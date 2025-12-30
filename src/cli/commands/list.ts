@@ -5,7 +5,7 @@
  */
 
 import { Command } from 'commander';
-import { ListOptions, AppInfo } from '../cli.types';
+import { ListOptions } from '../cli.types';
 import * as output from '../utils/output';
 import { getProcessManager, resetProcessManager } from '../../managers/process';
 
@@ -29,11 +29,12 @@ export function createListCommand(): Command {
           filtered = processes.filter(p => p.status === 'online');
         }
 
-        // Convert to AppInfo
-        const apps: AppInfo[] = filtered.map(p => ({
+        // Convert to AppInfo (with port)
+        const apps = filtered.map(p => ({
           name: p.name,
           status: p.status,
           type: p.execMode,
+          port: p.port,
           pid: p.pid ?? undefined,
           memory: p.memory,
           cpu: p.cpu,
@@ -57,17 +58,17 @@ export function createListCommand(): Command {
           output.table(
             [
               { header: 'NAME', key: 'name', width: 20 },
-              { header: 'STATUS', key: 'statusFormatted', width: 12 },
-              { header: 'TYPE', key: 'type', width: 8 },
+              { header: 'STATUS', key: 'statusFormatted', width: 10 },
+              { header: 'PORT', key: 'portStr', width: 6, align: 'right' },
               { header: 'PID', key: 'pidStr', width: 8, align: 'right' },
               { header: 'MEMORY', key: 'memoryStr', width: 10, align: 'right' },
               { header: 'CPU', key: 'cpuStr', width: 6, align: 'right' },
               { header: 'UPTIME', key: 'uptimeStr', width: 10, align: 'right' },
-              { header: 'RESTARTS', key: 'restarts', width: 8, align: 'right' },
             ],
             apps.map(app => ({
               ...app,
               statusFormatted: output.formatStatus(app.status),
+              portStr: app.port ?? '-',
               pidStr: app.pid ?? '-',
               memoryStr: app.memory ? output.formatBytes(app.memory) : '-',
               cpuStr: app.cpu !== undefined ? `${app.cpu.toFixed(1)}%` : '-',

@@ -10,7 +10,7 @@ import { DeployOptions } from '../cli.types';
 import * as output from '../utils/output';
 import { getDetector } from '../../core/detector';
 import { getBuilder } from '../../core/builder';
-import { getProcessManager } from '../../managers/process';
+import { getProcessManager, resetProcessManager } from '../../managers/process';
 
 export function createDeployCommand(): Command {
   const cmd = new Command('deploy')
@@ -95,9 +95,15 @@ export function createDeployCommand(): Command {
           const processManager = getProcessManager();
           const startCommand = detected.suggestedConfig?.startCommand || 'npm start';
 
+          // Parse start command - extract script from "node <file>" format
+          let script = startCommand;
+          if (startCommand.startsWith('node ')) {
+            script = startCommand.substring(5);
+          }
+
           const status = await processManager.start({
             name: appName,
-            script: startCommand,
+            script,
             cwd: absolutePath,
             port: options.port,
             env,
@@ -122,8 +128,11 @@ export function createDeployCommand(): Command {
               port: options.port,
             });
           }
+
+          resetProcessManager();
         } catch (err) {
           startSpin.fail('Failed to start application');
+          resetProcessManager();
           output.error('', err instanceof Error ? err : undefined);
           process.exit(1);
         }
