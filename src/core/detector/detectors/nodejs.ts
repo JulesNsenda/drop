@@ -147,12 +147,9 @@ function generateNodeConfig(
     config.buildCommand = 'npm run build';
   }
 
-  // Determine start command based on type/framework
-  if (packageJson.scripts?.start) {
-    config.startCommand = 'npm start';
-  } else {
-    config.startCommand = getDefaultStartCommand(type, framework, packageJson);
-  }
+  // Determine start command - always use the actual script file for PM2 compatibility
+  // Parse the start script or use the main entry point
+  config.startCommand = getActualStartScript(packageJson, type, framework);
 
   // Determine output directory
   config.outputDirectory = getOutputDirectory(type, framework);
@@ -168,35 +165,48 @@ function generateNodeConfig(
   return config;
 }
 
-function getDefaultStartCommand(
+/**
+ * Get the actual script file to run, parsing npm scripts if needed.
+ * This is needed because PM2 on Windows cannot run npm directly.
+ */
+function getActualStartScript(
+  packageJson: PackageJson,
   type: AppType,
-  _framework: string | null,
-  packageJson: PackageJson
+  _framework: string | null
 ): string {
+  // First, try to parse the start script if it exists
+  if (packageJson.scripts?.start) {
+    const startScript = packageJson.scripts.start;
+
+    // If the script is "node <file>", extract the file
+    if (startScript.startsWith('node ')) {
+      return startScript; // Return as-is, e.g., "node server.js"
+    }
+
+    // If it's just a file reference like "server.js"
+    if (startScript.endsWith('.js') || startScript.endsWith('.mjs') || startScript.endsWith('.ts')) {
+      return `node ${startScript}`;
+    }
+  }
+
+  // Fall back to main entry point
+  if (packageJson.main) {
+    return `node ${packageJson.main}`;
+  }
+
+  // Framework-specific defaults
   switch (type) {
     case 'nextjs':
-      return 'npm start';
+      return 'node node_modules/next/dist/bin/next start';
     case 'nuxt':
       return 'node .output/server/index.mjs';
     case 'sveltekit':
       return 'node build';
-    case 'remix':
-      return 'npm start';
     case 'astro':
       return 'node ./dist/server/entry.mjs';
     case 'nest':
       return 'node dist/main.js';
-    case 'express':
-    case 'fastify':
-    case 'hono':
-      if (packageJson.main) {
-        return `node ${packageJson.main}`;
-      }
-      return 'node index.js';
     default:
-      if (packageJson.main) {
-        return `node ${packageJson.main}`;
-      }
       return 'node index.js';
   }
 }

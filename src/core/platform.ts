@@ -281,9 +281,34 @@ export class DropPlatform {
 
       this.log('info', `Starting ${appName} on port ${port}...`);
 
+      // Determine start command based on app type
+      let script: string;
+      let interpreter: string | undefined;
+      let args: string[] | undefined;
+
+      if (detection.type === 'static' || detection.type === 'spa') {
+        // Static sites use our built-in static server
+        const serveDir = path.join(appPath, detection.suggestedConfig?.outputDirectory || '.');
+        // Use the compiled static-server.js from dist
+        script = path.join(__dirname, 'static-server.js');
+        args = [serveDir, '-s']; // -s for SPA mode
+      } else {
+        // For Node.js apps, the detector returns "node <file>" format
+        const startCommand = detection.suggestedConfig?.startCommand || 'node index.js';
+
+        if (startCommand.startsWith('node ')) {
+          // Extract the script file from "node <file>"
+          script = startCommand.substring(5); // Remove "node " prefix
+        } else {
+          script = startCommand;
+        }
+      }
+
       const status = await this.processManager.start({
         name: appName,
-        script: detection.suggestedConfig?.startCommand || 'npm start',
+        script,
+        interpreter,
+        args,
         cwd: appPath,
         port,
         env: { NODE_ENV: 'production' },
