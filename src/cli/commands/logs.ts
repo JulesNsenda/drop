@@ -15,7 +15,7 @@ export function createLogsCommand(): Command {
     .argument('<app>', 'Application name')
     .option('-n, --lines <number>', 'Number of lines to show', '100')
     .option('-e, --error', 'Show only error logs')
-    .option('-f, --follow', 'Follow log output (not implemented yet)')
+    .option('-f, --follow', 'Follow log output in real-time')
     .action(async (appName: string, options: LogsOptions) => {
       try {
         const processManager = getProcessManager();
@@ -26,6 +26,47 @@ export function createLogsCommand(): Command {
           process.exit(1);
         }
 
+        // If follow mode, stream logs
+        if (options.follow) {
+          output.info(`Following logs for ${appName}... (Ctrl+C to stop)`);
+          output.print('');
+
+          const stopStreaming = await processManager.streamLogs(
+            appName,
+            (line, type) => {
+              // Filter for errors if requested
+              if (options.error && type !== 'err') {
+                return;
+              }
+
+              if (type === 'err') {
+                output.print(output.color(`[ERR] ${line}`, 'red'));
+              } else {
+                output.print(`[OUT] ${line}`);
+              }
+            },
+            (error) => {
+              output.error('Log stream error', error);
+            }
+          );
+
+          // Handle graceful shutdown
+          const cleanup = (): void => {
+            stopStreaming();
+            resetProcessManager();
+            output.print('');
+            output.info('Stopped following logs');
+            process.exit(0);
+          };
+
+          process.on('SIGINT', cleanup);
+          process.on('SIGTERM', cleanup);
+
+          // Keep the process running
+          return;
+        }
+
+        // Non-follow mode: show last N lines
         const lines = parseInt(String(options.lines || '100'), 10);
         const logs = await processManager.getLogs(appName, lines);
 
@@ -56,10 +97,6 @@ export function createLogsCommand(): Command {
               output.print(line);
             }
           }
-        }
-
-        if (options.follow) {
-          output.warn('Follow mode (-f) is not yet implemented');
         }
 
         resetProcessManager();

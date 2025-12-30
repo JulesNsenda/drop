@@ -98,6 +98,8 @@ export interface ProcessStatus {
   pid: number | null;
   /** PM2 process ID */
   pmId: number | null;
+  /** Port the app is listening on */
+  port: number | null;
   /** Number of running instances */
   instances: number;
   /** Memory usage in bytes */

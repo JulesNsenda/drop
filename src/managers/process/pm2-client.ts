@@ -236,11 +236,19 @@ export function toProcessStatus(proc: PM2ProcessDescription): ProcessStatus {
     execMode = 'cluster';
   }
 
+  // Extract port from environment
+  let port: number | null = null;
+  if (env.env && typeof env.env === 'object' && 'PORT' in env.env) {
+    const envPort = (env.env as Record<string, string>).PORT;
+    port = envPort ? parseInt(envPort, 10) : null;
+  }
+
   return {
     name: proc.name || 'unknown',
     status,
     pid: proc.pid || null,
     pmId: proc.pm_id ?? null,
+    port,
     instances: env.instances || 1,
     memory: monit.memory || 0,
     cpu: monit.cpu || 0,
