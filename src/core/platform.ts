@@ -32,15 +32,21 @@ export interface PlatformConfig {
   caddyfilePath: string;
 }
 
+// Determine platform-appropriate defaults
+const isWindows = process.platform === 'win32';
+const DEFAULT_DROP_ROOT = isWindows ? 'C:\\drop' : '/var/drop';
+const DEFAULT_APPS_DIR = isWindows ? 'C:\\drop\\webapps' : '/var/drop/webapps';
+const DEFAULT_CADDYFILE = isWindows ? 'C:\\drop\\data\\Caddyfile' : '/etc/caddy/Caddyfile';
+
 const DEFAULT_CONFIG: PlatformConfig = {
-  dropRoot: '/var/drop',
-  appsDirectory: '/var/drop/apps',
+  dropRoot: DEFAULT_DROP_ROOT,
+  appsDirectory: DEFAULT_APPS_DIR,
   logLevel: 'info',
   portRangeStart: 3001,
   portRangeEnd: 3999,
   autoBuild: true,
   autoStart: true,
-  caddyfilePath: '/etc/caddy/Caddyfile',
+  caddyfilePath: DEFAULT_CADDYFILE,
 };
 
 export class DropPlatform {
