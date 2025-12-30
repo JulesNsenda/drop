@@ -7,7 +7,7 @@
 import { Command } from 'commander';
 import { GlobalOptions } from '../cli.types';
 import * as output from '../utils/output';
-import { getProcessManager } from '../../managers/process';
+import { getProcessManager, resetProcessManager } from '../../managers/process';
 
 export function createStatusCommand(): Command {
   const cmd = new Command('status')
@@ -52,7 +52,10 @@ export function createStatusCommand(): Command {
             output.print('');
           }
         }
+
+        resetProcessManager();
       } catch (err) {
+        resetProcessManager();
         output.error('Failed to get application status', err instanceof Error ? err : undefined);
         process.exit(1);
       }
