@@ -7,7 +7,7 @@
 import { Command } from 'commander';
 import { ProcessOptions } from '../cli.types';
 import * as output from '../utils/output';
-import { getProcessManager } from '../../managers/process';
+import { getProcessManager, resetProcessManager } from '../../managers/process';
 
 export function createRestartCommand(): Command {
   const cmd = new Command('restart')
@@ -38,10 +38,14 @@ export function createRestartCommand(): Command {
           }
         } else {
           spin.fail(`Failed to restart ${appName}`);
+          resetProcessManager();
           process.exit(1);
         }
+
+        resetProcessManager();
       } catch (err) {
         spin.fail(`Failed to restart ${appName}`);
+        resetProcessManager();
         output.error('', err instanceof Error ? err : undefined);
         process.exit(1);
       }

@@ -7,7 +7,7 @@
 import { Command } from 'commander';
 import { LogsOptions } from '../cli.types';
 import * as output from '../utils/output';
-import { getProcessManager } from '../../managers/process';
+import { getProcessManager, resetProcessManager } from '../../managers/process';
 
 export function createLogsCommand(): Command {
   const cmd = new Command('logs')
@@ -31,6 +31,7 @@ export function createLogsCommand(): Command {
 
         if (!logs) {
           output.info('No logs available');
+          resetProcessManager();
           return;
         }
 
@@ -60,7 +61,10 @@ export function createLogsCommand(): Command {
         if (options.follow) {
           output.warn('Follow mode (-f) is not yet implemented');
         }
+
+        resetProcessManager();
       } catch (err) {
+        resetProcessManager();
         output.error('Failed to get logs', err instanceof Error ? err : undefined);
         process.exit(1);
       }
