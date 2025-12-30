@@ -374,6 +374,9 @@ import ${path.join(dataDir, 'appconf', 'caddy', 'hosts', '*.caddy').replace(/\\/
     // Initialize process manager
     this.processManager = getProcessManager();
 
+    // Load used ports from existing PM2 processes
+    await this.loadUsedPorts();
+
     // Initialize router
     this.router = getRouterService({
       caddy: {
@@ -581,6 +584,36 @@ import ${path.join(dataDir, 'appconf', 'caddy', 'hosts', '*.caddy').replace(/\\/
 
   releasePort(port: number): void {
     this.usedPorts.delete(port);
+  }
+
+  /**
+   * Load used ports from existing PM2 processes
+   * This ensures we don't allocate ports that are already in use
+   */
+  private async loadUsedPorts(): Promise<void> {
+    if (!this.processManager) return;
+
+    try {
+      const processes = await this.processManager.getAllStatus();
+      for (const proc of processes) {
+        if (proc.port && proc.status === 'online') {
+          this.usedPorts.add(proc.port);
+          this.logger.debug(`Port ${proc.port} already in use by ${proc.name}`, 'PORT');
+        }
+      }
+
+      // Find the highest used port to set nextPort correctly
+      if (this.usedPorts.size > 0) {
+        const maxPort = Math.max(...this.usedPorts);
+        if (maxPort >= this.nextPort) {
+          this.nextPort = maxPort + 1;
+        }
+      }
+
+      this.logger.info(`Loaded ${this.usedPorts.size} used ports from running apps`, 'PORT');
+    } catch (error) {
+      this.logger.warn('Failed to load used ports from PM2', 'PORT', error);
+    }
   }
 
   /** @deprecated Use this.logger instead */
