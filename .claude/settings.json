@@ -25,6 +25,7 @@
       "Bash(git pull:*)",
       "Bash(gh pr:*)",
       "Bash(gh issue:*)",
+      "LSP(*)",
       "Read(./src/**)",
       "Read(./tests/**)",
       "Read(./docs/**)",

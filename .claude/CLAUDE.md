@@ -8,6 +8,68 @@ DROP (Deploy, Run, Operate, Publish) is a lightweight, self-hosted Platform as a
 
 > **Drop a folder, get a URL. Zero configuration for 80% of use cases.**
 
+---
+
+## CRITICAL: Development Workflow Rules
+
+### Before Writing ANY Code
+
+**ALWAYS follow this sequence:**
+
+1. **Read the PRD first**: `docs/specs/prd/PRD-XXX-feature-name.md`
+2. **Read the Tasks file**: `docs/specs/tasks/TASKS-XXX-feature-name.md`
+3. **Create feature branch**: Follow branching model in `docs/GIT-BRANCHING-MODEL.md`
+4. **Implement task by task**: Work through tasks sequentially
+5. **Mark tasks complete**: Update task file after each successful implementation
+6. **Run tests**: Ensure all tests pass before marking complete
+7. **Update documentation**: Use documenter agent after feature completion
+
+### Git Branching Model (MANDATORY)
+
+```bash
+# ALWAYS create a feature branch from develop
+git checkout develop
+git pull origin develop
+git checkout -b feature/DROP-XXX-description
+
+# Commit with conventional commits
+git commit -m "feat(scope): description"
+
+# Push and create PR to develop
+git push -u origin feature/DROP-XXX-description
+```
+
+**Branch Types:**
+- `feature/DROP-XXX-description` - New features
+- `bugfix/DROP-XXX-description` - Bug fixes
+- `hotfix/DROP-XXX-description` - Production hotfixes (from main)
+- `release/vX.Y.Z` - Release preparation
+
+**NEVER commit directly to `main` or `develop`!**
+
+### Task Completion Protocol
+
+After implementing each task:
+1. Run relevant tests
+2. Update task file: Change `[ ]` to `[x]`
+3. Add completion date and commit hash
+4. Commit changes including task file update
+
+### Clean Code Principles (MANDATORY)
+
+1. **Single Responsibility**: One function/class does one thing
+2. **DRY (Don't Repeat Yourself)**: Extract common logic
+3. **KISS (Keep It Simple)**: Simplest solution that works
+4. **Meaningful Names**: Self-documenting code
+5. **Small Functions**: Max 20-30 lines per function
+6. **No Magic Numbers**: Use named constants
+7. **Error Handling**: Handle all edge cases
+8. **Type Safety**: Full TypeScript strict mode
+9. **Pure Functions**: Prefer functions without side effects
+10. **Immutability**: Prefer `const` and immutable data structures
+
+---
+
 ## Technology Stack
 
 ### Backend
@@ -51,6 +113,27 @@ DROP (Deploy, Run, Operate, Publish) is a lightweight, self-hosted Platform as a
     ├── appconf/                # Configuration files
     ├── backup/                 # Automated backups
     └── temp/                   # Temporary files
+```
+
+## Project Documentation Structure
+
+```
+docs/
+├── specs/
+│   ├── DROP-PAAS-SPECIFICATION.md   # Master specification (read-only reference)
+│   ├── prd/                          # Product Requirement Documents
+│   │   ├── _TEMPLATE.md              # PRD template
+│   │   ├── PRD-001-watcher-service.md
+│   │   ├── PRD-002-detector-service.md
+│   │   └── ...
+│   └── tasks/                        # Implementation Tasks
+│       ├── _TEMPLATE.md              # Task template
+│       ├── TASKS-001-watcher-service.md
+│       ├── TASKS-002-detector-service.md
+│       └── ...
+├── api/                              # API Documentation
+├── guides/                           # User Guides
+└── GIT-BRANCHING-MODEL.md           # Branching strategy
 ```
 
 ## Coding Standards
@@ -104,6 +187,8 @@ src/
 ## Important Files
 
 - `docs/specs/DROP-PAAS-SPECIFICATION.md` - Complete specification
+- `docs/specs/prd/` - Product Requirements (READ BEFORE CODING)
+- `docs/specs/tasks/` - Implementation Tasks (READ BEFORE CODING)
 - `src/core/` - Core platform logic
 - `src/api/` - REST API endpoints
 - `src/cli/` - Command-line interface
@@ -166,3 +251,18 @@ drop restart <app>   # Restart application
 - Validate all user input
 - Sanitize file paths to prevent traversal attacks
 - Use parameterized queries for database operations
+
+## Agent Usage
+
+### Available Agents
+- **code-reviewer**: Use after writing code for quality review
+- **test-runner**: Use after code changes to run and fix tests
+- **api-designer**: Use when designing REST API endpoints
+- **database-expert**: Use for database schema and queries
+- **security-auditor**: Use for security reviews
+- **documenter**: Use after feature completion to update docs
+
+### Workflow Integration
+1. Before coding: Read PRD → Read Tasks
+2. During coding: Use relevant specialist agents
+3. After coding: Use code-reviewer → test-runner → documenter
