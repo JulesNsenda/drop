@@ -11,7 +11,7 @@ import * as fs from 'fs/promises';
 import { Stats } from 'fs';
 import { eventBus } from '../event-bus';
 import { Debouncer } from './debouncer';
-import { parsePath, getAppDirectory, isConfigFile } from './path-parser';
+import { parsePath, getAppDirectory, isConfigFile, isValidAppName } from './path-parser';
 import { createWatcherConfig } from './watcher.config';
 import {
   WatcherConfig,
@@ -279,6 +279,10 @@ export class WatcherService {
       // Only consider first-level directories as apps
       if (segments.length === 1) {
         const appName = segments[0];
+        // Skip invalid app names (., .., hidden dirs, etc.)
+        if (!isValidAppName(appName)) {
+          continue;
+        }
         if (!this.knownApps.has(appName)) {
           const parsed = parsePath(dir, this.config.appsDir);
           this.handleAppDetected(appName, dir, parsed.hostname, parsed.port);

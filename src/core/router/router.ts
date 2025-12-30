@@ -241,10 +241,9 @@ export class RouterService {
         const error = await response.text();
         throw new Error(`Caddy reload failed: ${error}`);
       }
-    } catch (error) {
-      // Caddy might not be running - just log and continue
-      // In production, we'd want better error handling
-      console.error('Failed to reload Caddy:', error);
+    } catch {
+      // Caddy might not be running - silently ignore
+      // Apps are still accessible directly via their ports
     }
   }
 

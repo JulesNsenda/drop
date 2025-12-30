@@ -40,6 +40,16 @@ export function parsePath(filePath: string, baseDir: string): ParsedPath {
   // First segment is the app/hostname directory
   const firstSegment = segments[0];
 
+  // Filter out invalid app names (parent refs, hidden dirs, special dirs)
+  if (!isValidAppName(firstSegment)) {
+    return {
+      appName: '',
+      hostname: null,
+      port: null,
+      relativePath,
+    };
+  }
+
   // Try to parse as hostname_port pattern
   const portMatch = firstSegment.match(HOSTNAME_PORT_PATTERN);
   if (portMatch) {
@@ -76,6 +86,26 @@ export function parsePath(filePath: string, baseDir: string): ParsedPath {
     port: null,
     relativePath,
   };
+}
+
+export function isValidAppName(name: string): boolean {
+  // Reject empty, parent refs, current dir refs
+  if (!name || name === '.' || name === '..') {
+    return false;
+  }
+
+  // Reject hidden directories (starting with .)
+  if (name.startsWith('.')) {
+    return false;
+  }
+
+  // Reject common non-app directories
+  const invalidNames = ['node_modules', '__pycache__', '.git', '.svn', '.hg'];
+  if (invalidNames.includes(name.toLowerCase())) {
+    return false;
+  }
+
+  return true;
 }
 
 export function isValidHostname(hostname: string): boolean {
