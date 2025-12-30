@@ -6,6 +6,7 @@
  */
 
 import * as path from 'path';
+import * as fs from 'fs/promises';
 import { EventBus, eventBus, Unsubscribe } from './event-bus';
 import { WatcherService } from './watcher';
 import { DetectorService, getDetector } from './detector';
@@ -89,6 +90,9 @@ export class DropPlatform {
     this.eventBus.publish('platform:starting', { config: this.config as unknown as Record<string, unknown> });
 
     try {
+      // Ensure required directories exist
+      await this.ensureDirectories();
+
       // Initialize services
       await this.initializeServices();
 
@@ -142,6 +146,27 @@ export class DropPlatform {
     this.isRunning = false;
     this.eventBus.publish('platform:stopped', { timestamp: new Date() });
     this.log('info', 'DROP platform stopped');
+  }
+
+  private async ensureDirectories(): Promise<void> {
+    const directories = [
+      this.config.dropRoot,
+      this.config.appsDirectory,
+      path.join(this.config.dropRoot, 'data'),
+      path.join(this.config.dropRoot, 'logs'),
+      path.join(this.config.dropRoot, 'temp'),
+    ];
+
+    for (const dir of directories) {
+      try {
+        await fs.mkdir(dir, { recursive: true });
+      } catch (error) {
+        // Ignore if directory already exists
+        if ((error as NodeJS.ErrnoException).code !== 'EEXIST') {
+          this.log('warn', `Failed to create directory: ${dir}`, error);
+        }
+      }
+    }
   }
 
   private async initializeServices(): Promise<void> {

@@ -14,20 +14,18 @@ A lightweight, self-hosted Platform as a Service (PaaS) engineered for the "drop
 - **Multi-Runtime Support** - Node.js, Python, Go, Rust, PHP, Docker, static sites
 - **Framework Detection** - Recognizes Next.js, Nuxt, SvelteKit, Remix, Astro, Express, FastAPI, Django, Flask, and more
 - **Process Management** - Built on PM2 for reliable process management with auto-restart
-- **Reverse Proxy** - Caddy integration for automatic HTTPS and routing
+- **Cross-Platform** - Works on Windows, Linux, and macOS
+- **Reverse Proxy** - Optional Caddy integration for automatic HTTPS and routing
 - **CLI Interface** - Full-featured command-line tool for management
-- **Event-Driven Architecture** - Extensible plugin system
 
 ## Requirements
 
 - Node.js 20+
 - npm 9+
-- PM2 (installed automatically)
-- Caddy (optional, for reverse proxy)
 
 ## Installation
 
-### From Source
+### Step 1: Clone and Build
 
 ```bash
 # Clone the repository
@@ -39,203 +37,197 @@ npm install
 
 # Build the project
 npm run build
+```
 
-# Link CLI globally
+### Step 2: Link CLI Globally (Optional)
+
+```bash
 npm link
 ```
 
-### Verify Installation
+This makes the `drop` command available globally.
+
+### Step 3: Verify Installation
 
 ```bash
+# If you ran npm link
 drop version
+
+# Or run directly
+node dist/cli/index.js version
 ```
 
 ## Quick Start
 
-### 1. Create DROP Directories
+### 1. Start the DROP Platform
+
+DROP automatically creates all required directories on first run.
 
 ```bash
-# Linux/macOS
-sudo mkdir -p /var/drop/webapps
-sudo mkdir -p /var/drop/data
-sudo mkdir -p /var/drop/logs
+# Using the CLI (after npm link)
+drop serve
 
-# Windows (run as Administrator)
-mkdir C:\drop\webapps
-mkdir C:\drop\data
-mkdir C:\drop\logs
-```
-
-### 2. Set Environment Variables
-
-```bash
-# Linux/macOS (add to ~/.bashrc or ~/.zshrc)
-export DROP_ROOT=/var/drop
-export DROP_APPS_DIR=/var/drop/webapps
-export DROP_LOG_LEVEL=info
-
-# Windows (System Environment Variables)
-set DROP_ROOT=C:\drop
-set DROP_APPS_DIR=C:\drop\webapps
-set DROP_LOG_LEVEL=info
-```
-
-### 3. Start DROP Platform
-
-```bash
-# Start the platform service
+# Or run directly
 node dist/index.js
-
-# Or use the development test runner
-npx ts-node drop-test/start-drop.ts
 ```
 
-### 4. Deploy Your First App
+You should see:
+```
+[INFO] Starting DROP platform...
+[INFO]   Drop root: C:\drop  (or /var/drop on Linux)
+[INFO]   Apps directory: C:\drop\webapps
+[INFO] DROP platform started successfully
+```
 
-Simply copy your application folder into the webapps directory:
+### 2. Deploy an Application
 
+While DROP is running, copy your application to the webapps directory:
+
+**Windows:**
+```powershell
+# Deploy a Node.js app
+xcopy my-app C:\drop\webapps\my-app\ /E /I
+
+# Deploy a static site
+xcopy my-site C:\drop\webapps\my-site\ /E /I
+```
+
+**Linux/macOS:**
 ```bash
-# Example: Deploy a Node.js app
-cp -r my-nodejs-app /var/drop/webapps/
+# Deploy a Node.js app
+cp -r my-app /var/drop/webapps/
 
-# Windows
-xcopy my-nodejs-app C:\drop\webapps\my-nodejs-app\ /E /I
+# Deploy a static site
+cp -r my-site /var/drop/webapps/
 ```
 
-DROP will automatically:
-1. Detect the application type
-2. Install dependencies
-3. Build the application (if needed)
-4. Start the application
-5. Configure routing
+### 3. Access Your Application
+
+DROP automatically:
+1. Detects the application type
+2. Installs dependencies (if needed)
+3. Builds the application (if needed)
+4. Starts the application
+5. Assigns a port (starting from 3001)
+
+Watch the DROP console for output:
+```
+[INFO] Building my-app...
+[INFO] Build completed for my-app in 1500ms
+[INFO] Starting my-app on port 3001...
+[INFO] Started my-app (PID: 12345)
+```
+
+Open your browser: `http://localhost:3001`
+
+## Default Directories
+
+DROP uses platform-appropriate defaults:
+
+| Platform | DROP Root | Webapps Directory |
+|----------|-----------|-------------------|
+| Windows | `C:\drop` | `C:\drop\webapps` |
+| Linux/macOS | `/var/drop` | `/var/drop/webapps` |
+
+All directories are created automatically on startup:
+```
+C:\drop\                      # DROP_ROOT (Windows)
+/var/drop/                    # DROP_ROOT (Linux/macOS)
+├── webapps/                  # Your deployed applications
+├── data/                     # Platform data (Caddyfile, etc.)
+├── logs/                     # Application logs
+└── temp/                     # Temporary files
+```
+
+## Environment Variables (Optional)
+
+Override defaults with environment variables:
+
+**Windows (PowerShell):**
+```powershell
+$env:DROP_ROOT = "D:\my-drop"
+$env:DROP_APPS_DIR = "D:\my-drop\apps"
+$env:DROP_LOG_LEVEL = "debug"
+node dist/index.js
+```
+
+**Linux/macOS:**
+```bash
+export DROP_ROOT=/opt/drop
+export DROP_APPS_DIR=/opt/drop/apps
+export DROP_LOG_LEVEL=debug
+node dist/index.js
+```
+
+| Variable | Default (Windows) | Default (Linux) | Description |
+|----------|-------------------|-----------------|-------------|
+| `DROP_ROOT` | `C:\drop` | `/var/drop` | Base directory |
+| `DROP_APPS_DIR` | `C:\drop\webapps` | `/var/drop/webapps` | Apps directory |
+| `DROP_LOG_LEVEL` | `info` | `info` | Log level: debug, info, warn, error |
 
 ## CLI Commands
 
-### Deploy
+If you ran `npm link`, you can use the `drop` CLI:
+
+### Start the Platform
 
 ```bash
-# Deploy from current directory
-drop deploy
-
-# Deploy from specific path
-drop deploy ./my-app
-
-# Deploy with options
-drop deploy ./my-app --name my-custom-name --port 3001
-
-# Deploy with environment variables
-drop deploy ./my-app -e NODE_ENV=production -e API_KEY=secret
-
-# Skip build step
-drop deploy ./my-app --no-build
+drop serve                   # Start DROP platform
+drop serve -r /custom/root   # Custom root directory
+drop serve -w /custom/apps   # Custom webapps directory
 ```
 
 ### List Applications
 
 ```bash
-# List running applications
-drop list
-
-# List all applications (including stopped)
-drop list --all
-
-# Filter by status
-drop list --status online
-drop list --status stopped
-drop list --status errored
-
-# JSON output
-drop list --json
+drop list                    # List running apps
+drop list --all              # Include stopped apps
+drop list --json             # JSON output
 ```
 
-### Application Status
+### Application Management
 
 ```bash
-drop status my-app
+drop status my-app           # Check app status
+drop logs my-app             # View logs
+drop logs my-app -n 50       # Last 50 lines
+drop logs my-app -e          # Error logs only
+drop stop my-app             # Stop app
+drop start my-app            # Start app
+drop restart my-app          # Restart app
+drop remove my-app           # Remove app
 ```
 
-### View Logs
+### Deploy via CLI
 
 ```bash
-# View last 100 lines
-drop logs my-app
-
-# View specific number of lines
-drop logs my-app -n 50
-
-# Show only error logs
-drop logs my-app -e
-```
-
-### Start/Stop/Restart
-
-```bash
-drop start my-app
-drop stop my-app
-drop restart my-app
-
-# Force stop
-drop stop my-app --force
-```
-
-### Remove Application
-
-```bash
-# Remove application
-drop remove my-app
-
-# Force remove without confirmation
-drop remove my-app --force
-
-# Remove but keep data
-drop remove my-app --keep-data
-```
-
-### Global Options
-
-```bash
-# JSON output mode (for scripting)
-drop --json list
-
-# Quiet mode (suppress non-error output)
-drop --quiet deploy ./my-app
+drop deploy ./my-app                          # Deploy from path
+drop deploy ./my-app --name custom-name       # Custom name
+drop deploy ./my-app --port 4000              # Specific port
+drop deploy ./my-app -e NODE_ENV=production   # With env vars
 ```
 
 ## Supported Application Types
 
-| Type | Detection | Auto-Config |
-|------|-----------|-------------|
-| **Node.js** | `package.json` | npm install, npm start |
-| **Next.js** | `next.config.*` | npm run build, npm start |
-| **Nuxt** | `nuxt.config.*` | npm run build, npm start |
-| **SvelteKit** | `svelte.config.js` | npm run build, npm start |
-| **Remix** | `remix.config.js` | npm run build, npm start |
-| **Astro** | `astro.config.*` | npm run build, npm start |
-| **Express** | express dependency | npm start |
-| **Fastify** | fastify dependency | npm start |
-| **Hono** | hono dependency | npm start |
-| **NestJS** | @nestjs/core dependency | npm run build, npm start |
-| **Python** | `requirements.txt`, `pyproject.toml` | pip install, python app.py |
-| **Django** | django dependency | python manage.py runserver |
-| **Flask** | flask dependency | flask run |
-| **FastAPI** | fastapi dependency | uvicorn main:app |
-| **Go** | `go.mod` | go build, ./app |
-| **Rust** | `Cargo.toml` | cargo build, ./target/release/app |
-| **Docker** | `Dockerfile` | docker build, docker run |
-| **Static** | `index.html` | Served directly |
-| **SPA** | `index.html` + JS framework | Served with SPA routing |
+| Type | Detection | What DROP Does |
+|------|-----------|----------------|
+| **Node.js** | `package.json` | `npm install` + runs start script |
+| **Next.js** | `next.config.*` | `npm install` + `npm run build` + starts |
+| **Nuxt** | `nuxt.config.*` | `npm install` + `npm run build` + starts |
+| **SvelteKit** | `svelte.config.js` | `npm install` + `npm run build` + starts |
+| **Express/Fastify/Hono** | Dependencies in package.json | `npm install` + runs start script |
+| **Static Site** | `index.html` | Serves with built-in static server |
+| **SPA** | `index.html` + framework | Serves with SPA routing support |
+| **Python** | `requirements.txt` | `pip install` + runs app |
+| **Docker** | `Dockerfile` | `docker build` + `docker run` |
 
-## Configuration
+## Configuration (Optional)
 
-### Manifest File (Optional)
-
-For explicit configuration, create a `drop.yaml` (or `drop.json`) in your app root:
+For explicit configuration, create a `drop.yaml` in your app root:
 
 ```yaml
-# drop.yaml
 name: my-app
 type: nodejs
-framework: express
 
 build:
   command: npm run build
@@ -251,186 +243,89 @@ port: 3000
 
 env:
   NODE_ENV: production
-  LOG_LEVEL: info
-
-healthCheck:
-  path: /health
-  interval: 30
-
-domains:
-  - myapp.example.com
-  - www.myapp.example.com
 ```
 
-Supported manifest files:
-- `drop.yaml` / `drop.yml`
-- `drop.json`
-- `.droprc` / `.droprc.json` / `.droprc.yaml`
+Supported files: `drop.yaml`, `drop.yml`, `drop.json`, `.droprc`
 
-### Environment Variables
+## Example: Deploy Sample Apps
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `DROP_ROOT` | `/var/drop` | Base installation directory |
-| `DROP_APPS_DIR` | `/var/drop/webapps` | Directory for deployed apps |
-| `DROP_LOG_LEVEL` | `info` | Log level: debug, info, warn, error |
-| `DROP_API_PORT` | `3000` | API server port |
+DROP includes sample applications for testing:
 
-### Platform Configuration
-
-When starting the platform programmatically:
-
-```typescript
-import { DropPlatform } from './core/platform';
-
-const platform = new DropPlatform({
-  dropRoot: '/var/drop',
-  appsDirectory: '/var/drop/webapps',
-  logLevel: 'info',
-  portRangeStart: 3001,
-  portRangeEnd: 3999,
-  autoBuild: true,
-  autoStart: true,
-  caddyfilePath: '/etc/caddy/Caddyfile',
-});
-
-await platform.start();
+**Static Site:**
+```powershell
+# Windows
+xcopy drop-test\sample-static C:\drop\webapps\my-site\ /E /I
+```
+```bash
+# Linux/macOS
+cp -r drop-test/sample-static /var/drop/webapps/my-site
 ```
 
-## Directory Structure
-
+**Node.js App:**
+```powershell
+# Windows
+xcopy drop-test\sample-nodejs C:\drop\webapps\my-app\ /E /I
 ```
-/var/drop/                    # DROP_ROOT
-├── webapps/                  # Deployed applications (DROP_APPS_DIR)
-│   ├── my-app/
-│   ├── another-app/
-│   └── static-site/
-├── data/                     # Platform data
-│   ├── drop.db               # SQLite metadata database
-│   └── Caddyfile             # Generated Caddy config
-├── logs/                     # Application logs
-│   ├── my-app-out.log
-│   └── my-app-err.log
-└── temp/                     # Temporary files
+```bash
+# Linux/macOS
+cp -r drop-test/sample-nodejs /var/drop/webapps/my-app
 ```
 
 ## Development
 
-### Scripts
-
 ```bash
-# Development mode with hot reload
-npm run dev
-
-# Build for production
-npm run build
-
-# Run tests
-npm test
-
-# Run tests with coverage
-npm run test:coverage
-
-# Lint code
-npm run lint
-
-# Format code
-npm run format
-```
-
-### Project Structure
-
-```
-src/
-├── cli/                      # CLI commands (Commander.js)
-│   ├── commands/             # Individual commands
-│   └── utils/                # CLI utilities
-├── core/                     # Core services
-│   ├── builder/              # Build pipeline
-│   ├── detector/             # App type detection
-│   ├── event-bus/            # Event system
-│   ├── router/               # Caddy configuration
-│   ├── watcher/              # File system watcher
-│   └── platform.ts           # Main orchestrator
-├── managers/                 # Domain managers
-│   ├── app/                  # App registry
-│   └── process/              # PM2 process management
-└── index.ts                  # Entry point
-```
-
-### Testing
-
-```bash
-# Run all tests
-npm test
-
-# Run specific test file
-npm test -- src/core/detector/detector.test.ts
-
-# Watch mode
-npm run test:watch
+npm run dev          # Start in development mode
+npm run build        # Build for production
+npm test             # Run tests
+npm run lint         # Lint code
+npm run format       # Format code
 ```
 
 ## Troubleshooting
 
-### Common Issues
-
-**App not detected:**
-- Ensure your app has the correct marker files (package.json, requirements.txt, etc.)
+### App not detected
+- Ensure your app has marker files (`package.json`, `index.html`, etc.)
 - Add a `drop.yaml` manifest for explicit configuration
 
-**Build fails:**
+### App won't start
 - Check logs: `drop logs my-app -e`
-- Verify all dependencies are listed in package.json/requirements.txt
-- Ensure the build command is correct in drop.yaml
-
-**App won't start:**
+- Verify the start script in `package.json` is correct
 - Check if the port is already in use
-- Verify the start command is correct
-- Check for missing environment variables
 
-**Permission denied:**
-- Ensure DROP has write access to the webapps directory
-- On Linux, you may need to run as root or configure proper permissions
-
-### Debug Mode
-
-Enable debug logging:
-
+### Permission denied (Linux/macOS)
 ```bash
+sudo chown -R $USER /var/drop
+```
+
+### Debug mode
+```bash
+# Windows PowerShell
+$env:DROP_LOG_LEVEL = "debug"
+
+# Linux/macOS
 export DROP_LOG_LEVEL=debug
 ```
 
 ## Architecture
 
-DROP uses an event-driven architecture:
+```
+┌─────────────────────────────────────────────────────────┐
+│                    DROP Platform                         │
+├─────────────┬─────────────┬─────────────┬───────────────┤
+│   Watcher   │  Detector   │   Builder   │ Process Mgr   │
+│  (chokidar) │  (auto-    │  (npm/pip)  │    (PM2)      │
+│             │  detect)    │             │               │
+└─────────────┴─────────────┴─────────────┴───────────────┘
+        │              │            │             │
+        └──────────────┴────────────┴─────────────┘
+                         Event Bus
+```
 
-1. **Watcher Service** - Monitors the webapps directory for changes
-2. **Detector Service** - Identifies application type and framework
-3. **Builder Service** - Installs dependencies and builds the app
-4. **Process Manager** - Manages app processes via PM2
-5. **Router Service** - Configures Caddy for reverse proxy
-
-Events flow through a central event bus, enabling loose coupling and extensibility.
-
-## Contributing
-
-1. Fork the repository
-2. Create a feature branch: `git checkout -b feature/my-feature`
-3. Make your changes
-4. Run tests: `npm test`
-5. Commit: `git commit -m "feat: add my feature"`
-6. Push: `git push origin feature/my-feature`
-7. Create a Pull Request
+1. **Watcher** - Monitors webapps directory for new folders
+2. **Detector** - Identifies app type from files (package.json, etc.)
+3. **Builder** - Installs dependencies and builds
+4. **Process Manager** - Starts and manages processes via PM2
 
 ## License
 
 MIT License - see [LICENSE](LICENSE) for details.
-
-## Acknowledgments
-
-- [PM2](https://pm2.keymetrics.io/) - Process management
-- [Caddy](https://caddyserver.com/) - Reverse proxy with automatic HTTPS
-- [Hono](https://hono.dev/) - Lightweight web framework
-- [Commander.js](https://github.com/tj/commander.js) - CLI framework
-- [chokidar](https://github.com/paulmillr/chokidar) - File watching
