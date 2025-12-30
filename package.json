@@ -1,0 +1,61 @@
+{
+  "name": "drop",
+  "version": "0.1.0-alpha.1",
+  "description": "DROP - Deploy, Run, Operate, Publish. A lightweight, self-hosted PaaS.",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "bin": {
+    "drop": "./dist/cli/index.js"
+  },
+  "scripts": {
+    "dev": "ts-node src/index.ts",
+    "build": "tsc",
+    "build:watch": "tsc --watch",
+    "start": "node dist/index.js",
+    "test": "jest",
+    "test:watch": "jest --watch",
+    "test:coverage": "jest --coverage",
+    "lint": "eslint src --ext .ts",
+    "lint:fix": "eslint src --ext .ts --fix",
+    "format": "prettier --write \"src/**/*.ts\"",
+    "format:check": "prettier --check \"src/**/*.ts\"",
+    "clean": "rimraf dist",
+    "db:migrate": "ts-node src/managers/app/migrations/runner.ts",
+    "db:migrate:create": "ts-node scripts/create-migration.ts"
+  },
+  "keywords": [
+    "paas",
+    "platform",
+    "deployment",
+    "nodejs",
+    "self-hosted"
+  ],
+  "author": "",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "dependencies": {
+    "chokidar": "^3.6.0",
+    "commander": "^12.1.0",
+    "hono": "^4.6.0",
+    "pg": "^8.13.0",
+    "pm2": "^5.4.0",
+    "yaml": "^2.6.0",
+    "zod": "^3.24.0"
+  },
+  "devDependencies": {
+    "@types/jest": "^29.5.0",
+    "@types/node": "^22.0.0",
+    "@types/pg": "^8.11.0",
+    "@typescript-eslint/eslint-plugin": "^8.0.0",
+    "@typescript-eslint/parser": "^8.0.0",
+    "eslint": "^9.0.0",
+    "jest": "^29.7.0",
+    "prettier": "^3.4.0",
+    "rimraf": "^6.0.0",
+    "ts-jest": "^29.2.0",
+    "ts-node": "^10.9.0",
+    "typescript": "^5.7.0"
+  }
+}
