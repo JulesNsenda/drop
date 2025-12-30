@@ -4,7 +4,7 @@
  * Manages the connection pool for DROP's internal database.
  */
 
-import { Pool, PoolClient, QueryResult } from 'pg';
+import { Pool, PoolClient, QueryResult, QueryResultRow } from 'pg';
 import { DatabaseConfig } from './app-registry.types';
 
 const DEFAULT_CONFIG: DatabaseConfig = {
@@ -58,7 +58,7 @@ export class Database {
     }
   }
 
-  async query<T = unknown>(text: string, params?: unknown[]): Promise<QueryResult<T>> {
+  async query<T extends QueryResultRow = QueryResultRow>(text: string, params?: unknown[]): Promise<QueryResult<T>> {
     if (!this.pool) {
       throw new Error('Database not connected. Call connect() first.');
     }
