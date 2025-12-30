@@ -159,10 +159,17 @@ export class DropPlatform {
     // └── data/                   # User data (preserved during upgrade)
     //     ├── webapps/            # Deployed web applications
     //     ├── drop-svc/           # Platform state (drop.db, encryption.key)
+    //     │   └── pm2/            # PM2 config files
     //     ├── db/                 # App databases (SQLite/PostgreSQL)
     //     ├── appdata/            # Per-app persistent data
     //     ├── logs/               # All logs
+    //     │   ├── drop-svc/       # Platform logs
+    //     │   ├── webapps/        # App logs
+    //     │   └── caddy/          # Caddy logs
     //     ├── appconf/            # Configuration files
+    //     │   └── caddy/          # Caddy config
+    //     │       ├── webapps/    # Per-app Caddy configs
+    //     │       └── hosts/      # Per-host Caddy configs
     //     ├── backup/             # Automated backups
     //     └── temp/               # Temporary files
 
@@ -175,12 +182,17 @@ export class DropPlatform {
       dataDir,
       this.config.appsDirectory, // data/webapps
       path.join(dataDir, 'drop-svc'), // Platform state
+      path.join(dataDir, 'drop-svc', 'pm2'), // PM2 config files
       path.join(dataDir, 'db'), // App databases
       path.join(dataDir, 'appdata'), // Per-app persistent data
       path.join(dataDir, 'logs'), // All logs
       path.join(dataDir, 'logs', 'drop-svc'), // Platform logs
       path.join(dataDir, 'logs', 'webapps'), // App logs
+      path.join(dataDir, 'logs', 'caddy'), // Caddy logs
       path.join(dataDir, 'appconf'), // Configuration files
+      path.join(dataDir, 'appconf', 'caddy'), // Caddy config root
+      path.join(dataDir, 'appconf', 'caddy', 'webapps'), // Per-app Caddy configs
+      path.join(dataDir, 'appconf', 'caddy', 'hosts'), // Per-host Caddy configs
       path.join(dataDir, 'backup'), // Automated backups
       path.join(dataDir, 'temp'), // Temporary files
     ];
@@ -200,6 +212,9 @@ export class DropPlatform {
       path.join(dataDir, 'db'),
       path.join(dataDir, 'appdata'),
       path.join(dataDir, 'logs', 'webapps'),
+      path.join(dataDir, 'logs', 'caddy'),
+      path.join(dataDir, 'appconf', 'caddy', 'webapps'),
+      path.join(dataDir, 'appconf', 'caddy', 'hosts'),
       path.join(dataDir, 'backup'),
       path.join(dataDir, 'temp'),
     ];
@@ -209,7 +224,6 @@ export class DropPlatform {
       try {
         await fs.access(keepFile);
       } catch {
-        // File doesn't exist, create it
         try {
           await fs.writeFile(keepFile, '');
         } catch (error) {
@@ -218,7 +232,62 @@ export class DropPlatform {
       }
     }
 
-    // Create initial Caddyfile if it doesn't exist
+    // Create required files
+    await this.ensureFiles(dataDir);
+  }
+
+  private async ensureFiles(dataDir: string): Promise<void> {
+    // 1. Create encryption.key if it doesn't exist
+    const encryptionKeyPath = path.join(dataDir, 'drop-svc', 'encryption.key');
+    try {
+      await fs.access(encryptionKeyPath);
+    } catch {
+      try {
+        // Generate a random 32-byte key (256-bit) encoded as hex
+        const crypto = await import('crypto');
+        const key = crypto.randomBytes(32).toString('hex');
+        await fs.writeFile(encryptionKeyPath, key, { mode: 0o600 });
+        this.log('info', 'Generated encryption key');
+      } catch (error) {
+        this.log('warn', 'Failed to create encryption.key', error);
+      }
+    }
+
+    // 2. Create platform config (drop.yaml) if it doesn't exist
+    const configPath = path.join(dataDir, 'appconf', 'drop.yaml');
+    try {
+      await fs.access(configPath);
+    } catch {
+      try {
+        const initialConfig = `# DROP Platform Configuration
+# Generated on ${new Date().toISOString()}
+
+# Platform settings
+platform:
+  logLevel: info
+  portRangeStart: 3001
+  portRangeEnd: 3999
+
+# Build settings
+build:
+  autoBuild: true
+  autoStart: true
+
+# Backup settings (optional)
+backup:
+  enabled: false
+  interval: 60  # minutes
+  retention: 7  # number of backups to keep
+  compression: true
+`;
+        await fs.writeFile(configPath, initialConfig);
+        this.log('info', 'Created platform configuration');
+      } catch (error) {
+        this.log('warn', 'Failed to create drop.yaml', error);
+      }
+    }
+
+    // 3. Create initial Caddyfile if it doesn't exist
     try {
       await fs.access(this.config.caddyfilePath);
     } catch {
@@ -231,11 +300,52 @@ export class DropPlatform {
     auto_https off
     admin off
 }
+
+# Logging
+(drop_logging) {
+    log {
+        output file ${path.join(dataDir, 'logs', 'caddy', 'access.log').replace(/\\/g, '/')} {
+            roll_size 100mb
+            roll_keep 10
+        }
+        format json
+    }
+}
+
+# Import app and host configurations
+import ${path.join(dataDir, 'appconf', 'caddy', 'webapps', '*.caddy').replace(/\\/g, '/')}
+import ${path.join(dataDir, 'appconf', 'caddy', 'hosts', '*.caddy').replace(/\\/g, '/')}
 `;
         await fs.writeFile(this.config.caddyfilePath, initialCaddyfile);
         this.log('info', `Created initial Caddyfile at ${this.config.caddyfilePath}`);
       } catch (error) {
         this.log('warn', 'Failed to create initial Caddyfile', error);
+      }
+    }
+
+    // 4. Create initial platform log file
+    const platformLogPath = path.join(dataDir, 'logs', 'drop-svc', 'drop-svc.log');
+    try {
+      await fs.access(platformLogPath);
+    } catch {
+      try {
+        const logHeader = `# DROP Platform Log\n# Started: ${new Date().toISOString()}\n`;
+        await fs.writeFile(platformLogPath, logHeader);
+      } catch (error) {
+        this.log('debug', 'Failed to create platform log file', error);
+      }
+    }
+
+    // 5. Create error log file
+    const errorLogPath = path.join(dataDir, 'logs', 'drop-svc', 'drop-svc-error.log');
+    try {
+      await fs.access(errorLogPath);
+    } catch {
+      try {
+        const logHeader = `# DROP Platform Error Log\n# Started: ${new Date().toISOString()}\n`;
+        await fs.writeFile(errorLogPath, logHeader);
+      } catch (error) {
+        this.log('debug', 'Failed to create error log file', error);
       }
     }
   }
