@@ -5,26 +5,69 @@
  * DROP services and their lifecycle.
  */
 
-import { EventBus, eventBus } from './event-bus';
+import * as path from 'path';
+import { EventBus, eventBus, Unsubscribe } from './event-bus';
+import { WatcherService } from './watcher';
+import { DetectorService, getDetector } from './detector';
+import { BuilderService, getBuilder } from './builder';
+import { RouterService, getRouterService, resetRouterService } from './router';
+import { ProcessManager, getProcessManager, resetProcessManager } from '../managers/process';
 
 export interface PlatformConfig {
+  /** Root directory for DROP */
   dropRoot: string;
+  /** Directory where apps are dropped */
   appsDirectory: string;
+  /** Log level */
   logLevel: 'debug' | 'info' | 'warn' | 'error';
+  /** Default port range start */
+  portRangeStart: number;
+  /** Default port range end */
+  portRangeEnd: number;
+  /** Auto-build on detection */
+  autoBuild: boolean;
+  /** Auto-start after build */
+  autoStart: boolean;
+  /** Caddyfile path for router */
+  caddyfilePath: string;
 }
+
+const DEFAULT_CONFIG: PlatformConfig = {
+  dropRoot: '/var/drop',
+  appsDirectory: '/var/drop/apps',
+  logLevel: 'info',
+  portRangeStart: 3001,
+  portRangeEnd: 3999,
+  autoBuild: true,
+  autoStart: true,
+  caddyfilePath: '/etc/caddy/Caddyfile',
+};
 
 export class DropPlatform {
   private readonly config: PlatformConfig;
   private readonly eventBus: EventBus;
+
+  private watcher: WatcherService | null = null;
+  private detector: DetectorService | null = null;
+  private builder: BuilderService | null = null;
+  private processManager: ProcessManager | null = null;
+  private router: RouterService | null = null;
+
+  private subscriptions: Unsubscribe[] = [];
   private isRunning = false;
+  private nextPort: number;
+  private usedPorts: Set<number> = new Set();
 
   constructor(config?: Partial<PlatformConfig>) {
     this.config = {
-      dropRoot: config?.dropRoot ?? process.env.DROP_ROOT ?? '/var/drop',
-      appsDirectory: config?.appsDirectory ?? process.env.DROP_APPS_DIR ?? '/var/drop/apps',
-      logLevel: config?.logLevel ?? (process.env.DROP_LOG_LEVEL as PlatformConfig['logLevel']) ?? 'info',
+      ...DEFAULT_CONFIG,
+      dropRoot: config?.dropRoot ?? process.env.DROP_ROOT ?? DEFAULT_CONFIG.dropRoot,
+      appsDirectory: config?.appsDirectory ?? process.env.DROP_APPS_DIR ?? DEFAULT_CONFIG.appsDirectory,
+      logLevel: config?.logLevel ?? (process.env.DROP_LOG_LEVEL as PlatformConfig['logLevel']) ?? DEFAULT_CONFIG.logLevel,
+      ...config,
     };
     this.eventBus = eventBus;
+    this.nextPort = this.config.portRangeStart;
   }
 
   async start(): Promise<void> {
@@ -32,27 +75,32 @@ export class DropPlatform {
       throw new Error('DROP platform is already running');
     }
 
-    console.log('Starting DROP platform...');
-    console.log(`  Drop root: ${this.config.dropRoot}`);
-    console.log(`  Apps directory: ${this.config.appsDirectory}`);
-    console.log(`  Log level: ${this.config.logLevel}`);
+    this.log('info', 'Starting DROP platform...');
+    this.log('info', `  Drop root: ${this.config.dropRoot}`);
+    this.log('info', `  Apps directory: ${this.config.appsDirectory}`);
 
-    // Initialize services in order
-    // 1. Event Bus is already initialized (singleton)
-    this.eventBus.publish('platform:starting', { config: this.config });
+    this.eventBus.publish('platform:starting', { config: this.config as unknown as Record<string, unknown> });
 
-    // TODO: Initialize services in order:
-    // 2. App Registry (database connection)
-    // 3. Watcher Service
-    // 4. Detector Service
-    // 5. Builder Service
-    // 6. Process Manager
-    // 7. Reverse Proxy
-    // 8. API Server
-    // 9. CLI Server
+    try {
+      // Initialize services
+      await this.initializeServices();
 
-    this.isRunning = true;
-    this.eventBus.publish('platform:started', { timestamp: new Date() });
+      // Wire up event handlers
+      this.setupEventHandlers();
+
+      // Start watching for apps
+      if (this.watcher) {
+        await this.watcher.start();
+      }
+
+      this.isRunning = true;
+      this.eventBus.publish('platform:started', { timestamp: new Date() });
+      this.log('info', 'DROP platform started successfully');
+    } catch (error) {
+      this.log('error', 'Failed to start platform', error);
+      await this.stop();
+      throw error;
+    }
   }
 
   async stop(): Promise<void> {
@@ -60,23 +108,225 @@ export class DropPlatform {
       return;
     }
 
-    console.log('Stopping DROP platform...');
+    this.log('info', 'Stopping DROP platform...');
     this.eventBus.publish('platform:stopping', { timestamp: new Date() });
 
-    // TODO: Stop services in reverse order:
-    // 1. CLI Server
-    // 2. API Server
-    // 3. Reverse Proxy
-    // 4. Process Manager
-    // 5. Builder Service
-    // 6. Detector Service
-    // 7. Watcher Service
-    // 8. App Registry (close database connections)
+    // Unsubscribe from all events
+    for (const unsub of this.subscriptions) {
+      unsub();
+    }
+    this.subscriptions = [];
+
+    // Stop services in reverse order
+    if (this.watcher) {
+      await this.watcher.stop();
+    }
+
+    if (this.router) {
+      this.router.stop();
+      resetRouterService();
+    }
+
+    if (this.processManager) {
+      this.processManager.disconnect();
+      resetProcessManager();
+    }
 
     this.isRunning = false;
     this.eventBus.publish('platform:stopped', { timestamp: new Date() });
+    this.log('info', 'DROP platform stopped');
   }
 
+  private async initializeServices(): Promise<void> {
+    // Initialize detector
+    this.detector = getDetector();
+
+    // Initialize builder
+    this.builder = getBuilder();
+
+    // Initialize process manager
+    this.processManager = getProcessManager();
+
+    // Initialize router
+    this.router = getRouterService({
+      caddy: {
+        caddyfilePath: this.config.caddyfilePath,
+        autoReload: true,
+      },
+    });
+
+    // Initialize watcher (watches apps directory)
+    this.watcher = new WatcherService({
+      appsDir: this.config.appsDirectory,
+      ignorePatterns: ['**/node_modules/**', '**/.git/**', '**/dist/**', '**/build/**'],
+      debounceMs: 1000,
+      maxDepth: 2,
+    });
+  }
+
+  private setupEventHandlers(): void {
+    // When watcher detects a new directory, detect the app type
+    const watcherSub = this.eventBus.subscribe('watcher:change', async (payload) => {
+      if (payload.changeType === 'addDir' && this.isTopLevelApp(payload.path)) {
+        await this.handleNewApp(payload.path);
+      }
+    });
+    this.subscriptions.push(watcherSub);
+
+    // When app is detected, build it
+    const detectedSub = this.eventBus.subscribe('app:detected', async (payload) => {
+      if (this.config.autoBuild && payload.type !== 'unknown') {
+        await this.handleBuildApp(payload.path, payload.name, payload.type as string);
+      }
+    });
+    this.subscriptions.push(detectedSub);
+
+    // When build completes, start the app
+    const buildSub = this.eventBus.subscribe('build:completed', async (payload) => {
+      if (this.config.autoStart) {
+        await this.handleStartApp(payload.appId);
+      }
+    });
+    this.subscriptions.push(buildSub);
+
+    // When app starts, configure routing
+    const startedSub = this.eventBus.subscribe('app:started', async (payload) => {
+      await this.handleConfigureRoute(payload.name, payload.port);
+    });
+    this.subscriptions.push(startedSub);
+  }
+
+  private isTopLevelApp(appPath: string): boolean {
+    const relative = path.relative(this.config.appsDirectory, appPath);
+    return !relative.includes(path.sep) && relative.length > 0;
+  }
+
+  private async handleNewApp(appPath: string): Promise<void> {
+    const appName = path.basename(appPath);
+    this.log('info', `New app detected: ${appName}`);
+
+    if (!this.detector) return;
+
+    try {
+      const result = await this.detector.detect(appPath);
+      this.log('info', `Detected ${appName} as ${result.type} (confidence: ${result.confidence})`);
+    } catch (error) {
+      this.log('error', `Failed to detect app type for ${appName}`, error);
+    }
+  }
+
+  private async handleBuildApp(appPath: string, appName: string, _appType: string): Promise<void> {
+    if (!this.builder || !this.detector) return;
+
+    this.log('info', `Building ${appName}...`);
+
+    try {
+      const detection = await this.detector.detect(appPath);
+
+      const result = await this.builder.build({
+        appName,
+        appPath,
+        appType: detection.type,
+        framework: detection.framework || null,
+        config: {
+          buildCommand: detection.suggestedConfig?.buildCommand,
+          installCommand: detection.suggestedConfig?.installCommand,
+        },
+        env: {},
+      });
+
+      if (result.success) {
+        this.log('info', `Build completed for ${appName} in ${result.duration}ms`);
+      } else {
+        this.log('error', `Build failed for ${appName}: ${result.errors?.[0]?.message}`);
+      }
+    } catch (error) {
+      this.log('error', `Build failed for ${appName}`, error);
+    }
+  }
+
+  private async handleStartApp(appName: string): Promise<void> {
+    if (!this.processManager || !this.detector) return;
+
+    const appPath = path.join(this.config.appsDirectory, appName);
+
+    try {
+      const detection = await this.detector.detect(appPath);
+      const port = this.allocatePort();
+
+      this.log('info', `Starting ${appName} on port ${port}...`);
+
+      const status = await this.processManager.start({
+        name: appName,
+        script: detection.suggestedConfig?.startCommand || 'npm start',
+        cwd: appPath,
+        port,
+        env: { NODE_ENV: 'production' },
+      });
+
+      this.log('info', `Started ${appName} (PID: ${status.pid})`);
+    } catch (error) {
+      this.log('error', `Failed to start ${appName}`, error);
+    }
+  }
+
+  private async handleConfigureRoute(appName: string, port: number): Promise<void> {
+    if (!this.router || !port) return;
+
+    try {
+      const hostname = `${appName}.localhost`;
+
+      await this.router.addRoute({
+        appName,
+        hostname,
+        upstream: `localhost:${port}`,
+        ssl: false,
+        redirectHttps: false,
+      });
+
+      this.log('info', `Route configured: ${hostname} -> localhost:${port}`);
+    } catch (error) {
+      // Route might already exist
+      this.log('warn', `Failed to configure route for ${appName}`, error);
+    }
+  }
+
+  private allocatePort(): number {
+    while (this.usedPorts.has(this.nextPort) && this.nextPort <= this.config.portRangeEnd) {
+      this.nextPort++;
+    }
+
+    if (this.nextPort > this.config.portRangeEnd) {
+      throw new Error('No available ports in configured range');
+    }
+
+    const port = this.nextPort;
+    this.usedPorts.add(port);
+    this.nextPort++;
+    return port;
+  }
+
+  releasePort(port: number): void {
+    this.usedPorts.delete(port);
+  }
+
+  private log(level: 'debug' | 'info' | 'warn' | 'error', message: string, error?: unknown): void {
+    const levels = { debug: 0, info: 1, warn: 2, error: 3 };
+    if (levels[level] >= levels[this.config.logLevel]) {
+      const timestamp = new Date().toISOString();
+      const prefix = `[${timestamp}] [${level.toUpperCase()}]`;
+
+      if (level === 'error') {
+        console.error(`${prefix} ${message}`, error || '');
+      } else if (level === 'warn') {
+        console.warn(`${prefix} ${message}`, error || '');
+      } else {
+        console.log(`${prefix} ${message}`);
+      }
+    }
+  }
+
+  // Public accessors
   getEventBus(): EventBus {
     return this.eventBus;
   }
@@ -84,4 +334,33 @@ export class DropPlatform {
   getConfig(): PlatformConfig {
     return { ...this.config };
   }
+
+  getWatcher(): WatcherService | null {
+    return this.watcher;
+  }
+
+  getDetector(): DetectorService | null {
+    return this.detector;
+  }
+
+  getBuilder(): BuilderService | null {
+    return this.builder;
+  }
+
+  getProcessManager(): ProcessManager | null {
+    return this.processManager;
+  }
+
+  getRouter(): RouterService | null {
+    return this.router;
+  }
+
+  isActive(): boolean {
+    return this.isRunning;
+  }
+}
+
+// Factory function
+export function createPlatform(config?: Partial<PlatformConfig>): DropPlatform {
+  return new DropPlatform(config);
 }
