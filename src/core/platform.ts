@@ -13,6 +13,7 @@ import { DetectorService, getDetector } from './detector';
 import { BuilderService, getBuilder } from './builder';
 import { RouterService, getRouterService, resetRouterService } from './router';
 import { ProcessManager, getProcessManager, resetProcessManager } from '../managers/process';
+import { Logger, createLogger } from '../utils/logger';
 
 export interface PlatformConfig {
   /** Root directory for DROP */
@@ -55,6 +56,7 @@ const DEFAULT_CONFIG: PlatformConfig = {
 export class DropPlatform {
   private readonly config: PlatformConfig;
   private readonly eventBus: EventBus;
+  private readonly logger: Logger;
 
   private watcher: WatcherService | null = null;
   private detector: DetectorService | null = null;
@@ -78,6 +80,13 @@ export class DropPlatform {
     };
     this.eventBus = eventBus;
     this.nextPort = this.config.portRangeStart;
+
+    // Initialize logger (console only initially, file logging enabled after dirs created)
+    this.logger = createLogger({
+      level: this.config.logLevel,
+      console: true,
+      file: false,
+    });
   }
 
   async start(): Promise<void> {
@@ -85,15 +94,19 @@ export class DropPlatform {
       throw new Error('DROP platform is already running');
     }
 
-    this.log('info', 'Starting DROP platform...');
-    this.log('info', `  Drop root: ${this.config.dropRoot}`);
-    this.log('info', `  Apps directory: ${this.config.appsDirectory}`);
+    this.logger.platformEvent('starting');
+    this.logger.info(`Drop root: ${this.config.dropRoot}`, 'CONFIG');
+    this.logger.info(`Apps directory: ${this.config.appsDirectory}`, 'CONFIG');
 
     this.eventBus.publish('platform:starting', { config: this.config as unknown as Record<string, unknown> });
 
     try {
       // Ensure required directories exist
       await this.ensureDirectories();
+
+      // Enable file logging now that directories exist
+      const logDir = path.join(this.config.dropRoot, 'data', 'logs', 'drop-svc');
+      this.logger.enableFileLogging(logDir);
 
       // Initialize services
       await this.initializeServices();
@@ -108,9 +121,9 @@ export class DropPlatform {
 
       this.isRunning = true;
       this.eventBus.publish('platform:started', { timestamp: new Date() });
-      this.log('info', 'DROP platform started successfully');
+      this.logger.platformEvent('started');
     } catch (error) {
-      this.log('error', 'Failed to start platform', error);
+      this.logger.platformEvent('error', error instanceof Error ? error.message : String(error));
       await this.stop();
       throw error;
     }
@@ -121,7 +134,7 @@ export class DropPlatform {
       return;
     }
 
-    this.log('info', 'Stopping DROP platform...');
+    this.logger.platformEvent('stopping');
     this.eventBus.publish('platform:stopping', { timestamp: new Date() });
 
     // Unsubscribe from all events
@@ -147,7 +160,8 @@ export class DropPlatform {
 
     this.isRunning = false;
     this.eventBus.publish('platform:stopped', { timestamp: new Date() });
-    this.log('info', 'DROP platform stopped');
+    this.logger.platformEvent('stopped');
+    this.logger.close();
   }
 
   private async ensureDirectories(): Promise<void> {
@@ -425,15 +439,15 @@ import ${path.join(dataDir, 'appconf', 'caddy', 'hosts', '*.caddy').replace(/\\/
 
   private async handleNewApp(appPath: string): Promise<void> {
     const appName = path.basename(appPath);
-    this.log('info', `New app detected: ${appName}`);
+    this.logger.appEvent('detected', appName);
 
     if (!this.detector) return;
 
     try {
       const result = await this.detector.detect(appPath);
-      this.log('info', `Detected ${appName} as ${result.type} (confidence: ${result.confidence})`);
+      this.logger.info(`Detected ${appName} as ${result.type} (confidence: ${result.confidence})`, 'DETECTOR');
     } catch (error) {
-      this.log('error', `Failed to detect app type for ${appName}`, error);
+      this.logger.error(`Failed to detect app type for ${appName}`, 'DETECTOR', error);
     }
   }
 
@@ -442,12 +456,12 @@ import ${path.join(dataDir, 'appconf', 'caddy', 'hosts', '*.caddy').replace(/\\/
 
     // Skip if already processing this app
     if (this.appsInProgress.has(appName)) {
-      this.log('debug', `Skipping ${appName} - already in progress`);
+      this.logger.debug(`Skipping ${appName} - already in progress`, 'BUILD');
       return;
     }
     this.appsInProgress.add(appName);
 
-    this.log('info', `Building ${appName}...`);
+    this.logger.appEvent('building', appName);
 
     try {
       const detection = await this.detector.detect(appPath);
@@ -465,13 +479,13 @@ import ${path.join(dataDir, 'appconf', 'caddy', 'hosts', '*.caddy').replace(/\\/
       });
 
       if (result.success) {
-        this.log('info', `Build completed for ${appName} in ${result.duration}ms`);
+        this.logger.appEvent('built', appName, `completed in ${result.duration}ms`);
       } else {
-        this.log('error', `Build failed for ${appName}: ${result.errors?.[0]?.message}`);
+        this.logger.appEvent('error', appName, result.errors?.[0]?.message || 'Build failed');
         this.appsInProgress.delete(appName);
       }
     } catch (error) {
-      this.log('error', `Build failed for ${appName}`, error);
+      this.logger.appEvent('error', appName, error instanceof Error ? error.message : 'Build failed');
       this.appsInProgress.delete(appName);
     }
   }
@@ -485,7 +499,7 @@ import ${path.join(dataDir, 'appconf', 'caddy', 'hosts', '*.caddy').replace(/\\/
       const detection = await this.detector.detect(appPath);
       const port = this.allocatePort();
 
-      this.log('info', `Starting ${appName} on port ${port}...`);
+      this.logger.appEvent('starting', appName, `port ${port}`);
 
       // Determine start command based on app type
       let script: string;
@@ -520,11 +534,11 @@ import ${path.join(dataDir, 'appconf', 'caddy', 'hosts', '*.caddy').replace(/\\/
         env: { NODE_ENV: 'production' },
       });
 
-      this.log('info', `Started ${appName} (PID: ${status.pid})`);
+      this.logger.appEvent('started', appName, `PID ${status.pid}, port ${port}`);
       // App is fully deployed now
       this.appsInProgress.delete(appName);
     } catch (error) {
-      this.log('error', `Failed to start ${appName}`, error);
+      this.logger.appEvent('error', appName, error instanceof Error ? error.message : 'Failed to start');
       this.appsInProgress.delete(appName);
     }
   }
@@ -543,10 +557,10 @@ import ${path.join(dataDir, 'appconf', 'caddy', 'hosts', '*.caddy').replace(/\\/
         redirectHttps: false,
       });
 
-      this.log('info', `Route configured: ${hostname} -> localhost:${port}`);
+      this.logger.info(`Route configured: ${hostname} -> localhost:${port}`, 'ROUTER');
     } catch (error) {
       // Route might already exist
-      this.log('warn', `Failed to configure route for ${appName}`, error);
+      this.logger.warn(`Failed to configure route for ${appName}`, 'ROUTER', error);
     }
   }
 
@@ -569,20 +583,9 @@ import ${path.join(dataDir, 'appconf', 'caddy', 'hosts', '*.caddy').replace(/\\/
     this.usedPorts.delete(port);
   }
 
+  /** @deprecated Use this.logger instead */
   private log(level: 'debug' | 'info' | 'warn' | 'error', message: string, error?: unknown): void {
-    const levels = { debug: 0, info: 1, warn: 2, error: 3 };
-    if (levels[level] >= levels[this.config.logLevel]) {
-      const timestamp = new Date().toISOString();
-      const prefix = `[${timestamp}] [${level.toUpperCase()}]`;
-
-      if (level === 'error') {
-        console.error(`${prefix} ${message}`, error || '');
-      } else if (level === 'warn') {
-        console.warn(`${prefix} ${message}`, error || '');
-      } else {
-        console.log(`${prefix} ${message}`);
-      }
-    }
+    this.logger.log(level, message, undefined, error);
   }
 
   // Public accessors

@@ -6,6 +6,7 @@
  */
 
 import * as fs from 'fs/promises';
+import * as fsSync from 'fs';
 import { eventBus } from '../../core/event-bus';
 import {
   ProcessConfig,
@@ -282,6 +283,120 @@ export class ProcessManager {
     }
 
     return logs;
+  }
+
+  /**
+   * Stream logs for a process (follow mode)
+   * Returns a function to stop streaming
+   */
+  async streamLogs(
+    name: string,
+    onLine: (line: string, type: 'out' | 'err') => void,
+    onError?: (error: Error) => void
+  ): Promise<() => void> {
+    const status = await this.getStatus(name);
+    if (!status) {
+      throw new Error(`Process not found: ${name}`);
+    }
+
+    const descriptions = await pm2Client.describe(name);
+    if (!descriptions || descriptions.length === 0) {
+      throw new Error(`No log files found for: ${name}`);
+    }
+
+    const env = descriptions[0].pm2_env;
+    const outLogPath = env?.pm_out_log_path;
+    const errLogPath = env?.pm_err_log_path;
+
+    const watchers: fsSync.FSWatcher[] = [];
+    const streams: fsSync.ReadStream[] = [];
+
+    const watchFile = (filePath: string, type: 'out' | 'err'): void => {
+      try {
+        // Get current file size to start reading from end
+        const stats = fsSync.statSync(filePath);
+        let position = stats.size;
+
+        // Watch for changes
+        const watcher = fsSync.watch(filePath, (eventType) => {
+          if (eventType === 'change') {
+            // Read new content
+            const newStats = fsSync.statSync(filePath);
+            if (newStats.size > position) {
+              const stream = fsSync.createReadStream(filePath, {
+                start: position,
+                end: newStats.size - 1,
+                encoding: 'utf-8',
+              });
+
+              let buffer = '';
+              stream.on('data', (chunk) => {
+                buffer += chunk;
+                const lines = buffer.split('\n');
+                buffer = lines.pop() || '';
+                for (const line of lines) {
+                  if (line.trim()) {
+                    onLine(line, type);
+                  }
+                }
+              });
+
+              stream.on('end', () => {
+                if (buffer.trim()) {
+                  onLine(buffer, type);
+                }
+                position = newStats.size;
+              });
+
+              stream.on('error', (err) => {
+                onError?.(err);
+              });
+
+              streams.push(stream);
+            }
+          }
+        });
+
+        watchers.push(watcher);
+      } catch (err) {
+        // File might not exist yet
+        onError?.(err instanceof Error ? err : new Error(String(err)));
+      }
+    };
+
+    // Start watching both log files
+    if (outLogPath) {
+      watchFile(outLogPath, 'out');
+    }
+    if (errLogPath) {
+      watchFile(errLogPath, 'err');
+    }
+
+    // Return cleanup function
+    return () => {
+      for (const watcher of watchers) {
+        watcher.close();
+      }
+      for (const stream of streams) {
+        stream.destroy();
+      }
+    };
+  }
+
+  /**
+   * Get log file paths for a process
+   */
+  async getLogPaths(name: string): Promise<{ out?: string; err?: string }> {
+    const descriptions = await pm2Client.describe(name);
+    if (!descriptions || descriptions.length === 0) {
+      return {};
+    }
+
+    const env = descriptions[0].pm2_env;
+    return {
+      out: env?.pm_out_log_path,
+      err: env?.pm_err_log_path,
+    };
   }
 
   /**
