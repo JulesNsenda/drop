@@ -1,0 +1,87 @@
+# Dependencies
+node_modules/
+.pnp
+.pnp.js
+
+# Build outputs
+dist/
+build/
+out/
+*.tsbuildinfo
+
+# Environment files
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+.env*.local
+
+# Secrets
+secrets/
+*.pem
+*.key
+encryption.key
+
+# IDE
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+!.vscode/launch.json
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+lerna-debug.log*
+
+# Test coverage
+coverage/
+.nyc_output/
+
+# Temporary files
+tmp/
+temp/
+.cache/
+
+# DROP platform data (local development)
+/var/drop/
+data/
+*.db
+*.sqlite
+*.sqlite3
+
+# Claude Code local settings (user-specific)
+.claude/settings.local.json
+
+# Package manager locks (choose one and keep it)
+# package-lock.json
+# yarn.lock
+# pnpm-lock.yaml
+
+# Docker
+docker-compose.override.yml
+
+# Misc
+*.bak
+*.backup
+.eslintcache
+.stylelintcache
+
+# Reference repositories (external)
+docs
+docs/**
+docs/.reference/
+docs/.reference/**
+

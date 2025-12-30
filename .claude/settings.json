@@ -1,0 +1,106 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm run:*)",
+      "Bash(npm test:*)",
+      "Bash(npm install:*)",
+      "Bash(npm run lint)",
+      "Bash(npm run build)",
+      "Bash(npm run dev)",
+      "Bash(npx prettier:*)",
+      "Bash(npx eslint:*)",
+      "Bash(npx jest:*)",
+      "Bash(npx tsc:*)",
+      "Bash(git status)",
+      "Bash(git diff:*)",
+      "Bash(git log:*)",
+      "Bash(git branch:*)",
+      "Bash(git checkout:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git merge:*)",
+      "Bash(git rebase:*)",
+      "Bash(git stash:*)",
+      "Bash(git fetch:*)",
+      "Bash(git pull:*)",
+      "Bash(gh pr:*)",
+      "Bash(gh issue:*)",
+      "Read(./src/**)",
+      "Read(./tests/**)",
+      "Read(./docs/**)",
+      "Read(./tsconfig.json)",
+      "Read(./package.json)",
+      "Read(./README.md)",
+      "Read(./.eslintrc*)",
+      "Read(./.prettierrc*)",
+      "Read(./jest.config*)",
+      "Edit(./src/**)",
+      "Edit(./tests/**)",
+      "Edit(./docs/**)",
+      "WebFetch(https://nodejs.org/*)",
+      "WebFetch(https://www.npmjs.com/*)",
+      "WebFetch(https://github.com/*)",
+      "WebFetch(https://api.github.com/*)",
+      "WebFetch(https://www.typescriptlang.org/*)",
+      "WebFetch(https://hono.dev/*)",
+      "WebFetch(https://caddyserver.com/*)"
+    ],
+    "deny": [
+      "Read(./.env)",
+      "Read(./.env.*)",
+      "Read(./.env.local)",
+      "Read(./secrets/**)",
+      "Read(./.git/objects/**)",
+      "Read(./node_modules/**)",
+      "Edit(./.git/**)",
+      "Edit(./node_modules/**)",
+      "Edit(package-lock.json)",
+      "Bash(curl:*)",
+      "Bash(wget:*)",
+      "Bash(rm -rf /)",
+      "Bash(sudo:*)",
+      "Bash(chmod 777:*)",
+      "WebFetch(http://*)"
+    ],
+    "ask": [
+      "Bash(git push:*)",
+      "Bash(git push --force:*)",
+      "Bash(npm publish:*)",
+      "Bash(docker:*)",
+      "Write(./package.json)",
+      "Edit(./package.json)",
+      "Write(./tsconfig.json)",
+      "Edit(./tsconfig.json)"
+    ]
+  },
+  "env": {
+    "NODE_ENV": "development",
+    "TS_NODE_PROJECT": "./tsconfig.json",
+    "DROP_LOG_LEVEL": "debug"
+  },
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node -e \"const p=process.env.CLAUDE_FILE_PATH||''; if(p.endsWith('.ts')||p.endsWith('.tsx')||p.endsWith('.js')||p.endsWith('.jsx')||p.endsWith('.json')) { require('child_process').execSync('npx prettier --write ' + p, {stdio:'inherit'}); }\""
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node -e \"const p=process.env.CLAUDE_FILE_PATH||''; if(p.includes('.env')||p.includes('secret')||p.includes('credential')) { process.exit(2); }\""
+          }
+        ]
+      }
+    ]
+  },
+  "enableAllProjectMcpServers": true
+}

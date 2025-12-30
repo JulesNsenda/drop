@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "filesystem": {
+      "type": "stdio",
+      "command": "npx",
+      "args": [
+        "-y",
+        "@anthropic/mcp-server-filesystem",
+        "./src",
+        "./tests",
+        "./docs"
+      ]
+    }
+  }
+}
