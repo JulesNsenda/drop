@@ -57,6 +57,7 @@ export class DropPlatform {
   private isRunning = false;
   private nextPort: number;
   private usedPorts: Set<number> = new Set();
+  private appsInProgress: Set<string> = new Set(); // Track apps being built/started
 
   constructor(config?: Partial<PlatformConfig>) {
     this.config = {
@@ -198,7 +199,16 @@ export class DropPlatform {
 
   private isTopLevelApp(appPath: string): boolean {
     const relative = path.relative(this.config.appsDirectory, appPath);
-    return !relative.includes(path.sep) && relative.length > 0;
+    // Must be a direct child (no path separators), non-empty, and not a parent reference
+    if (!relative || relative.includes(path.sep) || relative.startsWith('..')) {
+      return false;
+    }
+    // Skip hidden directories and invalid names
+    const basename = path.basename(appPath);
+    if (basename.startsWith('.') || basename === 'node_modules') {
+      return false;
+    }
+    return true;
   }
 
   private async handleNewApp(appPath: string): Promise<void> {
@@ -217,6 +227,13 @@ export class DropPlatform {
 
   private async handleBuildApp(appPath: string, appName: string, _appType: string): Promise<void> {
     if (!this.builder || !this.detector) return;
+
+    // Skip if already processing this app
+    if (this.appsInProgress.has(appName)) {
+      this.log('debug', `Skipping ${appName} - already in progress`);
+      return;
+    }
+    this.appsInProgress.add(appName);
 
     this.log('info', `Building ${appName}...`);
 
@@ -239,9 +256,11 @@ export class DropPlatform {
         this.log('info', `Build completed for ${appName} in ${result.duration}ms`);
       } else {
         this.log('error', `Build failed for ${appName}: ${result.errors?.[0]?.message}`);
+        this.appsInProgress.delete(appName);
       }
     } catch (error) {
       this.log('error', `Build failed for ${appName}`, error);
+      this.appsInProgress.delete(appName);
     }
   }
 
@@ -265,8 +284,11 @@ export class DropPlatform {
       });
 
       this.log('info', `Started ${appName} (PID: ${status.pid})`);
+      // App is fully deployed now
+      this.appsInProgress.delete(appName);
     } catch (error) {
       this.log('error', `Failed to start ${appName}`, error);
+      this.appsInProgress.delete(appName);
     }
   }
 
