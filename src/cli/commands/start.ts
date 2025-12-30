@@ -7,7 +7,7 @@
 import { Command } from 'commander';
 import { ProcessOptions } from '../cli.types';
 import * as output from '../utils/output';
-import { getProcessManager } from '../../managers/process';
+import { getProcessManager, resetProcessManager } from '../../managers/process';
 
 export function createStartCommand(): Command {
   const cmd = new Command('start')
@@ -29,6 +29,7 @@ export function createStartCommand(): Command {
 
         if (status.status === 'online') {
           spin.succeed(`${appName} is already running`);
+          resetProcessManager();
           return;
         }
 
@@ -43,10 +44,14 @@ export function createStartCommand(): Command {
           }
         } else {
           spin.fail(`Failed to start ${appName}`);
+          resetProcessManager();
           process.exit(1);
         }
+
+        resetProcessManager();
       } catch (err) {
         spin.fail(`Failed to start ${appName}`);
+        resetProcessManager();
         output.error('', err instanceof Error ? err : undefined);
         process.exit(1);
       }

@@ -7,7 +7,7 @@
 import { Command } from 'commander';
 import { ListOptions, AppInfo } from '../cli.types';
 import * as output from '../utils/output';
-import { getProcessManager } from '../../managers/process';
+import { getProcessManager, resetProcessManager } from '../../managers/process';
 
 export function createListCommand(): Command {
   const cmd = new Command('list')
@@ -47,6 +47,7 @@ export function createListCommand(): Command {
           } else {
             output.info('No applications found');
           }
+          resetProcessManager();
           return;
         }
 
@@ -74,7 +75,11 @@ export function createListCommand(): Command {
             }))
           );
         }
+
+        // Disconnect from PM2 to allow process to exit
+        resetProcessManager();
       } catch (err) {
+        resetProcessManager();
         output.error('Failed to list applications', err instanceof Error ? err : undefined);
         process.exit(1);
       }

@@ -75,7 +75,7 @@ You should see:
 ```
 [INFO] Starting DROP platform...
 [INFO]   Drop root: C:\drop  (or /var/drop on Linux)
-[INFO]   Apps directory: C:\drop\webapps
+[INFO]   Apps directory: C:\drop\data\webapps
 [INFO] DROP platform started successfully
 ```
 
@@ -86,19 +86,19 @@ While DROP is running, copy your application to the webapps directory:
 **Windows:**
 ```powershell
 # Deploy a Node.js app
-xcopy my-app C:\drop\webapps\my-app\ /E /I
+xcopy my-app C:\drop\data\webapps\my-app\ /E /I
 
 # Deploy a static site
-xcopy my-site C:\drop\webapps\my-site\ /E /I
+xcopy my-site C:\drop\data\webapps\my-site\ /E /I
 ```
 
 **Linux/macOS:**
 ```bash
 # Deploy a Node.js app
-cp -r my-app /var/drop/webapps/
+cp -r my-app /var/drop/data/webapps/
 
 # Deploy a static site
-cp -r my-site /var/drop/webapps/
+cp -r my-site /var/drop/data/webapps/
 ```
 
 ### 3. Access Your Application
@@ -126,17 +126,26 @@ DROP uses platform-appropriate defaults:
 
 | Platform | DROP Root | Webapps Directory |
 |----------|-----------|-------------------|
-| Windows | `C:\drop` | `C:\drop\webapps` |
-| Linux/macOS | `/var/drop` | `/var/drop/webapps` |
+| Windows | `C:\drop` | `C:\drop\data\webapps` |
+| Linux/macOS | `/var/drop` | `/var/drop/data/webapps` |
 
 All directories are created automatically on startup:
 ```
 C:\drop\                      # DROP_ROOT (Windows)
 /var/drop/                    # DROP_ROOT (Linux/macOS)
-├── webapps/                  # Your deployed applications
-├── data/                     # Platform data (Caddyfile, etc.)
-├── logs/                     # Application logs
-└── temp/                     # Temporary files
+├── apps/
+│   └── drop-svc/             # Platform files (replaced during upgrade)
+└── data/                     # User data (preserved during upgrade)
+    ├── webapps/              # Your deployed applications
+    ├── drop-svc/             # Platform state (drop.db, encryption.key)
+    ├── db/                   # App databases (SQLite/PostgreSQL)
+    ├── appdata/              # Per-app persistent data
+    ├── logs/                 # All logs
+    │   ├── drop-svc/         # Platform logs
+    │   └── webapps/          # Application logs
+    ├── appconf/              # Configuration files (Caddyfile, etc.)
+    ├── backup/               # Automated backups
+    └── temp/                 # Temporary files
 ```
 
 ## Environment Variables (Optional)
@@ -146,7 +155,7 @@ Override defaults with environment variables:
 **Windows (PowerShell):**
 ```powershell
 $env:DROP_ROOT = "D:\my-drop"
-$env:DROP_APPS_DIR = "D:\my-drop\apps"
+$env:DROP_APPS_DIR = "D:\my-drop\data\webapps"
 $env:DROP_LOG_LEVEL = "debug"
 node dist/index.js
 ```
@@ -154,7 +163,7 @@ node dist/index.js
 **Linux/macOS:**
 ```bash
 export DROP_ROOT=/opt/drop
-export DROP_APPS_DIR=/opt/drop/apps
+export DROP_APPS_DIR=/opt/drop/data/webapps
 export DROP_LOG_LEVEL=debug
 node dist/index.js
 ```
@@ -162,7 +171,7 @@ node dist/index.js
 | Variable | Default (Windows) | Default (Linux) | Description |
 |----------|-------------------|-----------------|-------------|
 | `DROP_ROOT` | `C:\drop` | `/var/drop` | Base directory |
-| `DROP_APPS_DIR` | `C:\drop\webapps` | `/var/drop/webapps` | Apps directory |
+| `DROP_APPS_DIR` | `C:\drop\data\webapps` | `/var/drop/data/webapps` | Apps directory |
 | `DROP_LOG_LEVEL` | `info` | `info` | Log level: debug, info, warn, error |
 
 ## CLI Commands
@@ -254,21 +263,21 @@ DROP includes sample applications for testing:
 **Static Site:**
 ```powershell
 # Windows
-xcopy drop-test\sample-static C:\drop\webapps\my-site\ /E /I
+xcopy drop-test\sample-static C:\drop\data\webapps\my-site\ /E /I
 ```
 ```bash
 # Linux/macOS
-cp -r drop-test/sample-static /var/drop/webapps/my-site
+cp -r drop-test/sample-static /var/drop/data/webapps/my-site
 ```
 
 **Node.js App:**
 ```powershell
 # Windows
-xcopy drop-test\sample-nodejs C:\drop\webapps\my-app\ /E /I
+xcopy drop-test\sample-nodejs C:\drop\data\webapps\my-app\ /E /I
 ```
 ```bash
 # Linux/macOS
-cp -r drop-test/sample-nodejs /var/drop/webapps/my-app
+cp -r drop-test/sample-nodejs /var/drop/data/webapps/my-app
 ```
 
 ## Development
@@ -294,6 +303,7 @@ npm run format       # Format code
 
 ### Permission denied (Linux/macOS)
 ```bash
+sudo mkdir -p /var/drop
 sudo chown -R $USER /var/drop
 ```
 

@@ -36,8 +36,10 @@ export interface PlatformConfig {
 // Determine platform-appropriate defaults
 const isWindows = process.platform === 'win32';
 const DEFAULT_DROP_ROOT = isWindows ? 'C:\\drop' : '/var/drop';
-const DEFAULT_APPS_DIR = isWindows ? 'C:\\drop\\webapps' : '/var/drop/webapps';
-const DEFAULT_CADDYFILE = isWindows ? 'C:\\drop\\data\\Caddyfile' : '/etc/caddy/Caddyfile';
+const DEFAULT_APPS_DIR = isWindows ? 'C:\\drop\\data\\webapps' : '/var/drop/data/webapps';
+const DEFAULT_CADDYFILE = isWindows
+  ? 'C:\\drop\\data\\appconf\\Caddyfile'
+  : '/var/drop/data/appconf/Caddyfile';
 
 const DEFAULT_CONFIG: PlatformConfig = {
   dropRoot: DEFAULT_DROP_ROOT,
@@ -149,22 +151,91 @@ export class DropPlatform {
   }
 
   private async ensureDirectories(): Promise<void> {
+    const dataDir = path.join(this.config.dropRoot, 'data');
+
+    // Directory structure per spec:
+    // /var/drop/
+    // ├── apps/drop-svc/          # Platform (replaced during upgrade)
+    // └── data/                   # User data (preserved during upgrade)
+    //     ├── webapps/            # Deployed web applications
+    //     ├── drop-svc/           # Platform state (drop.db, encryption.key)
+    //     ├── db/                 # App databases (SQLite/PostgreSQL)
+    //     ├── appdata/            # Per-app persistent data
+    //     ├── logs/               # All logs
+    //     ├── appconf/            # Configuration files
+    //     ├── backup/             # Automated backups
+    //     └── temp/               # Temporary files
+
     const directories = [
+      // Root
       this.config.dropRoot,
-      this.config.appsDirectory,
-      path.join(this.config.dropRoot, 'data'),
-      path.join(this.config.dropRoot, 'logs'),
-      path.join(this.config.dropRoot, 'temp'),
+      // Platform directory (for future use)
+      path.join(this.config.dropRoot, 'apps', 'drop-svc'),
+      // Data directories (preserved during upgrade)
+      dataDir,
+      this.config.appsDirectory, // data/webapps
+      path.join(dataDir, 'drop-svc'), // Platform state
+      path.join(dataDir, 'db'), // App databases
+      path.join(dataDir, 'appdata'), // Per-app persistent data
+      path.join(dataDir, 'logs'), // All logs
+      path.join(dataDir, 'logs', 'drop-svc'), // Platform logs
+      path.join(dataDir, 'logs', 'webapps'), // App logs
+      path.join(dataDir, 'appconf'), // Configuration files
+      path.join(dataDir, 'backup'), // Automated backups
+      path.join(dataDir, 'temp'), // Temporary files
     ];
 
     for (const dir of directories) {
       try {
         await fs.mkdir(dir, { recursive: true });
       } catch (error) {
-        // Ignore if directory already exists
         if ((error as NodeJS.ErrnoException).code !== 'EEXIST') {
           this.log('warn', `Failed to create directory: ${dir}`, error);
         }
+      }
+    }
+
+    // Create .gitkeep files to preserve empty directories
+    const keepDirs = [
+      path.join(dataDir, 'db'),
+      path.join(dataDir, 'appdata'),
+      path.join(dataDir, 'logs', 'webapps'),
+      path.join(dataDir, 'backup'),
+      path.join(dataDir, 'temp'),
+    ];
+
+    for (const dir of keepDirs) {
+      const keepFile = path.join(dir, '.gitkeep');
+      try {
+        await fs.access(keepFile);
+      } catch {
+        // File doesn't exist, create it
+        try {
+          await fs.writeFile(keepFile, '');
+        } catch (error) {
+          this.log('debug', `Failed to create .gitkeep in ${dir}`, error);
+        }
+      }
+    }
+
+    // Create initial Caddyfile if it doesn't exist
+    try {
+      await fs.access(this.config.caddyfilePath);
+    } catch {
+      try {
+        const initialCaddyfile = `# DROP Platform Caddyfile
+# Auto-generated - routes are added automatically when apps are deployed
+
+# Global options
+{
+    auto_https off
+    admin off
+}
+`;
+        await fs.writeFile(this.config.caddyfilePath, initialCaddyfile);
+        this.log('info', `Created initial Caddyfile at ${this.config.caddyfilePath}`);
+      } catch (error) {
+        this.log('warn', 'Failed to create initial Caddyfile', error);
       }
     }
   }
