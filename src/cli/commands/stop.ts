@@ -7,7 +7,7 @@
 import { Command } from 'commander';
 import { ProcessOptions } from '../cli.types';
 import * as output from '../utils/output';
-import { getProcessManager } from '../../managers/process';
+import { getProcessManager, resetProcessManager } from '../../managers/process';
 
 export function createStopCommand(): Command {
   const cmd = new Command('stop')
@@ -30,6 +30,7 @@ export function createStopCommand(): Command {
 
         if (status.status === 'stopped') {
           spin.succeed(`${appName} is already stopped`);
+          resetProcessManager();
           return;
         }
 
@@ -41,8 +42,11 @@ export function createStopCommand(): Command {
           const newStatus = await processManager.getStatus(appName);
           output.json(newStatus);
         }
+
+        resetProcessManager();
       } catch (err) {
         spin.fail(`Failed to stop ${appName}`);
+        resetProcessManager();
         output.error('', err instanceof Error ? err : undefined);
         process.exit(1);
       }

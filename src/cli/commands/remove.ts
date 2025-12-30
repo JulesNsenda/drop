@@ -7,7 +7,7 @@
 import { Command } from 'commander';
 import { RemoveOptions } from '../cli.types';
 import * as output from '../utils/output';
-import { getProcessManager } from '../../managers/process';
+import { getProcessManager, resetProcessManager } from '../../managers/process';
 
 export function createRemoveCommand(): Command {
   const cmd = new Command('remove')
@@ -52,7 +52,10 @@ export function createRemoveCommand(): Command {
         if (output.isJsonMode()) {
           output.json({ removed: appName, keepData: options.keepData ?? true });
         }
+
+        resetProcessManager();
       } catch (err) {
+        resetProcessManager();
         output.error('Failed to remove application', err instanceof Error ? err : undefined);
         process.exit(1);
       }

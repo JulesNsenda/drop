@@ -17,6 +17,7 @@ import {
   createRestartCommand,
   createDeployCommand,
   createRemoveCommand,
+  createServeCommand,
 } from './commands';
 
 const VERSION = '0.1.0-alpha.1';
@@ -44,6 +45,7 @@ function createProgram(): Command {
     });
 
   // Add commands
+  program.addCommand(createServeCommand());
   program.addCommand(createDeployCommand());
   program.addCommand(createListCommand());
   program.addCommand(createStatusCommand());

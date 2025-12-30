@@ -4,7 +4,7 @@
  * Types for the build pipeline and build strategies.
  */
 
-import { AppType, SuggestedConfig } from '../detector/detector.types';
+import { AppType } from '../detector/detector.types';
 
 /**
  * Build stage names
