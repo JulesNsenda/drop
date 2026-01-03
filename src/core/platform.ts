@@ -13,6 +13,8 @@ import { DetectorService, getDetector } from './detector';
 import { BuilderService, getBuilder } from './builder';
 import { RouterService, getRouterService, resetRouterService } from './router';
 import { ProcessManager, getProcessManager, resetProcessManager } from '../managers/process';
+import { AppStateManager, getStateManager, resetStateManager } from '../managers/app/state-manager';
+import { PostgresServer, getPostgresServer, resetPostgresServer, DatabaseProvisioner } from '../managers/database';
 import { Logger, createLogger } from '../utils/logger';
 
 export interface PlatformConfig {
@@ -63,6 +65,9 @@ export class DropPlatform {
   private builder: BuilderService | null = null;
   private processManager: ProcessManager | null = null;
   private router: RouterService | null = null;
+  private stateManager: AppStateManager | null = null;
+  private postgresServer: PostgresServer | null = null;
+  private dbProvisioner: DatabaseProvisioner | null = null;
 
   private subscriptions: Unsubscribe[] = [];
   private isRunning = false;
@@ -156,6 +161,19 @@ export class DropPlatform {
     if (this.processManager) {
       this.processManager.disconnect();
       resetProcessManager();
+    }
+
+    // Close state manager
+    if (this.stateManager) {
+      await this.stateManager.close();
+      resetStateManager();
+    }
+
+    // Stop PostgreSQL server
+    if (this.postgresServer) {
+      this.logger.info('Stopping PostgreSQL...', 'DATABASE');
+      await this.postgresServer.stop();
+      resetPostgresServer();
     }
 
     this.isRunning = false;
@@ -365,6 +383,34 @@ import ${path.join(dataDir, 'appconf', 'caddy', 'hosts', '*.caddy').replace(/\\/
   }
 
   private async initializeServices(): Promise<void> {
+    // Initialize PostgreSQL server
+    this.logger.info('Initializing PostgreSQL...', 'DATABASE');
+    this.postgresServer = getPostgresServer({
+      dropRoot: this.config.dropRoot,
+      onLog: (msg) => this.logger.debug(msg, 'POSTGRES'),
+    });
+
+    await this.postgresServer.ensureReady((msg) => {
+      this.logger.info(msg, 'DATABASE');
+    });
+
+    await this.postgresServer.start();
+    this.logger.info(`PostgreSQL running on port ${this.postgresServer.getPort()}`, 'DATABASE');
+
+    // Initialize database provisioner
+    this.dbProvisioner = new DatabaseProvisioner(this.postgresServer, this.config.dropRoot);
+    await this.dbProvisioner.initialize();
+
+    // Ensure internal database exists
+    const internalDb = await this.dbProvisioner.ensureInternalDatabase();
+    this.logger.info(`Internal database ready: ${internalDb.database}`, 'DATABASE');
+
+    // Initialize state manager for app tracking
+    const stateFilePath = path.join(this.config.dropRoot, 'data', 'drop-svc', 'apps.json');
+    this.stateManager = getStateManager({ stateFilePath });
+    await this.stateManager.initialize();
+    this.logger.info('App state manager initialized', 'STATE');
+
     // Initialize detector
     this.detector = getDetector();
 
@@ -376,6 +422,9 @@ import ${path.join(dataDir, 'appconf', 'caddy', 'hosts', '*.caddy').replace(/\\/
 
     // Load used ports from existing PM2 processes
     await this.loadUsedPorts();
+
+    // Sync state with actual running processes
+    await this.syncStateWithProcesses();
 
     // Initialize router
     this.router = getRouterService({
@@ -392,6 +441,39 @@ import ${path.join(dataDir, 'appconf', 'caddy', 'hosts', '*.caddy').replace(/\\/
       debounceMs: 1000,
       maxDepth: 2,
     });
+  }
+
+  /**
+   * Sync app state with actual running PM2 processes
+   * Updates state for apps that were started/stopped outside DROP
+   */
+  private async syncStateWithProcesses(): Promise<void> {
+    if (!this.processManager || !this.stateManager) return;
+
+    try {
+      const processes = await this.processManager.getAllStatus();
+      const runningNames = new Set(processes.filter((p) => p.status === 'online').map((p) => p.name));
+
+      // Update state for each tracked app
+      for (const app of this.stateManager.getAllApps()) {
+        const proc = processes.find((p) => p.name === app.name);
+
+        if (proc && proc.status === 'online') {
+          // App is running - update state
+          await this.stateManager.setAppStatus(app.name, 'running', {
+            port: proc.port ?? undefined,
+            pid: proc.pid ?? undefined,
+          });
+        } else if (app.status === 'running' && !runningNames.has(app.name)) {
+          // App was marked running but isn't - mark as stopped
+          await this.stateManager.setAppStatus(app.name, 'stopped');
+        }
+      }
+
+      this.logger.info(`Synced state with ${processes.length} processes`, 'STATE');
+    } catch (error) {
+      this.logger.warn('Failed to sync state with processes', 'STATE', error);
+    }
   }
 
   private setupEventHandlers(): void {
@@ -426,6 +508,55 @@ import ${path.join(dataDir, 'appconf', 'caddy', 'hosts', '*.caddy').replace(/\\/
     this.subscriptions.push(startedSub);
   }
 
+  /**
+   * Check if an app needs a database by looking for common database config files
+   */
+  private async appNeedsDatabase(appPath: string): Promise<boolean> {
+    const dbIndicators = [
+      'prisma/schema.prisma',
+      'drizzle.config.ts',
+      'drizzle.config.js',
+      'knexfile.js',
+      'knexfile.ts',
+      'ormconfig.json',
+      'typeorm.config.ts',
+      'sequelize.config.js',
+      '.sequelizerc',
+      'drop.yaml', // Check for database: true
+      'drop.json',
+    ];
+
+    for (const indicator of dbIndicators) {
+      try {
+        const filePath = path.join(appPath, indicator);
+        await fs.access(filePath);
+
+        // For drop.yaml/drop.json, check if database is requested
+        if (indicator === 'drop.yaml' || indicator === 'drop.json') {
+          const content = await fs.readFile(filePath, 'utf-8');
+          if (indicator === 'drop.yaml') {
+            // Simple check for database: postgres or database: true
+            if (content.includes('database:') && (content.includes('postgres') || content.includes('true'))) {
+              return true;
+            }
+          } else {
+            const json = JSON.parse(content);
+            if (json.database === true || json.database === 'postgres') {
+              return true;
+            }
+          }
+        } else {
+          // Other ORM config files indicate database need
+          return true;
+        }
+      } catch {
+        // File doesn't exist, continue checking
+      }
+    }
+
+    return false;
+  }
+
   private isTopLevelApp(appPath: string): boolean {
     const relative = path.relative(this.config.appsDirectory, appPath);
     // Must be a direct child (no path separators), non-empty, and not a parent reference
@@ -449,6 +580,16 @@ import ${path.join(dataDir, 'appconf', 'caddy', 'hosts', '*.caddy').replace(/\\/
     try {
       const result = await this.detector.detect(appPath);
       this.logger.info(`Detected ${appName} as ${result.type} (confidence: ${result.confidence})`, 'DETECTOR');
+
+      // Register app in state manager
+      if (this.stateManager) {
+        await this.stateManager.registerApp(
+          appName,
+          appPath,
+          result.type as 'nodejs' | 'python' | 'static' | 'docker' | 'unknown',
+          result.framework ?? undefined
+        );
+      }
     } catch (error) {
       this.logger.error(`Failed to detect app type for ${appName}`, 'DETECTOR', error);
     }
@@ -465,6 +606,11 @@ import ${path.join(dataDir, 'appconf', 'caddy', 'hosts', '*.caddy').replace(/\\/
     this.appsInProgress.add(appName);
 
     this.logger.appEvent('building', appName);
+
+    // Update state to building
+    if (this.stateManager) {
+      await this.stateManager.setAppStatus(appName, 'building');
+    }
 
     try {
       const detection = await this.detector.detect(appPath);
@@ -483,12 +629,26 @@ import ${path.join(dataDir, 'appconf', 'caddy', 'hosts', '*.caddy').replace(/\\/
 
       if (result.success) {
         this.logger.appEvent('built', appName, `completed in ${result.duration}ms`);
+        // Update state with build duration
+        if (this.stateManager) {
+          await this.stateManager.updateApp(appName, { buildDuration: result.duration });
+        }
       } else {
         this.logger.appEvent('error', appName, result.errors?.[0]?.message || 'Build failed');
+        if (this.stateManager) {
+          await this.stateManager.setAppStatus(appName, 'errored', {
+            error: result.errors?.[0]?.message || 'Build failed',
+          });
+        }
         this.appsInProgress.delete(appName);
       }
     } catch (error) {
       this.logger.appEvent('error', appName, error instanceof Error ? error.message : 'Build failed');
+      if (this.stateManager) {
+        await this.stateManager.setAppStatus(appName, 'errored', {
+          error: error instanceof Error ? error.message : 'Build failed',
+        });
+      }
       this.appsInProgress.delete(appName);
     }
   }
@@ -497,6 +657,11 @@ import ${path.join(dataDir, 'appconf', 'caddy', 'hosts', '*.caddy').replace(/\\/
     if (!this.processManager || !this.detector) return;
 
     const appPath = path.join(this.config.appsDirectory, appName);
+
+    // Update state to starting
+    if (this.stateManager) {
+      await this.stateManager.setAppStatus(appName, 'starting');
+    }
 
     try {
       const detection = await this.detector.detect(appPath);
@@ -527,6 +692,15 @@ import ${path.join(dataDir, 'appconf', 'caddy', 'hosts', '*.caddy').replace(/\\/
         }
       }
 
+      // Check if app needs a database and provision one
+      let dbEnvVars: Record<string, string> = {};
+      if (this.dbProvisioner && (await this.appNeedsDatabase(appPath))) {
+        this.logger.info(`Provisioning database for ${appName}...`, 'DATABASE');
+        const dbCreds = await this.dbProvisioner.provisionAppDatabase(appName);
+        dbEnvVars = this.dbProvisioner.getEnvVars(appName) || {};
+        this.logger.info(`Database provisioned: ${dbCreds.database}`, 'DATABASE');
+      }
+
       const status = await this.processManager.start({
         name: appName,
         script,
@@ -534,14 +708,32 @@ import ${path.join(dataDir, 'appconf', 'caddy', 'hosts', '*.caddy').replace(/\\/
         args,
         cwd: appPath,
         port,
-        env: { NODE_ENV: 'production' },
+        env: {
+          NODE_ENV: 'production',
+          PORT: port.toString(),
+          ...dbEnvVars,
+        },
       });
 
       this.logger.appEvent('started', appName, `PID ${status.pid}, port ${port}`);
+
+      // Update state to running with port and pid
+      if (this.stateManager) {
+        await this.stateManager.setAppStatus(appName, 'running', {
+          port,
+          pid: status.pid ?? undefined,
+        });
+      }
+
       // App is fully deployed now
       this.appsInProgress.delete(appName);
     } catch (error) {
       this.logger.appEvent('error', appName, error instanceof Error ? error.message : 'Failed to start');
+      if (this.stateManager) {
+        await this.stateManager.setAppStatus(appName, 'errored', {
+          error: error instanceof Error ? error.message : 'Failed to start',
+        });
+      }
       this.appsInProgress.delete(appName);
     }
   }
@@ -648,6 +840,18 @@ import ${path.join(dataDir, 'appconf', 'caddy', 'hosts', '*.caddy').replace(/\\/
 
   getRouter(): RouterService | null {
     return this.router;
+  }
+
+  getStateManager(): AppStateManager | null {
+    return this.stateManager;
+  }
+
+  getPostgresServer(): PostgresServer | null {
+    return this.postgresServer;
+  }
+
+  getDatabaseProvisioner(): DatabaseProvisioner | null {
+    return this.dbProvisioner;
   }
 
   isActive(): boolean {
