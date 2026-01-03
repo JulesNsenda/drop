@@ -18,6 +18,7 @@ import {
   createDeployCommand,
   createRemoveCommand,
   createServeCommand,
+  createServerCommand,
 } from './commands';
 
 const VERSION = '0.1.0-alpha.1';
@@ -46,6 +47,7 @@ function createProgram(): Command {
 
   // Add commands
   program.addCommand(createServeCommand());
+  program.addCommand(createServerCommand());
   program.addCommand(createDeployCommand());
   program.addCommand(createListCommand());
   program.addCommand(createStatusCommand());
