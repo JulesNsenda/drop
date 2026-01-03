@@ -113,11 +113,15 @@ describe('DropPlatform', () => {
 
   describe('constructor', () => {
     it('should create platform with default config', () => {
+      const isWindows = process.platform === 'win32';
+      const expectedDropRoot = isWindows ? 'C:\\drop' : '/var/drop';
+      const expectedAppsDir = isWindows ? 'C:\\drop\\data\\webapps' : '/var/drop/data/webapps';
+
       const p = new DropPlatform();
       const config = p.getConfig();
 
-      expect(config.dropRoot).toBe('/var/drop');
-      expect(config.appsDirectory).toBe('/var/drop/apps');
+      expect(config.dropRoot).toBe(expectedDropRoot);
+      expect(config.appsDirectory).toBe(expectedAppsDir);
       expect(config.portRangeStart).toBe(3001);
       expect(config.portRangeEnd).toBe(3999);
     });

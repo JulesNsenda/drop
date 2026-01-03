@@ -142,11 +142,12 @@ async function main(): Promise<void> {
       case 'migrate':
         await runner.migrate();
         break;
-      case 'status':
+      case 'status': {
         const status = await runner.status();
         console.log('Applied migrations:', status.applied);
         console.log('Pending migrations:', status.pending);
         break;
+      }
       default:
         console.error(`Unknown command: ${command}`);
         process.exit(1);
