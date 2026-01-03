@@ -37,14 +37,7 @@
       "Read(./jest.config*)",
       "Edit(./src/**)",
       "Edit(./tests/**)",
-      "Edit(./docs/**)",
-      "WebFetch(https://nodejs.org/*)",
-      "WebFetch(https://www.npmjs.com/*)",
-      "WebFetch(https://github.com/*)",
-      "WebFetch(https://api.github.com/*)",
-      "WebFetch(https://www.typescriptlang.org/*)",
-      "WebFetch(https://hono.dev/*)",
-      "WebFetch(https://caddyserver.com/*)"
+      "Edit(./docs/**)"
     ],
     "deny": [
       "Read(./.env)",
@@ -60,8 +53,7 @@
       "Bash(wget:*)",
       "Bash(rm -rf /)",
       "Bash(sudo:*)",
-      "Bash(chmod 777:*)",
-      "WebFetch(http://*)"
+      "Bash(chmod 777:*)"
     ],
     "ask": [
       "Bash(git push:*)",
