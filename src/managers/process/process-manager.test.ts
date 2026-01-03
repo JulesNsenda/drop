@@ -71,6 +71,7 @@ function createStatus(overrides: Partial<ProcessStatus> = {}): ProcessStatus {
     status: 'online',
     pid: 12345,
     pmId: 1,
+    port: null,
     instances: 1,
     memory: 52428800,
     cpu: 5,
