@@ -180,11 +180,7 @@ port = 5433
 max_connections = 100
 shared_buffers = 128MB
 log_destination = 'stderr'
-logging_collector = on
-log_directory = '${path.dirname(paths.logFile).replace(/\\/g, '/')}'
-log_filename = 'postgresql.log'
-log_rotation_age = 1d
-log_rotation_size = 100MB
+logging_collector = off
 `;
     await fs.appendFile(configPath, configAdditions);
 

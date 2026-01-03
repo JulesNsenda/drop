@@ -109,6 +109,9 @@ export class PostgresServer {
       return;
     }
 
+    // Clean up any stale files that might block startup
+    await this.cleanupStaleFiles();
+
     // Start the server
     try {
       await this.startServer();
@@ -231,17 +234,19 @@ export class PostgresServer {
   private async startServer(): Promise<void> {
     if (!this.paths) throw new Error('Paths not initialized');
 
-    const postgres = this.paths.postgres;
     const dataDir = this.paths.dataDir;
-    // logFile is configured in postgresql.conf, not needed for spawn
 
-    // Start postgres directly (more reliable than pg_ctl on Windows)
-    this.serverProcess = spawn(postgres, [
+    // Use pg_ctl to start postgres in the background (prevents console windows on Windows)
+    const pgCtl = this.paths.pgCtl;
+    this.serverProcess = spawn(pgCtl, [
+      'start',
       '-D', dataDir,
-      '-p', this.port.toString(),
+      '-o', `-p ${this.port}`,
+      '-w', // Wait for startup
     ], {
-      detached: true,
+      detached: false,
       stdio: ['ignore', 'pipe', 'pipe'],
+      windowsHide: true,
     });
 
     // Handle process output
@@ -259,14 +264,12 @@ export class PostgresServer {
     });
 
     this.serverProcess.on('exit', (code) => {
-      if (this.status !== 'stopping' && this.status !== 'stopped') {
-        this.log(`PostgreSQL exited unexpectedly with code ${code}`);
+      // pg_ctl start exits after starting postgres, so code 0 is expected
+      if (code !== 0 && this.status !== 'stopping' && this.status !== 'stopped') {
+        this.log(`PostgreSQL pg_ctl exited with code ${code}`);
         this.status = 'error';
       }
     });
-
-    // Unref so the process can run independently
-    this.serverProcess.unref();
   }
 
   private async waitForStartup(): Promise<void> {
@@ -322,6 +325,46 @@ export class PostgresServer {
 
   private sleep(ms: number): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  /**
+   * Clean up stale files that might block startup
+   * This can happen if postgres crashed or was killed, or log files are locked
+   */
+  private async cleanupStaleFiles(): Promise<void> {
+    if (!this.paths) return;
+
+    // Clean up stale PID file
+    const pidFile = path.join(this.paths.dataDir, 'postmaster.pid');
+    try {
+      await fs.access(pidFile);
+      this.log('Found stale postmaster.pid file, removing...');
+      await fs.unlink(pidFile);
+    } catch {
+      // No PID file
+    }
+
+    // Clean up locked log file (Windows sharing violation issue)
+    try {
+      await fs.access(this.paths.logFile);
+      // Rename old log instead of deleting (preserves logs)
+      const timestamp = Date.now();
+      const backupLog = `${this.paths.logFile}.${timestamp}.old`;
+      try {
+        await fs.rename(this.paths.logFile, backupLog);
+        this.log('Rotated old log file');
+      } catch {
+        // If rename fails, try to delete
+        try {
+          await fs.unlink(this.paths.logFile);
+          this.log('Removed locked log file');
+        } catch {
+          // Can't remove - will let pg_ctl try anyway
+        }
+      }
+    } catch {
+      // No log file
+    }
   }
 }
 

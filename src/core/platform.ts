@@ -557,6 +557,72 @@ import ${path.join(dataDir, 'appconf', 'caddy', 'hosts', '*.caddy').replace(/\\/
     return false;
   }
 
+  /**
+   * Parse drop.yaml and resolve depends_on to get dependency URLs
+   * Returns environment variables to inject based on dependent apps
+   */
+  private async resolveDependencies(appPath: string, appName: string): Promise<Record<string, string>> {
+    const envVars: Record<string, string> = {};
+
+    try {
+      const dropYamlPath = path.join(appPath, 'drop.yaml');
+      await fs.access(dropYamlPath);
+
+      const content = await fs.readFile(dropYamlPath, 'utf-8');
+
+      // Simple YAML parsing for depends_on section
+      // Format:
+      // depends_on:
+      //   - name: todo-api
+      //     env: API_URL
+      const dependsOnMatch = content.match(/depends_on:\s*\n((?:\s+-[^\n]+\n?)+)/);
+      if (!dependsOnMatch) return envVars;
+
+      const dependsOnBlock = dependsOnMatch[1];
+      const dependencies: Array<{ name: string; env: string }> = [];
+
+      // Parse each dependency
+      const depMatches = dependsOnBlock.matchAll(/-\s*name:\s*(\S+)\s*\n\s*env:\s*(\S+)/g);
+      for (const match of depMatches) {
+        dependencies.push({ name: match[1], env: match[2] });
+      }
+
+      // Resolve each dependency
+      for (const dep of dependencies) {
+        if (!this.stateManager) continue;
+
+        const depApp = this.stateManager.getApp(dep.name);
+        if (depApp && depApp.port) {
+          const url = `http://localhost:${depApp.port}`;
+          envVars[dep.env] = url;
+          this.logger.info(`Resolved dependency ${dep.name} -> ${dep.env}=${url}`, 'DEPS');
+        } else {
+          this.logger.warn(`Dependency ${dep.name} not found or not running for ${appName}`, 'DEPS');
+        }
+      }
+    } catch {
+      // No drop.yaml or parsing error - not a problem
+    }
+
+    return envVars;
+  }
+
+  /**
+   * Generate DROP config file for static apps with dependencies
+   */
+  private async generateStaticConfig(appPath: string, envVars: Record<string, string>): Promise<void> {
+    if (Object.keys(envVars).length === 0) return;
+
+    const configContent = `// DROP-generated configuration
+// Auto-generated based on depends_on in drop.yaml
+window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
+`;
+
+    const configPath = path.join(appPath, 'drop-config.js');
+    await fs.writeFile(configPath, configContent);
+    this.logger.info(`Generated drop-config.js for static app`, 'DEPS');
+  }
+
   private isTopLevelApp(appPath: string): boolean {
     const relative = path.relative(this.config.appsDirectory, appPath);
     // Must be a direct child (no path separators), non-empty, and not a parent reference
@@ -701,6 +767,14 @@ import ${path.join(dataDir, 'appconf', 'caddy', 'hosts', '*.caddy').replace(/\\/
         this.logger.info(`Database provisioned: ${dbCreds.database}`, 'DATABASE');
       }
 
+      // Resolve dependencies from drop.yaml
+      const depEnvVars = await this.resolveDependencies(appPath, appName);
+
+      // For static apps, generate drop-config.js with dependency URLs
+      if ((detection.type === 'static' || detection.type === 'spa') && Object.keys(depEnvVars).length > 0) {
+        await this.generateStaticConfig(appPath, depEnvVars);
+      }
+
       const status = await this.processManager.start({
         name: appName,
         script,
@@ -712,6 +786,7 @@ import ${path.join(dataDir, 'appconf', 'caddy', 'hosts', '*.caddy').replace(/\\/
           NODE_ENV: 'production',
           PORT: port.toString(),
           ...dbEnvVars,
+          ...depEnvVars,
         },
       });
 
