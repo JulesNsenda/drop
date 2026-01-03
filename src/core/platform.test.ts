@@ -9,6 +9,82 @@ import * as os from 'os';
 import { DropPlatform, createPlatform } from './platform';
 import { eventBus } from './event-bus';
 
+// Mock state manager
+jest.mock('../managers/app/state-manager', () => {
+  const mockStateManager = {
+    initialize: jest.fn().mockResolvedValue(undefined),
+    close: jest.fn().mockResolvedValue(undefined),
+    registerApp: jest.fn().mockResolvedValue({ name: 'test-app', status: 'pending' }),
+    updateApp: jest.fn().mockResolvedValue({ name: 'test-app', status: 'running' }),
+    setAppStatus: jest.fn().mockResolvedValue({ name: 'test-app', status: 'running' }),
+    removeApp: jest.fn().mockResolvedValue(true),
+    getApp: jest.fn().mockReturnValue(undefined),
+    getAllApps: jest.fn().mockReturnValue([]),
+    getAppsByStatus: jest.fn().mockReturnValue([]),
+    getRunningApps: jest.fn().mockReturnValue([]),
+    hasApp: jest.fn().mockReturnValue(false),
+    getUsedPorts: jest.fn().mockReturnValue([]),
+    getStats: jest.fn().mockReturnValue({ total: 0, running: 0, stopped: 0, errored: 0 }),
+  };
+
+  return {
+    AppStateManager: jest.fn().mockImplementation(() => mockStateManager),
+    getStateManager: jest.fn().mockReturnValue(mockStateManager),
+    resetStateManager: jest.fn(),
+  };
+});
+
+// Mock database module
+jest.mock('../managers/database', () => {
+  const mockPostgresServer = {
+    getStatus: jest.fn().mockReturnValue('running'),
+    getPort: jest.fn().mockReturnValue(5433),
+    getConnectionString: jest.fn().mockReturnValue('postgresql://postgres@localhost:5433/postgres'),
+    ensureReady: jest.fn().mockResolvedValue(undefined),
+    start: jest.fn().mockResolvedValue(undefined),
+    stop: jest.fn().mockResolvedValue(undefined),
+    getPool: jest.fn().mockResolvedValue({ query: jest.fn().mockResolvedValue({ rows: [] }), end: jest.fn() }),
+    query: jest.fn().mockResolvedValue([]),
+    databaseExists: jest.fn().mockResolvedValue(false),
+    createDatabase: jest.fn().mockResolvedValue(undefined),
+    createUser: jest.fn().mockResolvedValue(undefined),
+    grantPrivileges: jest.fn().mockResolvedValue(undefined),
+  };
+
+  const mockDbProvisioner = {
+    initialize: jest.fn().mockResolvedValue(undefined),
+    ensureInternalDatabase: jest.fn().mockResolvedValue({
+      host: 'localhost',
+      port: 5433,
+      database: 'drop_internal',
+      user: 'drop_admin',
+      password: 'test',
+      connectionString: 'postgresql://drop_admin:test@localhost:5433/drop_internal',
+    }),
+    provisionAppDatabase: jest.fn().mockResolvedValue({
+      host: 'localhost',
+      port: 5433,
+      database: 'drop_test_app',
+      user: 'drop_test_app_user',
+      password: 'test',
+      connectionString: 'postgresql://drop_test_app_user:test@localhost:5433/drop_test_app',
+    }),
+    getAppCredentials: jest.fn().mockReturnValue(null),
+    hasAppDatabase: jest.fn().mockReturnValue(false),
+    listDatabases: jest.fn().mockReturnValue([]),
+    deleteAppDatabase: jest.fn().mockResolvedValue(undefined),
+    getEnvVars: jest.fn().mockReturnValue(null),
+  };
+
+  return {
+    PostgresBinaries: jest.fn(),
+    PostgresServer: jest.fn().mockImplementation(() => mockPostgresServer),
+    getPostgresServer: jest.fn().mockReturnValue(mockPostgresServer),
+    resetPostgresServer: jest.fn(),
+    DatabaseProvisioner: jest.fn().mockImplementation(() => mockDbProvisioner),
+  };
+});
+
 // Mock PM2 client
 jest.mock('../managers/process/pm2-client', () => ({
   connect: jest.fn().mockResolvedValue(undefined),
