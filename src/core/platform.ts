@@ -34,6 +34,20 @@ export interface PlatformConfig {
   autoStart: boolean;
   /** Caddyfile path for router */
   caddyfilePath: string;
+  /** Enable HTTPS for apps */
+  enableHttps: boolean;
+  /** ACME email for Let's Encrypt certificates */
+  acmeEmail?: string;
+  /** Use ACME staging (for testing) */
+  acmeStaging?: boolean;
+  /** Default domain suffix (e.g., "example.com" for apps at myapp.example.com) */
+  domainSuffix?: string;
+  /** Enable API server */
+  enableApi: boolean;
+  /** API server port */
+  apiPort: number;
+  /** Enable API authentication */
+  enableApiAuth: boolean;
 }
 
 // Determine platform-appropriate defaults
@@ -53,6 +67,13 @@ const DEFAULT_CONFIG: PlatformConfig = {
   autoBuild: true,
   autoStart: true,
   caddyfilePath: DEFAULT_CADDYFILE,
+  enableHttps: false,
+  acmeEmail: undefined,
+  acmeStaging: false,
+  domainSuffix: 'localhost',
+  enableApi: true,
+  apiPort: 3000,
+  enableApiAuth: process.env.NODE_ENV === 'production',
 };
 
 export class DropPlatform {
@@ -81,6 +102,13 @@ export class DropPlatform {
       dropRoot: config?.dropRoot ?? process.env.DROP_ROOT ?? DEFAULT_CONFIG.dropRoot,
       appsDirectory: config?.appsDirectory ?? process.env.DROP_APPS_DIR ?? DEFAULT_CONFIG.appsDirectory,
       logLevel: config?.logLevel ?? (process.env.DROP_LOG_LEVEL as PlatformConfig['logLevel']) ?? DEFAULT_CONFIG.logLevel,
+      enableHttps: config?.enableHttps ?? (process.env.DROP_ENABLE_HTTPS !== undefined ? process.env.DROP_ENABLE_HTTPS === 'true' : DEFAULT_CONFIG.enableHttps),
+      acmeEmail: config?.acmeEmail ?? process.env.DROP_ACME_EMAIL ?? DEFAULT_CONFIG.acmeEmail,
+      acmeStaging: config?.acmeStaging ?? (process.env.DROP_ACME_STAGING !== undefined ? process.env.DROP_ACME_STAGING === 'true' : DEFAULT_CONFIG.acmeStaging),
+      domainSuffix: config?.domainSuffix ?? process.env.DROP_DOMAIN_SUFFIX ?? DEFAULT_CONFIG.domainSuffix,
+      enableApi: config?.enableApi ?? (process.env.DROP_ENABLE_API !== undefined ? process.env.DROP_ENABLE_API !== 'false' : DEFAULT_CONFIG.enableApi),
+      apiPort: config?.apiPort ?? (process.env.DROP_API_PORT ? parseInt(process.env.DROP_API_PORT, 10) : DEFAULT_CONFIG.apiPort),
+      enableApiAuth: config?.enableApiAuth ?? (process.env.DROP_ENABLE_API_AUTH !== undefined ? process.env.DROP_ENABLE_API_AUTH === 'true' : DEFAULT_CONFIG.enableApiAuth),
       ...config,
     };
     this.eventBus = eventBus;
@@ -426,11 +454,14 @@ import ${path.join(dataDir, 'appconf', 'caddy', 'hosts', '*.caddy').replace(/\\/
     // Sync state with actual running processes
     await this.syncStateWithProcesses();
 
-    // Initialize router
+    // Initialize router with HTTPS config
     this.router = getRouterService({
       caddy: {
         caddyfilePath: this.config.caddyfilePath,
         autoReload: true,
+        acmeEmail: this.config.acmeEmail,
+        acmeStaging: this.config.acmeStaging,
+        enableAdminApi: false,
       },
     });
 
@@ -509,9 +540,15 @@ import ${path.join(dataDir, 'appconf', 'caddy', 'hosts', '*.caddy').replace(/\\/
   }
 
   /**
-   * Check if an app needs a database by looking for common database config files
+   * Check if an app needs a database by looking at detection result or common ORM config files
    */
-  private async appNeedsDatabase(appPath: string): Promise<boolean> {
+  private async appNeedsDatabase(appPath: string, detectionDatabase?: boolean | string): Promise<boolean> {
+    // If detection already found database requirement, use that
+    if (detectionDatabase === true || detectionDatabase === 'postgres' || detectionDatabase === 'sqlite') {
+      return true;
+    }
+
+    // Otherwise, check for common ORM config files
     const dbIndicators = [
       'prisma/schema.prisma',
       'drizzle.config.ts',
@@ -522,33 +559,13 @@ import ${path.join(dataDir, 'appconf', 'caddy', 'hosts', '*.caddy').replace(/\\/
       'typeorm.config.ts',
       'sequelize.config.js',
       '.sequelizerc',
-      'drop.yaml', // Check for database: true
-      'drop.json',
     ];
 
     for (const indicator of dbIndicators) {
       try {
         const filePath = path.join(appPath, indicator);
         await fs.access(filePath);
-
-        // For drop.yaml/drop.json, check if database is requested
-        if (indicator === 'drop.yaml' || indicator === 'drop.json') {
-          const content = await fs.readFile(filePath, 'utf-8');
-          if (indicator === 'drop.yaml') {
-            // Simple check for database: postgres or database: true
-            if (content.includes('database:') && (content.includes('postgres') || content.includes('true'))) {
-              return true;
-            }
-          } else {
-            const json = JSON.parse(content);
-            if (json.database === true || json.database === 'postgres') {
-              return true;
-            }
-          }
-        } else {
-          // Other ORM config files indicate database need
-          return true;
-        }
+        return true; // ORM config file found
       } catch {
         // File doesn't exist, continue checking
       }
@@ -760,7 +777,8 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
 
       // Check if app needs a database and provision one
       let dbEnvVars: Record<string, string> = {};
-      if (this.dbProvisioner && (await this.appNeedsDatabase(appPath))) {
+      const needsDb = await this.appNeedsDatabase(appPath, detection.suggestedConfig?.database);
+      if (this.dbProvisioner && needsDb) {
         this.logger.info(`Provisioning database for ${appName}...`, 'DATABASE');
         const dbCreds = await this.dbProvisioner.provisionAppDatabase(appName);
         dbEnvVars = this.dbProvisioner.getEnvVars(appName) || {};
@@ -817,17 +835,21 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     if (!this.router || !port) return;
 
     try {
-      const hostname = `${appName}.localhost`;
+      const domainSuffix = this.config.domainSuffix || 'localhost';
+      const hostname = `${appName}.${domainSuffix}`;
+      const enableSsl = this.config.enableHttps && domainSuffix !== 'localhost';
 
       await this.router.addRoute({
         appName,
         hostname,
         upstream: `localhost:${port}`,
-        ssl: false,
-        redirectHttps: false,
+        ssl: enableSsl,
+        redirectHttps: enableSsl,
+        tls: enableSsl ? { auto: true } : undefined,
       });
 
-      this.logger.info(`Route configured: ${hostname} -> localhost:${port}`, 'ROUTER');
+      const protocol = enableSsl ? 'https' : 'http';
+      this.logger.info(`Route configured: ${protocol}://${hostname} -> localhost:${port}`, 'ROUTER');
     } catch (error) {
       // Route might already exist
       this.logger.warn(`Failed to configure route for ${appName}`, 'ROUTER', error);

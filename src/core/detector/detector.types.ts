@@ -39,6 +39,8 @@ export interface SuggestedConfig {
   env?: Record<string, string>;
   nodeVersion?: string;
   pythonVersion?: string;
+  /** Database requirement detected from manifest or ORM config files */
+  database?: DatabaseType;
 }
 
 // Detection result
@@ -66,6 +68,9 @@ export interface DetectorConfig {
   customDetectors: AppDetector[];
 }
 
+// Database configuration in manifest
+export type DatabaseType = 'postgres' | 'sqlite' | boolean;
+
 // Drop manifest schema (drop.yaml / drop.json)
 export interface DropManifest {
   name?: string;
@@ -83,6 +88,8 @@ export interface DropManifest {
   };
   env?: Record<string, string>;
   port?: number;
+  /** Database configuration - set to 'postgres', 'sqlite', or true for auto-provisioning */
+  database?: DatabaseType;
   healthCheck?: {
     path?: string;
     interval?: number;

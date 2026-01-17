@@ -45,6 +45,7 @@ export const manifestDetector: AppDetector = {
             outputDirectory: manifest.build?.output,
             port: manifest.port,
             env: manifest.env,
+            database: manifest.database,
           },
           warnings,
           metadata: {
