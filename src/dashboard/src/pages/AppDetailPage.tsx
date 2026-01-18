@@ -10,6 +10,7 @@ import {
   Terminal,
   Clock,
   Folder,
+  Download,
 } from 'lucide-react';
 import { useApp, appAction, deleteApp } from '../hooks/useApi';
 import StatusBadge from '../components/StatusBadge';
@@ -76,6 +77,30 @@ function AppDetailPage() {
   const formatDate = (dateString?: string) => {
     if (!dateString) return 'Never';
     return new Date(dateString).toLocaleString();
+  };
+
+  const handleDownloadLogs = async () => {
+    if (!name) return;
+    try {
+      // Fetch more logs for download (1000 lines)
+      const res = await fetch(`/api/v1/logs/${name}?lines=1000`);
+      const json = await res.json();
+      if (json.success && json.data?.logs) {
+        const content = json.data.logs.join('\n');
+        const blob = new Blob([content], { type: 'text/plain' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        const today = new Date().toISOString().split('T')[0];
+        a.href = url;
+        a.download = `${name}-${today}.log`;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+      }
+    } catch {
+      alert('Failed to download logs');
+    }
   };
 
   if (loading && !app) {
@@ -218,10 +243,20 @@ function AppDetailPage() {
 
       {/* Logs */}
       <div className="bg-white rounded-lg border border-gray-200">
-        <div className="flex items-center gap-2 px-4 py-3 border-b border-gray-200">
-          <Terminal className="w-4 h-4 text-gray-500" />
-          <h2 className="font-semibold text-gray-900">Logs</h2>
-          {logsLoading && <span className="text-xs text-gray-400">(loading...)</span>}
+        <div className="flex items-center justify-between px-4 py-3 border-b border-gray-200">
+          <div className="flex items-center gap-2">
+            <Terminal className="w-4 h-4 text-gray-500" />
+            <h2 className="font-semibold text-gray-900">Logs</h2>
+            {logsLoading && <span className="text-xs text-gray-400">(loading...)</span>}
+          </div>
+          <button
+            onClick={handleDownloadLogs}
+            className="flex items-center gap-1 px-2 py-1 text-sm text-gray-600 hover:text-gray-900 hover:bg-gray-100 rounded"
+            title="Download logs"
+          >
+            <Download className="w-4 h-4" />
+            Download
+          </button>
         </div>
         <div className="h-96 overflow-auto bg-gray-900 p-4 font-mono text-sm">
           {logs.length === 0 ? (
