@@ -33,12 +33,17 @@ export const DEFAULT_IGNORE_PATTERNS: string[] = [
   '**/*~',
 ];
 
+// Enable polling by default on Windows (more reliable file watching)
+const isWindows = process.platform === 'win32';
+
 export const DEFAULT_WATCHER_CONFIG: WatcherConfig = {
   appsDir: process.env.DROP_APPS_DIR || '/var/drop/apps',
   debounceMs: parseInt(process.env.DROP_WATCHER_DEBOUNCE || String(DEFAULT_DEBOUNCE_MS), 10),
   ignorePatterns: DEFAULT_IGNORE_PATTERNS,
   maxDepth: parseInt(process.env.DROP_WATCHER_DEPTH || String(DEFAULT_MAX_DEPTH), 10),
-  usePolling: process.env.DROP_WATCHER_POLLING === 'true',
+  usePolling: process.env.DROP_WATCHER_POLLING !== undefined
+    ? process.env.DROP_WATCHER_POLLING === 'true'
+    : isWindows, // Default to true on Windows
   pollInterval: parseInt(process.env.DROP_WATCHER_POLL_INTERVAL || String(DEFAULT_POLL_INTERVAL), 10),
   followSymlinks: true,
   persistent: true,

@@ -14,6 +14,7 @@ import { BuilderService, getBuilder } from './builder';
 import { RouterService, getRouterService, resetRouterService } from './router';
 import { ProcessManager, getProcessManager, resetProcessManager } from '../managers/process';
 import { AppStateManager, getStateManager, resetStateManager } from '../managers/app/state-manager';
+import { AppConfigService, getAppConfigService, resetAppConfigService } from '../managers/app/app-config';
 import { PostgresServer, getPostgresServer, resetPostgresServer, DatabaseProvisioner } from '../managers/database';
 import { Logger, createLogger } from '../utils/logger';
 
@@ -34,6 +35,20 @@ export interface PlatformConfig {
   autoStart: boolean;
   /** Caddyfile path for router */
   caddyfilePath: string;
+  /** Enable HTTPS for apps */
+  enableHttps: boolean;
+  /** ACME email for Let's Encrypt certificates */
+  acmeEmail?: string;
+  /** Use ACME staging (for testing) */
+  acmeStaging?: boolean;
+  /** Default domain suffix (e.g., "example.com" for apps at myapp.example.com) */
+  domainSuffix?: string;
+  /** Enable API server */
+  enableApi: boolean;
+  /** API server port */
+  apiPort: number;
+  /** Enable API authentication */
+  enableApiAuth: boolean;
 }
 
 // Determine platform-appropriate defaults
@@ -53,6 +68,13 @@ const DEFAULT_CONFIG: PlatformConfig = {
   autoBuild: true,
   autoStart: true,
   caddyfilePath: DEFAULT_CADDYFILE,
+  enableHttps: false,
+  acmeEmail: undefined,
+  acmeStaging: false,
+  domainSuffix: 'localhost',
+  enableApi: true,
+  apiPort: 3000,
+  enableApiAuth: process.env.NODE_ENV === 'production',
 };
 
 export class DropPlatform {
@@ -66,14 +88,17 @@ export class DropPlatform {
   private processManager: ProcessManager | null = null;
   private router: RouterService | null = null;
   private stateManager: AppStateManager | null = null;
+  private appConfigService: AppConfigService | null = null;
   private postgresServer: PostgresServer | null = null;
   private dbProvisioner: DatabaseProvisioner | null = null;
 
   private subscriptions: Unsubscribe[] = [];
   private isRunning = false;
   private nextPort: number;
-  private usedPorts: Set<number> = new Set();
+  private usedPorts: Map<number, string> = new Map(); // port -> appName ownership
   private appsInProgress: Set<string> = new Set(); // Track apps being built/started
+  private appDeployTimes: Map<string, number> = new Map(); // Track when apps were last deployed
+  private readonly DEPLOY_COOLDOWN_MS = 5000; // Ignore updates within 5s of deploy
 
   constructor(config?: Partial<PlatformConfig>) {
     this.config = {
@@ -81,6 +106,13 @@ export class DropPlatform {
       dropRoot: config?.dropRoot ?? process.env.DROP_ROOT ?? DEFAULT_CONFIG.dropRoot,
       appsDirectory: config?.appsDirectory ?? process.env.DROP_APPS_DIR ?? DEFAULT_CONFIG.appsDirectory,
       logLevel: config?.logLevel ?? (process.env.DROP_LOG_LEVEL as PlatformConfig['logLevel']) ?? DEFAULT_CONFIG.logLevel,
+      enableHttps: config?.enableHttps ?? (process.env.DROP_ENABLE_HTTPS !== undefined ? process.env.DROP_ENABLE_HTTPS === 'true' : DEFAULT_CONFIG.enableHttps),
+      acmeEmail: config?.acmeEmail ?? process.env.DROP_ACME_EMAIL ?? DEFAULT_CONFIG.acmeEmail,
+      acmeStaging: config?.acmeStaging ?? (process.env.DROP_ACME_STAGING !== undefined ? process.env.DROP_ACME_STAGING === 'true' : DEFAULT_CONFIG.acmeStaging),
+      domainSuffix: config?.domainSuffix ?? process.env.DROP_DOMAIN_SUFFIX ?? DEFAULT_CONFIG.domainSuffix,
+      enableApi: config?.enableApi ?? (process.env.DROP_ENABLE_API !== undefined ? process.env.DROP_ENABLE_API !== 'false' : DEFAULT_CONFIG.enableApi),
+      apiPort: config?.apiPort ?? (process.env.DROP_API_PORT ? parseInt(process.env.DROP_API_PORT, 10) : DEFAULT_CONFIG.apiPort),
+      enableApiAuth: config?.enableApiAuth ?? (process.env.DROP_ENABLE_API_AUTH !== undefined ? process.env.DROP_ENABLE_API_AUTH === 'true' : DEFAULT_CONFIG.enableApiAuth),
       ...config,
     };
     this.eventBus = eventBus;
@@ -167,6 +199,11 @@ export class DropPlatform {
     if (this.stateManager) {
       await this.stateManager.close();
       resetStateManager();
+    }
+
+    // Reset app config service
+    if (this.appConfigService) {
+      resetAppConfigService();
     }
 
     // Stop PostgreSQL server
@@ -411,6 +448,18 @@ import ${path.join(dataDir, 'appconf', 'caddy', 'hosts', '*.caddy').replace(/\\/
     await this.stateManager.initialize();
     this.logger.info('App state manager initialized', 'STATE');
 
+    // Initialize app config service for per-app config files
+    const appConfigDir = path.join(this.config.dropRoot, 'data', 'appconf', 'webapps');
+    this.appConfigService = getAppConfigService({
+      configDir: appConfigDir,
+      webappsDir: this.config.appsDirectory,
+    });
+    await this.appConfigService.initialize();
+    this.logger.info(`App config service initialized (${this.appConfigService.getAllConfigs().length} configs loaded)`, 'CONFIG');
+
+    // Sync state manager with app configs (configs are source of truth for ports)
+    await this.syncStateWithConfigs();
+
     // Initialize detector
     this.detector = getDetector();
 
@@ -426,11 +475,14 @@ import ${path.join(dataDir, 'appconf', 'caddy', 'hosts', '*.caddy').replace(/\\/
     // Sync state with actual running processes
     await this.syncStateWithProcesses();
 
-    // Initialize router
+    // Initialize router with HTTPS config
     this.router = getRouterService({
       caddy: {
         caddyfilePath: this.config.caddyfilePath,
         autoReload: true,
+        acmeEmail: this.config.acmeEmail,
+        acmeStaging: this.config.acmeStaging,
+        enableAdminApi: false,
       },
     });
 
@@ -476,6 +528,38 @@ import ${path.join(dataDir, 'appconf', 'caddy', 'hosts', '*.caddy').replace(/\\/
     }
   }
 
+  /**
+   * Sync state manager with app config files
+   * Config files are the source of truth for port assignments
+   */
+  private async syncStateWithConfigs(): Promise<void> {
+    if (!this.appConfigService || !this.stateManager) return;
+
+    const configs = this.appConfigService.getAllConfigs();
+    for (const config of configs) {
+      // Register app in state manager with preserved port
+      await this.stateManager.registerApp(
+        config.name,
+        config.path || path.join(this.config.appsDirectory, config.name),
+        config.type,
+        config.framework
+      );
+
+      // Update with additional fields from config
+      if (config.port || config.lastDeployedAt || config.buildDuration) {
+        await this.stateManager.updateApp(config.name, {
+          port: config.port,
+          lastDeployedAt: config.lastDeployedAt,
+          buildDuration: config.buildDuration,
+        });
+      }
+    }
+
+    if (configs.length > 0) {
+      this.logger.info(`Synced ${configs.length} apps from config files`, 'CONFIG');
+    }
+  }
+
   private setupEventHandlers(): void {
     // When watcher detects a new directory, detect the app type
     const watcherSub = this.eventBus.subscribe('watcher:change', async (payload) => {
@@ -485,8 +569,25 @@ import ${path.join(dataDir, 'appconf', 'caddy', 'hosts', '*.caddy').replace(/\\/
     });
     this.subscriptions.push(watcherSub);
 
-    // When app is detected, build it
+    // When app is detected, create config and build it
     const detectedSub = this.eventBus.subscribe('app:detected', async (payload) => {
+      const appType = (payload.type || 'unknown') as 'nodejs' | 'python' | 'static' | 'docker' | 'unknown';
+
+      // Create or update app config file (source of truth)
+      if (this.appConfigService) {
+        await this.appConfigService.upsertConfig(payload.name, {
+          type: appType,
+          path: payload.path,
+          hostname: `${payload.name}.localhost`,
+        });
+      }
+
+      // Register in state manager
+      if (this.stateManager) {
+        await this.stateManager.registerApp(payload.name, payload.path, appType);
+      }
+
+      // Build the app if auto-build is enabled
       if (this.config.autoBuild && payload.type !== 'unknown') {
         await this.handleBuildApp(payload.path, payload.name, payload.type as string);
       }
@@ -506,12 +607,24 @@ import ${path.join(dataDir, 'appconf', 'caddy', 'hosts', '*.caddy').replace(/\\/
       await this.handleConfigureRoute(payload.name, payload.port);
     });
     this.subscriptions.push(startedSub);
+
+    // When app files are updated, rebuild and restart
+    const updateSub = this.eventBus.subscribe('app:update', async (payload) => {
+      await this.handleAppUpdate(payload.name, payload.path, payload.reason);
+    });
+    this.subscriptions.push(updateSub);
   }
 
   /**
-   * Check if an app needs a database by looking for common database config files
+   * Check if an app needs a database by looking at detection result or common ORM config files
    */
-  private async appNeedsDatabase(appPath: string): Promise<boolean> {
+  private async appNeedsDatabase(appPath: string, detectionDatabase?: boolean | string): Promise<boolean> {
+    // If detection already found database requirement, use that
+    if (detectionDatabase === true || detectionDatabase === 'postgres' || detectionDatabase === 'sqlite') {
+      return true;
+    }
+
+    // Otherwise, check for common ORM config files
     const dbIndicators = [
       'prisma/schema.prisma',
       'drizzle.config.ts',
@@ -522,33 +635,13 @@ import ${path.join(dataDir, 'appconf', 'caddy', 'hosts', '*.caddy').replace(/\\/
       'typeorm.config.ts',
       'sequelize.config.js',
       '.sequelizerc',
-      'drop.yaml', // Check for database: true
-      'drop.json',
     ];
 
     for (const indicator of dbIndicators) {
       try {
         const filePath = path.join(appPath, indicator);
         await fs.access(filePath);
-
-        // For drop.yaml/drop.json, check if database is requested
-        if (indicator === 'drop.yaml' || indicator === 'drop.json') {
-          const content = await fs.readFile(filePath, 'utf-8');
-          if (indicator === 'drop.yaml') {
-            // Simple check for database: postgres or database: true
-            if (content.includes('database:') && (content.includes('postgres') || content.includes('true'))) {
-              return true;
-            }
-          } else {
-            const json = JSON.parse(content);
-            if (json.database === true || json.database === 'postgres') {
-              return true;
-            }
-          }
-        } else {
-          // Other ORM config files indicate database need
-          return true;
-        }
+        return true; // ORM config file found
       } catch {
         // File doesn't exist, continue checking
       }
@@ -647,12 +740,24 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       const result = await this.detector.detect(appPath);
       this.logger.info(`Detected ${appName} as ${result.type} (confidence: ${result.confidence})`, 'DETECTOR');
 
+      const appType = result.type as 'nodejs' | 'python' | 'static' | 'docker' | 'unknown';
+
+      // Create or update app config file (source of truth)
+      if (this.appConfigService) {
+        await this.appConfigService.upsertConfig(appName, {
+          type: appType,
+          framework: result.framework ?? undefined,
+          path: appPath,
+          hostname: `${appName}.localhost`,
+        });
+      }
+
       // Register app in state manager
       if (this.stateManager) {
         await this.stateManager.registerApp(
           appName,
           appPath,
-          result.type as 'nodejs' | 'python' | 'static' | 'docker' | 'unknown',
+          appType,
           result.framework ?? undefined
         );
       }
@@ -695,7 +800,10 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
 
       if (result.success) {
         this.logger.appEvent('built', appName, `completed in ${result.duration}ms`);
-        // Update state with build duration
+        // Update config and state with build duration
+        if (this.appConfigService) {
+          await this.appConfigService.updateConfig(appName, { buildDuration: result.duration });
+        }
         if (this.stateManager) {
           await this.stateManager.updateApp(appName, { buildDuration: result.duration });
         }
@@ -731,7 +839,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
 
     try {
       const detection = await this.detector.detect(appPath);
-      const port = this.allocatePort();
+      const port = this.allocatePort(appName);
 
       this.logger.appEvent('starting', appName, `port ${port}`);
 
@@ -760,7 +868,8 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
 
       // Check if app needs a database and provision one
       let dbEnvVars: Record<string, string> = {};
-      if (this.dbProvisioner && (await this.appNeedsDatabase(appPath))) {
+      const needsDb = await this.appNeedsDatabase(appPath, detection.suggestedConfig?.database);
+      if (this.dbProvisioner && needsDb) {
         this.logger.info(`Provisioning database for ${appName}...`, 'DATABASE');
         const dbCreds = await this.dbProvisioner.provisionAppDatabase(appName);
         dbEnvVars = this.dbProvisioner.getEnvVars(appName) || {};
@@ -792,6 +901,14 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
 
       this.logger.appEvent('started', appName, `PID ${status.pid}, port ${port}`);
 
+      // Save port to config file (source of truth for restarts)
+      if (this.appConfigService) {
+        await this.appConfigService.updateConfig(appName, {
+          port,
+          lastDeployedAt: new Date().toISOString(),
+        });
+      }
+
       // Update state to running with port and pid
       if (this.stateManager) {
         await this.stateManager.setAppStatus(appName, 'running', {
@@ -800,7 +917,8 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         });
       }
 
-      // App is fully deployed now
+      // App is fully deployed now - record deploy time for cooldown
+      this.appDeployTimes.set(appName, Date.now());
       this.appsInProgress.delete(appName);
     } catch (error) {
       this.logger.appEvent('error', appName, error instanceof Error ? error.message : 'Failed to start');
@@ -817,24 +935,204 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     if (!this.router || !port) return;
 
     try {
-      const hostname = `${appName}.localhost`;
+      const domainSuffix = this.config.domainSuffix || 'localhost';
+      const hostname = `${appName}.${domainSuffix}`;
+      const enableSsl = this.config.enableHttps && domainSuffix !== 'localhost';
 
       await this.router.addRoute({
         appName,
         hostname,
         upstream: `localhost:${port}`,
-        ssl: false,
-        redirectHttps: false,
+        ssl: enableSsl,
+        redirectHttps: enableSsl,
+        tls: enableSsl ? { auto: true } : undefined,
       });
 
-      this.logger.info(`Route configured: ${hostname} -> localhost:${port}`, 'ROUTER');
+      const protocol = enableSsl ? 'https' : 'http';
+      this.logger.info(`Route configured: ${protocol}://${hostname} -> localhost:${port}`, 'ROUTER');
     } catch (error) {
       // Route might already exist
       this.logger.warn(`Failed to configure route for ${appName}`, 'ROUTER', error);
     }
   }
 
-  private allocatePort(): number {
+  /**
+   * Handle app update events (file changes in existing apps)
+   * Stops the running process, rebuilds, and restarts on the same port
+   */
+  private async handleAppUpdate(appName: string, appPath: string, reason: string): Promise<void> {
+    if (!this.processManager || !this.stateManager || !this.detector || !this.builder) return;
+
+    // Skip if already processing this app (e.g., during initial deployment)
+    if (this.appsInProgress.has(appName)) {
+      this.logger.debug(`Skipping update for ${appName} - already in progress`, 'UPDATE');
+      return;
+    }
+
+    // Skip if app was just deployed (cooldown period to prevent loops)
+    const lastDeployTime = this.appDeployTimes.get(appName);
+    if (lastDeployTime && Date.now() - lastDeployTime < this.DEPLOY_COOLDOWN_MS) {
+      this.logger.debug(`Skipping update for ${appName} - within cooldown period`, 'UPDATE');
+      return;
+    }
+
+    const appState = this.stateManager.getApp(appName);
+    if (!appState) {
+      // App not yet registered - this can happen during initial deployment
+      // when file changes are detected before app:detected is fully processed
+      this.logger.debug(`Skipping update for ${appName} - not yet registered`, 'UPDATE');
+      return;
+    }
+
+    // Remember the current port so we can reuse it
+    const originalPort = appState.port;
+
+    this.logger.info(`Hot-reload triggered for ${appName}: ${reason}`, 'UPDATE');
+    this.appsInProgress.add(appName);
+
+    try {
+      // 1. Stop the running process (if any)
+      if (appState.status === 'running') {
+        this.logger.info(`Stopping ${appName} for rebuild...`, 'UPDATE');
+        await this.processManager.stop(appName);
+
+        // Release the port from usedPorts (we'll re-add it when we restart)
+        if (originalPort) {
+          this.usedPorts.delete(originalPort);
+        }
+      }
+
+      // 2. Update state to building
+      await this.stateManager.setAppStatus(appName, 'building');
+
+      // 3. Re-detect and rebuild the app
+      const detection = await this.detector.detect(appPath);
+      const buildResult = await this.builder.build({
+        appName,
+        appPath,
+        appType: detection.type,
+        framework: detection.framework || null,
+        config: {
+          buildCommand: detection.suggestedConfig?.buildCommand,
+          installCommand: detection.suggestedConfig?.installCommand,
+        },
+        env: {},
+      });
+
+      if (!buildResult.success) {
+        this.logger.appEvent('error', appName, buildResult.errors?.[0]?.message || 'Rebuild failed');
+        await this.stateManager.setAppStatus(appName, 'errored', {
+          error: buildResult.errors?.[0]?.message || 'Rebuild failed',
+        });
+        this.appsInProgress.delete(appName);
+        return;
+      }
+
+      this.logger.appEvent('built', appName, `rebuilt in ${buildResult.duration}ms`);
+
+      // 4. Restart the app on the same port (or allocate new if none)
+      const port = originalPort ?? this.allocatePort(appName);
+      this.usedPorts.set(port, appName);
+
+      await this.stateManager.setAppStatus(appName, 'starting');
+
+      // Determine start command
+      let script: string;
+      let args: string[] | undefined;
+
+      if (detection.type === 'static' || detection.type === 'spa') {
+        const serveDir = path.join(appPath, detection.suggestedConfig?.outputDirectory || '.');
+        script = path.join(__dirname, 'static-server.js');
+        args = [serveDir, '-s'];
+      } else {
+        const startCommand = detection.suggestedConfig?.startCommand || 'node index.js';
+        script = startCommand.startsWith('node ') ? startCommand.substring(5) : startCommand;
+      }
+
+      // Get database env vars if needed
+      let dbEnvVars: Record<string, string> = {};
+      if (this.dbProvisioner) {
+        dbEnvVars = this.dbProvisioner.getEnvVars(appName) || {};
+      }
+
+      // Resolve dependencies
+      const depEnvVars = await this.resolveDependencies(appPath, appName);
+
+      // For static apps, regenerate drop-config.js
+      if ((detection.type === 'static' || detection.type === 'spa') && Object.keys(depEnvVars).length > 0) {
+        await this.generateStaticConfig(appPath, depEnvVars);
+      }
+
+      const status = await this.processManager.start({
+        name: appName,
+        script,
+        args,
+        cwd: appPath,
+        port,
+        env: {
+          NODE_ENV: 'production',
+          PORT: port.toString(),
+          ...dbEnvVars,
+          ...depEnvVars,
+        },
+      });
+
+      this.logger.appEvent('started', appName, `PID ${status.pid}, port ${port} (hot-reloaded)`);
+
+      await this.stateManager.setAppStatus(appName, 'running', {
+        port,
+        pid: status.pid ?? undefined,
+      });
+
+      // Record deploy time for cooldown
+      this.appDeployTimes.set(appName, Date.now());
+      this.appsInProgress.delete(appName);
+    } catch (error) {
+      this.logger.appEvent('error', appName, error instanceof Error ? error.message : 'Hot-reload failed');
+      await this.stateManager.setAppStatus(appName, 'errored', {
+        error: error instanceof Error ? error.message : 'Hot-reload failed',
+      });
+      this.appsInProgress.delete(appName);
+    }
+  }
+
+  /**
+   * Allocate a port for an app
+   * If the app already has a port in config/state and it's available, reuse it
+   * Otherwise allocate a new port from the configured range
+   */
+  private allocatePort(appName?: string): number {
+    // Check if app already has a port assigned in config file (source of truth)
+    if (appName && this.appConfigService) {
+      const config = this.appConfigService.getConfig(appName);
+      if (config?.port) {
+        const portOwner = this.usedPorts.get(config.port);
+        // Allow reuse if port is free OR owned by the same app
+        if (!portOwner || portOwner === appName) {
+          this.logger.debug(`Reusing port ${config.port} for ${appName} (from config)`, 'PORT');
+          this.usedPorts.set(config.port, appName);
+          return config.port;
+        }
+        this.logger.debug(`Port ${config.port} for ${appName} is used by ${portOwner}, allocating new`, 'PORT');
+      }
+    }
+
+    // Fallback: check state manager
+    if (appName && this.stateManager) {
+      const appState = this.stateManager.getApp(appName);
+      if (appState?.port) {
+        const portOwner = this.usedPorts.get(appState.port);
+        // Allow reuse if port is free OR owned by the same app
+        if (!portOwner || portOwner === appName) {
+          this.logger.debug(`Reusing port ${appState.port} for ${appName} (from state)`, 'PORT');
+          this.usedPorts.set(appState.port, appName);
+          return appState.port;
+        }
+        this.logger.debug(`Port ${appState.port} for ${appName} is used by ${portOwner}, allocating new`, 'PORT');
+      }
+    }
+
+    // Allocate a new port
     while (this.usedPorts.has(this.nextPort) && this.nextPort <= this.config.portRangeEnd) {
       this.nextPort++;
     }
@@ -844,7 +1142,11 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     }
 
     const port = this.nextPort;
-    this.usedPorts.add(port);
+    if (appName) {
+      this.usedPorts.set(port, appName);
+    } else {
+      this.usedPorts.set(port, '__anonymous__');
+    }
     this.nextPort++;
     return port;
   }
@@ -854,33 +1156,63 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
   }
 
   /**
-   * Load used ports from existing PM2 processes
+   * Load used ports from config files, state manager, and PM2 processes
    * This ensures we don't allocate ports that are already in use
+   * Priority: Config files (source of truth) > PM2 running processes > State manager
    */
   private async loadUsedPorts(): Promise<void> {
-    if (!this.processManager) return;
+    const portSources: Map<number, string> = new Map();
 
-    try {
-      const processes = await this.processManager.getAllStatus();
-      for (const proc of processes) {
-        if (proc.port && proc.status === 'online') {
-          this.usedPorts.add(proc.port);
-          this.logger.debug(`Port ${proc.port} already in use by ${proc.name}`, 'PORT');
+    // 1. Load from app config files (source of truth for port assignments)
+    if (this.appConfigService) {
+      for (const config of this.appConfigService.getAllConfigs()) {
+        if (config.port) {
+          portSources.set(config.port, config.name);
+          this.logger.debug(`Port ${config.port} assigned to ${config.name} (from config)`, 'PORT');
         }
       }
-
-      // Find the highest used port to set nextPort correctly
-      if (this.usedPorts.size > 0) {
-        const maxPort = Math.max(...this.usedPorts);
-        if (maxPort >= this.nextPort) {
-          this.nextPort = maxPort + 1;
-        }
-      }
-
-      this.logger.info(`Loaded ${this.usedPorts.size} used ports from running apps`, 'PORT');
-    } catch (error) {
-      this.logger.warn('Failed to load used ports from PM2', 'PORT', error);
     }
+
+    // 2. Load from state manager (fallback for apps not yet in config)
+    if (this.stateManager) {
+      for (const app of this.stateManager.getAllApps()) {
+        if (app.port && !portSources.has(app.port)) {
+          portSources.set(app.port, app.name);
+          this.logger.debug(`Port ${app.port} assigned to ${app.name} (from state)`, 'PORT');
+        }
+      }
+    }
+
+    // 3. Load from PM2 (actually running processes)
+    //    These take precedence as they represent the current runtime state
+    if (this.processManager) {
+      try {
+        const processes = await this.processManager.getAllStatus();
+        for (const proc of processes) {
+          if (proc.port && proc.status === 'online') {
+            portSources.set(proc.port, proc.name);
+            this.logger.debug(`Port ${proc.port} in use by ${proc.name} (from PM2)`, 'PORT');
+          }
+        }
+      } catch (error) {
+        this.logger.warn('Failed to load used ports from PM2', 'PORT', error);
+      }
+    }
+
+    // Add all ports to usedPorts with their owning app name
+    for (const [port, appName] of portSources.entries()) {
+      this.usedPorts.set(port, appName);
+    }
+
+    // Find the highest used port to set nextPort correctly
+    if (this.usedPorts.size > 0) {
+      const maxPort = Math.max(...this.usedPorts.keys());
+      if (maxPort >= this.nextPort) {
+        this.nextPort = maxPort + 1;
+      }
+    }
+
+    this.logger.info(`Loaded ${this.usedPorts.size} used ports from running apps and state`, 'PORT');
   }
 
   /** @deprecated Use this.logger instead */
@@ -919,6 +1251,10 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
 
   getStateManager(): AppStateManager | null {
     return this.stateManager;
+  }
+
+  getAppConfigService(): AppConfigService | null {
+    return this.appConfigService;
   }
 
   getPostgresServer(): PostgresServer | null {

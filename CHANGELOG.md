@@ -7,6 +7,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-01-18
+
+First stable release of DROP with full deployment pipeline, hot-reload, and database auto-provisioning.
+
+### Added
+
+- **Hot Reload** - Automatic rebuild/restart when app files change
+  - Detects changes to .ts, .js, .tsx, .jsx, .py, .go, .rs files
+  - Detects changes to package.json, requirements.txt, Dockerfile, etc.
+  - 2-second debounce to batch rapid changes
+  - 5-second cooldown after deploys to prevent loops
+
+- **PostgreSQL Auto-Provisioning**
+  - Bundled PostgreSQL server with auto-start
+  - Per-app database creation
+  - Automatic `DATABASE_URL` injection
+  - Secure credential generation
+
+- **Port Persistence**
+  - Per-app YAML config files in `appconf/webapps/`
+  - Apps keep the same port across restarts
+  - Port ownership tracking to prevent conflicts
+
+- **REST API** (PRD-009)
+  - JWT authentication
+  - API key authentication
+  - Endpoints: GET/POST /api/apps, GET /api/apps/:name
+  - App management via API
+
+- **Daemon Mode**
+  - `drop serve -d` runs platform in background
+  - Proper process detachment
+
+- **App Config Service**
+  - Per-app YAML configuration files
+  - Stores: type, port, hostname, path, timestamps
+  - Source of truth for port assignments
+
+### Changed
+
+- Router now updates existing routes instead of throwing errors (upsert behavior)
+- File watcher uses polling by default on Windows for reliability
+- State manager preserves port on app re-registration
+
+### Fixed
+
+- Port allocation now tracks ownership (Map instead of Set)
+- Apps reuse their assigned port from config on restart
+- No more "Route already exists" errors on hot-reload
+
+### Technical
+
+- 390 passing tests
+- ESLint v9 flat config
+- TypeScript strict mode
+
+---
+
 ## [0.1.0-alpha.1] - 2026-01-03
 
 ### Added
@@ -47,45 +105,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Dynamic Caddyfile generation
   - Route management (add/remove/update)
   - TLS/SSL configuration support
-  - Load balancing options
-  - Automatic Caddy reload via admin API
 
 #### CLI Commands
 - `drop serve` - Start the DROP platform
-- `drop list` (alias: `ls`) - List all deployed applications
+- `drop list` - List all deployed applications
 - `drop status <app>` - Show detailed app status
-- `drop logs <app>` - View application logs (-n, -f, -e options)
+- `drop logs <app>` - View application logs
 - `drop start <app>` - Start an application
-- `drop stop <app>` - Stop an application (--force)
+- `drop stop <app>` - Stop an application
 - `drop restart <app>` - Restart an application
-- `drop deploy <path>` - Deploy app from path (--name, --port, --env)
-- `drop remove <app>` (alias: `rm`) - Remove an application (--force, --keep-data)
+- `drop deploy <path>` - Deploy app from path
+- `drop remove <app>` - Remove an application
 
 #### Infrastructure
 - Cross-platform support (Windows and Linux/macOS)
-- Configurable via environment variables (DROP_ROOT, DROP_APPS_DIR, DROP_LOG_LEVEL)
-- Structured logging system with file and console output
+- Configurable via environment variables
+- Structured logging system
 - Directory auto-creation on startup
 
-### Known Limitations
+---
 
-- **Database integration incomplete**: App Registry code exists but is not wired into the platform startup. App metadata is not persisted between restarts.
-- **Static server not implemented**: Static site detection works, but serving requires external HTTP server.
-- **Test coverage below target**: Overall coverage is ~52% (target: 80%). Process Manager and database operations have minimal coverage.
-- **No authentication**: Local access only, no security layer (planned for v0.2.0).
-- **HTTP only**: No automatic HTTPS (planned for v0.3.0).
-- **Single host only**: No clustering or replication (planned for v0.5.0).
+## Roadmap
 
-### Technical Notes
+### 0.2.0 (Planned)
+- Caddy reverse proxy integration
+- Hostname routing (myapp.localhost)
+- Automatic HTTPS with Let's Encrypt
 
-- Built with TypeScript 5.7, targeting Node.js 20+
-- Uses PM2 for process management
-- Uses Caddy for reverse proxy
-- PostgreSQL required for future database features (not used in this alpha)
+### 0.3.0 (Planned)
+- Web dashboard UI
+- Real-time log streaming
+- App metrics and monitoring
 
-## Version History
-
-- **0.1.0-alpha.1**: Initial alpha release with core deployment pipeline
-
-[Unreleased]: https://github.com/JulesNsenda/drop/compare/v0.1.0-alpha.1...HEAD
-[0.1.0-alpha.1]: https://github.com/JulesNsenda/drop/releases/tag/v0.1.0-alpha.1
+[Unreleased]: https://github.com/techamat/drop/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/techamat/drop/compare/v0.1.0-alpha.1...v0.1.0
+[0.1.0-alpha.1]: https://github.com/techamat/drop/releases/tag/v0.1.0-alpha.1

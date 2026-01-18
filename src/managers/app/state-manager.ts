@@ -75,11 +75,8 @@ export class AppStateManager {
           this.apps.set(app.name, app);
         }
       }
-    } catch (error) {
-      // File doesn't exist or is corrupted - start fresh
-      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
-        console.warn('Failed to load app state, starting fresh:', error);
-      }
+    } catch {
+      // File doesn't exist or is corrupted - start fresh silently
       this.apps.clear();
     }
   }
@@ -123,16 +120,23 @@ export class AppStateManager {
       hostname: `${name}.localhost`,
       createdAt: existing?.createdAt || now,
       updatedAt: now,
+      // Preserve important fields from existing state (for restart scenarios)
+      port: existing?.port,
+      lastDeployedAt: existing?.lastDeployedAt,
+      buildDuration: existing?.buildDuration,
     };
 
     this.apps.set(name, app);
     this.scheduleSave();
 
-    eventBus.publish('app:created', {
-      appId: name,
-      name,
-      type,
-    });
+    // Only emit app:created if this is a genuinely new app
+    if (!existing) {
+      eventBus.publish('app:created', {
+        appId: name,
+        name,
+        type,
+      });
+    }
 
     return app;
   }

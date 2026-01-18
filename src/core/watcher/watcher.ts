@@ -30,6 +30,25 @@ export class WatcherService {
   private eventsEmitted = 0;
   private errorsLogged = 0;
   private readonly knownApps: Set<string> = new Set();
+  private readonly pendingRebuilds: Map<string, NodeJS.Timeout> = new Map();
+  private readonly REBUILD_DEBOUNCE_MS = 2000;
+
+  /** File patterns that trigger a rebuild when changed */
+  private readonly REBUILD_TRIGGERS = [
+    'package.json',
+    // Note: lock files are excluded to prevent infinite loops (npm install modifies them)
+    'requirements.txt',
+    'Pipfile',
+    'pyproject.toml',
+    'Dockerfile',
+    'docker-compose.yml',
+    'docker-compose.yaml',
+    'drop.yaml',
+    'tsconfig.json',
+  ];
+
+  /** File extensions that trigger a rebuild when changed */
+  private readonly REBUILD_EXTENSIONS = ['.ts', '.js', '.tsx', '.jsx', '.py', '.go', '.rs'];
 
   constructor(config: Partial<WatcherConfig> = {}) {
     this.config = createWatcherConfig(config);
@@ -248,13 +267,73 @@ export class WatcherService {
     });
   }
 
-  private handleFileChange(_appName: string, change: PendingChange): void {
+  private handleFileChange(appName: string, change: PendingChange): void {
     this.eventsEmitted++;
 
     eventBus.publish('watcher:change', {
       path: change.path,
       changeType: change.type,
       relativePath: change.relativePath,
+    });
+
+    // Check if this is a significant file change that should trigger a rebuild
+    if (this.shouldTriggerRebuild(change.path)) {
+      this.scheduleRebuild(appName, change.path);
+    }
+  }
+
+  /**
+   * Check if a file change should trigger an app rebuild
+   */
+  private shouldTriggerRebuild(filePath: string): boolean {
+    const fileName = path.basename(filePath);
+    const ext = path.extname(filePath);
+
+    // Check for specific trigger files
+    if (this.REBUILD_TRIGGERS.includes(fileName)) {
+      return true;
+    }
+
+    // Check for trigger extensions
+    if (this.REBUILD_EXTENSIONS.includes(ext)) {
+      return true;
+    }
+
+    return false;
+  }
+
+  /**
+   * Schedule a debounced rebuild for an app
+   * Multiple file changes within the debounce window are coalesced into one rebuild
+   */
+  private scheduleRebuild(appName: string, changedFile: string): void {
+    // Cancel any pending rebuild for this app
+    const existing = this.pendingRebuilds.get(appName);
+    if (existing) {
+      clearTimeout(existing);
+    }
+
+    // Schedule a new rebuild
+    const timeout = setTimeout(() => {
+      this.pendingRebuilds.delete(appName);
+      this.emitAppUpdate(appName, changedFile);
+    }, this.REBUILD_DEBOUNCE_MS);
+
+    this.pendingRebuilds.set(appName, timeout);
+  }
+
+  /**
+   * Emit an app:update event to trigger rebuild/restart
+   */
+  private emitAppUpdate(appName: string, changedFile: string): void {
+    const appPath = path.join(this.config.appsDir, appName);
+
+    this.eventsEmitted++;
+
+    eventBus.publish('app:update', {
+      name: appName,
+      path: appPath,
+      reason: `File changed: ${path.basename(changedFile)}`,
     });
   }
 
