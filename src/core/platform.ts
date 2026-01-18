@@ -16,6 +16,7 @@ import { ProcessManager, getProcessManager, resetProcessManager } from '../manag
 import { AppStateManager, getStateManager, resetStateManager } from '../managers/app/state-manager';
 import { AppConfigService, getAppConfigService, resetAppConfigService } from '../managers/app/app-config';
 import { PostgresServer, getPostgresServer, resetPostgresServer, DatabaseProvisioner } from '../managers/database';
+import { ApiServer, createApiServer } from '../api';
 import { Logger, createLogger } from '../utils/logger';
 
 export interface PlatformConfig {
@@ -91,6 +92,7 @@ export class DropPlatform {
   private appConfigService: AppConfigService | null = null;
   private postgresServer: PostgresServer | null = null;
   private dbProvisioner: DatabaseProvisioner | null = null;
+  private apiServer: ApiServer | null = null;
 
   private subscriptions: Unsubscribe[] = [];
   private isRunning = false;
@@ -156,6 +158,11 @@ export class DropPlatform {
         await this.watcher.start();
       }
 
+      // Start API server if enabled
+      if (this.config.enableApi) {
+        await this.startApiServer();
+      }
+
       this.isRunning = true;
       this.eventBus.publish('platform:started', { timestamp: new Date() });
       this.logger.platformEvent('started');
@@ -211,6 +218,12 @@ export class DropPlatform {
       this.logger.info('Stopping PostgreSQL...', 'DATABASE');
       await this.postgresServer.stop();
       resetPostgresServer();
+    }
+
+    // Stop API server
+    if (this.apiServer) {
+      await this.apiServer.stop();
+      this.apiServer = null;
     }
 
     this.isRunning = false;
@@ -493,6 +506,29 @@ import ${path.join(dataDir, 'appconf', 'caddy', 'hosts', '*.caddy').replace(/\\/
       debounceMs: 1000,
       maxDepth: 2,
     });
+  }
+
+  /**
+   * Start the REST API server
+   */
+  private async startApiServer(): Promise<void> {
+    const credentialsPath = path.join(this.config.dropRoot, 'data', 'drop-svc', 'api-credentials.json');
+
+    this.apiServer = createApiServer({
+      port: this.config.apiPort,
+      host: '0.0.0.0',
+      credentialsPath,
+      enableAuth: this.config.enableApiAuth,
+    });
+
+    await this.apiServer.initialize();
+    await this.apiServer.start();
+
+    this.logger.info(`API server running on port ${this.config.apiPort}`, 'API');
+    if (this.config.enableApiAuth) {
+      this.logger.info('API authentication: ENABLED', 'API');
+    }
+    this.logger.info(`Dashboard available at http://localhost:${this.config.apiPort}/dashboard`, 'API');
   }
 
   /**
@@ -866,6 +902,10 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         }
       }
 
+      // Create persistent data directory for the app
+      const dataDir = await this.ensureAppDataDirectory(appName);
+      this.logger.info(`Data directory: ${dataDir}`, 'DATA');
+
       // Check if app needs a database and provision one
       let dbEnvVars: Record<string, string> = {};
       const needsDb = await this.appNeedsDatabase(appPath, detection.suggestedConfig?.database);
@@ -884,6 +924,9 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         await this.generateStaticConfig(appPath, depEnvVars);
       }
 
+      // Configure log files with dated filenames (auto-captured from stdout/stderr)
+      const { outFile, errorFile } = await this.getAppLogPaths(appName);
+
       const status = await this.processManager.start({
         name: appName,
         script,
@@ -891,9 +934,12 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         args,
         cwd: appPath,
         port,
+        outFile,
+        errorFile,
         env: {
           NODE_ENV: 'production',
           PORT: port.toString(),
+          DROP_DATA_DIR: dataDir,
           ...dbEnvVars,
           ...depEnvVars,
         },
@@ -901,10 +947,11 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
 
       this.logger.appEvent('started', appName, `PID ${status.pid}, port ${port}`);
 
-      // Save port to config file (source of truth for restarts)
+      // Save port and data directory to config file (source of truth for restarts)
       if (this.appConfigService) {
         await this.appConfigService.updateConfig(appName, {
           port,
+          dataDir,
           lastDeployedAt: new Date().toISOString(),
         });
       }
@@ -1049,6 +1096,9 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         script = startCommand.startsWith('node ') ? startCommand.substring(5) : startCommand;
       }
 
+      // Ensure data directory exists (preserved across upgrades)
+      const dataDir = await this.ensureAppDataDirectory(appName);
+
       // Get database env vars if needed
       let dbEnvVars: Record<string, string> = {};
       if (this.dbProvisioner) {
@@ -1063,15 +1113,21 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         await this.generateStaticConfig(appPath, depEnvVars);
       }
 
+      // Configure log files with dated filenames (auto-captured from stdout/stderr)
+      const { outFile, errorFile } = await this.getAppLogPaths(appName);
+
       const status = await this.processManager.start({
         name: appName,
         script,
         args,
         cwd: appPath,
         port,
+        outFile,
+        errorFile,
         env: {
           NODE_ENV: 'production',
           PORT: port.toString(),
+          DROP_DATA_DIR: dataDir,
           ...dbEnvVars,
           ...depEnvVars,
         },
@@ -1094,6 +1150,62 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       });
       this.appsInProgress.delete(appName);
     }
+  }
+
+  /**
+   * Get the log file paths for an app with today's date.
+   * Format: {appName}-YYYY-MM-DD-out.log and {appName}-YYYY-MM-DD-err.log
+   * Creates the log directory if it doesn't exist.
+   */
+  private async getAppLogPaths(appName: string): Promise<{ outFile: string; errorFile: string; logDir: string }> {
+    const logDir = path.join(this.config.dropRoot, 'data', 'logs', 'webapps', appName);
+
+    // Ensure log directory exists
+    try {
+      await fs.mkdir(logDir, { recursive: true });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') {
+        this.logger.warn(`Failed to create log directory for ${appName}`, 'LOGS', error);
+      }
+    }
+
+    // Format: appName-YYYY-MM-DD-out.log
+    const today = new Date().toISOString().split('T')[0]; // YYYY-MM-DD
+    const outFile = path.join(logDir, `${appName}-${today}-out.log`);
+    const errorFile = path.join(logDir, `${appName}-${today}-err.log`);
+
+    return { outFile, errorFile, logDir };
+  }
+
+  /**
+   * Ensure a persistent data directory exists for an app.
+   * This directory survives app upgrades (source code replacements).
+   * Returns the absolute path to the app's data directory.
+   */
+  private async ensureAppDataDirectory(appName: string): Promise<string> {
+    const dataDir = path.join(this.config.dropRoot, 'data', 'appdata', appName);
+
+    try {
+      await fs.mkdir(dataDir, { recursive: true });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') {
+        this.logger.warn(`Failed to create data directory for ${appName}`, 'DATA', error);
+      }
+    }
+
+    // Create common subdirectories that apps often need
+    const commonSubdirs = ['uploads', 'logs', 'cache'];
+    for (const subdir of commonSubdirs) {
+      try {
+        await fs.mkdir(path.join(dataDir, subdir), { recursive: true });
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'EEXIST') {
+          this.logger.debug(`Failed to create ${subdir} subdirectory for ${appName}`, 'DATA');
+        }
+      }
+    }
+
+    return dataDir;
   }
 
   /**
