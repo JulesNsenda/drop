@@ -924,6 +924,9 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         await this.generateStaticConfig(appPath, depEnvVars);
       }
 
+      // Configure log files with dated filenames (auto-captured from stdout/stderr)
+      const { outFile, errorFile } = await this.getAppLogPaths(appName);
+
       const status = await this.processManager.start({
         name: appName,
         script,
@@ -931,6 +934,8 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         args,
         cwd: appPath,
         port,
+        outFile,
+        errorFile,
         env: {
           NODE_ENV: 'production',
           PORT: port.toString(),
@@ -1108,12 +1113,17 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         await this.generateStaticConfig(appPath, depEnvVars);
       }
 
+      // Configure log files with dated filenames (auto-captured from stdout/stderr)
+      const { outFile, errorFile } = await this.getAppLogPaths(appName);
+
       const status = await this.processManager.start({
         name: appName,
         script,
         args,
         cwd: appPath,
         port,
+        outFile,
+        errorFile,
         env: {
           NODE_ENV: 'production',
           PORT: port.toString(),
@@ -1140,6 +1150,31 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       });
       this.appsInProgress.delete(appName);
     }
+  }
+
+  /**
+   * Get the log file paths for an app with today's date.
+   * Format: {appName}-YYYY-MM-DD-out.log and {appName}-YYYY-MM-DD-err.log
+   * Creates the log directory if it doesn't exist.
+   */
+  private async getAppLogPaths(appName: string): Promise<{ outFile: string; errorFile: string; logDir: string }> {
+    const logDir = path.join(this.config.dropRoot, 'data', 'logs', 'webapps', appName);
+
+    // Ensure log directory exists
+    try {
+      await fs.mkdir(logDir, { recursive: true });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') {
+        this.logger.warn(`Failed to create log directory for ${appName}`, 'LOGS', error);
+      }
+    }
+
+    // Format: appName-YYYY-MM-DD-out.log
+    const today = new Date().toISOString().split('T')[0]; // YYYY-MM-DD
+    const outFile = path.join(logDir, `${appName}-${today}-out.log`);
+    const errorFile = path.join(logDir, `${appName}-${today}-err.log`);
+
+    return { outFile, errorFile, logDir };
   }
 
   /**
