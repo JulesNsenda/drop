@@ -13,6 +13,16 @@ import {
 } from './router.types';
 
 /**
+ * Check if a hostname is a localhost domain (e.g., myapp.localhost)
+ */
+function isLocalhostDomain(hostname: string): boolean {
+  return hostname === 'localhost' ||
+    hostname.endsWith('.localhost') ||
+    hostname === '127.0.0.1' ||
+    hostname.startsWith('127.0.0.1:');
+}
+
+/**
  * Generate Caddyfile content from routes
  */
 export function generateCaddyfile(
@@ -20,6 +30,9 @@ export function generateCaddyfile(
   config: CaddyConfig
 ): string {
   const lines: string[] = [];
+
+  // Check if all routes are localhost (for auto_https off)
+  const hasNonLocalhostRoutes = routes.some(r => !isLocalhostDomain(r.hostname));
 
   // Global options block
   lines.push('{');
@@ -34,12 +47,16 @@ export function generateCaddyfile(
   } else if (config.adminApi) {
     lines.push(`\tadmin ${config.adminApi}`);
   }
+  // Disable auto HTTPS for localhost-only deployments
+  if (!hasNonLocalhostRoutes) {
+    lines.push('\tauto_https off');
+  }
   lines.push('}');
   lines.push('');
 
   // Generate route blocks
   for (const route of routes) {
-    const block = generateRouteBlock(route);
+    const block = generateRouteBlock(route, isLocalhostDomain(route.hostname));
     lines.push(formatBlock(block));
     lines.push('');
   }
@@ -49,12 +66,14 @@ export function generateCaddyfile(
 
 /**
  * Generate a single route block
+ * @param route - Route configuration
+ * @param isLocalhost - Whether this is a localhost domain (skips TLS)
  */
-export function generateRouteBlock(route: RouteConfig): CaddyBlock {
+export function generateRouteBlock(route: RouteConfig, isLocalhost = false): CaddyBlock {
   const directives: CaddyDirective[] = [];
 
-  // TLS configuration
-  if (route.ssl) {
+  // TLS configuration (skip for localhost domains)
+  if (route.ssl && !isLocalhost) {
     const tlsDirective = generateTlsDirective(route);
     if (tlsDirective) {
       directives.push(tlsDirective);
@@ -310,6 +329,9 @@ export function generateFullCaddyfile(
 ): string {
   const lines: string[] = [];
 
+  // Check if all routes are localhost (for auto_https off)
+  const hasNonLocalhostRoutes = routes.some(r => !isLocalhostDomain(r.hostname));
+
   // Global options block
   lines.push('{');
   if (config.acmeEmail) {
@@ -323,21 +345,28 @@ export function generateFullCaddyfile(
   } else if (config.adminApi) {
     lines.push(`\tadmin ${config.adminApi}`);
   }
+  // Disable auto HTTPS for localhost-only deployments
+  if (!hasNonLocalhostRoutes) {
+    lines.push('\tauto_https off');
+  }
   lines.push('}');
   lines.push('');
 
-  // Generate HTTP redirect blocks first
+  // Generate HTTP redirect blocks first (skip for localhost domains)
   for (const route of routes) {
-    const redirectBlock = generateHttpRedirectBlock(route);
-    if (redirectBlock) {
-      lines.push(formatBlock(redirectBlock));
-      lines.push('');
+    if (!isLocalhostDomain(route.hostname)) {
+      const redirectBlock = generateHttpRedirectBlock(route);
+      if (redirectBlock) {
+        lines.push(formatBlock(redirectBlock));
+        lines.push('');
+      }
     }
   }
 
   // Generate route blocks
   for (const route of routes) {
-    const block = generateRouteBlock(route);
+    const isLocalhost = isLocalhostDomain(route.hostname);
+    const block = generateRouteBlock(route, isLocalhost);
     lines.push(formatBlock(block));
     lines.push('');
   }
