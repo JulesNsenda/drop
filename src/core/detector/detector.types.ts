@@ -95,6 +95,15 @@ export interface DropManifest {
     interval?: number;
   };
   domains?: string[];
+  /**
+   * Persistent data directory configuration.
+   * Data stored here persists across app upgrades (source code replacements).
+   * If not specified, a default data directory is created at {dropRoot}/data/appdata/{appName}/
+   */
+  dataDirectory?: {
+    /** Subdirectories to create within the data directory */
+    subdirs?: string[];
+  };
 }
 
 // Package.json structure (partial)

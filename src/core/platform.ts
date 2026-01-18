@@ -902,6 +902,10 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         }
       }
 
+      // Create persistent data directory for the app
+      const dataDir = await this.ensureAppDataDirectory(appName);
+      this.logger.info(`Data directory: ${dataDir}`, 'DATA');
+
       // Check if app needs a database and provision one
       let dbEnvVars: Record<string, string> = {};
       const needsDb = await this.appNeedsDatabase(appPath, detection.suggestedConfig?.database);
@@ -930,6 +934,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         env: {
           NODE_ENV: 'production',
           PORT: port.toString(),
+          DROP_DATA_DIR: dataDir,
           ...dbEnvVars,
           ...depEnvVars,
         },
@@ -937,10 +942,11 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
 
       this.logger.appEvent('started', appName, `PID ${status.pid}, port ${port}`);
 
-      // Save port to config file (source of truth for restarts)
+      // Save port and data directory to config file (source of truth for restarts)
       if (this.appConfigService) {
         await this.appConfigService.updateConfig(appName, {
           port,
+          dataDir,
           lastDeployedAt: new Date().toISOString(),
         });
       }
@@ -1085,6 +1091,9 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         script = startCommand.startsWith('node ') ? startCommand.substring(5) : startCommand;
       }
 
+      // Ensure data directory exists (preserved across upgrades)
+      const dataDir = await this.ensureAppDataDirectory(appName);
+
       // Get database env vars if needed
       let dbEnvVars: Record<string, string> = {};
       if (this.dbProvisioner) {
@@ -1108,6 +1117,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         env: {
           NODE_ENV: 'production',
           PORT: port.toString(),
+          DROP_DATA_DIR: dataDir,
           ...dbEnvVars,
           ...depEnvVars,
         },
@@ -1130,6 +1140,37 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       });
       this.appsInProgress.delete(appName);
     }
+  }
+
+  /**
+   * Ensure a persistent data directory exists for an app.
+   * This directory survives app upgrades (source code replacements).
+   * Returns the absolute path to the app's data directory.
+   */
+  private async ensureAppDataDirectory(appName: string): Promise<string> {
+    const dataDir = path.join(this.config.dropRoot, 'data', 'appdata', appName);
+
+    try {
+      await fs.mkdir(dataDir, { recursive: true });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') {
+        this.logger.warn(`Failed to create data directory for ${appName}`, 'DATA', error);
+      }
+    }
+
+    // Create common subdirectories that apps often need
+    const commonSubdirs = ['uploads', 'logs', 'cache'];
+    for (const subdir of commonSubdirs) {
+      try {
+        await fs.mkdir(path.join(dataDir, subdir), { recursive: true });
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'EEXIST') {
+          this.logger.debug(`Failed to create ${subdir} subdirectory for ${appName}`, 'DATA');
+        }
+      }
+    }
+
+    return dataDir;
   }
 
   /**
