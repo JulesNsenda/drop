@@ -16,6 +16,7 @@ import { ProcessManager, getProcessManager, resetProcessManager } from '../manag
 import { AppStateManager, getStateManager, resetStateManager } from '../managers/app/state-manager';
 import { AppConfigService, getAppConfigService, resetAppConfigService } from '../managers/app/app-config';
 import { PostgresServer, getPostgresServer, resetPostgresServer, DatabaseProvisioner } from '../managers/database';
+import { CaddyServer, getCaddyServer, resetCaddyServer } from '../managers/router';
 import { ApiServer, createApiServer } from '../api';
 import { Logger, createLogger } from '../utils/logger';
 
@@ -92,6 +93,7 @@ export class DropPlatform {
   private appConfigService: AppConfigService | null = null;
   private postgresServer: PostgresServer | null = null;
   private dbProvisioner: DatabaseProvisioner | null = null;
+  private caddyServer: CaddyServer | null = null;
   private apiServer: ApiServer | null = null;
 
   private subscriptions: Unsubscribe[] = [];
@@ -218,6 +220,13 @@ export class DropPlatform {
       this.logger.info('Stopping PostgreSQL...', 'DATABASE');
       await this.postgresServer.stop();
       resetPostgresServer();
+    }
+
+    // Stop Caddy server
+    if (this.caddyServer) {
+      this.logger.info('Stopping Caddy...', 'CADDY');
+      await this.caddyServer.stop();
+      resetCaddyServer();
     }
 
     // Stop API server
@@ -495,9 +504,28 @@ import ${path.join(dataDir, 'appconf', 'caddy', 'hosts', '*.caddy').replace(/\\/
         autoReload: true,
         acmeEmail: this.config.acmeEmail,
         acmeStaging: this.config.acmeStaging,
-        enableAdminApi: false,
+        enableAdminApi: true,
+        adminApi: 'localhost:2019',
       },
     });
+
+    // Initialize Caddy server (for hostname-based routing)
+    this.caddyServer = getCaddyServer({
+      dropRoot: this.config.dropRoot,
+      caddyfilePath: this.config.caddyfilePath,
+      onLog: (msg) => this.logger.debug(msg, 'CADDY'),
+    });
+
+    const caddyAvailable = await this.caddyServer.ensureReady((msg) => {
+      this.logger.info(msg, 'CADDY');
+    });
+
+    if (caddyAvailable) {
+      await this.caddyServer.start();
+      this.logger.info(`Caddy server running on port ${this.caddyServer.getPort()}`, 'CADDY');
+    } else {
+      this.logger.warn('Caddy not available - apps accessible via direct ports only', 'CADDY');
+    }
 
     // Initialize watcher (watches apps directory)
     this.watcher = new WatcherService({
@@ -995,8 +1023,19 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         tls: enableSsl ? { auto: true } : undefined,
       });
 
+      // Reload Caddy to apply new route
+      if (this.caddyServer && this.caddyServer.getStatus() === 'running') {
+        await this.caddyServer.reload();
+      }
+
       const protocol = enableSsl ? 'https' : 'http';
-      this.logger.info(`Route configured: ${protocol}://${hostname} -> localhost:${port}`, 'ROUTER');
+      const caddyAvailable = this.caddyServer?.getStatus() === 'running';
+
+      if (caddyAvailable) {
+        this.logger.info(`Route configured: ${protocol}://${hostname} -> localhost:${port}`, 'ROUTER');
+      } else {
+        this.logger.info(`Route configured: localhost:${port} (Caddy unavailable for ${hostname})`, 'ROUTER');
+      }
     } catch (error) {
       // Route might already exist
       this.logger.warn(`Failed to configure route for ${appName}`, 'ROUTER', error);
@@ -1375,6 +1414,10 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
 
   getDatabaseProvisioner(): DatabaseProvisioner | null {
     return this.dbProvisioner;
+  }
+
+  getCaddyServer(): CaddyServer | null {
+    return this.caddyServer;
   }
 
   isActive(): boolean {

@@ -67,6 +67,7 @@ Router (Caddy config)  → Route configured
 - **BuilderService** (`src/core/builder/`): Runs install/build commands. Uses strategy pattern for different app types
 - **ProcessManager** (`src/managers/process/`): PM2 wrapper for process lifecycle. Singleton at `getProcessManager()`
 - **RouterService** (`src/core/router/`): Generates Caddy configuration for reverse proxy
+- **CaddyServer** (`src/managers/router/caddy-server.ts`): Manages Caddy process for hostname-based routing. Singleton at `getCaddyServer()`
 - **AppStateManager** (`src/managers/app/state-manager.ts`): Tracks app status in `apps.json`. Singleton at `getStateManager()`
 - **PostgresServer** (`src/managers/database/postgres-server.ts`): Bundled PostgreSQL with auto-provisioning. Singleton at `getPostgresServer()`
 - **DatabaseProvisioner** (`src/managers/database/database-provisioner.ts`): Auto-provisions per-app PostgreSQL databases
