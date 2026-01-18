@@ -44,14 +44,14 @@ export class RouterService {
   }
 
   /**
-   * Add a new route
+   * Add a new route (or update if it already exists)
    */
   async addRoute(routeConfig: RouteConfig): Promise<Route> {
     const { appName } = routeConfig;
 
-    // Check if route already exists
+    // If route already exists, update it instead
     if (this.routes.has(appName)) {
-      throw new Error(`Route already exists: ${appName}`);
+      return this.updateRoute(appName, routeConfig);
     }
 
     // Apply defaults

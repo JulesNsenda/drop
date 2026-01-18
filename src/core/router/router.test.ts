@@ -426,7 +426,7 @@ describe('RouterService', () => {
       expect(router.hasRoute('test-app')).toBe(true);
     });
 
-    it('should throw if route already exists', async () => {
+    it('should update route if it already exists', async () => {
       const router = new RouterService({
         caddy: { caddyfilePath: testCaddyfilePath },
       });
@@ -439,15 +439,17 @@ describe('RouterService', () => {
         redirectHttps: false,
       });
 
-      await expect(
-        router.addRoute({
-          appName: 'test-app',
-          hostname: 'test2.example.com',
-          upstream: 'localhost:3001',
-          ssl: false,
-          redirectHttps: false,
-        })
-      ).rejects.toThrow('Route already exists');
+      // Adding same app again should update, not throw
+      const updatedRoute = await router.addRoute({
+        appName: 'test-app',
+        hostname: 'test2.example.com',
+        upstream: 'localhost:3001',
+        ssl: false,
+        redirectHttps: false,
+      });
+
+      expect(updatedRoute.hostname).toBe('test2.example.com');
+      expect(updatedRoute.upstream).toBe('localhost:3001');
     });
 
     it('should write Caddyfile after adding route', async () => {

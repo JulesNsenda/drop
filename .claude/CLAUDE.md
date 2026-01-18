@@ -67,6 +67,9 @@ Router (Caddy config)  → Route configured
 - **BuilderService** (`src/core/builder/`): Runs install/build commands. Uses strategy pattern for different app types
 - **ProcessManager** (`src/managers/process/`): PM2 wrapper for process lifecycle. Singleton at `getProcessManager()`
 - **RouterService** (`src/core/router/`): Generates Caddy configuration for reverse proxy
+- **AppStateManager** (`src/managers/app/state-manager.ts`): Tracks app status in `apps.json`. Singleton at `getStateManager()`
+- **PostgresServer** (`src/managers/database/postgres-server.ts`): Bundled PostgreSQL with auto-provisioning. Singleton at `getPostgresServer()`
+- **DatabaseProvisioner** (`src/managers/database/database-provisioner.ts`): Auto-provisions per-app PostgreSQL databases
 
 ### Path Aliases
 
@@ -74,8 +77,10 @@ Configured in `tsconfig.json` and `jest.config.js`:
 - `@/*` → `src/*`
 - `@core/*` → `src/core/*`
 - `@managers/*` → `src/managers/*`
+- `@api/*` → `src/api/*`
 - `@cli/*` → `src/cli/*`
 - `@utils/*` → `src/utils/*`
+- `@types/*` → `src/types/*`
 
 ### Directory Structure (Runtime)
 
@@ -108,5 +113,6 @@ Configured in `tsconfig.json` and `jest.config.js`:
 
 - **Singletons**: EventBus, ProcessManager, RouterService use singleton pattern with `get*()` and `reset*()` functions
 - **Builder Strategies**: `src/core/builder/strategies/` contains per-app-type build logic (nodejs.ts, python.ts, static.ts, docker.ts)
-- **Detector Chain**: Multiple detectors in `src/core/detector/detectors/` run in priority order
+- **Detector Chain**: Multiple detectors in `src/core/detector/detectors/` run in priority order (manifest.ts, nodejs.ts, python.ts, docker.ts, static.ts)
 - **Zod Validation**: Use zod for runtime type validation (see existing schemas)
+- **Typed Events**: Events use TypeScript discriminated unions for type safety (`EventPayloadMap` in `event-bus.types.ts`)

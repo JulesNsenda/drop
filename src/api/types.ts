@@ -1,0 +1,116 @@
+/**
+ * REST API Types
+ *
+ * Type definitions for the DROP REST API.
+ */
+
+import { AppStatus, AppType } from '../managers/app/state-manager';
+
+// API Response wrapper
+export interface ApiResponse<T = unknown> {
+  success: boolean;
+  data?: T;
+  error?: ApiError;
+  meta?: ApiMeta;
+}
+
+export interface ApiError {
+  code: string;
+  message: string;
+  details?: unknown;
+}
+
+export interface ApiMeta {
+  page?: number;
+  limit?: number;
+  total?: number;
+  totalPages?: number;
+}
+
+// App DTOs
+export interface AppDto {
+  name: string;
+  type: AppType;
+  status: AppStatus;
+  port?: number;
+  pid?: number;
+  path: string;
+  framework?: string;
+  hostname?: string;
+  createdAt: string;
+  updatedAt: string;
+  lastDeployedAt?: string;
+  buildDuration?: number;
+  error?: string;
+}
+
+export interface CreateAppDto {
+  path: string;
+  name?: string;
+}
+
+export interface UpdateAppDto {
+  status?: AppStatus;
+}
+
+export interface AppLogsDto {
+  name: string;
+  logs: string[];
+  type: 'stdout' | 'stderr' | 'combined';
+}
+
+// Health DTOs
+export interface HealthDto {
+  status: 'healthy' | 'degraded' | 'unhealthy';
+  version: string;
+  uptime: number;
+  timestamp: string;
+  components: {
+    platform: ComponentHealth;
+    processManager: ComponentHealth;
+    database?: ComponentHealth;
+  };
+}
+
+export interface ComponentHealth {
+  status: 'up' | 'down' | 'unknown';
+  message?: string;
+}
+
+// Stats DTOs
+export interface StatsDto {
+  apps: {
+    total: number;
+    running: number;
+    stopped: number;
+    errored: number;
+  };
+  system: {
+    platform: string;
+    nodeVersion: string;
+    uptime: number;
+  };
+}
+
+// Helper to create success response
+export function success<T>(data: T, meta?: ApiMeta): ApiResponse<T> {
+  return { success: true, data, meta };
+}
+
+// Helper to create error response
+export function error(code: string, message: string, details?: unknown): ApiResponse {
+  return {
+    success: false,
+    error: { code, message, details },
+  };
+}
+
+// Common error codes
+export const ErrorCodes = {
+  NOT_FOUND: 'NOT_FOUND',
+  VALIDATION_ERROR: 'VALIDATION_ERROR',
+  INTERNAL_ERROR: 'INTERNAL_ERROR',
+  CONFLICT: 'CONFLICT',
+  BAD_REQUEST: 'BAD_REQUEST',
+  UNAUTHORIZED: 'UNAUTHORIZED',
+} as const;
