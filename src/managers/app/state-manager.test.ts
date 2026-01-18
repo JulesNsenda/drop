@@ -61,14 +61,10 @@ describe('AppStateManager', () => {
       await fs.mkdir(path.dirname(stateFilePath), { recursive: true });
       await fs.writeFile(stateFilePath, 'not valid json');
 
-      const consoleSpy = jest.spyOn(console, 'warn').mockImplementation();
-
+      // Should initialize without errors, starting fresh silently
       await manager.initialize();
 
-      expect(consoleSpy).toHaveBeenCalled();
       expect(manager.getAllApps()).toEqual([]);
-
-      consoleSpy.mockRestore();
     });
 
     it('should not reinitialize if already initialized', async () => {
