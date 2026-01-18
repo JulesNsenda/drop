@@ -18,6 +18,9 @@ A lightweight, self-hosted Platform as a Service (PaaS) engineered for the "drop
 - **Framework Detection** - Recognizes Next.js, Nuxt, Express, FastAPI, Flask, and more
 - **Process Management** - Built on PM2 for reliable process management with auto-restart
 - **REST API** - Full API with JWT and API key authentication
+- **Web Dashboard** - Real-time monitoring UI at `/dashboard`
+- **Auto-Capture Logging** - Stdout/stderr captured to dated log files automatically
+- **Persistent Data Directories** - App data survives upgrades (`DROP_DATA_DIR`)
 - **Cross-Platform** - Works on Windows, Linux, and macOS
 - **CLI Interface** - Full-featured command-line tool for management
 
@@ -150,16 +153,69 @@ curl -X POST http://localhost:3000/api/apps \
   -d '{"name": "my-app", "path": "/path/to/app"}'
 ```
 
+## Web Dashboard
+
+Access the dashboard at `http://localhost:3000/dashboard`:
+
+- **Apps List** - View all deployed apps with status indicators
+- **App Detail** - Start/stop/restart apps, view configuration
+- **Logs Viewer** - Real-time log display with download option
+- **Settings** - Platform configuration
+
+## Logging
+
+DROP automatically captures all console output (stdout/stderr) to dated log files:
+
+```
+C:\drop\data\logs\webapps\my-app\
+├── my-app-2026-01-18-out.log    # stdout
+└── my-app-2026-01-18-err.log    # stderr
+```
+
+View logs via CLI:
+```bash
+drop logs my-app          # View recent logs
+drop logs my-app -n 100   # Last 100 lines
+```
+
+Or view/download in the dashboard.
+
+For custom structured logging, use the `DROP_DATA_DIR` environment variable:
+```javascript
+const logDir = process.env.DROP_DATA_DIR || './data';
+fs.appendFileSync(`${logDir}/logs/app.json`, JSON.stringify(logEntry) + '\n');
+```
+
+## Persistent Data Directories
+
+Apps get a persistent data directory that survives source code upgrades:
+
+```
+C:\drop\data\appdata\my-app\
+├── uploads/     # User-uploaded files
+├── logs/        # Custom app logs
+└── cache/       # Cache files
+```
+
+Access via `DROP_DATA_DIR` environment variable:
+```javascript
+const dataDir = process.env.DROP_DATA_DIR;
+const uploadsPath = path.join(dataDir, 'uploads', filename);
+```
+
 ## Directory Structure
 
 ```
 C:\drop\                     # Windows (or /var/drop on Linux)
 ├── data/
 │   ├── webapps/             # Your deployed apps (watched)
+│   ├── appdata/             # Persistent data per app
 │   ├── drop-svc/            # Platform state
 │   ├── appconf/
 │   │   └── webapps/         # Per-app config files
-│   └── logs/                # All logs
+│   └── logs/
+│       ├── drop-svc/        # Platform logs
+│       └── webapps/         # App logs (auto-captured)
 ```
 
 ## Configuration (Optional)
@@ -182,11 +238,19 @@ env:
 
 ## Environment Variables
 
+### Platform Variables
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `DROP_ROOT` | `C:\drop` or `/var/drop` | Base directory |
 | `DROP_APPS_DIR` | `{root}/data/webapps` | Apps directory |
 | `DROP_LOG_LEVEL` | `info` | Log level: debug, info, warn, error |
+
+### Variables Injected Into Apps
+| Variable | Description |
+|----------|-------------|
+| `PORT` | Assigned port for the app to listen on |
+| `DROP_DATA_DIR` | Persistent data directory path |
+| `DATABASE_URL` | PostgreSQL connection string (if database provisioned) |
 
 ## Development
 
@@ -200,9 +264,13 @@ npm run format       # Format code
 
 ## Roadmap
 
+- [x] ~~Web dashboard UI~~ (v0.1.0)
+- [x] ~~PostgreSQL auto-provisioning~~ (v0.1.0)
+- [x] ~~Hot reload~~ (v0.1.0)
+- [x] ~~REST API with authentication~~ (v0.1.0)
 - [ ] Caddy reverse proxy integration (hostnames like `myapp.localhost`)
 - [ ] Automatic HTTPS with Let's Encrypt
-- [ ] Web dashboard UI
+- [ ] Log aggregation and search
 - [ ] Multi-node clustering
 
 ## License
