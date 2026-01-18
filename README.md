@@ -1,6 +1,6 @@
 # DROP
 
-**Deploy, Run, Operate, Publish** | v0.1.0
+**Deploy, Run, Operate, Publish** | v0.2.0
 
 A lightweight, self-hosted Platform as a Service (PaaS) engineered for the "drop folder and deploy" workflow. Zero-configuration deployment for Node.js, Python, static sites, and containerized applications.
 
@@ -11,6 +11,7 @@ A lightweight, self-hosted Platform as a Service (PaaS) engineered for the "drop
 ## Features
 
 - **Zero-Config Deployment** - Auto-detects app type, builds, and starts automatically
+- **Hostname Routing** - Access apps at `myapp.localhost` (requires Caddy)
 - **Hot Reload** - Edit files and your app rebuilds/restarts automatically
 - **PostgreSQL Auto-Provisioning** - Apps get their own database with `DATABASE_URL` injected
 - **Port Persistence** - Apps keep the same port across restarts
@@ -28,6 +29,7 @@ A lightweight, self-hosted Platform as a Service (PaaS) engineered for the "drop
 
 - Node.js 20+
 - npm 9+
+- Caddy 2.0+ (optional, for hostname routing)
 
 ## Quick Start
 
@@ -77,6 +79,11 @@ DROP automatically:
 
 ```
 http://localhost:3001
+```
+
+Or with Caddy installed, access via hostname:
+```
+http://my-app.localhost
 ```
 
 ### 5. Edit and Hot-Reload
@@ -252,12 +259,52 @@ env:
 | `DROP_DATA_DIR` | Persistent data directory path |
 | `DATABASE_URL` | PostgreSQL connection string (if database provisioned) |
 
+## Hostname Routing (Caddy)
+
+When Caddy is installed, DROP automatically configures hostname-based routing:
+
+```
+my-app.localhost  →  localhost:3001
+api.localhost     →  localhost:3002
+```
+
+### Install Caddy
+
+```bash
+# Windows (with Chocolatey)
+choco install caddy
+
+# macOS (with Homebrew)
+brew install caddy
+
+# Linux (Debian/Ubuntu)
+sudo apt install -y debian-keyring debian-archive-keyring apt-transport-https
+curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | sudo gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' | sudo tee /etc/apt/sources.list.d/caddy-stable.list
+sudo apt update && sudo apt install caddy
+```
+
+### How It Works
+
+- DROP detects Caddy on startup and manages it automatically
+- Each deployed app gets a `.localhost` hostname
+- Modern browsers resolve `.localhost` automatically (no `/etc/hosts` editing)
+- If Caddy isn't installed, apps are still accessible via direct ports
+
+### Graceful Degradation
+
+| Scenario | Behavior |
+|----------|----------|
+| Caddy installed | Apps accessible at `myapp.localhost` |
+| Caddy not installed | Apps accessible at `localhost:PORT` |
+| Port 80 in use | Warning logged, direct port access works |
+
 ## Development
 
 ```bash
 npm run dev          # Start in development mode
 npm run build        # Build for production
-npm test             # Run tests (390 tests)
+npm test             # Run tests
 npm run lint         # Lint code
 npm run format       # Format code
 ```
@@ -268,7 +315,7 @@ npm run format       # Format code
 - [x] ~~PostgreSQL auto-provisioning~~ (v0.1.0)
 - [x] ~~Hot reload~~ (v0.1.0)
 - [x] ~~REST API with authentication~~ (v0.1.0)
-- [ ] Caddy reverse proxy integration (hostnames like `myapp.localhost`)
+- [x] ~~Caddy reverse proxy integration~~ (v0.2.0)
 - [ ] Automatic HTTPS with Let's Encrypt
 - [ ] Log aggregation and search
 - [ ] Multi-node clustering
