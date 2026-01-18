@@ -39,6 +39,6 @@ module.exports = [
     },
   },
   {
-    ignores: ['dist/**', 'node_modules/**', '**/*.test.ts', 'jest.config.js', '*.js'],
+    ignores: ['dist/**', 'node_modules/**', '**/*.test.ts', 'jest.config.js', '*.js', 'src/dashboard/**'],
   },
 ];

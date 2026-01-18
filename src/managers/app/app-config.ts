@@ -20,6 +20,8 @@ export interface AppConfig {
   lastDeployedAt?: string;
   buildDuration?: number;
   env?: Record<string, string>;
+  /** Persistent data directory path - survives app upgrades */
+  dataDir?: string;
 }
 
 export interface AppConfigServiceOptions {
