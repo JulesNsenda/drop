@@ -8,6 +8,8 @@ import { Hono } from 'hono';
 import { cors } from 'hono/cors';
 import { logger } from 'hono/logger';
 import { serve } from '@hono/node-server';
+import * as path from 'path';
+import * as fs from 'fs';
 import { errorHandler, HttpError } from './middleware/error';
 import { initializeAuth, authMiddleware, isAuthEnabled } from './middleware/auth';
 import { error, ErrorCodes } from './types';
@@ -126,8 +128,69 @@ export class ApiServer {
     // Mount v1 under /api/v1
     this.app.route('/api/v1', v1);
 
-    // Root info
+    // Dashboard static files
+    const dashboardPath = path.join(__dirname, '..', 'dashboard');
+    const dashboardIndexPath = path.join(dashboardPath, 'index.html');
+    const dashboardExists = fs.existsSync(dashboardIndexPath);
+
+    console.log('[Dashboard] Path:', dashboardPath);
+    console.log('[Dashboard] Index exists:', dashboardExists);
+
+    if (dashboardExists) {
+      // Serve static assets (CSS, JS, images)
+      this.app.get('/dashboard/assets/*', async (c) => {
+        const assetPath = c.req.path.replace('/dashboard/', '');
+        const filePath = path.join(dashboardPath, assetPath);
+
+        if (fs.existsSync(filePath)) {
+          const content = fs.readFileSync(filePath);
+          const ext = path.extname(filePath);
+          const mimeTypes: Record<string, string> = {
+            '.js': 'application/javascript',
+            '.css': 'text/css',
+            '.svg': 'image/svg+xml',
+            '.png': 'image/png',
+            '.jpg': 'image/jpeg',
+            '.ico': 'image/x-icon',
+          };
+          const contentType = mimeTypes[ext] || 'application/octet-stream';
+          return c.body(content, 200, { 'Content-Type': contentType });
+        }
+        return c.notFound();
+      });
+
+      // Serve favicon
+      this.app.get('/dashboard/drop.svg', (c) => {
+        const filePath = path.join(dashboardPath, 'drop.svg');
+        if (fs.existsSync(filePath)) {
+          const content = fs.readFileSync(filePath);
+          return c.body(content, 200, { 'Content-Type': 'image/svg+xml' });
+        }
+        return c.notFound();
+      });
+
+      // SPA fallback - serve index.html for all dashboard routes
+      this.app.get('/dashboard', (c) => {
+        const html = fs.readFileSync(dashboardIndexPath, 'utf-8');
+        return c.html(html);
+      });
+
+      this.app.get('/dashboard/*', (c) => {
+        // Check if it's not an asset request
+        if (!c.req.path.includes('/assets/') && !c.req.path.endsWith('.svg')) {
+          const html = fs.readFileSync(dashboardIndexPath, 'utf-8');
+          return c.html(html);
+        }
+        return c.notFound();
+      });
+    }
+
+    // Root - redirect to dashboard if available, otherwise show API info
     this.app.get('/', (c) => {
+      const dashboardExists = fs.existsSync(path.join(__dirname, '../dashboard/index.html'));
+      if (dashboardExists) {
+        return c.redirect('/dashboard');
+      }
       return c.json({
         name: 'DROP API',
         version: '1.0.0',
@@ -151,6 +214,7 @@ export class ApiServer {
 
     // Handle 404
     this.app.notFound((c) => {
+      console.log('[404] Route not found:', c.req.path);
       return c.json(error(ErrorCodes.NOT_FOUND, `Route not found: ${c.req.path}`), 404);
     });
   }
