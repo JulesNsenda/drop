@@ -16,6 +16,7 @@ import { ProcessManager, getProcessManager, resetProcessManager } from '../manag
 import { AppStateManager, getStateManager, resetStateManager } from '../managers/app/state-manager';
 import { AppConfigService, getAppConfigService, resetAppConfigService } from '../managers/app/app-config';
 import { PostgresServer, getPostgresServer, resetPostgresServer, DatabaseProvisioner } from '../managers/database';
+import { ApiServer, createApiServer } from '../api';
 import { Logger, createLogger } from '../utils/logger';
 
 export interface PlatformConfig {
@@ -91,6 +92,7 @@ export class DropPlatform {
   private appConfigService: AppConfigService | null = null;
   private postgresServer: PostgresServer | null = null;
   private dbProvisioner: DatabaseProvisioner | null = null;
+  private apiServer: ApiServer | null = null;
 
   private subscriptions: Unsubscribe[] = [];
   private isRunning = false;
@@ -156,6 +158,11 @@ export class DropPlatform {
         await this.watcher.start();
       }
 
+      // Start API server if enabled
+      if (this.config.enableApi) {
+        await this.startApiServer();
+      }
+
       this.isRunning = true;
       this.eventBus.publish('platform:started', { timestamp: new Date() });
       this.logger.platformEvent('started');
@@ -211,6 +218,12 @@ export class DropPlatform {
       this.logger.info('Stopping PostgreSQL...', 'DATABASE');
       await this.postgresServer.stop();
       resetPostgresServer();
+    }
+
+    // Stop API server
+    if (this.apiServer) {
+      await this.apiServer.stop();
+      this.apiServer = null;
     }
 
     this.isRunning = false;
@@ -493,6 +506,29 @@ import ${path.join(dataDir, 'appconf', 'caddy', 'hosts', '*.caddy').replace(/\\/
       debounceMs: 1000,
       maxDepth: 2,
     });
+  }
+
+  /**
+   * Start the REST API server
+   */
+  private async startApiServer(): Promise<void> {
+    const credentialsPath = path.join(this.config.dropRoot, 'data', 'drop-svc', 'api-credentials.json');
+
+    this.apiServer = createApiServer({
+      port: this.config.apiPort,
+      host: '0.0.0.0',
+      credentialsPath,
+      enableAuth: this.config.enableApiAuth,
+    });
+
+    await this.apiServer.initialize();
+    await this.apiServer.start();
+
+    this.logger.info(`API server running on port ${this.config.apiPort}`, 'API');
+    if (this.config.enableApiAuth) {
+      this.logger.info('API authentication: ENABLED', 'API');
+    }
+    this.logger.info(`Dashboard available at http://localhost:${this.config.apiPort}/dashboard`, 'API');
   }
 
   /**
