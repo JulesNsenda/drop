@@ -209,10 +209,11 @@ describe('PathParser', () => {
 describe('WatcherConfig', () => {
   it('should create config with defaults', () => {
     const config = createWatcherConfig();
+    const isWindows = process.platform === 'win32';
 
     expect(config.debounceMs).toBe(2000);
     expect(config.maxDepth).toBe(3);
-    expect(config.usePolling).toBe(false);
+    expect(config.usePolling).toBe(isWindows); // Defaults to true on Windows
     expect(config.ignorePatterns).toContain('**/node_modules/**');
   });
 

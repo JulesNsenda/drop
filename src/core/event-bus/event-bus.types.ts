@@ -17,6 +17,7 @@ export type AppEventType =
   | 'app:detected'
   | 'app:created'
   | 'app:updated'
+  | 'app:update'
   | 'app:removed'
   | 'app:starting'
   | 'app:started'
@@ -91,6 +92,12 @@ export interface AppCreatedPayload extends BaseEvent {
 export interface AppUpdatedPayload extends BaseEvent {
   appId: string;
   changes: Record<string, unknown>;
+}
+
+export interface AppUpdatePayload extends BaseEvent {
+  name: string;
+  path: string;
+  reason: string;
 }
 
 export interface AppRemovedPayload extends BaseEvent {
@@ -210,6 +217,7 @@ export interface EventPayloadMap {
   'app:detected': AppDetectedPayload;
   'app:created': AppCreatedPayload;
   'app:updated': AppUpdatedPayload;
+  'app:update': AppUpdatePayload;
   'app:removed': AppRemovedPayload;
   'app:starting': AppStartingPayload;
   'app:started': AppStartedPayload;
