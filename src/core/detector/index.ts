@@ -18,6 +18,16 @@ export { pythonDetector } from './detectors/python';
 export { staticDetector } from './detectors/static';
 export { dockerDetector } from './detectors/docker';
 
+// Export drop.yaml parser
+export {
+  parseDropYaml,
+  findDropYaml,
+  getCustomDomains,
+  getTlsConfig,
+  mergeWithDefaults,
+  validateDropYamlConfig,
+} from './drop-yaml-parser';
+
 export type {
   AppType,
   DetectionResult,
@@ -30,3 +40,11 @@ export type {
   GoMod,
   CargoToml,
 } from './detector.types';
+
+export type {
+  DropYamlConfig,
+  DropYamlParseResult,
+  AppTlsConfig,
+  AppEnvConfig,
+  AppDependency,
+} from './drop-yaml-parser';

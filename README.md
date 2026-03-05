@@ -1,6 +1,6 @@
 # DROP
 
-**Deploy, Run, Operate, Publish** | v0.2.0
+**Deploy, Run, Operate, Publish** | v0.3.0
 
 A lightweight, self-hosted Platform as a Service (PaaS) engineered for the "drop folder and deploy" workflow. Zero-configuration deployment for Node.js, Python, static sites, and containerized applications.
 
@@ -12,6 +12,7 @@ A lightweight, self-hosted Platform as a Service (PaaS) engineered for the "drop
 
 - **Zero-Config Deployment** - Auto-detects app type, builds, and starts automatically
 - **Hostname Routing** - Access apps at `myapp.localhost` (requires Caddy)
+- **Automatic HTTPS** - Let's Encrypt certificates with zero configuration
 - **Hot Reload** - Edit files and your app rebuilds/restarts automatically
 - **PostgreSQL Auto-Provisioning** - Apps get their own database with `DATABASE_URL` injected
 - **Port Persistence** - Apps keep the same port across restarts
@@ -22,6 +23,7 @@ A lightweight, self-hosted Platform as a Service (PaaS) engineered for the "drop
 - **Web Dashboard** - Real-time monitoring UI at `/dashboard`
 - **Auto-Capture Logging** - Stdout/stderr captured to dated log files automatically
 - **Persistent Data Directories** - App data survives upgrades (`DROP_DATA_DIR`)
+- **Custom Domains** - Per-app domain configuration via `drop.yaml`
 - **Cross-Platform** - Works on Windows, Linux, and macOS
 - **CLI Interface** - Full-featured command-line tool for management
 
@@ -299,6 +301,42 @@ sudo apt update && sudo apt install caddy
 | Caddy not installed | Apps accessible at `localhost:PORT` |
 | Port 80 in use | Warning logged, direct port access works |
 
+## HTTPS & SSL
+
+DROP supports automatic HTTPS with Let's Encrypt certificates.
+
+### Quick Start (HTTPS)
+
+```bash
+drop serve --domain example.com --https --acme-email admin@example.com
+```
+
+Apps are now accessible at `https://myapp.example.com` with valid certificates.
+
+### Wildcard Certificates
+
+For wildcard certificates (`*.example.com`), use DNS-01 challenge:
+
+```bash
+export CF_API_TOKEN=your-cloudflare-token
+drop serve --domain example.com --https --wildcard --dns-provider cloudflare
+```
+
+Supported DNS providers: `cloudflare`, `route53`, `digitalocean`, `godaddy`
+
+### Per-App Custom Domains
+
+Configure custom domains in your app's `drop.yaml`:
+
+```yaml
+name: my-app
+domains:
+  - myapp.com
+  - www.myapp.com
+```
+
+See [HTTPS Setup Guide](docs/HTTPS-SETUP.md) for complete documentation.
+
 ## Development
 
 ```bash
@@ -316,7 +354,8 @@ npm run format       # Format code
 - [x] ~~Hot reload~~ (v0.1.0)
 - [x] ~~REST API with authentication~~ (v0.1.0)
 - [x] ~~Caddy reverse proxy integration~~ (v0.2.0)
-- [ ] Automatic HTTPS with Let's Encrypt
+- [x] ~~Automatic HTTPS with Let's Encrypt~~ (v0.3.0)
+- [x] ~~Custom domains per app~~ (v0.3.0)
 - [ ] Log aggregation and search
 - [ ] Multi-node clustering
 
