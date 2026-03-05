@@ -11,7 +11,7 @@ Quick reference to all PRDs and task files organized by version.
 | **v0.1.0** | MVP | 8 features | **Completed** |
 | v0.2.0 | Foundation | 4 features | **Completed** |
 | v0.3.0 | Interfaces | 5 features | **Completed** |
-| v0.4.0 | Experience | 4 features | Planned |
+| v0.4.0 | Experience | 4 features | **Completed** (Dashboard polish) |
 | v0.5.0 | Enterprise | 4 features | Planned |
 | v1.0.0 | Production | Stable | Planned |
 
@@ -98,16 +98,16 @@ Quick reference to all PRDs and task files organized by version.
 
 | Order | PRD | Feature | Tasks | Status |
 |-------|-----|---------|-------|--------|
-| 1 | [PRD-011](prd/PRD-011-web-dashboard.md) | Web Dashboard | [TASKS-011](tasks/TASKS-011-web-dashboard.md) | Not Started |
+| 1 | [PRD-011](prd/PRD-011-web-dashboard.md) | Web Dashboard | [TASKS-011](tasks/TASKS-011-web-dashboard.md) | **Completed** |
 | 2 | [PRD-015](prd/PRD-015-monitoring.md) | Monitoring | - | Not Started |
 | 3 | - | Health Checks | - | Not Started |
 | 4 | - | Log Aggregation | - | Not Started |
 
 ### v0.4.0 New Capabilities
-- React web dashboard
-- Real-time monitoring
-- Prometheus metrics
-- Centralized logging
+- ✅ React web dashboard (login, dark mode, deploy UI, search/filter, env vars, toasts, error boundaries)
+- Real-time monitoring - Not Started
+- Prometheus metrics - Not Started
+- Centralized logging - Not Started
 
 ---
 
