@@ -18,6 +18,7 @@ import { AppConfigService, getAppConfigService, resetAppConfigService } from '..
 import { PostgresServer, getPostgresServer, resetPostgresServer, DatabaseProvisioner } from '../managers/database';
 import { CaddyServer, getCaddyServer, resetCaddyServer } from '../managers/router';
 import { SecretManager, getSecretManager, resetSecretManager } from '../managers/secret';
+import { WebhookManager, getWebhookManager, resetWebhookManager } from './webhooks';
 import { ApiServer, createApiServer } from '../api';
 import { Logger, createLogger } from '../utils/logger';
 import {
@@ -115,6 +116,7 @@ export class DropPlatform {
   private dbProvisioner: DatabaseProvisioner | null = null;
   private caddyServer: CaddyServer | null = null;
   private secretManager: SecretManager | null = null;
+  private webhookManager: WebhookManager | null = null;
   private apiServer: ApiServer | null = null;
 
   private subscriptions: Unsubscribe[] = [];
@@ -279,8 +281,9 @@ export class DropPlatform {
       resetCaddyServer();
     }
 
-    // Reset secret manager
+    // Reset secret manager and webhook manager
     resetSecretManager();
+    resetWebhookManager();
 
     // Stop API server
     if (this.apiServer) {
@@ -541,6 +544,12 @@ import ${path.join(dataDir, 'appconf', 'caddy', 'hosts', '*.caddy').replace(/\\/
     await this.secretManager.initialize();
     this.logger.info('Secret manager initialized', 'SECURITY');
 
+    // Initialize webhook manager
+    const webhookStorePath = path.join(this.config.dropRoot, 'data', 'drop-svc', 'webhooks.json');
+    this.webhookManager = getWebhookManager({ storePath: webhookStorePath });
+    await this.webhookManager.initialize();
+    this.logger.info('Webhook manager initialized', 'WEBHOOKS');
+
     // Sync state manager with app configs (configs are source of truth for ports)
     await this.syncStateWithConfigs();
 
@@ -702,7 +711,7 @@ import ${path.join(dataDir, 'appconf', 'caddy', 'hosts', '*.caddy').replace(/\\/
 
     // When app is detected, create config and build it
     const detectedSub = this.eventBus.subscribe('app:detected', async (payload) => {
-      const appType = (payload.type || 'unknown') as 'nodejs' | 'python' | 'static' | 'docker' | 'unknown';
+      const appType = (payload.type || 'unknown') as 'nodejs' | 'python' | 'go' | 'static' | 'docker' | 'unknown';
 
       // Create or update app config file (source of truth)
       if (this.appConfigService) {
@@ -871,7 +880,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       const result = await this.detector.detect(appPath);
       this.logger.info(`Detected ${appName} as ${result.type} (confidence: ${result.confidence})`, 'DETECTOR');
 
-      const appType = result.type as 'nodejs' | 'python' | 'static' | 'docker' | 'unknown';
+      const appType = result.type as 'nodejs' | 'python' | 'go' | 'static' | 'docker' | 'unknown';
 
       // Create or update app config file (source of truth)
       if (this.appConfigService) {
@@ -985,8 +994,13 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         // Use the compiled static-server.js from dist
         script = path.join(__dirname, 'static-server.js');
         args = [serveDir, '-s']; // -s for SPA mode
+      } else if (detection.type === 'go') {
+        // Go apps run as compiled binaries
+        const startCommand = detection.suggestedConfig?.startCommand || `./${appName}`;
+        script = startCommand;
+        interpreter = 'none'; // No interpreter - run binary directly
       } else {
-        // For Node.js apps, the detector returns "node <file>" format
+        // For Node.js/Python apps, the detector returns "node <file>" or "python <file>" format
         const startCommand = detection.suggestedConfig?.startCommand || 'node index.js';
 
         if (startCommand.startsWith('node ')) {

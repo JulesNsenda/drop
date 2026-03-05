@@ -21,6 +21,7 @@ import {
 import { executeCommand } from './strategies/base';
 import { nodejsBuildStrategy } from './strategies/nodejs';
 import { pythonBuildStrategy } from './strategies/python';
+import { goBuildStrategy } from './strategies/go';
 import { staticBuildStrategy } from './strategies/static';
 import { dockerBuildStrategy } from './strategies/docker';
 
@@ -250,6 +251,7 @@ export class BuilderService {
   private registerBuiltinStrategies(): void {
     this.strategies.push(nodejsBuildStrategy);
     this.strategies.push(pythonBuildStrategy);
+    this.strategies.push(goBuildStrategy);
     this.strategies.push(staticBuildStrategy);
     this.strategies.push(dockerBuildStrategy);
   }
