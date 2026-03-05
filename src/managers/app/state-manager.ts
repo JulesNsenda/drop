@@ -10,7 +10,7 @@ import * as path from 'path';
 import { eventBus } from '../../core/event-bus';
 
 export type AppStatus = 'pending' | 'building' | 'starting' | 'running' | 'stopped' | 'errored';
-export type AppType = 'nodejs' | 'python' | 'static' | 'docker' | 'unknown';
+export type AppType = 'nodejs' | 'python' | 'go' | 'static' | 'docker' | 'unknown';
 
 export interface AppState {
   name: string;

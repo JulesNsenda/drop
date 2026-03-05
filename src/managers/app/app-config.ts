@@ -11,7 +11,7 @@ import * as yaml from 'yaml';
 
 export interface AppConfig {
   name: string;
-  type: 'nodejs' | 'python' | 'static' | 'docker' | 'unknown';
+  type: 'nodejs' | 'python' | 'go' | 'static' | 'docker' | 'unknown';
   port?: number;
   framework?: string;
   hostname?: string;
