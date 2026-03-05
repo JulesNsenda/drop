@@ -18,6 +18,7 @@ import {
 import { manifestDetector } from './detectors/manifest';
 import { nodejsDetector } from './detectors/nodejs';
 import { pythonDetector } from './detectors/python';
+import { goDetector } from './detectors/go';
 import { staticDetector } from './detectors/static';
 import { dockerDetector } from './detectors/docker';
 
@@ -132,6 +133,7 @@ export class DetectorService {
     // Framework-specific detectors
     this.detectors.push(nodejsDetector);
     this.detectors.push(pythonDetector);
+    this.detectors.push(goDetector);
     this.detectors.push(dockerDetector);
 
     // Static site detector as fallback
