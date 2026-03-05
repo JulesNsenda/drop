@@ -1,10 +1,37 @@
+import { useState, useMemo } from 'react';
 import { Link } from 'react-router-dom';
-import { RefreshCw, ExternalLink, Clock, Cpu } from 'lucide-react';
+import { RefreshCw, ExternalLink, Clock, Cpu, Search, Filter } from 'lucide-react';
 import { useApps } from '../hooks/useApi';
 import StatusBadge from '../components/StatusBadge';
 
+const STATUS_OPTIONS = ['all', 'running', 'stopped', 'building', 'errored', 'pending'] as const;
+
 function AppsPage() {
   const { apps, loading, error, refresh } = useApps();
+  const [search, setSearch] = useState('');
+  const [statusFilter, setStatusFilter] = useState<string>('all');
+
+  const filteredApps = useMemo(() => {
+    return apps.filter((app) => {
+      const matchesSearch =
+        !search ||
+        app.name.toLowerCase().includes(search.toLowerCase()) ||
+        app.type.toLowerCase().includes(search.toLowerCase()) ||
+        (app.framework && app.framework.toLowerCase().includes(search.toLowerCase()));
+
+      const matchesStatus = statusFilter === 'all' || app.status === statusFilter;
+
+      return matchesSearch && matchesStatus;
+    });
+  }, [apps, search, statusFilter]);
+
+  const statusCounts = useMemo(() => {
+    const counts: Record<string, number> = { all: apps.length };
+    for (const app of apps) {
+      counts[app.status] = (counts[app.status] || 0) + 1;
+    }
+    return counts;
+  }, [apps]);
 
   const formatDate = (dateString?: string) => {
     if (!dateString) return 'Never';
@@ -17,8 +44,10 @@ function AppsPage() {
       {/* Header */}
       <div className="flex items-center justify-between mb-6">
         <div>
-          <h1 className="text-2xl font-bold text-gray-900">Applications</h1>
-          <p className="text-gray-500">Manage your deployed applications</p>
+          <h1 className="text-2xl font-bold text-gray-900 dark:text-white">Applications</h1>
+          <p className="text-gray-500 dark:text-gray-400">
+            {apps.length} app{apps.length !== 1 ? 's' : ''} deployed
+          </p>
         </div>
         <button
           onClick={refresh}
@@ -30,9 +59,46 @@ function AppsPage() {
         </button>
       </div>
 
+      {/* Search and filter bar */}
+      {apps.length > 0 && (
+        <div className="flex flex-col sm:flex-row gap-3 mb-6">
+          {/* Search */}
+          <div className="relative flex-1 max-w-md">
+            <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400" />
+            <input
+              type="text"
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+              placeholder="Search apps..."
+              className="w-full pl-10 pr-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-800 text-gray-900 dark:text-white focus:ring-2 focus:ring-drop-500 focus:border-transparent outline-none text-sm"
+            />
+          </div>
+
+          {/* Status filter */}
+          <div className="flex items-center gap-2">
+            <Filter className="w-4 h-4 text-gray-400" />
+            <div className="flex gap-1">
+              {STATUS_OPTIONS.map((s) => (
+                <button
+                  key={s}
+                  onClick={() => setStatusFilter(s)}
+                  className={`px-3 py-1.5 text-xs font-medium rounded-full transition-colors ${
+                    statusFilter === s
+                      ? 'bg-drop-600 text-white'
+                      : 'bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-400 hover:bg-gray-200 dark:hover:bg-gray-700'
+                  }`}
+                >
+                  {s === 'all' ? `All (${statusCounts.all || 0})` : `${s} (${statusCounts[s] || 0})`}
+                </button>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Error state */}
       {error && (
-        <div className="mb-6 p-4 bg-red-50 border border-red-200 rounded-lg text-red-700">
+        <div className="mb-6 p-4 bg-red-50 dark:bg-red-900/30 border border-red-200 dark:border-red-800 rounded-lg text-red-700 dark:text-red-400">
           {error}
         </div>
       )}
@@ -40,51 +106,65 @@ function AppsPage() {
       {/* Empty state */}
       {!loading && apps.length === 0 && (
         <div className="text-center py-12">
-          <div className="w-16 h-16 bg-gray-100 rounded-full flex items-center justify-center mx-auto mb-4">
+          <div className="w-16 h-16 bg-gray-100 dark:bg-gray-800 rounded-full flex items-center justify-center mx-auto mb-4">
             <Cpu className="w-8 h-8 text-gray-400" />
           </div>
-          <h3 className="text-lg font-medium text-gray-900 mb-2">No applications</h3>
-          <p className="text-gray-500 max-w-md mx-auto">
-            Drop a folder into the webapps directory to deploy your first application.
+          <h3 className="text-lg font-medium text-gray-900 dark:text-white mb-2">No applications</h3>
+          <p className="text-gray-500 dark:text-gray-400 max-w-md mx-auto">
+            Drop a folder into the webapps directory or use the Deploy page to get started.
           </p>
-          <code className="mt-4 inline-block bg-gray-100 px-4 py-2 rounded text-sm">
-            C:\drop\data\webapps\
-          </code>
+        </div>
+      )}
+
+      {/* No results from filter */}
+      {apps.length > 0 && filteredApps.length === 0 && (
+        <div className="text-center py-12">
+          <Search className="w-12 h-12 text-gray-300 dark:text-gray-600 mx-auto mb-4" />
+          <p className="text-gray-500 dark:text-gray-400">No apps match your search</p>
+          <button
+            onClick={() => { setSearch(''); setStatusFilter('all'); }}
+            className="mt-2 text-sm text-drop-600 hover:underline"
+          >
+            Clear filters
+          </button>
         </div>
       )}
 
       {/* Apps grid */}
-      {apps.length > 0 && (
+      {filteredApps.length > 0 && (
         <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
-          {apps.map((app) => (
+          {filteredApps.map((app) => (
             <Link
               key={app.name}
               to={`/apps/${app.name}`}
-              className="block bg-white rounded-lg border border-gray-200 p-5 hover:shadow-md hover:border-drop-300 transition-all"
+              className="block bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-5 hover:shadow-md hover:border-drop-300 dark:hover:border-drop-600 transition-all"
             >
               <div className="flex items-start justify-between mb-3">
                 <div>
-                  <h3 className="font-semibold text-gray-900">{app.name}</h3>
-                  <p className="text-sm text-gray-500">{app.type}</p>
+                  <h3 className="font-semibold text-gray-900 dark:text-white">{app.name}</h3>
+                  <p className="text-sm text-gray-500 dark:text-gray-400">
+                    {app.type}
+                    {app.framework && ` / ${app.framework}`}
+                  </p>
                 </div>
                 <StatusBadge status={app.status} />
               </div>
 
               <div className="space-y-2 text-sm">
                 {app.port && (
-                  <div className="flex items-center gap-2 text-gray-600">
+                  <div className="flex items-center gap-2 text-gray-600 dark:text-gray-400">
                     <ExternalLink className="w-4 h-4" />
                     <span>localhost:{app.port}</span>
                   </div>
                 )}
-                <div className="flex items-center gap-2 text-gray-600">
+                <div className="flex items-center gap-2 text-gray-600 dark:text-gray-400">
                   <Clock className="w-4 h-4" />
                   <span>Deployed: {formatDate(app.lastDeployedAt)}</span>
                 </div>
               </div>
 
               {app.error && (
-                <div className="mt-3 p-2 bg-red-50 rounded text-xs text-red-600 truncate">
+                <div className="mt-3 p-2 bg-red-50 dark:bg-red-900/30 rounded text-xs text-red-600 dark:text-red-400 truncate">
                   {app.error}
                 </div>
               )}
