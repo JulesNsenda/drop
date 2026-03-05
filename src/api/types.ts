@@ -25,6 +25,8 @@ export interface ApiMeta {
   limit?: number;
   total?: number;
   totalPages?: number;
+  /** Additional metadata fields */
+  [key: string]: unknown;
 }
 
 // App DTOs
@@ -113,4 +115,6 @@ export const ErrorCodes = {
   CONFLICT: 'CONFLICT',
   BAD_REQUEST: 'BAD_REQUEST',
   UNAUTHORIZED: 'UNAUTHORIZED',
+  RATE_LIMITED: 'RATE_LIMITED',
+  SERVICE_UNAVAILABLE: 'SERVICE_UNAVAILABLE',
 } as const;

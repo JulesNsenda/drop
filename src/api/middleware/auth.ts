@@ -140,20 +140,30 @@ async function saveCredentials(credentialsPath: string, store: CredentialsStore)
 }
 
 /**
- * Hash a password using SHA-256 with salt
+ * Hash a password using scrypt (more secure than SHA-256)
  */
 function hashPassword(password: string, salt?: string): { hash: string; salt: string } {
   const useSalt = salt || crypto.randomBytes(16).toString('hex');
-  const hash = crypto.createHash('sha256').update(password + useSalt).digest('hex');
-  return { hash: `${useSalt}:${hash}`, salt: useSalt };
+  const derived = crypto.scryptSync(password, useSalt, 64, { N: 16384, r: 8, p: 1 });
+  return { hash: `scrypt:${useSalt}:${derived.toString('hex')}`, salt: useSalt };
 }
 
 /**
- * Verify a password against a hash
+ * Verify a password against a hash.
+ * Supports both legacy SHA-256 and new scrypt hashes for backward compatibility.
  */
 function verifyPassword(password: string, storedHash: string): boolean {
+  if (storedHash.startsWith('scrypt:')) {
+    // New scrypt format: "scrypt:salt:hash"
+    const [, salt, hash] = storedHash.split(':');
+    const derived = crypto.scryptSync(password, salt, 64, { N: 16384, r: 8, p: 1 });
+    return crypto.timingSafeEqual(Buffer.from(hash, 'hex'), derived);
+  }
+
+  // Legacy SHA-256 format: "salt:hash"
   const [salt] = storedHash.split(':');
-  const { hash: computedHash } = hashPassword(password, salt);
+  const legacyHash = crypto.createHash('sha256').update(password + salt).digest('hex');
+  const computedHash = `${salt}:${legacyHash}`;
   return computedHash === storedHash;
 }
 
