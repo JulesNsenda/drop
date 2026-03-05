@@ -12,11 +12,17 @@ import * as path from 'path';
 import * as fs from 'fs';
 import { errorHandler, HttpError } from './middleware/error';
 import { initializeAuth, authMiddleware, isAuthEnabled } from './middleware/auth';
+import { rateLimitMiddleware, authRateLimitMiddleware } from './middleware/rate-limit';
+import { securityHeadersMiddleware } from './middleware/security-headers';
+import { auditMiddleware, initializeAuditLog, closeAuditLog } from './middleware/audit';
+import { validateBodySize } from './middleware/validate';
 import { error, ErrorCodes } from './types';
 import healthRoutes from './routes/health';
 import appsRoutes from './routes/apps';
 import logsRoutes from './routes/logs';
 import authRoutes from './routes/auth';
+import certsRoutes from './routes/certs';
+import secretsRoutes from './routes/secrets';
 
 export interface ApiServerConfig {
   port: number;
@@ -26,6 +32,8 @@ export interface ApiServerConfig {
   credentialsPath?: string;
   /** Enable authentication (default: true in production) */
   enableAuth?: boolean;
+  /** Directory for log files (audit logs) */
+  logDir?: string;
 }
 
 export class ApiServer {
@@ -54,12 +62,20 @@ export class ApiServer {
       });
     }
 
+    // Initialize audit logging
+    if (this.config.logDir) {
+      initializeAuditLog(this.config.logDir);
+    }
+
     this.setupMiddleware();
     this.setupRoutes();
     this.setupErrorHandling();
   }
 
   private setupMiddleware(): void {
+    // Security headers
+    this.app.use('*', securityHeadersMiddleware());
+
     // CORS
     this.app.use(
       '*',
@@ -70,8 +86,17 @@ export class ApiServer {
       })
     );
 
+    // Request body size limit (1MB)
+    this.app.use('*', validateBodySize());
+
+    // Rate limiting
+    this.app.use('/api/*', rateLimitMiddleware());
+
     // Request logging
     this.app.use('*', logger());
+
+    // Audit logging
+    this.app.use('/api/*', auditMiddleware());
 
     // Global error handler
     this.app.use('*', errorHandler);
@@ -83,6 +108,9 @@ export class ApiServer {
 
     // Public routes (no auth required)
     v1.route('/health', healthRoutes);
+
+    // Auth routes with stricter rate limiting
+    v1.use('/auth/login', authRateLimitMiddleware());
     v1.route('/auth', authRoutes);
 
     // Protected routes (auth required if enabled)
@@ -119,10 +147,20 @@ export class ApiServer {
       // Logs routes require at least 'readonly' role
       v1.use('/logs/*', authMiddleware('readonly'));
       v1.route('/logs', logsRoutes);
+
+      // Certs routes require at least 'readonly' role
+      v1.use('/certs/*', authMiddleware('readonly'));
+      v1.route('/certs', certsRoutes);
+
+      // Secrets routes require 'admin' role
+      v1.use('/secrets/*', authMiddleware('admin'));
+      v1.route('/secrets', secretsRoutes);
     } else {
       // No auth - all routes are public
       v1.route('/apps', appsRoutes);
       v1.route('/logs', logsRoutes);
+      v1.route('/certs', certsRoutes);
+      v1.route('/secrets', secretsRoutes);
     }
 
     // Mount v1 under /api/v1
@@ -246,6 +284,7 @@ export class ApiServer {
   }
 
   async stop(): Promise<void> {
+    closeAuditLog();
     if (this.server) {
       this.server.close();
       this.server = null;
