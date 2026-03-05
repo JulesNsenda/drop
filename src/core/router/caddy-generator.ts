@@ -11,6 +11,7 @@ import {
   CaddyConfig,
   UpstreamConfig,
 } from './router.types';
+import { DnsProvider } from './dns-challenge';
 
 /**
  * Check if a hostname is a localhost domain (e.g., myapp.localhost)
@@ -68,13 +69,20 @@ export function generateCaddyfile(
  * Generate a single route block
  * @param route - Route configuration
  * @param isLocalhost - Whether this is a localhost domain (skips TLS)
+ * @param dnsProvider - Optional DNS provider for DNS-01 challenge
+ * @param isWildcard - Whether this is for a wildcard certificate
  */
-export function generateRouteBlock(route: RouteConfig, isLocalhost = false): CaddyBlock {
+export function generateRouteBlock(
+  route: RouteConfig,
+  isLocalhost = false,
+  dnsProvider?: DnsProvider,
+  isWildcard: boolean = false
+): CaddyBlock {
   const directives: CaddyDirective[] = [];
 
   // TLS configuration (skip for localhost domains)
   if (route.ssl && !isLocalhost) {
-    const tlsDirective = generateTlsDirective(route);
+    const tlsDirective = generateTlsDirective(route, dnsProvider, isWildcard);
     if (tlsDirective) {
       directives.push(tlsDirective);
     }
@@ -149,8 +157,15 @@ function buildAddress(route: RouteConfig): string {
 
 /**
  * Generate TLS directive
+ * @param route - Route configuration
+ * @param dnsProvider - Optional DNS provider for DNS-01 challenge
+ * @param isWildcard - Whether this is for a wildcard certificate
  */
-function generateTlsDirective(route: RouteConfig): CaddyDirective | null {
+function generateTlsDirective(
+  route: RouteConfig,
+  dnsProvider?: DnsProvider,
+  isWildcard: boolean = false
+): CaddyDirective | null {
   if (!route.ssl) {
     return null;
   }
@@ -175,6 +190,14 @@ function generateTlsDirective(route: RouteConfig): CaddyDirective | null {
     };
   }
 
+  // DNS-01 challenge for wildcard certificates
+  if (isWildcard && dnsProvider) {
+    const dnsDirective = generateDnsDirective(dnsProvider);
+    if (dnsDirective) {
+      block.push(dnsDirective);
+    }
+  }
+
   // Auto TLS with options
   if (block.length > 0) {
     return {
@@ -185,6 +208,47 @@ function generateTlsDirective(route: RouteConfig): CaddyDirective | null {
 
   // Default auto TLS (implicit)
   return null;
+}
+
+/**
+ * Generate DNS directive for DNS-01 ACME challenge
+ */
+function generateDnsDirective(provider: DnsProvider): CaddyDirective | null {
+  switch (provider) {
+    case 'cloudflare':
+      return {
+        name: 'dns',
+        args: ['cloudflare', '{env.CF_API_TOKEN}'],
+      };
+
+    case 'route53':
+      return {
+        name: 'dns',
+        args: ['route53'],
+        block: [
+          { name: 'access_key_id', args: ['{env.AWS_ACCESS_KEY_ID}'] },
+          { name: 'secret_access_key', args: ['{env.AWS_SECRET_ACCESS_KEY}'] },
+        ],
+      };
+
+    case 'digitalocean':
+      return {
+        name: 'dns',
+        args: ['digitalocean', '{env.DO_AUTH_TOKEN}'],
+      };
+
+    case 'godaddy':
+      return {
+        name: 'dns',
+        args: ['godaddy'],
+        block: [
+          { name: 'api_token', args: ['{env.GODADDY_API_KEY}', '{env.GODADDY_API_SECRET}'] },
+        ],
+      };
+
+    default:
+      return null;
+  }
 }
 
 /**
@@ -332,6 +396,10 @@ export function generateFullCaddyfile(
   // Check if all routes are localhost (for auto_https off)
   const hasNonLocalhostRoutes = routes.some(r => !isLocalhostDomain(r.hostname));
 
+  // Extract DNS challenge config
+  const dnsProvider = config.dnsProvider as DnsProvider | undefined;
+  const isWildcard = config.wildcardCert ?? false;
+
   // Global options block
   lines.push('{');
   if (config.acmeEmail) {
@@ -366,7 +434,7 @@ export function generateFullCaddyfile(
   // Generate route blocks
   for (const route of routes) {
     const isLocalhost = isLocalhostDomain(route.hostname);
-    const block = generateRouteBlock(route, isLocalhost);
+    const block = generateRouteBlock(route, isLocalhost, dnsProvider, isWildcard);
     lines.push(formatBlock(block));
     lines.push('');
   }
