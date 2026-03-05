@@ -153,6 +153,7 @@ export class DatabaseProvisioner {
       host: 'localhost',
       port: this.server.getPort(),
       user: 'postgres',
+      password: 'postgres',
       database: dbName,
     });
 
