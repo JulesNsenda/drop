@@ -15,6 +15,7 @@ export {
 export { manifestDetector, validateManifest } from './detectors/manifest';
 export { nodejsDetector } from './detectors/nodejs';
 export { pythonDetector } from './detectors/python';
+export { goDetector } from './detectors/go';
 export { staticDetector } from './detectors/static';
 export { dockerDetector } from './detectors/docker';
 

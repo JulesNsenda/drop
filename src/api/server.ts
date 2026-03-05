@@ -23,6 +23,7 @@ import logsRoutes from './routes/logs';
 import authRoutes from './routes/auth';
 import certsRoutes from './routes/certs';
 import secretsRoutes from './routes/secrets';
+import webhooksRoutes from './routes/webhooks';
 
 export interface ApiServerConfig {
   port: number;
@@ -155,12 +156,17 @@ export class ApiServer {
       // Secrets routes require 'admin' role
       v1.use('/secrets/*', authMiddleware('admin'));
       v1.route('/secrets', secretsRoutes);
+
+      // Webhooks routes require 'admin' role
+      v1.use('/webhooks/*', authMiddleware('admin'));
+      v1.route('/webhooks', webhooksRoutes);
     } else {
       // No auth - all routes are public
       v1.route('/apps', appsRoutes);
       v1.route('/logs', logsRoutes);
       v1.route('/certs', certsRoutes);
       v1.route('/secrets', secretsRoutes);
+      v1.route('/webhooks', webhooksRoutes);
     }
 
     // Mount v1 under /api/v1
