@@ -27,6 +27,12 @@ function printBanner(): void {
 async function startDaemon(options: {
   root?: string;
   watch?: string;
+  domain?: string;
+  https?: boolean;
+  acmeEmail?: string;
+  acmeStaging?: boolean;
+  dnsProvider?: string;
+  wildcard?: boolean;
 }): Promise<void> {
   // Check if already running
   const status = await getDaemonStatus();
@@ -45,6 +51,24 @@ async function startDaemon(options: {
   }
   if (options.watch) {
     args.push('--watch', options.watch);
+  }
+  if (options.domain) {
+    args.push('--domain', options.domain);
+  }
+  if (options.https) {
+    args.push('--https');
+  }
+  if (options.acmeEmail) {
+    args.push('--acme-email', options.acmeEmail);
+  }
+  if (options.acmeStaging) {
+    args.push('--acme-staging');
+  }
+  if (options.dnsProvider) {
+    args.push('--dns-provider', options.dnsProvider);
+  }
+  if (options.wildcard) {
+    args.push('--wildcard');
   }
 
   try {
@@ -112,6 +136,12 @@ export function createServeCommand(): Command {
     .option('-p, --port <port>', 'API port (not yet implemented)', '3000')
     .option('-w, --watch <dir>', 'Custom webapps directory')
     .option('-r, --root <dir>', 'Custom DROP root directory')
+    .option('--domain <suffix>', 'Domain suffix (e.g., "example.com" for apps at myapp.example.com)')
+    .option('--https', 'Enable HTTPS with Let\'s Encrypt')
+    .option('--acme-email <email>', 'Email for Let\'s Encrypt notifications')
+    .option('--acme-staging', 'Use Let\'s Encrypt staging environment (for testing)')
+    .option('--dns-provider <provider>', 'DNS provider for wildcard certs (cloudflare, route53, digitalocean, godaddy)')
+    .option('--wildcard', 'Use wildcard certificate (*.domain)')
     .action(async (options) => {
       try {
         printBanner();
@@ -123,7 +153,7 @@ export function createServeCommand(): Command {
         }
 
         // Foreground mode
-        const config: Record<string, string> = {};
+        const config: Record<string, unknown> = {};
 
         if (options.root) {
           config.dropRoot = options.root;
@@ -131,6 +161,31 @@ export function createServeCommand(): Command {
 
         if (options.watch) {
           config.appsDirectory = options.watch;
+        }
+
+        // HTTPS and domain configuration
+        if (options.domain) {
+          config.domainSuffix = options.domain;
+        }
+
+        if (options.https) {
+          config.enableHttps = true;
+        }
+
+        if (options.acmeEmail) {
+          config.acmeEmail = options.acmeEmail;
+        }
+
+        if (options.acmeStaging) {
+          config.acmeStaging = true;
+        }
+
+        if (options.dnsProvider) {
+          config.dnsProvider = options.dnsProvider;
+        }
+
+        if (options.wildcard) {
+          config.wildcardCert = true;
         }
 
         const platform = new DropPlatform(config);

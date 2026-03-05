@@ -115,6 +115,10 @@ export interface CaddyConfig {
   acmeEmail?: string;
   /** ACME staging (for testing) */
   acmeStaging?: boolean;
+  /** DNS provider for DNS-01 challenge (wildcards) */
+  dnsProvider?: 'cloudflare' | 'route53' | 'digitalocean' | 'godaddy';
+  /** Use wildcard certificate */
+  wildcardCert?: boolean;
 }
 
 /**
