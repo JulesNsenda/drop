@@ -22,6 +22,14 @@ export interface AppConfig {
   env?: Record<string, string>;
   /** Persistent data directory path - survives app upgrades */
   dataDir?: string;
+  /** Custom domains for this app (from drop.yaml) */
+  domains?: string[];
+  /** Custom TLS configuration */
+  tls?: {
+    certFile?: string;
+    keyFile?: string;
+    disabled?: boolean;
+  };
 }
 
 export interface AppConfigServiceOptions {
