@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback } from 'react';
+import { getAuthHeaders } from './useAuth';
 
 const API_BASE = '/api/v1';
 
@@ -46,7 +47,7 @@ export function useApps() {
   const fetchApps = useCallback(async () => {
     try {
       setLoading(true);
-      const res = await fetch(`${API_BASE}/apps`);
+      const res = await fetch(`${API_BASE}/apps`, { headers: getAuthHeaders() });
       const json: ApiResponse<App[]> = await res.json();
 
       if (json.success && json.data) {
@@ -64,7 +65,7 @@ export function useApps() {
 
   useEffect(() => {
     fetchApps();
-    const interval = setInterval(fetchApps, 5000); // Poll every 5s
+    const interval = setInterval(fetchApps, 5000);
     return () => clearInterval(interval);
   }, [fetchApps]);
 
@@ -79,7 +80,7 @@ export function useApp(name: string) {
   const fetchApp = useCallback(async () => {
     try {
       setLoading(true);
-      const res = await fetch(`${API_BASE}/apps/${name}`);
+      const res = await fetch(`${API_BASE}/apps/${name}`, { headers: getAuthHeaders() });
       const json: ApiResponse<App> = await res.json();
 
       if (json.success && json.data) {
@@ -97,7 +98,7 @@ export function useApp(name: string) {
 
   useEffect(() => {
     fetchApp();
-    const interval = setInterval(fetchApp, 3000); // Poll every 3s
+    const interval = setInterval(fetchApp, 3000);
     return () => clearInterval(interval);
   }, [fetchApp]);
 
@@ -111,7 +112,7 @@ export function useHealth() {
   useEffect(() => {
     const fetchHealth = async () => {
       try {
-        const res = await fetch(`${API_BASE}/health`);
+        const res = await fetch(`${API_BASE}/health`, { headers: getAuthHeaders() });
         const json: ApiResponse<HealthStatus> = await res.json();
         if (json.success && json.data) {
           setHealth(json.data);
@@ -135,6 +136,7 @@ export async function appAction(name: string, action: 'start' | 'stop' | 'restar
   try {
     const res = await fetch(`${API_BASE}/apps/${name}/${action}`, {
       method: 'POST',
+      headers: getAuthHeaders(),
     });
     const json: ApiResponse<unknown> = await res.json();
     return json.success;
@@ -147,6 +149,7 @@ export async function deleteApp(name: string): Promise<boolean> {
   try {
     const res = await fetch(`${API_BASE}/apps/${name}`, {
       method: 'DELETE',
+      headers: getAuthHeaders(),
     });
     const json: ApiResponse<unknown> = await res.json();
     return json.success;
