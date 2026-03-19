@@ -32,6 +32,7 @@ function DeployPage() {
   const [status, setStatus] = useState<DeployStatus>('idle');
   const [message, setMessage] = useState('');
   const [deployedApp, setDeployedApp] = useState('');
+  const [deployStep, setDeployStep] = useState('');
 
   // Git state
   const [repoUrl, setRepoUrl] = useState('');
@@ -69,6 +70,7 @@ function DeployPage() {
     if (!repoUrl.trim()) return;
     setStatus('deploying');
     setMessage('');
+    setDeployStep('Cloning repository...');
 
     const result = await gitDeploy({
       repoUrl: repoUrl.trim(),
@@ -79,10 +81,40 @@ function DeployPage() {
     });
 
     if (result.success && result.data) {
-      setStatus('success');
-      setDeployedApp(result.data.appName);
-      setMessage(`${result.data.appName} is being cloned, built, and started from ${result.data.repoUrl} (${result.data.branch})`);
-      toast('success', `Deploying ${result.data.appName}`);
+      const appName = result.data.appName;
+      setDeployedApp(appName);
+      setDeployStep('Building application...');
+
+      // Poll app status until running or errored
+      let attempts = 0;
+      const poll = setInterval(async () => {
+        attempts++;
+        try {
+          const res = await fetch(`/api/v1/apps/${appName}`, { headers: getAuthHeaders() });
+          const json = await res.json();
+          if (json.success && json.data) {
+            const appStatus = json.data.status;
+            if (appStatus === 'building') setDeployStep('Building application...');
+            else if (appStatus === 'starting') setDeployStep('Starting application...');
+            else if (appStatus === 'running') {
+              clearInterval(poll);
+              setStatus('success');
+              const url = json.data.customDomain || (json.data.port ? `localhost:${json.data.port}` : '');
+              setMessage(`${appName} is live${url ? ` at ${url}` : ''}`);
+              toast('success', `${appName} deployed!`);
+            } else if (appStatus === 'errored') {
+              clearInterval(poll);
+              setStatus('error');
+              setMessage(json.data.error || 'Application failed to start');
+            }
+          }
+        } catch {}
+        if (attempts > 60) { // 30 second timeout
+          clearInterval(poll);
+          setStatus('success');
+          setMessage(`${appName} is being deployed. Check the app detail for status.`);
+        }
+      }, 500);
     } else {
       setStatus('error');
       setMessage(result.error || 'Deploy failed');
@@ -384,7 +416,7 @@ function DeployPage() {
             {status === 'deploying' ? (
               <>
                 <Loader2 className="w-4 h-4 animate-spin" />
-                Cloning repository...
+                {deployStep || 'Deploying...'}
               </>
             ) : (
               <>
