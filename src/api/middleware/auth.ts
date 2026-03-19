@@ -33,6 +33,7 @@ export interface User {
   role: 'admin' | 'user' | 'readonly';
   createdAt: string;
   lastLogin?: string;
+  enabled?: boolean; // default true
 }
 
 // API key record
@@ -200,6 +201,36 @@ export async function createUser(
 }
 
 /**
+ * Change a user's password
+ */
+export async function changePassword(userId: string, currentPassword: string, newPassword: string): Promise<boolean> {
+  if (!credentials || !config) throw new Error('Auth not initialized');
+
+  const user = credentials.users.find((u) => u.id === userId);
+  if (!user || !verifyPassword(currentPassword, user.passwordHash)) return false;
+
+  const { hash } = hashPassword(newPassword);
+  user.passwordHash = hash;
+  await saveCredentials(config.credentialsPath, credentials);
+  return true;
+}
+
+/**
+ * Update a user's properties (admin function)
+ */
+export async function updateUser(userId: string, updates: { enabled?: boolean; role?: 'admin' | 'user' | 'readonly' }): Promise<boolean> {
+  if (!credentials || !config) throw new Error('Auth not initialized');
+
+  const user = credentials.users.find((u) => u.id === userId);
+  if (!user) return false;
+
+  if (updates.enabled !== undefined) user.enabled = updates.enabled;
+  if (updates.role) user.role = updates.role;
+  await saveCredentials(config.credentialsPath, credentials);
+  return true;
+}
+
+/**
  * Authenticate a user and return a JWT token
  */
 export async function authenticateUser(username: string, password: string): Promise<string | null> {
@@ -209,6 +240,11 @@ export async function authenticateUser(username: string, password: string): Prom
 
   const user = credentials.users.find((u) => u.username === username);
   if (!user || !verifyPassword(password, user.passwordHash)) {
+    return null;
+  }
+
+  // Block disabled users
+  if (user.enabled === false) {
     return null;
   }
 

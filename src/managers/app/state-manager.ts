@@ -29,6 +29,7 @@ export interface AppState {
   error?: string;
   gitSource?: GitSource;
   userId?: string;
+  customDomain?: string;
 }
 
 export interface StateManagerConfig {

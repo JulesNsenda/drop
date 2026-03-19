@@ -48,6 +48,7 @@ export interface AppDto {
   gitSource?: GitSource;
   userId?: string;
   ownerName?: string;
+  customDomain?: string;
 }
 
 export interface CreateAppDto {

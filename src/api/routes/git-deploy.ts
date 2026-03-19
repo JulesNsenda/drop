@@ -10,6 +10,8 @@ import { success, error, ErrorCodes } from '../types';
 import { ValidationError } from '../middleware/error';
 import { AuthContext } from '../middleware/auth';
 import { getGitDeployService } from '../../core/git-deploy';
+import { getStateManager } from '../../managers/app/state-manager';
+import { getActivityLog } from '../../managers/activity';
 import type { GitDeployRequest, GitTokenCreateRequest } from '../../core/git-deploy';
 
 const gitDeploy = new Hono();
@@ -29,13 +31,27 @@ gitDeploy.post('/deploy', async (c) => {
   }
 
   try {
-    // Pass userId so ownership is set atomically with app registration
     const auth = (c.get as Function)('auth') as AuthContext | undefined;
+
+    // Check per-user app limit
+    if (auth?.userId && auth.role !== 'admin') {
+      const maxApps = parseInt(process.env.DROP_MAX_APPS_PER_USER || '5', 10);
+      if (maxApps > 0) {
+        const stateManager = getStateManager();
+        const userApps = stateManager.getAllApps().filter((a) => a.userId === auth.userId);
+        if (userApps.length >= maxApps) {
+          return c.json(error(ErrorCodes.RATE_LIMITED, `App limit reached (${maxApps}). Delete an app or contact admin.`), 429);
+        }
+      }
+    }
+
+    // Pass userId so ownership is set atomically
     if (auth?.userId) {
       body.userId = auth.userId;
     }
 
     const result = await service.deploy(body);
+    try { await getActivityLog().log({ action: 'git-deploy', userId: auth?.userId, username: auth?.username, appName: result.appName, detail: result.repoUrl }); } catch {}
     return c.json(success(result), 201);
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Deploy failed';

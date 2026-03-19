@@ -13,6 +13,7 @@ import { AuthContext, listUsers } from '../middleware/auth';
 import { getProcessManager } from '../../managers/process';
 import { getStateManager, AppState } from '../../managers/app/state-manager';
 import { getAppConfigService } from '../../managers/app/app-config';
+import { getActivityLog } from '../../managers/activity';
 
 const apps = new Hono();
 
@@ -46,6 +47,7 @@ function toAppDto(app: AppState, isAdmin = false): AppDto {
     gitSource: app.gitSource,
     userId: app.userId,
     ownerName: isAdmin ? resolveUsername(app.userId) : undefined,
+    customDomain: app.customDomain,
   };
 }
 
@@ -148,6 +150,17 @@ apps.post('/', async (c) => {
     return c.json(error(ErrorCodes.CONFLICT, `Application '${appName}' already exists`), 409);
   }
 
+  // Check per-user app limit
+  if (auth?.userId && auth.role !== 'admin') {
+    const maxApps = parseInt(process.env.DROP_MAX_APPS_PER_USER || '5', 10);
+    if (maxApps > 0) {
+      const userApps = stateManager.getAllApps().filter((a) => a.userId === auth.userId);
+      if (userApps.length >= maxApps) {
+        return c.json(error(ErrorCodes.RATE_LIMITED, `App limit reached (${maxApps}). Delete an app or contact admin.`), 429);
+      }
+    }
+  }
+
   // Register the app (it will be detected and built by the platform)
   const app = await stateManager.registerApp(appName, body.path);
 
@@ -156,6 +169,7 @@ apps.post('/', async (c) => {
     await stateManager.updateApp(appName, { userId: auth.userId });
   }
 
+  try { await getActivityLog().log({ action: 'deploy', userId: auth?.userId, username: auth?.username, appName }); } catch {}
   return c.json(success(toAppDto({ ...app, userId: auth?.userId }, auth?.role === 'admin')), 201);
 });
 
@@ -220,6 +234,7 @@ apps.delete('/:name', async (c) => {
     }
   }
 
+  try { await getActivityLog().log({ action: 'delete', userId: auth?.userId, username: auth?.username, appName: name }); } catch {}
   return c.json(success({ message: `Application '${name}' removed` }));
 });
 
@@ -250,6 +265,7 @@ apps.post('/:name/start', async (c) => {
       pid: status.pid ?? undefined,
     });
 
+    try { await getActivityLog().log({ action: 'start', userId: auth?.userId, username: auth?.username, appName: name }); } catch {}
     return c.json(success({ message: `Application '${name}' started`, status }));
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Failed to start';
@@ -275,6 +291,7 @@ apps.post('/:name/stop', async (c) => {
     await pm.stop(name);
     await stateManager.setAppStatus(name, 'stopped');
 
+    try { await getActivityLog().log({ action: 'stop', userId: auth?.userId, username: auth?.username, appName: name }); } catch {}
     return c.json(success({ message: `Application '${name}' stopped` }));
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Failed to stop';
@@ -301,12 +318,49 @@ apps.post('/:name/restart', async (c) => {
       pid: status.pid ?? undefined,
     });
 
+    try { await getActivityLog().log({ action: 'restart', userId: auth?.userId, username: auth?.username, appName: name }); } catch {}
     return c.json(success({ message: `Application '${name}' restarted`, status }));
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Failed to restart';
     await stateManager.setAppStatus(name, 'errored', { error: message });
     return c.json(error(ErrorCodes.INTERNAL_ERROR, message), 500);
   }
+});
+
+// PUT /apps/:name/domain - Set custom domain
+apps.put('/:name/domain', async (c) => {
+  const auth = (c.get as Function)('auth') as AuthContext | undefined;
+  const name = c.req.param('name');
+  const body = await c.req.json<{ domain?: string }>();
+  const stateManager = getStateManager();
+  const app = stateManager.getApp(name);
+
+  if (!app || !canAccess(auth, app)) {
+    throw new NotFoundError(`Application '${name}' not found`);
+  }
+
+  const domain = body.domain?.trim() || undefined;
+
+  // Basic domain validation
+  if (domain && !/^[a-zA-Z0-9][a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/.test(domain)) {
+    throw new ValidationError('Invalid domain format');
+  }
+
+  await stateManager.updateApp(name, { customDomain: domain || ('' as unknown as undefined) });
+
+  return c.json(success({ message: domain ? `Domain set to ${domain}` : 'Domain removed', domain }));
+});
+
+// GET /apps/:name/usage - Get user app count and limit
+apps.get('/:name/usage', async (c) => {
+  const auth = (c.get as Function)('auth') as AuthContext | undefined;
+  if (!auth?.userId) return c.json(success({ used: 0, limit: 0 }));
+
+  const stateManager = getStateManager();
+  const maxApps = parseInt(process.env.DROP_MAX_APPS_PER_USER || '5', 10);
+  const used = stateManager.getAllApps().filter((a) => a.userId === auth.userId).length;
+
+  return c.json(success({ used, limit: auth.role === 'admin' ? 0 : maxApps }));
 });
 
 export default apps;

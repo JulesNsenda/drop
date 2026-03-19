@@ -20,6 +20,7 @@ import { CaddyServer, getCaddyServer, resetCaddyServer } from '../managers/route
 import { SecretManager, getSecretManager, resetSecretManager } from '../managers/secret';
 import { WebhookManager, getWebhookManager, resetWebhookManager } from './webhooks';
 import { GitDeployService, getGitDeployService, resetGitDeployService } from './git-deploy';
+import { getActivityLog, resetActivityLog } from '../managers/activity';
 import { ApiServer, createApiServer } from '../api';
 import { Logger, createLogger } from '../utils/logger';
 import {
@@ -70,6 +71,8 @@ export interface PlatformConfig {
   apiPort: number;
   /** Enable API authentication */
   enableApiAuth: boolean;
+  /** Maximum apps per user (0 = unlimited) */
+  maxAppsPerUser: number;
 }
 
 // Determine platform-appropriate defaults
@@ -99,6 +102,7 @@ const DEFAULT_CONFIG: PlatformConfig = {
   enableApi: true,
   apiPort: 3000,
   enableApiAuth: process.env.DROP_DISABLE_AUTH !== 'true',
+  maxAppsPerUser: parseInt(process.env.DROP_MAX_APPS_PER_USER || '5', 10),
 };
 
 export class DropPlatform {
@@ -287,6 +291,7 @@ export class DropPlatform {
     resetSecretManager();
     resetWebhookManager();
     resetGitDeployService();
+    resetActivityLog();
 
     // Stop API server
     if (this.apiServer) {
@@ -558,6 +563,11 @@ import ${path.join(dataDir, 'appconf', 'caddy', 'hosts', '*.caddy').replace(/\\/
       appsDirectory: this.config.appsDirectory,
     });
     await this.gitDeployService.initialize();
+
+    // Initialize activity log
+    const activityLogPath = path.join(this.config.dropRoot, 'data', 'drop-svc', 'activity-log.json');
+    const activityLog = getActivityLog(activityLogPath);
+    await activityLog.initialize();
 
     // Sync state manager with app configs (configs are source of truth for ports)
     await this.syncStateWithConfigs();
