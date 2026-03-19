@@ -5,7 +5,7 @@ import { useAuth } from '../hooks/useAuth';
 
 function Layout() {
   const { theme, setTheme } = useTheme();
-  const { authRequired, username, logout } = useAuth();
+  const { authRequired, username, role, logout } = useAuth();
 
   const themeIcon = theme === 'dark' ? Moon : theme === 'light' ? Sun : Monitor;
   const ThemeIcon = themeIcon;
@@ -99,6 +99,9 @@ function Layout() {
               <div className="flex items-center gap-2 text-sm text-gray-400">
                 <User className="w-4 h-4" />
                 <span className="truncate">{username || 'User'}</span>
+                {role === 'admin' && (
+                  <span className="text-[10px] px-1.5 py-0.5 bg-drop-500/20 text-drop-400 rounded font-medium uppercase">admin</span>
+                )}
               </div>
               <button
                 onClick={logout}

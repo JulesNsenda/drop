@@ -28,6 +28,7 @@ export interface AppState {
   buildDuration?: number;
   error?: string;
   gitSource?: GitSource;
+  userId?: string;
 }
 
 export interface StateManagerConfig {

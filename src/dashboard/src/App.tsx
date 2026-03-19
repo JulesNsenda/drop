@@ -9,6 +9,7 @@ import AppDetailPage from './pages/AppDetailPage';
 import SettingsPage from './pages/SettingsPage';
 import DeployPage from './pages/DeployPage';
 import LoginPage from './pages/LoginPage';
+import SignupPage from './pages/SignupPage';
 
 function App() {
   const auth = useAuthProvider();
@@ -22,6 +23,9 @@ function App() {
             <Route index element={<LandingPage />} />
             <Route path="login" element={
               auth.authenticated ? <Navigate to="/apps" replace /> : <LoginPage />
+            } />
+            <Route path="signup" element={
+              auth.authenticated ? <Navigate to="/apps" replace /> : <SignupPage />
             } />
 
             {/* Protected dashboard routes */}

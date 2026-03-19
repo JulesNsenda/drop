@@ -9,6 +9,7 @@ import * as path from 'path';
 import * as fs from 'fs/promises';
 import { success, error, ErrorCodes, AppDto, CreateAppDto, UpdateAppDto } from '../types';
 import { NotFoundError, ValidationError } from '../middleware/error';
+import { AuthContext } from '../middleware/auth';
 import { getProcessManager } from '../../managers/process';
 import { getStateManager, AppState } from '../../managers/app/state-manager';
 import { getAppConfigService } from '../../managers/app/app-config';
@@ -32,19 +33,29 @@ function toAppDto(app: AppState): AppDto {
     buildDuration: app.buildDuration,
     error: app.error,
     gitSource: app.gitSource,
+    userId: app.userId,
   };
 }
 
-// GET /apps - List all applications
+/** Check if the current user can access an app (owns it or is admin) */
+function canAccess(auth: AuthContext | undefined, app: AppState): boolean {
+  if (!auth) return true; // No auth enabled
+  if (auth.role === 'admin') return true;
+  return app.userId === auth.userId || !app.userId; // Own apps + legacy unowned apps
+}
+
+// GET /apps - List applications (filtered by user unless admin)
 apps.get('/', async (c) => {
+  const auth = (c.get as Function)('auth') as AuthContext | undefined;
   const stateManager = getStateManager();
   const allApps = stateManager.getAllApps();
 
-  // Apply filters from query params
+  // Filter by ownership
+  let filtered = allApps.filter((app) => canAccess(auth, app));
+
+  // Apply query param filters
   const status = c.req.query('status');
   const type = c.req.query('type');
-
-  let filtered = allApps;
 
   if (status) {
     filtered = filtered.filter((app) => app.status === status);
@@ -63,11 +74,12 @@ apps.get('/', async (c) => {
 
 // GET /apps/:name - Get application by name
 apps.get('/:name', async (c) => {
+  const auth = (c.get as Function)('auth') as AuthContext | undefined;
   const name = c.req.param('name');
   const stateManager = getStateManager();
   const app = stateManager.getApp(name);
 
-  if (!app) {
+  if (!app || !canAccess(auth, app)) {
     throw new NotFoundError(`Application '${name}' not found`);
   }
 
@@ -95,6 +107,7 @@ apps.get('/:name', async (c) => {
 
 // POST /apps - Deploy a new application
 apps.post('/', async (c) => {
+  const auth = (c.get as Function)('auth') as AuthContext | undefined;
   const body = await c.req.json<CreateAppDto>();
 
   if (!body.path) {
@@ -125,7 +138,12 @@ apps.post('/', async (c) => {
   // Register the app (it will be detected and built by the platform)
   const app = await stateManager.registerApp(appName, body.path);
 
-  return c.json(success(toAppDto(app)), 201);
+  // Set owner
+  if (auth?.userId) {
+    await stateManager.updateApp(appName, { userId: auth.userId });
+  }
+
+  return c.json(success(toAppDto({ ...app, userId: auth?.userId })), 201);
 });
 
 // PUT /apps/:name - Update application
@@ -150,11 +168,12 @@ apps.put('/:name', async (c) => {
 
 // DELETE /apps/:name - Remove application
 apps.delete('/:name', async (c) => {
+  const auth = (c.get as Function)('auth') as AuthContext | undefined;
   const name = c.req.param('name');
   const stateManager = getStateManager();
   const app = stateManager.getApp(name);
 
-  if (!app) {
+  if (!app || !canAccess(auth, app)) {
     throw new NotFoundError(`Application '${name}' not found`);
   }
 
@@ -192,11 +211,12 @@ apps.delete('/:name', async (c) => {
 
 // POST /apps/:name/start - Start application
 apps.post('/:name/start', async (c) => {
+  const auth = (c.get as Function)('auth') as AuthContext | undefined;
   const name = c.req.param('name');
   const stateManager = getStateManager();
   const app = stateManager.getApp(name);
 
-  if (!app) {
+  if (!app || !canAccess(auth, app)) {
     throw new NotFoundError(`Application '${name}' not found`);
   }
 
@@ -226,11 +246,12 @@ apps.post('/:name/start', async (c) => {
 
 // POST /apps/:name/stop - Stop application
 apps.post('/:name/stop', async (c) => {
+  const auth = (c.get as Function)('auth') as AuthContext | undefined;
   const name = c.req.param('name');
   const stateManager = getStateManager();
   const app = stateManager.getApp(name);
 
-  if (!app) {
+  if (!app || !canAccess(auth, app)) {
     throw new NotFoundError(`Application '${name}' not found`);
   }
 
@@ -249,11 +270,12 @@ apps.post('/:name/stop', async (c) => {
 
 // POST /apps/:name/restart - Restart application
 apps.post('/:name/restart', async (c) => {
+  const auth = (c.get as Function)('auth') as AuthContext | undefined;
   const name = c.req.param('name');
   const stateManager = getStateManager();
   const app = stateManager.getApp(name);
 
-  if (!app) {
+  if (!app || !canAccess(auth, app)) {
     throw new NotFoundError(`Application '${name}' not found`);
   }
 
