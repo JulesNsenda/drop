@@ -17,7 +17,7 @@ import {
   Eye,
   EyeOff,
 } from 'lucide-react';
-import { useApp, appAction, deleteApp } from '../hooks/useApi';
+import { useApp, appAction, deleteApp, gitRedeploy } from '../hooks/useApi';
 import { getAuthHeaders } from '../hooks/useAuth';
 import { useToast } from '../components/Toast';
 import StatusBadge from '../components/StatusBadge';
@@ -94,6 +94,19 @@ function AppDetailPage() {
       toast('success', `${action === 'start' ? 'Started' : action === 'stop' ? 'Stopped' : 'Restarted'} ${name}`);
     } else {
       toast('error', `Failed to ${action} ${name}`);
+    }
+    await refresh();
+    setActionLoading(null);
+  };
+
+  const handleRedeploy = async () => {
+    if (!name) return;
+    setActionLoading('redeploy');
+    const result = await gitRedeploy(name);
+    if (result.success) {
+      toast('success', `Redeploying ${name}...`);
+    } else {
+      toast('error', result.error || `Failed to redeploy ${name}`);
     }
     await refresh();
     setActionLoading(null);
@@ -259,6 +272,16 @@ function AppDetailPage() {
               Start
             </button>
           )}
+          {app.gitSource && (
+            <button
+              onClick={handleRedeploy}
+              disabled={actionLoading !== null}
+              className="flex items-center gap-2 px-3 py-2 bg-blue-100 dark:bg-blue-900/30 text-blue-700 dark:text-blue-400 rounded-lg hover:bg-blue-200 dark:hover:bg-blue-900/50 disabled:opacity-50"
+            >
+              <RotateCw className={`w-4 h-4 ${actionLoading === 'redeploy' ? 'animate-spin' : ''}`} />
+              Redeploy
+            </button>
+          )}
           <button
             onClick={handleDelete}
             disabled={actionLoading !== null}
@@ -312,6 +335,46 @@ function AppDetailPage() {
           )}
         </div>
       </div>
+
+      {/* Git source info */}
+      {app.gitSource && (
+        <div className="mb-6 bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-4">
+          <div className="flex items-center gap-2 text-gray-500 dark:text-gray-400 mb-3">
+            <span className="text-sm font-medium">Git Source</span>
+          </div>
+          <div className="grid gap-3 md:grid-cols-2 text-sm">
+            <div>
+              <span className="text-gray-500 dark:text-gray-400">Repository: </span>
+              <a
+                href={app.gitSource.repoUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="text-drop-600 hover:underline"
+              >
+                {app.gitSource.repoUrl.replace('https://github.com/', '')}
+              </a>
+            </div>
+            <div>
+              <span className="text-gray-500 dark:text-gray-400">Branch: </span>
+              <span className="text-gray-700 dark:text-gray-300 font-mono">{app.gitSource.branch}</span>
+            </div>
+            {app.gitSource.lastCommitSha && (
+              <div>
+                <span className="text-gray-500 dark:text-gray-400">Commit: </span>
+                <span className="text-gray-700 dark:text-gray-300 font-mono">
+                  {app.gitSource.lastCommitSha.slice(0, 7)}
+                </span>
+              </div>
+            )}
+            <div>
+              <span className="text-gray-500 dark:text-gray-400">Auto-redeploy: </span>
+              <span className="text-gray-700 dark:text-gray-300">
+                {app.gitSource.autoRedeploy ? 'Enabled' : 'Disabled'}
+              </span>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Error message */}
       {app.error && (

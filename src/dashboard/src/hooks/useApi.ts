@@ -12,6 +12,15 @@ interface ApiResponse<T> {
   };
 }
 
+export interface GitSource {
+  repoUrl: string;
+  branch: string;
+  lastCommitSha?: string;
+  lastClonedAt?: string;
+  autoRedeploy: boolean;
+  tokenId?: string;
+}
+
 export interface App {
   name: string;
   type: string;
@@ -26,6 +35,7 @@ export interface App {
   lastDeployedAt?: string;
   buildDuration?: number;
   error?: string;
+  gitSource?: GitSource;
 }
 
 export interface HealthStatus {
@@ -148,6 +158,96 @@ export async function appAction(name: string, action: 'start' | 'stop' | 'restar
 export async function deleteApp(name: string): Promise<boolean> {
   try {
     const res = await fetch(`${API_BASE}/apps/${name}`, {
+      method: 'DELETE',
+      headers: getAuthHeaders(),
+    });
+    const json: ApiResponse<unknown> = await res.json();
+    return json.success;
+  } catch {
+    return false;
+  }
+}
+
+// Git Deploy API
+
+export interface GitDeployResult {
+  appName: string;
+  repoUrl: string;
+  branch: string;
+  commitSha?: string;
+  clonedAt: string;
+}
+
+export interface GitTokenInfo {
+  id: string;
+  name: string;
+  createdAt: string;
+}
+
+export async function gitDeploy(request: {
+  repoUrl: string;
+  branch?: string;
+  name?: string;
+  autoRedeploy?: boolean;
+  tokenId?: string;
+}): Promise<{ success: boolean; data?: GitDeployResult; error?: string }> {
+  try {
+    const res = await fetch(`${API_BASE}/git/deploy`, {
+      method: 'POST',
+      headers: { ...getAuthHeaders(), 'Content-Type': 'application/json' },
+      body: JSON.stringify(request),
+    });
+    const json: ApiResponse<GitDeployResult> = await res.json();
+    return {
+      success: json.success,
+      data: json.data,
+      error: json.error?.message,
+    };
+  } catch (err) {
+    return { success: false, error: err instanceof Error ? err.message : 'Network error' };
+  }
+}
+
+export async function gitRedeploy(name: string): Promise<{ success: boolean; error?: string }> {
+  try {
+    const res = await fetch(`${API_BASE}/git/redeploy/${name}`, {
+      method: 'POST',
+      headers: getAuthHeaders(),
+    });
+    const json: ApiResponse<unknown> = await res.json();
+    return { success: json.success, error: json.error?.message };
+  } catch (err) {
+    return { success: false, error: err instanceof Error ? err.message : 'Network error' };
+  }
+}
+
+export async function getGitTokens(): Promise<GitTokenInfo[]> {
+  try {
+    const res = await fetch(`${API_BASE}/git/tokens`, { headers: getAuthHeaders() });
+    const json: ApiResponse<GitTokenInfo[]> = await res.json();
+    return json.data || [];
+  } catch {
+    return [];
+  }
+}
+
+export async function addGitToken(name: string, token: string): Promise<{ success: boolean; data?: GitTokenInfo; error?: string }> {
+  try {
+    const res = await fetch(`${API_BASE}/git/tokens`, {
+      method: 'POST',
+      headers: { ...getAuthHeaders(), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name, token }),
+    });
+    const json: ApiResponse<GitTokenInfo> = await res.json();
+    return { success: json.success, data: json.data, error: json.error?.message };
+  } catch (err) {
+    return { success: false, error: err instanceof Error ? err.message : 'Network error' };
+  }
+}
+
+export async function deleteGitToken(id: string): Promise<boolean> {
+  try {
+    const res = await fetch(`${API_BASE}/git/tokens/${id}`, {
       method: 'DELETE',
       headers: getAuthHeaders(),
     });

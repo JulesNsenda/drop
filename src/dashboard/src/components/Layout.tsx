@@ -1,5 +1,5 @@
 import { Outlet, NavLink } from 'react-router-dom';
-import { LayoutGrid, Settings, Box, Upload, Sun, Moon, Monitor, LogOut, User } from 'lucide-react';
+import { LayoutGrid, Settings, Box, Upload, GitBranch, Sun, Moon, Monitor, LogOut, User } from 'lucide-react';
 import { useTheme } from '../hooks/useTheme';
 import { useAuth } from '../hooks/useAuth';
 
@@ -61,6 +61,21 @@ function Layout() {
               >
                 <Upload className="w-5 h-5" />
                 Deploy
+              </NavLink>
+            </li>
+            <li>
+              <NavLink
+                to="/deploy/git"
+                className={({ isActive }) =>
+                  `flex items-center gap-3 px-3 py-2 rounded-lg transition-colors ${
+                    isActive
+                      ? 'bg-drop-600 text-white'
+                      : 'text-gray-300 hover:bg-gray-800'
+                  }`
+                }
+              >
+                <GitBranch className="w-5 h-5" />
+                Git Deploy
               </NavLink>
             </li>
             <li>
