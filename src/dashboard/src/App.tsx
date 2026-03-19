@@ -7,7 +7,6 @@ import AppsPage from './pages/AppsPage';
 import AppDetailPage from './pages/AppDetailPage';
 import SettingsPage from './pages/SettingsPage';
 import DeployPage from './pages/DeployPage';
-import GitDeployPage from './pages/GitDeployPage';
 import LoginPage from './pages/LoginPage';
 
 function App() {
@@ -34,7 +33,6 @@ function App() {
                 <Route index element={<AppsPage />} />
                 <Route path="apps/:name" element={<AppDetailPage />} />
                 <Route path="deploy" element={<DeployPage />} />
-                <Route path="deploy/git" element={<GitDeployPage />} />
                 <Route path="settings" element={<SettingsPage />} />
               </Route>
             </Routes>
