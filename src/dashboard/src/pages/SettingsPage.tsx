@@ -1,12 +1,35 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, FormEvent } from 'react';
 import { useHealth, AppHealthCheck } from '../hooks/useApi';
-import { getAuthHeaders } from '../hooks/useAuth';
-import { Server, Database, Eye, HardDrive, Activity, CheckCircle, XCircle, AlertTriangle } from 'lucide-react';
+import { getAuthHeaders, useAuth } from '../hooks/useAuth';
+import { useToast } from '../components/Toast';
+import { Server, Database, Eye, HardDrive, Activity, CheckCircle, XCircle, AlertTriangle, Lock, Clock } from 'lucide-react';
+
+interface ActivityEntry {
+  id: string;
+  action: string;
+  username?: string;
+  appName?: string;
+  detail?: string;
+  timestamp: string;
+}
 
 function SettingsPage() {
   const { health, loading } = useHealth();
+  const { role } = useAuth();
+  const isAdmin = role === 'admin';
+  const { toast } = useToast();
   const [appChecks, setAppChecks] = useState<AppHealthCheck[]>([]);
   const [appChecksLoading, setAppChecksLoading] = useState(true);
+
+  // Change password
+  const [currentPw, setCurrentPw] = useState('');
+  const [newPw, setNewPw] = useState('');
+  const [confirmPw, setConfirmPw] = useState('');
+  const [pwLoading, setPwLoading] = useState(false);
+
+  // Activity log (admin only)
+  const [activity, setActivity] = useState<ActivityEntry[]>([]);
+  const [activityLoading, setActivityLoading] = useState(true);
 
   useEffect(() => {
     const fetchAppHealth = async () => {
@@ -27,6 +50,43 @@ function SettingsPage() {
     const interval = setInterval(fetchAppHealth, 10000);
     return () => clearInterval(interval);
   }, []);
+
+  // Fetch activity log (admin only)
+  useEffect(() => {
+    if (!isAdmin) { setActivityLoading(false); return; }
+    const fetchActivity = async () => {
+      try {
+        const res = await fetch('/api/v1/admin/activity?limit=20', { headers: getAuthHeaders() });
+        const json = await res.json();
+        if (json.success) setActivity(json.data || []);
+      } catch {} finally { setActivityLoading(false); }
+    };
+    fetchActivity();
+    const interval = setInterval(fetchActivity, 15000);
+    return () => clearInterval(interval);
+  }, [isAdmin]);
+
+  const handleChangePassword = async (e: FormEvent) => {
+    e.preventDefault();
+    if (newPw !== confirmPw) { toast('error', 'Passwords do not match'); return; }
+    if (newPw.length < 8) { toast('error', 'Password must be at least 8 characters'); return; }
+    setPwLoading(true);
+    try {
+      const res = await fetch('/api/v1/auth/password', {
+        method: 'PUT',
+        headers: { ...getAuthHeaders(), 'Content-Type': 'application/json' },
+        body: JSON.stringify({ currentPassword: currentPw, newPassword: newPw }),
+      });
+      const json = await res.json();
+      if (json.success) {
+        toast('success', 'Password changed');
+        setCurrentPw(''); setNewPw(''); setConfirmPw('');
+      } else {
+        toast('error', json.error?.message || 'Failed to change password');
+      }
+    } catch { toast('error', 'Network error'); }
+    setPwLoading(false);
+  };
 
   const formatUptime = (seconds?: number) => {
     if (!seconds) return 'Unknown';
@@ -214,6 +274,60 @@ function SettingsPage() {
           </table>
         </div>
       </div>
+
+      {/* Change Password */}
+      <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 mb-6">
+        <div className="px-4 py-3 border-b border-gray-200 dark:border-gray-700">
+          <div className="flex items-center gap-2">
+            <Lock className="w-4 h-4 text-gray-500" />
+            <h2 className="font-semibold text-gray-900 dark:text-white">Change Password</h2>
+          </div>
+        </div>
+        <form onSubmit={handleChangePassword} className="p-4 space-y-3 max-w-md">
+          <input type="password" value={currentPw} onChange={(e) => setCurrentPw(e.target.value)} placeholder="Current password" required className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white text-sm outline-none focus:ring-2 focus:ring-drop-500" />
+          <input type="password" value={newPw} onChange={(e) => setNewPw(e.target.value)} placeholder="New password (min 8 chars)" required minLength={8} className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white text-sm outline-none focus:ring-2 focus:ring-drop-500" />
+          <input type="password" value={confirmPw} onChange={(e) => setConfirmPw(e.target.value)} placeholder="Confirm new password" required className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white text-sm outline-none focus:ring-2 focus:ring-drop-500" />
+          <button type="submit" disabled={pwLoading} className="px-4 py-2 bg-drop-600 text-white rounded-lg hover:bg-drop-700 disabled:opacity-50 text-sm font-medium">
+            {pwLoading ? 'Changing...' : 'Change password'}
+          </button>
+        </form>
+      </div>
+
+      {/* Activity Log (admin only) */}
+      {isAdmin && (
+        <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 mb-6">
+          <div className="px-4 py-3 border-b border-gray-200 dark:border-gray-700">
+            <div className="flex items-center gap-2">
+              <Clock className="w-4 h-4 text-gray-500" />
+              <h2 className="font-semibold text-gray-900 dark:text-white">Recent Activity</h2>
+            </div>
+          </div>
+          <div className="p-4">
+            {activityLoading ? (
+              <div className="animate-pulse space-y-2">
+                <div className="h-4 w-64 bg-gray-200 dark:bg-gray-700 rounded" />
+                <div className="h-4 w-48 bg-gray-200 dark:bg-gray-700 rounded" />
+              </div>
+            ) : activity.length === 0 ? (
+              <p className="text-sm text-gray-500 dark:text-gray-400">No activity yet</p>
+            ) : (
+              <div className="space-y-2 max-h-80 overflow-auto">
+                {activity.map((a) => (
+                  <div key={a.id} className="flex items-center justify-between py-1.5 text-sm">
+                    <div>
+                      <span className="font-medium text-gray-700 dark:text-gray-300">{a.username || 'system'}</span>
+                      <span className="text-gray-500 dark:text-gray-400"> {a.action}</span>
+                      {a.appName && <span className="text-drop-600 dark:text-drop-400"> {a.appName}</span>}
+                      {a.detail && <span className="text-gray-400 text-xs ml-1">({a.detail})</span>}
+                    </div>
+                    <span className="text-xs text-gray-400 whitespace-nowrap ml-4">{new Date(a.timestamp).toLocaleString()}</span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
 
       {/* About */}
       <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700">
