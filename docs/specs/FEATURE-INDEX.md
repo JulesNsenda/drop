@@ -13,6 +13,7 @@ Quick reference to all PRDs and task files organized by version.
 | v0.3.0 | Interfaces | 5 features | **Completed** |
 | v0.4.0 | Experience | 4 features | **Completed** (Dashboard polish) |
 | v0.5.0 | Enterprise | 4 features | Planned |
+| v0.6.0 | Connect | 2 features | Planned |
 | v1.0.0 | Production | Stable | Planned |
 
 ---
@@ -129,6 +130,27 @@ Quick reference to all PRDs and task files organized by version.
 - PRIMARY/REPLICA clustering
 - Automatic failover
 - Multi-tenant support
+
+---
+
+## v0.6.0 - Connect
+
+**Goal**: Deploy directly from GitHub repositories
+
+**Command**: `/work-version v0.6.0`
+
+| Order | PRD | Feature | Tasks | Status |
+|-------|-----|---------|-------|--------|
+| 1 | [PRD-016](prd/PRD-016-git-deploy.md) | Git Deploy (GitHub) | [TASKS-016](tasks/TASKS-016-git-deploy.md) | Not Started |
+| 2 | - | Auto-Redeploy (Webhooks) | - | Not Started |
+
+### v0.6.0 New Capabilities
+- Deploy apps from GitHub repos (public + private)
+- Personal Access Token management for private repos
+- Auto-redeploy on push via GitHub webhooks
+- Dashboard UI: paste URL, pick branch, deploy
+- CLI: `drop deploy --git <url>`
+- Git metadata tracking (repo URL, branch, commit SHA)
 
 ---
 
