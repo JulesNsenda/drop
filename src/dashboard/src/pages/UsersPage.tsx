@@ -12,6 +12,7 @@ interface UserInfo {
   role: string;
   enabled: boolean;
   appCount: number;
+  maxApps?: number;
   createdAt: string;
   lastLogin?: string;
 }
@@ -123,10 +124,36 @@ function UsersPage() {
         </div>
 
         {/* Stats */}
-        <div className="grid gap-4 md:grid-cols-3 mb-6">
+        <div className="grid gap-4 md:grid-cols-4 mb-6">
           <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-4">
             <p className="text-xs text-gray-500 dark:text-gray-400 mb-1">Applications</p>
             <p className="text-2xl font-bold text-gray-900 dark:text-white">{userApps.length}</p>
+          </div>
+          <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-4">
+            <p className="text-xs text-gray-500 dark:text-gray-400 mb-1">App Limit</p>
+            <div className="flex items-center gap-2">
+              <input
+                type="number"
+                min="0"
+                value={selectedUser.maxApps || 0}
+                onChange={(e) => setSelectedUser({ ...selectedUser, maxApps: parseInt(e.target.value) || 0 })}
+                className="w-16 px-2 py-1 border border-gray-300 dark:border-gray-600 rounded bg-white dark:bg-gray-700 text-gray-900 dark:text-white text-sm"
+              />
+              <button
+                onClick={async () => {
+                  await fetch(`/api/v1/auth/users/${selectedUser.id}`, {
+                    method: 'PUT',
+                    headers: { ...getAuthHeaders(), 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ maxApps: selectedUser.maxApps || 0 }),
+                  });
+                  toast('success', 'App limit updated');
+                }}
+                className="text-xs text-drop-600 hover:text-drop-500"
+              >
+                Save
+              </button>
+            </div>
+            <p className="text-[10px] text-gray-400 mt-1">0 = use global default</p>
           </div>
           <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-4">
             <p className="text-xs text-gray-500 dark:text-gray-400 mb-1">Last Login</p>

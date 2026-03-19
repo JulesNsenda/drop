@@ -9,7 +9,7 @@ import * as path from 'path';
 import * as fs from 'fs/promises';
 import { success, error, ErrorCodes, AppDto, CreateAppDto, UpdateAppDto } from '../types';
 import { NotFoundError, ValidationError } from '../middleware/error';
-import { AuthContext, listUsers } from '../middleware/auth';
+import { AuthContext, listUsers, getUser } from '../middleware/auth';
 import { getProcessManager } from '../../managers/process';
 import { getStateManager, AppState } from '../../managers/app/state-manager';
 import { getAppConfigService } from '../../managers/app/app-config';
@@ -49,6 +49,17 @@ function toAppDto(app: AppState, isAdmin = false): AppDto {
     ownerName: isAdmin ? resolveUsername(app.userId) : undefined,
     customDomain: app.customDomain,
   };
+}
+
+/** Get effective app limit for a user (per-user override > global default) */
+function getAppLimit(userId?: string): number {
+  const globalMax = parseInt(process.env.DROP_MAX_APPS_PER_USER || '5', 10);
+  if (!userId) return globalMax;
+  try {
+    const user = getUser(userId) as any;
+    if (user?.maxApps && user.maxApps > 0) return user.maxApps;
+  } catch {}
+  return globalMax;
 }
 
 /** Check if the current user can access an app (owns it or is admin) */
@@ -152,7 +163,7 @@ apps.post('/', async (c) => {
 
   // Check per-user app limit
   if (auth?.userId && auth.role !== 'admin') {
-    const maxApps = parseInt(process.env.DROP_MAX_APPS_PER_USER || '5', 10);
+    const maxApps = getAppLimit(auth.userId);
     if (maxApps > 0) {
       const userApps = stateManager.getAllApps().filter((a) => a.userId === auth.userId);
       if (userApps.length >= maxApps) {
@@ -357,10 +368,9 @@ apps.get('/:name/usage', async (c) => {
   if (!auth?.userId) return c.json(success({ used: 0, limit: 0 }));
 
   const stateManager = getStateManager();
-  const maxApps = parseInt(process.env.DROP_MAX_APPS_PER_USER || '5', 10);
   const used = stateManager.getAllApps().filter((a) => a.userId === auth.userId).length;
 
-  return c.json(success({ used, limit: auth.role === 'admin' ? 0 : maxApps }));
+  return c.json(success({ used, limit: auth.role === 'admin' ? 0 : getAppLimit(auth.userId) }));
 });
 
 export default apps;
