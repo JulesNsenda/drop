@@ -432,6 +432,14 @@ export function getUser(username: string): Omit<User, 'passwordHash'> | null {
   return safe;
 }
 
+export function getUserById(userId: string): Omit<User, 'passwordHash'> | null {
+  if (!credentials) return null;
+  const user = credentials.users.find((u) => u.id === userId);
+  if (!user) return null;
+  const { passwordHash: _, ...safe } = user;
+  return safe;
+}
+
 /**
  * Check if auth is enabled
  */

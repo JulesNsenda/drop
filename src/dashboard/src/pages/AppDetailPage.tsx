@@ -20,6 +20,7 @@ import {
 import { useApp, appAction, deleteApp, gitRedeploy } from '../hooks/useApi';
 import { getAuthHeaders, useAuth } from '../hooks/useAuth';
 import { useToast } from '../components/Toast';
+import { useConfirm } from '../components/ConfirmDialog';
 import StatusBadge from '../components/StatusBadge';
 
 function AppDetailPage() {
@@ -29,6 +30,7 @@ function AppDetailPage() {
   const isAdmin = role === 'admin';
   const { app, loading, error, refresh } = useApp(name || '');
   const { toast } = useToast();
+  const confirmDialog = useConfirm();
   const [logs, setLogs] = useState<string[]>([]);
   const [logsLoading, setLogsLoading] = useState(true);
   const [actionLoading, setActionLoading] = useState<string | null>(null);
@@ -119,7 +121,13 @@ function AppDetailPage() {
 
   const handleDelete = async () => {
     if (!name) return;
-    if (!confirm(`Are you sure you want to delete "${name}"? This cannot be undone.`)) return;
+    const confirmed = await confirmDialog({
+      title: 'Delete application',
+      message: `Are you sure you want to delete "${name}"? This will remove the app and all its files permanently.`,
+      confirmText: 'Delete',
+      variant: 'danger',
+    });
+    if (!confirmed) return;
 
     setActionLoading('delete');
     const success = await deleteApp(name);

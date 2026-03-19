@@ -9,7 +9,7 @@ import * as path from 'path';
 import * as fs from 'fs/promises';
 import { success, error, ErrorCodes, AppDto, CreateAppDto, UpdateAppDto } from '../types';
 import { NotFoundError, ValidationError } from '../middleware/error';
-import { AuthContext, listUsers, getUser } from '../middleware/auth';
+import { AuthContext, listUsers, getUserById } from '../middleware/auth';
 import { getProcessManager } from '../../managers/process';
 import { getStateManager, AppState } from '../../managers/app/state-manager';
 import { getAppConfigService } from '../../managers/app/app-config';
@@ -56,7 +56,7 @@ function getAppLimit(userId?: string): number {
   const globalMax = parseInt(process.env.DROP_MAX_APPS_PER_USER || '5', 10);
   if (!userId) return globalMax;
   try {
-    const user = getUser(userId) as any;
+    const user = getUserById(userId) as any;
     if (user?.maxApps && user.maxApps > 0) return user.maxApps;
   } catch {}
   return globalMax;
