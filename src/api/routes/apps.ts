@@ -9,21 +9,34 @@ import * as path from 'path';
 import * as fs from 'fs/promises';
 import { success, error, ErrorCodes, AppDto, CreateAppDto, UpdateAppDto } from '../types';
 import { NotFoundError, ValidationError } from '../middleware/error';
+import { AuthContext, listUsers, getUser } from '../middleware/auth';
 import { getProcessManager } from '../../managers/process';
 import { getStateManager, AppState } from '../../managers/app/state-manager';
 import { getAppConfigService } from '../../managers/app/app-config';
+import { getActivityLog } from '../../managers/activity';
 
 const apps = new Hono();
 
-// Helper to convert AppState to AppDto
-function toAppDto(app: AppState): AppDto {
+// Cache userId → username mapping
+function resolveUsername(userId?: string): string | undefined {
+  if (!userId) return undefined;
+  try {
+    const users = listUsers();
+    return users.find((u) => u.id === userId)?.username;
+  } catch {
+    return undefined;
+  }
+}
+
+// Helper to convert AppState to AppDto (role-aware)
+function toAppDto(app: AppState, isAdmin = false): AppDto {
   return {
     name: app.name,
     type: app.type,
     status: app.status,
     port: app.port,
-    pid: app.pid,
-    path: app.path,
+    pid: isAdmin ? app.pid : undefined,
+    path: isAdmin ? app.path : undefined as unknown as string,
     framework: app.framework,
     hostname: app.hostname,
     createdAt: app.createdAt,
@@ -32,19 +45,42 @@ function toAppDto(app: AppState): AppDto {
     buildDuration: app.buildDuration,
     error: app.error,
     gitSource: app.gitSource,
+    userId: app.userId,
+    ownerName: isAdmin ? resolveUsername(app.userId) : undefined,
+    customDomain: app.customDomain,
   };
 }
 
-// GET /apps - List all applications
+/** Get effective app limit for a user (per-user override > global default) */
+function getAppLimit(userId?: string): number {
+  const globalMax = parseInt(process.env.DROP_MAX_APPS_PER_USER || '5', 10);
+  if (!userId) return globalMax;
+  try {
+    const user = getUser(userId) as any;
+    if (user?.maxApps && user.maxApps > 0) return user.maxApps;
+  } catch {}
+  return globalMax;
+}
+
+/** Check if the current user can access an app (owns it or is admin) */
+function canAccess(auth: AuthContext | undefined, app: AppState): boolean {
+  if (!auth) return true; // No auth enabled
+  if (auth.role === 'admin') return true;
+  return app.userId === auth.userId;
+}
+
+// GET /apps - List applications (filtered by user unless admin)
 apps.get('/', async (c) => {
+  const auth = (c.get as Function)('auth') as AuthContext | undefined;
   const stateManager = getStateManager();
   const allApps = stateManager.getAllApps();
 
-  // Apply filters from query params
+  // Filter by ownership
+  let filtered = allApps.filter((app) => canAccess(auth, app));
+
+  // Apply query param filters
   const status = c.req.query('status');
   const type = c.req.query('type');
-
-  let filtered = allApps;
 
   if (status) {
     filtered = filtered.filter((app) => app.status === status);
@@ -55,7 +91,7 @@ apps.get('/', async (c) => {
   }
 
   return c.json(
-    success(filtered.map(toAppDto), {
+    success(filtered.map((a) => toAppDto(a, auth?.role === 'admin')), {
       total: filtered.length,
     })
   );
@@ -63,11 +99,12 @@ apps.get('/', async (c) => {
 
 // GET /apps/:name - Get application by name
 apps.get('/:name', async (c) => {
+  const auth = (c.get as Function)('auth') as AuthContext | undefined;
   const name = c.req.param('name');
   const stateManager = getStateManager();
   const app = stateManager.getApp(name);
 
-  if (!app) {
+  if (!app || !canAccess(auth, app)) {
     throw new NotFoundError(`Application '${name}' not found`);
   }
 
@@ -76,12 +113,13 @@ apps.get('/:name', async (c) => {
   try {
     const status = await pm.getStatus(name);
     if (status) {
+      const isAdmin = auth?.role === 'admin';
       return c.json(
         success({
-          ...toAppDto(app),
-          pid: status.pid ?? app.pid,
-          memory: status.memory,
-          cpu: status.cpu,
+          ...toAppDto(app, isAdmin),
+          pid: isAdmin ? (status.pid ?? app.pid) : undefined,
+          memory: isAdmin ? status.memory : undefined,
+          cpu: isAdmin ? status.cpu : undefined,
           restarts: status.restarts,
         })
       );
@@ -90,11 +128,12 @@ apps.get('/:name', async (c) => {
     // Process info not available
   }
 
-  return c.json(success(toAppDto(app)));
+  return c.json(success(toAppDto(app, auth?.role === 'admin')));
 });
 
 // POST /apps - Deploy a new application
 apps.post('/', async (c) => {
+  const auth = (c.get as Function)('auth') as AuthContext | undefined;
   const body = await c.req.json<CreateAppDto>();
 
   if (!body.path) {
@@ -122,10 +161,27 @@ apps.post('/', async (c) => {
     return c.json(error(ErrorCodes.CONFLICT, `Application '${appName}' already exists`), 409);
   }
 
+  // Check per-user app limit
+  if (auth?.userId && auth.role !== 'admin') {
+    const maxApps = getAppLimit(auth.userId);
+    if (maxApps > 0) {
+      const userApps = stateManager.getAllApps().filter((a) => a.userId === auth.userId);
+      if (userApps.length >= maxApps) {
+        return c.json(error(ErrorCodes.RATE_LIMITED, `App limit reached (${maxApps}). Delete an app or contact admin.`), 429);
+      }
+    }
+  }
+
   // Register the app (it will be detected and built by the platform)
   const app = await stateManager.registerApp(appName, body.path);
 
-  return c.json(success(toAppDto(app)), 201);
+  // Set owner
+  if (auth?.userId) {
+    await stateManager.updateApp(appName, { userId: auth.userId });
+  }
+
+  try { await getActivityLog().log({ action: 'deploy', userId: auth?.userId, username: auth?.username, appName }); } catch {}
+  return c.json(success(toAppDto({ ...app, userId: auth?.userId }, auth?.role === 'admin')), 201);
 });
 
 // PUT /apps/:name - Update application
@@ -145,16 +201,18 @@ apps.put('/:name', async (c) => {
     throw new NotFoundError(`Application '${name}' not found`);
   }
 
-  return c.json(success(toAppDto(updated)));
+  const authCtx = (c.get as Function)('auth') as AuthContext | undefined;
+  return c.json(success(toAppDto(updated, authCtx?.role === 'admin')));
 });
 
 // DELETE /apps/:name - Remove application
 apps.delete('/:name', async (c) => {
+  const auth = (c.get as Function)('auth') as AuthContext | undefined;
   const name = c.req.param('name');
   const stateManager = getStateManager();
   const app = stateManager.getApp(name);
 
-  if (!app) {
+  if (!app || !canAccess(auth, app)) {
     throw new NotFoundError(`Application '${name}' not found`);
   }
 
@@ -187,16 +245,18 @@ apps.delete('/:name', async (c) => {
     }
   }
 
+  try { await getActivityLog().log({ action: 'delete', userId: auth?.userId, username: auth?.username, appName: name }); } catch {}
   return c.json(success({ message: `Application '${name}' removed` }));
 });
 
 // POST /apps/:name/start - Start application
 apps.post('/:name/start', async (c) => {
+  const auth = (c.get as Function)('auth') as AuthContext | undefined;
   const name = c.req.param('name');
   const stateManager = getStateManager();
   const app = stateManager.getApp(name);
 
-  if (!app) {
+  if (!app || !canAccess(auth, app)) {
     throw new NotFoundError(`Application '${name}' not found`);
   }
 
@@ -216,6 +276,7 @@ apps.post('/:name/start', async (c) => {
       pid: status.pid ?? undefined,
     });
 
+    try { await getActivityLog().log({ action: 'start', userId: auth?.userId, username: auth?.username, appName: name }); } catch {}
     return c.json(success({ message: `Application '${name}' started`, status }));
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Failed to start';
@@ -226,11 +287,12 @@ apps.post('/:name/start', async (c) => {
 
 // POST /apps/:name/stop - Stop application
 apps.post('/:name/stop', async (c) => {
+  const auth = (c.get as Function)('auth') as AuthContext | undefined;
   const name = c.req.param('name');
   const stateManager = getStateManager();
   const app = stateManager.getApp(name);
 
-  if (!app) {
+  if (!app || !canAccess(auth, app)) {
     throw new NotFoundError(`Application '${name}' not found`);
   }
 
@@ -240,6 +302,7 @@ apps.post('/:name/stop', async (c) => {
     await pm.stop(name);
     await stateManager.setAppStatus(name, 'stopped');
 
+    try { await getActivityLog().log({ action: 'stop', userId: auth?.userId, username: auth?.username, appName: name }); } catch {}
     return c.json(success({ message: `Application '${name}' stopped` }));
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Failed to stop';
@@ -249,11 +312,12 @@ apps.post('/:name/stop', async (c) => {
 
 // POST /apps/:name/restart - Restart application
 apps.post('/:name/restart', async (c) => {
+  const auth = (c.get as Function)('auth') as AuthContext | undefined;
   const name = c.req.param('name');
   const stateManager = getStateManager();
   const app = stateManager.getApp(name);
 
-  if (!app) {
+  if (!app || !canAccess(auth, app)) {
     throw new NotFoundError(`Application '${name}' not found`);
   }
 
@@ -265,12 +329,48 @@ apps.post('/:name/restart', async (c) => {
       pid: status.pid ?? undefined,
     });
 
+    try { await getActivityLog().log({ action: 'restart', userId: auth?.userId, username: auth?.username, appName: name }); } catch {}
     return c.json(success({ message: `Application '${name}' restarted`, status }));
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Failed to restart';
     await stateManager.setAppStatus(name, 'errored', { error: message });
     return c.json(error(ErrorCodes.INTERNAL_ERROR, message), 500);
   }
+});
+
+// PUT /apps/:name/domain - Set custom domain
+apps.put('/:name/domain', async (c) => {
+  const auth = (c.get as Function)('auth') as AuthContext | undefined;
+  const name = c.req.param('name');
+  const body = await c.req.json<{ domain?: string }>();
+  const stateManager = getStateManager();
+  const app = stateManager.getApp(name);
+
+  if (!app || !canAccess(auth, app)) {
+    throw new NotFoundError(`Application '${name}' not found`);
+  }
+
+  const domain = body.domain?.trim() || undefined;
+
+  // Basic domain validation
+  if (domain && !/^[a-zA-Z0-9][a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/.test(domain)) {
+    throw new ValidationError('Invalid domain format');
+  }
+
+  await stateManager.updateApp(name, { customDomain: domain || ('' as unknown as undefined) });
+
+  return c.json(success({ message: domain ? `Domain set to ${domain}` : 'Domain removed', domain }));
+});
+
+// GET /apps/:name/usage - Get user app count and limit
+apps.get('/:name/usage', async (c) => {
+  const auth = (c.get as Function)('auth') as AuthContext | undefined;
+  if (!auth?.userId) return c.json(success({ used: 0, limit: 0 }));
+
+  const stateManager = getStateManager();
+  const used = stateManager.getAllApps().filter((a) => a.userId === auth.userId).length;
+
+  return c.json(success({ used, limit: auth.role === 'admin' ? 0 : getAppLimit(auth.userId) }));
 });
 
 export default apps;

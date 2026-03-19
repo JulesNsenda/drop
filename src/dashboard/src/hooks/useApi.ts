@@ -36,6 +36,9 @@ export interface App {
   buildDuration?: number;
   error?: string;
   gitSource?: GitSource;
+  userId?: string;
+  ownerName?: string;
+  customDomain?: string;
 }
 
 export interface ComponentHealth {

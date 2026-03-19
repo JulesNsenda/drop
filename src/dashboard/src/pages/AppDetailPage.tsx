@@ -18,13 +18,15 @@ import {
   EyeOff,
 } from 'lucide-react';
 import { useApp, appAction, deleteApp, gitRedeploy } from '../hooks/useApi';
-import { getAuthHeaders } from '../hooks/useAuth';
+import { getAuthHeaders, useAuth } from '../hooks/useAuth';
 import { useToast } from '../components/Toast';
 import StatusBadge from '../components/StatusBadge';
 
 function AppDetailPage() {
   const { name } = useParams<{ name: string }>();
   const navigate = useNavigate();
+  const { role } = useAuth();
+  const isAdmin = role === 'admin';
   const { app, loading, error, refresh } = useApp(name || '');
   const { toast } = useToast();
   const [logs, setLogs] = useState<string[]>([]);
@@ -317,15 +319,28 @@ function AppDetailPage() {
           )}
         </div>
 
-        <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-4">
-          <div className="flex items-center gap-2 text-gray-500 dark:text-gray-400 mb-1">
-            <Folder className="w-4 h-4" />
-            <span className="text-sm">Path</span>
+        {isAdmin && app.path ? (
+          <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-4">
+            <div className="flex items-center gap-2 text-gray-500 dark:text-gray-400 mb-1">
+              <Folder className="w-4 h-4" />
+              <span className="text-sm">Path</span>
+            </div>
+            <p className="text-sm font-mono text-gray-700 dark:text-gray-300 truncate" title={app.path}>
+              {app.path}
+            </p>
+            {app.ownerName && (
+              <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">Owner: {app.ownerName}</p>
+            )}
           </div>
-          <p className="text-sm font-mono text-gray-700 dark:text-gray-300 truncate" title={app.path}>
-            {app.path}
-          </p>
-        </div>
+        ) : (
+          <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-4">
+            <div className="flex items-center gap-2 text-gray-500 dark:text-gray-400 mb-1">
+              <Folder className="w-4 h-4" />
+              <span className="text-sm">Type</span>
+            </div>
+            <p className="text-sm text-gray-700 dark:text-gray-300 capitalize">{app.type}{app.framework ? ` (${app.framework})` : ''}</p>
+          </div>
+        )}
 
         <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-4">
           <div className="flex items-center gap-2 text-gray-500 dark:text-gray-400 mb-1">
@@ -338,6 +353,9 @@ function AppDetailPage() {
           )}
         </div>
       </div>
+
+      {/* Custom domain */}
+      <CustomDomainSection appName={app.name} currentDomain={app.customDomain} onUpdate={refresh} />
 
       {/* Git source info */}
       {app.gitSource && (
@@ -493,6 +511,60 @@ function AppDetailPage() {
           <div ref={logsEndRef} />
         </div>
       </div>
+    </div>
+  );
+}
+
+function CustomDomainSection({ appName, currentDomain, onUpdate }: { appName: string; currentDomain?: string; onUpdate: () => void }) {
+  const [domain, setDomain] = useState(currentDomain || '');
+  const [saving, setSaving] = useState(false);
+  const { toast } = useToast();
+
+  const handleSave = async () => {
+    setSaving(true);
+    try {
+      const res = await fetch(`/api/v1/apps/${appName}/domain`, {
+        method: 'PUT',
+        headers: { ...getAuthHeaders(), 'Content-Type': 'application/json' },
+        body: JSON.stringify({ domain: domain.trim() || undefined }),
+      });
+      const json = await res.json();
+      if (json.success) {
+        toast('success', domain.trim() ? `Domain set to ${domain.trim()}` : 'Domain removed');
+        onUpdate();
+      } else {
+        toast('error', json.error?.message || 'Failed');
+      }
+    } catch {
+      toast('error', 'Network error');
+    }
+    setSaving(false);
+  };
+
+  return (
+    <div className="mb-6 bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-4">
+      <div className="text-sm font-medium text-gray-500 dark:text-gray-400 mb-3">Custom Domain</div>
+      <div className="flex gap-2 max-w-md">
+        <input
+          type="text"
+          value={domain}
+          onChange={(e) => setDomain(e.target.value)}
+          placeholder="myapp.example.com"
+          className="flex-1 px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white text-sm outline-none focus:ring-2 focus:ring-drop-500"
+        />
+        <button
+          onClick={handleSave}
+          disabled={saving}
+          className="px-4 py-2 bg-drop-600 text-white rounded-lg hover:bg-drop-700 disabled:opacity-50 text-sm font-medium"
+        >
+          {saving ? 'Saving...' : 'Save'}
+        </button>
+      </div>
+      {currentDomain && (
+        <p className="mt-2 text-xs text-gray-500 dark:text-gray-400">
+          Point a CNAME record for <code className="bg-gray-100 dark:bg-gray-700 px-1 rounded">{currentDomain}</code> to your DROP server.
+        </p>
+      )}
     </div>
   );
 }

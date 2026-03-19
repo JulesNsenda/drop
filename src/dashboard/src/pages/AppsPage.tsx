@@ -1,13 +1,16 @@
 import { useState, useMemo } from 'react';
 import { Link } from 'react-router-dom';
-import { RefreshCw, ExternalLink, Clock, Cpu, Search, Filter } from 'lucide-react';
+import { RefreshCw, ExternalLink, Clock, Cpu, Search, Filter, User } from 'lucide-react';
 import { useApps } from '../hooks/useApi';
+import { useAuth } from '../hooks/useAuth';
 import StatusBadge from '../components/StatusBadge';
 
 const STATUS_OPTIONS = ['all', 'running', 'stopped', 'building', 'errored', 'pending'] as const;
 
 function AppsPage() {
   const { apps, loading, error, refresh } = useApps();
+  const { role } = useAuth();
+  const isAdmin = role === 'admin';
   const [search, setSearch] = useState('');
   const [statusFilter, setStatusFilter] = useState<string>('all');
 
@@ -159,8 +162,14 @@ function AppsPage() {
                 )}
                 <div className="flex items-center gap-2 text-gray-600 dark:text-gray-400">
                   <Clock className="w-4 h-4" />
-                  <span>Deployed: {formatDate(app.lastDeployedAt)}</span>
+                  <span>{formatDate(app.lastDeployedAt)}</span>
                 </div>
+                {isAdmin && app.ownerName && (
+                  <div className="flex items-center gap-2 text-gray-500 dark:text-gray-500">
+                    <User className="w-4 h-4" />
+                    <span>{app.ownerName}</span>
+                  </div>
+                )}
               </div>
 
               {app.error && (

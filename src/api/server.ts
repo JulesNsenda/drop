@@ -25,6 +25,7 @@ import certsRoutes from './routes/certs';
 import secretsRoutes from './routes/secrets';
 import webhooksRoutes from './routes/webhooks';
 import gitDeployRoutes from './routes/git-deploy';
+import adminRoutes from './routes/admin';
 
 export interface ApiServerConfig {
   port: number;
@@ -125,8 +126,9 @@ export class ApiServer {
       v1.use('/webhooks/*', authMiddleware('admin'));
       v1.use('/git/deploy', authMiddleware('user'));
       v1.use('/git/redeploy/*', authMiddleware('user'));
-      v1.use('/git/tokens', authMiddleware('admin'));
-      v1.use('/git/tokens/*', authMiddleware('admin'));
+      v1.use('/git/tokens', authMiddleware('user'));
+      v1.use('/git/tokens/*', authMiddleware('user'));
+      v1.use('/admin/*', authMiddleware('admin'));
     }
 
     // Mount all routes (auth middleware applied above when enabled)
@@ -136,6 +138,7 @@ export class ApiServer {
     v1.route('/secrets', secretsRoutes);
     v1.route('/webhooks', webhooksRoutes);
     v1.route('/git', gitDeployRoutes);
+    v1.route('/admin', adminRoutes);
 
     // Mount v1 under /api/v1
     this.app.route('/api/v1', v1);

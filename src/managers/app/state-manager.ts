@@ -28,6 +28,8 @@ export interface AppState {
   buildDuration?: number;
   error?: string;
   gitSource?: GitSource;
+  userId?: string;
+  customDomain?: string;
 }
 
 export interface StateManagerConfig {
@@ -128,6 +130,7 @@ export class AppStateManager {
       lastDeployedAt: existing?.lastDeployedAt,
       buildDuration: existing?.buildDuration,
       gitSource: existing?.gitSource,
+      userId: existing?.userId,
     };
 
     this.apps.set(name, app);

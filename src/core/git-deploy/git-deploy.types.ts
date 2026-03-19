@@ -21,6 +21,7 @@ export interface GitDeployRequest {
   name?: string;
   autoRedeploy?: boolean;
   tokenId?: string;
+  userId?: string;
 }
 
 /** API request to store a GitHub token */

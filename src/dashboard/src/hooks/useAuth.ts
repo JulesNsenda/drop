@@ -5,6 +5,8 @@ interface AuthState {
   loading: boolean;
   authRequired: boolean;
   username?: string;
+  userId?: string;
+  role?: 'admin' | 'user' | 'readonly';
 }
 
 interface AuthContextValue extends AuthState {
@@ -57,6 +59,8 @@ export function useAuthProvider(): AuthContextValue {
             loading: false,
             authRequired: res.headers.get('x-auth-required') === 'true' || !!token,
             username: localStorage.getItem('drop-username') || undefined,
+            userId: localStorage.getItem('drop-userId') || undefined,
+            role: (localStorage.getItem('drop-role') as AuthState['role']) || undefined,
           });
         }
       } catch {
@@ -80,11 +84,15 @@ export function useAuthProvider(): AuthContextValue {
       if (json.success && json.data?.token) {
         localStorage.setItem('drop-token', json.data.token);
         localStorage.setItem('drop-username', username);
+        if (json.data.user?.id) localStorage.setItem('drop-userId', json.data.user.id);
+        if (json.data.user?.role) localStorage.setItem('drop-role', json.data.user.role);
         setState({
           authenticated: true,
           loading: false,
           authRequired: true,
           username,
+          userId: json.data.user?.id,
+          role: json.data.user?.role,
         });
         return true;
       }
@@ -97,6 +105,8 @@ export function useAuthProvider(): AuthContextValue {
   const logout = useCallback(() => {
     localStorage.removeItem('drop-token');
     localStorage.removeItem('drop-username');
+    localStorage.removeItem('drop-userId');
+    localStorage.removeItem('drop-role');
     setState({ authenticated: false, loading: false, authRequired: true });
   }, []);
 

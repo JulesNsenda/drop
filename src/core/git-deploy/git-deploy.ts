@@ -140,7 +140,7 @@ export class GitDeployService {
 
     const clonedAt = new Date().toISOString();
 
-    // Register app with git source metadata
+    // Register app with git source metadata and userId atomically
     await stateManager.registerApp(appName, destPath);
 
     const gitSource: GitSource = {
@@ -152,7 +152,10 @@ export class GitDeployService {
       tokenId: request.tokenId,
     };
 
-    await stateManager.updateApp(appName, { gitSource } as Record<string, unknown>);
+    await stateManager.updateApp(appName, {
+      gitSource,
+      ...(request.userId ? { userId: request.userId } : {}),
+    } as Record<string, unknown>);
 
     logger.info(`Cloned ${repoUrl} → ${appName} (${commitSha?.slice(0, 7) || 'unknown'})`, 'GIT-DEPLOY');
 
