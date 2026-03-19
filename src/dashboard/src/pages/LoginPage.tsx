@@ -1,5 +1,6 @@
 import { useState, FormEvent } from 'react';
-import { Box, LogIn } from 'lucide-react';
+import { Link } from 'react-router-dom';
+import { Box, LogIn, ArrowLeft } from 'lucide-react';
 import { useAuth } from '../hooks/useAuth';
 
 function LoginPage() {
@@ -34,7 +35,7 @@ function LoginPage() {
         </div>
 
         {/* Login form */}
-        <form onSubmit={handleSubmit} className="bg-white dark:bg-gray-800 rounded-xl shadow-sm border border-gray-200 dark:border-gray-700 p-6">
+        <form onSubmit={handleSubmit} className="bg-white dark:bg-gray-800 rounded-xl shadow-sm border border-gray-200 dark:border-gray-700 p-6 mb-4">
           {error && (
             <div className="mb-4 p-3 bg-red-50 dark:bg-red-900/30 border border-red-200 dark:border-red-800 rounded-lg text-sm text-red-700 dark:text-red-400">
               {error}
@@ -80,6 +81,13 @@ function LoginPage() {
             {loading ? 'Signing in...' : 'Sign in'}
           </button>
         </form>
+
+        <div className="text-center">
+          <Link to="/" className="inline-flex items-center gap-1.5 text-sm text-gray-500 dark:text-gray-400 hover:text-drop-600 dark:hover:text-drop-400 transition-colors">
+            <ArrowLeft className="w-3.5 h-3.5" />
+            Back to home
+          </Link>
+        </div>
       </div>
     </div>
   );
