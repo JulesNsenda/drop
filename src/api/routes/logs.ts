@@ -5,7 +5,7 @@
  */
 
 import { Hono } from 'hono';
-import { success, error, ErrorCodes, AppLogsDto } from '../types';
+import { success, AppLogsDto } from '../types';
 import { NotFoundError } from '../middleware/error';
 import { getProcessManager } from '../../managers/process';
 import { getStateManager } from '../../managers/app/state-manager';
@@ -27,21 +27,21 @@ logs.get('/:name', async (c) => {
 
   const pm = getProcessManager();
 
+  let logLines: string[] = [];
   try {
     const logContent = await pm.getLogs(name, lines);
-    const logLines = logContent ? logContent.split('\n').filter(Boolean) : [];
-
-    const response: AppLogsDto = {
-      name,
-      logs: logLines,
-      type,
-    };
-
-    return c.json(success(response));
-  } catch (err) {
-    const message = err instanceof Error ? err.message : 'Failed to retrieve logs';
-    return c.json(error(ErrorCodes.INTERNAL_ERROR, message), 500);
+    logLines = logContent ? logContent.split('\n').filter(Boolean) : [];
+  } catch {
+    // No logs available yet — return empty
   }
+
+  const response: AppLogsDto = {
+    name,
+    logs: logLines,
+    type,
+  };
+
+  return c.json(success(response));
 });
 
 // GET /logs/:name/stream - Stream logs (SSE)
