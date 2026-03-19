@@ -81,9 +81,12 @@ function AppDetailPage() {
     fetchEnv();
   }, [name]);
 
-  // Auto-scroll logs
+  // Auto-scroll logs within the log container only
   useEffect(() => {
-    logsEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+    const container = logsEndRef.current?.parentElement;
+    if (container) {
+      container.scrollTop = container.scrollHeight;
+    }
   }, [logs]);
 
   const handleAction = async (action: 'start' | 'stop' | 'restart') => {
