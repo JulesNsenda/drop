@@ -742,16 +742,22 @@ import ${path.join(dataDir, 'appconf', 'caddy', 'hosts', '*.caddy').replace(/\\/
         await this.stateManager.registerApp(payload.name, payload.path, appType);
       }
 
-      // Build the app if auto-build is enabled
-      if (this.config.autoBuild && payload.type !== 'unknown') {
+      // Build the app if auto-build is enabled (skip if user stopped it)
+      const currentApp = this.stateManager?.getApp(payload.name);
+      if (this.config.autoBuild && payload.type !== 'unknown' && currentApp?.status !== 'stopped') {
         await this.handleBuildApp(payload.path, payload.name, payload.type as string);
       }
     });
     this.subscriptions.push(detectedSub);
 
-    // When build completes, start the app
+    // When build completes, start the app (unless it was explicitly stopped)
     const buildSub = this.eventBus.subscribe('build:completed', async (payload) => {
       if (this.config.autoStart) {
+        const app = this.stateManager?.getApp(payload.appId);
+        if (app?.status === 'stopped') {
+          this.logger.info(`Skipping auto-start for ${payload.appId} - app was stopped by user`, 'APP');
+          return;
+        }
         await this.handleStartApp(payload.appId);
       }
     });

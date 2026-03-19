@@ -116,7 +116,8 @@ export class AppStateManager {
     const app: AppState = {
       name,
       type,
-      status: 'pending',
+      // Preserve 'stopped' status so user-stopped apps don't auto-restart
+      status: existing?.status === 'stopped' ? 'stopped' : 'pending',
       path: appPath,
       framework,
       hostname: `${name}.localhost`,
@@ -126,6 +127,7 @@ export class AppStateManager {
       port: existing?.port,
       lastDeployedAt: existing?.lastDeployedAt,
       buildDuration: existing?.buildDuration,
+      gitSource: existing?.gitSource,
     };
 
     this.apps.set(name, app);
