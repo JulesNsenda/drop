@@ -10,7 +10,6 @@ import { success, error, ErrorCodes } from '../types';
 import { ValidationError } from '../middleware/error';
 import { AuthContext } from '../middleware/auth';
 import { getGitDeployService } from '../../core/git-deploy';
-import { getStateManager } from '../../managers/app/state-manager';
 import type { GitDeployRequest, GitTokenCreateRequest } from '../../core/git-deploy';
 
 const gitDeploy = new Hono();
@@ -30,15 +29,13 @@ gitDeploy.post('/deploy', async (c) => {
   }
 
   try {
-    const result = await service.deploy(body);
-
-    // Set owner
+    // Pass userId so ownership is set atomically with app registration
     const auth = (c.get as Function)('auth') as AuthContext | undefined;
     if (auth?.userId) {
-      const stateManager = getStateManager();
-      await stateManager.updateApp(result.appName, { userId: auth.userId });
+      body.userId = auth.userId;
     }
 
+    const result = await service.deploy(body);
     return c.json(success(result), 201);
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Deploy failed';

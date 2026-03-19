@@ -129,6 +129,7 @@ export class AppStateManager {
       lastDeployedAt: existing?.lastDeployedAt,
       buildDuration: existing?.buildDuration,
       gitSource: existing?.gitSource,
+      userId: existing?.userId,
     };
 
     this.apps.set(name, app);
