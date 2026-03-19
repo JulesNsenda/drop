@@ -36,6 +36,8 @@ export interface App {
   buildDuration?: number;
   error?: string;
   gitSource?: GitSource;
+  userId?: string;
+  ownerName?: string;
 }
 
 export interface ComponentHealth {

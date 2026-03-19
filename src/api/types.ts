@@ -37,7 +37,7 @@ export interface AppDto {
   status: AppStatus;
   port?: number;
   pid?: number;
-  path: string;
+  path?: string;
   framework?: string;
   hostname?: string;
   createdAt: string;
@@ -47,6 +47,7 @@ export interface AppDto {
   error?: string;
   gitSource?: GitSource;
   userId?: string;
+  ownerName?: string;
 }
 
 export interface CreateAppDto {
