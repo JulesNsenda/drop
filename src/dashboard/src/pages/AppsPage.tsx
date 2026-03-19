@@ -1,6 +1,6 @@
 import { useState, useMemo } from 'react';
-import { Link } from 'react-router-dom';
-import { RefreshCw, ExternalLink, Clock, Cpu, Search, Filter, User } from 'lucide-react';
+import { Link, useNavigate } from 'react-router-dom';
+import { RefreshCw, ExternalLink, Clock, Search, Filter, User, GitBranch, ArrowRight } from 'lucide-react';
 import { useApps } from '../hooks/useApi';
 import { useAuth } from '../hooks/useAuth';
 import StatusBadge from '../components/StatusBadge';
@@ -11,6 +11,7 @@ function AppsPage() {
   const { apps, loading, error, refresh } = useApps();
   const { role } = useAuth();
   const isAdmin = role === 'admin';
+  const navigate = useNavigate();
   const [search, setSearch] = useState('');
   const [statusFilter, setStatusFilter] = useState<string>('all');
 
@@ -106,16 +107,23 @@ function AppsPage() {
         </div>
       )}
 
-      {/* Empty state */}
+      {/* Empty state - onboarding */}
       {!loading && apps.length === 0 && (
-        <div className="text-center py-12">
-          <div className="w-16 h-16 bg-gray-100 dark:bg-gray-800 rounded-full flex items-center justify-center mx-auto mb-4">
-            <Cpu className="w-8 h-8 text-gray-400" />
+        <div className="max-w-lg mx-auto text-center py-16">
+          <div className="w-16 h-16 bg-drop-100 dark:bg-drop-900/30 rounded-2xl flex items-center justify-center mx-auto mb-6">
+            <GitBranch className="w-8 h-8 text-drop-600 dark:text-drop-400" />
           </div>
-          <h3 className="text-lg font-medium text-gray-900 dark:text-white mb-2">No applications</h3>
-          <p className="text-gray-500 dark:text-gray-400 max-w-md mx-auto">
-            Drop a folder into the webapps directory or use the Deploy page to get started.
+          <h2 className="text-xl font-bold text-gray-900 dark:text-white mb-2">Deploy your first app</h2>
+          <p className="text-gray-500 dark:text-gray-400 mb-8 leading-relaxed">
+            Paste a GitHub repo URL and your app will be live in seconds. Supports Node.js, Python, Go, static sites, and Docker.
           </p>
+          <button
+            onClick={() => navigate('/deploy')}
+            className="inline-flex items-center gap-2 px-6 py-3 bg-drop-600 text-white rounded-lg hover:bg-drop-700 font-medium transition-colors"
+          >
+            Deploy from GitHub
+            <ArrowRight className="w-4 h-4" />
+          </button>
         </div>
       )}
 
@@ -154,18 +162,24 @@ function AppsPage() {
               </div>
 
               <div className="space-y-2 text-sm">
-                {app.port && (
-                  <div className="flex items-center gap-2 text-gray-600 dark:text-gray-400">
+                {app.port && app.status === 'running' && (
+                  <a
+                    href={app.customDomain ? `https://${app.customDomain}` : `http://localhost:${app.port}`}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    onClick={(e) => e.stopPropagation()}
+                    className="flex items-center gap-2 text-drop-600 dark:text-drop-400 hover:underline"
+                  >
                     <ExternalLink className="w-4 h-4" />
-                    <span>localhost:{app.port}</span>
-                  </div>
+                    <span>{app.customDomain || `localhost:${app.port}`}</span>
+                  </a>
                 )}
-                <div className="flex items-center gap-2 text-gray-600 dark:text-gray-400">
+                <div className="flex items-center gap-2 text-gray-500 dark:text-gray-400">
                   <Clock className="w-4 h-4" />
                   <span>{formatDate(app.lastDeployedAt)}</span>
                 </div>
                 {isAdmin && app.ownerName && (
-                  <div className="flex items-center gap-2 text-gray-500 dark:text-gray-500">
+                  <div className="flex items-center gap-2 text-gray-400">
                     <User className="w-4 h-4" />
                     <span>{app.ownerName}</span>
                   </div>
