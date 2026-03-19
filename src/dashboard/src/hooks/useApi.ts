@@ -38,15 +38,29 @@ export interface App {
   gitSource?: GitSource;
 }
 
+export interface ComponentHealth {
+  status: 'up' | 'down' | 'unknown';
+  message?: string;
+}
+
 export interface HealthStatus {
   status: string;
   uptime: number;
   version: string;
+  timestamp: string;
   components: {
-    watcher: string;
-    processManager: string;
-    database: string;
+    platform: ComponentHealth;
+    processManager: ComponentHealth;
+    database?: ComponentHealth;
+    watcher?: ComponentHealth;
   };
+}
+
+export interface AppHealthCheck {
+  name: string;
+  status: string;
+  port?: number;
+  healthy: boolean;
 }
 
 export function useApps() {
