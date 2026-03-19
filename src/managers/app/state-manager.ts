@@ -165,6 +165,14 @@ export class AppStateManager {
   }
 
   async setAppStatus(name: string, status: AppStatus, details?: { port?: number; pid?: number; error?: string }): Promise<AppState | null> {
+    const app = this.apps.get(name);
+    if (!app) return null;
+
+    // Clear stale error when app transitions to a healthy state
+    if ((status === 'running' || status === 'building' || status === 'starting') && !details?.error) {
+      delete app.error;
+    }
+
     return this.updateApp(name, {
       status,
       ...details,

@@ -33,6 +33,7 @@ export interface GitDeployServiceConfig {
 export class GitDeployService {
   private readonly config: GitDeployServiceConfig;
   private gitAvailable = false;
+  private activeClones: Set<string> = new Set();
 
   constructor(config: GitDeployServiceConfig) {
     this.config = config;
@@ -49,6 +50,11 @@ export class GitDeployService {
 
   isAvailable(): boolean {
     return this.gitAvailable;
+  }
+
+  /** Check if an app is currently being cloned */
+  isCloning(appName: string): boolean {
+    return this.activeClones.has(appName);
   }
 
   /** Deploy an app from a GitHub repository */
@@ -97,6 +103,9 @@ export class GitDeployService {
       }
     }
 
+    // Mark as cloning to prevent watcher from detecting mid-clone
+    this.activeClones.add(appName);
+
     // Clone
     logger.info(`Cloning ${repoUrl} (branch: ${branch}) into ${appName}`, 'GIT-DEPLOY');
     try {
@@ -108,6 +117,7 @@ export class GitDeployService {
         shallow: true,
       });
     } catch (err) {
+      this.activeClones.delete(appName);
       // Clean up partial clone
       try {
         await fs.rm(destPath, { recursive: true, force: true });
@@ -116,6 +126,9 @@ export class GitDeployService {
       }
       throw err;
     }
+
+    // Clone complete - allow watcher to detect
+    this.activeClones.delete(appName);
 
     // Read commit SHA
     let commitSha: string | undefined;
