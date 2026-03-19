@@ -173,7 +173,12 @@ export class ApiServer {
     this.app.route('/api/v1', v1);
 
     // Dashboard static files
-    const dashboardPath = path.join(__dirname, '..', 'dashboard');
+    // Prefer built dashboard (dist/dashboard) over source (src/dashboard)
+    const distDashboardPath = path.join(__dirname, '..', '..', 'dist', 'dashboard');
+    const srcDashboardPath = path.join(__dirname, '..', 'dashboard');
+    const dashboardPath = fs.existsSync(path.join(distDashboardPath, 'index.html'))
+      ? distDashboardPath
+      : srcDashboardPath;
     const dashboardIndexPath = path.join(dashboardPath, 'index.html');
     const dashboardExists = fs.existsSync(dashboardIndexPath);
 
@@ -231,7 +236,8 @@ export class ApiServer {
 
     // Root - redirect to dashboard if available, otherwise show API info
     this.app.get('/', (c) => {
-      const dashboardExists = fs.existsSync(path.join(__dirname, '../dashboard/index.html'));
+      const dashboardExists = fs.existsSync(path.join(distDashboardPath, 'index.html'))
+        || fs.existsSync(path.join(srcDashboardPath, 'index.html'));
       if (dashboardExists) {
         return c.redirect('/dashboard');
       }
