@@ -98,7 +98,7 @@ const DEFAULT_CONFIG: PlatformConfig = {
   wildcardCert: false,
   enableApi: true,
   apiPort: 3000,
-  enableApiAuth: process.env.NODE_ENV === 'production',
+  enableApiAuth: process.env.DROP_DISABLE_AUTH !== 'true',
 };
 
 export class DropPlatform {

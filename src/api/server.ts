@@ -115,64 +115,27 @@ export class ApiServer {
     v1.use('/auth/login', authRateLimitMiddleware());
     v1.route('/auth', authRoutes);
 
-    // Protected routes (auth required if enabled)
+    // Apply auth middleware to protected routes when auth is enabled
     if (this.config.enableAuth && isAuthEnabled()) {
-      // Apps routes require at least 'user' role for modifications
-      const protectedApps = new Hono();
-      protectedApps.get('/', authMiddleware('readonly'), async (c) => {
-        const appsRouter = new Hono();
-        appsRouter.route('/', appsRoutes);
-        return appsRouter.fetch(c.req.raw);
-      });
-      protectedApps.get('/:name', authMiddleware('readonly'), async (c) => {
-        const appsRouter = new Hono();
-        appsRouter.route('/', appsRoutes);
-        return appsRouter.fetch(c.req.raw);
-      });
-      protectedApps.post('/*', authMiddleware('user'), async (c) => {
-        const appsRouter = new Hono();
-        appsRouter.route('/', appsRoutes);
-        return appsRouter.fetch(c.req.raw);
-      });
-      protectedApps.put('/*', authMiddleware('user'), async (c) => {
-        const appsRouter = new Hono();
-        appsRouter.route('/', appsRoutes);
-        return appsRouter.fetch(c.req.raw);
-      });
-      protectedApps.delete('/*', authMiddleware('admin'), async (c) => {
-        const appsRouter = new Hono();
-        appsRouter.route('/', appsRoutes);
-        return appsRouter.fetch(c.req.raw);
-      });
-      v1.route('/apps', protectedApps);
-
-      // Logs routes require at least 'readonly' role
+      v1.use('/apps/*', authMiddleware('readonly'));
+      v1.use('/apps', authMiddleware('readonly'));
       v1.use('/logs/*', authMiddleware('readonly'));
-      v1.route('/logs', logsRoutes);
-
-      // Certs routes require at least 'readonly' role
       v1.use('/certs/*', authMiddleware('readonly'));
-      v1.route('/certs', certsRoutes);
-
-      // Secrets routes require 'admin' role
       v1.use('/secrets/*', authMiddleware('admin'));
-      v1.route('/secrets', secretsRoutes);
-
-      // Webhooks routes require 'admin' role
       v1.use('/webhooks/*', authMiddleware('admin'));
-      v1.route('/webhooks', webhooksRoutes);
-
-      // Git deploy: webhook endpoint is public, rest requires 'user' role
-      v1.route('/git', gitDeployRoutes);
-    } else {
-      // No auth - all routes are public
-      v1.route('/apps', appsRoutes);
-      v1.route('/logs', logsRoutes);
-      v1.route('/certs', certsRoutes);
-      v1.route('/secrets', secretsRoutes);
-      v1.route('/webhooks', webhooksRoutes);
-      v1.route('/git', gitDeployRoutes);
+      v1.use('/git/deploy', authMiddleware('user'));
+      v1.use('/git/redeploy/*', authMiddleware('user'));
+      v1.use('/git/tokens', authMiddleware('admin'));
+      v1.use('/git/tokens/*', authMiddleware('admin'));
     }
+
+    // Mount all routes (auth middleware applied above when enabled)
+    v1.route('/apps', appsRoutes);
+    v1.route('/logs', logsRoutes);
+    v1.route('/certs', certsRoutes);
+    v1.route('/secrets', secretsRoutes);
+    v1.route('/webhooks', webhooksRoutes);
+    v1.route('/git', gitDeployRoutes);
 
     // Mount v1 under /api/v1
     this.app.route('/api/v1', v1);
