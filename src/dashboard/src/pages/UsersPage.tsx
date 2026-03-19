@@ -31,6 +31,7 @@ function UsersPage() {
   const [selectedUser, setSelectedUser] = useState<UserInfo | null>(null);
   const [userApps, setUserApps] = useState<App[]>([]);
   const [userActivity, setUserActivity] = useState<ActivityEntry[]>([]);
+  const [resetPw, setResetPw] = useState('');
   const { toast } = useToast();
 
   const fetchUsers = async () => {
@@ -191,6 +192,42 @@ function UsersPage() {
             </div>
           )}
         </div>
+
+        {/* Reset password (admin action) */}
+        {selectedUser.role !== 'admin' && (
+          <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 mb-6">
+            <div className="px-4 py-3 border-b border-gray-200 dark:border-gray-700">
+              <h2 className="font-semibold text-gray-900 dark:text-white">Reset Password</h2>
+            </div>
+            <div className="p-4 flex gap-2 max-w-md">
+              <input
+                type="password"
+                value={resetPw}
+                onChange={(e) => setResetPw(e.target.value)}
+                placeholder="New password (min 8 chars)"
+                minLength={8}
+                className="flex-1 px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white text-sm outline-none focus:ring-2 focus:ring-drop-500"
+              />
+              <button
+                onClick={async () => {
+                  if (resetPw.length < 8) { toast('error', 'Min 8 characters'); return; }
+                  const res = await fetch(`/api/v1/auth/users/${selectedUser.id}/reset-password`, {
+                    method: 'POST',
+                    headers: { ...getAuthHeaders(), 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ newPassword: resetPw }),
+                  });
+                  const json = await res.json();
+                  if (json.success) { toast('success', 'Password reset'); setResetPw(''); }
+                  else toast('error', json.error?.message || 'Failed');
+                }}
+                disabled={resetPw.length < 8}
+                className="px-4 py-2 bg-drop-600 text-white rounded-lg hover:bg-drop-700 disabled:opacity-50 text-sm font-medium"
+              >
+                Reset
+              </button>
+            </div>
+          </div>
+        )}
 
         {/* User's activity */}
         <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700">
