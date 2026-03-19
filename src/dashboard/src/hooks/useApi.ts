@@ -38,6 +38,7 @@ export interface App {
   gitSource?: GitSource;
   userId?: string;
   ownerName?: string;
+  customDomain?: string;
 }
 
 export interface ComponentHealth {

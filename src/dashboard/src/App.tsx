@@ -10,6 +10,7 @@ import SettingsPage from './pages/SettingsPage';
 import DeployPage from './pages/DeployPage';
 import LoginPage from './pages/LoginPage';
 import SignupPage from './pages/SignupPage';
+import UsersPage from './pages/UsersPage';
 
 function App() {
   const auth = useAuthProvider();
@@ -44,6 +45,7 @@ function App() {
               <Route path="apps/:name" element={<AppDetailPage />} />
               <Route path="deploy" element={<DeployPage />} />
               <Route path="settings" element={<SettingsPage />} />
+              <Route path="users" element={<UsersPage />} />
             </Route>
           </Routes>
         </ErrorBoundary>
