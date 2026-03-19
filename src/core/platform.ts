@@ -713,6 +713,12 @@ import ${path.join(dataDir, 'appconf', 'caddy', 'hosts', '*.caddy').replace(/\\/
     // When watcher detects a new directory, detect the app type
     const watcherSub = this.eventBus.subscribe('watcher:change', async (payload) => {
       if (payload.changeType === 'addDir' && this.isTopLevelApp(payload.path)) {
+        const appName = path.basename(payload.path);
+        // Skip apps currently being cloned by git deploy (race condition prevention)
+        if (this.gitDeployService?.isCloning(appName)) {
+          this.logger.debug(`Skipping watcher detection for ${appName} - git clone in progress`, 'GIT-DEPLOY');
+          return;
+        }
         await this.handleNewApp(payload.path);
       }
     });
