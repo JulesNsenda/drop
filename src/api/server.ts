@@ -125,8 +125,8 @@ export class ApiServer {
       v1.use('/webhooks/*', authMiddleware('admin'));
       v1.use('/git/deploy', authMiddleware('user'));
       v1.use('/git/redeploy/*', authMiddleware('user'));
-      v1.use('/git/tokens', authMiddleware('admin'));
-      v1.use('/git/tokens/*', authMiddleware('admin'));
+      v1.use('/git/tokens', authMiddleware('user'));
+      v1.use('/git/tokens/*', authMiddleware('user'));
     }
 
     // Mount all routes (auth middleware applied above when enabled)
