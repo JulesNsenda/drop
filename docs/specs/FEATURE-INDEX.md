@@ -14,8 +14,9 @@ Quick reference to all PRDs and task files organized by version.
 | v0.4.0 | Experience | 4 features | **Completed** (Dashboard polish) |
 | v0.5.0 | Enterprise | 4 features | Planned |
 | v0.6.0 | Connect | 2 features | **Completed** |
-| v0.7.0 | SaaS Ready | 6 features | In Progress |
-| v1.0.0 | Production | Stable | Planned |
+| v0.7.0 | SaaS Ready | 11 features | **Completed** |
+| v1.0.0 | Production | 5 features | Planned |
+| v2.0.0 | Architecture | 10 features | Planned |
 
 ---
 
@@ -203,6 +204,30 @@ Quick reference to all PRDs and task files organized by version.
 - Complete documentation
 - Performance benchmarks met
 - Security audit passed
+
+---
+
+## v2.0.0 - Architecture
+
+**Goal**: Production-grade architecture for real multi-tenant SaaS
+
+| Order | PRD | Feature | Tasks | Priority | Status |
+|-------|-----|---------|-------|----------|--------|
+| 1 | [PRD-029](prd/PRD-029-docker-isolation.md) | Docker Isolation | [TASKS-029](tasks/TASKS-029-docker-isolation.md) | P0 | Not Started |
+| 2 | [PRD-030](prd/PRD-030-deploy-transaction.md) | Deploy as Transaction | [TASKS-030](tasks/TASKS-030-deploy-transaction.md) | P0 | Not Started |
+| 3 | [PRD-031](prd/PRD-031-build-caching.md) | Build Caching | [TASKS-031](tasks/TASKS-031-build-caching.md) | P1 | Not Started |
+| 4 | [PRD-032](prd/PRD-032-caddy-required.md) | Caddy Required (Real URLs) | [TASKS-032](tasks/TASKS-032-caddy-required.md) | P1 | Not Started |
+| 5 | [PRD-033](prd/PRD-033-sqlite-state.md) | SQLite State Storage | [TASKS-033](tasks/TASKS-033-sqlite-state.md) | P1 | Not Started |
+| 6 | [PRD-034](prd/PRD-034-build-logs.md) | Build Logs in Dashboard | [TASKS-034](tasks/TASKS-034-build-logs.md) | P1 | Not Started |
+| 7 | [PRD-038](prd/PRD-038-ssl-all-apps.md) | SSL for All Apps | [TASKS-038](tasks/TASKS-038-ssl-all-apps.md) | P1 | Not Started |
+| 8 | [PRD-035](prd/PRD-035-deploy-rollback.md) | Deploy Rollback | [TASKS-035](tasks/TASKS-035-deploy-rollback.md) | P2 | Not Started |
+| 9 | [PRD-036](prd/PRD-036-resource-limits.md) | Resource Limits | [TASKS-036](tasks/TASKS-036-resource-limits.md) | P2 | Not Started |
+| 10 | [PRD-037](prd/PRD-037-app-backups.md) | App Backups | [TASKS-037](tasks/TASKS-037-app-backups.md) | P2 | Not Started |
+
+### v2.0 Architecture Priorities
+- **P0**: Docker isolation (security), deploy-as-transaction (reliability)
+- **P1**: Build caching, Caddy auto-URLs, SQLite state, build logs, SSL
+- **P2**: Rollback, resource limits, backups
 
 ---
 
