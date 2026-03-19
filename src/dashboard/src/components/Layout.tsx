@@ -34,7 +34,7 @@ function Layout() {
           <ul className="space-y-1">
             <li>
               <NavLink
-                to="/"
+                to="/apps"
                 end
                 className={({ isActive }) =>
                   `flex items-center gap-3 px-3 py-2 rounded-lg transition-colors ${
