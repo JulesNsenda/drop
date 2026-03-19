@@ -5,6 +5,7 @@
  */
 
 import { AppStatus, AppType } from '../managers/app/state-manager';
+import type { GitSource } from '../core/git-deploy/git-deploy.types';
 
 // API Response wrapper
 export interface ApiResponse<T = unknown> {
@@ -44,6 +45,7 @@ export interface AppDto {
   lastDeployedAt?: string;
   buildDuration?: number;
   error?: string;
+  gitSource?: GitSource;
 }
 
 export interface CreateAppDto {
