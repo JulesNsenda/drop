@@ -2,6 +2,7 @@ import { Routes, Route, Navigate } from 'react-router-dom';
 import Layout from './components/Layout';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import { ToastProvider } from './components/Toast';
+import { ConfirmProvider } from './components/ConfirmDialog';
 import { AuthContext, useAuthProvider } from './hooks/useAuth';
 import LandingPage from './pages/LandingPage';
 import AppsPage from './pages/AppsPage';
@@ -18,6 +19,7 @@ function App() {
   return (
     <AuthContext.Provider value={auth}>
       <ToastProvider>
+        <ConfirmProvider>
         <ErrorBoundary>
           <Routes>
             {/* Public routes */}
@@ -49,6 +51,7 @@ function App() {
             </Route>
           </Routes>
         </ErrorBoundary>
+        </ConfirmProvider>
       </ToastProvider>
     </AuthContext.Provider>
   );

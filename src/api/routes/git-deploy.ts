@@ -11,7 +11,7 @@ import { ValidationError } from '../middleware/error';
 import { AuthContext } from '../middleware/auth';
 import { getGitDeployService } from '../../core/git-deploy';
 import { getStateManager } from '../../managers/app/state-manager';
-import { getUser } from '../middleware/auth';
+import { getUserById } from '../middleware/auth';
 import { getActivityLog } from '../../managers/activity';
 import type { GitDeployRequest, GitTokenCreateRequest } from '../../core/git-deploy';
 
@@ -38,7 +38,7 @@ gitDeploy.post('/deploy', async (c) => {
     if (auth?.userId && auth.role !== 'admin') {
       const globalMax = parseInt(process.env.DROP_MAX_APPS_PER_USER || '5', 10);
       let maxApps = globalMax;
-      try { const u = getUser(auth.userId) as any; if (u?.maxApps > 0) maxApps = u.maxApps; } catch {}
+      try { const u = getUserById(auth.userId) as any; if (u?.maxApps > 0) maxApps = u.maxApps; } catch {}
       if (maxApps > 0) {
         const stateManager = getStateManager();
         const userApps = stateManager.getAllApps().filter((a) => a.userId === auth.userId);

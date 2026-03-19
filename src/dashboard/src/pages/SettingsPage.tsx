@@ -2,6 +2,7 @@ import { useState, useEffect, FormEvent } from 'react';
 import { useHealth, AppHealthCheck } from '../hooks/useApi';
 import { getAuthHeaders, useAuth } from '../hooks/useAuth';
 import { useToast } from '../components/Toast';
+import { useConfirm } from '../components/ConfirmDialog';
 import { Server, Database, Eye, HardDrive, Activity, CheckCircle, XCircle, AlertTriangle, Lock, Clock } from 'lucide-react';
 
 interface ActivityEntry {
@@ -18,6 +19,7 @@ function SettingsPage() {
   const { role } = useAuth();
   const isAdmin = role === 'admin';
   const { toast } = useToast();
+  const confirmDialog = useConfirm();
   const [appChecks, setAppChecks] = useState<AppHealthCheck[]>([]);
   const [appChecksLoading, setAppChecksLoading] = useState(true);
 
@@ -346,7 +348,8 @@ function SettingsPage() {
             </div>
             <button
               onClick={async () => {
-                if (!confirm('Are you sure? This will permanently delete your account and all your deployed applications. This cannot be undone.')) return;
+                const confirmed = await confirmDialog({ title: 'Delete account', message: 'This will permanently delete your account and all your deployed applications. This cannot be undone.', confirmText: 'Delete my account', variant: 'danger' });
+                if (!confirmed) return;
                 try {
                   const res = await fetch('/api/v1/auth/account', { method: 'DELETE', headers: getAuthHeaders() });
                   const json = await res.json();

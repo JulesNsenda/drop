@@ -13,6 +13,7 @@ import {
   ArrowRight,
 } from 'lucide-react';
 import { useToast } from '../components/Toast';
+import { useConfirm } from '../components/ConfirmDialog';
 import { getAuthHeaders } from '../hooks/useAuth';
 import { gitDeploy, getGitTokens, addGitToken, deleteGitToken, GitTokenInfo } from '../hooks/useApi';
 
@@ -26,6 +27,7 @@ const labelClass = 'block text-sm font-medium text-gray-700 dark:text-gray-300 m
 function DeployPage() {
   const [tab, setTab] = useState<Tab>('github');
   const { toast } = useToast();
+  const confirmDialog = useConfirm();
   const navigate = useNavigate();
 
   // Shared result state
@@ -137,7 +139,8 @@ function DeployPage() {
   };
 
   const handleDeleteToken = async (id: string) => {
-    if (!confirm('Delete this token?')) return;
+    const confirmed = await confirmDialog({ title: 'Delete token', message: 'Remove this GitHub token?', confirmText: 'Delete', variant: 'danger' });
+    if (!confirmed) return;
     const deleted = await deleteGitToken(id);
     if (deleted) {
       setTokens(tokens.filter((t) => t.id !== id));
