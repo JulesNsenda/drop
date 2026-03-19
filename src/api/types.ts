@@ -73,6 +73,7 @@ export interface HealthDto {
     platform: ComponentHealth;
     processManager: ComponentHealth;
     database?: ComponentHealth;
+    watcher?: ComponentHealth;
   };
 }
 
