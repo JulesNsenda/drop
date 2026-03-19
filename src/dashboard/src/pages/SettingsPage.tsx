@@ -333,6 +333,39 @@ function SettingsPage() {
         </div>
       )}
 
+      {/* Delete Account */}
+      {!isAdmin && (
+        <div className="bg-white dark:bg-gray-800 rounded-lg border border-red-200 dark:border-red-800/50 mb-6">
+          <div className="px-4 py-3 border-b border-red-200 dark:border-red-800/50">
+            <h2 className="font-semibold text-red-600 dark:text-red-400">Danger Zone</h2>
+          </div>
+          <div className="p-4 flex items-center justify-between">
+            <div>
+              <p className="text-sm font-medium text-gray-900 dark:text-white">Delete account</p>
+              <p className="text-xs text-gray-500 dark:text-gray-400">Permanently remove your account and all your apps</p>
+            </div>
+            <button
+              onClick={async () => {
+                if (!confirm('Are you sure? This will permanently delete your account and all your deployed applications. This cannot be undone.')) return;
+                try {
+                  const res = await fetch('/api/v1/auth/account', { method: 'DELETE', headers: getAuthHeaders() });
+                  const json = await res.json();
+                  if (json.success) {
+                    localStorage.clear();
+                    window.location.href = '/dashboard';
+                  } else {
+                    toast('error', json.error?.message || 'Failed to delete account');
+                  }
+                } catch { toast('error', 'Network error'); }
+              }}
+              className="px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700 text-sm font-medium"
+            >
+              Delete account
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* About */}
       <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700">
         <div className="px-4 py-3 border-b border-gray-200 dark:border-gray-700">
