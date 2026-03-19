@@ -101,13 +101,13 @@ Quick reference to all PRDs and task files organized by version.
 |-------|-----|---------|-------|--------|
 | 1 | [PRD-011](prd/PRD-011-web-dashboard.md) | Web Dashboard | [TASKS-011](tasks/TASKS-011-web-dashboard.md) | **Completed** |
 | 2 | [PRD-015](prd/PRD-015-monitoring.md) | Monitoring | - | Not Started |
-| 3 | - | Health Checks | - | Not Started |
+| 3 | - | Health Checks | - | **Completed** |
 | 4 | - | Log Aggregation | - | Not Started |
 
 ### v0.4.0 New Capabilities
 - ✅ React web dashboard (login, dark mode, deploy UI, search/filter, env vars, toasts, error boundaries)
+- ✅ Health checks: platform components, PostgreSQL, per-app HTTP pings, dashboard display
 - Real-time monitoring - Not Started
-- Prometheus metrics - Not Started
 - Centralized logging - Not Started
 
 ---
