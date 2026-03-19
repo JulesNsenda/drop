@@ -784,6 +784,8 @@ import ${path.join(dataDir, 'appconf', 'caddy', 'hosts', '*.caddy').replace(/\\/
 
     // When app files are updated, rebuild and restart
     const updateSub = this.eventBus.subscribe('app:update', async (payload) => {
+      // Skip apps currently being cloned
+      if (this.gitDeployService?.isCloning(payload.name)) return;
       await this.handleAppUpdate(payload.name, payload.path, payload.reason);
     });
     this.subscriptions.push(updateSub);
@@ -1224,6 +1226,9 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
    */
   private async handleAppUpdate(appName: string, appPath: string, reason: string): Promise<void> {
     if (!this.processManager || !this.stateManager || !this.detector || !this.builder) return;
+
+    // Skip apps currently being cloned by git deploy
+    if (this.gitDeployService?.isCloning(appName)) return;
 
     // Skip if already processing this app (e.g., during initial deployment)
     if (this.appsInProgress.has(appName)) {
