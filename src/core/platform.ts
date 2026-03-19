@@ -726,6 +726,9 @@ import ${path.join(dataDir, 'appconf', 'caddy', 'hosts', '*.caddy').replace(/\\/
 
     // When app is detected, create config and build it
     const detectedSub = this.eventBus.subscribe('app:detected', async (payload) => {
+      // Skip apps currently being cloned
+      if (this.gitDeployService?.isCloning(payload.name)) return;
+
       const appType = (payload.type || 'unknown') as 'nodejs' | 'python' | 'go' | 'static' | 'docker' | 'unknown';
 
       // Create or update app config file (source of truth)
@@ -893,6 +896,13 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
 
   private async handleNewApp(appPath: string): Promise<void> {
     const appName = path.basename(appPath);
+
+    // Skip apps currently being cloned by git deploy
+    if (this.gitDeployService?.isCloning(appName)) {
+      this.logger.debug(`Skipping detection for ${appName} - git clone in progress`, 'GIT-DEPLOY');
+      return;
+    }
+
     this.logger.appEvent('detected', appName);
 
     if (!this.detector) return;
