@@ -219,6 +219,37 @@ export async function changePassword(userId: string, currentPassword: string, ne
 /**
  * Update a user's properties (admin function)
  */
+/**
+ * Admin reset a user's password
+ */
+export async function resetUserPassword(userId: string, newPassword: string): Promise<boolean> {
+  if (!credentials || !config) throw new Error('Auth not initialized');
+  const user = credentials.users.find((u) => u.id === userId);
+  if (!user) return false;
+  const { hash } = hashPassword(newPassword);
+  user.passwordHash = hash;
+  await saveCredentials(config.credentialsPath, credentials);
+  return true;
+}
+
+/**
+ * Delete a user account
+ */
+export async function deleteUser(userId: string): Promise<boolean> {
+  if (!credentials || !config) throw new Error('Auth not initialized');
+  const index = credentials.users.findIndex((u) => u.id === userId);
+  if (index === -1) return false;
+  // Don't allow deleting the last admin
+  const user = credentials.users[index];
+  if (user.role === 'admin') {
+    const adminCount = credentials.users.filter((u) => u.role === 'admin').length;
+    if (adminCount <= 1) throw new Error('Cannot delete the last admin account');
+  }
+  credentials.users.splice(index, 1);
+  await saveCredentials(config.credentialsPath, credentials);
+  return true;
+}
+
 export async function updateUser(userId: string, updates: { enabled?: boolean; role?: 'admin' | 'user' | 'readonly'; maxApps?: number }): Promise<boolean> {
   if (!credentials || !config) throw new Error('Auth not initialized');
 

@@ -16,6 +16,8 @@ import {
   getUser,
   changePassword,
   updateUser,
+  resetUserPassword,
+  deleteUser,
   authMiddleware,
   isAuthEnabled,
   AuthContext,
@@ -236,6 +238,37 @@ auth.put('/users/:id', authMiddleware('admin'), async (c) => {
   }
 
   return c.json(success({ message: 'User updated' }));
+});
+
+// POST /auth/users/:id/reset-password - Admin reset user password
+auth.post('/users/:id/reset-password', authMiddleware('admin'), async (c) => {
+  const id = c.req.param('id');
+  const body = await c.req.json<{ newPassword: string }>();
+
+  if (!body.newPassword || body.newPassword.length < 8) {
+    throw new ValidationError('New password must be at least 8 characters');
+  }
+
+  const reset = await resetUserPassword(id, body.newPassword);
+  if (!reset) {
+    return c.json(error(ErrorCodes.NOT_FOUND, 'User not found'), 404);
+  }
+
+  return c.json(success({ message: 'Password reset' }));
+});
+
+// DELETE /auth/account - Delete own account
+auth.delete('/account', authMiddleware(), async (c) => {
+  const authCtx = (c.get as Function)('auth') as AuthContext;
+
+  try {
+    await deleteUser(authCtx.userId);
+    try { await getActivityLog().log({ action: 'delete' as any, userId: authCtx.userId, username: authCtx.username, detail: 'Account deleted' }); } catch {}
+    return c.json(success({ message: 'Account deleted' }));
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Failed to delete account';
+    return c.json(error(ErrorCodes.BAD_REQUEST, message), 400);
+  }
 });
 
 export default auth;
