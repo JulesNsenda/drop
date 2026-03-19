@@ -31,6 +31,7 @@ function toAppDto(app: AppState): AppDto {
     lastDeployedAt: app.lastDeployedAt,
     buildDuration: app.buildDuration,
     error: app.error,
+    gitSource: app.gitSource,
   };
 }
 

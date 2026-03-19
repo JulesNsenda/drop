@@ -19,6 +19,7 @@ import { PostgresServer, getPostgresServer, resetPostgresServer, DatabaseProvisi
 import { CaddyServer, getCaddyServer, resetCaddyServer } from '../managers/router';
 import { SecretManager, getSecretManager, resetSecretManager } from '../managers/secret';
 import { WebhookManager, getWebhookManager, resetWebhookManager } from './webhooks';
+import { GitDeployService, getGitDeployService, resetGitDeployService } from './git-deploy';
 import { ApiServer, createApiServer } from '../api';
 import { Logger, createLogger } from '../utils/logger';
 import {
@@ -117,6 +118,7 @@ export class DropPlatform {
   private caddyServer: CaddyServer | null = null;
   private secretManager: SecretManager | null = null;
   private webhookManager: WebhookManager | null = null;
+  private gitDeployService: GitDeployService | null = null;
   private apiServer: ApiServer | null = null;
 
   private subscriptions: Unsubscribe[] = [];
@@ -281,9 +283,10 @@ export class DropPlatform {
       resetCaddyServer();
     }
 
-    // Reset secret manager and webhook manager
+    // Reset secret manager, webhook manager, and git deploy service
     resetSecretManager();
     resetWebhookManager();
+    resetGitDeployService();
 
     // Stop API server
     if (this.apiServer) {
@@ -550,6 +553,12 @@ import ${path.join(dataDir, 'appconf', 'caddy', 'hosts', '*.caddy').replace(/\\/
     await this.webhookManager.initialize();
     this.logger.info('Webhook manager initialized', 'WEBHOOKS');
 
+    // Initialize git deploy service
+    this.gitDeployService = getGitDeployService({
+      appsDirectory: this.config.appsDirectory,
+    });
+    await this.gitDeployService.initialize();
+
     // Sync state manager with app configs (configs are source of truth for ports)
     await this.syncStateWithConfigs();
 
@@ -704,6 +713,12 @@ import ${path.join(dataDir, 'appconf', 'caddy', 'hosts', '*.caddy').replace(/\\/
     // When watcher detects a new directory, detect the app type
     const watcherSub = this.eventBus.subscribe('watcher:change', async (payload) => {
       if (payload.changeType === 'addDir' && this.isTopLevelApp(payload.path)) {
+        const appName = path.basename(payload.path);
+        // Skip apps currently being cloned by git deploy (race condition prevention)
+        if (this.gitDeployService?.isCloning(appName)) {
+          this.logger.debug(`Skipping watcher detection for ${appName} - git clone in progress`, 'GIT-DEPLOY');
+          return;
+        }
         await this.handleNewApp(payload.path);
       }
     });
@@ -727,16 +742,22 @@ import ${path.join(dataDir, 'appconf', 'caddy', 'hosts', '*.caddy').replace(/\\/
         await this.stateManager.registerApp(payload.name, payload.path, appType);
       }
 
-      // Build the app if auto-build is enabled
-      if (this.config.autoBuild && payload.type !== 'unknown') {
+      // Build the app if auto-build is enabled (skip if user stopped it)
+      const currentApp = this.stateManager?.getApp(payload.name);
+      if (this.config.autoBuild && payload.type !== 'unknown' && currentApp?.status !== 'stopped') {
         await this.handleBuildApp(payload.path, payload.name, payload.type as string);
       }
     });
     this.subscriptions.push(detectedSub);
 
-    // When build completes, start the app
+    // When build completes, start the app (unless it was explicitly stopped)
     const buildSub = this.eventBus.subscribe('build:completed', async (payload) => {
       if (this.config.autoStart) {
+        const app = this.stateManager?.getApp(payload.appId);
+        if (app?.status === 'stopped') {
+          this.logger.info(`Skipping auto-start for ${payload.appId} - app was stopped by user`, 'APP');
+          return;
+        }
         await this.handleStartApp(payload.appId);
       }
     });
@@ -991,8 +1012,11 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       if (detection.type === 'static' || detection.type === 'spa') {
         // Static sites use our built-in static server
         const serveDir = path.join(appPath, detection.suggestedConfig?.outputDirectory || '.');
-        // Use the compiled static-server.js from dist
-        script = path.join(__dirname, 'static-server.js');
+        // Prefer compiled dist/core/static-server.js, fallback to __dirname version
+        const fsSync = require('fs');
+        const distPath = path.join(__dirname, '..', '..', 'dist', 'core', 'static-server.js');
+        const localPath = path.join(__dirname, 'static-server.js');
+        script = fsSync.existsSync(localPath) ? localPath : fsSync.existsSync(distPath) ? distPath : localPath;
         args = [serveDir, '-s']; // -s for SPA mode
       } else if (detection.type === 'go') {
         // Go apps run as compiled binaries

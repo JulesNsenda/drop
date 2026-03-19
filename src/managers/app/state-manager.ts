@@ -8,6 +8,7 @@
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import { eventBus } from '../../core/event-bus';
+import type { GitSource } from '../../core/git-deploy/git-deploy.types';
 
 export type AppStatus = 'pending' | 'building' | 'starting' | 'running' | 'stopped' | 'errored';
 export type AppType = 'nodejs' | 'python' | 'go' | 'static' | 'docker' | 'unknown';
@@ -26,6 +27,7 @@ export interface AppState {
   lastDeployedAt?: string;
   buildDuration?: number;
   error?: string;
+  gitSource?: GitSource;
 }
 
 export interface StateManagerConfig {
@@ -114,7 +116,8 @@ export class AppStateManager {
     const app: AppState = {
       name,
       type,
-      status: 'pending',
+      // Preserve 'stopped' status so user-stopped apps don't auto-restart
+      status: existing?.status === 'stopped' ? 'stopped' : 'pending',
       path: appPath,
       framework,
       hostname: `${name}.localhost`,
@@ -124,6 +127,7 @@ export class AppStateManager {
       port: existing?.port,
       lastDeployedAt: existing?.lastDeployedAt,
       buildDuration: existing?.buildDuration,
+      gitSource: existing?.gitSource,
     };
 
     this.apps.set(name, app);
@@ -163,6 +167,14 @@ export class AppStateManager {
   }
 
   async setAppStatus(name: string, status: AppStatus, details?: { port?: number; pid?: number; error?: string }): Promise<AppState | null> {
+    const app = this.apps.get(name);
+    if (!app) return null;
+
+    // Clear stale error when app transitions to a healthy state
+    if ((status === 'running' || status === 'building' || status === 'starting') && !details?.error) {
+      delete app.error;
+    }
+
     return this.updateApp(name, {
       status,
       ...details,

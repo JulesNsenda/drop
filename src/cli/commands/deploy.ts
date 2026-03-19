@@ -11,6 +11,7 @@ import * as output from '../utils/output';
 import { getDetector } from '../../core/detector';
 import { getBuilder } from '../../core/builder';
 import { getProcessManager, resetProcessManager } from '../../managers/process';
+import { getGitDeployService } from '../../core/git-deploy';
 
 export function createDeployCommand(): Command {
   const cmd = new Command('deploy')
@@ -20,8 +21,43 @@ export function createDeployCommand(): Command {
     .option('-p, --port <port>', 'Port to run on', parseInt)
     .option('-e, --env <vars...>', 'Environment variables (KEY=VALUE)')
     .option('--no-build', 'Skip build step')
+    .option('-g, --git <url>', 'Deploy from a GitHub repository URL')
+    .option('-b, --branch <branch>', 'Git branch to deploy (default: main)')
     .action(async (appPath: string, options: DeployOptions) => {
       try {
+        // Handle git deploy
+        if (options.git) {
+          const spin = output.spinner('Cloning repository...');
+          spin.start();
+
+          try {
+            const gitService = getGitDeployService({
+              appsDirectory: path.resolve(process.env.DROP_APPS_DIR || (process.platform === 'win32' ? 'C:\\drop\\data\\webapps' : '/var/drop/data/webapps')),
+            });
+            await gitService.initialize();
+
+            const result = await gitService.deploy({
+              repoUrl: options.git,
+              branch: options.branch || 'main',
+              name: options.name,
+            });
+
+            spin.succeed(`Cloned ${result.repoUrl} (${result.branch})`);
+            output.success(`${result.appName} deployed from GitHub!`);
+            output.info(`Commit: ${result.commitSha?.slice(0, 7) || 'unknown'}`);
+            output.info('The platform will auto-detect, build, and start the app.');
+
+            if (output.isJsonMode()) {
+              output.json(result);
+            }
+          } catch (err) {
+            spin.fail('Git deploy failed');
+            output.error('', err instanceof Error ? err : undefined);
+            process.exit(1);
+          }
+          return;
+        }
+
         // Resolve path
         const absolutePath = path.resolve(appPath);
         const appName = options.name || path.basename(absolutePath);
