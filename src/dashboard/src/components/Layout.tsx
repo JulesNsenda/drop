@@ -13,9 +13,9 @@ function Layout() {
   const themeLabel = theme === 'light' ? 'Light' : theme === 'dark' ? 'Dark' : 'System';
 
   return (
-    <div className="min-h-screen flex bg-gray-50 dark:bg-gray-900">
+    <div className="h-screen flex bg-gray-50 dark:bg-gray-900 overflow-hidden">
       {/* Sidebar */}
-      <aside className="w-64 bg-gray-900 dark:bg-gray-950 text-white flex flex-col border-r border-gray-800">
+      <aside className="w-64 h-screen flex-shrink-0 bg-gray-900 dark:bg-gray-950 text-white flex flex-col border-r border-gray-800">
         {/* Logo */}
         <div className="p-4 border-b border-gray-800">
           <div className="flex items-center gap-3">
@@ -34,7 +34,7 @@ function Layout() {
           <ul className="space-y-1">
             <li>
               <NavLink
-                to="/"
+                to="/apps"
                 end
                 className={({ isActive }) =>
                   `flex items-center gap-3 px-3 py-2 rounded-lg transition-colors ${
