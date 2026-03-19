@@ -14,11 +14,18 @@ import {
   listUsers,
   createUser,
   authMiddleware,
+  isAuthEnabled,
   AuthContext,
 } from '../middleware/auth';
 import { ValidationError } from '../middleware/error';
 
 const auth = new Hono();
+
+// GET /auth/status - Public endpoint to check if auth is enabled
+auth.get('/status', (c) => {
+  const enabled = isAuthEnabled();
+  return c.json(success({ enabled }));
+});
 
 // POST /auth/login - Authenticate and get JWT token
 auth.post('/login', async (c) => {
