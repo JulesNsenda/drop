@@ -1000,8 +1000,11 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       if (detection.type === 'static' || detection.type === 'spa') {
         // Static sites use our built-in static server
         const serveDir = path.join(appPath, detection.suggestedConfig?.outputDirectory || '.');
-        // Use the compiled static-server.js from dist
-        script = path.join(__dirname, 'static-server.js');
+        // Prefer compiled dist/core/static-server.js, fallback to __dirname version
+        const fsSync = require('fs');
+        const distPath = path.join(__dirname, '..', '..', 'dist', 'core', 'static-server.js');
+        const localPath = path.join(__dirname, 'static-server.js');
+        script = fsSync.existsSync(localPath) ? localPath : fsSync.existsSync(distPath) ? distPath : localPath;
         args = [serveDir, '-s']; // -s for SPA mode
       } else if (detection.type === 'go') {
         // Go apps run as compiled binaries
