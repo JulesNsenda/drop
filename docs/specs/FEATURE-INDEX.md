@@ -163,25 +163,39 @@ Quick reference to all PRDs and task files organized by version.
 | Order | PRD | Feature | Tasks | Status |
 |-------|-----|---------|-------|--------|
 | 1 | [PRD-018](prd/PRD-018-multi-tenant.md) | Multi-Tenant (Signup, Ownership) | - | **Completed** |
-| 2 | [PRD-019](prd/PRD-019-admin-user-management.md) | Admin User Management | [TASKS-019](tasks/TASKS-019-admin-user-management.md) | Not Started |
-| 3 | [PRD-020](prd/PRD-020-per-user-app-limits.md) | Per-User App Limits | [TASKS-020](tasks/TASKS-020-per-user-app-limits.md) | Not Started |
-| 4 | [PRD-021](prd/PRD-021-change-password.md) | Change Password | [TASKS-021](tasks/TASKS-021-change-password.md) | Not Started |
-| 5 | [PRD-022](prd/PRD-022-custom-domains.md) | Custom Domains | [TASKS-022](tasks/TASKS-022-custom-domains.md) | Not Started |
-| 6 | [PRD-023](prd/PRD-023-activity-log.md) | Activity Log | [TASKS-023](tasks/TASKS-023-activity-log.md) | Not Started |
+| 2 | [PRD-019](prd/PRD-019-admin-user-management.md) | Admin User Management | [TASKS-019](tasks/TASKS-019-admin-user-management.md) | **Completed** |
+| 3 | [PRD-020](prd/PRD-020-per-user-app-limits.md) | Per-User App Limits | [TASKS-020](tasks/TASKS-020-per-user-app-limits.md) | **Completed** |
+| 4 | [PRD-021](prd/PRD-021-change-password.md) | Change Password | [TASKS-021](tasks/TASKS-021-change-password.md) | **Completed** |
+| 5 | [PRD-022](prd/PRD-022-custom-domains.md) | Custom Domains | [TASKS-022](tasks/TASKS-022-custom-domains.md) | **Completed** |
+| 6 | [PRD-023](prd/PRD-023-activity-log.md) | Activity Log | [TASKS-023](tasks/TASKS-023-activity-log.md) | **Completed** |
 
 ### v0.7.0 New Capabilities
 - ✅ Multi-tenant: signup, login, app ownership, role-based filtering
-- Admin user management dashboard
-- Per-user app limits (default: 5)
-- Change password
-- Custom domains with auto-HTTPS
-- Activity log for admin
+- ✅ Admin user management dashboard
+- ✅ Per-user app limits (default: 5, per-user override)
+- ✅ Change password
+- ✅ Custom domains API
+- ✅ Activity log for admin
+- ✅ Email on signup
+- ✅ Admin reset password
+- ✅ Delete account
+- ✅ Deploy progress indicator
+- ✅ Mobile responsive sidebar
+- ✅ Confirm dialog component (replaces native confirm)
 
 ---
 
 ## v1.0.0 - Production
 
 **Goal**: Stable, production-ready release
+
+| Order | PRD | Feature | Tasks | Status |
+|-------|-----|---------|-------|--------|
+| 1 | [PRD-024](prd/PRD-024-token-expiry-handling.md) | Token Expiry Handling | [TASKS-024](tasks/TASKS-024-token-expiry-handling.md) | Not Started |
+| 2 | [PRD-025](prd/PRD-025-404-page.md) | 404 Page | [TASKS-025](tasks/TASKS-025-404-page.md) | Not Started |
+| 3 | [PRD-026](prd/PRD-026-logout-redirect.md) | Logout Redirect | [TASKS-026](tasks/TASKS-026-logout-redirect.md) | Not Started |
+| 4 | [PRD-027](prd/PRD-027-app-limit-indicator.md) | App Limit Indicator | [TASKS-027](tasks/TASKS-027-app-limit-indicator.md) | Not Started |
+| 5 | [PRD-028](prd/PRD-028-signup-success-message.md) | Signup Success Message | [TASKS-028](tasks/TASKS-028-signup-success-message.md) | Not Started |
 
 **Requirements**:
 - All v0.x features stable
