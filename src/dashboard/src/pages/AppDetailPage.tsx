@@ -303,19 +303,19 @@ function AppDetailPage() {
         <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-4">
           <div className="flex items-center gap-2 text-gray-500 dark:text-gray-400 mb-1">
             <ExternalLink className="w-4 h-4" />
-            <span className="text-sm">Port</span>
+            <span className="text-sm">URL</span>
           </div>
           {app.port ? (
             <a
-              href={`http://localhost:${app.port}`}
+              href={app.customDomain ? `https://${app.customDomain}` : `http://localhost:${app.port}`}
               target="_blank"
               rel="noopener noreferrer"
-              className="text-lg font-semibold text-drop-600 hover:underline"
+              className="text-sm font-semibold text-drop-600 hover:underline break-all"
             >
-              localhost:{app.port}
+              {app.customDomain || `localhost:${app.port}`}
             </a>
           ) : (
-            <span className="text-lg font-semibold text-gray-400">Not assigned</span>
+            <span className="text-sm font-semibold text-gray-400">Not assigned</span>
           )}
         </div>
 
