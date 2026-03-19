@@ -36,14 +36,18 @@ auth.get('/status', (c) => {
 
 // POST /auth/signup - Self-service user registration
 auth.post('/signup', async (c) => {
-  const body = await c.req.json<{ username: string; password: string }>();
+  const body = await c.req.json<{ username: string; password: string; email: string }>();
 
-  if (!body.username || !body.password) {
-    throw new ValidationError('Username and password are required');
+  if (!body.username || !body.password || !body.email) {
+    throw new ValidationError('Username, email, and password are required');
   }
 
   if (body.username.length < 3 || !/^[a-zA-Z0-9_-]+$/.test(body.username)) {
     throw new ValidationError('Username must be at least 3 characters (letters, numbers, hyphens, underscores)');
+  }
+
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(body.email)) {
+    throw new ValidationError('Invalid email address');
   }
 
   if (body.password.length < 8) {
@@ -51,7 +55,7 @@ auth.post('/signup', async (c) => {
   }
 
   try {
-    const user = await createUser(body.username, body.password, 'user');
+    const user = await createUser(body.username, body.password, 'user', body.email);
     try { await getActivityLog().log({ action: 'signup', userId: user.id, username: user.username }); } catch {}
     return c.json(success({
       id: user.id,
@@ -89,7 +93,7 @@ auth.post('/login', async (c) => {
       token,
       tokenType: 'Bearer',
       expiresIn: 86400,
-      user: user ? { id: user.id, username: user.username, role: user.role } : undefined,
+      user: user ? { id: user.id, username: user.username, role: user.role, email: (user as any).email } : undefined,
     })
   );
 });

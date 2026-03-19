@@ -33,6 +33,7 @@ export interface User {
   role: 'admin' | 'user' | 'readonly';
   createdAt: string;
   lastLogin?: string;
+  email?: string;
   enabled?: boolean; // default true
   maxApps?: number; // per-user override (0 = use global default)
 }
@@ -175,7 +176,8 @@ function verifyPassword(password: string, storedHash: string): boolean {
 export async function createUser(
   username: string,
   password: string,
-  role: 'admin' | 'user' | 'readonly' = 'user'
+  role: 'admin' | 'user' | 'readonly' = 'user',
+  email?: string
 ): Promise<User> {
   if (!credentials || !config) {
     throw new Error('Auth not initialized');
@@ -192,6 +194,7 @@ export async function createUser(
     username,
     passwordHash,
     role,
+    email,
     createdAt: new Date().toISOString(),
   };
 
@@ -250,7 +253,7 @@ export async function deleteUser(userId: string): Promise<boolean> {
   return true;
 }
 
-export async function updateUser(userId: string, updates: { enabled?: boolean; role?: 'admin' | 'user' | 'readonly'; maxApps?: number }): Promise<boolean> {
+export async function updateUser(userId: string, updates: { enabled?: boolean; role?: 'admin' | 'user' | 'readonly'; maxApps?: number; email?: string }): Promise<boolean> {
   if (!credentials || !config) throw new Error('Auth not initialized');
 
   const user = credentials.users.find((u) => u.id === userId);
@@ -259,6 +262,7 @@ export async function updateUser(userId: string, updates: { enabled?: boolean; r
   if (updates.enabled !== undefined) user.enabled = updates.enabled;
   if (updates.role) user.role = updates.role;
   if (updates.maxApps !== undefined) user.maxApps = updates.maxApps;
+  if (updates.email !== undefined) user.email = updates.email;
   await saveCredentials(config.credentialsPath, credentials);
   return true;
 }

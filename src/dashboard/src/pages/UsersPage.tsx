@@ -9,6 +9,7 @@ import { App } from '../hooks/useApi';
 interface UserInfo {
   id: string;
   username: string;
+  email?: string;
   role: string;
   enabled: boolean;
   appCount: number;
@@ -98,6 +99,9 @@ function UsersPage() {
         <div className="flex items-center justify-between mb-6">
           <div>
             <h1 className="text-2xl font-bold text-gray-900 dark:text-white">{selectedUser.username}</h1>
+            {selectedUser.email && (
+              <p className="text-sm text-gray-500 dark:text-gray-400">{selectedUser.email}</p>
+            )}
             <div className="flex items-center gap-3 mt-1">
               <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${
                 selectedUser.role === 'admin'
@@ -273,6 +277,7 @@ function UsersPage() {
           <thead>
             <tr className="border-b border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-800/50">
               <th className="text-left px-4 py-3 font-medium text-gray-500 dark:text-gray-400">User</th>
+              <th className="text-left px-4 py-3 font-medium text-gray-500 dark:text-gray-400 hidden md:table-cell">Email</th>
               <th className="text-left px-4 py-3 font-medium text-gray-500 dark:text-gray-400">Role</th>
               <th className="text-left px-4 py-3 font-medium text-gray-500 dark:text-gray-400">Apps</th>
               <th className="text-left px-4 py-3 font-medium text-gray-500 dark:text-gray-400">Last Login</th>
@@ -293,6 +298,7 @@ function UsersPage() {
                     <span className="font-medium text-gray-900 dark:text-white">{u.username}</span>
                   </div>
                 </td>
+                <td className="px-4 py-3 text-gray-500 dark:text-gray-400 text-xs hidden md:table-cell">{u.email || '-'}</td>
                 <td className="px-4 py-3">
                   <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${
                     u.role === 'admin'
