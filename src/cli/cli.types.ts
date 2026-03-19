@@ -19,6 +19,8 @@ export interface DeployOptions extends GlobalOptions {
   port?: number;
   env?: string[];
   build?: boolean;
+  git?: string;
+  branch?: string;
 }
 
 /**

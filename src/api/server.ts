@@ -24,6 +24,7 @@ import authRoutes from './routes/auth';
 import certsRoutes from './routes/certs';
 import secretsRoutes from './routes/secrets';
 import webhooksRoutes from './routes/webhooks';
+import gitDeployRoutes from './routes/git-deploy';
 
 export interface ApiServerConfig {
   port: number;
@@ -160,6 +161,9 @@ export class ApiServer {
       // Webhooks routes require 'admin' role
       v1.use('/webhooks/*', authMiddleware('admin'));
       v1.route('/webhooks', webhooksRoutes);
+
+      // Git deploy: webhook endpoint is public, rest requires 'user' role
+      v1.route('/git', gitDeployRoutes);
     } else {
       // No auth - all routes are public
       v1.route('/apps', appsRoutes);
@@ -167,6 +171,7 @@ export class ApiServer {
       v1.route('/certs', certsRoutes);
       v1.route('/secrets', secretsRoutes);
       v1.route('/webhooks', webhooksRoutes);
+      v1.route('/git', gitDeployRoutes);
     }
 
     // Mount v1 under /api/v1
