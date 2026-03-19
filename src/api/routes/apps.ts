@@ -41,7 +41,7 @@ function toAppDto(app: AppState): AppDto {
 function canAccess(auth: AuthContext | undefined, app: AppState): boolean {
   if (!auth) return true; // No auth enabled
   if (auth.role === 'admin') return true;
-  return app.userId === auth.userId || !app.userId; // Own apps + legacy unowned apps
+  return app.userId === auth.userId;
 }
 
 // GET /apps - List applications (filtered by user unless admin)
