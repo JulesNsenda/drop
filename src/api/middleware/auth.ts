@@ -349,6 +349,17 @@ export function listUsers(): Omit<User, 'passwordHash'>[] {
 }
 
 /**
+ * Get a user by username (without password hash)
+ */
+export function getUser(username: string): Omit<User, 'passwordHash'> | null {
+  if (!credentials) return null;
+  const user = credentials.users.find((u) => u.username === username);
+  if (!user) return null;
+  const { passwordHash: _, ...safe } = user;
+  return safe;
+}
+
+/**
  * Check if auth is enabled
  */
 export function isAuthEnabled(): boolean {

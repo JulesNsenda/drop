@@ -46,6 +46,7 @@ export interface AppDto {
   buildDuration?: number;
   error?: string;
   gitSource?: GitSource;
+  userId?: string;
 }
 
 export interface CreateAppDto {

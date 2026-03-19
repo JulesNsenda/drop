@@ -13,6 +13,7 @@ import {
   listApiKeys,
   listUsers,
   createUser,
+  getUser,
   authMiddleware,
   isAuthEnabled,
   AuthContext,
@@ -25,6 +26,39 @@ const auth = new Hono();
 auth.get('/status', (c) => {
   const enabled = isAuthEnabled();
   return c.json(success({ enabled }));
+});
+
+// POST /auth/signup - Self-service user registration
+auth.post('/signup', async (c) => {
+  const body = await c.req.json<{ username: string; password: string }>();
+
+  if (!body.username || !body.password) {
+    throw new ValidationError('Username and password are required');
+  }
+
+  if (body.username.length < 3 || !/^[a-zA-Z0-9_-]+$/.test(body.username)) {
+    throw new ValidationError('Username must be at least 3 characters (letters, numbers, hyphens, underscores)');
+  }
+
+  if (body.password.length < 8) {
+    throw new ValidationError('Password must be at least 8 characters');
+  }
+
+  try {
+    const user = await createUser(body.username, body.password, 'user');
+    return c.json(success({
+      id: user.id,
+      username: user.username,
+      role: user.role,
+      message: 'Account created. You can now sign in.',
+    }), 201);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Registration failed';
+    if (message.includes('already exists')) {
+      return c.json(error(ErrorCodes.CONFLICT, message), 409);
+    }
+    return c.json(error(ErrorCodes.INTERNAL_ERROR, message), 500);
+  }
 });
 
 // POST /auth/login - Authenticate and get JWT token
@@ -41,11 +75,13 @@ auth.post('/login', async (c) => {
     return c.json(error(ErrorCodes.UNAUTHORIZED, 'Invalid username or password'), 401);
   }
 
+  const user = getUser(body.username);
   return c.json(
     success({
       token,
       tokenType: 'Bearer',
-      expiresIn: 86400, // 24 hours
+      expiresIn: 86400,
+      user: user ? { id: user.id, username: user.username, role: user.role } : undefined,
     })
   );
 });

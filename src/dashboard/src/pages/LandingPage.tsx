@@ -75,13 +75,23 @@ function LandingPage() {
           </p>
 
           {/* CTA */}
-          <button
-            onClick={handleEnter}
-            className="group px-8 py-3 bg-drop-500 text-white rounded-full hover:bg-drop-400 transition-all text-sm font-medium shadow-lg shadow-drop-500/20 hover:shadow-drop-500/30"
-          >
-            {authEnabled ? 'Enter' : 'Enter'}
-            <span className="inline-block ml-2 group-hover:translate-x-1 transition-transform">&rarr;</span>
-          </button>
+          <div className="flex flex-col items-center gap-3">
+            <button
+              onClick={handleEnter}
+              className="group px-8 py-3 bg-drop-500 text-white rounded-full hover:bg-drop-400 transition-all text-sm font-medium shadow-lg shadow-drop-500/20 hover:shadow-drop-500/30"
+            >
+              {authEnabled ? 'Sign in' : 'Enter'}
+              <span className="inline-block ml-2 group-hover:translate-x-1 transition-transform">&rarr;</span>
+            </button>
+            {authEnabled && (
+              <button
+                onClick={() => navigate('/signup')}
+                className="text-sm text-gray-500 hover:text-gray-300 transition-colors"
+              >
+                Create an account
+              </button>
+            )}
+          </div>
         </div>
       </div>
 

@@ -8,7 +8,9 @@ import { Hono } from 'hono';
 import * as crypto from 'crypto';
 import { success, error, ErrorCodes } from '../types';
 import { ValidationError } from '../middleware/error';
+import { AuthContext } from '../middleware/auth';
 import { getGitDeployService } from '../../core/git-deploy';
+import { getStateManager } from '../../managers/app/state-manager';
 import type { GitDeployRequest, GitTokenCreateRequest } from '../../core/git-deploy';
 
 const gitDeploy = new Hono();
@@ -29,6 +31,14 @@ gitDeploy.post('/deploy', async (c) => {
 
   try {
     const result = await service.deploy(body);
+
+    // Set owner
+    const auth = (c.get as Function)('auth') as AuthContext | undefined;
+    if (auth?.userId) {
+      const stateManager = getStateManager();
+      await stateManager.updateApp(result.appName, { userId: auth.userId });
+    }
+
     return c.json(success(result), 201);
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Deploy failed';
