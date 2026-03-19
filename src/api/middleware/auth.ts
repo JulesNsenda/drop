@@ -34,6 +34,7 @@ export interface User {
   createdAt: string;
   lastLogin?: string;
   enabled?: boolean; // default true
+  maxApps?: number; // per-user override (0 = use global default)
 }
 
 // API key record
@@ -218,7 +219,7 @@ export async function changePassword(userId: string, currentPassword: string, ne
 /**
  * Update a user's properties (admin function)
  */
-export async function updateUser(userId: string, updates: { enabled?: boolean; role?: 'admin' | 'user' | 'readonly' }): Promise<boolean> {
+export async function updateUser(userId: string, updates: { enabled?: boolean; role?: 'admin' | 'user' | 'readonly'; maxApps?: number }): Promise<boolean> {
   if (!credentials || !config) throw new Error('Auth not initialized');
 
   const user = credentials.users.find((u) => u.id === userId);
@@ -226,6 +227,7 @@ export async function updateUser(userId: string, updates: { enabled?: boolean; r
 
   if (updates.enabled !== undefined) user.enabled = updates.enabled;
   if (updates.role) user.role = updates.role;
+  if (updates.maxApps !== undefined) user.maxApps = updates.maxApps;
   await saveCredentials(config.credentialsPath, credentials);
   return true;
 }

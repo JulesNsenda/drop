@@ -117,6 +117,8 @@ function SettingsPage() {
         <p className="text-sm text-gray-500 dark:text-gray-400 mt-1">Platform health, configuration, and status</p>
       </div>
 
+      {/* Admin-only sections */}
+      {isAdmin && <>
       {/* System Health */}
       <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 mb-6">
         <div className="px-4 py-3 border-b border-gray-200 dark:border-gray-700">
@@ -274,6 +276,8 @@ function SettingsPage() {
           </table>
         </div>
       </div>
+
+      </>}
 
       {/* Change Password */}
       <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 mb-6">
