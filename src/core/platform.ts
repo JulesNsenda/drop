@@ -20,6 +20,7 @@ import { CaddyServer, getCaddyServer, resetCaddyServer } from '../managers/route
 import { SecretManager, getSecretManager, resetSecretManager } from '../managers/secret';
 import { WebhookManager, getWebhookManager, resetWebhookManager } from './webhooks';
 import { GitDeployService, getGitDeployService, resetGitDeployService } from './git-deploy';
+import { getActivityLog, resetActivityLog } from '../managers/activity';
 import { ApiServer, createApiServer } from '../api';
 import { Logger, createLogger } from '../utils/logger';
 import {
@@ -70,6 +71,8 @@ export interface PlatformConfig {
   apiPort: number;
   /** Enable API authentication */
   enableApiAuth: boolean;
+  /** Maximum apps per user (0 = unlimited) */
+  maxAppsPerUser: number;
 }
 
 // Determine platform-appropriate defaults
@@ -99,6 +102,7 @@ const DEFAULT_CONFIG: PlatformConfig = {
   enableApi: true,
   apiPort: 3000,
   enableApiAuth: process.env.DROP_DISABLE_AUTH !== 'true',
+  maxAppsPerUser: parseInt(process.env.DROP_MAX_APPS_PER_USER || '5', 10),
 };
 
 export class DropPlatform {
@@ -287,6 +291,7 @@ export class DropPlatform {
     resetSecretManager();
     resetWebhookManager();
     resetGitDeployService();
+    resetActivityLog();
 
     // Stop API server
     if (this.apiServer) {
@@ -559,6 +564,11 @@ import ${path.join(dataDir, 'appconf', 'caddy', 'hosts', '*.caddy').replace(/\\/
     });
     await this.gitDeployService.initialize();
 
+    // Initialize activity log
+    const activityLogPath = path.join(this.config.dropRoot, 'data', 'drop-svc', 'activity-log.json');
+    const activityLog = getActivityLog(activityLogPath);
+    await activityLog.initialize();
+
     // Sync state manager with app configs (configs are source of truth for ports)
     await this.syncStateWithConfigs();
 
@@ -726,6 +736,9 @@ import ${path.join(dataDir, 'appconf', 'caddy', 'hosts', '*.caddy').replace(/\\/
 
     // When app is detected, create config and build it
     const detectedSub = this.eventBus.subscribe('app:detected', async (payload) => {
+      // Skip apps currently being cloned
+      if (this.gitDeployService?.isCloning(payload.name)) return;
+
       const appType = (payload.type || 'unknown') as 'nodejs' | 'python' | 'go' | 'static' | 'docker' | 'unknown';
 
       // Create or update app config file (source of truth)
@@ -771,6 +784,8 @@ import ${path.join(dataDir, 'appconf', 'caddy', 'hosts', '*.caddy').replace(/\\/
 
     // When app files are updated, rebuild and restart
     const updateSub = this.eventBus.subscribe('app:update', async (payload) => {
+      // Skip apps currently being cloned
+      if (this.gitDeployService?.isCloning(payload.name)) return;
       await this.handleAppUpdate(payload.name, payload.path, payload.reason);
     });
     this.subscriptions.push(updateSub);
@@ -893,6 +908,13 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
 
   private async handleNewApp(appPath: string): Promise<void> {
     const appName = path.basename(appPath);
+
+    // Skip apps currently being cloned by git deploy
+    if (this.gitDeployService?.isCloning(appName)) {
+      this.logger.debug(`Skipping detection for ${appName} - git clone in progress`, 'GIT-DEPLOY');
+      return;
+    }
+
     this.logger.appEvent('detected', appName);
 
     if (!this.detector) return;
@@ -1204,6 +1226,9 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
    */
   private async handleAppUpdate(appName: string, appPath: string, reason: string): Promise<void> {
     if (!this.processManager || !this.stateManager || !this.detector || !this.builder) return;
+
+    // Skip apps currently being cloned by git deploy
+    if (this.gitDeployService?.isCloning(appName)) return;
 
     // Skip if already processing this app (e.g., during initial deployment)
     if (this.appsInProgress.has(appName)) {

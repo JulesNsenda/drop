@@ -14,6 +14,7 @@ Quick reference to all PRDs and task files organized by version.
 | v0.4.0 | Experience | 4 features | **Completed** (Dashboard polish) |
 | v0.5.0 | Enterprise | 4 features | Planned |
 | v0.6.0 | Connect | 2 features | **Completed** |
+| v0.7.0 | SaaS Ready | 6 features | In Progress |
 | v1.0.0 | Production | Stable | Planned |
 
 ---
@@ -152,6 +153,29 @@ Quick reference to all PRDs and task files organized by version.
 - ✅ CLI: `drop deploy --git <url>`
 - ✅ Git metadata tracking (repo, branch, commit SHA) in app detail
 - Git metadata tracking (repo URL, branch, commit SHA)
+
+---
+
+## v0.7.0 - SaaS Ready
+
+**Goal**: Multi-tenant SaaS features for shared platform usage
+
+| Order | PRD | Feature | Tasks | Status |
+|-------|-----|---------|-------|--------|
+| 1 | [PRD-018](prd/PRD-018-multi-tenant.md) | Multi-Tenant (Signup, Ownership) | - | **Completed** |
+| 2 | [PRD-019](prd/PRD-019-admin-user-management.md) | Admin User Management | [TASKS-019](tasks/TASKS-019-admin-user-management.md) | Not Started |
+| 3 | [PRD-020](prd/PRD-020-per-user-app-limits.md) | Per-User App Limits | [TASKS-020](tasks/TASKS-020-per-user-app-limits.md) | Not Started |
+| 4 | [PRD-021](prd/PRD-021-change-password.md) | Change Password | [TASKS-021](tasks/TASKS-021-change-password.md) | Not Started |
+| 5 | [PRD-022](prd/PRD-022-custom-domains.md) | Custom Domains | [TASKS-022](tasks/TASKS-022-custom-domains.md) | Not Started |
+| 6 | [PRD-023](prd/PRD-023-activity-log.md) | Activity Log | [TASKS-023](tasks/TASKS-023-activity-log.md) | Not Started |
+
+### v0.7.0 New Capabilities
+- ✅ Multi-tenant: signup, login, app ownership, role-based filtering
+- Admin user management dashboard
+- Per-user app limits (default: 5)
+- Change password
+- Custom domains with auto-HTTPS
+- Activity log for admin
 
 ---
 

@@ -1,11 +1,11 @@
 import { Outlet, NavLink } from 'react-router-dom';
-import { LayoutGrid, Settings, Box, Upload, Sun, Moon, Monitor, LogOut, User } from 'lucide-react';
+import { LayoutGrid, Settings, Box, Upload, Users, Sun, Moon, Monitor, LogOut, User } from 'lucide-react';
 import { useTheme } from '../hooks/useTheme';
 import { useAuth } from '../hooks/useAuth';
 
 function Layout() {
   const { theme, setTheme } = useTheme();
-  const { authRequired, username, logout } = useAuth();
+  const { authRequired, username, role, logout } = useAuth();
 
   const themeIcon = theme === 'dark' ? Moon : theme === 'light' ? Sun : Monitor;
   const ThemeIcon = themeIcon;
@@ -63,6 +63,23 @@ function Layout() {
                 Deploy
               </NavLink>
             </li>
+            {role === 'admin' && (
+              <li>
+                <NavLink
+                  to="/users"
+                  className={({ isActive }) =>
+                    `flex items-center gap-3 px-3 py-2 rounded-lg transition-colors ${
+                      isActive
+                        ? 'bg-drop-600 text-white'
+                        : 'text-gray-300 hover:bg-gray-800'
+                    }`
+                  }
+                >
+                  <Users className="w-5 h-5" />
+                  Users
+                </NavLink>
+              </li>
+            )}
           </ul>
         </nav>
 
@@ -99,6 +116,9 @@ function Layout() {
               <div className="flex items-center gap-2 text-sm text-gray-400">
                 <User className="w-4 h-4" />
                 <span className="truncate">{username || 'User'}</span>
+                {role === 'admin' && (
+                  <span className="text-[10px] px-1.5 py-0.5 bg-drop-500/20 text-drop-400 rounded font-medium uppercase">admin</span>
+                )}
               </div>
               <button
                 onClick={logout}
