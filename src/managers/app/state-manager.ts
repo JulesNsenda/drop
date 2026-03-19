@@ -8,6 +8,7 @@
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import { eventBus } from '../../core/event-bus';
+import type { GitSource } from '../../core/git-deploy/git-deploy.types';
 
 export type AppStatus = 'pending' | 'building' | 'starting' | 'running' | 'stopped' | 'errored';
 export type AppType = 'nodejs' | 'python' | 'go' | 'static' | 'docker' | 'unknown';
@@ -26,6 +27,7 @@ export interface AppState {
   lastDeployedAt?: string;
   buildDuration?: number;
   error?: string;
+  gitSource?: GitSource;
 }
 
 export interface StateManagerConfig {

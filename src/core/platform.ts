@@ -19,6 +19,7 @@ import { PostgresServer, getPostgresServer, resetPostgresServer, DatabaseProvisi
 import { CaddyServer, getCaddyServer, resetCaddyServer } from '../managers/router';
 import { SecretManager, getSecretManager, resetSecretManager } from '../managers/secret';
 import { WebhookManager, getWebhookManager, resetWebhookManager } from './webhooks';
+import { GitDeployService, getGitDeployService, resetGitDeployService } from './git-deploy';
 import { ApiServer, createApiServer } from '../api';
 import { Logger, createLogger } from '../utils/logger';
 import {
@@ -117,6 +118,7 @@ export class DropPlatform {
   private caddyServer: CaddyServer | null = null;
   private secretManager: SecretManager | null = null;
   private webhookManager: WebhookManager | null = null;
+  private gitDeployService: GitDeployService | null = null;
   private apiServer: ApiServer | null = null;
 
   private subscriptions: Unsubscribe[] = [];
@@ -281,9 +283,10 @@ export class DropPlatform {
       resetCaddyServer();
     }
 
-    // Reset secret manager and webhook manager
+    // Reset secret manager, webhook manager, and git deploy service
     resetSecretManager();
     resetWebhookManager();
+    resetGitDeployService();
 
     // Stop API server
     if (this.apiServer) {
@@ -549,6 +552,12 @@ import ${path.join(dataDir, 'appconf', 'caddy', 'hosts', '*.caddy').replace(/\\/
     this.webhookManager = getWebhookManager({ storePath: webhookStorePath });
     await this.webhookManager.initialize();
     this.logger.info('Webhook manager initialized', 'WEBHOOKS');
+
+    // Initialize git deploy service
+    this.gitDeployService = getGitDeployService({
+      appsDirectory: this.config.appsDirectory,
+    });
+    await this.gitDeployService.initialize();
 
     // Sync state manager with app configs (configs are source of truth for ports)
     await this.syncStateWithConfigs();
