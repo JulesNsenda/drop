@@ -11,6 +11,7 @@ import { success, error, ErrorCodes, AppDto, CreateAppDto, UpdateAppDto } from '
 import { NotFoundError, ValidationError } from '../middleware/error';
 import { getProcessManager } from '../../managers/process';
 import { getStateManager, AppState } from '../../managers/app/state-manager';
+import { getAppConfigService } from '../../managers/app/app-config';
 
 const apps = new Hono();
 
@@ -167,6 +168,23 @@ apps.delete('/:name', async (c) => {
 
   // Remove from state
   await stateManager.removeApp(name);
+
+  // Remove app config (e.g. appconf/webapps/ezsign.yaml)
+  try {
+    const configService = getAppConfigService();
+    await configService.deleteConfig(name);
+  } catch {
+    // Config may not exist
+  }
+
+  // Delete the app folder from the filesystem so the watcher doesn't re-detect it
+  if (app.path) {
+    try {
+      await fs.rm(app.path, { recursive: true, force: true });
+    } catch {
+      // Folder may already be gone
+    }
+  }
 
   return c.json(success({ message: `Application '${name}' removed` }));
 });
