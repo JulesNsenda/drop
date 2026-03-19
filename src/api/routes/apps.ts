@@ -9,22 +9,33 @@ import * as path from 'path';
 import * as fs from 'fs/promises';
 import { success, error, ErrorCodes, AppDto, CreateAppDto, UpdateAppDto } from '../types';
 import { NotFoundError, ValidationError } from '../middleware/error';
-import { AuthContext } from '../middleware/auth';
+import { AuthContext, listUsers } from '../middleware/auth';
 import { getProcessManager } from '../../managers/process';
 import { getStateManager, AppState } from '../../managers/app/state-manager';
 import { getAppConfigService } from '../../managers/app/app-config';
 
 const apps = new Hono();
 
-// Helper to convert AppState to AppDto
-function toAppDto(app: AppState): AppDto {
+// Cache userId → username mapping
+function resolveUsername(userId?: string): string | undefined {
+  if (!userId) return undefined;
+  try {
+    const users = listUsers();
+    return users.find((u) => u.id === userId)?.username;
+  } catch {
+    return undefined;
+  }
+}
+
+// Helper to convert AppState to AppDto (role-aware)
+function toAppDto(app: AppState, isAdmin = false): AppDto {
   return {
     name: app.name,
     type: app.type,
     status: app.status,
     port: app.port,
-    pid: app.pid,
-    path: app.path,
+    pid: isAdmin ? app.pid : undefined,
+    path: isAdmin ? app.path : undefined as unknown as string,
     framework: app.framework,
     hostname: app.hostname,
     createdAt: app.createdAt,
@@ -34,6 +45,7 @@ function toAppDto(app: AppState): AppDto {
     error: app.error,
     gitSource: app.gitSource,
     userId: app.userId,
+    ownerName: isAdmin ? resolveUsername(app.userId) : undefined,
   };
 }
 
@@ -66,7 +78,7 @@ apps.get('/', async (c) => {
   }
 
   return c.json(
-    success(filtered.map(toAppDto), {
+    success(filtered.map((a) => toAppDto(a, auth?.role === 'admin')), {
       total: filtered.length,
     })
   );
@@ -88,12 +100,13 @@ apps.get('/:name', async (c) => {
   try {
     const status = await pm.getStatus(name);
     if (status) {
+      const isAdmin = auth?.role === 'admin';
       return c.json(
         success({
-          ...toAppDto(app),
-          pid: status.pid ?? app.pid,
-          memory: status.memory,
-          cpu: status.cpu,
+          ...toAppDto(app, isAdmin),
+          pid: isAdmin ? (status.pid ?? app.pid) : undefined,
+          memory: isAdmin ? status.memory : undefined,
+          cpu: isAdmin ? status.cpu : undefined,
           restarts: status.restarts,
         })
       );
@@ -102,7 +115,7 @@ apps.get('/:name', async (c) => {
     // Process info not available
   }
 
-  return c.json(success(toAppDto(app)));
+  return c.json(success(toAppDto(app, auth?.role === 'admin')));
 });
 
 // POST /apps - Deploy a new application
@@ -143,7 +156,7 @@ apps.post('/', async (c) => {
     await stateManager.updateApp(appName, { userId: auth.userId });
   }
 
-  return c.json(success(toAppDto({ ...app, userId: auth?.userId })), 201);
+  return c.json(success(toAppDto({ ...app, userId: auth?.userId }, auth?.role === 'admin')), 201);
 });
 
 // PUT /apps/:name - Update application
@@ -163,7 +176,8 @@ apps.put('/:name', async (c) => {
     throw new NotFoundError(`Application '${name}' not found`);
   }
 
-  return c.json(success(toAppDto(updated)));
+  const authCtx = (c.get as Function)('auth') as AuthContext | undefined;
+  return c.json(success(toAppDto(updated, authCtx?.role === 'admin')));
 });
 
 // DELETE /apps/:name - Remove application
