@@ -34,6 +34,14 @@ export interface BuildContext {
   config: BuildConfig;
   env: Record<string, string>;
   previousBuild?: BuildResult;
+  /**
+   * Scratch directory for ephemeral build artifacts (tarballs, generated
+   * Dockerfiles, layer caches, …).  Lives outside the watched app dir so the
+   * watcher never sees these files and cannot trigger a spurious rebuild.
+   * Set by the platform to data/temp/{appName}/ before each build.
+   * Strategies that write temp files MUST use this path, not appPath.
+   */
+  workDir?: string;
 }
 
 /**

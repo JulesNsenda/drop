@@ -244,6 +244,12 @@ describe('WatcherConfig', () => {
     expect(config.ignorePatterns).toContain('**/__pycache__/**');
     expect(config.ignorePatterns).toContain('**/venv/**');
   });
+
+  it('should accept and preserve an isAppLocked callback', () => {
+    const isAppLocked = jest.fn().mockReturnValue(false);
+    const config = createWatcherConfig({ isAppLocked });
+    expect(config.isAppLocked).toBe(isAppLocked);
+  });
 });
 
 describe('WatcherService', () => {
@@ -325,5 +331,99 @@ describe('WatcherService', () => {
     await service.start();
 
     expect(service.getKnownApps()).toEqual([]);
+  });
+});
+
+describe('WatcherService deploy lock (isAppLocked)', () => {
+  const chokidar = require('chokidar');
+  const { WatcherService } = require('./watcher');
+  const { eventBus } = require('../event-bus');
+
+  // Build a per-test chokidar mock that captures registered event handlers
+  // so we can simulate file-change events manually.
+  function buildMockWatcher() {
+    const handlers: Record<string, (...args: unknown[]) => void> = {};
+    const mock = {
+      on: jest.fn().mockImplementation((event: string, cb: (...args: unknown[]) => void) => {
+        handlers[event] = cb;
+        return mock; // Return same object for method chaining
+      }),
+      close: jest.fn().mockResolvedValue(undefined),
+      getWatched: jest.fn().mockReturnValue({}),
+    };
+    return { mock, handlers };
+  }
+
+  beforeEach(() => {
+    jest.useFakeTimers();
+    jest.clearAllMocks();
+  });
+
+  afterEach(() => {
+    jest.useRealTimers();
+  });
+
+  it('suppresses app:update when isAppLocked returns true at schedule time', async () => {
+    const locked = new Set(['myapp']);
+    const { mock, handlers } = buildMockWatcher();
+    (chokidar.watch as jest.Mock).mockReturnValueOnce(mock);
+
+    const service = new WatcherService({
+      appsDir: '/apps',
+      debounceMs: 100,
+      isAppLocked: (name: string) => locked.has(name),
+    });
+    await service.start();
+
+    // Simulate a .ts file change — extension is in REBUILD_EXTENSIONS
+    handlers['change']?.('/apps/myapp/index.ts');
+
+    // Advance past debouncer (100ms) + rebuild debounce (2000ms)
+    jest.advanceTimersByTime(3000);
+
+    expect(eventBus.publish).not.toHaveBeenCalledWith('app:update', expect.anything());
+  });
+
+  it('emits app:update when isAppLocked returns false', async () => {
+    const { mock, handlers } = buildMockWatcher();
+    (chokidar.watch as jest.Mock).mockReturnValueOnce(mock);
+
+    const service = new WatcherService({
+      appsDir: '/apps',
+      debounceMs: 100,
+      isAppLocked: () => false,
+    });
+    await service.start();
+
+    handlers['change']?.('/apps/myapp/index.ts');
+    jest.advanceTimersByTime(3000);
+
+    expect(eventBus.publish).toHaveBeenCalledWith(
+      'app:update',
+      expect.objectContaining({ name: 'myapp' })
+    );
+  });
+
+  it('suppresses app:update if lock is acquired between debounce and rebuild-timer fire', async () => {
+    const locked = new Set<string>();
+    const { mock, handlers } = buildMockWatcher();
+    (chokidar.watch as jest.Mock).mockReturnValueOnce(mock);
+
+    const service = new WatcherService({
+      appsDir: '/apps',
+      debounceMs: 100,
+      isAppLocked: (name: string) => locked.has(name),
+    });
+    await service.start();
+
+    handlers['change']?.('/apps/myapp/index.ts');
+    // Advance past the debouncer but not yet past the rebuild debounce
+    jest.advanceTimersByTime(150);
+    // Now lock the app
+    locked.add('myapp');
+    // Advance past the rebuild debounce
+    jest.advanceTimersByTime(2500);
+
+    expect(eventBus.publish).not.toHaveBeenCalledWith('app:update', expect.anything());
   });
 });
