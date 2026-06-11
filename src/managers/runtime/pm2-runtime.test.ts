@@ -196,8 +196,10 @@ describe('getAppRuntime singleton', () => {
     expect(a).not.toBe(b);
   });
 
-  it('rejects the docker runtime until PRD-029 lands', () => {
-    expect(() => getAppRuntime('docker')).toThrow(/not available/);
+  it('returns a ContainerManager for the docker runtime', () => {
+    const runtime = getAppRuntime('docker');
+    expect(runtime.type).toBe('docker');
+    resetAppRuntime();
   });
 
   it('refuses a silent runtime switch', () => {

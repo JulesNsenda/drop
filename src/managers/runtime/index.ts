@@ -12,9 +12,11 @@ import { resetProcessManager } from '../process';
 import { AppRuntime } from './app-runtime';
 import { RuntimeType } from './app-runtime.types';
 import { Pm2Runtime } from './pm2-runtime';
+import { ContainerManager, resetContainerManager } from './container-manager';
 
 export type { AppRuntime } from './app-runtime';
 export { Pm2Runtime } from './pm2-runtime';
+export { ContainerManager, getContainerManager, resetContainerManager } from './container-manager';
 export type {
   AppLogPaths,
   AppProcessInfo,
@@ -27,8 +29,9 @@ export type {
 let runtimeInstance: AppRuntime | null = null;
 
 /**
- * Get the platform's app runtime. Defaults to PM2; 'docker' arrives with
- * the v2 ContainerManager (PRD-029).
+ * Get the platform's app runtime.
+ * - 'pm2'    (default) — host processes via PM2; the v1 runtime.
+ * - 'docker' — container isolation via ContainerManager; required for multi-user.
  */
 export function getAppRuntime(type: RuntimeType = 'pm2'): AppRuntime {
   if (runtimeInstance && runtimeInstance.type !== type) {
@@ -39,9 +42,10 @@ export function getAppRuntime(type: RuntimeType = 'pm2'): AppRuntime {
   }
   if (!runtimeInstance) {
     if (type === 'docker') {
-      throw new Error("Runtime 'docker' is not available yet (PRD-029)");
+      runtimeInstance = new ContainerManager();
+    } else {
+      runtimeInstance = new Pm2Runtime();
     }
-    runtimeInstance = new Pm2Runtime();
   }
   return runtimeInstance;
 }
@@ -51,7 +55,7 @@ export function resetAppRuntime(): void {
     runtimeInstance.disconnect();
   }
   runtimeInstance = null;
-  // The PM2 adapter wraps the ProcessManager singleton — reset it too so
-  // tests and platform.stop() get a clean slate.
+  // Reset both underlying singletons unconditionally — whichever was active.
   resetProcessManager();
+  resetContainerManager();
 }

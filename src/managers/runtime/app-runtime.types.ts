@@ -64,6 +64,18 @@ export interface AppStartSpec {
   errorFile?: string;
   /** Resource limits */
   limits?: AppResourceLimits;
+  /**
+   * Detected app type — used by the container runtime to pick the correct
+   * base image.  PM2 runtime ignores it.
+   */
+  appType?: string;
+  /**
+   * Override the base image for the container runtime (must be an absolute
+   * image reference from the DROP-approved image list; arbitrary tenant
+   * values are validated by ContainerManager before use).
+   * Only honoured when isolation === 'docker' and appType === 'docker'.
+   */
+  runtimeImage?: string;
 }
 
 /**
