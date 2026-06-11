@@ -8,6 +8,7 @@
  */
 
 import { DropPlatform, PlatformConfig } from './core/platform';
+import { IsolationMode } from './core/startup-constraints';
 
 /** Parse the subset of CLI flags the daemon forwards into a PlatformConfig. */
 export function parseArgs(argv: string[]): Partial<PlatformConfig> {
@@ -53,6 +54,14 @@ export function parseArgs(argv: string[]): Partial<PlatformConfig> {
       }
       case '--wildcard':
         config.wildcardCert = true;
+        break;
+      case '--isolation': {
+        const v = valueOf(i);
+        if (v === 'none' || v === 'docker') config.isolation = v as IsolationMode;
+        break;
+      }
+      case '--allow-signup':
+        config.allowSignup = true;
         break;
       default:
         // Ignore unknown tokens (e.g. the leading "serve").
