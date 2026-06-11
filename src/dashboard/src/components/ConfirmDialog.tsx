@@ -52,9 +52,15 @@ export function ConfirmProvider({ children }: { children: ReactNode }) {
           <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" onClick={() => handleClose(false)} />
 
           {/* Dialog */}
-          <div className="relative bg-white dark:bg-gray-800 rounded-xl shadow-2xl border border-gray-200 dark:border-gray-700 max-w-sm w-full p-6 animate-in">
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-label={state.options.title || 'Confirm'}
+            className="relative bg-white dark:bg-gray-800 rounded-xl shadow-2xl border border-gray-200 dark:border-gray-700 max-w-sm w-full p-6 animate-in"
+          >
             <button
               onClick={() => handleClose(false)}
+              aria-label="Close dialog"
               className="absolute top-4 right-4 text-gray-400 hover:text-gray-600 dark:hover:text-gray-300"
             >
               <X className="w-4 h-4" />

@@ -390,15 +390,4 @@ apps.put('/:name/domain', async (c) => {
   return c.json(success({ message: domain ? `Domain set to ${domain}` : 'Domain removed', domain }));
 });
 
-// GET /apps/:name/usage - Get user app count and limit
-apps.get('/:name/usage', async (c) => {
-  const auth = (c.get as Function)('auth') as AuthContext | undefined;
-  if (!auth?.userId) return c.json(success({ used: 0, limit: 0 }));
-
-  const stateManager = getStateManager();
-  const used = stateManager.getAllApps().filter((a) => a.userId === auth.userId).length;
-
-  return c.json(success({ used, limit: auth.role === 'admin' ? 0 : getAppLimit(auth.userId) }));
-});
-
 export default apps;

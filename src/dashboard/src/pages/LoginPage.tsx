@@ -1,10 +1,22 @@
 import { useState, FormEvent } from 'react';
-import { Link } from 'react-router-dom';
+import { Link, useLocation } from 'react-router-dom';
 import { Box, LogIn, ArrowLeft } from 'lucide-react';
 import { useAuth } from '../hooks/useAuth';
 
+interface LoginLocationState {
+  sessionExpired?: boolean;
+  message?: string;
+}
+
 function LoginPage() {
   const { login } = useAuth();
+  const location = useLocation();
+  const state = (location.state as LoginLocationState | null) || null;
+  // Notice carried from a session expiry (PRD-024) or a successful signup
+  // (PRD-028). Held in local state so it clears on the next interaction.
+  const [notice, setNotice] = useState<string | null>(
+    state?.sessionExpired ? 'Your session expired. Please sign in again.' : state?.message || null
+  );
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
   const [error, setError] = useState('');
@@ -13,6 +25,7 @@ function LoginPage() {
   const handleSubmit = async (e: FormEvent) => {
     e.preventDefault();
     setError('');
+    setNotice(null);
     setLoading(true);
 
     const success = await login(username, password);
@@ -36,8 +49,13 @@ function LoginPage() {
 
         {/* Login form */}
         <form onSubmit={handleSubmit} className="bg-white dark:bg-gray-800 rounded-xl shadow-sm border border-gray-200 dark:border-gray-700 p-6 mb-4">
+          {notice && (
+            <div role="status" className="mb-4 p-3 bg-green-50 dark:bg-green-900/30 border border-green-200 dark:border-green-800 rounded-lg text-sm text-green-700 dark:text-green-400">
+              {notice}
+            </div>
+          )}
           {error && (
-            <div className="mb-4 p-3 bg-red-50 dark:bg-red-900/30 border border-red-200 dark:border-red-800 rounded-lg text-sm text-red-700 dark:text-red-400">
+            <div role="alert" className="mb-4 p-3 bg-red-50 dark:bg-red-900/30 border border-red-200 dark:border-red-800 rounded-lg text-sm text-red-700 dark:text-red-400">
               {error}
             </div>
           )}

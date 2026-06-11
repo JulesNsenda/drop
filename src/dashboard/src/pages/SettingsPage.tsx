@@ -268,7 +268,7 @@ function SettingsPage() {
               </tr>
               <tr>
                 <td className="py-2 text-gray-500 dark:text-gray-400">API Endpoint</td>
-                <td className="py-2 font-mono text-gray-900 dark:text-white text-xs">http://localhost:3000/api/v1</td>
+                <td className="py-2 font-mono text-gray-900 dark:text-white text-xs">{`${window.location.origin}/api/v1`}</td>
               </tr>
               <tr>
                 <td className="py-2 text-gray-500 dark:text-gray-400">Node.js</td>
