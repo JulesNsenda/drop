@@ -6,6 +6,7 @@
 
 import * as fs from 'fs/promises';
 import * as path from 'path';
+import { writeJsonAtomic } from '../../utils/atomic-write';
 
 export interface ActivityEntry {
   id: string;
@@ -69,7 +70,7 @@ export class ActivityLog {
 
   private async save(): Promise<void> {
     await fs.mkdir(path.dirname(this.storePath), { recursive: true });
-    await fs.writeFile(this.storePath, JSON.stringify(this.store, null, 2));
+    await writeJsonAtomic(this.storePath, this.store);
   }
 }
 

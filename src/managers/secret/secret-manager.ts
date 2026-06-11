@@ -7,6 +7,7 @@
 
 import * as fs from 'fs/promises';
 import * as path from 'path';
+import { writeJsonAtomic } from '../../utils/atomic-write';
 import { encrypt, decrypt, deriveKey, generateSalt, EncryptedData } from './encryption';
 
 interface SecretStore {
@@ -121,11 +122,7 @@ export class SecretManager {
   }
 
   private async saveStore(store: SecretStore): Promise<void> {
-    await fs.writeFile(
-      this.config.storePath,
-      JSON.stringify(store, null, 2),
-      { mode: 0o600 }
-    );
+    await writeJsonAtomic(this.config.storePath, store, { mode: 0o600 });
   }
 
   /**

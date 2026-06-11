@@ -8,6 +8,7 @@
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import { eventBus } from '../../core/event-bus';
+import { writeJsonAtomic } from '../../utils/atomic-write';
 import type { GitSource } from '../../core/git-deploy/git-deploy.types';
 
 export type AppStatus = 'pending' | 'building' | 'starting' | 'running' | 'stopped' | 'errored';
@@ -41,6 +42,7 @@ export class AppStateManager {
   private apps: Map<string, AppState> = new Map();
   private initialized = false;
   private saveDebounceTimer: NodeJS.Timeout | null = null;
+  private savePromise: Promise<void> = Promise.resolve();
 
   constructor(config: StateManagerConfig) {
     this.config = config;
@@ -69,30 +71,62 @@ export class AppStateManager {
   }
 
   private async load(): Promise<void> {
+    let data: string;
     try {
-      const data = await fs.readFile(this.config.stateFilePath, 'utf-8');
-      const parsed = JSON.parse(data);
+      data = await fs.readFile(this.config.stateFilePath, 'utf-8');
+    } catch {
+      // No state file yet — first run.
+      this.apps.clear();
+      return;
+    }
 
+    try {
+      const parsed = JSON.parse(data);
       if (parsed.apps && Array.isArray(parsed.apps)) {
         this.apps.clear();
         for (const app of parsed.apps) {
           this.apps.set(app.name, app);
         }
       }
-    } catch {
-      // File doesn't exist or is corrupted - start fresh silently
+    } catch (err) {
+      // Corrupt state file. apps.json is the least-authoritative store (ports
+      // come from app-config, the watcher re-detects apps), but it solely
+      // holds userId/gitSource/user-stopped flags — so quarantine it for
+      // forensics rather than silently overwriting, then continue empty.
+      await this.quarantineCorruptStateFile(err);
       this.apps.clear();
     }
   }
 
+  private async quarantineCorruptStateFile(err: unknown): Promise<void> {
+    try {
+      const ts = new Date().toISOString().replace(/[:.]/g, '-');
+      const quarantinePath = `${this.config.stateFilePath}.corrupt-${ts}`;
+      await fs.rename(this.config.stateFilePath, quarantinePath);
+      console.error(
+        `[state-manager] Corrupt state file quarantined to ${quarantinePath}:`,
+        err instanceof Error ? err.message : err
+      );
+    } catch (renameErr) {
+      console.error('[state-manager] Failed to quarantine corrupt state file:', renameErr);
+    }
+  }
+
   private async save(): Promise<void> {
+    // Serialize overlapping saves so two debounced flushes can't interleave
+    // their temp writes.
+    this.savePromise = this.savePromise.then(() => this.doSave());
+    return this.savePromise;
+  }
+
+  private async doSave(): Promise<void> {
     try {
       const data = {
         version: 1,
         updatedAt: new Date().toISOString(),
         apps: Array.from(this.apps.values()),
       };
-      await fs.writeFile(this.config.stateFilePath, JSON.stringify(data, null, 2));
+      await writeJsonAtomic(this.config.stateFilePath, data);
     } catch (error) {
       console.error('Failed to save app state:', error);
     }

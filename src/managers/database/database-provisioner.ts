@@ -8,6 +8,7 @@ import * as crypto from 'crypto';
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import { Pool } from 'pg';
+import { writeJsonAtomic } from '../../utils/atomic-write';
 import { PostgresServer } from './postgres-server';
 
 export interface DatabaseCredentials {
@@ -316,6 +317,6 @@ export class DatabaseProvisioner {
     };
 
     await fs.mkdir(path.dirname(this.credentialsPath), { recursive: true });
-    await fs.writeFile(this.credentialsPath, JSON.stringify(data, null, 2), { mode: 0o600 });
+    await writeJsonAtomic(this.credentialsPath, data, { mode: 0o600 });
   }
 }

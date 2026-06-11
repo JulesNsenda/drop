@@ -153,12 +153,22 @@ export class BuilderService {
       const success = errors.length === 0;
       const status: BuildStatus = success ? 'success' : 'failed';
 
-      // Emit completion event
+      // Emit completion event (carries success so subscribers don't start a
+      // failed build). Also emit build:failed on stage failures so external
+      // consumers and the dashboard see the failure, not just exceptions.
       eventBus.publish('build:completed', {
         appId: context.appName,
         buildId,
         durationMs: Date.now() - startedAt.getTime(),
+        success,
       });
+      if (!success) {
+        eventBus.publish('build:failed', {
+          appId: context.appName,
+          buildId,
+          error: new Error(errors[0]?.message || 'Build failed'),
+        });
+      }
 
       return {
         success,

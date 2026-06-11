@@ -9,6 +9,7 @@ import * as crypto from 'crypto';
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import { eventBus, Unsubscribe } from '../event-bus';
+import { writeJsonAtomic } from '../../utils/atomic-write';
 import {
   WebhookConfig,
   WebhookEvent,
@@ -226,7 +227,7 @@ export class WebhookManager {
       webhooks: Array.from(this.webhooks.values()),
     };
     // 0600 — webhook secrets are stored here in plaintext.
-    await fs.writeFile(this.config.storePath, JSON.stringify(data, null, 2), { mode: 0o600 });
+    await writeJsonAtomic(this.config.storePath, data, { mode: 0o600 });
   }
 }
 
