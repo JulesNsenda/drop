@@ -29,6 +29,7 @@ import {
   isLocalhostDomain,
 } from '../utils/domain-validator';
 import { createApiKey, deleteApiKeysByName } from '../api/middleware/auth';
+import { IsolationMode, assertStartupConstraints } from './startup-constraints';
 
 export interface PlatformConfig {
   /** Root directory for DROP */
@@ -74,6 +75,20 @@ export interface PlatformConfig {
   enableApiAuth: boolean;
   /** Maximum apps per user (0 = unlimited) */
   maxAppsPerUser: number;
+  /**
+   * App isolation mode.
+   * - 'none'   — default; apps run as PM2 processes on the host. Single-user /
+   *              fully-trusted. signup cannot be enabled in this mode.
+   * - 'docker' — apps build and run in containers. Required for multi-user.
+   *              Linux-first; Windows via Docker Desktop is dev/best-effort only.
+   */
+  isolation: IsolationMode;
+  /**
+   * Allow new users to self-register via POST /auth/signup.
+   * Requires isolation: 'docker' and auth enabled — enforced at startup.
+   * Default false; enable with DROP_ALLOW_SIGNUP=true.
+   */
+  allowSignup: boolean;
 }
 
 // Determine platform-appropriate defaults
@@ -104,6 +119,8 @@ const DEFAULT_CONFIG: PlatformConfig = {
   apiPort: 3000,
   enableApiAuth: process.env.DROP_DISABLE_AUTH !== 'true',
   maxAppsPerUser: parseInt(process.env.DROP_MAX_APPS_PER_USER || '5', 10),
+  isolation: (process.env.DROP_ISOLATION as IsolationMode) ?? 'none',
+  allowSignup: process.env.DROP_ALLOW_SIGNUP === 'true',
 };
 
 export class DropPlatform {
@@ -189,6 +206,13 @@ export class DropPlatform {
     this.eventBus.publish('platform:starting', { config: this.config as unknown as Record<string, unknown> });
 
     try {
+      // Fail-closed startup constraints: docker reachability, signup gate
+      await assertStartupConstraints({
+        isolation: this.config.isolation,
+        allowSignup: this.config.allowSignup,
+        enableApiAuth: this.config.enableApiAuth,
+      });
+
       // Validate domain configuration if HTTPS is enabled
       if (this.config.enableHttps && this.config.domainSuffix) {
         await this.validateDomainConfig();
