@@ -19,9 +19,11 @@ import {
   createRemoveCommand,
   createServeCommand,
   createServerCommand,
+  createBackupCommand,
 } from './commands';
+import { getPlatformVersion } from '../utils/version';
 
-const VERSION = '0.1.0-alpha.1';
+const VERSION = getPlatformVersion();
 
 /**
  * Create the main CLI program
@@ -56,6 +58,7 @@ function createProgram(): Command {
   program.addCommand(createStopCommand());
   program.addCommand(createRestartCommand());
   program.addCommand(createRemoveCommand());
+  program.addCommand(createBackupCommand());
   program.addCommand(createVersionCommand());
 
   // Error handling

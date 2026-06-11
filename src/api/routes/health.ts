@@ -5,28 +5,18 @@
  */
 
 import * as http from 'http';
-import * as fs from 'fs';
-import * as path from 'path';
 import { Hono } from 'hono';
 import { success, HealthDto, StatsDto } from '../types';
 import { getProcessManager } from '../../managers/process';
 import { getStateManager, AppStateManager } from '../../managers/app/state-manager';
+import { getPlatformVersion } from '../../utils/version';
 
 const health = new Hono();
 
 // Track startup time
 const startTime = Date.now();
 
-// Resolve the platform version from package.json (same relative depth from
-// src/ and dist/ builds). npm_package_version is unset under PM2/node direct.
-const platformVersion = ((): string => {
-  try {
-    const pkgPath = path.join(__dirname, '..', '..', '..', 'package.json');
-    return (JSON.parse(fs.readFileSync(pkgPath, 'utf-8')) as { version?: string }).version || '0.0.0';
-  } catch {
-    return process.env.npm_package_version || '0.0.0';
-  }
-})();
+const platformVersion = getPlatformVersion();
 
 /** Quick HTTP ping to check if an app is responding */
 function httpPing(port: number, timeoutMs = 3000): Promise<boolean> {
