@@ -9,6 +9,7 @@ import * as jose from 'jose';
 import * as crypto from 'crypto';
 import * as fs from 'fs/promises';
 import * as path from 'path';
+import { writeJsonAtomic } from '../../utils/atomic-write';
 import { error, ErrorCodes } from '../types';
 
 // Auth configuration
@@ -139,7 +140,7 @@ async function loadCredentials(credentialsPath: string): Promise<CredentialsStor
  */
 async function saveCredentials(credentialsPath: string, store: CredentialsStore): Promise<void> {
   await fs.mkdir(path.dirname(credentialsPath), { recursive: true });
-  await fs.writeFile(credentialsPath, JSON.stringify(store, null, 2), { mode: 0o600 });
+  await writeJsonAtomic(credentialsPath, store, { mode: 0o600 });
 }
 
 /**

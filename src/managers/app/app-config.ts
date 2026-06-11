@@ -8,6 +8,7 @@
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import * as yaml from 'yaml';
+import { writeFileAtomic } from '../../utils/atomic-write';
 
 export interface AppConfig {
   name: string;
@@ -138,7 +139,7 @@ export class AppConfigService {
   async saveConfig(config: AppConfig): Promise<void> {
     const configPath = this.getConfigPath(config.name);
     const content = yaml.stringify(config, { indent: 2 });
-    await fs.writeFile(configPath, content, 'utf-8');
+    await writeFileAtomic(configPath, content);
     this.configs.set(config.name, config);
   }
 

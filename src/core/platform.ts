@@ -252,6 +252,11 @@ export class DropPlatform {
       await this.watcher.stop();
     }
 
+    // Let any in-flight build/start finish (best-effort, bounded) before we
+    // tear down the builder/state so apps aren't left half-deployed.
+    await this.drainInProgress(10_000);
+    this.appsInProgress.clear();
+
     if (this.router) {
       this.router.stop();
       resetRouterService();
@@ -303,6 +308,23 @@ export class DropPlatform {
     this.eventBus.publish('platform:stopped', { timestamp: new Date() });
     this.logger.platformEvent('stopped');
     this.logger.close();
+  }
+
+  /** Wait (up to timeoutMs) for in-progress deploys to drain. */
+  private async drainInProgress(timeoutMs: number): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    while (this.appsInProgress.size > 0 && Date.now() < deadline) {
+      await new Promise((resolve) => {
+        const t = setTimeout(resolve, 100);
+        t.unref?.();
+      });
+    }
+    if (this.appsInProgress.size > 0) {
+      this.logger.warn(
+        `Shutdown proceeding with ${this.appsInProgress.size} deploy(s) still in progress`,
+        'PLATFORM'
+      );
+    }
   }
 
   private async ensureDirectories(): Promise<void> {
@@ -681,8 +703,11 @@ import ${path.join(dataDir, 'appconf', 'caddy', 'hosts', '*.caddy').replace(/\\/
             pid: proc.pid ?? undefined,
           });
         } else if (app.status === 'running' && !runningNames.has(app.name)) {
-          // App was marked running but isn't - mark as stopped
-          await this.stateManager.setAppStatus(app.name, 'stopped');
+          // App was 'running' but its process is gone (platform/host restarted
+          // out from under it). Mark 'pending' — NOT 'stopped' — so the
+          // startup detection scan rebuilds and restarts it. User-stopped apps
+          // are persisted as 'stopped' and are intentionally left alone.
+          await this.stateManager.setAppStatus(app.name, 'pending');
         }
       }
 
@@ -768,15 +793,27 @@ import ${path.join(dataDir, 'appconf', 'caddy', 'hosts', '*.caddy').replace(/\\/
     });
     this.subscriptions.push(detectedSub);
 
-    // When build completes, start the app (unless it was explicitly stopped)
+    // When build completes, start the app (unless it failed or was stopped).
+    // handleBuildApp keeps the app in appsInProgress through the build and
+    // hands ownership to handleStartApp; every path here that does NOT start
+    // the app must release the guard, or future hot-reloads dead-end forever.
     const buildSub = this.eventBus.subscribe('build:completed', async (payload) => {
-      if (this.config.autoStart) {
-        const app = this.stateManager?.getApp(payload.appId);
+      if (payload.success === false) {
+        // Failed build — handleBuildApp already marked it errored and cleaned up.
+        this.appsInProgress.delete(payload.appId);
+        return;
+      }
+
+      const app = this.stateManager?.getApp(payload.appId);
+      const shouldStart = this.config.autoStart && app?.status !== 'stopped';
+
+      if (shouldStart) {
+        await this.handleStartApp(payload.appId); // owns appsInProgress cleanup
+      } else {
         if (app?.status === 'stopped') {
           this.logger.info(`Skipping auto-start for ${payload.appId} - app was stopped by user`, 'APP');
-          return;
         }
-        await this.handleStartApp(payload.appId);
+        this.appsInProgress.delete(payload.appId);
       }
     });
     this.subscriptions.push(buildSub);
