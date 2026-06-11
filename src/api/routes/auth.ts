@@ -22,7 +22,7 @@ import {
   isAuthEnabled,
   AuthContext,
 } from '../middleware/auth';
-import { getActivityLog } from '../../managers/activity';
+import { tryLogActivity } from '../../managers/activity';
 import { getStateManager } from '../../managers/app/state-manager';
 import { ValidationError } from '../middleware/error';
 
@@ -56,7 +56,7 @@ auth.post('/signup', async (c) => {
 
   try {
     const user = await createUser(body.username, body.password, 'user', body.email);
-    try { await getActivityLog().log({ action: 'signup', userId: user.id, username: user.username }); } catch {}
+    await tryLogActivity({ action: 'signup', userId: user.id, username: user.username });
     return c.json(success({
       id: user.id,
       username: user.username,
@@ -87,7 +87,7 @@ auth.post('/login', async (c) => {
   }
 
   const user = getUser(body.username);
-  try { await getActivityLog().log({ action: 'login', userId: user?.id, username: body.username }); } catch {}
+  await tryLogActivity({ action: 'login', userId: user?.id, username: body.username });
   return c.json(
     success({
       token,
@@ -267,7 +267,7 @@ auth.delete('/account', authMiddleware(), async (c) => {
 
   try {
     await deleteUser(authCtx.userId);
-    try { await getActivityLog().log({ action: 'delete' as any, userId: authCtx.userId, username: authCtx.username, detail: 'Account deleted' }); } catch {}
+    await tryLogActivity({ action: 'delete', userId: authCtx.userId, username: authCtx.username, detail: 'Account deleted' });
     return c.json(success({ message: 'Account deleted' }));
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Failed to delete account';

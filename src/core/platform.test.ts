@@ -137,6 +137,15 @@ jest.mock('fs/promises', () => {
     ...actual,
     mkdir: jest.fn().mockResolvedValue(undefined),
     writeFile: jest.fn().mockResolvedValue(undefined),
+    // Cover the atomic-write path (writeFileAtomic uses open+sync+close+rename)
+    // so no real files are written during platform tests.
+    open: jest.fn().mockResolvedValue({
+      writeFile: jest.fn().mockResolvedValue(undefined),
+      sync: jest.fn().mockResolvedValue(undefined),
+      close: jest.fn().mockResolvedValue(undefined),
+    }),
+    rename: jest.fn().mockResolvedValue(undefined),
+    rm: jest.fn().mockResolvedValue(undefined),
     readFile: jest.fn().mockImplementation(async (filePath: string) => {
       // Return package.json for test apps
       if (filePath.endsWith('package.json')) {

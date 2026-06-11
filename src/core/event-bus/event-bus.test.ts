@@ -112,12 +112,14 @@ describe('EventBus', () => {
         appId: 'test-id',
         buildId: 'build-1',
         durationMs: 1000,
+        success: true,
       });
 
       eventBus.publish('build:completed', {
         appId: 'test-id',
         buildId: 'build-2',
         durationMs: 2000,
+        success: true,
       });
 
       expect(handler).toHaveBeenCalledTimes(1);
@@ -143,6 +145,7 @@ describe('EventBus', () => {
         appId: 'test-id',
         buildId: 'build-1',
         durationMs: 1000,
+        success: true,
       });
 
       expect(handler).toHaveBeenCalledTimes(2);

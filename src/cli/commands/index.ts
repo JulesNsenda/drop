@@ -14,3 +14,4 @@ export { createRestartCommand } from './restart';
 export { createDeployCommand } from './deploy';
 export { createRemoveCommand } from './remove';
 export { createServeCommand, createServerCommand } from './serve';
+export { createBackupCommand } from './backup';

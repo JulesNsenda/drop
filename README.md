@@ -1,6 +1,6 @@
 # DROP
 
-**Deploy, Run, Operate, Publish** | v0.3.0
+**Deploy, Run, Operate, Publish** | v1.0.0-rc
 
 A lightweight, self-hosted Platform as a Service (PaaS) engineered for the "drop folder and deploy" workflow. Zero-configuration deployment for Node.js, Python, static sites, and containerized applications.
 
@@ -41,9 +41,17 @@ A lightweight, self-hosted Platform as a Service (PaaS) engineered for the "drop
 git clone https://github.com/techamat/drop.git
 cd drop
 npm install
-npm run build
-npm link  # Makes 'drop' command available globally
+# The dashboard is a separate package — install its deps once before building:
+(cd src/dashboard && npm install)
+npm run build        # compiles the server AND builds the dashboard
+npm link             # makes the 'drop' command available globally
 ```
+
+> If you only changed backend code, `npm run build:server` skips the dashboard
+> build. The full `npm run build` requires the dashboard deps above.
+
+On first start with auth enabled, DROP prints a one-time random admin password
+to the console (and, in daemon mode, to the PM2 log). Change it immediately.
 
 ### 2. Start DROP
 
@@ -117,6 +125,10 @@ drop remove my-app        # Remove app
 drop deploy ./my-app                    # Deploy from path
 drop deploy ./my-app --name custom      # Custom name
 drop deploy ./my-app --port 4000        # Specific port
+
+# Maintenance
+drop backup                             # Snapshot state + database
+drop backup --keep 14                   # Retain the last 14 backups
 ```
 
 ## Supported App Types
@@ -336,6 +348,69 @@ domains:
 ```
 
 See [HTTPS Setup Guide](docs/HTTPS-SETUP.md) for complete documentation.
+
+## Security & Trust Model
+
+**Read this before exposing DROP to anyone you don't fully trust.**
+
+DROP v1.0 is designed for **self-hosted deployments with trusted or
+semi-trusted users**. Deploying an app means running its code (install/build
+scripts and the app process) on the host as the DROP process user. **There is
+no container or per-user OS isolation yet** (planned for v2.0), so a deployed
+app — or a build script — can read other apps' data and the platform's own
+files on the same host.
+
+What this means in practice:
+
+- **Don't** let strangers sign up and deploy arbitrary code on a host you care
+  about. Treat deploy access like shell access.
+- **Do** keep API authentication on (the default). Disable it only on a trusted
+  local machine via `DROP_DISABLE_AUTH=true`.
+- **Do** set `DROP_GITHUB_WEBHOOK_SECRET` if you use GitHub auto-redeploy, so
+  webhook calls are authenticated.
+- **Do** manage the secrets master key: DROP encrypts app secrets with
+  `data/drop-svc/encryption.key` (auto-generated, `0600`). Keep it — losing it
+  makes existing secrets unrecoverable. Set `DROP_MASTER_KEY` to manage the key
+  externally.
+- The bundled PostgreSQL listens on `127.0.0.1:5433`. On first start, DROP gives
+  the `postgres` superuser a random password (stored at
+  `data/drop-svc/.pg-superuser`, `0600`) and migrates `pg_hba.conf` from `trust`
+  to `scram-sha-256` — so a local process can no longer get superuser access
+  without the password. Keep that file with your backups; don't expose the port.
+
+The platform-facing attack surface (API authorization, path traversal, command
+and SSRF injection, webhook authentication) is hardened; the *tenant-isolation*
+boundary is not. See `.env.example` for all security-relevant settings.
+
+## Backup & Restore
+
+DROP keeps critical state in the file stores under `data/drop-svc/`
+(credentials, encrypted secrets, the encryption key, webhooks, app state) and
+in the internal PostgreSQL database. Snapshot all of it with:
+
+```bash
+drop backup            # writes data/backup/backup-<timestamp>/
+drop backup --keep 14  # keep the newest 14, prune the rest
+```
+
+A backup contains the JSON/YAML stores, `encryption.key`, and a `pg_dump` of
+the internal database. **Schedule it yourself** (cron / Task Scheduler) — DROP
+does not run backups automatically. To restore, stop DROP, copy the files back
+into `data/drop-svc/` (and `data/appconf/webapps/`), and `pg_restore` the dump.
+
+## Upgrading
+
+DROP keeps PM2-managed app processes running across a platform restart, but the
+bundled PostgreSQL and Caddy are stopped and restarted with the platform, so
+expect a brief blip in database connectivity and routing during an upgrade.
+
+- Back up first (`drop backup`).
+- If you run the daemon, `drop server stop` then `drop serve -d` after upgrading
+  — a plain `pm2 restart` keeps the old args/path from the PM2 dump.
+- **Note:** as of v1.0, `drop serve -d` honors `--root/--domain/--https/...`
+  flags that were previously ignored. If you have been passing flags that had no
+  effect, they now take effect — review them before upgrading (e.g. a stray
+  `--https` will actually enable HTTPS and validate your domain config).
 
 ## Development
 

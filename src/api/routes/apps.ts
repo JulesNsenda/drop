@@ -7,15 +7,36 @@
 import { Hono } from 'hono';
 import * as path from 'path';
 import * as fs from 'fs/promises';
-import { success, error, ErrorCodes, AppDto, CreateAppDto, UpdateAppDto } from '../types';
+import { success, error, ErrorCodes, AppDto, CreateAppDto } from '../types';
 import { NotFoundError, ValidationError } from '../middleware/error';
 import { AuthContext, listUsers, getUserById } from '../middleware/auth';
+import { canAccess } from '../access';
 import { getProcessManager } from '../../managers/process';
 import { getStateManager, AppState } from '../../managers/app/state-manager';
 import { getAppConfigService } from '../../managers/app/app-config';
-import { getActivityLog } from '../../managers/activity';
+import { tryLogActivity } from '../../managers/activity';
+import { getAppsDirectory } from '../runtime-config';
+import { isPathWithin } from '../../utils/paths';
 
 const apps = new Hono();
+
+/**
+ * Fields a client may set via PUT /apps/:name. Deliberately excludes
+ * userId (ownership takeover), path (escape the webapps dir), and
+ * port/status/pid/name/type (platform-managed invariants). Status changes
+ * go through the start/stop/restart endpoints; domains through /domain.
+ */
+const UPDATABLE_APP_FIELDS = ['framework', 'customDomain'] as const;
+
+function pickUpdatableFields(body: Record<string, unknown>): Partial<AppState> {
+  const updates: Partial<AppState> = {};
+  for (const field of UPDATABLE_APP_FIELDS) {
+    if (body[field] !== undefined) {
+      (updates as Record<string, unknown>)[field] = body[field];
+    }
+  }
+  return updates;
+}
 
 // Cache userId → username mapping
 function resolveUsername(userId?: string): string | undefined {
@@ -58,15 +79,10 @@ function getAppLimit(userId?: string): number {
   try {
     const user = getUserById(userId) as any;
     if (user?.maxApps && user.maxApps > 0) return user.maxApps;
-  } catch {}
+  } catch {
+    // User lookup failed — fall back to the global limit
+  }
   return globalMax;
-}
-
-/** Check if the current user can access an app (owns it or is admin) */
-function canAccess(auth: AuthContext | undefined, app: AppState): boolean {
-  if (!auth) return true; // No auth enabled
-  if (auth.role === 'admin') return true;
-  return app.userId === auth.userId;
 }
 
 // GET /apps - List applications (filtered by user unless admin)
@@ -140,7 +156,7 @@ apps.post('/', async (c) => {
     throw new ValidationError('Path is required');
   }
 
-  // Validate path exists
+  // Validate path exists and is a directory
   try {
     const stats = await fs.stat(body.path);
     if (!stats.isDirectory()) {
@@ -151,6 +167,13 @@ apps.post('/', async (c) => {
       throw new ValidationError(`Path does not exist: ${body.path}`);
     }
     throw err;
+  }
+
+  // Containment: the deploy path must live inside the webapps directory.
+  // Without this, any authenticated user could register and serve arbitrary
+  // host directories (e.g. the platform's own credential store).
+  if (!(await isPathWithin(getAppsDirectory(), body.path))) {
+    throw new ValidationError('Path must be inside the webapps directory');
   }
 
   const appName = body.name || path.basename(body.path);
@@ -180,29 +203,34 @@ apps.post('/', async (c) => {
     await stateManager.updateApp(appName, { userId: auth.userId });
   }
 
-  try { await getActivityLog().log({ action: 'deploy', userId: auth?.userId, username: auth?.username, appName }); } catch {}
+  await tryLogActivity({ action: 'deploy', userId: auth?.userId, username: auth?.username, appName });
   return c.json(success(toAppDto({ ...app, userId: auth?.userId }, auth?.role === 'admin')), 201);
 });
 
 // PUT /apps/:name - Update application
 apps.put('/:name', async (c) => {
+  const auth = (c.get as Function)('auth') as AuthContext | undefined;
   const name = c.req.param('name');
-  const body = await c.req.json<UpdateAppDto>();
+  const body = (await c.req.json()) as Record<string, unknown>;
 
   const stateManager = getStateManager();
   const app = stateManager.getApp(name);
 
-  if (!app) {
+  if (!app || !canAccess(auth, app)) {
     throw new NotFoundError(`Application '${name}' not found`);
   }
 
-  const updated = await stateManager.updateApp(name, body);
+  // Only allow a strict set of user-editable fields; ignore everything else
+  // (userId, path, port, status, pid, ...) to prevent ownership takeover
+  // and escape of platform-managed invariants.
+  const updates = pickUpdatableFields(body);
+
+  const updated = await stateManager.updateApp(name, updates);
   if (!updated) {
     throw new NotFoundError(`Application '${name}' not found`);
   }
 
-  const authCtx = (c.get as Function)('auth') as AuthContext | undefined;
-  return c.json(success(toAppDto(updated, authCtx?.role === 'admin')));
+  return c.json(success(toAppDto(updated, auth?.role === 'admin')));
 });
 
 // DELETE /apps/:name - Remove application
@@ -245,7 +273,7 @@ apps.delete('/:name', async (c) => {
     }
   }
 
-  try { await getActivityLog().log({ action: 'delete', userId: auth?.userId, username: auth?.username, appName: name }); } catch {}
+  await tryLogActivity({ action: 'delete', userId: auth?.userId, username: auth?.username, appName: name });
   return c.json(success({ message: `Application '${name}' removed` }));
 });
 
@@ -276,7 +304,7 @@ apps.post('/:name/start', async (c) => {
       pid: status.pid ?? undefined,
     });
 
-    try { await getActivityLog().log({ action: 'start', userId: auth?.userId, username: auth?.username, appName: name }); } catch {}
+    await tryLogActivity({ action: 'start', userId: auth?.userId, username: auth?.username, appName: name });
     return c.json(success({ message: `Application '${name}' started`, status }));
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Failed to start';
@@ -302,7 +330,7 @@ apps.post('/:name/stop', async (c) => {
     await pm.stop(name);
     await stateManager.setAppStatus(name, 'stopped');
 
-    try { await getActivityLog().log({ action: 'stop', userId: auth?.userId, username: auth?.username, appName: name }); } catch {}
+    await tryLogActivity({ action: 'stop', userId: auth?.userId, username: auth?.username, appName: name });
     return c.json(success({ message: `Application '${name}' stopped` }));
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Failed to stop';
@@ -329,7 +357,7 @@ apps.post('/:name/restart', async (c) => {
       pid: status.pid ?? undefined,
     });
 
-    try { await getActivityLog().log({ action: 'restart', userId: auth?.userId, username: auth?.username, appName: name }); } catch {}
+    await tryLogActivity({ action: 'restart', userId: auth?.userId, username: auth?.username, appName: name });
     return c.json(success({ message: `Application '${name}' restarted`, status }));
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Failed to restart';
@@ -360,17 +388,6 @@ apps.put('/:name/domain', async (c) => {
   await stateManager.updateApp(name, { customDomain: domain || ('' as unknown as undefined) });
 
   return c.json(success({ message: domain ? `Domain set to ${domain}` : 'Domain removed', domain }));
-});
-
-// GET /apps/:name/usage - Get user app count and limit
-apps.get('/:name/usage', async (c) => {
-  const auth = (c.get as Function)('auth') as AuthContext | undefined;
-  if (!auth?.userId) return c.json(success({ used: 0, limit: 0 }));
-
-  const stateManager = getStateManager();
-  const used = stateManager.getAllApps().filter((a) => a.userId === auth.userId).length;
-
-  return c.json(success({ used, limit: auth.role === 'admin' ? 0 : getAppLimit(auth.userId) }));
 });
 
 export default apps;

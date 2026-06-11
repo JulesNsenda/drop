@@ -9,6 +9,7 @@ import * as jose from 'jose';
 import * as crypto from 'crypto';
 import * as fs from 'fs/promises';
 import * as path from 'path';
+import { writeJsonAtomic } from '../../utils/atomic-write';
 import { error, ErrorCodes } from '../types';
 
 // Auth configuration
@@ -79,6 +80,10 @@ let config: AuthConfig | null = null;
 let credentials: CredentialsStore | null = null;
 let jwtSecret: Uint8Array | null = null;
 
+// Throttle persistence of the cosmetic apiKey.lastUsed field.
+const LASTUSED_FLUSH_INTERVAL_MS = 60_000;
+let lastUsedFlushAt = 0;
+
 /**
  * Initialize the auth system
  */
@@ -139,7 +144,7 @@ async function loadCredentials(credentialsPath: string): Promise<CredentialsStor
  */
 async function saveCredentials(credentialsPath: string, store: CredentialsStore): Promise<void> {
   await fs.mkdir(path.dirname(credentialsPath), { recursive: true });
-  await fs.writeFile(credentialsPath, JSON.stringify(store, null, 2), { mode: 0o600 });
+  await writeJsonAtomic(credentialsPath, store, { mode: 0o600 });
 }
 
 /**
@@ -167,7 +172,15 @@ function verifyPassword(password: string, storedHash: string): boolean {
   const [salt] = storedHash.split(':');
   const legacyHash = crypto.createHash('sha256').update(password + salt).digest('hex');
   const computedHash = `${salt}:${legacyHash}`;
-  return computedHash === storedHash;
+  const a = Buffer.from(computedHash);
+  const b = Buffer.from(storedHash);
+  // Constant-time compare to avoid leaking the hash via response timing.
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+
+/** Whether a stored hash uses the deprecated SHA-256 format (should be upgraded). */
+function isLegacyPasswordHash(storedHash: string): boolean {
+  return !storedHash.startsWith('scrypt:');
 }
 
 /**
@@ -285,6 +298,11 @@ export async function authenticateUser(username: string, password: string): Prom
     return null;
   }
 
+  // Opportunistically upgrade legacy SHA-256 hashes to scrypt on successful login.
+  if (isLegacyPasswordHash(user.passwordHash)) {
+    user.passwordHash = hashPassword(password).hash;
+  }
+
   // Update last login
   user.lastLogin = new Date().toISOString();
   await saveCredentials(config.credentialsPath, credentials);
@@ -312,7 +330,8 @@ export async function verifyJwt(token: string): Promise<JwtPayload | null> {
   }
 
   try {
-    const { payload } = await jose.jwtVerify(token, jwtSecret);
+    // Pin the algorithm — never accept anything but the HS256 we sign with.
+    const { payload } = await jose.jwtVerify(token, jwtSecret, { algorithms: ['HS256'] });
     return payload as unknown as JwtPayload;
   } catch {
     return null;
@@ -373,9 +392,15 @@ export async function verifyApiKey(key: string): Promise<ApiKey | null> {
     return null;
   }
 
-  // Update last used
+  // Update last used in memory immediately, but persist at most once per
+  // minute — otherwise every authenticated request rewrites the entire
+  // credentials file (lock contention + needless I/O for a cosmetic field).
   apiKey.lastUsed = new Date().toISOString();
-  await saveCredentials(config.credentialsPath, credentials);
+  const now = Date.now();
+  if (now - lastUsedFlushAt >= LASTUSED_FLUSH_INTERVAL_MS) {
+    lastUsedFlushAt = now;
+    await saveCredentials(config.credentialsPath, credentials);
+  }
 
   return apiKey;
 }

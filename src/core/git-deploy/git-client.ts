@@ -48,6 +48,22 @@ export function isValidGitHubUrl(url: string): boolean {
   return /^https:\/\/github\.com\/[\w.-]+\/[\w.-]+$/.test(normalized);
 }
 
+/**
+ * Validate a git branch/ref name before passing it to the git CLI.
+ *
+ * Even with execFile (no shell), git interprets a leading '-' as an option,
+ * so a value like `--upload-pack=...` would be treated as a flag. We require
+ * a conservative charset and forbid leading dashes; callers also pass `--`
+ * before positional args as defense in depth.
+ */
+export function isValidBranchName(branch: string): boolean {
+  if (!branch || branch.length > 255) return false;
+  if (branch.startsWith('-')) return false;
+  if (branch.includes('..') || branch.includes('@{')) return false;
+  if (/[\s~^:?*[\\]/.test(branch)) return false;
+  return /^[A-Za-z0-9._/-]+$/.test(branch);
+}
+
 /** Check if git CLI is available */
 export async function isGitAvailable(): Promise<boolean> {
   try {
@@ -62,6 +78,10 @@ export async function isGitAvailable(): Promise<boolean> {
 export async function gitClone(options: GitCloneOptions): Promise<void> {
   const { url, dest, branch, token, shallow = true } = options;
 
+  if (!isValidBranchName(branch)) {
+    throw new Error(`Invalid branch name: ${branch}`);
+  }
+
   const cloneUrl = token ? injectToken(url, token) : url;
   const args = ['clone'];
 
@@ -69,7 +89,9 @@ export async function gitClone(options: GitCloneOptions): Promise<void> {
     args.push('--depth', '1');
   }
 
-  args.push('--branch', branch, cloneUrl, dest);
+  // `--` separates options from positional args so a crafted branch/url
+  // can't be reinterpreted as a git flag.
+  args.push('--branch', branch, '--', cloneUrl, dest);
 
   try {
     await execFileAsync('git', args, { timeout: 120_000 });
@@ -81,6 +103,9 @@ export async function gitClone(options: GitCloneOptions): Promise<void> {
 
 /** Pull latest changes in a repository */
 export async function gitPull(repoPath: string, branch: string, token?: string): Promise<void> {
+  if (!isValidBranchName(branch)) {
+    throw new Error(`Invalid branch name: ${branch}`);
+  }
   try {
     // If token provided, set the remote URL temporarily
     if (token) {
