@@ -339,22 +339,24 @@ export class CaddyServer {
     this.serverProcess.stderr?.on('data', (data) => {
       const message = data.toString().trim();
       if (message) {
-        this.log(`[Caddy] ${message}`);
+        // Caddy logs operational info (incl. TLS errors) to stderr — surface
+        // at error level, not debug, so they aren't invisible in production.
+        this.logError(`[Caddy] ${message}`);
       }
     });
 
     this.serverProcess.on('error', (error) => {
-      this.log(`Caddy process error: ${error.message}`);
+      this.logError(`Caddy process error: ${error.message}`);
       this.status = 'error';
     });
 
     this.serverProcess.on('exit', (code, signal) => {
       if (this.status !== 'stopping' && this.status !== 'stopped') {
         if (code !== 0 && code !== null) {
-          this.log(`Caddy exited with code ${code}`);
+          this.logError(`Caddy exited unexpectedly with code ${code}`);
           this.status = 'error';
         } else if (signal) {
-          this.log(`Caddy terminated by signal ${signal}`);
+          this.logError(`Caddy terminated by signal ${signal}`);
           this.status = 'stopped';
         }
       }
@@ -442,6 +444,14 @@ import ${path.join(this.config.dropRoot, 'data', 'appconf', 'caddy', 'hosts', '*
 
   private log(message: string): void {
     this.config.onLog?.(message);
+  }
+
+  private logError(message: string): void {
+    if (this.config.onError) {
+      this.config.onError(message);
+    } else {
+      this.config.onLog?.(message);
+    }
   }
 
   private sleep(ms: number): Promise<void> {

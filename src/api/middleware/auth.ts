@@ -80,6 +80,10 @@ let config: AuthConfig | null = null;
 let credentials: CredentialsStore | null = null;
 let jwtSecret: Uint8Array | null = null;
 
+// Throttle persistence of the cosmetic apiKey.lastUsed field.
+const LASTUSED_FLUSH_INTERVAL_MS = 60_000;
+let lastUsedFlushAt = 0;
+
 /**
  * Initialize the auth system
  */
@@ -388,9 +392,15 @@ export async function verifyApiKey(key: string): Promise<ApiKey | null> {
     return null;
   }
 
-  // Update last used
+  // Update last used in memory immediately, but persist at most once per
+  // minute — otherwise every authenticated request rewrites the entire
+  // credentials file (lock contention + needless I/O for a cosmetic field).
   apiKey.lastUsed = new Date().toISOString();
-  await saveCredentials(config.credentialsPath, credentials);
+  const now = Date.now();
+  if (now - lastUsedFlushAt >= LASTUSED_FLUSH_INTERVAL_MS) {
+    lastUsedFlushAt = now;
+    await saveCredentials(config.credentialsPath, credentials);
+  }
 
   return apiKey;
 }

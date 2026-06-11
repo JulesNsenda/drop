@@ -108,6 +108,18 @@ export class AppConfigService {
    * Clean up config files for apps that no longer exist
    */
   private async cleanupStaleConfigs(): Promise<void> {
+    // Guard: if the webapps root itself is unreachable (e.g. a network mount
+    // that's briefly down at startup), do NOT treat every app as stale and
+    // delete all their configs — including their canonical port assignments.
+    try {
+      await fs.access(this.webappsDir);
+    } catch {
+      console.warn(
+        `[app-config] webapps directory ${this.webappsDir} is not accessible; skipping stale-config cleanup`
+      );
+      return;
+    }
+
     const staleApps: string[] = [];
 
     for (const [appName, _config] of this.configs) {

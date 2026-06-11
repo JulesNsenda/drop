@@ -562,13 +562,13 @@ export class ProcessManager {
       await this.sleep(pollInterval);
     }
 
-    // Return last known status on timeout
+    // Timed out. Returning the last (wrong) status would let callers treat an
+    // app that never started as if it had — always throw instead.
     const finalStatus = await this.getStatus(name);
-    if (finalStatus) {
-      return finalStatus;
-    }
-
-    throw new Error(`Timeout waiting for process ${name} to reach status ${targetStatus}`);
+    throw new Error(
+      `Timeout waiting for process ${name} to reach status ${targetStatus}` +
+        (finalStatus ? ` (last status: ${finalStatus.status})` : '')
+    );
   }
 
   private sleep(ms: number): Promise<void> {
