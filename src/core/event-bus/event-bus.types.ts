@@ -158,6 +158,8 @@ export interface BuildCompletedPayload extends BaseEvent {
   appId: string;
   buildId: string;
   durationMs: number;
+  /** Whether the build succeeded. Subscribers must not start the app when false. */
+  success: boolean;
 }
 
 export interface BuildFailedPayload extends BaseEvent {

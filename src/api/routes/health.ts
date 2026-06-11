@@ -9,11 +9,14 @@ import { Hono } from 'hono';
 import { success, HealthDto, StatsDto } from '../types';
 import { getProcessManager } from '../../managers/process';
 import { getStateManager, AppStateManager } from '../../managers/app/state-manager';
+import { getPlatformVersion } from '../../utils/version';
 
 const health = new Hono();
 
 // Track startup time
 const startTime = Date.now();
+
+const platformVersion = getPlatformVersion();
 
 /** Quick HTTP ping to check if an app is responding */
 function httpPing(port: number, timeoutMs = 3000): Promise<boolean> {
@@ -74,7 +77,7 @@ health.get('/', async (c) => {
 
   const response: HealthDto = {
     status: overallStatus,
-    version: process.env.npm_package_version || '0.4.0',
+    version: platformVersion,
     uptime: Math.floor((Date.now() - startTime) / 1000),
     timestamp: new Date().toISOString(),
     components: {

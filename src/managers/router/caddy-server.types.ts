@@ -18,6 +18,8 @@ export interface CaddyServerConfig {
   caddyfilePath: string;
   /** Callback for log messages */
   onLog?: (message: string) => void;
+  /** Callback for errors (stderr, unexpected exit). Routed at warn/error level. */
+  onError?: (message: string) => void;
 }
 
 /**

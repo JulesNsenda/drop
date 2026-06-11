@@ -6,6 +6,7 @@
 
 import * as fs from 'fs/promises';
 import * as path from 'path';
+import { writeJsonAtomic } from '../../utils/atomic-write';
 
 export interface ActivityEntry {
   id: string;
@@ -69,7 +70,20 @@ export class ActivityLog {
 
   private async save(): Promise<void> {
     await fs.mkdir(path.dirname(this.storePath), { recursive: true });
-    await fs.writeFile(this.storePath, JSON.stringify(this.store, null, 2));
+    await writeJsonAtomic(this.storePath, this.store);
+  }
+}
+
+/**
+ * Best-effort activity logging. Activity records must never fail the
+ * request that triggered them, so failures are reported at debug level
+ * and swallowed.
+ */
+export async function tryLogActivity(entry: Omit<ActivityEntry, 'id' | 'timestamp'>): Promise<void> {
+  try {
+    await getActivityLog().log(entry);
+  } catch (err) {
+    console.debug('[activity-log] failed to record activity:', err instanceof Error ? err.message : err);
   }
 }
 

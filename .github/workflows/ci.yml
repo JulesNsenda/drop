@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install server dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Build server
+        run: npm run build:server
+
+      - name: Test
+        run: npm test
+
+      - name: Install dashboard dependencies
+        working-directory: src/dashboard
+        run: npm ci
+
+      - name: Build dashboard
+        working-directory: src/dashboard
+        run: npm run build

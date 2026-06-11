@@ -25,6 +25,24 @@ export function securityHeadersMiddleware() {
     // Permissions policy - restrict browser features
     c.header('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
 
+    // Content Security Policy. The dashboard is a same-origin Vite SPA with no
+    // inline scripts; 'unsafe-inline' is needed only for runtime-injected
+    // styles. Limits the blast radius of any future XSS.
+    c.header(
+      'Content-Security-Policy',
+      [
+        "default-src 'self'",
+        "script-src 'self'",
+        "style-src 'self' 'unsafe-inline'",
+        "img-src 'self' data:",
+        "font-src 'self' data:",
+        "connect-src 'self'",
+        "frame-ancestors 'none'",
+        "base-uri 'self'",
+        "form-action 'self'",
+      ].join('; ')
+    );
+
     // Remove server identification
     c.header('X-Powered-By', '');
   };

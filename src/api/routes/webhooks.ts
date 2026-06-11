@@ -8,6 +8,10 @@ import { Hono } from 'hono';
 import { success, error, ErrorCodes } from '../types';
 import { getWebhookManager, WebhookEvent } from '../../core/webhooks';
 import { ValidationError } from '../middleware/error';
+import { isSafeOutboundUrl } from '../../utils/url-safety';
+
+const UNSAFE_URL_MESSAGE =
+  'url must be a public http(s) URL (localhost, private, and link-local addresses are not allowed)';
 
 const VALID_EVENTS: WebhookEvent[] = [
   'app:created', 'app:started', 'app:stopped', 'app:errored', 'app:removed',
@@ -64,10 +68,8 @@ webhooks.post('/', async (c) => {
     throw new ValidationError('url is required');
   }
 
-  try {
-    new URL(body.url);
-  } catch {
-    throw new ValidationError('url must be a valid URL');
+  if (!isSafeOutboundUrl(body.url)) {
+    throw new ValidationError(UNSAFE_URL_MESSAGE);
   }
 
   if (!Array.isArray(body.events) || body.events.length === 0) {
@@ -108,12 +110,8 @@ webhooks.put('/:id', async (c) => {
     active: boolean;
   }>>();
 
-  if (body.url) {
-    try {
-      new URL(body.url);
-    } catch {
-      throw new ValidationError('url must be a valid URL');
-    }
+  if (body.url && !isSafeOutboundUrl(body.url)) {
+    throw new ValidationError(UNSAFE_URL_MESSAGE);
   }
 
   if (body.events) {

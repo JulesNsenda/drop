@@ -10,12 +10,14 @@ import { logger } from 'hono/logger';
 import { serve } from '@hono/node-server';
 import * as path from 'path';
 import * as fs from 'fs';
+import * as fsp from 'fs/promises';
 import { errorHandler, HttpError } from './middleware/error';
 import { initializeAuth, authMiddleware, isAuthEnabled } from './middleware/auth';
 import { rateLimitMiddleware, authRateLimitMiddleware } from './middleware/rate-limit';
 import { securityHeadersMiddleware } from './middleware/security-headers';
 import { auditMiddleware, initializeAuditLog, closeAuditLog } from './middleware/audit';
 import { validateBodySize } from './middleware/validate';
+import { setApiRuntimeConfig } from './runtime-config';
 import { error, ErrorCodes } from './types';
 import healthRoutes from './routes/health';
 import appsRoutes from './routes/apps';
@@ -26,6 +28,7 @@ import secretsRoutes from './routes/secrets';
 import webhooksRoutes from './routes/webhooks';
 import gitDeployRoutes from './routes/git-deploy';
 import adminRoutes from './routes/admin';
+import usageRoutes from './routes/usage';
 
 export interface ApiServerConfig {
   port: number;
@@ -33,10 +36,12 @@ export interface ApiServerConfig {
   corsOrigins?: string[];
   /** Path to store auth credentials */
   credentialsPath?: string;
-  /** Enable authentication (default: true in production) */
+  /** Enable authentication (default: true unless DROP_DISABLE_AUTH=true) */
   enableAuth?: boolean;
   /** Directory for log files (audit logs) */
   logDir?: string;
+  /** Webapps directory — used to contain user-supplied deploy paths */
+  appsDirectory?: string;
 }
 
 export class ApiServer {
@@ -47,10 +52,20 @@ export class ApiServer {
   constructor(config: ApiServerConfig) {
     this.config = {
       host: '0.0.0.0',
-      corsOrigins: ['*'],
-      enableAuth: process.env.NODE_ENV === 'production',
+      // Auth is on by default (fail-safe). Disable explicitly with
+      // DROP_DISABLE_AUTH=true. Callers (the platform) pass enableAuth
+      // explicitly; this default only governs direct/test construction.
+      enableAuth: process.env.DROP_DISABLE_AUTH !== 'true',
       ...config,
     };
+    // Default CORS to same-origin only unless explicitly configured. A
+    // multi-tenant API must not reflect arbitrary origins by default.
+    if (!this.config.corsOrigins) {
+      const fromEnv = process.env.DROP_CORS_ORIGINS?.split(',').map((o) => o.trim()).filter(Boolean);
+      this.config.corsOrigins = fromEnv && fromEnv.length > 0 ? fromEnv : [];
+    }
+
+    setApiRuntimeConfig({ appsDirectory: this.config.appsDirectory });
 
     this.app = new Hono();
   }
@@ -112,14 +127,16 @@ export class ApiServer {
     // Public routes (no auth required)
     v1.route('/health', healthRoutes);
 
-    // Auth routes with stricter rate limiting
+    // Auth routes with stricter rate limiting (brute-force / signup-flood)
     v1.use('/auth/login', authRateLimitMiddleware());
+    v1.use('/auth/signup', authRateLimitMiddleware());
     v1.route('/auth', authRoutes);
 
     // Apply auth middleware to protected routes when auth is enabled
     if (this.config.enableAuth && isAuthEnabled()) {
       v1.use('/apps/*', authMiddleware('readonly'));
       v1.use('/apps', authMiddleware('readonly'));
+      v1.use('/usage', authMiddleware('readonly'));
       v1.use('/logs/*', authMiddleware('readonly'));
       v1.use('/certs/*', authMiddleware('readonly'));
       v1.use('/secrets/*', authMiddleware('admin'));
@@ -133,6 +150,7 @@ export class ApiServer {
 
     // Mount all routes (auth middleware applied above when enabled)
     v1.route('/apps', appsRoutes);
+    v1.route('/usage', usageRoutes);
     v1.route('/logs', logsRoutes);
     v1.route('/certs', certsRoutes);
     v1.route('/secrets', secretsRoutes);
@@ -157,49 +175,70 @@ export class ApiServer {
     console.log('[Dashboard] Index exists:', dashboardExists);
 
     if (dashboardExists) {
-      // Serve static assets (CSS, JS, images)
+      const MIME_TYPES: Record<string, string> = {
+        '.js': 'application/javascript',
+        '.mjs': 'application/javascript',
+        '.css': 'text/css',
+        '.svg': 'image/svg+xml',
+        '.png': 'image/png',
+        '.jpg': 'image/jpeg',
+        '.jpeg': 'image/jpeg',
+        '.ico': 'image/x-icon',
+        '.json': 'application/json',
+        '.map': 'application/json',
+        '.woff': 'font/woff',
+        '.woff2': 'font/woff2',
+        '.ttf': 'font/ttf',
+      };
+
+      const readIndexHtml = (): Promise<string> => fsp.readFile(dashboardIndexPath, 'utf-8');
+
+      // Serve static assets. Vite emits content-hashed filenames under
+      // /assets, so they can be cached immutably.
       this.app.get('/dashboard/assets/*', async (c) => {
         const assetPath = c.req.path.replace('/dashboard/', '');
         const filePath = path.join(dashboardPath, assetPath);
-
-        if (fs.existsSync(filePath)) {
-          const content = fs.readFileSync(filePath);
-          const ext = path.extname(filePath);
-          const mimeTypes: Record<string, string> = {
-            '.js': 'application/javascript',
-            '.css': 'text/css',
-            '.svg': 'image/svg+xml',
-            '.png': 'image/png',
-            '.jpg': 'image/jpeg',
-            '.ico': 'image/x-icon',
-          };
-          const contentType = mimeTypes[ext] || 'application/octet-stream';
-          return c.body(content, 200, { 'Content-Type': contentType });
+        // Containment: never serve outside the dashboard directory.
+        if (!path.resolve(filePath).startsWith(path.resolve(dashboardPath))) {
+          return c.notFound();
         }
-        return c.notFound();
+        try {
+          const content = await fsp.readFile(filePath);
+          const contentType = MIME_TYPES[path.extname(filePath)] || 'application/octet-stream';
+          return c.body(content, 200, {
+            'Content-Type': contentType,
+            'Cache-Control': 'public, max-age=31536000, immutable',
+          });
+        } catch {
+          return c.notFound();
+        }
       });
 
       // Serve favicon
-      this.app.get('/dashboard/drop.svg', (c) => {
-        const filePath = path.join(dashboardPath, 'drop.svg');
-        if (fs.existsSync(filePath)) {
-          const content = fs.readFileSync(filePath);
-          return c.body(content, 200, { 'Content-Type': 'image/svg+xml' });
+      this.app.get('/dashboard/drop.svg', async (c) => {
+        try {
+          const content = await fsp.readFile(path.join(dashboardPath, 'drop.svg'));
+          return c.body(content, 200, {
+            'Content-Type': 'image/svg+xml',
+            'Cache-Control': 'public, max-age=86400',
+          });
+        } catch {
+          return c.notFound();
         }
-        return c.notFound();
       });
 
-      // SPA fallback - serve index.html for all dashboard routes
-      this.app.get('/dashboard', (c) => {
-        const html = fs.readFileSync(dashboardIndexPath, 'utf-8');
+      // SPA fallback — index.html must never be cached, or clients get a stale
+      // shell pointing at old asset hashes after a deploy.
+      const serveIndex = async (c: import('hono').Context) => {
+        const html = await readIndexHtml();
+        c.header('Cache-Control', 'no-cache');
         return c.html(html);
-      });
+      };
 
-      this.app.get('/dashboard/*', (c) => {
-        // Check if it's not an asset request
+      this.app.get('/dashboard', serveIndex);
+      this.app.get('/dashboard/*', async (c) => {
         if (!c.req.path.includes('/assets/') && !c.req.path.endsWith('.svg')) {
-          const html = fs.readFileSync(dashboardIndexPath, 'utf-8');
-          return c.html(html);
+          return serveIndex(c);
         }
         return c.notFound();
       });
