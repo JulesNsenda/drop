@@ -167,7 +167,15 @@ function verifyPassword(password: string, storedHash: string): boolean {
   const [salt] = storedHash.split(':');
   const legacyHash = crypto.createHash('sha256').update(password + salt).digest('hex');
   const computedHash = `${salt}:${legacyHash}`;
-  return computedHash === storedHash;
+  const a = Buffer.from(computedHash);
+  const b = Buffer.from(storedHash);
+  // Constant-time compare to avoid leaking the hash via response timing.
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+
+/** Whether a stored hash uses the deprecated SHA-256 format (should be upgraded). */
+function isLegacyPasswordHash(storedHash: string): boolean {
+  return !storedHash.startsWith('scrypt:');
 }
 
 /**
@@ -285,6 +293,11 @@ export async function authenticateUser(username: string, password: string): Prom
     return null;
   }
 
+  // Opportunistically upgrade legacy SHA-256 hashes to scrypt on successful login.
+  if (isLegacyPasswordHash(user.passwordHash)) {
+    user.passwordHash = hashPassword(password).hash;
+  }
+
   // Update last login
   user.lastLogin = new Date().toISOString();
   await saveCredentials(config.credentialsPath, credentials);
@@ -312,7 +325,8 @@ export async function verifyJwt(token: string): Promise<JwtPayload | null> {
   }
 
   try {
-    const { payload } = await jose.jwtVerify(token, jwtSecret);
+    // Pin the algorithm — never accept anything but the HS256 we sign with.
+    const { payload } = await jose.jwtVerify(token, jwtSecret, { algorithms: ['HS256'] });
     return payload as unknown as JwtPayload;
   } catch {
     return null;

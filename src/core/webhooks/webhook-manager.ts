@@ -225,7 +225,8 @@ export class WebhookManager {
       version: 1,
       webhooks: Array.from(this.webhooks.values()),
     };
-    await fs.writeFile(this.config.storePath, JSON.stringify(data, null, 2));
+    // 0600 — webhook secrets are stored here in plaintext.
+    await fs.writeFile(this.config.storePath, JSON.stringify(data, null, 2), { mode: 0o600 });
   }
 }
 

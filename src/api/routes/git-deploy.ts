@@ -17,6 +17,23 @@ import type { GitDeployRequest, GitTokenCreateRequest } from '../../core/git-dep
 
 const gitDeploy = new Hono();
 
+/** Minimal shape of the GitHub push payload we consume. */
+interface GitHubPushPayload {
+  ref?: string;
+  repository?: { html_url?: string; url?: string };
+}
+
+// Warn at most once per process when webhooks arrive without a configured secret.
+let webhookSecretWarned = false;
+function warnWebhookSecretMissing(): void {
+  if (webhookSecretWarned) return;
+  webhookSecretWarned = true;
+  console.warn(
+    '[git-webhook] DROP_GITHUB_WEBHOOK_SECRET is not set — webhook redeploys are NOT authenticated. ' +
+      'Set it to verify GitHub signatures. This will become a hard requirement in v1.0.'
+  );
+}
+
 // POST /git/deploy - Deploy from a GitHub repo
 gitDeploy.post('/deploy', async (c) => {
   const body = await c.req.json<GitDeployRequest>();
@@ -108,15 +125,34 @@ gitDeploy.post('/webhook', async (c) => {
   }
 
   const rawBody = await c.req.text();
-  const body = JSON.parse(rawBody);
 
-  // Verify signature if webhook secret is configured
+  // This endpoint is intentionally unauthenticated — the HMAC signature is
+  // its only authentication. Verify it before doing any work.
   const webhookSecret = process.env.DROP_GITHUB_WEBHOOK_SECRET;
-  if (webhookSecret && signature) {
+  if (webhookSecret) {
+    if (!signature) {
+      // Closing the bypass where omitting the header skipped verification.
+      return c.json(error(ErrorCodes.UNAUTHORIZED, 'Missing webhook signature'), 401);
+    }
     const expected = 'sha256=' + crypto.createHmac('sha256', webhookSecret).update(rawBody).digest('hex');
-    if (!crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expected))) {
+    const sigBuf = Buffer.from(signature);
+    const expBuf = Buffer.from(expected);
+    // timingSafeEqual throws on unequal lengths — guard first.
+    if (sigBuf.length !== expBuf.length || !crypto.timingSafeEqual(sigBuf, expBuf)) {
       return c.json(error(ErrorCodes.UNAUTHORIZED, 'Invalid webhook signature'), 401);
     }
+  } else {
+    // Warn-then-enforce: until v1.0 final this is accepted so existing
+    // auto-redeploy setups keep working, but it is logged loudly. Set
+    // DROP_GITHUB_WEBHOOK_SECRET to authenticate webhooks.
+    warnWebhookSecretMissing();
+  }
+
+  let body: GitHubPushPayload;
+  try {
+    body = JSON.parse(rawBody);
+  } catch {
+    return c.json(error(ErrorCodes.BAD_REQUEST, 'Invalid JSON payload'), 400);
   }
 
   // Extract repo URL and branch from push payload

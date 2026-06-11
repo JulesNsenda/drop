@@ -16,6 +16,7 @@ import { rateLimitMiddleware, authRateLimitMiddleware } from './middleware/rate-
 import { securityHeadersMiddleware } from './middleware/security-headers';
 import { auditMiddleware, initializeAuditLog, closeAuditLog } from './middleware/audit';
 import { validateBodySize } from './middleware/validate';
+import { setApiRuntimeConfig } from './runtime-config';
 import { error, ErrorCodes } from './types';
 import healthRoutes from './routes/health';
 import appsRoutes from './routes/apps';
@@ -33,10 +34,12 @@ export interface ApiServerConfig {
   corsOrigins?: string[];
   /** Path to store auth credentials */
   credentialsPath?: string;
-  /** Enable authentication (default: true in production) */
+  /** Enable authentication (default: true unless DROP_DISABLE_AUTH=true) */
   enableAuth?: boolean;
   /** Directory for log files (audit logs) */
   logDir?: string;
+  /** Webapps directory — used to contain user-supplied deploy paths */
+  appsDirectory?: string;
 }
 
 export class ApiServer {
@@ -47,10 +50,20 @@ export class ApiServer {
   constructor(config: ApiServerConfig) {
     this.config = {
       host: '0.0.0.0',
-      corsOrigins: ['*'],
-      enableAuth: process.env.NODE_ENV === 'production',
+      // Auth is on by default (fail-safe). Disable explicitly with
+      // DROP_DISABLE_AUTH=true. Callers (the platform) pass enableAuth
+      // explicitly; this default only governs direct/test construction.
+      enableAuth: process.env.DROP_DISABLE_AUTH !== 'true',
       ...config,
     };
+    // Default CORS to same-origin only unless explicitly configured. A
+    // multi-tenant API must not reflect arbitrary origins by default.
+    if (!this.config.corsOrigins) {
+      const fromEnv = process.env.DROP_CORS_ORIGINS?.split(',').map((o) => o.trim()).filter(Boolean);
+      this.config.corsOrigins = fromEnv && fromEnv.length > 0 ? fromEnv : [];
+    }
+
+    setApiRuntimeConfig({ appsDirectory: this.config.appsDirectory });
 
     this.app = new Hono();
   }
@@ -112,8 +125,9 @@ export class ApiServer {
     // Public routes (no auth required)
     v1.route('/health', healthRoutes);
 
-    // Auth routes with stricter rate limiting
+    // Auth routes with stricter rate limiting (brute-force / signup-flood)
     v1.use('/auth/login', authRateLimitMiddleware());
+    v1.use('/auth/signup', authRateLimitMiddleware());
     v1.route('/auth', authRoutes);
 
     // Apply auth middleware to protected routes when auth is enabled

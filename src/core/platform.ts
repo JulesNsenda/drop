@@ -548,6 +548,10 @@ import ${path.join(dataDir, 'appconf', 'caddy', 'hosts', '*.caddy').replace(/\\/
     this.secretManager = getSecretManager({
       storePath: secretStorePath,
       masterKey: process.env.DROP_MASTER_KEY,
+      // Fall back to the auto-generated encryption.key (0600, separate from
+      // secrets.json) so secrets aren't encrypted with a key derived from
+      // their own store file.
+      masterKeyPath: path.join(this.config.dropRoot, 'data', 'drop-svc', 'encryption.key'),
     });
     await this.secretManager.initialize();
     this.logger.info('Secret manager initialized', 'SECURITY');
@@ -642,6 +646,7 @@ import ${path.join(dataDir, 'appconf', 'caddy', 'hosts', '*.caddy').replace(/\\/
       credentialsPath,
       enableAuth: this.config.enableApiAuth,
       logDir,
+      appsDirectory: this.config.appsDirectory,
     });
 
     await this.apiServer.initialize();

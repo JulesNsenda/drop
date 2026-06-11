@@ -6,6 +6,7 @@ import {
   normalizeRepoUrl,
   extractRepoName,
   isValidGitHubUrl,
+  isValidBranchName,
 } from './git-client';
 
 describe('Git Client', () => {
@@ -83,6 +84,34 @@ describe('Git Client', () => {
 
     it('should reject URLs with extra path segments', () => {
       expect(isValidGitHubUrl('https://github.com/user/repo/tree/main')).toBe(false);
+    });
+  });
+
+  describe('isValidBranchName', () => {
+    it('should accept normal branch names', () => {
+      expect(isValidBranchName('main')).toBe(true);
+      expect(isValidBranchName('feature/DROP-123-thing')).toBe(true);
+      expect(isValidBranchName('release-1.0.0')).toBe(true);
+      expect(isValidBranchName('v2')).toBe(true);
+    });
+
+    it('should reject names starting with a dash (git option injection)', () => {
+      expect(isValidBranchName('--upload-pack=/bin/sh')).toBe(false);
+      expect(isValidBranchName('-x')).toBe(false);
+    });
+
+    it('should reject shell/whitespace/refspec metacharacters', () => {
+      expect(isValidBranchName('main; rm -rf /')).toBe(false);
+      expect(isValidBranchName('a b')).toBe(false);
+      expect(isValidBranchName('feat~1')).toBe(false);
+      expect(isValidBranchName('a..b')).toBe(false);
+      expect(isValidBranchName('ref@{0}')).toBe(false);
+      expect(isValidBranchName('a:b')).toBe(false);
+    });
+
+    it('should reject empty or overly long names', () => {
+      expect(isValidBranchName('')).toBe(false);
+      expect(isValidBranchName('a'.repeat(256))).toBe(false);
     });
   });
 });
