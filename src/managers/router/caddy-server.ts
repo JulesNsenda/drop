@@ -13,6 +13,7 @@ import {
   CaddyServerStatus,
   CaddyVersionInfo,
 } from './caddy-server.types';
+import { CaddyAdminClient, CertificateInfo } from './caddy-api';
 
 const DEFAULT_PORT = 80;
 const DEFAULT_ADMIN_PORT = 2019;
@@ -257,6 +258,61 @@ export class CaddyServer {
     }
   }
 
+  // ============ Certificate Methods ============
+
+  /**
+   * Get a CaddyAdminClient for certificate operations
+   */
+  getAdminClient(): CaddyAdminClient {
+    return new CaddyAdminClient(this.getAdminUrl());
+  }
+
+  /**
+   * Get all managed certificates
+   */
+  async getCertificates(): Promise<CertificateInfo[]> {
+    const client = this.getAdminClient();
+    return client.getCertificates();
+  }
+
+  /**
+   * Get certificate for a specific domain
+   */
+  async getCertificateForDomain(domain: string): Promise<CertificateInfo | null> {
+    const client = this.getAdminClient();
+    return client.getCertificateForDomain(domain);
+  }
+
+  /**
+   * Get certificates expiring within the specified number of days
+   */
+  async getExpiringCertificates(days: number = 7): Promise<CertificateInfo[]> {
+    const client = this.getAdminClient();
+    return client.getExpiringCertificates(days);
+  }
+
+  /**
+   * Get certificate health summary
+   */
+  async getCertificateHealth(): Promise<{
+    total: number;
+    valid: number;
+    expiring: number;
+    expired: number;
+    healthy: boolean;
+  }> {
+    const certs = await this.getCertificates();
+    const summary = {
+      total: certs.length,
+      valid: certs.filter(c => c.status === 'valid').length,
+      expiring: certs.filter(c => c.status === 'expiring').length,
+      expired: certs.filter(c => c.status === 'expired').length,
+      healthy: true,
+    };
+    summary.healthy = summary.expired === 0;
+    return summary;
+  }
+
   // ============ Private Methods ============
 
   private async startServer(): Promise<void> {
@@ -283,22 +339,24 @@ export class CaddyServer {
     this.serverProcess.stderr?.on('data', (data) => {
       const message = data.toString().trim();
       if (message) {
-        this.log(`[Caddy] ${message}`);
+        // Caddy logs operational info (incl. TLS errors) to stderr — surface
+        // at error level, not debug, so they aren't invisible in production.
+        this.logError(`[Caddy] ${message}`);
       }
     });
 
     this.serverProcess.on('error', (error) => {
-      this.log(`Caddy process error: ${error.message}`);
+      this.logError(`Caddy process error: ${error.message}`);
       this.status = 'error';
     });
 
     this.serverProcess.on('exit', (code, signal) => {
       if (this.status !== 'stopping' && this.status !== 'stopped') {
         if (code !== 0 && code !== null) {
-          this.log(`Caddy exited with code ${code}`);
+          this.logError(`Caddy exited unexpectedly with code ${code}`);
           this.status = 'error';
         } else if (signal) {
-          this.log(`Caddy terminated by signal ${signal}`);
+          this.logError(`Caddy terminated by signal ${signal}`);
           this.status = 'stopped';
         }
       }
@@ -386,6 +444,14 @@ import ${path.join(this.config.dropRoot, 'data', 'appconf', 'caddy', 'hosts', '*
 
   private log(message: string): void {
     this.config.onLog?.(message);
+  }
+
+  private logError(message: string): void {
+    if (this.config.onError) {
+      this.config.onError(message);
+    } else {
+      this.config.onLog?.(message);
+    }
   }
 
   private sleep(ms: number): Promise<void> {

@@ -5,8 +5,10 @@
  */
 
 import { Hono } from 'hono';
-import { success, error, ErrorCodes, AppLogsDto } from '../types';
+import { success, AppLogsDto } from '../types';
 import { NotFoundError } from '../middleware/error';
+import { AuthContext } from '../middleware/auth';
+import { canAccess } from '../access';
 import { getProcessManager } from '../../managers/process';
 import { getStateManager } from '../../managers/app/state-manager';
 
@@ -14,11 +16,12 @@ const logs = new Hono();
 
 // GET /logs/:name - Get application logs
 logs.get('/:name', async (c) => {
+  const auth = (c.get as Function)('auth') as AuthContext | undefined;
   const name = c.req.param('name');
   const stateManager = getStateManager();
   const app = stateManager.getApp(name);
 
-  if (!app) {
+  if (!app || !canAccess(auth, app)) {
     throw new NotFoundError(`Application '${name}' not found`);
   }
 
@@ -27,30 +30,31 @@ logs.get('/:name', async (c) => {
 
   const pm = getProcessManager();
 
+  let logLines: string[] = [];
   try {
     const logContent = await pm.getLogs(name, lines);
-    const logLines = logContent ? logContent.split('\n').filter(Boolean) : [];
-
-    const response: AppLogsDto = {
-      name,
-      logs: logLines,
-      type,
-    };
-
-    return c.json(success(response));
-  } catch (err) {
-    const message = err instanceof Error ? err.message : 'Failed to retrieve logs';
-    return c.json(error(ErrorCodes.INTERNAL_ERROR, message), 500);
+    logLines = logContent ? logContent.split('\n').filter(Boolean) : [];
+  } catch {
+    // No logs available yet — return empty
   }
+
+  const response: AppLogsDto = {
+    name,
+    logs: logLines,
+    type,
+  };
+
+  return c.json(success(response));
 });
 
 // GET /logs/:name/stream - Stream logs (SSE)
 logs.get('/:name/stream', async (c) => {
+  const auth = (c.get as Function)('auth') as AuthContext | undefined;
   const name = c.req.param('name');
   const stateManager = getStateManager();
   const app = stateManager.getApp(name);
 
-  if (!app) {
+  if (!app || !canAccess(auth, app)) {
     throw new NotFoundError(`Application '${name}' not found`);
   }
 

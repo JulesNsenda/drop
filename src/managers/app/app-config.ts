@@ -8,10 +8,11 @@
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import * as yaml from 'yaml';
+import { writeFileAtomic } from '../../utils/atomic-write';
 
 export interface AppConfig {
   name: string;
-  type: 'nodejs' | 'python' | 'static' | 'docker' | 'unknown';
+  type: 'nodejs' | 'python' | 'go' | 'static' | 'docker' | 'unknown';
   port?: number;
   framework?: string;
   hostname?: string;
@@ -22,6 +23,14 @@ export interface AppConfig {
   env?: Record<string, string>;
   /** Persistent data directory path - survives app upgrades */
   dataDir?: string;
+  /** Custom domains for this app (from drop.yaml) */
+  domains?: string[];
+  /** Custom TLS configuration */
+  tls?: {
+    certFile?: string;
+    keyFile?: string;
+    disabled?: boolean;
+  };
 }
 
 export interface AppConfigServiceOptions {
@@ -99,6 +108,18 @@ export class AppConfigService {
    * Clean up config files for apps that no longer exist
    */
   private async cleanupStaleConfigs(): Promise<void> {
+    // Guard: if the webapps root itself is unreachable (e.g. a network mount
+    // that's briefly down at startup), do NOT treat every app as stale and
+    // delete all their configs — including their canonical port assignments.
+    try {
+      await fs.access(this.webappsDir);
+    } catch {
+      console.warn(
+        `[app-config] webapps directory ${this.webappsDir} is not accessible; skipping stale-config cleanup`
+      );
+      return;
+    }
+
     const staleApps: string[] = [];
 
     for (const [appName, _config] of this.configs) {
@@ -130,7 +151,7 @@ export class AppConfigService {
   async saveConfig(config: AppConfig): Promise<void> {
     const configPath = this.getConfigPath(config.name);
     const content = yaml.stringify(config, { indent: 2 });
-    await fs.writeFile(configPath, content, 'utf-8');
+    await writeFileAtomic(configPath, content);
     this.configs.set(config.name, config);
   }
 

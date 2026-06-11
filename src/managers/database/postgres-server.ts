@@ -7,8 +7,13 @@
 import { spawn, ChildProcess, execSync } from 'child_process';
 import * as fs from 'fs/promises';
 import * as path from 'path';
-import { Pool } from 'pg';
+import { Pool, PoolConfig } from 'pg';
 import { PostgresBinaries, BinaryPaths } from './postgres-binaries';
+import {
+  resolveSuperuserPassword,
+  hbaNeedsMigration,
+  toScramHbaConf,
+} from './superuser-auth';
 
 export interface PostgresServerConfig {
   /** Base directory for DROP */
@@ -33,11 +38,31 @@ export class PostgresServer {
   private serverProcess: ChildProcess | null = null;
   private status: ServerStatus = 'stopped';
   private pool: Pool | null = null;
+  private superuserPassword: string | null = null;
 
   constructor(config: PostgresServerConfig) {
     this.config = config;
     this.port = config.port || DEFAULT_PORT;
     this.binaries = new PostgresBinaries({ dropRoot: config.dropRoot });
+  }
+
+  /** The bundled superuser password (resolved on start). Throws if not started. */
+  getSuperuserPassword(): string {
+    if (!this.superuserPassword) {
+      throw new Error('PostgreSQL superuser password not resolved (server not started)');
+    }
+    return this.superuserPassword;
+  }
+
+  /** Pool config for a superuser connection to the given database. */
+  getSuperuserPoolConfig(database = 'postgres'): PoolConfig {
+    return {
+      host: 'localhost',
+      port: this.port,
+      user: 'postgres',
+      password: this.getSuperuserPassword(),
+      database,
+    };
   }
 
   /**
@@ -58,7 +83,8 @@ export class PostgresServer {
    * Get connection string for the internal database
    */
   getConnectionString(database = 'postgres'): string {
-    return `postgresql://postgres@localhost:${this.port}/${database}`;
+    const pw = this.superuserPassword ? `:${encodeURIComponent(this.superuserPassword)}` : '';
+    return `postgresql://postgres${pw}@localhost:${this.port}/${database}`;
   }
 
   /**
@@ -101,11 +127,15 @@ export class PostgresServer {
     this.status = 'starting';
     this.log('Starting PostgreSQL server...');
 
+    // Resolve the superuser password before any connection so every pool uses it.
+    this.superuserPassword = await resolveSuperuserPassword(this.config.dropRoot);
+
     // Check if PostgreSQL is already running (from previous session)
     if (await this.isServerRunning()) {
       this.log('PostgreSQL is already running');
       this.status = 'running';
       await this.initializePool();
+      await this.secureSuperuser();
       return;
     }
 
@@ -117,11 +147,45 @@ export class PostgresServer {
       await this.startServer();
       await this.waitForStartup();
       await this.initializePool();
+      await this.secureSuperuser();
       this.status = 'running';
       this.log(`PostgreSQL started on port ${this.port}`);
     } catch (error) {
       this.status = 'error';
       throw error;
+    }
+  }
+
+  /**
+   * Give the superuser a password and migrate pg_hba from trust to
+   * scram-sha-256. Safe to run repeatedly and on a live server: the password
+   * is set first (while trust still permits the connection), then pg_hba is
+   * flipped and reloaded. Best-effort — a failure here must not take the
+   * platform down, but it is logged loudly.
+   */
+  private async secureSuperuser(): Promise<void> {
+    if (!this.paths || !this.pool || !this.superuserPassword) return;
+
+    try {
+      // Set/refresh the superuser password (scram-hashed). Works under trust.
+      await this.pool.query(`SET password_encryption = 'scram-sha-256'`);
+      await this.pool.query(`ALTER ROLE postgres PASSWORD '${this.superuserPassword.replace(/'/g, "''")}'`);
+
+      const hbaPath = path.join(this.paths.dataDir, 'pg_hba.conf');
+      const hba = await fs.readFile(hbaPath, 'utf-8');
+      if (hbaNeedsMigration(hba)) {
+        await fs.writeFile(hbaPath, toScramHbaConf(hba));
+        // Reload pg_hba without a restart; existing connections stay open.
+        execSync(`"${this.paths.pgCtl}" reload -D "${this.paths.dataDir}"`, {
+          timeout: 10000,
+          stdio: 'pipe',
+        });
+        this.log('Secured PostgreSQL superuser: password set, pg_hba migrated to scram-sha-256');
+      }
+    } catch (err) {
+      this.log(
+        `WARNING: failed to secure PostgreSQL superuser: ${err instanceof Error ? err.message : err}`
+      );
     }
   }
 
@@ -286,11 +350,17 @@ export class PostgresServer {
   }
 
   private async isServerRunning(): Promise<boolean> {
+    // Under trust the password is ignored; under scram it must be the resolved
+    // superuser password. Pass it so both pre- and post-migration servers are
+    // detected as running. Fall back to the legacy 'postgres' literal only if
+    // the password hasn't been resolved yet.
+    const password = this.superuserPassword ?? 'postgres';
     try {
       const pool = new Pool({
         host: 'localhost',
         port: this.port,
         user: 'postgres',
+        password,
         database: 'postgres',
         max: 1,
         connectionTimeoutMillis: 2000,
@@ -309,6 +379,7 @@ export class PostgresServer {
       host: 'localhost',
       port: this.port,
       user: 'postgres',
+      password: this.superuserPassword ?? 'postgres',
       database: 'postgres',
       max: 20,
       idleTimeoutMillis: 30000,

@@ -16,11 +16,11 @@ import {
   BuildStageResult,
   BuildError,
   ActiveBuild,
-  CommandResult,
 } from './builder.types';
 import { executeCommand } from './strategies/base';
 import { nodejsBuildStrategy } from './strategies/nodejs';
 import { pythonBuildStrategy } from './strategies/python';
+import { goBuildStrategy } from './strategies/go';
 import { staticBuildStrategy } from './strategies/static';
 import { dockerBuildStrategy } from './strategies/docker';
 
@@ -153,12 +153,22 @@ export class BuilderService {
       const success = errors.length === 0;
       const status: BuildStatus = success ? 'success' : 'failed';
 
-      // Emit completion event
+      // Emit completion event (carries success so subscribers don't start a
+      // failed build). Also emit build:failed on stage failures so external
+      // consumers and the dashboard see the failure, not just exceptions.
       eventBus.publish('build:completed', {
         appId: context.appName,
         buildId,
         durationMs: Date.now() - startedAt.getTime(),
+        success,
       });
+      if (!success) {
+        eventBus.publish('build:failed', {
+          appId: context.appName,
+          buildId,
+          error: new Error(errors[0]?.message || 'Build failed'),
+        });
+      }
 
       return {
         success,
@@ -250,6 +260,7 @@ export class BuilderService {
   private registerBuiltinStrategies(): void {
     this.strategies.push(nodejsBuildStrategy);
     this.strategies.push(pythonBuildStrategy);
+    this.strategies.push(goBuildStrategy);
     this.strategies.push(staticBuildStrategy);
     this.strategies.push(dockerBuildStrategy);
   }
@@ -418,23 +429,20 @@ export class BuilderService {
     this.emitLog(context.appName, 'build', 'info', `Running: ${buildCommand}`);
 
     const timeout = context.config.timeout || this.config.defaultTimeout;
-    const timeoutPromise = new Promise<never>((_, reject) => {
-      setTimeout(() => reject(new Error('Build timeout')), timeout);
-    });
 
     try {
-      const result = await Promise.race([
-        executeCommand(
-          buildCommand,
-          context.appPath,
-          context.env,
-          signal,
-          (data, type) => {
-            this.emitLog(context.appName, 'build', type === 'stderr' ? 'warn' : 'info', data);
-          }
-        ),
-        timeoutPromise,
-      ]) as CommandResult;
+      // executeCommand enforces the timeout internally and kills the child
+      // process tree on expiry, so a hung build can't leak.
+      const result = await executeCommand(
+        buildCommand,
+        context.appPath,
+        context.env,
+        signal,
+        (data, type) => {
+          this.emitLog(context.appName, 'build', type === 'stderr' ? 'warn' : 'info', data);
+        },
+        timeout
+      );
 
       if (result.exitCode !== 0) {
         return {

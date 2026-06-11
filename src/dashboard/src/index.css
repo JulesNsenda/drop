@@ -6,6 +6,11 @@ body {
   @apply bg-gray-50 text-gray-900;
 }
 
+.dark body,
+html.dark body {
+  @apply bg-gray-900 text-gray-100;
+}
+
 /* Custom scrollbar */
 ::-webkit-scrollbar {
   width: 8px;
@@ -13,26 +18,29 @@ body {
 }
 
 ::-webkit-scrollbar-track {
-  @apply bg-gray-100;
+  @apply bg-gray-100 dark:bg-gray-800;
 }
 
 ::-webkit-scrollbar-thumb {
-  @apply bg-gray-300 rounded;
+  @apply bg-gray-300 dark:bg-gray-600 rounded;
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  @apply bg-gray-400;
+  @apply bg-gray-400 dark:bg-gray-500;
 }
 
-/* Log viewer styles */
-.log-line {
-  @apply font-mono text-sm whitespace-pre-wrap break-all;
+/* Toast slide-in animation */
+@keyframes slide-in {
+  from {
+    transform: translateX(100%);
+    opacity: 0;
+  }
+  to {
+    transform: translateX(0);
+    opacity: 1;
+  }
 }
 
-.log-stdout {
-  @apply text-gray-700;
-}
-
-.log-stderr {
-  @apply text-red-600;
+.animate-slide-in {
+  animation: slide-in 0.3s ease-out;
 }

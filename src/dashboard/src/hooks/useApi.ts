@@ -1,14 +1,13 @@
 import { useState, useEffect, useCallback } from 'react';
+import { apiJson, jsonBody } from '../api/client';
 
-const API_BASE = '/api/v1';
-
-interface ApiResponse<T> {
-  success: boolean;
-  data?: T;
-  error?: {
-    code: string;
-    message: string;
-  };
+export interface GitSource {
+  repoUrl: string;
+  branch: string;
+  lastCommitSha?: string;
+  lastClonedAt?: string;
+  autoRedeploy: boolean;
+  tokenId?: string;
 }
 
 export interface App {
@@ -25,17 +24,35 @@ export interface App {
   lastDeployedAt?: string;
   buildDuration?: number;
   error?: string;
+  gitSource?: GitSource;
+  userId?: string;
+  ownerName?: string;
+  customDomain?: string;
+}
+
+export interface ComponentHealth {
+  status: 'up' | 'down' | 'unknown';
+  message?: string;
 }
 
 export interface HealthStatus {
   status: string;
   uptime: number;
   version: string;
+  timestamp: string;
   components: {
-    watcher: string;
-    processManager: string;
-    database: string;
+    platform: ComponentHealth;
+    processManager: ComponentHealth;
+    database?: ComponentHealth;
+    watcher?: ComponentHealth;
   };
+}
+
+export interface AppHealthCheck {
+  name: string;
+  status: string;
+  port?: number;
+  healthy: boolean;
 }
 
 export function useApps() {
@@ -44,27 +61,20 @@ export function useApps() {
   const [error, setError] = useState<string | null>(null);
 
   const fetchApps = useCallback(async () => {
-    try {
-      setLoading(true);
-      const res = await fetch(`${API_BASE}/apps`);
-      const json: ApiResponse<App[]> = await res.json();
-
-      if (json.success && json.data) {
-        setApps(json.data);
-        setError(null);
-      } else {
-        setError(json.error?.message || 'Failed to fetch apps');
-      }
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Network error');
-    } finally {
-      setLoading(false);
+    setLoading(true);
+    const json = await apiJson<App[]>('/apps');
+    if (json.success && json.data) {
+      setApps(json.data);
+      setError(null);
+    } else {
+      setError(json.error?.message || 'Failed to fetch apps');
     }
+    setLoading(false);
   }, []);
 
   useEffect(() => {
     fetchApps();
-    const interval = setInterval(fetchApps, 5000); // Poll every 5s
+    const interval = setInterval(fetchApps, 5000);
     return () => clearInterval(interval);
   }, [fetchApps]);
 
@@ -77,31 +87,46 @@ export function useApp(name: string) {
   const [error, setError] = useState<string | null>(null);
 
   const fetchApp = useCallback(async () => {
-    try {
-      setLoading(true);
-      const res = await fetch(`${API_BASE}/apps/${name}`);
-      const json: ApiResponse<App> = await res.json();
-
-      if (json.success && json.data) {
-        setApp(json.data);
-        setError(null);
-      } else {
-        setError(json.error?.message || 'Failed to fetch app');
-      }
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Network error');
-    } finally {
-      setLoading(false);
+    setLoading(true);
+    const json = await apiJson<App>(`/apps/${name}`);
+    if (json.success && json.data) {
+      setApp(json.data);
+      setError(null);
+    } else {
+      setError(json.error?.message || 'Failed to fetch app');
     }
+    setLoading(false);
   }, [name]);
 
   useEffect(() => {
     fetchApp();
-    const interval = setInterval(fetchApp, 3000); // Poll every 3s
+    const interval = setInterval(fetchApp, 3000);
     return () => clearInterval(interval);
   }, [fetchApp]);
 
   return { app, loading, error, refresh: fetchApp };
+}
+
+export interface UsageInfo {
+  used: number;
+  limit: number; // 0 = unlimited
+}
+
+export function useUsage() {
+  const [usage, setUsage] = useState<UsageInfo | null>(null);
+
+  const fetchUsage = useCallback(async () => {
+    const json = await apiJson<UsageInfo>('/usage');
+    if (json.success && json.data) setUsage(json.data);
+  }, []);
+
+  useEffect(() => {
+    fetchUsage();
+    const interval = setInterval(fetchUsage, 15000);
+    return () => clearInterval(interval);
+  }, [fetchUsage]);
+
+  return { usage, refresh: fetchUsage };
 }
 
 export function useHealth() {
@@ -110,17 +135,11 @@ export function useHealth() {
 
   useEffect(() => {
     const fetchHealth = async () => {
-      try {
-        const res = await fetch(`${API_BASE}/health`);
-        const json: ApiResponse<HealthStatus> = await res.json();
-        if (json.success && json.data) {
-          setHealth(json.data);
-        }
-      } catch {
-        // Ignore errors
-      } finally {
-        setLoading(false);
+      const json = await apiJson<HealthStatus>('/health');
+      if (json.success && json.data) {
+        setHealth(json.data);
       }
+      setLoading(false);
     };
 
     fetchHealth();
@@ -132,25 +151,58 @@ export function useHealth() {
 }
 
 export async function appAction(name: string, action: 'start' | 'stop' | 'restart'): Promise<boolean> {
-  try {
-    const res = await fetch(`${API_BASE}/apps/${name}/${action}`, {
-      method: 'POST',
-    });
-    const json: ApiResponse<unknown> = await res.json();
-    return json.success;
-  } catch {
-    return false;
-  }
+  const json = await apiJson(`/apps/${name}/${action}`, { method: 'POST' });
+  return json.success;
 }
 
 export async function deleteApp(name: string): Promise<boolean> {
-  try {
-    const res = await fetch(`${API_BASE}/apps/${name}`, {
-      method: 'DELETE',
-    });
-    const json: ApiResponse<unknown> = await res.json();
-    return json.success;
-  } catch {
-    return false;
-  }
+  const json = await apiJson(`/apps/${name}`, { method: 'DELETE' });
+  return json.success;
+}
+
+// Git Deploy API
+
+export interface GitDeployResult {
+  appName: string;
+  repoUrl: string;
+  branch: string;
+  commitSha?: string;
+  clonedAt: string;
+}
+
+export interface GitTokenInfo {
+  id: string;
+  name: string;
+  createdAt: string;
+}
+
+export async function gitDeploy(request: {
+  repoUrl: string;
+  branch?: string;
+  name?: string;
+  autoRedeploy?: boolean;
+  tokenId?: string;
+}): Promise<{ success: boolean; data?: GitDeployResult; error?: string }> {
+  const json = await apiJson<GitDeployResult>('/git/deploy', { method: 'POST', ...jsonBody(request) });
+  return { success: json.success, data: json.data, error: json.error?.message };
+}
+
+export async function gitRedeploy(name: string): Promise<{ success: boolean; error?: string }> {
+  const json = await apiJson(`/git/redeploy/${name}`, { method: 'POST' });
+  return { success: json.success, error: json.error?.message };
+}
+
+export async function getGitTokens(): Promise<GitTokenInfo[]> {
+  const json = await apiJson<GitTokenInfo[]>('/git/tokens');
+  return json.data || [];
+}
+
+export async function addGitToken(name: string, token: string): Promise<{ success: boolean; data?: GitTokenInfo; error?: string }> {
+  const json = await apiJson<GitTokenInfo>('/git/tokens', { method: 'POST', ...jsonBody({ name, token }) });
+  return { success: json.success, data: json.data, error: json.error?.message };
+}
+
+export async function deleteGitToken(id: string): Promise<boolean> {
+  const json = await apiJson(`/git/tokens/${id}`, { method: 'DELETE' });
+  return json.success;
 }
