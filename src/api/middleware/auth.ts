@@ -425,6 +425,15 @@ export async function deleteApiKey(keyId: string): Promise<boolean> {
 }
 
 /**
+ * Delete all API keys with a given name (used to rotate the CLI local key on restart).
+ */
+export async function deleteApiKeysByName(name: string): Promise<void> {
+  if (!credentials || !config) return;
+  credentials.apiKeys = credentials.apiKeys.filter((k) => k.name !== name);
+  await saveCredentials(config.credentialsPath, credentials);
+}
+
+/**
  * List all API keys (without revealing the actual keys)
  */
 export function listApiKeys(): Omit<ApiKey, 'keyHash'>[] {

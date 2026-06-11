@@ -170,9 +170,10 @@ apps.post('/', async (c) => {
   }
 
   // Containment: the deploy path must live inside the webapps directory.
-  // Without this, any authenticated user could register and serve arbitrary
-  // host directories (e.g. the platform's own credential store).
-  if (!(await isPathWithin(getAppsDirectory(), body.path))) {
+  // Admins (e.g. local CLI) are exempt — they are trusted to register paths
+  // from anywhere on the host (e.g. `drop deploy ./my-app`).
+  const isAdmin = auth?.role === 'admin';
+  if (!isAdmin && !(await isPathWithin(getAppsDirectory(), body.path))) {
     throw new ValidationError('Path must be inside the webapps directory');
   }
 

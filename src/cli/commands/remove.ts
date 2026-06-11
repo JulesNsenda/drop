@@ -1,13 +1,13 @@
 /**
  * Remove Command
  *
- * Removes an application from DROP.
+ * Removes an application from DROP via the REST API.
  */
 
 import { Command } from 'commander';
 import { RemoveOptions } from '../cli.types';
 import * as output from '../utils/output';
-import { getProcessManager, resetProcessManager } from '../../managers/process';
+import { createApiClient, DropApiError } from '../api-client';
 
 export function createRemoveCommand(): Command {
   const cmd = new Command('remove')
@@ -18,16 +18,18 @@ export function createRemoveCommand(): Command {
     .option('--keep-data', 'Keep application data and logs')
     .action(async (appName: string, options: RemoveOptions) => {
       try {
-        const processManager = getProcessManager();
-        const status = await processManager.getStatus(appName);
+        const client = await createApiClient();
+        const app = await client.getApp(appName).catch((err) => {
+          if (err instanceof DropApiError && err.statusCode === 404) return null;
+          throw err;
+        });
 
-        if (!status) {
+        if (!app) {
           output.error(`Application not found: ${appName}`);
           process.exit(1);
         }
 
-        // Warn if app is running
-        if (status.status === 'online' && !options.force) {
+        if (app.status === 'running' && !options.force) {
           output.warn(`${appName} is currently running. Use --force to remove anyway.`);
           process.exit(1);
         }
@@ -35,13 +37,7 @@ export function createRemoveCommand(): Command {
         const spin = output.spinner(`Removing ${appName}...`);
         spin.start();
 
-        // Stop if running
-        if (status.status === 'online') {
-          await processManager.stop(appName);
-        }
-
-        // Delete from PM2
-        await processManager.delete(appName);
+        await client.removeApp(appName);
 
         spin.succeed(`Removed ${appName}`);
 
@@ -52,11 +48,12 @@ export function createRemoveCommand(): Command {
         if (output.isJsonMode()) {
           output.json({ removed: appName, keepData: options.keepData ?? true });
         }
-
-        resetProcessManager();
       } catch (err) {
-        resetProcessManager();
-        output.error('Failed to remove application', err instanceof Error ? err : undefined);
+        if (err instanceof DropApiError) {
+          output.error(err.message);
+        } else {
+          output.error('Failed to remove application', err instanceof Error ? err : undefined);
+        }
         process.exit(1);
       }
     });
