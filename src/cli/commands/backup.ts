@@ -32,6 +32,7 @@ const DROP_SVC_FILES = [
   'api-credentials.json',
   'db-credentials.json',
   'encryption.key',
+  '.pg-superuser',
 ];
 
 async function copyIfExists(src: string, destDir: string): Promise<boolean> {
@@ -53,6 +54,15 @@ function runPgDump(dropRoot: string, outFile: string): Promise<boolean> {
     return Promise.resolve(false);
   }
 
+  // The superuser now requires a password (scram). Read it from the 0600 file
+  // and pass it via PGPASSWORD.
+  let pgPassword: string | undefined;
+  try {
+    pgPassword = fssync.readFileSync(path.join(dropRoot, 'data', 'drop-svc', '.pg-superuser'), 'utf-8').trim();
+  } catch {
+    // No password file — server may still be on trust; pg_dump will try without one.
+  }
+
   return new Promise((resolve) => {
     const args = [
       '-h', '127.0.0.1',
@@ -62,7 +72,10 @@ function runPgDump(dropRoot: string, outFile: string): Promise<boolean> {
       '-f', outFile,
       INTERNAL_DB,
     ];
-    const child = spawn(pgDump, args, { stdio: ['ignore', 'ignore', 'pipe'] });
+    const child = spawn(pgDump, args, {
+      stdio: ['ignore', 'ignore', 'pipe'],
+      env: pgPassword ? { ...process.env, PGPASSWORD: pgPassword } : process.env,
+    });
     let stderr = '';
     child.stderr.on('data', (d) => (stderr += d.toString()));
     child.on('error', (err) => {

@@ -372,7 +372,11 @@ What this means in practice:
   `data/drop-svc/encryption.key` (auto-generated, `0600`). Keep it — losing it
   makes existing secrets unrecoverable. Set `DROP_MASTER_KEY` to manage the key
   externally.
-- The bundled PostgreSQL listens on `127.0.0.1:5433`. Don't expose that port.
+- The bundled PostgreSQL listens on `127.0.0.1:5433`. On first start, DROP gives
+  the `postgres` superuser a random password (stored at
+  `data/drop-svc/.pg-superuser`, `0600`) and migrates `pg_hba.conf` from `trust`
+  to `scram-sha-256` — so a local process can no longer get superuser access
+  without the password. Keep that file with your backups; don't expose the port.
 
 The platform-facing attack surface (API authorization, path traversal, command
 and SSRF injection, webhook authentication) is hardened; the *tenant-isolation*
