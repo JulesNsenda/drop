@@ -15,7 +15,7 @@
   ],
   "scripts": {
     "dev": "ts-node src/index.ts",
-    "build": "tsc && npm run build:dashboard",
+    "build": "npm run build:server && npm run build:dashboard",
     "build:server": "tsc && node scripts/copy-assets.js",
     "build:dashboard": "cd src/dashboard && npm run build",
     "build:watch": "tsc --watch",
