@@ -1,13 +1,13 @@
 /**
  * Logs Command
  *
- * View application logs.
+ * View application logs via the DROP REST API.
  */
 
 import { Command } from 'commander';
 import { LogsOptions } from '../cli.types';
 import * as output from '../utils/output';
-import { getProcessManager, resetProcessManager } from '../../managers/process';
+import { createApiClient, DropApiError } from '../api-client';
 
 export function createLogsCommand(): Command {
   const cmd = new Command('logs')
@@ -18,77 +18,63 @@ export function createLogsCommand(): Command {
     .option('-f, --follow', 'Follow log output in real-time')
     .action(async (appName: string, options: LogsOptions) => {
       try {
-        const processManager = getProcessManager();
-        const status = await processManager.getStatus(appName);
+        const client = await createApiClient();
 
-        if (!status) {
+        // Verify the app exists before streaming/fetching
+        const app = await client.getApp(appName).catch((err) => {
+          if (err instanceof DropApiError && err.statusCode === 404) return null;
+          throw err;
+        });
+
+        if (!app) {
           output.error(`Application not found: ${appName}`);
           process.exit(1);
         }
 
-        // If follow mode, stream logs
         if (options.follow) {
           output.info(`Following logs for ${appName}... (Ctrl+C to stop)`);
           output.print('');
 
-          const stopStreaming = await processManager.streamLogs(
+          const stop = await client.streamLogs(
             appName,
-            (line, type) => {
-              // Filter for errors if requested
-              if (options.error && type !== 'err') {
-                return;
-              }
-
-              if (type === 'err') {
-                output.print(output.color(`[ERR] ${line}`, 'red'));
+            (line) => {
+              if (options.error && !line.startsWith('[err]')) return;
+              if (line.startsWith('[err]')) {
+                output.print(output.color(`[ERR] ${line.replace('[err] ', '')}`, 'red'));
               } else {
-                output.print(`[OUT] ${line}`);
+                output.print(line.replace('[out] ', ''));
               }
             },
-            (error) => {
-              output.error('Log stream error', error);
+            (err) => {
+              output.error('Log stream error', err);
             }
           );
 
-          // Handle graceful shutdown
           const cleanup = (): void => {
-            stopStreaming();
-            resetProcessManager();
+            stop();
             output.print('');
             output.info('Stopped following logs');
             process.exit(0);
           };
-
           process.on('SIGINT', cleanup);
           process.on('SIGTERM', cleanup);
-
-          // Keep the process running
           return;
         }
 
-        // Non-follow mode: show last N lines
         const lines = parseInt(String(options.lines || '100'), 10);
-        const logs = await processManager.getLogs(appName, lines);
+        const logLines = await client.getLogs(appName, lines);
 
-        if (!logs) {
+        if (logLines.length === 0) {
           output.info('No logs available');
-          resetProcessManager();
           return;
         }
 
-        // Filter for errors if requested
-        let logLines = logs.split('\n');
-        if (options.error) {
-          logLines = logLines.filter(line => line.startsWith('[err]'));
-        }
+        const filtered = options.error ? logLines.filter((l) => l.startsWith('[err]')) : logLines;
 
         if (output.isJsonMode()) {
-          output.json({
-            app: appName,
-            lines: logLines,
-          });
+          output.json({ app: appName, lines: filtered });
         } else {
-          for (const line of logLines) {
+          for (const line of filtered) {
             if (line.startsWith('[err]')) {
               output.print(output.color(line, 'red'));
             } else if (line.startsWith('[out]')) {
@@ -98,11 +84,12 @@ export function createLogsCommand(): Command {
             }
           }
         }
-
-        resetProcessManager();
       } catch (err) {
-        resetProcessManager();
-        output.error('Failed to get logs', err instanceof Error ? err : undefined);
+        if (err instanceof DropApiError) {
+          output.error(err.message);
+        } else {
+          output.error('Failed to get logs', err instanceof Error ? err : undefined);
+        }
         process.exit(1);
       }
     });

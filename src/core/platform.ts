@@ -28,6 +28,7 @@ import {
   validateDomainFormat,
   isLocalhostDomain,
 } from '../utils/domain-validator';
+import { createApiKey, deleteApiKeysByName } from '../api/middleware/auth';
 
 export interface PlatformConfig {
   /** Root directory for DROP */
@@ -684,6 +685,7 @@ import ${path.join(dataDir, 'appconf', 'caddy', 'hosts', '*.caddy').replace(/\\/
     this.logger.info(`API server running on port ${this.config.apiPort}`, 'API');
     if (this.config.enableApiAuth) {
       this.logger.info('API authentication: ENABLED', 'API');
+      await this.writeLocalCliKey();
     }
     this.logger.info(`Dashboard available at http://localhost:${this.config.apiPort}/dashboard`, 'API');
   }
@@ -1756,6 +1758,27 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
   /** @deprecated Use getRuntime() — kept for callers from the PM2-only era */
   getProcessManager(): AppRuntime | null {
     return this.runtime;
+  }
+
+  /**
+   * Generate a fresh admin API key for local CLI use and write it to
+   * data/drop-svc/local.key (mode 0600) so CLI commands can authenticate
+   * without requiring the user to set DROP_API_KEY manually.
+   * Called once per platform startup when auth is enabled.
+   */
+  private async writeLocalCliKey(): Promise<void> {
+    try {
+      const keyPath = path.join(this.config.dropRoot, 'data', 'drop-svc', 'local.key');
+      await deleteApiKeysByName('cli-local');
+      const { key } = await createApiKey('cli-local', 'admin');
+      await fs.writeFile(keyPath, key, { encoding: 'utf-8', mode: 0o600 });
+      this.logger.info('Local CLI auth key written', 'API');
+    } catch (err) {
+      this.logger.warn(
+        `Could not write local CLI key: ${err instanceof Error ? err.message : String(err)}`,
+        'API'
+      );
+    }
   }
 
   getRouter(): RouterService | null {
