@@ -11,7 +11,7 @@ import { success, error, ErrorCodes, AppDto, CreateAppDto } from '../types';
 import { NotFoundError, ValidationError } from '../middleware/error';
 import { AuthContext, listUsers, getUserById } from '../middleware/auth';
 import { canAccess } from '../access';
-import { getProcessManager } from '../../managers/process';
+import { getAppRuntime } from '../../managers/runtime';
 import { getStateManager, AppState } from '../../managers/app/state-manager';
 import { getAppConfigService } from '../../managers/app/app-config';
 import { tryLogActivity } from '../../managers/activity';
@@ -125,7 +125,7 @@ apps.get('/:name', async (c) => {
   }
 
   // Get additional process info
-  const pm = getProcessManager();
+  const pm = getAppRuntime();
   try {
     const status = await pm.getStatus(name);
     if (status) {
@@ -245,7 +245,7 @@ apps.delete('/:name', async (c) => {
   }
 
   // Stop the process if running
-  const pm = getProcessManager();
+  const pm = getAppRuntime();
   try {
     await pm.stop(name);
     await pm.delete(name);
@@ -288,7 +288,7 @@ apps.post('/:name/start', async (c) => {
     throw new NotFoundError(`Application '${name}' not found`);
   }
 
-  const pm = getProcessManager();
+  const pm = getAppRuntime();
 
   try {
     const status = await pm.start({
@@ -324,7 +324,7 @@ apps.post('/:name/stop', async (c) => {
     throw new NotFoundError(`Application '${name}' not found`);
   }
 
-  const pm = getProcessManager();
+  const pm = getAppRuntime();
 
   try {
     await pm.stop(name);
@@ -349,7 +349,7 @@ apps.post('/:name/restart', async (c) => {
     throw new NotFoundError(`Application '${name}' not found`);
   }
 
-  const pm = getProcessManager();
+  const pm = getAppRuntime();
 
   try {
     const status = await pm.restart(name);

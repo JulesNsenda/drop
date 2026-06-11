@@ -9,7 +9,7 @@ import { success, AppLogsDto } from '../types';
 import { NotFoundError } from '../middleware/error';
 import { AuthContext } from '../middleware/auth';
 import { canAccess } from '../access';
-import { getProcessManager } from '../../managers/process';
+import { getAppRuntime } from '../../managers/runtime';
 import { getStateManager } from '../../managers/app/state-manager';
 
 const logs = new Hono();
@@ -28,7 +28,7 @@ logs.get('/:name', async (c) => {
   const lines = parseInt(c.req.query('lines') || '100', 10);
   const type = (c.req.query('type') || 'combined') as 'stdout' | 'stderr' | 'combined';
 
-  const pm = getProcessManager();
+  const pm = getAppRuntime();
 
   let logLines: string[] = [];
   try {
@@ -63,7 +63,7 @@ logs.get('/:name/stream', async (c) => {
   c.header('Cache-Control', 'no-cache');
   c.header('Connection', 'keep-alive');
 
-  const pm = getProcessManager();
+  const pm = getAppRuntime();
 
   // Create a readable stream
   const stream = new ReadableStream({

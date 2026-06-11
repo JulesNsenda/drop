@@ -7,7 +7,7 @@
 import * as http from 'http';
 import { Hono } from 'hono';
 import { success, HealthDto, StatsDto } from '../types';
-import { getProcessManager } from '../../managers/process';
+import { getAppRuntime } from '../../managers/runtime';
 import { getStateManager, AppStateManager } from '../../managers/app/state-manager';
 import { getPlatformVersion } from '../../utils/version';
 
@@ -39,7 +39,7 @@ health.get('/', async (c) => {
 
   // Check process manager
   try {
-    const pm = getProcessManager();
+    const pm = getAppRuntime();
     const processes = await pm.getAllStatus();
     pmStatus = 'up';
     pmMessage = `${processes.length} process(es) tracked`;
@@ -145,7 +145,7 @@ health.get('/apps', async (c) => {
 // GET /health/ready - Readiness probe for k8s/orchestration
 health.get('/ready', async (c) => {
   try {
-    const pm = getProcessManager();
+    const pm = getAppRuntime();
     await pm.getAllStatus();
     return c.json(success({ ready: true }));
   } catch {
