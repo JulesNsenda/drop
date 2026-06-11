@@ -1571,12 +1571,14 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       this.logger.warn('Initial certificate check failed', 'CERTS', err);
     });
 
-    // Schedule periodic checks
+    // Schedule periodic checks. unref() so this background timer never keeps
+    // the process (or a Jest worker) alive on its own.
     this.certExpiryTimer = setInterval(() => {
       this.checkCertificateExpiry().catch(err => {
         this.logger.warn('Certificate expiry check failed', 'CERTS', err);
       });
     }, this.CERT_CHECK_INTERVAL_MS);
+    this.certExpiryTimer.unref?.();
   }
 
   /**

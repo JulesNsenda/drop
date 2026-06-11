@@ -12,7 +12,7 @@ import { AuthContext } from '../middleware/auth';
 import { getGitDeployService } from '../../core/git-deploy';
 import { getStateManager } from '../../managers/app/state-manager';
 import { getUserById } from '../middleware/auth';
-import { getActivityLog } from '../../managers/activity';
+import { tryLogActivity } from '../../managers/activity';
 import type { GitDeployRequest, GitTokenCreateRequest } from '../../core/git-deploy';
 
 const gitDeploy = new Hono();
@@ -38,7 +38,12 @@ gitDeploy.post('/deploy', async (c) => {
     if (auth?.userId && auth.role !== 'admin') {
       const globalMax = parseInt(process.env.DROP_MAX_APPS_PER_USER || '5', 10);
       let maxApps = globalMax;
-      try { const u = getUserById(auth.userId) as any; if (u?.maxApps > 0) maxApps = u.maxApps; } catch {}
+      try {
+        const u = getUserById(auth.userId) as any;
+        if (u?.maxApps > 0) maxApps = u.maxApps;
+      } catch {
+        // User lookup failed — fall back to the global limit
+      }
       if (maxApps > 0) {
         const stateManager = getStateManager();
         const userApps = stateManager.getAllApps().filter((a) => a.userId === auth.userId);
@@ -54,7 +59,7 @@ gitDeploy.post('/deploy', async (c) => {
     }
 
     const result = await service.deploy(body);
-    try { await getActivityLog().log({ action: 'git-deploy', userId: auth?.userId, username: auth?.username, appName: result.appName, detail: result.repoUrl }); } catch {}
+    await tryLogActivity({ action: 'git-deploy', userId: auth?.userId, username: auth?.username, appName: result.appName, detail: result.repoUrl });
     return c.json(success(result), 201);
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Deploy failed';

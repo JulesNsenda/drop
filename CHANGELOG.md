@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+Work toward the **v1.0.0** production release. Tracked in
+`docs/plans/2026-06-11-production-release-plan.md`.
+
+### Added
+
+- Continuous integration (GitHub Actions): lint, server build, tests, and
+  dashboard build on every PR to `main`/`develop`.
+- `scripts/create-migration.ts` restored so `npm run db:migrate:create` works.
+
+### Changed
+
+- Version set to `1.0.0-rc.0` for the production hardening cycle.
+- `/health` now reads its version from `package.json` rather than a hardcoded
+  fallback (previously reported `0.4.0` under PM2/`node` where
+  `npm_package_version` is unset).
+
+### Fixed
+
+- Resolved all ESLint errors (empty `catch` blocks now log or document why they
+  swallow). Activity logging consolidated behind a best-effort `tryLogActivity`
+  helper.
+- `certExpiryTimer` is now `unref()`'d so it can't keep the process or a Jest
+  worker alive.
+
 ## [0.1.0] - 2026-01-18
 
 First stable release of DROP with full deployment pipeline, hot-reload, and database auto-provisioning.
