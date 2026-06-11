@@ -24,6 +24,20 @@ export type BuildStage =
 export type BuildStatus = 'pending' | 'running' | 'success' | 'failed' | 'cancelled';
 
 /**
+ * Signature for a command executor injected into BuildContext.
+ * Matches the signature of executeCommand in base.ts so callers can
+ * swap between the host runner and the container runner transparently.
+ */
+export type ExecCommandFn = (
+  command: string,
+  cwd: string,
+  env: Record<string, string>,
+  signal?: AbortSignal,
+  onOutput?: (data: string, type: 'stdout' | 'stderr') => void,
+  timeoutMs?: number
+) => Promise<CommandResult>;
+
+/**
  * Context provided to the builder
  */
 export interface BuildContext {
@@ -42,6 +56,16 @@ export interface BuildContext {
    * Strategies that write temp files MUST use this path, not appPath.
    */
   workDir?: string;
+  /**
+   * Command executor for this build.  When isolation === 'docker', the
+   * platform injects a container-based executor; otherwise the builder
+   * falls back to executeCommand (the host shell runner).
+   *
+   * The BuilderService uses `context.execCommand ?? executeCommand`
+   * everywhere, so callers that don't care about the distinction get the
+   * right behaviour for free.
+   */
+  execCommand?: ExecCommandFn;
 }
 
 /**

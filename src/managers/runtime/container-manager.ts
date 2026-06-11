@@ -69,7 +69,7 @@ function mapDockerState(state: Docker.ContainerInspectInfo['State']): AppRuntime
 export class ContainerManager implements AppRuntime {
   readonly type = 'docker' as const;
 
-  private readonly docker: Docker;
+  readonly docker: Docker;
   /** Per-app log-tailer stop functions, keyed by app name. */
   private readonly logTailers: Map<string, () => void> = new Map();
 

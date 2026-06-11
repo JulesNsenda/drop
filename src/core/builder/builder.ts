@@ -325,8 +325,9 @@ export class BuilderService {
   ): Promise<BuildStageResult> {
     // Execute custom pre-build hooks
     if (context.config.preBuild?.length) {
+      const exec = context.execCommand ?? executeCommand;
       for (const hook of context.config.preBuild) {
-        const result = await executeCommand(hook, context.appPath, context.env);
+        const result = await exec(hook, context.appPath, context.env);
         if (result.exitCode !== 0) {
           return {
             stage: 'pre-build',
@@ -386,7 +387,8 @@ export class BuilderService {
 
     this.emitLog(context.appName, 'install', 'info', `Running: ${installCommand}`);
 
-    const result = await executeCommand(
+    const exec = context.execCommand ?? executeCommand;
+    const result = await exec(
       installCommand,
       context.appPath,
       context.env,
@@ -431,9 +433,8 @@ export class BuilderService {
     const timeout = context.config.timeout || this.config.defaultTimeout;
 
     try {
-      // executeCommand enforces the timeout internally and kills the child
-      // process tree on expiry, so a hung build can't leak.
-      const result = await executeCommand(
+      const exec = context.execCommand ?? executeCommand;
+      const result = await exec(
         buildCommand,
         context.appPath,
         context.env,
