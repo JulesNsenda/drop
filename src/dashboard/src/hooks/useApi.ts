@@ -1,16 +1,5 @@
 import { useState, useEffect, useCallback } from 'react';
-import { getAuthHeaders } from './useAuth';
-
-const API_BASE = '/api/v1';
-
-interface ApiResponse<T> {
-  success: boolean;
-  data?: T;
-  error?: {
-    code: string;
-    message: string;
-  };
-}
+import { apiJson, jsonBody } from '../api/client';
 
 export interface GitSource {
   repoUrl: string;
@@ -72,22 +61,15 @@ export function useApps() {
   const [error, setError] = useState<string | null>(null);
 
   const fetchApps = useCallback(async () => {
-    try {
-      setLoading(true);
-      const res = await fetch(`${API_BASE}/apps`, { headers: getAuthHeaders() });
-      const json: ApiResponse<App[]> = await res.json();
-
-      if (json.success && json.data) {
-        setApps(json.data);
-        setError(null);
-      } else {
-        setError(json.error?.message || 'Failed to fetch apps');
-      }
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Network error');
-    } finally {
-      setLoading(false);
+    setLoading(true);
+    const json = await apiJson<App[]>('/apps');
+    if (json.success && json.data) {
+      setApps(json.data);
+      setError(null);
+    } else {
+      setError(json.error?.message || 'Failed to fetch apps');
     }
+    setLoading(false);
   }, []);
 
   useEffect(() => {
@@ -105,22 +87,15 @@ export function useApp(name: string) {
   const [error, setError] = useState<string | null>(null);
 
   const fetchApp = useCallback(async () => {
-    try {
-      setLoading(true);
-      const res = await fetch(`${API_BASE}/apps/${name}`, { headers: getAuthHeaders() });
-      const json: ApiResponse<App> = await res.json();
-
-      if (json.success && json.data) {
-        setApp(json.data);
-        setError(null);
-      } else {
-        setError(json.error?.message || 'Failed to fetch app');
-      }
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Network error');
-    } finally {
-      setLoading(false);
+    setLoading(true);
+    const json = await apiJson<App>(`/apps/${name}`);
+    if (json.success && json.data) {
+      setApp(json.data);
+      setError(null);
+    } else {
+      setError(json.error?.message || 'Failed to fetch app');
     }
+    setLoading(false);
   }, [name]);
 
   useEffect(() => {
@@ -132,23 +107,39 @@ export function useApp(name: string) {
   return { app, loading, error, refresh: fetchApp };
 }
 
+export interface UsageInfo {
+  used: number;
+  limit: number; // 0 = unlimited
+}
+
+export function useUsage() {
+  const [usage, setUsage] = useState<UsageInfo | null>(null);
+
+  const fetchUsage = useCallback(async () => {
+    const json = await apiJson<UsageInfo>('/usage');
+    if (json.success && json.data) setUsage(json.data);
+  }, []);
+
+  useEffect(() => {
+    fetchUsage();
+    const interval = setInterval(fetchUsage, 15000);
+    return () => clearInterval(interval);
+  }, [fetchUsage]);
+
+  return { usage, refresh: fetchUsage };
+}
+
 export function useHealth() {
   const [health, setHealth] = useState<HealthStatus | null>(null);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
     const fetchHealth = async () => {
-      try {
-        const res = await fetch(`${API_BASE}/health`, { headers: getAuthHeaders() });
-        const json: ApiResponse<HealthStatus> = await res.json();
-        if (json.success && json.data) {
-          setHealth(json.data);
-        }
-      } catch {
-        // Ignore errors
-      } finally {
-        setLoading(false);
+      const json = await apiJson<HealthStatus>('/health');
+      if (json.success && json.data) {
+        setHealth(json.data);
       }
+      setLoading(false);
     };
 
     fetchHealth();
@@ -160,29 +151,13 @@ export function useHealth() {
 }
 
 export async function appAction(name: string, action: 'start' | 'stop' | 'restart'): Promise<boolean> {
-  try {
-    const res = await fetch(`${API_BASE}/apps/${name}/${action}`, {
-      method: 'POST',
-      headers: getAuthHeaders(),
-    });
-    const json: ApiResponse<unknown> = await res.json();
-    return json.success;
-  } catch {
-    return false;
-  }
+  const json = await apiJson(`/apps/${name}/${action}`, { method: 'POST' });
+  return json.success;
 }
 
 export async function deleteApp(name: string): Promise<boolean> {
-  try {
-    const res = await fetch(`${API_BASE}/apps/${name}`, {
-      method: 'DELETE',
-      headers: getAuthHeaders(),
-    });
-    const json: ApiResponse<unknown> = await res.json();
-    return json.success;
-  } catch {
-    return false;
-  }
+  const json = await apiJson(`/apps/${name}`, { method: 'DELETE' });
+  return json.success;
 }
 
 // Git Deploy API
@@ -208,69 +183,26 @@ export async function gitDeploy(request: {
   autoRedeploy?: boolean;
   tokenId?: string;
 }): Promise<{ success: boolean; data?: GitDeployResult; error?: string }> {
-  try {
-    const res = await fetch(`${API_BASE}/git/deploy`, {
-      method: 'POST',
-      headers: { ...getAuthHeaders(), 'Content-Type': 'application/json' },
-      body: JSON.stringify(request),
-    });
-    const json: ApiResponse<GitDeployResult> = await res.json();
-    return {
-      success: json.success,
-      data: json.data,
-      error: json.error?.message,
-    };
-  } catch (err) {
-    return { success: false, error: err instanceof Error ? err.message : 'Network error' };
-  }
+  const json = await apiJson<GitDeployResult>('/git/deploy', { method: 'POST', ...jsonBody(request) });
+  return { success: json.success, data: json.data, error: json.error?.message };
 }
 
 export async function gitRedeploy(name: string): Promise<{ success: boolean; error?: string }> {
-  try {
-    const res = await fetch(`${API_BASE}/git/redeploy/${name}`, {
-      method: 'POST',
-      headers: getAuthHeaders(),
-    });
-    const json: ApiResponse<unknown> = await res.json();
-    return { success: json.success, error: json.error?.message };
-  } catch (err) {
-    return { success: false, error: err instanceof Error ? err.message : 'Network error' };
-  }
+  const json = await apiJson(`/git/redeploy/${name}`, { method: 'POST' });
+  return { success: json.success, error: json.error?.message };
 }
 
 export async function getGitTokens(): Promise<GitTokenInfo[]> {
-  try {
-    const res = await fetch(`${API_BASE}/git/tokens`, { headers: getAuthHeaders() });
-    const json: ApiResponse<GitTokenInfo[]> = await res.json();
-    return json.data || [];
-  } catch {
-    return [];
-  }
+  const json = await apiJson<GitTokenInfo[]>('/git/tokens');
+  return json.data || [];
 }
 
 export async function addGitToken(name: string, token: string): Promise<{ success: boolean; data?: GitTokenInfo; error?: string }> {
-  try {
-    const res = await fetch(`${API_BASE}/git/tokens`, {
-      method: 'POST',
-      headers: { ...getAuthHeaders(), 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name, token }),
-    });
-    const json: ApiResponse<GitTokenInfo> = await res.json();
-    return { success: json.success, data: json.data, error: json.error?.message };
-  } catch (err) {
-    return { success: false, error: err instanceof Error ? err.message : 'Network error' };
-  }
+  const json = await apiJson<GitTokenInfo>('/git/tokens', { method: 'POST', ...jsonBody({ name, token }) });
+  return { success: json.success, data: json.data, error: json.error?.message };
 }
 
 export async function deleteGitToken(id: string): Promise<boolean> {
-  try {
-    const res = await fetch(`${API_BASE}/git/tokens/${id}`, {
-      method: 'DELETE',
-      headers: getAuthHeaders(),
-    });
-    const json: ApiResponse<unknown> = await res.json();
-    return json.success;
-  } catch {
-    return false;
-  }
+  const json = await apiJson(`/git/tokens/${id}`, { method: 'DELETE' });
+  return json.success;
 }

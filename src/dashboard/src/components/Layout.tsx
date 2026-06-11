@@ -1,13 +1,24 @@
 import { useState } from 'react';
-import { Outlet, NavLink } from 'react-router-dom';
+import { Outlet, NavLink, useNavigate } from 'react-router-dom';
 import { LayoutGrid, Settings, Box, Upload, Users, Sun, Moon, Monitor, LogOut, User, Menu, X } from 'lucide-react';
 import { useTheme } from '../hooks/useTheme';
 import { useAuth } from '../hooks/useAuth';
+import { useToast } from './Toast';
+import LimitBadge from './LimitBadge';
 
 function Layout() {
   const { theme, setTheme } = useTheme();
   const { authRequired, username, role, logout } = useAuth();
+  const navigate = useNavigate();
+  const { toast } = useToast();
   const [sidebarOpen, setSidebarOpen] = useState(false);
+
+  // PRD-026: explicit redirect to the landing page + confirmation on logout.
+  const handleLogout = () => {
+    logout();
+    toast('success', 'Signed out');
+    navigate('/', { replace: true });
+  };
 
   const themeIcon = theme === 'dark' ? Moon : theme === 'light' ? Sun : Monitor;
   const ThemeIcon = themeIcon;
@@ -69,9 +80,14 @@ function Layout() {
                 <span className="text-[10px] px-1.5 py-0.5 bg-drop-500/20 text-drop-400 rounded font-medium uppercase">admin</span>
               )}
             </div>
-            <button onClick={logout} className="text-gray-500 hover:text-white transition-colors" title="Sign out">
+            <button onClick={handleLogout} className="text-gray-500 hover:text-white transition-colors" title="Sign out" aria-label="Sign out">
               <LogOut className="w-4 h-4" />
             </button>
+          </div>
+        )}
+        {authRequired && role !== 'admin' && (
+          <div className="px-3 mb-2">
+            <LimitBadge />
           </div>
         )}
         <div className="text-xs text-gray-600 px-3">DROP v1.0</div>
