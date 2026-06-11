@@ -13,14 +13,15 @@ export async function errorHandler(c: Context, next: Next): Promise<Response | v
   } catch (err) {
     console.error('API Error:', err);
 
-    // Handle custom HTTP errors
+    // Handle custom HTTP errors — these messages are developer-authored and
+    // safe to surface to the client.
     if (err instanceof HttpError) {
       return c.json(error(err.code, err.message), err.statusCode as 400 | 401 | 403 | 404 | 409 | 500);
     }
 
-    const message = err instanceof Error ? err.message : 'An unexpected error occurred';
-
-    return c.json(error(ErrorCodes.INTERNAL_ERROR, message), 500);
+    // Unexpected errors may carry internal details (paths, table names, stack
+    // info). Log the real error server-side; return a generic message.
+    return c.json(error(ErrorCodes.INTERNAL_ERROR, 'An unexpected error occurred'), 500);
   }
 }
 

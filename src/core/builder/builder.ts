@@ -16,7 +16,6 @@ import {
   BuildStageResult,
   BuildError,
   ActiveBuild,
-  CommandResult,
 } from './builder.types';
 import { executeCommand } from './strategies/base';
 import { nodejsBuildStrategy } from './strategies/nodejs';
@@ -420,23 +419,20 @@ export class BuilderService {
     this.emitLog(context.appName, 'build', 'info', `Running: ${buildCommand}`);
 
     const timeout = context.config.timeout || this.config.defaultTimeout;
-    const timeoutPromise = new Promise<never>((_, reject) => {
-      setTimeout(() => reject(new Error('Build timeout')), timeout);
-    });
 
     try {
-      const result = await Promise.race([
-        executeCommand(
-          buildCommand,
-          context.appPath,
-          context.env,
-          signal,
-          (data, type) => {
-            this.emitLog(context.appName, 'build', type === 'stderr' ? 'warn' : 'info', data);
-          }
-        ),
-        timeoutPromise,
-      ]) as CommandResult;
+      // executeCommand enforces the timeout internally and kills the child
+      // process tree on expiry, so a hung build can't leak.
+      const result = await executeCommand(
+        buildCommand,
+        context.appPath,
+        context.env,
+        signal,
+        (data, type) => {
+          this.emitLog(context.appName, 'build', type === 'stderr' ? 'warn' : 'info', data);
+        },
+        timeout
+      );
 
       if (result.exitCode !== 0) {
         return {

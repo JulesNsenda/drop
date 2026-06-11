@@ -10,7 +10,8 @@ import * as path from 'path';
 import { encrypt, decrypt, deriveKey, generateSalt, EncryptedData } from './encryption';
 
 interface SecretStore {
-  version: 1;
+  /** 1 = key derived from the store's own salt (legacy, weak). 2 = key derived from an external master key. */
+  version: 1 | 2;
   salt: string;
   secrets: Record<string, Record<string, EncryptedData>>;
 }
@@ -18,8 +19,14 @@ interface SecretStore {
 export interface SecretManagerConfig {
   /** Path to the secrets store file */
   storePath: string;
-  /** Master passphrase for encryption (auto-generated if not provided) */
+  /** Master passphrase for encryption (e.g. from DROP_MASTER_KEY) */
   masterKey?: string;
+  /**
+   * Path to a file holding the master key (e.g. the auto-generated
+   * encryption.key). Used when masterKey is not provided. This keeps the key
+   * material out of secrets.json so the store is not self-decrypting.
+   */
+  masterKeyPath?: string;
 }
 
 export class SecretManager {
@@ -40,10 +47,61 @@ export class SecretManager {
     this.store = await this.loadStore();
 
     const salt = Buffer.from(this.store.salt, 'base64');
-    const passphrase = this.config.masterKey || this.store.salt;
-    this.encryptionKey = deriveKey(passphrase, salt);
+    const externalKey = await this.resolveExternalMasterKey();
+
+    if (externalKey) {
+      const newKey = deriveKey(externalKey, salt);
+
+      // Migrate a legacy (salt-derived) store to the external key in place.
+      if (this.store.version === 1) {
+        const legacyKey = deriveKey(this.store.salt, salt);
+        this.reencryptAll(legacyKey, newKey);
+        this.store.version = 2;
+        this.encryptionKey = newKey;
+        await this.saveStore(this.store);
+      } else {
+        this.encryptionKey = newKey;
+      }
+    } else {
+      // No external key available — fall back to the legacy self-derived key.
+      // This provides no confidentiality against anyone who can read the store
+      // file; warn so operators wire up an encryption key / DROP_MASTER_KEY.
+      if (this.store.version === 1) {
+        console.warn(
+          '[secret-manager] No master key configured — secrets are encrypted with a key derived ' +
+            'from the store itself and are NOT protected against disk-read access. ' +
+            'Set DROP_MASTER_KEY or provide an encryption.key file.'
+        );
+      }
+      this.encryptionKey = deriveKey(this.store.salt, salt);
+    }
 
     this.initialized = true;
+  }
+
+  /** Master key from explicit config, else the contents of masterKeyPath, else none. */
+  private async resolveExternalMasterKey(): Promise<string | null> {
+    if (this.config.masterKey) return this.config.masterKey;
+    if (this.config.masterKeyPath) {
+      try {
+        const key = (await fs.readFile(this.config.masterKeyPath, 'utf-8')).trim();
+        if (key.length > 0) return key;
+      } catch {
+        // File missing/unreadable — fall through to legacy mode.
+      }
+    }
+    return null;
+  }
+
+  /** Re-encrypt every stored secret from one key to another (used for v1→v2 migration). */
+  private reencryptAll(oldKey: Buffer, newKey: Buffer): void {
+    if (!this.store) return;
+    for (const appSecrets of Object.values(this.store.secrets)) {
+      for (const [key, encrypted] of Object.entries(appSecrets)) {
+        const plaintext = decrypt(encrypted, oldKey);
+        appSecrets[key] = encrypt(plaintext, newKey);
+      }
+    }
   }
 
   private async loadStore(): Promise<SecretStore> {

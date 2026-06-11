@@ -125,4 +125,48 @@ describe('SecretManager', () => {
     expect(raw).toContain('iv');
     expect(raw).toContain('tag');
   });
+
+  describe('master key from file', () => {
+    it('reads the master key from masterKeyPath when masterKey is not set', async () => {
+      const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'drop-secret-keyfile-'));
+      const store = path.join(dir, 'secrets.json');
+      const keyFile = path.join(dir, 'encryption.key');
+      await fs.writeFile(keyFile, 'a'.repeat(64));
+
+      const a = new SecretManager({ storePath: store, masterKeyPath: keyFile });
+      await a.initialize();
+      await a.set('app', 'K', 'v');
+
+      const b = new SecretManager({ storePath: store, masterKeyPath: keyFile });
+      await b.initialize();
+      expect(b.get('app', 'K')).toBe('v');
+
+      await fs.rm(dir, { recursive: true, force: true });
+    });
+
+    it('migrates a legacy (salt-derived) store to the external key and bumps to version 2', async () => {
+      const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'drop-secret-migrate-'));
+      const store = path.join(dir, 'secrets.json');
+      const keyFile = path.join(dir, 'encryption.key');
+
+      // Write a legacy v1 store with no external key.
+      const legacy = new SecretManager({ storePath: store });
+      await legacy.initialize();
+      await legacy.set('app', 'TOKEN', 'legacy-value');
+
+      const before = JSON.parse(await fs.readFile(store, 'utf-8'));
+      expect(before.version).toBe(1);
+
+      // Now provide an external key file — should migrate transparently.
+      await fs.writeFile(keyFile, 'b'.repeat(64));
+      const migrated = new SecretManager({ storePath: store, masterKeyPath: keyFile });
+      await migrated.initialize();
+
+      expect(migrated.get('app', 'TOKEN')).toBe('legacy-value');
+      const after = JSON.parse(await fs.readFile(store, 'utf-8'));
+      expect(after.version).toBe(2);
+
+      await fs.rm(dir, { recursive: true, force: true });
+    });
+  });
 });
