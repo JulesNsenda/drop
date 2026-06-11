@@ -132,7 +132,11 @@ export class DropPlatform {
   private usedPorts: Map<number, string> = new Map(); // port -> appName ownership
   private appsInProgress: Set<string> = new Set(); // Track apps being built/started
   private appDeployTimes: Map<string, number> = new Map(); // Track when apps were last deployed
-  private readonly DEPLOY_COOLDOWN_MS = 5000; // Ignore updates within 5s of deploy
+  private appBuildDurations: Map<string, number> = new Map(); // Last build duration per app (ms)
+  /** Minimum post-deploy quiet window. Adaptive: max(this, lastBuildDuration * 2). */
+  private readonly DEPLOY_COOLDOWN_MS_MIN = 5_000;
+  /** Hard cap on the adaptive cooldown so a flaky 10-minute build doesn't lock out hot-reload forever. */
+  private readonly DEPLOY_COOLDOWN_MS_MAX = 120_000;
   private certExpiryTimer: ReturnType<typeof setInterval> | null = null;
   private readonly CERT_CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 hours
 
@@ -653,12 +657,15 @@ import ${path.join(dataDir, 'appconf', 'caddy', 'hosts', '*.caddy').replace(/\\/
       this.logger.warn('Caddy not available - apps accessible via direct ports only', 'CADDY');
     }
 
-    // Initialize watcher (watches apps directory)
+    // Initialize watcher (watches apps directory).
+    // isAppLocked tells the watcher to silently drop rebuild events while a
+    // deploy is in flight — important for Docker builds that can take minutes.
     this.watcher = new WatcherService({
       appsDir: this.config.appsDirectory,
       ignorePatterns: ['**/node_modules/**', '**/.git/**', '**/dist/**', '**/build/**'],
       debounceMs: 1000,
       maxDepth: 2,
+      isAppLocked: (name) => this.appsInProgress.has(name),
     });
   }
 
@@ -1019,6 +1026,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
 
     try {
       const detection = await this.detector.detect(appPath);
+      const workDir = await this.getBuildWorkDir(appName);
 
       const result = await this.builder.build({
         appName,
@@ -1030,9 +1038,11 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           installCommand: detection.suggestedConfig?.installCommand,
         },
         env: {},
+        workDir,
       });
 
       if (result.success) {
+        this.appBuildDurations.set(appName, result.duration);
         this.logger.appEvent('built', appName, `completed in ${result.duration}ms`);
         // Update config and state with build duration
         if (this.appConfigService) {
@@ -1287,9 +1297,11 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       return;
     }
 
-    // Skip if app was just deployed (cooldown period to prevent loops)
+    // Skip if app was just deployed (adaptive cooldown to prevent loops).
+    // The window is max(5s, lastBuildDuration * 2) so Docker builds that take
+    // minutes don't immediately re-trigger from their own output files.
     const lastDeployTime = this.appDeployTimes.get(appName);
-    if (lastDeployTime && Date.now() - lastDeployTime < this.DEPLOY_COOLDOWN_MS) {
+    if (lastDeployTime && Date.now() - lastDeployTime < this.getEffectiveCooldownMs(appName)) {
       this.logger.debug(`Skipping update for ${appName} - within cooldown period`, 'UPDATE');
       return;
     }
@@ -1325,6 +1337,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
 
       // 3. Re-detect and rebuild the app
       const detection = await this.detector.detect(appPath);
+      const workDir = await this.getBuildWorkDir(appName);
       const buildResult = await this.builder.build({
         appName,
         appPath,
@@ -1335,6 +1348,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           installCommand: detection.suggestedConfig?.installCommand,
         },
         env: {},
+        workDir,
       });
 
       if (!buildResult.success) {
@@ -1346,6 +1360,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         return;
       }
 
+      this.appBuildDurations.set(appName, buildResult.duration);
       this.logger.appEvent('built', appName, `rebuilt in ${buildResult.duration}ms`);
 
       // 4. Restart the app on the same port (or allocate new if none)
@@ -1428,6 +1443,32 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       });
       this.appsInProgress.delete(appName);
     }
+  }
+
+  /**
+   * Return (and create) the scratch directory for a build's ephemeral
+   * artifacts.  Lives at data/temp/{appName}/ — well outside the watched
+   * webapps directory, so the watcher never sees build-context tarballs,
+   * generated Dockerfiles, layer caches, or any other temp output.
+   */
+  private async getBuildWorkDir(appName: string): Promise<string> {
+    const workDir = path.join(this.config.dropRoot, 'data', 'temp', appName);
+    await fs.mkdir(workDir, { recursive: true });
+    return workDir;
+  }
+
+  /**
+   * Compute the effective post-deploy quiet window for an app.
+   * The adaptive formula prevents a slow Docker build from triggering an
+   * immediate re-build caused by its own output files, while still allowing
+   * fast hot-reloads for quick builds.
+   */
+  private getEffectiveCooldownMs(appName: string): number {
+    const last = this.appBuildDurations.get(appName) ?? 0;
+    return Math.min(
+      this.DEPLOY_COOLDOWN_MS_MAX,
+      Math.max(this.DEPLOY_COOLDOWN_MS_MIN, last * 2)
+    );
   }
 
   /**

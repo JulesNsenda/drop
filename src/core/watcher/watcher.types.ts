@@ -16,6 +16,15 @@ export interface WatcherConfig {
   pollInterval: number;
   followSymlinks: boolean;
   persistent: boolean;
+  /**
+   * Optional callback the platform supplies so the watcher can skip rebuild
+   * events for apps that are currently being deployed.  Without this the
+   * watcher would still emit app:update, and the platform handler would drop
+   * them via its own appsInProgress guard — but having the lock respected at
+   * the source means Docker builds (which can run for minutes) never queue
+   * redundant rebuilds in the first place.
+   */
+  isAppLocked?: (appName: string) => boolean;
 }
 
 // Watch event types (from chokidar)
