@@ -15,8 +15,19 @@ export {
 export { manifestDetector, validateManifest } from './detectors/manifest';
 export { nodejsDetector } from './detectors/nodejs';
 export { pythonDetector } from './detectors/python';
+export { goDetector } from './detectors/go';
 export { staticDetector } from './detectors/static';
 export { dockerDetector } from './detectors/docker';
+
+// Export drop.yaml parser
+export {
+  parseDropYaml,
+  findDropYaml,
+  getCustomDomains,
+  getTlsConfig,
+  mergeWithDefaults,
+  validateDropYamlConfig,
+} from './drop-yaml-parser';
 
 export type {
   AppType,
@@ -30,3 +41,11 @@ export type {
   GoMod,
   CargoToml,
 } from './detector.types';
+
+export type {
+  DropYamlConfig,
+  DropYamlParseResult,
+  AppTlsConfig,
+  AppEnvConfig,
+  AppDependency,
+} from './drop-yaml-parser';

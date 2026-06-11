@@ -8,6 +8,7 @@ import * as crypto from 'crypto';
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import { Pool } from 'pg';
+import { writeJsonAtomic } from '../../utils/atomic-write';
 import { PostgresServer } from './postgres-server';
 
 export interface DatabaseCredentials {
@@ -100,14 +101,16 @@ export class DatabaseProvisioner {
       return existing.credentials;
     }
 
-    // Fallback - use postgres user
+    // Fallback - use the (secured) postgres superuser.
+    const superuserPassword = this.server.getSuperuserPassword();
+    const auth = `postgres:${encodeURIComponent(superuserPassword)}`;
     return {
       host: 'localhost',
       port: this.server.getPort(),
       database: dbName,
       user: 'postgres',
-      password: '',
-      connectionString: `postgresql://postgres@localhost:${this.server.getPort()}/${dbName}`,
+      password: superuserPassword,
+      connectionString: `postgresql://${auth}@localhost:${this.server.getPort()}/${dbName}`,
     };
   }
 
@@ -149,12 +152,7 @@ export class DatabaseProvisioner {
     await this.server.grantPrivileges(dbName, userName);
 
     // Also grant on public schema for new databases
-    const appPool = new Pool({
-      host: 'localhost',
-      port: this.server.getPort(),
-      user: 'postgres',
-      database: dbName,
-    });
+    const appPool = new Pool(this.server.getSuperuserPoolConfig(dbName));
 
     try {
       await appPool.query(`GRANT ALL ON SCHEMA public TO "${userName}"`);
@@ -315,6 +313,6 @@ export class DatabaseProvisioner {
     };
 
     await fs.mkdir(path.dirname(this.credentialsPath), { recursive: true });
-    await fs.writeFile(this.credentialsPath, JSON.stringify(data, null, 2), { mode: 0o600 });
+    await writeJsonAtomic(this.credentialsPath, data, { mode: 0o600 });
   }
 }

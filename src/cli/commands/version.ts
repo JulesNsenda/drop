@@ -6,9 +6,9 @@
 
 import { Command } from 'commander';
 import * as output from '../utils/output';
+import { getPlatformVersion } from '../../utils/version';
 
-// Version from package.json
-const VERSION = '0.1.0-alpha.1';
+const VERSION = getPlatformVersion();
 
 export function createVersionCommand(): Command {
   const cmd = new Command('version')

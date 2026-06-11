@@ -9,6 +9,7 @@ import * as jose from 'jose';
 import * as crypto from 'crypto';
 import * as fs from 'fs/promises';
 import * as path from 'path';
+import { writeJsonAtomic } from '../../utils/atomic-write';
 import { error, ErrorCodes } from '../types';
 
 // Auth configuration
@@ -33,6 +34,9 @@ export interface User {
   role: 'admin' | 'user' | 'readonly';
   createdAt: string;
   lastLogin?: string;
+  email?: string;
+  enabled?: boolean; // default true
+  maxApps?: number; // per-user override (0 = use global default)
 }
 
 // API key record
@@ -75,6 +79,10 @@ interface CredentialsStore {
 let config: AuthConfig | null = null;
 let credentials: CredentialsStore | null = null;
 let jwtSecret: Uint8Array | null = null;
+
+// Throttle persistence of the cosmetic apiKey.lastUsed field.
+const LASTUSED_FLUSH_INTERVAL_MS = 60_000;
+let lastUsedFlushAt = 0;
 
 /**
  * Initialize the auth system
@@ -136,25 +144,43 @@ async function loadCredentials(credentialsPath: string): Promise<CredentialsStor
  */
 async function saveCredentials(credentialsPath: string, store: CredentialsStore): Promise<void> {
   await fs.mkdir(path.dirname(credentialsPath), { recursive: true });
-  await fs.writeFile(credentialsPath, JSON.stringify(store, null, 2), { mode: 0o600 });
+  await writeJsonAtomic(credentialsPath, store, { mode: 0o600 });
 }
 
 /**
- * Hash a password using SHA-256 with salt
+ * Hash a password using scrypt (more secure than SHA-256)
  */
 function hashPassword(password: string, salt?: string): { hash: string; salt: string } {
   const useSalt = salt || crypto.randomBytes(16).toString('hex');
-  const hash = crypto.createHash('sha256').update(password + useSalt).digest('hex');
-  return { hash: `${useSalt}:${hash}`, salt: useSalt };
+  const derived = crypto.scryptSync(password, useSalt, 64, { N: 16384, r: 8, p: 1 });
+  return { hash: `scrypt:${useSalt}:${derived.toString('hex')}`, salt: useSalt };
 }
 
 /**
- * Verify a password against a hash
+ * Verify a password against a hash.
+ * Supports both legacy SHA-256 and new scrypt hashes for backward compatibility.
  */
 function verifyPassword(password: string, storedHash: string): boolean {
+  if (storedHash.startsWith('scrypt:')) {
+    // New scrypt format: "scrypt:salt:hash"
+    const [, salt, hash] = storedHash.split(':');
+    const derived = crypto.scryptSync(password, salt, 64, { N: 16384, r: 8, p: 1 });
+    return crypto.timingSafeEqual(Buffer.from(hash, 'hex'), derived);
+  }
+
+  // Legacy SHA-256 format: "salt:hash"
   const [salt] = storedHash.split(':');
-  const { hash: computedHash } = hashPassword(password, salt);
-  return computedHash === storedHash;
+  const legacyHash = crypto.createHash('sha256').update(password + salt).digest('hex');
+  const computedHash = `${salt}:${legacyHash}`;
+  const a = Buffer.from(computedHash);
+  const b = Buffer.from(storedHash);
+  // Constant-time compare to avoid leaking the hash via response timing.
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+
+/** Whether a stored hash uses the deprecated SHA-256 format (should be upgraded). */
+function isLegacyPasswordHash(storedHash: string): boolean {
+  return !storedHash.startsWith('scrypt:');
 }
 
 /**
@@ -163,7 +189,8 @@ function verifyPassword(password: string, storedHash: string): boolean {
 export async function createUser(
   username: string,
   password: string,
-  role: 'admin' | 'user' | 'readonly' = 'user'
+  role: 'admin' | 'user' | 'readonly' = 'user',
+  email?: string
 ): Promise<User> {
   if (!credentials || !config) {
     throw new Error('Auth not initialized');
@@ -180,6 +207,7 @@ export async function createUser(
     username,
     passwordHash,
     role,
+    email,
     createdAt: new Date().toISOString(),
   };
 
@@ -187,6 +215,69 @@ export async function createUser(
   await saveCredentials(config.credentialsPath, credentials);
 
   return user;
+}
+
+/**
+ * Change a user's password
+ */
+export async function changePassword(userId: string, currentPassword: string, newPassword: string): Promise<boolean> {
+  if (!credentials || !config) throw new Error('Auth not initialized');
+
+  const user = credentials.users.find((u) => u.id === userId);
+  if (!user || !verifyPassword(currentPassword, user.passwordHash)) return false;
+
+  const { hash } = hashPassword(newPassword);
+  user.passwordHash = hash;
+  await saveCredentials(config.credentialsPath, credentials);
+  return true;
+}
+
+/**
+ * Update a user's properties (admin function)
+ */
+/**
+ * Admin reset a user's password
+ */
+export async function resetUserPassword(userId: string, newPassword: string): Promise<boolean> {
+  if (!credentials || !config) throw new Error('Auth not initialized');
+  const user = credentials.users.find((u) => u.id === userId);
+  if (!user) return false;
+  const { hash } = hashPassword(newPassword);
+  user.passwordHash = hash;
+  await saveCredentials(config.credentialsPath, credentials);
+  return true;
+}
+
+/**
+ * Delete a user account
+ */
+export async function deleteUser(userId: string): Promise<boolean> {
+  if (!credentials || !config) throw new Error('Auth not initialized');
+  const index = credentials.users.findIndex((u) => u.id === userId);
+  if (index === -1) return false;
+  // Don't allow deleting the last admin
+  const user = credentials.users[index];
+  if (user.role === 'admin') {
+    const adminCount = credentials.users.filter((u) => u.role === 'admin').length;
+    if (adminCount <= 1) throw new Error('Cannot delete the last admin account');
+  }
+  credentials.users.splice(index, 1);
+  await saveCredentials(config.credentialsPath, credentials);
+  return true;
+}
+
+export async function updateUser(userId: string, updates: { enabled?: boolean; role?: 'admin' | 'user' | 'readonly'; maxApps?: number; email?: string }): Promise<boolean> {
+  if (!credentials || !config) throw new Error('Auth not initialized');
+
+  const user = credentials.users.find((u) => u.id === userId);
+  if (!user) return false;
+
+  if (updates.enabled !== undefined) user.enabled = updates.enabled;
+  if (updates.role) user.role = updates.role;
+  if (updates.maxApps !== undefined) user.maxApps = updates.maxApps;
+  if (updates.email !== undefined) user.email = updates.email;
+  await saveCredentials(config.credentialsPath, credentials);
+  return true;
 }
 
 /**
@@ -200,6 +291,16 @@ export async function authenticateUser(username: string, password: string): Prom
   const user = credentials.users.find((u) => u.username === username);
   if (!user || !verifyPassword(password, user.passwordHash)) {
     return null;
+  }
+
+  // Block disabled users
+  if (user.enabled === false) {
+    return null;
+  }
+
+  // Opportunistically upgrade legacy SHA-256 hashes to scrypt on successful login.
+  if (isLegacyPasswordHash(user.passwordHash)) {
+    user.passwordHash = hashPassword(password).hash;
   }
 
   // Update last login
@@ -229,7 +330,8 @@ export async function verifyJwt(token: string): Promise<JwtPayload | null> {
   }
 
   try {
-    const { payload } = await jose.jwtVerify(token, jwtSecret);
+    // Pin the algorithm — never accept anything but the HS256 we sign with.
+    const { payload } = await jose.jwtVerify(token, jwtSecret, { algorithms: ['HS256'] });
     return payload as unknown as JwtPayload;
   } catch {
     return null;
@@ -290,9 +392,15 @@ export async function verifyApiKey(key: string): Promise<ApiKey | null> {
     return null;
   }
 
-  // Update last used
+  // Update last used in memory immediately, but persist at most once per
+  // minute — otherwise every authenticated request rewrites the entire
+  // credentials file (lock contention + needless I/O for a cosmetic field).
   apiKey.lastUsed = new Date().toISOString();
-  await saveCredentials(config.credentialsPath, credentials);
+  const now = Date.now();
+  if (now - lastUsedFlushAt >= LASTUSED_FLUSH_INTERVAL_MS) {
+    lastUsedFlushAt = now;
+    await saveCredentials(config.credentialsPath, credentials);
+  }
 
   return apiKey;
 }
@@ -336,6 +444,25 @@ export function listUsers(): Omit<User, 'passwordHash'>[] {
   }
 
   return credentials.users.map(({ passwordHash: _, ...user }) => user);
+}
+
+/**
+ * Get a user by username (without password hash)
+ */
+export function getUser(username: string): Omit<User, 'passwordHash'> | null {
+  if (!credentials) return null;
+  const user = credentials.users.find((u) => u.username === username);
+  if (!user) return null;
+  const { passwordHash: _, ...safe } = user;
+  return safe;
+}
+
+export function getUserById(userId: string): Omit<User, 'passwordHash'> | null {
+  if (!credentials) return null;
+  const user = credentials.users.find((u) => u.id === userId);
+  if (!user) return null;
+  const { passwordHash: _, ...safe } = user;
+  return safe;
 }
 
 /**

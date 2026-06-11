@@ -262,8 +262,7 @@ export class ProcessManager {
     // Read stdout logs
     if (outLogPath) {
       try {
-        const content = await fs.readFile(outLogPath, 'utf-8');
-        const outLines = content.split('\n').slice(-lines);
+        const outLines = (await this.tailFile(outLogPath, lines)).slice(-lines);
         logs += outLines.map(l => `[out] ${l}`).join('\n');
       } catch {
         // Log file may not exist
@@ -273,8 +272,7 @@ export class ProcessManager {
     // Read stderr logs
     if (errLogPath) {
       try {
-        const content = await fs.readFile(errLogPath, 'utf-8');
-        const errLines = content.split('\n').slice(-lines);
+        const errLines = (await this.tailFile(errLogPath, lines)).slice(-lines);
         if (logs) logs += '\n';
         logs += errLines.map(l => `[err] ${l}`).join('\n');
       } catch {
@@ -283,6 +281,30 @@ export class ProcessManager {
     }
 
     return logs;
+  }
+
+  /**
+   * Read approximately the last `lines` lines of a file without loading the
+   * whole thing into memory. Production log files grow to GBs; a full
+   * readFile would OOM the platform process.
+   */
+  private async tailFile(filePath: string, lines: number): Promise<string[]> {
+    // Assume a generous average line length; read a bounded tail window.
+    const avgLineBytes = 512;
+    const readBytes = Math.min(lines * avgLineBytes, 2 * 1024 * 1024); // cap 2MB
+
+    const handle = await fs.open(filePath, 'r');
+    try {
+      const { size } = await handle.stat();
+      const start = Math.max(0, size - readBytes);
+      const length = size - start;
+      if (length <= 0) return [];
+      const buffer = Buffer.alloc(length);
+      await handle.read(buffer, 0, length, start);
+      return buffer.toString('utf-8').split('\n');
+    } finally {
+      await handle.close();
+    }
   }
 
   /**
@@ -562,13 +584,13 @@ export class ProcessManager {
       await this.sleep(pollInterval);
     }
 
-    // Return last known status on timeout
+    // Timed out. Returning the last (wrong) status would let callers treat an
+    // app that never started as if it had — always throw instead.
     const finalStatus = await this.getStatus(name);
-    if (finalStatus) {
-      return finalStatus;
-    }
-
-    throw new Error(`Timeout waiting for process ${name} to reach status ${targetStatus}`);
+    throw new Error(
+      `Timeout waiting for process ${name} to reach status ${targetStatus}` +
+        (finalStatus ? ` (last status: ${finalStatus.status})` : '')
+    );
   }
 
   private sleep(ms: number): Promise<void> {

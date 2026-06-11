@@ -19,6 +19,15 @@ export {
   parseTlsProtocols,
 } from './caddy-generator';
 
+export {
+  validateDnsCredentials,
+  generateDnsChallengeConfig,
+  generateTlsDirectiveWithDns,
+  requiresDnsChallenge,
+  getRequiredEnvVars,
+  checkProviderEnvVars,
+} from './dns-challenge';
+
 export type {
   RouteConfig,
   Route,
@@ -33,3 +42,9 @@ export type {
   RouterEventType,
   RouteChangePayload,
 } from './router.types';
+
+export type {
+  DnsProvider,
+  DnsProviderConfig,
+  DnsChallengeConfig,
+} from './dns-challenge';

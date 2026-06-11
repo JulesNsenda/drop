@@ -9,7 +9,7 @@ import * as path from 'path';
 import * as fs from 'fs/promises';
 import { EventBus, eventBus, Unsubscribe } from './event-bus';
 import { WatcherService } from './watcher';
-import { DetectorService, getDetector } from './detector';
+import { DetectorService, getDetector, parseDropYaml } from './detector';
 import { BuilderService, getBuilder } from './builder';
 import { RouterService, getRouterService, resetRouterService } from './router';
 import { ProcessManager, getProcessManager, resetProcessManager } from '../managers/process';
@@ -17,8 +17,17 @@ import { AppStateManager, getStateManager, resetStateManager } from '../managers
 import { AppConfigService, getAppConfigService, resetAppConfigService } from '../managers/app/app-config';
 import { PostgresServer, getPostgresServer, resetPostgresServer, DatabaseProvisioner } from '../managers/database';
 import { CaddyServer, getCaddyServer, resetCaddyServer } from '../managers/router';
+import { SecretManager, getSecretManager, resetSecretManager } from '../managers/secret';
+import { WebhookManager, getWebhookManager, resetWebhookManager } from './webhooks';
+import { GitDeployService, getGitDeployService, resetGitDeployService } from './git-deploy';
+import { getActivityLog, resetActivityLog } from '../managers/activity';
 import { ApiServer, createApiServer } from '../api';
 import { Logger, createLogger } from '../utils/logger';
+import {
+  validateDomain,
+  validateDomainFormat,
+  isLocalhostDomain,
+} from '../utils/domain-validator';
 
 export interface PlatformConfig {
   /** Root directory for DROP */
@@ -45,12 +54,25 @@ export interface PlatformConfig {
   acmeStaging?: boolean;
   /** Default domain suffix (e.g., "example.com" for apps at myapp.example.com) */
   domainSuffix?: string;
+  /** DNS provider for DNS-01 challenge (wildcard certs) */
+  dnsProvider?: 'cloudflare' | 'route53' | 'digitalocean' | 'godaddy';
+  /** DNS provider credentials */
+  dnsCredentials?: {
+    apiToken?: string;
+    zoneId?: string;
+    accessKey?: string;
+    secretKey?: string;
+  };
+  /** Use wildcard certificate for all apps */
+  wildcardCert?: boolean;
   /** Enable API server */
   enableApi: boolean;
   /** API server port */
   apiPort: number;
   /** Enable API authentication */
   enableApiAuth: boolean;
+  /** Maximum apps per user (0 = unlimited) */
+  maxAppsPerUser: number;
 }
 
 // Determine platform-appropriate defaults
@@ -74,9 +96,13 @@ const DEFAULT_CONFIG: PlatformConfig = {
   acmeEmail: undefined,
   acmeStaging: false,
   domainSuffix: 'localhost',
+  dnsProvider: undefined,
+  dnsCredentials: undefined,
+  wildcardCert: false,
   enableApi: true,
   apiPort: 3000,
-  enableApiAuth: process.env.NODE_ENV === 'production',
+  enableApiAuth: process.env.DROP_DISABLE_AUTH !== 'true',
+  maxAppsPerUser: parseInt(process.env.DROP_MAX_APPS_PER_USER || '5', 10),
 };
 
 export class DropPlatform {
@@ -94,6 +120,9 @@ export class DropPlatform {
   private postgresServer: PostgresServer | null = null;
   private dbProvisioner: DatabaseProvisioner | null = null;
   private caddyServer: CaddyServer | null = null;
+  private secretManager: SecretManager | null = null;
+  private webhookManager: WebhookManager | null = null;
+  private gitDeployService: GitDeployService | null = null;
   private apiServer: ApiServer | null = null;
 
   private subscriptions: Unsubscribe[] = [];
@@ -103,8 +132,18 @@ export class DropPlatform {
   private appsInProgress: Set<string> = new Set(); // Track apps being built/started
   private appDeployTimes: Map<string, number> = new Map(); // Track when apps were last deployed
   private readonly DEPLOY_COOLDOWN_MS = 5000; // Ignore updates within 5s of deploy
+  private certExpiryTimer: ReturnType<typeof setInterval> | null = null;
+  private readonly CERT_CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 hours
 
   constructor(config?: Partial<PlatformConfig>) {
+    // Load DNS credentials from environment variables
+    const dnsCredentials = config?.dnsCredentials ?? {
+      apiToken: process.env.DROP_DNS_CF_API_TOKEN || process.env.CF_API_TOKEN,
+      zoneId: process.env.DROP_DNS_CF_ZONE_ID || process.env.CF_ZONE_ID,
+      accessKey: process.env.DROP_DNS_AWS_ACCESS_KEY || process.env.AWS_ACCESS_KEY_ID,
+      secretKey: process.env.DROP_DNS_AWS_SECRET_KEY || process.env.AWS_SECRET_ACCESS_KEY,
+    };
+
     this.config = {
       ...DEFAULT_CONFIG,
       dropRoot: config?.dropRoot ?? process.env.DROP_ROOT ?? DEFAULT_CONFIG.dropRoot,
@@ -114,6 +153,9 @@ export class DropPlatform {
       acmeEmail: config?.acmeEmail ?? process.env.DROP_ACME_EMAIL ?? DEFAULT_CONFIG.acmeEmail,
       acmeStaging: config?.acmeStaging ?? (process.env.DROP_ACME_STAGING !== undefined ? process.env.DROP_ACME_STAGING === 'true' : DEFAULT_CONFIG.acmeStaging),
       domainSuffix: config?.domainSuffix ?? process.env.DROP_DOMAIN_SUFFIX ?? DEFAULT_CONFIG.domainSuffix,
+      dnsProvider: config?.dnsProvider ?? (process.env.DROP_DNS_PROVIDER as PlatformConfig['dnsProvider']) ?? DEFAULT_CONFIG.dnsProvider,
+      dnsCredentials: Object.values(dnsCredentials).some(v => v) ? dnsCredentials : undefined,
+      wildcardCert: config?.wildcardCert ?? (process.env.DROP_WILDCARD_CERT !== undefined ? process.env.DROP_WILDCARD_CERT === 'true' : DEFAULT_CONFIG.wildcardCert),
       enableApi: config?.enableApi ?? (process.env.DROP_ENABLE_API !== undefined ? process.env.DROP_ENABLE_API !== 'false' : DEFAULT_CONFIG.enableApi),
       apiPort: config?.apiPort ?? (process.env.DROP_API_PORT ? parseInt(process.env.DROP_API_PORT, 10) : DEFAULT_CONFIG.apiPort),
       enableApiAuth: config?.enableApiAuth ?? (process.env.DROP_ENABLE_API_AUTH !== undefined ? process.env.DROP_ENABLE_API_AUTH === 'true' : DEFAULT_CONFIG.enableApiAuth),
@@ -142,6 +184,11 @@ export class DropPlatform {
     this.eventBus.publish('platform:starting', { config: this.config as unknown as Record<string, unknown> });
 
     try {
+      // Validate domain configuration if HTTPS is enabled
+      if (this.config.enableHttps && this.config.domainSuffix) {
+        await this.validateDomainConfig();
+      }
+
       // Ensure required directories exist
       await this.ensureDirectories();
 
@@ -165,6 +212,11 @@ export class DropPlatform {
         await this.startApiServer();
       }
 
+      // Start certificate expiry monitoring if HTTPS is enabled
+      if (this.config.enableHttps && !isLocalhostDomain(this.config.domainSuffix || 'localhost')) {
+        this.startCertificateMonitoring();
+      }
+
       this.isRunning = true;
       this.eventBus.publish('platform:started', { timestamp: new Date() });
       this.logger.platformEvent('started');
@@ -183,6 +235,12 @@ export class DropPlatform {
     this.logger.platformEvent('stopping');
     this.eventBus.publish('platform:stopping', { timestamp: new Date() });
 
+    // Stop certificate monitoring
+    if (this.certExpiryTimer) {
+      clearInterval(this.certExpiryTimer);
+      this.certExpiryTimer = null;
+    }
+
     // Unsubscribe from all events
     for (const unsub of this.subscriptions) {
       unsub();
@@ -193,6 +251,11 @@ export class DropPlatform {
     if (this.watcher) {
       await this.watcher.stop();
     }
+
+    // Let any in-flight build/start finish (best-effort, bounded) before we
+    // tear down the builder/state so apps aren't left half-deployed.
+    await this.drainInProgress(10_000);
+    this.appsInProgress.clear();
 
     if (this.router) {
       this.router.stop();
@@ -229,6 +292,12 @@ export class DropPlatform {
       resetCaddyServer();
     }
 
+    // Reset secret manager, webhook manager, and git deploy service
+    resetSecretManager();
+    resetWebhookManager();
+    resetGitDeployService();
+    resetActivityLog();
+
     // Stop API server
     if (this.apiServer) {
       await this.apiServer.stop();
@@ -239,6 +308,23 @@ export class DropPlatform {
     this.eventBus.publish('platform:stopped', { timestamp: new Date() });
     this.logger.platformEvent('stopped');
     this.logger.close();
+  }
+
+  /** Wait (up to timeoutMs) for in-progress deploys to drain. */
+  private async drainInProgress(timeoutMs: number): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    while (this.appsInProgress.size > 0 && Date.now() < deadline) {
+      await new Promise((resolve) => {
+        const t = setTimeout(resolve, 100);
+        t.unref?.();
+      });
+    }
+    if (this.appsInProgress.size > 0) {
+      this.logger.warn(
+        `Shutdown proceeding with ${this.appsInProgress.size} deploy(s) still in progress`,
+        'PLATFORM'
+      );
+    }
   }
 
   private async ensureDirectories(): Promise<void> {
@@ -479,6 +565,36 @@ import ${path.join(dataDir, 'appconf', 'caddy', 'hosts', '*.caddy').replace(/\\/
     await this.appConfigService.initialize();
     this.logger.info(`App config service initialized (${this.appConfigService.getAllConfigs().length} configs loaded)`, 'CONFIG');
 
+    // Initialize secret manager for encrypted app secrets
+    const secretStorePath = path.join(this.config.dropRoot, 'data', 'drop-svc', 'secrets.json');
+    this.secretManager = getSecretManager({
+      storePath: secretStorePath,
+      masterKey: process.env.DROP_MASTER_KEY,
+      // Fall back to the auto-generated encryption.key (0600, separate from
+      // secrets.json) so secrets aren't encrypted with a key derived from
+      // their own store file.
+      masterKeyPath: path.join(this.config.dropRoot, 'data', 'drop-svc', 'encryption.key'),
+    });
+    await this.secretManager.initialize();
+    this.logger.info('Secret manager initialized', 'SECURITY');
+
+    // Initialize webhook manager
+    const webhookStorePath = path.join(this.config.dropRoot, 'data', 'drop-svc', 'webhooks.json');
+    this.webhookManager = getWebhookManager({ storePath: webhookStorePath });
+    await this.webhookManager.initialize();
+    this.logger.info('Webhook manager initialized', 'WEBHOOKS');
+
+    // Initialize git deploy service
+    this.gitDeployService = getGitDeployService({
+      appsDirectory: this.config.appsDirectory,
+    });
+    await this.gitDeployService.initialize();
+
+    // Initialize activity log
+    const activityLogPath = path.join(this.config.dropRoot, 'data', 'drop-svc', 'activity-log.json');
+    const activityLog = getActivityLog(activityLogPath);
+    await activityLog.initialize();
+
     // Sync state manager with app configs (configs are source of truth for ports)
     await this.syncStateWithConfigs();
 
@@ -506,6 +622,8 @@ import ${path.join(dataDir, 'appconf', 'caddy', 'hosts', '*.caddy').replace(/\\/
         acmeStaging: this.config.acmeStaging,
         enableAdminApi: true,
         adminApi: 'localhost:2019',
+        dnsProvider: this.config.dnsProvider,
+        wildcardCert: this.config.wildcardCert,
       },
     });
 
@@ -514,6 +632,13 @@ import ${path.join(dataDir, 'appconf', 'caddy', 'hosts', '*.caddy').replace(/\\/
       dropRoot: this.config.dropRoot,
       caddyfilePath: this.config.caddyfilePath,
       onLog: (msg) => this.logger.debug(msg, 'CADDY'),
+      onError: (msg) => {
+        this.logger.warn(msg, 'CADDY');
+        this.eventBus.publish('platform:error', {
+          error: new Error(msg),
+          context: 'caddy',
+        });
+      },
     });
 
     const caddyAvailable = await this.caddyServer.ensureReady((msg) => {
@@ -542,11 +667,15 @@ import ${path.join(dataDir, 'appconf', 'caddy', 'hosts', '*.caddy').replace(/\\/
   private async startApiServer(): Promise<void> {
     const credentialsPath = path.join(this.config.dropRoot, 'data', 'drop-svc', 'api-credentials.json');
 
+    const logDir = path.join(this.config.dropRoot, 'data', 'logs');
+
     this.apiServer = createApiServer({
       port: this.config.apiPort,
       host: '0.0.0.0',
       credentialsPath,
       enableAuth: this.config.enableApiAuth,
+      logDir,
+      appsDirectory: this.config.appsDirectory,
     });
 
     await this.apiServer.initialize();
@@ -581,8 +710,11 @@ import ${path.join(dataDir, 'appconf', 'caddy', 'hosts', '*.caddy').replace(/\\/
             pid: proc.pid ?? undefined,
           });
         } else if (app.status === 'running' && !runningNames.has(app.name)) {
-          // App was marked running but isn't - mark as stopped
-          await this.stateManager.setAppStatus(app.name, 'stopped');
+          // App was 'running' but its process is gone (platform/host restarted
+          // out from under it). Mark 'pending' — NOT 'stopped' — so the
+          // startup detection scan rebuilds and restarts it. User-stopped apps
+          // are persisted as 'stopped' and are intentionally left alone.
+          await this.stateManager.setAppStatus(app.name, 'pending');
         }
       }
 
@@ -628,6 +760,12 @@ import ${path.join(dataDir, 'appconf', 'caddy', 'hosts', '*.caddy').replace(/\\/
     // When watcher detects a new directory, detect the app type
     const watcherSub = this.eventBus.subscribe('watcher:change', async (payload) => {
       if (payload.changeType === 'addDir' && this.isTopLevelApp(payload.path)) {
+        const appName = path.basename(payload.path);
+        // Skip apps currently being cloned by git deploy (race condition prevention)
+        if (this.gitDeployService?.isCloning(appName)) {
+          this.logger.debug(`Skipping watcher detection for ${appName} - git clone in progress`, 'GIT-DEPLOY');
+          return;
+        }
         await this.handleNewApp(payload.path);
       }
     });
@@ -635,7 +773,10 @@ import ${path.join(dataDir, 'appconf', 'caddy', 'hosts', '*.caddy').replace(/\\/
 
     // When app is detected, create config and build it
     const detectedSub = this.eventBus.subscribe('app:detected', async (payload) => {
-      const appType = (payload.type || 'unknown') as 'nodejs' | 'python' | 'static' | 'docker' | 'unknown';
+      // Skip apps currently being cloned
+      if (this.gitDeployService?.isCloning(payload.name)) return;
+
+      const appType = (payload.type || 'unknown') as 'nodejs' | 'python' | 'go' | 'static' | 'docker' | 'unknown';
 
       // Create or update app config file (source of truth)
       if (this.appConfigService) {
@@ -651,17 +792,35 @@ import ${path.join(dataDir, 'appconf', 'caddy', 'hosts', '*.caddy').replace(/\\/
         await this.stateManager.registerApp(payload.name, payload.path, appType);
       }
 
-      // Build the app if auto-build is enabled
-      if (this.config.autoBuild && payload.type !== 'unknown') {
+      // Build the app if auto-build is enabled (skip if user stopped it)
+      const currentApp = this.stateManager?.getApp(payload.name);
+      if (this.config.autoBuild && payload.type !== 'unknown' && currentApp?.status !== 'stopped') {
         await this.handleBuildApp(payload.path, payload.name, payload.type as string);
       }
     });
     this.subscriptions.push(detectedSub);
 
-    // When build completes, start the app
+    // When build completes, start the app (unless it failed or was stopped).
+    // handleBuildApp keeps the app in appsInProgress through the build and
+    // hands ownership to handleStartApp; every path here that does NOT start
+    // the app must release the guard, or future hot-reloads dead-end forever.
     const buildSub = this.eventBus.subscribe('build:completed', async (payload) => {
-      if (this.config.autoStart) {
-        await this.handleStartApp(payload.appId);
+      if (payload.success === false) {
+        // Failed build — handleBuildApp already marked it errored and cleaned up.
+        this.appsInProgress.delete(payload.appId);
+        return;
+      }
+
+      const app = this.stateManager?.getApp(payload.appId);
+      const shouldStart = this.config.autoStart && app?.status !== 'stopped';
+
+      if (shouldStart) {
+        await this.handleStartApp(payload.appId); // owns appsInProgress cleanup
+      } else {
+        if (app?.status === 'stopped') {
+          this.logger.info(`Skipping auto-start for ${payload.appId} - app was stopped by user`, 'APP');
+        }
+        this.appsInProgress.delete(payload.appId);
       }
     });
     this.subscriptions.push(buildSub);
@@ -674,6 +833,8 @@ import ${path.join(dataDir, 'appconf', 'caddy', 'hosts', '*.caddy').replace(/\\/
 
     // When app files are updated, rebuild and restart
     const updateSub = this.eventBus.subscribe('app:update', async (payload) => {
+      // Skip apps currently being cloned
+      if (this.gitDeployService?.isCloning(payload.name)) return;
       await this.handleAppUpdate(payload.name, payload.path, payload.reason);
     });
     this.subscriptions.push(updateSub);
@@ -796,6 +957,13 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
 
   private async handleNewApp(appPath: string): Promise<void> {
     const appName = path.basename(appPath);
+
+    // Skip apps currently being cloned by git deploy
+    if (this.gitDeployService?.isCloning(appName)) {
+      this.logger.debug(`Skipping detection for ${appName} - git clone in progress`, 'GIT-DEPLOY');
+      return;
+    }
+
     this.logger.appEvent('detected', appName);
 
     if (!this.detector) return;
@@ -804,7 +972,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       const result = await this.detector.detect(appPath);
       this.logger.info(`Detected ${appName} as ${result.type} (confidence: ${result.confidence})`, 'DETECTOR');
 
-      const appType = result.type as 'nodejs' | 'python' | 'static' | 'docker' | 'unknown';
+      const appType = result.type as 'nodejs' | 'python' | 'go' | 'static' | 'docker' | 'unknown';
 
       // Create or update app config file (source of truth)
       if (this.appConfigService) {
@@ -915,11 +1083,19 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       if (detection.type === 'static' || detection.type === 'spa') {
         // Static sites use our built-in static server
         const serveDir = path.join(appPath, detection.suggestedConfig?.outputDirectory || '.');
-        // Use the compiled static-server.js from dist
-        script = path.join(__dirname, 'static-server.js');
+        // Prefer compiled dist/core/static-server.js, fallback to __dirname version
+        const fsSync = require('fs');
+        const distPath = path.join(__dirname, '..', '..', 'dist', 'core', 'static-server.js');
+        const localPath = path.join(__dirname, 'static-server.js');
+        script = fsSync.existsSync(localPath) ? localPath : fsSync.existsSync(distPath) ? distPath : localPath;
         args = [serveDir, '-s']; // -s for SPA mode
+      } else if (detection.type === 'go') {
+        // Go apps run as compiled binaries
+        const startCommand = detection.suggestedConfig?.startCommand || `./${appName}`;
+        script = startCommand;
+        interpreter = 'none'; // No interpreter - run binary directly
       } else {
-        // For Node.js apps, the detector returns "node <file>" format
+        // For Node.js/Python apps, the detector returns "node <file>" or "python <file>" format
         const startCommand = detection.suggestedConfig?.startCommand || 'node index.js';
 
         if (startCommand.startsWith('node ')) {
@@ -952,6 +1128,13 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         await this.generateStaticConfig(appPath, depEnvVars);
       }
 
+      // Load encrypted secrets for this app
+      let secretEnvVars: Record<string, string> = {};
+      if (this.secretManager && this.secretManager.hasSecrets(appName)) {
+        secretEnvVars = this.secretManager.getAll(appName);
+        this.logger.info(`Injecting ${Object.keys(secretEnvVars).length} secret(s)`, 'SECURITY');
+      }
+
       // Configure log files with dated filenames (auto-captured from stdout/stderr)
       const { outFile, errorFile } = await this.getAppLogPaths(appName);
 
@@ -970,6 +1153,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           DROP_DATA_DIR: dataDir,
           ...dbEnvVars,
           ...depEnvVars,
+          ...secretEnvVars,
         },
       });
 
@@ -1011,30 +1195,73 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
 
     try {
       const domainSuffix = this.config.domainSuffix || 'localhost';
-      const hostname = `${appName}.${domainSuffix}`;
-      const enableSsl = this.config.enableHttps && domainSuffix !== 'localhost';
+      const defaultHostname = `${appName}.${domainSuffix}`;
 
-      await this.router.addRoute({
-        appName,
-        hostname,
-        upstream: `localhost:${port}`,
-        ssl: enableSsl,
-        redirectHttps: enableSsl,
-        tls: enableSsl ? { auto: true } : undefined,
-      });
+      // Parse drop.yaml for custom domains
+      const appPath = path.join(this.config.appsDirectory, appName);
+      const dropYaml = await parseDropYaml(appPath);
 
-      // Reload Caddy to apply new route
-      if (this.caddyServer && this.caddyServer.getStatus() === 'running') {
-        await this.caddyServer.reload();
+      // Get domains from drop.yaml or use default
+      let domains: string[] = [defaultHostname];
+      let customTls: { certFile?: string; keyFile?: string } | undefined;
+
+      if (dropYaml.success && dropYaml.config) {
+        if (dropYaml.config.domains && dropYaml.config.domains.length > 0) {
+          domains = dropYaml.config.domains;
+          this.logger.info(`Custom domains configured for ${appName}: ${domains.join(', ')}`, 'ROUTER');
+        }
+
+        // Check for custom TLS config
+        if (dropYaml.config.tls) {
+          if (dropYaml.config.tls.disabled) {
+            this.logger.info(`TLS disabled for ${appName} via drop.yaml`, 'ROUTER');
+          } else if (dropYaml.config.tls.certFile && dropYaml.config.tls.keyFile) {
+            customTls = {
+              certFile: dropYaml.config.tls.certFile,
+              keyFile: dropYaml.config.tls.keyFile,
+            };
+            this.logger.info(`Custom TLS certificates configured for ${appName}`, 'ROUTER');
+          }
+        }
+
+        // Save custom domains to app config
+        if (this.appConfigService && dropYaml.config.domains) {
+          await this.appConfigService.updateConfig(appName, {
+            domains: dropYaml.config.domains,
+            tls: dropYaml.config.tls,
+          });
+        }
       }
 
-      const protocol = enableSsl ? 'https' : 'http';
-      const caddyAvailable = this.caddyServer?.getStatus() === 'running';
+      // Configure route for each domain
+      for (const hostname of domains) {
+        const isLocalhost = isLocalhostDomain(hostname);
+        const enableSsl = this.config.enableHttps && !isLocalhost && !dropYaml.config?.tls?.disabled;
 
-      if (caddyAvailable) {
-        this.logger.info(`Route configured: ${protocol}://${hostname} -> localhost:${port}`, 'ROUTER');
-      } else {
-        this.logger.info(`Route configured: localhost:${port} (Caddy unavailable for ${hostname})`, 'ROUTER');
+        await this.router.addRoute({
+          appName: `${appName}-${hostname.replace(/\./g, '-')}`, // Unique route name per domain
+          hostname,
+          upstream: `localhost:${port}`,
+          ssl: enableSsl,
+          redirectHttps: enableSsl,
+          tls: customTls
+            ? { certFile: customTls.certFile, keyFile: customTls.keyFile }
+            : (enableSsl ? { auto: true } : undefined),
+        });
+
+        const protocol = enableSsl ? 'https' : 'http';
+        const caddyAvailable = this.caddyServer?.getStatus() === 'running';
+
+        if (caddyAvailable) {
+          this.logger.info(`Route configured: ${protocol}://${hostname} -> localhost:${port}`, 'ROUTER');
+        } else {
+          this.logger.info(`Route configured: localhost:${port} (Caddy unavailable for ${hostname})`, 'ROUTER');
+        }
+      }
+
+      // Reload Caddy to apply new routes
+      if (this.caddyServer && this.caddyServer.getStatus() === 'running') {
+        await this.caddyServer.reload();
       }
     } catch (error) {
       // Route might already exist
@@ -1048,6 +1275,9 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
    */
   private async handleAppUpdate(appName: string, appPath: string, reason: string): Promise<void> {
     if (!this.processManager || !this.stateManager || !this.detector || !this.builder) return;
+
+    // Skip apps currently being cloned by git deploy
+    if (this.gitDeployService?.isCloning(appName)) return;
 
     // Skip if already processing this app (e.g., during initial deployment)
     if (this.appsInProgress.has(appName)) {
@@ -1152,6 +1382,12 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         await this.generateStaticConfig(appPath, depEnvVars);
       }
 
+      // Load encrypted secrets for this app
+      let secretEnvVars: Record<string, string> = {};
+      if (this.secretManager && this.secretManager.hasSecrets(appName)) {
+        secretEnvVars = this.secretManager.getAll(appName);
+      }
+
       // Configure log files with dated filenames (auto-captured from stdout/stderr)
       const { outFile, errorFile } = await this.getAppLogPaths(appName);
 
@@ -1169,6 +1405,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           DROP_DATA_DIR: dataDir,
           ...dbEnvVars,
           ...depEnvVars,
+          ...secretEnvVars,
         },
       });
 
@@ -1369,6 +1606,126 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
   /** @deprecated Use this.logger instead */
   private log(level: 'debug' | 'info' | 'warn' | 'error', message: string, error?: unknown): void {
     this.logger.log(level, message, undefined, error);
+  }
+
+  /**
+   * Start certificate expiry monitoring
+   * Checks every 24 hours for expiring certificates
+   */
+  private startCertificateMonitoring(): void {
+    this.logger.info('Starting certificate expiry monitoring (24h interval)', 'CERTS');
+
+    // Run an initial check
+    this.checkCertificateExpiry().catch(err => {
+      this.logger.warn('Initial certificate check failed', 'CERTS', err);
+    });
+
+    // Schedule periodic checks. unref() so this background timer never keeps
+    // the process (or a Jest worker) alive on its own.
+    this.certExpiryTimer = setInterval(() => {
+      this.checkCertificateExpiry().catch(err => {
+        this.logger.warn('Certificate expiry check failed', 'CERTS', err);
+      });
+    }, this.CERT_CHECK_INTERVAL_MS);
+    this.certExpiryTimer.unref?.();
+  }
+
+  /**
+   * Check for expiring certificates and log warnings
+   */
+  private async checkCertificateExpiry(): Promise<void> {
+    if (!this.caddyServer || this.caddyServer.getStatus() !== 'running') {
+      return;
+    }
+
+    try {
+      const expiringCerts = await this.caddyServer.getExpiringCertificates(7);
+
+      if (expiringCerts.length > 0) {
+        this.logger.warn(`${expiringCerts.length} certificate(s) expiring within 7 days:`, 'CERTS');
+        for (const cert of expiringCerts) {
+          const message = cert.daysUntilExpiry <= 0
+            ? `  - ${cert.domain}: EXPIRED`
+            : `  - ${cert.domain}: expires in ${cert.daysUntilExpiry} days`;
+          this.logger.warn(message, 'CERTS');
+        }
+
+        // Publish event for monitoring integrations
+        this.eventBus.publish('platform:warning' as never, {
+          type: 'certificate_expiry',
+          certificates: expiringCerts.map(c => ({
+            domain: c.domain,
+            daysUntilExpiry: c.daysUntilExpiry,
+            status: c.status,
+          })),
+        } as never);
+      } else {
+        this.logger.debug('All certificates are healthy', 'CERTS');
+      }
+    } catch (err) {
+      this.logger.log('debug', 'Could not check certificate expiry', 'CERTS', err);
+    }
+  }
+
+  /**
+   * Validate domain configuration for HTTPS
+   * Called before starting services when HTTPS is enabled
+   */
+  private async validateDomainConfig(): Promise<void> {
+    const domainSuffix = this.config.domainSuffix;
+
+    if (!domainSuffix) {
+      return;
+    }
+
+    // Skip validation for localhost (HTTPS will be disabled anyway)
+    if (isLocalhostDomain(domainSuffix)) {
+      this.logger.info('Localhost domain - HTTPS will use self-signed certificates or be disabled', 'HTTPS');
+      return;
+    }
+
+    // Validate domain format
+    if (!validateDomainFormat(domainSuffix)) {
+      throw new Error(`Invalid domain format: ${domainSuffix}`);
+    }
+
+    this.logger.info(`Validating domain: ${domainSuffix}`, 'HTTPS');
+
+    // Perform full domain validation
+    const validation = await validateDomain(domainSuffix);
+
+    // Log errors (blocking)
+    for (const error of validation.errors) {
+      this.logger.error(error, 'HTTPS');
+      throw new Error(error);
+    }
+
+    // Log warnings (non-blocking)
+    for (const warning of validation.warnings) {
+      this.logger.warn(warning, 'HTTPS');
+    }
+
+    // Log HTTPS configuration
+    this.logger.info(`HTTPS enabled for *.${domainSuffix}`, 'HTTPS');
+
+    if (this.config.acmeEmail) {
+      this.logger.info(`ACME email: ${this.config.acmeEmail}`, 'HTTPS');
+    } else {
+      this.logger.warn('No ACME email configured - certificate notifications will not be sent', 'HTTPS');
+    }
+
+    if (this.config.acmeStaging) {
+      this.logger.info('Using ACME staging environment (Let\'s Encrypt testing)', 'HTTPS');
+    }
+
+    if (this.config.wildcardCert) {
+      if (!this.config.dnsProvider) {
+        this.logger.warn('Wildcard certificate requested but no DNS provider configured', 'HTTPS');
+        this.logger.warn('Wildcard certificates require DNS-01 challenge via --dns-provider', 'HTTPS');
+      } else {
+        this.logger.info(`Wildcard certificate using ${this.config.dnsProvider} DNS challenge`, 'HTTPS');
+      }
+    }
   }
 
   // Public accessors

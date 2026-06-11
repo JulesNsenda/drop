@@ -5,6 +5,7 @@
  */
 
 import { AppStatus, AppType } from '../managers/app/state-manager';
+import type { GitSource } from '../core/git-deploy/git-deploy.types';
 
 // API Response wrapper
 export interface ApiResponse<T = unknown> {
@@ -25,6 +26,8 @@ export interface ApiMeta {
   limit?: number;
   total?: number;
   totalPages?: number;
+  /** Additional metadata fields */
+  [key: string]: unknown;
 }
 
 // App DTOs
@@ -34,7 +37,7 @@ export interface AppDto {
   status: AppStatus;
   port?: number;
   pid?: number;
-  path: string;
+  path?: string;
   framework?: string;
   hostname?: string;
   createdAt: string;
@@ -42,6 +45,10 @@ export interface AppDto {
   lastDeployedAt?: string;
   buildDuration?: number;
   error?: string;
+  gitSource?: GitSource;
+  userId?: string;
+  ownerName?: string;
+  customDomain?: string;
 }
 
 export interface CreateAppDto {
@@ -69,6 +76,7 @@ export interface HealthDto {
     platform: ComponentHealth;
     processManager: ComponentHealth;
     database?: ComponentHealth;
+    watcher?: ComponentHealth;
   };
 }
 
@@ -113,4 +121,6 @@ export const ErrorCodes = {
   CONFLICT: 'CONFLICT',
   BAD_REQUEST: 'BAD_REQUEST',
   UNAUTHORIZED: 'UNAUTHORIZED',
+  RATE_LIMITED: 'RATE_LIMITED',
+  SERVICE_UNAVAILABLE: 'SERVICE_UNAVAILABLE',
 } as const;

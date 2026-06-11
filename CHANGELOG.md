@@ -7,6 +7,75 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+Work toward the **v1.0.0** production release. Tracked in
+`docs/plans/2026-06-11-production-release-plan.md`. Scope: self-hosted with
+trusted/semi-trusted tenants; container isolation and SQLite state remain on
+the v2.0 roadmap (see the README "Security & Trust Model" section).
+
+### Security
+
+- **Access control:** `PUT /apps/:name` and the log endpoints now enforce
+  ownership (fixes IDOR — a user could previously take over or read any app),
+  and `PUT` accepts only a safe field allowlist (no more `userId`/`path`
+  overwrites). `POST /apps` contains the deploy path inside the webapps dir
+  (realpath, defeats symlink/junction/.. escapes).
+- **Webhooks:** GitHub webhook verification no longer skips when the signature
+  header is omitted, guards `JSON.parse`, and length-checks before
+  `timingSafeEqual`. Missing-secret deliveries warn now and will be rejected in
+  a future release. Outbound webhook URLs reject localhost/private/link-local
+  targets (SSRF).
+- **Auth:** authentication is on by default (set `DROP_DISABLE_AUTH=true` to
+  disable); JWT verification pinned to HS256; legacy password hashes compared
+  in constant time and upgraded to scrypt on login; `/auth/signup` rate-limited.
+- **Secrets:** app secrets are encrypted with the standalone `encryption.key`
+  (or `DROP_MASTER_KEY`) instead of a key derived from the store itself;
+  existing stores migrate transparently.
+- **Misc:** CORS defaults to same-origin (`DROP_CORS_ORIGINS` to allowlist);
+  added a Content-Security-Policy; git branch names validated; build
+  subprocesses no longer inherit platform secrets; `webhooks.json` is `0600`;
+  500 responses no longer leak internal error text.
+
+### Added
+
+- Continuous integration (GitHub Actions): lint, server build, tests, and
+  dashboard build on every PR to `main`/`develop`.
+- `drop backup` command: snapshots the file stores + a `pg_dump` of the
+  internal database, with retention.
+- Atomic, crash-safe writes (temp + fsync + rename) for every JSON/YAML state
+  store; corrupt `apps.json` is quarantined instead of silently wiped.
+- Dashboard v1.0 UX: session-expiry handling with redirect (PRD-024), 404 page
+  (PRD-025), logout redirect + toast (PRD-026), app-limit indicator and
+  `GET /api/v1/usage` (PRD-027), signup-success notice (PRD-028); app links and
+  the API endpoint derive from the current host instead of `localhost`.
+- `.env.example`, a LICENSE file, and a `files`/`prepublishOnly` package config.
+- `scripts/create-migration.ts` restored; `.sql` migrations are copied into
+  `dist` so a built deployment can run them.
+
+### Changed
+
+- Version set to `1.0.0-rc.0`.
+- `drop serve -d` now applies the `--root/--domain/--https/...` flags it
+  forwards (previously ignored). **Review forwarded flags before upgrading.**
+- Boot recovery: apps whose process died while marked `running` are set to
+  `pending` (and restarted by the startup scan) instead of `stopped`.
+- `/health`, the CLI, and `drop version` read the version from `package.json`.
+- Dashboard assets served with immutable cache headers; `index.html` is
+  `no-cache`.
+
+### Fixed
+
+- Resolved all ESLint errors; activity logging consolidated behind a
+  best-effort `tryLogActivity` helper.
+- Deploy pipeline: `build:completed` carries a `success` flag and the platform
+  no longer starts an app after a failed build; the `appsInProgress` guard no
+  longer leaks (which had permanently dead-ended hot reload).
+- Process safety: `unhandledRejection`/`uncaughtException` handlers and a
+  bounded, guarded shutdown; `waitForStatus` throws on timeout; build commands
+  hard-timeout and kill the process tree; app logs are tail-read (no OOM on
+  multi-GB files); `certExpiryTimer` is `unref()`'d.
+- Caddy stderr/unexpected exit logged at warn and surfaced via `platform:error`
+  instead of being swallowed at debug.
+
 ## [0.1.0] - 2026-01-18
 
 First stable release of DROP with full deployment pipeline, hot-reload, and database auto-provisioning.
