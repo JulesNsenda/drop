@@ -632,6 +632,13 @@ import ${path.join(dataDir, 'appconf', 'caddy', 'hosts', '*.caddy').replace(/\\/
       dropRoot: this.config.dropRoot,
       caddyfilePath: this.config.caddyfilePath,
       onLog: (msg) => this.logger.debug(msg, 'CADDY'),
+      onError: (msg) => {
+        this.logger.warn(msg, 'CADDY');
+        this.eventBus.publish('platform:error', {
+          error: new Error(msg),
+          context: 'caddy',
+        });
+      },
     });
 
     const caddyAvailable = await this.caddyServer.ensureReady((msg) => {
