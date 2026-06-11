@@ -13,7 +13,7 @@ import { AuthContext, listUsers, getUserById } from '../middleware/auth';
 import { getProcessManager } from '../../managers/process';
 import { getStateManager, AppState } from '../../managers/app/state-manager';
 import { getAppConfigService } from '../../managers/app/app-config';
-import { getActivityLog } from '../../managers/activity';
+import { tryLogActivity } from '../../managers/activity';
 
 const apps = new Hono();
 
@@ -58,7 +58,9 @@ function getAppLimit(userId?: string): number {
   try {
     const user = getUserById(userId) as any;
     if (user?.maxApps && user.maxApps > 0) return user.maxApps;
-  } catch {}
+  } catch {
+    // User lookup failed — fall back to the global limit
+  }
   return globalMax;
 }
 
@@ -180,7 +182,7 @@ apps.post('/', async (c) => {
     await stateManager.updateApp(appName, { userId: auth.userId });
   }
 
-  try { await getActivityLog().log({ action: 'deploy', userId: auth?.userId, username: auth?.username, appName }); } catch {}
+  await tryLogActivity({ action: 'deploy', userId: auth?.userId, username: auth?.username, appName });
   return c.json(success(toAppDto({ ...app, userId: auth?.userId }, auth?.role === 'admin')), 201);
 });
 
@@ -245,7 +247,7 @@ apps.delete('/:name', async (c) => {
     }
   }
 
-  try { await getActivityLog().log({ action: 'delete', userId: auth?.userId, username: auth?.username, appName: name }); } catch {}
+  await tryLogActivity({ action: 'delete', userId: auth?.userId, username: auth?.username, appName: name });
   return c.json(success({ message: `Application '${name}' removed` }));
 });
 
@@ -276,7 +278,7 @@ apps.post('/:name/start', async (c) => {
       pid: status.pid ?? undefined,
     });
 
-    try { await getActivityLog().log({ action: 'start', userId: auth?.userId, username: auth?.username, appName: name }); } catch {}
+    await tryLogActivity({ action: 'start', userId: auth?.userId, username: auth?.username, appName: name });
     return c.json(success({ message: `Application '${name}' started`, status }));
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Failed to start';
@@ -302,7 +304,7 @@ apps.post('/:name/stop', async (c) => {
     await pm.stop(name);
     await stateManager.setAppStatus(name, 'stopped');
 
-    try { await getActivityLog().log({ action: 'stop', userId: auth?.userId, username: auth?.username, appName: name }); } catch {}
+    await tryLogActivity({ action: 'stop', userId: auth?.userId, username: auth?.username, appName: name });
     return c.json(success({ message: `Application '${name}' stopped` }));
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Failed to stop';
@@ -329,7 +331,7 @@ apps.post('/:name/restart', async (c) => {
       pid: status.pid ?? undefined,
     });
 
-    try { await getActivityLog().log({ action: 'restart', userId: auth?.userId, username: auth?.username, appName: name }); } catch {}
+    await tryLogActivity({ action: 'restart', userId: auth?.userId, username: auth?.username, appName: name });
     return c.json(success({ message: `Application '${name}' restarted`, status }));
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Failed to restart';

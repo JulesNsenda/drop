@@ -73,6 +73,19 @@ export class ActivityLog {
   }
 }
 
+/**
+ * Best-effort activity logging. Activity records must never fail the
+ * request that triggered them, so failures are reported at debug level
+ * and swallowed.
+ */
+export async function tryLogActivity(entry: Omit<ActivityEntry, 'id' | 'timestamp'>): Promise<void> {
+  try {
+    await getActivityLog().log(entry);
+  } catch (err) {
+    console.debug('[activity-log] failed to record activity:', err instanceof Error ? err.message : err);
+  }
+}
+
 // Singleton
 let instance: ActivityLog | null = null;
 
