@@ -12,7 +12,7 @@ import { WatcherService } from './watcher';
 import { DetectorService, getDetector, parseDropYaml } from './detector';
 import { BuilderService, getBuilder } from './builder';
 import { RouterService, getRouterService, resetRouterService } from './router';
-import { ProcessManager, getProcessManager, resetProcessManager } from '../managers/process';
+import { AppRuntime, getAppRuntime, resetAppRuntime } from '../managers/runtime';
 import { AppStateManager, getStateManager, resetStateManager } from '../managers/app/state-manager';
 import { AppConfigService, getAppConfigService, resetAppConfigService } from '../managers/app/app-config';
 import { PostgresServer, getPostgresServer, resetPostgresServer, DatabaseProvisioner } from '../managers/database';
@@ -113,7 +113,7 @@ export class DropPlatform {
   private watcher: WatcherService | null = null;
   private detector: DetectorService | null = null;
   private builder: BuilderService | null = null;
-  private processManager: ProcessManager | null = null;
+  private runtime: AppRuntime | null = null;
   private router: RouterService | null = null;
   private stateManager: AppStateManager | null = null;
   private appConfigService: AppConfigService | null = null;
@@ -262,9 +262,9 @@ export class DropPlatform {
       resetRouterService();
     }
 
-    if (this.processManager) {
-      this.processManager.disconnect();
-      resetProcessManager();
+    if (this.runtime) {
+      resetAppRuntime();
+      this.runtime = null;
     }
 
     // Close state manager
@@ -604,8 +604,8 @@ import ${path.join(dataDir, 'appconf', 'caddy', 'hosts', '*.caddy').replace(/\\/
     // Initialize builder
     this.builder = getBuilder();
 
-    // Initialize process manager
-    this.processManager = getProcessManager();
+    // Initialize the app runtime (PM2 today; Docker arrives with PRD-029)
+    this.runtime = getAppRuntime();
 
     // Load used ports from existing PM2 processes
     await this.loadUsedPorts();
@@ -693,17 +693,17 @@ import ${path.join(dataDir, 'appconf', 'caddy', 'hosts', '*.caddy').replace(/\\/
    * Updates state for apps that were started/stopped outside DROP
    */
   private async syncStateWithProcesses(): Promise<void> {
-    if (!this.processManager || !this.stateManager) return;
+    if (!this.runtime || !this.stateManager) return;
 
     try {
-      const processes = await this.processManager.getAllStatus();
-      const runningNames = new Set(processes.filter((p) => p.status === 'online').map((p) => p.name));
+      const processes = await this.runtime.getAllStatus();
+      const runningNames = new Set(processes.filter((p) => p.status === 'running').map((p) => p.name));
 
       // Update state for each tracked app
       for (const app of this.stateManager.getAllApps()) {
         const proc = processes.find((p) => p.name === app.name);
 
-        if (proc && proc.status === 'online') {
+        if (proc && proc.status === 'running') {
           // App is running - update state
           await this.stateManager.setAppStatus(app.name, 'running', {
             port: proc.port ?? undefined,
@@ -1060,7 +1060,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
   }
 
   private async handleStartApp(appName: string): Promise<void> {
-    if (!this.processManager || !this.detector) return;
+    if (!this.runtime || !this.detector) return;
 
     const appPath = path.join(this.config.appsDirectory, appName);
 
@@ -1138,7 +1138,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       // Configure log files with dated filenames (auto-captured from stdout/stderr)
       const { outFile, errorFile } = await this.getAppLogPaths(appName);
 
-      const status = await this.processManager.start({
+      const status = await this.runtime.start({
         name: appName,
         script,
         interpreter,
@@ -1274,7 +1274,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
    * Stops the running process, rebuilds, and restarts on the same port
    */
   private async handleAppUpdate(appName: string, appPath: string, reason: string): Promise<void> {
-    if (!this.processManager || !this.stateManager || !this.detector || !this.builder) return;
+    if (!this.runtime || !this.stateManager || !this.detector || !this.builder) return;
 
     // Skip apps currently being cloned by git deploy
     if (this.gitDeployService?.isCloning(appName)) return;
@@ -1310,7 +1310,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       // 1. Stop the running process (if any)
       if (appState.status === 'running') {
         this.logger.info(`Stopping ${appName} for rebuild...`, 'UPDATE');
-        await this.processManager.stop(appName);
+        await this.runtime.stop(appName);
 
         // Release the port from usedPorts (we'll re-add it when we restart)
         if (originalPort) {
@@ -1391,7 +1391,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       // Configure log files with dated filenames (auto-captured from stdout/stderr)
       const { outFile, errorFile } = await this.getAppLogPaths(appName);
 
-      const status = await this.processManager.start({
+      const status = await this.runtime.start({
         name: appName,
         script,
         args,
@@ -1573,11 +1573,11 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
 
     // 3. Load from PM2 (actually running processes)
     //    These take precedence as they represent the current runtime state
-    if (this.processManager) {
+    if (this.runtime) {
       try {
-        const processes = await this.processManager.getAllStatus();
+        const processes = await this.runtime.getAllStatus();
         for (const proc of processes) {
-          if (proc.port && proc.status === 'online') {
+          if (proc.port && proc.status === 'running') {
             portSources.set(proc.port, proc.name);
             this.logger.debug(`Port ${proc.port} in use by ${proc.name} (from PM2)`, 'PORT');
           }
@@ -1749,8 +1749,13 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     return this.builder;
   }
 
-  getProcessManager(): ProcessManager | null {
-    return this.processManager;
+  getRuntime(): AppRuntime | null {
+    return this.runtime;
+  }
+
+  /** @deprecated Use getRuntime() — kept for callers from the PM2-only era */
+  getProcessManager(): AppRuntime | null {
+    return this.runtime;
   }
 
   getRouter(): RouterService | null {
