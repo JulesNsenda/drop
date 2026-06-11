@@ -30,6 +30,7 @@ import {
 } from '../utils/domain-validator';
 import { createApiKey, deleteApiKeysByName } from '../api/middleware/auth';
 import { IsolationMode, assertStartupConstraints } from './startup-constraints';
+import { createContainerExecCommand } from './builder/container-build-runner';
 
 export interface PlatformConfig {
   /** Root directory for DROP */
@@ -1052,6 +1053,15 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       const detection = await this.detector.detect(appPath);
       const workDir = await this.getBuildWorkDir(appName);
 
+      const execCommand =
+        this.config.isolation === 'docker' && this.runtime?.type === 'docker'
+          ? createContainerExecCommand(
+              (this.runtime as import('../managers/runtime').ContainerManager).docker,
+              detection.type,
+              appName
+            )
+          : undefined;
+
       const result = await this.builder.build({
         appName,
         appPath,
@@ -1063,6 +1073,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         },
         env: {},
         workDir,
+        execCommand,
       });
 
       if (result.success) {
