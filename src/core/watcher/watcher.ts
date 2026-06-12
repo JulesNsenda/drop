@@ -303,20 +303,31 @@ export class WatcherService {
   }
 
   /**
-   * Schedule a debounced rebuild for an app
-   * Multiple file changes within the debounce window are coalesced into one rebuild
+   * Schedule a debounced rebuild for an app.
+   * Multiple file changes within the debounce window are coalesced into one
+   * rebuild.  If the app is currently locked (a deploy is in progress) the
+   * pending rebuild is cancelled and silently dropped — the platform will do a
+   * fresh build when it finishes the current one if the sources changed.
    */
   private scheduleRebuild(appName: string, changedFile: string): void {
+    // Drop the event immediately if the app is currently being deployed.
+    if (this.config.isAppLocked?.(appName)) {
+      return;
+    }
+
     // Cancel any pending rebuild for this app
     const existing = this.pendingRebuilds.get(appName);
     if (existing) {
       clearTimeout(existing);
     }
 
-    // Schedule a new rebuild
+    // Schedule a new rebuild; re-check the lock when the timer fires to
+    // handle the edge case where the build started between schedule and fire.
     const timeout = setTimeout(() => {
       this.pendingRebuilds.delete(appName);
-      this.emitAppUpdate(appName, changedFile);
+      if (!this.config.isAppLocked?.(appName)) {
+        this.emitAppUpdate(appName, changedFile);
+      }
     }, this.REBUILD_DEBOUNCE_MS);
 
     this.pendingRebuilds.set(appName, timeout);

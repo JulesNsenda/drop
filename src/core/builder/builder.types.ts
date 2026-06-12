@@ -24,6 +24,20 @@ export type BuildStage =
 export type BuildStatus = 'pending' | 'running' | 'success' | 'failed' | 'cancelled';
 
 /**
+ * Signature for a command executor injected into BuildContext.
+ * Matches the signature of executeCommand in base.ts so callers can
+ * swap between the host runner and the container runner transparently.
+ */
+export type ExecCommandFn = (
+  command: string,
+  cwd: string,
+  env: Record<string, string>,
+  signal?: AbortSignal,
+  onOutput?: (data: string, type: 'stdout' | 'stderr') => void,
+  timeoutMs?: number
+) => Promise<CommandResult>;
+
+/**
  * Context provided to the builder
  */
 export interface BuildContext {
@@ -34,6 +48,30 @@ export interface BuildContext {
   config: BuildConfig;
   env: Record<string, string>;
   previousBuild?: BuildResult;
+  /**
+   * Scratch directory for ephemeral build artifacts (tarballs, generated
+   * Dockerfiles, layer caches, …).  Lives outside the watched app dir so the
+   * watcher never sees these files and cannot trigger a spurious rebuild.
+   * Set by the platform to data/temp/{appName}/ before each build.
+   * Strategies that write temp files MUST use this path, not appPath.
+   */
+  workDir?: string;
+  /**
+   * Command executor for this build.  When isolation === 'docker', the
+   * platform injects a container-based executor; otherwise the builder
+   * falls back to executeCommand (the host shell runner).
+   *
+   * The BuilderService uses `context.execCommand ?? executeCommand`
+   * everywhere, so callers that don't care about the distinction get the
+   * right behaviour for free.
+   */
+  execCommand?: ExecCommandFn;
+  /**
+   * Optional callback for build log lines (install/build output).
+   * Called by BuilderService.emitLog() when set. Used by the platform to
+   * persist build output to per-deploy log files.
+   */
+  onBuildLog?: (line: string) => void;
 }
 
 /**
@@ -49,6 +87,8 @@ export interface BuildConfig {
   preBuild?: string[];
   postBuild?: string[];
   timeout?: number;
+  /** Set by nodejs strategy when lockfile hash is unchanged — skips the install stage. */
+  skipInstall?: boolean;
 }
 
 /**
