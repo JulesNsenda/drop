@@ -20,6 +20,7 @@ import {
   deleteUser,
   authMiddleware,
   isAuthEnabled,
+  isSignupEnabled,
   AuthContext,
 } from '../middleware/auth';
 import { tryLogActivity } from '../../managers/activity';
@@ -36,6 +37,10 @@ auth.get('/status', (c) => {
 
 // POST /auth/signup - Self-service user registration
 auth.post('/signup', async (c) => {
+  if (!isSignupEnabled()) {
+    return c.json(error(ErrorCodes.UNAUTHORIZED, 'Self-service signup is not enabled on this instance'), 403);
+  }
+
   const body = await c.req.json<{ username: string; password: string; email: string }>();
 
   if (!body.username || !body.password || !body.email) {

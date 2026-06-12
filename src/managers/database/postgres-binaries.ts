@@ -175,7 +175,7 @@ export class PostgresBinaries {
     const configPath = path.join(paths.dataDir, 'postgresql.conf');
     const configAdditions = `
 # DROP Platform Configuration
-listen_addresses = 'localhost'
+listen_addresses = '*'
 port = 5433
 max_connections = 100
 shared_buffers = 128MB
@@ -184,14 +184,19 @@ logging_collector = off
 `;
     await fs.appendFile(configPath, configAdditions);
 
-    // Configure pg_hba.conf for local access
+    // Configure pg_hba.conf.  Host (TCP) lines start as trust so that
+    // superuser-auth.ts can set the postgres password on first boot; they are
+    // immediately migrated to scram-sha-256 by that module before the server
+    // is exposed to any tenant.  The 0.0.0.0/0 wildcard covers the Docker
+    // bridge gateway that containerised apps use to reach the host.
     const hbaPath = path.join(paths.dataDir, 'pg_hba.conf');
     const hbaContent = `
-# DROP Platform - Local connections only
+# DROP Platform
 # TYPE  DATABASE        USER            ADDRESS                 METHOD
 local   all             all                                     trust
 host    all             all             127.0.0.1/32            trust
 host    all             all             ::1/128                 trust
+host    all             all             0.0.0.0/0               trust
 `;
     await fs.writeFile(hbaPath, hbaContent);
 

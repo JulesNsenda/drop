@@ -92,6 +92,7 @@ gitDeploy.post('/deploy', async (c) => {
 
 // POST /git/redeploy/:name - Redeploy (git pull + rebuild)
 gitDeploy.post('/redeploy/:name', async (c) => {
+  const auth = (c.get as Function)('auth') as AuthContext | undefined;
   const name = c.req.param('name');
   const service = getGitDeployService();
 
@@ -101,6 +102,7 @@ gitDeploy.post('/redeploy/:name', async (c) => {
 
   try {
     const result = await service.redeploy(name);
+    await tryLogActivity({ action: 'redeploy', userId: auth?.userId, username: auth?.username, appName: name });
     return c.json(success(result));
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Redeploy failed';

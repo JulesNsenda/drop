@@ -1,17 +1,24 @@
 /**
  * Deploy Command
  *
- * Deploys an application from a directory.
+ * Registers an application with the DROP platform, which handles
+ * detection, build, and startup through its own pipeline.
+ *
+ * For git sources the folder is cloned directly into the webapps directory
+ * so the watcher picks it up automatically (no API call needed).
  */
 
 import * as path from 'path';
 import { Command } from 'commander';
 import { DeployOptions } from '../cli.types';
 import * as output from '../utils/output';
-import { getDetector } from '../../core/detector';
-import { getBuilder } from '../../core/builder';
-import { getProcessManager, resetProcessManager } from '../../managers/process';
+import { createApiClient, DropApiError } from '../api-client';
 import { getGitDeployService } from '../../core/git-deploy';
+
+function getWebappsDir(): string {
+  return process.env.DROP_APPS_DIR ??
+    (process.platform === 'win32' ? 'C:\\drop\\data\\webapps' : '/var/drop/data/webapps');
+}
 
 export function createDeployCommand(): Command {
   const cmd = new Command('deploy')
@@ -25,14 +32,14 @@ export function createDeployCommand(): Command {
     .option('-b, --branch <branch>', 'Git branch to deploy (default: main)')
     .action(async (appPath: string, options: DeployOptions) => {
       try {
-        // Handle git deploy
+        // Git deploy: clone into the webapps dir; watcher handles build+start
         if (options.git) {
           const spin = output.spinner('Cloning repository...');
           spin.start();
 
           try {
             const gitService = getGitDeployService({
-              appsDirectory: path.resolve(process.env.DROP_APPS_DIR || (process.platform === 'win32' ? 'C:\\drop\\data\\webapps' : '/var/drop/data/webapps')),
+              appsDirectory: path.resolve(getWebappsDir()),
             });
             await gitService.initialize();
 
@@ -47,9 +54,7 @@ export function createDeployCommand(): Command {
             output.info(`Commit: ${result.commitSha?.slice(0, 7) || 'unknown'}`);
             output.info('The platform will auto-detect, build, and start the app.');
 
-            if (output.isJsonMode()) {
-              output.json(result);
-            }
+            if (output.isJsonMode()) output.json(result);
           } catch (err) {
             spin.fail('Git deploy failed');
             output.error('', err instanceof Error ? err : undefined);
@@ -58,118 +63,33 @@ export function createDeployCommand(): Command {
           return;
         }
 
-        // Resolve path
+        // Local deploy: register the path with the platform; it handles the rest
         const absolutePath = path.resolve(appPath);
         const appName = options.name || path.basename(absolutePath);
 
-        output.info(`Deploying ${appName} from ${absolutePath}`);
-
-        // Detect project type
-        const detectSpin = output.spinner('Detecting project type...');
-        detectSpin.start();
-
-        const detector = getDetector();
-        const detected = await detector.detect(absolutePath);
-
-        if (!detected || detected.type === 'unknown') {
-          detectSpin.fail('Could not detect project type');
-          process.exit(1);
-        }
-
-        detectSpin.succeed(`Detected ${detected.type} project`);
-
-        // Parse environment variables
-        const env: Record<string, string> = {};
-        if (options.env) {
-          for (const envVar of options.env) {
-            const [key, ...valueParts] = envVar.split('=');
-            if (key && valueParts.length > 0) {
-              env[key] = valueParts.join('=');
-            }
-          }
-        }
-
-        // Build if needed
-        if (options.build !== false && detected.suggestedConfig?.buildCommand) {
-          const buildSpin = output.spinner('Building application...');
-          buildSpin.start();
-
-          try {
-            const builder = getBuilder();
-            const buildResult = await builder.build({
-              appName,
-              appPath: absolutePath,
-              appType: detected.type,
-              framework: detected.framework || null,
-              config: {
-                buildCommand: detected.suggestedConfig.buildCommand,
-                installCommand: detected.suggestedConfig.installCommand,
-              },
-              env,
-            });
-
-            if (!buildResult.success) {
-              buildSpin.fail('Build failed');
-              const errorMsg = buildResult.errors?.[0]?.message || 'Unknown build error';
-              output.error(errorMsg);
-              process.exit(1);
-            }
-
-            buildSpin.succeed(`Build completed in ${output.formatDuration(buildResult.duration)}`);
-          } catch (err) {
-            buildSpin.fail('Build failed');
-            output.error('', err instanceof Error ? err : undefined);
-            process.exit(1);
-          }
-        }
-
-        // Start the application
-        const startSpin = output.spinner('Starting application...');
-        startSpin.start();
+        const spin = output.spinner(`Registering ${appName} with the platform...`);
+        spin.start();
 
         try {
-          const processManager = getProcessManager();
-          const startCommand = detected.suggestedConfig?.startCommand || 'npm start';
+          const client = await createApiClient();
+          const app = await client.deployApp(absolutePath, appName, options.port);
 
-          // Parse start command - extract script from "node <file>" format
-          let script = startCommand;
-          if (startCommand.startsWith('node ')) {
-            script = startCommand.substring(5);
-          }
-
-          const status = await processManager.start({
-            name: appName,
-            script,
-            cwd: absolutePath,
-            port: options.port,
-            env,
-          });
-
-          startSpin.succeed(`Application started (PID: ${status.pid})`);
-
+          spin.succeed(`${appName} registered — platform is building and starting it`);
           output.print('');
-          output.success(`${appName} deployed successfully!`);
+          output.success(`${appName} deployment queued`);
+          output.info(`Run 'drop status ${appName}' to check progress`);
+          output.info(`Run 'drop logs ${appName}' to watch the build`);
 
-          if (options.port) {
-            output.info(`Running on port ${options.port}`);
-          }
+          if (app.port) output.info(`Will run on port ${app.port}`);
 
-          if (output.isJsonMode()) {
-            output.json({
-              name: appName,
-              path: absolutePath,
-              type: detected.type,
-              status: status.status,
-              pid: status.pid,
-              port: options.port,
-            });
-          }
-
-          resetProcessManager();
+          if (output.isJsonMode()) output.json(app);
         } catch (err) {
-          startSpin.fail('Failed to start application');
-          resetProcessManager();
-          output.error('', err instanceof Error ? err : undefined);
+          spin.fail('Deployment failed');
+          if (err instanceof DropApiError) {
+            output.error(err.message);
+          } else {
+            output.error('', err instanceof Error ? err : undefined);
+          }
           process.exit(1);
         }
       } catch (err) {
