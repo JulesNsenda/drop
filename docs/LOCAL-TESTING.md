@@ -15,7 +15,19 @@ How to run DROP on your dev machine and exercise the v2.0 features.
 
 ---
 
-## 1. Build
+## 1. Install (one-time)
+
+The fastest way to get a working `drop` CLI is the install script:
+
+```bash
+# Linux/macOS
+sudo bash install.sh --link          # --link wires up the drop CLI globally
+
+# Windows
+install.bat                          # always links the CLI
+```
+
+Or manually:
 
 ```bash
 # Server only (fast — skips the React dashboard)
@@ -28,12 +40,13 @@ npm run build
 
 The compiled output lands in `dist/`.
 
-## 2. Link the CLI globally (one-time)
+## 2. Verify the CLI (one-time)
 
 ```bash
-npm link
 drop --version   # should print 2.0.0-rc.1
 ```
+
+If `drop` isn't found after building manually, run `npm link` from the project root.
 
 ---
 

@@ -37,21 +37,43 @@ A lightweight, self-hosted Platform as a Service (PaaS) engineered for the "drop
 
 ### 1. Install
 
+**Linux / macOS**
+
 ```bash
-git clone https://github.com/techamat/drop.git
+curl -fsSL https://raw.githubusercontent.com/JulesNsenda/drop/main/install.sh \
+  | sudo bash
+```
+
+This installs Node.js 20 if needed, clones the repo to `/opt/drop`, builds the
+server, and registers a `drop-platform` systemd service.
+
+**Windows**
+
+```bat
+curl -fsSL https://raw.githubusercontent.com/JulesNsenda/drop/main/install.bat -o install.bat
+install.bat
+```
+
+Or download `install.bat` from the repo root and run it. It checks for Node.js
+20+ and Git, clones the repo, builds, and links the `drop` CLI.
+
+**Development / manual install**
+
+```bash
+git clone https://github.com/JulesNsenda/drop.git
 cd drop
 npm install
-# The dashboard is a separate package — install its deps once before building:
+# The dashboard is a separate package — install its deps once:
 (cd src/dashboard && npm install)
 npm run build        # compiles the server AND builds the dashboard
 npm link             # makes the 'drop' command available globally
 ```
 
 > If you only changed backend code, `npm run build:server` skips the dashboard
-> build. The full `npm run build` requires the dashboard deps above.
+> build.
 
-On first start with auth enabled, DROP prints a one-time random admin password
-to the console (and, in daemon mode, to the PM2 log). Change it immediately.
+On first start, DROP prints a one-time random admin password to the console.
+Change it immediately.
 
 ### 2. Start DROP
 
