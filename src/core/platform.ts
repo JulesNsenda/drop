@@ -1163,7 +1163,9 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       if (this.dbProvisioner && needsDb) {
         this.logger.info(`Provisioning database for ${appName}...`, 'DATABASE');
         const dbCreds = await this.dbProvisioner.provisionAppDatabase(appName);
-        dbEnvVars = this.dbProvisioner.getEnvVars(appName) || {};
+        dbEnvVars = this.dbProvisioner.getEnvVars(appName, {
+          pgHost: this.config.isolation === 'docker' ? 'host-gateway' : undefined,
+        }) || {};
         this.logger.info(`Database provisioned: ${dbCreds.database}`, 'DATABASE');
       }
 
@@ -1423,7 +1425,9 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       // Get database env vars if needed
       let dbEnvVars: Record<string, string> = {};
       if (this.dbProvisioner) {
-        dbEnvVars = this.dbProvisioner.getEnvVars(appName) || {};
+        dbEnvVars = this.dbProvisioner.getEnvVars(appName, {
+          pgHost: this.config.isolation === 'docker' ? 'host-gateway' : undefined,
+        }) || {};
       }
 
       // Resolve dependencies
