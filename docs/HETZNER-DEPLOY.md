@@ -53,7 +53,7 @@ This creates `~/.ssh/drop_deploy` (private) and `~/.ssh/drop_deploy.pub` (public
 
 ---
 
-## Step 3 — Configure the server
+## Step 3 — Bootstrap the server
 
 SSH in as root using your personal key:
 
@@ -61,85 +61,35 @@ SSH in as root using your personal key:
 ssh root@<server-ip>
 ```
 
-Then run this bootstrap script (copy-paste the whole block):
+Run the install script — it creates the `drop` system user, installs Node.js
+20, clones the repo, builds the server, and sets up the systemd service:
 
 ```bash
-set -e
+apt-get update -qq && apt-get install -y curl git build-essential
+curl -fsSL https://raw.githubusercontent.com/JulesNsenda/drop/main/install.sh \
+  | bash -s -- --root=/home/drop/drop-data
+```
 
-# 1. System packages
-apt-get update -qq
-apt-get install -y curl git build-essential
+The script prints the data directory and a command to retrieve the admin
+password once DROP starts.
 
-# 2. Node.js 20 (via NodeSource)
-curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
-apt-get install -y nodejs
+**Add SSH keys** so you (and GitHub Actions) can log in as the `drop` user:
 
-# 3. Create a dedicated user
-useradd -m -s /bin/bash drop
+```bash
 mkdir -p /home/drop/.ssh
-# Add YOUR personal public key so you can also SSH in manually:
-echo "$(cat ~/.ssh/authorized_keys 2>/dev/null || true)" >> /home/drop/.ssh/authorized_keys
-# Add the GitHub Actions deploy key:
+# Your personal key (lets you SSH in manually):
+cat /root/.ssh/authorized_keys >> /home/drop/.ssh/authorized_keys
+# GitHub Actions deploy key:
 echo "PASTE_DROP_DEPLOY_PUB_KEY_HERE" >> /home/drop/.ssh/authorized_keys
 chmod 700 /home/drop/.ssh
 chmod 600 /home/drop/.ssh/authorized_keys
 chown -R drop:drop /home/drop/.ssh
-
-# 4. Clone the repo
-cd /home/drop
-sudo -u drop git clone https://github.com/JulesNsenda/drop.git drop
-cd drop
-
-# 5. Install dependencies and build
-sudo -u drop npm ci
-sudo -u drop npm run build:server
-sudo -u drop npm link   # makes `drop` available system-wide for the drop user
-
-# 6. Allow drop user to bind low ports (optional — for port 80/443 with Caddy)
-# setcap 'cap_net_bind_service=+ep' /usr/bin/node   # if needed
-
-echo "Server setup complete."
 ```
 
 **Replace** `PASTE_DROP_DEPLOY_PUB_KEY_HERE` with the contents of
-`~/.ssh/drop_deploy.pub` before running.
+`~/.ssh/drop_deploy.pub`.
 
----
-
-## Step 4 — Create the systemd service
-
-Still as root on the server:
-
-```bash
-cat > /etc/systemd/system/drop-platform.service << 'EOF'
-[Unit]
-Description=DROP Platform
-After=network.target
-
-[Service]
-Type=simple
-User=drop
-WorkingDirectory=/home/drop/drop
-Environment=NODE_ENV=production
-Environment=DROP_ROOT=/home/drop/drop-data
-ExecStart=/usr/bin/node /home/drop/drop/dist/index.js serve
-Restart=on-failure
-RestartSec=5
-StandardOutput=journal
-StandardError=journal
-SyslogIdentifier=drop-platform
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-systemctl daemon-reload
-systemctl enable drop-platform
-systemctl start drop-platform
-systemctl status drop-platform
-```
-
-Check it started:
+Check DROP started:
 
 ```bash
 journalctl -u drop-platform -f
@@ -217,11 +167,18 @@ open http://<server-ip>:3000/dashboard
 ### Manual deploy (if you need to force it)
 
 ```bash
+ssh root@<server-ip>
+curl -fsSL https://raw.githubusercontent.com/JulesNsenda/drop/main/install.sh \
+  | bash -s -- --upgrade --branch develop
+```
+
+Or step-by-step as the `drop` user:
+
+```bash
 ssh drop@<server-ip>
-cd ~/drop
+cd /opt/drop
 git pull origin develop
-npm ci
-npm run build:server
+npm ci && npm run build:server
 sudo systemctl restart drop-platform
 journalctl -u drop-platform -f
 ```
