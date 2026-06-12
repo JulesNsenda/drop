@@ -1,13 +1,13 @@
 /**
  * Stop Command
  *
- * Stops a running application.
+ * Stops a running application via the DROP REST API.
  */
 
 import { Command } from 'commander';
 import { ProcessOptions } from '../cli.types';
 import * as output from '../utils/output';
-import { getProcessManager, resetProcessManager } from '../../managers/process';
+import { createApiClient, DropApiError } from '../api-client';
 
 export function createStopCommand(): Command {
   const cmd = new Command('stop')
@@ -20,34 +20,36 @@ export function createStopCommand(): Command {
       try {
         spin.start();
 
-        const processManager = getProcessManager();
-        const status = await processManager.getStatus(appName);
+        const client = await createApiClient();
+        const app = await client.getApp(appName).catch((err) => {
+          if (err instanceof DropApiError && err.statusCode === 404) return null;
+          throw err;
+        });
 
-        if (!status) {
+        if (!app) {
           spin.fail(`Application not found: ${appName}`);
           process.exit(1);
         }
 
-        if (status.status === 'stopped') {
+        if (app.status === 'stopped') {
           spin.succeed(`${appName} is already stopped`);
-          resetProcessManager();
           return;
         }
 
-        await processManager.stop(appName);
-
+        await client.stopApp(appName);
         spin.succeed(`Stopped ${appName}`);
 
         if (output.isJsonMode()) {
-          const newStatus = await processManager.getStatus(appName);
-          output.json(newStatus);
+          const updated = await client.getApp(appName).catch(() => null);
+          output.json(updated ?? { name: appName, status: 'stopped' });
         }
-
-        resetProcessManager();
       } catch (err) {
         spin.fail(`Failed to stop ${appName}`);
-        resetProcessManager();
-        output.error('', err instanceof Error ? err : undefined);
+        if (err instanceof DropApiError) {
+          output.error(err.message);
+        } else {
+          output.error('', err instanceof Error ? err : undefined);
+        }
         process.exit(1);
       }
     });

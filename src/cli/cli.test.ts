@@ -14,37 +14,24 @@ import {
 } from './utils/output';
 import { createProgram } from './index';
 
-// Mock process manager
-jest.mock('../managers/process', () => ({
-  getProcessManager: jest.fn().mockReturnValue({
-    getAllStatus: jest.fn().mockResolvedValue([]),
-    getStatus: jest.fn().mockResolvedValue(null),
-    start: jest.fn().mockResolvedValue({ status: 'online', pid: 12345 }),
-    stop: jest.fn().mockResolvedValue(undefined),
-    restart: jest.fn().mockResolvedValue({ status: 'online', pid: 12345 }),
-    delete: jest.fn().mockResolvedValue(undefined),
-    getLogs: jest.fn().mockResolvedValue(''),
+// Mock the API client so CLI command imports don't need a live platform
+jest.mock('./api-client', () => ({
+  createApiClient: jest.fn().mockResolvedValue({
+    listApps: jest.fn().mockResolvedValue([]),
+    getApp: jest.fn().mockResolvedValue(null),
+    startApp: jest.fn().mockResolvedValue(undefined),
+    stopApp: jest.fn().mockResolvedValue(undefined),
+    restartApp: jest.fn().mockResolvedValue(undefined),
+    removeApp: jest.fn().mockResolvedValue(undefined),
+    getLogs: jest.fn().mockResolvedValue([]),
+    streamLogs: jest.fn().mockResolvedValue(() => undefined),
+    deployApp: jest.fn().mockResolvedValue({ name: 'test', status: 'pending' }),
   }),
-}));
-
-// Mock detector
-jest.mock('../core/detector', () => ({
-  detectProjectType: jest.fn().mockResolvedValue({
-    type: 'node',
-    buildCommand: 'npm run build',
-    startCommand: 'npm start',
-    installCommand: 'npm install',
-  }),
-}));
-
-// Mock builder
-jest.mock('../core/builder', () => ({
-  createBuilder: jest.fn().mockReturnValue({
-    build: jest.fn().mockResolvedValue({
-      success: true,
-      durationMs: 1000,
-    }),
-  }),
+  DropApiError: class DropApiError extends Error {
+    constructor(public statusCode: number, public code: string, message: string) {
+      super(message);
+    }
+  },
 }));
 
 describe('CLI Output Utilities', () => {

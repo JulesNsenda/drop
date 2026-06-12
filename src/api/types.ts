@@ -40,6 +40,8 @@ export interface AppDto {
   path?: string;
   framework?: string;
   hostname?: string;
+  /** Full URL (computed from hostname + protocol). Populated when hostname is set. */
+  url?: string;
   createdAt: string;
   updatedAt: string;
   lastDeployedAt?: string;
@@ -49,6 +51,10 @@ export interface AppDto {
   userId?: string;
   ownerName?: string;
   customDomain?: string;
+  /** Live memory usage in bytes (from runtime; null when not running or unavailable). */
+  memory?: number | null;
+  /** Live CPU usage percent (from runtime; null when not running or unavailable). */
+  cpu?: number | null;
 }
 
 export interface CreateAppDto {

@@ -12,7 +12,7 @@ import * as path from 'path';
 import * as fs from 'fs';
 import * as fsp from 'fs/promises';
 import { errorHandler, HttpError } from './middleware/error';
-import { initializeAuth, authMiddleware, isAuthEnabled } from './middleware/auth';
+import { initializeAuth, authMiddleware, isAuthEnabled, setSignupEnabled } from './middleware/auth';
 import { rateLimitMiddleware, authRateLimitMiddleware } from './middleware/rate-limit';
 import { securityHeadersMiddleware } from './middleware/security-headers';
 import { auditMiddleware, initializeAuditLog, closeAuditLog } from './middleware/audit';
@@ -42,6 +42,15 @@ export interface ApiServerConfig {
   logDir?: string;
   /** Webapps directory — used to contain user-supplied deploy paths */
   appsDirectory?: string;
+  /**
+   * Allow self-service signup via POST /auth/signup.
+   * Default false — requires isolation: docker + auth enabled at startup too.
+   */
+  allowSignup?: boolean;
+  /** Whether HTTPS is enabled (passed through to runtime-config for URL generation). */
+  enableHttps?: boolean;
+  /** Active domain suffix (e.g. "example.com"). */
+  domainSuffix?: string;
 }
 
 export class ApiServer {
@@ -65,7 +74,11 @@ export class ApiServer {
       this.config.corsOrigins = fromEnv && fromEnv.length > 0 ? fromEnv : [];
     }
 
-    setApiRuntimeConfig({ appsDirectory: this.config.appsDirectory });
+    setApiRuntimeConfig({
+      appsDirectory: this.config.appsDirectory,
+      enableHttps: this.config.enableHttps,
+      domainSuffix: this.config.domainSuffix,
+    });
 
     this.app = new Hono();
   }
@@ -79,6 +92,9 @@ export class ApiServer {
         enableApiKeys: true,
       });
     }
+
+    // Signup gate — off by default; on only when platform config allows it.
+    setSignupEnabled(this.config.allowSignup === true);
 
     // Initialize audit logging
     if (this.config.logDir) {
@@ -134,6 +150,8 @@ export class ApiServer {
 
     // Apply auth middleware to protected routes when auth is enabled
     if (this.config.enableAuth && isAuthEnabled()) {
+      // migrate-runtime is admin-only — register before the general /apps/* guard.
+      v1.use('/apps/*/migrate-runtime', authMiddleware('admin'));
       v1.use('/apps/*', authMiddleware('readonly'));
       v1.use('/apps', authMiddleware('readonly'));
       v1.use('/usage', authMiddleware('readonly'));

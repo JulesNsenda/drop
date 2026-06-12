@@ -9,8 +9,9 @@ import { success, AppLogsDto } from '../types';
 import { NotFoundError } from '../middleware/error';
 import { AuthContext } from '../middleware/auth';
 import { canAccess } from '../access';
-import { getProcessManager } from '../../managers/process';
+import { getAppRuntime } from '../../managers/runtime';
 import { getStateManager } from '../../managers/app/state-manager';
+import { getBuildLogService } from '../../managers/build-log/build-log';
 
 const logs = new Hono();
 
@@ -28,7 +29,7 @@ logs.get('/:name', async (c) => {
   const lines = parseInt(c.req.query('lines') || '100', 10);
   const type = (c.req.query('type') || 'combined') as 'stdout' | 'stderr' | 'combined';
 
-  const pm = getProcessManager();
+  const pm = getAppRuntime();
 
   let logLines: string[] = [];
   try {
@@ -63,7 +64,7 @@ logs.get('/:name/stream', async (c) => {
   c.header('Cache-Control', 'no-cache');
   c.header('Connection', 'keep-alive');
 
-  const pm = getProcessManager();
+  const pm = getAppRuntime();
 
   // Create a readable stream
   const stream = new ReadableStream({
@@ -120,6 +121,55 @@ logs.get('/:name/stream', async (c) => {
       Connection: 'keep-alive',
     },
   });
+});
+
+// GET /logs/:name/builds - List build logs for an app (newest first)
+logs.get('/:name/builds', async (c) => {
+  const auth = (c.get as Function)('auth') as AuthContext | undefined;
+  const name = c.req.param('name');
+  const stateManager = getStateManager();
+  const app = stateManager.getApp(name);
+
+  if (!app || !canAccess(auth, app)) {
+    throw new NotFoundError(`Application '${name}' not found`);
+  }
+
+  let buildLogs: { id: string; appName: string; timestamp: string }[] = [];
+  try {
+    const svc = getBuildLogService();
+    const entries = await svc.listBuilds(name);
+    buildLogs = entries.map(({ id, appName, timestamp }) => ({ id, appName, timestamp }));
+  } catch {
+    // Service not initialized yet — return empty list
+  }
+
+  return c.json(success({ name, builds: buildLogs }));
+});
+
+// GET /logs/:name/build - Latest build log content
+logs.get('/:name/build', async (c) => {
+  const auth = (c.get as Function)('auth') as AuthContext | undefined;
+  const name = c.req.param('name');
+  const stateManager = getStateManager();
+  const app = stateManager.getApp(name);
+
+  if (!app || !canAccess(auth, app)) {
+    throw new NotFoundError(`Application '${name}' not found`);
+  }
+
+  let content: string | null = null;
+  try {
+    const svc = getBuildLogService();
+    content = await svc.getLatestBuildLog(name);
+  } catch {
+    // Service not initialized yet
+  }
+
+  if (content === null) {
+    throw new NotFoundError(`No build logs found for '${name}'`);
+  }
+
+  return c.json(success({ name, log: content }));
 });
 
 export default logs;
