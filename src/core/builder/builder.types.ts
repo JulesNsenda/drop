@@ -66,6 +66,12 @@ export interface BuildContext {
    * right behaviour for free.
    */
   execCommand?: ExecCommandFn;
+  /**
+   * Optional callback for build log lines (install/build output).
+   * Called by BuilderService.emitLog() when set. Used by the platform to
+   * persist build output to per-deploy log files.
+   */
+  onBuildLog?: (line: string) => void;
 }
 
 /**
@@ -81,6 +87,8 @@ export interface BuildConfig {
   preBuild?: string[];
   postBuild?: string[];
   timeout?: number;
+  /** Set by nodejs strategy when lockfile hash is unchanged — skips the install stage. */
+  skipInstall?: boolean;
 }
 
 /**

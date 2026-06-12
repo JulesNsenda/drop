@@ -33,6 +33,7 @@ import { IsolationMode, assertStartupConstraints } from './startup-constraints';
 import { createContainerExecCommand } from './builder/container-build-runner';
 import { migrateAllToDocker } from '../managers/runtime/runtime-migrator';
 import { buildNginxConf } from '../utils/nginx-conf';
+import { BuildLogService, getBuildLogService, resetBuildLogService } from '../managers/build-log/build-log';
 
 export interface PlatformConfig {
   /** Root directory for DROP */
@@ -154,6 +155,7 @@ export class DropPlatform {
   private webhookManager: WebhookManager | null = null;
   private gitDeployService: GitDeployService | null = null;
   private apiServer: ApiServer | null = null;
+  private buildLogService: BuildLogService | null = null;
 
   private subscriptions: Unsubscribe[] = [];
   private isRunning = false;
@@ -339,11 +341,12 @@ export class DropPlatform {
       resetCaddyServer();
     }
 
-    // Reset secret manager, webhook manager, and git deploy service
+    // Reset secret manager, webhook manager, git deploy service, and build logs
     resetSecretManager();
     resetWebhookManager();
     resetGitDeployService();
     resetActivityLog();
+    resetBuildLogService();
 
     // Stop API server
     if (this.apiServer) {
@@ -413,6 +416,7 @@ export class DropPlatform {
       path.join(dataDir, 'logs', 'drop-svc'), // Platform logs
       path.join(dataDir, 'logs', 'webapps'), // App logs
       path.join(dataDir, 'logs', 'caddy'), // Caddy logs
+      path.join(dataDir, 'logs', 'builds'), // Per-deploy build logs
       path.join(dataDir, 'appconf'), // Configuration files
       path.join(dataDir, 'appconf', 'caddy'), // Caddy config root
       path.join(dataDir, 'appconf', 'caddy', 'webapps'), // Per-app Caddy configs
@@ -700,6 +704,10 @@ backup:
 
     // Initialize builder
     this.builder = getBuilder();
+
+    // Initialize build log service (persists per-deploy stdout/stderr to files)
+    const buildLogsDir = path.join(this.config.dropRoot, 'data', 'logs', 'builds');
+    this.buildLogService = getBuildLogService(buildLogsDir);
 
     // Initialize the app runtime (PM2 today; Docker arrives with PRD-029)
     this.runtime = getAppRuntime();
@@ -1173,6 +1181,11 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
             )
           : undefined;
 
+      const buildStartedAt = new Date();
+      const logId = this.buildLogService
+        ? await this.buildLogService.startBuild(appName, buildStartedAt)
+        : null;
+
       const result = await this.builder.build({
         appName,
         appPath,
@@ -1185,7 +1198,14 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         env: {},
         workDir,
         execCommand,
+        onBuildLog: logId && this.buildLogService
+          ? (line) => this.buildLogService!.writeLine(logId, line)
+          : undefined,
       });
+
+      if (logId && this.buildLogService) {
+        await this.buildLogService.finishBuild(logId, appName);
+      }
 
       if (result.success) {
         this.appBuildDurations.set(appName, result.duration);
@@ -1520,30 +1540,25 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       return;
     }
 
-    // Remember the current port so we can reuse it
+    // Remember the current port and whether the app was running
     const originalPort = appState.port;
+    const wasRunning = appState.status === 'running';
 
     this.logger.info(`Hot-reload triggered for ${appName}: ${reason}`, 'UPDATE');
     this.appsInProgress.add(appName);
 
     try {
-      // 1. Stop the running process (if any)
-      if (appState.status === 'running') {
-        this.logger.info(`Stopping ${appName} for rebuild...`, 'UPDATE');
-        await this.runtime.stop(appName);
-
-        // Release the port from usedPorts (we'll re-add it when we restart)
-        if (originalPort) {
-          this.usedPorts.delete(originalPort);
-        }
-      }
-
-      // 2. Update state to building
+      // M5.1 deploy transaction: keep old version serving while the new build
+      // runs. Only stop the old process after a successful build — on failure,
+      // restore the `running` status so the old version stays live.
       await this.stateManager.setAppStatus(appName, 'building');
 
-      // 3. Re-detect and rebuild the app
+      // Re-detect and rebuild the app
       const detection = await this.detector.detect(appPath);
       const workDir = await this.getBuildWorkDir(appName);
+      const updateLogId = this.buildLogService
+        ? await this.buildLogService.startBuild(appName, new Date())
+        : null;
       const buildResult = await this.builder.build({
         appName,
         appPath,
@@ -1555,15 +1570,38 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         },
         env: {},
         workDir,
+        onBuildLog: updateLogId && this.buildLogService
+          ? (line) => this.buildLogService!.writeLine(updateLogId, line)
+          : undefined,
       });
+      if (updateLogId && this.buildLogService) {
+        await this.buildLogService.finishBuild(updateLogId, appName);
+      }
 
       if (!buildResult.success) {
-        this.logger.appEvent('error', appName, buildResult.errors?.[0]?.message || 'Rebuild failed');
-        await this.stateManager.setAppStatus(appName, 'errored', {
-          error: buildResult.errors?.[0]?.message || 'Rebuild failed',
-        });
+        const buildError = buildResult.errors?.[0]?.message || 'Rebuild failed';
+        this.logger.appEvent('error', appName, buildError);
+        // Old process is still running — restore status and surface the error
+        // so the dashboard shows it without taking down the live service.
+        if (wasRunning) {
+          await this.stateManager.setAppStatus(appName, 'running', {
+            port: originalPort,
+            error: `Build failed: ${buildError}`,
+          });
+        } else {
+          await this.stateManager.setAppStatus(appName, 'errored', { error: buildError });
+        }
         this.appsInProgress.delete(appName);
         return;
+      }
+
+      // Build succeeded — now stop the old version and swap in the new one
+      if (wasRunning) {
+        this.logger.info(`Stopping ${appName} to swap in new build...`, 'UPDATE');
+        await this.runtime.stop(appName);
+        if (originalPort) {
+          this.usedPorts.delete(originalPort);
+        }
       }
 
       this.appBuildDurations.set(appName, buildResult.duration);
