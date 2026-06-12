@@ -170,6 +170,8 @@ export class DropPlatform {
   private readonly DEPLOY_COOLDOWN_MS_MAX = 120_000;
   private certExpiryTimer: ReturnType<typeof setInterval> | null = null;
   private readonly CERT_CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 hours
+  /** Per-app health-probe intervals (PM2 mode only; Docker uses HEALTHCHECK). */
+  private readonly healthProbers: Map<string, ReturnType<typeof setInterval>> = new Map();
 
   constructor(config?: Partial<PlatformConfig>) {
     // Load DNS credentials from environment variables
@@ -340,6 +342,10 @@ export class DropPlatform {
       await this.caddyServer.stop();
       resetCaddyServer();
     }
+
+    // Stop all health probers
+    for (const [, timer] of this.healthProbers) clearInterval(timer);
+    this.healthProbers.clear();
 
     // Reset secret manager, webhook manager, git deploy service, and build logs
     resetSecretManager();
@@ -978,6 +984,15 @@ backup:
       await this.handleAppUpdate(payload.name, payload.path, payload.reason);
     });
     this.subscriptions.push(updateSub);
+
+    // Stop health probers when an app is explicitly stopped or removed
+    const statusSub = this.eventBus.subscribe('app:updated', (payload) => {
+      const status = (payload.changes as { status?: string })?.status;
+      if (status === 'stopped' || status === 'errored') {
+        this.stopHealthProber(payload.appId);
+      }
+    });
+    this.subscriptions.push(statusSub);
   }
 
   /**
@@ -1357,6 +1372,10 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         this.logger.info(`Injecting ${Object.keys(secretEnvVars).length} secret(s)`, 'SECURITY');
       }
 
+      // Read health check path from drop.yaml (optional)
+      const dropYamlForHealth = await parseDropYaml(appPath);
+      const healthCheckPath = dropYamlForHealth.success ? dropYamlForHealth.config?.healthCheck : undefined;
+
       // Configure log files with dated filenames (auto-captured from stdout/stderr)
       const { outFile, errorFile } = await this.getAppLogPaths(appName);
 
@@ -1370,6 +1389,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         outFile,
         errorFile,
         appType: detection.type,
+        healthCheckPath,
         env: {
           NODE_ENV: 'production',
           PORT: port.toString(),
@@ -1402,6 +1422,11 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       // App is fully deployed now - record deploy time for cooldown
       this.appDeployTimes.set(appName, Date.now());
       this.appsInProgress.delete(appName);
+
+      // Start health prober in PM2 mode (Docker uses its own HEALTHCHECK mechanism)
+      if (healthCheckPath && this.runtime?.type === 'pm2') {
+        this.startHealthProber(appName, port, healthCheckPath);
+      }
     } catch (error) {
       this.logger.appEvent('error', appName, error instanceof Error ? error.message : 'Failed to start');
       if (this.stateManager) {
@@ -1598,6 +1623,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       // Build succeeded — now stop the old version and swap in the new one
       if (wasRunning) {
         this.logger.info(`Stopping ${appName} to swap in new build...`, 'UPDATE');
+        this.stopHealthProber(appName);
         await this.runtime.stop(appName);
         if (originalPort) {
           this.usedPorts.delete(originalPort);
@@ -1715,6 +1741,52 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       this.DEPLOY_COOLDOWN_MS_MAX,
       Math.max(this.DEPLOY_COOLDOWN_MS_MIN, last * 2)
     );
+  }
+
+  /**
+   * Periodically probe an app's health endpoint (PM2 mode).
+   * After 3 consecutive failures, restarts the app.
+   * Docker mode handles health checks via the container HEALTHCHECK directive.
+   */
+  private startHealthProber(appName: string, port: number, healthPath: string): void {
+    this.stopHealthProber(appName); // clear any previous prober
+    let failures = 0;
+    const interval = setInterval(async () => {
+      try {
+        const http = await import('http');
+        const ok = await new Promise<boolean>((resolve) => {
+          const req = http.get(
+            { hostname: '127.0.0.1', port, path: healthPath, timeout: 5000 },
+            (res) => resolve(res.statusCode !== undefined && res.statusCode < 400)
+          );
+          req.on('error', () => resolve(false));
+          req.on('timeout', () => { req.destroy(); resolve(false); });
+        });
+        if (ok) {
+          failures = 0;
+        } else {
+          failures++;
+          this.logger.warn(`Health check failed for ${appName} (${failures}/3)`, 'HEALTH');
+          if (failures >= 3 && this.runtime) {
+            failures = 0;
+            this.logger.appEvent('error', appName, 'health check failed — restarting');
+            this.runtime.restart(appName).catch(() => undefined);
+          }
+        }
+      } catch {
+        // Ignore errors in the prober itself
+      }
+    }, 30_000);
+    interval.unref?.();
+    this.healthProbers.set(appName, interval);
+  }
+
+  private stopHealthProber(appName: string): void {
+    const t = this.healthProbers.get(appName);
+    if (t) {
+      clearInterval(t);
+      this.healthProbers.delete(appName);
+    }
   }
 
   /**

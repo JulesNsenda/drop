@@ -114,13 +114,14 @@ describe('GET /api/v1/apps/:name DTO contract', () => {
     expect(body.data.restarts).toBe(2);
   });
 
-  it('hides pid/memory/cpu from non-admin but keeps restarts', async () => {
+  it('hides pid from non-admin but shows memory/cpu/restarts to app owner', async () => {
     const res = await hono.request('/api/v1/apps/test-app', { headers: authHeader(userToken) });
     expect(res.status).toBe(200);
     const body = (await res.json()) as { data: Record<string, unknown> };
     expect(body.data.pid).toBeUndefined();
-    expect(body.data.memory).toBeUndefined();
-    expect(body.data.cpu).toBeUndefined();
+    // App owner can see live resource stats (shown on dashboard cards)
+    expect(body.data.memory).toBe(104857600);
+    expect(body.data.cpu).toBe(1.5);
     expect(body.data.restarts).toBe(2);
   });
 
