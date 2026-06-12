@@ -325,8 +325,9 @@ export class BuilderService {
   ): Promise<BuildStageResult> {
     // Execute custom pre-build hooks
     if (context.config.preBuild?.length) {
+      const exec = context.execCommand ?? executeCommand;
       for (const hook of context.config.preBuild) {
-        const result = await executeCommand(hook, context.appPath, context.env);
+        const result = await exec(hook, context.appPath, context.env);
         if (result.exitCode !== 0) {
           return {
             stage: 'pre-build',
@@ -384,15 +385,16 @@ export class BuilderService {
       return this.createSkippedResult('install', startTime);
     }
 
-    this.emitLog(context.appName, 'install', 'info', `Running: ${installCommand}`);
+    this.emitLog(context.appName, 'install', 'info', `Running: ${installCommand}`, context);
 
-    const result = await executeCommand(
+    const exec = context.execCommand ?? executeCommand;
+    const result = await exec(
       installCommand,
       context.appPath,
       context.env,
       signal,
       (data, type) => {
-        this.emitLog(context.appName, 'install', type === 'stderr' ? 'warn' : 'info', data);
+        this.emitLog(context.appName, 'install', type === 'stderr' ? 'warn' : 'info', data, context);
       }
     );
 
@@ -426,20 +428,19 @@ export class BuilderService {
       return this.createSkippedResult('build', startTime);
     }
 
-    this.emitLog(context.appName, 'build', 'info', `Running: ${buildCommand}`);
+    this.emitLog(context.appName, 'build', 'info', `Running: ${buildCommand}`, context);
 
     const timeout = context.config.timeout || this.config.defaultTimeout;
 
     try {
-      // executeCommand enforces the timeout internally and kills the child
-      // process tree on expiry, so a hung build can't leak.
-      const result = await executeCommand(
+      const exec = context.execCommand ?? executeCommand;
+      const result = await exec(
         buildCommand,
         context.appPath,
         context.env,
         signal,
         (data, type) => {
-          this.emitLog(context.appName, 'build', type === 'stderr' ? 'warn' : 'info', data);
+          this.emitLog(context.appName, 'build', type === 'stderr' ? 'warn' : 'info', data, context);
         },
         timeout
       );
@@ -562,11 +563,12 @@ export class BuilderService {
     _appName: string,
     _stage: BuildStage,
     level: 'info' | 'warn' | 'error',
-    message: string
+    message: string,
+    context?: BuildContext
   ): void {
-    // Log to console for now - build:log event type not in event bus
     const logFn = level === 'error' ? console.error : level === 'warn' ? console.warn : console.log;
     logFn(`[build] ${message}`);
+    context?.onBuildLog?.(message);
   }
 }
 

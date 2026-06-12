@@ -1,13 +1,13 @@
 /**
  * Status Command
  *
- * Shows detailed status of an application.
+ * Shows detailed status of an application via the DROP REST API.
  */
 
 import { Command } from 'commander';
 import { GlobalOptions } from '../cli.types';
 import * as output from '../utils/output';
-import { getProcessManager, resetProcessManager } from '../../managers/process';
+import { createApiClient, DropApiError } from '../api-client';
 
 export function createStatusCommand(): Command {
   const cmd = new Command('status')
@@ -15,48 +15,65 @@ export function createStatusCommand(): Command {
     .argument('<app>', 'Application name')
     .action(async (appName: string, _options: GlobalOptions) => {
       try {
-        const processManager = getProcessManager();
-        const status = await processManager.getStatus(appName);
+        const client = await createApiClient();
+        const app = await client.getApp(appName).catch((err) => {
+          if (err instanceof DropApiError && err.statusCode === 404) return null;
+          throw err;
+        });
 
-        if (!status) {
+        if (!app) {
           output.error(`Application not found: ${appName}`);
           process.exit(1);
         }
 
         if (output.isJsonMode()) {
-          output.json(status);
+          output.json(app);
         } else {
           output.print('');
-          output.print(`${output.color('Application:', 'bold')} ${status.name}`);
-          output.print(`${output.color('Status:', 'bold')}      ${output.formatStatus(status.status)}`);
-          output.print(`${output.color('Mode:', 'bold')}        ${status.execMode}`);
-          output.print(`${output.color('Instances:', 'bold')}   ${status.instances}`);
+          output.print(`${output.color('Application:', 'bold')} ${app.name}`);
+          output.print(`${output.color('Status:', 'bold')}      ${output.formatStatus(app.status)}`);
+          output.print(`${output.color('Type:', 'bold')}        ${app.type}${app.framework ? ` (${app.framework})` : ''}`);
+          if (app.hostname) {
+            output.print(`${output.color('Hostname:', 'bold')}    ${app.hostname}`);
+          }
+          if (app.customDomain) {
+            output.print(`${output.color('Domain:', 'bold')}      ${app.customDomain}`);
+          }
           output.print('');
           output.print(output.color('Process Info:', 'bold'));
-          output.print(`  PID:        ${status.pid ?? 'N/A'}`);
-          output.print(`  PM2 ID:     ${status.pmId ?? 'N/A'}`);
-          output.print(`  Restarts:   ${status.restarts}`);
-          output.print(`  Uptime:     ${status.uptime ? output.formatDuration(status.uptime) : 'N/A'}`);
+          output.print(`  Port:       ${app.port ?? 'N/A'}`);
+          output.print(`  PID:        ${app.pid ?? 'N/A'}`);
+          output.print(`  Restarts:   ${app.restarts ?? 'N/A'}`);
+          if (app.memory !== undefined) {
+            output.print(`  Memory:     ${output.formatBytes(app.memory)}`);
+          }
+          if (app.cpu !== undefined) {
+            output.print(`  CPU:        ${app.cpu.toFixed(1)}%`);
+          }
+          if (app.error) {
+            output.print('');
+            output.print(output.color('Error:', 'bold'));
+            output.print(`  ${app.error}`);
+          }
           output.print('');
-          output.print(output.color('Resources:', 'bold'));
-          output.print(`  Memory:     ${output.formatBytes(status.memory)}`);
-          output.print(`  CPU:        ${status.cpu.toFixed(1)}%`);
-          output.print('');
-
-          if (status.createdAt) {
+          if (app.createdAt) {
             output.print(output.color('Timestamps:', 'bold'));
-            output.print(`  Created:    ${status.createdAt.toISOString()}`);
-            if (status.restartedAt) {
-              output.print(`  Restarted:  ${status.restartedAt.toISOString()}`);
+            output.print(`  Created:    ${app.createdAt}`);
+            if (app.lastDeployedAt) {
+              output.print(`  Deployed:   ${app.lastDeployedAt}`);
+            }
+            if (app.buildDuration !== undefined) {
+              output.print(`  Build time: ${output.formatDuration(app.buildDuration)}`);
             }
             output.print('');
           }
         }
-
-        resetProcessManager();
       } catch (err) {
-        resetProcessManager();
-        output.error('Failed to get application status', err instanceof Error ? err : undefined);
+        if (err instanceof DropApiError) {
+          output.error(err.message);
+        } else {
+          output.error('Failed to get application status', err instanceof Error ? err : undefined);
+        }
         process.exit(1);
       }
     });

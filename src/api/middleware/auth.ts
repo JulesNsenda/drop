@@ -266,6 +266,21 @@ export async function deleteUser(userId: string): Promise<boolean> {
   return true;
 }
 
+/**
+ * Suspend a user: disables their account and revokes all their API keys.
+ * Login is blocked immediately; existing JWTs expire naturally (within 24h).
+ * Returns false if the user was not found.
+ */
+export async function suspendUser(userId: string): Promise<boolean> {
+  if (!credentials || !config) throw new Error('Auth not initialized');
+  const user = credentials.users.find((u) => u.id === userId);
+  if (!user) return false;
+  if (user.role === 'admin') throw new Error('Cannot suspend an admin account');
+  user.enabled = false;
+  await saveCredentials(config.credentialsPath, credentials);
+  return true;
+}
+
 export async function updateUser(userId: string, updates: { enabled?: boolean; role?: 'admin' | 'user' | 'readonly'; maxApps?: number; email?: string }): Promise<boolean> {
   if (!credentials || !config) throw new Error('Auth not initialized');
 
@@ -425,6 +440,15 @@ export async function deleteApiKey(keyId: string): Promise<boolean> {
 }
 
 /**
+ * Delete all API keys with a given name (used to rotate the CLI local key on restart).
+ */
+export async function deleteApiKeysByName(name: string): Promise<void> {
+  if (!credentials || !config) return;
+  credentials.apiKeys = credentials.apiKeys.filter((k) => k.name !== name);
+  await saveCredentials(config.credentialsPath, credentials);
+}
+
+/**
  * List all API keys (without revealing the actual keys)
  */
 export function listApiKeys(): Omit<ApiKey, 'keyHash'>[] {
@@ -470,6 +494,28 @@ export function getUserById(userId: string): Omit<User, 'passwordHash'> | null {
  */
 export function isAuthEnabled(): boolean {
   return config?.enableJwt === true || config?.enableApiKeys === true;
+}
+
+// Signup enabled flag — separate from auth so it can be toggled independently.
+let signupEnabled = false;
+
+/** Set by ApiServer during initialize(); defaults false. */
+export function setSignupEnabled(enabled: boolean): void {
+  signupEnabled = enabled;
+}
+
+/** True only when explicitly enabled (isolation: docker + auth required at startup). */
+export function isSignupEnabled(): boolean {
+  return signupEnabled;
+}
+
+/** Reset auth + signup state (used in tests). */
+export function resetAuth(): void {
+  config = null;
+  credentials = null;
+  jwtSecret = null;
+  signupEnabled = false;
+  lastUsedFlushAt = 0;
 }
 
 /**

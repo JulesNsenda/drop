@@ -4,7 +4,7 @@
 
 import { Hono } from 'hono';
 import healthRoutes from './health';
-import { resetProcessManager } from '../../managers/process';
+import { resetAppRuntime } from '../../managers/runtime';
 import { resetStateManager, getStateManager } from '../../managers/app/state-manager';
 import * as fs from 'fs/promises';
 import * as path from 'path';
@@ -37,12 +37,12 @@ describe('Health Routes', () => {
   beforeEach(() => {
     app = new Hono();
     app.route('/health', healthRoutes);
-    resetProcessManager();
+    resetAppRuntime();
     resetStateManager();
   });
 
   afterEach(() => {
-    resetProcessManager();
+    resetAppRuntime();
     resetStateManager();
   });
 

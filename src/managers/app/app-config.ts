@@ -9,10 +9,17 @@ import * as fs from 'fs/promises';
 import * as path from 'path';
 import * as yaml from 'yaml';
 import { writeFileAtomic } from '../../utils/atomic-write';
+import type { RuntimeType } from '../runtime/app-runtime.types';
 
 export interface AppConfig {
   name: string;
   type: 'nodejs' | 'python' | 'go' | 'static' | 'docker' | 'unknown';
+  /**
+   * Which runtime executes this app. Pre-v2 config files have no value;
+   * they are normalized to 'pm2' on load so upgrades are config-compatible.
+   * Set to 'docker' per app by the PM2→container cutover (PRD-029).
+   */
+  runtime?: RuntimeType;
   port?: number;
   framework?: string;
   hostname?: string;
@@ -98,6 +105,10 @@ export class AppConfigService {
     try {
       const content = await fs.readFile(configPath, 'utf-8');
       const config = yaml.parse(content) as AppConfig;
+      // v1 config files predate the runtime field
+      if (config && !config.runtime) {
+        config.runtime = 'pm2';
+      }
       return config;
     } catch {
       return null;
@@ -188,6 +199,7 @@ export class AppConfigService {
       ...updates,
       name: appName, // Ensure name is always correct
       type: updates.type ?? existing?.type ?? 'unknown',
+      runtime: updates.runtime ?? existing?.runtime ?? 'pm2',
       createdAt: existing?.createdAt ?? now,
     };
 

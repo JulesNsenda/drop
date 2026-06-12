@@ -1,6 +1,6 @@
 # DROP
 
-**Deploy, Run, Operate, Publish** | v1.0.0-rc
+**Deploy, Run, Operate, Publish** | v2.0.0-rc.1
 
 A lightweight, self-hosted Platform as a Service (PaaS) engineered for the "drop folder and deploy" workflow. Zero-configuration deployment for Node.js, Python, static sites, and containerized applications.
 
@@ -37,21 +37,43 @@ A lightweight, self-hosted Platform as a Service (PaaS) engineered for the "drop
 
 ### 1. Install
 
+**Linux / macOS**
+
 ```bash
-git clone https://github.com/techamat/drop.git
+curl -fsSL https://raw.githubusercontent.com/JulesNsenda/drop/main/install.sh \
+  | sudo bash
+```
+
+This installs Node.js 20 if needed, clones the repo to `/opt/drop`, builds the
+server, and registers a `drop-platform` systemd service.
+
+**Windows**
+
+```bat
+curl -fsSL https://raw.githubusercontent.com/JulesNsenda/drop/main/install.bat -o install.bat
+install.bat
+```
+
+Or download `install.bat` from the repo root and run it. It checks for Node.js
+20+ and Git, clones the repo, builds, and links the `drop` CLI.
+
+**Development / manual install**
+
+```bash
+git clone https://github.com/JulesNsenda/drop.git
 cd drop
 npm install
-# The dashboard is a separate package — install its deps once before building:
+# The dashboard is a separate package — install its deps once:
 (cd src/dashboard && npm install)
 npm run build        # compiles the server AND builds the dashboard
 npm link             # makes the 'drop' command available globally
 ```
 
 > If you only changed backend code, `npm run build:server` skips the dashboard
-> build. The full `npm run build` requires the dashboard deps above.
+> build.
 
-On first start with auth enabled, DROP prints a one-time random admin password
-to the console (and, in daemon mode, to the PM2 log). Change it immediately.
+On first start, DROP prints a one-time random admin password to the console.
+Change it immediately.
 
 ### 2. Start DROP
 
@@ -353,34 +375,59 @@ See [HTTPS Setup Guide](docs/HTTPS-SETUP.md) for complete documentation.
 
 **Read this before exposing DROP to anyone you don't fully trust.**
 
-DROP v1.0 is designed for **self-hosted deployments with trusted or
-semi-trusted users**. Deploying an app means running its code (install/build
-scripts and the app process) on the host as the DROP process user. **There is
-no container or per-user OS isolation yet** (planned for v2.0), so a deployed
-app — or a build script — can read other apps' data and the platform's own
-files on the same host.
+DROP v2.0 ships two explicit isolation modes with different trust guarantees:
 
-What this means in practice:
+### `isolation: none` (default) — single-user / trusted deployments
 
-- **Don't** let strangers sign up and deploy arbitrary code on a host you care
-  about. Treat deploy access like shell access.
-- **Do** keep API authentication on (the default). Disable it only on a trusted
-  local machine via `DROP_DISABLE_AUTH=true`.
-- **Do** set `DROP_GITHUB_WEBHOOK_SECRET` if you use GitHub auto-redeploy, so
-  webhook calls are authenticated.
-- **Do** manage the secrets master key: DROP encrypts app secrets with
-  `data/drop-svc/encryption.key` (auto-generated, `0600`). Keep it — losing it
-  makes existing secrets unrecoverable. Set `DROP_MASTER_KEY` to manage the key
-  externally.
-- The bundled PostgreSQL listens on `127.0.0.1:5433`. On first start, DROP gives
-  the `postgres` superuser a random password (stored at
-  `data/drop-svc/.pg-superuser`, `0600`) and migrates `pg_hba.conf` from `trust`
-  to `scram-sha-256` — so a local process can no longer get superuser access
-  without the password. Keep that file with your backups; don't expose the port.
+Deploying an app means running its code (install/build scripts and the app
+process) on the host as the DROP process user. A deployed app — or its build
+script — can read other apps' data and the platform's own files.
 
-The platform-facing attack surface (API authorization, path traversal, command
-and SSRF injection, webhook authentication) is hardened; the *tenant-isolation*
-boundary is not. See `.env.example` for all security-relevant settings.
+**Use this when:** it's your machine or a machine you control, and everyone
+with deploy access is trusted. Treat deploy access like shell access.
+
+- Never enable `allowSignup` in this mode — DROP refuses at startup.
+- Disable auth only on a trusted local machine (`DROP_DISABLE_AUTH=true`).
+- Windows is fully supported in this mode.
+
+### `isolation: docker` — multi-user / invited users
+
+Apps build and run in Docker containers with strict resource limits
+(`--cap-drop=ALL`, `--security-opt no-new-privileges`, memory/CPU caps,
+`--pids-limit`). Build containers have no access to platform secrets and
+cannot reach the LAN or cloud-metadata endpoints.
+
+**Honest residual risks** (documented, not hidden):
+
+- **Shared kernel**: containers are not VMs. A kernel exploit grants full host
+  access. This is documented here, not mitigated.
+- **Egress**: containers can reach the internet (package installs need it).
+  Container→LAN/metadata is blocked; full egress policy is v2.1.
+- **Shared-domain cookies**: subdomains of one registrable domain share the
+  same-site context. Apps at `a.yourdomain.com` and `b.yourdomain.com` can
+  read each other's cookies. Use a dedicated `baseDomain` for multi-tenant use,
+  or submit it to the Public Suffix List.
+- **Open signup** (`allowSignup: true`) enables self-service registration.
+  Abuse tooling, takedown runbooks, and egress enforcement for hostile public
+  access are v2.1 territory. Treat open-internet signup as documented residual
+  risk until then.
+
+Requires Docker Engine on Linux (Docker Desktop on Windows/macOS is
+dev/best-effort only for this mode).
+
+### What's hardened in both modes
+
+- API auth (JWT + API keys), role tiers (`readonly`/`user`/`admin`)
+- Rate limiting keyed on socket peer address (not spoofable `x-forwarded-for`)
+- Path traversal and containment checks on all file I/O and deploy paths
+- SSRF guard on webhook and git-clone URLs (private range + DNS-resolution check)
+- Strict `drop.yaml` schema (unknown keys rejected; TLS paths confined to app dir)
+- `drop.yaml` values never reach `docker run` args or mount specs directly
+- Audit log for all deploy/build/start/secret/suspend operations
+- Bundled PostgreSQL locked to scram-sha-256; unix socket restricted to peer auth
+
+See `.env.example` for all security-relevant settings and
+`docs/MIGRATION-v1-to-v2.md` if you are upgrading from v1.0.
 
 ## Backup & Restore
 
