@@ -281,6 +281,11 @@ export class DatabaseProvisioner {
     };
   }
 
+  /** True if a database has already been provisioned for this app name. */
+  isProvisioned(appName: string): boolean {
+    return this.provisionedDatabases.has(appName);
+  }
+
   // ============ Private Methods ============
 
   private sanitizeName(name: string): string {

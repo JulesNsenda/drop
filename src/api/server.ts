@@ -12,7 +12,7 @@ import * as path from 'path';
 import * as fs from 'fs';
 import * as fsp from 'fs/promises';
 import { errorHandler, HttpError } from './middleware/error';
-import { initializeAuth, authMiddleware, isAuthEnabled } from './middleware/auth';
+import { initializeAuth, authMiddleware, isAuthEnabled, setSignupEnabled } from './middleware/auth';
 import { rateLimitMiddleware, authRateLimitMiddleware } from './middleware/rate-limit';
 import { securityHeadersMiddleware } from './middleware/security-headers';
 import { auditMiddleware, initializeAuditLog, closeAuditLog } from './middleware/audit';
@@ -42,6 +42,11 @@ export interface ApiServerConfig {
   logDir?: string;
   /** Webapps directory — used to contain user-supplied deploy paths */
   appsDirectory?: string;
+  /**
+   * Allow self-service signup via POST /auth/signup.
+   * Default false — requires isolation: docker + auth enabled at startup too.
+   */
+  allowSignup?: boolean;
 }
 
 export class ApiServer {
@@ -79,6 +84,9 @@ export class ApiServer {
         enableApiKeys: true,
       });
     }
+
+    // Signup gate — off by default; on only when platform config allows it.
+    setSignupEnabled(this.config.allowSignup === true);
 
     // Initialize audit logging
     if (this.config.logDir) {

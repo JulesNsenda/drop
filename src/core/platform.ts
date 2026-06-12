@@ -92,6 +92,12 @@ export interface PlatformConfig {
    * Default false; enable with DROP_ALLOW_SIGNUP=true.
    */
   allowSignup: boolean;
+  /** Max databases a single user may provision (0 = unlimited). */
+  maxDbsPerUser: number;
+  /** Global limit on simultaneous builds (0 = unlimited). */
+  maxConcurrentBuilds: number;
+  /** Max disk usage per app directory in MB (0 = unlimited). */
+  maxDiskMbPerApp: number;
 }
 
 // Determine platform-appropriate defaults
@@ -124,6 +130,9 @@ const DEFAULT_CONFIG: PlatformConfig = {
   maxAppsPerUser: parseInt(process.env.DROP_MAX_APPS_PER_USER || '5', 10),
   isolation: (process.env.DROP_ISOLATION as IsolationMode) ?? 'none',
   allowSignup: process.env.DROP_ALLOW_SIGNUP === 'true',
+  maxDbsPerUser: parseInt(process.env.DROP_MAX_DBS_PER_USER || '3', 10),
+  maxConcurrentBuilds: parseInt(process.env.DROP_MAX_CONCURRENT_BUILDS || '3', 10),
+  maxDiskMbPerApp: parseInt(process.env.DROP_MAX_DISK_MB_PER_APP || '0', 10),
 };
 
 export class DropPlatform {
@@ -715,6 +724,7 @@ import ${path.join(dataDir, 'appconf', 'caddy', 'hosts', '*.caddy').replace(/\\/
       host: '0.0.0.0',
       credentialsPath,
       enableAuth: this.config.enableApiAuth,
+      allowSignup: this.config.allowSignup,
       logDir,
       appsDirectory: this.config.appsDirectory,
     });
@@ -1076,6 +1086,19 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       this.logger.debug(`Skipping ${appName} - already in progress`, 'BUILD');
       return;
     }
+
+    // Enforce global concurrent build limit.  The deploy cooldown will
+    // re-trigger the build on the next file change once a slot opens.
+    if (this.config.maxConcurrentBuilds > 0 &&
+        this.appsInProgress.size >= this.config.maxConcurrentBuilds) {
+      this.logger.warn(
+        `Build queue full (${this.appsInProgress.size}/${this.config.maxConcurrentBuilds}), ` +
+        `deferring ${appName}`,
+        'BUILD'
+      );
+      return;
+    }
+
     this.appsInProgress.add(appName);
 
     this.logger.appEvent('building', appName);
@@ -1215,12 +1238,36 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       let dbEnvVars: Record<string, string> = {};
       const needsDb = await this.appNeedsDatabase(appPath, detection.suggestedConfig?.database);
       if (this.dbProvisioner && needsDb) {
-        this.logger.info(`Provisioning database for ${appName}...`, 'DATABASE');
-        const dbCreds = await this.dbProvisioner.provisionAppDatabase(appName);
-        dbEnvVars = this.dbProvisioner.getEnvVars(appName, {
-          pgHost: this.config.isolation === 'docker' ? 'host-gateway' : undefined,
-        }) || {};
-        this.logger.info(`Database provisioned: ${dbCreds.database}`, 'DATABASE');
+        // Enforce per-user DB quota before provisioning
+        const appState = this.stateManager?.getApp(appName);
+        const ownerUserId = appState?.userId;
+        if (ownerUserId && this.config.maxDbsPerUser > 0) {
+          const allApps = this.stateManager?.getAllApps() ?? [];
+          const userDbCount = allApps.filter(
+            (a) => a.userId === ownerUserId && this.dbProvisioner!.isProvisioned(a.name)
+          ).length;
+          if (userDbCount >= this.config.maxDbsPerUser) {
+            this.logger.warn(
+              `DB quota reached for user ${ownerUserId} (${userDbCount}/${this.config.maxDbsPerUser}), ` +
+              `skipping database provisioning for ${appName}`,
+              'DATABASE'
+            );
+          } else {
+            this.logger.info(`Provisioning database for ${appName}...`, 'DATABASE');
+            const dbCreds = await this.dbProvisioner.provisionAppDatabase(appName);
+            dbEnvVars = this.dbProvisioner.getEnvVars(appName, {
+              pgHost: this.config.isolation === 'docker' ? 'host-gateway' : undefined,
+            }) || {};
+            this.logger.info(`Database provisioned: ${dbCreds.database}`, 'DATABASE');
+          }
+        } else {
+          this.logger.info(`Provisioning database for ${appName}...`, 'DATABASE');
+          const dbCreds = await this.dbProvisioner.provisionAppDatabase(appName);
+          dbEnvVars = this.dbProvisioner.getEnvVars(appName, {
+            pgHost: this.config.isolation === 'docker' ? 'host-gateway' : undefined,
+          }) || {};
+          this.logger.info(`Database provisioned: ${dbCreds.database}`, 'DATABASE');
+        }
       }
 
       // Resolve dependencies from drop.yaml

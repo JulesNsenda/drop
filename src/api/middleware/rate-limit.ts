@@ -32,12 +32,34 @@ const AUTH_CONFIG: RateLimitConfig = {
 // In-memory stores per limiter instance
 const stores = new Map<string, Map<string, RateLimitEntry>>();
 
+/**
+ * Extract the real client IP.
+ *
+ * Uses the TCP socket peer address as the authoritative source.
+ * XFF is only trusted when the socket peer is loopback (i.e. the request
+ * came from the local Caddy reverse proxy), preventing clients from spoofing
+ * their own rate-limit bucket by forging the X-Forwarded-For header.
+ */
 function getClientIp(c: Context): string {
-  return (
-    c.req.header('x-forwarded-for')?.split(',')[0]?.trim() ||
-    c.req.header('x-real-ip') ||
-    'unknown'
-  );
+  // @hono/node-server exposes the raw IncomingMessage on c.env.incoming
+  const incoming = (c.env as unknown as Record<string, unknown>)?.incoming as
+    | { socket?: { remoteAddress?: string } }
+    | undefined;
+  const socketIp = incoming?.socket?.remoteAddress;
+
+  // Normalise IPv6-mapped IPv4 (e.g. "::ffff:127.0.0.1" → "127.0.0.1")
+  const peerIp = socketIp?.replace(/^::ffff:/i, '') ?? 'unknown';
+
+  const isLocalPeer =
+    peerIp === '127.0.0.1' || peerIp === '::1' || peerIp === 'unknown';
+
+  if (isLocalPeer) {
+    // Trust XFF only from a local reverse proxy (Caddy runs on the same host).
+    const xff = c.req.header('x-forwarded-for')?.split(',')[0]?.trim();
+    if (xff) return xff;
+  }
+
+  return peerIp;
 }
 
 function cleanup(store: Map<string, RateLimitEntry>): void {

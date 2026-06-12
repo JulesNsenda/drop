@@ -9,6 +9,15 @@ import * as fs from 'fs/promises';
 import * as path from 'path';
 import * as yaml from 'yaml';
 
+/** Keys accepted at the top level of drop.yaml. Any others are rejected. */
+const ALLOWED_TOP_KEYS = new Set([
+  'name', 'domains', 'tls', 'env', 'depends_on', 'port',
+  'build', 'start', 'healthCheck', 'maxBodySize', 'timeout',
+]);
+
+/** Keys accepted under drop.yaml#tls */
+const ALLOWED_TLS_KEYS = new Set(['certFile', 'keyFile', 'disabled']);
+
 /**
  * Custom TLS configuration for an app
  */
@@ -125,8 +134,8 @@ export async function parseDropYaml(appPath: string): Promise<DropYamlParseResul
     const content = await fs.readFile(yamlPath, 'utf-8');
     const parsed = yaml.parse(content) as DropYamlConfig;
 
-    // Validate the parsed config
-    const validationResult = validateDropYamlConfig(parsed);
+    // Validate the parsed config (pass appPath for TLS path containment)
+    const validationResult = validateDropYamlConfig(parsed, appPath);
     if (!validationResult.valid) {
       return {
         config: null,
@@ -155,18 +164,33 @@ export async function parseDropYaml(appPath: string): Promise<DropYamlParseResul
 }
 
 /**
- * Validate a parsed drop.yaml configuration
+ * Validate a parsed drop.yaml configuration.
+ *
+ * @param config  The parsed YAML value (may be any type).
+ * @param appPath Optional: absolute path to the app directory.  When provided,
+ *                tls.certFile and tls.keyFile must reside inside it (prevents
+ *                reading arbitrary host files via a tenant-controlled drop.yaml).
  */
-export function validateDropYamlConfig(config: unknown): { valid: boolean; error?: string } {
+export function validateDropYamlConfig(
+  config: unknown,
+  appPath?: string,
+): { valid: boolean; error?: string } {
   if (config === null || config === undefined) {
     return { valid: true }; // Empty config is valid
   }
 
-  if (typeof config !== 'object') {
+  if (typeof config !== 'object' || Array.isArray(config)) {
     return { valid: false, error: 'Configuration must be an object' };
   }
 
   const cfg = config as Record<string, unknown>;
+
+  // Strict schema: reject unknown top-level keys
+  for (const key of Object.keys(cfg)) {
+    if (!ALLOWED_TOP_KEYS.has(key)) {
+      return { valid: false, error: `Unknown field '${key}' in drop.yaml` };
+    }
+  }
 
   // Validate domains
   if (cfg.domains !== undefined) {
@@ -185,15 +209,42 @@ export function validateDropYamlConfig(config: unknown): { valid: boolean; error
 
   // Validate tls
   if (cfg.tls !== undefined) {
-    if (typeof cfg.tls !== 'object' || cfg.tls === null) {
+    if (typeof cfg.tls !== 'object' || cfg.tls === null || Array.isArray(cfg.tls)) {
       return { valid: false, error: 'tls must be an object' };
     }
     const tls = cfg.tls as Record<string, unknown>;
-    if (tls.certFile !== undefined && typeof tls.certFile !== 'string') {
-      return { valid: false, error: 'tls.certFile must be a string' };
+
+    // Strict schema: reject unknown tls keys
+    for (const key of Object.keys(tls)) {
+      if (!ALLOWED_TLS_KEYS.has(key)) {
+        return { valid: false, error: `Unknown field 'tls.${key}' in drop.yaml` };
+      }
     }
-    if (tls.keyFile !== undefined && typeof tls.keyFile !== 'string') {
-      return { valid: false, error: 'tls.keyFile must be a string' };
+
+    if (tls.certFile !== undefined) {
+      if (typeof tls.certFile !== 'string') {
+        return { valid: false, error: 'tls.certFile must be a string' };
+      }
+      if (appPath) {
+        const resolved = path.resolve(appPath, tls.certFile as string);
+        if (!resolved.startsWith(path.resolve(appPath) + path.sep) && resolved !== path.resolve(appPath)) {
+          return { valid: false, error: 'tls.certFile must be inside the app directory' };
+        }
+      }
+    }
+    if (tls.keyFile !== undefined) {
+      if (typeof tls.keyFile !== 'string') {
+        return { valid: false, error: 'tls.keyFile must be a string' };
+      }
+      if (appPath) {
+        const resolved = path.resolve(appPath, tls.keyFile as string);
+        if (!resolved.startsWith(path.resolve(appPath) + path.sep) && resolved !== path.resolve(appPath)) {
+          return { valid: false, error: 'tls.keyFile must be inside the app directory' };
+        }
+      }
+    }
+    if (tls.disabled !== undefined && typeof tls.disabled !== 'boolean') {
+      return { valid: false, error: 'tls.disabled must be a boolean' };
     }
   }
 
@@ -204,21 +255,52 @@ export function validateDropYamlConfig(config: unknown): { valid: boolean; error
     }
   }
 
+  // Validate string fields
+  for (const field of ['name', 'build', 'start', 'healthCheck', 'maxBodySize'] as const) {
+    if (cfg[field] !== undefined && typeof cfg[field] !== 'string') {
+      return { valid: false, error: `${field} must be a string` };
+    }
+  }
+
+  if (cfg.timeout !== undefined) {
+    if (typeof cfg.timeout !== 'number' || cfg.timeout <= 0) {
+      return { valid: false, error: 'timeout must be a positive number' };
+    }
+  }
+
+  // Validate env
+  if (cfg.env !== undefined) {
+    if (typeof cfg.env !== 'object' || cfg.env === null || Array.isArray(cfg.env)) {
+      return { valid: false, error: 'env must be an object' };
+    }
+    for (const [k, v] of Object.entries(cfg.env as Record<string, unknown>)) {
+      if (!k || typeof k !== 'string') {
+        return { valid: false, error: 'env keys must be non-empty strings' };
+      }
+      if (typeof v !== 'string' && typeof v !== 'number' && typeof v !== 'boolean') {
+        return { valid: false, error: `env.${k} must be a string, number, or boolean` };
+      }
+    }
+  }
+
   // Validate depends_on
   if (cfg.depends_on !== undefined) {
     if (!Array.isArray(cfg.depends_on)) {
       return { valid: false, error: 'depends_on must be an array' };
     }
     for (const dep of cfg.depends_on) {
-      if (typeof dep !== 'object' || dep === null) {
+      if (typeof dep !== 'object' || dep === null || Array.isArray(dep)) {
         return { valid: false, error: 'Each dependency must be an object' };
       }
       const d = dep as Record<string, unknown>;
-      if (typeof d.name !== 'string') {
-        return { valid: false, error: 'dependency.name must be a string' };
+      if (typeof d.name !== 'string' || !d.name) {
+        return { valid: false, error: 'dependency.name must be a non-empty string' };
       }
-      if (typeof d.env !== 'string') {
-        return { valid: false, error: 'dependency.env must be a string' };
+      if (typeof d.env !== 'string' || !d.env) {
+        return { valid: false, error: 'dependency.env must be a non-empty string' };
+      }
+      if (d.path !== undefined && typeof d.path !== 'string') {
+        return { valid: false, error: 'dependency.path must be a string' };
       }
     }
   }
