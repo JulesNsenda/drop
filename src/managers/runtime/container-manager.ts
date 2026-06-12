@@ -127,6 +127,20 @@ export class ContainerManager implements AppRuntime {
 
     const cmd = this.buildCmd(spec);
 
+    // Docker HEALTHCHECK — only injected when the app declares a health path.
+    const healthcheck = spec.healthCheckPath
+      ? {
+          Test: [
+            'CMD-SHELL',
+            `curl -sf http://localhost:${hostPort}${spec.healthCheckPath} || exit 1`,
+          ],
+          Interval: 30_000_000_000, // 30s in nanoseconds
+          Timeout:  10_000_000_000, // 10s
+          Retries:  3,
+          StartPeriod: 15_000_000_000, // 15s grace on startup
+        }
+      : undefined;
+
     const container = await this.docker.createContainer({
       name,
       Image: image,
@@ -137,6 +151,7 @@ export class ContainerManager implements AppRuntime {
         [MANAGED_LABEL]: 'true',
         'drop.app': appName,
       },
+      ...(healthcheck ? { Healthcheck: healthcheck } : {}),
       HostConfig: {
         // Port binding to loopback only — preserves the appconf port assignment
         // and Caddy's localhost:port upstreams without any router rewrite.
@@ -153,7 +168,7 @@ export class ContainerManager implements AppRuntime {
         SecurityOpt: CONTAINER_SECURITY_OPT,
         // Networking — attach to the DROP bridge; no host networking
         NetworkMode: DROP_NETWORK,
-        // Restart policy
+        // Restart policy — healthy-based restart when a health check is configured
         RestartPolicy: {
           Name: spec.autorestart === false ? 'no' : 'unless-stopped',
         },
@@ -217,7 +232,12 @@ export class ContainerManager implements AppRuntime {
     try {
       const container = this.docker.getContainer(containerName(name));
       const info = await container.inspect();
-      return this.inspectToInfo(name, info);
+      const base = this.inspectToInfo(name, info);
+      if (base.status === 'running') {
+        const stats = await this.fetchContainerStats(container);
+        return { ...base, ...stats };
+      }
+      return base;
     } catch (err: unknown) {
       if (this.isNotFound(err)) return null;
       throw err;
@@ -394,13 +414,47 @@ export class ContainerManager implements AppRuntime {
       runtime: this.type,
       pid,
       port: null, // port lives in the appconf; not re-derived from inspect
-      memory: 0,  // live stats need docker stats API — deferred to M6
-      cpu: 0,     // ditto
+      memory: 0,  // populated by fetchContainerStats in getStatus when running
+      cpu: 0,
       uptime,
       restarts: info.RestartCount ?? 0,
       createdAt,
       restartedAt,
     };
+  }
+
+  /**
+   * One-shot stats snapshot for a running container. Returns { memory, cpu }
+   * in the same units as AppProcessInfo (bytes, percent). Best-effort — returns
+   * zeros on any error so the caller always gets a complete AppProcessInfo.
+   */
+  private async fetchContainerStats(
+    container: Docker.Container
+  ): Promise<{ memory: number; cpu: number }> {
+    try {
+      const raw = await container.stats({ stream: false }) as unknown as Record<string, unknown>;
+      const memStats = raw.memory_stats as Record<string, number> | undefined;
+      const cpuStats = raw.cpu_stats as Record<string, unknown> | undefined;
+      const preCpuStats = raw.precpu_stats as Record<string, unknown> | undefined;
+
+      const memUsage = memStats?.usage ?? 0;
+
+      // CPU % = (delta of container cpu ticks / delta of system cpu ticks) * numCPUs * 100
+      const cpuDelta =
+        ((cpuStats?.cpu_usage as Record<string, number>)?.total_usage ?? 0) -
+        ((preCpuStats?.cpu_usage as Record<string, number>)?.total_usage ?? 0);
+      const systemDelta =
+        ((cpuStats as Record<string, number>)?.system_cpu_usage ?? 0) -
+        ((preCpuStats as Record<string, number>)?.system_cpu_usage ?? 0);
+      const numCpus =
+        ((cpuStats?.cpu_usage as Record<string, number[]>)?.percpu_usage?.length) ?? 1;
+      const cpuPercent =
+        systemDelta > 0 ? (cpuDelta / systemDelta) * numCpus * 100 : 0;
+
+      return { memory: memUsage, cpu: Math.round(cpuPercent * 10) / 10 };
+    } catch {
+      return { memory: 0, cpu: 0 };
+    }
   }
 
   /** Parse a memory string ('256m', '1g', '512M') to bytes. */

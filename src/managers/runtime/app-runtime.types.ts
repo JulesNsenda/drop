@@ -76,6 +76,12 @@ export interface AppStartSpec {
    * Only honoured when isolation === 'docker' and appType === 'docker'.
    */
   runtimeImage?: string;
+  /**
+   * HTTP path for health checking (e.g. "/health").  When set:
+   * - Docker mode: injected as HEALTHCHECK CMD.
+   * - PM2 mode: platform prober polls this path and restarts on failure.
+   */
+  healthCheckPath?: string;
 }
 
 /**

@@ -124,10 +124,34 @@ apps.get('/', async (c) => {
     filtered = filtered.filter((app) => app.type === type);
   }
 
+  const isAdmin = auth?.role === 'admin';
+
+  // Batch-fetch live stats from the runtime (best-effort; no-op on failure).
+  // Joined by name so the list stays fast even if the runtime is unavailable.
+  let statsMap: Map<string, { memory: number; cpu: number }> = new Map();
+  try {
+    const pm = getAppRuntime();
+    const allStatus = await pm.getAllStatus();
+    for (const s of allStatus) {
+      statsMap.set(s.name, { memory: s.memory, cpu: s.cpu });
+    }
+  } catch {
+    // Runtime not yet ready — skip stats
+  }
+
   return c.json(
-    success(filtered.map((a) => toAppDto(a, auth?.role === 'admin')), {
-      total: filtered.length,
-    })
+    success(
+      filtered.map((a) => {
+        const dto = toAppDto(a, isAdmin);
+        const stats = statsMap.get(a.name);
+        if (stats && a.status === 'running') {
+          dto.memory = stats.memory;
+          dto.cpu = stats.cpu;
+        }
+        return dto;
+      }),
+      { total: filtered.length }
+    )
   );
 });
 
@@ -142,27 +166,29 @@ apps.get('/:name', async (c) => {
     throw new NotFoundError(`Application '${name}' not found`);
   }
 
-  // Get additional process info
+  const isAdmin = auth?.role === 'admin';
+  const isOwner = !auth || auth.userId === app.userId || isAdmin;
+
+  // Augment with live runtime stats (memory, cpu, restarts)
   const pm = getAppRuntime();
   try {
-    const status = await pm.getStatus(name);
-    if (status) {
-      const isAdmin = auth?.role === 'admin';
+    const procInfo = await pm.getStatus(name);
+    if (procInfo) {
       return c.json(
         success({
           ...toAppDto(app, isAdmin),
-          pid: isAdmin ? (status.pid ?? app.pid) : undefined,
-          memory: isAdmin ? status.memory : undefined,
-          cpu: isAdmin ? status.cpu : undefined,
-          restarts: status.restarts,
+          pid: isAdmin ? (procInfo.pid ?? app.pid) : undefined,
+          memory: isOwner ? procInfo.memory : undefined,
+          cpu: isOwner ? procInfo.cpu : undefined,
+          restarts: procInfo.restarts,
         })
       );
     }
   } catch {
-    // Process info not available
+    // Runtime info not available — return state-only data
   }
 
-  return c.json(success(toAppDto(app, auth?.role === 'admin')));
+  return c.json(success(toAppDto(app, isAdmin)));
 });
 
 // POST /apps - Deploy a new application
