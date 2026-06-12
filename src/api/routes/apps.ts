@@ -13,6 +13,7 @@ import { AuthContext, listUsers, getUserById } from '../middleware/auth';
 import { canAccess } from '../access';
 import { getAppRuntime } from '../../managers/runtime';
 import { migrateAppRuntime } from '../../managers/runtime/runtime-migrator';
+import { getDiskFreeMb } from '../../utils/disk';
 import { getStateManager, AppState } from '../../managers/app/state-manager';
 import { getAppConfigService } from '../../managers/app/app-config';
 import { tryLogActivity } from '../../managers/activity';
@@ -186,6 +187,18 @@ apps.post('/', async (c) => {
   const stateManager = getStateManager();
   if (stateManager.hasApp(appName)) {
     return c.json(error(ErrorCodes.CONFLICT, `Application '${appName}' already exists`), 409);
+  }
+
+  // Disk watermark: reject new deploys when the filesystem is dangerously full.
+  // MIN_FREE_MB is a hard floor regardless of per-app limits.
+  const MIN_FREE_DISK_MB = parseInt(process.env.DROP_MIN_FREE_DISK_MB || '500', 10);
+  try {
+    const freeMb = await getDiskFreeMb(body.path);
+    if (freeMb < MIN_FREE_DISK_MB) {
+      return c.json(error(ErrorCodes.INTERNAL_ERROR, `Insufficient disk space (${Math.round(freeMb)} MB free, need ${MIN_FREE_DISK_MB} MB)`), 507 as any);
+    }
+  } catch {
+    // Disk check failure is non-blocking — log but proceed
   }
 
   // Check per-user app limit

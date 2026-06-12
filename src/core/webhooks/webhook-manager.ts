@@ -10,6 +10,7 @@ import * as fs from 'fs/promises';
 import * as path from 'path';
 import { eventBus, Unsubscribe } from '../event-bus';
 import { writeJsonAtomic } from '../../utils/atomic-write';
+import { assertSafeOutboundUrl, SsrfBlockedError } from '../../utils/ssrf-guard';
 import {
   WebhookConfig,
   WebhookEvent,
@@ -141,6 +142,23 @@ export class WebhookManager {
     event: WebhookEvent,
     data: Record<string, unknown>
   ): Promise<void> {
+    // Block delivery to private/loopback/cloud-metadata addresses.
+    try {
+      await assertSafeOutboundUrl(webhook.url);
+    } catch (err) {
+      this.recordDelivery({
+        id: crypto.randomUUID(),
+        webhookId: webhook.id,
+        event,
+        statusCode: null,
+        success: false,
+        error: err instanceof SsrfBlockedError ? err.message : 'URL blocked',
+        duration: 0,
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
     const payload: WebhookPayload = {
       event,
       timestamp: new Date().toISOString(),

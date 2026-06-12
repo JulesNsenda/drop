@@ -10,7 +10,7 @@ import { writeJsonAtomic } from '../../utils/atomic-write';
 
 export interface ActivityEntry {
   id: string;
-  action: 'deploy' | 'git-deploy' | 'start' | 'stop' | 'restart' | 'delete' | 'login' | 'signup' | 'redeploy' | 'migrate-runtime';
+  action: 'deploy' | 'git-deploy' | 'start' | 'stop' | 'restart' | 'delete' | 'login' | 'signup' | 'redeploy' | 'migrate-runtime' | 'suspend' | 'unsuspend';
   userId?: string;
   username?: string;
   appName?: string;
