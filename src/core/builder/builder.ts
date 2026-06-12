@@ -385,7 +385,7 @@ export class BuilderService {
       return this.createSkippedResult('install', startTime);
     }
 
-    this.emitLog(context.appName, 'install', 'info', `Running: ${installCommand}`);
+    this.emitLog(context.appName, 'install', 'info', `Running: ${installCommand}`, context);
 
     const exec = context.execCommand ?? executeCommand;
     const result = await exec(
@@ -394,7 +394,7 @@ export class BuilderService {
       context.env,
       signal,
       (data, type) => {
-        this.emitLog(context.appName, 'install', type === 'stderr' ? 'warn' : 'info', data);
+        this.emitLog(context.appName, 'install', type === 'stderr' ? 'warn' : 'info', data, context);
       }
     );
 
@@ -428,7 +428,7 @@ export class BuilderService {
       return this.createSkippedResult('build', startTime);
     }
 
-    this.emitLog(context.appName, 'build', 'info', `Running: ${buildCommand}`);
+    this.emitLog(context.appName, 'build', 'info', `Running: ${buildCommand}`, context);
 
     const timeout = context.config.timeout || this.config.defaultTimeout;
 
@@ -440,7 +440,7 @@ export class BuilderService {
         context.env,
         signal,
         (data, type) => {
-          this.emitLog(context.appName, 'build', type === 'stderr' ? 'warn' : 'info', data);
+          this.emitLog(context.appName, 'build', type === 'stderr' ? 'warn' : 'info', data, context);
         },
         timeout
       );
@@ -563,11 +563,12 @@ export class BuilderService {
     _appName: string,
     _stage: BuildStage,
     level: 'info' | 'warn' | 'error',
-    message: string
+    message: string,
+    context?: BuildContext
   ): void {
-    // Log to console for now - build:log event type not in event bus
     const logFn = level === 'error' ? console.error : level === 'warn' ? console.warn : console.log;
     logFn(`[build] ${message}`);
+    context?.onBuildLog?.(message);
   }
 }
 
