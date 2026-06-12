@@ -32,6 +32,7 @@ import { createApiKey, deleteApiKeysByName } from '../api/middleware/auth';
 import { IsolationMode, assertStartupConstraints } from './startup-constraints';
 import { createContainerExecCommand } from './builder/container-build-runner';
 import { migrateAllToDocker } from '../managers/runtime/runtime-migrator';
+import { buildNginxConf } from '../utils/nginx-conf';
 
 export interface PlatformConfig {
   /** Root directory for DROP */
@@ -1157,20 +1158,42 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
 
       this.logger.appEvent('starting', appName, `port ${port}`);
 
-      // Determine start command based on app type
+      // Persistent data dir must be ready before script determination so that
+      // the docker+static path can write nginx.conf into it.
+      const dataDir = await this.ensureAppDataDirectory(appName);
+      this.logger.info(`Data directory: ${dataDir}`, 'DATA');
+
+      // Determine start command based on app type and isolation mode.
       let script: string;
       let interpreter: string | undefined;
       let args: string[] | undefined;
 
       if (detection.type === 'static' || detection.type === 'spa') {
-        // Static sites use our built-in static server
-        const serveDir = path.join(appPath, detection.suggestedConfig?.outputDirectory || '.');
-        // Prefer compiled dist/core/static-server.js, fallback to __dirname version
-        const fsSync = require('fs');
-        const distPath = path.join(__dirname, '..', '..', 'dist', 'core', 'static-server.js');
-        const localPath = path.join(__dirname, 'static-server.js');
-        script = fsSync.existsSync(localPath) ? localPath : fsSync.existsSync(distPath) ? distPath : localPath;
-        args = [serveDir, '-s']; // -s for SPA mode
+        if (this.config.isolation === 'docker') {
+          // In docker mode, nginx:alpine serves the built output.  Write a
+          // custom nginx.conf to the data dir (mounted read-write inside the
+          // container at the same path) and copy it on container start.
+          const outputSubdir = detection.suggestedConfig?.outputDirectory || '';
+          const nginxConf = buildNginxConf(port, outputSubdir);
+          const nginxConfPath = path.join(dataDir, 'nginx.conf');
+          await fs.writeFile(nginxConfPath, nginxConf, 'utf-8');
+          this.logger.info(`Wrote nginx.conf for ${appName} → port ${port}`, 'STATIC');
+
+          script = '/bin/sh';
+          interpreter = 'none';
+          args = [
+            '-c',
+            `cp ${nginxConfPath} /etc/nginx/conf.d/default.conf && nginx -g 'daemon off;'`,
+          ];
+        } else {
+          // PM2 mode: use the bundled Node.js static server.
+          const serveDir = path.join(appPath, detection.suggestedConfig?.outputDirectory || '.');
+          const fsSync = require('fs');
+          const distPath = path.join(__dirname, '..', '..', 'dist', 'core', 'static-server.js');
+          const localPath = path.join(__dirname, 'static-server.js');
+          script = fsSync.existsSync(localPath) ? localPath : fsSync.existsSync(distPath) ? distPath : localPath;
+          args = [serveDir, '-s']; // -s for SPA mode
+        }
       } else if (detection.type === 'go') {
         // Go apps run as compiled binaries
         const startCommand = detection.suggestedConfig?.startCommand || `./${appName}`;
@@ -1187,10 +1210,6 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           script = startCommand;
         }
       }
-
-      // Create persistent data directory for the app
-      const dataDir = await this.ensureAppDataDirectory(appName);
-      this.logger.info(`Data directory: ${dataDir}`, 'DATA');
 
       // Check if app needs a database and provision one
       let dbEnvVars: Record<string, string> = {};
@@ -1231,6 +1250,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         port,
         outFile,
         errorFile,
+        appType: detection.type,
         env: {
           NODE_ENV: 'production',
           PORT: port.toString(),
