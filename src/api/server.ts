@@ -134,6 +134,8 @@ export class ApiServer {
 
     // Apply auth middleware to protected routes when auth is enabled
     if (this.config.enableAuth && isAuthEnabled()) {
+      // migrate-runtime is admin-only — register before the general /apps/* guard.
+      v1.use('/apps/*/migrate-runtime', authMiddleware('admin'));
       v1.use('/apps/*', authMiddleware('readonly'));
       v1.use('/apps', authMiddleware('readonly'));
       v1.use('/usage', authMiddleware('readonly'));

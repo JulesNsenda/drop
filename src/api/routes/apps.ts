@@ -12,11 +12,14 @@ import { NotFoundError, ValidationError } from '../middleware/error';
 import { AuthContext, listUsers, getUserById } from '../middleware/auth';
 import { canAccess } from '../access';
 import { getAppRuntime } from '../../managers/runtime';
+import { migrateAppRuntime } from '../../managers/runtime/runtime-migrator';
 import { getStateManager, AppState } from '../../managers/app/state-manager';
 import { getAppConfigService } from '../../managers/app/app-config';
 import { tryLogActivity } from '../../managers/activity';
 import { getAppsDirectory } from '../runtime-config';
 import { isPathWithin } from '../../utils/paths';
+import { eventBus } from '../../core/event-bus';
+import type { RuntimeType } from '../../managers/runtime/app-runtime.types';
 
 const apps = new Hono();
 
@@ -389,6 +392,70 @@ apps.put('/:name/domain', async (c) => {
   await stateManager.updateApp(name, { customDomain: domain || ('' as unknown as undefined) });
 
   return c.json(success({ message: domain ? `Domain set to ${domain}` : 'Domain removed', domain }));
+});
+
+// POST /:name/migrate-runtime — Admin: move an app between PM2 and Docker.
+// Stops the current runtime, updates appconf, and triggers a redeploy via
+// app:detected so the platform restarts the app in the new runtime.
+apps.post('/:name/migrate-runtime', async (c) => {
+  const authCtx = (c.get as Function)('auth') as AuthContext | undefined;
+  if (authCtx && authCtx.role !== 'admin') {
+    return c.json(error(ErrorCodes.UNAUTHORIZED, 'Admin access required for runtime migration'), 403);
+  }
+
+  const appName = c.req.param('name');
+  const configService = getAppConfigService();
+  const config = configService.getConfig(appName);
+  if (!config) {
+    return c.json(error(ErrorCodes.NOT_FOUND, `App '${appName}' not found`), 404);
+  }
+
+  let body: { targetRuntime?: string } = {};
+  try {
+    body = await c.req.json();
+  } catch {
+    // No body — default to docker
+  }
+
+  const targetRuntime: RuntimeType =
+    body.targetRuntime === 'pm2' ? 'pm2' : 'docker';
+
+  try {
+    const result = await migrateAppRuntime(appName, targetRuntime);
+
+    // Trigger rebuild + restart in the new runtime (only if the app was not
+    // intentionally stopped by the user — mirrors platform's own logic).
+    const stateManager = getStateManager();
+    const appState = stateManager.getApp(appName);
+    if (appState?.status !== 'stopped') {
+      const appPath = config.path || path.join(getAppsDirectory(), appName);
+      eventBus.publish('app:detected', {
+        name: appName,
+        path: appPath,
+        type: config.type,
+        timestamp: new Date(),
+      });
+    }
+
+    await tryLogActivity({ action: 'migrate-runtime', userId: authCtx?.userId, username: authCtx?.username, appName });
+
+    return c.json(
+      success({
+        appName: result.appName,
+        from: result.from,
+        to: result.to,
+        redeploying: appState?.status !== 'stopped',
+      })
+    );
+  } catch (err) {
+    return c.json(
+      error(
+        ErrorCodes.INTERNAL_ERROR,
+        err instanceof Error ? err.message : 'Migration failed'
+      ),
+      500
+    );
+  }
 });
 
 export default apps;

@@ -174,6 +174,15 @@ export class DropApiClient {
   async deployApp(appPath: string, name?: string, port?: number): Promise<AppDto> {
     return this.request<AppDto>('POST', '/apps', { path: appPath, name, port });
   }
+
+  async migrateRuntime(
+    name: string,
+    targetRuntime: 'pm2' | 'docker' = 'docker'
+  ): Promise<{ appName: string; from: string; to: string; redeploying: boolean }> {
+    return this.request('POST', `/apps/${encodeURIComponent(name)}/migrate-runtime`, {
+      targetRuntime,
+    });
+  }
 }
 
 function getDropRoot(): string {
