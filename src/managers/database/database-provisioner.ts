@@ -158,6 +158,11 @@ export class DatabaseProvisioner {
       await appPool.query(`GRANT ALL ON SCHEMA public TO "${userName}"`);
       await appPool.query(`ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO "${userName}"`);
       await appPool.query(`ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO "${userName}"`);
+      // Revoke default PUBLIC privileges so only the provisioned app user can
+      // connect or act on the schema — prevents cross-tenant data access if a
+      // second DB user were somehow created.
+      await appPool.query(`REVOKE CONNECT ON DATABASE "${dbName}" FROM PUBLIC`);
+      await appPool.query(`REVOKE ALL ON SCHEMA public FROM PUBLIC`);
     } finally {
       await appPool.end();
     }
@@ -243,22 +248,32 @@ export class DatabaseProvisioner {
   }
 
   /**
-   * Get environment variables for an app's database connection
+   * Get environment variables for an app's database connection.
+   *
+   * When `pgHost` is provided (e.g. `'host-gateway'` for Docker mode) the host
+   * portion of every connection string is substituted so that containerised apps
+   * can reach the bundled PostgreSQL on the host rather than resolving
+   * `localhost` inside their own network namespace.
    */
-  getEnvVars(appName: string): Record<string, string> | null {
+  getEnvVars(appName: string, opts?: { pgHost?: string }): Record<string, string> | null {
     const creds = this.getAppCredentials(appName);
     if (!creds) {
       return null;
     }
 
+    const host = opts?.pgHost ?? creds.host;
+    const connectionString = opts?.pgHost
+      ? `postgresql://${creds.user}:${creds.password}@${opts.pgHost}:${creds.port}/${creds.database}`
+      : creds.connectionString;
+
     return {
-      DATABASE_URL: creds.connectionString,
-      PGHOST: creds.host,
+      DATABASE_URL: connectionString,
+      PGHOST: host,
       PGPORT: creds.port.toString(),
       PGDATABASE: creds.database,
       PGUSER: creds.user,
       PGPASSWORD: creds.password,
-      DB_HOST: creds.host,
+      DB_HOST: host,
       DB_PORT: creds.port.toString(),
       DB_NAME: creds.database,
       DB_USER: creds.user,
