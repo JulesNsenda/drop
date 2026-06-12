@@ -15,3 +15,4 @@ export { createDeployCommand } from './deploy';
 export { createRemoveCommand } from './remove';
 export { createServeCommand, createServerCommand } from './serve';
 export { createBackupCommand } from './backup';
+export { createMigrateRuntimeCommand } from './migrate-runtime';

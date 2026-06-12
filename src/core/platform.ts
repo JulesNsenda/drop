@@ -31,6 +31,7 @@ import {
 import { createApiKey, deleteApiKeysByName } from '../api/middleware/auth';
 import { IsolationMode, assertStartupConstraints } from './startup-constraints';
 import { createContainerExecCommand } from './builder/container-build-runner';
+import { migrateAllToDocker } from '../managers/runtime/runtime-migrator';
 
 export interface PlatformConfig {
   /** Root directory for DROP */
@@ -228,6 +229,12 @@ export class DropPlatform {
 
       // Initialize services
       await this.initializeServices();
+
+      // In docker mode, stop any PM2-managed apps before the watcher starts so
+      // containers can bind to the same ports without conflict.
+      if (this.config.isolation === 'docker') {
+        await this.runFirstBootMigration();
+      }
 
       // Wire up event handlers
       this.setupEventHandlers();
@@ -755,6 +762,34 @@ import ${path.join(dataDir, 'appconf', 'caddy', 'hosts', '*.caddy').replace(/\\/
       this.logger.info(`Synced state with ${processes.length} processes`, 'STATE');
     } catch (error) {
       this.logger.warn('Failed to sync state with processes', 'STATE', error);
+    }
+  }
+
+  /**
+   * On first boot in docker mode, stop any PM2-managed apps and mark their
+   * appconf runtime as 'docker' so the watcher's startup scan rebuilds them as
+   * containers instead of trying to start new processes against ports that PM2
+   * still holds.
+   */
+  private async runFirstBootMigration(): Promise<void> {
+    if (!this.appConfigService) return;
+
+    const configs = this.appConfigService.getAllConfigs();
+    const pm2Count = configs.filter((c) => (c.runtime ?? 'pm2') === 'pm2').length;
+    if (pm2Count === 0) return;
+
+    this.logger.info(
+      `Docker mode: migrating ${pm2Count} PM2 app(s) to container runtime...`,
+      'MIGRATE'
+    );
+
+    const results = await migrateAllToDocker(configs);
+    for (const r of results) {
+      if (r.error) {
+        this.logger.warn(`Migration failed for ${r.appName}: ${r.error}`, 'MIGRATE');
+      } else {
+        this.logger.info(`Migrated ${r.appName}: pm2 → docker`, 'MIGRATE');
+      }
     }
   }
 
