@@ -10,6 +10,8 @@ import { spawn } from 'child_process';
 
 export type IsolationMode = 'none' | 'docker';
 
+const CADDY_INSTALL_URL = 'https://caddyserver.com/docs/install';
+
 export class StartupConstraintError extends Error {
   constructor(message: string) {
     super(message);
@@ -63,10 +65,56 @@ export function checkDockerReachable(): Promise<void> {
   });
 }
 
+/**
+ * Probe whether `caddy` is on the PATH and responds to `caddy version`.
+ *
+ * In docker/multi-user mode Caddy is mandatory — hostname-based routing and
+ * TLS are not optional when apps are multi-tenant.  In isolation:none mode,
+ * Caddy is nice-to-have and its absence is only a soft warning.
+ */
+export function checkCaddyAvailable(): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const proc = spawn('caddy', ['version'], {
+      stdio: ['ignore', 'ignore', 'pipe'],
+    });
+
+    let stderr = '';
+    proc.stderr.on('data', (chunk: Buffer) => {
+      stderr += chunk.toString();
+    });
+
+    proc.on('error', () => {
+      reject(
+        new StartupConstraintError(
+          `Caddy is required in isolation:docker (multi-user) mode but was not found on the PATH. ` +
+            `Install Caddy from ${CADDY_INSTALL_URL} and ensure it is available as 'caddy'. ` +
+            `If you want to run without Caddy, switch to isolation:none (single-user mode).`
+        )
+      );
+    });
+
+    proc.on('close', (code) => {
+      if (code === 0) {
+        resolve();
+      } else {
+        reject(
+          new StartupConstraintError(
+            `Caddy is required in isolation:docker (multi-user) mode but 'caddy version' ` +
+              `exited with code ${code}. ${stderr.trim() ? stderr.trim() + ' ' : ''}` +
+              `Install or repair Caddy: ${CADDY_INSTALL_URL}`
+          )
+        );
+      }
+    });
+  });
+}
+
 export interface StartupConstraintConfig {
   isolation: IsolationMode;
   allowSignup: boolean;
   enableApiAuth: boolean;
+  /** Whether Caddy is currently available (passed in from the platform after its own probe). */
+  caddyAvailable?: boolean;
 }
 
 /**
@@ -82,12 +130,20 @@ export interface StartupConstraintConfig {
  */
 export async function assertStartupConstraints(
   config: StartupConstraintConfig,
-  opts?: { checkDocker?: () => Promise<void> }
+  opts?: {
+    checkDocker?: () => Promise<void>;
+    checkCaddy?: () => Promise<void>;
+  }
 ): Promise<void> {
   const checkDocker = opts?.checkDocker ?? checkDockerReachable;
+  const checkCaddy = opts?.checkCaddy ?? checkCaddyAvailable;
 
   if (config.isolation === 'docker') {
     await checkDocker();
+    // Caddy is mandatory in docker (multi-user) mode.
+    // Port-only access is not a safe fallback when multiple users share the host —
+    // hostname-based routing and TLS are required for correct origin isolation.
+    await checkCaddy();
   }
 
   if (config.allowSignup && config.isolation !== 'docker') {

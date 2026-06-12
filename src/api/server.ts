@@ -47,6 +47,10 @@ export interface ApiServerConfig {
    * Default false — requires isolation: docker + auth enabled at startup too.
    */
   allowSignup?: boolean;
+  /** Whether HTTPS is enabled (passed through to runtime-config for URL generation). */
+  enableHttps?: boolean;
+  /** Active domain suffix (e.g. "example.com"). */
+  domainSuffix?: string;
 }
 
 export class ApiServer {
@@ -70,7 +74,11 @@ export class ApiServer {
       this.config.corsOrigins = fromEnv && fromEnv.length > 0 ? fromEnv : [];
     }
 
-    setApiRuntimeConfig({ appsDirectory: this.config.appsDirectory });
+    setApiRuntimeConfig({
+      appsDirectory: this.config.appsDirectory,
+      enableHttps: this.config.enableHttps,
+      domainSuffix: this.config.domainSuffix,
+    });
 
     this.app = new Hono();
   }

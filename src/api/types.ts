@@ -40,6 +40,8 @@ export interface AppDto {
   path?: string;
   framework?: string;
   hostname?: string;
+  /** Full URL (computed from hostname + protocol). Populated when hostname is set. */
+  url?: string;
   createdAt: string;
   updatedAt: string;
   lastDeployedAt?: string;
