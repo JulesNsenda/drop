@@ -511,41 +511,10 @@ backup:
       }
     }
 
-    // 3. Create initial Caddyfile if it doesn't exist
-    try {
-      await fs.access(this.config.caddyfilePath);
-    } catch {
-      try {
-        const initialCaddyfile = `# DROP Platform Caddyfile
-# Auto-generated - routes are added automatically when apps are deployed
-
-# Global options
-{
-    auto_https off
-    admin off
-}
-
-# Logging
-(drop_logging) {
-    log {
-        output file ${path.join(dataDir, 'logs', 'caddy', 'access.log').replace(/\\/g, '/')} {
-            roll_size 100mb
-            roll_keep 10
-        }
-        format json
-    }
-}
-
-# Import app and host configurations
-import ${path.join(dataDir, 'appconf', 'caddy', 'webapps', '*.caddy').replace(/\\/g, '/')}
-import ${path.join(dataDir, 'appconf', 'caddy', 'hosts', '*.caddy').replace(/\\/g, '/')}
-`;
-        await fs.writeFile(this.config.caddyfilePath, initialCaddyfile);
-        this.log('info', `Created initial Caddyfile at ${this.config.caddyfilePath}`);
-      } catch (error) {
-        this.log('warn', 'Failed to create initial Caddyfile', error);
-      }
-    }
+    // 3. Create or upgrade the managed Caddyfile.
+    // We version it with a header so we can detect and regenerate stale configs
+    // on upgrade (e.g. when docker mode is first enabled on an existing install).
+    await this.ensureCaddyfile(dataDir);
 
     // 4. Create initial platform log file
     const platformLogPath = path.join(dataDir, 'logs', 'drop-svc', 'drop-svc.log');
@@ -570,6 +539,87 @@ import ${path.join(dataDir, 'appconf', 'caddy', 'hosts', '*.caddy').replace(/\\/
         await fs.writeFile(errorLogPath, logHeader);
       } catch (error) {
         this.log('debug', 'Failed to create error log file', error);
+      }
+    }
+  }
+
+  /**
+   * Managed Caddyfile versioning.
+   *
+   * Version header `# DROP Caddyfile v2` lets us detect stale configs written
+   * by older DROP releases and regenerate them.  Regeneration only touches the
+   * global options block and import lines — per-app *.caddy files are managed
+   * separately and are never rewritten here.
+   *
+   * The critical change from v1→v2: when `enableHttps` is true and domainSuffix
+   * is not localhost, we omit `auto_https off` so Caddy uses HTTP-01 ACME by
+   * default instead of requiring manual cert configuration.
+   */
+  private readonly CADDYFILE_VERSION = '# DROP Caddyfile v2';
+
+  private buildCaddyfileContent(dataDir: string): string {
+    const isHttps = this.config.enableHttps && !isLocalhostDomain(this.config.domainSuffix || 'localhost');
+    const logFile = path.join(dataDir, 'logs', 'caddy', 'access.log').replace(/\\/g, '/');
+    const webappsImport = path.join(dataDir, 'appconf', 'caddy', 'webapps', '*.caddy').replace(/\\/g, '/');
+    const hostsImport = path.join(dataDir, 'appconf', 'caddy', 'hosts', '*.caddy').replace(/\\/g, '/');
+
+    const globalBlock = [
+      `{`,
+      ...(this.config.acmeEmail ? [`    email ${this.config.acmeEmail}`] : []),
+      ...(this.config.acmeStaging ? [`    acme_ca https://acme-staging-v02.api.letsencrypt.org/directory`] : []),
+      `    admin localhost:2019`,
+      ...(!isHttps ? [`    auto_https off`] : []),
+      `}`,
+    ].join('\n');
+
+    return [
+      `${this.CADDYFILE_VERSION}`,
+      `# Managed by DROP — do not edit by hand.`,
+      `# Delete this file to reset to defaults.`,
+      ``,
+      globalBlock,
+      ``,
+      `# Logging`,
+      `(drop_logging) {`,
+      `    log {`,
+      `        output file ${logFile} {`,
+      `            roll_size 100mb`,
+      `            roll_keep 10`,
+      `        }`,
+      `        format json`,
+      `    }`,
+      `}`,
+      ``,
+      `# Import app and host configurations`,
+      `import ${webappsImport}`,
+      `import ${hostsImport}`,
+      ``,
+    ].join('\n');
+  }
+
+  private async ensureCaddyfile(dataDir: string): Promise<void> {
+    let needsWrite = false;
+    try {
+      const existing = await fs.readFile(this.config.caddyfilePath, 'utf-8');
+      // Regenerate if the version header is missing (stale v1 config)
+      if (!existing.startsWith(this.CADDYFILE_VERSION)) {
+        this.logger.info(
+          'Upgrading Caddyfile to v2 (version header missing — stale config detected)',
+          'CADDY'
+        );
+        needsWrite = true;
+      }
+    } catch {
+      // File doesn't exist yet
+      needsWrite = true;
+    }
+
+    if (needsWrite) {
+      try {
+        await fs.writeFile(this.config.caddyfilePath, this.buildCaddyfileContent(dataDir), 'utf-8');
+        this.logger.info(`Caddyfile written at ${this.config.caddyfilePath}`, 'CADDY');
+      } catch (error) {
+        this.logger.warn('Failed to write Caddyfile', 'CADDY', error);
       }
     }
   }
@@ -725,6 +775,8 @@ import ${path.join(dataDir, 'appconf', 'caddy', 'hosts', '*.caddy').replace(/\\/
       credentialsPath,
       enableAuth: this.config.enableApiAuth,
       allowSignup: this.config.allowSignup,
+      enableHttps: this.config.enableHttps,
+      domainSuffix: this.config.domainSuffix,
       logDir,
       appsDirectory: this.config.appsDirectory,
     });
@@ -1384,6 +1436,20 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         }
       }
 
+      // In docker (multi-user) mode inject security headers on all tenant routes.
+      // Shared-domain isolation honest note: subdomains of one registrable domain
+      // are same-site — these headers mitigate clickjacking and MIME sniffing but
+      // do NOT provide full origin isolation (that requires separate domains).
+      const tenantSecurityHeaders: Record<string, string> | undefined =
+        this.config.isolation === 'docker'
+          ? {
+              'X-Frame-Options': 'SAMEORIGIN',
+              'X-Content-Type-Options': 'nosniff',
+              'Referrer-Policy': 'strict-origin-when-cross-origin',
+              'Permissions-Policy': 'camera=(), microphone=(), geolocation=()',
+            }
+          : undefined;
+
       // Configure route for each domain
       for (const hostname of domains) {
         const isLocalhost = isLocalhostDomain(hostname);
@@ -1398,6 +1464,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           tls: customTls
             ? { certFile: customTls.certFile, keyFile: customTls.keyFile }
             : (enableSsl ? { auto: true } : undefined),
+          headers: tenantSecurityHeaders,
         });
 
         const protocol = enableSsl ? 'https' : 'http';

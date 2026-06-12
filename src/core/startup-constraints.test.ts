@@ -15,11 +15,17 @@ const dockerOk = jest.fn().mockResolvedValue(undefined);
 const dockerFail = jest.fn().mockRejectedValue(
   new StartupConstraintError('Docker daemon is not reachable')
 );
+const caddyOk = jest.fn().mockResolvedValue(undefined);
+const caddyFail = jest.fn().mockRejectedValue(
+  new StartupConstraintError('Caddy is required in isolation:docker')
+);
 
 describe('assertStartupConstraints', () => {
   beforeEach(() => {
     dockerOk.mockClear();
     dockerFail.mockClear();
+    caddyOk.mockClear();
+    caddyFail.mockClear();
   });
 
   describe('happy paths', () => {
@@ -27,7 +33,7 @@ describe('assertStartupConstraints', () => {
       await expect(
         assertStartupConstraints(
           { isolation: 'none', allowSignup: false, enableApiAuth: true },
-          { checkDocker: dockerOk }
+          { checkDocker: dockerOk, checkCaddy: caddyOk }
         )
       ).resolves.toBeUndefined();
       expect(dockerOk).not.toHaveBeenCalled();
@@ -37,7 +43,7 @@ describe('assertStartupConstraints', () => {
       await expect(
         assertStartupConstraints(
           { isolation: 'docker', allowSignup: false, enableApiAuth: true },
-          { checkDocker: dockerOk }
+          { checkDocker: dockerOk, checkCaddy: caddyOk }
         )
       ).resolves.toBeUndefined();
       expect(dockerOk).toHaveBeenCalledTimes(1);
@@ -47,7 +53,7 @@ describe('assertStartupConstraints', () => {
       await expect(
         assertStartupConstraints(
           { isolation: 'docker', allowSignup: true, enableApiAuth: true },
-          { checkDocker: dockerOk }
+          { checkDocker: dockerOk, checkCaddy: caddyOk }
         )
       ).resolves.toBeUndefined();
     });
@@ -58,7 +64,7 @@ describe('assertStartupConstraints', () => {
       await expect(
         assertStartupConstraints(
           { isolation: 'docker', allowSignup: false, enableApiAuth: true },
-          { checkDocker: dockerFail }
+          { checkDocker: dockerFail, checkCaddy: caddyOk }
         )
       ).rejects.toBeInstanceOf(StartupConstraintError);
     });
@@ -67,7 +73,7 @@ describe('assertStartupConstraints', () => {
       await expect(
         assertStartupConstraints(
           { isolation: 'docker', allowSignup: false, enableApiAuth: true },
-          { checkDocker: dockerFail }
+          { checkDocker: dockerFail, checkCaddy: caddyOk }
         )
       ).rejects.toThrow('Docker daemon is not reachable');
     });
@@ -75,7 +81,7 @@ describe('assertStartupConstraints', () => {
     it('does NOT probe Docker in none mode', async () => {
       await assertStartupConstraints(
         { isolation: 'none', allowSignup: false, enableApiAuth: false },
-        { checkDocker: dockerFail }
+        { checkDocker: dockerFail, checkCaddy: caddyOk }
       );
       expect(dockerFail).not.toHaveBeenCalled();
     });
@@ -86,7 +92,7 @@ describe('assertStartupConstraints', () => {
       await expect(
         assertStartupConstraints(
           { isolation: 'none', allowSignup: true, enableApiAuth: true },
-          { checkDocker: dockerOk }
+          { checkDocker: dockerOk, checkCaddy: caddyOk }
         )
       ).rejects.toBeInstanceOf(StartupConstraintError);
     });
@@ -95,7 +101,7 @@ describe('assertStartupConstraints', () => {
       await expect(
         assertStartupConstraints(
           { isolation: 'none', allowSignup: true, enableApiAuth: true },
-          { checkDocker: dockerOk }
+          { checkDocker: dockerOk, checkCaddy: caddyOk }
         )
       ).rejects.toThrow(/allowSignup requires isolation: docker/);
     });
@@ -106,7 +112,7 @@ describe('assertStartupConstraints', () => {
       await expect(
         assertStartupConstraints(
           { isolation: 'docker', allowSignup: true, enableApiAuth: false },
-          { checkDocker: dockerOk }
+          { checkDocker: dockerOk, checkCaddy: caddyOk }
         )
       ).rejects.toBeInstanceOf(StartupConstraintError);
     });
@@ -115,9 +121,37 @@ describe('assertStartupConstraints', () => {
       await expect(
         assertStartupConstraints(
           { isolation: 'docker', allowSignup: true, enableApiAuth: false },
-          { checkDocker: dockerOk }
+          { checkDocker: dockerOk, checkCaddy: caddyOk }
         )
       ).rejects.toThrow(/allowSignup requires API auth/);
+    });
+  });
+
+  describe('fail-closed: Caddy required in docker mode', () => {
+    it('throws when Caddy is not available in docker mode', async () => {
+      await expect(
+        assertStartupConstraints(
+          { isolation: 'docker', allowSignup: false, enableApiAuth: true },
+          { checkDocker: dockerOk, checkCaddy: caddyFail }
+        )
+      ).rejects.toBeInstanceOf(StartupConstraintError);
+    });
+
+    it('error message mentions Caddy', async () => {
+      await expect(
+        assertStartupConstraints(
+          { isolation: 'docker', allowSignup: false, enableApiAuth: true },
+          { checkDocker: dockerOk, checkCaddy: caddyFail }
+        )
+      ).rejects.toThrow(/Caddy is required/);
+    });
+
+    it('does NOT probe Caddy in none mode', async () => {
+      await assertStartupConstraints(
+        { isolation: 'none', allowSignup: false, enableApiAuth: false },
+        { checkDocker: dockerFail, checkCaddy: caddyFail }
+      );
+      expect(caddyFail).not.toHaveBeenCalled();
     });
   });
 
@@ -127,9 +161,19 @@ describe('assertStartupConstraints', () => {
       await expect(
         assertStartupConstraints(
           { isolation: 'docker', allowSignup: true, enableApiAuth: false },
-          { checkDocker: dockerFail }
+          { checkDocker: dockerFail, checkCaddy: caddyOk }
         )
       ).rejects.toThrow('Docker daemon is not reachable');
+    });
+
+    it('Caddy check runs after Docker succeeds', async () => {
+      await expect(
+        assertStartupConstraints(
+          { isolation: 'docker', allowSignup: false, enableApiAuth: true },
+          { checkDocker: dockerOk, checkCaddy: caddyFail }
+        )
+      ).rejects.toThrow(/Caddy is required/);
+      expect(dockerOk).toHaveBeenCalledTimes(1);
     });
   });
 

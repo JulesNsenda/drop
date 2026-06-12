@@ -17,7 +17,7 @@ import { getDiskFreeMb } from '../../utils/disk';
 import { getStateManager, AppState } from '../../managers/app/state-manager';
 import { getAppConfigService } from '../../managers/app/app-config';
 import { tryLogActivity } from '../../managers/activity';
-import { getAppsDirectory } from '../runtime-config';
+import { getAppsDirectory, isHttpsEnabled } from '../runtime-config';
 import { isPathWithin } from '../../utils/paths';
 import { eventBus } from '../../core/event-bus';
 import type { RuntimeType } from '../../managers/runtime/app-runtime.types';
@@ -53,6 +53,19 @@ function resolveUsername(userId?: string): string | undefined {
   }
 }
 
+/** Compute the full URL for an app from its hostname (or customDomain). */
+function computeAppUrl(app: AppState): string | undefined {
+  const domain = app.customDomain || app.hostname;
+  if (!domain) return undefined;
+  // Localhost domains never get https, regardless of the platform setting
+  const isLocalhost =
+    domain === 'localhost' ||
+    domain.endsWith('.localhost') ||
+    domain === '127.0.0.1';
+  const proto = !isLocalhost && isHttpsEnabled() ? 'https' : 'http';
+  return `${proto}://${domain}`;
+}
+
 // Helper to convert AppState to AppDto (role-aware)
 function toAppDto(app: AppState, isAdmin = false): AppDto {
   return {
@@ -64,6 +77,7 @@ function toAppDto(app: AppState, isAdmin = false): AppDto {
     path: isAdmin ? app.path : undefined as unknown as string,
     framework: app.framework,
     hostname: app.hostname,
+    url: computeAppUrl(app),
     createdAt: app.createdAt,
     updatedAt: app.updatedAt,
     lastDeployedAt: app.lastDeployedAt,
