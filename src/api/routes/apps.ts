@@ -128,7 +128,7 @@ apps.get('/', async (c) => {
 
   // Batch-fetch live stats from the runtime (best-effort; no-op on failure).
   // Joined by name so the list stays fast even if the runtime is unavailable.
-  let statsMap: Map<string, { memory: number; cpu: number }> = new Map();
+  const statsMap: Map<string, { memory: number; cpu: number }> = new Map();
   try {
     const pm = getAppRuntime();
     const allStatus = await pm.getAllStatus();
