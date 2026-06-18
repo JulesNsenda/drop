@@ -95,10 +95,13 @@ export class PostgresServer {
 
     // Check if binaries are installed
     if (!(await this.binaries.isInstalled())) {
-      onProgress?.('PostgreSQL binaries not found, downloading...');
-      await this.binaries.download((_percent, message) => {
-        onProgress?.(message);
-      });
+      const fromSystem = await this.binaries.setupFromSystemPackage();
+      if (!fromSystem) {
+        onProgress?.('PostgreSQL binaries not found, downloading...');
+        await this.binaries.download((_percent, message) => {
+          onProgress?.(message);
+        });
+      }
     }
 
     // Check if data directory is initialized

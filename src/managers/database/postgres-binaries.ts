@@ -15,11 +15,22 @@ import { spawn } from 'child_process';
 // PostgreSQL version to use
 const PG_VERSION = '16.1';
 
-// Download URLs for PostgreSQL binaries
+// Download URLs for PostgreSQL binaries (fallback when no system package found)
 const DOWNLOAD_URLS: Record<string, string> = {
   win32: `https://get.enterprisedb.com/postgresql/postgresql-${PG_VERSION}-1-windows-x64-binaries.zip`,
   linux: `https://get.enterprisedb.com/postgresql/postgresql-${PG_VERSION}-1-linux-x64-binaries.tar.gz`,
 };
+
+// Candidate system PostgreSQL bin directories (checked in order)
+const SYSTEM_PG_BIN_DIRS = [
+  '/usr/lib/postgresql/16/bin',
+  '/usr/lib/postgresql/15/bin',
+  '/usr/lib/postgresql/14/bin',
+  '/usr/pgsql-16/bin',
+  '/usr/pgsql-15/bin',
+];
+
+const PG_BINARIES = ['postgres', 'pg_ctl', 'initdb', 'psql', 'createdb', 'createuser'];
 
 export interface PostgresBinariesConfig {
   /** Base directory for DROP (e.g., C:\drop or /var/drop) */
@@ -108,6 +119,41 @@ export class PostgresBinaries {
     } catch {
       return false;
     }
+  }
+
+  /**
+   * On Linux, find a system-installed PostgreSQL and symlink its binaries into
+   * the DROP bin dir so the download step can be skipped entirely.
+   * Returns true if symlinks were created successfully.
+   */
+  async setupFromSystemPackage(): Promise<boolean> {
+    if (this.isWindows) return false;
+
+    const paths = this.getPaths();
+
+    for (const systemBinDir of SYSTEM_PG_BIN_DIRS) {
+      try {
+        await fs.access(path.join(systemBinDir, 'postgres'));
+      } catch {
+        continue;
+      }
+
+      await fs.mkdir(paths.binDir, { recursive: true });
+
+      for (const bin of PG_BINARIES) {
+        const src = path.join(systemBinDir, bin);
+        const dest = path.join(paths.binDir, bin);
+        try {
+          await fs.unlink(dest);
+        } catch {
+          // dest doesn't exist yet, that's fine
+        }
+        await fs.symlink(src, dest);
+      }
+      return true;
+    }
+
+    return false;
   }
 
   /**
