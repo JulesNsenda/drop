@@ -51,12 +51,21 @@ ssh root@<server-ip>
 
 **3a. Install DROP**
 
-Run the install script. It creates a `drop` system user, installs Node.js 20, clones the repo to `/opt/drop`, builds it, and sets up a systemd service that starts on boot:
+Run the install script. It creates a `drop` system user, installs Node.js 20 + PostgreSQL + Caddy, clones the repo to `/opt/drop`, builds it, and sets up a systemd service that starts on boot:
 
 ```bash
 apt-get update -qq && apt-get install -y curl git build-essential
 curl -fsSL https://raw.githubusercontent.com/JulesNsenda/drop/develop/install.sh \
   | bash -s -- --root=/var/drop
+```
+
+This serves the dashboard/API on port 3000 over plain HTTP. To publish on a real
+domain with automatic HTTPS instead, add the domain flags (see
+[Custom domain + HTTPS](#custom-domain--https)):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/JulesNsenda/drop/develop/install.sh \
+  | bash -s -- --root=/var/drop --domain=example.com --https --acme-email=you@example.com
 ```
 
 > **Note:** The script lives on the `develop` branch until the next merge to `main`. If the curl returns a 404 (e.g. private repo or branch not yet merged), use the manual install below instead.
@@ -170,10 +179,14 @@ Add these inbound rules:
 |---|---|---|---|
 | SSH | TCP | 22 | `0.0.0.0/0` |
 | DROP API & Dashboard | TCP | 3000 | `0.0.0.0/0` |
-| HTTP (optional, for Caddy) | TCP | 80 | `0.0.0.0/0` |
-| HTTPS (optional, for Caddy) | TCP | 443 | `0.0.0.0/0` |
+| HTTP | TCP | 80 | `0.0.0.0/0` |
+| HTTPS | TCP | 443 | `0.0.0.0/0` |
 
 Click **Create firewall** and apply it to `drop-test-1`.
+
+> Ports **80 and 443 are required** if you use a custom domain — Let's Encrypt
+> validates over port 80 and serves HTTPS on 443. Port 3000 stays open as a
+> direct backdoor to the dashboard/API; you can close it once your domain works.
 
 **Test it works:**
 
@@ -292,6 +305,61 @@ curl http://<server-ip>:3000/api/v1/apps
 ```
 
 See `docs/LOCAL-TESTING.md` for more testing patterns — they all work over SSH the same way.
+
+---
+
+## Custom domain + HTTPS
+
+By default DROP serves on `http://<server-ip>:3000`. To publish it on a real
+domain with automatic Let's Encrypt certificates:
+
+**1. Point DNS at the server** (at your registrar):
+
+| Record | Type | Value |
+|---|---|---|
+| `example.com` | A | server IP |
+| `*.example.com` | A | server IP |
+
+The apex serves the **dashboard**; each deployed app is served at
+`https://<app>.example.com`.
+
+**2. Open ports 80 and 443** in the Hetzner firewall (Step 4).
+
+**3. Enable the domain.** Run the installer once as root with the domain flags —
+on a fresh box or an existing one (it auto-detects upgrade):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/JulesNsenda/drop/develop/install.sh \
+  | sudo bash -s -- --upgrade --domain=example.com --https --acme-email=you@example.com
+```
+
+This installs Caddy (granting it permission to bind 80/443 as the `drop` user),
+writes the config to `/etc/drop/drop.env`, routes the apex to the dashboard, and
+restarts the service. Watch it come up and issue certificates:
+
+```bash
+journalctl -u drop-platform -f   # look for: HTTPS enabled for *.example.com
+```
+
+Certificates are fetched on first request to each hostname (a few seconds).
+
+### How config persists across deploys
+
+Domain/HTTPS settings live in `/etc/drop/drop.env`, which the systemd unit reads
+on every start — so a normal `git push` deploy keeps them. The deploy also runs
+`install.sh --provision` on the server, so **infra changes in `install.sh`
+(Caddy, the systemd unit, the apex route) are applied automatically** on each
+deploy; you don't need to re-run the installer by hand after the first time.
+
+To change config later, either re-run the installer with new flags, or edit
+`/etc/drop/drop.env` directly and `sudo systemctl restart drop-platform`.
+
+### Debugging certificates without hitting rate limits
+
+Let's Encrypt rate-limits failed issuance. While sorting out DNS/firewall, use
+staging certs (untrusted by browsers, but unlimited) by adding
+`DROP_ACME_STAGING=true` to `/etc/drop/drop.env` and restarting. Remove it once
+issuance works, then restart again for real certs.
 
 ---
 
