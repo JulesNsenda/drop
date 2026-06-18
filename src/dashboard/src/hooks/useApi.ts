@@ -46,6 +46,11 @@ export interface HealthStatus {
     database?: ComponentHealth;
     watcher?: ComponentHealth;
   };
+  /** Server runtime info — authoritative OS and paths (not the browser's). */
+  system?: {
+    platform: string;
+    appsDirectory: string;
+  };
 }
 
 export interface AppHealthCheck {

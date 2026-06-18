@@ -10,6 +10,7 @@ import { success, HealthDto, StatsDto } from '../types';
 import { getAppRuntime } from '../../managers/runtime';
 import { getStateManager, AppStateManager } from '../../managers/app/state-manager';
 import { getPlatformVersion } from '../../utils/version';
+import { getAppsDirectory } from '../runtime-config';
 
 const health = new Hono();
 
@@ -85,6 +86,10 @@ health.get('/', async (c) => {
       processManager: { status: pmStatus, message: pmMessage },
       database: { status: dbStatus, message: dbMessage },
       watcher: { status: watcherStatus },
+    },
+    system: {
+      platform: process.platform,
+      appsDirectory: getAppsDirectory(),
     },
   };
 

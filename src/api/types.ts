@@ -84,6 +84,13 @@ export interface HealthDto {
     database?: ComponentHealth;
     watcher?: ComponentHealth;
   };
+  /** Server runtime info — authoritative OS and paths (not the browser's). */
+  system: {
+    /** Node's process.platform on the server: 'linux', 'win32', 'darwin', … */
+    platform: string;
+    /** Resolved webapps directory on the server (honors DROP_ROOT / DROP_APPS_DIR). */
+    appsDirectory: string;
+  };
 }
 
 export interface ComponentHealth {
