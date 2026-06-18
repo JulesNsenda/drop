@@ -85,12 +85,15 @@ ensure_postgres() {
 
 # ── sudoers: let drop user start/stop the service (needed for CI deploy) ─────
 write_sudoers() {
+  local f="/etc/sudoers.d/${DROP_USER}-deploy"
   info "Writing sudoers rule for $DROP_USER..."
-  cat > "/etc/sudoers.d/${DROP_USER}-deploy" << EOF
-${DROP_USER} ALL=(ALL) NOPASSWD: /bin/systemctl stop ${SERVICE_NAME}, /bin/systemctl start ${SERVICE_NAME}, /bin/systemctl restart ${SERVICE_NAME}, /bin/systemctl status ${SERVICE_NAME}
-EOF
-  chmod 440 "/etc/sudoers.d/${DROP_USER}-deploy"
-  visudo -c -f "/etc/sudoers.d/${DROP_USER}-deploy" || error "sudoers syntax error — check /etc/sudoers.d/${DROP_USER}-deploy"
+  rm -f "$f"
+  echo "${DROP_USER} ALL=(ALL) NOPASSWD: /bin/systemctl stop ${SERVICE_NAME}"    >> "$f"
+  echo "${DROP_USER} ALL=(ALL) NOPASSWD: /bin/systemctl start ${SERVICE_NAME}"   >> "$f"
+  echo "${DROP_USER} ALL=(ALL) NOPASSWD: /bin/systemctl restart ${SERVICE_NAME}" >> "$f"
+  echo "${DROP_USER} ALL=(ALL) NOPASSWD: /bin/systemctl status ${SERVICE_NAME}"  >> "$f"
+  chmod 440 "$f"
+  visudo -c -f "$f" || error "sudoers syntax error — check $f"
 }
 
 # ── code: clone or pull ──────────────────────────────────────────────────────
