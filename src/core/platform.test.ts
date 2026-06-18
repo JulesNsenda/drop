@@ -411,9 +411,12 @@ describe('Event-driven pipeline', () => {
 
 describe('Service accessors', () => {
   let platform: DropPlatform;
+  let tempDir: string;
 
   beforeEach(() => {
+    tempDir = path.join(os.tmpdir(), `drop-test-${Date.now()}`);
     platform = createPlatform({
+      dropRoot: tempDir,
       logLevel: 'error',
     });
   });
