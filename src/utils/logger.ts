@@ -185,10 +185,12 @@ export class Logger {
    */
   close(): void {
     if (this.logStream) {
+      this.logStream.on('error', () => {});
       this.logStream.end();
       this.logStream = null;
     }
     if (this.errorStream) {
+      this.errorStream.on('error', () => {});
       this.errorStream.end();
       this.errorStream = null;
     }
