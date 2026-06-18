@@ -45,7 +45,6 @@ jobs:
 
       - name: Package artifact
         run: |
-          cp -r src/dashboard/dist dist/dashboard
           tar -czf drop-dist.tar.gz dist/ package.json package-lock.json
 
       - name: Upload artifact
