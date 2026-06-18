@@ -783,6 +783,8 @@ backup:
 
     const logDir = path.join(this.config.dropRoot, 'data', 'logs');
 
+    const masterKeyPath = path.join(this.config.dropRoot, 'data', 'drop-svc', 'encryption.key');
+
     this.apiServer = createApiServer({
       port: this.config.apiPort,
       host: '0.0.0.0',
@@ -793,6 +795,7 @@ backup:
       domainSuffix: this.config.domainSuffix,
       logDir,
       appsDirectory: this.config.appsDirectory,
+      masterKeyPath,
     });
 
     await this.apiServer.initialize();

@@ -51,6 +51,8 @@ export interface ApiServerConfig {
   enableHttps?: boolean;
   /** Active domain suffix (e.g. "example.com"). */
   domainSuffix?: string;
+  /** Path to the platform encryption key (for MFA secret at rest). */
+  masterKeyPath?: string;
 }
 
 export class ApiServer {
@@ -90,6 +92,7 @@ export class ApiServer {
         credentialsPath: this.config.credentialsPath,
         enableJwt: true,
         enableApiKeys: true,
+        masterKeyPath: this.config.masterKeyPath,
       });
     }
 
@@ -146,6 +149,7 @@ export class ApiServer {
     // Auth routes with stricter rate limiting (brute-force / signup-flood)
     v1.use('/auth/login', authRateLimitMiddleware());
     v1.use('/auth/signup', authRateLimitMiddleware());
+    v1.use('/auth/mfa/*', authRateLimitMiddleware());
     v1.route('/auth', authRoutes);
 
     // Apply auth middleware to protected routes when auth is enabled
