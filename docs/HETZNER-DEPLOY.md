@@ -23,7 +23,7 @@ Push to `develop` → GitHub Actions builds and tests → auto-deploys to your H
    - **SSH keys**: click **Add SSH key** and paste your local public key (usually at `~/.ssh/id_ed25519.pub` or `~/.ssh/id_rsa.pub`)
    - **Name**: `drop-test-1`
 4. Click **Create & Buy now**.
-5. Copy the server's **IP address** from the project dashboard — you'll use it throughout.
+5. Copy the server's **IP address** from the project dashboard — you'll use it throughout. (203.0.113.10)
 
 ---
 
@@ -55,9 +55,52 @@ Run the install script. It creates a `drop` system user, installs Node.js 20, cl
 
 ```bash
 apt-get update -qq && apt-get install -y curl git build-essential
-curl -fsSL https://raw.githubusercontent.com/JulesNsenda/drop/main/install.sh \
+curl -fsSL https://raw.githubusercontent.com/JulesNsenda/drop/develop/install.sh \
   | bash -s -- --root=/var/drop
 ```
+
+> **Note:** The script lives on the `develop` branch until the next merge to `main`. If the curl returns a 404 (e.g. private repo or branch not yet merged), use the manual install below instead.
+
+<details>
+<summary>Manual install (if the curl above fails)</summary>
+
+```bash
+# Install Node.js 20
+curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+apt-get install -y nodejs
+
+# Create drop user and clone the repo
+useradd -m -s /bin/bash drop
+git clone --branch develop https://github.com/JulesNsenda/drop.git /opt/drop
+cd /opt/drop && npm ci && npm run build:server
+chown -R drop:drop /opt/drop
+mkdir -p /var/drop && chown -R drop:drop /var/drop
+
+# Create the systemd service
+cat > /etc/systemd/system/drop-platform.service << 'EOF'
+[Unit]
+Description=DROP Platform
+After=network.target
+
+[Service]
+Type=simple
+User=drop
+WorkingDirectory=/opt/drop
+ExecStart=/usr/bin/node /opt/drop/dist/index.js serve --root=/var/drop
+Restart=on-failure
+RestartSec=5
+Environment=NODE_ENV=production
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable drop-platform
+systemctl start drop-platform
+```
+
+</details>
 
 When it finishes you'll see:
 ```
