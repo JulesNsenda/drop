@@ -22,6 +22,10 @@ import {
   authMiddleware,
   isAuthEnabled,
   isSignupEnabled,
+  setupMfa,
+  enableMfa,
+  disableMfa,
+  completeMfaLogin,
   AuthContext,
 } from '../middleware/auth';
 import { tryLogActivity } from '../../managers/activity';
@@ -78,7 +82,7 @@ auth.post('/signup', async (c) => {
   }
 });
 
-// POST /auth/login - Authenticate and get JWT token
+// POST /auth/login - Authenticate and get JWT token (or MFA challenge)
 auth.post('/login', async (c) => {
   const body = await c.req.json<{ username: string; password: string }>();
 
@@ -86,17 +90,23 @@ auth.post('/login', async (c) => {
     throw new ValidationError('Username and password are required');
   }
 
-  const token = await authenticateUser(body.username, body.password);
+  const result = await authenticateUser(body.username, body.password);
 
-  if (!token) {
+  if (result.status === 'invalid' || result.status === 'disabled') {
     return c.json(error(ErrorCodes.UNAUTHORIZED, 'Invalid username or password'), 401);
   }
 
+  if (result.status === 'mfa_required') {
+    await tryLogActivity({ action: 'login_mfa_challenge', username: body.username });
+    return c.json(success({ mfaRequired: true, challengeToken: result.challengeToken }));
+  }
+
+  // status === 'ok'
   const user = getUser(body.username);
   await tryLogActivity({ action: 'login', userId: user?.id, username: body.username });
   return c.json(
     success({
-      token,
+      token: result.token,
       tokenType: 'Bearer',
       expiresIn: 86400,
       user: user ? {
@@ -170,6 +180,7 @@ auth.get('/me', authMiddleware(), async (c) => {
       role: authContext.role,
       authMethod: authContext.authMethod,
       mustChangePassword: meUser?.mustChangePassword === true,
+      mfaEnabled: meUser?.mfaEnabled === true,
     })
   );
 });
@@ -287,6 +298,85 @@ auth.delete('/account', authMiddleware(), async (c) => {
     const message = err instanceof Error ? err.message : 'Failed to delete account';
     return c.json(error(ErrorCodes.BAD_REQUEST, message), 400);
   }
+});
+
+// POST /auth/mfa/verify - Complete MFA login (challengeToken + 6-digit code)
+auth.post('/mfa/verify', async (c) => {
+  const body = await c.req.json<{ challengeToken: string; code: string }>();
+  if (!body.challengeToken || !body.code) {
+    throw new ValidationError('challengeToken and code are required');
+  }
+
+  const result = await completeMfaLogin(body.challengeToken, body.code);
+
+  if (result.status === 'expired') {
+    return c.json(error(ErrorCodes.UNAUTHORIZED, 'Challenge token expired. Please log in again.'), 401);
+  }
+  if (result.status === 'attempt_limit') {
+    return c.json(error(ErrorCodes.UNAUTHORIZED, 'Too many failed attempts. Please log in again.'), 401);
+  }
+  if (result.status === 'invalid') {
+    return c.json(error(ErrorCodes.MFA_INVALID, 'Invalid authentication code.'), 401);
+  }
+
+  // status === 'ok'
+  await tryLogActivity({ action: 'login_mfa_ok' });
+  return c.json(success({ token: result.token, tokenType: 'Bearer', expiresIn: 86400 }));
+});
+
+// POST /auth/mfa/setup - Generate a candidate TOTP secret (not persisted until enabled)
+auth.post('/mfa/setup', authMiddleware(), async (c) => {
+  const authCtx = (c.get as Function)('auth') as AuthContext;
+  const setup = setupMfa(authCtx.userId);
+  if (!setup) {
+    return c.json(error(ErrorCodes.NOT_FOUND, 'User not found'), 404);
+  }
+  return c.json(success({ uri: setup.uri, secret: setup.secret }));
+});
+
+// POST /auth/mfa/enable - Persist and activate TOTP for the authenticated user
+auth.post('/mfa/enable', authMiddleware(), async (c) => {
+  const authCtx = (c.get as Function)('auth') as AuthContext;
+  const body = await c.req.json<{ password: string; secret: string; code: string }>();
+  if (!body.password || !body.secret || !body.code) {
+    throw new ValidationError('password, secret, and code are required');
+  }
+
+  const result = await enableMfa(authCtx.userId, body.password, body.secret, body.code);
+
+  if (result.status === 'invalid_password') {
+    return c.json(error(ErrorCodes.UNAUTHORIZED, 'Current password is incorrect'), 401);
+  }
+  if (result.status === 'invalid_code') {
+    return c.json(error(ErrorCodes.MFA_INVALID, 'Code does not match the provided secret'), 400);
+  }
+  if (result.status === 'no_key') {
+    return c.json(error(ErrorCodes.INTERNAL_ERROR, 'MFA encryption key not available. Contact the server operator.'), 500);
+  }
+
+  await tryLogActivity({ action: 'mfa_enabled', userId: authCtx.userId, username: authCtx.username });
+  return c.json(success({ message: 'Two-factor authentication enabled' }));
+});
+
+// POST /auth/mfa/disable - Disable TOTP (requires a valid current TOTP code)
+auth.post('/mfa/disable', authMiddleware(), async (c) => {
+  const authCtx = (c.get as Function)('auth') as AuthContext;
+  const body = await c.req.json<{ code: string }>();
+  if (!body.code) {
+    throw new ValidationError('code is required');
+  }
+
+  const result = await disableMfa(authCtx.userId, body.code);
+
+  if (result.status === 'not_enabled') {
+    return c.json(error(ErrorCodes.BAD_REQUEST, 'Two-factor authentication is not enabled'), 400);
+  }
+  if (result.status === 'invalid_code') {
+    return c.json(error(ErrorCodes.MFA_INVALID, 'Invalid authentication code'), 401);
+  }
+
+  await tryLogActivity({ action: 'mfa_disabled', userId: authCtx.userId, username: authCtx.username });
+  return c.json(success({ message: 'Two-factor authentication disabled' }));
 });
 
 export default auth;
