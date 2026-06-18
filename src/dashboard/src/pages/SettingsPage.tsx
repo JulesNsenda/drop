@@ -263,7 +263,7 @@ function SettingsPage() {
               <tr>
                 <td className="py-2 text-gray-500 dark:text-gray-400">Apps Directory</td>
                 <td className="py-2 font-mono text-gray-900 dark:text-white text-xs">
-                  {navigator.platform.includes('Win') ? 'C:\\drop\\data\\webapps' : '/var/drop/data/webapps'}
+                  {health?.system?.appsDirectory ?? '—'}
                 </td>
               </tr>
               <tr>
