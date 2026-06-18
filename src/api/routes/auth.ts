@@ -14,6 +14,7 @@ import {
   listUsers,
   createUser,
   getUser,
+  getUserById,
   changePassword,
   updateUser,
   resetUserPassword,
@@ -98,7 +99,13 @@ auth.post('/login', async (c) => {
       token,
       tokenType: 'Bearer',
       expiresIn: 86400,
-      user: user ? { id: user.id, username: user.username, role: user.role, email: (user as any).email } : undefined,
+      user: user ? {
+        id: user.id,
+        username: user.username,
+        role: user.role,
+        email: (user as any).email,
+        mustChangePassword: (user as any).mustChangePassword === true,
+      } : undefined,
     })
   );
 });
@@ -155,12 +162,14 @@ auth.get('/me', authMiddleware(), async (c) => {
     return c.json(error(ErrorCodes.UNAUTHORIZED, 'Not authenticated'), 401);
   }
 
+  const meUser = getUserById(authContext.userId);
   return c.json(
     success({
       userId: authContext.userId,
       username: authContext.username,
       role: authContext.role,
       authMethod: authContext.authMethod,
+      mustChangePassword: meUser?.mustChangePassword === true,
     })
   );
 });
@@ -218,7 +227,7 @@ auth.post('/users', authMiddleware('admin'), async (c) => {
   }
 
   try {
-    const user = await createUser(body.username, body.password, body.role || 'user');
+    const user = await createUser(body.username, body.password, body.role || 'user', undefined, true);
     return c.json(
       success({
         id: user.id,

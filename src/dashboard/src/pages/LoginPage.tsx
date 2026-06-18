@@ -28,8 +28,8 @@ function LoginPage() {
     setNotice(null);
     setLoading(true);
 
-    const success = await login(username, password);
-    if (!success) {
+    const result = await login(username, password);
+    if (!result.success) {
       setError('Invalid username or password');
     }
     setLoading(false);

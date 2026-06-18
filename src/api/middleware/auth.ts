@@ -37,6 +37,7 @@ export interface User {
   email?: string;
   enabled?: boolean; // default true
   maxApps?: number; // per-user override (0 = use global default)
+  mustChangePassword?: boolean;
 }
 
 // API key record
@@ -108,14 +109,14 @@ export async function initializeAuth(authConfig: AuthConfig): Promise<void> {
   // Create default admin user if no users exist
   if (credentials.users.length === 0) {
     const defaultPassword = crypto.randomBytes(16).toString('hex');
-    await createUser('admin', defaultPassword, 'admin');
+    await createUser('admin', defaultPassword, 'admin', undefined, true);
     console.log('='.repeat(60));
     console.log('DROP API - Default Admin Credentials');
     console.log('='.repeat(60));
     console.log(`Username: admin`);
     console.log(`Password: ${defaultPassword}`);
     console.log('='.repeat(60));
-    console.log('IMPORTANT: Change this password immediately!');
+    console.log('IMPORTANT: Change this password on first login.');
     console.log('='.repeat(60));
   }
 }
@@ -190,7 +191,8 @@ export async function createUser(
   username: string,
   password: string,
   role: 'admin' | 'user' | 'readonly' = 'user',
-  email?: string
+  email?: string,
+  mustChangePassword?: boolean,
 ): Promise<User> {
   if (!credentials || !config) {
     throw new Error('Auth not initialized');
@@ -209,6 +211,7 @@ export async function createUser(
     role,
     email,
     createdAt: new Date().toISOString(),
+    ...(mustChangePassword ? { mustChangePassword: true } : {}),
   };
 
   credentials.users.push(user);
@@ -228,6 +231,7 @@ export async function changePassword(userId: string, currentPassword: string, ne
 
   const { hash } = hashPassword(newPassword);
   user.passwordHash = hash;
+  user.mustChangePassword = false;
   await saveCredentials(config.credentialsPath, credentials);
   return true;
 }
@@ -244,6 +248,7 @@ export async function resetUserPassword(userId: string, newPassword: string): Pr
   if (!user) return false;
   const { hash } = hashPassword(newPassword);
   user.passwordHash = hash;
+  user.mustChangePassword = true;
   await saveCredentials(config.credentialsPath, credentials);
   return true;
 }
@@ -569,6 +574,23 @@ export function authMiddleware(requiredRole?: 'admin' | 'user' | 'readonly') {
         error(ErrorCodes.UNAUTHORIZED, 'Authentication required. Provide a valid JWT token or API key.'),
         401
       );
+    }
+
+    // Force-password-change gate (JWT only — API keys are programmatic and exempt)
+    if (authContext.authMethod === 'jwt') {
+      const userRecord = getUserById(authContext.userId);
+      if (userRecord?.mustChangePassword) {
+        const p = c.req.path || '';
+        const isExempt =
+          (c.req.method === 'PUT' && p.endsWith('/auth/password')) ||
+          (c.req.method === 'GET' && p.endsWith('/auth/me'));
+        if (!isExempt) {
+          return c.json(
+            error(ErrorCodes.MUST_CHANGE_PASSWORD, 'Password change required before accessing this resource.'),
+            403
+          );
+        }
+      }
     }
 
     // Check role if required
