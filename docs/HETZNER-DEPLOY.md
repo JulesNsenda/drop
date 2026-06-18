@@ -133,12 +133,12 @@ To get the public key contents, run this on your local machine:
 cat ~/.ssh/drop_deploy.pub
 ```
 
-**3c. Allow the `drop` user to restart the service without a password**
+**3c. Allow the `drop` user to manage the service without a password**
 
-GitHub Actions needs to run `sudo systemctl restart drop-platform`. Add a passwordless sudo rule:
+GitHub Actions stops the service, unpacks the new build, then starts it again. Add a passwordless sudo rule for those commands:
 
 ```bash
-echo "drop ALL=(ALL) NOPASSWD: /bin/systemctl restart drop-platform, /bin/systemctl status drop-platform" \
+echo "drop ALL=(ALL) NOPASSWD: /bin/systemctl stop drop-platform, /bin/systemctl start drop-platform, /bin/systemctl restart drop-platform, /bin/systemctl status drop-platform" \
   > /etc/sudoers.d/drop-deploy
 chmod 440 /etc/sudoers.d/drop-deploy
 ```
@@ -206,12 +206,21 @@ Add these three secrets:
 |---|---|
 | `DEPLOY_HOST` | Your Hetzner server IP (e.g. `65.21.100.42`) |
 | `DEPLOY_USER` | `drop` |
-| `DEPLOY_KEY` | The full contents of `~/.ssh/drop_deploy` (the private key file — include the `-----BEGIN...` and `-----END...` lines) |
+| `DEPLOY_KEY_B64` | Your private key **base64-encoded** (see below) |
 
-To print the private key:
+**Why base64?** Pasting a raw private key into GitHub Secrets on Windows adds Windows line endings (`\r\n`) that corrupt the key. Base64 is a single line with no newlines to corrupt.
+
+To generate the base64-encoded key, run this on your local machine:
+
 ```bash
-cat ~/.ssh/drop_deploy
+# Git Bash on Windows / Linux
+base64 -w 0 ~/.ssh/drop_deploy
+
+# macOS
+base64 -i ~/.ssh/drop_deploy
 ```
+
+Copy the entire output (one long line) and paste it as the `DEPLOY_KEY_B64` secret value.
 
 ---
 
@@ -252,16 +261,14 @@ ssh drop@<server-ip> 'journalctl -u drop-platform -f'
 
 ### Force a manual deploy
 
-If you need to deploy without a push (e.g. to roll back):
+The easiest way is to re-trigger the GitHub Actions workflow without pushing new code:
+
+GitHub repo → **Actions** → pick the last run → **Re-run all jobs**.
+
+Alternatively, if you need to restart the service without redeploying:
 
 ```bash
-ssh drop@<server-ip>
-cd /opt/drop
-git fetch origin && git checkout develop && git pull origin develop
-npm ci
-cd src/dashboard && npm ci && cd ../..
-npm run build
-sudo systemctl restart drop-platform
+ssh drop@<server-ip> 'sudo systemctl restart drop-platform'
 ```
 
 ---
@@ -297,8 +304,9 @@ When you're done testing, delete the server from Hetzner Cloud Console to stop b
 ## Troubleshooting
 
 **Deploy job fails with "Permission denied"**
-- Check the `DEPLOY_KEY` secret contains the full private key including the header/footer lines.
+- Check the `DEPLOY_KEY_B64` secret is a single base64 line with no spaces or newlines. Re-run the `base64` command and paste it fresh.
 - Confirm `drop_deploy.pub` was added to `/home/drop/.ssh/authorized_keys` on the server.
+- Test manually: `ssh -i ~/.ssh/drop_deploy drop@<server-ip> 'echo ok'`
 
 **`sudo systemctl restart` fails**
 - Make sure you ran Step 3c to create the sudoers rule.
