@@ -86,6 +86,7 @@ jobs:
             'set -e
             sudo systemctl stop drop-platform
             cd /opt/drop
+            rm -rf dist/
             tar -xzf /tmp/drop-dist.tar.gz
             npm ci --omit=dev
             rm -f /tmp/drop-dist.tar.gz
