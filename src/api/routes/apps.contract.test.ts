@@ -10,7 +10,8 @@ import * as fs from 'fs/promises';
 import * as path from 'path';
 import * as os from 'os';
 import { ApiServer } from '../server';
-import { createUser, authenticateUser } from '../middleware/auth';
+import { createUser, resetAuth } from '../middleware/auth';
+import { getTestToken } from '../__testutils__/auth';
 import { getStateManager, resetStateManager } from '../../managers/app/state-manager';
 import * as runtimeModule from '../../managers/runtime';
 import type { AppRuntime, AppProcessInfo } from '../../managers/runtime';
@@ -63,6 +64,7 @@ describe('GET /api/v1/apps/:name DTO contract', () => {
     jest.spyOn(console, 'warn').mockImplementation();
 
     resetStateManager();
+    resetAuth();
     getStateManager({ stateFilePath: path.join(tempDir, 'apps.json') });
 
     mockRuntime = makeMockRuntime();
@@ -79,8 +81,8 @@ describe('GET /api/v1/apps/:name DTO contract', () => {
     await createUser('admin-user', 'password123', 'admin');
     const user = await createUser('regular-user', 'password123', 'user');
     userId = user.id;
-    adminToken = (await authenticateUser('admin-user', 'password123'))!;
-    userToken = (await authenticateUser('regular-user', 'password123'))!;
+    adminToken = await getTestToken('admin-user', 'password123');
+    userToken = await getTestToken('regular-user', 'password123');
 
     const sm = getStateManager();
     await sm.registerApp('test-app', path.join(tempDir, 'test-app'));
@@ -162,6 +164,7 @@ describe('GET /api/v1/apps list DTO contract', () => {
     jest.spyOn(console, 'warn').mockImplementation();
 
     resetStateManager();
+    resetAuth();
     getStateManager({ stateFilePath: path.join(tempDir, 'apps.json') });
 
     jest.spyOn(runtimeModule, 'getAppRuntime').mockReturnValue(makeMockRuntime());
@@ -177,8 +180,8 @@ describe('GET /api/v1/apps list DTO contract', () => {
     const user = await createUser('user-list', 'password123', 'user');
     await createUser('admin-list', 'password123', 'admin');
     userId = user.id;
-    userToken = (await authenticateUser('user-list', 'password123'))!;
-    adminToken = (await authenticateUser('admin-list', 'password123'))!;
+    userToken = await getTestToken('user-list', 'password123');
+    adminToken = await getTestToken('admin-list', 'password123');
 
     const sm = getStateManager();
     await sm.registerApp('my-app', path.join(tempDir, 'my-app'));

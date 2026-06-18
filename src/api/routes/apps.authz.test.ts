@@ -10,7 +10,8 @@ import * as fs from 'fs/promises';
 import * as path from 'path';
 import * as os from 'os';
 import { ApiServer } from './../server';
-import { createUser, authenticateUser } from '../middleware/auth';
+import { createUser, resetAuth } from '../middleware/auth';
+import { getTestToken } from '../__testutils__/auth';
 import { getStateManager, resetStateManager } from '../../managers/app/state-manager';
 
 describe('app route authorization', () => {
@@ -30,6 +31,7 @@ describe('app route authorization', () => {
     jest.spyOn(console, 'warn').mockImplementation();
 
     resetStateManager();
+    resetAuth();
     getStateManager({ stateFilePath: path.join(tempDir, 'apps.json') });
 
     server = new ApiServer({
@@ -44,8 +46,8 @@ describe('app route authorization', () => {
     const bob = await createUser('bob', 'password123', 'user');
     aliceId = alice.id;
     bobId = bob.id;
-    aliceToken = (await authenticateUser('alice', 'password123'))!;
-    bobToken = (await authenticateUser('bob', 'password123'))!;
+    aliceToken = await getTestToken('alice', 'password123');
+    bobToken = await getTestToken('bob', 'password123');
 
     const sm = getStateManager();
     await sm.registerApp('alice-app', path.join(tempDir, 'alice-app'));

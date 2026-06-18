@@ -1,9 +1,10 @@
 import { useState, useEffect, FormEvent } from 'react';
+import QRCode from 'qrcode';
 import { useHealth, AppHealthCheck } from '../hooks/useApi';
 import { getAuthHeaders, useAuth } from '../hooks/useAuth';
 import { useToast } from '../components/Toast';
 import { useConfirm } from '../components/ConfirmDialog';
-import { Server, Database, Eye, HardDrive, Activity, CheckCircle, XCircle, AlertTriangle, Lock, Clock } from 'lucide-react';
+import { Server, Database, Eye, HardDrive, Activity, CheckCircle, XCircle, AlertTriangle, Lock, Clock, ShieldCheck, ShieldOff } from 'lucide-react';
 
 interface ActivityEntry {
   id: string;
@@ -16,7 +17,7 @@ interface ActivityEntry {
 
 function SettingsPage() {
   const { health, loading } = useHealth();
-  const { role } = useAuth();
+  const { role, mfaEnabled, refreshMe } = useAuth();
   const isAdmin = role === 'admin';
   const { toast } = useToast();
   const confirmDialog = useConfirm();
@@ -29,9 +30,89 @@ function SettingsPage() {
   const [confirmPw, setConfirmPw] = useState('');
   const [pwLoading, setPwLoading] = useState(false);
 
+  // MFA setup state
+  const [mfaStep, setMfaStep] = useState<'idle' | 'setup' | 'disable'>('idle');
+  const [mfaSetupUri, setMfaSetupUri] = useState('');
+  const [mfaSetupSecret, setMfaSetupSecret] = useState('');
+  const [mfaQrDataUrl, setMfaQrDataUrl] = useState('');
+  const [mfaCode, setMfaCode] = useState('');
+  const [mfaPassword, setMfaPassword] = useState('');
+  const [mfaLoading, setMfaLoading] = useState(false);
+
   // Activity log (admin only)
   const [activity, setActivity] = useState<ActivityEntry[]>([]);
   const [activityLoading, setActivityLoading] = useState(true);
+
+  // Generate QR code when setup URI is available
+  useEffect(() => {
+    if (!mfaSetupUri) { setMfaQrDataUrl(''); return; }
+    QRCode.toDataURL(mfaSetupUri, { width: 200, margin: 2 }).then(setMfaQrDataUrl).catch(() => {});
+  }, [mfaSetupUri]);
+
+  const handleMfaSetupStart = async () => {
+    setMfaLoading(true);
+    try {
+      const res = await fetch('/api/v1/auth/mfa/setup', { method: 'POST', headers: getAuthHeaders() });
+      const json = await res.json();
+      if (json.success) {
+        setMfaSetupUri(json.data.uri);
+        setMfaSetupSecret(json.data.secret);
+        setMfaCode('');
+        setMfaPassword('');
+        setMfaStep('setup');
+      } else {
+        toast('error', json.error?.message || 'Failed to start setup');
+      }
+    } catch { toast('error', 'Network error'); }
+    setMfaLoading(false);
+  };
+
+  const handleMfaEnable = async (e: FormEvent) => {
+    e.preventDefault();
+    setMfaLoading(true);
+    try {
+      const res = await fetch('/api/v1/auth/mfa/enable', {
+        method: 'POST',
+        headers: { ...getAuthHeaders(), 'Content-Type': 'application/json' },
+        body: JSON.stringify({ password: mfaPassword, secret: mfaSetupSecret, code: mfaCode }),
+      });
+      const json = await res.json();
+      if (json.success) {
+        toast('success', 'Two-factor authentication enabled');
+        setMfaStep('idle');
+        setMfaSetupUri('');
+        setMfaSetupSecret('');
+        setMfaCode('');
+        setMfaPassword('');
+        await refreshMe();
+      } else {
+        toast('error', json.error?.message || 'Failed to enable MFA');
+      }
+    } catch { toast('error', 'Network error'); }
+    setMfaLoading(false);
+  };
+
+  const handleMfaDisable = async (e: FormEvent) => {
+    e.preventDefault();
+    setMfaLoading(true);
+    try {
+      const res = await fetch('/api/v1/auth/mfa/disable', {
+        method: 'POST',
+        headers: { ...getAuthHeaders(), 'Content-Type': 'application/json' },
+        body: JSON.stringify({ code: mfaCode }),
+      });
+      const json = await res.json();
+      if (json.success) {
+        toast('success', 'Two-factor authentication disabled');
+        setMfaStep('idle');
+        setMfaCode('');
+        await refreshMe();
+      } else {
+        toast('error', json.error?.message || 'Failed to disable MFA');
+      }
+    } catch { toast('error', 'Network error'); }
+    setMfaLoading(false);
+  };
 
   useEffect(() => {
     const fetchAppHealth = async () => {
@@ -297,6 +378,153 @@ function SettingsPage() {
             {pwLoading ? 'Changing...' : 'Change password'}
           </button>
         </form>
+      </div>
+
+      {/* Two-Factor Authentication */}
+      <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 mb-6">
+        <div className="px-4 py-3 border-b border-gray-200 dark:border-gray-700">
+          <div className="flex items-center gap-2">
+            <ShieldCheck className="w-4 h-4 text-gray-500" />
+            <h2 className="font-semibold text-gray-900 dark:text-white">Two-Factor Authentication</h2>
+            {mfaEnabled && (
+              <span className="ml-2 px-2 py-0.5 text-xs font-medium bg-green-100 dark:bg-green-900/30 text-green-700 dark:text-green-400 rounded-full">Enabled</span>
+            )}
+          </div>
+        </div>
+        <div className="p-4">
+          {mfaStep === 'idle' && (
+            <div>
+              {mfaEnabled ? (
+                <div>
+                  <p className="text-sm text-gray-600 dark:text-gray-400 mb-3">
+                    Two-factor authentication is active. Your account requires a code from your authenticator app on each login.
+                  </p>
+                  <button
+                    onClick={() => { setMfaStep('disable'); setMfaCode(''); }}
+                    className="flex items-center gap-2 px-4 py-2 bg-red-100 dark:bg-red-900/30 text-red-700 dark:text-red-400 rounded-lg hover:bg-red-200 dark:hover:bg-red-900/50 text-sm font-medium transition-colors"
+                  >
+                    <ShieldOff className="w-4 h-4" />
+                    Disable two-factor authentication
+                  </button>
+                </div>
+              ) : (
+                <div>
+                  <p className="text-sm text-gray-600 dark:text-gray-400 mb-3">
+                    Add an extra layer of security to your account. You'll need an authenticator app (Google Authenticator, Authy, 1Password, etc.).
+                  </p>
+                  <button
+                    onClick={handleMfaSetupStart}
+                    disabled={mfaLoading}
+                    className="flex items-center gap-2 px-4 py-2 bg-drop-600 text-white rounded-lg hover:bg-drop-700 disabled:opacity-50 text-sm font-medium transition-colors"
+                  >
+                    <ShieldCheck className="w-4 h-4" />
+                    {mfaLoading ? 'Setting up...' : 'Enable two-factor authentication'}
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
+
+          {mfaStep === 'setup' && (
+            <form onSubmit={handleMfaEnable} className="space-y-4 max-w-sm">
+              <div>
+                <p className="text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
+                  1. Scan this QR code with your authenticator app
+                </p>
+                {mfaQrDataUrl ? (
+                  <img src={mfaQrDataUrl} alt="TOTP QR code" className="rounded-lg border border-gray-200 dark:border-gray-700" style={{ width: 200, height: 200 }} />
+                ) : (
+                  <div className="w-48 h-48 bg-gray-100 dark:bg-gray-700 rounded-lg flex items-center justify-center">
+                    <span className="text-xs text-gray-400">Generating...</span>
+                  </div>
+                )}
+                <p className="text-xs text-gray-500 dark:text-gray-400 mt-2">
+                  Can't scan? Enter this secret manually:
+                </p>
+                <code className="block mt-1 text-xs font-mono bg-gray-100 dark:bg-gray-700 text-gray-800 dark:text-gray-200 px-3 py-2 rounded break-all">
+                  {mfaSetupSecret}
+                </code>
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
+                  2. Enter the 6-digit code to confirm
+                </label>
+                <input
+                  type="text"
+                  inputMode="numeric"
+                  pattern="[0-9]{6}"
+                  maxLength={6}
+                  value={mfaCode}
+                  onChange={(e) => setMfaCode(e.target.value.replace(/\D/g, ''))}
+                  placeholder="000000"
+                  required
+                  className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white text-center text-xl font-mono tracking-widest outline-none focus:ring-2 focus:ring-drop-500"
+                />
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
+                  3. Confirm your account password
+                </label>
+                <input
+                  type="password"
+                  value={mfaPassword}
+                  onChange={(e) => setMfaPassword(e.target.value)}
+                  placeholder="Current password"
+                  required
+                  className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white text-sm outline-none focus:ring-2 focus:ring-drop-500"
+                />
+              </div>
+
+              <div className="flex gap-3">
+                <button type="submit" disabled={mfaLoading || mfaCode.length !== 6 || !mfaPassword} className="px-4 py-2 bg-drop-600 text-white rounded-lg hover:bg-drop-700 disabled:opacity-50 text-sm font-medium">
+                  {mfaLoading ? 'Activating...' : 'Activate'}
+                </button>
+                <button type="button" onClick={() => { setMfaStep('idle'); setMfaSetupUri(''); setMfaSetupSecret(''); }} className="px-4 py-2 border border-gray-300 dark:border-gray-600 text-gray-700 dark:text-gray-300 rounded-lg hover:bg-gray-50 dark:hover:bg-gray-700 text-sm">
+                  Cancel
+                </button>
+              </div>
+
+              <p className="text-xs text-gray-400 dark:text-gray-500">
+                Lost your device? Run <code className="font-mono bg-gray-100 dark:bg-gray-700 px-1 rounded">drop mfa disable &lt;username&gt;</code> on the server to recover access.
+              </p>
+            </form>
+          )}
+
+          {mfaStep === 'disable' && (
+            <form onSubmit={handleMfaDisable} className="space-y-4 max-w-sm">
+              <p className="text-sm text-gray-600 dark:text-gray-400">
+                Enter a current code from your authenticator app to disable two-factor authentication.
+              </p>
+              <div>
+                <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
+                  Authentication code
+                </label>
+                <input
+                  type="text"
+                  inputMode="numeric"
+                  pattern="[0-9]{6}"
+                  maxLength={6}
+                  value={mfaCode}
+                  onChange={(e) => setMfaCode(e.target.value.replace(/\D/g, ''))}
+                  placeholder="000000"
+                  required
+                  autoFocus
+                  className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white text-center text-xl font-mono tracking-widest outline-none focus:ring-2 focus:ring-drop-500"
+                />
+              </div>
+              <div className="flex gap-3">
+                <button type="submit" disabled={mfaLoading || mfaCode.length !== 6} className="px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700 disabled:opacity-50 text-sm font-medium">
+                  {mfaLoading ? 'Disabling...' : 'Disable 2FA'}
+                </button>
+                <button type="button" onClick={() => { setMfaStep('idle'); setMfaCode(''); }} className="px-4 py-2 border border-gray-300 dark:border-gray-600 text-gray-700 dark:text-gray-300 rounded-lg hover:bg-gray-50 dark:hover:bg-gray-700 text-sm">
+                  Cancel
+                </button>
+              </div>
+            </form>
+          )}
+        </div>
       </div>
 
       {/* Activity Log (admin only) */}
