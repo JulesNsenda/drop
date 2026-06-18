@@ -10,19 +10,22 @@ interface AuthState {
   username?: string;
   userId?: string;
   role?: 'admin' | 'user' | 'readonly';
+  mustChangePassword?: boolean;
 }
 
 interface AuthContextValue extends AuthState {
-  login: (username: string, password: string) => Promise<boolean>;
+  login: (username: string, password: string) => Promise<{ success: boolean; mustChangePassword?: boolean }>;
   logout: () => void;
+  clearMustChangePassword: () => void;
 }
 
 export const AuthContext = createContext<AuthContextValue>({
   authenticated: false,
   loading: true,
   authRequired: false,
-  login: async () => false,
+  login: async () => ({ success: false }),
   logout: () => {},
+  clearMustChangePassword: () => {},
 });
 
 export function useAuth() {
@@ -51,7 +54,27 @@ export function useAuthProvider(): AuthContextValue {
         return;
       }
 
-      if (res.status === 401 || res.status === 403) {
+      if (res.status === 401) {
+        setState({ authenticated: false, loading: false, authRequired: true });
+      } else if (res.status === 403) {
+        // May be MUST_CHANGE_PASSWORD — check body before bouncing to login
+        try {
+          const body = await res.json() as { error?: { code?: string } };
+          if (body?.error?.code === 'MUST_CHANGE_PASSWORD' && localStorage.getItem('drop-token')) {
+            setState({
+              authenticated: true,
+              loading: false,
+              authRequired: true,
+              mustChangePassword: true,
+              username: localStorage.getItem('drop-username') || undefined,
+              userId: localStorage.getItem('drop-userId') || undefined,
+              role: (localStorage.getItem('drop-role') as AuthState['role']) || undefined,
+            });
+            return;
+          }
+        } catch {
+          // fall through
+        }
         setState({ authenticated: false, loading: false, authRequired: true });
       } else {
         const token = localStorage.getItem('drop-token');
@@ -69,12 +92,13 @@ export function useAuthProvider(): AuthContextValue {
     checkAuth();
   }, []);
 
-  const login = useCallback(async (username: string, password: string): Promise<boolean> => {
-    const json = await apiJson<{ token: string; user?: { id?: string; role?: AuthState['role'] } }>(
+  const login = useCallback(async (username: string, password: string): Promise<{ success: boolean; mustChangePassword?: boolean }> => {
+    const json = await apiJson<{ token: string; user?: { id?: string; role?: AuthState['role']; mustChangePassword?: boolean } }>(
       '/auth/login',
       { method: 'POST', ...jsonBody({ username, password }) }
     );
     if (json.success && json.data?.token) {
+      const mustChangePassword = json.data.user?.mustChangePassword === true;
       localStorage.setItem('drop-token', json.data.token);
       localStorage.setItem('drop-username', username);
       if (json.data.user?.id) localStorage.setItem('drop-userId', json.data.user.id);
@@ -86,10 +110,11 @@ export function useAuthProvider(): AuthContextValue {
         username,
         userId: json.data.user?.id,
         role: json.data.user?.role,
+        mustChangePassword,
       });
-      return true;
+      return { success: true, mustChangePassword };
     }
-    return false;
+    return { success: false };
   }, []);
 
   const logout = useCallback(() => {
@@ -100,7 +125,11 @@ export function useAuthProvider(): AuthContextValue {
     setState({ authenticated: false, loading: false, authRequired: true });
   }, []);
 
-  return { ...state, login, logout };
+  const clearMustChangePassword = useCallback(() => {
+    setState(prev => ({ ...prev, mustChangePassword: false }));
+  }, []);
+
+  return { ...state, login, logout, clearMustChangePassword };
 }
 
 export function getAuthHeaders(): Record<string, string> {

@@ -11,6 +11,7 @@
 export const API_BASE = '/api/v1';
 
 export const UNAUTHORIZED_EVENT = 'drop:unauthorized';
+export const MUST_CHANGE_PASSWORD_EVENT = 'drop:must-change-password';
 
 export interface ApiResponse<T> {
   success: boolean;
@@ -43,6 +44,17 @@ export async function apiFetch(path: string, init: RequestInit = {}): Promise<Re
     if (localStorage.getItem('drop-token')) {
       clearStoredAuth();
       window.dispatchEvent(new CustomEvent(UNAUTHORIZED_EVENT));
+    }
+  }
+
+  if (res.status === 403) {
+    try {
+      const body = await res.clone().json() as { error?: { code?: string } };
+      if (body?.error?.code === 'MUST_CHANGE_PASSWORD') {
+        window.dispatchEvent(new CustomEvent(MUST_CHANGE_PASSWORD_EVENT));
+      }
+    } catch {
+      // ignore parse errors
     }
   }
 

@@ -366,14 +366,16 @@ describe('Auth Middleware', () => {
       jest.restoreAllMocks();
     });
 
-    function createMockContext(headers: Record<string, string> = {}): {
-      c: { req: { header: (name: string) => string | undefined }; json: jest.Mock; set: jest.Mock };
+    function createMockContext(headers: Record<string, string> = {}, path = '/api/v1/apps', method = 'GET'): {
+      c: { req: { header: (name: string) => string | undefined; path: string; method: string }; json: jest.Mock; set: jest.Mock };
       next: jest.Mock;
     } {
       return {
         c: {
           req: {
             header: (name: string) => headers[name],
+            path,
+            method,
           },
           json: jest.fn().mockReturnValue({ status: 401 } as Response),
           set: jest.fn(),
