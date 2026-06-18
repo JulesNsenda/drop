@@ -6,7 +6,7 @@
 |-------|-------|
 | PRD ID | PRD-027 |
 | Feature | App Limit Indicator |
-| Status | Pending |
+| Status | In Progress (usage API + sidebar badge done; deploy-page gating missing) |
 | Priority | P1 |
 | Created | 2026-03-19 |
 

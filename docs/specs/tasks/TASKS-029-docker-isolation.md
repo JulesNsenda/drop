@@ -6,8 +6,25 @@
 |-------|-------|
 | Task ID | TASKS-029 |
 | PRD | PRD-029 |
+| Status | Completed (alternate design) |
 | Branch | `feature/DROP-029-docker-isolation` |
 | Created | 2026-03-19 |
+| Updated | 2026-06-19 |
+
+> **Status note (2026-06-19):** Container isolation is fully implemented and tested, but via a
+> runtime-abstraction seam rather than the exact files/approach in the checklist below — so the
+> boxes are left unticked as a record of the design delta:
+> - Runtime strategy: `src/managers/runtime/app-runtime.ts` (interface), `pm2-runtime.ts`,
+>   `container-manager.ts` (dockerode), selected via `getAppRuntime()` / `DROP_ISOLATION`
+>   (`platform.ts`) — not a `DockerRuntime` in `src/managers/process/docker-runtime.ts`.
+> - Docker availability is fail-closed in `docker` mode via `src/core/startup-constraints.ts`
+>   (`checkDockerReachable`), falling back to PM2 when `isolation: 'none'`.
+> - **No Dockerfile-template generation** (`src/core/builder/dockerfile/` does not exist) — uses
+>   pinned base images in `container-config.ts` instead; images are pulled, not built per content hash.
+> - Resource limits (`--memory`/`--cpus`/pids-limit), loopback port publishing, env injection,
+>   Docker HEALTHCHECK, and a shared `drop-net` bridge with inter-container comms disabled are all present.
+> - Untrusted builds run in-container via `src/core/builder/container-build-runner.ts`.
+> - Tests: `container-manager.test.ts`, `pm2-runtime.test.ts`, `runtime-migrator.test.ts`.
 
 ---
 

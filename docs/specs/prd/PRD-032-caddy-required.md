@@ -6,7 +6,7 @@
 |-------|-------|
 | PRD ID | PRD-032 |
 | Feature | Caddy Required |
-| Status | Planned |
+| Status | In Progress (Caddy lifecycle/routing done; auto-install + base-domain URLs missing) |
 | Priority | P1 |
 | Created | 2026-03-19 |
 

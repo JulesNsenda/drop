@@ -6,7 +6,7 @@
 |-------|-------|
 | PRD ID | PRD-028 |
 | Feature | Signup Success Message |
-| Status | Pending |
+| Status | Completed |
 | Priority | P2 |
 | Created | 2026-03-19 |
 

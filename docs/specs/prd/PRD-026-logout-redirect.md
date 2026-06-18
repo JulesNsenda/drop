@@ -6,7 +6,7 @@
 |-------|-------|
 | PRD ID | PRD-026 |
 | Feature | Logout Redirect |
-| Status | Pending |
+| Status | Completed |
 | Priority | P1 |
 | Created | 2026-03-19 |
 
