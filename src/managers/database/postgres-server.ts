@@ -304,11 +304,14 @@ export class PostgresServer {
     const dataDir = this.paths.dataDir;
 
     // Use pg_ctl to start postgres in the background (prevents console windows on Windows)
+    // Use the data dir as the socket directory so we don't need write access to
+    // /var/run/postgresql (which is owned by the system postgres user on Ubuntu).
     const pgCtl = this.paths.pgCtl;
+    const socketOpts = process.platform !== 'win32' ? ` -k ${dataDir}` : '';
     this.serverProcess = spawn(pgCtl, [
       'start',
       '-D', dataDir,
-      '-o', `-p ${this.port}`,
+      '-o', `-p ${this.port}${socketOpts}`,
       '-w', // Wait for startup
     ], {
       detached: false,
