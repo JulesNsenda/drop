@@ -70,6 +70,29 @@ ensure_user() {
   fi
 }
 
+# ── postgresql (system package — avoids EDB binary download) ─────────────────
+ensure_postgres() {
+  if ls /usr/lib/postgresql/*/bin/postgres &>/dev/null 2>&1; then
+    info "PostgreSQL already installed"
+    return 0
+  fi
+  info "Installing PostgreSQL via apt..."
+  apt-get install -y postgresql
+  systemctl stop postgresql || true
+  systemctl disable postgresql || true
+  info "PostgreSQL installed (managed by DROP, not systemd)"
+}
+
+# ── sudoers: let drop user start/stop the service (needed for CI deploy) ─────
+write_sudoers() {
+  info "Writing sudoers rule for $DROP_USER..."
+  cat > "/etc/sudoers.d/${DROP_USER}-deploy" << EOF
+${DROP_USER} ALL=(ALL) NOPASSWD: /bin/systemctl stop ${SERVICE_NAME}, /bin/systemctl start ${SERVICE_NAME}, /bin/systemctl restart ${SERVICE_NAME}, /bin/systemctl status ${SERVICE_NAME}
+EOF
+  chmod 440 "/etc/sudoers.d/${DROP_USER}-deploy"
+  visudo -c -f "/etc/sudoers.d/${DROP_USER}-deploy" || error "sudoers syntax error — check /etc/sudoers.d/${DROP_USER}-deploy"
+}
+
 # ── code: clone or pull ──────────────────────────────────────────────────────
 fetch_code() {
   if $UPGRADE; then
@@ -90,6 +113,12 @@ build_drop() {
   sudo -u "$DROP_USER" bash -c "cd '$INSTALL_DIR' && npm ci"
   info "Building server..."
   sudo -u "$DROP_USER" bash -c "cd '$INSTALL_DIR' && npm run build:server"
+  if [[ -f "$INSTALL_DIR/src/dashboard/package.json" ]]; then
+    info "Installing dashboard dependencies..."
+    sudo -u "$DROP_USER" bash -c "cd '$INSTALL_DIR/src/dashboard' && npm ci"
+    info "Building dashboard..."
+    sudo -u "$DROP_USER" bash -c "cd '$INSTALL_DIR/src/dashboard' && npm run build"
+  fi
   if $DO_LINK; then
     info "Linking CLI globally (drop command)..."
     bash -c "cd '$INSTALL_DIR' && npm link"
@@ -141,10 +170,12 @@ if $UPGRADE; then
 else
   info "Installing DROP..."
   ensure_node
+  ensure_postgres
   ensure_user
   fetch_code
   build_drop
   write_service
+  write_sudoers
   systemctl start "$SERVICE_NAME"
   echo ""
   info "DROP is running!"
