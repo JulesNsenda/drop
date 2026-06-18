@@ -43,25 +43,56 @@ jobs:
         working-directory: src/dashboard
         run: npm run build
 
+      - name: Package artifact
+        run: |
+          cp -r src/dashboard/dist dist/dashboard
+          tar -czf drop-dist.tar.gz dist/ package.json package-lock.json
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: drop-dist
+          path: drop-dist.tar.gz
+          retention-days: 1
+
   deploy:
     needs: build-and-test
     runs-on: ubuntu-latest
     environment: hetzner
     steps:
-      - name: Deploy to Hetzner
-        uses: appleboy/ssh-action@v1.2.0
+      - name: Download artifact
+        uses: actions/download-artifact@v4
         with:
-          host: ${{ secrets.DEPLOY_HOST }}
-          username: ${{ secrets.DEPLOY_USER }}
-          key: ${{ secrets.DEPLOY_KEY }}
-          script: |
-            set -e
+          name: drop-dist
+
+      - name: Set up SSH key
+        run: |
+          echo "${{ secrets.DEPLOY_KEY_B64 }}" | base64 -d > /tmp/deploy_key
+          chmod 600 /tmp/deploy_key
+
+      - name: Upload to server
+        run: |
+          scp -i /tmp/deploy_key \
+            -o StrictHostKeyChecking=no \
+            -o ConnectTimeout=30 \
+            drop-dist.tar.gz \
+            ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}:/tmp/drop-dist.tar.gz
+
+      - name: Deploy on server
+        run: |
+          ssh -i /tmp/deploy_key \
+            -o StrictHostKeyChecking=no \
+            -o ConnectTimeout=30 \
+            ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }} \
+            'set -e
+            sudo systemctl stop drop-platform
             cd /opt/drop
-            git fetch origin
-            git checkout ${{ github.ref_name }}
-            git pull origin ${{ github.ref_name }}
-            npm ci
-            cd src/dashboard && npm ci && cd ../..
-            npm run build
-            sudo systemctl restart drop-platform
-            echo "Deploy complete — $(date)"
+            tar -xzf /tmp/drop-dist.tar.gz
+            npm ci --omit=dev
+            rm -f /tmp/drop-dist.tar.gz
+            sudo systemctl start drop-platform
+            echo "Deploy complete"'
+
+      - name: Remove deploy key
+        if: always()
+        run: rm -f /tmp/deploy_key
