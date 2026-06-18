@@ -18,7 +18,9 @@ import {
   isAuthEnabled,
   authMiddleware,
   optionalAuthMiddleware,
+  resetAuth,
 } from './auth';
+import { getTestToken } from '../__testutils__/auth';
 
 describe('Auth Middleware', () => {
   let tempDir: string;
@@ -130,6 +132,7 @@ describe('Auth Middleware', () => {
   describe('authenticateUser', () => {
     beforeEach(async () => {
       jest.spyOn(console, 'log').mockImplementation();
+      resetAuth();
       await initializeAuth({
         credentialsPath,
         enableJwt: true,
@@ -142,24 +145,22 @@ describe('Auth Middleware', () => {
       jest.restoreAllMocks();
     });
 
-    it('should return JWT token for valid credentials', async () => {
-      const token = await authenticateUser('testuser', 'correctpassword');
-
-      expect(token).toBeDefined();
-      expect(typeof token).toBe('string');
-      expect(token!.split('.').length).toBe(3); // JWT has 3 parts
+    it('should return status ok with JWT token for valid credentials', async () => {
+      const result = await authenticateUser('testuser', 'correctpassword');
+      expect(result.status).toBe('ok');
+      if (result.status !== 'ok') return;
+      expect(typeof result.token).toBe('string');
+      expect(result.token.split('.').length).toBe(3); // JWT has 3 parts
     });
 
-    it('should return null for invalid password', async () => {
-      const token = await authenticateUser('testuser', 'wrongpassword');
-
-      expect(token).toBeNull();
+    it('should return status invalid for wrong password', async () => {
+      const result = await authenticateUser('testuser', 'wrongpassword');
+      expect(result.status).toBe('invalid');
     });
 
-    it('should return null for non-existent user', async () => {
-      const token = await authenticateUser('nonexistent', 'password');
-
-      expect(token).toBeNull();
+    it('should return status invalid for non-existent user', async () => {
+      const result = await authenticateUser('nonexistent', 'password');
+      expect(result.status).toBe('invalid');
     });
   });
 
@@ -168,13 +169,14 @@ describe('Auth Middleware', () => {
 
     beforeEach(async () => {
       jest.spyOn(console, 'log').mockImplementation();
+      resetAuth();
       await initializeAuth({
         credentialsPath,
         enableJwt: true,
         enableApiKeys: true,
       });
       await createUser('testuser', 'password123', 'user');
-      validToken = (await authenticateUser('testuser', 'password123'))!;
+      validToken = await getTestToken('testuser', 'password123');
     });
 
     afterEach(() => {
@@ -351,13 +353,14 @@ describe('Auth Middleware', () => {
 
     beforeEach(async () => {
       jest.spyOn(console, 'log').mockImplementation();
+      resetAuth();
       await initializeAuth({
         credentialsPath,
         enableJwt: true,
         enableApiKeys: true,
       });
       await createUser('testuser', 'password123', 'user');
-      validToken = (await authenticateUser('testuser', 'password123'))!;
+      validToken = await getTestToken('testuser', 'password123');
       const { key } = await createApiKey('test-api-key', 'admin');
       validApiKey = key;
     });
@@ -465,13 +468,14 @@ describe('Auth Middleware', () => {
 
     beforeEach(async () => {
       jest.spyOn(console, 'log').mockImplementation();
+      resetAuth();
       await initializeAuth({
         credentialsPath,
         enableJwt: true,
         enableApiKeys: true,
       });
       await createUser('testuser', 'password123', 'user');
-      validToken = (await authenticateUser('testuser', 'password123'))!;
+      validToken = await getTestToken('testuser', 'password123');
     });
 
     afterEach(() => {

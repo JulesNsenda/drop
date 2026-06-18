@@ -10,6 +10,7 @@ import * as crypto from 'crypto';
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import { writeJsonAtomic } from '../../utils/atomic-write';
+import { encrypt, decrypt, EncryptedData } from '../../managers/secret/encryption';
 import { error, ErrorCodes } from '../types';
 
 // Auth configuration
@@ -24,6 +25,8 @@ export interface AuthConfig {
   enableApiKeys?: boolean;
   /** Enable JWT authentication */
   enableJwt?: boolean;
+  /** Path to the platform encryption key file (for MFA secret at rest) */
+  masterKeyPath?: string;
 }
 
 // User record
@@ -38,6 +41,12 @@ export interface User {
   enabled?: boolean; // default true
   maxApps?: number; // per-user override (0 = use global default)
   mustChangePassword?: boolean;
+  /** MFA enabled flag */
+  mfaEnabled?: boolean;
+  /** Encrypted TOTP secret (AES-256-GCM via platform encryption key) */
+  mfaSecret?: EncryptedData;
+  /** Last step index that was accepted — prevents replay */
+  mfaLastUsedStep?: number;
 }
 
 // API key record
@@ -74,12 +83,29 @@ interface CredentialsStore {
   users: User[];
   apiKeys: ApiKey[];
   jwtSecret: string;
+  /** Separate secret for signing MFA challenge tokens — keeps them structurally distinct from session JWTs. */
+  mfaChallengeSecret?: string;
 }
 
 // Module state
 let config: AuthConfig | null = null;
 let credentials: CredentialsStore | null = null;
 let jwtSecret: Uint8Array | null = null;
+let mfaChallengeSigningKey: Uint8Array | null = null;
+let masterKey: Buffer | null = null;
+
+// Per-challenge attempt cap: jti → attempt count. Evicted after TTL.
+const MFA_CHALLENGE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+const MFA_MAX_ATTEMPTS = 5;
+interface AttemptEntry { count: number; expiresAt: number }
+const challengeAttempts = new Map<string, AttemptEntry>();
+
+function pruneExpiredChallenges(): void {
+  const now = Date.now();
+  for (const [jti, entry] of challengeAttempts) {
+    if (entry.expiresAt <= now) challengeAttempts.delete(jti);
+  }
+}
 
 // Throttle persistence of the cosmetic apiKey.lastUsed field.
 const LASTUSED_FLUSH_INTERVAL_MS = 60_000;
@@ -104,6 +130,28 @@ export async function initializeAuth(authConfig: AuthConfig): Promise<void> {
     jwtSecret = new TextEncoder().encode(config.jwtSecret);
   } else {
     jwtSecret = new TextEncoder().encode(credentials.jwtSecret);
+  }
+
+  // Set up MFA challenge signing key (separate from session JWT secret)
+  if (!credentials.mfaChallengeSecret) {
+    credentials.mfaChallengeSecret = crypto.randomBytes(32).toString('hex');
+    await saveCredentials(config.credentialsPath, credentials);
+  }
+  mfaChallengeSigningKey = new TextEncoder().encode(credentials.mfaChallengeSecret);
+
+  // Load platform master key for MFA secret encryption at rest
+  if (config.masterKeyPath) {
+    try {
+      const keyHex = (await fs.readFile(config.masterKeyPath, 'utf-8')).trim();
+      masterKey = Buffer.from(keyHex, 'hex');
+      if (masterKey.length !== 32) {
+        console.warn('[Auth] encryption.key is not 32 bytes — MFA secrets will not be stored');
+        masterKey = null;
+      }
+    } catch {
+      // Key file not found — MFA enrolment will fail loudly when attempted
+      masterKey = null;
+    }
   }
 
   // Create default admin user if no users exist
@@ -300,35 +348,109 @@ export async function updateUser(userId: string, updates: { enabled?: boolean; r
   return true;
 }
 
+// Discriminated union return type for authenticateUser
+export type AuthenticateResult =
+  | { status: 'ok'; token: string }
+  | { status: 'mfa_required'; challengeToken: string; userId: string }
+  | { status: 'invalid' }
+  | { status: 'disabled' };
+
 /**
- * Authenticate a user and return a JWT token
+ * Authenticate a user.
+ * - Returns { status: 'ok', token } on successful single-factor login.
+ * - Returns { status: 'mfa_required', challengeToken } when the user has MFA enabled.
+ * - Returns { status: 'invalid' } for wrong credentials.
+ * - Returns { status: 'disabled' } for suspended accounts.
  */
-export async function authenticateUser(username: string, password: string): Promise<string | null> {
+export async function authenticateUser(username: string, password: string): Promise<AuthenticateResult> {
   if (!credentials || !jwtSecret || !config) {
     throw new Error('Auth not initialized');
   }
 
   const user = credentials.users.find((u) => u.username === username);
   if (!user || !verifyPassword(password, user.passwordHash)) {
-    return null;
+    return { status: 'invalid' };
   }
 
-  // Block disabled users
   if (user.enabled === false) {
-    return null;
+    return { status: 'disabled' };
   }
 
   // Opportunistically upgrade legacy SHA-256 hashes to scrypt on successful login.
   if (isLegacyPasswordHash(user.passwordHash)) {
     user.passwordHash = hashPassword(password).hash;
+    await saveCredentials(config.credentialsPath, credentials);
+  }
+
+  // MFA gate: if user has MFA enabled, issue a short-lived challenge token
+  if (user.mfaEnabled) {
+    const challengeToken = await issueMfaChallenge(user.id);
+    return { status: 'mfa_required', challengeToken, userId: user.id };
   }
 
   // Update last login
   user.lastLogin = new Date().toISOString();
   await saveCredentials(config.credentialsPath, credentials);
 
-  // Generate JWT
-  const token = await new jose.SignJWT({
+  const token = await issueSessionJwt(user);
+  return { status: 'ok', token };
+}
+
+/** Issue a short-lived MFA challenge token (signed with mfaChallengeSecret, not jwtSecret). */
+async function issueMfaChallenge(userId: string): Promise<string> {
+  if (!mfaChallengeSigningKey) throw new Error('MFA challenge key not initialized');
+  const jti = crypto.randomUUID();
+  return new jose.SignJWT({ sub: userId, typ: 'mfa_challenge', jti })
+    .setProtectedHeader({ alg: 'HS256' })
+    .setIssuedAt()
+    .setExpirationTime('5m')
+    .sign(mfaChallengeSigningKey);
+}
+
+export type VerifyChallengeResult =
+  | { status: 'ok'; userId: string; jti: string }
+  | { status: 'invalid' }
+  | { status: 'expired' }
+  | { status: 'attempt_limit' };
+
+/** Verify an MFA challenge token. Returns the userId and jti on success. */
+export async function verifyMfaChallenge(challengeToken: string): Promise<VerifyChallengeResult> {
+  if (!mfaChallengeSigningKey) return { status: 'invalid' };
+  try {
+    const { payload } = await jose.jwtVerify(challengeToken, mfaChallengeSigningKey, { algorithms: ['HS256'] });
+    if (payload['typ'] !== 'mfa_challenge') return { status: 'invalid' };
+    const userId = payload.sub as string;
+    const jti = payload.jti as string;
+    if (!userId || !jti) return { status: 'invalid' };
+
+    // Check attempt cap
+    pruneExpiredChallenges();
+    const entry = challengeAttempts.get(jti);
+    if (entry && entry.count >= MFA_MAX_ATTEMPTS) return { status: 'attempt_limit' };
+
+    return { status: 'ok', userId, jti };
+  } catch {
+    return { status: 'expired' };
+  }
+}
+
+/** Record a failed MFA attempt against a jti. */
+export function recordMfaAttempt(jti: string): void {
+  pruneExpiredChallenges();
+  const entry = challengeAttempts.get(jti) ?? { count: 0, expiresAt: Date.now() + MFA_CHALLENGE_TTL_MS };
+  entry.count += 1;
+  challengeAttempts.set(jti, entry);
+}
+
+/** Invalidate a challenge jti (call on success or limit hit). */
+export function invalidateMfaChallenge(jti: string): void {
+  challengeAttempts.delete(jti);
+}
+
+/** Issue the real 24h session JWT for a user. */
+async function issueSessionJwt(user: User): Promise<string> {
+  if (!jwtSecret || !config) throw new Error('Auth not initialized');
+  return new jose.SignJWT({
     sub: user.id,
     username: user.username,
     role: user.role,
@@ -337,8 +459,117 @@ export async function authenticateUser(username: string, password: string): Prom
     .setIssuedAt()
     .setExpirationTime(`${config.jwtExpiresIn}s`)
     .sign(jwtSecret);
+}
 
-  return token;
+/**
+ * Complete MFA login: verify the TOTP code for a challenge and issue the session JWT.
+ */
+export async function completeMfaLogin(
+  challengeToken: string,
+  code: string,
+): Promise<{ status: 'ok'; token: string } | { status: 'invalid' } | { status: 'expired' } | { status: 'attempt_limit' }> {
+  if (!credentials || !config) throw new Error('Auth not initialized');
+
+  const challenge = await verifyMfaChallenge(challengeToken);
+  if (challenge.status !== 'ok') return challenge;
+
+  const user = credentials.users.find((u) => u.id === challenge.userId);
+  if (!user || !user.mfaEnabled || !user.mfaSecret) {
+    return { status: 'invalid' };
+  }
+
+  if (!masterKey) throw new Error('MFA encryption key not available');
+
+  const { verifyTotp } = await import('../../utils/totp');
+  const secretBase32 = decrypt(user.mfaSecret, masterKey);
+  const now = Math.floor(Date.now() / 1000);
+  const matchedStep = verifyTotp(code, secretBase32, now, user.mfaLastUsedStep ?? null);
+
+  if (matchedStep === null) {
+    recordMfaAttempt(challenge.jti);
+    return { status: 'invalid' };
+  }
+
+  // Replay protection: update last-used step
+  user.mfaLastUsedStep = matchedStep;
+  user.lastLogin = new Date().toISOString();
+  await saveCredentials(config.credentialsPath, credentials);
+
+  invalidateMfaChallenge(challenge.jti);
+
+  const token = await issueSessionJwt(user);
+  return { status: 'ok', token };
+}
+
+/**
+ * Set up TOTP for a user: returns the otpauth:// URI and base32 secret.
+ * Does NOT persist anything — the client must call enableMfa() with a verified code.
+ */
+export function setupMfa(userId: string): { uri: string; secret: string } | null {
+  if (!credentials) return null;
+  const user = credentials.users.find((u) => u.id === userId);
+  if (!user) return null;
+
+  const { generateTotpSecret, buildOtpauthUri } = require('../../utils/totp');
+  const secret: string = generateTotpSecret();
+  const uri: string = buildOtpauthUri(user.username, secret);
+  return { uri, secret };
+}
+
+/**
+ * Enable MFA for a user.
+ * Requires the account password (prevents stolen-session attacker binding their authenticator)
+ * and a valid TOTP code for the candidate secret.
+ */
+export async function enableMfa(
+  userId: string,
+  password: string,
+  secretBase32: string,
+  code: string,
+): Promise<{ status: 'ok' } | { status: 'invalid_password' } | { status: 'invalid_code' } | { status: 'no_key' }> {
+  if (!credentials || !config) throw new Error('Auth not initialized');
+  if (!masterKey) return { status: 'no_key' };
+
+  const user = credentials.users.find((u) => u.id === userId);
+  if (!user || !verifyPassword(password, user.passwordHash)) return { status: 'invalid_password' };
+
+  const { verifyTotp } = await import('../../utils/totp');
+  const now = Math.floor(Date.now() / 1000);
+  const matchedStep = verifyTotp(code, secretBase32, now, null);
+  if (matchedStep === null) return { status: 'invalid_code' };
+
+  user.mfaSecret = encrypt(secretBase32, masterKey);
+  user.mfaEnabled = true;
+  user.mfaLastUsedStep = matchedStep;
+  await saveCredentials(config.credentialsPath, credentials);
+  return { status: 'ok' };
+}
+
+/**
+ * Disable MFA for a user.
+ * Requires a valid current TOTP code (prevents downgrade with stolen session + known password).
+ */
+export async function disableMfa(
+  userId: string,
+  code: string,
+): Promise<{ status: 'ok' } | { status: 'not_enabled' } | { status: 'invalid_code' }> {
+  if (!credentials || !config) throw new Error('Auth not initialized');
+
+  const user = credentials.users.find((u) => u.id === userId);
+  if (!user || !user.mfaEnabled || !user.mfaSecret) return { status: 'not_enabled' };
+  if (!masterKey) throw new Error('MFA encryption key not available');
+
+  const { verifyTotp } = await import('../../utils/totp');
+  const secretBase32 = decrypt(user.mfaSecret, masterKey);
+  const now = Math.floor(Date.now() / 1000);
+  const matchedStep = verifyTotp(code, secretBase32, now, user.mfaLastUsedStep ?? null);
+  if (matchedStep === null) return { status: 'invalid_code' };
+
+  delete user.mfaSecret;
+  delete user.mfaEnabled;
+  delete user.mfaLastUsedStep;
+  await saveCredentials(config.credentialsPath, credentials);
+  return { status: 'ok' };
 }
 
 /**
@@ -465,32 +696,32 @@ export function listApiKeys(): Omit<ApiKey, 'keyHash'>[] {
 }
 
 /**
- * List all users (without revealing password hashes)
+ * List all users (without revealing password hashes or MFA secrets)
  */
-export function listUsers(): Omit<User, 'passwordHash'>[] {
+export function listUsers(): Omit<User, 'passwordHash' | 'mfaSecret'>[] {
   if (!credentials) {
     throw new Error('Auth not initialized');
   }
 
-  return credentials.users.map(({ passwordHash: _, ...user }) => user);
+  return credentials.users.map(({ passwordHash: _p, mfaSecret: _m, ...user }) => user);
 }
 
 /**
- * Get a user by username (without password hash)
+ * Get a user by username (without password hash or MFA secret)
  */
-export function getUser(username: string): Omit<User, 'passwordHash'> | null {
+export function getUser(username: string): Omit<User, 'passwordHash' | 'mfaSecret'> | null {
   if (!credentials) return null;
   const user = credentials.users.find((u) => u.username === username);
   if (!user) return null;
-  const { passwordHash: _, ...safe } = user;
+  const { passwordHash: _p, mfaSecret: _m, ...safe } = user;
   return safe;
 }
 
-export function getUserById(userId: string): Omit<User, 'passwordHash'> | null {
+export function getUserById(userId: string): Omit<User, 'passwordHash' | 'mfaSecret'> | null {
   if (!credentials) return null;
   const user = credentials.users.find((u) => u.id === userId);
   if (!user) return null;
-  const { passwordHash: _, ...safe } = user;
+  const { passwordHash: _p, mfaSecret: _m, ...safe } = user;
   return safe;
 }
 
@@ -519,8 +750,11 @@ export function resetAuth(): void {
   config = null;
   credentials = null;
   jwtSecret = null;
+  mfaChallengeSigningKey = null;
+  masterKey = null;
   signupEnabled = false;
   lastUsedFlushAt = 0;
+  challengeAttempts.clear();
 }
 
 /**
@@ -543,6 +777,14 @@ export function authMiddleware(requiredRole?: 'admin' | 'user' | 'readonly') {
       const payload = await verifyJwt(token);
 
       if (payload) {
+        // Reject MFA challenge tokens — they are NOT session tokens.
+        // This must be the first check so challenge tokens never leak account state.
+        if ((payload as unknown as Record<string, unknown>)['typ'] === 'mfa_challenge') {
+          return c.json(
+            error(ErrorCodes.UNAUTHORIZED, 'Challenge tokens cannot be used for API access.'),
+            401
+          );
+        }
         authContext = {
           userId: payload.sub,
           username: payload.username,
@@ -621,7 +863,8 @@ export function optionalAuthMiddleware() {
     if (authHeader?.startsWith('Bearer ')) {
       const token = authHeader.substring(7);
       const payload = await verifyJwt(token);
-      if (payload) {
+      // Reject challenge tokens — never treat them as session tokens
+      if (payload && (payload as unknown as Record<string, unknown>)['typ'] !== 'mfa_challenge') {
         c.set('auth', {
           userId: payload.sub,
           username: payload.username,

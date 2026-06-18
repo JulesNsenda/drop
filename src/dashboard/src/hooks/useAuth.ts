@@ -11,12 +11,20 @@ interface AuthState {
   userId?: string;
   role?: 'admin' | 'user' | 'readonly';
   mustChangePassword?: boolean;
+  mfaEnabled?: boolean;
 }
 
+export type LoginResult =
+  | { success: true; mustChangePassword?: boolean }
+  | { success: false; mfaRequired: true; challengeToken: string }
+  | { success: false; mfaRequired?: false };
+
 interface AuthContextValue extends AuthState {
-  login: (username: string, password: string) => Promise<{ success: boolean; mustChangePassword?: boolean }>;
+  login: (username: string, password: string) => Promise<LoginResult>;
+  verifyMfa: (challengeToken: string, code: string) => Promise<{ success: boolean }>;
   logout: () => void;
   clearMustChangePassword: () => void;
+  refreshMe: () => Promise<void>;
 }
 
 export const AuthContext = createContext<AuthContextValue>({
@@ -24,8 +32,10 @@ export const AuthContext = createContext<AuthContextValue>({
   loading: true,
   authRequired: false,
   login: async () => ({ success: false }),
+  verifyMfa: async () => ({ success: false }),
   logout: () => {},
   clearMustChangePassword: () => {},
+  refreshMe: async () => {},
 });
 
 export function useAuth() {
@@ -38,6 +48,18 @@ export function useAuthProvider(): AuthContextValue {
     loading: true,
     authRequired: false,
   });
+
+  // Refresh current user info from /auth/me (used after MFA enable/disable)
+  const refreshMe = useCallback(async () => {
+    const json = await apiJson<{ mfaEnabled?: boolean; mustChangePassword?: boolean }>('/auth/me');
+    if (json.success && json.data) {
+      setState(prev => ({
+        ...prev,
+        mfaEnabled: json.data!.mfaEnabled,
+        mustChangePassword: json.data!.mustChangePassword,
+      }));
+    }
+  }, []);
 
   // Check if auth is required by hitting a protected endpoint
   useEffect(() => {
@@ -92,12 +114,31 @@ export function useAuthProvider(): AuthContextValue {
     checkAuth();
   }, []);
 
-  const login = useCallback(async (username: string, password: string): Promise<{ success: boolean; mustChangePassword?: boolean }> => {
-    const json = await apiJson<{ token: string; user?: { id?: string; role?: AuthState['role']; mustChangePassword?: boolean } }>(
+  const login = useCallback(async (username: string, password: string): Promise<LoginResult> => {
+    // Evict any stale token before the API call so an expired token can't
+    // fire drop:unauthorized mid-TOTP-entry on a background poll.
+    localStorage.removeItem('drop-token');
+
+    const json = await apiJson<{
+      token?: string;
+      mfaRequired?: boolean;
+      challengeToken?: string;
+      user?: { id?: string; role?: AuthState['role']; mustChangePassword?: boolean };
+    }>(
       '/auth/login',
       { method: 'POST', ...jsonBody({ username, password }) }
     );
-    if (json.success && json.data?.token) {
+
+    if (!json.success) {
+      return { success: false };
+    }
+
+    // MFA required: return challenge token to caller (never stored in localStorage)
+    if (json.data?.mfaRequired && json.data.challengeToken) {
+      return { success: false, mfaRequired: true, challengeToken: json.data.challengeToken };
+    }
+
+    if (json.data?.token) {
       const mustChangePassword = json.data.user?.mustChangePassword === true;
       localStorage.setItem('drop-token', json.data.token);
       localStorage.setItem('drop-username', username);
@@ -114,6 +155,27 @@ export function useAuthProvider(): AuthContextValue {
       });
       return { success: true, mustChangePassword };
     }
+
+    return { success: false };
+  }, []);
+
+  const verifyMfa = useCallback(async (challengeToken: string, code: string): Promise<{ success: boolean }> => {
+    const json = await apiJson<{ token: string; tokenType: string; expiresIn: number }>(
+      '/auth/mfa/verify',
+      { method: 'POST', ...jsonBody({ challengeToken, code }) }
+    );
+    if (json.success && json.data?.token) {
+      const storedUsername = localStorage.getItem('drop-username') || '';
+      localStorage.setItem('drop-token', json.data.token);
+      setState(prev => ({
+        ...prev,
+        authenticated: true,
+        loading: false,
+        authRequired: true,
+        username: storedUsername || prev.username,
+      }));
+      return { success: true };
+    }
     return { success: false };
   }, []);
 
@@ -129,7 +191,7 @@ export function useAuthProvider(): AuthContextValue {
     setState(prev => ({ ...prev, mustChangePassword: false }));
   }, []);
 
-  return { ...state, login, logout, clearMustChangePassword };
+  return { ...state, login, verifyMfa, logout, clearMustChangePassword, refreshMe };
 }
 
 export function getAuthHeaders(): Record<string, string> {

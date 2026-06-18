@@ -13,6 +13,11 @@ export {
   authenticateUser,
   createUser,
   createApiKey,
+  setupMfa,
+  enableMfa,
+  disableMfa,
+  completeMfaLogin,
   type AuthConfig,
   type AuthContext,
+  type AuthenticateResult,
 } from './middleware/auth';
