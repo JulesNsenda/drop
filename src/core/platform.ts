@@ -1797,12 +1797,12 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       healthCheckPath,
       pgSocketDir,
       env: {
+        ...secretEnvVars,
         NODE_ENV: 'production',
         PORT: port.toString(),
         DROP_DATA_DIR: dataDir,
         ...dbEnvVars,
         ...depEnvVars,
-        ...secretEnvVars,
       },
     };
   }

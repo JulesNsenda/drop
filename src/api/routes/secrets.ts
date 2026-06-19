@@ -4,26 +4,43 @@
  * API endpoints for managing encrypted app secrets/environment variables.
  */
 
-import { Hono } from 'hono';
+import { Hono, type Context } from 'hono';
 import { success, error, ErrorCodes } from '../types';
 import { getSecretManager } from '../../managers/secret';
-import { ValidationError } from '../middleware/error';
+import { NotFoundError, ValidationError } from '../middleware/error';
 import { isValidAppName } from '../middleware/validate';
+import { canAccess } from '../access';
+import { getStateManager } from '../../managers/app/state-manager';
+import type { AuthContext } from '../middleware/auth';
+
+// Keys that platform controls and must never be overridden by user secrets.
+const RESERVED_KEYS = new Set([
+  'PORT', 'DROP_DATA_DIR', 'DATABASE_URL', 'NODE_ENV',
+  'PGHOST', 'PGPORT', 'PGUSER', 'PGPASSWORD', 'PGDATABASE',
+]);
+
+const MAX_SECRET_VALUE_BYTES = 64 * 1024; // 64 KiB
 
 const secrets = new Hono();
 
+function resolveApp(c: Context) {
+  const auth = (c.get as Function)('auth') as AuthContext | undefined;
+  const name = c.req.param('name') as string;
+  if (!isValidAppName(name)) return { validationError: true as const, name, app: null, auth };
+  const app = getStateManager().getApp(name);
+  if (!app || !canAccess(auth, app)) return { notFound: true as const, name, app: null, auth };
+  return { name, app, auth };
+}
+
 // GET /secrets/:name - List secret keys for an app
 secrets.get('/:name', (c) => {
-  const name = c.req.param('name');
-
-  if (!isValidAppName(name)) {
-    return c.json(error(ErrorCodes.VALIDATION_ERROR, 'Invalid app name'), 400);
-  }
+  const r = resolveApp(c);
+  if (r.validationError) return c.json(error(ErrorCodes.VALIDATION_ERROR, 'Invalid app name'), 400);
+  if (r.notFound) throw new NotFoundError(`Application '${r.name}' not found`);
 
   try {
-    const sm = getSecretManager();
-    const keys = sm.list(name);
-    return c.json(success({ appName: name, keys }));
+    const keys = getSecretManager().list(r.name);
+    return c.json(success({ appName: r.name, keys }));
   } catch {
     return c.json(error(ErrorCodes.INTERNAL_ERROR, 'Secret manager not available'), 500);
   }
@@ -31,11 +48,9 @@ secrets.get('/:name', (c) => {
 
 // PUT /secrets/:name - Set a secret for an app
 secrets.put('/:name', async (c) => {
-  const name = c.req.param('name');
-
-  if (!isValidAppName(name)) {
-    return c.json(error(ErrorCodes.VALIDATION_ERROR, 'Invalid app name'), 400);
-  }
+  const r = resolveApp(c);
+  if (r.validationError) return c.json(error(ErrorCodes.VALIDATION_ERROR, 'Invalid app name'), 400);
+  if (r.notFound) throw new NotFoundError(`Application '${r.name}' not found`);
 
   const body = await c.req.json<{ key: string; value: string }>();
 
@@ -50,14 +65,23 @@ secrets.put('/:name', async (c) => {
   // Validate key format: uppercase alphanumeric with underscores
   if (!/^[A-Z][A-Z0-9_]{0,127}$/.test(body.key)) {
     throw new ValidationError(
-      'Secret key must be uppercase alphanumeric with underscores (e.g., DATABASE_URL)'
+      'Secret key must be uppercase alphanumeric with underscores (e.g., MY_SECRET)'
     );
   }
 
+  // Deny reserved platform keys
+  if (RESERVED_KEYS.has(body.key.toUpperCase())) {
+    throw new ValidationError(`'${body.key}' is a reserved platform key and cannot be stored as a secret`);
+  }
+
+  // Cap value size
+  if (Buffer.byteLength(String(body.value), 'utf8') > MAX_SECRET_VALUE_BYTES) {
+    throw new ValidationError('Secret value exceeds the 64 KiB limit');
+  }
+
   try {
-    const sm = getSecretManager();
-    await sm.set(name, body.key, String(body.value));
-    return c.json(success({ appName: name, key: body.key, message: 'Secret set' }));
+    await getSecretManager().set(r.name, body.key, String(body.value));
+    return c.json(success({ appName: r.name, key: body.key, message: 'Secret set' }));
   } catch {
     return c.json(error(ErrorCodes.INTERNAL_ERROR, 'Failed to set secret'), 500);
   }
@@ -65,22 +89,20 @@ secrets.put('/:name', async (c) => {
 
 // DELETE /secrets/:name/:key - Delete a specific secret
 secrets.delete('/:name/:key', async (c) => {
-  const name = c.req.param('name');
+  const r = resolveApp(c);
+  if (r.validationError) return c.json(error(ErrorCodes.VALIDATION_ERROR, 'Invalid app name'), 400);
+  if (r.notFound) throw new NotFoundError(`Application '${r.name}' not found`);
+
   const key = c.req.param('key');
 
-  if (!isValidAppName(name)) {
-    return c.json(error(ErrorCodes.VALIDATION_ERROR, 'Invalid app name'), 400);
-  }
-
   try {
-    const sm = getSecretManager();
-    const deleted = await sm.delete(name, key);
+    const deleted = await getSecretManager().delete(r.name, key);
 
     if (!deleted) {
-      return c.json(error(ErrorCodes.NOT_FOUND, `Secret '${key}' not found for app '${name}'`), 404);
+      return c.json(error(ErrorCodes.NOT_FOUND, `Secret '${key}' not found for app '${r.name}'`), 404);
     }
 
-    return c.json(success({ appName: name, key, message: 'Secret deleted' }));
+    return c.json(success({ appName: r.name, key, message: 'Secret deleted' }));
   } catch {
     return c.json(error(ErrorCodes.INTERNAL_ERROR, 'Failed to delete secret'), 500);
   }
@@ -88,16 +110,13 @@ secrets.delete('/:name/:key', async (c) => {
 
 // DELETE /secrets/:name - Delete all secrets for an app
 secrets.delete('/:name', async (c) => {
-  const name = c.req.param('name');
-
-  if (!isValidAppName(name)) {
-    return c.json(error(ErrorCodes.VALIDATION_ERROR, 'Invalid app name'), 400);
-  }
+  const r = resolveApp(c);
+  if (r.validationError) return c.json(error(ErrorCodes.VALIDATION_ERROR, 'Invalid app name'), 400);
+  if (r.notFound) throw new NotFoundError(`Application '${r.name}' not found`);
 
   try {
-    const sm = getSecretManager();
-    await sm.deleteAll(name);
-    return c.json(success({ appName: name, message: 'All secrets deleted' }));
+    await getSecretManager().deleteAll(r.name);
+    return c.json(success({ appName: r.name, message: 'All secrets deleted' }));
   } catch {
     return c.json(error(ErrorCodes.INTERNAL_ERROR, 'Failed to delete secrets'), 500);
   }
