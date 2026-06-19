@@ -468,8 +468,14 @@ describe('selectBaseImage', () => {
     expect(selectBaseImage('static')).toBe('nginx:alpine');
   });
 
-  it('respects runtimeImage override', () => {
-    expect(selectBaseImage('nodejs', 'node:18-alpine')).toBe('node:18-alpine');
+  it('respects runtimeImage override when image is in the allowlist', () => {
+    expect(selectBaseImage('nodejs', 'node:20-slim')).toBe('node:20-slim');
+  });
+
+  it('throws when runtimeImage is not in the allowlist', () => {
+    expect(() => selectBaseImage('nodejs', 'node:18-alpine')).toThrow(
+      /not in the DROP image allowlist/
+    );
   });
 
   it('falls back to node:20-slim for unknown types', () => {

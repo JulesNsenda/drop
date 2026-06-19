@@ -29,6 +29,7 @@ DOMAIN=""
 ACME_EMAIL=""
 ENABLE_HTTPS=false
 DEPLOY_PUBKEY=""
+ISOLATION=""       # "docker" to enable container isolation; empty to leave unchanged
 
 # ── colour helpers ───────────────────────────────────────────────────────────
 GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'; NC='\033[0m'
@@ -56,7 +57,8 @@ while [[ $# -gt 0 ]]; do
     --acme-email=*)    ACME_EMAIL="${1#*=}" ;;
     --deploy-pubkey=*) DEPLOY_PUBKEY="${1#*=}" ;;
     --port=*)          API_PORT="${1#*=}" ;;
-    *) error "Unknown option: $1 (try --bootstrap, --upgrade, --provision, --domain=, --https, --acme-email=, --deploy-pubkey=, --dir=, --root=, --branch=, --link)" ;;
+    --isolation=*)     ISOLATION="${1#*=}" ;;
+    *) error "Unknown option: $1 (try --bootstrap, --upgrade, --provision, --domain=, --https, --acme-email=, --deploy-pubkey=, --isolation=docker, --dir=, --root=, --branch=, --link)" ;;
   esac
   shift
 done
@@ -98,6 +100,46 @@ ensure_build_tools() {
   fi
   info "Installing build tools (build-essential, python3) for native npm deps..."
   aptget install -y build-essential python3
+}
+
+# ── Docker Engine (container isolation) ─────────────────────────────────────
+# Installs Docker Engine from the official apt repo (not the snap/distro pkg).
+# Adds the DROP service user to the 'docker' group so it can manage containers.
+# Call only when --isolation=docker is passed.
+ensure_docker() {
+  if command -v docker &>/dev/null && docker info &>/dev/null 2>&1; then
+    info "Docker Engine already installed and running"
+  else
+    info "Installing Docker Engine (official apt repo)..."
+    aptget install -y ca-certificates curl gnupg
+    install -m 0755 -d /etc/apt/keyrings
+    curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+      | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+    chmod a+r /etc/apt/keyrings/docker.gpg
+    echo \
+      "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
+      https://download.docker.com/linux/ubuntu \
+      $(. /etc/os-release && echo "$VERSION_CODENAME") stable" \
+      > /etc/apt/sources.list.d/docker.list
+    aptget update -qq
+    aptget install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+    systemctl enable --now docker
+    info "Docker Engine installed"
+  fi
+
+  # Add the DROP service user to the 'docker' group so it can manage containers
+  # without sudo. The service must be restarted after this for the group change to
+  # take effect — handled in the run section below.
+  if ! groups "$DROP_USER" 2>/dev/null | grep -q '\bdocker\b'; then
+    info "Adding $DROP_USER to the 'docker' group..."
+    usermod -aG docker "$DROP_USER"
+  fi
+
+  # Pre-pull the base images used by DROP so the first container start is fast.
+  info "Pre-pulling DROP base images (this may take a few minutes)..."
+  for img in node:20-slim python:3.12-slim nginx:alpine golang:1.22-alpine; do
+    docker pull "$img" 2>&1 | tail -1 || warn "Failed to pre-pull $img — will retry on first deploy"
+  done
 }
 
 # ── system user ──────────────────────────────────────────────────────────────
@@ -175,7 +217,7 @@ ensure_caddy() {
 # changes take effect on the next service restart without rewriting the unit.
 # Only keys passed as flags are touched; existing keys are preserved.
 write_env_config() {
-  if [[ -z "$DOMAIN" && -z "$ACME_EMAIL" && "$ENABLE_HTTPS" != "true" ]]; then
+  if [[ -z "$DOMAIN" && -z "$ACME_EMAIL" && "$ENABLE_HTTPS" != "true" && -z "$ISOLATION" ]]; then
     return 0
   fi
   mkdir -p "$(dirname "$ENV_FILE")"
@@ -188,9 +230,10 @@ write_env_config() {
       echo "${k}=${v}" >> "$ENV_FILE"
     fi
   }
-  [[ -n "$DOMAIN" ]]            && upsert DROP_DOMAIN_SUFFIX "$DOMAIN"
+  [[ -n "$DOMAIN" ]]              && upsert DROP_DOMAIN_SUFFIX "$DOMAIN"
   [[ "$ENABLE_HTTPS" == "true" ]] && upsert DROP_ENABLE_HTTPS true
-  [[ -n "$ACME_EMAIL" ]]       && upsert DROP_ACME_EMAIL "$ACME_EMAIL"
+  [[ -n "$ACME_EMAIL" ]]         && upsert DROP_ACME_EMAIL "$ACME_EMAIL"
+  [[ -n "$ISOLATION" ]]          && upsert DROP_ISOLATION "$ISOLATION"
   # 600, root-owned: systemd reads EnvironmentFile as root before dropping
   # privileges, so tenant apps (and other local users) can't read ACME email or
   # any future secrets persisted here.
@@ -290,11 +333,24 @@ build_drop() {
 write_service() {
   local node_bin
   node_bin=$(command -v node)
+
+  # Determine the effective isolation mode: flag > env file > default (none).
+  local eff_isolation="${ISOLATION}"
+  if [[ -z "$eff_isolation" && -f "$ENV_FILE" ]]; then
+    eff_isolation="$(sed -n 's|^DROP_ISOLATION=||p' "$ENV_FILE" | tail -n1)"
+  fi
+
+  # When running Docker isolation, the platform must start after Docker.
+  local docker_deps=""
+  if [[ "$eff_isolation" == "docker" ]]; then
+    docker_deps=$'\nAfter=docker.service\nRequires=docker.service'
+  fi
+
   info "Writing systemd service $SERVICE_NAME..."
   cat > "/etc/systemd/system/$SERVICE_NAME.service" << EOF
 [Unit]
 Description=DROP Platform
-After=network.target
+After=network.target${docker_deps}
 
 [Service]
 Type=simple
@@ -302,9 +358,9 @@ User=$DROP_USER
 WorkingDirectory=$INSTALL_DIR
 Environment=NODE_ENV=production
 Environment=DROP_ROOT=$DROP_ROOT
-# Optional domain/HTTPS config (DROP_DOMAIN_SUFFIX, DROP_ENABLE_HTTPS,
-# DROP_ACME_EMAIL). The leading '-' makes it optional; systemd re-reads it on
-# every start, so deploys pick up config changes without a daemon-reload.
+# Optional domain/HTTPS/isolation config. The leading '-' makes it optional;
+# systemd re-reads it on every start, so deploys pick up config changes
+# without a daemon-reload.
 EnvironmentFile=-$ENV_FILE
 ExecStart=$node_bin $INSTALL_DIR/dist/index.js serve
 Restart=on-failure
@@ -343,6 +399,7 @@ if $BOOTSTRAP; then
   ensure_postgres
   ensure_user
   ensure_build_tools
+  [[ "$ISOLATION" == "docker" ]] && ensure_docker
   ensure_root_dir
   seed_deploy_key
   # CI (deploy.yml) untars the build artifact into $INSTALL_DIR and runs
@@ -366,9 +423,17 @@ if $BOOTSTRAP; then
   fi
 elif $PROVISION; then
   info "Provisioning system (Caddy, unit, env, apex route)..."
+  [[ "$ISOLATION" == "docker" ]] && ensure_docker
   provision_system
   info "Restarting $SERVICE_NAME..."
   systemctl restart "$SERVICE_NAME"
+  # If Docker was just installed or the drop user was just added to the docker
+  # group, the running service process won't have the group yet. A restart picks
+  # up the new group membership since systemd respects it on exec.
+  if [[ "$ISOLATION" == "docker" ]]; then
+    info "Restarting $SERVICE_NAME to pick up docker group membership..."
+    systemctl restart "$SERVICE_NAME"
+  fi
   info "Provision complete."
 elif $UPGRADE; then
   info "Upgrading DROP..."
@@ -384,6 +449,7 @@ else
   ensure_postgres
   ensure_user
   ensure_build_tools
+  [[ "$ISOLATION" == "docker" ]] && ensure_docker
   ensure_root_dir
   fetch_code
   build_drop
