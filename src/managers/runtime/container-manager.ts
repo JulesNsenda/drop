@@ -192,10 +192,9 @@ export class ContainerManager implements AppRuntime {
         // Bounded restart: cap at 5 retries to prevent OOM-looping apps from
         // thrashing the box.  'unless-stopped' has no cap and can overwhelm a
         // 4 GB server with a crash-looping app.
-        RestartPolicy: {
-          Name: spec.autorestart === false ? 'no' : 'on-failure',
-          MaximumRetryCount: 5,
-        },
+        RestartPolicy: spec.autorestart === false
+          ? { Name: 'no' }
+          : { Name: 'on-failure', MaximumRetryCount: 5 },
         Mounts: mounts,
       },
       ExposedPorts: { [`${hostPort}/tcp`]: {} },
