@@ -250,15 +250,41 @@ export class DatabaseProvisioner {
   /**
    * Get environment variables for an app's database connection.
    *
-   * When `pgHost` is provided (e.g. `'host-gateway'` for Docker mode) the host
-   * portion of every connection string is substituted so that containerised apps
-   * can reach the bundled PostgreSQL on the host rather than resolving
-   * `localhost` inside their own network namespace.
+   * - Default (no opts): loopback TCP connection — for PM2 mode.
+   * - `pgSocketDir`: unix-socket connection via a bind-mounted socket directory
+   *   — for Docker isolation mode.  libpq treats a PGHOST value containing '/'
+   *   as a socket directory rather than a hostname.
+   * - `pgHost` (legacy): substitute a different hostname in the TCP URL.
    */
-  getEnvVars(appName: string, opts?: { pgHost?: string }): Record<string, string> | null {
+  getEnvVars(
+    appName: string,
+    opts?: { pgHost?: string; pgSocketDir?: string }
+  ): Record<string, string> | null {
     const creds = this.getAppCredentials(appName);
     if (!creds) {
       return null;
+    }
+
+    if (opts?.pgSocketDir) {
+      const socketDir = opts.pgSocketDir;
+      // libpq socket URL: postgresql://user:pw/dbname?host=<socketDir>&port=<port>
+      const pw = encodeURIComponent(creds.password);
+      const connectionString =
+        `postgresql://${creds.user}:${pw}/${creds.database}` +
+        `?host=${encodeURIComponent(socketDir)}&port=${creds.port}`;
+      return {
+        DATABASE_URL: connectionString,
+        PGHOST: socketDir,
+        PGPORT: creds.port.toString(),
+        PGDATABASE: creds.database,
+        PGUSER: creds.user,
+        PGPASSWORD: creds.password,
+        DB_HOST: socketDir,
+        DB_PORT: creds.port.toString(),
+        DB_NAME: creds.database,
+        DB_USER: creds.user,
+        DB_PASSWORD: creds.password,
+      };
     }
 
     const host = opts?.pgHost ?? creds.host;

@@ -114,6 +114,39 @@ describe('DatabaseProvisioner.getEnvVars', () => {
   it('returns null with pgHost opt when app is unknown', () => {
     expect(provisioner.getEnvVars('ghost', { pgHost: 'host-gateway' })).toBeNull();
   });
+
+  it('returns socket-based DATABASE_URL when pgSocketDir is provided', () => {
+    injectCredentials(provisioner, 'myapp');
+    const vars = provisioner.getEnvVars('myapp', { pgSocketDir: '/var/drop/data/db/pgdata' });
+
+    expect(vars).not.toBeNull();
+    // PGHOST must be the socket dir so libpq uses a unix domain socket.
+    expect(vars!['PGHOST']).toBe('/var/drop/data/db/pgdata');
+    expect(vars!['DB_HOST']).toBe('/var/drop/data/db/pgdata');
+    // DATABASE_URL must NOT contain a TCP host (@hostname:) — it uses the
+    // ?host=<socketDir> query param form that libpq understands.
+    expect(vars!['DATABASE_URL']).not.toContain('@localhost:');
+    expect(vars!['DATABASE_URL']).toContain('?host=');
+    expect(vars!['DATABASE_URL']).toContain('5433');
+  });
+
+  it('socket DATABASE_URL preserves user, password, port, dbname', () => {
+    injectCredentials(provisioner, 'myapp');
+    const vars = provisioner.getEnvVars('myapp', { pgSocketDir: '/var/drop/data/db/pgdata' });
+
+    // Parse only the non-query part (user:pw/db)
+    const url = vars!['DATABASE_URL'];
+    expect(url).toContain('drop_myapp_user:');
+    expect(url).toContain('/drop_myapp');
+    expect(vars!['PGPORT']).toBe('5433');
+    expect(vars!['PGUSER']).toBe('drop_myapp_user');
+    expect(vars!['PGPASSWORD']).toBe('testpassword');
+    expect(vars!['PGDATABASE']).toBe('drop_myapp');
+  });
+
+  it('returns null with pgSocketDir opt when app is unknown', () => {
+    expect(provisioner.getEnvVars('ghost', { pgSocketDir: '/var/drop/data/db/pgdata' })).toBeNull();
+  });
 });
 
 describe('DatabaseProvisioner.provisionAppDatabase — REVOKE FROM PUBLIC', () => {

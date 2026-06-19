@@ -82,6 +82,13 @@ export interface AppStartSpec {
    * - PM2 mode: platform prober polls this path and restarts on failure.
    */
   healthCheckPath?: string;
+  /**
+   * Absolute path to the Postgres unix-domain socket directory on the host.
+   * When set (docker isolation mode) the container runtime bind-mounts this
+   * directory read-only at the same absolute path inside the container so the
+   * app can reach the bundled Postgres without TCP.
+   */
+  pgSocketDir?: string;
 }
 
 /**

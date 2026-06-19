@@ -22,6 +22,12 @@ export interface PostgresServerConfig {
   port?: number;
   /** Callback for log messages */
   onLog?: (message: string) => void;
+  /**
+   * When true, a failure in secureSuperuser() throws instead of just logging.
+   * Required in docker isolation mode — a trust pg_hba with socket-mounted
+   * Postgres gives containers unauthenticated superuser access.
+   */
+  strictSecure?: boolean;
 }
 
 export type ServerStatus = 'stopped' | 'starting' | 'running' | 'stopping' | 'error';
@@ -52,6 +58,19 @@ export class PostgresServer {
       throw new Error('PostgreSQL superuser password not resolved (server not started)');
     }
     return this.superuserPassword;
+  }
+
+  /**
+   * Absolute path to the directory where the Postgres unix-domain socket file
+   * lives, or null on Windows (sockets not used there).
+   *
+   * DROP starts Postgres with `-k <dataDir>` so the socket file is
+   * `<dataDir>/.s.PGSQL.<port>`.  Containers bind-mount this directory to
+   * reach Postgres without TCP.
+   */
+  getSocketDir(): string | null {
+    if (process.platform === 'win32' || !this.paths) return null;
+    return this.paths.dataDir;
   }
 
   /** Pool config for a superuser connection to the given database. */
@@ -161,10 +180,13 @@ export class PostgresServer {
 
   /**
    * Give the superuser a password and migrate pg_hba from trust to
-   * scram-sha-256. Safe to run repeatedly and on a live server: the password
-   * is set first (while trust still permits the connection), then pg_hba is
-   * flipped and reloaded. Best-effort — a failure here must not take the
-   * platform down, but it is logged loudly.
+   * scram-sha-256 (both TCP and unix-socket lines).  Safe to run repeatedly
+   * and on a live server: the password is set first (while trust still permits
+   * the connection), then pg_hba is flipped and reloaded.
+   *
+   * When `strictSecure` is true (required in docker mode) this method throws
+   * on failure instead of just logging — a trust pg_hba with the Postgres
+   * socket bind-mounted into containers gives unauthenticated superuser access.
    */
   private async secureSuperuser(): Promise<void> {
     if (!this.paths || !this.pool || !this.superuserPassword) return;
@@ -185,10 +207,23 @@ export class PostgresServer {
         });
         this.log('Secured PostgreSQL superuser: password set, pg_hba migrated to scram-sha-256');
       }
+
+      // Post-migration assert: verify no trust lines remain.
+      const hbaAfter = await fs.readFile(hbaPath, 'utf-8');
+      const trustLines = hbaAfter
+        .split('\n')
+        .filter((l) => !/^\s*#/.test(l) && /\btrust\b/.test(l));
+      if (trustLines.length > 0) {
+        throw new Error(
+          `pg_hba.conf still contains trust lines after migration: ${trustLines.join(' | ')}`
+        );
+      }
     } catch (err) {
-      this.log(
-        `WARNING: failed to secure PostgreSQL superuser: ${err instanceof Error ? err.message : err}`
-      );
+      const msg = `Failed to secure PostgreSQL superuser: ${err instanceof Error ? err.message : err}`;
+      if (this.config.strictSecure) {
+        throw new Error(msg);
+      }
+      this.log(`WARNING: ${msg}`);
     }
   }
 
