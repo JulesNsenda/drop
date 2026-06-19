@@ -579,9 +579,16 @@ export class ContainerManager implements AppRuntime {
   }
 
   private isNotFoundOrNotRunning(err: unknown): boolean {
+    if (this.isNotFound(err)) return true;
+    if (!(err instanceof Error)) return false;
+    const msg = err.message;
+    // A container that already exited makes stop() a no-op. Docker surfaces this
+    // as "not running" or, when already stopped, HTTP 304 "container already
+    // stopped" — both mean the container is in the desired (stopped) state.
     return (
-      this.isNotFound(err) ||
-      (err instanceof Error && err.message.includes('not running'))
+      msg.includes('not running') ||
+      msg.includes('already stopped') ||
+      msg.includes('304')
     );
   }
 }
