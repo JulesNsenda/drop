@@ -51,6 +51,23 @@ async function pollStatus(
   );
 }
 
+// Poll an HTTP endpoint until it responds or the timeout expires. Needed
+// because Docker reports 'running' as soon as the process starts, but the
+// HTTP server inside may take a few ms more to bind.
+async function pollHttp(url: string, timeoutMs: number): Promise<Response> {
+  const deadline = Date.now() + timeoutMs;
+  let lastErr: unknown;
+  while (Date.now() < deadline) {
+    try {
+      return await fetch(url);
+    } catch (err) {
+      lastErr = err;
+      await new Promise((r) => setTimeout(r, 200));
+    }
+  }
+  throw lastErr;
+}
+
 // A tiny HTTP server that immediately responds "hello-drop-smoke".
 const HELLO_SERVER_JS = `
 const http = require('http');
@@ -89,6 +106,9 @@ beforeEach(async () => {
   if (!dockerAvailable) return;
 
   tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'drop-smoke-'));
+  // mkdtemp creates with 0700 (owner-only). The container runs as uid 1000
+  // (node user) which differs from the CI runner uid — make it world-readable.
+  await fs.chmod(tmpDir, 0o755);
   await fs.writeFile(path.join(tmpDir, 'index.js'), HELLO_SERVER_JS);
 
   const logDir = path.join(tmpDir, 'logs');
@@ -144,8 +164,10 @@ describe('ContainerManager smoke test (requires Docker)', () => {
     // Wait until the container reports 'running'.
     await pollStatus(manager, SMOKE_APP, 'running', 30_000);
 
-    // Verify the app is actually serving HTTP.
-    const res = await fetch(`http://127.0.0.1:${port}/`);
+    // Verify the app is actually serving HTTP. Use pollHttp rather than a
+    // single fetch — Docker marks the container 'running' before the HTTP
+    // server inside has bound, so a bare fetch can ECONNREFUSED on slow hosts.
+    const res = await pollHttp(`http://127.0.0.1:${port}/`, 10_000);
     expect(res.status).toBe(200);
     const body = await res.text();
     expect(body).toBe('hello-drop-smoke');
