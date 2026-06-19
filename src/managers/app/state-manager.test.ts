@@ -22,7 +22,7 @@ describe('AppStateManager', () => {
   afterEach(async () => {
     await manager.close();
     resetStateManager();
-    await fs.rm(tempDir, { recursive: true, force: true });
+    await fs.rm(tempDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   });
 
   describe('initialize', () => {
@@ -338,7 +338,7 @@ describe('getStateManager singleton', () => {
 
   afterEach(async () => {
     resetStateManager();
-    await fs.rm(tempDir, { recursive: true, force: true });
+    await fs.rm(tempDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   });
 
   it('should throw if no config provided on first call', () => {

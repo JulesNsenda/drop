@@ -43,7 +43,7 @@ describe('ApiServer', () => {
       await server.stop();
     }
     jest.restoreAllMocks();
-    await fs.rm(tempDir, { recursive: true, force: true });
+    await fs.rm(tempDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   });
 
   describe('constructor', () => {

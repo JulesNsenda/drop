@@ -69,7 +69,7 @@ describe('DatabaseProvisioner.getEnvVars', () => {
   });
 
   afterEach(async () => {
-    await fs.rm(dropRoot, { recursive: true, force: true });
+    await fs.rm(dropRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   });
 
   it('returns null for an unknown app', () => {
@@ -166,7 +166,7 @@ describe('DatabaseProvisioner.provisionAppDatabase — REVOKE FROM PUBLIC', () =
   });
 
   afterEach(async () => {
-    await fs.rm(dropRoot, { recursive: true, force: true });
+    await fs.rm(dropRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
     jest.clearAllMocks();
   });
 

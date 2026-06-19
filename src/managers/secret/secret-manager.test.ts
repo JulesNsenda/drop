@@ -16,7 +16,7 @@ describe('SecretManager', () => {
   });
 
   afterEach(async () => {
-    await fs.rm(tmpDir, { recursive: true, force: true });
+    await fs.rm(tmpDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   });
 
   it('should set and get a secret', async () => {
@@ -141,7 +141,7 @@ describe('SecretManager', () => {
       await b.initialize();
       expect(b.get('app', 'K')).toBe('v');
 
-      await fs.rm(dir, { recursive: true, force: true });
+      await fs.rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
     });
 
     it('migrates a legacy (salt-derived) store to the external key and bumps to version 2', async () => {
@@ -166,7 +166,7 @@ describe('SecretManager', () => {
       const after = JSON.parse(await fs.readFile(store, 'utf-8'));
       expect(after.version).toBe(2);
 
-      await fs.rm(dir, { recursive: true, force: true });
+      await fs.rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
     });
   });
 });
