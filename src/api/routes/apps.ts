@@ -12,6 +12,7 @@ import { NotFoundError, ValidationError } from '../middleware/error';
 import { AuthContext, listUsers, getUserById } from '../middleware/auth';
 import { canAccess } from '../access';
 import { getAppRuntime } from '../../managers/runtime';
+import { getSecretManager } from '../../managers/secret';
 import { migrateAppRuntime } from '../../managers/runtime/runtime-migrator';
 import { getDiskFreeMb } from '../../utils/disk';
 import { getStateManager, AppState } from '../../managers/app/state-manager';
@@ -312,6 +313,13 @@ apps.delete('/:name', async (c) => {
 
   // Remove from state
   await stateManager.removeApp(name);
+
+  // Clean up secrets so a future same-named app doesn't inherit them
+  try {
+    await getSecretManager().deleteAll(name);
+  } catch {
+    // Secret manager may not be initialised (tests / early failures)
+  }
 
   // Remove app config (e.g. appconf/webapps/ezsign.yaml)
   try {

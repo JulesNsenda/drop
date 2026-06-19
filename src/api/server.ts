@@ -161,7 +161,7 @@ export class ApiServer {
       v1.use('/usage', authMiddleware('readonly'));
       v1.use('/logs/*', authMiddleware('readonly'));
       v1.use('/certs/*', authMiddleware('readonly'));
-      v1.use('/secrets/*', authMiddleware('admin'));
+      v1.use('/secrets/*', authMiddleware('user'));
       v1.use('/webhooks/*', authMiddleware('admin'));
       v1.use('/git/deploy', authMiddleware('user'));
       v1.use('/git/redeploy/*', authMiddleware('user'));
