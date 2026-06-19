@@ -206,4 +206,13 @@ describe('getAppRuntime singleton', () => {
     getAppRuntime('pm2');
     expect(() => getAppRuntime('docker')).toThrow(/already initialized/);
   });
+
+  it('returns the active runtime for a no-arg call regardless of type', () => {
+    // The platform initializes as docker; API/CLI consumers call with no arg
+    // and must get the active runtime instead of being coerced to pm2 (which
+    // previously threw "already initialized as 'docker'").
+    getAppRuntime('docker');
+    const runtime = getAppRuntime();
+    expect(runtime.type).toBe('docker');
+  });
 });
