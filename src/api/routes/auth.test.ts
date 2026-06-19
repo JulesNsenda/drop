@@ -101,7 +101,7 @@ describe('Auth Routes', () => {
 
   afterEach(async () => {
     jest.restoreAllMocks();
-    await fs.rm(tempDir, { recursive: true, force: true });
+    await fs.rm(tempDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   });
 
   describe('POST /auth/login', () => {

@@ -142,7 +142,7 @@ afterEach(async () => {
   }
 
   if (dirToClean) {
-    await fs.rm(dirToClean, { recursive: true, force: true });
+    await fs.rm(dirToClean, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }
   // Generous hook timeout: container stop/remove + fs cleanup can exceed Jest's
   // 5s hook default, which would abandon this hook mid-run and race the next test.

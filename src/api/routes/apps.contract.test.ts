@@ -95,7 +95,7 @@ describe('GET /api/v1/apps/:name DTO contract', () => {
     await getStateManager().close();
     resetStateManager();
     jest.restoreAllMocks();
-    await fs.rm(tempDir, { recursive: true, force: true });
+    await fs.rm(tempDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   });
 
   it('status is the DROP enum value, not a PM2 native string', async () => {
@@ -195,7 +195,7 @@ describe('GET /api/v1/apps list DTO contract', () => {
     await getStateManager().close();
     resetStateManager();
     jest.restoreAllMocks();
-    await fs.rm(tempDir, { recursive: true, force: true });
+    await fs.rm(tempDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   });
 
   it('non-admin only sees their own apps', async () => {

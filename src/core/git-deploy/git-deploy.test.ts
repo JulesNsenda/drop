@@ -91,7 +91,7 @@ describe('GitDeployService', () => {
     resetStateManager();
     resetSecretManager();
     try {
-      await fs.rm(tempDir, { recursive: true, force: true });
+      await fs.rm(tempDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
     } catch {
       // ignore
     }

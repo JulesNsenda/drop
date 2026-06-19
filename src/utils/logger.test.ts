@@ -25,7 +25,7 @@ describe('Logger', () => {
     resetLogger();
     jest.restoreAllMocks();
     try {
-      fs.rmSync(tempDir, { recursive: true, force: true });
+      fs.rmSync(tempDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
     } catch {
       // Ignore cleanup errors
     }

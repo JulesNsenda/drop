@@ -52,7 +52,7 @@ describe('superuser-auth', () => {
     });
 
     afterEach(async () => {
-      await fs.rm(dropRoot, { recursive: true, force: true });
+      await fs.rm(dropRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
     });
 
     it('generates and persists a password on first call', async () => {

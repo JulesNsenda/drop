@@ -11,7 +11,7 @@ describe('atomic-write', () => {
   });
 
   afterEach(async () => {
-    await fs.rm(dir, { recursive: true, force: true });
+    await fs.rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   });
 
   it('writes file contents', async () => {
