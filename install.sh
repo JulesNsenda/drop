@@ -249,19 +249,37 @@ resolve_domain() {
   fi
 }
 
+# Resolve whether HTTPS is enabled: explicit --https flag wins, else read the
+# persisted DROP_ENABLE_HTTPS so --provision deploys keep the apex on the right
+# scheme/port.
+resolve_https() {
+  [[ "$ENABLE_HTTPS" == "true" ]] && return 0
+  if [[ -f "$ENV_FILE" ]] \
+    && [[ "$(sed -n 's|^DROP_ENABLE_HTTPS=||p' "$ENV_FILE" | tail -n1)" == "true" ]]; then
+    ENABLE_HTTPS=true
+  fi
+}
+
 # ── apex route: serve the DROP dashboard/API at the bare domain over HTTPS ─────
 # DROP imports hosts/*.caddy and never rewrites hand-managed files there, so this
 # persists. Apps are still served at <app>.<domain> via the domain suffix.
 ensure_apex_route() {
   resolve_domain
   [[ -z "$DOMAIN" ]] && return 0
+  resolve_https
+  # In HTTP-only mode bind the apex explicitly on :80 (http://). A bare hostname
+  # makes Caddy serve the site on :443, which has no certificate until HTTPS is
+  # enabled — so plain HTTP would never be served. With HTTPS on, the bare
+  # hostname lets Caddy auto-manage the cert and add the :80→:443 redirect.
+  local site="$DOMAIN"
+  [[ "$ENABLE_HTTPS" != "true" ]] && site="http://$DOMAIN"
   local hosts_dir="$DROP_ROOT/data/appconf/caddy/hosts"
-  info "Routing apex $DOMAIN → dashboard (localhost:$API_PORT)..."
+  info "Routing apex $site → dashboard (localhost:$API_PORT)..."
   mkdir -p "$hosts_dir"
   cat > "$hosts_dir/${DOMAIN}.caddy" <<EOF
 # Managed by install.sh — the apex domain serves the DROP dashboard/API.
 # Delete this file to stop routing $DOMAIN to the control plane.
-${DOMAIN} {
+${site} {
     encode gzip zstd
     reverse_proxy localhost:${API_PORT}
 }

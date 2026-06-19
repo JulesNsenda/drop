@@ -617,29 +617,37 @@ backup:
   }
 
   private async ensureCaddyfile(dataDir: string): Promise<void> {
-    let needsWrite = false;
+    // The managed Caddyfile is fully derived from config (global options + the
+    // fixed logging snippet + import lines). Regenerate whenever the on-disk
+    // content differs from what we'd produce now — this covers a missing file,
+    // a stale (pre-v2) config, AND config changes like toggling HTTPS or the
+    // ACME email. Per-app and host *.caddy files are separate imports and are
+    // never touched here, so a rewrite is safe. Comparing full content also
+    // avoids needless rewrites (and Caddy reloads) when nothing has changed.
+    const desired = this.buildCaddyfileContent(dataDir);
+    let existing: string | null = null;
     try {
-      const existing = await fs.readFile(this.config.caddyfilePath, 'utf-8');
-      // Regenerate if the version header is missing (stale v1 config)
-      if (!existing.startsWith(this.CADDYFILE_VERSION)) {
-        this.logger.info(
-          'Upgrading Caddyfile to v2 (version header missing — stale config detected)',
-          'CADDY'
-        );
-        needsWrite = true;
-      }
+      existing = await fs.readFile(this.config.caddyfilePath, 'utf-8');
     } catch {
-      // File doesn't exist yet
-      needsWrite = true;
+      // File doesn't exist yet — will be written below.
     }
 
-    if (needsWrite) {
-      try {
-        await fs.writeFile(this.config.caddyfilePath, this.buildCaddyfileContent(dataDir), 'utf-8');
-        this.logger.info(`Caddyfile written at ${this.config.caddyfilePath}`, 'CADDY');
-      } catch (error) {
-        this.logger.warn('Failed to write Caddyfile', 'CADDY', error);
-      }
+    if (existing === desired) {
+      return;
+    }
+
+    if (existing !== null && !existing.startsWith(this.CADDYFILE_VERSION)) {
+      this.logger.info(
+        'Upgrading Caddyfile to v2 (stale config detected)',
+        'CADDY'
+      );
+    }
+
+    try {
+      await fs.writeFile(this.config.caddyfilePath, desired, 'utf-8');
+      this.logger.info(`Caddyfile written at ${this.config.caddyfilePath}`, 'CADDY');
+    } catch (error) {
+      this.logger.warn('Failed to write Caddyfile', 'CADDY', error);
     }
   }
 
