@@ -41,23 +41,29 @@ export async function resolveSuperuserPassword(dropRoot: string): Promise<string
   return password;
 }
 
-/** True if any `host` (TCP) line in pg_hba still uses the `trust` method. */
+/**
+ * True if any `host` (TCP) or `local` (unix-socket) line in pg_hba still
+ * uses the `trust` method.
+ *
+ * We also migrate `local` lines because containerised apps access Postgres via
+ * the bind-mounted unix socket; leaving them trusted would let any container
+ * holding the socket mount connect as any user without a password.
+ */
 export function hbaNeedsMigration(content: string): boolean {
   return content
     .split('\n')
-    .some((line) => /^\s*host\b/.test(line) && /\btrust\b/.test(line));
+    .some((line) => /^\s*(host|local)\b/.test(line) && /\btrust\b/.test(line));
 }
 
 /**
  * Return pg_hba content with `trust` replaced by `scram-sha-256` on every
- * `host` (TCP) line. `local` (unix-socket) lines are left untouched — they are
- * gated by OS permissions and the platform connects over TCP anyway.
+ * `host` (TCP) and `local` (unix-socket) line.
  */
 export function toScramHbaConf(content: string): string {
   return content
     .split('\n')
     .map((line) => {
-      if (/^\s*host\b/.test(line) && /\btrust\b/.test(line)) {
+      if (/^\s*(host|local)\b/.test(line) && /\btrust\b/.test(line)) {
         return line.replace(/\btrust\b/, 'scram-sha-256');
       }
       return line;

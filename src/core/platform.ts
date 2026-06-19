@@ -9,10 +9,10 @@ import * as path from 'path';
 import * as fs from 'fs/promises';
 import { EventBus, eventBus, Unsubscribe } from './event-bus';
 import { WatcherService } from './watcher';
-import { DetectorService, getDetector, parseDropYaml } from './detector';
+import { DetectorService, getDetector, parseDropYaml, DetectionResult } from './detector';
 import { BuilderService, getBuilder } from './builder';
 import { RouterService, getRouterService, resetRouterService } from './router';
-import { AppRuntime, getAppRuntime, resetAppRuntime } from '../managers/runtime';
+import { AppRuntime, AppStartSpec, getAppRuntime, resetAppRuntime } from '../managers/runtime';
 import { AppStateManager, getStateManager, resetStateManager } from '../managers/app/state-manager';
 import { AppConfigService, getAppConfigService, resetAppConfigService } from '../managers/app/app-config';
 import { PostgresServer, getPostgresServer, resetPostgresServer, DatabaseProvisioner } from '../managers/database';
@@ -99,6 +99,14 @@ export interface PlatformConfig {
   maxConcurrentBuilds: number;
   /** Max disk usage per app directory in MB (0 = unlimited). */
   maxDiskMbPerApp: number;
+  /**
+   * Global cap on concurrently running apps (0 = unlimited).
+   * In docker mode on a 4 GB server, each app container uses ~256 MB by
+   * default, so 10 apps fills ~2.5 GB — set this to prevent OOM thrashing.
+   * Default 0 (unlimited) for PM2 mode; set DROP_MAX_CONCURRENT_APPS in
+   * drop.env when running with docker isolation.
+   */
+  maxConcurrentApps: number;
 }
 
 // Determine platform-appropriate defaults
@@ -134,6 +142,7 @@ const DEFAULT_CONFIG: PlatformConfig = {
   maxDbsPerUser: parseInt(process.env.DROP_MAX_DBS_PER_USER || '3', 10),
   maxConcurrentBuilds: parseInt(process.env.DROP_MAX_CONCURRENT_BUILDS || '3', 10),
   maxDiskMbPerApp: parseInt(process.env.DROP_MAX_DISK_MB_PER_APP || '0', 10),
+  maxConcurrentApps: parseInt(process.env.DROP_MAX_CONCURRENT_APPS || '0', 10),
 };
 
 export class DropPlatform {
@@ -640,6 +649,9 @@ backup:
     this.postgresServer = getPostgresServer({
       dropRoot: this.config.dropRoot,
       onLog: (msg) => this.logger.debug(msg, 'POSTGRES'),
+      // In docker mode the socket is bind-mounted into containers; a trust
+      // pg_hba would give containers unauthenticated superuser access.
+      strictSecure: this.config.isolation === 'docker',
     });
 
     await this.postgresServer.ensureReady((msg) => {
@@ -715,8 +727,8 @@ backup:
     const buildLogsDir = path.join(this.config.dropRoot, 'data', 'logs', 'builds');
     this.buildLogService = getBuildLogService(buildLogsDir);
 
-    // Initialize the app runtime (PM2 today; Docker arrives with PRD-029)
-    this.runtime = getAppRuntime();
+    // Initialize the app runtime — docker when isolation=docker, PM2 otherwise.
+    this.runtime = getAppRuntime(this.config.isolation === 'docker' ? 'docker' : 'pm2');
 
     // Load used ports from existing PM2 processes
     await this.loadUsedPorts();
@@ -1266,6 +1278,19 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     }
 
     try {
+      // Capacity guard: reject the deploy if the global running-app cap is reached.
+      if (this.config.maxConcurrentApps > 0 && this.stateManager) {
+        const runningCount = this.stateManager.getAllApps().filter(
+          (a) => a.status === 'running' || a.status === 'starting'
+        ).length;
+        if (runningCount >= this.config.maxConcurrentApps) {
+          throw new Error(
+            `App capacity reached (${runningCount}/${this.config.maxConcurrentApps} running). ` +
+            `Stop an existing app before deploying a new one, or increase DROP_MAX_CONCURRENT_APPS.`
+          );
+        }
+      }
+
       const detection = await this.detector.detect(appPath);
       const port = this.allocatePort(appName);
 
@@ -1276,59 +1301,16 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       const dataDir = await this.ensureAppDataDirectory(appName);
       this.logger.info(`Data directory: ${dataDir}`, 'DATA');
 
-      // Determine start command based on app type and isolation mode.
-      let script: string;
-      let interpreter: string | undefined;
-      let args: string[] | undefined;
-
-      if (detection.type === 'static' || detection.type === 'spa') {
-        if (this.config.isolation === 'docker') {
-          // In docker mode, nginx:alpine serves the built output.  Write a
-          // custom nginx.conf to the data dir (mounted read-write inside the
-          // container at the same path) and copy it on container start.
-          const outputSubdir = detection.suggestedConfig?.outputDirectory || '';
-          const nginxConf = buildNginxConf(port, outputSubdir);
-          const nginxConfPath = path.join(dataDir, 'nginx.conf');
-          await fs.writeFile(nginxConfPath, nginxConf, 'utf-8');
-          this.logger.info(`Wrote nginx.conf for ${appName} → port ${port}`, 'STATIC');
-
-          script = '/bin/sh';
-          interpreter = 'none';
-          args = [
-            '-c',
-            `cp ${nginxConfPath} /etc/nginx/conf.d/default.conf && nginx -g 'daemon off;'`,
-          ];
-        } else {
-          // PM2 mode: use the bundled Node.js static server.
-          const serveDir = path.join(appPath, detection.suggestedConfig?.outputDirectory || '.');
-          const fsSync = require('fs');
-          const distPath = path.join(__dirname, '..', '..', 'dist', 'core', 'static-server.js');
-          const localPath = path.join(__dirname, 'static-server.js');
-          script = fsSync.existsSync(localPath) ? localPath : fsSync.existsSync(distPath) ? distPath : localPath;
-          args = [serveDir, '-s']; // -s for SPA mode
-        }
-      } else if (detection.type === 'go') {
-        // Go apps run as compiled binaries
-        const startCommand = detection.suggestedConfig?.startCommand || `./${appName}`;
-        script = startCommand;
-        interpreter = 'none'; // No interpreter - run binary directly
-      } else {
-        // For Node.js/Python apps, the detector returns "node <file>" or "python <file>" format
-        const startCommand = detection.suggestedConfig?.startCommand || 'node index.js';
-
-        if (startCommand.startsWith('node ')) {
-          // Extract the script file from "node <file>"
-          script = startCommand.substring(5); // Remove "node " prefix
-        } else {
-          script = startCommand;
-        }
-      }
-
-      // Check if app needs a database and provision one
+      // Check if app needs a database and provision one.
       let dbEnvVars: Record<string, string> = {};
       const needsDb = await this.appNeedsDatabase(appPath, detection.suggestedConfig?.database);
       if (this.dbProvisioner && needsDb) {
-        // Enforce per-user DB quota before provisioning
+        const pgSocketDir =
+          this.config.isolation === 'docker'
+            ? (this.postgresServer?.getSocketDir() ?? undefined)
+            : undefined;
+        const dbOpts = pgSocketDir ? { pgSocketDir } : undefined;
+
         const appState = this.stateManager?.getApp(appName);
         const ownerUserId = appState?.userId;
         if (ownerUserId && this.config.maxDbsPerUser > 0) {
@@ -1345,63 +1327,19 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           } else {
             this.logger.info(`Provisioning database for ${appName}...`, 'DATABASE');
             const dbCreds = await this.dbProvisioner.provisionAppDatabase(appName);
-            dbEnvVars = this.dbProvisioner.getEnvVars(appName, {
-              pgHost: this.config.isolation === 'docker' ? 'host-gateway' : undefined,
-            }) || {};
+            dbEnvVars = this.dbProvisioner.getEnvVars(appName, dbOpts) || {};
             this.logger.info(`Database provisioned: ${dbCreds.database}`, 'DATABASE');
           }
         } else {
           this.logger.info(`Provisioning database for ${appName}...`, 'DATABASE');
           const dbCreds = await this.dbProvisioner.provisionAppDatabase(appName);
-          dbEnvVars = this.dbProvisioner.getEnvVars(appName, {
-            pgHost: this.config.isolation === 'docker' ? 'host-gateway' : undefined,
-          }) || {};
+          dbEnvVars = this.dbProvisioner.getEnvVars(appName, dbOpts) || {};
           this.logger.info(`Database provisioned: ${dbCreds.database}`, 'DATABASE');
         }
       }
 
-      // Resolve dependencies from drop.yaml
-      const depEnvVars = await this.resolveDependencies(appPath, appName);
-
-      // For static apps, generate drop-config.js with dependency URLs
-      if ((detection.type === 'static' || detection.type === 'spa') && Object.keys(depEnvVars).length > 0) {
-        await this.generateStaticConfig(appPath, depEnvVars);
-      }
-
-      // Load encrypted secrets for this app
-      let secretEnvVars: Record<string, string> = {};
-      if (this.secretManager && this.secretManager.hasSecrets(appName)) {
-        secretEnvVars = this.secretManager.getAll(appName);
-        this.logger.info(`Injecting ${Object.keys(secretEnvVars).length} secret(s)`, 'SECURITY');
-      }
-
-      // Read health check path from drop.yaml (optional)
-      const dropYamlForHealth = await parseDropYaml(appPath);
-      const healthCheckPath = dropYamlForHealth.success ? dropYamlForHealth.config?.healthCheck : undefined;
-
-      // Configure log files with dated filenames (auto-captured from stdout/stderr)
-      const { outFile, errorFile } = await this.getAppLogPaths(appName);
-
-      const status = await this.runtime.start({
-        name: appName,
-        script,
-        interpreter,
-        args,
-        cwd: appPath,
-        port,
-        outFile,
-        errorFile,
-        appType: detection.type,
-        healthCheckPath,
-        env: {
-          NODE_ENV: 'production',
-          PORT: port.toString(),
-          DROP_DATA_DIR: dataDir,
-          ...dbEnvVars,
-          ...depEnvVars,
-          ...secretEnvVars,
-        },
-      });
+      const spec = await this.buildStartSpec(appName, appPath, detection, port, dataDir, dbEnvVars);
+      const status = await this.runtime.start(spec);
 
       this.logger.appEvent('started', appName, `PID ${status.pid}, port ${port}`);
 
@@ -1427,8 +1365,8 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       this.appsInProgress.delete(appName);
 
       // Start health prober in PM2 mode (Docker uses its own HEALTHCHECK mechanism)
-      if (healthCheckPath && this.runtime?.type === 'pm2') {
-        this.startHealthProber(appName, port, healthCheckPath);
+      if (spec.healthCheckPath && this.runtime?.type === 'pm2') {
+        this.startHealthProber(appName, port, spec.healthCheckPath);
       }
     } catch (error) {
       this.logger.appEvent('error', appName, error instanceof Error ? error.message : 'Failed to start');
@@ -1642,64 +1580,24 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
 
       await this.stateManager.setAppStatus(appName, 'starting');
 
-      // Determine start command
-      let script: string;
-      let args: string[] | undefined;
-
-      if (detection.type === 'static' || detection.type === 'spa') {
-        const serveDir = path.join(appPath, detection.suggestedConfig?.outputDirectory || '.');
-        script = path.join(__dirname, 'static-server.js');
-        args = [serveDir, '-s'];
-      } else {
-        const startCommand = detection.suggestedConfig?.startCommand || 'node index.js';
-        script = startCommand.startsWith('node ') ? startCommand.substring(5) : startCommand;
-      }
-
       // Ensure data directory exists (preserved across upgrades)
       const dataDir = await this.ensureAppDataDirectory(appName);
 
-      // Get database env vars if needed
+      // Get env vars for an already-provisioned DB (no new provisioning on hot-reload).
       let dbEnvVars: Record<string, string> = {};
       if (this.dbProvisioner) {
-        dbEnvVars = this.dbProvisioner.getEnvVars(appName, {
-          pgHost: this.config.isolation === 'docker' ? 'host-gateway' : undefined,
-        }) || {};
+        const pgSocketDir =
+          this.config.isolation === 'docker'
+            ? (this.postgresServer?.getSocketDir() ?? undefined)
+            : undefined;
+        dbEnvVars = this.dbProvisioner.getEnvVars(
+          appName,
+          pgSocketDir ? { pgSocketDir } : undefined
+        ) || {};
       }
 
-      // Resolve dependencies
-      const depEnvVars = await this.resolveDependencies(appPath, appName);
-
-      // For static apps, regenerate drop-config.js
-      if ((detection.type === 'static' || detection.type === 'spa') && Object.keys(depEnvVars).length > 0) {
-        await this.generateStaticConfig(appPath, depEnvVars);
-      }
-
-      // Load encrypted secrets for this app
-      let secretEnvVars: Record<string, string> = {};
-      if (this.secretManager && this.secretManager.hasSecrets(appName)) {
-        secretEnvVars = this.secretManager.getAll(appName);
-      }
-
-      // Configure log files with dated filenames (auto-captured from stdout/stderr)
-      const { outFile, errorFile } = await this.getAppLogPaths(appName);
-
-      const status = await this.runtime.start({
-        name: appName,
-        script,
-        args,
-        cwd: appPath,
-        port,
-        outFile,
-        errorFile,
-        env: {
-          NODE_ENV: 'production',
-          PORT: port.toString(),
-          DROP_DATA_DIR: dataDir,
-          ...dbEnvVars,
-          ...depEnvVars,
-          ...secretEnvVars,
-        },
-      });
+      const spec = await this.buildStartSpec(appName, appPath, detection, port, dataDir, dbEnvVars);
+      const status = await this.runtime.start(spec);
 
       this.logger.appEvent('started', appName, `PID ${status.pid}, port ${port} (hot-reloaded)`);
 
@@ -1793,10 +1691,114 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
   }
 
   /**
-   * Get the log file paths for an app with today's date.
-   * Format: {appName}-YYYY-MM-DD-out.log and {appName}-YYYY-MM-DD-err.log
-   * Creates the log directory if it doesn't exist.
+   * Build the runtime-agnostic start specification for an app.  Called by both
+   * handleStartApp (on first deploy) and handleUpdateApp (on hot-reload) so the
+   * two paths can't drift apart.
+   *
+   * DB env vars are passed in by the caller: handleStartApp provisions the DB
+   * first and passes the resulting vars; handleUpdateApp fetches the existing
+   * vars for an already-provisioned DB.
    */
+  private async buildStartSpec(
+    appName: string,
+    appPath: string,
+    detection: DetectionResult,
+    port: number,
+    dataDir: string,
+    dbEnvVars: Record<string, string>
+  ): Promise<AppStartSpec> {
+    let script: string;
+    let interpreter: string | undefined;
+    let args: string[] | undefined;
+
+    if (detection.type === 'static' || detection.type === 'spa') {
+      if (this.config.isolation === 'docker') {
+        const outputSubdir = detection.suggestedConfig?.outputDirectory || '';
+        const nginxConf = buildNginxConf(port, outputSubdir);
+        const nginxConfPath = path.join(dataDir, 'nginx.conf');
+        await fs.writeFile(nginxConfPath, nginxConf, 'utf-8');
+        this.logger.info(`Wrote nginx.conf for ${appName} → port ${port}`, 'STATIC');
+
+        script = '/bin/sh';
+        interpreter = 'none';
+        args = [
+          '-c',
+          `cp ${nginxConfPath} /etc/nginx/conf.d/default.conf && nginx -g 'daemon off;'`,
+        ];
+      } else {
+        const serveDir = path.join(appPath, detection.suggestedConfig?.outputDirectory || '.');
+        // eslint-disable-next-line @typescript-eslint/no-require-imports
+        const fsSync = require('fs');
+        const distPath = path.join(__dirname, '..', '..', 'dist', 'core', 'static-server.js');
+        const localPath = path.join(__dirname, 'static-server.js');
+        script = fsSync.existsSync(localPath)
+          ? localPath
+          : fsSync.existsSync(distPath)
+          ? distPath
+          : localPath;
+        args = [serveDir, '-s'];
+      }
+    } else if (detection.type === 'go') {
+      const startCommand = detection.suggestedConfig?.startCommand || `./${appName}`;
+      script = startCommand;
+      interpreter = 'none';
+    } else {
+      const startCommand = detection.suggestedConfig?.startCommand || 'node index.js';
+      script = startCommand.startsWith('node ')
+        ? startCommand.substring(5)
+        : startCommand;
+    }
+
+    const depEnvVars = await this.resolveDependencies(appPath, appName);
+
+    if (
+      (detection.type === 'static' || detection.type === 'spa') &&
+      Object.keys(depEnvVars).length > 0
+    ) {
+      await this.generateStaticConfig(appPath, depEnvVars);
+    }
+
+    let secretEnvVars: Record<string, string> = {};
+    if (this.secretManager && this.secretManager.hasSecrets(appName)) {
+      secretEnvVars = this.secretManager.getAll(appName);
+      this.logger.info(`Injecting ${Object.keys(secretEnvVars).length} secret(s)`, 'SECURITY');
+    }
+
+    const dropYaml = await parseDropYaml(appPath);
+    const healthCheckPath = dropYaml.success ? dropYaml.config?.healthCheck : undefined;
+
+    const { outFile, errorFile } = await this.getAppLogPaths(appName);
+
+    // In docker mode, pass the Postgres socket dir so ContainerManager can
+    // bind-mount it; containers connect via unix socket instead of TCP.
+    const pgSocketDir =
+      this.config.isolation === 'docker'
+        ? (this.postgresServer?.getSocketDir() ?? undefined)
+        : undefined;
+
+    return {
+      name: appName,
+      script,
+      interpreter,
+      args,
+      cwd: appPath,
+      port,
+      outFile,
+      errorFile,
+      appType: detection.type,
+      healthCheckPath,
+      pgSocketDir,
+      env: {
+        NODE_ENV: 'production',
+        PORT: port.toString(),
+        DROP_DATA_DIR: dataDir,
+        ...dbEnvVars,
+        ...depEnvVars,
+        ...secretEnvVars,
+      },
+    };
+  }
+
   private async getAppLogPaths(appName: string): Promise<{ outFile: string; errorFile: string; logDir: string }> {
     const logDir = path.join(this.config.dropRoot, 'data', 'logs', 'webapps', appName);
 
@@ -1842,6 +1844,22 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         if ((error as NodeJS.ErrnoException).code !== 'EEXIST') {
           this.logger.debug(`Failed to create ${subdir} subdirectory for ${appName}`, 'DATA');
         }
+      }
+    }
+
+    // In docker isolation mode the container runs as a non-root user (e.g. UID
+    // 1000 'node' in node:20-slim).  Make the data dir world-writable so the
+    // container user can write to it without a chown step.  This is acceptable
+    // because the dir is only bind-mounted into this app's own container; Tier B
+    // will tighten this with explicit UID alignment.
+    if (this.config.isolation === 'docker') {
+      try {
+        await fs.chmod(dataDir, 0o777);
+        for (const subdir of commonSubdirs) {
+          await fs.chmod(path.join(dataDir, subdir), 0o777).catch(() => {});
+        }
+      } catch {
+        this.logger.warn(`Could not chmod data directory for ${appName}`, 'DATA');
       }
     }
 
