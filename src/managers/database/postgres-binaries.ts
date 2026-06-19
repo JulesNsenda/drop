@@ -221,7 +221,11 @@ export class PostgresBinaries {
     const configPath = path.join(paths.dataDir, 'postgresql.conf');
     const configAdditions = `
 # DROP Platform Configuration
-listen_addresses = '*'
+# Loopback-only by default: the bundled Postgres must never be reachable from the
+# public interface. Apps in the default (PM2) mode connect over 127.0.0.1. If
+# Docker container isolation is enabled, widen this to the Docker bridge CIDR
+# (e.g. '127.0.0.1,172.17.0.1') — never back to '*'.
+listen_addresses = '127.0.0.1'
 port = 5433
 max_connections = 100
 shared_buffers = 128MB
