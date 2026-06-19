@@ -61,7 +61,10 @@ describe('app route authorization', () => {
     await getStateManager().close();
     resetStateManager();
     jest.restoreAllMocks();
-    await fs.rm(tempDir, { recursive: true, force: true });
+    // recursive rm doesn't retry ENOTEMPTY by default; a lagging async write
+    // (e.g. the auth credentials flush) can land mid-rm and lose the race on
+    // CI. maxRetries makes cleanup robust to that without chasing every writer.
+    await fs.rm(tempDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   });
 
   it("hides another user's app on GET (404)", async () => {
