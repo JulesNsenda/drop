@@ -336,7 +336,11 @@ describe('CaddyServer', () => {
         'http://localhost:2019/load',
         expect.objectContaining({
           method: 'POST',
-          headers: { 'Content-Type': 'text/caddyfile' },
+          // Origin is required so Caddy 2.11+ doesn't 403 the admin API call.
+          headers: {
+            'Content-Type': 'text/caddyfile',
+            Origin: 'http://localhost:2019',
+          },
           body: '# Test config',
         })
       );
