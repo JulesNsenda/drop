@@ -1,0 +1,13 @@
+{
+  "name": "drop-waitlist",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Beta waitlist for DROP — deployed on DROP itself. Zero dependencies.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
