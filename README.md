@@ -37,25 +37,36 @@ A lightweight, self-hosted Platform as a Service (PaaS) engineered for the "drop
 
 ### 1. Install
 
-**Linux / macOS**
+> The repository is **private**, so the old public `curl … | sudo bash`
+> one-liner no longer works (the raw URL 404s without auth). Use the owner
+> bootstrap below instead.
+
+**Server bootstrap (owner / operator)**
+
+A freshly-provisioned box is brought up in two parts: a one-time `--bootstrap`
+that installs the system dependencies, and the GitHub Actions pipeline
+(`.github/workflows/deploy.yml`) that ships and runs the built code on every push.
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/JulesNsenda/drop/main/install.sh \
-  | sudo bash
+# From your laptop (you have the repo checked out — no GitHub token needed):
+scp install.sh root@<NEW_IP>:/tmp/install.sh
+ssh root@<NEW_IP> "bash /tmp/install.sh --bootstrap --domain=dropkit.sh \
+    --deploy-pubkey='$(cat drop-deploy.pub)'"
+#   add --https --acme-email=you@example.com on a later run, once HTTP works
 ```
 
-This installs Node.js 20 if needed, clones the repo to `/opt/drop`, builds the
-server, and registers a `drop-platform` systemd service.
+`--bootstrap` installs Node.js 20, PostgreSQL, Caddy, a C toolchain (for native
+deps), creates the `drop` user + `/opt/drop`, seeds the CI deploy key into
+`authorized_keys`, and registers the `drop-platform` systemd service **without**
+fetching or starting any code. Then set the `hetzner`-environment secrets
+(`DEPLOY_HOST`, `DEPLOY_USER=drop`, `DEPLOY_KEY_B64`) and push — CI builds the
+server + dashboard, scps the artifact, and starts the service.
 
-**Windows**
+Full step-by-step (DNS, firewall, deploy keypair, HTTPS) lives in
+`docs/plans/2026-06-19-one-command-bootstrap.md`.
 
-```bat
-curl -fsSL https://raw.githubusercontent.com/JulesNsenda/drop/main/install.bat -o install.bat
-install.bat
-```
-
-Or download `install.bat` from the repo root and run it. It checks for Node.js
-20+ and Git, clones the repo, builds, and links the `drop` CLI.
+> **Windows** (`install.bat`) does not yet support the private repo — clone with
+> your own credentials and run a manual/dev install for now.
 
 **Development / manual install**
 
