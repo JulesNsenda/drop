@@ -69,12 +69,16 @@ async function pollHttp(url: string, timeoutMs: number): Promise<Response> {
 }
 
 // A tiny HTTP server that immediately responds "hello-drop-smoke".
+// Handles SIGTERM so `docker stop` shuts it down immediately instead of
+// waiting out the full stop grace period then SIGKILLing — keeps cleanup fast.
 const HELLO_SERVER_JS = `
 const http = require('http');
-http.createServer((req, res) => {
+const server = http.createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'text/plain' });
   res.end('hello-drop-smoke');
-}).listen(parseInt(process.env.PORT || '3000'));
+});
+server.listen(parseInt(process.env.PORT || '3000'));
+process.on('SIGTERM', () => server.close(() => process.exit(0)));
 `;
 
 // ── Test-suite guards ─────────────────────────────────────────────────────────
@@ -123,22 +127,26 @@ beforeEach(async () => {
 afterEach(async () => {
   if (!dockerAvailable) return;
 
-  // Best-effort cleanup — stop then delete the smoke container.
-  try {
-    await manager.stop(SMOKE_APP);
-  } catch {
-    /* already stopped or never started */
-  }
+  // Snapshot the dir up front. tmpDir is reassigned by the next beforeEach, so
+  // reading it late (e.g. if this hook ran slow) could delete the *next* test's
+  // bind-mount source. Capturing here pins cleanup to this test's directory.
+  const dirToClean = tmpDir;
+  tmpDir = '';
+
+  // Best-effort cleanup — delete force-removes the container (stop + remove),
+  // so a single call is enough.
   try {
     await manager.delete(SMOKE_APP);
   } catch {
-    /* already removed */
+    /* already removed or never started */
   }
 
-  if (tmpDir) {
-    await fs.rm(tmpDir, { recursive: true, force: true });
+  if (dirToClean) {
+    await fs.rm(dirToClean, { recursive: true, force: true });
   }
-});
+  // Generous hook timeout: container stop/remove + fs cleanup can exceed Jest's
+  // 5s hook default, which would abandon this hook mid-run and race the next test.
+}, 30_000);
 
 // ── Smoke tests ───────────────────────────────────────────────────────────────
 
