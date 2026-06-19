@@ -30,23 +30,27 @@ let runtimeInstance: AppRuntime | null = null;
 
 /**
  * Get the platform's app runtime.
- * - 'pm2'    (default) — host processes via PM2; the v1 runtime.
+ * - 'pm2'    — host processes via PM2; the v1 runtime.
  * - 'docker' — container isolation via ContainerManager; required for multi-user.
+ *
+ * The platform initializes the runtime once with an explicit type (from the
+ * isolation config). All other consumers (API routes, CLI) call this with no
+ * argument and get whatever runtime is active — they must not force a type,
+ * otherwise they'd throw under docker isolation. When `type` is given and an
+ * instance of a different type already exists, that's a real misconfiguration
+ * and we throw. With no instance yet, we create one (defaulting to PM2).
  */
-export function getAppRuntime(type: RuntimeType = 'pm2'): AppRuntime {
-  if (runtimeInstance && runtimeInstance.type !== type) {
-    throw new Error(
-      `App runtime already initialized as '${runtimeInstance.type}'; ` +
-        `cannot switch to '${type}' without resetAppRuntime()`
-    );
-  }
-  if (!runtimeInstance) {
-    if (type === 'docker') {
-      runtimeInstance = new ContainerManager();
-    } else {
-      runtimeInstance = new Pm2Runtime();
+export function getAppRuntime(type?: RuntimeType): AppRuntime {
+  if (runtimeInstance) {
+    if (type && runtimeInstance.type !== type) {
+      throw new Error(
+        `App runtime already initialized as '${runtimeInstance.type}'; ` +
+          `cannot switch to '${type}' without resetAppRuntime()`
+      );
     }
+    return runtimeInstance;
   }
+  runtimeInstance = type === 'docker' ? new ContainerManager() : new Pm2Runtime();
   return runtimeInstance;
 }
 
