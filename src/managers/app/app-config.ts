@@ -50,6 +50,13 @@ export class AppConfigService {
   private readonly webappsDir: string;
   private configs: Map<string, AppConfig> = new Map();
   private initialized = false;
+  /**
+   * Per-app write chain. Concurrent upsert/update/delete for the same app run
+   * one after another so a call can't read a stale in-memory snapshot and then
+   * overwrite a field a concurrent call just wrote (lost update). Keyed by app;
+   * different apps never block each other.
+   */
+  private writeChains: Map<string, Promise<unknown>> = new Map();
 
   constructor(options: AppConfigServiceOptions) {
     this.configDir = options.configDir;
@@ -188,54 +195,80 @@ export class AppConfigService {
   }
 
   /**
+   * Run a write op serialized against other writes for the same app. The op
+   * must read the current config *inside* itself so it sees the result of the
+   * prior write rather than a snapshot taken before it settled.
+   */
+  private enqueueWrite<T>(appName: string, op: () => Promise<T>): Promise<T> {
+    const prev = this.writeChains.get(appName) ?? Promise.resolve();
+    const result = prev.then(() => op());
+    // Advance the chain with a tail that never rejects, so one failed op does
+    // not break serialization (or leak an unhandled rejection) for later ones.
+    this.writeChains.set(
+      appName,
+      result.then(
+        () => undefined,
+        () => undefined
+      )
+    );
+    return result;
+  }
+
+  /**
    * Create or update an app config
    */
   async upsertConfig(appName: string, updates: Partial<AppConfig>): Promise<AppConfig> {
-    const existing = this.configs.get(appName);
-    const now = new Date().toISOString();
+    return this.enqueueWrite(appName, async () => {
+      const existing = this.configs.get(appName);
+      const now = new Date().toISOString();
 
-    const config: AppConfig = {
-      ...existing,
-      ...updates,
-      name: appName, // Ensure name is always correct
-      type: updates.type ?? existing?.type ?? 'unknown',
-      runtime: updates.runtime ?? existing?.runtime ?? 'pm2',
-      createdAt: existing?.createdAt ?? now,
-    };
+      const config: AppConfig = {
+        ...existing,
+        ...updates,
+        name: appName, // Ensure name is always correct
+        type: updates.type ?? existing?.type ?? 'unknown',
+        runtime: updates.runtime ?? existing?.runtime ?? 'pm2',
+        createdAt: existing?.createdAt ?? now,
+      };
 
-    await this.saveConfig(config);
-    return config;
+      await this.saveConfig(config);
+      return config;
+    });
   }
 
   /**
    * Update specific fields of an app config
    */
   async updateConfig(appName: string, updates: Partial<AppConfig>): Promise<AppConfig | null> {
-    const existing = this.configs.get(appName);
-    if (!existing) return null;
+    return this.enqueueWrite(appName, async () => {
+      const existing = this.configs.get(appName);
+      if (!existing) return null;
 
-    const config: AppConfig = {
-      ...existing,
-      ...updates,
-      name: appName, // Ensure name is always correct
-    };
+      const config: AppConfig = {
+        ...existing,
+        ...updates,
+        name: appName, // Ensure name is always correct
+      };
 
-    await this.saveConfig(config);
-    return config;
+      await this.saveConfig(config);
+      return config;
+    });
   }
 
   /**
    * Delete an app config
    */
   async deleteConfig(appName: string): Promise<boolean> {
-    const configPath = this.getConfigPath(appName);
-    try {
-      await fs.unlink(configPath);
-      this.configs.delete(appName);
-      return true;
-    } catch {
-      return false;
-    }
+    return this.enqueueWrite(appName, async () => {
+      const configPath = this.getConfigPath(appName);
+      try {
+        await fs.unlink(configPath);
+        this.configs.delete(appName);
+        return true;
+      } catch {
+        return false;
+      }
+    });
   }
 
   /**

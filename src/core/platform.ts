@@ -912,6 +912,15 @@ backup:
           // startup detection scan rebuilds and restarts it. User-stopped apps
           // are persisted as 'stopped' and are intentionally left alone.
           await this.stateManager.setAppStatus(app.name, 'pending');
+        } else if (
+          (app.status === 'building' || app.status === 'starting') &&
+          !runningNames.has(app.name)
+        ) {
+          // App was mid-deploy when the platform stopped: it's wedged in a
+          // transient status with no live process, and nothing else demotes
+          // these. Reset to 'pending' so the startup detection scan resumes the
+          // deploy instead of it being stuck 'building'/'starting' forever.
+          await this.stateManager.setAppStatus(app.name, 'pending');
         }
       }
 
@@ -982,19 +991,10 @@ backup:
   }
 
   private setupEventHandlers(): void {
-    // When watcher detects a new directory, detect the app type
-    const watcherSub = this.eventBus.subscribe('watcher:change', async (payload) => {
-      if (payload.changeType === 'addDir' && this.isTopLevelApp(payload.path)) {
-        const appName = path.basename(payload.path);
-        // Skip apps currently being cloned by git deploy (race condition prevention)
-        if (this.gitDeployService?.isCloning(appName)) {
-          this.logger.debug(`Skipping watcher detection for ${appName} - git clone in progress`, 'GIT-DEPLOY');
-          return;
-        }
-        await this.handleNewApp(payload.path);
-      }
-    });
-    this.subscriptions.push(watcherSub);
+    // App onboarding is driven by the watcher publishing app:detected directly
+    // (WatcherService.handleAppDetected); the detector resolves the type and
+    // detectedSub below persists it. There is no watcher:change → new-app path:
+    // the watcher never emits watcher:change with changeType 'addDir'.
 
     // When app is detected, create config and build it
     const detectedSub = this.eventBus.subscribe('app:detected', async (payload) => {
@@ -1175,63 +1175,6 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     this.logger.info(`Generated drop-config.js for static app`, 'DEPS');
   }
 
-  private isTopLevelApp(appPath: string): boolean {
-    const relative = path.relative(this.config.appsDirectory, appPath);
-    // Must be a direct child (no path separators), non-empty, and not a parent reference
-    if (!relative || relative.includes(path.sep) || relative.startsWith('..')) {
-      return false;
-    }
-    // Skip hidden directories and invalid names
-    const basename = path.basename(appPath);
-    if (basename.startsWith('.') || basename === 'node_modules') {
-      return false;
-    }
-    return true;
-  }
-
-  private async handleNewApp(appPath: string): Promise<void> {
-    const appName = path.basename(appPath);
-
-    // Skip apps currently being cloned by git deploy
-    if (this.gitDeployService?.isCloning(appName)) {
-      this.logger.debug(`Skipping detection for ${appName} - git clone in progress`, 'GIT-DEPLOY');
-      return;
-    }
-
-    this.logger.appEvent('detected', appName);
-
-    if (!this.detector) return;
-
-    try {
-      const result = await this.detector.detect(appPath);
-      this.logger.info(`Detected ${appName} as ${result.type} (confidence: ${result.confidence})`, 'DETECTOR');
-
-      const appType = result.type as 'nodejs' | 'python' | 'go' | 'static' | 'docker' | 'unknown';
-
-      // Create or update app config file (source of truth)
-      if (this.appConfigService) {
-        await this.appConfigService.upsertConfig(appName, {
-          type: appType,
-          framework: result.framework ?? undefined,
-          path: appPath,
-          hostname: `${appName}.localhost`,
-        });
-      }
-
-      // Register app in state manager
-      if (this.stateManager) {
-        await this.stateManager.registerApp(
-          appName,
-          appPath,
-          appType,
-          result.framework ?? undefined
-        );
-      }
-    } catch (error) {
-      this.logger.error(`Failed to detect app type for ${appName}`, 'DETECTOR', error);
-    }
-  }
-
   private async handleBuildApp(appPath: string, appName: string, _appType: string): Promise<void> {
     if (!this.builder || !this.detector) return;
 
@@ -1257,13 +1200,36 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
 
     this.logger.appEvent('building', appName);
 
-    // Update state to building
-    if (this.stateManager) {
-      await this.stateManager.setAppStatus(appName, 'building');
-    }
-
     try {
-      const detection = await this.detector.detect(appPath);
+      // Update state to building. Kept inside the try: if this write throws it
+      // must not escape and leave the app wedged in appsInProgress — the catch
+      // below releases the guard. (The success path intentionally keeps the
+      // guard and hands off to handleStartApp, which owns the final release.)
+      if (this.stateManager) {
+        await this.stateManager.setAppStatus(appName, 'building');
+      }
+
+      const detection = await this.detector.detect(appPath, { silent: true });
+
+      // Persist the real detected type. The watcher's app:detected event can't
+      // know it (it only flags a hostname-pattern directory), and since detect()
+      // no longer republishes (P1-6), this is the only place the stored type is
+      // corrected from 'unknown' to the real runtime. Idempotent. The detector's
+      // AppType is broader than the stored runtime union — cast to match, the
+      // same way detectedSub does for the onboarding write.
+      const detectedType = detection.type as
+        | 'nodejs'
+        | 'python'
+        | 'go'
+        | 'static'
+        | 'docker'
+        | 'unknown';
+      if (this.appConfigService) {
+        await this.appConfigService.updateConfig(appName, { type: detectedType });
+      }
+      if (this.stateManager) {
+        await this.stateManager.updateApp(appName, { type: detectedType });
+      }
       const workDir = await this.getBuildWorkDir(appName);
 
       const execCommand =
@@ -1332,16 +1298,23 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
   }
 
   private async handleStartApp(appName: string): Promise<void> {
-    if (!this.runtime || !this.detector) return;
+    if (!this.runtime || !this.detector) {
+      // Only reachable during teardown; release the guard so a queued deploy
+      // isn't left wedged in appsInProgress forever.
+      this.appsInProgress.delete(appName);
+      return;
+    }
 
     const appPath = path.join(this.config.appsDirectory, appName);
 
-    // Update state to starting
-    if (this.stateManager) {
-      await this.stateManager.setAppStatus(appName, 'starting');
-    }
-
     try {
+      // Update state to starting. Kept inside the try: if this write throws it
+      // must not escape to the EventBus handler wrapper (which only logs) and
+      // leave the app wedged in appsInProgress with no cleanup.
+      if (this.stateManager) {
+        await this.stateManager.setAppStatus(appName, 'starting');
+      }
+
       // Capacity guard: reject the deploy if the global running-app cap is reached.
       if (this.config.maxConcurrentApps > 0 && this.stateManager) {
         const runningCount = this.stateManager.getAllApps().filter(
@@ -1355,7 +1328,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         }
       }
 
-      const detection = await this.detector.detect(appPath);
+      const detection = await this.detector.detect(appPath, { silent: true });
       const port = this.allocatePort(appName);
 
       this.logger.appEvent('starting', appName, `port ${port}`);
@@ -1426,7 +1399,6 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
 
       // App is fully deployed now - record deploy time for cooldown
       this.appDeployTimes.set(appName, Date.now());
-      this.appsInProgress.delete(appName);
 
       // Start health prober in PM2 mode (Docker uses its own HEALTHCHECK mechanism)
       if (spec.healthCheckPath && this.runtime?.type === 'pm2') {
@@ -1439,6 +1411,10 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           error: error instanceof Error ? error.message : 'Failed to start',
         });
       }
+    } finally {
+      // Terminal handler: always release the in-progress guard on every settled
+      // path (success, error, or a throw from the initial 'starting' write), so
+      // a transient failure can never wedge the app out of future rebuilds.
       this.appsInProgress.delete(appName);
     }
   }
@@ -1621,7 +1597,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       await this.stateManager.setAppStatus(appName, 'building');
 
       // Re-detect and rebuild the app
-      const detection = await this.detector.detect(appPath);
+      const detection = await this.detector.detect(appPath, { silent: true });
       const workDir = await this.getBuildWorkDir(appName);
       const updateLogId = this.buildLogService
         ? await this.buildLogService.startBuild(appName, new Date())

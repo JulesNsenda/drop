@@ -59,8 +59,14 @@ export class GoBuildStrategy extends BaseBuildStrategy {
   }
 
   private getBinaryName(context: BuildContext): string {
-    const name = context.appName || 'app';
-    return process.platform === 'win32' ? `${name}.exe` : name;
+    // The binary name is interpolated into a shell `go build -o <name> .`
+    // command, so strip anything that isn't a safe binary-name character (and a
+    // leading dash, which `-o` would treat as part of an option) to prevent
+    // command/argument injection via a crafted app or folder name. Mirrors the
+    // Docker strategy's imageName sanitization.
+    const raw = context.appName || 'app';
+    const safe = raw.replace(/[^a-zA-Z0-9_-]/g, '-').replace(/^-+/, '') || 'app';
+    return process.platform === 'win32' ? `${safe}.exe` : safe;
   }
 }
 
