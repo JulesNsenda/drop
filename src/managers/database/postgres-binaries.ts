@@ -217,7 +217,18 @@ export class PostgresBinaries {
       '-A', 'trust', // Local connections trusted (DROP manages access)
     ]);
 
-    // Configure postgresql.conf for DROP
+    // Configure postgresql.conf for DROP.
+    //
+    // max_connections must leave real headroom for tenant apps: the platform's
+    // own control-plane pool consumes some, and every DB-backed app opens its
+    // own pool. At the old default of 100 a box exhausted connections in the
+    // low dozens of apps ("too many clients"), taking down every app at once.
+    // Default to 200 and make both knobs env-tunable to the host's fleet size.
+    // NOTE: this applies only when the data dir is first initialised; existing
+    // installs must set it via `ALTER SYSTEM SET max_connections = N;` (or edit
+    // postgresql.conf) followed by a restart.
+    const maxConnections = parseInt(process.env.DROP_PG_MAX_CONNECTIONS || '200', 10);
+    const sharedBuffers = process.env.DROP_PG_SHARED_BUFFERS || '128MB';
     const configPath = path.join(paths.dataDir, 'postgresql.conf');
     const configAdditions = `
 # DROP Platform Configuration
@@ -227,8 +238,8 @@ export class PostgresBinaries {
 # (e.g. '127.0.0.1,172.17.0.1') — never back to '*'.
 listen_addresses = '127.0.0.1'
 port = 5433
-max_connections = 100
-shared_buffers = 128MB
+max_connections = ${maxConnections}
+shared_buffers = ${sharedBuffers}
 log_destination = 'stderr'
 logging_collector = off
 `;

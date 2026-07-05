@@ -416,13 +416,17 @@ export class PostgresServer {
   }
 
   private async initializePool(): Promise<void> {
+    // This is the platform's superuser control-plane pool (provisioning,
+    // health, migrations) — not a tenant workload pool. Keep it small so the
+    // bulk of max_connections stays available for tenant apps. Env-tunable.
+    const adminPoolMax = parseInt(process.env.DROP_PG_ADMIN_POOL_MAX || '10', 10);
     this.pool = new Pool({
       host: 'localhost',
       port: this.port,
       user: 'postgres',
       password: this.superuserPassword ?? 'postgres',
       database: 'postgres',
-      max: 20,
+      max: adminPoolMax,
       idleTimeoutMillis: 30000,
       connectionTimeoutMillis: 5000,
     });
