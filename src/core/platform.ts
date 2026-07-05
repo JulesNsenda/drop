@@ -1078,6 +1078,17 @@ backup:
    * Check if an app needs a database by looking at detection result or common ORM config files
    */
   private async appNeedsDatabase(appPath: string, detectionDatabase?: boolean | string): Promise<boolean> {
+    // DROP has no SQLite provisioner — 'sqlite' still provisions PostgreSQL and
+    // injects DATABASE_URL. Warn so the mismatch is visible instead of silent.
+    if (detectionDatabase === 'sqlite') {
+      this.logger.warn(
+        "drop.yaml requested 'database: sqlite', but DROP only provisions PostgreSQL — " +
+          "a PostgreSQL database will be provisioned and DATABASE_URL injected. " +
+          "Set 'database: postgres' to silence this warning.",
+        'DATABASE'
+      );
+    }
+
     // If detection already found database requirement, use that
     if (detectionDatabase === true || detectionDatabase === 'postgres' || detectionDatabase === 'sqlite') {
       return true;
