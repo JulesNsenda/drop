@@ -409,6 +409,130 @@ describe('Event-driven pipeline', () => {
   });
 });
 
+describe('handleAppUpdate — stopped-app guard (P0-2)', () => {
+  let platform: DropPlatform;
+  let tempDir: string;
+
+  beforeEach(async () => {
+    jest.clearAllMocks();
+    tempDir = path.join(os.tmpdir(), `drop-test-${Date.now()}`);
+    platform = createPlatform({
+      dropRoot: tempDir,
+      appsDirectory: path.join(tempDir, 'apps'),
+      logLevel: 'error',
+      autoBuild: true,
+      autoStart: true,
+      caddyfilePath: path.join(tempDir, 'Caddyfile'),
+    });
+    await platform.start();
+  });
+
+  afterEach(async () => {
+    if (platform.isActive()) {
+      await platform.stop();
+    }
+  });
+
+  it('does not rebuild or restart an app the user has stopped', async () => {
+    const stateManager = (platform as any).stateManager;
+    stateManager.getApp.mockReturnValue({ name: 'stoppedapp', status: 'stopped', port: 3005 });
+
+    const detectSpy = jest.spyOn(platform.getDetector()!, 'detect');
+    const startSpy = jest.spyOn((platform as any).runtime, 'start');
+
+    await (platform as any).handleAppUpdate(
+      'stoppedapp',
+      path.join(tempDir, 'apps', 'stoppedapp'),
+      'file change'
+    );
+
+    // The guard must short-circuit before any rebuild or restart work.
+    expect(detectSpy).not.toHaveBeenCalled();
+    expect(startSpy).not.toHaveBeenCalled();
+  });
+
+  it('proceeds past the guard for a running app (detect is invoked)', async () => {
+    const stateManager = (platform as any).stateManager;
+    stateManager.getApp.mockReturnValue({ name: 'liveapp', status: 'running', port: 3006 });
+
+    // detect() is the first step inside the rebuild try-block, reached only if
+    // the stopped-app guard did NOT fire. Reject it so the pipeline stops right
+    // there (caught internally) without doing any real build/FS work.
+    const detectSpy = jest
+      .spyOn(platform.getDetector()!, 'detect')
+      .mockRejectedValue(new Error('stop-here'));
+
+    await (platform as any).handleAppUpdate(
+      'liveapp',
+      path.join(tempDir, 'apps', 'liveapp'),
+      'file change'
+    );
+
+    expect(detectSpy).toHaveBeenCalled();
+  });
+});
+
+describe('buildStartSpec — resource limits (P0-4)', () => {
+  let platform: DropPlatform;
+  let tempDir: string;
+
+  const detection = {
+    type: 'nodejs',
+    framework: null,
+    suggestedConfig: { startCommand: 'node index.js' },
+  } as any;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    tempDir = path.join(os.tmpdir(), `drop-test-${Date.now()}`);
+  });
+
+  afterEach(async () => {
+    if (platform && platform.isActive()) {
+      await platform.stop();
+    }
+  });
+
+  it('wires configured per-app memory and cpu caps into the spec', async () => {
+    platform = createPlatform({
+      dropRoot: tempDir,
+      logLevel: 'error',
+      maxMemoryMbPerApp: 512,
+      maxCpusPerApp: 0.5,
+    } as any);
+    await platform.start();
+
+    const spec = await (platform as any).buildStartSpec(
+      'app1',
+      path.join(tempDir, 'app1'),
+      detection,
+      3005,
+      path.join(tempDir, 'data'),
+      {}
+    );
+
+    expect(spec.limits).toEqual({ memory: '512M', cpus: 0.5 });
+  });
+
+  it('omits limits by default (0 = opt-in), so runtimes keep their own defaults', async () => {
+    // Default config leaves caps at 0 — no forced cap, so an existing PM2 app
+    // is never newly killed and docker keeps its own 256M/0.5 container default.
+    platform = createPlatform({ dropRoot: tempDir, logLevel: 'error' });
+    await platform.start();
+
+    const spec = await (platform as any).buildStartSpec(
+      'app2',
+      path.join(tempDir, 'app2'),
+      detection,
+      3006,
+      path.join(tempDir, 'data'),
+      {}
+    );
+
+    expect(spec.limits).toBeUndefined();
+  });
+});
+
 describe('Service accessors', () => {
   let platform: DropPlatform;
   let tempDir: string;

@@ -87,6 +87,55 @@ describe('Auth Middleware', () => {
       const users = listUsers();
       expect(users.find(u => u.username === 'testuser')).toBeDefined();
     });
+
+    it('quarantines a corrupt credentials file instead of silently overwriting it', async () => {
+      jest.spyOn(console, 'log').mockImplementation();
+      jest.spyOn(console, 'error').mockImplementation();
+
+      // A populated credentials store exists on disk...
+      await initializeAuth({ credentialsPath, enableJwt: true, enableApiKeys: true });
+      await createUser('realuser', 'password123', 'user');
+      expect(await fs.readFile(credentialsPath, 'utf-8')).toContain('realuser');
+
+      // ...then it gets corrupted on disk. On restart we must NOT wipe it and
+      // mint a fresh default admin without a trace — the corrupt bytes must be
+      // preserved for recovery.
+      const corruptBytes = '{ half-written garbage that will not parse';
+      await fs.writeFile(credentialsPath, corruptBytes);
+      resetAuth();
+      await initializeAuth({ credentialsPath, enableJwt: true, enableApiKeys: true });
+
+      const files = await fs.readdir(tempDir);
+      const quarantined = files.filter((f) => f.startsWith('credentials.json.corrupt-'));
+      expect(quarantined).toHaveLength(1);
+      expect(await fs.readFile(path.join(tempDir, quarantined[0]), 'utf-8')).toBe(corruptBytes);
+
+      jest.restoreAllMocks();
+    });
+
+    it('quarantines a valid-JSON-but-wrong-shape credentials file', async () => {
+      jest.spyOn(console, 'log').mockImplementation();
+      jest.spyOn(console, 'error').mockImplementation();
+
+      await fs.writeFile(credentialsPath, JSON.stringify({ not: 'a credentials store' }));
+      resetAuth();
+      await initializeAuth({ credentialsPath, enableJwt: true, enableApiKeys: true });
+
+      const files = await fs.readdir(tempDir);
+      expect(files.filter((f) => f.startsWith('credentials.json.corrupt-'))).toHaveLength(1);
+
+      jest.restoreAllMocks();
+    });
+
+    it('does NOT quarantine on first run (missing file)', async () => {
+      jest.spyOn(console, 'log').mockImplementation();
+      await initializeAuth({ credentialsPath, enableJwt: true, enableApiKeys: true });
+
+      const files = await fs.readdir(tempDir);
+      expect(files.some((f) => f.startsWith('credentials.json.corrupt-'))).toBe(false);
+
+      jest.restoreAllMocks();
+    });
   });
 
   describe('createUser', () => {
