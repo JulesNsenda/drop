@@ -912,6 +912,15 @@ backup:
           // startup detection scan rebuilds and restarts it. User-stopped apps
           // are persisted as 'stopped' and are intentionally left alone.
           await this.stateManager.setAppStatus(app.name, 'pending');
+        } else if (
+          (app.status === 'building' || app.status === 'starting') &&
+          !runningNames.has(app.name)
+        ) {
+          // App was mid-deploy when the platform stopped: it's wedged in a
+          // transient status with no live process, and nothing else demotes
+          // these. Reset to 'pending' so the startup detection scan resumes the
+          // deploy instead of it being stuck 'building'/'starting' forever.
+          await this.stateManager.setAppStatus(app.name, 'pending');
         }
       }
 
@@ -1257,12 +1266,15 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
 
     this.logger.appEvent('building', appName);
 
-    // Update state to building
-    if (this.stateManager) {
-      await this.stateManager.setAppStatus(appName, 'building');
-    }
-
     try {
+      // Update state to building. Kept inside the try: if this write throws it
+      // must not escape and leave the app wedged in appsInProgress — the catch
+      // below releases the guard. (The success path intentionally keeps the
+      // guard and hands off to handleStartApp, which owns the final release.)
+      if (this.stateManager) {
+        await this.stateManager.setAppStatus(appName, 'building');
+      }
+
       const detection = await this.detector.detect(appPath);
       const workDir = await this.getBuildWorkDir(appName);
 
@@ -1332,16 +1344,23 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
   }
 
   private async handleStartApp(appName: string): Promise<void> {
-    if (!this.runtime || !this.detector) return;
+    if (!this.runtime || !this.detector) {
+      // Only reachable during teardown; release the guard so a queued deploy
+      // isn't left wedged in appsInProgress forever.
+      this.appsInProgress.delete(appName);
+      return;
+    }
 
     const appPath = path.join(this.config.appsDirectory, appName);
 
-    // Update state to starting
-    if (this.stateManager) {
-      await this.stateManager.setAppStatus(appName, 'starting');
-    }
-
     try {
+      // Update state to starting. Kept inside the try: if this write throws it
+      // must not escape to the EventBus handler wrapper (which only logs) and
+      // leave the app wedged in appsInProgress with no cleanup.
+      if (this.stateManager) {
+        await this.stateManager.setAppStatus(appName, 'starting');
+      }
+
       // Capacity guard: reject the deploy if the global running-app cap is reached.
       if (this.config.maxConcurrentApps > 0 && this.stateManager) {
         const runningCount = this.stateManager.getAllApps().filter(
@@ -1426,7 +1445,6 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
 
       // App is fully deployed now - record deploy time for cooldown
       this.appDeployTimes.set(appName, Date.now());
-      this.appsInProgress.delete(appName);
 
       // Start health prober in PM2 mode (Docker uses its own HEALTHCHECK mechanism)
       if (spec.healthCheckPath && this.runtime?.type === 'pm2') {
@@ -1439,6 +1457,10 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           error: error instanceof Error ? error.message : 'Failed to start',
         });
       }
+    } finally {
+      // Terminal handler: always release the in-progress guard on every settled
+      // path (success, error, or a throw from the initial 'starting' write), so
+      // a transient failure can never wedge the app out of future rebuilds.
       this.appsInProgress.delete(appName);
     }
   }

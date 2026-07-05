@@ -472,6 +472,56 @@ describe('handleAppUpdate — stopped-app guard (P0-2)', () => {
   });
 });
 
+describe('deploy strand & startup reconciler (P1-1)', () => {
+  let platform: DropPlatform;
+  let tempDir: string;
+
+  beforeEach(async () => {
+    jest.clearAllMocks();
+    tempDir = path.join(os.tmpdir(), `drop-test-${Date.now()}`);
+    platform = createPlatform({
+      dropRoot: tempDir,
+      appsDirectory: path.join(tempDir, 'apps'),
+      logLevel: 'error',
+      autoBuild: true,
+      autoStart: true,
+      caddyfilePath: path.join(tempDir, 'Caddyfile'),
+    });
+    await platform.start();
+  });
+
+  afterEach(async () => {
+    if (platform && platform.isActive()) {
+      await platform.stop();
+    }
+  });
+
+  it('releases the in-progress guard when the initial status write throws', async () => {
+    const sm = (platform as any).stateManager;
+    // Simulate the app already being mid-deploy (handleBuildApp added it).
+    (platform as any).appsInProgress.add('wedged');
+    // The first setAppStatus — the 'starting' write — fails, as a disk error would.
+    sm.setAppStatus.mockRejectedValueOnce(new Error('disk full'));
+
+    await (platform as any).handleStartApp('wedged');
+
+    // finally must have released the guard, so future rebuilds aren't wedged.
+    expect((platform as any).appsInProgress.has('wedged')).toBe(false);
+  });
+
+  it('reconciles a mid-deploy building app to pending on startup', async () => {
+    const sm = (platform as any).stateManager;
+    sm.getAllApps.mockReturnValue([
+      { name: 'buildingapp', status: 'building', path: path.join(tempDir, 'apps', 'buildingapp') },
+    ]);
+    jest.spyOn((platform as any).runtime, 'getAllStatus').mockResolvedValue([]);
+
+    await (platform as any).syncStateWithProcesses();
+
+    expect(sm.setAppStatus).toHaveBeenCalledWith('buildingapp', 'pending');
+  });
+});
+
 describe('buildStartSpec — resource limits (P0-4)', () => {
   let platform: DropPlatform;
   let tempDir: string;
