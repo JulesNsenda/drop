@@ -991,19 +991,10 @@ backup:
   }
 
   private setupEventHandlers(): void {
-    // When watcher detects a new directory, detect the app type
-    const watcherSub = this.eventBus.subscribe('watcher:change', async (payload) => {
-      if (payload.changeType === 'addDir' && this.isTopLevelApp(payload.path)) {
-        const appName = path.basename(payload.path);
-        // Skip apps currently being cloned by git deploy (race condition prevention)
-        if (this.gitDeployService?.isCloning(appName)) {
-          this.logger.debug(`Skipping watcher detection for ${appName} - git clone in progress`, 'GIT-DEPLOY');
-          return;
-        }
-        await this.handleNewApp(payload.path);
-      }
-    });
-    this.subscriptions.push(watcherSub);
+    // App onboarding is driven by the watcher publishing app:detected directly
+    // (WatcherService.handleAppDetected); the detector resolves the type and
+    // detectedSub below persists it. There is no watcher:change → new-app path:
+    // the watcher never emits watcher:change with changeType 'addDir'.
 
     // When app is detected, create config and build it
     const detectedSub = this.eventBus.subscribe('app:detected', async (payload) => {
@@ -1184,63 +1175,6 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     this.logger.info(`Generated drop-config.js for static app`, 'DEPS');
   }
 
-  private isTopLevelApp(appPath: string): boolean {
-    const relative = path.relative(this.config.appsDirectory, appPath);
-    // Must be a direct child (no path separators), non-empty, and not a parent reference
-    if (!relative || relative.includes(path.sep) || relative.startsWith('..')) {
-      return false;
-    }
-    // Skip hidden directories and invalid names
-    const basename = path.basename(appPath);
-    if (basename.startsWith('.') || basename === 'node_modules') {
-      return false;
-    }
-    return true;
-  }
-
-  private async handleNewApp(appPath: string): Promise<void> {
-    const appName = path.basename(appPath);
-
-    // Skip apps currently being cloned by git deploy
-    if (this.gitDeployService?.isCloning(appName)) {
-      this.logger.debug(`Skipping detection for ${appName} - git clone in progress`, 'GIT-DEPLOY');
-      return;
-    }
-
-    this.logger.appEvent('detected', appName);
-
-    if (!this.detector) return;
-
-    try {
-      const result = await this.detector.detect(appPath, { silent: true });
-      this.logger.info(`Detected ${appName} as ${result.type} (confidence: ${result.confidence})`, 'DETECTOR');
-
-      const appType = result.type as 'nodejs' | 'python' | 'go' | 'static' | 'docker' | 'unknown';
-
-      // Create or update app config file (source of truth)
-      if (this.appConfigService) {
-        await this.appConfigService.upsertConfig(appName, {
-          type: appType,
-          framework: result.framework ?? undefined,
-          path: appPath,
-          hostname: `${appName}.localhost`,
-        });
-      }
-
-      // Register app in state manager
-      if (this.stateManager) {
-        await this.stateManager.registerApp(
-          appName,
-          appPath,
-          appType,
-          result.framework ?? undefined
-        );
-      }
-    } catch (error) {
-      this.logger.error(`Failed to detect app type for ${appName}`, 'DETECTOR', error);
-    }
-  }
-
   private async handleBuildApp(appPath: string, appName: string, _appType: string): Promise<void> {
     if (!this.builder || !this.detector) return;
 
@@ -1276,6 +1210,26 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       }
 
       const detection = await this.detector.detect(appPath, { silent: true });
+
+      // Persist the real detected type. The watcher's app:detected event can't
+      // know it (it only flags a hostname-pattern directory), and since detect()
+      // no longer republishes (P1-6), this is the only place the stored type is
+      // corrected from 'unknown' to the real runtime. Idempotent. The detector's
+      // AppType is broader than the stored runtime union — cast to match, the
+      // same way detectedSub does for the onboarding write.
+      const detectedType = detection.type as
+        | 'nodejs'
+        | 'python'
+        | 'go'
+        | 'static'
+        | 'docker'
+        | 'unknown';
+      if (this.appConfigService) {
+        await this.appConfigService.updateConfig(appName, { type: detectedType });
+      }
+      if (this.stateManager) {
+        await this.stateManager.updateApp(appName, { type: detectedType });
+      }
       const workDir = await this.getBuildWorkDir(appName);
 
       const execCommand =
