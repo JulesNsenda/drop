@@ -83,6 +83,7 @@ export interface HealthDto {
     processManager: ComponentHealth;
     database?: ComponentHealth;
     watcher?: ComponentHealth;
+    caddy?: ComponentHealth;
   };
   /** Server runtime info — authoritative OS and paths (not the browser's). */
   system: {
