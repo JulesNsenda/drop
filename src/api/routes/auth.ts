@@ -153,6 +153,7 @@ auth.get('/api-keys', authMiddleware('admin'), async (c) => {
 // DELETE /auth/api-keys/:id - Delete an API key (admin only)
 auth.delete('/api-keys/:id', authMiddleware('admin'), async (c) => {
   const id = c.req.param('id');
+  if (!id) return c.json(error(ErrorCodes.VALIDATION_ERROR, 'Missing id'), 400);
   const deleted = await deleteApiKey(id);
 
   if (!deleted) {
@@ -259,6 +260,7 @@ auth.post('/users', authMiddleware('admin'), async (c) => {
 // PUT /auth/users/:id - Update user (admin only)
 auth.put('/users/:id', authMiddleware('admin'), async (c) => {
   const id = c.req.param('id');
+  if (!id) return c.json(error(ErrorCodes.VALIDATION_ERROR, 'Missing id'), 400);
   const body = await c.req.json<{ enabled?: boolean; role?: 'admin' | 'user' | 'readonly' }>();
 
   const updated = await updateUser(id, body);
@@ -272,6 +274,7 @@ auth.put('/users/:id', authMiddleware('admin'), async (c) => {
 // POST /auth/users/:id/reset-password - Admin reset user password
 auth.post('/users/:id/reset-password', authMiddleware('admin'), async (c) => {
   const id = c.req.param('id');
+  if (!id) return c.json(error(ErrorCodes.VALIDATION_ERROR, 'Missing id'), 400);
   const body = await c.req.json<{ newPassword: string }>();
 
   if (!body.newPassword || body.newPassword.length < 8) {
