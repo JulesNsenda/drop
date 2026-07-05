@@ -11,6 +11,7 @@ import { success, error, ErrorCodes, AppDto, CreateAppDto } from '../types';
 import { NotFoundError, ValidationError } from '../middleware/error';
 import { AuthContext, listUsers, getUserById } from '../middleware/auth';
 import { canAccess } from '../access';
+import { isValidAppName } from '../middleware/validate';
 import { getAppRuntime } from '../../managers/runtime';
 import { getSecretManager } from '../../managers/secret';
 import { migrateAppRuntime } from '../../managers/runtime/runtime-migrator';
@@ -223,6 +224,16 @@ apps.post('/', async (c) => {
   }
 
   const appName = body.name || path.basename(body.path);
+
+  // Validate the name before it becomes a state-manager key, a filesystem
+  // path, and a PM2 process name. Every other write path (git-deploy, secrets)
+  // validates; this one did not, letting a caller register an app keyed by an
+  // arbitrary string (control chars, whitespace, shell/path metacharacters).
+  if (!isValidAppName(appName)) {
+    throw new ValidationError(
+      'Invalid app name: must be 1-64 alphanumeric characters, hyphens, or underscores'
+    );
+  }
 
   // Check if app already exists
   const stateManager = getStateManager();
