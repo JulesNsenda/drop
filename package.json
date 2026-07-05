@@ -28,8 +28,6 @@
     "format": "prettier --write \"src/**/*.ts\"",
     "format:check": "prettier --check \"src/**/*.ts\"",
     "clean": "rimraf dist",
-    "db:migrate": "ts-node src/managers/app/migrations/runner.ts",
-    "db:migrate:create": "ts-node scripts/create-migration.ts",
     "prepublishOnly": "npm run build"
   },
   "keywords": [
