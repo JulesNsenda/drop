@@ -17,6 +17,19 @@ interface SecretStore {
   secrets: Record<string, Record<string, EncryptedData>>;
 }
 
+/** Structural check that a parsed value is a usable SecretStore before we trust it. */
+function isValidSecretStore(value: unknown): value is SecretStore {
+  if (typeof value !== 'object' || value === null) return false;
+  const v = value as Record<string, unknown>;
+  return (
+    (v.version === 1 || v.version === 2) &&
+    typeof v.salt === 'string' &&
+    v.salt.length > 0 &&
+    typeof v.secrets === 'object' &&
+    v.secrets !== null
+  );
+}
+
 export interface SecretManagerConfig {
   /** Path to the secrets store file */
   storePath: string;
@@ -106,18 +119,57 @@ export class SecretManager {
   }
 
   private async loadStore(): Promise<SecretStore> {
+    let data: string;
     try {
-      const data = await fs.readFile(this.config.storePath, 'utf-8');
-      return JSON.parse(data);
+      data = await fs.readFile(this.config.storePath, 'utf-8');
     } catch {
-      const salt = generateSalt();
-      const store: SecretStore = {
-        version: 1,
-        salt: salt.toString('base64'),
-        secrets: {},
-      };
-      await this.saveStore(store);
-      return store;
+      // No store file yet — first run. Create a fresh store.
+      return this.createFreshStore();
+    }
+
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(data);
+    } catch (err) {
+      // Corrupt store file. This holds encrypted secrets that may be
+      // recoverable, so quarantine it for forensics before falling back to an
+      // empty store rather than silently overwriting and destroying it.
+      await this.quarantineCorruptStore(err);
+      return this.createFreshStore();
+    }
+
+    if (!isValidSecretStore(parsed)) {
+      // Parsed but not a valid store (wrong shape / truncated-yet-valid JSON) —
+      // treat the same as corrupt: preserve, don't overwrite.
+      await this.quarantineCorruptStore(new Error('secrets store has an unexpected shape'));
+      return this.createFreshStore();
+    }
+
+    return parsed;
+  }
+
+  private async createFreshStore(): Promise<SecretStore> {
+    const salt = generateSalt();
+    const store: SecretStore = {
+      version: 1,
+      salt: salt.toString('base64'),
+      secrets: {},
+    };
+    await this.saveStore(store);
+    return store;
+  }
+
+  private async quarantineCorruptStore(err: unknown): Promise<void> {
+    try {
+      const ts = new Date().toISOString().replace(/[:.]/g, '-');
+      const quarantinePath = `${this.config.storePath}.corrupt-${ts}`;
+      await fs.rename(this.config.storePath, quarantinePath);
+      console.error(
+        `[secret-manager] Corrupt secrets store quarantined to ${quarantinePath}:`,
+        err instanceof Error ? err.message : err
+      );
+    } catch (renameErr) {
+      console.error('[secret-manager] Failed to quarantine corrupt secrets store:', renameErr);
     }
   }
 
