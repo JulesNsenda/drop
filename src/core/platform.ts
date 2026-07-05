@@ -34,6 +34,11 @@ import { createContainerExecCommand } from './builder/container-build-runner';
 import { migrateAllToDocker } from '../managers/runtime/runtime-migrator';
 import { buildNginxConf } from '../utils/nginx-conf';
 import { BuildLogService, getBuildLogService, resetBuildLogService } from '../managers/build-log/build-log';
+import {
+  LogRetentionService,
+  getLogRetentionService,
+  resetLogRetentionService,
+} from '../managers/log-retention/log-retention';
 
 export interface PlatformConfig {
   /** Root directory for DROP */
@@ -107,6 +112,36 @@ export interface PlatformConfig {
    * drop.env when running with docker isolation.
    */
   maxConcurrentApps: number;
+  /**
+   * Per-app memory cap in MB (0 = no platform-set cap — the default). When > 0
+   * it becomes PM2's max_memory_restart (process restarted on exceed — the
+   * closest degraded equivalent to a hard limit, so a runaway can't OOM the
+   * host) and the container --memory limit in docker mode.
+   *
+   * Opt-in by default (0) on purpose: forcing a cap would silently kill
+   * existing PM2 apps that legitimately use more, and would override docker's
+   * own tuned 256 MB container default. Operators enable it via
+   * DROP_MAX_MEMORY_MB_PER_APP once they know their apps' real footprint;
+   * multi-tenant (docker) installs should set it. When 0, docker containers
+   * keep ContainerManager's 256 MB default.
+   */
+  maxMemoryMbPerApp: number;
+  /**
+   * Per-app CPU cap in cores (0 = no platform-set cap — the default). Honored
+   * in docker mode (--cpus); PM2 cannot enforce CPU limits so it is ignored
+   * there. When 0, docker keeps ContainerManager's 0.5-core default.
+   */
+  maxCpusPerApp: number;
+  /**
+   * Delete log files under data/logs older than this many days (min 1).
+   * Bounds disk usage from per-app, Caddy, build, and platform logs. Default 14.
+   */
+  logRetentionDays: number;
+  /**
+   * Rotate the platform log at startup once it exceeds this many MB
+   * (0 = never). Default 50.
+   */
+  logMaxFileMb: number;
 }
 
 // Determine platform-appropriate defaults
@@ -143,6 +178,10 @@ const DEFAULT_CONFIG: PlatformConfig = {
   maxConcurrentBuilds: parseInt(process.env.DROP_MAX_CONCURRENT_BUILDS || '3', 10),
   maxDiskMbPerApp: parseInt(process.env.DROP_MAX_DISK_MB_PER_APP || '0', 10),
   maxConcurrentApps: parseInt(process.env.DROP_MAX_CONCURRENT_APPS || '0', 10),
+  maxMemoryMbPerApp: parseInt(process.env.DROP_MAX_MEMORY_MB_PER_APP || '0', 10),
+  maxCpusPerApp: parseFloat(process.env.DROP_MAX_CPUS_PER_APP || '0'),
+  logRetentionDays: parseInt(process.env.DROP_LOG_RETENTION_DAYS || '14', 10),
+  logMaxFileMb: parseInt(process.env.DROP_LOG_MAX_FILE_MB || '50', 10),
 };
 
 export class DropPlatform {
@@ -165,6 +204,7 @@ export class DropPlatform {
   private gitDeployService: GitDeployService | null = null;
   private apiServer: ApiServer | null = null;
   private buildLogService: BuildLogService | null = null;
+  private logRetention: LogRetentionService | null = null;
 
   private subscriptions: Unsubscribe[] = [];
   private isRunning = false;
@@ -216,6 +256,7 @@ export class DropPlatform {
       level: this.config.logLevel,
       console: true,
       file: false,
+      maxFileBytes: this.config.logMaxFileMb > 0 ? this.config.logMaxFileMb * 1024 * 1024 : 0,
     });
   }
 
@@ -249,6 +290,14 @@ export class DropPlatform {
       // Enable file logging now that directories exist
       const logDir = path.join(this.config.dropRoot, 'data', 'logs', 'drop-svc');
       this.logger.enableFileLogging(logDir);
+
+      // Prune old logs so a long-lived box can't fill its disk (per-app, Caddy,
+      // build and platform logs all live under data/logs). Sweeps now + daily.
+      this.logRetention = getLogRetentionService(
+        path.join(this.config.dropRoot, 'data', 'logs'),
+        this.config.logRetentionDays
+      );
+      this.logRetention.start();
 
       // Initialize services
       await this.initializeServices();
@@ -299,6 +348,13 @@ export class DropPlatform {
     if (this.certExpiryTimer) {
       clearInterval(this.certExpiryTimer);
       this.certExpiryTimer = null;
+    }
+
+    // Stop the log-retention sweep
+    if (this.logRetention) {
+      this.logRetention.stop();
+      resetLogRetentionService();
+      this.logRetention = null;
     }
 
     // Unsubscribe from all events
@@ -1514,6 +1570,16 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       return;
     }
 
+    // A user-stopped app must not be resurrected by a file-change hot-reload.
+    // Every other deploy path guards on this (detectedSub, buildSub); without
+    // it, any edit or touch to a stopped app's files (git pull, editor
+    // autosave) silently rebuilds and restarts it against the user's explicit
+    // `drop stop`.
+    if (appState.status === 'stopped') {
+      this.logger.debug(`Skipping update for ${appName} - app was stopped by user`, 'UPDATE');
+      return;
+    }
+
     // Remember the current port and whether the app was running
     const originalPort = appState.port;
     const wasRunning = appState.status === 'running';
@@ -1784,6 +1850,15 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         ? (this.postgresServer?.getSocketDir() ?? undefined)
         : undefined;
 
+    // Optional per-app resource caps. Only set when an operator has configured
+    // them (> 0), so we never silently kill an existing PM2 app or override
+    // docker's own 256 MB / 0.5-core container defaults. When set, PM2 honors
+    // `memory` (via max_memory_restart); docker honors both `memory` and `cpus`.
+    const memory =
+      this.config.maxMemoryMbPerApp > 0 ? `${this.config.maxMemoryMbPerApp}M` : undefined;
+    const cpus = this.config.maxCpusPerApp > 0 ? this.config.maxCpusPerApp : undefined;
+    const limits = memory !== undefined || cpus !== undefined ? { memory, cpus } : undefined;
+
     return {
       name: appName,
       script,
@@ -1796,6 +1871,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       appType: detection.type,
       healthCheckPath,
       pgSocketDir,
+      limits,
       env: {
         ...secretEnvVars,
         NODE_ENV: 'production',
