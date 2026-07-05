@@ -236,7 +236,7 @@ export class WatcherService {
   private handleAppDetected(
     appName: string,
     appPath: string,
-    hostname: string | null,
+    _hostname: string | null,
     _port: number | null
   ): void {
     if (this.knownApps.has(appName)) {
@@ -246,10 +246,14 @@ export class WatcherService {
     this.knownApps.add(appName);
     this.eventsEmitted++;
 
+    // The watcher only knows a directory appeared; it can't determine the app
+    // type. Leave `type` unset — the detector resolves it and the platform
+    // persists it after build. (Previously this overloaded `type` with the
+    // literal 'hostname', writing an invalid AppType into config/state.)
     eventBus.publish('app:detected', {
       name: appName,
       path: appPath,
-      type: hostname ? 'hostname' : undefined,
+      type: undefined,
     });
   }
 

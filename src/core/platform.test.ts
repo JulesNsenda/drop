@@ -472,6 +472,106 @@ describe('handleAppUpdate — stopped-app guard (P0-2)', () => {
   });
 });
 
+describe('deploy strand & startup reconciler (P1-1)', () => {
+  let platform: DropPlatform;
+  let tempDir: string;
+
+  beforeEach(async () => {
+    jest.clearAllMocks();
+    tempDir = path.join(os.tmpdir(), `drop-test-${Date.now()}`);
+    platform = createPlatform({
+      dropRoot: tempDir,
+      appsDirectory: path.join(tempDir, 'apps'),
+      logLevel: 'error',
+      autoBuild: true,
+      autoStart: true,
+      caddyfilePath: path.join(tempDir, 'Caddyfile'),
+    });
+    await platform.start();
+  });
+
+  afterEach(async () => {
+    if (platform && platform.isActive()) {
+      await platform.stop();
+    }
+  });
+
+  it('releases the in-progress guard when the initial status write throws', async () => {
+    const sm = (platform as any).stateManager;
+    // Simulate the app already being mid-deploy (handleBuildApp added it).
+    (platform as any).appsInProgress.add('wedged');
+    // The first setAppStatus — the 'starting' write — fails, as a disk error would.
+    sm.setAppStatus.mockRejectedValueOnce(new Error('disk full'));
+
+    await (platform as any).handleStartApp('wedged');
+
+    // finally must have released the guard, so future rebuilds aren't wedged.
+    expect((platform as any).appsInProgress.has('wedged')).toBe(false);
+  });
+
+  it('reconciles a mid-deploy building app to pending on startup', async () => {
+    const sm = (platform as any).stateManager;
+    sm.getAllApps.mockReturnValue([
+      { name: 'buildingapp', status: 'building', path: path.join(tempDir, 'apps', 'buildingapp') },
+    ]);
+    jest.spyOn((platform as any).runtime, 'getAllStatus').mockResolvedValue([]);
+
+    await (platform as any).syncStateWithProcesses();
+
+    expect(sm.setAppStatus).toHaveBeenCalledWith('buildingapp', 'pending');
+  });
+});
+
+describe('app type persistence after build (P1-5 / P1-6 follow-up)', () => {
+  let platform: DropPlatform;
+  let tempDir: string;
+
+  beforeEach(async () => {
+    jest.clearAllMocks();
+    tempDir = path.join(os.tmpdir(), `drop-test-${Date.now()}`);
+    platform = createPlatform({
+      dropRoot: tempDir,
+      appsDirectory: path.join(tempDir, 'apps'),
+      logLevel: 'error',
+      autoBuild: true,
+      autoStart: false,
+      caddyfilePath: path.join(tempDir, 'Caddyfile'),
+    });
+    await platform.start();
+  });
+
+  afterEach(async () => {
+    if (platform && platform.isActive()) {
+      await platform.stop();
+    }
+  });
+
+  it('persists the real detected type to state after building', async () => {
+    const sm = (platform as any).stateManager;
+    (platform as any).buildLogService = null; // skip build-log FS writes
+    jest.spyOn(platform.getDetector()!, 'detect').mockResolvedValue({
+      type: 'nodejs',
+      framework: null,
+      suggestedConfig: {},
+    } as any);
+    jest.spyOn(platform.getBuilder()!, 'build').mockResolvedValue({
+      success: true,
+      duration: 5,
+      errors: [],
+    } as any);
+
+    await (platform as any).handleBuildApp(path.join(tempDir, 'apps', 'app'), 'app', 'unknown');
+    // handleBuildApp's success path hands off to handleStartApp (which owns the
+    // guard release); that handoff doesn't run in isolation, so clear it here to
+    // keep afterEach's stop()/drain from waiting on it.
+    (platform as any).appsInProgress.clear();
+
+    // The watcher's app:detected can't know the real type, and detect() no
+    // longer republishes (P1-6), so the build path must persist it.
+    expect(sm.updateApp).toHaveBeenCalledWith('app', expect.objectContaining({ type: 'nodejs' }));
+  });
+});
+
 describe('buildStartSpec — resource limits (P0-4)', () => {
   let platform: DropPlatform;
   let tempDir: string;

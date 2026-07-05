@@ -131,4 +131,36 @@ describe('AppConfigService runtime field', () => {
       expect(owners.get('victim.dropkit.sh')).toBe('victim');
     });
   });
+
+  describe('write serialization (P1-2 lost-update)', () => {
+    it('serializes concurrent updates so no field is dropped', async () => {
+      const service = makeService();
+      await service.initialize();
+      await service.upsertConfig('app', { type: 'nodejs', port: 3000 });
+
+      // Two updates for the same app in flight at once, each setting a different
+      // field. Without serialization both read the {port:3000} base and the
+      // last write wins, dropping the other field.
+      await Promise.all([
+        service.updateConfig('app', { port: 3001 }),
+        service.updateConfig('app', { hostname: 'app.example.com' }),
+      ]);
+
+      const cfg = service.getConfig('app');
+      expect(cfg?.port).toBe(3001);
+      expect(cfg?.hostname).toBe('app.example.com');
+    });
+
+    it('a failed write does not break serialization for later writes', async () => {
+      const service = makeService();
+      await service.initialize();
+      // updateConfig on a missing app is a no-op (returns null) and must not
+      // wedge the per-app chain.
+      const missing = await service.updateConfig('ghost', { port: 1 });
+      expect(missing).toBeNull();
+
+      const created = await service.upsertConfig('ghost', { type: 'nodejs', port: 4000 });
+      expect(created.port).toBe(4000);
+    });
+  });
 });

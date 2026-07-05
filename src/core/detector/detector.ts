@@ -47,7 +47,7 @@ export class DetectorService {
   /**
    * Detect the application type for a given path
    */
-  async detect(appPath: string): Promise<DetectionResult> {
+  async detect(appPath: string, options?: { silent?: boolean }): Promise<DetectionResult> {
     // Verify path exists
     try {
       const stat = await fs.stat(appPath);
@@ -87,12 +87,16 @@ export class DetectorService {
     // Select best result
     const bestResult = this.selectBestResult(results);
 
-    // Emit detection event
-    eventBus.publish('app:detected', {
-      name: appPath.split(/[/\\]/).pop() || 'unknown',
-      path: appPath,
-      type: bestResult.type,
-    });
+    // Emit detection event — unless the caller is re-detecting an
+    // already-onboarded app (build/start/hot-reload). Re-publishing there
+    // re-triggers registerApp and flickers the app's status back to 'pending'.
+    if (!options?.silent) {
+      eventBus.publish('app:detected', {
+        name: appPath.split(/[/\\]/).pop() || 'unknown',
+        path: appPath,
+        type: bestResult.type,
+      });
+    }
 
     return bestResult;
   }
