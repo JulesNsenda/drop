@@ -105,6 +105,27 @@ describe('DetectorService', () => {
       expect(result.type).toBe('unknown');
       expect(result.confidence).toBe(0);
     });
+
+    describe('silent option (P1-6)', () => {
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const { eventBus } = require('../event-bus');
+      const detectedCount = (): number =>
+        (eventBus.publish as jest.Mock).mock.calls.filter(
+          (c: unknown[]) => c[0] === 'app:detected'
+        ).length;
+
+      it('publishes app:detected by default', async () => {
+        (eventBus.publish as jest.Mock).mockClear();
+        await new DetectorService().detect(tempDir);
+        expect(detectedCount()).toBe(1);
+      });
+
+      it('does not publish app:detected when silent (internal re-detection)', async () => {
+        (eventBus.publish as jest.Mock).mockClear();
+        await new DetectorService().detect(tempDir, { silent: true });
+        expect(detectedCount()).toBe(0);
+      });
+    });
   });
 });
 

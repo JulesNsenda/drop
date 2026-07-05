@@ -1212,7 +1212,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     if (!this.detector) return;
 
     try {
-      const result = await this.detector.detect(appPath);
+      const result = await this.detector.detect(appPath, { silent: true });
       this.logger.info(`Detected ${appName} as ${result.type} (confidence: ${result.confidence})`, 'DETECTOR');
 
       const appType = result.type as 'nodejs' | 'python' | 'go' | 'static' | 'docker' | 'unknown';
@@ -1275,7 +1275,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         await this.stateManager.setAppStatus(appName, 'building');
       }
 
-      const detection = await this.detector.detect(appPath);
+      const detection = await this.detector.detect(appPath, { silent: true });
       const workDir = await this.getBuildWorkDir(appName);
 
       const execCommand =
@@ -1374,7 +1374,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         }
       }
 
-      const detection = await this.detector.detect(appPath);
+      const detection = await this.detector.detect(appPath, { silent: true });
       const port = this.allocatePort(appName);
 
       this.logger.appEvent('starting', appName, `port ${port}`);
@@ -1643,7 +1643,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       await this.stateManager.setAppStatus(appName, 'building');
 
       // Re-detect and rebuild the app
-      const detection = await this.detector.detect(appPath);
+      const detection = await this.detector.detect(appPath, { silent: true });
       const workDir = await this.getBuildWorkDir(appName);
       const updateLogId = this.buildLogService
         ? await this.buildLogService.startBuild(appName, new Date())
