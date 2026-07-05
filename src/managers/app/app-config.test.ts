@@ -79,4 +79,56 @@ describe('AppConfigService runtime field', () => {
     expect(updated.runtime).toBe('docker');
     expect(updated.port).toBe(3005);
   });
+
+  describe('getDomainOwners (P0-6 hostname-hijack guard)', () => {
+    it('maps each hostname and custom domain to its owning app, lowercased', async () => {
+      const service = makeService();
+      await service.initialize();
+      await service.upsertConfig('shop', {
+        type: 'nodejs',
+        hostname: 'shop.localhost',
+        domains: ['shop.example.com', 'WWW.Shop.Example.com'],
+      });
+      await service.upsertConfig('blog', {
+        type: 'nodejs',
+        hostname: 'blog.localhost',
+      });
+
+      const owners = service.getDomainOwners();
+      expect(owners.get('shop.localhost')).toBe('shop');
+      expect(owners.get('shop.example.com')).toBe('shop');
+      expect(owners.get('www.shop.example.com')).toBe('shop'); // lowercased
+      expect(owners.get('blog.localhost')).toBe('blog');
+      expect(owners.has('unclaimed.example.com')).toBe(false);
+    });
+
+    it('seeds the real served hostname for a non-localhost suffix', async () => {
+      // The persisted hostname is `${name}.localhost`, but on a real box the app
+      // serves on `${name}.${suffix}` — which must be owned so a different app
+      // cannot claim `victim.<suffix>` (the production hijack scenario).
+      const service = makeService();
+      await service.initialize();
+      await service.upsertConfig('victim', { type: 'nodejs', hostname: 'victim.localhost' });
+
+      const owners = service.getDomainOwners('dropkit.sh');
+      expect(owners.get('victim.dropkit.sh')).toBe('victim');
+      expect(owners.get('victim.localhost')).toBe('victim');
+    });
+
+    it("default hostname wins over another app's stale persisted domain claim", async () => {
+      // Simulate a pre-fix hijack: 'evil' persisted victim's served hostname.
+      const service = makeService();
+      await service.initialize();
+      await service.upsertConfig('victim', { type: 'nodejs', hostname: 'victim.localhost' });
+      await service.upsertConfig('evil', {
+        type: 'nodejs',
+        hostname: 'evil.localhost',
+        domains: ['victim.dropkit.sh'],
+      });
+
+      const owners = service.getDomainOwners('dropkit.sh');
+      // Pass 2 restores true ownership, so evil's re-deploy would be rejected.
+      expect(owners.get('victim.dropkit.sh')).toBe('victim');
+    });
+  });
 });

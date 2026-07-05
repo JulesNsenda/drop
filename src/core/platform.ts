@@ -1458,10 +1458,12 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       let domains: string[] = [defaultHostname];
       let customTls: { certFile?: string; keyFile?: string } | undefined;
 
+      let hasCustomDomains = false;
       if (dropYaml.success && dropYaml.config) {
         if (dropYaml.config.domains && dropYaml.config.domains.length > 0) {
           domains = dropYaml.config.domains;
-          this.logger.info(`Custom domains configured for ${appName}: ${domains.join(', ')}`, 'ROUTER');
+          hasCustomDomains = true;
+          this.logger.info(`Custom domains requested for ${appName}: ${domains.join(', ')}`, 'ROUTER');
         }
 
         // Check for custom TLS config
@@ -1476,14 +1478,37 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
             this.logger.info(`Custom TLS certificates configured for ${appName}`, 'ROUTER');
           }
         }
+      }
 
-        // Save custom domains to app config
-        if (this.appConfigService && dropYaml.config.domains) {
-          await this.appConfigService.updateConfig(appName, {
-            domains: dropYaml.config.domains,
-            tls: dropYaml.config.tls,
-          });
-        }
+      // Cross-tenant hostname guard: reject any custom domain already claimed by
+      // a *different* app before it reaches Caddy. Without this, a tenant's
+      // drop.yaml could claim another app's hostname/domain and hijack its
+      // traffic, or introduce a duplicate site address that wedges Caddy's
+      // config reload for the whole box. The app always keeps its own default
+      // hostname (never filtered), so it stays reachable even if every custom
+      // domain is refused.
+      let acceptedCustomDomains: string[] = [];
+      if (hasCustomDomains && this.appConfigService) {
+        const owners = this.appConfigService.getDomainOwners(domainSuffix);
+        acceptedCustomDomains = domains.filter((d) => {
+          const owner = owners.get(d.toLowerCase());
+          if (owner && owner !== appName) {
+            this.logger.warn(
+              `Refusing domain '${d}' for ${appName}: already claimed by '${owner}'`,
+              'ROUTER'
+            );
+            return false;
+          }
+          return true;
+        });
+        domains = acceptedCustomDomains.length > 0 ? acceptedCustomDomains : [defaultHostname];
+
+        // Persist only the accepted domains as the source of truth — never the
+        // raw, possibly-hijacking request.
+        await this.appConfigService.updateConfig(appName, {
+          domains: acceptedCustomDomains,
+          tls: dropYaml.config?.tls,
+        });
       }
 
       // In docker (multi-user) mode inject security headers on all tenant routes.
@@ -1532,8 +1557,10 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         await this.caddyServer.reload();
       }
     } catch (error) {
-      // Route might already exist
-      this.logger.warn(`Failed to configure route for ${appName}`, 'ROUTER', error);
+      // Surface at error level: a failed reload means this (and every
+      // subsequent) route change silently stops applying until an operator
+      // intervenes — not a benign "route already exists".
+      this.logger.error(`Failed to configure route for ${appName}`, 'ROUTER', error);
     }
   }
 
