@@ -187,47 +187,6 @@ export class ProcessManager {
   }
 
   /**
-   * Scale a process to the specified number of instances
-   */
-  async scale(name: string, _instances: number): Promise<ProcessStatus> {
-    const status = await this.getStatus(name);
-    if (!status) {
-      throw new Error(`Process not found: ${name}`);
-    }
-
-    if (status.execMode !== 'cluster') {
-      throw new Error('Scaling is only supported in cluster mode');
-    }
-
-    // PM2 doesn't have a direct scale API, we need to restart with new instance count
-    // For now, we'll use the pm2 command approach via pm2Client
-    // This is a simplified implementation - in production you'd want proper scaling
-
-    try {
-      // Delete and restart with new instance count
-      // This is not truly zero-downtime, but works for MVP
-      await pm2Client.deleteProcess(name);
-
-      // Get the original config somehow - for now just restart
-      // In a full implementation, we'd store the config
-      const newStatus = await this.waitForStatus(name, 'online', 30000);
-
-      return newStatus;
-    } catch (error) {
-      const errorObj = error instanceof Error ? error : new Error('Failed to scale process');
-
-      eventBus.publish('app:error', {
-        appId: name,
-        name,
-        error: errorObj,
-        context: 'scale',
-      });
-
-      throw errorObj;
-    }
-  }
-
-  /**
    * Get the status of a process
    */
   async getStatus(name: string): Promise<ProcessStatus | null> {
