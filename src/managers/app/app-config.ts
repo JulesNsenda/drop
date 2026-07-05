@@ -274,6 +274,37 @@ export class AppConfigService {
     }
     return undefined;
   }
+
+  /**
+   * Map every domain claimed by any app (its default hostname plus any custom
+   * domains) to the app that owns it. Used to stop one app from claiming a
+   * hostname already owned by another (cross-tenant routing hijack). Keys are
+   * lowercased for case-insensitive comparison.
+   *
+   * `domainSuffix` is the platform's serving suffix (e.g. `dropkit.sh`). The
+   * hostname persisted in config is always `${name}.localhost`, but the
+   * hostname an app actually *serves on* is `${name}.${domainSuffix}` (computed
+   * at route time, never persisted). We seed those here — and let them win over
+   * any persisted `domains` entry — so a different app can never claim (or keep
+   * a stale claim on) `${victim}.${domainSuffix}` on a non-localhost box.
+   */
+  getDomainOwners(domainSuffix?: string): Map<string, string> {
+    const owners = new Map<string, string>();
+    // Pass 1: persisted hostname + custom domains.
+    for (const [appName, config] of this.configs) {
+      if (config.hostname) owners.set(config.hostname.toLowerCase(), appName);
+      for (const d of config.domains ?? []) {
+        owners.set(d.toLowerCase(), appName);
+      }
+    }
+    // Pass 2: each app's computed default hostname is authoritative for that app.
+    if (domainSuffix) {
+      for (const appName of this.configs.keys()) {
+        owners.set(`${appName}.${domainSuffix}`.toLowerCase(), appName);
+      }
+    }
+    return owners;
+  }
 }
 
 // Singleton instance

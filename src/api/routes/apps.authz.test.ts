@@ -111,4 +111,26 @@ describe('app route authorization', () => {
     const aliceJson = (await aliceRes.json()) as { data: { used: number } };
     expect(aliceJson.data.used).toBe(1); // alice owns one
   });
+
+  it('rejects an invalid app name on POST /apps (P0-9)', async () => {
+    await createUser('root', 'password123', 'admin');
+    const adminToken = await getTestToken('root', 'password123');
+    const dir = path.join(tempDir, 'validdir');
+    await fs.mkdir(dir, { recursive: true });
+
+    // Admin bypasses path containment, so we reach the name-validation step.
+    const bad = await app.request('/api/v1/apps', {
+      method: 'POST',
+      headers: { ...authHeader(adminToken), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: dir, name: 'bad name!!' }),
+    });
+    expect(bad.status).toBe(400);
+
+    const ok = await app.request('/api/v1/apps', {
+      method: 'POST',
+      headers: { ...authHeader(adminToken), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: dir, name: 'good-name' }),
+    });
+    expect(ok.status).toBe(201);
+  });
 });

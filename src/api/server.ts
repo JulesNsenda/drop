@@ -160,6 +160,9 @@ export class ApiServer {
       v1.use('/apps', authMiddleware('readonly'));
       v1.use('/usage', authMiddleware('readonly'));
       v1.use('/logs/*', authMiddleware('readonly'));
+      // Renewal triggers a platform-wide ACME pass (Let's Encrypt rate-limit
+      // risk) — admin-only. Register before the general /certs/* guard.
+      v1.use('/certs/renew', authMiddleware('admin'));
       v1.use('/certs/*', authMiddleware('readonly'));
       v1.use('/secrets/*', authMiddleware('user'));
       v1.use('/webhooks/*', authMiddleware('admin'));
