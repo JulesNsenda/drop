@@ -6,9 +6,10 @@
 
 import * as http from 'http';
 import { Hono } from 'hono';
-import { success, HealthDto, StatsDto } from '../types';
+import { success, HealthDto, StatsDto, ComponentHealth } from '../types';
 import { getAppRuntime } from '../../managers/runtime';
 import { getStateManager, AppStateManager } from '../../managers/app/state-manager';
+import { getCaddyAdminClient } from '../../managers/router/caddy-api';
 import { getPlatformVersion } from '../../utils/version';
 import { getAppsDirectory } from '../runtime-config';
 
@@ -18,6 +19,85 @@ const health = new Hono();
 const startTime = Date.now();
 
 const platformVersion = getPlatformVersion();
+
+/** Per-subsystem health probe timeout. A probe must never hang the endpoint. */
+const PROBE_TIMEOUT_MS = 2000;
+
+/** Max concurrent app pings for /health/apps so a large fleet can't self-DoS. */
+const APP_PING_CONCURRENCY = 10;
+
+const TIMED_OUT = Symbol('timed-out');
+
+/**
+ * Resolve to the probe's value, or to TIMED_OUT if it takes longer than `ms`.
+ * A rejection propagates so the caller can report the real error message —
+ * only a genuine hang is converted to a timeout.
+ */
+function withTimeout<T>(p: Promise<T>, ms: number): Promise<T | typeof TIMED_OUT> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => resolve(TIMED_OUT), ms);
+    p.then(
+      (v) => {
+        clearTimeout(timer);
+        resolve(v);
+      },
+      (e) => {
+        clearTimeout(timer);
+        reject(e);
+      }
+    );
+  });
+}
+
+async function probeProcessManager(): Promise<ComponentHealth> {
+  try {
+    const processes = await withTimeout(getAppRuntime().getAllStatus(), PROBE_TIMEOUT_MS);
+    if (processes === TIMED_OUT) return { status: 'down', message: 'process manager probe timed out' };
+    return { status: 'up', message: `${processes.length} process(es) tracked` };
+  } catch (err) {
+    return { status: 'down', message: err instanceof Error ? err.message : 'Unknown error' };
+  }
+}
+
+async function probeDatabase(): Promise<ComponentHealth> {
+  try {
+    const { getPostgresServer } = await import('../../managers/database');
+    const pg = getPostgresServer();
+    const pgStatus = pg.getStatus();
+    return {
+      status: pgStatus === 'running' ? 'up' : 'down',
+      message: `PostgreSQL ${pgStatus} on port ${pg.getPort()}`,
+    };
+  } catch {
+    return { status: 'unknown', message: 'Not initialized' };
+  }
+}
+
+/** Run `fn` over `items` with at most `limit` in flight at once (order preserved). */
+async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
+  const results: R[] = new Array(items.length);
+  let next = 0;
+  const worker = async (): Promise<void> => {
+    while (next < items.length) {
+      const idx = next++;
+      results[idx] = await fn(items[idx]);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, () => worker()));
+  return results;
+}
+
+async function probeCaddy(): Promise<ComponentHealth> {
+  try {
+    const available = await withTimeout(getCaddyAdminClient().isAvailable(), PROBE_TIMEOUT_MS);
+    if (available === TIMED_OUT) return { status: 'unknown', message: 'Caddy probe timed out' };
+    return available
+      ? { status: 'up', message: 'Caddy admin API reachable' }
+      : { status: 'down', message: 'Caddy admin API unreachable' };
+  } catch {
+    return { status: 'unknown', message: 'Caddy not configured' };
+  }
+}
 
 /** Quick HTTP ping to check if an app is responding */
 function httpPing(port: number, timeoutMs = 3000): Promise<boolean> {
@@ -33,48 +113,30 @@ function httpPing(port: number, timeoutMs = 3000): Promise<boolean> {
 
 // GET /health - Full health check with all components
 health.get('/', async (c) => {
-  let pmStatus: 'up' | 'down' = 'unknown' as 'up' | 'down';
-  let pmMessage: string | undefined;
-  let dbStatus: 'up' | 'down' | 'unknown' = 'unknown';
-  let dbMessage: string | undefined;
+  // Probe subsystems in parallel, each time-bounded so a hung dependency (e.g.
+  // an unresponsive PM2 daemon) degrades the report instead of hanging /health.
+  const [processManager, database, caddy] = await Promise.all([
+    probeProcessManager(),
+    probeDatabase(),
+    probeCaddy(),
+  ]);
 
-  // Check process manager
+  // State-manager reachability (a lightweight proxy for platform liveness).
+  let watcher: ComponentHealth = { status: 'unknown' };
   try {
-    const pm = getAppRuntime();
-    const processes = await pm.getAllStatus();
-    pmStatus = 'up';
-    pmMessage = `${processes.length} process(es) tracked`;
-  } catch (err) {
-    pmStatus = 'down';
-    pmMessage = err instanceof Error ? err.message : 'Unknown error';
-  }
-
-  // Check PostgreSQL
-  try {
-    const { getPostgresServer } = await import('../../managers/database');
-    const pg = getPostgresServer();
-    const pgStatus = pg.getStatus();
-    dbStatus = pgStatus === 'running' ? 'up' : 'down';
-    dbMessage = `PostgreSQL ${pgStatus} on port ${pg.getPort()}`;
+    getStateManager().getAllApps();
+    watcher = { status: 'up' };
   } catch {
-    dbStatus = 'unknown';
-    dbMessage = 'Not initialized';
+    watcher = { status: 'unknown' };
   }
 
-  // Check watcher
-  let watcherStatus: 'up' | 'down' | 'unknown' = 'unknown';
-  try {
-    const stateManager = getStateManager();
-    const apps = stateManager.getAllApps();
-    watcherStatus = apps.length >= 0 ? 'up' : 'unknown';
-  } catch {
-    watcherStatus = 'unknown';
-  }
-
-  // Determine overall status
-  const allUp = pmStatus === 'up' && dbStatus === 'up';
-  const anyDown = pmStatus === 'down' || dbStatus === 'down';
-  const overallStatus = allUp ? 'healthy' : anyDown ? 'degraded' : 'healthy';
+  // Degraded (not healthy) only if an always-required subsystem is down.
+  // Caddy is reported for visibility but does NOT force 'degraded': it is
+  // optional (localhost / no-HTTPS setups run without it), so treating it as
+  // down-worthy would falsely degrade those. Whether a Caddy-expecting install
+  // should degrade on Caddy-down is a config-aware policy left as a follow-up.
+  const coreDown = processManager.status === 'down' || database.status === 'down';
+  const overallStatus = coreDown ? 'degraded' : 'healthy';
 
   const response: HealthDto = {
     status: overallStatus,
@@ -83,9 +145,10 @@ health.get('/', async (c) => {
     timestamp: new Date().toISOString(),
     components: {
       platform: { status: 'up' },
-      processManager: { status: pmStatus, message: pmMessage },
-      database: { status: dbStatus, message: dbMessage },
-      watcher: { status: watcherStatus },
+      processManager,
+      database,
+      watcher,
+      caddy,
     },
     system: {
       platform: process.platform,
@@ -130,17 +193,15 @@ health.get('/apps', async (c) => {
   }
 
   const runningApps = stateManager.getRunningApps();
-  const checks = await Promise.all(
-    runningApps.map(async (app) => {
-      const healthy = app.port ? await httpPing(app.port) : false;
-      return {
-        name: app.name,
-        status: app.status,
-        port: app.port,
-        healthy,
-      };
-    })
-  );
+  const checks = await mapLimit(runningApps, APP_PING_CONCURRENCY, async (app) => {
+    const healthy = app.port ? await httpPing(app.port) : false;
+    return {
+      name: app.name,
+      status: app.status,
+      port: app.port,
+      healthy,
+    };
+  });
 
   const healthyCount = checks.filter((c) => c.healthy).length;
 
@@ -150,8 +211,10 @@ health.get('/apps', async (c) => {
 // GET /health/ready - Readiness probe for k8s/orchestration
 health.get('/ready', async (c) => {
   try {
-    const pm = getAppRuntime();
-    await pm.getAllStatus();
+    const status = await withTimeout(getAppRuntime().getAllStatus(), PROBE_TIMEOUT_MS);
+    if (status === TIMED_OUT) {
+      return c.json(success({ ready: false }), 503);
+    }
     return c.json(success({ ready: true }));
   } catch {
     return c.json(success({ ready: false }), 503);
