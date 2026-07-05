@@ -570,6 +570,26 @@ describe('app type persistence after build (P1-5 / P1-6 follow-up)', () => {
     // longer republishes (P1-6), so the build path must persist it.
     expect(sm.updateApp).toHaveBeenCalledWith('app', expect.objectContaining({ type: 'nodejs' }));
   });
+
+  it('persists a changed type on hot-reload too', async () => {
+    const sm = (platform as any).stateManager;
+    sm.getApp.mockReturnValue({ name: 'app', status: 'running', port: 3005 });
+    (platform as any).buildLogService = null;
+    jest.spyOn(platform.getDetector()!, 'detect').mockResolvedValue({
+      type: 'python',
+      framework: null,
+      suggestedConfig: {},
+    } as any);
+    // Fail the build fast — the type write happens before the build runs.
+    jest.spyOn(platform.getBuilder()!, 'build').mockResolvedValue({
+      success: false,
+      errors: [{ message: 'stub' }],
+    } as any);
+
+    await (platform as any).handleAppUpdate('app', path.join(tempDir, 'apps', 'app'), 'edit');
+
+    expect(sm.updateApp).toHaveBeenCalledWith('app', expect.objectContaining({ type: 'python' }));
+  });
 });
 
 describe('buildStartSpec — resource limits (P0-4)', () => {

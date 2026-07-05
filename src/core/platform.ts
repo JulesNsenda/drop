@@ -1598,6 +1598,23 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
 
       // Re-detect and rebuild the app
       const detection = await this.detector.detect(appPath, { silent: true });
+
+      // Persist the (possibly changed) type on hot-reload too — detect() is
+      // silent, so this is the only place a static→node type change is recorded.
+      const detectedType = detection.type as
+        | 'nodejs'
+        | 'python'
+        | 'go'
+        | 'static'
+        | 'docker'
+        | 'unknown';
+      if (this.appConfigService) {
+        await this.appConfigService.updateConfig(appName, { type: detectedType });
+      }
+      if (this.stateManager) {
+        await this.stateManager.updateApp(appName, { type: detectedType });
+      }
+
       const workDir = await this.getBuildWorkDir(appName);
       const updateLogId = this.buildLogService
         ? await this.buildLogService.startBuild(appName, new Date())
