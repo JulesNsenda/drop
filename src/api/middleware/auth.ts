@@ -173,18 +173,72 @@ export async function initializeAuth(authConfig: AuthConfig): Promise<void> {
  * Load credentials from file
  */
 async function loadCredentials(credentialsPath: string): Promise<CredentialsStore> {
+  let data: string;
   try {
-    const data = await fs.readFile(credentialsPath, 'utf-8');
-    return JSON.parse(data);
+    data = await fs.readFile(credentialsPath, 'utf-8');
   } catch {
-    // Create new credentials store
-    const store: CredentialsStore = {
-      users: [],
-      apiKeys: [],
-      jwtSecret: crypto.randomBytes(32).toString('hex'),
-    };
-    await saveCredentials(credentialsPath, store);
-    return store;
+    // No credentials file yet — first run. Create a fresh store.
+    return createFreshCredentials(credentialsPath);
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(data);
+  } catch (err) {
+    // Corrupt credentials file. Overwriting it would wipe every user and API
+    // key and mint a brand-new default admin (see initializeAuth) — a silent,
+    // unrecoverable takeover of the auth store. Quarantine it for forensics
+    // before falling back to an empty store.
+    await quarantineCorruptCredentials(credentialsPath, err);
+    return createFreshCredentials(credentialsPath);
+  }
+
+  if (!isValidCredentialsStore(parsed)) {
+    // Parsed but not a usable store (wrong shape / truncated-yet-valid JSON) —
+    // treat the same as corrupt: preserve, don't overwrite.
+    await quarantineCorruptCredentials(
+      credentialsPath,
+      new Error('credentials store has an unexpected shape')
+    );
+    return createFreshCredentials(credentialsPath);
+  }
+
+  return parsed;
+}
+
+/** Structural check that a parsed value is a usable CredentialsStore before we trust it. */
+function isValidCredentialsStore(value: unknown): value is CredentialsStore {
+  if (typeof value !== 'object' || value === null) return false;
+  const v = value as Record<string, unknown>;
+  return (
+    Array.isArray(v.users) &&
+    Array.isArray(v.apiKeys) &&
+    typeof v.jwtSecret === 'string' &&
+    v.jwtSecret.length > 0
+  );
+}
+
+async function createFreshCredentials(credentialsPath: string): Promise<CredentialsStore> {
+  const store: CredentialsStore = {
+    users: [],
+    apiKeys: [],
+    jwtSecret: crypto.randomBytes(32).toString('hex'),
+  };
+  await saveCredentials(credentialsPath, store);
+  return store;
+}
+
+async function quarantineCorruptCredentials(credentialsPath: string, err: unknown): Promise<void> {
+  try {
+    const ts = new Date().toISOString().replace(/[:.]/g, '-');
+    const quarantinePath = `${credentialsPath}.corrupt-${ts}`;
+    await fs.rename(credentialsPath, quarantinePath);
+    console.error(
+      `[auth] Corrupt credentials store quarantined to ${quarantinePath}:`,
+      err instanceof Error ? err.message : err
+    );
+  } catch (renameErr) {
+    console.error('[auth] Failed to quarantine corrupt credentials store:', renameErr);
   }
 }
 
