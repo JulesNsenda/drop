@@ -34,11 +34,6 @@ npm run lint:fix         # Auto-fix lint issues
 npm run format           # Prettier format (src/**/*.ts)
 npm run format:check     # Check formatting
 
-# Database (internal PostgreSQL "drop_internal")
-npm run db:migrate              # Apply pending .sql migrations
-npm run db:migrate -- status    # Show applied/pending migrations
-npm run db:migrate:create <name>  # Scaffold a new migration
-
 # CLI (after npm run build + npm link, or via npm run dev)
 drop serve               # Start DROP platform (also: -d daemon, -r <root>, --https, --domain)
 drop list [--all]        # List running (or all) apps
@@ -103,21 +98,18 @@ Middleware stack (applied in `setupMiddleware`): security headers → CORS → b
 
 A **separate npm package** (React 18 + Vite + Tailwind + react-router-dom). It has its own `package.json`, `node_modules`, and `tsconfig.json`. It is built to `dist/dashboard/` and served by `ApiServer` at `/dashboard` (SPA fallback). `ApiServer` prefers the built `dist/dashboard` over `src/dashboard`. Treat the dashboard as its own frontend project — run `npm` commands from inside `src/dashboard/`.
 
-### Persistence Model (three layers — important)
+### Persistence Model (two file-based layers — important)
 
-DROP intentionally keeps lightweight state in files and uses PostgreSQL only where relational data helps:
+DROP keeps its own state in flat files; PostgreSQL is provisioned only as a service *for deployed apps*, not for platform state:
 
 1. **App runtime state** → `AppStateManager`, JSON file at `data/drop-svc/apps.json`. Zero-config status tracking (`pending`/`building`/`running`/`stopped`/`errored`, port, pid).
 2. **Per-app config** → `AppConfigService`, files under `data/appconf/webapps/`. **Source of truth for ports** and persisted deploy metadata. On startup `platform.ts` reconciles: config files > running PM2 processes > apps.json.
-3. **Internal PostgreSQL DB** (`drop_internal`) → relational tables (`apps`, `domains`, `env_vars`, `deployments`, `platform_config`) via SQL migrations in `src/managers/app/migrations/*.sql`. Accessed through the `Database` pool class (`src/managers/app/database.ts`); the `MigrationRunner` applies numbered `.sql` files in a transaction and records them in a `migrations` table.
 
 Other file-backed stores under `data/drop-svc/`: `secrets.json` (encrypted), `webhooks.json`, `activity-log.json`, `api-credentials.json`, `encryption.key` (auto-generated, `0600`).
 
-> Note: code comments and `PRD-033-sqlite-state.md` reference a future `drop.db` SQLite store. The current runtime uses the JSON files above — don't assume a SQLite file exists.
+**Bundled PostgreSQL** (`src/managers/database/`) is a *runtime dependency for apps*: `DatabaseProvisioner` creates a per-app database and injects `DATABASE_URL` when an app needs one. It does **not** store platform state.
 
-### Migrations
-
-To change the internal DB schema: add a new `NNN_name.sql` file in `src/managers/app/migrations/` (numeric prefix determines order), then `npm run db:migrate`. Migrations are PostgreSQL (UUID PKs, JSONB, triggers — see `001_initial.sql`). `scripts/create-migration.ts` scaffolds new files.
+> Historical note: an internal relational registry (`AppRegistry` + a `drop_internal` schema + `MigrationRunner` + `db:migrate` scripts) once existed but was never wired into `platform.ts` — it was removed as dead code (the two file layers above are the real system of record). Code comments / `PRD-005` / `PRD-033-sqlite-state.md` may still reference the old registry or a future `drop.db` SQLite store; neither exists in the runtime.
 
 ### Path Aliases
 
