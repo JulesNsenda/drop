@@ -15,12 +15,18 @@ export class PythonBuildStrategy extends BaseBuildStrategy {
   supportedTypes: AppType[] = ['python', 'django', 'flask', 'fastapi'];
 
   getInstallCommand(context: BuildContext): string | null {
+    // preBuild sets skipInstall when no dependency manifest exists — nothing to
+    // install, so don't run pip against a requirements.txt that isn't there.
+    if (context.config.skipInstall) {
+      return null;
+    }
+
     // Use custom install command if provided
     if (context.config.installCommand) {
       return context.config.installCommand;
     }
 
-    // Will be updated in preBuild based on what files exist
+    // Default: a requirements.txt is the common case.
     return 'pip install -r requirements.txt';
   }
 
@@ -67,8 +73,10 @@ export class PythonBuildStrategy extends BaseBuildStrategy {
       } else if (hasRequirements) {
         context.config.installCommand = 'pip install -r requirements.txt';
       } else {
-        // No dependencies file found
-        context.config.installCommand = '';
+        // No dependency manifest found → skip the install stage entirely
+        // (the same mechanism nodejs uses), rather than an '' sentinel that
+        // getInstallCommand's truthy check would ignore.
+        context.config.skipInstall = true;
       }
     }
   }
