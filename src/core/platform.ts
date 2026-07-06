@@ -21,6 +21,7 @@ import { SecretManager, getSecretManager, resetSecretManager } from '../managers
 import { WebhookManager, getWebhookManager, resetWebhookManager } from './webhooks';
 import { GitDeployService, getGitDeployService, resetGitDeployService } from './git-deploy';
 import { getActivityLog, resetActivityLog } from '../managers/activity';
+import { getDeployTracker, resetDeployTracker } from '../managers/deploy-tracker';
 import { ApiServer, createApiServer } from '../api';
 import { Logger, createLogger } from '../utils/logger';
 import {
@@ -207,6 +208,10 @@ export class DropPlatform {
   private logRetention: LogRetentionService | null = null;
 
   private subscriptions: Unsubscribe[] = [];
+  // Held separately from `subscriptions`: must stay subscribed through
+  // drainInProgress() in stop() so late-completing deploys still close out
+  // (see the drain-window fix in docs/plans/2026-07-06-p2-4-deploy-observability.md).
+  private deployTrackerUnsub?: Unsubscribe;
   private isRunning = false;
   private nextPort: number;
   private usedPorts: Map<number, string> = new Map(); // port -> appName ownership
@@ -423,6 +428,21 @@ export class DropPlatform {
     resetGitDeployService();
     resetActivityLog();
     resetBuildLogService();
+
+    // Tear down the deploy tracker's subscription only now — after the drain
+    // above completes — so a deploy that finishes during the drain window
+    // still gets its closing row recorded, then flush the final state to
+    // disk before reset.
+    if (this.deployTrackerUnsub) {
+      this.deployTrackerUnsub();
+      this.deployTrackerUnsub = undefined;
+    }
+    try {
+      await getDeployTracker().flush();
+    } catch {
+      // best-effort
+    }
+    resetDeployTracker();
 
     // Stop API server
     if (this.apiServer) {
@@ -782,6 +802,14 @@ backup:
     const activityLogPath = path.join(this.config.dropRoot, 'data', 'drop-svc', 'activity-log.json');
     const activityLog = getActivityLog(activityLogPath);
     await activityLog.initialize();
+
+    // Initialize deploy tracker (durable per-deploy timeline). Its unsubscribe
+    // is held separately from `this.subscriptions` — see stop() — so it stays
+    // wired through the shutdown drain window.
+    const deployStorePath = path.join(this.config.dropRoot, 'data', 'drop-svc', 'deploys.json');
+    const deployTracker = getDeployTracker(deployStorePath);
+    await deployTracker.initialize();
+    this.deployTrackerUnsub = deployTracker.subscribe(this.eventBus);
 
     // Sync state manager with app configs (configs are source of truth for ports)
     await this.syncStateWithConfigs();
