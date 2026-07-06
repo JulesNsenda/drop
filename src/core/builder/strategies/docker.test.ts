@@ -3,12 +3,9 @@
  *
  * Covers the pure command-generation methods (image-name sanitization) plus
  * the file-system-dependent preBuild Dockerfile/compose-file detection and
- * validate().
- *
- * Note: dockerfilePath/composeFile are tracked as *instance* fields on the
- * strategy rather than on the (per-build) BuildContext — see the dedicated
- * "shared instance state" test below, which documents a real cross-build
- * leak this causes (reported in FINDINGS).
+ * validate(). The strategy is a shared singleton, so it records the detected
+ * file on the per-build BuildContext (config.dockerFile) rather than on the
+ * instance — the "no leak across builds" test below locks that in.
  */
 
 import * as fs from 'fs/promises';
@@ -135,12 +132,9 @@ describe('DockerBuildStrategy', () => {
       expect(c.config.buildCommand).toBeUndefined();
     });
 
-    it('BUG: leaks a previously detected Dockerfile path into a later, unrelated build (shared instance state)', async () => {
-      // dockerfilePath/composeFile are private fields on the strategy
-      // instance, not on the per-build BuildContext. BuilderService registers
-      // a single shared strategy instance for every docker app (see
-      // dockerBuildStrategy singleton export), so sequential builds for
-      // *different* apps share this state.
+    it('does not leak a detected file into a later, unrelated build (shared singleton is stateless)', async () => {
+      // The strategy is exported as one shared instance reused for every docker
+      // app, so per-build detection must live on the context, not the instance.
       const strategy = new DockerBuildStrategy();
 
       const appA = await fs.mkdtemp(path.join(os.tmpdir(), 'drop-docker-a-'));
@@ -151,14 +145,11 @@ describe('DockerBuildStrategy', () => {
         await strategy.preBuild(ctxA);
         expect(ctxA.config.buildCommand).toBe('docker build -t app-a:latest -f Dockerfile .');
 
-        // appB has no Docker files at all.
+        // appB has no Docker files at all → it must NOT inherit appA's Dockerfile.
         const ctxB = ctx({ appName: 'app-b', appPath: appB });
         await strategy.preBuild(ctxB);
-
-        // Real (surprising) behaviour: buildCommand for appB still
-        // references "-f Dockerfile", inherited from appA's build, even
-        // though appB's directory has no Dockerfile of its own.
-        expect(ctxB.config.buildCommand).toBe('docker build -t app-b:latest -f Dockerfile .');
+        expect(ctxB.config.buildCommand).toBeUndefined();
+        expect(ctxB.config.dockerFile).toBeUndefined();
       } finally {
         await fs.rm(appA, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
         await fs.rm(appB, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
