@@ -212,6 +212,11 @@ export class DropPlatform {
   private usedPorts: Map<number, string> = new Map(); // port -> appName ownership
   private appsInProgress: Set<string> = new Set(); // Track apps being built/started
   private appDeployTimes: Map<string, number> = new Map(); // Track when apps were last deployed
+  // Apps whose rebuild+restart is being managed as a single transaction by
+  // handleAppUpdate. Their builder.build still emits build:completed, but
+  // buildSub must NOT also start them (that would double-start). Held only for
+  // the duration of the build() call — see handleAppUpdate / buildSub.
+  private selfManagedUpdates: Set<string> = new Set();
   private appBuildDurations: Map<string, number> = new Map(); // Last build duration per app (ms)
   /** Minimum post-deploy quiet window. Adaptive: max(this, lastBuildDuration * 2). */
   private readonly DEPLOY_COOLDOWN_MS_MIN = 5_000;
@@ -1030,6 +1035,19 @@ backup:
     // hands ownership to handleStartApp; every path here that does NOT start
     // the app must release the guard, or future hot-reloads dead-end forever.
     const buildSub = this.eventBus.subscribe('build:completed', async (payload) => {
+      // A hot-reload (handleAppUpdate) owns its own stop+rebuild+start as one
+      // transaction — its builder.build emits build:completed too, but buildSub
+      // must abstain or the app double-starts. handleAppUpdate owns appsInProgress
+      // cleanup in that case, so we return without touching it. MUST be the first
+      // statement (before any await): it is correct only because EventBus
+      // dispatch is synchronous, so this runs during build()'s publish, between
+      // handleAppUpdate's marker add() and the finally delete() bracketing the
+      // await this.builder.build(...). A move to async/deferred dispatch would
+      // silently reintroduce the double-start.
+      if (this.selfManagedUpdates.has(payload.appId)) {
+        return;
+      }
+
       if (payload.success === false) {
         // Failed build — handleBuildApp already marked it errored and cleaned up.
         this.appsInProgress.delete(payload.appId);
@@ -1630,21 +1648,32 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       const updateLogId = this.buildLogService
         ? await this.buildLogService.startBuild(appName, new Date())
         : null;
-      const buildResult = await this.builder.build({
-        appName,
-        appPath,
-        appType: detection.type,
-        framework: detection.framework || null,
-        config: {
-          buildCommand: detection.suggestedConfig?.buildCommand,
-          installCommand: detection.suggestedConfig?.installCommand,
-        },
-        env: {},
-        workDir,
-        onBuildLog: updateLogId && this.buildLogService
-          ? (line) => this.buildLogService!.writeLine(updateLogId, line)
-          : undefined,
-      });
+      // Mark this app self-managed only around build(): the build:completed it
+      // emits is dispatched synchronously inside build(), so buildSub sees the
+      // marker and abstains from starting the app (handleAppUpdate starts it
+      // below). finally guarantees the marker is cleared even on build failure —
+      // a stuck marker would silently suppress the app's NEXT legit deploy.
+      this.selfManagedUpdates.add(appName);
+      let buildResult;
+      try {
+        buildResult = await this.builder.build({
+          appName,
+          appPath,
+          appType: detection.type,
+          framework: detection.framework || null,
+          config: {
+            buildCommand: detection.suggestedConfig?.buildCommand,
+            installCommand: detection.suggestedConfig?.installCommand,
+          },
+          env: {},
+          workDir,
+          onBuildLog: updateLogId && this.buildLogService
+            ? (line) => this.buildLogService!.writeLine(updateLogId, line)
+            : undefined,
+        });
+      } finally {
+        this.selfManagedUpdates.delete(appName);
+      }
       if (updateLogId && this.buildLogService) {
         await this.buildLogService.finishBuild(updateLogId, appName);
       }
