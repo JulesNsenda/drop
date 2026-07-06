@@ -21,6 +21,7 @@ import { appUrl } from '../api/client';
 import { useToast } from '../components/Toast';
 import { useConfirm } from '../components/ConfirmDialog';
 import StatusBadge from '../components/StatusBadge';
+import DeployTimeline from '../components/DeployTimeline';
 
 function AppDetailPage() {
   const { name } = useParams<{ name: string }>();
@@ -358,6 +359,9 @@ function AppDetailPage() {
           )}
         </div>
       </div>
+
+      {/* Deploy timeline */}
+      <DeployTimeline appName={app.name} />
 
       {/* Custom domain */}
       <CustomDomainSection appName={app.name} currentDomain={app.customDomain} onUpdate={refresh} />
