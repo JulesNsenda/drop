@@ -87,6 +87,7 @@ import { DropPlatform, createPlatform } from './platform';
 import { eventBus } from './event-bus';
 import { getStateManager, resetStateManager } from '../managers/app/state-manager';
 import { getAppConfigService, resetAppConfigService } from '../managers/app/app-config';
+import { getDeployTracker } from '../managers/deploy-tracker';
 
 /** Poll until `predicate` holds or the timeout elapses (drives async handlers). */
 async function waitFor(
@@ -291,5 +292,40 @@ describe('Platform integration (P2-1)', () => {
     expect(getStateManager().getApp('site')?.status).toBe('running');
 
     inProgress.delete('site'); // cleanup so afterEach stop()/drain doesn't wait
+  }, 20000);
+
+  // P2-4: a REAL deploy through the real detector/builder/state-transitions must
+  // produce a retrievable, owner-scoped deploy episode. This is the seam the
+  // tracker's own unit tests (synthetic events) and the route tests (mocked
+  // tracker) can't prove — that the platform actually emits build:started ->
+  // app:updated{running} in the shape the tracker expects, closing on the
+  // runtime-agnostic status transition (the D1 Docker regression, exercised
+  // here for real since FakeRuntime never emits app:started either).
+  it('records a retrievable, owner-scoped deploy episode end-to-end (P2-4)', async () => {
+    platform = makePlatform();
+    await platform.start();
+
+    const appPath = await createStaticApp('owned');
+    // Set the owner BEFORE detection, mirroring the API deploy where the route
+    // sets userId before the pipeline builds — so the build:started snapshot is
+    // populated and the owner can actually see their own deploy.
+    const state = getStateManager();
+    await state.registerApp('owned', appPath);
+    await state.updateApp('owned', { userId: 'user-123' });
+
+    eventBus.publish('app:detected', { name: 'owned', path: appPath, type: undefined });
+    await waitFor(() => state.getApp('owned')?.status === 'running');
+
+    const episodes = getDeployTracker().getEpisodes('owned');
+    expect(episodes).toHaveLength(1);
+    const ep = episodes[0];
+    expect(ep.status).toBe('succeeded');
+    expect(ep.appName).toBe('owned');
+    // Closed on the runtime-agnostic app:updated{running}, not PM2's app:started.
+    const stageNames = ep.stages.map((s) => s.stage);
+    expect(stageNames).toEqual(expect.arrayContaining(['build-started', 'build', 'running']));
+    // Owner snapshot is populated — the route filters tenants on THIS, so an
+    // undefined here would hide the deploy from its own owner.
+    expect(ep.userId).toBe('user-123');
   }, 20000);
 });
