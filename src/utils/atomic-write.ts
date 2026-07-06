@@ -9,6 +9,7 @@
  * so 0600 stores stay 0600 after the rename.
  */
 
+import * as crypto from 'crypto';
 import * as fs from 'fs/promises';
 import * as path from 'path';
 
@@ -30,8 +31,12 @@ export async function writeFileAtomic(
 ): Promise<void> {
   const dir = path.dirname(filePath);
   // Sibling temp file — must be on the same volume as the target, or rename
-  // would fail with EXDEV.
-  const tmpPath = path.join(dir, `.${path.basename(filePath)}.${process.pid}.tmp`);
+  // would fail with EXDEV. The suffix includes the pid AND a per-call random
+  // token so two concurrent writers targeting the same filePath (e.g. two
+  // in-flight writeJsonAtomic calls in the same process) never share a temp
+  // file and clobber each other before either rename lands.
+  const uniqueSuffix = `${process.pid}.${crypto.randomBytes(6).toString('hex')}`;
+  const tmpPath = path.join(dir, `.${path.basename(filePath)}.${uniqueSuffix}.tmp`);
 
   const handle = await fs.open(tmpPath, 'w', options.mode ?? 0o644);
   try {
