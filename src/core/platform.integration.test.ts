@@ -237,14 +237,39 @@ describe('Platform integration (P2-1)', () => {
     expect(getStateManager().getApp('site')?.port).toBe(port);
   }, 20000);
 
+  // Regression: a hot-reload is ONE stop+rebuild+start transaction. Its
+  // builder.build emits build:completed, but that must not also drive
+  // buildSub -> handleStartApp on top of handleAppUpdate's own start. Before the
+  // fix this asserted 2 (the double-start).
+  it('starts the runtime exactly once per hot-reload (no double-start)', async () => {
+    platform = makePlatform();
+    await platform.start();
+    const appPath = await createStaticApp('site');
+    eventBus.publish('app:detected', { name: 'site', path: appPath, type: undefined });
+    await waitFor(() => getStateManager().getApp('site')?.status === 'running');
+
+    (platform as unknown as { appDeployTimes: Map<string, number> }).appDeployTimes.clear();
+    const startsBefore = fakeRuntime.startCount;
+    const pidBefore = fakeRuntime.pidOf('site');
+
+    await fs.writeFile(path.join(appPath, 'index.html'), '<h1>site v2</h1>');
+    eventBus.publish('app:update', { name: 'site', path: appPath, reason: 'edit' });
+
+    await waitFor(
+      () => fakeRuntime.runningNames().includes('site') && fakeRuntime.pidOf('site') !== pidBefore
+    );
+    await new Promise((r) => setTimeout(r, 200)); // let any second (buildSub) start settle
+
+    expect(fakeRuntime.startCount - startsBefore).toBe(1);
+    expect(getStateManager().getApp('site')?.status).toBe('running');
+  }, 20000);
+
   // Scenario 4: the re-entrancy guard drops an update that arrives while a
   // deploy for the same app is already in progress (the realistic case — the
   // watcher debounces bursts, and a redeploy takes real time during which a new
-  // edit can land). We assert the guard's DROP directly (no build/start runs)
-  // rather than counting runtime starts, because a real hot-reload legitimately
-  // calls start more than once (handleAppUpdate starts, and its builder's
-  // build:completed also drives buildSub -> handleStartApp), which would make a
-  // start-count assertion ambiguous.
+  // edit can land). We assert the guard's DROP directly — the app never leaves
+  // 'running' and the runtime is never touched — which is robust and doesn't
+  // depend on any reload internals.
   it('drops an update while a deploy for the same app is in progress', async () => {
     platform = makePlatform();
     await platform.start();
