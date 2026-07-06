@@ -14,6 +14,7 @@ import { canAccess } from '../access';
 import { isValidAppName } from '../middleware/validate';
 import { getAppRuntime } from '../../managers/runtime';
 import { getSecretManager } from '../../managers/secret';
+import { getDeployTracker } from '../../managers/deploy-tracker';
 import { migrateAppRuntime } from '../../managers/runtime/runtime-migrator';
 import { getDiskFreeMb } from '../../utils/disk';
 import { getStateManager, AppState } from '../../managers/app/state-manager';
@@ -330,6 +331,15 @@ apps.delete('/:name', async (c) => {
     await getSecretManager().deleteAll(name);
   } catch {
     // Secret manager may not be initialised (tests / early failures)
+  }
+
+  // Purge deploy history so a future same-named app doesn't inherit the
+  // deleted app's deploy timeline (and, more importantly, its owner-scoped
+  // episodes leaking to whoever registers the name next).
+  try {
+    getDeployTracker().purgeApp(name);
+  } catch {
+    // Deploy tracker may not be initialised (tests / early failures)
   }
 
   // Remove app config (e.g. appconf/webapps/ezsign.yaml)
