@@ -107,25 +107,19 @@ describe('PythonBuildStrategy', () => {
       expect(c.config.installCommand).toBe('poetry install');
     });
 
-    it('sets installCommand to an empty string when no dependency manifest is found', async () => {
+    it('flags skipInstall when no dependency manifest is found', async () => {
       const c = ctx({ appType: 'python', appPath: tmpDir });
       await strategy.preBuild(c);
-      expect(c.config.installCommand).toBe('');
+      expect(c.config.skipInstall).toBe(true);
     });
 
-    it('BUG: the empty-string "no manifest" sentinel from preBuild is ignored by getInstallCommand', async () => {
-      // preBuild decides there's nothing to install and records that with ''.
+    it('skips the install stage (null command) when no manifest exists', async () => {
+      // With no requirements.txt/Pipfile/pyproject, preBuild flags skipInstall
+      // and getInstallCommand returns null so the builder skips install rather
+      // than running pip against a requirements.txt that does not exist.
       const c = ctx({ appType: 'python', appPath: tmpDir });
       await strategy.preBuild(c);
-      expect(c.config.installCommand).toBe('');
-
-      // But getInstallCommand() only special-cases a *set* installCommand via
-      // a truthy check (`if (context.config.installCommand)`), and '' is
-      // falsy in JS. So the builder (which calls getInstallCommand(context)
-      // for the actual install stage, see builder.ts) silently falls back to
-      // the default pip command instead of skipping install — even though a
-      // requirements.txt was never found.
-      expect(strategy.getInstallCommand(c)).toBe('pip install -r requirements.txt');
+      expect(strategy.getInstallCommand(c)).toBeNull();
     });
 
     it('does not overwrite an explicit installCommand even when a Pipfile is present', async () => {
