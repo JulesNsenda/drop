@@ -187,6 +187,10 @@ gitDeploy.post('/webhook', async (c) => {
   for (const appName of matchingApps) {
     try {
       await service.redeploy(appName);
+      // Webhook auto-redeploys are unattended and had no audit trail — record
+      // them (system action, no user). The API /git/redeploy route logs its
+      // own; this webhook path is distinct, so there is no double-count.
+      await tryLogActivity({ action: 'redeploy', appName, detail: `webhook: ${branch}` });
       results.push({ app: appName, status: 'redeploying' });
     } catch (err) {
       results.push({
