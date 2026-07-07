@@ -146,6 +146,9 @@ export function createBackupCommand(): Command {
         output.print(`  Files copied:   ${copied}`);
         output.print(`  Database dump:  ${dumpOk ? 'ok' : 'skipped/failed'}`);
         output.print(`  Retained:       last ${keep}`);
+        output.warn('Per-app databases are NOT included in this backup.');
+        output.warn(`Only DROP platform state (file stores) and the internal ${INTERNAL_DB} database are captured.`);
+        output.warn('Apps using a provisioned Postgres database must be backed up separately for now.');
       } catch (err) {
         output.error('Backup failed', err instanceof Error ? err : undefined);
         process.exitCode = 1;
