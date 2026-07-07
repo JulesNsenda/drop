@@ -11,7 +11,7 @@ import { success, error, ErrorCodes, AppDto, CreateAppDto } from '../types';
 import { NotFoundError, ValidationError } from '../middleware/error';
 import { AuthContext, listUsers, getUserById } from '../middleware/auth';
 import { canAccess } from '../access';
-import { isValidAppName } from '../middleware/validate';
+import { isValidAppName, validateAppName } from '../middleware/validate';
 import { getAppRuntime } from '../../managers/runtime';
 import { getSecretManager } from '../../managers/secret';
 import { getDeployTracker } from '../../managers/deploy-tracker';
@@ -27,6 +27,14 @@ import { eventBus } from '../../core/event-bus';
 import type { RuntimeType } from '../../managers/runtime/app-runtime.types';
 
 const apps = new Hono();
+
+// Defense-in-depth: reject a malformed :name param before any handler runs.
+// The security-critical paths already 404 on a non-existent, access-checked
+// app, but this stops a bad name from reaching downstream path/SQL
+// construction. Registered before the routes so it runs first; both patterns
+// are needed to cover the bare `/:name` and its sub-routes (`/:name/start`…).
+apps.use('/:name', validateAppName());
+apps.use('/:name/*', validateAppName());
 
 /**
  * Fields a client may set via PUT /apps/:name. Deliberately excludes
