@@ -295,10 +295,14 @@ export class ApiServer {
       console.error('API Error:', err);
 
       if (err instanceof HttpError) {
+        // HttpErrors carry deliberate, client-safe messages.
         return c.json(error(err.code, err.message), err.statusCode as 400 | 401 | 403 | 404 | 409 | 500);
       }
 
-      return c.json(error(ErrorCodes.INTERNAL_ERROR, err.message || 'Internal server error'), 500);
+      // Unexpected error: the real message/stack is logged above. Return a
+      // generic message so internal details (filesystem paths, DB/driver
+      // errors, stack text) never leak to API clients.
+      return c.json(error(ErrorCodes.INTERNAL_ERROR, 'Internal server error'), 500);
     });
 
     // Handle 404
