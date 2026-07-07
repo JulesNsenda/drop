@@ -6,10 +6,12 @@
 
 import * as crypto from 'crypto';
 import * as fs from 'fs/promises';
+import * as fssync from 'fs';
 import * as path from 'path';
 import { Pool } from 'pg';
 import { writeJsonAtomic } from '../../utils/atomic-write';
 import { PostgresServer } from './postgres-server';
+import { runPgDump, createRoleSql } from './pg-dump';
 
 export interface DatabaseCredentials {
   host: string;
@@ -31,13 +33,18 @@ const DROP_INTERNAL_USER = 'drop_admin';
 const APP_DB_PREFIX = 'drop_';
 const APP_USER_PREFIX = 'drop_';
 
+/** Defense-in-depth: sanitized DB/role identifiers must match before touching a path or SQL statement. */
+const DB_NAME_ALLOWLIST = /^[a-z0-9_]+$/;
+
 export class DatabaseProvisioner {
   private readonly server: PostgresServer;
+  private readonly dropRoot: string;
   private readonly credentialsPath: string;
   private provisionedDatabases: Map<string, ProvisionedDatabase> = new Map();
 
   constructor(server: PostgresServer, dropRoot: string) {
     this.server = server;
+    this.dropRoot = dropRoot;
     this.credentialsPath = path.join(dropRoot, 'data', 'drop-svc', 'db-credentials.json');
   }
 
@@ -234,40 +241,183 @@ export class DatabaseProvisioner {
   }
 
   /**
-   * Delete an app's database
+   * Dump-then-drop an app's database on a deliberate app delete.
+   *
+   * Fail-closed at every step: if the dump can't be produced and verified,
+   * the database (and its credentials-registry entry) are KEPT — a retained,
+   * undeleted database is always the safe outcome. Only once a verified dump
+   * (plus a role-recreation script) is safely committed to disk do we touch
+   * `DROP DATABASE`/`DROP USER`. The registry entry is removed only if BOTH
+   * drops succeed, so a partial failure never produces an untracked orphan.
+   *
+   * See docs/plans/2026-07-07-dump-then-drop-on-delete.md.
    */
-  async deleteAppDatabase(appName: string): Promise<void> {
+  async backupAndDeleteAppDatabase(
+    appName: string
+  ): Promise<{ dropped: boolean; reason?: string; dumpPath?: string }> {
     const provisioned = this.provisionedDatabases.get(appName);
     if (!provisioned) {
-      return;
+      return { dropped: false, reason: 'no database provisioned' };
     }
 
-    const { database, user } = provisioned.credentials;
+    const { database, user, password } = provisioned.credentials;
 
-    // Terminate connections and drop database
+    // Defense-in-depth: these become a filesystem path component and an
+    // interpolated SQL identifier below. sanitizeName() should already
+    // guarantee this shape, but never trust that transitively for a
+    // destructive operation.
+    if (!DB_NAME_ALLOWLIST.test(database) || !DB_NAME_ALLOWLIST.test(user)) {
+      return { dropped: false, reason: 'refusing: unexpected identifier' };
+    }
+
+    // Hardened pre-delete dump directory. mode-on-mkdir only applies at
+    // creation time, so an already-existing (possibly looser) directory must
+    // be re-hardened unconditionally. No process.umask() here — this runs
+    // inside the long-lived server process, and a global umask mutation
+    // would race every other concurrent file write.
+    const preDeleteDir = path.join(this.dropRoot, 'data', 'backup', 'pre-delete');
+    await fs.mkdir(preDeleteDir, { recursive: true, mode: 0o700 });
+    await fs.chmod(preDeleteDir, 0o700);
+
+    const ext = process.platform === 'win32' ? '.exe' : '';
+    const pgDumpPath = path.join(this.dropRoot, 'apps', 'drop-svc', 'pgsql', 'bin', `pg_dump${ext}`);
+    if (!fssync.existsSync(pgDumpPath)) {
+      return { dropped: false, reason: 'pg_dump binary not found' };
+    }
+
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const partial = path.join(preDeleteDir, `${database}-${stamp}.dump.partial`);
+    const finalDump = partial.replace(/\.partial$/, '');
+
+    const result = await runPgDump(pgDumpPath, {
+      port: this.server.getPort(),
+      user: 'postgres',
+      dbName: database,
+      outFile: partial,
+      password: this.server.getSuperuserPassword(),
+    });
+
+    if (!result.ok) {
+      await fs.rm(partial, { force: true });
+      return { dropped: false, reason: `dump failed: ${result.error}` };
+    }
+
+    // Verify before touching the database: exists, non-empty, and begins
+    // with the pg_dump custom-format magic header ("PGDMP"). A corrupt or
+    // truncated dump must never be trusted as the safety net for a drop.
+    const verified = await this.verifyDumpFile(partial);
+    if (!verified) {
+      await fs.rm(partial, { force: true });
+      return { dropped: false, reason: 'dump verification failed (not a valid pg_dump archive)' };
+    }
+
+    // Dump is proven good — commit the artifacts BEFORE any drop. -Fc does
+    // not capture roles, so the owning role must be recreated separately at
+    // restore time.
+    const restoreRoleSqlPath = path.join(preDeleteDir, `${database}-${stamp}.restore-role.sql`);
+    await fs.writeFile(restoreRoleSqlPath, createRoleSql(user, password) + '\n', { mode: 0o600 });
+    await fs.rename(partial, finalDump);
+    await fs.chmod(finalDump, 0o600);
+
+    // Only now — drop. Uses the shared admin pool; never .end() it.
     const pool = await this.server.getPool();
 
+    let dbDropped = false;
+    let roleDropped = false;
+
     try {
-      // Terminate active connections
-      await pool.query(`
-        SELECT pg_terminate_backend(pg_stat_activity.pid)
-        FROM pg_stat_activity
-        WHERE pg_stat_activity.datname = $1
-        AND pid <> pg_backend_pid()
-      `, [database]);
-
-      // Drop database
-      await pool.query(`DROP DATABASE IF EXISTS "${database}"`);
-
-      // Drop user
-      await pool.query(`DROP USER IF EXISTS "${user}"`);
+      // WITH (FORCE) terminates active connections and drops in one
+      // statement (PG13+; the bundled server is v16). The allowlist check
+      // above makes this interpolation safe.
+      await pool.query(`DROP DATABASE IF EXISTS "${database}" WITH (FORCE)`);
+      dbDropped = true;
     } catch (error) {
-      // Log but don't fail
-      console.warn(`Failed to fully clean up database for ${appName}:`, error);
+      console.warn(`Failed to drop database for ${appName}:`, error);
     }
 
-    this.provisionedDatabases.delete(appName);
-    await this.saveCredentials();
+    try {
+      await pool.query(`DROP USER IF EXISTS "${user}"`);
+      roleDropped = true;
+    } catch (error) {
+      console.warn(`Failed to drop role for ${appName}:`, error);
+    }
+
+    let reason: string | undefined;
+    if (dbDropped && roleDropped) {
+      // Only remove the registry entry once BOTH drops succeeded — otherwise
+      // a partially-dropped database/role would become an untracked orphan.
+      this.provisionedDatabases.delete(appName);
+      await this.saveCredentials();
+    } else {
+      reason = `database drop ${dbDropped ? 'ok' : 'FAILED'}, role drop ${roleDropped ? 'ok' : 'FAILED'}`;
+    }
+
+    await this.prunePreDeleteBackups(preDeleteDir);
+
+    return { dropped: dbDropped && roleDropped, reason, dumpPath: finalDump };
+  }
+
+  /** True if `file` exists, is non-empty, and begins with the pg_dump custom-format magic header. */
+  private async verifyDumpFile(file: string): Promise<boolean> {
+    try {
+      const stat = await fs.stat(file);
+      if (!stat.isFile() || stat.size === 0) {
+        return false;
+      }
+      const handle = await fs.open(file, 'r');
+      try {
+        const buf = Buffer.alloc(5);
+        const { bytesRead } = await handle.read(buf, 0, 5, 0);
+        return bytesRead === 5 && buf.toString('latin1') === 'PGDMP';
+      } finally {
+        await handle.close();
+      }
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Best-effort age-based retention for pre-delete dumps. Never throws — a
+   * pruning failure must never be mistaken for (or cause) a drop failure.
+   * Age-based (not keep-last-N) so pruning never evicts a different app's
+   * only surviving copy. `DROP_PREDELETE_RETENTION_DAYS <= 0` disables
+   * pruning entirely (keep forever). Default: 3 days.
+   */
+  private async prunePreDeleteBackups(preDeleteDir: string): Promise<void> {
+    try {
+      const raw = process.env.DROP_PREDELETE_RETENTION_DAYS;
+      const days = raw !== undefined && raw !== '' ? Number(raw) : 3;
+      if (!Number.isFinite(days) || days <= 0) {
+        return;
+      }
+
+      const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
+      const entries = await fs.readdir(preDeleteDir);
+      for (const entry of entries) {
+        // Also sweep `.dump.partial` files orphaned by a crash/SIGKILL between
+        // pg_dump completing and the rename — age-based, so a fresh in-flight
+        // one is never touched.
+        if (
+          !entry.endsWith('.dump') &&
+          !entry.endsWith('.restore-role.sql') &&
+          !entry.endsWith('.dump.partial')
+        ) {
+          continue;
+        }
+        const filePath = path.join(preDeleteDir, entry);
+        try {
+          const stat = await fs.stat(filePath);
+          if (stat.mtimeMs < cutoff) {
+            await fs.rm(filePath, { force: true });
+          }
+        } catch {
+          // Best-effort — skip files we can't stat/remove.
+        }
+      }
+    } catch {
+      // Best-effort — pruning failures must never surface as a drop failure.
+    }
   }
 
   /**

@@ -486,6 +486,25 @@ Postgres client, since major-version mismatches can corrupt the restore.
 Restore `drop_internal` and the remaining file stores (`data/drop-svc/`,
 `data/appconf/webapps/`) the same way as before per-app DB backups existed.
 
+### Pre-delete database dumps
+
+Deleting an app (`drop remove <app>` / `DELETE /api/v1/apps/:name`) now
+dump-then-drops its provisioned database: before the database is dropped,
+DROP `pg_dump`s it to `data/backup/pre-delete/<db>-<timestamp>.dump` plus a
+companion `<db>-<timestamp>.restore-role.sql` (recreates the role, since
+`-Fc` doesn't capture it). The drop only happens if the dump verifies; if
+`pg_dump` fails or Postgres is down, the database is left intact instead of
+being lost. Pre-delete dumps are retained for `DROP_PREDELETE_RETENTION_DAYS`
+days (default **3**) and pruned automatically on each subsequent delete —
+copy any you want to keep permanently off-box before then.
+
+Run `drop remove --keep-data <app>` to skip dump-then-drop entirely and leave
+the database in place.
+
+To restore a pre-delete dump, use the same procedure as the [Restore](#restore)
+section above: run its `.restore-role.sql` with `psql`, then
+`pg_restore --create` the `.dump` file.
+
 ## Upgrading
 
 DROP keeps PM2-managed app processes running across a platform restart, but the
