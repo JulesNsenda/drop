@@ -12,8 +12,13 @@ import { canAccess } from '../access';
 import { getAppRuntime } from '../../managers/runtime';
 import { getStateManager } from '../../managers/app/state-manager';
 import { getBuildLogService } from '../../managers/build-log/build-log';
+import { validateAppName } from '../middleware/validate';
 
 const logs = new Hono();
+
+// Defense-in-depth: reject a malformed :name param before any handler runs.
+logs.use('/:name', validateAppName());
+logs.use('/:name/*', validateAppName());
 
 // GET /logs/:name - Get application logs
 logs.get('/:name', async (c) => {
