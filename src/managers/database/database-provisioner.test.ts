@@ -451,3 +451,82 @@ describe('DatabaseProvisioner.backupAndDeleteAppDatabase', () => {
     expect(files.some((f) => f.startsWith('drop_myapp-') && f.endsWith('.dump'))).toBe(true);
   });
 });
+
+describe('DatabaseProvisioner.loadCredentials — corrupt-file quarantine', () => {
+  let dropRoot: string;
+  let svcDir: string;
+  let credsPath: string;
+
+  beforeEach(async () => {
+    dropRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'drop-prov-'));
+    svcDir = path.join(dropRoot, 'data', 'drop-svc');
+    await fs.mkdir(svcDir, { recursive: true });
+    credsPath = path.join(svcDir, 'db-credentials.json');
+    jest.spyOn(console, 'error').mockImplementation();
+  });
+
+  afterEach(async () => {
+    jest.restoreAllMocks();
+    await fs.rm(dropRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  });
+
+  async function quarantineFiles(): Promise<string[]> {
+    return (await fs.readdir(svcDir)).filter((f) => f.includes('.corrupt-'));
+  }
+
+  it('quarantines a corrupt (unparseable) db-credentials.json instead of overwriting it', async () => {
+    await fs.writeFile(credsPath, '{ this is not: valid json');
+    const p = new DatabaseProvisioner(makeMockServer(), dropRoot);
+    await p.initialize();
+
+    // Original renamed away — not left in place, not silently overwritten.
+    await expect(fs.access(credsPath)).rejects.toThrow();
+    const quarantined = await quarantineFiles();
+    expect(quarantined).toHaveLength(1);
+    // Contents preserved for recovery.
+    expect(await fs.readFile(path.join(svcDir, quarantined[0]), 'utf-8')).toContain('not: valid json');
+    expect(p.listDatabases()).toEqual([]);
+  });
+
+  it('quarantines a valid-JSON-but-wrong-shape file', async () => {
+    await fs.writeFile(credsPath, JSON.stringify({ version: 1, notDatabases: [] }));
+    const p = new DatabaseProvisioner(makeMockServer(), dropRoot);
+    await p.initialize();
+    expect(await quarantineFiles()).toHaveLength(1);
+    expect(p.listDatabases()).toEqual([]);
+  });
+
+  it('loads a valid file without quarantining', async () => {
+    await fs.writeFile(
+      credsPath,
+      JSON.stringify({
+        version: 1,
+        databases: [
+          {
+            appName: 'myapp',
+            credentials: {
+              host: 'localhost',
+              port: 5433,
+              database: 'drop_myapp',
+              user: 'drop_myapp_user',
+              password: 'p',
+              connectionString: 'postgresql://x',
+            },
+            createdAt: new Date().toISOString(),
+          },
+        ],
+      })
+    );
+    const p = new DatabaseProvisioner(makeMockServer(), dropRoot);
+    await p.initialize();
+    expect(await quarantineFiles()).toHaveLength(0);
+    expect(p.getAppCredentials('myapp')).not.toBeNull();
+  });
+
+  it('first run (no file) starts empty and creates no quarantine file', async () => {
+    const p = new DatabaseProvisioner(makeMockServer(), dropRoot);
+    await p.initialize();
+    expect(await quarantineFiles()).toHaveLength(0);
+    expect(p.listDatabases()).toEqual([]);
+  });
+});
