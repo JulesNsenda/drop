@@ -501,22 +501,67 @@ export class DatabaseProvisioner {
   }
 
   private async loadCredentials(): Promise<void> {
+    let data: string;
     try {
-      const data = await fs.readFile(this.credentialsPath, 'utf-8');
-      const parsed = JSON.parse(data);
-
-      if (parsed.databases && Array.isArray(parsed.databases)) {
-        for (const db of parsed.databases) {
-          this.provisionedDatabases.set(db.appName, {
-            appName: db.appName,
-            credentials: db.credentials,
-            createdAt: new Date(db.createdAt),
-          });
-        }
-      }
+      data = await fs.readFile(this.credentialsPath, 'utf-8');
     } catch {
-      // File doesn't exist or is corrupted - start fresh
+      // No credentials file yet — first run. Start with an empty registry.
       this.provisionedDatabases.clear();
+      return;
+    }
+
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(data);
+    } catch (err) {
+      // Corrupt file. It maps every app to its database + role + password;
+      // losing it strands every app (the collision guard in
+      // provisionAppDatabase then refuses to re-provision over the existing
+      // database, so redeploys fail loudly). Quarantine it for recovery
+      // instead of silently overwriting it on the next save.
+      await this.quarantineCorruptCredentials(err);
+      this.provisionedDatabases.clear();
+      return;
+    }
+
+    if (
+      !parsed ||
+      typeof parsed !== 'object' ||
+      !Array.isArray((parsed as { databases?: unknown }).databases)
+    ) {
+      // Parsed but wrong shape (truncated-yet-valid JSON / hand-edited) — treat
+      // as corrupt: preserve, don't overwrite.
+      await this.quarantineCorruptCredentials(new Error('db-credentials.json has an unexpected shape'));
+      this.provisionedDatabases.clear();
+      return;
+    }
+
+    this.provisionedDatabases.clear();
+    const databases = (parsed as { databases: Array<Record<string, unknown>> }).databases;
+    for (const db of databases) {
+      if (!db || typeof db.appName !== 'string' || !db.credentials) {
+        continue; // skip malformed entries rather than crashing the load
+      }
+      this.provisionedDatabases.set(db.appName, {
+        appName: db.appName,
+        credentials: db.credentials as DatabaseCredentials,
+        createdAt: new Date(db.createdAt as string),
+      });
+    }
+  }
+
+  /** Preserve a corrupt db-credentials.json (rename to `.corrupt-<ts>`) for recovery. */
+  private async quarantineCorruptCredentials(err: unknown): Promise<void> {
+    try {
+      const ts = new Date().toISOString().replace(/[:.]/g, '-');
+      const quarantinePath = `${this.credentialsPath}.corrupt-${ts}`;
+      await fs.rename(this.credentialsPath, quarantinePath);
+      console.error(
+        `[db-provisioner] Corrupt db-credentials.json quarantined to ${quarantinePath}:`,
+        err instanceof Error ? err.message : err
+      );
+    } catch (renameErr) {
+      console.error('[db-provisioner] Failed to quarantine corrupt db-credentials.json:', renameErr);
     }
   }
 
