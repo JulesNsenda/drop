@@ -513,7 +513,6 @@ export class DropPlatform {
       path.join(dataDir, 'appconf', 'caddy'), // Caddy config root
       path.join(dataDir, 'appconf', 'caddy', 'webapps'), // Per-app Caddy configs
       path.join(dataDir, 'appconf', 'caddy', 'hosts'), // Per-host Caddy configs
-      path.join(dataDir, 'backup'), // Automated backups
       path.join(dataDir, 'temp'), // Temporary files
     ];
 
@@ -524,6 +523,17 @@ export class DropPlatform {
         if ((error as NodeJS.ErrnoException).code !== 'EEXIST') {
           this.log('warn', `Failed to create directory: ${dir}`, error);
         }
+      }
+    }
+
+    // Backups contain plaintext DB credentials (db-credentials.json,
+    // .pg-superuser, restore-roles.sql) — keep the root non-world-traversable.
+    // (POSIX-effective only; on Windows this relies on NTFS ACL inheritance.)
+    try {
+      await fs.mkdir(path.join(dataDir, 'backup'), { recursive: true, mode: 0o700 });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') {
+        this.log('warn', `Failed to create directory: ${path.join(dataDir, 'backup')}`, error);
       }
     }
 
