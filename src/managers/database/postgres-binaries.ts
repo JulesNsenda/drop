@@ -30,7 +30,16 @@ const SYSTEM_PG_BIN_DIRS = [
   '/usr/pgsql-15/bin',
 ];
 
-const PG_BINARIES = ['postgres', 'pg_ctl', 'initdb', 'psql', 'createdb', 'createuser'];
+const PG_BINARIES = [
+  'postgres',
+  'pg_ctl',
+  'initdb',
+  'psql',
+  'createdb',
+  'createuser',
+  'pg_dump',
+  'pg_restore',
+];
 
 export interface PostgresBinariesConfig {
   /** Base directory for DROP (e.g., C:\drop or /var/drop) */
