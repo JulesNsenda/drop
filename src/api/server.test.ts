@@ -163,5 +163,22 @@ describe('ApiServer', () => {
 
       expect(res.status).toBe(500);
     });
+
+    it('does not leak internal error messages to clients (P3-3)', async () => {
+      const app = server.getApp();
+      jest.spyOn(console, 'error').mockImplementation(); // the handler logs the real error
+      // Inject a route that throws a raw (non-HttpError) Error carrying a sensitive detail.
+      app.get('/__test_throw', () => {
+        throw new Error('sensitive internal detail: /var/drop/data/drop-svc/.pg-superuser');
+      });
+
+      const res = await app.request('/__test_throw');
+      expect(res.status).toBe(500);
+      const body = (await res.json()) as { success: boolean; error: { message: string } };
+      expect(body.success).toBe(false);
+      expect(body.error.message).toBe('Internal server error');
+      // The raw error text must never appear anywhere in the client response.
+      expect(JSON.stringify(body)).not.toContain('sensitive internal detail');
+    });
   });
 });
