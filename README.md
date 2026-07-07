@@ -162,6 +162,8 @@ drop deploy ./my-app --port 4000        # Specific port
 # Maintenance
 drop backup                             # Snapshot state + database
 drop backup --keep 14                   # Retain the last 14 backups
+drop restore <backup-dir>               # Preview a restore (writes nothing)
+drop restore <backup-dir> --confirm     # Restore from a backup (stop the platform first)
 ```
 
 ## Supported App Types
@@ -466,25 +468,53 @@ data layout are platform-specific.
 
 ### Restore
 
-Stop DROP, then restore the file stores and PostgreSQL data from a backup
-directory (`data/backup/backup-<timestamp>/`):
+`drop restore` reverses a backup. It is **destructive** — it overwrites the
+current file stores and databases — so it refuses to run while the platform is
+up, requires `--confirm`, and prints its plan first:
 
 ```bash
-BIN=<dropRoot>/apps/drop-svc/pgsql/bin ; export PGPASSWORD="$(cat .pg-superuser)"
-# 1. Recreate app roles (clean server runs clean; on a re-run, "role already exists" is expected/benign)
-"$BIN/psql" -h 127.0.0.1 -p 5433 -U postgres -d postgres -f databases/restore-roles.sql
-# 2. Recreate + restore each per-app database (--create makes the DB AND restores REVOKE CONNECT)
-"$BIN/pg_restore" -h 127.0.0.1 -p 5433 -U postgres --create -d postgres databases/drop_<app>.dump
-#    (re-run: add --clean --if-exists ; check exit codes, don't ignore stderr)
-# 3. Restore file stores + drop_internal as before.
+drop restore data/backup/backup-<timestamp>/            # prints the plan, writes nothing
+drop restore data/backup/backup-<timestamp>/ --confirm  # actually restores
 ```
 
-Use the backup's own `.pg-superuser` file for `PGPASSWORD` (it holds the
-superuser password at the time the backup was taken) and the bundled
-`pg_restore`/`psql` under `apps/drop-svc/pgsql/bin` — do not use a system
-Postgres client, since major-version mismatches can corrupt the restore.
-Restore `drop_internal` and the remaining file stores (`data/drop-svc/`,
-`data/appconf/webapps/`) the same way as before per-app DB backups existed.
+- **Stop the platform first.** A running `drop serve` holds state in memory and
+  would stomp the restore; `drop restore` refuses if it detects a daemon *or* a
+  foreground platform still answering on the API port.
+- **File stores** (`data/drop-svc/`, `data/appconf/webapps/`) are copied back
+  with their modes preserved (secrets stay `0600`).
+- **Databases** are replayed with the bundled `psql`/`pg_restore` — but note
+  that `drop server stop` also stops the bundled PostgreSQL, so in the normal
+  flow `drop restore` finds it unreachable, **prints the exact per-database
+  commands, and skips the automatic DB step**. To restore databases
+  automatically, start PostgreSQL standalone first and re-run:
+
+  ```bash
+  "<dropRoot>/apps/drop-svc/pgsql/bin/pg_ctl" -D "<dropRoot>/data/db" start
+  drop restore data/backup/backup-<timestamp>/ --confirm
+  ```
+
+The DB step authenticates against the **currently running** server's
+`data/drop-svc/.pg-superuser` (read before any file is overwritten), not the
+backup's copy. After a restore the running server's password and the restored
+file may diverge until the next platform restart.
+
+**Doing it by hand** (equivalent to what `drop restore` runs, and what it
+prints when it skips the DB step):
+
+```bash
+BIN=<dropRoot>/apps/drop-svc/pgsql/bin ; export PGPASSWORD="$(cat data/drop-svc/.pg-superuser)"
+# 1. Recreate app roles (clean server runs clean; on a re-run, "role already exists" is expected/benign)
+"$BIN/psql" -h 127.0.0.1 -p 5433 -U postgres -d postgres -f databases/restore-roles.sql
+# 2. Recreate + restore each database, drop_internal included (--create makes the DB AND restores REVOKE CONNECT)
+"$BIN/pg_restore" -h 127.0.0.1 -p 5433 -U postgres --create -d postgres databases/drop_<app>.dump
+#    (re-run over existing DBs: add --clean --if-exists ; check exit codes, don't ignore stderr)
+```
+
+Use the bundled `pg_restore`/`psql` under `apps/drop-svc/pgsql/bin` — not a
+system Postgres client, since major-version mismatches can corrupt the restore.
+Backups are **same-platform only** (a Windows backup won't restore on Linux),
+and the DB restore round-trip is **not covered by automated tests** — validate
+on a non-production box first.
 
 ### Pre-delete database dumps
 
