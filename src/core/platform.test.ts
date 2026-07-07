@@ -10,6 +10,20 @@ import { DropPlatform, createPlatform } from './platform';
 import { eventBus } from './event-bus';
 import * as diskUtils from '../utils/disk';
 
+// These are pipeline/service unit tests — they never exercise the HTTP API, so
+// disable it (createPlatform reads DROP_ENABLE_API when no enableApi is passed).
+// Otherwise start() binds a real, fixed port (3000), which HANGS/fails the
+// suite on CI whenever 3000 is contended by a parallel worker or a leaked
+// process — while passing locally where 3000 is free. The API itself is covered
+// by src/api/**/*.test.ts on their own explicit ports. Mirrors
+// platform.integration.test.ts, which passes enableApi: false directly.
+const PRIOR_DROP_ENABLE_API = process.env.DROP_ENABLE_API;
+process.env.DROP_ENABLE_API = 'false';
+afterAll(() => {
+  if (PRIOR_DROP_ENABLE_API === undefined) delete process.env.DROP_ENABLE_API;
+  else process.env.DROP_ENABLE_API = PRIOR_DROP_ENABLE_API;
+});
+
 // Disk-space queries shell out to `df`/PowerShell — mock them so platform
 // tests are hermetic and don't depend on real free disk space or subprocess
 // execution. Defaults to "plenty of space"; individual tests (P2-5 disk
