@@ -333,6 +333,17 @@ export class ProcessManager {
                 onError?.(err);
               });
 
+              // Each 'change' spawns a fresh short-lived ReadStream. Remove it
+              // from the tracking array once it finishes (end/error/destroy all
+              // emit 'close') so a long-lived `logs -f` session over a chatty
+              // app doesn't accumulate dead stream references without bound.
+              stream.on('close', () => {
+                const idx = streams.indexOf(stream);
+                if (idx !== -1) {
+                  streams.splice(idx, 1);
+                }
+              });
+
               streams.push(stream);
             }
           }
