@@ -12,7 +12,12 @@
  */
 
 import { executeCommandInContainer, createContainerExecCommand } from './container-build-runner';
-import { CONTAINER_CAP_DROP, CONTAINER_SECURITY_OPT } from '../../managers/runtime/container-config';
+import {
+  CONTAINER_CAP_DROP,
+  CONTAINER_SECURITY_OPT,
+  NON_ROOT_UID,
+  NON_ROOT_GID,
+} from '../../managers/runtime/container-config';
 
 // ── Docker mock ───────────────────────────────────────────────────────────────
 
@@ -75,6 +80,30 @@ describe('executeCommandInContainer', () => {
     expect(mount.Source).toBe('/apps/my-app');
     expect(mount.Target).toBe('/app');
     expect(mount.ReadOnly).toBe(false);
+  });
+
+  it('runs the build as the platform (non-root) uid so it owns the read-write /app mount', async () => {
+    const docker = makeDockerMock();
+    await executeCommandInContainer(docker, baseOpts);
+
+    const call = docker.createContainer.mock.calls[0][0];
+    // The build must run as the uid that owns the cloned app dir — the platform's
+    // own uid — not the image default (root), which CapDrop:['ALL'] renders unable
+    // to write a non-root-owned bind mount.
+    const expectedUser = `${process.getuid?.() ?? NON_ROOT_UID}:${process.getgid?.() ?? NON_ROOT_GID}`;
+    expect(call.User).toBe(expectedUser);
+    expect(call.User).toMatch(/^\d+:\d+$/);
+  });
+
+  it('points HOME at /tmp so a non-root build can write its package-manager cache', async () => {
+    const docker = makeDockerMock();
+    await executeCommandInContainer(docker, baseOpts);
+
+    const call = docker.createContainer.mock.calls[0][0];
+    // Exactly one HOME entry, overriding any inherited /home/<user> (unwritable
+    // by a non-root uid, and unset for a numeric uid with no passwd entry).
+    const homeEntries = (call.Env as string[]).filter((e) => e.startsWith('HOME='));
+    expect(homeEntries).toEqual(['HOME=/tmp']);
   });
 
   it('sets AutoRemove so the container cleans itself up', async () => {
