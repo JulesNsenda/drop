@@ -17,6 +17,7 @@
 
 import { ContainerManager } from './container-manager';
 import { AppStartSpec } from './app-runtime.types';
+import { eventBus } from '../../core/event-bus';
 import {
   DROP_NETWORK,
   selectBaseImage,
@@ -132,6 +133,26 @@ describe('ContainerManager', () => {
       expect(call.HostConfig.CapDrop).toEqual(CONTAINER_CAP_DROP);
       expect(call.HostConfig.SecurityOpt).toEqual(CONTAINER_SECURITY_OPT);
       expect(call.HostConfig.PidsLimit).toBe(DEFAULT_PIDS_LIMIT);
+    });
+
+    it('publishes app:started with the port so the router configures the app route under docker isolation', async () => {
+      const docker = makeDockerMock() as any;
+      const mgr = new ContainerManager(docker);
+      const publishSpy = jest.spyOn(eventBus, 'publish');
+
+      try {
+        await mgr.start(baseSpec);
+
+        // handleConfigureRoute (router) and webhooks listen for this event. Without
+        // it, docker-isolated apps never get a Caddy vhost / TLS cert. Must match
+        // the PM2 runtime's payload shape (appId/name/port/pid).
+        expect(publishSpy).toHaveBeenCalledWith(
+          'app:started',
+          expect.objectContaining({ appId: 'my-app', name: 'my-app', port: 4000 })
+        );
+      } finally {
+        publishSpy.mockRestore();
+      }
     });
 
     it('publishes the port to loopback only', async () => {

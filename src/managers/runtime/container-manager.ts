@@ -27,6 +27,7 @@ import {
   AppRuntimeState,
   AppStartSpec,
 } from './app-runtime.types';
+import { eventBus } from '../../core/event-bus';
 import {
   DROP_NETWORK,
   CONTAINER_CAP_DROP,
@@ -219,7 +220,21 @@ export class ContainerManager implements AppRuntime {
       });
     }
 
-    return this.inspectToInfo(appName, await container.inspect());
+    const info = this.inspectToInfo(appName, await container.inspect());
+
+    // Publish the lifecycle event the router (handleConfigureRoute) and webhooks
+    // subscribe to. The PM2 runtime emits this from ProcessManager; the container
+    // runtime MUST mirror it, or under docker isolation app:started never fires —
+    // so the app never gets a Caddy vhost / TLS certificate (subdomain HTTPS
+    // fails) and webhooks stay silent. Matches AppStartedPayload / the PM2 path.
+    eventBus.publish('app:started', {
+      appId: appName,
+      name: appName,
+      port: hostPort,
+      pid: info.pid ?? undefined,
+    });
+
+    return info;
   }
 
   async stop(name: string): Promise<void> {
