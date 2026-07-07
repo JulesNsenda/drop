@@ -113,7 +113,12 @@ beforeEach(async () => {
   // mkdtemp creates with 0700 (owner-only). The container runs as uid 1000
   // (node user) which differs from the CI runner uid — make it world-readable.
   await fs.chmod(tmpDir, 0o755);
-  await fs.writeFile(path.join(tmpDir, 'index.js'), HELLO_SERVER_JS);
+  const indexJs = path.join(tmpDir, 'index.js');
+  await fs.writeFile(indexJs, HELLO_SERVER_JS);
+  // writeFile honors the ambient umask, so a non-default umask in this process
+  // (e.g. leaked from another suite) could make index.js 0600 → unreadable by
+  // the container's uid 1000. Force it container-readable regardless of umask.
+  await fs.chmod(indexJs, 0o644);
 
   const logDir = path.join(tmpDir, 'logs');
   await fs.mkdir(logDir);
