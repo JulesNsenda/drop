@@ -7,7 +7,7 @@
 
 import * as path from 'path';
 import * as fs from 'fs/promises';
-import { EventBus, eventBus, Unsubscribe } from './event-bus';
+import { EventBus, eventBus, Unsubscribe, AppDeletedPayload } from './event-bus';
 import { WatcherService } from './watcher';
 import { DetectorService, getDetector, parseDropYaml, DetectionResult } from './detector';
 import { BuilderService, getBuilder } from './builder';
@@ -40,6 +40,7 @@ import {
   getLogRetentionService,
   resetLogRetentionService,
 } from '../managers/log-retention/log-retention';
+import { hasEnoughDisk, getMinFreeDiskMb } from '../utils/disk';
 
 export interface PlatformConfig {
   /** Root directory for DROP */
@@ -103,8 +104,6 @@ export interface PlatformConfig {
   maxDbsPerUser: number;
   /** Global limit on simultaneous builds (0 = unlimited). */
   maxConcurrentBuilds: number;
-  /** Max disk usage per app directory in MB (0 = unlimited). */
-  maxDiskMbPerApp: number;
   /**
    * Global cap on concurrently running apps (0 = unlimited).
    * In docker mode on a 4 GB server, each app container uses ~256 MB by
@@ -177,7 +176,6 @@ const DEFAULT_CONFIG: PlatformConfig = {
   allowSignup: process.env.DROP_ALLOW_SIGNUP === 'true',
   maxDbsPerUser: parseInt(process.env.DROP_MAX_DBS_PER_USER || '3', 10),
   maxConcurrentBuilds: parseInt(process.env.DROP_MAX_CONCURRENT_BUILDS || '3', 10),
-  maxDiskMbPerApp: parseInt(process.env.DROP_MAX_DISK_MB_PER_APP || '0', 10),
   maxConcurrentApps: parseInt(process.env.DROP_MAX_CONCURRENT_APPS || '0', 10),
   maxMemoryMbPerApp: parseInt(process.env.DROP_MAX_MEMORY_MB_PER_APP || '0', 10),
   maxCpusPerApp: parseFloat(process.env.DROP_MAX_CPUS_PER_APP || '0'),
@@ -213,7 +211,6 @@ export class DropPlatform {
   // (see the drain-window fix in docs/plans/2026-07-06-p2-4-deploy-observability.md).
   private deployTrackerUnsub?: Unsubscribe;
   private isRunning = false;
-  private nextPort: number;
   private usedPorts: Map<number, string> = new Map(); // port -> appName ownership
   private appsInProgress: Set<string> = new Set(); // Track apps being built/started
   private appDeployTimes: Map<string, number> = new Map(); // Track when apps were last deployed
@@ -259,7 +256,6 @@ export class DropPlatform {
       ...config,
     };
     this.eventBus = eventBus;
-    this.nextPort = this.config.portRangeStart;
 
     // Initialize logger (console only initially, file logging enabled after dirs created)
     this.logger = createLogger({
@@ -1118,6 +1114,32 @@ backup:
       }
     });
     this.subscriptions.push(statusSub);
+
+    // Release the deleted app's port(s) so allocatePort's range-scan can
+    // reuse them. Keyed on app:deleted — published only by
+    // stateManager.removeApp (real teardown) — NOT app:removed, which also
+    // fires from the watcher's chokidar unlinkDir handler (a folder momentarily
+    // vanishing, e.g. mid-redeploy) and would free a live/just-redeployed app's
+    // port out from under it. See docs/plans/2026-07-07-p2-5-disk-and-port-guards.md.
+    const deletedSub = this.eventBus.subscribe('app:deleted', (payload) => {
+      this.handleAppDeleted(payload);
+    });
+    this.subscriptions.push(deletedSub);
+  }
+
+  /**
+   * Release every port owned by a deleted app. Reverse-lookup over
+   * `usedPorts` (Map<port, appName>) rather than a single stored port,
+   * because the map is the only place ownership is tracked. Excludes the
+   * '__anonymous__' sentinel, which never corresponds to a real app name.
+   */
+  private handleAppDeleted(payload: AppDeletedPayload): void {
+    for (const [port, owner] of this.usedPorts.entries()) {
+      if (owner === payload.name && owner !== '__anonymous__') {
+        this.usedPorts.delete(port);
+        this.logger.debug(`Released port ${port} for deleted app ${payload.name}`, 'PORT');
+      }
+    }
   }
 
   /**
@@ -1302,6 +1324,16 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       const logId = this.buildLogService
         ? await this.buildLogService.startBuild(appName, buildStartedAt)
         : null;
+
+      // Fresh deploy — nothing is currently serving this app, so a low-disk
+      // abort is a hard failure: throw into the catch below, which marks the
+      // app 'errored' and releases appsInProgress.
+      const disk = await hasEnoughDisk(appPath);
+      if (!disk.ok) {
+        throw new Error(
+          `Insufficient disk space: ${Math.round(disk.freeMb)} MB free, need ${getMinFreeDiskMb()} MB`
+        );
+      }
 
       const result = await this.builder.build({
         appName,
@@ -1646,6 +1678,22 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
 
     this.logger.info(`Hot-reload triggered for ${appName}: ${reason}`, 'UPDATE');
     this.appsInProgress.add(appName);
+
+    // Hot-reload — the app is currently RUNNING and serving traffic. Abort
+    // with a `return`, never a `throw`: the catch below unconditionally marks
+    // the app 'errored' and tears down its health prober, which is wrong for
+    // a healthy running app that simply can't be rebuilt right now. Must run
+    // after appsInProgress.add (before it would open a TOCTOU double-build
+    // window) and before setAppStatus('building') (so status stays 'running').
+    const disk = await hasEnoughDisk(appPath);
+    if (!disk.ok) {
+      this.logger.warn(
+        `Skipping hot-reload of ${appName}: insufficient disk (${Math.round(disk.freeMb)} MB free, need ${getMinFreeDiskMb()} MB)`,
+        'UPDATE'
+      );
+      this.appsInProgress.delete(appName);
+      return;
+    }
 
     try {
       // M5.1 deploy transaction: keep old version serving while the new build
@@ -2074,23 +2122,19 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       }
     }
 
-    // Allocate a new port
-    while (this.usedPorts.has(this.nextPort) && this.nextPort <= this.config.portRangeEnd) {
-      this.nextPort++;
+    // Allocate a new port: scan the full configured range for the first free
+    // slot so interior gaps freed by app:deleted are reused, rather than a
+    // monotonic cursor that only ever moves forward. Synchronous — no await
+    // between the scan and the claim — so two concurrent callers can't race
+    // onto the same port (see docs/plans/2026-07-07-p2-5-disk-and-port-guards.md).
+    for (let p = this.config.portRangeStart; p <= this.config.portRangeEnd; p++) {
+      if (!this.usedPorts.has(p)) {
+        this.usedPorts.set(p, appName ?? '__anonymous__');
+        return p;
+      }
     }
 
-    if (this.nextPort > this.config.portRangeEnd) {
-      throw new Error('No available ports in configured range');
-    }
-
-    const port = this.nextPort;
-    if (appName) {
-      this.usedPorts.set(port, appName);
-    } else {
-      this.usedPorts.set(port, '__anonymous__');
-    }
-    this.nextPort++;
-    return port;
+    throw new Error('No available ports in configured range');
   }
 
   releasePort(port: number): void {
@@ -2144,14 +2188,6 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     // Add all ports to usedPorts with their owning app name
     for (const [port, appName] of portSources.entries()) {
       this.usedPorts.set(port, appName);
-    }
-
-    // Find the highest used port to set nextPort correctly
-    if (this.usedPorts.size > 0) {
-      const maxPort = Math.max(...this.usedPorts.keys());
-      if (maxPort >= this.nextPort) {
-        this.nextPort = maxPort + 1;
-      }
     }
 
     this.logger.info(`Loaded ${this.usedPorts.size} used ports from running apps and state`, 'PORT');
