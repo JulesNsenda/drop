@@ -224,9 +224,12 @@ export function createBackupCommand(): Command {
     .option('-k, --keep <n>', 'Number of backups to retain', '7')
     .action(async (options) => {
       // Must run before any dump/write in this action: children (pg_dump)
-      // inherit it, so their `-f` output is born 0600. Nothing else runs
-      // concurrently in this CLI process, so this is safe.
-      process.umask(0o077);
+      // inherit it, so their `-f` output is born 0600. Captured and restored in
+      // the finally below — process.umask is process-GLOBAL, so leaving it at
+      // 0o077 would corrupt unrelated file creation in any embedding process
+      // (jest workers, a future in-process caller). Harmless to leak in the
+      // one-shot CLI, but wrong everywhere else, so we don't leak it.
+      const prevUmask = process.umask(0o077);
 
       const dropRoot = resolveDropRoot(options.root);
       const dataDir = path.join(dropRoot, 'data');
@@ -342,6 +345,10 @@ export function createBackupCommand(): Command {
           // Best effort — don't let cleanup failure mask the real error.
         }
         process.exitCode = 1;
+      } finally {
+        // Restore the umask so the 0o077 above never leaks past this action
+        // (see the capture site). No-op on Windows.
+        process.umask(prevUmask);
       }
     });
 }
