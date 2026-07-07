@@ -47,4 +47,53 @@ describe('atomic-write', () => {
     const stat = await fs.stat(target);
     expect(stat.mode & 0o777).toBe(0o600);
   });
+
+  it('handles concurrent writes to the same target without clobbering temp files', async () => {
+    // Regression test for audit P3-3: the temp file path used to be derived
+    // only from process.pid, so two concurrent writeJsonAtomic calls to the
+    // SAME target file shared one temp path and could stomp on each other
+    // (one call's open/write racing another's rename/unlink) before either
+    // rename landed. The fix appends a per-call random suffix so concurrent
+    // writers never share a temp file.
+    const target = path.join(dir, 'concurrent.json');
+    const payloadA = { writer: 'a', value: 1 };
+    const payloadB = { writer: 'b', value: 2 };
+
+    const results = await Promise.allSettled([
+      writeJsonAtomic(target, payloadA),
+      writeJsonAtomic(target, payloadB),
+    ]);
+
+    for (const result of results) {
+      expect(result.status).toBe('fulfilled');
+    }
+
+    const finalContents = await fs.readFile(target, 'utf-8');
+    const finalValue = JSON.parse(finalContents);
+    expect([payloadA, payloadB]).toContainEqual(finalValue);
+
+    // No stray temp files should remain in the directory.
+    const entries = await fs.readdir(dir);
+    expect(entries).toEqual(['concurrent.json']);
+  });
+
+  it('runs many concurrent writers to the same target without errors', async () => {
+    const target = path.join(dir, 'many-writers.json');
+    const writerCount = 20;
+    const payloads = Array.from({ length: writerCount }, (_, i) => ({ i }));
+
+    const results = await Promise.allSettled(
+      payloads.map((payload) => writeJsonAtomic(target, payload))
+    );
+
+    for (const result of results) {
+      expect(result.status).toBe('fulfilled');
+    }
+
+    const finalValue = JSON.parse(await fs.readFile(target, 'utf-8'));
+    expect(payloads).toContainEqual(finalValue);
+
+    const entries = await fs.readdir(dir);
+    expect(entries).toEqual(['many-writers.json']);
+  });
 });

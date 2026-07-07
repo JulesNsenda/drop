@@ -24,6 +24,7 @@ import appsRoutes from './routes/apps';
 import logsRoutes from './routes/logs';
 import authRoutes from './routes/auth';
 import certsRoutes from './routes/certs';
+import deploysRoutes from './routes/deploys';
 import secretsRoutes from './routes/secrets';
 import webhooksRoutes from './routes/webhooks';
 import gitDeployRoutes from './routes/git-deploy';
@@ -160,6 +161,8 @@ export class ApiServer {
       v1.use('/apps', authMiddleware('readonly'));
       v1.use('/usage', authMiddleware('readonly'));
       v1.use('/logs/*', authMiddleware('readonly'));
+      v1.use('/deploys/*', authMiddleware('readonly'));
+      v1.use('/deploys', authMiddleware('readonly'));
       // Renewal triggers a platform-wide ACME pass (Let's Encrypt rate-limit
       // risk) — admin-only. Register before the general /certs/* guard.
       v1.use('/certs/renew', authMiddleware('admin'));
@@ -178,6 +181,7 @@ export class ApiServer {
     v1.route('/usage', usageRoutes);
     v1.route('/logs', logsRoutes);
     v1.route('/certs', certsRoutes);
+    v1.route('/deploys', deploysRoutes);
     v1.route('/secrets', secretsRoutes);
     v1.route('/webhooks', webhooksRoutes);
     v1.route('/git', gitDeployRoutes);
