@@ -28,12 +28,14 @@ describe('superuser-auth', () => {
   });
 
   describe('toScramHbaConf', () => {
-    it('replaces trust with scram-sha-256 on host lines only', () => {
+    it('replaces trust with scram-sha-256 on host and local lines', () => {
       const out = toScramHbaConf(TRUST_HBA);
       expect(out).toContain('host    all             all             127.0.0.1/32            scram-sha-256');
       expect(out).toContain('host    all             all             ::1/128                 scram-sha-256');
-      // local (unix socket) line is left as trust
-      expect(out).toMatch(/local\s+all\s+all\s+trust/);
+      // local (unix-socket) lines are also migrated — containers reach Postgres
+      // via socket and must not get trust access.
+      expect(out).toContain('local   all             all                                     scram-sha-256');
+      expect(out).not.toMatch(/\btrust\b/);
     });
 
     it('is idempotent', () => {
@@ -50,7 +52,7 @@ describe('superuser-auth', () => {
     });
 
     afterEach(async () => {
-      await fs.rm(dropRoot, { recursive: true, force: true });
+      await fs.rm(dropRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
     });
 
     it('generates and persists a password on first call', async () => {

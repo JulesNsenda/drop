@@ -8,8 +8,47 @@ import { Hono } from 'hono';
 import { success, error, ErrorCodes } from '../types';
 import { NotFoundError } from '../middleware/error';
 import { getCaddyAdminClient, CertificateInfo } from '../../managers/router/caddy-api';
+import { AuthContext } from '../middleware/auth';
+import { canAccess } from '../access';
+import { getStateManager } from '../../managers/app/state-manager';
+import { getAppConfigService } from '../../managers/app/app-config';
 
 const certs = new Hono();
+
+/**
+ * The lowercased set of domains the caller is allowed to see certificates for,
+ * or `null` meaning "all" (admin, or auth disabled). Without this, any
+ * authenticated user — even readonly — could enumerate every tenant's custom
+ * domains, issuers and expiry dates from the shared Caddy instance.
+ */
+function ownedDomains(auth: AuthContext | undefined): Set<string> | null {
+  if (!auth || auth.role === 'admin') return null;
+
+  const domains = new Set<string>();
+  const stateManager = getStateManager();
+
+  let configService: ReturnType<typeof getAppConfigService> | null = null;
+  try {
+    configService = getAppConfigService();
+  } catch {
+    configService = null; // config service not initialized — fall back to state only
+  }
+
+  for (const app of stateManager.getAllApps()) {
+    if (!canAccess(auth, app)) continue;
+    if (app.hostname) domains.add(app.hostname.toLowerCase());
+    if (app.customDomain) domains.add(app.customDomain.toLowerCase());
+    // Multi-domain apps keep their full domain list in the app config file.
+    const cfg = configService?.getConfig(app.name);
+    for (const d of cfg?.domains ?? []) domains.add(d.toLowerCase());
+  }
+  return domains;
+}
+
+/** Whether a certificate is visible to the caller given their owned-domain set. */
+function certVisible(cert: CertificateInfo, owned: Set<string> | null): boolean {
+  return owned === null || owned.has(cert.domain.toLowerCase());
+}
 
 /**
  * Certificate DTO for API responses
@@ -59,7 +98,11 @@ certs.get('/', async (c) => {
     );
   }
 
-  const certificates = await client.getCertificates();
+  const auth = (c.get as (k: string) => AuthContext | undefined)('auth');
+  const owned = ownedDomains(auth);
+  const certificates = (await client.getCertificates()).filter((cert) =>
+    certVisible(cert, owned)
+  );
 
   // Filter by status if query param provided
   const statusFilter = c.req.query('status');
@@ -118,7 +161,11 @@ certs.get('/expiring', async (c) => {
     );
   }
 
-  const certificates = await client.getExpiringCertificates(days);
+  const auth = (c.get as (k: string) => AuthContext | undefined)('auth');
+  const owned = ownedDomains(auth);
+  const certificates = (await client.getExpiringCertificates(days)).filter((cert) =>
+    certVisible(cert, owned)
+  );
 
   return c.json(
     success(
@@ -148,9 +195,13 @@ certs.get('/:domain', async (c) => {
     );
   }
 
+  const auth = (c.get as (k: string) => AuthContext | undefined)('auth');
+  const owned = ownedDomains(auth);
   const certificate = await client.getCertificateForDomain(domain);
 
-  if (!certificate) {
+  // Return 404 (not 403) for both missing and unauthorized so we don't confirm
+  // the existence of another tenant's certificate.
+  if (!certificate || !certVisible(certificate, owned)) {
     throw new NotFoundError(`No certificate found for domain '${domain}'`);
   }
 
@@ -209,7 +260,11 @@ certs.get('/health', async (c) => {
     );
   }
 
-  const certificates = await client.getCertificates();
+  const auth = (c.get as (k: string) => AuthContext | undefined)('auth');
+  const owned = ownedDomains(auth);
+  const certificates = (await client.getCertificates()).filter((cert) =>
+    certVisible(cert, owned)
+  );
 
   const summary = {
     total: certificates.length,

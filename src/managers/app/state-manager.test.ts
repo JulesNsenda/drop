@@ -22,7 +22,7 @@ describe('AppStateManager', () => {
   afterEach(async () => {
     await manager.close();
     resetStateManager();
-    await fs.rm(tempDir, { recursive: true, force: true });
+    await fs.rm(tempDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   });
 
   describe('initialize', () => {
@@ -227,6 +227,30 @@ describe('AppStateManager', () => {
         })
       );
     });
+
+    it('should emit both app:removed and app:deleted exactly once', async () => {
+      const removedHandler = jest.fn();
+      const deletedHandler = jest.fn();
+      eventBus.subscribe('app:removed', removedHandler);
+      eventBus.subscribe('app:deleted', deletedHandler);
+
+      await manager.removeApp('remove-app');
+
+      expect(removedHandler).toHaveBeenCalledTimes(1);
+      expect(removedHandler).toHaveBeenCalledWith(
+        expect.objectContaining({
+          appId: 'remove-app',
+          name: 'remove-app',
+        })
+      );
+      expect(deletedHandler).toHaveBeenCalledTimes(1);
+      expect(deletedHandler).toHaveBeenCalledWith(
+        expect.objectContaining({
+          appId: 'remove-app',
+          name: 'remove-app',
+        })
+      );
+    });
   });
 
   describe('query operations', () => {
@@ -338,7 +362,7 @@ describe('getStateManager singleton', () => {
 
   afterEach(async () => {
     resetStateManager();
-    await fs.rm(tempDir, { recursive: true, force: true });
+    await fs.rm(tempDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   });
 
   it('should throw if no config provided on first call', () => {

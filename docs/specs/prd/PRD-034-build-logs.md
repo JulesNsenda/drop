@@ -6,7 +6,7 @@
 |-------|-------|
 | PRD ID | PRD-034 |
 | Feature | Build Logs |
-| Status | Planned |
+| Status | In Progress (writer + read API done; dashboard viewer missing) |
 | Priority | P1 |
 | Created | 2026-03-19 |
 

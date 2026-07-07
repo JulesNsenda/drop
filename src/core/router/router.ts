@@ -233,6 +233,10 @@ export class RouterService {
         method: 'POST',
         headers: {
           'Content-Type': 'text/caddyfile',
+          // Caddy 2.11+ rejects admin API calls that look like browser CORS
+          // requests (Node fetch sends Sec-Fetch-Mode: cors) unless the Origin
+          // matches the admin endpoint — else 403 "origin ''".
+          Origin: `http://${this.config.caddy.adminApi}`,
         },
         body: await fs.readFile(this.config.caddy.caddyfilePath, 'utf-8'),
       });

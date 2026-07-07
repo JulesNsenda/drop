@@ -15,8 +15,8 @@ Quick reference to all PRDs and task files organized by version.
 | v0.5.0 | Enterprise | 4 features | Planned |
 | v0.6.0 | Connect | 2 features | **Completed** |
 | v0.7.0 | SaaS Ready | 11 features | **Completed** |
-| v1.0.0 | Production | 5 features | Planned |
-| v2.0.0 | Architecture | 10 features | Planned |
+| v1.0.0 | Production | 5 features | **In Progress** (4/5 done) |
+| v2.0.0 | Architecture | 10 features | **In Progress** (1 done, 3 partial) |
 
 ---
 
@@ -102,15 +102,15 @@ Quick reference to all PRDs and task files organized by version.
 | Order | PRD | Feature | Tasks | Status |
 |-------|-----|---------|-------|--------|
 | 1 | [PRD-011](prd/PRD-011-web-dashboard.md) | Web Dashboard | [TASKS-011](tasks/TASKS-011-web-dashboard.md) | **Completed** |
-| 2 | [PRD-015](prd/PRD-015-monitoring.md) | Monitoring | - | Not Started |
+| 2 | [PRD-015](prd/PRD-015-monitoring.md) | Monitoring | - | In Progress (per-app CPU/mem in apps API; no Prometheus/alerting/history) |
 | 3 | - | Health Checks | - | **Completed** |
-| 4 | - | Log Aggregation | - | Not Started |
+| 4 | - | Log Aggregation | - | Not Started (per-app logs only) |
 
 ### v0.4.0 New Capabilities
 - ✅ React web dashboard (login, dark mode, deploy UI, search/filter, env vars, toasts, error boundaries)
 - ✅ Health checks: platform components, PostgreSQL, per-app HTTP pings, dashboard display
-- Real-time monitoring - Not Started
-- Centralized logging - Not Started
+- ⚠️ Monitoring - Partial: per-app CPU/memory exposed via the apps API; no Prometheus export, alerting, or historical metrics
+- Centralized logging - Not Started (per-app log access only)
 
 ---
 
@@ -124,8 +124,8 @@ Quick reference to all PRDs and task files organized by version.
 |-------|-----|---------|-------|--------|
 | 1 | [PRD-013](prd/PRD-013-plugins.md) | Plugin Architecture | - | Not Started |
 | 2 | [PRD-014](prd/PRD-014-replication.md) | Replication & HA | - | Not Started |
-| 3 | - | Multi-tenancy | - | Not Started |
-| 4 | - | Backup Automation | - | Not Started |
+| 3 | - | Multi-tenancy | - | **Completed** (shipped as [PRD-018](prd/PRD-018-multi-tenant.md)) |
+| 4 | - | Backup Automation | - | In Progress (manual `drop backup` CLI done; no scheduler/API) |
 
 ### v0.5.0 New Capabilities
 - Plugin system
@@ -192,11 +192,11 @@ Quick reference to all PRDs and task files organized by version.
 
 | Order | PRD | Feature | Tasks | Status |
 |-------|-----|---------|-------|--------|
-| 1 | [PRD-024](prd/PRD-024-token-expiry-handling.md) | Token Expiry Handling | [TASKS-024](tasks/TASKS-024-token-expiry-handling.md) | Not Started |
-| 2 | [PRD-025](prd/PRD-025-404-page.md) | 404 Page | [TASKS-025](tasks/TASKS-025-404-page.md) | Not Started |
-| 3 | [PRD-026](prd/PRD-026-logout-redirect.md) | Logout Redirect | [TASKS-026](tasks/TASKS-026-logout-redirect.md) | Not Started |
-| 4 | [PRD-027](prd/PRD-027-app-limit-indicator.md) | App Limit Indicator | [TASKS-027](tasks/TASKS-027-app-limit-indicator.md) | Not Started |
-| 5 | [PRD-028](prd/PRD-028-signup-success-message.md) | Signup Success Message | [TASKS-028](tasks/TASKS-028-signup-success-message.md) | Not Started |
+| 1 | [PRD-024](prd/PRD-024-token-expiry-handling.md) | Token Expiry Handling | [TASKS-024](tasks/TASKS-024-token-expiry-handling.md) | **Completed** |
+| 2 | [PRD-025](prd/PRD-025-404-page.md) | 404 Page | [TASKS-025](tasks/TASKS-025-404-page.md) | **Completed** |
+| 3 | [PRD-026](prd/PRD-026-logout-redirect.md) | Logout Redirect | [TASKS-026](tasks/TASKS-026-logout-redirect.md) | **Completed** |
+| 4 | [PRD-027](prd/PRD-027-app-limit-indicator.md) | App Limit Indicator | [TASKS-027](tasks/TASKS-027-app-limit-indicator.md) | In Progress (usage API + badge done; deploy-page gating missing) |
+| 5 | [PRD-028](prd/PRD-028-signup-success-message.md) | Signup Success Message | [TASKS-028](tasks/TASKS-028-signup-success-message.md) | **Completed** |
 
 **Requirements**:
 - All v0.x features stable
@@ -213,13 +213,13 @@ Quick reference to all PRDs and task files organized by version.
 
 | Order | PRD | Feature | Tasks | Priority | Status |
 |-------|-----|---------|-------|----------|--------|
-| 1 | [PRD-029](prd/PRD-029-docker-isolation.md) | Docker Isolation | [TASKS-029](tasks/TASKS-029-docker-isolation.md) | P0 | Not Started |
+| 1 | [PRD-029](prd/PRD-029-docker-isolation.md) | Docker Isolation | [TASKS-029](tasks/TASKS-029-docker-isolation.md) | P0 | **Completed** (alternate design) |
 | 2 | [PRD-030](prd/PRD-030-deploy-transaction.md) | Deploy as Transaction | [TASKS-030](tasks/TASKS-030-deploy-transaction.md) | P0 | Not Started |
 | 3 | [PRD-031](prd/PRD-031-build-caching.md) | Build Caching | [TASKS-031](tasks/TASKS-031-build-caching.md) | P1 | Not Started |
-| 4 | [PRD-032](prd/PRD-032-caddy-required.md) | Caddy Required (Real URLs) | [TASKS-032](tasks/TASKS-032-caddy-required.md) | P1 | Not Started |
+| 4 | [PRD-032](prd/PRD-032-caddy-required.md) | Caddy Required (Real URLs) | [TASKS-032](tasks/TASKS-032-caddy-required.md) | P1 | In Progress (Caddy lifecycle/routing done; auto-install + base-domain URLs missing) |
 | 5 | [PRD-033](prd/PRD-033-sqlite-state.md) | SQLite State Storage | [TASKS-033](tasks/TASKS-033-sqlite-state.md) | P1 | Not Started |
-| 6 | [PRD-034](prd/PRD-034-build-logs.md) | Build Logs in Dashboard | [TASKS-034](tasks/TASKS-034-build-logs.md) | P1 | Not Started |
-| 7 | [PRD-038](prd/PRD-038-ssl-all-apps.md) | SSL for All Apps | [TASKS-038](tasks/TASKS-038-ssl-all-apps.md) | P1 | Not Started |
+| 6 | [PRD-034](prd/PRD-034-build-logs.md) | Build Logs in Dashboard | [TASKS-034](tasks/TASKS-034-build-logs.md) | P1 | In Progress (writer + read API done; dashboard viewer missing) |
+| 7 | [PRD-038](prd/PRD-038-ssl-all-apps.md) | SSL for All Apps | [TASKS-038](tasks/TASKS-038-ssl-all-apps.md) | P1 | In Progress (backend HTTPS/wildcard/cert API via M4; app cert-status field + dashboard UI missing) |
 | 8 | [PRD-035](prd/PRD-035-deploy-rollback.md) | Deploy Rollback | [TASKS-035](tasks/TASKS-035-deploy-rollback.md) | P2 | Not Started |
 | 9 | [PRD-036](prd/PRD-036-resource-limits.md) | Resource Limits | [TASKS-036](tasks/TASKS-036-resource-limits.md) | P2 | Not Started |
 | 10 | [PRD-037](prd/PRD-037-app-backups.md) | App Backups | [TASKS-037](tasks/TASKS-037-app-backups.md) | P2 | Not Started |

@@ -16,7 +16,7 @@ describe('SecretManager', () => {
   });
 
   afterEach(async () => {
-    await fs.rm(tmpDir, { recursive: true, force: true });
+    await fs.rm(tmpDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   });
 
   it('should set and get a secret', async () => {
@@ -141,7 +141,7 @@ describe('SecretManager', () => {
       await b.initialize();
       expect(b.get('app', 'K')).toBe('v');
 
-      await fs.rm(dir, { recursive: true, force: true });
+      await fs.rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
     });
 
     it('migrates a legacy (salt-derived) store to the external key and bumps to version 2', async () => {
@@ -166,7 +166,59 @@ describe('SecretManager', () => {
       const after = JSON.parse(await fs.readFile(store, 'utf-8'));
       expect(after.version).toBe(2);
 
-      await fs.rm(dir, { recursive: true, force: true });
+      await fs.rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+    });
+  });
+
+  describe('corrupt store handling', () => {
+    // Quarantine logs to console.error by design — keep test output clean.
+    beforeEach(() => {
+      jest.spyOn(console, 'error').mockImplementation(() => {});
+    });
+    afterEach(() => {
+      jest.restoreAllMocks();
+    });
+
+    it('quarantines an unparseable store instead of overwriting it, then starts empty', async () => {
+      const store = path.join(tmpDir, 'corrupt.json');
+      const garbage = '{ this is not valid json at all';
+      await fs.writeFile(store, garbage);
+
+      const mgr = new SecretManager({ storePath: store, masterKey: 'k' });
+      await mgr.initialize(); // must not throw
+
+      // Original bytes preserved in a .corrupt-* quarantine file (not destroyed).
+      const files = await fs.readdir(tmpDir);
+      const quarantined = files.filter((f) => f.startsWith('corrupt.json.corrupt-'));
+      expect(quarantined).toHaveLength(1);
+      expect(await fs.readFile(path.join(tmpDir, quarantined[0]), 'utf-8')).toBe(garbage);
+
+      // A fresh, empty, usable store took its place.
+      expect(mgr.get('any', 'KEY')).toBeNull();
+      await mgr.set('app', 'K', 'v');
+      expect(mgr.get('app', 'K')).toBe('v');
+    });
+
+    it('quarantines a valid-JSON-but-wrong-shape store', async () => {
+      const store = path.join(tmpDir, 'wrongshape.json');
+      await fs.writeFile(store, JSON.stringify({ not: 'a store' }));
+
+      const mgr = new SecretManager({ storePath: store, masterKey: 'k' });
+      await mgr.initialize();
+
+      const files = await fs.readdir(tmpDir);
+      expect(files.filter((f) => f.startsWith('wrongshape.json.corrupt-'))).toHaveLength(1);
+      expect(mgr.get('app', 'K')).toBeNull();
+    });
+
+    it('does NOT quarantine on first run (missing file)', async () => {
+      const store = path.join(tmpDir, 'fresh.json');
+      const mgr = new SecretManager({ storePath: store, masterKey: 'k' });
+      await mgr.initialize();
+
+      const files = await fs.readdir(tmpDir);
+      expect(files.some((f) => f.startsWith('fresh.json.corrupt-'))).toBe(false);
+      expect(files).toContain('fresh.json');
     });
   });
 });

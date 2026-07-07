@@ -7,14 +7,32 @@
 import { Context, Next } from 'hono';
 import { error, ErrorCodes } from '../types';
 
-/** Valid app name: alphanumeric, hyphens, underscores, 1-64 chars */
+/** Valid app name for CREATION: alphanumeric, hyphens, underscores, 1-64 chars (no dots). */
 const APP_NAME_RE = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/;
+
+/**
+ * Valid app name for a :name ROUTE PARAM — deliberately looser than
+ * APP_NAME_RE, because folder-drop persists a directory name almost verbatim
+ * (path-parser only bars empty/`.`/`..`/leading-dot/known-dirs). It must not
+ * 400 an existing app on its own management routes, so the first char allows
+ * a leading `_`/`-` (e.g. `_worker`, `-cache`) and dots are allowed mid-name
+ * (`my.app`). Leading `.` stays barred (not in the first-char class) and
+ * `..`/path separators are still rejected by PATH_TRAVERSAL_RE below.
+ *
+ * It is INTENTIONALLY stricter than folder-drop in two safe ways: it rejects
+ * spaces/other punctuation and caps length at 64. Those are pathological
+ * directory names; bounding them on a URL param is defense-in-depth, not a
+ * regression of any realistic app.
+ */
+const APP_NAME_PARAM_RE = /^[a-zA-Z0-9_-][a-zA-Z0-9_.-]{0,63}$/;
 
 /** Characters that could enable path traversal */
 const PATH_TRAVERSAL_RE = /\.\.|[/\\]/;
 
 /**
- * Validate and sanitize an app name parameter
+ * Validate a :name route param (defense-in-depth on the management routes).
+ * Rejects a malformed name before it can reach any downstream path/SQL
+ * construction, without regressing legitimately-dotted folder-drop apps.
  */
 export function validateAppName() {
   return async (c: Context, next: Next): Promise<Response | void> => {
@@ -28,11 +46,11 @@ export function validateAppName() {
       );
     }
 
-    if (!APP_NAME_RE.test(name)) {
+    if (!APP_NAME_PARAM_RE.test(name)) {
       return c.json(
         error(
           ErrorCodes.VALIDATION_ERROR,
-          'Invalid app name: must be 1-64 alphanumeric characters, hyphens, or underscores'
+          'Invalid app name: must be 1-64 characters of letters, digits, dot, hyphen, or underscore, starting with a letter or digit'
         ),
         400
       );

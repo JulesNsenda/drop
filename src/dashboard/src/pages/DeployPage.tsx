@@ -15,7 +15,7 @@ import {
 import { useToast } from '../components/Toast';
 import { useConfirm } from '../components/ConfirmDialog';
 import { getAuthHeaders } from '../hooks/useAuth';
-import { gitDeploy, getGitTokens, addGitToken, deleteGitToken, GitTokenInfo } from '../hooks/useApi';
+import { gitDeploy, getGitTokens, addGitToken, deleteGitToken, GitTokenInfo, useHealth } from '../hooks/useApi';
 
 type Tab = 'github' | 'upload';
 type DeployStatus = 'idle' | 'deploying' | 'success' | 'error';
@@ -29,6 +29,18 @@ function DeployPage() {
   const { toast } = useToast();
   const confirmDialog = useConfirm();
   const navigate = useNavigate();
+  const { health } = useHealth();
+
+  // Build the "deploy via filesystem" hint from the SERVER's OS and webapps
+  // directory (reported by /health), not the browser's — the dashboard is
+  // often viewed from a different OS than the one DROP runs on.
+  const serverIsWindows = health?.system?.platform === 'win32';
+  const appsDir = health?.system?.appsDirectory;
+  const filesystemHint = appsDir
+    ? serverIsWindows
+      ? `copy my-app\\ ${appsDir}\\my-app\\`
+      : `cp -r ./my-app ${appsDir}/`
+    : null;
 
   // Shared result state
   const [status, setStatus] = useState<DeployStatus>('idle');
@@ -486,18 +498,16 @@ function DeployPage() {
           </div>
 
           {/* CLI hint */}
-          <div className="bg-gray-50 dark:bg-gray-800/50 border border-gray-200 dark:border-gray-700 rounded-lg p-4">
-            <p className="text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wide mb-2">
-              Or deploy via filesystem
-            </p>
-            <div className="bg-gray-900 dark:bg-gray-950 rounded-md px-3 py-2">
-              <code className="text-xs text-green-400 font-mono">
-                {navigator.platform.includes('Win')
-                  ? 'copy my-app\\ C:\\drop\\data\\webapps\\my-app\\'
-                  : 'cp -r ./my-app /var/drop/data/webapps/'}
-              </code>
+          {filesystemHint && (
+            <div className="bg-gray-50 dark:bg-gray-800/50 border border-gray-200 dark:border-gray-700 rounded-lg p-4">
+              <p className="text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wide mb-2">
+                Or deploy via filesystem
+              </p>
+              <div className="bg-gray-900 dark:bg-gray-950 rounded-md px-3 py-2">
+                <code className="text-xs text-green-400 font-mono">{filesystemHint}</code>
+              </div>
             </div>
-          </div>
+          )}
         </div>
       )}
     </div>

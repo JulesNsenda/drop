@@ -14,8 +14,6 @@ import {
   Key,
   Plus,
   X,
-  Eye,
-  EyeOff,
 } from 'lucide-react';
 import { useApp, appAction, deleteApp, gitRedeploy } from '../hooks/useApi';
 import { getAuthHeaders, useAuth } from '../hooks/useAuth';
@@ -23,6 +21,7 @@ import { appUrl } from '../api/client';
 import { useToast } from '../components/Toast';
 import { useConfirm } from '../components/ConfirmDialog';
 import StatusBadge from '../components/StatusBadge';
+import DeployTimeline from '../components/DeployTimeline';
 
 function AppDetailPage() {
   const { name } = useParams<{ name: string }>();
@@ -37,10 +36,9 @@ function AppDetailPage() {
   const [actionLoading, setActionLoading] = useState<string | null>(null);
   const logsEndRef = useRef<HTMLDivElement>(null);
 
-  // Env vars state
-  const [envVars, setEnvVars] = useState<Record<string, string>>({});
+  // Env vars state — keys only; values are never returned by the API
+  const [envVars, setEnvVars] = useState<string[]>([]);
   const [envLoading, setEnvLoading] = useState(false);
-  const [showValues, setShowValues] = useState(false);
   const [newKey, setNewKey] = useState('');
   const [newValue, setNewValue] = useState('');
 
@@ -75,7 +73,7 @@ function AppDetailPage() {
         const res = await fetch(`/api/v1/secrets/${name}`, { headers: getAuthHeaders() });
         const json = await res.json();
         if (json.success && json.data) {
-          setEnvVars(json.data);
+          setEnvVars(json.data.keys ?? []);
         }
       } catch {
         // Secrets endpoint may not be available
@@ -147,14 +145,17 @@ function AppDetailPage() {
       const res = await fetch(`/api/v1/secrets/${name}`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
-        body: JSON.stringify({ [newKey.trim()]: newValue }),
+        body: JSON.stringify({ key: newKey.trim(), value: newValue }),
       });
       const json = await res.json();
       if (json.success) {
-        setEnvVars((prev) => ({ ...prev, [newKey.trim()]: newValue }));
+        const trimmed = newKey.trim();
+        setEnvVars((prev) => (prev.includes(trimmed) ? prev : [...prev, trimmed]));
         setNewKey('');
         setNewValue('');
-        toast('success', `Added ${newKey.trim()}`);
+        toast('success', `Added ${trimmed}`);
+      } else {
+        toast('error', json.error?.message || 'Failed to add environment variable');
       }
     } catch {
       toast('error', 'Failed to add environment variable');
@@ -170,11 +171,7 @@ function AppDetailPage() {
       });
       const json = await res.json();
       if (json.success) {
-        setEnvVars((prev) => {
-          const next = { ...prev };
-          delete next[key];
-          return next;
-        });
+        setEnvVars((prev) => prev.filter((k) => k !== key));
         toast('success', `Removed ${key}`);
       }
     } catch {
@@ -363,6 +360,9 @@ function AppDetailPage() {
         </div>
       </div>
 
+      {/* Deploy timeline */}
+      <DeployTimeline appName={app.name} />
+
       {/* Custom domain */}
       <CustomDomainSection appName={app.name} currentDomain={app.customDomain} onUpdate={refresh} />
 
@@ -415,76 +415,76 @@ function AppDetailPage() {
 
       {/* Environment Variables */}
       <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 mb-6">
-        <div className="flex items-center justify-between px-4 py-3 border-b border-gray-200 dark:border-gray-700">
-          <div className="flex items-center gap-2">
-            <Key className="w-4 h-4 text-gray-500 dark:text-gray-400" />
-            <h2 className="font-semibold text-gray-900 dark:text-white">Environment Variables</h2>
-          </div>
-          <button
-            onClick={() => setShowValues(!showValues)}
-            className="flex items-center gap-1 text-sm text-gray-500 hover:text-gray-700 dark:hover:text-gray-300"
-          >
-            {showValues ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
-            {showValues ? 'Hide' : 'Show'}
-          </button>
+        <div className="flex items-center px-4 py-3 border-b border-gray-200 dark:border-gray-700">
+          <Key className="w-4 h-4 text-gray-500 dark:text-gray-400 mr-2" />
+          <h2 className="font-semibold text-gray-900 dark:text-white">Environment Variables</h2>
         </div>
         <div className="p-4">
           {envLoading ? (
             <div className="animate-pulse h-8 bg-gray-100 dark:bg-gray-700 rounded" />
           ) : (
             <>
-              {Object.keys(envVars).length > 0 && (
+              {envVars.length > 0 && (
                 <div className="space-y-2 mb-4">
-                  {Object.entries(envVars).map(([key, value]) => (
+                  {envVars.map((key) => (
                     <div key={key} className="flex items-center gap-2 text-sm">
                       <span className="font-mono font-medium text-gray-700 dark:text-gray-300 min-w-[120px]">
                         {key}
                       </span>
                       <span className="flex-1 font-mono text-gray-500 dark:text-gray-400 truncate">
-                        {showValues ? value : '••••••••'}
+                        ••••••••
                       </span>
-                      <button
-                        onClick={() => handleRemoveEnvVar(key)}
-                        className="text-gray-400 hover:text-red-500"
-                      >
-                        <X className="w-4 h-4" />
-                      </button>
+                      {role !== 'readonly' && (
+                        <button
+                          onClick={() => handleRemoveEnvVar(key)}
+                          className="text-gray-400 hover:text-red-500"
+                        >
+                          <X className="w-4 h-4" />
+                        </button>
+                      )}
                     </div>
                   ))}
                 </div>
               )}
 
-              {Object.keys(envVars).length === 0 && (
+              {envVars.length === 0 && (
                 <p className="text-sm text-gray-500 dark:text-gray-400 mb-4">
                   No environment variables set
                 </p>
               )}
 
-              {/* Add new */}
-              <div className="flex items-center gap-2">
-                <input
-                  type="text"
-                  value={newKey}
-                  onChange={(e) => setNewKey(e.target.value.toUpperCase())}
-                  placeholder="KEY"
-                  className="flex-1 px-2 py-1.5 text-sm border border-gray-300 dark:border-gray-600 rounded bg-white dark:bg-gray-700 text-gray-900 dark:text-white font-mono outline-none focus:ring-1 focus:ring-drop-500"
-                />
-                <input
-                  type="text"
-                  value={newValue}
-                  onChange={(e) => setNewValue(e.target.value)}
-                  placeholder="value"
-                  className="flex-1 px-2 py-1.5 text-sm border border-gray-300 dark:border-gray-600 rounded bg-white dark:bg-gray-700 text-gray-900 dark:text-white font-mono outline-none focus:ring-1 focus:ring-drop-500"
-                />
-                <button
-                  onClick={handleAddEnvVar}
-                  disabled={!newKey.trim()}
-                  className="flex items-center gap-1 px-3 py-1.5 text-sm bg-drop-600 text-white rounded hover:bg-drop-700 disabled:opacity-50"
-                >
-                  <Plus className="w-3 h-3" />
-                  Add
-                </button>
-              </div>
+              {role !== 'readonly' && (
+                <>
+                  {/* Add new */}
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="text"
+                      value={newKey}
+                      onChange={(e) => setNewKey(e.target.value.toUpperCase())}
+                      placeholder="KEY"
+                      className="flex-1 px-2 py-1.5 text-sm border border-gray-300 dark:border-gray-600 rounded bg-white dark:bg-gray-700 text-gray-900 dark:text-white font-mono outline-none focus:ring-1 focus:ring-drop-500"
+                    />
+                    <input
+                      type="text"
+                      value={newValue}
+                      onChange={(e) => setNewValue(e.target.value)}
+                      placeholder="value"
+                      className="flex-1 px-2 py-1.5 text-sm border border-gray-300 dark:border-gray-600 rounded bg-white dark:bg-gray-700 text-gray-900 dark:text-white font-mono outline-none focus:ring-1 focus:ring-drop-500"
+                    />
+                    <button
+                      onClick={handleAddEnvVar}
+                      disabled={!newKey.trim()}
+                      className="flex items-center gap-1 px-3 py-1.5 text-sm bg-drop-600 text-white rounded hover:bg-drop-700 disabled:opacity-50"
+                    >
+                      <Plus className="w-3 h-3" />
+                      Add
+                    </button>
+                  </div>
+                  <p className="mt-2 text-xs text-gray-500 dark:text-gray-400">
+                    Changes take effect on next restart.
+                  </p>
+                </>
+              )}
             </>
           )}
         </div>

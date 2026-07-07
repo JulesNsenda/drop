@@ -6,7 +6,7 @@
 |-------|-------|
 | PRD ID | PRD-025 |
 | Feature | 404 Not Found Page |
-| Status | Pending |
+| Status | Completed |
 | Priority | P1 |
 | Created | 2026-03-19 |
 

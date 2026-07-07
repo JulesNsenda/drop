@@ -88,12 +88,23 @@ export class CaddyAdminClient {
   }
 
   /**
+   * Headers for admin API requests. Caddy 2.11+ rejects requests that look
+   * like browser CORS calls (Node's fetch auto-sends `Sec-Fetch-Mode: cors`)
+   * unless they carry an Origin matching the admin endpoint — otherwise the
+   * request fails with 403 "client is not allowed to access from origin ''".
+   */
+  private adminHeaders(extra?: Record<string, string>): Record<string, string> {
+    return { Origin: this.adminUrl, ...extra };
+  }
+
+  /**
    * Check if the Caddy admin API is reachable
    */
   async isAvailable(): Promise<boolean> {
     try {
       const response = await fetch(`${this.adminUrl}/config/`, {
         method: 'GET',
+        headers: this.adminHeaders(),
         signal: AbortSignal.timeout(this.timeout),
       });
       return response.ok;
@@ -109,6 +120,7 @@ export class CaddyAdminClient {
     try {
       const response = await fetch(`${this.adminUrl}/config/`, {
         method: 'GET',
+        headers: this.adminHeaders(),
         signal: AbortSignal.timeout(this.timeout),
       });
 
@@ -158,6 +170,7 @@ export class CaddyAdminClient {
       // Caddy's PKI app endpoint (may not be available in all versions)
       const response = await fetch(`${this.adminUrl}/pki/ca/local/certificates`, {
         method: 'GET',
+        headers: this.adminHeaders(),
         signal: AbortSignal.timeout(this.timeout),
       });
 
@@ -301,9 +314,7 @@ export class CaddyAdminClient {
       // Reload the config to trigger certificate checks
       const response = await fetch(`${this.adminUrl}/load`, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
+        headers: this.adminHeaders({ 'Content-Type': 'application/json' }),
         body: '{}', // Empty config to just trigger a refresh
         signal: AbortSignal.timeout(this.timeout),
       });

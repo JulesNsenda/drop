@@ -13,8 +13,9 @@ export class DockerBuildStrategy extends BaseBuildStrategy {
   name = 'docker';
   supportedTypes: AppType[] = ['docker'];
 
-  private dockerfilePath: string | null = null;
-  private composeFile: string | null = null;
+  // NOTE: this strategy is exported as a shared singleton and reused for every
+  // docker app (and builds can run concurrently), so it MUST hold no per-build
+  // state. The detected file is recorded on the per-build BuildContext instead.
 
   getInstallCommand(_context: BuildContext): string | null {
     // Docker doesn't have a separate install step
@@ -38,46 +39,48 @@ export class DockerBuildStrategy extends BaseBuildStrategy {
   }
 
   async preBuild(context: BuildContext): Promise<void> {
-    // Detect Dockerfile location
-    const dockerfiles = ['Dockerfile', 'dockerfile', 'Containerfile'];
-    for (const file of dockerfiles) {
+    // Detect Dockerfile location (local vars — never instance state).
+    let dockerfilePath: string | null = null;
+    for (const file of ['Dockerfile', 'dockerfile', 'Containerfile']) {
       if (await this.fileExists(path.join(context.appPath, file))) {
-        this.dockerfilePath = file;
+        dockerfilePath = file;
         break;
       }
     }
 
     // Detect docker-compose file
-    const composeFiles = ['docker-compose.yml', 'docker-compose.yaml', 'compose.yml', 'compose.yaml'];
-    for (const file of composeFiles) {
+    let composeFile: string | null = null;
+    for (const file of ['docker-compose.yml', 'docker-compose.yaml', 'compose.yml', 'compose.yaml']) {
       if (await this.fileExists(path.join(context.appPath, file))) {
-        this.composeFile = file;
+        composeFile = file;
         break;
       }
     }
+
+    // Record the file that drives the build on the per-build context so
+    // validate() can re-check it without sharing state across builds. Compose
+    // takes precedence over a plain Dockerfile.
+    context.config.dockerFile = composeFile ?? dockerfilePath ?? undefined;
 
     // Update build command based on what we found
     if (!context.config.buildCommand) {
       const imageName = context.appName.toLowerCase().replace(/[^a-z0-9-]/g, '-');
 
-      if (this.composeFile) {
-        context.config.buildCommand = `docker-compose -f ${this.composeFile} build`;
-      } else if (this.dockerfilePath) {
-        context.config.buildCommand = `docker build -t ${imageName}:latest -f ${this.dockerfilePath} .`;
+      if (composeFile) {
+        context.config.buildCommand = `docker-compose -f ${composeFile} build`;
+      } else if (dockerfilePath) {
+        context.config.buildCommand = `docker build -t ${imageName}:latest -f ${dockerfilePath} .`;
       }
     }
   }
 
   async validate(context: BuildContext, _outputPath: string): Promise<boolean> {
-    // Verify Dockerfile or docker-compose exists
-    if (this.dockerfilePath) {
-      return this.fileExists(path.join(context.appPath, this.dockerfilePath));
-    }
-    if (this.composeFile) {
-      return this.fileExists(path.join(context.appPath, this.composeFile));
+    // Verify the file detected in preBuild for THIS build still exists.
+    if (context.config.dockerFile) {
+      return this.fileExists(path.join(context.appPath, context.config.dockerFile));
     }
 
-    // Check for any Docker files
+    // Fallback (validate called without preBuild): any Docker file present.
     const hasDockerfile = await this.fileExists(path.join(context.appPath, 'Dockerfile'));
     const hasCompose = await this.fileExists(path.join(context.appPath, 'docker-compose.yml'));
 

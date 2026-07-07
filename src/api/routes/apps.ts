@@ -11,11 +11,15 @@ import { success, error, ErrorCodes, AppDto, CreateAppDto } from '../types';
 import { NotFoundError, ValidationError } from '../middleware/error';
 import { AuthContext, listUsers, getUserById } from '../middleware/auth';
 import { canAccess } from '../access';
+import { isValidAppName, validateAppName } from '../middleware/validate';
 import { getAppRuntime } from '../../managers/runtime';
+import { getSecretManager } from '../../managers/secret';
+import { getDeployTracker } from '../../managers/deploy-tracker';
 import { migrateAppRuntime } from '../../managers/runtime/runtime-migrator';
-import { getDiskFreeMb } from '../../utils/disk';
+import { hasEnoughDisk, getMinFreeDiskMb } from '../../utils/disk';
 import { getStateManager, AppState } from '../../managers/app/state-manager';
 import { getAppConfigService } from '../../managers/app/app-config';
+import { getDatabaseProvisioner } from '../../managers/database';
 import { tryLogActivity } from '../../managers/activity';
 import { getAppsDirectory, isHttpsEnabled } from '../runtime-config';
 import { isPathWithin } from '../../utils/paths';
@@ -23,6 +27,14 @@ import { eventBus } from '../../core/event-bus';
 import type { RuntimeType } from '../../managers/runtime/app-runtime.types';
 
 const apps = new Hono();
+
+// Defense-in-depth: reject a malformed :name param before any handler runs.
+// The security-critical paths already 404 on a non-existent, access-checked
+// app, but this stops a bad name from reaching downstream path/SQL
+// construction. Registered before the routes so it runs first; both patterns
+// are needed to cover the bare `/:name` and its sub-routes (`/:name/start`…).
+apps.use('/:name', validateAppName());
+apps.use('/:name/*', validateAppName());
 
 /**
  * Fields a client may set via PUT /apps/:name. Deliberately excludes
@@ -128,7 +140,7 @@ apps.get('/', async (c) => {
 
   // Batch-fetch live stats from the runtime (best-effort; no-op on failure).
   // Joined by name so the list stays fast even if the runtime is unavailable.
-  let statsMap: Map<string, { memory: number; cpu: number }> = new Map();
+  const statsMap: Map<string, { memory: number; cpu: number }> = new Map();
   try {
     const pm = getAppRuntime();
     const allStatus = await pm.getAllStatus();
@@ -223,6 +235,16 @@ apps.post('/', async (c) => {
 
   const appName = body.name || path.basename(body.path);
 
+  // Validate the name before it becomes a state-manager key, a filesystem
+  // path, and a PM2 process name. Every other write path (git-deploy, secrets)
+  // validates; this one did not, letting a caller register an app keyed by an
+  // arbitrary string (control chars, whitespace, shell/path metacharacters).
+  if (!isValidAppName(appName)) {
+    throw new ValidationError(
+      'Invalid app name: must be 1-64 alphanumeric characters, hyphens, or underscores'
+    );
+  }
+
   // Check if app already exists
   const stateManager = getStateManager();
   if (stateManager.hasApp(appName)) {
@@ -231,14 +253,9 @@ apps.post('/', async (c) => {
 
   // Disk watermark: reject new deploys when the filesystem is dangerously full.
   // MIN_FREE_MB is a hard floor regardless of per-app limits.
-  const MIN_FREE_DISK_MB = parseInt(process.env.DROP_MIN_FREE_DISK_MB || '500', 10);
-  try {
-    const freeMb = await getDiskFreeMb(body.path);
-    if (freeMb < MIN_FREE_DISK_MB) {
-      return c.json(error(ErrorCodes.INTERNAL_ERROR, `Insufficient disk space (${Math.round(freeMb)} MB free, need ${MIN_FREE_DISK_MB} MB)`), 507 as any);
-    }
-  } catch {
-    // Disk check failure is non-blocking — log but proceed
+  const { ok: hasDiskSpace, freeMb } = await hasEnoughDisk(body.path);
+  if (!hasDiskSpace) {
+    return c.json(error(ErrorCodes.INTERNAL_ERROR, `Insufficient disk space (${Math.round(freeMb)} MB free, need ${getMinFreeDiskMb()} MB)`), 507 as any);
   }
 
   // Check per-user app limit
@@ -310,8 +327,69 @@ apps.delete('/:name', async (c) => {
     // Process might not exist in PM2
   }
 
+  // Dump-then-drop the app's provisioned database (if any) BEFORE removing
+  // app state. This must run before stateManager.removeApp so a same-named
+  // recreate can't race in and inherit a still-live/retained database.
+  // `?keepData=true` skips the drop entirely — the DB is left intact.
+  // Non-fatal: a failure here still lets the rest of the delete proceed; the
+  // database is simply retained (the safe outcome — see
+  // docs/plans/2026-07-07-dump-then-drop-on-delete.md).
+  const keepData = c.req.query('keepData') === 'true';
+  let dbStatus: 'dropped' | 'retained' | 'preserved' | 'none' = 'none';
+  if (keepData) {
+    dbStatus = 'preserved';
+  } else {
+    try {
+      const provisioner = getDatabaseProvisioner();
+      if (!provisioner) {
+        // In a running server the provisioner is never null. A null here means
+        // the database layer didn't initialise and we're SILENTLY skipping the
+        // drop — the exact orphan-leak this feature exists to prevent, and
+        // indistinguishable in the response from the legitimate "no database"
+        // case. Make it loud instead of collapsing it into 'none'.
+        console.warn(
+          `[apps.delete] database provisioner unavailable — DB teardown SKIPPED for ${name} (database NOT dropped)`
+        );
+        dbStatus = 'none';
+      } else {
+        const outcome = await provisioner.backupAndDeleteAppDatabase(name);
+        if (outcome.dropped) {
+          dbStatus = 'dropped';
+        } else if (outcome.reason === 'no database provisioned') {
+          dbStatus = 'none';
+        } else {
+          dbStatus = 'retained';
+        }
+        // The full reason (which may embed raw pg_dump stderr, i.e. a path leak)
+        // is logged server-side only — never returned to the client.
+        if (!outcome.dropped && outcome.reason !== 'no database provisioned') {
+          console.warn(`[apps.delete] database retained for ${name}: ${outcome.reason}`);
+        }
+      }
+    } catch (err) {
+      dbStatus = 'retained';
+      console.warn(`[apps.delete] database teardown threw for ${name}:`, err);
+    }
+  }
+
   // Remove from state
   await stateManager.removeApp(name);
+
+  // Clean up secrets so a future same-named app doesn't inherit them
+  try {
+    await getSecretManager().deleteAll(name);
+  } catch {
+    // Secret manager may not be initialised (tests / early failures)
+  }
+
+  // Purge deploy history so a future same-named app doesn't inherit the
+  // deleted app's deploy timeline (and, more importantly, its owner-scoped
+  // episodes leaking to whoever registers the name next).
+  try {
+    getDeployTracker().purgeApp(name);
+  } catch {
+    // Deploy tracker may not be initialised (tests / early failures)
+  }
 
   // Remove app config (e.g. appconf/webapps/ezsign.yaml)
   try {
@@ -331,7 +409,7 @@ apps.delete('/:name', async (c) => {
   }
 
   await tryLogActivity({ action: 'delete', userId: auth?.userId, username: auth?.username, appName: name });
-  return c.json(success({ message: `Application '${name}' removed` }));
+  return c.json(success({ message: `Application '${name}' removed`, database: dbStatus }));
 });
 
 // POST /apps/:name/start - Start application

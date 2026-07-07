@@ -144,10 +144,19 @@ gitDeploy.post('/webhook', async (c) => {
       return c.json(error(ErrorCodes.UNAUTHORIZED, 'Invalid webhook signature'), 401);
     }
   } else {
-    // Warn-then-enforce: until v1.0 final this is accepted so existing
-    // auto-redeploy setups keep working, but it is logged loudly. Set
-    // DROP_GITHUB_WEBHOOK_SECRET to authenticate webhooks.
+    // Fail closed. This receiver is unauthenticated by design — the HMAC
+    // signature is its only auth. With no secret configured, anyone who knows a
+    // deployed app's (often public) repo URL could force repeated
+    // pull+rebuild+restart — a DoS and a recon oracle. Refuse to act until an
+    // operator configures a signing secret, rather than processing anyway.
     warnWebhookSecretMissing();
+    return c.json(
+      error(
+        ErrorCodes.SERVICE_UNAVAILABLE,
+        'Webhook deploys are disabled: set DROP_GITHUB_WEBHOOK_SECRET to enable them'
+      ),
+      503
+    );
   }
 
   let body: GitHubPushPayload;
@@ -178,6 +187,10 @@ gitDeploy.post('/webhook', async (c) => {
   for (const appName of matchingApps) {
     try {
       await service.redeploy(appName);
+      // Webhook auto-redeploys are unattended and had no audit trail — record
+      // them (system action, no user). The API /git/redeploy route logs its
+      // own; this webhook path is distinct, so there is no double-count.
+      await tryLogActivity({ action: 'redeploy', appName, detail: `webhook: ${branch}` });
       results.push({ app: appName, status: 'redeploying' });
     } catch (err) {
       results.push({

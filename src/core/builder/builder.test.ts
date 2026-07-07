@@ -357,7 +357,7 @@ describe('executeCommand', () => {
   });
 
   afterAll(async () => {
-    await fs.rm(tempDir, { recursive: true, force: true });
+    await fs.rm(tempDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   });
 
   it('should execute simple command', async () => {
@@ -412,7 +412,7 @@ describe('BuilderService Integration', () => {
   });
 
   afterAll(async () => {
-    await fs.rm(tempDir, { recursive: true, force: true });
+    await fs.rm(tempDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   });
 
   it('should fail build for unknown app type', async () => {

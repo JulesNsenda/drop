@@ -37,25 +37,36 @@ A lightweight, self-hosted Platform as a Service (PaaS) engineered for the "drop
 
 ### 1. Install
 
-**Linux / macOS**
+> The repository is **private**, so the old public `curl … | sudo bash`
+> one-liner no longer works (the raw URL 404s without auth). Use the owner
+> bootstrap below instead.
+
+**Server bootstrap (owner / operator)**
+
+A freshly-provisioned box is brought up in two parts: a one-time `--bootstrap`
+that installs the system dependencies, and the GitHub Actions pipeline
+(`.github/workflows/deploy.yml`) that ships and runs the built code on every push.
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/JulesNsenda/drop/main/install.sh \
-  | sudo bash
+# From your laptop (you have the repo checked out — no GitHub token needed):
+scp install.sh root@<NEW_IP>:/tmp/install.sh
+ssh root@<NEW_IP> "bash /tmp/install.sh --bootstrap --domain=dropkit.sh \
+    --deploy-pubkey='$(cat drop-deploy.pub)'"
+#   add --https --acme-email=you@example.com on a later run, once HTTP works
 ```
 
-This installs Node.js 20 if needed, clones the repo to `/opt/drop`, builds the
-server, and registers a `drop-platform` systemd service.
+`--bootstrap` installs Node.js 20, PostgreSQL, Caddy, a C toolchain (for native
+deps), creates the `drop` user + `/opt/drop`, seeds the CI deploy key into
+`authorized_keys`, and registers the `drop-platform` systemd service **without**
+fetching or starting any code. Then set the `hetzner`-environment secrets
+(`DEPLOY_HOST`, `DEPLOY_USER=drop`, `DEPLOY_KEY_B64`) and push — CI builds the
+server + dashboard, scps the artifact, and starts the service.
 
-**Windows**
+Full step-by-step (DNS, firewall, deploy keypair, HTTPS) lives in
+`docs/plans/2026-06-19-one-command-bootstrap.md`.
 
-```bat
-curl -fsSL https://raw.githubusercontent.com/JulesNsenda/drop/main/install.bat -o install.bat
-install.bat
-```
-
-Or download `install.bat` from the repo root and run it. It checks for Node.js
-20+ and Git, clones the repo, builds, and links the `drop` CLI.
+> **Windows** (`install.bat`) does not yet support the private repo — clone with
+> your own credentials and run a manual/dev install for now.
 
 **Development / manual install**
 
@@ -433,17 +444,66 @@ See `.env.example` for all security-relevant settings and
 
 DROP keeps critical state in the file stores under `data/drop-svc/`
 (credentials, encrypted secrets, the encryption key, webhooks, app state) and
-in the internal PostgreSQL database. Snapshot all of it with:
+in PostgreSQL — both the internal `drop_internal` database and **every
+provisioned per-app database**. Snapshot all of it with:
 
 ```bash
 drop backup            # writes data/backup/backup-<timestamp>/
 drop backup --keep 14  # keep the newest 14, prune the rest
 ```
 
-A backup contains the JSON/YAML stores, `encryption.key`, and a `pg_dump` of
-the internal database. **Schedule it yourself** (cron / Task Scheduler) — DROP
-does not run backups automatically. To restore, stop DROP, copy the files back
-into `data/drop-svc/` (and `data/appconf/webapps/`), and `pg_restore` the dump.
+A backup contains the JSON/YAML stores, `encryption.key`, a `pg_dump` of
+`drop_internal`, and a `pg_dump -Fc` of **each per-app database** under
+`databases/` (plus a generated `databases/restore-roles.sql` that recreates
+the app DB roles). **Schedule it yourself** (cron / Task Scheduler) — DROP
+does not run backups automatically. The backup command exits non-zero if any
+dump — per-app, internal, or the database enumeration itself — fails, so a
+cron job that only checks the exit code will still catch a partial backup.
+
+**Caveat: backups are same-platform only.** A backup taken on Windows will
+not restore on Linux (and vice versa) — the bundled PostgreSQL binaries and
+data layout are platform-specific.
+
+### Restore
+
+Stop DROP, then restore the file stores and PostgreSQL data from a backup
+directory (`data/backup/backup-<timestamp>/`):
+
+```bash
+BIN=<dropRoot>/apps/drop-svc/pgsql/bin ; export PGPASSWORD="$(cat .pg-superuser)"
+# 1. Recreate app roles (clean server runs clean; on a re-run, "role already exists" is expected/benign)
+"$BIN/psql" -h 127.0.0.1 -p 5433 -U postgres -d postgres -f databases/restore-roles.sql
+# 2. Recreate + restore each per-app database (--create makes the DB AND restores REVOKE CONNECT)
+"$BIN/pg_restore" -h 127.0.0.1 -p 5433 -U postgres --create -d postgres databases/drop_<app>.dump
+#    (re-run: add --clean --if-exists ; check exit codes, don't ignore stderr)
+# 3. Restore file stores + drop_internal as before.
+```
+
+Use the backup's own `.pg-superuser` file for `PGPASSWORD` (it holds the
+superuser password at the time the backup was taken) and the bundled
+`pg_restore`/`psql` under `apps/drop-svc/pgsql/bin` — do not use a system
+Postgres client, since major-version mismatches can corrupt the restore.
+Restore `drop_internal` and the remaining file stores (`data/drop-svc/`,
+`data/appconf/webapps/`) the same way as before per-app DB backups existed.
+
+### Pre-delete database dumps
+
+Deleting an app (`drop remove <app>` / `DELETE /api/v1/apps/:name`) now
+dump-then-drops its provisioned database: before the database is dropped,
+DROP `pg_dump`s it to `data/backup/pre-delete/<db>-<timestamp>.dump` plus a
+companion `<db>-<timestamp>.restore-role.sql` (recreates the role, since
+`-Fc` doesn't capture it). The drop only happens if the dump verifies; if
+`pg_dump` fails or Postgres is down, the database is left intact instead of
+being lost. Pre-delete dumps are retained for `DROP_PREDELETE_RETENTION_DAYS`
+days (default **3**) and pruned automatically on each subsequent delete —
+copy any you want to keep permanently off-box before then.
+
+Run `drop remove --keep-data <app>` to skip dump-then-drop entirely and leave
+the database in place.
+
+To restore a pre-delete dump, use the same procedure as the [Restore](#restore)
+section above: run its `.restore-role.sql` with `psql`, then
+`pg_restore --create` the `.dump` file.
 
 ## Upgrading
 

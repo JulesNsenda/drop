@@ -6,10 +6,12 @@
 
 import * as crypto from 'crypto';
 import * as fs from 'fs/promises';
+import * as fssync from 'fs';
 import * as path from 'path';
 import { Pool } from 'pg';
 import { writeJsonAtomic } from '../../utils/atomic-write';
 import { PostgresServer } from './postgres-server';
+import { runPgDump, createRoleSql } from './pg-dump';
 
 export interface DatabaseCredentials {
   host: string;
@@ -31,13 +33,18 @@ const DROP_INTERNAL_USER = 'drop_admin';
 const APP_DB_PREFIX = 'drop_';
 const APP_USER_PREFIX = 'drop_';
 
+/** Defense-in-depth: sanitized DB/role identifiers must match before touching a path or SQL statement. */
+const DB_NAME_ALLOWLIST = /^[a-z0-9_]+$/;
+
 export class DatabaseProvisioner {
   private readonly server: PostgresServer;
+  private readonly dropRoot: string;
   private readonly credentialsPath: string;
   private provisionedDatabases: Map<string, ProvisionedDatabase> = new Map();
 
   constructor(server: PostgresServer, dropRoot: string) {
     this.server = server;
+    this.dropRoot = dropRoot;
     this.credentialsPath = path.join(dropRoot, 'data', 'drop-svc', 'db-credentials.json');
   }
 
@@ -122,25 +129,48 @@ export class DatabaseProvisioner {
     const dbName = `${APP_DB_PREFIX}${safeName}`;
     const userName = `${APP_USER_PREFIX}${safeName}_user`;
 
-    // Check if already provisioned
+    // Check if already provisioned for THIS app.
     const existing = this.provisionedDatabases.get(appName);
-    if (existing && (await this.server.databaseExists(dbName))) {
+    const dbAlreadyExists = await this.server.databaseExists(dbName);
+
+    if (existing && dbAlreadyExists) {
       return existing.credentials;
     }
 
-    // Generate password
-    const password = this.generatePassword();
-
-    // Create database if it doesn't exist
-    if (!(await this.server.databaseExists(dbName))) {
-      await this.server.createDatabase(dbName);
+    // The database exists but this app has no registry entry for it. sanitizeName()
+    // is lossy — 'my-app' and 'my_app' both map to the same dbName, and names are
+    // truncated to 32 chars — so a *different* app's name can collide onto this
+    // dbName. Falling through would hit the "user already exists" branch below and
+    // ALTER that tenant's password, handing this app their live database
+    // (cross-tenant takeover + DoS). Refuse loudly. NOTE: this also fails a
+    // legitimate re-provision whose registry entry was lost (corrupt/cleared
+    // db-credentials.json, or a crash before saveCredentials); that used to
+    // self-heal by re-adopting its own DB, but that path is indistinguishable
+    // from the attack, so failing closed is the correct security call — the error
+    // tells the operator how to recover.
+    if (dbAlreadyExists) {
+      throw new Error(
+        `Database "${dbName}" already exists but is not registered to app "${appName}". ` +
+          `This is usually a name collision after sanitization (e.g. "a-b" and "a_b" both ` +
+          `map to "${dbName}", or two names sharing the first 32 characters). Refusing to ` +
+          `reuse it to avoid taking over another app's database. If no other app owns this ` +
+          `database, drop the orphan DB (or restore its db-credentials.json entry) and ` +
+          `redeploy; otherwise rename this app to a distinct name.`
+      );
     }
+
+    // Fresh provision — the database does not exist yet.
+    const password = this.generatePassword();
+    await this.server.createDatabase(dbName);
 
     // Create user and grant privileges
     try {
       await this.server.createUser(userName, password);
     } catch (error) {
-      // User might already exist - update password
+      // User might already exist - update password. (Residual: if a DB was
+      // dropped but its role lingered, a colliding name could reach here and
+      // rotate that orphan role's password. Low-risk — the collision guard above
+      // already rejects any *existing* database, so there is no live DB to adopt.)
       if (String(error).includes('already exists')) {
         const pool = await this.server.getPool();
         await pool.query(`ALTER USER "${userName}" WITH PASSWORD '${password}'`);
@@ -211,54 +241,223 @@ export class DatabaseProvisioner {
   }
 
   /**
-   * Delete an app's database
+   * Dump-then-drop an app's database on a deliberate app delete.
+   *
+   * Fail-closed at every step: if the dump can't be produced and verified,
+   * the database (and its credentials-registry entry) are KEPT — a retained,
+   * undeleted database is always the safe outcome. Only once a verified dump
+   * (plus a role-recreation script) is safely committed to disk do we touch
+   * `DROP DATABASE`/`DROP USER`. The registry entry is removed only if BOTH
+   * drops succeed, so a partial failure never produces an untracked orphan.
+   *
+   * See docs/plans/2026-07-07-dump-then-drop-on-delete.md.
    */
-  async deleteAppDatabase(appName: string): Promise<void> {
+  async backupAndDeleteAppDatabase(
+    appName: string
+  ): Promise<{ dropped: boolean; reason?: string; dumpPath?: string }> {
     const provisioned = this.provisionedDatabases.get(appName);
     if (!provisioned) {
-      return;
+      return { dropped: false, reason: 'no database provisioned' };
     }
 
-    const { database, user } = provisioned.credentials;
+    const { database, user, password } = provisioned.credentials;
 
-    // Terminate connections and drop database
+    // Defense-in-depth: these become a filesystem path component and an
+    // interpolated SQL identifier below. sanitizeName() should already
+    // guarantee this shape, but never trust that transitively for a
+    // destructive operation.
+    if (!DB_NAME_ALLOWLIST.test(database) || !DB_NAME_ALLOWLIST.test(user)) {
+      return { dropped: false, reason: 'refusing: unexpected identifier' };
+    }
+
+    // Hardened pre-delete dump directory. mode-on-mkdir only applies at
+    // creation time, so an already-existing (possibly looser) directory must
+    // be re-hardened unconditionally. No process.umask() here — this runs
+    // inside the long-lived server process, and a global umask mutation
+    // would race every other concurrent file write.
+    const preDeleteDir = path.join(this.dropRoot, 'data', 'backup', 'pre-delete');
+    await fs.mkdir(preDeleteDir, { recursive: true, mode: 0o700 });
+    await fs.chmod(preDeleteDir, 0o700);
+
+    const ext = process.platform === 'win32' ? '.exe' : '';
+    const pgDumpPath = path.join(this.dropRoot, 'apps', 'drop-svc', 'pgsql', 'bin', `pg_dump${ext}`);
+    if (!fssync.existsSync(pgDumpPath)) {
+      return { dropped: false, reason: 'pg_dump binary not found' };
+    }
+
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const partial = path.join(preDeleteDir, `${database}-${stamp}.dump.partial`);
+    const finalDump = partial.replace(/\.partial$/, '');
+
+    const result = await runPgDump(pgDumpPath, {
+      port: this.server.getPort(),
+      user: 'postgres',
+      dbName: database,
+      outFile: partial,
+      password: this.server.getSuperuserPassword(),
+    });
+
+    if (!result.ok) {
+      await fs.rm(partial, { force: true });
+      return { dropped: false, reason: `dump failed: ${result.error}` };
+    }
+
+    // Verify before touching the database: exists, non-empty, and begins
+    // with the pg_dump custom-format magic header ("PGDMP"). A corrupt or
+    // truncated dump must never be trusted as the safety net for a drop.
+    const verified = await this.verifyDumpFile(partial);
+    if (!verified) {
+      await fs.rm(partial, { force: true });
+      return { dropped: false, reason: 'dump verification failed (not a valid pg_dump archive)' };
+    }
+
+    // Dump is proven good — commit the artifacts BEFORE any drop. -Fc does
+    // not capture roles, so the owning role must be recreated separately at
+    // restore time.
+    const restoreRoleSqlPath = path.join(preDeleteDir, `${database}-${stamp}.restore-role.sql`);
+    await fs.writeFile(restoreRoleSqlPath, createRoleSql(user, password) + '\n', { mode: 0o600 });
+    await fs.rename(partial, finalDump);
+    await fs.chmod(finalDump, 0o600);
+
+    // Only now — drop. Uses the shared admin pool; never .end() it.
     const pool = await this.server.getPool();
 
+    let dbDropped = false;
+    let roleDropped = false;
+
     try {
-      // Terminate active connections
-      await pool.query(`
-        SELECT pg_terminate_backend(pg_stat_activity.pid)
-        FROM pg_stat_activity
-        WHERE pg_stat_activity.datname = $1
-        AND pid <> pg_backend_pid()
-      `, [database]);
-
-      // Drop database
-      await pool.query(`DROP DATABASE IF EXISTS "${database}"`);
-
-      // Drop user
-      await pool.query(`DROP USER IF EXISTS "${user}"`);
+      // WITH (FORCE) terminates active connections and drops in one
+      // statement (PG13+; the bundled server is v16). The allowlist check
+      // above makes this interpolation safe.
+      await pool.query(`DROP DATABASE IF EXISTS "${database}" WITH (FORCE)`);
+      dbDropped = true;
     } catch (error) {
-      // Log but don't fail
-      console.warn(`Failed to fully clean up database for ${appName}:`, error);
+      console.warn(`Failed to drop database for ${appName}:`, error);
     }
 
-    this.provisionedDatabases.delete(appName);
-    await this.saveCredentials();
+    try {
+      await pool.query(`DROP USER IF EXISTS "${user}"`);
+      roleDropped = true;
+    } catch (error) {
+      console.warn(`Failed to drop role for ${appName}:`, error);
+    }
+
+    let reason: string | undefined;
+    if (dbDropped && roleDropped) {
+      // Only remove the registry entry once BOTH drops succeeded — otherwise
+      // a partially-dropped database/role would become an untracked orphan.
+      this.provisionedDatabases.delete(appName);
+      await this.saveCredentials();
+    } else {
+      reason = `database drop ${dbDropped ? 'ok' : 'FAILED'}, role drop ${roleDropped ? 'ok' : 'FAILED'}`;
+    }
+
+    await this.prunePreDeleteBackups(preDeleteDir);
+
+    return { dropped: dbDropped && roleDropped, reason, dumpPath: finalDump };
+  }
+
+  /** True if `file` exists, is non-empty, and begins with the pg_dump custom-format magic header. */
+  private async verifyDumpFile(file: string): Promise<boolean> {
+    try {
+      const stat = await fs.stat(file);
+      if (!stat.isFile() || stat.size === 0) {
+        return false;
+      }
+      const handle = await fs.open(file, 'r');
+      try {
+        const buf = Buffer.alloc(5);
+        const { bytesRead } = await handle.read(buf, 0, 5, 0);
+        return bytesRead === 5 && buf.toString('latin1') === 'PGDMP';
+      } finally {
+        await handle.close();
+      }
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Best-effort age-based retention for pre-delete dumps. Never throws — a
+   * pruning failure must never be mistaken for (or cause) a drop failure.
+   * Age-based (not keep-last-N) so pruning never evicts a different app's
+   * only surviving copy. `DROP_PREDELETE_RETENTION_DAYS <= 0` disables
+   * pruning entirely (keep forever). Default: 3 days.
+   */
+  private async prunePreDeleteBackups(preDeleteDir: string): Promise<void> {
+    try {
+      const raw = process.env.DROP_PREDELETE_RETENTION_DAYS;
+      const days = raw !== undefined && raw !== '' ? Number(raw) : 3;
+      if (!Number.isFinite(days) || days <= 0) {
+        return;
+      }
+
+      const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
+      const entries = await fs.readdir(preDeleteDir);
+      for (const entry of entries) {
+        // Also sweep `.dump.partial` files orphaned by a crash/SIGKILL between
+        // pg_dump completing and the rename — age-based, so a fresh in-flight
+        // one is never touched.
+        if (
+          !entry.endsWith('.dump') &&
+          !entry.endsWith('.restore-role.sql') &&
+          !entry.endsWith('.dump.partial')
+        ) {
+          continue;
+        }
+        const filePath = path.join(preDeleteDir, entry);
+        try {
+          const stat = await fs.stat(filePath);
+          if (stat.mtimeMs < cutoff) {
+            await fs.rm(filePath, { force: true });
+          }
+        } catch {
+          // Best-effort — skip files we can't stat/remove.
+        }
+      }
+    } catch {
+      // Best-effort — pruning failures must never surface as a drop failure.
+    }
   }
 
   /**
    * Get environment variables for an app's database connection.
    *
-   * When `pgHost` is provided (e.g. `'host-gateway'` for Docker mode) the host
-   * portion of every connection string is substituted so that containerised apps
-   * can reach the bundled PostgreSQL on the host rather than resolving
-   * `localhost` inside their own network namespace.
+   * - Default (no opts): loopback TCP connection — for PM2 mode.
+   * - `pgSocketDir`: unix-socket connection via a bind-mounted socket directory
+   *   — for Docker isolation mode.  libpq treats a PGHOST value containing '/'
+   *   as a socket directory rather than a hostname.
+   * - `pgHost` (legacy): substitute a different hostname in the TCP URL.
    */
-  getEnvVars(appName: string, opts?: { pgHost?: string }): Record<string, string> | null {
+  getEnvVars(
+    appName: string,
+    opts?: { pgHost?: string; pgSocketDir?: string }
+  ): Record<string, string> | null {
     const creds = this.getAppCredentials(appName);
     if (!creds) {
       return null;
+    }
+
+    if (opts?.pgSocketDir) {
+      const socketDir = opts.pgSocketDir;
+      // libpq socket URL: postgresql://user:pw/dbname?host=<socketDir>&port=<port>
+      const pw = encodeURIComponent(creds.password);
+      const connectionString =
+        `postgresql://${creds.user}:${pw}/${creds.database}` +
+        `?host=${encodeURIComponent(socketDir)}&port=${creds.port}`;
+      return {
+        DATABASE_URL: connectionString,
+        PGHOST: socketDir,
+        PGPORT: creds.port.toString(),
+        PGDATABASE: creds.database,
+        PGUSER: creds.user,
+        PGPASSWORD: creds.password,
+        DB_HOST: socketDir,
+        DB_PORT: creds.port.toString(),
+        DB_NAME: creds.database,
+        DB_USER: creds.user,
+        DB_PASSWORD: creds.password,
+      };
     }
 
     const host = opts?.pgHost ?? creds.host;
@@ -302,22 +501,67 @@ export class DatabaseProvisioner {
   }
 
   private async loadCredentials(): Promise<void> {
+    let data: string;
     try {
-      const data = await fs.readFile(this.credentialsPath, 'utf-8');
-      const parsed = JSON.parse(data);
-
-      if (parsed.databases && Array.isArray(parsed.databases)) {
-        for (const db of parsed.databases) {
-          this.provisionedDatabases.set(db.appName, {
-            appName: db.appName,
-            credentials: db.credentials,
-            createdAt: new Date(db.createdAt),
-          });
-        }
-      }
+      data = await fs.readFile(this.credentialsPath, 'utf-8');
     } catch {
-      // File doesn't exist or is corrupted - start fresh
+      // No credentials file yet — first run. Start with an empty registry.
       this.provisionedDatabases.clear();
+      return;
+    }
+
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(data);
+    } catch (err) {
+      // Corrupt file. It maps every app to its database + role + password;
+      // losing it strands every app (the collision guard in
+      // provisionAppDatabase then refuses to re-provision over the existing
+      // database, so redeploys fail loudly). Quarantine it for recovery
+      // instead of silently overwriting it on the next save.
+      await this.quarantineCorruptCredentials(err);
+      this.provisionedDatabases.clear();
+      return;
+    }
+
+    if (
+      !parsed ||
+      typeof parsed !== 'object' ||
+      !Array.isArray((parsed as { databases?: unknown }).databases)
+    ) {
+      // Parsed but wrong shape (truncated-yet-valid JSON / hand-edited) — treat
+      // as corrupt: preserve, don't overwrite.
+      await this.quarantineCorruptCredentials(new Error('db-credentials.json has an unexpected shape'));
+      this.provisionedDatabases.clear();
+      return;
+    }
+
+    this.provisionedDatabases.clear();
+    const databases = (parsed as { databases: Array<Record<string, unknown>> }).databases;
+    for (const db of databases) {
+      if (!db || typeof db.appName !== 'string' || !db.credentials) {
+        continue; // skip malformed entries rather than crashing the load
+      }
+      this.provisionedDatabases.set(db.appName, {
+        appName: db.appName,
+        credentials: db.credentials as DatabaseCredentials,
+        createdAt: new Date(db.createdAt as string),
+      });
+    }
+  }
+
+  /** Preserve a corrupt db-credentials.json (rename to `.corrupt-<ts>`) for recovery. */
+  private async quarantineCorruptCredentials(err: unknown): Promise<void> {
+    try {
+      const ts = new Date().toISOString().replace(/[:.]/g, '-');
+      const quarantinePath = `${this.credentialsPath}.corrupt-${ts}`;
+      await fs.rename(this.credentialsPath, quarantinePath);
+      console.error(
+        `[db-provisioner] Corrupt db-credentials.json quarantined to ${quarantinePath}:`,
+        err instanceof Error ? err.message : err
+      );
+    } catch (renameErr) {
+      console.error('[db-provisioner] Failed to quarantine corrupt db-credentials.json:', renameErr);
     }
   }
 

@@ -6,7 +6,7 @@
 |-------|-------|
 | PRD ID | PRD-015 |
 | Feature | Monitoring & Observability |
-| Status | Not Started |
+| Status | In Progress (per-app CPU/mem in apps API; no Prometheus/alerting/history) |
 | Phase | 3 - Advanced Features |
 | Priority | P1 |
 | Owner | TBD |

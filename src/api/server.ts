@@ -24,6 +24,7 @@ import appsRoutes from './routes/apps';
 import logsRoutes from './routes/logs';
 import authRoutes from './routes/auth';
 import certsRoutes from './routes/certs';
+import deploysRoutes from './routes/deploys';
 import secretsRoutes from './routes/secrets';
 import webhooksRoutes from './routes/webhooks';
 import gitDeployRoutes from './routes/git-deploy';
@@ -51,6 +52,8 @@ export interface ApiServerConfig {
   enableHttps?: boolean;
   /** Active domain suffix (e.g. "example.com"). */
   domainSuffix?: string;
+  /** Path to the platform encryption key (for MFA secret at rest). */
+  masterKeyPath?: string;
 }
 
 export class ApiServer {
@@ -90,6 +93,7 @@ export class ApiServer {
         credentialsPath: this.config.credentialsPath,
         enableJwt: true,
         enableApiKeys: true,
+        masterKeyPath: this.config.masterKeyPath,
       });
     }
 
@@ -146,6 +150,7 @@ export class ApiServer {
     // Auth routes with stricter rate limiting (brute-force / signup-flood)
     v1.use('/auth/login', authRateLimitMiddleware());
     v1.use('/auth/signup', authRateLimitMiddleware());
+    v1.use('/auth/mfa/*', authRateLimitMiddleware());
     v1.route('/auth', authRoutes);
 
     // Apply auth middleware to protected routes when auth is enabled
@@ -156,8 +161,13 @@ export class ApiServer {
       v1.use('/apps', authMiddleware('readonly'));
       v1.use('/usage', authMiddleware('readonly'));
       v1.use('/logs/*', authMiddleware('readonly'));
+      v1.use('/deploys/*', authMiddleware('readonly'));
+      v1.use('/deploys', authMiddleware('readonly'));
+      // Renewal triggers a platform-wide ACME pass (Let's Encrypt rate-limit
+      // risk) — admin-only. Register before the general /certs/* guard.
+      v1.use('/certs/renew', authMiddleware('admin'));
       v1.use('/certs/*', authMiddleware('readonly'));
-      v1.use('/secrets/*', authMiddleware('admin'));
+      v1.use('/secrets/*', authMiddleware('user'));
       v1.use('/webhooks/*', authMiddleware('admin'));
       v1.use('/git/deploy', authMiddleware('user'));
       v1.use('/git/redeploy/*', authMiddleware('user'));
@@ -171,6 +181,7 @@ export class ApiServer {
     v1.route('/usage', usageRoutes);
     v1.route('/logs', logsRoutes);
     v1.route('/certs', certsRoutes);
+    v1.route('/deploys', deploysRoutes);
     v1.route('/secrets', secretsRoutes);
     v1.route('/webhooks', webhooksRoutes);
     v1.route('/git', gitDeployRoutes);
@@ -284,10 +295,14 @@ export class ApiServer {
       console.error('API Error:', err);
 
       if (err instanceof HttpError) {
+        // HttpErrors carry deliberate, client-safe messages.
         return c.json(error(err.code, err.message), err.statusCode as 400 | 401 | 403 | 404 | 409 | 500);
       }
 
-      return c.json(error(ErrorCodes.INTERNAL_ERROR, err.message || 'Internal server error'), 500);
+      // Unexpected error: the real message/stack is logged above. Return a
+      // generic message so internal details (filesystem paths, DB/driver
+      // errors, stack text) never leak to API clients.
+      return c.json(error(ErrorCodes.INTERNAL_ERROR, 'Internal server error'), 500);
     });
 
     // Handle 404

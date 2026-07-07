@@ -30,7 +30,7 @@ describe('DetectorService', () => {
   });
 
   afterAll(async () => {
-    await fs.rm(tempDir, { recursive: true, force: true });
+    await fs.rm(tempDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   });
 
   describe('constructor', () => {
@@ -105,6 +105,27 @@ describe('DetectorService', () => {
       expect(result.type).toBe('unknown');
       expect(result.confidence).toBe(0);
     });
+
+    describe('silent option (P1-6)', () => {
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const { eventBus } = require('../event-bus');
+      const detectedCount = (): number =>
+        (eventBus.publish as jest.Mock).mock.calls.filter(
+          (c: unknown[]) => c[0] === 'app:detected'
+        ).length;
+
+      it('publishes app:detected by default', async () => {
+        (eventBus.publish as jest.Mock).mockClear();
+        await new DetectorService().detect(tempDir);
+        expect(detectedCount()).toBe(1);
+      });
+
+      it('does not publish app:detected when silent (internal re-detection)', async () => {
+        (eventBus.publish as jest.Mock).mockClear();
+        await new DetectorService().detect(tempDir, { silent: true });
+        expect(detectedCount()).toBe(0);
+      });
+    });
   });
 });
 
@@ -116,7 +137,7 @@ describe('Manifest Detector', () => {
   });
 
   afterAll(async () => {
-    await fs.rm(tempDir, { recursive: true, force: true });
+    await fs.rm(tempDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   });
 
   it('should detect drop.yaml', async () => {
@@ -200,7 +221,7 @@ describe('Node.js Detector', () => {
   });
 
   afterAll(async () => {
-    await fs.rm(tempDir, { recursive: true, force: true });
+    await fs.rm(tempDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   });
 
   it('should detect basic Node.js app', async () => {
@@ -284,7 +305,7 @@ describe('Python Detector', () => {
   });
 
   afterAll(async () => {
-    await fs.rm(tempDir, { recursive: true, force: true });
+    await fs.rm(tempDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   });
 
   it('should detect Django from manage.py', async () => {
@@ -340,7 +361,7 @@ describe('Static Detector', () => {
   });
 
   afterAll(async () => {
-    await fs.rm(tempDir, { recursive: true, force: true });
+    await fs.rm(tempDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   });
 
   it('should detect static site with index.html', async () => {
@@ -397,7 +418,7 @@ describe('Docker Detector', () => {
   });
 
   afterAll(async () => {
-    await fs.rm(tempDir, { recursive: true, force: true });
+    await fs.rm(tempDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   });
 
   it('should detect Dockerfile', async () => {

@@ -6,6 +6,7 @@
 
 import { AppStatus, AppType } from '../managers/app/state-manager';
 import type { GitSource } from '../core/git-deploy/git-deploy.types';
+import type { DeployStageName, DeployStatus } from '../managers/deploy-tracker';
 
 // API Response wrapper
 export interface ApiResponse<T = unknown> {
@@ -72,6 +73,28 @@ export interface AppLogsDto {
   type: 'stdout' | 'stderr' | 'combined';
 }
 
+// Deploy observability DTOs (P2-4). Mirror DeployStage/DeployEpisode from
+// managers/deploy-tracker EXCEPT `userId` — that's an owner snapshot used
+// for server-side tenant filtering only and must never reach a client.
+export interface DeployStageDto {
+  stage: DeployStageName;
+  at: string;
+  durationMs?: number;
+  ok?: boolean;
+  category?: string;
+}
+
+export interface DeployEpisodeDto {
+  deployId: string;
+  appName: string;
+  trigger: 'deploy' | 'hot-reload' | 'unknown';
+  status: DeployStatus;
+  startedAt: string;
+  endedAt?: string;
+  durationMs?: number;
+  stages: DeployStageDto[];
+}
+
 // Health DTOs
 export interface HealthDto {
   status: 'healthy' | 'degraded' | 'unhealthy';
@@ -83,6 +106,14 @@ export interface HealthDto {
     processManager: ComponentHealth;
     database?: ComponentHealth;
     watcher?: ComponentHealth;
+    caddy?: ComponentHealth;
+  };
+  /** Server runtime info — authoritative OS and paths (not the browser's). */
+  system: {
+    /** Node's process.platform on the server: 'linux', 'win32', 'darwin', … */
+    platform: string;
+    /** Resolved webapps directory on the server (honors DROP_ROOT / DROP_APPS_DIR). */
+    appsDirectory: string;
   };
 }
 
@@ -129,4 +160,8 @@ export const ErrorCodes = {
   UNAUTHORIZED: 'UNAUTHORIZED',
   RATE_LIMITED: 'RATE_LIMITED',
   SERVICE_UNAVAILABLE: 'SERVICE_UNAVAILABLE',
+  MUST_CHANGE_PASSWORD: 'MUST_CHANGE_PASSWORD',
+  MFA_REQUIRED: 'MFA_REQUIRED',
+  MFA_INVALID: 'MFA_INVALID',
+  MFA_REPLAY: 'MFA_REPLAY',
 } as const;

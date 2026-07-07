@@ -5,7 +5,7 @@ import { ErrorBoundary } from './components/ErrorBoundary';
 import { ToastProvider } from './components/Toast';
 import { ConfirmProvider } from './components/ConfirmDialog';
 import { AuthContext, useAuthProvider } from './hooks/useAuth';
-import { UNAUTHORIZED_EVENT } from './api/client';
+import { UNAUTHORIZED_EVENT, MUST_CHANGE_PASSWORD_EVENT } from './api/client';
 import LandingPage from './pages/LandingPage';
 import AppsPage from './pages/AppsPage';
 import AppDetailPage from './pages/AppDetailPage';
@@ -15,6 +15,7 @@ import LoginPage from './pages/LoginPage';
 import SignupPage from './pages/SignupPage';
 import UsersPage from './pages/UsersPage';
 import NotFoundPage from './pages/NotFoundPage';
+import ChangePasswordPage from './pages/ChangePasswordPage';
 
 function App() {
   const auth = useAuthProvider();
@@ -31,6 +32,15 @@ function App() {
     return () => window.removeEventListener(UNAUTHORIZED_EVENT, onUnauthorized);
   }, [auth, navigate]);
 
+  // When any API call returns 403 MUST_CHANGE_PASSWORD, redirect to the
+  // change-password page (catches stray in-flight calls before the route
+  // guard fires).
+  useEffect(() => {
+    const onMustChange = () => navigate('/change-password', { replace: true });
+    window.addEventListener(MUST_CHANGE_PASSWORD_EVENT, onMustChange);
+    return () => window.removeEventListener(MUST_CHANGE_PASSWORD_EVENT, onMustChange);
+  }, [navigate]);
+
   return (
     <AuthContext.Provider value={auth}>
       <ToastProvider>
@@ -40,10 +50,17 @@ function App() {
             {/* Public routes */}
             <Route index element={<LandingPage />} />
             <Route path="login" element={
-              auth.authenticated ? <Navigate to="/apps" replace /> : <LoginPage />
+              auth.authenticated
+                ? (auth.mustChangePassword ? <Navigate to="/change-password" replace /> : <Navigate to="/apps" replace />)
+                : <LoginPage />
             } />
             <Route path="signup" element={
               auth.authenticated ? <Navigate to="/apps" replace /> : <SignupPage />
+            } />
+
+            {/* Force-password-change — accessible while authenticated */}
+            <Route path="change-password" element={
+              auth.authenticated ? <ChangePasswordPage /> : <Navigate to="/login" replace />
             } />
 
             {/* Protected dashboard routes */}
@@ -54,6 +71,8 @@ function App() {
                 </div>
               ) : auth.authRequired && !auth.authenticated ? (
                 <Navigate to="/login" replace />
+              ) : auth.mustChangePassword ? (
+                <Navigate to="/change-password" replace />
               ) : (
                 <Layout />
               )

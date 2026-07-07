@@ -7,6 +7,10 @@
 import { execFile } from 'child_process';
 import { promisify } from 'util';
 import * as fs from 'fs/promises';
+// Self-import so `hasEnoughDisk` calls `getDiskFreeMb` through the module's
+// exports object rather than a direct closure reference — this lets tests
+// `jest.spyOn` the module and have the mock actually take effect.
+import * as self from './disk';
 
 const execFileAsync = promisify(execFile);
 
@@ -59,30 +63,30 @@ async function getDiskFreeMbWindows(dirPath: string): Promise<number> {
 }
 
 /**
- * Compute the total size of a directory tree in MB.
- * Returns 0 on error.  This is a best-effort estimate (hard links, etc. are
- * counted multiple times), suitable for quota displays, not accounting.
+ * Reads the shared free-disk watermark (in MB) from the environment.
+ * Single source of truth for the free-disk minimum, shared by the API route
+ * and the platform build-boundary checks — avoids two independently-tunable
+ * copies of the same threshold.
  */
-export async function getDirSizeMb(dirPath: string): Promise<number> {
-  try {
-    let total = 0;
-    const walk = async (p: string): Promise<void> => {
-      const entries = await fs.readdir(p, { withFileTypes: true });
-      await Promise.all(
-        entries.map(async (e) => {
-          const full = `${p}/${e.name}`;
-          if (e.isDirectory()) {
-            await walk(full);
-          } else if (e.isFile() || e.isSymbolicLink()) {
-            const st = await fs.stat(full).catch(() => null);
-            if (st) total += st.size;
-          }
-        })
-      );
-    };
-    await walk(dirPath);
-    return total / (1024 * 1024);
-  } catch {
-    return 0;
-  }
+export function getMinFreeDiskMb(): number {
+  return parseInt(process.env.DROP_MIN_FREE_DISK_MB || '500', 10);
+}
+
+/**
+ * Checks whether the filesystem containing `dir` has at least `minMb` free.
+ *
+ * FAIL-CLOSED BY DESIGN: `getDiskFreeMb` returns 0 both when the query fails
+ * AND when the disk is genuinely full — the two cases are indistinguishable
+ * to this function. Treating `freeMb === 0` as `ok: true` (fail-open) would
+ * let deploys proceed on a full disk, which is exactly the condition this
+ * check exists to guard against. Do not wrap this in a try/catch that flips
+ * the result to fail-open; `getDiskFreeMb` never throws.
+ */
+export async function hasEnoughDisk(
+  dir: string,
+  minMb?: number
+): Promise<{ ok: boolean; freeMb: number }> {
+  const freeMb = await self.getDiskFreeMb(dir);
+  const min = minMb ?? getMinFreeDiskMb();
+  return { ok: freeMb >= min, freeMb };
 }
