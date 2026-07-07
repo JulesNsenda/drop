@@ -19,6 +19,7 @@ export type AppEventType =
   | 'app:updated'
   | 'app:update'
   | 'app:removed'
+  | 'app:deleted'
   | 'app:starting'
   | 'app:started'
   | 'app:stopping'
@@ -101,6 +102,11 @@ export interface AppUpdatePayload extends BaseEvent {
 }
 
 export interface AppRemovedPayload extends BaseEvent {
+  appId: string;
+  name: string;
+}
+
+export interface AppDeletedPayload extends BaseEvent {
   appId: string;
   name: string;
 }
@@ -221,6 +227,7 @@ export interface EventPayloadMap {
   'app:updated': AppUpdatedPayload;
   'app:update': AppUpdatePayload;
   'app:removed': AppRemovedPayload;
+  'app:deleted': AppDeletedPayload;
   'app:starting': AppStartingPayload;
   'app:started': AppStartedPayload;
   'app:stopping': AppStoppingPayload;
