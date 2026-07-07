@@ -83,6 +83,16 @@ jest.mock('./watcher', () => ({
   })),
 }));
 
+// Stub the free-disk preflight (P2-5): getDiskFreeMb shells out to the OS
+// (PowerShell/df) — an OS boundary this harness otherwise fakes. Left real, the
+// build-boundary check in handleBuildApp would couple these deploy tests to the
+// runner's actual free disk (or fail-close when the subprocess is denied).
+// Keep the rest of the module real; force hasEnoughDisk to pass.
+jest.mock('../utils/disk', () => ({
+  ...jest.requireActual('../utils/disk'),
+  hasEnoughDisk: jest.fn().mockResolvedValue({ ok: true, freeMb: 999999 }),
+}));
+
 import { DropPlatform, createPlatform } from './platform';
 import { eventBus } from './event-bus';
 import { getStateManager, resetStateManager } from '../managers/app/state-manager';

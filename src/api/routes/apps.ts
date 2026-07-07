@@ -16,7 +16,7 @@ import { getAppRuntime } from '../../managers/runtime';
 import { getSecretManager } from '../../managers/secret';
 import { getDeployTracker } from '../../managers/deploy-tracker';
 import { migrateAppRuntime } from '../../managers/runtime/runtime-migrator';
-import { getDiskFreeMb } from '../../utils/disk';
+import { hasEnoughDisk, getMinFreeDiskMb } from '../../utils/disk';
 import { getStateManager, AppState } from '../../managers/app/state-manager';
 import { getAppConfigService } from '../../managers/app/app-config';
 import { tryLogActivity } from '../../managers/activity';
@@ -244,14 +244,9 @@ apps.post('/', async (c) => {
 
   // Disk watermark: reject new deploys when the filesystem is dangerously full.
   // MIN_FREE_MB is a hard floor regardless of per-app limits.
-  const MIN_FREE_DISK_MB = parseInt(process.env.DROP_MIN_FREE_DISK_MB || '500', 10);
-  try {
-    const freeMb = await getDiskFreeMb(body.path);
-    if (freeMb < MIN_FREE_DISK_MB) {
-      return c.json(error(ErrorCodes.INTERNAL_ERROR, `Insufficient disk space (${Math.round(freeMb)} MB free, need ${MIN_FREE_DISK_MB} MB)`), 507 as any);
-    }
-  } catch {
-    // Disk check failure is non-blocking — log but proceed
+  const { ok: hasDiskSpace, freeMb } = await hasEnoughDisk(body.path);
+  if (!hasDiskSpace) {
+    return c.json(error(ErrorCodes.INTERNAL_ERROR, `Insufficient disk space (${Math.round(freeMb)} MB free, need ${getMinFreeDiskMb()} MB)`), 507 as any);
   }
 
   // Check per-user app limit

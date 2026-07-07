@@ -21,6 +21,7 @@ import {
 import { getStateManager } from '../../managers/app/state-manager';
 import { getSecretManager } from '../../managers/secret';
 import { getLogger } from '../../utils/logger';
+import { hasEnoughDisk, getMinFreeDiskMb } from '../../utils/disk';
 
 const logger = getLogger();
 
@@ -92,6 +93,14 @@ export class GitDeployService {
       if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
         throw err;
       }
+    }
+
+    // Preflight: ensure enough free disk space before cloning
+    const disk = await hasEnoughDisk(this.config.appsDirectory);
+    if (!disk.ok) {
+      throw new Error(
+        `Insufficient disk space to deploy: ${Math.round(disk.freeMb)} MB free, need ${getMinFreeDiskMb()} MB`
+      );
     }
 
     // Resolve token if provided
@@ -185,6 +194,14 @@ export class GitDeployService {
 
     if (!app.gitSource) {
       throw new Error(`Application '${appName}' was not deployed from git`);
+    }
+
+    // Preflight: ensure enough free disk space before pulling
+    const disk = await hasEnoughDisk(app.path);
+    if (!disk.ok) {
+      throw new Error(
+        `Insufficient disk space to redeploy: ${Math.round(disk.freeMb)} MB free, need ${getMinFreeDiskMb()} MB`
+      );
     }
 
     const { repoUrl, branch, tokenId } = app.gitSource;

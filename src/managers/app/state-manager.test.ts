@@ -227,6 +227,30 @@ describe('AppStateManager', () => {
         })
       );
     });
+
+    it('should emit both app:removed and app:deleted exactly once', async () => {
+      const removedHandler = jest.fn();
+      const deletedHandler = jest.fn();
+      eventBus.subscribe('app:removed', removedHandler);
+      eventBus.subscribe('app:deleted', deletedHandler);
+
+      await manager.removeApp('remove-app');
+
+      expect(removedHandler).toHaveBeenCalledTimes(1);
+      expect(removedHandler).toHaveBeenCalledWith(
+        expect.objectContaining({
+          appId: 'remove-app',
+          name: 'remove-app',
+        })
+      );
+      expect(deletedHandler).toHaveBeenCalledTimes(1);
+      expect(deletedHandler).toHaveBeenCalledWith(
+        expect.objectContaining({
+          appId: 'remove-app',
+          name: 'remove-app',
+        })
+      );
+    });
   });
 
   describe('query operations', () => {

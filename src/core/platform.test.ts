@@ -8,6 +8,16 @@ import * as path from 'path';
 import * as os from 'os';
 import { DropPlatform, createPlatform } from './platform';
 import { eventBus } from './event-bus';
+import * as diskUtils from '../utils/disk';
+
+// Disk-space queries shell out to `df`/PowerShell — mock them so platform
+// tests are hermetic and don't depend on real free disk space or subprocess
+// execution. Defaults to "plenty of space"; individual tests (P2-5 disk
+// preflight guards) override hasEnoughDisk to simulate a low-disk condition.
+jest.mock('../utils/disk', () => ({
+  hasEnoughDisk: jest.fn().mockResolvedValue({ ok: true, freeMb: 999999 }),
+  getMinFreeDiskMb: jest.fn().mockReturnValue(500),
+}));
 
 // Mock state manager
 jest.mock('../managers/app/state-manager', () => {
@@ -292,6 +302,124 @@ describe('DropPlatform', () => {
       platform.releasePort(port);
 
       expect((platform as any).usedPorts.has(port)).toBe(false);
+    });
+
+    it('reuses the freed interior port after an app:deleted release (P2-5)', async () => {
+      // The app:deleted subscription is wired up in setupEventHandlers, which
+      // only runs on start().
+      await platform.start();
+
+      const portA = (platform as any).allocatePort('a');
+      const portB = (platform as any).allocatePort('b');
+      const portC = (platform as any).allocatePort('c');
+
+      expect(portA).toBe(3001);
+      expect(portB).toBe(3002);
+      expect(portC).toBe(3003);
+
+      eventBus.publish('app:deleted', { appId: 'b', name: 'b' });
+
+      expect((platform as any).usedPorts.has(portB)).toBe(false);
+
+      // Range-scan must find the freed interior gap (3002), not just append at 3004.
+      const portD = (platform as any).allocatePort('d');
+      expect(portD).toBe(portB);
+    });
+
+    it('does NOT release a port on a stray app:removed event — release is keyed on app:deleted only (P2-5)', async () => {
+      await platform.start();
+
+      const portA = (platform as any).allocatePort('a');
+
+      // app:removed fires from two producers (real teardown AND the watcher's
+      // chokidar unlinkDir handler on a transient folder disappearance); it
+      // must never free a port on its own.
+      eventBus.publish('app:removed', { appId: 'a', name: 'a' });
+
+      expect((platform as any).usedPorts.has(portA)).toBe(true);
+    });
+
+    it('throws when the configured port range is exhausted (P2-5)', () => {
+      const { portRangeStart, portRangeEnd } = platform.getConfig();
+      const totalPorts = portRangeEnd - portRangeStart + 1;
+
+      for (let i = 0; i < totalPorts; i++) {
+        (platform as any).allocatePort();
+      }
+
+      expect(() => (platform as any).allocatePort()).toThrow('No available ports in configured range');
+    });
+  });
+
+  describe('disk preflight guards (P2-5)', () => {
+    let diskPlatform: DropPlatform;
+    let diskTempDir: string;
+
+    beforeEach(async () => {
+      jest.clearAllMocks();
+      diskTempDir = path.join(os.tmpdir(), `drop-test-${Date.now()}`);
+      diskPlatform = createPlatform({
+        dropRoot: diskTempDir,
+        appsDirectory: path.join(diskTempDir, 'apps'),
+        logLevel: 'error',
+        autoBuild: true,
+        autoStart: false,
+        caddyfilePath: path.join(diskTempDir, 'Caddyfile'),
+      });
+      await diskPlatform.start();
+      (diskPlatform as any).buildLogService = null; // skip build-log FS writes
+    });
+
+    afterEach(async () => {
+      if (diskPlatform && diskPlatform.isActive()) {
+        await diskPlatform.stop();
+      }
+    });
+
+    it('aborts a fresh deploy (handleBuildApp) and marks the app errored when disk is low', async () => {
+      (diskUtils.hasEnoughDisk as jest.Mock).mockResolvedValueOnce({ ok: false, freeMb: 10 });
+      const sm = (diskPlatform as any).stateManager;
+      jest.spyOn(diskPlatform.getDetector()!, 'detect').mockResolvedValue({
+        type: 'nodejs',
+        framework: null,
+        suggestedConfig: {},
+      } as any);
+      const buildSpy = jest.spyOn(diskPlatform.getBuilder()!, 'build');
+
+      await (diskPlatform as any).handleBuildApp(
+        path.join(diskTempDir, 'apps', 'lowdiskapp'),
+        'lowdiskapp',
+        'nodejs'
+      );
+
+      expect(buildSpy).not.toHaveBeenCalled();
+      expect(sm.setAppStatus).toHaveBeenCalledWith(
+        'lowdiskapp',
+        'errored',
+        expect.objectContaining({ error: expect.stringContaining('Insufficient disk space') })
+      );
+      expect((diskPlatform as any).appsInProgress.has('lowdiskapp')).toBe(false);
+    });
+
+    it('aborts a hot-reload (handleAppUpdate) without erroring a running app when disk is low', async () => {
+      (diskUtils.hasEnoughDisk as jest.Mock).mockResolvedValueOnce({ ok: false, freeMb: 10 });
+      const sm = (diskPlatform as any).stateManager;
+      sm.getApp.mockReturnValue({ name: 'liveapp', status: 'running', port: 3005 });
+      const detectSpy = jest.spyOn(diskPlatform.getDetector()!, 'detect');
+      const buildSpy = jest.spyOn(diskPlatform.getBuilder()!, 'build');
+
+      await (diskPlatform as any).handleAppUpdate(
+        'liveapp',
+        path.join(diskTempDir, 'apps', 'liveapp'),
+        'file change'
+      );
+
+      // Must return before touching the rebuild pipeline or the app's status —
+      // a throw here would incorrectly mark a healthy running app 'errored'.
+      expect(detectSpy).not.toHaveBeenCalled();
+      expect(buildSpy).not.toHaveBeenCalled();
+      expect(sm.setAppStatus).not.toHaveBeenCalled();
+      expect((diskPlatform as any).appsInProgress.has('liveapp')).toBe(false);
     });
   });
 
