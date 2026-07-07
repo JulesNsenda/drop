@@ -857,7 +857,14 @@ backup:
     // Sync state with actual running processes
     await this.syncStateWithProcesses();
 
-    // Initialize router with HTTPS config
+    // Initialize router with HTTPS config. importGlobs re-imports the apex/host
+    // site files (hosts/*.caddy, written by install.sh) into the router's
+    // generated Caddyfile — RouterService.reload() fully replaces the managed
+    // Caddyfile with app routes, so without this the apex/dashboard is knocked
+    // offline on the first route change.
+    const hostsImportGlob = path
+      .join(this.config.dropRoot, 'data', 'appconf', 'caddy', 'hosts', '*.caddy')
+      .replace(/\\/g, '/');
     this.router = getRouterService({
       caddy: {
         caddyfilePath: this.config.caddyfilePath,
@@ -868,6 +875,7 @@ backup:
         adminApi: 'localhost:2019',
         dnsProvider: this.config.dnsProvider,
         wildcardCert: this.config.wildcardCert,
+        importGlobs: [hostsImportGlob],
       },
     });
 
