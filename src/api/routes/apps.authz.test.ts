@@ -13,6 +13,7 @@ import { ApiServer } from './../server';
 import { createUser, resetAuth } from '../middleware/auth';
 import { getTestToken } from '../__testutils__/auth';
 import { getStateManager, resetStateManager } from '../../managers/app/state-manager';
+import * as diskUtils from '../../utils/disk';
 
 describe('app route authorization', () => {
   let tempDir: string;
@@ -29,6 +30,9 @@ describe('app route authorization', () => {
     tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'drop-authz-test-'));
     jest.spyOn(console, 'log').mockImplementation();
     jest.spyOn(console, 'warn').mockImplementation();
+    // The POST /apps disk preflight shells out to the OS for free space (P2-5);
+    // stub it so these auth tests don't couple to the runner's real free disk.
+    jest.spyOn(diskUtils, 'hasEnoughDisk').mockResolvedValue({ ok: true, freeMb: 10000 });
 
     resetStateManager();
     resetAuth();
@@ -132,5 +136,20 @@ describe('app route authorization', () => {
       body: JSON.stringify({ path: dir, name: 'good-name' }),
     });
     expect(ok.status).toBe(201);
+  });
+
+  it('rejects POST /apps with 507 when disk is below the watermark (P2-5)', async () => {
+    await createUser('root', 'password123', 'admin');
+    const adminToken = await getTestToken('root', 'password123');
+    const dir = path.join(tempDir, 'lowdiskdir');
+    await fs.mkdir(dir, { recursive: true });
+    (diskUtils.hasEnoughDisk as jest.Mock).mockResolvedValueOnce({ ok: false, freeMb: 10 });
+
+    const res = await app.request('/api/v1/apps', {
+      method: 'POST',
+      headers: { ...authHeader(adminToken), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: dir, name: 'low-disk-app' }),
+    });
+    expect(res.status).toBe(507);
   });
 });
