@@ -8,6 +8,7 @@ import * as os from 'os';
 import { GitDeployService, resetGitDeployService } from './git-deploy';
 import { resetStateManager, getStateManager } from '../../managers/app/state-manager';
 import { resetSecretManager, getSecretManager } from '../../managers/secret';
+import * as diskUtils from '../../utils/disk';
 
 // Mock execFile to avoid actual git operations
 jest.mock('child_process', () => ({
@@ -84,9 +85,17 @@ describe('GitDeployService', () => {
     resetGitDeployService();
     service = new GitDeployService({ appsDirectory: appsDir });
     await service.initialize();
+
+    // The child_process mock above intercepts the PowerShell/df calls that
+    // hasEnoughDisk relies on, which would otherwise make every disk check
+    // report 0 MB free. Stub it out so deploy/redeploy tests exercise the
+    // rest of the pipeline; disk-preflight behavior itself is unit-tested
+    // separately against src/utils/disk.ts.
+    jest.spyOn(diskUtils, 'hasEnoughDisk').mockResolvedValue({ ok: true, freeMb: 10000 });
   });
 
   afterEach(async () => {
+    jest.restoreAllMocks();
     resetGitDeployService();
     resetStateManager();
     resetSecretManager();
@@ -144,6 +153,13 @@ describe('GitDeployService', () => {
       });
 
       expect(result.appName).toBe('my-custom-name');
+    });
+
+    it('rejects the deploy when disk space is below the watermark (P2-5)', async () => {
+      (diskUtils.hasEnoughDisk as jest.Mock).mockResolvedValueOnce({ ok: false, freeMb: 10 });
+      await expect(
+        service.deploy({ repoUrl: 'https://github.com/user/low-disk-app', branch: 'main' })
+      ).rejects.toThrow(/disk space/i);
     });
 
     it('should default branch to main', async () => {
