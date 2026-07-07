@@ -119,6 +119,14 @@ export interface CaddyConfig {
   dnsProvider?: 'cloudflare' | 'route53' | 'digitalocean' | 'godaddy';
   /** Use wildcard certificate */
   wildcardCert?: boolean;
+  /**
+   * Extra Caddyfile `import` globs appended to the generated config, for site
+   * files managed outside the router (e.g. the apex/dashboard host written to
+   * hosts/*.caddy by install.sh). This generated Caddyfile fully replaces the
+   * on-disk one, so without re-importing those globs the apex is dropped on
+   * every route change.
+   */
+  importGlobs?: string[];
 }
 
 /**

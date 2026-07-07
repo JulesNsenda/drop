@@ -439,6 +439,14 @@ export function generateFullCaddyfile(
     lines.push('');
   }
 
+  // Import site files managed outside the router (e.g. the apex/dashboard host
+  // in hosts/*.caddy). This Caddyfile fully replaces the on-disk one, so without
+  // re-importing those globs the apex would be dropped on every route change.
+  for (const glob of config.importGlobs ?? []) {
+    lines.push(`import ${glob}`);
+    lines.push('');
+  }
+
   return lines.join('\n');
 }
 
