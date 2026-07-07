@@ -424,9 +424,24 @@ cannot reach the LAN or cloud-metadata endpoints.
   Abuse tooling, takedown runbooks, and egress enforcement for hostile public
   access are v2.1 territory. Treat open-internet signup as documented residual
   risk until then.
+- **Deps must land in the app dir.** Build and run happen in separate ephemeral
+  containers sharing only the `/app` bind mount (no image commit), so only
+  dependencies written *into the app dir* reach the runtime. Node (`node_modules`)
+  and Go (compiled binary) work. **Python does not yet**: `pip install` targets
+  system site-packages, which is never mounted into the runtime — the build
+  "succeeds" but the app fails to import at boot. Python-under-isolation
+  (install into an `/app`-local venv/`--target`) is a tracked follow-up.
 
 Requires Docker Engine on Linux (Docker Desktop on Windows/macOS is
 dev/best-effort only for this mode).
+
+Build containers run as the **platform's own (non-root) user** so they can write
+the app source without needing `CAP_DAC_OVERRIDE`. Apps deployed through DROP
+(git deploy, webhook, `drop deploy`) are owned by that user automatically. If
+you instead **place a folder into `data/webapps/` by hand**, own it as the
+platform user (e.g. `chown -R drop:drop`) — a folder owned by a different user
+(a `sudo cp` as root) will fail the build with `EACCES` (fail-closed by design;
+DROP will not run an untrusted build as root to work around it).
 
 ### What's hardened in both modes
 
