@@ -10,8 +10,10 @@ import * as fs from 'fs/promises';
 import * as path from 'path';
 import * as os from 'os';
 import { ApiServer } from './../server';
-import { createUser, authenticateUser } from '../middleware/auth';
+import { createUser, resetAuth } from '../middleware/auth';
+import { getTestToken } from '../__testutils__/auth';
 import { getStateManager, resetStateManager } from '../../managers/app/state-manager';
+import * as diskUtils from '../../utils/disk';
 
 describe('app route authorization', () => {
   let tempDir: string;
@@ -28,8 +30,12 @@ describe('app route authorization', () => {
     tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'drop-authz-test-'));
     jest.spyOn(console, 'log').mockImplementation();
     jest.spyOn(console, 'warn').mockImplementation();
+    // The POST /apps disk preflight shells out to the OS for free space (P2-5);
+    // stub it so these auth tests don't couple to the runner's real free disk.
+    jest.spyOn(diskUtils, 'hasEnoughDisk').mockResolvedValue({ ok: true, freeMb: 10000 });
 
     resetStateManager();
+    resetAuth();
     getStateManager({ stateFilePath: path.join(tempDir, 'apps.json') });
 
     server = new ApiServer({
@@ -44,8 +50,8 @@ describe('app route authorization', () => {
     const bob = await createUser('bob', 'password123', 'user');
     aliceId = alice.id;
     bobId = bob.id;
-    aliceToken = (await authenticateUser('alice', 'password123'))!;
-    bobToken = (await authenticateUser('bob', 'password123'))!;
+    aliceToken = await getTestToken('alice', 'password123');
+    bobToken = await getTestToken('bob', 'password123');
 
     const sm = getStateManager();
     await sm.registerApp('alice-app', path.join(tempDir, 'alice-app'));
@@ -59,7 +65,10 @@ describe('app route authorization', () => {
     await getStateManager().close();
     resetStateManager();
     jest.restoreAllMocks();
-    await fs.rm(tempDir, { recursive: true, force: true });
+    // recursive rm doesn't retry ENOTEMPTY by default; a lagging async write
+    // (e.g. the auth credentials flush) can land mid-rm and lose the race on
+    // CI. maxRetries makes cleanup robust to that without chasing every writer.
+    await fs.rm(tempDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   });
 
   it("hides another user's app on GET (404)", async () => {
@@ -105,5 +114,42 @@ describe('app route authorization', () => {
     const aliceRes = await app.request('/api/v1/usage', { headers: authHeader(aliceToken) });
     const aliceJson = (await aliceRes.json()) as { data: { used: number } };
     expect(aliceJson.data.used).toBe(1); // alice owns one
+  });
+
+  it('rejects an invalid app name on POST /apps (P0-9)', async () => {
+    await createUser('root', 'password123', 'admin');
+    const adminToken = await getTestToken('root', 'password123');
+    const dir = path.join(tempDir, 'validdir');
+    await fs.mkdir(dir, { recursive: true });
+
+    // Admin bypasses path containment, so we reach the name-validation step.
+    const bad = await app.request('/api/v1/apps', {
+      method: 'POST',
+      headers: { ...authHeader(adminToken), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: dir, name: 'bad name!!' }),
+    });
+    expect(bad.status).toBe(400);
+
+    const ok = await app.request('/api/v1/apps', {
+      method: 'POST',
+      headers: { ...authHeader(adminToken), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: dir, name: 'good-name' }),
+    });
+    expect(ok.status).toBe(201);
+  });
+
+  it('rejects POST /apps with 507 when disk is below the watermark (P2-5)', async () => {
+    await createUser('root', 'password123', 'admin');
+    const adminToken = await getTestToken('root', 'password123');
+    const dir = path.join(tempDir, 'lowdiskdir');
+    await fs.mkdir(dir, { recursive: true });
+    (diskUtils.hasEnoughDisk as jest.Mock).mockResolvedValueOnce({ ok: false, freeMb: 10 });
+
+    const res = await app.request('/api/v1/apps', {
+      method: 'POST',
+      headers: { ...authHeader(adminToken), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: dir, name: 'low-disk-app' }),
+    });
+    expect(res.status).toBe(507);
   });
 });

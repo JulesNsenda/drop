@@ -11,7 +11,7 @@ describe('atomic-write', () => {
   });
 
   afterEach(async () => {
-    await fs.rm(dir, { recursive: true, force: true });
+    await fs.rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   });
 
   it('writes file contents', async () => {
@@ -46,5 +46,59 @@ describe('atomic-write', () => {
     await writeJsonAtomic(target, { s: 1 }, { mode: 0o600 });
     const stat = await fs.stat(target);
     expect(stat.mode & 0o777).toBe(0o600);
+  });
+
+  it('handles concurrent writes to the same target without clobbering temp files', async () => {
+    // Regression test for audit P3-3: the temp file path used to be derived
+    // only from process.pid, so two concurrent writeJsonAtomic calls to the
+    // SAME target file shared one temp path and could stomp on each other
+    // (one call's open/write racing another's rename/unlink) before either
+    // rename landed. The fix appends a per-call random suffix so concurrent
+    // writers never share a temp file.
+    const target = path.join(dir, 'concurrent.json');
+    const payloadA = { writer: 'a', value: 1 };
+    const payloadB = { writer: 'b', value: 2 };
+
+    const results = await Promise.allSettled([
+      writeJsonAtomic(target, payloadA),
+      writeJsonAtomic(target, payloadB),
+    ]);
+
+    for (const result of results) {
+      expect(result.status).toBe('fulfilled');
+    }
+
+    const finalContents = await fs.readFile(target, 'utf-8');
+    const finalValue = JSON.parse(finalContents);
+    expect([payloadA, payloadB]).toContainEqual(finalValue);
+
+    // No stray temp files should remain in the directory.
+    const entries = await fs.readdir(dir);
+    expect(entries).toEqual(['concurrent.json']);
+  });
+
+  it('never corrupts the target under many concurrent writers to the same path', async () => {
+    const target = path.join(dir, 'many-writers.json');
+    const writerCount = 20;
+    const payloads = Array.from({ length: writerCount }, (_, i) => ({ i }));
+
+    const results = await Promise.allSettled(
+      payloads.map((payload) => writeJsonAtomic(target, payload))
+    );
+
+    // The per-call temp suffix guarantees CORRUPTION SAFETY, not that the OS
+    // lets 20 concurrent renames onto one target all win: on Windows a
+    // MoveFileEx-replace can transiently reject under heavy same-target
+    // contention (which production never does — every store serializes its own
+    // writes via save-coalescing). What must ALWAYS hold: at least one writer
+    // lands, the final file is a COMPLETE, valid payload (never a torn/partial
+    // temp — the bug the per-call suffix fixed), and no temp files leak.
+    expect(results.some((r) => r.status === 'fulfilled')).toBe(true);
+
+    const finalValue = JSON.parse(await fs.readFile(target, 'utf-8'));
+    expect(payloads).toContainEqual(finalValue);
+
+    const entries = await fs.readdir(dir);
+    expect(entries).toEqual(['many-writers.json']);
   });
 });

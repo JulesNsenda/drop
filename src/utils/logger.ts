@@ -22,6 +22,14 @@ export interface LoggerConfig {
   filename?: string;
   /** Error log file name (without path) */
   errorFilename?: string;
+  /**
+   * Rotate a log file at startup if it already exceeds this many bytes
+   * (0 = never rotate). Rotation renames the existing file to
+   * `<name>.<timestamp>` before the append stream is opened, so there is no
+   * live-file-rename hazard; the archived file is later pruned by
+   * LogRetentionService. Bounds the platform log across restarts.
+   */
+  maxFileBytes?: number;
 }
 
 const LOG_LEVELS: Record<LogLevel, number> = {
@@ -44,6 +52,7 @@ export class Logger {
       file: config.file ?? false,
       filename: config.filename ?? 'drop-svc.log',
       errorFilename: config.errorFilename ?? 'drop-svc-error.log',
+      maxFileBytes: config.maxFileBytes ?? 0,
     };
 
     if (this.config.file && this.config.logDir) {
@@ -61,10 +70,34 @@ export class Logger {
       const logPath = path.join(this.config.logDir, this.config.filename!);
       const errorPath = path.join(this.config.logDir, this.config.errorFilename!);
 
+      // Rotate oversized logs before opening — done while the file is not open,
+      // so there is no cross-platform live-rename hazard.
+      this.rotateIfLarge(logPath);
+      this.rotateIfLarge(errorPath);
+
       this.logStream = fs.createWriteStream(logPath, { flags: 'a' });
       this.errorStream = fs.createWriteStream(errorPath, { flags: 'a' });
     } catch (error) {
       console.error('Failed to initialize log streams:', error);
+    }
+  }
+
+  /**
+   * If a log file already exceeds maxFileBytes, archive it to
+   * `<path>.<timestamp>` so a fresh (empty) file is opened. Safe: the file is
+   * not open here, so the rename can't race an active write stream.
+   */
+  private rotateIfLarge(filePath: string): void {
+    const max = this.config.maxFileBytes ?? 0;
+    if (max <= 0) return;
+    try {
+      const stat = fs.statSync(filePath);
+      if (stat.size >= max) {
+        const ts = new Date().toISOString().replace(/[:.]/g, '-');
+        fs.renameSync(filePath, `${filePath}.${ts}`);
+      }
+    } catch {
+      // File doesn't exist yet, or can't be rotated — leave it and continue.
     }
   }
 
@@ -185,10 +218,12 @@ export class Logger {
    */
   close(): void {
     if (this.logStream) {
+      this.logStream.on('error', () => {});
       this.logStream.end();
       this.logStream = null;
     }
     if (this.errorStream) {
+      this.errorStream.on('error', () => {});
       this.errorStream.end();
       this.errorStream = null;
     }

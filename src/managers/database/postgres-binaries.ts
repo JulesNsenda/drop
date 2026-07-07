@@ -15,11 +15,31 @@ import { spawn } from 'child_process';
 // PostgreSQL version to use
 const PG_VERSION = '16.1';
 
-// Download URLs for PostgreSQL binaries
+// Download URLs for PostgreSQL binaries (fallback when no system package found)
 const DOWNLOAD_URLS: Record<string, string> = {
   win32: `https://get.enterprisedb.com/postgresql/postgresql-${PG_VERSION}-1-windows-x64-binaries.zip`,
   linux: `https://get.enterprisedb.com/postgresql/postgresql-${PG_VERSION}-1-linux-x64-binaries.tar.gz`,
 };
+
+// Candidate system PostgreSQL bin directories (checked in order)
+const SYSTEM_PG_BIN_DIRS = [
+  '/usr/lib/postgresql/16/bin',
+  '/usr/lib/postgresql/15/bin',
+  '/usr/lib/postgresql/14/bin',
+  '/usr/pgsql-16/bin',
+  '/usr/pgsql-15/bin',
+];
+
+const PG_BINARIES = [
+  'postgres',
+  'pg_ctl',
+  'initdb',
+  'psql',
+  'createdb',
+  'createuser',
+  'pg_dump',
+  'pg_restore',
+];
 
 export interface PostgresBinariesConfig {
   /** Base directory for DROP (e.g., C:\drop or /var/drop) */
@@ -111,6 +131,41 @@ export class PostgresBinaries {
   }
 
   /**
+   * On Linux, find a system-installed PostgreSQL and symlink its binaries into
+   * the DROP bin dir so the download step can be skipped entirely.
+   * Returns true if symlinks were created successfully.
+   */
+  async setupFromSystemPackage(): Promise<boolean> {
+    if (this.isWindows) return false;
+
+    const paths = this.getPaths();
+
+    for (const systemBinDir of SYSTEM_PG_BIN_DIRS) {
+      try {
+        await fs.access(path.join(systemBinDir, 'postgres'));
+      } catch {
+        continue;
+      }
+
+      await fs.mkdir(paths.binDir, { recursive: true });
+
+      for (const bin of PG_BINARIES) {
+        const src = path.join(systemBinDir, bin);
+        const dest = path.join(paths.binDir, bin);
+        try {
+          await fs.unlink(dest);
+        } catch {
+          // dest doesn't exist yet, that's fine
+        }
+        await fs.symlink(src, dest);
+      }
+      return true;
+    }
+
+    return false;
+  }
+
+  /**
    * Download PostgreSQL binaries
    */
   async download(onProgress?: (percent: number, message: string) => void): Promise<void> {
@@ -171,14 +226,29 @@ export class PostgresBinaries {
       '-A', 'trust', // Local connections trusted (DROP manages access)
     ]);
 
-    // Configure postgresql.conf for DROP
+    // Configure postgresql.conf for DROP.
+    //
+    // max_connections must leave real headroom for tenant apps: the platform's
+    // own control-plane pool consumes some, and every DB-backed app opens its
+    // own pool. At the old default of 100 a box exhausted connections in the
+    // low dozens of apps ("too many clients"), taking down every app at once.
+    // Default to 200 and make both knobs env-tunable to the host's fleet size.
+    // NOTE: this applies only when the data dir is first initialised; existing
+    // installs must set it via `ALTER SYSTEM SET max_connections = N;` (or edit
+    // postgresql.conf) followed by a restart.
+    const maxConnections = parseInt(process.env.DROP_PG_MAX_CONNECTIONS || '200', 10);
+    const sharedBuffers = process.env.DROP_PG_SHARED_BUFFERS || '128MB';
     const configPath = path.join(paths.dataDir, 'postgresql.conf');
     const configAdditions = `
 # DROP Platform Configuration
-listen_addresses = '*'
+# Loopback-only by default: the bundled Postgres must never be reachable from the
+# public interface. Apps in the default (PM2) mode connect over 127.0.0.1. If
+# Docker container isolation is enabled, widen this to the Docker bridge CIDR
+# (e.g. '127.0.0.1,172.17.0.1') — never back to '*'.
+listen_addresses = '127.0.0.1'
 port = 5433
-max_connections = 100
-shared_buffers = 128MB
+max_connections = ${maxConnections}
+shared_buffers = ${sharedBuffers}
 log_destination = 'stderr'
 logging_collector = off
 `;

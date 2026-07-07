@@ -64,6 +64,19 @@ export class CaddyServer {
   }
 
   /**
+   * Headers for Caddy admin API requests.
+   *
+   * Caddy 2.11+ enforces an origin check on the admin API for requests that
+   * look like browser CORS calls. Node's fetch (undici) auto-sends
+   * `Sec-Fetch-Mode: cors`, which triggers that check; with no Origin header
+   * Caddy rejects the request with 403 "client is not allowed to access from
+   * origin ''". Sending an Origin that matches the admin endpoint satisfies it.
+   */
+  private adminHeaders(extra?: Record<string, string>): Record<string, string> {
+    return { Origin: this.getAdminUrl(), ...extra };
+  }
+
+  /**
    * Check if Caddy is installed on the system
    */
   async isInstalled(): Promise<boolean> {
@@ -223,9 +236,7 @@ export class CaddyServer {
 
       const response = await fetch(`${this.getAdminUrl()}/load`, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'text/caddyfile',
-        },
+        headers: this.adminHeaders({ 'Content-Type': 'text/caddyfile' }),
         body: caddyfileContent,
       });
 
@@ -250,6 +261,7 @@ export class CaddyServer {
     try {
       const response = await fetch(`${this.getAdminUrl()}/config/`, {
         method: 'GET',
+        headers: this.adminHeaders(),
         signal: AbortSignal.timeout(2000),
       });
       return response.ok;
@@ -381,6 +393,7 @@ export class CaddyServer {
     try {
       await fetch(`${this.getAdminUrl()}/stop`, {
         method: 'POST',
+        headers: this.adminHeaders(),
         signal: AbortSignal.timeout(2000),
       });
     } catch {

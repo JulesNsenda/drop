@@ -25,7 +25,7 @@ describe('AppConfigService runtime field', () => {
   });
 
   afterEach(async () => {
-    await fs.rm(tmpDir, { recursive: true, force: true });
+    await fs.rm(tmpDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   });
 
   function makeService(): AppConfigService {
@@ -78,5 +78,89 @@ describe('AppConfigService runtime field', () => {
     const updated = await service.upsertConfig('app', { port: 3005 });
     expect(updated.runtime).toBe('docker');
     expect(updated.port).toBe(3005);
+  });
+
+  describe('getDomainOwners (P0-6 hostname-hijack guard)', () => {
+    it('maps each hostname and custom domain to its owning app, lowercased', async () => {
+      const service = makeService();
+      await service.initialize();
+      await service.upsertConfig('shop', {
+        type: 'nodejs',
+        hostname: 'shop.localhost',
+        domains: ['shop.example.com', 'WWW.Shop.Example.com'],
+      });
+      await service.upsertConfig('blog', {
+        type: 'nodejs',
+        hostname: 'blog.localhost',
+      });
+
+      const owners = service.getDomainOwners();
+      expect(owners.get('shop.localhost')).toBe('shop');
+      expect(owners.get('shop.example.com')).toBe('shop');
+      expect(owners.get('www.shop.example.com')).toBe('shop'); // lowercased
+      expect(owners.get('blog.localhost')).toBe('blog');
+      expect(owners.has('unclaimed.example.com')).toBe(false);
+    });
+
+    it('seeds the real served hostname for a non-localhost suffix', async () => {
+      // The persisted hostname is `${name}.localhost`, but on a real box the app
+      // serves on `${name}.${suffix}` — which must be owned so a different app
+      // cannot claim `victim.<suffix>` (the production hijack scenario).
+      const service = makeService();
+      await service.initialize();
+      await service.upsertConfig('victim', { type: 'nodejs', hostname: 'victim.localhost' });
+
+      const owners = service.getDomainOwners('dropkit.sh');
+      expect(owners.get('victim.dropkit.sh')).toBe('victim');
+      expect(owners.get('victim.localhost')).toBe('victim');
+    });
+
+    it("default hostname wins over another app's stale persisted domain claim", async () => {
+      // Simulate a pre-fix hijack: 'evil' persisted victim's served hostname.
+      const service = makeService();
+      await service.initialize();
+      await service.upsertConfig('victim', { type: 'nodejs', hostname: 'victim.localhost' });
+      await service.upsertConfig('evil', {
+        type: 'nodejs',
+        hostname: 'evil.localhost',
+        domains: ['victim.dropkit.sh'],
+      });
+
+      const owners = service.getDomainOwners('dropkit.sh');
+      // Pass 2 restores true ownership, so evil's re-deploy would be rejected.
+      expect(owners.get('victim.dropkit.sh')).toBe('victim');
+    });
+  });
+
+  describe('write serialization (P1-2 lost-update)', () => {
+    it('serializes concurrent updates so no field is dropped', async () => {
+      const service = makeService();
+      await service.initialize();
+      await service.upsertConfig('app', { type: 'nodejs', port: 3000 });
+
+      // Two updates for the same app in flight at once, each setting a different
+      // field. Without serialization both read the {port:3000} base and the
+      // last write wins, dropping the other field.
+      await Promise.all([
+        service.updateConfig('app', { port: 3001 }),
+        service.updateConfig('app', { hostname: 'app.example.com' }),
+      ]);
+
+      const cfg = service.getConfig('app');
+      expect(cfg?.port).toBe(3001);
+      expect(cfg?.hostname).toBe('app.example.com');
+    });
+
+    it('a failed write does not break serialization for later writes', async () => {
+      const service = makeService();
+      await service.initialize();
+      // updateConfig on a missing app is a no-op (returns null) and must not
+      // wedge the per-app chain.
+      const missing = await service.updateConfig('ghost', { port: 1 });
+      expect(missing).toBeNull();
+
+      const created = await service.upsertConfig('ghost', { type: 'nodejs', port: 4000 });
+      expect(created.port).toBe(4000);
+    });
   });
 });

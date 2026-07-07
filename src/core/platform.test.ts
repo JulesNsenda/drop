@@ -8,6 +8,30 @@ import * as path from 'path';
 import * as os from 'os';
 import { DropPlatform, createPlatform } from './platform';
 import { eventBus } from './event-bus';
+import * as diskUtils from '../utils/disk';
+
+// These are pipeline/service unit tests — they never exercise the HTTP API, so
+// disable it (createPlatform reads DROP_ENABLE_API when no enableApi is passed).
+// Otherwise start() binds a real, fixed port (3000), which HANGS/fails the
+// suite on CI whenever 3000 is contended by a parallel worker or a leaked
+// process — while passing locally where 3000 is free. The API itself is covered
+// by src/api/**/*.test.ts on their own explicit ports. Mirrors
+// platform.integration.test.ts, which passes enableApi: false directly.
+const PRIOR_DROP_ENABLE_API = process.env.DROP_ENABLE_API;
+process.env.DROP_ENABLE_API = 'false';
+afterAll(() => {
+  if (PRIOR_DROP_ENABLE_API === undefined) delete process.env.DROP_ENABLE_API;
+  else process.env.DROP_ENABLE_API = PRIOR_DROP_ENABLE_API;
+});
+
+// Disk-space queries shell out to `df`/PowerShell — mock them so platform
+// tests are hermetic and don't depend on real free disk space or subprocess
+// execution. Defaults to "plenty of space"; individual tests (P2-5 disk
+// preflight guards) override hasEnoughDisk to simulate a low-disk condition.
+jest.mock('../utils/disk', () => ({
+  hasEnoughDisk: jest.fn().mockResolvedValue({ ok: true, freeMb: 999999 }),
+  getMinFreeDiskMb: jest.fn().mockReturnValue(500),
+}));
 
 // Mock state manager
 jest.mock('../managers/app/state-manager', () => {
@@ -82,6 +106,8 @@ jest.mock('../managers/database', () => {
     getPostgresServer: jest.fn().mockReturnValue(mockPostgresServer),
     resetPostgresServer: jest.fn(),
     DatabaseProvisioner: jest.fn().mockImplementation(() => mockDbProvisioner),
+    getDatabaseProvisioner: jest.fn().mockReturnValue(mockDbProvisioner),
+    resetDatabaseProvisioner: jest.fn(),
   };
 });
 
@@ -293,6 +319,124 @@ describe('DropPlatform', () => {
 
       expect((platform as any).usedPorts.has(port)).toBe(false);
     });
+
+    it('reuses the freed interior port after an app:deleted release (P2-5)', async () => {
+      // The app:deleted subscription is wired up in setupEventHandlers, which
+      // only runs on start().
+      await platform.start();
+
+      const portA = (platform as any).allocatePort('a');
+      const portB = (platform as any).allocatePort('b');
+      const portC = (platform as any).allocatePort('c');
+
+      expect(portA).toBe(3001);
+      expect(portB).toBe(3002);
+      expect(portC).toBe(3003);
+
+      eventBus.publish('app:deleted', { appId: 'b', name: 'b' });
+
+      expect((platform as any).usedPorts.has(portB)).toBe(false);
+
+      // Range-scan must find the freed interior gap (3002), not just append at 3004.
+      const portD = (platform as any).allocatePort('d');
+      expect(portD).toBe(portB);
+    });
+
+    it('does NOT release a port on a stray app:removed event — release is keyed on app:deleted only (P2-5)', async () => {
+      await platform.start();
+
+      const portA = (platform as any).allocatePort('a');
+
+      // app:removed fires from two producers (real teardown AND the watcher's
+      // chokidar unlinkDir handler on a transient folder disappearance); it
+      // must never free a port on its own.
+      eventBus.publish('app:removed', { appId: 'a', name: 'a' });
+
+      expect((platform as any).usedPorts.has(portA)).toBe(true);
+    });
+
+    it('throws when the configured port range is exhausted (P2-5)', () => {
+      const { portRangeStart, portRangeEnd } = platform.getConfig();
+      const totalPorts = portRangeEnd - portRangeStart + 1;
+
+      for (let i = 0; i < totalPorts; i++) {
+        (platform as any).allocatePort();
+      }
+
+      expect(() => (platform as any).allocatePort()).toThrow('No available ports in configured range');
+    });
+  });
+
+  describe('disk preflight guards (P2-5)', () => {
+    let diskPlatform: DropPlatform;
+    let diskTempDir: string;
+
+    beforeEach(async () => {
+      jest.clearAllMocks();
+      diskTempDir = path.join(os.tmpdir(), `drop-test-${Date.now()}`);
+      diskPlatform = createPlatform({
+        dropRoot: diskTempDir,
+        appsDirectory: path.join(diskTempDir, 'apps'),
+        logLevel: 'error',
+        autoBuild: true,
+        autoStart: false,
+        caddyfilePath: path.join(diskTempDir, 'Caddyfile'),
+      });
+      await diskPlatform.start();
+      (diskPlatform as any).buildLogService = null; // skip build-log FS writes
+    });
+
+    afterEach(async () => {
+      if (diskPlatform && diskPlatform.isActive()) {
+        await diskPlatform.stop();
+      }
+    });
+
+    it('aborts a fresh deploy (handleBuildApp) and marks the app errored when disk is low', async () => {
+      (diskUtils.hasEnoughDisk as jest.Mock).mockResolvedValueOnce({ ok: false, freeMb: 10 });
+      const sm = (diskPlatform as any).stateManager;
+      jest.spyOn(diskPlatform.getDetector()!, 'detect').mockResolvedValue({
+        type: 'nodejs',
+        framework: null,
+        suggestedConfig: {},
+      } as any);
+      const buildSpy = jest.spyOn(diskPlatform.getBuilder()!, 'build');
+
+      await (diskPlatform as any).handleBuildApp(
+        path.join(diskTempDir, 'apps', 'lowdiskapp'),
+        'lowdiskapp',
+        'nodejs'
+      );
+
+      expect(buildSpy).not.toHaveBeenCalled();
+      expect(sm.setAppStatus).toHaveBeenCalledWith(
+        'lowdiskapp',
+        'errored',
+        expect.objectContaining({ error: expect.stringContaining('Insufficient disk space') })
+      );
+      expect((diskPlatform as any).appsInProgress.has('lowdiskapp')).toBe(false);
+    });
+
+    it('aborts a hot-reload (handleAppUpdate) without erroring a running app when disk is low', async () => {
+      (diskUtils.hasEnoughDisk as jest.Mock).mockResolvedValueOnce({ ok: false, freeMb: 10 });
+      const sm = (diskPlatform as any).stateManager;
+      sm.getApp.mockReturnValue({ name: 'liveapp', status: 'running', port: 3005 });
+      const detectSpy = jest.spyOn(diskPlatform.getDetector()!, 'detect');
+      const buildSpy = jest.spyOn(diskPlatform.getBuilder()!, 'build');
+
+      await (diskPlatform as any).handleAppUpdate(
+        'liveapp',
+        path.join(diskTempDir, 'apps', 'liveapp'),
+        'file change'
+      );
+
+      // Must return before touching the rebuild pipeline or the app's status —
+      // a throw here would incorrectly mark a healthy running app 'errored'.
+      expect(detectSpy).not.toHaveBeenCalled();
+      expect(buildSpy).not.toHaveBeenCalled();
+      expect(sm.setAppStatus).not.toHaveBeenCalled();
+      expect((diskPlatform as any).appsInProgress.has('liveapp')).toBe(false);
+    });
   });
 
   describe('getEventBus', () => {
@@ -409,11 +553,258 @@ describe('Event-driven pipeline', () => {
   });
 });
 
-describe('Service accessors', () => {
+describe('handleAppUpdate — stopped-app guard (P0-2)', () => {
   let platform: DropPlatform;
+  let tempDir: string;
+
+  beforeEach(async () => {
+    jest.clearAllMocks();
+    tempDir = path.join(os.tmpdir(), `drop-test-${Date.now()}`);
+    platform = createPlatform({
+      dropRoot: tempDir,
+      appsDirectory: path.join(tempDir, 'apps'),
+      logLevel: 'error',
+      autoBuild: true,
+      autoStart: true,
+      caddyfilePath: path.join(tempDir, 'Caddyfile'),
+    });
+    await platform.start();
+  });
+
+  afterEach(async () => {
+    if (platform.isActive()) {
+      await platform.stop();
+    }
+  });
+
+  it('does not rebuild or restart an app the user has stopped', async () => {
+    const stateManager = (platform as any).stateManager;
+    stateManager.getApp.mockReturnValue({ name: 'stoppedapp', status: 'stopped', port: 3005 });
+
+    const detectSpy = jest.spyOn(platform.getDetector()!, 'detect');
+    const startSpy = jest.spyOn((platform as any).runtime, 'start');
+
+    await (platform as any).handleAppUpdate(
+      'stoppedapp',
+      path.join(tempDir, 'apps', 'stoppedapp'),
+      'file change'
+    );
+
+    // The guard must short-circuit before any rebuild or restart work.
+    expect(detectSpy).not.toHaveBeenCalled();
+    expect(startSpy).not.toHaveBeenCalled();
+  });
+
+  it('proceeds past the guard for a running app (detect is invoked)', async () => {
+    const stateManager = (platform as any).stateManager;
+    stateManager.getApp.mockReturnValue({ name: 'liveapp', status: 'running', port: 3006 });
+
+    // detect() is the first step inside the rebuild try-block, reached only if
+    // the stopped-app guard did NOT fire. Reject it so the pipeline stops right
+    // there (caught internally) without doing any real build/FS work.
+    const detectSpy = jest
+      .spyOn(platform.getDetector()!, 'detect')
+      .mockRejectedValue(new Error('stop-here'));
+
+    await (platform as any).handleAppUpdate(
+      'liveapp',
+      path.join(tempDir, 'apps', 'liveapp'),
+      'file change'
+    );
+
+    expect(detectSpy).toHaveBeenCalled();
+  });
+});
+
+describe('deploy strand & startup reconciler (P1-1)', () => {
+  let platform: DropPlatform;
+  let tempDir: string;
+
+  beforeEach(async () => {
+    jest.clearAllMocks();
+    tempDir = path.join(os.tmpdir(), `drop-test-${Date.now()}`);
+    platform = createPlatform({
+      dropRoot: tempDir,
+      appsDirectory: path.join(tempDir, 'apps'),
+      logLevel: 'error',
+      autoBuild: true,
+      autoStart: true,
+      caddyfilePath: path.join(tempDir, 'Caddyfile'),
+    });
+    await platform.start();
+  });
+
+  afterEach(async () => {
+    if (platform && platform.isActive()) {
+      await platform.stop();
+    }
+  });
+
+  it('releases the in-progress guard when the initial status write throws', async () => {
+    const sm = (platform as any).stateManager;
+    // Simulate the app already being mid-deploy (handleBuildApp added it).
+    (platform as any).appsInProgress.add('wedged');
+    // The first setAppStatus — the 'starting' write — fails, as a disk error would.
+    sm.setAppStatus.mockRejectedValueOnce(new Error('disk full'));
+
+    await (platform as any).handleStartApp('wedged');
+
+    // finally must have released the guard, so future rebuilds aren't wedged.
+    expect((platform as any).appsInProgress.has('wedged')).toBe(false);
+  });
+
+  it('reconciles a mid-deploy building app to pending on startup', async () => {
+    const sm = (platform as any).stateManager;
+    sm.getAllApps.mockReturnValue([
+      { name: 'buildingapp', status: 'building', path: path.join(tempDir, 'apps', 'buildingapp') },
+    ]);
+    jest.spyOn((platform as any).runtime, 'getAllStatus').mockResolvedValue([]);
+
+    await (platform as any).syncStateWithProcesses();
+
+    expect(sm.setAppStatus).toHaveBeenCalledWith('buildingapp', 'pending');
+  });
+});
+
+describe('app type persistence after build (P1-5 / P1-6 follow-up)', () => {
+  let platform: DropPlatform;
+  let tempDir: string;
+
+  beforeEach(async () => {
+    jest.clearAllMocks();
+    tempDir = path.join(os.tmpdir(), `drop-test-${Date.now()}`);
+    platform = createPlatform({
+      dropRoot: tempDir,
+      appsDirectory: path.join(tempDir, 'apps'),
+      logLevel: 'error',
+      autoBuild: true,
+      autoStart: false,
+      caddyfilePath: path.join(tempDir, 'Caddyfile'),
+    });
+    await platform.start();
+  });
+
+  afterEach(async () => {
+    if (platform && platform.isActive()) {
+      await platform.stop();
+    }
+  });
+
+  it('persists the real detected type to state after building', async () => {
+    const sm = (platform as any).stateManager;
+    (platform as any).buildLogService = null; // skip build-log FS writes
+    jest.spyOn(platform.getDetector()!, 'detect').mockResolvedValue({
+      type: 'nodejs',
+      framework: null,
+      suggestedConfig: {},
+    } as any);
+    jest.spyOn(platform.getBuilder()!, 'build').mockResolvedValue({
+      success: true,
+      duration: 5,
+      errors: [],
+    } as any);
+
+    await (platform as any).handleBuildApp(path.join(tempDir, 'apps', 'app'), 'app', 'unknown');
+    // handleBuildApp's success path hands off to handleStartApp (which owns the
+    // guard release); that handoff doesn't run in isolation, so clear it here to
+    // keep afterEach's stop()/drain from waiting on it.
+    (platform as any).appsInProgress.clear();
+
+    // The watcher's app:detected can't know the real type, and detect() no
+    // longer republishes (P1-6), so the build path must persist it.
+    expect(sm.updateApp).toHaveBeenCalledWith('app', expect.objectContaining({ type: 'nodejs' }));
+  });
+
+  it('persists a changed type on hot-reload too', async () => {
+    const sm = (platform as any).stateManager;
+    sm.getApp.mockReturnValue({ name: 'app', status: 'running', port: 3005 });
+    (platform as any).buildLogService = null;
+    jest.spyOn(platform.getDetector()!, 'detect').mockResolvedValue({
+      type: 'python',
+      framework: null,
+      suggestedConfig: {},
+    } as any);
+    // Fail the build fast — the type write happens before the build runs.
+    jest.spyOn(platform.getBuilder()!, 'build').mockResolvedValue({
+      success: false,
+      errors: [{ message: 'stub' }],
+    } as any);
+
+    await (platform as any).handleAppUpdate('app', path.join(tempDir, 'apps', 'app'), 'edit');
+
+    expect(sm.updateApp).toHaveBeenCalledWith('app', expect.objectContaining({ type: 'python' }));
+  });
+});
+
+describe('buildStartSpec — resource limits (P0-4)', () => {
+  let platform: DropPlatform;
+  let tempDir: string;
+
+  const detection = {
+    type: 'nodejs',
+    framework: null,
+    suggestedConfig: { startCommand: 'node index.js' },
+  } as any;
 
   beforeEach(() => {
+    jest.clearAllMocks();
+    tempDir = path.join(os.tmpdir(), `drop-test-${Date.now()}`);
+  });
+
+  afterEach(async () => {
+    if (platform && platform.isActive()) {
+      await platform.stop();
+    }
+  });
+
+  it('wires configured per-app memory and cpu caps into the spec', async () => {
     platform = createPlatform({
+      dropRoot: tempDir,
+      logLevel: 'error',
+      maxMemoryMbPerApp: 512,
+      maxCpusPerApp: 0.5,
+    } as any);
+    await platform.start();
+
+    const spec = await (platform as any).buildStartSpec(
+      'app1',
+      path.join(tempDir, 'app1'),
+      detection,
+      3005,
+      path.join(tempDir, 'data'),
+      {}
+    );
+
+    expect(spec.limits).toEqual({ memory: '512M', cpus: 0.5 });
+  });
+
+  it('omits limits by default (0 = opt-in), so runtimes keep their own defaults', async () => {
+    // Default config leaves caps at 0 — no forced cap, so an existing PM2 app
+    // is never newly killed and docker keeps its own 256M/0.5 container default.
+    platform = createPlatform({ dropRoot: tempDir, logLevel: 'error' });
+    await platform.start();
+
+    const spec = await (platform as any).buildStartSpec(
+      'app2',
+      path.join(tempDir, 'app2'),
+      detection,
+      3006,
+      path.join(tempDir, 'data'),
+      {}
+    );
+
+    expect(spec.limits).toBeUndefined();
+  });
+});
+
+describe('Service accessors', () => {
+  let platform: DropPlatform;
+  let tempDir: string;
+
+  beforeEach(() => {
+    tempDir = path.join(os.tmpdir(), `drop-test-${Date.now()}`);
+    platform = createPlatform({
+      dropRoot: tempDir,
       logLevel: 'error',
     });
   });

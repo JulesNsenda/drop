@@ -46,6 +46,11 @@ export interface HealthStatus {
     database?: ComponentHealth;
     watcher?: ComponentHealth;
   };
+  /** Server runtime info — authoritative OS and paths (not the browser's). */
+  system?: {
+    platform: string;
+    appsDirectory: string;
+  };
 }
 
 export interface AppHealthCheck {
@@ -105,6 +110,61 @@ export function useApp(name: string) {
   }, [fetchApp]);
 
   return { app, loading, error, refresh: fetchApp };
+}
+
+// Deploy Timeline API (P2-4 deploy observability)
+
+export type DeployStageName =
+  | 'triggered'
+  | 'build-started'
+  | 'build'
+  | 'build-failed'
+  | 'running'
+  | 'errored';
+
+export interface DeployStageDto {
+  stage: DeployStageName;
+  at: string;
+  durationMs?: number;
+  ok?: boolean;
+  category?: string;
+}
+
+export interface DeployEpisodeDto {
+  deployId: string;
+  appName: string;
+  trigger: 'deploy' | 'hot-reload' | 'unknown';
+  status: 'in-progress' | 'succeeded' | 'failed' | 'superseded' | 'interrupted';
+  startedAt: string;
+  endedAt?: string;
+  durationMs?: number;
+  stages: DeployStageDto[];
+}
+
+export function useDeployTimeline(appName: string) {
+  const [episodes, setEpisodes] = useState<DeployEpisodeDto[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  const fetchEpisodes = useCallback(async () => {
+    setLoading(true);
+    const json = await apiJson<DeployEpisodeDto[]>(`/deploys?app=${encodeURIComponent(appName)}`);
+    if (json.success && json.data) {
+      setEpisodes(json.data);
+      setError(null);
+    } else {
+      setError(json.error?.message || 'Failed to fetch deploy timeline');
+    }
+    setLoading(false);
+  }, [appName]);
+
+  useEffect(() => {
+    fetchEpisodes();
+    const interval = setInterval(fetchEpisodes, 5000);
+    return () => clearInterval(interval);
+  }, [fetchEpisodes]);
+
+  return { episodes, loading, error, refresh: fetchEpisodes };
 }
 
 export interface UsageInfo {

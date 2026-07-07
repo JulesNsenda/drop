@@ -17,7 +17,7 @@ describe('WebhookManager', () => {
 
   afterEach(async () => {
     await wm.close();
-    await fs.rm(tmpDir, { recursive: true, force: true });
+    await fs.rm(tmpDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   });
 
   it('should register a webhook', async () => {

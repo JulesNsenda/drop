@@ -21,6 +21,7 @@ import {
   createServerCommand,
   createBackupCommand,
   createMigrateRuntimeCommand,
+  createMfaCommand,
 } from './commands';
 import { getPlatformVersion } from '../utils/version';
 
@@ -61,6 +62,7 @@ function createProgram(): Command {
   program.addCommand(createRemoveCommand());
   program.addCommand(createBackupCommand());
   program.addCommand(createMigrateRuntimeCommand());
+  program.addCommand(createMfaCommand());
   program.addCommand(createVersionCommand());
 
   // Error handling

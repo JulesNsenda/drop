@@ -7,20 +7,28 @@
 
 import * as path from 'path';
 import * as fs from 'fs/promises';
-import { EventBus, eventBus, Unsubscribe } from './event-bus';
+import { EventBus, eventBus, Unsubscribe, AppDeletedPayload } from './event-bus';
 import { WatcherService } from './watcher';
-import { DetectorService, getDetector, parseDropYaml } from './detector';
+import { DetectorService, getDetector, parseDropYaml, DetectionResult } from './detector';
 import { BuilderService, getBuilder } from './builder';
 import { RouterService, getRouterService, resetRouterService } from './router';
-import { AppRuntime, getAppRuntime, resetAppRuntime } from '../managers/runtime';
+import { AppRuntime, AppStartSpec, getAppRuntime, resetAppRuntime } from '../managers/runtime';
 import { AppStateManager, getStateManager, resetStateManager } from '../managers/app/state-manager';
 import { AppConfigService, getAppConfigService, resetAppConfigService } from '../managers/app/app-config';
-import { PostgresServer, getPostgresServer, resetPostgresServer, DatabaseProvisioner } from '../managers/database';
+import {
+  PostgresServer,
+  getPostgresServer,
+  resetPostgresServer,
+  DatabaseProvisioner,
+  getDatabaseProvisioner,
+  resetDatabaseProvisioner,
+} from '../managers/database';
 import { CaddyServer, getCaddyServer, resetCaddyServer } from '../managers/router';
 import { SecretManager, getSecretManager, resetSecretManager } from '../managers/secret';
 import { WebhookManager, getWebhookManager, resetWebhookManager } from './webhooks';
 import { GitDeployService, getGitDeployService, resetGitDeployService } from './git-deploy';
 import { getActivityLog, resetActivityLog } from '../managers/activity';
+import { getDeployTracker, resetDeployTracker } from '../managers/deploy-tracker';
 import { ApiServer, createApiServer } from '../api';
 import { Logger, createLogger } from '../utils/logger';
 import {
@@ -34,6 +42,12 @@ import { createContainerExecCommand } from './builder/container-build-runner';
 import { migrateAllToDocker } from '../managers/runtime/runtime-migrator';
 import { buildNginxConf } from '../utils/nginx-conf';
 import { BuildLogService, getBuildLogService, resetBuildLogService } from '../managers/build-log/build-log';
+import {
+  LogRetentionService,
+  getLogRetentionService,
+  resetLogRetentionService,
+} from '../managers/log-retention/log-retention';
+import { hasEnoughDisk, getMinFreeDiskMb } from '../utils/disk';
 
 export interface PlatformConfig {
   /** Root directory for DROP */
@@ -97,8 +111,44 @@ export interface PlatformConfig {
   maxDbsPerUser: number;
   /** Global limit on simultaneous builds (0 = unlimited). */
   maxConcurrentBuilds: number;
-  /** Max disk usage per app directory in MB (0 = unlimited). */
-  maxDiskMbPerApp: number;
+  /**
+   * Global cap on concurrently running apps (0 = unlimited).
+   * In docker mode on a 4 GB server, each app container uses ~256 MB by
+   * default, so 10 apps fills ~2.5 GB — set this to prevent OOM thrashing.
+   * Default 0 (unlimited) for PM2 mode; set DROP_MAX_CONCURRENT_APPS in
+   * drop.env when running with docker isolation.
+   */
+  maxConcurrentApps: number;
+  /**
+   * Per-app memory cap in MB (0 = no platform-set cap — the default). When > 0
+   * it becomes PM2's max_memory_restart (process restarted on exceed — the
+   * closest degraded equivalent to a hard limit, so a runaway can't OOM the
+   * host) and the container --memory limit in docker mode.
+   *
+   * Opt-in by default (0) on purpose: forcing a cap would silently kill
+   * existing PM2 apps that legitimately use more, and would override docker's
+   * own tuned 256 MB container default. Operators enable it via
+   * DROP_MAX_MEMORY_MB_PER_APP once they know their apps' real footprint;
+   * multi-tenant (docker) installs should set it. When 0, docker containers
+   * keep ContainerManager's 256 MB default.
+   */
+  maxMemoryMbPerApp: number;
+  /**
+   * Per-app CPU cap in cores (0 = no platform-set cap — the default). Honored
+   * in docker mode (--cpus); PM2 cannot enforce CPU limits so it is ignored
+   * there. When 0, docker keeps ContainerManager's 0.5-core default.
+   */
+  maxCpusPerApp: number;
+  /**
+   * Delete log files under data/logs older than this many days (min 1).
+   * Bounds disk usage from per-app, Caddy, build, and platform logs. Default 14.
+   */
+  logRetentionDays: number;
+  /**
+   * Rotate the platform log at startup once it exceeds this many MB
+   * (0 = never). Default 50.
+   */
+  logMaxFileMb: number;
 }
 
 // Determine platform-appropriate defaults
@@ -133,7 +183,11 @@ const DEFAULT_CONFIG: PlatformConfig = {
   allowSignup: process.env.DROP_ALLOW_SIGNUP === 'true',
   maxDbsPerUser: parseInt(process.env.DROP_MAX_DBS_PER_USER || '3', 10),
   maxConcurrentBuilds: parseInt(process.env.DROP_MAX_CONCURRENT_BUILDS || '3', 10),
-  maxDiskMbPerApp: parseInt(process.env.DROP_MAX_DISK_MB_PER_APP || '0', 10),
+  maxConcurrentApps: parseInt(process.env.DROP_MAX_CONCURRENT_APPS || '0', 10),
+  maxMemoryMbPerApp: parseInt(process.env.DROP_MAX_MEMORY_MB_PER_APP || '0', 10),
+  maxCpusPerApp: parseFloat(process.env.DROP_MAX_CPUS_PER_APP || '0'),
+  logRetentionDays: parseInt(process.env.DROP_LOG_RETENTION_DAYS || '14', 10),
+  logMaxFileMb: parseInt(process.env.DROP_LOG_MAX_FILE_MB || '50', 10),
 };
 
 export class DropPlatform {
@@ -156,13 +210,22 @@ export class DropPlatform {
   private gitDeployService: GitDeployService | null = null;
   private apiServer: ApiServer | null = null;
   private buildLogService: BuildLogService | null = null;
+  private logRetention: LogRetentionService | null = null;
 
   private subscriptions: Unsubscribe[] = [];
+  // Held separately from `subscriptions`: must stay subscribed through
+  // drainInProgress() in stop() so late-completing deploys still close out
+  // (see the drain-window fix in docs/plans/2026-07-06-p2-4-deploy-observability.md).
+  private deployTrackerUnsub?: Unsubscribe;
   private isRunning = false;
-  private nextPort: number;
   private usedPorts: Map<number, string> = new Map(); // port -> appName ownership
   private appsInProgress: Set<string> = new Set(); // Track apps being built/started
   private appDeployTimes: Map<string, number> = new Map(); // Track when apps were last deployed
+  // Apps whose rebuild+restart is being managed as a single transaction by
+  // handleAppUpdate. Their builder.build still emits build:completed, but
+  // buildSub must NOT also start them (that would double-start). Held only for
+  // the duration of the build() call — see handleAppUpdate / buildSub.
+  private selfManagedUpdates: Set<string> = new Set();
   private appBuildDurations: Map<string, number> = new Map(); // Last build duration per app (ms)
   /** Minimum post-deploy quiet window. Adaptive: max(this, lastBuildDuration * 2). */
   private readonly DEPLOY_COOLDOWN_MS_MIN = 5_000;
@@ -200,13 +263,13 @@ export class DropPlatform {
       ...config,
     };
     this.eventBus = eventBus;
-    this.nextPort = this.config.portRangeStart;
 
     // Initialize logger (console only initially, file logging enabled after dirs created)
     this.logger = createLogger({
       level: this.config.logLevel,
       console: true,
       file: false,
+      maxFileBytes: this.config.logMaxFileMb > 0 ? this.config.logMaxFileMb * 1024 * 1024 : 0,
     });
   }
 
@@ -240,6 +303,14 @@ export class DropPlatform {
       // Enable file logging now that directories exist
       const logDir = path.join(this.config.dropRoot, 'data', 'logs', 'drop-svc');
       this.logger.enableFileLogging(logDir);
+
+      // Prune old logs so a long-lived box can't fill its disk (per-app, Caddy,
+      // build and platform logs all live under data/logs). Sweeps now + daily.
+      this.logRetention = getLogRetentionService(
+        path.join(this.config.dropRoot, 'data', 'logs'),
+        this.config.logRetentionDays
+      );
+      this.logRetention.start();
 
       // Initialize services
       await this.initializeServices();
@@ -292,6 +363,13 @@ export class DropPlatform {
       this.certExpiryTimer = null;
     }
 
+    // Stop the log-retention sweep
+    if (this.logRetention) {
+      this.logRetention.stop();
+      resetLogRetentionService();
+      this.logRetention = null;
+    }
+
     // Unsubscribe from all events
     for (const unsub of this.subscriptions) {
       unsub();
@@ -336,6 +414,13 @@ export class DropPlatform {
       resetPostgresServer();
     }
 
+    // Reset database provisioner singleton (paired with postgresServer above
+    // since the provisioner depends on it)
+    if (this.dbProvisioner) {
+      resetDatabaseProvisioner();
+      this.dbProvisioner = null;
+    }
+
     // Stop Caddy server
     if (this.caddyServer) {
       this.logger.info('Stopping Caddy...', 'CADDY');
@@ -353,6 +438,21 @@ export class DropPlatform {
     resetGitDeployService();
     resetActivityLog();
     resetBuildLogService();
+
+    // Tear down the deploy tracker's subscription only now — after the drain
+    // above completes — so a deploy that finishes during the drain window
+    // still gets its closing row recorded, then flush the final state to
+    // disk before reset.
+    if (this.deployTrackerUnsub) {
+      this.deployTrackerUnsub();
+      this.deployTrackerUnsub = undefined;
+    }
+    try {
+      await getDeployTracker().flush();
+    } catch {
+      // best-effort
+    }
+    resetDeployTracker();
 
     // Stop API server
     if (this.apiServer) {
@@ -427,7 +527,6 @@ export class DropPlatform {
       path.join(dataDir, 'appconf', 'caddy'), // Caddy config root
       path.join(dataDir, 'appconf', 'caddy', 'webapps'), // Per-app Caddy configs
       path.join(dataDir, 'appconf', 'caddy', 'hosts'), // Per-host Caddy configs
-      path.join(dataDir, 'backup'), // Automated backups
       path.join(dataDir, 'temp'), // Temporary files
     ];
 
@@ -438,6 +537,17 @@ export class DropPlatform {
         if ((error as NodeJS.ErrnoException).code !== 'EEXIST') {
           this.log('warn', `Failed to create directory: ${dir}`, error);
         }
+      }
+    }
+
+    // Backups contain plaintext DB credentials (db-credentials.json,
+    // .pg-superuser, restore-roles.sql) — keep the root non-world-traversable.
+    // (POSIX-effective only; on Windows this relies on NTFS ACL inheritance.)
+    try {
+      await fs.mkdir(path.join(dataDir, 'backup'), { recursive: true, mode: 0o700 });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') {
+        this.log('warn', `Failed to create directory: ${path.join(dataDir, 'backup')}`, error);
       }
     }
 
@@ -608,29 +718,37 @@ backup:
   }
 
   private async ensureCaddyfile(dataDir: string): Promise<void> {
-    let needsWrite = false;
+    // The managed Caddyfile is fully derived from config (global options + the
+    // fixed logging snippet + import lines). Regenerate whenever the on-disk
+    // content differs from what we'd produce now — this covers a missing file,
+    // a stale (pre-v2) config, AND config changes like toggling HTTPS or the
+    // ACME email. Per-app and host *.caddy files are separate imports and are
+    // never touched here, so a rewrite is safe. Comparing full content also
+    // avoids needless rewrites (and Caddy reloads) when nothing has changed.
+    const desired = this.buildCaddyfileContent(dataDir);
+    let existing: string | null = null;
     try {
-      const existing = await fs.readFile(this.config.caddyfilePath, 'utf-8');
-      // Regenerate if the version header is missing (stale v1 config)
-      if (!existing.startsWith(this.CADDYFILE_VERSION)) {
-        this.logger.info(
-          'Upgrading Caddyfile to v2 (version header missing — stale config detected)',
-          'CADDY'
-        );
-        needsWrite = true;
-      }
+      existing = await fs.readFile(this.config.caddyfilePath, 'utf-8');
     } catch {
-      // File doesn't exist yet
-      needsWrite = true;
+      // File doesn't exist yet — will be written below.
     }
 
-    if (needsWrite) {
-      try {
-        await fs.writeFile(this.config.caddyfilePath, this.buildCaddyfileContent(dataDir), 'utf-8');
-        this.logger.info(`Caddyfile written at ${this.config.caddyfilePath}`, 'CADDY');
-      } catch (error) {
-        this.logger.warn('Failed to write Caddyfile', 'CADDY', error);
-      }
+    if (existing === desired) {
+      return;
+    }
+
+    if (existing !== null && !existing.startsWith(this.CADDYFILE_VERSION)) {
+      this.logger.info(
+        'Upgrading Caddyfile to v2 (stale config detected)',
+        'CADDY'
+      );
+    }
+
+    try {
+      await fs.writeFile(this.config.caddyfilePath, desired, 'utf-8');
+      this.logger.info(`Caddyfile written at ${this.config.caddyfilePath}`, 'CADDY');
+    } catch (error) {
+      this.logger.warn('Failed to write Caddyfile', 'CADDY', error);
     }
   }
 
@@ -640,6 +758,9 @@ backup:
     this.postgresServer = getPostgresServer({
       dropRoot: this.config.dropRoot,
       onLog: (msg) => this.logger.debug(msg, 'POSTGRES'),
+      // In docker mode the socket is bind-mounted into containers; a trust
+      // pg_hba would give containers unauthenticated superuser access.
+      strictSecure: this.config.isolation === 'docker',
     });
 
     await this.postgresServer.ensureReady((msg) => {
@@ -649,8 +770,12 @@ backup:
     await this.postgresServer.start();
     this.logger.info(`PostgreSQL running on port ${this.postgresServer.getPort()}`, 'DATABASE');
 
-    // Initialize database provisioner
-    this.dbProvisioner = new DatabaseProvisioner(this.postgresServer, this.config.dropRoot);
+    // Initialize database provisioner (module singleton so the API layer,
+    // which holds no platform reference, can reach the same instance)
+    this.dbProvisioner = getDatabaseProvisioner(this.postgresServer, this.config.dropRoot);
+    if (!this.dbProvisioner) {
+      throw new Error('Failed to initialize DatabaseProvisioner');
+    }
     await this.dbProvisioner.initialize();
 
     // Ensure internal database exists
@@ -702,6 +827,14 @@ backup:
     const activityLog = getActivityLog(activityLogPath);
     await activityLog.initialize();
 
+    // Initialize deploy tracker (durable per-deploy timeline). Its unsubscribe
+    // is held separately from `this.subscriptions` — see stop() — so it stays
+    // wired through the shutdown drain window.
+    const deployStorePath = path.join(this.config.dropRoot, 'data', 'drop-svc', 'deploys.json');
+    const deployTracker = getDeployTracker(deployStorePath);
+    await deployTracker.initialize();
+    this.deployTrackerUnsub = deployTracker.subscribe(this.eventBus);
+
     // Sync state manager with app configs (configs are source of truth for ports)
     await this.syncStateWithConfigs();
 
@@ -715,8 +848,8 @@ backup:
     const buildLogsDir = path.join(this.config.dropRoot, 'data', 'logs', 'builds');
     this.buildLogService = getBuildLogService(buildLogsDir);
 
-    // Initialize the app runtime (PM2 today; Docker arrives with PRD-029)
-    this.runtime = getAppRuntime();
+    // Initialize the app runtime — docker when isolation=docker, PM2 otherwise.
+    this.runtime = getAppRuntime(this.config.isolation === 'docker' ? 'docker' : 'pm2');
 
     // Load used ports from existing PM2 processes
     await this.loadUsedPorts();
@@ -783,6 +916,8 @@ backup:
 
     const logDir = path.join(this.config.dropRoot, 'data', 'logs');
 
+    const masterKeyPath = path.join(this.config.dropRoot, 'data', 'drop-svc', 'encryption.key');
+
     this.apiServer = createApiServer({
       port: this.config.apiPort,
       host: '0.0.0.0',
@@ -793,6 +928,7 @@ backup:
       domainSuffix: this.config.domainSuffix,
       logDir,
       appsDirectory: this.config.appsDirectory,
+      masterKeyPath,
     });
 
     await this.apiServer.initialize();
@@ -832,6 +968,15 @@ backup:
           // out from under it). Mark 'pending' — NOT 'stopped' — so the
           // startup detection scan rebuilds and restarts it. User-stopped apps
           // are persisted as 'stopped' and are intentionally left alone.
+          await this.stateManager.setAppStatus(app.name, 'pending');
+        } else if (
+          (app.status === 'building' || app.status === 'starting') &&
+          !runningNames.has(app.name)
+        ) {
+          // App was mid-deploy when the platform stopped: it's wedged in a
+          // transient status with no live process, and nothing else demotes
+          // these. Reset to 'pending' so the startup detection scan resumes the
+          // deploy instead of it being stuck 'building'/'starting' forever.
           await this.stateManager.setAppStatus(app.name, 'pending');
         }
       }
@@ -903,19 +1048,10 @@ backup:
   }
 
   private setupEventHandlers(): void {
-    // When watcher detects a new directory, detect the app type
-    const watcherSub = this.eventBus.subscribe('watcher:change', async (payload) => {
-      if (payload.changeType === 'addDir' && this.isTopLevelApp(payload.path)) {
-        const appName = path.basename(payload.path);
-        // Skip apps currently being cloned by git deploy (race condition prevention)
-        if (this.gitDeployService?.isCloning(appName)) {
-          this.logger.debug(`Skipping watcher detection for ${appName} - git clone in progress`, 'GIT-DEPLOY');
-          return;
-        }
-        await this.handleNewApp(payload.path);
-      }
-    });
-    this.subscriptions.push(watcherSub);
+    // App onboarding is driven by the watcher publishing app:detected directly
+    // (WatcherService.handleAppDetected); the detector resolves the type and
+    // detectedSub below persists it. There is no watcher:change → new-app path:
+    // the watcher never emits watcher:change with changeType 'addDir'.
 
     // When app is detected, create config and build it
     const detectedSub = this.eventBus.subscribe('app:detected', async (payload) => {
@@ -951,6 +1087,19 @@ backup:
     // hands ownership to handleStartApp; every path here that does NOT start
     // the app must release the guard, or future hot-reloads dead-end forever.
     const buildSub = this.eventBus.subscribe('build:completed', async (payload) => {
+      // A hot-reload (handleAppUpdate) owns its own stop+rebuild+start as one
+      // transaction — its builder.build emits build:completed too, but buildSub
+      // must abstain or the app double-starts. handleAppUpdate owns appsInProgress
+      // cleanup in that case, so we return without touching it. MUST be the first
+      // statement (before any await): it is correct only because EventBus
+      // dispatch is synchronous, so this runs during build()'s publish, between
+      // handleAppUpdate's marker add() and the finally delete() bracketing the
+      // await this.builder.build(...). A move to async/deferred dispatch would
+      // silently reintroduce the double-start.
+      if (this.selfManagedUpdates.has(payload.appId)) {
+        return;
+      }
+
       if (payload.success === false) {
         // Failed build — handleBuildApp already marked it errored and cleaned up.
         this.appsInProgress.delete(payload.appId);
@@ -993,12 +1142,49 @@ backup:
       }
     });
     this.subscriptions.push(statusSub);
+
+    // Release the deleted app's port(s) so allocatePort's range-scan can
+    // reuse them. Keyed on app:deleted — published only by
+    // stateManager.removeApp (real teardown) — NOT app:removed, which also
+    // fires from the watcher's chokidar unlinkDir handler (a folder momentarily
+    // vanishing, e.g. mid-redeploy) and would free a live/just-redeployed app's
+    // port out from under it. See docs/plans/2026-07-07-p2-5-disk-and-port-guards.md.
+    const deletedSub = this.eventBus.subscribe('app:deleted', (payload) => {
+      this.handleAppDeleted(payload);
+    });
+    this.subscriptions.push(deletedSub);
+  }
+
+  /**
+   * Release every port owned by a deleted app. Reverse-lookup over
+   * `usedPorts` (Map<port, appName>) rather than a single stored port,
+   * because the map is the only place ownership is tracked. Excludes the
+   * '__anonymous__' sentinel, which never corresponds to a real app name.
+   */
+  private handleAppDeleted(payload: AppDeletedPayload): void {
+    for (const [port, owner] of this.usedPorts.entries()) {
+      if (owner === payload.name && owner !== '__anonymous__') {
+        this.usedPorts.delete(port);
+        this.logger.debug(`Released port ${port} for deleted app ${payload.name}`, 'PORT');
+      }
+    }
   }
 
   /**
    * Check if an app needs a database by looking at detection result or common ORM config files
    */
   private async appNeedsDatabase(appPath: string, detectionDatabase?: boolean | string): Promise<boolean> {
+    // DROP has no SQLite provisioner — 'sqlite' still provisions PostgreSQL and
+    // injects DATABASE_URL. Warn so the mismatch is visible instead of silent.
+    if (detectionDatabase === 'sqlite') {
+      this.logger.warn(
+        "drop.yaml requested 'database: sqlite', but DROP only provisions PostgreSQL — " +
+          "a PostgreSQL database will be provisioned and DATABASE_URL injected. " +
+          "Set 'database: postgres' to silence this warning.",
+        'DATABASE'
+      );
+    }
+
     // If detection already found database requirement, use that
     if (detectionDatabase === true || detectionDatabase === 'postgres' || detectionDatabase === 'sqlite') {
       return true;
@@ -1096,63 +1282,6 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     this.logger.info(`Generated drop-config.js for static app`, 'DEPS');
   }
 
-  private isTopLevelApp(appPath: string): boolean {
-    const relative = path.relative(this.config.appsDirectory, appPath);
-    // Must be a direct child (no path separators), non-empty, and not a parent reference
-    if (!relative || relative.includes(path.sep) || relative.startsWith('..')) {
-      return false;
-    }
-    // Skip hidden directories and invalid names
-    const basename = path.basename(appPath);
-    if (basename.startsWith('.') || basename === 'node_modules') {
-      return false;
-    }
-    return true;
-  }
-
-  private async handleNewApp(appPath: string): Promise<void> {
-    const appName = path.basename(appPath);
-
-    // Skip apps currently being cloned by git deploy
-    if (this.gitDeployService?.isCloning(appName)) {
-      this.logger.debug(`Skipping detection for ${appName} - git clone in progress`, 'GIT-DEPLOY');
-      return;
-    }
-
-    this.logger.appEvent('detected', appName);
-
-    if (!this.detector) return;
-
-    try {
-      const result = await this.detector.detect(appPath);
-      this.logger.info(`Detected ${appName} as ${result.type} (confidence: ${result.confidence})`, 'DETECTOR');
-
-      const appType = result.type as 'nodejs' | 'python' | 'go' | 'static' | 'docker' | 'unknown';
-
-      // Create or update app config file (source of truth)
-      if (this.appConfigService) {
-        await this.appConfigService.upsertConfig(appName, {
-          type: appType,
-          framework: result.framework ?? undefined,
-          path: appPath,
-          hostname: `${appName}.localhost`,
-        });
-      }
-
-      // Register app in state manager
-      if (this.stateManager) {
-        await this.stateManager.registerApp(
-          appName,
-          appPath,
-          appType,
-          result.framework ?? undefined
-        );
-      }
-    } catch (error) {
-      this.logger.error(`Failed to detect app type for ${appName}`, 'DETECTOR', error);
-    }
-  }
-
   private async handleBuildApp(appPath: string, appName: string, _appType: string): Promise<void> {
     if (!this.builder || !this.detector) return;
 
@@ -1178,13 +1307,36 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
 
     this.logger.appEvent('building', appName);
 
-    // Update state to building
-    if (this.stateManager) {
-      await this.stateManager.setAppStatus(appName, 'building');
-    }
-
     try {
-      const detection = await this.detector.detect(appPath);
+      // Update state to building. Kept inside the try: if this write throws it
+      // must not escape and leave the app wedged in appsInProgress — the catch
+      // below releases the guard. (The success path intentionally keeps the
+      // guard and hands off to handleStartApp, which owns the final release.)
+      if (this.stateManager) {
+        await this.stateManager.setAppStatus(appName, 'building');
+      }
+
+      const detection = await this.detector.detect(appPath, { silent: true });
+
+      // Persist the real detected type. The watcher's app:detected event can't
+      // know it (it only flags a hostname-pattern directory), and since detect()
+      // no longer republishes (P1-6), this is the only place the stored type is
+      // corrected from 'unknown' to the real runtime. Idempotent. The detector's
+      // AppType is broader than the stored runtime union — cast to match, the
+      // same way detectedSub does for the onboarding write.
+      const detectedType = detection.type as
+        | 'nodejs'
+        | 'python'
+        | 'go'
+        | 'static'
+        | 'docker'
+        | 'unknown';
+      if (this.appConfigService) {
+        await this.appConfigService.updateConfig(appName, { type: detectedType });
+      }
+      if (this.stateManager) {
+        await this.stateManager.updateApp(appName, { type: detectedType });
+      }
       const workDir = await this.getBuildWorkDir(appName);
 
       const execCommand =
@@ -1200,6 +1352,16 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       const logId = this.buildLogService
         ? await this.buildLogService.startBuild(appName, buildStartedAt)
         : null;
+
+      // Fresh deploy — nothing is currently serving this app, so a low-disk
+      // abort is a hard failure: throw into the catch below, which marks the
+      // app 'errored' and releases appsInProgress.
+      const disk = await hasEnoughDisk(appPath);
+      if (!disk.ok) {
+        throw new Error(
+          `Insufficient disk space: ${Math.round(disk.freeMb)} MB free, need ${getMinFreeDiskMb()} MB`
+        );
+      }
 
       const result = await this.builder.build({
         appName,
@@ -1253,17 +1415,37 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
   }
 
   private async handleStartApp(appName: string): Promise<void> {
-    if (!this.runtime || !this.detector) return;
+    if (!this.runtime || !this.detector) {
+      // Only reachable during teardown; release the guard so a queued deploy
+      // isn't left wedged in appsInProgress forever.
+      this.appsInProgress.delete(appName);
+      return;
+    }
 
     const appPath = path.join(this.config.appsDirectory, appName);
 
-    // Update state to starting
-    if (this.stateManager) {
-      await this.stateManager.setAppStatus(appName, 'starting');
-    }
-
     try {
-      const detection = await this.detector.detect(appPath);
+      // Update state to starting. Kept inside the try: if this write throws it
+      // must not escape to the EventBus handler wrapper (which only logs) and
+      // leave the app wedged in appsInProgress with no cleanup.
+      if (this.stateManager) {
+        await this.stateManager.setAppStatus(appName, 'starting');
+      }
+
+      // Capacity guard: reject the deploy if the global running-app cap is reached.
+      if (this.config.maxConcurrentApps > 0 && this.stateManager) {
+        const runningCount = this.stateManager.getAllApps().filter(
+          (a) => a.status === 'running' || a.status === 'starting'
+        ).length;
+        if (runningCount >= this.config.maxConcurrentApps) {
+          throw new Error(
+            `App capacity reached (${runningCount}/${this.config.maxConcurrentApps} running). ` +
+            `Stop an existing app before deploying a new one, or increase DROP_MAX_CONCURRENT_APPS.`
+          );
+        }
+      }
+
+      const detection = await this.detector.detect(appPath, { silent: true });
       const port = this.allocatePort(appName);
 
       this.logger.appEvent('starting', appName, `port ${port}`);
@@ -1273,59 +1455,16 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       const dataDir = await this.ensureAppDataDirectory(appName);
       this.logger.info(`Data directory: ${dataDir}`, 'DATA');
 
-      // Determine start command based on app type and isolation mode.
-      let script: string;
-      let interpreter: string | undefined;
-      let args: string[] | undefined;
-
-      if (detection.type === 'static' || detection.type === 'spa') {
-        if (this.config.isolation === 'docker') {
-          // In docker mode, nginx:alpine serves the built output.  Write a
-          // custom nginx.conf to the data dir (mounted read-write inside the
-          // container at the same path) and copy it on container start.
-          const outputSubdir = detection.suggestedConfig?.outputDirectory || '';
-          const nginxConf = buildNginxConf(port, outputSubdir);
-          const nginxConfPath = path.join(dataDir, 'nginx.conf');
-          await fs.writeFile(nginxConfPath, nginxConf, 'utf-8');
-          this.logger.info(`Wrote nginx.conf for ${appName} → port ${port}`, 'STATIC');
-
-          script = '/bin/sh';
-          interpreter = 'none';
-          args = [
-            '-c',
-            `cp ${nginxConfPath} /etc/nginx/conf.d/default.conf && nginx -g 'daemon off;'`,
-          ];
-        } else {
-          // PM2 mode: use the bundled Node.js static server.
-          const serveDir = path.join(appPath, detection.suggestedConfig?.outputDirectory || '.');
-          const fsSync = require('fs');
-          const distPath = path.join(__dirname, '..', '..', 'dist', 'core', 'static-server.js');
-          const localPath = path.join(__dirname, 'static-server.js');
-          script = fsSync.existsSync(localPath) ? localPath : fsSync.existsSync(distPath) ? distPath : localPath;
-          args = [serveDir, '-s']; // -s for SPA mode
-        }
-      } else if (detection.type === 'go') {
-        // Go apps run as compiled binaries
-        const startCommand = detection.suggestedConfig?.startCommand || `./${appName}`;
-        script = startCommand;
-        interpreter = 'none'; // No interpreter - run binary directly
-      } else {
-        // For Node.js/Python apps, the detector returns "node <file>" or "python <file>" format
-        const startCommand = detection.suggestedConfig?.startCommand || 'node index.js';
-
-        if (startCommand.startsWith('node ')) {
-          // Extract the script file from "node <file>"
-          script = startCommand.substring(5); // Remove "node " prefix
-        } else {
-          script = startCommand;
-        }
-      }
-
-      // Check if app needs a database and provision one
+      // Check if app needs a database and provision one.
       let dbEnvVars: Record<string, string> = {};
       const needsDb = await this.appNeedsDatabase(appPath, detection.suggestedConfig?.database);
       if (this.dbProvisioner && needsDb) {
-        // Enforce per-user DB quota before provisioning
+        const pgSocketDir =
+          this.config.isolation === 'docker'
+            ? (this.postgresServer?.getSocketDir() ?? undefined)
+            : undefined;
+        const dbOpts = pgSocketDir ? { pgSocketDir } : undefined;
+
         const appState = this.stateManager?.getApp(appName);
         const ownerUserId = appState?.userId;
         if (ownerUserId && this.config.maxDbsPerUser > 0) {
@@ -1342,63 +1481,19 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           } else {
             this.logger.info(`Provisioning database for ${appName}...`, 'DATABASE');
             const dbCreds = await this.dbProvisioner.provisionAppDatabase(appName);
-            dbEnvVars = this.dbProvisioner.getEnvVars(appName, {
-              pgHost: this.config.isolation === 'docker' ? 'host-gateway' : undefined,
-            }) || {};
+            dbEnvVars = this.dbProvisioner.getEnvVars(appName, dbOpts) || {};
             this.logger.info(`Database provisioned: ${dbCreds.database}`, 'DATABASE');
           }
         } else {
           this.logger.info(`Provisioning database for ${appName}...`, 'DATABASE');
           const dbCreds = await this.dbProvisioner.provisionAppDatabase(appName);
-          dbEnvVars = this.dbProvisioner.getEnvVars(appName, {
-            pgHost: this.config.isolation === 'docker' ? 'host-gateway' : undefined,
-          }) || {};
+          dbEnvVars = this.dbProvisioner.getEnvVars(appName, dbOpts) || {};
           this.logger.info(`Database provisioned: ${dbCreds.database}`, 'DATABASE');
         }
       }
 
-      // Resolve dependencies from drop.yaml
-      const depEnvVars = await this.resolveDependencies(appPath, appName);
-
-      // For static apps, generate drop-config.js with dependency URLs
-      if ((detection.type === 'static' || detection.type === 'spa') && Object.keys(depEnvVars).length > 0) {
-        await this.generateStaticConfig(appPath, depEnvVars);
-      }
-
-      // Load encrypted secrets for this app
-      let secretEnvVars: Record<string, string> = {};
-      if (this.secretManager && this.secretManager.hasSecrets(appName)) {
-        secretEnvVars = this.secretManager.getAll(appName);
-        this.logger.info(`Injecting ${Object.keys(secretEnvVars).length} secret(s)`, 'SECURITY');
-      }
-
-      // Read health check path from drop.yaml (optional)
-      const dropYamlForHealth = await parseDropYaml(appPath);
-      const healthCheckPath = dropYamlForHealth.success ? dropYamlForHealth.config?.healthCheck : undefined;
-
-      // Configure log files with dated filenames (auto-captured from stdout/stderr)
-      const { outFile, errorFile } = await this.getAppLogPaths(appName);
-
-      const status = await this.runtime.start({
-        name: appName,
-        script,
-        interpreter,
-        args,
-        cwd: appPath,
-        port,
-        outFile,
-        errorFile,
-        appType: detection.type,
-        healthCheckPath,
-        env: {
-          NODE_ENV: 'production',
-          PORT: port.toString(),
-          DROP_DATA_DIR: dataDir,
-          ...dbEnvVars,
-          ...depEnvVars,
-          ...secretEnvVars,
-        },
-      });
+      const spec = await this.buildStartSpec(appName, appPath, detection, port, dataDir, dbEnvVars);
+      const status = await this.runtime.start(spec);
 
       this.logger.appEvent('started', appName, `PID ${status.pid}, port ${port}`);
 
@@ -1421,11 +1516,10 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
 
       // App is fully deployed now - record deploy time for cooldown
       this.appDeployTimes.set(appName, Date.now());
-      this.appsInProgress.delete(appName);
 
       // Start health prober in PM2 mode (Docker uses its own HEALTHCHECK mechanism)
-      if (healthCheckPath && this.runtime?.type === 'pm2') {
-        this.startHealthProber(appName, port, healthCheckPath);
+      if (spec.healthCheckPath && this.runtime?.type === 'pm2') {
+        this.startHealthProber(appName, port, spec.healthCheckPath);
       }
     } catch (error) {
       this.logger.appEvent('error', appName, error instanceof Error ? error.message : 'Failed to start');
@@ -1434,6 +1528,10 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           error: error instanceof Error ? error.message : 'Failed to start',
         });
       }
+    } finally {
+      // Terminal handler: always release the in-progress guard on every settled
+      // path (success, error, or a throw from the initial 'starting' write), so
+      // a transient failure can never wedge the app out of future rebuilds.
       this.appsInProgress.delete(appName);
     }
   }
@@ -1453,10 +1551,12 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       let domains: string[] = [defaultHostname];
       let customTls: { certFile?: string; keyFile?: string } | undefined;
 
+      let hasCustomDomains = false;
       if (dropYaml.success && dropYaml.config) {
         if (dropYaml.config.domains && dropYaml.config.domains.length > 0) {
           domains = dropYaml.config.domains;
-          this.logger.info(`Custom domains configured for ${appName}: ${domains.join(', ')}`, 'ROUTER');
+          hasCustomDomains = true;
+          this.logger.info(`Custom domains requested for ${appName}: ${domains.join(', ')}`, 'ROUTER');
         }
 
         // Check for custom TLS config
@@ -1471,14 +1571,37 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
             this.logger.info(`Custom TLS certificates configured for ${appName}`, 'ROUTER');
           }
         }
+      }
 
-        // Save custom domains to app config
-        if (this.appConfigService && dropYaml.config.domains) {
-          await this.appConfigService.updateConfig(appName, {
-            domains: dropYaml.config.domains,
-            tls: dropYaml.config.tls,
-          });
-        }
+      // Cross-tenant hostname guard: reject any custom domain already claimed by
+      // a *different* app before it reaches Caddy. Without this, a tenant's
+      // drop.yaml could claim another app's hostname/domain and hijack its
+      // traffic, or introduce a duplicate site address that wedges Caddy's
+      // config reload for the whole box. The app always keeps its own default
+      // hostname (never filtered), so it stays reachable even if every custom
+      // domain is refused.
+      let acceptedCustomDomains: string[] = [];
+      if (hasCustomDomains && this.appConfigService) {
+        const owners = this.appConfigService.getDomainOwners(domainSuffix);
+        acceptedCustomDomains = domains.filter((d) => {
+          const owner = owners.get(d.toLowerCase());
+          if (owner && owner !== appName) {
+            this.logger.warn(
+              `Refusing domain '${d}' for ${appName}: already claimed by '${owner}'`,
+              'ROUTER'
+            );
+            return false;
+          }
+          return true;
+        });
+        domains = acceptedCustomDomains.length > 0 ? acceptedCustomDomains : [defaultHostname];
+
+        // Persist only the accepted domains as the source of truth — never the
+        // raw, possibly-hijacking request.
+        await this.appConfigService.updateConfig(appName, {
+          domains: acceptedCustomDomains,
+          tls: dropYaml.config?.tls,
+        });
       }
 
       // In docker (multi-user) mode inject security headers on all tenant routes.
@@ -1527,8 +1650,10 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         await this.caddyServer.reload();
       }
     } catch (error) {
-      // Route might already exist
-      this.logger.warn(`Failed to configure route for ${appName}`, 'ROUTER', error);
+      // Surface at error level: a failed reload means this (and every
+      // subsequent) route change silently stops applying until an operator
+      // intervenes — not a benign "route already exists".
+      this.logger.error(`Failed to configure route for ${appName}`, 'ROUTER', error);
     }
   }
 
@@ -1565,12 +1690,38 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       return;
     }
 
+    // A user-stopped app must not be resurrected by a file-change hot-reload.
+    // Every other deploy path guards on this (detectedSub, buildSub); without
+    // it, any edit or touch to a stopped app's files (git pull, editor
+    // autosave) silently rebuilds and restarts it against the user's explicit
+    // `drop stop`.
+    if (appState.status === 'stopped') {
+      this.logger.debug(`Skipping update for ${appName} - app was stopped by user`, 'UPDATE');
+      return;
+    }
+
     // Remember the current port and whether the app was running
     const originalPort = appState.port;
     const wasRunning = appState.status === 'running';
 
     this.logger.info(`Hot-reload triggered for ${appName}: ${reason}`, 'UPDATE');
     this.appsInProgress.add(appName);
+
+    // Hot-reload — the app is currently RUNNING and serving traffic. Abort
+    // with a `return`, never a `throw`: the catch below unconditionally marks
+    // the app 'errored' and tears down its health prober, which is wrong for
+    // a healthy running app that simply can't be rebuilt right now. Must run
+    // after appsInProgress.add (before it would open a TOCTOU double-build
+    // window) and before setAppStatus('building') (so status stays 'running').
+    const disk = await hasEnoughDisk(appPath);
+    if (!disk.ok) {
+      this.logger.warn(
+        `Skipping hot-reload of ${appName}: insufficient disk (${Math.round(disk.freeMb)} MB free, need ${getMinFreeDiskMb()} MB)`,
+        'UPDATE'
+      );
+      this.appsInProgress.delete(appName);
+      return;
+    }
 
     try {
       // M5.1 deploy transaction: keep old version serving while the new build
@@ -1579,26 +1730,54 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       await this.stateManager.setAppStatus(appName, 'building');
 
       // Re-detect and rebuild the app
-      const detection = await this.detector.detect(appPath);
+      const detection = await this.detector.detect(appPath, { silent: true });
+
+      // Persist the (possibly changed) type on hot-reload too — detect() is
+      // silent, so this is the only place a static→node type change is recorded.
+      const detectedType = detection.type as
+        | 'nodejs'
+        | 'python'
+        | 'go'
+        | 'static'
+        | 'docker'
+        | 'unknown';
+      if (this.appConfigService) {
+        await this.appConfigService.updateConfig(appName, { type: detectedType });
+      }
+      if (this.stateManager) {
+        await this.stateManager.updateApp(appName, { type: detectedType });
+      }
+
       const workDir = await this.getBuildWorkDir(appName);
       const updateLogId = this.buildLogService
         ? await this.buildLogService.startBuild(appName, new Date())
         : null;
-      const buildResult = await this.builder.build({
-        appName,
-        appPath,
-        appType: detection.type,
-        framework: detection.framework || null,
-        config: {
-          buildCommand: detection.suggestedConfig?.buildCommand,
-          installCommand: detection.suggestedConfig?.installCommand,
-        },
-        env: {},
-        workDir,
-        onBuildLog: updateLogId && this.buildLogService
-          ? (line) => this.buildLogService!.writeLine(updateLogId, line)
-          : undefined,
-      });
+      // Mark this app self-managed only around build(): the build:completed it
+      // emits is dispatched synchronously inside build(), so buildSub sees the
+      // marker and abstains from starting the app (handleAppUpdate starts it
+      // below). finally guarantees the marker is cleared even on build failure —
+      // a stuck marker would silently suppress the app's NEXT legit deploy.
+      this.selfManagedUpdates.add(appName);
+      let buildResult;
+      try {
+        buildResult = await this.builder.build({
+          appName,
+          appPath,
+          appType: detection.type,
+          framework: detection.framework || null,
+          config: {
+            buildCommand: detection.suggestedConfig?.buildCommand,
+            installCommand: detection.suggestedConfig?.installCommand,
+          },
+          env: {},
+          workDir,
+          onBuildLog: updateLogId && this.buildLogService
+            ? (line) => this.buildLogService!.writeLine(updateLogId, line)
+            : undefined,
+        });
+      } finally {
+        this.selfManagedUpdates.delete(appName);
+      }
       if (updateLogId && this.buildLogService) {
         await this.buildLogService.finishBuild(updateLogId, appName);
       }
@@ -1639,64 +1818,24 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
 
       await this.stateManager.setAppStatus(appName, 'starting');
 
-      // Determine start command
-      let script: string;
-      let args: string[] | undefined;
-
-      if (detection.type === 'static' || detection.type === 'spa') {
-        const serveDir = path.join(appPath, detection.suggestedConfig?.outputDirectory || '.');
-        script = path.join(__dirname, 'static-server.js');
-        args = [serveDir, '-s'];
-      } else {
-        const startCommand = detection.suggestedConfig?.startCommand || 'node index.js';
-        script = startCommand.startsWith('node ') ? startCommand.substring(5) : startCommand;
-      }
-
       // Ensure data directory exists (preserved across upgrades)
       const dataDir = await this.ensureAppDataDirectory(appName);
 
-      // Get database env vars if needed
+      // Get env vars for an already-provisioned DB (no new provisioning on hot-reload).
       let dbEnvVars: Record<string, string> = {};
       if (this.dbProvisioner) {
-        dbEnvVars = this.dbProvisioner.getEnvVars(appName, {
-          pgHost: this.config.isolation === 'docker' ? 'host-gateway' : undefined,
-        }) || {};
+        const pgSocketDir =
+          this.config.isolation === 'docker'
+            ? (this.postgresServer?.getSocketDir() ?? undefined)
+            : undefined;
+        dbEnvVars = this.dbProvisioner.getEnvVars(
+          appName,
+          pgSocketDir ? { pgSocketDir } : undefined
+        ) || {};
       }
 
-      // Resolve dependencies
-      const depEnvVars = await this.resolveDependencies(appPath, appName);
-
-      // For static apps, regenerate drop-config.js
-      if ((detection.type === 'static' || detection.type === 'spa') && Object.keys(depEnvVars).length > 0) {
-        await this.generateStaticConfig(appPath, depEnvVars);
-      }
-
-      // Load encrypted secrets for this app
-      let secretEnvVars: Record<string, string> = {};
-      if (this.secretManager && this.secretManager.hasSecrets(appName)) {
-        secretEnvVars = this.secretManager.getAll(appName);
-      }
-
-      // Configure log files with dated filenames (auto-captured from stdout/stderr)
-      const { outFile, errorFile } = await this.getAppLogPaths(appName);
-
-      const status = await this.runtime.start({
-        name: appName,
-        script,
-        args,
-        cwd: appPath,
-        port,
-        outFile,
-        errorFile,
-        env: {
-          NODE_ENV: 'production',
-          PORT: port.toString(),
-          DROP_DATA_DIR: dataDir,
-          ...dbEnvVars,
-          ...depEnvVars,
-          ...secretEnvVars,
-        },
-      });
+      const spec = await this.buildStartSpec(appName, appPath, detection, port, dataDir, dbEnvVars);
+      const status = await this.runtime.start(spec);
 
       this.logger.appEvent('started', appName, `PID ${status.pid}, port ${port} (hot-reloaded)`);
 
@@ -1790,10 +1929,124 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
   }
 
   /**
-   * Get the log file paths for an app with today's date.
-   * Format: {appName}-YYYY-MM-DD-out.log and {appName}-YYYY-MM-DD-err.log
-   * Creates the log directory if it doesn't exist.
+   * Build the runtime-agnostic start specification for an app.  Called by both
+   * handleStartApp (on first deploy) and handleUpdateApp (on hot-reload) so the
+   * two paths can't drift apart.
+   *
+   * DB env vars are passed in by the caller: handleStartApp provisions the DB
+   * first and passes the resulting vars; handleUpdateApp fetches the existing
+   * vars for an already-provisioned DB.
    */
+  private async buildStartSpec(
+    appName: string,
+    appPath: string,
+    detection: DetectionResult,
+    port: number,
+    dataDir: string,
+    dbEnvVars: Record<string, string>
+  ): Promise<AppStartSpec> {
+    let script: string;
+    let interpreter: string | undefined;
+    let args: string[] | undefined;
+
+    if (detection.type === 'static' || detection.type === 'spa') {
+      if (this.config.isolation === 'docker') {
+        const outputSubdir = detection.suggestedConfig?.outputDirectory || '';
+        const nginxConf = buildNginxConf(port, outputSubdir);
+        const nginxConfPath = path.join(dataDir, 'nginx.conf');
+        await fs.writeFile(nginxConfPath, nginxConf, 'utf-8');
+        this.logger.info(`Wrote nginx.conf for ${appName} → port ${port}`, 'STATIC');
+
+        script = '/bin/sh';
+        interpreter = 'none';
+        args = [
+          '-c',
+          `cp ${nginxConfPath} /etc/nginx/conf.d/default.conf && nginx -g 'daemon off;'`,
+        ];
+      } else {
+        const serveDir = path.join(appPath, detection.suggestedConfig?.outputDirectory || '.');
+        // eslint-disable-next-line @typescript-eslint/no-require-imports
+        const fsSync = require('fs');
+        const distPath = path.join(__dirname, '..', '..', 'dist', 'core', 'static-server.js');
+        const localPath = path.join(__dirname, 'static-server.js');
+        script = fsSync.existsSync(localPath)
+          ? localPath
+          : fsSync.existsSync(distPath)
+          ? distPath
+          : localPath;
+        args = [serveDir, '-s'];
+      }
+    } else if (detection.type === 'go') {
+      const startCommand = detection.suggestedConfig?.startCommand || `./${appName}`;
+      script = startCommand;
+      interpreter = 'none';
+    } else {
+      const startCommand = detection.suggestedConfig?.startCommand || 'node index.js';
+      script = startCommand.startsWith('node ')
+        ? startCommand.substring(5)
+        : startCommand;
+    }
+
+    const depEnvVars = await this.resolveDependencies(appPath, appName);
+
+    if (
+      (detection.type === 'static' || detection.type === 'spa') &&
+      Object.keys(depEnvVars).length > 0
+    ) {
+      await this.generateStaticConfig(appPath, depEnvVars);
+    }
+
+    let secretEnvVars: Record<string, string> = {};
+    if (this.secretManager && this.secretManager.hasSecrets(appName)) {
+      secretEnvVars = this.secretManager.getAll(appName);
+      this.logger.info(`Injecting ${Object.keys(secretEnvVars).length} secret(s)`, 'SECURITY');
+    }
+
+    const dropYaml = await parseDropYaml(appPath);
+    const healthCheckPath = dropYaml.success ? dropYaml.config?.healthCheck : undefined;
+
+    const { outFile, errorFile } = await this.getAppLogPaths(appName);
+
+    // In docker mode, pass the Postgres socket dir so ContainerManager can
+    // bind-mount it; containers connect via unix socket instead of TCP.
+    const pgSocketDir =
+      this.config.isolation === 'docker'
+        ? (this.postgresServer?.getSocketDir() ?? undefined)
+        : undefined;
+
+    // Optional per-app resource caps. Only set when an operator has configured
+    // them (> 0), so we never silently kill an existing PM2 app or override
+    // docker's own 256 MB / 0.5-core container defaults. When set, PM2 honors
+    // `memory` (via max_memory_restart); docker honors both `memory` and `cpus`.
+    const memory =
+      this.config.maxMemoryMbPerApp > 0 ? `${this.config.maxMemoryMbPerApp}M` : undefined;
+    const cpus = this.config.maxCpusPerApp > 0 ? this.config.maxCpusPerApp : undefined;
+    const limits = memory !== undefined || cpus !== undefined ? { memory, cpus } : undefined;
+
+    return {
+      name: appName,
+      script,
+      interpreter,
+      args,
+      cwd: appPath,
+      port,
+      outFile,
+      errorFile,
+      appType: detection.type,
+      healthCheckPath,
+      pgSocketDir,
+      limits,
+      env: {
+        ...secretEnvVars,
+        NODE_ENV: 'production',
+        PORT: port.toString(),
+        DROP_DATA_DIR: dataDir,
+        ...dbEnvVars,
+        ...depEnvVars,
+      },
+    };
+  }
+
   private async getAppLogPaths(appName: string): Promise<{ outFile: string; errorFile: string; logDir: string }> {
     const logDir = path.join(this.config.dropRoot, 'data', 'logs', 'webapps', appName);
 
@@ -1842,6 +2095,22 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       }
     }
 
+    // In docker isolation mode the container runs as a non-root user (e.g. UID
+    // 1000 'node' in node:20-slim).  Make the data dir world-writable so the
+    // container user can write to it without a chown step.  This is acceptable
+    // because the dir is only bind-mounted into this app's own container; Tier B
+    // will tighten this with explicit UID alignment.
+    if (this.config.isolation === 'docker') {
+      try {
+        await fs.chmod(dataDir, 0o777);
+        for (const subdir of commonSubdirs) {
+          await fs.chmod(path.join(dataDir, subdir), 0o777).catch(() => {});
+        }
+      } catch {
+        this.logger.warn(`Could not chmod data directory for ${appName}`, 'DATA');
+      }
+    }
+
     return dataDir;
   }
 
@@ -1881,23 +2150,19 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       }
     }
 
-    // Allocate a new port
-    while (this.usedPorts.has(this.nextPort) && this.nextPort <= this.config.portRangeEnd) {
-      this.nextPort++;
+    // Allocate a new port: scan the full configured range for the first free
+    // slot so interior gaps freed by app:deleted are reused, rather than a
+    // monotonic cursor that only ever moves forward. Synchronous — no await
+    // between the scan and the claim — so two concurrent callers can't race
+    // onto the same port (see docs/plans/2026-07-07-p2-5-disk-and-port-guards.md).
+    for (let p = this.config.portRangeStart; p <= this.config.portRangeEnd; p++) {
+      if (!this.usedPorts.has(p)) {
+        this.usedPorts.set(p, appName ?? '__anonymous__');
+        return p;
+      }
     }
 
-    if (this.nextPort > this.config.portRangeEnd) {
-      throw new Error('No available ports in configured range');
-    }
-
-    const port = this.nextPort;
-    if (appName) {
-      this.usedPorts.set(port, appName);
-    } else {
-      this.usedPorts.set(port, '__anonymous__');
-    }
-    this.nextPort++;
-    return port;
+    throw new Error('No available ports in configured range');
   }
 
   releasePort(port: number): void {
@@ -1951,14 +2216,6 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     // Add all ports to usedPorts with their owning app name
     for (const [port, appName] of portSources.entries()) {
       this.usedPorts.set(port, appName);
-    }
-
-    // Find the highest used port to set nextPort correctly
-    if (this.usedPorts.size > 0) {
-      const maxPort = Math.max(...this.usedPorts.keys());
-      if (maxPort >= this.nextPort) {
-        this.nextPort = maxPort + 1;
-      }
     }
 
     this.logger.info(`Loaded ${this.usedPorts.size} used ports from running apps and state`, 'PORT');

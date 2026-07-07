@@ -6,7 +6,7 @@
 |-------|-------|
 | PRD ID | PRD-024 |
 | Feature | Token Expiry Handling |
-| Status | Pending |
+| Status | Completed |
 | Priority | P0 |
 | Created | 2026-03-19 |
 

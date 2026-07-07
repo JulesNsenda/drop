@@ -18,7 +18,9 @@ import {
   isAuthEnabled,
   authMiddleware,
   optionalAuthMiddleware,
+  resetAuth,
 } from './auth';
+import { getTestToken } from '../__testutils__/auth';
 
 describe('Auth Middleware', () => {
   let tempDir: string;
@@ -30,7 +32,7 @@ describe('Auth Middleware', () => {
   });
 
   afterEach(async () => {
-    await fs.rm(tempDir, { recursive: true, force: true });
+    await fs.rm(tempDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   });
 
   describe('initializeAuth', () => {
@@ -85,6 +87,55 @@ describe('Auth Middleware', () => {
       const users = listUsers();
       expect(users.find(u => u.username === 'testuser')).toBeDefined();
     });
+
+    it('quarantines a corrupt credentials file instead of silently overwriting it', async () => {
+      jest.spyOn(console, 'log').mockImplementation();
+      jest.spyOn(console, 'error').mockImplementation();
+
+      // A populated credentials store exists on disk...
+      await initializeAuth({ credentialsPath, enableJwt: true, enableApiKeys: true });
+      await createUser('realuser', 'password123', 'user');
+      expect(await fs.readFile(credentialsPath, 'utf-8')).toContain('realuser');
+
+      // ...then it gets corrupted on disk. On restart we must NOT wipe it and
+      // mint a fresh default admin without a trace — the corrupt bytes must be
+      // preserved for recovery.
+      const corruptBytes = '{ half-written garbage that will not parse';
+      await fs.writeFile(credentialsPath, corruptBytes);
+      resetAuth();
+      await initializeAuth({ credentialsPath, enableJwt: true, enableApiKeys: true });
+
+      const files = await fs.readdir(tempDir);
+      const quarantined = files.filter((f) => f.startsWith('credentials.json.corrupt-'));
+      expect(quarantined).toHaveLength(1);
+      expect(await fs.readFile(path.join(tempDir, quarantined[0]), 'utf-8')).toBe(corruptBytes);
+
+      jest.restoreAllMocks();
+    });
+
+    it('quarantines a valid-JSON-but-wrong-shape credentials file', async () => {
+      jest.spyOn(console, 'log').mockImplementation();
+      jest.spyOn(console, 'error').mockImplementation();
+
+      await fs.writeFile(credentialsPath, JSON.stringify({ not: 'a credentials store' }));
+      resetAuth();
+      await initializeAuth({ credentialsPath, enableJwt: true, enableApiKeys: true });
+
+      const files = await fs.readdir(tempDir);
+      expect(files.filter((f) => f.startsWith('credentials.json.corrupt-'))).toHaveLength(1);
+
+      jest.restoreAllMocks();
+    });
+
+    it('does NOT quarantine on first run (missing file)', async () => {
+      jest.spyOn(console, 'log').mockImplementation();
+      await initializeAuth({ credentialsPath, enableJwt: true, enableApiKeys: true });
+
+      const files = await fs.readdir(tempDir);
+      expect(files.some((f) => f.startsWith('credentials.json.corrupt-'))).toBe(false);
+
+      jest.restoreAllMocks();
+    });
   });
 
   describe('createUser', () => {
@@ -130,6 +181,7 @@ describe('Auth Middleware', () => {
   describe('authenticateUser', () => {
     beforeEach(async () => {
       jest.spyOn(console, 'log').mockImplementation();
+      resetAuth();
       await initializeAuth({
         credentialsPath,
         enableJwt: true,
@@ -142,24 +194,22 @@ describe('Auth Middleware', () => {
       jest.restoreAllMocks();
     });
 
-    it('should return JWT token for valid credentials', async () => {
-      const token = await authenticateUser('testuser', 'correctpassword');
-
-      expect(token).toBeDefined();
-      expect(typeof token).toBe('string');
-      expect(token!.split('.').length).toBe(3); // JWT has 3 parts
+    it('should return status ok with JWT token for valid credentials', async () => {
+      const result = await authenticateUser('testuser', 'correctpassword');
+      expect(result.status).toBe('ok');
+      if (result.status !== 'ok') return;
+      expect(typeof result.token).toBe('string');
+      expect(result.token.split('.').length).toBe(3); // JWT has 3 parts
     });
 
-    it('should return null for invalid password', async () => {
-      const token = await authenticateUser('testuser', 'wrongpassword');
-
-      expect(token).toBeNull();
+    it('should return status invalid for wrong password', async () => {
+      const result = await authenticateUser('testuser', 'wrongpassword');
+      expect(result.status).toBe('invalid');
     });
 
-    it('should return null for non-existent user', async () => {
-      const token = await authenticateUser('nonexistent', 'password');
-
-      expect(token).toBeNull();
+    it('should return status invalid for non-existent user', async () => {
+      const result = await authenticateUser('nonexistent', 'password');
+      expect(result.status).toBe('invalid');
     });
   });
 
@@ -168,13 +218,14 @@ describe('Auth Middleware', () => {
 
     beforeEach(async () => {
       jest.spyOn(console, 'log').mockImplementation();
+      resetAuth();
       await initializeAuth({
         credentialsPath,
         enableJwt: true,
         enableApiKeys: true,
       });
       await createUser('testuser', 'password123', 'user');
-      validToken = (await authenticateUser('testuser', 'password123'))!;
+      validToken = await getTestToken('testuser', 'password123');
     });
 
     afterEach(() => {
@@ -351,13 +402,14 @@ describe('Auth Middleware', () => {
 
     beforeEach(async () => {
       jest.spyOn(console, 'log').mockImplementation();
+      resetAuth();
       await initializeAuth({
         credentialsPath,
         enableJwt: true,
         enableApiKeys: true,
       });
       await createUser('testuser', 'password123', 'user');
-      validToken = (await authenticateUser('testuser', 'password123'))!;
+      validToken = await getTestToken('testuser', 'password123');
       const { key } = await createApiKey('test-api-key', 'admin');
       validApiKey = key;
     });
@@ -366,14 +418,16 @@ describe('Auth Middleware', () => {
       jest.restoreAllMocks();
     });
 
-    function createMockContext(headers: Record<string, string> = {}): {
-      c: { req: { header: (name: string) => string | undefined }; json: jest.Mock; set: jest.Mock };
+    function createMockContext(headers: Record<string, string> = {}, path = '/api/v1/apps', method = 'GET'): {
+      c: { req: { header: (name: string) => string | undefined; path: string; method: string }; json: jest.Mock; set: jest.Mock };
       next: jest.Mock;
     } {
       return {
         c: {
           req: {
             header: (name: string) => headers[name],
+            path,
+            method,
           },
           json: jest.fn().mockReturnValue({ status: 401 } as Response),
           set: jest.fn(),
@@ -463,13 +517,14 @@ describe('Auth Middleware', () => {
 
     beforeEach(async () => {
       jest.spyOn(console, 'log').mockImplementation();
+      resetAuth();
       await initializeAuth({
         credentialsPath,
         enableJwt: true,
         enableApiKeys: true,
       });
       await createUser('testuser', 'password123', 'user');
-      validToken = (await authenticateUser('testuser', 'password123'))!;
+      validToken = await getTestToken('testuser', 'password123');
     });
 
     afterEach(() => {

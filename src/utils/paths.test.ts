@@ -14,7 +14,7 @@ describe('isPathWithin', () => {
   });
 
   afterAll(async () => {
-    await fs.rm(root, { recursive: true, force: true });
+    await fs.rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   });
 
   it('accepts a direct child directory', async () => {

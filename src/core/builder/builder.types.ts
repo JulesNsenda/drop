@@ -89,6 +89,12 @@ export interface BuildConfig {
   timeout?: number;
   /** Set by nodejs strategy when lockfile hash is unchanged — skips the install stage. */
   skipInstall?: boolean;
+  /**
+   * Set by the docker strategy in preBuild — the specific Dockerfile/Containerfile
+   * or compose file it detected, so validate() can re-check it. Lives on the
+   * per-build context (NOT on the strategy instance, which is a shared singleton).
+   */
+  dockerFile?: string;
 }
 
 /**

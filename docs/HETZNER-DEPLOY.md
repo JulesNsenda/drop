@@ -1,242 +1,387 @@
 # Deploying DROP to Hetzner for Testing
 
-This sets up a persistent Hetzner VPS where every push to `develop` (or the
-active v2 feature branch) automatically deploys and restarts DROP. You get a
-live URL to hit for testing within ~60 seconds of a push.
+Push to `develop` → GitHub Actions builds and tests → auto-deploys to your Hetzner server. Live URL in ~90 seconds.
 
 ---
 
-## Architecture
+## What you need before starting
 
-```
-Your machine
-    │ git push
-    ▼
-GitHub Actions
-    ├── CI job (lint + build + test)   ← existing ci.yml
-    └── Deploy job (SSH → server)      ← new deploy.yml
-            │ on: push to develop / feature/DROP-v2*
-            ▼
-      Hetzner VPS (Ubuntu 24.04)
-        /home/drop/drop/              ← git clone
-        systemd: drop-platform.service
-        DROP API: http://<ip>:3000
-        Dashboard: http://<ip>:3000/dashboard
-```
+- A [Hetzner Cloud](https://console.hetzner.cloud) account
+- Your GitHub repo (this one) with Actions enabled
+- `ssh-keygen` available on your machine (comes with Git for Windows / macOS / Linux)
 
 ---
 
-## Step 1 — Create the Hetzner server
+## Step 1 — Create the server on Hetzner
 
-1. Go to [console.hetzner.cloud](https://console.hetzner.cloud).
-2. **New project** → e.g. `drop-testing`.
-3. **Add server**:
-   - Location: pick the nearest (e.g. Nuremberg)
-   - Image: **Ubuntu 24.04**
-   - Type: **CX22** (2 vCPU, 4 GB RAM — ~€3.79/month; enough for DROP + PG)
-   - SSH keys: add your local public key (`~/.ssh/id_ed25519.pub` or similar)
-   - Name: `drop-test-1`
-4. Click **Create & Buy** → note the server's IP address.
+1. Log in to [console.hetzner.cloud](https://console.hetzner.cloud).
+2. Click **New project** → name it `drop-testing` → click **Add server**.
+3. Choose these settings:
+   - **Location**: pick the closest to you (e.g. Nuremberg)
+   - **Image**: Ubuntu 24.04
+   - **Type**: CX22 (2 vCPU, 4 GB RAM — costs ~€4/month)
+   - **SSH keys**: click **Add SSH key** and paste your local public key (usually at `~/.ssh/id_ed25519.pub` or `~/.ssh/id_rsa.pub`)
+   - **Name**: `drop-test-1`
+4. Click **Create & Buy now**.
+5. Copy the server's **IP address** from the project dashboard — you'll use it throughout. (203.0.113.10)
 
 ---
 
-## Step 2 — Generate a deploy key
+## Step 2 — Create a deploy key
 
-This key is used only by GitHub Actions to SSH into the server.
+This is a separate SSH key used only by GitHub Actions to log in to the server. Run this on your local machine:
 
 ```bash
-# On your local machine
 ssh-keygen -t ed25519 -C "github-actions-deploy" -f ~/.ssh/drop_deploy -N ""
 ```
 
-This creates `~/.ssh/drop_deploy` (private) and `~/.ssh/drop_deploy.pub` (public).
+This creates two files:
+- `~/.ssh/drop_deploy` — the **private** key (goes into GitHub)
+- `~/.ssh/drop_deploy.pub` — the **public** key (goes onto the server)
 
 ---
 
 ## Step 3 — Bootstrap the server
 
-SSH in as root using your personal key:
+SSH into the server as root (using your personal key from Step 1):
 
 ```bash
 ssh root@<server-ip>
 ```
 
-Run the install script — it creates the `drop` system user, installs Node.js
-20, clones the repo, builds the server, and sets up the systemd service:
+**3a. Install DROP**
+
+Run the install script. It creates a `drop` system user, installs Node.js 20 + PostgreSQL + Caddy, clones the repo to `/opt/drop`, builds it, and sets up a systemd service that starts on boot:
 
 ```bash
 apt-get update -qq && apt-get install -y curl git build-essential
-curl -fsSL https://raw.githubusercontent.com/JulesNsenda/drop/main/install.sh \
-  | bash -s -- --root=/home/drop/drop-data
+curl -fsSL https://raw.githubusercontent.com/JulesNsenda/drop/develop/install.sh \
+  | bash -s -- --root=/var/drop
 ```
 
-The script prints the data directory and a command to retrieve the admin
-password once DROP starts.
+This serves the dashboard/API on port 3000 over plain HTTP. To publish on a real
+domain with automatic HTTPS instead, add the domain flags (see
+[Custom domain + HTTPS](#custom-domain--https)):
 
-**Add SSH keys** so you (and GitHub Actions) can log in as the `drop` user:
+```bash
+curl -fsSL https://raw.githubusercontent.com/JulesNsenda/drop/develop/install.sh \
+  | bash -s -- --root=/var/drop --domain=example.com --https --acme-email=you@example.com
+```
+
+> **Note:** The script lives on the `develop` branch until the next merge to `main`. If the curl returns a 404 (e.g. private repo or branch not yet merged), use the manual install below instead.
+
+<details>
+<summary>Manual install (if the curl above fails)</summary>
+
+```bash
+# Install Node.js 20
+curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+apt-get install -y nodejs
+
+# Create drop user and clone the repo
+useradd -m -s /bin/bash drop
+git clone --branch develop https://github.com/JulesNsenda/drop.git /opt/drop
+cd /opt/drop && npm ci && npm run build:server
+chown -R drop:drop /opt/drop
+mkdir -p /var/drop && chown -R drop:drop /var/drop
+
+# Create the systemd service
+cat > /etc/systemd/system/drop-platform.service << 'EOF'
+[Unit]
+Description=DROP Platform
+After=network.target
+
+[Service]
+Type=simple
+User=drop
+WorkingDirectory=/opt/drop
+ExecStart=/usr/bin/node /opt/drop/dist/index.js serve --root=/var/drop
+Restart=on-failure
+RestartSec=5
+Environment=NODE_ENV=production
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable drop-platform
+systemctl start drop-platform
+```
+
+</details>
+
+When it finishes you'll see:
+```
+✓ DROP installed successfully
+  Install directory: /opt/drop
+  Data root:         /var/drop
+  Service:           drop-platform
+```
+
+**3b. Add SSH keys for the `drop` user**
+
+This lets you (and GitHub Actions) log in as the `drop` user:
 
 ```bash
 mkdir -p /home/drop/.ssh
-# Your personal key (lets you SSH in manually):
+
+# Your personal key — lets you SSH in manually
 cat /root/.ssh/authorized_keys >> /home/drop/.ssh/authorized_keys
-# GitHub Actions deploy key:
-echo "PASTE_DROP_DEPLOY_PUB_KEY_HERE" >> /home/drop/.ssh/authorized_keys
+
+# GitHub Actions deploy key — paste the contents of ~/.ssh/drop_deploy.pub
+echo "PASTE_CONTENTS_OF_drop_deploy.pub_HERE" >> /home/drop/.ssh/authorized_keys
+
 chmod 700 /home/drop/.ssh
 chmod 600 /home/drop/.ssh/authorized_keys
 chown -R drop:drop /home/drop/.ssh
 ```
 
-**Replace** `PASTE_DROP_DEPLOY_PUB_KEY_HERE` with the contents of
-`~/.ssh/drop_deploy.pub`.
+To get the public key contents, run this on your local machine:
+```bash
+cat ~/.ssh/drop_deploy.pub
+```
 
-Check DROP started:
+**3c. Allow the `drop` user to manage the service without a password**
+
+GitHub Actions stops the service, unpacks the new build, then starts it again. Add a passwordless sudo rule for those commands:
+
+```bash
+echo "drop ALL=(ALL) NOPASSWD: /bin/systemctl stop drop-platform, /bin/systemctl start drop-platform, /bin/systemctl restart drop-platform, /bin/systemctl status drop-platform" \
+  > /etc/sudoers.d/drop-deploy
+chmod 440 /etc/sudoers.d/drop-deploy
+```
+
+**3d. Check DROP started**
 
 ```bash
 journalctl -u drop-platform -f
-# Look for:
-#   API server running on http://0.0.0.0:3000
-#   Authentication: ENABLED
-#   Admin password: <one-time password>  ← copy this
 ```
 
-The one-time admin password is printed **once** on first boot. It is also
-stored at `/home/drop/drop-data/data/drop-svc/api-credentials.json`.
+Look for this line — it contains the one-time admin password:
+```
+Admin password: <password>   ← copy this, you'll need it to log in
+```
+
+The password is also saved at `/var/drop/data/drop-svc/api-credentials.json` if you miss it.
+
+Press `Ctrl+C` to exit the log view.
 
 ---
 
-## Step 5 — Open the firewall
+## Step 4 — Open the firewall
 
-In Hetzner Cloud Console, go to your server → **Firewalls** → **Create firewall**:
+In Hetzner Cloud Console → your server → **Firewalls** → **Create firewall**.
 
-| Rule | Protocol | Port | Source |
+Add these inbound rules:
+
+| Name | Protocol | Port | Source |
 |---|---|---|---|
-| SSH | TCP | 22 | Your IP (or `0.0.0.0/0` for open) |
-| DROP API | TCP | 3000 | `0.0.0.0/0` |
-| HTTP | TCP | 80 | `0.0.0.0/0` (if using Caddy) |
-| HTTPS | TCP | 443 | `0.0.0.0/0` (if using Caddy) |
+| SSH | TCP | 22 | `0.0.0.0/0` |
+| DROP API & Dashboard | TCP | 3000 | `0.0.0.0/0` |
+| HTTP | TCP | 80 | `0.0.0.0/0` |
+| HTTPS | TCP | 443 | `0.0.0.0/0` |
 
-Apply the firewall to `drop-test-1`.
+Click **Create firewall** and apply it to `drop-test-1`.
 
-Test from your local machine:
+> Ports **80 and 443 are required** if you use a custom domain — Let's Encrypt
+> validates over port 80 and serves HTTPS on 443. Port 3000 stays open as a
+> direct backdoor to the dashboard/API; you can close it once your domain works.
+
+**Test it works:**
 
 ```bash
 curl http://<server-ip>:3000/api/v1/health
+# Should return: {"status":"ok", ...}
 ```
 
-Dashboard: `http://<server-ip>:3000/dashboard`
+Dashboard: open `http://<server-ip>:3000/dashboard` in your browser.
 
 ---
 
-## Step 6 — Add GitHub Secrets
+## Step 5 — Create the GitHub environment
 
-In your GitHub repository → **Settings → Secrets and variables → Actions →
-New repository secret**:
+The deploy workflow requires a GitHub environment called `hetzner`. Without it the deploy job will be blocked.
+
+1. Go to your GitHub repo → **Settings** → **Environments** → **New environment**.
+2. Name it exactly `hetzner`.
+3. Click **Configure environment** — no protection rules needed for a test server, just save.
+
+---
+
+## Step 6 — Add GitHub secrets
+
+Go to your GitHub repo → **Settings** → **Secrets and variables** → **Actions** → **New repository secret**.
+
+Add these three secrets:
 
 | Secret name | Value |
 |---|---|
-| `DEPLOY_HOST` | Your Hetzner server IP |
+| `DEPLOY_HOST` | Your Hetzner server IP (e.g. `65.21.100.42`) |
 | `DEPLOY_USER` | `drop` |
-| `DEPLOY_KEY` | Contents of `~/.ssh/drop_deploy` (private key, the whole file) |
+| `DEPLOY_KEY_B64` | Your private key **base64-encoded** (see below) |
+
+**Why base64?** Pasting a raw private key into GitHub Secrets on Windows adds Windows line endings (`\r\n`) that corrupt the key. Base64 is a single line with no newlines to corrupt.
+
+To generate the base64-encoded key, run this on your local machine:
+
+```bash
+# Git Bash on Windows / Linux
+base64 -w 0 ~/.ssh/drop_deploy
+
+# macOS
+base64 -i ~/.ssh/drop_deploy
+```
+
+Copy the entire output (one long line) and paste it as the `DEPLOY_KEY_B64` secret value.
 
 ---
 
-## Step 7 — The deploy workflow is already added
+## Step 7 — Push and watch it deploy
 
-See `.github/workflows/deploy.yml` (committed alongside this guide). It runs
-after CI passes on `develop` and on the active v2 feature branch, SSHs into
-the server, pulls the latest code, rebuilds, and restarts the service.
+The deploy workflow (`.github/workflows/deploy.yml`) is already in the repo. It triggers on every push to `develop` (and `main`), runs lint + build + tests, then SSHes into the server and restarts the service.
 
-To trigger a deployment: push to `develop`.
+Trigger your first deployment:
+
+```bash
+git push origin develop
+```
+
+Go to **GitHub → Actions** to watch it run. The deploy job appears after the build passes (~60s). Total time from push to live: ~90 seconds.
 
 ---
 
 ## Daily workflow
 
 ```bash
-# Make changes locally, run tests
+# Make your changes, run tests locally
 npm test
 
-# Push — CI runs, then deploy runs automatically
+# Push — deploys automatically
 git push origin develop
 
-# ~60s later, check the server
+# ~90s later, check the server
 curl http://<server-ip>:3000/api/v1/apps
+# Open the dashboard
 open http://<server-ip>:3000/dashboard
 ```
 
-### Manual deploy (if you need to force it)
-
-```bash
-ssh root@<server-ip>
-curl -fsSL https://raw.githubusercontent.com/JulesNsenda/drop/main/install.sh \
-  | bash -s -- --upgrade --branch develop
-```
-
-Or step-by-step as the `drop` user:
-
-```bash
-ssh drop@<server-ip>
-cd /opt/drop
-git pull origin develop
-npm ci && npm run build:server
-sudo systemctl restart drop-platform
-journalctl -u drop-platform -f
-```
-
-### View live logs
+### Watch live logs
 
 ```bash
 ssh drop@<server-ip> 'journalctl -u drop-platform -f'
 ```
 
----
+### Force a manual deploy
 
-## Testing DROP features on the server
+The easiest way is to re-trigger the GitHub Actions workflow without pushing new code:
 
-See `docs/LOCAL-TESTING.md` — the same commands work over SSH. The webapps
-directory on the server is `/home/drop/drop-data/data/webapps/`.
+GitHub repo → **Actions** → pick the last run → **Re-run all jobs**.
+
+Alternatively, if you need to restart the service without redeploying:
 
 ```bash
-# Deploy a test app from your local machine via SCP
-scp -r ./my-test-app drop@<server-ip>:/home/drop/drop-data/data/webapps/
+ssh drop@<server-ip> 'sudo systemctl restart drop-platform'
+```
 
-# Or create one directly on the server
+---
+
+## Testing DROP on the server
+
+The webapps directory is `/var/drop/data/webapps/`. Anything dropped there is auto-detected and deployed within seconds.
+
+```bash
+# Copy a local app to the server
+scp -r ./my-app drop@<server-ip>:/var/drop/data/webapps/
+
+# Or create a quick static app directly on the server
 ssh drop@<server-ip> '
-  mkdir -p ~/drop-data/data/webapps/hello
-  echo "<h1>Hello from Hetzner</h1>" > ~/drop-data/data/webapps/hello/index.html
+  mkdir -p /var/drop/data/webapps/hello
+  echo "<h1>Hello from Hetzner</h1>" > /var/drop/data/webapps/hello/index.html
 '
 
-# DROP auto-detects it within a few seconds
+# Check it was picked up
 curl http://<server-ip>:3000/api/v1/apps
 ```
+
+See `docs/LOCAL-TESTING.md` for more testing patterns — they all work over SSH the same way.
+
+---
+
+## Custom domain + HTTPS
+
+By default DROP serves on `http://<server-ip>:3000`. To publish it on a real
+domain with automatic Let's Encrypt certificates:
+
+**1. Point DNS at the server** (at your registrar):
+
+| Record | Type | Value |
+|---|---|---|
+| `example.com` | A | server IP |
+| `*.example.com` | A | server IP |
+
+The apex serves the **dashboard**; each deployed app is served at
+`https://<app>.example.com`.
+
+**2. Open ports 80 and 443** in the Hetzner firewall (Step 4).
+
+**3. Enable the domain.** Run the installer once as root with the domain flags —
+on a fresh box or an existing one (it auto-detects upgrade):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/JulesNsenda/drop/develop/install.sh \
+  | sudo bash -s -- --upgrade --domain=example.com --https --acme-email=you@example.com
+```
+
+This installs Caddy (granting it permission to bind 80/443 as the `drop` user),
+writes the config to `/etc/drop/drop.env`, routes the apex to the dashboard, and
+restarts the service. Watch it come up and issue certificates:
+
+```bash
+journalctl -u drop-platform -f   # look for: HTTPS enabled for *.example.com
+```
+
+Certificates are fetched on first request to each hostname (a few seconds).
+
+### How config persists across deploys
+
+Domain/HTTPS settings live in `/etc/drop/drop.env`, which the systemd unit reads
+on every start — so a normal `git push` deploy keeps them. The deploy also runs
+`install.sh --provision` on the server, so **infra changes in `install.sh`
+(Caddy, the systemd unit, the apex route) are applied automatically** on each
+deploy; you don't need to re-run the installer by hand after the first time.
+
+To change config later, either re-run the installer with new flags, or edit
+`/etc/drop/drop.env` directly and `sudo systemctl restart drop-platform`.
+
+### Debugging certificates without hitting rate limits
+
+Let's Encrypt rate-limits failed issuance. While sorting out DNS/firewall, use
+staging certs (untrusted by browsers, but unlimited) by adding
+`DROP_ACME_STAGING=true` to `/etc/drop/drop.env` and restarting. Remove it once
+issuance works, then restart again for real certs.
 
 ---
 
 ## Teardown
 
-When you're done testing, destroy the server from Hetzner Cloud Console to
-stop billing. Your local repo and GitHub are unaffected.
+When you're done testing, delete the server from Hetzner Cloud Console to stop billing. Your code and GitHub are unaffected.
 
 ---
 
-## Optional: Docker mode on the server
+## Troubleshooting
 
-To test `isolation: docker` (multi-user, containerised apps):
+**Deploy job fails with "Permission denied"**
+- Check the `DEPLOY_KEY_B64` secret is a single base64 line with no spaces or newlines. Re-run the `base64` command and paste it fresh.
+- Confirm `drop_deploy.pub` was added to `/home/drop/.ssh/authorized_keys` on the server.
+- Test manually: `ssh -i ~/.ssh/drop_deploy drop@<server-ip> 'echo ok'`
 
-```bash
-# On the server as root — install Docker Engine
-curl -fsSL https://get.docker.com | sh
-usermod -aG docker drop
+**`sudo systemctl restart` fails**
+- Make sure you ran Step 3c to create the sudoers rule.
+- Check it exists: `ssh drop@<server-ip> 'sudo systemctl restart drop-platform'`
 
-# Edit the systemd service to add docker isolation
-# /etc/systemd/system/drop-platform.service
-# Change the ExecStart line:
-#   ExecStart=... serve
-# Add under [Service]:
-#   Environment=DROP_ISOLATION=docker
-#   Environment=DROP_ALLOW_SIGNUP=true   # only if you want signup
+**Dashboard shows blank / 404**
+- The dashboard build may not have run yet. SSH in and run: `cd /opt/drop/src/dashboard && npm ci && npm run build`
 
-systemctl daemon-reload && systemctl restart drop-platform
-```
-
-DROP will migrate existing apps to containers on first boot in docker mode.
+**Can't find the admin password**
+- `cat /var/drop/data/drop-svc/api-credentials.json`

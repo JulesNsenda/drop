@@ -6,7 +6,7 @@
 |-------|-------|
 | PRD ID | PRD-029 |
 | Feature | Docker Isolation |
-| Status | Planned |
+| Status | Completed (alternate design) |
 | Priority | P0 |
 | Created | 2026-03-19 |
 

@@ -6,7 +6,7 @@
 |-------|-------|
 | PRD ID | PRD-038 |
 | Feature | SSL for All Apps |
-| Status | Planned |
+| Status | In Progress (backend HTTPS/wildcard/cert API via M4; app cert-status field + dashboard UI missing) |
 | Priority | P1 |
 | Depends On | PRD-032 |
 | Created | 2026-03-19 |

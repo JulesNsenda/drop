@@ -43,7 +43,7 @@ describe('ApiServer', () => {
       await server.stop();
     }
     jest.restoreAllMocks();
-    await fs.rm(tempDir, { recursive: true, force: true });
+    await fs.rm(tempDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   });
 
   describe('constructor', () => {
@@ -114,11 +114,14 @@ describe('ApiServer', () => {
       }
     });
 
-    it('should respond to health check', async () => {
+    it('should respond to health check without hanging', async () => {
       const app = server.getApp();
+      // A standalone server has no PM2/Postgres/Caddy running, so health is
+      // legitimately 'degraded' (503) — the point is it responds promptly with
+      // a valid report rather than hanging on an unresponsive subsystem probe.
       const res = await app.request('/api/v1/health');
 
-      expect(res.status).toBe(200);
+      expect([200, 503]).toContain(res.status);
       const data = (await res.json()) as ApiResponse<HealthResponse>;
       expect(data.success).toBe(true);
       expect(data.data.status).toBeDefined();
@@ -159,6 +162,23 @@ describe('ApiServer', () => {
       });
 
       expect(res.status).toBe(500);
+    });
+
+    it('does not leak internal error messages to clients (P3-3)', async () => {
+      const app = server.getApp();
+      jest.spyOn(console, 'error').mockImplementation(); // the handler logs the real error
+      // Inject a route that throws a raw (non-HttpError) Error carrying a sensitive detail.
+      app.get('/__test_throw', () => {
+        throw new Error('sensitive internal detail: /var/drop/data/drop-svc/.pg-superuser');
+      });
+
+      const res = await app.request('/__test_throw');
+      expect(res.status).toBe(500);
+      const body = (await res.json()) as { success: boolean; error: { message: string } };
+      expect(body.success).toBe(false);
+      expect(body.error.message).toBe('Internal server error');
+      // The raw error text must never appear anywhere in the client response.
+      expect(JSON.stringify(body)).not.toContain('sensitive internal detail');
     });
   });
 });

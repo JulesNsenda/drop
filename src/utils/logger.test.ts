@@ -25,7 +25,7 @@ describe('Logger', () => {
     resetLogger();
     jest.restoreAllMocks();
     try {
-      fs.rmSync(tempDir, { recursive: true, force: true });
+      fs.rmSync(tempDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
     } catch {
       // Ignore cleanup errors
     }
@@ -376,5 +376,80 @@ describe('createLogger factory', () => {
 
     logger1.close();
     logger2.close();
+  });
+});
+
+describe('Logger startup rotation (maxFileBytes)', () => {
+  let dir: string;
+
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'drop-logrot-'));
+    jest.spyOn(console, 'log').mockImplementation();
+  });
+
+  afterEach(() => {
+    jest.restoreAllMocks();
+    try {
+      fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+    } catch {
+      // ignore cleanup errors
+    }
+  });
+
+  it('archives an oversized existing log before opening a fresh one', async () => {
+    const logPath = path.join(dir, 'drop-svc.log');
+    fs.writeFileSync(logPath, 'A'.repeat(100)); // pre-existing 100-byte log
+
+    const logger = createLogger({
+      level: 'info',
+      console: false,
+      file: true,
+      logDir: dir,
+      maxFileBytes: 50, // cap below existing size → rotate on open
+    });
+    logger.info('fresh line');
+    await new Promise((r) => setTimeout(r, 100)); // let the stream flush
+    logger.close();
+
+    // The old content was archived intact, not sitting in the active file.
+    const archived = fs.readdirSync(dir).filter((f) => f.startsWith('drop-svc.log.'));
+    expect(archived).toHaveLength(1);
+    expect(fs.readFileSync(path.join(dir, archived[0]), 'utf-8')).toBe('A'.repeat(100));
+
+    const current = fs.readFileSync(logPath, 'utf-8');
+    expect(current).toContain('fresh line');
+    expect(current).not.toContain('A'.repeat(100));
+  });
+
+  it('does not rotate a log under the cap', () => {
+    const logPath = path.join(dir, 'drop-svc.log');
+    fs.writeFileSync(logPath, 'small');
+
+    const logger = createLogger({
+      level: 'info',
+      console: false,
+      file: true,
+      logDir: dir,
+      maxFileBytes: 1024,
+    });
+    logger.close();
+
+    expect(fs.readdirSync(dir).filter((f) => f.startsWith('drop-svc.log.'))).toHaveLength(0);
+  });
+
+  it('does not rotate when maxFileBytes is 0 (disabled)', () => {
+    const logPath = path.join(dir, 'drop-svc.log');
+    fs.writeFileSync(logPath, 'A'.repeat(100));
+
+    const logger = createLogger({
+      level: 'info',
+      console: false,
+      file: true,
+      logDir: dir,
+      maxFileBytes: 0,
+    });
+    logger.close();
+
+    expect(fs.readdirSync(dir).filter((f) => f.startsWith('drop-svc.log.'))).toHaveLength(0);
   });
 });

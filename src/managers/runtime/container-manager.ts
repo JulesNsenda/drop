@@ -35,6 +35,7 @@ import {
   DEFAULT_MEMORY,
   DEFAULT_PIDS_LIMIT,
   selectBaseImage,
+  selectImageUser,
 } from './container-config';
 import { AppType } from '../../core/detector/detector.types';
 
@@ -72,6 +73,8 @@ export class ContainerManager implements AppRuntime {
   readonly docker: Docker;
   /** Per-app log-tailer stop functions, keyed by app name. */
   private readonly logTailers: Map<string, () => void> = new Map();
+  /** Per-app log file paths, populated in start() and returned by getLogPaths(). */
+  private readonly logPaths: Map<string, AppLogPaths> = new Map();
 
   constructor(docker?: Docker) {
     this.docker = docker ?? new Docker();
@@ -125,7 +128,20 @@ export class ContainerManager implements AppRuntime {
       });
     }
 
+    // Bind-mount the Postgres socket directory so the app can reach the bundled
+    // Postgres without TCP.  The same absolute path is used inside the container
+    // so DATABASE_URL (which contains this path) resolves correctly.
+    if (spec.pgSocketDir) {
+      mounts.push({
+        Type: 'bind',
+        Source: spec.pgSocketDir,
+        Target: spec.pgSocketDir,
+        ReadOnly: true,
+      });
+    }
+
     const cmd = this.buildCmd(spec);
+    const imageUser = selectImageUser((spec.appType as AppType) ?? 'nodejs');
 
     // Docker HEALTHCHECK — only injected when the app declares a health path.
     const healthcheck = spec.healthCheckPath
@@ -147,6 +163,11 @@ export class ContainerManager implements AppRuntime {
       Cmd: cmd,
       WorkingDir: '/app',
       Env: env,
+      // Run as non-root where the base image supports it (nodejs → 'node',
+      // python/go → '1000:1000').  Static/nginx is left as root in Tier A
+      // because the entrypoint copies nginx config to /etc/nginx — Tier B will
+      // address this with a full-nginx.conf approach.
+      ...(imageUser ? { User: imageUser } : {}),
       Labels: {
         [MANAGED_LABEL]: 'true',
         'drop.app': appName,
@@ -168,10 +189,12 @@ export class ContainerManager implements AppRuntime {
         SecurityOpt: CONTAINER_SECURITY_OPT,
         // Networking — attach to the DROP bridge; no host networking
         NetworkMode: DROP_NETWORK,
-        // Restart policy — healthy-based restart when a health check is configured
-        RestartPolicy: {
-          Name: spec.autorestart === false ? 'no' : 'unless-stopped',
-        },
+        // Bounded restart: cap at 5 retries to prevent OOM-looping apps from
+        // thrashing the box.  'unless-stopped' has no cap and can overwhelm a
+        // 4 GB server with a crash-looping app.
+        RestartPolicy: spec.autorestart === false
+          ? { Name: 'no' }
+          : { Name: 'on-failure', MaximumRetryCount: 5 },
         Mounts: mounts,
       },
       ExposedPorts: { [`${hostPort}/tcp`]: {} },
@@ -183,6 +206,11 @@ export class ContainerManager implements AppRuntime {
     });
 
     await container.start();
+
+    // Remember the log paths so getLogPaths() can return them without guessing.
+    if (spec.outFile || spec.errorFile) {
+      this.logPaths.set(appName, { out: spec.outFile, err: spec.errorFile });
+    }
 
     // Wire container stdout/stderr → DROP log files (best-effort).
     if (spec.outFile || spec.errorFile) {
@@ -324,12 +352,10 @@ export class ContainerManager implements AppRuntime {
   }
 
   async getLogPaths(name: string): Promise<AppLogPaths> {
-    // Log paths are DROP-owned; populated by the log tailer started in start().
-    // Callers may read these even before logs arrive.
-    return {
-      out: this.logFilePath(name, 'out'),
-      err: this.logFilePath(name, 'err'),
-    };
+    // Return paths stored when start() was called.  Callers (e.g. the logs API)
+    // may read these before any log data arrives; returns an empty object on the
+    // first call before start() has run for this app (e.g. after a crash/restart).
+    return this.logPaths.get(name) ?? {};
   }
 
   disconnect(): void {
@@ -357,9 +383,38 @@ export class ContainerManager implements AppRuntime {
   }
 
   private async ensureNetwork(): Promise<void> {
+    let networkExists = false;
+    let iccDisabled = false;
+
     try {
-      await this.docker.getNetwork(DROP_NETWORK).inspect();
+      const net = await this.docker.getNetwork(DROP_NETWORK).inspect() as {
+        Options?: Record<string, string>;
+      };
+      networkExists = true;
+      iccDisabled = net.Options?.['com.docker.network.bridge.enable_icc'] === 'false';
     } catch {
+      // Network does not exist yet — fall through to create.
+    }
+
+    if (networkExists && iccDisabled) {
+      // Already correctly configured.
+      return;
+    }
+
+    if (networkExists && !iccDisabled) {
+      // ICC is enabled — attempt to remove and recreate.  This may fail if
+      // containers are currently attached; in that case, log and leave it —
+      // the operator should restart DROP with no containers to fix ICC.
+      try {
+        await this.docker.getNetwork(DROP_NETWORK).remove();
+        networkExists = false;
+      } catch {
+        // Network is in use; ICC misconfiguration persists until next clean restart.
+        return;
+      }
+    }
+
+    if (!networkExists) {
       await this.docker.createNetwork({
         Name: DROP_NETWORK,
         Driver: 'bridge',
@@ -470,11 +525,6 @@ export class ContainerManager implements AppRuntime {
     }
   }
 
-  private logFilePath(appName: string, type: 'out' | 'err'): string {
-    // Mirrors the log path convention used in platform.ts for PM2-mode apps.
-    return path.join('logs', 'webapps', appName, type === 'out' ? 'out.log' : 'err.log');
-  }
-
   private async startLogTailer(
     appName: string,
     container: Docker.Container,
@@ -529,9 +579,16 @@ export class ContainerManager implements AppRuntime {
   }
 
   private isNotFoundOrNotRunning(err: unknown): boolean {
+    if (this.isNotFound(err)) return true;
+    if (!(err instanceof Error)) return false;
+    const msg = err.message;
+    // A container that already exited makes stop() a no-op. Docker surfaces this
+    // as "not running" or, when already stopped, HTTP 304 "container already
+    // stopped" — both mean the container is in the desired (stopped) state.
     return (
-      this.isNotFound(err) ||
-      (err instanceof Error && err.message.includes('not running'))
+      msg.includes('not running') ||
+      msg.includes('already stopped') ||
+      msg.includes('304')
     );
   }
 }

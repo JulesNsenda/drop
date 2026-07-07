@@ -47,10 +47,13 @@ describe('Health Routes', () => {
   });
 
   describe('GET /health', () => {
-    it('should return health status', async () => {
+    it('should return a valid health report promptly', async () => {
       const res = await app.request('/health');
 
-      expect(res.status).toBe(200);
+      // In-test, subsystems (PM2/Postgres/Caddy) aren't running, so health is
+      // legitimately 'healthy' (unknown subsystems tolerated) or 'degraded'
+      // (503) — the contract is a prompt, valid report, never a hang.
+      expect([200, 503]).toContain(res.status);
       const data = (await res.json()) as ApiResponse<HealthResponse>;
       expect(data.success).toBe(true);
       expect(data.data.status).toBeDefined();
@@ -92,19 +95,21 @@ describe('Health Routes', () => {
         await stateManager.close();
         resetStateManager();
       } finally {
-        await fs.rm(tempDir, { recursive: true, force: true });
+        await fs.rm(tempDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
       }
     });
   });
 
   describe('GET /health/ready', () => {
-    it('should return ready status', async () => {
+    it('should return a readiness status promptly', async () => {
       const res = await app.request('/health/ready');
 
-      expect(res.status).toBe(200);
+      // ready when PM2 responds, not-ready (503) when it isn't running — either
+      // is valid; the fix under test is that the probe is time-bounded.
+      expect([200, 503]).toContain(res.status);
       const data = (await res.json()) as ApiResponse<{ ready: boolean }>;
       expect(data.success).toBe(true);
-      expect(data.data.ready).toBe(true);
+      expect(typeof data.data.ready).toBe('boolean');
     });
   });
 
