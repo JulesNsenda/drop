@@ -15,7 +15,14 @@ import { RouterService, getRouterService, resetRouterService } from './router';
 import { AppRuntime, AppStartSpec, getAppRuntime, resetAppRuntime } from '../managers/runtime';
 import { AppStateManager, getStateManager, resetStateManager } from '../managers/app/state-manager';
 import { AppConfigService, getAppConfigService, resetAppConfigService } from '../managers/app/app-config';
-import { PostgresServer, getPostgresServer, resetPostgresServer, DatabaseProvisioner } from '../managers/database';
+import {
+  PostgresServer,
+  getPostgresServer,
+  resetPostgresServer,
+  DatabaseProvisioner,
+  getDatabaseProvisioner,
+  resetDatabaseProvisioner,
+} from '../managers/database';
 import { CaddyServer, getCaddyServer, resetCaddyServer } from '../managers/router';
 import { SecretManager, getSecretManager, resetSecretManager } from '../managers/secret';
 import { WebhookManager, getWebhookManager, resetWebhookManager } from './webhooks';
@@ -407,6 +414,13 @@ export class DropPlatform {
       resetPostgresServer();
     }
 
+    // Reset database provisioner singleton (paired with postgresServer above
+    // since the provisioner depends on it)
+    if (this.dbProvisioner) {
+      resetDatabaseProvisioner();
+      this.dbProvisioner = null;
+    }
+
     // Stop Caddy server
     if (this.caddyServer) {
       this.logger.info('Stopping Caddy...', 'CADDY');
@@ -756,8 +770,12 @@ backup:
     await this.postgresServer.start();
     this.logger.info(`PostgreSQL running on port ${this.postgresServer.getPort()}`, 'DATABASE');
 
-    // Initialize database provisioner
-    this.dbProvisioner = new DatabaseProvisioner(this.postgresServer, this.config.dropRoot);
+    // Initialize database provisioner (module singleton so the API layer,
+    // which holds no platform reference, can reach the same instance)
+    this.dbProvisioner = getDatabaseProvisioner(this.postgresServer, this.config.dropRoot);
+    if (!this.dbProvisioner) {
+      throw new Error('Failed to initialize DatabaseProvisioner');
+    }
     await this.dbProvisioner.initialize();
 
     // Ensure internal database exists

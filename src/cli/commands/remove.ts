@@ -37,16 +37,30 @@ export function createRemoveCommand(): Command {
         const spin = output.spinner(`Removing ${appName}...`);
         spin.start();
 
-        await client.removeApp(appName);
+        const result = await client.removeApp(appName, { keepData: options.keepData });
 
         spin.succeed(`Removed ${appName}`);
 
-        if (!options.keepData) {
-          output.info('Application data and logs have been preserved');
+        switch (result.database) {
+          case 'preserved':
+            output.info("Kept the app's database (--keep-data).");
+            break;
+          case 'dropped':
+            output.info(
+              "Backed up and dropped the app's database (dump retained ~3 days under data/backup/pre-delete)."
+            );
+            break;
+          case 'retained':
+            output.warn("Could not drop the database — it was left intact (see server logs).");
+            break;
+          case 'none':
+          default:
+            // No database was provisioned for this app — nothing to report.
+            break;
         }
 
         if (output.isJsonMode()) {
-          output.json({ removed: appName, keepData: options.keepData ?? true });
+          output.json({ removed: appName, keepData: options.keepData ?? false, database: result.database });
         }
       } catch (err) {
         if (err instanceof DropApiError) {

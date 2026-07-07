@@ -19,6 +19,7 @@ import { migrateAppRuntime } from '../../managers/runtime/runtime-migrator';
 import { hasEnoughDisk, getMinFreeDiskMb } from '../../utils/disk';
 import { getStateManager, AppState } from '../../managers/app/state-manager';
 import { getAppConfigService } from '../../managers/app/app-config';
+import { getDatabaseProvisioner } from '../../managers/database';
 import { tryLogActivity } from '../../managers/activity';
 import { getAppsDirectory, isHttpsEnabled } from '../runtime-config';
 import { isPathWithin } from '../../utils/paths';
@@ -318,6 +319,51 @@ apps.delete('/:name', async (c) => {
     // Process might not exist in PM2
   }
 
+  // Dump-then-drop the app's provisioned database (if any) BEFORE removing
+  // app state. This must run before stateManager.removeApp so a same-named
+  // recreate can't race in and inherit a still-live/retained database.
+  // `?keepData=true` skips the drop entirely — the DB is left intact.
+  // Non-fatal: a failure here still lets the rest of the delete proceed; the
+  // database is simply retained (the safe outcome — see
+  // docs/plans/2026-07-07-dump-then-drop-on-delete.md).
+  const keepData = c.req.query('keepData') === 'true';
+  let dbStatus: 'dropped' | 'retained' | 'preserved' | 'none' = 'none';
+  if (keepData) {
+    dbStatus = 'preserved';
+  } else {
+    try {
+      const provisioner = getDatabaseProvisioner();
+      if (!provisioner) {
+        // In a running server the provisioner is never null. A null here means
+        // the database layer didn't initialise and we're SILENTLY skipping the
+        // drop — the exact orphan-leak this feature exists to prevent, and
+        // indistinguishable in the response from the legitimate "no database"
+        // case. Make it loud instead of collapsing it into 'none'.
+        console.warn(
+          `[apps.delete] database provisioner unavailable — DB teardown SKIPPED for ${name} (database NOT dropped)`
+        );
+        dbStatus = 'none';
+      } else {
+        const outcome = await provisioner.backupAndDeleteAppDatabase(name);
+        if (outcome.dropped) {
+          dbStatus = 'dropped';
+        } else if (outcome.reason === 'no database provisioned') {
+          dbStatus = 'none';
+        } else {
+          dbStatus = 'retained';
+        }
+        // The full reason (which may embed raw pg_dump stderr, i.e. a path leak)
+        // is logged server-side only — never returned to the client.
+        if (!outcome.dropped && outcome.reason !== 'no database provisioned') {
+          console.warn(`[apps.delete] database retained for ${name}: ${outcome.reason}`);
+        }
+      }
+    } catch (err) {
+      dbStatus = 'retained';
+      console.warn(`[apps.delete] database teardown threw for ${name}:`, err);
+    }
+  }
+
   // Remove from state
   await stateManager.removeApp(name);
 
@@ -355,7 +401,7 @@ apps.delete('/:name', async (c) => {
   }
 
   await tryLogActivity({ action: 'delete', userId: auth?.userId, username: auth?.username, appName: name });
-  return c.json(success({ message: `Application '${name}' removed` }));
+  return c.json(success({ message: `Application '${name}' removed`, database: dbStatus }));
 });
 
 // POST /apps/:name/start - Start application

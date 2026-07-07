@@ -12,6 +12,7 @@ import * as fs from 'fs/promises';
 import * as path from 'path';
 import { Pool } from 'pg';
 import { DatabaseProvisioner } from './database-provisioner';
+import { runPgDump } from './pg-dump';
 
 // jest.mock factory is hoisted — keep the factory a pure jest.fn() stub so
 // there are no TDZ references to module-level vars.  We configure the
@@ -20,7 +21,18 @@ jest.mock('pg', () => ({
   Pool: jest.fn(),
 }));
 
+// backupAndDeleteAppDatabase shells out via runPgDump — mock it so tests
+// never spawn a real pg_dump process. createRoleSql is a pure function; the
+// mock mirrors its real shape closely enough for assertions.
+jest.mock('./pg-dump', () => ({
+  runPgDump: jest.fn(),
+  createRoleSql: jest.fn(
+    (u: string, p: string) => `CREATE ROLE "${u}" LOGIN PASSWORD '${p}';`
+  ),
+}));
+
 const MockPool = Pool as jest.MockedClass<typeof Pool>;
+const mockRunPgDump = runPgDump as jest.Mock;
 
 // ── PostgresServer mock ───────────────────────────────────────────────────────
 
@@ -31,10 +43,21 @@ function makeMockServer() {
     createUser: jest.fn().mockResolvedValue(undefined),
     grantPrivileges: jest.fn().mockResolvedValue(undefined),
     getSuperuserPoolConfig: jest.fn().mockReturnValue({ host: 'localhost', port: 5433 }),
-    getPool: jest.fn(),
+    // Async, matching the real PostgresServer.getPool() signature. Defaults
+    // to a pool whose query() resolves empty rows — tests that care about
+    // specific queries override this with their own queryMock reference.
+    getPool: jest.fn().mockResolvedValue({ query: jest.fn().mockResolvedValue({ rows: [] }) }),
     getPort: jest.fn().mockReturnValue(5433),
     getSuperuserPassword: jest.fn().mockReturnValue('superpassword'),
   } as any;
+}
+
+/** Seed the bundled pg_dump binary path so the existence check in backupAndDeleteAppDatabase passes. */
+async function seedPgDumpBinary(dropRoot: string): Promise<void> {
+  const ext = process.platform === 'win32' ? '.exe' : '';
+  const binDir = path.join(dropRoot, 'apps', 'drop-svc', 'pgsql', 'bin');
+  await fs.mkdir(binDir, { recursive: true });
+  await fs.writeFile(path.join(binDir, `pg_dump${ext}`), '');
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -255,5 +278,176 @@ describe('DatabaseProvisioner.provisionAppDatabase — name-collision guard (cro
 
     expect(server.createDatabase).toHaveBeenCalledWith('drop_brand_new_app');
     expect(server.createUser).toHaveBeenCalled();
+  });
+});
+
+describe('DatabaseProvisioner.backupAndDeleteAppDatabase', () => {
+  let dropRoot: string;
+  let queryMock: jest.Mock;
+  let server: ReturnType<typeof makeMockServer>;
+  let provisioner: DatabaseProvisioner;
+  const prevRetentionEnv = process.env.DROP_PREDELETE_RETENTION_DAYS;
+
+  beforeEach(async () => {
+    delete process.env.DROP_PREDELETE_RETENTION_DAYS;
+    dropRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'drop-prov-del-'));
+    await seedPgDumpBinary(dropRoot);
+
+    queryMock = jest.fn().mockResolvedValue({ rows: [] });
+    server = makeMockServer();
+    server.getPool = jest.fn().mockResolvedValue({ query: queryMock });
+
+    provisioner = new DatabaseProvisioner(server, dropRoot);
+    mockRunPgDump.mockReset();
+  });
+
+  afterEach(async () => {
+    if (prevRetentionEnv === undefined) {
+      delete process.env.DROP_PREDELETE_RETENTION_DAYS;
+    } else {
+      process.env.DROP_PREDELETE_RETENTION_DAYS = prevRetentionEnv;
+    }
+    await fs.rm(dropRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+    jest.clearAllMocks();
+  });
+
+  function preDeleteDir(): string {
+    return path.join(dropRoot, 'data', 'backup', 'pre-delete');
+  }
+
+  async function listPreDeleteFiles(): Promise<string[]> {
+    try {
+      return await fs.readdir(preDeleteDir());
+    } catch {
+      return [];
+    }
+  }
+
+  /** Default happy-path runPgDump stub: writes a valid PGDMP-magic file to outFile. */
+  function stubSuccessfulDump(): void {
+    mockRunPgDump.mockImplementation(async (_bin: string, opts: { outFile: string }) => {
+      await fs.writeFile(opts.outFile, Buffer.from('PGDMP-fake-custom-format-dump'));
+      return { ok: true };
+    });
+  }
+
+  it('no provisioned entry -> no-op', async () => {
+    const result = await provisioner.backupAndDeleteAppDatabase('ghost-app');
+
+    expect(result).toEqual({ dropped: false, reason: 'no database provisioned' });
+    expect(mockRunPgDump).not.toHaveBeenCalled();
+    expect(queryMock).not.toHaveBeenCalled();
+  });
+
+  it('happy path: dump ok + both drops succeed -> entry removed, dump + role-sql on disk', async () => {
+    const creds = injectCredentials(provisioner, 'myapp');
+    stubSuccessfulDump();
+
+    const result = await provisioner.backupAndDeleteAppDatabase('myapp');
+
+    expect(result.dropped).toBe(true);
+    expect(result.reason).toBeUndefined();
+    expect(result.dumpPath).toBeDefined();
+    expect(provisioner.isProvisioned('myapp')).toBe(false);
+
+    const queries = queryMock.mock.calls.map((c: unknown[]) => c[0] as string);
+    expect(
+      queries.some((q) => q.includes(`DROP DATABASE IF EXISTS "${creds.database}" WITH (FORCE)`))
+    ).toBe(true);
+    expect(queries.some((q) => q.includes(`DROP USER IF EXISTS "${creds.user}"`))).toBe(true);
+
+    const files = await listPreDeleteFiles();
+    expect(files.some((f) => f.endsWith('.dump'))).toBe(true);
+    expect(files.some((f) => f.endsWith('.restore-role.sql'))).toBe(true);
+    expect(files.some((f) => f.endsWith('.partial'))).toBe(false);
+  });
+
+  it('dump fails -> no drop issued, entry retained, no leftover .partial', async () => {
+    injectCredentials(provisioner, 'myapp');
+    mockRunPgDump.mockResolvedValue({ ok: false, error: 'disk full' });
+
+    const result = await provisioner.backupAndDeleteAppDatabase('myapp');
+
+    expect(result.dropped).toBe(false);
+    expect(result.reason).toMatch(/dump failed/);
+    expect(queryMock).not.toHaveBeenCalled();
+    expect(provisioner.isProvisioned('myapp')).toBe(true);
+
+    const files = await listPreDeleteFiles();
+    expect(files.some((f) => f.endsWith('.partial'))).toBe(false);
+    expect(files.some((f) => f.endsWith('.dump'))).toBe(false);
+  });
+
+  it('pg_dump binary missing -> dropped:false, reason mentions not found, entry retained', async () => {
+    const ext = process.platform === 'win32' ? '.exe' : '';
+    await fs.rm(path.join(dropRoot, 'apps', 'drop-svc', 'pgsql', 'bin', `pg_dump${ext}`), {
+      force: true,
+    });
+    injectCredentials(provisioner, 'myapp');
+
+    const result = await provisioner.backupAndDeleteAppDatabase('myapp');
+
+    expect(result.dropped).toBe(false);
+    expect(result.reason).toMatch(/not found/);
+    expect(mockRunPgDump).not.toHaveBeenCalled();
+    expect(queryMock).not.toHaveBeenCalled();
+    expect(provisioner.isProvisioned('myapp')).toBe(true);
+  });
+
+  it('DROP USER fails after a good dump + DROP DATABASE -> dropped:false, entry retained (both-gate)', async () => {
+    injectCredentials(provisioner, 'myapp');
+    stubSuccessfulDump();
+    queryMock.mockImplementation((sql: string) => {
+      if (/DROP USER/i.test(sql)) {
+        return Promise.reject(new Error('role has dependent privileges'));
+      }
+      return Promise.resolve({ rows: [] });
+    });
+
+    const result = await provisioner.backupAndDeleteAppDatabase('myapp');
+
+    expect(result.dropped).toBe(false);
+    expect(result.reason).toMatch(/database drop ok, role drop FAILED/);
+    expect(provisioner.isProvisioned('myapp')).toBe(true);
+    // The dump itself is still committed to disk — it's the safety net,
+    // independent of whether the drop half-succeeded.
+    const files = await listPreDeleteFiles();
+    expect(files.some((f) => f.endsWith('.dump'))).toBe(true);
+  });
+
+  it('dump "succeeds" but is not a valid pg_dump archive -> verification fails, no drop, entry retained', async () => {
+    injectCredentials(provisioner, 'myapp');
+    mockRunPgDump.mockImplementation(async (_bin: string, opts: { outFile: string }) => {
+      await fs.writeFile(opts.outFile, Buffer.from('NOT-A-REAL-DUMP'));
+      return { ok: true };
+    });
+
+    const result = await provisioner.backupAndDeleteAppDatabase('myapp');
+
+    expect(result.dropped).toBe(false);
+    expect(result.reason).toMatch(/verification failed/);
+    expect(queryMock).not.toHaveBeenCalled();
+    expect(provisioner.isProvisioned('myapp')).toBe(true);
+
+    const files = await listPreDeleteFiles();
+    expect(files.some((f) => f.endsWith('.partial'))).toBe(false);
+    expect(files.some((f) => f.endsWith('.dump'))).toBe(false);
+  });
+
+  it('retention: prunes pre-delete dumps older than DROP_PREDELETE_RETENTION_DAYS (default 3 days)', async () => {
+    await fs.mkdir(preDeleteDir(), { recursive: true, mode: 0o700 });
+    const oldDump = path.join(preDeleteDir(), 'drop_old-app-2020-01-01T00-00-00-000Z.dump');
+    await fs.writeFile(oldDump, 'stale dump content');
+    const fourDaysAgo = new Date(Date.now() - 4 * 24 * 60 * 60 * 1000);
+    await fs.utimes(oldDump, fourDaysAgo, fourDaysAgo);
+
+    injectCredentials(provisioner, 'myapp');
+    stubSuccessfulDump();
+
+    await provisioner.backupAndDeleteAppDatabase('myapp');
+
+    const files = await listPreDeleteFiles();
+    expect(files).not.toContain('drop_old-app-2020-01-01T00-00-00-000Z.dump');
+    expect(files.some((f) => f.startsWith('drop_myapp-') && f.endsWith('.dump'))).toBe(true);
   });
 });
