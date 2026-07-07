@@ -6,6 +6,7 @@
 
 import { AppStatus, AppType } from '../managers/app/state-manager';
 import type { GitSource } from '../core/git-deploy/git-deploy.types';
+import type { DeployStageName, DeployStatus } from '../managers/deploy-tracker';
 
 // API Response wrapper
 export interface ApiResponse<T = unknown> {
@@ -70,6 +71,28 @@ export interface AppLogsDto {
   name: string;
   logs: string[];
   type: 'stdout' | 'stderr' | 'combined';
+}
+
+// Deploy observability DTOs (P2-4). Mirror DeployStage/DeployEpisode from
+// managers/deploy-tracker EXCEPT `userId` — that's an owner snapshot used
+// for server-side tenant filtering only and must never reach a client.
+export interface DeployStageDto {
+  stage: DeployStageName;
+  at: string;
+  durationMs?: number;
+  ok?: boolean;
+  category?: string;
+}
+
+export interface DeployEpisodeDto {
+  deployId: string;
+  appName: string;
+  trigger: 'deploy' | 'hot-reload' | 'unknown';
+  status: DeployStatus;
+  startedAt: string;
+  endedAt?: string;
+  durationMs?: number;
+  stages: DeployStageDto[];
 }
 
 // Health DTOs
