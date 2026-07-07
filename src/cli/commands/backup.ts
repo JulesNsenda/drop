@@ -24,12 +24,12 @@
  */
 
 import { Command } from 'commander';
-import { spawn } from 'child_process';
 import * as path from 'path';
 import * as fs from 'fs/promises';
 import * as fssync from 'fs';
 import { Pool } from 'pg';
 import * as output from '../utils/output';
+import { runPgDump, createRoleSql } from '../../managers/database/pg-dump';
 
 const isWindows = process.platform === 'win32';
 const DEFAULT_DROP_ROOT = isWindows ? 'C:\\drop' : '/var/drop';
@@ -110,54 +110,6 @@ async function enumerateAppDatabases(pgPassword: string | undefined): Promise<st
   }
 }
 
-/** Result of a single pg_dump invocation. */
-interface DumpResult {
-  ok: boolean;
-  error?: string;
-}
-
-/**
- * Run `pg_dump -Fc <dbName>` to `outFile`. Parameterized over dbName so it
- * can dump the internal database as well as every per-app database.
- * Intentionally omits `-C` — it's a no-op in custom format; `pg_restore
- * --create` is the real restore-time lever (and carries the per-DB
- * REVOKE CONNECT FROM PUBLIC).
- */
-function runPgDump(
-  pgDumpPath: string,
-  dbName: string,
-  outFile: string,
-  pgPassword?: string
-): Promise<DumpResult> {
-  return new Promise((resolve) => {
-    const args = [
-      '-h', '127.0.0.1',
-      '-p', String(PG_PORT),
-      '-U', 'postgres',
-      '-Fc',
-      '-f', outFile,
-      dbName,
-    ];
-    const child = spawn(pgDumpPath, args, {
-      stdio: ['ignore', 'ignore', 'pipe'],
-      // Password goes via env, never argv.
-      env: pgPassword ? { ...process.env, PGPASSWORD: pgPassword } : process.env,
-    });
-    let stderr = '';
-    child.stderr?.on('data', (d) => (stderr += d.toString()));
-    child.on('error', (err) => {
-      resolve({ ok: false, error: `pg_dump failed to run: ${err.message}` });
-    });
-    child.on('close', (code) => {
-      if (code === 0) {
-        resolve({ ok: true });
-      } else {
-        resolve({ ok: false, error: `pg_dump exited with code ${code}: ${stderr.trim()}` });
-      }
-    });
-  });
-}
-
 /**
  * Generate `databases/restore-roles.sql` from db-credentials.json — one
  * `CREATE ROLE ... LOGIN PASSWORD ...` per app user. These are all
@@ -182,11 +134,7 @@ async function generateRestoreRolesSql(
       const user = entry?.credentials?.user;
       const password = entry?.credentials?.password;
       if (typeof user !== 'string' || !user || typeof password !== 'string') continue;
-      // Defensive escaping — role names are sanitized at provisioning time and
-      // passwords are base64-with-no-quotes, but don't rely on that forever.
-      const safeUser = user.replace(/"/g, '""');
-      const safePassword = password.replace(/'/g, "''");
-      lines.push(`CREATE ROLE "${safeUser}" LOGIN PASSWORD '${safePassword}';`);
+      lines.push(createRoleSql(user, password));
     }
   } catch {
     warning = `${DB_CREDENTIALS_FILE} missing or unparseable — restore-roles.sql is empty (apps may have no databases)`;
@@ -302,7 +250,13 @@ export function createBackupCommand(): Command {
         } else {
           for (const name of dbTargets) {
             const outFile = path.join(databasesDir, `${name}.dump`);
-            const result = await runPgDump(pgDumpPath, name, outFile, pgPassword);
+            const result = await runPgDump(pgDumpPath, {
+              port: PG_PORT,
+              user: 'postgres',
+              dbName: name,
+              outFile,
+              password: pgPassword,
+            });
             if (result.ok) {
               dbDumpCount++;
             } else {
