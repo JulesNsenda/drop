@@ -231,6 +231,11 @@ export class AppStateManager {
       name,
     });
 
+    eventBus.publish('app:deleted', {
+      appId: name,
+      name,
+    });
+
     return true;
   }
 

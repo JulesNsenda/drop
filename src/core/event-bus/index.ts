@@ -31,6 +31,7 @@ export type {
   AppCreatedPayload,
   AppUpdatedPayload,
   AppRemovedPayload,
+  AppDeletedPayload,
   AppStartingPayload,
   AppStartedPayload,
   AppStoppingPayload,
