@@ -122,25 +122,48 @@ export class DatabaseProvisioner {
     const dbName = `${APP_DB_PREFIX}${safeName}`;
     const userName = `${APP_USER_PREFIX}${safeName}_user`;
 
-    // Check if already provisioned
+    // Check if already provisioned for THIS app.
     const existing = this.provisionedDatabases.get(appName);
-    if (existing && (await this.server.databaseExists(dbName))) {
+    const dbAlreadyExists = await this.server.databaseExists(dbName);
+
+    if (existing && dbAlreadyExists) {
       return existing.credentials;
     }
 
-    // Generate password
-    const password = this.generatePassword();
-
-    // Create database if it doesn't exist
-    if (!(await this.server.databaseExists(dbName))) {
-      await this.server.createDatabase(dbName);
+    // The database exists but this app has no registry entry for it. sanitizeName()
+    // is lossy — 'my-app' and 'my_app' both map to the same dbName, and names are
+    // truncated to 32 chars — so a *different* app's name can collide onto this
+    // dbName. Falling through would hit the "user already exists" branch below and
+    // ALTER that tenant's password, handing this app their live database
+    // (cross-tenant takeover + DoS). Refuse loudly. NOTE: this also fails a
+    // legitimate re-provision whose registry entry was lost (corrupt/cleared
+    // db-credentials.json, or a crash before saveCredentials); that used to
+    // self-heal by re-adopting its own DB, but that path is indistinguishable
+    // from the attack, so failing closed is the correct security call — the error
+    // tells the operator how to recover.
+    if (dbAlreadyExists) {
+      throw new Error(
+        `Database "${dbName}" already exists but is not registered to app "${appName}". ` +
+          `This is usually a name collision after sanitization (e.g. "a-b" and "a_b" both ` +
+          `map to "${dbName}", or two names sharing the first 32 characters). Refusing to ` +
+          `reuse it to avoid taking over another app's database. If no other app owns this ` +
+          `database, drop the orphan DB (or restore its db-credentials.json entry) and ` +
+          `redeploy; otherwise rename this app to a distinct name.`
+      );
     }
+
+    // Fresh provision — the database does not exist yet.
+    const password = this.generatePassword();
+    await this.server.createDatabase(dbName);
 
     // Create user and grant privileges
     try {
       await this.server.createUser(userName, password);
     } catch (error) {
-      // User might already exist - update password
+      // User might already exist - update password. (Residual: if a DB was
+      // dropped but its role lingered, a colliding name could reach here and
+      // rotate that orphan role's password. Low-risk — the collision guard above
+      // already rejects any *existing* database, so there is no live DB to adopt.)
       if (String(error).includes('already exists')) {
         const pool = await this.server.getPool();
         await pool.query(`ALTER USER "${userName}" WITH PASSWORD '${password}'`);

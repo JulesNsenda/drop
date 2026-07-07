@@ -199,3 +199,61 @@ describe('DatabaseProvisioner.provisionAppDatabase — REVOKE FROM PUBLIC', () =
     expect(revokeIdx).toBeGreaterThan(grantIdx);
   });
 });
+
+describe('DatabaseProvisioner.provisionAppDatabase — name-collision guard (cross-tenant)', () => {
+  let dropRoot: string;
+
+  beforeEach(async () => {
+    dropRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'drop-prov-'));
+    MockPool.mockImplementation(
+      () => ({ query: jest.fn().mockResolvedValue({ rows: [] }), end: jest.fn().mockResolvedValue(undefined) }) as any
+    );
+  });
+
+  afterEach(async () => {
+    await fs.rm(dropRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+    jest.clearAllMocks();
+  });
+
+  it('refuses to take over a DB that exists but is not registered to this app', async () => {
+    // Another app already created drop_my_app; this app ("my_app" — a
+    // sanitized-name collision with "my-app") has no registry entry. Reusing it
+    // would ALTER the other tenant's password and adopt their database.
+    const server = makeMockServer();
+    server.databaseExists.mockResolvedValue(true);
+    const provisioner = new DatabaseProvisioner(server, dropRoot);
+
+    await expect(provisioner.provisionAppDatabase('my_app')).rejects.toThrow(
+      /already exists but is not registered/i
+    );
+    // The throw MUST precede every mutation — proving no takeover is possible.
+    // createUser is the actual takeover vector (its "already exists" branch
+    // rotates the password); createDatabase not being called proves ordering.
+    expect(server.createDatabase).not.toHaveBeenCalled();
+    expect(server.createUser).not.toHaveBeenCalled();
+    expect(server.getPool).not.toHaveBeenCalled();
+  });
+
+  it('re-provisioning the SAME app returns its stored creds without re-creating', async () => {
+    const server = makeMockServer();
+    server.databaseExists.mockResolvedValue(true);
+    const provisioner = new DatabaseProvisioner(server, dropRoot);
+    const creds = injectCredentials(provisioner, 'my-app');
+
+    const result = await provisioner.provisionAppDatabase('my-app');
+
+    expect(result).toEqual(creds);
+    expect(server.createDatabase).not.toHaveBeenCalled();
+    expect(server.createUser).not.toHaveBeenCalled();
+  });
+
+  it('fresh provision (no existing DB) still creates the database and user', async () => {
+    const server = makeMockServer(); // databaseExists defaults to false
+    const provisioner = new DatabaseProvisioner(server, dropRoot);
+
+    await provisioner.provisionAppDatabase('brand-new-app');
+
+    expect(server.createDatabase).toHaveBeenCalledWith('drop_brand_new_app');
+    expect(server.createUser).toHaveBeenCalled();
+  });
+});
