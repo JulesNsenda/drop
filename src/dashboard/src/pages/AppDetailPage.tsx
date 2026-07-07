@@ -17,7 +17,7 @@ import {
 } from 'lucide-react';
 import { useApp, appAction, deleteApp, gitRedeploy } from '../hooks/useApi';
 import { getAuthHeaders, useAuth } from '../hooks/useAuth';
-import { appUrl } from '../api/client';
+import { appLinkInfo } from '../api/client';
 import { useToast } from '../components/Toast';
 import { useConfirm } from '../components/ConfirmDialog';
 import StatusBadge from '../components/StatusBadge';
@@ -313,12 +313,12 @@ function AppDetailPage() {
           </div>
           {app.port ? (
             <a
-              href={app.customDomain ? `https://${app.customDomain}` : appUrl(app.port)}
+              href={appLinkInfo(app).href}
               target="_blank"
               rel="noopener noreferrer"
               className="text-sm font-semibold text-drop-600 hover:underline break-all"
             >
-              {app.customDomain || `localhost:${app.port}`}
+              {appLinkInfo(app).label}
             </a>
           ) : (
             <span className="text-sm font-semibold text-gray-400">Not assigned</span>

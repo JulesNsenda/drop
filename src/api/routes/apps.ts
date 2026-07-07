@@ -21,8 +21,9 @@ import { getStateManager, AppState } from '../../managers/app/state-manager';
 import { getAppConfigService } from '../../managers/app/app-config';
 import { getDatabaseProvisioner } from '../../managers/database';
 import { tryLogActivity } from '../../managers/activity';
-import { getAppsDirectory, isHttpsEnabled } from '../runtime-config';
+import { getAppsDirectory, isHttpsEnabled, getDomainSuffix } from '../runtime-config';
 import { isPathWithin } from '../../utils/paths';
+import { isLocalhostDomain } from '../../utils/domain-validator';
 import { eventBus } from '../../core/event-bus';
 import type { RuntimeType } from '../../managers/runtime/app-runtime.types';
 
@@ -65,16 +66,31 @@ function resolveUsername(userId?: string): string | undefined {
   }
 }
 
-/** Compute the full URL for an app from its hostname (or customDomain). */
-function computeAppUrl(app: AppState): string | undefined {
-  const domain = app.customDomain || app.hostname;
-  if (!domain) return undefined;
-  // Localhost domains never get https, regardless of the platform setting
-  const isLocalhost =
-    domain === 'localhost' ||
-    domain.endsWith('.localhost') ||
-    domain === '127.0.0.1';
-  const proto = !isLocalhost && isHttpsEnabled() ? 'https' : 'http';
+/**
+ * Compute an app's externally-reachable URL.
+ *
+ * The served host is DERIVED, never read from `app.hostname` — that field is the
+ * persisted `<name>.localhost` placeholder; the host an app actually serves on is
+ * computed at route time and never stored (P0-6 hijack guard — see
+ * `AppConfigService.getDomainOwners`). Priority: dashboard-set `customDomain` >
+ * drop.yaml `domains` (persisted in app config) > default `<name>.<domainSuffix>`
+ * (mirrors `platform.ts` `handleConfigureRoute`). Returns `undefined` for a
+ * localhost host — there is no globally-reachable URL, so the dashboard falls back
+ * to a direct host:port link derived from the viewer's own location.
+ */
+export function computeAppUrl(app: AppState): string | undefined {
+  let configDomains: string[] | undefined;
+  let tlsDisabled = false;
+  try {
+    const cfg = getAppConfigService().getConfig(app.name);
+    configDomains = cfg?.domains;
+    tlsDisabled = cfg?.tls?.disabled === true;
+  } catch {
+    // Config service not initialised (e.g. isolated route tests) — use default host.
+  }
+  const domain = app.customDomain || configDomains?.[0] || `${app.name}.${getDomainSuffix()}`;
+  if (isLocalhostDomain(domain)) return undefined;
+  const proto = isHttpsEnabled() && !tlsDisabled ? 'https' : 'http';
   return `${proto}://${domain}`;
 }
 

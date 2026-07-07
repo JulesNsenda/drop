@@ -16,6 +16,7 @@ import { useToast } from '../components/Toast';
 import { useConfirm } from '../components/ConfirmDialog';
 import { getAuthHeaders } from '../hooks/useAuth';
 import { gitDeploy, getGitTokens, addGitToken, deleteGitToken, GitTokenInfo, useHealth } from '../hooks/useApi';
+import { appLinkInfo } from '../api/client';
 
 type Tab = 'github' | 'upload';
 type DeployStatus = 'idle' | 'deploying' | 'success' | 'error';
@@ -113,8 +114,8 @@ function DeployPage() {
             else if (appStatus === 'running') {
               clearInterval(poll);
               setStatus('success');
-              const url = json.data.customDomain || (json.data.port ? `localhost:${json.data.port}` : '');
-              setMessage(`${appName} is live${url ? ` at ${url}` : ''}`);
+              const { label } = appLinkInfo(json.data);
+              setMessage(`${appName} is live${label ? ` at ${label}` : ''}`);
               toast('success', `${appName} deployed!`);
             } else if (appStatus === 'errored') {
               clearInterval(poll);
