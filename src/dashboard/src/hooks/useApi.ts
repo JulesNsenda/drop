@@ -18,6 +18,8 @@ export interface App {
   pid?: number;
   path: string;
   hostname?: string;
+  /** Server-computed external URL (e.g. https://app.example.com); absent on localhost boxes. */
+  url?: string;
   framework?: string;
   createdAt: string;
   updatedAt: string;
