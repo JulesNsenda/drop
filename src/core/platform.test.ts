@@ -106,6 +106,8 @@ jest.mock('../managers/database', () => {
     getPostgresServer: jest.fn().mockReturnValue(mockPostgresServer),
     resetPostgresServer: jest.fn(),
     DatabaseProvisioner: jest.fn().mockImplementation(() => mockDbProvisioner),
+    getDatabaseProvisioner: jest.fn().mockReturnValue(mockDbProvisioner),
+    resetDatabaseProvisioner: jest.fn(),
   };
 });
 

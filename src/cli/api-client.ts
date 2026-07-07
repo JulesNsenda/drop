@@ -112,8 +112,12 @@ export class DropApiClient {
     await this.request('POST', `/apps/${encodeURIComponent(name)}/restart`);
   }
 
-  async removeApp(name: string): Promise<void> {
-    await this.request('DELETE', `/apps/${encodeURIComponent(name)}`);
+  async removeApp(
+    name: string,
+    opts?: { keepData?: boolean }
+  ): Promise<{ message?: string; database?: 'dropped' | 'retained' | 'preserved' | 'none' }> {
+    const qs = opts?.keepData ? '?keepData=true' : '';
+    return this.request('DELETE', `/apps/${encodeURIComponent(name)}${qs}`);
   }
 
   async getLogs(name: string, lines = 100): Promise<string[]> {
