@@ -444,17 +444,47 @@ See `.env.example` for all security-relevant settings and
 
 DROP keeps critical state in the file stores under `data/drop-svc/`
 (credentials, encrypted secrets, the encryption key, webhooks, app state) and
-in the internal PostgreSQL database. Snapshot all of it with:
+in PostgreSQL — both the internal `drop_internal` database and **every
+provisioned per-app database**. Snapshot all of it with:
 
 ```bash
 drop backup            # writes data/backup/backup-<timestamp>/
 drop backup --keep 14  # keep the newest 14, prune the rest
 ```
 
-A backup contains the JSON/YAML stores, `encryption.key`, and a `pg_dump` of
-the internal database. **Schedule it yourself** (cron / Task Scheduler) — DROP
-does not run backups automatically. To restore, stop DROP, copy the files back
-into `data/drop-svc/` (and `data/appconf/webapps/`), and `pg_restore` the dump.
+A backup contains the JSON/YAML stores, `encryption.key`, a `pg_dump` of
+`drop_internal`, and a `pg_dump -Fc` of **each per-app database** under
+`databases/` (plus a generated `databases/restore-roles.sql` that recreates
+the app DB roles). **Schedule it yourself** (cron / Task Scheduler) — DROP
+does not run backups automatically. The backup command exits non-zero if any
+dump — per-app, internal, or the database enumeration itself — fails, so a
+cron job that only checks the exit code will still catch a partial backup.
+
+**Caveat: backups are same-platform only.** A backup taken on Windows will
+not restore on Linux (and vice versa) — the bundled PostgreSQL binaries and
+data layout are platform-specific.
+
+### Restore
+
+Stop DROP, then restore the file stores and PostgreSQL data from a backup
+directory (`data/backup/backup-<timestamp>/`):
+
+```bash
+BIN=<dropRoot>/apps/drop-svc/pgsql/bin ; export PGPASSWORD="$(cat .pg-superuser)"
+# 1. Recreate app roles (clean server runs clean; on a re-run, "role already exists" is expected/benign)
+"$BIN/psql" -h 127.0.0.1 -p 5433 -U postgres -d postgres -f databases/restore-roles.sql
+# 2. Recreate + restore each per-app database (--create makes the DB AND restores REVOKE CONNECT)
+"$BIN/pg_restore" -h 127.0.0.1 -p 5433 -U postgres --create -d postgres databases/drop_<app>.dump
+#    (re-run: add --clean --if-exists ; check exit codes, don't ignore stderr)
+# 3. Restore file stores + drop_internal as before.
+```
+
+Use the backup's own `.pg-superuser` file for `PGPASSWORD` (it holds the
+superuser password at the time the backup was taken) and the bundled
+`pg_restore`/`psql` under `apps/drop-svc/pgsql/bin` — do not use a system
+Postgres client, since major-version mismatches can corrupt the restore.
+Restore `drop_internal` and the remaining file stores (`data/drop-svc/`,
+`data/appconf/webapps/`) the same way as before per-app DB backups existed.
 
 ## Upgrading
 
