@@ -36,7 +36,6 @@ import {
   DEFAULT_MEMORY,
   DEFAULT_PIDS_LIMIT,
   selectBaseImage,
-  selectCapAdd,
   selectImageUser,
 } from './container-config';
 import { AppType } from '../../core/detector/detector.types';
@@ -144,7 +143,6 @@ export class ContainerManager implements AppRuntime {
 
     const cmd = this.buildCmd(spec);
     const imageUser = selectImageUser((spec.appType as AppType) ?? 'nodejs');
-    const capAdd = selectCapAdd((spec.appType as AppType) ?? 'nodejs');
 
     // Docker HEALTHCHECK — only injected when the app declares a health path.
     const healthcheck = spec.healthCheckPath
@@ -166,10 +164,9 @@ export class ContainerManager implements AppRuntime {
       Cmd: cmd,
       WorkingDir: '/app',
       Env: env,
-      // Run as non-root where the base image supports it (nodejs → 'node',
-      // python/go → '1000:1000').  Static/nginx is left as root in Tier A
-      // because the entrypoint copies nginx config to /etc/nginx — Tier B will
-      // address this with a full-nginx.conf approach.
+      // Run as non-root everywhere: nodejs → 'node', python/go → '1000:1000',
+      // static/spa → '101:101' (the nginx user; DROP passes a full nginx.conf
+      // via -c so nothing in the container needs root).
       ...(imageUser ? { User: imageUser } : {}),
       Labels: {
         [MANAGED_LABEL]: 'true',
@@ -187,10 +184,8 @@ export class ContainerManager implements AppRuntime {
         CpuQuota: cpuQuota,
         CpuPeriod: 100_000,
         PidsLimit: DEFAULT_PIDS_LIMIT,
-        // Security — drop everything, then grant back only the minimal set
-        // the app type needs (root-nginx for static/spa; empty otherwise).
+        // Security — every container runs non-root with zero capabilities.
         CapDrop: CONTAINER_CAP_DROP,
-        ...(capAdd.length > 0 ? { CapAdd: capAdd } : {}),
         SecurityOpt: CONTAINER_SECURITY_OPT,
         // Networking — attach to the DROP bridge; no host networking
         NetworkMode: DROP_NETWORK,
