@@ -31,8 +31,23 @@ describe('buildNginxConf', () => {
     expect(conf).toContain('gzip on;');
   });
 
-  it('produces a valid server block structure', () => {
+  it('produces a full config with events and http blocks', () => {
     const conf = buildNginxConf(5000, 'dist');
-    expect(conf.trim()).toMatch(/^server \{[\s\S]+\}$/);
+    expect(conf).toMatch(/events \{[\s\S]+\}/);
+    expect(conf).toMatch(/http \{[\s\S]+server \{[\s\S]+\}[\s\S]+\}/);
+  });
+
+  it('is runnable unprivileged: pid and temp paths under /tmp, no user directive', () => {
+    const conf = buildNginxConf(3000, '');
+    expect(conf).toContain('pid /tmp/nginx.pid;');
+    expect(conf).toContain('client_body_temp_path /tmp/client_temp;');
+    expect(conf).toContain('proxy_temp_path /tmp/proxy_temp;');
+    expect(conf).not.toMatch(/^\s*user /m);
+  });
+
+  it('logs to stdout/stderr so the container log tailer captures them', () => {
+    const conf = buildNginxConf(3000, '');
+    expect(conf).toContain('error_log stderr warn;');
+    expect(conf).toContain('access_log /dev/stdout;');
   });
 });

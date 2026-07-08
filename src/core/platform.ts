@@ -2127,12 +2127,12 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         await fs.writeFile(nginxConfPath, nginxConf, 'utf-8');
         this.logger.info(`Wrote nginx.conf for ${appName} → port ${port}`, 'STATIC');
 
+        // Tier B: nginx runs unprivileged (uid 101, zero caps), so the full
+        // config is passed via -c from the bind-mounted data dir instead of
+        // being copied into root-owned /etc/nginx.
         script = '/bin/sh';
         interpreter = 'none';
-        args = [
-          '-c',
-          `cp ${nginxConfPath} /etc/nginx/conf.d/default.conf && nginx -g 'daemon off;'`,
-        ];
+        args = ['-c', `nginx -c ${nginxConfPath} -g 'daemon off;'`];
       } else {
         const serveDir = path.join(appPath, detection.suggestedConfig?.outputDirectory || '.');
         // eslint-disable-next-line @typescript-eslint/no-require-imports
