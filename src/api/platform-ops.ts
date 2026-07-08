@@ -1,0 +1,54 @@
+/**
+ * Platform operations exposed to API routes.
+ *
+ * The platform registers these when it starts the API server so route
+ * handlers (which are imported as singletons and don't receive a platform
+ * reference) can invoke platform-level orchestration. A direct import of
+ * DropPlatform from a route file would be circular (platform → api → routes),
+ * hence this seam — same pattern as runtime-config.ts.
+ *
+ * Unlike runtime-config there is no fallback: routes that need an operation
+ * must 503 when it is unwired (standalone ApiServer in tests). Falling back
+ * to raw runtime calls would silently reintroduce the stale-env restart bug
+ * these ops exist to fix.
+ */
+
+import { AppProcessInfo } from '../managers/runtime';
+
+/** Thrown by platform ops when the app has a deploy/build/restart in flight. */
+export class AppInProgressError extends Error {
+  readonly code = 'APP_IN_PROGRESS';
+
+  constructor(appName: string) {
+    super(`Application '${appName}' has an operation in progress`);
+    this.name = 'AppInProgressError';
+  }
+}
+
+export interface PlatformOps {
+  /**
+   * Stop-if-running, rebuild the start spec from current state (secrets,
+   * DATABASE_URL, DROP_DATA_DIR, dependency env), and start the app on its
+   * existing port. Resolves once the app is running again.
+   *
+   * Serves both the start and restart routes: on a stopped app it degenerates
+   * to a fresh start. Rejects with AppInProgressError when the app is busy.
+   */
+  restartApp(appName: string): Promise<AppProcessInfo>;
+}
+
+let platformOps: PlatformOps | null = null;
+
+export function setPlatformOps(ops: PlatformOps): void {
+  platformOps = ops;
+}
+
+/** Null when no platform is wired (e.g. ApiServer constructed directly in tests). */
+export function getPlatformOps(): PlatformOps | null {
+  return platformOps;
+}
+
+/** Called from platform.stop() and test teardown so ops never leak across instances. */
+export function resetPlatformOps(): void {
+  platformOps = null;
+}

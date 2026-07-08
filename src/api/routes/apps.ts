@@ -13,6 +13,7 @@ import { AuthContext, listUsers, getUserById } from '../middleware/auth';
 import { canAccess } from '../access';
 import { isValidAppName, validateAppName } from '../middleware/validate';
 import { getAppRuntime } from '../../managers/runtime';
+import { getPlatformOps, AppInProgressError } from '../platform-ops';
 import { getSecretManager } from '../../managers/secret';
 import { getDeployTracker } from '../../managers/deploy-tracker';
 import { migrateAppRuntime } from '../../managers/runtime/runtime-migrator';
@@ -439,27 +440,23 @@ apps.post('/:name/start', async (c) => {
     throw new NotFoundError(`Application '${name}' not found`);
   }
 
-  const pm = getAppRuntime();
+  const ops = getPlatformOps();
+  if (!ops) {
+    return c.json(error(ErrorCodes.SERVICE_UNAVAILABLE, 'Platform operations unavailable'), 503);
+  }
 
   try {
-    const status = await pm.start({
-      name,
-      script: 'index.js',
-      cwd: app.path,
-      port: app.port,
-      env: { NODE_ENV: 'production' },
-    });
-
-    await stateManager.setAppStatus(name, 'running', {
-      port: status.port ?? undefined,
-      pid: status.pid ?? undefined,
-    });
-
+    // start-on-a-stopped-app and restart are the same platform operation
+    // (delete-then-fresh-start with a rebuilt spec); only the activity-log
+    // action and response message differ.
+    const status = await ops.restartApp(name);
     await tryLogActivity({ action: 'start', userId: auth?.userId, username: auth?.username, appName: name });
     return c.json(success({ message: `Application '${name}' started`, status }));
   } catch (err) {
+    if (err instanceof AppInProgressError) {
+      return c.json(error(ErrorCodes.CONFLICT, err.message), 409);
+    }
     const message = err instanceof Error ? err.message : 'Failed to start';
-    await stateManager.setAppStatus(name, 'errored', { error: message });
     return c.json(error(ErrorCodes.INTERNAL_ERROR, message), 500);
   }
 });
@@ -500,19 +497,20 @@ apps.post('/:name/restart', async (c) => {
     throw new NotFoundError(`Application '${name}' not found`);
   }
 
-  const pm = getAppRuntime();
+  const ops = getPlatformOps();
+  if (!ops) {
+    return c.json(error(ErrorCodes.SERVICE_UNAVAILABLE, 'Platform operations unavailable'), 503);
+  }
 
   try {
-    const status = await pm.restart(name);
-    await stateManager.setAppStatus(name, 'running', {
-      pid: status.pid ?? undefined,
-    });
-
+    const status = await ops.restartApp(name);
     await tryLogActivity({ action: 'restart', userId: auth?.userId, username: auth?.username, appName: name });
     return c.json(success({ message: `Application '${name}' restarted`, status }));
   } catch (err) {
+    if (err instanceof AppInProgressError) {
+      return c.json(error(ErrorCodes.CONFLICT, err.message), 409);
+    }
     const message = err instanceof Error ? err.message : 'Failed to restart';
-    await stateManager.setAppStatus(name, 'errored', { error: message });
     return c.json(error(ErrorCodes.INTERNAL_ERROR, message), 500);
   }
 });
