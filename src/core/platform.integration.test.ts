@@ -306,6 +306,121 @@ describe('Platform integration (P2-1)', () => {
     inProgress.delete('site'); // cleanup so afterEach stop()/drain doesn't wait
   }, 20000);
 
+  // Scenario 5 (bypass): an explicit redeploy (git-deploy's deterministic
+  // publish, bugfix/DROP-git-redeploy-deterministic) must still rebuild even
+  // while the post-deploy cooldown is armed. Deliberately does NOT call
+  // appDeployTimes.clear() — that's the point of this test.
+  it('bypasses the deploy cooldown for an explicit redeploy (bypassCooldown: true)', async () => {
+    platform = makePlatform();
+    await platform.start();
+    const appPath = await createStaticApp('site');
+    eventBus.publish('app:detected', { name: 'site', path: appPath, type: undefined });
+    await waitFor(() => getStateManager().getApp('site')?.status === 'running');
+    const pidBefore = fakeRuntime.pidOf('site');
+    const startsBefore = fakeRuntime.startCount;
+
+    await fs.writeFile(path.join(appPath, 'index.html'), '<h1>site v2</h1>');
+    eventBus.publish('app:update', {
+      name: 'site',
+      path: appPath,
+      reason: 'git redeploy',
+      bypassCooldown: true,
+    });
+
+    await waitFor(
+      () => fakeRuntime.runningNames().includes('site') && fakeRuntime.pidOf('site') !== pidBefore
+    );
+    expect(fakeRuntime.startCount).toBe(startsBefore + 1);
+    expect(getStateManager().getApp('site')?.status).toBe('running');
+  }, 20000);
+
+  // Scenario 5 (control): the same cooldown window, but a watcher-shaped
+  // update with no bypassCooldown flag must still be swallowed — proves the
+  // bypass didn't accidentally widen to the normal watcher path.
+  it('control: a watcher-shaped update with no bypassCooldown is still swallowed by the cooldown', async () => {
+    platform = makePlatform();
+    await platform.start();
+    const appPath = await createStaticApp('site');
+    eventBus.publish('app:detected', { name: 'site', path: appPath, type: undefined });
+    await waitFor(() => getStateManager().getApp('site')?.status === 'running');
+    const startsBefore = fakeRuntime.startCount;
+
+    await fs.writeFile(path.join(appPath, 'index.html'), '<h1>site v2</h1>');
+    eventBus.publish('app:update', {
+      name: 'site',
+      path: appPath,
+      reason: 'File changed: index.html',
+    });
+    await new Promise((r) => setTimeout(r, 200)); // give the (dropped) handler time to run
+
+    expect(fakeRuntime.startCount).toBe(startsBefore); // cooldown dropped it: no rebuild/start
+    expect(getStateManager().getApp('site')?.status).toBe('running');
+  }, 20000);
+
+  // Scenario 6: a redeploy must never resurrect a user-stopped app, even with
+  // bypassCooldown — the stopped-app guard applies before the cooldown check.
+  it('does not resurrect a user-stopped app even with bypassCooldown', async () => {
+    platform = makePlatform();
+    await platform.start();
+    const appPath = await createStaticApp('site');
+    eventBus.publish('app:detected', { name: 'site', path: appPath, type: undefined });
+    await waitFor(() => getStateManager().getApp('site')?.status === 'running');
+
+    await getStateManager().setAppStatus('site', 'stopped');
+    const startsBefore = fakeRuntime.startCount;
+
+    eventBus.publish('app:update', {
+      name: 'site',
+      path: appPath,
+      reason: 'git redeploy',
+      bypassCooldown: true,
+    });
+    await new Promise((r) => setTimeout(r, 200)); // give the (dropped) handler time to run
+
+    expect(fakeRuntime.startCount).toBe(startsBefore);
+    expect(getStateManager().getApp('site')?.status).toBe('stopped');
+  }, 20000);
+
+  // Scenario 7 (errored-but-alive fix): an app can be marked 'errored' while
+  // its process is still alive (the hot-reload catch fires after runtime.start
+  // succeeded, e.g. a post-start failure) — a redeploy must still stop the old
+  // process and swap in the new build, not silently no-op because
+  // wasRunning was false.
+  it('stops and restarts an errored-but-alive app on update', async () => {
+    platform = makePlatform();
+    await platform.start();
+    const appPath = await createStaticApp('site');
+    eventBus.publish('app:detected', { name: 'site', path: appPath, type: undefined });
+    await waitFor(() => getStateManager().getApp('site')?.status === 'running');
+
+    // Model the errored-but-alive state: status flips to 'errored' but the
+    // FakeRuntime process is left untouched (still reporting 'running').
+    await getStateManager().setAppStatus('site', 'errored', { error: 'simulated post-start failure' });
+    (platform as unknown as { appDeployTimes: Map<string, number> }).appDeployTimes.clear();
+
+    const stopSpy = jest.spyOn(fakeRuntime, 'stop');
+    const startsBefore = fakeRuntime.startCount;
+    const pidBefore = fakeRuntime.pidOf('site');
+
+    try {
+      eventBus.publish('app:update', {
+        name: 'site',
+        path: appPath,
+        reason: 'git redeploy',
+        bypassCooldown: true,
+      });
+
+      await waitFor(
+        () => fakeRuntime.runningNames().includes('site') && fakeRuntime.pidOf('site') !== pidBefore
+      );
+      expect(stopSpy).toHaveBeenCalledWith('site');
+      expect(fakeRuntime.startCount).toBe(startsBefore + 1);
+      expect(getStateManager().getApp('site')?.status).toBe('running');
+    } finally {
+      stopSpy.mockRestore();
+    }
+  }, 20000);
+
   // P2-4: a REAL deploy through the real detector/builder/state-transitions must
   // produce a retrievable, owner-scoped deploy episode. This is the seam the
   // tracker's own unit tests (synthetic events) and the route tests (mocked
