@@ -36,6 +36,7 @@ import {
   DEFAULT_MEMORY,
   DEFAULT_PIDS_LIMIT,
   selectBaseImage,
+  selectCapAdd,
   selectImageUser,
 } from './container-config';
 import { AppType } from '../../core/detector/detector.types';
@@ -143,6 +144,7 @@ export class ContainerManager implements AppRuntime {
 
     const cmd = this.buildCmd(spec);
     const imageUser = selectImageUser((spec.appType as AppType) ?? 'nodejs');
+    const capAdd = selectCapAdd((spec.appType as AppType) ?? 'nodejs');
 
     // Docker HEALTHCHECK — only injected when the app declares a health path.
     const healthcheck = spec.healthCheckPath
@@ -185,8 +187,10 @@ export class ContainerManager implements AppRuntime {
         CpuQuota: cpuQuota,
         CpuPeriod: 100_000,
         PidsLimit: DEFAULT_PIDS_LIMIT,
-        // Security
+        // Security — drop everything, then grant back only the minimal set
+        // the app type needs (root-nginx for static/spa; empty otherwise).
         CapDrop: CONTAINER_CAP_DROP,
+        ...(capAdd.length > 0 ? { CapAdd: capAdd } : {}),
         SecurityOpt: CONTAINER_SECURITY_OPT,
         // Networking — attach to the DROP bridge; no host networking
         NetworkMode: DROP_NETWORK,
