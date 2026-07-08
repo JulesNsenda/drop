@@ -21,7 +21,7 @@ import { eventBus } from '../../core/event-bus';
 import {
   DROP_NETWORK,
   selectBaseImage,
-  selectCapAdd,
+  selectImageUser,
   DEFAULT_PIDS_LIMIT,
   CONTAINER_CAP_DROP,
   CONTAINER_SECURITY_OPT,
@@ -134,11 +134,11 @@ describe('ContainerManager', () => {
       expect(call.HostConfig.CapDrop).toEqual(CONTAINER_CAP_DROP);
       expect(call.HostConfig.SecurityOpt).toEqual(CONTAINER_SECURITY_OPT);
       expect(call.HostConfig.PidsLimit).toBe(DEFAULT_PIDS_LIMIT);
-      // Non-static apps get zero capabilities back.
+      // No capabilities are ever granted back — all app types run non-root.
       expect(call.HostConfig.CapAdd).toBeUndefined();
     });
 
-    it('grants root-nginx the minimal caps for static apps (chown/setuid/setgid)', async () => {
+    it('runs static apps as the unprivileged nginx user with zero capabilities', async () => {
       const docker = makeDockerMock() as any;
       const mgr = new ContainerManager(docker);
 
@@ -147,14 +147,15 @@ describe('ContainerManager', () => {
         name: 'my-site',
         script: '/bin/sh',
         interpreter: 'none',
-        args: ['-c', "nginx -g 'daemon off;'"],
+        args: ['-c', "nginx -c /data/nginx.conf -g 'daemon off;'"],
         appType: 'static',
       });
 
       const call = docker.createContainer.mock.calls[0][0];
-      expect(call.HostConfig.CapDrop).toEqual(CONTAINER_CAP_DROP);
-      expect(call.HostConfig.CapAdd).toEqual(['CHOWN', 'SETUID', 'SETGID']);
       expect(call.Image).toBe('nginx:alpine');
+      expect(call.User).toBe('101:101');
+      expect(call.HostConfig.CapDrop).toEqual(CONTAINER_CAP_DROP);
+      expect(call.HostConfig.CapAdd).toBeUndefined();
     });
 
     it('publishes app:started with the port so the router configures the app route under docker isolation', async () => {
@@ -530,15 +531,15 @@ describe('selectBaseImage', () => {
   });
 });
 
-describe('selectCapAdd', () => {
-  it('grants CHOWN/SETUID/SETGID to static and spa (root nginx needs them)', () => {
-    expect(selectCapAdd('static')).toEqual(['CHOWN', 'SETUID', 'SETGID']);
-    expect(selectCapAdd('spa')).toEqual(['CHOWN', 'SETUID', 'SETGID']);
+describe('selectImageUser', () => {
+  it('runs static and spa as the nginx user (uid/gid 101)', () => {
+    expect(selectImageUser('static')).toBe('101:101');
+    expect(selectImageUser('spa')).toBe('101:101');
   });
 
-  it('grants no capabilities to non-static types', () => {
-    expect(selectCapAdd('nodejs')).toEqual([]);
-    expect(selectCapAdd('python')).toEqual([]);
-    expect(selectCapAdd('go')).toEqual([]);
+  it('runs nodejs as the node user and python/go as 1000:1000', () => {
+    expect(selectImageUser('nodejs')).toBe('node');
+    expect(selectImageUser('python')).toBe('1000:1000');
+    expect(selectImageUser('go')).toBe('1000:1000');
   });
 });
