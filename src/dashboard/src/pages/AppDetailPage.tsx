@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect } from 'react';
 import { useParams, useNavigate, Link } from 'react-router-dom';
 import {
   ArrowLeft,
@@ -7,10 +7,8 @@ import {
   RotateCw,
   Trash2,
   ExternalLink,
-  Terminal,
   Clock,
   Folder,
-  Download,
   Key,
   Plus,
   X,
@@ -22,6 +20,7 @@ import { useToast } from '../components/Toast';
 import { useConfirm } from '../components/ConfirmDialog';
 import StatusBadge from '../components/StatusBadge';
 import DeployTimeline from '../components/DeployTimeline';
+import LogViewer from '../components/LogViewer';
 
 function AppDetailPage() {
   const { name } = useParams<{ name: string }>();
@@ -31,38 +30,13 @@ function AppDetailPage() {
   const { app, loading, error, refresh } = useApp(name || '');
   const { toast } = useToast();
   const confirmDialog = useConfirm();
-  const [logs, setLogs] = useState<string[]>([]);
-  const [logsLoading, setLogsLoading] = useState(true);
   const [actionLoading, setActionLoading] = useState<string | null>(null);
-  const logsEndRef = useRef<HTMLDivElement>(null);
 
   // Env vars state — keys only; values are never returned by the API
   const [envVars, setEnvVars] = useState<string[]>([]);
   const [envLoading, setEnvLoading] = useState(false);
   const [newKey, setNewKey] = useState('');
   const [newValue, setNewValue] = useState('');
-
-  // Fetch logs
-  useEffect(() => {
-    if (!name) return;
-    const fetchLogs = async () => {
-      try {
-        const res = await fetch(`/api/v1/logs/${name}?lines=100`, { headers: getAuthHeaders() });
-        const json = await res.json();
-        if (json.success && json.data?.logs) {
-          setLogs(json.data.logs);
-        }
-      } catch {
-        // Ignore
-      } finally {
-        setLogsLoading(false);
-      }
-    };
-
-    fetchLogs();
-    const interval = setInterval(fetchLogs, 3000);
-    return () => clearInterval(interval);
-  }, [name]);
 
   // Fetch env vars
   useEffect(() => {
@@ -83,14 +57,6 @@ function AppDetailPage() {
     };
     fetchEnv();
   }, [name]);
-
-  // Auto-scroll logs within the log container only
-  useEffect(() => {
-    const container = logsEndRef.current?.parentElement;
-    if (container) {
-      container.scrollTop = container.scrollHeight;
-    }
-  }, [logs]);
 
   const handleAction = async (action: 'start' | 'stop' | 'restart') => {
     if (!name) return;
@@ -182,28 +148,6 @@ function AppDetailPage() {
   const formatDate = (dateString?: string) => {
     if (!dateString) return 'Never';
     return new Date(dateString).toLocaleString();
-  };
-
-  const handleDownloadLogs = async () => {
-    if (!name) return;
-    try {
-      const res = await fetch(`/api/v1/logs/${name}?lines=1000`, { headers: getAuthHeaders() });
-      const json = await res.json();
-      if (json.success && json.data?.logs) {
-        const content = json.data.logs.join('\n');
-        const blob = new Blob([content], { type: 'text/plain' });
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = `${name}-${new Date().toISOString().split('T')[0]}.log`;
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
-        URL.revokeObjectURL(url);
-      }
-    } catch {
-      toast('error', 'Failed to download logs');
-    }
   };
 
   if (loading && !app) {
@@ -491,35 +435,7 @@ function AppDetailPage() {
       </div>
 
       {/* Logs */}
-      <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700">
-        <div className="flex items-center justify-between px-4 py-3 border-b border-gray-200 dark:border-gray-700">
-          <div className="flex items-center gap-2">
-            <Terminal className="w-4 h-4 text-gray-500 dark:text-gray-400" />
-            <h2 className="font-semibold text-gray-900 dark:text-white">Logs</h2>
-            {logsLoading && <span className="text-xs text-gray-400">(loading...)</span>}
-          </div>
-          <button
-            onClick={handleDownloadLogs}
-            className="flex items-center gap-1 px-2 py-1 text-sm text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-white hover:bg-gray-100 dark:hover:bg-gray-700 rounded"
-            title="Download logs"
-          >
-            <Download className="w-4 h-4" />
-            Download
-          </button>
-        </div>
-        <div className="h-96 overflow-auto bg-gray-900 dark:bg-gray-950 p-4 font-mono text-sm">
-          {logs.length === 0 ? (
-            <p className="text-gray-500">No logs available</p>
-          ) : (
-            logs.map((line, i) => (
-              <div key={i} className="text-gray-300 whitespace-pre-wrap break-all">
-                {line}
-              </div>
-            ))
-          )}
-          <div ref={logsEndRef} />
-        </div>
-      </div>
+      <LogViewer appName={app.name} appStatus={app.status} />
     </div>
   );
 }
