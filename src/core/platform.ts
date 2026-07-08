@@ -12,7 +12,7 @@ import { WatcherService } from './watcher';
 import { DetectorService, getDetector, parseDropYaml, DetectionResult } from './detector';
 import { BuilderService, getBuilder } from './builder';
 import { RouterService, getRouterService, resetRouterService } from './router';
-import { AppRuntime, AppStartSpec, getAppRuntime, resetAppRuntime } from '../managers/runtime';
+import { AppRuntime, AppProcessInfo, AppStartSpec, getAppRuntime, resetAppRuntime } from '../managers/runtime';
 import { AppStateManager, getStateManager, resetStateManager } from '../managers/app/state-manager';
 import { AppConfigService, getAppConfigService, resetAppConfigService } from '../managers/app/app-config';
 import {
@@ -30,6 +30,7 @@ import { GitDeployService, getGitDeployService, resetGitDeployService } from './
 import { getActivityLog, resetActivityLog } from '../managers/activity';
 import { getDeployTracker, resetDeployTracker } from '../managers/deploy-tracker';
 import { ApiServer, createApiServer } from '../api';
+import { AppInProgressError, setPlatformOps, resetPlatformOps } from '../api/platform-ops';
 import { Logger, createLogger } from '../utils/logger';
 import {
   validateDomain,
@@ -432,12 +433,14 @@ export class DropPlatform {
     for (const [, timer] of this.healthProbers) clearInterval(timer);
     this.healthProbers.clear();
 
-    // Reset secret manager, webhook manager, git deploy service, and build logs
+    // Reset secret manager, webhook manager, git deploy service, build logs,
+    // and the platform-ops seam (routes must 503 once the platform is down).
     resetSecretManager();
     resetWebhookManager();
     resetGitDeployService();
     resetActivityLog();
     resetBuildLogService();
+    resetPlatformOps();
 
     // Tear down the deploy tracker's subscription only now — after the drain
     // above completes — so a deploy that finishes during the drain window
@@ -941,6 +944,10 @@ backup:
 
     await this.apiServer.initialize();
     await this.apiServer.start();
+
+    // Expose restart/start orchestration to the API routes via the
+    // platform-ops seam — a direct import would be circular (platform → api → routes).
+    setPlatformOps({ restartApp: (name) => this.restartApp(name) });
 
     this.logger.info(`API server running on port ${this.config.apiPort}`, 'API');
     if (this.config.enableApiAuth) {
@@ -1807,42 +1814,23 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         return;
       }
 
-      // Build succeeded — now stop the old version and swap in the new one
+      // Build succeeded — now stop the old version and swap in the new one.
+      // The port reservation is held throughout — no release here — because
+      // buildFreshStartSpec's allocatePort() call below re-claims the same
+      // config-sourced port; releasing it in between would open a window for
+      // a concurrent deploy to steal it.
       if (wasRunning) {
         this.logger.info(`Stopping ${appName} to swap in new build...`, 'UPDATE');
         this.stopHealthProber(appName);
         await this.runtime.stop(appName);
-        if (originalPort) {
-          this.usedPorts.delete(originalPort);
-        }
       }
 
       this.appBuildDurations.set(appName, buildResult.duration);
       this.logger.appEvent('built', appName, `rebuilt in ${buildResult.duration}ms`);
 
-      // 4. Restart the app on the same port (or allocate new if none)
-      const port = originalPort ?? this.allocatePort(appName);
-      this.usedPorts.set(port, appName);
-
       await this.stateManager.setAppStatus(appName, 'starting');
 
-      // Ensure data directory exists (preserved across upgrades)
-      const dataDir = await this.ensureAppDataDirectory(appName);
-
-      // Get env vars for an already-provisioned DB (no new provisioning on hot-reload).
-      let dbEnvVars: Record<string, string> = {};
-      if (this.dbProvisioner) {
-        const pgSocketDir =
-          this.config.isolation === 'docker'
-            ? (this.postgresServer?.getSocketDir() ?? undefined)
-            : undefined;
-        dbEnvVars = this.dbProvisioner.getEnvVars(
-          appName,
-          pgSocketDir ? { pgSocketDir } : undefined
-        ) || {};
-      }
-
-      const spec = await this.buildStartSpec(appName, appPath, detection, port, dataDir, dbEnvVars);
+      const { spec, port } = await this.buildFreshStartSpec(appName, appPath, detection);
       const status = await this.runtime.start(spec);
 
       this.logger.appEvent('started', appName, `PID ${status.pid}, port ${port} (hot-reloaded)`);
@@ -1854,12 +1842,152 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
 
       // Record deploy time for cooldown
       this.appDeployTimes.set(appName, Date.now());
+
+      // Re-arm the health prober — stopHealthProber above tore it down and it
+      // must restart against the new (hot-reloaded) process.
+      if (spec.healthCheckPath && this.runtime?.type === 'pm2') {
+        this.startHealthProber(appName, port, spec.healthCheckPath);
+      }
+
       this.appsInProgress.delete(appName);
     } catch (error) {
       this.logger.appEvent('error', appName, error instanceof Error ? error.message : 'Hot-reload failed');
       await this.stateManager.setAppStatus(appName, 'errored', {
         error: error instanceof Error ? error.message : 'Hot-reload failed',
       });
+      this.appsInProgress.delete(appName);
+    }
+  }
+
+  /**
+   * Rebuild the start spec for an app the platform already knows about: port
+   * resolution, the persistent data dir, and env vars for an
+   * already-provisioned database (no new provisioning here — that only
+   * happens on a fresh deploy, see handleStartApp). Shared by handleAppUpdate
+   * (hot-reload) and restartApp so the two paths can't drift apart.
+   *
+   * State writes, health-prober (re)arming, and appDeployTimes bookkeeping
+   * are NOT done here — they stay with the caller, which knows whether this
+   * is a hot-reload or a restart and what else needs to happen around it.
+   *
+   * Port: allocatePort() is config-first (reuses the app's persisted port)
+   * and does its own usedPorts bookkeeping; callers must NOT release the
+   * port before calling this, or a concurrent deploy could steal it while
+   * the spec is being rebuilt.
+   */
+  private async buildFreshStartSpec(
+    appName: string,
+    appPath: string,
+    detection: DetectionResult
+  ): Promise<{ spec: AppStartSpec; port: number }> {
+    const port = this.allocatePort(appName);
+
+    // Ensure data directory exists (preserved across upgrades)
+    const dataDir = await this.ensureAppDataDirectory(appName);
+
+    // Get env vars for an already-provisioned DB (no new provisioning here).
+    let dbEnvVars: Record<string, string> = {};
+    if (this.dbProvisioner) {
+      const pgSocketDir =
+        this.config.isolation === 'docker'
+          ? (this.postgresServer?.getSocketDir() ?? undefined)
+          : undefined;
+      dbEnvVars = this.dbProvisioner.getEnvVars(
+        appName,
+        pgSocketDir ? { pgSocketDir } : undefined
+      ) || {};
+    }
+
+    const spec = await this.buildStartSpec(appName, appPath, detection, port, dataDir, dbEnvVars);
+    return { spec, port };
+  }
+
+  /**
+   * Stop-if-running, rebuild the start spec from current state (secrets,
+   * DATABASE_URL, DROP_DATA_DIR, dependency env), and start the app on its
+   * existing port. Resolves once the app is running again.
+   *
+   * Serves both the start and restart routes via the platform-ops seam (see
+   * api/platform-ops.ts): on a stopped app it degenerates to a fresh start.
+   */
+  async restartApp(appName: string): Promise<AppProcessInfo> {
+    // Synchronous check-and-insert — no await between the check and the add,
+    // mirroring handleAppUpdate — so two concurrent restarts of the same app
+    // can't both pass the guard.
+    if (this.appsInProgress.has(appName)) {
+      throw new AppInProgressError(appName);
+    }
+    this.appsInProgress.add(appName);
+
+    try {
+      if (!this.runtime || !this.detector || !this.stateManager || !this.appConfigService) {
+        throw new Error('Platform is not fully initialized');
+      }
+
+      // Resolve the app. Out-of-tree (admin-deployed) apps have state but no
+      // appconf, so fall back through both before the webapps-dir default.
+      const config = this.appConfigService.getConfig(appName);
+      const state = this.stateManager.getApp(appName);
+      if (!config && !state) {
+        throw new Error(`Application not found: ${appName}`);
+      }
+      const appPath = config?.path || state?.path || path.join(this.config.appsDirectory, appName);
+
+      const runtimeStatus = await this.runtime.getStatus(appName);
+      const isRunning = runtimeStatus?.status === 'running';
+
+      // Capacity guard: only relevant when this restart is actually starting
+      // a currently-stopped app (same check as handleStartApp).
+      if (!isRunning && this.config.maxConcurrentApps > 0) {
+        const runningCount = this.stateManager.getAllApps().filter(
+          (a) => a.status === 'running' || a.status === 'starting'
+        ).length;
+        if (runningCount >= this.config.maxConcurrentApps) {
+          throw new Error(
+            `App capacity reached (${runningCount}/${this.config.maxConcurrentApps} running). ` +
+            `Stop an existing app before starting a new one, or increase DROP_MAX_CONCURRENT_APPS.`
+          );
+        }
+      }
+
+      try {
+        this.stopHealthProber(appName);
+        // Delete, not stop: PM2's env update on a bare restart/start is a
+        // merge, so a removed secret would keep being injected; delete forces
+        // a fresh registration (and, on docker, a fresh container) so the
+        // spec built below is what actually ends up running.
+        await this.runtime.delete(appName);
+
+        const detection = await this.detector.detect(appPath, { silent: true });
+        const { spec, port } = await this.buildFreshStartSpec(appName, appPath, detection);
+        const status = await this.runtime.start(spec);
+
+        this.logger.appEvent('started', appName, `PID ${status.pid}, port ${port} (restarted)`);
+
+        await this.stateManager.setAppStatus(appName, 'running', {
+          port,
+          pid: status.pid ?? undefined,
+        });
+
+        // buildFreshStartSpec's drop-config.js write (static apps with
+        // depends_on) lands inside the watched directory; record the deploy
+        // time so the watcher's own debounced event doesn't read it back as a
+        // user change and trigger a spurious hot-reload.
+        this.appDeployTimes.set(appName, Date.now());
+
+        if (spec.healthCheckPath && this.runtime.type === 'pm2') {
+          this.startHealthProber(appName, port, spec.healthCheckPath);
+        }
+
+        return status;
+      } catch (error) {
+        this.logger.appEvent('error', appName, error instanceof Error ? error.message : 'Failed to restart');
+        await this.stateManager.setAppStatus(appName, 'errored', {
+          error: error instanceof Error ? error.message : 'Failed to restart',
+        });
+        throw error;
+      }
+    } finally {
       this.appsInProgress.delete(appName);
     }
   }

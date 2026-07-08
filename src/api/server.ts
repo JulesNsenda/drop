@@ -157,6 +157,12 @@ export class ApiServer {
     if (this.config.enableAuth && isAuthEnabled()) {
       // migrate-runtime is admin-only — register before the general /apps/* guard.
       v1.use('/apps/*/migrate-runtime', authMiddleware('admin'));
+      // start/stop/restart mutate runtime state (and, on restart, tear down
+      // and recreate the process/container) — read-only tokens must not
+      // reach them. Register before the general /apps/* guard.
+      v1.use('/apps/*/start', authMiddleware('user'));
+      v1.use('/apps/*/stop', authMiddleware('user'));
+      v1.use('/apps/*/restart', authMiddleware('user'));
       v1.use('/apps/*', authMiddleware('readonly'));
       v1.use('/apps', authMiddleware('readonly'));
       v1.use('/usage', authMiddleware('readonly'));
