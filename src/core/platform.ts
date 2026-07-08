@@ -1145,7 +1145,7 @@ backup:
     const updateSub = this.eventBus.subscribe('app:update', async (payload) => {
       // Skip apps currently being cloned
       if (this.gitDeployService?.isCloning(payload.name)) return;
-      await this.handleAppUpdate(payload.name, payload.path, payload.reason);
+      await this.handleAppUpdate(payload.name, payload.path, payload.reason, payload.bypassCooldown);
     });
     this.subscriptions.push(updateSub);
 
@@ -1676,25 +1676,43 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
    * Handle app update events (file changes in existing apps)
    * Stops the running process, rebuilds, and restarts on the same port
    */
-  private async handleAppUpdate(appName: string, appPath: string, reason: string): Promise<void> {
+  private async handleAppUpdate(
+    appName: string,
+    appPath: string,
+    reason: string,
+    bypassCooldown?: boolean
+  ): Promise<void> {
     if (!this.runtime || !this.stateManager || !this.detector || !this.builder) return;
 
     // Skip apps currently being cloned by git deploy
     if (this.gitDeployService?.isCloning(appName)) return;
 
-    // Skip if already processing this app (e.g., during initial deployment)
+    // Skip if already processing this app (e.g., during initial deployment).
+    // An explicit redeploy that's dropped here is logged at info - the API/
+    // webhook caller has already reported success, so a silent debug-level
+    // drop would hide the fact that nothing actually happened.
     if (this.appsInProgress.has(appName)) {
-      this.logger.debug(`Skipping update for ${appName} - already in progress`, 'UPDATE');
+      if (bypassCooldown) {
+        this.logger.info(`Dropped redeploy for ${appName} - already in progress`, 'UPDATE');
+      } else {
+        this.logger.debug(`Skipping update for ${appName} - already in progress`, 'UPDATE');
+      }
       return;
     }
 
-    // Skip if app was just deployed (adaptive cooldown to prevent loops).
+    // Skip if app was just deployed (adaptive cooldown to prevent loops), UNLESS
+    // this is an explicit redeploy (bypassCooldown): the cooldown exists to stop
+    // a build's own file writes from re-triggering the watcher, which an
+    // explicit redeploy is not - and the watcher never sets this flag, so the
+    // bypass can't leak into that loop-prevention path.
     // The window is max(5s, lastBuildDuration * 2) so Docker builds that take
     // minutes don't immediately re-trigger from their own output files.
-    const lastDeployTime = this.appDeployTimes.get(appName);
-    if (lastDeployTime && Date.now() - lastDeployTime < this.getEffectiveCooldownMs(appName)) {
-      this.logger.debug(`Skipping update for ${appName} - within cooldown period`, 'UPDATE');
-      return;
+    if (!bypassCooldown) {
+      const lastDeployTime = this.appDeployTimes.get(appName);
+      if (lastDeployTime && Date.now() - lastDeployTime < this.getEffectiveCooldownMs(appName)) {
+        this.logger.debug(`Skipping update for ${appName} - within cooldown period`, 'UPDATE');
+        return;
+      }
     }
 
     const appState = this.stateManager.getApp(appName);
@@ -1705,13 +1723,17 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       return;
     }
 
-    // A user-stopped app must not be resurrected by a file-change hot-reload.
-    // Every other deploy path guards on this (detectedSub, buildSub); without
-    // it, any edit or touch to a stopped app's files (git pull, editor
-    // autosave) silently rebuilds and restarts it against the user's explicit
-    // `drop stop`.
+    // A user-stopped app must not be resurrected by a file-change hot-reload
+    // (or an explicit redeploy). Every other deploy path guards on this
+    // (detectedSub, buildSub); without it, any edit or touch to a stopped
+    // app's files (git pull, editor autosave) silently rebuilds and restarts
+    // it against the user's explicit `drop stop`.
     if (appState.status === 'stopped') {
-      this.logger.debug(`Skipping update for ${appName} - app was stopped by user`, 'UPDATE');
+      if (bypassCooldown) {
+        this.logger.info(`Dropped redeploy for ${appName} - app was stopped by user`, 'UPDATE');
+      } else {
+        this.logger.debug(`Skipping update for ${appName} - app was stopped by user`, 'UPDATE');
+      }
       return;
     }
 
@@ -1819,7 +1841,12 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       // buildFreshStartSpec's allocatePort() call below re-claims the same
       // config-sourced port; releasing it in between would open a window for
       // a concurrent deploy to steal it.
-      if (wasRunning) {
+      // Also stop when the app is 'errored': the hot-reload catch block below
+      // can mark an app errored while its PM2 process is still alive (the
+      // failure happened after start), and skipping stop() here would hit
+      // ProcessManager.start's online-early-return - a silent no-op that
+      // leaves the old (broken) code running.
+      if (wasRunning || appState.status === 'errored') {
         this.logger.info(`Stopping ${appName} to swap in new build...`, 'UPDATE');
         this.stopHealthProber(appName);
         await this.runtime.stop(appName);

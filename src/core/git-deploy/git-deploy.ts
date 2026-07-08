@@ -22,6 +22,7 @@ import { getStateManager } from '../../managers/app/state-manager';
 import { getSecretManager } from '../../managers/secret';
 import { getLogger } from '../../utils/logger';
 import { hasEnoughDisk, getMinFreeDiskMb } from '../../utils/disk';
+import { eventBus } from '../event-bus';
 
 const logger = getLogger();
 
@@ -217,7 +218,16 @@ export class GitDeployService {
 
     logger.info(`Redeploying ${appName} from ${repoUrl} (branch: ${branch})`, 'GIT-DEPLOY');
 
-    await gitPull(app.path, branch, token);
+    // Mark as cloning for the duration of the pull only - mirrors deploy()'s
+    // guard against the watcher building a half-pulled tree. Cleared before
+    // the deterministic publish below, or the platform's isCloning guards
+    // (platform.ts) would eat that event too.
+    this.activeClones.add(appName);
+    try {
+      await gitPull(app.path, branch, token);
+    } finally {
+      this.activeClones.delete(appName);
+    }
 
     let commitSha: string | undefined;
     try {
@@ -238,7 +248,16 @@ export class GitDeployService {
 
     logger.info(`Redeployed ${appName} (${commitSha?.slice(0, 7) || 'unknown'})`, 'GIT-DEPLOY');
 
-    // The watcher will detect file changes and trigger rebuild
+    // Publish the rebuild trigger directly instead of waiting on the watcher
+    // to notice file changes: a no-change pull touches nothing on disk (the
+    // watcher would never fire), and on a slow pull the watcher's mid-pull
+    // flush could otherwise race this with a half-pulled tree.
+    eventBus.publish('app:update', {
+      name: appName,
+      path: app.path,
+      reason: 'git redeploy',
+      bypassCooldown: true,
+    });
 
     return {
       appName,
