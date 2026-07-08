@@ -19,6 +19,11 @@ const BASE_IMAGES: Partial<Record<AppType, string>> = {
   python: 'python:3.12-slim',
   go: 'golang:1.22-alpine',
   static: 'nginx:alpine',
+  // SPAs are served by the same nginx path as plain static apps
+  // (buildStartSpec treats 'static' and 'spa' identically); without this
+  // entry they fell back to node:20-slim, where the nginx start command
+  // cannot exist.
+  spa: 'nginx:alpine',
 };
 
 /** Fallback for types not yet fully containerised. */
@@ -79,3 +84,27 @@ export const DEFAULT_PIDS_LIMIT = 256;
  */
 export const CONTAINER_SECURITY_OPT = ['no-new-privileges:true'];
 export const CONTAINER_CAP_DROP = ['ALL'];
+
+/**
+ * Minimal capabilities granted back per app type on top of CapDrop ALL.
+ *
+ * Static/SPA apps run the official nginx image as root (Tier A): the nginx
+ * master chowns its temp dirs (/var/cache/nginx/*) to the worker uid and
+ * setuid/setgids workers down to the `nginx` user.  With zero capabilities
+ * even root cannot do either, so nginx exits at startup with
+ * "chown(/var/cache/nginx/client_temp) failed (1: Operation not permitted)".
+ * NET_BIND_SERVICE is not needed — DROP always assigns high ports.
+ *
+ * All other types run as non-root users that never chown/setuid and keep
+ * zero capabilities.  Tier B (unprivileged nginx via a full nginx.conf)
+ * will remove the static/spa exception.
+ */
+const IMAGE_CAP_ADD: Partial<Record<AppType, string[]>> = {
+  static: ['CHOWN', 'SETUID', 'SETGID'],
+  spa: ['CHOWN', 'SETUID', 'SETGID'],
+};
+
+/** Return the minimal CapAdd list for the app type (empty = no extra caps). */
+export function selectCapAdd(appType: AppType): string[] {
+  return IMAGE_CAP_ADD[appType] ?? [];
+}
