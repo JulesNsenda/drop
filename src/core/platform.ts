@@ -1073,6 +1073,13 @@ backup:
       // Skip apps currently being cloned
       if (this.gitDeployService?.isCloning(payload.name)) return;
 
+      // Tell the watcher this app is known regardless of who published the
+      // detection (git deploy publishes deterministically after a clone) —
+      // otherwise the watcher's own debounced flush would emit a duplicate
+      // app:detected for the same app a few seconds later. After the
+      // isCloning guard on purpose: only mark what we actually onboard.
+      this.watcher?.markAppKnown(payload.name);
+
       const appType = (payload.type || 'unknown') as 'nodejs' | 'python' | 'go' | 'static' | 'docker' | 'unknown';
 
       // Create or update app config file (source of truth)

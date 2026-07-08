@@ -67,6 +67,9 @@ the v2.0 roadmap (see the README "Security & Trust Model" section).
 
 ### Fixed
 
+- Git deploys whose clone writes for longer than the watcher's flush window
+  could register but never build/start until a platform restart; `deploy()`
+  now publishes the detection itself instead of relying on the watcher.
 - Resolved all ESLint errors; activity logging consolidated behind a
   best-effort `tryLogActivity` helper.
 - Deploy pipeline: `build:completed` carries a `success` flag and the platform
