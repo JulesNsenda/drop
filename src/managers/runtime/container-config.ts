@@ -55,13 +55,17 @@ export function selectBaseImage(appType: AppType, runtimeImage?: string): string
  * - node:20-slim ships a `node` user (UID 1000, GID 1000).
  * - python/go slim images have no named non-root user; `1000:1000` is used as
  *   a numeric UID which Docker accepts even without /etc/passwd entry.
- * - nginx:alpine has an `nginx` user but the static entrypoint writes to
- *   /etc/nginx so it runs as root in Tier A; tightened in Tier B.
+ * - static/spa run nginx:alpine as its `nginx` user (uid/gid 101) — Tier B:
+ *   DROP generates a full nginx.conf with pid/temp paths under /tmp and
+ *   starts nginx via `-c` from the bind-mounted data dir, so nothing needs
+ *   root or capabilities.
  */
 const IMAGE_USERS: Partial<Record<AppType, string>> = {
   nodejs: 'node',
   python: '1000:1000',
   go: '1000:1000',
+  static: '101:101',
+  spa: '101:101',
 };
 
 /** UID used for non-root container apps (nodejs and python/go fallback). */
@@ -84,27 +88,3 @@ export const DEFAULT_PIDS_LIMIT = 256;
  */
 export const CONTAINER_SECURITY_OPT = ['no-new-privileges:true'];
 export const CONTAINER_CAP_DROP = ['ALL'];
-
-/**
- * Minimal capabilities granted back per app type on top of CapDrop ALL.
- *
- * Static/SPA apps run the official nginx image as root (Tier A): the nginx
- * master chowns its temp dirs (/var/cache/nginx/*) to the worker uid and
- * setuid/setgids workers down to the `nginx` user.  With zero capabilities
- * even root cannot do either, so nginx exits at startup with
- * "chown(/var/cache/nginx/client_temp) failed (1: Operation not permitted)".
- * NET_BIND_SERVICE is not needed — DROP always assigns high ports.
- *
- * All other types run as non-root users that never chown/setuid and keep
- * zero capabilities.  Tier B (unprivileged nginx via a full nginx.conf)
- * will remove the static/spa exception.
- */
-const IMAGE_CAP_ADD: Partial<Record<AppType, string[]>> = {
-  static: ['CHOWN', 'SETUID', 'SETGID'],
-  spa: ['CHOWN', 'SETUID', 'SETGID'],
-};
-
-/** Return the minimal CapAdd list for the app type (empty = no extra caps). */
-export function selectCapAdd(appType: AppType): string[] {
-  return IMAGE_CAP_ADD[appType] ?? [];
-}

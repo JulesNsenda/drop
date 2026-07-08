@@ -37,6 +37,14 @@ the v2.0 roadmap (see the README "Security & Trust Model" section).
 
 ### Added
 
+- Dashboard log viewer: Runtime/Build tabs (build logs were previously not
+  surfaced in the dashboard at all), stdout/stderr filter, text search with
+  highlighting, line-count selector, pause/resume, copy/download, severity
+  color-coding, ANSI/control-byte sanitization, and auto-scroll that only
+  sticks when already at the bottom.
+- Dashboard settings page reorganized into tabs (System / Account / Activity /
+  About), with the active tab kept in the URL (`?tab=`) and admin-only tabs
+  hidden per role.
 - Continuous integration (GitHub Actions): lint, server build, tests, and
   dashboard build on every PR to `main`/`develop`.
 - `drop backup` command: snapshots the file stores + a `pg_dump` of the
@@ -67,6 +75,14 @@ the v2.0 roadmap (see the README "Security & Trust Model" section).
 
 ### Fixed
 
+- Static/SPA apps under docker isolation crash-looped at startup: root-nginx
+  could not `chown`/`setuid` under `CapDrop: ALL`, and SPA-detected apps got
+  the `node:20-slim` fallback image (no nginx). Static/SPA containers now run
+  nginx fully unprivileged (uid 101, zero capabilities) with a DROP-generated
+  complete `nginx.conf` (pid/temp paths in `/tmp`, logs to stdout/stderr)
+  started via `nginx -c` from the bind-mounted data dir, and `spa` maps to
+  `nginx:alpine`. Already-deployed static apps must be redeployed (not just
+  restarted) to pick up the new container config.
 - Git deploys whose clone writes for longer than the watcher's flush window
   could register but never build/start until a platform restart; `deploy()`
   now publishes the detection itself instead of relying on the watcher.
