@@ -82,6 +82,7 @@ jest.mock('./watcher', () => ({
   WatcherService: jest.fn().mockImplementation(() => ({
     start: jest.fn().mockResolvedValue(undefined),
     stop: jest.fn().mockResolvedValue(undefined),
+    markAppKnown: jest.fn(),
   })),
 }));
 

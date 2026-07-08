@@ -169,7 +169,16 @@ export class GitDeployService {
 
     logger.info(`Cloned ${repoUrl} → ${appName} (${commitSha?.slice(0, 7) || 'unknown'})`, 'GIT-DEPLOY');
 
-    // The watcher will detect the new folder and trigger detect → build → start
+    // Publish the detection directly instead of waiting on the watcher: a
+    // clone that writes for longer than the watcher's max-wait flush gets its
+    // app:detected dropped mid-clone (isCloning guard) and never re-emitted -
+    // the app would sit registered but never built until a lucky file change.
+    // Same shape as the watcher's own publish; the detector resolves the type.
+    eventBus.publish('app:detected', {
+      name: appName,
+      path: destPath,
+      type: undefined,
+    });
 
     return {
       appName,
