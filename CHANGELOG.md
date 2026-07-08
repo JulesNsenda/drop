@@ -61,6 +61,9 @@ the v2.0 roadmap (see the README "Security & Trust Model" section).
 - `/health`, the CLI, and `drop version` read the version from `package.json`.
 - Dashboard assets served with immutable cache headers; `index.html` is
   `no-cache`.
+- Git redeploy (API + webhook) now always triggers a rebuild+restart after a
+  successful pull, including no-change pulls, instead of relying on the
+  watcher to notice file changes.
 
 ### Fixed
 

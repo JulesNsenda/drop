@@ -99,6 +99,8 @@ export interface AppUpdatePayload extends BaseEvent {
   name: string;
   path: string;
   reason: string;
+  /** Set by an explicit redeploy (git pull / webhook) so the anti-loop cooldown doesn't swallow it. */
+  bypassCooldown?: boolean;
 }
 
 export interface AppRemovedPayload extends BaseEvent {
