@@ -12,6 +12,7 @@ import { AuthContext } from '../middleware/auth';
 import { getGitDeployService } from '../../core/git-deploy';
 import { getStateManager } from '../../managers/app/state-manager';
 import { getUserById } from '../middleware/auth';
+import { canAccess } from '../access';
 import { tryLogActivity } from '../../managers/activity';
 import type { GitDeployRequest, GitTokenCreateRequest } from '../../core/git-deploy';
 
@@ -98,6 +99,11 @@ gitDeploy.post('/redeploy/:name', async (c) => {
 
   if (!service.isAvailable()) {
     return c.json(error(ErrorCodes.SERVICE_UNAVAILABLE, 'git CLI is not available on this system'), 503);
+  }
+
+  const app = getStateManager().getApp(name);
+  if (!app || !canAccess(auth, app)) {
+    return c.json(error(ErrorCodes.NOT_FOUND, `Application '${name}' not found`), 404);
   }
 
   try {
