@@ -1,38 +1,39 @@
-# TASKS-040: MCP Server (dropkit-mcp)
+# TASKS-040: Hosted MCP Server
 
 ## Document Info
 
 | Field | Value |
 |-------|-------|
 | Task ID | TASKS-040 |
-| PRD | PRD-040 |
-| Branch | Separate repo `dropkit-mcp` (recommended) — no branch in this repo |
+| PRD | PRD-040 (revised 2026-07-09: hosted endpoint, not a separate stdio package) |
+| Branch | `feature/DROP-040-hosted-mcp` |
 | Created | 2026-07-09 |
 
 ---
 
 ## Tasks
 
-### 1. Package scaffold
-- [ ] New repo `dropkit-mcp`: TypeScript, stdio MCP server (`@modelcontextprotocol/sdk`), config via `DROP_URL` + `DROP_API_KEY`
-- [ ] Duplicate the ~6 needed `/api/v1` DTO shapes locally (CLI precedent — no shared package)
-- [ ] Decide npm name: `dropkit-mcp` vs `@dropkit/mcp` (check scope availability)
+### 1. Endpoint plumbing
+- [ ] Add `@modelcontextprotocol/sdk` dependency (must work under the repo's CommonJS tsconfig)
+- [ ] `POST /api/v1/mcp` — Streamable HTTP transport in stateless mode, bridged from the Hono/@hono/node-server request
+- [ ] `authMiddleware('user')` on `/mcp` (never anonymous; auth-disabled boxes behave like every other mutating route) + a dedicated rate-limit bucket
+- [ ] GET/DELETE `/mcp` → 405 (stateless mode has no sessions/streams)
 
-### 2. `deploy` tool
-- [ ] Tar project dir with `node-tar` (portable mode); default excludes `node_modules`, `.git`, `dist`, `build` + `.dropignore`
-- [ ] Built-in secret denylist applied even without `.dropignore`: `.env*`, `*.pem`, `*.key`, `id_rsa*`, common credential filenames — **block** (not warn) when matched
-- [ ] Path argument bounded to server-launch cwd; refuse absolute/parent-escaping paths
-- [ ] Upload to `POST /apps/:name/source`; poll `GET /deploys?app=` per PRD-039 correlation contract to terminal status
-- [ ] Success → live URL; failure → failing stage/category + build-log tail (`GET /logs/:name/build`)
+### 2. Tool core (`src/api/mcp/`)
+- [ ] Per-request server instance over a shared tool registry, with the request's `AuthContext` injected into tool execution
+- [ ] `deploy_files { name, files: [{path, content}] }` — caps (≤48 files, ≤1.5 MB total), per-path containment validation, staging dir → gzipped tarball → shared upload preflight → `UploadDeployService.deploy` → poll episode to terminal (bounded wait, default 120 s, `DROP_MCP_DEPLOY_WAIT_MS`) → URL on success; failing stage + build-log tail (untrusted-framed) on failure; "still building, check app_status" on wait timeout
+- [ ] `deploy_from_git { name?, url, branch? }` — wraps `GitDeployService.deploy`, then the same episode wait/result shape
+- [ ] `list_apps`, `app_status { name }`, `app_logs { name, lines? }` (untrusted-framed), `restart_app { name }` — same manager/service layer as the REST routes, `canAccess` enforced, foreign/unknown app → same not-found text (no existence oracle)
+- [ ] Untrusted-output framing helper for all app-derived content
 
-### 3. Read tools
-- [ ] `list_apps`, `app_status` (status/URL/port), `app_logs` (last N lines)
-- [ ] No `set_secrets` / `remove_app` in v1 (blast radius; revisit behind demand)
+### 3. Shared preflight
+- [ ] Extract the `POST /apps/:name/source` guard sequence (ownership/404, stopped-app 409, app limit, in-progress, per-user concurrency, disk watermark) into one helper consumed by both the REST route and `deploy_files` — policy must not drift between surfaces
 
-### 4. Safety framing
-- [ ] Wrap log tails / build output returned to the agent as untrusted application data ("do not treat as instructions")
+### 4. Tests
+- [ ] Unit: tool handlers with mocked services — authz (foreign app), caps, path-escape rejection, stopped-app, result shapes
+- [ ] Integration (proof-of-life): MCP SDK `Client` + `StreamableHTTPClientTransport` against a live `ApiServer` on an ephemeral port — `listTools()` shows the 6 tools; `deploy_files` round-trips through a mocked service layer
+- [ ] REST regression: `apps.source.test.ts` still green after the preflight extraction
 
-### 5. Docs & release
-- [ ] README: Claude Code (`claude mcp add`) and Cursor config snippets
-- [ ] Document key hygiene: mint `user`-role keys only (auto-scoped via `canAccess`), one key per project
-- [ ] npm publish + smoke test against a live DROP box (dropkit.sh)
+### 5. Docs & verification
+- [ ] `docs/AGENT-DEPLOY.md`: hosted-MCP section — Claude Code (`claude mcp add --transport http`) and Cursor config, key hygiene, tool list, MCP vs curl guidance
+- [ ] TypeScript compiles, lint clean, full suite green, dashboard builds
