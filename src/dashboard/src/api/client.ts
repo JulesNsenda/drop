@@ -87,3 +87,15 @@ export function jsonBody(value: unknown): RequestInit {
 export function appUrl(port: number): string {
   return `${window.location.protocol}//${window.location.hostname}:${port}`;
 }
+
+/**
+ * Resolve an app's clickable link. Prefers the server-computed external URL
+ * (`app.url`, e.g. https://myapp.example.com); when the app has no external URL
+ * (local-dev box with no domain suffix) it falls back to a direct host:port link
+ * derived from the viewer's own location. `label` is the href without its scheme.
+ * Single source of truth for the three pages that render an app link.
+ */
+export function appLinkInfo(app: { url?: string; port?: number }): { href: string; label: string } {
+  const href = app.url || (app.port != null ? appUrl(app.port) : '');
+  return { href, label: href.replace(/^https?:\/\//, '') };
+}

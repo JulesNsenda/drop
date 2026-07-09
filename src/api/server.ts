@@ -13,7 +13,7 @@ import * as fs from 'fs';
 import * as fsp from 'fs/promises';
 import { errorHandler, HttpError } from './middleware/error';
 import { initializeAuth, authMiddleware, isAuthEnabled, setSignupEnabled } from './middleware/auth';
-import { rateLimitMiddleware, authRateLimitMiddleware } from './middleware/rate-limit';
+import { rateLimitMiddleware, authRateLimitMiddleware, uploadRateLimitMiddleware } from './middleware/rate-limit';
 import { securityHeadersMiddleware } from './middleware/security-headers';
 import { auditMiddleware, initializeAuditLog, closeAuditLog } from './middleware/audit';
 import { validateBodySize } from './middleware/validate';
@@ -30,6 +30,9 @@ import webhooksRoutes from './routes/webhooks';
 import gitDeployRoutes from './routes/git-deploy';
 import adminRoutes from './routes/admin';
 import usageRoutes from './routes/usage';
+
+/** Matches POST /api/v1/apps/:name/source — the upload-deploy endpoint (PRD-039). */
+const UPLOAD_SOURCE_PATH_RE = /^\/api\/v1\/apps\/[A-Za-z0-9_-]+\/source$/;
 
 export interface ApiServerConfig {
   port: number;
@@ -54,6 +57,10 @@ export interface ApiServerConfig {
   domainSuffix?: string;
   /** Path to the platform encryption key (for MFA secret at rest). */
   masterKeyPath?: string;
+  /** Directory for ephemeral build/upload staging (outside the watched webapps tree). */
+  tempDirectory?: string;
+  /** Cap on the compressed (as-uploaded) archive size for POST /apps/:name/source, in MB. */
+  maxUploadSizeMb?: number;
 }
 
 export class ApiServer {
@@ -81,6 +88,8 @@ export class ApiServer {
       appsDirectory: this.config.appsDirectory,
       enableHttps: this.config.enableHttps,
       domainSuffix: this.config.domainSuffix,
+      tempDirectory: this.config.tempDirectory,
+      maxUploadSizeMb: this.config.maxUploadSizeMb,
     });
 
     this.app = new Hono();
@@ -124,8 +133,19 @@ export class ApiServer {
       })
     );
 
-    // Request body size limit (1MB)
-    this.app.use('*', validateBodySize());
+    // Request body size limit (1MB) — carved out for the upload-source route
+    // (PRD-039): a gzipped tarball is far larger than 1MB, and this
+    // Content-Length header check would otherwise reject it before the route
+    // ever runs. The route's own streamed byte cap (routes/apps.ts,
+    // getUploadMaxBytes) is the real enforcement — it never trusts
+    // Content-Length either. Every other path's behavior is unchanged.
+    const bodySizeLimit = validateBodySize();
+    this.app.use('*', async (c, next) => {
+      if (UPLOAD_SOURCE_PATH_RE.test(c.req.path)) {
+        return next();
+      }
+      return bodySizeLimit(c, next);
+    });
 
     // Rate limiting
     this.app.use('/api/*', rateLimitMiddleware());
@@ -153,10 +173,25 @@ export class ApiServer {
     v1.use('/auth/mfa/*', authRateLimitMiddleware());
     v1.route('/auth', authRoutes);
 
+    // Upload deploys get a stricter, route-specific rate limit (PRD-039),
+    // registered unconditionally like the auth-login limiter above — an
+    // auth-disabled (single-operator) box still gets flood protection.
+    v1.use('/apps/*/source', uploadRateLimitMiddleware());
+
     // Apply auth middleware to protected routes when auth is enabled
     if (this.config.enableAuth && isAuthEnabled()) {
       // migrate-runtime is admin-only — register before the general /apps/* guard.
       v1.use('/apps/*/migrate-runtime', authMiddleware('admin'));
+      // start/stop/restart mutate runtime state (and, on restart, tear down
+      // and recreate the process/container) — read-only tokens must not
+      // reach them. Register before the general /apps/* guard.
+      v1.use('/apps/*/start', authMiddleware('user'));
+      v1.use('/apps/*/stop', authMiddleware('user'));
+      v1.use('/apps/*/restart', authMiddleware('user'));
+      // Upload deploy is never anonymous, even on an auth-enabled box with a
+      // readonly token in hand — it mutates the app the same way git-deploy
+      // does. Register before the general /apps/* readonly guard.
+      v1.use('/apps/*/source', authMiddleware('user'));
       v1.use('/apps/*', authMiddleware('readonly'));
       v1.use('/apps', authMiddleware('readonly'));
       v1.use('/usage', authMiddleware('readonly'));

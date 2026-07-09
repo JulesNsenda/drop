@@ -12,7 +12,7 @@ import { WatcherService } from './watcher';
 import { DetectorService, getDetector, parseDropYaml, DetectionResult } from './detector';
 import { BuilderService, getBuilder } from './builder';
 import { RouterService, getRouterService, resetRouterService } from './router';
-import { AppRuntime, AppStartSpec, getAppRuntime, resetAppRuntime } from '../managers/runtime';
+import { AppRuntime, AppProcessInfo, AppStartSpec, getAppRuntime, resetAppRuntime } from '../managers/runtime';
 import { AppStateManager, getStateManager, resetStateManager } from '../managers/app/state-manager';
 import { AppConfigService, getAppConfigService, resetAppConfigService } from '../managers/app/app-config';
 import {
@@ -27,9 +27,11 @@ import { CaddyServer, getCaddyServer, resetCaddyServer } from '../managers/route
 import { SecretManager, getSecretManager, resetSecretManager } from '../managers/secret';
 import { WebhookManager, getWebhookManager, resetWebhookManager } from './webhooks';
 import { GitDeployService, getGitDeployService, resetGitDeployService } from './git-deploy';
+import { UploadDeployService, getUploadDeployService, resetUploadDeployService } from './upload-deploy';
 import { getActivityLog, resetActivityLog } from '../managers/activity';
 import { getDeployTracker, resetDeployTracker } from '../managers/deploy-tracker';
 import { ApiServer, createApiServer } from '../api';
+import { AppInProgressError, setPlatformOps, resetPlatformOps } from '../api/platform-ops';
 import { Logger, createLogger } from '../utils/logger';
 import {
   validateDomain,
@@ -149,6 +151,20 @@ export interface PlatformConfig {
    * (0 = never). Default 50.
    */
   logMaxFileMb: number;
+  /**
+   * Cap on the compressed (as-uploaded) archive size for
+   * `POST /apps/:name/source` (PRD-039), in MB. Enforced by the route's own
+   * incremental byte counter while streaming to disk — never trusts
+   * Content-Length. Default 100.
+   */
+  maxUploadSizeMb: number;
+  /**
+   * Cap on the cumulative decompressed size of an uploaded archive, in MB.
+   * Enforced by `UploadDeployService`/`extractTarball` mid-extraction (aborts
+   * as soon as the cap is crossed, not post-hoc). Distinct from
+   * `maxUploadSizeMb`, which bounds the compressed upload itself. Default 1024.
+   */
+  maxUploadUnpackedMb: number;
 }
 
 // Determine platform-appropriate defaults
@@ -188,6 +204,8 @@ const DEFAULT_CONFIG: PlatformConfig = {
   maxCpusPerApp: parseFloat(process.env.DROP_MAX_CPUS_PER_APP || '0'),
   logRetentionDays: parseInt(process.env.DROP_LOG_RETENTION_DAYS || '14', 10),
   logMaxFileMb: parseInt(process.env.DROP_LOG_MAX_FILE_MB || '50', 10),
+  maxUploadSizeMb: parseInt(process.env.DROP_MAX_UPLOAD_SIZE_MB || '100', 10),
+  maxUploadUnpackedMb: parseInt(process.env.DROP_MAX_UPLOAD_UNPACKED_MB || '1024', 10),
 };
 
 export class DropPlatform {
@@ -208,6 +226,7 @@ export class DropPlatform {
   private secretManager: SecretManager | null = null;
   private webhookManager: WebhookManager | null = null;
   private gitDeployService: GitDeployService | null = null;
+  private uploadDeployService: UploadDeployService | null = null;
   private apiServer: ApiServer | null = null;
   private buildLogService: BuildLogService | null = null;
   private logRetention: LogRetentionService | null = null;
@@ -432,12 +451,15 @@ export class DropPlatform {
     for (const [, timer] of this.healthProbers) clearInterval(timer);
     this.healthProbers.clear();
 
-    // Reset secret manager, webhook manager, git deploy service, and build logs
+    // Reset secret manager, webhook manager, git deploy service, build logs,
+    // and the platform-ops seam (routes must 503 once the platform is down).
     resetSecretManager();
     resetWebhookManager();
     resetGitDeployService();
+    resetUploadDeployService();
     resetActivityLog();
     resetBuildLogService();
+    resetPlatformOps();
 
     // Tear down the deploy tracker's subscription only now — after the drain
     // above completes — so a deploy that finishes during the drain window
@@ -822,6 +844,17 @@ backup:
     });
     await this.gitDeployService.initialize();
 
+    // Initialize upload deploy service (PRD-039). Staging lives under
+    // data/temp — same root as getBuildWorkDir, well outside the watched
+    // webapps directory.
+    this.uploadDeployService = getUploadDeployService({
+      appsDirectory: this.config.appsDirectory,
+      tempDirectory: path.join(this.config.dropRoot, 'data', 'temp'),
+      maxUncompressedBytes: this.config.maxUploadUnpackedMb * 1024 * 1024,
+      maxEntries: 20_000,
+      extractTimeoutMs: 60_000,
+    });
+
     // Initialize activity log
     const activityLogPath = path.join(this.config.dropRoot, 'data', 'drop-svc', 'activity-log.json');
     const activityLog = getActivityLog(activityLogPath);
@@ -857,7 +890,14 @@ backup:
     // Sync state with actual running processes
     await this.syncStateWithProcesses();
 
-    // Initialize router with HTTPS config
+    // Initialize router with HTTPS config. importGlobs re-imports the apex/host
+    // site files (hosts/*.caddy, written by install.sh) into the router's
+    // generated Caddyfile — RouterService.reload() fully replaces the managed
+    // Caddyfile with app routes, so without this the apex/dashboard is knocked
+    // offline on the first route change.
+    const hostsImportGlob = path
+      .join(this.config.dropRoot, 'data', 'appconf', 'caddy', 'hosts', '*.caddy')
+      .replace(/\\/g, '/');
     this.router = getRouterService({
       caddy: {
         caddyfilePath: this.config.caddyfilePath,
@@ -868,6 +908,7 @@ backup:
         adminApi: 'localhost:2019',
         dnsProvider: this.config.dnsProvider,
         wildcardCert: this.config.wildcardCert,
+        importGlobs: [hostsImportGlob],
       },
     });
 
@@ -929,10 +970,19 @@ backup:
       logDir,
       appsDirectory: this.config.appsDirectory,
       masterKeyPath,
+      tempDirectory: path.join(this.config.dropRoot, 'data', 'temp'),
+      maxUploadSizeMb: this.config.maxUploadSizeMb,
     });
 
     await this.apiServer.initialize();
     await this.apiServer.start();
+
+    // Expose restart/start orchestration to the API routes via the
+    // platform-ops seam — a direct import would be circular (platform → api → routes).
+    setPlatformOps({
+      restartApp: (name) => this.restartApp(name),
+      isAppInProgress: (name) => this.appsInProgress.has(name),
+    });
 
     this.logger.info(`API server running on port ${this.config.apiPort}`, 'API');
     if (this.config.enableApiAuth) {
@@ -1057,6 +1107,16 @@ backup:
     const detectedSub = this.eventBus.subscribe('app:detected', async (payload) => {
       // Skip apps currently being cloned
       if (this.gitDeployService?.isCloning(payload.name)) return;
+      // Skip apps currently being uploaded (PRD-039) — same rationale as the
+      // isCloning guard above: don't let the watcher onboard mid-upload.
+      if (this.uploadDeployService?.isUploading(payload.name)) return;
+
+      // Tell the watcher this app is known regardless of who published the
+      // detection (git deploy publishes deterministically after a clone) —
+      // otherwise the watcher's own debounced flush would emit a duplicate
+      // app:detected for the same app a few seconds later. After the
+      // isCloning guard on purpose: only mark what we actually onboard.
+      this.watcher?.markAppKnown(payload.name);
 
       const appType = (payload.type || 'unknown') as 'nodejs' | 'python' | 'go' | 'static' | 'docker' | 'unknown';
 
@@ -1130,7 +1190,9 @@ backup:
     const updateSub = this.eventBus.subscribe('app:update', async (payload) => {
       // Skip apps currently being cloned
       if (this.gitDeployService?.isCloning(payload.name)) return;
-      await this.handleAppUpdate(payload.name, payload.path, payload.reason);
+      // Skip apps currently being uploaded (PRD-039)
+      if (this.uploadDeployService?.isUploading(payload.name)) return;
+      await this.handleAppUpdate(payload.name, payload.path, payload.reason, payload.bypassCooldown);
     });
     this.subscriptions.push(updateSub);
 
@@ -1661,25 +1723,46 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
    * Handle app update events (file changes in existing apps)
    * Stops the running process, rebuilds, and restarts on the same port
    */
-  private async handleAppUpdate(appName: string, appPath: string, reason: string): Promise<void> {
+  private async handleAppUpdate(
+    appName: string,
+    appPath: string,
+    reason: string,
+    bypassCooldown?: boolean
+  ): Promise<void> {
     if (!this.runtime || !this.stateManager || !this.detector || !this.builder) return;
 
     // Skip apps currently being cloned by git deploy
     if (this.gitDeployService?.isCloning(appName)) return;
 
-    // Skip if already processing this app (e.g., during initial deployment)
+    // Skip apps currently being uploaded (PRD-039)
+    if (this.uploadDeployService?.isUploading(appName)) return;
+
+    // Skip if already processing this app (e.g., during initial deployment).
+    // An explicit redeploy that's dropped here is logged at info - the API/
+    // webhook caller has already reported success, so a silent debug-level
+    // drop would hide the fact that nothing actually happened.
     if (this.appsInProgress.has(appName)) {
-      this.logger.debug(`Skipping update for ${appName} - already in progress`, 'UPDATE');
+      if (bypassCooldown) {
+        this.logger.info(`Dropped redeploy for ${appName} - already in progress`, 'UPDATE');
+      } else {
+        this.logger.debug(`Skipping update for ${appName} - already in progress`, 'UPDATE');
+      }
       return;
     }
 
-    // Skip if app was just deployed (adaptive cooldown to prevent loops).
+    // Skip if app was just deployed (adaptive cooldown to prevent loops), UNLESS
+    // this is an explicit redeploy (bypassCooldown): the cooldown exists to stop
+    // a build's own file writes from re-triggering the watcher, which an
+    // explicit redeploy is not - and the watcher never sets this flag, so the
+    // bypass can't leak into that loop-prevention path.
     // The window is max(5s, lastBuildDuration * 2) so Docker builds that take
     // minutes don't immediately re-trigger from their own output files.
-    const lastDeployTime = this.appDeployTimes.get(appName);
-    if (lastDeployTime && Date.now() - lastDeployTime < this.getEffectiveCooldownMs(appName)) {
-      this.logger.debug(`Skipping update for ${appName} - within cooldown period`, 'UPDATE');
-      return;
+    if (!bypassCooldown) {
+      const lastDeployTime = this.appDeployTimes.get(appName);
+      if (lastDeployTime && Date.now() - lastDeployTime < this.getEffectiveCooldownMs(appName)) {
+        this.logger.debug(`Skipping update for ${appName} - within cooldown period`, 'UPDATE');
+        return;
+      }
     }
 
     const appState = this.stateManager.getApp(appName);
@@ -1690,13 +1773,17 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       return;
     }
 
-    // A user-stopped app must not be resurrected by a file-change hot-reload.
-    // Every other deploy path guards on this (detectedSub, buildSub); without
-    // it, any edit or touch to a stopped app's files (git pull, editor
-    // autosave) silently rebuilds and restarts it against the user's explicit
-    // `drop stop`.
+    // A user-stopped app must not be resurrected by a file-change hot-reload
+    // (or an explicit redeploy). Every other deploy path guards on this
+    // (detectedSub, buildSub); without it, any edit or touch to a stopped
+    // app's files (git pull, editor autosave) silently rebuilds and restarts
+    // it against the user's explicit `drop stop`.
     if (appState.status === 'stopped') {
-      this.logger.debug(`Skipping update for ${appName} - app was stopped by user`, 'UPDATE');
+      if (bypassCooldown) {
+        this.logger.info(`Dropped redeploy for ${appName} - app was stopped by user`, 'UPDATE');
+      } else {
+        this.logger.debug(`Skipping update for ${appName} - app was stopped by user`, 'UPDATE');
+      }
       return;
     }
 
@@ -1799,42 +1886,28 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         return;
       }
 
-      // Build succeeded — now stop the old version and swap in the new one
-      if (wasRunning) {
+      // Build succeeded — now stop the old version and swap in the new one.
+      // The port reservation is held throughout — no release here — because
+      // buildFreshStartSpec's allocatePort() call below re-claims the same
+      // config-sourced port; releasing it in between would open a window for
+      // a concurrent deploy to steal it.
+      // Also stop when the app is 'errored': the hot-reload catch block below
+      // can mark an app errored while its PM2 process is still alive (the
+      // failure happened after start), and skipping stop() here would hit
+      // ProcessManager.start's online-early-return - a silent no-op that
+      // leaves the old (broken) code running.
+      if (wasRunning || appState.status === 'errored') {
         this.logger.info(`Stopping ${appName} to swap in new build...`, 'UPDATE');
         this.stopHealthProber(appName);
         await this.runtime.stop(appName);
-        if (originalPort) {
-          this.usedPorts.delete(originalPort);
-        }
       }
 
       this.appBuildDurations.set(appName, buildResult.duration);
       this.logger.appEvent('built', appName, `rebuilt in ${buildResult.duration}ms`);
 
-      // 4. Restart the app on the same port (or allocate new if none)
-      const port = originalPort ?? this.allocatePort(appName);
-      this.usedPorts.set(port, appName);
-
       await this.stateManager.setAppStatus(appName, 'starting');
 
-      // Ensure data directory exists (preserved across upgrades)
-      const dataDir = await this.ensureAppDataDirectory(appName);
-
-      // Get env vars for an already-provisioned DB (no new provisioning on hot-reload).
-      let dbEnvVars: Record<string, string> = {};
-      if (this.dbProvisioner) {
-        const pgSocketDir =
-          this.config.isolation === 'docker'
-            ? (this.postgresServer?.getSocketDir() ?? undefined)
-            : undefined;
-        dbEnvVars = this.dbProvisioner.getEnvVars(
-          appName,
-          pgSocketDir ? { pgSocketDir } : undefined
-        ) || {};
-      }
-
-      const spec = await this.buildStartSpec(appName, appPath, detection, port, dataDir, dbEnvVars);
+      const { spec, port } = await this.buildFreshStartSpec(appName, appPath, detection);
       const status = await this.runtime.start(spec);
 
       this.logger.appEvent('started', appName, `PID ${status.pid}, port ${port} (hot-reloaded)`);
@@ -1846,12 +1919,152 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
 
       // Record deploy time for cooldown
       this.appDeployTimes.set(appName, Date.now());
+
+      // Re-arm the health prober — stopHealthProber above tore it down and it
+      // must restart against the new (hot-reloaded) process.
+      if (spec.healthCheckPath && this.runtime?.type === 'pm2') {
+        this.startHealthProber(appName, port, spec.healthCheckPath);
+      }
+
       this.appsInProgress.delete(appName);
     } catch (error) {
       this.logger.appEvent('error', appName, error instanceof Error ? error.message : 'Hot-reload failed');
       await this.stateManager.setAppStatus(appName, 'errored', {
         error: error instanceof Error ? error.message : 'Hot-reload failed',
       });
+      this.appsInProgress.delete(appName);
+    }
+  }
+
+  /**
+   * Rebuild the start spec for an app the platform already knows about: port
+   * resolution, the persistent data dir, and env vars for an
+   * already-provisioned database (no new provisioning here — that only
+   * happens on a fresh deploy, see handleStartApp). Shared by handleAppUpdate
+   * (hot-reload) and restartApp so the two paths can't drift apart.
+   *
+   * State writes, health-prober (re)arming, and appDeployTimes bookkeeping
+   * are NOT done here — they stay with the caller, which knows whether this
+   * is a hot-reload or a restart and what else needs to happen around it.
+   *
+   * Port: allocatePort() is config-first (reuses the app's persisted port)
+   * and does its own usedPorts bookkeeping; callers must NOT release the
+   * port before calling this, or a concurrent deploy could steal it while
+   * the spec is being rebuilt.
+   */
+  private async buildFreshStartSpec(
+    appName: string,
+    appPath: string,
+    detection: DetectionResult
+  ): Promise<{ spec: AppStartSpec; port: number }> {
+    const port = this.allocatePort(appName);
+
+    // Ensure data directory exists (preserved across upgrades)
+    const dataDir = await this.ensureAppDataDirectory(appName);
+
+    // Get env vars for an already-provisioned DB (no new provisioning here).
+    let dbEnvVars: Record<string, string> = {};
+    if (this.dbProvisioner) {
+      const pgSocketDir =
+        this.config.isolation === 'docker'
+          ? (this.postgresServer?.getSocketDir() ?? undefined)
+          : undefined;
+      dbEnvVars = this.dbProvisioner.getEnvVars(
+        appName,
+        pgSocketDir ? { pgSocketDir } : undefined
+      ) || {};
+    }
+
+    const spec = await this.buildStartSpec(appName, appPath, detection, port, dataDir, dbEnvVars);
+    return { spec, port };
+  }
+
+  /**
+   * Stop-if-running, rebuild the start spec from current state (secrets,
+   * DATABASE_URL, DROP_DATA_DIR, dependency env), and start the app on its
+   * existing port. Resolves once the app is running again.
+   *
+   * Serves both the start and restart routes via the platform-ops seam (see
+   * api/platform-ops.ts): on a stopped app it degenerates to a fresh start.
+   */
+  async restartApp(appName: string): Promise<AppProcessInfo> {
+    // Synchronous check-and-insert — no await between the check and the add,
+    // mirroring handleAppUpdate — so two concurrent restarts of the same app
+    // can't both pass the guard.
+    if (this.appsInProgress.has(appName)) {
+      throw new AppInProgressError(appName);
+    }
+    this.appsInProgress.add(appName);
+
+    try {
+      if (!this.runtime || !this.detector || !this.stateManager || !this.appConfigService) {
+        throw new Error('Platform is not fully initialized');
+      }
+
+      // Resolve the app. Out-of-tree (admin-deployed) apps have state but no
+      // appconf, so fall back through both before the webapps-dir default.
+      const config = this.appConfigService.getConfig(appName);
+      const state = this.stateManager.getApp(appName);
+      if (!config && !state) {
+        throw new Error(`Application not found: ${appName}`);
+      }
+      const appPath = config?.path || state?.path || path.join(this.config.appsDirectory, appName);
+
+      const runtimeStatus = await this.runtime.getStatus(appName);
+      const isRunning = runtimeStatus?.status === 'running';
+
+      // Capacity guard: only relevant when this restart is actually starting
+      // a currently-stopped app (same check as handleStartApp).
+      if (!isRunning && this.config.maxConcurrentApps > 0) {
+        const runningCount = this.stateManager.getAllApps().filter(
+          (a) => a.status === 'running' || a.status === 'starting'
+        ).length;
+        if (runningCount >= this.config.maxConcurrentApps) {
+          throw new Error(
+            `App capacity reached (${runningCount}/${this.config.maxConcurrentApps} running). ` +
+            `Stop an existing app before starting a new one, or increase DROP_MAX_CONCURRENT_APPS.`
+          );
+        }
+      }
+
+      try {
+        this.stopHealthProber(appName);
+        // Delete, not stop: PM2's env update on a bare restart/start is a
+        // merge, so a removed secret would keep being injected; delete forces
+        // a fresh registration (and, on docker, a fresh container) so the
+        // spec built below is what actually ends up running.
+        await this.runtime.delete(appName);
+
+        const detection = await this.detector.detect(appPath, { silent: true });
+        const { spec, port } = await this.buildFreshStartSpec(appName, appPath, detection);
+        const status = await this.runtime.start(spec);
+
+        this.logger.appEvent('started', appName, `PID ${status.pid}, port ${port} (restarted)`);
+
+        await this.stateManager.setAppStatus(appName, 'running', {
+          port,
+          pid: status.pid ?? undefined,
+        });
+
+        // buildFreshStartSpec's drop-config.js write (static apps with
+        // depends_on) lands inside the watched directory; record the deploy
+        // time so the watcher's own debounced event doesn't read it back as a
+        // user change and trigger a spurious hot-reload.
+        this.appDeployTimes.set(appName, Date.now());
+
+        if (spec.healthCheckPath && this.runtime.type === 'pm2') {
+          this.startHealthProber(appName, port, spec.healthCheckPath);
+        }
+
+        return status;
+      } catch (error) {
+        this.logger.appEvent('error', appName, error instanceof Error ? error.message : 'Failed to restart');
+        await this.stateManager.setAppStatus(appName, 'errored', {
+          error: error instanceof Error ? error.message : 'Failed to restart',
+        });
+        throw error;
+      }
+    } finally {
       this.appsInProgress.delete(appName);
     }
   }
@@ -1957,12 +2170,12 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         await fs.writeFile(nginxConfPath, nginxConf, 'utf-8');
         this.logger.info(`Wrote nginx.conf for ${appName} → port ${port}`, 'STATIC');
 
+        // Tier B: nginx runs unprivileged (uid 101, zero caps), so the full
+        // config is passed via -c from the bind-mounted data dir instead of
+        // being copied into root-owned /etc/nginx.
         script = '/bin/sh';
         interpreter = 'none';
-        args = [
-          '-c',
-          `cp ${nginxConfPath} /etc/nginx/conf.d/default.conf && nginx -g 'daemon off;'`,
-        ];
+        args = ['-c', `nginx -c ${nginxConfPath} -g 'daemon off;'`];
       } else {
         const serveDir = path.join(appPath, detection.suggestedConfig?.outputDirectory || '.');
         // eslint-disable-next-line @typescript-eslint/no-require-imports

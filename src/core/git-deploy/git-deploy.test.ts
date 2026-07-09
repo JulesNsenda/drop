@@ -5,10 +5,15 @@
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import * as os from 'os';
+import { execFile } from 'child_process';
 import { GitDeployService, resetGitDeployService } from './git-deploy';
 import { resetStateManager, getStateManager } from '../../managers/app/state-manager';
 import { resetSecretManager, getSecretManager } from '../../managers/secret';
 import * as diskUtils from '../../utils/disk';
+import { eventBus } from '../event-bus';
+// AppUpdatePayload isn't re-exported by ../event-bus (index.ts) - see the same
+// note in managers/deploy-tracker/deploy-tracker.ts.
+import type { AppDetectedPayload, AppUpdatePayload } from '../event-bus/event-bus.types';
 
 // Mock execFile to avoid actual git operations
 jest.mock('child_process', () => ({
@@ -186,6 +191,54 @@ describe('GitDeployService', () => {
       expect(app?.gitSource?.autoRedeploy).toBe(false);
     });
 
+    it('publishes app:detected after a successful clone', async () => {
+      const appName = 'detected-app';
+
+      const received: AppDetectedPayload[] = [];
+      let isCloningWhenEventFired: boolean | undefined;
+      const unsubscribe = eventBus.subscribe('app:detected', (payload) => {
+        received.push(payload);
+        isCloningWhenEventFired = service.isCloning(appName);
+      });
+
+      try {
+        await service.deploy({ repoUrl: `https://github.com/user/${appName}`, branch: 'main' });
+
+        expect(received).toHaveLength(1);
+        expect(received[0].name).toBe(appName);
+        expect(received[0].path).toBe(path.join(tempDir, 'webapps', appName));
+        expect(received[0].type).toBeUndefined();
+        // Cleared before the publish - the platform's isCloning guard would
+        // drop the detection otherwise.
+        expect(isCloningWhenEventFired).toBe(false);
+      } finally {
+        unsubscribe();
+      }
+    });
+
+    it('does not publish app:detected when the clone fails', async () => {
+      // Override the NEXT execFile call only - the clone is the first execFile
+      // call deploy() makes (disk preflight and token lookup do not shell out).
+      (execFile as unknown as jest.Mock).mockImplementationOnce(
+        (_cmd: string, _args: string[], _opts: unknown, cb?: (err: Error) => void) => {
+          if (cb) cb(new Error('fatal: repository not found'));
+          return {} as unknown;
+        }
+      );
+
+      const handler = jest.fn();
+      const unsubscribe = eventBus.subscribe('app:detected', handler);
+
+      try {
+        await expect(
+          service.deploy({ repoUrl: 'https://github.com/user/clone-fail-app', branch: 'main' })
+        ).rejects.toThrow();
+        expect(handler).not.toHaveBeenCalled();
+      } finally {
+        unsubscribe();
+      }
+    });
+
     it('should normalize .git suffix in URL', async () => {
       const result = await service.deploy({
         repoUrl: 'https://github.com/user/dotgit-test.git',
@@ -193,6 +246,74 @@ describe('GitDeployService', () => {
 
       expect(result.repoUrl).toBe('https://github.com/user/dotgit-test');
       expect(result.appName).toBe('dotgit-test');
+    });
+  });
+
+  describe('redeploy', () => {
+    it('publishes app:update with bypassCooldown after a successful pull', async () => {
+      const appName = 'redeploy-app';
+      await service.deploy({ repoUrl: `https://github.com/user/${appName}`, branch: 'main' });
+
+      const received: AppUpdatePayload[] = [];
+      const unsubscribe = eventBus.subscribe('app:update', (payload) => {
+        received.push(payload);
+      });
+
+      try {
+        const result = await service.redeploy(appName);
+
+        expect(received).toHaveLength(1);
+        expect(received[0].name).toBe(appName);
+        expect(received[0].path).toBe(path.join(tempDir, 'webapps', appName));
+        expect(received[0].bypassCooldown).toBe(true);
+        expect(result.appName).toBe(appName);
+      } finally {
+        unsubscribe();
+      }
+    });
+
+    it('clears isCloning before publishing app:update', async () => {
+      const appName = 'redeploy-cloning-app';
+      await service.deploy({ repoUrl: `https://github.com/user/${appName}`, branch: 'main' });
+
+      let isCloningWhenEventFired: boolean | undefined;
+      const unsubscribe = eventBus.subscribe('app:update', (payload) => {
+        if (payload.name === appName) {
+          isCloningWhenEventFired = service.isCloning(appName);
+        }
+      });
+
+      try {
+        await service.redeploy(appName);
+        expect(isCloningWhenEventFired).toBe(false);
+      } finally {
+        unsubscribe();
+      }
+    });
+
+    it('does not publish app:update and rejects when git pull fails', async () => {
+      const appName = 'redeploy-fail-app';
+      await service.deploy({ repoUrl: `https://github.com/user/${appName}`, branch: 'main' });
+
+      // Override the NEXT execFile call only - the pull inside redeploy() is
+      // the first (and, without a token, only) execFile call it makes.
+      (execFile as unknown as jest.Mock).mockImplementationOnce(
+        (_cmd: string, _args: string[], _opts: unknown, cb?: (err: Error) => void) => {
+          if (cb) cb(new Error('fatal: could not read from remote repository'));
+          return {} as unknown;
+        }
+      );
+
+      const handler = jest.fn();
+      const unsubscribe = eventBus.subscribe('app:update', handler);
+
+      try {
+        await expect(service.redeploy(appName)).rejects.toThrow();
+        expect(handler).not.toHaveBeenCalled();
+        expect(service.isCloning(appName)).toBe(false);
+      } finally {
+        unsubscribe();
+      }
     });
   });
 

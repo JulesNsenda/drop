@@ -27,6 +27,7 @@ import {
   AppRuntimeState,
   AppStartSpec,
 } from './app-runtime.types';
+import { eventBus } from '../../core/event-bus';
 import {
   DROP_NETWORK,
   CONTAINER_CAP_DROP,
@@ -163,10 +164,9 @@ export class ContainerManager implements AppRuntime {
       Cmd: cmd,
       WorkingDir: '/app',
       Env: env,
-      // Run as non-root where the base image supports it (nodejs → 'node',
-      // python/go → '1000:1000').  Static/nginx is left as root in Tier A
-      // because the entrypoint copies nginx config to /etc/nginx — Tier B will
-      // address this with a full-nginx.conf approach.
+      // Run as non-root everywhere: nodejs → 'node', python/go → '1000:1000',
+      // static/spa → '101:101' (the nginx user; DROP passes a full nginx.conf
+      // via -c so nothing in the container needs root).
       ...(imageUser ? { User: imageUser } : {}),
       Labels: {
         [MANAGED_LABEL]: 'true',
@@ -184,7 +184,7 @@ export class ContainerManager implements AppRuntime {
         CpuQuota: cpuQuota,
         CpuPeriod: 100_000,
         PidsLimit: DEFAULT_PIDS_LIMIT,
-        // Security
+        // Security — every container runs non-root with zero capabilities.
         CapDrop: CONTAINER_CAP_DROP,
         SecurityOpt: CONTAINER_SECURITY_OPT,
         // Networking — attach to the DROP bridge; no host networking
@@ -219,7 +219,21 @@ export class ContainerManager implements AppRuntime {
       });
     }
 
-    return this.inspectToInfo(appName, await container.inspect());
+    const info = this.inspectToInfo(appName, await container.inspect());
+
+    // Publish the lifecycle event the router (handleConfigureRoute) and webhooks
+    // subscribe to. The PM2 runtime emits this from ProcessManager; the container
+    // runtime MUST mirror it, or under docker isolation app:started never fires —
+    // so the app never gets a Caddy vhost / TLS certificate (subdomain HTTPS
+    // fails) and webhooks stay silent. Matches AppStartedPayload / the PM2 path.
+    eventBus.publish('app:started', {
+      appId: appName,
+      name: appName,
+      port: hostPort,
+      pid: info.pid ?? undefined,
+    });
+
+    return info;
   }
 
   async stop(name: string): Promise<void> {

@@ -15,5 +15,6 @@ export { createDeployCommand } from './deploy';
 export { createRemoveCommand } from './remove';
 export { createServeCommand, createServerCommand } from './serve';
 export { createBackupCommand } from './backup';
+export { createRestoreCommand } from './restore';
 export { createMigrateRuntimeCommand } from './migrate-runtime';
 export { createMfaCommand } from './mfa';

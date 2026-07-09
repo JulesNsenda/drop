@@ -20,6 +20,7 @@ import {
   createServeCommand,
   createServerCommand,
   createBackupCommand,
+  createRestoreCommand,
   createMigrateRuntimeCommand,
   createMfaCommand,
 } from './commands';
@@ -61,6 +62,7 @@ function createProgram(): Command {
   program.addCommand(createRestartCommand());
   program.addCommand(createRemoveCommand());
   program.addCommand(createBackupCommand());
+  program.addCommand(createRestoreCommand());
   program.addCommand(createMigrateRuntimeCommand());
   program.addCommand(createMfaCommand());
   program.addCommand(createVersionCommand());

@@ -1,10 +1,12 @@
-import { useState, useEffect, FormEvent } from 'react';
+import { useState, useEffect, useMemo, FormEvent } from 'react';
+import { useSearchParams } from 'react-router-dom';
 import QRCode from 'qrcode';
 import { useHealth, AppHealthCheck } from '../hooks/useApi';
 import { getAuthHeaders, useAuth } from '../hooks/useAuth';
 import { useToast } from '../components/Toast';
 import { useConfirm } from '../components/ConfirmDialog';
-import { Server, Database, Eye, HardDrive, Activity, CheckCircle, XCircle, AlertTriangle, Lock, Clock, ShieldCheck, ShieldOff } from 'lucide-react';
+import { Server, Database, Eye, HardDrive, Activity, CheckCircle, XCircle, AlertTriangle, Lock, Clock, ShieldCheck, ShieldOff, Info } from 'lucide-react';
+import Tabs, { TabDef } from '../components/Tabs';
 
 interface ActivityEntry {
   id: string;
@@ -21,6 +23,7 @@ function SettingsPage() {
   const isAdmin = role === 'admin';
   const { toast } = useToast();
   const confirmDialog = useConfirm();
+  const [searchParams, setSearchParams] = useSearchParams();
   const [appChecks, setAppChecks] = useState<AppHealthCheck[]>([]);
   const [appChecksLoading, setAppChecksLoading] = useState(true);
 
@@ -193,6 +196,25 @@ function SettingsPage() {
     return 'text-yellow-600 dark:text-yellow-400';
   };
 
+  const availableTabs = useMemo<TabDef[]>(() => {
+    const tabs: TabDef[] = [];
+    if (isAdmin) tabs.push({ id: 'system', label: 'System', icon: Server });
+    tabs.push({ id: 'account', label: 'Account', icon: Lock });
+    if (isAdmin) tabs.push({ id: 'activity', label: 'Activity', icon: Clock });
+    tabs.push({ id: 'about', label: 'About', icon: Info });
+    return tabs;
+  }, [isAdmin]);
+
+  // Invalid or role-forbidden ?tab= values fall back to the role's default
+  // without rewriting the URL, so a deep link survives async role loading.
+  const requestedTab = searchParams.get('tab');
+  const activeTab =
+    requestedTab && availableTabs.some((t) => t.id === requestedTab)
+      ? requestedTab
+      : isAdmin
+        ? 'system'
+        : 'account';
+
   return (
     <div className="p-6">
       <div className="mb-6">
@@ -200,8 +222,14 @@ function SettingsPage() {
         <p className="text-sm text-gray-500 dark:text-gray-400 mt-1">Platform health, configuration, and status</p>
       </div>
 
-      {/* Admin-only sections */}
-      {isAdmin && <>
+      <Tabs
+        tabs={availableTabs}
+        active={activeTab}
+        onChange={(id) => setSearchParams({ tab: id }, { replace: true })}
+      />
+
+      {/* System tab (admin only) */}
+      {isAdmin && activeTab === 'system' && <>
       {/* System Health */}
       <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 mb-6">
         <div className="px-4 py-3 border-b border-gray-200 dark:border-gray-700">
@@ -362,6 +390,8 @@ function SettingsPage() {
 
       </>}
 
+      {/* Account tab */}
+      {activeTab === 'account' && <>
       {/* Change Password */}
       <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 mb-6">
         <div className="px-4 py-3 border-b border-gray-200 dark:border-gray-700">
@@ -527,8 +557,43 @@ function SettingsPage() {
         </div>
       </div>
 
-      {/* Activity Log (admin only) */}
-      {isAdmin && (
+      {/* Delete Account */}
+      {!isAdmin && (
+        <div className="bg-white dark:bg-gray-800 rounded-lg border border-red-200 dark:border-red-800/50 mb-6">
+          <div className="px-4 py-3 border-b border-red-200 dark:border-red-800/50">
+            <h2 className="font-semibold text-red-600 dark:text-red-400">Danger Zone</h2>
+          </div>
+          <div className="p-4 flex items-center justify-between">
+            <div>
+              <p className="text-sm font-medium text-gray-900 dark:text-white">Delete account</p>
+              <p className="text-xs text-gray-500 dark:text-gray-400">Permanently remove your account and all your apps</p>
+            </div>
+            <button
+              onClick={async () => {
+                const confirmed = await confirmDialog({ title: 'Delete account', message: 'This will permanently delete your account and all your deployed applications. This cannot be undone.', confirmText: 'Delete my account', variant: 'danger' });
+                if (!confirmed) return;
+                try {
+                  const res = await fetch('/api/v1/auth/account', { method: 'DELETE', headers: getAuthHeaders() });
+                  const json = await res.json();
+                  if (json.success) {
+                    localStorage.clear();
+                    window.location.href = '/dashboard';
+                  } else {
+                    toast('error', json.error?.message || 'Failed to delete account');
+                  }
+                } catch { toast('error', 'Network error'); }
+              }}
+              className="px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700 text-sm font-medium"
+            >
+              Delete account
+            </button>
+          </div>
+        </div>
+      )}
+      </>}
+
+      {/* Activity tab (admin only) */}
+      {isAdmin && activeTab === 'activity' && (
         <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 mb-6">
           <div className="px-4 py-3 border-b border-gray-200 dark:border-gray-700">
             <div className="flex items-center gap-2">
@@ -563,41 +628,8 @@ function SettingsPage() {
         </div>
       )}
 
-      {/* Delete Account */}
-      {!isAdmin && (
-        <div className="bg-white dark:bg-gray-800 rounded-lg border border-red-200 dark:border-red-800/50 mb-6">
-          <div className="px-4 py-3 border-b border-red-200 dark:border-red-800/50">
-            <h2 className="font-semibold text-red-600 dark:text-red-400">Danger Zone</h2>
-          </div>
-          <div className="p-4 flex items-center justify-between">
-            <div>
-              <p className="text-sm font-medium text-gray-900 dark:text-white">Delete account</p>
-              <p className="text-xs text-gray-500 dark:text-gray-400">Permanently remove your account and all your apps</p>
-            </div>
-            <button
-              onClick={async () => {
-                const confirmed = await confirmDialog({ title: 'Delete account', message: 'This will permanently delete your account and all your deployed applications. This cannot be undone.', confirmText: 'Delete my account', variant: 'danger' });
-                if (!confirmed) return;
-                try {
-                  const res = await fetch('/api/v1/auth/account', { method: 'DELETE', headers: getAuthHeaders() });
-                  const json = await res.json();
-                  if (json.success) {
-                    localStorage.clear();
-                    window.location.href = '/dashboard';
-                  } else {
-                    toast('error', json.error?.message || 'Failed to delete account');
-                  }
-                } catch { toast('error', 'Network error'); }
-              }}
-              className="px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700 text-sm font-medium"
-            >
-              Delete account
-            </button>
-          </div>
-        </div>
-      )}
-
-      {/* About */}
+      {/* About tab */}
+      {activeTab === 'about' && (
       <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700">
         <div className="px-4 py-3 border-b border-gray-200 dark:border-gray-700">
           <h2 className="font-semibold text-gray-900 dark:text-white">About DROP</h2>
@@ -617,6 +649,7 @@ function SettingsPage() {
           </div>
         </div>
       </div>
+      )}
     </div>
   );
 }

@@ -272,6 +272,24 @@ describe('WatcherService', () => {
     expect(config.debounceMs).toBe(1000);
   });
 
+  it('markAppKnown suppresses the watcher-side app:detected for that app', () => {
+    const { eventBus } = require('../event-bus');
+    const service = new WatcherService({
+      appsDir: '/test/apps',
+      debounceMs: 1000,
+    });
+
+    service.markAppKnown('cloned-app');
+    service.handleAppDetected('cloned-app', '/test/apps/cloned-app', null, null);
+    expect(eventBus.publish).not.toHaveBeenCalledWith('app:detected', expect.anything());
+
+    service.handleAppDetected('fresh-app', '/test/apps/fresh-app', null, null);
+    expect(eventBus.publish).toHaveBeenCalledWith(
+      'app:detected',
+      expect.objectContaining({ name: 'fresh-app' })
+    );
+  });
+
   it('should start watching', async () => {
     const service = new WatcherService({
       appsDir: '/test/apps',

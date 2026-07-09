@@ -26,6 +26,8 @@ import {
   DROP_NETWORK,
   CONTAINER_CAP_DROP,
   CONTAINER_SECURITY_OPT,
+  NON_ROOT_UID,
+  NON_ROOT_GID,
   selectBaseImage,
 } from '../../managers/runtime/container-config';
 
@@ -77,9 +79,29 @@ export async function executeCommandInContainer(
   const containerName = `drop-build-${appName}-${Date.now()}`;
 
   const sanitizedEnv = sanitizeBuildEnv(env);
+  // The build runs as a NON-ROOT uid (`buildUser` below), so HOME must point at
+  // a path that uid can write. The inherited HOME (the platform user's
+  // /home/<user>) isn't writable inside the container, and a numeric uid with
+  // no /etc/passwd entry (python/go slim images) would otherwise resolve HOME
+  // to '/'. /tmp (mode 1777, the container's own ephemeral fs) covers
+  // npm/pnpm/yarn/pip caches in one line. Set after sanitizeBuildEnv so it
+  // overrides any inherited or drop.yaml HOME.
+  sanitizedEnv.HOME = '/tmp';
   const dockerEnv = Object.entries(sanitizedEnv)
     .filter((entry): entry is [string, string] => entry[1] !== undefined)
     .map(([k, v]) => `${k}=${v}`);
+
+  // Run the build as the platform's OWN uid — deterministically the owner of
+  // the cloned app dir (the platform process cloned/copied it). The default
+  // (root) hits EACCES because CapDrop:['ALL'] strips CAP_DAC_OVERRIDE (so root
+  // can't write files it doesn't own) and CAP_SETUID (so npm can't de-escalate
+  // to the owner); running as the owner needs no capability. Using the platform
+  // uid rather than a hardcoded 1000 is robust when the `drop` user isn't uid
+  // 1000, and it never escalates — a foreign-/root-owned dir fails closed with
+  // EACCES instead of running an untrusted build as root. Fallback to the
+  // non-root constants where getuid is unavailable (Windows; docker isolation
+  // is Linux-only regardless).
+  const buildUser = `${process.getuid?.() ?? NON_ROOT_UID}:${process.getgid?.() ?? NON_ROOT_GID}`;
 
   const startTime = Date.now();
   let container: Docker.Container | null = null;
@@ -93,6 +115,7 @@ export async function executeCommandInContainer(
       Image: image,
       Cmd: ['/bin/sh', '-c', command],
       WorkingDir: '/app',
+      User: buildUser,
       Env: dockerEnv,
       HostConfig: {
         // Source bind-mounted read-write — build output must land here.

@@ -197,6 +197,23 @@ describe('generateFullCaddyfile', () => {
     );
     expect(out).not.toContain('http://app.localhost');
   });
+
+  it('re-imports externally-managed host globs so the apex is not dropped', () => {
+    // Regression: RouterService.reload() fully replaces the on-disk Caddyfile.
+    // Without re-importing hosts/*.caddy, configuring the first app route wipes
+    // the apex/dashboard site out of Caddy's config.
+    const out = generateFullCaddyfile(
+      [makeRoute({ hostname: 'app.example.com', ssl: true })],
+      makeConfig({ importGlobs: ['/var/drop/data/appconf/caddy/hosts/*.caddy'] })
+    );
+    expect(out).toContain('import /var/drop/data/appconf/caddy/hosts/*.caddy');
+    expect(out).toContain('app.example.com'); // app route still present alongside the import
+  });
+
+  it('emits no import line when importGlobs is unset', () => {
+    const out = generateFullCaddyfile([makeRoute({ hostname: 'app.example.com' })], makeConfig());
+    expect(out).not.toContain('import ');
+  });
 });
 
 describe('parseTlsProtocols', () => {
