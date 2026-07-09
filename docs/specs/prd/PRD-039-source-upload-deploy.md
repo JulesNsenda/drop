@@ -6,7 +6,7 @@
 |-------|-------|
 | PRD ID | PRD-039 |
 | Feature | Source Upload Deploy (remote tarball deploys) |
-| Status | Planned |
+| Status | Completed |
 | Priority | P1 |
 | Target | v2.1 |
 | Depends On | PRD-016 (git deploy — landing pattern), PRD-029 (docker isolation); companion: PRD-040 (MCP client) |
