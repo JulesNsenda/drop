@@ -137,6 +137,48 @@ describe('ApiServer', () => {
     });
   });
 
+  describe('body-size carve-out for upload-source (PRD-039)', () => {
+    beforeEach(async () => {
+      server = new ApiServer({
+        port: 3097,
+        enableAuth: true,
+        credentialsPath,
+      });
+      await server.initialize();
+    });
+
+    it('does not 413 a large Content-Length on the upload-source path (falls through to auth instead)', async () => {
+      const app = server.getApp();
+      const res = await app.request('/api/v1/apps/foo/source', {
+        method: 'POST',
+        headers: { 'content-length': String(5 * 1024 * 1024) },
+      });
+      // The global validateBodySize() middleware is carved out for this exact
+      // path — it must never 413 here. No Authorization header means the
+      // request is rejected by auth instead (401), never by the body-size gate.
+      expect(res.status).not.toBe(413);
+      expect(res.status).toBe(401);
+    });
+
+    it('still 413s a large Content-Length on any other route (byte-identical elsewhere)', async () => {
+      const app = server.getApp();
+      const res = await app.request('/api/v1/apps', {
+        method: 'POST',
+        headers: { 'content-length': String(5 * 1024 * 1024), 'Content-Type': 'application/json' },
+      });
+      expect(res.status).toBe(413);
+    });
+
+    it('still 413s a large Content-Length on a path that merely looks similar (e.g. nested /source)', async () => {
+      const app = server.getApp();
+      const res = await app.request('/api/v1/apps/foo/source/nested', {
+        method: 'POST',
+        headers: { 'content-length': String(5 * 1024 * 1024) },
+      });
+      expect(res.status).toBe(413);
+    });
+  });
+
   describe('createApiServer factory', () => {
     it('should create server instance', () => {
       server = createApiServer({ port: 3006 });

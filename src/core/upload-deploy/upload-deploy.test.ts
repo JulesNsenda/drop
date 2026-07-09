@@ -113,6 +113,30 @@ describe('UploadDeployService', () => {
       }
     });
 
+    it('clears isUploading before publishing app:detected (platform guard must not drop the event)', async () => {
+      // The platform's app:detected subscriber (platform.ts) skips onboarding
+      // while isUploading(name) is true, mirroring GitDeployService's isCloning
+      // guard. If this method published while still marked "uploading", the
+      // platform would silently drop its own event and the app would register
+      // but never build. EventBus dispatch is synchronous, so reading
+      // isUploading from inside the subscriber observes the exact state at
+      // publish time.
+      const archivePath = await buildArchive('ordering-detected-app', { 'index.js': 'x' });
+      let uploadingAtPublish: boolean | undefined;
+      const unsubscribe = eventBus.subscribe('app:detected', (payload) => {
+        if (payload.name === 'ordering-detected-app') {
+          uploadingAtPublish = service.isUploading('ordering-detected-app');
+        }
+      });
+
+      try {
+        await service.deploy({ appName: 'ordering-detected-app', archivePath });
+        expect(uploadingAtPublish).toBe(false);
+      } finally {
+        unsubscribe();
+      }
+    });
+
     it('lands nested directories correctly', async () => {
       const archivePath = await buildArchive('nested-app', {
         'index.js': 'main',
@@ -180,6 +204,29 @@ describe('UploadDeployService', () => {
 
       expect(fssync.existsSync(path.join(appsDir, 'stale-app', 'remove-me.js'))).toBe(false);
       expect(fssync.readFileSync(path.join(appsDir, 'stale-app', 'keep.js'), 'utf8')).toBe('keep updated');
+    });
+
+    it('clears isUploading before publishing app:update (platform guard must not drop the redeploy)', async () => {
+      // Same ordering hazard as the app:detected case above, on the redeploy
+      // path: the platform's app:update subscriber (and handleAppUpdate)
+      // skip while isUploading(name) is true.
+      const archive1 = await buildArchive('ordering-update-app-v1', { 'index.js': 'v1' });
+      await service.deploy({ appName: 'ordering-update-app', archivePath: archive1 });
+
+      const archive2 = await buildArchive('ordering-update-app-v2', { 'index.js': 'v2' });
+      let uploadingAtPublish: boolean | undefined;
+      const unsubscribe = eventBus.subscribe('app:update', (payload) => {
+        if (payload.name === 'ordering-update-app') {
+          uploadingAtPublish = service.isUploading('ordering-update-app');
+        }
+      });
+
+      try {
+        await service.deploy({ appName: 'ordering-update-app', archivePath: archive2 });
+        expect(uploadingAtPublish).toBe(false);
+      } finally {
+        unsubscribe();
+      }
     });
 
     it('does not re-register or touch userId on redeploy', async () => {

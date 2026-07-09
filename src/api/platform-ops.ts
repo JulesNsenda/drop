@@ -35,6 +35,17 @@ export interface PlatformOps {
    * to a fresh start. Rejects with AppInProgressError when the app is busy.
    */
   restartApp(appName: string): Promise<AppProcessInfo>;
+
+  /**
+   * Synchronous check for whether the app currently has a build/restart/
+   * deploy in flight (backed by the platform's `appsInProgress` set). Unlike
+   * `restartApp`, callers that find this unwired (null platform-ops) should
+   * treat it as "not in progress" rather than 503 — it's a defense-in-depth
+   * guard (e.g. the upload-deploy route), not the operation itself, and the
+   * caller's own concurrency guard (e.g. UploadDeployService's activeUploads)
+   * remains the real backstop.
+   */
+  isAppInProgress(appName: string): boolean;
 }
 
 let platformOps: PlatformOps | null = null;
