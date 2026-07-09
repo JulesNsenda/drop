@@ -105,6 +105,15 @@ export class UploadDeployService {
 
       const acceptedAt = new Date().toISOString();
 
+      // Files are landed - clear the guard *before* publishing. The
+      // platform's app:detected/app:update subscribers consult isUploading
+      // the same way they consult git-deploy's isCloning (see platform.ts);
+      // publishing while still marked "uploading" would have this method's
+      // own event dropped by its own guard. Mirrors GitDeployService's
+      // "clone complete - allow watcher to detect" ordering (activeClones is
+      // cleared before its deterministic publish too).
+      this.activeUploads.delete(appName);
+
       if (isNew) {
         eventBus.publish('app:detected', {
           name: appName,
@@ -125,6 +134,9 @@ export class UploadDeployService {
 
       return { app: appName, acceptedAt, isNew };
     } finally {
+      // Idempotent: already cleared above on the success path. Still needed
+      // here for the failure path (extraction/disk-check/landFiles threw
+      // before reaching the clear above).
       this.activeUploads.delete(appName);
       if (stagingDir) {
         await fs.rm(stagingDir, { recursive: true, force: true }).catch(() => undefined);

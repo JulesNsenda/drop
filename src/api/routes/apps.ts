@@ -7,6 +7,9 @@
 import { Hono } from 'hono';
 import * as path from 'path';
 import * as fs from 'fs/promises';
+import * as fsSync from 'fs';
+import { Readable, Transform } from 'stream';
+import { pipeline } from 'stream/promises';
 import { success, error, ErrorCodes, AppDto, CreateAppDto } from '../types';
 import { NotFoundError, ValidationError } from '../middleware/error';
 import { AuthContext, listUsers, getUserById } from '../middleware/auth';
@@ -22,10 +25,16 @@ import { getStateManager, AppState } from '../../managers/app/state-manager';
 import { getAppConfigService } from '../../managers/app/app-config';
 import { getDatabaseProvisioner } from '../../managers/database';
 import { tryLogActivity } from '../../managers/activity';
-import { getAppsDirectory, isHttpsEnabled, getDomainSuffix } from '../runtime-config';
+import { getAppsDirectory, isHttpsEnabled, getDomainSuffix, getTempDirectory, getUploadMaxBytes } from '../runtime-config';
 import { isPathWithin } from '../../utils/paths';
 import { isLocalhostDomain } from '../../utils/domain-validator';
 import { eventBus } from '../../core/event-bus';
+import {
+  getUploadDeployService,
+  ArchiveRejectedError,
+  UploadValidationError,
+  InsufficientDiskSpaceError,
+} from '../../core/upload-deploy';
 import type { RuntimeType } from '../../managers/runtime/app-runtime.types';
 
 const apps = new Hono();
@@ -117,6 +126,42 @@ function toAppDto(app: AppState, isAdmin = false): AppDto {
     ownerName: isAdmin ? resolveUsername(app.userId) : undefined,
     customDomain: app.customDomain,
   };
+}
+
+/**
+ * Apps with an upload currently streaming/extracting, keyed per account (or
+ * the single-user sentinel when auth is disabled). Distinct from the
+ * platform-ops isAppInProgress check: that guards a single app name, while
+ * this caps a single account to one upload at a time even across different
+ * (e.g. brand-new) app names.
+ */
+const uploadsInFlight = new Set<string>();
+
+/** Thrown by the byte-counting transform the moment the cap is crossed. */
+class UploadTooLargeError extends Error {
+  constructor(public readonly maxBytes: number) {
+    super(`Upload exceeds maximum of ${maxBytes} bytes`);
+    this.name = 'UploadTooLargeError';
+  }
+}
+
+/**
+ * Counts bytes as they stream through and aborts (destroying the pipeline)
+ * the moment the cumulative count exceeds maxBytes — never buffers the whole
+ * body and never trusts the Content-Length header.
+ */
+function createByteLimiter(maxBytes: number): Transform {
+  let total = 0;
+  return new Transform({
+    transform(chunk: Buffer, _encoding, callback) {
+      total += chunk.length;
+      if (total > maxBytes) {
+        callback(new UploadTooLargeError(maxBytes));
+        return;
+      }
+      callback(null, chunk);
+    },
+  });
 }
 
 /** Get effective app limit for a user (per-user override > global default) */
@@ -296,6 +341,146 @@ apps.post('/', async (c) => {
 
   await tryLogActivity({ action: 'deploy', userId: auth?.userId, username: auth?.username, appName });
   return c.json(success(toAppDto({ ...app, userId: auth?.userId }, auth?.role === 'admin')), 201);
+});
+
+// POST /apps/:name/source - Deploy (or redeploy) from an uploaded gzipped
+// tarball (PRD-039). Never anonymous — auth('user') is wired in server.ts
+// even when the general /apps/* guard would allow readonly.
+apps.post('/:name/source', async (c) => {
+  const auth = (c.get as Function)('auth') as AuthContext | undefined;
+  const name = c.req.param('name');
+
+  if (!isValidAppName(name)) {
+    throw new ValidationError(
+      'Invalid app name: must be 1-64 alphanumeric characters, hyphens, or underscores'
+    );
+  }
+
+  const stateManager = getStateManager();
+  const existingApp = stateManager.getApp(name);
+
+  if (existingApp) {
+    // No existence oracle: a foreign-owned app and an unknown app both 404.
+    if (!canAccess(auth, existingApp)) {
+      throw new NotFoundError(`Application '${name}' not found`);
+    }
+    // A stopped app's rebuilds are deliberately dropped by the platform
+    // (autoBuild/autoStart both check status !== 'stopped') - a 202 here
+    // would have the caller poll for an episode that never arrives.
+    if (existingApp.status === 'stopped') {
+      return c.json(
+        error(ErrorCodes.CONFLICT, `Application '${name}' is stopped; start or remove it before uploading`),
+        409
+      );
+    }
+  } else if (auth?.userId && auth.role !== 'admin') {
+    // Same limit/behavior/status as POST /apps (first-time create only).
+    const maxApps = getAppLimit(auth.userId);
+    if (maxApps > 0) {
+      const userApps = stateManager.getAllApps().filter((a) => a.userId === auth.userId);
+      if (userApps.length >= maxApps) {
+        return c.json(error(ErrorCodes.RATE_LIMITED, `App limit reached (${maxApps}). Delete an app or contact admin.`), 429);
+      }
+    }
+  }
+
+  // Synchronous busy check: a build/restart already in flight for this app
+  // means a 202 here would never yield an observable deploy episode.
+  if (getPlatformOps()?.isAppInProgress(name)) {
+    return c.json(error(ErrorCodes.CONFLICT, `Application '${name}' has an operation in progress`), 409);
+  }
+
+  // Per-user upload concurrency of 1. Synchronous check-and-insert (no await
+  // between check and add) so two concurrent uploads from the same account
+  // can't both pass the guard — mirrors restartApp's appsInProgress pattern.
+  const inFlightKey = auth?.userId ?? '__single_user__';
+  if (uploadsInFlight.has(inFlightKey)) {
+    return c.json(error(ErrorCodes.RATE_LIMITED, 'An upload is already in progress for this account'), 429);
+  }
+  uploadsInFlight.add(inFlightKey);
+
+  let archivePath: string | undefined;
+  try {
+    // Disk watermark, re-checked here (pre-stream) and again by
+    // UploadDeployService nearer the actual write (extraction consumes disk
+    // and time has passed by then).
+    const { ok: hasDiskSpace, freeMb } = await hasEnoughDisk(getAppsDirectory());
+    if (!hasDiskSpace) {
+      return c.json(
+        error(ErrorCodes.INTERNAL_ERROR, `Insufficient disk space (${Math.round(freeMb)} MB free, need ${getMinFreeDiskMb()} MB)`),
+        507 as any
+      );
+    }
+
+    if (!c.req.raw.body) {
+      throw new ValidationError('Request body (gzipped tarball) is required');
+    }
+
+    const stagingDir = path.join(getTempDirectory(), 'upload-archives');
+    await fs.mkdir(stagingDir, { recursive: true });
+    archivePath = path.join(stagingDir, `${name}-${Date.now()}.tar.gz`);
+
+    // Stream the raw body straight to disk with an incremental byte cap —
+    // never buffered via formData()/arrayBuffer(), never trusting
+    // Content-Length (the global body-size middleware is carved out for this
+    // exact path in server.ts; this cap is the real enforcement).
+    const maxBytes = getUploadMaxBytes();
+    // c.req.raw.body is a WHATWG ReadableStream (Fetch API); Readable.fromWeb
+    // expects node:stream/web's type, which is structurally identical but a
+    // distinct declaration — hence the cast.
+    const source = Readable.fromWeb(c.req.raw.body as any);
+    const limiter = createByteLimiter(maxBytes);
+    const dest = fsSync.createWriteStream(archivePath);
+
+    try {
+      await pipeline(source, limiter, dest);
+    } catch (err) {
+      if (err instanceof UploadTooLargeError) {
+        return c.json(
+          error(ErrorCodes.VALIDATION_ERROR, `Upload exceeds maximum size of ${maxBytes} bytes`),
+          413 as any
+        );
+      }
+      throw err;
+    }
+
+    const result = await getUploadDeployService().deploy({
+      appName: name,
+      archivePath,
+      userId: auth?.userId,
+    });
+
+    await tryLogActivity({
+      action: 'upload-deploy',
+      userId: auth?.userId,
+      username: auth?.username,
+      appName: name,
+    });
+
+    return c.json(success({ app: result.app, acceptedAt: result.acceptedAt, isNew: result.isNew }), 202);
+  } catch (err) {
+    if (err instanceof ArchiveRejectedError) {
+      return c.json(
+        error(ErrorCodes.VALIDATION_ERROR, `Archive rejected: ${err.message} (reason: ${err.reason})`),
+        400
+      );
+    }
+    if (err instanceof UploadValidationError) {
+      return c.json(error(ErrorCodes.VALIDATION_ERROR, err.message), 400);
+    }
+    if (err instanceof InsufficientDiskSpaceError) {
+      return c.json(error(ErrorCodes.INTERNAL_ERROR, err.message), 507 as any);
+    }
+    // Anything else (validation errors thrown above, unexpected failures)
+    // rethrows to the global error handler: HttpErrors map to their own
+    // status, everything else becomes a generic 500.
+    throw err;
+  } finally {
+    uploadsInFlight.delete(inFlightKey);
+    if (archivePath) {
+      await fs.rm(archivePath, { force: true }).catch(() => undefined);
+    }
+  }
 });
 
 // PUT /apps/:name - Update application
