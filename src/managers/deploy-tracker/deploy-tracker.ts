@@ -47,7 +47,7 @@ import type {
 
 const MAX_ROWS = 1000;
 
-type DeployTrigger = 'deploy' | 'hot-reload';
+type DeployTrigger = 'deploy' | 'hot-reload' | 'upload';
 
 interface PendingTrigger {
   trigger: DeployTrigger;
@@ -124,13 +124,15 @@ export class DeployTracker {
 
   private handleAppDetected(payload: AppDetectedPayload): void {
     const appName = this.resolveAppName(payload);
-    this.pendingTrigger.set(appName, { trigger: 'deploy', at: payload.timestamp.toISOString() });
+    const trigger: DeployTrigger = payload.origin === 'upload' ? 'upload' : 'deploy';
+    this.pendingTrigger.set(appName, { trigger, at: payload.timestamp.toISOString() });
     // Transient only — do NOT open an episode (avoids restart orphans).
   }
 
   private handleAppUpdate(payload: AppUpdatePayload): void {
     const appName = this.resolveAppName(payload);
-    this.pendingTrigger.set(appName, { trigger: 'hot-reload', at: payload.timestamp.toISOString() });
+    const trigger: DeployTrigger = payload.reason === 'upload deploy' ? 'upload' : 'hot-reload';
+    this.pendingTrigger.set(appName, { trigger, at: payload.timestamp.toISOString() });
     // Transient only — do NOT open an episode.
   }
 
@@ -384,8 +386,8 @@ export class DeployTracker {
     }
   }
 
-  private deriveTrigger(detail: string | undefined): 'deploy' | 'hot-reload' | 'unknown' {
-    if (detail === 'deploy' || detail === 'hot-reload') return detail;
+  private deriveTrigger(detail: string | undefined): 'deploy' | 'hot-reload' | 'upload' | 'unknown' {
+    if (detail === 'deploy' || detail === 'hot-reload' || detail === 'upload') return detail;
     return 'unknown';
   }
 
