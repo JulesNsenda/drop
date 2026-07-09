@@ -135,7 +135,7 @@ export interface DeployStageDto {
 export interface DeployEpisodeDto {
   deployId: string;
   appName: string;
-  trigger: 'deploy' | 'hot-reload' | 'unknown';
+  trigger: 'deploy' | 'hot-reload' | 'upload' | 'unknown';
   status: 'in-progress' | 'succeeded' | 'failed' | 'superseded' | 'interrupted';
   startedAt: string;
   endedAt?: string;
