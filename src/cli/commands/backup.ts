@@ -44,8 +44,12 @@ function resolveDropRoot(rootOpt?: string): string {
   return rootOpt || process.env.DROP_ROOT || DEFAULT_DROP_ROOT;
 }
 
-/** Files under data/drop-svc that hold critical state. */
-const DROP_SVC_FILES = [
+/**
+ * Files under data/drop-svc that hold critical state. Exported so `drop
+ * restore` can copy back exactly the set of files a backup may contain —
+ * single source of truth, so the two commands can't silently drift apart.
+ */
+export const DROP_SVC_FILES = [
   'apps.json',
   'secrets.json',
   'webhooks.json',

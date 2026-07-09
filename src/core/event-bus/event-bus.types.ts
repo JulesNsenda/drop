@@ -82,6 +82,8 @@ export interface AppDetectedPayload extends BaseEvent {
   name: string;
   path: string;
   type?: string;
+  /** Set when detection was triggered by an upload-deploy (PRD-039), not the file watcher. */
+  origin?: 'upload';
 }
 
 export interface AppCreatedPayload extends BaseEvent {
@@ -99,6 +101,8 @@ export interface AppUpdatePayload extends BaseEvent {
   name: string;
   path: string;
   reason: string;
+  /** Set by an explicit redeploy (git pull / webhook) so the anti-loop cooldown doesn't swallow it. */
+  bypassCooldown?: boolean;
 }
 
 export interface AppRemovedPayload extends BaseEvent {

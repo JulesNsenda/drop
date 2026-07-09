@@ -47,7 +47,7 @@ export interface DeployEpisode {
    * re-registers the freed app name. Strip this before returning to clients.
    */
   userId?: string;
-  trigger: 'deploy' | 'hot-reload' | 'unknown';
+  trigger: 'deploy' | 'hot-reload' | 'upload' | 'unknown';
   status: DeployStatus;
   startedAt: string;
   endedAt?: string;

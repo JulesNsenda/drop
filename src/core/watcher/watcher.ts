@@ -257,6 +257,17 @@ export class WatcherService {
     });
   }
 
+  /**
+   * Mark an app as already known so the watcher does not publish its own
+   * app:detected for it. Called by the platform when an app was onboarded by
+   * a non-watcher path (e.g. git deploy's deterministic publish) — without
+   * this, the watcher's debounced flush would emit a duplicate detection for
+   * the same app a few seconds later. Idempotent.
+   */
+  markAppKnown(appName: string): void {
+    this.knownApps.add(appName);
+  }
+
   private handleAppRemoved(appName: string, _appPath: string): void {
     if (!this.knownApps.has(appName)) {
       return;

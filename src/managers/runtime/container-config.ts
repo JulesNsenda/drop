@@ -19,6 +19,11 @@ const BASE_IMAGES: Partial<Record<AppType, string>> = {
   python: 'python:3.12-slim',
   go: 'golang:1.22-alpine',
   static: 'nginx:alpine',
+  // SPAs are served by the same nginx path as plain static apps
+  // (buildStartSpec treats 'static' and 'spa' identically); without this
+  // entry they fell back to node:20-slim, where the nginx start command
+  // cannot exist.
+  spa: 'nginx:alpine',
 };
 
 /** Fallback for types not yet fully containerised. */
@@ -50,13 +55,17 @@ export function selectBaseImage(appType: AppType, runtimeImage?: string): string
  * - node:20-slim ships a `node` user (UID 1000, GID 1000).
  * - python/go slim images have no named non-root user; `1000:1000` is used as
  *   a numeric UID which Docker accepts even without /etc/passwd entry.
- * - nginx:alpine has an `nginx` user but the static entrypoint writes to
- *   /etc/nginx so it runs as root in Tier A; tightened in Tier B.
+ * - static/spa run nginx:alpine as its `nginx` user (uid/gid 101) — Tier B:
+ *   DROP generates a full nginx.conf with pid/temp paths under /tmp and
+ *   starts nginx via `-c` from the bind-mounted data dir, so nothing needs
+ *   root or capabilities.
  */
 const IMAGE_USERS: Partial<Record<AppType, string>> = {
   nodejs: 'node',
   python: '1000:1000',
   go: '1000:1000',
+  static: '101:101',
+  spa: '101:101',
 };
 
 /** UID used for non-root container apps (nodejs and python/go fallback). */

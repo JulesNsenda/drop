@@ -3,7 +3,7 @@ import { Link, useNavigate } from 'react-router-dom';
 import { RefreshCw, ExternalLink, Clock, Search, Filter, User, GitBranch, ArrowRight } from 'lucide-react';
 import { useApps } from '../hooks/useApi';
 import { useAuth } from '../hooks/useAuth';
-import { appUrl } from '../api/client';
+import { appLinkInfo } from '../api/client';
 import StatusBadge from '../components/StatusBadge';
 
 const STATUS_OPTIONS = ['all', 'running', 'stopped', 'building', 'errored', 'pending'] as const;
@@ -165,14 +165,14 @@ function AppsPage() {
               <div className="space-y-2 text-sm">
                 {app.port && app.status === 'running' && (
                   <a
-                    href={app.customDomain ? `https://${app.customDomain}` : appUrl(app.port)}
+                    href={appLinkInfo(app).href}
                     target="_blank"
                     rel="noopener noreferrer"
                     onClick={(e) => e.stopPropagation()}
                     className="flex items-center gap-2 text-drop-600 dark:text-drop-400 hover:underline"
                   >
                     <ExternalLink className="w-4 h-4" />
-                    <span>{app.customDomain || `localhost:${app.port}`}</span>
+                    <span>{appLinkInfo(app).label}</span>
                   </a>
                 )}
                 <div className="flex items-center gap-2 text-gray-500 dark:text-gray-400">

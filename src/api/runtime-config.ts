@@ -7,13 +7,22 @@
  * same env/defaults the platform uses when not explicitly set.
  */
 
+import * as path from 'path';
+
 const isWindows = process.platform === 'win32';
+const DEFAULT_DROP_ROOT = isWindows ? 'C:\\drop' : '/var/drop';
 const DEFAULT_APPS_DIR = isWindows ? 'C:\\drop\\data\\webapps' : '/var/drop/data/webapps';
+/** Default compressed-archive upload cap (MB), matching PlatformConfig.maxUploadSizeMb's default. */
+const DEFAULT_MAX_UPLOAD_SIZE_MB = 100;
 
 interface ApiRuntimeConfig {
   appsDirectory?: string;
   enableHttps?: boolean;
   domainSuffix?: string;
+  /** Directory for ephemeral build/upload staging (outside the watched webapps tree). */
+  tempDirectory?: string;
+  /** Cap on the compressed (as-uploaded) archive size, in MB. */
+  maxUploadSizeMb?: number;
 }
 
 const runtimeConfig: ApiRuntimeConfig = {};
@@ -22,11 +31,39 @@ export function setApiRuntimeConfig(config: ApiRuntimeConfig): void {
   if (config.appsDirectory) runtimeConfig.appsDirectory = config.appsDirectory;
   if (config.enableHttps !== undefined) runtimeConfig.enableHttps = config.enableHttps;
   if (config.domainSuffix !== undefined) runtimeConfig.domainSuffix = config.domainSuffix;
+  if (config.tempDirectory) runtimeConfig.tempDirectory = config.tempDirectory;
+  if (config.maxUploadSizeMb !== undefined) runtimeConfig.maxUploadSizeMb = config.maxUploadSizeMb;
 }
 
 /** Resolved webapps directory: explicit config > DROP_APPS_DIR env > platform default. */
 export function getAppsDirectory(): string {
   return runtimeConfig.appsDirectory || process.env.DROP_APPS_DIR || DEFAULT_APPS_DIR;
+}
+
+/**
+ * Resolved temp/staging directory: explicit config > DROP_ROOT env (+ data/temp)
+ * > platform default. Mirrors `platform.ts`'s `getBuildWorkDir` root — outside
+ * the watched webapps tree, so the watcher never sees staged upload archives.
+ */
+export function getTempDirectory(): string {
+  if (runtimeConfig.tempDirectory) return runtimeConfig.tempDirectory;
+  const dropRoot = process.env.DROP_ROOT || DEFAULT_DROP_ROOT;
+  return path.join(dropRoot, 'data', 'temp');
+}
+
+/**
+ * Resolved cap on the compressed (as-uploaded) archive size, in bytes:
+ * explicit config > DROP_MAX_UPLOAD_SIZE_MB env > default (100 MB). This is
+ * the route's own streamed byte cap (413) — distinct from
+ * UploadDeployService's maxUncompressedBytes, which bounds the *decompressed*
+ * size instead.
+ */
+export function getUploadMaxBytes(): number {
+  const envMb = process.env.DROP_MAX_UPLOAD_SIZE_MB
+    ? parseInt(process.env.DROP_MAX_UPLOAD_SIZE_MB, 10)
+    : undefined;
+  const mb = runtimeConfig.maxUploadSizeMb ?? envMb ?? DEFAULT_MAX_UPLOAD_SIZE_MB;
+  return mb * 1024 * 1024;
 }
 
 /** Whether HTTPS is enabled for app routes. */

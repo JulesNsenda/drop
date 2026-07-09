@@ -17,9 +17,11 @@
 
 import { ContainerManager } from './container-manager';
 import { AppStartSpec } from './app-runtime.types';
+import { eventBus } from '../../core/event-bus';
 import {
   DROP_NETWORK,
   selectBaseImage,
+  selectImageUser,
   DEFAULT_PIDS_LIMIT,
   CONTAINER_CAP_DROP,
   CONTAINER_SECURITY_OPT,
@@ -132,6 +134,48 @@ describe('ContainerManager', () => {
       expect(call.HostConfig.CapDrop).toEqual(CONTAINER_CAP_DROP);
       expect(call.HostConfig.SecurityOpt).toEqual(CONTAINER_SECURITY_OPT);
       expect(call.HostConfig.PidsLimit).toBe(DEFAULT_PIDS_LIMIT);
+      // No capabilities are ever granted back — all app types run non-root.
+      expect(call.HostConfig.CapAdd).toBeUndefined();
+    });
+
+    it('runs static apps as the unprivileged nginx user with zero capabilities', async () => {
+      const docker = makeDockerMock() as any;
+      const mgr = new ContainerManager(docker);
+
+      await mgr.start({
+        ...baseSpec,
+        name: 'my-site',
+        script: '/bin/sh',
+        interpreter: 'none',
+        args: ['-c', "nginx -c /data/nginx.conf -g 'daemon off;'"],
+        appType: 'static',
+      });
+
+      const call = docker.createContainer.mock.calls[0][0];
+      expect(call.Image).toBe('nginx:alpine');
+      expect(call.User).toBe('101:101');
+      expect(call.HostConfig.CapDrop).toEqual(CONTAINER_CAP_DROP);
+      expect(call.HostConfig.CapAdd).toBeUndefined();
+    });
+
+    it('publishes app:started with the port so the router configures the app route under docker isolation', async () => {
+      const docker = makeDockerMock() as any;
+      const mgr = new ContainerManager(docker);
+      const publishSpy = jest.spyOn(eventBus, 'publish');
+
+      try {
+        await mgr.start(baseSpec);
+
+        // handleConfigureRoute (router) and webhooks listen for this event. Without
+        // it, docker-isolated apps never get a Caddy vhost / TLS cert. Must match
+        // the PM2 runtime's payload shape (appId/name/port/pid).
+        expect(publishSpy).toHaveBeenCalledWith(
+          'app:started',
+          expect.objectContaining({ appId: 'my-app', name: 'my-app', port: 4000 })
+        );
+      } finally {
+        publishSpy.mockRestore();
+      }
     });
 
     it('publishes the port to loopback only', async () => {
@@ -468,6 +512,10 @@ describe('selectBaseImage', () => {
     expect(selectBaseImage('static')).toBe('nginx:alpine');
   });
 
+  it('returns nginx:alpine for spa (served by the same nginx path as static)', () => {
+    expect(selectBaseImage('spa')).toBe('nginx:alpine');
+  });
+
   it('respects runtimeImage override when image is in the allowlist', () => {
     expect(selectBaseImage('nodejs', 'node:20-slim')).toBe('node:20-slim');
   });
@@ -480,5 +528,18 @@ describe('selectBaseImage', () => {
 
   it('falls back to node:20-slim for unknown types', () => {
     expect(selectBaseImage('docker' as any)).toBe('node:20-slim');
+  });
+});
+
+describe('selectImageUser', () => {
+  it('runs static and spa as the nginx user (uid/gid 101)', () => {
+    expect(selectImageUser('static')).toBe('101:101');
+    expect(selectImageUser('spa')).toBe('101:101');
+  });
+
+  it('runs nodejs as the node user and python/go as 1000:1000', () => {
+    expect(selectImageUser('nodejs')).toBe('node');
+    expect(selectImageUser('python')).toBe('1000:1000');
+    expect(selectImageUser('go')).toBe('1000:1000');
   });
 });

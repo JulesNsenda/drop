@@ -100,7 +100,7 @@ async function startDaemon(options: {
   }
 }
 
-async function getDaemonStatus(): Promise<{
+export async function getDaemonStatus(): Promise<{
   running: boolean;
   pid?: number;
   uptime?: number;
