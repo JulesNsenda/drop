@@ -7,6 +7,8 @@ import { ConfirmProvider } from './components/ConfirmDialog';
 import { AuthContext, useAuthProvider } from './hooks/useAuth';
 import { UNAUTHORIZED_EVENT, MUST_CHANGE_PASSWORD_EVENT } from './api/client';
 const LandingPage = lazy(() => import('./pages/LandingPage'));
+const DocsPage = lazy(() => import('./pages/DocsPage'));
+const ReferencePage = lazy(() => import('./pages/ReferencePage'));
 import AppsPage from './pages/AppsPage';
 import AppDetailPage from './pages/AppDetailPage';
 import SettingsPage from './pages/SettingsPage';
@@ -72,6 +74,28 @@ function App() {
             } />
             <Route path="signup" element={
               auth.authenticated ? <Navigate to="/apps" replace /> : <SignupPage />
+            } />
+
+            {/* Public docs site (PRD-043) — no auth, not wrapped in Layout */}
+            <Route path="docs" element={
+              <Suspense fallback={
+                <div className="min-h-screen flex items-center justify-center bg-gray-50 dark:bg-gray-900">
+                  <div className="animate-pulse text-gray-400">Loading...</div>
+                </div>
+              }>
+                <DocsPage />
+              </Suspense>
+            } />
+
+            {/* Public API/CLI reference (PRD-044) — no auth, not wrapped in Layout */}
+            <Route path="reference" element={
+              <Suspense fallback={
+                <div className="min-h-screen flex items-center justify-center bg-gray-50 dark:bg-gray-900">
+                  <div className="animate-pulse text-gray-400">Loading...</div>
+                </div>
+              }>
+                <ReferencePage />
+              </Suspense>
             } />
 
             {/* Force-password-change — accessible while authenticated */}
