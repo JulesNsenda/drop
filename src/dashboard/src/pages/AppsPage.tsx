@@ -1,12 +1,49 @@
-import { useState, useMemo } from 'react';
+import { useMemo, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
-import { RefreshCw, ExternalLink, Clock, Search, Filter, User, GitBranch, ArrowRight } from 'lucide-react';
+import {
+  ArrowRight,
+  Clock,
+  Cpu,
+  ExternalLink,
+  Filter,
+  GitBranch,
+  RefreshCw,
+  Search,
+  User,
+} from 'lucide-react';
 import { useApps } from '../hooks/useApi';
+import type { App } from '../hooks/useApi';
 import { useAuth } from '../hooks/useAuth';
 import { appLinkInfo } from '../api/client';
 import StatusBadge from '../components/StatusBadge';
+import { statusToTone } from '../components/ui/Badge';
+import Button from '../components/ui/Button';
+import Card from '../components/ui/Card';
+import StatCard from '../components/ui/StatCard';
 
 const STATUS_OPTIONS = ['all', 'running', 'stopped', 'building', 'errored', 'pending'] as const;
+
+const DOT_COLOR: Record<string, string> = {
+  ok: 'var(--ok)',
+  err: 'var(--err)',
+  warn: 'var(--warn)',
+  accent: 'var(--accent)',
+  neutral: 'var(--text-3)',
+};
+
+/**
+ * The `/apps` list endpoint joins in live PM2 stats (memory/cpu) for running
+ * apps (see `src/api/routes/apps.ts`), but the shared `App` type
+ * (hooks/useApi.ts) doesn't declare those fields yet — extending locally here
+ * rather than editing that shared hook, which is out of scope for this file.
+ */
+type AppWithStats = App & { cpu?: number; memory?: number };
+
+function formatDate(dateString?: string) {
+  if (!dateString) return 'Never';
+  const date = new Date(dateString);
+  return date.toLocaleString();
+}
 
 function AppsPage() {
   const { apps, loading, error, refresh } = useApps();
@@ -17,7 +54,7 @@ function AppsPage() {
   const [statusFilter, setStatusFilter] = useState<string>('all');
 
   const filteredApps = useMemo(() => {
-    return apps.filter((app) => {
+    return apps.filter(app => {
       const matchesSearch =
         !search ||
         app.name.toLowerCase().includes(search.toLowerCase()) ||
@@ -38,62 +75,85 @@ function AppsPage() {
     return counts;
   }, [apps]);
 
-  const formatDate = (dateString?: string) => {
-    if (!dateString) return 'Never';
-    const date = new Date(dateString);
-    return date.toLocaleString();
-  };
+  // Overview strip (PRD-047 §2.3) — real data only. "Apps online" is a count
+  // from the apps list already fetched. "Avg CPU" only renders when at least
+  // one running app actually carries a `cpu` sample; there is no
+  // "Databases"/"Requests per min" data source on this endpoint, so those
+  // cards are omitted rather than fabricated (PRD-048 territory).
+  const runningCount = useMemo(() => apps.filter(app => app.status === 'running').length, [apps]);
+
+  const avgCpu = useMemo(() => {
+    const samples = (apps as AppWithStats[])
+      .filter(app => app.status === 'running' && typeof app.cpu === 'number')
+      .map(app => app.cpu as number);
+    if (samples.length === 0) return null;
+    return samples.reduce((sum, v) => sum + v, 0) / samples.length;
+  }, [apps]);
 
   return (
     <div className="p-6">
       {/* Header */}
-      <div className="flex items-center justify-between mb-6">
+      <div className="mb-6 flex items-center justify-between gap-3">
         <div>
-          <h1 className="text-2xl font-bold text-gray-900 dark:text-white">Applications</h1>
-          <p className="text-gray-500 dark:text-gray-400">
+          <h1 className="text-2xl font-bold" style={{ color: 'var(--text)' }}>
+            Applications
+          </h1>
+          <p style={{ color: 'var(--text-2)' }}>
             {apps.length} app{apps.length !== 1 ? 's' : ''} deployed
           </p>
         </div>
-        <button
-          onClick={refresh}
-          disabled={loading}
-          className="flex items-center gap-2 px-4 py-2 bg-drop-600 text-white rounded-lg hover:bg-drop-700 disabled:opacity-50 transition-colors"
-        >
-          <RefreshCw className={`w-4 h-4 ${loading ? 'animate-spin' : ''}`} />
+        <Button variant="secondary" onClick={refresh} disabled={loading}>
+          <RefreshCw className={`h-4 w-4 ${loading ? 'animate-spin' : ''}`} />
           Refresh
-        </button>
+        </Button>
       </div>
+
+      {/* Overview stat strip */}
+      {apps.length > 0 && (
+        <div className="mb-6 grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
+          <StatCard label="Apps online" value={`${runningCount}/${apps.length}`} icon={GitBranch} />
+          {avgCpu !== null && (
+            <StatCard label="Avg CPU" value={`${avgCpu.toFixed(1)}%`} icon={Cpu} />
+          )}
+        </div>
+      )}
 
       {/* Search and filter bar */}
       {apps.length > 0 && (
-        <div className="flex flex-col sm:flex-row gap-3 mb-6">
+        <div className="mb-6 flex flex-col gap-3 sm:flex-row">
           {/* Search */}
-          <div className="relative flex-1 max-w-md">
-            <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400" />
+          <div className="relative max-w-md flex-1">
+            <Search
+              className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2"
+              style={{ color: 'var(--text-3)' }}
+            />
             <input
               type="text"
               value={search}
-              onChange={(e) => setSearch(e.target.value)}
+              onChange={e => setSearch(e.target.value)}
               placeholder="Search apps..."
-              className="w-full pl-10 pr-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-800 text-gray-900 dark:text-white focus:ring-2 focus:ring-drop-500 focus:border-transparent outline-none text-sm"
+              className="dui-input w-full rounded-lg py-2 pl-10 pr-3 text-sm outline-none"
             />
           </div>
 
           {/* Status filter */}
-          <div className="flex items-center gap-2">
-            <Filter className="w-4 h-4 text-gray-400" />
-            <div className="flex gap-1">
-              {STATUS_OPTIONS.map((s) => (
+          <div className="flex flex-wrap items-center gap-2">
+            <Filter className="h-4 w-4" style={{ color: 'var(--text-3)' }} />
+            <div className="flex flex-wrap gap-1">
+              {STATUS_OPTIONS.map(s => (
                 <button
                   key={s}
                   onClick={() => setStatusFilter(s)}
-                  className={`px-3 py-1.5 text-xs font-medium rounded-full transition-colors ${
+                  className="rounded-full px-3 py-1.5 text-xs font-medium transition-colors"
+                  style={
                     statusFilter === s
-                      ? 'bg-drop-600 text-white'
-                      : 'bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-400 hover:bg-gray-200 dark:hover:bg-gray-700'
-                  }`}
+                      ? { background: 'var(--accent)', color: 'var(--accent-ink)' }
+                      : { background: 'var(--bg-2)', color: 'var(--text-2)' }
+                  }
                 >
-                  {s === 'all' ? `All (${statusCounts.all || 0})` : `${s} (${statusCounts[s] || 0})`}
+                  {s === 'all'
+                    ? `All (${statusCounts.all || 0})`
+                    : `${s} (${statusCounts[s] || 0})`}
                 </button>
               ))}
             </div>
@@ -103,95 +163,130 @@ function AppsPage() {
 
       {/* Error state */}
       {error && (
-        <div className="mb-6 p-4 bg-red-50 dark:bg-red-900/30 border border-red-200 dark:border-red-800 rounded-lg text-red-700 dark:text-red-400">
+        <div
+          role="alert"
+          className="mb-6 rounded-lg border px-4 py-3 text-sm"
+          style={{
+            background: 'color-mix(in srgb, var(--err) 15%, transparent)',
+            borderColor: 'color-mix(in srgb, var(--err) 35%, transparent)',
+            color: 'var(--err)',
+          }}
+        >
           {error}
         </div>
       )}
 
       {/* Empty state - onboarding */}
       {!loading && apps.length === 0 && (
-        <div className="max-w-lg mx-auto text-center py-16">
-          <div className="w-16 h-16 bg-drop-100 dark:bg-drop-900/30 rounded-2xl flex items-center justify-center mx-auto mb-6">
-            <GitBranch className="w-8 h-8 text-drop-600 dark:text-drop-400" />
-          </div>
-          <h2 className="text-xl font-bold text-gray-900 dark:text-white mb-2">Deploy your first app</h2>
-          <p className="text-gray-500 dark:text-gray-400 mb-8 leading-relaxed">
-            Paste a GitHub repo URL and your app will be live in seconds. Supports Node.js, Python, Go, static sites, and Docker.
-          </p>
-          <button
-            onClick={() => navigate('/deploy')}
-            className="inline-flex items-center gap-2 px-6 py-3 bg-drop-600 text-white rounded-lg hover:bg-drop-700 font-medium transition-colors"
+        <Card className="mx-auto max-w-lg p-10 text-center">
+          <div
+            className="mx-auto mb-6 flex h-16 w-16 items-center justify-center rounded-2xl"
+            style={{ background: 'var(--accent-soft)' }}
           >
+            <GitBranch className="h-8 w-8" style={{ color: 'var(--accent)' }} />
+          </div>
+          <h2 className="mb-2 text-xl font-bold" style={{ color: 'var(--text)' }}>
+            Deploy your first app
+          </h2>
+          <p className="mb-8 leading-relaxed" style={{ color: 'var(--text-2)' }}>
+            Paste a GitHub repo URL and your app will be live in seconds. Supports Node.js, Python,
+            Go, static sites, and Docker.
+          </p>
+          <Button variant="primary" onClick={() => navigate('/deploy')}>
             Deploy from GitHub
-            <ArrowRight className="w-4 h-4" />
-          </button>
-        </div>
+            <ArrowRight className="h-4 w-4" />
+          </Button>
+        </Card>
       )}
 
       {/* No results from filter */}
       {apps.length > 0 && filteredApps.length === 0 && (
-        <div className="text-center py-12">
-          <Search className="w-12 h-12 text-gray-300 dark:text-gray-600 mx-auto mb-4" />
-          <p className="text-gray-500 dark:text-gray-400">No apps match your search</p>
+        <div className="py-12 text-center">
+          <Search className="mx-auto mb-4 h-12 w-12" style={{ color: 'var(--text-3)' }} />
+          <p style={{ color: 'var(--text-2)' }}>No apps match your search</p>
           <button
-            onClick={() => { setSearch(''); setStatusFilter('all'); }}
-            className="mt-2 text-sm text-drop-600 hover:underline"
+            onClick={() => {
+              setSearch('');
+              setStatusFilter('all');
+            }}
+            className="mt-2 text-sm font-medium"
+            style={{ color: 'var(--accent)' }}
           >
             Clear filters
           </button>
         </div>
       )}
 
-      {/* Apps grid */}
+      {/* Apps list */}
       {filteredApps.length > 0 && (
-        <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
-          {filteredApps.map((app) => (
-            <Link
-              key={app.name}
-              to={`/apps/${app.name}`}
-              className="block bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-5 hover:shadow-md hover:border-drop-300 dark:hover:border-drop-600 transition-all"
-            >
-              <div className="flex items-start justify-between mb-3">
-                <div>
-                  <h3 className="font-semibold text-gray-900 dark:text-white">{app.name}</h3>
-                  <p className="text-sm text-gray-500 dark:text-gray-400">
-                    {app.type}
-                    {app.framework && ` / ${app.framework}`}
-                  </p>
-                </div>
-                <StatusBadge status={app.status} />
-              </div>
+        <div className="flex flex-col gap-3">
+          {filteredApps.map(app => (
+            <Link key={app.name} to={`/apps/${app.name}`} className="block">
+              <Card className="transition-colors hover:!border-[var(--accent-2)]">
+                <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                  <div className="flex min-w-0 items-center gap-3">
+                    <span
+                      className="h-2.5 w-2.5 flex-shrink-0 rounded-full"
+                      style={{ background: DOT_COLOR[statusToTone(app.status)] }}
+                      aria-hidden="true"
+                    />
+                    <div className="min-w-0">
+                      <div className="flex items-center gap-2">
+                        <h3 className="truncate font-semibold" style={{ color: 'var(--text)' }}>
+                          {app.name}
+                        </h3>
+                        <StatusBadge status={app.status} />
+                      </div>
+                      <p className="truncate text-sm" style={{ color: 'var(--text-3)' }}>
+                        {app.type}
+                        {app.framework && ` · ${app.framework}`}
+                        {app.port ? ` · :${app.port}` : ''}
+                      </p>
+                    </div>
+                  </div>
 
-              <div className="space-y-2 text-sm">
-                {app.port && app.status === 'running' && (
-                  <a
-                    href={appLinkInfo(app).href}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    onClick={(e) => e.stopPropagation()}
-                    className="flex items-center gap-2 text-drop-600 dark:text-drop-400 hover:underline"
+                  <div
+                    className="flex flex-wrap items-center gap-x-5 gap-y-1 text-sm sm:justify-end"
+                    style={{ color: 'var(--text-2)' }}
                   >
-                    <ExternalLink className="w-4 h-4" />
-                    <span>{appLinkInfo(app).label}</span>
-                  </a>
-                )}
-                <div className="flex items-center gap-2 text-gray-500 dark:text-gray-400">
-                  <Clock className="w-4 h-4" />
-                  <span>{formatDate(app.lastDeployedAt)}</span>
+                    {app.port && app.status === 'running' && (
+                      <a
+                        href={appLinkInfo(app).href}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        onClick={e => e.stopPropagation()}
+                        className="inline-flex items-center gap-1.5 hover:underline"
+                        style={{ color: 'var(--accent)' }}
+                      >
+                        <ExternalLink className="h-3.5 w-3.5" />
+                        <span>{appLinkInfo(app).label}</span>
+                      </a>
+                    )}
+                    <span className="inline-flex items-center gap-1.5">
+                      <Clock className="h-3.5 w-3.5" style={{ color: 'var(--text-3)' }} />
+                      {formatDate(app.lastDeployedAt)}
+                    </span>
+                    {isAdmin && app.ownerName && (
+                      <span className="inline-flex items-center gap-1.5">
+                        <User className="h-3.5 w-3.5" style={{ color: 'var(--text-3)' }} />
+                        {app.ownerName}
+                      </span>
+                    )}
+                  </div>
                 </div>
-                {isAdmin && app.ownerName && (
-                  <div className="flex items-center gap-2 text-gray-400">
-                    <User className="w-4 h-4" />
-                    <span>{app.ownerName}</span>
+
+                {app.error && (
+                  <div
+                    className="mt-3 truncate rounded-lg px-3 py-2 text-xs"
+                    style={{
+                      background: 'color-mix(in srgb, var(--err) 15%, transparent)',
+                      color: 'var(--err)',
+                    }}
+                  >
+                    {app.error}
                   </div>
                 )}
-              </div>
-
-              {app.error && (
-                <div className="mt-3 p-2 bg-red-50 dark:bg-red-900/30 rounded text-xs text-red-600 dark:text-red-400 truncate">
-                  {app.error}
-                </div>
-              )}
+              </Card>
             </Link>
           ))}
         </div>

@@ -1,22 +1,39 @@
-import { Outlet, NavLink, useNavigate } from 'react-router-dom';
-import { LayoutGrid, Settings, Upload, Users, Sun, Moon, Monitor, LogOut, User } from 'lucide-react';
+import { Outlet, NavLink, Link, useLocation, useNavigate } from 'react-router-dom';
+import {
+  LayoutGrid,
+  Settings,
+  Upload,
+  Users,
+  Sun,
+  Moon,
+  Monitor,
+  LogOut,
+  Plus,
+} from 'lucide-react';
 import { useTheme } from '../hooks/useTheme';
 import { useAuth } from '../hooks/useAuth';
 import { useToast } from './Toast';
 import LimitBadge from './LimitBadge';
+import Button from './ui/Button';
 import AppShell from './AppShell';
 
 /**
- * Thin wrapper around AppShell (PRD-045): fills the shell's `sidebarNav` and
- * `themeToggle` slots with the real nav items, LimitBadge, theme toggle, and
- * logout. AppShell owns the responsive sidebar/drawer chrome; this component
+ * Thin wrapper around AppShell (PRD-045/PRD-047): fills the shell's
+ * `sidebarNav`, `breadcrumb`, `themeToggle`, `headerActions`, and `user`
+ * slots. AppShell owns the responsive sidebar/drawer chrome; this component
  * only supplies content and behavior — see AppShell.tsx for the shell itself.
+ *
+ * Nav reconciliation (PRD-047 §2.1): Applications (/apps), Deploy (/deploy),
+ * Users (/users, admin-only), Settings (/settings) — every item routes to a
+ * real page. The mockup's top-level Databases/Domains/Logs are intentionally
+ * omitted (they're per-app, surfaced on the app-detail tabs in a later slice).
  */
 function Layout() {
   const { theme, setTheme } = useTheme();
   const { authRequired, username, role, logout } = useAuth();
   const navigate = useNavigate();
   const { toast } = useToast();
+  const location = useLocation();
 
   // PRD-026: explicit redirect to the landing page + confirmation on logout.
   const handleLogout = () => {
@@ -68,44 +85,43 @@ function Layout() {
           Settings
         </NavLink>
 
-        {authRequired && (
-          <div className="flex items-center justify-between px-3 py-2">
-            <div className="flex items-center gap-2 text-sm" style={{ color: 'var(--text-2)' }}>
-              <User className="h-4 w-4" />
-              <span className="max-w-[100px] truncate">{username || 'User'}</span>
-              {role === 'admin' && (
-                <span
-                  className="rounded px-1.5 py-0.5 text-[10px] font-medium uppercase"
-                  style={{ background: 'var(--accent-soft)', color: 'var(--accent)' }}
-                >
-                  admin
-                </span>
-              )}
-            </div>
-            <button
-              onClick={handleLogout}
-              className="transition-colors"
-              style={{ color: 'var(--text-3)' }}
-              title="Sign out"
-              aria-label="Sign out"
-            >
-              <LogOut className="h-4 w-4" />
-            </button>
-          </div>
-        )}
-
         {authRequired && role !== 'admin' && (
-          <div className="px-3 mb-1">
+          <div className="px-3 pt-1">
             <LimitBadge />
           </div>
         )}
 
-        <div className="px-3 text-xs" style={{ color: 'var(--text-3)' }}>
+        <div className="px-3 pt-2 text-xs" style={{ color: 'var(--text-3)' }}>
           DROP v2.0.0-rc.1
         </div>
       </div>
     </>
   );
+
+  // Simple route-aware breadcrumb (PRD-047 §2.2): "Applications" on the list,
+  // "Applications / {name}" on an app-detail route, otherwise the current
+  // section's label. Deliberately minimal — no deep-linking beyond one level.
+  let breadcrumb = null;
+  const appDetailMatch = location.pathname.match(/^\/apps\/([^/]+)/);
+  if (appDetailMatch) {
+    breadcrumb = (
+      <span className="flex items-center gap-1.5 text-sm" style={{ color: 'var(--text-3)' }}>
+        <Link to="/apps" style={{ color: 'var(--text-3)' }}>
+          Applications
+        </Link>
+        <span aria-hidden="true">/</span>
+        <span style={{ color: 'var(--text)' }}>{decodeURIComponent(appDetailMatch[1])}</span>
+      </span>
+    );
+  } else if (location.pathname.startsWith('/apps')) {
+    breadcrumb = <span style={{ color: 'var(--text)' }}>Applications</span>;
+  } else if (location.pathname.startsWith('/deploy')) {
+    breadcrumb = <span style={{ color: 'var(--text)' }}>Deploy</span>;
+  } else if (location.pathname.startsWith('/settings')) {
+    breadcrumb = <span style={{ color: 'var(--text)' }}>Settings</span>;
+  } else if (location.pathname.startsWith('/users')) {
+    breadcrumb = <span style={{ color: 'var(--text)' }}>Users</span>;
+  }
 
   const themeToggle = (
     <button
@@ -119,8 +135,63 @@ function Layout() {
     </button>
   );
 
+  const headerActions = (
+    <Button variant="primary" onClick={() => navigate('/deploy')} aria-label="New deploy">
+      <Plus className="h-4 w-4" />
+      <span className="hidden sm:inline">New deploy</span>
+    </Button>
+  );
+
+  // Header account/avatar area (PRD-047 §2.2) — replaces the old sidebar
+  // user block; preserves the admin badge and logout (PRD-026).
+  const user = authRequired ? (
+    <div
+      className="ml-1 flex items-center gap-2 border-l pl-3"
+      style={{ borderColor: 'var(--border)' }}
+    >
+      <span
+        className="flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-full text-xs font-semibold"
+        style={{ background: 'var(--accent-soft)', color: 'var(--accent)' }}
+        aria-hidden="true"
+      >
+        {(username || 'U').charAt(0).toUpperCase()}
+      </span>
+      {/* Username hides on narrow headers to save space; the avatar + admin
+          badge (below) stay visible at every width — the admin badge must be
+          preserved on mobile too, not just desktop. */}
+      <span
+        className="hidden max-w-[120px] truncate text-sm font-medium sm:inline"
+        style={{ color: 'var(--text)' }}
+      >
+        {username || 'User'}
+      </span>
+      {role === 'admin' && (
+        <span
+          className="rounded px-1.5 py-0.5 text-[10px] font-medium uppercase"
+          style={{ background: 'var(--accent-soft)', color: 'var(--accent)' }}
+        >
+          admin
+        </span>
+      )}
+      <button
+        onClick={handleLogout}
+        className="dui-nav-link flex h-9 w-9 flex-shrink-0 items-center justify-center rounded-lg transition-colors"
+        title="Sign out"
+        aria-label="Sign out"
+      >
+        <LogOut className="h-4 w-4" />
+      </button>
+    </div>
+  ) : null;
+
   return (
-    <AppShell sidebarNav={sidebarNav} themeToggle={themeToggle}>
+    <AppShell
+      sidebarNav={sidebarNav}
+      breadcrumb={breadcrumb}
+      themeToggle={themeToggle}
+      headerActions={headerActions}
+      user={user}
+    >
       <Outlet />
     </AppShell>
   );
