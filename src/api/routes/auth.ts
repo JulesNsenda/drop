@@ -124,11 +124,30 @@ auth.post('/login', async (c) => {
 auth.post('/api-keys', authMiddleware('admin'), async (c) => {
   const body = await c.req.json<{ name: string; role?: 'admin' | 'user' | 'readonly'; expiresInDays?: number }>();
 
-  if (!body.name) {
+  const name = typeof body.name === 'string' ? body.name.trim() : body.name;
+  if (!name) {
     throw new ValidationError('API key name is required');
   }
+  if (name.length > 64) {
+    throw new ValidationError('API key name must be 64 characters or fewer');
+  }
+  if (name === 'cli-local') {
+    throw new ValidationError("This name is reserved for the platform's local CLI key");
+  }
 
-  const { key, apiKey } = await createApiKey(body.name, body.role || 'user', body.expiresInDays);
+  if (
+    body.expiresInDays !== undefined &&
+    !(
+      typeof body.expiresInDays === 'number' &&
+      Number.isInteger(body.expiresInDays) &&
+      body.expiresInDays >= 1 &&
+      body.expiresInDays <= 3650
+    )
+  ) {
+    throw new ValidationError('expiresInDays must be an integer between 1 and 3650');
+  }
+
+  const { key, apiKey } = await createApiKey(name, body.role || 'user', body.expiresInDays);
 
   return c.json(
     success({
