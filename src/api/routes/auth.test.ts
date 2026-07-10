@@ -193,6 +193,129 @@ describe('Auth Routes', () => {
 
       expect(res.status).toBe(400);
     });
+
+    it('should return 400 for reserved name cli-local', async () => {
+      const res = await app.request('/auth/api-keys', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${adminToken}`,
+        },
+        body: JSON.stringify({ name: 'cli-local' }),
+      });
+
+      expect(res.status).toBe(400);
+      const data = (await res.json()) as ApiResponse;
+      expect(data.error?.code).toBe('VALIDATION_ERROR');
+    });
+
+    it('should return 400 for whitespace-only name', async () => {
+      const res = await app.request('/auth/api-keys', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${adminToken}`,
+        },
+        body: JSON.stringify({ name: '   ' }),
+      });
+
+      expect(res.status).toBe(400);
+      const data = (await res.json()) as ApiResponse;
+      expect(data.error?.code).toBe('VALIDATION_ERROR');
+    });
+
+    it('should return 400 for a name longer than 64 characters', async () => {
+      const res = await app.request('/auth/api-keys', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${adminToken}`,
+        },
+        body: JSON.stringify({ name: 'a'.repeat(65) }),
+      });
+
+      expect(res.status).toBe(400);
+      const data = (await res.json()) as ApiResponse;
+      expect(data.error?.code).toBe('VALIDATION_ERROR');
+    });
+
+    it('should return 400 for expiresInDays: 0', async () => {
+      const res = await app.request('/auth/api-keys', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${adminToken}`,
+        },
+        body: JSON.stringify({ name: 'zero-expiry-key', expiresInDays: 0 }),
+      });
+
+      expect(res.status).toBe(400);
+      const data = (await res.json()) as ApiResponse;
+      expect(data.error?.code).toBe('VALIDATION_ERROR');
+    });
+
+    it('should return 400 for a negative expiresInDays', async () => {
+      const res = await app.request('/auth/api-keys', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${adminToken}`,
+        },
+        body: JSON.stringify({ name: 'negative-expiry-key', expiresInDays: -5 }),
+      });
+
+      expect(res.status).toBe(400);
+      const data = (await res.json()) as ApiResponse;
+      expect(data.error?.code).toBe('VALIDATION_ERROR');
+    });
+
+    it('should return 400 (not 500) for a non-numeric expiresInDays', async () => {
+      const res = await app.request('/auth/api-keys', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${adminToken}`,
+        },
+        body: JSON.stringify({ name: 'non-numeric-expiry-key', expiresInDays: 'abc' }),
+      });
+
+      expect(res.status).toBe(400);
+      const data = (await res.json()) as ApiResponse;
+      expect(data.error?.code).toBe('VALIDATION_ERROR');
+    });
+
+    it('should return 400 for expiresInDays exceeding the 3650-day cap', async () => {
+      const res = await app.request('/auth/api-keys', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${adminToken}`,
+        },
+        body: JSON.stringify({ name: 'huge-expiry-key', expiresInDays: 99999 }),
+      });
+
+      expect(res.status).toBe(400);
+      const data = (await res.json()) as ApiResponse;
+      expect(data.error?.code).toBe('VALIDATION_ERROR');
+    });
+
+    it('should create API key with a valid name and expiresInDays', async () => {
+      const res = await app.request('/auth/api-keys', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${adminToken}`,
+        },
+        body: JSON.stringify({ name: 'valid-expiry-key', role: 'user', expiresInDays: 30 }),
+      });
+
+      expect(res.status).toBe(201);
+      const data = (await res.json()) as ApiResponse<ApiKeyResponse>;
+      expect(data.success).toBe(true);
+      expect(data.data.key).toMatch(/^drop_/);
+      expect(data.data.name).toBe('valid-expiry-key');
+      expect(data.data.expiresAt).toBeDefined();
+    });
   });
 
   describe('GET /auth/api-keys', () => {

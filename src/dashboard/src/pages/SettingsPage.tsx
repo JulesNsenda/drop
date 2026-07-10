@@ -5,8 +5,9 @@ import { useHealth, AppHealthCheck } from '../hooks/useApi';
 import { getAuthHeaders, useAuth } from '../hooks/useAuth';
 import { useToast } from '../components/Toast';
 import { useConfirm } from '../components/ConfirmDialog';
-import { Server, Database, Eye, HardDrive, Activity, CheckCircle, XCircle, AlertTriangle, Lock, Clock, ShieldCheck, ShieldOff, Info } from 'lucide-react';
+import { Server, Database, Eye, HardDrive, Activity, CheckCircle, XCircle, AlertTriangle, Lock, Clock, ShieldCheck, ShieldOff, Info, KeyRound } from 'lucide-react';
 import Tabs, { TabDef } from '../components/Tabs';
+import ApiKeysTab from '../components/ApiKeysTab';
 
 interface ActivityEntry {
   id: string;
@@ -200,6 +201,7 @@ function SettingsPage() {
     const tabs: TabDef[] = [];
     if (isAdmin) tabs.push({ id: 'system', label: 'System', icon: Server });
     tabs.push({ id: 'account', label: 'Account', icon: Lock });
+    if (isAdmin) tabs.push({ id: 'api-keys', label: 'API Keys', icon: KeyRound });
     if (isAdmin) tabs.push({ id: 'activity', label: 'Activity', icon: Clock });
     tabs.push({ id: 'about', label: 'About', icon: Info });
     return tabs;
@@ -591,6 +593,9 @@ function SettingsPage() {
         </div>
       )}
       </>}
+
+      {/* API Keys tab (admin only) */}
+      {isAdmin && activeTab === 'api-keys' && <ApiKeysTab />}
 
       {/* Activity tab (admin only) */}
       {isAdmin && activeTab === 'activity' && (
