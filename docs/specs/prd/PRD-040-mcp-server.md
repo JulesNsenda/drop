@@ -6,7 +6,7 @@
 |-------|-------|
 | PRD ID | PRD-040 |
 | Feature | Hosted MCP endpoint (`/api/v1/mcp`) on the DROP API server |
-| Status | In Progress |
+| Status | Completed |
 | Priority | P1 |
 | Target | v2.1 |
 | Depends On | PRD-039 (source upload pipeline), PRD-016 (git deploy) |
