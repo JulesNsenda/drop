@@ -29,6 +29,16 @@ const AUTH_CONFIG: RateLimitConfig = {
   windowMs: 60_000, // 1 minute - stricter for auth endpoints
 };
 
+const UPLOAD_CONFIG: RateLimitConfig = {
+  maxRequests: 10,
+  windowMs: 60_000, // 1 minute - stricter for the upload-deploy endpoint (PRD-039)
+};
+
+const MCP_CONFIG: RateLimitConfig = {
+  maxRequests: 60,
+  windowMs: 60_000, // 1 minute - dedicated bucket for the hosted MCP endpoint (PRD-040)
+};
+
 // In-memory stores per limiter instance
 const stores = new Map<string, Map<string, RateLimitEntry>>();
 
@@ -50,8 +60,7 @@ function getClientIp(c: Context): string {
   // Normalise IPv6-mapped IPv4 (e.g. "::ffff:127.0.0.1" → "127.0.0.1")
   const peerIp = socketIp?.replace(/^::ffff:/i, '') ?? 'unknown';
 
-  const isLocalPeer =
-    peerIp === '127.0.0.1' || peerIp === '::1' || peerIp === 'unknown';
+  const isLocalPeer = peerIp === '127.0.0.1' || peerIp === '::1' || peerIp === 'unknown';
 
   if (isLocalPeer) {
     // Trust XFF only from a local reverse proxy (Caddy runs on the same host).
@@ -121,6 +130,16 @@ export function rateLimitMiddleware(config?: Partial<RateLimitConfig>) {
 /** Strict rate limiter for auth endpoints (login, token refresh) */
 export function authRateLimitMiddleware(config?: Partial<RateLimitConfig>) {
   return createRateLimiter('auth', { ...AUTH_CONFIG, ...config });
+}
+
+/** Strict rate limiter for the upload-deploy endpoint (large-body abuse, PRD-039) */
+export function uploadRateLimitMiddleware(config?: Partial<RateLimitConfig>) {
+  return createRateLimiter('upload', { ...UPLOAD_CONFIG, ...config });
+}
+
+/** Dedicated rate limiter for the hosted MCP endpoint (PRD-040) */
+export function mcpRateLimitMiddleware(config?: Partial<RateLimitConfig>) {
+  return createRateLimiter('mcp', { ...MCP_CONFIG, ...config });
 }
 
 /** Reset all rate limit stores (for testing) */

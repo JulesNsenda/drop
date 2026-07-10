@@ -80,6 +80,37 @@ describe('DeployTracker', () => {
     expect(episodes[0].status).toBe('succeeded');
   });
 
+  it('upload: app:detected{origin:"upload"} tags the trigger as upload', async () => {
+    bus.publish('app:detected', { name: 'app3b', path: '/webapps/app3b', origin: 'upload' });
+    bus.publish('build:started', { appId: 'app3b', buildId: 'b1' });
+    bus.publish('build:completed', { appId: 'app3b', buildId: 'b1', durationMs: 20, success: true });
+    bus.publish('app:updated', { appId: 'app3b', changes: { status: 'running' } });
+    await tracker.flush();
+
+    const episodes = tracker.getEpisodes('app3b');
+    expect(episodes).toHaveLength(1);
+    expect(episodes[0].trigger).toBe('upload');
+    expect(episodes[0].status).toBe('succeeded');
+  });
+
+  it('upload redeploy: app:update{reason:"upload deploy"} tags the trigger as upload', async () => {
+    bus.publish('app:update', {
+      name: 'app3c',
+      path: '/webapps/app3c',
+      reason: 'upload deploy',
+      bypassCooldown: true,
+    });
+    bus.publish('build:started', { appId: 'app3c', buildId: 'b1' });
+    bus.publish('build:completed', { appId: 'app3c', buildId: 'b1', durationMs: 20, success: true });
+    bus.publish('app:updated', { appId: 'app3c', changes: { status: 'running' } });
+    await tracker.flush();
+
+    const episodes = tracker.getEpisodes('app3c');
+    expect(episodes).toHaveLength(1);
+    expect(episodes[0].trigger).toBe('upload');
+    expect(episodes[0].status).toBe('succeeded');
+  });
+
   it('build failure: status is failed, build stage carries ok:false, no raw error text stored, closes on build:failed', async () => {
     bus.publish('app:detected', { name: 'app4', path: '/webapps/app4' });
     bus.publish('build:started', { appId: 'app4', buildId: 'b1' });

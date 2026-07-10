@@ -7,6 +7,9 @@
 import { Hono } from 'hono';
 import * as path from 'path';
 import * as fs from 'fs/promises';
+import * as fsSync from 'fs';
+import { Readable, Transform } from 'stream';
+import { pipeline } from 'stream/promises';
 import { success, error, ErrorCodes, AppDto, CreateAppDto } from '../types';
 import { NotFoundError, ValidationError } from '../middleware/error';
 import { AuthContext, listUsers, getUserById } from '../middleware/auth';
@@ -22,10 +25,23 @@ import { getStateManager, AppState } from '../../managers/app/state-manager';
 import { getAppConfigService } from '../../managers/app/app-config';
 import { getDatabaseProvisioner } from '../../managers/database';
 import { tryLogActivity } from '../../managers/activity';
-import { getAppsDirectory, isHttpsEnabled, getDomainSuffix } from '../runtime-config';
+import {
+  getAppsDirectory,
+  isHttpsEnabled,
+  getDomainSuffix,
+  getTempDirectory,
+  getUploadMaxBytes,
+} from '../runtime-config';
 import { isPathWithin } from '../../utils/paths';
 import { isLocalhostDomain } from '../../utils/domain-validator';
 import { eventBus } from '../../core/event-bus';
+import {
+  getUploadDeployService,
+  ArchiveRejectedError,
+  UploadValidationError,
+  InsufficientDiskSpaceError,
+} from '../../core/upload-deploy';
+import { runUploadPreflight } from '../upload-preflight';
 import type { RuntimeType } from '../../managers/runtime/app-runtime.types';
 
 const apps = new Hono();
@@ -61,7 +77,7 @@ function resolveUsername(userId?: string): string | undefined {
   if (!userId) return undefined;
   try {
     const users = listUsers();
-    return users.find((u) => u.id === userId)?.username;
+    return users.find(u => u.id === userId)?.username;
   } catch {
     return undefined;
   }
@@ -103,7 +119,7 @@ function toAppDto(app: AppState, isAdmin = false): AppDto {
     status: app.status,
     port: app.port,
     pid: isAdmin ? app.pid : undefined,
-    path: isAdmin ? app.path : undefined as unknown as string,
+    path: isAdmin ? app.path : (undefined as unknown as string),
     framework: app.framework,
     hostname: app.hostname,
     url: computeAppUrl(app),
@@ -117,6 +133,33 @@ function toAppDto(app: AppState, isAdmin = false): AppDto {
     ownerName: isAdmin ? resolveUsername(app.userId) : undefined,
     customDomain: app.customDomain,
   };
+}
+
+/** Thrown by the byte-counting transform the moment the cap is crossed. */
+class UploadTooLargeError extends Error {
+  constructor(public readonly maxBytes: number) {
+    super(`Upload exceeds maximum of ${maxBytes} bytes`);
+    this.name = 'UploadTooLargeError';
+  }
+}
+
+/**
+ * Counts bytes as they stream through and aborts (destroying the pipeline)
+ * the moment the cumulative count exceeds maxBytes — never buffers the whole
+ * body and never trusts the Content-Length header.
+ */
+function createByteLimiter(maxBytes: number): Transform {
+  let total = 0;
+  return new Transform({
+    transform(chunk: Buffer, _encoding, callback) {
+      total += chunk.length;
+      if (total > maxBytes) {
+        callback(new UploadTooLargeError(maxBytes));
+        return;
+      }
+      callback(null, chunk);
+    },
+  });
 }
 
 /** Get effective app limit for a user (per-user override > global default) */
@@ -133,24 +176,24 @@ function getAppLimit(userId?: string): number {
 }
 
 // GET /apps - List applications (filtered by user unless admin)
-apps.get('/', async (c) => {
+apps.get('/', async c => {
   const auth = (c.get as Function)('auth') as AuthContext | undefined;
   const stateManager = getStateManager();
   const allApps = stateManager.getAllApps();
 
   // Filter by ownership
-  let filtered = allApps.filter((app) => canAccess(auth, app));
+  let filtered = allApps.filter(app => canAccess(auth, app));
 
   // Apply query param filters
   const status = c.req.query('status');
   const type = c.req.query('type');
 
   if (status) {
-    filtered = filtered.filter((app) => app.status === status);
+    filtered = filtered.filter(app => app.status === status);
   }
 
   if (type) {
-    filtered = filtered.filter((app) => app.type === type);
+    filtered = filtered.filter(app => app.type === type);
   }
 
   const isAdmin = auth?.role === 'admin';
@@ -170,7 +213,7 @@ apps.get('/', async (c) => {
 
   return c.json(
     success(
-      filtered.map((a) => {
+      filtered.map(a => {
         const dto = toAppDto(a, isAdmin);
         const stats = statsMap.get(a.name);
         if (stats && a.status === 'running') {
@@ -185,7 +228,7 @@ apps.get('/', async (c) => {
 });
 
 // GET /apps/:name - Get application by name
-apps.get('/:name', async (c) => {
+apps.get('/:name', async c => {
   const auth = (c.get as Function)('auth') as AuthContext | undefined;
   const name = c.req.param('name');
   const stateManager = getStateManager();
@@ -221,7 +264,7 @@ apps.get('/:name', async (c) => {
 });
 
 // POST /apps - Deploy a new application
-apps.post('/', async (c) => {
+apps.post('/', async c => {
   const auth = (c.get as Function)('auth') as AuthContext | undefined;
   const body = await c.req.json<CreateAppDto>();
 
@@ -272,16 +315,28 @@ apps.post('/', async (c) => {
   // MIN_FREE_MB is a hard floor regardless of per-app limits.
   const { ok: hasDiskSpace, freeMb } = await hasEnoughDisk(body.path);
   if (!hasDiskSpace) {
-    return c.json(error(ErrorCodes.INTERNAL_ERROR, `Insufficient disk space (${Math.round(freeMb)} MB free, need ${getMinFreeDiskMb()} MB)`), 507 as any);
+    return c.json(
+      error(
+        ErrorCodes.INTERNAL_ERROR,
+        `Insufficient disk space (${Math.round(freeMb)} MB free, need ${getMinFreeDiskMb()} MB)`
+      ),
+      507 as any
+    );
   }
 
   // Check per-user app limit
   if (auth?.userId && auth.role !== 'admin') {
     const maxApps = getAppLimit(auth.userId);
     if (maxApps > 0) {
-      const userApps = stateManager.getAllApps().filter((a) => a.userId === auth.userId);
+      const userApps = stateManager.getAllApps().filter(a => a.userId === auth.userId);
       if (userApps.length >= maxApps) {
-        return c.json(error(ErrorCodes.RATE_LIMITED, `App limit reached (${maxApps}). Delete an app or contact admin.`), 429);
+        return c.json(
+          error(
+            ErrorCodes.RATE_LIMITED,
+            `App limit reached (${maxApps}). Delete an app or contact admin.`
+          ),
+          429
+        );
       }
     }
   }
@@ -294,12 +349,112 @@ apps.post('/', async (c) => {
     await stateManager.updateApp(appName, { userId: auth.userId });
   }
 
-  await tryLogActivity({ action: 'deploy', userId: auth?.userId, username: auth?.username, appName });
+  await tryLogActivity({
+    action: 'deploy',
+    userId: auth?.userId,
+    username: auth?.username,
+    appName,
+  });
   return c.json(success(toAppDto({ ...app, userId: auth?.userId }, auth?.role === 'admin')), 201);
 });
 
+// POST /apps/:name/source - Deploy (or redeploy) from an uploaded gzipped
+// tarball (PRD-039). Never anonymous — auth('user') is wired in server.ts
+// even when the general /apps/* guard would allow readonly.
+apps.post('/:name/source', async c => {
+  const auth = (c.get as Function)('auth') as AuthContext | undefined;
+  const name = c.req.param('name');
+
+  // Shared with the MCP deploy_files tool (PRD-040 §5) — see upload-preflight.ts
+  // for the full guard sequence and ordering rationale. Any failure here maps
+  // 1:1 onto the exact status/body this route returned before extraction
+  // (apps.source.test.ts is the regression gate).
+  const preflight = await runUploadPreflight(auth, name);
+  if (!preflight.ok) {
+    throw preflight.error;
+  }
+
+  let archivePath: string | undefined;
+  try {
+    if (!c.req.raw.body) {
+      throw new ValidationError('Request body (gzipped tarball) is required');
+    }
+
+    const stagingDir = path.join(getTempDirectory(), 'upload-archives');
+    await fs.mkdir(stagingDir, { recursive: true });
+    archivePath = path.join(stagingDir, `${name}-${Date.now()}.tar.gz`);
+
+    // Stream the raw body straight to disk with an incremental byte cap —
+    // never buffered via formData()/arrayBuffer(), never trusting
+    // Content-Length (the global body-size middleware is carved out for this
+    // exact path in server.ts; this cap is the real enforcement).
+    const maxBytes = getUploadMaxBytes();
+    // c.req.raw.body is a WHATWG ReadableStream (Fetch API); Readable.fromWeb
+    // expects node:stream/web's type, which is structurally identical but a
+    // distinct declaration — hence the cast.
+    const source = Readable.fromWeb(c.req.raw.body as any);
+    const limiter = createByteLimiter(maxBytes);
+    const dest = fsSync.createWriteStream(archivePath);
+
+    try {
+      await pipeline(source, limiter, dest);
+    } catch (err) {
+      if (err instanceof UploadTooLargeError) {
+        return c.json(
+          error(ErrorCodes.VALIDATION_ERROR, `Upload exceeds maximum size of ${maxBytes} bytes`),
+          413 as any
+        );
+      }
+      throw err;
+    }
+
+    const result = await getUploadDeployService().deploy({
+      appName: name,
+      archivePath,
+      userId: auth?.userId,
+    });
+
+    await tryLogActivity({
+      action: 'upload-deploy',
+      userId: auth?.userId,
+      username: auth?.username,
+      appName: name,
+    });
+
+    return c.json(
+      success({ app: result.app, acceptedAt: result.acceptedAt, isNew: result.isNew }),
+      202
+    );
+  } catch (err) {
+    if (err instanceof ArchiveRejectedError) {
+      return c.json(
+        error(
+          ErrorCodes.VALIDATION_ERROR,
+          `Archive rejected: ${err.message} (reason: ${err.reason})`
+        ),
+        400
+      );
+    }
+    if (err instanceof UploadValidationError) {
+      return c.json(error(ErrorCodes.VALIDATION_ERROR, err.message), 400);
+    }
+    if (err instanceof InsufficientDiskSpaceError) {
+      return c.json(error(ErrorCodes.INTERNAL_ERROR, err.message), 507 as any);
+    }
+    // Anything else (validation errors thrown above, unexpected failures)
+    // rethrows to the global error handler: HttpErrors map to their own
+    // status, everything else becomes a generic 500.
+    throw err;
+  } finally {
+    preflight.release();
+    if (archivePath) {
+      await fs.rm(archivePath, { force: true }).catch(() => undefined);
+    }
+  }
+});
+
 // PUT /apps/:name - Update application
-apps.put('/:name', async (c) => {
+apps.put('/:name', async c => {
   const auth = (c.get as Function)('auth') as AuthContext | undefined;
   const name = c.req.param('name');
   const body = (await c.req.json()) as Record<string, unknown>;
@@ -325,7 +480,7 @@ apps.put('/:name', async (c) => {
 });
 
 // DELETE /apps/:name - Remove application
-apps.delete('/:name', async (c) => {
+apps.delete('/:name', async c => {
   const auth = (c.get as Function)('auth') as AuthContext | undefined;
   const name = c.req.param('name');
   const stateManager = getStateManager();
@@ -425,12 +580,17 @@ apps.delete('/:name', async (c) => {
     }
   }
 
-  await tryLogActivity({ action: 'delete', userId: auth?.userId, username: auth?.username, appName: name });
+  await tryLogActivity({
+    action: 'delete',
+    userId: auth?.userId,
+    username: auth?.username,
+    appName: name,
+  });
   return c.json(success({ message: `Application '${name}' removed`, database: dbStatus }));
 });
 
 // POST /apps/:name/start - Start application
-apps.post('/:name/start', async (c) => {
+apps.post('/:name/start', async c => {
   const auth = (c.get as Function)('auth') as AuthContext | undefined;
   const name = c.req.param('name');
   const stateManager = getStateManager();
@@ -450,7 +610,12 @@ apps.post('/:name/start', async (c) => {
     // (delete-then-fresh-start with a rebuilt spec); only the activity-log
     // action and response message differ.
     const status = await ops.restartApp(name);
-    await tryLogActivity({ action: 'start', userId: auth?.userId, username: auth?.username, appName: name });
+    await tryLogActivity({
+      action: 'start',
+      userId: auth?.userId,
+      username: auth?.username,
+      appName: name,
+    });
     return c.json(success({ message: `Application '${name}' started`, status }));
   } catch (err) {
     if (err instanceof AppInProgressError) {
@@ -462,7 +627,7 @@ apps.post('/:name/start', async (c) => {
 });
 
 // POST /apps/:name/stop - Stop application
-apps.post('/:name/stop', async (c) => {
+apps.post('/:name/stop', async c => {
   const auth = (c.get as Function)('auth') as AuthContext | undefined;
   const name = c.req.param('name');
   const stateManager = getStateManager();
@@ -478,7 +643,12 @@ apps.post('/:name/stop', async (c) => {
     await pm.stop(name);
     await stateManager.setAppStatus(name, 'stopped');
 
-    await tryLogActivity({ action: 'stop', userId: auth?.userId, username: auth?.username, appName: name });
+    await tryLogActivity({
+      action: 'stop',
+      userId: auth?.userId,
+      username: auth?.username,
+      appName: name,
+    });
     return c.json(success({ message: `Application '${name}' stopped` }));
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Failed to stop';
@@ -487,7 +657,7 @@ apps.post('/:name/stop', async (c) => {
 });
 
 // POST /apps/:name/restart - Restart application
-apps.post('/:name/restart', async (c) => {
+apps.post('/:name/restart', async c => {
   const auth = (c.get as Function)('auth') as AuthContext | undefined;
   const name = c.req.param('name');
   const stateManager = getStateManager();
@@ -504,7 +674,12 @@ apps.post('/:name/restart', async (c) => {
 
   try {
     const status = await ops.restartApp(name);
-    await tryLogActivity({ action: 'restart', userId: auth?.userId, username: auth?.username, appName: name });
+    await tryLogActivity({
+      action: 'restart',
+      userId: auth?.userId,
+      username: auth?.username,
+      appName: name,
+    });
     return c.json(success({ message: `Application '${name}' restarted`, status }));
   } catch (err) {
     if (err instanceof AppInProgressError) {
@@ -516,7 +691,7 @@ apps.post('/:name/restart', async (c) => {
 });
 
 // PUT /apps/:name/domain - Set custom domain
-apps.put('/:name/domain', async (c) => {
+apps.put('/:name/domain', async c => {
   const auth = (c.get as Function)('auth') as AuthContext | undefined;
   const name = c.req.param('name');
   const body = await c.req.json<{ domain?: string }>();
@@ -536,16 +711,21 @@ apps.put('/:name/domain', async (c) => {
 
   await stateManager.updateApp(name, { customDomain: domain || ('' as unknown as undefined) });
 
-  return c.json(success({ message: domain ? `Domain set to ${domain}` : 'Domain removed', domain }));
+  return c.json(
+    success({ message: domain ? `Domain set to ${domain}` : 'Domain removed', domain })
+  );
 });
 
 // POST /:name/migrate-runtime — Admin: move an app between PM2 and Docker.
 // Stops the current runtime, updates appconf, and triggers a redeploy via
 // app:detected so the platform restarts the app in the new runtime.
-apps.post('/:name/migrate-runtime', async (c) => {
+apps.post('/:name/migrate-runtime', async c => {
   const authCtx = (c.get as Function)('auth') as AuthContext | undefined;
   if (authCtx && authCtx.role !== 'admin') {
-    return c.json(error(ErrorCodes.UNAUTHORIZED, 'Admin access required for runtime migration'), 403);
+    return c.json(
+      error(ErrorCodes.UNAUTHORIZED, 'Admin access required for runtime migration'),
+      403
+    );
   }
 
   const appName = c.req.param('name');
@@ -562,8 +742,7 @@ apps.post('/:name/migrate-runtime', async (c) => {
     // No body — default to docker
   }
 
-  const targetRuntime: RuntimeType =
-    body.targetRuntime === 'pm2' ? 'pm2' : 'docker';
+  const targetRuntime: RuntimeType = body.targetRuntime === 'pm2' ? 'pm2' : 'docker';
 
   try {
     const result = await migrateAppRuntime(appName, targetRuntime);
@@ -582,7 +761,12 @@ apps.post('/:name/migrate-runtime', async (c) => {
       });
     }
 
-    await tryLogActivity({ action: 'migrate-runtime', userId: authCtx?.userId, username: authCtx?.username, appName });
+    await tryLogActivity({
+      action: 'migrate-runtime',
+      userId: authCtx?.userId,
+      username: authCtx?.username,
+      appName,
+    });
 
     return c.json(
       success({
@@ -594,10 +778,7 @@ apps.post('/:name/migrate-runtime', async (c) => {
     );
   } catch (err) {
     return c.json(
-      error(
-        ErrorCodes.INTERNAL_ERROR,
-        err instanceof Error ? err.message : 'Migration failed'
-      ),
+      error(ErrorCodes.INTERNAL_ERROR, err instanceof Error ? err.message : 'Migration failed'),
       500
     );
   }

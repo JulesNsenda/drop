@@ -27,6 +27,7 @@ import { CaddyServer, getCaddyServer, resetCaddyServer } from '../managers/route
 import { SecretManager, getSecretManager, resetSecretManager } from '../managers/secret';
 import { WebhookManager, getWebhookManager, resetWebhookManager } from './webhooks';
 import { GitDeployService, getGitDeployService, resetGitDeployService } from './git-deploy';
+import { UploadDeployService, getUploadDeployService, resetUploadDeployService } from './upload-deploy';
 import { getActivityLog, resetActivityLog } from '../managers/activity';
 import { getDeployTracker, resetDeployTracker } from '../managers/deploy-tracker';
 import { ApiServer, createApiServer } from '../api';
@@ -150,6 +151,20 @@ export interface PlatformConfig {
    * (0 = never). Default 50.
    */
   logMaxFileMb: number;
+  /**
+   * Cap on the compressed (as-uploaded) archive size for
+   * `POST /apps/:name/source` (PRD-039), in MB. Enforced by the route's own
+   * incremental byte counter while streaming to disk — never trusts
+   * Content-Length. Default 100.
+   */
+  maxUploadSizeMb: number;
+  /**
+   * Cap on the cumulative decompressed size of an uploaded archive, in MB.
+   * Enforced by `UploadDeployService`/`extractTarball` mid-extraction (aborts
+   * as soon as the cap is crossed, not post-hoc). Distinct from
+   * `maxUploadSizeMb`, which bounds the compressed upload itself. Default 1024.
+   */
+  maxUploadUnpackedMb: number;
 }
 
 // Determine platform-appropriate defaults
@@ -189,6 +204,8 @@ const DEFAULT_CONFIG: PlatformConfig = {
   maxCpusPerApp: parseFloat(process.env.DROP_MAX_CPUS_PER_APP || '0'),
   logRetentionDays: parseInt(process.env.DROP_LOG_RETENTION_DAYS || '14', 10),
   logMaxFileMb: parseInt(process.env.DROP_LOG_MAX_FILE_MB || '50', 10),
+  maxUploadSizeMb: parseInt(process.env.DROP_MAX_UPLOAD_SIZE_MB || '100', 10),
+  maxUploadUnpackedMb: parseInt(process.env.DROP_MAX_UPLOAD_UNPACKED_MB || '1024', 10),
 };
 
 export class DropPlatform {
@@ -209,6 +226,7 @@ export class DropPlatform {
   private secretManager: SecretManager | null = null;
   private webhookManager: WebhookManager | null = null;
   private gitDeployService: GitDeployService | null = null;
+  private uploadDeployService: UploadDeployService | null = null;
   private apiServer: ApiServer | null = null;
   private buildLogService: BuildLogService | null = null;
   private logRetention: LogRetentionService | null = null;
@@ -438,6 +456,7 @@ export class DropPlatform {
     resetSecretManager();
     resetWebhookManager();
     resetGitDeployService();
+    resetUploadDeployService();
     resetActivityLog();
     resetBuildLogService();
     resetPlatformOps();
@@ -825,6 +844,17 @@ backup:
     });
     await this.gitDeployService.initialize();
 
+    // Initialize upload deploy service (PRD-039). Staging lives under
+    // data/temp — same root as getBuildWorkDir, well outside the watched
+    // webapps directory.
+    this.uploadDeployService = getUploadDeployService({
+      appsDirectory: this.config.appsDirectory,
+      tempDirectory: path.join(this.config.dropRoot, 'data', 'temp'),
+      maxUncompressedBytes: this.config.maxUploadUnpackedMb * 1024 * 1024,
+      maxEntries: 20_000,
+      extractTimeoutMs: 60_000,
+    });
+
     // Initialize activity log
     const activityLogPath = path.join(this.config.dropRoot, 'data', 'drop-svc', 'activity-log.json');
     const activityLog = getActivityLog(activityLogPath);
@@ -940,6 +970,8 @@ backup:
       logDir,
       appsDirectory: this.config.appsDirectory,
       masterKeyPath,
+      tempDirectory: path.join(this.config.dropRoot, 'data', 'temp'),
+      maxUploadSizeMb: this.config.maxUploadSizeMb,
     });
 
     await this.apiServer.initialize();
@@ -947,7 +979,10 @@ backup:
 
     // Expose restart/start orchestration to the API routes via the
     // platform-ops seam — a direct import would be circular (platform → api → routes).
-    setPlatformOps({ restartApp: (name) => this.restartApp(name) });
+    setPlatformOps({
+      restartApp: (name) => this.restartApp(name),
+      isAppInProgress: (name) => this.appsInProgress.has(name),
+    });
 
     this.logger.info(`API server running on port ${this.config.apiPort}`, 'API');
     if (this.config.enableApiAuth) {
@@ -1072,6 +1107,9 @@ backup:
     const detectedSub = this.eventBus.subscribe('app:detected', async (payload) => {
       // Skip apps currently being cloned
       if (this.gitDeployService?.isCloning(payload.name)) return;
+      // Skip apps currently being uploaded (PRD-039) — same rationale as the
+      // isCloning guard above: don't let the watcher onboard mid-upload.
+      if (this.uploadDeployService?.isUploading(payload.name)) return;
 
       // Tell the watcher this app is known regardless of who published the
       // detection (git deploy publishes deterministically after a clone) —
@@ -1152,6 +1190,8 @@ backup:
     const updateSub = this.eventBus.subscribe('app:update', async (payload) => {
       // Skip apps currently being cloned
       if (this.gitDeployService?.isCloning(payload.name)) return;
+      // Skip apps currently being uploaded (PRD-039)
+      if (this.uploadDeployService?.isUploading(payload.name)) return;
       await this.handleAppUpdate(payload.name, payload.path, payload.reason, payload.bypassCooldown);
     });
     this.subscriptions.push(updateSub);
@@ -1693,6 +1733,9 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
 
     // Skip apps currently being cloned by git deploy
     if (this.gitDeployService?.isCloning(appName)) return;
+
+    // Skip apps currently being uploaded (PRD-039)
+    if (this.uploadDeployService?.isUploading(appName)) return;
 
     // Skip if already processing this app (e.g., during initial deployment).
     // An explicit redeploy that's dropped here is logged at info - the API/
