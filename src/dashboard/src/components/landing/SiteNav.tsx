@@ -21,12 +21,10 @@ interface NavLinkItem {
   enter?: boolean;
 }
 
-const GITHUB_URL = 'https://github.com/JulesNsenda/drop';
-
 const NAV_LINKS: NavLinkItem[] = [
   { key: 'features', label: 'Features', href: '#features' },
   { key: 'docs', label: 'Docs', to: '/docs' },
-  { key: 'api', label: 'API', href: GITHUB_URL, external: true },
+  { key: 'api', label: 'API', to: '/reference' },
   { key: 'dashboard', label: 'Dashboard', enter: true },
 ];
 

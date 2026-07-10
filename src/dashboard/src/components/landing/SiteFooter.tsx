@@ -37,8 +37,8 @@ const FOOTER_COLUMNS: FooterColumn[] = [
     title: 'Developers',
     links: [
       { label: 'Documentation', to: '/docs' },
-      { label: 'API Reference', href: GITHUB_URL, external: true },
-      { label: 'CLI', href: GITHUB_URL, external: true },
+      { label: 'API Reference', to: '/reference' },
+      { label: 'CLI', to: '/reference#cli' },
       { label: 'drop.yaml', to: '/docs#drop-yaml' },
     ],
   },
