@@ -1,4 +1,4 @@
-import { useEffect } from 'react';
+import { useEffect, lazy, Suspense } from 'react';
 import { Routes, Route, Navigate, useNavigate } from 'react-router-dom';
 import Layout from './components/Layout';
 import { ErrorBoundary } from './components/ErrorBoundary';
@@ -6,7 +6,7 @@ import { ToastProvider } from './components/Toast';
 import { ConfirmProvider } from './components/ConfirmDialog';
 import { AuthContext, useAuthProvider } from './hooks/useAuth';
 import { UNAUTHORIZED_EVENT, MUST_CHANGE_PASSWORD_EVENT } from './api/client';
-import LandingPage from './pages/LandingPage';
+const LandingPage = lazy(() => import('./pages/LandingPage'));
 import AppsPage from './pages/AppsPage';
 import AppDetailPage from './pages/AppDetailPage';
 import SettingsPage from './pages/SettingsPage';
@@ -48,7 +48,23 @@ function App() {
         <ErrorBoundary>
           <Routes>
             {/* Public routes */}
-            <Route index element={<LandingPage />} />
+            <Route index element={
+              auth.loading ? (
+                <div className="min-h-screen flex items-center justify-center bg-gray-50 dark:bg-gray-900">
+                  <div className="animate-pulse text-gray-400">Loading...</div>
+                </div>
+              ) : auth.authenticated ? (
+                auth.mustChangePassword ? <Navigate to="/change-password" replace /> : <Navigate to="/apps" replace />
+              ) : (
+                <Suspense fallback={
+                  <div className="min-h-screen flex items-center justify-center bg-gray-50 dark:bg-gray-900">
+                    <div className="animate-pulse text-gray-400">Loading...</div>
+                  </div>
+                }>
+                  <LandingPage />
+                </Suspense>
+              )
+            } />
             <Route path="login" element={
               auth.authenticated
                 ? (auth.mustChangePassword ? <Navigate to="/change-password" replace /> : <Navigate to="/apps" replace />)
