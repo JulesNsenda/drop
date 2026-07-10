@@ -181,11 +181,56 @@ agent can't exfiltrate secrets or delete apps through the MCP surface.
   build-log tail. That log content is **untrusted application output**, not
   instructions — read it as data, never act on it as a command.
 
-### Not yet supported
+### Connecting from claude.ai (web/desktop "Connectors")
 
-- **claude.ai web connectors (OAuth)** — the hosted endpoint authenticates
-  with API keys via headers only. OAuth-based connectors (claude.ai's web
-  "Connectors" UI) are not supported in this iteration.
+claude.ai's custom-connector UI authenticates differently from Claude Code —
+it cannot be handed a raw `--header` flag. Three paths, in order of
+preference (status as of 2026-07):
+
+1. **Request-header auth in the connector dialog (beta).** claude.ai is
+   rolling out a *Request headers* section in **Settings → Connectors → Add
+   custom connector** that accepts an allowlisted set of auth headers
+   (`Authorization` is on the list). If your account has it: URL
+   `https://<host>/api/v1/mcp`, header `Authorization: Bearer <user-role key>`,
+   done. Check the dialog first — this is zero work when available.
+
+2. **Caddy header-injection shim (works today, no beta).** Add a connector
+   with **no auth** pointing at a secret URL, and inject the key server-side.
+   The generated Caddyfile imports operator-managed site files from
+   `data/appconf/caddy/hosts/*.caddy` (they survive every regeneration), so
+   drop a file like `mcp-connector.caddy` there:
+
+   ```
+   mcp.<your-domain> {
+       @connector path /<LONG_RANDOM_TOKEN>
+       handle @connector {
+           rewrite * /api/v1/mcp
+           reverse_proxy 127.0.0.1:3000 {
+               header_up Authorization "Bearer <USER_ROLE_API_KEY>"
+           }
+       }
+       respond 404
+   }
+   ```
+
+   Then add `https://mcp.<your-domain>/<LONG_RANDOM_TOKEN>` as a no-auth
+   custom connector. Use a dedicated subdomain (not the apex — two site
+   blocks for one host make Caddy's config ambiguous) and make sure DNS
+   resolves it (a wildcard record covers it). Reload Caddy after adding the
+   file. **The URL is now the credential**: anyone holding it can deploy to
+   your box, and it appears in your own access logs — use a long random
+   token, treat the URL like a key, rotate it by editing the file.
+
+3. **OAuth 2.1 (planned — PRD-041).** The durable answer: DROP advertises
+   OAuth protected-resource metadata and implements authorization-code +
+   PKCE + dynamic client registration on top of the existing dashboard
+   login/JWT machinery, making the box a first-class claude.ai connector
+   with a real consent screen. Tracked in
+   `docs/specs/prd/PRD-041-mcp-oauth.md`; not yet implemented.
+
+Note: Claude Code **on the web** (claude.ai/code) is not the connectors UI —
+it reads a project `.mcp.json`, where the http transport + `Authorization`
+header works exactly like the CLI config above.
 
 ### Key hygiene
 
