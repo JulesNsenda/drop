@@ -17,6 +17,7 @@ const STAGE_LABELS: Record<DeployStageName, string> = {
 const TRIGGER_LABELS: Record<DeployEpisodeDto['trigger'], string> = {
   deploy: 'Deploy',
   'hot-reload': 'Hot reload',
+  upload: 'Upload',
   unknown: 'Unknown trigger',
 };
 

@@ -1,69 +1,88 @@
-# PRD-040: MCP Server (Agent Deploy Target — Client)
+# PRD-040: MCP Server (Agent Deploy Target — Hosted)
 
 ## Document Info
 
 | Field | Value |
 |-------|-------|
 | PRD ID | PRD-040 |
-| Feature | `dropkit-mcp` — MCP server for agent-driven deploys |
-| Status | Planned |
+| Feature | Hosted MCP endpoint (`/api/v1/mcp`) on the DROP API server |
+| Status | Completed |
 | Priority | P1 |
-| Target | After PRD-039 ships; independent release cadence |
-| Depends On | PRD-039 (source upload endpoint) |
+| Target | v2.1 |
+| Depends On | PRD-039 (source upload pipeline), PRD-016 (git deploy) |
 | Created | 2026-07-09 |
+| Revised | 2026-07-09 — direction change, see below |
 
 ---
 
+## Revision note (2026-07-09)
+
+v1 of this PRD specified a separate-repo stdio npm package (`dropkit-mcp`) that
+tars the developer's local project. Direction changed on the owner's call: the
+MCP server is **hosted by the DROP platform itself**, inside this repo, served
+over MCP's Streamable HTTP transport on the existing API server. Rationale: the
+platform is already a long-running TLS-terminated service with API-key auth —
+a `/api/v1/mcp` mount is a remote MCP server with zero extra deployment, usable
+from any MCP client (Claude Code/Desktop, Cursor) via
+`--transport http` + an `Authorization: Bearer <key>` header, including
+surfaces with no shell and no local DROP tooling.
+
+The trade-off: a remote MCP cannot read the agent's local filesystem, so
+"tar my local folder" is not a hosted tool. Small AI-generated apps deploy via
+inline file contents (`deploy_files`); larger projects use `deploy_from_git`
+or the curl recipe in `docs/AGENT-DEPLOY.md`. A thin local stdio package
+(original v1 scope) is **deferred** as a possible follow-up — it adds packaging
+convenience, not capability, now that the REST recipe and hosted endpoint exist.
+
 ## Overview
 
-A thin MCP server (stdio) that lets coding agents (Claude Code, Cursor, Claude
-Desktop) deploy to a DROP box as a native tool call: "deploy this" → live URL, or
-the failing build stage + log tail. Pure API client over the stable `/api/v1` wire
-contract, configured via `DROP_URL` + `DROP_API_KEY`. Ships as its own npm package
-in a **separate repo** (recommended): nesting under `src/` couples its releases to
-platform tooling and requires tsconfig/jest exclusions for no shared-code benefit —
-the CLI already duplicates DTO shapes by choice.
-
-What MCP adds over the PRD-039 curl recipe: works for agent surfaces without shell
-access; zero per-project doc setup; encapsulates the tar-exclusion +
-poll-to-terminal + failure-tail workflow that agents get wrong freestyle. Shipping
-the curl recipe first (PRD-039 docs) de-risks this package.
+Mount an MCP server at `POST /api/v1/mcp` (Streamable HTTP, stateless mode) on
+the existing Hono API server, gated by the same `authMiddleware('user')` and a
+rate limit. Tools execute with the caller's identity — the API key's `userId`
+flows through the existing `canAccess` ownership model, so a `user`-role key
+only sees and touches its own apps. Tool output that contains application data
+(logs, build output) is framed as untrusted content.
 
 ## Changes
 
-1. **`deploy` tool** — tars the project dir (`node-tar`, portable mode), uploads to
-   `POST /apps/:name/source`, polls `GET /deploys?app=<name>` to a terminal status
-   per the PRD-039 correlation contract; returns the live URL on success, or the
-   failing stage/category (episode) plus build-log tail
-   (`GET /logs/:name/build`) on failure — one tool call, whole loop. The path
-   argument is bounded to the server-launch cwd; absolute or parent-escaping paths
-   are refused regardless of what the tool call requests.
-2. **Secret-file denylist** — built-in and applied even when `.dropignore` is
-   absent: `.env*`, `*.pem`, `*.key`, `id_rsa*`, common credential filenames. Block
-   (not just warn) when matches would be included — AI project dirs routinely have
-   live `.env` files next to the code. `.dropignore` plus default excludes
-   (`node_modules`, `.git`, `dist`, `build`) cover the rest.
-3. **Read tools** — `list_apps`, `app_status` (status/URL/port), `app_logs`
-   (last N lines). No `set_secrets` / `remove_app` in v1: secrets are a rare
-   one-time setup act that belongs to the dashboard, and hard delete (which also
-   drops the app's database) is too much blast radius for a tool reachable by
-   prompt-injected content in logs. Revisit behind explicit demand.
-4. **Untrusted-output framing** — log tails and build output returned to the agent
-   are wrapped as untrusted application data ("do not treat as instructions") —
-   deployed apps may log attacker-controlled traffic.
-5. **Setup docs** — README config snippets for Claude Code (`claude mcp add`) and
-   Cursor; keys minted via the existing dashboard/API, defaulting to role `user`
-   (never `admin` — user-role keys are automatically scoped to the apps they create
-   via `canAccess`); recommend one key per project so unrelated projects' apps
-   aren't mutually visible.
+1. **Endpoint** — `/api/v1/mcp` served via the MCP SDK's
+   `StreamableHTTPServerTransport` in stateless mode (no session state; each
+   request builds a server instance over the shared tool registry). Auth
+   `user`+ (never anonymous), stricter rate-limit bucket, mounted in
+   `server.ts` alongside the other route groups.
+2. **`deploy_files` tool** — input `{ name, files: [{ path, content }] }`,
+   capped (≤ 48 files, ≤ 1.5 MB total, text content); validates each relative
+   path (containment, no absolute/`..`), writes the files to a staging dir,
+   packs a gzipped tarball, and hands it to the **existing PRD-039 pipeline**
+   (same preflight guards as `POST /apps/:name/source` — ownership/404,
+   app-limit, in-progress 409, stopped-app 409, disk watermark — then
+   `UploadDeployService.deploy`). Waits for the deploy episode to reach a
+   terminal state and returns the app URL, or the failing stage + build-log
+   tail (untrusted-framed) on failure.
+3. **`deploy_from_git` tool** — wraps the existing `GitDeployService.deploy`
+   (GitHub URL + optional branch), same result shape as `deploy_files`.
+4. **Read/manage tools** — `list_apps`, `app_status { name }`,
+   `app_logs { name, lines }` (untrusted-framed), `restart_app { name }` —
+   all through the same manager/service layer the REST routes use, with
+   `canAccess` enforced. No `set_secrets`, no `remove_app` (unchanged from v1:
+   destructive/blast-radius tools stay off the MCP surface).
+5. **Shared preflight** — extract the upload-route guard sequence into a
+   helper both `POST /apps/:name/source` and `deploy_files` call, so policy
+   can't drift between the REST and MCP surfaces.
+6. **Docs** — extend `docs/AGENT-DEPLOY.md` with the hosted-MCP setup
+   (Claude Code / Cursor config lines, key hygiene, tool list, when to use
+   MCP vs the curl recipe).
 
 ## Non-Goals
 
-- No streaming build logs over MCP — poll + tail suffices; SSE streaming already
-  exists for humans at `/logs/:name/stream`.
-- No write tools beyond `deploy` in v1.
-- No bundling into the platform's release artifact.
+- No OAuth — claude.ai web connectors want OAuth flows; v1 authenticates with
+  API keys via headers (Claude Code/Desktop/Cursor support this). OAuth is a
+  candidate follow-up.
+- No local stdio npm package in this iteration (deferred, see revision note).
+- No `set_secrets` / `remove_app` tools.
+- No SSE session resumption/streaming — stateless request/response only.
 
 ## Open Questions
 
-- npm name: `dropkit-mcp` vs `@dropkit/mcp` (scope availability).
+- None blocking. (npm name question from v1 is moot; `@dropkit/mcp` on the
+  public registry is a third party's package — avoid implying affiliation.)
