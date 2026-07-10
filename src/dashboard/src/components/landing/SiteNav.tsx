@@ -67,6 +67,7 @@ export function SiteNav({ isDark, onToggleTheme, onEnter, authEnabled, current }
         />
         <span style={{ fontFamily: 'var(--mono)', fontWeight: 700, fontSize: 16, letterSpacing: 2 }}>DROP</span>
         <span
+          className="dl-hide-xs"
           style={{
             fontFamily: 'var(--mono)',
             fontSize: 10,
@@ -83,7 +84,7 @@ export function SiteNav({ isDark, onToggleTheme, onEnter, authEnabled, current }
 
       <div style={{ flex: 1 }} />
 
-      <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+      <div className="dl-hide-sm" style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
         {NAV_LINKS.map((link) => {
           if (link.enter) {
             return (
@@ -142,6 +143,7 @@ export function SiteNav({ isDark, onToggleTheme, onEnter, authEnabled, current }
         <button
           type="button"
           onClick={onEnter}
+          className="dl-hide-xs"
           style={{
             fontFamily: 'var(--mono)',
             fontSize: 13,
