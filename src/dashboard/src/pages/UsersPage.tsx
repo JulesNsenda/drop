@@ -5,6 +5,10 @@ import { getAuthHeaders } from '../hooks/useAuth';
 import { useToast } from '../components/Toast';
 import StatusBadge from '../components/StatusBadge';
 import { App } from '../hooks/useApi';
+import Button from '../components/ui/Button';
+import Card from '../components/ui/Card';
+import Badge from '../components/ui/Badge';
+import StatCard from '../components/ui/StatCard';
 
 interface UserInfo {
   id: string;
@@ -41,10 +45,15 @@ function UsersPage() {
       const res = await fetch('/api/v1/auth/users', { headers: getAuthHeaders() });
       const json = await res.json();
       if (json.success) setUsers(json.data || []);
-    } catch {} finally { setLoading(false); }
+    } catch {
+    } finally {
+      setLoading(false);
+    }
   };
 
-  useEffect(() => { fetchUsers(); }, []);
+  useEffect(() => {
+    fetchUsers();
+  }, []);
 
   const selectUser = async (user: UserInfo) => {
     setSelectedUser(user);
@@ -56,16 +65,22 @@ function UsersPage() {
       if (json.success) {
         setUserApps((json.data || []).filter((a: App) => a.userId === user.id));
       }
-    } catch { setUserApps([]); }
+    } catch {
+      setUserApps([]);
+    }
 
     // Fetch activity filtered by username
     try {
       const res = await fetch('/api/v1/admin/activity?limit=50', { headers: getAuthHeaders() });
       const json = await res.json();
       if (json.success) {
-        setUserActivity((json.data || []).filter((a: ActivityEntry) => a.username === user.username).slice(0, 15));
+        setUserActivity(
+          (json.data || []).filter((a: ActivityEntry) => a.username === user.username).slice(0, 15)
+        );
       }
-    } catch { setUserActivity([]); }
+    } catch {
+      setUserActivity([]);
+    }
   };
 
   const toggleUser = async (id: string, enabled: boolean) => {
@@ -84,65 +99,81 @@ function UsersPage() {
     }
   };
 
-  const formatDate = (d?: string) => d ? new Date(d).toLocaleDateString() : 'Never';
+  const formatDate = (d?: string) => (d ? new Date(d).toLocaleDateString() : 'Never');
   const formatTime = (d: string) => new Date(d).toLocaleString();
 
   // User detail view
   if (selectedUser) {
     return (
       <div className="p-6">
-        <button onClick={() => setSelectedUser(null)} className="flex items-center gap-2 text-sm text-gray-500 dark:text-gray-400 hover:text-drop-600 mb-6">
-          <ArrowLeft className="w-4 h-4" /> Back to users
+        <button
+          onClick={() => setSelectedUser(null)}
+          className="mb-6 inline-flex items-center gap-2 text-sm transition-colors hover:text-[var(--accent)]"
+          style={{ color: 'var(--text-2)' }}
+        >
+          <ArrowLeft className="h-4 w-4" /> Back to users
         </button>
 
         {/* User header */}
-        <div className="flex items-center justify-between mb-6">
+        <div className="mb-6 flex items-center justify-between">
           <div>
-            <h1 className="text-2xl font-bold text-gray-900 dark:text-white">{selectedUser.username}</h1>
+            <h1 className="text-2xl font-bold" style={{ color: 'var(--text)' }}>
+              {selectedUser.username}
+            </h1>
             {selectedUser.email && (
-              <p className="text-sm text-gray-500 dark:text-gray-400">{selectedUser.email}</p>
+              <p className="text-sm" style={{ color: 'var(--text-2)' }}>
+                {selectedUser.email}
+              </p>
             )}
-            <div className="flex items-center gap-3 mt-1">
-              <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${
-                selectedUser.role === 'admin'
-                  ? 'bg-drop-100 dark:bg-drop-900/30 text-drop-700 dark:text-drop-400'
-                  : 'bg-gray-100 dark:bg-gray-700 text-gray-600 dark:text-gray-400'
-              }`}>{selectedUser.role}</span>
-              <span className={`text-xs ${selectedUser.enabled ? 'text-green-600' : 'text-red-500'}`}>
+            <div className="mt-1 flex items-center gap-3">
+              <Badge tone={selectedUser.role === 'admin' ? 'accent' : 'neutral'}>
+                {selectedUser.role}
+              </Badge>
+              <span
+                className="text-xs"
+                style={{ color: selectedUser.enabled ? 'var(--ok)' : 'var(--err)' }}
+              >
                 {selectedUser.enabled ? 'Active' : 'Disabled'}
               </span>
-              <span className="text-xs text-gray-500">Joined {formatDate(selectedUser.createdAt)}</span>
+              <span className="text-xs" style={{ color: 'var(--text-3)' }}>
+                Joined {formatDate(selectedUser.createdAt)}
+              </span>
             </div>
           </div>
           {selectedUser.role !== 'admin' && (
-            <button
+            <Button
+              variant={selectedUser.enabled ? 'danger' : 'primary'}
               onClick={() => toggleUser(selectedUser.id, !selectedUser.enabled)}
-              className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium ${
-                selectedUser.enabled
-                  ? 'bg-red-100 dark:bg-red-900/30 text-red-700 dark:text-red-400 hover:bg-red-200'
-                  : 'bg-green-100 dark:bg-green-900/30 text-green-700 dark:text-green-400 hover:bg-green-200'
-              }`}
             >
-              {selectedUser.enabled ? <><ShieldOff className="w-4 h-4" /> Disable</> : <><Shield className="w-4 h-4" /> Enable</>}
-            </button>
+              {selectedUser.enabled ? (
+                <>
+                  <ShieldOff className="h-4 w-4" /> Disable
+                </>
+              ) : (
+                <>
+                  <Shield className="h-4 w-4" /> Enable
+                </>
+              )}
+            </Button>
           )}
         </div>
 
         {/* Stats */}
-        <div className="grid gap-4 md:grid-cols-4 mb-6">
-          <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-4">
-            <p className="text-xs text-gray-500 dark:text-gray-400 mb-1">Applications</p>
-            <p className="text-2xl font-bold text-gray-900 dark:text-white">{userApps.length}</p>
-          </div>
-          <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-4">
-            <p className="text-xs text-gray-500 dark:text-gray-400 mb-1">App Limit</p>
+        <div className="mb-6 grid gap-4 md:grid-cols-4">
+          <StatCard label="Applications" value={userApps.length} />
+          <Card>
+            <p className="mb-1 text-sm font-medium" style={{ color: 'var(--text-2)' }}>
+              App Limit
+            </p>
             <div className="flex items-center gap-2">
               <input
                 type="number"
                 min="0"
                 value={selectedUser.maxApps || 0}
-                onChange={(e) => setSelectedUser({ ...selectedUser, maxApps: parseInt(e.target.value) || 0 })}
-                className="w-16 px-2 py-1 border border-gray-300 dark:border-gray-600 rounded bg-white dark:bg-gray-700 text-gray-900 dark:text-white text-sm"
+                onChange={e =>
+                  setSelectedUser({ ...selectedUser, maxApps: parseInt(e.target.value) || 0 })
+                }
+                className="dui-input w-16 rounded px-2 py-1 text-sm outline-none transition-colors"
               />
               <button
                 onClick={async () => {
@@ -153,41 +184,53 @@ function UsersPage() {
                   });
                   toast('success', 'App limit updated');
                 }}
-                className="text-xs text-drop-600 hover:text-drop-500"
+                className="text-xs font-medium"
+                style={{ color: 'var(--accent)' }}
               >
                 Save
               </button>
             </div>
-            <p className="text-[10px] text-gray-400 mt-1">0 = use global default</p>
-          </div>
-          <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-4">
-            <p className="text-xs text-gray-500 dark:text-gray-400 mb-1">Last Login</p>
-            <p className="text-sm font-medium text-gray-900 dark:text-white">{formatDate(selectedUser.lastLogin)}</p>
-          </div>
-          <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-4">
-            <p className="text-xs text-gray-500 dark:text-gray-400 mb-1">Recent Actions</p>
-            <p className="text-2xl font-bold text-gray-900 dark:text-white">{userActivity.length}</p>
-          </div>
+            <p className="mt-1 text-[10px]" style={{ color: 'var(--text-3)' }}>
+              0 = use global default
+            </p>
+          </Card>
+          <StatCard label="Last Login" value={formatDate(selectedUser.lastLogin)} />
+          <StatCard label="Recent Actions" value={userActivity.length} />
         </div>
 
         {/* User's apps */}
-        <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 mb-6">
-          <div className="px-4 py-3 border-b border-gray-200 dark:border-gray-700">
-            <h2 className="font-semibold text-gray-900 dark:text-white">Applications</h2>
+        <Card padded={false} className="mb-6">
+          <div className="border-b px-4 py-3" style={{ borderColor: 'var(--border)' }}>
+            <h2 className="font-semibold" style={{ color: 'var(--text)' }}>
+              Applications
+            </h2>
           </div>
           {userApps.length === 0 ? (
-            <div className="p-4 text-sm text-gray-500 dark:text-gray-400">No applications deployed</div>
+            <div className="p-4 text-sm" style={{ color: 'var(--text-2)' }}>
+              No applications deployed
+            </div>
           ) : (
-            <div className="divide-y divide-gray-100 dark:divide-gray-700">
-              {userApps.map((app) => (
-                <Link key={app.name} to={`/apps/${app.name}`} className="flex items-center justify-between px-4 py-3 hover:bg-gray-50 dark:hover:bg-gray-700/50 transition-colors">
+            <div className="divide-y" style={{ borderColor: 'var(--border)' }}>
+              {userApps.map(app => (
+                <Link
+                  key={app.name}
+                  to={`/apps/${app.name}`}
+                  className="flex items-center justify-between px-4 py-3 transition-colors hover:bg-[var(--bg-2)]"
+                  style={{ borderColor: 'var(--border)' }}
+                >
                   <div>
-                    <span className="font-medium text-gray-900 dark:text-white text-sm">{app.name}</span>
-                    <span className="text-xs text-gray-500 ml-2">{app.type}</span>
+                    <span className="text-sm font-medium" style={{ color: 'var(--text)' }}>
+                      {app.name}
+                    </span>
+                    <span className="ml-2 text-xs" style={{ color: 'var(--text-3)' }}>
+                      {app.type}
+                    </span>
                   </div>
                   <div className="flex items-center gap-3">
                     {app.port && (
-                      <span className="text-xs text-gray-400 font-mono">:{app.port}</span>
+                      <span className="font-mono text-xs" style={{ color: 'var(--text-3)' }}>
+                        :{app.port}
+                      </span>
                     )}
                     <StatusBadge status={app.status} />
                   </div>
@@ -195,65 +238,85 @@ function UsersPage() {
               ))}
             </div>
           )}
-        </div>
+        </Card>
 
         {/* Reset password (admin action) */}
         {selectedUser.role !== 'admin' && (
-          <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 mb-6">
-            <div className="px-4 py-3 border-b border-gray-200 dark:border-gray-700">
-              <h2 className="font-semibold text-gray-900 dark:text-white">Reset Password</h2>
+          <Card padded={false} className="mb-6">
+            <div className="border-b px-4 py-3" style={{ borderColor: 'var(--border)' }}>
+              <h2 className="font-semibold" style={{ color: 'var(--text)' }}>
+                Reset Password
+              </h2>
             </div>
-            <div className="p-4 flex gap-2 max-w-md">
+            <div className="flex max-w-md gap-2 p-4">
               <input
                 type="password"
                 value={resetPw}
-                onChange={(e) => setResetPw(e.target.value)}
+                onChange={e => setResetPw(e.target.value)}
                 placeholder="New password (min 8 chars)"
                 minLength={8}
-                className="flex-1 px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white text-sm outline-none focus:ring-2 focus:ring-drop-500"
+                className="dui-input flex-1 rounded-lg px-3 py-2 text-sm outline-none transition-colors"
               />
-              <button
+              <Button
+                disabled={resetPw.length < 8}
                 onClick={async () => {
-                  if (resetPw.length < 8) { toast('error', 'Min 8 characters'); return; }
+                  if (resetPw.length < 8) {
+                    toast('error', 'Min 8 characters');
+                    return;
+                  }
                   const res = await fetch(`/api/v1/auth/users/${selectedUser.id}/reset-password`, {
                     method: 'POST',
                     headers: { ...getAuthHeaders(), 'Content-Type': 'application/json' },
                     body: JSON.stringify({ newPassword: resetPw }),
                   });
                   const json = await res.json();
-                  if (json.success) { toast('success', 'Password reset'); setResetPw(''); }
-                  else toast('error', json.error?.message || 'Failed');
+                  if (json.success) {
+                    toast('success', 'Password reset');
+                    setResetPw('');
+                  } else toast('error', json.error?.message || 'Failed');
                 }}
-                disabled={resetPw.length < 8}
-                className="px-4 py-2 bg-drop-600 text-white rounded-lg hover:bg-drop-700 disabled:opacity-50 text-sm font-medium"
               >
                 Reset
-              </button>
+              </Button>
             </div>
-          </div>
+          </Card>
         )}
 
         {/* User's activity */}
-        <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700">
-          <div className="px-4 py-3 border-b border-gray-200 dark:border-gray-700">
-            <h2 className="font-semibold text-gray-900 dark:text-white">Recent Activity</h2>
+        <Card padded={false}>
+          <div className="border-b px-4 py-3" style={{ borderColor: 'var(--border)' }}>
+            <h2 className="font-semibold" style={{ color: 'var(--text)' }}>
+              Recent Activity
+            </h2>
           </div>
           {userActivity.length === 0 ? (
-            <div className="p-4 text-sm text-gray-500 dark:text-gray-400">No activity recorded</div>
+            <div className="p-4 text-sm" style={{ color: 'var(--text-2)' }}>
+              No activity recorded
+            </div>
           ) : (
-            <div className="divide-y divide-gray-100 dark:divide-gray-700">
-              {userActivity.map((a) => (
-                <div key={a.id} className="flex items-center justify-between px-4 py-2.5 text-sm">
+            <div className="divide-y" style={{ borderColor: 'var(--border)' }}>
+              {userActivity.map(a => (
+                <div
+                  key={a.id}
+                  className="flex items-center justify-between px-4 py-2.5 text-sm"
+                  style={{ borderColor: 'var(--border)' }}
+                >
                   <div>
-                    <span className="text-gray-600 dark:text-gray-400">{a.action}</span>
-                    {a.appName && <span className="text-drop-600 dark:text-drop-400 ml-1">{a.appName}</span>}
+                    <span style={{ color: 'var(--text-2)' }}>{a.action}</span>
+                    {a.appName && (
+                      <span className="ml-1" style={{ color: 'var(--accent)' }}>
+                        {a.appName}
+                      </span>
+                    )}
                   </div>
-                  <span className="text-xs text-gray-400">{formatTime(a.timestamp)}</span>
+                  <span className="text-xs" style={{ color: 'var(--text-3)' }}>
+                    {formatTime(a.timestamp)}
+                  </span>
                 </div>
               ))}
             </div>
           )}
-        </div>
+        </Card>
       </div>
     );
   }
@@ -261,66 +324,106 @@ function UsersPage() {
   // User list view
   return (
     <div className="p-6">
-      <div className="flex items-center justify-between mb-6">
+      <div className="mb-6 flex items-center justify-between">
         <div>
-          <h1 className="text-2xl font-bold text-gray-900 dark:text-white">Users</h1>
-          <p className="text-sm text-gray-500 dark:text-gray-400 mt-1">{users.length} registered user{users.length !== 1 ? 's' : ''}</p>
+          <h1 className="text-2xl font-bold" style={{ color: 'var(--text)' }}>
+            Users
+          </h1>
+          <p className="mt-1 text-sm" style={{ color: 'var(--text-2)' }}>
+            {users.length} registered user{users.length !== 1 ? 's' : ''}
+          </p>
         </div>
-        <button onClick={fetchUsers} disabled={loading} className="flex items-center gap-2 px-4 py-2 bg-drop-600 text-white rounded-lg hover:bg-drop-700 disabled:opacity-50 text-sm">
-          <RefreshCw className={`w-4 h-4 ${loading ? 'animate-spin' : ''}`} />
+        <Button onClick={fetchUsers} loading={loading}>
+          {!loading && <RefreshCw className="h-4 w-4" />}
           Refresh
-        </button>
+        </Button>
       </div>
 
-      <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 overflow-hidden">
+      <Card padded={false} className="overflow-hidden">
         <table className="w-full text-sm">
           <thead>
-            <tr className="border-b border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-800/50">
-              <th className="text-left px-4 py-3 font-medium text-gray-500 dark:text-gray-400">User</th>
-              <th className="text-left px-4 py-3 font-medium text-gray-500 dark:text-gray-400 hidden md:table-cell">Email</th>
-              <th className="text-left px-4 py-3 font-medium text-gray-500 dark:text-gray-400">Role</th>
-              <th className="text-left px-4 py-3 font-medium text-gray-500 dark:text-gray-400">Apps</th>
-              <th className="text-left px-4 py-3 font-medium text-gray-500 dark:text-gray-400">Last Login</th>
-              <th className="text-left px-4 py-3 font-medium text-gray-500 dark:text-gray-400">Status</th>
-              <th className="text-right px-4 py-3 font-medium text-gray-500 dark:text-gray-400">Actions</th>
+            <tr
+              className="border-b"
+              style={{ borderColor: 'var(--border)', background: 'var(--bg-2)' }}
+            >
+              <th className="px-4 py-3 text-left font-medium" style={{ color: 'var(--text-3)' }}>
+                User
+              </th>
+              <th
+                className="hidden px-4 py-3 text-left font-medium md:table-cell"
+                style={{ color: 'var(--text-3)' }}
+              >
+                Email
+              </th>
+              <th className="px-4 py-3 text-left font-medium" style={{ color: 'var(--text-3)' }}>
+                Role
+              </th>
+              <th className="px-4 py-3 text-left font-medium" style={{ color: 'var(--text-3)' }}>
+                Apps
+              </th>
+              <th className="px-4 py-3 text-left font-medium" style={{ color: 'var(--text-3)' }}>
+                Last Login
+              </th>
+              <th className="px-4 py-3 text-left font-medium" style={{ color: 'var(--text-3)' }}>
+                Status
+              </th>
+              <th className="px-4 py-3 text-right font-medium" style={{ color: 'var(--text-3)' }}>
+                Actions
+              </th>
             </tr>
           </thead>
-          <tbody className="divide-y divide-gray-100 dark:divide-gray-700">
-            {users.map((u) => (
+          <tbody className="divide-y" style={{ borderColor: 'var(--border)' }}>
+            {users.map(u => (
               <tr
                 key={u.id}
-                className={`cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-700/50 transition-colors ${u.enabled ? '' : 'opacity-50'}`}
+                className="cursor-pointer transition-colors hover:bg-[var(--bg-2)]"
+                style={{ borderColor: 'var(--border)', opacity: u.enabled ? 1 : 0.5 }}
                 onClick={() => selectUser(u)}
               >
                 <td className="px-4 py-3">
                   <div className="flex items-center gap-2">
-                    <Users className="w-4 h-4 text-gray-400" />
-                    <span className="font-medium text-gray-900 dark:text-white">{u.username}</span>
+                    <Users className="h-4 w-4" style={{ color: 'var(--text-3)' }} />
+                    <span className="font-medium" style={{ color: 'var(--text)' }}>
+                      {u.username}
+                    </span>
                   </div>
                 </td>
-                <td className="px-4 py-3 text-gray-500 dark:text-gray-400 text-xs hidden md:table-cell">{u.email || '-'}</td>
-                <td className="px-4 py-3">
-                  <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${
-                    u.role === 'admin'
-                      ? 'bg-drop-100 dark:bg-drop-900/30 text-drop-700 dark:text-drop-400'
-                      : 'bg-gray-100 dark:bg-gray-700 text-gray-600 dark:text-gray-400'
-                  }`}>{u.role}</span>
+                <td
+                  className="hidden px-4 py-3 text-xs md:table-cell"
+                  style={{ color: 'var(--text-2)' }}
+                >
+                  {u.email || '-'}
                 </td>
-                <td className="px-4 py-3 text-gray-600 dark:text-gray-400">{u.appCount}</td>
-                <td className="px-4 py-3 text-gray-500 dark:text-gray-400 text-xs">{formatDate(u.lastLogin)}</td>
                 <td className="px-4 py-3">
-                  <span className={`text-xs ${u.enabled ? 'text-green-600 dark:text-green-400' : 'text-red-500'}`}>
+                  <Badge tone={u.role === 'admin' ? 'accent' : 'neutral'}>{u.role}</Badge>
+                </td>
+                <td className="px-4 py-3" style={{ color: 'var(--text-2)' }}>
+                  {u.appCount}
+                </td>
+                <td className="px-4 py-3 text-xs" style={{ color: 'var(--text-2)' }}>
+                  {formatDate(u.lastLogin)}
+                </td>
+                <td className="px-4 py-3">
+                  <span
+                    className="text-xs"
+                    style={{ color: u.enabled ? 'var(--ok)' : 'var(--err)' }}
+                  >
                     {u.enabled ? 'Active' : 'Disabled'}
                   </span>
                 </td>
-                <td className="px-4 py-3 text-right" onClick={(e) => e.stopPropagation()}>
+                <td className="px-4 py-3 text-right" onClick={e => e.stopPropagation()}>
                   {u.role !== 'admin' && (
                     <button
                       onClick={() => toggleUser(u.id, !u.enabled)}
-                      className="text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 transition-colors"
+                      className="transition-colors hover:text-[var(--text)]"
+                      style={{ color: 'var(--text-3)' }}
                       title={u.enabled ? 'Disable user' : 'Enable user'}
                     >
-                      {u.enabled ? <ShieldOff className="w-4 h-4" /> : <Shield className="w-4 h-4" />}
+                      {u.enabled ? (
+                        <ShieldOff className="h-4 w-4" />
+                      ) : (
+                        <Shield className="h-4 w-4" />
+                      )}
                     </button>
                   )}
                 </td>
@@ -328,7 +431,7 @@ function UsersPage() {
             ))}
           </tbody>
         </table>
-      </div>
+      </Card>
     </div>
   );
 }
