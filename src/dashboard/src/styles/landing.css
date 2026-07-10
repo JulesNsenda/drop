@@ -121,6 +121,50 @@ html.dark .drop-landing {
 }
 
 /*
+ * Docs page (PRD-043): three-column layout — left section TOC (220px),
+ * center content (1fr), right "on this page" rail (200px). Both rails are
+ * sticky under the 60px SiteNav. Collapses to a single column on narrow
+ * viewports: the right rail hides (it's a reading aid, not primary nav) and
+ * the left TOC becomes a static block above the content.
+ */
+.drop-landing .dl-docs-grid {
+  display: grid;
+  grid-template-columns: 220px 1fr 200px;
+  gap: 40px;
+  align-items: start;
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 40px 28px 96px;
+}
+.drop-landing .dl-docs-toc,
+.drop-landing .dl-docs-rail {
+  position: sticky;
+  top: 76px;
+  max-height: calc(100vh - 96px);
+  overflow-y: auto;
+}
+.drop-landing .dl-docs-content {
+  min-width: 0;
+}
+@media (max-width: 960px) {
+  .drop-landing .dl-docs-grid {
+    grid-template-columns: 1fr !important;
+    padding: 28px 20px 64px;
+  }
+  .drop-landing .dl-docs-rail {
+    display: none;
+  }
+  .drop-landing .dl-docs-toc {
+    position: static;
+    max-height: none;
+    overflow-y: visible;
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 20px;
+    margin-bottom: 8px;
+  }
+}
+
+/*
  * Responsive collapses. The sample is a fixed 1200px desktop mock with no media
  * queries; these keep the real page from overflowing on tablet/mobile without
  * changing the desktop look.
