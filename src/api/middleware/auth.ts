@@ -54,7 +54,7 @@ export interface ApiKey {
   id: string;
   name: string;
   keyHash: string;
-  prefix: string; // First 8 chars for identification
+  prefix: string; // First 12 chars for identification
   role: 'admin' | 'user' | 'readonly';
   createdAt: string;
   lastUsed?: string;
