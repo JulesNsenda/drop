@@ -1,11 +1,40 @@
-import { useState, FormEvent, useRef } from 'react';
+import { useState, FormEvent, useRef, ReactNode } from 'react';
 import { Link, useLocation } from 'react-router-dom';
-import { Box, LogIn, ShieldCheck, ArrowLeft } from 'lucide-react';
+import { LogIn, ShieldCheck, ArrowLeft } from 'lucide-react';
 import { useAuth } from '../hooks/useAuth';
+import AuthLayout from '../components/AuthLayout';
+import Button from '../components/ui/Button';
+import Input from '../components/ui/Input';
+import Card from '../components/ui/Card';
 
 interface LoginLocationState {
   sessionExpired?: boolean;
   message?: string;
+}
+
+/** Inline notice/error banner, token-driven (mirrors `.dui-badge-*` tone colors). */
+function AuthAlert({
+  tone,
+  role,
+  children,
+}: {
+  tone: 'ok' | 'err';
+  role: 'status' | 'alert';
+  children: ReactNode;
+}) {
+  return (
+    <div
+      role={role}
+      className="mb-4 rounded-lg border px-3 py-2.5 text-sm"
+      style={{
+        background: `color-mix(in srgb, var(--${tone}) 15%, transparent)`,
+        borderColor: `color-mix(in srgb, var(--${tone}) 35%, transparent)`,
+        color: `var(--${tone})`,
+      }}
+    >
+      {children}
+    </div>
+  );
 }
 
 function LoginPage() {
@@ -20,7 +49,7 @@ function LoginPage() {
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
 
-  // MFA step — challengeToken lives only in React state, never localStorage
+  // MFA step — challengeToken lives only in a ref, never localStorage/state
   const [step, setStep] = useState<'credentials' | 'totp'>('credentials');
   const [totpCode, setTotpCode] = useState('');
   const challengeTokenRef = useRef<string>('');
@@ -71,143 +100,131 @@ function LoginPage() {
   };
 
   return (
-    <div className="min-h-screen flex items-center justify-center bg-gray-50 dark:bg-gray-900 px-4">
-      <div className="w-full max-w-sm">
-        {/* Logo */}
-        <div className="text-center mb-8">
-          <div className="w-16 h-16 bg-drop-500 rounded-2xl flex items-center justify-center mx-auto mb-4">
-            {step === 'totp' ? (
-              <ShieldCheck className="w-10 h-10 text-white" />
-            ) : (
-              <Box className="w-10 h-10 text-white" />
-            )}
-          </div>
-          <h1 className="text-2xl font-bold text-gray-900 dark:text-white">DROP</h1>
-          <p className="text-gray-500 dark:text-gray-400 mt-1">
-            {step === 'totp' ? 'Two-factor authentication' : 'Sign in to your dashboard'}
-          </p>
-          <p className="text-xs text-gray-400 dark:text-gray-600 mt-1">v2.0.0-rc.1</p>
-        </div>
+    <AuthLayout>
+      <div className="mb-6 text-center">
+        <h1 className="text-2xl font-semibold" style={{ color: 'var(--text)' }}>
+          {step === 'totp' ? 'Two-factor authentication' : 'Sign in'}
+        </h1>
+        <p className="mt-1 text-sm" style={{ color: 'var(--text-2)' }}>
+          {step === 'totp'
+            ? 'Enter the 6-digit code from your authenticator app.'
+            : 'Sign in to your dashboard.'}
+        </p>
+      </div>
 
-        {step === 'credentials' ? (
-          <form onSubmit={handleCredentialsSubmit} className="bg-white dark:bg-gray-800 rounded-xl shadow-sm border border-gray-200 dark:border-gray-700 p-6 mb-4">
+      {step === 'credentials' ? (
+        <Card>
+          <form onSubmit={handleCredentialsSubmit}>
             {notice && (
-              <div role="status" className="mb-4 p-3 bg-green-50 dark:bg-green-900/30 border border-green-200 dark:border-green-800 rounded-lg text-sm text-green-700 dark:text-green-400">
+              <AuthAlert tone="ok" role="status">
                 {notice}
-              </div>
+              </AuthAlert>
             )}
             {error && (
-              <div role="alert" className="mb-4 p-3 bg-red-50 dark:bg-red-900/30 border border-red-200 dark:border-red-800 rounded-lg text-sm text-red-700 dark:text-red-400">
+              <AuthAlert tone="err" role="alert">
                 {error}
-              </div>
+              </AuthAlert>
             )}
 
             <div className="mb-4">
-              <label htmlFor="username" className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
-                Username
-              </label>
-              <input
+              <Input
                 id="username"
+                label="Username"
                 type="text"
                 value={username}
-                onChange={(e) => setUsername(e.target.value)}
+                onChange={e => setUsername(e.target.value)}
                 required
                 autoFocus
-                className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white focus:ring-2 focus:ring-drop-500 focus:border-transparent outline-none"
                 placeholder="admin"
               />
             </div>
 
             <div className="mb-6">
-              <label htmlFor="password" className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
-                Password
-              </label>
-              <input
+              <Input
                 id="password"
+                label="Password"
                 type="password"
                 value={password}
-                onChange={(e) => setPassword(e.target.value)}
+                onChange={e => setPassword(e.target.value)}
                 required
-                className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white focus:ring-2 focus:ring-drop-500 focus:border-transparent outline-none"
               />
             </div>
 
-            <button
-              type="submit"
-              disabled={loading}
-              className="w-full flex items-center justify-center gap-2 px-4 py-2.5 bg-drop-600 text-white rounded-lg hover:bg-drop-700 disabled:opacity-50 transition-colors font-medium"
-            >
-              <LogIn className="w-4 h-4" />
+            <Button type="submit" variant="primary" loading={loading} className="w-full">
+              {!loading && <LogIn className="h-4 w-4" aria-hidden="true" />}
               {loading ? 'Signing in...' : 'Sign in'}
-            </button>
+            </Button>
           </form>
-        ) : (
-          <form onSubmit={handleTotpSubmit} className="bg-white dark:bg-gray-800 rounded-xl shadow-sm border border-gray-200 dark:border-gray-700 p-6 mb-4">
-            <p className="text-sm text-gray-600 dark:text-gray-400 mb-4">
-              Enter the 6-digit code from your authenticator app.
-            </p>
-
+        </Card>
+      ) : (
+        <Card>
+          <form onSubmit={handleTotpSubmit}>
             {error && (
-              <div role="alert" className="mb-4 p-3 bg-red-50 dark:bg-red-900/30 border border-red-200 dark:border-red-800 rounded-lg text-sm text-red-700 dark:text-red-400">
+              <AuthAlert tone="err" role="alert">
                 {error}
-              </div>
+              </AuthAlert>
             )}
 
             <div className="mb-6">
-              <label htmlFor="totp-code" className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
-                Authentication code
-              </label>
-              <input
+              <Input
                 id="totp-code"
+                label="Authentication code"
                 type="text"
                 inputMode="numeric"
                 pattern="[0-9]{6}"
                 maxLength={6}
                 value={totpCode}
-                onChange={(e) => setTotpCode(e.target.value.replace(/\D/g, ''))}
+                onChange={e => setTotpCode(e.target.value.replace(/\D/g, ''))}
                 required
                 autoFocus
                 autoComplete="one-time-code"
-                className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white focus:ring-2 focus:ring-drop-500 focus:border-transparent outline-none text-center text-2xl tracking-widest font-mono"
                 placeholder="000000"
+                className="text-center text-2xl font-mono tracking-widest"
               />
             </div>
 
-            <button
+            <Button
               type="submit"
-              disabled={loading || totpCode.length !== 6}
-              className="w-full flex items-center justify-center gap-2 px-4 py-2.5 bg-drop-600 text-white rounded-lg hover:bg-drop-700 disabled:opacity-50 transition-colors font-medium"
+              variant="primary"
+              loading={loading}
+              disabled={totpCode.length !== 6}
+              className="w-full"
             >
-              <ShieldCheck className="w-4 h-4" />
+              {!loading && <ShieldCheck className="h-4 w-4" aria-hidden="true" />}
               {loading ? 'Verifying...' : 'Verify'}
-            </button>
+            </Button>
 
-            <button
+            <Button
               type="button"
+              variant="ghost"
               onClick={handleBackToCredentials}
-              className="mt-3 w-full text-sm text-gray-500 dark:text-gray-400 hover:text-drop-600 dark:hover:text-drop-400 transition-colors"
+              className="mt-3 w-full"
             >
               ← Back to sign in
-            </button>
+            </Button>
           </form>
-        )}
+        </Card>
+      )}
 
-        {step === 'credentials' && (
-          <div className="text-center space-y-2">
-            <p className="text-sm text-gray-500 dark:text-gray-400">
-              Don't have an account?{' '}
-              <Link to="/signup" className="text-drop-600 hover:text-drop-500 font-medium">
-                Sign up
-              </Link>
-            </p>
-            <Link to="/" className="inline-flex items-center gap-1.5 text-sm text-gray-500 dark:text-gray-400 hover:text-drop-600 dark:hover:text-drop-400 transition-colors">
-              <ArrowLeft className="w-3.5 h-3.5" />
-              Back to home
+      {step === 'credentials' && (
+        <div className="mt-4 space-y-2 text-center">
+          <p className="text-sm" style={{ color: 'var(--text-2)' }}>
+            Don't have an account?{' '}
+            <Link to="/signup" className="font-medium" style={{ color: 'var(--accent)' }}>
+              Sign up
             </Link>
-          </div>
-        )}
-      </div>
-    </div>
+          </p>
+          <Link
+            to="/"
+            className="inline-flex items-center gap-1.5 text-sm transition-colors"
+            style={{ color: 'var(--text-2)' }}
+          >
+            <ArrowLeft className="h-3.5 w-3.5" />
+            Back to home
+          </Link>
+        </div>
+      )}
+    </AuthLayout>
   );
 }
 

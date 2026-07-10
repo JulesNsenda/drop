@@ -1,17 +1,9 @@
 import { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 
-// Self-hosted fonts (bundled as same-origin assets — required by the app CSP,
-// which blocks external Google Fonts). JetBrains Mono + Hanken Grotesk match the
-// design's --mono/--sans stacks.
-import '@fontsource/hanken-grotesk/400.css';
-import '@fontsource/hanken-grotesk/500.css';
-import '@fontsource/hanken-grotesk/600.css';
-import '@fontsource/hanken-grotesk/700.css';
-import '@fontsource/jetbrains-mono/400.css';
-import '@fontsource/jetbrains-mono/500.css';
-import '@fontsource/jetbrains-mono/600.css';
-import '@fontsource/jetbrains-mono/700.css';
+// Self-hosted fonts (JetBrains Mono + Hanken Grotesk) are imported once at the
+// app entry (main.tsx) so they're available app-wide under the strict CSP —
+// see PRD-045. No per-page font import needed here.
 
 import '../styles/landing.css';
 import { useTheme } from '../hooks/useTheme';

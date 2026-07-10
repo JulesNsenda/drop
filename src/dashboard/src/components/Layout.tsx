@@ -1,17 +1,39 @@
-import { useState } from 'react';
-import { Outlet, NavLink, useNavigate } from 'react-router-dom';
-import { LayoutGrid, Settings, Box, Upload, Users, Sun, Moon, Monitor, LogOut, User, Menu, X } from 'lucide-react';
+import { Outlet, NavLink, Link, useLocation, useNavigate } from 'react-router-dom';
+import {
+  LayoutGrid,
+  Settings,
+  Upload,
+  Users,
+  Sun,
+  Moon,
+  Monitor,
+  LogOut,
+  Plus,
+} from 'lucide-react';
 import { useTheme } from '../hooks/useTheme';
 import { useAuth } from '../hooks/useAuth';
 import { useToast } from './Toast';
 import LimitBadge from './LimitBadge';
+import Button from './ui/Button';
+import AppShell from './AppShell';
 
+/**
+ * Thin wrapper around AppShell (PRD-045/PRD-047): fills the shell's
+ * `sidebarNav`, `breadcrumb`, `themeToggle`, `headerActions`, and `user`
+ * slots. AppShell owns the responsive sidebar/drawer chrome; this component
+ * only supplies content and behavior — see AppShell.tsx for the shell itself.
+ *
+ * Nav reconciliation (PRD-047 §2.1): Applications (/apps), Deploy (/deploy),
+ * Users (/users, admin-only), Settings (/settings) — every item routes to a
+ * real page. The mockup's top-level Databases/Domains/Logs are intentionally
+ * omitted (they're per-app, surfaced on the app-detail tabs in a later slice).
+ */
 function Layout() {
   const { theme, setTheme } = useTheme();
   const { authRequired, username, role, logout } = useAuth();
   const navigate = useNavigate();
   const { toast } = useToast();
-  const [sidebarOpen, setSidebarOpen] = useState(false);
+  const location = useLocation();
 
   // PRD-026: explicit redirect to the landing page + confirmation on logout.
   const handleLogout = () => {
@@ -20,116 +42,158 @@ function Layout() {
     navigate('/', { replace: true });
   };
 
-  const themeIcon = theme === 'dark' ? Moon : theme === 'light' ? Sun : Monitor;
-  const ThemeIcon = themeIcon;
+  const ThemeIcon = theme === 'dark' ? Moon : theme === 'light' ? Sun : Monitor;
   const nextTheme = theme === 'light' ? 'dark' : theme === 'dark' ? 'system' : 'light';
   const themeLabel = theme === 'light' ? 'Light' : theme === 'dark' ? 'Dark' : 'System';
 
   const navLinkClass = ({ isActive }: { isActive: boolean }) =>
-    `flex items-center gap-3 px-3 py-2 rounded-lg transition-colors ${
-      isActive ? 'bg-drop-600 text-white' : 'text-gray-300 hover:bg-gray-800'
-    }`;
+    `flex items-center gap-3 rounded-lg px-3 py-2 transition-colors dui-nav-link ${isActive ? 'dui-nav-link-active' : ''}`;
 
-  const closeSidebar = () => setSidebarOpen(false);
+  const secondaryLinkClass = ({ isActive }: { isActive: boolean }) =>
+    `flex items-center gap-3 rounded-lg px-3 py-2 text-sm transition-colors dui-nav-link ${isActive ? 'dui-nav-link-active' : ''}`;
 
-  const sidebar = (
+  const sidebarNav = (
     <>
-      {/* Logo */}
-      <div className="p-4 border-b border-gray-800">
-        <div className="flex items-center justify-between">
-          <div className="flex items-center gap-3">
-            <div className="w-10 h-10 bg-drop-500 rounded-lg flex items-center justify-center">
-              <Box className="w-6 h-6" />
-            </div>
-            <div>
-              <h1 className="font-bold text-lg">DROP</h1>
-              <p className="text-xs text-gray-400">Dashboard</p>
-            </div>
-          </div>
-          <button onClick={closeSidebar} className="md:hidden text-gray-400 hover:text-white">
-            <X className="w-5 h-5" />
-          </button>
-        </div>
-      </div>
-
-      {/* Navigation */}
-      <nav className="flex-1 p-4">
+      <nav>
         <ul className="space-y-1">
-          <li><NavLink to="/apps" end className={navLinkClass} onClick={closeSidebar}><LayoutGrid className="w-5 h-5" />Applications</NavLink></li>
-          <li><NavLink to="/deploy" className={navLinkClass} onClick={closeSidebar}><Upload className="w-5 h-5" />Deploy</NavLink></li>
+          <li>
+            <NavLink to="/apps" end className={navLinkClass}>
+              <LayoutGrid className="h-5 w-5" />
+              Applications
+            </NavLink>
+          </li>
+          <li>
+            <NavLink to="/deploy" className={navLinkClass}>
+              <Upload className="h-5 w-5" />
+              Deploy
+            </NavLink>
+          </li>
           {role === 'admin' && (
-            <li><NavLink to="/users" className={navLinkClass} onClick={closeSidebar}><Users className="w-5 h-5" />Users</NavLink></li>
+            <li>
+              <NavLink to="/users" className={navLinkClass}>
+                <Users className="h-5 w-5" />
+                Users
+              </NavLink>
+            </li>
           )}
         </ul>
       </nav>
 
-      {/* Footer */}
-      <div className="p-4 border-t border-gray-800 space-y-1">
-        <NavLink to="/settings" onClick={closeSidebar} className={({ isActive }) => `flex items-center gap-3 px-3 py-2 text-sm rounded-lg transition-colors ${isActive ? 'bg-drop-600 text-white' : 'text-gray-400 hover:text-white hover:bg-gray-800'}`}>
-          <Settings className="w-4 h-4" />Settings
+      <div className="mt-6 space-y-1 border-t pt-4" style={{ borderColor: 'var(--border)' }}>
+        <NavLink to="/settings" className={secondaryLinkClass}>
+          <Settings className="h-4 w-4" />
+          Settings
         </NavLink>
-        <button onClick={() => setTheme(nextTheme)} className="flex items-center gap-3 w-full px-3 py-2 text-sm text-gray-400 hover:text-white hover:bg-gray-800 rounded-lg transition-colors">
-          <ThemeIcon className="w-4 h-4" /><span>{themeLabel}</span>
-        </button>
-        {authRequired && (
-          <div className="flex items-center justify-between px-3 py-2">
-            <div className="flex items-center gap-2 text-sm text-gray-400">
-              <User className="w-4 h-4" />
-              <span className="truncate max-w-[100px]">{username || 'User'}</span>
-              {role === 'admin' && (
-                <span className="text-[10px] px-1.5 py-0.5 bg-drop-500/20 text-drop-400 rounded font-medium uppercase">admin</span>
-              )}
-            </div>
-            <button onClick={handleLogout} className="text-gray-500 hover:text-white transition-colors" title="Sign out" aria-label="Sign out">
-              <LogOut className="w-4 h-4" />
-            </button>
-          </div>
-        )}
+
         {authRequired && role !== 'admin' && (
-          <div className="px-3 mb-2">
+          <div className="px-3 pt-1">
             <LimitBadge />
           </div>
         )}
-        <div className="text-xs text-gray-600 px-3">DROP v1.0</div>
+
+        <div className="px-3 pt-2 text-xs" style={{ color: 'var(--text-3)' }}>
+          DROP v2.0.0-rc.1
+        </div>
       </div>
     </>
   );
 
-  return (
-    <div className="h-screen flex bg-gray-50 dark:bg-gray-900 overflow-hidden">
-      {/* Mobile header */}
-      <div className="md:hidden fixed top-0 left-0 right-0 z-30 bg-gray-900 border-b border-gray-800 px-4 py-3 flex items-center justify-between">
-        <div className="flex items-center gap-3">
-          <div className="w-8 h-8 bg-drop-500 rounded-lg flex items-center justify-center">
-            <Box className="w-5 h-5 text-white" />
-          </div>
-          <span className="font-bold text-white">DROP</span>
-        </div>
-        <button onClick={() => setSidebarOpen(true)} className="text-gray-400 hover:text-white">
-          <Menu className="w-5 h-5" />
-        </button>
-      </div>
+  // Simple route-aware breadcrumb (PRD-047 §2.2): "Applications" on the list,
+  // "Applications / {name}" on an app-detail route, otherwise the current
+  // section's label. Deliberately minimal — no deep-linking beyond one level.
+  let breadcrumb = null;
+  const appDetailMatch = location.pathname.match(/^\/apps\/([^/]+)/);
+  if (appDetailMatch) {
+    breadcrumb = (
+      <span className="flex items-center gap-1.5 text-sm" style={{ color: 'var(--text-3)' }}>
+        <Link to="/apps" style={{ color: 'var(--text-3)' }}>
+          Applications
+        </Link>
+        <span aria-hidden="true">/</span>
+        <span style={{ color: 'var(--text)' }}>{decodeURIComponent(appDetailMatch[1])}</span>
+      </span>
+    );
+  } else if (location.pathname.startsWith('/apps')) {
+    breadcrumb = <span style={{ color: 'var(--text)' }}>Applications</span>;
+  } else if (location.pathname.startsWith('/deploy')) {
+    breadcrumb = <span style={{ color: 'var(--text)' }}>Deploy</span>;
+  } else if (location.pathname.startsWith('/settings')) {
+    breadcrumb = <span style={{ color: 'var(--text)' }}>Settings</span>;
+  } else if (location.pathname.startsWith('/users')) {
+    breadcrumb = <span style={{ color: 'var(--text)' }}>Users</span>;
+  }
 
-      {/* Mobile overlay */}
-      {sidebarOpen && (
-        <div className="md:hidden fixed inset-0 z-40 bg-black/50" onClick={closeSidebar} />
+  const themeToggle = (
+    <button
+      onClick={() => setTheme(nextTheme)}
+      className="flex h-9 w-9 items-center justify-center rounded-lg transition-colors"
+      style={{ background: 'var(--bg-3)', border: '1px solid var(--border)', color: 'var(--text)' }}
+      title={`Theme: ${themeLabel}`}
+      aria-label={`Cycle theme (current: ${themeLabel})`}
+    >
+      <ThemeIcon className="h-4 w-4" />
+    </button>
+  );
+
+  const headerActions = (
+    <Button variant="primary" onClick={() => navigate('/deploy')} aria-label="New deploy">
+      <Plus className="h-4 w-4" />
+      <span className="hidden sm:inline">New deploy</span>
+    </Button>
+  );
+
+  // Header account/avatar area (PRD-047 §2.2) — replaces the old sidebar
+  // user block; preserves the admin badge and logout (PRD-026).
+  const user = authRequired ? (
+    <div
+      className="ml-1 flex items-center gap-2 border-l pl-3"
+      style={{ borderColor: 'var(--border)' }}
+    >
+      <span
+        className="flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-full text-xs font-semibold"
+        style={{ background: 'var(--accent-soft)', color: 'var(--accent)' }}
+        aria-hidden="true"
+      >
+        {(username || 'U').charAt(0).toUpperCase()}
+      </span>
+      {/* Username hides on narrow headers to save space; the avatar + admin
+          badge (below) stay visible at every width — the admin badge must be
+          preserved on mobile too, not just desktop. */}
+      <span
+        className="hidden max-w-[120px] truncate text-sm font-medium sm:inline"
+        style={{ color: 'var(--text)' }}
+      >
+        {username || 'User'}
+      </span>
+      {role === 'admin' && (
+        <span
+          className="rounded px-1.5 py-0.5 text-[10px] font-medium uppercase"
+          style={{ background: 'var(--accent-soft)', color: 'var(--accent)' }}
+        >
+          admin
+        </span>
       )}
-
-      {/* Sidebar - desktop */}
-      <aside className="hidden md:flex w-64 h-screen flex-shrink-0 bg-gray-900 dark:bg-gray-950 text-white flex-col border-r border-gray-800">
-        {sidebar}
-      </aside>
-
-      {/* Sidebar - mobile */}
-      <aside className={`md:hidden fixed inset-y-0 left-0 z-50 w-64 bg-gray-900 dark:bg-gray-950 text-white flex flex-col transition-transform duration-200 ${sidebarOpen ? 'translate-x-0' : '-translate-x-full'}`}>
-        {sidebar}
-      </aside>
-
-      {/* Main content */}
-      <main className="flex-1 overflow-auto pt-14 md:pt-0">
-        <Outlet />
-      </main>
+      <button
+        onClick={handleLogout}
+        className="dui-nav-link flex h-9 w-9 flex-shrink-0 items-center justify-center rounded-lg transition-colors"
+        title="Sign out"
+        aria-label="Sign out"
+      >
+        <LogOut className="h-4 w-4" />
+      </button>
     </div>
+  ) : null;
+
+  return (
+    <AppShell
+      sidebarNav={sidebarNav}
+      breadcrumb={breadcrumb}
+      themeToggle={themeToggle}
+      headerActions={headerActions}
+      user={user}
+    >
+      <Outlet />
+    </AppShell>
   );
 }
 
