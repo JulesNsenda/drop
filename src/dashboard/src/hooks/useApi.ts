@@ -30,6 +30,12 @@ export interface App {
   userId?: string;
   ownerName?: string;
   customDomain?: string;
+  /** Live memory usage in bytes (from runtime; present only while status === 'running'). */
+  memory?: number | null;
+  /** Live CPU usage percent (from runtime; present only while status === 'running'). */
+  cpu?: number | null;
+  /** Live uptime in ms since the current process started (present only while status === 'running'). */
+  uptime?: number | null;
 }
 
 export interface ComponentHealth {
@@ -212,7 +218,10 @@ export function useHealth() {
   return { health, loading };
 }
 
-export async function appAction(name: string, action: 'start' | 'stop' | 'restart'): Promise<boolean> {
+export async function appAction(
+  name: string,
+  action: 'start' | 'stop' | 'restart'
+): Promise<boolean> {
   const json = await apiJson(`/apps/${name}/${action}`, { method: 'POST' });
   return json.success;
 }
@@ -245,7 +254,10 @@ export async function gitDeploy(request: {
   autoRedeploy?: boolean;
   tokenId?: string;
 }): Promise<{ success: boolean; data?: GitDeployResult; error?: string }> {
-  const json = await apiJson<GitDeployResult>('/git/deploy', { method: 'POST', ...jsonBody(request) });
+  const json = await apiJson<GitDeployResult>('/git/deploy', {
+    method: 'POST',
+    ...jsonBody(request),
+  });
   return { success: json.success, data: json.data, error: json.error?.message };
 }
 
@@ -259,8 +271,14 @@ export async function getGitTokens(): Promise<GitTokenInfo[]> {
   return json.data || [];
 }
 
-export async function addGitToken(name: string, token: string): Promise<{ success: boolean; data?: GitTokenInfo; error?: string }> {
-  const json = await apiJson<GitTokenInfo>('/git/tokens', { method: 'POST', ...jsonBody({ name, token }) });
+export async function addGitToken(
+  name: string,
+  token: string
+): Promise<{ success: boolean; data?: GitTokenInfo; error?: string }> {
+  const json = await apiJson<GitTokenInfo>('/git/tokens', {
+    method: 'POST',
+    ...jsonBody({ name, token }),
+  });
   return { success: json.success, data: json.data, error: json.error?.message };
 }
 

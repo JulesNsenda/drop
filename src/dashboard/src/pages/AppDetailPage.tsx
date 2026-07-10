@@ -26,6 +26,7 @@ import StatusBadge from '../components/StatusBadge';
 import DeployTimeline from '../components/DeployTimeline';
 import LogViewer from '../components/LogViewer';
 import Tabs, { TabDef } from '../components/Tabs';
+import MetricsTab from '../components/MetricsTab';
 import Card from '../components/ui/Card';
 import Button from '../components/ui/Button';
 import Input from '../components/ui/Input';
@@ -422,17 +423,7 @@ function AppDetailPage() {
 
       {activeTab === 'logs' && <LogViewer appName={app.name} appStatus={app.status} />}
 
-      {activeTab === 'metrics' && (
-        <Card className="py-12 text-center">
-          <Activity className="mx-auto mb-3 h-8 w-8" style={{ color: 'var(--text-3)' }} />
-          <h3 className="mb-1 text-base font-semibold" style={{ color: 'var(--text)' }}>
-            Metrics — coming soon
-          </h3>
-          <p className="text-sm" style={{ color: 'var(--text-2)' }}>
-            Per-app CPU, memory and uptime land in PRD-048.
-          </p>
-        </Card>
-      )}
+      {activeTab === 'metrics' && <MetricsTab app={app} />}
 
       {activeTab === 'environment' && (
         <Card padded={false}>

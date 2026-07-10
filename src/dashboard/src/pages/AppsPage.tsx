@@ -32,10 +32,10 @@ const DOT_COLOR: Record<string, string> = {
 };
 
 /**
- * The `/apps` list endpoint joins in live PM2 stats (memory/cpu) for running
- * apps (see `src/api/routes/apps.ts`), but the shared `App` type
- * (hooks/useApi.ts) doesn't declare those fields yet — extending locally here
- * rather than editing that shared hook, which is out of scope for this file.
+ * The `/apps` list endpoint joins in live runtime stats (memory/cpu, and now
+ * uptime — PRD-048) for running apps (see `src/api/routes/apps.ts`); the
+ * shared `App` type (hooks/useApi.ts) already declares these as optional.
+ * Kept as a local alias for narrower typing at the two call sites below.
  */
 type AppWithStats = App & { cpu?: number; memory?: number };
 
