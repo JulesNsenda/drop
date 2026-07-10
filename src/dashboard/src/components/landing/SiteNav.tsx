@@ -16,6 +16,7 @@ interface NavLinkItem {
   key: NavKey;
   label: string;
   href?: string;
+  to?: string;
   external?: boolean;
   enter?: boolean;
 }
@@ -24,7 +25,7 @@ const GITHUB_URL = 'https://github.com/JulesNsenda/drop';
 
 const NAV_LINKS: NavLinkItem[] = [
   { key: 'features', label: 'Features', href: '#features' },
-  { key: 'docs', label: 'Docs', href: GITHUB_URL, external: true },
+  { key: 'docs', label: 'Docs', to: '/docs' },
   { key: 'api', label: 'API', href: GITHUB_URL, external: true },
   { key: 'dashboard', label: 'Dashboard', enter: true },
 ];
@@ -109,6 +110,13 @@ export function SiteNav({ isDark, onToggleTheme, onEnter, authEnabled, current }
               >
                 {link.label}
               </a>
+            );
+          }
+          if (link.to) {
+            return (
+              <Link key={link.key} to={link.to} style={navLinkStyle(link.key)}>
+                {link.label}
+              </Link>
             );
           }
           return (

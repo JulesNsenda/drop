@@ -1,4 +1,5 @@
 import type { CSSProperties } from 'react';
+import { Link } from 'react-router-dom';
 
 export interface SiteFooterProps {
   onEnter: () => void;
@@ -7,6 +8,7 @@ export interface SiteFooterProps {
 interface FooterLinkItem {
   label: string;
   href?: string;
+  to?: string;
   external?: boolean;
   enter?: boolean;
 }
@@ -34,10 +36,10 @@ const FOOTER_COLUMNS: FooterColumn[] = [
     key: 'developers',
     title: 'Developers',
     links: [
-      { label: 'Documentation', href: GITHUB_URL, external: true },
+      { label: 'Documentation', to: '/docs' },
       { label: 'API Reference', href: GITHUB_URL, external: true },
       { label: 'CLI', href: GITHUB_URL, external: true },
-      { label: 'drop.yaml', href: '#config' },
+      { label: 'drop.yaml', to: '/docs#drop-yaml' },
     ],
   },
   {
@@ -45,7 +47,7 @@ const FOOTER_COLUMNS: FooterColumn[] = [
     title: 'Resources',
     links: [
       { label: 'GitHub', href: GITHUB_URL, external: true },
-      { label: 'Self-hosting', href: GITHUB_URL, external: true },
+      { label: 'Self-hosting', to: '/docs#installation' },
       { label: 'Community', href: GITHUB_URL, external: true },
       { label: 'Sign in', enter: true },
     ],
@@ -180,6 +182,13 @@ export function SiteFooter({ onEnter }: SiteFooterProps): JSX.Element {
                     >
                       {link.label}
                     </a>
+                  );
+                }
+                if (link.to) {
+                  return (
+                    <Link key={linkKey} to={link.to} className="dl-hover-text" style={columnLinkStyle}>
+                      {link.label}
+                    </Link>
                   );
                 }
                 return (
