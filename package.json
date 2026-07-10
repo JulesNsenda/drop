@@ -44,6 +44,7 @@
   },
   "dependencies": {
     "@hono/node-server": "^1.19.9",
+    "@modelcontextprotocol/sdk": "^1.29.0",
     "bcrypt": "^6.0.0",
     "chokidar": "^3.6.0",
     "commander": "^12.1.0",
@@ -54,7 +55,7 @@
     "pm2": "^5.4.0",
     "tar": "^7.5.19",
     "yaml": "^2.6.0",
-    "zod": "^3.24.0"
+    "zod": "3.25.67"
   },
   "devDependencies": {
     "@eslint/js": "^9.39.2",
