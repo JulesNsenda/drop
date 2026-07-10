@@ -6,8 +6,8 @@
 |-------|-------|
 | PRD ID | PRD-041 |
 | Feature | OAuth 2.1 for `/api/v1/mcp` (claude.ai connector support) |
-| Status | On hold — superseded for the common case by claude.ai's Request-headers connector auth (confirmed available 2026-07-10). Retained as the tier-independent / prefer-OAuth option; design fully reconciled and ready to build. |
-| Priority | P3 |
+| Status | On hold — design fully reconciled and ready to build. (Note: the Request-headers connector shortcut turned out NOT available on the operator's dialog — only Name/URL + optional OAuth Client ID/Secret — so the interim answer is the Caddy shim, and OAuth is the genuine native path claude.ai's dialog is built for.) |
+| Priority | P2 |
 | Target | Post-v2.1 (when claude.ai connector support is wanted) |
 | Depends On | PRD-040 (hosted MCP endpoint) |
 | Created | 2026-07-10 |
