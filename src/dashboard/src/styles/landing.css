@@ -88,6 +88,7 @@ html.dark .drop-landing {
 }
 .drop-landing pre {
   font-family: var(--mono);
+  max-width: 100%;
 }
 
 /* Hover helpers (replace the design's DC-only `style-hover` attribute).
@@ -132,6 +133,17 @@ html.dark .drop-landing {
   .drop-landing .dl-grid-sidebar {
     grid-template-columns: 1fr !important;
   }
+  /* Let collapsed grid items shrink below their content's intrinsic width, so
+     wide <pre>/mono content scrolls internally (overflow:auto) instead of
+     widening the whole page. */
+  .drop-landing .dl-grid-2 > *,
+  .drop-landing .dl-grid-hero > *,
+  .drop-landing .dl-grid-3 > *,
+  .drop-landing .dl-grid-4 > *,
+  .drop-landing .dl-grid-sidebar > *,
+  .drop-landing .dl-bento > * {
+    min-width: 0;
+  }
   .drop-landing .dl-bento {
     grid-template-columns: 1fr 1fr !important;
     grid-auto-rows: auto !important;
@@ -150,5 +162,8 @@ html.dark .drop-landing {
   .drop-landing .dl-bento > * {
     grid-column: auto !important;
     grid-row: auto !important;
+  }
+  .drop-landing .dl-hide-xs {
+    display: none !important;
   }
 }
