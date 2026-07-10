@@ -200,12 +200,12 @@ apps.get('/', async c => {
 
   // Batch-fetch live stats from the runtime (best-effort; no-op on failure).
   // Joined by name so the list stays fast even if the runtime is unavailable.
-  const statsMap: Map<string, { memory: number; cpu: number }> = new Map();
+  const statsMap: Map<string, { memory: number; cpu: number; uptime: number }> = new Map();
   try {
     const pm = getAppRuntime();
     const allStatus = await pm.getAllStatus();
     for (const s of allStatus) {
-      statsMap.set(s.name, { memory: s.memory, cpu: s.cpu });
+      statsMap.set(s.name, { memory: s.memory, cpu: s.cpu, uptime: s.uptime });
     }
   } catch {
     // Runtime not yet ready — skip stats
@@ -219,6 +219,7 @@ apps.get('/', async c => {
         if (stats && a.status === 'running') {
           dto.memory = stats.memory;
           dto.cpu = stats.cpu;
+          dto.uptime = stats.uptime;
         }
         return dto;
       }),
@@ -252,6 +253,7 @@ apps.get('/:name', async c => {
           pid: isAdmin ? (procInfo.pid ?? app.pid) : undefined,
           memory: isOwner ? procInfo.memory : undefined,
           cpu: isOwner ? procInfo.cpu : undefined,
+          uptime: isOwner ? procInfo.uptime : undefined,
           restarts: procInfo.restarts,
         })
       );
