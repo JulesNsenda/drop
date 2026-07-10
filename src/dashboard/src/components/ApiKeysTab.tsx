@@ -3,6 +3,9 @@ import { KeyRound, Copy, Trash2, Plus, CheckCircle, AlertTriangle } from 'lucide
 import { apiJson, jsonBody } from '../api/client';
 import { useToast } from './Toast';
 import { useConfirm } from './ConfirmDialog';
+import Button from './ui/Button';
+import Input from './ui/Input';
+import Card from './ui/Card';
 
 interface ApiKeyRecord {
   id: string;
@@ -26,14 +29,13 @@ interface CreatedApiKey {
 
 const RESERVED_NAME = 'cli-local';
 
-const inputClass =
-  'w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white text-sm outline-none focus:ring-2 focus:ring-drop-500';
-const labelClass = 'block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1';
-
-const roleBadgeClass: Record<ApiKeyRecord['role'], string> = {
-  admin: 'bg-drop-100 dark:bg-drop-900/30 text-drop-700 dark:text-drop-400',
-  user: 'bg-blue-100 dark:bg-blue-900/30 text-blue-700 dark:text-blue-400',
-  readonly: 'bg-gray-100 dark:bg-gray-700 text-gray-600 dark:text-gray-400',
+// Token-driven role tones (styles/app-ui.css `.dui-badge-*`). admin keeps the
+// brand/accent tone (its original highlighted styling); user and readonly
+// stay distinguishable via ok/neutral.
+const roleBadgeTone: Record<ApiKeyRecord['role'], string> = {
+  admin: 'dui-badge-accent',
+  user: 'dui-badge-ok',
+  readonly: 'dui-badge-neutral',
 };
 
 const formatDate = (d?: string) => (d ? new Date(d).toLocaleDateString() : 'Never');
@@ -66,7 +68,9 @@ function ApiKeysTab() {
     setLoading(false);
   };
 
-  useEffect(() => { fetchKeys(); }, []);
+  useEffect(() => {
+    fetchKeys();
+  }, []);
 
   const resetForm = () => {
     setName('');
@@ -90,9 +94,18 @@ function ApiKeysTab() {
     setFormError('');
 
     const trimmedName = name.trim();
-    if (!trimmedName) { setFormError('Name is required'); return; }
-    if (trimmedName.length > 64) { setFormError('Name must be 64 characters or fewer'); return; }
-    if (trimmedName === RESERVED_NAME) { setFormError(`"${RESERVED_NAME}" is reserved for the platform's local CLI key`); return; }
+    if (!trimmedName) {
+      setFormError('Name is required');
+      return;
+    }
+    if (trimmedName.length > 64) {
+      setFormError('Name must be 64 characters or fewer');
+      return;
+    }
+    if (trimmedName === RESERVED_NAME) {
+      setFormError(`"${RESERVED_NAME}" is reserved for the platform's local CLI key`);
+      return;
+    }
 
     let parsedExpiry: number | undefined;
     if (expiresInDays.trim() !== '') {
@@ -162,157 +175,233 @@ function ApiKeysTab() {
   };
 
   return (
-    <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 mb-6">
-      <div className="px-4 py-3 border-b border-gray-200 dark:border-gray-700 flex items-center justify-between">
+    <Card padded={false} className="mb-6">
+      <div
+        className="px-4 py-3 border-b flex items-center justify-between"
+        style={{ borderColor: 'var(--border)' }}
+      >
         <div className="flex items-center gap-2">
-          <KeyRound className="w-4 h-4 text-gray-500" />
-          <h2 className="font-semibold text-gray-900 dark:text-white">API Keys</h2>
+          <KeyRound className="w-4 h-4" style={{ color: 'var(--text-2)' }} />
+          <h2 className="font-semibold" style={{ color: 'var(--text)' }}>
+            API Keys
+          </h2>
         </div>
         {step === 'idle' && (
-          <button
-            onClick={handleStartCreate}
-            className="flex items-center gap-2 px-3 py-1.5 bg-drop-600 text-white rounded-lg hover:bg-drop-700 text-sm font-medium transition-colors"
-          >
+          <Button onClick={handleStartCreate} className="text-sm">
             <Plus className="w-4 h-4" />
             Create API key
-          </button>
+          </Button>
         )}
       </div>
 
       <div className="p-4">
         {step === 'form' && (
-          <form onSubmit={handleCreate} className="mb-6 space-y-3 max-w-md bg-gray-50 dark:bg-gray-800/50 border border-gray-200 dark:border-gray-700 rounded-lg p-4">
+          <form
+            onSubmit={handleCreate}
+            className="mb-6 space-y-3 max-w-md border rounded-lg p-4"
+            style={{ background: 'var(--bg-2)', borderColor: 'var(--border)' }}
+          >
             {formError && (
-              <div role="alert" className="p-2.5 bg-red-50 dark:bg-red-900/30 border border-red-200 dark:border-red-800 rounded-lg text-sm text-red-700 dark:text-red-400">
+              <div
+                role="alert"
+                className="p-2.5 border rounded-lg text-sm"
+                style={{
+                  background: 'color-mix(in srgb, var(--err) 15%, transparent)',
+                  borderColor: 'color-mix(in srgb, var(--err) 35%, transparent)',
+                  color: 'var(--err)',
+                }}
+              >
                 {formError}
               </div>
             )}
+            <Input
+              id="api-key-name"
+              label="Name"
+              type="text"
+              value={name}
+              onChange={e => setName(e.target.value)}
+              maxLength={64}
+              placeholder="e.g. CI deploy key"
+              autoFocus
+            />
             <div>
-              <label className={labelClass} htmlFor="api-key-name">Name</label>
-              <input
-                id="api-key-name"
-                type="text"
-                value={name}
-                onChange={(e) => setName(e.target.value)}
-                maxLength={64}
-                placeholder="e.g. CI deploy key"
-                autoFocus
-                className={inputClass}
-              />
-            </div>
-            <div>
-              <label className={labelClass} htmlFor="api-key-role">Role</label>
-              <select id="api-key-role" value={role} onChange={(e) => setRole(e.target.value as ApiKeyRecord['role'])} className={inputClass}>
+              <label
+                className="mb-1 block text-sm font-medium"
+                style={{ color: 'var(--text-2)' }}
+                htmlFor="api-key-role"
+              >
+                Role
+              </label>
+              <select
+                id="api-key-role"
+                value={role}
+                onChange={e => setRole(e.target.value as ApiKeyRecord['role'])}
+                className="w-full rounded-lg px-3 py-2 text-sm outline-none dui-input"
+              >
                 <option value="readonly">Readonly</option>
                 <option value="user">User</option>
                 <option value="admin">Admin</option>
               </select>
             </div>
-            <div>
-              <label className={labelClass} htmlFor="api-key-expires">Expires in (days)</label>
-              <input
-                id="api-key-expires"
-                type="number"
-                min={1}
-                max={3650}
-                step={1}
-                value={expiresInDays}
-                onChange={(e) => setExpiresInDays(e.target.value)}
-                placeholder="Never expires"
-                className={inputClass}
-              />
-            </div>
+            <Input
+              id="api-key-expires"
+              label="Expires in (days)"
+              type="number"
+              min={1}
+              max={3650}
+              step={1}
+              value={expiresInDays}
+              onChange={e => setExpiresInDays(e.target.value)}
+              placeholder="Never expires"
+            />
             <div className="flex gap-3 pt-1">
-              <button type="submit" disabled={creating} className="px-4 py-2 bg-drop-600 text-white rounded-lg hover:bg-drop-700 disabled:opacity-50 text-sm font-medium">
+              <Button type="submit" loading={creating}>
                 {creating ? 'Creating...' : 'Create key'}
-              </button>
-              <button type="button" onClick={handleCancelForm} className="px-4 py-2 border border-gray-300 dark:border-gray-600 text-gray-700 dark:text-gray-300 rounded-lg hover:bg-gray-50 dark:hover:bg-gray-700 text-sm">
+              </Button>
+              <Button type="button" variant="secondary" onClick={handleCancelForm}>
                 Cancel
-              </button>
+              </Button>
             </div>
           </form>
         )}
 
         {step === 'reveal' && createdKey && (
-          <div className="mb-6 max-w-md bg-gray-50 dark:bg-gray-800/50 border border-gray-200 dark:border-gray-700 rounded-lg p-4 space-y-3">
-            <div className="flex items-center gap-2 text-amber-700 dark:text-amber-400">
+          <div
+            className="mb-6 max-w-md border rounded-lg p-4 space-y-3"
+            style={{ background: 'var(--bg-2)', borderColor: 'var(--border)' }}
+          >
+            <div className="flex items-center gap-2" style={{ color: 'var(--warn)' }}>
               <AlertTriangle className="w-4 h-4 flex-shrink-0" />
               <p className="text-sm font-medium">This key won't be shown again — copy it now.</p>
             </div>
-            <code className="block text-xs font-mono bg-white dark:bg-gray-900 text-gray-800 dark:text-gray-200 px-3 py-2 rounded border border-gray-200 dark:border-gray-700 break-all select-all">
+            <code
+              className="block text-xs font-mono px-3 py-2 rounded border break-all select-all"
+              style={{
+                background: 'var(--bg-3)',
+                color: 'var(--text)',
+                borderColor: 'var(--border)',
+              }}
+            >
               {createdKey.key}
             </code>
             <div className="flex gap-3">
-              <button
-                type="button"
-                onClick={handleCopy}
-                className="flex items-center gap-2 px-4 py-2 border border-gray-300 dark:border-gray-600 text-gray-700 dark:text-gray-300 rounded-lg hover:bg-gray-50 dark:hover:bg-gray-700 text-sm font-medium"
-              >
+              <Button type="button" variant="secondary" onClick={handleCopy}>
                 <Copy className="w-4 h-4" />
                 Copy
-              </button>
-              <button
-                type="button"
-                onClick={handleDone}
-                className="flex items-center gap-2 px-4 py-2 bg-drop-600 text-white rounded-lg hover:bg-drop-700 text-sm font-medium"
-              >
+              </Button>
+              <Button type="button" onClick={handleDone}>
                 <CheckCircle className="w-4 h-4" />
                 Done
-              </button>
+              </Button>
             </div>
           </div>
         )}
 
         {loading ? (
           <div className="animate-pulse space-y-2">
-            <div className="h-4 w-48 bg-gray-200 dark:bg-gray-700 rounded" />
-            <div className="h-4 w-36 bg-gray-200 dark:bg-gray-700 rounded" />
+            <div className="h-4 w-48 rounded" style={{ background: 'var(--border-2)' }} />
+            <div className="h-4 w-36 rounded" style={{ background: 'var(--border-2)' }} />
           </div>
         ) : error ? (
-          <p className="text-sm text-red-600 dark:text-red-400">{error}</p>
+          <p className="text-sm" style={{ color: 'var(--err)' }}>
+            {error}
+          </p>
         ) : keys.length === 0 ? (
-          <p className="text-sm text-gray-500 dark:text-gray-400">No API keys yet</p>
+          <p className="text-sm" style={{ color: 'var(--text-2)' }}>
+            No API keys yet
+          </p>
         ) : (
           <div className="overflow-x-auto">
             <table className="w-full text-sm">
               <thead>
-                <tr className="border-b border-gray-200 dark:border-gray-700">
-                  <th className="text-left py-2 pr-4 font-medium text-gray-500 dark:text-gray-400">Name</th>
-                  <th className="text-left py-2 pr-4 font-medium text-gray-500 dark:text-gray-400">Prefix</th>
-                  <th className="text-left py-2 pr-4 font-medium text-gray-500 dark:text-gray-400">Role</th>
-                  <th className="text-left py-2 pr-4 font-medium text-gray-500 dark:text-gray-400">Created</th>
-                  <th className="text-left py-2 pr-4 font-medium text-gray-500 dark:text-gray-400">Last used</th>
-                  <th className="text-left py-2 pr-4 font-medium text-gray-500 dark:text-gray-400">Expires</th>
-                  <th className="text-right py-2 font-medium text-gray-500 dark:text-gray-400">Actions</th>
+                <tr className="border-b" style={{ borderColor: 'var(--border)' }}>
+                  <th
+                    className="text-left py-2 pr-4 font-medium"
+                    style={{ color: 'var(--text-3)' }}
+                  >
+                    Name
+                  </th>
+                  <th
+                    className="text-left py-2 pr-4 font-medium"
+                    style={{ color: 'var(--text-3)' }}
+                  >
+                    Prefix
+                  </th>
+                  <th
+                    className="text-left py-2 pr-4 font-medium"
+                    style={{ color: 'var(--text-3)' }}
+                  >
+                    Role
+                  </th>
+                  <th
+                    className="text-left py-2 pr-4 font-medium"
+                    style={{ color: 'var(--text-3)' }}
+                  >
+                    Created
+                  </th>
+                  <th
+                    className="text-left py-2 pr-4 font-medium"
+                    style={{ color: 'var(--text-3)' }}
+                  >
+                    Last used
+                  </th>
+                  <th
+                    className="text-left py-2 pr-4 font-medium"
+                    style={{ color: 'var(--text-3)' }}
+                  >
+                    Expires
+                  </th>
+                  <th className="text-right py-2 font-medium" style={{ color: 'var(--text-3)' }}>
+                    Actions
+                  </th>
                 </tr>
               </thead>
-              <tbody className="divide-y divide-gray-100 dark:divide-gray-700">
-                {keys.map((k) => {
+              <tbody>
+                {keys.map(k => {
                   const isCliLocal = k.name === RESERVED_NAME;
                   const isExpired = !!k.expiresAt && new Date(k.expiresAt).getTime() < Date.now();
                   return (
-                    <tr key={k.id}>
+                    <tr
+                      key={k.id}
+                      className="border-b last:border-b-0"
+                      style={{ borderColor: 'var(--border)' }}
+                    >
                       <td className="py-2.5 pr-4">
                         <div className="flex items-center gap-2">
-                          <span className="font-medium text-gray-900 dark:text-white">{k.name}</span>
+                          <span className="font-medium" style={{ color: 'var(--text)' }}>
+                            {k.name}
+                          </span>
                           {isCliLocal && (
-                            <span className="text-[10px] px-1.5 py-0.5 bg-gray-100 dark:bg-gray-700 text-gray-500 dark:text-gray-400 rounded font-medium uppercase">
+                            <span className="text-[10px] px-1.5 py-0.5 rounded font-medium uppercase dui-badge-neutral">
                               System (CLI)
                             </span>
                           )}
                         </div>
                       </td>
-                      <td className="py-2.5 pr-4 font-mono text-xs text-gray-500 dark:text-gray-400">{k.prefix}</td>
-                      <td className="py-2.5 pr-4">
-                        <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${roleBadgeClass[k.role]}`}>{k.role}</span>
+                      <td
+                        className="py-2.5 pr-4 font-mono text-xs"
+                        style={{ color: 'var(--text-3)' }}
+                      >
+                        {k.prefix}
                       </td>
-                      <td className="py-2.5 pr-4 text-gray-500 dark:text-gray-400 text-xs">{formatDate(k.createdAt)}</td>
-                      <td className="py-2.5 pr-4 text-gray-500 dark:text-gray-400 text-xs">{formatDate(k.lastUsed)}</td>
-                      <td className="py-2.5 pr-4 text-gray-500 dark:text-gray-400 text-xs">
+                      <td className="py-2.5 pr-4">
+                        <span
+                          className={`text-xs px-2 py-0.5 rounded-full font-medium ${roleBadgeTone[k.role]}`}
+                        >
+                          {k.role}
+                        </span>
+                      </td>
+                      <td className="py-2.5 pr-4 text-xs" style={{ color: 'var(--text-3)' }}>
+                        {formatDate(k.createdAt)}
+                      </td>
+                      <td className="py-2.5 pr-4 text-xs" style={{ color: 'var(--text-3)' }}>
+                        {formatDate(k.lastUsed)}
+                      </td>
+                      <td className="py-2.5 pr-4 text-xs" style={{ color: 'var(--text-3)' }}>
                         <div className="flex items-center gap-1.5">
                           {formatDate(k.expiresAt)}
                           {isExpired && (
-                            <span className="text-[10px] px-1.5 py-0.5 bg-red-100 dark:bg-red-900/30 text-red-700 dark:text-red-400 rounded font-medium uppercase">
+                            <span className="text-[10px] px-1.5 py-0.5 rounded font-medium uppercase dui-badge-err">
                               Expired
                             </span>
                           )}
@@ -321,7 +410,8 @@ function ApiKeysTab() {
                       <td className="py-2.5 text-right">
                         <button
                           onClick={() => handleDelete(k)}
-                          className="text-gray-400 hover:text-red-500 transition-colors"
+                          className="transition-colors hover:text-red-500"
+                          style={{ color: 'var(--text-3)' }}
                           title="Delete API key"
                           aria-label={`Delete API key ${k.name}`}
                         >
@@ -336,7 +426,7 @@ function ApiKeysTab() {
           </div>
         )}
       </div>
-    </div>
+    </Card>
   );
 }
 

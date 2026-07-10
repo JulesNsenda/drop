@@ -1,0 +1,247 @@
+/*
+ * App-wide design tokens for the authenticated dashboard + auth screens —
+ * PRD-045 (Dashboard design system & app shell). Mirrors the token
+ * vocabulary proven by `landing.css` (`.drop-landing`) so there is one
+ * naming scheme across the marketing landing page and the app itself, but
+ * scoped under `.drop-ui` so it never collides with the existing Tailwind
+ * `drop-*` palette or unscoped global styles.
+ *
+ * Theming is driven off the same `html.dark` class owned by useTheme() —
+ * not a parallel signal. Light values are the base (matches the repo's
+ * light-is-base convention); `html.dark .drop-ui` supplies the dark
+ * palette.
+ *
+ * Per PRD-045 §2.1, `.drop-ui` must be applied on BOTH layout shells
+ * (`AppShell` and `AuthLayout`), not a common ancestor above the route
+ * split — see those components for where the scope is applied.
+ */
+
+.drop-ui {
+  /* Light palette (base) */
+  --bg: #fcfdfe;
+  --bg-2: #f3f6fa;
+  --bg-3: #ffffff;
+  --panel: #ffffff;
+  --border: #e4e9f1;
+  --border-2: #d6dde8;
+  --text: #0a101b;
+  --text-2: #4b586c;
+  --text-3: #8996ab;
+  --accent: #0a84e0;
+  --accent-2: #2e9bfe;
+  --accent-ink: #ffffff;
+  --accent-soft: rgba(10, 132, 224, 0.08);
+  --ok: #12a150;
+  --warn: #c77700;
+  --err: #d1242f;
+  --grid: rgba(10, 20, 40, 0.05);
+  --elev: 0 1px 2px rgba(16, 24, 40, 0.05), 0 14px 34px rgba(16, 24, 40, 0.08);
+  --btn: 0 8px 24px color-mix(in srgb, var(--accent) 24%, transparent);
+
+  /* Fonts (theme-independent) */
+  --mono: 'JetBrains Mono', ui-monospace, 'SFMono-Regular', Menlo, monospace;
+  --sans: 'Hanken Grotesk', system-ui, -apple-system, 'Segoe UI', sans-serif;
+
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--sans);
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+}
+
+html.dark .drop-ui {
+  /* Dark palette */
+  --bg: #090c12;
+  --bg-2: #0e121b;
+  --bg-3: #141926;
+  --panel: #10151f;
+  --border: #212938;
+  --border-2: #2c3547;
+  --text: #eaeef6;
+  --text-2: #98a4b7;
+  --text-3: #5c6880;
+  --accent: #2e9bfe;
+  --accent-2: #66c0ff;
+  --accent-ink: #04121f;
+  --accent-soft: rgba(46, 155, 254, 0.12);
+  --ok: #39d98a;
+  --warn: #febc2e;
+  --err: #f85149;
+  --grid: rgba(255, 255, 255, 0.035);
+  --elev: 0 1px 0 rgba(255, 255, 255, 0.04) inset, 0 12px 34px rgba(0, 0, 0, 0.35);
+  --btn: 0 8px 24px color-mix(in srgb, var(--accent) 34%, transparent);
+}
+
+/* Scoped element styling (mirrors `.drop-landing`'s scoped rules) */
+.drop-ui a {
+  color: var(--accent);
+  text-decoration: none;
+}
+.drop-ui a:hover {
+  color: var(--accent-2);
+}
+.drop-ui ::selection {
+  background: var(--accent);
+  color: var(--accent-ink);
+}
+.drop-ui code {
+  font-family: var(--mono);
+  font-size: 0.9em;
+  background: var(--bg-3);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  padding: 1px 6px;
+  color: var(--text);
+}
+
+/*
+ * Primitive component classes (components/ui/*.tsx). Colors live here (as
+ * `var(--token)`) rather than as Tailwind arbitrary-value classes so hover/
+ * focus states can be expressed with plain CSS pseudo-classes, mirroring the
+ * `.dl-hover-*` helper pattern above.
+ */
+
+/* Button (components/ui/Button.tsx) */
+.drop-ui .dui-btn-primary {
+  background: var(--accent);
+  color: var(--accent-ink);
+  border-color: transparent;
+}
+.drop-ui .dui-btn-primary:hover:not(:disabled) {
+  background: var(--accent-2);
+}
+.drop-ui .dui-btn-secondary {
+  background: var(--bg-3);
+  color: var(--text);
+  border-color: var(--border);
+}
+.drop-ui .dui-btn-secondary:hover:not(:disabled) {
+  border-color: var(--border-2);
+  background: var(--bg-2);
+}
+.drop-ui .dui-btn-danger {
+  background: var(--err);
+  color: #ffffff;
+  border-color: transparent;
+}
+.drop-ui .dui-btn-danger:hover:not(:disabled) {
+  filter: brightness(1.08);
+}
+.drop-ui .dui-btn-ghost {
+  background: transparent;
+  color: var(--text-2);
+  border-color: transparent;
+}
+.drop-ui .dui-btn-ghost:hover:not(:disabled) {
+  background: var(--bg-2);
+  color: var(--text);
+}
+
+/* Card (components/ui/Card.tsx) */
+.drop-ui .dui-card {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  box-shadow: var(--elev);
+}
+
+/* Input (components/ui/Input.tsx) */
+.drop-ui .dui-input {
+  background: var(--bg-3);
+  color: var(--text);
+  border: 1px solid var(--border);
+}
+.drop-ui .dui-input::placeholder {
+  color: var(--text-3);
+}
+.drop-ui .dui-input:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+.drop-ui .dui-input-error {
+  border-color: var(--err);
+}
+.drop-ui .dui-input-error:focus {
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--err) 20%, transparent);
+}
+
+/* Badge (components/ui/Badge.tsx) */
+.drop-ui .dui-badge-neutral {
+  background: var(--bg-2);
+  color: var(--text-2);
+}
+.drop-ui .dui-badge-accent {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+.drop-ui .dui-badge-ok {
+  background: color-mix(in srgb, var(--ok) 15%, transparent);
+  color: var(--ok);
+}
+.drop-ui .dui-badge-warn {
+  background: color-mix(in srgb, var(--warn) 15%, transparent);
+  color: var(--warn);
+}
+.drop-ui .dui-badge-err {
+  background: color-mix(in srgb, var(--err) 15%, transparent);
+  color: var(--err);
+}
+
+/* StatCard (components/ui/StatCard.tsx) */
+.drop-ui .dui-stat-card {
+  background: var(--panel);
+  border: 1px solid var(--border);
+}
+.drop-ui .dui-stat-delta-up {
+  color: var(--ok);
+}
+.drop-ui .dui-stat-delta-down {
+  color: var(--err);
+}
+
+/* Tabs (components/Tabs.tsx restyle) */
+.drop-ui .dui-tab {
+  color: var(--text-2);
+  border-color: transparent;
+}
+.drop-ui .dui-tab:hover {
+  color: var(--text);
+}
+.drop-ui .dui-tab-active {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+/* Sidebar nav links (components/Layout.tsx) */
+.drop-ui .dui-nav-link {
+  color: var(--text-2);
+  background: transparent;
+}
+.drop-ui .dui-nav-link:hover {
+  background: var(--bg-3);
+  color: var(--text);
+}
+.drop-ui .dui-nav-link-active,
+.drop-ui .dui-nav-link-active:hover {
+  background: var(--accent);
+  color: var(--accent-ink);
+}
+
+/* AuthLayout branding-panel diamond (components/AuthLayout.tsx) */
+.drop-ui .dui-auth-logo {
+  display: block;
+  width: 40px;
+  height: 40px;
+  background: var(--accent);
+  border-radius: 50% 50% 50% 6px;
+  transform: rotate(45deg);
+  animation: dui-diamond-pulse 3s ease-in-out infinite;
+}
+@keyframes dui-diamond-pulse {
+  0%,
+  100% {
+    box-shadow: 0 0 0 rgba(0, 0, 0, 0);
+  }
+  50% {
+    box-shadow: 0 0 32px var(--accent);
+  }
+}

@@ -12,6 +12,10 @@ import {
   Key,
   Plus,
   X,
+  GitBranch,
+  Activity,
+  Globe,
+  Terminal,
 } from 'lucide-react';
 import { useApp, appAction, deleteApp, gitRedeploy } from '../hooks/useApi';
 import { getAuthHeaders, useAuth } from '../hooks/useAuth';
@@ -21,6 +25,18 @@ import { useConfirm } from '../components/ConfirmDialog';
 import StatusBadge from '../components/StatusBadge';
 import DeployTimeline from '../components/DeployTimeline';
 import LogViewer from '../components/LogViewer';
+import Tabs, { TabDef } from '../components/Tabs';
+import MetricsTab from '../components/MetricsTab';
+import Card from '../components/ui/Card';
+import Button from '../components/ui/Button';
+import Input from '../components/ui/Input';
+
+const DETAIL_TABS: TabDef[] = [
+  { id: 'logs', label: 'Logs', icon: Terminal },
+  { id: 'metrics', label: 'Metrics', icon: Activity },
+  { id: 'environment', label: 'Environment', icon: Key },
+  { id: 'domains', label: 'Domains', icon: Globe },
+];
 
 function AppDetailPage() {
   const { name } = useParams<{ name: string }>();
@@ -31,6 +47,7 @@ function AppDetailPage() {
   const { toast } = useToast();
   const confirmDialog = useConfirm();
   const [actionLoading, setActionLoading] = useState<string | null>(null);
+  const [activeTab, setActiveTab] = useState<string>('logs');
 
   // Env vars state — keys only; values are never returned by the API
   const [envVars, setEnvVars] = useState<string[]>([]);
@@ -63,7 +80,10 @@ function AppDetailPage() {
     setActionLoading(action);
     const success = await appAction(name, action);
     if (success) {
-      toast('success', `${action === 'start' ? 'Started' : action === 'stop' ? 'Stopped' : 'Restarted'} ${name}`);
+      toast(
+        'success',
+        `${action === 'start' ? 'Started' : action === 'stop' ? 'Stopped' : 'Restarted'} ${name}`
+      );
     } else {
       toast('error', `Failed to ${action} ${name}`);
     }
@@ -116,7 +136,7 @@ function AppDetailPage() {
       const json = await res.json();
       if (json.success) {
         const trimmed = newKey.trim();
-        setEnvVars((prev) => (prev.includes(trimmed) ? prev : [...prev, trimmed]));
+        setEnvVars(prev => (prev.includes(trimmed) ? prev : [...prev, trimmed]));
         setNewKey('');
         setNewValue('');
         toast('success', `Added ${trimmed}`);
@@ -137,7 +157,7 @@ function AppDetailPage() {
       });
       const json = await res.json();
       if (json.success) {
-        setEnvVars((prev) => prev.filter((k) => k !== key));
+        setEnvVars(prev => prev.filter(k => k !== key));
         toast('success', `Removed ${key}`);
       }
     } catch {
@@ -154,8 +174,8 @@ function AppDetailPage() {
     return (
       <div className="p-6">
         <div className="animate-pulse">
-          <div className="h-8 w-48 bg-gray-200 dark:bg-gray-700 rounded mb-4" />
-          <div className="h-4 w-96 bg-gray-200 dark:bg-gray-700 rounded" />
+          <div className="mb-4 h-8 w-48 rounded" style={{ background: 'var(--bg-2)' }} />
+          <div className="h-4 w-96 rounded" style={{ background: 'var(--bg-2)' }} />
         </div>
       </div>
     );
@@ -164,11 +184,22 @@ function AppDetailPage() {
   if (error || !app) {
     return (
       <div className="p-6">
-        <Link to="/" className="flex items-center gap-2 text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-white mb-6">
-          <ArrowLeft className="w-4 h-4" />
+        <Link
+          to="/"
+          className="mb-6 inline-flex items-center gap-2 text-sm transition-opacity hover:opacity-70"
+          style={{ color: 'var(--text-2)' }}
+        >
+          <ArrowLeft className="h-4 w-4" />
           Back to apps
         </Link>
-        <div className="p-4 bg-red-50 dark:bg-red-900/30 border border-red-200 dark:border-red-800 rounded-lg text-red-700 dark:text-red-400">
+        <div
+          className="rounded-lg border p-4 text-sm"
+          style={{
+            borderColor: 'var(--err)',
+            background: 'color-mix(in srgb, var(--err) 10%, transparent)',
+            color: 'var(--err)',
+          }}
+        >
           {error || 'App not found'}
         </div>
       </div>
@@ -178,81 +209,89 @@ function AppDetailPage() {
   return (
     <div className="p-6">
       {/* Back link */}
-      <Link to="/" className="flex items-center gap-2 text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-white mb-6">
-        <ArrowLeft className="w-4 h-4" />
+      <Link
+        to="/"
+        className="mb-6 inline-flex items-center gap-2 text-sm transition-opacity hover:opacity-70"
+        style={{ color: 'var(--text-2)' }}
+      >
+        <ArrowLeft className="h-4 w-4" />
         Back to apps
       </Link>
 
-      {/* Header */}
-      <div className="flex items-start justify-between mb-6">
+      {/* Header: name, status, type + destructive/lifecycle actions (visible regardless of tab) */}
+      <div className="mb-6 flex flex-wrap items-start justify-between gap-4">
         <div>
-          <div className="flex items-center gap-3 mb-2">
-            <h1 className="text-2xl font-bold text-gray-900 dark:text-white">{app.name}</h1>
+          <div className="mb-2 flex items-center gap-3">
+            <h1 className="text-2xl font-bold" style={{ color: 'var(--text)' }}>
+              {app.name}
+            </h1>
             <StatusBadge status={app.status} />
           </div>
-          <p className="text-gray-500 dark:text-gray-400">
+          <p className="text-sm" style={{ color: 'var(--text-2)' }}>
             {app.type} application
             {app.framework && ` (${app.framework})`}
           </p>
         </div>
 
         {/* Actions */}
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
           {app.status === 'running' ? (
             <>
-              <button
+              <Button
+                variant="secondary"
                 onClick={() => handleAction('restart')}
                 disabled={actionLoading !== null}
-                className="flex items-center gap-2 px-3 py-2 bg-yellow-100 dark:bg-yellow-900/30 text-yellow-700 dark:text-yellow-400 rounded-lg hover:bg-yellow-200 dark:hover:bg-yellow-900/50 disabled:opacity-50"
+                style={{ color: 'var(--warn)' }}
               >
-                <RotateCw className={`w-4 h-4 ${actionLoading === 'restart' ? 'animate-spin' : ''}`} />
+                <RotateCw
+                  className={`h-4 w-4 ${actionLoading === 'restart' ? 'animate-spin' : ''}`}
+                />
                 Restart
-              </button>
-              <button
+              </Button>
+              <Button
+                variant="danger"
                 onClick={() => handleAction('stop')}
                 disabled={actionLoading !== null}
-                className="flex items-center gap-2 px-3 py-2 bg-red-100 dark:bg-red-900/30 text-red-700 dark:text-red-400 rounded-lg hover:bg-red-200 dark:hover:bg-red-900/50 disabled:opacity-50"
               >
-                <Square className="w-4 h-4" />
+                <Square className="h-4 w-4" />
                 Stop
-              </button>
+              </Button>
             </>
           ) : (
-            <button
+            <Button
+              variant="primary"
               onClick={() => handleAction('start')}
               disabled={actionLoading !== null}
-              className="flex items-center gap-2 px-3 py-2 bg-green-100 dark:bg-green-900/30 text-green-700 dark:text-green-400 rounded-lg hover:bg-green-200 dark:hover:bg-green-900/50 disabled:opacity-50"
             >
-              <Play className="w-4 h-4" />
+              <Play className="h-4 w-4" />
               Start
-            </button>
+            </Button>
           )}
           {app.gitSource && (
-            <button
+            <Button
+              variant="secondary"
               onClick={handleRedeploy}
               disabled={actionLoading !== null}
-              className="flex items-center gap-2 px-3 py-2 bg-blue-100 dark:bg-blue-900/30 text-blue-700 dark:text-blue-400 rounded-lg hover:bg-blue-200 dark:hover:bg-blue-900/50 disabled:opacity-50"
+              style={{ color: 'var(--accent)' }}
             >
-              <RotateCw className={`w-4 h-4 ${actionLoading === 'redeploy' ? 'animate-spin' : ''}`} />
+              <RotateCw
+                className={`h-4 w-4 ${actionLoading === 'redeploy' ? 'animate-spin' : ''}`}
+              />
               Redeploy
-            </button>
+            </Button>
           )}
-          <button
-            onClick={handleDelete}
-            disabled={actionLoading !== null}
-            className="flex items-center gap-2 px-3 py-2 bg-gray-100 dark:bg-gray-800 text-gray-700 dark:text-gray-400 rounded-lg hover:bg-gray-200 dark:hover:bg-gray-700 disabled:opacity-50"
-          >
-            <Trash2 className="w-4 h-4" />
+          <Button variant="danger" onClick={handleDelete} disabled={actionLoading !== null}>
+            <Trash2 className="h-4 w-4" />
             Delete
-          </button>
+          </Button>
         </div>
       </div>
 
       {/* Info cards */}
-      <div className="grid gap-4 md:grid-cols-3 mb-6">
-        <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-4">
-          <div className="flex items-center gap-2 text-gray-500 dark:text-gray-400 mb-1">
-            <ExternalLink className="w-4 h-4" />
+      <div className="mb-6 grid gap-4 md:grid-cols-3">
+        <Card>
+          <div className="mb-1 flex items-center gap-2" style={{ color: 'var(--text-2)' }}>
+            <ExternalLink className="h-4 w-4" />
             <span className="text-sm">URL</span>
           </div>
           {app.port ? (
@@ -260,187 +299,243 @@ function AppDetailPage() {
               href={appLinkInfo(app).href}
               target="_blank"
               rel="noopener noreferrer"
-              className="text-sm font-semibold text-drop-600 hover:underline break-all"
+              className="break-all text-sm font-semibold hover:underline"
             >
               {appLinkInfo(app).label}
             </a>
           ) : (
-            <span className="text-sm font-semibold text-gray-400">Not assigned</span>
+            <span className="text-sm font-semibold" style={{ color: 'var(--text-3)' }}>
+              Not assigned
+            </span>
           )}
-        </div>
+        </Card>
 
         {isAdmin && app.path ? (
-          <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-4">
-            <div className="flex items-center gap-2 text-gray-500 dark:text-gray-400 mb-1">
-              <Folder className="w-4 h-4" />
+          <Card>
+            <div className="mb-1 flex items-center gap-2" style={{ color: 'var(--text-2)' }}>
+              <Folder className="h-4 w-4" />
               <span className="text-sm">Path</span>
             </div>
-            <p className="text-sm font-mono text-gray-700 dark:text-gray-300 truncate" title={app.path}>
+            <p
+              className="truncate font-mono text-sm"
+              style={{ color: 'var(--text)' }}
+              title={app.path}
+            >
               {app.path}
             </p>
             {app.ownerName && (
-              <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">Owner: {app.ownerName}</p>
+              <p className="mt-1 text-xs" style={{ color: 'var(--text-2)' }}>
+                Owner: {app.ownerName}
+              </p>
             )}
-          </div>
+          </Card>
         ) : (
-          <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-4">
-            <div className="flex items-center gap-2 text-gray-500 dark:text-gray-400 mb-1">
-              <Folder className="w-4 h-4" />
+          <Card>
+            <div className="mb-1 flex items-center gap-2" style={{ color: 'var(--text-2)' }}>
+              <Folder className="h-4 w-4" />
               <span className="text-sm">Type</span>
             </div>
-            <p className="text-sm text-gray-700 dark:text-gray-300 capitalize">{app.type}{app.framework ? ` (${app.framework})` : ''}</p>
-          </div>
+            <p className="text-sm capitalize" style={{ color: 'var(--text)' }}>
+              {app.type}
+              {app.framework ? ` (${app.framework})` : ''}
+            </p>
+          </Card>
         )}
 
-        <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-4">
-          <div className="flex items-center gap-2 text-gray-500 dark:text-gray-400 mb-1">
-            <Clock className="w-4 h-4" />
+        <Card>
+          <div className="mb-1 flex items-center gap-2" style={{ color: 'var(--text-2)' }}>
+            <Clock className="h-4 w-4" />
             <span className="text-sm">Last Deployed</span>
           </div>
-          <p className="text-sm text-gray-700 dark:text-gray-300">{formatDate(app.lastDeployedAt)}</p>
+          <p className="text-sm" style={{ color: 'var(--text)' }}>
+            {formatDate(app.lastDeployedAt)}
+          </p>
           {app.buildDuration && (
-            <p className="text-xs text-gray-500 dark:text-gray-400">Build: {app.buildDuration}ms</p>
+            <p className="text-xs" style={{ color: 'var(--text-2)' }}>
+              Build: {app.buildDuration}ms
+            </p>
           )}
-        </div>
+        </Card>
       </div>
 
       {/* Deploy timeline */}
       <DeployTimeline appName={app.name} />
 
-      {/* Custom domain */}
-      <CustomDomainSection appName={app.name} currentDomain={app.customDomain} onUpdate={refresh} />
-
       {/* Git source info */}
       {app.gitSource && (
-        <div className="mb-6 bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-4">
-          <div className="flex items-center gap-2 text-gray-500 dark:text-gray-400 mb-3">
+        <Card className="mb-6">
+          <div className="mb-3 flex items-center gap-2" style={{ color: 'var(--text-2)' }}>
+            <GitBranch className="h-4 w-4" />
             <span className="text-sm font-medium">Git Source</span>
           </div>
-          <div className="grid gap-3 md:grid-cols-2 text-sm">
+          <div className="grid gap-3 text-sm md:grid-cols-2">
             <div>
-              <span className="text-gray-500 dark:text-gray-400">Repository: </span>
+              <span style={{ color: 'var(--text-2)' }}>Repository: </span>
               <a
                 href={app.gitSource.repoUrl}
                 target="_blank"
                 rel="noopener noreferrer"
-                className="text-drop-600 hover:underline"
+                className="hover:underline"
               >
                 {app.gitSource.repoUrl.replace('https://github.com/', '')}
               </a>
             </div>
             <div>
-              <span className="text-gray-500 dark:text-gray-400">Branch: </span>
-              <span className="text-gray-700 dark:text-gray-300 font-mono">{app.gitSource.branch}</span>
+              <span style={{ color: 'var(--text-2)' }}>Branch: </span>
+              <span className="font-mono" style={{ color: 'var(--text)' }}>
+                {app.gitSource.branch}
+              </span>
             </div>
             {app.gitSource.lastCommitSha && (
               <div>
-                <span className="text-gray-500 dark:text-gray-400">Commit: </span>
-                <span className="text-gray-700 dark:text-gray-300 font-mono">
+                <span style={{ color: 'var(--text-2)' }}>Commit: </span>
+                <span className="font-mono" style={{ color: 'var(--text)' }}>
                   {app.gitSource.lastCommitSha.slice(0, 7)}
                 </span>
               </div>
             )}
             <div>
-              <span className="text-gray-500 dark:text-gray-400">Auto-redeploy: </span>
-              <span className="text-gray-700 dark:text-gray-300">
+              <span style={{ color: 'var(--text-2)' }}>Auto-redeploy: </span>
+              <span style={{ color: 'var(--text)' }}>
                 {app.gitSource.autoRedeploy ? 'Enabled' : 'Disabled'}
               </span>
             </div>
           </div>
-        </div>
+        </Card>
       )}
 
       {/* Error message */}
       {app.error && (
-        <div className="mb-6 p-4 bg-red-50 dark:bg-red-900/30 border border-red-200 dark:border-red-800 rounded-lg text-red-700 dark:text-red-400">
+        <div
+          className="mb-6 rounded-lg border p-4 text-sm"
+          style={{
+            borderColor: 'var(--err)',
+            background: 'color-mix(in srgb, var(--err) 10%, transparent)',
+            color: 'var(--err)',
+          }}
+        >
           <strong>Error:</strong> {app.error}
         </div>
       )}
 
-      {/* Environment Variables */}
-      <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 mb-6">
-        <div className="flex items-center px-4 py-3 border-b border-gray-200 dark:border-gray-700">
-          <Key className="w-4 h-4 text-gray-500 dark:text-gray-400 mr-2" />
-          <h2 className="font-semibold text-gray-900 dark:text-white">Environment Variables</h2>
-        </div>
-        <div className="p-4">
-          {envLoading ? (
-            <div className="animate-pulse h-8 bg-gray-100 dark:bg-gray-700 rounded" />
-          ) : (
-            <>
-              {envVars.length > 0 && (
-                <div className="space-y-2 mb-4">
-                  {envVars.map((key) => (
-                    <div key={key} className="flex items-center gap-2 text-sm">
-                      <span className="font-mono font-medium text-gray-700 dark:text-gray-300 min-w-[120px]">
-                        {key}
-                      </span>
-                      <span className="flex-1 font-mono text-gray-500 dark:text-gray-400 truncate">
-                        ••••••••
-                      </span>
-                      {role !== 'readonly' && (
-                        <button
-                          onClick={() => handleRemoveEnvVar(key)}
-                          className="text-gray-400 hover:text-red-500"
+      {/* Deep-view tabs: Logs / Metrics / Environment / Domains */}
+      <Tabs tabs={DETAIL_TABS} active={activeTab} onChange={setActiveTab} />
+
+      {activeTab === 'logs' && <LogViewer appName={app.name} appStatus={app.status} />}
+
+      {activeTab === 'metrics' && <MetricsTab app={app} />}
+
+      {activeTab === 'environment' && (
+        <Card padded={false}>
+          <div
+            className="flex items-center border-b px-4 py-3"
+            style={{ borderColor: 'var(--border)' }}
+          >
+            <Key className="mr-2 h-4 w-4" style={{ color: 'var(--text-2)' }} />
+            <h2 className="font-semibold" style={{ color: 'var(--text)' }}>
+              Environment Variables
+            </h2>
+          </div>
+          <div className="p-4">
+            {envLoading ? (
+              <div className="h-8 animate-pulse rounded" style={{ background: 'var(--bg-2)' }} />
+            ) : (
+              <>
+                {envVars.length > 0 && (
+                  <div className="mb-4 space-y-2">
+                    {envVars.map(key => (
+                      <div key={key} className="flex items-center gap-2 text-sm">
+                        <span
+                          className="min-w-[120px] font-mono font-medium"
+                          style={{ color: 'var(--text)' }}
                         >
-                          <X className="w-4 h-4" />
-                        </button>
-                      )}
-                    </div>
-                  ))}
-                </div>
-              )}
-
-              {envVars.length === 0 && (
-                <p className="text-sm text-gray-500 dark:text-gray-400 mb-4">
-                  No environment variables set
-                </p>
-              )}
-
-              {role !== 'readonly' && (
-                <>
-                  {/* Add new */}
-                  <div className="flex items-center gap-2">
-                    <input
-                      type="text"
-                      value={newKey}
-                      onChange={(e) => setNewKey(e.target.value.toUpperCase())}
-                      placeholder="KEY"
-                      className="flex-1 px-2 py-1.5 text-sm border border-gray-300 dark:border-gray-600 rounded bg-white dark:bg-gray-700 text-gray-900 dark:text-white font-mono outline-none focus:ring-1 focus:ring-drop-500"
-                    />
-                    <input
-                      type="text"
-                      value={newValue}
-                      onChange={(e) => setNewValue(e.target.value)}
-                      placeholder="value"
-                      className="flex-1 px-2 py-1.5 text-sm border border-gray-300 dark:border-gray-600 rounded bg-white dark:bg-gray-700 text-gray-900 dark:text-white font-mono outline-none focus:ring-1 focus:ring-drop-500"
-                    />
-                    <button
-                      onClick={handleAddEnvVar}
-                      disabled={!newKey.trim()}
-                      className="flex items-center gap-1 px-3 py-1.5 text-sm bg-drop-600 text-white rounded hover:bg-drop-700 disabled:opacity-50"
-                    >
-                      <Plus className="w-3 h-3" />
-                      Add
-                    </button>
+                          {key}
+                        </span>
+                        <span
+                          className="flex-1 truncate font-mono"
+                          style={{ color: 'var(--text-2)' }}
+                        >
+                          ••••••••
+                        </span>
+                        {role !== 'readonly' && (
+                          <button
+                            onClick={() => handleRemoveEnvVar(key)}
+                            className="transition-opacity hover:opacity-70"
+                            style={{ color: 'var(--text-3)' }}
+                            aria-label={`Remove ${key}`}
+                          >
+                            <X className="h-4 w-4" />
+                          </button>
+                        )}
+                      </div>
+                    ))}
                   </div>
-                  <p className="mt-2 text-xs text-gray-500 dark:text-gray-400">
-                    Changes take effect on next restart.
-                  </p>
-                </>
-              )}
-            </>
-          )}
-        </div>
-      </div>
+                )}
 
-      {/* Logs */}
-      <LogViewer appName={app.name} appStatus={app.status} />
+                {envVars.length === 0 && (
+                  <p className="mb-4 text-sm" style={{ color: 'var(--text-2)' }}>
+                    No environment variables set
+                  </p>
+                )}
+
+                {role !== 'readonly' && (
+                  <>
+                    {/* Add new */}
+                    <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+                      <div className="flex-1">
+                        <Input
+                          type="text"
+                          value={newKey}
+                          onChange={e => setNewKey(e.target.value.toUpperCase())}
+                          placeholder="KEY"
+                          className="font-mono"
+                        />
+                      </div>
+                      <div className="flex-1">
+                        <Input
+                          type="text"
+                          value={newValue}
+                          onChange={e => setNewValue(e.target.value)}
+                          placeholder="value"
+                          className="font-mono"
+                        />
+                      </div>
+                      <Button variant="primary" onClick={handleAddEnvVar} disabled={!newKey.trim()}>
+                        <Plus className="h-3.5 w-3.5" />
+                        Add
+                      </Button>
+                    </div>
+                    <p className="mt-2 text-xs" style={{ color: 'var(--text-2)' }}>
+                      Changes take effect on next restart.
+                    </p>
+                  </>
+                )}
+              </>
+            )}
+          </div>
+        </Card>
+      )}
+
+      {activeTab === 'domains' && (
+        <CustomDomainSection
+          appName={app.name}
+          currentDomain={app.customDomain}
+          onUpdate={refresh}
+        />
+      )}
     </div>
   );
 }
 
-function CustomDomainSection({ appName, currentDomain, onUpdate }: { appName: string; currentDomain?: string; onUpdate: () => void }) {
+function CustomDomainSection({
+  appName,
+  currentDomain,
+  onUpdate,
+}: {
+  appName: string;
+  currentDomain?: string;
+  onUpdate: () => void;
+}) {
   const [domain, setDomain] = useState(currentDomain || '');
   const [saving, setSaving] = useState(false);
   const { toast } = useToast();
@@ -467,30 +562,30 @@ function CustomDomainSection({ appName, currentDomain, onUpdate }: { appName: st
   };
 
   return (
-    <div className="mb-6 bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-4">
-      <div className="text-sm font-medium text-gray-500 dark:text-gray-400 mb-3">Custom Domain</div>
-      <div className="flex gap-2 max-w-md">
-        <input
-          type="text"
-          value={domain}
-          onChange={(e) => setDomain(e.target.value)}
-          placeholder="myapp.example.com"
-          className="flex-1 px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white text-sm outline-none focus:ring-2 focus:ring-drop-500"
-        />
-        <button
-          onClick={handleSave}
-          disabled={saving}
-          className="px-4 py-2 bg-drop-600 text-white rounded-lg hover:bg-drop-700 disabled:opacity-50 text-sm font-medium"
-        >
-          {saving ? 'Saving...' : 'Save'}
-        </button>
+    <Card>
+      <div className="mb-3 flex items-center gap-2" style={{ color: 'var(--text-2)' }}>
+        <Globe className="h-4 w-4" />
+        <span className="text-sm font-medium">Custom Domain</span>
+      </div>
+      <div className="flex max-w-md gap-2">
+        <div className="flex-1">
+          <Input
+            type="text"
+            value={domain}
+            onChange={e => setDomain(e.target.value)}
+            placeholder="myapp.example.com"
+          />
+        </div>
+        <Button variant="primary" onClick={handleSave} loading={saving}>
+          Save
+        </Button>
       </div>
       {currentDomain && (
-        <p className="mt-2 text-xs text-gray-500 dark:text-gray-400">
-          Point a CNAME record for <code className="bg-gray-100 dark:bg-gray-700 px-1 rounded">{currentDomain}</code> to your DROP server.
+        <p className="mt-2 text-xs" style={{ color: 'var(--text-2)' }}>
+          Point a CNAME record for <code>{currentDomain}</code> to your DROP server.
         </p>
       )}
-    </div>
+    </Card>
   );
 }
 

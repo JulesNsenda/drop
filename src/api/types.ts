@@ -56,6 +56,13 @@ export interface AppDto {
   memory?: number | null;
   /** Live CPU usage percent (from runtime; null when not running or unavailable). */
   cpu?: number | null;
+  /**
+   * Live uptime in ms, i.e. time since the current process/container started
+   * (from runtime; null when not running or unavailable). Only meaningful
+   * when `status === 'running'` — a runtime may still report a stale value
+   * for a process it stopped but did not fully remove (PRD-048 §1.3).
+   */
+  uptime?: number | null;
 }
 
 export interface CreateAppDto {

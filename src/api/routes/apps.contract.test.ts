@@ -106,17 +106,18 @@ describe('GET /api/v1/apps/:name DTO contract', () => {
     expect(body.data.status).not.toBe('online');
   });
 
-  it('exposes pid, memory, cpu, restarts to admin', async () => {
+  it('exposes pid, memory, cpu, uptime, restarts to admin', async () => {
     const res = await hono.request('/api/v1/apps/test-app', { headers: authHeader(adminToken) });
     expect(res.status).toBe(200);
     const body = (await res.json()) as { data: Record<string, unknown> };
     expect(body.data.pid).toBe(12345);
     expect(body.data.memory).toBe(104857600);
     expect(body.data.cpu).toBe(1.5);
+    expect(body.data.uptime).toBe(60000);
     expect(body.data.restarts).toBe(2);
   });
 
-  it('hides pid from non-admin but shows memory/cpu/restarts to app owner', async () => {
+  it('hides pid from non-admin but shows memory/cpu/uptime/restarts to app owner', async () => {
     const res = await hono.request('/api/v1/apps/test-app', { headers: authHeader(userToken) });
     expect(res.status).toBe(200);
     const body = (await res.json()) as { data: Record<string, unknown> };
@@ -124,6 +125,7 @@ describe('GET /api/v1/apps/:name DTO contract', () => {
     // App owner can see live resource stats (shown on dashboard cards)
     expect(body.data.memory).toBe(104857600);
     expect(body.data.cpu).toBe(1.5);
+    expect(body.data.uptime).toBe(60000);
     expect(body.data.restarts).toBe(2);
   });
 
@@ -135,6 +137,7 @@ describe('GET /api/v1/apps/:name DTO contract', () => {
     expect(body.data.name).toBe('test-app');
     expect(body.data.memory).toBeUndefined();
     expect(body.data.cpu).toBeUndefined();
+    expect(body.data.uptime).toBeUndefined();
     expect(body.data.restarts).toBeUndefined();
   });
 

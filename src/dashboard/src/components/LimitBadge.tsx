@@ -14,15 +14,11 @@ function LimitBadge() {
   const atLimit = used >= limit;
   const warning = ratio >= 0.8;
 
-  const tone = atLimit
-    ? 'bg-red-500/15 text-red-400'
-    : warning
-      ? 'bg-amber-500/15 text-amber-400'
-      : 'bg-gray-700 text-gray-300';
+  const toneClass = atLimit ? 'dui-badge-err' : warning ? 'dui-badge-warn' : 'dui-badge-neutral';
 
   return (
     <div
-      className={`px-3 py-1.5 rounded-lg text-xs font-medium ${tone}`}
+      className={`px-3 py-1.5 rounded-lg text-xs font-medium ${toneClass}`}
       title={atLimit ? 'You have reached your app limit' : `${used} of ${limit} apps used`}
     >
       Apps: {used}/{limit}
