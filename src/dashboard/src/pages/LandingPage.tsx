@@ -1,94 +1,104 @@
 import { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-
-// Self-hosted fonts (bundled as same-origin assets — required by the app CSP,
-// which blocks external Google Fonts). JetBrains Mono + Hanken Grotesk match the
-// design's --mono/--sans stacks.
-import '@fontsource/hanken-grotesk/400.css';
-import '@fontsource/hanken-grotesk/500.css';
-import '@fontsource/hanken-grotesk/600.css';
-import '@fontsource/hanken-grotesk/700.css';
-import '@fontsource/jetbrains-mono/400.css';
-import '@fontsource/jetbrains-mono/500.css';
-import '@fontsource/jetbrains-mono/600.css';
-import '@fontsource/jetbrains-mono/700.css';
-
-import '../styles/landing.css';
-import { useTheme } from '../hooks/useTheme';
-import { SiteNav } from '../components/landing/SiteNav';
-import { SiteFooter } from '../components/landing/SiteFooter';
-import { LandingSections } from '../components/landing/LandingSections';
+import { Box } from 'lucide-react';
+import { useAuth } from '../hooks/useAuth';
 
 function LandingPage() {
+  const { authenticated, loading } = useAuth();
   const navigate = useNavigate();
-  // Calling useTheme() here ensures the `dark` class is applied on this route,
-  // which is rendered outside the dashboard Layout.
-  const { theme, setTheme } = useTheme();
   const [authEnabled, setAuthEnabled] = useState<boolean | null>(null);
-  const [isDark, setIsDark] = useState<boolean>(() =>
-    typeof document !== 'undefined' && document.documentElement.classList.contains('dark')
-  );
+  const [revealed, setRevealed] = useState(false);
 
-  // Auth-enabled probe (preserved from the previous landing) — decides the CTA
-  // labels and whether to show the signup link.
   useEffect(() => {
     fetch('/api/v1/auth/status')
       .then((r) => r.json())
       .then((json) => {
         if (json.success) setAuthEnabled(json.data.enabled);
-        else setAuthEnabled(false);
       })
       .catch(() => setAuthEnabled(false));
   }, []);
 
-  // Track the resolved theme (useTheme only exposes the raw preference) by
-  // observing the `dark` class that useTheme maintains on <html>.
   useEffect(() => {
-    const el = document.documentElement;
-    const sync = () => setIsDark(el.classList.contains('dark'));
-    sync();
-    const obs = new MutationObserver(sync);
-    obs.observe(el, { attributes: true, attributeFilter: ['class'] });
-    return () => obs.disconnect();
-  }, [theme]);
+    if (!loading && authenticated) {
+      navigate('/apps', { replace: true });
+    }
+  }, [loading, authenticated, navigate]);
 
-  const handleEnter = () => navigate(authEnabled ? '/login' : '/apps');
-  const handleSignup = () => navigate('/signup');
-  const onToggleTheme = () => setTheme(isDark ? 'light' : 'dark');
+  useEffect(() => {
+    const t = setTimeout(() => setRevealed(true), 100);
+    return () => clearTimeout(t);
+  }, []);
 
-  if (authEnabled === null) {
+  if (loading || authEnabled === null) {
     return (
-      <div
-        className="drop-landing"
-        style={{ minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center' }}
-      >
-        <span
-          style={{
-            display: 'block',
-            width: 22,
-            height: 22,
-            background: 'var(--accent)',
-            borderRadius: '50% 50% 50% 3px',
-            transform: 'rotate(45deg)',
-            boxShadow: '0 0 30px var(--accent)',
-          }}
-          className="animate-pulse"
-        />
+      <div className="min-h-screen flex items-center justify-center bg-gray-950">
+        <div className="w-10 h-10 bg-drop-500 rounded-xl flex items-center justify-center animate-pulse">
+          <Box className="w-6 h-6 text-white" />
+        </div>
       </div>
     );
   }
 
+  const handleEnter = () => {
+    navigate(authEnabled ? '/login' : '/apps');
+  };
+
   return (
-    <div className="drop-landing">
-      <SiteNav
-        isDark={isDark}
-        onToggleTheme={onToggleTheme}
-        onEnter={handleEnter}
-        authEnabled={authEnabled}
-        current="landing"
-      />
-      <LandingSections onEnter={handleEnter} onSignup={handleSignup} authEnabled={authEnabled} />
-      <SiteFooter onEnter={handleEnter} />
+    <div className="min-h-screen bg-gray-950 flex flex-col items-center justify-center relative overflow-hidden select-none">
+      {/* Ambient glow */}
+      <div className="absolute inset-0">
+        <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[600px] h-[600px] bg-drop-500/[0.04] rounded-full blur-3xl" />
+      </div>
+
+      {/* Content */}
+      <div className={`relative z-10 text-center px-6 transition-all duration-1000 ease-out ${revealed ? 'opacity-100 translate-y-0' : 'opacity-0 translate-y-4'}`}>
+        {/* Logo */}
+        <div
+          className="w-12 h-12 bg-drop-500 rounded-xl flex items-center justify-center mx-auto mb-10 cursor-pointer hover:rotate-12 transition-transform duration-300"
+          onClick={handleEnter}
+        >
+          <Box className="w-7 h-7 text-white" />
+        </div>
+
+        {/* The hook */}
+        <p className="text-gray-500 text-sm uppercase tracking-[0.3em] mb-6">
+          What if deploying was just
+        </p>
+
+        <h1 className="text-6xl md:text-7xl font-bold text-white mb-4 tracking-tight leading-none">
+          dropping<br />a folder<span className="text-drop-500">?</span>
+        </h1>
+
+        <div className={`transition-all duration-1000 delay-700 ${revealed ? 'opacity-100' : 'opacity-0'}`}>
+          <p className="text-gray-600 text-sm mb-14">
+            No config. No pipelines. No YAML.
+          </p>
+
+          {/* CTA */}
+          <div className="flex flex-col items-center gap-3">
+            <button
+              onClick={handleEnter}
+              className="group px-8 py-3 bg-drop-500 text-white rounded-full hover:bg-drop-400 transition-all text-sm font-medium shadow-lg shadow-drop-500/20 hover:shadow-drop-500/30"
+            >
+              {authEnabled ? 'Sign in' : 'Enter'}
+              <span className="inline-block ml-2 group-hover:translate-x-1 transition-transform">&rarr;</span>
+            </button>
+            {authEnabled && (
+              <button
+                onClick={() => navigate('/signup')}
+                className="text-sm text-gray-500 hover:text-gray-300 transition-colors"
+              >
+                Create an account
+              </button>
+            )}
+          </div>
+        </div>
+      </div>
+
+      {/* Bottom text */}
+      <div className={`absolute bottom-8 text-gray-700 text-[11px] tracking-widest uppercase transition-opacity duration-1000 delay-1000 ${revealed ? 'opacity-100' : 'opacity-0'}`}>
+        DROP &middot; Self-hosted PaaS
+      </div>
     </div>
   );
 }
