@@ -14,6 +14,7 @@ import { BuilderService, getBuilder } from './builder';
 import { RouterService, getRouterService, resetRouterService } from './router';
 import { AppRuntime, AppProcessInfo, AppStartSpec, getAppRuntime, resetAppRuntime } from '../managers/runtime';
 import { AppStateManager, getStateManager, resetStateManager } from '../managers/app/state-manager';
+import { SettingsManager, getSettingsManager, resetSettingsManager } from '../managers/settings/settings-manager';
 import { AppConfigService, getAppConfigService, resetAppConfigService } from '../managers/app/app-config';
 import {
   PostgresServer,
@@ -220,6 +221,7 @@ export class DropPlatform {
   private runtime: AppRuntime | null = null;
   private router: RouterService | null = null;
   private stateManager: AppStateManager | null = null;
+  private settingsManager: SettingsManager | null = null;
   private appConfigService: AppConfigService | null = null;
   private postgresServer: PostgresServer | null = null;
   private dbProvisioner: DatabaseProvisioner | null = null;
@@ -420,6 +422,12 @@ export class DropPlatform {
     if (this.stateManager) {
       await this.stateManager.close();
       resetStateManager();
+    }
+
+    // Close settings manager
+    if (this.settingsManager) {
+      await this.settingsManager.close();
+      resetSettingsManager();
     }
 
     // Reset app config service
@@ -810,6 +818,14 @@ backup:
     this.stateManager = getStateManager({ stateFilePath });
     await this.stateManager.initialize();
     this.logger.info('App state manager initialized', 'STATE');
+
+    // Initialize platform settings manager (admin-settable overrides, e.g.
+    // DROP_PUBLIC_URL — see PRD-041). Must be loaded before startApiServer()
+    // constructs the ApiServer, which reads getStoredPublicUrl() synchronously.
+    const settingsFilePath = path.join(this.config.dropRoot, 'data', 'drop-svc', 'settings.json');
+    this.settingsManager = getSettingsManager({ settingsFilePath });
+    await this.settingsManager.load();
+    this.logger.info('Settings manager initialized', 'CONFIG');
 
     // Initialize app config service for per-app config files
     const appConfigDir = path.join(this.config.dropRoot, 'data', 'appconf', 'webapps');

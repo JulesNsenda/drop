@@ -12,8 +12,24 @@ import { getStateManager } from '../../managers/app/state-manager';
 import { getAppRuntime } from '../../managers/runtime';
 import { tryLogActivity } from '../../managers/activity';
 import { getDiskFreeMb } from '../../utils/disk';
+import { getSettingsManager } from '../../managers/settings/settings-manager';
+import { normalizePublicUrl } from '../../utils/url-validator';
+import { getPublicUrl, setPublicUrl } from '../runtime-config';
 
 const admin = new Hono();
+
+type SettingsSource = 'stored' | 'env' | 'unset';
+
+/** Shared payload shape for GET /settings and the "cleared" branch of PUT /settings/public-url. */
+function buildSettingsPayload(): { publicUrl: string | null; source: SettingsSource; storedPublicUrl: string | null } {
+  const storedPublicUrl = getSettingsManager().getStoredPublicUrl() ?? null;
+  const source: SettingsSource = storedPublicUrl ? 'stored' : process.env.DROP_PUBLIC_URL ? 'env' : 'unset';
+  return {
+    publicUrl: getPublicUrl() ?? null,
+    source,
+    storedPublicUrl,
+  };
+}
 
 // GET /admin/activity - Activity log (paginated)
 admin.get('/activity', async (c) => {
@@ -157,6 +173,43 @@ admin.post('/apps/:name/suspend', async (c) => {
   });
 
   return c.json(success({ appName, suspended: true }));
+});
+
+// GET /admin/settings - Platform settings (currently: the public base
+// URL / OAuth issuer override — PRD-041).
+admin.get('/settings', async (c) => {
+  return c.json(success(buildSettingsPayload()));
+});
+
+// PUT /admin/settings/public-url - Set or clear the admin override for
+// DROP_PUBLIC_URL (the OAuth issuer/resource base). Security-adjacent:
+// validated HTTPS-only (except localhost) via normalizePublicUrl, and a
+// bad/empty value fails CLOSED — it never derives an issuer from the Host
+// header. Updates both the persisted store and the live runtime config so
+// the change takes effect immediately, without a restart.
+admin.put('/settings/public-url', async (c) => {
+  const body = (await c.req.json()) as { publicUrl?: unknown };
+  const input = body.publicUrl;
+
+  if (input === null || input === undefined || input === '') {
+    await getSettingsManager().setPublicUrl(undefined);
+    setPublicUrl(undefined);
+    return c.json(success(buildSettingsPayload()));
+  }
+
+  if (typeof input !== 'string') {
+    return c.json(error(ErrorCodes.VALIDATION_ERROR, 'publicUrl must be a string or null'), 400);
+  }
+
+  const result = normalizePublicUrl(input);
+  if (!result.ok) {
+    return c.json(error(ErrorCodes.VALIDATION_ERROR, result.reason), 400);
+  }
+
+  await getSettingsManager().setPublicUrl(result.value);
+  setPublicUrl(result.value);
+
+  return c.json(success({ publicUrl: result.value, source: 'stored' as const, storedPublicUrl: result.value }));
 });
 
 export default admin;
