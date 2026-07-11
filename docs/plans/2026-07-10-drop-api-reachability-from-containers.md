@@ -1,7 +1,10 @@
 # Plan: make DROP's control-plane API reachable from isolated app containers
 
 **Date:** 2026-07-10
-**Status:** DRAFT — awaiting approval (do not implement yet)
+**Status:** MERGED to `develop` 2026-07-11 (DROP-050, PR #66, commit f02c432). The
+"Optional: build-time reachability" section below was intentionally **not** done — the
+failing call is runtime-only, so it's a fast-follow if build-time DROP API calls are ever
+needed.
 **Slug:** `drop-api-reachability-from-containers`
 
 ## Goal
