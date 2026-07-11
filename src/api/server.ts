@@ -30,6 +30,7 @@ import { securityHeadersMiddleware } from './middleware/security-headers';
 import { auditMiddleware, initializeAuditLog, closeAuditLog } from './middleware/audit';
 import { validateBodySize } from './middleware/validate';
 import { setApiRuntimeConfig, getPublicUrl } from './runtime-config';
+import { getSettingsManager } from '../managers/settings/settings-manager';
 import { buildProtectedResourceMetadata, buildAuthServerMetadata } from './oauth/metadata';
 import { error, ErrorCodes } from './types';
 import healthRoutes from './routes/health';
@@ -111,6 +112,16 @@ export class ApiServer {
       domainSuffix: this.config.domainSuffix,
       tempDirectory: this.config.tempDirectory,
       maxUploadSizeMb: this.config.maxUploadSizeMb,
+      // Admin-stored override (PRD-041 settings UI) takes precedence over
+      // DROP_PUBLIC_URL — see getPublicUrl()'s precedence. Reads whatever
+      // the settings manager singleton has loaded so far: the real platform
+      // (platform.ts) awaits settingsManager.load() before constructing
+      // this server, so the stored value is already present; tests that
+      // construct ApiServer directly without touching the settings manager
+      // get an empty/default singleton, i.e. undefined here, which leaves
+      // runtimeConfig.publicUrl untouched (see setApiRuntimeConfig above)
+      // and getPublicUrl() falls back to the env var as before.
+      publicUrl: getSettingsManager().getStoredPublicUrl(),
     });
 
     this.app = new Hono();
