@@ -465,5 +465,107 @@ describe('Auth Routes', () => {
 
       expect(res.status).toBe(409);
     });
+
+    describe('scoped users:create capability', () => {
+      let scopedKey: string;
+      let plainUserKey: string;
+
+      beforeEach(async () => {
+        const { key } = await createApiKey('waitlist-provision', 'none', undefined, ['users:create']);
+        scopedKey = key;
+        const { key: userKey } = await createApiKey('plain-user-key', 'user');
+        plainUserKey = userKey;
+      });
+
+      it('scoped key can create a user-role account with no role specified, defaulting to user', async () => {
+        const res = await app.request('/auth/users', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-API-Key': scopedKey,
+          },
+          body: JSON.stringify({
+            username: 'scoped-created-user',
+            password: 'password123',
+          }),
+        });
+
+        expect(res.status).toBe(201);
+        const data = (await res.json()) as ApiResponse<CreatedUserResponse>;
+        expect(data.success).toBe(true);
+        expect(data.data.username).toBe('scoped-created-user');
+        expect(data.data.role).toBe('user');
+      });
+
+      it('scoped key requesting an admin role is rejected with 403 and creates no user', async () => {
+        const res = await app.request('/auth/users', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-API-Key': scopedKey,
+          },
+          body: JSON.stringify({
+            username: 'scoped-wants-admin',
+            password: 'password123',
+            role: 'admin',
+          }),
+        });
+
+        expect(res.status).toBe(403);
+
+        // Confirm no user was created (admin-only listing).
+        const listRes = await app.request('/auth/users', {
+          method: 'GET',
+          headers: { Authorization: `Bearer ${adminToken}` },
+        });
+        const listData = (await listRes.json()) as ApiResponse<Array<{ username: string }>>;
+        expect(listData.data.some((u) => u.username === 'scoped-wants-admin')).toBe(false);
+      });
+
+      it('admin token can still create an admin-role account', async () => {
+        const res = await app.request('/auth/users', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${adminToken}`,
+          },
+          body: JSON.stringify({
+            username: 'second-admin',
+            password: 'password123',
+            role: 'admin',
+          }),
+        });
+
+        expect(res.status).toBe(201);
+        const data = (await res.json()) as ApiResponse<CreatedUserResponse>;
+        expect(data.success).toBe(true);
+        expect(data.data.role).toBe('admin');
+      });
+
+      it('scoped key is rejected (403) from the admin-only GET /auth/users listing', async () => {
+        const res = await app.request('/auth/users', {
+          method: 'GET',
+          headers: { 'X-API-Key': scopedKey },
+        });
+
+        expect(res.status).toBe(403);
+      });
+
+      it('a plain non-admin user API key (no scope) cannot create users', async () => {
+        const res = await app.request('/auth/users', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-API-Key': plainUserKey,
+          },
+          body: JSON.stringify({
+            username: 'should-not-be-created',
+            password: 'password123',
+          }),
+        });
+
+        expect(res.status).toBe(403);
+      });
+    });
   });
 });

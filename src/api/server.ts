@@ -191,6 +191,14 @@ export class ApiServer {
     v1.use('/auth/login', authRateLimitMiddleware());
     v1.use('/auth/signup', authRateLimitMiddleware());
     v1.use('/auth/mfa/*', authRateLimitMiddleware());
+    // Account creation (POST /auth/users) — reachable by a scoped provisioning
+    // token now, so bound it with the strict auth limiter. POST only, so admin
+    // GET listing of users is not throttled. Registered unconditionally like the
+    // login limiter above.
+    const usersCreateRateLimit = authRateLimitMiddleware();
+    v1.use('/auth/users', (c, next) =>
+      c.req.method === 'POST' ? usersCreateRateLimit(c, next) : next()
+    );
     v1.route('/auth', authRoutes);
 
     // Upload deploys get a stricter, route-specific rate limit (PRD-039),
@@ -206,6 +214,10 @@ export class ApiServer {
     if (this.config.enableAuth && isAuthEnabled()) {
       // migrate-runtime is admin-only — register before the general /apps/* guard.
       v1.use('/apps/*/migrate-runtime', authMiddleware('admin'));
+      // Granting/revoking an app's control-plane API capabilities (which mints a
+      // scoped DROP_API_KEY) is admin-only — register before the general /apps/*
+      // guard so a readonly/user token can't confer capabilities.
+      v1.use('/apps/*/capabilities', authMiddleware('admin'));
       // start/stop/restart mutate runtime state (and, on restart, tear down
       // and recreate the process/container) — read-only tokens must not
       // reach them. Register before the general /apps/* guard.

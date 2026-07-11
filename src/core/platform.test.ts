@@ -9,6 +9,7 @@ import * as os from 'os';
 import { DropPlatform, createPlatform } from './platform';
 import { eventBus } from './event-bus';
 import * as diskUtils from '../utils/disk';
+import { createApiKey, deleteApiKeysByName } from '../api/middleware/auth';
 
 // These are pipeline/service unit tests — they never exercise the HTTP API, so
 // disable it (createPlatform reads DROP_ENABLE_API when no enableApi is passed).
@@ -32,6 +33,23 @@ jest.mock('../utils/disk', () => ({
   hasEnoughDisk: jest.fn().mockResolvedValue({ ok: true, freeMb: 999999 }),
   getMinFreeDiskMb: jest.fn().mockReturnValue(500),
 }));
+
+// Mock only the auth module's API-key helpers (createApiKey/deleteApiKeysByName)
+// so buildStartSpec's provisioning-key minting (PR2) is exercisable without a
+// real, initialized auth store — while keeping the rest of the module (e.g.
+// authMiddleware, used transitively by the API routes platform.ts imports)
+// real, since this file doesn't otherwise touch auth.
+jest.mock('../api/middleware/auth', () => {
+  const actual = jest.requireActual('../api/middleware/auth');
+  return {
+    ...actual,
+    createApiKey: jest.fn().mockResolvedValue({
+      key: 'drop_testkey',
+      apiKey: { id: 'test-key-id', name: 'test', role: 'none', createdAt: new Date().toISOString() },
+    }),
+    deleteApiKeysByName: jest.fn().mockResolvedValue(undefined),
+  };
+});
 
 // Mock state manager
 jest.mock('../managers/app/state-manager', () => {
@@ -890,6 +908,86 @@ describe('buildStartSpec — DROP_API_URL injection (PR1)', () => {
     );
 
     expect(spec.env.DROP_API_URL).toBe('http://127.0.0.1:4113');
+  });
+});
+
+describe('buildStartSpec — DROP_API_KEY provisioning grant (PR2)', () => {
+  let platform: DropPlatform;
+  let tempDir: string;
+
+  const detection = {
+    type: 'nodejs',
+    framework: null,
+    suggestedConfig: { startCommand: 'node index.js' },
+  } as any;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    tempDir = path.join(os.tmpdir(), `drop-test-${Date.now()}`);
+  });
+
+  afterEach(async () => {
+    if (platform && platform.isActive()) {
+      await platform.stop();
+    }
+  });
+
+  it('mints a fresh, rotated provisioning key and injects DROP_API_KEY when the app has a granted scope', async () => {
+    platform = createPlatform({
+      dropRoot: tempDir,
+      logLevel: 'error',
+      apiPort: 4114,
+      isolation: 'none',
+    });
+    await platform.start();
+    (platform as any).appConfigService = {
+      getConfig: jest.fn().mockReturnValue({ grantedApiScopes: ['users:create'] }),
+    };
+
+    const spec = await (platform as any).buildStartSpec(
+      'app-granted',
+      path.join(tempDir, 'app-granted'),
+      detection,
+      3008,
+      path.join(tempDir, 'data'),
+      {}
+    );
+
+    expect(spec.env.DROP_API_KEY).toBe('drop_testkey');
+    // Rotation: any prior key for this app is deleted before minting the new one.
+    expect(deleteApiKeysByName).toHaveBeenCalledWith('app:app-granted:provision');
+    expect(createApiKey).toHaveBeenCalledWith(
+      'app:app-granted:provision',
+      'none',
+      undefined,
+      ['users:create']
+    );
+  });
+
+  it('omits DROP_API_KEY entirely when the app has no granted scopes', async () => {
+    platform = createPlatform({
+      dropRoot: tempDir,
+      logLevel: 'error',
+      apiPort: 4115,
+      isolation: 'none',
+    });
+    await platform.start();
+    (platform as any).appConfigService = {
+      getConfig: jest.fn().mockReturnValue(undefined),
+    };
+
+    const spec = await (platform as any).buildStartSpec(
+      'app-ungranted',
+      path.join(tempDir, 'app-ungranted'),
+      detection,
+      3009,
+      path.join(tempDir, 'data'),
+      {}
+    );
+
+    expect(spec.env.DROP_API_KEY).toBeUndefined();
+    expect(createApiKey).not.toHaveBeenCalled();
+    expect(deleteApiKeysByName).not.toHaveBeenCalled();
   });
 });
 

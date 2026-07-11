@@ -38,6 +38,14 @@ export interface AppConfig {
     keyFile?: string;
     disabled?: boolean;
   };
+  /**
+   * Capability scopes DROP has granted this app for calling its own control-plane
+   * API (e.g. ['users:create']). Admin-conferred, default none. When non-empty,
+   * DROP mints a least-privilege per-app API key (role 'none' + these scopes) and
+   * injects it as DROP_API_KEY at start — so the app never holds a full admin key.
+   * See docs/plans/2026-07-11-scoped-provisioning-token.md.
+   */
+  grantedApiScopes?: string[];
 }
 
 export interface AppConfigServiceOptions {
