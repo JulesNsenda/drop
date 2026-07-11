@@ -12,17 +12,25 @@ import * as path from 'path';
 import * as fs from 'fs';
 import * as fsp from 'fs/promises';
 import { errorHandler, HttpError } from './middleware/error';
-import { initializeAuth, authMiddleware, isAuthEnabled, setSignupEnabled } from './middleware/auth';
+import {
+  initializeAuth,
+  authMiddleware,
+  mcpAuthMiddleware,
+  isAuthEnabled,
+  setSignupEnabled,
+} from './middleware/auth';
 import {
   rateLimitMiddleware,
   authRateLimitMiddleware,
   uploadRateLimitMiddleware,
   mcpRateLimitMiddleware,
+  oauthRateLimitMiddleware,
 } from './middleware/rate-limit';
 import { securityHeadersMiddleware } from './middleware/security-headers';
 import { auditMiddleware, initializeAuditLog, closeAuditLog } from './middleware/audit';
 import { validateBodySize } from './middleware/validate';
-import { setApiRuntimeConfig } from './runtime-config';
+import { setApiRuntimeConfig, getPublicUrl } from './runtime-config';
+import { buildProtectedResourceMetadata, buildAuthServerMetadata } from './oauth/metadata';
 import { error, ErrorCodes } from './types';
 import healthRoutes from './routes/health';
 import appsRoutes from './routes/apps';
@@ -35,6 +43,7 @@ import webhooksRoutes from './routes/webhooks';
 import gitDeployRoutes from './routes/git-deploy';
 import adminRoutes from './routes/admin';
 import usageRoutes from './routes/usage';
+import oauthRoutes from './routes/oauth';
 import { handleMcpRequest, methodNotAllowed } from './mcp/transport';
 
 /** Matches POST /api/v1/apps/:name/source — the upload-deploy endpoint (PRD-039). */
@@ -210,6 +219,11 @@ export class ApiServer {
     // unconditionally.
     v1.use('/mcp', mcpRateLimitMiddleware());
 
+    // OAuth 2.1 endpoints (PRD-041) get their own bucket too, registered
+    // unconditionally — the handlers themselves fail closed (503/400) when
+    // OAuth isn't configured/enabled, but the rate limit applies regardless.
+    v1.use('/oauth/*', oauthRateLimitMiddleware());
+
     // Apply auth middleware to protected routes when auth is enabled
     if (this.config.enableAuth && isAuthEnabled()) {
       // migrate-runtime is admin-only — register before the general /apps/* guard.
@@ -229,8 +243,17 @@ export class ApiServer {
       // does. Register before the general /apps/* readonly guard.
       v1.use('/apps/*/source', authMiddleware('user'));
       // MCP tools mutate apps (deploy_files, restart_app, ...) — never
-      // anonymous, same tier as upload/git deploy.
-      v1.use('/mcp', authMiddleware('user'));
+      // anonymous, same tier as upload/git deploy. mcpAuthMiddleware also
+      // accepts an audience-bound OAuth access token (PRD-041), falling back
+      // to the same session-JWT/API-key path authMiddleware('user') used.
+      v1.use('/mcp', mcpAuthMiddleware());
+      // OAuth 2.1 endpoints (PRD-041): selective auth only. /authorize and
+      // /token are deliberately NOT gated here — /authorize self-gates via
+      // the SPA session redirect and /token authenticates via PKCE; mounting
+      // session auth on either would break claude.ai's calls.
+      v1.use('/oauth/approve', authMiddleware('user'));
+      v1.use('/oauth/revoke', authMiddleware('user'));
+      v1.use('/oauth/client', authMiddleware('admin'));
       v1.use('/apps/*', authMiddleware('readonly'));
       v1.use('/apps', authMiddleware('readonly'));
       v1.use('/usage', authMiddleware('readonly'));
@@ -260,6 +283,7 @@ export class ApiServer {
     v1.route('/webhooks', webhooksRoutes);
     v1.route('/git', gitDeployRoutes);
     v1.route('/admin', adminRoutes);
+    v1.route('/oauth', oauthRoutes);
 
     // Hosted MCP endpoint (PRD-040): stateless Streamable HTTP, POST only.
     // GET/DELETE have no meaning in stateless mode (no sessions/streams) —
@@ -268,6 +292,32 @@ export class ApiServer {
     v1.post('/mcp', handleMcpRequest);
     v1.get('/mcp', methodNotAllowed);
     v1.delete('/mcp', methodNotAllowed);
+
+    // OAuth 2.1 discovery metadata (PRD-041) — RFC 8414/9728 mandate these at
+    // fixed ROOT paths (not under /api/v1), so they're mounted directly on
+    // the app, before /api/v1. Public (no auth, no /api/* rate limiter — the
+    // OAuth-specific bucket above only covers /api/v1/oauth/*), and fail
+    // closed with 404 when the OAuth issuer isn't configured.
+    const protectedResourceHandler = (c: import('hono').Context) => {
+      const publicUrl = getPublicUrl();
+      // Phase 5 observability: discovery probes are the fragile part of the
+      // claude.ai handshake (resource-scoped vs root path is a known breakage
+      // class) — log which path was hit and whether it resolved.
+      console.log('[oauth] discovery probe', { path: c.req.path, resolved: Boolean(publicUrl) });
+      if (!publicUrl) return c.notFound();
+      return c.json(buildProtectedResourceMetadata(publicUrl));
+    };
+    this.app.get('/.well-known/oauth-protected-resource', protectedResourceHandler);
+    this.app.get('/.well-known/oauth-protected-resource/api/v1/mcp', protectedResourceHandler);
+    // Newer non-`oauth-`prefixed spelling some MCP clients probe — serve the
+    // same doc so discovery can't 404 on either variant.
+    this.app.get('/.well-known/protected-resource/api/v1/mcp', protectedResourceHandler);
+    this.app.get('/.well-known/oauth-authorization-server', (c) => {
+      const publicUrl = getPublicUrl();
+      console.log('[oauth] discovery probe', { path: c.req.path, resolved: Boolean(publicUrl) });
+      if (!publicUrl) return c.notFound();
+      return c.json(buildAuthServerMetadata(publicUrl));
+    });
 
     // Mount v1 under /api/v1
     this.app.route('/api/v1', v1);
