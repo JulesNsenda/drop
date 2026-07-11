@@ -308,9 +308,19 @@ oauth.post('/token', async (c) => {
 oauth.post('/client', async (c) => {
   const pre = requireOAuthPreconditions(c);
   if (pre instanceof Response) return pre;
+  const { publicUrl } = pre;
 
   const clientId = await getOrCreateOAuthClientId();
-  return c.json(success({ client_id: clientId, redirect_uri: CLAUDE_REDIRECT_URI }));
+  return c.json(
+    success({
+      client_id: clientId,
+      // DROP is a public PKCE client — there is no client secret. Surfaced
+      // explicitly so the UI can tell the operator to leave that field blank.
+      client_secret: null,
+      redirect_uri: CLAUDE_REDIRECT_URI,
+      mcp_url: getMcpResourceUrl(publicUrl),
+    })
+  );
 });
 
 // POST /oauth/revoke — bearer-authenticated (authMiddleware('user'), mounted
