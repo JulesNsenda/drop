@@ -55,10 +55,18 @@ export interface ApiKey {
   name: string;
   keyHash: string;
   prefix: string; // First 12 chars for identification
-  role: 'admin' | 'user' | 'readonly';
+  /**
+   * 'none' is a scope-only marker: the key carries no role standing at all
+   * (ranks 0 in the authMiddleware role hierarchy) and is authorized purely
+   * via `scopes` + `requireCapability()`. Distinct from `User.role`, which
+   * has no 'none' option — there are no "service users".
+   */
+  role: 'admin' | 'user' | 'readonly' | 'none';
   createdAt: string;
   lastUsed?: string;
   expiresAt?: string;
+  /** Capability scopes for this key (e.g. 'users:create'). Orthogonal to role. */
+  scopes?: string[];
 }
 
 // JWT payload
@@ -74,8 +82,11 @@ export interface JwtPayload {
 export interface AuthContext {
   userId: string;
   username: string;
-  role: 'admin' | 'user' | 'readonly';
+  /** See `ApiKey.role` for the meaning of 'none' (scope-only, no role standing). */
+  role: 'admin' | 'user' | 'readonly' | 'none';
   authMethod: 'jwt' | 'apikey';
+  /** Capability scopes carried by API-key auth. Always undefined on the JWT path — JWTs don't carry scopes. */
+  scopes?: string[];
 }
 
 // Credentials storage
@@ -648,8 +659,9 @@ export async function verifyJwt(token: string): Promise<JwtPayload | null> {
  */
 export async function createApiKey(
   name: string,
-  role: 'admin' | 'user' | 'readonly' = 'user',
-  expiresInDays?: number
+  role: 'admin' | 'user' | 'readonly' | 'none' = 'user',
+  expiresInDays?: number,
+  scopes?: string[]
 ): Promise<{ key: string; apiKey: ApiKey }> {
   if (!credentials || !config) {
     throw new Error('Auth not initialized');
@@ -669,6 +681,7 @@ export async function createApiKey(
     expiresAt: expiresInDays
       ? new Date(Date.now() + expiresInDays * 24 * 60 * 60 * 1000).toISOString()
       : undefined,
+    ...(scopes !== undefined ? { scopes } : {}),
   };
 
   credentials.apiKeys.push(apiKey);
@@ -859,6 +872,7 @@ export function authMiddleware(requiredRole?: 'admin' | 'user' | 'readonly') {
             username: key.name,
             role: key.role,
             authMethod: 'apikey',
+            scopes: key.scopes,
           };
         }
       }
@@ -891,8 +905,13 @@ export function authMiddleware(requiredRole?: 'admin' | 'user' | 'readonly') {
 
     // Check role if required
     if (requiredRole) {
-      const roleHierarchy = { admin: 3, user: 2, readonly: 1 };
-      if (roleHierarchy[authContext.role] < roleHierarchy[requiredRole]) {
+      const roleHierarchy: Record<string, number> = { admin: 3, user: 2, readonly: 1, none: 0 };
+      // Defensive `?? 0`: a 'none' (scope-only) role, or any malformed/unknown
+      // role that somehow ends up on a persisted record, ranks 0 rather than
+      // `undefined` — `undefined < roleHierarchy[requiredRole]` is always
+      // `false`, which would have let an unrecognized role pass every gate.
+      const rank = (roleHierarchy as Record<string, number>)[authContext.role] ?? 0;
+      if (rank < roleHierarchy[requiredRole]) {
         return c.json(
           error(ErrorCodes.UNAUTHORIZED, `Insufficient permissions. Required role: ${requiredRole}`),
           403
@@ -902,6 +921,46 @@ export function authMiddleware(requiredRole?: 'admin' | 'user' | 'readonly') {
 
     // Add auth context to request
     c.set('auth', authContext);
+
+    return next();
+  };
+}
+
+/**
+ * Capability-gate middleware. Must run AFTER `authMiddleware()` (with no
+ * required role, or a role low enough to admit scope-only callers) has
+ * already authenticated the request and set `c.get('auth')` — this
+ * middleware does NOT parse JWTs or API keys itself.
+ *
+ * Admits iff the caller is an admin, or its AuthContext carries the
+ * requested capability in `scopes`. This is the only path through which a
+ * `role: 'none'` scope-only key (see `createApiKey`) can be authorized —
+ * every `authMiddleware(role)` gate ranks it 0 and rejects it.
+ */
+export function requireCapability(cap: string) {
+  return async (c: Context, next: Next): Promise<Response | void> => {
+    // Skip if auth is not enabled (open platform), same as authMiddleware.
+    if (!isAuthEnabled()) {
+      return next();
+    }
+
+    const auth = c.get('auth') as AuthContext | undefined;
+    if (!auth) {
+      // Safety net — normally authMiddleware() runs first and would already
+      // have rejected an unauthenticated request with 401.
+      return c.json(
+        error(ErrorCodes.UNAUTHORIZED, 'Authentication required. Provide a valid JWT token or API key.'),
+        401
+      );
+    }
+
+    const admitted = auth.role === 'admin' || (auth.scopes?.includes(cap) ?? false);
+    if (!admitted) {
+      return c.json(
+        error(ErrorCodes.UNAUTHORIZED, `Insufficient permissions. Required capability: ${cap}`),
+        403
+      );
+    }
 
     return next();
   };
@@ -937,6 +996,7 @@ export function optionalAuthMiddleware() {
           username: key.name,
           role: key.role,
           authMethod: 'apikey',
+          scopes: key.scopes,
         });
       }
     }

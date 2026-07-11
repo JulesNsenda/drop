@@ -542,6 +542,8 @@ timeout: 30`}
             ['PORT', 'The port assigned to the app — bind to this, not a hardcoded port'],
             ['DROP_DATA_DIR', 'Persistent data directory that survives redeploys (see below)'],
             ['DATABASE_URL', 'PostgreSQL connection string, only if a database was provisioned'],
+            ['DROP_API_URL', "Base URL for DROP's own REST API — http://drop-host:<apiPort> under docker isolation, http://127.0.0.1:<apiPort> otherwise"],
+            ['DROP_API_KEY', "Least-privilege, scoped API key for calling DROP's own API — injected only for apps an admin has granted capabilities (never a full admin key)"],
           ]}
         />
         <p style={pStyle}>
