@@ -96,3 +96,14 @@ export function getPublicUrl(): string | undefined {
   if (!trimmed) return undefined;
   return trimmed.replace(/\/+$/, '');
 }
+
+/**
+ * Live-update the public URL override (or, with `undefined`, clear it so
+ * `getPublicUrl()` falls back to the DROP_PUBLIC_URL env var). Used by the
+ * admin settings route so a change takes effect immediately, without a
+ * restart — separate from `setApiRuntimeConfig`, which only ever sets
+ * fields when explicitly provided and can't express "clear this field".
+ */
+export function setPublicUrl(url: string | undefined): void {
+  runtimeConfig.publicUrl = url;
+}
