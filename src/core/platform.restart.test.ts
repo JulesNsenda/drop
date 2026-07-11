@@ -263,6 +263,19 @@ describe('DropPlatform.restartApp', () => {
     expect(spec.env!.DROP_DATA_DIR).toBe(path.join(tempDir, 'data', 'appdata', 'site'));
   }, 20000);
 
+  it('includes DROP_API_URL in the restart spec env (re-injected via buildFreshStartSpec -> buildStartSpec)', async () => {
+    platform = makePlatform({ isolation: 'none', apiPort: 4114 });
+    await platform.start();
+    const appPath = await createStaticApp('site');
+    await deploy('site', appPath);
+
+    const startSpy = jest.spyOn(fakeRuntime, 'start');
+    await platform!.restartApp('site');
+
+    const spec = startSpy.mock.calls[startSpy.mock.calls.length - 1][0];
+    expect(spec.env!.DROP_API_URL).toBe('http://127.0.0.1:4114');
+  }, 20000);
+
   it('reuses the app\'s existing port on restart', async () => {
     platform = makePlatform();
     await platform.start();
