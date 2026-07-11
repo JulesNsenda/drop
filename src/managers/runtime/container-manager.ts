@@ -35,6 +35,9 @@ import {
   DEFAULT_CPUS,
   DEFAULT_MEMORY,
   DEFAULT_PIDS_LIMIT,
+  DROP_NET_SUBNET,
+  DROP_NET_GATEWAY,
+  HOST_ALIAS,
   selectBaseImage,
   selectImageUser,
 } from './container-config';
@@ -189,6 +192,9 @@ export class ContainerManager implements AppRuntime {
         SecurityOpt: CONTAINER_SECURITY_OPT,
         // Networking — attach to the DROP bridge; no host networking
         NetworkMode: DROP_NETWORK,
+        // Resolve the DROP control-plane API from inside the container via a
+        // fixed name mapped to the pinned drop-net gateway (see container-config).
+        ExtraHosts: [`${HOST_ALIAS}:${DROP_NET_GATEWAY}`],
         // Bounded restart: cap at 5 retries to prevent OOM-looping apps from
         // thrashing the box.  'unless-stopped' has no cap and can overwhelm a
         // 4 GB server with a crash-looping app.
@@ -398,32 +404,47 @@ export class ContainerManager implements AppRuntime {
 
   private async ensureNetwork(): Promise<void> {
     let networkExists = false;
-    let iccDisabled = false;
+    let optionsMatch = false;
 
     try {
       const net = await this.docker.getNetwork(DROP_NETWORK).inspect() as {
         Options?: Record<string, string>;
+        IPAM?: { Config?: Array<{ Subnet?: string; Gateway?: string }> };
       };
       networkExists = true;
-      iccDisabled = net.Options?.['com.docker.network.bridge.enable_icc'] === 'false';
+      const iccDisabled = net.Options?.['com.docker.network.bridge.enable_icc'] === 'false';
+      const subnetPinned =
+        net.IPAM?.Config?.some((c) => c.Subnet === DROP_NET_SUBNET) ?? false;
+      optionsMatch = iccDisabled && subnetPinned;
     } catch {
       // Network does not exist yet — fall through to create.
     }
 
-    if (networkExists && iccDisabled) {
-      // Already correctly configured.
+    if (networkExists && optionsMatch) {
+      // Already correctly configured (ICC disabled, pinned subnet+gateway).
       return;
     }
 
-    if (networkExists && !iccDisabled) {
-      // ICC is enabled — attempt to remove and recreate.  This may fail if
-      // containers are currently attached; in that case, log and leave it —
-      // the operator should restart DROP with no containers to fix ICC.
+    if (networkExists && !optionsMatch) {
+      // ICC is enabled and/or the subnet doesn't match the pinned
+      // DROP_NET_SUBNET/DROP_NET_GATEWAY — attempt to remove and recreate so
+      // `drop-host` (ExtraHosts) keeps resolving to a known gateway.  This may
+      // fail if containers are currently attached; in that case, keep the
+      // fail-soft behavior but warn loudly — the operator must restart DROP
+      // with no running containers to migrate `drop-net` to the pinned subnet.
       try {
         await this.docker.getNetwork(DROP_NETWORK).remove();
         networkExists = false;
       } catch {
-        // Network is in use; ICC misconfiguration persists until next clean restart.
+        // Network is in use; the ICC/subnet misconfiguration persists until
+        // the next clean restart with no attached containers.
+        console.warn(
+          `[ContainerManager] WARNING: '${DROP_NETWORK}' is not configured with the ` +
+            `pinned subnet ${DROP_NET_SUBNET} / gateway ${DROP_NET_GATEWAY} (or has ICC ` +
+            `enabled), and could not be recreated because containers are still attached. ` +
+            `Until DROP is restarted with no running containers, the '${HOST_ALIAS}' ` +
+            'alias injected into containers may not resolve to the DROP control-plane API.'
+        );
         return;
       }
     }
@@ -437,6 +458,7 @@ export class ContainerManager implements AppRuntime {
           // each other directly; cross-app traffic must go host→published port.
           'com.docker.network.bridge.enable_icc': 'false',
         },
+        IPAM: { Config: [{ Subnet: DROP_NET_SUBNET, Gateway: DROP_NET_GATEWAY }] },
       });
     }
   }

@@ -42,6 +42,7 @@ import { createApiKey, deleteApiKeysByName } from '../api/middleware/auth';
 import { IsolationMode, assertStartupConstraints } from './startup-constraints';
 import { createContainerExecCommand } from './builder/container-build-runner';
 import { migrateAllToDocker } from '../managers/runtime/runtime-migrator';
+import { HOST_ALIAS } from '../managers/runtime/container-config';
 import { buildNginxConf } from '../utils/nginx-conf';
 import { BuildLogService, getBuildLogService, resetBuildLogService } from '../managers/build-log/build-log';
 import {
@@ -2236,6 +2237,17 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     const cpus = this.config.maxCpusPerApp > 0 ? this.config.maxCpusPerApp : undefined;
     const limits = memory !== undefined || cpus !== undefined ? { memory, cpus } : undefined;
 
+    // The DROP control-plane API is reachable from docker-isolated containers
+    // via the `drop-host` ExtraHosts alias (ContainerManager); non-isolated
+    // (PM2) apps share the host's loopback directly. Placed after
+    // ...secretEnvVars below so it is platform-authoritative — a tenant
+    // secret must not be able to redirect the destination of an admin
+    // Bearer credential.
+    const dropApiUrl =
+      this.config.isolation === 'docker'
+        ? `http://${HOST_ALIAS}:${this.config.apiPort}`
+        : `http://127.0.0.1:${this.config.apiPort}`;
+
     return {
       name: appName,
       script,
@@ -2254,6 +2266,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         NODE_ENV: 'production',
         PORT: port.toString(),
         DROP_DATA_DIR: dataDir,
+        DROP_API_URL: dropApiUrl,
         ...dbEnvVars,
         ...depEnvVars,
       },

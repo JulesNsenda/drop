@@ -797,6 +797,102 @@ describe('buildStartSpec — resource limits (P0-4)', () => {
   });
 });
 
+describe('buildStartSpec — DROP_API_URL injection (PR1)', () => {
+  let platform: DropPlatform;
+  let tempDir: string;
+
+  const detection = {
+    type: 'nodejs',
+    framework: null,
+    suggestedConfig: { startCommand: 'node index.js' },
+  } as any;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    tempDir = path.join(os.tmpdir(), `drop-test-${Date.now()}`);
+  });
+
+  afterEach(async () => {
+    if (platform && platform.isActive()) {
+      await platform.stop();
+    }
+  });
+
+  it('injects the drop-host alias URL under docker isolation', async () => {
+    platform = createPlatform({ dropRoot: tempDir, logLevel: 'error', apiPort: 4111 });
+    await platform.start();
+    // Flip isolation post-start rather than passing isolation: 'docker' to
+    // createPlatform — docker isolation triggers real `docker info`/`caddy
+    // version` startup probes (assertStartupConstraints) that aren't
+    // available/mocked in this hermetic suite. buildStartSpec only reads
+    // this.config.isolation, so mutating it directly is sufficient here.
+    (platform as any).config.isolation = 'docker';
+    // The shared database mock (top of file) doesn't stub getSocketDir —
+    // buildStartSpec's docker-only pgSocketDir branch calls it once
+    // isolation is flipped above, so add the missing method here.
+    (platform as any).postgresServer.getSocketDir = jest.fn().mockReturnValue(undefined);
+
+    const spec = await (platform as any).buildStartSpec(
+      'app-docker',
+      path.join(tempDir, 'app-docker'),
+      detection,
+      3005,
+      path.join(tempDir, 'data'),
+      {}
+    );
+
+    expect(spec.env.DROP_API_URL).toBe('http://drop-host:4111');
+  });
+
+  it('injects the loopback URL when isolation is none', async () => {
+    platform = createPlatform({
+      dropRoot: tempDir,
+      logLevel: 'error',
+      apiPort: 4112,
+      isolation: 'none',
+    });
+    await platform.start();
+
+    const spec = await (platform as any).buildStartSpec(
+      'app-none',
+      path.join(tempDir, 'app-none'),
+      detection,
+      3006,
+      path.join(tempDir, 'data'),
+      {}
+    );
+
+    expect(spec.env.DROP_API_URL).toBe('http://127.0.0.1:4112');
+  });
+
+  it('does not let a tenant DROP_API_URL secret override the platform-authoritative value', async () => {
+    platform = createPlatform({
+      dropRoot: tempDir,
+      logLevel: 'error',
+      apiPort: 4113,
+      isolation: 'none',
+    });
+    await platform.start();
+    // Stub the secret manager to simulate a tenant secret literally named
+    // DROP_API_URL — must not win over the platform value (R6).
+    (platform as any).secretManager = {
+      hasSecrets: jest.fn().mockReturnValue(true),
+      getAll: jest.fn().mockReturnValue({ DROP_API_URL: 'http://evil.example:9999' }),
+    };
+
+    const spec = await (platform as any).buildStartSpec(
+      'app-secret-override',
+      path.join(tempDir, 'app-secret-override'),
+      detection,
+      3007,
+      path.join(tempDir, 'data'),
+      {}
+    );
+
+    expect(spec.env.DROP_API_URL).toBe('http://127.0.0.1:4113');
+  });
+});
+
 describe('Service accessors', () => {
   let platform: DropPlatform;
   let tempDir: string;

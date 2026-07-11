@@ -25,6 +25,9 @@ import {
   DEFAULT_PIDS_LIMIT,
   CONTAINER_CAP_DROP,
   CONTAINER_SECURITY_OPT,
+  DROP_NET_SUBNET,
+  DROP_NET_GATEWAY,
+  HOST_ALIAS,
 } from './container-config';
 
 // ── Docker mock helpers ──────────────────────────────────────────────────────
@@ -278,6 +281,36 @@ describe('ContainerManager', () => {
 
       const call = docker.createContainer.mock.calls[0][0];
       expect((call.Env as string[]).some((e: string) => e.startsWith('PORT='))).toBe(true);
+    });
+
+    it('adds an ExtraHosts entry mapping drop-host to the pinned drop-net gateway', async () => {
+      const docker = makeDockerMock() as any;
+      const mgr = new ContainerManager(docker);
+
+      await mgr.start(baseSpec);
+
+      const call = docker.createContainer.mock.calls[0][0];
+      expect(call.HostConfig.ExtraHosts).toContain(`${HOST_ALIAS}:${DROP_NET_GATEWAY}`);
+    });
+  });
+
+  describe('ensureNetwork() — pinned drop-net IPAM', () => {
+    it('creates drop-net with the pinned subnet and gateway when it does not exist yet', async () => {
+      const docker = makeDockerMock() as any;
+      docker.getNetwork.mockReturnValue({
+        inspect: jest.fn().mockRejectedValue(new Error('no such network: drop-net')),
+        remove: jest.fn(),
+      });
+      const mgr = new ContainerManager(docker);
+
+      await mgr.start(baseSpec);
+
+      expect(docker.createNetwork).toHaveBeenCalledWith(
+        expect.objectContaining({
+          Name: DROP_NETWORK,
+          IPAM: { Config: [{ Subnet: DROP_NET_SUBNET, Gateway: DROP_NET_GATEWAY }] },
+        })
+      );
     });
   });
 
