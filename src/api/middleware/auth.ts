@@ -532,7 +532,16 @@ async function issueSessionJwt(user: User): Promise<string> {
 export async function completeMfaLogin(
   challengeToken: string,
   code: string,
-): Promise<{ status: 'ok'; token: string } | { status: 'invalid' } | { status: 'expired' } | { status: 'attempt_limit' }> {
+): Promise<
+  | {
+      status: 'ok';
+      token: string;
+      user: { id: string; username: string; role: 'admin' | 'user' | 'readonly'; email?: string; mustChangePassword: boolean };
+    }
+  | { status: 'invalid' }
+  | { status: 'expired' }
+  | { status: 'attempt_limit' }
+> {
   if (!credentials || !config) throw new Error('Auth not initialized');
 
   const challenge = await verifyMfaChallenge(challengeToken);
@@ -563,7 +572,20 @@ export async function completeMfaLogin(
   invalidateMfaChallenge(challenge.jti);
 
   const token = await issueSessionJwt(user);
-  return { status: 'ok', token };
+  return {
+    status: 'ok',
+    token,
+    // Return the same safe user view as POST /auth/login so the MFA path
+    // propagates the role (and mustChangePassword) — without it the client
+    // has no role after MFA and shows an admin as a plain user.
+    user: {
+      id: user.id,
+      username: user.username,
+      role: user.role,
+      email: (user as { email?: string }).email,
+      mustChangePassword: (user as { mustChangePassword?: boolean }).mustChangePassword === true,
+    },
+  };
 }
 
 /**

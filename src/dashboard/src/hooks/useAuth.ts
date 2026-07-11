@@ -160,19 +160,33 @@ export function useAuthProvider(): AuthContextValue {
   }, []);
 
   const verifyMfa = useCallback(async (challengeToken: string, code: string): Promise<{ success: boolean }> => {
-    const json = await apiJson<{ token: string; tokenType: string; expiresIn: number }>(
+    const json = await apiJson<{
+      token: string;
+      tokenType: string;
+      expiresIn: number;
+      user?: { id?: string; username?: string; role?: AuthState['role']; mustChangePassword?: boolean };
+    }>(
       '/auth/mfa/verify',
       { method: 'POST', ...jsonBody({ challengeToken, code }) }
     );
     if (json.success && json.data?.token) {
-      const storedUsername = localStorage.getItem('drop-username') || '';
+      const user = json.data.user;
+      const storedUsername = user?.username || localStorage.getItem('drop-username') || '';
       localStorage.setItem('drop-token', json.data.token);
+      // Persist role/userId the same way login() does — the MFA path used to
+      // drop them, leaving an admin displayed as a plain user after 2FA.
+      if (storedUsername) localStorage.setItem('drop-username', storedUsername);
+      if (user?.id) localStorage.setItem('drop-userId', user.id);
+      if (user?.role) localStorage.setItem('drop-role', user.role);
       setState(prev => ({
         ...prev,
         authenticated: true,
         loading: false,
         authRequired: true,
         username: storedUsername || prev.username,
+        userId: user?.id ?? prev.userId,
+        role: user?.role ?? prev.role,
+        mustChangePassword: user?.mustChangePassword === true,
       }));
       return { success: true };
     }
