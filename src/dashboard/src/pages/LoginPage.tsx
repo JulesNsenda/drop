@@ -1,5 +1,5 @@
 import { useState, FormEvent, useRef, ReactNode } from 'react';
-import { Link, useLocation } from 'react-router-dom';
+import { Link, useLocation, useNavigate } from 'react-router-dom';
 import { LogIn, ShieldCheck, ArrowLeft } from 'lucide-react';
 import { useAuth } from '../hooks/useAuth';
 import AuthLayout from '../components/AuthLayout';
@@ -10,6 +10,9 @@ import Card from '../components/ui/Card';
 interface LoginLocationState {
   sessionExpired?: boolean;
   message?: string;
+  /** Path (+ query string) to return to after a successful login, e.g. the
+   *  OAuth consent page bouncing an unauthenticated operator through /login. */
+  returnTo?: string;
 }
 
 /** Inline notice/error banner, token-driven (mirrors `.dui-badge-*` tone colors). */
@@ -40,7 +43,9 @@ function AuthAlert({
 function LoginPage() {
   const { login, verifyMfa } = useAuth();
   const location = useLocation();
+  const navigate = useNavigate();
   const state = (location.state as LoginLocationState | null) || null;
+  const returnTo = typeof state?.returnTo === 'string' ? state.returnTo : null;
   const [notice, setNotice] = useState<string | null>(
     state?.sessionExpired ? 'Your session expired. Please sign in again.' : state?.message || null
   );
@@ -70,8 +75,14 @@ function LoginPage() {
       } else {
         setError('Invalid username or password');
       }
+    } else if (returnTo && !result.mustChangePassword) {
+      // Honor a caller-supplied returnTo (e.g. the OAuth consent page)
+      // instead of the default post-login destination. Skipped when a forced
+      // password change is pending — that guard takes priority and returnTo
+      // is dropped (accepted v1 limitation).
+      navigate(returnTo, { replace: true });
     }
-    // If success, App.tsx route guards handle the redirect
+    // Otherwise, App.tsx route guards handle the redirect.
 
     setLoading(false);
   };
@@ -86,8 +97,13 @@ function LoginPage() {
     if (!result.success) {
       setError('Invalid or expired code. Please try again.');
       setTotpCode('');
+    } else if (returnTo) {
+      // Same returnTo handling as the credentials step. verifyMfa()'s result
+      // doesn't surface mustChangePassword, so this path doesn't special-case
+      // it — an accepted v1 limitation (see plan refinement #1).
+      navigate(returnTo, { replace: true });
     }
-    // On success, App.tsx route guards redirect to /apps
+    // Otherwise, App.tsx route guards redirect to /apps (or /change-password).
 
     setLoading(false);
   };
