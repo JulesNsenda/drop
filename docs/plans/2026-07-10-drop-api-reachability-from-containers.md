@@ -95,13 +95,16 @@ The API listens on that gateway interface (it binds `0.0.0.0` today; see R5/R2).
 Subnet choice: pick a high, uncommon /24 (e.g. `10.83.0.0/24`) to minimize collision with
 operator networks, and make it overridable via env (`DROP_NET_SUBNET` / `DROP_NET_GATEWAY`).
 
-**Migration note (live box):** `drop-net` on dropkit.sh currently has an auto-allocated
-subnet. `ensureNetwork()` already removes+recreates the network when its options don't
-match (the ICC branch, `container-manager.ts:418-429`); extend that check to also require
-the pinned subnet, so the network is recreated with the pinned IPAM on the **next clean
-restart with no attached containers**. Document that operators restart DROP once after
-upgrading. (Recreate can't happen while containers are attached — same constraint the ICC
-branch already lives with.)
+**Migration note (live box) — SUPERSEDED by the DROP-052 follow-up.** The shipped PR1
+required recreating `drop-net` with the pinned subnet on a clean restart with no attached
+containers. In practice a normal CI/CD deploy does NOT do that, so an upgraded box kept its
+legacy subnet while containers were injected `drop-host → 10.83.0.1` (a dead IP) — turning
+`ECONNREFUSED` into a connect timeout. The follow-up
+(`feature/DROP-052-api-reachability-gateway`) removes the dependency entirely: `drop-host`
+is now mapped to `drop-net`'s **actual** gateway (resolved at container start via
+`resolveHostGatewayIp()`), so a legacy subnet works with no migration. The pinned subnet is
+kept only for freshly created networks (cosmetic), and `ensureNetwork()` no longer recreates
+an existing network over a subnet mismatch (only over an ICC regression).
 
 **No-migration alternative: defensive inspection.** If pinning's one-time recreate is
 undesirable, inspect instead — but robustly: select the **IPv4** `IPAM.Config` entry
