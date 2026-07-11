@@ -1,6 +1,6 @@
 import type { CSSProperties, ReactNode } from 'react';
 import { Link } from 'react-router-dom';
-import { Layers, Rocket, Settings2 } from 'lucide-react';
+import { Layers, Plug, Rocket, Settings2 } from 'lucide-react';
 
 /**
  * Docs content model (PRD-043).
@@ -56,6 +56,15 @@ export const DOC_GROUPS: DocGroup[] = [
       { id: 'routing-https', title: 'Routing & HTTPS' },
       { id: 'databases', title: 'Databases' },
       { id: 'logs', title: 'Logs' },
+    ],
+  },
+  {
+    id: 'integrations',
+    title: 'Integrations',
+    icon: <Plug size={13} />,
+    items: [
+      { id: 'claude-web', title: 'Connect Claude (web)' },
+      { id: 'mcp-clients', title: 'Claude Code, Cursor & agents' },
     ],
   },
 ];
@@ -677,6 +686,115 @@ drop logs my-app -n 100   # last 100 lines`}
           code={`const logDir = process.env.DROP_DATA_DIR || './data';
 fs.appendFileSync(\`\${logDir}/logs/app.json\`, JSON.stringify(logEntry) + '\\n');`}
         />
+      </Section>
+
+      <Section id="claude-web" title="Connect Claude (web)">
+        <p style={pStyle}>
+          DROP runs a hosted <strong style={{ color: 'var(--text)' }}>MCP server</strong> at{' '}
+          <code>/api/v1/mcp</code>. Connect <strong style={{ color: 'var(--text)' }}>claude.ai</strong> to it as a
+          custom connector and Claude can deploy and manage your apps in plain language — through the tools{' '}
+          <code>deploy_files</code>, <code>deploy_from_git</code>, <code>list_apps</code>, <code>app_status</code>,{' '}
+          <code>app_logs</code>, and <code>restart_app</code>. The web connector authenticates with OAuth, so you sign
+          into your own DROP account and approve access — no API keys to paste.
+        </p>
+        <Callout tone="warn">
+          The web connector needs a DROP reachable over public HTTPS, with <code>DROP_PUBLIC_URL</code> set to that
+          origin (e.g. <code>https://drop.example.com</code>). Every OAuth endpoint fails closed until it is set, and
+          claude.ai cannot reach a <code>localhost</code> DROP — for a local box, use Claude Code or Cursor (below).
+        </Callout>
+
+        <h3 style={h3Style}>1. Get the Client ID (admin, once per server)</h3>
+        <p style={pStyle}>
+          claude.ai uses a pre-registered OAuth Client ID. An administrator mints one — it is the same for the whole
+          server and is not a secret, so you can hand it to anyone who should connect:
+        </p>
+        <CodeBlock
+          label="shell"
+          code={`curl -X POST https://drop.example.com/api/v1/oauth/client \\
+  -H "Authorization: Bearer <admin-api-key>"
+
+# → { "client_id": "a1b2c3…", "redirect_uri": "https://claude.ai/api/mcp/auth_callback" }`}
+        />
+
+        <h3 style={h3Style}>2. Add the connector in claude.ai</h3>
+        <p style={pStyle}>
+          In claude.ai, open{' '}
+          <strong style={{ color: 'var(--text)' }}>Settings → Connectors → Add custom connector</strong> and fill in:
+        </p>
+        <DocTable
+          headers={['Field', 'Value']}
+          rows={[
+            ['Remote MCP server URL', 'https://drop.example.com/api/v1/mcp'],
+            ['OAuth Client ID', 'the client_id from step 1'],
+            ['OAuth Client Secret', 'leave blank — DROP uses PKCE, no client secret'],
+          ]}
+        />
+
+        <h3 style={h3Style}>3. Connect and consent</h3>
+        <p style={pStyle}>
+          Click <strong style={{ color: 'var(--text)' }}>Connect</strong>. claude.ai sends you to your DROP sign-in;
+          approve the <em>&ldquo;Deploy and manage your apps&rdquo;</em> request and you are returned to claude.ai with
+          the connector live.
+        </p>
+        <Callout>
+          The connection is scoped to your DROP user — Claude only sees and touches{' '}
+          <strong style={{ color: 'var(--text)' }}>your</strong> apps, exactly like a <code>user</code>-role API key.
+          There is no <code>set_secrets</code> or <code>remove_app</code> tool, so a connected agent can never read
+          secrets or delete apps through MCP.
+        </Callout>
+
+        <h3 style={h3Style}>4. Use it</h3>
+        <p style={pStyle}>
+          Start a chat with the connector enabled and ask, for example, <em>&ldquo;list my DROP apps&rdquo;</em> or{' '}
+          <em>&ldquo;deploy this as a new app called demo&rdquo;</em>. Revoke access anytime from claude.ai&apos;s
+          connector settings, or server-side via the DROP API.
+        </p>
+      </Section>
+
+      <Section id="mcp-clients" title="Claude Code, Cursor &amp; agents">
+        <p style={pStyle}>
+          MCP clients that support request headers — <strong style={{ color: 'var(--text)' }}>Claude Code</strong>,{' '}
+          <strong style={{ color: 'var(--text)' }}>Claude Desktop</strong>, and{' '}
+          <strong style={{ color: 'var(--text)' }}>Cursor</strong> — skip OAuth and authenticate with a DROP API key.
+          Mint a <code>user</code>-role key in the dashboard (never an admin key — a <code>user</code> key is
+          automatically scoped to the apps it creates).
+        </p>
+        <CodeBlock
+          label="Claude Code"
+          code={`claude mcp add --transport http dropkit \\
+  https://drop.example.com/api/v1/mcp \\
+  --header "Authorization: Bearer <user-api-key>"`}
+        />
+        <CodeBlock
+          label="Cursor — .cursor/mcp.json"
+          code={`{
+  "mcpServers": {
+    "dropkit": {
+      "url": "https://drop.example.com/api/v1/mcp",
+      "headers": { "Authorization": "Bearer <user-api-key>" }
+    }
+  }
+}`}
+        />
+        <h3 style={h3Style}>Tools</h3>
+        <DocTable
+          headers={['Tool', 'What it does']}
+          rows={[
+            ['deploy_files', 'Deploy from inline file contents — small/AI-generated apps (≤48 files, 1.5 MB text)'],
+            ['deploy_from_git', 'Deploy a new app by cloning a GitHub repo (optional branch)'],
+            ['list_apps', 'List the apps you can see'],
+            ['app_status', "An app's status, type, port, and URL"],
+            ['app_logs', 'Recent runtime stdout/stderr (returned as untrusted data)'],
+            ['restart_app', 'Stop and restart an app on its existing port'],
+          ]}
+        />
+        <p style={pStyle}>
+          The same key drives the shell-only tarball-upload recipe (no MCP client needed) — see the{' '}
+          <Link to="/reference" style={linkStyle}>
+            reference
+          </Link>{' '}
+          for the REST endpoints.
+        </p>
       </Section>
 
       <div style={{ textAlign: 'center', padding: '8px 0 24px' }}>
