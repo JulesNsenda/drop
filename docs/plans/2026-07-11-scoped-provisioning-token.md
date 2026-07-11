@@ -1,11 +1,36 @@
 # Plan (PR2): scoped per-app provisioning token
 
 **Date:** 2026-07-11
-**Status:** DRAFT — awaiting approval (do not implement yet)
+**Status:** MERGED to `develop` 2026-07-11 (DROP-051, PR #66, commit 2afe6cb). See
+"Update (post-merge)" below — decision Q3 was superseded and end-to-end step 5 is deferred.
 **Slug:** `scoped-provisioning-token`
 **Companion to:** `2026-07-10-drop-api-reachability-from-containers.md` (PR1). PR1 ships the
 reachability fix first; **this PR2 lands before the waitlist app is repointed off its
 current admin key.**
+
+## Update (post-merge, 2026-07-11)
+
+Merged to `develop` via PR #66 (commit 2afe6cb, stacked on PR1 f02c432). Two items in this
+plan changed after merge:
+
+- **Q3 / R5 ("don't broaden `Bearer`") — SUPERSEDED.** DROP-053 (PR #68, commit e72ed11)
+  broadened the `Bearer` path platform-wide: `authMiddleware` now tries JWT first and falls
+  back to API-key verification for a non-JWT `Bearer` value. So an app can send
+  `Authorization: Bearer <key>` (the waitlist already does); the `X-API-Key`-only guidance
+  here no longer holds. Scopes still propagate — no new privilege.
+- **Step 5 (repoint the app off the admin key, remove the admin-key secret) — DEFERRED,
+  currently blocked.** The waitlist's **re-invite** feature (drop-waitlist commit 51573ea)
+  resets a DROP user's password via `GET /api/v1/auth/users` + `POST
+  /api/v1/auth/users/:id/reset-password`, both `authMiddleware('admin')`-only. A scoped
+  `users:create` token cannot perform re-invite, so the app must retain
+  `DROP_ADMIN_API_KEY`. Removing the admin key (PR2's actual security goal) now needs a
+  follow-up: an ownership-scoped DROP capability that lets a scoped token look up + reset a
+  user it created (e.g. `users:reset`), plus persisting the DROP user id in the waitlist at
+  provision time so re-invite needs no admin list call. Until that lands the admin key
+  stays — a conscious trade-off made when re-invite was prioritized. A "partial" repoint
+  (scoped key for signups while the admin-key secret still sits in the container) is
+  explicitly **not** done: it leaves the admin key in the blast radius and delivers ~none of
+  PR2's goal.
 
 ## Goal
 
