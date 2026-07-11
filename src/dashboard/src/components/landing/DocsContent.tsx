@@ -703,17 +703,26 @@ fs.appendFileSync(\`\${logDir}/logs/app.json\`, JSON.stringify(logEntry) + '\\n'
           claude.ai cannot reach a <code>localhost</code> DROP — for a local box, use Claude Code or Cursor (below).
         </Callout>
 
-        <h3 style={h3Style}>1. Get the Client ID (admin, once per server)</h3>
+        <h3 style={h3Style}>1. Get your connector details (admin)</h3>
         <p style={pStyle}>
-          claude.ai uses a pre-registered OAuth Client ID. An administrator mints one — it is the same for the whole
-          server and is not a secret, so you can hand it to anyone who should connect:
+          In the DROP dashboard, open{' '}
+          <strong style={{ color: 'var(--text)' }}>Settings → Claude (MCP)</strong> (admin only). It shows the{' '}
+          <strong style={{ color: 'var(--text)' }}>MCP Server URL</strong> and{' '}
+          <strong style={{ color: 'var(--text)' }}>OAuth Client ID</strong> with copy buttons, and confirms the Client
+          Secret stays blank. The Client ID is the same for the whole server and is not a secret — hand it to anyone
+          who should connect.
         </p>
+        <p style={pStyle}>Prefer a script? The same values come from the admin API:</p>
         <CodeBlock
           label="shell"
           code={`curl -X POST https://drop.example.com/api/v1/oauth/client \\
   -H "Authorization: Bearer <admin-api-key>"
 
-# → { "client_id": "a1b2c3…", "redirect_uri": "https://claude.ai/api/mcp/auth_callback" }`}
+# → { "success": true, "data": {
+#       "client_id": "a1b2c3…",
+#       "client_secret": null,
+#       "redirect_uri": "https://claude.ai/api/mcp/auth_callback",
+#       "mcp_url": "https://drop.example.com/api/v1/mcp" } }`}
         />
 
         <h3 style={h3Style}>2. Add the connector in claude.ai</h3>
