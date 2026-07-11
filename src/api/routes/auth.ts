@@ -353,8 +353,17 @@ auth.post('/mfa/verify', async (c) => {
   }
 
   // status === 'ok'
-  await tryLogActivity({ action: 'login_mfa_ok' });
-  return c.json(success({ token: result.token, tokenType: 'Bearer', expiresIn: 86400 }));
+  await tryLogActivity({ action: 'login_mfa_ok', userId: result.user.id, username: result.user.username });
+  return c.json(
+    success({
+      token: result.token,
+      tokenType: 'Bearer',
+      expiresIn: 86400,
+      // Mirror POST /auth/login: return the user so the client keeps the
+      // real role after MFA (otherwise an admin is shown as a plain user).
+      user: result.user,
+    })
+  );
 });
 
 // POST /auth/mfa/setup - Generate a candidate TOTP secret (not persisted until enabled)
