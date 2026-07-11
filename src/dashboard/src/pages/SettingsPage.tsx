@@ -132,6 +132,15 @@ function SettingsPage() {
   const [activity, setActivity] = useState<ActivityEntry[]>([]);
   const [activityLoading, setActivityLoading] = useState(true);
 
+  // Hydrate MFA (and must-change) status from /auth/me on mount. It is not
+  // carried in the login/mfa-verify response or localStorage, and refreshMe()
+  // otherwise only runs right after enable/disable — so without this the MFA
+  // card shows "Enable MFA" for a user who already has it on once they open
+  // Settings in a fresh session.
+  useEffect(() => {
+    refreshMe();
+  }, [refreshMe]);
+
   // Generate QR code when setup URI is available
   useEffect(() => {
     if (!mfaSetupUri) {
