@@ -756,7 +756,7 @@ export function ReferenceBody(): JSX.Element {
           <li>
             <strong style={{ color: 'var(--text)' }}>API key</strong> — created via{' '}
             <code>POST /api/v1/auth/api-keys</code> (admin-only), sent as{' '}
-            <code>X-API-Key: &lt;key&gt;</code> — <em>not</em> the Authorization header.
+            <code>X-API-Key: &lt;key&gt;</code> or <code>Authorization: Bearer &lt;key&gt;</code> (either header works).
           </li>
         </ul>
         <p style={pStyle}>

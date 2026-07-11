@@ -858,6 +858,21 @@ export function authMiddleware(requiredRole?: 'admin' | 'user' | 'readonly') {
           role: payload.role as AuthContext['role'],
           authMethod: 'jwt',
         };
+      } else {
+        // Not a valid session JWT — accept a Bearer-presented API key too, so the
+        // conventional `Authorization: Bearer <key>` works (keys are also accepted
+        // via X-API-Key below). JWT is tried first, so real sessions keep their
+        // semantics; only a non-JWT Bearer value is looked up as an API key.
+        const key = await verifyApiKey(token);
+        if (key) {
+          authContext = {
+            userId: key.id,
+            username: key.name,
+            role: key.role,
+            authMethod: 'apikey',
+            scopes: key.scopes,
+          };
+        }
       }
     }
 
@@ -984,6 +999,19 @@ export function optionalAuthMiddleware() {
           role: payload.role,
           authMethod: 'jwt',
         });
+      } else if (!payload) {
+        // Not a valid JWT — accept a Bearer-presented API key too (mirrors
+        // authMiddleware). A valid-but-challenge token is intentionally skipped.
+        const key = await verifyApiKey(token);
+        if (key) {
+          c.set('auth', {
+            userId: key.id,
+            username: key.name,
+            role: key.role,
+            authMethod: 'apikey',
+            scopes: key.scopes,
+          });
+        }
       }
     }
 
