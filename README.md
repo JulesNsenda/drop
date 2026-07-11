@@ -307,6 +307,7 @@ env:
 | `PORT` | Assigned port for the app to listen on |
 | `DROP_DATA_DIR` | Persistent data directory path |
 | `DATABASE_URL` | PostgreSQL connection string (if database provisioned) |
+| `DROP_API_URL` | Base URL for DROP's own REST API (`http://drop-host:<apiPort>` under docker isolation, `http://127.0.0.1:<apiPort>` otherwise) |
 
 ## Hostname Routing (Caddy)
 

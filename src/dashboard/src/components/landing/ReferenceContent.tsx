@@ -69,11 +69,11 @@ export const ENDPOINT_GROUPS: EndpointGroupDef[] = [
     title: 'Health',
     basePath: '/api/v1/health',
     sourceFile: 'src/api/routes/health.ts',
-    description: 'Platform and per-app health probes. Not gated by auth — safe for uptime monitors.',
+    description: 'Platform and per-app health probes. Liveness/readiness are public (safe for uptime monitors); the per-app and stats endpoints require a token.',
     endpoints: [
       { method: 'GET', path: '/api/v1/health', description: 'Full health check: process manager, database, Caddy, watcher.', role: 'public' },
-      { method: 'GET', path: '/api/v1/health/stats', description: 'App counts by status + basic system stats.', role: 'public' },
-      { method: 'GET', path: '/api/v1/health/apps', description: 'HTTP-pings every running app and reports per-app health.', role: 'public' },
+      { method: 'GET', path: '/api/v1/health/stats', description: 'App counts by status + basic system stats.', role: 'readonly' },
+      { method: 'GET', path: '/api/v1/health/apps', description: 'HTTP-pings every running app and reports per-app health.', role: 'readonly' },
       { method: 'GET', path: '/api/v1/health/ready', description: 'Readiness probe (for k8s/orchestration).', role: 'public' },
       { method: 'GET', path: '/api/v1/health/live', description: 'Liveness probe.', role: 'public' },
     ],
@@ -126,6 +126,7 @@ export const ENDPOINT_GROUPS: EndpointGroupDef[] = [
       { method: 'POST', path: '/api/v1/apps/:name/restart', description: 'Restart an app.', role: 'user' },
       { method: 'PUT', path: '/api/v1/apps/:name/domain', description: 'Set or clear a custom domain.', role: 'readonly*' },
       { method: 'POST', path: '/api/v1/apps/:name/migrate-runtime', description: 'Move an app between PM2 and Docker runtimes.', role: 'admin' },
+      { method: 'PUT', path: '/api/v1/apps/:name/capabilities', description: "Grant/clear the control-plane API capabilities DROP mints into this app's injected DROP_API_KEY (e.g. users:create). Empty array clears.", role: 'admin' },
     ],
   },
   {

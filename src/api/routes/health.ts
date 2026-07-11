@@ -12,6 +12,7 @@ import { getStateManager, AppStateManager } from '../../managers/app/state-manag
 import { getCaddyAdminClient } from '../../managers/router/caddy-api';
 import { getPlatformVersion } from '../../utils/version';
 import { getAppsDirectory } from '../runtime-config';
+import { authMiddleware } from '../middleware/auth';
 
 const health = new Hono();
 
@@ -161,7 +162,10 @@ health.get('/', async (c) => {
 });
 
 // GET /health/stats - Detailed statistics
-health.get('/stats', async (c) => {
+// Gated: exposes per-tenant app counts/status. Public before the drop-net
+// reachability change made this endpoint reachable from every app container
+// (docs/plans/2026-07-10-drop-api-reachability-from-containers.md, §3).
+health.get('/stats', authMiddleware('readonly'), async (c) => {
   let stateManager: AppStateManager | null = null;
   try {
     stateManager = getStateManager();
@@ -184,7 +188,10 @@ health.get('/stats', async (c) => {
 });
 
 // GET /health/apps - Per-app health checks (HTTP ping each running app)
-health.get('/apps', async (c) => {
+// Gated: anonymously enumerates every tenant's app name/port/status. Public
+// before the drop-net reachability change made this endpoint reachable from
+// every app container (docs/plans/2026-07-10-drop-api-reachability-from-containers.md, §3).
+health.get('/apps', authMiddleware('readonly'), async (c) => {
   let stateManager: AppStateManager | null = null;
   try {
     stateManager = getStateManager();

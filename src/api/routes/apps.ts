@@ -692,6 +692,86 @@ apps.post('/:name/restart', async c => {
   }
 });
 
+/**
+ * Scopes an admin may grant via PUT /:name/capabilities. Deliberately a fixed
+ * allowlist (not "any string") — this is the only write path that populates
+ * `grantedApiScopes`, which platform.ts mints into a real DROP_API_KEY, so an
+ * unrecognized scope must be rejected rather than silently granted.
+ * See docs/plans/2026-07-11-scoped-provisioning-token.md.
+ */
+const GRANTABLE_API_SCOPES = ['users:create'] as const;
+
+// PUT /apps/:name/capabilities - Admin: set/clear the capability scopes DROP
+// grants this app's injected DROP_API_KEY (e.g. ['users:create']). Admin-only
+// gating is applied in server.ts (authMiddleware('admin')), not here. Persists
+// through AppConfigService (source of truth, survives restarts) then restarts
+// the app so platform.ts (re)mints and injects the scoped key. An empty array
+// clears the grant (and, on the next restart, the injected key).
+apps.put('/:name/capabilities', async c => {
+  const auth = (c.get as Function)('auth') as AuthContext | undefined;
+  const name = c.req.param('name');
+  const stateManager = getStateManager();
+  const app = stateManager.getApp(name);
+
+  if (!app) {
+    throw new NotFoundError(`Application '${name}' not found`);
+  }
+
+  const body = (await c.req.json()) as { scopes?: unknown };
+  const scopes = body.scopes;
+
+  if (!Array.isArray(scopes) || !scopes.every(s => typeof s === 'string')) {
+    throw new ValidationError('scopes must be an array of strings');
+  }
+
+  const unknownScopes = scopes.filter(
+    s => !(GRANTABLE_API_SCOPES as readonly string[]).includes(s)
+  );
+  if (unknownScopes.length > 0) {
+    throw new ValidationError(`Unknown scope(s): ${unknownScopes.join(', ')}`);
+  }
+
+  const updatedConfig = await getAppConfigService().updateConfig(name, {
+    grantedApiScopes: scopes,
+  });
+  if (!updatedConfig) {
+    // App exists in state but has no persisted config yet — nothing to grant against.
+    throw new NotFoundError(`Application '${name}' not found`);
+  }
+
+  const ops = getPlatformOps();
+  if (!ops) {
+    return c.json(error(ErrorCodes.SERVICE_UNAVAILABLE, 'Platform operations unavailable'), 503);
+  }
+
+  try {
+    await ops.restartApp(name);
+  } catch (err) {
+    if (err instanceof AppInProgressError) {
+      return c.json(error(ErrorCodes.CONFLICT, err.message), 409);
+    }
+    const message = err instanceof Error ? err.message : 'Failed to restart';
+    return c.json(error(ErrorCodes.INTERNAL_ERROR, message), 500);
+  }
+
+  await tryLogActivity({
+    action: 'grant-capabilities',
+    userId: auth?.userId,
+    username: auth?.username,
+    appName: name,
+  });
+
+  return c.json(
+    success({
+      message:
+        scopes.length > 0
+          ? `Capabilities granted for '${name}'`
+          : `Capabilities cleared for '${name}'`,
+      grantedApiScopes: scopes,
+    })
+  );
+});
+
 // PUT /apps/:name/domain - Set custom domain
 apps.put('/:name/domain', async c => {
   const auth = (c.get as Function)('auth') as AuthContext | undefined;
