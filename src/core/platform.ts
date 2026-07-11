@@ -2248,6 +2248,24 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         ? `http://${HOST_ALIAS}:${this.config.apiPort}`
         : `http://127.0.0.1:${this.config.apiPort}`;
 
+    // Admin-conferred capability grant (PR2): apps with a non-empty
+    // grantedApiScopes get a fresh, scope-only (role: 'none') provisioning
+    // key minted and rotated on every start — the previous key (if any) is
+    // deleted first so a stale key never remains valid. Ungranted apps get
+    // no DROP_API_KEY at all. Minting is best-effort: if auth isn't
+    // initialized (e.g. DROP_DISABLE_AUTH), skip rather than fail the deploy.
+    const grantedScopes = this.appConfigService?.getConfig(appName)?.grantedApiScopes ?? [];
+    let dropApiKey: string | undefined;
+    if (grantedScopes.length > 0) {
+      try {
+        await deleteApiKeysByName(`app:${appName}:provision`);
+        const { key } = await createApiKey(`app:${appName}:provision`, 'none', undefined, grantedScopes);
+        dropApiKey = key;
+      } catch (err) {
+        this.logger.warn(`Could not mint provisioning key for ${appName}`, 'SECURITY', err);
+      }
+    }
+
     return {
       name: appName,
       script,
@@ -2267,6 +2285,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         PORT: port.toString(),
         DROP_DATA_DIR: dataDir,
         DROP_API_URL: dropApiUrl,
+        ...(dropApiKey ? { DROP_API_KEY: dropApiKey } : {}),
         ...dbEnvVars,
         ...depEnvVars,
       },
