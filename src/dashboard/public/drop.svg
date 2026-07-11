@@ -1,4 +1,9 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">
-  <rect width="100" height="100" rx="20" fill="#0ea5e9"/>
-  <path d="M50 20 L70 50 L50 80 L30 50 Z" fill="white"/>
+  <!-- Matches the in-app LogoMark (AppShell.tsx): an accent droplet — a square
+       with border-radius 50% 50% 50% 3px, rotated 45deg. Tracks the theme like
+       --accent (light #0a84e0 / dark #2e9bfe); the fill attribute is the
+       fallback for renderers that ignore the internal stylesheet. -->
+  <style>@media (prefers-color-scheme: dark){ path { fill: #2e9bfe; } }</style>
+  <path transform="rotate(45 50 50)" fill="#0a84e0"
+        d="M50 20 Q80 20 80 50 Q80 80 50 80 L29 80 Q20 80 20 71 L20 50 Q20 20 50 20 Z"/>
 </svg>
