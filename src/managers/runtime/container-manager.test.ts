@@ -81,7 +81,12 @@ function makeMockContainer(_name: string, inspectData: Record<string, unknown>):
 
 function makeDockerMock(containers: Record<string, ReturnType<typeof makeMockContainer>> = {}) {
   const networkMock = {
-    inspect: jest.fn().mockResolvedValue({}),
+    // ICC disabled so ensureNetwork() returns early; no IPAM.Config so
+    // resolveHostGatewayIp() falls back to the pinned DROP_NET_GATEWAY.
+    inspect: jest.fn().mockResolvedValue({
+      Options: { 'com.docker.network.bridge.enable_icc': 'false' },
+    }),
+    remove: jest.fn().mockResolvedValue(undefined),
   };
   const imageMock = {
     inspect: jest.fn().mockResolvedValue({}),
@@ -283,8 +288,26 @@ describe('ContainerManager', () => {
       expect((call.Env as string[]).some((e: string) => e.startsWith('PORT='))).toBe(true);
     });
 
-    it('adds an ExtraHosts entry mapping drop-host to the pinned drop-net gateway', async () => {
+    it("maps drop-host to drop-net's ACTUAL gateway, not the pinned constant", async () => {
       const docker = makeDockerMock() as any;
+      // drop-net exists with a legacy (non-pinned) subnet — ICC disabled.
+      docker.getNetwork.mockReturnValue({
+        inspect: jest.fn().mockResolvedValue({
+          Options: { 'com.docker.network.bridge.enable_icc': 'false' },
+          IPAM: { Config: [{ Subnet: '172.20.0.0/16', Gateway: '172.20.0.1' }] },
+        }),
+        remove: jest.fn(),
+      });
+      const mgr = new ContainerManager(docker);
+
+      await mgr.start(baseSpec);
+
+      const call = docker.createContainer.mock.calls[0][0];
+      expect(call.HostConfig.ExtraHosts).toContain(`${HOST_ALIAS}:172.20.0.1`);
+    });
+
+    it('falls back to the pinned gateway when drop-net exposes no inspectable gateway', async () => {
+      const docker = makeDockerMock() as any; // default network mock: no IPAM.Config
       const mgr = new ContainerManager(docker);
 
       await mgr.start(baseSpec);
