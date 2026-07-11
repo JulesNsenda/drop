@@ -18,6 +18,7 @@ import SignupPage from './pages/SignupPage';
 import UsersPage from './pages/UsersPage';
 import NotFoundPage from './pages/NotFoundPage';
 import ChangePasswordPage from './pages/ChangePasswordPage';
+import OAuthConsent from './pages/OAuthConsent';
 
 function App() {
   const auth = useAuthProvider();
@@ -75,6 +76,12 @@ function App() {
             <Route path="signup" element={
               auth.authenticated ? <Navigate to="/apps" replace /> : <SignupPage />
             } />
+
+            {/* OAuth 2.1 consent (PRD-041) — standalone AuthLayout route, no
+                sidebar, self-manages auth (redirects to /login with a
+                returnTo when signed out; see refinement #1 in the OAuth
+                execution plan). */}
+            <Route path="oauth-consent" element={<OAuthConsent />} />
 
             {/* Public docs site (PRD-043) — no auth, not wrapped in Layout */}
             <Route path="docs" element={

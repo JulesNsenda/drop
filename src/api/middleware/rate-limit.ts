@@ -39,6 +39,11 @@ const MCP_CONFIG: RateLimitConfig = {
   windowMs: 60_000, // 1 minute - dedicated bucket for the hosted MCP endpoint (PRD-040)
 };
 
+const OAUTH_CONFIG: RateLimitConfig = {
+  maxRequests: 30,
+  windowMs: 60_000, // 1 minute - dedicated bucket for the OAuth 2.1 endpoints (PRD-041)
+};
+
 // In-memory stores per limiter instance
 const stores = new Map<string, Map<string, RateLimitEntry>>();
 
@@ -140,6 +145,11 @@ export function uploadRateLimitMiddleware(config?: Partial<RateLimitConfig>) {
 /** Dedicated rate limiter for the hosted MCP endpoint (PRD-040) */
 export function mcpRateLimitMiddleware(config?: Partial<RateLimitConfig>) {
   return createRateLimiter('mcp', { ...MCP_CONFIG, ...config });
+}
+
+/** Dedicated rate limiter for the OAuth 2.1 endpoints (PRD-041) */
+export function oauthRateLimitMiddleware(config?: Partial<RateLimitConfig>) {
+  return createRateLimiter('oauth', { ...OAUTH_CONFIG, ...config });
 }
 
 /** Reset all rate limit stores (for testing) */
