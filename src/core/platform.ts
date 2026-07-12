@@ -7,9 +7,10 @@
 
 import * as path from 'path';
 import * as fs from 'fs/promises';
+import * as yaml from 'yaml';
 import { EventBus, eventBus, Unsubscribe, AppDeletedPayload } from './event-bus';
 import { WatcherService } from './watcher';
-import { DetectorService, getDetector, parseDropYaml, DetectionResult } from './detector';
+import { DetectorService, getDetector, parseDropYaml, DetectionResult, DropYamlConfig } from './detector';
 import { BuilderService, getBuilder } from './builder';
 import { RouterService, getRouterService, resetRouterService } from './router';
 import { AppRuntime, AppProcessInfo, AppStartSpec, getAppRuntime, resetAppRuntime } from '../managers/runtime';
@@ -1128,6 +1129,17 @@ backup:
       // isCloning guard above: don't let the watcher onboard mid-upload.
       if (this.uploadDeployService?.isUploading(payload.name)) return;
 
+      // Monorepo interception (M2): a root drop.yaml with a `services:` map
+      // describes a group container, never a single app. Materialize each
+      // declared service as its own top-level sibling app and skip the
+      // normal single-app onboarding below for the container folder itself.
+      const rootYaml = await parseDropYaml(payload.path);
+      if (rootYaml.success && rootYaml.config?.services && Object.keys(rootYaml.config.services).length > 0) {
+        this.watcher?.markAppKnown(payload.name);
+        await this.expandMonorepo(payload.path, payload.name, rootYaml.config);
+        return;
+      }
+
       // Tell the watcher this app is known regardless of who published the
       // detection (git deploy publishes deterministically after a clone) —
       // otherwise the watcher's own debounced flush would emit a duplicate
@@ -1432,6 +1444,186 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     const configPath = path.join(appPath, 'drop-config.js');
     await fs.writeFile(configPath, configContent);
     this.logger.info(`Generated drop-config.js for static app`, 'DEPS');
+  }
+
+  /**
+   * Matches path segments 'node_modules', '.git', 'dist', or 'build' anywhere
+   * in a path, bounded by path separators (or string start/end) so real
+   * prefixes like 'distribution/' aren't accidentally excluded.
+   */
+  private static readonly MONOREPO_COPY_EXCLUDE_RE = /(^|[\\/])(node_modules|\.git|dist|build)([\\/]|$)/;
+
+  /**
+   * Expand a monorepo container (a repo whose root drop.yaml declares a
+   * `services:` map) into N ordinary top-level DROP apps — one per service.
+   *
+   * Fork C (docs/plans/2026-07-12-monorepo-multi-service.md, M2): each
+   * service's subtree is copied into its own top-level `webapps/<group>-<svc>`
+   * folder and onboarded exactly like any other single-app deploy, so the
+   * `appName == top-level-folder-name` invariant that the rest of the
+   * platform relies on (reconciliation, DELETE, hot-reload) is preserved.
+   * The container folder itself (`repoPath`) is never onboarded as an app.
+   *
+   * Idempotent: safe to re-run on every redeploy of the container (git pull /
+   * re-upload re-emits `app:detected`) — each service's folder is fully
+   * replaced (remove-then-copy) and its config/state are upserted, not
+   * duplicated.
+   */
+  private async expandMonorepo(
+    repoPath: string,
+    repoName: string,
+    config: DropYamlConfig
+  ): Promise<void> {
+    const group = (config.group || config.name || repoName).trim();
+    const services = config.services ?? {};
+    const serviceNames = new Set(Object.keys(services));
+
+    if (serviceNames.size > this.config.maxConcurrentBuilds) {
+      this.logger.warn(
+        `Monorepo group '${group}' declares ${serviceNames.size} services, which exceeds ` +
+          `maxConcurrentBuilds (${this.config.maxConcurrentBuilds}); services beyond the cap ` +
+          `will be deferred by the build queue ("Build queue full") rather than built immediately`,
+        'MONOREPO'
+      );
+    }
+
+    for (const [svcName, svc] of Object.entries(services)) {
+      try {
+        const childName = `${group}-${svcName}`;
+        if (!/^[a-zA-Z0-9_-]+$/.test(childName)) {
+          this.logger.warn(
+            `Skipping service '${svcName}' in monorepo group '${group}': derived app name ` +
+              `'${childName}' contains characters outside [a-zA-Z0-9_-]`,
+            'MONOREPO'
+          );
+          continue;
+        }
+
+        // Collision guard: refuse to clobber a standalone app (or an app from
+        // a different group) that already owns this name. Allow refresh when
+        // the existing config already belongs to this same group (redeploy).
+        const existing = this.appConfigService?.getConfig(childName);
+        if (existing && existing.group !== group) {
+          this.logger.warn(
+            `Skipping service '${svcName}': app '${childName}' already exists and does not ` +
+              `belong to monorepo group '${group}'`,
+            'MONOREPO'
+          );
+          continue;
+        }
+
+        const srcDir = path.join(repoPath, svc.path);
+        try {
+          const st = await fs.stat(srcDir);
+          if (!st.isDirectory()) {
+            this.logger.warn(
+              `Skipping service '${svcName}': '${svc.path}' in '${repoName}' is not a directory`,
+              'MONOREPO'
+            );
+            continue;
+          }
+        } catch {
+          this.logger.warn(
+            `Skipping service '${svcName}': path '${svc.path}' does not exist in '${repoName}'`,
+            'MONOREPO'
+          );
+          continue;
+        }
+
+        const childPath = path.join(this.config.appsDirectory, childName);
+
+        // Suppress the watcher's own onboarding of the folder we're about to
+        // write — we onboard it ourselves below, same as the interception
+        // above does for the container.
+        this.watcher?.markAppKnown(childName);
+
+        // Materialize (idempotent): drop any previous copy, then copy fresh,
+        // excluding node_modules/.git/dist/build so redeploys stay cheap and
+        // don't duplicate installed dependencies or build output.
+        await fs.rm(childPath, { recursive: true, force: true });
+        await fs.cp(srcDir, childPath, {
+          recursive: true,
+          force: true,
+          filter: (src: string) => !DropPlatform.MONOREPO_COPY_EXCLUDE_RE.test(src),
+        });
+
+        // Resolve type: honor an explicit override, else detect from the
+        // freshly copied subtree (the real source — the generated child
+        // drop.yaml written below doesn't exist yet at detection time). If
+        // the source subtree itself carries its own drop.yaml, it was copied
+        // above and gets overwritten by the generated one next.
+        let childType = svc.type;
+        if (!childType && this.detector) {
+          const det = await this.detector.detect(childPath, { silent: true });
+          childType = det.type;
+        }
+        childType = childType || 'static';
+
+        // Rewrite depends_on so a dependency naming a sibling service resolves
+        // to that sibling's real, group-qualified child app name. Dependencies
+        // on apps outside this group are left unchanged.
+        const dependsOn = svc.depends_on?.map(dep =>
+          serviceNames.has(dep.name) ? { ...dep, name: `${group}-${dep.name}` } : dep
+        );
+
+        // NOTE: intentionally omits `route` (services.<svc>.route). The
+        // top-level drop.yaml parser's ALLOWED_TOP_KEYS (drop-yaml-parser.ts)
+        // has no `route` key yet — writing it here would make every later
+        // parseDropYaml(childPath) call (resolveBuildEnv, appNeedsDatabase,
+        // health-check config) reject the whole file as "Unknown field
+        // 'route'", silently dropping env/build_env/database for the child.
+        // `route` is unread until M3 wires up same-origin routing; add
+        // top-level `route` parsing support there together with this write.
+        const childConfig: DropYamlConfig = {
+          name: childName,
+          type: childType,
+          ...(svc.database ? { database: svc.database } : {}),
+          ...(svc.domains && svc.domains.length > 0 ? { domains: svc.domains } : {}),
+          ...(svc.env ? { env: svc.env } : {}),
+          ...(svc.build_env ? { build_env: svc.build_env } : {}),
+          ...(svc.healthCheck ? { healthCheck: svc.healthCheck } : {}),
+          ...(svc.build ? { build: svc.build } : {}),
+          ...(svc.start ? { start: svc.start } : {}),
+          ...(dependsOn && dependsOn.length > 0 ? { depends_on: dependsOn } : {}),
+        };
+        await fs.writeFile(path.join(childPath, 'drop.yaml'), yaml.stringify(childConfig));
+
+        // Same narrowing cast the normal onboarding path (detectedSub) and
+        // handleBuildApp already use: the detector's AppType is wider than
+        // the stored config/state runtime union.
+        const narrowedType = childType as 'nodejs' | 'python' | 'go' | 'static' | 'docker' | 'unknown';
+
+        if (this.appConfigService) {
+          await this.appConfigService.upsertConfig(childName, {
+            type: narrowedType,
+            path: childPath,
+            hostname: `${childName}.localhost`,
+            group,
+          });
+        }
+        if (this.stateManager) {
+          await this.stateManager.registerApp(childName, childPath, narrowedType);
+          await this.stateManager.updateApp(childName, { group });
+        }
+
+        // Sequential await: gives declared-order onboarding for the common
+        // small-N case and stays under maxConcurrentBuilds without needing a
+        // further file change to retrigger queued services (a single drop
+        // produces none). If a service is deferred by the "Build queue full"
+        // guard in handleBuildApp, it is not silently lost — the warning above
+        // flags oversized groups — but it also won't auto-retrigger; that's
+        // acceptable for the common small-N case and left for a future pass.
+        if (this.config.autoBuild) {
+          await this.handleBuildApp(childPath, childName, childType);
+        }
+      } catch (error) {
+        this.logger.error(
+          `Failed to expand service '${svcName}' in monorepo group '${group}': ` +
+            `${error instanceof Error ? error.message : String(error)}`,
+          'MONOREPO'
+        );
+      }
+    }
   }
 
   private async handleBuildApp(appPath: string, appName: string, _appType: string): Promise<void> {
