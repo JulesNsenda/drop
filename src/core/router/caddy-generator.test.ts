@@ -229,3 +229,54 @@ describe('parseTlsProtocols', () => {
     expect(parseTlsProtocols('')).toEqual({});
   });
 });
+
+describe('monorepo same-origin path-split routing (M3)', () => {
+  // A frontend at `/` and a backend at `/api*` on ONE shared hostname.
+  const frontend = makeRoute({
+    appName: 'ezsign-frontend-ezsign-example-com',
+    hostname: 'ezsign.example.com',
+    upstream: 'localhost:3101',
+    ssl: true,
+    redirectHttps: true,
+  });
+  const backend = makeRoute({
+    appName: 'ezsign-backend-ezsign-example-com',
+    hostname: 'ezsign.example.com',
+    pathPrefix: '/api*',
+    upstream: 'localhost:3102',
+    ssl: true,
+    redirectHttps: true,
+  });
+
+  it('emits two distinct site addresses for the same host (root and /api*)', () => {
+    const out = generateFullCaddyfile([frontend, backend], makeConfig());
+    // Root site block (frontend) and path-scoped site block (backend).
+    expect(out).toContain('ezsign.example.com {');
+    expect(out).toContain('ezsign.example.com/api* {');
+    // Each reverse-proxies to its own upstream.
+    expect(out).toContain('localhost:3101');
+    expect(out).toContain('localhost:3102');
+  });
+
+  it('dedupes the HTTP→HTTPS redirect block so the shared host is not duplicated', () => {
+    const out = generateFullCaddyfile([frontend, backend], makeConfig());
+    // Exactly one `http://ezsign.example.com {` redirect block — a second would
+    // be a duplicate site address that wedges Caddy's reload.
+    const redirectMatches = out.match(/http:\/\/ezsign\.example\.com\s*\{/g) || [];
+    expect(redirectMatches).toHaveLength(1);
+  });
+
+  it('localhost dev: two path-split blocks, no redirect blocks', () => {
+    const devFrontend = makeRoute({ appName: 'fe', hostname: 'ezsign.localhost', upstream: 'localhost:3101' });
+    const devBackend = makeRoute({
+      appName: 'be',
+      hostname: 'ezsign.localhost',
+      pathPrefix: '/api*',
+      upstream: 'localhost:3102',
+    });
+    const out = generateFullCaddyfile([devFrontend, devBackend], makeConfig());
+    expect(out).toContain('ezsign.localhost {');
+    expect(out).toContain('ezsign.localhost/api* {');
+    expect(out).not.toContain('http://ezsign.localhost {');
+  });
+});

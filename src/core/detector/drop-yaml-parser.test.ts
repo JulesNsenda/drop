@@ -462,6 +462,38 @@ describe('Drop YAML Parser', () => {
     });
   });
 
+  describe('validateDropYamlConfig - top-level route (M3: same-origin routing)', () => {
+    it('should accept a top-level route with just a path', () => {
+      const result = validateDropYamlConfig({ route: { path: '/api' } });
+      expect(result.valid).toBe(true);
+      expect(result.error).toBeUndefined();
+    });
+
+    it('should accept a top-level route with path and strip', () => {
+      const result = validateDropYamlConfig({ route: { path: '/api', strip: true } });
+      expect(result.valid).toBe(true);
+      expect(result.error).toBeUndefined();
+    });
+
+    it('should reject a top-level route.path that is not a string', () => {
+      const result = validateDropYamlConfig({ route: { path: 123 } });
+      expect(result.valid).toBe(false);
+      expect(result.error).toContain('route.path');
+    });
+
+    it('should reject a top-level route.strip that is not a boolean', () => {
+      const result = validateDropYamlConfig({ route: { strip: 'yes' } });
+      expect(result.valid).toBe(false);
+      expect(result.error).toContain('route.strip');
+    });
+
+    it('should reject an unknown field in the top-level route object', () => {
+      const result = validateDropYamlConfig({ route: { bogus: 1 } });
+      expect(result.valid).toBe(false);
+      expect(result.error).toContain('route.bogus');
+    });
+  });
+
   describe('parseDropYaml - services (end-to-end)', () => {
     it('should parse a valid multi-service drop.yaml from a real file', async () => {
       await fs.writeFile(
@@ -511,6 +543,28 @@ describe('Drop YAML Parser', () => {
       const result = await parseDropYaml(tmpDir);
       expect(result.success).toBe(false);
       expect(result.error).toBeDefined();
+    });
+  });
+
+  describe('parseDropYaml - top-level route (end-to-end)', () => {
+    it('should parse a valid top-level route from a real file', async () => {
+      await fs.writeFile(
+        path.join(tmpDir, 'drop.yaml'),
+        'name: ezsign-backend\nroute:\n  path: /api\n  strip: true\n'
+      );
+      const result = await parseDropYaml(tmpDir);
+      expect(result.success).toBe(true);
+      expect(result.config?.route).toEqual({ path: '/api', strip: true });
+    });
+
+    it('should reject an invalid top-level route from a real file', async () => {
+      await fs.writeFile(
+        path.join(tmpDir, 'drop.yaml'),
+        'route:\n  bogus: 1\n'
+      );
+      const result = await parseDropYaml(tmpDir);
+      expect(result.success).toBe(false);
+      expect(result.error).toContain('route.bogus');
     });
   });
 
