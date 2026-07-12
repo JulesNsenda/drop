@@ -27,7 +27,7 @@ export class PythonBuildStrategy extends BaseBuildStrategy {
     }
 
     // Default: a requirements.txt is the common case.
-    return 'pip install -r requirements.txt';
+    return this.pipInstall(context);
   }
 
   getBuildCommand(context: BuildContext): string | null {
@@ -36,13 +36,38 @@ export class PythonBuildStrategy extends BaseBuildStrategy {
       return context.config.buildCommand;
     }
 
-    // Django needs collectstatic
+    // Django needs collectstatic. Run it with the same interpreter the deps
+    // were installed into: the in-app-dir venv when we created one (docker
+    // build), else the host/global python.
     if (context.appType === 'django') {
-      return 'python manage.py collectstatic --noinput';
+      const py = this.usesVenv(context) ? '.venv/bin/python' : 'python';
+      return `${py} manage.py collectstatic --noinput`;
     }
 
     // Most Python apps don't need a build step
     return null;
+  }
+
+  /**
+   * The pip install command. Under docker isolation the build runs in an
+   * ephemeral container whose global site-packages are discarded when it is
+   * removed, and the fresh runtime container only sees the bind-mounted app
+   * dir — so a plain `pip install` would leave the runtime with no deps and
+   * `gunicorn`/`uvicorn`/etc. "not found". Install into an in-app-dir
+   * virtualenv (.venv) instead so the packages and their console scripts
+   * persist in the app dir; platform.buildStartSpec puts `.venv/bin` on the
+   * runtime PATH. On the host (PM2, no injected container executor) a plain
+   * pip install is correct — the host interpreter runs the app directly.
+   */
+  private pipInstall(context: BuildContext): string {
+    return context.execCommand
+      ? 'python -m venv .venv && .venv/bin/pip install -r requirements.txt'
+      : 'pip install -r requirements.txt';
+  }
+
+  /** Whether this build installed deps into an in-app-dir .venv (docker path). */
+  private usesVenv(context: BuildContext): boolean {
+    return context.config.installCommand?.includes('.venv/bin/pip') ?? false;
   }
 
   getOutputDirectory(context: BuildContext): string | null {
@@ -71,7 +96,7 @@ export class PythonBuildStrategy extends BaseBuildStrategy {
       } else if (hasPoetry) {
         context.config.installCommand = 'poetry install';
       } else if (hasRequirements) {
-        context.config.installCommand = 'pip install -r requirements.txt';
+        context.config.installCommand = this.pipInstall(context);
       } else {
         // No dependency manifest found → skip the install stage entirely
         // (the same mechanism nodejs uses), rather than an '' sentinel that

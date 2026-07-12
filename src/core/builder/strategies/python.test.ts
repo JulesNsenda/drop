@@ -33,11 +33,21 @@ describe('PythonBuildStrategy', () => {
     });
 
     it.each(['python', 'django', 'flask', 'fastapi'] as const)(
-      'defaults to "pip install -r requirements.txt" for %s',
+      'defaults to "pip install -r requirements.txt" for %s (host build)',
       (appType) => {
         expect(strategy.getInstallCommand(ctx({ appType }))).toBe('pip install -r requirements.txt');
       }
     );
+
+    it('installs into an in-app-dir .venv under docker isolation (execCommand present)', () => {
+      // A container executor means the build runs in an ephemeral container
+      // whose global site-packages vanish on removal — deps MUST land in the
+      // bind-mounted app dir (.venv) to survive into the runtime container.
+      const c = ctx({ appType: 'flask', execCommand: jest.fn() });
+      expect(strategy.getInstallCommand(c)).toBe(
+        'python -m venv .venv && .venv/bin/pip install -r requirements.txt'
+      );
+    });
   });
 
   describe('getBuildCommand', () => {
@@ -46,10 +56,20 @@ describe('PythonBuildStrategy', () => {
       expect(strategy.getBuildCommand(c)).toBe('echo build');
     });
 
-    it('runs collectstatic for django', () => {
+    it('runs collectstatic for django with the host python (no venv install)', () => {
       expect(strategy.getBuildCommand(ctx({ appType: 'django' }))).toBe(
         'python manage.py collectstatic --noinput'
       );
+    });
+
+    it('runs collectstatic with the venv python when deps were installed into .venv', () => {
+      // Mirrors the docker path: preBuild set a .venv install command, so
+      // collectstatic must use the same interpreter that has django installed.
+      const c = ctx({
+        appType: 'django',
+        config: { installCommand: 'python -m venv .venv && .venv/bin/pip install -r requirements.txt' },
+      });
+      expect(strategy.getBuildCommand(c)).toBe('.venv/bin/python manage.py collectstatic --noinput');
     });
 
     it.each(['python', 'flask', 'fastapi'] as const)('returns null for %s (no build step)', (appType) => {
@@ -83,11 +103,20 @@ describe('PythonBuildStrategy', () => {
       await fs.rm(tmpDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
     });
 
-    it('uses pip + requirements.txt when only requirements.txt is present', async () => {
+    it('uses pip + requirements.txt when only requirements.txt is present (host build)', async () => {
       await fs.writeFile(path.join(tmpDir, 'requirements.txt'), 'flask==3.0.0\n');
       const c = ctx({ appType: 'flask', appPath: tmpDir });
       await strategy.preBuild(c);
       expect(c.config.installCommand).toBe('pip install -r requirements.txt');
+    });
+
+    it('uses a .venv install for requirements.txt under docker isolation', async () => {
+      await fs.writeFile(path.join(tmpDir, 'requirements.txt'), 'flask==3.0.0\n');
+      const c = ctx({ appType: 'flask', appPath: tmpDir, execCommand: jest.fn() });
+      await strategy.preBuild(c);
+      expect(c.config.installCommand).toBe(
+        'python -m venv .venv && .venv/bin/pip install -r requirements.txt'
+      );
     });
 
     it('prefers Pipfile (pipenv) over pyproject.toml and requirements.txt', async () => {
