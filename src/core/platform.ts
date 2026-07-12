@@ -2670,6 +2670,16 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     }
   }
 
+  /** True if `p` exists on disk (best-effort; any access error → false). */
+  private async pathExists(p: string): Promise<boolean> {
+    try {
+      await fs.access(p);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   /**
    * Build the runtime-agnostic start specification for an app.  Called by both
    * handleStartApp (on first deploy) and handleUpdateApp (on hot-reload) so the
@@ -2728,13 +2738,43 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       }
     } else if (detection.type === 'go') {
       const startCommand = startOverride || detection.suggestedConfig?.startCommand || `./${appName}`;
-      script = startCommand;
-      interpreter = 'none';
+      if (this.config.isolation === 'docker') {
+        // Docker execs the container Cmd array directly, with no shell — so a
+        // multi-token command or an env ref (e.g. $PORT) must go through
+        // /bin/sh -c to split args and expand vars.
+        script = '/bin/sh';
+        interpreter = 'none';
+        args = ['-c', startCommand];
+      } else {
+        script = startCommand;
+        interpreter = 'none';
+      }
     } else {
       const startCommand = startOverride || detection.suggestedConfig?.startCommand || 'node index.js';
-      script = startCommand.startsWith('node ')
-        ? startCommand.substring(5)
-        : startCommand;
+      if (this.config.isolation === 'docker') {
+        // Docker execs the Cmd array directly with NO shell, so a multi-token
+        // start command — the python detector's `gunicorn --bind 0.0.0.0:$PORT
+        // app:app`/`uvicorn ... --port $PORT`, or `node dist/server.js` — would
+        // be treated as one bogus executable name and $PORT would never expand.
+        // Run it through /bin/sh -c. Python deps are installed into an
+        // in-app-dir virtualenv (.venv) by PythonBuildStrategy so they survive
+        // into the fresh runtime container; put its bin dir first on PATH so
+        // `gunicorn`/`uvicorn`/`python` resolve to the installed packages.
+        const isPython = ['python', 'django', 'flask', 'fastapi'].includes(detection.type);
+        const venvPrefix =
+          isPython && (await this.pathExists(path.join(appPath, '.venv')))
+            ? 'export PATH="/app/.venv/bin:$PATH"; '
+            : '';
+        script = '/bin/sh';
+        interpreter = 'none';
+        args = ['-c', `${venvPrefix}${startCommand}`];
+      } else {
+        // PM2 infers the interpreter from the script file's extension, so keep
+        // the file-only script (with any `node ` prefix stripped) it expects.
+        script = startCommand.startsWith('node ')
+          ? startCommand.substring(5)
+          : startCommand;
+      }
     }
 
     const depEnvVars = await this.resolveDependencies(appPath, appName);
