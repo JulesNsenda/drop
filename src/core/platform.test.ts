@@ -2057,3 +2057,74 @@ describe('teardownApp / removeGroup (M4: group lifecycle)', () => {
     });
   });
 });
+
+describe('build-drain queue', () => {
+  let platform: DropPlatform;
+  let tempDir: string;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    jest.useFakeTimers();
+
+    tempDir = path.join(
+      os.tmpdir(),
+      `drop-test-build-drain-${Date.now()}-${Math.random().toString(36).slice(2)}`
+    );
+    platform = createPlatform({
+      dropRoot: tempDir,
+      appsDirectory: path.join(tempDir, 'apps'),
+      logLevel: 'error',
+      maxConcurrentBuilds: 1,
+    });
+    // handleBuildApp only needs these two to be truthy to get past its guard
+    // clause — no real detect/build work happens once the cap-full branch
+    // (or a stubbed drain dispatch) returns early.
+    (platform as any).builder = {} as any;
+    (platform as any).detector = {} as any;
+  });
+
+  afterEach(() => {
+    jest.useRealTimers();
+  });
+
+  it('queues the app when the concurrent-build cap is full, instead of dropping it', async () => {
+    (platform as any).appsInProgress.add('other'); // fills the cap (maxConcurrentBuilds: 1)
+    const drainSpy = jest
+      .spyOn(platform as any, 'scheduleBuildDrain')
+      .mockImplementation(() => undefined);
+
+    await (platform as any).handleBuildApp('/some/path', 'app1', 'static');
+
+    expect((platform as any).pendingBuilds.has('app1')).toBe(true);
+    expect((platform as any).pendingBuilds.get('app1')).toEqual({
+      appPath: '/some/path',
+      appType: 'static',
+    });
+    // Not started nor errored — just queued.
+    expect((platform as any).appsInProgress.has('app1')).toBe(false);
+    expect(drainSpy).toHaveBeenCalled();
+  });
+
+  it('drainPendingBuilds starts a queued build once a slot frees', async () => {
+    (platform as any).pendingBuilds.set('app1', { appPath: '/p', appType: 'static' });
+    (platform as any).handleBuildApp = jest.fn().mockResolvedValue(undefined);
+    // appsInProgress is empty here — below the cap of 1.
+
+    await (platform as any).drainPendingBuilds();
+
+    expect((platform as any).handleBuildApp).toHaveBeenCalledWith('/p', 'app1', 'static');
+    expect((platform as any).pendingBuilds.has('app1')).toBe(false);
+  });
+
+  it('drainPendingBuilds does not dispatch while the cap is still full', async () => {
+    (platform as any).appsInProgress.add('other'); // cap (1) already full
+    (platform as any).pendingBuilds.set('app1', { appPath: '/p', appType: 'static' });
+    (platform as any).handleBuildApp = jest.fn().mockResolvedValue(undefined);
+
+    await (platform as any).drainPendingBuilds();
+
+    expect((platform as any).handleBuildApp).not.toHaveBeenCalled();
+    // Entry stays queued for the next drain attempt.
+    expect((platform as any).pendingBuilds.has('app1')).toBe(true);
+  });
+});

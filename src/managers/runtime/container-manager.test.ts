@@ -560,6 +560,23 @@ describe('selectBaseImage', () => {
     expect(selectBaseImage('python')).toBe('python:3.12-slim');
   });
 
+  // Python web frameworks: the detector reports the specific type
+  // (django/flask/fastapi) and the BUILD image is selected from that wide
+  // type (platform.ts passes `detection.type`). Without these BASE_IMAGES
+  // entries they fell back to node:20-slim, where `pip` doesn't exist —
+  // the build failed with "/bin/sh: 1: pip: not found".
+  it('returns python:3.12-slim for django', () => {
+    expect(selectBaseImage('django')).toBe('python:3.12-slim');
+  });
+
+  it('returns python:3.12-slim for flask', () => {
+    expect(selectBaseImage('flask')).toBe('python:3.12-slim');
+  });
+
+  it('returns python:3.12-slim for fastapi', () => {
+    expect(selectBaseImage('fastapi')).toBe('python:3.12-slim');
+  });
+
   it('returns golang:1.22-alpine for go', () => {
     expect(selectBaseImage('go')).toBe('golang:1.22-alpine');
   });
