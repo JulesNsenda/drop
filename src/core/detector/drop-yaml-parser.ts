@@ -13,7 +13,7 @@ import * as yaml from 'yaml';
 const ALLOWED_TOP_KEYS = new Set([
   'name', 'domains', 'tls', 'env', 'build_env', 'depends_on', 'port',
   'build', 'start', 'healthCheck', 'maxBodySize', 'timeout',
-  'group', 'services', 'type', 'database', 'route',
+  'group', 'services', 'type', 'database', 'redis', 'route',
 ]);
 
 /** Keys accepted under drop.yaml#tls */
@@ -21,7 +21,7 @@ const ALLOWED_TLS_KEYS = new Set(['certFile', 'keyFile', 'disabled']);
 
 /** Keys accepted under a drop.yaml#services.<name> entry */
 const ALLOWED_SERVICE_KEYS = new Set([
-  'path', 'type', 'build', 'start', 'env', 'build_env', 'database',
+  'path', 'type', 'build', 'start', 'env', 'build_env', 'database', 'redis',
   'healthCheck', 'domains', 'depends_on', 'route',
 ]);
 
@@ -92,6 +92,8 @@ export interface ServiceConfig {
   build_env?: AppEnvConfig;
   /** Provision a database for this service only (e.g. "postgres") */
   database?: string;
+  /** Provision managed Redis (per-app logical DB + injected REDIS_URL) for this service. */
+  redis?: boolean;
   /** Health check path */
   healthCheck?: string;
   /** Custom domains for this service */
@@ -120,6 +122,8 @@ export interface DropYamlConfig {
    * same reason as `type`; drives per-app DB provisioning via the detector.
    */
   database?: string;
+  /** Provision managed Redis (per-app logical DB + injected REDIS_URL). */
+  redis?: boolean;
   /** Custom domains for this app */
   domains?: string[];
   /** TLS configuration */
@@ -349,6 +353,11 @@ export function validateDropYamlConfig(
     if (cfg[field] !== undefined && typeof cfg[field] !== 'string') {
       return { valid: false, error: `${field} must be a string` };
     }
+  }
+
+  // Validate boolean fields
+  if (cfg.redis !== undefined && typeof cfg.redis !== 'boolean') {
+    return { valid: false, error: 'redis must be a boolean' };
   }
 
   if (cfg.timeout !== undefined) {
@@ -582,6 +591,11 @@ function validateServiceConfig(
     if (svc[field] !== undefined && typeof svc[field] !== 'string') {
       return { valid: false, error: `services.${name}.${field} must be a string` };
     }
+  }
+
+  // Optional boolean fields
+  if (svc.redis !== undefined && typeof svc.redis !== 'boolean') {
+    return { valid: false, error: `services.${name}.redis must be a boolean` };
   }
 
   // domains

@@ -25,6 +25,14 @@ import {
   getDatabaseProvisioner,
   resetDatabaseProvisioner,
 } from '../managers/database';
+import {
+  RedisServer,
+  getRedisServer,
+  resetRedisServer,
+  RedisProvisioner,
+  getRedisProvisioner,
+  resetRedisProvisioner,
+} from '../managers/redis';
 import { CaddyServer, getCaddyServer, resetCaddyServer } from '../managers/router';
 import { SecretManager, getSecretManager, resetSecretManager } from '../managers/secret';
 import { WebhookManager, getWebhookManager, resetWebhookManager } from './webhooks';
@@ -114,6 +122,12 @@ export interface PlatformConfig {
   allowSignup: boolean;
   /** Max databases a single user may provision (0 = unlimited). */
   maxDbsPerUser: number;
+  /** Run the bundled managed Redis (per-app logical DB + injected REDIS_URL). Default true. */
+  enableRedis: boolean;
+  /** Host TCP port for the managed Redis instance (default 6380). */
+  redisPort: number;
+  /** Max managed-Redis logical DBs a single user may provision (0 = unlimited). */
+  maxRedisPerUser: number;
   /** Global limit on simultaneous builds (0 = unlimited). */
   maxConcurrentBuilds: number;
   /**
@@ -201,6 +215,9 @@ const DEFAULT_CONFIG: PlatformConfig = {
   isolation: (process.env.DROP_ISOLATION as IsolationMode) ?? 'none',
   allowSignup: process.env.DROP_ALLOW_SIGNUP === 'true',
   maxDbsPerUser: parseInt(process.env.DROP_MAX_DBS_PER_USER || '3', 10),
+  enableRedis: process.env.DROP_ENABLE_REDIS !== 'false',
+  redisPort: parseInt(process.env.DROP_REDIS_PORT || '6380', 10),
+  maxRedisPerUser: parseInt(process.env.DROP_MAX_REDIS_PER_USER || '3', 10),
   maxConcurrentBuilds: parseInt(process.env.DROP_MAX_CONCURRENT_BUILDS || '3', 10),
   maxConcurrentApps: parseInt(process.env.DROP_MAX_CONCURRENT_APPS || '0', 10),
   maxMemoryMbPerApp: parseInt(process.env.DROP_MAX_MEMORY_MB_PER_APP || '0', 10),
@@ -226,6 +243,8 @@ export class DropPlatform {
   private appConfigService: AppConfigService | null = null;
   private postgresServer: PostgresServer | null = null;
   private dbProvisioner: DatabaseProvisioner | null = null;
+  private redisServer: RedisServer | null = null;
+  private redisProvisioner: RedisProvisioner | null = null;
   private caddyServer: CaddyServer | null = null;
   private secretManager: SecretManager | null = null;
   private webhookManager: WebhookManager | null = null;
@@ -463,6 +482,18 @@ export class DropPlatform {
     if (this.dbProvisioner) {
       resetDatabaseProvisioner();
       this.dbProvisioner = null;
+    }
+
+    // Stop managed Redis + reset its singletons (provisioner depends on server).
+    if (this.redisServer) {
+      this.logger.info('Stopping managed Redis...', 'REDIS');
+      await this.redisServer.stop();
+      resetRedisServer();
+      this.redisServer = null;
+    }
+    if (this.redisProvisioner) {
+      resetRedisProvisioner();
+      this.redisProvisioner = null;
     }
 
     // Stop Caddy server
@@ -828,6 +859,35 @@ backup:
     // Ensure internal database exists
     const internalDb = await this.dbProvisioner.ensureInternalDatabase();
     this.logger.info(`Internal database ready: ${internalDb.database}`, 'DATABASE');
+
+    // Initialize the managed Redis instance + provisioner. FAIL-SOFT: Redis is
+    // an optional convenience (apps can still use an external REDIS_URL secret),
+    // so a start failure (no redis-server on a dev host, docker hiccup) logs and
+    // continues rather than aborting platform start. Apps that need Redis then
+    // simply get no REDIS_URL — the same posture as Postgres-unavailable.
+    if (this.config.enableRedis) {
+      try {
+        this.logger.info('Initializing managed Redis...', 'REDIS');
+        this.redisServer = getRedisServer({
+          dropRoot: this.config.dropRoot,
+          port: this.config.redisPort,
+          useDocker: this.config.isolation === 'docker',
+          onLog: (msg) => this.logger.debug(msg, 'REDIS'),
+        });
+        await this.redisServer.start();
+        this.redisProvisioner = getRedisProvisioner(this.redisServer, this.config.dropRoot);
+        await this.redisProvisioner?.initialize();
+        this.logger.info(`Managed Redis running on port ${this.redisServer.getPort()}`, 'REDIS');
+      } catch (err) {
+        this.logger.warn(
+          'Managed Redis failed to start — apps needing Redis must use an external REDIS_URL secret',
+          'REDIS',
+          err
+        );
+        this.redisServer = null;
+        this.redisProvisioner = null;
+      }
+    }
 
     // Initialize state manager for app tracking
     const stateFilePath = path.join(this.config.dropRoot, 'data', 'drop-svc', 'apps.json');
@@ -1342,6 +1402,97 @@ backup:
   }
 
   /**
+   * Whether an app wants managed Redis. An explicit `redis:` in drop.yaml wins
+   * (true opts in, false opts out); otherwise auto-detect a Redis client in the
+   * app's package.json dependencies — the same "detect from project files"
+   * approach appNeedsDatabase uses for ORM config. Non-Node apps opt in via
+   * `redis: true` in drop.yaml.
+   */
+  private async appNeedsRedis(appPath: string): Promise<boolean> {
+    const dropYaml = await parseDropYaml(appPath);
+    if (dropYaml.success && typeof dropYaml.config?.redis === 'boolean') {
+      return dropYaml.config.redis;
+    }
+
+    try {
+      const pkgRaw = await fs.readFile(path.join(appPath, 'package.json'), 'utf-8');
+      const pkg = JSON.parse(pkgRaw) as {
+        dependencies?: Record<string, string>;
+        devDependencies?: Record<string, string>;
+      };
+      const deps = { ...(pkg.dependencies ?? {}), ...(pkg.devDependencies ?? {}) };
+      const redisClients = [
+        'ioredis',
+        'redis',
+        'bullmq',
+        '@nestjs/bullmq',
+        'bull',
+        'rate-limit-redis',
+        'connect-redis',
+      ];
+      if (redisClients.some((c) => c in deps)) {
+        return true;
+      }
+    } catch {
+      // No/unreadable package.json — not a Node app, or nothing to detect.
+    }
+
+    return false;
+  }
+
+  /**
+   * Provision (or fetch the existing) managed-Redis env vars for an app.
+   * Idempotent and fail-soft: returns {} when Redis is unavailable, the app
+   * doesn't need it, or the user's quota is exceeded. Shared by the first-deploy
+   * start path and the hot-reload/restart path (which just re-fetches the
+   * existing allocation). The app-facing host is the container-reachable
+   * `drop-host` alias under docker isolation, loopback otherwise.
+   */
+  private async provisionRedisEnvVars(
+    appName: string,
+    appPath: string
+  ): Promise<Record<string, string>> {
+    if (!this.redisProvisioner) {
+      return {};
+    }
+    const redisHost = this.config.isolation === 'docker' ? HOST_ALIAS : '127.0.0.1';
+
+    // Already provisioned (e.g. hot-reload/restart) — just return its URL.
+    if (this.redisProvisioner.isProvisioned(appName)) {
+      return this.redisProvisioner.getEnvVars(appName, { host: redisHost }) || {};
+    }
+
+    if (!(await this.appNeedsRedis(appPath))) {
+      return {};
+    }
+
+    // Per-user quota (mirrors the Postgres DB quota).
+    const ownerUserId = this.stateManager?.getApp(appName)?.userId;
+    if (ownerUserId !== undefined && this.config.maxRedisPerUser > 0) {
+      const count = (this.stateManager?.getAllApps() ?? []).filter(
+        (a) => a.userId === ownerUserId && this.redisProvisioner!.isProvisioned(a.name)
+      ).length;
+      if (count >= this.config.maxRedisPerUser) {
+        this.logger.warn(
+          `Redis quota reached for user ${ownerUserId} (${count}/${this.config.maxRedisPerUser}), ` +
+            `skipping Redis for ${appName}`,
+          'REDIS'
+        );
+        return {};
+      }
+    }
+
+    try {
+      const alloc = await this.redisProvisioner.provisionAppRedis(appName);
+      this.logger.info(`Redis provisioned for ${appName}: logical db ${alloc.db}`, 'REDIS');
+      return this.redisProvisioner.getEnvVars(appName, { host: redisHost }) || {};
+    } catch (err) {
+      this.logger.warn(`Redis provisioning failed for ${appName}`, 'REDIS', err);
+      return {};
+    }
+  }
+
+  /**
    * Parse drop.yaml and resolve depends_on to get dependency URLs.
    * Returns environment variables to inject based on dependent apps.
    *
@@ -1608,6 +1759,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           name: childName,
           type: childType,
           ...(svc.database ? { database: svc.database } : {}),
+          ...(typeof svc.redis === 'boolean' ? { redis: svc.redis } : {}),
           ...(svc.domains && svc.domains.length > 0 ? { domains: svc.domains } : {}),
           ...(svc.env ? { env: svc.env } : {}),
           ...(svc.build_env ? { build_env: svc.build_env } : {}),
@@ -1921,7 +2073,19 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         }
       }
 
-      const spec = await this.buildStartSpec(appName, appPath, detection, port, dataDir, dbEnvVars);
+      // Check if app needs Redis and provision a logical DB (fail-soft — a Redis
+      // failure must never block the app start; the app just gets no REDIS_URL).
+      const redisEnvVars = await this.provisionRedisEnvVars(appName, appPath);
+
+      const spec = await this.buildStartSpec(
+        appName,
+        appPath,
+        detection,
+        port,
+        dataDir,
+        dbEnvVars,
+        redisEnvVars
+      );
       const status = await this.runtime.start(spec);
 
       this.logger.appEvent('started', appName, `PID ${status.pid}, port ${port}`);
@@ -2376,7 +2540,19 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       ) || {};
     }
 
-    const spec = await this.buildStartSpec(appName, appPath, detection, port, dataDir, dbEnvVars);
+    // Re-fetch the existing Redis allocation (idempotent; no new provisioning
+    // on a hot-reload of an already-running app).
+    const redisEnvVars = await this.provisionRedisEnvVars(appName, appPath);
+
+    const spec = await this.buildStartSpec(
+      appName,
+      appPath,
+      detection,
+      port,
+      dataDir,
+      dbEnvVars,
+      redisEnvVars
+    );
     return { spec, port };
   }
 
@@ -2516,6 +2692,13 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         await this.dbProvisioner?.backupAndDeleteAppDatabase(name);
       } catch (err) {
         this.logger.warn(`Database teardown failed for ${name}`, 'DATABASE', err);
+      }
+      try {
+        // Free the app's logical Redis DB (FLUSHDB + release the number).
+        // Idempotent + fail-soft; a no-op if the app had no Redis.
+        await this.redisProvisioner?.deprovisionAppRedis(name);
+      } catch (err) {
+        this.logger.warn(`Redis teardown failed for ${name}`, 'REDIS', err);
       }
     }
 
@@ -2695,7 +2878,8 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     detection: DetectionResult,
     port: number,
     dataDir: string,
-    dbEnvVars: Record<string, string>
+    dbEnvVars: Record<string, string>,
+    redisEnvVars: Record<string, string> = {}
   ): Promise<AppStartSpec> {
     let script: string;
     let interpreter: string | undefined;
@@ -2869,6 +3053,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         DROP_API_URL: dropApiUrl,
         ...(dropApiKey ? { DROP_API_KEY: dropApiKey } : {}),
         ...dbEnvVars,
+        ...redisEnvVars,
         ...depEnvVars,
       },
     };

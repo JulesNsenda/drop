@@ -326,6 +326,67 @@ describe('DropPlatform', () => {
       expect(spec.interpreter).toBe('none');
       expect(spec.args).toEqual(['-c', 'node dist/server.js']);
     });
+
+    it('spreads the injected redisEnvVars into the start spec env', async () => {
+      const spec = await (dockerPlatform as any).buildStartSpec(
+        'redisapp',
+        path.join(tempDir, 'redisapp'),
+        detection('nodejs', 'node server.js'),
+        4000,
+        path.join(tempDir, 'data', 'redisapp'),
+        {},
+        { REDIS_URL: 'redis://:pw@drop-host:6380/3', REDIS_DB: '3' }
+      );
+      expect(spec.env.REDIS_URL).toBe('redis://:pw@drop-host:6380/3');
+      expect(spec.env.REDIS_DB).toBe('3');
+    });
+  });
+
+  // Managed-Redis platform wiring: provisionRedisEnvVars picks the app-facing
+  // host (drop-host under docker isolation, loopback otherwise) and is fail-soft
+  // when Redis is unavailable. The provisioner itself is unit-tested separately;
+  // these cover the platform's host-selection + gating, which the unit tests
+  // can't see.
+  describe('provisionRedisEnvVars', () => {
+    const mockProvisioner = () => ({
+      isProvisioned: jest.fn().mockReturnValue(true), // short-circuits to getEnvVars
+      getEnvVars: jest.fn().mockReturnValue({ REDIS_URL: 'redis://:pw@H:6380/3', REDIS_DB: '3' }),
+      provisionAppRedis: jest.fn(),
+    });
+
+    const makePlatform = (isolation: string) => {
+      const p = createPlatform({
+        dropRoot: tempDir,
+        appsDirectory: path.join(tempDir, 'apps'),
+        logLevel: 'error',
+        caddyfilePath: path.join(tempDir, 'Caddyfile'),
+      });
+      (p as any).config.isolation = isolation;
+      return p;
+    };
+
+    it('returns {} when managed Redis is unavailable (no provisioner)', async () => {
+      const p = makePlatform('docker');
+      (p as any).redisProvisioner = null;
+      expect(await (p as any).provisionRedisEnvVars('app', path.join(tempDir, 'app'))).toEqual({});
+    });
+
+    it('addresses Redis via the drop-host alias under docker isolation', async () => {
+      const prov = mockProvisioner();
+      const p = makePlatform('docker');
+      (p as any).redisProvisioner = prov;
+      const env = await (p as any).provisionRedisEnvVars('app', path.join(tempDir, 'app'));
+      expect(prov.getEnvVars).toHaveBeenCalledWith('app', { host: 'drop-host' });
+      expect(env.REDIS_URL).toBe('redis://:pw@H:6380/3');
+    });
+
+    it('addresses Redis via loopback when not under docker isolation', async () => {
+      const prov = mockProvisioner();
+      const p = makePlatform('none');
+      (p as any).redisProvisioner = prov;
+      await (p as any).provisionRedisEnvVars('app', path.join(tempDir, 'app'));
+      expect(prov.getEnvVars).toHaveBeenCalledWith('app', { host: '127.0.0.1' });
+    });
   });
 
   describe('start', () => {

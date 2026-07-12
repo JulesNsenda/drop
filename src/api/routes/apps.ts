@@ -24,6 +24,7 @@ import { hasEnoughDisk, getMinFreeDiskMb } from '../../utils/disk';
 import { getStateManager, AppState } from '../../managers/app/state-manager';
 import { getAppConfigService } from '../../managers/app/app-config';
 import { getDatabaseProvisioner } from '../../managers/database';
+import { getRedisProvisioner } from '../../managers/redis';
 import { getRouterService } from '../../core/router';
 import { tryLogActivity } from '../../managers/activity';
 import {
@@ -572,6 +573,15 @@ apps.delete('/:name', async c => {
     } catch (err) {
       dbStatus = 'retained';
       console.warn(`[apps.delete] database teardown threw for ${name}:`, err);
+    }
+
+    // Free the app's managed-Redis logical DB (FLUSHDB + release the number).
+    // Idempotent + fail-soft; a no-op when the app had no Redis. `?keepData=true`
+    // skips it (handled by the enclosing `else`).
+    try {
+      await getRedisProvisioner()?.deprovisionAppRedis(name);
+    } catch (err) {
+      console.warn(`[apps.delete] redis teardown threw for ${name}:`, err);
     }
   }
 
