@@ -13,7 +13,7 @@ import * as yaml from 'yaml';
 const ALLOWED_TOP_KEYS = new Set([
   'name', 'domains', 'tls', 'env', 'build_env', 'depends_on', 'port',
   'build', 'start', 'healthCheck', 'maxBodySize', 'timeout',
-  'group', 'services', 'type', 'database',
+  'group', 'services', 'type', 'database', 'route',
 ]);
 
 /** Keys accepted under drop.yaml#tls */
@@ -158,6 +158,13 @@ export interface DropYamlConfig {
    * materialized as its own top-level app (see M2 expansion).
    */
   services?: Record<string, ServiceConfig>;
+  /**
+   * Same-origin route mount for this app (used by monorepo children: the
+   * frontend mounts at `/`, the backend at `/api`). Accepted at the top level
+   * so a generated child `<group>-<service>` drop.yaml validates; applied by
+   * handleConfigureRoute as a Caddy path prefix (M3).
+   */
+  route?: AppRouteConfig;
 }
 
 /**
@@ -395,6 +402,12 @@ export function validateDropYamlConfig(
       const result = validateServiceConfig(name, services[name], appPath);
       if (!result.valid) return result;
     }
+  }
+
+  // Validate top-level route (same schema as a per-service route block)
+  if (cfg.route !== undefined) {
+    const result = validateRouteConfig(cfg.route, 'route');
+    if (!result.valid) return result;
   }
 
   return { valid: true };

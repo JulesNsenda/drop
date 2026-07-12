@@ -1566,14 +1566,10 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           serviceNames.has(dep.name) ? { ...dep, name: `${group}-${dep.name}` } : dep
         );
 
-        // NOTE: intentionally omits `route` (services.<svc>.route). The
-        // top-level drop.yaml parser's ALLOWED_TOP_KEYS (drop-yaml-parser.ts)
-        // has no `route` key yet — writing it here would make every later
-        // parseDropYaml(childPath) call (resolveBuildEnv, appNeedsDatabase,
-        // health-check config) reject the whole file as "Unknown field
-        // 'route'", silently dropping env/build_env/database for the child.
-        // `route` is unread until M3 wires up same-origin routing; add
-        // top-level `route` parsing support there together with this write.
+        // M3: `route` (services.<svc>.route) is now a top-level allowed key,
+        // so it is written into the child drop.yaml and applied by
+        // handleConfigureRoute as a same-origin Caddy path prefix (frontend at
+        // `/`, backend at `/api`).
         const childConfig: DropYamlConfig = {
           name: childName,
           type: childType,
@@ -1584,6 +1580,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           ...(svc.healthCheck ? { healthCheck: svc.healthCheck } : {}),
           ...(svc.build ? { build: svc.build } : {}),
           ...(svc.start ? { start: svc.start } : {}),
+          ...(svc.route ? { route: svc.route } : {}),
           ...(dependsOn && dependsOn.length > 0 ? { depends_on: dependsOn } : {}),
         };
         await fs.writeFile(path.join(childPath, 'drop.yaml'), yaml.stringify(childConfig));
@@ -1919,6 +1916,36 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         }
       }
 
+      // Same-origin routing (M3): a monorepo child (a `group` in its config +
+      // a `route` in its drop.yaml) is routed onto the SHARED group hostname
+      // `<group>.<suffix>` at the route's path prefix — the frontend at `/`,
+      // the backend at `/api*`. The group hostname is a COMPUTED default (not a
+      // custom drop.yaml `domains` entry), so it bypasses the custom-domain
+      // ownership guard below; two children coexist because the backend carries
+      // a `/api*` prefix, making its Caddy site address differ from the
+      // frontend's root address (identical addresses would wedge Caddy's
+      // reload). A child that also declares custom `domains` opts out of this.
+      let routePathPrefix: string | undefined;
+      const appConfig = this.appConfigService?.getConfig(appName);
+      const routeCfg = dropYaml.success ? dropYaml.config?.route : undefined;
+      if (appConfig?.group && routeCfg && !hasCustomDomains) {
+        domains = [`${appConfig.group}.${domainSuffix}`];
+        const rp = routeCfg.path?.trim();
+        if (rp && rp !== '/') {
+          const prefix = (rp.startsWith('/') ? rp : `/${rp}`).replace(/\/+$/, '');
+          // Caddy site-address path matcher: `<host>/api*` matches `/api` and
+          // `/api/...`. No prefix stripping — the backend owns its `/api` path.
+          routePathPrefix = prefix.endsWith('*') ? prefix : `${prefix}*`;
+          if (routeCfg.strip) {
+            this.logger.warn(
+              `route.strip requested for ${appName} but prefix-stripping (Caddy handle_path) ` +
+                `is not yet supported; serving with the prefix preserved (the backend must own '${prefix}')`,
+              'ROUTER'
+            );
+          }
+        }
+      }
+
       // Cross-tenant hostname guard: reject any custom domain already claimed by
       // a *different* app before it reaches Caddy. Without this, a tenant's
       // drop.yaml could claim another app's hostname/domain and hijack its
@@ -1972,6 +1999,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         await this.router.addRoute({
           appName: `${appName}-${hostname.replace(/\./g, '-')}`, // Unique route name per domain
           hostname,
+          ...(routePathPrefix ? { pathPrefix: routePathPrefix } : {}),
           upstream: `localhost:${port}`,
           ssl: enableSsl,
           redirectHttps: enableSsl,

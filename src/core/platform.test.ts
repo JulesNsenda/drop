@@ -10,7 +10,7 @@ import * as fsPromises from 'fs/promises';
 import * as yaml from 'yaml';
 import { DropPlatform, createPlatform } from './platform';
 import { eventBus } from './event-bus';
-import { getDetector } from './detector';
+import { getDetector, parseDropYaml } from './detector';
 import * as diskUtils from '../utils/disk';
 import { createApiKey, deleteApiKeysByName } from '../api/middleware/auth';
 
@@ -1506,5 +1506,129 @@ describe('expandMonorepo (M2: monorepo -> per-service app expansion)', () => {
     expect(configStore.get(`${repoName}-backend`)?.group).toBeUndefined();
     // The other service in the same group still proceeds normally.
     expect(configStore.get(`${repoName}-frontend`)?.group).toBe(repoName);
+  });
+
+  it('(g) writes route into the generated child drop.yaml when a service declares one (M3)', async () => {
+    const repoName = 'ezsign';
+    const repoPath = path.join(appsDir, repoName);
+    await writeFixtureRepo(repoPath);
+
+    const configStore = new Map<string, any>();
+    (platform as any).appConfigService = {
+      getConfig: jest.fn((name: string) => configStore.get(name)),
+      upsertConfig: jest.fn(async (name: string, updates: any) => {
+        const merged = { ...(configStore.get(name) || {}), ...updates, name };
+        configStore.set(name, merged);
+        return merged;
+      }),
+    };
+    (platform as any).stateManager = {
+      registerApp: jest.fn().mockResolvedValue(undefined),
+      updateApp: jest.fn().mockResolvedValue(undefined),
+    };
+    (platform as any).handleBuildApp = jest.fn().mockResolvedValue(undefined);
+
+    const dropConfig = {
+      group: repoName,
+      services: {
+        backend: { path: 'backend', database: 'postgres', route: { path: '/api' } },
+        frontend: { path: 'frontend', type: 'static', route: { path: '/' } },
+      },
+    };
+
+    await (platform as any).expandMonorepo(repoPath, repoName, dropConfig);
+
+    const backendChildPath = path.join(appsDir, `${repoName}-backend`);
+    const frontendChildPath = path.join(appsDir, `${repoName}-frontend`);
+
+    // Read back through the real parser (not just yaml.parse) so this also
+    // proves the generated child drop.yaml is schema-valid, not just present.
+    const backendResult = await parseDropYaml(backendChildPath);
+    const frontendResult = await parseDropYaml(frontendChildPath);
+
+    expect(backendResult.success).toBe(true);
+    expect(backendResult.config?.route).toEqual({ path: '/api' });
+    expect(frontendResult.success).toBe(true);
+    expect(frontendResult.config?.route).toEqual({ path: '/' });
+  });
+
+  describe('handleConfigureRoute (M3: same-origin routing)', () => {
+    it('routes a grouped app with route.path "/api" to the shared group hostname with a Caddy path prefix', async () => {
+      const childName = 'ezsign-backend';
+      const childPath = path.join(appsDir, childName);
+      await fsPromises.mkdir(childPath, { recursive: true });
+      await fsPromises.writeFile(
+        path.join(childPath, 'drop.yaml'),
+        'name: ezsign-backend\nroute:\n  path: /api\n'
+      );
+
+      const addRoute = jest.fn().mockResolvedValue(undefined);
+      (platform as any).router = { addRoute };
+      (platform as any).appConfigService = {
+        getConfig: jest.fn().mockReturnValue({ group: 'ezsign' }),
+        updateConfig: jest.fn(),
+      };
+      (platform as any).caddyServer = undefined;
+
+      await (platform as any).handleConfigureRoute(childName, 4001);
+
+      expect(addRoute).toHaveBeenCalledTimes(1);
+      expect(addRoute).toHaveBeenCalledWith(
+        expect.objectContaining({
+          hostname: 'ezsign.localhost',
+          pathPrefix: '/api*',
+          upstream: 'localhost:4001',
+        })
+      );
+    });
+
+    it('routes the frontend (route.path "/") to the shared group hostname with no path prefix', async () => {
+      const childName = 'ezsign-frontend';
+      const childPath = path.join(appsDir, childName);
+      await fsPromises.mkdir(childPath, { recursive: true });
+      await fsPromises.writeFile(
+        path.join(childPath, 'drop.yaml'),
+        'name: ezsign-frontend\nroute:\n  path: /\n'
+      );
+
+      const addRoute = jest.fn().mockResolvedValue(undefined);
+      (platform as any).router = { addRoute };
+      (platform as any).appConfigService = {
+        getConfig: jest.fn().mockReturnValue({ group: 'ezsign' }),
+        updateConfig: jest.fn(),
+      };
+      (platform as any).caddyServer = undefined;
+
+      await (platform as any).handleConfigureRoute(childName, 4002);
+
+      expect(addRoute).toHaveBeenCalledTimes(1);
+      const call = addRoute.mock.calls[0][0];
+      expect(call.hostname).toBe('ezsign.localhost');
+      expect(call.pathPrefix).toBeUndefined();
+      expect(call.upstream).toBe('localhost:4002');
+    });
+
+    it('routes a standalone app (no group) to its own default hostname with no path prefix', async () => {
+      const appName = 'solo-app';
+      // Deliberately no drop.yaml on disk for this app — parseDropYaml should
+      // resolve gracefully to "not found" and default (non-group) routing
+      // should apply unchanged.
+
+      const addRoute = jest.fn().mockResolvedValue(undefined);
+      (platform as any).router = { addRoute };
+      (platform as any).appConfigService = {
+        getConfig: jest.fn().mockReturnValue(undefined),
+        updateConfig: jest.fn(),
+      };
+      (platform as any).caddyServer = undefined;
+
+      await (platform as any).handleConfigureRoute(appName, 4003);
+
+      expect(addRoute).toHaveBeenCalledTimes(1);
+      const call = addRoute.mock.calls[0][0];
+      expect(call.hostname).toBe('solo-app.localhost');
+      expect(call.pathPrefix).toBeUndefined();
+      expect(call.upstream).toBe('localhost:4003');
+    });
   });
 });
