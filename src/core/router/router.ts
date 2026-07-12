@@ -106,6 +106,49 @@ export class RouterService {
   }
 
   /**
+   * Remove every route owned by `owner` (the bare owning app name — see
+   * `RouteConfig.owner`). Unlike `removeRoute`, which removes exactly one
+   * route by its per-domain key and throws if it doesn't exist, this is a
+   * no-op (no throw) when the owner has no routes, and removes potentially
+   * several routes (one per custom domain / group path). Regenerates and
+   * reloads the Caddyfile ONCE after removing every matching route, not once
+   * per route.
+   *
+   * This is the general route-leak fix (M4): `removeRoute` was never called
+   * in production, so routes accumulated on every stop/delete. Callers:
+   * `handleAppDeleted` (app:deleted — covers delete for every app), the
+   * explicit STOP handler (a stop doesn't go through app:deleted), and
+   * `teardownApp`/`removeGroup` (monorepo group teardown).
+   */
+  async removeRoutesForApp(owner: string): Promise<void> {
+    const keysToRemove: string[] = [];
+
+    for (const [key, route] of this.routes.entries()) {
+      if (route.owner === owner) {
+        keysToRemove.push(key);
+      }
+    }
+
+    if (keysToRemove.length === 0) return;
+
+    for (const key of keysToRemove) {
+      const route = this.routes.get(key);
+      this.routes.delete(key);
+
+      if (route) {
+        eventBus.publish('route:removed' as never, {
+          appName: key,
+          hostname: route.hostname,
+          action: 'remove',
+        } as never);
+      }
+    }
+
+    // Regenerate and reload Caddy ONCE for the whole batch.
+    await this.regenerateConfig();
+  }
+
+  /**
    * Update an existing route
    */
   async updateRoute(appName: string, updates: Partial<RouteConfig>): Promise<Route> {

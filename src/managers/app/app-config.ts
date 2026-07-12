@@ -46,6 +46,14 @@ export interface AppConfig {
    * See docs/plans/2026-07-11-scoped-provisioning-token.md.
    */
   grantedApiScopes?: string[];
+  /**
+   * Grouping tag for apps expanded from a single monorepo deploy (e.g. a repo
+   * `ezsign` with `services: {backend, frontend}` expands to apps
+   * `ezsign-backend` / `ezsign-frontend`, both tagged `group: ezsign`). Lets
+   * lifecycle ops and the dashboard relate sibling apps. Absent for ordinary
+   * standalone apps. See docs/plans/2026-07-12-monorepo-multi-service.md (M2).
+   */
+  group?: string;
 }
 
 export interface AppConfigServiceOptions {

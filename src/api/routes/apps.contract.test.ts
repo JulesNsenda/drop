@@ -149,6 +149,21 @@ describe('GET /api/v1/apps/:name DTO contract', () => {
     expect(body.data.name).toBe('test-app');
     expect(body.data.memory).toBeUndefined();
   });
+
+  it('omits group for a standalone app (M4)', async () => {
+    const res = await hono.request('/api/v1/apps/test-app', { headers: authHeader(adminToken) });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { data: Record<string, unknown> };
+    expect(body.data.group).toBeUndefined();
+  });
+
+  it('exposes group for an app expanded from a monorepo deploy (M4)', async () => {
+    await getStateManager().updateApp('test-app', { group: 'ezsign' });
+    const res = await hono.request('/api/v1/apps/test-app', { headers: authHeader(adminToken) });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { data: Record<string, unknown> };
+    expect(body.data.group).toBe('ezsign');
+  });
 });
 
 describe('GET /api/v1/apps list DTO contract', () => {

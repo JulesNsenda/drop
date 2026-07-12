@@ -18,6 +18,8 @@ import * as runtimeModule from '../../managers/runtime';
 import type { AppRuntime } from '../../managers/runtime';
 import * as databaseModule from '../../managers/database';
 import type { DatabaseProvisioner } from '../../managers/database';
+import * as routerModule from '../../core/router';
+import { setPlatformOps, resetPlatformOps, PlatformOps } from '../platform-ops';
 
 function makeMockRuntime(): AppRuntime {
   return {
@@ -125,5 +127,240 @@ describe('DELETE /api/v1/apps/:name — database teardown', () => {
     const body = (await res.json()) as { data: { database: string } };
     expect(body.data.database).toBe('retained');
     expect(getStateManager().getApp('db-app')).toBeUndefined();
+  });
+});
+
+describe('DELETE /api/v1/apps/:name — group-aware (M4)', () => {
+  let tempDir: string;
+  let server: ApiServer;
+  let hono: ReturnType<ApiServer['getApp']>;
+  let ownerToken: string;
+  let ownerId: string;
+  let removeGroup: jest.Mock;
+
+  const authHeader = (token: string) => ({ Authorization: `Bearer ${token}` });
+
+  function makeOps(overrides?: Partial<PlatformOps>): PlatformOps {
+    return {
+      restartApp: jest.fn(),
+      isAppInProgress: jest.fn().mockReturnValue(false),
+      removeGroup: jest.fn().mockResolvedValue({ removed: [] }),
+      ...overrides,
+    };
+  }
+
+  beforeEach(async () => {
+    tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'drop-delete-group-test-'));
+    jest.spyOn(console, 'log').mockImplementation();
+    jest.spyOn(console, 'warn').mockImplementation();
+
+    resetStateManager();
+    resetAuth();
+    resetPlatformOps();
+    getStateManager({ stateFilePath: path.join(tempDir, 'apps.json') });
+
+    jest.spyOn(runtimeModule, 'getAppRuntime').mockReturnValue(makeMockRuntime());
+    jest.spyOn(databaseModule, 'getDatabaseProvisioner').mockReturnValue({
+      backupAndDeleteAppDatabase: jest.fn().mockResolvedValue({ dropped: true }),
+    } as unknown as DatabaseProvisioner);
+
+    server = new ApiServer({
+      port: 3099,
+      enableAuth: true,
+      credentialsPath: path.join(tempDir, 'credentials.json'),
+      appsDirectory: path.join(tempDir, 'webapps'),
+    });
+    await server.initialize();
+    hono = server.getApp();
+
+    const owner = await createUser('group-owner', 'password123', 'user');
+    ownerId = owner.id;
+    ownerToken = await getTestToken('group-owner', 'password123');
+
+    removeGroup = jest.fn().mockResolvedValue({ removed: ['grp-backend', 'grp-frontend'] });
+
+    const sm = getStateManager();
+    await sm.registerApp('grp-backend', path.join(tempDir, 'webapps', 'grp-backend'));
+    await sm.updateApp('grp-backend', { userId: ownerId, group: 'grp' });
+    await sm.registerApp('grp-frontend', path.join(tempDir, 'webapps', 'grp-frontend'));
+    await sm.updateApp('grp-frontend', { userId: ownerId, group: 'grp' });
+  });
+
+  afterEach(async () => {
+    if (server) await server.stop();
+    await getStateManager().close();
+    resetStateManager();
+    resetPlatformOps();
+    jest.restoreAllMocks();
+    await fs.rm(tempDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  });
+
+  it('404s when neither an app nor a group with that name exists', async () => {
+    setPlatformOps(makeOps({ removeGroup }));
+
+    const res = await hono.request('/api/v1/apps/does-not-exist', {
+      method: 'DELETE',
+      headers: authHeader(ownerToken),
+    });
+
+    expect(res.status).toBe(404);
+    expect(removeGroup).not.toHaveBeenCalled();
+  });
+
+  it('tears down the whole group via platformOps.removeGroup when :name matches no app but a group', async () => {
+    setPlatformOps(makeOps({ removeGroup }));
+
+    const res = await hono.request('/api/v1/apps/grp', {
+      method: 'DELETE',
+      headers: authHeader(ownerToken),
+    });
+
+    expect(res.status).toBe(200);
+    expect(removeGroup).toHaveBeenCalledWith('grp');
+    const body = (await res.json()) as { data: { removed: string[] } };
+    expect(body.data.removed.sort()).toEqual(['grp-backend', 'grp-frontend']);
+  });
+
+  it('503s the group branch when platform ops is unavailable', async () => {
+    // Deliberately not calling setPlatformOps — mirrors a standalone ApiServer.
+    const res = await hono.request('/api/v1/apps/grp', {
+      method: 'DELETE',
+      headers: authHeader(ownerToken),
+    });
+
+    expect(res.status).toBe(503);
+  });
+
+  it('404s the group delete when not every child is owned by the requester (IDOR guard)', async () => {
+    setPlatformOps(makeOps({ removeGroup }));
+
+    // A second child of the SAME group, owned by someone else.
+    const otherOwner = await createUser('other-owner', 'password123', 'user');
+    const sm = getStateManager();
+    await sm.registerApp('grp-extra', path.join(tempDir, 'webapps', 'grp-extra'));
+    await sm.updateApp('grp-extra', { userId: otherOwner.id, group: 'grp' });
+
+    const res = await hono.request('/api/v1/apps/grp', {
+      method: 'DELETE',
+      headers: authHeader(ownerToken),
+    });
+
+    expect(res.status).toBe(404);
+    expect(removeGroup).not.toHaveBeenCalled();
+  });
+
+  it('removes the group container folder when the deleted app was the LAST remaining child', async () => {
+    setPlatformOps(makeOps({ removeGroup }));
+    // `fs/promises` is a built-in ESM namespace here — its properties aren't
+    // configurable, so `jest.spyOn(fs, 'rm')` throws. Assert the real,
+    // observable effect (the container folder is actually gone) instead.
+    const containerDir = path.join(tempDir, 'webapps', 'grp');
+    await fs.mkdir(containerDir, { recursive: true });
+    await fs.writeFile(path.join(containerDir, 'drop.yaml'), 'services:\n  backend: {}\n  frontend: {}\n');
+
+    // Delete grp-backend first — grp-frontend is still around, so no cleanup yet.
+    await hono.request('/api/v1/apps/grp-backend', {
+      method: 'DELETE',
+      headers: authHeader(ownerToken),
+    });
+    await expect(fs.access(containerDir)).resolves.toBeUndefined();
+
+    // Now delete the LAST remaining child.
+    const res = await hono.request('/api/v1/apps/grp-frontend', {
+      method: 'DELETE',
+      headers: authHeader(ownerToken),
+    });
+
+    expect(res.status).toBe(200);
+    await expect(fs.access(containerDir)).rejects.toThrow();
+  });
+
+  it('does NOT remove the group container folder while siblings remain', async () => {
+    setPlatformOps(makeOps({ removeGroup }));
+    const containerDir = path.join(tempDir, 'webapps', 'grp');
+    await fs.mkdir(containerDir, { recursive: true });
+    await fs.writeFile(path.join(containerDir, 'drop.yaml'), 'services:\n  backend: {}\n  frontend: {}\n');
+
+    const res = await hono.request('/api/v1/apps/grp-backend', {
+      method: 'DELETE',
+      headers: authHeader(ownerToken),
+    });
+
+    expect(res.status).toBe(200);
+    await expect(fs.access(containerDir)).resolves.toBeUndefined();
+  });
+});
+
+describe('POST /api/v1/apps/:name/stop — route cleanup (M4: route-leak fix)', () => {
+  let tempDir: string;
+  let server: ApiServer;
+  let hono: ReturnType<ApiServer['getApp']>;
+  let ownerToken: string;
+  let ownerId: string;
+  let removeRoutesForApp: jest.Mock;
+
+  const authHeader = (token: string) => ({ Authorization: `Bearer ${token}` });
+
+  beforeEach(async () => {
+    tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'drop-stop-route-test-'));
+    jest.spyOn(console, 'log').mockImplementation();
+    jest.spyOn(console, 'warn').mockImplementation();
+
+    resetStateManager();
+    resetAuth();
+    getStateManager({ stateFilePath: path.join(tempDir, 'apps.json') });
+
+    jest.spyOn(runtimeModule, 'getAppRuntime').mockReturnValue(makeMockRuntime());
+
+    removeRoutesForApp = jest.fn().mockResolvedValue(undefined);
+    jest.spyOn(routerModule, 'getRouterService').mockReturnValue({
+      removeRoutesForApp,
+    } as unknown as ReturnType<typeof routerModule.getRouterService>);
+
+    server = new ApiServer({
+      port: 3097,
+      enableAuth: true,
+      credentialsPath: path.join(tempDir, 'credentials.json'),
+    });
+    await server.initialize();
+    hono = server.getApp();
+
+    const owner = await createUser('stop-owner', 'password123', 'user');
+    ownerId = owner.id;
+    ownerToken = await getTestToken('stop-owner', 'password123');
+
+    const sm = getStateManager();
+    await sm.registerApp('stop-app', path.join(tempDir, 'stop-app'));
+    await sm.updateApp('stop-app', { userId: ownerId });
+  });
+
+  afterEach(async () => {
+    if (server) await server.stop();
+    await getStateManager().close();
+    resetStateManager();
+    jest.restoreAllMocks();
+    await fs.rm(tempDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  });
+
+  it('removes the app Caddy routes after stopping', async () => {
+    const res = await hono.request('/api/v1/apps/stop-app/stop', {
+      method: 'POST',
+      headers: authHeader(ownerToken),
+    });
+
+    expect(res.status).toBe(200);
+    expect(removeRoutesForApp).toHaveBeenCalledWith('stop-app');
+  });
+
+  it('still stops successfully (non-fatal) when route removal throws', async () => {
+    removeRoutesForApp.mockRejectedValueOnce(new Error('caddy unreachable'));
+
+    const res = await hono.request('/api/v1/apps/stop-app/stop', {
+      method: 'POST',
+      headers: authHeader(ownerToken),
+    });
+
+    expect(res.status).toBe(200);
+    expect(removeRoutesForApp).toHaveBeenCalledWith('stop-app');
   });
 });

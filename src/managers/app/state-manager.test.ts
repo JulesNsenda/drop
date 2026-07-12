@@ -335,6 +335,37 @@ describe('AppStateManager', () => {
     });
   });
 
+  describe('group field (M2 monorepo expansion tagging)', () => {
+    beforeEach(async () => {
+      await manager.initialize();
+      await manager.registerApp('ezsign-backend', '/path', 'nodejs');
+    });
+
+    it('persists a group set via updateApp', async () => {
+      const updated = await manager.updateApp('ezsign-backend', { group: 'ezsign' });
+
+      expect(updated).not.toBeNull();
+      expect(updated!.group).toBe('ezsign');
+    });
+
+    it('round-trips group through a reload from disk', async () => {
+      await manager.updateApp('ezsign-backend', { group: 'ezsign' });
+      await manager.close();
+
+      const manager2 = new AppStateManager({ stateFilePath });
+      await manager2.initialize();
+
+      expect(manager2.getApp('ezsign-backend')?.group).toBe('ezsign');
+
+      await manager2.close();
+    });
+
+    it('leaves group undefined for apps that never had one set (backward-compat)', async () => {
+      const app = manager.getApp('ezsign-backend');
+      expect(app?.group).toBeUndefined();
+    });
+  });
+
   describe('persistence', () => {
     it('should persist state to file', async () => {
       await manager.initialize();

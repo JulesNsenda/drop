@@ -7,9 +7,10 @@
 
 import * as path from 'path';
 import * as fs from 'fs/promises';
+import * as yaml from 'yaml';
 import { EventBus, eventBus, Unsubscribe, AppDeletedPayload } from './event-bus';
 import { WatcherService } from './watcher';
-import { DetectorService, getDetector, parseDropYaml, DetectionResult } from './detector';
+import { DetectorService, getDetector, parseDropYaml, DetectionResult, DropYamlConfig } from './detector';
 import { BuilderService, getBuilder } from './builder';
 import { RouterService, getRouterService, resetRouterService } from './router';
 import { AppRuntime, AppProcessInfo, AppStartSpec, getAppRuntime, resetAppRuntime } from '../managers/runtime';
@@ -999,6 +1000,7 @@ backup:
     setPlatformOps({
       restartApp: (name) => this.restartApp(name),
       isAppInProgress: (name) => this.appsInProgress.has(name),
+      removeGroup: (name) => this.removeGroup(name),
     });
 
     this.logger.info(`API server running on port ${this.config.apiPort}`, 'API');
@@ -1128,6 +1130,17 @@ backup:
       // isCloning guard above: don't let the watcher onboard mid-upload.
       if (this.uploadDeployService?.isUploading(payload.name)) return;
 
+      // Monorepo interception (M2): a root drop.yaml with a `services:` map
+      // describes a group container, never a single app. Materialize each
+      // declared service as its own top-level sibling app and skip the
+      // normal single-app onboarding below for the container folder itself.
+      const rootYaml = await parseDropYaml(payload.path);
+      if (rootYaml.success && rootYaml.config?.services && Object.keys(rootYaml.config.services).length > 0) {
+        this.watcher?.markAppKnown(payload.name);
+        await this.expandMonorepo(payload.path, payload.name, rootYaml.config);
+        return;
+      }
+
       // Tell the watcher this app is known regardless of who published the
       // detection (git deploy publishes deterministically after a clone) —
       // otherwise the watcher's own debounced flush would emit a duplicate
@@ -1228,24 +1241,42 @@ backup:
     // fires from the watcher's chokidar unlinkDir handler (a folder momentarily
     // vanishing, e.g. mid-redeploy) and would free a live/just-redeployed app's
     // port out from under it. See docs/plans/2026-07-07-p2-5-disk-and-port-guards.md.
-    const deletedSub = this.eventBus.subscribe('app:deleted', (payload) => {
-      this.handleAppDeleted(payload);
+    const deletedSub = this.eventBus.subscribe('app:deleted', async (payload) => {
+      await this.handleAppDeleted(payload);
     });
     this.subscriptions.push(deletedSub);
   }
 
   /**
-   * Release every port owned by a deleted app. Reverse-lookup over
-   * `usedPorts` (Map<port, appName>) rather than a single stored port,
-   * because the map is the only place ownership is tracked. Excludes the
-   * '__anonymous__' sentinel, which never corresponds to a real app name.
+   * Release every port owned by a deleted app, and remove any Caddy routes
+   * it still owns. Reverse-lookup over `usedPorts` (Map<port, appName>)
+   * rather than a single stored port, because the map is the only place
+   * ownership is tracked. Excludes the '__anonymous__' sentinel, which never
+   * corresponds to a real app name.
+   *
+   * Route removal is the general fix for M4's route-leak: `app:deleted` is
+   * published by every `stateManager.removeApp` call (the only production
+   * call site is the DELETE /apps/:name route, including via
+   * `teardownApp`/`removeGroup`'s own explicit — and here, redundant but
+   * harmless — removal), so hooking it here covers deletion universally, not
+   * just the paths that happen to also call `removeRoutesForApp` directly.
    */
-  private handleAppDeleted(payload: AppDeletedPayload): void {
+  private async handleAppDeleted(payload: AppDeletedPayload): Promise<void> {
     for (const [port, owner] of this.usedPorts.entries()) {
       if (owner === payload.name && owner !== '__anonymous__') {
         this.usedPorts.delete(port);
         this.logger.debug(`Released port ${port} for deleted app ${payload.name}`, 'PORT');
       }
+    }
+
+    try {
+      await this.router?.removeRoutesForApp(payload.appId);
+    } catch (err) {
+      this.logger.warn(
+        `Failed to remove routes for deleted app ${payload.appId}`,
+        'ROUTER',
+        err
+      );
     }
   }
 
@@ -1296,53 +1327,126 @@ backup:
   }
 
   /**
-   * Parse drop.yaml and resolve depends_on to get dependency URLs
-   * Returns environment variables to inject based on dependent apps
+   * Parse drop.yaml and resolve depends_on to get dependency URLs.
+   * Returns environment variables to inject based on dependent apps.
+   *
+   * Resolution is config-based (via appConfigService.getConfig), NOT the
+   * running app's runtime port — a dependency need only be REGISTERED, not
+   * running, for this to resolve, which removes build-ordering. It also
+   * means the URL is browser-reachable (hostname-based) whenever the
+   * dependency has a custom domain or the platform serves a real domain
+   * suffix, instead of always being a server-local `localhost:<port>` that a
+   * browser can never reach.
    */
   private async resolveDependencies(appPath: string, appName: string): Promise<Record<string, string>> {
     const envVars: Record<string, string> = {};
 
-    try {
-      const dropYamlPath = path.join(appPath, 'drop.yaml');
-      await fs.access(dropYamlPath);
+    const dropYaml = await parseDropYaml(appPath);
+    if (!dropYaml.success || !dropYaml.config?.depends_on?.length) {
+      return envVars;
+    }
 
-      const content = await fs.readFile(dropYamlPath, 'utf-8');
-
-      // Simple YAML parsing for depends_on section
-      // Format:
-      // depends_on:
-      //   - name: todo-api
-      //     env: API_URL
-      const dependsOnMatch = content.match(/depends_on:\s*\n((?:\s+-[^\n]+\n?)+)/);
-      if (!dependsOnMatch) return envVars;
-
-      const dependsOnBlock = dependsOnMatch[1];
-      const dependencies: Array<{ name: string; env: string }> = [];
-
-      // Parse each dependency
-      const depMatches = dependsOnBlock.matchAll(/-\s*name:\s*(\S+)\s*\n\s*env:\s*(\S+)/g);
-      for (const match of depMatches) {
-        dependencies.push({ name: match[1], env: match[2] });
+    for (const dep of dropYaml.config.depends_on) {
+      const baseUrl = this.resolveDependencyUrl(dep.name);
+      if (!baseUrl) {
+        this.logger.warn(`Dependency ${dep.name} not found or not configured for ${appName}`, 'DEPS');
+        continue;
       }
 
-      // Resolve each dependency
-      for (const dep of dependencies) {
-        if (!this.stateManager) continue;
-
-        const depApp = this.stateManager.getApp(dep.name);
-        if (depApp && depApp.port) {
-          const url = `http://localhost:${depApp.port}`;
-          envVars[dep.env] = url;
-          this.logger.info(`Resolved dependency ${dep.name} -> ${dep.env}=${url}`, 'DEPS');
-        } else {
-          this.logger.warn(`Dependency ${dep.name} not found or not running for ${appName}`, 'DEPS');
-        }
-      }
-    } catch {
-      // No drop.yaml or parsing error - not a problem
+      const url = dep.path ? this.joinDependencyUrlPath(baseUrl, dep.path) : baseUrl;
+      envVars[dep.env] = url;
+      this.logger.info(`Resolved dependency ${dep.name} -> ${dep.env}=${url}`, 'DEPS');
     }
 
     return envVars;
+  }
+
+  /**
+   * Resolve the browser-reachable base URL for a registered dependency app,
+   * from its persisted config — never the runtime/state-manager port.
+   *
+   * Precedence:
+   * 1. The dependency's own custom domain (drop.yaml `domains`), if set.
+   * 2. The platform's default hostname for the app (`<dep>.<domainSuffix>`),
+   *    whenever a real (non-localhost) domain suffix is configured — this is
+   *    the same hostname handleConfigureRoute always registers a route for,
+   *    regardless of `enableHttps` (which only toggles TLS on that route, so
+   *    protocol - not existence - is what depends on it).
+   * 3. `http://localhost:<port>` as the pure-local-dev fallback, using the
+   *    dependency's *configured* port (source of truth across restarts).
+   *
+   * Returns undefined when the dependency has no config at all (unknown /
+   * not yet registered) or no fallback is resolvable.
+   */
+  private resolveDependencyUrl(depName: string): string | undefined {
+    const depConfig = this.appConfigService?.getConfig(depName);
+    if (!depConfig) return undefined;
+
+    const domainSuffix = this.config.domainSuffix || 'localhost';
+
+    const customDomain =
+      depConfig.domains && depConfig.domains.length > 0 ? depConfig.domains[0] : undefined;
+    if (customDomain) {
+      const protocol = this.config.enableHttps && !isLocalhostDomain(customDomain) ? 'https' : 'http';
+      return `${protocol}://${customDomain}`;
+    }
+
+    if (!isLocalhostDomain(domainSuffix)) {
+      const protocol = this.config.enableHttps ? 'https' : 'http';
+      return `${protocol}://${depName}.${domainSuffix}`;
+    }
+
+    if (depConfig.port) {
+      return `http://localhost:${depConfig.port}`;
+    }
+
+    return undefined;
+  }
+
+  /** Append a drop.yaml dependency `path` to a resolved base URL, normalizing slashes. */
+  private joinDependencyUrlPath(baseUrl: string, depPath: string): string {
+    const base = baseUrl.replace(/\/+$/, '');
+    const suffix = depPath.startsWith('/') ? depPath : `/${depPath}`;
+    return `${base}${suffix}`;
+  }
+
+  /**
+   * Build the env map handed to the builder's child process for a fresh
+   * build (handleBuildApp) or a hot-reload rebuild (handleAppUpdate). Shared
+   * so the two call sites can't drift.
+   *
+   * Precedence (later wins): drop.yaml `env` (runtime env, also usable at
+   * build time) -> drop.yaml `build_env` (build-only, e.g. Vite `VITE_*`
+   * vars a static bundler inlines) -> resolved `depends_on` URLs (highest
+   * precedence — a build must always see the current, browser-reachable
+   * dependency URL, not a stale build-time default).
+   *
+   * All values are coerced to strings: drop.yaml allows number/boolean
+   * scalars, but a child process env must be `Record<string, string>`.
+   */
+  private async resolveBuildEnv(appPath: string, appName: string): Promise<Record<string, string>> {
+    const dropYaml = await parseDropYaml(appPath);
+    const config = dropYaml.success ? dropYaml.config : null;
+
+    const depEnvVars = await this.resolveDependencies(appPath, appName);
+
+    return {
+      ...this.coerceEnvRecord(config?.env),
+      ...this.coerceEnvRecord(config?.build_env),
+      ...depEnvVars,
+    };
+  }
+
+  /** Coerce drop.yaml's string|number|boolean env scalars to plain strings. */
+  private coerceEnvRecord(
+    rec?: Record<string, string | number | boolean>
+  ): Record<string, string> {
+    if (!rec) return {};
+    const out: Record<string, string> = {};
+    for (const [key, value] of Object.entries(rec)) {
+      out[key] = String(value);
+    }
+    return out;
   }
 
   /**
@@ -1359,6 +1463,183 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     const configPath = path.join(appPath, 'drop-config.js');
     await fs.writeFile(configPath, configContent);
     this.logger.info(`Generated drop-config.js for static app`, 'DEPS');
+  }
+
+  /**
+   * Matches path segments 'node_modules', '.git', 'dist', or 'build' anywhere
+   * in a path, bounded by path separators (or string start/end) so real
+   * prefixes like 'distribution/' aren't accidentally excluded.
+   */
+  private static readonly MONOREPO_COPY_EXCLUDE_RE = /(^|[\\/])(node_modules|\.git|dist|build)([\\/]|$)/;
+
+  /**
+   * Expand a monorepo container (a repo whose root drop.yaml declares a
+   * `services:` map) into N ordinary top-level DROP apps — one per service.
+   *
+   * Fork C (docs/plans/2026-07-12-monorepo-multi-service.md, M2): each
+   * service's subtree is copied into its own top-level `webapps/<group>-<svc>`
+   * folder and onboarded exactly like any other single-app deploy, so the
+   * `appName == top-level-folder-name` invariant that the rest of the
+   * platform relies on (reconciliation, DELETE, hot-reload) is preserved.
+   * The container folder itself (`repoPath`) is never onboarded as an app.
+   *
+   * Idempotent: safe to re-run on every redeploy of the container (git pull /
+   * re-upload re-emits `app:detected`) — each service's folder is fully
+   * replaced (remove-then-copy) and its config/state are upserted, not
+   * duplicated.
+   */
+  private async expandMonorepo(
+    repoPath: string,
+    repoName: string,
+    config: DropYamlConfig
+  ): Promise<void> {
+    const group = (config.group || config.name || repoName).trim();
+    const services = config.services ?? {};
+    const serviceNames = new Set(Object.keys(services));
+
+    if (serviceNames.size > this.config.maxConcurrentBuilds) {
+      this.logger.warn(
+        `Monorepo group '${group}' declares ${serviceNames.size} services, which exceeds ` +
+          `maxConcurrentBuilds (${this.config.maxConcurrentBuilds}); services beyond the cap ` +
+          `will be deferred by the build queue ("Build queue full") rather than built immediately`,
+        'MONOREPO'
+      );
+    }
+
+    for (const [svcName, svc] of Object.entries(services)) {
+      try {
+        const childName = `${group}-${svcName}`;
+        if (!/^[a-zA-Z0-9_-]+$/.test(childName)) {
+          this.logger.warn(
+            `Skipping service '${svcName}' in monorepo group '${group}': derived app name ` +
+              `'${childName}' contains characters outside [a-zA-Z0-9_-]`,
+            'MONOREPO'
+          );
+          continue;
+        }
+
+        // Collision guard: refuse to clobber a standalone app (or an app from
+        // a different group) that already owns this name. Allow refresh when
+        // the existing config already belongs to this same group (redeploy).
+        const existing = this.appConfigService?.getConfig(childName);
+        if (existing && existing.group !== group) {
+          this.logger.warn(
+            `Skipping service '${svcName}': app '${childName}' already exists and does not ` +
+              `belong to monorepo group '${group}'`,
+            'MONOREPO'
+          );
+          continue;
+        }
+
+        const srcDir = path.join(repoPath, svc.path);
+        try {
+          const st = await fs.stat(srcDir);
+          if (!st.isDirectory()) {
+            this.logger.warn(
+              `Skipping service '${svcName}': '${svc.path}' in '${repoName}' is not a directory`,
+              'MONOREPO'
+            );
+            continue;
+          }
+        } catch {
+          this.logger.warn(
+            `Skipping service '${svcName}': path '${svc.path}' does not exist in '${repoName}'`,
+            'MONOREPO'
+          );
+          continue;
+        }
+
+        const childPath = path.join(this.config.appsDirectory, childName);
+
+        // Suppress the watcher's own onboarding of the folder we're about to
+        // write — we onboard it ourselves below, same as the interception
+        // above does for the container.
+        this.watcher?.markAppKnown(childName);
+
+        // Materialize (idempotent): drop any previous copy, then copy fresh,
+        // excluding node_modules/.git/dist/build so redeploys stay cheap and
+        // don't duplicate installed dependencies or build output.
+        await fs.rm(childPath, { recursive: true, force: true });
+        await fs.cp(srcDir, childPath, {
+          recursive: true,
+          force: true,
+          filter: (src: string) => !DropPlatform.MONOREPO_COPY_EXCLUDE_RE.test(src),
+        });
+
+        // Resolve type: honor an explicit override, else detect from the
+        // freshly copied subtree (the real source — the generated child
+        // drop.yaml written below doesn't exist yet at detection time). If
+        // the source subtree itself carries its own drop.yaml, it was copied
+        // above and gets overwritten by the generated one next.
+        let childType = svc.type;
+        if (!childType && this.detector) {
+          const det = await this.detector.detect(childPath, { silent: true });
+          childType = det.type;
+        }
+        childType = childType || 'static';
+
+        // Rewrite depends_on so a dependency naming a sibling service resolves
+        // to that sibling's real, group-qualified child app name. Dependencies
+        // on apps outside this group are left unchanged.
+        const dependsOn = svc.depends_on?.map(dep =>
+          serviceNames.has(dep.name) ? { ...dep, name: `${group}-${dep.name}` } : dep
+        );
+
+        // M3: `route` (services.<svc>.route) is now a top-level allowed key,
+        // so it is written into the child drop.yaml and applied by
+        // handleConfigureRoute as a same-origin Caddy path prefix (frontend at
+        // `/`, backend at `/api`).
+        const childConfig: DropYamlConfig = {
+          name: childName,
+          type: childType,
+          ...(svc.database ? { database: svc.database } : {}),
+          ...(svc.domains && svc.domains.length > 0 ? { domains: svc.domains } : {}),
+          ...(svc.env ? { env: svc.env } : {}),
+          ...(svc.build_env ? { build_env: svc.build_env } : {}),
+          ...(svc.healthCheck ? { healthCheck: svc.healthCheck } : {}),
+          ...(svc.build ? { build: svc.build } : {}),
+          ...(svc.start ? { start: svc.start } : {}),
+          ...(svc.route ? { route: svc.route } : {}),
+          ...(dependsOn && dependsOn.length > 0 ? { depends_on: dependsOn } : {}),
+        };
+        await fs.writeFile(path.join(childPath, 'drop.yaml'), yaml.stringify(childConfig));
+
+        // Same narrowing cast the normal onboarding path (detectedSub) and
+        // handleBuildApp already use: the detector's AppType is wider than
+        // the stored config/state runtime union.
+        const narrowedType = childType as 'nodejs' | 'python' | 'go' | 'static' | 'docker' | 'unknown';
+
+        if (this.appConfigService) {
+          await this.appConfigService.upsertConfig(childName, {
+            type: narrowedType,
+            path: childPath,
+            hostname: `${childName}.localhost`,
+            group,
+          });
+        }
+        if (this.stateManager) {
+          await this.stateManager.registerApp(childName, childPath, narrowedType);
+          await this.stateManager.updateApp(childName, { group });
+        }
+
+        // Sequential await: gives declared-order onboarding for the common
+        // small-N case and stays under maxConcurrentBuilds without needing a
+        // further file change to retrigger queued services (a single drop
+        // produces none). If a service is deferred by the "Build queue full"
+        // guard in handleBuildApp, it is not silently lost — the warning above
+        // flags oversized groups — but it also won't auto-retrigger; that's
+        // acceptable for the common small-N case and left for a future pass.
+        if (this.config.autoBuild) {
+          await this.handleBuildApp(childPath, childName, childType);
+        }
+      } catch (error) {
+        this.logger.error(
+          `Failed to expand service '${svcName}' in monorepo group '${group}': ` +
+            `${error instanceof Error ? error.message : String(error)}`,
+          'MONOREPO'
+        );
+      }
+    }
   }
 
   private async handleBuildApp(appPath: string, appName: string, _appType: string): Promise<void> {
@@ -1442,6 +1723,8 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         );
       }
 
+      const buildEnv = await this.resolveBuildEnv(appPath, appName);
+
       const result = await this.builder.build({
         appName,
         appPath,
@@ -1451,7 +1734,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           buildCommand: detection.suggestedConfig?.buildCommand,
           installCommand: detection.suggestedConfig?.installCommand,
         },
-        env: {},
+        env: buildEnv,
         workDir,
         execCommand,
         onBuildLog: logId && this.buildLogService
@@ -1652,6 +1935,36 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         }
       }
 
+      // Same-origin routing (M3): a monorepo child (a `group` in its config +
+      // a `route` in its drop.yaml) is routed onto the SHARED group hostname
+      // `<group>.<suffix>` at the route's path prefix — the frontend at `/`,
+      // the backend at `/api*`. The group hostname is a COMPUTED default (not a
+      // custom drop.yaml `domains` entry), so it bypasses the custom-domain
+      // ownership guard below; two children coexist because the backend carries
+      // a `/api*` prefix, making its Caddy site address differ from the
+      // frontend's root address (identical addresses would wedge Caddy's
+      // reload). A child that also declares custom `domains` opts out of this.
+      let routePathPrefix: string | undefined;
+      const appConfig = this.appConfigService?.getConfig(appName);
+      const routeCfg = dropYaml.success ? dropYaml.config?.route : undefined;
+      if (appConfig?.group && routeCfg && !hasCustomDomains) {
+        domains = [`${appConfig.group}.${domainSuffix}`];
+        const rp = routeCfg.path?.trim();
+        if (rp && rp !== '/') {
+          const prefix = (rp.startsWith('/') ? rp : `/${rp}`).replace(/\/+$/, '');
+          // Caddy site-address path matcher: `<host>/api*` matches `/api` and
+          // `/api/...`. No prefix stripping — the backend owns its `/api` path.
+          routePathPrefix = prefix.endsWith('*') ? prefix : `${prefix}*`;
+          if (routeCfg.strip) {
+            this.logger.warn(
+              `route.strip requested for ${appName} but prefix-stripping (Caddy handle_path) ` +
+                `is not yet supported; serving with the prefix preserved (the backend must own '${prefix}')`,
+              'ROUTER'
+            );
+          }
+        }
+      }
+
       // Cross-tenant hostname guard: reject any custom domain already claimed by
       // a *different* app before it reaches Caddy. Without this, a tenant's
       // drop.yaml could claim another app's hostname/domain and hijack its
@@ -1704,7 +2017,9 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
 
         await this.router.addRoute({
           appName: `${appName}-${hostname.replace(/\./g, '-')}`, // Unique route name per domain
+          owner: appName, // Bare owning app name — lets removeRoutesForApp find every route this app owns
           hostname,
+          ...(routePathPrefix ? { pathPrefix: routePathPrefix } : {}),
           upstream: `localhost:${port}`,
           ssl: enableSsl,
           redirectHttps: enableSsl,
@@ -1864,6 +2179,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       this.selfManagedUpdates.add(appName);
       let buildResult;
       try {
+        const buildEnv = await this.resolveBuildEnv(appPath, appName);
         buildResult = await this.builder.build({
           appName,
           appPath,
@@ -1873,7 +2189,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
             buildCommand: detection.suggestedConfig?.buildCommand,
             installCommand: detection.suggestedConfig?.installCommand,
           },
-          env: {},
+          env: buildEnv,
           workDir,
           onBuildLog: updateLogId && this.buildLogService
             ? (line) => this.buildLogService!.writeLine(updateLogId, line)
@@ -2087,6 +2403,134 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
   }
 
   /**
+   * Full app teardown — mirrors the steps DELETE /apps/:name performs
+   * (stop+delete the runtime process, remove Caddy routes, dump-then-drop
+   * the provisioned database unless `keepData`, remove state/secrets/deploy
+   * history/config, delete the generated folder). Used directly by
+   * `removeGroup` for each group child; the DELETE route itself keeps its
+   * own inline copy of these steps (not refactored to call this, to avoid
+   * risk to the working single-app delete path — see M4 plan).
+   *
+   * Every step is independently best-effort (try/catch) so one failing step
+   * (e.g. no provisioned database, PM2 already gone) never aborts the rest
+   * of the teardown.
+   */
+  private async teardownApp(name: string, opts: { keepData?: boolean } = {}): Promise<void> {
+    // Resolve the on-disk path BEFORE removing config/state — both are the
+    // only places it's recorded, and both get deleted below.
+    const appPath =
+      this.appConfigService?.getConfig(name)?.path ??
+      this.stateManager?.getApp(name)?.path ??
+      path.join(this.config.appsDirectory, name);
+
+    try {
+      await this.runtime?.stop(name);
+      await this.runtime?.delete(name);
+    } catch {
+      // Process might not exist in the runtime
+    }
+
+    // Explicit + deterministic: `stateManager.removeApp` below also triggers
+    // this via `app:deleted` -> `handleAppDeleted`, but that's fire-and-forget
+    // from this method's perspective. Calling it here directly means a caller
+    // awaiting `teardownApp` (e.g. `removeGroup`, before it removes the group
+    // container folder) knows routes are actually gone. The event-driven call
+    // that follows is a harmless no-op (removeRoutesForApp no-ops when there's
+    // nothing left to remove).
+    try {
+      await this.router?.removeRoutesForApp(name);
+    } catch (err) {
+      this.logger.warn(`Failed to remove routes for ${name}`, 'ROUTER', err);
+    }
+
+    if (!opts.keepData) {
+      try {
+        await this.dbProvisioner?.backupAndDeleteAppDatabase(name);
+      } catch (err) {
+        this.logger.warn(`Database teardown failed for ${name}`, 'DATABASE', err);
+      }
+    }
+
+    try {
+      await this.stateManager?.removeApp(name);
+    } catch (err) {
+      this.logger.warn(`Failed to remove state for ${name}`, 'STATE', err);
+    }
+
+    try {
+      await this.secretManager?.deleteAll(name);
+    } catch {
+      // Secret manager may not be initialised
+    }
+
+    try {
+      getDeployTracker().purgeApp(name);
+    } catch {
+      // Deploy tracker may not be initialised
+    }
+
+    try {
+      await this.appConfigService?.deleteConfig(name);
+    } catch {
+      // Config may not exist
+    }
+
+    try {
+      await fs.rm(appPath, { recursive: true, force: true });
+    } catch {
+      // Folder may already be gone
+    }
+  }
+
+  /**
+   * Tear down every app belonging to a monorepo group (M4): each child gets
+   * the full `teardownApp` treatment, then the group's CONTAINER folder
+   * (`webapps/<group>/`, which holds the root drop.yaml with `services:`) is
+   * removed too — otherwise it would regenerate the deleted children on the
+   * watcher's next scan. Per-child failures are isolated so one bad child
+   * doesn't abort teardown of the rest. Exposed to the API via the
+   * platform-ops seam (`removeGroup`).
+   */
+  async removeGroup(groupName: string): Promise<{ removed: string[] }> {
+    const children = this.stateManager?.getAllApps().filter((a) => a.group === groupName) ?? [];
+    const removed: string[] = [];
+
+    for (const child of children) {
+      try {
+        await this.teardownApp(child.name);
+        removed.push(child.name);
+      } catch (err) {
+        this.logger.error(
+          `Failed to tear down '${child.name}' in group '${groupName}'`,
+          'MONOREPO',
+          err
+        );
+      }
+    }
+
+    // Defense-in-depth before a recursive fs.rm: the container path is derived
+    // from a `group` tag. That tag is already transitively constrained to
+    // [A-Za-z0-9_-] (expandMonorepo only creates children whose `<group>-<svc>`
+    // name passes that regex), but re-assert it here so this destructive delete
+    // can never escape the webapps directory even if a group value is ever set
+    // by a future/other code path.
+    if (/^[a-zA-Z0-9_-]+$/.test(groupName)) {
+      try {
+        await fs.rm(path.join(this.config.appsDirectory, groupName), { recursive: true, force: true });
+      } catch (err) {
+        this.logger.warn(`Failed to remove group container folder for '${groupName}'`, 'MONOREPO', err);
+      }
+    } else {
+      this.logger.warn(
+        `Refusing to remove container folder for group '${groupName}': unsafe name`,
+        'MONOREPO'
+      );
+    }
+
+    return { removed };
+  }
+
+  /**
    * Return (and create) the scratch directory for a build's ephemeral
    * artifacts.  Lives at data/temp/{appName}/ — well outside the watched
    * webapps directory, so the watcher never sees build-context tarballs,
@@ -2296,6 +2740,13 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       pgSocketDir,
       limits,
       env: {
+        // drop.yaml `env` (tenant config) is the base layer — now injected at
+        // START as well as build, so `env:` is honored end-to-end. Placed
+        // FIRST so secrets and every platform-authoritative var (PORT,
+        // DROP_DATA_DIR, DROP_API_URL/KEY, DATABASE_URL) still override it and
+        // a tenant cannot hijack them. `build_env` is intentionally NOT
+        // injected here — it is build-only by design.
+        ...this.coerceEnvRecord(dropYaml.success ? dropYaml.config?.env : undefined),
         ...secretEnvVars,
         NODE_ENV: 'production',
         PORT: port.toString(),

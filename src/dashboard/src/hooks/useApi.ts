@@ -30,6 +30,8 @@ export interface App {
   userId?: string;
   ownerName?: string;
   customDomain?: string;
+  /** Monorepo group name (e.g. shared repo root) — apps sharing a group are siblings deployed from the same monorepo. */
+  group?: string;
   /** Live memory usage in bytes (from runtime; present only while status === 'running'). */
   memory?: number | null;
   /** Live CPU usage percent (from runtime; present only while status === 'running'). */

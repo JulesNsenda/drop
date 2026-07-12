@@ -77,6 +77,27 @@ describe('Drop YAML Parser', () => {
       expect(result.success).toBe(false);
       expect(result.error).toContain('Invalid domain');
     });
+
+    it('should parse build_env alongside env', async () => {
+      await fs.writeFile(
+        path.join(tmpDir, 'drop.yaml'),
+        'env:\n  NODE_ENV: production\nbuild_env:\n  VITE_API_URL: ""\n  VITE_PORT: 5173'
+      );
+      const result = await parseDropYaml(tmpDir);
+      expect(result.success).toBe(true);
+      expect(result.config?.env).toEqual({ NODE_ENV: 'production' });
+      expect(result.config?.build_env).toEqual({ VITE_API_URL: '', VITE_PORT: 5173 });
+    });
+
+    it('should reject invalid build_env values from a real file', async () => {
+      await fs.writeFile(
+        path.join(tmpDir, 'drop.yaml'),
+        'build_env:\n  BAD: [1, 2, 3]'
+      );
+      const result = await parseDropYaml(tmpDir);
+      expect(result.success).toBe(false);
+      expect(result.error).toContain('build_env.BAD');
+    });
   });
 
   describe('validateDropYamlConfig', () => {
@@ -104,6 +125,446 @@ describe('Drop YAML Parser', () => {
         depends_on: [{ name: 123 }],
       });
       expect(invalid.valid).toBe(false);
+    });
+
+    it('should accept build_env with string, number, and boolean values', () => {
+      const result = validateDropYamlConfig({
+        build_env: {
+          VITE_API_URL: '/api',
+          VITE_PORT: 5173,
+          VITE_DEBUG: true,
+        },
+      });
+      expect(result.valid).toBe(true);
+    });
+
+    it('should reject build_env that is not an object', () => {
+      expect(validateDropYamlConfig({ build_env: 'nope' }).valid).toBe(false);
+      expect(validateDropYamlConfig({ build_env: ['nope'] }).valid).toBe(false);
+    });
+
+    it('should reject build_env values of the wrong type', () => {
+      const result = validateDropYamlConfig({
+        build_env: { VITE_CONFIG: { nested: true } },
+      });
+      expect(result.valid).toBe(false);
+      expect(result.error).toContain('build_env.VITE_CONFIG');
+    });
+
+    it('should reject build_env with non-string keys via empty key', () => {
+      const result = validateDropYamlConfig({
+        build_env: { '': 'value' },
+      });
+      expect(result.valid).toBe(false);
+    });
+
+    it('should no longer reject build_env as an unknown top-level field', () => {
+      const result = validateDropYamlConfig({ build_env: { FOO: 'bar' } });
+      expect(result.valid).toBe(true);
+      expect(result.error).toBeUndefined();
+    });
+  });
+
+  describe('validateDropYamlConfig - group', () => {
+    it('should accept a valid non-empty group string', () => {
+      const result = validateDropYamlConfig({ group: 'ezsign' });
+      expect(result.valid).toBe(true);
+    });
+
+    it('should reject a non-string group', () => {
+      const result = validateDropYamlConfig({ group: 123 });
+      expect(result.valid).toBe(false);
+      expect(result.error).toContain('group');
+    });
+
+    it('should reject an empty-string group', () => {
+      const result = validateDropYamlConfig({ group: '' });
+      expect(result.valid).toBe(false);
+      expect(result.error).toContain('group');
+    });
+  });
+
+  describe('validateDropYamlConfig - services', () => {
+    it('should accept a valid services map with a single service', () => {
+      const result = validateDropYamlConfig({
+        group: 'ezsign',
+        services: {
+          backend: { path: 'backend' },
+        },
+      });
+      expect(result.valid).toBe(true);
+    });
+
+    it('should accept a realistic 2-service (backend + frontend) example', () => {
+      const result = validateDropYamlConfig({
+        name: 'ezsign',
+        group: 'ezsign',
+        services: {
+          backend: {
+            path: 'backend',
+            database: 'postgres',
+            healthCheck: '/api/health',
+            route: { path: '/api' },
+            env: { NODE_ENV: 'production' },
+            depends_on: [{ name: 'redis', env: 'REDIS_URL' }],
+          },
+          frontend: {
+            path: 'frontend',
+            type: 'static',
+            build_env: { VITE_API_URL: '' },
+            route: { path: '/' },
+            depends_on: [{ service: 'backend' }],
+          },
+        },
+      });
+      // depends_on entries require name+env; the frontend one above is
+      // deliberately malformed to prove per-service depends_on validation
+      // actually runs — assert it is rejected, then assert the well-formed
+      // version passes.
+      expect(result.valid).toBe(false);
+
+      const wellFormed = validateDropYamlConfig({
+        name: 'ezsign',
+        group: 'ezsign',
+        services: {
+          backend: {
+            path: 'backend',
+            database: 'postgres',
+            healthCheck: '/api/health',
+            route: { path: '/api' },
+            env: { NODE_ENV: 'production' },
+          },
+          frontend: {
+            path: 'frontend',
+            type: 'static',
+            build_env: { VITE_API_URL: '' },
+            route: { path: '/' },
+            depends_on: [{ name: 'backend', env: 'BACKEND_URL' }],
+          },
+        },
+      });
+      expect(wellFormed.valid).toBe(true);
+      expect(wellFormed.error).toBeUndefined();
+    });
+
+    it('should reject services that is not an object', () => {
+      expect(validateDropYamlConfig({ services: 'nope' }).valid).toBe(false);
+      expect(validateDropYamlConfig({ services: ['nope'] }).valid).toBe(false);
+    });
+
+    it('should reject an empty services map', () => {
+      const result = validateDropYamlConfig({ services: {} });
+      expect(result.valid).toBe(false);
+      expect(result.error).toContain('services');
+    });
+
+    it('should reject a service missing the required path field', () => {
+      const result = validateDropYamlConfig({
+        services: { backend: { type: 'nodejs' } },
+      });
+      expect(result.valid).toBe(false);
+      expect(result.error).toContain('services.backend.path');
+    });
+
+    it('should reject an empty-string path', () => {
+      const result = validateDropYamlConfig({
+        services: { backend: { path: '' } },
+      });
+      expect(result.valid).toBe(false);
+      expect(result.error).toContain('services.backend.path');
+    });
+
+    it('should reject an absolute service path', () => {
+      const result = validateDropYamlConfig({
+        services: { backend: { path: '/etc/passwd' } },
+      });
+      expect(result.valid).toBe(false);
+      expect(result.error).toContain('relative path');
+    });
+
+    it('should reject an absolute Windows-style service path', () => {
+      const result = validateDropYamlConfig({
+        services: { backend: { path: 'C:\\Windows\\System32' } },
+      });
+      expect(result.valid).toBe(false);
+      expect(result.error).toContain('relative path');
+    });
+
+    it('should reject a service path containing ".." traversal', () => {
+      const result = validateDropYamlConfig({
+        services: { backend: { path: '../../etc/passwd' } },
+      });
+      expect(result.valid).toBe(false);
+      expect(result.error).toContain('..');
+    });
+
+    it('should reject a bare ".." service path', () => {
+      const result = validateDropYamlConfig({
+        services: { backend: { path: '..' } },
+      });
+      expect(result.valid).toBe(false);
+    });
+
+    it('should reject a service path that escapes appPath when appPath is supplied', () => {
+      const result = validateDropYamlConfig(
+        { services: { backend: { path: 'backend/../../outside' } } },
+        path.join(os.tmpdir(), 'some-app-root')
+      );
+      expect(result.valid).toBe(false);
+    });
+
+    it('should accept a service path contained within appPath when supplied', () => {
+      const appPath = path.join(os.tmpdir(), 'some-app-root');
+      const result = validateDropYamlConfig(
+        { services: { backend: { path: 'backend' } } },
+        appPath
+      );
+      expect(result.valid).toBe(true);
+    });
+
+    it('should reject an unknown key in a service object', () => {
+      const result = validateDropYamlConfig({
+        services: { backend: { path: 'backend', bogus: true } },
+      });
+      expect(result.valid).toBe(false);
+      expect(result.error).toContain("services.backend.bogus");
+    });
+
+    it('should reject an unknown key in a service route object', () => {
+      const result = validateDropYamlConfig({
+        services: {
+          backend: { path: 'backend', route: { path: '/api', bogus: true } },
+        },
+      });
+      expect(result.valid).toBe(false);
+      expect(result.error).toContain('route.bogus');
+    });
+
+    it('should validate route.path and route.strip types', () => {
+      const badPath = validateDropYamlConfig({
+        services: { backend: { path: 'backend', route: { path: 123 } } },
+      });
+      expect(badPath.valid).toBe(false);
+
+      const badStrip = validateDropYamlConfig({
+        services: { backend: { path: 'backend', route: { strip: 'yes' } } },
+      });
+      expect(badStrip.valid).toBe(false);
+
+      const good = validateDropYamlConfig({
+        services: { backend: { path: 'backend', route: { path: '/api', strip: true } } },
+      });
+      expect(good.valid).toBe(true);
+    });
+
+    it('should reject an invalid service name', () => {
+      const result = validateDropYamlConfig({
+        services: { 'bad name!': { path: 'backend' } },
+      });
+      expect(result.valid).toBe(false);
+      expect(result.error).toContain('Invalid service name');
+    });
+
+    it('should accept service names with hyphens and underscores', () => {
+      const result = validateDropYamlConfig({
+        services: { 'my-service_1': { path: 'backend' } },
+      });
+      expect(result.valid).toBe(true);
+    });
+
+    it('should validate per-service env with the same rules as top-level env', () => {
+      const badType = validateDropYamlConfig({
+        services: { backend: { path: 'backend', env: { BAD: [1, 2] } } },
+      });
+      expect(badType.valid).toBe(false);
+      expect(badType.error).toContain('services.backend.env.BAD');
+
+      const good = validateDropYamlConfig({
+        services: {
+          backend: { path: 'backend', env: { NODE_ENV: 'production', PORT: 3001, DEBUG: false } },
+        },
+      });
+      expect(good.valid).toBe(true);
+    });
+
+    it('should validate per-service build_env with the same rules as top-level build_env', () => {
+      const badType = validateDropYamlConfig({
+        services: { frontend: { path: 'frontend', build_env: { BAD: { nested: true } } } },
+      });
+      expect(badType.valid).toBe(false);
+      expect(badType.error).toContain('services.frontend.build_env.BAD');
+
+      const good = validateDropYamlConfig({
+        services: { frontend: { path: 'frontend', build_env: { VITE_API_URL: '' } } },
+      });
+      expect(good.valid).toBe(true);
+    });
+
+    it('should validate per-service depends_on with the same rules as top-level depends_on', () => {
+      const badShape = validateDropYamlConfig({
+        services: {
+          frontend: { path: 'frontend', depends_on: [{ name: 123 }] },
+        },
+      });
+      expect(badShape.valid).toBe(false);
+
+      const missingEnv = validateDropYamlConfig({
+        services: {
+          frontend: { path: 'frontend', depends_on: [{ name: 'backend' }] },
+        },
+      });
+      expect(missingEnv.valid).toBe(false);
+
+      const good = validateDropYamlConfig({
+        services: {
+          frontend: {
+            path: 'frontend',
+            depends_on: [{ name: 'backend', env: 'BACKEND_URL' }],
+          },
+        },
+      });
+      expect(good.valid).toBe(true);
+    });
+
+    it('should validate per-service domains using the same domain rules', () => {
+      const bad = validateDropYamlConfig({
+        services: { backend: { path: 'backend', domains: ['not a domain!!'] } },
+      });
+      expect(bad.valid).toBe(false);
+      expect(bad.error).toContain('Invalid domain');
+
+      const good = validateDropYamlConfig({
+        services: { backend: { path: 'backend', domains: ['api.example.com'] } },
+      });
+      expect(good.valid).toBe(true);
+    });
+
+    it('should validate optional per-service string fields (type/build/start/healthCheck/database)', () => {
+      const bad = validateDropYamlConfig({
+        services: { backend: { path: 'backend', type: 123 } },
+      });
+      expect(bad.valid).toBe(false);
+      expect(bad.error).toContain('services.backend.type');
+
+      const good = validateDropYamlConfig({
+        services: {
+          backend: {
+            path: 'backend',
+            type: 'nodejs',
+            build: 'npm run build',
+            start: 'npm start',
+            healthCheck: '/health',
+            database: 'postgres',
+          },
+        },
+      });
+      expect(good.valid).toBe(true);
+    });
+  });
+
+  describe('validateDropYamlConfig - top-level route (M3: same-origin routing)', () => {
+    it('should accept a top-level route with just a path', () => {
+      const result = validateDropYamlConfig({ route: { path: '/api' } });
+      expect(result.valid).toBe(true);
+      expect(result.error).toBeUndefined();
+    });
+
+    it('should accept a top-level route with path and strip', () => {
+      const result = validateDropYamlConfig({ route: { path: '/api', strip: true } });
+      expect(result.valid).toBe(true);
+      expect(result.error).toBeUndefined();
+    });
+
+    it('should reject a top-level route.path that is not a string', () => {
+      const result = validateDropYamlConfig({ route: { path: 123 } });
+      expect(result.valid).toBe(false);
+      expect(result.error).toContain('route.path');
+    });
+
+    it('should reject a top-level route.strip that is not a boolean', () => {
+      const result = validateDropYamlConfig({ route: { strip: 'yes' } });
+      expect(result.valid).toBe(false);
+      expect(result.error).toContain('route.strip');
+    });
+
+    it('should reject an unknown field in the top-level route object', () => {
+      const result = validateDropYamlConfig({ route: { bogus: 1 } });
+      expect(result.valid).toBe(false);
+      expect(result.error).toContain('route.bogus');
+    });
+  });
+
+  describe('parseDropYaml - services (end-to-end)', () => {
+    it('should parse a valid multi-service drop.yaml from a real file', async () => {
+      await fs.writeFile(
+        path.join(tmpDir, 'drop.yaml'),
+        [
+          'name: ezsign',
+          'group: ezsign',
+          'services:',
+          '  backend:',
+          '    path: backend',
+          '    database: postgres',
+          '    healthCheck: /api/health',
+          '    route:',
+          '      path: /api',
+          '    env:',
+          '      NODE_ENV: production',
+          '  frontend:',
+          '    path: frontend',
+          '    type: static',
+          '    build_env:',
+          '      VITE_API_URL: ""',
+          '    route:',
+          '      path: /',
+          '    depends_on:',
+          '      - name: backend',
+          '        env: BACKEND_URL',
+          '',
+        ].join('\n')
+      );
+
+      const result = await parseDropYaml(tmpDir);
+      expect(result.success).toBe(true);
+      expect(result.config?.group).toBe('ezsign');
+      expect(result.config?.services?.backend.path).toBe('backend');
+      expect(result.config?.services?.backend.route?.path).toBe('/api');
+      expect(result.config?.services?.frontend.build_env).toEqual({ VITE_API_URL: '' });
+      expect(result.config?.services?.frontend.depends_on).toEqual([
+        { name: 'backend', env: 'BACKEND_URL' },
+      ]);
+    });
+
+    it('should reject a service path escaping the repo via a real file', async () => {
+      await fs.writeFile(
+        path.join(tmpDir, 'drop.yaml'),
+        'services:\n  backend:\n    path: ../../etc\n'
+      );
+      const result = await parseDropYaml(tmpDir);
+      expect(result.success).toBe(false);
+      expect(result.error).toBeDefined();
+    });
+  });
+
+  describe('parseDropYaml - top-level route (end-to-end)', () => {
+    it('should parse a valid top-level route from a real file', async () => {
+      await fs.writeFile(
+        path.join(tmpDir, 'drop.yaml'),
+        'name: ezsign-backend\nroute:\n  path: /api\n  strip: true\n'
+      );
+      const result = await parseDropYaml(tmpDir);
+      expect(result.success).toBe(true);
+      expect(result.config?.route).toEqual({ path: '/api', strip: true });
+    });
+
+    it('should reject an invalid top-level route from a real file', async () => {
+      await fs.writeFile(
+        path.join(tmpDir, 'drop.yaml'),
+        'route:\n  bogus: 1\n'
+      );
+      const result = await parseDropYaml(tmpDir);
+      expect(result.success).toBe(false);
+      expect(result.error).toContain('route.bogus');
     });
   });
 

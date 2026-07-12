@@ -11,12 +11,25 @@ import * as yaml from 'yaml';
 
 /** Keys accepted at the top level of drop.yaml. Any others are rejected. */
 const ALLOWED_TOP_KEYS = new Set([
-  'name', 'domains', 'tls', 'env', 'depends_on', 'port',
+  'name', 'domains', 'tls', 'env', 'build_env', 'depends_on', 'port',
   'build', 'start', 'healthCheck', 'maxBodySize', 'timeout',
+  'group', 'services', 'type', 'database', 'route',
 ]);
 
 /** Keys accepted under drop.yaml#tls */
 const ALLOWED_TLS_KEYS = new Set(['certFile', 'keyFile', 'disabled']);
+
+/** Keys accepted under a drop.yaml#services.<name> entry */
+const ALLOWED_SERVICE_KEYS = new Set([
+  'path', 'type', 'build', 'start', 'env', 'build_env', 'database',
+  'healthCheck', 'domains', 'depends_on', 'route',
+]);
+
+/** Keys accepted under a drop.yaml#services.<name>.route entry */
+const ALLOWED_ROUTE_KEYS = new Set(['path', 'strip']);
+
+/** Safe service name: letters, digits, hyphens, underscores only. */
+const SERVICE_NAME_REGEX = /^[a-zA-Z0-9_-]+$/;
 
 /**
  * Custom TLS configuration for an app
@@ -51,17 +64,75 @@ export interface AppDependency {
 }
 
 /**
+ * Route configuration for a service exposed on a shared (group) hostname.
+ * Consumed by M3 (same-origin `/api` routing) — parsed and stored now.
+ */
+export interface AppRouteConfig {
+  /** Path prefix this service is mounted under on the shared hostname (e.g. "/api") */
+  path?: string;
+  /** Whether the matched prefix should be stripped before proxying (default: false) */
+  strip?: boolean;
+}
+
+/**
+ * Configuration for a single service in a monorepo `services:` map.
+ */
+export interface ServiceConfig {
+  /** Subtree within the repo this service is materialized from (e.g. "backend") */
+  path: string;
+  /** Optional detector override (skips auto-detection) */
+  type?: string;
+  /** Build command override */
+  build?: string;
+  /** Start command override */
+  start?: string;
+  /** Environment variables (available at both build and start time) */
+  env?: AppEnvConfig;
+  /** Build-only environment variables (see DropYamlConfig.build_env) */
+  build_env?: AppEnvConfig;
+  /** Provision a database for this service only (e.g. "postgres") */
+  database?: string;
+  /** Health check path */
+  healthCheck?: string;
+  /** Custom domains for this service */
+  domains?: string[];
+  /** Service dependencies */
+  depends_on?: AppDependency[];
+  /** Routing configuration on the shared group hostname */
+  route?: AppRouteConfig;
+}
+
+/**
  * Drop YAML configuration for an app
  */
 export interface DropYamlConfig {
   /** App name override */
   name?: string;
+  /**
+   * App-type override (e.g. "nodejs", "static"). Accepted at the top level so
+   * a generated child `<group>-<service>` drop.yaml (and the existing
+   * drop-test fixtures) validate; consumed by the manifest detector, not the
+   * strict parser.
+   */
+  type?: string;
+  /**
+   * Database requirement (e.g. "postgres"). Accepted at the top level for the
+   * same reason as `type`; drives per-app DB provisioning via the detector.
+   */
+  database?: string;
   /** Custom domains for this app */
   domains?: string[];
   /** TLS configuration */
   tls?: AppTlsConfig;
-  /** Environment variables */
+  /** Environment variables (available at both build and start time) */
   env?: AppEnvConfig;
+  /**
+   * Build-only environment variables — merged into the build child process
+   * alongside `env`, but never injected into the running app at start time.
+   * Useful for values a static-site bundler inlines at build time (e.g.
+   * Vite's `VITE_*` vars) that shouldn't also linger in the runtime env.
+   */
+  build_env?: AppEnvConfig;
   /** App dependencies */
   depends_on?: AppDependency[];
   /** Port override */
@@ -76,6 +147,24 @@ export interface DropYamlConfig {
   maxBodySize?: string;
   /** Request timeout in seconds */
   timeout?: number;
+  /**
+   * Group name for a monorepo of multiple services. Defaults to `name`.
+   * Services sharing a group share a hostname (`<group>.<suffix>`).
+   */
+  group?: string;
+  /**
+   * Monorepo multi-service map. When present, the root drop.yaml describes a
+   * group container (never deployed as a single app) — each entry is
+   * materialized as its own top-level app (see M2 expansion).
+   */
+  services?: Record<string, ServiceConfig>;
+  /**
+   * Same-origin route mount for this app (used by monorepo children: the
+   * frontend mounts at `/`, the backend at `/api`). Accepted at the top level
+   * so a generated child `<group>-<service>` drop.yaml validates; applied by
+   * handleConfigureRoute as a Caddy path prefix (M3).
+   */
+  route?: AppRouteConfig;
 }
 
 /**
@@ -256,7 +345,7 @@ export function validateDropYamlConfig(
   }
 
   // Validate string fields
-  for (const field of ['name', 'build', 'start', 'healthCheck', 'maxBodySize'] as const) {
+  for (const field of ['name', 'type', 'database', 'build', 'start', 'healthCheck', 'maxBodySize'] as const) {
     if (cfg[field] !== undefined && typeof cfg[field] !== 'string') {
       return { valid: false, error: `${field} must be a string` };
     }
@@ -270,39 +359,55 @@ export function validateDropYamlConfig(
 
   // Validate env
   if (cfg.env !== undefined) {
-    if (typeof cfg.env !== 'object' || cfg.env === null || Array.isArray(cfg.env)) {
-      return { valid: false, error: 'env must be an object' };
-    }
-    for (const [k, v] of Object.entries(cfg.env as Record<string, unknown>)) {
-      if (!k || typeof k !== 'string') {
-        return { valid: false, error: 'env keys must be non-empty strings' };
-      }
-      if (typeof v !== 'string' && typeof v !== 'number' && typeof v !== 'boolean') {
-        return { valid: false, error: `env.${k} must be a string, number, or boolean` };
-      }
-    }
+    const result = validateEnvObject(cfg.env, 'env');
+    if (!result.valid) return result;
+  }
+
+  // Validate build_env (same shape/rules as env)
+  if (cfg.build_env !== undefined) {
+    const result = validateEnvObject(cfg.build_env, 'build_env');
+    if (!result.valid) return result;
   }
 
   // Validate depends_on
   if (cfg.depends_on !== undefined) {
-    if (!Array.isArray(cfg.depends_on)) {
-      return { valid: false, error: 'depends_on must be an array' };
+    const result = validateDependsOn(cfg.depends_on, 'depends_on');
+    if (!result.valid) return result;
+  }
+
+  // Validate group
+  if (cfg.group !== undefined) {
+    if (typeof cfg.group !== 'string' || !cfg.group) {
+      return { valid: false, error: 'group must be a non-empty string' };
     }
-    for (const dep of cfg.depends_on) {
-      if (typeof dep !== 'object' || dep === null || Array.isArray(dep)) {
-        return { valid: false, error: 'Each dependency must be an object' };
-      }
-      const d = dep as Record<string, unknown>;
-      if (typeof d.name !== 'string' || !d.name) {
-        return { valid: false, error: 'dependency.name must be a non-empty string' };
-      }
-      if (typeof d.env !== 'string' || !d.env) {
-        return { valid: false, error: 'dependency.env must be a non-empty string' };
-      }
-      if (d.path !== undefined && typeof d.path !== 'string') {
-        return { valid: false, error: 'dependency.path must be a string' };
-      }
+  }
+
+  // Validate services (monorepo multi-service map)
+  if (cfg.services !== undefined) {
+    if (typeof cfg.services !== 'object' || cfg.services === null || Array.isArray(cfg.services)) {
+      return { valid: false, error: 'services must be an object' };
     }
+    const services = cfg.services as Record<string, unknown>;
+    const serviceNames = Object.keys(services);
+    if (serviceNames.length === 0) {
+      return { valid: false, error: 'services must contain at least one entry' };
+    }
+    for (const name of serviceNames) {
+      if (!SERVICE_NAME_REGEX.test(name)) {
+        return {
+          valid: false,
+          error: `Invalid service name '${name}': must contain only letters, digits, hyphens, and underscores`,
+        };
+      }
+      const result = validateServiceConfig(name, services[name], appPath);
+      if (!result.valid) return result;
+    }
+  }
+
+  // Validate top-level route (same schema as a per-service route block)
+  if (cfg.route !== undefined) {
+    const result = validateRouteConfig(cfg.route, 'route');
+    if (!result.valid) return result;
   }
 
   return { valid: true };
@@ -320,6 +425,203 @@ function isValidDomain(domain: string): boolean {
   // Basic domain format check
   const domainRegex = /^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$/;
   return domainRegex.test(domain);
+}
+
+/**
+ * Validate an env-like object: a plain object whose values are each a
+ * string, number, or boolean. Shared by top-level `env`/`build_env` and
+ * per-service `env`/`build_env` (identical rules, different error prefix).
+ */
+function validateEnvObject(
+  value: unknown,
+  label: string,
+): { valid: boolean; error?: string } {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return { valid: false, error: `${label} must be an object` };
+  }
+  for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+    if (!k || typeof k !== 'string') {
+      return { valid: false, error: `${label} keys must be non-empty strings` };
+    }
+    if (typeof v !== 'string' && typeof v !== 'number' && typeof v !== 'boolean') {
+      return { valid: false, error: `${label}.${k} must be a string, number, or boolean` };
+    }
+  }
+  return { valid: true };
+}
+
+/**
+ * Validate a `depends_on` array. Shared by the top-level `depends_on` and
+ * per-service `depends_on` (identical rules, different error prefix).
+ */
+function validateDependsOn(
+  value: unknown,
+  label: string,
+): { valid: boolean; error?: string } {
+  if (!Array.isArray(value)) {
+    return { valid: false, error: `${label} must be an array` };
+  }
+  for (const dep of value) {
+    if (typeof dep !== 'object' || dep === null || Array.isArray(dep)) {
+      return { valid: false, error: `Each entry in ${label} must be an object` };
+    }
+    const d = dep as Record<string, unknown>;
+    if (typeof d.name !== 'string' || !d.name) {
+      return { valid: false, error: `${label}[].name must be a non-empty string` };
+    }
+    if (typeof d.env !== 'string' || !d.env) {
+      return { valid: false, error: `${label}[].env must be a non-empty string` };
+    }
+    if (d.path !== undefined && typeof d.path !== 'string') {
+      return { valid: false, error: `${label}[].path must be a string` };
+    }
+  }
+  return { valid: true };
+}
+
+/**
+ * Validate that a relative path stays within `appPath` (when supplied):
+ * rejects absolute paths and any `..` traversal outright (structural check,
+ * always applied), and — mirroring the tls.certFile/keyFile containment
+ * style — additionally resolves against `appPath` when available to confirm
+ * real containment.
+ */
+function validateContainedPath(
+  value: string,
+  label: string,
+  appPath?: string,
+): { valid: boolean; error?: string } {
+  // Platform-independent absolute-path check: path.isAbsolute() alone is
+  // OS-specific (e.g. a Windows drive path like "C:\Windows" is NOT
+  // absolute per POSIX rules, and a leading "/" is not absolute on
+  // Windows' drive-relative semantics in all Node versions), so also
+  // explicitly reject POSIX-root and Windows drive-letter/UNC forms
+  // regardless of the host OS running validation.
+  if (
+    path.isAbsolute(value) ||
+    value.startsWith('/') ||
+    value.startsWith('\\') ||
+    /^[a-zA-Z]:[\\/]/.test(value)
+  ) {
+    return { valid: false, error: `${label} must be a relative path` };
+  }
+
+  const normalized = path.normalize(value);
+  if (normalized === '..' || normalized.startsWith(`..${path.sep}`)) {
+    return { valid: false, error: `${label} must not contain '..' path traversal` };
+  }
+
+  if (appPath) {
+    const base = path.resolve(appPath);
+    const resolved = path.resolve(appPath, value);
+    if (resolved !== base && !resolved.startsWith(base + path.sep)) {
+      return { valid: false, error: `${label} must stay inside the app directory` };
+    }
+  }
+
+  return { valid: true };
+}
+
+/**
+ * Validate a `services.<name>.route` block.
+ */
+function validateRouteConfig(
+  value: unknown,
+  label: string,
+): { valid: boolean; error?: string } {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return { valid: false, error: `${label} must be an object` };
+  }
+  const route = value as Record<string, unknown>;
+
+  for (const key of Object.keys(route)) {
+    if (!ALLOWED_ROUTE_KEYS.has(key)) {
+      return { valid: false, error: `Unknown field '${label}.${key}' in drop.yaml` };
+    }
+  }
+
+  if (route.path !== undefined && typeof route.path !== 'string') {
+    return { valid: false, error: `${label}.path must be a string` };
+  }
+  if (route.strip !== undefined && typeof route.strip !== 'boolean') {
+    return { valid: false, error: `${label}.strip must be a boolean` };
+  }
+
+  return { valid: true };
+}
+
+/**
+ * Validate a single `services.<name>` entry.
+ */
+function validateServiceConfig(
+  name: string,
+  value: unknown,
+  appPath?: string,
+): { valid: boolean; error?: string } {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return { valid: false, error: `services.${name} must be an object` };
+  }
+  const svc = value as Record<string, unknown>;
+
+  // Strict schema: reject unknown service keys
+  for (const key of Object.keys(svc)) {
+    if (!ALLOWED_SERVICE_KEYS.has(key)) {
+      return { valid: false, error: `Unknown field 'services.${name}.${key}' in drop.yaml` };
+    }
+  }
+
+  // path is required
+  if (typeof svc.path !== 'string' || !svc.path) {
+    return { valid: false, error: `services.${name}.path is required and must be a non-empty string` };
+  }
+  const pathResult = validateContainedPath(svc.path, `services.${name}.path`, appPath);
+  if (!pathResult.valid) return pathResult;
+
+  // Optional string fields
+  for (const field of ['type', 'build', 'start', 'healthCheck', 'database'] as const) {
+    if (svc[field] !== undefined && typeof svc[field] !== 'string') {
+      return { valid: false, error: `services.${name}.${field} must be a string` };
+    }
+  }
+
+  // domains
+  if (svc.domains !== undefined) {
+    if (!Array.isArray(svc.domains)) {
+      return { valid: false, error: `services.${name}.domains must be an array` };
+    }
+    for (const domain of svc.domains) {
+      if (typeof domain !== 'string') {
+        return { valid: false, error: `Each domain in services.${name}.domains must be a string` };
+      }
+      if (!isValidDomain(domain)) {
+        return { valid: false, error: `Invalid domain in services.${name}.domains: ${domain}` };
+      }
+    }
+  }
+
+  // env / build_env (same rules as top-level)
+  if (svc.env !== undefined) {
+    const result = validateEnvObject(svc.env, `services.${name}.env`);
+    if (!result.valid) return result;
+  }
+  if (svc.build_env !== undefined) {
+    const result = validateEnvObject(svc.build_env, `services.${name}.build_env`);
+    if (!result.valid) return result;
+  }
+
+  // depends_on (same rules as top-level)
+  if (svc.depends_on !== undefined) {
+    const result = validateDependsOn(svc.depends_on, `services.${name}.depends_on`);
+    if (!result.valid) return result;
+  }
+
+  // route
+  if (svc.route !== undefined) {
+    const result = validateRouteConfig(svc.route, `services.${name}.route`);
+    if (!result.valid) return result;
+  }
+
+  return { valid: true };
 }
 
 /**
