@@ -4,6 +4,7 @@ module.exports = {
   testEnvironment: 'node',
   roots: ['<rootDir>/src'],
   testMatch: ['**/*.test.ts', '**/*.spec.ts'],
+  setupFilesAfterEnv: ['<rootDir>/src/__test-setup__/reset-exit-code.ts'],
   moduleNameMapper: {
     '^jose$': '<rootDir>/src/__mocks__/jose.ts',
     '^@/(.*)$': '<rootDir>/src/$1',
@@ -20,6 +21,7 @@ module.exports = {
     '!src/**/*.spec.ts',
     '!src/**/*.types.ts',
     '!src/types/**',
+    '!src/__test-setup__/**',
   ],
   coverageThreshold: {
     global: {
