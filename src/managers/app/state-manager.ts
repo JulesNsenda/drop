@@ -31,6 +31,14 @@ export interface AppState {
   gitSource?: GitSource;
   userId?: string;
   customDomain?: string;
+  /**
+   * Grouping tag for apps expanded from a single monorepo deploy (e.g.
+   * `ezsign-backend` / `ezsign-frontend` both tagged `group: ezsign`). Set via
+   * `updateApp(name, { group })`, not `registerApp` — `AppConfig` (app-config.ts)
+   * is the source of truth for `group`; this mirrors it for state consumers
+   * that only read `AppState`. Absent for standalone apps.
+   */
+  group?: string;
 }
 
 export interface StateManagerConfig {
