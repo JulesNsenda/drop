@@ -243,6 +243,14 @@ export class DropPlatform {
   private isRunning = false;
   private usedPorts: Map<number, string> = new Map(); // port -> appName ownership
   private appsInProgress: Set<string> = new Set(); // Track apps being built/started
+  // Builds deferred because the concurrent-build cap was full (appName -> its
+  // path + type hint). A first-boot or single-drop burst can briefly saturate
+  // the cap — in docker mode especially, where a first-time base-image pull
+  // holds a build slot for a while — and without a drain those deferred builds
+  // wait for a file change that may never come, so a static/other app "never
+  // starts automatically". `drainPendingBuilds` retries them as slots free.
+  private pendingBuilds: Map<string, { appPath: string; appType: string }> = new Map();
+  private buildDrainTimer: ReturnType<typeof setTimeout> | null = null;
   private appDeployTimes: Map<string, number> = new Map(); // Track when apps were last deployed
   // Apps whose rebuild+restart is being managed as a single transaction by
   // handleAppUpdate. Their builder.build still emits build:completed, but
@@ -385,6 +393,13 @@ export class DropPlatform {
       clearInterval(this.certExpiryTimer);
       this.certExpiryTimer = null;
     }
+
+    // Stop the pending-build drain
+    if (this.buildDrainTimer) {
+      clearTimeout(this.buildDrainTimer);
+      this.buildDrainTimer = null;
+    }
+    this.pendingBuilds.clear();
 
     // Stop the log-retention sweep
     if (this.logRetention) {
@@ -1651,8 +1666,9 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       return;
     }
 
-    // Enforce global concurrent build limit.  The deploy cooldown will
-    // re-trigger the build on the next file change once a slot opens.
+    // Enforce global concurrent build limit. Deferred builds are queued and
+    // retried by drainPendingBuilds as slots free, rather than waiting for a
+    // file change that may never arrive (which left apps stuck "not started").
     if (this.config.maxConcurrentBuilds > 0 &&
         this.appsInProgress.size >= this.config.maxConcurrentBuilds) {
       this.logger.warn(
@@ -1660,9 +1676,14 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         `deferring ${appName}`,
         'BUILD'
       );
+      this.pendingBuilds.set(appName, { appPath, appType: _appType });
+      this.scheduleBuildDrain();
       return;
     }
 
+    // Proceeding — drop any queued entry for this app so the drain doesn't
+    // start a duplicate build.
+    this.pendingBuilds.delete(appName);
     this.appsInProgress.add(appName);
 
     this.logger.appEvent('building', appName);
@@ -1757,6 +1778,15 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         if (this.stateManager) {
           await this.stateManager.updateApp(appName, { buildDuration: result.duration });
         }
+      } else if (result.errors?.[0]?.code === 'MAX_BUILDS') {
+        // The builder's own concurrent-build cap fired (a redundant safety net
+        // under the platform cap above). Don't error the app — re-queue it so
+        // it retries when a slot frees, instead of leaving it permanently
+        // failed after a transient burst.
+        this.logger.warn(`Builder busy for ${appName}; re-queuing`, 'BUILD');
+        this.appsInProgress.delete(appName);
+        this.pendingBuilds.set(appName, { appPath, appType: _appType });
+        this.scheduleBuildDrain();
       } else {
         this.logger.appEvent('error', appName, result.errors?.[0]?.message || 'Build failed');
         if (this.stateManager) {
@@ -1775,6 +1805,42 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       }
       this.appsInProgress.delete(appName);
     }
+  }
+
+  /** Schedule a single deferred drain of the pending-build queue (~2s later). */
+  private scheduleBuildDrain(): void {
+    if (this.buildDrainTimer) return;
+    this.buildDrainTimer = setTimeout(() => {
+      this.buildDrainTimer = null;
+      void this.drainPendingBuilds();
+    }, 2000);
+    this.buildDrainTimer.unref?.();
+  }
+
+  /**
+   * Start builds that were deferred by the concurrent-build cap, up to the
+   * free slots, then re-arm while any remain queued. handleBuildApp adds to
+   * appsInProgress synchronously (before its first await), so each dispatch in
+   * this loop reserves its slot before the next iteration's size check, and
+   * handleBuildApp re-queues itself if the cap refilled — so this converges
+   * without over-subscribing.
+   */
+  private async drainPendingBuilds(): Promise<void> {
+    for (const [appName, info] of [...this.pendingBuilds]) {
+      if (this.config.maxConcurrentBuilds > 0 &&
+          this.appsInProgress.size >= this.config.maxConcurrentBuilds) {
+        break;
+      }
+      // Started some other way (or already running) since it was queued — drop it.
+      if (this.appsInProgress.has(appName) ||
+          this.stateManager?.getApp(appName)?.status === 'running') {
+        this.pendingBuilds.delete(appName);
+        continue;
+      }
+      this.pendingBuilds.delete(appName);
+      void this.handleBuildApp(info.appPath, appName, info.appType);
+    }
+    if (this.pendingBuilds.size > 0) this.scheduleBuildDrain();
   }
 
   private async handleStartApp(appName: string): Promise<void> {

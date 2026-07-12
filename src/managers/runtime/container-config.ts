@@ -38,6 +38,15 @@ export const DROP_NET_GATEWAY = process.env.DROP_NET_GATEWAY ?? '10.83.0.1';
 const BASE_IMAGES: Partial<Record<AppType, string>> = {
   nodejs: 'node:20-slim',
   python: 'python:3.12-slim',
+  // Python web frameworks: the detector reports the specific type (django/
+  // flask/fastapi), and the BUILD image is selected from that wide type
+  // (platform.ts passes `detection.type`). Without these entries they fell
+  // back to node:20-slim, where `pip` doesn't exist — the build failed with
+  // "/bin/sh: 1: pip: not found". (The runtime container uses the narrowed
+  // 'python' type and was already correct.)
+  django: 'python:3.12-slim',
+  flask: 'python:3.12-slim',
+  fastapi: 'python:3.12-slim',
   go: 'golang:1.22-alpine',
   static: 'nginx:alpine',
   // SPAs are served by the same nginx path as plain static apps
