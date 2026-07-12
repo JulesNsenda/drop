@@ -10,7 +10,7 @@ import * as fsPromises from 'fs/promises';
 import * as yaml from 'yaml';
 import { DropPlatform, createPlatform } from './platform';
 import { eventBus } from './event-bus';
-import { getDetector, parseDropYaml } from './detector';
+import { getDetector, parseDropYaml, DetectionResult } from './detector';
 import * as diskUtils from '../utils/disk';
 import { createApiKey, deleteApiKeysByName } from '../api/middleware/auth';
 
@@ -1664,6 +1664,179 @@ describe('expandMonorepo (M2: monorepo -> per-service app expansion)', () => {
       expect(call.hostname).toBe('solo-app.localhost');
       expect(call.pathPrefix).toBeUndefined();
       expect(call.upstream).toBe('localhost:4003');
+    });
+  });
+});
+
+describe('drop.yaml build/start overrides', () => {
+  let platform: DropPlatform;
+  let tempDir: string;
+  let appsDir: string;
+
+  beforeAll(() => {
+    // buildStartSpec calls the real parseDropYaml (fs-backed) against a
+    // drop.yaml written to a real temp dir — override the file-level
+    // fs/promises mocks (set up above for the rest of this file's hermetic
+    // unit tests) with the real implementation for the duration of this
+    // suite only. Mirrors the expandMonorepo suite above.
+    const actual = jest.requireActual('fs/promises') as typeof fsPromises;
+    (fsPromises.mkdir as jest.Mock).mockImplementation(actual.mkdir);
+    (fsPromises.writeFile as jest.Mock).mockImplementation(actual.writeFile);
+    (fsPromises.rm as jest.Mock).mockImplementation(actual.rm);
+    (fsPromises.stat as jest.Mock).mockImplementation(actual.stat);
+    (fsPromises.access as jest.Mock).mockImplementation(actual.access);
+    (fsPromises.readFile as jest.Mock).mockImplementation(actual.readFile);
+  });
+
+  afterAll(() => {
+    // Restore this file's original mock behavior (matches the jest.mock
+    // factory at the top of the file) for hygiene.
+    (fsPromises.mkdir as jest.Mock).mockResolvedValue(undefined);
+    (fsPromises.writeFile as jest.Mock).mockResolvedValue(undefined);
+    (fsPromises.rm as jest.Mock).mockResolvedValue(undefined);
+    (fsPromises.stat as jest.Mock).mockImplementation(async () => ({
+      isDirectory: () => true,
+      isFile: () => false,
+    }));
+    (fsPromises.access as jest.Mock).mockResolvedValue(undefined);
+    (fsPromises.readFile as jest.Mock).mockImplementation(async (filePath: string) => {
+      if (filePath.endsWith('package.json')) {
+        return JSON.stringify({
+          name: 'test-app',
+          version: '1.0.0',
+          scripts: { start: 'node index.js', build: 'echo build' },
+        });
+      }
+      const realFs = jest.requireActual('fs/promises') as typeof fsPromises;
+      return realFs.readFile(filePath as never);
+    });
+  });
+
+  beforeEach(async () => {
+    tempDir = path.join(
+      os.tmpdir(),
+      `drop-test-overrides-${Date.now()}-${Math.random().toString(36).slice(2)}`
+    );
+    appsDir = path.join(tempDir, 'apps');
+    await fsPromises.mkdir(appsDir, { recursive: true });
+
+    platform = createPlatform({
+      dropRoot: tempDir,
+      appsDirectory: appsDir,
+      logLevel: 'error',
+    });
+  });
+
+  afterEach(async () => {
+    if (platform && platform.isActive()) {
+      await platform.stop();
+    }
+    await fsPromises.rm(tempDir, { recursive: true, force: true }).catch(() => undefined);
+  });
+
+  /** Minimal nodejs DetectionResult, with a configurable suggested start command. */
+  function makeNodejsDetection(startCommand: string): DetectionResult {
+    return {
+      type: 'nodejs',
+      framework: null,
+      confidence: 1,
+      detectedBy: 'test',
+      suggestedConfig: { startCommand },
+      warnings: [],
+      metadata: {},
+    };
+  }
+
+  describe('buildStartSpec `start:` override', () => {
+    it('honors drop.yaml `start:` as an override, stripping the `node ` prefix', async () => {
+      const appName = 'override-app';
+      const appPath = path.join(appsDir, appName);
+      await fsPromises.mkdir(appPath, { recursive: true });
+      await fsPromises.writeFile(
+        path.join(appPath, 'drop.yaml'),
+        yaml.stringify({ name: appName, start: 'node dist/server.js' })
+      );
+
+      const detection = makeNodejsDetection('node index.js');
+      const dataDir = path.join(tempDir, 'data', 'appdata', appName);
+
+      const spec = await (platform as any).buildStartSpec(
+        appName,
+        appPath,
+        detection,
+        4100,
+        dataDir,
+        {}
+      );
+
+      expect(spec.script).toBe('dist/server.js');
+    });
+
+    it('falls back to suggestedConfig.startCommand when drop.yaml has no `start:` override', async () => {
+      const appName = 'no-override-app';
+      const appPath = path.join(appsDir, appName);
+      await fsPromises.mkdir(appPath, { recursive: true });
+      await fsPromises.writeFile(
+        path.join(appPath, 'drop.yaml'),
+        yaml.stringify({ name: appName })
+      );
+
+      const detection = makeNodejsDetection('node index.js');
+      const dataDir = path.join(tempDir, 'data', 'appdata', appName);
+
+      const spec = await (platform as any).buildStartSpec(
+        appName,
+        appPath,
+        detection,
+        4101,
+        dataDir,
+        {}
+      );
+
+      expect(spec.script).toBe('index.js');
+    });
+  });
+
+  describe('handleBuildApp `build:` override', () => {
+    /** Minimal real nodejs fixture so the real detector resolves type 'nodejs'. */
+    async function writeNodejsFixture(appPath: string): Promise<void> {
+      await fsPromises.mkdir(appPath, { recursive: true });
+      await fsPromises.writeFile(
+        path.join(appPath, 'package.json'),
+        JSON.stringify({ name: 'fixture', version: '1.0.0', scripts: { start: 'node index.js' } })
+      );
+      await fsPromises.writeFile(path.join(appPath, 'index.js'), "console.log('ok');\n");
+    }
+
+    it('passes the drop.yaml `build:` override through to builder.build as config.buildCommand', async () => {
+      const appName = 'build-override-app';
+      const appPath = path.join(appsDir, appName);
+      await writeNodejsFixture(appPath);
+      await fsPromises.writeFile(
+        path.join(appPath, 'drop.yaml'),
+        yaml.stringify({ name: appName, build: 'npm run build' })
+      );
+
+      (platform as any).detector = getDetector();
+      (platform as any).stateManager = {
+        setAppStatus: jest.fn().mockResolvedValue(undefined),
+        updateApp: jest.fn().mockResolvedValue(undefined),
+      };
+      (platform as any).appConfigService = {
+        updateConfig: jest.fn().mockResolvedValue(undefined),
+      };
+      (platform as any).buildLogService = null;
+      const buildSpy = jest.fn().mockResolvedValue({ success: true, duration: 1, errors: [] });
+      (platform as any).builder = { build: buildSpy };
+
+      await (platform as any).handleBuildApp(appPath, appName, 'nodejs');
+
+      expect(buildSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          appName,
+          config: expect.objectContaining({ buildCommand: 'npm run build' }),
+        })
+      );
     });
   });
 });
