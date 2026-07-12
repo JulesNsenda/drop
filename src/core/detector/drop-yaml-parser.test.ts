@@ -77,6 +77,27 @@ describe('Drop YAML Parser', () => {
       expect(result.success).toBe(false);
       expect(result.error).toContain('Invalid domain');
     });
+
+    it('should parse build_env alongside env', async () => {
+      await fs.writeFile(
+        path.join(tmpDir, 'drop.yaml'),
+        'env:\n  NODE_ENV: production\nbuild_env:\n  VITE_API_URL: ""\n  VITE_PORT: 5173'
+      );
+      const result = await parseDropYaml(tmpDir);
+      expect(result.success).toBe(true);
+      expect(result.config?.env).toEqual({ NODE_ENV: 'production' });
+      expect(result.config?.build_env).toEqual({ VITE_API_URL: '', VITE_PORT: 5173 });
+    });
+
+    it('should reject invalid build_env values from a real file', async () => {
+      await fs.writeFile(
+        path.join(tmpDir, 'drop.yaml'),
+        'build_env:\n  BAD: [1, 2, 3]'
+      );
+      const result = await parseDropYaml(tmpDir);
+      expect(result.success).toBe(false);
+      expect(result.error).toContain('build_env.BAD');
+    });
   });
 
   describe('validateDropYamlConfig', () => {
@@ -104,6 +125,43 @@ describe('Drop YAML Parser', () => {
         depends_on: [{ name: 123 }],
       });
       expect(invalid.valid).toBe(false);
+    });
+
+    it('should accept build_env with string, number, and boolean values', () => {
+      const result = validateDropYamlConfig({
+        build_env: {
+          VITE_API_URL: '/api',
+          VITE_PORT: 5173,
+          VITE_DEBUG: true,
+        },
+      });
+      expect(result.valid).toBe(true);
+    });
+
+    it('should reject build_env that is not an object', () => {
+      expect(validateDropYamlConfig({ build_env: 'nope' }).valid).toBe(false);
+      expect(validateDropYamlConfig({ build_env: ['nope'] }).valid).toBe(false);
+    });
+
+    it('should reject build_env values of the wrong type', () => {
+      const result = validateDropYamlConfig({
+        build_env: { VITE_CONFIG: { nested: true } },
+      });
+      expect(result.valid).toBe(false);
+      expect(result.error).toContain('build_env.VITE_CONFIG');
+    });
+
+    it('should reject build_env with non-string keys via empty key', () => {
+      const result = validateDropYamlConfig({
+        build_env: { '': 'value' },
+      });
+      expect(result.valid).toBe(false);
+    });
+
+    it('should no longer reject build_env as an unknown top-level field', () => {
+      const result = validateDropYamlConfig({ build_env: { FOO: 'bar' } });
+      expect(result.valid).toBe(true);
+      expect(result.error).toBeUndefined();
     });
   });
 
