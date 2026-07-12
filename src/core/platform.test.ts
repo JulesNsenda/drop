@@ -119,6 +119,8 @@ jest.mock('../managers/database', () => {
     listDatabases: jest.fn().mockReturnValue([]),
     deleteAppDatabase: jest.fn().mockResolvedValue(undefined),
     getEnvVars: jest.fn().mockReturnValue(null),
+    // M4 group teardown (teardownApp/removeGroup) dump-then-drops via this.
+    backupAndDeleteAppDatabase: jest.fn().mockResolvedValue({ dropped: true }),
   };
 
   return {
@@ -465,6 +467,39 @@ describe('DropPlatform', () => {
       const bus = platform.getEventBus();
 
       expect(bus).toBe(eventBus);
+    });
+  });
+
+  describe('handleAppDeleted route cleanup (M4: route-leak fix)', () => {
+    it('removes every route the deleted app owns, alongside the existing port release', async () => {
+      // The app:deleted subscription (and the real router) are wired by
+      // start().
+      await platform.start();
+
+      const router = (platform as any).router;
+      await router.addRoute({
+        appName: 'gone-gone-localhost',
+        owner: 'gone',
+        hostname: 'gone.localhost',
+        upstream: 'localhost:4009',
+        ssl: false,
+        redirectHttps: false,
+      });
+      expect(router.hasRoute('gone-gone-localhost')).toBe(true);
+
+      const portA = (platform as any).allocatePort('gone');
+      eventBus.publish('app:deleted', { appId: 'gone', name: 'gone' });
+
+      // Port release is synchronous within the async handler (runs before the
+      // first await), so it's observable immediately.
+      expect((platform as any).usedPorts.has(portA)).toBe(false);
+
+      // Route removal happens in a chain of awaits inside the fire-and-forget
+      // async event handler (router.removeRoutesForApp -> regenerateConfig ->
+      // fs.mkdir/writeFile) — flush the microtask queue before asserting.
+      await new Promise((resolve) => setImmediate(resolve));
+
+      expect(router.hasRoute('gone-gone-localhost')).toBe(false);
     });
   });
 });
@@ -1629,6 +1664,223 @@ describe('expandMonorepo (M2: monorepo -> per-service app expansion)', () => {
       expect(call.hostname).toBe('solo-app.localhost');
       expect(call.pathPrefix).toBeUndefined();
       expect(call.upstream).toBe('localhost:4003');
+    });
+  });
+});
+
+describe('teardownApp / removeGroup (M4: group lifecycle)', () => {
+  let platform: DropPlatform;
+  let tempDir: string;
+  let appsDir: string;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+
+    tempDir = path.join(
+      os.tmpdir(),
+      `drop-test-teardown-${Date.now()}-${Math.random().toString(36).slice(2)}`
+    );
+    appsDir = path.join(tempDir, 'apps');
+
+    platform = createPlatform({
+      dropRoot: tempDir,
+      appsDirectory: appsDir,
+      logLevel: 'error',
+    });
+  });
+
+  afterEach(async () => {
+    if (platform.isActive()) {
+      await platform.stop();
+    }
+  });
+
+  /** Minimal AppState-shaped object, enough for the fields teardownApp/removeGroup read. */
+  function makeAppState(name: string, group?: string) {
+    return {
+      name,
+      type: 'nodejs' as const,
+      status: 'running' as const,
+      path: path.join(appsDir, name),
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      group,
+    };
+  }
+
+  /** Wires minimal mocks for every manager teardownApp/removeGroup touches. */
+  function wireMocks(overrides: {
+    stateManager?: Partial<{ removeApp: jest.Mock; getApp: jest.Mock; getAllApps: jest.Mock }>;
+    runtime?: Partial<{ stop: jest.Mock; delete: jest.Mock }>;
+    router?: Partial<{ removeRoutesForApp: jest.Mock }>;
+    dbProvisioner?: Partial<{ backupAndDeleteAppDatabase: jest.Mock }>;
+    appConfigService?: Partial<{ getConfig: jest.Mock; deleteConfig: jest.Mock }>;
+    secretManager?: Partial<{ deleteAll: jest.Mock }>;
+  } = {}) {
+    (platform as any).stateManager = {
+      removeApp: jest.fn().mockResolvedValue(true),
+      getApp: jest.fn().mockReturnValue(undefined),
+      getAllApps: jest.fn().mockReturnValue([]),
+      ...overrides.stateManager,
+    };
+    (platform as any).runtime = {
+      stop: jest.fn().mockResolvedValue(undefined),
+      delete: jest.fn().mockResolvedValue(undefined),
+      ...overrides.runtime,
+    };
+    (platform as any).router = {
+      removeRoutesForApp: jest.fn().mockResolvedValue(undefined),
+      ...overrides.router,
+    };
+    (platform as any).dbProvisioner = {
+      backupAndDeleteAppDatabase: jest.fn().mockResolvedValue({ dropped: true }),
+      ...overrides.dbProvisioner,
+    };
+    (platform as any).appConfigService = {
+      getConfig: jest.fn().mockReturnValue(undefined),
+      deleteConfig: jest.fn().mockResolvedValue(true),
+      ...overrides.appConfigService,
+    };
+    (platform as any).secretManager = {
+      deleteAll: jest.fn().mockResolvedValue(true),
+      ...overrides.secretManager,
+    };
+  }
+
+  describe('teardownApp', () => {
+    it('stops+deletes the runtime, removes routes, drops the DB, removes state/secrets/config, and rm-s the folder', async () => {
+      wireMocks({
+        appConfigService: {
+          getConfig: jest.fn().mockReturnValue({ path: path.join(appsDir, 'myapp') }),
+          deleteConfig: jest.fn().mockResolvedValue(true),
+        },
+      });
+
+      await (platform as any).teardownApp('myapp');
+
+      expect((platform as any).runtime.stop).toHaveBeenCalledWith('myapp');
+      expect((platform as any).runtime.delete).toHaveBeenCalledWith('myapp');
+      expect((platform as any).router.removeRoutesForApp).toHaveBeenCalledWith('myapp');
+      expect((platform as any).dbProvisioner.backupAndDeleteAppDatabase).toHaveBeenCalledWith('myapp');
+      expect((platform as any).stateManager.removeApp).toHaveBeenCalledWith('myapp');
+      expect((platform as any).secretManager.deleteAll).toHaveBeenCalledWith('myapp');
+      expect((platform as any).appConfigService.deleteConfig).toHaveBeenCalledWith('myapp');
+      expect(fsPromises.rm).toHaveBeenCalledWith(
+        path.join(appsDir, 'myapp'),
+        { recursive: true, force: true }
+      );
+    });
+
+    it('skips the DB teardown when keepData is set', async () => {
+      wireMocks();
+
+      await (platform as any).teardownApp('myapp', { keepData: true });
+
+      expect((platform as any).dbProvisioner.backupAndDeleteAppDatabase).not.toHaveBeenCalled();
+      // The rest of teardown still runs.
+      expect((platform as any).stateManager.removeApp).toHaveBeenCalledWith('myapp');
+    });
+
+    it('isolates a single failing step so the rest of teardown still runs', async () => {
+      wireMocks({
+        router: { removeRoutesForApp: jest.fn().mockRejectedValue(new Error('caddy boom')) },
+        dbProvisioner: { backupAndDeleteAppDatabase: jest.fn().mockRejectedValue(new Error('db boom')) },
+      });
+
+      await expect((platform as any).teardownApp('myapp')).resolves.toBeUndefined();
+
+      // Steps after the two failures still ran.
+      expect((platform as any).stateManager.removeApp).toHaveBeenCalledWith('myapp');
+      expect((platform as any).secretManager.deleteAll).toHaveBeenCalledWith('myapp');
+      expect((platform as any).appConfigService.deleteConfig).toHaveBeenCalledWith('myapp');
+      expect(fsPromises.rm).toHaveBeenCalledWith(
+        path.join(appsDir, 'myapp'),
+        { recursive: true, force: true }
+      );
+    });
+  });
+
+  describe('removeGroup', () => {
+    it('tears down every child of the group and removes the group container folder', async () => {
+      const children = [
+        makeAppState('ezsign-backend', 'ezsign'),
+        makeAppState('ezsign-frontend', 'ezsign'),
+        makeAppState('standalone-app'), // no group — must be left alone
+      ];
+      wireMocks({
+        stateManager: {
+          getAllApps: jest.fn().mockReturnValue(children),
+          removeApp: jest.fn().mockResolvedValue(true),
+          getApp: jest.fn().mockReturnValue(undefined),
+        },
+      });
+
+      const result = await platform.removeGroup('ezsign');
+
+      expect(result.removed.slice().sort()).toEqual(['ezsign-backend', 'ezsign-frontend']);
+      expect((platform as any).stateManager.removeApp).toHaveBeenCalledWith('ezsign-backend');
+      expect((platform as any).stateManager.removeApp).toHaveBeenCalledWith('ezsign-frontend');
+      expect((platform as any).stateManager.removeApp).not.toHaveBeenCalledWith('standalone-app');
+      expect((platform as any).runtime.stop).toHaveBeenCalledWith('ezsign-backend');
+      expect((platform as any).runtime.stop).toHaveBeenCalledWith('ezsign-frontend');
+      expect((platform as any).router.removeRoutesForApp).toHaveBeenCalledWith('ezsign-backend');
+      expect((platform as any).router.removeRoutesForApp).toHaveBeenCalledWith('ezsign-frontend');
+
+      // The container folder (webapps/ezsign/, the root drop.yaml holder) is removed too.
+      expect(fsPromises.rm).toHaveBeenCalledWith(
+        path.join(appsDir, 'ezsign'),
+        { recursive: true, force: true }
+      );
+    });
+
+    it('isolates a per-child teardown failure so the remaining children still get removed', async () => {
+      // teardownApp itself already isolates every one of ITS OWN steps (see
+      // the teardownApp describe block above) — it never rejects on a normal
+      // step failure. removeGroup's own try/catch around each `teardownApp`
+      // call is a second, independent isolation layer (defense in depth); test
+      // it directly by making teardownApp itself reject for one child.
+      const children = [makeAppState('child-a', 'g'), makeAppState('child-b', 'g')];
+      wireMocks({
+        stateManager: {
+          getAllApps: jest.fn().mockReturnValue(children),
+          removeApp: jest.fn().mockResolvedValue(true),
+          getApp: jest.fn().mockReturnValue(undefined),
+        },
+      });
+
+      const teardownSpy = jest
+        .spyOn(platform as any, 'teardownApp')
+        .mockRejectedValueOnce(new Error('boom on child-a'))
+        .mockResolvedValueOnce(undefined);
+
+      const result = await platform.removeGroup('g');
+
+      expect(teardownSpy).toHaveBeenCalledTimes(2);
+      // child-a's teardown rejected — isolated, doesn't abort child-b.
+      expect(result.removed).toEqual(['child-b']);
+      // The container folder removal is still attempted regardless.
+      expect(fsPromises.rm).toHaveBeenCalledWith(
+        path.join(appsDir, 'g'),
+        { recursive: true, force: true }
+      );
+    });
+
+    it('returns an empty removed list when no app belongs to the group (still attempts folder cleanup)', async () => {
+      wireMocks({
+        stateManager: {
+          getAllApps: jest.fn().mockReturnValue([]),
+          removeApp: jest.fn().mockResolvedValue(true),
+          getApp: jest.fn().mockReturnValue(undefined),
+        },
+      });
+
+      const result = await platform.removeGroup('ghost-group');
+
+      expect(result.removed).toEqual([]);
+      expect(fsPromises.rm).toHaveBeenCalledWith(
+        path.join(appsDir, 'ghost-group'),
+        { recursive: true, force: true }
+      );
     });
   });
 });

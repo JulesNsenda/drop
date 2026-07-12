@@ -7,6 +7,7 @@ import {
   ExternalLink,
   Filter,
   GitBranch,
+  Layers,
   RefreshCw,
   Search,
   User,
@@ -16,7 +17,7 @@ import type { App } from '../hooks/useApi';
 import { useAuth } from '../hooks/useAuth';
 import { appLinkInfo } from '../api/client';
 import StatusBadge from '../components/StatusBadge';
-import { statusToTone } from '../components/ui/Badge';
+import Badge, { statusToTone } from '../components/ui/Badge';
 import Button from '../components/ui/Button';
 import Card from '../components/ui/Card';
 import StatCard from '../components/ui/StatCard';
@@ -45,6 +46,79 @@ function formatDate(dateString?: string) {
   return date.toLocaleString();
 }
 
+/** A single app row, shared by the flat (ungrouped) list and grouped sections. */
+function AppListCard({ app, isAdmin }: { app: App; isAdmin: boolean }) {
+  return (
+    <Link to={`/apps/${app.name}`} className="block">
+      <Card className="transition-colors hover:!border-[var(--accent-2)]">
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+          <div className="flex min-w-0 items-center gap-3">
+            <span
+              className="h-2.5 w-2.5 flex-shrink-0 rounded-full"
+              style={{ background: DOT_COLOR[statusToTone(app.status)] }}
+              aria-hidden="true"
+            />
+            <div className="min-w-0">
+              <div className="flex items-center gap-2">
+                <h3 className="truncate font-semibold" style={{ color: 'var(--text)' }}>
+                  {app.name}
+                </h3>
+                <StatusBadge status={app.status} />
+              </div>
+              <p className="truncate text-sm" style={{ color: 'var(--text-3)' }}>
+                {app.type}
+                {app.framework && ` · ${app.framework}`}
+                {app.port ? ` · :${app.port}` : ''}
+              </p>
+            </div>
+          </div>
+
+          <div
+            className="flex flex-wrap items-center gap-x-5 gap-y-1 text-sm sm:justify-end"
+            style={{ color: 'var(--text-2)' }}
+          >
+            {app.port && app.status === 'running' && (
+              <a
+                href={appLinkInfo(app).href}
+                target="_blank"
+                rel="noopener noreferrer"
+                onClick={e => e.stopPropagation()}
+                className="inline-flex items-center gap-1.5 hover:underline"
+                style={{ color: 'var(--accent)' }}
+              >
+                <ExternalLink className="h-3.5 w-3.5" />
+                <span>{appLinkInfo(app).label}</span>
+              </a>
+            )}
+            <span className="inline-flex items-center gap-1.5">
+              <Clock className="h-3.5 w-3.5" style={{ color: 'var(--text-3)' }} />
+              {formatDate(app.lastDeployedAt)}
+            </span>
+            {isAdmin && app.ownerName && (
+              <span className="inline-flex items-center gap-1.5">
+                <User className="h-3.5 w-3.5" style={{ color: 'var(--text-3)' }} />
+                {app.ownerName}
+              </span>
+            )}
+          </div>
+        </div>
+
+        {app.error && (
+          <div
+            className="mt-3 truncate rounded-lg px-3 py-2 text-xs"
+            style={{
+              background: 'color-mix(in srgb, var(--err) 15%, transparent)',
+              color: 'var(--err)',
+            }}
+          >
+            {app.error}
+          </div>
+        )}
+      </Card>
+    </Link>
+  );
+}
+
 function AppsPage() {
   const { apps, loading, error, refresh } = useApps();
   const { role } = useAuth();
@@ -66,6 +140,32 @@ function AppsPage() {
       return matchesSearch && matchesStatus;
     });
   }, [apps, search, statusFilter]);
+
+  // Monorepo grouping (purely presentational, on top of filteredApps): apps
+  // that share a non-empty `group` (e.g. multiple services from the same repo
+  // root) are clustered under a labeled section; apps with no group render as
+  // a plain flat list, same as before grouping existed.
+  const { groupedSections, ungroupedApps } = useMemo(() => {
+    const sections: { group: string; apps: App[] }[] = [];
+    const sectionIndexByGroup = new Map<string, number>();
+    const ungrouped: App[] = [];
+
+    for (const app of filteredApps) {
+      if (app.group) {
+        let idx = sectionIndexByGroup.get(app.group);
+        if (idx === undefined) {
+          idx = sections.length;
+          sectionIndexByGroup.set(app.group, idx);
+          sections.push({ group: app.group, apps: [] });
+        }
+        sections[idx].apps.push(app);
+      } else {
+        ungrouped.push(app);
+      }
+    }
+
+    return { groupedSections: sections, ungroupedApps: ungrouped };
+  }, [filteredApps]);
 
   const statusCounts = useMemo(() => {
     const counts: Record<string, number> = { all: apps.length };
@@ -219,76 +319,40 @@ function AppsPage() {
 
       {/* Apps list */}
       {filteredApps.length > 0 && (
-        <div className="flex flex-col gap-3">
-          {filteredApps.map(app => (
-            <Link key={app.name} to={`/apps/${app.name}`} className="block">
-              <Card className="transition-colors hover:!border-[var(--accent-2)]">
-                <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-                  <div className="flex min-w-0 items-center gap-3">
-                    <span
-                      className="h-2.5 w-2.5 flex-shrink-0 rounded-full"
-                      style={{ background: DOT_COLOR[statusToTone(app.status)] }}
-                      aria-hidden="true"
-                    />
-                    <div className="min-w-0">
-                      <div className="flex items-center gap-2">
-                        <h3 className="truncate font-semibold" style={{ color: 'var(--text)' }}>
-                          {app.name}
-                        </h3>
-                        <StatusBadge status={app.status} />
-                      </div>
-                      <p className="truncate text-sm" style={{ color: 'var(--text-3)' }}>
-                        {app.type}
-                        {app.framework && ` · ${app.framework}`}
-                        {app.port ? ` · :${app.port}` : ''}
-                      </p>
-                    </div>
-                  </div>
-
-                  <div
-                    className="flex flex-wrap items-center gap-x-5 gap-y-1 text-sm sm:justify-end"
-                    style={{ color: 'var(--text-2)' }}
-                  >
-                    {app.port && app.status === 'running' && (
-                      <a
-                        href={appLinkInfo(app).href}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        onClick={e => e.stopPropagation()}
-                        className="inline-flex items-center gap-1.5 hover:underline"
-                        style={{ color: 'var(--accent)' }}
-                      >
-                        <ExternalLink className="h-3.5 w-3.5" />
-                        <span>{appLinkInfo(app).label}</span>
-                      </a>
-                    )}
-                    <span className="inline-flex items-center gap-1.5">
-                      <Clock className="h-3.5 w-3.5" style={{ color: 'var(--text-3)' }} />
-                      {formatDate(app.lastDeployedAt)}
-                    </span>
-                    {isAdmin && app.ownerName && (
-                      <span className="inline-flex items-center gap-1.5">
-                        <User className="h-3.5 w-3.5" style={{ color: 'var(--text-3)' }} />
-                        {app.ownerName}
-                      </span>
-                    )}
-                  </div>
-                </div>
-
-                {app.error && (
-                  <div
-                    className="mt-3 truncate rounded-lg px-3 py-2 text-xs"
-                    style={{
-                      background: 'color-mix(in srgb, var(--err) 15%, transparent)',
-                      color: 'var(--err)',
-                    }}
-                  >
-                    {app.error}
-                  </div>
-                )}
-              </Card>
-            </Link>
+        <div className="flex flex-col gap-6">
+          {/* Monorepo groups — sibling apps deployed from the same repo root */}
+          {groupedSections.map(section => (
+            <div key={section.group}>
+              <div className="mb-2 flex flex-wrap items-center gap-2">
+                <Layers className="h-4 w-4" style={{ color: 'var(--text-3)' }} />
+                <h2 className="text-sm font-semibold" style={{ color: 'var(--text)' }}>
+                  {section.group}
+                  <span className="font-normal" style={{ color: 'var(--text-3)' }}>
+                    {' '}
+                    · {section.apps.length} service{section.apps.length !== 1 ? 's' : ''}
+                  </span>
+                </h2>
+                <Badge tone="neutral">monorepo</Badge>
+              </div>
+              <div
+                className="flex flex-col gap-3 border-l-2 pl-4"
+                style={{ borderColor: 'var(--border)' }}
+              >
+                {section.apps.map(app => (
+                  <AppListCard key={app.name} app={app} isAdmin={isAdmin} />
+                ))}
+              </div>
+            </div>
           ))}
+
+          {/* Ungrouped apps render as a plain flat list, same as before grouping existed */}
+          {ungroupedApps.length > 0 && (
+            <div className="flex flex-col gap-3">
+              {ungroupedApps.map(app => (
+                <AppListCard key={app.name} app={app} isAdmin={isAdmin} />
+              ))}
+            </div>
+          )}
         </div>
       )}
     </div>

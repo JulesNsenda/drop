@@ -24,6 +24,7 @@ import { hasEnoughDisk, getMinFreeDiskMb } from '../../utils/disk';
 import { getStateManager, AppState } from '../../managers/app/state-manager';
 import { getAppConfigService } from '../../managers/app/app-config';
 import { getDatabaseProvisioner } from '../../managers/database';
+import { getRouterService } from '../../core/router';
 import { tryLogActivity } from '../../managers/activity';
 import {
   getAppsDirectory,
@@ -132,6 +133,7 @@ function toAppDto(app: AppState, isAdmin = false): AppDto {
     userId: app.userId,
     ownerName: isAdmin ? resolveUsername(app.userId) : undefined,
     customDomain: app.customDomain,
+    group: app.group,
   };
 }
 
@@ -481,14 +483,41 @@ apps.put('/:name', async c => {
   return c.json(success(toAppDto(updated, auth?.role === 'admin')));
 });
 
-// DELETE /apps/:name - Remove application
+// DELETE /apps/:name - Remove application (group-aware, M4)
 apps.delete('/:name', async c => {
   const auth = (c.get as Function)('auth') as AuthContext | undefined;
   const name = c.req.param('name');
   const stateManager = getStateManager();
   const app = stateManager.getApp(name);
 
-  if (!app || !canAccess(auth, app)) {
+  // No app named `:name` — it may instead be a monorepo GROUP name (the
+  // shared `group` tag several apps carry, not itself a registered app).
+  // Require every child accessible (not just one) before tearing down the
+  // whole group — same IDOR posture as the single-app canAccess check below.
+  if (!app) {
+    const groupChildren = stateManager.getAllApps().filter(a => a.group === name);
+    if (groupChildren.length === 0 || !groupChildren.every(a => canAccess(auth, a))) {
+      throw new NotFoundError(`Application '${name}' not found`);
+    }
+
+    const ops = getPlatformOps();
+    if (!ops) {
+      return c.json(error(ErrorCodes.SERVICE_UNAVAILABLE, 'Platform operations unavailable'), 503);
+    }
+
+    const { removed } = await ops.removeGroup(name);
+
+    await tryLogActivity({
+      action: 'delete',
+      userId: auth?.userId,
+      username: auth?.username,
+      appName: name,
+    });
+
+    return c.json(success({ message: `Group '${name}' removed`, removed }));
+  }
+
+  if (!canAccess(auth, app)) {
     throw new NotFoundError(`Application '${name}' not found`);
   }
 
@@ -582,6 +611,22 @@ apps.delete('/:name', async c => {
     }
   }
 
+  // If this app was a monorepo group child and is now the LAST remaining
+  // child of its group, also remove the group's CONTAINER folder
+  // (webapps/<group>/, holding the root drop.yaml with `services:`) — left
+  // behind, it would regenerate the just-deleted child on the watcher's next
+  // scan.
+  if (app.group) {
+    const remainingSiblings = stateManager.getAllApps().filter(a => a.group === app.group);
+    if (remainingSiblings.length === 0) {
+      try {
+        await fs.rm(path.join(getAppsDirectory(), app.group), { recursive: true, force: true });
+      } catch {
+        // Container folder may already be gone
+      }
+    }
+  }
+
   await tryLogActivity({
     action: 'delete',
     userId: auth?.userId,
@@ -644,6 +689,16 @@ apps.post('/:name/stop', async c => {
   try {
     await pm.stop(name);
     await stateManager.setAppStatus(name, 'stopped');
+
+    // Best-effort: a stopped app has no upstream to proxy to, so its Caddy
+    // routes should go too (M4 route-leak fix). A later restart re-adds them
+    // via the app:started -> handleConfigureRoute handler, so removing them
+    // here is safe. Non-fatal — a failure here shouldn't fail the stop.
+    try {
+      await getRouterService().removeRoutesForApp(name);
+    } catch {
+      // Router may not be initialised (tests / standalone ApiServer)
+    }
 
     await tryLogActivity({
       action: 'stop',

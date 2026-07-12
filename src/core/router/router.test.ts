@@ -500,6 +500,99 @@ describe('RouterService', () => {
     });
   });
 
+  describe('removeRoutesForApp (M4: route-leak fix)', () => {
+    it('removes all routes owned by an app across multiple domains', async () => {
+      const router = new RouterService({
+        caddy: { caddyfilePath: testCaddyfilePath },
+      });
+
+      // Two domains for the same owning app (e.g. default host + a custom domain).
+      await router.addRoute({
+        appName: 'myapp-myapp-localhost',
+        owner: 'myapp',
+        hostname: 'myapp.localhost',
+        upstream: 'localhost:3000',
+        ssl: false,
+        redirectHttps: false,
+      });
+      await router.addRoute({
+        appName: 'myapp-custom-example-com',
+        owner: 'myapp',
+        hostname: 'custom.example.com',
+        upstream: 'localhost:3000',
+        ssl: false,
+        redirectHttps: false,
+      });
+      // A route owned by a different app must survive.
+      await router.addRoute({
+        appName: 'other-other-localhost',
+        owner: 'other',
+        hostname: 'other.localhost',
+        upstream: 'localhost:3001',
+        ssl: false,
+        redirectHttps: false,
+      });
+
+      await router.removeRoutesForApp('myapp');
+
+      expect(router.hasRoute('myapp-myapp-localhost')).toBe(false);
+      expect(router.hasRoute('myapp-custom-example-com')).toBe(false);
+      expect(router.hasRoute('other-other-localhost')).toBe(true);
+      expect(router.routeCount).toBe(1);
+    });
+
+    it('is a no-op (no throw) when the owner has no routes', async () => {
+      const router = new RouterService({
+        caddy: { caddyfilePath: testCaddyfilePath },
+      });
+
+      await expect(router.removeRoutesForApp('ghost')).resolves.toBeUndefined();
+      expect(router.routeCount).toBe(0);
+    });
+
+    it('does not regenerate the Caddyfile when nothing matches', async () => {
+      const router = new RouterService({
+        caddy: { caddyfilePath: testCaddyfilePath },
+      });
+
+      await router.addRoute({
+        appName: 'kept-kept-localhost',
+        owner: 'kept',
+        hostname: 'kept.localhost',
+        upstream: 'localhost:3000',
+        ssl: false,
+        redirectHttps: false,
+      });
+
+      mockFs.writeFile.mockClear();
+
+      await router.removeRoutesForApp('ghost');
+
+      expect(mockFs.writeFile).not.toHaveBeenCalled();
+      expect(router.hasRoute('kept-kept-localhost')).toBe(true);
+    });
+
+    it('leaves existing removeRoute (single, exact-key) behavior intact', async () => {
+      const router = new RouterService({
+        caddy: { caddyfilePath: testCaddyfilePath },
+      });
+
+      await router.addRoute({
+        appName: 'solo-app',
+        owner: 'solo-app',
+        hostname: 'solo.localhost',
+        upstream: 'localhost:3000',
+        ssl: false,
+        redirectHttps: false,
+      });
+
+      await router.removeRoute('solo-app');
+
+      expect(router.hasRoute('solo-app')).toBe(false);
+      await expect(router.removeRoute('solo-app')).rejects.toThrow('Route not found');
+    });
+  });
+
   describe('updateRoute', () => {
     it('should update an existing route', async () => {
       const router = new RouterService({

@@ -1000,6 +1000,7 @@ backup:
     setPlatformOps({
       restartApp: (name) => this.restartApp(name),
       isAppInProgress: (name) => this.appsInProgress.has(name),
+      removeGroup: (name) => this.removeGroup(name),
     });
 
     this.logger.info(`API server running on port ${this.config.apiPort}`, 'API');
@@ -1240,24 +1241,42 @@ backup:
     // fires from the watcher's chokidar unlinkDir handler (a folder momentarily
     // vanishing, e.g. mid-redeploy) and would free a live/just-redeployed app's
     // port out from under it. See docs/plans/2026-07-07-p2-5-disk-and-port-guards.md.
-    const deletedSub = this.eventBus.subscribe('app:deleted', (payload) => {
-      this.handleAppDeleted(payload);
+    const deletedSub = this.eventBus.subscribe('app:deleted', async (payload) => {
+      await this.handleAppDeleted(payload);
     });
     this.subscriptions.push(deletedSub);
   }
 
   /**
-   * Release every port owned by a deleted app. Reverse-lookup over
-   * `usedPorts` (Map<port, appName>) rather than a single stored port,
-   * because the map is the only place ownership is tracked. Excludes the
-   * '__anonymous__' sentinel, which never corresponds to a real app name.
+   * Release every port owned by a deleted app, and remove any Caddy routes
+   * it still owns. Reverse-lookup over `usedPorts` (Map<port, appName>)
+   * rather than a single stored port, because the map is the only place
+   * ownership is tracked. Excludes the '__anonymous__' sentinel, which never
+   * corresponds to a real app name.
+   *
+   * Route removal is the general fix for M4's route-leak: `app:deleted` is
+   * published by every `stateManager.removeApp` call (the only production
+   * call site is the DELETE /apps/:name route, including via
+   * `teardownApp`/`removeGroup`'s own explicit — and here, redundant but
+   * harmless — removal), so hooking it here covers deletion universally, not
+   * just the paths that happen to also call `removeRoutesForApp` directly.
    */
-  private handleAppDeleted(payload: AppDeletedPayload): void {
+  private async handleAppDeleted(payload: AppDeletedPayload): Promise<void> {
     for (const [port, owner] of this.usedPorts.entries()) {
       if (owner === payload.name && owner !== '__anonymous__') {
         this.usedPorts.delete(port);
         this.logger.debug(`Released port ${port} for deleted app ${payload.name}`, 'PORT');
       }
+    }
+
+    try {
+      await this.router?.removeRoutesForApp(payload.appId);
+    } catch (err) {
+      this.logger.warn(
+        `Failed to remove routes for deleted app ${payload.appId}`,
+        'ROUTER',
+        err
+      );
     }
   }
 
@@ -1998,6 +2017,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
 
         await this.router.addRoute({
           appName: `${appName}-${hostname.replace(/\./g, '-')}`, // Unique route name per domain
+          owner: appName, // Bare owning app name — lets removeRoutesForApp find every route this app owns
           hostname,
           ...(routePathPrefix ? { pathPrefix: routePathPrefix } : {}),
           upstream: `localhost:${port}`,
@@ -2380,6 +2400,134 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     } finally {
       this.appsInProgress.delete(appName);
     }
+  }
+
+  /**
+   * Full app teardown — mirrors the steps DELETE /apps/:name performs
+   * (stop+delete the runtime process, remove Caddy routes, dump-then-drop
+   * the provisioned database unless `keepData`, remove state/secrets/deploy
+   * history/config, delete the generated folder). Used directly by
+   * `removeGroup` for each group child; the DELETE route itself keeps its
+   * own inline copy of these steps (not refactored to call this, to avoid
+   * risk to the working single-app delete path — see M4 plan).
+   *
+   * Every step is independently best-effort (try/catch) so one failing step
+   * (e.g. no provisioned database, PM2 already gone) never aborts the rest
+   * of the teardown.
+   */
+  private async teardownApp(name: string, opts: { keepData?: boolean } = {}): Promise<void> {
+    // Resolve the on-disk path BEFORE removing config/state — both are the
+    // only places it's recorded, and both get deleted below.
+    const appPath =
+      this.appConfigService?.getConfig(name)?.path ??
+      this.stateManager?.getApp(name)?.path ??
+      path.join(this.config.appsDirectory, name);
+
+    try {
+      await this.runtime?.stop(name);
+      await this.runtime?.delete(name);
+    } catch {
+      // Process might not exist in the runtime
+    }
+
+    // Explicit + deterministic: `stateManager.removeApp` below also triggers
+    // this via `app:deleted` -> `handleAppDeleted`, but that's fire-and-forget
+    // from this method's perspective. Calling it here directly means a caller
+    // awaiting `teardownApp` (e.g. `removeGroup`, before it removes the group
+    // container folder) knows routes are actually gone. The event-driven call
+    // that follows is a harmless no-op (removeRoutesForApp no-ops when there's
+    // nothing left to remove).
+    try {
+      await this.router?.removeRoutesForApp(name);
+    } catch (err) {
+      this.logger.warn(`Failed to remove routes for ${name}`, 'ROUTER', err);
+    }
+
+    if (!opts.keepData) {
+      try {
+        await this.dbProvisioner?.backupAndDeleteAppDatabase(name);
+      } catch (err) {
+        this.logger.warn(`Database teardown failed for ${name}`, 'DATABASE', err);
+      }
+    }
+
+    try {
+      await this.stateManager?.removeApp(name);
+    } catch (err) {
+      this.logger.warn(`Failed to remove state for ${name}`, 'STATE', err);
+    }
+
+    try {
+      await this.secretManager?.deleteAll(name);
+    } catch {
+      // Secret manager may not be initialised
+    }
+
+    try {
+      getDeployTracker().purgeApp(name);
+    } catch {
+      // Deploy tracker may not be initialised
+    }
+
+    try {
+      await this.appConfigService?.deleteConfig(name);
+    } catch {
+      // Config may not exist
+    }
+
+    try {
+      await fs.rm(appPath, { recursive: true, force: true });
+    } catch {
+      // Folder may already be gone
+    }
+  }
+
+  /**
+   * Tear down every app belonging to a monorepo group (M4): each child gets
+   * the full `teardownApp` treatment, then the group's CONTAINER folder
+   * (`webapps/<group>/`, which holds the root drop.yaml with `services:`) is
+   * removed too — otherwise it would regenerate the deleted children on the
+   * watcher's next scan. Per-child failures are isolated so one bad child
+   * doesn't abort teardown of the rest. Exposed to the API via the
+   * platform-ops seam (`removeGroup`).
+   */
+  async removeGroup(groupName: string): Promise<{ removed: string[] }> {
+    const children = this.stateManager?.getAllApps().filter((a) => a.group === groupName) ?? [];
+    const removed: string[] = [];
+
+    for (const child of children) {
+      try {
+        await this.teardownApp(child.name);
+        removed.push(child.name);
+      } catch (err) {
+        this.logger.error(
+          `Failed to tear down '${child.name}' in group '${groupName}'`,
+          'MONOREPO',
+          err
+        );
+      }
+    }
+
+    // Defense-in-depth before a recursive fs.rm: the container path is derived
+    // from a `group` tag. That tag is already transitively constrained to
+    // [A-Za-z0-9_-] (expandMonorepo only creates children whose `<group>-<svc>`
+    // name passes that regex), but re-assert it here so this destructive delete
+    // can never escape the webapps directory even if a group value is ever set
+    // by a future/other code path.
+    if (/^[a-zA-Z0-9_-]+$/.test(groupName)) {
+      try {
+        await fs.rm(path.join(this.config.appsDirectory, groupName), { recursive: true, force: true });
+      } catch (err) {
+        this.logger.warn(`Failed to remove group container folder for '${groupName}'`, 'MONOREPO', err);
+      }
+    } else {
+      this.logger.warn(
+        `Refusing to remove container folder for group '${groupName}': unsafe name`,
+        'MONOREPO'
+      );
+    }
+
+    return { removed };
   }
 
   /**

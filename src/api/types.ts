@@ -52,6 +52,13 @@ export interface AppDto {
   userId?: string;
   ownerName?: string;
   customDomain?: string;
+  /**
+   * Grouping tag for apps expanded from a single monorepo deploy (e.g. a repo
+   * `ezsign` with `services: {backend, frontend}` expands to apps
+   * `ezsign-backend` / `ezsign-frontend`, both tagged `group: ezsign`). Absent
+   * for standalone apps. See docs/plans/2026-07-12-monorepo-multi-service.md.
+   */
+  group?: string;
   /** Live memory usage in bytes (from runtime; null when not running or unavailable). */
   memory?: number | null;
   /** Live CPU usage percent (from runtime; null when not running or unavailable). */
