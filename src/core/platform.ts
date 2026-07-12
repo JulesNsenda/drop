@@ -1724,6 +1724,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       }
 
       const buildEnv = await this.resolveBuildEnv(appPath, appName);
+      const buildOverride = (await parseDropYaml(appPath)).config?.build;
 
       const result = await this.builder.build({
         appName,
@@ -1731,7 +1732,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         appType: detection.type,
         framework: detection.framework || null,
         config: {
-          buildCommand: detection.suggestedConfig?.buildCommand,
+          buildCommand: buildOverride ?? detection.suggestedConfig?.buildCommand,
           installCommand: detection.suggestedConfig?.installCommand,
         },
         env: buildEnv,
@@ -2180,13 +2181,14 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       let buildResult;
       try {
         const buildEnv = await this.resolveBuildEnv(appPath, appName);
+        const buildOverride = (await parseDropYaml(appPath)).config?.build;
         buildResult = await this.builder.build({
           appName,
           appPath,
           appType: detection.type,
           framework: detection.framework || null,
           config: {
-            buildCommand: detection.suggestedConfig?.buildCommand,
+            buildCommand: buildOverride ?? detection.suggestedConfig?.buildCommand,
             installCommand: detection.suggestedConfig?.installCommand,
           },
           env: buildEnv,
@@ -2623,6 +2625,14 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     let interpreter: string | undefined;
     let args: string[] | undefined;
 
+    // Honor an explicit `start` command from drop.yaml as an override. The
+    // manifest detector only reads the object form `start.command`, so a plain
+    // `start: node dist/server.js` string (including the ones monorepo
+    // expansion writes into each child's drop.yaml) was previously ignored,
+    // leaving e.g. a TypeScript backend stuck on the `node index.js` default.
+    const dropYamlCfg = await parseDropYaml(appPath);
+    const startOverride = dropYamlCfg.success ? dropYamlCfg.config?.start : undefined;
+
     if (detection.type === 'static' || detection.type === 'spa') {
       if (this.config.isolation === 'docker') {
         const outputSubdir = detection.suggestedConfig?.outputDirectory || '';
@@ -2651,11 +2661,11 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         args = [serveDir, '-s'];
       }
     } else if (detection.type === 'go') {
-      const startCommand = detection.suggestedConfig?.startCommand || `./${appName}`;
+      const startCommand = startOverride || detection.suggestedConfig?.startCommand || `./${appName}`;
       script = startCommand;
       interpreter = 'none';
     } else {
-      const startCommand = detection.suggestedConfig?.startCommand || 'node index.js';
+      const startCommand = startOverride || detection.suggestedConfig?.startCommand || 'node index.js';
       script = startCommand.startsWith('node ')
         ? startCommand.substring(5)
         : startCommand;
@@ -2676,8 +2686,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       this.logger.info(`Injecting ${Object.keys(secretEnvVars).length} secret(s)`, 'SECURITY');
     }
 
-    const dropYaml = await parseDropYaml(appPath);
-    const healthCheckPath = dropYaml.success ? dropYaml.config?.healthCheck : undefined;
+    const healthCheckPath = dropYamlCfg.success ? dropYamlCfg.config?.healthCheck : undefined;
 
     const { outFile, errorFile } = await this.getAppLogPaths(appName);
 
@@ -2746,7 +2755,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         // DROP_DATA_DIR, DROP_API_URL/KEY, DATABASE_URL) still override it and
         // a tenant cannot hijack them. `build_env` is intentionally NOT
         // injected here — it is build-only by design.
-        ...this.coerceEnvRecord(dropYaml.success ? dropYaml.config?.env : undefined),
+        ...this.coerceEnvRecord(dropYamlCfg.success ? dropYamlCfg.config?.env : undefined),
         ...secretEnvVars,
         NODE_ENV: 'production',
         PORT: port.toString(),
