@@ -270,6 +270,64 @@ describe('DropPlatform', () => {
     });
   });
 
+  // Regression guard for the docker-isolation start bugs: Docker execs the
+  // container Cmd array directly with NO shell, so a multi-token start command
+  // ("gunicorn --bind 0.0.0.0:$PORT app:app", "node dist/server.js") must be
+  // wrapped in /bin/sh -c or runc fails with "executable file not found", and
+  // $PORT never expands. These assert what buildStartSpec ACTUALLY emits under
+  // docker isolation — the ContainerManager unit tests hand-craft specs and so
+  // cannot catch a regression here. (fs.access is globally mocked to resolve,
+  // so pathExists('.venv') is true; the python case therefore gets the venv
+  // PATH prefix.)
+  describe('buildStartSpec docker command shaping', () => {
+    let dockerPlatform: DropPlatform;
+
+    beforeEach(() => {
+      dockerPlatform = createPlatform({
+        dropRoot: tempDir,
+        appsDirectory: path.join(tempDir, 'apps'),
+        logLevel: 'error',
+        caddyfilePath: path.join(tempDir, 'Caddyfile'),
+      });
+      (dockerPlatform as any).config.isolation = 'docker';
+    });
+
+    const detection = (type: string, startCommand: string): DetectionResult =>
+      ({
+        type,
+        framework: null,
+        confidence: 1,
+        suggestedConfig: { startCommand },
+      }) as unknown as DetectionResult;
+
+    const build = (appName: string, det: DetectionResult) =>
+      (dockerPlatform as any).buildStartSpec(
+        appName,
+        path.join(tempDir, appName),
+        det,
+        4000,
+        path.join(tempDir, 'data', appName),
+        {}
+      );
+
+    it('wraps a python gunicorn command in /bin/sh -c with the venv on PATH', async () => {
+      const spec = await build('pyapp', detection('flask', 'gunicorn --bind 0.0.0.0:$PORT app:app'));
+      expect(spec.script).toBe('/bin/sh');
+      expect(spec.interpreter).toBe('none');
+      expect(spec.args).toEqual([
+        '-c',
+        'export PATH="/app/.venv/bin:$PATH"; gunicorn --bind 0.0.0.0:$PORT app:app',
+      ]);
+    });
+
+    it('wraps a node start command in /bin/sh -c with no venv prefix', async () => {
+      const spec = await build('nodeapp', detection('nodejs', 'node dist/server.js'));
+      expect(spec.script).toBe('/bin/sh');
+      expect(spec.interpreter).toBe('none');
+      expect(spec.args).toEqual(['-c', 'node dist/server.js']);
+    });
+  });
+
   describe('start', () => {
     it('should start the platform', async () => {
       const startedHandler = jest.fn();
