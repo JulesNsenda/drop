@@ -6,6 +6,7 @@
 
 import * as path from 'path';
 import * as os from 'os';
+import * as fsPromises from 'fs/promises';
 import { DropPlatform, createPlatform } from './platform';
 import { eventBus } from './event-bus';
 import * as diskUtils from '../utils/disk';
@@ -1025,5 +1026,245 @@ describe('Service accessors', () => {
     expect(platform.getBuilder()).not.toBeNull();
     expect(platform.getProcessManager()).not.toBeNull();
     expect(platform.getRouter()).not.toBeNull();
+  });
+});
+
+describe('resolveBuildEnv / resolveDependencies (M1: build-time env + browser-reachable depends_on)', () => {
+  let platform: DropPlatform;
+  let tempDir: string;
+  // Content returned for any path ending in a drop.yaml filename; null means
+  // "no drop.yaml" (parseDropYaml sees the ENOENT thrown below as a failed
+  // parse, same net effect as absent for our purposes — no config).
+  let dropYamlContent: string | null;
+
+  beforeAll(() => {
+    // Override just for this suite: the shared fs/promises mock's default
+    // readFile only special-cases package.json. Route anything ending in a
+    // drop.yaml filename through the test-controlled `dropYamlContent`, so
+    // parseDropYaml (used by both resolveBuildEnv and resolveDependencies)
+    // sees real, per-test YAML instead of throwing ENOENT.
+    (fsPromises.readFile as jest.Mock).mockImplementation(async (filePath: unknown) => {
+      const p = String(filePath);
+      if (/drop\.ya?ml$/.test(p) || /\.drop\.ya?ml$/.test(p)) {
+        if (dropYamlContent === null) {
+          const err = new Error('ENOENT') as NodeJS.ErrnoException;
+          err.code = 'ENOENT';
+          throw err;
+        }
+        return dropYamlContent;
+      }
+      const err = new Error('ENOENT') as NodeJS.ErrnoException;
+      err.code = 'ENOENT';
+      throw err;
+    });
+  });
+
+  afterAll(() => {
+    // Restore the file-level default so later-running suites (if any) aren't
+    // affected — this suite is the last in the file, but keep it hygienic.
+    (fsPromises.readFile as jest.Mock).mockImplementation(async (filePath: string) => {
+      if (filePath.endsWith('package.json')) {
+        return JSON.stringify({
+          name: 'test-app',
+          version: '1.0.0',
+          scripts: { start: 'node index.js', build: 'echo build' },
+        });
+      }
+      const actual = jest.requireActual('fs/promises') as typeof fsPromises;
+      return actual.readFile(filePath as never);
+    });
+  });
+
+  beforeEach(() => {
+    dropYamlContent = null;
+    tempDir = path.join(os.tmpdir(), `drop-test-${Date.now()}-${Math.random()}`);
+  });
+
+  afterEach(async () => {
+    if (platform && platform.isActive()) {
+      await platform.stop();
+    }
+  });
+
+  describe('resolveBuildEnv', () => {
+    it('merges env -> build_env -> depends_on (later wins) and coerces scalars to strings', async () => {
+      platform = createPlatform({
+        dropRoot: tempDir,
+        appsDirectory: path.join(tempDir, 'apps'),
+        logLevel: 'error',
+        domainSuffix: 'localhost',
+      });
+      (platform as any).appConfigService = {
+        getConfig: jest.fn().mockReturnValue({ port: 4001 }),
+      };
+
+      dropYamlContent = [
+        'env:',
+        '  NODE_ENV: production',
+        '  SHARED: from-env',
+        'build_env:',
+        '  VITE_API_URL: /api',
+        '  VITE_PORT: 5173',
+        '  VITE_DEBUG: true',
+        '  SHARED: from-build-env',
+        'depends_on:',
+        '  - name: backend',
+        '    env: SHARED',
+        '    path: /api',
+      ].join('\n');
+
+      const result = await (platform as any).resolveBuildEnv(
+        path.join(tempDir, 'apps', 'app'),
+        'app'
+      );
+
+      expect(result.NODE_ENV).toBe('production');
+      expect(result.VITE_API_URL).toBe('/api');
+      expect(result.VITE_PORT).toBe('5173'); // number coerced to string
+      expect(result.VITE_DEBUG).toBe('true'); // boolean coerced to string
+      // depends_on beats both env and build_env for the same key.
+      expect(result.SHARED).toBe('http://localhost:4001/api');
+    });
+
+    it('returns an empty object when there is no valid drop.yaml', async () => {
+      platform = createPlatform({
+        dropRoot: tempDir,
+        appsDirectory: path.join(tempDir, 'apps'),
+        logLevel: 'error',
+      });
+      dropYamlContent = null;
+
+      const result = await (platform as any).resolveBuildEnv(
+        path.join(tempDir, 'apps', 'app'),
+        'app'
+      );
+
+      expect(result).toEqual({});
+    });
+  });
+
+  describe('resolveDependencies', () => {
+    it('resolves to the dependency custom domain (browser-reachable), honoring path — not localhost:port', async () => {
+      platform = createPlatform({
+        dropRoot: tempDir,
+        appsDirectory: path.join(tempDir, 'apps'),
+        logLevel: 'error',
+        enableHttps: true,
+        domainSuffix: 'dropkit.sh',
+      });
+      (platform as any).appConfigService = {
+        getConfig: jest.fn().mockReturnValue({ domains: ['api.example.com'], port: 4002 }),
+      };
+
+      dropYamlContent = [
+        'depends_on:',
+        '  - name: api',
+        '    env: API_URL',
+        '    path: /v1',
+      ].join('\n');
+
+      const result = await (platform as any).resolveDependencies(
+        path.join(tempDir, 'apps', 'frontend'),
+        'frontend'
+      );
+
+      expect(result.API_URL).toBe('https://api.example.com/v1');
+    });
+
+    it('falls back to <dep>.<domainSuffix> when a real domain suffix is configured and the dep has no custom domain', async () => {
+      platform = createPlatform({
+        dropRoot: tempDir,
+        appsDirectory: path.join(tempDir, 'apps'),
+        logLevel: 'error',
+        enableHttps: true,
+        domainSuffix: 'dropkit.sh',
+      });
+      (platform as any).appConfigService = {
+        getConfig: jest.fn().mockReturnValue({ port: 4003 }),
+      };
+
+      dropYamlContent = [
+        'depends_on:',
+        '  - name: backend',
+        '    env: BACKEND_URL',
+      ].join('\n');
+
+      const result = await (platform as any).resolveDependencies(
+        path.join(tempDir, 'apps', 'frontend'),
+        'frontend'
+      );
+
+      expect(result.BACKEND_URL).toBe('https://backend.dropkit.sh');
+    });
+
+    it('falls back to http://localhost:<configPort> for pure local dev (no real domain configured)', async () => {
+      platform = createPlatform({
+        dropRoot: tempDir,
+        appsDirectory: path.join(tempDir, 'apps'),
+        logLevel: 'error',
+        // domainSuffix defaults to 'localhost', enableHttps defaults to false
+      });
+      (platform as any).appConfigService = {
+        getConfig: jest.fn().mockReturnValue({ port: 4004 }),
+      };
+
+      dropYamlContent = [
+        'depends_on:',
+        '  - name: backend',
+        '    env: BACKEND_URL',
+      ].join('\n');
+
+      const result = await (platform as any).resolveDependencies(
+        path.join(tempDir, 'apps', 'frontend'),
+        'frontend'
+      );
+
+      expect(result.BACKEND_URL).toBe('http://localhost:4004');
+    });
+
+    it('warns and omits the env var when the dependency is unregistered (no config)', async () => {
+      platform = createPlatform({
+        dropRoot: tempDir,
+        appsDirectory: path.join(tempDir, 'apps'),
+        logLevel: 'error',
+      });
+      (platform as any).appConfigService = {
+        getConfig: jest.fn().mockReturnValue(undefined),
+      };
+      const warnSpy = jest.spyOn((platform as any).logger, 'warn').mockImplementation(() => undefined);
+
+      dropYamlContent = [
+        'depends_on:',
+        '  - name: ghost',
+        '    env: GHOST_URL',
+      ].join('\n');
+
+      const result = await (platform as any).resolveDependencies(
+        path.join(tempDir, 'apps', 'frontend'),
+        'frontend'
+      );
+
+      expect(result).toEqual({});
+      expect(warnSpy).toHaveBeenCalledWith(
+        expect.stringContaining('ghost'),
+        'DEPS'
+      );
+    });
+
+    it('resolves an empty object when depends_on is absent', async () => {
+      platform = createPlatform({
+        dropRoot: tempDir,
+        appsDirectory: path.join(tempDir, 'apps'),
+        logLevel: 'error',
+      });
+      dropYamlContent = 'name: frontend';
+
+      const result = await (platform as any).resolveDependencies(
+        path.join(tempDir, 'apps', 'frontend'),
+        'frontend'
+      );
+
+      expect(result).toEqual({});
+    });
   });
 });

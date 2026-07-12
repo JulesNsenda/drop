@@ -1296,53 +1296,126 @@ backup:
   }
 
   /**
-   * Parse drop.yaml and resolve depends_on to get dependency URLs
-   * Returns environment variables to inject based on dependent apps
+   * Parse drop.yaml and resolve depends_on to get dependency URLs.
+   * Returns environment variables to inject based on dependent apps.
+   *
+   * Resolution is config-based (via appConfigService.getConfig), NOT the
+   * running app's runtime port — a dependency need only be REGISTERED, not
+   * running, for this to resolve, which removes build-ordering. It also
+   * means the URL is browser-reachable (hostname-based) whenever the
+   * dependency has a custom domain or the platform serves a real domain
+   * suffix, instead of always being a server-local `localhost:<port>` that a
+   * browser can never reach.
    */
   private async resolveDependencies(appPath: string, appName: string): Promise<Record<string, string>> {
     const envVars: Record<string, string> = {};
 
-    try {
-      const dropYamlPath = path.join(appPath, 'drop.yaml');
-      await fs.access(dropYamlPath);
+    const dropYaml = await parseDropYaml(appPath);
+    if (!dropYaml.success || !dropYaml.config?.depends_on?.length) {
+      return envVars;
+    }
 
-      const content = await fs.readFile(dropYamlPath, 'utf-8');
-
-      // Simple YAML parsing for depends_on section
-      // Format:
-      // depends_on:
-      //   - name: todo-api
-      //     env: API_URL
-      const dependsOnMatch = content.match(/depends_on:\s*\n((?:\s+-[^\n]+\n?)+)/);
-      if (!dependsOnMatch) return envVars;
-
-      const dependsOnBlock = dependsOnMatch[1];
-      const dependencies: Array<{ name: string; env: string }> = [];
-
-      // Parse each dependency
-      const depMatches = dependsOnBlock.matchAll(/-\s*name:\s*(\S+)\s*\n\s*env:\s*(\S+)/g);
-      for (const match of depMatches) {
-        dependencies.push({ name: match[1], env: match[2] });
+    for (const dep of dropYaml.config.depends_on) {
+      const baseUrl = this.resolveDependencyUrl(dep.name);
+      if (!baseUrl) {
+        this.logger.warn(`Dependency ${dep.name} not found or not configured for ${appName}`, 'DEPS');
+        continue;
       }
 
-      // Resolve each dependency
-      for (const dep of dependencies) {
-        if (!this.stateManager) continue;
-
-        const depApp = this.stateManager.getApp(dep.name);
-        if (depApp && depApp.port) {
-          const url = `http://localhost:${depApp.port}`;
-          envVars[dep.env] = url;
-          this.logger.info(`Resolved dependency ${dep.name} -> ${dep.env}=${url}`, 'DEPS');
-        } else {
-          this.logger.warn(`Dependency ${dep.name} not found or not running for ${appName}`, 'DEPS');
-        }
-      }
-    } catch {
-      // No drop.yaml or parsing error - not a problem
+      const url = dep.path ? this.joinDependencyUrlPath(baseUrl, dep.path) : baseUrl;
+      envVars[dep.env] = url;
+      this.logger.info(`Resolved dependency ${dep.name} -> ${dep.env}=${url}`, 'DEPS');
     }
 
     return envVars;
+  }
+
+  /**
+   * Resolve the browser-reachable base URL for a registered dependency app,
+   * from its persisted config — never the runtime/state-manager port.
+   *
+   * Precedence:
+   * 1. The dependency's own custom domain (drop.yaml `domains`), if set.
+   * 2. The platform's default hostname for the app (`<dep>.<domainSuffix>`),
+   *    whenever a real (non-localhost) domain suffix is configured — this is
+   *    the same hostname handleConfigureRoute always registers a route for,
+   *    regardless of `enableHttps` (which only toggles TLS on that route, so
+   *    protocol - not existence - is what depends on it).
+   * 3. `http://localhost:<port>` as the pure-local-dev fallback, using the
+   *    dependency's *configured* port (source of truth across restarts).
+   *
+   * Returns undefined when the dependency has no config at all (unknown /
+   * not yet registered) or no fallback is resolvable.
+   */
+  private resolveDependencyUrl(depName: string): string | undefined {
+    const depConfig = this.appConfigService?.getConfig(depName);
+    if (!depConfig) return undefined;
+
+    const domainSuffix = this.config.domainSuffix || 'localhost';
+
+    const customDomain =
+      depConfig.domains && depConfig.domains.length > 0 ? depConfig.domains[0] : undefined;
+    if (customDomain) {
+      const protocol = this.config.enableHttps && !isLocalhostDomain(customDomain) ? 'https' : 'http';
+      return `${protocol}://${customDomain}`;
+    }
+
+    if (!isLocalhostDomain(domainSuffix)) {
+      const protocol = this.config.enableHttps ? 'https' : 'http';
+      return `${protocol}://${depName}.${domainSuffix}`;
+    }
+
+    if (depConfig.port) {
+      return `http://localhost:${depConfig.port}`;
+    }
+
+    return undefined;
+  }
+
+  /** Append a drop.yaml dependency `path` to a resolved base URL, normalizing slashes. */
+  private joinDependencyUrlPath(baseUrl: string, depPath: string): string {
+    const base = baseUrl.replace(/\/+$/, '');
+    const suffix = depPath.startsWith('/') ? depPath : `/${depPath}`;
+    return `${base}${suffix}`;
+  }
+
+  /**
+   * Build the env map handed to the builder's child process for a fresh
+   * build (handleBuildApp) or a hot-reload rebuild (handleAppUpdate). Shared
+   * so the two call sites can't drift.
+   *
+   * Precedence (later wins): drop.yaml `env` (runtime env, also usable at
+   * build time) -> drop.yaml `build_env` (build-only, e.g. Vite `VITE_*`
+   * vars a static bundler inlines) -> resolved `depends_on` URLs (highest
+   * precedence — a build must always see the current, browser-reachable
+   * dependency URL, not a stale build-time default).
+   *
+   * All values are coerced to strings: drop.yaml allows number/boolean
+   * scalars, but a child process env must be `Record<string, string>`.
+   */
+  private async resolveBuildEnv(appPath: string, appName: string): Promise<Record<string, string>> {
+    const dropYaml = await parseDropYaml(appPath);
+    const config = dropYaml.success ? dropYaml.config : null;
+
+    const depEnvVars = await this.resolveDependencies(appPath, appName);
+
+    return {
+      ...this.coerceEnvRecord(config?.env),
+      ...this.coerceEnvRecord(config?.build_env),
+      ...depEnvVars,
+    };
+  }
+
+  /** Coerce drop.yaml's string|number|boolean env scalars to plain strings. */
+  private coerceEnvRecord(
+    rec?: Record<string, string | number | boolean>
+  ): Record<string, string> {
+    if (!rec) return {};
+    const out: Record<string, string> = {};
+    for (const [key, value] of Object.entries(rec)) {
+      out[key] = String(value);
+    }
+    return out;
   }
 
   /**
@@ -1442,6 +1515,8 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         );
       }
 
+      const buildEnv = await this.resolveBuildEnv(appPath, appName);
+
       const result = await this.builder.build({
         appName,
         appPath,
@@ -1451,7 +1526,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           buildCommand: detection.suggestedConfig?.buildCommand,
           installCommand: detection.suggestedConfig?.installCommand,
         },
-        env: {},
+        env: buildEnv,
         workDir,
         execCommand,
         onBuildLog: logId && this.buildLogService
@@ -1864,6 +1939,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       this.selfManagedUpdates.add(appName);
       let buildResult;
       try {
+        const buildEnv = await this.resolveBuildEnv(appPath, appName);
         buildResult = await this.builder.build({
           appName,
           appPath,
@@ -1873,7 +1949,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
             buildCommand: detection.suggestedConfig?.buildCommand,
             installCommand: detection.suggestedConfig?.installCommand,
           },
-          env: {},
+          env: buildEnv,
           workDir,
           onBuildLog: updateLogId && this.buildLogService
             ? (line) => this.buildLogService!.writeLine(updateLogId, line)
@@ -2296,6 +2372,13 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       pgSocketDir,
       limits,
       env: {
+        // drop.yaml `env` (tenant config) is the base layer — now injected at
+        // START as well as build, so `env:` is honored end-to-end. Placed
+        // FIRST so secrets and every platform-authoritative var (PORT,
+        // DROP_DATA_DIR, DROP_API_URL/KEY, DATABASE_URL) still override it and
+        // a tenant cannot hijack them. `build_env` is intentionally NOT
+        // injected here — it is build-only by design.
+        ...this.coerceEnvRecord(dropYaml.success ? dropYaml.config?.env : undefined),
         ...secretEnvVars,
         NODE_ENV: 'production',
         PORT: port.toString(),

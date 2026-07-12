@@ -11,7 +11,7 @@ import * as yaml from 'yaml';
 
 /** Keys accepted at the top level of drop.yaml. Any others are rejected. */
 const ALLOWED_TOP_KEYS = new Set([
-  'name', 'domains', 'tls', 'env', 'depends_on', 'port',
+  'name', 'domains', 'tls', 'env', 'build_env', 'depends_on', 'port',
   'build', 'start', 'healthCheck', 'maxBodySize', 'timeout',
 ]);
 
@@ -60,8 +60,15 @@ export interface DropYamlConfig {
   domains?: string[];
   /** TLS configuration */
   tls?: AppTlsConfig;
-  /** Environment variables */
+  /** Environment variables (available at both build and start time) */
   env?: AppEnvConfig;
+  /**
+   * Build-only environment variables — merged into the build child process
+   * alongside `env`, but never injected into the running app at start time.
+   * Useful for values a static-site bundler inlines at build time (e.g.
+   * Vite's `VITE_*` vars) that shouldn't also linger in the runtime env.
+   */
+  build_env?: AppEnvConfig;
   /** App dependencies */
   depends_on?: AppDependency[];
   /** Port override */
@@ -279,6 +286,21 @@ export function validateDropYamlConfig(
       }
       if (typeof v !== 'string' && typeof v !== 'number' && typeof v !== 'boolean') {
         return { valid: false, error: `env.${k} must be a string, number, or boolean` };
+      }
+    }
+  }
+
+  // Validate build_env (same shape/rules as env)
+  if (cfg.build_env !== undefined) {
+    if (typeof cfg.build_env !== 'object' || cfg.build_env === null || Array.isArray(cfg.build_env)) {
+      return { valid: false, error: 'build_env must be an object' };
+    }
+    for (const [k, v] of Object.entries(cfg.build_env as Record<string, unknown>)) {
+      if (!k || typeof k !== 'string') {
+        return { valid: false, error: 'build_env keys must be non-empty strings' };
+      }
+      if (typeof v !== 'string' && typeof v !== 'number' && typeof v !== 'boolean') {
+        return { valid: false, error: `build_env.${k} must be a string, number, or boolean` };
       }
     }
   }
