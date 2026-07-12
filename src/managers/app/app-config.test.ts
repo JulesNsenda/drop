@@ -132,6 +132,50 @@ describe('AppConfigService runtime field', () => {
     });
   });
 
+  describe('group field (M2 monorepo expansion tagging)', () => {
+    it('persists and reloads an explicit group', async () => {
+      await fs.mkdir(path.join(webappsDir, 'ezsign-backend'), { recursive: true });
+
+      const service = makeService();
+      await service.initialize();
+      await service.upsertConfig('ezsign-backend', { type: 'nodejs', group: 'ezsign' });
+
+      expect(service.getConfig('ezsign-backend')?.group).toBe('ezsign');
+
+      // Reload from disk in a fresh service instance
+      const reloaded = makeService();
+      await reloaded.initialize();
+      expect(reloaded.getConfig('ezsign-backend')?.group).toBe('ezsign');
+    });
+
+    it('loads a config with no group unchanged (backward-compat)', async () => {
+      await fs.mkdir(path.join(webappsDir, 'legacy-app'), { recursive: true });
+      // Pre-existing config file written before `group` existed — no group key.
+      await fs.writeFile(
+        path.join(configDir, 'legacy-app.yaml'),
+        'name: legacy-app\ntype: nodejs\nport: 3001\ncreatedAt: "2026-01-01T00:00:00.000Z"\n'
+      );
+
+      const service = makeService();
+      await service.initialize();
+
+      const config = service.getConfig('legacy-app');
+      expect(config).toBeDefined();
+      expect(config?.group).toBeUndefined();
+      expect(config?.port).toBe(3001);
+    });
+
+    it('preserves group across partial updates that do not mention it', async () => {
+      const service = makeService();
+      await service.initialize();
+      await service.upsertConfig('ezsign-frontend', { type: 'static', group: 'ezsign' });
+
+      const updated = await service.upsertConfig('ezsign-frontend', { port: 3010 });
+      expect(updated.group).toBe('ezsign');
+      expect(updated.port).toBe(3010);
+    });
+  });
+
   describe('write serialization (P1-2 lost-update)', () => {
     it('serializes concurrent updates so no field is dropped', async () => {
       const service = makeService();

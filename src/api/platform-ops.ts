@@ -46,6 +46,17 @@ export interface PlatformOps {
    * remains the real backstop.
    */
   isAppInProgress(appName: string): boolean;
+
+  /**
+   * Tear down every app belonging to a monorepo group (M4): stop+delete each
+   * child's runtime process, remove its Caddy routes, dump-then-drop its
+   * database, and remove its state/secrets/deploy-history/config/folder —
+   * then remove the group's container folder so deleted children don't
+   * regenerate on the watcher's next scan. Per-child failures are isolated
+   * (one bad child doesn't abort the rest). Resolves with the names of the
+   * children that were successfully removed.
+   */
+  removeGroup(groupName: string): Promise<{ removed: string[] }>;
 }
 
 let platformOps: PlatformOps | null = null;

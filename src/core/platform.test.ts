@@ -6,8 +6,11 @@
 
 import * as path from 'path';
 import * as os from 'os';
+import * as fsPromises from 'fs/promises';
+import * as yaml from 'yaml';
 import { DropPlatform, createPlatform } from './platform';
 import { eventBus } from './event-bus';
+import { getDetector, parseDropYaml } from './detector';
 import * as diskUtils from '../utils/disk';
 import { createApiKey, deleteApiKeysByName } from '../api/middleware/auth';
 
@@ -116,6 +119,8 @@ jest.mock('../managers/database', () => {
     listDatabases: jest.fn().mockReturnValue([]),
     deleteAppDatabase: jest.fn().mockResolvedValue(undefined),
     getEnvVars: jest.fn().mockReturnValue(null),
+    // M4 group teardown (teardownApp/removeGroup) dump-then-drops via this.
+    backupAndDeleteAppDatabase: jest.fn().mockResolvedValue({ dropped: true }),
   };
 
   return {
@@ -462,6 +467,39 @@ describe('DropPlatform', () => {
       const bus = platform.getEventBus();
 
       expect(bus).toBe(eventBus);
+    });
+  });
+
+  describe('handleAppDeleted route cleanup (M4: route-leak fix)', () => {
+    it('removes every route the deleted app owns, alongside the existing port release', async () => {
+      // The app:deleted subscription (and the real router) are wired by
+      // start().
+      await platform.start();
+
+      const router = (platform as any).router;
+      await router.addRoute({
+        appName: 'gone-gone-localhost',
+        owner: 'gone',
+        hostname: 'gone.localhost',
+        upstream: 'localhost:4009',
+        ssl: false,
+        redirectHttps: false,
+      });
+      expect(router.hasRoute('gone-gone-localhost')).toBe(true);
+
+      const portA = (platform as any).allocatePort('gone');
+      eventBus.publish('app:deleted', { appId: 'gone', name: 'gone' });
+
+      // Port release is synchronous within the async handler (runs before the
+      // first await), so it's observable immediately.
+      expect((platform as any).usedPorts.has(portA)).toBe(false);
+
+      // Route removal happens in a chain of awaits inside the fire-and-forget
+      // async event handler (router.removeRoutesForApp -> regenerateConfig ->
+      // fs.mkdir/writeFile) — flush the microtask queue before asserting.
+      await new Promise((resolve) => setImmediate(resolve));
+
+      expect(router.hasRoute('gone-gone-localhost')).toBe(false);
     });
   });
 });
@@ -1025,5 +1063,824 @@ describe('Service accessors', () => {
     expect(platform.getBuilder()).not.toBeNull();
     expect(platform.getProcessManager()).not.toBeNull();
     expect(platform.getRouter()).not.toBeNull();
+  });
+});
+
+describe('resolveBuildEnv / resolveDependencies (M1: build-time env + browser-reachable depends_on)', () => {
+  let platform: DropPlatform;
+  let tempDir: string;
+  // Content returned for any path ending in a drop.yaml filename; null means
+  // "no drop.yaml" (parseDropYaml sees the ENOENT thrown below as a failed
+  // parse, same net effect as absent for our purposes — no config).
+  let dropYamlContent: string | null;
+
+  beforeAll(() => {
+    // Override just for this suite: the shared fs/promises mock's default
+    // readFile only special-cases package.json. Route anything ending in a
+    // drop.yaml filename through the test-controlled `dropYamlContent`, so
+    // parseDropYaml (used by both resolveBuildEnv and resolveDependencies)
+    // sees real, per-test YAML instead of throwing ENOENT.
+    (fsPromises.readFile as jest.Mock).mockImplementation(async (filePath: unknown) => {
+      const p = String(filePath);
+      if (/drop\.ya?ml$/.test(p) || /\.drop\.ya?ml$/.test(p)) {
+        if (dropYamlContent === null) {
+          const err = new Error('ENOENT') as NodeJS.ErrnoException;
+          err.code = 'ENOENT';
+          throw err;
+        }
+        return dropYamlContent;
+      }
+      const err = new Error('ENOENT') as NodeJS.ErrnoException;
+      err.code = 'ENOENT';
+      throw err;
+    });
+  });
+
+  afterAll(() => {
+    // Restore the file-level default so later-running suites (if any) aren't
+    // affected — this suite is the last in the file, but keep it hygienic.
+    (fsPromises.readFile as jest.Mock).mockImplementation(async (filePath: string) => {
+      if (filePath.endsWith('package.json')) {
+        return JSON.stringify({
+          name: 'test-app',
+          version: '1.0.0',
+          scripts: { start: 'node index.js', build: 'echo build' },
+        });
+      }
+      const actual = jest.requireActual('fs/promises') as typeof fsPromises;
+      return actual.readFile(filePath as never);
+    });
+  });
+
+  beforeEach(() => {
+    dropYamlContent = null;
+    tempDir = path.join(os.tmpdir(), `drop-test-${Date.now()}-${Math.random()}`);
+  });
+
+  afterEach(async () => {
+    if (platform && platform.isActive()) {
+      await platform.stop();
+    }
+  });
+
+  describe('resolveBuildEnv', () => {
+    it('merges env -> build_env -> depends_on (later wins) and coerces scalars to strings', async () => {
+      platform = createPlatform({
+        dropRoot: tempDir,
+        appsDirectory: path.join(tempDir, 'apps'),
+        logLevel: 'error',
+        domainSuffix: 'localhost',
+      });
+      (platform as any).appConfigService = {
+        getConfig: jest.fn().mockReturnValue({ port: 4001 }),
+      };
+
+      dropYamlContent = [
+        'env:',
+        '  NODE_ENV: production',
+        '  SHARED: from-env',
+        'build_env:',
+        '  VITE_API_URL: /api',
+        '  VITE_PORT: 5173',
+        '  VITE_DEBUG: true',
+        '  SHARED: from-build-env',
+        'depends_on:',
+        '  - name: backend',
+        '    env: SHARED',
+        '    path: /api',
+      ].join('\n');
+
+      const result = await (platform as any).resolveBuildEnv(
+        path.join(tempDir, 'apps', 'app'),
+        'app'
+      );
+
+      expect(result.NODE_ENV).toBe('production');
+      expect(result.VITE_API_URL).toBe('/api');
+      expect(result.VITE_PORT).toBe('5173'); // number coerced to string
+      expect(result.VITE_DEBUG).toBe('true'); // boolean coerced to string
+      // depends_on beats both env and build_env for the same key.
+      expect(result.SHARED).toBe('http://localhost:4001/api');
+    });
+
+    it('returns an empty object when there is no valid drop.yaml', async () => {
+      platform = createPlatform({
+        dropRoot: tempDir,
+        appsDirectory: path.join(tempDir, 'apps'),
+        logLevel: 'error',
+      });
+      dropYamlContent = null;
+
+      const result = await (platform as any).resolveBuildEnv(
+        path.join(tempDir, 'apps', 'app'),
+        'app'
+      );
+
+      expect(result).toEqual({});
+    });
+  });
+
+  describe('resolveDependencies', () => {
+    it('resolves to the dependency custom domain (browser-reachable), honoring path — not localhost:port', async () => {
+      platform = createPlatform({
+        dropRoot: tempDir,
+        appsDirectory: path.join(tempDir, 'apps'),
+        logLevel: 'error',
+        enableHttps: true,
+        domainSuffix: 'dropkit.sh',
+      });
+      (platform as any).appConfigService = {
+        getConfig: jest.fn().mockReturnValue({ domains: ['api.example.com'], port: 4002 }),
+      };
+
+      dropYamlContent = [
+        'depends_on:',
+        '  - name: api',
+        '    env: API_URL',
+        '    path: /v1',
+      ].join('\n');
+
+      const result = await (platform as any).resolveDependencies(
+        path.join(tempDir, 'apps', 'frontend'),
+        'frontend'
+      );
+
+      expect(result.API_URL).toBe('https://api.example.com/v1');
+    });
+
+    it('falls back to <dep>.<domainSuffix> when a real domain suffix is configured and the dep has no custom domain', async () => {
+      platform = createPlatform({
+        dropRoot: tempDir,
+        appsDirectory: path.join(tempDir, 'apps'),
+        logLevel: 'error',
+        enableHttps: true,
+        domainSuffix: 'dropkit.sh',
+      });
+      (platform as any).appConfigService = {
+        getConfig: jest.fn().mockReturnValue({ port: 4003 }),
+      };
+
+      dropYamlContent = [
+        'depends_on:',
+        '  - name: backend',
+        '    env: BACKEND_URL',
+      ].join('\n');
+
+      const result = await (platform as any).resolveDependencies(
+        path.join(tempDir, 'apps', 'frontend'),
+        'frontend'
+      );
+
+      expect(result.BACKEND_URL).toBe('https://backend.dropkit.sh');
+    });
+
+    it('falls back to http://localhost:<configPort> for pure local dev (no real domain configured)', async () => {
+      platform = createPlatform({
+        dropRoot: tempDir,
+        appsDirectory: path.join(tempDir, 'apps'),
+        logLevel: 'error',
+        // domainSuffix defaults to 'localhost', enableHttps defaults to false
+      });
+      (platform as any).appConfigService = {
+        getConfig: jest.fn().mockReturnValue({ port: 4004 }),
+      };
+
+      dropYamlContent = [
+        'depends_on:',
+        '  - name: backend',
+        '    env: BACKEND_URL',
+      ].join('\n');
+
+      const result = await (platform as any).resolveDependencies(
+        path.join(tempDir, 'apps', 'frontend'),
+        'frontend'
+      );
+
+      expect(result.BACKEND_URL).toBe('http://localhost:4004');
+    });
+
+    it('warns and omits the env var when the dependency is unregistered (no config)', async () => {
+      platform = createPlatform({
+        dropRoot: tempDir,
+        appsDirectory: path.join(tempDir, 'apps'),
+        logLevel: 'error',
+      });
+      (platform as any).appConfigService = {
+        getConfig: jest.fn().mockReturnValue(undefined),
+      };
+      const warnSpy = jest.spyOn((platform as any).logger, 'warn').mockImplementation(() => undefined);
+
+      dropYamlContent = [
+        'depends_on:',
+        '  - name: ghost',
+        '    env: GHOST_URL',
+      ].join('\n');
+
+      const result = await (platform as any).resolveDependencies(
+        path.join(tempDir, 'apps', 'frontend'),
+        'frontend'
+      );
+
+      expect(result).toEqual({});
+      expect(warnSpy).toHaveBeenCalledWith(
+        expect.stringContaining('ghost'),
+        'DEPS'
+      );
+    });
+
+    it('resolves an empty object when depends_on is absent', async () => {
+      platform = createPlatform({
+        dropRoot: tempDir,
+        appsDirectory: path.join(tempDir, 'apps'),
+        logLevel: 'error',
+      });
+      dropYamlContent = 'name: frontend';
+
+      const result = await (platform as any).resolveDependencies(
+        path.join(tempDir, 'apps', 'frontend'),
+        'frontend'
+      );
+
+      expect(result).toEqual({});
+    });
+  });
+});
+
+describe('expandMonorepo (M2: monorepo -> per-service app expansion)', () => {
+  let platform: DropPlatform;
+  let tempDir: string;
+  let appsDir: string;
+
+  beforeAll(() => {
+    // This suite exercises real copy-per-service materialization, real
+    // generated child drop.yaml content, and real type detection against a
+    // fixture on disk — override the file-level fs/promises mocks (set up
+    // above for the rest of this file's hermetic unit tests) with the real
+    // implementation for the duration of this suite only. `cp` is untouched
+    // by the file-level mock already (falls through to the real impl via the
+    // `...actual` spread), so only the explicitly-overridden functions need
+    // restoring here.
+    const actual = jest.requireActual('fs/promises') as typeof fsPromises;
+    (fsPromises.mkdir as jest.Mock).mockImplementation(actual.mkdir);
+    (fsPromises.writeFile as jest.Mock).mockImplementation(actual.writeFile);
+    (fsPromises.rm as jest.Mock).mockImplementation(actual.rm);
+    (fsPromises.stat as jest.Mock).mockImplementation(actual.stat);
+    (fsPromises.access as jest.Mock).mockImplementation(actual.access);
+    (fsPromises.readFile as jest.Mock).mockImplementation(actual.readFile);
+  });
+
+  afterAll(() => {
+    // Restore this file's original mock behavior (matches the jest.mock
+    // factory at the top of the file) for hygiene, even though this suite
+    // happens to run last.
+    (fsPromises.mkdir as jest.Mock).mockResolvedValue(undefined);
+    (fsPromises.writeFile as jest.Mock).mockResolvedValue(undefined);
+    (fsPromises.rm as jest.Mock).mockResolvedValue(undefined);
+    (fsPromises.stat as jest.Mock).mockImplementation(async () => ({
+      isDirectory: () => true,
+      isFile: () => false,
+    }));
+    (fsPromises.access as jest.Mock).mockResolvedValue(undefined);
+    (fsPromises.readFile as jest.Mock).mockImplementation(async (filePath: string) => {
+      if (filePath.endsWith('package.json')) {
+        return JSON.stringify({
+          name: 'test-app',
+          version: '1.0.0',
+          scripts: { start: 'node index.js', build: 'echo build' },
+        });
+      }
+      const realFs = jest.requireActual('fs/promises') as typeof fsPromises;
+      return realFs.readFile(filePath as never);
+    });
+  });
+
+  beforeEach(async () => {
+    tempDir = path.join(
+      os.tmpdir(),
+      `drop-test-monorepo-${Date.now()}-${Math.random().toString(36).slice(2)}`
+    );
+    appsDir = path.join(tempDir, 'apps');
+    await fsPromises.mkdir(appsDir, { recursive: true });
+
+    platform = createPlatform({
+      dropRoot: tempDir,
+      appsDirectory: appsDir,
+      logLevel: 'error',
+      autoBuild: true,
+    });
+    // detect() is exercised for real (backend's type isn't overridden in the
+    // fixture) — wire up a real detector instance, same as production wires
+    // it in initializeServices().
+    (platform as any).detector = getDetector();
+  });
+
+  afterEach(async () => {
+    if (platform && platform.isActive()) {
+      await platform.stop();
+    }
+    await fsPromises.rm(tempDir, { recursive: true, force: true }).catch(() => undefined);
+  });
+
+  /** Writes a minimal two-service repo fixture (backend + frontend), each with a node_modules/ subtree that must be excluded from the copy. */
+  async function writeFixtureRepo(repoPath: string): Promise<void> {
+    const backendDir = path.join(repoPath, 'backend');
+    await fsPromises.mkdir(path.join(backendDir, 'node_modules', 'some-dep'), { recursive: true });
+    await fsPromises.writeFile(
+      path.join(backendDir, 'node_modules', 'some-dep', 'index.js'),
+      '// should be excluded from the copy'
+    );
+    await fsPromises.writeFile(
+      path.join(backendDir, 'package.json'),
+      JSON.stringify({
+        name: 'backend',
+        version: '1.0.0',
+        scripts: { start: 'node index.js' },
+      })
+    );
+    await fsPromises.writeFile(path.join(backendDir, 'index.js'), "console.log('backend');\n");
+
+    const frontendDir = path.join(repoPath, 'frontend');
+    await fsPromises.mkdir(path.join(frontendDir, 'node_modules', 'some-dep'), { recursive: true });
+    await fsPromises.writeFile(
+      path.join(frontendDir, 'node_modules', 'some-dep', 'index.js'),
+      '// should be excluded from the copy'
+    );
+    await fsPromises.writeFile(
+      path.join(frontendDir, 'package.json'),
+      JSON.stringify({ name: 'frontend', version: '1.0.0' })
+    );
+    await fsPromises.writeFile(path.join(frontendDir, 'index.html'), '<html></html>');
+  }
+
+  it('materializes each service into its own top-level app folder with type/DB/depends_on resolved correctly', async () => {
+    const repoName = 'ezsign';
+    const repoPath = path.join(appsDir, repoName);
+    await writeFixtureRepo(repoPath);
+
+    const configStore = new Map<string, any>();
+    (platform as any).appConfigService = {
+      getConfig: jest.fn((name: string) => configStore.get(name)),
+      upsertConfig: jest.fn(async (name: string, updates: any) => {
+        const merged = { ...(configStore.get(name) || {}), ...updates, name };
+        configStore.set(name, merged);
+        return merged;
+      }),
+    };
+    (platform as any).stateManager = {
+      registerApp: jest.fn().mockResolvedValue(undefined),
+      updateApp: jest.fn().mockResolvedValue(undefined),
+    };
+    const buildSpy = jest.fn().mockResolvedValue(undefined);
+    (platform as any).handleBuildApp = buildSpy;
+
+    const dropConfig = {
+      services: {
+        backend: { path: 'backend', database: 'postgres' },
+        frontend: {
+          path: 'frontend',
+          type: 'static',
+          depends_on: [{ name: 'backend', env: 'API_URL' }],
+        },
+      },
+    };
+
+    await (platform as any).expandMonorepo(repoPath, repoName, dropConfig);
+
+    const backendChildPath = path.join(appsDir, `${repoName}-backend`);
+    const frontendChildPath = path.join(appsDir, `${repoName}-frontend`);
+
+    // (a) folders created, files copied, node_modules excluded
+    await expect(fsPromises.stat(path.join(backendChildPath, 'index.js'))).resolves.toBeDefined();
+    await expect(fsPromises.stat(path.join(frontendChildPath, 'index.html'))).resolves.toBeDefined();
+    await expect(fsPromises.stat(path.join(backendChildPath, 'node_modules'))).rejects.toThrow();
+    await expect(fsPromises.stat(path.join(frontendChildPath, 'node_modules'))).rejects.toThrow();
+
+    const backendYaml = yaml.parse(
+      await fsPromises.readFile(path.join(backendChildPath, 'drop.yaml'), 'utf-8')
+    );
+    const frontendYaml = yaml.parse(
+      await fsPromises.readFile(path.join(frontendChildPath, 'drop.yaml'), 'utf-8')
+    );
+
+    // (b) each child drop.yaml has a real (non-'unknown') type
+    expect(backendYaml.type).toBeTruthy();
+    expect(backendYaml.type).not.toBe('unknown');
+    expect(frontendYaml.type).toBe('static'); // explicit override honored, no detection needed
+
+    // (c) frontend's depends_on is rewritten to the real sibling app name
+    expect(frontendYaml.depends_on).toEqual([{ name: `${repoName}-backend`, env: 'API_URL' }]);
+
+    // (d) only backend gets `database`
+    expect(backendYaml.database).toBe('postgres');
+    expect(frontendYaml.database).toBeUndefined();
+
+    // (e) configs + state registered with the group tag
+    expect(configStore.get(`${repoName}-backend`)?.group).toBe(repoName);
+    expect(configStore.get(`${repoName}-frontend`)?.group).toBe(repoName);
+    expect((platform as any).stateManager.registerApp).toHaveBeenCalledWith(
+      `${repoName}-backend`,
+      backendChildPath,
+      expect.any(String)
+    );
+    expect((platform as any).stateManager.registerApp).toHaveBeenCalledWith(
+      `${repoName}-frontend`,
+      frontendChildPath,
+      'static'
+    );
+    expect((platform as any).stateManager.updateApp).toHaveBeenCalledWith(`${repoName}-backend`, {
+      group: repoName,
+    });
+    expect((platform as any).stateManager.updateApp).toHaveBeenCalledWith(`${repoName}-frontend`, {
+      group: repoName,
+    });
+
+    // Builds were driven for both children (build itself is stubbed).
+    expect(buildSpy).toHaveBeenCalledWith(backendChildPath, `${repoName}-backend`, expect.any(String));
+    expect(buildSpy).toHaveBeenCalledWith(frontendChildPath, `${repoName}-frontend`, 'static');
+  });
+
+  it('(f) skips a service whose derived name collides with a pre-existing app outside the group', async () => {
+    const repoName = 'ezsign';
+    const repoPath = path.join(appsDir, repoName);
+    await writeFixtureRepo(repoPath);
+
+    const configStore = new Map<string, any>();
+    // A standalone, non-grouped app already owns 'ezsign-backend'.
+    configStore.set(`${repoName}-backend`, { name: `${repoName}-backend`, type: 'nodejs' });
+
+    (platform as any).appConfigService = {
+      getConfig: jest.fn((name: string) => configStore.get(name)),
+      upsertConfig: jest.fn(async (name: string, updates: any) => {
+        const merged = { ...(configStore.get(name) || {}), ...updates, name };
+        configStore.set(name, merged);
+        return merged;
+      }),
+    };
+    (platform as any).stateManager = {
+      registerApp: jest.fn().mockResolvedValue(undefined),
+      updateApp: jest.fn().mockResolvedValue(undefined),
+    };
+    (platform as any).handleBuildApp = jest.fn().mockResolvedValue(undefined);
+    const warnSpy = jest.spyOn((platform as any).logger, 'warn').mockImplementation(() => undefined);
+
+    const dropConfig = {
+      services: {
+        backend: { path: 'backend' },
+        frontend: { path: 'frontend', type: 'static' },
+      },
+    };
+
+    await (platform as any).expandMonorepo(repoPath, repoName, dropConfig);
+
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining(`${repoName}-backend`),
+      'MONOREPO'
+    );
+    // The colliding service was skipped — its config is untouched (still the
+    // pre-existing standalone owner, no group tag added).
+    expect(configStore.get(`${repoName}-backend`)?.group).toBeUndefined();
+    // The other service in the same group still proceeds normally.
+    expect(configStore.get(`${repoName}-frontend`)?.group).toBe(repoName);
+  });
+
+  it('(g) writes route into the generated child drop.yaml when a service declares one (M3)', async () => {
+    const repoName = 'ezsign';
+    const repoPath = path.join(appsDir, repoName);
+    await writeFixtureRepo(repoPath);
+
+    const configStore = new Map<string, any>();
+    (platform as any).appConfigService = {
+      getConfig: jest.fn((name: string) => configStore.get(name)),
+      upsertConfig: jest.fn(async (name: string, updates: any) => {
+        const merged = { ...(configStore.get(name) || {}), ...updates, name };
+        configStore.set(name, merged);
+        return merged;
+      }),
+    };
+    (platform as any).stateManager = {
+      registerApp: jest.fn().mockResolvedValue(undefined),
+      updateApp: jest.fn().mockResolvedValue(undefined),
+    };
+    (platform as any).handleBuildApp = jest.fn().mockResolvedValue(undefined);
+
+    const dropConfig = {
+      group: repoName,
+      services: {
+        backend: { path: 'backend', database: 'postgres', route: { path: '/api' } },
+        frontend: { path: 'frontend', type: 'static', route: { path: '/' } },
+      },
+    };
+
+    await (platform as any).expandMonorepo(repoPath, repoName, dropConfig);
+
+    const backendChildPath = path.join(appsDir, `${repoName}-backend`);
+    const frontendChildPath = path.join(appsDir, `${repoName}-frontend`);
+
+    // Read back through the real parser (not just yaml.parse) so this also
+    // proves the generated child drop.yaml is schema-valid, not just present.
+    const backendResult = await parseDropYaml(backendChildPath);
+    const frontendResult = await parseDropYaml(frontendChildPath);
+
+    expect(backendResult.success).toBe(true);
+    expect(backendResult.config?.route).toEqual({ path: '/api' });
+    expect(frontendResult.success).toBe(true);
+    expect(frontendResult.config?.route).toEqual({ path: '/' });
+  });
+
+  describe('handleConfigureRoute (M3: same-origin routing)', () => {
+    it('routes a grouped app with route.path "/api" to the shared group hostname with a Caddy path prefix', async () => {
+      const childName = 'ezsign-backend';
+      const childPath = path.join(appsDir, childName);
+      await fsPromises.mkdir(childPath, { recursive: true });
+      await fsPromises.writeFile(
+        path.join(childPath, 'drop.yaml'),
+        'name: ezsign-backend\nroute:\n  path: /api\n'
+      );
+
+      const addRoute = jest.fn().mockResolvedValue(undefined);
+      (platform as any).router = { addRoute };
+      (platform as any).appConfigService = {
+        getConfig: jest.fn().mockReturnValue({ group: 'ezsign' }),
+        updateConfig: jest.fn(),
+      };
+      (platform as any).caddyServer = undefined;
+
+      await (platform as any).handleConfigureRoute(childName, 4001);
+
+      expect(addRoute).toHaveBeenCalledTimes(1);
+      expect(addRoute).toHaveBeenCalledWith(
+        expect.objectContaining({
+          hostname: 'ezsign.localhost',
+          pathPrefix: '/api*',
+          upstream: 'localhost:4001',
+        })
+      );
+    });
+
+    it('routes the frontend (route.path "/") to the shared group hostname with no path prefix', async () => {
+      const childName = 'ezsign-frontend';
+      const childPath = path.join(appsDir, childName);
+      await fsPromises.mkdir(childPath, { recursive: true });
+      await fsPromises.writeFile(
+        path.join(childPath, 'drop.yaml'),
+        'name: ezsign-frontend\nroute:\n  path: /\n'
+      );
+
+      const addRoute = jest.fn().mockResolvedValue(undefined);
+      (platform as any).router = { addRoute };
+      (platform as any).appConfigService = {
+        getConfig: jest.fn().mockReturnValue({ group: 'ezsign' }),
+        updateConfig: jest.fn(),
+      };
+      (platform as any).caddyServer = undefined;
+
+      await (platform as any).handleConfigureRoute(childName, 4002);
+
+      expect(addRoute).toHaveBeenCalledTimes(1);
+      const call = addRoute.mock.calls[0][0];
+      expect(call.hostname).toBe('ezsign.localhost');
+      expect(call.pathPrefix).toBeUndefined();
+      expect(call.upstream).toBe('localhost:4002');
+    });
+
+    it('routes a standalone app (no group) to its own default hostname with no path prefix', async () => {
+      const appName = 'solo-app';
+      // Deliberately no drop.yaml on disk for this app — parseDropYaml should
+      // resolve gracefully to "not found" and default (non-group) routing
+      // should apply unchanged.
+
+      const addRoute = jest.fn().mockResolvedValue(undefined);
+      (platform as any).router = { addRoute };
+      (platform as any).appConfigService = {
+        getConfig: jest.fn().mockReturnValue(undefined),
+        updateConfig: jest.fn(),
+      };
+      (platform as any).caddyServer = undefined;
+
+      await (platform as any).handleConfigureRoute(appName, 4003);
+
+      expect(addRoute).toHaveBeenCalledTimes(1);
+      const call = addRoute.mock.calls[0][0];
+      expect(call.hostname).toBe('solo-app.localhost');
+      expect(call.pathPrefix).toBeUndefined();
+      expect(call.upstream).toBe('localhost:4003');
+    });
+  });
+});
+
+describe('teardownApp / removeGroup (M4: group lifecycle)', () => {
+  let platform: DropPlatform;
+  let tempDir: string;
+  let appsDir: string;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+
+    tempDir = path.join(
+      os.tmpdir(),
+      `drop-test-teardown-${Date.now()}-${Math.random().toString(36).slice(2)}`
+    );
+    appsDir = path.join(tempDir, 'apps');
+
+    platform = createPlatform({
+      dropRoot: tempDir,
+      appsDirectory: appsDir,
+      logLevel: 'error',
+    });
+  });
+
+  afterEach(async () => {
+    if (platform.isActive()) {
+      await platform.stop();
+    }
+  });
+
+  /** Minimal AppState-shaped object, enough for the fields teardownApp/removeGroup read. */
+  function makeAppState(name: string, group?: string) {
+    return {
+      name,
+      type: 'nodejs' as const,
+      status: 'running' as const,
+      path: path.join(appsDir, name),
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      group,
+    };
+  }
+
+  /** Wires minimal mocks for every manager teardownApp/removeGroup touches. */
+  function wireMocks(overrides: {
+    stateManager?: Partial<{ removeApp: jest.Mock; getApp: jest.Mock; getAllApps: jest.Mock }>;
+    runtime?: Partial<{ stop: jest.Mock; delete: jest.Mock }>;
+    router?: Partial<{ removeRoutesForApp: jest.Mock }>;
+    dbProvisioner?: Partial<{ backupAndDeleteAppDatabase: jest.Mock }>;
+    appConfigService?: Partial<{ getConfig: jest.Mock; deleteConfig: jest.Mock }>;
+    secretManager?: Partial<{ deleteAll: jest.Mock }>;
+  } = {}) {
+    (platform as any).stateManager = {
+      removeApp: jest.fn().mockResolvedValue(true),
+      getApp: jest.fn().mockReturnValue(undefined),
+      getAllApps: jest.fn().mockReturnValue([]),
+      ...overrides.stateManager,
+    };
+    (platform as any).runtime = {
+      stop: jest.fn().mockResolvedValue(undefined),
+      delete: jest.fn().mockResolvedValue(undefined),
+      ...overrides.runtime,
+    };
+    (platform as any).router = {
+      removeRoutesForApp: jest.fn().mockResolvedValue(undefined),
+      ...overrides.router,
+    };
+    (platform as any).dbProvisioner = {
+      backupAndDeleteAppDatabase: jest.fn().mockResolvedValue({ dropped: true }),
+      ...overrides.dbProvisioner,
+    };
+    (platform as any).appConfigService = {
+      getConfig: jest.fn().mockReturnValue(undefined),
+      deleteConfig: jest.fn().mockResolvedValue(true),
+      ...overrides.appConfigService,
+    };
+    (platform as any).secretManager = {
+      deleteAll: jest.fn().mockResolvedValue(true),
+      ...overrides.secretManager,
+    };
+  }
+
+  describe('teardownApp', () => {
+    it('stops+deletes the runtime, removes routes, drops the DB, removes state/secrets/config, and rm-s the folder', async () => {
+      wireMocks({
+        appConfigService: {
+          getConfig: jest.fn().mockReturnValue({ path: path.join(appsDir, 'myapp') }),
+          deleteConfig: jest.fn().mockResolvedValue(true),
+        },
+      });
+
+      await (platform as any).teardownApp('myapp');
+
+      expect((platform as any).runtime.stop).toHaveBeenCalledWith('myapp');
+      expect((platform as any).runtime.delete).toHaveBeenCalledWith('myapp');
+      expect((platform as any).router.removeRoutesForApp).toHaveBeenCalledWith('myapp');
+      expect((platform as any).dbProvisioner.backupAndDeleteAppDatabase).toHaveBeenCalledWith('myapp');
+      expect((platform as any).stateManager.removeApp).toHaveBeenCalledWith('myapp');
+      expect((platform as any).secretManager.deleteAll).toHaveBeenCalledWith('myapp');
+      expect((platform as any).appConfigService.deleteConfig).toHaveBeenCalledWith('myapp');
+      expect(fsPromises.rm).toHaveBeenCalledWith(
+        path.join(appsDir, 'myapp'),
+        { recursive: true, force: true }
+      );
+    });
+
+    it('skips the DB teardown when keepData is set', async () => {
+      wireMocks();
+
+      await (platform as any).teardownApp('myapp', { keepData: true });
+
+      expect((platform as any).dbProvisioner.backupAndDeleteAppDatabase).not.toHaveBeenCalled();
+      // The rest of teardown still runs.
+      expect((platform as any).stateManager.removeApp).toHaveBeenCalledWith('myapp');
+    });
+
+    it('isolates a single failing step so the rest of teardown still runs', async () => {
+      wireMocks({
+        router: { removeRoutesForApp: jest.fn().mockRejectedValue(new Error('caddy boom')) },
+        dbProvisioner: { backupAndDeleteAppDatabase: jest.fn().mockRejectedValue(new Error('db boom')) },
+      });
+
+      await expect((platform as any).teardownApp('myapp')).resolves.toBeUndefined();
+
+      // Steps after the two failures still ran.
+      expect((platform as any).stateManager.removeApp).toHaveBeenCalledWith('myapp');
+      expect((platform as any).secretManager.deleteAll).toHaveBeenCalledWith('myapp');
+      expect((platform as any).appConfigService.deleteConfig).toHaveBeenCalledWith('myapp');
+      expect(fsPromises.rm).toHaveBeenCalledWith(
+        path.join(appsDir, 'myapp'),
+        { recursive: true, force: true }
+      );
+    });
+  });
+
+  describe('removeGroup', () => {
+    it('tears down every child of the group and removes the group container folder', async () => {
+      const children = [
+        makeAppState('ezsign-backend', 'ezsign'),
+        makeAppState('ezsign-frontend', 'ezsign'),
+        makeAppState('standalone-app'), // no group — must be left alone
+      ];
+      wireMocks({
+        stateManager: {
+          getAllApps: jest.fn().mockReturnValue(children),
+          removeApp: jest.fn().mockResolvedValue(true),
+          getApp: jest.fn().mockReturnValue(undefined),
+        },
+      });
+
+      const result = await platform.removeGroup('ezsign');
+
+      expect(result.removed.slice().sort()).toEqual(['ezsign-backend', 'ezsign-frontend']);
+      expect((platform as any).stateManager.removeApp).toHaveBeenCalledWith('ezsign-backend');
+      expect((platform as any).stateManager.removeApp).toHaveBeenCalledWith('ezsign-frontend');
+      expect((platform as any).stateManager.removeApp).not.toHaveBeenCalledWith('standalone-app');
+      expect((platform as any).runtime.stop).toHaveBeenCalledWith('ezsign-backend');
+      expect((platform as any).runtime.stop).toHaveBeenCalledWith('ezsign-frontend');
+      expect((platform as any).router.removeRoutesForApp).toHaveBeenCalledWith('ezsign-backend');
+      expect((platform as any).router.removeRoutesForApp).toHaveBeenCalledWith('ezsign-frontend');
+
+      // The container folder (webapps/ezsign/, the root drop.yaml holder) is removed too.
+      expect(fsPromises.rm).toHaveBeenCalledWith(
+        path.join(appsDir, 'ezsign'),
+        { recursive: true, force: true }
+      );
+    });
+
+    it('isolates a per-child teardown failure so the remaining children still get removed', async () => {
+      // teardownApp itself already isolates every one of ITS OWN steps (see
+      // the teardownApp describe block above) — it never rejects on a normal
+      // step failure. removeGroup's own try/catch around each `teardownApp`
+      // call is a second, independent isolation layer (defense in depth); test
+      // it directly by making teardownApp itself reject for one child.
+      const children = [makeAppState('child-a', 'g'), makeAppState('child-b', 'g')];
+      wireMocks({
+        stateManager: {
+          getAllApps: jest.fn().mockReturnValue(children),
+          removeApp: jest.fn().mockResolvedValue(true),
+          getApp: jest.fn().mockReturnValue(undefined),
+        },
+      });
+
+      const teardownSpy = jest
+        .spyOn(platform as any, 'teardownApp')
+        .mockRejectedValueOnce(new Error('boom on child-a'))
+        .mockResolvedValueOnce(undefined);
+
+      const result = await platform.removeGroup('g');
+
+      expect(teardownSpy).toHaveBeenCalledTimes(2);
+      // child-a's teardown rejected — isolated, doesn't abort child-b.
+      expect(result.removed).toEqual(['child-b']);
+      // The container folder removal is still attempted regardless.
+      expect(fsPromises.rm).toHaveBeenCalledWith(
+        path.join(appsDir, 'g'),
+        { recursive: true, force: true }
+      );
+    });
+
+    it('returns an empty removed list when no app belongs to the group (still attempts folder cleanup)', async () => {
+      wireMocks({
+        stateManager: {
+          getAllApps: jest.fn().mockReturnValue([]),
+          removeApp: jest.fn().mockResolvedValue(true),
+          getApp: jest.fn().mockReturnValue(undefined),
+        },
+      });
+
+      const result = await platform.removeGroup('ghost-group');
+
+      expect(result.removed).toEqual([]);
+      expect(fsPromises.rm).toHaveBeenCalledWith(
+        path.join(appsDir, 'ghost-group'),
+        { recursive: true, force: true }
+      );
+    });
   });
 });
