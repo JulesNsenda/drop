@@ -15,7 +15,7 @@ jest.mock('../event-bus', () => ({
 }));
 
 import { BuilderService, createBuilderService, getBuilder, resetBuilder } from './builder';
-import { BuildContext, BuildStrategy } from './builder.types';
+import { BuildContext, BuildStrategy, ExecCommandFn } from './builder.types';
 import { nodejsBuildStrategy } from './strategies/nodejs';
 import { pythonBuildStrategy } from './strategies/python';
 import { staticBuildStrategy } from './strategies/static';
@@ -346,6 +346,58 @@ describe('Docker Build Strategy', () => {
     };
 
     expect(dockerBuildStrategy.getInstallCommand(context)).toBeNull();
+  });
+});
+
+describe('BuilderService install stage — dev dependencies', () => {
+  it('forces npm_config_include=dev on the install exec (not the build exec) even when NODE_ENV is production', async () => {
+    const service = new BuilderService();
+
+    // 'rust' has no built-in strategy, so this custom strategy is the only
+    // match — avoids colliding with the real nodejs strategy's preBuild
+    // (lockfile detection etc.), which needs a real appPath on disk.
+    const devDepsStrategy: BuildStrategy = {
+      name: 'test-devdeps',
+      supportedTypes: ['rust'],
+      canBuild: () => true,
+      getInstallCommand: () => 'npm install',
+      getBuildCommand: () => 'npm run build',
+      getOutputDirectory: () => 'dist',
+    };
+    service.registerStrategy(devDepsStrategy);
+
+    const execCalls: Array<{ command: string; env: Record<string, string> }> = [];
+    const execCommand: ExecCommandFn = async (command, _cwd, env) => {
+      execCalls.push({ command, env });
+      return { exitCode: 0, stdout: '', stderr: '', duration: 0 };
+    };
+
+    const context: BuildContext = {
+      appName: 'devdeps-test',
+      appPath: '/test',
+      appType: 'rust',
+      framework: null,
+      config: {},
+      env: { NODE_ENV: 'production' },
+      execCommand,
+    };
+
+    const result = await service.build(context);
+
+    expect(result.success).toBe(true);
+
+    const installCall = execCalls.find(c => c.command === 'npm install');
+    const buildCall = execCalls.find(c => c.command === 'npm run build');
+
+    expect(installCall).toBeDefined();
+    expect(installCall!.env.npm_config_include).toBe('dev');
+    expect(installCall!.env.NODE_ENV).toBe('production');
+
+    // Build stage keeps context.env untouched — the override must not leak
+    // into the compile step.
+    expect(buildCall).toBeDefined();
+    expect(buildCall!.env.npm_config_include).not.toBe('dev');
+    expect(buildCall!.env.NODE_ENV).toBe('production');
   });
 });
 
