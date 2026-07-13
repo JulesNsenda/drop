@@ -50,7 +50,9 @@ describe('pythonDetector', () => {
     expect(result?.framework).toBe('flask');
     expect(result?.confidence).toBe(0.85);
     expect(result?.detectedBy).toBe('requirement:flask');
-    expect(result?.suggestedConfig.startCommand).toBe('gunicorn --bind 0.0.0.0:$PORT app:app');
+    expect(result?.suggestedConfig.startCommand).toBe(
+      'python -m gunicorn --bind 0.0.0.0:$PORT app:app'
+    );
     expect(result?.suggestedConfig.port).toBe(5000);
   });
 
@@ -63,7 +65,7 @@ describe('pythonDetector', () => {
     expect(result?.type).toBe('fastapi');
     expect(result?.detectedBy).toBe('requirement:fastapi');
     expect(result?.suggestedConfig.startCommand).toBe(
-      'uvicorn main:app --host 0.0.0.0 --port $PORT'
+      'python -m uvicorn main:app --host 0.0.0.0 --port $PORT'
     );
     expect(result?.suggestedConfig.port).toBe(8000);
   });
@@ -131,5 +133,138 @@ describe('pythonDetector', () => {
       expect.stringContaining('Both requirements.txt and Pipfile found')
     );
     expect(result?.suggestedConfig.installCommand).toBe('pipenv install');
+  });
+
+  it('emits python -m gunicorn for the Django framework default (never a bare gunicorn binary)', async () => {
+    await fs.writeFile(path.join(tmpDir, 'manage.py'), '');
+    await fs.writeFile(path.join(tmpDir, 'requirements.txt'), 'django==4.0');
+
+    const result = await pythonDetector.detect(tmpDir);
+
+    expect(result?.type).toBe('django');
+    expect(result?.suggestedConfig.startCommand).toBe(
+      'python -m gunicorn --bind 0.0.0.0:$PORT wsgi:application'
+    );
+  });
+
+  describe('entry-point-only detection (no dependency manifest)', () => {
+    it('detects a Python app from an entry point + Procfile alone, at confidence 0.5', async () => {
+      await fs.writeFile(path.join(tmpDir, 'app.py'), '');
+      await fs.writeFile(path.join(tmpDir, 'Procfile'), 'web: python3 app.py\n');
+
+      const result = await pythonDetector.detect(tmpDir);
+
+      expect(result).not.toBeNull();
+      expect(result?.type).toBe('python');
+      expect(result?.confidence).toBe(0.5);
+      expect(result?.detectedBy).toBe('entrypoint+procfile');
+      // The Procfile's web command wins over the guessed `python app.py` default.
+      expect(result?.suggestedConfig.startCommand).toBe('python3 app.py');
+    });
+
+    it('detects a Python app from an entry point alone, with no Procfile', async () => {
+      await fs.writeFile(path.join(tmpDir, 'main.py'), '');
+
+      const result = await pythonDetector.detect(tmpDir);
+
+      expect(result).not.toBeNull();
+      expect(result?.type).toBe('python');
+      expect(result?.confidence).toBe(0.5);
+      expect(result?.detectedBy).toBe('entrypoint');
+      expect(result?.suggestedConfig.startCommand).toBe('python main.py');
+    });
+
+    it('returns null for a truly empty directory (no manifest, no entry point, no Procfile)', async () => {
+      const result = await pythonDetector.detect(tmpDir);
+
+      expect(result).toBeNull();
+    });
+
+    it('returns null when only a Procfile exists - a Procfile alone is not a Python signal', async () => {
+      await fs.writeFile(path.join(tmpDir, 'Procfile'), 'web: node server.js\n');
+
+      const result = await pythonDetector.detect(tmpDir);
+
+      expect(result).toBeNull();
+    });
+  });
+
+  describe('-r/-c include resolution in requirements.txt', () => {
+    it('follows a -r include so "requirements.txt" containing only "-r deps.txt" still detects the framework', async () => {
+      await fs.writeFile(path.join(tmpDir, 'requirements.txt'), '-r deps.txt\n');
+      await fs.writeFile(path.join(tmpDir, 'deps.txt'), 'fastapi\n');
+      await fs.writeFile(path.join(tmpDir, 'main.py'), '');
+
+      const result = await pythonDetector.detect(tmpDir);
+
+      expect(result?.type).toBe('fastapi');
+      expect(result?.detectedBy).toBe('requirement:fastapi');
+    });
+
+    it('resolves a nested -r include relative to the directory of the file that references it (not the app root)', async () => {
+      // requirements.txt -> reqs/base.txt -> "-r more.txt" (sibling of base.txt,
+      // i.e. reqs/more.txt) - resolving that "-r more.txt" against the app root
+      // instead of base.txt's own directory (reqs/) would silently miss the file
+      // and only "flask" would be seen; resolving it correctly also picks up
+      // fastapi from reqs/more.txt.
+      await fs.mkdir(path.join(tmpDir, 'reqs'), { recursive: true });
+      await fs.writeFile(path.join(tmpDir, 'requirements.txt'), '-r reqs/base.txt\n');
+      await fs.writeFile(path.join(tmpDir, 'reqs', 'base.txt'), '-r more.txt\nflask\n');
+      await fs.writeFile(path.join(tmpDir, 'reqs', 'more.txt'), 'fastapi\n');
+      await fs.writeFile(path.join(tmpDir, 'app.py'), '');
+
+      const result = await pythonDetector.detect(tmpDir);
+
+      expect(result?.type).toBe('fastapi');
+    });
+
+    it('also follows -c/--constraint includes', async () => {
+      await fs.writeFile(path.join(tmpDir, 'requirements.txt'), '-c constraints.txt\n');
+      await fs.writeFile(path.join(tmpDir, 'constraints.txt'), 'fastapi\n');
+      await fs.writeFile(path.join(tmpDir, 'main.py'), '');
+
+      const result = await pythonDetector.detect(tmpDir);
+
+      expect(result?.type).toBe('fastapi');
+    });
+
+    it('refuses a -r include that points outside the app directory', async () => {
+      await fs.mkdir(path.join(tmpDir, 'app'), { recursive: true });
+      await fs.writeFile(path.join(tmpDir, 'app', 'requirements.txt'), '-r ../evil.txt\n');
+      await fs.writeFile(path.join(tmpDir, 'evil.txt'), 'fastapi\n');
+      await fs.writeFile(path.join(tmpDir, 'app', 'main.py'), '');
+
+      const result = await pythonDetector.detect(path.join(tmpDir, 'app'));
+
+      // The outside-the-app-dir include is never read, so fastapi never surfaces.
+      expect(result?.type).toBe('python');
+      expect(result?.framework).toBeNull();
+    });
+
+    it('refuses an absolute-path -r include', async () => {
+      await fs.writeFile(path.join(tmpDir, 'evil.txt'), 'fastapi\n');
+      const absoluteEvil = path.join(tmpDir, 'evil.txt');
+      await fs.writeFile(path.join(tmpDir, 'requirements.txt'), `-r ${absoluteEvil}\n`);
+      await fs.writeFile(path.join(tmpDir, 'main.py'), '');
+
+      const result = await pythonDetector.detect(tmpDir);
+
+      expect(result?.type).toBe('python');
+      expect(result?.framework).toBeNull();
+    });
+
+    it('is cycle-safe when -r includes reference each other', async () => {
+      await fs.writeFile(path.join(tmpDir, 'requirements.txt'), '-r deps.txt\nflask\n');
+      await fs.writeFile(path.join(tmpDir, 'deps.txt'), '-r requirements.txt\nfastapi\n');
+      await fs.writeFile(path.join(tmpDir, 'app.py'), '');
+
+      const result = await pythonDetector.detect(tmpDir);
+
+      // Must terminate rather than looping/stack-overflowing on the cycle. The
+      // flattened list ends up ['fastapi', 'flask'] (deps.txt's second visit of
+      // requirements.txt is skipped by the visited-set); fastapi is matched
+      // first and flask's equal 0.85 confidence doesn't beat it (strict `>`).
+      expect(result?.type).toBe('fastapi');
+    });
   });
 });
