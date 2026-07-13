@@ -247,6 +247,9 @@ export function formatStatus(status: string): string {
     failed: 'red',
     launching: 'cyan',
     building: 'cyan',
+    // Was up, now restarting repeatedly (post-deploy liveness watch) —
+    // distinct from the terminal `errored`/red state.
+    'crash-looping': 'yellow',
   };
 
   const colorName = statusColors[status.toLowerCase()] || 'white';

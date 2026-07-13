@@ -53,6 +53,7 @@ export function statusToTone(status: string): BadgeTone {
     case 'pending':
     case 'building':
     case 'starting':
+    case 'crash-looping':
       return 'warn';
     default:
       return 'neutral';
