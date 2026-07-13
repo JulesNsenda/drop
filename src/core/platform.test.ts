@@ -310,21 +310,21 @@ describe('DropPlatform', () => {
         {}
       );
 
-    it('wraps a python gunicorn command in /bin/sh -c with the venv on PATH', async () => {
+    it('wraps a python gunicorn command in /bin/sh -c with the venv on PATH, execd', async () => {
       const spec = await build('pyapp', detection('flask', 'gunicorn --bind 0.0.0.0:$PORT app:app'));
       expect(spec.script).toBe('/bin/sh');
       expect(spec.interpreter).toBe('none');
       expect(spec.args).toEqual([
         '-c',
-        'export PATH="/app/.venv/bin:$PATH"; gunicorn --bind 0.0.0.0:$PORT app:app',
+        'export PATH="/app/.venv/bin:$PATH"; exec gunicorn --bind 0.0.0.0:$PORT app:app',
       ]);
     });
 
-    it('wraps a node start command in /bin/sh -c with no venv prefix', async () => {
+    it('wraps a node start command in /bin/sh -c with no venv prefix, execd', async () => {
       const spec = await build('nodeapp', detection('nodejs', 'node dist/server.js'));
       expect(spec.script).toBe('/bin/sh');
       expect(spec.interpreter).toBe('none');
-      expect(spec.args).toEqual(['-c', 'node dist/server.js']);
+      expect(spec.args).toEqual(['-c', 'exec node dist/server.js']);
     });
 
     it('spreads the injected redisEnvVars into the start spec env', async () => {
@@ -339,6 +339,71 @@ describe('DropPlatform', () => {
       );
       expect(spec.env.REDIS_URL).toBe('redis://:pw@drop-host:6380/3');
       expect(spec.env.REDIS_DB).toBe('3');
+    });
+  });
+
+  // Regression guard for the `none`/PM2 start bugs: previously this branch
+  // passed the raw, possibly multi-token startCommand straight through as a
+  // bare `script` (PM2 infers the interpreter from the file extension), with
+  // no args/interpreter — so a multi-token command (gunicorn/uvicorn
+  // invocations) was treated as a single bogus executable → ENOENT, and
+  // $PORT (only present in the child env, process-manager.ts) never expanded.
+  // These assert buildStartSpec now mirrors the docker branch's /bin/sh -c +
+  // exec shape under `none`/PM2 isolation too — while Node stays prefix-free
+  // so PM2 monitors the real node PID (metrics/restart parity, not a shell).
+  describe('buildStartSpec PM2 (isolation:none) command shaping', () => {
+    let pm2Platform: DropPlatform;
+
+    beforeEach(() => {
+      pm2Platform = createPlatform({
+        dropRoot: tempDir,
+        appsDirectory: path.join(tempDir, 'apps'),
+        logLevel: 'error',
+        caddyfilePath: path.join(tempDir, 'Caddyfile'),
+      });
+      (pm2Platform as any).config.isolation = 'none';
+    });
+
+    const detection = (type: string, startCommand: string): DetectionResult =>
+      ({
+        type,
+        framework: null,
+        confidence: 1,
+        suggestedConfig: { startCommand },
+      }) as unknown as DetectionResult;
+
+    const build = (appName: string, det: DetectionResult) =>
+      (pm2Platform as any).buildStartSpec(
+        appName,
+        path.join(tempDir, appName),
+        det,
+        4000,
+        path.join(tempDir, 'data', appName),
+        {}
+      );
+
+    it('wraps a python gunicorn command in /bin/sh -c with the real appPath venv on PATH, execd', async () => {
+      const appPath = path.join(tempDir, 'pyapp');
+      const spec = await build('pyapp', detection('flask', 'gunicorn --bind 0.0.0.0:$PORT app:app'));
+      expect(spec.script).toBe('/bin/sh');
+      expect(spec.interpreter).toBe('none');
+      expect(spec.args).toEqual([
+        '-c',
+        `export PATH="${appPath}/.venv/bin:$PATH"; exec gunicorn --bind 0.0.0.0:$PORT app:app`,
+      ]);
+      // Guards the old failure mode directly: no bare multi-token script/no args.
+      expect(spec.args![1]).toMatch(/^export PATH=".*\.venv\/bin:\$PATH"; exec /);
+      expect(spec.args![1]).toContain('$PORT');
+    });
+
+    it('wraps a node start command in /bin/sh -c with NO venv prefix, execd (PM2 PID parity)', async () => {
+      const spec = await build('nodeapp', detection('nodejs', 'node dist/server.js'));
+      expect(spec.script).toBe('/bin/sh');
+      expect(spec.interpreter).toBe('none');
+      expect(spec.args).toEqual(['-c', 'exec node dist/server.js']);
+      // Guards the Node/PM2 PID-parity constraint: no export/&& prefix at all.
+      expect(spec.args![1]).not.toMatch(/export |&&/);
+      expect(spec.args![1]).toBe('exec node dist/server.js');
     });
   });
 
@@ -1888,7 +1953,12 @@ describe('drop.yaml build/start overrides', () => {
         {}
       );
 
-      expect(spec.script).toBe('dist/server.js');
+      // PM2 branch now mirrors the docker branch's /bin/sh -c + exec shape
+      // (M1b) rather than passing the (node-prefix-stripped) command as a
+      // bare script — the override still wins, just wrapped/execd.
+      expect(spec.script).toBe('/bin/sh');
+      expect(spec.interpreter).toBe('none');
+      expect(spec.args).toEqual(['-c', 'exec node dist/server.js']);
     });
 
     it('falls back to suggestedConfig.startCommand when drop.yaml has no `start:` override', async () => {
@@ -1912,7 +1982,11 @@ describe('drop.yaml build/start overrides', () => {
         {}
       );
 
-      expect(spec.script).toBe('index.js');
+      // Same PM2 /bin/sh -c + exec shape (M1b) applies to the no-override
+      // fallback path too.
+      expect(spec.script).toBe('/bin/sh');
+      expect(spec.interpreter).toBe('none');
+      expect(spec.args).toEqual(['-c', 'exec node index.js']);
     });
   });
 

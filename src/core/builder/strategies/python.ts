@@ -15,8 +15,11 @@ export class PythonBuildStrategy extends BaseBuildStrategy {
   supportedTypes: AppType[] = ['python', 'django', 'flask', 'fastapi'];
 
   getInstallCommand(context: BuildContext): string | null {
-    // preBuild sets skipInstall when no dependency manifest exists — nothing to
-    // install, so don't run pip against a requirements.txt that isn't there.
+    // Defensive only: this strategy's own preBuild no longer sets
+    // skipInstall (a manifest-less app still gets a venv-only install
+    // command — see preBuild below, mirroring the uniform-.venv goal), but
+    // honor an explicitly configured skipInstall the same way nodejs's
+    // strategy does.
     if (context.config.skipInstall) {
       return null;
     }
@@ -27,7 +30,7 @@ export class PythonBuildStrategy extends BaseBuildStrategy {
     }
 
     // Default: a requirements.txt is the common case.
-    return this.pipInstall(context);
+    return this.pipInstall();
   }
 
   getBuildCommand(context: BuildContext): string | null {
@@ -49,25 +52,46 @@ export class PythonBuildStrategy extends BaseBuildStrategy {
   }
 
   /**
-   * The pip install command. Under docker isolation the build runs in an
-   * ephemeral container whose global site-packages are discarded when it is
-   * removed, and the fresh runtime container only sees the bind-mounted app
-   * dir — so a plain `pip install` would leave the runtime with no deps and
-   * `gunicorn`/`uvicorn`/etc. "not found". Install into an in-app-dir
-   * virtualenv (.venv) instead so the packages and their console scripts
-   * persist in the app dir; platform.buildStartSpec puts `.venv/bin` on the
-   * runtime PATH. On the host (PM2, no injected container executor) a plain
-   * pip install is correct — the host interpreter runs the app directly.
+   * The pip install command. Deps must persist into the app dir in BOTH
+   * isolation modes, so this no longer branches on context.execCommand:
+   *  - under docker isolation the build runs in an ephemeral container whose
+   *    global site-packages are discarded when it is removed, and the fresh
+   *    runtime container only sees the bind-mounted app dir — a plain
+   *    `pip install` would leave the runtime with no deps and
+   *    `gunicorn`/`uvicorn`/etc. "not found";
+   *  - under host (PM2/none) isolation a plain `pip install` has been
+   *    observed landing outside the app dir the running process sees, and
+   *    bare `pip` may not even be on PATH (only `python3` is guaranteed).
+   * Installing into an in-app-dir virtualenv (.venv) fixes both: the
+   * packages and their console scripts persist in the app dir (ship with
+   * the artifact like node_modules), and `.venv/bin/python -m pip` — never
+   * bare `pip`, and never `--user`/`-t` (those install outside the app dir,
+   * defeating the point) — is unambiguous about which interpreter/pip runs.
+   * platform.buildStartSpec puts `.venv/bin` on the runtime PATH whenever
+   * `.venv` exists.
+   *
+   * Host requirement: `python3 -m venv` needs the `python3-venv` package
+   * (ensurepip) on Debian/Ubuntu hosts under isolation:none — host
+   * provisioning must install it (docker's python:3.12-slim base already
+   * ships venv, so the docker build side needs no extra package).
    */
-  private pipInstall(context: BuildContext): string {
-    return context.execCommand
-      ? 'python -m venv .venv && .venv/bin/pip install -r requirements.txt'
-      : 'pip install -r requirements.txt';
+  private pipInstall(): string {
+    return (
+      'python3 -m venv .venv && ' +
+      '.venv/bin/python -m pip install --upgrade pip && ' +
+      '.venv/bin/python -m pip install -r requirements.txt'
+    );
   }
 
-  /** Whether this build installed deps into an in-app-dir .venv (docker path). */
+  /**
+   * Whether this build installs deps into (or otherwise creates) an
+   * in-app-dir .venv — true for the default install paths (both the
+   * requirements.txt case and the manifest-less venv-only case created by
+   * preBuild), and for any custom installCommand that references .venv.
+   * Gates which interpreter runs Django's collectstatic.
+   */
   private usesVenv(context: BuildContext): boolean {
-    return context.config.installCommand?.includes('.venv/bin/pip') ?? false;
+    return context.config.installCommand?.includes('.venv') ?? false;
   }
 
   getOutputDirectory(context: BuildContext): string | null {
@@ -96,12 +120,15 @@ export class PythonBuildStrategy extends BaseBuildStrategy {
       } else if (hasPoetry) {
         context.config.installCommand = 'poetry install';
       } else if (hasRequirements) {
-        context.config.installCommand = this.pipInstall(context);
+        context.config.installCommand = this.pipInstall();
       } else {
-        // No dependency manifest found → skip the install stage entirely
-        // (the same mechanism nodejs uses), rather than an '' sentinel that
-        // getInstallCommand's truthy check would ignore.
-        context.config.skipInstall = true;
+        // No dependency manifest found — still create an (empty) in-app-dir
+        // .venv (venv only, no pip install to run) instead of skipping the
+        // install stage entirely. platform.buildStartSpec only puts
+        // `.venv/bin` on the runtime PATH when `.venv` exists, so a
+        // manifest-less (stdlib-only) app needs one too for `.venv/bin/python`
+        // to exist uniformly across every Python app.
+        context.config.installCommand = 'python3 -m venv .venv';
       }
     }
   }

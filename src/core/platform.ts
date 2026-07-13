@@ -2962,29 +2962,49 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       }
     } else {
       const startCommand = startOverride || detection.suggestedConfig?.startCommand || 'node index.js';
+      // Python deps are installed into an in-app-dir virtualenv (.venv) by
+      // PythonBuildStrategy so they survive into the fresh runtime; put its
+      // bin dir first on PATH so `gunicorn`/`uvicorn`/`python` resolve to the
+      // installed packages. The venv is always written to the real (host)
+      // appPath by the build step — check for it there regardless of run
+      // mode — but embed whichever base dir the command will actually run
+      // against: the container's /app mount under docker, or appPath itself
+      // under PM2 (no remapping on the host).
+      const isPython = ['python', 'django', 'flask', 'fastapi'].includes(detection.type);
+      const venvPrefixFor = async (baseDir: string): Promise<string> =>
+        isPython && (await this.pathExists(path.join(appPath, '.venv')))
+          ? `export PATH="${baseDir}/.venv/bin:$PATH"; `
+          : '';
+
       if (this.config.isolation === 'docker') {
         // Docker execs the Cmd array directly with NO shell, so a multi-token
         // start command — the python detector's `gunicorn --bind 0.0.0.0:$PORT
         // app:app`/`uvicorn ... --port $PORT`, or `node dist/server.js` — would
         // be treated as one bogus executable name and $PORT would never expand.
-        // Run it through /bin/sh -c. Python deps are installed into an
-        // in-app-dir virtualenv (.venv) by PythonBuildStrategy so they survive
-        // into the fresh runtime container; put its bin dir first on PATH so
-        // `gunicorn`/`uvicorn`/`python` resolve to the installed packages.
-        const isPython = ['python', 'django', 'flask', 'fastapi'].includes(detection.type);
-        const venvPrefix =
-          isPython && (await this.pathExists(path.join(appPath, '.venv')))
-            ? 'export PATH="/app/.venv/bin:$PATH"; '
-            : '';
+        // Run it through /bin/sh -c. `exec` replaces the shell with the app
+        // process so the container's PID 1 is the real app (correct signal
+        // handling / metrics / crash-restart).
+        const venvPrefix = await venvPrefixFor('/app');
         script = '/bin/sh';
         interpreter = 'none';
-        args = ['-c', `${venvPrefix}${startCommand}`];
+        args = ['-c', `${venvPrefix}exec ${startCommand}`];
       } else {
-        // PM2 infers the interpreter from the script file's extension, so keep
-        // the file-only script (with any `node ` prefix stripped) it expects.
-        script = startCommand.startsWith('node ')
-          ? startCommand.substring(5)
-          : startCommand;
+        // PM2 fork mode: previously this branch passed the raw, possibly
+        // multi-token startCommand as a bare `script` (with any leading
+        // `node ` stripped) and no args/interpreter — PM2 treated it as a
+        // single executable name, so a multi-token command (gunicorn/uvicorn
+        // invocations, `python app.py --flag`) failed with ENOENT and $PORT
+        // (only present in the child env) never expanded. Mirror the docker
+        // branch's shape: run through /bin/sh -c so the command is split and
+        // $PORT expands, and `exec` so the shell is replaced by the app
+        // process — PM2 then monitors the real app's PID (correct
+        // metrics/restart/memory-cap). Node gets no venv prefix (isPython is
+        // false for it), so its command stays prefix-free:
+        // `/bin/sh -c 'exec node …'`.
+        const venvPrefix = await venvPrefixFor(appPath);
+        script = '/bin/sh';
+        interpreter = 'none';
+        args = ['-c', `${venvPrefix}exec ${startCommand}`];
       }
     }
 
