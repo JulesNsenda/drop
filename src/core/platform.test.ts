@@ -2616,3 +2616,105 @@ describe('build-drain queue', () => {
     expect((platform as any).pendingBuilds.has('app1')).toBe(true);
   });
 });
+
+// M3 3a: handleStartApp must not declare 'running' the instant runtime.start
+// resolves — it gates on awaitReadiness first. A failing gate writes 'errored'
+// (never 'running') and skips the health prober / crash-loop watch entirely;
+// a passing gate proceeds to 'running' and arms both. awaitReadiness itself is
+// unit-tested in isolation (platform.readiness.test.ts), so here it's mocked
+// directly — this test is about handleStartApp's branching on the gate's
+// result, not the gate's own logic. Constructed but never start()-ed, mirroring
+// the teardownApp/removeGroup harness above: the constructor does no I/O, so
+// runtime/detector/stateManager can be bare mocks without the full
+// module-level mock stack the rest of this file sets up for the pipeline.
+describe('handleStartApp — readiness gate (M3 3a)', () => {
+  let platform: DropPlatform;
+  let tempDir: string;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    tempDir = path.join(
+      os.tmpdir(),
+      `drop-test-readiness-gate-${Date.now()}-${Math.random().toString(36).slice(2)}`
+    );
+    platform = createPlatform({
+      dropRoot: tempDir,
+      appsDirectory: path.join(tempDir, 'apps'),
+      logLevel: 'error',
+    });
+
+    (platform as any).detector = {
+      detect: jest.fn().mockResolvedValue({
+        type: 'nodejs',
+        framework: null,
+        confidence: 1,
+        suggestedConfig: {},
+      }),
+    };
+    (platform as any).runtime = {
+      type: 'pm2',
+      start: jest.fn().mockResolvedValue({ pid: 4242 }),
+    };
+    (platform as any).stateManager = {
+      setAppStatus: jest.fn().mockResolvedValue(undefined),
+      getAllApps: jest.fn().mockReturnValue([]),
+      getApp: jest.fn().mockReturnValue(undefined),
+    };
+    // buildStartSpec's own shaping is covered by the "buildStartSpec ... command
+    // shaping" describes above; stub it here so this test is only about the
+    // gate branch, with a healthCheckPath set so a passing gate has something
+    // real to arm the prober with.
+    jest.spyOn(platform as any, 'buildStartSpec').mockResolvedValue({
+      name: 'gatedapp',
+      script: '/bin/sh',
+      args: ['-c', 'exec node index.js'],
+      cwd: path.join(tempDir, 'apps', 'gatedapp'),
+      port: 4000,
+      env: {},
+      healthCheckPath: '/health',
+    });
+  });
+
+  afterEach(async () => {
+    if (platform.isActive()) {
+      await platform.stop();
+    }
+  });
+
+  it('errors the app (not running) when the readiness gate fails, and starts neither the health prober nor the crash-loop watch', async () => {
+    const sm = (platform as any).stateManager;
+    (platform as any).awaitReadiness = jest.fn().mockResolvedValue({ ok: false, reason: 'boom' });
+    const proberSpy = jest.spyOn(platform as any, 'startHealthProber').mockImplementation(() => undefined);
+    const crashWatchSpy = jest.spyOn(platform as any, 'startCrashLoopWatch').mockImplementation(() => undefined);
+
+    await (platform as any).handleStartApp('gatedapp');
+
+    expect(sm.setAppStatus).toHaveBeenCalledWith(
+      'gatedapp',
+      'errored',
+      expect.objectContaining({ error: expect.stringContaining('boom') })
+    );
+    expect(sm.setAppStatus).not.toHaveBeenCalledWith('gatedapp', 'running', expect.anything());
+    expect(proberSpy).not.toHaveBeenCalled();
+    expect(crashWatchSpy).not.toHaveBeenCalled();
+  });
+
+  it('reaches running when the readiness gate passes, and arms the health prober + crash-loop watch', async () => {
+    const sm = (platform as any).stateManager;
+    (platform as any).awaitReadiness = jest.fn().mockResolvedValue({ ok: true });
+    const proberSpy = jest.spyOn(platform as any, 'startHealthProber').mockImplementation(() => undefined);
+    const crashWatchSpy = jest.spyOn(platform as any, 'startCrashLoopWatch').mockImplementation(() => undefined);
+
+    await (platform as any).handleStartApp('gatedapp');
+
+    expect(sm.setAppStatus).toHaveBeenCalledWith(
+      'gatedapp',
+      'running',
+      expect.objectContaining({ pid: 4242 })
+    );
+    // The prober is armed with handleStartApp's own allocated port (not
+    // buildStartSpec's mocked spec.port — that field isn't the one it reads).
+    expect(proberSpy).toHaveBeenCalledWith('gatedapp', expect.any(Number), '/health');
+    expect(crashWatchSpy).toHaveBeenCalledWith('gatedapp');
+  });
+});

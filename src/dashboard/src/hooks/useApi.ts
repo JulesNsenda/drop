@@ -13,7 +13,7 @@ export interface GitSource {
 export interface App {
   name: string;
   type: string;
-  status: 'pending' | 'building' | 'starting' | 'running' | 'stopped' | 'errored';
+  status: 'pending' | 'building' | 'starting' | 'running' | 'stopped' | 'errored' | 'crash-looping';
   port?: number;
   pid?: number;
   path: string;

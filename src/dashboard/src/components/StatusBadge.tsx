@@ -12,6 +12,9 @@ const statusTones: Record<string, string> = {
   building: 'dui-badge-accent',
   starting: 'dui-badge-accent',
   errored: 'dui-badge-err',
+  // Was up, now restarting repeatedly (post-deploy liveness watch) — a warning
+  // tone, distinct from the terminal `errored` (err/red) state.
+  'crash-looping': 'dui-badge-warn',
 };
 
 function StatusBadge({ status }: StatusBadgeProps) {

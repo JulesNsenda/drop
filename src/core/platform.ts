@@ -62,6 +62,7 @@ import {
   resetLogRetentionService,
 } from '../managers/log-retention/log-retention';
 import { hasEnoughDisk, getMinFreeDiskMb } from '../utils/disk';
+import { probePort, probeHttp } from '../utils/http-probe';
 
 export interface PlatformConfig {
   /** Root directory for DROP */
@@ -286,6 +287,15 @@ export class DropPlatform {
   private readonly CERT_CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 hours
   /** Per-app health-probe intervals (PM2 mode only; Docker uses HEALTHCHECK). */
   private readonly healthProbers: Map<string, ReturnType<typeof setInterval>> = new Map();
+  /** Per-app post-deploy crash-loop watches (both modes; keyed on restart count). */
+  private readonly crashLoopWatchers: Map<string, ReturnType<typeof setInterval>> = new Map();
+  /** Restart count (over one watch interval) at/above which a running app is flagged crash-looping. */
+  private readonly CRASHLOOP_RESTART_THRESHOLD = 3;
+  /** Startup readiness window: how long handleStartApp waits for an app to come up before erroring. */
+  private readonly readinessTimeoutMs = Math.max(
+    50,
+    Number(process.env.DROP_READINESS_TIMEOUT_MS) || 20_000
+  );
 
   constructor(config?: Partial<PlatformConfig>) {
     // Load DNS credentials from environment variables
@@ -504,9 +514,11 @@ export class DropPlatform {
       resetCaddyServer();
     }
 
-    // Stop all health probers
+    // Stop all health probers and crash-loop watches
     for (const [, timer] of this.healthProbers) clearInterval(timer);
     this.healthProbers.clear();
+    for (const [, timer] of this.crashLoopWatchers) clearInterval(timer);
+    this.crashLoopWatchers.clear();
 
     // Reset secret manager, webhook manager, git deploy service, build logs,
     // and the platform-ops seam (routes must 503 once the platform is down).
@@ -1263,6 +1275,7 @@ backup:
       const status = (payload.changes as { status?: string })?.status;
       if (status === 'stopped' || status === 'errored') {
         this.stopHealthProber(payload.appId);
+        this.stopCrashLoopWatch(payload.appId);
       }
     });
     this.subscriptions.push(statusSub);
@@ -2114,6 +2127,26 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
 
       this.logger.appEvent('started', appName, `PID ${status.pid}, port ${port}`);
 
+      // Readiness gate: PM2/Docker report 'online' the instant a process is
+      // (re)forked, so a crash-looping app satisfies runtime.start's own
+      // wait — don't declare 'running' until the app actually proves it's up.
+      // A first-deploy failure resolves to 'errored' (never 'crash-looping'):
+      // the deploy tracker closes an episode only on running|errored, so
+      // 'errored' is what makes deploy_files report the failure honestly.
+      const readiness = await this.awaitReadiness(appName, port, spec);
+      if (!readiness.ok) {
+        this.logger.appEvent('error', appName, `readiness check failed: ${readiness.reason}`);
+        if (this.stateManager) {
+          await this.stateManager.setAppStatus(appName, 'errored', {
+            port,
+            pid: status.pid ?? undefined,
+            error: `App started but failed its readiness check: ${readiness.reason}`,
+          });
+        }
+        // The finally block releases appsInProgress; no prober/crash-watch here.
+        return;
+      }
+
       // Save port and data directory to config file (source of truth for restarts)
       if (this.appConfigService) {
         await this.appConfigService.updateConfig(appName, {
@@ -2138,6 +2171,12 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       if (spec.healthCheckPath && this.runtime?.type === 'pm2') {
         this.startHealthProber(appName, port, spec.healthCheckPath);
       }
+      // Watch for a post-deploy crash-loop (both modes) — flips a running app to
+      // 'crash-looping' when its runtime restart count climbs. Keyed on restart
+      // count, not an HTTP rule, so a healthy JSON API (4xx at `/`) is never
+      // mis-flagged. The deploy episode has already closed on 'running', so this
+      // status change does not affect deploy_files.
+      this.startCrashLoopWatch(appName);
     } catch (error) {
       this.logger.appEvent('error', appName, error instanceof Error ? error.message : 'Failed to start');
       if (this.stateManager) {
@@ -2901,6 +2940,114 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     if (t) {
       clearInterval(t);
       this.healthProbers.delete(appName);
+    }
+  }
+
+  /**
+   * Block until a just-started app proves it's actually up, or fail. Returns
+   * `{ ok: false }` (caller writes `errored`, closing the deploy episode) when:
+   *  - the process exits or crash-loops (runtime restart count climbs) during
+   *    the startup window; or
+   *  - a web app never answers an HTTP probe within the window.
+   * A background worker that never binds its assigned port AND declares no
+   * healthCheck passes on process-liveness alone (never HTTP-gated). An HTTP
+   * probe counts as success on ANY response (4xx/5xx included) — "the app
+   * answered" means it's serving; a 404-at-`/` JSON API is healthy. Docker
+   * port-bind alone is NOT trusted (the userland proxy accepts connections
+   * before the in-container app listens), so in docker mode the HTTP probe is
+   * required; in PM2 mode a bind is sufficient (lenient for slow-booting apps).
+   * Never throws.
+   */
+  private async awaitReadiness(
+    appName: string,
+    port: number,
+    spec: AppStartSpec
+  ): Promise<{ ok: boolean; reason?: string }> {
+    if (!this.runtime) return { ok: true };
+    const windowMs = this.readinessTimeoutMs;
+    const isDocker = this.config.isolation === 'docker';
+    const healthPath = spec.healthCheckPath || '/';
+    const baselineRestarts = (await this.runtime.getStatus(appName))?.restarts ?? 0;
+    const start = Date.now();
+
+    /** Whether the process died or restarted (crash-loop) since start. */
+    const liveness = async (): Promise<{ dead: boolean; crashed: boolean }> => {
+      const info = await this.runtime?.getStatus(appName);
+      if (!info || info.status === 'stopped' || info.status === 'errored') {
+        return { dead: true, crashed: false };
+      }
+      return { dead: false, crashed: info.restarts > baselineRestarts };
+    };
+
+    // Poll: succeed as soon as an HTTP probe answers; fail as soon as the
+    // process dies or crash-loops.
+    while (Date.now() - start < windowMs) {
+      const l = await liveness();
+      if (l.dead) return { ok: false, reason: 'process exited during startup' };
+      if (l.crashed) return { ok: false, reason: 'process crash-looped during startup' };
+      if (await probePort('127.0.0.1', port, 1000)) {
+        const r = await probeHttp('127.0.0.1', port, healthPath, 3000);
+        if (r.responded) return { ok: true };
+      }
+      await new Promise((resolve) => setTimeout(resolve, Math.min(500, windowMs)));
+    }
+
+    // Window elapsed with no HTTP success — classify the (stable) process.
+    const l = await liveness();
+    if (l.dead) return { ok: false, reason: 'process exited during startup' };
+    if (l.crashed) return { ok: false, reason: 'process crash-looped during startup' };
+    const bound = await probePort('127.0.0.1', port, 1000);
+    if (!bound && !spec.healthCheckPath) return { ok: true }; // worker: no port, no health check
+    if (bound && !isDocker) return { ok: true }; // PM2: a bind proves it's listening
+    return {
+      ok: false,
+      reason: `no HTTP response on :${port} within ${Math.round(windowMs / 1000)}s`,
+    };
+  }
+
+  /**
+   * After a successful deploy, watch for the process entering a crash-loop and
+   * flip its status to 'crash-looping'. Keyed on the runtime's restart count
+   * (PM2 restart_time / Docker RestartCount), NOT an HTTP health rule, so a
+   * healthy JSON API returning 4xx at `/` is never mis-flagged. Only escalates
+   * an app that is currently 'running'. Both isolation modes.
+   */
+  private startCrashLoopWatch(appName: string): void {
+    this.stopCrashLoopWatch(appName);
+    let baseline: number | null = null;
+    const interval = setInterval(async () => {
+      try {
+        const info = await this.runtime?.getStatus(appName);
+        if (!info) return;
+        if (baseline === null) {
+          baseline = info.restarts;
+          return;
+        }
+        if (this.stateManager?.getApp(appName)?.status !== 'running') return;
+        if (info.restarts - baseline >= this.CRASHLOOP_RESTART_THRESHOLD) {
+          this.logger.appEvent(
+            'error',
+            appName,
+            `crash-looping (${info.restarts - baseline} restarts since deploy)`
+          );
+          await this.stateManager?.setAppStatus(appName, 'crash-looping', {
+            error: 'Process is restarting repeatedly',
+          });
+          baseline = info.restarts; // re-baseline so we don't re-flag every tick
+        }
+      } catch {
+        // Ignore errors in the watch itself.
+      }
+    }, 30_000);
+    interval.unref?.();
+    this.crashLoopWatchers.set(appName, interval);
+  }
+
+  private stopCrashLoopWatch(appName: string): void {
+    const t = this.crashLoopWatchers.get(appName);
+    if (t) {
+      clearInterval(t);
+      this.crashLoopWatchers.delete(appName);
     }
   }
 

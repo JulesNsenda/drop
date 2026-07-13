@@ -11,7 +11,18 @@ import { eventBus } from '../../core/event-bus';
 import { writeJsonAtomic } from '../../utils/atomic-write';
 import type { GitSource } from '../../core/git-deploy/git-deploy.types';
 
-export type AppStatus = 'pending' | 'building' | 'starting' | 'running' | 'stopped' | 'errored';
+export type AppStatus =
+  | 'pending'
+  | 'building'
+  | 'starting'
+  | 'running'
+  | 'stopped'
+  | 'errored'
+  // Set by the post-deploy liveness watch when an already-`running` app begins
+  // restarting repeatedly. NOT used as a first-deploy outcome — a deploy that
+  // never comes up resolves to `errored` so the deploy tracker closes the
+  // episode (it only closes on `running`/`errored`).
+  | 'crash-looping';
 export type AppType = 'nodejs' | 'python' | 'go' | 'static' | 'docker' | 'unknown';
 
 export interface AppState {
