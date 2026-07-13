@@ -488,6 +488,21 @@ apps.put('/:name', async c => {
 apps.delete('/:name', async c => {
   const auth = (c.get as Function)('auth') as AuthContext | undefined;
   const name = c.req.param('name');
+
+  // M4 (DELETE-during-build guard): a build/hot-reload still holds this app
+  // in appsInProgress. Tearing its state down now would wipe the record out
+  // from under the in-flight operation — whose later setAppStatus('errored')
+  // then no-ops because the app is gone — so the operator sees "not found"
+  // instead of "errored". Block until it settles (mirrors the start/restart
+  // AppInProgressError -> 409 pattern below, but checked synchronously since
+  // there's no teardown operation to catch it from).
+  if (getPlatformOps()?.isAppInProgress(name)) {
+    return c.json(
+      error(ErrorCodes.CONFLICT, `Application '${name}' is building or deploying — retry once it settles`),
+      409
+    );
+  }
+
   const stateManager = getStateManager();
   const app = stateManager.getApp(name);
 
@@ -504,6 +519,16 @@ apps.delete('/:name', async c => {
     const ops = getPlatformOps();
     if (!ops) {
       return c.json(error(ErrorCodes.SERVICE_UNAVAILABLE, 'Platform operations unavailable'), 503);
+    }
+
+    // Group-aware extension of the same guard: `name` here is the group tag,
+    // not an individual app name, so the top-of-handler check above can't see
+    // a child mid-build. Block the whole-group teardown if any child is busy.
+    if (groupChildren.some(child => ops.isAppInProgress(child.name))) {
+      return c.json(
+        error(ErrorCodes.CONFLICT, `Group '${name}' has an app building or deploying — retry once it settles`),
+        409
+      );
     }
 
     const { removed } = await ops.removeGroup(name);

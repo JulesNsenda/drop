@@ -20,6 +20,7 @@ import * as databaseModule from '../../managers/database';
 import type { DatabaseProvisioner } from '../../managers/database';
 import * as routerModule from '../../core/router';
 import { setPlatformOps, resetPlatformOps, PlatformOps } from '../platform-ops';
+import { ErrorCodes } from '../types';
 
 function makeMockRuntime(): AppRuntime {
   return {
@@ -288,6 +289,119 @@ describe('DELETE /api/v1/apps/:name — group-aware (M4)', () => {
 
     expect(res.status).toBe(200);
     await expect(fs.access(containerDir)).resolves.toBeUndefined();
+  });
+});
+
+describe('DELETE /api/v1/apps/:name — in-progress guard (M4)', () => {
+  // Regression coverage for docs/plan/python-docker-runtime-fixes.md §M4: a
+  // DELETE issued while a build/hot-reload still holds the app in
+  // appsInProgress used to wipe the app's state, so the build's later
+  // setAppStatus('errored') became a no-op and the operator saw "not found"
+  // instead of "errored". The route now checks PlatformOps.isAppInProgress
+  // up front and 409s instead of tearing anything down.
+  let tempDir: string;
+  let server: ApiServer;
+  let hono: ReturnType<ApiServer['getApp']>;
+  let ownerToken: string;
+  let ownerId: string;
+  let runtime: AppRuntime;
+
+  const authHeader = (token: string) => ({ Authorization: `Bearer ${token}` });
+
+  function makeOps(overrides?: Partial<PlatformOps>): PlatformOps {
+    return {
+      restartApp: jest.fn(),
+      isAppInProgress: jest.fn().mockReturnValue(false),
+      removeGroup: jest.fn().mockResolvedValue({ removed: [] }),
+      ...overrides,
+    };
+  }
+
+  beforeEach(async () => {
+    tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'drop-delete-inprogress-test-'));
+    jest.spyOn(console, 'log').mockImplementation();
+    jest.spyOn(console, 'warn').mockImplementation();
+
+    resetStateManager();
+    resetAuth();
+    resetPlatformOps();
+    getStateManager({ stateFilePath: path.join(tempDir, 'apps.json') });
+
+    runtime = makeMockRuntime();
+    jest.spyOn(runtimeModule, 'getAppRuntime').mockReturnValue(runtime);
+    jest.spyOn(databaseModule, 'getDatabaseProvisioner').mockReturnValue({
+      backupAndDeleteAppDatabase: jest.fn().mockResolvedValue({ dropped: true }),
+    } as unknown as DatabaseProvisioner);
+
+    server = new ApiServer({
+      port: 3095,
+      enableAuth: true,
+      credentialsPath: path.join(tempDir, 'credentials.json'),
+    });
+    await server.initialize();
+    hono = server.getApp();
+
+    const owner = await createUser('busy-owner', 'password123', 'user');
+    ownerId = owner.id;
+    ownerToken = await getTestToken('busy-owner', 'password123');
+
+    const sm = getStateManager();
+    await sm.registerApp('busy-app', path.join(tempDir, 'busy-app'));
+    await sm.updateApp('busy-app', { userId: ownerId });
+  });
+
+  afterEach(async () => {
+    if (server) await server.stop();
+    await getStateManager().close();
+    resetStateManager();
+    resetPlatformOps();
+    jest.restoreAllMocks();
+    await fs.rm(tempDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  });
+
+  it('409s and tears down nothing while the app is mid-build/deploy', async () => {
+    setPlatformOps(makeOps({ isAppInProgress: jest.fn().mockReturnValue(true) }));
+
+    const res = await hono.request('/api/v1/apps/busy-app', {
+      method: 'DELETE',
+      headers: authHeader(ownerToken),
+    });
+
+    expect(res.status).toBe(409);
+    const body = (await res.json()) as { error: { code: string } };
+    expect(body.error.code).toBe(ErrorCodes.CONFLICT);
+
+    // No teardown of any kind ran: the runtime was never stopped/deleted, and
+    // the app's record is still present in state (not wiped to "not found").
+    expect(runtime.stop).not.toHaveBeenCalled();
+    expect(runtime.delete).not.toHaveBeenCalled();
+    expect(getStateManager().getApp('busy-app')).toBeDefined();
+  });
+
+  it('proceeds with the delete once nothing is in progress', async () => {
+    setPlatformOps(makeOps({ isAppInProgress: jest.fn().mockReturnValue(false) }));
+
+    const res = await hono.request('/api/v1/apps/busy-app', {
+      method: 'DELETE',
+      headers: authHeader(ownerToken),
+    });
+
+    expect(res.status).toBe(200);
+    expect(runtime.stop).toHaveBeenCalledWith('busy-app');
+    expect(getStateManager().getApp('busy-app')).toBeUndefined();
+  });
+
+  it('proceeds with the delete when platform ops is unwired (defense-in-depth only, matches upload-deploy route posture)', async () => {
+    // Deliberately not calling setPlatformOps — mirrors a standalone
+    // ApiServer. isAppInProgress is treated as "not in progress" rather than
+    // blocking, same posture as platform-ops.ts documents for other callers.
+    const res = await hono.request('/api/v1/apps/busy-app', {
+      method: 'DELETE',
+      headers: authHeader(ownerToken),
+    });
+
+    expect(res.status).toBe(200);
+    expect(getStateManager().getApp('busy-app')).toBeUndefined();
   });
 });
 

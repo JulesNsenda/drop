@@ -572,6 +572,38 @@ describe('DropPlatform', () => {
 
       expect(() => (platform as any).allocatePort()).toThrow('No available ports in configured range');
     });
+
+    // M4 regression coverage for bug 6 (docs/plan/python-docker-runtime-fixes.md
+    // §M4) — already fixed 2026-07-07 by claiming usedPorts synchronously at
+    // allocation time (reserve-by-assignment), not at successful bind. These
+    // assert the old double-booking failure mode is now impossible.
+    it('allocates a distinct port for every app — no two apps ever double-book (bug 6)', () => {
+      const names = ['app-a', 'app-b', 'app-c', 'app-d', 'app-e'];
+      const ports = names.map((n) => (platform as any).allocatePort(n));
+
+      expect(new Set(ports).size).toBe(ports.length);
+      names.forEach((n, i) => {
+        expect((platform as any).usedPorts.get(ports[i])).toBe(n);
+      });
+    });
+
+    it("a crash-looping app's already-assigned port is never handed to a different app (bug 6)", () => {
+      // The crash-looper's port is reserved the moment allocatePort claims it
+      // — no successful bind is required. A repeatedly-restarting process
+      // never fires app:deleted, so the reservation must survive further
+      // allocations for brand-new apps.
+      const crashPort = (platform as any).allocatePort('crash-looper');
+      const otherPort = (platform as any).allocatePort('other-app');
+      expect(otherPort).not.toBe(crashPort);
+
+      // Simulate the crash-looper still churning (PM2 restart-count climbing,
+      // no app:deleted) while a THIRD, brand-new app is deployed.
+      const newPort = (platform as any).allocatePort('new-app');
+
+      expect(newPort).not.toBe(crashPort);
+      expect(newPort).not.toBe(otherPort);
+      expect((platform as any).usedPorts.get(crashPort)).toBe('crash-looper');
+    });
   });
 
   describe('disk preflight guards (P2-5)', () => {
@@ -1074,6 +1106,76 @@ describe('app type persistence after build (P1-5 / P1-6 follow-up)', () => {
     await (platform as any).handleAppUpdate('app', path.join(tempDir, 'apps', 'app'), 'edit');
 
     expect(sm.updateApp).toHaveBeenCalledWith('app', expect.objectContaining({ type: 'python' }));
+  });
+});
+
+describe('hung/failed build ends errored with the record intact (M4)', () => {
+  // Regression coverage for docs/plan/python-docker-runtime-fixes.md §M4: the
+  // builder's own build-timeout resolves with the same { success: false,
+  // errors: [...] } shape as any other build failure — already handled by
+  // handleBuildApp's else-branch (setAppStatus('errored'), never removeApp).
+  // This locks in that a hung/failed build does NOT wipe the app's state out
+  // from under it (the old "operator sees not found instead of errored" bug,
+  // which the M4 DELETE-during-build guard also targets from the API side).
+  let platform: DropPlatform;
+  let tempDir: string;
+
+  beforeEach(async () => {
+    jest.clearAllMocks();
+    tempDir = path.join(os.tmpdir(), `drop-test-${Date.now()}`);
+    platform = createPlatform({
+      dropRoot: tempDir,
+      appsDirectory: path.join(tempDir, 'apps'),
+      logLevel: 'error',
+      autoBuild: true,
+      autoStart: false,
+      caddyfilePath: path.join(tempDir, 'Caddyfile'),
+    });
+    await platform.start();
+  });
+
+  afterEach(async () => {
+    if (platform && platform.isActive()) {
+      await platform.stop();
+    }
+  });
+
+  it('a timed-out build ends the app errored, never calls removeApp, and the record stays gettable', async () => {
+    const sm = (platform as any).stateManager;
+    (platform as any).buildLogService = null; // skip build-log FS writes
+
+    // Stateful getApp/removeApp so "record intact" is a real assertion, not a
+    // static mock return value: removeApp actually clears it if called.
+    let record: { name: string; status: string } | undefined = { name: 'hungapp', status: 'building' };
+    sm.getApp.mockImplementation((n: string) => (n === 'hungapp' ? record : undefined));
+    sm.removeApp.mockImplementation(async (n: string) => {
+      if (n === 'hungapp') record = undefined;
+      return true;
+    });
+
+    jest.spyOn(platform.getDetector()!, 'detect').mockResolvedValue({
+      type: 'python',
+      framework: null,
+      suggestedConfig: {},
+    } as any);
+    // Same shape the 10-minute builder timeout produces: success: false with
+    // an error message, not a thrown exception.
+    jest.spyOn(platform.getBuilder()!, 'build').mockResolvedValue({
+      success: false,
+      errors: [{ message: 'Build timed out after 600000ms' }],
+    } as any);
+
+    await (platform as any).handleBuildApp(path.join(tempDir, 'apps', 'hungapp'), 'hungapp', 'python');
+
+    expect(sm.setAppStatus).toHaveBeenCalledWith(
+      'hungapp',
+      'errored',
+      expect.objectContaining({ error: expect.stringContaining('timed out') })
+    );
+    expect(sm.removeApp).not.toHaveBeenCalled();
+    expect(sm.getApp('hungapp')).toBeDefined();
+    // The build guard is released on failure so a later retry isn't wedged.
+    expect((platform as any).appsInProgress.has('hungapp')).toBe(false);
   });
 });
 
