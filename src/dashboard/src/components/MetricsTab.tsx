@@ -53,6 +53,8 @@ function unavailableReason(status: App['status']): string {
       return 'Waiting to deploy — metrics will appear once the app is running.';
     case 'starting':
       return 'Starting — metrics will appear once the app is running.';
+    case 'crash-looping':
+      return 'Crash-looping — the app is restarting repeatedly, no live metrics.';
     default:
       return 'No live metrics available.';
   }
