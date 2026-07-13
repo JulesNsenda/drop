@@ -1960,6 +1960,139 @@ describe('drop.yaml build/start overrides', () => {
   });
 });
 
+// Bug 2 fix (docs/plans/2026-07-13-ezsign-monorepo-deploy-fixes.md): a monorepo
+// container (root drop.yaml has a `services:` map) is a group descriptor, not a
+// buildable app. The git-deploy path registers it in state, so an app:update for
+// the container must not fall through to a plain build/detect - it must be
+// skipped (incidental watcher settle) or re-expanded (explicit redeploy).
+describe('handleAppUpdate — monorepo container guard (Bug 2 fix)', () => {
+  let platform: DropPlatform;
+  let tempDir: string;
+  let appsDir: string;
+
+  beforeAll(() => {
+    // The guard calls the real, fs-backed parseDropYaml against a drop.yaml
+    // written to a real temp dir — override the file-level fs/promises mocks
+    // (set up above for the rest of this file's hermetic unit tests) with the
+    // real implementation for the duration of this suite only. Mirrors the
+    // expandMonorepo / drop.yaml build-start-overrides suites above.
+    const actual = jest.requireActual('fs/promises') as typeof fsPromises;
+    (fsPromises.mkdir as jest.Mock).mockImplementation(actual.mkdir);
+    (fsPromises.writeFile as jest.Mock).mockImplementation(actual.writeFile);
+    (fsPromises.rm as jest.Mock).mockImplementation(actual.rm);
+    (fsPromises.stat as jest.Mock).mockImplementation(actual.stat);
+    (fsPromises.access as jest.Mock).mockImplementation(actual.access);
+    (fsPromises.readFile as jest.Mock).mockImplementation(actual.readFile);
+  });
+
+  afterAll(() => {
+    // Restore this file's original mock behavior (matches the jest.mock
+    // factory at the top of the file) for hygiene.
+    (fsPromises.mkdir as jest.Mock).mockResolvedValue(undefined);
+    (fsPromises.writeFile as jest.Mock).mockResolvedValue(undefined);
+    (fsPromises.rm as jest.Mock).mockResolvedValue(undefined);
+    (fsPromises.stat as jest.Mock).mockImplementation(async () => ({
+      isDirectory: () => true,
+      isFile: () => false,
+    }));
+    (fsPromises.access as jest.Mock).mockResolvedValue(undefined);
+    (fsPromises.readFile as jest.Mock).mockImplementation(async (filePath: string) => {
+      if (filePath.endsWith('package.json')) {
+        return JSON.stringify({
+          name: 'test-app',
+          version: '1.0.0',
+          scripts: { start: 'node index.js', build: 'echo build' },
+        });
+      }
+      const realFs = jest.requireActual('fs/promises') as typeof fsPromises;
+      return realFs.readFile(filePath as never);
+    });
+  });
+
+  beforeEach(async () => {
+    tempDir = path.join(
+      os.tmpdir(),
+      `drop-test-monorepo-guard-${Date.now()}-${Math.random().toString(36).slice(2)}`
+    );
+    appsDir = path.join(tempDir, 'apps');
+    await fsPromises.mkdir(appsDir, { recursive: true });
+
+    platform = createPlatform({
+      dropRoot: tempDir,
+      appsDirectory: appsDir,
+      logLevel: 'error',
+      caddyfilePath: path.join(tempDir, 'Caddyfile'),
+    });
+    // handleAppUpdate's own early guard bails out unless these are truthy;
+    // stub minimally rather than starting the whole platform (which would
+    // spin up a real watcher that could race the fixture file below).
+    (platform as any).runtime = {};
+    (platform as any).stateManager = { getApp: jest.fn().mockReturnValue(undefined) };
+    (platform as any).detector = {};
+    (platform as any).builder = {};
+  });
+
+  afterEach(async () => {
+    if (platform && platform.isActive()) {
+      await platform.stop();
+    }
+    await fsPromises.rm(tempDir, { recursive: true, force: true }).catch(() => undefined);
+  });
+
+  /** Writes a container drop.yaml declaring a `services:` map (monorepo group descriptor). */
+  async function writeContainerYaml(appPath: string): Promise<void> {
+    await fsPromises.mkdir(appPath, { recursive: true });
+    await fsPromises.writeFile(
+      path.join(appPath, 'drop.yaml'),
+      yaml.stringify({
+        name: 'ezsign',
+        services: {
+          backend: { path: 'backend' },
+          frontend: { path: 'frontend', type: 'static' },
+        },
+      })
+    );
+  }
+
+  it('skips the container on an incidental watcher settle (bypassCooldown=false), without re-expanding', async () => {
+    const appName = 'ezsign';
+    const appPath = path.join(appsDir, appName);
+    await writeContainerYaml(appPath);
+
+    const expandSpy = jest.spyOn(platform as any, 'expandMonorepo').mockResolvedValue(undefined);
+    const debugSpy = jest.spyOn((platform as any).logger, 'debug').mockImplementation(() => undefined);
+
+    await (platform as any).handleAppUpdate(appName, appPath, 'file change', false);
+
+    expect(expandSpy).not.toHaveBeenCalled();
+    expect(debugSpy).toHaveBeenCalledWith(
+      expect.stringContaining(`Skipping update for monorepo container '${appName}'`),
+      'UPDATE'
+    );
+  });
+
+  it('re-expands the container on an explicit redeploy (bypassCooldown=true)', async () => {
+    const appName = 'ezsign';
+    const appPath = path.join(appsDir, appName);
+    await writeContainerYaml(appPath);
+
+    const expandSpy = jest.spyOn(platform as any, 'expandMonorepo').mockResolvedValue(undefined);
+    const infoSpy = jest.spyOn((platform as any).logger, 'info').mockImplementation(() => undefined);
+
+    await (platform as any).handleAppUpdate(appName, appPath, 'redeploy', true);
+
+    expect(expandSpy).toHaveBeenCalledWith(
+      appPath,
+      appName,
+      expect.objectContaining({ services: expect.any(Object) })
+    );
+    expect(infoSpy).toHaveBeenCalledWith(
+      expect.stringContaining(`Re-expanding monorepo container '${appName}'`),
+      'MONOREPO'
+    );
+  });
+});
+
 describe('teardownApp / removeGroup (M4: group lifecycle)', () => {
   let platform: DropPlatform;
   let tempDir: string;

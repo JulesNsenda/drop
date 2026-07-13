@@ -2313,6 +2313,33 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       return;
     }
 
+    // A monorepo container (root drop.yaml has `services:`) is a group descriptor, never a buildable
+    // app — the app:detected interception (see the detectedSub handler above) expands it into child
+    // apps and never builds it. The git-deploy path registers the container in state, so without this
+    // guard its app:update would fall through to detect-as-`unknown` → "No build strategy found". On an
+    // EXPLICIT redeploy (bypassCooldown) re-expand — git pull refreshed the container and the children
+    // are copies that must be re-materialized — via the same idempotent expandMonorepo path the
+    // interception uses. On an incidental watcher file-settle (bypassCooldown false) skip: the
+    // interception already expanded the children this deploy, and re-expanding would fs.rm/fs.cp their
+    // folders out from under an in-flight build.
+    const containerYaml = await parseDropYaml(appPath);
+    if (
+      containerYaml.success &&
+      containerYaml.config?.services &&
+      Object.keys(containerYaml.config.services).length > 0
+    ) {
+      if (bypassCooldown) {
+        this.logger.info(`Re-expanding monorepo container '${appName}' (explicit redeploy)`, 'MONOREPO');
+        await this.expandMonorepo(appPath, appName, containerYaml.config);
+      } else {
+        this.logger.debug(
+          `Skipping update for monorepo container '${appName}' - not a buildable app`,
+          'UPDATE'
+        );
+      }
+      return;
+    }
+
     // Skip if app was just deployed (adaptive cooldown to prevent loops), UNLESS
     // this is an explicit redeploy (bypassCooldown): the cooldown exists to stop
     // a build's own file writes from re-triggering the watcher, which an
