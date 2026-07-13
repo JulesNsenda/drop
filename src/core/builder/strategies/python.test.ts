@@ -16,6 +16,15 @@ import { AppType } from '../../detector/detector.types';
 describe('PythonBuildStrategy', () => {
   const strategy = new PythonBuildStrategy();
 
+  // The in-app-dir venv install command every default (non-custom,
+  // requirements.txt) install path must produce, identically regardless of
+  // isolation mode (bugs 1 + 3): deps persist in the app dir, and only
+  // `.venv/bin/python -m pip` is used — never bare `pip`.
+  const VENV_INSTALL_CMD =
+    'python3 -m venv .venv && ' +
+    '.venv/bin/python -m pip install --upgrade pip && ' +
+    '.venv/bin/python -m pip install -r requirements.txt';
+
   const ctx = (overrides: Partial<BuildContext> & { appType: AppType }): BuildContext =>
     ({
       appName: 'app',
@@ -33,20 +42,28 @@ describe('PythonBuildStrategy', () => {
     });
 
     it.each(['python', 'django', 'flask', 'fastapi'] as const)(
-      'defaults to "pip install -r requirements.txt" for %s (host build)',
+      'defaults to the in-app-dir venv install using .venv/bin/python -m pip for %s (no execCommand — host/none isolation)',
       (appType) => {
-        expect(strategy.getInstallCommand(ctx({ appType }))).toBe('pip install -r requirements.txt');
+        expect(strategy.getInstallCommand(ctx({ appType }))).toBe(VENV_INSTALL_CMD);
       }
     );
 
-    it('installs into an in-app-dir .venv under docker isolation (execCommand present)', () => {
-      // A container executor means the build runs in an ephemeral container
-      // whose global site-packages vanish on removal — deps MUST land in the
-      // bind-mounted app dir (.venv) to survive into the runtime container.
+    it('installs into the identical in-app-dir .venv when execCommand is set (docker isolation)', () => {
+      // Deps must persist into the app dir in BOTH isolation modes (bug 1),
+      // so the install command no longer branches on context.execCommand —
+      // docker and host/none isolation must produce the exact same command.
       const c = ctx({ appType: 'flask', execCommand: jest.fn() });
-      expect(strategy.getInstallCommand(c)).toBe(
-        'python -m venv .venv && .venv/bin/pip install -r requirements.txt'
-      );
+      expect(strategy.getInstallCommand(c)).toBe(VENV_INSTALL_CMD);
+    });
+
+    it('never uses bare `pip` or --user/-t, regardless of isolation mode (bug 3)', () => {
+      for (const c of [ctx({ appType: 'flask' }), ctx({ appType: 'flask', execCommand: jest.fn() })]) {
+        const cmd = strategy.getInstallCommand(c) ?? '';
+        expect(cmd).toContain('.venv/bin/python -m pip');
+        expect(cmd).not.toMatch(/(^|&&\s*)pip\s/);
+        expect(cmd).not.toContain('--user');
+        expect(cmd).not.toMatch(/\s-t\s/);
+      }
     });
   });
 
@@ -103,20 +120,18 @@ describe('PythonBuildStrategy', () => {
       await fs.rm(tmpDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
     });
 
-    it('uses pip + requirements.txt when only requirements.txt is present (host build)', async () => {
+    it('uses the in-app-dir venv install for requirements.txt (host build, no execCommand)', async () => {
       await fs.writeFile(path.join(tmpDir, 'requirements.txt'), 'flask==3.0.0\n');
       const c = ctx({ appType: 'flask', appPath: tmpDir });
       await strategy.preBuild(c);
-      expect(c.config.installCommand).toBe('pip install -r requirements.txt');
+      expect(c.config.installCommand).toBe(VENV_INSTALL_CMD);
     });
 
-    it('uses a .venv install for requirements.txt under docker isolation', async () => {
+    it('uses the identical in-app-dir venv install for requirements.txt under docker isolation (execCommand present)', async () => {
       await fs.writeFile(path.join(tmpDir, 'requirements.txt'), 'flask==3.0.0\n');
       const c = ctx({ appType: 'flask', appPath: tmpDir, execCommand: jest.fn() });
       await strategy.preBuild(c);
-      expect(c.config.installCommand).toBe(
-        'python -m venv .venv && .venv/bin/pip install -r requirements.txt'
-      );
+      expect(c.config.installCommand).toBe(VENV_INSTALL_CMD);
     });
 
     it('prefers Pipfile (pipenv) over pyproject.toml and requirements.txt', async () => {
@@ -136,19 +151,23 @@ describe('PythonBuildStrategy', () => {
       expect(c.config.installCommand).toBe('poetry install');
     });
 
-    it('flags skipInstall when no dependency manifest is found', async () => {
+    it('creates a venv-only install command (no skipInstall) when no dependency manifest is found', async () => {
+      // A manifest-less (stdlib-only) Python app still needs `.venv/bin/python`
+      // to exist so the runner behaves uniformly across every Python app —
+      // it no longer short-circuits via skipInstall.
       const c = ctx({ appType: 'python', appPath: tmpDir });
       await strategy.preBuild(c);
-      expect(c.config.skipInstall).toBe(true);
+      expect(c.config.installCommand).toBe('python3 -m venv .venv');
+      expect(c.config.skipInstall).toBeUndefined();
     });
 
-    it('skips the install stage (null command) when no manifest exists', async () => {
-      // With no requirements.txt/Pipfile/pyproject, preBuild flags skipInstall
-      // and getInstallCommand returns null so the builder skips install rather
-      // than running pip against a requirements.txt that does not exist.
+    it('still returns a venv-creation install command (not null) when no manifest exists', async () => {
+      // Contrast with nodejs's skipInstall mechanism: an entrypoint-only
+      // Python app (no requirements.txt/Pipfile/pyproject) still gets an
+      // (empty) `.venv` created, so getInstallCommand must not return null.
       const c = ctx({ appType: 'python', appPath: tmpDir });
       await strategy.preBuild(c);
-      expect(strategy.getInstallCommand(c)).toBeNull();
+      expect(strategy.getInstallCommand(c)).toBe('python3 -m venv .venv');
     });
 
     it('does not overwrite an explicit installCommand even when a Pipfile is present', async () => {
@@ -205,6 +224,17 @@ describe('PythonBuildStrategy', () => {
     it('returns false when no entry point or manage.py is found', async () => {
       const c = ctx({ appType: 'flask', appPath: tmpDir });
       expect(await strategy.validate(c, '')).toBe(false);
+    });
+
+    it('still validates via entry-point presence when the app was built with an in-app-dir venv', async () => {
+      // validate() only inspects source-level entry points, not the install
+      // command — a created .venv alongside the entry point must not change
+      // the outcome either way.
+      const c = ctx({ appType: 'flask', appPath: tmpDir, config: { installCommand: VENV_INSTALL_CMD } });
+      expect(await strategy.validate(c, '')).toBe(false);
+      await fs.mkdir(path.join(tmpDir, '.venv'));
+      await fs.writeFile(path.join(tmpDir, 'app.py'), '# entry point');
+      expect(await strategy.validate(c, '')).toBe(true);
     });
   });
 });

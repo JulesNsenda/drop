@@ -310,21 +310,21 @@ describe('DropPlatform', () => {
         {}
       );
 
-    it('wraps a python gunicorn command in /bin/sh -c with the venv on PATH', async () => {
+    it('wraps a python gunicorn command in /bin/sh -c with the venv on PATH, execd', async () => {
       const spec = await build('pyapp', detection('flask', 'gunicorn --bind 0.0.0.0:$PORT app:app'));
       expect(spec.script).toBe('/bin/sh');
       expect(spec.interpreter).toBe('none');
       expect(spec.args).toEqual([
         '-c',
-        'export PATH="/app/.venv/bin:$PATH"; gunicorn --bind 0.0.0.0:$PORT app:app',
+        'export PATH="/app/.venv/bin:$PATH"; exec gunicorn --bind 0.0.0.0:$PORT app:app',
       ]);
     });
 
-    it('wraps a node start command in /bin/sh -c with no venv prefix', async () => {
+    it('wraps a node start command in /bin/sh -c with no venv prefix, execd', async () => {
       const spec = await build('nodeapp', detection('nodejs', 'node dist/server.js'));
       expect(spec.script).toBe('/bin/sh');
       expect(spec.interpreter).toBe('none');
-      expect(spec.args).toEqual(['-c', 'node dist/server.js']);
+      expect(spec.args).toEqual(['-c', 'exec node dist/server.js']);
     });
 
     it('spreads the injected redisEnvVars into the start spec env', async () => {
@@ -339,6 +339,71 @@ describe('DropPlatform', () => {
       );
       expect(spec.env.REDIS_URL).toBe('redis://:pw@drop-host:6380/3');
       expect(spec.env.REDIS_DB).toBe('3');
+    });
+  });
+
+  // Regression guard for the `none`/PM2 start bugs: previously this branch
+  // passed the raw, possibly multi-token startCommand straight through as a
+  // bare `script` (PM2 infers the interpreter from the file extension), with
+  // no args/interpreter — so a multi-token command (gunicorn/uvicorn
+  // invocations) was treated as a single bogus executable → ENOENT, and
+  // $PORT (only present in the child env, process-manager.ts) never expanded.
+  // These assert buildStartSpec now mirrors the docker branch's /bin/sh -c +
+  // exec shape under `none`/PM2 isolation too — while Node stays prefix-free
+  // so PM2 monitors the real node PID (metrics/restart parity, not a shell).
+  describe('buildStartSpec PM2 (isolation:none) command shaping', () => {
+    let pm2Platform: DropPlatform;
+
+    beforeEach(() => {
+      pm2Platform = createPlatform({
+        dropRoot: tempDir,
+        appsDirectory: path.join(tempDir, 'apps'),
+        logLevel: 'error',
+        caddyfilePath: path.join(tempDir, 'Caddyfile'),
+      });
+      (pm2Platform as any).config.isolation = 'none';
+    });
+
+    const detection = (type: string, startCommand: string): DetectionResult =>
+      ({
+        type,
+        framework: null,
+        confidence: 1,
+        suggestedConfig: { startCommand },
+      }) as unknown as DetectionResult;
+
+    const build = (appName: string, det: DetectionResult) =>
+      (pm2Platform as any).buildStartSpec(
+        appName,
+        path.join(tempDir, appName),
+        det,
+        4000,
+        path.join(tempDir, 'data', appName),
+        {}
+      );
+
+    it('wraps a python gunicorn command in /bin/sh -c with the real appPath venv on PATH, execd', async () => {
+      const appPath = path.join(tempDir, 'pyapp');
+      const spec = await build('pyapp', detection('flask', 'gunicorn --bind 0.0.0.0:$PORT app:app'));
+      expect(spec.script).toBe('/bin/sh');
+      expect(spec.interpreter).toBe('none');
+      expect(spec.args).toEqual([
+        '-c',
+        `export PATH="${appPath}/.venv/bin:$PATH"; exec gunicorn --bind 0.0.0.0:$PORT app:app`,
+      ]);
+      // Guards the old failure mode directly: no bare multi-token script/no args.
+      expect(spec.args![1]).toMatch(/^export PATH=".*\.venv\/bin:\$PATH"; exec /);
+      expect(spec.args![1]).toContain('$PORT');
+    });
+
+    it('wraps a node start command in /bin/sh -c with NO venv prefix, execd (PM2 PID parity)', async () => {
+      const spec = await build('nodeapp', detection('nodejs', 'node dist/server.js'));
+      expect(spec.script).toBe('/bin/sh');
+      expect(spec.interpreter).toBe('none');
+      expect(spec.args).toEqual(['-c', 'exec node dist/server.js']);
+      // Guards the Node/PM2 PID-parity constraint: no export/&& prefix at all.
+      expect(spec.args![1]).not.toMatch(/export |&&/);
+      expect(spec.args![1]).toBe('exec node dist/server.js');
     });
   });
 
@@ -506,6 +571,38 @@ describe('DropPlatform', () => {
       }
 
       expect(() => (platform as any).allocatePort()).toThrow('No available ports in configured range');
+    });
+
+    // M4 regression coverage for bug 6 (docs/plan/python-docker-runtime-fixes.md
+    // §M4) — already fixed 2026-07-07 by claiming usedPorts synchronously at
+    // allocation time (reserve-by-assignment), not at successful bind. These
+    // assert the old double-booking failure mode is now impossible.
+    it('allocates a distinct port for every app — no two apps ever double-book (bug 6)', () => {
+      const names = ['app-a', 'app-b', 'app-c', 'app-d', 'app-e'];
+      const ports = names.map((n) => (platform as any).allocatePort(n));
+
+      expect(new Set(ports).size).toBe(ports.length);
+      names.forEach((n, i) => {
+        expect((platform as any).usedPorts.get(ports[i])).toBe(n);
+      });
+    });
+
+    it("a crash-looping app's already-assigned port is never handed to a different app (bug 6)", () => {
+      // The crash-looper's port is reserved the moment allocatePort claims it
+      // — no successful bind is required. A repeatedly-restarting process
+      // never fires app:deleted, so the reservation must survive further
+      // allocations for brand-new apps.
+      const crashPort = (platform as any).allocatePort('crash-looper');
+      const otherPort = (platform as any).allocatePort('other-app');
+      expect(otherPort).not.toBe(crashPort);
+
+      // Simulate the crash-looper still churning (PM2 restart-count climbing,
+      // no app:deleted) while a THIRD, brand-new app is deployed.
+      const newPort = (platform as any).allocatePort('new-app');
+
+      expect(newPort).not.toBe(crashPort);
+      expect(newPort).not.toBe(otherPort);
+      expect((platform as any).usedPorts.get(crashPort)).toBe('crash-looper');
     });
   });
 
@@ -791,6 +888,107 @@ describe('handleAppUpdate — stopped-app guard (P0-2)', () => {
   });
 });
 
+// M2 2g: an app the detector can't classify used to be left registered at
+// `pending` forever (the autoBuild guard requires `payload.type !== 'unknown'`,
+// so it never builds and nothing else ever writes a terminal status). Assert
+// it now ends `errored` with an actionable message instead of dangling silently.
+describe('handleAppDetected — unknown type ends errored (M2 2g)', () => {
+  let platform: DropPlatform;
+  let tempDir: string;
+
+  beforeEach(async () => {
+    jest.clearAllMocks();
+    tempDir = path.join(os.tmpdir(), `drop-test-${Date.now()}`);
+    platform = createPlatform({
+      dropRoot: tempDir,
+      appsDirectory: path.join(tempDir, 'apps'),
+      logLevel: 'error',
+      autoBuild: true,
+      autoStart: true,
+      caddyfilePath: path.join(tempDir, 'Caddyfile'),
+    });
+    await platform.start();
+  });
+
+  afterEach(async () => {
+    if (platform.isActive()) {
+      await platform.stop();
+    }
+  });
+
+  it('marks an unknown-type app errored with a clear message, not left at pending', async () => {
+    const stateManager = (platform as any).stateManager;
+    // getApp's mock return value persists across tests/suites (clearAllMocks
+    // resets call history, not implementations) — reset explicitly so this
+    // test isn't hostage to another suite's leftover override.
+    stateManager.getApp.mockReturnValue(undefined);
+
+    await (platform as any).handleAppDetected({
+      name: 'mystery-app',
+      path: path.join(tempDir, 'apps', 'mystery-app'),
+      type: 'unknown',
+      timestamp: new Date(),
+    });
+
+    expect(stateManager.setAppStatus).toHaveBeenCalledWith(
+      'mystery-app',
+      'errored',
+      expect.objectContaining({ error: expect.stringContaining('Could not detect application type') })
+    );
+  });
+
+  it('does not build an unknown-type app', async () => {
+    const buildSpy = jest.spyOn(platform as any, 'handleBuildApp');
+    ((platform as any).stateManager.getApp as jest.Mock).mockReturnValue(undefined);
+
+    await (platform as any).handleAppDetected({
+      name: 'mystery-app-2',
+      path: path.join(tempDir, 'apps', 'mystery-app-2'),
+      type: 'unknown',
+      timestamp: new Date(),
+    });
+
+    expect(buildSpy).not.toHaveBeenCalled();
+  });
+
+  it('does not mark a user-stopped app errored on re-detection as unknown', async () => {
+    const stateManager = (platform as any).stateManager;
+    stateManager.getApp.mockReturnValue({ name: 'stopped-mystery-app', status: 'stopped' });
+
+    await (platform as any).handleAppDetected({
+      name: 'stopped-mystery-app',
+      path: path.join(tempDir, 'apps', 'stopped-mystery-app'),
+      type: 'unknown',
+      timestamp: new Date(),
+    });
+
+    expect(stateManager.setAppStatus).not.toHaveBeenCalled();
+  });
+
+  it('still builds a known-type app (errored branch does not shadow the normal path)', async () => {
+    const buildSpy = jest.spyOn(platform as any, 'handleBuildApp').mockResolvedValue(undefined);
+    const stateManager = (platform as any).stateManager;
+    // getApp's mock return value persists across tests (jest.clearAllMocks
+    // resets call history, not implementations) — reset explicitly rather
+    // than depend on a previous test's leftover 'stopped' override.
+    stateManager.getApp.mockReturnValue(undefined);
+
+    await (platform as any).handleAppDetected({
+      name: 'known-app',
+      path: path.join(tempDir, 'apps', 'known-app'),
+      type: 'nodejs',
+      timestamp: new Date(),
+    });
+
+    expect(buildSpy).toHaveBeenCalledWith(
+      path.join(tempDir, 'apps', 'known-app'),
+      'known-app',
+      'nodejs'
+    );
+    expect(stateManager.setAppStatus).not.toHaveBeenCalled();
+  });
+});
+
 describe('deploy strand & startup reconciler (P1-1)', () => {
   let platform: DropPlatform;
   let tempDir: string;
@@ -908,6 +1106,76 @@ describe('app type persistence after build (P1-5 / P1-6 follow-up)', () => {
     await (platform as any).handleAppUpdate('app', path.join(tempDir, 'apps', 'app'), 'edit');
 
     expect(sm.updateApp).toHaveBeenCalledWith('app', expect.objectContaining({ type: 'python' }));
+  });
+});
+
+describe('hung/failed build ends errored with the record intact (M4)', () => {
+  // Regression coverage for docs/plan/python-docker-runtime-fixes.md §M4: the
+  // builder's own build-timeout resolves with the same { success: false,
+  // errors: [...] } shape as any other build failure — already handled by
+  // handleBuildApp's else-branch (setAppStatus('errored'), never removeApp).
+  // This locks in that a hung/failed build does NOT wipe the app's state out
+  // from under it (the old "operator sees not found instead of errored" bug,
+  // which the M4 DELETE-during-build guard also targets from the API side).
+  let platform: DropPlatform;
+  let tempDir: string;
+
+  beforeEach(async () => {
+    jest.clearAllMocks();
+    tempDir = path.join(os.tmpdir(), `drop-test-${Date.now()}`);
+    platform = createPlatform({
+      dropRoot: tempDir,
+      appsDirectory: path.join(tempDir, 'apps'),
+      logLevel: 'error',
+      autoBuild: true,
+      autoStart: false,
+      caddyfilePath: path.join(tempDir, 'Caddyfile'),
+    });
+    await platform.start();
+  });
+
+  afterEach(async () => {
+    if (platform && platform.isActive()) {
+      await platform.stop();
+    }
+  });
+
+  it('a timed-out build ends the app errored, never calls removeApp, and the record stays gettable', async () => {
+    const sm = (platform as any).stateManager;
+    (platform as any).buildLogService = null; // skip build-log FS writes
+
+    // Stateful getApp/removeApp so "record intact" is a real assertion, not a
+    // static mock return value: removeApp actually clears it if called.
+    let record: { name: string; status: string } | undefined = { name: 'hungapp', status: 'building' };
+    sm.getApp.mockImplementation((n: string) => (n === 'hungapp' ? record : undefined));
+    sm.removeApp.mockImplementation(async (n: string) => {
+      if (n === 'hungapp') record = undefined;
+      return true;
+    });
+
+    jest.spyOn(platform.getDetector()!, 'detect').mockResolvedValue({
+      type: 'python',
+      framework: null,
+      suggestedConfig: {},
+    } as any);
+    // Same shape the 10-minute builder timeout produces: success: false with
+    // an error message, not a thrown exception.
+    jest.spyOn(platform.getBuilder()!, 'build').mockResolvedValue({
+      success: false,
+      errors: [{ message: 'Build timed out after 600000ms' }],
+    } as any);
+
+    await (platform as any).handleBuildApp(path.join(tempDir, 'apps', 'hungapp'), 'hungapp', 'python');
+
+    expect(sm.setAppStatus).toHaveBeenCalledWith(
+      'hungapp',
+      'errored',
+      expect.objectContaining({ error: expect.stringContaining('timed out') })
+    );
+    expect(sm.removeApp).not.toHaveBeenCalled();
+    expect(sm.getApp('hungapp')).toBeDefined();
+    // The build guard is released on failure so a later retry isn't wedged.
+    expect((platform as any).appsInProgress.has('hungapp')).toBe(false);
   });
 });
 
@@ -1888,7 +2156,12 @@ describe('drop.yaml build/start overrides', () => {
         {}
       );
 
-      expect(spec.script).toBe('dist/server.js');
+      // PM2 branch now mirrors the docker branch's /bin/sh -c + exec shape
+      // (M1b) rather than passing the (node-prefix-stripped) command as a
+      // bare script — the override still wins, just wrapped/execd.
+      expect(spec.script).toBe('/bin/sh');
+      expect(spec.interpreter).toBe('none');
+      expect(spec.args).toEqual(['-c', 'exec node dist/server.js']);
     });
 
     it('falls back to suggestedConfig.startCommand when drop.yaml has no `start:` override', async () => {
@@ -1912,7 +2185,72 @@ describe('drop.yaml build/start overrides', () => {
         {}
       );
 
-      expect(spec.script).toBe('index.js');
+      // Same PM2 /bin/sh -c + exec shape (M1b) applies to the no-override
+      // fallback path too.
+      expect(spec.script).toBe('/bin/sh');
+      expect(spec.interpreter).toBe('none');
+      expect(spec.args).toEqual(['-c', 'exec node index.js']);
+    });
+  });
+
+  // M2 2b: precedence is drop.yaml `start` (top) → Procfile `web:` → detector
+  // suggestion → default. This is the mechanism that lets App B's Flask
+  // Procfile (`python3 app.py`) win over the python detector's gunicorn
+  // default, so a missing gunicorn dependency can never be reached/break the
+  // start.
+  describe('buildStartSpec Procfile `web:` precedence', () => {
+    it('prefers a Procfile `web:` command over the detector suggestedConfig', async () => {
+      const appName = 'procfile-app';
+      const appPath = path.join(appsDir, appName);
+      await fsPromises.mkdir(appPath, { recursive: true });
+      await fsPromises.writeFile(
+        path.join(appPath, 'drop.yaml'),
+        yaml.stringify({ name: appName })
+      );
+      await fsPromises.writeFile(path.join(appPath, 'Procfile'), 'web: python3 app.py\n');
+
+      const detection = makeNodejsDetection('node index.js');
+      const dataDir = path.join(tempDir, 'data', 'appdata', appName);
+
+      const spec = await (platform as any).buildStartSpec(
+        appName,
+        appPath,
+        detection,
+        4102,
+        dataDir,
+        {}
+      );
+
+      expect(spec.script).toBe('/bin/sh');
+      expect(spec.interpreter).toBe('none');
+      expect(spec.args).toEqual(['-c', 'exec python3 app.py']);
+    });
+
+    it('still honors drop.yaml `start:` as an override over a Procfile `web:` command', async () => {
+      const appName = 'procfile-and-override-app';
+      const appPath = path.join(appsDir, appName);
+      await fsPromises.mkdir(appPath, { recursive: true });
+      await fsPromises.writeFile(
+        path.join(appPath, 'drop.yaml'),
+        yaml.stringify({ name: appName, start: 'node dist/server.js' })
+      );
+      await fsPromises.writeFile(path.join(appPath, 'Procfile'), 'web: python3 app.py\n');
+
+      const detection = makeNodejsDetection('node index.js');
+      const dataDir = path.join(tempDir, 'data', 'appdata', appName);
+
+      const spec = await (platform as any).buildStartSpec(
+        appName,
+        appPath,
+        detection,
+        4103,
+        dataDir,
+        {}
+      );
+
+      expect(spec.script).toBe('/bin/sh');
+      expect(spec.interpreter).toBe('none');
+      expect(spec.args).toEqual(['-c', 'exec node dist/server.js']);
     });
   });
 
@@ -2378,5 +2716,107 @@ describe('build-drain queue', () => {
     expect((platform as any).handleBuildApp).not.toHaveBeenCalled();
     // Entry stays queued for the next drain attempt.
     expect((platform as any).pendingBuilds.has('app1')).toBe(true);
+  });
+});
+
+// M3 3a: handleStartApp must not declare 'running' the instant runtime.start
+// resolves — it gates on awaitReadiness first. A failing gate writes 'errored'
+// (never 'running') and skips the health prober / crash-loop watch entirely;
+// a passing gate proceeds to 'running' and arms both. awaitReadiness itself is
+// unit-tested in isolation (platform.readiness.test.ts), so here it's mocked
+// directly — this test is about handleStartApp's branching on the gate's
+// result, not the gate's own logic. Constructed but never start()-ed, mirroring
+// the teardownApp/removeGroup harness above: the constructor does no I/O, so
+// runtime/detector/stateManager can be bare mocks without the full
+// module-level mock stack the rest of this file sets up for the pipeline.
+describe('handleStartApp — readiness gate (M3 3a)', () => {
+  let platform: DropPlatform;
+  let tempDir: string;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    tempDir = path.join(
+      os.tmpdir(),
+      `drop-test-readiness-gate-${Date.now()}-${Math.random().toString(36).slice(2)}`
+    );
+    platform = createPlatform({
+      dropRoot: tempDir,
+      appsDirectory: path.join(tempDir, 'apps'),
+      logLevel: 'error',
+    });
+
+    (platform as any).detector = {
+      detect: jest.fn().mockResolvedValue({
+        type: 'nodejs',
+        framework: null,
+        confidence: 1,
+        suggestedConfig: {},
+      }),
+    };
+    (platform as any).runtime = {
+      type: 'pm2',
+      start: jest.fn().mockResolvedValue({ pid: 4242 }),
+    };
+    (platform as any).stateManager = {
+      setAppStatus: jest.fn().mockResolvedValue(undefined),
+      getAllApps: jest.fn().mockReturnValue([]),
+      getApp: jest.fn().mockReturnValue(undefined),
+    };
+    // buildStartSpec's own shaping is covered by the "buildStartSpec ... command
+    // shaping" describes above; stub it here so this test is only about the
+    // gate branch, with a healthCheckPath set so a passing gate has something
+    // real to arm the prober with.
+    jest.spyOn(platform as any, 'buildStartSpec').mockResolvedValue({
+      name: 'gatedapp',
+      script: '/bin/sh',
+      args: ['-c', 'exec node index.js'],
+      cwd: path.join(tempDir, 'apps', 'gatedapp'),
+      port: 4000,
+      env: {},
+      healthCheckPath: '/health',
+    });
+  });
+
+  afterEach(async () => {
+    if (platform.isActive()) {
+      await platform.stop();
+    }
+  });
+
+  it('errors the app (not running) when the readiness gate fails, and starts neither the health prober nor the crash-loop watch', async () => {
+    const sm = (platform as any).stateManager;
+    (platform as any).awaitReadiness = jest.fn().mockResolvedValue({ ok: false, reason: 'boom' });
+    const proberSpy = jest.spyOn(platform as any, 'startHealthProber').mockImplementation(() => undefined);
+    const crashWatchSpy = jest.spyOn(platform as any, 'startCrashLoopWatch').mockImplementation(() => undefined);
+
+    await (platform as any).handleStartApp('gatedapp');
+
+    expect(sm.setAppStatus).toHaveBeenCalledWith(
+      'gatedapp',
+      'errored',
+      expect.objectContaining({ error: expect.stringContaining('boom') })
+    );
+    expect(sm.setAppStatus).not.toHaveBeenCalledWith('gatedapp', 'running', expect.anything());
+    expect(proberSpy).not.toHaveBeenCalled();
+    expect(crashWatchSpy).not.toHaveBeenCalled();
+  });
+
+  it('reaches running when the readiness gate passes, and arms the health prober + crash-loop watch', async () => {
+    const sm = (platform as any).stateManager;
+    (platform as any).awaitReadiness = jest.fn().mockResolvedValue({ ok: true });
+    const proberSpy = jest.spyOn(platform as any, 'startHealthProber').mockImplementation(() => undefined);
+    const crashWatchSpy = jest.spyOn(platform as any, 'startCrashLoopWatch').mockImplementation(() => undefined);
+
+    await (platform as any).handleStartApp('gatedapp');
+
+    expect(sm.setAppStatus).toHaveBeenCalledWith(
+      'gatedapp',
+      'running',
+      expect.objectContaining({ pid: 4242 })
+    );
+    // The prober is armed with handleStartApp's own allocated port (not
+    // buildStartSpec's mocked spec.port — that field isn't the one it reads).
+    expect(proberSpy).toHaveBeenCalledWith('gatedapp', expect.any(Number), '/health');
+    expect(crashWatchSpy).toHaveBeenCalledWith('gatedapp');
   });
 });

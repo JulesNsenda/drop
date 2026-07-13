@@ -254,7 +254,13 @@ describe('Python Build Strategy', () => {
       env: {},
     };
 
-    expect(pythonBuildStrategy.getInstallCommand(context)).toBe('pip install -r requirements.txt');
+    // Deps are installed into an in-app-dir venv (both isolation modes) so they
+    // persist to runtime like node_modules — never bare `pip`/`--user`/`-t`.
+    expect(pythonBuildStrategy.getInstallCommand(context)).toBe(
+      'python3 -m venv .venv && ' +
+        '.venv/bin/python -m pip install --upgrade pip && ' +
+        '.venv/bin/python -m pip install -r requirements.txt'
+    );
   });
 
   it('should return build command for Django', () => {

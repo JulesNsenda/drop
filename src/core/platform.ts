@@ -8,9 +8,10 @@
 import * as path from 'path';
 import * as fs from 'fs/promises';
 import * as yaml from 'yaml';
-import { EventBus, eventBus, Unsubscribe, AppDeletedPayload } from './event-bus';
+import { EventBus, eventBus, Unsubscribe, AppDeletedPayload, AppDetectedPayload } from './event-bus';
 import { WatcherService } from './watcher';
 import { DetectorService, getDetector, parseDropYaml, DetectionResult, DropYamlConfig } from './detector';
+import { getProcfileWebCommand } from './detector/procfile';
 import { BuilderService, getBuilder } from './builder';
 import { RouterService, getRouterService, resetRouterService } from './router';
 import { AppRuntime, AppProcessInfo, AppStartSpec, getAppRuntime, resetAppRuntime } from '../managers/runtime';
@@ -61,6 +62,7 @@ import {
   resetLogRetentionService,
 } from '../managers/log-retention/log-retention';
 import { hasEnoughDisk, getMinFreeDiskMb } from '../utils/disk';
+import { probePort, probeHttp } from '../utils/http-probe';
 
 export interface PlatformConfig {
   /** Root directory for DROP */
@@ -285,6 +287,15 @@ export class DropPlatform {
   private readonly CERT_CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 hours
   /** Per-app health-probe intervals (PM2 mode only; Docker uses HEALTHCHECK). */
   private readonly healthProbers: Map<string, ReturnType<typeof setInterval>> = new Map();
+  /** Per-app post-deploy crash-loop watches (both modes; keyed on restart count). */
+  private readonly crashLoopWatchers: Map<string, ReturnType<typeof setInterval>> = new Map();
+  /** Restart count (over one watch interval) at/above which a running app is flagged crash-looping. */
+  private readonly CRASHLOOP_RESTART_THRESHOLD = 3;
+  /** Startup readiness window: how long handleStartApp waits for an app to come up before erroring. */
+  private readonly readinessTimeoutMs = Math.max(
+    50,
+    Number(process.env.DROP_READINESS_TIMEOUT_MS) || 20_000
+  );
 
   constructor(config?: Partial<PlatformConfig>) {
     // Load DNS credentials from environment variables
@@ -503,9 +514,11 @@ export class DropPlatform {
       resetCaddyServer();
     }
 
-    // Stop all health probers
+    // Stop all health probers and crash-loop watches
     for (const [, timer] of this.healthProbers) clearInterval(timer);
     this.healthProbers.clear();
+    for (const [, timer] of this.crashLoopWatchers) clearInterval(timer);
+    this.crashLoopWatchers.clear();
 
     // Reset secret manager, webhook manager, git deploy service, build logs,
     // and the platform-ops seam (routes must 503 once the platform is down).
@@ -1198,53 +1211,9 @@ backup:
     // the watcher never emits watcher:change with changeType 'addDir'.
 
     // When app is detected, create config and build it
-    const detectedSub = this.eventBus.subscribe('app:detected', async (payload) => {
-      // Skip apps currently being cloned
-      if (this.gitDeployService?.isCloning(payload.name)) return;
-      // Skip apps currently being uploaded (PRD-039) — same rationale as the
-      // isCloning guard above: don't let the watcher onboard mid-upload.
-      if (this.uploadDeployService?.isUploading(payload.name)) return;
-
-      // Monorepo interception (M2): a root drop.yaml with a `services:` map
-      // describes a group container, never a single app. Materialize each
-      // declared service as its own top-level sibling app and skip the
-      // normal single-app onboarding below for the container folder itself.
-      const rootYaml = await parseDropYaml(payload.path);
-      if (rootYaml.success && rootYaml.config?.services && Object.keys(rootYaml.config.services).length > 0) {
-        this.watcher?.markAppKnown(payload.name);
-        await this.expandMonorepo(payload.path, payload.name, rootYaml.config);
-        return;
-      }
-
-      // Tell the watcher this app is known regardless of who published the
-      // detection (git deploy publishes deterministically after a clone) —
-      // otherwise the watcher's own debounced flush would emit a duplicate
-      // app:detected for the same app a few seconds later. After the
-      // isCloning guard on purpose: only mark what we actually onboard.
-      this.watcher?.markAppKnown(payload.name);
-
-      const appType = (payload.type || 'unknown') as 'nodejs' | 'python' | 'go' | 'static' | 'docker' | 'unknown';
-
-      // Create or update app config file (source of truth)
-      if (this.appConfigService) {
-        await this.appConfigService.upsertConfig(payload.name, {
-          type: appType,
-          path: payload.path,
-          hostname: `${payload.name}.localhost`,
-        });
-      }
-
-      // Register in state manager
-      if (this.stateManager) {
-        await this.stateManager.registerApp(payload.name, payload.path, appType);
-      }
-
-      // Build the app if auto-build is enabled (skip if user stopped it)
-      const currentApp = this.stateManager?.getApp(payload.name);
-      if (this.config.autoBuild && payload.type !== 'unknown' && currentApp?.status !== 'stopped') {
-        await this.handleBuildApp(payload.path, payload.name, payload.type as string);
-      }
-    });
+    const detectedSub = this.eventBus.subscribe('app:detected', (payload) =>
+      this.handleAppDetected(payload)
+    );
     this.subscriptions.push(detectedSub);
 
     // When build completes, start the app (unless it failed or was stopped).
@@ -1306,6 +1275,7 @@ backup:
       const status = (payload.changes as { status?: string })?.status;
       if (status === 'stopped' || status === 'errored') {
         this.stopHealthProber(payload.appId);
+        this.stopCrashLoopWatch(payload.appId);
       }
     });
     this.subscriptions.push(statusSub);
@@ -1809,6 +1779,73 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     }
   }
 
+  /**
+   * Handles `app:detected`: onboards a newly-seen app (or a monorepo
+   * container) — persists its config/state and kicks off the initial build.
+   * Extracted from the `setupEventHandlers` subscription (a pure move, same
+   * behavior) so it can be exercised directly in tests without racing the
+   * real fs I/O inside `parseDropYaml` through the event bus's fire-and-forget
+   * dispatch.
+   */
+  private async handleAppDetected(payload: AppDetectedPayload): Promise<void> {
+    // Skip apps currently being cloned
+    if (this.gitDeployService?.isCloning(payload.name)) return;
+    // Skip apps currently being uploaded (PRD-039) — same rationale as the
+    // isCloning guard above: don't let the watcher onboard mid-upload.
+    if (this.uploadDeployService?.isUploading(payload.name)) return;
+
+    // Monorepo interception (M2): a root drop.yaml with a `services:` map
+    // describes a group container, never a single app. Materialize each
+    // declared service as its own top-level sibling app and skip the
+    // normal single-app onboarding below for the container folder itself.
+    const rootYaml = await parseDropYaml(payload.path);
+    if (rootYaml.success && rootYaml.config?.services && Object.keys(rootYaml.config.services).length > 0) {
+      this.watcher?.markAppKnown(payload.name);
+      await this.expandMonorepo(payload.path, payload.name, rootYaml.config);
+      return;
+    }
+
+    // Tell the watcher this app is known regardless of who published the
+    // detection (git deploy publishes deterministically after a clone) —
+    // otherwise the watcher's own debounced flush would emit a duplicate
+    // app:detected for the same app a few seconds later. After the
+    // isCloning guard on purpose: only mark what we actually onboard.
+    this.watcher?.markAppKnown(payload.name);
+
+    const appType = (payload.type || 'unknown') as 'nodejs' | 'python' | 'go' | 'static' | 'docker' | 'unknown';
+
+    // Create or update app config file (source of truth)
+    if (this.appConfigService) {
+      await this.appConfigService.upsertConfig(payload.name, {
+        type: appType,
+        path: payload.path,
+        hostname: `${payload.name}.localhost`,
+      });
+    }
+
+    // Register in state manager
+    if (this.stateManager) {
+      await this.stateManager.registerApp(payload.name, payload.path, appType);
+    }
+
+    // Build the app if auto-build is enabled (skip if user stopped it)
+    const currentApp = this.stateManager?.getApp(payload.name);
+    if (this.config.autoBuild && payload.type !== 'unknown' && currentApp?.status !== 'stopped') {
+      await this.handleBuildApp(payload.path, payload.name, payload.type as string);
+    } else if (payload.type === 'unknown' && currentApp?.status !== 'stopped') {
+      // Detection couldn't resolve a type: the build guard above never fires
+      // for 'unknown', which used to leave the app registered at `pending`
+      // forever with no logs explaining why. Fail loudly instead — a later
+      // file change re-detects (handleAppUpdate only skips `stopped` apps),
+      // so adding a drop.yaml/Procfile/manifest recovers the app automatically.
+      await this.stateManager?.setAppStatus(payload.name, 'errored', {
+        error:
+          'Could not detect application type — add a drop.yaml, Procfile, or a recognized manifest ' +
+          '(requirements.txt, package.json, go.mod, Dockerfile, index.html)',
+      });
+    }
+  }
+
   private async handleBuildApp(appPath: string, appName: string, _appType: string): Promise<void> {
     if (!this.builder || !this.detector) return;
 
@@ -2090,6 +2127,26 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
 
       this.logger.appEvent('started', appName, `PID ${status.pid}, port ${port}`);
 
+      // Readiness gate: PM2/Docker report 'online' the instant a process is
+      // (re)forked, so a crash-looping app satisfies runtime.start's own
+      // wait — don't declare 'running' until the app actually proves it's up.
+      // A first-deploy failure resolves to 'errored' (never 'crash-looping'):
+      // the deploy tracker closes an episode only on running|errored, so
+      // 'errored' is what makes deploy_files report the failure honestly.
+      const readiness = await this.awaitReadiness(appName, port, spec);
+      if (!readiness.ok) {
+        this.logger.appEvent('error', appName, `readiness check failed: ${readiness.reason}`);
+        if (this.stateManager) {
+          await this.stateManager.setAppStatus(appName, 'errored', {
+            port,
+            pid: status.pid ?? undefined,
+            error: `App started but failed its readiness check: ${readiness.reason}`,
+          });
+        }
+        // The finally block releases appsInProgress; no prober/crash-watch here.
+        return;
+      }
+
       // Save port and data directory to config file (source of truth for restarts)
       if (this.appConfigService) {
         await this.appConfigService.updateConfig(appName, {
@@ -2114,6 +2171,12 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       if (spec.healthCheckPath && this.runtime?.type === 'pm2') {
         this.startHealthProber(appName, port, spec.healthCheckPath);
       }
+      // Watch for a post-deploy crash-loop (both modes) — flips a running app to
+      // 'crash-looping' when its runtime restart count climbs. Keyed on restart
+      // count, not an HTTP rule, so a healthy JSON API (4xx at `/`) is never
+      // mis-flagged. The deploy episode has already closed on 'running', so this
+      // status change does not affect deploy_files.
+      this.startCrashLoopWatch(appName);
     } catch (error) {
       this.logger.appEvent('error', appName, error instanceof Error ? error.message : 'Failed to start');
       if (this.stateManager) {
@@ -2880,6 +2943,114 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     }
   }
 
+  /**
+   * Block until a just-started app proves it's actually up, or fail. Returns
+   * `{ ok: false }` (caller writes `errored`, closing the deploy episode) when:
+   *  - the process exits or crash-loops (runtime restart count climbs) during
+   *    the startup window; or
+   *  - a web app never answers an HTTP probe within the window.
+   * A background worker that never binds its assigned port AND declares no
+   * healthCheck passes on process-liveness alone (never HTTP-gated). An HTTP
+   * probe counts as success on ANY response (4xx/5xx included) — "the app
+   * answered" means it's serving; a 404-at-`/` JSON API is healthy. Docker
+   * port-bind alone is NOT trusted (the userland proxy accepts connections
+   * before the in-container app listens), so in docker mode the HTTP probe is
+   * required; in PM2 mode a bind is sufficient (lenient for slow-booting apps).
+   * Never throws.
+   */
+  private async awaitReadiness(
+    appName: string,
+    port: number,
+    spec: AppStartSpec
+  ): Promise<{ ok: boolean; reason?: string }> {
+    if (!this.runtime) return { ok: true };
+    const windowMs = this.readinessTimeoutMs;
+    const isDocker = this.config.isolation === 'docker';
+    const healthPath = spec.healthCheckPath || '/';
+    const baselineRestarts = (await this.runtime.getStatus(appName))?.restarts ?? 0;
+    const start = Date.now();
+
+    /** Whether the process died or restarted (crash-loop) since start. */
+    const liveness = async (): Promise<{ dead: boolean; crashed: boolean }> => {
+      const info = await this.runtime?.getStatus(appName);
+      if (!info || info.status === 'stopped' || info.status === 'errored') {
+        return { dead: true, crashed: false };
+      }
+      return { dead: false, crashed: info.restarts > baselineRestarts };
+    };
+
+    // Poll: succeed as soon as an HTTP probe answers; fail as soon as the
+    // process dies or crash-loops.
+    while (Date.now() - start < windowMs) {
+      const l = await liveness();
+      if (l.dead) return { ok: false, reason: 'process exited during startup' };
+      if (l.crashed) return { ok: false, reason: 'process crash-looped during startup' };
+      if (await probePort('127.0.0.1', port, 1000)) {
+        const r = await probeHttp('127.0.0.1', port, healthPath, 3000);
+        if (r.responded) return { ok: true };
+      }
+      await new Promise((resolve) => setTimeout(resolve, Math.min(500, windowMs)));
+    }
+
+    // Window elapsed with no HTTP success — classify the (stable) process.
+    const l = await liveness();
+    if (l.dead) return { ok: false, reason: 'process exited during startup' };
+    if (l.crashed) return { ok: false, reason: 'process crash-looped during startup' };
+    const bound = await probePort('127.0.0.1', port, 1000);
+    if (!bound && !spec.healthCheckPath) return { ok: true }; // worker: no port, no health check
+    if (bound && !isDocker) return { ok: true }; // PM2: a bind proves it's listening
+    return {
+      ok: false,
+      reason: `no HTTP response on :${port} within ${Math.round(windowMs / 1000)}s`,
+    };
+  }
+
+  /**
+   * After a successful deploy, watch for the process entering a crash-loop and
+   * flip its status to 'crash-looping'. Keyed on the runtime's restart count
+   * (PM2 restart_time / Docker RestartCount), NOT an HTTP health rule, so a
+   * healthy JSON API returning 4xx at `/` is never mis-flagged. Only escalates
+   * an app that is currently 'running'. Both isolation modes.
+   */
+  private startCrashLoopWatch(appName: string): void {
+    this.stopCrashLoopWatch(appName);
+    let baseline: number | null = null;
+    const interval = setInterval(async () => {
+      try {
+        const info = await this.runtime?.getStatus(appName);
+        if (!info) return;
+        if (baseline === null) {
+          baseline = info.restarts;
+          return;
+        }
+        if (this.stateManager?.getApp(appName)?.status !== 'running') return;
+        if (info.restarts - baseline >= this.CRASHLOOP_RESTART_THRESHOLD) {
+          this.logger.appEvent(
+            'error',
+            appName,
+            `crash-looping (${info.restarts - baseline} restarts since deploy)`
+          );
+          await this.stateManager?.setAppStatus(appName, 'crash-looping', {
+            error: 'Process is restarting repeatedly',
+          });
+          baseline = info.restarts; // re-baseline so we don't re-flag every tick
+        }
+      } catch {
+        // Ignore errors in the watch itself.
+      }
+    }, 30_000);
+    interval.unref?.();
+    this.crashLoopWatchers.set(appName, interval);
+  }
+
+  private stopCrashLoopWatch(appName: string): void {
+    const t = this.crashLoopWatchers.get(appName);
+    if (t) {
+      clearInterval(t);
+      this.crashLoopWatchers.delete(appName);
+    }
+  }
+
   /** True if `p` exists on disk (best-effort; any access error → false). */
   private async pathExists(p: string): Promise<boolean> {
     try {
@@ -2920,6 +3091,13 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     const dropYamlCfg = await parseDropYaml(appPath);
     const startOverride = dropYamlCfg.success ? dropYamlCfg.config?.start : undefined;
 
+    // Procfile `web:` is the next rung down: a user-provided, language-agnostic
+    // start command (e.g. App B's Flask `python3 app.py`) that should win over
+    // the detector's guessed framework default (e.g. a gunicorn invocation
+    // against an app with no gunicorn dependency installed). Computed once so
+    // both the go and generic branches below share the same precedence.
+    const procfileWeb = await getProcfileWebCommand(appPath);
+
     if (detection.type === 'static' || detection.type === 'spa') {
       if (this.config.isolation === 'docker') {
         const outputSubdir = detection.suggestedConfig?.outputDirectory || '';
@@ -2948,7 +3126,10 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         args = [serveDir, '-s'];
       }
     } else if (detection.type === 'go') {
-      const startCommand = startOverride || detection.suggestedConfig?.startCommand || `./${appName}`;
+      // Precedence: drop.yaml `start` (explicit override) → Procfile `web:` →
+      // detector-suggested command → the built binary default.
+      const startCommand =
+        startOverride || procfileWeb || detection.suggestedConfig?.startCommand || `./${appName}`;
       if (this.config.isolation === 'docker') {
         // Docker execs the container Cmd array directly, with no shell — so a
         // multi-token command or an env ref (e.g. $PORT) must go through
@@ -2961,30 +3142,58 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         interpreter = 'none';
       }
     } else {
-      const startCommand = startOverride || detection.suggestedConfig?.startCommand || 'node index.js';
+      // Precedence: drop.yaml `start` (explicit override, DROP's own manifest,
+      // sits above everything else) → Procfile `web:` (a user-provided,
+      // language-agnostic start command) → the detector's framework-guessed
+      // command → the generic default. This is why a Flask app's Procfile
+      // `python3 app.py` wins over the python detector's gunicorn default —
+      // the gunicorn command is never reached, so a missing gunicorn
+      // dependency can't break the start.
+      const startCommand =
+        startOverride || procfileWeb || detection.suggestedConfig?.startCommand || 'node index.js';
+      // Python deps are installed into an in-app-dir virtualenv (.venv) by
+      // PythonBuildStrategy so they survive into the fresh runtime; put its
+      // bin dir first on PATH so `gunicorn`/`uvicorn`/`python` resolve to the
+      // installed packages. The venv is always written to the real (host)
+      // appPath by the build step — check for it there regardless of run
+      // mode — but embed whichever base dir the command will actually run
+      // against: the container's /app mount under docker, or appPath itself
+      // under PM2 (no remapping on the host).
+      const isPython = ['python', 'django', 'flask', 'fastapi'].includes(detection.type);
+      const venvPrefixFor = async (baseDir: string): Promise<string> =>
+        isPython && (await this.pathExists(path.join(appPath, '.venv')))
+          ? `export PATH="${baseDir}/.venv/bin:$PATH"; `
+          : '';
+
       if (this.config.isolation === 'docker') {
         // Docker execs the Cmd array directly with NO shell, so a multi-token
         // start command — the python detector's `gunicorn --bind 0.0.0.0:$PORT
         // app:app`/`uvicorn ... --port $PORT`, or `node dist/server.js` — would
         // be treated as one bogus executable name and $PORT would never expand.
-        // Run it through /bin/sh -c. Python deps are installed into an
-        // in-app-dir virtualenv (.venv) by PythonBuildStrategy so they survive
-        // into the fresh runtime container; put its bin dir first on PATH so
-        // `gunicorn`/`uvicorn`/`python` resolve to the installed packages.
-        const isPython = ['python', 'django', 'flask', 'fastapi'].includes(detection.type);
-        const venvPrefix =
-          isPython && (await this.pathExists(path.join(appPath, '.venv')))
-            ? 'export PATH="/app/.venv/bin:$PATH"; '
-            : '';
+        // Run it through /bin/sh -c. `exec` replaces the shell with the app
+        // process so the container's PID 1 is the real app (correct signal
+        // handling / metrics / crash-restart).
+        const venvPrefix = await venvPrefixFor('/app');
         script = '/bin/sh';
         interpreter = 'none';
-        args = ['-c', `${venvPrefix}${startCommand}`];
+        args = ['-c', `${venvPrefix}exec ${startCommand}`];
       } else {
-        // PM2 infers the interpreter from the script file's extension, so keep
-        // the file-only script (with any `node ` prefix stripped) it expects.
-        script = startCommand.startsWith('node ')
-          ? startCommand.substring(5)
-          : startCommand;
+        // PM2 fork mode: previously this branch passed the raw, possibly
+        // multi-token startCommand as a bare `script` (with any leading
+        // `node ` stripped) and no args/interpreter — PM2 treated it as a
+        // single executable name, so a multi-token command (gunicorn/uvicorn
+        // invocations, `python app.py --flag`) failed with ENOENT and $PORT
+        // (only present in the child env) never expanded. Mirror the docker
+        // branch's shape: run through /bin/sh -c so the command is split and
+        // $PORT expands, and `exec` so the shell is replaced by the app
+        // process — PM2 then monitors the real app's PID (correct
+        // metrics/restart/memory-cap). Node gets no venv prefix (isPython is
+        // false for it), so its command stays prefix-free:
+        // `/bin/sh -c 'exec node …'`.
+        const venvPrefix = await venvPrefixFor(appPath);
+        script = '/bin/sh';
+        interpreter = 'none';
+        args = ['-c', `${venvPrefix}exec ${startCommand}`];
       }
     }
 

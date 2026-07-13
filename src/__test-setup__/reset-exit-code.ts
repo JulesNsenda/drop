@@ -15,6 +15,13 @@
  * cares about `process.exitCode` must set (and assert) it itself — the correct
  * hygiene for a process-global.
  */
+// Shrink the startup readiness window (handleStartApp's awaitReadiness) so
+// start-flow tests — which use mocked runtimes with no real listening socket —
+// fall through to the readiness classifier in milliseconds instead of waiting
+// the 20s production default. A test that needs a specific window can still set
+// this env var before constructing its platform.
+process.env.DROP_READINESS_TIMEOUT_MS = process.env.DROP_READINESS_TIMEOUT_MS || '100';
+
 beforeEach(() => {
   process.exitCode = undefined;
 });
