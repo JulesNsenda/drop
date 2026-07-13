@@ -8,9 +8,10 @@
 import * as path from 'path';
 import * as fs from 'fs/promises';
 import * as yaml from 'yaml';
-import { EventBus, eventBus, Unsubscribe, AppDeletedPayload } from './event-bus';
+import { EventBus, eventBus, Unsubscribe, AppDeletedPayload, AppDetectedPayload } from './event-bus';
 import { WatcherService } from './watcher';
 import { DetectorService, getDetector, parseDropYaml, DetectionResult, DropYamlConfig } from './detector';
+import { getProcfileWebCommand } from './detector/procfile';
 import { BuilderService, getBuilder } from './builder';
 import { RouterService, getRouterService, resetRouterService } from './router';
 import { AppRuntime, AppProcessInfo, AppStartSpec, getAppRuntime, resetAppRuntime } from '../managers/runtime';
@@ -1198,53 +1199,9 @@ backup:
     // the watcher never emits watcher:change with changeType 'addDir'.
 
     // When app is detected, create config and build it
-    const detectedSub = this.eventBus.subscribe('app:detected', async (payload) => {
-      // Skip apps currently being cloned
-      if (this.gitDeployService?.isCloning(payload.name)) return;
-      // Skip apps currently being uploaded (PRD-039) — same rationale as the
-      // isCloning guard above: don't let the watcher onboard mid-upload.
-      if (this.uploadDeployService?.isUploading(payload.name)) return;
-
-      // Monorepo interception (M2): a root drop.yaml with a `services:` map
-      // describes a group container, never a single app. Materialize each
-      // declared service as its own top-level sibling app and skip the
-      // normal single-app onboarding below for the container folder itself.
-      const rootYaml = await parseDropYaml(payload.path);
-      if (rootYaml.success && rootYaml.config?.services && Object.keys(rootYaml.config.services).length > 0) {
-        this.watcher?.markAppKnown(payload.name);
-        await this.expandMonorepo(payload.path, payload.name, rootYaml.config);
-        return;
-      }
-
-      // Tell the watcher this app is known regardless of who published the
-      // detection (git deploy publishes deterministically after a clone) —
-      // otherwise the watcher's own debounced flush would emit a duplicate
-      // app:detected for the same app a few seconds later. After the
-      // isCloning guard on purpose: only mark what we actually onboard.
-      this.watcher?.markAppKnown(payload.name);
-
-      const appType = (payload.type || 'unknown') as 'nodejs' | 'python' | 'go' | 'static' | 'docker' | 'unknown';
-
-      // Create or update app config file (source of truth)
-      if (this.appConfigService) {
-        await this.appConfigService.upsertConfig(payload.name, {
-          type: appType,
-          path: payload.path,
-          hostname: `${payload.name}.localhost`,
-        });
-      }
-
-      // Register in state manager
-      if (this.stateManager) {
-        await this.stateManager.registerApp(payload.name, payload.path, appType);
-      }
-
-      // Build the app if auto-build is enabled (skip if user stopped it)
-      const currentApp = this.stateManager?.getApp(payload.name);
-      if (this.config.autoBuild && payload.type !== 'unknown' && currentApp?.status !== 'stopped') {
-        await this.handleBuildApp(payload.path, payload.name, payload.type as string);
-      }
-    });
+    const detectedSub = this.eventBus.subscribe('app:detected', (payload) =>
+      this.handleAppDetected(payload)
+    );
     this.subscriptions.push(detectedSub);
 
     // When build completes, start the app (unless it failed or was stopped).
@@ -1806,6 +1763,73 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           'MONOREPO'
         );
       }
+    }
+  }
+
+  /**
+   * Handles `app:detected`: onboards a newly-seen app (or a monorepo
+   * container) — persists its config/state and kicks off the initial build.
+   * Extracted from the `setupEventHandlers` subscription (a pure move, same
+   * behavior) so it can be exercised directly in tests without racing the
+   * real fs I/O inside `parseDropYaml` through the event bus's fire-and-forget
+   * dispatch.
+   */
+  private async handleAppDetected(payload: AppDetectedPayload): Promise<void> {
+    // Skip apps currently being cloned
+    if (this.gitDeployService?.isCloning(payload.name)) return;
+    // Skip apps currently being uploaded (PRD-039) — same rationale as the
+    // isCloning guard above: don't let the watcher onboard mid-upload.
+    if (this.uploadDeployService?.isUploading(payload.name)) return;
+
+    // Monorepo interception (M2): a root drop.yaml with a `services:` map
+    // describes a group container, never a single app. Materialize each
+    // declared service as its own top-level sibling app and skip the
+    // normal single-app onboarding below for the container folder itself.
+    const rootYaml = await parseDropYaml(payload.path);
+    if (rootYaml.success && rootYaml.config?.services && Object.keys(rootYaml.config.services).length > 0) {
+      this.watcher?.markAppKnown(payload.name);
+      await this.expandMonorepo(payload.path, payload.name, rootYaml.config);
+      return;
+    }
+
+    // Tell the watcher this app is known regardless of who published the
+    // detection (git deploy publishes deterministically after a clone) —
+    // otherwise the watcher's own debounced flush would emit a duplicate
+    // app:detected for the same app a few seconds later. After the
+    // isCloning guard on purpose: only mark what we actually onboard.
+    this.watcher?.markAppKnown(payload.name);
+
+    const appType = (payload.type || 'unknown') as 'nodejs' | 'python' | 'go' | 'static' | 'docker' | 'unknown';
+
+    // Create or update app config file (source of truth)
+    if (this.appConfigService) {
+      await this.appConfigService.upsertConfig(payload.name, {
+        type: appType,
+        path: payload.path,
+        hostname: `${payload.name}.localhost`,
+      });
+    }
+
+    // Register in state manager
+    if (this.stateManager) {
+      await this.stateManager.registerApp(payload.name, payload.path, appType);
+    }
+
+    // Build the app if auto-build is enabled (skip if user stopped it)
+    const currentApp = this.stateManager?.getApp(payload.name);
+    if (this.config.autoBuild && payload.type !== 'unknown' && currentApp?.status !== 'stopped') {
+      await this.handleBuildApp(payload.path, payload.name, payload.type as string);
+    } else if (payload.type === 'unknown' && currentApp?.status !== 'stopped') {
+      // Detection couldn't resolve a type: the build guard above never fires
+      // for 'unknown', which used to leave the app registered at `pending`
+      // forever with no logs explaining why. Fail loudly instead — a later
+      // file change re-detects (handleAppUpdate only skips `stopped` apps),
+      // so adding a drop.yaml/Procfile/manifest recovers the app automatically.
+      await this.stateManager?.setAppStatus(payload.name, 'errored', {
+        error:
+          'Could not detect application type — add a drop.yaml, Procfile, or a recognized manifest ' +
+          '(requirements.txt, package.json, go.mod, Dockerfile, index.html)',
+      });
     }
   }
 
@@ -2920,6 +2944,13 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     const dropYamlCfg = await parseDropYaml(appPath);
     const startOverride = dropYamlCfg.success ? dropYamlCfg.config?.start : undefined;
 
+    // Procfile `web:` is the next rung down: a user-provided, language-agnostic
+    // start command (e.g. App B's Flask `python3 app.py`) that should win over
+    // the detector's guessed framework default (e.g. a gunicorn invocation
+    // against an app with no gunicorn dependency installed). Computed once so
+    // both the go and generic branches below share the same precedence.
+    const procfileWeb = await getProcfileWebCommand(appPath);
+
     if (detection.type === 'static' || detection.type === 'spa') {
       if (this.config.isolation === 'docker') {
         const outputSubdir = detection.suggestedConfig?.outputDirectory || '';
@@ -2948,7 +2979,10 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         args = [serveDir, '-s'];
       }
     } else if (detection.type === 'go') {
-      const startCommand = startOverride || detection.suggestedConfig?.startCommand || `./${appName}`;
+      // Precedence: drop.yaml `start` (explicit override) → Procfile `web:` →
+      // detector-suggested command → the built binary default.
+      const startCommand =
+        startOverride || procfileWeb || detection.suggestedConfig?.startCommand || `./${appName}`;
       if (this.config.isolation === 'docker') {
         // Docker execs the container Cmd array directly, with no shell — so a
         // multi-token command or an env ref (e.g. $PORT) must go through
@@ -2961,7 +2995,15 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         interpreter = 'none';
       }
     } else {
-      const startCommand = startOverride || detection.suggestedConfig?.startCommand || 'node index.js';
+      // Precedence: drop.yaml `start` (explicit override, DROP's own manifest,
+      // sits above everything else) → Procfile `web:` (a user-provided,
+      // language-agnostic start command) → the detector's framework-guessed
+      // command → the generic default. This is why a Flask app's Procfile
+      // `python3 app.py` wins over the python detector's gunicorn default —
+      // the gunicorn command is never reached, so a missing gunicorn
+      // dependency can't break the start.
+      const startCommand =
+        startOverride || procfileWeb || detection.suggestedConfig?.startCommand || 'node index.js';
       // Python deps are installed into an in-app-dir virtualenv (.venv) by
       // PythonBuildStrategy so they survive into the fresh runtime; put its
       // bin dir first on PATH so `gunicorn`/`uvicorn`/`python` resolve to the

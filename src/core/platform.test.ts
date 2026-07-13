@@ -856,6 +856,107 @@ describe('handleAppUpdate — stopped-app guard (P0-2)', () => {
   });
 });
 
+// M2 2g: an app the detector can't classify used to be left registered at
+// `pending` forever (the autoBuild guard requires `payload.type !== 'unknown'`,
+// so it never builds and nothing else ever writes a terminal status). Assert
+// it now ends `errored` with an actionable message instead of dangling silently.
+describe('handleAppDetected — unknown type ends errored (M2 2g)', () => {
+  let platform: DropPlatform;
+  let tempDir: string;
+
+  beforeEach(async () => {
+    jest.clearAllMocks();
+    tempDir = path.join(os.tmpdir(), `drop-test-${Date.now()}`);
+    platform = createPlatform({
+      dropRoot: tempDir,
+      appsDirectory: path.join(tempDir, 'apps'),
+      logLevel: 'error',
+      autoBuild: true,
+      autoStart: true,
+      caddyfilePath: path.join(tempDir, 'Caddyfile'),
+    });
+    await platform.start();
+  });
+
+  afterEach(async () => {
+    if (platform.isActive()) {
+      await platform.stop();
+    }
+  });
+
+  it('marks an unknown-type app errored with a clear message, not left at pending', async () => {
+    const stateManager = (platform as any).stateManager;
+    // getApp's mock return value persists across tests/suites (clearAllMocks
+    // resets call history, not implementations) — reset explicitly so this
+    // test isn't hostage to another suite's leftover override.
+    stateManager.getApp.mockReturnValue(undefined);
+
+    await (platform as any).handleAppDetected({
+      name: 'mystery-app',
+      path: path.join(tempDir, 'apps', 'mystery-app'),
+      type: 'unknown',
+      timestamp: new Date(),
+    });
+
+    expect(stateManager.setAppStatus).toHaveBeenCalledWith(
+      'mystery-app',
+      'errored',
+      expect.objectContaining({ error: expect.stringContaining('Could not detect application type') })
+    );
+  });
+
+  it('does not build an unknown-type app', async () => {
+    const buildSpy = jest.spyOn(platform as any, 'handleBuildApp');
+    ((platform as any).stateManager.getApp as jest.Mock).mockReturnValue(undefined);
+
+    await (platform as any).handleAppDetected({
+      name: 'mystery-app-2',
+      path: path.join(tempDir, 'apps', 'mystery-app-2'),
+      type: 'unknown',
+      timestamp: new Date(),
+    });
+
+    expect(buildSpy).not.toHaveBeenCalled();
+  });
+
+  it('does not mark a user-stopped app errored on re-detection as unknown', async () => {
+    const stateManager = (platform as any).stateManager;
+    stateManager.getApp.mockReturnValue({ name: 'stopped-mystery-app', status: 'stopped' });
+
+    await (platform as any).handleAppDetected({
+      name: 'stopped-mystery-app',
+      path: path.join(tempDir, 'apps', 'stopped-mystery-app'),
+      type: 'unknown',
+      timestamp: new Date(),
+    });
+
+    expect(stateManager.setAppStatus).not.toHaveBeenCalled();
+  });
+
+  it('still builds a known-type app (errored branch does not shadow the normal path)', async () => {
+    const buildSpy = jest.spyOn(platform as any, 'handleBuildApp').mockResolvedValue(undefined);
+    const stateManager = (platform as any).stateManager;
+    // getApp's mock return value persists across tests (jest.clearAllMocks
+    // resets call history, not implementations) — reset explicitly rather
+    // than depend on a previous test's leftover 'stopped' override.
+    stateManager.getApp.mockReturnValue(undefined);
+
+    await (platform as any).handleAppDetected({
+      name: 'known-app',
+      path: path.join(tempDir, 'apps', 'known-app'),
+      type: 'nodejs',
+      timestamp: new Date(),
+    });
+
+    expect(buildSpy).toHaveBeenCalledWith(
+      path.join(tempDir, 'apps', 'known-app'),
+      'known-app',
+      'nodejs'
+    );
+    expect(stateManager.setAppStatus).not.toHaveBeenCalled();
+  });
+});
+
 describe('deploy strand & startup reconciler (P1-1)', () => {
   let platform: DropPlatform;
   let tempDir: string;
@@ -1987,6 +2088,67 @@ describe('drop.yaml build/start overrides', () => {
       expect(spec.script).toBe('/bin/sh');
       expect(spec.interpreter).toBe('none');
       expect(spec.args).toEqual(['-c', 'exec node index.js']);
+    });
+  });
+
+  // M2 2b: precedence is drop.yaml `start` (top) → Procfile `web:` → detector
+  // suggestion → default. This is the mechanism that lets App B's Flask
+  // Procfile (`python3 app.py`) win over the python detector's gunicorn
+  // default, so a missing gunicorn dependency can never be reached/break the
+  // start.
+  describe('buildStartSpec Procfile `web:` precedence', () => {
+    it('prefers a Procfile `web:` command over the detector suggestedConfig', async () => {
+      const appName = 'procfile-app';
+      const appPath = path.join(appsDir, appName);
+      await fsPromises.mkdir(appPath, { recursive: true });
+      await fsPromises.writeFile(
+        path.join(appPath, 'drop.yaml'),
+        yaml.stringify({ name: appName })
+      );
+      await fsPromises.writeFile(path.join(appPath, 'Procfile'), 'web: python3 app.py\n');
+
+      const detection = makeNodejsDetection('node index.js');
+      const dataDir = path.join(tempDir, 'data', 'appdata', appName);
+
+      const spec = await (platform as any).buildStartSpec(
+        appName,
+        appPath,
+        detection,
+        4102,
+        dataDir,
+        {}
+      );
+
+      expect(spec.script).toBe('/bin/sh');
+      expect(spec.interpreter).toBe('none');
+      expect(spec.args).toEqual(['-c', 'exec python3 app.py']);
+    });
+
+    it('still honors drop.yaml `start:` as an override over a Procfile `web:` command', async () => {
+      const appName = 'procfile-and-override-app';
+      const appPath = path.join(appsDir, appName);
+      await fsPromises.mkdir(appPath, { recursive: true });
+      await fsPromises.writeFile(
+        path.join(appPath, 'drop.yaml'),
+        yaml.stringify({ name: appName, start: 'node dist/server.js' })
+      );
+      await fsPromises.writeFile(path.join(appPath, 'Procfile'), 'web: python3 app.py\n');
+
+      const detection = makeNodejsDetection('node index.js');
+      const dataDir = path.join(tempDir, 'data', 'appdata', appName);
+
+      const spec = await (platform as any).buildStartSpec(
+        appName,
+        appPath,
+        detection,
+        4103,
+        dataDir,
+        {}
+      );
+
+      expect(spec.script).toBe('/bin/sh');
+      expect(spec.interpreter).toBe('none');
+      expect(spec.args).toEqual(['-c', 'exec node dist/server.js']);
     });
   });
 
