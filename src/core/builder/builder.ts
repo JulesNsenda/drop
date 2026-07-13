@@ -387,11 +387,18 @@ export class BuilderService {
 
     this.emitLog(context.appName, 'install', 'info', `Running: ${installCommand}`, context);
 
+    // Builds need the dev toolchain (tsc/vite/webpack are devDependencies). NODE_ENV=production
+    // (forced by executeEnvironment for the compile, and/or set via the app's drop.yaml env) makes npm
+    // omit devDependencies, so the build step can't find its compiler. Force dev deps in for INSTALL
+    // only; the build/compile stage keeps context.env (NODE_ENV=production) so output stays a production
+    // bundle. sanitizeBuildEnv (base.ts) preserves npm_config_*; npm>=7 include=dev overrides the omit.
+    const installEnv = { ...context.env, npm_config_include: 'dev' };
+
     const exec = context.execCommand ?? executeCommand;
     const result = await exec(
       installCommand,
       context.appPath,
-      context.env,
+      installEnv,
       signal,
       (data, type) => {
         this.emitLog(context.appName, 'install', type === 'stderr' ? 'warn' : 'info', data, context);
