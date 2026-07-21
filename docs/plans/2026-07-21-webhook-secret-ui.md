@@ -101,7 +101,7 @@ env-configured operator opts in knowingly. Fail-closed 503 when neither is set �
   admin-only and DeployPage isn't).
 
 ### M4 — Docs
-- [ ] `docs/GIT-REDEPLOY-AND-CUSTOM-DOMAINS.md:26–48` — dashboard flow becomes the primary
+- [x] `docs/GIT-REDEPLOY-AND-CUSTOM-DOMAINS.md:26–48` — dashboard flow becomes the primary
   instruction; env var documented as fallback with stored-over-env precedence.
 
 ## Risks & open questions
