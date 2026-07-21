@@ -407,6 +407,79 @@ describe('BuilderService install stage — dev dependencies', () => {
   });
 });
 
+describe('BuilderService install stage — postInstall hook', () => {
+  // 'rust' has no built-in strategy (see the devdeps test above): the custom
+  // strategy is the only match, keeping the real nodejs preBuild out of play.
+  const makeStrategy = (postInstall: jest.Mock, installCommand: string | null = 'npm install') =>
+    ({
+      name: 'test-postinstall',
+      supportedTypes: ['rust'],
+      canBuild: () => true,
+      getInstallCommand: () => installCommand,
+      getBuildCommand: () => null,
+      getOutputDirectory: () => null,
+      postInstall,
+    }) as BuildStrategy;
+
+  const makeContext = (execCommand: ExecCommandFn): BuildContext => ({
+    appName: 'postinstall-test',
+    appPath: '/test',
+    appType: 'rust',
+    framework: null,
+    config: {},
+    env: {},
+    execCommand,
+  });
+
+  it('calls postInstall after a successful install', async () => {
+    const service = new BuilderService();
+    const postInstall = jest.fn().mockResolvedValue(undefined);
+    service.registerStrategy(makeStrategy(postInstall));
+
+    const exec: ExecCommandFn = async () => ({ exitCode: 0, stdout: '', stderr: '', duration: 0 });
+    const result = await service.build(makeContext(exec));
+
+    expect(result.success).toBe(true);
+    expect(postInstall).toHaveBeenCalledTimes(1);
+  });
+
+  it('does NOT call postInstall when the install fails — the skip marker must not outlive a failed install', async () => {
+    const service = new BuilderService();
+    const postInstall = jest.fn().mockResolvedValue(undefined);
+    service.registerStrategy(makeStrategy(postInstall));
+
+    const exec: ExecCommandFn = async () => ({ exitCode: 1, stdout: '', stderr: 'boom', duration: 0 });
+    const result = await service.build(makeContext(exec));
+
+    expect(result.success).toBe(false);
+    expect(postInstall).not.toHaveBeenCalled();
+  });
+
+  it('a throwing postInstall does not fail the build — the marker is best-effort', async () => {
+    const service = new BuilderService();
+    const postInstall = jest.fn().mockRejectedValue(new Error('marker write blew up'));
+    service.registerStrategy(makeStrategy(postInstall));
+
+    const exec: ExecCommandFn = async () => ({ exitCode: 0, stdout: '', stderr: '', duration: 0 });
+    const result = await service.build(makeContext(exec));
+
+    expect(result.success).toBe(true);
+    expect(postInstall).toHaveBeenCalledTimes(1);
+  });
+
+  it('does NOT call postInstall when the install stage is skipped', async () => {
+    const service = new BuilderService();
+    const postInstall = jest.fn().mockResolvedValue(undefined);
+    service.registerStrategy(makeStrategy(postInstall, null));
+
+    const exec: ExecCommandFn = async () => ({ exitCode: 0, stdout: '', stderr: '', duration: 0 });
+    const result = await service.build(makeContext(exec));
+
+    expect(result.success).toBe(true);
+    expect(postInstall).not.toHaveBeenCalled();
+  });
+});
+
 describe('executeCommand', () => {
   let tempDir: string;
 
