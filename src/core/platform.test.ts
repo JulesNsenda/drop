@@ -2631,6 +2631,57 @@ describe('handleAppUpdate — monorepo container guard (Bug 2 fix)', () => {
       'MONOREPO'
     );
   });
+
+  // Regression guard for the expansion/DELETE race: the container name must
+  // sit in appsInProgress for the whole expansion (the DELETE route's 409
+  // in-progress guard keys off it — a teardown must not interleave with the
+  // fs.rm/fs.cp of child folders), and must be released even on failure.
+  it('holds the container in appsInProgress during re-expansion and releases it after', async () => {
+    const appName = 'ezsign';
+    const appPath = path.join(appsDir, appName);
+    await writeContainerYaml(appPath);
+
+    let inProgressDuringExpand: boolean | undefined;
+    jest.spyOn(platform as any, 'expandMonorepo').mockImplementation(async () => {
+      inProgressDuringExpand = (platform as any).appsInProgress.has(appName);
+    });
+    jest.spyOn((platform as any).logger, 'info').mockImplementation(() => undefined);
+
+    await (platform as any).handleAppUpdate(appName, appPath, 'redeploy', true);
+
+    expect(inProgressDuringExpand).toBe(true);
+    expect((platform as any).appsInProgress.has(appName)).toBe(false);
+  });
+
+  it('releases the in-progress guard even when re-expansion throws', async () => {
+    const appName = 'ezsign';
+    const appPath = path.join(appsDir, appName);
+    await writeContainerYaml(appPath);
+
+    jest.spyOn(platform as any, 'expandMonorepo').mockRejectedValue(new Error('expand boom'));
+    jest.spyOn((platform as any).logger, 'info').mockImplementation(() => undefined);
+
+    await expect(
+      (platform as any).handleAppUpdate(appName, appPath, 'redeploy', true)
+    ).rejects.toThrow('expand boom');
+    expect((platform as any).appsInProgress.has(appName)).toBe(false);
+  });
+
+  it('holds the container in appsInProgress during the app:detected interception too', async () => {
+    const appName = 'ezsign';
+    const appPath = path.join(appsDir, appName);
+    await writeContainerYaml(appPath);
+
+    let inProgressDuringExpand: boolean | undefined;
+    jest.spyOn(platform as any, 'expandMonorepo').mockImplementation(async () => {
+      inProgressDuringExpand = (platform as any).appsInProgress.has(appName);
+    });
+
+    await (platform as any).handleAppDetected({ name: appName, path: appPath });
+
+    expect(inProgressDuringExpand).toBe(true);
+    expect((platform as any).appsInProgress.has(appName)).toBe(false);
+  });
 });
 
 describe('teardownApp / removeGroup (M4: group lifecycle)', () => {
