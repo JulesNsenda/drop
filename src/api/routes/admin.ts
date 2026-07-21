@@ -5,6 +5,7 @@
  */
 
 import { Hono } from 'hono';
+import * as crypto from 'crypto';
 import { success, error, ErrorCodes } from '../types';
 import { getActivityLog } from '../../managers/activity';
 import { suspendUser, updateUser, listUsers, AuthContext } from '../middleware/auth';
@@ -30,6 +31,34 @@ function buildSettingsPayload(): { publicUrl: string | null; source: SettingsSou
     storedPublicUrl,
   };
 }
+
+interface GithubWebhookPayload {
+  configured: boolean;
+  source: SettingsSource;
+  payloadUrl: string | null;
+}
+
+/**
+ * Status block for the GitHub webhook HMAC secret (stored value wins over
+ * DROP_GITHUB_WEBHOOK_SECRET — see src/api/routes/git-deploy.ts). Used by
+ * GET /admin/settings and by the generate/PUT responses below; never
+ * includes the secret value itself.
+ */
+function buildGithubWebhookPayload(): GithubWebhookPayload {
+  const stored = getSettingsManager().getGithubWebhookSecret();
+  const source: SettingsSource = stored ? 'stored' : process.env.DROP_GITHUB_WEBHOOK_SECRET ? 'env' : 'unset';
+  const publicUrl = getPublicUrl();
+  return {
+    configured: source !== 'unset',
+    source,
+    payloadUrl: publicUrl ? `${publicUrl}/api/v1/git/webhook` : null,
+  };
+}
+
+const GITHUB_WEBHOOK_SECRET_MIN_LENGTH = 8;
+const GITHUB_WEBHOOK_SECRET_MAX_LENGTH = 256;
+// eslint-disable-next-line no-control-regex -- deliberately matching ASCII control chars (incl. DEL) to reject them.
+const CONTROL_CHAR_PATTERN = /[\x00-\x1f\x7f]/;
 
 // GET /admin/activity - Activity log (paginated)
 admin.get('/activity', async (c) => {
@@ -175,10 +204,10 @@ admin.post('/apps/:name/suspend', async (c) => {
   return c.json(success({ appName, suspended: true }));
 });
 
-// GET /admin/settings - Platform settings (currently: the public base
-// URL / OAuth issuer override — PRD-041).
+// GET /admin/settings - Platform settings: the public base URL / OAuth
+// issuer override (PRD-041) plus the GitHub webhook secret status.
 admin.get('/settings', async (c) => {
-  return c.json(success(buildSettingsPayload()));
+  return c.json(success({ ...buildSettingsPayload(), githubWebhook: buildGithubWebhookPayload() }));
 });
 
 // PUT /admin/settings/public-url - Set or clear the admin override for
@@ -210,6 +239,77 @@ admin.put('/settings/public-url', async (c) => {
   setPublicUrl(result.value);
 
   return c.json(success({ publicUrl: result.value, source: 'stored' as const, storedPublicUrl: result.value }));
+});
+
+// POST /admin/settings/github-webhook-secret/generate - Generate a new random
+// GitHub webhook HMAC secret, store it, and reveal it exactly once in this
+// response (it never appears in any other response, including GET /settings).
+admin.post('/settings/github-webhook-secret/generate', async (c) => {
+  const authCtx = (c.get as Function)('auth') as AuthContext | undefined;
+
+  const secret = crypto.randomBytes(32).toString('hex');
+  await getSettingsManager().setGithubWebhookSecret(secret);
+
+  await tryLogActivity({
+    action: 'github-webhook-secret-generate',
+    userId: authCtx?.userId,
+    username: authCtx?.username,
+  });
+
+  return c.json(success({ secret, ...buildGithubWebhookPayload() }));
+});
+
+// PUT /admin/settings/github-webhook-secret - Set or clear the stored GitHub
+// webhook HMAC secret. `null`/empty/whitespace-only clears it (mirrors
+// PUT /settings/public-url — no separate DELETE). The secret value is never
+// echoed back, in either the success or the validation-error response.
+admin.put('/settings/github-webhook-secret', async (c) => {
+  const authCtx = (c.get as Function)('auth') as AuthContext | undefined;
+  const body = (await c.req.json()) as { secret?: unknown };
+  const input = body.secret;
+
+  if (input === null || input === undefined || (typeof input === 'string' && input.trim() === '')) {
+    await getSettingsManager().setGithubWebhookSecret(undefined);
+    await tryLogActivity({
+      action: 'github-webhook-secret-clear',
+      userId: authCtx?.userId,
+      username: authCtx?.username,
+    });
+    return c.json(success(buildGithubWebhookPayload()));
+  }
+
+  if (typeof input !== 'string') {
+    return c.json(error(ErrorCodes.VALIDATION_ERROR, 'secret must be a string or null'), 400);
+  }
+
+  const trimmed = input.trim();
+  if (trimmed.length < GITHUB_WEBHOOK_SECRET_MIN_LENGTH) {
+    return c.json(
+      error(
+        ErrorCodes.VALIDATION_ERROR,
+        `Secret must be at least ${GITHUB_WEBHOOK_SECRET_MIN_LENGTH} characters — generate one instead`
+      ),
+      400
+    );
+  }
+  if (trimmed.length > GITHUB_WEBHOOK_SECRET_MAX_LENGTH) {
+    return c.json(
+      error(ErrorCodes.VALIDATION_ERROR, `Secret must be at most ${GITHUB_WEBHOOK_SECRET_MAX_LENGTH} characters`),
+      400
+    );
+  }
+  if (CONTROL_CHAR_PATTERN.test(trimmed)) {
+    return c.json(error(ErrorCodes.VALIDATION_ERROR, 'Secret must contain only printable characters'), 400);
+  }
+
+  await getSettingsManager().setGithubWebhookSecret(trimmed);
+  await tryLogActivity({
+    action: 'github-webhook-secret-set',
+    userId: authCtx?.userId,
+    username: authCtx?.username,
+  });
+
+  return c.json(success(buildGithubWebhookPayload()));
 });
 
 export default admin;
