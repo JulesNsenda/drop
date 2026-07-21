@@ -161,6 +161,7 @@ export class BuilderService {
         buildId,
         durationMs: Date.now() - startedAt.getTime(),
         success,
+        outputPath: outputPath ?? undefined,
       });
       if (!success) {
         eventBus.publish('build:failed', {

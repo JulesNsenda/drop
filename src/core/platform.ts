@@ -1244,7 +1244,10 @@ backup:
       const shouldStart = this.config.autoStart && app?.status !== 'stopped';
 
       if (shouldStart) {
-        await this.handleStartApp(payload.appId); // owns appsInProgress cleanup
+        // owns appsInProgress cleanup. outputPath rides the payload because
+        // this dispatch happens synchronously inside build() — before
+        // handleBuildApp can persist it to the app config.
+        await this.handleStartApp(payload.appId, payload.outputPath);
       } else {
         if (app?.status === 'stopped') {
           this.logger.info(`Skipping auto-start for ${payload.appId} - app was stopped by user`, 'APP');
@@ -1960,9 +1963,16 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       if (result.success) {
         this.appBuildDurations.set(appName, result.duration);
         this.logger.appEvent('built', appName, `completed in ${result.duration}ms`);
-        // Update config and state with build duration
+        // Update config and state with build duration. Also persist where the
+        // build's output landed: the start handler for THIS deploy already got
+        // it via the build:completed payload (dispatched synchronously inside
+        // build(), before this line runs) — this write is for later plain
+        // restarts, which have no build to ask.
         if (this.appConfigService) {
-          await this.appConfigService.updateConfig(appName, { buildDuration: result.duration });
+          await this.appConfigService.updateConfig(appName, {
+            buildDuration: result.duration,
+            ...(result.outputPath ? { outputDirectory: result.outputPath } : {}),
+          });
         }
         if (this.stateManager) {
           await this.stateManager.updateApp(appName, { buildDuration: result.duration });
@@ -2032,7 +2042,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     if (this.pendingBuilds.size > 0) this.scheduleBuildDrain();
   }
 
-  private async handleStartApp(appName: string): Promise<void> {
+  private async handleStartApp(appName: string, buildOutputDir?: string): Promise<void> {
     if (!this.runtime || !this.detector) {
       // Only reachable during teardown; release the guard so a queued deploy
       // isn't left wedged in appsInProgress forever.
@@ -2121,7 +2131,8 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         port,
         dataDir,
         dbEnvVars,
-        redisEnvVars
+        redisEnvVars,
+        buildOutputDir
       );
       const status = await this.runtime.start(spec);
 
@@ -2560,9 +2571,22 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       this.appBuildDurations.set(appName, buildResult.duration);
       this.logger.appEvent('built', appName, `rebuilt in ${buildResult.duration}ms`);
 
+      // Persist the rebuild's output dir for later plain restarts (mirrors
+      // handleBuildApp); the start below gets the fresh value directly.
+      if (this.appConfigService && buildResult.outputPath) {
+        await this.appConfigService.updateConfig(appName, {
+          outputDirectory: buildResult.outputPath,
+        });
+      }
+
       await this.stateManager.setAppStatus(appName, 'starting');
 
-      const { spec, port } = await this.buildFreshStartSpec(appName, appPath, detection);
+      const { spec, port } = await this.buildFreshStartSpec(
+        appName,
+        appPath,
+        detection,
+        buildResult.outputPath ?? undefined
+      );
       const status = await this.runtime.start(spec);
 
       this.logger.appEvent('started', appName, `PID ${status.pid}, port ${port} (hot-reloaded)`);
@@ -2610,7 +2634,8 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
   private async buildFreshStartSpec(
     appName: string,
     appPath: string,
-    detection: DetectionResult
+    detection: DetectionResult,
+    buildOutputDir?: string
   ): Promise<{ spec: AppStartSpec; port: number }> {
     const port = this.allocatePort(appName);
 
@@ -2641,7 +2666,8 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       port,
       dataDir,
       dbEnvVars,
-      redisEnvVars
+      redisEnvVars,
+      buildOutputDir
     );
     return { spec, port };
   }
@@ -3062,6 +3088,22 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
   }
 
   /**
+   * Constrain a static app's build-output subdir to a safe relative path.
+   * The value is interpolated into nginx.conf (`root /app/<subdir>`) and can
+   * originate from a user-supplied drop.yaml `build.output`, so absolute
+   * paths, traversal, and anything that could smuggle nginx directives
+   * (whitespace, `;`, `{`) must not pass. Invalid or root-ish values
+   * collapse to '' — serve the app root, the pre-existing default.
+   */
+  private sanitizeOutputSubdir(subdir: string): string {
+    const trimmed = subdir.replace(/^\.\/+/, '').replace(/\/+$/, '');
+    if (!trimmed || trimmed === '.') return '';
+    if (!/^[A-Za-z0-9._-]+(\/[A-Za-z0-9._-]+)*$/.test(trimmed)) return '';
+    if (trimmed.split('/').some((seg) => seg === '..')) return '';
+    return trimmed;
+  }
+
+  /**
    * Build the runtime-agnostic start specification for an app.  Called by both
    * handleStartApp (on first deploy) and handleUpdateApp (on hot-reload) so the
    * two paths can't drift apart.
@@ -3077,7 +3119,8 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     port: number,
     dataDir: string,
     dbEnvVars: Record<string, string>,
-    redisEnvVars: Record<string, string> = {}
+    redisEnvVars: Record<string, string> = {},
+    buildOutputDir?: string
   ): Promise<AppStartSpec> {
     let script: string;
     let interpreter: string | undefined;
@@ -3099,8 +3142,20 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     const procfileWeb = await getProcfileWebCommand(appPath);
 
     if (detection.type === 'static' || detection.type === 'spa') {
+      // Detection alone can't always name the build output dir: the manifest
+      // detector wins detection for any app carrying a drop.yaml (confidence
+      // 1.0) but only knows an explicit `build.output` — for a Vite/CRA app
+      // typed `static` without one, serving the app root delivers the SOURCE
+      // index.html (→ /src/main.tsx → octet-stream). Fall back to the dir the
+      // build strategy reported: fresh from this build's payload, else the
+      // value persisted after the last successful build (plain restarts).
+      const outputSubdir = this.sanitizeOutputSubdir(
+        detection.suggestedConfig?.outputDirectory ||
+          buildOutputDir ||
+          this.appConfigService?.getConfig(appName)?.outputDirectory ||
+          ''
+      );
       if (this.config.isolation === 'docker') {
-        const outputSubdir = detection.suggestedConfig?.outputDirectory || '';
         const nginxConf = buildNginxConf(port, outputSubdir);
         const nginxConfPath = path.join(dataDir, 'nginx.conf');
         await fs.writeFile(nginxConfPath, nginxConf, 'utf-8');
@@ -3113,7 +3168,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         interpreter = 'none';
         args = ['-c', `nginx -c ${nginxConfPath} -g 'daemon off;'`];
       } else {
-        const serveDir = path.join(appPath, detection.suggestedConfig?.outputDirectory || '.');
+        const serveDir = path.join(appPath, outputSubdir || '.');
         // eslint-disable-next-line @typescript-eslint/no-require-imports
         const fsSync = require('fs');
         const distPath = path.join(__dirname, '..', '..', 'dist', 'core', 'static-server.js');
