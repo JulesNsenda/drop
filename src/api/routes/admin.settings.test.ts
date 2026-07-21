@@ -20,11 +20,19 @@ import { getStateManager, resetStateManager } from '../../managers/app/state-man
 import { getSettingsManager, resetSettingsManager } from '../../managers/settings/settings-manager';
 import { resetPlatformOps } from '../platform-ops';
 import { getPublicUrl, setPublicUrl } from '../runtime-config';
+import * as activityModule from '../../managers/activity';
+
+interface GithubWebhookPayload {
+  configured: boolean;
+  source: 'stored' | 'env' | 'unset';
+  payloadUrl: string | null;
+}
 
 interface SettingsPayload {
   publicUrl: string | null;
   source: 'stored' | 'env' | 'unset';
   storedPublicUrl: string | null;
+  githubWebhook: GithubWebhookPayload;
 }
 
 interface ApiEnvelope<T> {
@@ -53,13 +61,28 @@ describe('admin settings routes (PRD-041)', () => {
       body: JSON.stringify({ publicUrl }),
     });
 
+  const generateGithubWebhookSecret = (token?: string) =>
+    hono.request('/api/v1/admin/settings/github-webhook-secret/generate', {
+      method: 'POST',
+      headers: authHeader(token ?? adminToken),
+    });
+
+  const putGithubWebhookSecret = (secret: unknown, token?: string) =>
+    hono.request('/api/v1/admin/settings/github-webhook-secret', {
+      method: 'PUT',
+      headers: authHeader(token ?? adminToken),
+      body: JSON.stringify({ secret }),
+    });
+
   beforeEach(async () => {
     tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'drop-admin-settings-test-'));
     jest.spyOn(console, 'log').mockImplementation();
     jest.spyOn(console, 'warn').mockImplementation();
     jest.spyOn(console, 'error').mockImplementation();
+    jest.spyOn(console, 'debug').mockImplementation();
 
     delete process.env.DROP_PUBLIC_URL;
+    delete process.env.DROP_GITHUB_WEBHOOK_SECRET;
     resetStateManager();
     resetAuth();
     resetPlatformOps();
@@ -90,6 +113,7 @@ describe('admin settings routes (PRD-041)', () => {
     resetPlatformOps();
     setPublicUrl(undefined);
     delete process.env.DROP_PUBLIC_URL;
+    delete process.env.DROP_GITHUB_WEBHOOK_SECRET;
     jest.restoreAllMocks();
     await fs.rm(tempDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   });
@@ -99,7 +123,12 @@ describe('admin settings routes (PRD-041)', () => {
       const res = await getSettings();
       expect(res.status).toBe(200);
       const body = (await res.json()) as ApiEnvelope<SettingsPayload>;
-      expect(body.data).toEqual({ publicUrl: null, source: 'unset', storedPublicUrl: null });
+      expect(body.data).toEqual({
+        publicUrl: null,
+        source: 'unset',
+        storedPublicUrl: null,
+        githubWebhook: { configured: false, source: 'unset', payloadUrl: null },
+      });
     });
 
     it('reports source "env" when only DROP_PUBLIC_URL is set', async () => {
@@ -110,6 +139,11 @@ describe('admin settings routes (PRD-041)', () => {
         publicUrl: 'https://env.example.com',
         source: 'env',
         storedPublicUrl: null,
+        githubWebhook: {
+          configured: false,
+          source: 'unset',
+          payloadUrl: 'https://env.example.com/api/v1/git/webhook',
+        },
       });
     });
 
@@ -124,6 +158,11 @@ describe('admin settings routes (PRD-041)', () => {
         publicUrl: 'https://stored.example.com',
         source: 'stored',
         storedPublicUrl: 'https://stored.example.com',
+        githubWebhook: {
+          configured: false,
+          source: 'unset',
+          payloadUrl: 'https://stored.example.com/api/v1/git/webhook',
+        },
       });
     });
   });
@@ -194,6 +233,192 @@ describe('admin settings routes (PRD-041)', () => {
 
       expect(getPublicUrl()).toBe('https://env.example.com');
       expect(getSettingsManager().getStoredPublicUrl()).toBeUndefined();
+    });
+  });
+
+  describe('GET /admin/settings — githubWebhook block', () => {
+    it('reports source "env" and configured:true when only DROP_GITHUB_WEBHOOK_SECRET is set', async () => {
+      process.env.DROP_GITHUB_WEBHOOK_SECRET = 'env-secret-value';
+      const res = await getSettings();
+      const body = (await res.json()) as ApiEnvelope<SettingsPayload>;
+      expect(body.data?.githubWebhook).toEqual({ configured: true, source: 'env', payloadUrl: null });
+    });
+
+    it('reports source "stored" (winning over env) once a secret has been persisted, and never leaks the value', async () => {
+      process.env.DROP_GITHUB_WEBHOOK_SECRET = 'env-secret-value';
+      await getSettingsManager().setGithubWebhookSecret('stored-secret-value');
+
+      const res = await getSettings();
+      const body = (await res.json()) as ApiEnvelope<SettingsPayload>;
+      expect(body.data?.githubWebhook).toEqual({ configured: true, source: 'stored', payloadUrl: null });
+
+      const raw = JSON.stringify(body);
+      expect(raw).not.toContain('stored-secret-value');
+      expect(raw).not.toContain('env-secret-value');
+    });
+
+    it('reports payloadUrl null when the public URL is unset, and the derived webhook URL once it is set', async () => {
+      let res = await getSettings();
+      let body = (await res.json()) as ApiEnvelope<SettingsPayload>;
+      expect(body.data?.githubWebhook.payloadUrl).toBeNull();
+
+      await putPublicUrl('https://drop.example.com');
+
+      res = await getSettings();
+      body = (await res.json()) as ApiEnvelope<SettingsPayload>;
+      expect(body.data?.githubWebhook.payloadUrl).toBe('https://drop.example.com/api/v1/git/webhook');
+    });
+  });
+
+  describe('POST /admin/settings/github-webhook-secret/generate', () => {
+    it('generates a 64-char hex secret, persists it, reveals it once, and round-trips into source "stored"', async () => {
+      const res = await generateGithubWebhookSecret();
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as ApiEnvelope<{ secret: string } & GithubWebhookPayload>;
+      expect(body.data?.secret).toMatch(/^[0-9a-f]{64}$/);
+      expect(body.data?.configured).toBe(true);
+      expect(body.data?.source).toBe('stored');
+      const secret = body.data!.secret;
+
+      // A fresh GET reports it configured (stored) — the value never reappears.
+      const getRes = await getSettings();
+      const getBody = (await getRes.json()) as ApiEnvelope<SettingsPayload>;
+      expect(getBody.data?.githubWebhook).toEqual({ configured: true, source: 'stored', payloadUrl: null });
+      expect(JSON.stringify(getBody)).not.toContain(secret);
+
+      // Persisted to disk — a fresh manager instance reading the same file sees it.
+      resetSettingsManager();
+      getSettingsManager({ settingsFilePath: path.join(tempDir, 'settings.json') });
+      await getSettingsManager().load();
+      expect(getSettingsManager().getGithubWebhookSecret()).toBe(secret);
+    });
+
+    it('records an audit entry with no secret value', async () => {
+      const logSpy = jest.spyOn(activityModule, 'tryLogActivity').mockResolvedValue();
+
+      const res = await generateGithubWebhookSecret();
+      const body = (await res.json()) as ApiEnvelope<{ secret: string }>;
+
+      expect(logSpy).toHaveBeenCalledTimes(1);
+      const entry = logSpy.mock.calls[0][0];
+      expect(entry).toMatchObject({ action: 'github-webhook-secret-generate' });
+      expect(JSON.stringify(entry)).not.toContain(body.data!.secret);
+    });
+
+    it('rejects a non-admin request with 403', async () => {
+      await createUser('regular', 'password123', 'user');
+      const userToken = await getTestToken('regular', 'password123');
+      const res = await generateGithubWebhookSecret(userToken);
+      expect(res.status).toBe(403);
+    });
+
+    it('rejects an unauthenticated request with 401', async () => {
+      const res = await hono.request('/api/v1/admin/settings/github-webhook-secret/generate', { method: 'POST' });
+      expect(res.status).toBe(401);
+    });
+  });
+
+  describe('PUT /admin/settings/github-webhook-secret', () => {
+    it('rejects a secret shorter than 8 characters, suggesting generate instead', async () => {
+      const res = await putGithubWebhookSecret('short');
+      expect(res.status).toBe(400);
+      const body = (await res.json()) as ApiEnvelope<never>;
+      expect(body.error?.code).toBe('VALIDATION_ERROR');
+      expect(body.error?.message.toLowerCase()).toContain('generate');
+      expect(body.error?.message).not.toContain('short');
+    });
+
+    it('rejects a secret longer than 256 characters', async () => {
+      const res = await putGithubWebhookSecret('a'.repeat(257));
+      expect(res.status).toBe(400);
+    });
+
+    it('accepts a secret exactly at the 256-character boundary', async () => {
+      const secret = 'a'.repeat(256);
+      const res = await putGithubWebhookSecret(secret);
+      expect(res.status).toBe(200);
+      expect(getSettingsManager().getGithubWebhookSecret()).toBe(secret);
+    });
+
+    it('rejects a secret containing an ASCII control character', async () => {
+      const res = await putGithubWebhookSecret('valid-but-has-a-\x01-control-char');
+      expect(res.status).toBe(400);
+      const body = (await res.json()) as ApiEnvelope<never>;
+      expect(body.error?.code).toBe('VALIDATION_ERROR');
+      expect(body.error?.message).not.toContain('\x01');
+    });
+
+    it('accepts a secret with interior spaces (GitHub permits them)', async () => {
+      const res = await putGithubWebhookSecret('my github secret value');
+      expect(res.status).toBe(200);
+      expect(getSettingsManager().getGithubWebhookSecret()).toBe('my github secret value');
+    });
+
+    it('trims surrounding whitespace before persisting', async () => {
+      const res = await putGithubWebhookSecret('  padded-secret-value  ');
+      expect(res.status).toBe(200);
+      expect(getSettingsManager().getGithubWebhookSecret()).toBe('padded-secret-value');
+    });
+
+    it('never echoes the submitted value back on success', async () => {
+      const res = await putGithubWebhookSecret('my-plaintext-secret-value');
+      const body = (await res.json()) as ApiEnvelope<GithubWebhookPayload>;
+      expect(JSON.stringify(body)).not.toContain('my-plaintext-secret-value');
+      expect(body.data).toEqual({ configured: true, source: 'stored', payloadUrl: null });
+    });
+
+    it('rejects a non-string, non-null secret with 400', async () => {
+      const res = await putGithubWebhookSecret(12345);
+      expect(res.status).toBe(400);
+    });
+
+    it('clears the stored secret on null, falling back to env', async () => {
+      process.env.DROP_GITHUB_WEBHOOK_SECRET = 'env-fallback-value';
+      await putGithubWebhookSecret('to-be-cleared-value');
+      expect(getSettingsManager().getGithubWebhookSecret()).toBe('to-be-cleared-value');
+
+      const res = await putGithubWebhookSecret(null);
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as ApiEnvelope<GithubWebhookPayload>;
+      expect(body.data).toEqual({ configured: true, source: 'env', payloadUrl: null });
+      expect(getSettingsManager().getGithubWebhookSecret()).toBeUndefined();
+    });
+
+    it('clears the stored secret on an empty string', async () => {
+      await putGithubWebhookSecret('to-be-cleared-value');
+      const res = await putGithubWebhookSecret('');
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as ApiEnvelope<GithubWebhookPayload>;
+      expect(body.data).toEqual({ configured: false, source: 'unset', payloadUrl: null });
+      expect(getSettingsManager().getGithubWebhookSecret()).toBeUndefined();
+    });
+
+    it('records "set" and "clear" audit entries with no secret value', async () => {
+      const logSpy = jest.spyOn(activityModule, 'tryLogActivity').mockResolvedValue();
+
+      await putGithubWebhookSecret('my-secret-value-for-audit');
+      await putGithubWebhookSecret(null);
+
+      expect(logSpy).toHaveBeenCalledTimes(2);
+      expect(logSpy.mock.calls[0][0]).toMatchObject({ action: 'github-webhook-secret-set' });
+      expect(logSpy.mock.calls[1][0]).toMatchObject({ action: 'github-webhook-secret-clear' });
+      expect(JSON.stringify(logSpy.mock.calls)).not.toContain('my-secret-value-for-audit');
+    });
+
+    it('rejects a non-admin request with 403', async () => {
+      await createUser('regular2', 'password123', 'user');
+      const userToken = await getTestToken('regular2', 'password123');
+      const res = await putGithubWebhookSecret('some-valid-secret-value', userToken);
+      expect(res.status).toBe(403);
+    });
+
+    it('rejects an unauthenticated request with 401', async () => {
+      const res = await hono.request('/api/v1/admin/settings/github-webhook-secret', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ secret: 'some-valid-secret-value' }),
+      });
+      expect(res.status).toBe(401);
     });
   });
 });

@@ -51,13 +51,13 @@ env-configured operator opts in knowingly. Fail-closed 503 when neither is set �
   `parseSettings` bug); empty-string normalization; 0600 mode asserted (skip on win32).
 
 ### M2 — Receiver resolution + admin API
-- [ ] `src/api/routes/git-deploy.ts`
+- [x] `src/api/routes/git-deploy.ts`
   - Line 139: effective secret =
     `getSettingsManager().getGithubWebhookSecret() ?? process.env.DROP_GITHUB_WEBHOOK_SECRET`.
     (Fail-closed branch is lines 152–166; HMAC verification unchanged.)
   - Update the one-time-warning + 503 message texts (lines 33, 162) to mention the
     dashboard path (Settings → Git webhooks) alongside the env var.
-- [ ] `src/api/routes/admin.ts`
+- [x] `src/api/routes/admin.ts`
   - New `buildGithubWebhookPayload()` →
     `{ configured: boolean, source: 'stored'|'env'|'unset', payloadUrl: string | null }`;
     `payloadUrl` = `<getPublicUrl()>/api/v1/git/webhook` or `null` when public URL unset
@@ -74,11 +74,11 @@ env-configured operator opts in knowingly. Fail-closed 503 when neither is set �
     GitHub permits them). Error messages state the rule, never echo the value; the
     too-short message suggests "generate one instead". Audit set/cleared.
   - Both already admin-only via `authMiddleware('admin')` on `/admin/*` (`server.ts:284`).
-- [ ] `src/api/routes/admin.settings.test.ts` — **update the five full-payload `toEqual`
+- [x] `src/api/routes/admin.settings.test.ts` — **update the five full-payload `toEqual`
   assertions** (lines ~102–193) for the new `githubWebhook` block; new tests: generate
   returns 64-hex; secret absent from the full `GET /admin/settings` payload; PUT
   validation + clear; non-admin 401/403; audit entries contain no secret value.
-- [ ] `src/api/routes/git-deploy.webhook.test.ts` — new cases: signature verifies against a
+- [x] `src/api/routes/git-deploy.webhook.test.ts` — new cases: signature verifies against a
   stored secret; stored overrides env; env fallback when nothing stored; neither → 503.
   Setup **must** pass `getSettingsManager({ settingsFilePath: <tempdir> })` (the default
   path writes to the real `C:\drop`/`/var/drop`) + `resetSettingsManager()` hygiene.
