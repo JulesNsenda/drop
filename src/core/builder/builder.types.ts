@@ -188,6 +188,15 @@ export interface BuildStrategy {
   preBuild?(context: BuildContext): Promise<void>;
 
   /**
+   * Runs only after a successful (non-skipped) install stage — the place to
+   * persist install-skip markers such as the lockfile hash. Never called for
+   * failed installs, so a marker can't outlive the install it describes.
+   * Best-effort: the builder logs and swallows a throw from this hook — it
+   * must not be able to fail a build whose install already succeeded.
+   */
+  postInstall?(context: BuildContext): Promise<void>;
+
+  /**
    * Execute post-build tasks (e.g., optimization)
    */
   postBuild?(context: BuildContext, outputPath: string): Promise<void>;
