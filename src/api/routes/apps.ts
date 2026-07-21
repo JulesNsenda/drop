@@ -184,8 +184,10 @@ apps.get('/', async c => {
   const stateManager = getStateManager();
   const allApps = stateManager.getAllApps();
 
-  // Filter by ownership
-  let filtered = allApps.filter(app => canAccess(auth, app));
+  // Filter by ownership. Monorepo container entries are internal bookkeeping
+  // (they carry the repo's gitSource for webhook matching, never run anything)
+  // — hide them; the group is represented by its child apps' `group` tag.
+  let filtered = allApps.filter(app => !app.isGroupContainer && canAccess(auth, app));
 
   // Apply query param filters
   const status = c.req.query('status');
@@ -506,13 +508,27 @@ apps.delete('/:name', async c => {
   const stateManager = getStateManager();
   const app = stateManager.getApp(name);
 
-  // No app named `:name` — it may instead be a monorepo GROUP name (the
-  // shared `group` tag several apps carry, not itself a registered app).
+  // Group teardown routes here two ways: `:name` is a monorepo GROUP name
+  // (the shared `group` tag several apps carry, not itself a registered app),
+  // or `:name` is the CONTAINER entry the deploy-from-git path registered —
+  // deleting a container as if it were a single app would rm the cloned repo
+  // folder and orphan the children, so it always means "delete the group".
   // Require every child accessible (not just one) before tearing down the
   // whole group — same IDOR posture as the single-app canAccess check below.
-  if (!app) {
-    const groupChildren = stateManager.getAllApps().filter(a => a.group === name);
-    if (groupChildren.length === 0 || !groupChildren.every(a => canAccess(auth, a))) {
+  if (!app || app.isGroupContainer) {
+    if (app?.isGroupContainer && !canAccess(auth, app)) {
+      throw new NotFoundError(`Application '${name}' not found`);
+    }
+    const groupName = app?.isGroupContainer ? (app.group ?? name) : name;
+    const groupChildren = stateManager
+      .getAllApps()
+      .filter(a => a.group === groupName && !a.isGroupContainer);
+    // A container with zero children (failed expansion) is still deletable —
+    // removeGroup tears the container entry + folder down via its group tag.
+    if (!app && groupChildren.length === 0) {
+      throw new NotFoundError(`Application '${name}' not found`);
+    }
+    if (!groupChildren.every(a => canAccess(auth, a))) {
       throw new NotFoundError(`Application '${name}' not found`);
     }
 
@@ -521,26 +537,26 @@ apps.delete('/:name', async c => {
       return c.json(error(ErrorCodes.SERVICE_UNAVAILABLE, 'Platform operations unavailable'), 503);
     }
 
-    // Group-aware extension of the same guard: `name` here is the group tag,
-    // not an individual app name, so the top-of-handler check above can't see
-    // a child mid-build. Block the whole-group teardown if any child is busy.
+    // Group-aware extension of the same guard: the target is the group, not
+    // an individual app name, so the top-of-handler check above can't see a
+    // child mid-build. Block the whole-group teardown if any child is busy.
     if (groupChildren.some(child => ops.isAppInProgress(child.name))) {
       return c.json(
-        error(ErrorCodes.CONFLICT, `Group '${name}' has an app building or deploying — retry once it settles`),
+        error(ErrorCodes.CONFLICT, `Group '${groupName}' has an app building or deploying — retry once it settles`),
         409
       );
     }
 
-    const { removed } = await ops.removeGroup(name);
+    const { removed } = await ops.removeGroup(groupName);
 
     await tryLogActivity({
       action: 'delete',
       userId: auth?.userId,
       username: auth?.username,
-      appName: name,
+      appName: groupName,
     });
 
-    return c.json(success({ message: `Group '${name}' removed`, removed }));
+    return c.json(success({ message: `Group '${groupName}' removed`, removed }));
   }
 
   if (!canAccess(auth, app)) {
@@ -650,10 +666,23 @@ apps.delete('/:name', async c => {
   // child of its group, also remove the group's CONTAINER folder
   // (webapps/<group>/, holding the root drop.yaml with `services:`) — left
   // behind, it would regenerate the just-deleted child on the watcher's next
-  // scan.
+  // scan. The container's own state entry carries the group tag too and must
+  // not count as a sibling; with no real children left it goes as well, or it
+  // would linger as an invisible orphan.
   if (app.group) {
-    const remainingSiblings = stateManager.getAllApps().filter(a => a.group === app.group);
+    const groupApps = stateManager.getAllApps().filter(a => a.group === app.group);
+    const remainingSiblings = groupApps.filter(a => !a.isGroupContainer);
     if (remainingSiblings.length === 0) {
+      for (const container of groupApps.filter(a => a.isGroupContainer)) {
+        try {
+          await stateManager.removeApp(container.name);
+          if (container.path) {
+            await fs.rm(container.path, { recursive: true, force: true });
+          }
+        } catch {
+          // Container entry/folder may already be gone
+        }
+      }
       try {
         await fs.rm(path.join(getAppsDirectory(), app.group), { recursive: true, force: true });
       } catch {

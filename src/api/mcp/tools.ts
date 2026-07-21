@@ -342,9 +342,11 @@ export async function handleDeployFromGit(
 // ============ list_apps / app_status / app_logs / restart_app ============
 
 export function handleListApps(auth: AuthContext | undefined): CallToolResult {
+  // Monorepo container entries are internal bookkeeping (webhook matching),
+  // never runnable apps — hidden here like in GET /apps.
   const apps = getStateManager()
     .getAllApps()
-    .filter(a => canAccess(auth, a));
+    .filter(a => !a.isGroupContainer && canAccess(auth, a));
 
   if (apps.length === 0) {
     return toolText('No apps found.');

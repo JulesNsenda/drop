@@ -290,6 +290,81 @@ describe('DELETE /api/v1/apps/:name — group-aware (M4)', () => {
     expect(res.status).toBe(200);
     await expect(fs.access(containerDir)).resolves.toBeUndefined();
   });
+
+  // Regression guards for the phantom-container bug: the deploy-from-git path
+  // registers the cloned repo itself as a state entry (tagged isGroupContainer
+  // by expandMonorepo). Deleting it as a single app would rm the cloned repo
+  // folder and orphan the children — DELETE on it must mean "delete the group".
+  describe('container entries', () => {
+    beforeEach(async () => {
+      const sm = getStateManager();
+      // Container entry named differently from the group on purpose — proves
+      // the route resolves the group via the entry's tag, not its name.
+      await sm.registerApp('grp-repo', path.join(tempDir, 'webapps', 'grp-repo'));
+      await sm.updateApp('grp-repo', { userId: ownerId, group: 'grp', isGroupContainer: true });
+    });
+
+    it('DELETE on a container entry tears down the whole group via its group tag', async () => {
+      setPlatformOps(makeOps({ removeGroup }));
+
+      const res = await hono.request('/api/v1/apps/grp-repo', {
+        method: 'DELETE',
+        headers: authHeader(ownerToken),
+      });
+
+      expect(res.status).toBe(200);
+      expect(removeGroup).toHaveBeenCalledWith('grp');
+      const body = (await res.json()) as { data: { message: string } };
+      expect(body.data.message).toContain("Group 'grp' removed");
+    });
+
+    it("404s a container DELETE when the requester can't access the container", async () => {
+      setPlatformOps(makeOps({ removeGroup }));
+      const stranger = await createUser('stranger', 'password123', 'user');
+      void stranger;
+      const strangerToken = await getTestToken('stranger', 'password123');
+
+      const res = await hono.request('/api/v1/apps/grp-repo', {
+        method: 'DELETE',
+        headers: authHeader(strangerToken),
+      });
+
+      expect(res.status).toBe(404);
+      expect(removeGroup).not.toHaveBeenCalled();
+    });
+
+    it('GET /apps hides container entries but lists the real children', async () => {
+      setPlatformOps(makeOps({ removeGroup }));
+
+      const res = await hono.request('/api/v1/apps', {
+        headers: authHeader(ownerToken),
+      });
+
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as { data: Array<{ name: string }> };
+      const names = body.data.map(a => a.name).sort();
+      expect(names).toEqual(['grp-backend', 'grp-frontend']);
+    });
+
+    it('deleting the LAST real child also removes the container state entry', async () => {
+      setPlatformOps(makeOps({ removeGroup }));
+
+      await hono.request('/api/v1/apps/grp-backend', {
+        method: 'DELETE',
+        headers: authHeader(ownerToken),
+      });
+      // Container survives while a sibling remains.
+      expect(getStateManager().getApp('grp-repo')).toBeDefined();
+
+      const res = await hono.request('/api/v1/apps/grp-frontend', {
+        method: 'DELETE',
+        headers: authHeader(ownerToken),
+      });
+
+      expect(res.status).toBe(200);
+      expect(getStateManager().getApp('grp-repo')).toBeUndefined();
+    });
+  });
 });
 
 describe('DELETE /api/v1/apps/:name — in-progress guard (M4)', () => {

@@ -1636,6 +1636,18 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     const services = config.services ?? {};
     const serviceNames = new Set(Object.keys(services));
 
+    // The deploy-from-git path registers the cloned repo itself as an app
+    // before detection can know it's a container. That entry must survive —
+    // its gitSource is what webhook auto-redeploys match on — but it is not
+    // a runnable app: tag it so listings hide it and group teardown finds it
+    // (the group can differ from the entry's own name via drop.yaml
+    // name:/group:). Runs on every expansion, so a phantom left by an older
+    // platform heals on the next redeploy. Folder-dropped containers were
+    // never registered and no entry is created for them here.
+    if (this.stateManager?.hasApp(repoName)) {
+      await this.stateManager.updateApp(repoName, { group, isGroupContainer: true });
+    }
+
     if (serviceNames.size > this.config.maxConcurrentBuilds) {
       this.logger.warn(
         `Monorepo group '${group}' declares ${serviceNames.size} services, which exceeds ` +
@@ -2859,7 +2871,10 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
    * platform-ops seam (`removeGroup`).
    */
   async removeGroup(groupName: string): Promise<{ removed: string[] }> {
-    const children = this.stateManager?.getAllApps().filter((a) => a.group === groupName) ?? [];
+    // The container's own state entry carries the group tag too (expandMonorepo
+    // marks it) — it is torn down separately below, not as a child.
+    const groupApps = this.stateManager?.getAllApps().filter((a) => a.group === groupName) ?? [];
+    const children = groupApps.filter((a) => !a.isGroupContainer);
     const removed: string[] = [];
 
     for (const child of children) {
@@ -2875,12 +2890,31 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       }
     }
 
+    // Tear down the container's own state entry (registered by the
+    // deploy-from-git path, tagged by expandMonorepo). teardownApp also
+    // removes the cloned repo folder via the entry's real path — which covers
+    // the case where the folder name (repo name) differs from the group name
+    // and the name-derived rm below would miss it.
+    for (const container of groupApps.filter((a) => a.isGroupContainer)) {
+      try {
+        await this.teardownApp(container.name);
+      } catch (err) {
+        this.logger.error(
+          `Failed to tear down container '${container.name}' of group '${groupName}'`,
+          'MONOREPO',
+          err
+        );
+      }
+    }
+
     // Defense-in-depth before a recursive fs.rm: the container path is derived
     // from a `group` tag. That tag is already transitively constrained to
     // [A-Za-z0-9_-] (expandMonorepo only creates children whose `<group>-<svc>`
     // name passes that regex), but re-assert it here so this destructive delete
     // can never escape the webapps directory even if a group value is ever set
-    // by a future/other code path.
+    // by a future/other code path. Kept even with the entry-driven teardown
+    // above: it also covers unmarked phantoms from older platform versions
+    // (where the folder name equals the group name).
     if (/^[a-zA-Z0-9_-]+$/.test(groupName)) {
       try {
         await fs.rm(path.join(this.config.appsDirectory, groupName), { recursive: true, force: true });
