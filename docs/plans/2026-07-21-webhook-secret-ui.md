@@ -84,7 +84,7 @@ env-configured operator opts in knowingly. Fail-closed 503 when neither is set �
   path writes to the real `C:\drop`/`/var/drop`) + `resetSettingsManager()` hygiene.
 
 ### M3 — Dashboard
-- [ ] New admin-gated **"Git webhooks" tab** on SettingsPage (own tab like API Keys — the
+- [x] New admin-gated **"Git webhooks" tab** on SettingsPage (own tab like API Keys — the
   reveal-once flow and payload URL don't fit the read-only System cards; placement keeps
   the publicUrl dependency visible via an inline hint linking to where Public URL is set
   when `payloadUrl` is `null`).
@@ -96,7 +96,7 @@ env-configured operator opts in knowingly. Fail-closed 503 when neither is set �
     `navigator.clipboard.writeText` + toast, "you won't see this again"); confirm dialog
     when a secret already exists ("existing GitHub webhooks fail until updated") or when
     current source is `env` (posture warning). "Use my own secret" input (PUT) + Clear.
-- [ ] `src/dashboard/src/pages/DeployPage.tsx:461` — static hint by the auto-redeploy
+- [x] `src/dashboard/src/pages/DeployPage.tsx:461` — static hint by the auto-redeploy
   checkbox linking to Settings → Git webhooks (no status fetch — the endpoint is
   admin-only and DeployPage isn't).
 
