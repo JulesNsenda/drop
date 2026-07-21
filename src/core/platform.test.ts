@@ -1938,6 +1938,7 @@ describe('expandMonorepo (M2: monorepo -> per-service app expansion)', () => {
     (platform as any).stateManager = {
       registerApp: jest.fn().mockResolvedValue(undefined),
       updateApp: jest.fn().mockResolvedValue(undefined),
+      hasApp: jest.fn().mockReturnValue(false),
     };
     const buildSpy = jest.fn().mockResolvedValue(undefined);
     (platform as any).handleBuildApp = buildSpy;
@@ -2028,6 +2029,7 @@ describe('expandMonorepo (M2: monorepo -> per-service app expansion)', () => {
     (platform as any).stateManager = {
       registerApp: jest.fn().mockResolvedValue(undefined),
       updateApp: jest.fn().mockResolvedValue(undefined),
+      hasApp: jest.fn().mockReturnValue(false),
     };
     (platform as any).handleBuildApp = jest.fn().mockResolvedValue(undefined);
     const warnSpy = jest.spyOn((platform as any).logger, 'warn').mockImplementation(() => undefined);
@@ -2069,6 +2071,7 @@ describe('expandMonorepo (M2: monorepo -> per-service app expansion)', () => {
     (platform as any).stateManager = {
       registerApp: jest.fn().mockResolvedValue(undefined),
       updateApp: jest.fn().mockResolvedValue(undefined),
+      hasApp: jest.fn().mockReturnValue(false),
     };
     (platform as any).handleBuildApp = jest.fn().mockResolvedValue(undefined);
 
@@ -2094,6 +2097,83 @@ describe('expandMonorepo (M2: monorepo -> per-service app expansion)', () => {
     expect(backendResult.config?.route).toEqual({ path: '/api' });
     expect(frontendResult.success).toBe(true);
     expect(frontendResult.config?.route).toEqual({ path: '/' });
+  });
+
+  // Regression guard for the phantom-container bug: deploy-from-git registers
+  // the cloned repo in state before detection can know it's a container. The
+  // entry must be TAGGED (listings hide it, removeGroup finds it) — not
+  // removed, since its gitSource is what webhook auto-redeploys match on.
+  it('tags a pre-registered container state entry with group + isGroupContainer', async () => {
+    const repoName = 'ezsign';
+    const repoPath = path.join(appsDir, repoName);
+    await writeFixtureRepo(repoPath);
+
+    const configStore = new Map<string, any>();
+    (platform as any).appConfigService = {
+      getConfig: jest.fn((name: string) => configStore.get(name)),
+      upsertConfig: jest.fn(async (name: string, updates: any) => {
+        const merged = { ...(configStore.get(name) || {}), ...updates, name };
+        configStore.set(name, merged);
+        return merged;
+      }),
+    };
+    const updateApp = jest.fn().mockResolvedValue(undefined);
+    (platform as any).stateManager = {
+      registerApp: jest.fn().mockResolvedValue(undefined),
+      updateApp,
+      // The deploy-from-git path registered the repo just before expansion.
+      hasApp: jest.fn((name: string) => name === repoName),
+    };
+    (platform as any).handleBuildApp = jest.fn().mockResolvedValue(undefined);
+
+    const dropConfig = {
+      group: 'ezsign-group',
+      services: {
+        backend: { path: 'backend' },
+        frontend: { path: 'frontend', type: 'static' },
+      },
+    };
+
+    await (platform as any).expandMonorepo(repoPath, repoName, dropConfig);
+
+    // Tagged with the DERIVED group name (drop.yaml group:), which here
+    // deliberately differs from the repo's own folder/entry name.
+    expect(updateApp).toHaveBeenCalledWith(repoName, {
+      group: 'ezsign-group',
+      isGroupContainer: true,
+    });
+  });
+
+  it('does not create a container state entry for a folder-dropped monorepo (no pre-registration)', async () => {
+    const repoName = 'dropped-repo';
+    const repoPath = path.join(appsDir, repoName);
+    await writeFixtureRepo(repoPath);
+
+    const configStore = new Map<string, any>();
+    (platform as any).appConfigService = {
+      getConfig: jest.fn((name: string) => configStore.get(name)),
+      upsertConfig: jest.fn(async (name: string, updates: any) => {
+        const merged = { ...(configStore.get(name) || {}), ...updates, name };
+        configStore.set(name, merged);
+        return merged;
+      }),
+    };
+    const updateApp = jest.fn().mockResolvedValue(undefined);
+    const registerApp = jest.fn().mockResolvedValue(undefined);
+    (platform as any).stateManager = {
+      registerApp,
+      updateApp,
+      hasApp: jest.fn().mockReturnValue(false),
+    };
+    (platform as any).handleBuildApp = jest.fn().mockResolvedValue(undefined);
+
+    await (platform as any).expandMonorepo(repoPath, repoName, {
+      services: { backend: { path: 'backend' } },
+    });
+
+    // Children are registered; the container itself is neither registered nor tagged.
+    expect(registerApp).not.toHaveBeenCalledWith(repoName, expect.anything(), expect.anything());
+    expect(updateApp).not.toHaveBeenCalledWith(repoName, expect.anything());
   });
 
   describe('handleConfigureRoute (M3: same-origin routing)', () => {
@@ -2764,6 +2844,60 @@ describe('teardownApp / removeGroup (M4: group lifecycle)', () => {
       expect(result.removed).toEqual([]);
       expect(fsPromises.rm).toHaveBeenCalledWith(
         path.join(appsDir, 'ghost-group'),
+        { recursive: true, force: true }
+      );
+    });
+
+    // Regression guard for the phantom-container bug: the deploy-from-git path
+    // registers the cloned repo itself in state (expandMonorepo tags it
+    // isGroupContainer). removeGroup must tear that entry down too — but never
+    // count it as a child in `removed`.
+    it('tears down the group-container state entry without counting it as a child', async () => {
+      const entries = [
+        makeAppState('ezsign-backend', 'ezsign'),
+        makeAppState('ezsign-frontend', 'ezsign'),
+        { ...makeAppState('ezsign', 'ezsign'), isGroupContainer: true },
+      ];
+      wireMocks({
+        stateManager: {
+          getAllApps: jest.fn().mockReturnValue(entries),
+          removeApp: jest.fn().mockResolvedValue(true),
+          getApp: jest.fn().mockReturnValue(undefined),
+        },
+      });
+
+      const result = await platform.removeGroup('ezsign');
+
+      expect(result.removed.slice().sort()).toEqual(['ezsign-backend', 'ezsign-frontend']);
+      expect((platform as any).stateManager.removeApp).toHaveBeenCalledWith('ezsign');
+    });
+
+    it('removes the container entry and ITS folder when the repo name differs from the group name', async () => {
+      const entries = [
+        makeAppState('ezsign-backend', 'ezsign'),
+        { ...makeAppState('my-repo', 'ezsign'), isGroupContainer: true },
+      ];
+      wireMocks({
+        stateManager: {
+          getAllApps: jest.fn().mockReturnValue(entries),
+          removeApp: jest.fn().mockResolvedValue(true),
+          getApp: jest.fn().mockReturnValue(undefined),
+        },
+      });
+
+      const result = await platform.removeGroup('ezsign');
+
+      expect(result.removed).toEqual(['ezsign-backend']);
+      expect((platform as any).stateManager.removeApp).toHaveBeenCalledWith('my-repo');
+      // teardownApp removes the container's REAL folder (webapps/my-repo/) via
+      // the entry's path — the name-derived rm below can't reach it.
+      expect(fsPromises.rm).toHaveBeenCalledWith(
+        path.join(appsDir, 'my-repo'),
+        { recursive: true, force: true }
+      );
+      // The legacy name-derived cleanup still runs as well.
+      expect(fsPromises.rm).toHaveBeenCalledWith(
+        path.join(appsDir, 'ezsign'),
         { recursive: true, force: true }
       );
     });
