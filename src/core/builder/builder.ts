@@ -415,6 +415,24 @@ export class BuilderService {
       };
     }
 
+    // Only a successful install may persist install-skip markers (lockfile
+    // hash). Persisting earlier lets a failed install mark its lockfile as
+    // "installed", and every later build then skips install into a missing or
+    // broken node_modules. The marker is a pure perf optimization, so a
+    // failure here must never fail the (already successful) install — worst
+    // case the next build re-installs.
+    try {
+      await strategy.postInstall?.(context);
+    } catch (err) {
+      this.emitLog(
+        context.appName,
+        'install',
+        'warn',
+        `postInstall skipped: ${err instanceof Error ? err.message : String(err)}`,
+        context
+      );
+    }
+
     return {
       stage: 'install',
       status: 'success',
