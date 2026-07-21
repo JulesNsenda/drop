@@ -342,6 +342,128 @@ describe('DropPlatform', () => {
     });
   });
 
+  // Regression guard for the static-docroot bug (DROP-059): the manifest
+  // detector wins detection for any app carrying a drop.yaml (confidence 1.0)
+  // but only knows an explicit `build.output` — so a Vite/CRA app typed
+  // `static` in its manifest got nginx `root /app` and served its SOURCE
+  // index.html (browser then loads /src/main.tsx as octet-stream). The fix
+  // falls back to the build strategy's reported output dir: fresh from the
+  // build:completed payload on deploy, or the persisted app config on plain
+  // restarts. Values are sanitized before interpolation into nginx.conf.
+  describe('buildStartSpec static docroot fallback', () => {
+    let dockerPlatform: DropPlatform;
+
+    beforeEach(() => {
+      dockerPlatform = createPlatform({
+        dropRoot: tempDir,
+        appsDirectory: path.join(tempDir, 'apps'),
+        logLevel: 'error',
+        caddyfilePath: path.join(tempDir, 'Caddyfile'),
+      });
+      (dockerPlatform as any).config.isolation = 'docker';
+    });
+
+    const staticDetection = (outputDirectory?: string): DetectionResult =>
+      ({
+        type: 'static',
+        framework: 'spa',
+        confidence: 1,
+        suggestedConfig: outputDirectory ? { outputDirectory } : {},
+      }) as unknown as DetectionResult;
+
+    const stubConfig = (config?: Record<string, unknown>) => {
+      (dockerPlatform as any).appConfigService = {
+        getConfig: jest.fn().mockReturnValue(config),
+      };
+    };
+
+    const build = (appName: string, det: DetectionResult, buildOutputDir?: string) =>
+      (dockerPlatform as any).buildStartSpec(
+        appName,
+        path.join(tempDir, appName),
+        det,
+        4000,
+        path.join(tempDir, 'data', appName),
+        {},
+        {},
+        buildOutputDir
+      );
+
+    const writtenNginxConf = (appName: string): string => {
+      const confPath = path.join(tempDir, 'data', appName, 'nginx.conf');
+      const calls = (fsPromises.writeFile as unknown as jest.Mock).mock.calls.filter(
+        (c) => c[0] === confPath
+      );
+      expect(calls.length).toBeGreaterThan(0);
+      return calls[calls.length - 1][1] as string;
+    };
+
+    it('serves the persisted outputDirectory when detection has none (restart path)', async () => {
+      stubConfig({ outputDirectory: 'dist' });
+      await build('staticapp1', staticDetection());
+      expect(writtenNginxConf('staticapp1')).toContain('root /app/dist;');
+    });
+
+    it('serves the fresh build outputPath when detection and config have none (first deploy)', async () => {
+      stubConfig(undefined);
+      await build('staticapp2', staticDetection(), 'dist');
+      expect(writtenNginxConf('staticapp2')).toContain('root /app/dist;');
+    });
+
+    it('lets an explicit manifest build.output win over build and config values', async () => {
+      stubConfig({ outputDirectory: 'dist' });
+      await build('staticapp3', staticDetection('out'), 'dist');
+      expect(writtenNginxConf('staticapp3')).toContain('root /app/out;');
+    });
+
+    it('falls back to the app root when no output dir is known anywhere', async () => {
+      stubConfig(undefined);
+      await build('staticapp4', staticDetection());
+      expect(writtenNginxConf('staticapp4')).toContain('root /app;');
+    });
+
+    it('collapses traversal and nginx-directive-smuggling values to the app root', async () => {
+      stubConfig({ outputDirectory: '../../etc' });
+      await build('staticapp5', staticDetection());
+      expect(writtenNginxConf('staticapp5')).toContain('root /app;');
+
+      stubConfig({ outputDirectory: 'dist; } server { listen 80' });
+      await build('staticapp6', staticDetection());
+      expect(writtenNginxConf('staticapp6')).toContain('root /app;');
+    });
+
+    it('normalizes a "./dist"-style value and treats "." as the app root', async () => {
+      stubConfig({ outputDirectory: './dist/' });
+      await build('staticapp7', staticDetection());
+      expect(writtenNginxConf('staticapp7')).toContain('root /app/dist;');
+
+      stubConfig({ outputDirectory: '.' });
+      await build('staticapp8', staticDetection());
+      expect(writtenNginxConf('staticapp8')).toContain('root /app;');
+    });
+
+    it('applies the same fallback to the non-docker static-server path', async () => {
+      const pm2Platform = createPlatform({
+        dropRoot: tempDir,
+        appsDirectory: path.join(tempDir, 'apps'),
+        logLevel: 'error',
+        caddyfilePath: path.join(tempDir, 'Caddyfile'),
+      });
+      (pm2Platform as any).appConfigService = {
+        getConfig: jest.fn().mockReturnValue({ outputDirectory: 'dist' }),
+      };
+      const spec = await (pm2Platform as any).buildStartSpec(
+        'staticapp9',
+        path.join(tempDir, 'staticapp9'),
+        staticDetection(),
+        4000,
+        path.join(tempDir, 'data', 'staticapp9'),
+        {}
+      );
+      expect(spec.args?.[0]).toBe(path.join(tempDir, 'staticapp9', 'dist'));
+    });
+  });
+
   // Regression guard for the `none`/PM2 start bugs: previously this branch
   // passed the raw, possibly multi-token startCommand straight through as a
   // bare `script` (PM2 infers the interpreter from the file extension), with
