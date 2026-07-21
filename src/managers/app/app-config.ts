@@ -27,6 +27,15 @@ export interface AppConfig {
   createdAt: string;
   lastDeployedAt?: string;
   buildDuration?: number;
+  /**
+   * Build output directory relative to the app root (e.g. 'dist'), as reported
+   * by the build strategy after the last successful build. The static serve
+   * path falls back to this when detection can't supply one: the manifest
+   * detector wins detection for any app carrying a drop.yaml (confidence 1.0)
+   * but only knows an explicit `build.output`, so without this a built SPA
+   * would be served from its source root on restart.
+   */
+  outputDirectory?: string;
   env?: Record<string, string>;
   /** Persistent data directory path - survives app upgrades */
   dataDir?: string;
