@@ -170,6 +170,14 @@ export interface BuildCompletedPayload extends BaseEvent {
   durationMs: number;
   /** Whether the build succeeded. Subscribers must not start the app when false. */
   success: boolean;
+  /**
+   * Build output directory relative to the app root (e.g. 'dist'), as reported
+   * by the build strategy. Carried in the payload because dispatch is
+   * synchronous inside build(): the start handler runs before the builder's
+   * caller can persist anything, so this is the only race-free way for the
+   * start path to learn where a static build's output landed.
+   */
+  outputPath?: string;
 }
 
 export interface BuildFailedPayload extends BaseEvent {
