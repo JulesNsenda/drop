@@ -120,6 +120,103 @@ describe('SettingsManager', () => {
     });
   });
 
+  describe('githubWebhookSecret', () => {
+    it('sets and persists a value, readable via getGithubWebhookSecret', async () => {
+      await manager.setGithubWebhookSecret('a'.repeat(64));
+      expect(manager.getGithubWebhookSecret()).toBe('a'.repeat(64));
+
+      const raw = await fs.readFile(settingsFilePath, 'utf-8');
+      expect(JSON.parse(raw)).toEqual({ githubWebhookSecret: 'a'.repeat(64) });
+    });
+
+    it('persists across a reload (new manager instance, same file) — catches the parseSettings whitelist bug', async () => {
+      await manager.setGithubWebhookSecret('a'.repeat(64));
+
+      const reloaded = new SettingsManager({ settingsFilePath });
+      await reloaded.load();
+      expect(reloaded.getGithubWebhookSecret()).toBe('a'.repeat(64));
+      await reloaded.close();
+    });
+
+    it('treats an empty string as absent (clears) and does not return it', async () => {
+      await manager.setGithubWebhookSecret('a'.repeat(64));
+      await manager.setGithubWebhookSecret('');
+      expect(manager.getGithubWebhookSecret()).toBeUndefined();
+
+      const reloaded = new SettingsManager({ settingsFilePath });
+      await reloaded.load();
+      expect(reloaded.getGithubWebhookSecret()).toBeUndefined();
+      await reloaded.close();
+    });
+
+    it('treats a whitespace-only string as absent (clears)', async () => {
+      await manager.setGithubWebhookSecret('a'.repeat(64));
+      await manager.setGithubWebhookSecret('   ');
+      expect(manager.getGithubWebhookSecret()).toBeUndefined();
+    });
+
+    it('loads a hand-written empty-string value from disk as undefined', async () => {
+      await fs.mkdir(path.dirname(settingsFilePath), { recursive: true });
+      await fs.writeFile(settingsFilePath, JSON.stringify({ githubWebhookSecret: '' }));
+
+      await manager.load();
+
+      expect(manager.getGithubWebhookSecret()).toBeUndefined();
+    });
+
+    it('clears the value when set to undefined', async () => {
+      await manager.setGithubWebhookSecret('a'.repeat(64));
+      expect(manager.getGithubWebhookSecret()).toBe('a'.repeat(64));
+
+      await manager.setGithubWebhookSecret(undefined);
+      expect(manager.getGithubWebhookSecret()).toBeUndefined();
+
+      const reloaded = new SettingsManager({ settingsFilePath });
+      await reloaded.load();
+      expect(reloaded.getGithubWebhookSecret()).toBeUndefined();
+      await reloaded.close();
+    });
+
+    it('is independent of publicUrl across a reload (writing one field does not disturb the other)', async () => {
+      await manager.setPublicUrl('https://drop.example.com');
+      await manager.setGithubWebhookSecret('a'.repeat(64));
+
+      const reloaded = new SettingsManager({ settingsFilePath });
+      await reloaded.load();
+      expect(reloaded.getStoredPublicUrl()).toBe('https://drop.example.com');
+      expect(reloaded.getGithubWebhookSecret()).toBe('a'.repeat(64));
+      await reloaded.close();
+
+      // Clearing the secret must not disturb the previously-set publicUrl.
+      await manager.setGithubWebhookSecret(undefined);
+
+      const reloadedAgain = new SettingsManager({ settingsFilePath });
+      await reloadedAgain.load();
+      expect(reloadedAgain.getStoredPublicUrl()).toBe('https://drop.example.com');
+      expect(reloadedAgain.getGithubWebhookSecret()).toBeUndefined();
+      await reloadedAgain.close();
+    });
+  });
+
+  describe('file permissions', () => {
+    // POSIX mode bits aren't meaningful on Windows (no chmod-style ACL model).
+    const itPosix = process.platform === 'win32' ? it.skip : it;
+
+    itPosix('writes settings.json with mode 0600', async () => {
+      await manager.setPublicUrl('https://drop.example.com');
+
+      const stats = await fs.stat(settingsFilePath);
+      expect(stats.mode & 0o777).toBe(0o600);
+    });
+
+    itPosix('writes settings.json with mode 0600 when saving the webhook secret', async () => {
+      await manager.setGithubWebhookSecret('a'.repeat(64));
+
+      const stats = await fs.stat(settingsFilePath);
+      expect(stats.mode & 0o777).toBe(0o600);
+    });
+  });
+
   describe('getSettingsManager / resetSettingsManager (singleton)', () => {
     afterEach(() => {
       resetSettingsManager();

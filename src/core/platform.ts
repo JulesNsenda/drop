@@ -597,6 +597,35 @@ export class DropPlatform {
     //     ├── backup/             # Automated backups
     //     └── temp/               # Temporary files
 
+    // Ensure ancestors exist first (default mode). `recursive: true` + `mode`
+    // applies that mode to every directory it has to create along the path —
+    // if `dataDir` didn't exist yet, the drop-svc mkdir below would also
+    // stamp `data/` (and the drop root) 0700, blocking traversal into
+    // sibling dirs like `data/webapps` for non-owner processes. Creating
+    // `dataDir` here first (default mode, same as everywhere else) means the
+    // drop-svc mkdir only ever has one new segment to create.
+    try {
+      await fs.mkdir(dataDir, { recursive: true });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') {
+        this.log('warn', `Failed to create directory: ${dataDir}`, error);
+      }
+    }
+
+    // Platform state (settings.json, secrets.json, encryption.key, ...) can
+    // hold plaintext secrets (e.g. the GitHub webhook HMAC secret) — keep the
+    // directory non-world-traversable, same rationale as `backup` below.
+    // Created ahead of the main loop so the `pm2` subdirectory below doesn't
+    // cause it to be created first with the default mode via `recursive: true`.
+    // (POSIX-effective only; on Windows this relies on NTFS ACL inheritance.)
+    try {
+      await fs.mkdir(path.join(dataDir, 'drop-svc'), { recursive: true, mode: 0o700 });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') {
+        this.log('warn', `Failed to create directory: ${path.join(dataDir, 'drop-svc')}`, error);
+      }
+    }
+
     const directories = [
       // Root
       this.config.dropRoot,
@@ -605,7 +634,6 @@ export class DropPlatform {
       // Data directories (preserved during upgrade)
       dataDir,
       this.config.appsDirectory, // data/webapps
-      path.join(dataDir, 'drop-svc'), // Platform state
       path.join(dataDir, 'drop-svc', 'pm2'), // PM2 config files
       path.join(dataDir, 'db'), // App databases
       path.join(dataDir, 'appdata'), // Per-app persistent data
