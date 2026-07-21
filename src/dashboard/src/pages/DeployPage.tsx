@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect, DragEvent } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate, Link } from 'react-router-dom';
 import {
   FolderUp,
   GitBranch,
@@ -461,6 +461,13 @@ function DeployPage() {
               Auto-redeploy when code is pushed (via GitHub webhook)
             </label>
           </div>
+          <p className="-mt-2 text-xs" style={{ color: 'var(--text-3)' }}>
+            Requires a webhook secret — configure one in{' '}
+            <Link to="/settings?tab=git-webhooks" className="underline">
+              Settings &rarr; Git webhooks
+            </Link>
+            .
+          </p>
 
           {/* Deploy button */}
           <Button
