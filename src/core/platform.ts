@@ -1816,7 +1816,17 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     const rootYaml = await parseDropYaml(payload.path);
     if (rootYaml.success && rootYaml.config?.services && Object.keys(rootYaml.config.services).length > 0) {
       this.watcher?.markAppKnown(payload.name);
-      await this.expandMonorepo(payload.path, payload.name, rootYaml.config);
+      // Hold the container name in appsInProgress for the duration of the
+      // expansion: the DELETE route's in-progress guard keys off it (a
+      // teardown must not interleave with the fs.rm/fs.cp of child folders)
+      // and a concurrent app:update for the container drops re-entrantly.
+      // finally-guaranteed release — a stuck entry would wedge the app.
+      this.appsInProgress.add(payload.name);
+      try {
+        await this.expandMonorepo(payload.path, payload.name, rootYaml.config);
+      } finally {
+        this.appsInProgress.delete(payload.name);
+      }
       return;
     }
 
@@ -2416,7 +2426,15 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     ) {
       if (bypassCooldown) {
         this.logger.info(`Re-expanding monorepo container '${appName}' (explicit redeploy)`, 'MONOREPO');
-        await this.expandMonorepo(appPath, appName, containerYaml.config);
+        // Same in-progress bracket as the app:detected interception: blocks a
+        // concurrent DELETE (409) and re-entrant updates while child folders
+        // are re-materialized out from under running apps.
+        this.appsInProgress.add(appName);
+        try {
+          await this.expandMonorepo(appPath, appName, containerYaml.config);
+        } finally {
+          this.appsInProgress.delete(appName);
+        }
       } else {
         this.logger.debug(
           `Skipping update for monorepo container '${appName}' - not a buildable app`,

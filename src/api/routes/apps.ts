@@ -520,15 +520,18 @@ apps.delete('/:name', async c => {
       throw new NotFoundError(`Application '${name}' not found`);
     }
     const groupName = app?.isGroupContainer ? (app.group ?? name) : name;
-    const groupChildren = stateManager
-      .getAllApps()
-      .filter(a => a.group === groupName && !a.isGroupContainer);
+    const groupApps = stateManager.getAllApps().filter(a => a.group === groupName);
+    const groupChildren = groupApps.filter(a => !a.isGroupContainer);
     // A container with zero children (failed expansion) is still deletable —
     // removeGroup tears the container entry + folder down via its group tag.
     if (!app && groupChildren.length === 0) {
       throw new NotFoundError(`Application '${name}' not found`);
     }
-    if (!groupChildren.every(a => canAccess(auth, a))) {
+    // IDOR gate over EVERY entry the teardown will destroy — containers
+    // included, since removeGroup tears those down too. Group tags are
+    // tenant-influenced (drop.yaml group:/name:), so a crafted collision must
+    // not let one user's group delete reach another user's container.
+    if (!groupApps.every(a => canAccess(auth, a))) {
       throw new NotFoundError(`Application '${name}' not found`);
     }
 
@@ -673,7 +676,10 @@ apps.delete('/:name', async c => {
     const groupApps = stateManager.getAllApps().filter(a => a.group === app.group);
     const remainingSiblings = groupApps.filter(a => !a.isGroupContainer);
     if (remainingSiblings.length === 0) {
-      for (const container of groupApps.filter(a => a.isGroupContainer)) {
+      // Only containers the requester may access: group tags are
+      // tenant-influenced, so a child delete must not cascade into another
+      // user's colliding container entry/folder.
+      for (const container of groupApps.filter(a => a.isGroupContainer && canAccess(auth, a))) {
         try {
           await stateManager.removeApp(container.name);
           if (container.path) {
