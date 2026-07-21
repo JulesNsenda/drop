@@ -50,6 +50,18 @@ export interface AppState {
    * that only read `AppState`. Absent for standalone apps.
    */
   group?: string;
+  /**
+   * True for the state entry of a monorepo CONTAINER repo (the cloned folder
+   * whose root drop.yaml declares `services:`). The deploy-from-git path
+   * registers the repo before detection can know it's a container, and the
+   * entry must survive — its `gitSource` is what webhook auto-redeploys match
+   * on — but it is not a runnable app: listings hide it, DELETE on it tears
+   * down the whole group, and removeGroup cleans it up. Tagged with the
+   * group's name in `group` (which can differ from this entry's own name when
+   * drop.yaml sets `name:`/`group:`). Set by expandMonorepo on every
+   * expansion, so pre-existing phantoms self-heal on the next redeploy.
+   */
+  isGroupContainer?: boolean;
 }
 
 export interface StateManagerConfig {
