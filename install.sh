@@ -212,6 +212,38 @@ ensure_caddy() {
   fi
 }
 
+# ── logind RemoveIPC ─────────────────────────────────────────────────────────
+# systemd-logind's default RemoveIPC=yes deletes ALL POSIX/SysV shared memory
+# owned by a non-system user the moment that user's last login session ends —
+# even while a system service still runs as that user. The bundled PostgreSQL
+# runs as $DROP_USER (a regular useradd user), and CI deploys SSH in and out
+# as that same user, so every deploy wiped the live server's dynamic shared
+# memory ("could not open shared memory segment /PostgreSQL.N: No such file or
+# directory" on the next parallel query). RemoveIPC=no is the fix PostgreSQL's
+# own docs prescribe for running as a non-system user under systemd.
+ensure_removeipc_off() {
+  local dropin_dir="/etc/systemd/logind.conf.d"
+  local dropin="$dropin_dir/99-drop-removeipc.conf"
+  if grep -qs '^RemoveIPC=no' "$dropin"; then
+    return 0
+  fi
+  info "Disabling systemd-logind RemoveIPC (protects the bundled PostgreSQL)..."
+  mkdir -p "$dropin_dir"
+  cat > "$dropin" << 'EOF'
+# Written by DROP install.sh — do not remove.
+# The bundled PostgreSQL runs as a regular (non-system) user; logind's default
+# RemoveIPC=yes would delete its shared memory whenever that user's last SSH
+# session ends, breaking queries with "could not open shared memory segment".
+[Login]
+RemoveIPC=no
+EOF
+  # logind does not re-read its config on HUP; restart it so the setting takes
+  # effect now. Safe on a headless box — active sessions (including the one
+  # running this script) survive a logind restart via /run/systemd state.
+  systemctl restart systemd-logind \
+    || warn "Could not restart systemd-logind — RemoveIPC=no takes effect after reboot"
+}
+
 # ── platform config (domain / HTTPS) — persisted, survives upgrades & deploys ─
 # Written to an EnvironmentFile that systemd re-reads on every start, so config
 # changes take effect on the next service restart without rewriting the unit.
@@ -401,6 +433,7 @@ EOF
 provision_system() {
   ensure_root_dir
   ensure_caddy
+  ensure_removeipc_off
   write_env_config
   write_service      # (re)writes the unit + daemon-reload + enable
   write_sudoers
