@@ -121,7 +121,8 @@ export class SettingsManager {
 
   /** Set (or, with `undefined`/empty/whitespace-only, clear) the stored GitHub webhook secret. Persists atomically. */
   async setGithubWebhookSecret(secret: string | undefined): Promise<void> {
-    const normalized = secret && secret.trim().length > 0 ? secret : undefined;
+    const trimmed = secret?.trim();
+    const normalized = trimmed ? trimmed : undefined;
     const next: PlatformSettings = { ...this.settings, githubWebhookSecret: normalized };
     // Same persist-then-commit-in-memory shape as setPublicUrl above — see
     // that method's comment for why this isn't queued through a chained

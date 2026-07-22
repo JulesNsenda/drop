@@ -372,6 +372,26 @@ describe('admin settings routes (PRD-041)', () => {
       expect(res.status).toBe(400);
     });
 
+    it('rejects a non-object JSON body with 400 without clearing a stored secret', async () => {
+      // A top-level number/string/array/null body would make `body.secret`
+      // undefined and silently fall into the clear branch (or 500 on null)
+      // without the object-shape guard.
+      await putGithubWebhookSecret('a-stored-secret-value');
+      expect(getSettingsManager().getGithubWebhookSecret()).toBe('a-stored-secret-value');
+
+      for (const rawBody of ['123', '"foo"', '[]', 'null']) {
+        const res = await hono.request('/api/v1/admin/settings/github-webhook-secret', {
+          method: 'PUT',
+          headers: authHeader(adminToken),
+          body: rawBody,
+        });
+        expect(res.status).toBe(400);
+        const body = (await res.json()) as ApiEnvelope<never>;
+        expect(body.error?.code).toBe('VALIDATION_ERROR');
+      }
+      expect(getSettingsManager().getGithubWebhookSecret()).toBe('a-stored-secret-value');
+    });
+
     it('clears the stored secret on null, falling back to env', async () => {
       process.env.DROP_GITHUB_WEBHOOK_SECRET = 'env-fallback-value';
       await putGithubWebhookSecret('to-be-cleared-value');

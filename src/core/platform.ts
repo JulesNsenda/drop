@@ -597,13 +597,7 @@ export class DropPlatform {
     //     ├── backup/             # Automated backups
     //     └── temp/               # Temporary files
 
-    // Ensure ancestors exist first (default mode). `recursive: true` + `mode`
-    // applies that mode to every directory it has to create along the path —
-    // if `dataDir` didn't exist yet, the drop-svc mkdir below would also
-    // stamp `data/` (and the drop root) 0700, blocking traversal into
-    // sibling dirs like `data/webapps` for non-owner processes. Creating
-    // `dataDir` here first (default mode, same as everywhere else) means the
-    // drop-svc mkdir only ever has one new segment to create.
+    // Ensure ancestors exist first (default mode, same as everywhere else).
     try {
       await fs.mkdir(dataDir, { recursive: true });
     } catch (error) {
@@ -615,15 +609,34 @@ export class DropPlatform {
     // Platform state (settings.json, secrets.json, encryption.key, ...) can
     // hold plaintext secrets (e.g. the GitHub webhook HMAC secret) — keep the
     // directory non-world-traversable, same rationale as `backup` below.
-    // Created ahead of the main loop so the `pm2` subdirectory below doesn't
-    // cause it to be created first with the default mode via `recursive: true`.
     // (POSIX-effective only; on Windows this relies on NTFS ACL inheritance.)
+    //
+    // Two-step, not a single `recursive: true, mode: 0o700` mkdir:
+    //  1. Non-recursive create at 0700. Since `dataDir` already exists (or a
+    //     transient failure above left it missing, in which case this simply
+    //     ENOENTs and gets warn-logged rather than creating it), this call
+    //     has at most one path segment (`drop-svc`) to create — it is
+    //     structurally impossible for a non-recursive mkdir to stamp an
+    //     ancestor directory (`data/`, the drop root) 0700 and block
+    //     traversal into siblings like `data/webapps` for non-owner
+    //     processes. EEXIST is swallowed; other errors are warn-logged.
+    //  2. Unconditional chmod, in its own try/catch. `mkdir`'s `mode` only
+    //     applies at creation time, so step 1 alone would leave an install
+    //     upgraded from before this hardening was added at its old, looser
+    //     mode forever. Chmod-ing every start closes that gap for existing
+    //     installs too. Best-effort: warn on failure, and this is a no-op on
+    //     Windows (no POSIX mode bits) — never fatal either way.
     try {
-      await fs.mkdir(path.join(dataDir, 'drop-svc'), { recursive: true, mode: 0o700 });
+      await fs.mkdir(path.join(dataDir, 'drop-svc'), { mode: 0o700 });
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'EEXIST') {
         this.log('warn', `Failed to create directory: ${path.join(dataDir, 'drop-svc')}`, error);
       }
+    }
+    try {
+      await fs.chmod(path.join(dataDir, 'drop-svc'), 0o700);
+    } catch (error) {
+      this.log('warn', `Failed to set permissions on directory: ${path.join(dataDir, 'drop-svc')}`, error);
     }
 
     const directories = [

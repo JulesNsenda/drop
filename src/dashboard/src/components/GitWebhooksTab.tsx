@@ -66,6 +66,13 @@ function GitWebhooksTab() {
 
   const [clearing, setClearing] = useState(false);
 
+  /** Cross-disable the three idle actions (+ the custom-form submit): while
+   * any one mutation is in flight, the others must not be clickable — e.g.
+   * Clear firing while Generate is still in flight could wipe the
+   * freshly-generated secret out from under the admin before they've copied
+   * it, leaving them about to paste a dead secret into GitHub. */
+  const busy = generating || settingCustom || clearing;
+
   const fetchStatus = useCallback(async () => {
     setStatusLoading(true);
     setStatusError('');
@@ -104,6 +111,7 @@ function GitWebhooksTab() {
   };
 
   const handleGenerate = async () => {
+    if (busy) return;
     const ok = await confirmSecretChange();
     if (!ok) return;
     setGenerating(true);
@@ -146,6 +154,7 @@ function GitWebhooksTab() {
   };
 
   const handleOpenCustomForm = () => {
+    if (busy) return;
     setCustomSecret('');
     setCustomError('');
     setStep('custom-form');
@@ -188,6 +197,7 @@ function GitWebhooksTab() {
   };
 
   const handleClear = async () => {
+    if (busy) return;
     const confirmed = await confirmDialog({
       title: 'Clear webhook secret',
       message:
@@ -295,7 +305,7 @@ function GitWebhooksTab() {
               autoFocus
             />
             <div className="flex gap-3">
-              <Button type="submit" loading={settingCustom}>
+              <Button type="submit" loading={settingCustom} disabled={busy}>
                 {settingCustom ? 'Saving...' : 'Save secret'}
               </Button>
               <Button type="button" variant="secondary" onClick={handleCancelCustomForm}>
@@ -397,10 +407,15 @@ function GitWebhooksTab() {
             {/* Actions */}
             {step === 'idle' && (
               <div className="flex flex-wrap items-center gap-3">
-                <Button onClick={() => void handleGenerate()} loading={generating}>
+                <Button onClick={() => void handleGenerate()} loading={generating} disabled={busy}>
                   {generating ? 'Generating...' : 'Generate secret'}
                 </Button>
-                <Button type="button" variant="secondary" onClick={handleOpenCustomForm}>
+                <Button
+                  type="button"
+                  variant="secondary"
+                  onClick={handleOpenCustomForm}
+                  disabled={busy}
+                >
                   <KeyRound className="w-4 h-4" />
                   Use my own secret
                 </Button>
@@ -410,6 +425,7 @@ function GitWebhooksTab() {
                     variant="danger"
                     onClick={() => void handleClear()}
                     loading={clearing}
+                    disabled={busy}
                   >
                     <Trash2 className="w-4 h-4" />
                     {clearing ? 'Clearing...' : 'Clear secret'}
