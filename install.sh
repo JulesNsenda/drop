@@ -39,7 +39,10 @@ error() { echo -e "${RED}[DROP]${NC} $*" >&2; exit 1; }
 
 # apt-get wrapper: wait up to 5 min for the dpkg lock so we don't race the
 # unattended-upgrades / apt-daily jobs that run on a freshly-booted box.
-aptget() { apt-get -o DPkg::Lock::Timeout=300 "$@"; }
+# DEBIAN_FRONTEND=noninteractive keeps apt from opening a dialog (debconf or a
+# needrestart service prompt) on a TTY-less deploy SSH session, where it would
+# hang until the job times out rather than fail fast.
+aptget() { DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=300 "$@"; }
 
 # ── argument parsing ─────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
@@ -93,13 +96,25 @@ ensure_node() {
 # bcrypt is a native runtime dependency; CI's `npm ci` compiles it on the box, so
 # a freshly-bootstrapped server needs a C toolchain present even though the build
 # itself happens during deploy.
+# python3-venv is what lets a Python app build at all under isolation:none:
+# the builder installs deps into an in-app-dir `.venv`, and on Debian/Ubuntu
+# `python3 -m venv` fails with "ensurepip is not available" unless python3-venv
+# is present. Debian's bare `python3` ships neither venv nor pip, which is why
+# this must be provisioned rather than assumed.
 ensure_build_tools() {
-  if dpkg -s build-essential &>/dev/null && command -v python3 &>/dev/null; then
+  if dpkg -s build-essential &>/dev/null \
+    && dpkg -s python3-venv &>/dev/null \
+    && dpkg -s python3-pip &>/dev/null \
+    && command -v python3 &>/dev/null; then
     info "Build tools already installed"
     return 0
   fi
-  info "Installing build tools (build-essential, python3) for native npm deps..."
-  aptget install -y build-essential python3
+  info "Installing build tools (build-essential, python3, python3-venv, python3-pip)..."
+  # Refresh the index first: on an already-bootstrapped server this runs from
+  # the deploy's --provision pass, where the cached lists can be months stale
+  # and would resolve python3-venv to a version that no longer exists.
+  aptget update -qq
+  aptget install -y build-essential python3 python3-venv python3-pip
 }
 
 # ── Docker Engine (container isolation) ─────────────────────────────────────
@@ -475,6 +490,10 @@ if $BOOTSTRAP; then
 elif $PROVISION; then
   info "Provisioning system (Caddy, unit, env, apex route)..."
   [[ "$ISOLATION" == "docker" ]] && ensure_docker
+  # Deploys run `--provision`, so this is the only path that reaches an
+  # already-bootstrapped server. Re-run the package step here or host
+  # requirements added after bootstrap (python3-venv) never land.
+  ensure_build_tools
   provision_system
   info "Restarting $SERVICE_NAME..."
   systemctl restart "$SERVICE_NAME"

@@ -123,7 +123,7 @@ describe('pythonDetector', () => {
     );
   });
 
-  it('warns when both requirements.txt and Pipfile exist, and prefers pipenv for install', async () => {
+  it('warns when both requirements.txt and Pipfile exist', async () => {
     await fs.writeFile(path.join(tmpDir, 'requirements.txt'), 'flask==2.0');
     await fs.writeFile(path.join(tmpDir, 'Pipfile'), '[packages]\nflask = "*"');
 
@@ -132,7 +132,25 @@ describe('pythonDetector', () => {
     expect(result?.warnings).toContainEqual(
       expect.stringContaining('Both requirements.txt and Pipfile found')
     );
-    expect(result?.suggestedConfig.installCommand).toBe('pipenv install');
+  });
+
+  // Regression: the detector used to suggest a bare `pip install -r
+  // requirements.txt` (and `pipenv install`). platform.buildApp feeds
+  // suggestedConfig.installCommand straight into the build context, where
+  // PythonBuildStrategy honors it *ahead of* its own in-app-dir venv logic —
+  // so suggesting anything here silently disabled the venv install and broke
+  // every Python app with dependencies, in both isolation modes.
+  it.each([
+    ['requirements.txt', 'flask==2.0'],
+    ['Pipfile', '[packages]\nflask = "*"'],
+    ['pyproject.toml', '[tool.poetry]\nname = "x"'],
+  ])('never suggests an install command for a %s project', async (manifest, body) => {
+    await fs.writeFile(path.join(tmpDir, manifest), body);
+    await fs.writeFile(path.join(tmpDir, 'app.py'), '');
+
+    const result = await pythonDetector.detect(tmpDir);
+
+    expect(result?.suggestedConfig.installCommand).toBeUndefined();
   });
 
   it('emits python -m gunicorn for the Django framework default (never a bare gunicorn binary)', async () => {
