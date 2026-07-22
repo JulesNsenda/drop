@@ -175,7 +175,7 @@ drop restore <backup-dir> --confirm     # Restore from a backup (stop the platfo
 | **Express/Fastify/Hono** | Dependencies | `npm install` + runs start script |
 | **Static Site** | `index.html` | Serves with built-in static server |
 | **SPA** | `index.html` + framework | Serves with SPA routing support |
-| **Python** | `requirements.txt` | `pip install` + runs app |
+| **Python** | `requirements.txt` | Installs into an in-app `.venv` + runs app |
 | **Docker** | `Dockerfile` | `docker build` + `docker run` |
 
 ## Database Auto-Provisioning
@@ -427,11 +427,12 @@ cannot reach the LAN or cloud-metadata endpoints.
   risk until then.
 - **Deps must land in the app dir.** Build and run happen in separate ephemeral
   containers sharing only the `/app` bind mount (no image commit), so only
-  dependencies written *into the app dir* reach the runtime. Node (`node_modules`)
-  and Go (compiled binary) work. **Python does not yet**: `pip install` targets
-  system site-packages, which is never mounted into the runtime — the build
-  "succeeds" but the app fails to import at boot. Python-under-isolation
-  (install into an `/app`-local venv/`--target`) is a tracked follow-up.
+  dependencies written *into the app dir* reach the runtime. Node
+  (`node_modules`), Go (compiled binary) and Python (an `/app`-local `.venv`,
+  whose `bin/` is put on the runtime `PATH`) all land there. Anything a custom
+  build command installs into system site-packages or a global prefix is
+  discarded with the build container — the build "succeeds" and the app then
+  fails to import at boot.
 
 Requires Docker Engine on Linux (Docker Desktop on Windows/macOS is
 dev/best-effort only for this mode).

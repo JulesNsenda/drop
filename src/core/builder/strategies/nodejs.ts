@@ -83,6 +83,12 @@ export class NodejsBuildStrategy extends BaseBuildStrategy {
   async preBuild(context: BuildContext): Promise<void> {
     const packageManager = await this.detectPackageManager(context.appPath);
 
+    // DEAD IN THE DEFAULT PATH: the Node detector always supplies
+    // installCommand: 'npm install' (see detectors/nodejs.ts), so this guard
+    // is false for every detected Node app and none of the branches below
+    // run. The equivalent logic in strategies/static.ts IS live, because the
+    // static detector suggests no install command. Do not "fix" a bug in here
+    // without first removing the detector's suggestion.
     if (!context.config.installCommand) {
       // Prefer `npm ci` (or equivalent) when a lockfile exists — it's faster
       // and deterministic. Skip install only when the lockfile hash matches

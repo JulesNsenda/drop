@@ -104,7 +104,7 @@ export const pythonDetector: AppDetector = {
     }
 
     // Generate suggested config
-    const suggestedConfig = generatePythonConfig(type, framework, entryPoint, hasRequirements, hasPipfile);
+    const suggestedConfig = generatePythonConfig(type, framework, entryPoint);
 
     // A Procfile `web:` command is the authoritative user-provided start
     // command for a manifest-less app - prefer it over the guessed default.
@@ -230,18 +230,21 @@ async function findEntryPoint(appPath: string): Promise<string | null> {
 function generatePythonConfig(
   type: AppType,
   _framework: string | null,
-  entryPoint: string | null,
-  hasRequirements: boolean,
-  hasPipfile: boolean
+  entryPoint: string | null
 ): SuggestedConfig {
   const config: SuggestedConfig = {};
 
-  // Install command
-  if (hasPipfile) {
-    config.installCommand = 'pipenv install';
-  } else if (hasRequirements) {
-    config.installCommand = 'pip install -r requirements.txt';
-  }
+  // Deliberately no installCommand. PythonBuildStrategy owns dependency
+  // installation, and platform.buildApp passes whatever we suggest here
+  // straight into BuildContext.config.installCommand — which the strategy
+  // honors ahead of its own logic. Suggesting a command from here therefore
+  // *replaces* the in-app-dir venv install rather than defaulting it, and a
+  // bare `pip`/`pipenv` breaks both isolation modes: on a host build `pip` is
+  // usually not on PATH at all ("/bin/sh: 1: pip: not found" — only `python3`
+  // is guaranteed), and inside a build container it "succeeds" into
+  // site-packages that are discarded with the container, leaving the runtime
+  // with no deps ("No module named uvicorn"). Leaving it unset lets
+  // PythonBuildStrategy.preBuild pick the correct `.venv`-based command.
 
   // Start command based on framework. Always invoke via `python -m` rather
   // than a bare `uvicorn`/`gunicorn` binary: at runtime `.venv/bin` is on
