@@ -10,6 +10,16 @@ import { BuildContext } from '../builder.types';
 import { AppType } from '../../detector/detector.types';
 import { BaseBuildStrategy } from './base';
 
+/**
+ * Every Python install path funnels through an in-app-dir virtualenv, so the
+ * deps ship with the app artifact (like node_modules) and survive both the
+ * ephemeral build container and a host build. `python3` is the only
+ * interpreter guaranteed to be on PATH — never invoke a bare `pip`.
+ */
+const VENV_CREATE = 'python3 -m venv .venv';
+const VENV_PYTHON = '.venv/bin/python';
+const VENV_PIP = `${VENV_PYTHON} -m pip`;
+
 export class PythonBuildStrategy extends BaseBuildStrategy {
   name = 'python';
   supportedTypes: AppType[] = ['python', 'django', 'flask', 'fastapi'];
@@ -75,11 +85,28 @@ export class PythonBuildStrategy extends BaseBuildStrategy {
    * provisioning must install it (docker's python:3.12-slim base already
    * ships venv, so the docker build side needs no extra package).
    */
-  private pipInstall(): string {
+  private pipInstall(target: string = '-r requirements.txt'): string {
     return (
-      'python3 -m venv .venv && ' +
-      '.venv/bin/python -m pip install --upgrade pip && ' +
-      '.venv/bin/python -m pip install -r requirements.txt'
+      `${VENV_CREATE} && ` +
+      `${VENV_PIP} install --upgrade pip && ` +
+      `${VENV_PIP} install ${target}`
+    );
+  }
+
+  /**
+   * Pipenv/Poetry are not installed on a DROP host, and the container build
+   * images don't ship them either, so invoking them directly can only ever
+   * fail with "not found". Install into the same in-app-dir .venv instead:
+   * `pip install .` covers any PEP 517 project (Poetry, Hatch, setuptools),
+   * and pipenv is bootstrapped into the venv and told to install into it
+   * (`--system` means "this interpreter", which inside a venv is the venv).
+   */
+  private pipenvInstall(): string {
+    return (
+      `${VENV_CREATE} && ` +
+      `${VENV_PIP} install --upgrade pip && ` +
+      `${VENV_PIP} install pipenv && ` +
+      `${VENV_PYTHON} -m pipenv install --system`
     );
   }
 
@@ -115,12 +142,16 @@ export class PythonBuildStrategy extends BaseBuildStrategy {
     const hasRequirements = await this.fileExists(path.join(context.appPath, 'requirements.txt'));
 
     if (!context.config.installCommand) {
-      if (hasPipfile) {
-        context.config.installCommand = 'pipenv install';
-      } else if (hasPoetry) {
-        context.config.installCommand = 'poetry install';
-      } else if (hasRequirements) {
+      // requirements.txt wins when several manifests coexist: it's the
+      // deployment manifest, and projects that carry a pyproject.toml purely
+      // for tool config (ruff/black/pytest) would otherwise be sent down the
+      // PEP 517 path and fail to build.
+      if (hasRequirements) {
         context.config.installCommand = this.pipInstall();
+      } else if (hasPipfile) {
+        context.config.installCommand = this.pipenvInstall();
+      } else if (hasPoetry) {
+        context.config.installCommand = this.pipInstall('.');
       } else {
         // No dependency manifest found — still create an (empty) in-app-dir
         // .venv (venv only, no pip install to run) instead of skipping the
@@ -128,7 +159,7 @@ export class PythonBuildStrategy extends BaseBuildStrategy {
         // `.venv/bin` on the runtime PATH when `.venv` exists, so a
         // manifest-less (stdlib-only) app needs one too for `.venv/bin/python`
         // to exist uniformly across every Python app.
-        context.config.installCommand = 'python3 -m venv .venv';
+        context.config.installCommand = VENV_CREATE;
       }
     }
   }
