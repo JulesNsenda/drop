@@ -1,7 +1,12 @@
 # Plan: GitHub webhook secret — generate & configure from the dashboard
 
 **Date:** 2026-07-21 · **Branch:** `feature/DROP-061-webhook-secret-ui` (from `develop`)
-**Status:** awaiting approval
+**Status:** implemented 2026-07-22 — all four gates passed (conformance; adversarial
+diff review: 3× acceptable with 5 findings fixed in 3c31b87; full suite 1588 green;
+runtime-verified via standalone ApiServer harness over real HTTP — 14/14 checks incl.
+stored-over-env precedence, live clear-to-env fallback, fail-closed 503. Visual
+browser click-through pending on a live host (no Chrome extension on this dev box);
+served SPA bundle confirmed to contain the tab and settings route.
 
 ## Goal
 
