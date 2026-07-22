@@ -139,6 +139,13 @@ function generateNodeConfig(
   framework: string | null
 ): SuggestedConfig {
   const config: SuggestedConfig = {
+    // SHADOWS NodejsBuildStrategy.preBuild: platform.buildApp feeds this into
+    // BuildContext.config, and getInstallCommand honors a configured command
+    // ahead of its own logic — so the strategy's npm-ci / --frozen-lockfile /
+    // lockfile-hash skipInstall branches never run. Same defect the Python
+    // detector had (it produced installs the runtime couldn't see); left in
+    // place here only because removing it CHANGES Node install behaviour on a
+    // live platform, which wants its own change with its own rollback.
     installCommand: 'npm install',
   };
 

@@ -12,6 +12,7 @@ import * as os from 'os';
 import { PythonBuildStrategy } from './python';
 import { BuildContext } from '../builder.types';
 import { AppType } from '../../detector/detector.types';
+import { pythonDetector } from '../../detector/detectors/python';
 
 describe('PythonBuildStrategy', () => {
   const strategy = new PythonBuildStrategy();
@@ -134,21 +135,61 @@ describe('PythonBuildStrategy', () => {
       expect(c.config.installCommand).toBe(VENV_INSTALL_CMD);
     });
 
-    it('prefers Pipfile (pipenv) over pyproject.toml and requirements.txt', async () => {
+    it('prefers requirements.txt over pyproject.toml and Pipfile', async () => {
+      // A pyproject.toml is often present purely for tool config (ruff/pytest);
+      // requirements.txt is the deployment manifest, so it wins.
       await fs.writeFile(path.join(tmpDir, 'Pipfile'), '[packages]\n');
       await fs.writeFile(path.join(tmpDir, 'pyproject.toml'), '[tool.poetry]\n');
       await fs.writeFile(path.join(tmpDir, 'requirements.txt'), 'flask\n');
       const c = ctx({ appType: 'flask', appPath: tmpDir });
       await strategy.preBuild(c);
-      expect(c.config.installCommand).toBe('pipenv install');
+      expect(c.config.installCommand).toBe(VENV_INSTALL_CMD);
     });
 
-    it('prefers pyproject.toml (poetry) over requirements.txt when no Pipfile is present', async () => {
-      await fs.writeFile(path.join(tmpDir, 'pyproject.toml'), '[tool.poetry]\n');
-      await fs.writeFile(path.join(tmpDir, 'requirements.txt'), 'flask\n');
+    it('uses pipenv only to export the lock, and venv pip to install it', async () => {
+      // pipenv must not be the thing that places packages: `pipenv install`
+      // chooses its own destination (its own virtualenv, or system
+      // site-packages under --system), which is how deps end up somewhere the
+      // runtime container can't see. Exporting the lock and handing it to
+      // `.venv/bin/python -m pip` keeps the destination unambiguous.
+      await fs.writeFile(path.join(tmpDir, 'Pipfile'), '[packages]\n');
       const c = ctx({ appType: 'flask', appPath: tmpDir });
       await strategy.preBuild(c);
-      expect(c.config.installCommand).toBe('poetry install');
+      expect(c.config.installCommand).toBe(
+        'python3 -m venv .venv && ' +
+          '.venv/bin/python -m pip install --upgrade pip && ' +
+          '.venv/bin/python -m pip install pipenv && ' +
+          '.venv/bin/python -m pipenv requirements > .drop-requirements.txt && ' +
+          '.venv/bin/python -m pip install -r .drop-requirements.txt'
+      );
+      expect(c.config.installCommand).not.toContain('pipenv install');
+    });
+
+    it('installs a pyproject.toml project into the venv rather than invoking a bare poetry', async () => {
+      // Neither poetry nor pipenv exists on a DROP host or in the build
+      // images, so invoking them directly could only ever fail with
+      // "not found". PEP 517 `pip install .` covers Poetry/Hatch/setuptools.
+      await fs.writeFile(path.join(tmpDir, 'pyproject.toml'), '[tool.poetry]\n');
+      const c = ctx({ appType: 'flask', appPath: tmpDir });
+      await strategy.preBuild(c);
+      expect(c.config.installCommand).toBe(
+        'python3 -m venv .venv && ' +
+          '.venv/bin/python -m pip install --upgrade pip && ' +
+          '.venv/bin/python -m pip install .'
+      );
+    });
+
+    it.each([
+      ['requirements.txt', 'flask\n'],
+      ['Pipfile', '[packages]\n'],
+      ['pyproject.toml', '[tool.poetry]\n'],
+    ])('never emits a bare pip/pipenv/poetry invocation for %s', async (manifest, body) => {
+      await fs.writeFile(path.join(tmpDir, manifest), body);
+      const c = ctx({ appType: 'flask', appPath: tmpDir });
+      await strategy.preBuild(c);
+      const cmd = c.config.installCommand ?? '';
+      expect(cmd).toContain('.venv');
+      expect(cmd).not.toMatch(/(^|&&\s*|;\s*)(pip|pip3|pipenv|poetry)\s/);
     });
 
     it('creates a venv-only install command (no skipInstall) when no dependency manifest is found', async () => {
@@ -235,6 +276,63 @@ describe('PythonBuildStrategy', () => {
       await fs.mkdir(path.join(tmpDir, '.venv'));
       await fs.writeFile(path.join(tmpDir, 'app.py'), '# entry point');
       expect(await strategy.validate(c, '')).toBe(true);
+    });
+  });
+
+  // The bug this guards against lived in neither the detector nor the strategy
+  // alone, but in the seam between them: platform.buildApp passes
+  // `detection.suggestedConfig?.installCommand` into BuildContext.config, and
+  // getInstallCommand honors a configured command ahead of its own venv logic.
+  // A detector suggestion therefore *overrode* the venv install rather than
+  // defaulting it, so every Python app with dependencies installed outside the
+  // app dir — failing with "pip: not found" on a host build, or "No module
+  // named uvicorn" at runtime under docker isolation. Unit tests on either
+  // side passed throughout; only the composition was broken.
+  describe('detector → build-config seam', () => {
+    let tmpDir: string;
+
+    beforeEach(async () => {
+      tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'drop-python-seam-'));
+    });
+
+    afterEach(async () => {
+      await fs.rm(tmpDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+    });
+
+    it('resolves a detected FastAPI app to the in-app-dir venv install', async () => {
+      await fs.writeFile(path.join(tmpDir, 'requirements.txt'), 'fastapi\nuvicorn\n');
+      await fs.writeFile(path.join(tmpDir, 'main.py'), 'app = 1\n');
+
+      const detection = await pythonDetector.detect(tmpDir);
+      expect(detection?.type).toBe('fastapi');
+
+      // Exactly what platform.buildApp assembles.
+      const c = ctx({
+        appType: detection!.type,
+        appPath: tmpDir,
+        config: { installCommand: detection!.suggestedConfig?.installCommand },
+      });
+      await strategy.preBuild(c);
+
+      expect(strategy.getInstallCommand(c)).toBe(VENV_INSTALL_CMD);
+    });
+
+    it('still lets an explicit configured install command win over the default', async () => {
+      // Only the *detector* stopped suggesting a command; an install command
+      // that reaches BuildContext.config by any other route keeps its
+      // precedence. NOTE: today the only such route is manifestDetector, and
+      // drop.yaml cannot actually express one — `install` is not in the
+      // parser's ALLOWED_TOP_KEYS. So this pins the strategy's precedence,
+      // not an end-to-end drop.yaml escape hatch (which does not exist yet).
+      await fs.writeFile(path.join(tmpDir, 'requirements.txt'), 'flask\n');
+      const c = ctx({
+        appType: 'flask',
+        appPath: tmpDir,
+        config: { installCommand: './scripts/install.sh' },
+      });
+      await strategy.preBuild(c);
+
+      expect(strategy.getInstallCommand(c)).toBe('./scripts/install.sh');
     });
   });
 });
