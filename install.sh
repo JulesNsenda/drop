@@ -101,20 +101,23 @@ ensure_node() {
 # `python3 -m venv` fails with "ensurepip is not available" unless python3-venv
 # is present. Debian's bare `python3` ships neither venv nor pip, which is why
 # this must be provisioned rather than assumed.
+# No python3-pip on purpose: python3-venv brings ensurepip, so each app's
+# .venv gets its own pip, and every command the builder emits goes through
+# `.venv/bin/python -m pip`. A system-wide pip would only add a way for an
+# install to land outside the app dir and still look like it worked.
 ensure_build_tools() {
   if dpkg -s build-essential &>/dev/null \
     && dpkg -s python3-venv &>/dev/null \
-    && dpkg -s python3-pip &>/dev/null \
     && command -v python3 &>/dev/null; then
     info "Build tools already installed"
     return 0
   fi
-  info "Installing build tools (build-essential, python3, python3-venv, python3-pip)..."
+  info "Installing build tools (build-essential, python3, python3-venv)..."
   # Refresh the index first: on an already-bootstrapped server this runs from
   # the deploy's --provision pass, where the cached lists can be months stale
   # and would resolve python3-venv to a version that no longer exists.
   aptget update -qq
-  aptget install -y build-essential python3 python3-venv python3-pip
+  aptget install -y build-essential python3 python3-venv
 }
 
 # ── Docker Engine (container isolation) ─────────────────────────────────────
@@ -492,8 +495,10 @@ elif $PROVISION; then
   [[ "$ISOLATION" == "docker" ]] && ensure_docker
   # Deploys run `--provision`, so this is the only path that reaches an
   # already-bootstrapped server. Re-run the package step here or host
-  # requirements added after bootstrap (python3-venv) never land.
-  ensure_build_tools
+  # requirements added after bootstrap (python3-venv) never land. Non-fatal
+  # under `set -e`: an apt mirror hiccup must not abort a deploy that has
+  # already unpacked the new artifact but not yet restarted the service.
+  ensure_build_tools || warn "Host build tools incomplete — Python apps may fail to build under isolation:none"
   provision_system
   info "Restarting $SERVICE_NAME..."
   systemctl restart "$SERVICE_NAME"

@@ -146,7 +146,12 @@ describe('PythonBuildStrategy', () => {
       expect(c.config.installCommand).toBe(VENV_INSTALL_CMD);
     });
 
-    it('installs a Pipfile project into the venv rather than invoking a bare pipenv', async () => {
+    it('uses pipenv only to export the lock, and venv pip to install it', async () => {
+      // pipenv must not be the thing that places packages: `pipenv install`
+      // chooses its own destination (its own virtualenv, or system
+      // site-packages under --system), which is how deps end up somewhere the
+      // runtime container can't see. Exporting the lock and handing it to
+      // `.venv/bin/python -m pip` keeps the destination unambiguous.
       await fs.writeFile(path.join(tmpDir, 'Pipfile'), '[packages]\n');
       const c = ctx({ appType: 'flask', appPath: tmpDir });
       await strategy.preBuild(c);
@@ -154,8 +159,10 @@ describe('PythonBuildStrategy', () => {
         'python3 -m venv .venv && ' +
           '.venv/bin/python -m pip install --upgrade pip && ' +
           '.venv/bin/python -m pip install pipenv && ' +
-          '.venv/bin/python -m pipenv install --system'
+          '.venv/bin/python -m pipenv requirements > .drop-requirements.txt && ' +
+          '.venv/bin/python -m pip install -r .drop-requirements.txt'
       );
+      expect(c.config.installCommand).not.toContain('pipenv install');
     });
 
     it('installs a pyproject.toml project into the venv rather than invoking a bare poetry', async () => {
@@ -310,9 +317,13 @@ describe('PythonBuildStrategy', () => {
       expect(strategy.getInstallCommand(c)).toBe(VENV_INSTALL_CMD);
     });
 
-    it('still lets an explicit drop.yaml install command win over the default', async () => {
-      // Only the *detector* stopped suggesting a command; a real user override
-      // (manifest detector / drop.yaml) must keep its precedence.
+    it('still lets an explicit configured install command win over the default', async () => {
+      // Only the *detector* stopped suggesting a command; an install command
+      // that reaches BuildContext.config by any other route keeps its
+      // precedence. NOTE: today the only such route is manifestDetector, and
+      // drop.yaml cannot actually express one — `install` is not in the
+      // parser's ALLOWED_TOP_KEYS. So this pins the strategy's precedence,
+      // not an end-to-end drop.yaml escape hatch (which does not exist yet).
       await fs.writeFile(path.join(tmpDir, 'requirements.txt'), 'flask\n');
       const c = ctx({
         appType: 'flask',

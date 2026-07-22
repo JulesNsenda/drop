@@ -19,6 +19,8 @@ import { BaseBuildStrategy } from './base';
 const VENV_CREATE = 'python3 -m venv .venv';
 const VENV_PYTHON = '.venv/bin/python';
 const VENV_PIP = `${VENV_PYTHON} -m pip`;
+/** Where the Pipfile.lock export is materialised for pip to consume. */
+const PIPENV_EXPORT = '.drop-requirements.txt';
 
 export class PythonBuildStrategy extends BaseBuildStrategy {
   name = 'python';
@@ -94,19 +96,25 @@ export class PythonBuildStrategy extends BaseBuildStrategy {
   }
 
   /**
-   * Pipenv/Poetry are not installed on a DROP host, and the container build
-   * images don't ship them either, so invoking them directly can only ever
-   * fail with "not found". Install into the same in-app-dir .venv instead:
-   * `pip install .` covers any PEP 517 project (Poetry, Hatch, setuptools),
-   * and pipenv is bootstrapped into the venv and told to install into it
-   * (`--system` means "this interpreter", which inside a venv is the venv).
+   * Pipenv is installed on neither the host nor the build images, so a bare
+   * `pipenv install` could only ever fail with "not found". Bootstrap it into
+   * the venv and use it purely as a lockfile *reader*: `pipenv requirements`
+   * prints the pinned set from Pipfile.lock, which plain venv pip then
+   * installs. Deliberately NOT `pipenv install` — that would have pipenv
+   * decide where packages land (its own virtualenv, or system site-packages
+   * under `--system`), which is exactly the "installed somewhere the runtime
+   * can't see" failure this whole strategy exists to prevent. Here every
+   * package is placed by `.venv/bin/python -m pip`, so the destination is
+   * unambiguous. A missing/stale Pipfile.lock fails the build loudly rather
+   * than silently deploying unpinned deps.
    */
   private pipenvInstall(): string {
     return (
       `${VENV_CREATE} && ` +
       `${VENV_PIP} install --upgrade pip && ` +
       `${VENV_PIP} install pipenv && ` +
-      `${VENV_PYTHON} -m pipenv install --system`
+      `${VENV_PYTHON} -m pipenv requirements > ${PIPENV_EXPORT} && ` +
+      `${VENV_PIP} install -r ${PIPENV_EXPORT}`
     );
   }
 
@@ -138,7 +146,7 @@ export class PythonBuildStrategy extends BaseBuildStrategy {
   async preBuild(context: BuildContext): Promise<void> {
     // Detect Python package manager
     const hasPipfile = await this.fileExists(path.join(context.appPath, 'Pipfile'));
-    const hasPoetry = await this.fileExists(path.join(context.appPath, 'pyproject.toml'));
+    const hasPyproject = await this.fileExists(path.join(context.appPath, 'pyproject.toml'));
     const hasRequirements = await this.fileExists(path.join(context.appPath, 'requirements.txt'));
 
     if (!context.config.installCommand) {
@@ -150,7 +158,12 @@ export class PythonBuildStrategy extends BaseBuildStrategy {
         context.config.installCommand = this.pipInstall();
       } else if (hasPipfile) {
         context.config.installCommand = this.pipenvInstall();
-      } else if (hasPoetry) {
+      } else if (hasPyproject) {
+        // Installs the project itself, which pulls its declared dependencies.
+        // This covers a normal packaged layout; a pyproject that declares no
+        // build backend, or a Poetry project with `package-mode = false`, has
+        // nothing to build and will fail here — loudly, at build time, which
+        // still beats the previous `poetry install` ("poetry: not found").
         context.config.installCommand = this.pipInstall('.');
       } else {
         // No dependency manifest found — still create an (empty) in-app-dir
