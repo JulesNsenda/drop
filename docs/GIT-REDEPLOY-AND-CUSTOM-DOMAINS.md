@@ -18,9 +18,29 @@ Both pull the configured branch and rebuild/restart the app.
 ### 2. GitHub webhook (auto-redeploy)
 
 Auto-redeploy is **webhook-driven only**. Pushing to GitHub does nothing until
-a webhook is configured on both ends:
+a webhook is configured on both ends.
 
-**Server side (once per platform):**
+**Dashboard (recommended, once per platform):**
+
+1. **Settings → Git webhooks** (admin-only) → **Generate secret** — the value
+   is shown **once**; copy it immediately before leaving the page. Already
+   have a secret you'd rather reuse? Use **Use my own secret** instead.
+2. Copy the **Payload URL** shown on the same page.
+3. On GitHub: repo → *Settings* → *Webhooks* → *Add webhook* → paste the
+   payload URL, set **Content type** to `application/json`, paste the secret,
+   and subscribe to **just the push event**.
+
+Changes take effect **immediately** — no `systemctl restart drop`, no SSH
+session. The same page also shows the current status (configured from the
+dashboard, from the environment variable, or not configured) and lets you
+clear or regenerate the secret at any time.
+
+The payload URL is derived from the platform's **Public URL** setting
+(**Settings → Claude (MCP)**); if that isn't set yet, the dashboard falls back
+to your browser's current origin and hints at setting Public URL for the
+exact value — this matters most behind a reverse proxy.
+
+**Fallback for headless / bootstrap setups — `DROP_GITHUB_WEBHOOK_SECRET`:**
 
 ```bash
 # generate a secret
@@ -33,19 +53,24 @@ DROP_GITHUB_WEBHOOK_SECRET=<the generated value>
 systemctl restart drop
 ```
 
-The webhook endpoint is **fail-closed**: while `DROP_GITHUB_WEBHOOK_SECRET` is
-unset, `POST /api/v1/git/webhook` answers `503` and no auto-redeploy can
-happen, even if GitHub is already sending events.
+**Precedence**: a secret stored via the dashboard always takes precedence over
+`DROP_GITHUB_WEBHOOK_SECRET`. The dashboard's status line reports which source
+is currently in effect, and warns before generating or setting a new secret
+while the environment variable is the active source, since doing so moves the
+secret off the environment and onto disk (the stored value then wins from
+then on).
 
-**GitHub side (once per repository):**
+The webhook endpoint is **fail-closed**: while neither a stored secret nor
+`DROP_GITHUB_WEBHOOK_SECRET` is set, `POST /api/v1/git/webhook` answers `503`
+and no auto-redeploy can happen, even if GitHub is already sending events.
 
-Repo → *Settings* → *Webhooks* → *Add webhook*:
+**GitHub webhook fields, for reference:**
 
 | Field | Value |
 |---|---|
-| Payload URL | `https://<your-platform-domain>/api/v1/git/webhook` |
+| Payload URL | shown on **Settings → Git webhooks** (or `https://<your-platform-domain>/api/v1/git/webhook`) |
 | Content type | `application/json` |
-| Secret | the same `DROP_GITHUB_WEBHOOK_SECRET` value |
+| Secret | the secret from **Settings → Git webhooks** (or `DROP_GITHUB_WEBHOOK_SECRET`) |
 | Events | *Just the push event* |
 
 Signatures are verified from the `X-Hub-Signature-256` header

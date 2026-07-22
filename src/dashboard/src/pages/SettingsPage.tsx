@@ -22,10 +22,12 @@ import {
   KeyRound,
   LucideIcon,
   Plug,
+  GitBranch,
 } from 'lucide-react';
 import Tabs, { TabDef } from '../components/Tabs';
 import ApiKeysTab from '../components/ApiKeysTab';
 import McpConnectorTab from '../components/McpConnectorTab';
+import GitWebhooksTab from '../components/GitWebhooksTab';
 import Button from '../components/ui/Button';
 import Card from '../components/ui/Card';
 import Input from '../components/ui/Input';
@@ -317,6 +319,7 @@ function SettingsPage() {
     tabs.push({ id: 'account', label: 'Account', icon: Lock });
     if (isAdmin) tabs.push({ id: 'api-keys', label: 'API Keys', icon: KeyRound });
     if (isAdmin) tabs.push({ id: 'mcp-connector', label: 'Claude (MCP)', icon: Plug });
+    if (isAdmin) tabs.push({ id: 'git-webhooks', label: 'Git webhooks', icon: GitBranch });
     if (isAdmin) tabs.push({ id: 'activity', label: 'Activity', icon: Clock });
     tabs.push({ id: 'about', label: 'About', icon: Info });
     return tabs;
@@ -839,6 +842,9 @@ function SettingsPage() {
 
       {/* Claude (MCP) connector tab (admin only) */}
       {isAdmin && activeTab === 'mcp-connector' && <McpConnectorTab />}
+
+      {/* Git webhooks tab (admin only) */}
+      {isAdmin && activeTab === 'git-webhooks' && <GitWebhooksTab />}
 
       {/* Activity tab (admin only) */}
       {isAdmin && activeTab === 'activity' && (
