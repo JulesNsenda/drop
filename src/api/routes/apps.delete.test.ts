@@ -364,6 +364,44 @@ describe('DELETE /api/v1/apps/:name — group-aware (M4)', () => {
       expect(res.status).toBe(200);
       expect(getStateManager().getApp('grp-repo')).toBeUndefined();
     });
+
+    // IDOR guards: group tags are tenant-influenced (drop.yaml group:/name:),
+    // so a crafted group-name collision must never let one user's delete reach
+    // another user's container entry/folder.
+    it("404s a group-name DELETE when a colliding container belongs to someone else", async () => {
+      setPlatformOps(makeOps({ removeGroup }));
+      const victim = await createUser('victim-owner', 'password123', 'user');
+      const sm = getStateManager();
+      await sm.updateApp('grp-repo', { userId: victim.id });
+
+      const res = await hono.request('/api/v1/apps/grp', {
+        method: 'DELETE',
+        headers: authHeader(ownerToken),
+      });
+
+      expect(res.status).toBe(404);
+      expect(removeGroup).not.toHaveBeenCalled();
+    });
+
+    it("last-child delete does NOT cascade into another user's colliding container", async () => {
+      setPlatformOps(makeOps({ removeGroup }));
+      const victim = await createUser('victim-owner2', 'password123', 'user');
+      const sm = getStateManager();
+      await sm.updateApp('grp-repo', { userId: victim.id });
+
+      await hono.request('/api/v1/apps/grp-backend', {
+        method: 'DELETE',
+        headers: authHeader(ownerToken),
+      });
+      const res = await hono.request('/api/v1/apps/grp-frontend', {
+        method: 'DELETE',
+        headers: authHeader(ownerToken),
+      });
+
+      // The requester's own children are gone, but the foreign container survives.
+      expect(res.status).toBe(200);
+      expect(getStateManager().getApp('grp-repo')).toBeDefined();
+    });
   });
 });
 
