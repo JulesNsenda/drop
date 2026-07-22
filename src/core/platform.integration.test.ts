@@ -167,6 +167,32 @@ describe('Platform integration (P2-1)', () => {
     platform = null;
   }, 20000);
 
+  // DROP-061 M1 hardening: data/drop-svc/ (settings.json, secrets.json,
+  // encryption.key, ...) can hold plaintext secrets (e.g. the GitHub webhook
+  // HMAC secret) and must not be world-traversable — the 0700 dir-mode half
+  // of the settings.json 0600 file-mode hardening (see
+  // settings-manager.test.ts's `itPosix` pair for the file-mode half).
+  // Existence is asserted unconditionally so a wrong-path regression is
+  // caught on every platform, not just POSIX.
+  it('creates data/drop-svc/ (platform state) after start()', async () => {
+    platform = makePlatform();
+    await platform.start();
+
+    const stats = await fs.stat(path.join(tempDir, 'data', 'drop-svc'));
+    expect(stats.isDirectory()).toBe(true);
+  }, 20000);
+
+  // POSIX mode bits aren't meaningful on Windows (no chmod-style ACL model).
+  const itPosix = process.platform === 'win32' ? it.skip : it;
+
+  itPosix('hardens data/drop-svc/ (platform state) to mode 0700', async () => {
+    platform = makePlatform();
+    await platform.start();
+
+    const stats = await fs.stat(path.join(tempDir, 'data', 'drop-svc'));
+    expect(stats.mode & 0o777).toBe(0o700);
+  }, 20000);
+
   // Scenario 1: deploy happy path — the full real chain (detect → build →
   // start → runtime) driven by an app:detected event.
   it('deploys a dropped static app end-to-end', async () => {

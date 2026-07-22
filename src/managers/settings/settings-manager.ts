@@ -2,10 +2,11 @@
  * Platform Settings Manager
  *
  * Small JSON file-based store for platform-level settings that are safe to
- * change at runtime without a restart. Currently holds a single field — an
- * admin-set override for the public base URL (DROP_PUBLIC_URL), which
- * doubles as the OAuth issuer (PRD-041) — but the shape is deliberately
- * extensible for future platform settings.
+ * change at runtime without a restart. Holds an admin-set override for the
+ * public base URL (DROP_PUBLIC_URL), which doubles as the OAuth issuer
+ * (PRD-041), and an admin-set GitHub webhook HMAC secret
+ * (DROP_GITHUB_WEBHOOK_SECRET) — but the shape is deliberately extensible
+ * for future platform settings.
  *
  * Kept separate from AppStateManager/AppConfigService (app-scoped state):
  * this is genuinely platform-scoped.
@@ -28,6 +29,8 @@ import { writeJsonAtomic } from '../../utils/atomic-write';
 export interface PlatformSettings {
   /** Admin-set public base URL override (falls back to DROP_PUBLIC_URL env when unset). */
   publicUrl?: string;
+  /** Admin-set GitHub webhook HMAC secret (falls back to DROP_GITHUB_WEBHOOK_SECRET env when unset). */
+  githubWebhookSecret?: string;
 }
 
 export interface SettingsManagerConfig {
@@ -46,7 +49,14 @@ function parseSettings(raw: string): PlatformSettings {
   const parsed = JSON.parse(raw);
   if (!parsed || typeof parsed !== 'object') return {};
   const publicUrl = (parsed as Record<string, unknown>).publicUrl;
-  return { publicUrl: typeof publicUrl === 'string' ? publicUrl : undefined };
+  const githubWebhookSecret = (parsed as Record<string, unknown>).githubWebhookSecret;
+  return {
+    publicUrl: typeof publicUrl === 'string' ? publicUrl : undefined,
+    githubWebhookSecret:
+      typeof githubWebhookSecret === 'string' && githubWebhookSecret.length > 0
+        ? githubWebhookSecret
+        : undefined,
+  };
 }
 
 export class SettingsManager {
@@ -104,10 +114,31 @@ export class SettingsManager {
     this.settings = next;
   }
 
+  /** Never returns '' — an empty string is treated as "not configured". */
+  getGithubWebhookSecret(): string | undefined {
+    return this.settings.githubWebhookSecret || undefined;
+  }
+
+  /** Set (or, with `undefined`/empty/whitespace-only, clear) the stored GitHub webhook secret. Persists atomically. */
+  async setGithubWebhookSecret(secret: string | undefined): Promise<void> {
+    const trimmed = secret?.trim();
+    const normalized = trimmed ? trimmed : undefined;
+    const next: PlatformSettings = { ...this.settings, githubWebhookSecret: normalized };
+    // Same persist-then-commit-in-memory shape as setPublicUrl above — see
+    // that method's comment for why this isn't queued through a chained
+    // savePromise.
+    await this.doSave(next);
+    this.settings = next;
+  }
+
   private async doSave(next: PlatformSettings): Promise<void> {
     const dir = path.dirname(this.settingsFilePath);
     await fs.mkdir(dir, { recursive: true });
-    await writeJsonAtomic(this.settingsFilePath, next);
+    // Mode 0600: this store holds the GitHub webhook secret in plaintext at
+    // rest (a deliberate choice — an HMAC secret must stay recoverable) —
+    // match the other security-adjacent stores (secrets.json,
+    // api-credentials.json, webhooks.json) instead of inheriting umask.
+    await writeJsonAtomic(this.settingsFilePath, next, { mode: 0o600 });
   }
 
   async close(): Promise<void> {
