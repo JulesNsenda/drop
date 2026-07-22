@@ -14,7 +14,7 @@ import {
 } from 'lucide-react';
 import { useToast } from '../components/Toast';
 import { useConfirm } from '../components/ConfirmDialog';
-import { getAuthHeaders } from '../hooks/useAuth';
+import { getAuthHeaders, useAuth } from '../hooks/useAuth';
 import {
   gitDeploy,
   getGitTokens,
@@ -47,6 +47,7 @@ function DeployPage() {
   const confirmDialog = useConfirm();
   const navigate = useNavigate();
   const { health } = useHealth();
+  const { role } = useAuth();
 
   // Build the "deploy via filesystem" hint from the SERVER's OS and webapps
   // directory (reported by /health), not the browser's — the dashboard is
@@ -462,11 +463,20 @@ function DeployPage() {
             </label>
           </div>
           <p className="-mt-2 text-xs" style={{ color: 'var(--text-3)' }}>
-            Requires a webhook secret — configure one in{' '}
-            <Link to="/settings?tab=git-webhooks" className="underline">
-              Settings &rarr; Git webhooks
-            </Link>
-            .
+            {/* The Git webhooks settings tab is admin-only — don't deep-link
+                non-admins to a tab they can't open (SettingsPage would
+                silently fall back to the Account tab). */}
+            {role === 'admin' ? (
+              <>
+                Requires a webhook secret — configure one in{' '}
+                <Link to="/settings?tab=git-webhooks" className="underline">
+                  Settings &rarr; Git webhooks
+                </Link>
+                .
+              </>
+            ) : (
+              <>Requires a webhook secret — ask an admin to configure one in Settings.</>
+            )}
           </p>
 
           {/* Deploy button */}

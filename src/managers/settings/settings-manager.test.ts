@@ -155,6 +155,16 @@ describe('SettingsManager', () => {
       expect(manager.getGithubWebhookSecret()).toBeUndefined();
     });
 
+    it('stores a padded value trimmed (a padded string would fail HMAC verification against the GitHub-side secret)', async () => {
+      await manager.setGithubWebhookSecret('  padded-secret-value  ');
+      expect(manager.getGithubWebhookSecret()).toBe('padded-secret-value');
+
+      const reloaded = new SettingsManager({ settingsFilePath });
+      await reloaded.load();
+      expect(reloaded.getGithubWebhookSecret()).toBe('padded-secret-value');
+      await reloaded.close();
+    });
+
     it('loads a hand-written empty-string value from disk as undefined', async () => {
       await fs.mkdir(path.dirname(settingsFilePath), { recursive: true });
       await fs.writeFile(settingsFilePath, JSON.stringify({ githubWebhookSecret: '' }));

@@ -265,8 +265,13 @@ admin.post('/settings/github-webhook-secret/generate', async (c) => {
 // echoed back, in either the success or the validation-error response.
 admin.put('/settings/github-webhook-secret', async (c) => {
   const authCtx = (c.get as Function)('auth') as AuthContext | undefined;
-  const body = (await c.req.json()) as { secret?: unknown };
-  const input = body.secret;
+  const body = (await c.req.json()) as unknown;
+
+  if (typeof body !== 'object' || body === null || Array.isArray(body)) {
+    return c.json(error(ErrorCodes.VALIDATION_ERROR, 'Request body must be a JSON object'), 400);
+  }
+
+  const input = (body as { secret?: unknown }).secret;
 
   if (input === null || input === undefined || (typeof input === 'string' && input.trim() === '')) {
     await getSettingsManager().setGithubWebhookSecret(undefined);
