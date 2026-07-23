@@ -2232,6 +2232,118 @@ describe('expandMonorepo (M2: monorepo -> per-service app expansion)', () => {
       expect(call.upstream).toBe('localhost:4002');
     });
 
+    it('persists the resolved group publicUrl (frontend → group root) so the dashboard links to the routed address', async () => {
+      const childName = 'ezsign-frontend';
+      const childPath = path.join(appsDir, childName);
+      await fsPromises.mkdir(childPath, { recursive: true });
+      await fsPromises.writeFile(
+        path.join(childPath, 'drop.yaml'),
+        'name: ezsign-frontend\nroute:\n  path: /\n'
+      );
+
+      // A real (non-localhost) suffix so there is an external URL to persist.
+      (platform as any).config.domainSuffix = 'dropkit.sh';
+      (platform as any).config.enableHttps = true;
+      const updateConfig = jest.fn().mockResolvedValue(undefined);
+      (platform as any).router = { addRoute: jest.fn().mockResolvedValue(undefined) };
+      (platform as any).appConfigService = {
+        getConfig: jest.fn().mockReturnValue({ group: 'ezsign' }),
+        updateConfig,
+      };
+      (platform as any).caddyServer = undefined;
+
+      await (platform as any).handleConfigureRoute(childName, 4004);
+
+      expect(updateConfig).toHaveBeenCalledWith(childName, { publicUrl: 'https://ezsign.dropkit.sh' });
+    });
+
+    it('persists the group publicUrl WITH the route path for a path-prefixed backend child', async () => {
+      const childName = 'ezsign-backend';
+      const childPath = path.join(appsDir, childName);
+      await fsPromises.mkdir(childPath, { recursive: true });
+      await fsPromises.writeFile(
+        path.join(childPath, 'drop.yaml'),
+        'name: ezsign-backend\nroute:\n  path: /api\n'
+      );
+
+      (platform as any).config.domainSuffix = 'dropkit.sh';
+      (platform as any).config.enableHttps = true;
+      const updateConfig = jest.fn().mockResolvedValue(undefined);
+      (platform as any).router = { addRoute: jest.fn().mockResolvedValue(undefined) };
+      (platform as any).appConfigService = {
+        getConfig: jest.fn().mockReturnValue({ group: 'ezsign' }),
+        updateConfig,
+      };
+      (platform as any).caddyServer = undefined;
+
+      await (platform as any).handleConfigureRoute(childName, 4005);
+
+      expect(updateConfig).toHaveBeenCalledWith(childName, { publicUrl: 'https://ezsign.dropkit.sh/api' });
+    });
+
+    it('does NOT persist a publicUrl for a standalone (non-group) app with none already', async () => {
+      (platform as any).config.domainSuffix = 'dropkit.sh';
+      (platform as any).config.enableHttps = true;
+      const updateConfig = jest.fn().mockResolvedValue(undefined);
+      (platform as any).router = { addRoute: jest.fn().mockResolvedValue(undefined) };
+      (platform as any).appConfigService = {
+        getConfig: jest.fn().mockReturnValue(undefined),
+        updateConfig,
+      };
+      (platform as any).caddyServer = undefined;
+
+      await (platform as any).handleConfigureRoute('solo-app', 4006);
+
+      // Nothing to reconcile (no existing publicUrl, not same-origin) → no write.
+      expect(updateConfig).not.toHaveBeenCalled();
+    });
+
+    it('CLEARS a stale publicUrl when the app is no longer same-origin (route/domains changed)', async () => {
+      // Reachable without hand-editing: a grouped child adds a custom domain
+      // that the hijack guard rejects (persisted as domains:[]), so it now
+      // serves at its own subdomain — the stale group publicUrl must not linger
+      // and mislink to a sibling's app.
+      (platform as any).config.domainSuffix = 'dropkit.sh';
+      (platform as any).config.enableHttps = true;
+      const updateConfig = jest.fn().mockResolvedValue(undefined);
+      (platform as any).router = { addRoute: jest.fn().mockResolvedValue(undefined) };
+      (platform as any).appConfigService = {
+        // No `route` on disk (no drop.yaml) → not same-origin this run, but a
+        // stale publicUrl from a previous same-origin run is present.
+        getConfig: jest.fn().mockReturnValue({ group: 'ezsign', publicUrl: 'https://ezsign.dropkit.sh' }),
+        updateConfig,
+      };
+      (platform as any).caddyServer = undefined;
+
+      await (platform as any).handleConfigureRoute('ezsign-frontend', 4007);
+
+      expect(updateConfig).toHaveBeenCalledWith('ezsign-frontend', { publicUrl: undefined });
+    });
+
+    it('strips a wildcard route.path so the publicUrl has no Caddy "*"', async () => {
+      const childName = 'ezsign-backend';
+      const childPath = path.join(appsDir, childName);
+      await fsPromises.mkdir(childPath, { recursive: true });
+      await fsPromises.writeFile(
+        path.join(childPath, 'drop.yaml'),
+        'name: ezsign-backend\nroute:\n  path: /api*\n'
+      );
+
+      (platform as any).config.domainSuffix = 'dropkit.sh';
+      (platform as any).config.enableHttps = true;
+      const updateConfig = jest.fn().mockResolvedValue(undefined);
+      (platform as any).router = { addRoute: jest.fn().mockResolvedValue(undefined) };
+      (platform as any).appConfigService = {
+        getConfig: jest.fn().mockReturnValue({ group: 'ezsign' }),
+        updateConfig,
+      };
+      (platform as any).caddyServer = undefined;
+
+      await (platform as any).handleConfigureRoute(childName, 4008);
+
+      expect(updateConfig).toHaveBeenCalledWith(childName, { publicUrl: 'https://ezsign.dropkit.sh/api' });
+    });
+
     it('routes a standalone app (no group) to its own default hostname with no path prefix', async () => {
       const appName = 'solo-app';
       // Deliberately no drop.yaml on disk for this app — parseDropYaml should

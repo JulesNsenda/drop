@@ -41,6 +41,18 @@ export interface AppConfig {
   dataDir?: string;
   /** Custom domains for this app (from drop.yaml) */
   domains?: string[];
+  /**
+   * The effective public URL for a same-origin monorepo child (the group
+   * domain plus the service's route path — e.g. `https://ezsign.dropkit.sh`
+   * for the frontend, `https://ezsign.dropkit.sh/api` for the backend). Set by
+   * platform.handleConfigureRoute at route-configuration time, because that is
+   * the one place that knows a child is routed onto the group host rather than
+   * its own `<name>` subdomain. Absent for standalone apps and for group
+   * children that declare their own `domains` (those use the name/domain-based
+   * URL). computeAppUrl returns this so the dashboard links to the address that
+   * is actually routed, not a dead `<name>.<suffix>`.
+   */
+  publicUrl?: string;
   /** Custom TLS configuration */
   tls?: {
     certFile?: string;
