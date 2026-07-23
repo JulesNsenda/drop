@@ -128,6 +128,54 @@ describe('DropPlatform readiness gate (M3)', () => {
 
       expect(result).toEqual({ ok: true });
     });
+
+    // Regression: a healthy app that simply booted slower than the window was
+    // declared failed. Reproduced live as a Node app that listens after 25s —
+    // build fine, process alive, URL serving 200, deploy reported 'errored'.
+    // At the deadline "still booting" and "hung" are indistinguishable, so the
+    // gate must not convict a process that never died and never crash-looped;
+    // only the two fail-fast paths above are real failures.
+    it('does not error a slow-booting app that is alive and has never crash-looped', async () => {
+      (platform as any).config.isolation = 'docker'; // the stricter branch: a bind alone is not proof
+      (platform as any).readinessTimeoutMs = 150;
+      (platform as any).runtime = {
+        getStatus: jest.fn().mockResolvedValue({ status: 'running', restarts: 0 }),
+      };
+      const port = 48103; // still booting — nothing listening yet
+
+      const result = await (platform as any).awaitReadiness(
+        'slowapp',
+        port,
+        minimalSpec({ name: 'slowapp', port, healthCheckPath: '/' })
+      );
+
+      expect(result.ok).toBe(true);
+      expect(result.reason).toBeUndefined();
+      expect(result.warning).toMatch(/slow start/);
+    });
+
+    it.each([
+      ['exited', { status: 'stopped', restarts: 0 }, /exited/],
+      ['crash-looped', { status: 'running', restarts: 5 }, /crash-looped/],
+    ])('still fails a process that %s, rather than waiting it out', async (_label, status, reason) => {
+      (platform as any).config.isolation = 'docker';
+      (platform as any).readinessTimeoutMs = 150;
+      (platform as any).runtime = {
+        getStatus: jest
+          .fn()
+          .mockResolvedValueOnce({ status: 'running', restarts: 0 }) // baseline
+          .mockResolvedValue(status),
+      };
+
+      const result = await (platform as any).awaitReadiness(
+        'badapp',
+        48104,
+        minimalSpec({ name: 'badapp', port: 48104, healthCheckPath: '/' })
+      );
+
+      expect(result.ok).toBe(false);
+      expect(result.reason).toMatch(reason);
+    });
   });
 
   describe('startCrashLoopWatch / stopCrashLoopWatch', () => {
