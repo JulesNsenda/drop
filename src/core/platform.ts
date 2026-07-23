@@ -2332,16 +2332,23 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       // frontend's root address (identical addresses would wedge Caddy's
       // reload). A child that also declares custom `domains` opts out of this.
       let routePathPrefix: string | undefined;
+      // The path portion of the child's public URL, set ONLY for a same-origin
+      // group child: '' when it serves the group root (frontend), '/api' etc.
+      // for a path-prefixed sibling (backend). `undefined` means "not a
+      // same-origin child" — leave the name/domain-based URL alone.
+      let sameOriginPublicPath: string | undefined;
       const appConfig = this.appConfigService?.getConfig(appName);
       const routeCfg = dropYaml.success ? dropYaml.config?.route : undefined;
       if (appConfig?.group && routeCfg && !hasCustomDomains) {
         domains = [`${appConfig.group}.${domainSuffix}`];
+        sameOriginPublicPath = '';
         const rp = routeCfg.path?.trim();
         if (rp && rp !== '/') {
           const prefix = (rp.startsWith('/') ? rp : `/${rp}`).replace(/\/+$/, '');
           // Caddy site-address path matcher: `<host>/api*` matches `/api` and
           // `/api/...`. No prefix stripping — the backend owns its `/api` path.
           routePathPrefix = prefix.endsWith('*') ? prefix : `${prefix}*`;
+          sameOriginPublicPath = prefix; // the display path, without the '*'
           if (routeCfg.strip) {
             this.logger.warn(
               `route.strip requested for ${appName} but prefix-stripping (Caddy handle_path) ` +
@@ -2398,6 +2405,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           : undefined;
 
       // Configure route for each domain
+      let resolvedPublicUrl: string | undefined;
       for (const hostname of domains) {
         const isLocalhost = isLocalhostDomain(hostname);
         const enableSsl = this.config.enableHttps && !isLocalhost && !dropYaml.config?.tls?.disabled;
@@ -2419,11 +2427,27 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         const protocol = enableSsl ? 'https' : 'http';
         const caddyAvailable = this.caddyServer?.getStatus() === 'running';
 
+        // A same-origin group child is routed onto exactly this one group host;
+        // capture the real, fully-resolved public URL (proto + host + route
+        // path) so computeAppUrl can hand the dashboard a link that is actually
+        // routed. Skip localhost — there is no external URL there, and the
+        // dashboard's host:port fallback covers dev.
+        if (sameOriginPublicPath !== undefined && !isLocalhost) {
+          resolvedPublicUrl = `${protocol}://${hostname}${sameOriginPublicPath}`;
+        }
+
         if (caddyAvailable) {
           this.logger.info(`Route configured: ${protocol}://${hostname} -> localhost:${port}`, 'ROUTER');
         } else {
           this.logger.info(`Route configured: localhost:${port} (Caddy unavailable for ${hostname})`, 'ROUTER');
         }
+      }
+
+      // Persist the resolved group URL so the dashboard/API stop showing the
+      // dead `<name>.<suffix>` default for a same-origin child. Re-runs on every
+      // start/redeploy, so a changed group/route path stays current.
+      if (this.appConfigService && resolvedPublicUrl) {
+        await this.appConfigService.updateConfig(appName, { publicUrl: resolvedPublicUrl });
       }
 
       // Reload Caddy to apply new routes

@@ -28,7 +28,7 @@ function makeApp(over: Partial<AppState> = {}): AppState {
   return { name: 'waitlist', ...over } as AppState;
 }
 
-function withConfig(cfg: { domains?: string[]; tls?: { disabled?: boolean } }): void {
+function withConfig(cfg: { domains?: string[]; tls?: { disabled?: boolean }; publicUrl?: string }): void {
   mockConfigService.mockReturnValue({ getConfig: () => cfg });
 }
 
@@ -75,5 +75,36 @@ describe('computeAppUrl', () => {
   it('serves http when the app disables TLS in drop.yaml, even on an HTTPS box', () => {
     withConfig({ domains: ['declared.example.com'], tls: { disabled: true } });
     expect(computeAppUrl(makeApp())).toBe('http://declared.example.com');
+  });
+
+  // Same-origin monorepo children: the child serves on the GROUP domain, never
+  // its own `<name>` subdomain, so the name-based default is a dead link (the
+  // reported bug — the dashboard showed ezsign-frontend.dropkit.sh, which has no
+  // route/cert). handleConfigureRoute persists the real URL as publicUrl.
+  it('returns the persisted group publicUrl for a same-origin frontend child', () => {
+    withConfig({ publicUrl: 'https://ezsign.dropkit.sh' });
+    expect(computeAppUrl(makeApp({ name: 'ezsign-frontend' }))).toBe('https://ezsign.dropkit.sh');
+  });
+
+  it('returns the group publicUrl WITH its route path for a backend child', () => {
+    withConfig({ publicUrl: 'https://ezsign.dropkit.sh/api' });
+    expect(computeAppUrl(makeApp({ name: 'ezsign-backend' }))).toBe('https://ezsign.dropkit.sh/api');
+  });
+
+  it('lets a dashboard-set customDomain override a persisted publicUrl', () => {
+    withConfig({ publicUrl: 'https://ezsign.dropkit.sh' });
+    expect(computeAppUrl(makeApp({ name: 'ezsign-frontend', customDomain: 'app.example.org' }))).toBe(
+      'https://app.example.org'
+    );
+  });
+
+  it('lets an explicit drop.yaml domain override a persisted publicUrl', () => {
+    withConfig({ domains: ['declared.example.com'], publicUrl: 'https://ezsign.dropkit.sh' });
+    expect(computeAppUrl(makeApp({ name: 'ezsign-frontend' }))).toBe('https://declared.example.com');
+  });
+
+  it('is unaffected for a standalone app (no publicUrl) — still the name-based default', () => {
+    withConfig({});
+    expect(computeAppUrl(makeApp())).toBe('https://waitlist.dropkit.sh');
   });
 });
