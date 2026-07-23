@@ -100,12 +100,22 @@ function resolveUsername(userId?: string): string | undefined {
 export function computeAppUrl(app: AppState): string | undefined {
   let configDomains: string[] | undefined;
   let tlsDisabled = false;
+  let publicUrl: string | undefined;
   try {
     const cfg = getAppConfigService().getConfig(app.name);
     configDomains = cfg?.domains;
     tlsDisabled = cfg?.tls?.disabled === true;
+    publicUrl = cfg?.publicUrl;
   } catch {
     // Config service not initialised (e.g. isolated route tests) — use default host.
+  }
+  // A same-origin monorepo child is routed onto the group domain (frontend at
+  // '/', backend at '/api'), never its own `<name>` subdomain — so the
+  // name-based default below would be a dead link. handleConfigureRoute persists
+  // the real, fully-resolved URL as publicUrl. A custom domain still wins:
+  // declaring `domains` opts the child out of same-origin routing.
+  if (publicUrl && !app.customDomain && !configDomains?.length) {
+    return publicUrl;
   }
   const domain = app.customDomain || configDomains?.[0] || `${app.name}.${getDomainSuffix()}`;
   if (isLocalhostDomain(domain)) return undefined;
