@@ -2348,7 +2348,8 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           // Caddy site-address path matcher: `<host>/api*` matches `/api` and
           // `/api/...`. No prefix stripping — the backend owns its `/api` path.
           routePathPrefix = prefix.endsWith('*') ? prefix : `${prefix}*`;
-          sameOriginPublicPath = prefix; // the display path, without the '*'
+          // Display path never carries the Caddy wildcard: `/api*` → `/api`.
+          sameOriginPublicPath = prefix.replace(/\*+$/, '');
           if (routeCfg.strip) {
             this.logger.warn(
               `route.strip requested for ${appName} but prefix-stripping (Caddy handle_path) ` +
@@ -2443,10 +2444,15 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         }
       }
 
-      // Persist the resolved group URL so the dashboard/API stop showing the
-      // dead `<name>.<suffix>` default for a same-origin child. Re-runs on every
-      // start/redeploy, so a changed group/route path stays current.
-      if (this.appConfigService && resolvedPublicUrl) {
+      // Reconcile the persisted group URL (not set-only). resolvedPublicUrl is
+      // the address actually routed this run, or undefined when the app is no
+      // longer a same-origin child (route removed, or custom domains added —
+      // including the `[]` left by a rejected custom domain). Writing it every
+      // time it CHANGES both fills the dashboard link for a group child and
+      // CLEARS a stale one, so computeAppUrl can never link to the group host
+      // for an app no longer served there (which would load a sibling's app).
+      // The change-guard avoids a config write per app on every start.
+      if (this.appConfigService && resolvedPublicUrl !== appConfig?.publicUrl) {
         await this.appConfigService.updateConfig(appName, { publicUrl: resolvedPublicUrl });
       }
 
