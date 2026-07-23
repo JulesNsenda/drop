@@ -291,10 +291,18 @@ export class DropPlatform {
   private readonly crashLoopWatchers: Map<string, ReturnType<typeof setInterval>> = new Map();
   /** Restart count (over one watch interval) at/above which a running app is flagged crash-looping. */
   private readonly CRASHLOOP_RESTART_THRESHOLD = 3;
-  /** Startup readiness window: how long handleStartApp waits for an app to come up before erroring. */
+  /**
+   * Startup readiness window: how long handleStartApp waits for an app to
+   * prove it is up. A process that dies or crash-loops fails immediately
+   * regardless, so this bounds only the ambiguous "still booting?" case —
+   * raising it delays no real failure. 20s was under the cold-start time of
+   * ordinary apps (migrations, large dependency graphs, connection warm-up).
+   * Keep below the MCP deploy wait (DEFAULT_DEPLOY_WAIT_MS, 120s) so
+   * deploy_files still reports an outcome rather than timing out.
+   */
   private readonly readinessTimeoutMs = Math.max(
     50,
-    Number(process.env.DROP_READINESS_TIMEOUT_MS) || 20_000
+    Number(process.env.DROP_READINESS_TIMEOUT_MS) || 60_000
   );
 
   constructor(config?: Partial<PlatformConfig>) {
@@ -2207,6 +2215,19 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       // A first-deploy failure resolves to 'errored' (never 'crash-looping'):
       // the deploy tracker closes an episode only on running|errored, so
       // 'errored' is what makes deploy_files report the failure honestly.
+      // Persist the port BEFORE the readiness verdict. The app config is the
+      // source of truth for port assignment across restarts, and this used to
+      // sit after the failure return — so an app that failed readiness kept a
+      // live process on a port nothing had recorded, and the next allocation
+      // was free to hand that same port to another app.
+      if (this.appConfigService) {
+        await this.appConfigService.updateConfig(appName, {
+          port,
+          dataDir,
+          lastDeployedAt: new Date().toISOString(),
+        });
+      }
+
       const readiness = await this.awaitReadiness(appName, port, spec);
       if (!readiness.ok) {
         this.logger.appEvent('error', appName, `readiness check failed: ${readiness.reason}`);
@@ -2221,13 +2242,11 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         return;
       }
 
-      // Save port and data directory to config file (source of truth for restarts)
-      if (this.appConfigService) {
-        await this.appConfigService.updateConfig(appName, {
-          port,
-          dataDir,
-          lastDeployedAt: new Date().toISOString(),
-        });
+      if (readiness.warning) {
+        this.logger.warn(
+          `${appName} did not prove ready before the deploy completed: ${readiness.warning}`,
+          'APP'
+        );
       }
 
       // Update state to running with port and pid
@@ -3081,7 +3100,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     appName: string,
     port: number,
     spec: AppStartSpec
-  ): Promise<{ ok: boolean; reason?: string }> {
+  ): Promise<{ ok: boolean; reason?: string; warning?: string }> {
     if (!this.runtime) return { ok: true };
     const windowMs = this.readinessTimeoutMs;
     const isDocker = this.config.isolation === 'docker';
@@ -3118,9 +3137,20 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     const bound = await probePort('127.0.0.1', port, 1000);
     if (!bound && !spec.healthCheckPath) return { ok: true }; // worker: no port, no health check
     if (bound && !isDocker) return { ok: true }; // PM2: a bind proves it's listening
+
+    // Alive, never crash-looped, but it didn't answer HTTP in time. At the
+    // deadline "still booting" and "hung" are indistinguishable, so this is a
+    // choice about which way to be wrong. Failing here declared healthy apps
+    // dead whenever they booted slower than the window (migrations, big
+    // dependency graphs, connection warm-up) — the deploy reported failure
+    // for an app that was seconds away from serving, and did so while the
+    // process kept running. Being wrong the other way shows the app as
+    // running and its URL answers late, which is self-evident and recovers on
+    // its own. Only a process that died or crash-looped is a real failure,
+    // and both return above, well before this point.
     return {
-      ok: false,
-      reason: `no HTTP response on :${port} within ${Math.round(windowMs / 1000)}s`,
+      ok: true,
+      warning: `no HTTP response on :${port} within ${Math.round(windowMs / 1000)}s — treating as slow start`,
     };
   }
 
