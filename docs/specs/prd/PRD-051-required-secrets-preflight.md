@@ -182,8 +182,32 @@ follow-up.
   restart for the first cut. Leaning event-driven, but an explicit restart is an
   acceptable v1 if the event wiring is fiddly.
 
-## 8. Changelog
+## 8. Implementation Notes (v1 delivered)
+
+- **Preflight lives in `buildStartSpec`** so the missing-check runs against the
+  *authoritative final env* (`providedKeys` = assembled env keys with non-empty
+  values) — no duplicating platform-var knowledge. It throws `AppNeedsConfigError`
+  (src/api/platform-ops.ts); `handleStartApp`/`restartApp` catch it and park.
+- **Generation** runs earlier in `buildStartSpec` and treats a secret as
+  "already provided" only if its stored value is **non-empty**, so a `generate`
+  secret sitting at `""` is regenerated rather than booting an empty key
+  (security review, medium).
+- **`secrets:` map capped at 50** entries to bound shared-store rewrites
+  (security review, low).
+- **Auto-retry (open question → resolved for v1): dashboard-driven.** The
+  `needs-config` banner's "Retry deploy" calls the existing restart, which
+  re-runs the preflight. CLI/MCP users set the secret then restart. Event-driven
+  auto-restart-on-secret-set is deferred.
+- **Deploy-tracker not touched.** A parked deploy leaves its episode
+  `in-progress` (superseded by the next deploy); MCP reads the app's live
+  `needs-config` status directly to avoid the 120s wait. **Follow-up:** a
+  terminal `needs-config` deploy stage so deploy history reflects the park.
+- **Deferred:** `.env.example` hinting; build-time (`build_env`) required
+  secrets; counting `needs-config` in `StatsDto`.
+
+## 9. Changelog
 
 | Date | Author | Changes |
 |------|--------|---------|
 | 2026-07-24 | jules | Initial draft |
+| 2026-07-24 | jules | v1 implemented (commits 6f2eb06, 00bfa54, bbfe3e8); security review applied; notes added |
