@@ -63,14 +63,14 @@ async function seedPgDumpBinary(dropRoot: string): Promise<void> {
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 /** Inject credentials directly (bypasses provisionAppDatabase) for fast unit tests. */
-function injectCredentials(provisioner: DatabaseProvisioner, appName: string) {
+function injectCredentials(provisioner: DatabaseProvisioner, appName: string, password = 'testpassword') {
   const creds = {
     host: 'localhost',
     port: 5433,
     database: `drop_${appName}`,
     user: `drop_${appName}_user`,
-    password: 'testpassword',
-    connectionString: `postgresql://drop_${appName}_user:testpassword@localhost:5433/drop_${appName}`,
+    password,
+    connectionString: `postgresql://drop_${appName}_user:${encodeURIComponent(password)}@localhost:5433/drop_${appName}`,
   };
   (provisioner as any).provisionedDatabases.set(appName, {
     appName,
@@ -138,7 +138,7 @@ describe('DatabaseProvisioner.getEnvVars', () => {
     expect(provisioner.getEnvVars('ghost', { pgHost: 'host-gateway' })).toBeNull();
   });
 
-  it('returns socket-based DATABASE_URL when pgSocketDir is provided', () => {
+  it('returns a WHATWG-parseable socket DATABASE_URL when pgSocketDir is provided (DROP-066)', () => {
     injectCredentials(provisioner, 'myapp');
     const vars = provisioner.getEnvVars('myapp', { pgSocketDir: '/var/drop/data/db/pgdata' });
 
@@ -146,25 +146,59 @@ describe('DatabaseProvisioner.getEnvVars', () => {
     // PGHOST must be the socket dir so libpq uses a unix domain socket.
     expect(vars!['PGHOST']).toBe('/var/drop/data/db/pgdata');
     expect(vars!['DB_HOST']).toBe('/var/drop/data/db/pgdata');
-    // DATABASE_URL must NOT contain a TCP host (@hostname:) — it uses the
-    // ?host=<socketDir> query param form that libpq understands.
-    expect(vars!['DATABASE_URL']).not.toContain('@localhost:');
-    expect(vars!['DATABASE_URL']).toContain('?host=');
-    expect(vars!['DATABASE_URL']).toContain('5433');
+
+    // Regression (DROP-066): the socket DATABASE_URL MUST be parseable by the
+    // WHATWG URL constructor. The old `postgresql://user:pw/db?host=<dir>&port=`
+    // form had NO '@', so `new URL()` threw ERR_INVALID_URL and crash-looped
+    // every Node app that validates DATABASE_URL at startup. The socket dir now
+    // lives, percent-encoded, in the host (authority) position — no dangling
+    // `?host=` query form.
+    const url = vars!['DATABASE_URL'];
+    expect(() => new URL(url)).not.toThrow();
+    expect(url).toContain('@');
+    expect(url).not.toContain('?host=');
+    // A consumer that decodes the host (pg-connection-string, psycopg, libpq)
+    // recovers the socket path; the `:<port>` selects the .s.PGSQL.<port> file.
+    expect(decodeURIComponent(new URL(url).hostname)).toBe('/var/drop/data/db/pgdata');
+    expect(new URL(url).port).toBe('5433');
   });
 
   it('socket DATABASE_URL preserves user, password, port, dbname', () => {
     injectCredentials(provisioner, 'myapp');
     const vars = provisioner.getEnvVars('myapp', { pgSocketDir: '/var/drop/data/db/pgdata' });
 
-    // Parse only the non-query part (user:pw/db)
-    const url = vars!['DATABASE_URL'];
-    expect(url).toContain('drop_myapp_user:');
-    expect(url).toContain('/drop_myapp');
+    // Parse the way `pg` / `node-pg-migrate` do at runtime (decode encoding).
+    const url = new URL(vars!['DATABASE_URL']);
+    expect(url.protocol).toBe('postgresql:');
+    expect(url.username).toBe('drop_myapp_user');
+    expect(decodeURIComponent(url.password)).toBe('testpassword');
+    expect(decodeURIComponent(url.hostname)).toBe('/var/drop/data/db/pgdata');
+    expect(url.port).toBe('5433');
+    expect(url.pathname).toBe('/drop_myapp');
+
+    // Discrete libpq vars stay aligned for apps that read them directly.
     expect(vars!['PGPORT']).toBe('5433');
     expect(vars!['PGUSER']).toBe('drop_myapp_user');
     expect(vars!['PGPASSWORD']).toBe('testpassword');
     expect(vars!['PGDATABASE']).toBe('drop_myapp');
+  });
+
+  it('socket DATABASE_URL survives a URL-hostile password (DROP-066)', () => {
+    // '@', '/', '#', ':' and space in the password would corrupt the authority
+    // if they leaked in raw — putting the password directly before '@<host>' in
+    // the new form makes correct percent-encoding essential.
+    const hostile = 'p@ss/w#rd:x y';
+    injectCredentials(provisioner, 'hostileapp', hostile);
+    const vars = provisioner.getEnvVars('hostileapp', { pgSocketDir: '/var/drop/data/db/pgdata' });
+
+    const raw = vars!['DATABASE_URL'];
+    expect(() => new URL(raw)).not.toThrow();
+    const url = new URL(raw);
+    expect(decodeURIComponent(url.password)).toBe(hostile);
+    expect(decodeURIComponent(url.hostname)).toBe('/var/drop/data/db/pgdata');
+    expect(url.pathname).toBe('/drop_hostileapp');
+    // The raw password characters must not appear unescaped in the URL.
+    expect(raw).not.toContain('p@ss');
   });
 
   it('returns null with pgSocketDir opt when app is unknown', () => {
