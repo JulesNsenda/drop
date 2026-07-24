@@ -1,9 +1,14 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">
-  <!-- Matches the in-app LogoMark (AppShell.tsx): an accent droplet — a square
-       with border-radius 50% 50% 50% 3px, rotated 45deg. Tracks the theme like
-       --accent (light #0a84e0 / dark #2e9bfe); the fill attribute is the
-       fallback for renderers that ignore the internal stylesheet. -->
+  <!-- DROP logo mark. A faithful vector of the in-app CSS LogoMark
+       (AppShell.tsx / SiteNav.tsx / .dui-auth-logo): a rounded square with three
+       fully-round corners and one near-sharp corner (border-radius:
+       50% 50% 50% 3px), rotated 45deg into a droplet. The square is inset to
+       16..84 so the 45deg-rotated shape (and its point) fit the viewBox without
+       clipping. The earlier path rounded that point away, so the mark read as a
+       blob rather than a droplet. Fill tracks the accent color like the CSS
+       mark (light #0a84e0 / dark #2e9bfe); the fill attribute is the fallback
+       for renderers that ignore the internal stylesheet. -->
   <style>@media (prefers-color-scheme: dark){ path { fill: #2e9bfe; } }</style>
   <path transform="rotate(45 50 50)" fill="#0a84e0"
-        d="M50 20 Q80 20 80 50 Q80 80 50 80 L29 80 Q20 80 20 71 L20 50 Q20 20 50 20 Z"/>
+        d="M50 16 A34 34 0 0 1 84 50 A34 34 0 0 1 50 84 L18 84 A2 2 0 0 1 16 82 L16 50 A34 34 0 0 1 50 16 Z"/>
 </svg>
