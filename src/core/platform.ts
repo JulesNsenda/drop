@@ -2754,6 +2754,22 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
 
       this.appsInProgress.delete(appName);
     } catch (error) {
+      // Secret preflight park (PRD-051) on a hot-reload — e.g. the edited
+      // drop.yaml added a required `secrets:` entry. Park in `needs-config`
+      // (not `errored`) so the operator gets the actionable missing list. The
+      // `starting` transition above already cleared any stale error.
+      if (error instanceof AppNeedsConfigError) {
+        this.logger.warn(
+          `${appName} parked in needs-config on hot-reload — set required secret(s): ` +
+            `${error.missingSecrets.join(', ')}, then restart`,
+          'SECURITY'
+        );
+        await this.stateManager.setAppStatus(appName, 'needs-config', {
+          missingSecrets: error.missingSecrets,
+        });
+        this.appsInProgress.delete(appName);
+        return;
+      }
       this.logger.appEvent('error', appName, error instanceof Error ? error.message : 'Hot-reload failed');
       await this.stateManager.setAppStatus(appName, 'errored', {
         error: error instanceof Error ? error.message : 'Hot-reload failed',
