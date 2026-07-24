@@ -59,6 +59,14 @@ export interface AppDto {
    * for standalone apps. See docs/plans/2026-07-12-monorepo-multi-service.md.
    */
   group?: string;
+  /**
+   * True when this app belongs to a monorepo group whose CONTAINER was deployed
+   * from git (so the group is git-redeployable). Children carry no `gitSource`
+   * of their own — this flag lets the dashboard offer a "Redeploy group" action
+   * on any child, which resolves to the container. Absent for standalone apps
+   * and folder-dropped (non-git) groups.
+   */
+  groupGitBacked?: boolean;
   /** Live memory usage in bytes (from runtime; null when not running or unavailable). */
   memory?: number | null;
   /** Live CPU usage percent (from runtime; null when not running or unavailable). */
