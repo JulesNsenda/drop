@@ -42,7 +42,8 @@ import { UploadDeployService, getUploadDeployService, resetUploadDeployService }
 import { getActivityLog, resetActivityLog } from '../managers/activity';
 import { getDeployTracker, resetDeployTracker } from '../managers/deploy-tracker';
 import { ApiServer, createApiServer } from '../api';
-import { AppInProgressError, setPlatformOps, resetPlatformOps } from '../api/platform-ops';
+import { AppInProgressError, AppNeedsConfigError, setPlatformOps, resetPlatformOps } from '../api/platform-ops';
+import { planSecretPreflight, generateSecretValue } from '../managers/secret/secret-preflight';
 import { Logger, createLogger } from '../utils/logger';
 import {
   validateDomain,
@@ -130,6 +131,13 @@ export interface PlatformConfig {
   redisPort: number;
   /** Max managed-Redis logical DBs a single user may provision (0 = unlimited). */
   maxRedisPerUser: number;
+  /**
+   * Run the secret preflight (PRD-051): before starting an app, auto-generate
+   * declared generatable secrets and PARK the app in `needs-config` if a
+   * declared-required secret is missing, instead of letting it crash-loop.
+   * Default true; the escape hatch is DROP_ENABLE_SECRET_PREFLIGHT=false.
+   */
+  enableSecretPreflight: boolean;
   /** Global limit on simultaneous builds (0 = unlimited). */
   maxConcurrentBuilds: number;
   /**
@@ -220,6 +228,7 @@ const DEFAULT_CONFIG: PlatformConfig = {
   enableRedis: process.env.DROP_ENABLE_REDIS !== 'false',
   redisPort: parseInt(process.env.DROP_REDIS_PORT || '6380', 10),
   maxRedisPerUser: parseInt(process.env.DROP_MAX_REDIS_PER_USER || '3', 10),
+  enableSecretPreflight: process.env.DROP_ENABLE_SECRET_PREFLIGHT !== 'false',
   maxConcurrentBuilds: parseInt(process.env.DROP_MAX_CONCURRENT_BUILDS || '3', 10),
   maxConcurrentApps: parseInt(process.env.DROP_MAX_CONCURRENT_APPS || '0', 10),
   maxMemoryMbPerApp: parseInt(process.env.DROP_MAX_MEMORY_MB_PER_APP || '0', 10),
@@ -1797,6 +1806,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           ...(svc.domains && svc.domains.length > 0 ? { domains: svc.domains } : {}),
           ...(svc.env ? { env: svc.env } : {}),
           ...(svc.build_env ? { build_env: svc.build_env } : {}),
+          ...(svc.secrets ? { secrets: svc.secrets } : {}),
           ...(svc.healthCheck ? { healthCheck: svc.healthCheck } : {}),
           ...(svc.build ? { build: svc.build } : {}),
           ...(svc.start ? { start: svc.start } : {}),
@@ -2271,6 +2281,23 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       // status change does not affect deploy_files.
       this.startCrashLoopWatch(appName);
     } catch (error) {
+      // Secret preflight park (PRD-051): not a failure — the app declared
+      // required secrets that aren't set. Record them and stop, so the operator
+      // gets an actionable `needs-config` instead of a crash-loop. The
+      // `starting` transition above already cleared any stale error.
+      if (error instanceof AppNeedsConfigError) {
+        this.logger.warn(
+          `${appName} parked in needs-config — set required secret(s): ` +
+            `${error.missingSecrets.join(', ')}, then restart`,
+          'SECURITY'
+        );
+        if (this.stateManager) {
+          await this.stateManager.setAppStatus(appName, 'needs-config', {
+            missingSecrets: error.missingSecrets,
+          });
+        }
+        return;
+      }
       this.logger.appEvent('error', appName, error instanceof Error ? error.message : 'Failed to start');
       if (this.stateManager) {
         await this.stateManager.setAppStatus(appName, 'errored', {
@@ -2727,6 +2754,22 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
 
       this.appsInProgress.delete(appName);
     } catch (error) {
+      // Secret preflight park (PRD-051) on a hot-reload — e.g. the edited
+      // drop.yaml added a required `secrets:` entry. Park in `needs-config`
+      // (not `errored`) so the operator gets the actionable missing list. The
+      // `starting` transition above already cleared any stale error.
+      if (error instanceof AppNeedsConfigError) {
+        this.logger.warn(
+          `${appName} parked in needs-config on hot-reload — set required secret(s): ` +
+            `${error.missingSecrets.join(', ')}, then restart`,
+          'SECURITY'
+        );
+        await this.stateManager.setAppStatus(appName, 'needs-config', {
+          missingSecrets: error.missingSecrets,
+        });
+        this.appsInProgress.delete(appName);
+        return;
+      }
       this.logger.appEvent('error', appName, error instanceof Error ? error.message : 'Hot-reload failed');
       await this.stateManager.setAppStatus(appName, 'errored', {
         error: error instanceof Error ? error.message : 'Hot-reload failed',
@@ -2871,6 +2914,15 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
 
         return status;
       } catch (error) {
+        // Secret preflight park (PRD-051): re-park in `needs-config` rather than
+        // `errored` (e.g. a "retry" that still has some required secrets unset),
+        // then re-throw so the caller/route reports which are missing.
+        if (error instanceof AppNeedsConfigError) {
+          await this.stateManager.setAppStatus(appName, 'needs-config', {
+            missingSecrets: error.missingSecrets,
+          });
+          throw error;
+        }
         this.logger.appEvent('error', appName, error instanceof Error ? error.message : 'Failed to restart');
         await this.stateManager.setAppStatus(appName, 'errored', {
           error: error instanceof Error ? error.message : 'Failed to restart',
@@ -3414,6 +3466,35 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       await this.generateStaticConfig(appPath, depEnvVars);
     }
 
+    // Secret preflight — generation (PRD-051). Auto-fill any declared
+    // `generate` secret that isn't set yet, BEFORE reading the secret env below
+    // so the generated value is injected. Names (never values) are logged.
+    if (this.config.enableSecretPreflight && this.secretManager) {
+      const declaredSecrets = dropYamlCfg.success ? dropYamlCfg.config?.secrets : undefined;
+      if (declaredSecrets) {
+        // "Already provided" for generation = secrets set to a NON-EMPTY value.
+        // Presence alone (list()) is not enough: a `generate` secret that exists
+        // with an empty-string value must be (re)generated, never accepted — it
+        // would otherwise boot the app with an empty signing/session key.
+        const setSecrets = this.secretManager.hasSecrets(appName)
+          ? this.secretManager.getAll(appName)
+          : {};
+        const nonEmptyKeys = Object.entries(setSecrets)
+          .filter(([, value]) => value.length > 0)
+          .map(([key]) => key);
+        const { toGenerate } = planSecretPreflight(declaredSecrets, nonEmptyKeys);
+        for (const decl of toGenerate) {
+          await this.secretManager.set(appName, decl.name, generateSecretValue(decl.generate));
+        }
+        if (toGenerate.length > 0) {
+          this.logger.info(
+            `Generated ${toGenerate.length} declared secret(s): ${toGenerate.map(d => d.name).join(', ')}`,
+            'SECURITY'
+          );
+        }
+      }
+    }
+
     let secretEnvVars: Record<string, string> = {};
     if (this.secretManager && this.secretManager.hasSecrets(appName)) {
       secretEnvVars = this.secretManager.getAll(appName);
@@ -3469,6 +3550,43 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       }
     }
 
+    const env: Record<string, string> = {
+      // drop.yaml `env` (tenant config) is the base layer — now injected at
+      // START as well as build, so `env:` is honored end-to-end. Placed
+      // FIRST so secrets and every platform-authoritative var (PORT,
+      // DROP_DATA_DIR, DROP_API_URL/KEY, DATABASE_URL) still override it and
+      // a tenant cannot hijack them. `build_env` is intentionally NOT
+      // injected here — it is build-only by design.
+      ...this.coerceEnvRecord(dropYamlCfg.success ? dropYamlCfg.config?.env : undefined),
+      ...secretEnvVars,
+      NODE_ENV: 'production',
+      PORT: port.toString(),
+      DROP_DATA_DIR: dataDir,
+      DROP_API_URL: dropApiUrl,
+      ...(dropApiKey ? { DROP_API_KEY: dropApiKey } : {}),
+      ...dbEnvVars,
+      ...redisEnvVars,
+      ...depEnvVars,
+    };
+
+    // Secret preflight — gate (PRD-051). A declared-required secret that is
+    // neither auto-generated above nor present (non-empty) in the assembled
+    // env — after set secrets, drop.yaml `env`, and every platform-injected
+    // var (DATABASE_URL, REDIS_URL, depends_on URLs, ...) — parks the app in
+    // `needs-config`. Throwing here (caught by the start/restart path) prevents
+    // the process from ever starting, so a missing secret becomes an actionable
+    // state instead of a runtime crash-loop.
+    if (this.config.enableSecretPreflight) {
+      const declaredSecrets = dropYamlCfg.success ? dropYamlCfg.config?.secrets : undefined;
+      const providedKeys = Object.entries(env)
+        .filter(([, value]) => value.length > 0)
+        .map(([key]) => key);
+      const { missing } = planSecretPreflight(declaredSecrets, providedKeys);
+      if (missing.length > 0) {
+        throw new AppNeedsConfigError(appName, missing.map(m => m.name));
+      }
+    }
+
     return {
       name: appName,
       script,
@@ -3482,24 +3600,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       healthCheckPath,
       pgSocketDir,
       limits,
-      env: {
-        // drop.yaml `env` (tenant config) is the base layer — now injected at
-        // START as well as build, so `env:` is honored end-to-end. Placed
-        // FIRST so secrets and every platform-authoritative var (PORT,
-        // DROP_DATA_DIR, DROP_API_URL/KEY, DATABASE_URL) still override it and
-        // a tenant cannot hijack them. `build_env` is intentionally NOT
-        // injected here — it is build-only by design.
-        ...this.coerceEnvRecord(dropYamlCfg.success ? dropYamlCfg.config?.env : undefined),
-        ...secretEnvVars,
-        NODE_ENV: 'production',
-        PORT: port.toString(),
-        DROP_DATA_DIR: dataDir,
-        DROP_API_URL: dropApiUrl,
-        ...(dropApiKey ? { DROP_API_KEY: dropApiKey } : {}),
-        ...dbEnvVars,
-        ...redisEnvVars,
-        ...depEnvVars,
-      },
+      env,
     };
   }
 

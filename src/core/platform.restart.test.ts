@@ -209,6 +209,108 @@ describe('DropPlatform.restartApp', () => {
     expect(result.status).toBe('running');
   }, 20000);
 
+  // ── Secret preflight (PRD-051) ──────────────────────────────────────────────
+
+  it('parks an app in needs-config when a declared required secret is unset', async () => {
+    platform = makePlatform();
+    await platform.start();
+    const appPath = await createStaticApp('needsconf');
+    await fs.writeFile(
+      path.join(appPath, 'drop.yaml'),
+      'type: static\nsecrets:\n  JWT_SECRET:\n    required: true\n'
+    );
+    const startSpy = jest.spyOn(fakeRuntime, 'start');
+
+    eventBus.publish('app:detected', { name: 'needsconf', path: appPath, type: undefined });
+    await waitFor(() => getStateManager().getApp('needsconf')?.status === 'needs-config');
+
+    const app = getStateManager().getApp('needsconf')!;
+    expect(app.status).toBe('needs-config');
+    expect(app.missingSecrets).toEqual(['JWT_SECRET']);
+    // The gate must PREVENT the process from ever starting.
+    expect(startSpy.mock.calls.some((c) => c[0].name === 'needsconf')).toBe(false);
+  }, 20000);
+
+  it('auto-generates a declared generatable secret and starts the app', async () => {
+    platform = makePlatform();
+    await platform.start();
+    const appPath = await createStaticApp('genapp');
+    await fs.writeFile(path.join(appPath, 'drop.yaml'), 'type: static\nsecrets:\n  SESSION_KEY: generate\n');
+    const startSpy = jest.spyOn(fakeRuntime, 'start');
+
+    eventBus.publish('app:detected', { name: 'genapp', path: appPath, type: undefined });
+    await waitFor(() => getStateManager().getApp('genapp')?.status === 'running');
+
+    const secretManager = (platform as unknown as {
+      secretManager: { list: (a: string) => string[]; get: (a: string, k: string) => string | null };
+    }).secretManager;
+    expect(secretManager.list('genapp')).toContain('SESSION_KEY');
+    const generated = secretManager.get('genapp', 'SESSION_KEY');
+    expect(generated).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    // ...and the generated value was injected into the start spec.
+    const call = startSpy.mock.calls.find((c) => c[0].name === 'genapp');
+    expect(call?.[0].env?.SESSION_KEY).toBe(generated);
+  }, 20000);
+
+  it('regenerates a declared generatable secret that exists but is empty', async () => {
+    platform = makePlatform();
+    await platform.start();
+    const secretManager = (platform as unknown as {
+      secretManager: { set: Function; get: (a: string, k: string) => string | null };
+    }).secretManager;
+    // Pre-existing but EMPTY — must NOT be accepted as satisfying the requirement
+    // (an empty signing/session key would boot forgeable-token-vulnerable).
+    await secretManager.set('emptygen', 'SESSION_KEY', '');
+
+    const appPath = await createStaticApp('emptygen');
+    await fs.writeFile(path.join(appPath, 'drop.yaml'), 'type: static\nsecrets:\n  SESSION_KEY: generate\n');
+
+    eventBus.publish('app:detected', { name: 'emptygen', path: appPath, type: undefined });
+    await waitFor(() => getStateManager().getApp('emptygen')?.status === 'running');
+
+    expect(secretManager.get('emptygen', 'SESSION_KEY')).toMatch(/^[A-Za-z0-9_-]{43}$/);
+  }, 20000);
+
+  it('starts a parked app once the missing secret is set and it is restarted', async () => {
+    platform = makePlatform();
+    await platform.start();
+    const appPath = await createStaticApp('retryapp');
+    await fs.writeFile(path.join(appPath, 'drop.yaml'), 'type: static\nsecrets:\n  JWT_SECRET: required\n');
+
+    eventBus.publish('app:detected', { name: 'retryapp', path: appPath, type: undefined });
+    await waitFor(() => getStateManager().getApp('retryapp')?.status === 'needs-config');
+
+    const secretManager = (platform as unknown as { secretManager: { set: Function } }).secretManager;
+    await secretManager.set('retryapp', 'JWT_SECRET', 'supplied-value');
+
+    const result = await platform!.restartApp('retryapp');
+    expect(result.status).toBe('running');
+    const app = getStateManager().getApp('retryapp')!;
+    expect(app.status).toBe('running');
+    expect(app.missingSecrets).toBeUndefined();
+  }, 20000);
+
+  it('parks a running app in needs-config when a hot-reload adds a required secret', async () => {
+    platform = makePlatform();
+    await platform.start();
+    const appPath = await createStaticApp('hotpark');
+    await deploy('hotpark', appPath);
+    expect(getStateManager().getApp('hotpark')?.status).toBe('running');
+
+    // Edit drop.yaml to declare a required secret, then trigger a hot-reload:
+    // the preflight throw must park (needs-config), NOT mark the app errored.
+    await fs.writeFile(path.join(appPath, 'drop.yaml'), 'type: static\nsecrets:\n  JWT_SECRET: required\n');
+    eventBus.publish('app:update', {
+      name: 'hotpark',
+      path: appPath,
+      reason: 'test-secret-added',
+      bypassCooldown: true,
+    });
+
+    await waitFor(() => getStateManager().getApp('hotpark')?.status === 'needs-config');
+    expect(getStateManager().getApp('hotpark')?.missingSecrets).toEqual(['JWT_SECRET']);
+  }, 20000);
+
   it('reflects a secret value changed since the last deploy in the restart spec', async () => {
     platform = makePlatform();
     await platform.start();

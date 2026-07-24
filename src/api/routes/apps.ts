@@ -16,7 +16,7 @@ import { AuthContext, listUsers, getUserById } from '../middleware/auth';
 import { canAccess } from '../access';
 import { isValidAppName, validateAppName } from '../middleware/validate';
 import { getAppRuntime } from '../../managers/runtime';
-import { getPlatformOps, AppInProgressError } from '../platform-ops';
+import { getPlatformOps, AppInProgressError, AppNeedsConfigError } from '../platform-ops';
 import { getSecretManager } from '../../managers/secret';
 import { getDeployTracker } from '../../managers/deploy-tracker';
 import { migrateAppRuntime } from '../../managers/runtime/runtime-migrator';
@@ -140,6 +140,7 @@ function toAppDto(app: AppState, isAdmin = false): AppDto {
     lastDeployedAt: app.lastDeployedAt,
     buildDuration: app.buildDuration,
     error: app.error,
+    missingSecrets: app.missingSecrets,
     gitSource: app.gitSource,
     userId: app.userId,
     ownerName: isAdmin ? resolveUsername(app.userId) : undefined,
@@ -748,6 +749,15 @@ apps.post('/:name/start', async c => {
     if (err instanceof AppInProgressError) {
       return c.json(error(ErrorCodes.CONFLICT, err.message), 409);
     }
+    if (err instanceof AppNeedsConfigError) {
+      return c.json(
+        error(
+          ErrorCodes.CONFLICT,
+          `Application '${name}' needs configuration — set required secret(s): ${err.missingSecrets.join(', ')}, then retry`
+        ),
+        409
+      );
+    }
     const message = err instanceof Error ? err.message : 'Failed to start';
     return c.json(error(ErrorCodes.INTERNAL_ERROR, message), 500);
   }
@@ -822,6 +832,15 @@ apps.post('/:name/restart', async c => {
     if (err instanceof AppInProgressError) {
       return c.json(error(ErrorCodes.CONFLICT, err.message), 409);
     }
+    if (err instanceof AppNeedsConfigError) {
+      return c.json(
+        error(
+          ErrorCodes.CONFLICT,
+          `Application '${name}' needs configuration — set required secret(s): ${err.missingSecrets.join(', ')}, then retry`
+        ),
+        409
+      );
+    }
     const message = err instanceof Error ? err.message : 'Failed to restart';
     return c.json(error(ErrorCodes.INTERNAL_ERROR, message), 500);
   }
@@ -884,6 +903,15 @@ apps.put('/:name/capabilities', async c => {
   } catch (err) {
     if (err instanceof AppInProgressError) {
       return c.json(error(ErrorCodes.CONFLICT, err.message), 409);
+    }
+    if (err instanceof AppNeedsConfigError) {
+      return c.json(
+        error(
+          ErrorCodes.CONFLICT,
+          `Application '${name}' needs configuration — set required secret(s): ${err.missingSecrets.join(', ')}, then retry`
+        ),
+        409
+      );
     }
     const message = err instanceof Error ? err.message : 'Failed to restart';
     return c.json(error(ErrorCodes.INTERNAL_ERROR, message), 500);

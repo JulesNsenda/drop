@@ -13,7 +13,17 @@ export interface GitSource {
 export interface App {
   name: string;
   type: string;
-  status: 'pending' | 'building' | 'starting' | 'running' | 'stopped' | 'errored' | 'crash-looping';
+  status:
+    | 'pending'
+    | 'building'
+    | 'starting'
+    | 'running'
+    | 'stopped'
+    | 'errored'
+    | 'crash-looping'
+    | 'needs-config';
+  /** Required secrets (env-var names) the app declared in drop.yaml that aren't set yet — present only when status === 'needs-config'. */
+  missingSecrets?: string[];
   port?: number;
   pid?: number;
   path: string;

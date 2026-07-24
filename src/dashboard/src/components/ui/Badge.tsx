@@ -54,6 +54,7 @@ export function statusToTone(status: string): BadgeTone {
     case 'building':
     case 'starting':
     case 'crash-looping':
+    case 'needs-config':
       return 'warn';
     default:
       return 'neutral';
