@@ -25,6 +25,26 @@ export class AppInProgressError extends Error {
   }
 }
 
+/**
+ * Thrown by the start path (PRD-051) when an app declares required secrets in
+ * its drop.yaml that are neither already set nor auto-generatable. The platform
+ * catches it and parks the app in the `needs-config` state instead of starting
+ * it — turning a runtime crash-loop into an actionable "set these secrets" step.
+ */
+export class AppNeedsConfigError extends Error {
+  readonly code = 'APP_NEEDS_CONFIG';
+
+  constructor(
+    readonly appName: string,
+    readonly missingSecrets: string[],
+  ) {
+    super(
+      `Application '${appName}' is missing required secret(s): ${missingSecrets.join(', ')}`,
+    );
+    this.name = 'AppNeedsConfigError';
+  }
+}
+
 export interface PlatformOps {
   /**
    * Stop-if-running, rebuild the start spec from current state (secrets,
