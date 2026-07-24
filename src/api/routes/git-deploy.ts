@@ -103,14 +103,35 @@ gitDeploy.post('/redeploy/:name', async (c) => {
     return c.json(error(ErrorCodes.SERVICE_UNAVAILABLE, 'git CLI is not available on this system'), 503);
   }
 
-  const app = getStateManager().getApp(name);
+  const stateManager = getStateManager();
+  const app = stateManager.getApp(name);
   if (!app || !canAccess(auth, app)) {
     return c.json(error(ErrorCodes.NOT_FOUND, `Application '${name}' not found`), 404);
   }
 
+  // Monorepo children carry no gitSource of their own — the group's hidden
+  // container holds it (and is what a git pull + re-expansion runs against).
+  // So "Redeploy" on any child resolves to its container: one pull re-pulls
+  // and re-materializes the whole group. The `group` tag is tenant-influenced
+  // (drop.yaml group:/name:), so a crafted collision could name a victim's
+  // group — re-check access on the RESOLVED container, mirroring the
+  // group-aware DELETE guard (apps.ts), before redeploying it.
+  let target = app;
+  if (!app.gitSource && app.group) {
+    const container = stateManager
+      .getAllApps()
+      .find(a => a.isGroupContainer && a.group === app.group && a.gitSource);
+    if (container) {
+      if (!canAccess(auth, container)) {
+        return c.json(error(ErrorCodes.NOT_FOUND, `Application '${name}' not found`), 404);
+      }
+      target = container;
+    }
+  }
+
   try {
-    const result = await service.redeploy(name);
-    await tryLogActivity({ action: 'redeploy', userId: auth?.userId, username: auth?.username, appName: name });
+    const result = await service.redeploy(target.name);
+    await tryLogActivity({ action: 'redeploy', userId: auth?.userId, username: auth?.username, appName: target.name });
     return c.json(success(result));
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Redeploy failed';
