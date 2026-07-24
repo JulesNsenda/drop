@@ -165,6 +165,83 @@ describe('Drop YAML Parser', () => {
     });
   });
 
+  describe('validateDropYamlConfig - secrets (PRD-051)', () => {
+    it('accepts boolean and string shorthands', () => {
+      expect(validateDropYamlConfig({ secrets: { A: true, B: false } }).valid).toBe(true);
+      expect(validateDropYamlConfig({ secrets: { A: 'required', B: 'generate' } }).valid).toBe(true);
+    });
+
+    it('accepts the object form with required/generate/description', () => {
+      const result = validateDropYamlConfig({
+        secrets: {
+          JWT_SECRET: { required: true, generate: 'random', description: 'signs tokens' },
+          SMTP_PASSWORD: { required: true },
+          SENTRY_DSN: { required: false },
+        },
+      });
+      expect(result.valid).toBe(true);
+    });
+
+    it('rejects a non-object secrets value', () => {
+      expect(validateDropYamlConfig({ secrets: 'nope' }).valid).toBe(false);
+      expect(validateDropYamlConfig({ secrets: ['A'] }).valid).toBe(false);
+    });
+
+    it('rejects an unknown string shorthand', () => {
+      const result = validateDropYamlConfig({ secrets: { A: 'sometimes' } });
+      expect(result.valid).toBe(false);
+      expect(result.error).toContain('secrets.A');
+    });
+
+    it('rejects generate values other than "random"', () => {
+      const result = validateDropYamlConfig({ secrets: { A: { generate: 'uuid' } } });
+      expect(result.valid).toBe(false);
+      expect(result.error).toContain('secrets.A.generate');
+    });
+
+    it('rejects unknown keys inside a secret declaration', () => {
+      const result = validateDropYamlConfig({ secrets: { A: { required: true, rotate: true } } });
+      expect(result.valid).toBe(false);
+      expect(result.error).toContain('secrets.A.rotate');
+    });
+
+    it('rejects a non-boolean required and a non-string description', () => {
+      expect(validateDropYamlConfig({ secrets: { A: { required: 'yes' } } }).valid).toBe(false);
+      expect(validateDropYamlConfig({ secrets: { A: { description: 5 } } }).valid).toBe(false);
+    });
+
+    it('rejects an empty secret name', () => {
+      expect(validateDropYamlConfig({ secrets: { '': 'required' } }).valid).toBe(false);
+    });
+
+    it('rejects a secrets map exceeding the entry cap', () => {
+      const secrets: Record<string, string> = {};
+      for (let i = 0; i < 51; i++) secrets[`S${i}`] = 'required';
+      const result = validateDropYamlConfig({ secrets });
+      expect(result.valid).toBe(false);
+      expect(result.error).toContain('exceeding the limit');
+    });
+
+    it('accepts per-service secrets under services.<name>', () => {
+      const result = validateDropYamlConfig({
+        services: {
+          backend: { path: 'backend', secrets: { JWT_SECRET: 'generate' } },
+        },
+      });
+      expect(result.valid).toBe(true);
+    });
+
+    it('rejects invalid per-service secrets with a service-scoped error', () => {
+      const result = validateDropYamlConfig({
+        services: {
+          backend: { path: 'backend', secrets: { A: { generate: 'nope' } } },
+        },
+      });
+      expect(result.valid).toBe(false);
+      expect(result.error).toContain('services.backend.secrets.A.generate');
+    });
+  });
+
   describe('validateDropYamlConfig - group', () => {
     it('should accept a valid non-empty group string', () => {
       const result = validateDropYamlConfig({ group: 'ezsign' });
