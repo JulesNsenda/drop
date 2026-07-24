@@ -164,6 +164,41 @@ describe('GET /api/v1/apps/:name DTO contract', () => {
     const body = (await res.json()) as { data: Record<string, unknown> };
     expect(body.data.group).toBe('ezsign');
   });
+
+  it('omits groupGitBacked for a standalone app', async () => {
+    const res = await hono.request('/api/v1/apps/test-app', { headers: authHeader(adminToken) });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { data: Record<string, unknown> };
+    expect(body.data.groupGitBacked).toBeUndefined();
+  });
+
+  it('sets groupGitBacked when the group container was git-deployed (DROP-065)', async () => {
+    const sm = getStateManager();
+    await sm.updateApp('test-app', { group: 'ezsign' });
+    // The hidden container carries the group's gitSource.
+    await sm.registerApp('ezsign-repo', path.join(tempDir, 'ezsign-repo'));
+    await sm.updateApp('ezsign-repo', {
+      userId,
+      group: 'ezsign',
+      isGroupContainer: true,
+      gitSource: { repoUrl: 'https://github.com/acme/ezsign', branch: 'main', autoRedeploy: true },
+    });
+    const res = await hono.request('/api/v1/apps/test-app', { headers: authHeader(adminToken) });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { data: Record<string, unknown> };
+    expect(body.data.groupGitBacked).toBe(true);
+  });
+
+  it('omits groupGitBacked for a folder-dropped group (container has no gitSource)', async () => {
+    const sm = getStateManager();
+    await sm.updateApp('test-app', { group: 'ezsign' });
+    await sm.registerApp('ezsign-repo', path.join(tempDir, 'ezsign-repo'));
+    await sm.updateApp('ezsign-repo', { userId, group: 'ezsign', isGroupContainer: true });
+    const res = await hono.request('/api/v1/apps/test-app', { headers: authHeader(adminToken) });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { data: Record<string, unknown> };
+    expect(body.data.groupGitBacked).toBeUndefined();
+  });
 });
 
 describe('GET /api/v1/apps list DTO contract', () => {

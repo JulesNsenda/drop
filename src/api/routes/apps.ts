@@ -123,6 +123,24 @@ export function computeAppUrl(app: AppState): string | undefined {
   return `${proto}://${domain}`;
 }
 
+/**
+ * Whether a monorepo group is git-redeployable: its hidden container entry
+ * (`isGroupContainer`, tagged with the group name) carries a `gitSource`.
+ * Folder-dropped groups have a container tag but no gitSource — not
+ * redeployable — and standalone apps have no group at all. Surfaced on child
+ * DTOs as `groupGitBacked` so the dashboard can offer "Redeploy group".
+ */
+function isGroupGitBacked(group: string): boolean {
+  try {
+    return getStateManager()
+      .getAllApps()
+      .some(a => a.isGroupContainer && a.group === group && !!a.gitSource);
+  } catch {
+    // State manager not initialised (e.g. isolated route tests) — treat as not git-backed.
+    return false;
+  }
+}
+
 // Helper to convert AppState to AppDto (role-aware)
 function toAppDto(app: AppState, isAdmin = false): AppDto {
   return {
@@ -145,6 +163,11 @@ function toAppDto(app: AppState, isAdmin = false): AppDto {
     ownerName: isAdmin ? resolveUsername(app.userId) : undefined,
     customDomain: app.customDomain,
     group: app.group,
+    // Emitted as `true` only for a group child whose container is git-backed;
+    // omitted otherwise (standalone apps redeploy via their own gitSource, and
+    // folder-dropped groups aren't git-redeployable at all).
+    groupGitBacked:
+      !app.gitSource && app.group && isGroupGitBacked(app.group) ? true : undefined,
   };
 }
 
