@@ -16,6 +16,7 @@ import {
   Activity,
   Globe,
   Terminal,
+  AlertTriangle,
 } from 'lucide-react';
 import { useApp, appAction, deleteApp, gitRedeploy } from '../hooks/useApi';
 import { getAuthHeaders, useAuth } from '../hooks/useAuth';
@@ -286,6 +287,60 @@ function AppDetailPage() {
           </Button>
         </div>
       </div>
+
+      {/* Needs-config banner — app declared required secrets that aren't set,
+          so DROP parked it instead of crash-looping. Actionable, not an error. */}
+      {app.status === 'needs-config' && (
+        <div
+          className="mb-6 rounded-lg border p-4"
+          style={{
+            borderColor: 'var(--warn)',
+            background: 'color-mix(in srgb, var(--warn) 10%, transparent)',
+          }}
+        >
+          <div className="mb-2 flex items-center gap-2" style={{ color: 'var(--warn)' }}>
+            <AlertTriangle className="h-4 w-4 flex-shrink-0" />
+            <p className="text-sm font-medium">Waiting on required secrets</p>
+          </div>
+          <p className="mb-3 text-sm" style={{ color: 'var(--text-2)' }}>
+            This app declared required secrets in its <code>drop.yaml</code> that aren&apos;t set
+            yet, so DROP parked it instead of starting it.
+            {app.missingSecrets && app.missingSecrets.length > 0
+              ? ' Set the values below, then retry:'
+              : ' Set the required secrets below, then retry.'}
+          </p>
+          {app.missingSecrets && app.missingSecrets.length > 0 && (
+            <ul className="mb-3 space-y-1">
+              {app.missingSecrets.map(key => (
+                <li key={key} className="font-mono text-sm" style={{ color: 'var(--text)' }}>
+                  {key}
+                </li>
+              ))}
+            </ul>
+          )}
+          <div className="flex flex-wrap items-center gap-2">
+            <Button
+              variant="secondary"
+              onClick={() => setActiveTab('environment')}
+              disabled={actionLoading !== null}
+            >
+              <Key className="h-4 w-4" />
+              Add environment variable
+            </Button>
+            <Button
+              variant="secondary"
+              onClick={() => handleAction('restart')}
+              disabled={actionLoading !== null}
+              style={{ color: 'var(--warn)' }}
+            >
+              <RotateCw
+                className={`h-4 w-4 ${actionLoading === 'restart' ? 'animate-spin' : ''}`}
+              />
+              Retry deploy
+            </Button>
+          </div>
+        </div>
+      )}
 
       {/* Info cards */}
       <div className="mb-6 grid gap-4 md:grid-cols-3">
