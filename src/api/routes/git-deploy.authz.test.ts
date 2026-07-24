@@ -129,4 +129,64 @@ describe('git redeploy route authorization', () => {
     expect(res.status).toBe(200);
     expect(redeploy).toHaveBeenCalledWith('legacy-app');
   });
+
+  describe('monorepo group child resolution', () => {
+    // A monorepo deploy registers a hidden container (carries the gitSource)
+    // plus visible children (carry only the `group` tag, no gitSource). Redeploy
+    // on a child must resolve to the container so the whole group re-pulls.
+    beforeEach(async () => {
+      const sm = getStateManager();
+      // Alice's git-backed group: container `grp-repo` + child `grp-backend`.
+      await sm.registerApp('grp-repo', path.join(tempDir, 'grp-repo'));
+      await sm.updateApp('grp-repo', {
+        userId: aliceId,
+        group: 'grp',
+        isGroupContainer: true,
+        gitSource: {
+          repoUrl: 'https://github.com/acme/grp',
+          branch: 'main',
+          autoRedeploy: true,
+        },
+      });
+      await sm.registerApp('grp-backend', path.join(tempDir, 'grp-backend'));
+      await sm.updateApp('grp-backend', { userId: aliceId, group: 'grp' });
+    });
+
+    it('owner redeploying a group child resolves to the container', async () => {
+      const res = await app.request('/api/v1/git/redeploy/grp-backend', {
+        method: 'POST',
+        headers: bearer(aliceToken),
+      });
+      expect(res.status).toBe(200);
+      // Resolved to the container, not the child (child has no gitSource).
+      expect(redeploy).toHaveBeenCalledWith('grp-repo');
+    });
+
+    it('admin redeploying a group child resolves to the container', async () => {
+      const res = await app.request('/api/v1/git/redeploy/grp-backend', {
+        method: 'POST',
+        headers: bearer(adminToken),
+      });
+      expect(res.status).toBe(200);
+      expect(redeploy).toHaveBeenCalledWith('grp-repo');
+    });
+
+    it("crafted group collision cannot redeploy another tenant's container (IDOR)", async () => {
+      // Bob owns a child whose `group` tag collides with Alice's group name.
+      // He can reach his own child, but the resolved container is Alice's — the
+      // recheck on the resolved container must block it. Same 404 as any miss.
+      const sm = getStateManager();
+      const bobId = (await createUser('mallory', 'password123', 'user')).id;
+      const malloryToken = await getTestToken('mallory', 'password123');
+      await sm.registerApp('evil-backend', path.join(tempDir, 'evil-backend'));
+      await sm.updateApp('evil-backend', { userId: bobId, group: 'grp' });
+
+      const res = await app.request('/api/v1/git/redeploy/evil-backend', {
+        method: 'POST',
+        headers: bearer(malloryToken),
+      });
+      expect(res.status).toBe(404);
+      expect(redeploy).not.toHaveBeenCalled();
+    });
+  });
 });

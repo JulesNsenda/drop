@@ -92,12 +92,18 @@ function AppDetailPage() {
     setActionLoading(null);
   };
 
+  // A monorepo child has no gitSource of its own, but its git-backed group can
+  // still be redeployed — the server resolves the child to its container and
+  // re-pulls + re-expands the whole group.
+  const isGroupChild = !app?.gitSource && !!app?.groupGitBacked;
+  const canRedeploy = !!app?.gitSource || isGroupChild;
+
   const handleRedeploy = async () => {
     if (!name) return;
     setActionLoading('redeploy');
     const result = await gitRedeploy(name);
     if (result.success) {
-      toast('success', `Redeploying ${name}...`);
+      toast('success', isGroupChild ? `Redeploying group ${app?.group}...` : `Redeploying ${name}...`);
     } else {
       toast('error', result.error || `Failed to redeploy ${name}`);
     }
@@ -268,17 +274,22 @@ function AppDetailPage() {
               Start
             </Button>
           )}
-          {app.gitSource && (
+          {canRedeploy && (
             <Button
               variant="secondary"
               onClick={handleRedeploy}
               disabled={actionLoading !== null}
               style={{ color: 'var(--accent)' }}
+              title={
+                isGroupChild
+                  ? `Re-pull and rebuild the whole ${app.group} monorepo group`
+                  : undefined
+              }
             >
               <RotateCw
                 className={`h-4 w-4 ${actionLoading === 'redeploy' ? 'animate-spin' : ''}`}
               />
-              Redeploy
+              {isGroupChild ? 'Redeploy group' : 'Redeploy'}
             </Button>
           )}
           <Button variant="danger" onClick={handleDelete} disabled={actionLoading !== null}>

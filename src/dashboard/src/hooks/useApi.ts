@@ -42,6 +42,12 @@ export interface App {
   customDomain?: string;
   /** Monorepo group name (e.g. shared repo root) — apps sharing a group are siblings deployed from the same monorepo. */
   group?: string;
+  /**
+   * True when this app is a monorepo child whose group was deployed from git —
+   * the group is redeployable even though the child carries no `gitSource` of
+   * its own. Lets the dashboard offer a "Redeploy group" action on any child.
+   */
+  groupGitBacked?: boolean;
   /** Live memory usage in bytes (from runtime; present only while status === 'running'). */
   memory?: number | null;
   /** Live CPU usage percent (from runtime; present only while status === 'running'). */
