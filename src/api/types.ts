@@ -48,6 +48,11 @@ export interface AppDto {
   lastDeployedAt?: string;
   buildDuration?: number;
   error?: string;
+  /**
+   * Env-var names the app declared required (drop.yaml `secrets:`) that were
+   * missing at start; present only with `status: 'needs-config'` (PRD-051).
+   */
+  missingSecrets?: string[];
   gitSource?: GitSource;
   userId?: string;
   ownerName?: string;

@@ -300,6 +300,33 @@ describe('MCP tool handlers', () => {
         else process.env.DROP_MCP_DEPLOY_WAIT_MS = original;
       }
     }, 10000);
+
+    it('parked path: reports needs-config with the missing secrets instead of hanging (PRD-051)', async () => {
+      // App parked by the preflight: needs-config + missingSecrets, updated
+      // "now" (>= the deploy's acceptedAt), with NO terminal deploy episode.
+      await getStateManager().registerApp('park-app', path.join(tempDir, 'park-app'));
+      await getStateManager().updateApp('park-app', { userId: alice.userId });
+      await getStateManager().setAppStatus('park-app', 'needs-config', { missingSecrets: ['JWT_SECRET'] });
+
+      jest.spyOn(uploadDeployModule, 'getUploadDeployService').mockReturnValue({
+        deploy: jest
+          .fn()
+          .mockResolvedValue({ app: 'park-app', acceptedAt: '2026-07-09T00:00:00.000Z', isNew: false }),
+      } as unknown as ReturnType<typeof uploadDeployModule.getUploadDeployService>);
+      // No matching terminal episode — the status short-circuit must fire, not a 120s hang.
+      jest.spyOn(deployTrackerModule, 'getDeployTracker').mockReturnValue({
+        getEpisodes: jest.fn().mockReturnValue([]),
+      } as unknown as ReturnType<typeof deployTrackerModule.getDeployTracker>);
+
+      const result = await handleDeployFiles(alice, {
+        name: 'park-app',
+        files: [{ path: 'index.js', content: 'x' }],
+      });
+
+      expect(result.isError).toBe(true);
+      expect(firstText(result)).toContain('JWT_SECRET');
+      expect(firstText(result)).toMatch(/parked|needs/i);
+    }, 10000);
   });
 
   describe('deploy_from_git', () => {

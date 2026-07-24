@@ -11,7 +11,7 @@ import * as yaml from 'yaml';
 
 /** Keys accepted at the top level of drop.yaml. Any others are rejected. */
 const ALLOWED_TOP_KEYS = new Set([
-  'name', 'domains', 'tls', 'env', 'build_env', 'depends_on', 'port',
+  'name', 'domains', 'tls', 'env', 'build_env', 'secrets', 'depends_on', 'port',
   'build', 'start', 'healthCheck', 'maxBodySize', 'timeout',
   'group', 'services', 'type', 'database', 'redis', 'route',
 ]);
@@ -21,7 +21,7 @@ const ALLOWED_TLS_KEYS = new Set(['certFile', 'keyFile', 'disabled']);
 
 /** Keys accepted under a drop.yaml#services.<name> entry */
 const ALLOWED_SERVICE_KEYS = new Set([
-  'path', 'type', 'build', 'start', 'env', 'build_env', 'database', 'redis',
+  'path', 'type', 'build', 'start', 'env', 'build_env', 'secrets', 'database', 'redis',
   'healthCheck', 'domains', 'depends_on', 'route',
 ]);
 
@@ -49,6 +49,38 @@ export interface AppTlsConfig {
 export interface AppEnvConfig {
   /** Static environment variables */
   [key: string]: string | number | boolean;
+}
+
+/** Auto-generation strategy for a declared secret (PRD-051). Only `random` in v1. */
+export type SecretGenerateStrategy = 'random';
+
+/**
+ * Object form of a declared secret requirement (drop.yaml `secrets:`).
+ */
+export interface SecretDeclObject {
+  /** The app cannot start without this secret. `generate` implies `required`. */
+  required?: boolean;
+  /** DROP fills a strong random value if the secret is unset at start. */
+  generate?: SecretGenerateStrategy;
+  /** Human-facing hint shown in the dashboard / CLI prompt. */
+  description?: string;
+}
+
+/**
+ * A declared secret requirement. Shorthand forms:
+ * - `true` / `"required"` — required, human-supplied.
+ * - `"generate"` — required and auto-generated (random).
+ * - object — {@link SecretDeclObject}.
+ */
+export type SecretDecl = boolean | 'required' | 'generate' | SecretDeclObject;
+
+/**
+ * drop.yaml `secrets:` — a map of ENV var name -> declaration (PRD-051).
+ * Declaring a secret makes DROP resolve it (auto-generate / prompt / park in
+ * `needs-config`) BEFORE the app starts, rather than crash-looping at runtime.
+ */
+export interface AppSecretsConfig {
+  [key: string]: SecretDecl;
 }
 
 /**
@@ -90,6 +122,8 @@ export interface ServiceConfig {
   env?: AppEnvConfig;
   /** Build-only environment variables (see DropYamlConfig.build_env) */
   build_env?: AppEnvConfig;
+  /** Declared required secrets for this service (see DropYamlConfig.secrets) */
+  secrets?: AppSecretsConfig;
   /** Provision a database for this service only (e.g. "postgres") */
   database?: string;
   /** Provision managed Redis (per-app logical DB + injected REDIS_URL) for this service. */
@@ -137,6 +171,12 @@ export interface DropYamlConfig {
    * Vite's `VITE_*` vars) that shouldn't also linger in the runtime env.
    */
   build_env?: AppEnvConfig;
+  /**
+   * Declared required secrets (PRD-051). A map of ENV var name -> declaration.
+   * DROP resolves these (auto-generate / prompt / park in `needs-config`) before
+   * the app starts, instead of letting a missing secret crash-loop the app.
+   */
+  secrets?: AppSecretsConfig;
   /** App dependencies */
   depends_on?: AppDependency[];
   /** Port override */
@@ -378,6 +418,12 @@ export function validateDropYamlConfig(
     if (!result.valid) return result;
   }
 
+  // Validate secrets (declared required secrets — PRD-051)
+  if (cfg.secrets !== undefined) {
+    const result = validateSecretsObject(cfg.secrets, 'secrets');
+    if (!result.valid) return result;
+  }
+
   // Validate depends_on
   if (cfg.depends_on !== undefined) {
     const result = validateDependsOn(cfg.depends_on, 'depends_on');
@@ -454,6 +500,74 @@ function validateEnvObject(
     }
     if (typeof v !== 'string' && typeof v !== 'number' && typeof v !== 'boolean') {
       return { valid: false, error: `${label}.${k} must be a string, number, or boolean` };
+    }
+  }
+  return { valid: true };
+}
+
+/** Keys accepted under a drop.yaml `secrets.<NAME>` object declaration. */
+const ALLOWED_SECRET_KEYS = new Set(['required', 'generate', 'description']);
+
+/**
+ * Cap on `secrets:` entries per block. Each declared `generate` secret triggers
+ * an atomic rewrite of the shared secrets store at start, so an unbounded map
+ * would let one app's drop.yaml degrade every tenant's deploy. Real apps need a
+ * handful; 50 is generous headroom.
+ */
+const MAX_SECRET_DECLS = 50;
+
+/**
+ * Validate a `secrets:` map (PRD-051). Each key is an env var name; each value
+ * is a declaration in one of these forms:
+ * - boolean (`true` = required)
+ * - string `"required"` or `"generate"`
+ * - object `{ required?, generate?: "random", description? }`
+ * Shared by the top-level `secrets` and per-service `secrets`.
+ */
+function validateSecretsObject(
+  value: unknown,
+  label: string,
+): { valid: boolean; error?: string } {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return { valid: false, error: `${label} must be an object` };
+  }
+  const entries = Object.entries(value as Record<string, unknown>);
+  if (entries.length > MAX_SECRET_DECLS) {
+    return {
+      valid: false,
+      error: `${label} declares ${entries.length} secrets, exceeding the limit of ${MAX_SECRET_DECLS}`,
+    };
+  }
+  for (const [name, decl] of entries) {
+    if (!name || typeof name !== 'string') {
+      return { valid: false, error: `${label} keys must be non-empty strings` };
+    }
+    if (typeof decl === 'boolean') {
+      continue;
+    }
+    if (typeof decl === 'string') {
+      if (decl !== 'required' && decl !== 'generate') {
+        return { valid: false, error: `${label}.${name} shorthand must be "required" or "generate"` };
+      }
+      continue;
+    }
+    if (typeof decl !== 'object' || decl === null || Array.isArray(decl)) {
+      return { valid: false, error: `${label}.${name} must be a boolean, "required"/"generate", or an object` };
+    }
+    const d = decl as Record<string, unknown>;
+    for (const key of Object.keys(d)) {
+      if (!ALLOWED_SECRET_KEYS.has(key)) {
+        return { valid: false, error: `Unknown field '${label}.${name}.${key}' in drop.yaml` };
+      }
+    }
+    if (d.required !== undefined && typeof d.required !== 'boolean') {
+      return { valid: false, error: `${label}.${name}.required must be a boolean` };
+    }
+    if (d.generate !== undefined && d.generate !== 'random') {
+      return { valid: false, error: `${label}.${name}.generate must be "random"` };
+    }
+    if (d.description !== undefined && typeof d.description !== 'string') {
+      return { valid: false, error: `${label}.${name}.description must be a string` };
     }
   }
   return { valid: true };
@@ -620,6 +734,10 @@ function validateServiceConfig(
   }
   if (svc.build_env !== undefined) {
     const result = validateEnvObject(svc.build_env, `services.${name}.build_env`);
+    if (!result.valid) return result;
+  }
+  if (svc.secrets !== undefined) {
+    const result = validateSecretsObject(svc.secrets, `services.${name}.secrets`);
     if (!result.valid) return result;
   }
 

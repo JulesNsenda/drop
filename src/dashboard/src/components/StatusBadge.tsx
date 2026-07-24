@@ -15,6 +15,15 @@ const statusTones: Record<string, string> = {
   // Was up, now restarting repeatedly (post-deploy liveness watch) — a warning
   // tone, distinct from the terminal `errored` (err/red) state.
   'crash-looping': 'dui-badge-warn',
+  // Parked because required secrets from drop.yaml aren't set yet — actionable,
+  // not an error, so it shares the warn tone rather than err.
+  'needs-config': 'dui-badge-warn',
+};
+
+// Friendly display text for statuses whose raw value reads awkwardly as-is;
+// everything else falls back to the raw status string below.
+const statusLabels: Record<string, string> = {
+  'needs-config': 'Needs config',
 };
 
 function StatusBadge({ status }: StatusBadgeProps) {
@@ -30,7 +39,7 @@ function StatusBadge({ status }: StatusBadgeProps) {
           style={{ background: 'var(--ok)' }}
         />
       )}
-      {status}
+      {statusLabels[status] || status}
     </span>
   );
 }
