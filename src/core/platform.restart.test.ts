@@ -290,6 +290,27 @@ describe('DropPlatform.restartApp', () => {
     expect(app.missingSecrets).toBeUndefined();
   }, 20000);
 
+  it('parks a running app in needs-config when a hot-reload adds a required secret', async () => {
+    platform = makePlatform();
+    await platform.start();
+    const appPath = await createStaticApp('hotpark');
+    await deploy('hotpark', appPath);
+    expect(getStateManager().getApp('hotpark')?.status).toBe('running');
+
+    // Edit drop.yaml to declare a required secret, then trigger a hot-reload:
+    // the preflight throw must park (needs-config), NOT mark the app errored.
+    await fs.writeFile(path.join(appPath, 'drop.yaml'), 'type: static\nsecrets:\n  JWT_SECRET: required\n');
+    eventBus.publish('app:update', {
+      name: 'hotpark',
+      path: appPath,
+      reason: 'test-secret-added',
+      bypassCooldown: true,
+    });
+
+    await waitFor(() => getStateManager().getApp('hotpark')?.status === 'needs-config');
+    expect(getStateManager().getApp('hotpark')?.missingSecrets).toEqual(['JWT_SECRET']);
+  }, 20000);
+
   it('reflects a secret value changed since the last deploy in the restart spec', async () => {
     platform = makePlatform();
     await platform.start();
