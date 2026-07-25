@@ -5,7 +5,6 @@
  * Secrets are stored encrypted at rest using AES-256-GCM.
  */
 
-import * as crypto from 'crypto';
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import { writeJsonAtomic } from '../../utils/atomic-write';
@@ -230,29 +229,6 @@ export class SecretManager {
     if (!appSecrets) return [];
 
     return Object.keys(appSecrets);
-  }
-
-  /**
-   * SHA-256 fingerprint of an app's secret set, for boot reconciliation (M1)
-   * to detect a rotation/removal without ever decrypting a value (M1 review
-   * item 5, round-2 diff pass — the previous approach hashed getAll()'s
-   * PLAINTEXT, and platform.ts's own computeSecretFingerprint then wrote
-   * that hash into AppConfig, a 0644 YAML file — a much weaker boundary than
-   * this store's own 0600 encrypted JSON). Hashes each key with its STORED
-   * CIPHERTEXT (never decrypted here), sorted by key for determinism. IV
-   * churn on re-encrypting the SAME value only ever makes this differ from a
-   * previous fingerprint — the safe direction (one extra redeploy, never a
-   * missed one) — and the ciphertext is already high-entropy, so no
-   * additional salting is needed for this to be a good change-detector.
-   */
-  fingerprint(appName: string): string {
-    this.ensureInitialized();
-
-    const appSecrets = this.store!.secrets[appName] ?? {};
-    const entries = Object.entries(appSecrets)
-      .map(([key, encrypted]) => `${key}:${encrypted.ciphertext}`)
-      .sort();
-    return crypto.createHash('sha256').update(JSON.stringify(entries)).digest('hex');
   }
 
   /**

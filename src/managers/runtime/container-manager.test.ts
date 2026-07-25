@@ -496,33 +496,6 @@ describe('ContainerManager', () => {
       const info = await mgr.getStatus('my-app');
       expect(info?.pid).toBe(12345);
     });
-
-    // M1 review item 7 (round-2 diff pass): port was previously always null
-    // ("not re-derived from inspect"), which made boot reconciliation's
-    // portDrifted check structurally inert under docker isolation.
-    it('reports the published host port from NetworkSettings.Ports (item 7)', async () => {
-      const inspectInfo = makeInspectInfo('my-app', makeState(true));
-      (inspectInfo['NetworkSettings'] as Record<string, unknown>) = {
-        Networks: {},
-        Ports: { '4000/tcp': [{ HostIp: '127.0.0.1', HostPort: '4000' }] },
-      };
-      const container = makeMockContainer('my-app', inspectInfo);
-      const docker = makeDockerMock({ 'my-app': container }) as any;
-      const mgr = new ContainerManager(docker);
-
-      const info = await mgr.getStatus('my-app');
-      expect(info?.port).toBe(4000);
-    });
-
-    it('reports port null when no port binding is published', async () => {
-      // makeInspectInfo's default NetworkSettings has no Ports key.
-      const container = makeMockContainer('my-app', makeInspectInfo('my-app', makeState(true)));
-      const docker = makeDockerMock({ 'my-app': container }) as any;
-      const mgr = new ContainerManager(docker);
-
-      const info = await mgr.getStatus('my-app');
-      expect(info?.port).toBeNull();
-    });
   });
 
   describe('getAllStatus()', () => {

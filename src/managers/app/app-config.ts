@@ -28,52 +28,6 @@ export interface AppConfig {
   lastDeployedAt?: string;
   buildDuration?: number;
   /**
-   * SHA-256 hash over the sorted (relativePath, mtimeMs, size) tuple of every
-   * file/dir in the app's source tree, excluding build output/dependency
-   * dirs (node_modules, dist, build, ...) — see platform.ts's
-   * computeSourceMtimeMs. Boot reconciliation (M1, DROP_BOOT_RECONCILE)
-   * compares the CURRENT hash against this recorded value to decide whether
-   * a running app's source changed since it was last deployed. Deliberately
-   * mtime-to-mtime (well, tuple-to-tuple), not mtime-to-`lastDeployedAt`:
-   * `tar -x` preserves original mtimes, so a fresh deploy can land with older
-   * mtimes than its own deploy timestamp and would otherwise look unchanged
-   * forever. Hashing the whole tuple set (not just the single newest mtime,
-   * the M1 review round-2 item 2 fix) catches a deletion/rename that never
-   * touches the newest file, and a replaced file whose archived mtime lands
-   * below the tree's existing max — both of which a max-mtime-only signal
-   * missed on the tar/upload redeploy path. Absent on pre-M1 configs, on
-   * configs recorded before this hash replaced the raw max-mtime number, and
-   * for apps that have never deployed — all three read as "no recorded
-   * signature" and redeploy once (the migration seam).
-   */
-  sourceHash?: string;
-  /**
-   * SHA-256 fingerprint of the app's secret key/value set (sorted, hashed —
-   * never the plaintext values) as of the last successful deploy. `PUT`/
-   * `DELETE /api/v1/secrets/:name` has no restart hook, so the next start is
-   * the only point a rotated or revoked secret is actually applied; boot
-   * reconciliation (M1) compares this against the CURRENT fingerprint and
-   * forces a redeploy on any difference — otherwise a revoked secret would
-   * stay live in a skipped, still-running process indefinitely. Absent on
-   * pre-M1 configs and for apps that have never deployed.
-   */
-  secretFingerprint?: string;
-  /**
-   * SHA-256 fingerprint recorded at the last successful deploy — see
-   * container-config.ts's containerPolicyFingerprint (M1 review item 4,
-   * round-2 diff pass; replaces a hand-bumped integer version that could
-   * only ever be manually incremented and missed everything except an
-   * explicit doc-comment bump). Covers the fixed container-hardening
-   * constants (CapDrop, SecurityOpt, PidsLimit, ...) AND the operator-tunable
-   * inputs (apiPort, maxMemoryMbPerApp, maxCpusPerApp) that also affect a PM2
-   * app's env/max_memory_restart. Container hardening is fixed at
-   * container-creation time and reaches an existing container only by
-   * recreating it; boot reconciliation (M1) forces a redeploy when this is
-   * stale, regardless of isolation mode, so a policy change actually reaches
-   * already-running apps instead of only new ones.
-   */
-  runtimeSpecFingerprint?: string;
-  /**
    * Build output directory relative to the app root (e.g. 'dist'), as reported
    * by the build strategy after the last successful build. The static serve
    * path falls back to this when detection can't supply one: the manifest
@@ -252,13 +206,7 @@ export class AppConfigService {
   async saveConfig(config: AppConfig): Promise<void> {
     const configPath = this.getConfigPath(config.name);
     const content = yaml.stringify(config, { indent: 2 });
-    // M1 review item 5 (round-2 diff pass): 0600, matching secrets.json — a
-    // per-app config now also carries sourceHash/secretFingerprint/
-    // runtimeSpecFingerprint (boot reconciliation, M1), and the previous
-    // default (writeFileAtomic's 0644) left it world-readable. Existing
-    // files on disk pick this up on their NEXT write, same as any other
-    // progressive permission tightening.
-    await writeFileAtomic(configPath, content, { mode: 0o600 });
+    await writeFileAtomic(configPath, content);
     this.configs.set(config.name, config);
   }
 

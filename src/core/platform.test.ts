@@ -1534,12 +1534,7 @@ describe('buildStartSpec — DROP_API_KEY provisioning grant (PR2)', () => {
 
     expect(spec.env.DROP_API_KEY).toBeUndefined();
     expect(createApiKey).not.toHaveBeenCalled();
-    // M1 review item 8: revocation must actually invalidate a previous key —
-    // the delete now runs UNCONDITIONALLY (not only when re-minting), so a
-    // capability revoked to an empty scope list still deletes the stale key
-    // rather than leaving it valid forever. This assertion used to expect
-    // NO delete call here; that was pinning the bug this fix closes.
-    expect(deleteApiKeysByName).toHaveBeenCalledWith('app:app-ungranted:provision');
+    expect(deleteApiKeysByName).not.toHaveBeenCalled();
   });
 });
 
