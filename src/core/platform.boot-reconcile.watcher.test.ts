@@ -95,6 +95,7 @@ import { DropPlatform, createPlatform, PlatformConfig } from './platform';
 import { eventBus } from './event-bus';
 import { getStateManager, resetStateManager } from '../managers/app/state-manager';
 import { resetAppConfigService } from '../managers/app/app-config';
+import { DEFAULT_IGNORE_PATTERNS } from './watcher/watcher.config';
 
 /** Poll until `predicate` holds or the timeout elapses. */
 async function waitFor(
@@ -117,7 +118,33 @@ describe('DropPlatform boot reconciliation (M1) — real watcher (item A)', () =
   let platform2: DropPlatform | null = null;
 
   beforeEach(async () => {
-    tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'drop-boot-reconcile-watcher-'));
+    // NOT under os.tmpdir(). DEFAULT_IGNORE_PATTERNS contains '**/tmp/**',
+    // and on Linux os.tmpdir() IS /tmp — so a webapps dir there matches the
+    // watcher's own ignore list and chokidar correctly delivers no events at
+    // all. That makes every assertion in this file vacuous on Linux (the
+    // negative ones pass for the wrong reason) while passing on Windows,
+    // where os.tmpdir() is ...\AppData\Local\Temp and does not match.
+    // This is the only suite in the repo that drives a REAL watcher, so it is
+    // the only one the trap can reach.
+    const testRoot = path.join(os.homedir(), '.drop-test-tmp');
+    await fs.mkdir(testRoot, { recursive: true });
+    tempDir = await fs.mkdtemp(path.join(testRoot, 'drop-boot-reconcile-watcher-'));
+
+    // Fail loudly rather than vacuously if the root ever moves back under an
+    // ignored directory name. Without this, the negative assertions in this
+    // file ("no app:update fired") pass for the wrong reason — nothing fires
+    // at all — which is precisely how a working change got reverted once.
+    const ignoredDirNames = DEFAULT_IGNORE_PATTERNS.map(
+      (p) => p.match(/^\*\*\/(.+)\/\*\*$/)?.[1]
+    ).filter((n): n is string => Boolean(n));
+    const clash = tempDir.split(path.sep).find((seg) => ignoredDirNames.includes(seg));
+    if (clash) {
+      throw new Error(
+        `Test root ${tempDir} contains the watcher-ignored segment '${clash}'. ` +
+          `chokidar would deliver no events and every assertion in this suite ` +
+          `would be vacuous. Pick a root outside DEFAULT_IGNORE_PATTERNS.`
+      );
+    }
     webappsDir = path.join(tempDir, 'webapps');
     fakeRuntime.reset();
   });
