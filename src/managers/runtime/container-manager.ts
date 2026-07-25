@@ -538,27 +538,12 @@ export class ContainerManager implements AppRuntime {
         ? Date.now() - new Date(state.StartedAt).getTime()
         : 0;
 
-    // Host-published port (M1 review item 7, round-2 diff pass): the
-    // published port lives at NetworkSettings.Ports['<containerPort>/tcp'][0]
-    // .HostPort. This doesn't know the container-side port key ahead of
-    // time, but DROP's own container spec always publishes exactly ONE port
-    // binding, host==container (see start()'s PortBindings/ExposedPorts:
-    // `${hostPort}/tcp` -> HostPort: hostPort) — so taking the first
-    // published binding, whatever its key, is exactly as specific as
-    // knowing the key. Previously always null ("not re-derived from
-    // inspect"); this activates boot reconciliation's portDrifted check for
-    // docker for the first time — it was structurally inert before.
-    const publishedPort = Object.values(info.NetworkSettings?.Ports ?? {}).find(
-      (bindings) => bindings && bindings.length > 0
-    )?.[0]?.HostPort;
-    const port = publishedPort ? parseInt(publishedPort, 10) : null;
-
     return {
       name: appName,
       status: mapDockerState(state),
       runtime: this.type,
       pid,
-      port,
+      port: null, // port lives in the appconf; not re-derived from inspect
       memory: 0,  // populated by fetchContainerStats in getStatus when running
       cpu: 0,
       uptime,

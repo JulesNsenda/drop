@@ -301,11 +301,7 @@ describe('WatcherService', () => {
       '/test/apps',
       expect.objectContaining({
         persistent: true,
-        // M1 review item 6 (round-2 diff pass): true — chokidar suppresses
-        // its own initial-scan 'add'/'addDir' events at the source; a
-        // pre-existing app dir is still onboarded via handleReady's
-        // getWatched() loop, which chokidar populates regardless.
-        ignoreInitial: true,
+        ignoreInitial: false,
       })
     );
 
