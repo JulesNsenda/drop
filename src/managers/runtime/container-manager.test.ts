@@ -25,6 +25,9 @@ import {
   DEFAULT_PIDS_LIMIT,
   CONTAINER_CAP_DROP,
   CONTAINER_SECURITY_OPT,
+  DROP_NET_SUBNET,
+  DROP_NET_GATEWAY,
+  HOST_ALIAS,
 } from './container-config';
 
 // ── Docker mock helpers ──────────────────────────────────────────────────────
@@ -78,7 +81,12 @@ function makeMockContainer(_name: string, inspectData: Record<string, unknown>):
 
 function makeDockerMock(containers: Record<string, ReturnType<typeof makeMockContainer>> = {}) {
   const networkMock = {
-    inspect: jest.fn().mockResolvedValue({}),
+    // ICC disabled so ensureNetwork() returns early; no IPAM.Config so
+    // resolveHostGatewayIp() falls back to the pinned DROP_NET_GATEWAY.
+    inspect: jest.fn().mockResolvedValue({
+      Options: { 'com.docker.network.bridge.enable_icc': 'false' },
+    }),
+    remove: jest.fn().mockResolvedValue(undefined),
   };
   const imageMock = {
     inspect: jest.fn().mockResolvedValue({}),
@@ -278,6 +286,54 @@ describe('ContainerManager', () => {
 
       const call = docker.createContainer.mock.calls[0][0];
       expect((call.Env as string[]).some((e: string) => e.startsWith('PORT='))).toBe(true);
+    });
+
+    it("maps drop-host to drop-net's ACTUAL gateway, not the pinned constant", async () => {
+      const docker = makeDockerMock() as any;
+      // drop-net exists with a legacy (non-pinned) subnet — ICC disabled.
+      docker.getNetwork.mockReturnValue({
+        inspect: jest.fn().mockResolvedValue({
+          Options: { 'com.docker.network.bridge.enable_icc': 'false' },
+          IPAM: { Config: [{ Subnet: '172.20.0.0/16', Gateway: '172.20.0.1' }] },
+        }),
+        remove: jest.fn(),
+      });
+      const mgr = new ContainerManager(docker);
+
+      await mgr.start(baseSpec);
+
+      const call = docker.createContainer.mock.calls[0][0];
+      expect(call.HostConfig.ExtraHosts).toContain(`${HOST_ALIAS}:172.20.0.1`);
+    });
+
+    it('falls back to the pinned gateway when drop-net exposes no inspectable gateway', async () => {
+      const docker = makeDockerMock() as any; // default network mock: no IPAM.Config
+      const mgr = new ContainerManager(docker);
+
+      await mgr.start(baseSpec);
+
+      const call = docker.createContainer.mock.calls[0][0];
+      expect(call.HostConfig.ExtraHosts).toContain(`${HOST_ALIAS}:${DROP_NET_GATEWAY}`);
+    });
+  });
+
+  describe('ensureNetwork() — pinned drop-net IPAM', () => {
+    it('creates drop-net with the pinned subnet and gateway when it does not exist yet', async () => {
+      const docker = makeDockerMock() as any;
+      docker.getNetwork.mockReturnValue({
+        inspect: jest.fn().mockRejectedValue(new Error('no such network: drop-net')),
+        remove: jest.fn(),
+      });
+      const mgr = new ContainerManager(docker);
+
+      await mgr.start(baseSpec);
+
+      expect(docker.createNetwork).toHaveBeenCalledWith(
+        expect.objectContaining({
+          Name: DROP_NETWORK,
+          IPAM: { Config: [{ Subnet: DROP_NET_SUBNET, Gateway: DROP_NET_GATEWAY }] },
+        })
+      );
     });
   });
 
@@ -502,6 +558,23 @@ describe('selectBaseImage', () => {
 
   it('returns python:3.12-slim for python', () => {
     expect(selectBaseImage('python')).toBe('python:3.12-slim');
+  });
+
+  // Python web frameworks: the detector reports the specific type
+  // (django/flask/fastapi) and the BUILD image is selected from that wide
+  // type (platform.ts passes `detection.type`). Without these BASE_IMAGES
+  // entries they fell back to node:20-slim, where `pip` doesn't exist —
+  // the build failed with "/bin/sh: 1: pip: not found".
+  it('returns python:3.12-slim for django', () => {
+    expect(selectBaseImage('django')).toBe('python:3.12-slim');
+  });
+
+  it('returns python:3.12-slim for flask', () => {
+    expect(selectBaseImage('flask')).toBe('python:3.12-slim');
+  });
+
+  it('returns python:3.12-slim for fastapi', () => {
+    expect(selectBaseImage('fastapi')).toBe('python:3.12-slim');
   });
 
   it('returns golang:1.22-alpine for go', () => {

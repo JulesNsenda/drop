@@ -106,17 +106,18 @@ describe('GET /api/v1/apps/:name DTO contract', () => {
     expect(body.data.status).not.toBe('online');
   });
 
-  it('exposes pid, memory, cpu, restarts to admin', async () => {
+  it('exposes pid, memory, cpu, uptime, restarts to admin', async () => {
     const res = await hono.request('/api/v1/apps/test-app', { headers: authHeader(adminToken) });
     expect(res.status).toBe(200);
     const body = (await res.json()) as { data: Record<string, unknown> };
     expect(body.data.pid).toBe(12345);
     expect(body.data.memory).toBe(104857600);
     expect(body.data.cpu).toBe(1.5);
+    expect(body.data.uptime).toBe(60000);
     expect(body.data.restarts).toBe(2);
   });
 
-  it('hides pid from non-admin but shows memory/cpu/restarts to app owner', async () => {
+  it('hides pid from non-admin but shows memory/cpu/uptime/restarts to app owner', async () => {
     const res = await hono.request('/api/v1/apps/test-app', { headers: authHeader(userToken) });
     expect(res.status).toBe(200);
     const body = (await res.json()) as { data: Record<string, unknown> };
@@ -124,6 +125,7 @@ describe('GET /api/v1/apps/:name DTO contract', () => {
     // App owner can see live resource stats (shown on dashboard cards)
     expect(body.data.memory).toBe(104857600);
     expect(body.data.cpu).toBe(1.5);
+    expect(body.data.uptime).toBe(60000);
     expect(body.data.restarts).toBe(2);
   });
 
@@ -135,6 +137,7 @@ describe('GET /api/v1/apps/:name DTO contract', () => {
     expect(body.data.name).toBe('test-app');
     expect(body.data.memory).toBeUndefined();
     expect(body.data.cpu).toBeUndefined();
+    expect(body.data.uptime).toBeUndefined();
     expect(body.data.restarts).toBeUndefined();
   });
 
@@ -145,6 +148,56 @@ describe('GET /api/v1/apps/:name DTO contract', () => {
     const body = (await res.json()) as { data: Record<string, unknown> };
     expect(body.data.name).toBe('test-app');
     expect(body.data.memory).toBeUndefined();
+  });
+
+  it('omits group for a standalone app (M4)', async () => {
+    const res = await hono.request('/api/v1/apps/test-app', { headers: authHeader(adminToken) });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { data: Record<string, unknown> };
+    expect(body.data.group).toBeUndefined();
+  });
+
+  it('exposes group for an app expanded from a monorepo deploy (M4)', async () => {
+    await getStateManager().updateApp('test-app', { group: 'ezsign' });
+    const res = await hono.request('/api/v1/apps/test-app', { headers: authHeader(adminToken) });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { data: Record<string, unknown> };
+    expect(body.data.group).toBe('ezsign');
+  });
+
+  it('omits groupGitBacked for a standalone app', async () => {
+    const res = await hono.request('/api/v1/apps/test-app', { headers: authHeader(adminToken) });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { data: Record<string, unknown> };
+    expect(body.data.groupGitBacked).toBeUndefined();
+  });
+
+  it('sets groupGitBacked when the group container was git-deployed (DROP-065)', async () => {
+    const sm = getStateManager();
+    await sm.updateApp('test-app', { group: 'ezsign' });
+    // The hidden container carries the group's gitSource.
+    await sm.registerApp('ezsign-repo', path.join(tempDir, 'ezsign-repo'));
+    await sm.updateApp('ezsign-repo', {
+      userId,
+      group: 'ezsign',
+      isGroupContainer: true,
+      gitSource: { repoUrl: 'https://github.com/acme/ezsign', branch: 'main', autoRedeploy: true },
+    });
+    const res = await hono.request('/api/v1/apps/test-app', { headers: authHeader(adminToken) });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { data: Record<string, unknown> };
+    expect(body.data.groupGitBacked).toBe(true);
+  });
+
+  it('omits groupGitBacked for a folder-dropped group (container has no gitSource)', async () => {
+    const sm = getStateManager();
+    await sm.updateApp('test-app', { group: 'ezsign' });
+    await sm.registerApp('ezsign-repo', path.join(tempDir, 'ezsign-repo'));
+    await sm.updateApp('ezsign-repo', { userId, group: 'ezsign', isGroupContainer: true });
+    const res = await hono.request('/api/v1/apps/test-app', { headers: authHeader(adminToken) });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { data: Record<string, unknown> };
+    expect(body.data.groupGitBacked).toBeUndefined();
   });
 });
 

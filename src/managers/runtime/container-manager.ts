@@ -35,6 +35,9 @@ import {
   DEFAULT_CPUS,
   DEFAULT_MEMORY,
   DEFAULT_PIDS_LIMIT,
+  DROP_NET_SUBNET,
+  DROP_NET_GATEWAY,
+  HOST_ALIAS,
   selectBaseImage,
   selectImageUser,
 } from './container-config';
@@ -91,6 +94,12 @@ export class ContainerManager implements AppRuntime {
 
     await this.ensureImage(image);
     await this.ensureNetwork();
+
+    // Map the in-container `drop-host` alias to drop-net's ACTUAL gateway
+    // (whatever subnet the network currently has), so the control-plane is
+    // reachable without depending on the network having been recreated with the
+    // pinned subnet — an in-place upgrade keeps its legacy subnet and still works.
+    const hostGatewayIp = await this.resolveHostGatewayIp();
 
     const name = containerName(spec.name);
     const appName = spec.name;
@@ -189,6 +198,9 @@ export class ContainerManager implements AppRuntime {
         SecurityOpt: CONTAINER_SECURITY_OPT,
         // Networking — attach to the DROP bridge; no host networking
         NetworkMode: DROP_NETWORK,
+        // Resolve the DROP control-plane API from inside the container via a
+        // fixed name mapped to drop-net's real gateway (resolved above).
+        ExtraHosts: [`${HOST_ALIAS}:${hostGatewayIp}`],
         // Bounded restart: cap at 5 retries to prevent OOM-looping apps from
         // thrashing the box.  'unless-stopped' has no cap and can overwhelm a
         // 4 GB server with a crash-looping app.
@@ -411,19 +423,29 @@ export class ContainerManager implements AppRuntime {
     }
 
     if (networkExists && iccDisabled) {
-      // Already correctly configured.
+      // Already correctly configured. The subnet is deliberately NOT required to
+      // match DROP_NET_SUBNET: `drop-host` is mapped to the network's ACTUAL
+      // gateway at container start (resolveHostGatewayIp), so an in-place upgrade
+      // keeps its legacy subnet and still reaches the control-plane — no
+      // migration / clean-restart needed. Pinning only governs freshly created
+      // networks below.
       return;
     }
 
     if (networkExists && !iccDisabled) {
-      // ICC is enabled — attempt to remove and recreate.  This may fail if
-      // containers are currently attached; in that case, log and leave it —
-      // the operator should restart DROP with no containers to fix ICC.
+      // ICC is ENABLED — a security regression (tenants could reach each other).
+      // Attempt to remove and recreate with ICC disabled. This may fail if
+      // containers are currently attached; warn and leave it — the operator
+      // should restart DROP with no running containers to re-disable ICC.
       try {
         await this.docker.getNetwork(DROP_NETWORK).remove();
         networkExists = false;
       } catch {
-        // Network is in use; ICC misconfiguration persists until next clean restart.
+        console.warn(
+          `[ContainerManager] WARNING: '${DROP_NETWORK}' has inter-container ` +
+            'communication ENABLED and could not be recreated because containers are ' +
+            'still attached. Restart DROP with no running containers to re-disable ICC.'
+        );
         return;
       }
     }
@@ -437,8 +459,47 @@ export class ContainerManager implements AppRuntime {
           // each other directly; cross-app traffic must go host→published port.
           'com.docker.network.bridge.enable_icc': 'false',
         },
+        // Pin a predictable subnet/gateway for freshly created networks. Not
+        // load-bearing (ExtraHosts uses the real gateway either way) — it just
+        // gives new installs a stable, uncommon range.
+        IPAM: { Config: [{ Subnet: DROP_NET_SUBNET, Gateway: DROP_NET_GATEWAY }] },
       });
     }
+  }
+
+  /**
+   * Resolve the gateway IP that the `drop-host` alias should map to — the ACTUAL
+   * IPv4 gateway of drop-net, whatever subnet it currently has. This is what makes
+   * the control-plane reachable without any migration: a box upgraded in place
+   * keeps its legacy drop-net subnet, and we point `drop-host` at *that* real
+   * gateway rather than a hardcoded constant that would be a dead IP (which is why
+   * an upgraded box saw ECONNREFUSED turn into a connect timeout).
+   *
+   * Falls back to the pinned `DROP_NET_GATEWAY` only if inspection yields no
+   * usable IPv4 gateway (e.g. inspect fails, or a race before the bridge is up).
+   */
+  private async resolveHostGatewayIp(): Promise<string> {
+    try {
+      const net = (await this.docker.getNetwork(DROP_NETWORK).inspect()) as {
+        IPAM?: { Config?: Array<{ Subnet?: string; Gateway?: string }> };
+      };
+      const configs = net.IPAM?.Config ?? [];
+      // Prefer an explicit IPv4 gateway (no ':' → not an IPv6 entry).
+      for (const cfg of configs) {
+        if (cfg.Gateway && !cfg.Gateway.includes(':')) return cfg.Gateway;
+      }
+      // Some auto-allocated networks omit Gateway; derive .1 from an IPv4 subnet
+      // (Docker's default bridge gateway is the first usable host address).
+      for (const cfg of configs) {
+        if (cfg.Subnet && !cfg.Subnet.includes(':')) {
+          const octets = cfg.Subnet.split('/')[0].split('.');
+          if (octets.length === 4) return `${octets[0]}.${octets[1]}.${octets[2]}.1`;
+        }
+      }
+    } catch {
+      // Fall through to the pinned constant.
+    }
+    return DROP_NET_GATEWAY;
   }
 
   private async removeIfExists(cName: string): Promise<void> {

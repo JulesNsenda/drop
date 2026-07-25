@@ -16,7 +16,7 @@ import { AuthContext, listUsers, getUserById } from '../middleware/auth';
 import { canAccess } from '../access';
 import { isValidAppName, validateAppName } from '../middleware/validate';
 import { getAppRuntime } from '../../managers/runtime';
-import { getPlatformOps, AppInProgressError } from '../platform-ops';
+import { getPlatformOps, AppInProgressError, AppNeedsConfigError } from '../platform-ops';
 import { getSecretManager } from '../../managers/secret';
 import { getDeployTracker } from '../../managers/deploy-tracker';
 import { migrateAppRuntime } from '../../managers/runtime/runtime-migrator';
@@ -24,6 +24,8 @@ import { hasEnoughDisk, getMinFreeDiskMb } from '../../utils/disk';
 import { getStateManager, AppState } from '../../managers/app/state-manager';
 import { getAppConfigService } from '../../managers/app/app-config';
 import { getDatabaseProvisioner } from '../../managers/database';
+import { getRedisProvisioner } from '../../managers/redis';
+import { getRouterService } from '../../core/router';
 import { tryLogActivity } from '../../managers/activity';
 import {
   getAppsDirectory,
@@ -98,17 +100,45 @@ function resolveUsername(userId?: string): string | undefined {
 export function computeAppUrl(app: AppState): string | undefined {
   let configDomains: string[] | undefined;
   let tlsDisabled = false;
+  let publicUrl: string | undefined;
   try {
     const cfg = getAppConfigService().getConfig(app.name);
     configDomains = cfg?.domains;
     tlsDisabled = cfg?.tls?.disabled === true;
+    publicUrl = cfg?.publicUrl;
   } catch {
     // Config service not initialised (e.g. isolated route tests) — use default host.
+  }
+  // A same-origin monorepo child is routed onto the group domain (frontend at
+  // '/', backend at '/api'), never its own `<name>` subdomain — so the
+  // name-based default below would be a dead link. handleConfigureRoute persists
+  // the real, fully-resolved URL as publicUrl. A custom domain still wins:
+  // declaring `domains` opts the child out of same-origin routing.
+  if (publicUrl && !app.customDomain && !configDomains?.length) {
+    return publicUrl;
   }
   const domain = app.customDomain || configDomains?.[0] || `${app.name}.${getDomainSuffix()}`;
   if (isLocalhostDomain(domain)) return undefined;
   const proto = isHttpsEnabled() && !tlsDisabled ? 'https' : 'http';
   return `${proto}://${domain}`;
+}
+
+/**
+ * Whether a monorepo group is git-redeployable: its hidden container entry
+ * (`isGroupContainer`, tagged with the group name) carries a `gitSource`.
+ * Folder-dropped groups have a container tag but no gitSource — not
+ * redeployable — and standalone apps have no group at all. Surfaced on child
+ * DTOs as `groupGitBacked` so the dashboard can offer "Redeploy group".
+ */
+function isGroupGitBacked(group: string): boolean {
+  try {
+    return getStateManager()
+      .getAllApps()
+      .some(a => a.isGroupContainer && a.group === group && !!a.gitSource);
+  } catch {
+    // State manager not initialised (e.g. isolated route tests) — treat as not git-backed.
+    return false;
+  }
 }
 
 // Helper to convert AppState to AppDto (role-aware)
@@ -128,10 +158,17 @@ function toAppDto(app: AppState, isAdmin = false): AppDto {
     lastDeployedAt: app.lastDeployedAt,
     buildDuration: app.buildDuration,
     error: app.error,
+    missingSecrets: app.missingSecrets,
     gitSource: app.gitSource,
     userId: app.userId,
     ownerName: isAdmin ? resolveUsername(app.userId) : undefined,
     customDomain: app.customDomain,
+    group: app.group,
+    // Emitted as `true` only for a group child whose container is git-backed;
+    // omitted otherwise (standalone apps redeploy via their own gitSource, and
+    // folder-dropped groups aren't git-redeployable at all).
+    groupGitBacked:
+      !app.gitSource && app.group && isGroupGitBacked(app.group) ? true : undefined,
   };
 }
 
@@ -181,8 +218,10 @@ apps.get('/', async c => {
   const stateManager = getStateManager();
   const allApps = stateManager.getAllApps();
 
-  // Filter by ownership
-  let filtered = allApps.filter(app => canAccess(auth, app));
+  // Filter by ownership. Monorepo container entries are internal bookkeeping
+  // (they carry the repo's gitSource for webhook matching, never run anything)
+  // — hide them; the group is represented by its child apps' `group` tag.
+  let filtered = allApps.filter(app => !app.isGroupContainer && canAccess(auth, app));
 
   // Apply query param filters
   const status = c.req.query('status');
@@ -200,12 +239,12 @@ apps.get('/', async c => {
 
   // Batch-fetch live stats from the runtime (best-effort; no-op on failure).
   // Joined by name so the list stays fast even if the runtime is unavailable.
-  const statsMap: Map<string, { memory: number; cpu: number }> = new Map();
+  const statsMap: Map<string, { memory: number; cpu: number; uptime: number }> = new Map();
   try {
     const pm = getAppRuntime();
     const allStatus = await pm.getAllStatus();
     for (const s of allStatus) {
-      statsMap.set(s.name, { memory: s.memory, cpu: s.cpu });
+      statsMap.set(s.name, { memory: s.memory, cpu: s.cpu, uptime: s.uptime });
     }
   } catch {
     // Runtime not yet ready — skip stats
@@ -219,6 +258,7 @@ apps.get('/', async c => {
         if (stats && a.status === 'running') {
           dto.memory = stats.memory;
           dto.cpu = stats.cpu;
+          dto.uptime = stats.uptime;
         }
         return dto;
       }),
@@ -252,6 +292,7 @@ apps.get('/:name', async c => {
           pid: isAdmin ? (procInfo.pid ?? app.pid) : undefined,
           memory: isOwner ? procInfo.memory : undefined,
           cpu: isOwner ? procInfo.cpu : undefined,
+          uptime: isOwner ? procInfo.uptime : undefined,
           restarts: procInfo.restarts,
         })
       );
@@ -479,14 +520,83 @@ apps.put('/:name', async c => {
   return c.json(success(toAppDto(updated, auth?.role === 'admin')));
 });
 
-// DELETE /apps/:name - Remove application
+// DELETE /apps/:name - Remove application (group-aware, M4)
 apps.delete('/:name', async c => {
   const auth = (c.get as Function)('auth') as AuthContext | undefined;
   const name = c.req.param('name');
+
+  // M4 (DELETE-during-build guard): a build/hot-reload still holds this app
+  // in appsInProgress. Tearing its state down now would wipe the record out
+  // from under the in-flight operation — whose later setAppStatus('errored')
+  // then no-ops because the app is gone — so the operator sees "not found"
+  // instead of "errored". Block until it settles (mirrors the start/restart
+  // AppInProgressError -> 409 pattern below, but checked synchronously since
+  // there's no teardown operation to catch it from).
+  if (getPlatformOps()?.isAppInProgress(name)) {
+    return c.json(
+      error(ErrorCodes.CONFLICT, `Application '${name}' is building or deploying — retry once it settles`),
+      409
+    );
+  }
+
   const stateManager = getStateManager();
   const app = stateManager.getApp(name);
 
-  if (!app || !canAccess(auth, app)) {
+  // Group teardown routes here two ways: `:name` is a monorepo GROUP name
+  // (the shared `group` tag several apps carry, not itself a registered app),
+  // or `:name` is the CONTAINER entry the deploy-from-git path registered —
+  // deleting a container as if it were a single app would rm the cloned repo
+  // folder and orphan the children, so it always means "delete the group".
+  // Require every child accessible (not just one) before tearing down the
+  // whole group — same IDOR posture as the single-app canAccess check below.
+  if (!app || app.isGroupContainer) {
+    if (app?.isGroupContainer && !canAccess(auth, app)) {
+      throw new NotFoundError(`Application '${name}' not found`);
+    }
+    const groupName = app?.isGroupContainer ? (app.group ?? name) : name;
+    const groupApps = stateManager.getAllApps().filter(a => a.group === groupName);
+    const groupChildren = groupApps.filter(a => !a.isGroupContainer);
+    // A container with zero children (failed expansion) is still deletable —
+    // removeGroup tears the container entry + folder down via its group tag.
+    if (!app && groupChildren.length === 0) {
+      throw new NotFoundError(`Application '${name}' not found`);
+    }
+    // IDOR gate over EVERY entry the teardown will destroy — containers
+    // included, since removeGroup tears those down too. Group tags are
+    // tenant-influenced (drop.yaml group:/name:), so a crafted collision must
+    // not let one user's group delete reach another user's container.
+    if (!groupApps.every(a => canAccess(auth, a))) {
+      throw new NotFoundError(`Application '${name}' not found`);
+    }
+
+    const ops = getPlatformOps();
+    if (!ops) {
+      return c.json(error(ErrorCodes.SERVICE_UNAVAILABLE, 'Platform operations unavailable'), 503);
+    }
+
+    // Group-aware extension of the same guard: the target is the group, not
+    // an individual app name, so the top-of-handler check above can't see a
+    // child mid-build. Block the whole-group teardown if any child is busy.
+    if (groupChildren.some(child => ops.isAppInProgress(child.name))) {
+      return c.json(
+        error(ErrorCodes.CONFLICT, `Group '${groupName}' has an app building or deploying — retry once it settles`),
+        409
+      );
+    }
+
+    const { removed } = await ops.removeGroup(groupName);
+
+    await tryLogActivity({
+      action: 'delete',
+      userId: auth?.userId,
+      username: auth?.username,
+      appName: groupName,
+    });
+
+    return c.json(success({ message: `Group '${groupName}' removed`, removed }));
+  }
+
+  if (!canAccess(auth, app)) {
     throw new NotFoundError(`Application '${name}' not found`);
   }
 
@@ -542,6 +652,15 @@ apps.delete('/:name', async c => {
       dbStatus = 'retained';
       console.warn(`[apps.delete] database teardown threw for ${name}:`, err);
     }
+
+    // Free the app's managed-Redis logical DB (FLUSHDB + release the number).
+    // Idempotent + fail-soft; a no-op when the app had no Redis. `?keepData=true`
+    // skips it (handled by the enclosing `else`).
+    try {
+      await getRedisProvisioner()?.deprovisionAppRedis(name);
+    } catch (err) {
+      console.warn(`[apps.delete] redis teardown threw for ${name}:`, err);
+    }
   }
 
   // Remove from state
@@ -577,6 +696,38 @@ apps.delete('/:name', async c => {
       await fs.rm(app.path, { recursive: true, force: true });
     } catch {
       // Folder may already be gone
+    }
+  }
+
+  // If this app was a monorepo group child and is now the LAST remaining
+  // child of its group, also remove the group's CONTAINER folder
+  // (webapps/<group>/, holding the root drop.yaml with `services:`) — left
+  // behind, it would regenerate the just-deleted child on the watcher's next
+  // scan. The container's own state entry carries the group tag too and must
+  // not count as a sibling; with no real children left it goes as well, or it
+  // would linger as an invisible orphan.
+  if (app.group) {
+    const groupApps = stateManager.getAllApps().filter(a => a.group === app.group);
+    const remainingSiblings = groupApps.filter(a => !a.isGroupContainer);
+    if (remainingSiblings.length === 0) {
+      // Only containers the requester may access: group tags are
+      // tenant-influenced, so a child delete must not cascade into another
+      // user's colliding container entry/folder.
+      for (const container of groupApps.filter(a => a.isGroupContainer && canAccess(auth, a))) {
+        try {
+          await stateManager.removeApp(container.name);
+          if (container.path) {
+            await fs.rm(container.path, { recursive: true, force: true });
+          }
+        } catch {
+          // Container entry/folder may already be gone
+        }
+      }
+      try {
+        await fs.rm(path.join(getAppsDirectory(), app.group), { recursive: true, force: true });
+      } catch {
+        // Container folder may already be gone
+      }
     }
   }
 
@@ -621,6 +772,15 @@ apps.post('/:name/start', async c => {
     if (err instanceof AppInProgressError) {
       return c.json(error(ErrorCodes.CONFLICT, err.message), 409);
     }
+    if (err instanceof AppNeedsConfigError) {
+      return c.json(
+        error(
+          ErrorCodes.CONFLICT,
+          `Application '${name}' needs configuration — set required secret(s): ${err.missingSecrets.join(', ')}, then retry`
+        ),
+        409
+      );
+    }
     const message = err instanceof Error ? err.message : 'Failed to start';
     return c.json(error(ErrorCodes.INTERNAL_ERROR, message), 500);
   }
@@ -642,6 +802,16 @@ apps.post('/:name/stop', async c => {
   try {
     await pm.stop(name);
     await stateManager.setAppStatus(name, 'stopped');
+
+    // Best-effort: a stopped app has no upstream to proxy to, so its Caddy
+    // routes should go too (M4 route-leak fix). A later restart re-adds them
+    // via the app:started -> handleConfigureRoute handler, so removing them
+    // here is safe. Non-fatal — a failure here shouldn't fail the stop.
+    try {
+      await getRouterService().removeRoutesForApp(name);
+    } catch {
+      // Router may not be initialised (tests / standalone ApiServer)
+    }
 
     await tryLogActivity({
       action: 'stop',
@@ -685,9 +855,107 @@ apps.post('/:name/restart', async c => {
     if (err instanceof AppInProgressError) {
       return c.json(error(ErrorCodes.CONFLICT, err.message), 409);
     }
+    if (err instanceof AppNeedsConfigError) {
+      return c.json(
+        error(
+          ErrorCodes.CONFLICT,
+          `Application '${name}' needs configuration — set required secret(s): ${err.missingSecrets.join(', ')}, then retry`
+        ),
+        409
+      );
+    }
     const message = err instanceof Error ? err.message : 'Failed to restart';
     return c.json(error(ErrorCodes.INTERNAL_ERROR, message), 500);
   }
+});
+
+/**
+ * Scopes an admin may grant via PUT /:name/capabilities. Deliberately a fixed
+ * allowlist (not "any string") — this is the only write path that populates
+ * `grantedApiScopes`, which platform.ts mints into a real DROP_API_KEY, so an
+ * unrecognized scope must be rejected rather than silently granted.
+ * See docs/plans/2026-07-11-scoped-provisioning-token.md.
+ */
+const GRANTABLE_API_SCOPES = ['users:create'] as const;
+
+// PUT /apps/:name/capabilities - Admin: set/clear the capability scopes DROP
+// grants this app's injected DROP_API_KEY (e.g. ['users:create']). Admin-only
+// gating is applied in server.ts (authMiddleware('admin')), not here. Persists
+// through AppConfigService (source of truth, survives restarts) then restarts
+// the app so platform.ts (re)mints and injects the scoped key. An empty array
+// clears the grant (and, on the next restart, the injected key).
+apps.put('/:name/capabilities', async c => {
+  const auth = (c.get as Function)('auth') as AuthContext | undefined;
+  const name = c.req.param('name');
+  const stateManager = getStateManager();
+  const app = stateManager.getApp(name);
+
+  if (!app) {
+    throw new NotFoundError(`Application '${name}' not found`);
+  }
+
+  const body = (await c.req.json()) as { scopes?: unknown };
+  const scopes = body.scopes;
+
+  if (!Array.isArray(scopes) || !scopes.every(s => typeof s === 'string')) {
+    throw new ValidationError('scopes must be an array of strings');
+  }
+
+  const unknownScopes = scopes.filter(
+    s => !(GRANTABLE_API_SCOPES as readonly string[]).includes(s)
+  );
+  if (unknownScopes.length > 0) {
+    throw new ValidationError(`Unknown scope(s): ${unknownScopes.join(', ')}`);
+  }
+
+  const updatedConfig = await getAppConfigService().updateConfig(name, {
+    grantedApiScopes: scopes,
+  });
+  if (!updatedConfig) {
+    // App exists in state but has no persisted config yet — nothing to grant against.
+    throw new NotFoundError(`Application '${name}' not found`);
+  }
+
+  const ops = getPlatformOps();
+  if (!ops) {
+    return c.json(error(ErrorCodes.SERVICE_UNAVAILABLE, 'Platform operations unavailable'), 503);
+  }
+
+  try {
+    await ops.restartApp(name);
+  } catch (err) {
+    if (err instanceof AppInProgressError) {
+      return c.json(error(ErrorCodes.CONFLICT, err.message), 409);
+    }
+    if (err instanceof AppNeedsConfigError) {
+      return c.json(
+        error(
+          ErrorCodes.CONFLICT,
+          `Application '${name}' needs configuration — set required secret(s): ${err.missingSecrets.join(', ')}, then retry`
+        ),
+        409
+      );
+    }
+    const message = err instanceof Error ? err.message : 'Failed to restart';
+    return c.json(error(ErrorCodes.INTERNAL_ERROR, message), 500);
+  }
+
+  await tryLogActivity({
+    action: 'grant-capabilities',
+    userId: auth?.userId,
+    username: auth?.username,
+    appName: name,
+  });
+
+  return c.json(
+    success({
+      message:
+        scopes.length > 0
+          ? `Capabilities granted for '${name}'`
+          : `Capabilities cleared for '${name}'`,
+      grantedApiScopes: scopes,
+    })
+  );
 });
 
 // PUT /apps/:name/domain - Set custom domain

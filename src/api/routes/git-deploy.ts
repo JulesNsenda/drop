@@ -11,6 +11,7 @@ import { ValidationError } from '../middleware/error';
 import { AuthContext } from '../middleware/auth';
 import { getGitDeployService } from '../../core/git-deploy';
 import { getStateManager } from '../../managers/app/state-manager';
+import { getSettingsManager } from '../../managers/settings/settings-manager';
 import { getUserById } from '../middleware/auth';
 import { canAccess } from '../access';
 import { tryLogActivity } from '../../managers/activity';
@@ -30,8 +31,9 @@ function warnWebhookSecretMissing(): void {
   if (webhookSecretWarned) return;
   webhookSecretWarned = true;
   console.warn(
-    '[git-webhook] DROP_GITHUB_WEBHOOK_SECRET is not set — webhook redeploys are NOT authenticated. ' +
-      'Set it to verify GitHub signatures. This will become a hard requirement in v1.0.'
+    '[git-webhook] No GitHub webhook secret is configured — webhook redeploys are NOT authenticated. ' +
+      'Set one from the dashboard (Settings → Git webhooks) or via DROP_GITHUB_WEBHOOK_SECRET to verify ' +
+      'GitHub signatures. This will become a hard requirement in v1.0.'
   );
 }
 
@@ -101,14 +103,35 @@ gitDeploy.post('/redeploy/:name', async (c) => {
     return c.json(error(ErrorCodes.SERVICE_UNAVAILABLE, 'git CLI is not available on this system'), 503);
   }
 
-  const app = getStateManager().getApp(name);
+  const stateManager = getStateManager();
+  const app = stateManager.getApp(name);
   if (!app || !canAccess(auth, app)) {
     return c.json(error(ErrorCodes.NOT_FOUND, `Application '${name}' not found`), 404);
   }
 
+  // Monorepo children carry no gitSource of their own — the group's hidden
+  // container holds it (and is what a git pull + re-expansion runs against).
+  // So "Redeploy" on any child resolves to its container: one pull re-pulls
+  // and re-materializes the whole group. The `group` tag is tenant-influenced
+  // (drop.yaml group:/name:), so a crafted collision could name a victim's
+  // group — re-check access on the RESOLVED container, mirroring the
+  // group-aware DELETE guard (apps.ts), before redeploying it.
+  let target = app;
+  if (!app.gitSource && app.group) {
+    const container = stateManager
+      .getAllApps()
+      .find(a => a.isGroupContainer && a.group === app.group && a.gitSource);
+    if (container) {
+      if (!canAccess(auth, container)) {
+        return c.json(error(ErrorCodes.NOT_FOUND, `Application '${name}' not found`), 404);
+      }
+      target = container;
+    }
+  }
+
   try {
-    const result = await service.redeploy(name);
-    await tryLogActivity({ action: 'redeploy', userId: auth?.userId, username: auth?.username, appName: name });
+    const result = await service.redeploy(target.name);
+    await tryLogActivity({ action: 'redeploy', userId: auth?.userId, username: auth?.username, appName: target.name });
     return c.json(success(result));
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Redeploy failed';
@@ -135,8 +158,10 @@ gitDeploy.post('/webhook', async (c) => {
   const rawBody = await c.req.text();
 
   // This endpoint is intentionally unauthenticated — the HMAC signature is
-  // its only authentication. Verify it before doing any work.
-  const webhookSecret = process.env.DROP_GITHUB_WEBHOOK_SECRET;
+  // its only authentication. Verify it before doing any work. Stored
+  // (dashboard-configured) secret wins over the env var — see
+  // docs/plans/2026-07-21-webhook-secret-ui.md.
+  const webhookSecret = getSettingsManager().getGithubWebhookSecret() ?? process.env.DROP_GITHUB_WEBHOOK_SECRET;
   if (webhookSecret) {
     if (!signature) {
       // Closing the bypass where omitting the header skipped verification.
@@ -159,7 +184,8 @@ gitDeploy.post('/webhook', async (c) => {
     return c.json(
       error(
         ErrorCodes.SERVICE_UNAVAILABLE,
-        'Webhook deploys are disabled: set DROP_GITHUB_WEBHOOK_SECRET to enable them'
+        'Webhook deploys are disabled: configure a GitHub webhook secret from the dashboard ' +
+          '(Settings → Git webhooks) or set DROP_GITHUB_WEBHOOK_SECRET to enable them'
       ),
       503
     );

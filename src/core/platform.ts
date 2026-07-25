@@ -7,13 +7,16 @@
 
 import * as path from 'path';
 import * as fs from 'fs/promises';
-import { EventBus, eventBus, Unsubscribe, AppDeletedPayload } from './event-bus';
+import * as yaml from 'yaml';
+import { EventBus, eventBus, Unsubscribe, AppDeletedPayload, AppDetectedPayload } from './event-bus';
 import { WatcherService } from './watcher';
-import { DetectorService, getDetector, parseDropYaml, DetectionResult } from './detector';
+import { DetectorService, getDetector, parseDropYaml, DetectionResult, DropYamlConfig } from './detector';
+import { getProcfileWebCommand } from './detector/procfile';
 import { BuilderService, getBuilder } from './builder';
 import { RouterService, getRouterService, resetRouterService } from './router';
 import { AppRuntime, AppProcessInfo, AppStartSpec, getAppRuntime, resetAppRuntime } from '../managers/runtime';
 import { AppStateManager, getStateManager, resetStateManager } from '../managers/app/state-manager';
+import { SettingsManager, getSettingsManager, resetSettingsManager } from '../managers/settings/settings-manager';
 import { AppConfigService, getAppConfigService, resetAppConfigService } from '../managers/app/app-config';
 import {
   PostgresServer,
@@ -23,6 +26,14 @@ import {
   getDatabaseProvisioner,
   resetDatabaseProvisioner,
 } from '../managers/database';
+import {
+  RedisServer,
+  getRedisServer,
+  resetRedisServer,
+  RedisProvisioner,
+  getRedisProvisioner,
+  resetRedisProvisioner,
+} from '../managers/redis';
 import { CaddyServer, getCaddyServer, resetCaddyServer } from '../managers/router';
 import { SecretManager, getSecretManager, resetSecretManager } from '../managers/secret';
 import { WebhookManager, getWebhookManager, resetWebhookManager } from './webhooks';
@@ -31,7 +42,8 @@ import { UploadDeployService, getUploadDeployService, resetUploadDeployService }
 import { getActivityLog, resetActivityLog } from '../managers/activity';
 import { getDeployTracker, resetDeployTracker } from '../managers/deploy-tracker';
 import { ApiServer, createApiServer } from '../api';
-import { AppInProgressError, setPlatformOps, resetPlatformOps } from '../api/platform-ops';
+import { AppInProgressError, AppNeedsConfigError, setPlatformOps, resetPlatformOps } from '../api/platform-ops';
+import { planSecretPreflight, generateSecretValue } from '../managers/secret/secret-preflight';
 import { Logger, createLogger } from '../utils/logger';
 import {
   validateDomain,
@@ -42,6 +54,7 @@ import { createApiKey, deleteApiKeysByName } from '../api/middleware/auth';
 import { IsolationMode, assertStartupConstraints } from './startup-constraints';
 import { createContainerExecCommand } from './builder/container-build-runner';
 import { migrateAllToDocker } from '../managers/runtime/runtime-migrator';
+import { HOST_ALIAS } from '../managers/runtime/container-config';
 import { buildNginxConf } from '../utils/nginx-conf';
 import { BuildLogService, getBuildLogService, resetBuildLogService } from '../managers/build-log/build-log';
 import {
@@ -50,6 +63,7 @@ import {
   resetLogRetentionService,
 } from '../managers/log-retention/log-retention';
 import { hasEnoughDisk, getMinFreeDiskMb } from '../utils/disk';
+import { probePort, probeHttp } from '../utils/http-probe';
 
 export interface PlatformConfig {
   /** Root directory for DROP */
@@ -111,6 +125,19 @@ export interface PlatformConfig {
   allowSignup: boolean;
   /** Max databases a single user may provision (0 = unlimited). */
   maxDbsPerUser: number;
+  /** Run the bundled managed Redis (per-app logical DB + injected REDIS_URL). Default true. */
+  enableRedis: boolean;
+  /** Host TCP port for the managed Redis instance (default 6380). */
+  redisPort: number;
+  /** Max managed-Redis logical DBs a single user may provision (0 = unlimited). */
+  maxRedisPerUser: number;
+  /**
+   * Run the secret preflight (PRD-051): before starting an app, auto-generate
+   * declared generatable secrets and PARK the app in `needs-config` if a
+   * declared-required secret is missing, instead of letting it crash-loop.
+   * Default true; the escape hatch is DROP_ENABLE_SECRET_PREFLIGHT=false.
+   */
+  enableSecretPreflight: boolean;
   /** Global limit on simultaneous builds (0 = unlimited). */
   maxConcurrentBuilds: number;
   /**
@@ -198,6 +225,10 @@ const DEFAULT_CONFIG: PlatformConfig = {
   isolation: (process.env.DROP_ISOLATION as IsolationMode) ?? 'none',
   allowSignup: process.env.DROP_ALLOW_SIGNUP === 'true',
   maxDbsPerUser: parseInt(process.env.DROP_MAX_DBS_PER_USER || '3', 10),
+  enableRedis: process.env.DROP_ENABLE_REDIS !== 'false',
+  redisPort: parseInt(process.env.DROP_REDIS_PORT || '6380', 10),
+  maxRedisPerUser: parseInt(process.env.DROP_MAX_REDIS_PER_USER || '3', 10),
+  enableSecretPreflight: process.env.DROP_ENABLE_SECRET_PREFLIGHT !== 'false',
   maxConcurrentBuilds: parseInt(process.env.DROP_MAX_CONCURRENT_BUILDS || '3', 10),
   maxConcurrentApps: parseInt(process.env.DROP_MAX_CONCURRENT_APPS || '0', 10),
   maxMemoryMbPerApp: parseInt(process.env.DROP_MAX_MEMORY_MB_PER_APP || '0', 10),
@@ -219,9 +250,12 @@ export class DropPlatform {
   private runtime: AppRuntime | null = null;
   private router: RouterService | null = null;
   private stateManager: AppStateManager | null = null;
+  private settingsManager: SettingsManager | null = null;
   private appConfigService: AppConfigService | null = null;
   private postgresServer: PostgresServer | null = null;
   private dbProvisioner: DatabaseProvisioner | null = null;
+  private redisServer: RedisServer | null = null;
+  private redisProvisioner: RedisProvisioner | null = null;
   private caddyServer: CaddyServer | null = null;
   private secretManager: SecretManager | null = null;
   private webhookManager: WebhookManager | null = null;
@@ -239,6 +273,14 @@ export class DropPlatform {
   private isRunning = false;
   private usedPorts: Map<number, string> = new Map(); // port -> appName ownership
   private appsInProgress: Set<string> = new Set(); // Track apps being built/started
+  // Builds deferred because the concurrent-build cap was full (appName -> its
+  // path + type hint). A first-boot or single-drop burst can briefly saturate
+  // the cap — in docker mode especially, where a first-time base-image pull
+  // holds a build slot for a while — and without a drain those deferred builds
+  // wait for a file change that may never come, so a static/other app "never
+  // starts automatically". `drainPendingBuilds` retries them as slots free.
+  private pendingBuilds: Map<string, { appPath: string; appType: string }> = new Map();
+  private buildDrainTimer: ReturnType<typeof setTimeout> | null = null;
   private appDeployTimes: Map<string, number> = new Map(); // Track when apps were last deployed
   // Apps whose rebuild+restart is being managed as a single transaction by
   // handleAppUpdate. Their builder.build still emits build:completed, but
@@ -254,6 +296,23 @@ export class DropPlatform {
   private readonly CERT_CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 hours
   /** Per-app health-probe intervals (PM2 mode only; Docker uses HEALTHCHECK). */
   private readonly healthProbers: Map<string, ReturnType<typeof setInterval>> = new Map();
+  /** Per-app post-deploy crash-loop watches (both modes; keyed on restart count). */
+  private readonly crashLoopWatchers: Map<string, ReturnType<typeof setInterval>> = new Map();
+  /** Restart count (over one watch interval) at/above which a running app is flagged crash-looping. */
+  private readonly CRASHLOOP_RESTART_THRESHOLD = 3;
+  /**
+   * Startup readiness window: how long handleStartApp waits for an app to
+   * prove it is up. A process that dies or crash-loops fails immediately
+   * regardless, so this bounds only the ambiguous "still booting?" case —
+   * raising it delays no real failure. 20s was under the cold-start time of
+   * ordinary apps (migrations, large dependency graphs, connection warm-up).
+   * Keep below the MCP deploy wait (DEFAULT_DEPLOY_WAIT_MS, 120s) so
+   * deploy_files still reports an outcome rather than timing out.
+   */
+  private readonly readinessTimeoutMs = Math.max(
+    50,
+    Number(process.env.DROP_READINESS_TIMEOUT_MS) || 60_000
+  );
 
   constructor(config?: Partial<PlatformConfig>) {
     // Load DNS credentials from environment variables
@@ -382,6 +441,13 @@ export class DropPlatform {
       this.certExpiryTimer = null;
     }
 
+    // Stop the pending-build drain
+    if (this.buildDrainTimer) {
+      clearTimeout(this.buildDrainTimer);
+      this.buildDrainTimer = null;
+    }
+    this.pendingBuilds.clear();
+
     // Stop the log-retention sweep
     if (this.logRetention) {
       this.logRetention.stop();
@@ -421,6 +487,12 @@ export class DropPlatform {
       resetStateManager();
     }
 
+    // Close settings manager
+    if (this.settingsManager) {
+      await this.settingsManager.close();
+      resetSettingsManager();
+    }
+
     // Reset app config service
     if (this.appConfigService) {
       resetAppConfigService();
@@ -440,6 +512,18 @@ export class DropPlatform {
       this.dbProvisioner = null;
     }
 
+    // Stop managed Redis + reset its singletons (provisioner depends on server).
+    if (this.redisServer) {
+      this.logger.info('Stopping managed Redis...', 'REDIS');
+      await this.redisServer.stop();
+      resetRedisServer();
+      this.redisServer = null;
+    }
+    if (this.redisProvisioner) {
+      resetRedisProvisioner();
+      this.redisProvisioner = null;
+    }
+
     // Stop Caddy server
     if (this.caddyServer) {
       this.logger.info('Stopping Caddy...', 'CADDY');
@@ -447,9 +531,11 @@ export class DropPlatform {
       resetCaddyServer();
     }
 
-    // Stop all health probers
+    // Stop all health probers and crash-loop watches
     for (const [, timer] of this.healthProbers) clearInterval(timer);
     this.healthProbers.clear();
+    for (const [, timer] of this.crashLoopWatchers) clearInterval(timer);
+    this.crashLoopWatchers.clear();
 
     // Reset secret manager, webhook manager, git deploy service, build logs,
     // and the platform-ops seam (routes must 503 once the platform is down).
@@ -528,6 +614,48 @@ export class DropPlatform {
     //     ├── backup/             # Automated backups
     //     └── temp/               # Temporary files
 
+    // Ensure ancestors exist first (default mode, same as everywhere else).
+    try {
+      await fs.mkdir(dataDir, { recursive: true });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') {
+        this.log('warn', `Failed to create directory: ${dataDir}`, error);
+      }
+    }
+
+    // Platform state (settings.json, secrets.json, encryption.key, ...) can
+    // hold plaintext secrets (e.g. the GitHub webhook HMAC secret) — keep the
+    // directory non-world-traversable, same rationale as `backup` below.
+    // (POSIX-effective only; on Windows this relies on NTFS ACL inheritance.)
+    //
+    // Two-step, not a single `recursive: true, mode: 0o700` mkdir:
+    //  1. Non-recursive create at 0700. Since `dataDir` already exists (or a
+    //     transient failure above left it missing, in which case this simply
+    //     ENOENTs and gets warn-logged rather than creating it), this call
+    //     has at most one path segment (`drop-svc`) to create — it is
+    //     structurally impossible for a non-recursive mkdir to stamp an
+    //     ancestor directory (`data/`, the drop root) 0700 and block
+    //     traversal into siblings like `data/webapps` for non-owner
+    //     processes. EEXIST is swallowed; other errors are warn-logged.
+    //  2. Unconditional chmod, in its own try/catch. `mkdir`'s `mode` only
+    //     applies at creation time, so step 1 alone would leave an install
+    //     upgraded from before this hardening was added at its old, looser
+    //     mode forever. Chmod-ing every start closes that gap for existing
+    //     installs too. Best-effort: warn on failure, and this is a no-op on
+    //     Windows (no POSIX mode bits) — never fatal either way.
+    try {
+      await fs.mkdir(path.join(dataDir, 'drop-svc'), { mode: 0o700 });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') {
+        this.log('warn', `Failed to create directory: ${path.join(dataDir, 'drop-svc')}`, error);
+      }
+    }
+    try {
+      await fs.chmod(path.join(dataDir, 'drop-svc'), 0o700);
+    } catch (error) {
+      this.log('warn', `Failed to set permissions on directory: ${path.join(dataDir, 'drop-svc')}`, error);
+    }
+
     const directories = [
       // Root
       this.config.dropRoot,
@@ -536,7 +664,6 @@ export class DropPlatform {
       // Data directories (preserved during upgrade)
       dataDir,
       this.config.appsDirectory, // data/webapps
-      path.join(dataDir, 'drop-svc'), // Platform state
       path.join(dataDir, 'drop-svc', 'pm2'), // PM2 config files
       path.join(dataDir, 'db'), // App databases
       path.join(dataDir, 'appdata'), // Per-app persistent data
@@ -804,11 +931,48 @@ backup:
     const internalDb = await this.dbProvisioner.ensureInternalDatabase();
     this.logger.info(`Internal database ready: ${internalDb.database}`, 'DATABASE');
 
+    // Initialize the managed Redis instance + provisioner. FAIL-SOFT: Redis is
+    // an optional convenience (apps can still use an external REDIS_URL secret),
+    // so a start failure (no redis-server on a dev host, docker hiccup) logs and
+    // continues rather than aborting platform start. Apps that need Redis then
+    // simply get no REDIS_URL — the same posture as Postgres-unavailable.
+    if (this.config.enableRedis) {
+      try {
+        this.logger.info('Initializing managed Redis...', 'REDIS');
+        this.redisServer = getRedisServer({
+          dropRoot: this.config.dropRoot,
+          port: this.config.redisPort,
+          useDocker: this.config.isolation === 'docker',
+          onLog: (msg) => this.logger.debug(msg, 'REDIS'),
+        });
+        await this.redisServer.start();
+        this.redisProvisioner = getRedisProvisioner(this.redisServer, this.config.dropRoot);
+        await this.redisProvisioner?.initialize();
+        this.logger.info(`Managed Redis running on port ${this.redisServer.getPort()}`, 'REDIS');
+      } catch (err) {
+        this.logger.warn(
+          'Managed Redis failed to start — apps needing Redis must use an external REDIS_URL secret',
+          'REDIS',
+          err
+        );
+        this.redisServer = null;
+        this.redisProvisioner = null;
+      }
+    }
+
     // Initialize state manager for app tracking
     const stateFilePath = path.join(this.config.dropRoot, 'data', 'drop-svc', 'apps.json');
     this.stateManager = getStateManager({ stateFilePath });
     await this.stateManager.initialize();
     this.logger.info('App state manager initialized', 'STATE');
+
+    // Initialize platform settings manager (admin-settable overrides, e.g.
+    // DROP_PUBLIC_URL — see PRD-041). Must be loaded before startApiServer()
+    // constructs the ApiServer, which reads getStoredPublicUrl() synchronously.
+    const settingsFilePath = path.join(this.config.dropRoot, 'data', 'drop-svc', 'settings.json');
+    this.settingsManager = getSettingsManager({ settingsFilePath });
+    await this.settingsManager.load();
+    this.logger.info('Settings manager initialized', 'CONFIG');
 
     // Initialize app config service for per-app config files
     const appConfigDir = path.join(this.config.dropRoot, 'data', 'appconf', 'webapps');
@@ -982,6 +1146,7 @@ backup:
     setPlatformOps({
       restartApp: (name) => this.restartApp(name),
       isAppInProgress: (name) => this.appsInProgress.has(name),
+      removeGroup: (name) => this.removeGroup(name),
     });
 
     this.logger.info(`API server running on port ${this.config.apiPort}`, 'API');
@@ -1104,42 +1269,9 @@ backup:
     // the watcher never emits watcher:change with changeType 'addDir'.
 
     // When app is detected, create config and build it
-    const detectedSub = this.eventBus.subscribe('app:detected', async (payload) => {
-      // Skip apps currently being cloned
-      if (this.gitDeployService?.isCloning(payload.name)) return;
-      // Skip apps currently being uploaded (PRD-039) — same rationale as the
-      // isCloning guard above: don't let the watcher onboard mid-upload.
-      if (this.uploadDeployService?.isUploading(payload.name)) return;
-
-      // Tell the watcher this app is known regardless of who published the
-      // detection (git deploy publishes deterministically after a clone) —
-      // otherwise the watcher's own debounced flush would emit a duplicate
-      // app:detected for the same app a few seconds later. After the
-      // isCloning guard on purpose: only mark what we actually onboard.
-      this.watcher?.markAppKnown(payload.name);
-
-      const appType = (payload.type || 'unknown') as 'nodejs' | 'python' | 'go' | 'static' | 'docker' | 'unknown';
-
-      // Create or update app config file (source of truth)
-      if (this.appConfigService) {
-        await this.appConfigService.upsertConfig(payload.name, {
-          type: appType,
-          path: payload.path,
-          hostname: `${payload.name}.localhost`,
-        });
-      }
-
-      // Register in state manager
-      if (this.stateManager) {
-        await this.stateManager.registerApp(payload.name, payload.path, appType);
-      }
-
-      // Build the app if auto-build is enabled (skip if user stopped it)
-      const currentApp = this.stateManager?.getApp(payload.name);
-      if (this.config.autoBuild && payload.type !== 'unknown' && currentApp?.status !== 'stopped') {
-        await this.handleBuildApp(payload.path, payload.name, payload.type as string);
-      }
-    });
+    const detectedSub = this.eventBus.subscribe('app:detected', (payload) =>
+      this.handleAppDetected(payload)
+    );
     this.subscriptions.push(detectedSub);
 
     // When build completes, start the app (unless it failed or was stopped).
@@ -1170,7 +1302,10 @@ backup:
       const shouldStart = this.config.autoStart && app?.status !== 'stopped';
 
       if (shouldStart) {
-        await this.handleStartApp(payload.appId); // owns appsInProgress cleanup
+        // owns appsInProgress cleanup. outputPath rides the payload because
+        // this dispatch happens synchronously inside build() — before
+        // handleBuildApp can persist it to the app config.
+        await this.handleStartApp(payload.appId, payload.outputPath);
       } else {
         if (app?.status === 'stopped') {
           this.logger.info(`Skipping auto-start for ${payload.appId} - app was stopped by user`, 'APP');
@@ -1201,6 +1336,7 @@ backup:
       const status = (payload.changes as { status?: string })?.status;
       if (status === 'stopped' || status === 'errored') {
         this.stopHealthProber(payload.appId);
+        this.stopCrashLoopWatch(payload.appId);
       }
     });
     this.subscriptions.push(statusSub);
@@ -1211,24 +1347,42 @@ backup:
     // fires from the watcher's chokidar unlinkDir handler (a folder momentarily
     // vanishing, e.g. mid-redeploy) and would free a live/just-redeployed app's
     // port out from under it. See docs/plans/2026-07-07-p2-5-disk-and-port-guards.md.
-    const deletedSub = this.eventBus.subscribe('app:deleted', (payload) => {
-      this.handleAppDeleted(payload);
+    const deletedSub = this.eventBus.subscribe('app:deleted', async (payload) => {
+      await this.handleAppDeleted(payload);
     });
     this.subscriptions.push(deletedSub);
   }
 
   /**
-   * Release every port owned by a deleted app. Reverse-lookup over
-   * `usedPorts` (Map<port, appName>) rather than a single stored port,
-   * because the map is the only place ownership is tracked. Excludes the
-   * '__anonymous__' sentinel, which never corresponds to a real app name.
+   * Release every port owned by a deleted app, and remove any Caddy routes
+   * it still owns. Reverse-lookup over `usedPorts` (Map<port, appName>)
+   * rather than a single stored port, because the map is the only place
+   * ownership is tracked. Excludes the '__anonymous__' sentinel, which never
+   * corresponds to a real app name.
+   *
+   * Route removal is the general fix for M4's route-leak: `app:deleted` is
+   * published by every `stateManager.removeApp` call (the only production
+   * call site is the DELETE /apps/:name route, including via
+   * `teardownApp`/`removeGroup`'s own explicit — and here, redundant but
+   * harmless — removal), so hooking it here covers deletion universally, not
+   * just the paths that happen to also call `removeRoutesForApp` directly.
    */
-  private handleAppDeleted(payload: AppDeletedPayload): void {
+  private async handleAppDeleted(payload: AppDeletedPayload): Promise<void> {
     for (const [port, owner] of this.usedPorts.entries()) {
       if (owner === payload.name && owner !== '__anonymous__') {
         this.usedPorts.delete(port);
         this.logger.debug(`Released port ${port} for deleted app ${payload.name}`, 'PORT');
       }
+    }
+
+    try {
+      await this.router?.removeRoutesForApp(payload.appId);
+    } catch (err) {
+      this.logger.warn(
+        `Failed to remove routes for deleted app ${payload.appId}`,
+        'ROUTER',
+        err
+      );
     }
   }
 
@@ -1279,53 +1433,217 @@ backup:
   }
 
   /**
-   * Parse drop.yaml and resolve depends_on to get dependency URLs
-   * Returns environment variables to inject based on dependent apps
+   * Whether an app wants managed Redis. An explicit `redis:` in drop.yaml wins
+   * (true opts in, false opts out); otherwise auto-detect a Redis client in the
+   * app's package.json dependencies — the same "detect from project files"
+   * approach appNeedsDatabase uses for ORM config. Non-Node apps opt in via
+   * `redis: true` in drop.yaml.
+   */
+  private async appNeedsRedis(appPath: string): Promise<boolean> {
+    const dropYaml = await parseDropYaml(appPath);
+    if (dropYaml.success && typeof dropYaml.config?.redis === 'boolean') {
+      return dropYaml.config.redis;
+    }
+
+    try {
+      const pkgRaw = await fs.readFile(path.join(appPath, 'package.json'), 'utf-8');
+      const pkg = JSON.parse(pkgRaw) as {
+        dependencies?: Record<string, string>;
+        devDependencies?: Record<string, string>;
+      };
+      const deps = { ...(pkg.dependencies ?? {}), ...(pkg.devDependencies ?? {}) };
+      const redisClients = [
+        'ioredis',
+        'redis',
+        'bullmq',
+        '@nestjs/bullmq',
+        'bull',
+        'rate-limit-redis',
+        'connect-redis',
+      ];
+      if (redisClients.some((c) => c in deps)) {
+        return true;
+      }
+    } catch {
+      // No/unreadable package.json — not a Node app, or nothing to detect.
+    }
+
+    return false;
+  }
+
+  /**
+   * Provision (or fetch the existing) managed-Redis env vars for an app.
+   * Idempotent and fail-soft: returns {} when Redis is unavailable, the app
+   * doesn't need it, or the user's quota is exceeded. Shared by the first-deploy
+   * start path and the hot-reload/restart path (which just re-fetches the
+   * existing allocation). The app-facing host is the container-reachable
+   * `drop-host` alias under docker isolation, loopback otherwise.
+   */
+  private async provisionRedisEnvVars(
+    appName: string,
+    appPath: string
+  ): Promise<Record<string, string>> {
+    if (!this.redisProvisioner) {
+      return {};
+    }
+    const redisHost = this.config.isolation === 'docker' ? HOST_ALIAS : '127.0.0.1';
+
+    // Already provisioned (e.g. hot-reload/restart) — just return its URL.
+    if (this.redisProvisioner.isProvisioned(appName)) {
+      return this.redisProvisioner.getEnvVars(appName, { host: redisHost }) || {};
+    }
+
+    if (!(await this.appNeedsRedis(appPath))) {
+      return {};
+    }
+
+    // Per-user quota (mirrors the Postgres DB quota).
+    const ownerUserId = this.stateManager?.getApp(appName)?.userId;
+    if (ownerUserId !== undefined && this.config.maxRedisPerUser > 0) {
+      const count = (this.stateManager?.getAllApps() ?? []).filter(
+        (a) => a.userId === ownerUserId && this.redisProvisioner!.isProvisioned(a.name)
+      ).length;
+      if (count >= this.config.maxRedisPerUser) {
+        this.logger.warn(
+          `Redis quota reached for user ${ownerUserId} (${count}/${this.config.maxRedisPerUser}), ` +
+            `skipping Redis for ${appName}`,
+          'REDIS'
+        );
+        return {};
+      }
+    }
+
+    try {
+      const alloc = await this.redisProvisioner.provisionAppRedis(appName);
+      this.logger.info(`Redis provisioned for ${appName}: logical db ${alloc.db}`, 'REDIS');
+      return this.redisProvisioner.getEnvVars(appName, { host: redisHost }) || {};
+    } catch (err) {
+      this.logger.warn(`Redis provisioning failed for ${appName}`, 'REDIS', err);
+      return {};
+    }
+  }
+
+  /**
+   * Parse drop.yaml and resolve depends_on to get dependency URLs.
+   * Returns environment variables to inject based on dependent apps.
+   *
+   * Resolution is config-based (via appConfigService.getConfig), NOT the
+   * running app's runtime port — a dependency need only be REGISTERED, not
+   * running, for this to resolve, which removes build-ordering. It also
+   * means the URL is browser-reachable (hostname-based) whenever the
+   * dependency has a custom domain or the platform serves a real domain
+   * suffix, instead of always being a server-local `localhost:<port>` that a
+   * browser can never reach.
    */
   private async resolveDependencies(appPath: string, appName: string): Promise<Record<string, string>> {
     const envVars: Record<string, string> = {};
 
-    try {
-      const dropYamlPath = path.join(appPath, 'drop.yaml');
-      await fs.access(dropYamlPath);
+    const dropYaml = await parseDropYaml(appPath);
+    if (!dropYaml.success || !dropYaml.config?.depends_on?.length) {
+      return envVars;
+    }
 
-      const content = await fs.readFile(dropYamlPath, 'utf-8');
-
-      // Simple YAML parsing for depends_on section
-      // Format:
-      // depends_on:
-      //   - name: todo-api
-      //     env: API_URL
-      const dependsOnMatch = content.match(/depends_on:\s*\n((?:\s+-[^\n]+\n?)+)/);
-      if (!dependsOnMatch) return envVars;
-
-      const dependsOnBlock = dependsOnMatch[1];
-      const dependencies: Array<{ name: string; env: string }> = [];
-
-      // Parse each dependency
-      const depMatches = dependsOnBlock.matchAll(/-\s*name:\s*(\S+)\s*\n\s*env:\s*(\S+)/g);
-      for (const match of depMatches) {
-        dependencies.push({ name: match[1], env: match[2] });
+    for (const dep of dropYaml.config.depends_on) {
+      const baseUrl = this.resolveDependencyUrl(dep.name);
+      if (!baseUrl) {
+        this.logger.warn(`Dependency ${dep.name} not found or not configured for ${appName}`, 'DEPS');
+        continue;
       }
 
-      // Resolve each dependency
-      for (const dep of dependencies) {
-        if (!this.stateManager) continue;
-
-        const depApp = this.stateManager.getApp(dep.name);
-        if (depApp && depApp.port) {
-          const url = `http://localhost:${depApp.port}`;
-          envVars[dep.env] = url;
-          this.logger.info(`Resolved dependency ${dep.name} -> ${dep.env}=${url}`, 'DEPS');
-        } else {
-          this.logger.warn(`Dependency ${dep.name} not found or not running for ${appName}`, 'DEPS');
-        }
-      }
-    } catch {
-      // No drop.yaml or parsing error - not a problem
+      const url = dep.path ? this.joinDependencyUrlPath(baseUrl, dep.path) : baseUrl;
+      envVars[dep.env] = url;
+      this.logger.info(`Resolved dependency ${dep.name} -> ${dep.env}=${url}`, 'DEPS');
     }
 
     return envVars;
+  }
+
+  /**
+   * Resolve the browser-reachable base URL for a registered dependency app,
+   * from its persisted config — never the runtime/state-manager port.
+   *
+   * Precedence:
+   * 1. The dependency's own custom domain (drop.yaml `domains`), if set.
+   * 2. The platform's default hostname for the app (`<dep>.<domainSuffix>`),
+   *    whenever a real (non-localhost) domain suffix is configured — this is
+   *    the same hostname handleConfigureRoute always registers a route for,
+   *    regardless of `enableHttps` (which only toggles TLS on that route, so
+   *    protocol - not existence - is what depends on it).
+   * 3. `http://localhost:<port>` as the pure-local-dev fallback, using the
+   *    dependency's *configured* port (source of truth across restarts).
+   *
+   * Returns undefined when the dependency has no config at all (unknown /
+   * not yet registered) or no fallback is resolvable.
+   */
+  private resolveDependencyUrl(depName: string): string | undefined {
+    const depConfig = this.appConfigService?.getConfig(depName);
+    if (!depConfig) return undefined;
+
+    const domainSuffix = this.config.domainSuffix || 'localhost';
+
+    const customDomain =
+      depConfig.domains && depConfig.domains.length > 0 ? depConfig.domains[0] : undefined;
+    if (customDomain) {
+      const protocol = this.config.enableHttps && !isLocalhostDomain(customDomain) ? 'https' : 'http';
+      return `${protocol}://${customDomain}`;
+    }
+
+    if (!isLocalhostDomain(domainSuffix)) {
+      const protocol = this.config.enableHttps ? 'https' : 'http';
+      return `${protocol}://${depName}.${domainSuffix}`;
+    }
+
+    if (depConfig.port) {
+      return `http://localhost:${depConfig.port}`;
+    }
+
+    return undefined;
+  }
+
+  /** Append a drop.yaml dependency `path` to a resolved base URL, normalizing slashes. */
+  private joinDependencyUrlPath(baseUrl: string, depPath: string): string {
+    const base = baseUrl.replace(/\/+$/, '');
+    const suffix = depPath.startsWith('/') ? depPath : `/${depPath}`;
+    return `${base}${suffix}`;
+  }
+
+  /**
+   * Build the env map handed to the builder's child process for a fresh
+   * build (handleBuildApp) or a hot-reload rebuild (handleAppUpdate). Shared
+   * so the two call sites can't drift.
+   *
+   * Precedence (later wins): drop.yaml `env` (runtime env, also usable at
+   * build time) -> drop.yaml `build_env` (build-only, e.g. Vite `VITE_*`
+   * vars a static bundler inlines) -> resolved `depends_on` URLs (highest
+   * precedence — a build must always see the current, browser-reachable
+   * dependency URL, not a stale build-time default).
+   *
+   * All values are coerced to strings: drop.yaml allows number/boolean
+   * scalars, but a child process env must be `Record<string, string>`.
+   */
+  private async resolveBuildEnv(appPath: string, appName: string): Promise<Record<string, string>> {
+    const dropYaml = await parseDropYaml(appPath);
+    const config = dropYaml.success ? dropYaml.config : null;
+
+    const depEnvVars = await this.resolveDependencies(appPath, appName);
+
+    return {
+      ...this.coerceEnvRecord(config?.env),
+      ...this.coerceEnvRecord(config?.build_env),
+      ...depEnvVars,
+    };
+  }
+
+  /** Coerce drop.yaml's string|number|boolean env scalars to plain strings. */
+  private coerceEnvRecord(
+    rec?: Record<string, string | number | boolean>
+  ): Record<string, string> {
+    if (!rec) return {};
+    const out: Record<string, string> = {};
+    for (const [key, value] of Object.entries(rec)) {
+      out[key] = String(value);
+    }
+    return out;
   }
 
   /**
@@ -1344,6 +1662,274 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     this.logger.info(`Generated drop-config.js for static app`, 'DEPS');
   }
 
+  /**
+   * Matches path segments 'node_modules', '.git', 'dist', or 'build' anywhere
+   * in a path, bounded by path separators (or string start/end) so real
+   * prefixes like 'distribution/' aren't accidentally excluded.
+   */
+  private static readonly MONOREPO_COPY_EXCLUDE_RE = /(^|[\\/])(node_modules|\.git|dist|build)([\\/]|$)/;
+
+  /**
+   * Expand a monorepo container (a repo whose root drop.yaml declares a
+   * `services:` map) into N ordinary top-level DROP apps — one per service.
+   *
+   * Fork C (docs/plans/2026-07-12-monorepo-multi-service.md, M2): each
+   * service's subtree is copied into its own top-level `webapps/<group>-<svc>`
+   * folder and onboarded exactly like any other single-app deploy, so the
+   * `appName == top-level-folder-name` invariant that the rest of the
+   * platform relies on (reconciliation, DELETE, hot-reload) is preserved.
+   * The container folder itself (`repoPath`) is never onboarded as an app.
+   *
+   * Idempotent: safe to re-run on every redeploy of the container (git pull /
+   * re-upload re-emits `app:detected`) — each service's folder is fully
+   * replaced (remove-then-copy) and its config/state are upserted, not
+   * duplicated.
+   */
+  private async expandMonorepo(
+    repoPath: string,
+    repoName: string,
+    config: DropYamlConfig
+  ): Promise<void> {
+    const group = (config.group || config.name || repoName).trim();
+    const services = config.services ?? {};
+    const serviceNames = new Set(Object.keys(services));
+
+    // The deploy-from-git path registers the cloned repo itself as an app
+    // before detection can know it's a container. That entry must survive —
+    // its gitSource is what webhook auto-redeploys match on — but it is not
+    // a runnable app: tag it so listings hide it and group teardown finds it
+    // (the group can differ from the entry's own name via drop.yaml
+    // name:/group:). Runs on every expansion, so a phantom left by an older
+    // platform heals on the next redeploy. Folder-dropped containers were
+    // never registered and no entry is created for them here.
+    if (this.stateManager?.hasApp(repoName)) {
+      await this.stateManager.updateApp(repoName, { group, isGroupContainer: true });
+    }
+
+    if (serviceNames.size > this.config.maxConcurrentBuilds) {
+      this.logger.warn(
+        `Monorepo group '${group}' declares ${serviceNames.size} services, which exceeds ` +
+          `maxConcurrentBuilds (${this.config.maxConcurrentBuilds}); services beyond the cap ` +
+          `will be deferred by the build queue ("Build queue full") rather than built immediately`,
+        'MONOREPO'
+      );
+    }
+
+    for (const [svcName, svc] of Object.entries(services)) {
+      try {
+        const childName = `${group}-${svcName}`;
+        if (!/^[a-zA-Z0-9_-]+$/.test(childName)) {
+          this.logger.warn(
+            `Skipping service '${svcName}' in monorepo group '${group}': derived app name ` +
+              `'${childName}' contains characters outside [a-zA-Z0-9_-]`,
+            'MONOREPO'
+          );
+          continue;
+        }
+
+        // Collision guard: refuse to clobber a standalone app (or an app from
+        // a different group) that already owns this name. Allow refresh when
+        // the existing config already belongs to this same group (redeploy).
+        const existing = this.appConfigService?.getConfig(childName);
+        if (existing && existing.group !== group) {
+          this.logger.warn(
+            `Skipping service '${svcName}': app '${childName}' already exists and does not ` +
+              `belong to monorepo group '${group}'`,
+            'MONOREPO'
+          );
+          continue;
+        }
+
+        const srcDir = path.join(repoPath, svc.path);
+        try {
+          const st = await fs.stat(srcDir);
+          if (!st.isDirectory()) {
+            this.logger.warn(
+              `Skipping service '${svcName}': '${svc.path}' in '${repoName}' is not a directory`,
+              'MONOREPO'
+            );
+            continue;
+          }
+        } catch {
+          this.logger.warn(
+            `Skipping service '${svcName}': path '${svc.path}' does not exist in '${repoName}'`,
+            'MONOREPO'
+          );
+          continue;
+        }
+
+        const childPath = path.join(this.config.appsDirectory, childName);
+
+        // Suppress the watcher's own onboarding of the folder we're about to
+        // write — we onboard it ourselves below, same as the interception
+        // above does for the container.
+        this.watcher?.markAppKnown(childName);
+
+        // Materialize (idempotent): drop any previous copy, then copy fresh,
+        // excluding node_modules/.git/dist/build so redeploys stay cheap and
+        // don't duplicate installed dependencies or build output.
+        await fs.rm(childPath, { recursive: true, force: true });
+        await fs.cp(srcDir, childPath, {
+          recursive: true,
+          force: true,
+          filter: (src: string) => !DropPlatform.MONOREPO_COPY_EXCLUDE_RE.test(src),
+        });
+
+        // Resolve type: honor an explicit override, else detect from the
+        // freshly copied subtree (the real source — the generated child
+        // drop.yaml written below doesn't exist yet at detection time). If
+        // the source subtree itself carries its own drop.yaml, it was copied
+        // above and gets overwritten by the generated one next.
+        let childType = svc.type;
+        if (!childType && this.detector) {
+          const det = await this.detector.detect(childPath, { silent: true });
+          childType = det.type;
+        }
+        childType = childType || 'static';
+
+        // Rewrite depends_on so a dependency naming a sibling service resolves
+        // to that sibling's real, group-qualified child app name. Dependencies
+        // on apps outside this group are left unchanged.
+        const dependsOn = svc.depends_on?.map(dep =>
+          serviceNames.has(dep.name) ? { ...dep, name: `${group}-${dep.name}` } : dep
+        );
+
+        // M3: `route` (services.<svc>.route) is now a top-level allowed key,
+        // so it is written into the child drop.yaml and applied by
+        // handleConfigureRoute as a same-origin Caddy path prefix (frontend at
+        // `/`, backend at `/api`).
+        const childConfig: DropYamlConfig = {
+          name: childName,
+          type: childType,
+          ...(svc.database ? { database: svc.database } : {}),
+          ...(typeof svc.redis === 'boolean' ? { redis: svc.redis } : {}),
+          ...(svc.domains && svc.domains.length > 0 ? { domains: svc.domains } : {}),
+          ...(svc.env ? { env: svc.env } : {}),
+          ...(svc.build_env ? { build_env: svc.build_env } : {}),
+          ...(svc.secrets ? { secrets: svc.secrets } : {}),
+          ...(svc.healthCheck ? { healthCheck: svc.healthCheck } : {}),
+          ...(svc.build ? { build: svc.build } : {}),
+          ...(svc.start ? { start: svc.start } : {}),
+          ...(svc.route ? { route: svc.route } : {}),
+          ...(dependsOn && dependsOn.length > 0 ? { depends_on: dependsOn } : {}),
+        };
+        await fs.writeFile(path.join(childPath, 'drop.yaml'), yaml.stringify(childConfig));
+
+        // Same narrowing cast the normal onboarding path (detectedSub) and
+        // handleBuildApp already use: the detector's AppType is wider than
+        // the stored config/state runtime union.
+        const narrowedType = childType as 'nodejs' | 'python' | 'go' | 'static' | 'docker' | 'unknown';
+
+        if (this.appConfigService) {
+          await this.appConfigService.upsertConfig(childName, {
+            type: narrowedType,
+            path: childPath,
+            hostname: `${childName}.localhost`,
+            group,
+          });
+        }
+        if (this.stateManager) {
+          await this.stateManager.registerApp(childName, childPath, narrowedType);
+          await this.stateManager.updateApp(childName, { group });
+        }
+
+        // Sequential await: gives declared-order onboarding for the common
+        // small-N case and stays under maxConcurrentBuilds without needing a
+        // further file change to retrigger queued services (a single drop
+        // produces none). If a service is deferred by the "Build queue full"
+        // guard in handleBuildApp, it is not silently lost — the warning above
+        // flags oversized groups — but it also won't auto-retrigger; that's
+        // acceptable for the common small-N case and left for a future pass.
+        if (this.config.autoBuild) {
+          await this.handleBuildApp(childPath, childName, childType);
+        }
+      } catch (error) {
+        this.logger.error(
+          `Failed to expand service '${svcName}' in monorepo group '${group}': ` +
+            `${error instanceof Error ? error.message : String(error)}`,
+          'MONOREPO'
+        );
+      }
+    }
+  }
+
+  /**
+   * Handles `app:detected`: onboards a newly-seen app (or a monorepo
+   * container) — persists its config/state and kicks off the initial build.
+   * Extracted from the `setupEventHandlers` subscription (a pure move, same
+   * behavior) so it can be exercised directly in tests without racing the
+   * real fs I/O inside `parseDropYaml` through the event bus's fire-and-forget
+   * dispatch.
+   */
+  private async handleAppDetected(payload: AppDetectedPayload): Promise<void> {
+    // Skip apps currently being cloned
+    if (this.gitDeployService?.isCloning(payload.name)) return;
+    // Skip apps currently being uploaded (PRD-039) — same rationale as the
+    // isCloning guard above: don't let the watcher onboard mid-upload.
+    if (this.uploadDeployService?.isUploading(payload.name)) return;
+
+    // Monorepo interception (M2): a root drop.yaml with a `services:` map
+    // describes a group container, never a single app. Materialize each
+    // declared service as its own top-level sibling app and skip the
+    // normal single-app onboarding below for the container folder itself.
+    const rootYaml = await parseDropYaml(payload.path);
+    if (rootYaml.success && rootYaml.config?.services && Object.keys(rootYaml.config.services).length > 0) {
+      this.watcher?.markAppKnown(payload.name);
+      // Hold the container name in appsInProgress for the duration of the
+      // expansion: the DELETE route's in-progress guard keys off it (a
+      // teardown must not interleave with the fs.rm/fs.cp of child folders)
+      // and a concurrent app:update for the container drops re-entrantly.
+      // finally-guaranteed release — a stuck entry would wedge the app.
+      this.appsInProgress.add(payload.name);
+      try {
+        await this.expandMonorepo(payload.path, payload.name, rootYaml.config);
+      } finally {
+        this.appsInProgress.delete(payload.name);
+      }
+      return;
+    }
+
+    // Tell the watcher this app is known regardless of who published the
+    // detection (git deploy publishes deterministically after a clone) —
+    // otherwise the watcher's own debounced flush would emit a duplicate
+    // app:detected for the same app a few seconds later. After the
+    // isCloning guard on purpose: only mark what we actually onboard.
+    this.watcher?.markAppKnown(payload.name);
+
+    const appType = (payload.type || 'unknown') as 'nodejs' | 'python' | 'go' | 'static' | 'docker' | 'unknown';
+
+    // Create or update app config file (source of truth)
+    if (this.appConfigService) {
+      await this.appConfigService.upsertConfig(payload.name, {
+        type: appType,
+        path: payload.path,
+        hostname: `${payload.name}.localhost`,
+      });
+    }
+
+    // Register in state manager
+    if (this.stateManager) {
+      await this.stateManager.registerApp(payload.name, payload.path, appType);
+    }
+
+    // Build the app if auto-build is enabled (skip if user stopped it)
+    const currentApp = this.stateManager?.getApp(payload.name);
+    if (this.config.autoBuild && payload.type !== 'unknown' && currentApp?.status !== 'stopped') {
+      await this.handleBuildApp(payload.path, payload.name, payload.type as string);
+    } else if (payload.type === 'unknown' && currentApp?.status !== 'stopped') {
+      // Detection couldn't resolve a type: the build guard above never fires
+      // for 'unknown', which used to leave the app registered at `pending`
+      // forever with no logs explaining why. Fail loudly instead — a later
+      // file change re-detects (handleAppUpdate only skips `stopped` apps),
+      // so adding a drop.yaml/Procfile/manifest recovers the app automatically.
+      await this.stateManager?.setAppStatus(payload.name, 'errored', {
+        error:
+          'Could not detect application type — add a drop.yaml, Procfile, or a recognized manifest ' +
+          '(requirements.txt, package.json, go.mod, Dockerfile, index.html)',
+      });
+    }
+  }
+
   private async handleBuildApp(appPath: string, appName: string, _appType: string): Promise<void> {
     if (!this.builder || !this.detector) return;
 
@@ -1353,8 +1939,9 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       return;
     }
 
-    // Enforce global concurrent build limit.  The deploy cooldown will
-    // re-trigger the build on the next file change once a slot opens.
+    // Enforce global concurrent build limit. Deferred builds are queued and
+    // retried by drainPendingBuilds as slots free, rather than waiting for a
+    // file change that may never arrive (which left apps stuck "not started").
     if (this.config.maxConcurrentBuilds > 0 &&
         this.appsInProgress.size >= this.config.maxConcurrentBuilds) {
       this.logger.warn(
@@ -1362,9 +1949,14 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         `deferring ${appName}`,
         'BUILD'
       );
+      this.pendingBuilds.set(appName, { appPath, appType: _appType });
+      this.scheduleBuildDrain();
       return;
     }
 
+    // Proceeding — drop any queued entry for this app so the drain doesn't
+    // start a duplicate build.
+    this.pendingBuilds.delete(appName);
     this.appsInProgress.add(appName);
 
     this.logger.appEvent('building', appName);
@@ -1425,16 +2017,19 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         );
       }
 
+      const buildEnv = await this.resolveBuildEnv(appPath, appName);
+      const buildOverride = (await parseDropYaml(appPath)).config?.build;
+
       const result = await this.builder.build({
         appName,
         appPath,
         appType: detection.type,
         framework: detection.framework || null,
         config: {
-          buildCommand: detection.suggestedConfig?.buildCommand,
+          buildCommand: buildOverride ?? detection.suggestedConfig?.buildCommand,
           installCommand: detection.suggestedConfig?.installCommand,
         },
-        env: {},
+        env: buildEnv,
         workDir,
         execCommand,
         onBuildLog: logId && this.buildLogService
@@ -1449,13 +2044,29 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       if (result.success) {
         this.appBuildDurations.set(appName, result.duration);
         this.logger.appEvent('built', appName, `completed in ${result.duration}ms`);
-        // Update config and state with build duration
+        // Update config and state with build duration. Also persist where the
+        // build's output landed: the start handler for THIS deploy already got
+        // it via the build:completed payload (dispatched synchronously inside
+        // build(), before this line runs) — this write is for later plain
+        // restarts, which have no build to ask.
         if (this.appConfigService) {
-          await this.appConfigService.updateConfig(appName, { buildDuration: result.duration });
+          await this.appConfigService.updateConfig(appName, {
+            buildDuration: result.duration,
+            ...(result.outputPath ? { outputDirectory: result.outputPath } : {}),
+          });
         }
         if (this.stateManager) {
           await this.stateManager.updateApp(appName, { buildDuration: result.duration });
         }
+      } else if (result.errors?.[0]?.code === 'MAX_BUILDS') {
+        // The builder's own concurrent-build cap fired (a redundant safety net
+        // under the platform cap above). Don't error the app — re-queue it so
+        // it retries when a slot frees, instead of leaving it permanently
+        // failed after a transient burst.
+        this.logger.warn(`Builder busy for ${appName}; re-queuing`, 'BUILD');
+        this.appsInProgress.delete(appName);
+        this.pendingBuilds.set(appName, { appPath, appType: _appType });
+        this.scheduleBuildDrain();
       } else {
         this.logger.appEvent('error', appName, result.errors?.[0]?.message || 'Build failed');
         if (this.stateManager) {
@@ -1476,7 +2087,43 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     }
   }
 
-  private async handleStartApp(appName: string): Promise<void> {
+  /** Schedule a single deferred drain of the pending-build queue (~2s later). */
+  private scheduleBuildDrain(): void {
+    if (this.buildDrainTimer) return;
+    this.buildDrainTimer = setTimeout(() => {
+      this.buildDrainTimer = null;
+      void this.drainPendingBuilds();
+    }, 2000);
+    this.buildDrainTimer.unref?.();
+  }
+
+  /**
+   * Start builds that were deferred by the concurrent-build cap, up to the
+   * free slots, then re-arm while any remain queued. handleBuildApp adds to
+   * appsInProgress synchronously (before its first await), so each dispatch in
+   * this loop reserves its slot before the next iteration's size check, and
+   * handleBuildApp re-queues itself if the cap refilled — so this converges
+   * without over-subscribing.
+   */
+  private async drainPendingBuilds(): Promise<void> {
+    for (const [appName, info] of [...this.pendingBuilds]) {
+      if (this.config.maxConcurrentBuilds > 0 &&
+          this.appsInProgress.size >= this.config.maxConcurrentBuilds) {
+        break;
+      }
+      // Started some other way (or already running) since it was queued — drop it.
+      if (this.appsInProgress.has(appName) ||
+          this.stateManager?.getApp(appName)?.status === 'running') {
+        this.pendingBuilds.delete(appName);
+        continue;
+      }
+      this.pendingBuilds.delete(appName);
+      void this.handleBuildApp(info.appPath, appName, info.appType);
+    }
+    if (this.pendingBuilds.size > 0) this.scheduleBuildDrain();
+  }
+
+  private async handleStartApp(appName: string, buildOutputDir?: string): Promise<void> {
     if (!this.runtime || !this.detector) {
       // Only reachable during teardown; release the guard so a queued deploy
       // isn't left wedged in appsInProgress forever.
@@ -1554,18 +2201,62 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         }
       }
 
-      const spec = await this.buildStartSpec(appName, appPath, detection, port, dataDir, dbEnvVars);
+      // Check if app needs Redis and provision a logical DB (fail-soft — a Redis
+      // failure must never block the app start; the app just gets no REDIS_URL).
+      const redisEnvVars = await this.provisionRedisEnvVars(appName, appPath);
+
+      const spec = await this.buildStartSpec(
+        appName,
+        appPath,
+        detection,
+        port,
+        dataDir,
+        dbEnvVars,
+        redisEnvVars,
+        buildOutputDir
+      );
       const status = await this.runtime.start(spec);
 
       this.logger.appEvent('started', appName, `PID ${status.pid}, port ${port}`);
 
-      // Save port and data directory to config file (source of truth for restarts)
+      // Readiness gate: PM2/Docker report 'online' the instant a process is
+      // (re)forked, so a crash-looping app satisfies runtime.start's own
+      // wait — don't declare 'running' until the app actually proves it's up.
+      // A first-deploy failure resolves to 'errored' (never 'crash-looping'):
+      // the deploy tracker closes an episode only on running|errored, so
+      // 'errored' is what makes deploy_files report the failure honestly.
+      // Persist the port BEFORE the readiness verdict. The app config is the
+      // source of truth for port assignment across restarts, and this used to
+      // sit after the failure return — so an app that failed readiness kept a
+      // live process on a port nothing had recorded, and the next allocation
+      // was free to hand that same port to another app.
       if (this.appConfigService) {
         await this.appConfigService.updateConfig(appName, {
           port,
           dataDir,
           lastDeployedAt: new Date().toISOString(),
         });
+      }
+
+      const readiness = await this.awaitReadiness(appName, port, spec);
+      if (!readiness.ok) {
+        this.logger.appEvent('error', appName, `readiness check failed: ${readiness.reason}`);
+        if (this.stateManager) {
+          await this.stateManager.setAppStatus(appName, 'errored', {
+            port,
+            pid: status.pid ?? undefined,
+            error: `App started but failed its readiness check: ${readiness.reason}`,
+          });
+        }
+        // The finally block releases appsInProgress; no prober/crash-watch here.
+        return;
+      }
+
+      if (readiness.warning) {
+        this.logger.warn(
+          `${appName} did not prove ready before the deploy completed: ${readiness.warning}`,
+          'APP'
+        );
       }
 
       // Update state to running with port and pid
@@ -1583,7 +2274,30 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       if (spec.healthCheckPath && this.runtime?.type === 'pm2') {
         this.startHealthProber(appName, port, spec.healthCheckPath);
       }
+      // Watch for a post-deploy crash-loop (both modes) — flips a running app to
+      // 'crash-looping' when its runtime restart count climbs. Keyed on restart
+      // count, not an HTTP rule, so a healthy JSON API (4xx at `/`) is never
+      // mis-flagged. The deploy episode has already closed on 'running', so this
+      // status change does not affect deploy_files.
+      this.startCrashLoopWatch(appName);
     } catch (error) {
+      // Secret preflight park (PRD-051): not a failure — the app declared
+      // required secrets that aren't set. Record them and stop, so the operator
+      // gets an actionable `needs-config` instead of a crash-loop. The
+      // `starting` transition above already cleared any stale error.
+      if (error instanceof AppNeedsConfigError) {
+        this.logger.warn(
+          `${appName} parked in needs-config — set required secret(s): ` +
+            `${error.missingSecrets.join(', ')}, then restart`,
+          'SECURITY'
+        );
+        if (this.stateManager) {
+          await this.stateManager.setAppStatus(appName, 'needs-config', {
+            missingSecrets: error.missingSecrets,
+          });
+        }
+        return;
+      }
       this.logger.appEvent('error', appName, error instanceof Error ? error.message : 'Failed to start');
       if (this.stateManager) {
         await this.stateManager.setAppStatus(appName, 'errored', {
@@ -1635,6 +2349,44 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         }
       }
 
+      // Same-origin routing (M3): a monorepo child (a `group` in its config +
+      // a `route` in its drop.yaml) is routed onto the SHARED group hostname
+      // `<group>.<suffix>` at the route's path prefix — the frontend at `/`,
+      // the backend at `/api*`. The group hostname is a COMPUTED default (not a
+      // custom drop.yaml `domains` entry), so it bypasses the custom-domain
+      // ownership guard below; two children coexist because the backend carries
+      // a `/api*` prefix, making its Caddy site address differ from the
+      // frontend's root address (identical addresses would wedge Caddy's
+      // reload). A child that also declares custom `domains` opts out of this.
+      let routePathPrefix: string | undefined;
+      // The path portion of the child's public URL, set ONLY for a same-origin
+      // group child: '' when it serves the group root (frontend), '/api' etc.
+      // for a path-prefixed sibling (backend). `undefined` means "not a
+      // same-origin child" — leave the name/domain-based URL alone.
+      let sameOriginPublicPath: string | undefined;
+      const appConfig = this.appConfigService?.getConfig(appName);
+      const routeCfg = dropYaml.success ? dropYaml.config?.route : undefined;
+      if (appConfig?.group && routeCfg && !hasCustomDomains) {
+        domains = [`${appConfig.group}.${domainSuffix}`];
+        sameOriginPublicPath = '';
+        const rp = routeCfg.path?.trim();
+        if (rp && rp !== '/') {
+          const prefix = (rp.startsWith('/') ? rp : `/${rp}`).replace(/\/+$/, '');
+          // Caddy site-address path matcher: `<host>/api*` matches `/api` and
+          // `/api/...`. No prefix stripping — the backend owns its `/api` path.
+          routePathPrefix = prefix.endsWith('*') ? prefix : `${prefix}*`;
+          // Display path never carries the Caddy wildcard: `/api*` → `/api`.
+          sameOriginPublicPath = prefix.replace(/\*+$/, '');
+          if (routeCfg.strip) {
+            this.logger.warn(
+              `route.strip requested for ${appName} but prefix-stripping (Caddy handle_path) ` +
+                `is not yet supported; serving with the prefix preserved (the backend must own '${prefix}')`,
+              'ROUTER'
+            );
+          }
+        }
+      }
+
       // Cross-tenant hostname guard: reject any custom domain already claimed by
       // a *different* app before it reaches Caddy. Without this, a tenant's
       // drop.yaml could claim another app's hostname/domain and hijack its
@@ -1681,13 +2433,16 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           : undefined;
 
       // Configure route for each domain
+      let resolvedPublicUrl: string | undefined;
       for (const hostname of domains) {
         const isLocalhost = isLocalhostDomain(hostname);
         const enableSsl = this.config.enableHttps && !isLocalhost && !dropYaml.config?.tls?.disabled;
 
         await this.router.addRoute({
           appName: `${appName}-${hostname.replace(/\./g, '-')}`, // Unique route name per domain
+          owner: appName, // Bare owning app name — lets removeRoutesForApp find every route this app owns
           hostname,
+          ...(routePathPrefix ? { pathPrefix: routePathPrefix } : {}),
           upstream: `localhost:${port}`,
           ssl: enableSsl,
           redirectHttps: enableSsl,
@@ -1700,11 +2455,32 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         const protocol = enableSsl ? 'https' : 'http';
         const caddyAvailable = this.caddyServer?.getStatus() === 'running';
 
+        // A same-origin group child is routed onto exactly this one group host;
+        // capture the real, fully-resolved public URL (proto + host + route
+        // path) so computeAppUrl can hand the dashboard a link that is actually
+        // routed. Skip localhost — there is no external URL there, and the
+        // dashboard's host:port fallback covers dev.
+        if (sameOriginPublicPath !== undefined && !isLocalhost) {
+          resolvedPublicUrl = `${protocol}://${hostname}${sameOriginPublicPath}`;
+        }
+
         if (caddyAvailable) {
           this.logger.info(`Route configured: ${protocol}://${hostname} -> localhost:${port}`, 'ROUTER');
         } else {
           this.logger.info(`Route configured: localhost:${port} (Caddy unavailable for ${hostname})`, 'ROUTER');
         }
+      }
+
+      // Reconcile the persisted group URL (not set-only). resolvedPublicUrl is
+      // the address actually routed this run, or undefined when the app is no
+      // longer a same-origin child (route removed, or custom domains added —
+      // including the `[]` left by a rejected custom domain). Writing it every
+      // time it CHANGES both fills the dashboard link for a group child and
+      // CLEARS a stale one, so computeAppUrl can never link to the group host
+      // for an app no longer served there (which would load a sibling's app).
+      // The change-guard avoids a config write per app on every start.
+      if (this.appConfigService && resolvedPublicUrl !== appConfig?.publicUrl) {
+        await this.appConfigService.updateConfig(appName, { publicUrl: resolvedPublicUrl });
       }
 
       // Reload Caddy to apply new routes
@@ -1746,6 +2522,41 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         this.logger.info(`Dropped redeploy for ${appName} - already in progress`, 'UPDATE');
       } else {
         this.logger.debug(`Skipping update for ${appName} - already in progress`, 'UPDATE');
+      }
+      return;
+    }
+
+    // A monorepo container (root drop.yaml has `services:`) is a group descriptor, never a buildable
+    // app — the app:detected interception (see the detectedSub handler above) expands it into child
+    // apps and never builds it. The git-deploy path registers the container in state, so without this
+    // guard its app:update would fall through to detect-as-`unknown` → "No build strategy found". On an
+    // EXPLICIT redeploy (bypassCooldown) re-expand — git pull refreshed the container and the children
+    // are copies that must be re-materialized — via the same idempotent expandMonorepo path the
+    // interception uses. On an incidental watcher file-settle (bypassCooldown false) skip: the
+    // interception already expanded the children this deploy, and re-expanding would fs.rm/fs.cp their
+    // folders out from under an in-flight build.
+    const containerYaml = await parseDropYaml(appPath);
+    if (
+      containerYaml.success &&
+      containerYaml.config?.services &&
+      Object.keys(containerYaml.config.services).length > 0
+    ) {
+      if (bypassCooldown) {
+        this.logger.info(`Re-expanding monorepo container '${appName}' (explicit redeploy)`, 'MONOREPO');
+        // Same in-progress bracket as the app:detected interception: blocks a
+        // concurrent DELETE (409) and re-entrant updates while child folders
+        // are re-materialized out from under running apps.
+        this.appsInProgress.add(appName);
+        try {
+          await this.expandMonorepo(appPath, appName, containerYaml.config);
+        } finally {
+          this.appsInProgress.delete(appName);
+        }
+      } else {
+        this.logger.debug(
+          `Skipping update for monorepo container '${appName}' - not a buildable app`,
+          'UPDATE'
+        );
       }
       return;
     }
@@ -1847,16 +2658,18 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       this.selfManagedUpdates.add(appName);
       let buildResult;
       try {
+        const buildEnv = await this.resolveBuildEnv(appPath, appName);
+        const buildOverride = (await parseDropYaml(appPath)).config?.build;
         buildResult = await this.builder.build({
           appName,
           appPath,
           appType: detection.type,
           framework: detection.framework || null,
           config: {
-            buildCommand: detection.suggestedConfig?.buildCommand,
+            buildCommand: buildOverride ?? detection.suggestedConfig?.buildCommand,
             installCommand: detection.suggestedConfig?.installCommand,
           },
-          env: {},
+          env: buildEnv,
           workDir,
           onBuildLog: updateLogId && this.buildLogService
             ? (line) => this.buildLogService!.writeLine(updateLogId, line)
@@ -1905,9 +2718,22 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       this.appBuildDurations.set(appName, buildResult.duration);
       this.logger.appEvent('built', appName, `rebuilt in ${buildResult.duration}ms`);
 
+      // Persist the rebuild's output dir for later plain restarts (mirrors
+      // handleBuildApp); the start below gets the fresh value directly.
+      if (this.appConfigService && buildResult.outputPath) {
+        await this.appConfigService.updateConfig(appName, {
+          outputDirectory: buildResult.outputPath,
+        });
+      }
+
       await this.stateManager.setAppStatus(appName, 'starting');
 
-      const { spec, port } = await this.buildFreshStartSpec(appName, appPath, detection);
+      const { spec, port } = await this.buildFreshStartSpec(
+        appName,
+        appPath,
+        detection,
+        buildResult.outputPath ?? undefined
+      );
       const status = await this.runtime.start(spec);
 
       this.logger.appEvent('started', appName, `PID ${status.pid}, port ${port} (hot-reloaded)`);
@@ -1928,6 +2754,22 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
 
       this.appsInProgress.delete(appName);
     } catch (error) {
+      // Secret preflight park (PRD-051) on a hot-reload — e.g. the edited
+      // drop.yaml added a required `secrets:` entry. Park in `needs-config`
+      // (not `errored`) so the operator gets the actionable missing list. The
+      // `starting` transition above already cleared any stale error.
+      if (error instanceof AppNeedsConfigError) {
+        this.logger.warn(
+          `${appName} parked in needs-config on hot-reload — set required secret(s): ` +
+            `${error.missingSecrets.join(', ')}, then restart`,
+          'SECURITY'
+        );
+        await this.stateManager.setAppStatus(appName, 'needs-config', {
+          missingSecrets: error.missingSecrets,
+        });
+        this.appsInProgress.delete(appName);
+        return;
+      }
       this.logger.appEvent('error', appName, error instanceof Error ? error.message : 'Hot-reload failed');
       await this.stateManager.setAppStatus(appName, 'errored', {
         error: error instanceof Error ? error.message : 'Hot-reload failed',
@@ -1955,7 +2797,8 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
   private async buildFreshStartSpec(
     appName: string,
     appPath: string,
-    detection: DetectionResult
+    detection: DetectionResult,
+    buildOutputDir?: string
   ): Promise<{ spec: AppStartSpec; port: number }> {
     const port = this.allocatePort(appName);
 
@@ -1975,7 +2818,20 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       ) || {};
     }
 
-    const spec = await this.buildStartSpec(appName, appPath, detection, port, dataDir, dbEnvVars);
+    // Re-fetch the existing Redis allocation (idempotent; no new provisioning
+    // on a hot-reload of an already-running app).
+    const redisEnvVars = await this.provisionRedisEnvVars(appName, appPath);
+
+    const spec = await this.buildStartSpec(
+      appName,
+      appPath,
+      detection,
+      port,
+      dataDir,
+      dbEnvVars,
+      redisEnvVars,
+      buildOutputDir
+    );
     return { spec, port };
   }
 
@@ -2058,6 +2914,15 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
 
         return status;
       } catch (error) {
+        // Secret preflight park (PRD-051): re-park in `needs-config` rather than
+        // `errored` (e.g. a "retry" that still has some required secrets unset),
+        // then re-throw so the caller/route reports which are missing.
+        if (error instanceof AppNeedsConfigError) {
+          await this.stateManager.setAppStatus(appName, 'needs-config', {
+            missingSecrets: error.missingSecrets,
+          });
+          throw error;
+        }
         this.logger.appEvent('error', appName, error instanceof Error ? error.message : 'Failed to restart');
         await this.stateManager.setAppStatus(appName, 'errored', {
           error: error instanceof Error ? error.message : 'Failed to restart',
@@ -2067,6 +2932,163 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     } finally {
       this.appsInProgress.delete(appName);
     }
+  }
+
+  /**
+   * Full app teardown — mirrors the steps DELETE /apps/:name performs
+   * (stop+delete the runtime process, remove Caddy routes, dump-then-drop
+   * the provisioned database unless `keepData`, remove state/secrets/deploy
+   * history/config, delete the generated folder). Used directly by
+   * `removeGroup` for each group child; the DELETE route itself keeps its
+   * own inline copy of these steps (not refactored to call this, to avoid
+   * risk to the working single-app delete path — see M4 plan).
+   *
+   * Every step is independently best-effort (try/catch) so one failing step
+   * (e.g. no provisioned database, PM2 already gone) never aborts the rest
+   * of the teardown.
+   */
+  private async teardownApp(name: string, opts: { keepData?: boolean } = {}): Promise<void> {
+    // Resolve the on-disk path BEFORE removing config/state — both are the
+    // only places it's recorded, and both get deleted below.
+    const appPath =
+      this.appConfigService?.getConfig(name)?.path ??
+      this.stateManager?.getApp(name)?.path ??
+      path.join(this.config.appsDirectory, name);
+
+    try {
+      await this.runtime?.stop(name);
+      await this.runtime?.delete(name);
+    } catch {
+      // Process might not exist in the runtime
+    }
+
+    // Explicit + deterministic: `stateManager.removeApp` below also triggers
+    // this via `app:deleted` -> `handleAppDeleted`, but that's fire-and-forget
+    // from this method's perspective. Calling it here directly means a caller
+    // awaiting `teardownApp` (e.g. `removeGroup`, before it removes the group
+    // container folder) knows routes are actually gone. The event-driven call
+    // that follows is a harmless no-op (removeRoutesForApp no-ops when there's
+    // nothing left to remove).
+    try {
+      await this.router?.removeRoutesForApp(name);
+    } catch (err) {
+      this.logger.warn(`Failed to remove routes for ${name}`, 'ROUTER', err);
+    }
+
+    if (!opts.keepData) {
+      try {
+        await this.dbProvisioner?.backupAndDeleteAppDatabase(name);
+      } catch (err) {
+        this.logger.warn(`Database teardown failed for ${name}`, 'DATABASE', err);
+      }
+      try {
+        // Free the app's logical Redis DB (FLUSHDB + release the number).
+        // Idempotent + fail-soft; a no-op if the app had no Redis.
+        await this.redisProvisioner?.deprovisionAppRedis(name);
+      } catch (err) {
+        this.logger.warn(`Redis teardown failed for ${name}`, 'REDIS', err);
+      }
+    }
+
+    try {
+      await this.stateManager?.removeApp(name);
+    } catch (err) {
+      this.logger.warn(`Failed to remove state for ${name}`, 'STATE', err);
+    }
+
+    try {
+      await this.secretManager?.deleteAll(name);
+    } catch {
+      // Secret manager may not be initialised
+    }
+
+    try {
+      getDeployTracker().purgeApp(name);
+    } catch {
+      // Deploy tracker may not be initialised
+    }
+
+    try {
+      await this.appConfigService?.deleteConfig(name);
+    } catch {
+      // Config may not exist
+    }
+
+    try {
+      await fs.rm(appPath, { recursive: true, force: true });
+    } catch {
+      // Folder may already be gone
+    }
+  }
+
+  /**
+   * Tear down every app belonging to a monorepo group (M4): each child gets
+   * the full `teardownApp` treatment, then the group's CONTAINER folder
+   * (`webapps/<group>/`, which holds the root drop.yaml with `services:`) is
+   * removed too — otherwise it would regenerate the deleted children on the
+   * watcher's next scan. Per-child failures are isolated so one bad child
+   * doesn't abort teardown of the rest. Exposed to the API via the
+   * platform-ops seam (`removeGroup`).
+   */
+  async removeGroup(groupName: string): Promise<{ removed: string[] }> {
+    // The container's own state entry carries the group tag too (expandMonorepo
+    // marks it) — it is torn down separately below, not as a child.
+    const groupApps = this.stateManager?.getAllApps().filter((a) => a.group === groupName) ?? [];
+    const children = groupApps.filter((a) => !a.isGroupContainer);
+    const removed: string[] = [];
+
+    for (const child of children) {
+      try {
+        await this.teardownApp(child.name);
+        removed.push(child.name);
+      } catch (err) {
+        this.logger.error(
+          `Failed to tear down '${child.name}' in group '${groupName}'`,
+          'MONOREPO',
+          err
+        );
+      }
+    }
+
+    // Tear down the container's own state entry (registered by the
+    // deploy-from-git path, tagged by expandMonorepo). teardownApp also
+    // removes the cloned repo folder via the entry's real path — which covers
+    // the case where the folder name (repo name) differs from the group name
+    // and the name-derived rm below would miss it.
+    for (const container of groupApps.filter((a) => a.isGroupContainer)) {
+      try {
+        await this.teardownApp(container.name);
+      } catch (err) {
+        this.logger.error(
+          `Failed to tear down container '${container.name}' of group '${groupName}'`,
+          'MONOREPO',
+          err
+        );
+      }
+    }
+
+    // Defense-in-depth before a recursive fs.rm: the container path is derived
+    // from a `group` tag. That tag is already transitively constrained to
+    // [A-Za-z0-9_-] (expandMonorepo only creates children whose `<group>-<svc>`
+    // name passes that regex), but re-assert it here so this destructive delete
+    // can never escape the webapps directory even if a group value is ever set
+    // by a future/other code path. Kept even with the entry-driven teardown
+    // above: it also covers unmarked phantoms from older platform versions
+    // (where the folder name equals the group name).
+    if (/^[a-zA-Z0-9_-]+$/.test(groupName)) {
+      try {
+        await fs.rm(path.join(this.config.appsDirectory, groupName), { recursive: true, force: true });
+      } catch (err) {
+        this.logger.warn(`Failed to remove group container folder for '${groupName}'`, 'MONOREPO', err);
+      }
+    } else {
+      this.logger.warn(
+        `Refusing to remove container folder for group '${groupName}': unsafe name`,
+        'MONOREPO'
+      );
+    }
+
+    return { removed };
   }
 
   /**
@@ -2142,6 +3164,151 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
   }
 
   /**
+   * Block until a just-started app proves it's actually up, or fail. Returns
+   * `{ ok: false }` (caller writes `errored`, closing the deploy episode) when:
+   *  - the process exits or crash-loops (runtime restart count climbs) during
+   *    the startup window; or
+   *  - a web app never answers an HTTP probe within the window.
+   * A background worker that never binds its assigned port AND declares no
+   * healthCheck passes on process-liveness alone (never HTTP-gated). An HTTP
+   * probe counts as success on ANY response (4xx/5xx included) — "the app
+   * answered" means it's serving; a 404-at-`/` JSON API is healthy. Docker
+   * port-bind alone is NOT trusted (the userland proxy accepts connections
+   * before the in-container app listens), so in docker mode the HTTP probe is
+   * required; in PM2 mode a bind is sufficient (lenient for slow-booting apps).
+   * Never throws.
+   */
+  private async awaitReadiness(
+    appName: string,
+    port: number,
+    spec: AppStartSpec
+  ): Promise<{ ok: boolean; reason?: string; warning?: string }> {
+    if (!this.runtime) return { ok: true };
+    const windowMs = this.readinessTimeoutMs;
+    const isDocker = this.config.isolation === 'docker';
+    const healthPath = spec.healthCheckPath || '/';
+    const baselineRestarts = (await this.runtime.getStatus(appName))?.restarts ?? 0;
+    const start = Date.now();
+
+    /** Whether the process died or restarted (crash-loop) since start. */
+    const liveness = async (): Promise<{ dead: boolean; crashed: boolean }> => {
+      const info = await this.runtime?.getStatus(appName);
+      if (!info || info.status === 'stopped' || info.status === 'errored') {
+        return { dead: true, crashed: false };
+      }
+      return { dead: false, crashed: info.restarts > baselineRestarts };
+    };
+
+    // Poll: succeed as soon as an HTTP probe answers; fail as soon as the
+    // process dies or crash-loops.
+    while (Date.now() - start < windowMs) {
+      const l = await liveness();
+      if (l.dead) return { ok: false, reason: 'process exited during startup' };
+      if (l.crashed) return { ok: false, reason: 'process crash-looped during startup' };
+      if (await probePort('127.0.0.1', port, 1000)) {
+        const r = await probeHttp('127.0.0.1', port, healthPath, 3000);
+        if (r.responded) return { ok: true };
+      }
+      await new Promise((resolve) => setTimeout(resolve, Math.min(500, windowMs)));
+    }
+
+    // Window elapsed with no HTTP success — classify the (stable) process.
+    const l = await liveness();
+    if (l.dead) return { ok: false, reason: 'process exited during startup' };
+    if (l.crashed) return { ok: false, reason: 'process crash-looped during startup' };
+    const bound = await probePort('127.0.0.1', port, 1000);
+    if (!bound && !spec.healthCheckPath) return { ok: true }; // worker: no port, no health check
+    if (bound && !isDocker) return { ok: true }; // PM2: a bind proves it's listening
+
+    // Alive, never crash-looped, but it didn't answer HTTP in time. At the
+    // deadline "still booting" and "hung" are indistinguishable, so this is a
+    // choice about which way to be wrong. Failing here declared healthy apps
+    // dead whenever they booted slower than the window (migrations, big
+    // dependency graphs, connection warm-up) — the deploy reported failure
+    // for an app that was seconds away from serving, and did so while the
+    // process kept running. Being wrong the other way shows the app as
+    // running and its URL answers late, which is self-evident and recovers on
+    // its own. Only a process that died or crash-looped is a real failure,
+    // and both return above, well before this point.
+    return {
+      ok: true,
+      warning: `no HTTP response on :${port} within ${Math.round(windowMs / 1000)}s — treating as slow start`,
+    };
+  }
+
+  /**
+   * After a successful deploy, watch for the process entering a crash-loop and
+   * flip its status to 'crash-looping'. Keyed on the runtime's restart count
+   * (PM2 restart_time / Docker RestartCount), NOT an HTTP health rule, so a
+   * healthy JSON API returning 4xx at `/` is never mis-flagged. Only escalates
+   * an app that is currently 'running'. Both isolation modes.
+   */
+  private startCrashLoopWatch(appName: string): void {
+    this.stopCrashLoopWatch(appName);
+    let baseline: number | null = null;
+    const interval = setInterval(async () => {
+      try {
+        const info = await this.runtime?.getStatus(appName);
+        if (!info) return;
+        if (baseline === null) {
+          baseline = info.restarts;
+          return;
+        }
+        if (this.stateManager?.getApp(appName)?.status !== 'running') return;
+        if (info.restarts - baseline >= this.CRASHLOOP_RESTART_THRESHOLD) {
+          this.logger.appEvent(
+            'error',
+            appName,
+            `crash-looping (${info.restarts - baseline} restarts since deploy)`
+          );
+          await this.stateManager?.setAppStatus(appName, 'crash-looping', {
+            error: 'Process is restarting repeatedly',
+          });
+          baseline = info.restarts; // re-baseline so we don't re-flag every tick
+        }
+      } catch {
+        // Ignore errors in the watch itself.
+      }
+    }, 30_000);
+    interval.unref?.();
+    this.crashLoopWatchers.set(appName, interval);
+  }
+
+  private stopCrashLoopWatch(appName: string): void {
+    const t = this.crashLoopWatchers.get(appName);
+    if (t) {
+      clearInterval(t);
+      this.crashLoopWatchers.delete(appName);
+    }
+  }
+
+  /** True if `p` exists on disk (best-effort; any access error → false). */
+  private async pathExists(p: string): Promise<boolean> {
+    try {
+      await fs.access(p);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Constrain a static app's build-output subdir to a safe relative path.
+   * The value is interpolated into nginx.conf (`root /app/<subdir>`) and can
+   * originate from a user-supplied drop.yaml `build.output`, so absolute
+   * paths, traversal, and anything that could smuggle nginx directives
+   * (whitespace, `;`, `{`) must not pass. Invalid or root-ish values
+   * collapse to '' — serve the app root, the pre-existing default.
+   */
+  private sanitizeOutputSubdir(subdir: string): string {
+    const trimmed = subdir.replace(/^\.\/+/, '').replace(/\/+$/, '');
+    if (!trimmed || trimmed === '.') return '';
+    if (!/^[A-Za-z0-9._-]+(\/[A-Za-z0-9._-]+)*$/.test(trimmed)) return '';
+    if (trimmed.split('/').some((seg) => seg === '..')) return '';
+    return trimmed;
+  }
+
+  /**
    * Build the runtime-agnostic start specification for an app.  Called by both
    * handleStartApp (on first deploy) and handleUpdateApp (on hot-reload) so the
    * two paths can't drift apart.
@@ -2156,15 +3323,44 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     detection: DetectionResult,
     port: number,
     dataDir: string,
-    dbEnvVars: Record<string, string>
+    dbEnvVars: Record<string, string>,
+    redisEnvVars: Record<string, string> = {},
+    buildOutputDir?: string
   ): Promise<AppStartSpec> {
     let script: string;
     let interpreter: string | undefined;
     let args: string[] | undefined;
 
+    // Honor an explicit `start` command from drop.yaml as an override. The
+    // manifest detector only reads the object form `start.command`, so a plain
+    // `start: node dist/server.js` string (including the ones monorepo
+    // expansion writes into each child's drop.yaml) was previously ignored,
+    // leaving e.g. a TypeScript backend stuck on the `node index.js` default.
+    const dropYamlCfg = await parseDropYaml(appPath);
+    const startOverride = dropYamlCfg.success ? dropYamlCfg.config?.start : undefined;
+
+    // Procfile `web:` is the next rung down: a user-provided, language-agnostic
+    // start command (e.g. App B's Flask `python3 app.py`) that should win over
+    // the detector's guessed framework default (e.g. a gunicorn invocation
+    // against an app with no gunicorn dependency installed). Computed once so
+    // both the go and generic branches below share the same precedence.
+    const procfileWeb = await getProcfileWebCommand(appPath);
+
     if (detection.type === 'static' || detection.type === 'spa') {
+      // Detection alone can't always name the build output dir: the manifest
+      // detector wins detection for any app carrying a drop.yaml (confidence
+      // 1.0) but only knows an explicit `build.output` — for a Vite/CRA app
+      // typed `static` without one, serving the app root delivers the SOURCE
+      // index.html (→ /src/main.tsx → octet-stream). Fall back to the dir the
+      // build strategy reported: fresh from this build's payload, else the
+      // value persisted after the last successful build (plain restarts).
+      const outputSubdir = this.sanitizeOutputSubdir(
+        detection.suggestedConfig?.outputDirectory ||
+          buildOutputDir ||
+          this.appConfigService?.getConfig(appName)?.outputDirectory ||
+          ''
+      );
       if (this.config.isolation === 'docker') {
-        const outputSubdir = detection.suggestedConfig?.outputDirectory || '';
         const nginxConf = buildNginxConf(port, outputSubdir);
         const nginxConfPath = path.join(dataDir, 'nginx.conf');
         await fs.writeFile(nginxConfPath, nginxConf, 'utf-8');
@@ -2177,7 +3373,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         interpreter = 'none';
         args = ['-c', `nginx -c ${nginxConfPath} -g 'daemon off;'`];
       } else {
-        const serveDir = path.join(appPath, detection.suggestedConfig?.outputDirectory || '.');
+        const serveDir = path.join(appPath, outputSubdir || '.');
         // eslint-disable-next-line @typescript-eslint/no-require-imports
         const fsSync = require('fs');
         const distPath = path.join(__dirname, '..', '..', 'dist', 'core', 'static-server.js');
@@ -2190,14 +3386,75 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         args = [serveDir, '-s'];
       }
     } else if (detection.type === 'go') {
-      const startCommand = detection.suggestedConfig?.startCommand || `./${appName}`;
-      script = startCommand;
-      interpreter = 'none';
+      // Precedence: drop.yaml `start` (explicit override) → Procfile `web:` →
+      // detector-suggested command → the built binary default.
+      const startCommand =
+        startOverride || procfileWeb || detection.suggestedConfig?.startCommand || `./${appName}`;
+      if (this.config.isolation === 'docker') {
+        // Docker execs the container Cmd array directly, with no shell — so a
+        // multi-token command or an env ref (e.g. $PORT) must go through
+        // /bin/sh -c to split args and expand vars.
+        script = '/bin/sh';
+        interpreter = 'none';
+        args = ['-c', startCommand];
+      } else {
+        script = startCommand;
+        interpreter = 'none';
+      }
     } else {
-      const startCommand = detection.suggestedConfig?.startCommand || 'node index.js';
-      script = startCommand.startsWith('node ')
-        ? startCommand.substring(5)
-        : startCommand;
+      // Precedence: drop.yaml `start` (explicit override, DROP's own manifest,
+      // sits above everything else) → Procfile `web:` (a user-provided,
+      // language-agnostic start command) → the detector's framework-guessed
+      // command → the generic default. This is why a Flask app's Procfile
+      // `python3 app.py` wins over the python detector's gunicorn default —
+      // the gunicorn command is never reached, so a missing gunicorn
+      // dependency can't break the start.
+      const startCommand =
+        startOverride || procfileWeb || detection.suggestedConfig?.startCommand || 'node index.js';
+      // Python deps are installed into an in-app-dir virtualenv (.venv) by
+      // PythonBuildStrategy so they survive into the fresh runtime; put its
+      // bin dir first on PATH so `gunicorn`/`uvicorn`/`python` resolve to the
+      // installed packages. The venv is always written to the real (host)
+      // appPath by the build step — check for it there regardless of run
+      // mode — but embed whichever base dir the command will actually run
+      // against: the container's /app mount under docker, or appPath itself
+      // under PM2 (no remapping on the host).
+      const isPython = ['python', 'django', 'flask', 'fastapi'].includes(detection.type);
+      const venvPrefixFor = async (baseDir: string): Promise<string> =>
+        isPython && (await this.pathExists(path.join(appPath, '.venv')))
+          ? `export PATH="${baseDir}/.venv/bin:$PATH"; `
+          : '';
+
+      if (this.config.isolation === 'docker') {
+        // Docker execs the Cmd array directly with NO shell, so a multi-token
+        // start command — the python detector's `gunicorn --bind 0.0.0.0:$PORT
+        // app:app`/`uvicorn ... --port $PORT`, or `node dist/server.js` — would
+        // be treated as one bogus executable name and $PORT would never expand.
+        // Run it through /bin/sh -c. `exec` replaces the shell with the app
+        // process so the container's PID 1 is the real app (correct signal
+        // handling / metrics / crash-restart).
+        const venvPrefix = await venvPrefixFor('/app');
+        script = '/bin/sh';
+        interpreter = 'none';
+        args = ['-c', `${venvPrefix}exec ${startCommand}`];
+      } else {
+        // PM2 fork mode: previously this branch passed the raw, possibly
+        // multi-token startCommand as a bare `script` (with any leading
+        // `node ` stripped) and no args/interpreter — PM2 treated it as a
+        // single executable name, so a multi-token command (gunicorn/uvicorn
+        // invocations, `python app.py --flag`) failed with ENOENT and $PORT
+        // (only present in the child env) never expanded. Mirror the docker
+        // branch's shape: run through /bin/sh -c so the command is split and
+        // $PORT expands, and `exec` so the shell is replaced by the app
+        // process — PM2 then monitors the real app's PID (correct
+        // metrics/restart/memory-cap). Node gets no venv prefix (isPython is
+        // false for it), so its command stays prefix-free:
+        // `/bin/sh -c 'exec node …'`.
+        const venvPrefix = await venvPrefixFor(appPath);
+        script = '/bin/sh';
+        interpreter = 'none';
+        args = ['-c', `${venvPrefix}exec ${startCommand}`];
+      }
     }
 
     const depEnvVars = await this.resolveDependencies(appPath, appName);
@@ -2209,14 +3466,42 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       await this.generateStaticConfig(appPath, depEnvVars);
     }
 
+    // Secret preflight — generation (PRD-051). Auto-fill any declared
+    // `generate` secret that isn't set yet, BEFORE reading the secret env below
+    // so the generated value is injected. Names (never values) are logged.
+    if (this.config.enableSecretPreflight && this.secretManager) {
+      const declaredSecrets = dropYamlCfg.success ? dropYamlCfg.config?.secrets : undefined;
+      if (declaredSecrets) {
+        // "Already provided" for generation = secrets set to a NON-EMPTY value.
+        // Presence alone (list()) is not enough: a `generate` secret that exists
+        // with an empty-string value must be (re)generated, never accepted — it
+        // would otherwise boot the app with an empty signing/session key.
+        const setSecrets = this.secretManager.hasSecrets(appName)
+          ? this.secretManager.getAll(appName)
+          : {};
+        const nonEmptyKeys = Object.entries(setSecrets)
+          .filter(([, value]) => value.length > 0)
+          .map(([key]) => key);
+        const { toGenerate } = planSecretPreflight(declaredSecrets, nonEmptyKeys);
+        for (const decl of toGenerate) {
+          await this.secretManager.set(appName, decl.name, generateSecretValue(decl.generate));
+        }
+        if (toGenerate.length > 0) {
+          this.logger.info(
+            `Generated ${toGenerate.length} declared secret(s): ${toGenerate.map(d => d.name).join(', ')}`,
+            'SECURITY'
+          );
+        }
+      }
+    }
+
     let secretEnvVars: Record<string, string> = {};
     if (this.secretManager && this.secretManager.hasSecrets(appName)) {
       secretEnvVars = this.secretManager.getAll(appName);
       this.logger.info(`Injecting ${Object.keys(secretEnvVars).length} secret(s)`, 'SECURITY');
     }
 
-    const dropYaml = await parseDropYaml(appPath);
-    const healthCheckPath = dropYaml.success ? dropYaml.config?.healthCheck : undefined;
+    const healthCheckPath = dropYamlCfg.success ? dropYamlCfg.config?.healthCheck : undefined;
 
     const { outFile, errorFile } = await this.getAppLogPaths(appName);
 
@@ -2236,6 +3521,72 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     const cpus = this.config.maxCpusPerApp > 0 ? this.config.maxCpusPerApp : undefined;
     const limits = memory !== undefined || cpus !== undefined ? { memory, cpus } : undefined;
 
+    // The DROP control-plane API is reachable from docker-isolated containers
+    // via the `drop-host` ExtraHosts alias (ContainerManager); non-isolated
+    // (PM2) apps share the host's loopback directly. Placed after
+    // ...secretEnvVars below so it is platform-authoritative — a tenant
+    // secret must not be able to redirect the destination of an admin
+    // Bearer credential.
+    const dropApiUrl =
+      this.config.isolation === 'docker'
+        ? `http://${HOST_ALIAS}:${this.config.apiPort}`
+        : `http://127.0.0.1:${this.config.apiPort}`;
+
+    // Admin-conferred capability grant (PR2): apps with a non-empty
+    // grantedApiScopes get a fresh, scope-only (role: 'none') provisioning
+    // key minted and rotated on every start — the previous key (if any) is
+    // deleted first so a stale key never remains valid. Ungranted apps get
+    // no DROP_API_KEY at all. Minting is best-effort: if auth isn't
+    // initialized (e.g. DROP_DISABLE_AUTH), skip rather than fail the deploy.
+    const grantedScopes = this.appConfigService?.getConfig(appName)?.grantedApiScopes ?? [];
+    let dropApiKey: string | undefined;
+    if (grantedScopes.length > 0) {
+      try {
+        await deleteApiKeysByName(`app:${appName}:provision`);
+        const { key } = await createApiKey(`app:${appName}:provision`, 'none', undefined, grantedScopes);
+        dropApiKey = key;
+      } catch (err) {
+        this.logger.warn(`Could not mint provisioning key for ${appName}`, 'SECURITY', err);
+      }
+    }
+
+    const env: Record<string, string> = {
+      // drop.yaml `env` (tenant config) is the base layer — now injected at
+      // START as well as build, so `env:` is honored end-to-end. Placed
+      // FIRST so secrets and every platform-authoritative var (PORT,
+      // DROP_DATA_DIR, DROP_API_URL/KEY, DATABASE_URL) still override it and
+      // a tenant cannot hijack them. `build_env` is intentionally NOT
+      // injected here — it is build-only by design.
+      ...this.coerceEnvRecord(dropYamlCfg.success ? dropYamlCfg.config?.env : undefined),
+      ...secretEnvVars,
+      NODE_ENV: 'production',
+      PORT: port.toString(),
+      DROP_DATA_DIR: dataDir,
+      DROP_API_URL: dropApiUrl,
+      ...(dropApiKey ? { DROP_API_KEY: dropApiKey } : {}),
+      ...dbEnvVars,
+      ...redisEnvVars,
+      ...depEnvVars,
+    };
+
+    // Secret preflight — gate (PRD-051). A declared-required secret that is
+    // neither auto-generated above nor present (non-empty) in the assembled
+    // env — after set secrets, drop.yaml `env`, and every platform-injected
+    // var (DATABASE_URL, REDIS_URL, depends_on URLs, ...) — parks the app in
+    // `needs-config`. Throwing here (caught by the start/restart path) prevents
+    // the process from ever starting, so a missing secret becomes an actionable
+    // state instead of a runtime crash-loop.
+    if (this.config.enableSecretPreflight) {
+      const declaredSecrets = dropYamlCfg.success ? dropYamlCfg.config?.secrets : undefined;
+      const providedKeys = Object.entries(env)
+        .filter(([, value]) => value.length > 0)
+        .map(([key]) => key);
+      const { missing } = planSecretPreflight(declaredSecrets, providedKeys);
+      if (missing.length > 0) {
+        throw new AppNeedsConfigError(appName, missing.map(m => m.name));
+      }
+    }
+
     return {
       name: appName,
       script,
@@ -2249,14 +3600,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       healthCheckPath,
       pgSocketDir,
       limits,
-      env: {
-        ...secretEnvVars,
-        NODE_ENV: 'production',
-        PORT: port.toString(),
-        DROP_DATA_DIR: dataDir,
-        ...dbEnvVars,
-        ...depEnvVars,
-      },
+      env,
     };
   }
 

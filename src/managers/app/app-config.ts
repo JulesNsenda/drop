@@ -27,17 +27,54 @@ export interface AppConfig {
   createdAt: string;
   lastDeployedAt?: string;
   buildDuration?: number;
+  /**
+   * Build output directory relative to the app root (e.g. 'dist'), as reported
+   * by the build strategy after the last successful build. The static serve
+   * path falls back to this when detection can't supply one: the manifest
+   * detector wins detection for any app carrying a drop.yaml (confidence 1.0)
+   * but only knows an explicit `build.output`, so without this a built SPA
+   * would be served from its source root on restart.
+   */
+  outputDirectory?: string;
   env?: Record<string, string>;
   /** Persistent data directory path - survives app upgrades */
   dataDir?: string;
   /** Custom domains for this app (from drop.yaml) */
   domains?: string[];
+  /**
+   * The effective public URL for a same-origin monorepo child (the group
+   * domain plus the service's route path — e.g. `https://ezsign.dropkit.sh`
+   * for the frontend, `https://ezsign.dropkit.sh/api` for the backend). Set by
+   * platform.handleConfigureRoute at route-configuration time, because that is
+   * the one place that knows a child is routed onto the group host rather than
+   * its own `<name>` subdomain. Absent for standalone apps and for group
+   * children that declare their own `domains` (those use the name/domain-based
+   * URL). computeAppUrl returns this so the dashboard links to the address that
+   * is actually routed, not a dead `<name>.<suffix>`.
+   */
+  publicUrl?: string;
   /** Custom TLS configuration */
   tls?: {
     certFile?: string;
     keyFile?: string;
     disabled?: boolean;
   };
+  /**
+   * Capability scopes DROP has granted this app for calling its own control-plane
+   * API (e.g. ['users:create']). Admin-conferred, default none. When non-empty,
+   * DROP mints a least-privilege per-app API key (role 'none' + these scopes) and
+   * injects it as DROP_API_KEY at start — so the app never holds a full admin key.
+   * See docs/plans/2026-07-11-scoped-provisioning-token.md.
+   */
+  grantedApiScopes?: string[];
+  /**
+   * Grouping tag for apps expanded from a single monorepo deploy (e.g. a repo
+   * `ezsign` with `services: {backend, frontend}` expands to apps
+   * `ezsign-backend` / `ezsign-frontend`, both tagged `group: ezsign`). Lets
+   * lifecycle ops and the dashboard relate sibling apps. Absent for ordinary
+   * standalone apps. See docs/plans/2026-07-12-monorepo-multi-service.md (M2).
+   */
+  group?: string;
 }
 
 export interface AppConfigServiceOptions {

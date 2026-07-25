@@ -52,6 +52,16 @@ export interface UpstreamConfig {
 export interface RouteConfig {
   /** Application name (unique identifier) */
   appName: string;
+  /**
+   * The bare owning app name (e.g. "myapp"), as distinct from `appName`
+   * above, which is a per-domain route key (`${owner}-${hostname}`) — one app
+   * can own several routes (one per custom domain). Used by
+   * `RouterService.removeRoutesForApp` to remove every route an app owns
+   * without needing to know its per-domain keys. Optional for backward
+   * compatibility with callers that construct a RouteConfig directly (e.g.
+   * tests) without an owner.
+   */
+  owner?: string;
   /** Hostname to match (e.g., "myapp.example.com") */
   hostname: string;
   /** Port to listen on (defaults to 443 for SSL, 80 otherwise) */

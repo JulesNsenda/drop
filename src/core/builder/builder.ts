@@ -161,6 +161,7 @@ export class BuilderService {
         buildId,
         durationMs: Date.now() - startedAt.getTime(),
         success,
+        outputPath: outputPath ?? undefined,
       });
       if (!success) {
         eventBus.publish('build:failed', {
@@ -387,11 +388,18 @@ export class BuilderService {
 
     this.emitLog(context.appName, 'install', 'info', `Running: ${installCommand}`, context);
 
+    // Builds need the dev toolchain (tsc/vite/webpack are devDependencies). NODE_ENV=production
+    // (forced by executeEnvironment for the compile, and/or set via the app's drop.yaml env) makes npm
+    // omit devDependencies, so the build step can't find its compiler. Force dev deps in for INSTALL
+    // only; the build/compile stage keeps context.env (NODE_ENV=production) so output stays a production
+    // bundle. sanitizeBuildEnv (base.ts) preserves npm_config_*; npm>=7 include=dev overrides the omit.
+    const installEnv = { ...context.env, npm_config_include: 'dev' };
+
     const exec = context.execCommand ?? executeCommand;
     const result = await exec(
       installCommand,
       context.appPath,
-      context.env,
+      installEnv,
       signal,
       (data, type) => {
         this.emitLog(context.appName, 'install', type === 'stderr' ? 'warn' : 'info', data, context);
@@ -406,6 +414,24 @@ export class BuilderService {
         output: result.stdout,
         error: result.stderr || `Install failed with exit code ${result.exitCode}`,
       };
+    }
+
+    // Only a successful install may persist install-skip markers (lockfile
+    // hash). Persisting earlier lets a failed install mark its lockfile as
+    // "installed", and every later build then skips install into a missing or
+    // broken node_modules. The marker is a pure perf optimization, so a
+    // failure here must never fail the (already successful) install — worst
+    // case the next build re-installs.
+    try {
+      await strategy.postInstall?.(context);
+    } catch (err) {
+      this.emitLog(
+        context.appName,
+        'install',
+        'warn',
+        `postInstall skipped: ${err instanceof Error ? err.message : String(err)}`,
+        context
+      );
     }
 
     return {

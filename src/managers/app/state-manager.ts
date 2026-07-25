@@ -11,7 +11,23 @@ import { eventBus } from '../../core/event-bus';
 import { writeJsonAtomic } from '../../utils/atomic-write';
 import type { GitSource } from '../../core/git-deploy/git-deploy.types';
 
-export type AppStatus = 'pending' | 'building' | 'starting' | 'running' | 'stopped' | 'errored';
+export type AppStatus =
+  | 'pending'
+  | 'building'
+  | 'starting'
+  | 'running'
+  | 'stopped'
+  | 'errored'
+  // Set by the post-deploy liveness watch when an already-`running` app begins
+  // restarting repeatedly. NOT used as a first-deploy outcome — a deploy that
+  // never comes up resolves to `errored` so the deploy tracker closes the
+  // episode (it only closes on `running`/`errored`).
+  | 'crash-looping'
+  // Parked by the secret preflight (PRD-051): the app declares required secrets
+  // in its drop.yaml that are neither set nor auto-generatable, so DROP did NOT
+  // start it (avoiding a runtime crash-loop). `missingSecrets` names what to
+  // set; the app starts on the next restart once they are present.
+  | 'needs-config';
 export type AppType = 'nodejs' | 'python' | 'go' | 'static' | 'docker' | 'unknown';
 
 export interface AppState {
@@ -31,6 +47,33 @@ export interface AppState {
   gitSource?: GitSource;
   userId?: string;
   customDomain?: string;
+  /**
+   * Env-var names the app declared as required (drop.yaml `secrets:`) that were
+   * missing at start, set alongside `status: 'needs-config'` (PRD-051). Cleared
+   * once the app starts. Surfaced to the dashboard/MCP so the operator knows
+   * exactly what to set.
+   */
+  missingSecrets?: string[];
+  /**
+   * Grouping tag for apps expanded from a single monorepo deploy (e.g.
+   * `ezsign-backend` / `ezsign-frontend` both tagged `group: ezsign`). Set via
+   * `updateApp(name, { group })`, not `registerApp` — `AppConfig` (app-config.ts)
+   * is the source of truth for `group`; this mirrors it for state consumers
+   * that only read `AppState`. Absent for standalone apps.
+   */
+  group?: string;
+  /**
+   * True for the state entry of a monorepo CONTAINER repo (the cloned folder
+   * whose root drop.yaml declares `services:`). The deploy-from-git path
+   * registers the repo before detection can know it's a container, and the
+   * entry must survive — its `gitSource` is what webhook auto-redeploys match
+   * on — but it is not a runnable app: listings hide it, DELETE on it tears
+   * down the whole group, and removeGroup cleans it up. Tagged with the
+   * group's name in `group` (which can differ from this entry's own name when
+   * drop.yaml sets `name:`/`group:`). Set by expandMonorepo on every
+   * expansion, so pre-existing phantoms self-heal on the next redeploy.
+   */
+  isGroupContainer?: boolean;
 }
 
 export interface StateManagerConfig {
@@ -203,13 +246,18 @@ export class AppStateManager {
     return updated;
   }
 
-  async setAppStatus(name: string, status: AppStatus, details?: { port?: number; pid?: number; error?: string }): Promise<AppState | null> {
+  async setAppStatus(name: string, status: AppStatus, details?: { port?: number; pid?: number; error?: string; missingSecrets?: string[] }): Promise<AppState | null> {
     const app = this.apps.get(name);
     if (!app) return null;
 
     // Clear stale error when app transitions to a healthy state
     if ((status === 'running' || status === 'building' || status === 'starting') && !details?.error) {
       delete app.error;
+    }
+    // Clear the needs-config secret list whenever the app leaves that state
+    // (PRD-051), unless the caller is explicitly setting a fresh list.
+    if (status !== 'needs-config' && details?.missingSecrets === undefined) {
+      delete app.missingSecrets;
     }
 
     return this.updateApp(name, {

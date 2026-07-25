@@ -15,7 +15,7 @@ jest.mock('../event-bus', () => ({
 }));
 
 import { BuilderService, createBuilderService, getBuilder, resetBuilder } from './builder';
-import { BuildContext, BuildStrategy } from './builder.types';
+import { BuildContext, BuildStrategy, ExecCommandFn } from './builder.types';
 import { nodejsBuildStrategy } from './strategies/nodejs';
 import { pythonBuildStrategy } from './strategies/python';
 import { staticBuildStrategy } from './strategies/static';
@@ -254,7 +254,13 @@ describe('Python Build Strategy', () => {
       env: {},
     };
 
-    expect(pythonBuildStrategy.getInstallCommand(context)).toBe('pip install -r requirements.txt');
+    // Deps are installed into an in-app-dir venv (both isolation modes) so they
+    // persist to runtime like node_modules — never bare `pip`/`--user`/`-t`.
+    expect(pythonBuildStrategy.getInstallCommand(context)).toBe(
+      'python3 -m venv .venv && ' +
+        '.venv/bin/python -m pip install --upgrade pip && ' +
+        '.venv/bin/python -m pip install -r requirements.txt'
+    );
   });
 
   it('should return build command for Django', () => {
@@ -346,6 +352,131 @@ describe('Docker Build Strategy', () => {
     };
 
     expect(dockerBuildStrategy.getInstallCommand(context)).toBeNull();
+  });
+});
+
+describe('BuilderService install stage — dev dependencies', () => {
+  it('forces npm_config_include=dev on the install exec (not the build exec) even when NODE_ENV is production', async () => {
+    const service = new BuilderService();
+
+    // 'rust' has no built-in strategy, so this custom strategy is the only
+    // match — avoids colliding with the real nodejs strategy's preBuild
+    // (lockfile detection etc.), which needs a real appPath on disk.
+    const devDepsStrategy: BuildStrategy = {
+      name: 'test-devdeps',
+      supportedTypes: ['rust'],
+      canBuild: () => true,
+      getInstallCommand: () => 'npm install',
+      getBuildCommand: () => 'npm run build',
+      getOutputDirectory: () => 'dist',
+    };
+    service.registerStrategy(devDepsStrategy);
+
+    const execCalls: Array<{ command: string; env: Record<string, string> }> = [];
+    const execCommand: ExecCommandFn = async (command, _cwd, env) => {
+      execCalls.push({ command, env });
+      return { exitCode: 0, stdout: '', stderr: '', duration: 0 };
+    };
+
+    const context: BuildContext = {
+      appName: 'devdeps-test',
+      appPath: '/test',
+      appType: 'rust',
+      framework: null,
+      config: {},
+      env: { NODE_ENV: 'production' },
+      execCommand,
+    };
+
+    const result = await service.build(context);
+
+    expect(result.success).toBe(true);
+
+    const installCall = execCalls.find(c => c.command === 'npm install');
+    const buildCall = execCalls.find(c => c.command === 'npm run build');
+
+    expect(installCall).toBeDefined();
+    expect(installCall!.env.npm_config_include).toBe('dev');
+    expect(installCall!.env.NODE_ENV).toBe('production');
+
+    // Build stage keeps context.env untouched — the override must not leak
+    // into the compile step.
+    expect(buildCall).toBeDefined();
+    expect(buildCall!.env.npm_config_include).not.toBe('dev');
+    expect(buildCall!.env.NODE_ENV).toBe('production');
+  });
+});
+
+describe('BuilderService install stage — postInstall hook', () => {
+  // 'rust' has no built-in strategy (see the devdeps test above): the custom
+  // strategy is the only match, keeping the real nodejs preBuild out of play.
+  const makeStrategy = (postInstall: jest.Mock, installCommand: string | null = 'npm install') =>
+    ({
+      name: 'test-postinstall',
+      supportedTypes: ['rust'],
+      canBuild: () => true,
+      getInstallCommand: () => installCommand,
+      getBuildCommand: () => null,
+      getOutputDirectory: () => null,
+      postInstall,
+    }) as BuildStrategy;
+
+  const makeContext = (execCommand: ExecCommandFn): BuildContext => ({
+    appName: 'postinstall-test',
+    appPath: '/test',
+    appType: 'rust',
+    framework: null,
+    config: {},
+    env: {},
+    execCommand,
+  });
+
+  it('calls postInstall after a successful install', async () => {
+    const service = new BuilderService();
+    const postInstall = jest.fn().mockResolvedValue(undefined);
+    service.registerStrategy(makeStrategy(postInstall));
+
+    const exec: ExecCommandFn = async () => ({ exitCode: 0, stdout: '', stderr: '', duration: 0 });
+    const result = await service.build(makeContext(exec));
+
+    expect(result.success).toBe(true);
+    expect(postInstall).toHaveBeenCalledTimes(1);
+  });
+
+  it('does NOT call postInstall when the install fails — the skip marker must not outlive a failed install', async () => {
+    const service = new BuilderService();
+    const postInstall = jest.fn().mockResolvedValue(undefined);
+    service.registerStrategy(makeStrategy(postInstall));
+
+    const exec: ExecCommandFn = async () => ({ exitCode: 1, stdout: '', stderr: 'boom', duration: 0 });
+    const result = await service.build(makeContext(exec));
+
+    expect(result.success).toBe(false);
+    expect(postInstall).not.toHaveBeenCalled();
+  });
+
+  it('a throwing postInstall does not fail the build — the marker is best-effort', async () => {
+    const service = new BuilderService();
+    const postInstall = jest.fn().mockRejectedValue(new Error('marker write blew up'));
+    service.registerStrategy(makeStrategy(postInstall));
+
+    const exec: ExecCommandFn = async () => ({ exitCode: 0, stdout: '', stderr: '', duration: 0 });
+    const result = await service.build(makeContext(exec));
+
+    expect(result.success).toBe(true);
+    expect(postInstall).toHaveBeenCalledTimes(1);
+  });
+
+  it('does NOT call postInstall when the install stage is skipped', async () => {
+    const service = new BuilderService();
+    const postInstall = jest.fn().mockResolvedValue(undefined);
+    service.registerStrategy(makeStrategy(postInstall, null));
+
+    const exec: ExecCommandFn = async () => ({ exitCode: 0, stdout: '', stderr: '', duration: 0 });
+    const result = await service.build(makeContext(exec));
+
+    expect(result.success).toBe(true);
+    expect(postInstall).not.toHaveBeenCalled();
   });
 });
 

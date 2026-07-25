@@ -420,11 +420,18 @@ export function generateFullCaddyfile(
   lines.push('}');
   lines.push('');
 
-  // Generate HTTP redirect blocks first (skip for localhost domains)
+  // Generate HTTP redirect blocks first (skip for localhost domains). Dedupe by
+  // hostname: multiple routes can legitimately share one hostname (monorepo
+  // children path-split as `host` and `host/api*`), but the redirect block is
+  // keyed on hostname ALONE (no path), so emitting it more than once per host
+  // would create a duplicate `http://host` site address that wedges Caddy's
+  // whole config reload.
+  const redirectedHosts = new Set<string>();
   for (const route of routes) {
-    if (!isLocalhostDomain(route.hostname)) {
+    if (!isLocalhostDomain(route.hostname) && !redirectedHosts.has(route.hostname)) {
       const redirectBlock = generateHttpRedirectBlock(route);
       if (redirectBlock) {
+        redirectedHosts.add(route.hostname);
         lines.push(formatBlock(redirectBlock));
         lines.push('');
       }

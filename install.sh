@@ -39,7 +39,10 @@ error() { echo -e "${RED}[DROP]${NC} $*" >&2; exit 1; }
 
 # apt-get wrapper: wait up to 5 min for the dpkg lock so we don't race the
 # unattended-upgrades / apt-daily jobs that run on a freshly-booted box.
-aptget() { apt-get -o DPkg::Lock::Timeout=300 "$@"; }
+# DEBIAN_FRONTEND=noninteractive keeps apt from opening a dialog (debconf or a
+# needrestart service prompt) on a TTY-less deploy SSH session, where it would
+# hang until the job times out rather than fail fast.
+aptget() { DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=300 "$@"; }
 
 # ── argument parsing ─────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
@@ -93,13 +96,28 @@ ensure_node() {
 # bcrypt is a native runtime dependency; CI's `npm ci` compiles it on the box, so
 # a freshly-bootstrapped server needs a C toolchain present even though the build
 # itself happens during deploy.
+# python3-venv is what lets a Python app build at all under isolation:none:
+# the builder installs deps into an in-app-dir `.venv`, and on Debian/Ubuntu
+# `python3 -m venv` fails with "ensurepip is not available" unless python3-venv
+# is present. Debian's bare `python3` ships neither venv nor pip, which is why
+# this must be provisioned rather than assumed.
+# No python3-pip on purpose: python3-venv brings ensurepip, so each app's
+# .venv gets its own pip, and every command the builder emits goes through
+# `.venv/bin/python -m pip`. A system-wide pip would only add a way for an
+# install to land outside the app dir and still look like it worked.
 ensure_build_tools() {
-  if dpkg -s build-essential &>/dev/null && command -v python3 &>/dev/null; then
+  if dpkg -s build-essential &>/dev/null \
+    && dpkg -s python3-venv &>/dev/null \
+    && command -v python3 &>/dev/null; then
     info "Build tools already installed"
     return 0
   fi
-  info "Installing build tools (build-essential, python3) for native npm deps..."
-  aptget install -y build-essential python3
+  info "Installing build tools (build-essential, python3, python3-venv)..."
+  # Refresh the index first: on an already-bootstrapped server this runs from
+  # the deploy's --provision pass, where the cached lists can be months stale
+  # and would resolve python3-venv to a version that no longer exists.
+  aptget update -qq
+  aptget install -y build-essential python3 python3-venv
 }
 
 # ── Docker Engine (container isolation) ─────────────────────────────────────
@@ -210,6 +228,38 @@ ensure_caddy() {
     setcap 'cap_net_bind_service=+ep' "$caddy_bin" \
       || warn "setcap failed — Caddy may not bind :80/:443 as the '$DROP_USER' user"
   fi
+}
+
+# ── logind RemoveIPC ─────────────────────────────────────────────────────────
+# systemd-logind's default RemoveIPC=yes deletes ALL POSIX/SysV shared memory
+# owned by a non-system user the moment that user's last login session ends —
+# even while a system service still runs as that user. The bundled PostgreSQL
+# runs as $DROP_USER (a regular useradd user), and CI deploys SSH in and out
+# as that same user, so every deploy wiped the live server's dynamic shared
+# memory ("could not open shared memory segment /PostgreSQL.N: No such file or
+# directory" on the next parallel query). RemoveIPC=no is the fix PostgreSQL's
+# own docs prescribe for running as a non-system user under systemd.
+ensure_removeipc_off() {
+  local dropin_dir="/etc/systemd/logind.conf.d"
+  local dropin="$dropin_dir/99-drop-removeipc.conf"
+  if grep -qs '^RemoveIPC=no' "$dropin"; then
+    return 0
+  fi
+  info "Disabling systemd-logind RemoveIPC (protects the bundled PostgreSQL)..."
+  mkdir -p "$dropin_dir"
+  cat > "$dropin" << 'EOF'
+# Written by DROP install.sh — do not remove.
+# The bundled PostgreSQL runs as a regular (non-system) user; logind's default
+# RemoveIPC=yes would delete its shared memory whenever that user's last SSH
+# session ends, breaking queries with "could not open shared memory segment".
+[Login]
+RemoveIPC=no
+EOF
+  # logind does not re-read its config on HUP; restart it so the setting takes
+  # effect now. Safe on a headless box — active sessions (including the one
+  # running this script) survive a logind restart via /run/systemd state.
+  systemctl restart systemd-logind \
+    || warn "Could not restart systemd-logind — RemoveIPC=no takes effect after reboot"
 }
 
 # ── platform config (domain / HTTPS) — persisted, survives upgrades & deploys ─
@@ -401,6 +451,7 @@ EOF
 provision_system() {
   ensure_root_dir
   ensure_caddy
+  ensure_removeipc_off
   write_env_config
   write_service      # (re)writes the unit + daemon-reload + enable
   write_sudoers
@@ -442,6 +493,12 @@ if $BOOTSTRAP; then
 elif $PROVISION; then
   info "Provisioning system (Caddy, unit, env, apex route)..."
   [[ "$ISOLATION" == "docker" ]] && ensure_docker
+  # Deploys run `--provision`, so this is the only path that reaches an
+  # already-bootstrapped server. Re-run the package step here or host
+  # requirements added after bootstrap (python3-venv) never land. Non-fatal
+  # under `set -e`: an apt mirror hiccup must not abort a deploy that has
+  # already unpacked the new artifact but not yet restarted the service.
+  ensure_build_tools || warn "Host build tools incomplete — Python apps may fail to build under isolation:none"
   provision_system
   info "Restarting $SERVICE_NAME..."
   systemctl restart "$SERVICE_NAME"

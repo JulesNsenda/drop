@@ -48,14 +48,41 @@ export interface AppDto {
   lastDeployedAt?: string;
   buildDuration?: number;
   error?: string;
+  /**
+   * Env-var names the app declared required (drop.yaml `secrets:`) that were
+   * missing at start; present only with `status: 'needs-config'` (PRD-051).
+   */
+  missingSecrets?: string[];
   gitSource?: GitSource;
   userId?: string;
   ownerName?: string;
   customDomain?: string;
+  /**
+   * Grouping tag for apps expanded from a single monorepo deploy (e.g. a repo
+   * `ezsign` with `services: {backend, frontend}` expands to apps
+   * `ezsign-backend` / `ezsign-frontend`, both tagged `group: ezsign`). Absent
+   * for standalone apps. See docs/plans/2026-07-12-monorepo-multi-service.md.
+   */
+  group?: string;
+  /**
+   * True when this app belongs to a monorepo group whose CONTAINER was deployed
+   * from git (so the group is git-redeployable). Children carry no `gitSource`
+   * of their own — this flag lets the dashboard offer a "Redeploy group" action
+   * on any child, which resolves to the container. Absent for standalone apps
+   * and folder-dropped (non-git) groups.
+   */
+  groupGitBacked?: boolean;
   /** Live memory usage in bytes (from runtime; null when not running or unavailable). */
   memory?: number | null;
   /** Live CPU usage percent (from runtime; null when not running or unavailable). */
   cpu?: number | null;
+  /**
+   * Live uptime in ms, i.e. time since the current process/container started
+   * (from runtime; null when not running or unavailable). Only meaningful
+   * when `status === 'running'` — a runtime may still report a stale value
+   * for a process it stopped but did not fully remove (PRD-048 §1.3).
+   */
+  uptime?: number | null;
 }
 
 export interface CreateAppDto {

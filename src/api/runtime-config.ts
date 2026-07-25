@@ -23,6 +23,8 @@ interface ApiRuntimeConfig {
   tempDirectory?: string;
   /** Cap on the compressed (as-uploaded) archive size, in MB. */
   maxUploadSizeMb?: number;
+  /** Public base URL of the API (e.g. "https://drop.example.com"), used as the OAuth issuer. */
+  publicUrl?: string;
 }
 
 const runtimeConfig: ApiRuntimeConfig = {};
@@ -33,6 +35,7 @@ export function setApiRuntimeConfig(config: ApiRuntimeConfig): void {
   if (config.domainSuffix !== undefined) runtimeConfig.domainSuffix = config.domainSuffix;
   if (config.tempDirectory) runtimeConfig.tempDirectory = config.tempDirectory;
   if (config.maxUploadSizeMb !== undefined) runtimeConfig.maxUploadSizeMb = config.maxUploadSizeMb;
+  if (config.publicUrl !== undefined) runtimeConfig.publicUrl = config.publicUrl;
 }
 
 /** Resolved webapps directory: explicit config > DROP_APPS_DIR env > platform default. */
@@ -75,4 +78,32 @@ export function isHttpsEnabled(): boolean {
 /** Active domain suffix (e.g. "example.com" → apps get "appname.example.com"). */
 export function getDomainSuffix(): string {
   return runtimeConfig.domainSuffix || process.env.DROP_DOMAIN_SUFFIX || 'localhost';
+}
+
+/**
+ * Public base URL of the DROP API (e.g. "https://drop.example.com"), used as
+ * the OAuth issuer/resource base. Explicit config > DROP_PUBLIC_URL env.
+ *
+ * Deliberately **fail-closed**: unlike `getDomainSuffix()` (which defaults to
+ * "localhost"), this returns `undefined` when unset so callers can refuse to
+ * serve OAuth endpoints rather than derive an issuer from a spoofable `Host`
+ * header or the apps' wildcard domain suffix.
+ */
+export function getPublicUrl(): string | undefined {
+  const raw = runtimeConfig.publicUrl || process.env.DROP_PUBLIC_URL;
+  if (!raw) return undefined;
+  const trimmed = raw.trim();
+  if (!trimmed) return undefined;
+  return trimmed.replace(/\/+$/, '');
+}
+
+/**
+ * Live-update the public URL override (or, with `undefined`, clear it so
+ * `getPublicUrl()` falls back to the DROP_PUBLIC_URL env var). Used by the
+ * admin settings route so a change takes effect immediately, without a
+ * restart — separate from `setApiRuntimeConfig`, which only ever sets
+ * fields when explicitly provided and can't express "clear this field".
+ */
+export function setPublicUrl(url: string | undefined): void {
+  runtimeConfig.publicUrl = url;
 }

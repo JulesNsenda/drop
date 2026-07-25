@@ -8,6 +8,7 @@
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import { AppDetector, DetectionResult, AppType, SuggestedConfig } from '../detector.types';
+import { readProcfile, getWebCommand, ProcfileProcesses } from '../procfile';
 
 // Framework indicators in requirements
 const FRAMEWORK_PATTERNS: Record<string, { type: AppType; framework: string; confidence: number }> = {
@@ -40,16 +41,39 @@ export const pythonDetector: AppDetector = {
     const hasPyproject = await fileExists(path.join(appPath, 'pyproject.toml'));
     const hasSetupPy = await fileExists(path.join(appPath, 'setup.py'));
     const hasPipfile = await fileExists(path.join(appPath, 'Pipfile'));
+    const hasManifest = hasRequirements || hasPyproject || hasSetupPy || hasPipfile;
 
-    if (!hasRequirements && !hasPyproject && !hasSetupPy && !hasPipfile) {
-      return null;
+    // Find entry point up front - it doubles as the detection signal below
+    // when there is no dependency manifest.
+    const entryPoint = await findEntryPoint(appPath);
+
+    // No requirements.txt/pyproject.toml/setup.py/Pipfile: an app with just
+    // an entry point file (app.py, main.py, ...) is still a real Python app,
+    // so don't fall through to `unknown` - detect it at a lower confidence
+    // instead. A Procfile reinforces the match (and its `web:` command, if
+    // present, is a better start-command guess than the generic framework
+    // default), but a Procfile alone - with no entry point - is NOT a Python
+    // signal; plenty of other languages declare one too.
+    let procfile: ProcfileProcesses | null = null;
+    if (!hasManifest) {
+      if (!entryPoint) {
+        return null;
+      }
+      procfile = await readProcfile(appPath);
     }
 
     const warnings: string[] = [];
     let type: AppType = 'python';
     let framework: string | null = null;
-    let confidence = 0.70;
-    let detectedBy = 'python-project';
+    let confidence: number;
+    let detectedBy: string;
+    if (hasManifest) {
+      confidence = 0.70;
+      detectedBy = 'python-project';
+    } else {
+      confidence = 0.5;
+      detectedBy = procfile ? 'entrypoint+procfile' : 'entrypoint';
+    }
 
     // Check for Django (manage.py is a strong indicator)
     const hasManagePy = await fileExists(path.join(appPath, 'manage.py'));
@@ -62,7 +86,7 @@ export const pythonDetector: AppDetector = {
 
     // Parse requirements.txt for framework detection
     if (hasRequirements && type === 'python') {
-      const requirements = await readRequirements(path.join(appPath, 'requirements.txt'));
+      const requirements = await readRequirements(appPath, 'requirements.txt');
 
       for (const req of requirements) {
         const reqName = req.toLowerCase();
@@ -79,11 +103,15 @@ export const pythonDetector: AppDetector = {
       }
     }
 
-    // Find entry point
-    const entryPoint = await findEntryPoint(appPath);
-
     // Generate suggested config
-    const suggestedConfig = generatePythonConfig(type, framework, entryPoint, hasRequirements, hasPipfile);
+    const suggestedConfig = generatePythonConfig(type, framework, entryPoint);
+
+    // A Procfile `web:` command is the authoritative user-provided start
+    // command for a manifest-less app - prefer it over the guessed default.
+    const procfileWebCommand = getWebCommand(procfile);
+    if (procfileWebCommand) {
+      suggestedConfig.startCommand = procfileWebCommand;
+    }
 
     // Check for common issues
     if (!entryPoint && type !== 'django') {
@@ -121,17 +149,73 @@ async function fileExists(filePath: string): Promise<boolean> {
   }
 }
 
-async function readRequirements(filePath: string): Promise<string[]> {
+// Matches `-r <file>` / `--requirement <file>` / `-c <file>` / `--constraint <file>`
+// include directives inside a requirements file.
+const INCLUDE_DIRECTIVE = /^(?:-r|--requirement|-c|--constraint)\s+(.+)$/;
+
+/**
+ * Read `relativeFilePath` (relative to `appPath`) and return the dependency
+ * names it declares, following any `-r`/`--requirement`/`-c`/`--constraint`
+ * includes recursively. Includes are resolved relative to the directory of
+ * the file that references them, guarded against cycles (visited-set) and
+ * against escaping the app directory (never read outside `appPath`).
+ */
+async function readRequirements(appPath: string, relativeFilePath: string): Promise<string[]> {
+  return readRequirementsFile(appPath, relativeFilePath, new Set<string>());
+}
+
+async function readRequirementsFile(
+  appPath: string,
+  relativeFilePath: string,
+  visited: Set<string>
+): Promise<string[]> {
+  const absAppPath = path.resolve(appPath);
+  const absFilePath = path.resolve(appPath, relativeFilePath);
+  const relToApp = path.relative(absAppPath, absFilePath);
+
+  // Containment guard: refuse anything that resolves outside the app dir.
+  if (relToApp.startsWith('..') || path.isAbsolute(relToApp)) {
+    return [];
+  }
+
+  // Cycle guard: canonicalize on the app-relative path so the same file
+  // reached via different relative spellings is only ever read once.
+  const visitKey = relToApp.split(path.sep).join('/');
+  if (visited.has(visitKey)) {
+    return [];
+  }
+  visited.add(visitKey);
+
+  let content: string;
   try {
-    const content = await fs.readFile(filePath, 'utf-8');
-    return content
-      .split('\n')
-      .map(line => line.trim())
-      .filter(line => line && !line.startsWith('#') && !line.startsWith('-'))
-      .map(line => line.split(/[=<>!~[]/)[0].trim());
+    content = await fs.readFile(absFilePath, 'utf-8');
   } catch {
     return [];
   }
+
+  const currentDir = path.dirname(relativeFilePath);
+  const results: string[] = [];
+
+  for (const rawLine of content.split('\n')) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith('#')) continue;
+
+    const includeMatch = INCLUDE_DIRECTIVE.exec(line);
+    if (includeMatch) {
+      const target = includeMatch[1].trim();
+      if (path.isAbsolute(target)) continue; // reject absolute-path includes
+      const targetRelative = path.join(currentDir, target);
+      const included = await readRequirementsFile(appPath, targetRelative, visited);
+      results.push(...included);
+      continue;
+    }
+
+    if (line.startsWith('-')) continue; // other pip options (-e, --index-url, ...)
+
+    results.push(line.split(/[=<>!~[]/)[0].trim());
+  }
+
+  return results;
 }
 
 async function findEntryPoint(appPath: string): Promise<string | null> {
@@ -146,32 +230,39 @@ async function findEntryPoint(appPath: string): Promise<string | null> {
 function generatePythonConfig(
   type: AppType,
   _framework: string | null,
-  entryPoint: string | null,
-  hasRequirements: boolean,
-  hasPipfile: boolean
+  entryPoint: string | null
 ): SuggestedConfig {
   const config: SuggestedConfig = {};
 
-  // Install command
-  if (hasPipfile) {
-    config.installCommand = 'pipenv install';
-  } else if (hasRequirements) {
-    config.installCommand = 'pip install -r requirements.txt';
-  }
+  // Deliberately no installCommand. PythonBuildStrategy owns dependency
+  // installation, and platform.buildApp passes whatever we suggest here
+  // straight into BuildContext.config.installCommand — which the strategy
+  // honors ahead of its own logic. Suggesting a command from here therefore
+  // *replaces* the in-app-dir venv install rather than defaulting it, and a
+  // bare `pip`/`pipenv` breaks both isolation modes: on a host build `pip` is
+  // usually not on PATH at all ("/bin/sh: 1: pip: not found" — only `python3`
+  // is guaranteed), and inside a build container it "succeeds" into
+  // site-packages that are discarded with the container, leaving the runtime
+  // with no deps ("No module named uvicorn"). Leaving it unset lets
+  // PythonBuildStrategy.preBuild pick the correct `.venv`-based command.
 
-  // Start command based on framework
+  // Start command based on framework. Always invoke via `python -m` rather
+  // than a bare `uvicorn`/`gunicorn` binary: at runtime `.venv/bin` is on
+  // PATH so `python` is the venv interpreter and `-m <module>` resolves the
+  // console-script iff it's installed - a bare binary name is not guaranteed
+  // to be on PATH at all.
   switch (type) {
     case 'django':
-      config.startCommand = 'gunicorn --bind 0.0.0.0:$PORT wsgi:application';
+      config.startCommand = 'python -m gunicorn --bind 0.0.0.0:$PORT wsgi:application';
       config.port = 8000;
       break;
 
     case 'flask':
       if (entryPoint) {
         const module = entryPoint.replace('.py', '');
-        config.startCommand = `gunicorn --bind 0.0.0.0:$PORT ${module}:app`;
+        config.startCommand = `python -m gunicorn --bind 0.0.0.0:$PORT ${module}:app`;
       } else {
-        config.startCommand = 'gunicorn --bind 0.0.0.0:$PORT app:app';
+        config.startCommand = 'python -m gunicorn --bind 0.0.0.0:$PORT app:app';
       }
       config.port = 5000;
       break;
@@ -179,9 +270,9 @@ function generatePythonConfig(
     case 'fastapi':
       if (entryPoint) {
         const module = entryPoint.replace('.py', '');
-        config.startCommand = `uvicorn ${module}:app --host 0.0.0.0 --port $PORT`;
+        config.startCommand = `python -m uvicorn ${module}:app --host 0.0.0.0 --port $PORT`;
       } else {
-        config.startCommand = 'uvicorn main:app --host 0.0.0.0 --port $PORT';
+        config.startCommand = 'python -m uvicorn main:app --host 0.0.0.0 --port $PORT';
       }
       config.port = 8000;
       break;

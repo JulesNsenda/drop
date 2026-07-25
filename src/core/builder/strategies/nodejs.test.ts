@@ -160,39 +160,94 @@ describe('NodejsBuildStrategy', () => {
       expect(c.config.buildCommand).toBeUndefined();
     });
 
-    it('skips install (skipInstall=true) when the stored lockfile hash matches the current lockfile', async () => {
+    it('skips install (skipInstall=true) when the node_modules marker matches the current lockfile', async () => {
       const lockContent = '{"name":"app","lockfileVersion":3}';
       await fs.writeFile(path.join(tmpDir, 'package-lock.json'), lockContent);
       const hash = crypto.createHash('sha256').update(lockContent).digest('hex');
+      await fs.mkdir(path.join(tmpDir, 'node_modules'));
+      await fs.writeFile(path.join(tmpDir, 'node_modules', '.drop-lockfile-hash'), hash);
 
-      const workDir = await fs.mkdtemp(path.join(os.tmpdir(), 'drop-nodejs-workdir-'));
-      try {
-        await fs.writeFile(path.join(workDir, 'lockfile-hash.txt'), hash);
-
-        const c = ctx({ appType: 'nodejs', appPath: tmpDir, workDir });
-        await strategy.preBuild(c);
-        expect(c.config.skipInstall).toBe(true);
-        expect(strategy.getInstallCommand(c)).toBeNull();
-      } finally {
-        await fs.rm(workDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
-      }
+      const c = ctx({ appType: 'nodejs', appPath: tmpDir });
+      await strategy.preBuild(c);
+      expect(c.config.skipInstall).toBe(true);
+      expect(strategy.getInstallCommand(c)).toBeNull();
     });
 
-    it('persists the lockfile hash to workDir so a later build with the same lockfile can skip install', async () => {
+    it('does NOT skip install once node_modules is wiped — the marker dies with it (monorepo redeploys)', async () => {
+      const lockContent = '{"name":"app","lockfileVersion":3}';
+      await fs.writeFile(path.join(tmpDir, 'package-lock.json'), lockContent);
+      const hash = crypto.createHash('sha256').update(lockContent).digest('hex');
+      await fs.mkdir(path.join(tmpDir, 'node_modules'));
+      await fs.writeFile(path.join(tmpDir, 'node_modules', '.drop-lockfile-hash'), hash);
+
+      // Simulate expandMonorepo's wipe-and-recopy, which excludes node_modules.
+      await fs.rm(path.join(tmpDir, 'node_modules'), { recursive: true, force: true });
+
+      const c = ctx({ appType: 'nodejs', appPath: tmpDir });
+      await strategy.preBuild(c);
+      expect(c.config.skipInstall).toBeUndefined();
+      expect(c.config.installCommand).toBe('npm ci');
+    });
+
+    it('does not persist the lockfile hash in preBuild (a failed install must not mark it as installed)', async () => {
       const lockContent = '{"name":"app2","lockfileVersion":3}';
       await fs.writeFile(path.join(tmpDir, 'package-lock.json'), lockContent);
-      const expectedHash = crypto.createHash('sha256').update(lockContent).digest('hex');
+      await fs.mkdir(path.join(tmpDir, 'node_modules'));
 
-      const workDir = await fs.mkdtemp(path.join(os.tmpdir(), 'drop-nodejs-workdir2-'));
-      try {
-        const c = ctx({ appType: 'nodejs', appPath: tmpDir, workDir });
-        await strategy.preBuild(c);
-        expect(c.config.skipInstall).toBeUndefined();
-        const stored = await fs.readFile(path.join(workDir, 'lockfile-hash.txt'), 'utf-8');
-        expect(stored.trim()).toBe(expectedHash);
-      } finally {
-        await fs.rm(workDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
-      }
+      const c = ctx({ appType: 'nodejs', appPath: tmpDir });
+      await strategy.preBuild(c);
+      expect(c.config.skipInstall).toBeUndefined();
+      await expect(
+        fs.access(path.join(tmpDir, 'node_modules', '.drop-lockfile-hash'))
+      ).rejects.toThrow();
+    });
+  });
+
+  describe('postInstall', () => {
+    let tmpDir: string;
+
+    beforeEach(async () => {
+      tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'drop-nodejs-postinstall-'));
+    });
+
+    afterEach(async () => {
+      await fs.rm(tmpDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+    });
+
+    it('persists the lockfile hash into node_modules so the next build with the same lockfile skips install', async () => {
+      const lockContent = '{"name":"app3","lockfileVersion":3}';
+      await fs.writeFile(path.join(tmpDir, 'package-lock.json'), lockContent);
+      const expectedHash = crypto.createHash('sha256').update(lockContent).digest('hex');
+      await fs.mkdir(path.join(tmpDir, 'node_modules'));
+
+      const c = ctx({ appType: 'nodejs', appPath: tmpDir });
+      await strategy.postInstall(c);
+
+      const stored = await fs.readFile(
+        path.join(tmpDir, 'node_modules', '.drop-lockfile-hash'),
+        'utf-8'
+      );
+      expect(stored.trim()).toBe(expectedHash);
+
+      const next = ctx({ appType: 'nodejs', appPath: tmpDir });
+      await strategy.preBuild(next);
+      expect(next.config.skipInstall).toBe(true);
+    });
+
+    it('is a no-op when there is no lockfile to hash', async () => {
+      await fs.mkdir(path.join(tmpDir, 'node_modules'));
+      const c = ctx({ appType: 'nodejs', appPath: tmpDir });
+      await strategy.postInstall(c);
+      await expect(
+        fs.access(path.join(tmpDir, 'node_modules', '.drop-lockfile-hash'))
+      ).rejects.toThrow();
+    });
+
+    it('never creates node_modules just to hold the marker', async () => {
+      await fs.writeFile(path.join(tmpDir, 'package-lock.json'), '{"lockfileVersion":3}');
+      const c = ctx({ appType: 'nodejs', appPath: tmpDir });
+      await strategy.postInstall(c);
+      await expect(fs.access(path.join(tmpDir, 'node_modules'))).rejects.toThrow();
     });
   });
 

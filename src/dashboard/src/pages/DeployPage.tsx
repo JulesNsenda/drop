@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect, DragEvent } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate, Link } from 'react-router-dom';
 import {
   FolderUp,
   GitBranch,
@@ -14,16 +14,32 @@ import {
 } from 'lucide-react';
 import { useToast } from '../components/Toast';
 import { useConfirm } from '../components/ConfirmDialog';
-import { getAuthHeaders } from '../hooks/useAuth';
-import { gitDeploy, getGitTokens, addGitToken, deleteGitToken, GitTokenInfo, useHealth } from '../hooks/useApi';
+import { getAuthHeaders, useAuth } from '../hooks/useAuth';
+import {
+  gitDeploy,
+  getGitTokens,
+  addGitToken,
+  deleteGitToken,
+  GitTokenInfo,
+  useHealth,
+} from '../hooks/useApi';
 import { appLinkInfo } from '../api/client';
+import Tabs, { TabDef } from '../components/Tabs';
+import Button from '../components/ui/Button';
+import Card from '../components/ui/Card';
+import Input from '../components/ui/Input';
 
 type Tab = 'github' | 'upload';
 type DeployStatus = 'idle' | 'deploying' | 'success' | 'error';
 
-const inputClass =
-  'w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white focus:ring-2 focus:ring-drop-500 focus:border-transparent outline-none text-sm';
-const labelClass = 'block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1';
+const deployTabs: TabDef[] = [
+  { id: 'github', label: 'GitHub', icon: GitBranch },
+  { id: 'upload', label: 'Upload', icon: FolderUp },
+];
+
+/** Compact select/text-input styling that matches the `Input` primitive's `.dui-input` look for controls the primitive doesn't cover (native `<select>`, inline icon buttons). */
+const inlineFieldClass =
+  'w-full rounded-lg px-3 py-2 text-sm outline-none transition-colors dui-input';
 
 function DeployPage() {
   const [tab, setTab] = useState<Tab>('github');
@@ -31,6 +47,7 @@ function DeployPage() {
   const confirmDialog = useConfirm();
   const navigate = useNavigate();
   const { health } = useHealth();
+  const { role } = useAuth();
 
   // Build the "deploy via filesystem" hint from the SERVER's OS and webapps
   // directory (reported by /health), not the browser's — the dashboard is
@@ -124,7 +141,8 @@ function DeployPage() {
             }
           }
         } catch {}
-        if (attempts > 60) { // 30 second timeout
+        if (attempts > 60) {
+          // 30 second timeout
           clearInterval(poll);
           setStatus('success');
           setMessage(`${appName} is being deployed. Check the app detail for status.`);
@@ -152,19 +170,30 @@ function DeployPage() {
   };
 
   const handleDeleteToken = async (id: string) => {
-    const confirmed = await confirmDialog({ title: 'Delete token', message: 'Remove this GitHub token?', confirmText: 'Delete', variant: 'danger' });
+    const confirmed = await confirmDialog({
+      title: 'Delete token',
+      message: 'Remove this GitHub token?',
+      confirmText: 'Delete',
+      variant: 'danger',
+    });
     if (!confirmed) return;
     const deleted = await deleteGitToken(id);
     if (deleted) {
-      setTokens(tokens.filter((t) => t.id !== id));
+      setTokens(tokens.filter(t => t.id !== id));
       if (selectedToken === id) setSelectedToken('');
       toast('success', 'Token deleted');
     }
   };
 
   // --- File Upload ---
-  const handleDragOver = (e: DragEvent) => { e.preventDefault(); setDragOver(true); };
-  const handleDragLeave = (e: DragEvent) => { e.preventDefault(); setDragOver(false); };
+  const handleDragOver = (e: DragEvent) => {
+    e.preventDefault();
+    setDragOver(true);
+  };
+  const handleDragLeave = (e: DragEvent) => {
+    e.preventDefault();
+    setDragOver(false);
+  };
 
   const handleDrop = async (e: DragEvent) => {
     e.preventDefault();
@@ -213,35 +242,32 @@ function DeployPage() {
   if (status === 'success') {
     return (
       <div className="p-6">
-        <div className="max-w-lg mx-auto mt-12">
-          <div className="bg-white dark:bg-gray-800 rounded-xl border border-gray-200 dark:border-gray-700 p-8 text-center">
-            <div className="w-14 h-14 bg-green-100 dark:bg-green-900/30 rounded-full flex items-center justify-center mx-auto mb-5">
-              <CheckCircle className="w-7 h-7 text-green-600 dark:text-green-400" />
+        <div className="mx-auto mt-12 max-w-lg">
+          <Card className="text-center">
+            <div
+              className="mx-auto mb-5 flex h-14 w-14 items-center justify-center rounded-full"
+              style={{ background: 'color-mix(in srgb, var(--ok) 15%, transparent)' }}
+            >
+              <CheckCircle className="h-7 w-7" style={{ color: 'var(--ok)' }} />
             </div>
-            <h2 className="text-xl font-semibold text-gray-900 dark:text-white mb-2">
+            <h2 className="mb-2 text-xl font-semibold" style={{ color: 'var(--text)' }}>
               Deployment started
             </h2>
-            <p className="text-sm text-gray-500 dark:text-gray-400 mb-6 leading-relaxed">
+            <p className="mb-6 text-sm leading-relaxed" style={{ color: 'var(--text-2)' }}>
               {message}
             </p>
-            <div className="flex flex-col sm:flex-row gap-3 justify-center">
+            <div className="flex flex-col justify-center gap-3 sm:flex-row">
               {deployedApp && (
-                <button
-                  onClick={() => navigate(`/apps/${deployedApp}`)}
-                  className="inline-flex items-center justify-center gap-2 px-5 py-2.5 bg-drop-600 text-white rounded-lg hover:bg-drop-700 font-medium text-sm transition-colors"
-                >
+                <Button variant="primary" onClick={() => navigate(`/apps/${deployedApp}`)}>
                   View application
-                  <ArrowRight className="w-4 h-4" />
-                </button>
+                  <ArrowRight className="h-4 w-4" />
+                </Button>
               )}
-              <button
-                onClick={resetState}
-                className="inline-flex items-center justify-center px-5 py-2.5 border border-gray-300 dark:border-gray-600 text-gray-700 dark:text-gray-300 rounded-lg hover:bg-gray-50 dark:hover:bg-gray-800 font-medium text-sm transition-colors"
-              >
+              <Button variant="secondary" onClick={resetState}>
                 Deploy another
-              </button>
+              </Button>
             </div>
-          </div>
+          </Card>
         </div>
       </div>
     );
@@ -250,24 +276,27 @@ function DeployPage() {
   if (status === 'error') {
     return (
       <div className="p-6">
-        <div className="max-w-lg mx-auto mt-12">
-          <div className="bg-white dark:bg-gray-800 rounded-xl border border-red-200 dark:border-red-800/50 p-8 text-center">
-            <div className="w-14 h-14 bg-red-100 dark:bg-red-900/30 rounded-full flex items-center justify-center mx-auto mb-5">
-              <AlertCircle className="w-7 h-7 text-red-600 dark:text-red-400" />
+        <div className="mx-auto mt-12 max-w-lg">
+          <Card
+            className="text-center"
+            style={{ borderColor: 'color-mix(in srgb, var(--err) 35%, transparent)' }}
+          >
+            <div
+              className="mx-auto mb-5 flex h-14 w-14 items-center justify-center rounded-full"
+              style={{ background: 'color-mix(in srgb, var(--err) 15%, transparent)' }}
+            >
+              <AlertCircle className="h-7 w-7" style={{ color: 'var(--err)' }} />
             </div>
-            <h2 className="text-xl font-semibold text-gray-900 dark:text-white mb-2">
+            <h2 className="mb-2 text-xl font-semibold" style={{ color: 'var(--text)' }}>
               Deployment failed
             </h2>
-            <p className="text-sm text-gray-500 dark:text-gray-400 mb-6 leading-relaxed">
+            <p className="mb-6 text-sm leading-relaxed" style={{ color: 'var(--text-2)' }}>
               {message}
             </p>
-            <button
-              onClick={() => setStatus('idle')}
-              className="inline-flex items-center justify-center px-5 py-2.5 bg-drop-600 text-white rounded-lg hover:bg-drop-700 font-medium text-sm transition-colors"
-            >
+            <Button variant="primary" onClick={() => setStatus('idle')}>
               Try again
-            </button>
-          </div>
+            </Button>
+          </Card>
         </div>
       </div>
     );
@@ -277,133 +306,143 @@ function DeployPage() {
     <div className="p-6">
       {/* Header */}
       <div className="mb-6">
-        <h1 className="text-2xl font-bold text-gray-900 dark:text-white">Deploy</h1>
-        <p className="text-sm text-gray-500 dark:text-gray-400 mt-1">
+        <h1 className="text-2xl font-bold" style={{ color: 'var(--text)' }}>
+          Deploy
+        </h1>
+        <p className="mt-1 text-sm" style={{ color: 'var(--text-2)' }}>
           Deploy a new application from GitHub or by uploading files
         </p>
       </div>
 
-      {/* Tabs */}
-      <div className="flex border-b border-gray-200 dark:border-gray-700 mb-6 max-w-2xl">
-        <button
-          onClick={() => setTab('github')}
-          className={`flex items-center gap-2 px-4 py-2.5 text-sm font-medium border-b-2 transition-colors -mb-px ${
-            tab === 'github'
-              ? 'border-drop-600 text-drop-600 dark:text-drop-400'
-              : 'border-transparent text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-300'
-          }`}
-        >
-          <GitBranch className="w-4 h-4" />
-          GitHub
-        </button>
-        <button
-          onClick={() => setTab('upload')}
-          className={`flex items-center gap-2 px-4 py-2.5 text-sm font-medium border-b-2 transition-colors -mb-px ${
-            tab === 'upload'
-              ? 'border-drop-600 text-drop-600 dark:text-drop-400'
-              : 'border-transparent text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-300'
-          }`}
-        >
-          <FolderUp className="w-4 h-4" />
-          Upload
-        </button>
+      <div className="max-w-2xl">
+        <Tabs tabs={deployTabs} active={tab} onChange={id => setTab(id as Tab)} />
       </div>
 
       {/* GitHub tab */}
       {tab === 'github' && (
-        <div className="max-w-2xl space-y-5">
-          {/* Repo URL */}
-          <div>
-            <label className={labelClass}>Repository URL</label>
-            <div className="relative">
-              <GitBranch className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400" />
-              <input
-                type="url"
-                value={repoUrl}
-                onChange={(e) => setRepoUrl(e.target.value)}
-                placeholder="https://github.com/user/repo"
-                className={`${inputClass} pl-10`}
-                disabled={status === 'deploying'}
-              />
-            </div>
-          </div>
+        <Card className="max-w-2xl space-y-5">
+          <Input
+            label="Repository URL"
+            type="url"
+            value={repoUrl}
+            onChange={e => setRepoUrl(e.target.value)}
+            placeholder="https://github.com/user/repo"
+            disabled={status === 'deploying'}
+          />
 
           {/* Branch + Name row */}
           <div className="grid grid-cols-2 gap-4">
-            <div>
-              <label className={labelClass}>Branch</label>
-              <input
-                type="text"
-                value={branch}
-                onChange={(e) => setBranch(e.target.value)}
-                placeholder="main"
-                className={inputClass}
-                disabled={status === 'deploying'}
-              />
-            </div>
-            <div>
-              <label className={labelClass}>App name (optional)</label>
-              <input
-                type="text"
-                value={gitAppName}
-                onChange={(e) => setGitAppName(e.target.value)}
-                placeholder="Derived from repo name"
-                className={inputClass}
-                disabled={status === 'deploying'}
-              />
-            </div>
+            <Input
+              label="Branch"
+              type="text"
+              value={branch}
+              onChange={e => setBranch(e.target.value)}
+              placeholder="main"
+              disabled={status === 'deploying'}
+            />
+            <Input
+              label="App name (optional)"
+              type="text"
+              value={gitAppName}
+              onChange={e => setGitAppName(e.target.value)}
+              placeholder="Derived from repo name"
+              disabled={status === 'deploying'}
+            />
           </div>
 
           {/* Token + auto-redeploy row */}
           <div>
-            <label className={labelClass}>Authentication (private repos)</label>
+            <label className="mb-1 block text-sm font-medium" style={{ color: 'var(--text-2)' }}>
+              Authentication (private repos)
+            </label>
             <div className="flex gap-2">
               <select
                 value={selectedToken}
-                onChange={(e) => setSelectedToken(e.target.value)}
-                className={inputClass}
+                onChange={e => setSelectedToken(e.target.value)}
+                className={inlineFieldClass}
                 disabled={status === 'deploying'}
               >
                 <option value="">No token (public repo)</option>
-                {tokens.map((t) => (
-                  <option key={t.id} value={t.id}>{t.name}</option>
+                {tokens.map(t => (
+                  <option key={t.id} value={t.id}>
+                    {t.name}
+                  </option>
                 ))}
               </select>
               <button
+                type="button"
                 onClick={() => setShowTokenForm(!showTokenForm)}
-                className="flex-shrink-0 px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-50 dark:hover:bg-gray-800 text-gray-500 dark:text-gray-400 transition-colors"
                 title="Manage tokens"
+                aria-label="Manage tokens"
+                className="dui-btn-secondary flex-shrink-0 rounded-lg border px-3 py-2 transition-colors"
               >
-                <Key className="w-4 h-4" />
+                <Key className="h-4 w-4" />
               </button>
             </div>
           </div>
 
           {/* Token manager panel */}
           {showTokenForm && (
-            <div className="bg-gray-50 dark:bg-gray-800/50 border border-gray-200 dark:border-gray-700 rounded-lg p-4 space-y-3">
-              <h3 className="text-sm font-medium text-gray-700 dark:text-gray-300">Manage tokens</h3>
+            <div
+              className="space-y-3 rounded-lg border p-4"
+              style={{ background: 'var(--bg-2)', borderColor: 'var(--border)' }}
+            >
+              <h3 className="text-sm font-medium" style={{ color: 'var(--text-2)' }}>
+                Manage tokens
+              </h3>
               {tokens.length > 0 && (
                 <div className="space-y-1.5">
-                  {tokens.map((t) => (
-                    <div key={t.id} className="flex items-center justify-between py-1.5 px-2 rounded bg-white dark:bg-gray-800 border border-gray-100 dark:border-gray-700">
-                      <span className="text-sm text-gray-700 dark:text-gray-300">{t.name}</span>
-                      <button onClick={() => handleDeleteToken(t.id)} className="text-gray-400 hover:text-red-500 transition-colors">
-                        <Trash2 className="w-3.5 h-3.5" />
+                  {tokens.map(t => (
+                    <div
+                      key={t.id}
+                      className="flex items-center justify-between rounded px-2 py-1.5"
+                      style={{ background: 'var(--bg-3)', border: '1px solid var(--border)' }}
+                    >
+                      <span className="text-sm" style={{ color: 'var(--text-2)' }}>
+                        {t.name}
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => handleDeleteToken(t.id)}
+                        title="Delete token"
+                        aria-label="Delete token"
+                        className="transition-colors hover:text-[var(--err)]"
+                        style={{ color: 'var(--text-3)' }}
+                      >
+                        <Trash2 className="h-3.5 w-3.5" />
                       </button>
                     </div>
                   ))}
                 </div>
               )}
               <div className="flex gap-2">
-                <input type="text" value={newTokenName} onChange={(e) => setNewTokenName(e.target.value)} placeholder="Label" className={inputClass} />
-                <input type="password" value={newTokenValue} onChange={(e) => setNewTokenValue(e.target.value)} placeholder="ghp_..." className={inputClass} />
-                <button onClick={handleAddToken} disabled={!newTokenName.trim() || !newTokenValue.trim()} className="flex-shrink-0 px-3 py-2 bg-drop-600 text-white rounded-lg hover:bg-drop-700 disabled:opacity-50 transition-colors">
-                  <Plus className="w-4 h-4" />
+                <input
+                  type="text"
+                  value={newTokenName}
+                  onChange={e => setNewTokenName(e.target.value)}
+                  placeholder="Label"
+                  className={inlineFieldClass}
+                />
+                <input
+                  type="password"
+                  value={newTokenValue}
+                  onChange={e => setNewTokenValue(e.target.value)}
+                  placeholder="ghp_..."
+                  className={inlineFieldClass}
+                />
+                <button
+                  type="button"
+                  onClick={handleAddToken}
+                  disabled={!newTokenName.trim() || !newTokenValue.trim()}
+                  title="Add token"
+                  aria-label="Add token"
+                  className="dui-btn-primary flex-shrink-0 rounded-lg border px-3 py-2 transition-colors disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  <Plus className="h-4 w-4" />
                 </button>
               </div>
-              <p className="text-xs text-gray-500 dark:text-gray-400">
-                Use a fine-grained PAT with <code className="bg-gray-200 dark:bg-gray-700 px-1 rounded">Contents: Read</code> permission.
+              <p className="text-xs" style={{ color: 'var(--text-3)' }}>
+                Use a fine-grained PAT with <code>Contents: Read</code> permission.
               </p>
             </div>
           )}
@@ -414,51 +453,63 @@ function DeployPage() {
               type="checkbox"
               id="autoRedeploy"
               checked={autoRedeploy}
-              onChange={(e) => setAutoRedeploy(e.target.checked)}
-              className="w-4 h-4 rounded border-gray-300 dark:border-gray-600 text-drop-600 focus:ring-drop-500"
+              onChange={e => setAutoRedeploy(e.target.checked)}
+              className="h-4 w-4 rounded"
+              style={{ accentColor: 'var(--accent)' }}
               disabled={status === 'deploying'}
             />
-            <label htmlFor="autoRedeploy" className="text-sm text-gray-600 dark:text-gray-400">
+            <label htmlFor="autoRedeploy" className="text-sm" style={{ color: 'var(--text-2)' }}>
               Auto-redeploy when code is pushed (via GitHub webhook)
             </label>
           </div>
+          <p className="-mt-2 text-xs" style={{ color: 'var(--text-3)' }}>
+            {/* The Git webhooks settings tab is admin-only — don't deep-link
+                non-admins to a tab they can't open (SettingsPage would
+                silently fall back to the Account tab). */}
+            {role === 'admin' ? (
+              <>
+                Requires a webhook secret — configure one in{' '}
+                <Link to="/settings?tab=git-webhooks" className="underline">
+                  Settings &rarr; Git webhooks
+                </Link>
+                .
+              </>
+            ) : (
+              <>Requires a webhook secret — ask an admin to configure one in Settings.</>
+            )}
+          </p>
 
           {/* Deploy button */}
-          <button
+          <Button
             onClick={handleGitDeploy}
-            disabled={!repoUrl.trim() || status === 'deploying'}
-            className="w-full px-4 py-3 bg-drop-600 text-white rounded-lg hover:bg-drop-700 disabled:opacity-50 disabled:cursor-not-allowed font-medium text-sm flex items-center justify-center gap-2 transition-colors"
+            disabled={!repoUrl.trim()}
+            loading={status === 'deploying'}
+            className="w-full"
           >
             {status === 'deploying' ? (
-              <>
-                <Loader2 className="w-4 h-4 animate-spin" />
-                {deployStep || 'Deploying...'}
-              </>
+              deployStep || 'Deploying...'
             ) : (
               <>
                 Deploy from GitHub
-                <ExternalLink className="w-4 h-4" />
+                <ExternalLink className="h-4 w-4" />
               </>
             )}
-          </button>
-        </div>
+          </Button>
+        </Card>
       )}
 
       {/* Upload tab */}
       {tab === 'upload' && (
-        <div className="max-w-2xl space-y-5">
+        <Card className="max-w-2xl space-y-5">
           {/* App name */}
-          <div>
-            <label className={labelClass}>Application name (optional)</label>
-            <input
-              type="text"
-              value={uploadAppName}
-              onChange={(e) => setUploadAppName(e.target.value)}
-              placeholder="Auto-generated if empty"
-              className={inputClass}
-              disabled={status === 'deploying'}
-            />
-          </div>
+          <Input
+            label="Application name (optional)"
+            type="text"
+            value={uploadAppName}
+            onChange={e => setUploadAppName(e.target.value)}
+            placeholder="Auto-generated if empty"
+            disabled={status === 'deploying'}
+          />
 
           {/* Drop zone */}
           <div
@@ -466,11 +517,11 @@ function DeployPage() {
             onDragLeave={handleDragLeave}
             onDrop={handleDrop}
             onClick={() => status !== 'deploying' && fileInputRef.current?.click()}
-            className={`border-2 border-dashed rounded-xl p-10 text-center cursor-pointer transition-all ${
-              dragOver
-                ? 'border-drop-500 bg-drop-50 dark:bg-drop-900/20'
-                : 'border-gray-300 dark:border-gray-600 hover:border-drop-400 hover:bg-gray-50 dark:hover:bg-gray-800/50'
-            }`}
+            className="cursor-pointer rounded-xl border-2 border-dashed p-10 text-center transition-colors"
+            style={{
+              borderColor: dragOver ? 'var(--accent)' : 'var(--border)',
+              background: dragOver ? 'var(--accent-soft)' : 'transparent',
+            }}
           >
             <input
               ref={fileInputRef}
@@ -482,16 +533,21 @@ function DeployPage() {
             />
             {status === 'deploying' ? (
               <>
-                <Loader2 className="w-10 h-10 text-drop-500 mx-auto mb-3 animate-spin" />
-                <p className="text-sm font-medium text-gray-700 dark:text-gray-300">Uploading and deploying...</p>
+                <Loader2
+                  className="mx-auto mb-3 h-10 w-10 animate-spin"
+                  style={{ color: 'var(--accent)' }}
+                />
+                <p className="text-sm font-medium" style={{ color: 'var(--text)' }}>
+                  Uploading and deploying...
+                </p>
               </>
             ) : (
               <>
-                <FolderUp className="w-10 h-10 text-gray-400 dark:text-gray-500 mx-auto mb-3" />
-                <p className="text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
-                  Drag & drop files here, or click to browse
+                <FolderUp className="mx-auto mb-3 h-10 w-10" style={{ color: 'var(--text-3)' }} />
+                <p className="mb-1 text-sm font-medium" style={{ color: 'var(--text)' }}>
+                  Drag &amp; drop files here, or click to browse
                 </p>
-                <p className="text-xs text-gray-500 dark:text-gray-400">
+                <p className="text-xs" style={{ color: 'var(--text-2)' }}>
                   Upload your application files to deploy
                 </p>
               </>
@@ -500,16 +556,32 @@ function DeployPage() {
 
           {/* CLI hint */}
           {filesystemHint && (
-            <div className="bg-gray-50 dark:bg-gray-800/50 border border-gray-200 dark:border-gray-700 rounded-lg p-4">
-              <p className="text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wide mb-2">
+            <div
+              className="rounded-lg border p-4"
+              style={{ background: 'var(--bg-2)', borderColor: 'var(--border)' }}
+            >
+              <p
+                className="mb-2 text-xs font-medium uppercase tracking-wide"
+                style={{ color: 'var(--text-3)' }}
+              >
                 Or deploy via filesystem
               </p>
-              <div className="bg-gray-900 dark:bg-gray-950 rounded-md px-3 py-2">
-                <code className="text-xs text-green-400 font-mono">{filesystemHint}</code>
+              <div className="rounded-md px-3 py-2" style={{ background: '#0d1117' }}>
+                <code
+                  className="font-mono text-xs"
+                  style={{
+                    color: 'var(--ok)',
+                    background: 'transparent',
+                    border: 'none',
+                    padding: 0,
+                  }}
+                >
+                  {filesystemHint}
+                </code>
               </div>
             </div>
           )}
-        </div>
+        </Card>
       )}
     </div>
   );

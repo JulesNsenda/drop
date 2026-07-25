@@ -10,13 +10,28 @@ import { BuildContext } from '../builder.types';
 import { AppType } from '../../detector/detector.types';
 import { BaseBuildStrategy } from './base';
 
+/**
+ * Every Python install path funnels through an in-app-dir virtualenv, so the
+ * deps ship with the app artifact (like node_modules) and survive both the
+ * ephemeral build container and a host build. `python3` is the only
+ * interpreter guaranteed to be on PATH — never invoke a bare `pip`.
+ */
+const VENV_CREATE = 'python3 -m venv .venv';
+const VENV_PYTHON = '.venv/bin/python';
+const VENV_PIP = `${VENV_PYTHON} -m pip`;
+/** Where the Pipfile.lock export is materialised for pip to consume. */
+const PIPENV_EXPORT = '.drop-requirements.txt';
+
 export class PythonBuildStrategy extends BaseBuildStrategy {
   name = 'python';
   supportedTypes: AppType[] = ['python', 'django', 'flask', 'fastapi'];
 
   getInstallCommand(context: BuildContext): string | null {
-    // preBuild sets skipInstall when no dependency manifest exists — nothing to
-    // install, so don't run pip against a requirements.txt that isn't there.
+    // Defensive only: this strategy's own preBuild no longer sets
+    // skipInstall (a manifest-less app still gets a venv-only install
+    // command — see preBuild below, mirroring the uniform-.venv goal), but
+    // honor an explicitly configured skipInstall the same way nodejs's
+    // strategy does.
     if (context.config.skipInstall) {
       return null;
     }
@@ -27,7 +42,7 @@ export class PythonBuildStrategy extends BaseBuildStrategy {
     }
 
     // Default: a requirements.txt is the common case.
-    return 'pip install -r requirements.txt';
+    return this.pipInstall();
   }
 
   getBuildCommand(context: BuildContext): string | null {
@@ -36,13 +51,82 @@ export class PythonBuildStrategy extends BaseBuildStrategy {
       return context.config.buildCommand;
     }
 
-    // Django needs collectstatic
+    // Django needs collectstatic. Run it with the same interpreter the deps
+    // were installed into: the in-app-dir venv when we created one (docker
+    // build), else the host/global python.
     if (context.appType === 'django') {
-      return 'python manage.py collectstatic --noinput';
+      const py = this.usesVenv(context) ? '.venv/bin/python' : 'python';
+      return `${py} manage.py collectstatic --noinput`;
     }
 
     // Most Python apps don't need a build step
     return null;
+  }
+
+  /**
+   * The pip install command. Deps must persist into the app dir in BOTH
+   * isolation modes, so this no longer branches on context.execCommand:
+   *  - under docker isolation the build runs in an ephemeral container whose
+   *    global site-packages are discarded when it is removed, and the fresh
+   *    runtime container only sees the bind-mounted app dir — a plain
+   *    `pip install` would leave the runtime with no deps and
+   *    `gunicorn`/`uvicorn`/etc. "not found";
+   *  - under host (PM2/none) isolation a plain `pip install` has been
+   *    observed landing outside the app dir the running process sees, and
+   *    bare `pip` may not even be on PATH (only `python3` is guaranteed).
+   * Installing into an in-app-dir virtualenv (.venv) fixes both: the
+   * packages and their console scripts persist in the app dir (ship with
+   * the artifact like node_modules), and `.venv/bin/python -m pip` — never
+   * bare `pip`, and never `--user`/`-t` (those install outside the app dir,
+   * defeating the point) — is unambiguous about which interpreter/pip runs.
+   * platform.buildStartSpec puts `.venv/bin` on the runtime PATH whenever
+   * `.venv` exists.
+   *
+   * Host requirement: `python3 -m venv` needs the `python3-venv` package
+   * (ensurepip) on Debian/Ubuntu hosts under isolation:none — host
+   * provisioning must install it (docker's python:3.12-slim base already
+   * ships venv, so the docker build side needs no extra package).
+   */
+  private pipInstall(target: string = '-r requirements.txt'): string {
+    return (
+      `${VENV_CREATE} && ` +
+      `${VENV_PIP} install --upgrade pip && ` +
+      `${VENV_PIP} install ${target}`
+    );
+  }
+
+  /**
+   * Pipenv is installed on neither the host nor the build images, so a bare
+   * `pipenv install` could only ever fail with "not found". Bootstrap it into
+   * the venv and use it purely as a lockfile *reader*: `pipenv requirements`
+   * prints the pinned set from Pipfile.lock, which plain venv pip then
+   * installs. Deliberately NOT `pipenv install` — that would have pipenv
+   * decide where packages land (its own virtualenv, or system site-packages
+   * under `--system`), which is exactly the "installed somewhere the runtime
+   * can't see" failure this whole strategy exists to prevent. Here every
+   * package is placed by `.venv/bin/python -m pip`, so the destination is
+   * unambiguous. A missing/stale Pipfile.lock fails the build loudly rather
+   * than silently deploying unpinned deps.
+   */
+  private pipenvInstall(): string {
+    return (
+      `${VENV_CREATE} && ` +
+      `${VENV_PIP} install --upgrade pip && ` +
+      `${VENV_PIP} install pipenv && ` +
+      `${VENV_PYTHON} -m pipenv requirements > ${PIPENV_EXPORT} && ` +
+      `${VENV_PIP} install -r ${PIPENV_EXPORT}`
+    );
+  }
+
+  /**
+   * Whether this build installs deps into (or otherwise creates) an
+   * in-app-dir .venv — true for the default install paths (both the
+   * requirements.txt case and the manifest-less venv-only case created by
+   * preBuild), and for any custom installCommand that references .venv.
+   * Gates which interpreter runs Django's collectstatic.
+   */
+  private usesVenv(context: BuildContext): boolean {
+    return context.config.installCommand?.includes('.venv') ?? false;
   }
 
   getOutputDirectory(context: BuildContext): string | null {
@@ -62,21 +146,33 @@ export class PythonBuildStrategy extends BaseBuildStrategy {
   async preBuild(context: BuildContext): Promise<void> {
     // Detect Python package manager
     const hasPipfile = await this.fileExists(path.join(context.appPath, 'Pipfile'));
-    const hasPoetry = await this.fileExists(path.join(context.appPath, 'pyproject.toml'));
+    const hasPyproject = await this.fileExists(path.join(context.appPath, 'pyproject.toml'));
     const hasRequirements = await this.fileExists(path.join(context.appPath, 'requirements.txt'));
 
     if (!context.config.installCommand) {
-      if (hasPipfile) {
-        context.config.installCommand = 'pipenv install';
-      } else if (hasPoetry) {
-        context.config.installCommand = 'poetry install';
-      } else if (hasRequirements) {
-        context.config.installCommand = 'pip install -r requirements.txt';
+      // requirements.txt wins when several manifests coexist: it's the
+      // deployment manifest, and projects that carry a pyproject.toml purely
+      // for tool config (ruff/black/pytest) would otherwise be sent down the
+      // PEP 517 path and fail to build.
+      if (hasRequirements) {
+        context.config.installCommand = this.pipInstall();
+      } else if (hasPipfile) {
+        context.config.installCommand = this.pipenvInstall();
+      } else if (hasPyproject) {
+        // Installs the project itself, which pulls its declared dependencies.
+        // This covers a normal packaged layout; a pyproject that declares no
+        // build backend, or a Poetry project with `package-mode = false`, has
+        // nothing to build and will fail here — loudly, at build time, which
+        // still beats the previous `poetry install` ("poetry: not found").
+        context.config.installCommand = this.pipInstall('.');
       } else {
-        // No dependency manifest found → skip the install stage entirely
-        // (the same mechanism nodejs uses), rather than an '' sentinel that
-        // getInstallCommand's truthy check would ignore.
-        context.config.skipInstall = true;
+        // No dependency manifest found — still create an (empty) in-app-dir
+        // .venv (venv only, no pip install to run) instead of skipping the
+        // install stage entirely. platform.buildStartSpec only puts
+        // `.venv/bin` on the runtime PATH when `.venv` exists, so a
+        // manifest-less (stdlib-only) app needs one too for `.venv/bin/python`
+        // to exist uniformly across every Python app.
+        context.config.installCommand = VENV_CREATE;
       }
     }
   }

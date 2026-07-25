@@ -1,0 +1,46 @@
+# DROP hosted-MCP connector shim for claude.ai (PRD-040 / AGENT-DEPLOY.md path 2)
+#
+# claude.ai's "Add custom connector" dialog offers only Name + URL (+ optional
+# OAuth). When the Request-headers beta isn't on your account, this shim lets
+# you add a NO-AUTH connector at a secret URL while the DROP API key is injected
+# server-side by Caddy — so claude.ai sees a working unauthenticated MCP
+# endpoint and never handles your key.
+#
+# ── Install ─────────────────────────────────────────────────────────────────
+# 1. Copy this file to the Caddy hosts dir on the box (imported automatically,
+#    survives every Caddyfile regeneration):
+#        <DROP_ROOT>/data/appconf/caddy/hosts/mcp-connector.caddy
+#    (on dropkit.sh: /var/drop/data/appconf/caddy/hosts/mcp-connector.caddy)
+# 2. Replace the three placeholders below.
+# 3. Ensure DNS resolves the subdomain to the box (a *.<domain> wildcard covers
+#    it). Use a DEDICATED subdomain, never the apex — two site blocks for one
+#    host make Caddy's config ambiguous.
+# 4. Reload Caddy (the platform reloads on config change; or `caddy reload`).
+# 5. In claude.ai → Add custom connector, set URL to
+#        https://mcp.<YOUR_DOMAIN>/<SECRET_PATH_TOKEN>
+#    Leave OAuth Client ID/Secret blank. No auth needed on the connector.
+#
+# ── SECURITY ────────────────────────────────────────────────────────────────
+# The secret URL IS the credential: anyone who has it can deploy to your box,
+# and it appears in your own Caddy access logs. Use a long random token
+# (e.g. `openssl rand -hex 24`), treat the whole URL like an API key, and
+# rotate by editing SECRET_PATH_TOKEN here. Prefer path 1 (Request headers) or
+# path 3 (OAuth, PRD-041) if either is available to you.
+#
+# Placeholders:
+#   mcp.<YOUR_DOMAIN>   — a dedicated subdomain (e.g. mcp.dropkit.sh)
+#   <SECRET_PATH_TOKEN> — long random string, e.g. openssl rand -hex 24
+#   <USER_ROLE_API_KEY> — a DROP user-role key (never admin); mint in dashboard
+#   127.0.0.1:3000      — the DROP API port (default 3000; change if customized)
+
+mcp.<YOUR_DOMAIN> {
+    @connector path /<SECRET_PATH_TOKEN>
+    handle @connector {
+        rewrite * /api/v1/mcp
+        reverse_proxy 127.0.0.1:3000 {
+            header_up Authorization "Bearer <USER_ROLE_API_KEY>"
+        }
+    }
+    # Anything other than the exact secret path gets nothing.
+    respond 404
+}

@@ -20,6 +20,7 @@ import {
   resetUserPassword,
   deleteUser,
   authMiddleware,
+  requireCapability,
   isAuthEnabled,
   isSignupEnabled,
   setupMfa,
@@ -245,8 +246,8 @@ auth.get('/users', authMiddleware('admin'), async (c) => {
   return c.json(success(enriched));
 });
 
-// POST /auth/users - Create a new user (admin only)
-auth.post('/users', authMiddleware('admin'), async (c) => {
+// POST /auth/users - Create a new user (admin: any role; scoped 'users:create' caller: 'user' role only)
+auth.post('/users', authMiddleware(), requireCapability('users:create'), async (c) => {
   const body = await c.req.json<{ username: string; password: string; role?: 'admin' | 'user' | 'readonly' }>();
 
   if (!body.username || !body.password) {
@@ -255,6 +256,16 @@ auth.post('/users', authMiddleware('admin'), async (c) => {
 
   if (body.password.length < 8) {
     throw new ValidationError('Password must be at least 8 characters');
+  }
+
+  // Scope-based (non-admin) callers may only create 'user'-role accounts, and an
+  // explicit request for any other role is rejected (never silently downgraded).
+  // Only enforced when an auth context is present: a missing context means auth
+  // is disabled (open single-operator box), where the pre-existing behavior of
+  // allowing any role is preserved.
+  const authCtx = (c.get as Function)('auth') as AuthContext | undefined;
+  if (authCtx && authCtx.role !== 'admin' && body.role !== undefined && body.role !== 'user') {
+    return c.json(error(ErrorCodes.UNAUTHORIZED, 'This token may only create user-role accounts'), 403);
   }
 
   try {
@@ -342,8 +353,17 @@ auth.post('/mfa/verify', async (c) => {
   }
 
   // status === 'ok'
-  await tryLogActivity({ action: 'login_mfa_ok' });
-  return c.json(success({ token: result.token, tokenType: 'Bearer', expiresIn: 86400 }));
+  await tryLogActivity({ action: 'login_mfa_ok', userId: result.user.id, username: result.user.username });
+  return c.json(
+    success({
+      token: result.token,
+      tokenType: 'Bearer',
+      expiresIn: 86400,
+      // Mirror POST /auth/login: return the user so the client keeps the
+      // real role after MFA (otherwise an admin is shown as a plain user).
+      user: result.user,
+    })
+  );
 });
 
 // POST /auth/mfa/setup - Generate a candidate TOTP secret (not persisted until enabled)

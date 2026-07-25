@@ -128,6 +128,22 @@ async function failureResult(appName: string, episode: DeployEpisode): Promise<C
 }
 
 /**
+ * Result for an app the secret preflight parked in `needs-config` (PRD-051):
+ * it declared required secrets that aren't set, so DROP did not start it.
+ * Actionable, not a crash — but reported as an error so the caller acts.
+ */
+function needsConfigResult(appName: string): CallToolResult {
+  const app = getStateManager().getApp(appName);
+  const missing = app?.missingSecrets ?? [];
+  const text = missing.length
+    ? `Deploy of '${appName}' is parked pending required secret(s): ${missing.join(', ')}. ` +
+      `Set them (e.g. via the dashboard or PUT /api/v1/secrets/${appName}), then restart the app.`
+    : `Deploy of '${appName}' is parked pending required secrets. Set the app's required ` +
+      `secret(s), then restart the app.`;
+  return { content: [{ type: 'text', text }], isError: true };
+}
+
+/**
  * Poll the deploy tracker until the episode correlated with this deploy
  * (`startedAt >= acceptedAt`) reaches a terminal status, or the wait budget
  * (`DROP_MCP_DEPLOY_WAIT_MS`, default 120s) elapses.
@@ -142,6 +158,17 @@ async function waitForDeployOutcome(
   const acceptedAtMs = new Date(acceptedAtIso).getTime();
 
   while (Date.now() < deadline) {
+    // A parked app (PRD-051) never reaches a terminal deploy status, so report
+    // it as soon as THIS deploy parks it — guarded by `updatedAt >= acceptedAt`
+    // so a stale park from an earlier deploy can't cause a premature return.
+    const app = getStateManager().getApp(appName);
+    if (
+      app?.status === 'needs-config' &&
+      new Date(app.updatedAt).getTime() >= acceptedAtMs
+    ) {
+      return needsConfigResult(appName);
+    }
+
     const [episode] = getDeployTracker().getEpisodes(appName, 1);
     if (episode && new Date(episode.startedAt).getTime() >= acceptedAtMs) {
       if (episode.status === 'succeeded') return successResult(appName, isNew);
@@ -342,9 +369,11 @@ export async function handleDeployFromGit(
 // ============ list_apps / app_status / app_logs / restart_app ============
 
 export function handleListApps(auth: AuthContext | undefined): CallToolResult {
+  // Monorepo container entries are internal bookkeeping (webhook matching),
+  // never runnable apps — hidden here like in GET /apps.
   const apps = getStateManager()
     .getAllApps()
-    .filter(a => canAccess(auth, a));
+    .filter(a => !a.isGroupContainer && canAccess(auth, a));
 
   if (apps.length === 0) {
     return toolText('No apps found.');

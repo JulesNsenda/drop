@@ -12,6 +12,8 @@ import * as path from 'path';
 import { writeJsonAtomic } from '../../utils/atomic-write';
 import { encrypt, decrypt, EncryptedData } from '../../managers/secret/encryption';
 import { error, ErrorCodes } from '../types';
+import { getPublicUrl } from '../runtime-config';
+import { getMcpResourceUrl, canonicalizeUrl } from '../oauth/metadata';
 
 // Auth configuration
 export interface AuthConfig {
@@ -55,10 +57,18 @@ export interface ApiKey {
   name: string;
   keyHash: string;
   prefix: string; // First 12 chars for identification
-  role: 'admin' | 'user' | 'readonly';
+  /**
+   * 'none' is a scope-only marker: the key carries no role standing at all
+   * (ranks 0 in the authMiddleware role hierarchy) and is authorized purely
+   * via `scopes` + `requireCapability()`. Distinct from `User.role`, which
+   * has no 'none' option — there are no "service users".
+   */
+  role: 'admin' | 'user' | 'readonly' | 'none';
   createdAt: string;
   lastUsed?: string;
   expiresAt?: string;
+  /** Capability scopes for this key (e.g. 'users:create'). Orthogonal to role. */
+  scopes?: string[];
 }
 
 // JWT payload
@@ -74,8 +84,19 @@ export interface JwtPayload {
 export interface AuthContext {
   userId: string;
   username: string;
-  role: 'admin' | 'user' | 'readonly';
-  authMethod: 'jwt' | 'apikey';
+  /** See `ApiKey.role` for the meaning of 'none' (scope-only, no role standing). */
+  role: 'admin' | 'user' | 'readonly' | 'none';
+  authMethod: 'jwt' | 'apikey' | 'oauth';
+  /** Capability scopes carried by API-key auth. Always undefined on the JWT path — JWTs don't carry scopes. */
+  scopes?: string[];
+}
+
+/** A rotated-on-use opaque refresh token, hashed at rest (never the raw token). */
+interface RefreshTokenRecord {
+  tokenHash: string;
+  userId: string;
+  clientId: string;
+  createdAt: string;
 }
 
 // Credentials storage
@@ -85,6 +106,16 @@ interface CredentialsStore {
   jwtSecret: string;
   /** Separate secret for signing MFA challenge tokens — keeps them structurally distinct from session JWTs. */
   mfaChallengeSecret?: string;
+  /** Separate secret for signing OAuth access tokens (PRD-041) — keeps them structurally + cryptographically distinct from session JWTs. */
+  oauthTokenSecret?: string;
+  /** Opaque, hashed-at-rest OAuth refresh tokens. Rotated on every use. */
+  refreshTokens?: RefreshTokenRecord[];
+  /**
+   * The single static OAuth client_id (PRD-041) the operator pastes into
+   * claude.ai's connector settings. PUBLIC (non-secret) — generated once via
+   * `getOrCreateOAuthClientId()`, on first admin `POST /oauth/client` call.
+   */
+  oauthClientId?: string;
 }
 
 // Module state
@@ -92,6 +123,7 @@ let config: AuthConfig | null = null;
 let credentials: CredentialsStore | null = null;
 let jwtSecret: Uint8Array | null = null;
 let mfaChallengeSigningKey: Uint8Array | null = null;
+let oauthTokenSecret: Uint8Array | null = null;
 let masterKey: Buffer | null = null;
 
 // Per-challenge attempt cap: jti → attempt count. Evicted after TTL.
@@ -138,6 +170,14 @@ export async function initializeAuth(authConfig: AuthConfig): Promise<void> {
     await saveCredentials(config.credentialsPath, credentials);
   }
   mfaChallengeSigningKey = new TextEncoder().encode(credentials.mfaChallengeSecret);
+
+  // Set up OAuth access token signing key (separate from session JWT + MFA secrets —
+  // see "THREE GATES" in docs/plans/2026-07-10-mcp-oauth.md)
+  if (!credentials.oauthTokenSecret) {
+    credentials.oauthTokenSecret = crypto.randomBytes(32).toString('hex');
+    await saveCredentials(config.credentialsPath, credentials);
+  }
+  oauthTokenSecret = new TextEncoder().encode(credentials.oauthTokenSecret);
 
   // Load platform master key for MFA secret encryption at rest
   if (config.masterKeyPath) {
@@ -223,6 +263,7 @@ async function createFreshCredentials(credentialsPath: string): Promise<Credenti
     users: [],
     apiKeys: [],
     jwtSecret: crypto.randomBytes(32).toString('hex'),
+    oauthTokenSecret: crypto.randomBytes(32).toString('hex'),
   };
   await saveCredentials(credentialsPath, store);
   return store;
@@ -521,7 +562,16 @@ async function issueSessionJwt(user: User): Promise<string> {
 export async function completeMfaLogin(
   challengeToken: string,
   code: string,
-): Promise<{ status: 'ok'; token: string } | { status: 'invalid' } | { status: 'expired' } | { status: 'attempt_limit' }> {
+): Promise<
+  | {
+      status: 'ok';
+      token: string;
+      user: { id: string; username: string; role: 'admin' | 'user' | 'readonly'; email?: string; mustChangePassword: boolean };
+    }
+  | { status: 'invalid' }
+  | { status: 'expired' }
+  | { status: 'attempt_limit' }
+> {
   if (!credentials || !config) throw new Error('Auth not initialized');
 
   const challenge = await verifyMfaChallenge(challengeToken);
@@ -552,7 +602,20 @@ export async function completeMfaLogin(
   invalidateMfaChallenge(challenge.jti);
 
   const token = await issueSessionJwt(user);
-  return { status: 'ok', token };
+  return {
+    status: 'ok',
+    token,
+    // Return the same safe user view as POST /auth/login so the MFA path
+    // propagates the role (and mustChangePassword) — without it the client
+    // has no role after MFA and shows an admin as a plain user.
+    user: {
+      id: user.id,
+      username: user.username,
+      role: user.role,
+      email: (user as { email?: string }).email,
+      mustChangePassword: (user as { mustChangePassword?: boolean }).mustChangePassword === true,
+    },
+  };
 }
 
 /**
@@ -644,12 +707,192 @@ export async function verifyJwt(token: string): Promise<JwtPayload | null> {
 }
 
 /**
+ * Mint a short-lived OAuth 2.1 access token for the hosted MCP endpoint (PRD-041).
+ *
+ * Signed with the dedicated `oauthTokenSecret` (NOT `jwtSecret`) and carries
+ * `token_use: 'oauth_access'` + an exact `aud` (the RFC 8707 `resource`, e.g.
+ * the canonical `/mcp` URL). These are two of the "three gates" that keep an
+ * OAuth token from reaching the general API — see
+ * docs/plans/2026-07-10-mcp-oauth.md.
+ */
+export async function mintOAuthAccessToken(user: User, audience: string): Promise<string> {
+  if (!oauthTokenSecret) throw new Error('Auth not initialized');
+  return new jose.SignJWT({
+    sub: user.id,
+    username: user.username,
+    role: user.role,
+    token_use: 'oauth_access',
+    aud: audience,
+  })
+    .setProtectedHeader({ alg: 'HS256' })
+    .setIssuedAt()
+    .setExpirationTime('15m')
+    .sign(oauthTokenSecret);
+}
+
+/**
+ * Verify an OAuth access token minted by `mintOAuthAccessToken`.
+ *
+ * Returns null unless the token verifies against the OAuth signing key AND
+ * `token_use === 'oauth_access'` AND `aud` EXACT-equals `expectedAudience`
+ * (no array-membership / prefix matching — a straight `===`). On success,
+ * builds the same `AuthContext` shape session JWTs and API keys build, so
+ * downstream `canAccess`/role checks are unchanged.
+ *
+ * NOTE: the `jose` mock used under Jest ignores the signing secret entirely,
+ * so real crypto key-isolation is NOT exercised in tests — only the claim
+ * checks (`token_use`, `aud`) are. The separate key is defense-in-depth,
+ * verified by code review; see docs/plans/2026-07-11-mcp-oauth-execution.md.
+ */
+export async function verifyOAuthAccessToken(
+  token: string,
+  expectedAudience: string
+): Promise<AuthContext | null> {
+  if (!oauthTokenSecret) return null;
+  try {
+    const { payload } = await jose.jwtVerify(token, oauthTokenSecret, { algorithms: ['HS256'] });
+    const p = payload as unknown as Record<string, unknown>;
+    if (p['token_use'] !== 'oauth_access') return null;
+    if (p['aud'] !== expectedAudience) return null;
+
+    const userId = p['sub'];
+    const username = p['username'];
+    const role = p['role'];
+    if (typeof userId !== 'string' || typeof username !== 'string' || typeof role !== 'string') {
+      return null;
+    }
+
+    return {
+      userId,
+      username,
+      role: role as AuthContext['role'],
+      authMethod: 'oauth',
+    };
+  } catch {
+    return null;
+  }
+}
+
+/** Hash an opaque token the same way API keys are hashed (sha256 hex digest of the raw value). */
+function hashOpaqueToken(token: string): string {
+  return crypto.createHash('sha256').update(token).digest('hex');
+}
+
+/**
+ * Issue a new opaque OAuth refresh token for a user + OAuth client, hashed at
+ * rest (the raw token is returned once and never stored).
+ */
+export async function issueRefreshToken(userId: string, clientId: string): Promise<string> {
+  if (!credentials || !config) throw new Error('Auth not initialized');
+
+  const token = crypto.randomBytes(32).toString('base64url');
+  const record: RefreshTokenRecord = {
+    tokenHash: hashOpaqueToken(token),
+    userId,
+    clientId,
+    createdAt: new Date().toISOString(),
+  };
+
+  if (!credentials.refreshTokens) credentials.refreshTokens = [];
+  credentials.refreshTokens.push(record);
+  await saveCredentials(config.credentialsPath, credentials);
+
+  return token;
+}
+
+/**
+ * Rotate a presented refresh token: if it matches a stored (hashed) record,
+ * delete that record and issue a fresh one for the same user + client.
+ * Returns null if the presented token is unknown (already rotated/revoked,
+ * or never issued) — the caller should treat this as a hard failure (RFC
+ * 6749 §10.4 reuse-detection is a documented fast-follow, not implemented
+ * here).
+ */
+export async function rotateRefreshToken(
+  presented: string
+): Promise<{ refreshToken: string; userId: string; clientId: string } | null> {
+  if (!credentials || !config) throw new Error('Auth not initialized');
+
+  const tokenHash = hashOpaqueToken(presented);
+  const records = credentials.refreshTokens ?? [];
+  const index = records.findIndex((r) => r.tokenHash === tokenHash);
+  if (index === -1) return null;
+
+  const { userId, clientId } = records[index];
+  records.splice(index, 1);
+
+  const refreshToken = crypto.randomBytes(32).toString('base64url');
+  records.push({
+    tokenHash: hashOpaqueToken(refreshToken),
+    userId,
+    clientId,
+    createdAt: new Date().toISOString(),
+  });
+
+  credentials.refreshTokens = records;
+  await saveCredentials(config.credentialsPath, credentials);
+
+  return { refreshToken, userId, clientId };
+}
+
+/** Revoke a single presented refresh token. Returns false if it was not found. */
+export async function revokeRefreshToken(presented: string): Promise<boolean> {
+  if (!credentials || !config) throw new Error('Auth not initialized');
+
+  const tokenHash = hashOpaqueToken(presented);
+  const records = credentials.refreshTokens ?? [];
+  const index = records.findIndex((r) => r.tokenHash === tokenHash);
+  if (index === -1) return false;
+
+  records.splice(index, 1);
+  credentials.refreshTokens = records;
+  await saveCredentials(config.credentialsPath, credentials);
+  return true;
+}
+
+/** Revoke every refresh token issued to a user (e.g. on suspend/delete). */
+export async function revokeAllRefreshTokensForUser(userId: string): Promise<void> {
+  if (!credentials || !config) throw new Error('Auth not initialized');
+
+  const records = credentials.refreshTokens ?? [];
+  const filtered = records.filter((r) => r.userId !== userId);
+  if (filtered.length === records.length) return;
+
+  credentials.refreshTokens = filtered;
+  await saveCredentials(config.credentialsPath, credentials);
+}
+
+/**
+ * Get (or generate + persist, on first call) the single static OAuth
+ * client_id (PRD-041). This is a PUBLIC, non-secret identifier — the
+ * operator pastes it into claude.ai's connector "Advanced settings", it is
+ * never used as a credential (PKCE + the bearer-authed /approve step carry
+ * the actual security).
+ */
+export async function getOrCreateOAuthClientId(): Promise<string> {
+  if (!credentials || !config) throw new Error('Auth not initialized');
+
+  if (!credentials.oauthClientId) {
+    credentials.oauthClientId = crypto.randomBytes(16).toString('hex');
+    await saveCredentials(config.credentialsPath, credentials);
+  }
+
+  return credentials.oauthClientId;
+}
+
+/** Read-only lookup of the static OAuth client_id — does NOT generate one. Returns undefined if none has been minted yet. */
+export function getOAuthClientId(): string | undefined {
+  return credentials?.oauthClientId;
+}
+
+/**
  * Create a new API key
  */
 export async function createApiKey(
   name: string,
-  role: 'admin' | 'user' | 'readonly' = 'user',
-  expiresInDays?: number
+  role: 'admin' | 'user' | 'readonly' | 'none' = 'user',
+  expiresInDays?: number,
+  scopes?: string[]
 ): Promise<{ key: string; apiKey: ApiKey }> {
   if (!credentials || !config) {
     throw new Error('Auth not initialized');
@@ -669,6 +912,7 @@ export async function createApiKey(
     expiresAt: expiresInDays
       ? new Date(Date.now() + expiresInDays * 24 * 60 * 60 * 1000).toISOString()
       : undefined,
+    ...(scopes !== undefined ? { scopes } : {}),
   };
 
   credentials.apiKeys.push(apiKey);
@@ -805,6 +1049,7 @@ export function resetAuth(): void {
   credentials = null;
   jwtSecret = null;
   mfaChallengeSigningKey = null;
+  oauthTokenSecret = null;
   masterKey = null;
   signupEnabled = false;
   lastUsedFlushAt = 0;
@@ -839,12 +1084,40 @@ export function authMiddleware(requiredRole?: 'admin' | 'user' | 'readonly') {
             401
           );
         }
+        // Reject OAuth access tokens — they are scoped (audience-bound) to the
+        // hosted MCP endpoint and must never reach the general API (/secrets,
+        // /admin/*, DELETE /apps/:name, etc). Session JWTs carry neither claim,
+        // so this is safe defense-in-depth alongside the separate signing key
+        // and the mcpAuthMiddleware audience check. See "THREE GATES" in
+        // docs/plans/2026-07-10-mcp-oauth.md.
+        const rawPayload = payload as unknown as Record<string, unknown>;
+        if (rawPayload['token_use'] === 'oauth_access' || rawPayload['aud'] !== undefined) {
+          return c.json(
+            error(ErrorCodes.UNAUTHORIZED, 'OAuth access tokens are not valid for the general API.'),
+            401
+          );
+        }
         authContext = {
           userId: payload.sub,
           username: payload.username,
           role: payload.role as AuthContext['role'],
           authMethod: 'jwt',
         };
+      } else {
+        // Not a valid session JWT — accept a Bearer-presented API key too, so the
+        // conventional `Authorization: Bearer <key>` works (keys are also accepted
+        // via X-API-Key below). JWT is tried first, so real sessions keep their
+        // semantics; only a non-JWT Bearer value is looked up as an API key.
+        const key = await verifyApiKey(token);
+        if (key) {
+          authContext = {
+            userId: key.id,
+            username: key.name,
+            role: key.role,
+            authMethod: 'apikey',
+            scopes: key.scopes,
+          };
+        }
       }
     }
 
@@ -859,6 +1132,7 @@ export function authMiddleware(requiredRole?: 'admin' | 'user' | 'readonly') {
             username: key.name,
             role: key.role,
             authMethod: 'apikey',
+            scopes: key.scopes,
           };
         }
       }
@@ -891,8 +1165,13 @@ export function authMiddleware(requiredRole?: 'admin' | 'user' | 'readonly') {
 
     // Check role if required
     if (requiredRole) {
-      const roleHierarchy = { admin: 3, user: 2, readonly: 1 };
-      if (roleHierarchy[authContext.role] < roleHierarchy[requiredRole]) {
+      const roleHierarchy: Record<string, number> = { admin: 3, user: 2, readonly: 1, none: 0 };
+      // Defensive `?? 0`: a 'none' (scope-only) role, or any malformed/unknown
+      // role that somehow ends up on a persisted record, ranks 0 rather than
+      // `undefined` — `undefined < roleHierarchy[requiredRole]` is always
+      // `false`, which would have let an unrecognized role pass every gate.
+      const rank = (roleHierarchy as Record<string, number>)[authContext.role] ?? 0;
+      if (rank < roleHierarchy[requiredRole]) {
         return c.json(
           error(ErrorCodes.UNAUTHORIZED, `Insufficient permissions. Required role: ${requiredRole}`),
           403
@@ -902,6 +1181,122 @@ export function authMiddleware(requiredRole?: 'admin' | 'user' | 'readonly') {
 
     // Add auth context to request
     c.set('auth', authContext);
+
+    return next();
+  };
+}
+
+/**
+ * Auth gate for the hosted MCP endpoint (PRD-041). Replaces the plain
+ * `authMiddleware('user')` on `/mcp`: accepts an OAuth access token
+ * (audience-checked against this server's MCP resource URL) in addition to
+ * the existing session-JWT / API-key path, and — when NO credential at all
+ * is presented — returns the `WWW-Authenticate` discovery hint claude.ai and
+ * the MCP Inspector rely on to find the protected-resource metadata.
+ */
+export function mcpAuthMiddleware() {
+  return async (c: Context, next: Next): Promise<Response | void> => {
+    // Skip auth if not enabled (mirrors authMiddleware's own defensive check;
+    // this is only ever mounted inside the enableAuth guard in server.ts).
+    if (!isAuthEnabled()) {
+      return next();
+    }
+
+    const authHeader = c.req.header('Authorization');
+    const bearerToken = authHeader?.startsWith('Bearer ') ? authHeader.substring(7) : undefined;
+    const apiKeyHeader = c.req.header('X-API-Key');
+
+    // No credentials at all — this is the unauthenticated discovery probe
+    // claude.ai / the MCP Inspector send first. Point them at the
+    // protected-resource metadata via WWW-Authenticate (only when the OAuth
+    // issuer is actually configured — otherwise say nothing new).
+    if (!bearerToken && !apiKeyHeader) {
+      const publicUrl = getPublicUrl();
+      if (publicUrl) {
+        c.header(
+          'WWW-Authenticate',
+          `Bearer resource_metadata="${canonicalizeUrl(publicUrl)}/.well-known/oauth-protected-resource"`
+        );
+      }
+      return c.json(
+        error(
+          ErrorCodes.UNAUTHORIZED,
+          'Authentication required. Provide a valid JWT token, API key, or OAuth access token.'
+        ),
+        401
+      );
+    }
+
+    // A Bearer token is present — try it as an OAuth access token first
+    // (audience-bound to this server's MCP resource URL). Falls through to
+    // the general session-JWT/API-key path below on any failure.
+    if (bearerToken) {
+      const publicUrl = getPublicUrl();
+      if (publicUrl) {
+        const audience = getMcpResourceUrl(publicUrl);
+        const oauthCtx = await verifyOAuthAccessToken(bearerToken, audience);
+        if (oauthCtx) {
+          c.set('auth', oauthCtx);
+          return next();
+        }
+      }
+    }
+
+    // Fall back to the session-JWT / API-key path. If it 401s a
+    // present-but-invalid credential — notably an EXPIRED OAuth access token,
+    // which claude.ai retries with mid-session — stamp the RFC 6750
+    // WWW-Authenticate hint (error="invalid_token") so the client re-runs
+    // discovery / refresh instead of treating the connection as dead. (The
+    // no-credential probe above already gets its own hint.)
+    const res = await authMiddleware('user')(c, next);
+    if (res && res.status === 401) {
+      const publicUrl = getPublicUrl();
+      if (publicUrl) {
+        res.headers.set(
+          'WWW-Authenticate',
+          `Bearer error="invalid_token", resource_metadata="${canonicalizeUrl(publicUrl)}/.well-known/oauth-protected-resource"`
+        );
+      }
+    }
+    return res;
+  };
+}
+
+/**
+ * Capability-gate middleware. Must run AFTER `authMiddleware()` (with no
+ * required role, or a role low enough to admit scope-only callers) has
+ * already authenticated the request and set `c.get('auth')` — this
+ * middleware does NOT parse JWTs or API keys itself.
+ *
+ * Admits iff the caller is an admin, or its AuthContext carries the
+ * requested capability in `scopes`. This is the only path through which a
+ * `role: 'none'` scope-only key (see `createApiKey`) can be authorized —
+ * every `authMiddleware(role)` gate ranks it 0 and rejects it.
+ */
+export function requireCapability(cap: string) {
+  return async (c: Context, next: Next): Promise<Response | void> => {
+    // Skip if auth is not enabled (open platform), same as authMiddleware.
+    if (!isAuthEnabled()) {
+      return next();
+    }
+
+    const auth = c.get('auth') as AuthContext | undefined;
+    if (!auth) {
+      // Safety net — normally authMiddleware() runs first and would already
+      // have rejected an unauthenticated request with 401.
+      return c.json(
+        error(ErrorCodes.UNAUTHORIZED, 'Authentication required. Provide a valid JWT token or API key.'),
+        401
+      );
+    }
+
+    const admitted = auth.role === 'admin' || (auth.scopes?.includes(cap) ?? false);
+    if (!admitted) {
+      return c.json(
+        error(ErrorCodes.UNAUTHORIZED, `Insufficient permissions. Required capability: ${cap}`),
+        403
+      );
+    }
 
     return next();
   };
@@ -925,6 +1320,19 @@ export function optionalAuthMiddleware() {
           role: payload.role,
           authMethod: 'jwt',
         });
+      } else if (!payload) {
+        // Not a valid JWT — accept a Bearer-presented API key too (mirrors
+        // authMiddleware). A valid-but-challenge token is intentionally skipped.
+        const key = await verifyApiKey(token);
+        if (key) {
+          c.set('auth', {
+            userId: key.id,
+            username: key.name,
+            role: key.role,
+            authMethod: 'apikey',
+            scopes: key.scopes,
+          });
+        }
       }
     }
 
@@ -937,6 +1345,7 @@ export function optionalAuthMiddleware() {
           username: key.name,
           role: key.role,
           authMethod: 'apikey',
+          scopes: key.scopes,
         });
       }
     }

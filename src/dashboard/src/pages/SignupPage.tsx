@@ -1,6 +1,10 @@
 import { useState, FormEvent } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
-import { Box, UserPlus, ArrowLeft } from 'lucide-react';
+import { UserPlus, ArrowLeft } from 'lucide-react';
+import AuthLayout from '../components/AuthLayout';
+import Button from '../components/ui/Button';
+import Input from '../components/ui/Input';
+import Card from '../components/ui/Card';
 
 function SignupPage() {
   const [username, setUsername] = useState('');
@@ -41,110 +45,107 @@ function SignupPage() {
   };
 
   return (
-    <div className="min-h-screen flex items-center justify-center bg-gray-50 dark:bg-gray-900 px-4">
-      <div className="w-full max-w-sm">
-        <div className="text-center mb-8">
-          <div className="w-16 h-16 bg-drop-500 rounded-2xl flex items-center justify-center mx-auto mb-4">
-            <Box className="w-10 h-10 text-white" />
-          </div>
-          <h1 className="text-2xl font-bold text-gray-900 dark:text-white">Create account</h1>
-          <p className="text-gray-500 dark:text-gray-400 mt-1">Start deploying in seconds</p>
-        </div>
+    <AuthLayout>
+      <div className="mb-6 text-center">
+        <h1 className="text-2xl font-semibold" style={{ color: 'var(--text)' }}>
+          Create account
+        </h1>
+        <p className="mt-1 text-sm" style={{ color: 'var(--text-2)' }}>
+          Start deploying in seconds.
+        </p>
+      </div>
 
-        <form onSubmit={handleSubmit} className="bg-white dark:bg-gray-800 rounded-xl shadow-sm border border-gray-200 dark:border-gray-700 p-6 mb-4">
+      <Card>
+        <form onSubmit={handleSubmit}>
           {error && (
-            <div className="mb-4 p-3 bg-red-50 dark:bg-red-900/30 border border-red-200 dark:border-red-800 rounded-lg text-sm text-red-700 dark:text-red-400">
+            <div
+              role="alert"
+              className="mb-4 rounded-lg border px-3 py-2.5 text-sm"
+              style={{
+                background: 'color-mix(in srgb, var(--err) 15%, transparent)',
+                borderColor: 'color-mix(in srgb, var(--err) 35%, transparent)',
+                color: 'var(--err)',
+              }}
+            >
               {error}
             </div>
           )}
 
           <div className="mb-4">
-            <label htmlFor="username" className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
-              Username
-            </label>
-            <input
+            <Input
               id="username"
+              label="Username"
               type="text"
               value={username}
-              onChange={(e) => setUsername(e.target.value)}
+              onChange={e => setUsername(e.target.value)}
               required
               minLength={3}
               pattern="^[a-zA-Z0-9_-]+$"
               autoFocus
-              className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white focus:ring-2 focus:ring-drop-500 focus:border-transparent outline-none"
               placeholder="Choose a username"
             />
           </div>
 
           <div className="mb-4">
-            <label htmlFor="email" className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
-              Email
-            </label>
-            <input
+            <Input
               id="email"
+              label="Email"
               type="email"
               value={email}
-              onChange={(e) => setEmail(e.target.value)}
+              onChange={e => setEmail(e.target.value)}
               required
-              className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white focus:ring-2 focus:ring-drop-500 focus:border-transparent outline-none"
               placeholder="you@example.com"
             />
           </div>
 
           <div className="mb-4">
-            <label htmlFor="password" className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
-              Password
-            </label>
-            <input
+            <Input
               id="password"
+              label="Password"
               type="password"
               value={password}
-              onChange={(e) => setPassword(e.target.value)}
+              onChange={e => setPassword(e.target.value)}
               required
               minLength={8}
-              className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white focus:ring-2 focus:ring-drop-500 focus:border-transparent outline-none"
               placeholder="At least 8 characters"
             />
           </div>
 
           <div className="mb-6">
-            <label htmlFor="confirm" className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
-              Confirm password
-            </label>
-            <input
+            <Input
               id="confirm"
+              label="Confirm password"
               type="password"
               value={confirm}
-              onChange={(e) => setConfirm(e.target.value)}
+              onChange={e => setConfirm(e.target.value)}
               required
-              className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white focus:ring-2 focus:ring-drop-500 focus:border-transparent outline-none"
             />
           </div>
 
-          <button
-            type="submit"
-            disabled={loading}
-            className="w-full flex items-center justify-center gap-2 px-4 py-2.5 bg-drop-600 text-white rounded-lg hover:bg-drop-700 disabled:opacity-50 transition-colors font-medium"
-          >
-            <UserPlus className="w-4 h-4" />
+          <Button type="submit" variant="primary" loading={loading} className="w-full">
+            {!loading && <UserPlus className="h-4 w-4" aria-hidden="true" />}
             {loading ? 'Creating account...' : 'Create account'}
-          </button>
+          </Button>
         </form>
+      </Card>
 
-        <div className="text-center space-y-2">
-          <p className="text-sm text-gray-500 dark:text-gray-400">
-            Already have an account?{' '}
-            <Link to="/login" className="text-drop-600 hover:text-drop-500 font-medium">
-              Sign in
-            </Link>
-          </p>
-          <Link to="/" className="inline-flex items-center gap-1.5 text-sm text-gray-500 dark:text-gray-400 hover:text-drop-600 dark:hover:text-drop-400 transition-colors">
-            <ArrowLeft className="w-3.5 h-3.5" />
-            Back to home
+      <div className="mt-4 space-y-2 text-center">
+        <p className="text-sm" style={{ color: 'var(--text-2)' }}>
+          Already have an account?{' '}
+          <Link to="/login" className="font-medium" style={{ color: 'var(--accent)' }}>
+            Sign in
           </Link>
-        </div>
+        </p>
+        <Link
+          to="/"
+          className="inline-flex items-center gap-1.5 text-sm transition-colors"
+          style={{ color: 'var(--text-2)' }}
+        >
+          <ArrowLeft className="h-3.5 w-3.5" />
+          Back to home
+        </Link>
       </div>
-    </div>
+    </AuthLayout>
   );
 }
 

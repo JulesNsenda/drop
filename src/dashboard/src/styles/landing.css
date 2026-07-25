@@ -1,0 +1,291 @@
+/*
+ * Landing page design tokens — imported from the "DROP Platform Design" Claude
+ * Design project (Landing.dc.html). Everything is scoped under `.drop-landing`
+ * so it never leaks into the rest of the dashboard. Theming is driven off the
+ * existing `html.dark` class (owned by useTheme()), not a parallel signal.
+ *
+ * Light values are the base (matches the repo's light-is-base convention);
+ * `html.dark .drop-landing` supplies the dark palette that the sample defaults
+ * to. Fonts are self-hosted via @fontsource (see LandingPage.tsx) so they load
+ * under the app's strict CSP (font-src 'self').
+ */
+
+.drop-landing {
+  /* Light palette (base) */
+  --bg: #fcfdfe;
+  --bg-2: #f3f6fa;
+  --bg-3: #ffffff;
+  --panel: #ffffff;
+  --border: #e4e9f1;
+  --border-2: #d6dde8;
+  --text: #0a101b;
+  --text-2: #4b586c;
+  --text-3: #8996ab;
+  --accent: #0a84e0;
+  --accent-2: #2e9bfe;
+  --accent-ink: #ffffff;
+  --accent-soft: rgba(10, 132, 224, 0.08);
+  --ok: #12a150;
+  --warn: #c77700;
+  /* HTTP-method chip tokens (PRD-044 §2.3), used on the /reference page */
+  --get: #12a150;
+  --post: #0a84e0;
+  --put: #c77700;
+  --del: #d92d20;
+  --grid: rgba(10, 20, 40, 0.05);
+  --elev: 0 1px 2px rgba(16, 24, 40, 0.05), 0 14px 34px rgba(16, 24, 40, 0.08);
+  --btn: 0 8px 24px color-mix(in srgb, var(--accent) 24%, transparent);
+
+  /* Fonts (theme-independent) */
+  --mono: 'JetBrains Mono', ui-monospace, 'SFMono-Regular', Menlo, monospace;
+  --sans: 'Hanken Grotesk', system-ui, -apple-system, 'Segoe UI', sans-serif;
+
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--sans);
+  line-height: 1.5;
+  min-height: 100vh;
+  -webkit-font-smoothing: antialiased;
+}
+
+html.dark .drop-landing {
+  /* Dark palette (the sample's default) */
+  --bg: #090c12;
+  --bg-2: #0e121b;
+  --bg-3: #141926;
+  --panel: #10151f;
+  --border: #212938;
+  --border-2: #2c3547;
+  --text: #eaeef6;
+  --text-2: #98a4b7;
+  --text-3: #5c6880;
+  --accent: #2e9bfe;
+  --accent-2: #66c0ff;
+  --accent-ink: #04121f;
+  --accent-soft: rgba(46, 155, 254, 0.12);
+  --ok: #39d98a;
+  --warn: #febc2e;
+  --get: #39d98a;
+  --post: #2e9bfe;
+  --put: #febc2e;
+  --del: #f97066;
+  --grid: rgba(255, 255, 255, 0.035);
+  --elev: 0 1px 0 rgba(255, 255, 255, 0.04) inset, 0 12px 34px rgba(0, 0, 0, 0.35);
+  --btn: 0 8px 24px color-mix(in srgb, var(--accent) 34%, transparent);
+}
+
+/* Scoped element styling (mirrors the sample's global rules, but scoped) */
+.drop-landing a {
+  color: var(--accent);
+  text-decoration: none;
+}
+.drop-landing a:hover {
+  color: var(--accent-2);
+}
+.drop-landing ::selection {
+  background: var(--accent);
+  color: var(--accent-ink);
+}
+.drop-landing code {
+  font-family: var(--mono);
+  font-size: 0.9em;
+  background: var(--bg-3);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  padding: 1px 6px;
+  color: var(--text);
+}
+.drop-landing pre {
+  font-family: var(--mono);
+  max-width: 100%;
+}
+
+/* Hover helpers (replace the design's DC-only `style-hover` attribute).
+ * `!important` is required: these elements carry the base value as an inline
+ * `style={{}}` (e.g. border/color/background), and inline styles otherwise win
+ * over a stylesheet `:hover` rule. */
+.drop-landing .dl-hover-border:hover {
+  border-color: var(--accent) !important;
+}
+.drop-landing .dl-hover-text:hover {
+  color: var(--text) !important;
+}
+.drop-landing .dl-hover-accent2:hover {
+  background: var(--accent-2) !important;
+}
+
+/* Terminal cursor blink (sample: animateTerminal default on) */
+@keyframes dl-blink {
+  50% {
+    opacity: 0;
+  }
+}
+.drop-landing .dl-cursor {
+  animation: dl-blink 1s step-end infinite;
+}
+
+/* Sticky-nav offset for in-page anchor jumps (#features, #mcp, …) */
+.drop-landing [id] {
+  scroll-margin-top: 80px;
+}
+
+/*
+ * Docs page (PRD-043): three-column layout — left section TOC (220px),
+ * center content (1fr), right "on this page" rail (200px). Both rails are
+ * sticky under the 60px SiteNav. Collapses to a single column on narrow
+ * viewports: the right rail hides (it's a reading aid, not primary nav) and
+ * the left TOC becomes a static block above the content.
+ */
+.drop-landing .dl-docs-grid {
+  display: grid;
+  grid-template-columns: 220px 1fr 200px;
+  gap: 40px;
+  align-items: start;
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 40px 28px 96px;
+}
+.drop-landing .dl-docs-toc,
+.drop-landing .dl-docs-rail {
+  position: sticky;
+  top: 76px;
+  max-height: calc(100vh - 96px);
+  overflow-y: auto;
+}
+.drop-landing .dl-docs-content {
+  min-width: 0;
+}
+@media (max-width: 960px) {
+  .drop-landing .dl-docs-grid {
+    grid-template-columns: 1fr !important;
+    padding: 28px 20px 64px;
+  }
+  .drop-landing .dl-docs-rail {
+    display: none;
+  }
+  .drop-landing .dl-docs-toc {
+    position: static;
+    max-height: none;
+    overflow-y: visible;
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 20px;
+    margin-bottom: 8px;
+  }
+}
+
+/*
+ * Responsive collapses. The sample is a fixed 1200px desktop mock with no media
+ * queries; these keep the real page from overflowing on tablet/mobile without
+ * changing the desktop look.
+ */
+@media (max-width: 960px) {
+  .drop-landing .dl-grid-2,
+  .drop-landing .dl-grid-hero,
+  .drop-landing .dl-grid-3,
+  .drop-landing .dl-grid-4,
+  .drop-landing .dl-grid-sidebar {
+    grid-template-columns: 1fr !important;
+  }
+  /* Let collapsed grid items shrink below their content's intrinsic width, so
+     wide <pre>/mono content scrolls internally (overflow:auto) instead of
+     widening the whole page. */
+  .drop-landing .dl-grid-2 > *,
+  .drop-landing .dl-grid-hero > *,
+  .drop-landing .dl-grid-3 > *,
+  .drop-landing .dl-grid-4 > *,
+  .drop-landing .dl-grid-sidebar > *,
+  .drop-landing .dl-bento > * {
+    min-width: 0;
+  }
+  .drop-landing .dl-bento {
+    grid-template-columns: 1fr 1fr !important;
+    grid-auto-rows: auto !important;
+  }
+  .drop-landing .dl-hero-h1 {
+    font-size: 44px !important;
+  }
+  .drop-landing .dl-hide-sm {
+    display: none !important;
+  }
+}
+@media (max-width: 560px) {
+  .drop-landing .dl-bento {
+    grid-template-columns: 1fr !important;
+  }
+  .drop-landing .dl-bento > * {
+    grid-column: auto !important;
+    grid-row: auto !important;
+  }
+  .drop-landing .dl-hide-xs {
+    display: none !important;
+  }
+}
+
+/*
+ * HTTP-method chips (PRD-044, /reference page). `.dl-chip` is the full
+ * text badge used on each endpoint row; `.dl-dot` is a compact 6px variant
+ * used in the left TOC next to a route-group name (one dot per method used
+ * in that group, matching API.dc.html's nav treatment without the width
+ * cost of full chips at that size).
+ */
+.drop-landing .dl-chip {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 48px;
+  font-family: var(--mono);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+  line-height: 1;
+  text-transform: uppercase;
+  padding: 4px 7px;
+  border-radius: 5px;
+  border: 1px solid transparent;
+}
+.drop-landing .dl-dot {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+}
+.drop-landing .dl-chip-get,
+.drop-landing .dl-dot-get {
+  color: var(--get);
+  background: color-mix(in srgb, var(--get) 14%, transparent);
+  border-color: color-mix(in srgb, var(--get) 35%, transparent);
+}
+.drop-landing .dl-dot-get {
+  background: var(--get);
+  border: none;
+}
+.drop-landing .dl-chip-post,
+.drop-landing .dl-dot-post {
+  color: var(--post);
+  background: color-mix(in srgb, var(--post) 14%, transparent);
+  border-color: color-mix(in srgb, var(--post) 35%, transparent);
+}
+.drop-landing .dl-dot-post {
+  background: var(--post);
+  border: none;
+}
+.drop-landing .dl-chip-put,
+.drop-landing .dl-dot-put {
+  color: var(--put);
+  background: color-mix(in srgb, var(--put) 14%, transparent);
+  border-color: color-mix(in srgb, var(--put) 35%, transparent);
+}
+.drop-landing .dl-dot-put {
+  background: var(--put);
+  border: none;
+}
+.drop-landing .dl-chip-del,
+.drop-landing .dl-dot-del {
+  color: var(--del);
+  background: color-mix(in srgb, var(--del) 14%, transparent);
+  border-color: color-mix(in srgb, var(--del) 35%, transparent);
+}
+.drop-landing .dl-dot-del {
+  background: var(--del);
+  border: none;
+}

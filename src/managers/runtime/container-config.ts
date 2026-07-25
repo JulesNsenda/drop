@@ -11,12 +11,42 @@ import { AppType } from '../../core/detector/detector.types';
 export const DROP_NETWORK = 'drop-net';
 
 /**
+ * The DROP control-plane API is reachable from inside app containers under this
+ * hostname, wired via a Docker `ExtraHosts` entry (`drop-host:<gateway>`) that
+ * every container receives.  Apps get `DROP_API_URL=http://drop-host:<apiPort>`
+ * injected so they never hardcode a bridge IP.  See the
+ * drop-api-reachability-from-containers plan.
+ */
+export const HOST_ALIAS = 'drop-host';
+
+/**
+ * Pinned subnet + gateway for `drop-net`.  Pinned (rather than letting Docker
+ * auto-allocate) so the in-container `drop-host` alias maps to a KNOWN constant
+ * gateway IP with no `docker network inspect` at start time — the gateway is the
+ * host interface the API listens on (bound 0.0.0.0), reached on the container's
+ * own same-subnet default route (host INPUT path, so `enable_icc=false` /
+ * DOCKER-USER FORWARD rules cannot block it).  A high, uncommon /24 minimises
+ * collision with operator networks; both are env-overridable.
+ */
+export const DROP_NET_SUBNET = process.env.DROP_NET_SUBNET ?? '10.83.0.0/24';
+export const DROP_NET_GATEWAY = process.env.DROP_NET_GATEWAY ?? '10.83.0.1';
+
+/**
  * Pinned base images per app type.  Versions are explicit; "latest" is
  * deliberately avoided so image changes are a conscious upgrade decision.
  */
 const BASE_IMAGES: Partial<Record<AppType, string>> = {
   nodejs: 'node:20-slim',
   python: 'python:3.12-slim',
+  // Python web frameworks: the detector reports the specific type (django/
+  // flask/fastapi), and the BUILD image is selected from that wide type
+  // (platform.ts passes `detection.type`). Without these entries they fell
+  // back to node:20-slim, where `pip` doesn't exist — the build failed with
+  // "/bin/sh: 1: pip: not found". (The runtime container uses the narrowed
+  // 'python' type and was already correct.)
+  django: 'python:3.12-slim',
+  flask: 'python:3.12-slim',
+  fastapi: 'python:3.12-slim',
   go: 'golang:1.22-alpine',
   static: 'nginx:alpine',
   // SPAs are served by the same nginx path as plain static apps

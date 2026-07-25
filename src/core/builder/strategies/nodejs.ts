@@ -83,10 +83,19 @@ export class NodejsBuildStrategy extends BaseBuildStrategy {
   async preBuild(context: BuildContext): Promise<void> {
     const packageManager = await this.detectPackageManager(context.appPath);
 
+    // DEAD IN THE DEFAULT PATH: the Node detector always supplies
+    // installCommand: 'npm install' (see detectors/nodejs.ts), so this guard
+    // is false for every detected Node app and none of the branches below
+    // run. The equivalent logic in strategies/static.ts IS live, because the
+    // static detector suggests no install command. Do not "fix" a bug in here
+    // without first removing the detector's suggestion.
     if (!context.config.installCommand) {
       // Prefer `npm ci` (or equivalent) when a lockfile exists — it's faster
-      // and deterministic. Skip install entirely when the lockfile hash is
-      // unchanged from the last build (node_modules presumed valid).
+      // and deterministic. Skip install only when the lockfile hash matches
+      // the marker from the last successful install. The marker lives INSIDE
+      // node_modules (see markerPath), so anything that destroys node_modules
+      // — the monorepo re-copy, `npm ci`'s pre-clean — destroys the marker
+      // with it, and a stale marker can never vouch for deps that are gone.
       const lockfileHash = await this.hashLockfile(context.appPath, packageManager);
       const storedHash = await this.readStoredHash(context);
 
@@ -104,10 +113,7 @@ export class NodejsBuildStrategy extends BaseBuildStrategy {
             // Use `npm ci` when a lockfile is present, `npm install` otherwise
             context.config.installCommand = lockfileHash ? 'npm ci' : 'npm install';
         }
-        // Persist hash so next build can skip if unchanged
-        if (lockfileHash) {
-          await this.writeStoredHash(context, lockfileHash);
-        }
+        // The hash is persisted in postInstall, after the install succeeds.
       }
     }
 
@@ -123,6 +129,29 @@ export class NodejsBuildStrategy extends BaseBuildStrategy {
           context.config.buildCommand = 'npm run build';
       }
     }
+  }
+
+  /**
+   * Persist the lockfile hash only after the install stage succeeded (the
+   * builder calls this for successful, non-skipped installs). Hashing here —
+   * rather than reusing preBuild's hash — also captures a lockfile that the
+   * install itself created or updated (`npm install` without a prior lockfile).
+   */
+  async postInstall(context: BuildContext): Promise<void> {
+    const packageManager = await this.detectPackageManager(context.appPath);
+    const hash = await this.hashLockfile(context.appPath, packageManager);
+    if (hash) {
+      await this.writeStoredHash(context, hash);
+    }
+  }
+
+  /**
+   * The install-skip marker sits inside node_modules on purpose: its validity
+   * is exactly node_modules' lifetime. Never create node_modules for it —
+   * that would fabricate the evidence the marker stands for.
+   */
+  private markerPath(context: BuildContext): string {
+    return path.join(context.appPath, 'node_modules', '.drop-lockfile-hash');
   }
 
   private async hashLockfile(
@@ -144,19 +173,18 @@ export class NodejsBuildStrategy extends BaseBuildStrategy {
   }
 
   private async readStoredHash(context: BuildContext): Promise<string | null> {
-    if (!context.workDir) return null;
     try {
-      return (await fsp.readFile(path.join(context.workDir, 'lockfile-hash.txt'), 'utf-8')).trim();
+      return (await fsp.readFile(this.markerPath(context), 'utf-8')).trim();
     } catch {
       return null;
     }
   }
 
   private async writeStoredHash(context: BuildContext, hash: string): Promise<void> {
-    if (!context.workDir) return;
     try {
-      await fsp.mkdir(context.workDir, { recursive: true });
-      await fsp.writeFile(path.join(context.workDir, 'lockfile-hash.txt'), hash, 'utf-8');
+      // No mkdir: if install didn't produce node_modules there is nothing to
+      // vouch for, and the write fails closed (next build installs again).
+      await fsp.writeFile(this.markerPath(context), hash, 'utf-8');
     } catch {
       // Best-effort; a missing hash just means next build won't skip
     }

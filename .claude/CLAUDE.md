@@ -142,7 +142,7 @@ Root is `C:\drop\` (Windows) or `/var/drop/` (Linux), overridable via `DROP_ROOT
 
 ### Env vars injected into deployed apps
 
-`PORT` (assigned port), `DROP_DATA_DIR` (persistent data dir), `DATABASE_URL` (if a DB was provisioned), plus any per-app secrets and `depends_on`-resolved URLs from the app's `drop.yaml`.
+`PORT` (assigned port), `DROP_DATA_DIR` (persistent data dir), `DATABASE_URL` (if a DB was provisioned), `DROP_API_URL` (base URL for DROP's own REST API — `http://drop-host:<apiPort>` under docker isolation, `http://127.0.0.1:<apiPort>` otherwise), `DROP_API_KEY` (a least-privilege, scoped API key for calling DROP's own API — injected **only** for apps an admin has granted control-plane capabilities via `PUT /api/v1/apps/<name>/capabilities`; scoped to those capabilities, e.g. `users:create`, never a full admin key), plus any per-app secrets and `depends_on`-resolved URLs from the app's `drop.yaml`.
 
 ## Development Workflow
 

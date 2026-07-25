@@ -25,6 +25,26 @@ export class AppInProgressError extends Error {
   }
 }
 
+/**
+ * Thrown by the start path (PRD-051) when an app declares required secrets in
+ * its drop.yaml that are neither already set nor auto-generatable. The platform
+ * catches it and parks the app in the `needs-config` state instead of starting
+ * it — turning a runtime crash-loop into an actionable "set these secrets" step.
+ */
+export class AppNeedsConfigError extends Error {
+  readonly code = 'APP_NEEDS_CONFIG';
+
+  constructor(
+    readonly appName: string,
+    readonly missingSecrets: string[],
+  ) {
+    super(
+      `Application '${appName}' is missing required secret(s): ${missingSecrets.join(', ')}`,
+    );
+    this.name = 'AppNeedsConfigError';
+  }
+}
+
 export interface PlatformOps {
   /**
    * Stop-if-running, rebuild the start spec from current state (secrets,
@@ -46,6 +66,17 @@ export interface PlatformOps {
    * remains the real backstop.
    */
   isAppInProgress(appName: string): boolean;
+
+  /**
+   * Tear down every app belonging to a monorepo group (M4): stop+delete each
+   * child's runtime process, remove its Caddy routes, dump-then-drop its
+   * database, and remove its state/secrets/deploy-history/config/folder —
+   * then remove the group's container folder so deleted children don't
+   * regenerate on the watcher's next scan. Per-child failures are isolated
+   * (one bad child doesn't abort the rest). Resolves with the names of the
+   * children that were successfully removed.
+   */
+  removeGroup(groupName: string): Promise<{ removed: string[] }>;
 }
 
 let platformOps: PlatformOps | null = null;

@@ -16,7 +16,7 @@ import { ApiServer } from '../server';
 import { createUser, resetAuth } from '../middleware/auth';
 import { getTestToken } from '../__testutils__/auth';
 import { getStateManager, resetStateManager } from '../../managers/app/state-manager';
-import { setPlatformOps, resetPlatformOps, AppInProgressError, PlatformOps } from '../platform-ops';
+import { setPlatformOps, resetPlatformOps, AppInProgressError, AppNeedsConfigError, PlatformOps } from '../platform-ops';
 import * as activity from '../../managers/activity';
 import type { AppProcessInfo } from '../../managers/runtime';
 import { ErrorCodes } from '../types';
@@ -39,6 +39,7 @@ function makeOps(overrides?: Partial<PlatformOps>): PlatformOps {
   return {
     restartApp: jest.fn().mockResolvedValue(RUNNING_PROCESS),
     isAppInProgress: jest.fn().mockReturnValue(false),
+    removeGroup: jest.fn().mockResolvedValue({ removed: [] }),
     ...overrides,
   };
 }
@@ -139,6 +140,42 @@ describe('POST /apps/:name/start and /apps/:name/restart (platform ops)', () => 
       expect(res.status).toBe(409);
       const body = (await res.json()) as { error: { code: string } };
       expect(body.error.code).toBe(ErrorCodes.CONFLICT);
+    });
+  });
+
+  describe('parked (AppNeedsConfigError)', () => {
+    it('409s on restart and names the missing secrets when the app is parked', async () => {
+      setPlatformOps(
+        makeOps({
+          restartApp: jest.fn().mockRejectedValue(new AppNeedsConfigError('test-app', ['JWT_SECRET', 'API_KEY'])),
+        })
+      );
+
+      const res = await hono.request('/api/v1/apps/test-app/restart', {
+        method: 'POST',
+        headers: authHeader(ownerToken),
+      });
+      expect(res.status).toBe(409);
+      const body = (await res.json()) as { error: { code: string; message: string } };
+      expect(body.error.code).toBe(ErrorCodes.CONFLICT);
+      expect(body.error.message).toContain('JWT_SECRET');
+      expect(body.error.message).toContain('API_KEY');
+    });
+
+    it('409s on start when the app is parked in needs-config', async () => {
+      setPlatformOps(
+        makeOps({
+          restartApp: jest.fn().mockRejectedValue(new AppNeedsConfigError('test-app', ['JWT_SECRET'])),
+        })
+      );
+
+      const res = await hono.request('/api/v1/apps/test-app/start', {
+        method: 'POST',
+        headers: authHeader(ownerToken),
+      });
+      expect(res.status).toBe(409);
+      const body = (await res.json()) as { error: { message: string } };
+      expect(body.error.message).toContain('JWT_SECRET');
     });
   });
 

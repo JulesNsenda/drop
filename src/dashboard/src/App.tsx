@@ -1,4 +1,4 @@
-import { useEffect } from 'react';
+import { useEffect, lazy, Suspense } from 'react';
 import { Routes, Route, Navigate, useNavigate } from 'react-router-dom';
 import Layout from './components/Layout';
 import { ErrorBoundary } from './components/ErrorBoundary';
@@ -6,7 +6,9 @@ import { ToastProvider } from './components/Toast';
 import { ConfirmProvider } from './components/ConfirmDialog';
 import { AuthContext, useAuthProvider } from './hooks/useAuth';
 import { UNAUTHORIZED_EVENT, MUST_CHANGE_PASSWORD_EVENT } from './api/client';
-import LandingPage from './pages/LandingPage';
+const LandingPage = lazy(() => import('./pages/LandingPage'));
+const DocsPage = lazy(() => import('./pages/DocsPage'));
+const ReferencePage = lazy(() => import('./pages/ReferencePage'));
 import AppsPage from './pages/AppsPage';
 import AppDetailPage from './pages/AppDetailPage';
 import SettingsPage from './pages/SettingsPage';
@@ -16,6 +18,7 @@ import SignupPage from './pages/SignupPage';
 import UsersPage from './pages/UsersPage';
 import NotFoundPage from './pages/NotFoundPage';
 import ChangePasswordPage from './pages/ChangePasswordPage';
+import OAuthConsent from './pages/OAuthConsent';
 
 function App() {
   const auth = useAuthProvider();
@@ -48,7 +51,23 @@ function App() {
         <ErrorBoundary>
           <Routes>
             {/* Public routes */}
-            <Route index element={<LandingPage />} />
+            <Route index element={
+              auth.loading ? (
+                <div className="min-h-screen flex items-center justify-center bg-gray-50 dark:bg-gray-900">
+                  <div className="animate-pulse text-gray-400">Loading...</div>
+                </div>
+              ) : auth.authenticated ? (
+                auth.mustChangePassword ? <Navigate to="/change-password" replace /> : <Navigate to="/apps" replace />
+              ) : (
+                <Suspense fallback={
+                  <div className="min-h-screen flex items-center justify-center bg-gray-50 dark:bg-gray-900">
+                    <div className="animate-pulse text-gray-400">Loading...</div>
+                  </div>
+                }>
+                  <LandingPage />
+                </Suspense>
+              )
+            } />
             <Route path="login" element={
               auth.authenticated
                 ? (auth.mustChangePassword ? <Navigate to="/change-password" replace /> : <Navigate to="/apps" replace />)
@@ -56,6 +75,34 @@ function App() {
             } />
             <Route path="signup" element={
               auth.authenticated ? <Navigate to="/apps" replace /> : <SignupPage />
+            } />
+
+            {/* OAuth 2.1 consent (PRD-041) — standalone AuthLayout route, no
+                sidebar, self-manages auth (redirects to /login with a
+                returnTo when signed out; see refinement #1 in the OAuth
+                execution plan). */}
+            <Route path="oauth-consent" element={<OAuthConsent />} />
+
+            {/* Public docs site (PRD-043) — no auth, not wrapped in Layout */}
+            <Route path="docs" element={
+              <Suspense fallback={
+                <div className="min-h-screen flex items-center justify-center bg-gray-50 dark:bg-gray-900">
+                  <div className="animate-pulse text-gray-400">Loading...</div>
+                </div>
+              }>
+                <DocsPage />
+              </Suspense>
+            } />
+
+            {/* Public API/CLI reference (PRD-044) — no auth, not wrapped in Layout */}
+            <Route path="reference" element={
+              <Suspense fallback={
+                <div className="min-h-screen flex items-center justify-center bg-gray-50 dark:bg-gray-900">
+                  <div className="animate-pulse text-gray-400">Loading...</div>
+                </div>
+              }>
+                <ReferencePage />
+              </Suspense>
             } />
 
             {/* Force-password-change — accessible while authenticated */}
