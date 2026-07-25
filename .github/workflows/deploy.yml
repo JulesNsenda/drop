@@ -88,7 +88,25 @@ jobs:
             cd /opt/drop
             rm -rf dist/ install.sh
             tar -xzf /tmp/drop-dist.tar.gz
-            npm ci --omit=dev
+            # npm ci wipes and rebuilds node_modules from scratch every time,
+            # which means compiling native bcrypt on a 4 GB box while the
+            # service is already stopped. Skip it when the lockfile is
+            # byte-identical to the one installed last deploy.
+            #
+            # The witness lives INSIDE node_modules on purpose: npm ci removes
+            # that whole tree before installing, so the witness cannot outlive
+            # the tree it describes. An interrupted or failed install therefore
+            # leaves no witness and the next deploy installs, where a witness
+            # kept beside package.json would have survived and been trusted.
+            [ -f package-lock.json ] || { echo "package-lock.json missing from artifact" >&2; exit 1; }
+            LOCK_HASH=$(sha256sum package-lock.json | cut -d" " -f1)
+            PREV_HASH=$(cat node_modules/.deploy-lock-hash 2>/dev/null || echo none)
+            if [ "$LOCK_HASH" = "$PREV_HASH" ]; then
+              echo "Dependencies unchanged - skipping npm ci"
+            else
+              npm ci --omit=dev
+              echo "$LOCK_HASH" > node_modules/.deploy-lock-hash
+            fi
             rm -f /tmp/drop-dist.tar.gz
             # Re-apply system provisioning (Caddy, systemd unit, env, apex route)
             # so infra changes in install.sh land on the server. This also
@@ -101,12 +119,24 @@ jobs:
               echo "::warning::Provisioning unavailable — falling back to restart. Bootstrap install.sh on the server to enable self-provisioning."
               sudo systemctl restart drop-platform
             fi
-            # Verify the service actually came back up before calling it a success.
-            for i in $(seq 1 15); do
-              if curl -fsS http://localhost:3000/api/v1/health >/dev/null 2>&1; then
+            # Verify the service actually came back up before calling it a
+            # success. Probe /health/live, which is unconditionally 200 when the
+            # process is serving — /api/v1/health returns 503 whenever PM2 or
+            # Postgres probe down, which a slow boot does routinely (see
+            # DROP-063, where the internal readiness gate went 20s -> 60s for
+            # this reason). Window is 60s to match that gate.
+            #
+            # Deliberately NO automatic dependency reinstall here: npm ci
+            # removes node_modules before installing, so a reinstall that then
+            # fails (an OOM compiling bcrypt on a 4 GB box is the realistic
+            # case) would leave the box with no dependencies at all, crash-
+            # looping on MODULE_NOT_FOUND under Restart=on-failure. Failing the
+            # deploy loudly is strictly safer than a destructive self-heal.
+            for i in $(seq 1 30); do
+              if curl -fsS http://localhost:3000/api/v1/health/live >/dev/null 2>&1; then
                 echo "Health check passed"; break
               fi
-              if [ "$i" = "15" ]; then echo "Health check FAILED after restart" >&2; exit 1; fi
+              if [ "$i" = "30" ]; then echo "Health check FAILED after restart" >&2; exit 1; fi
               sleep 2
             done
             echo "Deploy complete"'
