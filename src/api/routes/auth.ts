@@ -16,6 +16,7 @@ import {
   getUser,
   getUserById,
   changePassword,
+  verifyUserPassword,
   updateUser,
   resetUserPassword,
   deleteUser,
@@ -153,19 +154,33 @@ auth.post('/api-keys', authMiddleware('admin'), async (c) => {
     throw new ValidationError('expiresInDays must be an integer between 1 and 3650');
   }
 
-  // Who the key acts for. Explicit `ownerUserId` wins; otherwise the key is
-  // attributed to the admin creating it. Never left unset: a key with no owner
-  // is a principal no human can log in as, so the apps it creates are visible
-  // to nobody but an admin and count against no user's quota.
-  const callerAuth = (c.get as (k: string) => AuthContext | undefined)('auth');
-  let ownerUserId = callerAuth?.userId;
-
-  if (body.ownerUserId !== undefined) {
-    if (typeof body.ownerUserId !== 'string' || !getUserById(body.ownerUserId)) {
-      throw new ValidationError('ownerUserId must reference an existing user');
-    }
-    ownerUserId = body.ownerUserId;
+  // `role` is only a TypeScript annotation on `body` — validate it at runtime,
+  // or an arbitrary string (or 'none', which the declared type excludes) is
+  // persisted onto the key and evaluated by every later role check.
+  if (body.role !== undefined && !['admin', 'user', 'readonly'].includes(body.role)) {
+    throw new ValidationError('role must be one of: admin, user, readonly');
   }
+
+  // Who the key acts for. Explicit `ownerUserId` wins; otherwise the key is
+  // attributed to the caller. Never left unset, and never set to something
+  // that isn't a real user: a key whose owner can't be resolved reproduces the
+  // exact bug this field exists to fix, while looking correct.
+  //
+  // The default needs the same validation as the explicit value, because the
+  // caller is not always user-backed — `cli-local` (platform.ts) is a legacy
+  // admin KEY with no owner of its own, so `callerAuth.userId` is a key id
+  // there, and its id is regenerated on every platform start.
+  const callerAuth = (c.get as (k: string) => AuthContext | undefined)('auth');
+  const requestedOwner = body.ownerUserId !== undefined ? body.ownerUserId : callerAuth?.userId;
+
+  if (callerAuth && (typeof requestedOwner !== 'string' || !getUserById(requestedOwner))) {
+    throw new ValidationError(
+      body.ownerUserId !== undefined
+        ? 'ownerUserId must reference an existing user'
+        : 'ownerUserId is required when the caller is not itself a user (e.g. the local CLI key)'
+    );
+  }
+  const ownerUserId = requestedOwner;
 
   const { key, apiKey } = await createApiKey(
     name,
@@ -345,8 +360,39 @@ auth.post('/users/:id/reset-password', authMiddleware('admin'), async (c) => {
   return c.json(success({ message: 'Password reset' }));
 });
 
-// DELETE /auth/account - Delete own account
+/**
+ * DELETE /auth/account - Delete own account.
+ *
+ * Interactive-session only, and password-confirmed. Both guards exist because
+ * `AuthContext.userId` now resolves to an API key's `ownerUserId`: without
+ * them, ANY key issued to a CI job or a deployed app — including a `readonly`
+ * one, since this route requires no role — would delete its owner's account on
+ * a single unauthenticated-in-spirit call. Before ownership resolution this was
+ * accidentally inert (a key's id is never in `credentials.users`, so
+ * `deleteUser` was a guaranteed no-op), so the containment was a side effect of
+ * the bug rather than a decision.
+ */
 auth.delete('/account', authMiddleware(), async (c) => {
+  const requester = (c.get as (k: string) => AuthContext | undefined)('auth');
+
+  if (requester && requester.authMethod !== 'jwt') {
+    return c.json(
+      error(
+        ErrorCodes.UNAUTHORIZED,
+        'Account deletion requires an interactive session. API keys and OAuth tokens cannot delete an account.'
+      ),
+      403
+    );
+  }
+
+  const confirmBody = await c.req.json<{ password?: string }>().catch(() => ({ password: undefined }));
+  if (!confirmBody.password) {
+    throw new ValidationError('Current password is required to delete your account');
+  }
+  if (requester && !verifyUserPassword(requester.userId, confirmBody.password)) {
+    return c.json(error(ErrorCodes.UNAUTHORIZED, 'Current password is incorrect'), 401);
+  }
+
   const authCtx = (c.get as Function)('auth') as AuthContext;
 
   try {

@@ -375,6 +375,18 @@ export async function createUser(
 }
 
 /**
+ * Verify a user's current password by id, without issuing a session or
+ * running the MFA flow. For re-authenticating a destructive action the caller
+ * is already authenticated for (e.g. account deletion).
+ */
+export function verifyUserPassword(userId: string, password: string): boolean {
+  if (!credentials) return false;
+  const user = credentials.users.find((u) => u.id === userId);
+  if (!user) return false;
+  return verifyPassword(password, user.passwordHash);
+}
+
+/**
  * Change a user's password
  */
 export async function changePassword(userId: string, currentPassword: string, newPassword: string): Promise<boolean> {
@@ -421,6 +433,10 @@ export async function deleteUser(userId: string): Promise<boolean> {
     if (adminCount <= 1) throw new Error('Cannot delete the last admin account');
   }
   credentials.users.splice(index, 1);
+  // Revoke every key that acts as this user. verifyApiKey also rejects an
+  // orphaned key, so this is defence in depth — but it keeps the stored state
+  // honest rather than leaving dangling credentials in the file.
+  credentials.apiKeys = credentials.apiKeys.filter((k) => k.ownerUserId !== userId);
   await saveCredentials(config.credentialsPath, credentials);
   return true;
 }
@@ -436,6 +452,11 @@ export async function suspendUser(userId: string): Promise<boolean> {
   if (!user) return false;
   if (user.role === 'admin') throw new Error('Cannot suspend an admin account');
   user.enabled = false;
+  // The docstring above has always promised this; it was never implemented,
+  // and it did nothing while a key's userId was its own id. Now that keys act
+  // as their owner, a suspended user's keys would otherwise keep full access
+  // to every app they own.
+  credentials.apiKeys = credentials.apiKeys.filter((k) => k.ownerUserId !== userId);
   await saveCredentials(config.credentialsPath, credentials);
   return true;
 }
@@ -952,6 +973,18 @@ export async function verifyApiKey(key: string): Promise<ApiKey | null> {
   // Check expiration
   if (apiKey.expiresAt && new Date(apiKey.expiresAt) < new Date()) {
     return null;
+  }
+
+  // The key acts AS a human, so it must stop working when that human is
+  // deleted or suspended. Without this, deleting or suspending a user blocks
+  // their login while every key issued for them keeps authenticating as their
+  // userId — retaining canAccess to all their apps, with no account left to
+  // revoke it from. (Legacy keys have no owner and are unaffected.)
+  if (apiKey.ownerUserId) {
+    const owner = credentials.users.find((u) => u.id === apiKey.ownerUserId);
+    if (!owner || owner.enabled === false) {
+      return null;
+    }
   }
 
   // Update last used in memory immediately, but persist at most once per
