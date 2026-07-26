@@ -136,9 +136,15 @@ async function failureResult(appName: string, episode: DeployEpisode): Promise<C
 function needsConfigResult(appName: string): CallToolResult {
   const app = getStateManager().getApp(appName);
   const missing = app?.missingSecrets ?? [];
+  // The secret NAMES come from the app's own drop.yaml, which is
+  // attacker-authored on the deploy_from_git path. The parser now constrains
+  // them to env-var names, so this is defence in depth — but it is the one
+  // place app-authored text reaches the agent without having passed through a
+  // log, so fence it rather than relying on the parser alone.
   const text = missing.length
-    ? `Deploy of '${appName}' is parked pending required secret(s): ${missing.join(', ')}. ` +
-      `Set them (e.g. via the dashboard or PUT /api/v1/secrets/${appName}), then restart the app.`
+    ? `Deploy of '${appName}' is parked pending required secret(s). ` +
+      `Set them (e.g. via the dashboard or PUT /api/v1/secrets/${appName}), then restart the app.\n\n` +
+      wrapUntrusted(`REQUIRED SECRET NAMES: ${appName}`, missing.join(', '))
     : `Deploy of '${appName}' is parked pending required secrets. Set the app's required ` +
       `secret(s), then restart the app.`;
   return { content: [{ type: 'text', text }], isError: true };
