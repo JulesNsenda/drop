@@ -29,6 +29,33 @@ jobs:
       - name: Lint
         run: npm run lint
 
+      # DROP-074. The remote deploy script is passed to ssh as ONE
+      # single-quoted argument, so a single apostrophe anywhere inside it —
+      # including in a comment (chown'd, install.sh's, exec'ing) — closes the
+      # string early and silently corrupts every command after it. That took
+      # production down: both provisioning arms and the fallback
+      # `systemctl restart` were mangled into unrecognisable commands, so the
+      # deploy stopped the service and never restarted it. Nothing in bash,
+      # YAML, or shellcheck catches it, because each half parses fine on its
+      # own. Fail the build instead.
+      - name: Deploy script must contain no apostrophes (DROP-074)
+        run: |
+          node -e '
+            const fs = require("fs");
+            const yaml = require("yaml");
+            const wf = yaml.parse(fs.readFileSync(".github/workflows/deploy.yml", "utf8"));
+            const step = wf.jobs.deploy.steps.find(s => s.name === "Deploy on server");
+            if (!step) { console.error("Deploy on server step not found"); process.exit(1); }
+            const quotes = (step.run.match(/’|\x27/g) || []).length;
+            if (quotes !== 2) {
+              console.error("Deploy step has " + quotes + " single-quotes; expected exactly 2 (the ssh argument delimiters).");
+              console.error("An apostrophe inside the remote script closes the quoted argument early and corrupts the deploy.");
+              step.run.split("\n").forEach((l, i) => { if (l.includes("\x27")) console.error("  line " + (i + 1) + ": " + l.trim()); });
+              process.exit(1);
+            }
+            console.log("Deploy script quoting OK (2 delimiters, no stray apostrophes).");
+          '
+
       - name: Build server
         run: npm run build:server
 
@@ -141,8 +168,8 @@ jobs:
             #
             # Preferred target is the root-owned /usr/local/sbin/drop-provision
             # (DROP-071) — a copy of install.sh outside /opt/drop, which is
-            # chown'd to the drop user and therefore not something root should
-            # ever be sudo'd into running directly. The middle arm is legacy:
+            # chowned to the drop user and therefore not something root should
+            # ever be run as root via sudo directly. The middle arm is legacy:
             # a box bootstrapped before DROP-071 only has a sudoers rule for
             # /opt/drop/install.sh directly, and running --provision through
             # it (the new install.sh code, just untarred above) is what seeds
@@ -152,10 +179,10 @@ jobs:
             # way), fall back to a plain restart so the deploy still ships the
             # new code.
             # The interpreter is pinned to an absolute /usr/bin/bash and MUST
-            # match install.sh's write_sudoers rule byte for byte (interpreter
+            # match the write_sudoers rule in install.sh byte for byte (interpreter
             # + path + args) or sudo refuses and this silently falls through to
-            # the legacy arm. Pinning matters: exec'ing the script directly
-            # would honour its #!/usr/bin/env bash shebang, and sudo's
+            # the legacy arm. Pinning matters: executing the script directly
+            # would honour its #!/usr/bin/env bash shebang, and the sudo
             # secure_path starts with /usr/local/sbin:/usr/local/bin — the
             # latter root:staff 2775 on stock Debian, so `bash` could resolve
             # to something other than the real interpreter.
@@ -169,7 +196,7 @@ jobs:
             fi
             # Staleness check (DROP-071 follow-up): --provision alone only
             # re-applies whatever provisioning logic was last installed into
-            # /usr/local/sbin/drop-provision — see install.sh's
+            # /usr/local/sbin/drop-provision — see the
             # install_provision_script for why. Compare it against the
             # install.sh just untarred above so an infra change (systemd
             # unit, Caddy setup, sudoers, apex route) that shipped in THIS
@@ -179,13 +206,13 @@ jobs:
             # This is a DETECTION AID ONLY, deliberately unauthenticated — a
             # plain sha256sum comparison, no secret involved. It proves
             # nothing about trust: an actor who could forge one side of it
-            # could already do worse (see install.sh's trust-chain comment).
+            # could already do worse (see the trust-chain comment in install.sh).
             # Never read a match here as "the box is provisioned correctly"
             # or build any authorization decision on it.
             #
             # --bootstrap (not --upgrade) is the correct remediation on this
             # deployment model: /opt/drop is populated by this tarball
-            # extraction, not a git clone, so --upgrade's `git -C /opt/drop
+            # extraction, not a git clone, so the --upgrade path`s git -C /opt/drop
             # fetch` would fail outright (no .git here). --bootstrap re-runs
             # provisioning idempotently against whatever install.sh already
             # sits in /opt/drop, without needing a git checkout.
@@ -203,7 +230,7 @@ jobs:
             if [ -x /usr/local/sbin/drop-provision ]; then
               INSTALLED_HASH=$(sha256sum /usr/local/sbin/drop-provision | cut -d" " -f1)
               if [ "${{ env.SHIPPED_HASH }}" != "$INSTALLED_HASH" ]; then
-                echo "::warning::The install.sh shipped in this deploy differs from /usr/local/sbin/drop-provision — provisioning changes (systemd unit, Caddy, sudoers, apex route) have NOT been applied. To remediate, copy a TRUSTED install.sh to the box and run it as root: scp install.sh root@<host>:/tmp/ && ssh root@<host> 'bash /tmp/install.sh --bootstrap'. Do NOT run /opt/drop/install.sh as root — it is writable by the drop user, which is the exact primitive DROP-071 removes."
+                echo "::warning::The install.sh shipped in this deploy differs from /usr/local/sbin/drop-provision — provisioning changes (systemd unit, Caddy, sudoers, apex route) have NOT been applied. Remediate by copying a TRUSTED install.sh to the box and running it as root via ssh: bash /tmp/install.sh --bootstrap. Do NOT run /opt/drop/install.sh as root — it is writable by the drop user, which is the exact primitive DROP-071 removes."
               fi
             fi
             # Verify the service actually came back up before calling it a
