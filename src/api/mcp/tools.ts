@@ -43,6 +43,7 @@ import { getTempDirectory } from '../runtime-config';
 import { runUploadPreflight } from '../upload-preflight';
 import { wrapUntrusted } from './untrusted';
 import { computeAppUrl } from '../routes/apps';
+import { getPlatformVersion } from '../../utils/version';
 
 /** ≤48 files per deploy_files call. */
 export const DEPLOY_FILES_MAX_FILES = 48;
@@ -466,7 +467,7 @@ export async function handleRestartApp(
  * callers must not reuse an instance across requests.
  */
 export function buildMcpServer(auth: AuthContext | undefined): McpServer {
-  const server = new McpServer({ name: 'dropkit', version: '1.0.0' });
+  const server = new McpServer({ name: 'dropkit', version: getPlatformVersion() });
 
   server.registerTool(
     'deploy_files',
