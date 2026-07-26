@@ -3987,6 +3987,26 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     } catch {
       // Folder may already be gone
     }
+
+    // Runtime + build logs are keyed on the APP NAME, and teardown frees that
+    // name for anyone to re-register. GET /logs/:name and /logs/:name/build[s]
+    // authorize against the LIVE app and then read by name, so leaving these
+    // behind hands the next owner of the name the previous tenant's stdout,
+    // stderr and build output (npm/pip logs, build_env values, source
+    // fragments). Removed unconditionally — `keepData` guards the app's
+    // database and Redis, which are the user's data; these are DROP-generated
+    // diagnostics about an app that no longer exists.
+    const logDirs = [
+      path.join(this.config.dropRoot, 'data', 'logs', 'webapps', name),
+      path.join(this.config.dropRoot, 'data', 'logs', 'builds', name),
+    ];
+    for (const dir of logDirs) {
+      try {
+        await fs.rm(dir, { recursive: true, force: true });
+      } catch (error) {
+        this.logger.warn(`Failed to remove log directory ${dir}`, 'LOGS', error);
+      }
+    }
   }
 
   /**
