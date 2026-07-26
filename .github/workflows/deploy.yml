@@ -95,6 +95,15 @@ jobs:
             drop-dist.tar.gz \
             ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}:/tmp/drop-dist.tar.gz
 
+      # Hash the install.sh that CI actually built, straight out of the
+      # artifact, on the runner. This is the trusted half of the drift check
+      # below: computing it server-side would let the drop user (who owns
+      # /opt/drop/install.sh) rewrite both sides to match and silence the
+      # signal. Still only a detection aid — see the comment at its use site.
+      - name: Hash the shipped install.sh
+        run: |
+          echo "SHIPPED_HASH=$(tar -xzOf drop-dist.tar.gz install.sh | sha256sum | cut -d' ' -f1)" >> "$GITHUB_ENV"
+
       - name: Deploy on server
         run: |
           ssh -i /tmp/deploy_key \
@@ -142,7 +151,15 @@ jobs:
             # Until the server has been provisioned at least once (either
             # way), fall back to a plain restart so the deploy still ships the
             # new code.
-            if sudo -n /usr/local/sbin/drop-provision --provision; then
+            # The interpreter is pinned to an absolute /usr/bin/bash and MUST
+            # match install.sh's write_sudoers rule byte for byte (interpreter
+            # + path + args) or sudo refuses and this silently falls through to
+            # the legacy arm. Pinning matters: exec'ing the script directly
+            # would honour its #!/usr/bin/env bash shebang, and sudo's
+            # secure_path starts with /usr/local/sbin:/usr/local/bin — the
+            # latter root:staff 2775 on stock Debian, so `bash` could resolve
+            # to something other than the real interpreter.
+            if sudo -n /usr/bin/bash /usr/local/sbin/drop-provision --provision; then
               echo "System provisioning applied"
             elif sudo -n /usr/bin/bash /opt/drop/install.sh --provision; then
               echo "System provisioning applied (legacy sudoers rule — server will use /usr/local/sbin/drop-provision from the next deploy)"
@@ -176,11 +193,17 @@ jobs:
             # Deliberately non-fatal: a stale-but-working box is not an
             # outage, and failing the deploy here would block shipping
             # application code over an unrelated infra drift.
+            # SHIPPED_HASH is passed in from the runner (computed straight out
+            # of the CI-built tarball, see the env: block on this step) rather
+            # than recomputed here from /opt/drop/install.sh. On the server the
+            # drop user owns that file and could rewrite it between the untar
+            # above and this line, making both sides match and permanently
+            # silencing the one staleness signal. Runner-side, one half of the
+            # comparison is genuinely CI-authored.
             if [ -x /usr/local/sbin/drop-provision ]; then
-              SHIPPED_HASH=$(sha256sum /opt/drop/install.sh | cut -d" " -f1)
               INSTALLED_HASH=$(sha256sum /usr/local/sbin/drop-provision | cut -d" " -f1)
-              if [ "$SHIPPED_HASH" != "$INSTALLED_HASH" ]; then
-                echo "::warning::/opt/drop/install.sh differs from /usr/local/sbin/drop-provision — provisioning changes in this deploy (systemd unit, Caddy, sudoers, apex route) have NOT been applied. Run on the server: sudo bash /opt/drop/install.sh --bootstrap"
+              if [ "${{ env.SHIPPED_HASH }}" != "$INSTALLED_HASH" ]; then
+                echo "::warning::The install.sh shipped in this deploy differs from /usr/local/sbin/drop-provision — provisioning changes (systemd unit, Caddy, sudoers, apex route) have NOT been applied. To remediate, copy a TRUSTED install.sh to the box and run it as root: scp install.sh root@<host>:/tmp/ && ssh root@<host> 'bash /tmp/install.sh --bootstrap'. Do NOT run /opt/drop/install.sh as root — it is writable by the drop user, which is the exact primitive DROP-071 removes."
               fi
             fi
             # Verify the service actually came back up before calling it a
