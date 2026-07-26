@@ -626,7 +626,18 @@ provision_system() {
   # once $PROVISION_BIN exists, a drop-level actor invoking --provision has no
   # way to change what's in it (root-owned dir, drop can't write or unlink).
   # Ongoing refreshes only happen on --bootstrap/--upgrade/install, below.
-  [[ -x "$PROVISION_BIN" ]] || install_provision_script
+  #
+  # Harden the directory FIRST, unconditionally: /usr/local/sbin ships
+  # root:staff 2775 on stock Debian/Ubuntu, so hardening it only from inside
+  # the branch the check can skip leaves the check protecting itself. And test
+  # with provision_bin_is_trusted, not `-x`: `-x` follows symlinks and asserts
+  # nothing about ownership, so a symlink planted at $PROVISION_BIN pointing at
+  # the drop-writable $INSTALL_DIR/install.sh would satisfy it — the seed would
+  # be skipped, write_sudoers would emit a rule naming the symlink, and sudo
+  # (which stats through it) would hand root the drop-writable target. That is
+  # this whole ticket's vulnerability wearing a new filename.
+  harden_provision_dir
+  provision_bin_is_trusted || install_provision_script
   write_sudoers
   ensure_apex_route
 }
