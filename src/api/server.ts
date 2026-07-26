@@ -54,6 +54,23 @@ const MCP_PATH_RE = /^\/api\/v1\/mcp$/;
 /** deploy_files allows up to 1.5 MB of summed file content — comfortably over the global 1 MB body cap. */
 const MCP_MAX_BODY_BYTES = 2 * 1024 * 1024;
 
+/**
+ * True if `candidatePath` is `basePath` itself or a path inside it — used to
+ * contain the dashboard/site static-asset routes to their own directory.
+ * Exported as a standalone pure function (rather than a route-handler
+ * closure) so it's directly unit-testable: a crafted `..`/`%2e%2e` request
+ * path gets normalized by the URL layer before a handler ever sees it (Hono
+ * routes it to a different path entirely), so an HTTP-level test of this
+ * predicate would pass whether or not the check is correct. Rejects `..`
+ * escapes AND sibling directories that merely share a string prefix (e.g.
+ * `dist/site-backup` against a `dist/site` base — `startsWith(base)` with no
+ * trailing separator incorrectly accepts that).
+ */
+export function isPathContained(basePath: string, candidatePath: string): boolean {
+  const relative = path.relative(basePath, candidatePath);
+  return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
+}
+
 export interface ApiServerConfig {
   port: number;
   host?: string;
@@ -333,6 +350,33 @@ export class ApiServer {
     // Mount v1 under /api/v1
     this.app.route('/api/v1', v1);
 
+    // Content-type map shared by the dashboard and site static-asset routes
+    // below.
+    const MIME_TYPES: Record<string, string> = {
+      '.js': 'application/javascript',
+      '.mjs': 'application/javascript',
+      '.css': 'text/css',
+      '.svg': 'image/svg+xml',
+      '.png': 'image/png',
+      '.jpg': 'image/jpeg',
+      '.jpeg': 'image/jpeg',
+      '.ico': 'image/x-icon',
+      '.json': 'application/json',
+      '.map': 'application/json',
+      '.woff': 'font/woff',
+      '.woff2': 'font/woff2',
+      '.ttf': 'font/ttf',
+    };
+
+    // Moved public URLs (DROP-070): /docs and /reference used to live under
+    // /dashboard. Permanently redirect inbound links and search-index
+    // entries to their new home. Registered before the /dashboard/* SPA
+    // fallback below so these specific paths take priority over it, and
+    // unconditionally (independent of dashboardExists/siteExists below) —
+    // a stale link should redirect even on a box with no build present yet.
+    this.app.get('/dashboard/docs', c => c.redirect('/docs', 301));
+    this.app.get('/dashboard/reference', c => c.redirect('/reference', 301));
+
     // Dashboard static files
     // Prefer built dashboard (dist/dashboard) over source (src/dashboard)
     const distDashboardPath = path.join(__dirname, '..', '..', 'dist', 'dashboard');
@@ -347,22 +391,6 @@ export class ApiServer {
     console.log('[Dashboard] Index exists:', dashboardExists);
 
     if (dashboardExists) {
-      const MIME_TYPES: Record<string, string> = {
-        '.js': 'application/javascript',
-        '.mjs': 'application/javascript',
-        '.css': 'text/css',
-        '.svg': 'image/svg+xml',
-        '.png': 'image/png',
-        '.jpg': 'image/jpeg',
-        '.jpeg': 'image/jpeg',
-        '.ico': 'image/x-icon',
-        '.json': 'application/json',
-        '.map': 'application/json',
-        '.woff': 'font/woff',
-        '.woff2': 'font/woff2',
-        '.ttf': 'font/ttf',
-      };
-
       const readIndexHtml = (): Promise<string> => fsp.readFile(dashboardIndexPath, 'utf-8');
 
       // Serve static assets. Vite emits content-hashed filenames under
@@ -371,7 +399,7 @@ export class ApiServer {
         const assetPath = c.req.path.replace('/dashboard/', '');
         const filePath = path.join(dashboardPath, assetPath);
         // Containment: never serve outside the dashboard directory.
-        if (!path.resolve(filePath).startsWith(path.resolve(dashboardPath))) {
+        if (!isPathContained(dashboardPath, filePath)) {
           return c.notFound();
         }
         try {
@@ -416,21 +444,85 @@ export class ApiServer {
       });
     }
 
-    // Root - redirect to dashboard if available, otherwise show API info
-    this.app.get('/', c => {
-      const dashboardExists =
-        fs.existsSync(path.join(distDashboardPath, 'index.html')) ||
-        fs.existsSync(path.join(srcDashboardPath, 'index.html'));
-      if (dashboardExists) {
-        return c.redirect('/dashboard');
-      }
-      return c.json({
-        name: 'DROP API',
-        version: '1.0.0',
-        docs: '/api/v1',
-        auth: this.config.enableAuth ? 'enabled' : 'disabled',
+    // Public site static files (marketing landing + /docs + /reference,
+    // DROP-070) — a separate Vite build (vite.site.config.ts) from the admin
+    // dashboard, so a marketing visitor never downloads the admin bundle or
+    // calls the API. Built-only: unlike the dashboard block above, this does
+    // NOT fall back to raw source (src/dashboard/site/index.html isn't a
+    // servable bundle without Vite), so a box with no `dist/site` build
+    // falls through to the API-info JSON fallback below, not a broken shell.
+    const distSitePath = path.join(__dirname, '..', '..', 'dist', 'site');
+    const siteIndexPath = path.join(distSitePath, 'index.html');
+    const siteExists = fs.existsSync(siteIndexPath);
+
+    console.log('[Site] Path:', distSitePath);
+    console.log('[Site] Index exists:', siteExists);
+
+    if (siteExists) {
+      const readSiteIndexHtml = (): Promise<string> => fsp.readFile(siteIndexPath, 'utf-8');
+
+      // Serve static assets. Vite emits content-hashed filenames under
+      // /assets, so they can be cached immutably.
+      this.app.get('/assets/*', async c => {
+        const assetPath = c.req.path.replace(/^\//, '');
+        const filePath = path.join(distSitePath, assetPath);
+        // Containment: never serve outside the site directory.
+        if (!isPathContained(distSitePath, filePath)) {
+          return c.notFound();
+        }
+        try {
+          const content = await fsp.readFile(filePath);
+          const contentType = MIME_TYPES[path.extname(filePath)] || 'application/octet-stream';
+          return c.body(content, 200, {
+            'Content-Type': contentType,
+            'Cache-Control': 'public, max-age=31536000, immutable',
+          });
+        } catch {
+          return c.notFound();
+        }
       });
-    });
+
+      // Serve favicon
+      this.app.get('/drop.svg', async c => {
+        try {
+          const content = await fsp.readFile(path.join(distSitePath, 'drop.svg'));
+          return c.body(content, 200, {
+            'Content-Type': 'image/svg+xml',
+            'Cache-Control': 'public, max-age=86400',
+          });
+        } catch {
+          return c.notFound();
+        }
+      });
+
+      // Explicit routes only — deliberately NOT a bare `/*` catch-all.
+      // Mirroring the dashboard's `/dashboard/*` fallback to the root would
+      // swallow /.well-known/oauth-protected-resource and
+      // /.well-known/oauth-authorization-server (registered above),
+      // returning a 200 HTML shell and silently breaking the claude.ai MCP
+      // connector. index.html must never be cached, or clients get a stale
+      // shell pointing at old asset hashes after a deploy.
+      const serveSiteIndex = async (c: import('hono').Context) => {
+        const html = await readSiteIndexHtml();
+        c.header('Cache-Control', 'no-cache');
+        return c.html(html);
+      };
+
+      this.app.get('/', serveSiteIndex);
+      this.app.get('/docs', serveSiteIndex);
+      this.app.get('/reference', serveSiteIndex);
+    } else {
+      // No built site available — surface API info instead of a 404 at the
+      // root, for installs with no frontend built yet.
+      this.app.get('/', c => {
+        return c.json({
+          name: 'DROP API',
+          version: '1.0.0',
+          docs: '/api/v1',
+          auth: this.config.enableAuth ? 'enabled' : 'disabled',
+        });
+      });
+    }
   }
 
   private setupErrorHandling(): void {

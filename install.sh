@@ -390,6 +390,14 @@ build_drop() {
     sudo -u "$DROP_USER" bash -c "cd '$INSTALL_DIR/src/dashboard' && npm ci"
     info "Building dashboard..."
     sudo -u "$DROP_USER" bash -c "cd '$INSTALL_DIR/src/dashboard' && npm run build"
+    # Public marketing site (landing/docs/reference, DROP-070) — a separate
+    # Vite build from the dashboard above (vite.site.config.ts), same
+    # dependencies. Must run after the dashboard build: both write into
+    # dist/ with emptyOutDir, but into their own dist/dashboard / dist/site
+    # subdirectories, so ordering here only matters for matching CI
+    # (deploy.yml) so the two can't drift apart.
+    info "Building site..."
+    sudo -u "$DROP_USER" bash -c "cd '$INSTALL_DIR/src/dashboard' && npm run build:site"
   fi
   if $DO_LINK; then
     info "Linking CLI globally (drop command)..."
