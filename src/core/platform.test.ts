@@ -2914,6 +2914,39 @@ describe('teardownApp / removeGroup (M4: group lifecycle)', () => {
       expect((platform as any).stateManager.removeApp).toHaveBeenCalledWith('myapp');
     });
 
+    it('removes the app runtime and build log directories', async () => {
+      // These are keyed on the app NAME, which teardown frees for re-use. The
+      // /logs/:name routes authorize on the LIVE app and then read by name, so
+      // leaving them behind hands the next owner of the name the previous
+      // tenant's stdout/stderr and build output.
+      wireMocks();
+
+      await (platform as any).teardownApp('myapp');
+
+      expect(fsPromises.rm).toHaveBeenCalledWith(
+        path.join(tempDir, 'data', 'logs', 'webapps', 'myapp'),
+        { recursive: true, force: true }
+      );
+      expect(fsPromises.rm).toHaveBeenCalledWith(
+        path.join(tempDir, 'data', 'logs', 'builds', 'myapp'),
+        { recursive: true, force: true }
+      );
+    });
+
+    it('removes the log directories even when keepData is set', async () => {
+      // keepData protects the user's database and Redis. Logs are DROP-generated
+      // diagnostics about an app that no longer exists, and keeping them across
+      // a name hand-off is the leak above.
+      wireMocks();
+
+      await (platform as any).teardownApp('myapp', { keepData: true });
+
+      expect(fsPromises.rm).toHaveBeenCalledWith(
+        path.join(tempDir, 'data', 'logs', 'webapps', 'myapp'),
+        { recursive: true, force: true }
+      );
+    });
+
     it('isolates a single failing step so the rest of teardown still runs', async () => {
       wireMocks({
         router: { removeRoutesForApp: jest.fn().mockRejectedValue(new Error('caddy boom')) },
