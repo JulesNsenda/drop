@@ -563,6 +563,62 @@ describe('BuilderService Integration', () => {
     expect(result.errors.some(e => e.code === 'NO_STRATEGY')).toBe(true);
   });
 
+  it('opens AND closes a deploy episode when no strategy matches', async () => {
+    // Regression: this path used to return before build:started was published,
+    // so DeployTracker never opened an episode. The caller's later
+    // setAppStatus('errored') then hit the tracker's orphan guard and no-opped,
+    // leaving the episode permanently unclosed — every MCP deploy tool polled
+    // for its full ~120s budget and reported "still building" instead of the
+    // failure. Reachable via drop.yaml `type: rust` / `type: php`, neither of
+    // which has a strategy.
+    const { eventBus } = jest.requireMock('../event-bus');
+    (eventBus.publish as jest.Mock).mockClear();
+
+    const service = new BuilderService();
+    await service.build({
+      appName: 'no-strategy-app',
+      appPath: tempDir,
+      appType: 'unknown',
+      framework: null,
+      config: {},
+      env: {},
+    });
+
+    const events = (eventBus.publish as jest.Mock).mock.calls.map(
+      ([name, payload]: [string, { appId: string; buildId: string }]) => ({ name, payload })
+    );
+
+    const started = events.find(e => e.name === 'build:started');
+    const failed = events.find(e => e.name === 'build:failed');
+
+    expect(started).toBeDefined();
+    expect(failed).toBeDefined();
+    // Same buildId on both, or the tracker cannot correlate open with close.
+    expect(started!.payload.buildId).toBe(failed!.payload.buildId);
+    expect(started!.payload.appId).toBe('no-strategy-app');
+  });
+
+  it('emits no events when deferred by the concurrent-build cap', async () => {
+    // MAX_BUILDS is a deferral, not a failure: the platform re-queues the app
+    // and the retry opens its own episode. Publishing here would either strand
+    // a 'superseded' episode or report a queue wait as a failed deploy.
+    const { eventBus } = jest.requireMock('../event-bus');
+    const service = new BuilderService({ maxConcurrentBuilds: 0 });
+    (eventBus.publish as jest.Mock).mockClear();
+
+    const result = await service.build({
+      appName: 'deferred-app',
+      appPath: tempDir,
+      appType: 'nodejs',
+      framework: null,
+      config: {},
+      env: {},
+    });
+
+    expect(result.errors.some(e => e.code === 'MAX_BUILDS')).toBe(true);
+    expect(eventBus.publish).not.toHaveBeenCalled();
+  });
+
   it('should build static site successfully', async () => {
     // Create a simple static site
     const appDir = path.join(tempDir, 'static-site');
