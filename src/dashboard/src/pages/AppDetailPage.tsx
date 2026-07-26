@@ -192,7 +192,7 @@ function AppDetailPage() {
     return (
       <div className="p-6">
         <Link
-          to="/"
+          to="/apps"
           className="mb-6 inline-flex items-center gap-2 text-sm transition-opacity hover:opacity-70"
           style={{ color: 'var(--text-2)' }}
         >
@@ -217,7 +217,7 @@ function AppDetailPage() {
     <div className="p-6">
       {/* Back link */}
       <Link
-        to="/"
+        to="/apps"
         className="mb-6 inline-flex items-center gap-2 text-sm transition-opacity hover:opacity-70"
         style={{ color: 'var(--text-2)' }}
       >

@@ -1,5 +1,4 @@
 import { useCallback, useEffect, useState } from 'react';
-import { useNavigate } from 'react-router-dom';
 
 // Self-hosted fonts (bundled as same-origin assets — required by the app CSP,
 // which blocks external Google Fonts). Same setup as LandingPage.tsx.
@@ -17,6 +16,10 @@ import { useTheme } from '../hooks/useTheme';
 import { SiteNav } from '../components/landing/SiteNav';
 import { SiteFooter } from '../components/landing/SiteFooter';
 import { DOC_ITEM_IDS, DocsBody, DocsRail, DocsToc } from '../components/landing/DocsContent';
+
+// The marketing bundle makes no API calls (DROP-070) — see LandingPage.tsx's
+// AUTH_ENABLED constant for why this is fixed rather than probed.
+const AUTH_ENABLED = true;
 
 /**
  * Scroll-spy: tracks which doc section is currently in view so the left TOC
@@ -55,28 +58,13 @@ function useActiveSection(ids: string[]): string {
 }
 
 function DocsPage(): JSX.Element {
-  const navigate = useNavigate();
   // Calling useTheme() here ensures the `dark` class is applied on this route,
   // which is rendered outside the dashboard Layout.
   const { theme, setTheme } = useTheme();
-  const [authEnabled, setAuthEnabled] = useState<boolean | null>(null);
   const [isDark, setIsDark] = useState<boolean>(() =>
     typeof document !== 'undefined' && document.documentElement.classList.contains('dark')
   );
   const activeId = useActiveSection(DOC_ITEM_IDS);
-
-  // Auth-enabled probe — decides whether nav/footer CTAs read "Sign in" or
-  // "Enter". Docs content itself doesn't depend on it, so we don't block
-  // rendering while it's in flight (unlike LandingPage's hero CTA).
-  useEffect(() => {
-    fetch('/api/v1/auth/status')
-      .then(r => r.json())
-      .then(json => {
-        if (json.success) setAuthEnabled(json.data.enabled);
-        else setAuthEnabled(false);
-      })
-      .catch(() => setAuthEnabled(false));
-  }, []);
 
   // Track the resolved theme (useTheme only exposes the raw preference) by
   // observing the `dark` class that useTheme maintains on <html>.
@@ -89,7 +77,11 @@ function DocsPage(): JSX.Element {
     return () => obs.disconnect();
   }, [theme]);
 
-  const handleEnter = () => navigate(authEnabled ? '/login' : '/apps');
+  // The dashboard/login page lives in a separate bundle (DROP-070) — this has
+  // to be a full page navigation, not react-router's navigate().
+  const handleEnter = () => {
+    window.location.href = '/dashboard/login';
+  };
   const onToggleTheme = () => setTheme(isDark ? 'light' : 'dark');
 
   const scrollToSection = useCallback((id: string) => {
@@ -120,7 +112,7 @@ function DocsPage(): JSX.Element {
         isDark={isDark}
         onToggleTheme={onToggleTheme}
         onEnter={handleEnter}
-        authEnabled={authEnabled ?? false}
+        authEnabled={AUTH_ENABLED}
         current="docs"
       />
 

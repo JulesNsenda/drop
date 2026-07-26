@@ -15,9 +15,10 @@ The platform itself is a long-running Node.js service (`drop serve`) that runs a
 ```bash
 # Development
 npm run dev              # Start platform with ts-node (src/index.ts)
-npm run build            # Compile TS (tsc) AND build the dashboard (Vite)
-npm run build:server     # Compile TS only — skips the dashboard build
-npm run build:dashboard  # Build only the React dashboard (cd src/dashboard && vite build)
+npm run build            # Compile TS (tsc) AND build the dashboard + public site (Vite, both configs)
+npm run build:server     # Compile TS only — skips the dashboard/site builds
+npm run build:dashboard  # Build only the React admin dashboard (cd src/dashboard && vite build)
+npm run build:site       # Build only the public marketing/docs/reference site (cd src/dashboard && vite build --config vite.site.config.ts)
 npm run build:watch      # tsc --watch (server only)
 npm start                # Run compiled dist/index.js
 
@@ -43,7 +44,7 @@ drop deploy <path>       # Deploy from a path (--name, --port)
 drop start|stop|restart|remove <app>
 ```
 
-**Building gotcha**: `npm run build` invokes the dashboard build, which requires its own deps. Run `cd src/dashboard && npm install` once first, or use `npm run build:server` when you only changed backend code.
+**Building gotcha**: `npm run build` invokes both frontend builds — the admin dashboard AND the public site (DROP-070: one `src/dashboard` npm package, two Vite configs/entry points — `vite.config.ts` for `/dashboard`, `vite.site.config.ts` for `/`, `/docs`, `/reference` — not two packages). Both require the same `src/dashboard` deps. Run `cd src/dashboard && npm install` once first, or use `npm run build:server` when you only changed backend code. If you only changed frontend code, `npm run build:dashboard` / `npm run build:site` build just one side; a change under `src/dashboard/src/components/landing/`, `src/dashboard/src/pages/{Landing,Docs,Reference}Page.tsx`, `src/dashboard/src/{SiteApp,site-main}.tsx`, or `src/dashboard/src/styles/{landing,tokens,site-reset}.css` needs `build:site`, not `build:dashboard`.
 
 **Testing note**: `jose` (used for JWT) is mocked in tests via `src/__mocks__/jose.ts` (wired through `jest.config.js` `moduleNameMapper`). Tests run on `ts-jest` against `src/**/*.test.ts`.
 
@@ -88,15 +89,17 @@ Most managers follow the singleton pattern: `get*(config?)` returns/creates the 
 
 ### REST API (`src/api/`)
 
-Hono-based, served by `ApiServer` (`src/api/server.ts`) on `apiPort` (default 3000). Routes are mounted under **`/api/v1`** (`health`, `auth`, `apps`, `logs`, `certs`, `secrets`, `webhooks`, `git`, `admin`).
+Hono-based, served by `ApiServer` (`src/api/server.ts`) on `apiPort` (default 3000). Routes are mounted under **`/api/v1`** (`health`, `auth`, `apps`, `logs`, `certs`, `secrets`, `webhooks`, `git`, `admin`). `ApiServer` also serves both frontend bundles directly at the root level: `/`, `/docs`, `/reference` (the public site, DROP-070) and `/dashboard` (the admin SPA), each behind an explicit-routes-only registration — no bare `/*` catch-all, since that would swallow the `/.well-known/oauth-*` discovery routes below. `/dashboard/docs` and `/dashboard/reference` 301-redirect to their new `/docs` / `/reference` homes.
 
 Middleware stack (applied in `setupMiddleware`): security headers → CORS → body-size limit → rate limiting (`/api/*`, stricter on `/auth/login`) → request logger → audit logging → error handler. Auth middleware is applied per-route-group only when auth is enabled, with role tiers **`readonly` / `user` / `admin`** (`authMiddleware(role)`).
 
 **Auth** (`src/api/middleware/auth.ts`): JWT (via `jose`) + API keys. Users and API keys are persisted to a **file** (`api-credentials.json`), not the internal DB. Auth is **on by default** (`enableApiAuth`); disable with `DROP_DISABLE_AUTH=true` / `DROP_ENABLE_API_AUTH=false`. Adding endpoints means: add a route file under `src/api/routes/`, mount it in `server.ts`, and (if protected) add an `authMiddleware(role)` line in `setupRoutes`.
 
-### Web Dashboard (`src/dashboard/`)
+### Web Dashboard + public site (`src/dashboard/`)
 
-A **separate npm package** (React 18 + Vite + Tailwind + react-router-dom). It has its own `package.json`, `node_modules`, and `tsconfig.json`. It is built to `dist/dashboard/` and served by `ApiServer` at `/dashboard` (SPA fallback). `ApiServer` prefers the built `dist/dashboard` over `src/dashboard`. Treat the dashboard as its own frontend project — run `npm` commands from inside `src/dashboard/`.
+A **separate npm package** (React 18 + Vite + Tailwind + react-router-dom) — but **two Vite surfaces** sharing one `src/` tree (DROP-070): `vite.config.ts` builds the admin dashboard (`base: /dashboard/`, entry `index.html` → `dist/dashboard/`), and `vite.site.config.ts` builds the public marketing/docs/reference site (`base: /`, entry `site/index.html` → `dist/site/`). Same `package.json`/`node_modules`/`tsconfig.json` for both — not a second package. `ApiServer` prefers the built `dist/dashboard` / `dist/site` over the raw `src/dashboard` (dashboard only; the site build has no source fallback — see `server.ts`). Treat `src/dashboard` as its own frontend project — run `npm` commands from inside it (`npm run build` / `build:site`, `npm run dev` / `dev:site`).
+
+**Invariant the split depends on:** the site bundle (`src/dashboard/src/{SiteApp,site-main}.tsx`, `pages/{Landing,Docs,Reference,SiteNotFound}Page.tsx`, `components/landing/*`) must never import `hooks/useAuth`, `api/client`, `components/Layout`, `Toast`, or `ConfirmDialog` — that's the admin-only code the split exists to keep out of a marketing visitor's download (CI enforces this with a `grep` over the built `dist/site` JS, `deploy.yml`). Cross-bundle navigation (e.g. a "Sign in" link, or the dashboard's logout redirect) is a plain `window.location.href` / `<a href>`, never react-router's `Link`/`navigate()` — each bundle has its own `BrowserRouter` with no shared history.
 
 ### Persistence Model (two file-based layers — important)
 

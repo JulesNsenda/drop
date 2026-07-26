@@ -36,10 +36,14 @@ function Layout() {
   const location = useLocation();
 
   // PRD-026: explicit redirect to the landing page + confirmation on logout.
+  // The marketing landing page now lives in a separate bundle at "/"
+  // (DROP-070) — a react-router navigate('/') would just re-render the
+  // dashboard SPA's own index route (which redirects a logged-out visitor to
+  // /dashboard/login, see App.tsx), not the real site. Full page load instead.
   const handleLogout = () => {
     logout();
     toast('success', 'Signed out');
-    navigate('/', { replace: true });
+    window.location.href = '/';
   };
 
   const ThemeIcon = theme === 'dark' ? Moon : theme === 'light' ? Sun : Monitor;
