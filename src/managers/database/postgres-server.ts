@@ -36,6 +36,20 @@ const DEFAULT_PORT = 5433; // Use non-standard port to avoid conflicts
 const STARTUP_TIMEOUT_MS = 30000;
 const HEALTH_CHECK_INTERVAL_MS = 1000;
 
+/**
+ * Mode for the dedicated socket directory (DROP-072). Owner gets full rwx
+ * (needed to create/remove the socket file); group and "other" both get
+ * execute-only (traverse) so a bind-mounted container — whose uid is
+ * typically neither the owner nor the owner's group — can still reach
+ * `.s.PGSQL.<port>` by path. No read bit anywhere: the directory holds
+ * nothing but the socket file, so there is nothing to list, and no write bit
+ * outside the owner: a container can connect but can't create/replace files
+ * in it. This is what the data directory (0700, container uid == owner) could
+ * never give a DIFFERENT uid without opening it up to every other app's raw
+ * database files too.
+ */
+const SOCKET_DIR_MODE = 0o711;
+
 export class PostgresServer {
   private readonly config: PostgresServerConfig;
   private readonly binaries: PostgresBinaries;
@@ -61,16 +75,23 @@ export class PostgresServer {
   }
 
   /**
-   * Absolute path to the directory where the Postgres unix-domain socket file
-   * lives, or null on Windows (sockets not used there).
+   * Absolute path to the dedicated directory where the Postgres unix-domain
+   * socket file lives, or null on Windows (sockets not used there).
    *
-   * DROP starts Postgres with `-k <dataDir>` so the socket file is
-   * `<dataDir>/.s.PGSQL.<port>`.  Containers bind-mount this directory to
+   * DROP starts Postgres with `-k <socketDir>` so the socket file is
+   * `<socketDir>/.s.PGSQL.<port>`.  Containers bind-mount this directory to
    * reach Postgres without TCP.
+   *
+   * DROP-072: this used to return the Postgres DATA directory, which
+   * bind-mounted every app's raw database files (`base/`, `global/pg_authid`
+   * scram verifiers, `pg_hba.conf`, ...) into every DB-using container —
+   * `ReadOnly: true` on the mount prevents writes, not reads. The socket now
+   * lives in its own directory (see SOCKET_DIR_MODE) that never contains
+   * anything else.
    */
   getSocketDir(): string | null {
     if (process.platform === 'win32' || !this.paths) return null;
-    return this.paths.dataDir;
+    return this.paths.socketDir;
   }
 
   /** Pool config for a superuser connection to the given database. */
@@ -131,6 +152,22 @@ export class PostgresServer {
 
     // Ensure log directory exists
     await fs.mkdir(path.dirname(this.paths.logFile), { recursive: true });
+
+    // Ensure the dedicated socket directory exists with the hardened mode
+    // (DROP-072). Unconditional create+chmod — not gated by isInitialized() —
+    // so an existing install upgrading to this fix gets both the directory
+    // and the correct permissions on its very next start, not only on a
+    // fresh install.
+    await this.ensureSocketDir();
+  }
+
+  /** Create (if missing) and harden the dedicated Postgres socket directory. No-op on Windows. */
+  private async ensureSocketDir(): Promise<void> {
+    if (process.platform === 'win32' || !this.paths) return;
+    await fs.mkdir(this.paths.socketDir, { recursive: true, mode: SOCKET_DIR_MODE });
+    // mkdir's `mode` only applies at creation time, so re-assert it on every
+    // start (same rationale as ensureDirectories()'s drop-svc hardening).
+    await fs.chmod(this.paths.socketDir, SOCKET_DIR_MODE);
   }
 
   /**
@@ -339,10 +376,13 @@ export class PostgresServer {
     const dataDir = this.paths.dataDir;
 
     // Use pg_ctl to start postgres in the background (prevents console windows on Windows)
-    // Use the data dir as the socket directory so we don't need write access to
-    // /var/run/postgresql (which is owned by the system postgres user on Ubuntu).
+    // Use a dedicated socket directory (DROP-072), not the data dir or the
+    // system default /var/run/postgresql (which is owned by the system
+    // postgres user on Ubuntu and DROP wouldn't have write access to). A
+    // directory containing only the socket can be bind-mounted into
+    // containers without exposing the data dir's raw database files.
     const pgCtl = this.paths.pgCtl;
-    const socketOpts = process.platform !== 'win32' ? ` -k ${dataDir}` : '';
+    const socketOpts = process.platform !== 'win32' ? ` -k ${this.paths.socketDir}` : '';
     this.serverProcess = spawn(pgCtl, [
       'start',
       '-D', dataDir,

@@ -63,6 +63,16 @@ export interface BinaryPaths {
   createuser: string;
   /** PostgreSQL data directory */
   dataDir: string;
+  /**
+   * Dedicated directory Postgres binds its unix-domain socket in (`-k`).
+   * Deliberately NOT the data directory (DROP-072): the data dir holds every
+   * app's raw database files (`base/`, `global/pg_authid`, `pg_hba.conf`,
+   * ...), and under Docker isolation the socket dir is bind-mounted into
+   * every DB-using container — mounting the data dir handed every container
+   * a read path to every OTHER app's database files. This directory holds
+   * only the socket file.
+   */
+  socketDir: string;
   /** PostgreSQL log file */
   logFile: string;
 }
@@ -85,6 +95,7 @@ export class PostgresBinaries {
     const pgsqlDir = path.join(this.config.dropRoot, 'apps', 'drop-svc', 'pgsql');
     const binDir = path.join(pgsqlDir, 'bin');
     const dataDir = path.join(this.config.dropRoot, 'data', 'db', 'pgdata');
+    const socketDir = path.join(this.config.dropRoot, 'data', 'pgsock');
     const logDir = path.join(this.config.dropRoot, 'data', 'logs', 'postgres');
     const ext = this.isWindows ? '.exe' : '';
 
@@ -97,6 +108,7 @@ export class PostgresBinaries {
       createdb: path.join(binDir, `createdb${ext}`),
       createuser: path.join(binDir, `createuser${ext}`),
       dataDir,
+      socketDir,
       logFile: path.join(logDir, 'postgresql.log'),
     };
   }

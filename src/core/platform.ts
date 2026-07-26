@@ -1770,6 +1770,12 @@ backup:
           apiPort: this.config.apiPort,
           maxMemoryMbPerApp: this.config.maxMemoryMbPerApp,
           maxCpusPerApp: this.config.maxCpusPerApp,
+          // DROP-072: same gating as the actual mount/env-var call sites
+          // (buildStartSpec) — undefined outside docker isolation.
+          pgSocketDir:
+            this.config.isolation === 'docker'
+              ? (this.postgresServer?.getSocketDir() ?? undefined)
+              : undefined,
         }),
       });
     } catch (error) {
@@ -2069,6 +2075,12 @@ backup:
           apiPort: this.config.apiPort,
           maxMemoryMbPerApp: this.config.maxMemoryMbPerApp,
           maxCpusPerApp: this.config.maxCpusPerApp,
+          // DROP-072: same gating as the actual mount/env-var call sites
+          // (buildStartSpec) — undefined outside docker isolation.
+          pgSocketDir:
+            this.config.isolation === 'docker'
+              ? (this.postgresServer?.getSocketDir() ?? undefined)
+              : undefined,
         });
       // Port drift (M1 review item H): the skip path trusts config.port to
       // reconcile routing, but the runtime's own report is right there —

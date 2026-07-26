@@ -132,6 +132,26 @@ export interface ContainerPolicyInputs {
   maxMemoryMbPerApp: number;
   /** DROP_MAX_CPUS_PER_APP — this.config.maxCpusPerApp. */
   maxCpusPerApp: number;
+  /**
+   * PostgresServer.getSocketDir() at docker isolation — the directory
+   * bind-mounted into every DB-using container so it can reach Postgres over
+   * a unix socket instead of TCP. `undefined` outside docker isolation (PM2
+   * apps always connect over loopback TCP, never a socket dir), matching how
+   * the caller already gates this value at the actual mount/env-var site.
+   * `undefined` is dropped entirely by JSON.stringify, so this field never
+   * causes a fingerprint mismatch for a PM2 app on its own.
+   *
+   * DROP-072: this directory changed from the Postgres DATA directory (which
+   * bind-mounted every OTHER app's raw database files — base/, pg_hba.conf,
+   * global/pg_authid — into every container) to a dedicated directory holding
+   * only the socket file. Folding the value into the fingerprint is what
+   * forces every already-running docker-mode app to redeploy exactly once on
+   * the first boot after this ships — without it, boot reconciliation would
+   * see status=running/port assigned/scopes empty and SKIP every one of
+   * them, leaving their containers bind-mounting the old (now-socket-less)
+   * path and holding a DATABASE_URL that can never reconnect.
+   */
+  pgSocketDir: string | undefined;
 }
 
 /**
@@ -153,7 +173,9 @@ export interface ContainerPolicyInputs {
  * PM2 app's env/max_memory_restart too (see pm2-runtime.ts), so hashing the
  * docker-only constants alongside them under PM2 is harmless (they're
  * static and never trigger a mismatch there) while still catching the parts
- * that DO apply everywhere.
+ * that DO apply everywhere. Also covers `pgSocketDir` (DROP-072) — see that
+ * field's doc comment on ContainerPolicyInputs for why it's included and
+ * what forcing its one-time mismatch protects against.
  */
 export function containerPolicyFingerprint(inputs: ContainerPolicyInputs): string {
   const payload = {
@@ -167,6 +189,7 @@ export function containerPolicyFingerprint(inputs: ContainerPolicyInputs): strin
     apiPort: inputs.apiPort,
     maxMemoryMbPerApp: inputs.maxMemoryMbPerApp,
     maxCpusPerApp: inputs.maxCpusPerApp,
+    pgSocketDir: inputs.pgSocketDir,
   };
   return crypto.createHash('sha256').update(JSON.stringify(payload)).digest('hex');
 }

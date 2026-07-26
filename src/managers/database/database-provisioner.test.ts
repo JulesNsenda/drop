@@ -204,6 +204,30 @@ describe('DatabaseProvisioner.getEnvVars', () => {
   it('returns null with pgSocketDir opt when app is unknown', () => {
     expect(provisioner.getEnvVars('ghost', { pgSocketDir: '/var/drop/data/db/pgdata' })).toBeNull();
   });
+
+  it('returns a WHATWG-parseable socket DATABASE_URL for the dedicated socket dir (DROP-072)', () => {
+    // DROP-072: PostgresServer.getSocketDir() no longer returns the Postgres
+    // DATA directory (which bind-mounted every app's raw database files into
+    // every container) — it returns a dedicated directory holding only the
+    // socket file. getEnvVars() itself is directory-value-agnostic (it just
+    // formats whatever pgSocketDir string it's handed), so this exercises the
+    // SAME WHATWG-parseable construction the DROP-066 tests above cover,
+    // pinned to the actual new directory value so a future change back to a
+    // data-dir-shaped path would not silently slip past this regression.
+    injectCredentials(provisioner, 'myapp');
+    const vars = provisioner.getEnvVars('myapp', { pgSocketDir: '/var/drop/data/pgsock' });
+
+    expect(vars).not.toBeNull();
+    expect(vars!['PGHOST']).toBe('/var/drop/data/pgsock');
+    expect(vars!['DB_HOST']).toBe('/var/drop/data/pgsock');
+
+    const url = vars!['DATABASE_URL'];
+    expect(() => new URL(url)).not.toThrow();
+    expect(url).toContain('@');
+    expect(url).not.toContain('?host=');
+    expect(decodeURIComponent(new URL(url).hostname)).toBe('/var/drop/data/pgsock');
+    expect(new URL(url).port).toBe('5433');
+  });
 });
 
 describe('DatabaseProvisioner.provisionAppDatabase — REVOKE FROM PUBLIC', () => {
