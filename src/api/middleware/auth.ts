@@ -69,6 +69,17 @@ export interface ApiKey {
   expiresAt?: string;
   /** Capability scopes for this key (e.g. 'users:create'). Orthogonal to role. */
   scopes?: string[];
+  /**
+   * The human this key acts on behalf of. `AuthContext.userId` resolves to
+   * this when set, so apps created through the key are owned by a real user
+   * and count against THAT user's quota.
+   *
+   * Absent on keys minted before this field existed: those keep the legacy
+   * behaviour (`userId` = the key's own id) so the apps they already own stay
+   * reachable. Re-parenting legacy keys is a data migration, deliberately not
+   * done here — see the DROP-075 commit message.
+   */
+  ownerUserId?: string;
 }
 
 // JWT payload
@@ -892,7 +903,8 @@ export async function createApiKey(
   name: string,
   role: 'admin' | 'user' | 'readonly' | 'none' = 'user',
   expiresInDays?: number,
-  scopes?: string[]
+  scopes?: string[],
+  ownerUserId?: string
 ): Promise<{ key: string; apiKey: ApiKey }> {
   if (!credentials || !config) {
     throw new Error('Auth not initialized');
@@ -913,6 +925,7 @@ export async function createApiKey(
       ? new Date(Date.now() + expiresInDays * 24 * 60 * 60 * 1000).toISOString()
       : undefined,
     ...(scopes !== undefined ? { scopes } : {}),
+    ...(ownerUserId !== undefined ? { ownerUserId } : {}),
   };
 
   credentials.apiKeys.push(apiKey);
@@ -952,6 +965,30 @@ export async function verifyApiKey(key: string): Promise<ApiKey | null> {
   }
 
   return apiKey;
+}
+
+/**
+ * Build the AuthContext for an authenticated API key.
+ *
+ * `userId` resolves to the key's `ownerUserId` when set, so ownership checks
+ * (`canAccess`) and per-user quotas attribute the key's actions to the human
+ * it acts for. Without this, `userId` was the KEY's own id, which meant every
+ * key was a fresh principal owning zero apps — so each one carried a full
+ * `DROP_MAX_APPS_PER_USER` allowance, `getUserById` returned null (silently
+ * discarding any per-user `maxApps` override), and apps the key created were
+ * owned by an identity no human could log in as.
+ *
+ * Legacy keys (no `ownerUserId`) keep the old behaviour so the apps they
+ * already own remain reachable.
+ */
+function apiKeyAuthContext(key: ApiKey): AuthContext {
+  return {
+    userId: key.ownerUserId ?? key.id,
+    username: key.name,
+    role: key.role,
+    authMethod: 'apikey',
+    scopes: key.scopes,
+  };
 }
 
 /**
@@ -1110,13 +1147,7 @@ export function authMiddleware(requiredRole?: 'admin' | 'user' | 'readonly') {
         // semantics; only a non-JWT Bearer value is looked up as an API key.
         const key = await verifyApiKey(token);
         if (key) {
-          authContext = {
-            userId: key.id,
-            username: key.name,
-            role: key.role,
-            authMethod: 'apikey',
-            scopes: key.scopes,
-          };
+          authContext = apiKeyAuthContext(key);
         }
       }
     }
@@ -1127,13 +1158,7 @@ export function authMiddleware(requiredRole?: 'admin' | 'user' | 'readonly') {
       if (apiKey) {
         const key = await verifyApiKey(apiKey);
         if (key) {
-          authContext = {
-            userId: key.id,
-            username: key.name,
-            role: key.role,
-            authMethod: 'apikey',
-            scopes: key.scopes,
-          };
+          authContext = apiKeyAuthContext(key);
         }
       }
     }
@@ -1325,13 +1350,7 @@ export function optionalAuthMiddleware() {
         // authMiddleware). A valid-but-challenge token is intentionally skipped.
         const key = await verifyApiKey(token);
         if (key) {
-          c.set('auth', {
-            userId: key.id,
-            username: key.name,
-            role: key.role,
-            authMethod: 'apikey',
-            scopes: key.scopes,
-          });
+          c.set('auth', apiKeyAuthContext(key));
         }
       }
     }
@@ -1340,13 +1359,7 @@ export function optionalAuthMiddleware() {
     if (apiKey && !c.get('auth')) {
       const key = await verifyApiKey(apiKey);
       if (key) {
-        c.set('auth', {
-          userId: key.id,
-          username: key.name,
-          role: key.role,
-          authMethod: 'apikey',
-          scopes: key.scopes,
-        });
+        c.set('auth', apiKeyAuthContext(key));
       }
     }
 
