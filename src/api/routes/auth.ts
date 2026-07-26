@@ -190,6 +190,18 @@ auth.post('/api-keys', authMiddleware('admin'), async (c) => {
     ownerUserId
   );
 
+  // Record who minted the key and for whom. `ownerUserId` accepts any existing
+  // user (including another admin) and `AuthContext.username` is the free-text
+  // key name, so without this an admin could mint {ownerUserId: <other-admin>,
+  // name: "<their-username>"} and have every later action attributed to them —
+  // with the minting itself leaving no trace at all.
+  await tryLogActivity({
+    action: 'apikey-create',
+    userId: callerAuth?.userId,
+    username: callerAuth?.username,
+    detail: `key=${apiKey.id} name=${apiKey.name} role=${apiKey.role} owner=${apiKey.ownerUserId ?? 'none'}`,
+  });
+
   return c.json(
     success({
       key, // Only returned once!
