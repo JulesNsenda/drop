@@ -7,6 +7,7 @@ import * as path from 'path';
 import * as os from 'os';
 import { ApiServer, createApiServer } from './server';
 import { isPathWithin } from '../utils/paths';
+import { getPlatformVersion } from '../utils/version';
 
 interface ApiResponse<T = unknown> {
   success: boolean;
@@ -118,7 +119,13 @@ describe('ApiServer', () => {
       if (contentType.includes('application/json')) {
         const data = (await res.json()) as RootResponse;
         expect(data.name).toBe('DROP API');
-        expect(data.version).toBe('1.0.0');
+        // Assert against package.json, not a literal. This assertion used to
+        // hardcode '1.0.0' and matched only because server.ts hardcoded the
+        // same stale string — it would have gone on passing while the endpoint
+        // reported a version the platform hadn't been for two majors. Note it
+        // is reached only on the JSON branch above, i.e. when dist/site is NOT
+        // built: that is CI, but not a dev box that has run `npm run build`.
+        expect(data.version).toBe(getPlatformVersion());
       } else {
         expect(contentType).toContain('text/html');
       }
