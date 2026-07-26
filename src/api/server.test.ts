@@ -5,7 +5,8 @@
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import * as os from 'os';
-import { ApiServer, createApiServer, isPathContained } from './server';
+import { ApiServer, createApiServer } from './server';
+import { isPathWithin } from '../utils/paths';
 
 interface ApiResponse<T = unknown> {
   success: boolean;
@@ -147,70 +148,56 @@ describe('ApiServer', () => {
   });
 
   describe('marketing site split (DROP-070)', () => {
-    describe('isPathContained', () => {
-      const base = path.join('dist', 'site');
+    describe('isPathWithin (asset containment, src/utils/paths.ts)', () => {
+      // Guaranteed not to exist on disk, so isPathWithin's realpath step
+      // always falls back to a lexical resolve on both sides — keeps this
+      // deterministic regardless of whatever a local build happens to have
+      // left under the repo's real dist/.
+      const base = path.join(os.tmpdir(), 'drop-test-nonexistent-dist-site');
 
-      it('accepts the base directory itself and paths inside it', () => {
-        expect(isPathContained(base, base)).toBe(true);
-        expect(isPathContained(base, path.join(base, 'assets', 'index.js'))).toBe(true);
+      it('accepts the base directory itself and paths inside it', async () => {
+        expect(await isPathWithin(base, base)).toBe(true);
+        expect(await isPathWithin(base, path.join(base, 'assets', 'index.js'))).toBe(true);
       });
 
-      it('rejects a sibling directory that merely shares a string prefix', () => {
-        // The bug this replaces: `startsWith(base)` with no trailing
+      it('rejects a sibling directory that merely shares a string prefix', async () => {
+        // The bug this guards against: `startsWith(base)` with no trailing
         // separator accepts `dist/site-backup` because the raw STRING
         // "dist/site-backup" starts with "dist/site". A real HTTP request
         // can't exercise this directly — the URL layer normalizes `..`/
         // encoded-dot traversal before a route handler ever sees it — so
         // this is tested at the predicate level instead.
-        const sibling = path.join('dist', 'site-backup', 'secret.txt');
-        expect(isPathContained(base, sibling)).toBe(false);
+        const sibling = `${base}-backup`;
+        expect(await isPathWithin(base, path.join(sibling, 'secret.txt'))).toBe(false);
       });
 
-      it('rejects a `..` escape out of the base directory', () => {
+      it('rejects a `..` escape out of the base directory', async () => {
         const escaped = path.join(base, '..', '..', 'etc', 'passwd');
-        expect(isPathContained(base, escaped)).toBe(false);
+        expect(await isPathWithin(base, escaped)).toBe(false);
       });
     });
 
-    describe('serving / (real dist/site fixture)', () => {
-      // No dist/site build exists in this checkout (dist/ is gitignored and
-      // the frontend isn't built before `npm test` runs, matching CI's
-      // build-then-test-then-build-frontend order in deploy.yml). ApiServer's
-      // site path is a fixed, non-configurable location, so exercising the
-      // "site exists" branch means writing a real fixture there — spying on
-      // node:fs's own exports throws ("Cannot redefine property"), and this
-      // matches the file's existing real-tempdir-over-mocking style. Backs up
-      // and restores anything already at dist/site so this can't clobber a
-      // real local build.
-      const siteDir = path.join(__dirname, '..', '..', 'dist', 'site');
-      const siteIndexPath = path.join(siteDir, 'index.html');
-      let backupDir: string | null = null;
+    describe('serving / (isolated site fixture via ApiServerConfig.sitePath)', () => {
+      // ApiServerConfig.sitePath overrides the resolved site directory, so
+      // this never touches the repo's real dist/site — that path is shared,
+      // mutable global state: 18 test files construct an ApiServer, Jest
+      // runs files in parallel workers, and a backup/rm/restore dance around
+      // one real, fixed directory is exactly the kind of shared state that
+      // can be observed mid-mutation by an unrelated parallel test, or left
+      // clobbered if a run is interrupted before the restore step.
+      let siteDir: string;
 
       beforeEach(async () => {
-        const preexisting = await fs
-          .access(siteDir)
-          .then(() => true)
-          .catch(() => false);
-        if (preexisting) {
-          backupDir = await fs.mkdtemp(path.join(os.tmpdir(), 'drop-dist-site-backup-'));
-          await fs.cp(siteDir, backupDir, { recursive: true });
-          await fs.rm(siteDir, { recursive: true, force: true });
-        }
-        await fs.mkdir(siteDir, { recursive: true });
-        await fs.writeFile(siteIndexPath, '<html><body>SITE-SHELL</body></html>', 'utf-8');
+        siteDir = await fs.mkdtemp(path.join(os.tmpdir(), 'drop-site-fixture-'));
+        await fs.writeFile(path.join(siteDir, 'index.html'), '<html><body>SITE-SHELL</body></html>', 'utf-8');
       });
 
       afterEach(async () => {
         await fs.rm(siteDir, { recursive: true, force: true });
-        if (backupDir) {
-          await fs.cp(backupDir, siteDir, { recursive: true });
-          await fs.rm(backupDir, { recursive: true, force: true });
-          backupDir = null;
-        }
       });
 
-      it('serves the site bundle at /, /docs, and /reference when dist/site exists', async () => {
-        server = new ApiServer({ port: 3006, enableAuth: false });
+      it('serves the site bundle at /, /docs, and /reference when the site path exists', async () => {
+        server = new ApiServer({ port: 3006, enableAuth: false, sitePath: siteDir });
         await server.initialize();
         const app = server.getApp();
 
@@ -220,6 +207,48 @@ describe('ApiServer', () => {
           expect(res.headers.get('content-type') || '').toContain('text/html');
           expect(await res.text()).toContain('SITE-SHELL');
         }
+      });
+
+      it('301-redirects the trailing-slash variants /docs/ and /reference/ to their canonical form', async () => {
+        server = new ApiServer({ port: 3010, enableAuth: false, sitePath: siteDir });
+        await server.initialize();
+        const app = server.getApp();
+
+        const docsSlash = await app.request('/docs/', { redirect: 'manual' });
+        expect(docsSlash.status).toBe(301);
+        expect(docsSlash.headers.get('location')).toBe('/docs');
+
+        const refSlash = await app.request('/reference/', { redirect: 'manual' });
+        expect(refSlash.status).toBe(301);
+        expect(refSlash.headers.get('location')).toBe('/reference');
+      });
+
+      // These two assertions only mean something when the site's own root-
+      // level routes (/, /docs, /reference) are actually registered — CI
+      // runs `npm test` before `npm run build:site` (deploy.yml), so without
+      // this fixture, siteExists is false and the site routes never exist at
+      // all, which would make "not swallowed" trivially, vacuously true.
+      it('does not let the site routes swallow /.well-known/oauth-protected-resource', async () => {
+        server = new ApiServer({ port: 3009, enableAuth: false, sitePath: siteDir });
+        await server.initialize();
+        const app = server.getApp();
+        const res = await app.request('/.well-known/oauth-protected-resource');
+
+        // No DROP_PUBLIC_URL is configured on this test server, so the
+        // well-known handler itself 404s — the point is this is a JSON 404
+        // from the registered well-known route, never a 200 HTML shell from
+        // a root catch-all that would otherwise shadow it.
+        expect(res.status).toBe(404);
+        expect(res.headers.get('content-type') || '').not.toContain('text/html');
+      });
+
+      it('does not let the site routes swallow /api/v1/health', async () => {
+        server = new ApiServer({ port: 3013, enableAuth: false, sitePath: siteDir });
+        await server.initialize();
+        const app = server.getApp();
+        const res = await app.request('/api/v1/health');
+
+        expect(res.headers.get('content-type') || '').not.toContain('text/html');
       });
     });
 
@@ -255,32 +284,6 @@ describe('ApiServer', () => {
 
         expect(res.status).toBe(301);
         expect(res.headers.get('location')).toBe('/reference');
-      });
-    });
-
-    describe('no bare catch-all at the root', () => {
-      beforeEach(async () => {
-        server = new ApiServer({ port: 3009, enableAuth: false });
-        await server.initialize();
-      });
-
-      it('does not let a root catch-all swallow /.well-known/oauth-protected-resource', async () => {
-        const app = server.getApp();
-        const res = await app.request('/.well-known/oauth-protected-resource');
-
-        // No DROP_PUBLIC_URL is configured on this test server, so the
-        // well-known handler itself 404s — the point is this is a JSON 404
-        // from the registered well-known route, never a 200 HTML shell from
-        // a root catch-all that would otherwise shadow it.
-        expect(res.status).toBe(404);
-        expect(res.headers.get('content-type') || '').not.toContain('text/html');
-      });
-
-      it('does not let a root catch-all swallow /api/v1/health', async () => {
-        const app = server.getApp();
-        const res = await app.request('/api/v1/health');
-
-        expect(res.headers.get('content-type') || '').not.toContain('text/html');
       });
     });
   });

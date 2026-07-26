@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "dev:site": "vite --config vite.site.config.ts",
     "build": "tsc && vite build",
     "build:site": "tsc && vite build --config vite.site.config.ts",
     "preview": "vite preview"

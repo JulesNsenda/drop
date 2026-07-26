@@ -31,6 +31,7 @@ import { auditMiddleware, initializeAuditLog, closeAuditLog } from './middleware
 import { validateBodySize } from './middleware/validate';
 import { setApiRuntimeConfig, getPublicUrl } from './runtime-config';
 import { getSettingsManager } from '../managers/settings/settings-manager';
+import { isPathWithin } from '../utils/paths';
 import { buildProtectedResourceMetadata, buildAuthServerMetadata } from './oauth/metadata';
 import { error, ErrorCodes } from './types';
 import healthRoutes from './routes/health';
@@ -53,23 +54,6 @@ const UPLOAD_SOURCE_PATH_RE = /^\/api\/v1\/apps\/[A-Za-z0-9_-]+\/source$/;
 const MCP_PATH_RE = /^\/api\/v1\/mcp$/;
 /** deploy_files allows up to 1.5 MB of summed file content — comfortably over the global 1 MB body cap. */
 const MCP_MAX_BODY_BYTES = 2 * 1024 * 1024;
-
-/**
- * True if `candidatePath` is `basePath` itself or a path inside it — used to
- * contain the dashboard/site static-asset routes to their own directory.
- * Exported as a standalone pure function (rather than a route-handler
- * closure) so it's directly unit-testable: a crafted `..`/`%2e%2e` request
- * path gets normalized by the URL layer before a handler ever sees it (Hono
- * routes it to a different path entirely), so an HTTP-level test of this
- * predicate would pass whether or not the check is correct. Rejects `..`
- * escapes AND sibling directories that merely share a string prefix (e.g.
- * `dist/site-backup` against a `dist/site` base — `startsWith(base)` with no
- * trailing separator incorrectly accepts that).
- */
-export function isPathContained(basePath: string, candidatePath: string): boolean {
-  const relative = path.relative(basePath, candidatePath);
-  return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
-}
 
 export interface ApiServerConfig {
   port: number;
@@ -98,6 +82,21 @@ export interface ApiServerConfig {
   tempDirectory?: string;
   /** Cap on the compressed (as-uploaded) archive size for POST /apps/:name/source, in MB. */
   maxUploadSizeMb?: number;
+  /**
+   * Override the resolved dashboard directory (normally dist/dashboard, or
+   * src/dashboard as a dev fallback — see setupRoutes). Defaults to that
+   * resolution when unset; exists so tests can point at an isolated fixture
+   * instead of the real repo-relative dist/dashboard.
+   */
+  dashboardPath?: string;
+  /**
+   * Override the resolved site directory (normally dist/site — see
+   * setupRoutes). Defaults to that resolution when unset; exists so tests
+   * can point at an isolated fixture instead of the real repo-relative
+   * dist/site, which every `new ApiServer(...)` in the suite would otherwise
+   * share as a real, mutable, non-parallel-safe path.
+   */
+  sitePath?: string;
 }
 
 export class ApiServer {
@@ -368,22 +367,14 @@ export class ApiServer {
       '.ttf': 'font/ttf',
     };
 
-    // Moved public URLs (DROP-070): /docs and /reference used to live under
-    // /dashboard. Permanently redirect inbound links and search-index
-    // entries to their new home. Registered before the /dashboard/* SPA
-    // fallback below so these specific paths take priority over it, and
-    // unconditionally (independent of dashboardExists/siteExists below) —
-    // a stale link should redirect even on a box with no build present yet.
-    this.app.get('/dashboard/docs', c => c.redirect('/docs', 301));
-    this.app.get('/dashboard/reference', c => c.redirect('/reference', 301));
-
     // Dashboard static files
-    // Prefer built dashboard (dist/dashboard) over source (src/dashboard)
+    // Prefer built dashboard (dist/dashboard) over source (src/dashboard),
+    // unless a test/caller overrides the resolved path directly.
     const distDashboardPath = path.join(__dirname, '..', '..', 'dist', 'dashboard');
     const srcDashboardPath = path.join(__dirname, '..', 'dashboard');
-    const dashboardPath = fs.existsSync(path.join(distDashboardPath, 'index.html'))
-      ? distDashboardPath
-      : srcDashboardPath;
+    const dashboardPath =
+      this.config.dashboardPath ??
+      (fs.existsSync(path.join(distDashboardPath, 'index.html')) ? distDashboardPath : srcDashboardPath);
     const dashboardIndexPath = path.join(dashboardPath, 'index.html');
     const dashboardExists = fs.existsSync(dashboardIndexPath);
 
@@ -399,7 +390,10 @@ export class ApiServer {
         const assetPath = c.req.path.replace('/dashboard/', '');
         const filePath = path.join(dashboardPath, assetPath);
         // Containment: never serve outside the dashboard directory.
-        if (!isPathContained(dashboardPath, filePath)) {
+        // isPathWithin realpaths both sides, so a symlink/junction planted
+        // under the dashboard dir can't escape it either (plain lexical
+        // path.relative would miss that).
+        if (!(await isPathWithin(dashboardPath, filePath))) {
           return c.notFound();
         }
         try {
@@ -436,6 +430,16 @@ export class ApiServer {
       };
 
       this.app.get('/dashboard', serveIndex);
+
+      // Moved public URLs (DROP-070): /docs and /reference used to live
+      // under /dashboard. Permanently redirect inbound links and
+      // search-index entries to their new home. MUST be registered
+      // immediately above the /dashboard/* fallback below — that wildcard
+      // would otherwise match these two paths first and serve the dashboard
+      // SPA shell instead of redirecting.
+      this.app.get('/dashboard/docs', c => c.redirect('/docs', 301));
+      this.app.get('/dashboard/reference', c => c.redirect('/reference', 301));
+
       this.app.get('/dashboard/*', async c => {
         if (!c.req.path.includes('/assets/') && !c.req.path.endsWith('.svg')) {
           return serveIndex(c);
@@ -451,7 +455,7 @@ export class ApiServer {
     // NOT fall back to raw source (src/dashboard/site/index.html isn't a
     // servable bundle without Vite), so a box with no `dist/site` build
     // falls through to the API-info JSON fallback below, not a broken shell.
-    const distSitePath = path.join(__dirname, '..', '..', 'dist', 'site');
+    const distSitePath = this.config.sitePath ?? path.join(__dirname, '..', '..', 'dist', 'site');
     const siteIndexPath = path.join(distSitePath, 'index.html');
     const siteExists = fs.existsSync(siteIndexPath);
 
@@ -466,8 +470,9 @@ export class ApiServer {
       this.app.get('/assets/*', async c => {
         const assetPath = c.req.path.replace(/^\//, '');
         const filePath = path.join(distSitePath, assetPath);
-        // Containment: never serve outside the site directory.
-        if (!isPathContained(distSitePath, filePath)) {
+        // Containment: never serve outside the site directory (see the
+        // isPathWithin comment on the dashboard's asset route above).
+        if (!(await isPathWithin(distSitePath, filePath))) {
           return c.notFound();
         }
         try {
@@ -511,6 +516,12 @@ export class ApiServer {
       this.app.get('/', serveSiteIndex);
       this.app.get('/docs', serveSiteIndex);
       this.app.get('/reference', serveSiteIndex);
+      // Canonicalize the trailing-slash variants (the old /dashboard/*
+      // SPA fallback served these too, since react-router ignores a
+      // trailing slash when matching a leaf route) rather than silently
+      // 404ing or double-serving the same content at two URLs.
+      this.app.get('/docs/', c => c.redirect('/docs', 301));
+      this.app.get('/reference/', c => c.redirect('/reference', 301));
     } else {
       // No built site available — surface API info instead of a 404 at the
       // root, for installs with no frontend built yet.
