@@ -13,6 +13,33 @@
 #   These settings persist in /etc/drop/drop.env and survive upgrades/deploys.
 set -euo pipefail
 
+# Force a root-owned, non-group-writable PATH before anything else runs.
+# Every helper below resolves systemctl/install/visudo/setcap/caddy/node/etc.
+# through PATH by bare name, and sudo's secure_path typically starts with
+# /usr/local/sbin:/usr/local/bin — the latter (like /usr/local/sbin) is
+# root:staff 2775 on stock Debian/Ubuntu, so anything writable there by a
+# 'staff'-group member could otherwise shadow a system binary this script (or
+# the root-owned $PROVISION_BIN copy of it, run via sudo) resolves and execs
+# as root. Assigning PATH here overrides whatever was inherited, regardless
+# of how this script was invoked.
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+
+# BASH_SOURCE[0] is unset when this script is read from stdin (e.g.
+# `curl ... | bash`) — under `set -u` that would die two lines below with an
+# opaque "unbound variable" error, before argument parsing even runs, and (if
+# `set -u` were ever relaxed) silently produce an empty $SELF instead. Either
+# way, fail loudly and actionably here: a piped invocation has no on-disk
+# file for install_provision_script (DROP-071) to seed $PROVISION_BIN from,
+# and skipping that seed is NOT a safe fallback — the box would still expect
+# --provision to work, and there is nothing else it could point at except the
+# drop-writable legacy path this fix removes. See docs/HETZNER-DEPLOY.md for
+# the save-then-run form.
+if [[ -z "${BASH_SOURCE[0]:-}" ]]; then
+  echo "DROP's install.sh must be run from a saved file, not piped (e.g. curl | bash)." >&2
+  echo "Save it first, then run it, e.g.:" >&2
+  echo "  curl -fsSL <url> -o install.sh && sudo bash install.sh [flags]" >&2
+  exit 1
+fi
 # Absolute path to the currently-executing copy of this script, resolved once
 # up front (BASH_SOURCE[0] may be relative, e.g. "install.sh" when invoked as
 # `bash install.sh`). install_provision_script() (DROP-071) later reads
@@ -371,6 +398,17 @@ ensure_root_dir() {
 # just re-introduce the same hole under a new name) installed outside
 # $INSTALL_DIR, root:root 0755, in a directory the drop user cannot write to.
 #
+# Defence in depth, not a full drop-is-non-root-equivalent claim: this closes
+# ONE way $DROP_USER could reach root (rewrite install.sh, ride the sudoers
+# rule). Under DROP_ISOLATION=docker, ensure_docker adds $DROP_USER to the
+# 'docker' group so it can manage containers — and docker-group membership is
+# itself a second, independent root-equivalent door (e.g.
+# `docker run -v /:/mnt alpine chroot /mnt sh`), unaffected by anything here.
+# On a DROP_ISOLATION=docker box (dropkit.sh included), this fix removes one
+# of two doors, not the only one. It IS the only door on DROP_ISOLATION=none
+# boxes (no docker group involved there), which is why it's worth shipping
+# regardless — just don't read it as "drop is no longer root-equivalent".
+#
 # Trust chain: this function only ever runs on paths that are ALREADY
 # root-authenticated by something other than the drop-reachable NOPASSWD rule
 # — --bootstrap, a fresh install, and --upgrade, all of which require a real
@@ -392,7 +430,7 @@ ensure_root_dir() {
 # read (e.g. a CI-held HMAC key checked against a root-only key file) or a
 # deploy channel that authenticates as root directly, neither of which exists
 # today. That's a bigger change than this fix; this trades per-deploy
-# freshness for closing the unconditional escalation.
+# freshness for closing the install.sh-rewrite escalation path.
 #
 # Operational contract: provisioning-logic changes (systemd unit, Caddy,
 # sudoers, apex route) require a root-authenticated run of --bootstrap or
@@ -401,35 +439,73 @@ ensure_root_dir() {
 # the shipped install.sh so that staleness is visible rather than silent.
 install_provision_script() {
   info "Installing root-owned provisioning script to $PROVISION_BIN..."
+  harden_provision_dir
+  # GNU install refuses to copy a file onto itself — true when this IS
+  # already $PROVISION_BIN (e.g. an operator running
+  # `sudo bash /usr/local/sbin/drop-provision --upgrade` directly). Skip the
+  # no-op rather than aborting: this runs after fetch_code/build_drop, and an
+  # abort here would leave the box mid-upgrade — code rebuilt, provisioning
+  # not yet (re)applied.
+  [[ "$SELF" -ef "$PROVISION_BIN" ]] || install -o root -g root -m 0755 "$SELF" "$PROVISION_BIN"
+}
+
+# Root-owned, non-group-writable home for $PROVISION_BIN. Called
+# unconditionally, every time — not just when (re)installing the script —
+# because /usr/local/sbin is root:staff 2775 on stock Debian/Ubuntu (any
+# 'staff'-group member can write there) until this hardens it. If hardening
+# only ran when the seed guard below decided to reinstall, a directory left
+# group-writable from before this fix ever ran could let a 'staff'-group
+# member plant something at $PROVISION_BIN ahead of the check, which would
+# then read as already-trusted and never get hardened or overwritten.
+harden_provision_dir() {
   install -d -o root -g root -m 0755 "$(dirname "$PROVISION_BIN")"
-  install -o root -g root -m 0755 "$SELF" "$PROVISION_BIN"
+}
+
+# True only if $PROVISION_BIN is a root-owned REGULAR file — not a symlink.
+# `-x` alone follows symlinks and asserts nothing about ownership: a symlink
+# planted at $PROVISION_BIN pointing at $INSTALL_DIR/install.sh (drop-
+# writable) would satisfy `-x`, which would both skip the reseed below AND
+# leave the sudoers rule pointed at a symlink sudo happily follows onto
+# drop-authored content — root would execute it just the same.
+provision_bin_is_trusted() {
+  [[ -f "$PROVISION_BIN" && ! -L "$PROVISION_BIN" ]] || return 1
+  [[ "$(stat -c %u "$PROVISION_BIN")" == "0" ]]
 }
 
 # ── sudoers: let drop user start/stop the service (needed for CI deploy) ─────
 write_sudoers() {
   local f="/etc/sudoers.d/${DROP_USER}-deploy"
   local tmp
-  tmp="$(mktemp)"
+  # Staged in the SAME directory as $f (not /tmp), so the `mv -f` below is a
+  # same-filesystem rename — atomic. Writing straight into $f (even via a
+  # copy validated beforehand) risks a truncated file if interrupted mid-copy,
+  # and a truncated /etc/sudoers.d/${DROP_USER}-deploy makes sudo refuse
+  # everything for everyone, not just this rule.
+  tmp="$(mktemp "${f}.XXXXXX")"
   info "Writing sudoers rule for $DROP_USER..."
   {
-    echo "${DROP_USER} ALL=(ALL) NOPASSWD: /bin/systemctl stop ${SERVICE_NAME}"
-    echo "${DROP_USER} ALL=(ALL) NOPASSWD: /bin/systemctl start ${SERVICE_NAME}"
-    echo "${DROP_USER} ALL=(ALL) NOPASSWD: /bin/systemctl restart ${SERVICE_NAME}"
-    echo "${DROP_USER} ALL=(ALL) NOPASSWD: /bin/systemctl status ${SERVICE_NAME}"
+    # (root), not (ALL): none of these commands ever need to run as a target
+    # user other than root, so don't grant the option.
+    echo "${DROP_USER} ALL=(root) NOPASSWD: /bin/systemctl stop ${SERVICE_NAME}"
+    echo "${DROP_USER} ALL=(root) NOPASSWD: /bin/systemctl start ${SERVICE_NAME}"
+    echo "${DROP_USER} ALL=(root) NOPASSWD: /bin/systemctl restart ${SERVICE_NAME}"
+    echo "${DROP_USER} ALL=(root) NOPASSWD: /bin/systemctl status ${SERVICE_NAME}"
     # Let the CI deploy re-apply system provisioning (Caddy, unit, env, apex
     # route) by running the root-owned provisioning script — see
     # install_provision_script above for why it's a copy at $PROVISION_BIN
-    # rather than $INSTALL_DIR/install.sh. Until that copy exists, fall back to
-    # the legacy in-place rule so an already-bootstrapped box's very next
-    # deploy can still provision itself long enough to seed it (see the
-    # migration guard in provision_system) — otherwise every future deploy on
-    # that box would have no working --provision path at all.
-    if [[ -x "$PROVISION_BIN" ]]; then
-      echo "${DROP_USER} ALL=(ALL) NOPASSWD: ${PROVISION_BIN} --provision"
-    else
-      echo "${DROP_USER} ALL=(ALL) NOPASSWD: /usr/bin/bash ${INSTALL_DIR}/install.sh --provision"
-    fi
+    # rather than $INSTALL_DIR/install.sh. The interpreter is pinned to an
+    # absolute, root-owned /usr/bin/bash (not left to $PROVISION_BIN's own
+    # #!/usr/bin/env bash shebang): sudo resolves an unqualified command
+    # through secure_path, whose /usr/local/bin entry is group-writable by
+    # 'staff' on stock Debian/Ubuntu, so an unqualified `bash` could resolve
+    # to something other than the real interpreter. deploy.yml's invocation
+    # must match this exactly (interpreter + path + args) or sudo will refuse
+    # it. By the time this line runs, provision_system has already guaranteed
+    # $PROVISION_BIN exists via harden_provision_dir/provision_bin_is_trusted
+    # above — there is no legacy fallback rule here to fall open to.
+    echo "${DROP_USER} ALL=(root) NOPASSWD: /usr/bin/bash ${PROVISION_BIN} --provision"
   } > "$tmp"
+  chmod 0440 "$tmp"
   # Validate before this ever becomes the live file — a malformed rule here
   # would otherwise briefly lock out provisioning (and, for the systemctl
   # lines, the CI deploy's stop/start/restart too).
@@ -437,8 +513,7 @@ write_sudoers() {
     rm -f "$tmp"
     error "sudoers syntax error — check the generated rule"
   fi
-  install -o root -g root -m 0440 "$tmp" "$f"
-  rm -f "$tmp"
+  mv -f "$tmp" "$f"
 }
 
 # ── code: clone or pull ──────────────────────────────────────────────────────
