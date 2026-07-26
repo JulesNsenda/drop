@@ -214,6 +214,40 @@ describe('ContainerManager', () => {
       expect(appMount.ReadOnly).toBe(true);
     });
 
+    // DROP-072 review item 4. The 0711 mode on the socket dir is NOT what
+    // protects the socket when the container uid collides with the DROP service
+    // uid — useradd commonly lands the service user on 1000 and IMAGE_USERS
+    // runs nodejs/python/go containers as 1000, in which case the container IS
+    // the owner and gets rwx. ReadOnly on the bind mount is what stops it
+    // unlinking .s.PGSQL.<port> and planting its own socket to proxy every
+    // other app's SCRAM handshake. Pinned here so it cannot be dropped quietly.
+    it('bind-mounts the Postgres socket dir read-only', async () => {
+      const docker = makeDockerMock() as any;
+      const mgr = new ContainerManager(docker);
+
+      await mgr.start({ ...baseSpec, pgSocketDir: '/var/drop/data/pgsock' });
+
+      const call = docker.createContainer.mock.calls[0][0];
+      const sockMount = call.HostConfig.Mounts.find(
+        (m: Record<string, unknown>) => m.Source === '/var/drop/data/pgsock'
+      );
+      expect(sockMount).toBeDefined();
+      expect(sockMount.ReadOnly).toBe(true);
+    });
+
+    it('does not mount a Postgres socket dir when the app has no database', async () => {
+      const docker = makeDockerMock() as any;
+      const mgr = new ContainerManager(docker);
+
+      await mgr.start(baseSpec); // no pgSocketDir
+
+      const call = docker.createContainer.mock.calls[0][0];
+      const sockMount = (call.HostConfig.Mounts as Record<string, unknown>[]).find(
+        (m) => typeof m.Source === 'string' && (m.Source as string).includes('pgsock')
+      );
+      expect(sockMount).toBeUndefined();
+    });
+
     it('attaches the container to drop-net', async () => {
       const docker = makeDockerMock() as any;
       const mgr = new ContainerManager(docker);
