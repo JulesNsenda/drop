@@ -261,6 +261,20 @@ export class DeployTracker {
     return typeof limit === 'number' ? episodes.slice(0, limit) : episodes;
   }
 
+  /**
+   * Whether an episode is currently OPEN for this app (a `build:started` has
+   * been seen with no terminal row yet).
+   *
+   * Exists so the platform can tell "nothing ever opened an episode for this
+   * deploy" from "an episode opened and already closed". Without that
+   * distinction a caller trying to report a pre-build failure would either
+   * no-op (the close hits the orphan guard) or manufacture a second, spurious
+   * failed episode for a deploy that already reported one.
+   */
+  hasOpenEpisode(appName: string): boolean {
+    return this.active.has(appName);
+  }
+
   /** Drop all rows for an app (delete-time) and clear its in-memory state. */
   purgeApp(appName: string): void {
     this.rows = this.rows.filter((row) => row.appName !== appName);

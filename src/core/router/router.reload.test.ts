@@ -127,6 +127,41 @@ describe('reloadCaddy error handling', () => {
     );
   });
 
+  it('redacts secret-shaped tokens from the rejection body', async () => {
+    // The generated Caddyfile carries DNS-provider credentials as {env.*}
+    // placeholders, and the Caddyfile adapter substitutes those while parsing —
+    // so an adapt error quoting the offending line can contain the EXPANDED
+    // token, which would then be written to the host log.
+    const token = 'cf_live_9aA1bB2cC3dD4eE5fF6gG7hH';
+    global.fetch = jest.fn().mockResolvedValue({
+      ok: false,
+      status: 400,
+      text: jest.fn().mockResolvedValue(`adapt error near 'dns cloudflare ${token}'`),
+    });
+
+    await invokeReload(makeRouter());
+
+    const logged = String(errorSpy.mock.calls[0][0]);
+    expect(logged).not.toContain(token);
+    expect(logged).toContain('[redacted]');
+    // Ordinary diagnostics still survive.
+    expect(logged).toContain('dns cloudflare');
+  });
+
+  it('leaves short diagnostic text intact', async () => {
+    global.fetch = jest.fn().mockResolvedValue({
+      ok: false,
+      status: 400,
+      text: jest.fn().mockResolvedValue('unrecognized directive: lggg, line 42'),
+    });
+
+    await invokeReload(makeRouter());
+
+    const logged = String(errorSpy.mock.calls[0][0]);
+    expect(logged).toContain('unrecognized directive: lggg');
+    expect(logged).not.toContain('[redacted]');
+  });
+
   it('truncates a large rejection body', async () => {
     global.fetch = jest.fn().mockResolvedValue({
       ok: false,

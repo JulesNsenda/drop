@@ -27,6 +27,21 @@ const DEFAULT_ROUTER_CONFIG: RouterConfig = {
   defaultCompress: true,
 };
 
+/**
+ * Scrub secret-shaped tokens from text before it is logged.
+ *
+ * Caddy's rejection body may quote the offending source line, and the generated
+ * Caddyfile contains DNS-provider credentials as `{env.CF_API_TOKEN}` /
+ * `{env.GODADDY_API_KEY}` placeholders — which the Caddyfile adapter SUBSTITUTES
+ * while parsing. So an adapt error can carry an expanded provider token, and
+ * that would land in the host log. Long unbroken alphanumeric runs are replaced;
+ * ordinary Caddy diagnostics (directive names, paths, ports) are far shorter
+ * than the threshold and survive intact.
+ */
+function redactSecretLikeTokens(text: string): string {
+  return text.replace(/[A-Za-z0-9_-]{24,}/g, '[redacted]');
+}
+
 export class RouterService {
   private readonly config: RouterConfig;
   private readonly routes: Map<string, Route> = new Map();
@@ -267,6 +282,7 @@ export class RouterService {
    * Reload Caddy server
    */
   private async reloadCaddy(): Promise<void> {
+    // (see redactSecretLikeTokens below for why the error body is scrubbed)
     if (!this.config.caddy.enableAdminApi || !this.config.caddy.adminApi) {
       return;
     }
@@ -304,7 +320,7 @@ export class RouterService {
     // so this must be loud.
     let detail = '';
     try {
-      detail = (await response.text()).slice(0, 500);
+      detail = redactSecretLikeTokens((await response.text()).slice(0, 500));
     } catch {
       // Body unreadable — the status alone is the signal.
     }
