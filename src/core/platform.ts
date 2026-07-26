@@ -1770,6 +1770,12 @@ backup:
           apiPort: this.config.apiPort,
           maxMemoryMbPerApp: this.config.maxMemoryMbPerApp,
           maxCpusPerApp: this.config.maxCpusPerApp,
+          // DROP-072: same gating as the actual mount/env-var call sites
+          // (buildStartSpec) — undefined outside docker isolation.
+          pgSocketDir:
+            this.config.isolation === 'docker'
+              ? (this.postgresServer?.getSocketDir() ?? undefined)
+              : undefined,
         }),
       });
     } catch (error) {
@@ -2069,6 +2075,12 @@ backup:
           apiPort: this.config.apiPort,
           maxMemoryMbPerApp: this.config.maxMemoryMbPerApp,
           maxCpusPerApp: this.config.maxCpusPerApp,
+          // DROP-072: same gating as the actual mount/env-var call sites
+          // (buildStartSpec) — undefined outside docker isolation.
+          pgSocketDir:
+            this.config.isolation === 'docker'
+              ? (this.postgresServer?.getSocketDir() ?? undefined)
+              : undefined,
         });
       // Port drift (M1 review item H): the skip path trusts config.port to
       // reconcile routing, but the runtime's own report is right there —
@@ -4499,8 +4511,17 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
 
     // In docker mode, pass the Postgres socket dir so ContainerManager can
     // bind-mount it; containers connect via unix socket instead of TCP.
+    // DROP-072 follow-up (security review item 2): gated on the app actually
+    // HAVING a database (dbEnvVars carries a DATABASE_URL), not merely on
+    // isolation mode — without this, every docker container (a static site,
+    // a Go binary, anything with no DB at all) got a direct bind-mounted
+    // channel to the bundled Postgres and could attempt to authenticate as
+    // any role, the same least-privilege gap this ticket set out to close,
+    // one layer up. This also makes the runtimeSpecFingerprint (below,
+    // recordDeploySignature/decideOneAppOnBoot) correctly diverge per-app:
+    // non-DB docker apps stop being force-redeployed by a socket-dir change.
     const pgSocketDir =
-      this.config.isolation === 'docker'
+      this.config.isolation === 'docker' && dbEnvVars['DATABASE_URL']
         ? (this.postgresServer?.getSocketDir() ?? undefined)
         : undefined;
 
