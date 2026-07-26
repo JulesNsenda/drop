@@ -136,14 +136,19 @@ function SignupPage() {
             Sign in
           </Link>
         </p>
-        <Link
-          to="/"
+        {/* The marketing home lives in a separate bundle at "/" (DROP-070) —
+            a react-router Link would resolve inside this dashboard router
+            (basename /dashboard) instead, which the anonymous index route
+            now sends straight back to /login (see App.tsx), turning this
+            into a no-op loop. Full page navigation instead. */}
+        <a
+          href="/"
           className="inline-flex items-center gap-1.5 text-sm transition-colors"
           style={{ color: 'var(--text-2)' }}
         >
           <ArrowLeft className="h-3.5 w-3.5" />
           Back to home
-        </Link>
+        </a>
       </div>
     </AuthLayout>
   );

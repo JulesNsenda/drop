@@ -89,15 +89,17 @@ Most managers follow the singleton pattern: `get*(config?)` returns/creates the 
 
 ### REST API (`src/api/`)
 
-Hono-based, served by `ApiServer` (`src/api/server.ts`) on `apiPort` (default 3000). Routes are mounted under **`/api/v1`** (`health`, `auth`, `apps`, `logs`, `certs`, `secrets`, `webhooks`, `git`, `admin`).
+Hono-based, served by `ApiServer` (`src/api/server.ts`) on `apiPort` (default 3000). Routes are mounted under **`/api/v1`** (`health`, `auth`, `apps`, `logs`, `certs`, `secrets`, `webhooks`, `git`, `admin`). `ApiServer` also serves both frontend bundles directly at the root level: `/`, `/docs`, `/reference` (the public site, DROP-070) and `/dashboard` (the admin SPA), each behind an explicit-routes-only registration — no bare `/*` catch-all, since that would swallow the `/.well-known/oauth-*` discovery routes below. `/dashboard/docs` and `/dashboard/reference` 301-redirect to their new `/docs` / `/reference` homes.
 
 Middleware stack (applied in `setupMiddleware`): security headers → CORS → body-size limit → rate limiting (`/api/*`, stricter on `/auth/login`) → request logger → audit logging → error handler. Auth middleware is applied per-route-group only when auth is enabled, with role tiers **`readonly` / `user` / `admin`** (`authMiddleware(role)`).
 
 **Auth** (`src/api/middleware/auth.ts`): JWT (via `jose`) + API keys. Users and API keys are persisted to a **file** (`api-credentials.json`), not the internal DB. Auth is **on by default** (`enableApiAuth`); disable with `DROP_DISABLE_AUTH=true` / `DROP_ENABLE_API_AUTH=false`. Adding endpoints means: add a route file under `src/api/routes/`, mount it in `server.ts`, and (if protected) add an `authMiddleware(role)` line in `setupRoutes`.
 
-### Web Dashboard (`src/dashboard/`)
+### Web Dashboard + public site (`src/dashboard/`)
 
-A **separate npm package** (React 18 + Vite + Tailwind + react-router-dom). It has its own `package.json`, `node_modules`, and `tsconfig.json`. It is built to `dist/dashboard/` and served by `ApiServer` at `/dashboard` (SPA fallback). `ApiServer` prefers the built `dist/dashboard` over `src/dashboard`. Treat the dashboard as its own frontend project — run `npm` commands from inside `src/dashboard/`.
+A **separate npm package** (React 18 + Vite + Tailwind + react-router-dom) — but **two Vite surfaces** sharing one `src/` tree (DROP-070): `vite.config.ts` builds the admin dashboard (`base: /dashboard/`, entry `index.html` → `dist/dashboard/`), and `vite.site.config.ts` builds the public marketing/docs/reference site (`base: /`, entry `site/index.html` → `dist/site/`). Same `package.json`/`node_modules`/`tsconfig.json` for both — not a second package. `ApiServer` prefers the built `dist/dashboard` / `dist/site` over the raw `src/dashboard` (dashboard only; the site build has no source fallback — see `server.ts`). Treat `src/dashboard` as its own frontend project — run `npm` commands from inside it (`npm run build` / `build:site`, `npm run dev` / `dev:site`).
+
+**Invariant the split depends on:** the site bundle (`src/dashboard/src/{SiteApp,site-main}.tsx`, `pages/{Landing,Docs,Reference,SiteNotFound}Page.tsx`, `components/landing/*`) must never import `hooks/useAuth`, `api/client`, `components/Layout`, `Toast`, or `ConfirmDialog` — that's the admin-only code the split exists to keep out of a marketing visitor's download (CI enforces this with a `grep` over the built `dist/site` JS, `deploy.yml`). Cross-bundle navigation (e.g. a "Sign in" link, or the dashboard's logout redirect) is a plain `window.location.href` / `<a href>`, never react-router's `Link`/`navigate()` — each bundle has its own `BrowserRouter` with no shared history.
 
 ### Persistence Model (two file-based layers — important)
 
