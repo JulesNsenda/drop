@@ -95,6 +95,15 @@ jobs:
             drop-dist.tar.gz \
             ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}:/tmp/drop-dist.tar.gz
 
+      # Hash the install.sh that CI actually built, straight out of the
+      # artifact, on the runner. This is the trusted half of the drift check
+      # below: computing it server-side would let the drop user (who owns
+      # /opt/drop/install.sh) rewrite both sides to match and silence the
+      # signal. Still only a detection aid — see the comment at its use site.
+      - name: Hash the shipped install.sh
+        run: |
+          echo "SHIPPED_HASH=$(tar -xzOf drop-dist.tar.gz install.sh | sha256sum | cut -d' ' -f1)" >> "$GITHUB_ENV"
+
       - name: Deploy on server
         run: |
           ssh -i /tmp/deploy_key \
@@ -128,14 +137,74 @@ jobs:
             rm -f /tmp/drop-dist.tar.gz
             # Re-apply system provisioning (Caddy, systemd unit, env, apex route)
             # so infra changes in install.sh land on the server. This also
-            # restarts the service. Until the server has been provisioned once
-            # (which installs the NOPASSWD rule for this command), fall back to a
-            # plain restart so the deploy still ships the new code.
-            if sudo -n /usr/bin/bash /opt/drop/install.sh --provision; then
+            # restarts the service.
+            #
+            # Preferred target is the root-owned /usr/local/sbin/drop-provision
+            # (DROP-071) — a copy of install.sh outside /opt/drop, which is
+            # chown'd to the drop user and therefore not something root should
+            # ever be sudo'd into running directly. The middle arm is legacy:
+            # a box bootstrapped before DROP-071 only has a sudoers rule for
+            # /opt/drop/install.sh directly, and running --provision through
+            # it (the new install.sh code, just untarred above) is what seeds
+            # /usr/local/sbin/drop-provision and rewrites the sudoers rule to
+            # point at it — so the very next deploy takes the first branch.
+            # Until the server has been provisioned at least once (either
+            # way), fall back to a plain restart so the deploy still ships the
+            # new code.
+            # The interpreter is pinned to an absolute /usr/bin/bash and MUST
+            # match install.sh's write_sudoers rule byte for byte (interpreter
+            # + path + args) or sudo refuses and this silently falls through to
+            # the legacy arm. Pinning matters: exec'ing the script directly
+            # would honour its #!/usr/bin/env bash shebang, and sudo's
+            # secure_path starts with /usr/local/sbin:/usr/local/bin — the
+            # latter root:staff 2775 on stock Debian, so `bash` could resolve
+            # to something other than the real interpreter.
+            if sudo -n /usr/bin/bash /usr/local/sbin/drop-provision --provision; then
               echo "System provisioning applied"
+            elif sudo -n /usr/bin/bash /opt/drop/install.sh --provision; then
+              echo "System provisioning applied (legacy sudoers rule — server will use /usr/local/sbin/drop-provision from the next deploy)"
             else
               echo "::warning::Provisioning unavailable — falling back to restart. Bootstrap install.sh on the server to enable self-provisioning."
               sudo systemctl restart drop-platform
+            fi
+            # Staleness check (DROP-071 follow-up): --provision alone only
+            # re-applies whatever provisioning logic was last installed into
+            # /usr/local/sbin/drop-provision — see install.sh's
+            # install_provision_script for why. Compare it against the
+            # install.sh just untarred above so an infra change (systemd
+            # unit, Caddy setup, sudoers, apex route) that shipped in THIS
+            # deploy but silently did not take effect is visible, instead of
+            # the box quietly diverging from what the repo says it should be.
+            #
+            # This is a DETECTION AID ONLY, deliberately unauthenticated — a
+            # plain sha256sum comparison, no secret involved. It proves
+            # nothing about trust: an actor who could forge one side of it
+            # could already do worse (see install.sh's trust-chain comment).
+            # Never read a match here as "the box is provisioned correctly"
+            # or build any authorization decision on it.
+            #
+            # --bootstrap (not --upgrade) is the correct remediation on this
+            # deployment model: /opt/drop is populated by this tarball
+            # extraction, not a git clone, so --upgrade's `git -C /opt/drop
+            # fetch` would fail outright (no .git here). --bootstrap re-runs
+            # provisioning idempotently against whatever install.sh already
+            # sits in /opt/drop, without needing a git checkout.
+            #
+            # Deliberately non-fatal: a stale-but-working box is not an
+            # outage, and failing the deploy here would block shipping
+            # application code over an unrelated infra drift.
+            # SHIPPED_HASH is passed in from the runner (computed straight out
+            # of the CI-built tarball, see the env: block on this step) rather
+            # than recomputed here from /opt/drop/install.sh. On the server the
+            # drop user owns that file and could rewrite it between the untar
+            # above and this line, making both sides match and permanently
+            # silencing the one staleness signal. Runner-side, one half of the
+            # comparison is genuinely CI-authored.
+            if [ -x /usr/local/sbin/drop-provision ]; then
+              INSTALLED_HASH=$(sha256sum /usr/local/sbin/drop-provision | cut -d" " -f1)
+              if [ "${{ env.SHIPPED_HASH }}" != "$INSTALLED_HASH" ]; then
+                echo "::warning::The install.sh shipped in this deploy differs from /usr/local/sbin/drop-provision — provisioning changes (systemd unit, Caddy, sudoers, apex route) have NOT been applied. To remediate, copy a TRUSTED install.sh to the box and run it as root: scp install.sh root@<host>:/tmp/ && ssh root@<host> 'bash /tmp/install.sh --bootstrap'. Do NOT run /opt/drop/install.sh as root — it is writable by the drop user, which is the exact primitive DROP-071 removes."
+              fi
             fi
             # Verify the service actually came back up before calling it a
             # success. Probe /health/live, which is unconditionally 200 when the
