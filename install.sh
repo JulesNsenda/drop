@@ -13,6 +13,15 @@
 #   These settings persist in /etc/drop/drop.env and survive upgrades/deploys.
 set -euo pipefail
 
+# Absolute path to the currently-executing copy of this script, resolved once
+# up front (BASH_SOURCE[0] may be relative, e.g. "install.sh" when invoked as
+# `bash install.sh`). install_provision_script() (DROP-071) later reads
+# $SELF's on-disk bytes to seed/refresh the root-owned provisioning script —
+# by the time it does, on --upgrade, fetch_code has already git-pulled fresh
+# content onto this same path, so that read still picks up what root just
+# pulled, not a stale in-memory copy of this script.
+SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+
 REPO_URL="https://github.com/JulesNsenda/drop.git"
 INSTALL_DIR="/opt/drop"
 DROP_ROOT="/var/drop"
@@ -21,6 +30,10 @@ BRANCH="main"
 SERVICE_NAME="drop-platform"
 API_PORT="3000"
 ENV_FILE="/etc/drop/drop.env"
+# Root-owned copy of this script that the sudoers --provision rule targets
+# (DROP-071). Lives outside $INSTALL_DIR — which is chown'd to $DROP_USER, see
+# ensure_root_dir/fetch_code — in a directory the drop user cannot write to.
+PROVISION_BIN="/usr/local/sbin/drop-provision"
 UPGRADE=false
 DO_LINK=false
 PROVISION=false
@@ -348,21 +361,84 @@ ensure_root_dir() {
   chown -R "$DROP_USER:$DROP_USER" "$DROP_ROOT/data"
 }
 
+# ── root-owned provisioning script (DROP-071) ────────────────────────────────
+# $INSTALL_DIR is chown'd to $DROP_USER (ensure_root_dir/fetch_code), and under
+# DROP_ISOLATION=none that's the same OS user tenant apps run as — so a
+# compromised app could rewrite $INSTALL_DIR/install.sh and, if the sudoers
+# --provision rule ever pointed there, get root to execute whatever it wrote,
+# unconditionally, any time it chose to. $PROVISION_BIN is a COPY of this
+# script (not a wrapper that execs $INSTALL_DIR/install.sh — a wrapper would
+# just re-introduce the same hole under a new name) installed outside
+# $INSTALL_DIR, root:root 0755, in a directory the drop user cannot write to.
+#
+# Trust chain: this function only ever runs on paths that are ALREADY
+# root-authenticated by something other than the drop-reachable NOPASSWD rule
+# — --bootstrap, a fresh install, and --upgrade, all of which require a real
+# interactive `sudo`/root session (see the "run" section below). It is
+# deliberately NOT called unconditionally from provision_system(), which is
+# also reachable via the --provision sudoers rule: if it were, a drop-level
+# actor could rewrite $INSTALL_DIR/install.sh and simply invoke --provision
+# themselves to get that content copied into $PROVISION_BIN and executed —
+# the exact vulnerability this is meant to close, just renamed. The one
+# exception is a seed-if-missing guard in provision_system() for migrating an
+# already-bootstrapped box off the old rule — see write_sudoers below.
+#
+# This does mean provisioning-logic changes no longer ride along on every
+# ordinary CI deploy the way they used to: only --bootstrap/--upgrade/install
+# refresh $PROVISION_BIN. A deploy that only runs --provision keeps re-applying
+# whatever provisioning logic was last installed that way. Closing that gap
+# without giving it up would require root to distinguish CI-authored bytes
+# from drop-authored bytes — which needs either a secret the drop user cannot
+# read (e.g. a CI-held HMAC key checked against a root-only key file) or a
+# deploy channel that authenticates as root directly, neither of which exists
+# today. That's a bigger change than this fix; this trades per-deploy
+# freshness for closing the unconditional escalation.
+#
+# Operational contract: provisioning-logic changes (systemd unit, Caddy,
+# sudoers, apex route) require a root-authenticated run of --bootstrap or
+# --upgrade; deploys that only run --provision will NOT apply them. deploy.yml
+# runs an advisory (unauthenticated, non-fatal) sha256sum comparison against
+# the shipped install.sh so that staleness is visible rather than silent.
+install_provision_script() {
+  info "Installing root-owned provisioning script to $PROVISION_BIN..."
+  install -d -o root -g root -m 0755 "$(dirname "$PROVISION_BIN")"
+  install -o root -g root -m 0755 "$SELF" "$PROVISION_BIN"
+}
+
 # ── sudoers: let drop user start/stop the service (needed for CI deploy) ─────
 write_sudoers() {
   local f="/etc/sudoers.d/${DROP_USER}-deploy"
+  local tmp
+  tmp="$(mktemp)"
   info "Writing sudoers rule for $DROP_USER..."
-  rm -f "$f"
-  echo "${DROP_USER} ALL=(ALL) NOPASSWD: /bin/systemctl stop ${SERVICE_NAME}"    >> "$f"
-  echo "${DROP_USER} ALL=(ALL) NOPASSWD: /bin/systemctl start ${SERVICE_NAME}"   >> "$f"
-  echo "${DROP_USER} ALL=(ALL) NOPASSWD: /bin/systemctl restart ${SERVICE_NAME}" >> "$f"
-  echo "${DROP_USER} ALL=(ALL) NOPASSWD: /bin/systemctl status ${SERVICE_NAME}"  >> "$f"
-  # Let the CI deploy re-apply system provisioning (Caddy, unit, env, apex route)
-  # by running install.sh in --provision mode as root. This is what lets infra
-  # changes in install.sh land on the server via a normal git-push deploy.
-  echo "${DROP_USER} ALL=(ALL) NOPASSWD: /usr/bin/bash ${INSTALL_DIR}/install.sh --provision" >> "$f"
-  chmod 440 "$f"
-  visudo -c -f "$f" || error "sudoers syntax error — check $f"
+  {
+    echo "${DROP_USER} ALL=(ALL) NOPASSWD: /bin/systemctl stop ${SERVICE_NAME}"
+    echo "${DROP_USER} ALL=(ALL) NOPASSWD: /bin/systemctl start ${SERVICE_NAME}"
+    echo "${DROP_USER} ALL=(ALL) NOPASSWD: /bin/systemctl restart ${SERVICE_NAME}"
+    echo "${DROP_USER} ALL=(ALL) NOPASSWD: /bin/systemctl status ${SERVICE_NAME}"
+    # Let the CI deploy re-apply system provisioning (Caddy, unit, env, apex
+    # route) by running the root-owned provisioning script — see
+    # install_provision_script above for why it's a copy at $PROVISION_BIN
+    # rather than $INSTALL_DIR/install.sh. Until that copy exists, fall back to
+    # the legacy in-place rule so an already-bootstrapped box's very next
+    # deploy can still provision itself long enough to seed it (see the
+    # migration guard in provision_system) — otherwise every future deploy on
+    # that box would have no working --provision path at all.
+    if [[ -x "$PROVISION_BIN" ]]; then
+      echo "${DROP_USER} ALL=(ALL) NOPASSWD: ${PROVISION_BIN} --provision"
+    else
+      echo "${DROP_USER} ALL=(ALL) NOPASSWD: /usr/bin/bash ${INSTALL_DIR}/install.sh --provision"
+    fi
+  } > "$tmp"
+  # Validate before this ever becomes the live file — a malformed rule here
+  # would otherwise briefly lock out provisioning (and, for the systemctl
+  # lines, the CI deploy's stop/start/restart too).
+  if ! visudo -c -f "$tmp"; then
+    rm -f "$tmp"
+    error "sudoers syntax error — check the generated rule"
+  fi
+  install -o root -g root -m 0440 "$tmp" "$f"
+  rm -f "$tmp"
 }
 
 # ── code: clone or pull ──────────────────────────────────────────────────────
@@ -453,15 +529,29 @@ EOF
 }
 
 # ── system provisioning (root-level, no code build) ──────────────────────────
-# Idempotent. Re-run on every deploy via `install.sh --provision` so that infra
-# changes in this script (Caddy, the systemd unit, the apex route) land on the
-# server without a manual install. Code itself is shipped as a prebuilt artifact.
+# Idempotent. Re-run on every deploy via `install.sh --provision` (through
+# $PROVISION_BIN, see install_provision_script) so that infra changes in this
+# script (Caddy, the systemd unit, the apex route) land on the server without
+# a manual install. Code itself is shipped as a prebuilt artifact. Note this
+# only picks up provisioning-logic changes as of the last --bootstrap/
+# --upgrade/install — a deploy that only ever runs --provision re-applies
+# whatever was last installed into $PROVISION_BIN, not necessarily this
+# deploy's install.sh (DROP-071 trade-off, see install_provision_script).
 provision_system() {
   ensure_root_dir
   ensure_caddy
   ensure_removeipc_off
   write_env_config
   write_service      # (re)writes the unit + daemon-reload + enable
+  # DROP-071 migration only: seed $PROVISION_BIN if it's missing. This is what
+  # lets a box still running the pre-DROP-071 sudoers rule (which targets
+  # $INSTALL_DIR/install.sh directly) converge the very first time --provision
+  # runs after the fix ships — see write_sudoers for the rule this feeds. It
+  # never overwrites an existing copy, so it can't become a self-refresh path:
+  # once $PROVISION_BIN exists, a drop-level actor invoking --provision has no
+  # way to change what's in it (root-owned dir, drop can't write or unlink).
+  # Ongoing refreshes only happen on --bootstrap/--upgrade/install, below.
+  [[ -x "$PROVISION_BIN" ]] || install_provision_script
   write_sudoers
   ensure_apex_route
 }
@@ -485,6 +575,10 @@ if $BOOTSTRAP; then
   info "Preparing install directory $INSTALL_DIR for CI deploys..."
   mkdir -p "$INSTALL_DIR"
   chown "$DROP_USER:$DROP_USER" "$INSTALL_DIR"
+  # Seed the root-owned provisioning script from this real root session —
+  # never from the drop-reachable --provision sudoers rule. See
+  # install_provision_script for why.
+  install_provision_script
   provision_system        # Caddy, env, systemd unit (enabled, NOT started), sudoers, apex
   echo ""
   info "Bootstrap complete — box provisioned; $SERVICE_NAME installed but not yet started."
@@ -522,6 +616,10 @@ elif $UPGRADE; then
   info "Upgrading DROP..."
   fetch_code
   build_drop
+  # Refresh the root-owned provisioning script from the code this real root
+  # session just pulled — this (not --provision) is how provisioning-logic
+  # changes reach an already-bootstrapped box. See install_provision_script.
+  install_provision_script
   provision_system
   info "Restarting $SERVICE_NAME..."
   systemctl restart "$SERVICE_NAME"
@@ -536,6 +634,7 @@ else
   ensure_root_dir
   fetch_code
   build_drop
+  install_provision_script
   provision_system
   systemctl start "$SERVICE_NAME"
   echo ""

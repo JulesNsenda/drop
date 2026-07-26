@@ -128,14 +128,60 @@ jobs:
             rm -f /tmp/drop-dist.tar.gz
             # Re-apply system provisioning (Caddy, systemd unit, env, apex route)
             # so infra changes in install.sh land on the server. This also
-            # restarts the service. Until the server has been provisioned once
-            # (which installs the NOPASSWD rule for this command), fall back to a
-            # plain restart so the deploy still ships the new code.
-            if sudo -n /usr/bin/bash /opt/drop/install.sh --provision; then
+            # restarts the service.
+            #
+            # Preferred target is the root-owned /usr/local/sbin/drop-provision
+            # (DROP-071) — a copy of install.sh outside /opt/drop, which is
+            # chown'd to the drop user and therefore not something root should
+            # ever be sudo'd into running directly. The middle arm is legacy:
+            # a box bootstrapped before DROP-071 only has a sudoers rule for
+            # /opt/drop/install.sh directly, and running --provision through
+            # it (the new install.sh code, just untarred above) is what seeds
+            # /usr/local/sbin/drop-provision and rewrites the sudoers rule to
+            # point at it — so the very next deploy takes the first branch.
+            # Until the server has been provisioned at least once (either
+            # way), fall back to a plain restart so the deploy still ships the
+            # new code.
+            if sudo -n /usr/local/sbin/drop-provision --provision; then
               echo "System provisioning applied"
+            elif sudo -n /usr/bin/bash /opt/drop/install.sh --provision; then
+              echo "System provisioning applied (legacy sudoers rule — server will use /usr/local/sbin/drop-provision from the next deploy)"
             else
               echo "::warning::Provisioning unavailable — falling back to restart. Bootstrap install.sh on the server to enable self-provisioning."
               sudo systemctl restart drop-platform
+            fi
+            # Staleness check (DROP-071 follow-up): --provision alone only
+            # re-applies whatever provisioning logic was last installed into
+            # /usr/local/sbin/drop-provision — see install.sh's
+            # install_provision_script for why. Compare it against the
+            # install.sh just untarred above so an infra change (systemd
+            # unit, Caddy setup, sudoers, apex route) that shipped in THIS
+            # deploy but silently did not take effect is visible, instead of
+            # the box quietly diverging from what the repo says it should be.
+            #
+            # This is a DETECTION AID ONLY, deliberately unauthenticated — a
+            # plain sha256sum comparison, no secret involved. It proves
+            # nothing about trust: an actor who could forge one side of it
+            # could already do worse (see install.sh's trust-chain comment).
+            # Never read a match here as "the box is provisioned correctly"
+            # or build any authorization decision on it.
+            #
+            # --bootstrap (not --upgrade) is the correct remediation on this
+            # deployment model: /opt/drop is populated by this tarball
+            # extraction, not a git clone, so --upgrade's `git -C /opt/drop
+            # fetch` would fail outright (no .git here). --bootstrap re-runs
+            # provisioning idempotently against whatever install.sh already
+            # sits in /opt/drop, without needing a git checkout.
+            #
+            # Deliberately non-fatal: a stale-but-working box is not an
+            # outage, and failing the deploy here would block shipping
+            # application code over an unrelated infra drift.
+            if [ -x /usr/local/sbin/drop-provision ]; then
+              SHIPPED_HASH=$(sha256sum /opt/drop/install.sh | cut -d" " -f1)
+              INSTALLED_HASH=$(sha256sum /usr/local/sbin/drop-provision | cut -d" " -f1)
+              if [ "$SHIPPED_HASH" != "$INSTALLED_HASH" ]; then
+                echo "::warning::/opt/drop/install.sh differs from /usr/local/sbin/drop-provision — provisioning changes in this deploy (systemd unit, Caddy, sudoers, apex route) have NOT been applied. Run on the server: sudo bash /opt/drop/install.sh --bootstrap"
+              fi
             fi
             # Verify the service actually came back up before calling it a
             # success. Probe /health/live, which is unconditionally 200 when the
