@@ -123,7 +123,12 @@ auth.post('/login', async (c) => {
 
 // POST /auth/api-keys - Create a new API key (admin only)
 auth.post('/api-keys', authMiddleware('admin'), async (c) => {
-  const body = await c.req.json<{ name: string; role?: 'admin' | 'user' | 'readonly'; expiresInDays?: number }>();
+  const body = await c.req.json<{
+    name: string;
+    role?: 'admin' | 'user' | 'readonly';
+    expiresInDays?: number;
+    ownerUserId?: string;
+  }>();
 
   const name = typeof body.name === 'string' ? body.name.trim() : body.name;
   if (!name) {
@@ -148,7 +153,27 @@ auth.post('/api-keys', authMiddleware('admin'), async (c) => {
     throw new ValidationError('expiresInDays must be an integer between 1 and 3650');
   }
 
-  const { key, apiKey } = await createApiKey(name, body.role || 'user', body.expiresInDays);
+  // Who the key acts for. Explicit `ownerUserId` wins; otherwise the key is
+  // attributed to the admin creating it. Never left unset: a key with no owner
+  // is a principal no human can log in as, so the apps it creates are visible
+  // to nobody but an admin and count against no user's quota.
+  const callerAuth = (c.get as (k: string) => AuthContext | undefined)('auth');
+  let ownerUserId = callerAuth?.userId;
+
+  if (body.ownerUserId !== undefined) {
+    if (typeof body.ownerUserId !== 'string' || !getUserById(body.ownerUserId)) {
+      throw new ValidationError('ownerUserId must reference an existing user');
+    }
+    ownerUserId = body.ownerUserId;
+  }
+
+  const { key, apiKey } = await createApiKey(
+    name,
+    body.role || 'user',
+    body.expiresInDays,
+    undefined,
+    ownerUserId
+  );
 
   return c.json(
     success({
@@ -159,6 +184,7 @@ auth.post('/api-keys', authMiddleware('admin'), async (c) => {
       role: apiKey.role,
       createdAt: apiKey.createdAt,
       expiresAt: apiKey.expiresAt,
+      ownerUserId: apiKey.ownerUserId,
     }),
     201
   );
