@@ -346,10 +346,34 @@ Certificates are fetched on first request to each hostname (a few seconds).
 ### How config persists across deploys
 
 Domain/HTTPS settings live in `/etc/drop/drop.env`, which the systemd unit reads
-on every start — so a normal `git push` deploy keeps them. The deploy also runs
-`install.sh --provision` on the server, so **infra changes in `install.sh`
-(Caddy, the systemd unit, the apex route) are applied automatically** on each
-deploy; you don't need to re-run the installer by hand after the first time.
+on every start — so a normal `git push` deploy keeps them.
+
+> **Provisioning changes are NOT applied automatically (DROP-071).** The deploy
+> runs the *root-owned* `/usr/local/sbin/drop-provision`, not `/opt/drop/install.sh`
+> — because `/opt/drop` is owned by the `drop` user, and letting root execute a
+> file that user can rewrite was an unconditional privilege escalation. That
+> root-owned copy is only refreshed by a root-authenticated run
+> (`--bootstrap`/`--upgrade`/a fresh install), so **a change to `install.sh`'s
+> infra logic (Caddy, the systemd unit, sudoers, the apex route) ships in the
+> repo and does not reach the box until you re-run the installer as root.**
+>
+> The deploy compares the shipped `install.sh` against the installed copy and
+> emits a GitHub `::warning::` when they differ, so this is visible rather than
+> silent. To apply, copy a **trusted** `install.sh` to the box and run it as
+> root — do not run `/opt/drop/install.sh`, which the `drop` user can write:
+>
+> ```bash
+> scp install.sh root@<host>:/tmp/
+> ssh root@<host> 'bash /tmp/install.sh --bootstrap'
+> ```
+>
+> `--bootstrap` (not `--upgrade`): `/opt/drop` here is populated by the CI
+> tarball, not a git clone, so `--upgrade`'s `git fetch` would fail.
+>
+> Scope note: on a `DROP_ISOLATION=docker` box the `drop` user is in the
+> `docker` group, which is root-equivalent on its own, so this hardening is
+> defence-in-depth there. It is a real privilege boundary under
+> `DROP_ISOLATION=none`, where deployed apps run as that same user.
 
 To change config later, either re-run the installer with new flags, or edit
 `/etc/drop/drop.env` directly and `sudo systemctl restart drop-platform`.
