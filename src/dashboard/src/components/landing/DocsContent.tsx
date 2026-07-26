@@ -480,9 +480,13 @@ cp -r my-app /var/drop/data/webapps/`}
         </p>
         <p style={pStyle}>
           Everything here also works from the{' '}
-          <Link to="/apps" style={linkStyle}>
+          {/* The dashboard lives in a separate bundle at /dashboard/apps
+              (DROP-070) — a react-router Link here would resolve within this
+              site's own router (no /apps route, no basename) instead of
+              crossing bundles, so this is a plain cross-origin-looking href. */}
+          <a href="/dashboard/apps" style={linkStyle}>
             dashboard
-          </Link>{' '}
+          </a>{' '}
           or the CLI — see the{' '}
           <Link to="/reference" style={linkStyle}>
             CLI &amp; API reference

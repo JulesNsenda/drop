@@ -1,0 +1,16 @@
+/*
+ * CSS reset for the marketing site bundle (DROP-070). The admin dashboard
+ * gets this reset for free via `index.css`'s `@tailwind base` (Tailwind's
+ * "preflight" — `body { margin: 0 }`, universal `box-sizing: border-box`,
+ * `list-style: none` on `ul`/`ol`, heading margins/sizes reset to `inherit`,
+ * etc.), which the landing/docs/reference pages were authored against when
+ * they still shipped inside that bundle. The site entry (site-main.tsx)
+ * intentionally does NOT import the rest of `index.css` — that also pulls
+ * in Tailwind's JIT-generated utility classes and the `body { @apply
+ * bg-gray-50 ... }` rule, scanned across the *entire* `src/` tree
+ * (tailwind.config.js `content` isn't scoped per bundle), which would bloat
+ * this bundle with dashboard-only utilities. `@tailwind base` alone is the
+ * fixed preflight ruleset, independent of that content scan.
+ */
+
+@tailwind base;

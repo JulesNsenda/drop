@@ -43,6 +43,17 @@ jobs:
         working-directory: src/dashboard
         run: npm run build
 
+      - name: Build site
+        working-directory: src/dashboard
+        run: npm run build:site
+
+      - name: Verify site build output
+        run: |
+          if [ ! -f dist/site/index.html ]; then
+            echo "::error::dist/site/index.html missing after build:site — the marketing site would ship with no frontend" >&2
+            exit 1
+          fi
+
       - name: Package artifact
         run: |
           tar -czf drop-dist.tar.gz dist/ install.sh package.json package-lock.json

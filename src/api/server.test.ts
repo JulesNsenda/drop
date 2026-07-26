@@ -5,7 +5,7 @@
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import * as os from 'os';
-import { ApiServer, createApiServer } from './server';
+import { ApiServer, createApiServer, isPathContained } from './server';
 
 interface ApiResponse<T = unknown> {
   success: boolean;
@@ -105,12 +105,21 @@ describe('ApiServer', () => {
       const app = server.getApp();
       const res = await app.request('/');
 
-      // Root endpoint either redirects to dashboard (302) or returns API info (200)
-      expect([200, 302]).toContain(res.status);
-      if (res.status === 200) {
+      // DROP-070: the root no longer redirects to /dashboard (never 302) —
+      // it serves the marketing site bundle directly when dist/site has been
+      // built, or falls back to API-info JSON otherwise. Tolerant of both,
+      // same as the pre-DROP-070 test was tolerant of [200, 302]: whether
+      // dist/site exists depends on local build state (CI always runs tests
+      // before building the frontend, but a dev running `npm test` after
+      // `npm run build` will see the built branch).
+      expect(res.status).toBe(200);
+      const contentType = res.headers.get('content-type') || '';
+      if (contentType.includes('application/json')) {
         const data = (await res.json()) as RootResponse;
         expect(data.name).toBe('DROP API');
         expect(data.version).toBe('1.0.0');
+      } else {
+        expect(contentType).toContain('text/html');
       }
     });
 
@@ -134,6 +143,145 @@ describe('ApiServer', () => {
       expect(res.status).toBe(404);
       const data = (await res.json()) as ApiResponse;
       expect(data.success).toBe(false);
+    });
+  });
+
+  describe('marketing site split (DROP-070)', () => {
+    describe('isPathContained', () => {
+      const base = path.join('dist', 'site');
+
+      it('accepts the base directory itself and paths inside it', () => {
+        expect(isPathContained(base, base)).toBe(true);
+        expect(isPathContained(base, path.join(base, 'assets', 'index.js'))).toBe(true);
+      });
+
+      it('rejects a sibling directory that merely shares a string prefix', () => {
+        // The bug this replaces: `startsWith(base)` with no trailing
+        // separator accepts `dist/site-backup` because the raw STRING
+        // "dist/site-backup" starts with "dist/site". A real HTTP request
+        // can't exercise this directly — the URL layer normalizes `..`/
+        // encoded-dot traversal before a route handler ever sees it — so
+        // this is tested at the predicate level instead.
+        const sibling = path.join('dist', 'site-backup', 'secret.txt');
+        expect(isPathContained(base, sibling)).toBe(false);
+      });
+
+      it('rejects a `..` escape out of the base directory', () => {
+        const escaped = path.join(base, '..', '..', 'etc', 'passwd');
+        expect(isPathContained(base, escaped)).toBe(false);
+      });
+    });
+
+    describe('serving / (real dist/site fixture)', () => {
+      // No dist/site build exists in this checkout (dist/ is gitignored and
+      // the frontend isn't built before `npm test` runs, matching CI's
+      // build-then-test-then-build-frontend order in deploy.yml). ApiServer's
+      // site path is a fixed, non-configurable location, so exercising the
+      // "site exists" branch means writing a real fixture there — spying on
+      // node:fs's own exports throws ("Cannot redefine property"), and this
+      // matches the file's existing real-tempdir-over-mocking style. Backs up
+      // and restores anything already at dist/site so this can't clobber a
+      // real local build.
+      const siteDir = path.join(__dirname, '..', '..', 'dist', 'site');
+      const siteIndexPath = path.join(siteDir, 'index.html');
+      let backupDir: string | null = null;
+
+      beforeEach(async () => {
+        const preexisting = await fs
+          .access(siteDir)
+          .then(() => true)
+          .catch(() => false);
+        if (preexisting) {
+          backupDir = await fs.mkdtemp(path.join(os.tmpdir(), 'drop-dist-site-backup-'));
+          await fs.cp(siteDir, backupDir, { recursive: true });
+          await fs.rm(siteDir, { recursive: true, force: true });
+        }
+        await fs.mkdir(siteDir, { recursive: true });
+        await fs.writeFile(siteIndexPath, '<html><body>SITE-SHELL</body></html>', 'utf-8');
+      });
+
+      afterEach(async () => {
+        await fs.rm(siteDir, { recursive: true, force: true });
+        if (backupDir) {
+          await fs.cp(backupDir, siteDir, { recursive: true });
+          await fs.rm(backupDir, { recursive: true, force: true });
+          backupDir = null;
+        }
+      });
+
+      it('serves the site bundle at /, /docs, and /reference when dist/site exists', async () => {
+        server = new ApiServer({ port: 3006, enableAuth: false });
+        await server.initialize();
+        const app = server.getApp();
+
+        for (const route of ['/', '/docs', '/reference']) {
+          const res = await app.request(route);
+          expect(res.status).toBe(200);
+          expect(res.headers.get('content-type') || '').toContain('text/html');
+          expect(await res.text()).toContain('SITE-SHELL');
+        }
+      });
+    });
+
+    describe('/dashboard still serves', () => {
+      it('serves 200 HTML at /dashboard (checked-in src/dashboard/index.html, no build required)', async () => {
+        server = new ApiServer({ port: 3007, enableAuth: false });
+        await server.initialize();
+        const app = server.getApp();
+        const res = await app.request('/dashboard');
+
+        expect(res.status).toBe(200);
+        expect(res.headers.get('content-type') || '').toContain('text/html');
+      });
+    });
+
+    describe('301 redirects for the moved public URLs', () => {
+      beforeEach(async () => {
+        server = new ApiServer({ port: 3008, enableAuth: false });
+        await server.initialize();
+      });
+
+      it('redirects /dashboard/docs to /docs', async () => {
+        const app = server.getApp();
+        const res = await app.request('/dashboard/docs', { redirect: 'manual' });
+
+        expect(res.status).toBe(301);
+        expect(res.headers.get('location')).toBe('/docs');
+      });
+
+      it('redirects /dashboard/reference to /reference', async () => {
+        const app = server.getApp();
+        const res = await app.request('/dashboard/reference', { redirect: 'manual' });
+
+        expect(res.status).toBe(301);
+        expect(res.headers.get('location')).toBe('/reference');
+      });
+    });
+
+    describe('no bare catch-all at the root', () => {
+      beforeEach(async () => {
+        server = new ApiServer({ port: 3009, enableAuth: false });
+        await server.initialize();
+      });
+
+      it('does not let a root catch-all swallow /.well-known/oauth-protected-resource', async () => {
+        const app = server.getApp();
+        const res = await app.request('/.well-known/oauth-protected-resource');
+
+        // No DROP_PUBLIC_URL is configured on this test server, so the
+        // well-known handler itself 404s — the point is this is a JSON 404
+        // from the registered well-known route, never a 200 HTML shell from
+        // a root catch-all that would otherwise shadow it.
+        expect(res.status).toBe(404);
+        expect(res.headers.get('content-type') || '').not.toContain('text/html');
+      });
+
+      it('does not let a root catch-all swallow /api/v1/health', async () => {
+        const app = server.getApp();
+        const res = await app.request('/api/v1/health');
+
+        expect(res.headers.get('content-type') || '').not.toContain('text/html');
+      });
     });
   });
 

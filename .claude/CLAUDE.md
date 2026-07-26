@@ -15,9 +15,10 @@ The platform itself is a long-running Node.js service (`drop serve`) that runs a
 ```bash
 # Development
 npm run dev              # Start platform with ts-node (src/index.ts)
-npm run build            # Compile TS (tsc) AND build the dashboard (Vite)
-npm run build:server     # Compile TS only — skips the dashboard build
-npm run build:dashboard  # Build only the React dashboard (cd src/dashboard && vite build)
+npm run build            # Compile TS (tsc) AND build the dashboard + public site (Vite, both configs)
+npm run build:server     # Compile TS only — skips the dashboard/site builds
+npm run build:dashboard  # Build only the React admin dashboard (cd src/dashboard && vite build)
+npm run build:site       # Build only the public marketing/docs/reference site (cd src/dashboard && vite build --config vite.site.config.ts)
 npm run build:watch      # tsc --watch (server only)
 npm start                # Run compiled dist/index.js
 
@@ -43,7 +44,7 @@ drop deploy <path>       # Deploy from a path (--name, --port)
 drop start|stop|restart|remove <app>
 ```
 
-**Building gotcha**: `npm run build` invokes the dashboard build, which requires its own deps. Run `cd src/dashboard && npm install` once first, or use `npm run build:server` when you only changed backend code.
+**Building gotcha**: `npm run build` invokes both frontend builds — the admin dashboard AND the public site (DROP-070: one `src/dashboard` npm package, two Vite configs/entry points — `vite.config.ts` for `/dashboard`, `vite.site.config.ts` for `/`, `/docs`, `/reference` — not two packages). Both require the same `src/dashboard` deps. Run `cd src/dashboard && npm install` once first, or use `npm run build:server` when you only changed backend code. If you only changed frontend code, `npm run build:dashboard` / `npm run build:site` build just one side; a change under `src/dashboard/src/components/landing/`, `src/dashboard/src/pages/{Landing,Docs,Reference}Page.tsx`, `src/dashboard/src/{SiteApp,site-main}.tsx`, or `src/dashboard/src/styles/{landing,tokens,site-reset}.css` needs `build:site`, not `build:dashboard`.
 
 **Testing note**: `jose` (used for JWT) is mocked in tests via `src/__mocks__/jose.ts` (wired through `jest.config.js` `moduleNameMapper`). Tests run on `ts-jest` against `src/**/*.test.ts`.
 

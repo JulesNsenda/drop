@@ -6,92 +6,24 @@
  * scoped under `.drop-ui` so it never collides with the existing Tailwind
  * `drop-*` palette or unscoped global styles.
  *
- * Theming is driven off the same `html.dark` class owned by useTheme() —
- * not a parallel signal. Light values are the base (matches the repo's
- * light-is-base convention); `html.dark .drop-ui` supplies the dark
- * palette.
+ * The shared palette (background/text/accent/font tokens) lives in
+ * tokens.css, imported below — identical to landing.css's `.drop-landing`
+ * palette (DROP-070), so it's defined once rather than duplicated. Only the
+ * `--err` token (unused by the marketing site) stays here.
  *
  * Per PRD-045 §2.1, `.drop-ui` must be applied on BOTH layout shells
  * (`AppShell` and `AuthLayout`), not a common ancestor above the route
  * split — see those components for where the scope is applied.
  */
 
+@import './tokens.css';
+
 .drop-ui {
-  /* Light palette (base) */
-  --bg: #fcfdfe;
-  --bg-2: #f3f6fa;
-  --bg-3: #ffffff;
-  --panel: #ffffff;
-  --border: #e4e9f1;
-  --border-2: #d6dde8;
-  --text: #0a101b;
-  --text-2: #4b586c;
-  --text-3: #8996ab;
-  --accent: #0a84e0;
-  --accent-2: #2e9bfe;
-  --accent-ink: #ffffff;
-  --accent-soft: rgba(10, 132, 224, 0.08);
-  --ok: #12a150;
-  --warn: #c77700;
   --err: #d1242f;
-  --grid: rgba(10, 20, 40, 0.05);
-  --elev: 0 1px 2px rgba(16, 24, 40, 0.05), 0 14px 34px rgba(16, 24, 40, 0.08);
-  --btn: 0 8px 24px color-mix(in srgb, var(--accent) 24%, transparent);
-
-  /* Fonts (theme-independent) */
-  --mono: 'JetBrains Mono', ui-monospace, 'SFMono-Regular', Menlo, monospace;
-  --sans: 'Hanken Grotesk', system-ui, -apple-system, 'Segoe UI', sans-serif;
-
-  background: var(--bg);
-  color: var(--text);
-  font-family: var(--sans);
-  line-height: 1.5;
-  -webkit-font-smoothing: antialiased;
 }
 
 html.dark .drop-ui {
-  /* Dark palette */
-  --bg: #090c12;
-  --bg-2: #0e121b;
-  --bg-3: #141926;
-  --panel: #10151f;
-  --border: #212938;
-  --border-2: #2c3547;
-  --text: #eaeef6;
-  --text-2: #98a4b7;
-  --text-3: #5c6880;
-  --accent: #2e9bfe;
-  --accent-2: #66c0ff;
-  --accent-ink: #04121f;
-  --accent-soft: rgba(46, 155, 254, 0.12);
-  --ok: #39d98a;
-  --warn: #febc2e;
   --err: #f85149;
-  --grid: rgba(255, 255, 255, 0.035);
-  --elev: 0 1px 0 rgba(255, 255, 255, 0.04) inset, 0 12px 34px rgba(0, 0, 0, 0.35);
-  --btn: 0 8px 24px color-mix(in srgb, var(--accent) 34%, transparent);
-}
-
-/* Scoped element styling (mirrors `.drop-landing`'s scoped rules) */
-.drop-ui a {
-  color: var(--accent);
-  text-decoration: none;
-}
-.drop-ui a:hover {
-  color: var(--accent-2);
-}
-.drop-ui ::selection {
-  background: var(--accent);
-  color: var(--accent-ink);
-}
-.drop-ui code {
-  font-family: var(--mono);
-  font-size: 0.9em;
-  background: var(--bg-3);
-  border: 1px solid var(--border);
-  border-radius: 5px;
-  padding: 1px 6px;
-  color: var(--text);
 }
 
 /*
