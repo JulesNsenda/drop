@@ -2903,38 +2903,43 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         ? await this.buildLogService.startBuild(appName, buildStartedAt)
         : null;
 
-      // Fresh deploy — nothing is currently serving this app, so a low-disk
-      // abort is a hard failure: throw into the catch below, which marks the
-      // app 'errored' and releases appsInProgress.
-      const disk = await hasEnoughDisk(appPath);
-      if (!disk.ok) {
-        throw new Error(
-          `Insufficient disk space: ${Math.round(disk.freeMb)} MB free, need ${getMinFreeDiskMb()} MB`
-        );
-      }
+      // Everything between startBuild and closeBuildLog must sit in this
+      // try/finally: the disk check below throws on a low-disk box, and that
+      // used to skip finishBuild entirely — leaking the log's write stream and
+      // never running retention for the app.
+      let result;
+      try {
+        // Fresh deploy — nothing is currently serving this app, so a low-disk
+        // abort is a hard failure: throw into the catch below, which marks the
+        // app 'errored' and releases appsInProgress.
+        const disk = await hasEnoughDisk(appPath);
+        if (!disk.ok) {
+          throw new Error(
+            `Insufficient disk space: ${Math.round(disk.freeMb)} MB free, need ${getMinFreeDiskMb()} MB`
+          );
+        }
 
-      const buildEnv = await this.resolveBuildEnv(appPath, appName);
-      const buildOverride = (await parseDropYaml(appPath)).config?.build;
+        const buildEnv = await this.resolveBuildEnv(appPath, appName);
+        const buildOverride = (await parseDropYaml(appPath)).config?.build;
 
-      const result = await this.builder.build({
-        appName,
-        appPath,
-        appType: detection.type,
-        framework: detection.framework || null,
-        config: {
-          buildCommand: buildOverride ?? detection.suggestedConfig?.buildCommand,
-          installCommand: detection.suggestedConfig?.installCommand,
-        },
-        env: buildEnv,
-        workDir,
-        execCommand,
-        onBuildLog: logId && this.buildLogService
-          ? (line) => this.buildLogService!.writeLine(logId, line)
-          : undefined,
-      });
-
-      if (logId && this.buildLogService) {
-        await this.buildLogService.finishBuild(logId, appName);
+        result = await this.builder.build({
+          appName,
+          appPath,
+          appType: detection.type,
+          framework: detection.framework || null,
+          config: {
+            buildCommand: buildOverride ?? detection.suggestedConfig?.buildCommand,
+            installCommand: detection.suggestedConfig?.installCommand,
+          },
+          env: buildEnv,
+          workDir,
+          execCommand,
+          onBuildLog: logId && this.buildLogService
+            ? (line) => this.buildLogService!.writeLine(logId, line)
+            : undefined,
+        });
+      } finally {
+        await this.closeBuildLog(logId, appName);
       }
 
       if (result.success) {
@@ -2980,6 +2985,22 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         });
       }
       this.appsInProgress.delete(appName);
+    }
+  }
+
+  /**
+   * Close a build log stream. Never throws.
+   *
+   * Called from `finally` on both build paths, where a throw would replace the
+   * error actually being propagated with an unrelated logging failure. A no-op
+   * when the build log service is disabled or no log was opened.
+   */
+  private async closeBuildLog(logId: string | null, appName: string): Promise<void> {
+    if (!logId || !this.buildLogService) return;
+    try {
+      await this.buildLogService.finishBuild(logId, appName);
+    } catch (error) {
+      this.logger.warn(`Failed to close build log for ${appName}`, 'BUILD', error);
     }
   }
 
@@ -3604,9 +3625,11 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         });
       } finally {
         this.selfManagedUpdates.delete(appName);
-      }
-      if (updateLogId && this.buildLogService) {
-        await this.buildLogService.finishBuild(updateLogId, appName);
+        // Also in the finally: resolveBuildEnv/parseDropYaml above can throw,
+        // and the close used to sit after this block — so a throw leaked the
+        // log's write stream and skipped retention, exactly as on the fresh
+        // deploy path.
+        await this.closeBuildLog(updateLogId, appName);
       }
 
       if (!buildResult.success) {
