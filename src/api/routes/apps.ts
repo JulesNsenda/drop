@@ -699,6 +699,18 @@ apps.delete('/:name', async c => {
     }
   }
 
+  // Remove the name-keyed artifacts that live outside the app folder (logs,
+  // and DROP_DATA_DIR unless keepData). This route does its own inline
+  // teardown rather than calling platform.teardownApp, so without this the
+  // previous tenant's logs and persistent data survive under a name that is
+  // now free for anyone to re-register. Best-effort — never fails the delete.
+  try {
+    await getPlatformOps()?.purgeAppArtifacts(name, { keepData });
+  } catch {
+    // Platform not wired (direct ApiServer construction in tests) or cleanup
+    // failed; the delete itself has already succeeded.
+  }
+
   // If this app was a monorepo group child and is now the LAST remaining
   // child of its group, also remove the group's CONTAINER folder
   // (webapps/<group>/, holding the root drop.yaml with `services:`) — left

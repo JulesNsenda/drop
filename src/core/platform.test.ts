@@ -2933,6 +2933,33 @@ describe('teardownApp / removeGroup (M4: group lifecycle)', () => {
       );
     });
 
+    it('removes the app data directory, which is also name-keyed', async () => {
+      // DROP_DATA_DIR is data/appdata/<name> — SQLite files, uploads, cached
+      // credentials. Teardown frees the name, so leaving it behind gives the
+      // next registrant read-write access to the previous tenant's data.
+      wireMocks();
+
+      await (platform as any).teardownApp('myapp');
+
+      expect(fsPromises.rm).toHaveBeenCalledWith(
+        path.join(tempDir, 'data', 'appdata', 'myapp'),
+        { recursive: true, force: true }
+      );
+    });
+
+    it('keeps the app data directory when keepData is set', async () => {
+      // Unlike logs, appdata IS the user's data — that is exactly what
+      // keepData protects.
+      wireMocks();
+
+      await (platform as any).teardownApp('myapp', { keepData: true });
+
+      expect(fsPromises.rm).not.toHaveBeenCalledWith(
+        path.join(tempDir, 'data', 'appdata', 'myapp'),
+        expect.anything()
+      );
+    });
+
     it('removes the log directories even when keepData is set', async () => {
       // keepData protects the user's database and Redis. Logs are DROP-generated
       // diagnostics about an app that no longer exists, and keeping them across

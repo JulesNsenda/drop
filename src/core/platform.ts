@@ -1507,6 +1507,7 @@ backup:
       restartApp: (name) => this.restartApp(name),
       isAppInProgress: (name) => this.appsInProgress.has(name),
       removeGroup: (name) => this.removeGroup(name),
+      purgeAppArtifacts: (name, opts) => this.purgeAppArtifacts(name, opts),
     });
 
     this.logger.info(`API server running on port ${this.config.apiPort}`, 'API');
@@ -3988,23 +3989,42 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       // Folder may already be gone
     }
 
-    // Runtime + build logs are keyed on the APP NAME, and teardown frees that
-    // name for anyone to re-register. GET /logs/:name and /logs/:name/build[s]
-    // authorize against the LIVE app and then read by name, so leaving these
-    // behind hands the next owner of the name the previous tenant's stdout,
-    // stderr and build output (npm/pip logs, build_env values, source
-    // fragments). Removed unconditionally — `keepData` guards the app's
-    // database and Redis, which are the user's data; these are DROP-generated
-    // diagnostics about an app that no longer exists.
-    const logDirs = [
+    await this.purgeAppArtifacts(name, opts);
+  }
+
+  /**
+   * Remove the name-keyed artifacts that live OUTSIDE the app folder.
+   *
+   * Deleting an app frees its name, and all three of these are addressed by
+   * name, so leaving them behind hands the next registrant the previous
+   * tenant's data:
+   *  - `data/logs/webapps/<name>/` and `data/logs/builds/<name>/` —
+   *    `/logs/:name` and `/logs/:name/build[s]` authorize against the LIVE app
+   *    and then read by name (npm/pip output, `build_env` values, source
+   *    fragments, app stdout/stderr).
+   *  - `data/appdata/<name>/` — the app's `DROP_DATA_DIR`: SQLite files,
+   *    uploads, cached credentials, read-write to whoever gets the name next.
+   *
+   * Logs go unconditionally: `keepData` protects the user's DATA (database,
+   * Redis, and appdata), whereas logs are DROP-generated diagnostics about an
+   * app that no longer exists.
+   *
+   * Shared with `DELETE /apps/:name` through the platform-ops seam — that
+   * route runs its own inline teardown rather than calling `teardownApp`
+   * (which only `removeGroup` uses), so a fix applied here alone would miss
+   * essentially every real deletion. Best-effort; never throws.
+   */
+  async purgeAppArtifacts(name: string, opts: { keepData?: boolean } = {}): Promise<void> {
+    const targets = [
       path.join(this.config.dropRoot, 'data', 'logs', 'webapps', name),
       path.join(this.config.dropRoot, 'data', 'logs', 'builds', name),
+      ...(opts.keepData ? [] : [path.join(this.config.dropRoot, 'data', 'appdata', name)]),
     ];
-    for (const dir of logDirs) {
+    for (const dir of targets) {
       try {
         await fs.rm(dir, { recursive: true, force: true });
       } catch (error) {
-        this.logger.warn(`Failed to remove log directory ${dir}`, 'LOGS', error);
+        this.logger.warn(`Failed to remove ${dir}`, 'CLEANUP', error);
       }
     }
   }
