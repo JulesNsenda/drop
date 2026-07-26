@@ -271,8 +271,9 @@ export class RouterService {
       return;
     }
 
+    let response: Response;
     try {
-      const response = await fetch(`http://${this.config.caddy.adminApi}/load`, {
+      response = await fetch(`http://${this.config.caddy.adminApi}/load`, {
         method: 'POST',
         headers: {
           'Content-Type': 'text/caddyfile',
@@ -283,15 +284,40 @@ export class RouterService {
         },
         body: await fs.readFile(this.config.caddy.caddyfilePath, 'utf-8'),
       });
-
-      if (!response.ok) {
-        const error = await response.text();
-        throw new Error(`Caddy reload failed: ${error}`);
-      }
     } catch {
-      // Caddy might not be running - silently ignore
-      // Apps are still accessible directly via their ports
+      // Transport-level failure — Caddy isn't running, or the admin endpoint
+      // is unreachable. Benign and expected (dev boxes, pre-start ordering);
+      // apps remain reachable directly on their ports. Stay quiet.
+      return;
     }
+
+    if (response.ok) {
+      return;
+    }
+
+    // Caddy is RUNNING and REJECTED the config. This is categorically
+    // different from "not running" and used to be swallowed by the same catch:
+    // the fleet silently kept serving the last good in-memory config while the
+    // rejected file stayed on disk as the boot config (caddy-server starts with
+    // `--config <caddyfilePath>`), so the next restart lost every route with no
+    // prior warning. One malformed per-app block breaks routing for ALL apps,
+    // so this must be loud.
+    let detail = '';
+    try {
+      detail = (await response.text()).slice(0, 500);
+    } catch {
+      // Body unreadable — the status alone is the signal.
+    }
+
+    const message =
+      `Caddy rejected the generated config (HTTP ${response.status}). Routing is UNCHANGED ` +
+      `and this file will fail at next Caddy start: ${this.config.caddy.caddyfilePath}. ${detail}`;
+
+    console.error(`[router] ${message}`);
+    eventBus.publish('platform:error', {
+      error: new Error(message),
+      context: 'caddy-reload',
+    });
   }
 
   /**
