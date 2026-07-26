@@ -47,6 +47,7 @@ import adminRoutes from './routes/admin';
 import usageRoutes from './routes/usage';
 import oauthRoutes from './routes/oauth';
 import { handleMcpRequest, methodNotAllowed } from './mcp/transport';
+import { getPlatformVersion } from '../utils/version';
 
 /** Matches POST /api/v1/apps/:name/source — the upload-deploy endpoint (PRD-039). */
 const UPLOAD_SOURCE_PATH_RE = /^\/api\/v1\/apps\/[A-Za-z0-9_-]+\/source$/;
@@ -528,7 +529,7 @@ export class ApiServer {
       this.app.get('/', c => {
         return c.json({
           name: 'DROP API',
-          version: '1.0.0',
+          version: getPlatformVersion(),
           docs: '/api/v1',
           auth: this.config.enableAuth ? 'enabled' : 'disabled',
         });
