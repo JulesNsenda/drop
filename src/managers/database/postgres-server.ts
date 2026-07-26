@@ -47,6 +47,14 @@ const HEALTH_CHECK_INTERVAL_MS = 1000;
  * in it. This is what the data directory (0700, container uid == owner) could
  * never give a DIFFERENT uid without opening it up to every other app's raw
  * database files too.
+ *
+ * These bits are NOT the control under a uid collision. `useradd` commonly
+ * lands the DROP service user on uid 1000 and IMAGE_USERS runs nodejs/python/go
+ * containers as uid 1000 too; on such a box the container IS the directory
+ * owner and gets rwx. What stops it unlinking `.s.PGSQL.<port>` and planting
+ * its own socket to proxy every other app's SCRAM handshake is `ReadOnly: true`
+ * on the bind mount (container-manager.ts), which is pinned by a test. Treat
+ * that flag as load-bearing security, not a detail.
  */
 const SOCKET_DIR_MODE = 0o711;
 
@@ -59,6 +67,12 @@ export class PostgresServer {
   private status: ServerStatus = 'stopped';
   private pool: Pool | null = null;
   private superuserPassword: string | null = null;
+  /**
+   * Socket directory of the postmaster we are actually talking to, resolved
+   * from its own postmaster.pid rather than assumed from config (DROP-072
+   * review item 1). Null until a server is started or adopted.
+   */
+  private activeSocketDir: string | null = null;
 
   constructor(config: PostgresServerConfig) {
     this.config = config;
@@ -91,7 +105,57 @@ export class PostgresServer {
    */
   getSocketDir(): string | null {
     if (process.platform === 'win32' || !this.paths) return null;
-    return this.paths.socketDir;
+    // activeSocketDir is set from the RUNNING postmaster (see resolveActiveSocketDir).
+    // Returning the configured path unconditionally is how an adopted server —
+    // one that outlived an ungraceful platform exit and still binds the OLD
+    // -k — hands every app a DATABASE_URL pointing at an empty directory.
+    return this.activeSocketDir ?? this.paths.socketDir;
+  }
+
+  /**
+   * Resolve the socket directory of the postmaster we are actually connected
+   * to, and fail closed if it does not hold a socket (DROP-072 review item 1).
+   *
+   * `pg_ctl` daemonises Postgres, so a postmaster outlives any ungraceful exit
+   * of this process (SIGKILL, OOM). `isServerRunning()` probes TCP, finds it,
+   * and `start()` adopts it WITHOUT restarting — so it keeps whatever `-k` it
+   * was launched with, which after an upgrade is the old data directory. If we
+   * then advertised the configured socketDir, every docker app would be handed
+   * a DATABASE_URL pointing at an empty directory, and the runtimeSpecFingerprint
+   * would force the whole fleet to redeploy into that broken config in one pass
+   * while the platform logged success.
+   *
+   * postmaster.pid is authoritative: line 5 (index 4) is the socket directory
+   * of the running server. Prefer it, verify a socket is really there, and
+   * throw otherwise — a platform that refuses to start is recoverable; a silent
+   * fleet-wide database outage is not.
+   */
+  private async resolveActiveSocketDir(): Promise<void> {
+    if (process.platform === 'win32' || !this.paths) return;
+
+    let dir = this.paths.socketDir;
+    try {
+      const pidFile = await fs.readFile(path.join(this.paths.dataDir, 'postmaster.pid'), 'utf-8');
+      const recorded = pidFile.split('\n')[4]?.trim();
+      if (recorded) dir = recorded;
+    } catch {
+      // No/unreadable postmaster.pid — fall back to the configured dir and let
+      // the socket check below be the arbiter.
+    }
+
+    const socketPath = path.join(dir, `.s.PGSQL.${this.port}`);
+    try {
+      await fs.access(socketPath);
+    } catch {
+      throw new Error(
+        `PostgreSQL is running but its unix socket is not at ${socketPath}. ` +
+          `This usually means a postmaster survived an ungraceful shutdown and is ` +
+          `still bound to its original socket directory. Stop it (pg_ctl stop -D ` +
+          `${this.paths.dataDir}) and restart the platform so it rebinds.`
+      );
+    }
+
+    this.activeSocketDir = dir;
   }
 
   /** Pool config for a superuser connection to the given database. */
@@ -192,6 +256,11 @@ export class PostgresServer {
     // Check if PostgreSQL is already running (from previous session)
     if (await this.isServerRunning()) {
       this.log('PostgreSQL is already running');
+      // Adopted, not started by us — it keeps whatever -k it was launched with,
+      // so resolve the socket dir from ITS postmaster.pid and fail closed if
+      // there is no socket there. See resolveActiveSocketDir.
+      await this.resolveActiveSocketDir();
+      this.log(`PostgreSQL socket directory: ${this.activeSocketDir}`);
       this.status = 'running';
       await this.initializePool();
       await this.secureSuperuser();
@@ -205,6 +274,9 @@ export class PostgresServer {
     try {
       await this.startServer();
       await this.waitForStartup();
+      // Same check on the path we DID start: confirms -k actually took effect
+      // before any app is handed a DATABASE_URL built from it.
+      await this.resolveActiveSocketDir();
       await this.initializePool();
       await this.secureSuperuser();
       this.status = 'running';
@@ -382,7 +454,9 @@ export class PostgresServer {
     // directory containing only the socket can be bind-mounted into
     // containers without exposing the data dir's raw database files.
     const pgCtl = this.paths.pgCtl;
-    const socketOpts = process.platform !== 'win32' ? ` -k ${this.paths.socketDir}` : '';
+    // Quoted: pg_ctl re-splits the single -o string on whitespace, so an
+    // unquoted path silently truncates if DROP_ROOT ever contains a space.
+    const socketOpts = process.platform !== 'win32' ? ` -k "${this.paths.socketDir}"` : '';
     this.serverProcess = spawn(pgCtl, [
       'start',
       '-D', dataDir,
@@ -490,14 +564,42 @@ export class PostgresServer {
   private async cleanupStaleFiles(): Promise<void> {
     if (!this.paths) return;
 
-    // Clean up stale PID file
+    // Clean up stale PID file — but ONLY if the postmaster it names is really
+    // dead (DROP-072 review item 3). isServerRunning() probes TCP and returns
+    // false for a LIVE server whenever auth fails (rotated superuser file,
+    // pg_hba mid-migration, a timeout on a loaded box). Unlinking the pid file
+    // then lets a second postmaster start on the same -D, and that file plus
+    // the shmem key it records IS PostgreSQL's interlock against exactly that
+    // — the documented route to data corruption. Fail loudly instead.
     const pidFile = path.join(this.paths.dataDir, 'postmaster.pid');
     try {
-      await fs.access(pidFile);
+      const contents = await fs.readFile(pidFile, 'utf-8');
+      const recordedPid = parseInt(contents.split('\n')[0]?.trim() ?? '', 10);
+      if (Number.isInteger(recordedPid) && recordedPid > 0) {
+        let alive = false;
+        try {
+          process.kill(recordedPid, 0);
+          alive = true;
+        } catch (err) {
+          // ESRCH => no such process (stale). EPERM => it exists but is owned
+          // by another user, which still means "alive" for our purposes.
+          alive = (err as NodeJS.ErrnoException).code === 'EPERM';
+        }
+        if (alive) {
+          throw new Error(
+            `postmaster.pid names a live process (pid ${recordedPid}) but PostgreSQL ` +
+              `did not answer a health check. Refusing to remove the pid file — doing ` +
+              `so would allow a second postmaster on the same data directory and risk ` +
+              `corruption. Investigate that process, or stop it with ` +
+              `pg_ctl stop -D ${this.paths.dataDir}.`
+          );
+        }
+      }
       this.log('Found stale postmaster.pid file, removing...');
       await fs.unlink(pidFile);
-    } catch {
-      // No PID file
+    } catch (err) {
+      // Rethrow our own refusal; swallow "no pid file" and read races.
+      if (err instanceof Error && err.message.includes('names a live process')) throw err;
     }
 
     // Clean up locked log file (Windows sharing violation issue)
