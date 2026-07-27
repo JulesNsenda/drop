@@ -43,7 +43,12 @@ export type DeployResultStatus =
   | 'in_progress';
 
 /** Closed union of tool names. Never derived from output, never with arguments. */
-export type DeployNextAction = 'app_logs' | 'app_status' | 'restart_app' | 'list_apps';
+export type DeployNextAction =
+  | 'get_deploy_logs'
+  | 'app_logs'
+  | 'app_status'
+  | 'restart_app'
+  | 'list_apps';
 
 /** DROP-generated stand-in for the command line. Never the literal command. */
 export type DeployCommandKind = 'prebuild' | 'install' | 'build' | 'validate';
@@ -136,6 +141,11 @@ export function hintFor(code: DeployErrorCode): string {
 export function nextActionsFor(status: DeployResultStatus, phase?: 'build' | 'boot'): DeployNextAction[] {
   if (status === 'succeeded') return [];
   if (status === 'succeeded_unverified') return ['app_status', 'app_logs'];
-  if (phase === 'boot') return ['app_logs', 'restart_app'];
-  return ['app_logs'];
+  // get_deploy_logs FIRST for any failure: it returns the output of THIS
+  // deploy, where app_logs returns whatever the app is doing now — which for a
+  // failed deploy is usually nothing, and for a build failure is structurally
+  // the wrong log. restart_app stays for a boot failure, where retrying is a
+  // plausible next move; it is not, for a build that cannot compile.
+  if (phase === 'boot') return ['get_deploy_logs', 'restart_app'];
+  return ['get_deploy_logs'];
 }
