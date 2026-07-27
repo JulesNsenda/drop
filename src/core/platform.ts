@@ -53,7 +53,9 @@ import {
   getDeployBreaker,
   breakerKey,
   automationKey,
+  ownerKey,
   resetDeployBreaker,
+  type GuardrailKey,
 } from '../managers/guardrail/deploy-breaker';
 import {
   getDeployTracker,
@@ -568,6 +570,13 @@ export function decideBootReconciliation(input: BootReconcileInput): BootReconci
   return decideBootReconciliationCheap(input) ?? decideBootReconciliationSignature(input);
 }
 
+/** The guardrail-relevant slice of a deploy event payload. */
+type DeployActorInfo = {
+  principalId?: string;
+  actorUserId?: string;
+  automationSource?: 'webhook';
+};
+
 export class DropPlatform {
   private readonly config: PlatformConfig;
   private readonly eventBus: EventBus;
@@ -609,7 +618,7 @@ export class DropPlatform {
    * there would silently key automation-triggered outcomes differently from the
    * gate that let them through, so the window would never close.
    */
-  private readonly breakerKeys: Map<string, string> = new Map();
+  private readonly breakerKeys: Map<string, GuardrailKey[]> = new Map();
   private isRunning = false;
   // Snapshot of each app's persisted status, taken in initializeServices
   // BEFORE syncStateWithConfigs/syncStateWithProcesses run — both reconcile
@@ -628,7 +637,8 @@ export class DropPlatform {
   // holds a build slot for a while — and without a drain those deferred builds
   // wait for a file change that may never come, so a static/other app "never
   // starts automatically". `drainPendingBuilds` retries them as slots free.
-  private pendingBuilds: Map<string, { appPath: string; appType: string }> = new Map();
+  private pendingBuilds: Map<string, { appPath: string; appType: string; actor?: DeployActorInfo }> =
+    new Map();
   private buildDrainTimer: ReturnType<typeof setTimeout> | null = null;
   private appDeployTimes: Map<string, number> = new Map(); // Track when apps were last deployed
   // Apps whose rebuild+restart is being managed as a single transaction by
@@ -2272,7 +2282,13 @@ backup:
       if (this.gitDeployService?.isCloning(payload.name)) return;
       // Skip apps currently being uploaded (PRD-039)
       if (this.uploadDeployService?.isUploading(payload.name)) return;
-      await this.handleAppUpdate(payload.name, payload.path, payload.reason, payload.bypassCooldown);
+      await this.handleAppUpdate(
+        payload.name,
+        payload.path,
+        payload.reason,
+        payload.bypassCooldown,
+        payload
+      );
     });
     this.subscriptions.push(updateSub);
 
@@ -2633,7 +2649,9 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
   private async expandMonorepo(
     repoPath: string,
     repoName: string,
-    config: DropYamlConfig
+    config: DropYamlConfig,
+    /** The caller whose redeploy triggered this, for guardrail keying. */
+    actor?: DeployActorInfo
   ): Promise<void> {
     const group = (config.group || config.name || repoName).trim();
     const services = config.services ?? {};
@@ -2786,7 +2804,10 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         // flags oversized groups — but it also won't auto-retrigger; that's
         // acceptable for the common small-N case and left for a future pass.
         if (this.config.autoBuild) {
-          await this.handleBuildApp(childPath, childName, childType);
+          // Children inherit the container's actor. Left undefined they would
+          // each key as automation on their OWN name, so a loop that varies
+          // service names would accumulate nowhere.
+          await this.handleBuildApp(childPath, childName, childType, actor);
         }
       } catch (error) {
         this.logger.error(
@@ -2827,7 +2848,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       // finally-guaranteed release — a stuck entry would wedge the app.
       this.appsInProgress.add(payload.name);
       try {
-        await this.expandMonorepo(payload.path, payload.name, rootYaml.config);
+        await this.expandMonorepo(payload.path, payload.name, rootYaml.config, payload);
       } finally {
         this.appsInProgress.delete(payload.name);
       }
@@ -2860,12 +2881,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     // Build the app if auto-build is enabled (skip if user stopped it)
     const currentApp = this.stateManager?.getApp(payload.name);
     if (this.config.autoBuild && payload.type !== 'unknown' && currentApp?.status !== 'stopped') {
-      await this.handleBuildApp(
-        payload.path,
-        payload.name,
-        payload.type as string,
-        payload.principalId
-      );
+      await this.handleBuildApp(payload.path, payload.name, payload.type as string, payload);
     } else if (payload.type === 'unknown' && currentApp?.status !== 'stopped') {
       // Detection couldn't resolve a type: the build guard above never fires
       // for 'unknown', which used to leave the app registered at `pending`
@@ -2893,7 +2909,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     appPath: string,
     appName: string,
     _appType: string,
-    principalId?: string
+    actor?: DeployActorInfo
   ): Promise<void> {
     if (!this.builder || !this.detector) return;
 
@@ -2914,22 +2930,23 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     // caller, so a looping watcher cannot consume the quota of the human who
     // happens to own the app.
     const existing = this.stateManager?.getApp(appName);
-    const guardKey = principalId
-      ? breakerKey(principalId, existing ? appName : undefined)
-      : automationKey('watcher', appName);
-    const verdict = getDeployBreaker().check(guardKey);
+    const guardKeys = this.guardrailKeys(appName, !existing, actor ?? {});
+    const verdict = this.checkGuardrails(guardKeys);
     if (!verdict.allowed) {
       const reason =
         `Too many failed deploys (${verdict.failures}). ` +
         `Retry in ${verdict.retryAfterSeconds}s.`;
       this.logger.warn(`Deploy of ${appName} refused by guardrail: ${reason}`, 'BUILD');
+      // See the matching release in handleAppUpdate: a stale key would turn
+      // this refusal into a counted failure against the window that refused it.
+      this.releaseGuardrailKeys(appName);
       // Reported as a normal deploy failure so a caller polling for an outcome
       // gets an answer instead of waiting out its budget — the same reason
       // failDeployEpisode exists.
       this.failDeployEpisode(appName, new Error(reason), crypto.randomUUID());
       return;
     }
-    this.breakerKeys.set(appName, guardKey);
+    this.breakerKeys.set(appName, guardKeys);
 
     // Enforce global concurrent build limit. Deferred builds are queued and
     // retried by drainPendingBuilds as slots free, rather than waiting for a
@@ -2941,7 +2958,14 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         `deferring ${appName}`,
         'BUILD'
       );
-      this.pendingBuilds.set(appName, { appPath, appType: _appType });
+      // The actor rides along. Without it the drain re-enters with no caller,
+      // so anyone who keeps maxConcurrentBuilds slots busy has their next
+      // deploys re-keyed as anonymous automation — no principal window, no
+      // owner window. Four parallel deploys is enough to arrange.
+      this.pendingBuilds.set(appName, { appPath, appType: _appType, actor });
+      // Reserved above, but nothing will be recorded for this attempt: the
+      // retry re-enters handleBuildApp and re-reserves.
+      this.releaseGuardrailKeys(appName);
       this.scheduleBuildDrain();
       return;
     }
@@ -3085,9 +3109,9 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         // not rejected. Counting a queue wait as a failure would let a busy
         // platform trip the breaker on apps that never actually failed — and
         // the retry re-enters this method and re-gates itself.
-        this.breakerKeys.delete(appName);
+        this.releaseGuardrailKeys(appName);
         this.appsInProgress.delete(appName);
-        this.pendingBuilds.set(appName, { appPath, appType: _appType });
+        this.pendingBuilds.set(appName, { appPath, appType: _appType, actor });
         this.scheduleBuildDrain();
       } else {
         this.logger.appEvent('error', appName, result.errors?.[0]?.message || 'Build failed');
@@ -3179,13 +3203,113 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
    * A deploy with no recorded key was never gated (it predates this, or the
    * platform restarted mid-deploy) — nothing to record.
    */
+  /**
+   * The guardrail keys a deploy is checked against, in order.
+   *
+   * TWO windows for a real caller, and the deploy must pass BOTH. The
+   * per-principal one is defeatable with no attacker effort: a fresh
+   * authorization-code exchange mints a new sid, hence a new principal with no
+   * failure history. An autonomous agent cannot reach that flow — re-consent
+   * needs a session-authenticated approval an OAuth token cannot make — but a
+   * user clicking "reconnect" after a trip clears their own cooldown, which is
+   * the realistic path and needs no malice at all. The owner window spans every
+   * session and app that human has, so re-minting an identity does not escape it.
+   *
+   * Automation gets ONE key and no owner window: it has no human to attribute
+   * the failures to, and borrowing the app owner's would let a looping webhook
+   * consume the quota of someone who did nothing.
+   */
+  private guardrailKeys(
+    appName: string,
+    isNewApp: boolean,
+    actor: DeployActorInfo
+  ): GuardrailKey[] {
+    const breaker = getDeployBreaker();
+    if (!actor.principalId) {
+      return [
+        {
+          key: automationKey(actor.automationSource ?? 'watcher', appName),
+          threshold: breaker.threshold,
+          clearOnSuccess: true,
+        },
+      ];
+    }
+    const keys: GuardrailKey[] = [
+      {
+        key: breakerKey(actor.principalId, isNewApp ? undefined : appName),
+        threshold: breaker.threshold,
+        clearOnSuccess: true,
+      },
+    ];
+    // Only when the actor's own human is known. Falling back to the app's owner
+    // would be wrong in both directions: a NEW app has no state to read, so
+    // every user's first-deploy failures would share one bucket and any user
+    // could lock out every other.
+    if (actor.actorUserId) {
+      keys.push({
+        key: ownerKey(actor.actorUserId),
+        threshold: breaker.ownerThreshold,
+        // Decay-only. See GuardrailKey.clearOnSuccess — clearing this on a
+        // success would let one trivial deploy wipe a window filled by
+        // expensive failures, which is the cheapest possible bypass.
+        clearOnSuccess: false,
+      });
+    }
+    return keys;
+  }
+
+  /**
+   * Check every guardrail window and return the first refusal.
+   *
+   * Checks are side-effect-free with respect to failure counting, so evaluating
+   * all of them costs nothing.
+   */
+  private checkGuardrails(keys: GuardrailKey[]): {
+    allowed: boolean;
+    failures: number;
+    retryAfterSeconds?: number;
+  } {
+    const breaker = getDeployBreaker();
+    // Short-circuits deliberately. `check` is NOT side-effect-free: it deletes a
+    // key whose cooldown has lapsed. Evaluating every key on an attempt that is
+    // already refused would silently expire the owner backstop's cooldown on
+    // traffic that was rejected — i.e. rejected retries would reset it.
+    for (const { key } of keys) {
+      const verdict = breaker.check(key);
+      if (!verdict.allowed) return verdict;
+    }
+    return { allowed: true, failures: 0 };
+  }
+
+  /**
+   * Abandon an episode's guardrail keys without recording anything.
+   *
+   * Must be called on every path that reserved keys and then returned without
+   * deploying. A key left behind is charged to the NEXT outcome recorded for
+   * that app — including the failure that `failDeployEpisode` records when a
+   * later attempt is refused, which would let a refusal extend its own
+   * cooldown indefinitely, or charge principal A for principal B's episode.
+   */
+  private releaseGuardrailKeys(appName: string): void {
+    this.breakerKeys.delete(appName);
+  }
+
   private recordDeployOutcome(appName: string, ok: boolean): void {
-    const key = this.breakerKeys.get(appName);
-    if (!key) return;
+    const keys = this.breakerKeys.get(appName);
+    if (!keys) return;
     this.breakerKeys.delete(appName);
     try {
-      if (ok) getDeployBreaker().recordSuccess(key);
-      else getDeployBreaker().recordFailure(key);
+      const breaker = getDeployBreaker();
+      for (const entry of keys) {
+        if (!ok) {
+          breaker.recordFailure(entry.key, Date.now(), entry.threshold);
+        } else if (entry.clearOnSuccess) {
+          breaker.recordSuccess(entry.key);
+        }
+        // A success does NOT clear a decay-only key. See
+        // GuardrailKey.clearOnSuccess: the owner backstop must not be wipeable
+        // by one cheap deploy, or it stops being a backstop.
+      }
     } catch {
       // Guardrail state is best-effort; it must never fail a deploy.
     }
@@ -3238,7 +3362,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         continue;
       }
       this.pendingBuilds.delete(appName);
-      void this.handleBuildApp(info.appPath, appName, info.appType);
+      void this.handleBuildApp(info.appPath, appName, info.appType, info.actor);
     }
     if (this.pendingBuilds.size > 0) this.scheduleBuildDrain();
   }
@@ -3465,6 +3589,11 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
             missingSecrets: error.missingSecrets,
           });
         }
+        // COUNTED. buildFreshStartSpec throws this AFTER the build completed,
+        // so the install and build were already paid for, and the `secrets:`
+        // block that triggers it is tenant-controlled — leaving it uncounted
+        // made `deploy → full build → park → deploy` a free, unbounded loop.
+        this.recordDeployOutcome(appName, false);
         return;
       }
       this.logger.appEvent('error', appName, error instanceof Error ? error.message : 'Failed to start');
@@ -3473,6 +3602,11 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           error: error instanceof Error ? error.message : 'Failed to start',
         });
       }
+      // A whole class of expensive, caller-reproducible failures reaches here
+      // rather than the readiness verdict — port allocation, secret/env
+      // resolution, runtime spec assembly, runtime.start() itself. Uncounted,
+      // they were invisible to the breaker AND left a stale key behind.
+      this.recordDeployOutcome(appName, false);
     } finally {
       // Terminal handler: always release the in-progress guard on every settled
       // path (success, error, or a throw from the initial 'starting' write), so
@@ -3691,7 +3825,8 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     appName: string,
     appPath: string,
     reason: string,
-    bypassCooldown?: boolean
+    bypassCooldown?: boolean,
+    actor?: DeployActorInfo
   ): Promise<void> {
     if (!this.runtime || !this.stateManager || !this.detector || !this.builder) return;
 
@@ -3730,13 +3865,36 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       Object.keys(containerYaml.config.services).length > 0
     ) {
       if (bypassCooldown) {
+        // GUARDRAIL. This branch RETURNS below, above the gate on the ordinary
+        // rebuild path, and expandMonorepo is one of the most expensive things
+        // on the box: a git pull plus an fs.rm/fs.cp of every child tree plus a
+        // build per service. Whether an app takes this branch is decided by the
+        // caller's own drop.yaml (`services:`), so leaving it ungated let any
+        // caller opt into an unmetered build loop.
+        const containerKeys = this.guardrailKeys(appName, false, actor ?? {});
+        const containerVerdict = this.checkGuardrails(containerKeys);
+        if (!containerVerdict.allowed) {
+          const refusal =
+            `Too many failed deploys (${containerVerdict.failures}). ` +
+            `Retry in ${containerVerdict.retryAfterSeconds}s.`;
+          this.logger.warn(`Re-expansion of '${appName}' refused by guardrail: ${refusal}`, 'MONOREPO');
+          this.releaseGuardrailKeys(appName);
+          this.failDeployEpisode(appName, new Error(refusal), crypto.randomUUID());
+          return;
+        }
+        this.breakerKeys.set(appName, containerKeys);
+
         this.logger.info(`Re-expanding monorepo container '${appName}' (explicit redeploy)`, 'MONOREPO');
         // Same in-progress bracket as the app:detected interception: blocks a
         // concurrent DELETE (409) and re-entrant updates while child folders
         // are re-materialized out from under running apps.
         this.appsInProgress.add(appName);
         try {
-          await this.expandMonorepo(appPath, appName, containerYaml.config);
+          await this.expandMonorepo(appPath, appName, containerYaml.config, actor);
+          this.recordDeployOutcome(appName, true);
+        } catch (err) {
+          this.recordDeployOutcome(appName, false);
+          throw err;
         } finally {
           this.appsInProgress.delete(appName);
         }
@@ -3790,6 +3948,43 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     const originalPort = appState.port;
     const wasRunning = appState.status === 'running';
 
+    // GUARDRAIL. A SECOND choke point, not a duplicate: handleAppUpdate does
+    // not route through handleBuildApp — it has its own build — so the Step 7
+    // gate covered only FIRST deploys. Redeploy is the path an agent loop
+    // actually rides (deploy, fail, "fix", redeploy, fail), and it is where
+    // upload-deploy and git-redeploy send every app that already exists.
+    //
+    // Deliberately here, below every skip guard above (in-progress, monorepo
+    // container, cooldown, unregistered, user-stopped) and below the
+    // `reason`/`wasRunning` reads: each of those returns without deploying, and
+    // an update that never deploys must neither be refused nor leave a key in
+    // breakerKeys for some later episode's outcome to be recorded against.
+    const guardKeys = this.guardrailKeys(appName, false, actor ?? {});
+    const verdict = this.checkGuardrails(guardKeys);
+    if (!verdict.allowed) {
+      const refusal =
+        `Too many failed deploys (${verdict.failures}). Retry in ${verdict.retryAfterSeconds}s.`;
+      this.logger.warn(`Redeploy of ${appName} refused by guardrail: ${refusal}`, 'UPDATE');
+      // Released BEFORE reporting. failDeployEpisode records a failure, and a
+      // key left over from an earlier aborted episode would receive it — so
+      // every refused retry would push a new failure into the window that
+      // refused it and re-arm the cooldown, extending its own lockout forever.
+      this.releaseGuardrailKeys(appName);
+      // Suppress the watcher's follow-up. upload-deploy LANDS the files before
+      // publishing app:update, so a refusal here does not undo the write — and
+      // those writes are inside the watched tree. Without this the watcher's
+      // debounced flush would republish app:update with NO actor moments later,
+      // laundering the refused build into the `watcher::<app>` bucket and
+      // running it anyway. An explicit redeploy still bypasses this and is
+      // re-gated above, which is the intended behaviour.
+      this.appDeployTimes.set(appName, Date.now());
+      // Reported as a normal deploy failure so a caller polling for an outcome
+      // gets an answer instead of waiting out its budget.
+      this.failDeployEpisode(appName, new Error(refusal), crypto.randomUUID());
+      return;
+    }
+    this.breakerKeys.set(appName, guardKeys);
+
     this.logger.info(`Hot-reload triggered for ${appName}: ${reason}`, 'UPDATE');
     this.appsInProgress.add(appName);
 
@@ -3805,6 +4000,10 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         `Skipping hot-reload of ${appName}: insufficient disk (${Math.round(disk.freeMb)} MB free, need ${getMinFreeDiskMb()} MB)`,
         'UPDATE'
       );
+      // Released, not counted: the build never ran, and the box being full is
+      // not evidence the caller is looping. Leaving the key set would hand this
+      // episode's slot to whatever outcome is recorded next.
+      this.releaseGuardrailKeys(appName);
       this.appsInProgress.delete(appName);
       return;
     }
@@ -3891,6 +4090,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         } else {
           await this.stateManager.setAppStatus(appName, 'errored', { error: buildError });
         }
+        this.recordDeployOutcome(appName, false);
         this.appsInProgress.delete(appName);
         return;
       }
@@ -3957,6 +4157,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       // process rather than continuing to watch the old one's count.
       this.armPostDeployWatches(appName, port, spec.healthCheckPath);
 
+      this.recordDeployOutcome(appName, true);
       this.appsInProgress.delete(appName);
     } catch (error) {
       // Secret preflight park (PRD-051) on a hot-reload — e.g. the edited
@@ -3972,6 +4173,15 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         await this.stateManager.setAppStatus(appName, 'needs-config', {
           missingSecrets: error.missingSecrets,
         });
+        // COUNTED, unlike the pre-build deferrals. AppNeedsConfigError is
+        // thrown from buildFreshStartSpec, which runs AFTER builder.build() has
+        // completed — so the install and build were already paid for. The
+        // `secrets:` block that triggers it is tenant-controlled and both
+        // upload-deploy and git-redeploy publish with bypassCooldown, so
+        // leaving it uncounted made `deploy → full build → park → deploy` a
+        // free, unbounded loop. (An earlier revision likened this to MAX_BUILDS;
+        // that was wrong — MAX_BUILDS aborts BEFORE the build.)
+        this.recordDeployOutcome(appName, false);
         this.appsInProgress.delete(appName);
         return;
       }
@@ -3979,6 +4189,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       await this.stateManager.setAppStatus(appName, 'errored', {
         error: error instanceof Error ? error.message : 'Hot-reload failed',
       });
+      this.recordDeployOutcome(appName, false);
       this.appsInProgress.delete(appName);
     }
   }

@@ -104,6 +104,14 @@ export interface AppDetectedPayload extends BaseEvent {
    * rather than lumping those in with an anonymous caller.
    */
   principalId?: string;
+  /**
+   * The human the principal is acting for, for the coarser backstop window.
+   *
+   * Deliberately NOT read off the app's own state: a NEW app has no state yet,
+   * so keying the backstop on the app owner would put every user's first-deploy
+   * failures in one shared bucket and let any user lock out every other.
+   */
+  actorUserId?: string;
 }
 
 export interface AppCreatedPayload extends BaseEvent {
@@ -123,6 +131,13 @@ export interface AppUpdatePayload extends BaseEvent {
   reason: string;
   /** See AppDetectedPayload.principalId. */
   principalId?: string;
+  /** See AppDetectedPayload.actorUserId. */
+  actorUserId?: string;
+  /**
+   * Set when DROP triggered this itself. Kept distinct from "no principal" so a
+   * looping webhook cannot consume the app owner's guardrail quota.
+   */
+  automationSource?: 'webhook';
   /** Set by an explicit redeploy (git pull / webhook) so the anti-loop cooldown doesn't swallow it. */
   bypassCooldown?: boolean;
 }

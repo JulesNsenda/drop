@@ -57,7 +57,7 @@ export class UploadDeployService {
 
   /** Deploy (or redeploy) an app from an already-staged tarball. */
   async deploy(request: UploadDeployRequest): Promise<UploadDeployResult> {
-    const { appName, archivePath, userId } = request;
+    const { appName, archivePath, userId, principalId } = request;
 
     if (!isValidAppName(appName)) {
       throw new UploadValidationError(`Invalid app name: ${appName}`);
@@ -120,13 +120,20 @@ export class UploadDeployService {
           path: destPath,
           type: undefined,
           origin: 'upload',
+          principalId,
+          actorUserId: userId,
         });
       } else {
+        // The REDEPLOY branch, and the one an agent loop actually rides: fix,
+        // re-upload, fail, repeat. Leaving the actor off here would have left
+        // the guardrail keying every retry as anonymous automation.
         eventBus.publish('app:update', {
           name: appName,
           path: destPath,
           reason: 'upload deploy',
           bypassCooldown: true,
+          principalId,
+          actorUserId: userId,
         });
       }
 

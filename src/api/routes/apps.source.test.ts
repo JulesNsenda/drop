@@ -142,6 +142,9 @@ describe('POST /apps/:name/source (upload deploy)', () => {
       appName: 'alice-app',
       archivePath: expect.any(String),
       userId: aliceId,
+      // Threaded for the deploy guardrail, so a looping agent is keyed on its
+      // own credential rather than on the human it acts for.
+      principalId: `jwt:${aliceId}`,
     });
 
     const entry = activitySpy.mock.calls.find((call) => call[0].action === 'upload-deploy')?.[0];
