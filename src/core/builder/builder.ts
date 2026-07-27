@@ -99,6 +99,7 @@ export class BuilderService {
       eventBus.publish('build:started', {
         appId: context.appName,
         buildId,
+        deployId: context.deployId,
       });
 
       const noStrategy: BuildError = {
@@ -111,6 +112,7 @@ export class BuilderService {
         appId: context.appName,
         buildId,
         error: new Error(noStrategy.message),
+        deployId: context.deployId,
       });
 
       return this.createFailedResult(startedAt, [noStrategy], []);
@@ -134,6 +136,7 @@ export class BuilderService {
     eventBus.publish('build:started', {
       appId: context.appName,
       buildId,
+      deployId: context.deployId,
     });
 
     try {
@@ -188,12 +191,14 @@ export class BuilderService {
         durationMs: Date.now() - startedAt.getTime(),
         success,
         outputPath: outputPath ?? undefined,
+        deployId: context.deployId,
       });
       if (!success) {
         eventBus.publish('build:failed', {
           appId: context.appName,
           buildId,
           error: new Error(errors[0]?.message || 'Build failed'),
+          deployId: context.deployId,
         });
       }
 
@@ -222,6 +227,7 @@ export class BuilderService {
         appId: context.appName,
         buildId,
         error: errorObj,
+        deployId: context.deployId,
       });
 
       return this.createFailedResult(startedAt, errors, stages);

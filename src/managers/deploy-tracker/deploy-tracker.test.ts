@@ -28,6 +28,76 @@ describe('DeployTracker', () => {
     await fs.rm(tmpDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   });
 
+  describe('deployId adoption', () => {
+    // The tracker used to mint the deployId itself, which meant the id
+    // identifying an episode was one nothing upstream could reference — the
+    // caller, the build log and the episode all named the deploy differently.
+    it('adopts the deployId supplied by the publisher', async () => {
+      bus.publish('build:started', {
+        appId: 'adopt-app',
+        buildId: 'b1',
+        deployId: 'caller-minted-id',
+      });
+      bus.publish('app:updated', { appId: 'adopt-app', changes: { status: 'running' } });
+      await tracker.flush();
+
+      const [episode] = tracker.getEpisodes('adopt-app', 1);
+      expect(episode.deployId).toBe('caller-minted-id');
+    });
+
+    it('keeps the adopted id across every row of the episode', async () => {
+      // Rows are correlated by deployId, so adopting on open but minting on a
+      // later row would split one deploy into two episodes.
+      bus.publish('build:started', { appId: 'multi', buildId: 'b1', deployId: 'stable-id' });
+      bus.publish('build:failed', {
+        appId: 'multi',
+        buildId: 'b1',
+        error: new Error('boom'),
+        deployId: 'stable-id',
+      });
+      await tracker.flush();
+
+      const episodes = tracker.getEpisodes('multi', 10);
+      expect(episodes).toHaveLength(1);
+      expect(episodes[0].deployId).toBe('stable-id');
+    });
+
+    it('still mints one when the publisher supplies none', async () => {
+      // The fallback must stay live — a hand-built payload or a publisher that
+      // has not been threaded yet still gets a working episode.
+      bus.publish('build:started', { appId: 'no-id-app', buildId: 'b1' });
+      bus.publish('app:updated', { appId: 'no-id-app', changes: { status: 'running' } });
+      await tracker.flush();
+
+      const [episode] = tracker.getEpisodes('no-id-app', 1);
+      expect(episode.deployId).toEqual(expect.any(String));
+      expect(episode.deployId.length).toBeGreaterThan(0);
+    });
+
+    it('logs the degraded case rather than falling back silently', async () => {
+      // A deploy arriving with no id means a call site was missed. That is
+      // invisible otherwise, and the whole point of the change is that every
+      // deploy is addressable.
+      const debug = jest.spyOn(console, 'debug').mockImplementation();
+
+      bus.publish('build:started', { appId: 'quiet-app', buildId: 'b1' });
+      await tracker.flush();
+
+      expect(debug).toHaveBeenCalledWith(expect.stringContaining('carried no deployId'));
+      debug.mockRestore();
+    });
+
+    it('does not log when an id was supplied', async () => {
+      const debug = jest.spyOn(console, 'debug').mockImplementation();
+
+      bus.publish('build:started', { appId: 'loud-app', buildId: 'b1', deployId: 'given' });
+      await tracker.flush();
+
+      expect(debug).not.toHaveBeenCalledWith(expect.stringContaining('carried no deployId'));
+      debug.mockRestore();
+    });
+  });
+
   describe('hasOpenEpisode', () => {
     // Lets the platform distinguish "nothing ever opened an episode for this
     // deploy" from "one opened and already closed" — without that it would
