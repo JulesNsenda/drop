@@ -57,6 +57,13 @@ import {
 } from '../managers/guardrail/promotion';
 import { getPrincipalQuota, resetPrincipalQuota } from '../managers/guardrail/principal-quota';
 import {
+  planIdleSweep,
+  createIdleSweepState,
+  dryRunSweeps,
+  idleWindowMs,
+  type IdleSweepState,
+} from '../managers/guardrail/idle-reaper';
+import {
   findOverCeiling,
   toMb,
   configuredCeilingBytes,
@@ -610,6 +617,11 @@ export class DropPlatform {
   private logRetention: LogRetentionService | null = null;
   /** Periodic per-app disk accounting (Step 8c). */
   private diskSweepTimer: NodeJS.Timeout | null = null;
+  /** Idle-reaper sweep (Step 9). */
+  private idleSweepTimer: NodeJS.Timeout | null = null;
+  private readonly idleState: IdleSweepState = createIdleSweepState();
+  /** Sweeps completed; the first few are dry runs before anything is deleted. */
+  private idleSweepCount = 0;
 
   private subscriptions: Unsubscribe[] = [];
   // Held separately from `subscriptions`: must stay subscribed through
@@ -757,6 +769,7 @@ export class DropPlatform {
       );
       this.logRetention.start();
       this.startDiskCeilingSweep();
+      this.startIdleReaper();
 
       // Anchor the deploy quota under DROP_ROOT. Its fallback path is relative
       // and would resolve against whatever CWD `drop serve` was launched from,
@@ -850,6 +863,10 @@ export class DropPlatform {
     if (this.diskSweepTimer) {
       clearInterval(this.diskSweepTimer);
       this.diskSweepTimer = null;
+    }
+    if (this.idleSweepTimer) {
+      clearInterval(this.idleSweepTimer);
+      this.idleSweepTimer = null;
     }
 
     // Stop the log-retention sweep
@@ -5044,6 +5061,90 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       await this.handleStartApp(appName, pending.outputDirectory);
     } finally {
       this.appsInProgress.delete(appName);
+    }
+  }
+
+  /**
+   * Idle reaper (Step 9). Sweeps every 15 minutes so a CPU delta reflects a
+   * useful slice of time — an hourly sample would miss short bursts of work
+   * and a one-minute sample is mostly noise.
+   */
+  private startIdleReaper(): void {
+    if (this.idleSweepTimer) return;
+    if (idleWindowMs() <= 0) {
+      this.logger.debug('Idle reaping disabled (DROP_IDLE_REAP_HOURS=0)', 'REAP');
+      return;
+    }
+    this.idleSweepTimer = setInterval(() => void this.sweepIdleApps(), 15 * 60 * 1000);
+    this.idleSweepTimer.unref?.();
+  }
+
+  /**
+   * Reap agent-created apps that are demonstrably doing nothing.
+   *
+   * This DELETES, database included, so the first `DROP_IDLE_REAP_DRY_RUNS`
+   * sweeps only log what they would have done. A signal that is subtly wrong
+   * should surface as would-have-reaped lines, not as a fleet that is gone.
+   */
+  private async sweepIdleApps(): Promise<void> {
+    if (!this.stateManager || !this.runtime) return;
+    try {
+      const apps = this.stateManager.getAllApps().filter((a) => !a.isGroupContainer);
+      const candidates = [];
+      for (const app of apps) {
+        const info = await this.runtime.getStatus(app.name).catch(() => null);
+        const config = this.appConfigService?.getConfig(app.name);
+        candidates.push({
+          name: app.name,
+          agentCreated: config?.agentCreated,
+          noReap: config?.noReap,
+          createdAt: app.createdAt,
+          cpuTotalNs: info?.cpuTotalNs,
+          status: app.status,
+        });
+      }
+
+      const { reap, abortReason } = planIdleSweep(candidates, this.idleState, Date.now());
+      if (abortReason) {
+        this.logger.debug(`Idle sweep took no action: ${abortReason}`, 'REAP');
+        return;
+      }
+
+      this.idleSweepCount += 1;
+      const dryRun = this.idleSweepCount <= dryRunSweeps();
+      for (const name of reap) {
+        if (dryRun) {
+          this.logger.info(
+            `[dry run ${this.idleSweepCount}/${dryRunSweeps()}] would reap idle app '${name}'`,
+            'REAP'
+          );
+          continue;
+        }
+        const app = this.stateManager.getApp(name);
+        this.logger.info(`Reaping idle agent-created app '${name}'`, 'REAP');
+        await tryLogActivity({
+          action: 'idle-reap',
+          appName: name,
+          userId: app?.userId,
+          detail: 'Idle beyond the reap window',
+        });
+        // The existing teardown, not a second one — it is the only path that
+        // knows about routes, the database, secrets and deploy history.
+        await this.teardownApp(name).catch((err) => {
+          this.logger.warn(
+            `Idle reap of '${name}' failed: ${err instanceof Error ? err.message : 'unknown'}`,
+            'REAP'
+          );
+        });
+        // Forget it, or a name reused later inherits this app's history.
+        this.idleState.lastCpu.delete(name);
+        this.idleState.lastActive.delete(name);
+      }
+    } catch (err) {
+      this.logger.debug(
+        `Idle sweep failed: ${err instanceof Error ? err.message : 'unknown'}`,
+        'REAP'
+      );
     }
   }
 

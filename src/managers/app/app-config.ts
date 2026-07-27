@@ -59,6 +59,18 @@ export interface AppConfig {
    * DROP_DEFAULT_PROMOTION. A per-app value wins either way — an operator who
    * marked one app `auto` on a `manual` platform meant it.
    */
+  /**
+   * True when an AGENT credential created this app.
+   *
+   * Set ONLY on first creation and never on a redeploy, and never from caller
+   * input (SEC-11). Setting it on any agent-assisted deploy would flag a
+   * long-lived human-owned app permanently the first time an agent redeployed
+   * it — and this flag is what exposes an app to automatic DELETION, database
+   * included.
+   */
+  agentCreated?: boolean;
+  /** Operator opt-out from idle reaping. */
+  noReap?: boolean;
   promotion?: 'auto' | 'manual';
   /**
    * A built-but-unpromoted deploy, when promotion is manual. Absent when

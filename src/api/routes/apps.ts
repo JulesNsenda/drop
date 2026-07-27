@@ -456,6 +456,7 @@ apps.post('/:name/source', async c => {
       archivePath,
       userId: auth?.userId,
       principalId: auth?.principalId,
+      agentCaller: auth?.kind === 'agent',
     });
 
     await tryLogActivity({

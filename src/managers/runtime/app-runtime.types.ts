@@ -129,6 +129,20 @@ export interface AppProcessInfo {
    * `false` so the two cases stay distinguishable — "not OOM" vs "cannot know".
    */
   oomKilled?: boolean;
+  /**
+   * CUMULATIVE CPU time consumed by this app, in nanoseconds.
+   *
+   * Monotonic for the life of one process, which is what makes it usable as an
+   * "did this app do any work since the last sweep?" signal — `cpu` above is an
+   * instantaneous percentage, and a request served between two samples leaves
+   * no trace in it at all.
+   *
+   * DOCKER ONLY. PM2 reports only an instantaneous percentage, so it is left
+   * `undefined` rather than 0 — "cannot know" must stay distinguishable from
+   * "did no work", or an idle reaper would read every PM2 app as permanently
+   * idle and delete the fleet.
+   */
+  cpuTotalNs?: number;
 }
 
 /**

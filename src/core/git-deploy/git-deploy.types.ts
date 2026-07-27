@@ -38,6 +38,8 @@ export interface GitDeployRequest {
   userId?: string;
   /** See UploadDeployRequest.principalId — guardrail keying, not authorization. */
   principalId?: string;
+  /** See UploadDeployRequest.agentCaller — server-derived, first creation only. */
+  agentCaller?: boolean;
 }
 
 /** API request to store a GitHub token */

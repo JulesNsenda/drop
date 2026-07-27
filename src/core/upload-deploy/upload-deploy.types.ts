@@ -17,6 +17,12 @@ export interface UploadDeployRequest {
    * DROP triggered the deploy itself.
    */
   principalId?: string;
+  /**
+   * Whether the CALLER is an agent credential, derived server-side from the
+   * auth context — never read from a request body. Only consulted when the app
+   * is new; a redeploy never changes it (SEC-11).
+   */
+  agentCaller?: boolean;
 }
 
 /**

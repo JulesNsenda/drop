@@ -23,6 +23,7 @@ import {
 } from './upload-deploy.types';
 import { isValidAppName } from '../../api/middleware/validate';
 import { getStateManager } from '../../managers/app/state-manager';
+import { getAppConfigService } from '../../managers/app/app-config';
 import { getLogger } from '../../utils/logger';
 import { hasEnoughDisk, getMinFreeDiskMb } from '../../utils/disk';
 import { eventBus } from '../event-bus';
@@ -58,7 +59,7 @@ export class UploadDeployService {
 
   /** Deploy (or redeploy) an app from an already-staged tarball. */
   async deploy(request: UploadDeployRequest): Promise<UploadDeployResult> {
-    const { appName, archivePath, userId, principalId } = request;
+    const { appName, archivePath, userId, principalId, agentCaller } = request;
 
     if (!isValidAppName(appName)) {
       throw new UploadValidationError(`Invalid app name: ${appName}`);
@@ -126,6 +127,13 @@ export class UploadDeployService {
         await stateManager.registerApp(appName, destPath);
         if (userId) {
           await stateManager.updateApp(appName, { userId } as Record<string, unknown>);
+        }
+        // ONLY on first creation (SEC-11). A redeploy must never set this: it
+        // is what exposes an app to automatic deletion, database included, and
+        // one agent-assisted redeploy of a long-lived human-owned app would
+        // otherwise flag it permanently.
+        if (agentCaller) {
+          await getAppConfigService().updateConfig(appName, { agentCreated: true });
         }
       }
 
