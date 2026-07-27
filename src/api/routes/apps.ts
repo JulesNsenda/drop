@@ -731,6 +731,12 @@ apps.delete('/:name', async c => {
           if (container.path) {
             await fs.rm(container.path, { recursive: true, force: true });
           }
+          // The container is detected and built before expansion, so it can
+          // have deploy details of its own — and its log directory. This
+          // cascade never went through purgeAppArtifacts, so those details
+          // kept live name-keyed log offsets with no retention stamp, which
+          // also put them outside the serve-time guard.
+          await getPlatformOps()?.purgeAppArtifacts(container.name, { keepData });
         } catch {
           // Container entry/folder may already be gone
         }
