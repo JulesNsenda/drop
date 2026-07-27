@@ -27,6 +27,21 @@ const DEFAULT_ROUTER_CONFIG: RouterConfig = {
   defaultCompress: true,
 };
 
+/**
+ * Scrub secret-shaped tokens from text before it is logged.
+ *
+ * Caddy's rejection body may quote the offending source line, and the generated
+ * Caddyfile contains DNS-provider credentials as `{env.CF_API_TOKEN}` /
+ * `{env.GODADDY_API_KEY}` placeholders — which the Caddyfile adapter SUBSTITUTES
+ * while parsing. So an adapt error can carry an expanded provider token, and
+ * that would land in the host log. Long unbroken alphanumeric runs are replaced;
+ * ordinary Caddy diagnostics (directive names, paths, ports) are far shorter
+ * than the threshold and survive intact.
+ */
+function redactSecretLikeTokens(text: string): string {
+  return text.replace(/[A-Za-z0-9_-]{24,}/g, '[redacted]');
+}
+
 export class RouterService {
   private readonly config: RouterConfig;
   private readonly routes: Map<string, Route> = new Map();
@@ -267,12 +282,14 @@ export class RouterService {
    * Reload Caddy server
    */
   private async reloadCaddy(): Promise<void> {
+    // (see redactSecretLikeTokens below for why the error body is scrubbed)
     if (!this.config.caddy.enableAdminApi || !this.config.caddy.adminApi) {
       return;
     }
 
+    let response: Response;
     try {
-      const response = await fetch(`http://${this.config.caddy.adminApi}/load`, {
+      response = await fetch(`http://${this.config.caddy.adminApi}/load`, {
         method: 'POST',
         headers: {
           'Content-Type': 'text/caddyfile',
@@ -283,15 +300,40 @@ export class RouterService {
         },
         body: await fs.readFile(this.config.caddy.caddyfilePath, 'utf-8'),
       });
-
-      if (!response.ok) {
-        const error = await response.text();
-        throw new Error(`Caddy reload failed: ${error}`);
-      }
     } catch {
-      // Caddy might not be running - silently ignore
-      // Apps are still accessible directly via their ports
+      // Transport-level failure — Caddy isn't running, or the admin endpoint
+      // is unreachable. Benign and expected (dev boxes, pre-start ordering);
+      // apps remain reachable directly on their ports. Stay quiet.
+      return;
     }
+
+    if (response.ok) {
+      return;
+    }
+
+    // Caddy is RUNNING and REJECTED the config. This is categorically
+    // different from "not running" and used to be swallowed by the same catch:
+    // the fleet silently kept serving the last good in-memory config while the
+    // rejected file stayed on disk as the boot config (caddy-server starts with
+    // `--config <caddyfilePath>`), so the next restart lost every route with no
+    // prior warning. One malformed per-app block breaks routing for ALL apps,
+    // so this must be loud.
+    let detail = '';
+    try {
+      detail = redactSecretLikeTokens((await response.text()).slice(0, 500));
+    } catch {
+      // Body unreadable — the status alone is the signal.
+    }
+
+    const message =
+      `Caddy rejected the generated config (HTTP ${response.status}). Routing is UNCHANGED ` +
+      `and this file will fail at next Caddy start: ${this.config.caddy.caddyfilePath}. ${detail}`;
+
+    console.error(`[router] ${message}`);
+    eventBus.publish('platform:error', {
+      error: new Error(message),
+      context: 'caddy-reload',
+    });
   }
 
   /**

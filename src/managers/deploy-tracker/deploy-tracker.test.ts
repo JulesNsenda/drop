@@ -28,6 +28,57 @@ describe('DeployTracker', () => {
     await fs.rm(tmpDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   });
 
+  describe('hasOpenEpisode', () => {
+    // Lets the platform distinguish "nothing ever opened an episode for this
+    // deploy" from "one opened and already closed" — without that it would
+    // either no-op a pre-build failure (the close hits the orphan guard) or
+    // manufacture a second, spurious failed episode.
+    it('is false for an app with no episode at all', () => {
+      expect(tracker.hasOpenEpisode('never-seen')).toBe(false);
+    });
+
+    it('is true between build:started and a terminal event', async () => {
+      bus.publish('build:started', { appId: 'open-app', buildId: 'b1' });
+      expect(tracker.hasOpenEpisode('open-app')).toBe(true);
+      await tracker.flush();
+    });
+
+    it('is false once the episode closes as succeeded', async () => {
+      bus.publish('build:started', { appId: 'ok-app', buildId: 'b1' });
+      bus.publish('app:updated', { appId: 'ok-app', changes: { status: 'running' } });
+      await tracker.flush();
+
+      expect(tracker.hasOpenEpisode('ok-app')).toBe(false);
+    });
+
+    it('is false once the episode closes as failed', async () => {
+      bus.publish('build:started', { appId: 'bad-app', buildId: 'b1' });
+      bus.publish('build:failed', { appId: 'bad-app', buildId: 'b1', error: new Error('boom') });
+      await tracker.flush();
+
+      expect(tracker.hasOpenEpisode('bad-app')).toBe(false);
+    });
+
+    it('a synthesized open/close pair produces one terminal failed episode', async () => {
+      // Exactly the sequence platform.failDeployEpisode emits for a failure
+      // that never reached the builder (undetectable type, disk check,
+      // malformed drop.yaml).
+      bus.publish('build:started', { appId: 'pre-fail', buildId: 'synthetic-1' });
+      bus.publish('build:failed', {
+        appId: 'pre-fail',
+        buildId: 'synthetic-1',
+        error: new Error('Could not detect application type'),
+      });
+      await tracker.flush();
+
+      const episodes = tracker.getEpisodes('pre-fail');
+      expect(episodes).toHaveLength(1);
+      expect(episodes[0].status).toBe('failed');
+      expect(episodes[0].endedAt).toBeDefined();
+      expect(tracker.hasOpenEpisode('pre-fail')).toBe(false);
+    });
+  });
+
   it('PM2 happy path: detect -> build -> running closes with a full stage timeline', async () => {
     bus.publish('app:detected', { name: 'app1', path: '/webapps/app1' });
     bus.publish('build:started', { appId: 'app1', buildId: 'b1' });

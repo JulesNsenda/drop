@@ -40,6 +40,7 @@ function makeOps(overrides?: Partial<PlatformOps>): PlatformOps {
     restartApp: jest.fn(),
     isAppInProgress: jest.fn().mockReturnValue(false),
     removeGroup: jest.fn().mockResolvedValue({ removed: [] }),
+    purgeAppArtifacts: jest.fn().mockResolvedValue(undefined),
     ...overrides,
   };
 }
