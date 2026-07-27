@@ -14,6 +14,12 @@ import { ArchiveRejectedError } from './tar-extract';
 import { resetStateManager, getStateManager } from '../../managers/app/state-manager';
 import * as diskUtils from '../../utils/disk';
 import { eventBus } from '../event-bus';
+import {
+  getDeployBreaker,
+  resetDeployBreaker,
+  DeployRefusedError,
+  guardrailKeysFor,
+} from '../../managers/guardrail/deploy-breaker';
 import type { AppDetectedPayload } from '../event-bus';
 // AppUpdatePayload isn't re-exported by ../event-bus (index.ts) - see the same
 // note in src/core/git-deploy/git-deploy.test.ts.
@@ -160,6 +166,96 @@ describe('UploadDeployService', () => {
 
       const app = getStateManager().getApp('anon-app');
       expect(app?.userId).toBeUndefined();
+    });
+  });
+
+  describe('deploy - guardrail pre-check', () => {
+    // The platform's gates sit at the BUILD. Everything before it was unmetered:
+    // the archive is extracted and LANDED over the live app tree before any
+    // event is published, so a downstream refusal could not undo the write and
+    // never stopped the work.
+    afterEach(() => resetDeployBreaker());
+
+    const actor = { userId: 'human-1', principalId: 'key:looper' };
+
+    const trip = () => {
+      const keys = guardrailKeysFor('blocked-app', true, {
+        principalId: actor.principalId,
+        actorUserId: actor.userId,
+      });
+      const breaker = getDeployBreaker();
+      for (let i = 0; i < 5; i++) breaker.recordFailure(keys[0].key, Date.now(), keys[0].threshold);
+    };
+
+    it('refuses BEFORE extracting or landing anything', async () => {
+      const archivePath = await buildArchive('blocked-app', { 'index.js': 'x' });
+      trip();
+
+      await expect(
+        service.deploy({ appName: 'blocked-app', archivePath, ...actor })
+      ).rejects.toBeInstanceOf(DeployRefusedError);
+
+      // Nothing landed — the whole point.
+      expect(fssync.existsSync(path.join(appsDir, 'blocked-app'))).toBe(false);
+    });
+
+    it('does not overwrite a live app tree when a REDEPLOY is refused', async () => {
+      // The damaging half: landFiles syncs over the running app, so a refusal
+      // that arrives after the write leaves new source under an old process.
+      const v1 = await buildArchive('live-app-v1', { 'index.js': 'v1' });
+      await service.deploy({ appName: 'live-app', archivePath: v1, ...actor });
+      expect(fssync.readFileSync(path.join(appsDir, 'live-app', 'index.js'), 'utf8')).toBe('v1');
+
+      const keys = guardrailKeysFor('live-app', false, {
+        principalId: actor.principalId,
+        actorUserId: actor.userId,
+      });
+      const breaker = getDeployBreaker();
+      for (let i = 0; i < 5; i++) breaker.recordFailure(keys[0].key, Date.now(), keys[0].threshold);
+
+      const v2 = await buildArchive('live-app-v2', { 'index.js': 'v2' });
+      await expect(
+        service.deploy({ appName: 'live-app', archivePath: v2, ...actor })
+      ).rejects.toBeInstanceOf(DeployRefusedError);
+
+      expect(fssync.readFileSync(path.join(appsDir, 'live-app', 'index.js'), 'utf8')).toBe('v1');
+    });
+
+    it('reports how long to wait, so a caller can back off', async () => {
+      const archivePath = await buildArchive('blocked-app', { 'index.js': 'x' });
+      trip();
+
+      await expect(
+        service.deploy({ appName: 'blocked-app', archivePath, ...actor })
+      ).rejects.toMatchObject({ retryAfterSeconds: expect.any(Number) });
+    });
+
+    it('lets an UNRELATED caller through', async () => {
+      // A pre-check that refused everyone would be worse than none at all.
+      const archivePath = await buildArchive('other-app', { 'index.js': 'x' });
+      trip();
+
+      await expect(
+        service.deploy({
+          appName: 'other-app',
+          archivePath,
+          userId: 'human-2',
+          principalId: 'key:innocent',
+        })
+      ).resolves.toBeDefined();
+    });
+
+    it('records nothing itself — the platform owns the outcome', async () => {
+      // A pre-check that counted would double-charge every deploy.
+      const archivePath = await buildArchive('counted-app', { 'index.js': 'x' });
+      const keys = guardrailKeysFor('counted-app', true, {
+        principalId: actor.principalId,
+        actorUserId: actor.userId,
+      });
+
+      await service.deploy({ appName: 'counted-app', archivePath, ...actor });
+
+      expect(getDeployBreaker().check(keys[0].key).failures).toBe(0);
     });
   });
 

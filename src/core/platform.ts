@@ -51,11 +51,11 @@ import { UploadDeployService, getUploadDeployService, resetUploadDeployService }
 import { getActivityLog, resetActivityLog } from '../managers/activity';
 import {
   getDeployBreaker,
-  breakerKey,
-  automationKey,
-  ownerKey,
+  guardrailKeysFor,
+  checkGuardrailKeys,
   resetDeployBreaker,
   type GuardrailKey,
+  type DeployActorInfo,
 } from '../managers/guardrail/deploy-breaker';
 import {
   getDeployTracker,
@@ -569,13 +569,6 @@ export function decideBootReconciliationSignature(
 export function decideBootReconciliation(input: BootReconcileInput): BootReconcileDecision {
   return decideBootReconciliationCheap(input) ?? decideBootReconciliationSignature(input);
 }
-
-/** The guardrail-relevant slice of a deploy event payload. */
-type DeployActorInfo = {
-  principalId?: string;
-  actorUserId?: string;
-  automationSource?: 'webhook';
-};
 
 export class DropPlatform {
   private readonly config: PlatformConfig;
@@ -3203,82 +3196,20 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
    * A deploy with no recorded key was never gated (it predates this, or the
    * platform restarted mid-deploy) — nothing to record.
    */
-  /**
-   * The guardrail keys a deploy is checked against, in order.
-   *
-   * TWO windows for a real caller, and the deploy must pass BOTH. The
-   * per-principal one is defeatable with no attacker effort: a fresh
-   * authorization-code exchange mints a new sid, hence a new principal with no
-   * failure history. An autonomous agent cannot reach that flow — re-consent
-   * needs a session-authenticated approval an OAuth token cannot make — but a
-   * user clicking "reconnect" after a trip clears their own cooldown, which is
-   * the realistic path and needs no malice at all. The owner window spans every
-   * session and app that human has, so re-minting an identity does not escape it.
-   *
-   * Automation gets ONE key and no owner window: it has no human to attribute
-   * the failures to, and borrowing the app owner's would let a looping webhook
-   * consume the quota of someone who did nothing.
-   */
   private guardrailKeys(
     appName: string,
     isNewApp: boolean,
     actor: DeployActorInfo
   ): GuardrailKey[] {
-    const breaker = getDeployBreaker();
-    if (!actor.principalId) {
-      return [
-        {
-          key: automationKey(actor.automationSource ?? 'watcher', appName),
-          threshold: breaker.threshold,
-          clearOnSuccess: true,
-        },
-      ];
-    }
-    const keys: GuardrailKey[] = [
-      {
-        key: breakerKey(actor.principalId, isNewApp ? undefined : appName),
-        threshold: breaker.threshold,
-        clearOnSuccess: true,
-      },
-    ];
-    // Only when the actor's own human is known. Falling back to the app's owner
-    // would be wrong in both directions: a NEW app has no state to read, so
-    // every user's first-deploy failures would share one bucket and any user
-    // could lock out every other.
-    if (actor.actorUserId) {
-      keys.push({
-        key: ownerKey(actor.actorUserId),
-        threshold: breaker.ownerThreshold,
-        // Decay-only. See GuardrailKey.clearOnSuccess — clearing this on a
-        // success would let one trivial deploy wipe a window filled by
-        // expensive failures, which is the cheapest possible bypass.
-        clearOnSuccess: false,
-      });
-    }
-    return keys;
+    return guardrailKeysFor(appName, isNewApp, actor);
   }
 
-  /**
-   * Check every guardrail window and return the first refusal.
-   *
-   * Checks are side-effect-free with respect to failure counting, so evaluating
-   * all of them costs nothing.
-   */
   private checkGuardrails(keys: GuardrailKey[]): {
     allowed: boolean;
     failures: number;
     retryAfterSeconds?: number;
   } {
-    const breaker = getDeployBreaker();
-    // Short-circuits deliberately. `check` is NOT side-effect-free: it deletes a
-    // key whose cooldown has lapsed. Evaluating every key on an attempt that is
-    // already refused would silently expire the owner backstop's cooldown on
-    // traffic that was rejected — i.e. rejected retries would reset it.
-    for (const { key } of keys) {
-      const verdict = breaker.check(key);
-      if (!verdict.allowed) return verdict;
-    }
-    return { allowed: true, failures: 0 };
+    return checkGuardrailKeys(keys);
   }
 
   /**
