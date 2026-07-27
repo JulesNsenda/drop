@@ -56,6 +56,7 @@ import {
   type PromotionMode,
 } from '../managers/guardrail/promotion';
 import { getPrincipalQuota, resetPrincipalQuota } from '../managers/guardrail/principal-quota';
+import { isExpired } from '../managers/guardrail/ephemeral';
 import {
   planIdleSweep,
   createIdleSweepState,
@@ -4397,7 +4398,10 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
    * (e.g. no provisioned database, PM2 already gone) never aborts the rest
    * of the teardown.
    */
-  private async teardownApp(name: string, opts: { keepData?: boolean } = {}): Promise<void> {
+  private async teardownApp(
+    name: string,
+    opts: { keepData?: boolean; skipDatabaseBackup?: boolean } = {}
+  ): Promise<void> {
     // Resolve the on-disk path BEFORE removing config/state — both are the
     // only places it's recorded, and both get deleted below.
     const appPath =
@@ -4427,7 +4431,9 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
 
     if (!opts.keepData) {
       try {
-        await this.dbProvisioner?.backupAndDeleteAppDatabase(name);
+        await this.dbProvisioner?.backupAndDeleteAppDatabase(name, {
+          skipBackup: opts.skipDatabaseBackup === true,
+        });
       } catch (err) {
         this.logger.warn(`Database teardown failed for ${name}`, 'DATABASE', err);
       }
@@ -5071,11 +5077,15 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
    */
   private startIdleReaper(): void {
     if (this.idleSweepTimer) return;
+    // NOT gated on idleWindowMs: disabling idle reaping must not also disable
+    // ephemeral expiry, which is a deadline the caller explicitly asked for.
+    // planIdleSweep itself no-ops when the window is 0.
     if (idleWindowMs() <= 0) {
-      this.logger.debug('Idle reaping disabled (DROP_IDLE_REAP_HOURS=0)', 'REAP');
-      return;
+      this.logger.debug('Idle reaping disabled; ephemeral expiry still runs', 'REAP');
     }
-    this.idleSweepTimer = setInterval(() => void this.sweepIdleApps(), 15 * 60 * 1000);
+    this.idleSweepTimer = setInterval(() => {
+      void this.sweepExpiredEphemerals().then(() => this.sweepIdleApps());
+    }, 15 * 60 * 1000);
     this.idleSweepTimer.unref?.();
   }
 
@@ -5143,6 +5153,54 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     } catch (err) {
       this.logger.debug(
         `Idle sweep failed: ${err instanceof Error ? err.message : 'unknown'}`,
+        'REAP'
+      );
+    }
+  }
+
+  /**
+   * Reap ephemerals whose lifetime has run out (Step 10).
+   *
+   * Runs on the idle sweep's timer rather than its own: both tear apps down,
+   * and two timers racing to delete the same app is a needless hazard.
+   *
+   * Deliberately NOT subject to the idle reaper's liveness precondition. That
+   * exists because idleness is INFERRED and a broken signal looks like a dead
+   * fleet; an expiry is a recorded deadline the caller asked for, so there is
+   * no inference to get wrong.
+   */
+  private async sweepExpiredEphemerals(): Promise<void> {
+    if (!this.appConfigService) return;
+    const now = Date.now();
+    try {
+      const expired = this.appConfigService
+        .getAllConfigs()
+        .filter((c) => c.ephemeral === true && isExpired({ expiresAt: c.expiresAt }, now));
+
+      for (const config of expired) {
+        const app = this.stateManager?.getApp(config.name);
+        this.logger.info(`Reaping expired ephemeral app '${config.name}'`, 'REAP');
+        await tryLogActivity({
+          action: 'ephemeral-reap',
+          appName: config.name,
+          userId: app?.userId,
+          detail: `Expired at ${config.expiresAt}`,
+        });
+        // skipDatabaseBackup: an ephemeral's data is throwaway by construction,
+        // and dumping it on the way out would fill the box with backups of
+        // scratch databases nobody will ever read.
+        await this.teardownApp(config.name, { skipDatabaseBackup: true }).catch((err) => {
+          this.logger.warn(
+            `Ephemeral reap of '${config.name}' failed: ${err instanceof Error ? err.message : 'unknown'}`,
+            'REAP'
+          );
+        });
+        this.idleState.lastCpu.delete(config.name);
+        this.idleState.lastActive.delete(config.name);
+      }
+    } catch (err) {
+      this.logger.debug(
+        `Ephemeral sweep failed: ${err instanceof Error ? err.message : 'unknown'}`,
         'REAP'
       );
     }
