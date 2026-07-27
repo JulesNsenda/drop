@@ -55,6 +55,7 @@ import { getDeployDetailStore } from '../../managers/deploy-tracker';
 import { classifyBuildFailure } from '../../core/builder/classify';
 import { computeAppUrl } from '../routes/apps';
 import { getPlatformVersion } from '../../utils/version';
+import { tryLogActivity } from '../../managers/activity';
 
 /** ≤48 files per deploy_files call. */
 export const DEPLOY_FILES_MAX_FILES = 48;
@@ -388,6 +389,11 @@ export async function handleDeployFiles(
       userId: auth?.userId,
     });
 
+    // Logged on ACCEPTANCE, not on outcome: a deploy that was started matters
+    // to an audit even if it then fails, and waitForDeployOutcome can return
+    // after its budget without a verdict.
+    await auditToolAction(auth, 'agent-deploy', name, result.isNew ? 'deploy_files (new)' : 'deploy_files');
+
     return await waitForDeployOutcome(name, result.acceptedAt ?? acceptedAt, result.isNew);
   } catch (err) {
     if (err instanceof ArchiveRejectedError) {
@@ -412,6 +418,36 @@ interface DeployFromGitArgs {
   url: string;
   name?: string;
   branch?: string;
+}
+
+/**
+ * Record that an MCP caller acted on an app.
+ *
+ * The audit gap this closes: every tool call arrives as one
+ * `POST /api/v1/mcp`, so the HTTP audit middleware sees no tool name, no app
+ * name, and no principal. Issuance of an agent token was already logged; USE
+ * was not — which meant that after a token leaked there was no way to answer
+ * "which deploys were this token's", the exact question a stable principalId
+ * exists to make answerable.
+ *
+ * Best-effort, like every other tryLogActivity call: an audit failure must not
+ * fail the action it is describing.
+ */
+async function auditToolAction(
+  auth: AuthContext | undefined,
+  action: 'agent-deploy' | 'restart',
+  appName: string,
+  detail?: string
+): Promise<void> {
+  await tryLogActivity({
+    action,
+    userId: auth?.userId,
+    username: auth?.username,
+    principalId: auth?.principalId,
+    authMethod: auth?.authMethod,
+    appName,
+    detail,
+  });
 }
 
 export async function handleDeployFromGit(
@@ -463,6 +499,8 @@ export async function handleDeployFromGit(
       branch: args.branch,
       userId: auth?.userId,
     });
+    await auditToolAction(auth, 'agent-deploy', result.appName, 'deploy_from_git');
+
     return await waitForDeployOutcome(result.appName, acceptedAt, true);
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Deploy failed';
@@ -668,6 +706,7 @@ export async function handleRestartApp(
 
   try {
     await ops.restartApp(args.name);
+    await auditToolAction(auth, 'restart', args.name, 'restart_app');
     return toolText(`Application '${args.name}' restarted.`);
   } catch (err) {
     if (err instanceof AppInProgressError) {

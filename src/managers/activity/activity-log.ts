@@ -10,9 +10,21 @@ import { writeJsonAtomic } from '../../utils/atomic-write';
 
 export interface ActivityEntry {
   id: string;
-  action: 'deploy' | 'git-deploy' | 'upload-deploy' | 'start' | 'stop' | 'restart' | 'delete' | 'login' | 'signup' | 'redeploy' | 'migrate-runtime' | 'suspend' | 'unsuspend' | 'login_mfa_challenge' | 'login_mfa_ok' | 'mfa_enabled' | 'mfa_disabled' | 'grant-capabilities' | 'github-webhook-secret-generate' | 'github-webhook-secret-set' | 'github-webhook-secret-clear' | 'apikey-create' | 'agent-token-issue';
+  action: 'deploy' | 'git-deploy' | 'upload-deploy' | 'start' | 'stop' | 'restart' | 'delete' | 'login' | 'signup' | 'redeploy' | 'migrate-runtime' | 'suspend' | 'unsuspend' | 'login_mfa_challenge' | 'login_mfa_ok' | 'mfa_enabled' | 'mfa_disabled' | 'grant-capabilities' | 'github-webhook-secret-generate' | 'github-webhook-secret-set' | 'github-webhook-secret-clear' | 'apikey-create' | 'agent-token-issue' | 'agent-deploy';
   userId?: string;
   username?: string;
+  /**
+   * WHICH CREDENTIAL acted, as opposed to `userId`'s which human it acted for.
+   *
+   * The two differ exactly where it matters: several API keys and several
+   * concurrent agent sessions all resolve to one human, so `userId` alone
+   * cannot answer "which deploys were that leaked token's?" — the question an
+   * incident actually asks. Namespaced (`jwt:` / `key:` / `oauth:`) so the
+   * spaces cannot alias.
+   */
+  principalId?: string;
+  /** How the caller authenticated. Cheap to record, and it splits agent traffic from human. */
+  authMethod?: 'jwt' | 'apikey' | 'oauth';
   appName?: string;
   detail?: string;
   timestamp: string;
