@@ -145,6 +145,9 @@ describe('POST /apps/:name/source (upload deploy)', () => {
       // Threaded for the deploy guardrail, so a looping agent is keyed on its
       // own credential rather than on the human it acts for.
       principalId: `jwt:${aliceId}`,
+      // Derived from the credential kind, never from request input — it is what
+      // exposes an app to automatic reaping.
+      agentCaller: false,
     });
 
     const entry = activitySpy.mock.calls.find((call) => call[0].action === 'upload-deploy')?.[0];
@@ -300,6 +303,10 @@ describe('POST /apps/:name/source (upload deploy)', () => {
         appName: 'alice-app',
         archivePath: expect.any(String),
         userId: undefined,
+        principalId: undefined,
+        // With auth disabled there is no credential at all, so nothing can be
+        // an agent — and an app created here is never auto-reapable.
+        agentCaller: false,
       });
     });
   });

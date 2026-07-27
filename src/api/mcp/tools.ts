@@ -425,6 +425,8 @@ export async function handleDeployFiles(
       archivePath,
       userId: auth?.userId,
       principalId: auth?.principalId,
+      // Derived from the credential, never from tool input.
+      agentCaller: auth?.kind === 'agent',
     });
 
     // Logged on ACCEPTANCE, not on outcome: a deploy that was started matters
@@ -542,6 +544,7 @@ export async function handleDeployFromGit(
       branch: args.branch,
       userId: auth?.userId,
       principalId: auth?.principalId,
+      agentCaller: auth?.kind === 'agent',
     });
     await auditToolAction(auth, 'agent-deploy', result.appName, 'deploy_from_git');
 
