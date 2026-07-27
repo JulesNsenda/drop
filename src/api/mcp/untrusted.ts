@@ -35,8 +35,26 @@ const BEGIN_SUFFIX =
 const END_PREFIX = '----- END UNTRUSTED';
 const END_SUFFIX = '-----';
 
-/** Zero-width and BOM characters — invisible ways to split a token. */
-const ZERO_WIDTH_RE = /[\u200b-\u200f\u2060\ufeff]/g;
+/**
+ * Invisible characters — the ways a token can be split without the split being
+ * visible, or a line-start anchor dodged.
+ *
+ * `\p{Cf}` (the whole format category) rather than a hand-listed range: it
+ * covers the zero-width set, BOM, bidi controls, U+00AD SOFT HYPHEN, U+061C,
+ * U+180E, U+2060-2064 and the U+E0000 tag block in one rule. The enumerated
+ * list this replaces was bypassable — a SOFT HYPHEN inside `UNTRUSTED` and a
+ * leading COMBINING GRAPHEME JOINER both passed through untouched, defeating
+ * MARKER_RE and RULE_LINE_RE's `^` anchor respectively. That reduced this
+ * defence to zero while looking present.
+ *
+ * The additions are invisible but classified Mn (mark), not Cf, so the
+ * property escape alone misses them: U+034F COMBINING GRAPHEME JOINER and the
+ * two variation-selector blocks. Other Mn characters are deliberately NOT
+ * stripped — legitimate combining accents in application output must survive.
+ *
+ * None of these are folded by NFKC, so normalization does not cover it.
+ */
+const INVISIBLE_RE = /[\p{Cf}\u034f\ufe00-\ufe0f\u{e0100}-\u{e01ef}]/gu;
 
 /**
  * Separators allowed between BEGIN/END and UNTRUSTED when matching. Covers all
@@ -56,10 +74,12 @@ const RULE_LINE_RE = /^([ \t]*)-{3,}(.*?)-{3,}([ \t]*)$/gm;
  * the gap for a consumer that matches the marker loosely.
  *
  * NFKC normalization folds fullwidth and other compatibility forms onto their
- * ASCII equivalents first, so `ＵＮＴＲＵＳＴＥＤ` cannot slip past the ASCII
- * pattern. Zero-width characters are stripped before matching, so a zero-width
- * character splitting the word cannot slip past it either.
- * human reading the log can see the text was altered.
+ * ASCII equivalents FIRST, so `ＵＮＴＲＵＳＴＥＤ` cannot slip past the ASCII
+ * pattern. Invisible characters are stripped SECOND, so one splitting the word
+ * cannot slip past it either. That order matters: NFKC folds NBSP to a plain
+ * space, so normalizing first lets the space-tolerant MARKER_GAP see it.
+ * Replacement is visible (`UNTRU_STED`, `~~~`) so a human reading the log can
+ * see the text was altered.
  *
  * Note: NFKC does not fold Cyrillic homoglyphs (`Е` U+0415 vs `E`) — those
  * survive as distinct characters and therefore do NOT match the marker pattern,
@@ -68,7 +88,7 @@ const RULE_LINE_RE = /^([ \t]*)-{3,}(.*?)-{3,}([ \t]*)$/gm;
 function defangFenceMarkers(text: string): string {
   return text
     .normalize('NFKC')
-    .replace(ZERO_WIDTH_RE, '')
+    .replace(INVISIBLE_RE, '')
     .replace(MARKER_RE, '$1$2UNTRU_STED')
     .replace(RULE_LINE_RE, '$1~~~$2~~~$3');
 }
@@ -85,7 +105,10 @@ function sanitizeLabel(label: string): string {
 
 /** Fence `text` with a labeled, nonce-bound untrusted-content marker pair. */
 export function wrapUntrusted(label: string, text: string): string {
-  const nonce = randomBytes(4).toString('hex');
+  // 16 bytes, not 4. The nonce's entire job is unguessability, and an app can
+  // plant many candidate close-markers in a single response (app_logs returns
+  // up to MAX_LOG_LINES), so 32 bits is a thinner margin than it looks.
+  const nonce = randomBytes(16).toString('hex');
   const safeLabel = sanitizeLabel(label);
   return [
     `${BEGIN_PREFIX} ${safeLabel} #${nonce} ${BEGIN_SUFFIX}`,
