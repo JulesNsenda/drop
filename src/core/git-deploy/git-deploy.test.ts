@@ -67,6 +67,10 @@ import {
   DeployRefusedError,
   guardrailKeysFor,
 } from '../../managers/guardrail/deploy-breaker';
+import {
+  getPrincipalQuota,
+  resetPrincipalQuota,
+} from '../../managers/guardrail/principal-quota';
 
 describe('GitDeployService', () => {
   let service: GitDeployService;
@@ -74,6 +78,13 @@ describe('GitDeployService', () => {
 
   beforeEach(async () => {
     tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'drop-git-test-'));
+
+    // The deploy quota is a singleton whose DEFAULT store path is relative and
+    // resolves against the process CWD. Left alone these tests would write into
+    // the repo and accumulate counts across runs until every deploy is refused.
+    resetDeployBreaker();
+    resetPrincipalQuota();
+    getPrincipalQuota(path.join(tempDir, 'principal-quotas.json'));
 
     // Initialize state manager
     resetStateManager();

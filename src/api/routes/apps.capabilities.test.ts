@@ -40,7 +40,7 @@ const RUNNING_PROCESS: AppProcessInfo = {
 function makeOps(overrides?: Partial<PlatformOps>): PlatformOps {
   return {
     restartApp: jest.fn().mockResolvedValue(RUNNING_PROCESS),
-    isAppInProgress: jest.fn().mockReturnValue(false),
+    isAppInProgress: jest.fn().mockReturnValue(false), promoteApp: jest.fn(),
     removeGroup: jest.fn().mockResolvedValue({ removed: [] }),
     purgeAppArtifacts: jest.fn().mockResolvedValue(undefined),
     ...overrides,

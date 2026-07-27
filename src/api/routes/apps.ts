@@ -858,6 +858,63 @@ apps.post('/:name/stop', async c => {
 });
 
 // POST /apps/:name/restart - Restart application
+// POST /:name/promote — put a held build in front of traffic (Step 6d).
+//
+// Owner or admin only, at role >= `user`, and NEVER an agent token: promotion
+// is the human decision the manual mode exists to require. An agent that could
+// promote its own build would make the gate a formality — so this checks the
+// credential KIND, not just the role, because an agent token can carry a role
+// and a scope can carry an app.
+apps.post('/:name/promote', async c => {
+  const auth = (c.get as Function)('auth') as AuthContext | undefined;
+  const name = c.req.param('name');
+  const stateManager = getStateManager();
+  const app = stateManager.getApp(name);
+
+  if (!app || !canAccess(auth, app)) {
+    throw new NotFoundError(`Application '${name}' not found`);
+  }
+
+  // Checked even though auth may be disabled: with auth off there is no agent
+  // context to speak of, and with it on this is the whole point of the gate.
+  if (auth?.kind === 'agent') {
+    return c.json(
+      error(
+        ErrorCodes.UNAUTHORIZED,
+        'Promotion requires a human session. Agent credentials cannot promote a build.'
+      ),
+      403
+    );
+  }
+  if (auth && auth.role !== 'admin' && auth.role !== 'user') {
+    return c.json(error(ErrorCodes.UNAUTHORIZED, 'Promotion requires at least the `user` role'), 403);
+  }
+
+  const ops = getPlatformOps();
+  if (!ops) {
+    return c.json(error(ErrorCodes.SERVICE_UNAVAILABLE, 'Platform operations unavailable'), 503);
+  }
+
+  try {
+    await ops.promoteApp(name);
+    await tryLogActivity({
+      action: 'promote',
+      userId: auth?.userId,
+      username: auth?.username,
+      principalId: auth?.principalId,
+      authMethod: auth?.authMethod,
+      appName: name,
+    });
+    return c.json(success({ app: name, promoted: true }));
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Promote failed';
+    if (message.includes('awaiting promotion')) {
+      return c.json(error(ErrorCodes.BAD_REQUEST, message), 400);
+    }
+    return c.json(error(ErrorCodes.INTERNAL_ERROR, message), 500);
+  }
+});
+
 apps.post('/:name/restart', async c => {
   const auth = (c.get as Function)('auth') as AuthContext | undefined;
   const name = c.req.param('name');

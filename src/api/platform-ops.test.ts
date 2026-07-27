@@ -18,20 +18,20 @@ describe('platform-ops singleton', () => {
   });
 
   it('get returns the exact ops object passed to set', () => {
-    const ops: PlatformOps = { restartApp: jest.fn(), isAppInProgress: jest.fn(), removeGroup: jest.fn(), purgeAppArtifacts: jest.fn().mockResolvedValue(undefined) };
+    const ops: PlatformOps = { restartApp: jest.fn(), isAppInProgress: jest.fn(), promoteApp: jest.fn(), removeGroup: jest.fn(), purgeAppArtifacts: jest.fn().mockResolvedValue(undefined) };
     setPlatformOps(ops);
     expect(getPlatformOps()).toBe(ops);
   });
 
   it('reset clears the wired ops back to null', () => {
-    setPlatformOps({ restartApp: jest.fn(), isAppInProgress: jest.fn(), removeGroup: jest.fn(), purgeAppArtifacts: jest.fn().mockResolvedValue(undefined) });
+    setPlatformOps({ restartApp: jest.fn(), isAppInProgress: jest.fn(), promoteApp: jest.fn(), removeGroup: jest.fn(), purgeAppArtifacts: jest.fn().mockResolvedValue(undefined) });
     resetPlatformOps();
     expect(getPlatformOps()).toBeNull();
   });
 
   it('setting twice keeps the latest ops', () => {
-    const first: PlatformOps = { restartApp: jest.fn(), isAppInProgress: jest.fn(), removeGroup: jest.fn(), purgeAppArtifacts: jest.fn().mockResolvedValue(undefined) };
-    const second: PlatformOps = { restartApp: jest.fn(), isAppInProgress: jest.fn(), removeGroup: jest.fn(), purgeAppArtifacts: jest.fn().mockResolvedValue(undefined) };
+    const first: PlatformOps = { restartApp: jest.fn(), isAppInProgress: jest.fn(), promoteApp: jest.fn(), removeGroup: jest.fn(), purgeAppArtifacts: jest.fn().mockResolvedValue(undefined) };
+    const second: PlatformOps = { restartApp: jest.fn(), isAppInProgress: jest.fn(), promoteApp: jest.fn(), removeGroup: jest.fn(), purgeAppArtifacts: jest.fn().mockResolvedValue(undefined) };
     setPlatformOps(first);
     setPlatformOps(second);
     expect(getPlatformOps()).toBe(second);

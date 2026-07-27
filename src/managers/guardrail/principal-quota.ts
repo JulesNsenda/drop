@@ -236,6 +236,15 @@ export class PrincipalQuota {
 
 let instance: PrincipalQuota | null = null;
 
+/**
+ * The singleton.
+ *
+ * The platform passes an absolute path under DROP_ROOT during startup. The
+ * fallback is RELATIVE and therefore resolves against the process CWD — which
+ * is wherever `drop serve` happened to be launched, not the DROP root — so it
+ * is a last resort for callers that run before initialization, never the
+ * intended production path.
+ */
 export function getPrincipalQuota(storePath?: string): PrincipalQuota {
   if (!instance) {
     instance = new PrincipalQuota(storePath ?? 'data/drop-svc/principal-quotas.json');

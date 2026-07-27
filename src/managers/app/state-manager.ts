@@ -88,6 +88,17 @@ export interface AppState {
    */
   parkedReason?: string;
   /**
+   * A build finished and is waiting for a human to promote it (Step 6d).
+   *
+   * A FLAG, not an `AppStatus` member (ARCH-14). The app's status is whatever
+   * it already was — a previously-running app keeps `running`, because the OLD
+   * version is still serving and untouched; a brand-new app stays `stopped`,
+   * because nothing has ever served. Both are true statements about what is
+   * running, which is what `status` answers; this answers a different
+   * question, so it gets its own field.
+   */
+  awaitingPromotion?: boolean;
+  /**
    * Grouping tag for apps expanded from a single monorepo deploy (e.g.
    * `ezsign-backend` / `ezsign-frontend` both tagged `group: ezsign`). Set via
    * `updateApp(name, { group })`, not `registerApp` — `AppConfig` (app-config.ts)
@@ -295,7 +306,7 @@ export class AppStateManager {
     return updated;
   }
 
-  async setAppStatus(name: string, status: AppStatus, details?: { port?: number; pid?: number; error?: string; missingSecrets?: string[]; readinessUnverified?: boolean; parkedReason?: string }): Promise<AppState | null> {
+  async setAppStatus(name: string, status: AppStatus, details?: { port?: number; pid?: number; error?: string; missingSecrets?: string[]; readinessUnverified?: boolean; parkedReason?: string; awaitingPromotion?: boolean }): Promise<AppState | null> {
     const app = this.apps.get(name);
     if (!app) return null;
 
