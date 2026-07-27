@@ -12,8 +12,8 @@
  *
  * SCOPE — this is the half of the plan's taxonomy that is derivable today.
  * Deliberately absent, each pending the step that can populate it:
- *   - INSTALL_MISSING_DEP / BUILD_TYPE_ERROR / MIGRATION_FAILED — need the
- *     log-matching classifier (Step 5).
+ *   - (INSTALL_MISSING_DEP / BUILD_TYPE_ERROR / MIGRATION_FAILED now exist, but
+ *     are produced by classify.ts, never by deriveErrorCode.)
  *   - BUILD_TIMEOUT / BUILD_ABORTED / DISK_FULL / DETECT_FAILED / NEEDS_CONFIG /
  *     CAPACITY_REACHED — reachable, but the failure paths that produce them do
  *     not yet carry a distinguishing signal into build:failed.
@@ -44,6 +44,12 @@ export type DeployErrorCode =
   // Boot phase
   | 'PROCESS_EXITED'
   | 'CRASH_LOOPED'
+  // Classifier refinements (Step 5) — produced ONLY by classify.ts, which
+  // sharpens a stage-derived code from the log tail. deriveErrorCode never
+  // returns these: they are not derivable from DROP-generated signals alone.
+  | 'INSTALL_MISSING_DEP'
+  | 'BUILD_TYPE_ERROR'
+  | 'MIGRATION_FAILED'
   // Fallback
   | 'UNKNOWN';
 
