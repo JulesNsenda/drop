@@ -25,6 +25,7 @@ import {
   isGitAvailable,
 } from './git-client';
 import { getStateManager } from '../../managers/app/state-manager';
+import { getAppConfigService } from '../../managers/app/app-config';
 import { getSecretManager } from '../../managers/secret';
 import { getLogger } from '../../utils/logger';
 import { hasEnoughDisk, getMinFreeDiskMb } from '../../utils/disk';
@@ -192,6 +193,13 @@ export class GitDeployService {
     // app:detected dropped mid-clone (isCloning guard) and never re-emitted -
     // the app would sit registered but never built until a lucky file change.
     // Same shape as the watcher's own publish; the detector resolves the type.
+    // ONLY on first creation (SEC-11) — deploy() rejects an existing app name
+    // above, so reaching here always means new. A redeploy goes through
+    // redeploy(), which never touches this flag.
+    if (request.agentCaller) {
+      await getAppConfigService().updateConfig(appName, { agentCreated: true });
+    }
+
     eventBus.publish('app:detected', {
       name: appName,
       path: destPath,

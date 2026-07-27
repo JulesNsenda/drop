@@ -578,7 +578,7 @@ export class ContainerManager implements AppRuntime {
    */
   private async fetchContainerStats(
     container: Docker.Container
-  ): Promise<{ memory: number; cpu: number }> {
+  ): Promise<{ memory: number; cpu: number; cpuTotalNs?: number }> {
     try {
       const raw = await container.stats({ stream: false }) as unknown as Record<string, unknown>;
       const memStats = raw.memory_stats as Record<string, number> | undefined;
@@ -599,8 +599,21 @@ export class ContainerManager implements AppRuntime {
       const cpuPercent =
         systemDelta > 0 ? (cpuDelta / systemDelta) * numCpus * 100 : 0;
 
-      return { memory: memUsage, cpu: Math.round(cpuPercent * 10) / 10 };
+      // The CUMULATIVE counter, not the derived percentage. Idle detection
+      // needs "did any work happen between these two moments", which a sampled
+      // percentage cannot answer — a request served between samples is invisible
+      // to it.
+      const cpuTotalNs = (cpuStats?.cpu_usage as Record<string, number>)?.total_usage;
+
+      return {
+        memory: memUsage,
+        cpu: Math.round(cpuPercent * 10) / 10,
+        ...(typeof cpuTotalNs === 'number' ? { cpuTotalNs } : {}),
+      };
     } catch {
+      // No cpuTotalNs on failure — absent means "unknown", and a 0 here would
+      // read as "did no work" and count toward reaping an app we simply could
+      // not measure.
       return { memory: 0, cpu: 0 };
     }
   }
