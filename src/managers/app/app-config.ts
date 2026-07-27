@@ -46,6 +46,14 @@ export interface AppConfig {
    * for apps that have never deployed — all three read as "no recorded
    * signature" and redeploy once (the migration seam).
    */
+  /**
+   * Per-app disk ceiling in MB, overriding DROP_MAX_APP_DISK_MB.
+   *
+   * An explicit 0 EXEMPTS this app, which is deliberately distinct from unset:
+   * an operator can excuse one legitimately large app without disabling the
+   * ceiling for everything else.
+   */
+  maxDiskMb?: number;
   sourceHash?: string;
   /**
    * SHA-256 fingerprint of the app's secret key/value set (sorted, hashed —
