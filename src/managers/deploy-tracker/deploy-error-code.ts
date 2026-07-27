@@ -44,6 +44,7 @@ export type DeployErrorCode =
   // Boot phase
   | 'PROCESS_EXITED'
   | 'CRASH_LOOPED'
+  | 'OOM_KILLED'
   // Classifier refinements (Step 5) — produced ONLY by classify.ts, which
   // sharpens a stage-derived code from the log tail. deriveErrorCode never
   // returns these: they are not derivable from DROP-generated signals alone.
@@ -78,6 +79,8 @@ function codeForReason(reason: DeployFailureReason): DeployErrorCode {
       return 'PROCESS_EXITED';
     case 'crash-looped':
       return 'CRASH_LOOPED';
+    case 'oom-killed':
+      return 'OOM_KILLED';
   }
 }
 

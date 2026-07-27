@@ -283,7 +283,7 @@ export type DeployFailurePhase = 'boot';
  * leniency for slow starters). Adding a member no publisher can produce would
  * be the same unreachable-value defect as a constant field.
  */
-export type DeployFailureReason = 'process-exited' | 'crash-looped';
+export type DeployFailureReason = 'process-exited' | 'crash-looped' | 'oom-killed';
 
 /**
  * A deploy that got past the build and then failed. Widens the boot-failure

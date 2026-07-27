@@ -453,6 +453,35 @@ describe('ContainerManager', () => {
       expect(status).toBeNull();
     });
 
+    it('CARRIES State.OOMKilled instead of discarding it', async () => {
+      // It was read only to fold into `errored` and then thrown away, so an app
+      // killed for exceeding its memory limit was indistinguishable from one
+      // that crashed on a bug — and those need opposite fixes.
+      const state = { ...makeState(false, 137), OOMKilled: true };
+      const container = makeMockContainer('my-app', makeInspectInfo('my-app', state));
+      const docker = makeDockerMock({ 'my-app': container }) as any;
+      const mgr = new ContainerManager(docker);
+
+      const info = await mgr.getStatus('my-app');
+
+      expect(info?.oomKilled).toBe(true);
+    });
+
+    it('reports oomKilled false for an ordinary non-zero exit', async () => {
+      // The value must track the container, not be a constant. A field that is
+      // always true is as useless as one that was always discarded.
+      const container = makeMockContainer(
+        'my-app',
+        makeInspectInfo('my-app', makeState(false, 1))
+      );
+      const docker = makeDockerMock({ 'my-app': container }) as any;
+      const mgr = new ContainerManager(docker);
+
+      const info = await mgr.getStatus('my-app');
+
+      expect(info?.oomKilled).toBe(false);
+    });
+
     it('maps running → running', async () => {
       const container = makeMockContainer('my-app', makeInspectInfo('my-app', makeState(true)));
       const docker = makeDockerMock({ 'my-app': container }) as any;
