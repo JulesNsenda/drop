@@ -26,9 +26,10 @@
  *  - `next_actions` is a closed union of tool-name literals. Never derived
  *    from output, and never carries arguments.
  *
- * `file` and `line` are absent: they come from the log classifier (Step 5),
- * which is also where their own validation belongs — `path.relative` alone
- * does NOT make an extracted path safe.
+ * `file` and `line` come from the log classifier, which validates them at the
+ * point of extraction — `path.relative` alone does NOT make an extracted path
+ * safe, so `classify.ts` additionally requires an allowlist match. Absent
+ * whenever safety could not be proven.
  */
 
 import type { DeployErrorCode } from '../../managers/deploy-tracker';
@@ -57,6 +58,14 @@ export interface DeployResult {
   stage?: BuildStage;
   exit_code?: number;
   command?: DeployCommandKind;
+  /**
+   * Relative source path from the classifier. VALIDATED there
+   * (`safeRelativePath`) — it is extracted from tenant build output and lands
+   * in this unfenced field, so `path.relative` containment alone is NOT
+   * sufficient. Absent whenever it could not be proven safe.
+   */
+  file?: string;
+  line?: number;
   hint?: string;
   /** Application output. FENCED — the one untrusted field here. */
   output_tail?: string;
@@ -103,6 +112,12 @@ const HINTS: Record<DeployErrorCode, string> = {
     'The app started and then exited before it was ready. This is almost always a crash at startup — check the runtime logs, not the build log.',
   CRASH_LOOPED:
     'The app restarted repeatedly at startup. A missing environment variable or an unreachable dependency is the usual cause.',
+  INSTALL_MISSING_DEP:
+    'A dependency could not be resolved from the registry. Check the package name and version — a typo, a private package, or a version that does not exist are the usual causes.',
+  BUILD_TYPE_ERROR:
+    'The build failed on a compile or module-resolution error. If a file and line are reported, start there.',
+  MIGRATION_FAILED:
+    'This looks like a database migration failure. DROP infers this from the log, so treat it as a strong hint rather than a certainty — the migration may have partially applied.',
   UNKNOWN:
     'DROP could not classify this failure. The phase, stage and log tail are still accurate.',
 };

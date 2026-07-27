@@ -39,7 +39,7 @@ import { getGitDeployService } from '../../core/git-deploy';
 import { getDeployTracker } from '../../managers/deploy-tracker';
 import type { DeployEpisode } from '../../managers/deploy-tracker';
 import { getBuildLogService } from '../../managers/build-log/build-log';
-import { getTempDirectory } from '../runtime-config';
+import { getTempDirectory, getAppsDirectory } from '../runtime-config';
 import { runUploadPreflight } from '../upload-preflight';
 import { wrapUntrusted } from './untrusted';
 import {
@@ -50,6 +50,7 @@ import {
   nextActionsFor,
 } from './deploy-result';
 import { getDeployDetailStore } from '../../managers/deploy-tracker';
+import { classifyBuildFailure } from '../../core/builder/classify';
 import { computeAppUrl } from '../routes/apps';
 import { getPlatformVersion } from '../../utils/version';
 
@@ -165,7 +166,16 @@ async function failureResult(appName: string, episode: DeployEpisode): Promise<C
   const fencedTail = logTail ? wrapUntrusted(`BUILD LOG: ${appName}`, logTail) : undefined;
   const text = fencedTail ? `${summary}\n\n${fencedTail}` : summary;
 
-  const errorCode = detail?.errorCode ?? 'UNKNOWN';
+  const derivedCode = detail?.errorCode ?? 'UNKNOWN';
+  // Refine the DROP-derived code from the log tail. Classification is derived
+  // at READ time from output already in hand, deliberately not persisted: a
+  // GET handler mutating the coalescing store is the concurrency hazard
+  // ARCH-15 flags, and no other route in src/api/routes/ does it. The
+  // classifier is pure and only ever SHARPENS the code — it cannot contradict
+  // the stage the builder reported, and a miss leaves the verdict untouched.
+  const refined = classifyBuildFailure(logTail, derivedCode, path.join(getAppsDirectory(), appName));
+  const errorCode = refined.errorCode ?? derivedCode;
+
   const structured: DeployResult = {
     ok: false,
     deploy_id: episode.deployId,
@@ -179,6 +189,8 @@ async function failureResult(appName: string, episode: DeployEpisode): Promise<C
     // tenant-authored drop.yaml `build:` override. The literal command line
     // stays inside the fenced tail above.
     command: detail?.stage ? commandKindForStage(detail.stage) : undefined,
+    file: refined.file,
+    line: refined.line,
     hint: hintFor(errorCode),
     output_tail: fencedTail,
     next_actions: nextActionsFor('failed', detail?.phase),
