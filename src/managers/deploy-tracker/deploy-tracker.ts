@@ -2,10 +2,14 @@
  * DeployTracker
  *
  * Bus-observer that appends flat milestone rows to a durable store as
- * pipeline events fire, correlated by an observer-minted `deployId`. Deploy
- * *status* is never persisted — it is derived at read time from the rows
- * (see `getEpisodes`). See docs/plans/2026-07-06-p2-4-deploy-observability.md
- * for the full design rationale.
+ * pipeline events fire, correlated by a `deployId` the observer ADOPTS from
+ * `build:started` when the publisher supplies one, and mints itself otherwise.
+ * (It was mint-only until deploy-id threading; an observer-minted id is not
+ * something the caller can reference, so the platform now mints at the call
+ * site that begins the deploy and threads it through.) Deploy *status* is
+ * never persisted — it is derived at read time from the rows (see
+ * `getEpisodes`). See docs/plans/2026-07-06-p2-4-deploy-observability.md for
+ * the full design rationale.
  *
  * Hard invariants (do not relax without re-reading the plan):
  *  - Every handler mutates in-memory state SYNCHRONOUSLY at the top, then
@@ -140,11 +144,26 @@ export class DeployTracker {
     const appName = this.resolveAppName(payload);
     const at = payload.timestamp.toISOString();
 
-    // Mint a new deployId. If one was already open for this app (a new build
-    // fired before the previous one closed), it is simply overwritten here —
-    // the old episode stays un-terminated and derives as 'superseded' at read
-    // time; we do not need to do anything special with it.
-    const deployId = randomUUID();
+    // ADOPT the publisher's deployId when there is one, so the episode carries
+    // the same id the caller already holds (and the same one encoded into the
+    // build log filename). Minting here unconditionally, as this did, produced
+    // an id nothing upstream could reference.
+    //
+    // The fallback stays: any publisher without one still gets a working
+    // episode. It is logged rather than silent — a deploy arriving with no id
+    // means a call site was missed, and that is invisible otherwise.
+    //
+    // Either way, if an episode was already open for this app (a new build
+    // fired before the previous one closed) it is simply overwritten — the old
+    // episode stays un-terminated and derives as 'superseded' at read time.
+    let deployId = payload.deployId;
+    if (!deployId) {
+      deployId = randomUUID();
+      console.debug(
+        `[DeployTracker] build:started for '${appName}' carried no deployId; minted ${deployId}. ` +
+          'The publisher is not threading one — the deploy is not addressable end to end.'
+      );
+    }
     this.active.set(appName, deployId);
 
     const pending = this.pendingTrigger.get(appName);

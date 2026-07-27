@@ -3304,3 +3304,130 @@ describe('handleStartApp — readiness gate (M3 3a)', () => {
     expect(crashWatchSpy).toHaveBeenCalledWith('gatedapp');
   });
 });
+describe('Step 0 — one deploy id threaded through both build paths', () => {
+  // The id has to reach BOTH sinks and be the SAME in each: the build log
+  // filename (so the log is retrievable by deploy) and the build's events (so
+  // DeployTracker's episode carries it). An id that reaches only one of them
+  // correlates nothing.
+  //
+  // Both paths are covered deliberately. The first draft of this step threaded
+  // only handleBuildApp, which would have left every REDEPLOY unaddressable —
+  // and upload-deploy routes all existing apps through handleAppUpdate, so
+  // that is the dominant path for an agent.
+  let platform: DropPlatform;
+  let tempDir: string;
+  let startBuild: jest.Mock;
+
+  beforeEach(async () => {
+    jest.clearAllMocks();
+    tempDir = path.join(os.tmpdir(), `drop-deployid-${Date.now()}`);
+    platform = createPlatform({
+      dropRoot: tempDir,
+      appsDirectory: path.join(tempDir, 'apps'),
+      logLevel: 'error',
+      autoBuild: true,
+      autoStart: false,
+      caddyfilePath: path.join(tempDir, 'Caddyfile'),
+    });
+    await platform.start();
+
+    // Stub rather than null: these tests exist to observe what startBuild is
+    // handed, which the `buildLogService = null` shortcut would erase.
+    startBuild = jest.fn().mockResolvedValue('log-1');
+    (platform as any).buildLogService = {
+      startBuild,
+      writeLine: jest.fn(),
+      finishBuild: jest.fn().mockResolvedValue(undefined),
+    };
+  });
+
+  afterEach(async () => {
+    if (platform && platform.isActive()) {
+      await platform.stop();
+    }
+  });
+
+  const stubDetect = (type: string) =>
+    jest.spyOn(platform.getDetector()!, 'detect').mockResolvedValue({
+      type,
+      framework: null,
+      suggestedConfig: {},
+    } as any);
+
+  it('threads the same id to the build log and the builder on a fresh deploy', async () => {
+    stubDetect('nodejs');
+    const build = jest.spyOn(platform.getBuilder()!, 'build').mockResolvedValue({
+      success: true,
+      duration: 5,
+      errors: [],
+    } as any);
+
+    await (platform as any).handleBuildApp(path.join(tempDir, 'apps', 'app'), 'app', 'unknown');
+    (platform as any).appsInProgress.clear();
+
+    const contextId = build.mock.calls[0][0].deployId;
+    const logFileId = startBuild.mock.calls[0][2];
+
+    expect(contextId).toEqual(expect.any(String));
+    expect(contextId).not.toHaveLength(0);
+    expect(logFileId).toBe(contextId);
+  });
+
+  it('threads the same id on the REDEPLOY path too', async () => {
+    const sm = (platform as any).stateManager;
+    sm.getApp.mockReturnValue({ name: 'app', status: 'running', port: 3005 });
+    stubDetect('nodejs');
+    const build = jest.spyOn(platform.getBuilder()!, 'build').mockResolvedValue({
+      success: false,
+      errors: [{ message: 'stub' }],
+    } as any);
+
+    await (platform as any).handleAppUpdate('app', path.join(tempDir, 'apps', 'app'), 'edit');
+
+    const contextId = build.mock.calls[0][0].deployId;
+    const logFileId = startBuild.mock.calls[0][2];
+
+    expect(contextId).toEqual(expect.any(String));
+    expect(contextId).not.toHaveLength(0);
+    expect(logFileId).toBe(contextId);
+  });
+
+  it('mints a distinct id per deploy, not a constant', async () => {
+    // Guards the degenerate implementation that satisfies both tests above:
+    // a fixed string threads consistently and correlates nothing.
+    stubDetect('nodejs');
+    const build = jest.spyOn(platform.getBuilder()!, 'build').mockResolvedValue({
+      success: true,
+      duration: 5,
+      errors: [],
+    } as any);
+
+    await (platform as any).handleBuildApp(path.join(tempDir, 'apps', 'app'), 'app', 'unknown');
+    (platform as any).appsInProgress.clear();
+    await (platform as any).handleBuildApp(path.join(tempDir, 'apps', 'app2'), 'app2', 'unknown');
+    (platform as any).appsInProgress.clear();
+
+    expect(build.mock.calls[0][0].deployId).not.toBe(build.mock.calls[1][0].deployId);
+  });
+
+  it('gives a pre-build failure its own id rather than leaving the tracker to invent one', async () => {
+    // handleAppDetected's unknown-type branch never reaches a build, so it
+    // never had an id. The episode is still a real terminal outcome for a real
+    // deploy attempt and has to be nameable like any other.
+    const published: Array<{ deployId?: string }> = [];
+    jest.spyOn(platform.getEventBus(), 'publish').mockImplementation((type: any, payload: any) => {
+      if (type === 'build:started') published.push(payload);
+      return undefined as any;
+    });
+
+    await (platform as any).handleAppDetected({
+      name: 'undetectable',
+      path: path.join(tempDir, 'apps', 'undetectable'),
+      type: 'unknown',
+      timestamp: new Date(),
+    });
+
+    expect(published.length).toBeGreaterThan(0);
+    expect(published[published.length - 1].deployId).toEqual(expect.any(String));
+  });
+});
