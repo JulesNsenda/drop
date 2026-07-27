@@ -114,6 +114,21 @@ export interface AppProcessInfo {
   restarts: number;
   createdAt: Date | null;
   restartedAt: Date | null;
+  /**
+   * Whether the kernel OOM-killed this app, from `State.OOMKilled`.
+   *
+   * DOCKER ONLY, and only while the container is actually down. DROP runs
+   * containers with `RestartPolicy: on-failure` (max 5), and Docker clears the
+   * flag on the new run — so an app that is up again after an OOM reads
+   * `false`, not `true`. It is authoritative when true and says nothing when
+   * false.
+   *
+   * Always `undefined` under PM2, which cannot report this at all:
+   * `max_memory_restart` RESTARTS on exceed rather than capping, so an OOM is
+   * indistinguishable from any other crash-loop. Left undefined rather than
+   * `false` so the two cases stay distinguishable — "not OOM" vs "cannot know".
+   */
+  oomKilled?: boolean;
 }
 
 /**

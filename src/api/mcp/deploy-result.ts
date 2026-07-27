@@ -117,6 +117,8 @@ const HINTS: Record<DeployErrorCode, string> = {
     'The app started and then exited before it was ready. This is almost always a crash at startup — check the runtime logs, not the build log.',
   CRASH_LOOPED:
     'The app restarted repeatedly at startup. A missing environment variable or an unreachable dependency is the usual cause.',
+  OOM_KILLED:
+    'The kernel killed this app for exceeding its memory limit. Reduce what the app holds in memory, or ask an admin to raise the limit — restarting unchanged will hit the same ceiling. DROP reports this only when the container runtime confirmed it, so it is a fact rather than an inference.',
   INSTALL_MISSING_DEP:
     'A dependency could not be resolved from the registry. Check the package name and version — a typo, a private package, or a version that does not exist are the usual causes.',
   BUILD_TYPE_ERROR:

@@ -4690,21 +4690,42 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     const baselineRestarts = (await this.runtime.getStatus(appName))?.restarts ?? 0;
     const start = Date.now();
 
-    /** Whether the process died or restarted (crash-loop) since start. */
-    const liveness = async (): Promise<{ dead: boolean; crashed: boolean }> => {
+    /**
+     * Whether the process died or restarted (crash-loop) since start, and
+     * whether the runtime CONFIRMED an OOM kill.
+     *
+     * `oomKilled` rides on the `dead` branch only, and that is not an
+     * oversight: DROP runs containers with `RestartPolicy: on-failure`, and
+     * Docker clears `State.OOMKilled` on the new run — so a container that is
+     * back up after an OOM reports `false`. The flag is therefore readable
+     * exactly when the app has stopped for good, which is the `dead` case.
+     * A crash-loop that happens to be OOM is reported as `crash-looped`,
+     * because at that moment nothing can prove otherwise.
+     */
+    const liveness = async (): Promise<{ dead: boolean; crashed: boolean; oomKilled: boolean }> => {
       const info = await this.runtime?.getStatus(appName);
       if (!info || info.status === 'stopped' || info.status === 'errored') {
-        return { dead: true, crashed: false };
+        return { dead: true, crashed: false, oomKilled: info?.oomKilled === true };
       }
-      return { dead: false, crashed: info.restarts > baselineRestarts };
+      return { dead: false, crashed: info.restarts > baselineRestarts, oomKilled: false };
     };
+
+    /** The configured ceiling, named in the reason so the app owner can act. */
+    const limitText = spec.limits?.memory ? ` (memory limit ${spec.limits.memory})` : '';
+    const oomVerdict = () => ({
+      ok: false,
+      reason: `killed for exceeding its memory limit${limitText}`,
+      failure: 'oom-killed' as const,
+    });
 
     // Poll: succeed as soon as an HTTP probe answers; fail as soon as the
     // process dies or crash-loops.
     while (Date.now() - start < windowMs) {
       const l = await liveness();
-      if (l.dead)
+      if (l.dead) {
+        if (l.oomKilled) return oomVerdict();
         return { ok: false, reason: 'process exited during startup', failure: 'process-exited' };
+      }
       if (l.crashed)
         return {
           ok: false,
@@ -4720,8 +4741,10 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
 
     // Window elapsed with no HTTP success — classify the (stable) process.
     const l = await liveness();
-    if (l.dead)
+    if (l.dead) {
+      if (l.oomKilled) return oomVerdict();
       return { ok: false, reason: 'process exited during startup', failure: 'process-exited' };
+    }
     if (l.crashed)
       return { ok: false, reason: 'process crash-looped during startup', failure: 'crash-looped' };
     const bound = await probePort('127.0.0.1', port, 1000);
@@ -4764,13 +4787,23 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         }
         if (this.stateManager?.getApp(appName)?.status !== 'running') return;
         if (info.restarts - baseline >= this.CRASHLOOP_RESTART_THRESHOLD) {
+          // Docker clears OOMKilled on the next run, so this is true only on a
+          // tick that catches the app down. When it does, say so — "restarting
+          // repeatedly" sends an operator looking for a crash bug, and raising
+          // the memory limit is a different fix entirely.
+          const oom = info.oomKilled === true;
           this.logger.appEvent(
             'error',
             appName,
-            `crash-looping (${info.restarts - baseline} restarts since deploy)`
+            oom
+              ? `crash-looping — killed for exceeding its memory limit ` +
+                  `(${info.restarts - baseline} restarts since deploy)`
+              : `crash-looping (${info.restarts - baseline} restarts since deploy)`
           );
           await this.stateManager?.setAppStatus(appName, 'crash-looping', {
-            error: 'Process is restarting repeatedly',
+            error: oom
+              ? 'Killed for exceeding its memory limit'
+              : 'Process is restarting repeatedly',
           });
           baseline = info.restarts; // re-baseline so we don't re-flag every tick
         }
