@@ -121,6 +121,22 @@ deploys.get('/:deployId', async (c) => {
     throw new NotFoundError(`No deploy found for '${deployId}'`);
   }
 
+  // Belt and braces for a RETAINED record (its app is gone; teardown freed the
+  // name). If that name now belongs to a DIFFERENT owner, refuse — even though
+  // the snapshot check above already passed. The bytes are copied out at
+  // teardown so there is no path-based leak left, but a name collision across
+  // tenants is precisely the situation where a stale snapshot would be the
+  // only thing standing between them.
+  // Admins are exempt: they pass canAccess for everything, and 404-ing an
+  // admin investigating a retained record the moment anyone re-registers the
+  // name is an availability bug, not a protection.
+  if (detail.retainUntil && auth?.role !== 'admin') {
+    const liveApp = getStateManager().getApp(detail.appName);
+    if (liveApp && liveApp.userId !== detail.userId) {
+      throw new NotFoundError(`No deploy found for '${deployId}'`);
+    }
+  }
+
   return c.json(success(toDetailDto(detail)));
 });
 
