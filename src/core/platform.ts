@@ -3276,6 +3276,10 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       const readiness = await this.awaitReadiness(appName, port, spec);
       if (!readiness.ok) {
         this.logger.appEvent('error', appName, `readiness check failed: ${readiness.reason}`);
+        // Close the runtime-log window FIRST. Without an end offset a retained
+        // copy runs start-to-EOF, which sweeps in anything appended after this
+        // deploy died — including by a re-registered app of the same name.
+        await this.noteRuntimeLogEnd(appName);
         // Published BEFORE the 'errored' status write below: that write is
         // what closes the deploy episode, and a subscriber correlating by app
         // name needs the episode still open to resolve this app's deployId.
@@ -4172,7 +4176,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     // (SEC-3). Hooked here rather than at the two delete call sites because
     // this method is the single funnel both of them go through.
     try {
-      await getDeployDetailStore().retainForApp(name);
+      await getDeployDetailStore().retainForApp(name, opts);
     } catch (error) {
       // Never block a delete that is already happening.
       this.logger.warn(`Failed to retain deploy details for ${name}`, 'CLEANUP', error);
@@ -4919,6 +4923,32 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     } catch {
       // Store not initialised (isolated tests), or the log dir is unreadable.
       // A missing offset costs a log tail, never a deploy.
+    }
+  }
+
+  /**
+   * Record where this deploy's runtime output ENDS. Mirror of
+   * noteRuntimeLogStart, called on the failure path — the only path that
+   * produces a retained record. Best-effort; a missing end just means the
+   * copy falls back to its byte cap.
+   */
+  private async noteRuntimeLogEnd(appName: string): Promise<void> {
+    try {
+      const { outFile, errorFile } = await this.getAppLogPaths(appName);
+      const sizeOf = async (file: string): Promise<number> => {
+        try {
+          return (await fs.stat(file)).size;
+        } catch {
+          return 0;
+        }
+      };
+      const [outEndOffset, errEndOffset] = await Promise.all([
+        sizeOf(outFile),
+        sizeOf(errorFile),
+      ]);
+      getDeployDetailStore().noteRuntimeLogEnd(appName, { outEndOffset, errEndOffset });
+    } catch {
+      // Store not initialised, or the log dir is unreadable.
     }
   }
 

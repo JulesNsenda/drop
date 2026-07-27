@@ -351,6 +351,166 @@ describe('DeployDetailStore', () => {
     });
   });
 
+  describe('retained log copy', () => {
+    let logDir: string;
+
+    const seed = async (before: string, during: string, after = '') => {
+      logDir = path.join(tmpDir, 'logs');
+      await fs.mkdir(logDir, { recursive: true });
+      const outFile = path.join(logDir, 'app-out.log');
+      const errFile = path.join(logDir, 'app-err.log');
+      await fs.writeFile(outFile, before, 'utf-8');
+      await fs.writeFile(errFile, '', 'utf-8');
+      const start = Buffer.byteLength(before, 'utf-8');
+      await fs.appendFile(outFile, during, 'utf-8');
+      const end = Buffer.byteLength(before + during, 'utf-8');
+      if (after) await fs.appendFile(outFile, after, 'utf-8');
+      return {
+        outFile,
+        errFile,
+        outStartOffset: start,
+        errStartOffset: 0,
+        outEndOffset: end,
+        errEndOffset: 0,
+      };
+    };
+
+    const failWith = async (app: string, id: string, offsets: unknown) => {
+      openEpisode(app, id);
+      store.noteRuntimeLog(app, offsets as never);
+      bus.publish('deploy:failed', { appId: app, phase: 'boot', reason: 'crash-looped' });
+      await store.flush();
+    };
+
+    it('copies only THIS deploy window, not the whole shared file', async () => {
+      const offsets = await seed('PREVIOUS DEPLOY\n', 'MY DEPLOY\n');
+      await failWith('app', 'c-1', offsets);
+
+      await store.retainForApp('app', { keepData: true });
+
+      const body = await fs.readFile(store.getDetail('c-1')!.retainedLogFile as string, 'utf-8');
+      expect(body).toContain('MY DEPLOY');
+      expect(body).not.toContain('PREVIOUS DEPLOY');
+    });
+
+    it('stops at the END offset, so a re-registered app output is excluded', async () => {
+      // The window closes when the deploy fails. Reading to EOF would sweep
+      // in whatever was appended afterwards - and teardown FREES the app
+      // name, so that can be a different tenant writing to the same path.
+      const offsets = await seed('old\n', 'MINE\n', 'NEXT TENANT OUTPUT\n');
+      await failWith('app', 'c-2', offsets);
+
+      await store.retainForApp('app', { keepData: true });
+
+      const body = await fs.readFile(store.getDetail('c-2')!.retainedLogFile as string, 'utf-8');
+      expect(body).toContain('MINE');
+      expect(body).not.toContain('NEXT TENANT OUTPUT');
+    });
+
+    it('REFUSES to follow a symlink', async () => {
+      // Under pm2 isolation the app runs as the drop user and can point its
+      // own log at api-credentials.json or the encryption key. Following it
+      // would make the platform copy that out on the app's behalf.
+      logDir = path.join(tmpDir, 'symlink-logs');
+      await fs.mkdir(logDir, { recursive: true });
+      const secret = path.join(tmpDir, 'api-credentials.json');
+      await fs.writeFile(secret, 'SUPER SECRET KEY', 'utf-8');
+      const link = path.join(logDir, 'app-out.log');
+      let linked = true;
+      try {
+        await fs.symlink(secret, link);
+      } catch {
+        // Unprivileged Windows cannot create symlinks. Marked rather than
+        // silently returning, so this cannot look like a pass it never made.
+        // It DOES run on the ubuntu CI, which is where it matters.
+        linked = false;
+      }
+      if (!linked) return;
+
+      await failWith('sym', 'c-3', {
+        outFile: link,
+        errFile: path.join(logDir, 'app-err.log'),
+        outStartOffset: 0,
+        errStartOffset: 0,
+      });
+
+      await store.retainForApp('sym', { keepData: true });
+
+      expect(store.getDetail('c-3')?.retainedLogFile).toBeUndefined();
+    });
+
+    it('produces no copy when the log path is not a regular file', async () => {
+      // Runs everywhere, unlike the symlink case above. It does NOT pin the
+      // isFile guard — mutation-checking showed the read fails anyway on a
+      // directory (EISDIR), so this passes with the guard removed. It is a
+      // behavioural check, not a proof of that guard; the symlink test is the
+      // one that pins the security property, and it runs only on Linux CI.
+      const dirAsLog = path.join(tmpDir, 'not-a-file');
+      await fs.mkdir(dirAsLog, { recursive: true });
+
+      await failWith('dir', 'c-3b', {
+        outFile: dirAsLog,
+        errFile: dirAsLog,
+        outStartOffset: 0,
+        errStartOffset: 0,
+      });
+
+      await store.retainForApp('dir', { keepData: true });
+
+      expect(store.getDetail('c-3b')?.retainedLogFile).toBeUndefined();
+    });
+
+    it('copies NOTHING on a plain delete', async () => {
+      // keepData:false is an explicit destroy. stdout routinely carries
+      // DATABASE_URL and injected secrets, so creating a fresh copy of it
+      // during a destroy would be exactly backwards.
+      const offsets = await seed('', 'sensitive DATABASE_URL=postgres://u:pw@h/db\n');
+      await failWith('kd', 'c-4', offsets);
+
+      await store.retainForApp('kd');
+
+      expect(store.getDetail('c-4')?.retainedLogFile).toBeUndefined();
+      expect(store.getDetail('c-4')?.runtimeLog).toBeUndefined();
+    });
+
+    it('still clears the name-keyed pointer even when it copies nothing', async () => {
+      // The SEC-3 leak is the dangling pointer, not the missing copy.
+      const offsets = await seed('', 'out\n');
+      await failWith('kd2', 'c-5', offsets);
+
+      await store.retainForApp('kd2');
+
+      expect(store.getDetail('c-5')?.runtimeLog).toBeUndefined();
+    });
+
+    it('unlinks the copy when the record is swept', async () => {
+      const offsets = await seed('', 'out\n');
+      await failWith('sw', 'c-6', offsets);
+      await store.retainForApp('sw', { keepData: true });
+      const copied = store.getDetail('c-6')!.retainedLogFile as string;
+      const until = store.getDetail('c-6')!.retainUntil as string;
+
+      await store.sweepExpired(Date.parse(until) + 1000);
+
+      await expect(fs.access(copied)).rejects.toBeDefined();
+    });
+
+    it('reclaims an orphaned copy on initialize', async () => {
+      // The MAX_DETAILS trim drops records without unlinking, and nothing
+      // else walks this directory - LogRetentionService only sweeps the logs
+      // root. Without this, churn leaves app stdout on disk forever.
+      const orphanDir = path.join(tmpDir, 'deploy-details');
+      await fs.mkdir(orphanDir, { recursive: true });
+      const orphan = path.join(orphanDir, 'no-such-deploy.log');
+      await fs.writeFile(orphan, 'leftover stdout', 'utf-8');
+
+      const reloaded = new DeployDetailStore(storePath);
+      await reloaded.initialize();
+
+      await expect(fs.access(orphan)).rejects.toBeDefined();
+    });
+  });
+
   describe('persistence', () => {
     it('survives a round trip to disk', async () => {
       openEpisode('persist', 'p-1');
