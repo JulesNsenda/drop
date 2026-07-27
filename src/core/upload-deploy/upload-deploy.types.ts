@@ -11,6 +11,12 @@ export interface UploadDeployRequest {
   appName: string;
   archivePath: string;
   userId?: string;
+  /**
+   * The credential that asked for this deploy, for guardrail keying — NOT for
+   * authorization, which happened at the route or tool boundary. Absent when
+   * DROP triggered the deploy itself.
+   */
+  principalId?: string;
 }
 
 /**

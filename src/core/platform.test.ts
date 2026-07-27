@@ -3439,11 +3439,15 @@ describe('Step 0 — one deploy id threaded through both build paths', () => {
   });
 });
 
-describe('Step 7 — deploy guardrail at the choke point', () => {
-  // Gated in handleBuildApp, NOT at the tool boundaries (SEC-15). It is the one
-  // path every deploy traverses — watcher, webhook, git, upload, MCP — so a
-  // tool-boundary gate would leave webhook- and watcher-driven redeploy loops
-  // completely unthrottled.
+describe('Step 7 — deploy guardrail at the choke points', () => {
+  // Gated inside the platform, NOT at the tool boundaries (SEC-15): a
+  // tool-boundary gate leaves webhook- and watcher-driven loops unthrottled.
+  //
+  // TWO gates, because there are two build paths. handleBuildApp builds a NEW
+  // app; handleAppUpdate has its own build and never calls handleBuildApp, so
+  // gating only the former covered only first deploys — while redeploy is the
+  // path an agent loop actually rides and where upload-deploy and git-redeploy
+  // send every app that already exists.
   let platform: DropPlatform;
   let tempDir: string;
   let buildSpy: jest.Mock;
@@ -3484,7 +3488,7 @@ describe('Step 7 — deploy guardrail at the choke point', () => {
       path.join(tempDir, 'apps', 'loopy'),
       'loopy',
       'nodejs',
-      PRINCIPAL
+      { principalId: PRINCIPAL, actorUserId: 'human-1' }
     );
     (platform as any).appsInProgress.clear();
   };
@@ -3521,7 +3525,7 @@ describe('Step 7 — deploy guardrail at the choke point', () => {
       path.join(tempDir, 'apps', 'loopy'),
       'loopy',
       'nodejs',
-      'key:a-different-token'
+      { principalId: 'key:a-different-token', actorUserId: 'human-2' }
     );
     (platform as any).appsInProgress.clear();
 
@@ -3536,6 +3540,142 @@ describe('Step 7 — deploy guardrail at the choke point', () => {
 
     await (platform as any).handleBuildApp(path.join(tempDir, 'apps', 'loopy'), 'loopy', 'nodejs');
     (platform as any).appsInProgress.clear();
+
+    expect(buildSpy).toHaveBeenCalled();
+  });
+
+  it('counts the REDEPLOY path, which does not route through handleBuildApp', async () => {
+    // The gap this closes. handleAppUpdate has its own build and never calls
+    // handleBuildApp, so before this every redeploy — the dominant path for an
+    // agent, and the shape an actual loop takes — was ungated and uncounted.
+    const appPath = path.join(tempDir, 'apps', 'loopy');
+    // Stubbed HERE rather than relying on a registerApp call: the state manager
+    // is module-mocked in this file and getApp defaults to undefined, so an
+    // earlier test's leaked mockReturnValue is the only thing that would make
+    // this pass otherwise — which it silently did until a mutation check
+    // removed the gate and the test kept passing.
+    const stateManager = platform.getStateManager()!;
+    (stateManager.getApp as jest.Mock).mockReturnValue({
+      name: 'loopy',
+      path: appPath,
+      type: 'nodejs',
+      status: 'running',
+      port: 4321,
+      userId: 'human-1',
+    });
+
+    const redeploy = async () => {
+      await (platform as any).handleAppUpdate('loopy', appPath, 'upload deploy', true, {
+        principalId: PRINCIPAL,
+        actorUserId: 'human-1',
+      });
+      (platform as any).appsInProgress.clear();
+    };
+
+    for (let i = 0; i < 5; i++) await redeploy();
+    expect(buildSpy).toHaveBeenCalled();
+    buildSpy.mockClear();
+
+    await redeploy();
+
+    expect(buildSpy).not.toHaveBeenCalled();
+  });
+
+  it('trips the OWNER backstop when the caller keeps re-minting principals', async () => {
+    // The per-principal window alone is defeatable with no attacker effort: a
+    // fresh authorization-code exchange mints a new sid, so "reconnect" hands
+    // the caller a clean window. The owner window spans every session that
+    // human has, so re-minting does not escape it.
+    for (let i = 0; i < 15; i++) {
+      await (platform as any).handleBuildApp(
+        path.join(tempDir, 'apps', 'loopy'),
+        'loopy',
+        'nodejs',
+        { principalId: `oauth:human-1::session-${i}`, actorUserId: 'human-1' }
+      );
+      (platform as any).appsInProgress.clear();
+    }
+    buildSpy.mockClear();
+
+    // A brand-new session for the SAME human: its own window is empty.
+    await (platform as any).handleBuildApp(
+      path.join(tempDir, 'apps', 'loopy'),
+      'loopy',
+      'nodejs',
+      { principalId: 'oauth:human-1::session-fresh', actorUserId: 'human-1' }
+    );
+
+    expect(buildSpy).not.toHaveBeenCalled();
+  });
+
+  it("does not let one human's backstop touch ANOTHER human", async () => {
+    // The failure mode of keying the backstop wrong: a shared bucket turns a
+    // loop-stopper into a cross-tenant denial of service.
+    for (let i = 0; i < 15; i++) {
+      await (platform as any).handleBuildApp(
+        path.join(tempDir, 'apps', 'loopy'),
+        'loopy',
+        'nodejs',
+        { principalId: `oauth:human-1::session-${i}`, actorUserId: 'human-1' }
+      );
+      (platform as any).appsInProgress.clear();
+    }
+    buildSpy.mockClear();
+
+    await (platform as any).handleBuildApp(
+      path.join(tempDir, 'apps', 'other'),
+      'other',
+      'nodejs',
+      { principalId: 'oauth:human-2::s1', actorUserId: 'human-2' }
+    );
+
+    expect(buildSpy).toHaveBeenCalled();
+  });
+
+  it('does not open a shared bucket for callers whose human is unknown', async () => {
+    // An API key resolves to a principal but may carry no userId. Those must
+    // NOT collapse into one `owner::anonymous` window, or any such caller
+    // could lock out every other.
+    for (let i = 0; i < 15; i++) {
+      await (platform as any).handleBuildApp(
+        path.join(tempDir, 'apps', 'loopy'),
+        'loopy',
+        'nodejs',
+        { principalId: `key:token-${i}` }
+      );
+      (platform as any).appsInProgress.clear();
+    }
+    buildSpy.mockClear();
+
+    await (platform as any).handleBuildApp(
+      path.join(tempDir, 'apps', 'other'),
+      'other',
+      'nodejs',
+      { principalId: 'key:unrelated' }
+    );
+
+    expect(buildSpy).toHaveBeenCalled();
+  });
+
+  it("gives a WEBHOOK its own bucket rather than the app owner's", async () => {
+    // A looping webhook must not consume the quota of a human who did nothing.
+    for (let i = 0; i < 15; i++) {
+      await (platform as any).handleBuildApp(
+        path.join(tempDir, 'apps', 'loopy'),
+        'loopy',
+        'nodejs',
+        { automationSource: 'webhook' }
+      );
+      (platform as any).appsInProgress.clear();
+    }
+    buildSpy.mockClear();
+
+    await (platform as any).handleBuildApp(
+      path.join(tempDir, 'apps', 'loopy'),
+      'loopy',
+      'nodejs',
+      { principalId: 'oauth:human-1::s1', actorUserId: 'human-1' }
+    );
 
     expect(buildSpy).toHaveBeenCalled();
   });

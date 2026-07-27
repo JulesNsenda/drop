@@ -8,7 +8,13 @@
 
 import * as path from 'path';
 import * as fs from 'fs/promises';
-import { GitDeployRequest, GitDeployResult, GitSource, GitTokenInfo } from './git-deploy.types';
+import {
+  DeployActor,
+  GitDeployRequest,
+  GitDeployResult,
+  GitSource,
+  GitTokenInfo,
+} from './git-deploy.types';
 import {
   gitClone,
   gitPull,
@@ -178,6 +184,8 @@ export class GitDeployService {
       name: appName,
       path: destPath,
       type: undefined,
+      principalId: request.principalId,
+      actorUserId: request.userId,
     });
 
     return {
@@ -190,7 +198,7 @@ export class GitDeployService {
   }
 
   /** Redeploy a git-deployed app (git pull + trigger rebuild) */
-  async redeploy(appName: string): Promise<GitDeployResult> {
+  async redeploy(appName: string, actor: DeployActor = {}): Promise<GitDeployResult> {
     if (!this.gitAvailable) {
       throw new Error('git CLI is not available on this system');
     }
@@ -266,6 +274,9 @@ export class GitDeployService {
       path: app.path,
       reason: 'git redeploy',
       bypassCooldown: true,
+      principalId: actor.principalId,
+      actorUserId: actor.userId,
+      automationSource: actor.automation,
     });
 
     return {
