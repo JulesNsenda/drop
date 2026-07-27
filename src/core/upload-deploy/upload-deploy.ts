@@ -26,7 +26,7 @@ import { getStateManager } from '../../managers/app/state-manager';
 import { getLogger } from '../../utils/logger';
 import { hasEnoughDisk, getMinFreeDiskMb } from '../../utils/disk';
 import { eventBus } from '../event-bus';
-import { assertDeployAllowed } from '../../managers/guardrail/deploy-breaker';
+import { admitDeploy } from '../../managers/guardrail/deploy-breaker';
 
 const logger = getLogger();
 
@@ -74,12 +74,24 @@ export class UploadDeployService {
     // republish with no actor and launder the refused build into the automation
     // bucket.
     //
-    // Records nothing — the outcome is recorded once, by the platform, for the
-    // episode this admits.
-    const existingApp = getStateManager().getApp(appName);
-    assertDeployAllowed(appName, !existingApp, { principalId, actorUserId: userId });
-
+    // Records nothing against the breaker — that outcome is recorded once, by
+    // the platform, for the episode this admits. It DOES spend quota, which is
+    // counted on admission rather than on outcome.
+    //
+    // Marked in-flight BEFORE the await. `isUploading` is what the platform's
+    // app:detected/app:update subscribers consult to drop watcher events mid
+    // upload, and this method used to set it synchronously; awaiting first
+    // would open a window where the deploy has begun and nothing says so.
+    // Released again if admission refuses, since nothing was started.
     this.activeUploads.add(appName);
+    try {
+      const existingApp = getStateManager().getApp(appName);
+      await admitDeploy(appName, !existingApp, { principalId, actorUserId: userId });
+    } catch (err) {
+      this.activeUploads.delete(appName);
+      throw err;
+    }
+
     let stagingDir: string | undefined;
 
     try {

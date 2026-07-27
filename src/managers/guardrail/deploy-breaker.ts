@@ -12,6 +12,12 @@
  * spending build capacity on something that keeps failing the same way.
  */
 
+import {
+  getPrincipalQuota,
+  quotaKeysFor,
+  QuotaExceededError,
+} from './principal-quota';
+
 /** Failures within the window before the breaker opens. */
 const DEFAULT_THRESHOLD = 5;
 /** How far back failures are counted. */
@@ -312,15 +318,48 @@ export function checkGuardrailKeys(keys: GuardrailKey[]): BreakerVerdict {
 }
 
 /**
- * Pre-check at a deploy ENTRY point, before any expensive work.
+ * Admit a deploy at an ENTRY point, before any expensive work.
  *
  * The in-pipeline gates sit at the build, which leaves everything BEFORE the
  * build unmetered: upload-deploy extracts and lands the archive, and git-deploy
  * clones the repo, both before the platform ever sees an event. A refused
  * caller could still make DROP do that work on every attempt.
  *
- * Records nothing — the outcome is recorded once, by the platform, for the
- * episode this admits.
+ * ORDER MATTERS. Breaker first, then quota, and the quota is spent only once
+ * BOTH have passed — a refused attempt must never consume the allowance that
+ * would have refused it, and a breaker refusal must not burn quota either.
+ *
+ * The breaker outcome is still recorded once, by the platform, for the episode
+ * this admits; only the quota is counted here, because volume is counted on
+ * admission rather than on outcome.
+ */
+export async function admitDeploy(
+  appName: string,
+  isNewApp: boolean,
+  actor: DeployActorInfo
+): Promise<void> {
+  const verdict = checkGuardrailKeys(guardrailKeysFor(appName, isNewApp, actor));
+  if (!verdict.allowed) {
+    throw new DeployRefusedError(verdict.failures, verdict.retryAfterSeconds ?? 0);
+  }
+
+  const quota = getPrincipalQuota();
+  await quota.initialize();
+  const keys = quotaKeysFor(actor);
+  const q = quota.check(keys);
+  if (!q.allowed) {
+    throw new QuotaExceededError(q.used ?? 0, q.limit ?? 0, q.retryAfterSeconds ?? 0);
+  }
+  quota.record(keys);
+}
+
+/**
+ * Breaker-only pre-check, synchronous.
+ *
+ * Kept separate from admitDeploy so the platform's in-pipeline gates stay
+ * synchronous and, more importantly, do NOT spend quota: they run on the same
+ * deploy an entry point already counted, and counting twice would halve every
+ * caller's real allowance.
  */
 export function assertDeployAllowed(
   appName: string,

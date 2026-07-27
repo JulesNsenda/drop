@@ -45,6 +45,11 @@ export type DeployErrorCode =
   | 'PROCESS_EXITED'
   | 'CRASH_LOOPED'
   | 'OOM_KILLED'
+  // Guardrail phase — refused before anything ran. Neither is a failure of the
+  // app: the deploy was never attempted, so telling a caller to read a build
+  // log would send them looking for output that does not exist.
+  | 'GUARDRAIL_TRIPPED'
+  | 'QUOTA_EXCEEDED'
   // Classifier refinements (Step 5) — produced ONLY by classify.ts, which
   // sharpens a stage-derived code from the log tail. deriveErrorCode never
   // returns these: they are not derivable from DROP-generated signals alone.
@@ -102,6 +107,11 @@ export interface ErrorCodeInput {
 export function deriveErrorCode(input: ErrorCodeInput): DeployErrorCode {
   if (input.builderCode === 'NO_STRATEGY') return 'NO_STRATEGY';
   if (input.builderCode === 'MAX_BUILDS') return 'MAX_BUILDS';
+  // Refusals name themselves. Without this a guardrail refusal is reported as
+  // PREBUILD_FAILED — its stage is truthfully 'pre-build' — whose hint sends
+  // the caller to check detection and drop.yaml, neither of which is wrong.
+  if (input.builderCode === 'GUARDRAIL_TRIPPED') return 'GUARDRAIL_TRIPPED';
+  if (input.builderCode === 'QUOTA_EXCEEDED') return 'QUOTA_EXCEEDED';
 
   if (input.phase === 'boot') {
     return input.reason ? codeForReason(input.reason) : 'UNKNOWN';
