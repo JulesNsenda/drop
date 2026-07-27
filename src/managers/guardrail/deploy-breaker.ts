@@ -216,3 +216,119 @@ export function getDeployBreaker(opts?: DeployBreakerOptions): DeployBreaker {
 export function resetDeployBreaker(): void {
   instance = null;
 }
+
+/** The guardrail-relevant slice of a deploy request or event payload. */
+export interface DeployActorInfo {
+  principalId?: string;
+  actorUserId?: string;
+  automationSource?: 'webhook';
+}
+
+/**
+ * Refusal raised by a pre-check at a deploy ENTRY point.
+ *
+ * Distinct from the platform's in-pipeline refusal (which reports through
+ * failDeployEpisode so a polling caller gets an outcome): here nothing has been
+ * started yet, so the caller is told synchronously and no episode exists.
+ */
+export class DeployRefusedError extends Error {
+  constructor(
+    public readonly failures: number,
+    public readonly retryAfterSeconds: number
+  ) {
+    super(`Too many failed deploys (${failures}). Retry in ${retryAfterSeconds}s.`);
+    this.name = 'DeployRefusedError';
+  }
+}
+
+/**
+ * The keys a deploy is checked against, in order.
+ *
+ * TWO windows for a real caller, and the deploy must pass BOTH. The
+ * per-principal one is defeatable with no attacker effort: a fresh
+ * authorization-code exchange mints a new sid, hence a new principal with no
+ * failure history. An autonomous agent cannot reach that flow — re-consent
+ * needs a session-authenticated approval an OAuth token cannot make — but a
+ * user clicking "reconnect" after a trip clears their own cooldown, which is
+ * the realistic path and needs no malice at all. The owner window spans every
+ * session and app that human has, so re-minting an identity does not escape it.
+ *
+ * Automation gets ONE key and no owner window: it has no human to attribute the
+ * failures to, and borrowing the app owner's would let a looping webhook consume
+ * the quota of someone who did nothing.
+ *
+ * Lives here rather than on the platform because the entry points (upload,
+ * git clone) pre-check with it too, and two copies of this would drift.
+ */
+export function guardrailKeysFor(
+  appName: string,
+  isNewApp: boolean,
+  actor: DeployActorInfo
+): GuardrailKey[] {
+  const breaker = getDeployBreaker();
+  if (!actor.principalId) {
+    return [
+      {
+        key: automationKey(actor.automationSource ?? 'watcher', appName),
+        threshold: breaker.threshold,
+        clearOnSuccess: true,
+      },
+    ];
+  }
+  const keys: GuardrailKey[] = [
+    {
+      key: breakerKey(actor.principalId, isNewApp ? undefined : appName),
+      threshold: breaker.threshold,
+      clearOnSuccess: true,
+    },
+  ];
+  // Only when the actor's own human is known. Falling back to the app's owner
+  // would be wrong in both directions: a NEW app has no state to read, so every
+  // user's first-deploy failures would share one bucket and any user could lock
+  // out every other.
+  if (actor.actorUserId) {
+    keys.push({
+      key: ownerKey(actor.actorUserId),
+      threshold: breaker.ownerThreshold,
+      // Decay-only. See GuardrailKey.clearOnSuccess.
+      clearOnSuccess: false,
+    });
+  }
+  return keys;
+}
+
+/** First refusal among the keys, or an allow. */
+export function checkGuardrailKeys(keys: GuardrailKey[]): BreakerVerdict {
+  const breaker = getDeployBreaker();
+  // Short-circuits deliberately. `check` is NOT side-effect-free: it deletes a
+  // key whose cooldown has lapsed. Evaluating every key on an attempt that is
+  // already refused would silently expire the owner backstop's cooldown on
+  // traffic that was rejected — i.e. rejected retries would reset it.
+  for (const { key } of keys) {
+    const verdict = breaker.check(key);
+    if (!verdict.allowed) return verdict;
+  }
+  return { allowed: true, failures: 0 };
+}
+
+/**
+ * Pre-check at a deploy ENTRY point, before any expensive work.
+ *
+ * The in-pipeline gates sit at the build, which leaves everything BEFORE the
+ * build unmetered: upload-deploy extracts and lands the archive, and git-deploy
+ * clones the repo, both before the platform ever sees an event. A refused
+ * caller could still make DROP do that work on every attempt.
+ *
+ * Records nothing — the outcome is recorded once, by the platform, for the
+ * episode this admits.
+ */
+export function assertDeployAllowed(
+  appName: string,
+  isNewApp: boolean,
+  actor: DeployActorInfo
+): void {
+  const verdict = checkGuardrailKeys(guardrailKeysFor(appName, isNewApp, actor));
+  if (!verdict.allowed) {
+    throw new DeployRefusedError(verdict.failures, verdict.retryAfterSeconds ?? 0);
+  }
+}

@@ -15,6 +15,7 @@ import { getSettingsManager } from '../../managers/settings/settings-manager';
 import { getUserById } from '../middleware/auth';
 import { canAccess } from '../access';
 import { tryLogActivity } from '../../managers/activity';
+import { DeployRefusedError } from '../../managers/guardrail/deploy-breaker';
 import type { GitDeployRequest, GitTokenCreateRequest } from '../../core/git-deploy';
 
 const gitDeploy = new Hono();
@@ -87,6 +88,10 @@ gitDeploy.post('/deploy', async (c) => {
     await tryLogActivity({ action: 'git-deploy', userId: auth?.userId, username: auth?.username, appName: result.appName, detail: result.repoUrl });
     return c.json(success(result), 201);
   } catch (err) {
+    if (err instanceof DeployRefusedError) {
+      c.header('Retry-After', String(err.retryAfterSeconds));
+      return c.json(error(ErrorCodes.RATE_LIMITED, err.message), 429);
+    }
     const message = err instanceof Error ? err.message : 'Deploy failed';
     if (message.includes('already exists')) {
       return c.json(error(ErrorCodes.CONFLICT, message), 409);

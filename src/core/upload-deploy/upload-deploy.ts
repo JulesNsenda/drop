@@ -26,6 +26,7 @@ import { getStateManager } from '../../managers/app/state-manager';
 import { getLogger } from '../../utils/logger';
 import { hasEnoughDisk, getMinFreeDiskMb } from '../../utils/disk';
 import { eventBus } from '../event-bus';
+import { assertDeployAllowed } from '../../managers/guardrail/deploy-breaker';
 
 const logger = getLogger();
 
@@ -62,6 +63,21 @@ export class UploadDeployService {
     if (!isValidAppName(appName)) {
       throw new UploadValidationError(`Invalid app name: ${appName}`);
     }
+
+    // GUARDRAIL PRE-CHECK, before any expensive work.
+    //
+    // The platform's gates sit at the BUILD, which leaves everything up to it
+    // unmetered: the archive is extracted and LANDED over the live app tree
+    // before app:detected/app:update is ever published, so a refusal downstream
+    // could not undo the write and never stopped the work. Worse, those writes
+    // are inside the watched directory, so the watcher's debounced flush would
+    // republish with no actor and launder the refused build into the automation
+    // bucket.
+    //
+    // Records nothing — the outcome is recorded once, by the platform, for the
+    // episode this admits.
+    const existingApp = getStateManager().getApp(appName);
+    assertDeployAllowed(appName, !existingApp, { principalId, actorUserId: userId });
 
     this.activeUploads.add(appName);
     let stagingDir: string | undefined;
