@@ -75,6 +75,19 @@ export interface AppState {
    */
   missingSecrets?: string[];
   /**
+   * Why DROP stopped this app on its own, when it did.
+   *
+   * A FLAG, deliberately not an `AppStatus` member (ARCH-14) — the same
+   * reasoning as `readinessUnverified` above. There are ~20
+   * `status === 'running'` comparisons answering at least four different
+   * questions, and a new status member silently fails some of them.
+   *
+   * A parked app carries `status: 'stopped'`, so every existing consumer keeps
+   * working; this only explains WHY, so the operator is not left staring at an
+   * app that stopped for no visible reason. Cleared when the app starts again.
+   */
+  parkedReason?: string;
+  /**
    * Grouping tag for apps expanded from a single monorepo deploy (e.g.
    * `ezsign-backend` / `ezsign-frontend` both tagged `group: ezsign`). Set via
    * `updateApp(name, { group })`, not `registerApp` — `AppConfig` (app-config.ts)
@@ -282,7 +295,7 @@ export class AppStateManager {
     return updated;
   }
 
-  async setAppStatus(name: string, status: AppStatus, details?: { port?: number; pid?: number; error?: string; missingSecrets?: string[]; readinessUnverified?: boolean }): Promise<AppState | null> {
+  async setAppStatus(name: string, status: AppStatus, details?: { port?: number; pid?: number; error?: string; missingSecrets?: string[]; readinessUnverified?: boolean; parkedReason?: string }): Promise<AppState | null> {
     const app = this.apps.get(name);
     if (!app) return null;
 
@@ -310,6 +323,14 @@ export class AppStateManager {
     const { readinessUnverified, ...rest } = details ?? {};
     if (readinessUnverified === false) {
       delete app.readinessUnverified;
+    }
+
+    // A park explains why DROP stopped the app itself. Any transition to a
+    // LIVE state clears it: the reason no longer holds, and updateApp is a
+    // spread merge, so leaving it would keep explaining a stop that has since
+    // been undone. Set only by the caller that parks.
+    if (status === 'running' || status === 'building' || status === 'starting') {
+      delete app.parkedReason;
     }
 
     return this.updateApp(name, {
