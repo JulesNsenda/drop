@@ -18,6 +18,13 @@ const DEFAULT_THRESHOLD = 5;
 const DEFAULT_WINDOW_MS = 10 * 60 * 1000;
 /** How long the breaker stays open once tripped. */
 const DEFAULT_COOLDOWN_MS = 15 * 60 * 1000;
+/**
+ * Failures across ALL of one human's sessions and apps before the backstop
+ * opens. Looser than the per-principal threshold on purpose: this window spans
+ * everything they are doing, so it must not fire on someone legitimately
+ * juggling several apps.
+ */
+const DEFAULT_OWNER_THRESHOLD = 15;
 
 export interface BreakerVerdict {
   allowed: boolean;
@@ -36,6 +43,8 @@ interface KeyState {
 
 export interface DeployBreakerOptions {
   threshold?: number;
+  /** Threshold for the coarser owner-level backstop. Looser by design — see ownerKey. */
+  ownerThreshold?: number;
   windowMs?: number;
   cooldownMs?: number;
 }
@@ -62,14 +71,35 @@ export function automationKey(source: 'webhook' | 'watcher', appName: string): s
   return `${source}::${appName}`;
 }
 
+/**
+ * Coarser BACKSTOP key, one per human.
+ *
+ * The per-principal window alone is defeatable without any attacker effort: a
+ * fresh authorization-code exchange mints a new `sid`, hence a brand-new
+ * principal with no failure history. An autonomous agent cannot reach that
+ * flow — re-consent needs a session-authenticated approval an OAuth token
+ * cannot make — but a user who clicks "reconnect" after a trip clears the
+ * cooldown, which is the realistic path and needs no malice at all.
+ *
+ * So a deploy is checked against BOTH windows and must pass both. This one is
+ * deliberately looser (a larger threshold), because it spans every session and
+ * every app a human has: it exists to stop a loop that keeps re-minting
+ * identities, not to throttle someone working normally across several apps.
+ */
+export function ownerKey(userId: string | undefined): string {
+  return `owner::${userId ?? 'anonymous'}`;
+}
+
 export class DeployBreaker {
   private readonly threshold: number;
+  private readonly ownerThreshold: number;
   private readonly windowMs: number;
   private readonly cooldownMs: number;
   private readonly state: Map<string, KeyState> = new Map();
 
   constructor(opts: DeployBreakerOptions = {}) {
     this.threshold = opts.threshold ?? DEFAULT_THRESHOLD;
+    this.ownerThreshold = opts.ownerThreshold ?? DEFAULT_OWNER_THRESHOLD;
     this.windowMs = opts.windowMs ?? DEFAULT_WINDOW_MS;
     this.cooldownMs = opts.cooldownMs ?? DEFAULT_COOLDOWN_MS;
   }
@@ -107,7 +137,8 @@ export class DeployBreaker {
     failures.push(now);
     entry.failures = failures;
 
-    if (failures.length >= this.threshold) {
+    const limit = key.startsWith('owner::') ? this.ownerThreshold : this.threshold;
+    if (failures.length >= limit) {
       entry.openUntil = now + this.cooldownMs;
     }
     this.state.set(key, entry);

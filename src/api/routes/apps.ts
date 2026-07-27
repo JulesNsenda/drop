@@ -453,6 +453,7 @@ apps.post('/:name/source', async c => {
       appName: name,
       archivePath,
       userId: auth?.userId,
+      principalId: auth?.principalId,
     });
 
     await tryLogActivity({
