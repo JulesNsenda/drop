@@ -5,11 +5,11 @@ import { useTheme } from '../hooks/useTheme';
 export interface AuthLayoutProps {
   /** The auth form (login / signup / change-password). */
   children: ReactNode;
-  /** Host-status footer line on the branding panel, e.g. "drop-node-01 · v2.0.0-rc.1 · self-hosted". */
+  /** Host-status footer line on the branding panel, e.g. "drop-node-01 · v2.0.0-rc.3 · self-hosted". */
   hostStatus?: string;
 }
 
-const DEFAULT_HOST_STATUS = 'drop-node-01 · v2.0.0-rc.1 · self-hosted';
+const DEFAULT_HOST_STATUS = `drop-node-01 · v${__DROP_VERSION__} · self-hosted`;
 
 /**
  * Split-screen auth shell (PRD-045), from `Login.dc.html`: a left branding
