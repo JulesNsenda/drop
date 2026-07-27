@@ -4115,11 +4115,11 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       // Deploy tracker may not be initialised
     }
 
-    try {
-      getDeployDetailStore().purgeApp(name);
-    } catch {
-      // Deploy detail store may not be initialised
-    }
+    // Deploy DETAILS are deliberately NOT purged here. They are retained for a
+    // window instead (purgeAppArtifacts -> retainForApp), which is the whole
+    // point of D4: a deploy that failed and was then torn down is exactly the
+    // one a caller still wants to ask about. Hard-purging here would also run
+    // BEFORE purgeAppArtifacts, so retention would find nothing left to copy.
 
     try {
       await this.appConfigService?.deleteConfig(name);
@@ -4159,6 +4159,20 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
    * essentially every real deletion. Best-effort; never throws.
    */
   async purgeAppArtifacts(name: string, opts: { keepData?: boolean } = {}): Promise<void> {
+    // BEFORE the deletes below, not after. Deploy details hold byte offsets
+    // into the very log files this is about to remove, and those paths are
+    // keyed on the app NAME — which this teardown frees for anyone to
+    // re-register. Copying each retained deploy's slice out first is what
+    // stops a retained record later resolving to the NEXT tenant's output
+    // (SEC-3). Hooked here rather than at the two delete call sites because
+    // this method is the single funnel both of them go through.
+    try {
+      await getDeployDetailStore().retainForApp(name);
+    } catch (error) {
+      // Never block a delete that is already happening.
+      this.logger.warn(`Failed to retain deploy details for ${name}`, 'CLEANUP', error);
+    }
+
     const targets = [
       path.join(this.config.dropRoot, 'data', 'logs', 'webapps', name),
       path.join(this.config.dropRoot, 'data', 'logs', 'builds', name),

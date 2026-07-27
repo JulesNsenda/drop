@@ -66,8 +66,26 @@ export interface DeployDetail {
   /**
    * Where to start reading this deploy's runtime output. Absent for a build
    * failure — nothing was ever started, so there is no runtime log.
+   *
+   * CLEARED at teardown. `outFile` is keyed on the APP NAME and teardown frees
+   * that name, so leaving the offsets in place would let a retained record
+   * resolve to a path the NEXT tenant is now writing to (SEC-3).
+   *
+   * The plan also specifies copying the bytes into a private, deployId-keyed
+   * file so the output survives teardown. That is deliberately NOT done yet —
+   * nothing reads it (`get_deploy_logs` is a later step), and writing durable
+   * uncapped copies of tenant stdout with no consumer is pure cost. It also
+   * would make `?keepData=false` create a fresh copy of output that routinely
+   * contains DATABASE_URL and injected secrets, which is both against the
+   * user's stated intent and against the invariant below. The copy belongs
+   * with its reader.
    */
   runtimeLog?: RuntimeLogOffsets;
+  /**
+   * When this record may be swept. Set at teardown — a live app's details are
+   * kept as long as the app is.
+   */
+  retainUntil?: string;
   createdAt: string;
 }
 

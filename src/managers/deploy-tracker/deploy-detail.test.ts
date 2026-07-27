@@ -247,6 +247,108 @@ describe('DeployDetailStore', () => {
     });
   });
 
+  describe('retention at teardown (D4 / SEC-3)', () => {
+    const offsets = {
+      outFile: '/logs/app-2026-07-27-out.log',
+      errFile: '/logs/app-2026-07-27-err.log',
+      outStartOffset: 10,
+      errStartOffset: 0,
+    };
+
+    const failBoot = (app: string, deployId: string) => {
+      openEpisode(app, deployId);
+      store.noteRuntimeLog(app, offsets);
+      bus.publish('deploy:failed', { appId: app, phase: 'boot', reason: 'readiness-failed' });
+    };
+
+    it('CLEARS the name-keyed log offsets', async () => {
+      // THE SEC-3 assertion. outFile is keyed on the app name and teardown
+      // frees that name — a surviving offset would resolve to whatever the
+      // next tenant to claim the name is writing.
+      failBoot('app', 'r-1');
+      await store.flush();
+      expect(store.getDetail('r-1')?.runtimeLog).toEqual(offsets);
+
+      await store.retainForApp('app');
+
+      expect(store.getDetail('r-1')?.runtimeLog).toBeUndefined();
+    });
+
+    it('keeps the DROP-generated metadata', async () => {
+      // Severing the log pointer must not throw away the diagnosis — that is
+      // the whole reason a torn-down deploy is worth retaining.
+      openEpisode('m', 'r-2');
+      bus.publish('build:failed', {
+        appId: 'm',
+        buildId: 'b1',
+        error: new Error('x'),
+        stage: 'install',
+        exitCode: 127,
+        command: 'npm ci',
+      });
+      await store.flush();
+
+      await store.retainForApp('m');
+
+      expect(store.getDetail('r-2')).toMatchObject({ stage: 'install', exitCode: 127 });
+    });
+
+    it('stamps a window and stops serving the record once it closes', async () => {
+      failBoot('w', 'r-3');
+      await store.flush();
+      await store.retainForApp('w');
+
+      const until = store.getDetail('r-3')?.retainUntil;
+      expect(until).toBeDefined();
+
+      // Expiry is enforced on READ, not only by the sweep — the platform can
+      // stay up for weeks, so a window that only closed on restart would not
+      // be a window at all.
+      await store.sweepExpired(Date.parse(until as string) + 1000);
+      expect(store.getDetail('r-3')).toBeUndefined();
+    });
+
+    it('treats a malformed retainUntil as expired, not immortal', async () => {
+      // NaN <= now is false, so a naive comparison keeps a hand-edited or
+      // half-written record forever.
+      failBoot('bad', 'r-4');
+      await store.flush();
+      await store.retainForApp('bad');
+      (store.getDetail('r-4') as { retainUntil?: string }).retainUntil = 'not-a-date';
+
+      expect(store.getDetail('r-4')).toBeUndefined();
+    });
+
+    it('persists the cleared offsets before returning to the caller', async () => {
+      // The caller deletes the log directories immediately after this returns.
+      // A crash before the write lands would reload the record with LIVE
+      // name-keyed offsets and no retainUntil — the pre-fix state, and
+      // invisible to the serve-time guard, which keys on retainUntil.
+      failBoot('p', 'r-5');
+      await store.flush();
+
+      await store.retainForApp('p');
+
+      const reloaded = new DeployDetailStore(storePath);
+      await reloaded.initialize();
+      expect(reloaded.getDetail('r-5')?.runtimeLog).toBeUndefined();
+      expect(reloaded.getDetail('r-5')?.retainUntil).toBeDefined();
+    });
+
+    it('rejects a deployId that is not safe to use as a key', async () => {
+      bus.publish('build:started', { appId: 'evil', buildId: 'b1', deployId: '../../escape' });
+      bus.publish('build:failed', {
+        appId: 'evil',
+        buildId: 'b1',
+        error: new Error('x'),
+        stage: 'build',
+      });
+      await store.flush();
+
+      expect(store.getDetails('evil')).toEqual([]);
+    });
+  });
+
   describe('persistence', () => {
     it('survives a round trip to disk', async () => {
       openEpisode('persist', 'p-1');
