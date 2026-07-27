@@ -84,6 +84,7 @@ gitDeploy.post('/deploy', async (c) => {
     // matching every other unauthenticated path).
     body.userId = auth?.userId;
     body.principalId = auth?.principalId;
+    body.agentCaller = auth?.kind === 'agent';
 
     const result = await service.deploy(body);
     await tryLogActivity({ action: 'git-deploy', userId: auth?.userId, username: auth?.username, appName: result.appName, detail: result.repoUrl });
