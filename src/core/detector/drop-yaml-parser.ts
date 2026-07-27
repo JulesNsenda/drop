@@ -32,6 +32,14 @@ const ALLOWED_ROUTE_KEYS = new Set(['path', 'strip']);
 const SERVICE_NAME_REGEX = /^[a-zA-Z0-9_-]+$/;
 
 /**
+ * A declared secret's key must be a real environment variable name. This is a
+ * security boundary, not just tidiness: the key is echoed into API errors and
+ * into the MCP `needs-config` tool result, and drop.yaml is attacker-authored
+ * on the `deploy_from_git` path. See validateSecretsObject.
+ */
+const SECRET_NAME_REGEX = /^[A-Za-z_][A-Za-z0-9_]{0,63}$/;
+
+/**
  * Custom TLS configuration for an app
  */
 export interface AppTlsConfig {
@@ -541,6 +549,23 @@ function validateSecretsObject(
   for (const [name, decl] of entries) {
     if (!name || typeof name !== 'string') {
       return { valid: false, error: `${label} keys must be non-empty strings` };
+    }
+    // A declared secret's key is an ENV VAR NAME, but it was previously only
+    // checked for being a non-empty string — so any text at all was accepted,
+    // including newlines. That key is carried verbatim into
+    // AppNeedsConfigError.missingSecrets, persisted onto AppState, and
+    // interpolated raw into the `needs-config` MCP tool result. Since
+    // deploy_from_git clones a third-party repo, the drop.yaml is
+    // attacker-authored, so an unconstrained key was a direct injection path
+    // into a calling agent's context — reached on the FIRST deploy attempt,
+    // before any log is ever read. Constrain it to a real env var name.
+    if (!SECRET_NAME_REGEX.test(name)) {
+      return {
+        valid: false,
+        error:
+          `Invalid ${label} key '${name.slice(0, 40)}': must be a valid environment ` +
+          `variable name (letters, digits, underscore; not starting with a digit; max 64 chars)`,
+      };
     }
     if (typeof decl === 'boolean') {
       continue;
