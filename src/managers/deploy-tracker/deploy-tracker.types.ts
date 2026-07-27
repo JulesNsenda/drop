@@ -7,6 +7,21 @@
  * persisted — it is derived at read time from the rows.
  */
 
+/**
+ * Why a build failed, derived from the failing build stage.
+ *
+ * Was documented as an inline three-value comment while the producer
+ * hardcoded a single constant — so `GET /api/v1/deploys` reported a fixed
+ * string as though it discriminated. Now a real type with a real mapping (see
+ * `categoryForStage`), and 'postbuild-failed' is added because the optimize /
+ * post-build / validate stages fit none of the original three.
+ */
+export type DeployFailureCategory =
+  | 'prebuild-failed'
+  | 'install-failed'
+  | 'build-failed'
+  | 'postbuild-failed';
+
 export type DeployStageName =
   | 'triggered'
   | 'build-started'
@@ -22,8 +37,16 @@ export interface DeployRow {
   stage: DeployStageName;
   at: string; // ISO
   ok?: boolean; // for 'build' stage = payload.success
-  category?: string; // for 'build-failed': 'install-failed'|'build-failed'|'prebuild-failed'
+  category?: DeployFailureCategory; // set on the 'build-failed' stage only
   detail?: string; // SANITIZED: relative paths only, NEVER raw error.message
+  /** Exit code of the failing command, when it reported one. */
+  exitCode?: number;
+  /**
+   * The failing command, truncated by the publisher. Safe to persist: it is
+   * DROP-composed, not process output. `detail`'s never-raw-message rule is
+   * unaffected — this is a separate, structured field.
+   */
+  command?: string;
 }
 
 export type DeployStatus = 'in-progress' | 'succeeded' | 'failed' | 'superseded' | 'interrupted';
@@ -33,7 +56,9 @@ export interface DeployStage {
   at: string;
   durationMs?: number; // from previous stage
   ok?: boolean;
-  category?: string;
+  category?: DeployFailureCategory;
+  exitCode?: number;
+  command?: string;
 }
 
 export interface DeployEpisode {

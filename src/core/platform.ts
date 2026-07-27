@@ -3052,7 +3052,16 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       if (!tracker.hasOpenEpisode(appName)) {
         eventBus.publish('build:started', { appId: appName, buildId, deployId });
       }
-      eventBus.publish('build:failed', { appId: appName, buildId, error, deployId });
+      // 'pre-build' is the truthful stage for every caller of this: detection
+      // failures, the disk check, resolveBuildEnv, a malformed drop.yaml — all
+      // of them end the deploy before builder.build() is entered.
+      eventBus.publish('build:failed', {
+        appId: appName,
+        buildId,
+        error,
+        deployId,
+        stage: 'pre-build',
+      });
     } catch {
       // Tracker not initialised (isolated tests) — observability only, never
       // allowed to interfere with the failure being reported.

@@ -42,14 +42,39 @@ import type {
 // types module directly rather than editing the barrel, which is outside
 // this module's scope.
 import type { AppUpdatePayload } from '../../core/event-bus/event-bus.types';
+import type { BuildStage } from '../../core/builder/builder.types';
 import type {
   DeployRow,
   DeployEpisode,
   DeployStage,
   DeployStatus,
+  DeployFailureCategory,
 } from './deploy-tracker.types';
 
 const MAX_ROWS = 1000;
+
+/**
+ * Map a failing build stage to a persisted failure category.
+ *
+ * Total over BuildStage rather than a lookup with a default, so adding a stage
+ * is a compile error here instead of silently becoming 'build-failed' — which
+ * is exactly how the previous hardcoded constant went unnoticed.
+ */
+function categoryForStage(stage: BuildStage): DeployFailureCategory {
+  switch (stage) {
+    case 'pre-build':
+    case 'environment':
+      return 'prebuild-failed';
+    case 'install':
+      return 'install-failed';
+    case 'build':
+      return 'build-failed';
+    case 'optimize':
+    case 'post-build':
+    case 'validate':
+      return 'postbuild-failed';
+  }
+}
 
 type DeployTrigger = 'deploy' | 'hot-reload' | 'upload';
 
@@ -218,9 +243,13 @@ export class DeployTracker {
       appName,
       stage: 'build-failed',
       at: payload.timestamp.toISOString(),
-      // Never store payload.error.message (raw npm stderr can carry absolute
-      // paths / env dumps) — category only.
-      category: 'build-failed',
+      // Still never payload.error.message — raw npm stderr can carry absolute
+      // paths and env dumps. What IS stored is structured and DROP-generated:
+      // the failing stage's category, its exit code, and the command DROP
+      // composed and ran.
+      category: categoryForStage(payload.stage),
+      exitCode: payload.exitCode,
+      command: payload.command,
     });
 
     void this.persist();
@@ -355,6 +384,8 @@ export class DeployTracker {
         at: row.at,
         ok: row.ok,
         category: row.category,
+        exitCode: row.exitCode,
+        command: row.command,
       };
       if (previousAt) {
         stage.durationMs = new Date(row.at).getTime() - new Date(previousAt).getTime();

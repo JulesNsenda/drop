@@ -54,6 +54,7 @@ describe('DeployTracker', () => {
         buildId: 'b1',
         error: new Error('boom'),
         deployId: 'stable-id',
+        stage: 'build',
       });
       await tracker.flush();
 
@@ -98,6 +99,94 @@ describe('DeployTracker', () => {
     });
   });
 
+  describe('failure category is derived, not hardcoded', () => {
+    // Gap A: builder.ts always knew which stage failed but published only
+    // {appId, buildId, error}, so this handler hardcoded 'build-failed' while
+    // DeployRow.category documented three values. GET /api/v1/deploys reported
+    // a constant as though it discriminated.
+    const categoryAfter = async (app: string, stage: string): Promise<string | undefined> => {
+      bus.publish('build:started', { appId: app, buildId: 'b1' });
+      bus.publish('build:failed', {
+        appId: app,
+        buildId: 'b1',
+        error: new Error('boom'),
+        stage: stage as never,
+      });
+      await tracker.flush();
+      const [episode] = tracker.getEpisodes(app, 1);
+      return episode.stages.find((s) => s.stage === 'build-failed')?.category;
+    };
+
+    it('maps install to install-failed', async () => {
+      expect(await categoryAfter('a-install', 'install')).toBe('install-failed');
+    });
+
+    it('maps build to build-failed', async () => {
+      expect(await categoryAfter('a-build', 'build')).toBe('build-failed');
+    });
+
+    it('maps pre-build and environment to prebuild-failed', async () => {
+      expect(await categoryAfter('a-pre', 'pre-build')).toBe('prebuild-failed');
+      expect(await categoryAfter('a-env', 'environment')).toBe('prebuild-failed');
+    });
+
+    it('maps the post-compile stages to postbuild-failed', async () => {
+      // These three fit none of the original three documented values, which is
+      // why the category type gained a fourth rather than folding them into
+      // 'build-failed' and reporting a compile failure that never happened.
+      expect(await categoryAfter('a-opt', 'optimize')).toBe('postbuild-failed');
+      expect(await categoryAfter('a-post', 'post-build')).toBe('postbuild-failed');
+      expect(await categoryAfter('a-val', 'validate')).toBe('postbuild-failed');
+    });
+
+    it('actually discriminates — two stages do not produce the same category', async () => {
+      // The assertion the old code would fail. Each test above passes on its
+      // own against a hardcoded 'build-failed' only if that happens to be the
+      // expected value; this one cannot.
+      const install = await categoryAfter('d-install', 'install');
+      const build = await categoryAfter('d-build', 'build');
+      const pre = await categoryAfter('d-pre', 'pre-build');
+      expect(new Set([install, build, pre]).size).toBe(3);
+    });
+
+    it('persists exitCode and command on the failed row', async () => {
+      bus.publish('build:started', { appId: 'with-detail', buildId: 'b1' });
+      bus.publish('build:failed', {
+        appId: 'with-detail',
+        buildId: 'b1',
+        error: new Error('npm ERR! code ELIFECYCLE'),
+        stage: 'install',
+        exitCode: 127,
+        command: 'npm ci',
+      });
+      await tracker.flush();
+
+      const [episode] = tracker.getEpisodes('with-detail', 1);
+      const failed = episode.stages.find((s) => s.stage === 'build-failed');
+      expect(failed?.exitCode).toBe(127);
+      expect(failed?.command).toBe('npm ci');
+    });
+
+    it('still never persists the raw error message', async () => {
+      // The invariant the new fields must not erode: stage/exitCode/command are
+      // DROP-generated, error.message is process output and stays out.
+      bus.publish('build:started', { appId: 'no-leak', buildId: 'b1' });
+      bus.publish('build:failed', {
+        appId: 'no-leak',
+        buildId: 'b1',
+        error: new Error('/etc/secret leaked DATABASE_URL=postgres://user:pw@host/db'),
+        stage: 'install',
+        exitCode: 1,
+        command: 'npm ci',
+      });
+      await tracker.flush();
+
+      const raw = JSON.stringify(tracker.getEpisodes('no-leak', 1));
+      expect(raw).not.toContain('DATABASE_URL');
+      expect(raw).not.toContain('/etc/secret');
+    });
+  });
+
   describe('hasOpenEpisode', () => {
     // Lets the platform distinguish "nothing ever opened an episode for this
     // deploy" from "one opened and already closed" — without that it would
@@ -123,7 +212,12 @@ describe('DeployTracker', () => {
 
     it('is false once the episode closes as failed', async () => {
       bus.publish('build:started', { appId: 'bad-app', buildId: 'b1' });
-      bus.publish('build:failed', { appId: 'bad-app', buildId: 'b1', error: new Error('boom') });
+      bus.publish('build:failed', {
+        appId: 'bad-app',
+        buildId: 'b1',
+        error: new Error('boom'),
+        stage: 'build',
+      });
       await tracker.flush();
 
       expect(tracker.hasOpenEpisode('bad-app')).toBe(false);
@@ -138,6 +232,7 @@ describe('DeployTracker', () => {
         appId: 'pre-fail',
         buildId: 'synthetic-1',
         error: new Error('Could not detect application type'),
+        stage: 'pre-build',
       });
       await tracker.flush();
 
@@ -240,6 +335,7 @@ describe('DeployTracker', () => {
       appId: 'app4',
       buildId: 'b1',
       error: new Error('/etc/secret/abs/path leaked DATABASE_URL=postgres://user:pw@host/db'),
+      stage: 'build',
     });
     await tracker.flush();
 
@@ -290,7 +386,12 @@ describe('DeployTracker', () => {
   });
 
   it('orphan-close guard: a stray build:failed with no open episode is ignored', async () => {
-    bus.publish('build:failed', { appId: 'app7', buildId: 'bx', error: new Error('boom') });
+    bus.publish('build:failed', {
+      appId: 'app7',
+      buildId: 'bx',
+      error: new Error('boom'),
+      stage: 'build',
+    });
     await tracker.flush();
 
     expect(tracker.getEpisodes('app7')).toEqual([]);
@@ -370,6 +471,7 @@ describe('DeployTracker', () => {
       appId: 'app12',
       buildId: 'b1',
       error: new Error(`ENOENT: ${path.join(tmpDir, 'node_modules', 'missing')}`),
+      stage: 'build',
     });
     await tracker.flush();
 

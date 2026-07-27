@@ -598,6 +598,94 @@ describe('BuilderService Integration', () => {
     expect(started!.payload.appId).toBe('no-strategy-app');
   });
 
+  it('publishes the failing STAGE, not a constant (Gap A)', async () => {
+    // builder.ts always knew which stage failed but published only
+    // {appId, buildId, error}, so DeployTracker hardcoded a category. A
+    // no-strategy failure is genuinely pre-build, and must say so.
+    const { eventBus } = jest.requireMock('../event-bus');
+    (eventBus.publish as jest.Mock).mockClear();
+
+    const service = new BuilderService();
+    await service.build({
+      appName: 'stage-app',
+      appPath: tempDir,
+      appType: 'unknown',
+      framework: null,
+      config: {},
+      env: {},
+    });
+
+    const failed = (eventBus.publish as jest.Mock).mock.calls.find(
+      ([name]: [string]) => name === 'build:failed'
+    );
+    expect(failed![1].stage).toBe('pre-build');
+  });
+
+  it('carries the failing command and exit code off a real stage failure', async () => {
+    // executeInstall/executeBuild have always held both; they stopped at the
+    // BuildStageResult and never reached the payload.
+    const { eventBus } = jest.requireMock('../event-bus');
+    (eventBus.publish as jest.Mock).mockClear();
+
+    const service = new BuilderService();
+    const execCommand = jest.fn().mockResolvedValue({
+      exitCode: 127,
+      stdout: '',
+      stderr: 'sh: vite: not found',
+      duration: 3,
+    });
+
+    await service.build({
+      appName: 'cmd-app',
+      appPath: tempDir,
+      appType: 'nodejs',
+      framework: null,
+      config: { buildCommand: 'npm run build', installCommand: 'npm ci' },
+      env: {},
+      execCommand,
+    } as never);
+
+    const failed = (eventBus.publish as jest.Mock).mock.calls.find(
+      ([name]: [string]) => name === 'build:failed'
+    );
+    expect(failed![1].exitCode).toBe(127);
+    expect(typeof failed![1].command).toBe('string');
+    expect(failed![1].command.length).toBeGreaterThan(0);
+    // Still a real stage, not the 'build' default.
+    expect(['install', 'build']).toContain(failed![1].stage);
+  });
+
+  it('truncates an oversized command rather than publishing it whole', async () => {
+    // drop.yaml `build` is app-authored and unbounded, and this value ends up
+    // in a persisted deploy row.
+    const { eventBus } = jest.requireMock('../event-bus');
+    (eventBus.publish as jest.Mock).mockClear();
+
+    const service = new BuilderService();
+    const huge = 'x'.repeat(5000);
+    const execCommand = jest.fn().mockResolvedValue({
+      exitCode: 1,
+      stdout: '',
+      stderr: 'boom',
+      duration: 3,
+    });
+
+    await service.build({
+      appName: 'huge-cmd-app',
+      appPath: tempDir,
+      appType: 'nodejs',
+      framework: null,
+      config: { buildCommand: huge, installCommand: huge },
+      env: {},
+      execCommand,
+    } as never);
+
+    const failed = (eventBus.publish as jest.Mock).mock.calls.find(
+      ([name]: [string]) => name === 'build:failed'
+    );
+    expect(failed![1].command.length).toBe(512);
+  });
+
   it('emits no events when deferred by the concurrent-build cap', async () => {
     // MAX_BUILDS is a deferral, not a failure: the platform re-queues the app
     // and the retry opens its own episode. Publishing here would either strand
