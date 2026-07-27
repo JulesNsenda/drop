@@ -467,6 +467,7 @@ export async function deleteUser(userId: string): Promise<boolean> {
   credentials.refreshTokens = (credentials.refreshTokens ?? []).filter(
     (r) => r.userId !== userId
   );
+  denyUser(userId);
   await saveCredentials(config.credentialsPath, credentials);
   return true;
 }
@@ -495,6 +496,9 @@ export async function suspendUser(userId: string): Promise<boolean> {
   credentials.refreshTokens = (credentials.refreshTokens ?? []).filter(
     (r) => r.userId !== userId
   );
+  // And the access tokens already in the wild — otherwise a suspension takes
+  // up to 15 minutes to bite, which is the window an incident happens in.
+  denyUser(userId);
   await saveCredentials(config.credentialsPath, credentials);
   return true;
 }
@@ -837,6 +841,11 @@ export async function verifyOAuthAccessToken(
       return null;
     }
 
+    // Revoked? Checked BEFORE the principal is built, so a denied token never
+    // becomes an AuthContext at all.
+    const rawSid = typeof p['sid'] === 'string' ? (p['sid'] as string) : undefined;
+    if (isDenied(userId, rawSid)) return null;
+
     // Per GRANT, not per token, and NAMESPACED.
     //
     // The prefix is not cosmetic: without it a JWT session (`sub`) and a
@@ -860,6 +869,61 @@ export async function verifyOAuthAccessToken(
   } catch {
     return null;
   }
+}
+
+/**
+ * Short-lived denylist for OAuth ACCESS tokens (Step 6e).
+ *
+ * Revoking a refresh token or disabling a user stops NEW access tokens being
+ * minted. It does nothing about one already in the wild, and those live 15
+ * minutes — so "revoked" meant "revoked in up to a quarter of an hour", which
+ * is exactly the window that matters during an incident.
+ *
+ * Keyed on the GRANT (sid) and the USER, not on `jti` as the plan sketched.
+ * The revocation events know which grant and which user they are killing; they
+ * do not know the id of an access token minted minutes ago and never stored.
+ * A jti denylist could therefore only ever be populated by a caller that
+ * already holds the token it wants to revoke — which is not the incident case.
+ *
+ * In-memory and bounded by TTL, deliberately: entries are worthless after the
+ * token lifetime, so this must not grow without limit or need persisting. A
+ * platform restart drops it, which is safe — every token minted before the
+ * restart has also expired or will within the window, and the durable half
+ * (the refresh token) is already gone from the store.
+ */
+const ACCESS_TOKEN_TTL_MS = 15 * 60 * 1000;
+const revokedGrants = new Map<string, number>();
+const revokedUsers = new Map<string, number>();
+
+function denyUntil(map: Map<string, number>, key: string): void {
+  map.set(key, Date.now() + ACCESS_TOKEN_TTL_MS);
+  // Opportunistic sweep — no timer to leak, and the map only ever holds
+  // entries from the last 15 minutes of revocation activity.
+  const now = Date.now();
+  for (const [k, expiry] of map) {
+    if (expiry <= now) map.delete(k);
+  }
+}
+
+/** Deny every access token belonging to a grant (sid). */
+export function denyGrant(sid: string): void {
+  if (sid) denyUntil(revokedGrants, sid);
+}
+
+/** Deny every access token belonging to a user, across all their grants. */
+export function denyUser(userId: string): void {
+  if (userId) denyUntil(revokedUsers, userId);
+}
+
+function isDenied(userId: string, sid: string | undefined): boolean {
+  const now = Date.now();
+  const userUntil = revokedUsers.get(userId);
+  if (userUntil !== undefined && userUntil > now) return true;
+  if (sid) {
+    const grantUntil = revokedGrants.get(sid);
+    if (grantUntil !== undefined && grantUntil > now) return true;
+  }
+  return false;
 }
 
 /** Hash an opaque token the same way API keys are hashed (sha256 hex digest of the raw value). */
@@ -947,14 +1011,21 @@ export async function revokeRefreshToken(presented: string): Promise<boolean> {
   const index = records.findIndex((r) => r.tokenHash === tokenHash);
   if (index === -1) return false;
 
+  // Kill the grant's outstanding ACCESS tokens too. Removing the refresh
+  // record alone only stops new ones being minted; anything already issued
+  // stays valid for the rest of its 15 minutes.
+  const { sid } = records[index];
+  if (sid) denyGrant(sid);
+
   records.splice(index, 1);
   credentials.refreshTokens = records;
   await saveCredentials(config.credentialsPath, credentials);
   return true;
 }
 
-/** Revoke every refresh token issued to a user (e.g. on suspend/delete). */
+/** Revoke every refresh token issued to a user, and deny their live access tokens. */
 export async function revokeAllRefreshTokensForUser(userId: string): Promise<void> {
+  denyUser(userId);
   if (!credentials || !config) throw new Error('Auth not initialized');
 
   const records = credentials.refreshTokens ?? [];
@@ -1199,6 +1270,8 @@ export function resetAuth(): void {
   signupEnabled = false;
   lastUsedFlushAt = 0;
   challengeAttempts.clear();
+  revokedGrants.clear();
+  revokedUsers.clear();
 }
 
 /**
