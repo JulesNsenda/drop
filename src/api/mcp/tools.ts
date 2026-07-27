@@ -387,6 +387,7 @@ export async function handleDeployFiles(
       appName: name,
       archivePath,
       userId: auth?.userId,
+      principalId: auth?.principalId,
     });
 
     // Logged on ACCEPTANCE, not on outcome: a deploy that was started matters
@@ -498,6 +499,7 @@ export async function handleDeployFromGit(
       name: args.name,
       branch: args.branch,
       userId: auth?.userId,
+      principalId: auth?.principalId,
     });
     await auditToolAction(auth, 'agent-deploy', result.appName, 'deploy_from_git');
 

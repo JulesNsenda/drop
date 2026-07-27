@@ -80,6 +80,28 @@ describe('git webhook fail-closed (P0-7) + stored-secret resolution (DROP-061 M2
     await fs.rm(tempDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   });
 
+  it('marks the redeploy as webhook AUTOMATION, not as an anonymous caller', async () => {
+    // The other tests here assert only on the signature verdict, so the
+    // service reports no matching apps and redeploy is never reached.
+    jest.spyOn(gitDeployModule, 'getGitDeployService').mockReturnValue({
+      findAppsForWebhook: () => ['hooked-app'],
+      redeploy,
+    } as unknown as ReturnType<typeof gitDeployModule.getGitDeployService>);
+
+    // The deploy guardrail keys automation separately on purpose. Left
+    // unmarked, a webhook falls through to the watcher's bucket — so a repo
+    // whose push hook fires in a loop would burn the guardrail budget of the
+    // human who owns the app and lock them out of their own redeploys.
+    delete process.env.DROP_GITHUB_WEBHOOK_SECRET;
+    await getSettingsManager().setGithubWebhookSecret('stored-only-secret');
+
+    const res = await postWebhook(sign('stored-only-secret', pushBody));
+
+    expect(res.status).toBe(200);
+    expect(redeploy).toHaveBeenCalledTimes(1);
+    expect(redeploy.mock.calls[0][1]).toEqual({ automation: 'webhook' });
+  });
+
   it('rejects a push webhook with 503 when no secret is configured (neither stored nor env)', async () => {
     delete process.env.DROP_GITHUB_WEBHOOK_SECRET;
 

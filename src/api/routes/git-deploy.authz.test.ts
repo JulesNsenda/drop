@@ -25,6 +25,7 @@ describe('git redeploy route authorization', () => {
   let adminToken: string;
   let aliceId: string;
   let redeploy: jest.Mock;
+  let deploy: jest.Mock;
 
   const bearer = (token: string) => ({ Authorization: `Bearer ${token}` });
 
@@ -34,9 +35,11 @@ describe('git redeploy route authorization', () => {
     jest.spyOn(console, 'warn').mockImplementation();
 
     redeploy = jest.fn().mockResolvedValue({ appName: 'alice-app', repoUrl: 'https://github.com/acme/app' });
+    deploy = jest.fn().mockResolvedValue({ appName: 'fresh-app', repoUrl: 'https://github.com/acme/app' });
     jest.spyOn(gitDeployModule, 'getGitDeployService').mockReturnValue({
       isAvailable: () => true,
       redeploy,
+      deploy,
     } as unknown as ReturnType<typeof gitDeployModule.getGitDeployService>);
 
     resetStateManager();
@@ -91,7 +94,7 @@ describe('git redeploy route authorization', () => {
       headers: bearer(aliceToken),
     });
     expect(res.status).toBe(200);
-    expect(redeploy).toHaveBeenCalledWith('alice-app');
+    expect(redeploy).toHaveBeenCalledWith('alice-app', expect.anything());
   });
 
   it("admin can redeploy any user's app", async () => {
@@ -100,7 +103,7 @@ describe('git redeploy route authorization', () => {
       headers: bearer(adminToken),
     });
     expect(res.status).toBe(200);
-    expect(redeploy).toHaveBeenCalledWith('alice-app');
+    expect(redeploy).toHaveBeenCalledWith('alice-app', expect.anything());
   });
 
   it('nonexistent app returns 404, service not called', async () => {
@@ -127,7 +130,7 @@ describe('git redeploy route authorization', () => {
       headers: bearer(adminToken),
     });
     expect(res.status).toBe(200);
-    expect(redeploy).toHaveBeenCalledWith('legacy-app');
+    expect(redeploy).toHaveBeenCalledWith('legacy-app', expect.anything());
   });
 
   describe('monorepo group child resolution', () => {
@@ -159,7 +162,7 @@ describe('git redeploy route authorization', () => {
       });
       expect(res.status).toBe(200);
       // Resolved to the container, not the child (child has no gitSource).
-      expect(redeploy).toHaveBeenCalledWith('grp-repo');
+      expect(redeploy).toHaveBeenCalledWith('grp-repo', expect.anything());
     });
 
     it('admin redeploying a group child resolves to the container', async () => {
@@ -168,7 +171,7 @@ describe('git redeploy route authorization', () => {
         headers: bearer(adminToken),
       });
       expect(res.status).toBe(200);
-      expect(redeploy).toHaveBeenCalledWith('grp-repo');
+      expect(redeploy).toHaveBeenCalledWith('grp-repo', expect.anything());
     });
 
     it("crafted group collision cannot redeploy another tenant's container (IDOR)", async () => {
@@ -187,6 +190,45 @@ describe('git redeploy route authorization', () => {
       });
       expect(res.status).toBe(404);
       expect(redeploy).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('caller identity is never read from the request body', () => {
+    // POST /git/deploy parses the client body AS GitDeployRequest, and that
+    // type carries the two identity fields. A caller that can name its own
+    // principalId picks a fresh, empty guardrail bucket on every request —
+    // which defeats the deploy breaker completely — and one that can name its
+    // own userId assigns ownership of the app it is creating.
+
+    it('overwrites a forged principalId with the authenticated caller', async () => {
+      const res = await app.request('/api/v1/git/deploy', {
+        method: 'POST',
+        headers: { ...bearer(aliceToken), 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          repoUrl: 'https://github.com/acme/app',
+          principalId: 'oauth:victim::fresh-and-empty',
+        }),
+      });
+
+      expect(res.status).toBe(201);
+      expect(deploy).toHaveBeenCalledTimes(1);
+      const sent = deploy.mock.calls[0][0];
+      expect(sent.principalId).not.toBe('oauth:victim::fresh-and-empty');
+      expect(sent.principalId).toBe(`jwt:${aliceId}`);
+    });
+
+    it('overwrites a forged userId with the authenticated caller', async () => {
+      const res = await app.request('/api/v1/git/deploy', {
+        method: 'POST',
+        headers: { ...bearer(aliceToken), 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          repoUrl: 'https://github.com/acme/app',
+          userId: 'some-other-user',
+        }),
+      });
+
+      expect(res.status).toBe(201);
+      expect(deploy.mock.calls[0][0].userId).toBe(aliceId);
     });
   });
 });

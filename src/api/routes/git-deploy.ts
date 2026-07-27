@@ -73,10 +73,15 @@ gitDeploy.post('/deploy', async (c) => {
       }
     }
 
-    // Pass userId so ownership is set atomically
-    if (auth?.userId) {
-      body.userId = auth.userId;
-    }
+    // Identity comes from the AUTH CONTEXT and is overwritten unconditionally —
+    // the body is client-supplied and shares a type with these fields. A caller
+    // that can name its own principalId picks a fresh, empty guardrail bucket on
+    // every request, which defeats the breaker completely; one that can name its
+    // own userId assigns ownership of the app it is creating. Neither is ever
+    // read from the body, even when auth is disabled (then both are undefined,
+    // matching every other unauthenticated path).
+    body.userId = auth?.userId;
+    body.principalId = auth?.principalId;
 
     const result = await service.deploy(body);
     await tryLogActivity({ action: 'git-deploy', userId: auth?.userId, username: auth?.username, appName: result.appName, detail: result.repoUrl });
@@ -130,7 +135,10 @@ gitDeploy.post('/redeploy/:name', async (c) => {
   }
 
   try {
-    const result = await service.redeploy(target.name);
+    const result = await service.redeploy(target.name, {
+      principalId: auth?.principalId,
+      userId: auth?.userId,
+    });
     await tryLogActivity({ action: 'redeploy', userId: auth?.userId, username: auth?.username, appName: target.name });
     return c.json(success(result));
   } catch (err) {
@@ -218,7 +226,10 @@ gitDeploy.post('/webhook', async (c) => {
   const results: Array<{ app: string; status: string; error?: string }> = [];
   for (const appName of matchingApps) {
     try {
-      await service.redeploy(appName);
+      // No caller: the webhook is unattended. Marked as automation rather than
+      // left principal-less so a looping webhook gets its own guardrail bucket
+      // instead of consuming the app owner's.
+      await service.redeploy(appName, { automation: 'webhook' });
       // Webhook auto-redeploys are unattended and had no audit trail — record
       // them (system action, no user). The API /git/redeploy route logs its
       // own; this webhook path is distinct, so there is no double-count.

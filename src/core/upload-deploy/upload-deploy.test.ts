@@ -163,6 +163,97 @@ describe('UploadDeployService', () => {
     });
   });
 
+  describe('deploy - actor identity for the deploy guardrail', () => {
+    // Without this the guardrail is INERT on the upload path: `principalId`
+    // exists on the payload but nothing populates it, so every deploy keys as
+    // anonymous automation and the per-principal window never fills. Exactly
+    // the structurally-constant-field defect, in the one place that decides
+    // whether an agent loop can be stopped.
+
+    it('carries the credential AND its human onto app:detected', async () => {
+      const archivePath = await buildArchive('actor-new', { 'index.js': 'x' });
+      const received: AppDetectedPayload[] = [];
+      const unsubscribe = eventBus.subscribe('app:detected', (p) => {
+        received.push(p);
+      });
+
+      try {
+        await service.deploy({
+          appName: 'actor-new',
+          archivePath,
+          userId: 'human-1',
+          principalId: 'oauth:human-1::sess-a',
+        });
+
+        expect(received).toHaveLength(1);
+        expect(received[0].principalId).toBe('oauth:human-1::sess-a');
+        expect(received[0].actorUserId).toBe('human-1');
+      } finally {
+        unsubscribe();
+      }
+    });
+
+    it('carries them onto app:update too — the REDEPLOY path an agent loop rides', async () => {
+      // The branch that mattered most and is easiest to miss: fix, re-upload,
+      // fail, repeat all lands here, never on app:detected.
+      const first = await buildArchive('actor-redeploy-v1', { 'index.js': 'v1' });
+      await service.deploy({ appName: 'actor-redeploy', archivePath: first });
+
+      const second = await buildArchive('actor-redeploy-v2', { 'index.js': 'v2' });
+      const received: AppUpdatePayload[] = [];
+      const unsubscribe = eventBus.subscribe('app:update', (p) => {
+        received.push(p);
+      });
+
+      try {
+        await service.deploy({
+          appName: 'actor-redeploy',
+          archivePath: second,
+          userId: 'human-1',
+          principalId: 'key:token-abc',
+        });
+
+        expect(received).toHaveLength(1);
+        expect(received[0].principalId).toBe('key:token-abc');
+        expect(received[0].actorUserId).toBe('human-1');
+      } finally {
+        unsubscribe();
+      }
+    });
+
+    it('distinguishes two credentials belonging to the SAME human', async () => {
+      // The load-bearing assertion: if the publisher dropped principalId and
+      // only actorUserId survived, both deploys would key identically and one
+      // agent could throttle another. userId alone cannot separate them.
+      const a = await buildArchive('actor-two-a', { 'index.js': 'a' });
+      const b = await buildArchive('actor-two-b', { 'index.js': 'b' });
+      const received: AppDetectedPayload[] = [];
+      const unsubscribe = eventBus.subscribe('app:detected', (p) => {
+        received.push(p);
+      });
+
+      try {
+        await service.deploy({
+          appName: 'actor-two-a',
+          archivePath: a,
+          userId: 'human-1',
+          principalId: 'key:token-1',
+        });
+        await service.deploy({
+          appName: 'actor-two-b',
+          archivePath: b,
+          userId: 'human-1',
+          principalId: 'key:token-2',
+        });
+
+        expect(received.map((p) => p.actorUserId)).toEqual(['human-1', 'human-1']);
+        expect(received.map((p) => p.principalId)).toEqual(['key:token-1', 'key:token-2']);
+      } finally {
+        unsubscribe();
+      }
+    });
+  });
+
   describe('deploy - redeploy', () => {
     it('publishes app:update with bypassCooldown and reason "upload deploy"', async () => {
       const archive1 = await buildArchive('redeploy-app-v1', { 'index.js': 'v1' });

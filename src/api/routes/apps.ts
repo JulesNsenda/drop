@@ -453,6 +453,7 @@ apps.post('/:name/source', async c => {
       appName: name,
       archivePath,
       userId: auth?.userId,
+      principalId: auth?.principalId,
     });
 
     await tryLogActivity({
@@ -1044,6 +1045,10 @@ apps.post('/:name/migrate-runtime', async c => {
         path: appPath,
         type: config.type,
         timestamp: new Date(),
+        // The last app:detected publisher with a real caller behind it. Left
+        // unnamed the rebuild keys as watcher automation rather than the admin.
+        principalId: authCtx?.principalId,
+        actorUserId: authCtx?.userId,
       });
     }
 
