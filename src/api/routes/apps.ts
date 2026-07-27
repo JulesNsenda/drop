@@ -43,6 +43,7 @@ import {
   UploadValidationError,
   InsufficientDiskSpaceError,
 } from '../../core/upload-deploy';
+import { DeployRefusedError } from '../../managers/guardrail/deploy-breaker';
 import { runUploadPreflight } from '../upload-preflight';
 import type { RuntimeType } from '../../managers/runtime/app-runtime.types';
 
@@ -482,6 +483,12 @@ apps.post('/:name/source', async c => {
     }
     if (err instanceof InsufficientDiskSpaceError) {
       return c.json(error(ErrorCodes.INTERNAL_ERROR, err.message), 507 as any);
+    }
+    if (err instanceof DeployRefusedError) {
+      // 429 with Retry-After, so a caller backs off on its own rather than
+      // hammering a refusal it cannot read.
+      c.header('Retry-After', String(err.retryAfterSeconds));
+      return c.json(error(ErrorCodes.RATE_LIMITED, err.message), 429);
     }
     // Anything else (validation errors thrown above, unexpected failures)
     // rethrows to the global error handler: HttpErrors map to their own

@@ -61,6 +61,13 @@ jest.mock('child_process', () => ({
   }),
 }));
 
+import {
+  getDeployBreaker,
+  resetDeployBreaker,
+  DeployRefusedError,
+  guardrailKeysFor,
+} from '../../managers/guardrail/deploy-breaker';
+
 describe('GitDeployService', () => {
   let service: GitDeployService;
   let tempDir: string;
@@ -246,6 +253,56 @@ describe('GitDeployService', () => {
 
       expect(result.repoUrl).toBe('https://github.com/user/dotgit-test');
       expect(result.appName).toBe('dotgit-test');
+    });
+  });
+
+  describe('deploy - guardrail pre-check', () => {
+    // The platform's gates sit at the BUILD, so without this a refused caller
+    // could still make DROP clone an arbitrary repository on every attempt —
+    // network, disk and time spent before the event that would refuse it is
+    // even published.
+    afterEach(() => resetDeployBreaker());
+
+    const actor = { userId: 'human-1', principalId: 'key:looper' };
+
+    const trip = (appName: string) => {
+      const keys = guardrailKeysFor(appName, true, {
+        principalId: actor.principalId,
+        actorUserId: actor.userId,
+      });
+      const breaker = getDeployBreaker();
+      for (let i = 0; i < 5; i++) breaker.recordFailure(keys[0].key, Date.now(), keys[0].threshold);
+    };
+
+    it('refuses BEFORE cloning', async () => {
+      trip('test-app');
+
+      await expect(
+        service.deploy({ repoUrl: 'https://github.com/user/test-app', ...actor })
+      ).rejects.toBeInstanceOf(DeployRefusedError);
+    });
+
+    it('keys on the caller, not the app name — a fresh name does not reset it', async () => {
+      // Every new-app deploy shares one `<principal>::__new__` bucket precisely
+      // so that inventing a new repo name each time accumulates rather than
+      // starting over.
+      trip('test-app');
+
+      await expect(
+        service.deploy({ repoUrl: 'https://github.com/user/a-different-name', ...actor })
+      ).rejects.toBeInstanceOf(DeployRefusedError);
+    });
+
+    it('lets an UNRELATED caller clone', async () => {
+      trip('test-app');
+
+      await expect(
+        service.deploy({
+          repoUrl: 'https://github.com/user/test-app',
+          userId: 'human-2',
+          principalId: 'key:innocent',
+        })
+      ).resolves.toBeDefined();
     });
   });
 
