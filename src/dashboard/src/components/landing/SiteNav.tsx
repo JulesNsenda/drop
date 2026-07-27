@@ -77,7 +77,7 @@ export function SiteNav({ isDark, onToggleTheme, onEnter, authEnabled, current }
             letterSpacing: 0.5,
           }}
         >
-          v2.0.0-rc.1
+          v{__DROP_VERSION__}
         </span>
       </Link>
 
