@@ -68,6 +68,15 @@ export interface PlatformOps {
   isAppInProgress(appName: string): boolean;
 
   /**
+   * Put a held (built-but-unpromoted) build in front of traffic.
+   *
+   * Starts exactly what was built rather than rebuilding — a rebuild could pick
+   * up source that changed since the operator looked at it, promoting something
+   * nobody approved. Rejects when nothing is held.
+   */
+  promoteApp(appName: string): Promise<void>;
+
+  /**
    * Tear down every app belonging to a monorepo group (M4): stop+delete each
    * child's runtime process, remove its Caddy routes, dump-then-drop its
    * database, and remove its state/secrets/deploy-history/config/folder —
