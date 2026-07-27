@@ -70,6 +70,21 @@ export interface ApiKey {
   /** Capability scopes for this key (e.g. 'users:create'). Orthogonal to role. */
   scopes?: string[];
   /**
+   * What this key IS, as opposed to what it can do.
+   *
+   * 'agent' marks a token minted for an autonomous caller through
+   * POST /auth/agent-tokens. It is load-bearing rather than descriptive: the
+   * MCP gate admits a rank-0 principal ONLY when it is `kind: 'agent'` AND
+   * carries an agent-grammar scope. Without that second condition, opening the
+   * gate to rank-0 would also admit the `app:<name>:provision` key DROP
+   * injects into every tenant container as DROP_API_KEY — which is also
+   * rank-0, and which must stay structurally ineligible.
+   *
+   * Absent on every key minted before this existed, and on the provisioning
+   * keys, which is exactly the discrimination wanted.
+   */
+  kind?: 'agent';
+  /**
    * The human this key acts on behalf of. `AuthContext.userId` resolves to
    * this when set, so apps created through the key are owned by a real user
    * and count against THAT user's quota.
@@ -1076,7 +1091,14 @@ export async function createApiKey(
   role: 'admin' | 'user' | 'readonly' | 'none' = 'user',
   expiresInDays?: number,
   scopes?: string[],
-  ownerUserId?: string
+  ownerUserId?: string,
+  /**
+   * Options the positional parameters above cannot express. Agent tokens want
+   * MINUTES, not days — a token handed to an autonomous caller for one task
+   * should outlive the task by minutes, and a one-day floor is the difference
+   * between a bounded credential and a standing one.
+   */
+  opts?: { expiresInMinutes?: number; kind?: 'agent' }
 ): Promise<{ key: string; apiKey: ApiKey }> {
   if (!credentials || !config) {
     throw new Error('Auth not initialized');
@@ -1093,11 +1115,16 @@ export async function createApiKey(
     prefix: key.substring(0, 12),
     role,
     createdAt: new Date().toISOString(),
-    expiresAt: expiresInDays
-      ? new Date(Date.now() + expiresInDays * 24 * 60 * 60 * 1000).toISOString()
-      : undefined,
+    // Minutes win when supplied — they are the finer grain, and a caller that
+    // passes both meant the tighter bound.
+    expiresAt: opts?.expiresInMinutes
+      ? new Date(Date.now() + opts.expiresInMinutes * 60 * 1000).toISOString()
+      : expiresInDays
+        ? new Date(Date.now() + expiresInDays * 24 * 60 * 60 * 1000).toISOString()
+        : undefined,
     ...(scopes !== undefined ? { scopes } : {}),
     ...(ownerUserId !== undefined ? { ownerUserId } : {}),
+    ...(opts?.kind ? { kind: opts.kind } : {}),
   };
 
   credentials.apiKeys.push(apiKey);

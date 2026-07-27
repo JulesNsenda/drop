@@ -32,9 +32,16 @@ import {
 } from '../middleware/auth';
 import { tryLogActivity } from '../../managers/activity';
 import { getStateManager } from '../../managers/app/state-manager';
+import { canAccess } from '../access';
+import { assertMintable } from '../agent-scopes';
 import { ValidationError } from '../middleware/error';
 
 const auth = new Hono();
+
+/** Default life of an agent token: long enough for a deploy, short enough to forget about. */
+const DEFAULT_AGENT_TOKEN_MINUTES = 60;
+/** Ceiling. A scope-only token is still a credential; a standing one defeats the point. */
+const MAX_AGENT_TOKEN_MINUTES = 60 * 24 * 7;
 
 /**
  * Guard for self-service ACCOUNT routes — the ones that act on the caller's own
@@ -642,6 +649,88 @@ auth.post('/mfa/disable', authMiddleware(), async c => {
     username: authCtx.username,
   });
   return c.json(success({ message: 'Two-factor authentication disabled' }));
+});
+
+/**
+ * POST /auth/agent-tokens - mint a scope-only token for an autonomous caller.
+ *
+ * Distinct from POST /auth/api-keys in three ways that matter:
+ *
+ *  - role is ALWAYS 'none'. An agent token has no role standing whatsoever;
+ *    its entire authority is the scope list, checked by canAccessScoped.
+ *    There is no parameter to raise it, because there is no reason to.
+ *  - the requester may only grant apps they can already reach. assertMintable
+ *    enforces that; without it any authenticated user mints
+ *    app:<someone-elses-app>:deploy for themselves.
+ *  - expiry is in MINUTES and is capped. A credential handed to an autonomous
+ *    caller should outlive its task by minutes.
+ *
+ * Gated at `user` (not admin) deliberately: this grants a SUBSET of what the
+ * caller already holds, so requiring an admin would make the safe path the
+ * inconvenient one and push people towards long-lived full-role keys.
+ */
+auth.post('/agent-tokens', authMiddleware('user'), async (c) => {
+  const requester = (c.get as (k: string) => AuthContext | undefined)('auth');
+  const body = await c.req.json<{
+    name?: string;
+    scopes?: unknown;
+    expiresInMinutes?: number;
+  }>();
+
+  const name = typeof body.name === 'string' ? body.name.trim() : '';
+  if (!name) throw new ValidationError('A name is required');
+  if (name.length > 64) throw new ValidationError('Name must be 64 characters or fewer');
+
+  const minutes = body.expiresInMinutes ?? DEFAULT_AGENT_TOKEN_MINUTES;
+  if (
+    !Number.isInteger(minutes) ||
+    minutes < 1 ||
+    minutes > MAX_AGENT_TOKEN_MINUTES
+  ) {
+    throw new ValidationError(
+      `expiresInMinutes must be an integer between 1 and ${MAX_AGENT_TOKEN_MINUTES}`
+    );
+  }
+
+  // The requester's OWN reach, evaluated per app named. An admin passes
+  // everything via canAccess; anyone else only their own apps. A name that
+  // does not resolve to a live app fails too — you cannot pre-grant against a
+  // name you do not hold, which would otherwise be a way to claim one.
+  const check = assertMintable(body.scopes, (appName) => {
+    const app = getStateManager().getApp(appName);
+    return !!app && canAccess(requester, app);
+  });
+  if (!check.ok) {
+    return c.json(error(ErrorCodes.VALIDATION_ERROR, check.reason ?? 'Invalid scopes'), 400);
+  }
+
+  const { key, apiKey } = await createApiKey(
+    name,
+    'none',
+    undefined,
+    check.normalized,
+    requester?.userId,
+    { expiresInMinutes: minutes, kind: 'agent' }
+  );
+
+  await tryLogActivity({
+    action: 'agent-token-issue',
+    userId: requester?.userId,
+    username: requester?.username,
+    detail: `${check.normalized?.length ?? 0} scope(s), ${minutes}m`,
+  });
+
+  // The raw key is returned ONCE and never stored.
+  return c.json(
+    success({
+      id: apiKey.id,
+      name: apiKey.name,
+      key,
+      scopes: apiKey.scopes,
+      expiresAt: apiKey.expiresAt,
+    }),
+    201
+  );
 });
 
 export default auth;
