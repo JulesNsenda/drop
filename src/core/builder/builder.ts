@@ -31,6 +31,16 @@ const DEFAULT_CONFIG: BuilderConfig = {
   customStrategies: [],
 };
 
+/**
+ * Cap on the `command` carried in a build:failed payload. The command is
+ * DROP-composed, but an app's drop.yaml `build` is app-authored and
+ * unbounded, and this value ends up in a persisted deploy row.
+ */
+const MAX_FAILED_COMMAND_CHARS = 512;
+
+const truncateCommand = (cmd?: string): string | undefined =>
+  cmd === undefined ? undefined : cmd.slice(0, MAX_FAILED_COMMAND_CHARS);
+
 const BUILD_STAGES: BuildStage[] = [
   'pre-build',
   'environment',
@@ -113,6 +123,7 @@ export class BuilderService {
         buildId,
         error: new Error(noStrategy.message),
         deployId: context.deployId,
+        stage: noStrategy.stage,
       });
 
       return this.createFailedResult(startedAt, [noStrategy], []);
@@ -168,6 +179,8 @@ export class BuilderService {
           errors.push({
             stage,
             message: stageResult.error || 'Stage failed',
+            exitCode: stageResult.exitCode,
+            command: stageResult.command,
           });
 
           // Stop on failure
@@ -199,6 +212,11 @@ export class BuilderService {
           buildId,
           error: new Error(errors[0]?.message || 'Build failed'),
           deployId: context.deployId,
+          // The stage was known here all along and simply never left the
+          // builder — this is Gap A.
+          stage: errors[0]?.stage ?? 'build',
+          exitCode: errors[0]?.exitCode,
+          command: truncateCommand(errors[0]?.command),
         });
       }
 
@@ -228,6 +246,9 @@ export class BuilderService {
         buildId,
         error: errorObj,
         deployId: context.deployId,
+        // Whatever stage was running when it threw. activeBuild.currentStage is
+        // null only before the loop's first iteration, i.e. still pre-build.
+        stage: activeBuild.currentStage ?? 'pre-build',
       });
 
       return this.createFailedResult(startedAt, errors, stages);
@@ -445,6 +466,8 @@ export class BuilderService {
         duration: result.duration,
         output: result.stdout,
         error: result.stderr || `Install failed with exit code ${result.exitCode}`,
+        exitCode: result.exitCode,
+        command: installCommand,
       };
     }
 
@@ -510,6 +533,8 @@ export class BuilderService {
           duration: result.duration,
           output: result.stdout,
           error: result.stderr || `Build failed with exit code ${result.exitCode}`,
+          exitCode: result.exitCode,
+          command: buildCommand,
         };
       }
 
@@ -520,11 +545,14 @@ export class BuilderService {
         output: result.stdout,
       };
     } catch (error) {
+      // A throw (timeout, spawn failure) yields no exit code — but the command
+      // is still known and is the more useful of the two for a caller.
       return {
         stage: 'build',
         status: 'failed',
         duration: Date.now() - startTime,
         error: error instanceof Error ? error.message : 'Build failed',
+        command: buildCommand,
       };
     }
   }
