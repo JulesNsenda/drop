@@ -80,7 +80,7 @@ describe('command kind', () => {
 });
 
 describe('next actions', () => {
-  const ALLOWED = ['app_logs', 'app_status', 'restart_app', 'list_apps'];
+  const ALLOWED = ['get_deploy_logs', 'app_logs', 'app_status', 'restart_app', 'list_apps'];
 
   it('only ever returns tool-name literals', () => {
     const all = [
@@ -94,12 +94,18 @@ describe('next actions', () => {
     }
   });
 
-  it('points a BOOT failure at the runtime log, not the build log', () => {
-    // The build succeeded, so the build log will not contain the crash.
-    // Sending a caller there is the single most useless thing this field
-    // could do.
-    expect(nextActionsFor('failed', 'boot')).toContain('app_logs');
+  it('sends any failure to the log for THAT deploy first', () => {
+    // app_logs shows what the app is doing NOW — for a failed deploy usually
+    // nothing, and for a build failure structurally the wrong log.
+    expect(nextActionsFor('failed', 'build')[0]).toBe('get_deploy_logs');
+    expect(nextActionsFor('failed', 'boot')[0]).toBe('get_deploy_logs');
+  });
+
+  it('offers a restart only where retrying could plausibly help', () => {
+    // A crash at startup might be transient. A build that cannot compile will
+    // not compile on the second try.
     expect(nextActionsFor('failed', 'boot')).toContain('restart_app');
+    expect(nextActionsFor('failed', 'build')).not.toContain('restart_app');
   });
 
   it('suggests nothing after a clean success', () => {
