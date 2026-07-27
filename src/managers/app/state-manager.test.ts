@@ -25,6 +25,81 @@ describe('AppStateManager', () => {
     await fs.rm(tempDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   });
 
+  describe('registerApp preserves state across a re-register', () => {
+    // registerApp runs for EVERY app on EVERY boot (syncStateWithConfigs), so
+    // anything it drops is lost on restart. It used to be a literal naming ~12
+    // fields; everything else was silently discarded. These are the fields
+    // that were actually being lost in shipped code.
+    beforeEach(async () => {
+      await manager.initialize();
+      await manager.registerApp('app', '/tmp/app', 'nodejs');
+    });
+
+    it('keeps the missing-secrets list a needs-config park recorded', async () => {
+      // PRD-051 parks an app and tells the operator exactly what to set.
+      // Dropping this list threw that away on the next restart.
+      await manager.setAppStatus('app', 'needs-config', { missingSecrets: ['JWT_SECRET'] });
+
+      await manager.registerApp('app', '/tmp/app', 'nodejs');
+
+      expect(manager.getApp('app')?.missingSecrets).toEqual(['JWT_SECRET']);
+    });
+
+    it('keeps the monorepo group tag', async () => {
+      // Not recomputed from state — dropping it made group apps invisible to
+      // every state-only consumer after a restart.
+      await manager.updateApp('app', { group: 'ezsign', isGroupContainer: false });
+
+      await manager.registerApp('app', '/tmp/app', 'nodejs');
+
+      expect(manager.getApp('app')?.group).toBe('ezsign');
+    });
+
+    it('keeps a user-configured custom domain', async () => {
+      await manager.updateApp('app', { customDomain: 'app.example.com' });
+
+      await manager.registerApp('app', '/tmp/app', 'nodejs');
+
+      expect(manager.getApp('app')?.customDomain).toBe('app.example.com');
+    });
+
+    it('keeps framework when the caller does not supply one', async () => {
+      await manager.registerApp('app', '/tmp/app', 'nodejs', 'express');
+
+      await manager.registerApp('app', '/tmp/app', 'nodejs');
+
+      expect(manager.getApp('app')?.framework).toBe('express');
+    });
+
+    it('still lets an explicit framework win', async () => {
+      await manager.registerApp('app', '/tmp/app', 'nodejs', 'express');
+
+      await manager.registerApp('app', '/tmp/app', 'nodejs', 'fastify');
+
+      expect(manager.getApp('app')?.framework).toBe('fastify');
+    });
+
+    it('still resets status to pending, and still preserves stopped', async () => {
+      // The one deliberate reset: a re-registered app is about to be
+      // redeployed. Only a user-stopped app keeps its status.
+      await manager.setAppStatus('app', 'running', { port: 3000 });
+      await manager.registerApp('app', '/tmp/app', 'nodejs');
+      expect(manager.getApp('app')?.status).toBe('pending');
+
+      await manager.setAppStatus('app', 'stopped');
+      await manager.registerApp('app', '/tmp/app', 'nodejs');
+      expect(manager.getApp('app')?.status).toBe('stopped');
+    });
+
+    it('still clears pid, since no process is claimed yet', async () => {
+      await manager.setAppStatus('app', 'running', { port: 3000, pid: 4242 });
+
+      await manager.registerApp('app', '/tmp/app', 'nodejs');
+
+      expect(manager.getApp('app')?.pid).toBeUndefined();
+    });
+  });
+
   describe('readinessUnverified (D1)', () => {
     // setAppStatus takes a THREE-way signal, because only the caller knows
     // whether the readiness gate actually ran. updateApp is a spread merge, so
