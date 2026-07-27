@@ -25,6 +25,94 @@ describe('AppStateManager', () => {
     await fs.rm(tempDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   });
 
+  describe('readinessUnverified (D1)', () => {
+    // setAppStatus takes a THREE-way signal, because only the caller knows
+    // whether the readiness gate actually ran. updateApp is a spread merge, so
+    // the difference between "omit the key" and "pass false" is the whole
+    // mechanism — get it wrong and an app flagged once stays flagged forever.
+    beforeEach(async () => {
+      await manager.initialize();
+      await manager.registerApp('app', '/tmp/app', 'nodejs');
+    });
+
+    it('sets the flag when readiness ran and the app did not prove ready', async () => {
+      await manager.setAppStatus('app', 'running', { readinessUnverified: true });
+
+      expect(manager.getApp('app')?.readinessUnverified).toBe(true);
+    });
+
+    it('CLEARS the flag when readiness ran and passed', async () => {
+      // The load-bearing case. A later clean deploy has to be able to undo the
+      // flag; if this only omitted the key, the spread would preserve `true`.
+      await manager.setAppStatus('app', 'running', { readinessUnverified: true });
+      await manager.setAppStatus('app', 'running', { readinessUnverified: false });
+
+      expect(manager.getApp('app')?.readinessUnverified).toBeUndefined();
+    });
+
+    it('leaves an existing flag ALONE when readiness did not run', async () => {
+      // handleAppUpdate and restartApp are ungated. They must not silently
+      // certify an app as verified just by writing 'running'.
+      await manager.setAppStatus('app', 'running', { readinessUnverified: true });
+      await manager.setAppStatus('app', 'running', { port: 3000 });
+
+      expect(manager.getApp('app')?.readinessUnverified).toBe(true);
+    });
+
+    it('does not invent a flag when readiness did not run', async () => {
+      await manager.setAppStatus('app', 'running', { port: 3000 });
+
+      expect(manager.getApp('app')?.readinessUnverified).toBeUndefined();
+    });
+
+    it('does not survive a round trip to disk once cleared', async () => {
+      // The clear must reach the persisted file, not just the in-memory map —
+      // the boot predicate reads what was persisted.
+      await manager.setAppStatus('app', 'running', { readinessUnverified: true });
+      await manager.setAppStatus('app', 'running', { readinessUnverified: false });
+      await manager.close();
+
+      const reloaded = new AppStateManager({ stateFilePath });
+      await reloaded.initialize();
+      expect(reloaded.getApp('app')?.readinessUnverified).toBeUndefined();
+      await reloaded.close();
+    });
+
+    it('survives registerApp, which boot reconciliation runs before reading it', async () => {
+      // THE seam test. syncStateWithConfigs calls registerApp for every config
+      // BEFORE reconcileAppsOnBoot reads the flag, so a registerApp that drops
+      // the field makes the whole boot-redeploy arm unreachable — written at
+      // deploy, destroyed unread on the next boot, with a fully green suite.
+      await manager.setAppStatus('app', 'running', { readinessUnverified: true });
+
+      await manager.registerApp('app', '/tmp/app', 'nodejs');
+
+      expect(manager.getApp('app')?.readinessUnverified).toBe(true);
+    });
+
+    it('treats an explicitly-passed undefined as "readiness did not run", not as verified', () => {
+      // Keyed on the VALUE, not key presence. With `in`, a caller writing
+      // `{ readinessUnverified: maybeUndefined }` would silently certify an app
+      // that genuinely failed readiness — the exact lie the three-way prevents.
+      return (async () => {
+        await manager.setAppStatus('app', 'running', { readinessUnverified: true });
+        await manager.setAppStatus('app', 'running', { readinessUnverified: undefined });
+
+        expect(manager.getApp('app')?.readinessUnverified).toBe(true);
+      })();
+    });
+
+    it('persists a set flag across a round trip to disk', async () => {
+      await manager.setAppStatus('app', 'running', { readinessUnverified: true });
+      await manager.close();
+
+      const reloaded = new AppStateManager({ stateFilePath });
+      await reloaded.initialize();
+      expect(reloaded.getApp('app')?.readinessUnverified).toBe(true);
+      await reloaded.close();
+    });
+  });
+
   describe('initialize', () => {
     it('should create state file directory if it does not exist', async () => {
       const nestedPath = path.join(tempDir, 'nested', 'dir', 'state.json');
