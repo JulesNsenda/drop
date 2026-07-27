@@ -2936,7 +2936,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       // Reported as a normal deploy failure so a caller polling for an outcome
       // gets an answer instead of waiting out its budget — the same reason
       // failDeployEpisode exists.
-      this.failDeployEpisode(appName, new Error(reason), crypto.randomUUID());
+      this.failDeployEpisode(appName, new Error(reason), crypto.randomUUID(), 'GUARDRAIL_TRIPPED');
       return;
     }
     this.breakerKeys.set(appName, guardKeys);
@@ -3159,7 +3159,22 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
    * `buildId` is not used for correlation (the tracker keys on app name), so a
    * synthetic one is fine.
    */
-  private failDeployEpisode(appName: string, error: Error, deployId?: string): void {
+  private failDeployEpisode(
+    appName: string,
+    error: Error,
+    deployId?: string,
+    /**
+     * Names the refusal so it does not classify as PREBUILD_FAILED.
+     *
+     * Every other caller of this genuinely failed before the build — detection,
+     * the disk check, a malformed drop.yaml — and 'pre-build' is the truthful
+     * stage for those. A guardrail refusal shares the stage but not the cause:
+     * nothing was attempted, so the PREBUILD_FAILED hint ("check detection, the
+     * environment, or drop.yaml") sends the caller to look at something that is
+     * not wrong.
+     */
+    code?: 'GUARDRAIL_TRIPPED' | 'QUOTA_EXCEEDED'
+  ): void {
     this.recordDeployOutcome(appName, false);
     try {
       const tracker = getDeployTracker();
@@ -3176,6 +3191,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         error,
         deployId,
         stage: 'pre-build',
+        code,
       });
     } catch {
       // Tracker not initialised (isolated tests) — observability only, never
@@ -3810,7 +3826,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
             `Retry in ${containerVerdict.retryAfterSeconds}s.`;
           this.logger.warn(`Re-expansion of '${appName}' refused by guardrail: ${refusal}`, 'MONOREPO');
           this.releaseGuardrailKeys(appName);
-          this.failDeployEpisode(appName, new Error(refusal), crypto.randomUUID());
+          this.failDeployEpisode(appName, new Error(refusal), crypto.randomUUID(), 'GUARDRAIL_TRIPPED');
           return;
         }
         this.breakerKeys.set(appName, containerKeys);
@@ -3911,7 +3927,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       this.appDeployTimes.set(appName, Date.now());
       // Reported as a normal deploy failure so a caller polling for an outcome
       // gets an answer instead of waiting out its budget.
-      this.failDeployEpisode(appName, new Error(refusal), crypto.randomUUID());
+      this.failDeployEpisode(appName, new Error(refusal), crypto.randomUUID(), 'GUARDRAIL_TRIPPED');
       return;
     }
     this.breakerKeys.set(appName, guardKeys);
