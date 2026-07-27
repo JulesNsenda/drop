@@ -25,7 +25,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 
 import { AuthContext, getUserById } from '../middleware/auth';
-import { canAccess } from '../access';
+import { canAccess, canAccessScoped } from '../access';
 import { isValidAppName } from '../middleware/validate';
 import { getStateManager } from '../../managers/app/state-manager';
 import { getAppRuntime } from '../../managers/runtime';
@@ -477,7 +477,7 @@ export function handleAppStatus(
   args: { name: string }
 ): CallToolResult {
   const app = getStateManager().getApp(args.name);
-  if (!app || !canAccess(auth, app)) {
+  if (!app || !canAccessScoped(auth, app, args.name, 'read')) {
     return toolError(`Application '${args.name}' not found`);
   }
 
@@ -498,7 +498,7 @@ export async function handleAppLogs(
   args: { name: string; lines?: number }
 ): Promise<CallToolResult> {
   const app = getStateManager().getApp(args.name);
-  if (!app || !canAccess(auth, app)) {
+  if (!app || !canAccessScoped(auth, app, args.name, 'read')) {
     return toolError(`Application '${args.name}' not found`);
   }
 
@@ -548,7 +548,7 @@ export async function handleGetDeployLogs(
   // One indistinguishable answer for missing, succeeded (no detail is written
   // for one) and foreign — anything else is an oracle for which deploy ids
   // exist and whose they are.
-  if (!detail || !canAccess(auth, { userId: detail.userId })) {
+  if (!detail || !canAccessScoped(auth, { userId: detail.userId }, detail.appName, 'read')) {
     return toolError(notFound);
   }
 
@@ -635,7 +635,9 @@ export async function handleRestartApp(
   args: { name: string }
 ): Promise<CallToolResult> {
   const app = getStateManager().getApp(args.name);
-  if (!app || !canAccess(auth, app)) {
+  // 'deploy', not 'read': a restart replaces what is currently serving, and a
+  // read-only grant must not be able to do that.
+  if (!app || !canAccessScoped(auth, app, args.name, 'deploy')) {
     return toolError(`Application '${args.name}' not found`);
   }
 

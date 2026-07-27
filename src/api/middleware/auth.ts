@@ -12,6 +12,7 @@ import * as path from 'path';
 import { writeJsonAtomic } from '../../utils/atomic-write';
 import { encrypt, decrypt, EncryptedData } from '../../managers/secret/encryption';
 import { error, ErrorCodes } from '../types';
+import { normalizeAgentScope } from '../agent-scopes';
 import { getPublicUrl } from '../runtime-config';
 import { getMcpResourceUrl, canonicalizeUrl } from '../oauth/metadata';
 
@@ -133,6 +134,11 @@ export interface AuthContext {
    * 15-minute slices.
    */
   principalId?: string;
+  /**
+   * Set only for a token minted through POST /auth/agent-tokens. Load-bearing
+   * at the MCP gate — see mcpAuthMiddleware.
+   */
+  kind?: 'agent';
 }
 
 /** A rotated-on-use opaque refresh token, hashed at rest (never the raw token). */
@@ -1134,6 +1140,40 @@ export async function createApiKey(
 }
 
 /**
+ * Resolve an AGENT token from the presented credentials, or null.
+ *
+ * Deliberately narrow, and deliberately not part of authMiddleware: this
+ * admission exists for /mcp alone, so widening the general role gate to let it
+ * through would open every rank-0 key on every route.
+ *
+ * BOTH conditions are required. `kind === 'agent'` proves the token came from
+ * POST /auth/agent-tokens; at least one well-formed agent scope proves it was
+ * granted something. A key with the right kind and no usable scope is not an
+ * agent token in any meaningful sense, and admitting it would put a principal
+ * with zero authority in front of every tool's own checks.
+ */
+async function resolveAgentToken(
+  bearerToken: string | undefined,
+  apiKeyHeader: string | undefined
+): Promise<AuthContext | null> {
+  const raw = apiKeyHeader ?? bearerToken;
+  if (!raw) return null;
+
+  let key: ApiKey | null = null;
+  try {
+    key = await verifyApiKey(raw);
+  } catch {
+    return null;
+  }
+  if (!key || key.kind !== 'agent') return null;
+
+  const usable = (key.scopes ?? []).some((scope) => normalizeAgentScope(scope) !== null);
+  if (!usable) return null;
+
+  return apiKeyAuthContext(key);
+}
+
+/**
  * Verify an API key
  */
 export async function verifyApiKey(key: string): Promise<ApiKey | null> {
@@ -1203,6 +1243,7 @@ function apiKeyAuthContext(key: ApiKey): AuthContext {
     // must be metered and attributed separately — that is the point of issuing
     // more than one. Ownership still flows through userId above.
     principalId: `key:${key.id}`,
+    ...(key.kind ? { kind: key.kind } : {}),
   };
 }
 
@@ -1493,6 +1534,25 @@ export function mcpAuthMiddleware() {
           return next();
         }
       }
+    }
+
+    // AGENT TOKENS (SEC-5). authMiddleware('user') below ranks a scope-only
+    // principal at 0 and rejects it, which is correct for the general API —
+    // but it also blocks the tokens this endpoint exists to serve. So admit
+    // them HERE, and only here, on two conditions that must BOTH hold.
+    //
+    // The second condition is the load-bearing one. DROP injects a rank-0
+    // provisioning key into every tenant container as DROP_API_KEY
+    // (`createApiKey('app:<app>:provision', 'none', …)`). Admitting rank-0 on
+    // role alone would authenticate that key at /mcp too — and a compromised
+    // tenant app would escalate from "can call POST /auth/users" to "can
+    // create and run arbitrary apps". Requiring `kind: 'agent'` keeps
+    // provisioning keys structurally ineligible: they are not minted through
+    // the agent-token route and carry no kind at all.
+    const agentCtx = await resolveAgentToken(bearerToken, apiKeyHeader);
+    if (agentCtx) {
+      c.set('auth', agentCtx);
+      return next();
     }
 
     // Fall back to the session-JWT / API-key path. If it 401s a
