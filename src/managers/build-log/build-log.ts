@@ -14,8 +14,40 @@ const MAX_BUILD_LOGS = 10;
 export interface BuildLogEntry {
   id: string;
   appName: string;
+  /**
+   * The timestamp portion ONLY (`2026-07-27T07-13-56-456Z`). The deploy id is
+   * a separate field and must never be folded in here or into `id`: both are
+   * exposed through GET /logs/:name/builds, so concatenating them would leak
+   * the deploy id into two documented API fields and change their shape.
+   */
   timestamp: string;
   logFile: string;
+  /**
+   * Deploy this log belongs to, parsed back out of the filename. Absent for
+   * logs written before deploy-id threading, and whenever the caller did not
+   * supply one.
+   */
+  deployId?: string;
+}
+
+/**
+ * Separates the timestamp from the deploy id in a build-log filename.
+ *
+ * A double dash is unambiguous: `startBuild` builds the timestamp portion via
+ * `toISOString().replace(/[:.]/g, '-')`, which yields single dashes only
+ * (`2026-07-27T07-13-56-456Z`) and can never itself contain `--`. A UUID
+ * likewise contains only single dashes.
+ */
+const DEPLOY_ID_SEPARATOR = '--';
+
+/** Split a build-log basename (no `.log`) into its timestamp and deploy id. */
+function parseLogBasename(basename: string): { timestamp: string; deployId?: string } {
+  const at = basename.indexOf(DEPLOY_ID_SEPARATOR);
+  if (at === -1) return { timestamp: basename };
+  return {
+    timestamp: basename.slice(0, at),
+    deployId: basename.slice(at + DEPLOY_ID_SEPARATOR.length) || undefined,
+  };
 }
 
 interface ActiveLog {
@@ -33,14 +65,20 @@ export class BuildLogService {
 
   /**
    * Start capturing a new build. Returns a log ID.
+   *
+   * `deployId`, when supplied, is encoded into the FILENAME rather than kept
+   * in memory, so a build log stays addressable by deploy after a restart —
+   * this service holds no durable index. It does not enter `logId`, which
+   * remains timestamp-keyed as before.
    */
-  async startBuild(appName: string, timestamp: Date): Promise<string> {
+  async startBuild(appName: string, timestamp: Date, deployId?: string): Promise<string> {
     const appLogDir = path.join(this.baseDir, appName);
     await fsp.mkdir(appLogDir, { recursive: true });
 
     const iso = timestamp.toISOString().replace(/[:.]/g, '-');
     const logId = `${appName}-${iso}`;
-    const logFile = path.join(appLogDir, `${iso}.log`);
+    const basename = deployId ? `${iso}${DEPLOY_ID_SEPARATOR}${deployId}` : iso;
+    const logFile = path.join(appLogDir, `${basename}.log`);
 
     const stream = fs.createWriteStream(logFile, { flags: 'a', encoding: 'utf-8' });
     this.activeLogs.set(logId, { stream, file: logFile });
@@ -83,12 +121,20 @@ export class BuildLogService {
         .filter((f) => f.endsWith('.log'))
         .sort()
         .reverse()
-        .map((f) => ({
-          id: `${appName}-${f.replace('.log', '')}`,
-          appName,
-          timestamp: f.replace('.log', ''),
-          logFile: path.join(appLogDir, f),
-        }));
+        .map((f) => {
+          // Parse the deploy id back out rather than letting it ride along in
+          // `id`/`timestamp` — see BuildLogEntry.timestamp. Sorting is still
+          // correct because the timestamp is the filename PREFIX, so the
+          // suffix never affects lexical order.
+          const { timestamp, deployId } = parseLogBasename(f.replace(/\.log$/, ''));
+          return {
+            id: `${appName}-${timestamp}`,
+            appName,
+            timestamp,
+            logFile: path.join(appLogDir, f),
+            ...(deployId ? { deployId } : {}),
+          };
+        });
       return logs;
     } catch {
       return [];
@@ -106,6 +152,21 @@ export class BuildLogService {
     } catch {
       return null;
     }
+  }
+
+  /**
+   * Return the content of the build log for a specific deploy, or null if no
+   * log for that deploy exists (never written, or aged out by retention).
+   *
+   * Resolves through `listBuilds` rather than reconstructing a filename: the
+   * timestamp half is not derivable from the deploy id, and this way an entry
+   * whose file has been deleted simply doesn't match.
+   */
+  async getBuildLogByDeployId(appName: string, deployId: string): Promise<string | null> {
+    if (!deployId) return null;
+    const entry = (await this.listBuilds(appName)).find((e) => e.deployId === deployId);
+    if (!entry) return null;
+    return this.getBuildLog(entry.logFile);
   }
 
   /**

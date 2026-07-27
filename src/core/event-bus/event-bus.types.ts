@@ -151,9 +151,20 @@ export interface BuildQueuedPayload extends BaseEvent {
   buildId: string;
 }
 
+/**
+ * The platform-minted deploy id, threaded from the call site that began this
+ * deploy through the build to DeployTracker, so one deploy is addressable end
+ * to end (build log file, episode, structured result).
+ *
+ * OPTIONAL on purpose. DeployTracker keeps its mint-a-fresh-one fallback for
+ * any publisher that doesn't supply it — tests constructing payloads by hand,
+ * and any future publisher — so the fallback stays live code rather than
+ * becoming unreachable. The tracker logs when it takes that path.
+ */
 export interface BuildStartedPayload extends BaseEvent {
   appId: string;
   buildId: string;
+  deployId?: string;
 }
 
 export interface BuildProgressPayload extends BaseEvent {
@@ -178,6 +189,8 @@ export interface BuildCompletedPayload extends BaseEvent {
    * start path to learn where a static build's output landed.
    */
   outputPath?: string;
+  /** See BuildStartedPayload.deployId. */
+  deployId?: string;
 }
 
 export interface BuildFailedPayload extends BaseEvent {
@@ -185,6 +198,8 @@ export interface BuildFailedPayload extends BaseEvent {
   buildId: string;
   error: Error;
   logs?: string;
+  /** See BuildStartedPayload.deployId. */
+  deployId?: string;
 }
 
 // Deployment event payloads
