@@ -96,7 +96,7 @@ function Layout() {
         )}
 
         <div className="px-3 pt-2 text-xs" style={{ color: 'var(--text-3)' }}>
-          DROP v2.0.0-rc.1
+          DROP v{__DROP_VERSION__}
         </div>
       </div>
     </>

@@ -1,6 +1,15 @@
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
+import fs from 'fs';
 import path from 'path';
+
+// See vite.config.ts — same root-package.json version inject, mirrored here.
+// `__dirname` is still src/dashboard even though `root` is overridden below.
+const platformVersion = (
+  JSON.parse(
+    fs.readFileSync(path.resolve(__dirname, '../../package.json'), 'utf-8')
+  ) as { version: string }
+).version;
 
 // Public marketing site (landing / docs / reference) — DROP-070. A separate
 // Vite root (./site, with its own entry HTML) keeps this a distinct Rollup
@@ -13,6 +22,9 @@ import path from 'path';
 export default defineConfig({
   plugins: [react()],
   base: '/',
+  define: {
+    __DROP_VERSION__: JSON.stringify(platformVersion),
+  },
   root: path.resolve(__dirname, 'site'),
   // publicDir defaults to `<root>/public`, which would resolve to
   // `./site/public` once `root` is overridden — point it back at the shared
