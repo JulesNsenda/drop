@@ -28,6 +28,7 @@ import {
   getOAuthClientId,
   getOrCreateOAuthClientId,
   mintOAuthAccessToken,
+  ACCESS_TOKEN_TTL_SECONDS,
   issueRefreshToken,
   rotateRefreshToken,
   revokeRefreshToken,
@@ -273,7 +274,7 @@ oauth.post('/token', async (c) => {
     return c.json({
       access_token: accessToken,
       token_type: 'Bearer',
-      expires_in: 900,
+      expires_in: ACCESS_TOKEN_TTL_SECONDS,
       refresh_token: refreshToken,
       scope: 'offline_access',
     });
@@ -310,7 +311,7 @@ oauth.post('/token', async (c) => {
     return c.json({
       access_token: accessToken,
       token_type: 'Bearer',
-      expires_in: 900,
+      expires_in: ACCESS_TOKEN_TTL_SECONDS,
       refresh_token: rotated.refreshToken,
       scope: 'offline_access',
     });
