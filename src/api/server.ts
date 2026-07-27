@@ -228,6 +228,12 @@ export class ApiServer {
     v1.use('/auth/login', authRateLimitMiddleware());
     v1.use('/auth/signup', authRateLimitMiddleware());
     v1.use('/auth/mfa/*', authRateLimitMiddleware());
+    // PUT /auth/password compares `currentPassword` and reports the mismatch,
+    // so it is a password-guessing surface exactly like /auth/login and needs
+    // the same bucket — the general /api/* limiter is far too generous for it.
+    // The route is additionally interactive-session-only (see auth.ts), which
+    // closes it to API keys; this bucket is what bounds the JWT path.
+    v1.use('/auth/password', authRateLimitMiddleware());
     // Account creation (POST /auth/users) — reachable by a scoped provisioning
     // token now, so bound it with the strict auth limiter. POST only, so admin
     // GET listing of users is not throttled. Registered unconditionally like the
@@ -282,6 +288,20 @@ export class ApiServer {
       v1.use('/oauth/approve', authMiddleware('user'));
       v1.use('/oauth/revoke', authMiddleware('user'));
       v1.use('/oauth/client', authMiddleware('admin'));
+      // DELETE/PUT on an app (delete, rename, re-domain) are destructive and
+      // must not be reachable with a read-only token. They used to fall through
+      // to the readonly guard below and rely on `canAccess` alone — which was
+      // inert for API keys only because a key's userId was its own id and
+      // therefore owned nothing. Now that a key resolves to its owner, that
+      // accident no longer contains it, so the tier is stated explicitly.
+      // Method-scoped: GET /apps/:name must stay readable at `readonly`.
+      v1.use('/apps/*', async (c, next) => {
+        const method = c.req.method;
+        if (method === 'DELETE' || method === 'PUT' || method === 'PATCH') {
+          return authMiddleware('user')(c, next);
+        }
+        return next();
+      });
       v1.use('/apps/*', authMiddleware('readonly'));
       v1.use('/apps', authMiddleware('readonly'));
       v1.use('/usage', authMiddleware('readonly'));
@@ -340,7 +360,7 @@ export class ApiServer {
     // Newer non-`oauth-`prefixed spelling some MCP clients probe — serve the
     // same doc so discovery can't 404 on either variant.
     this.app.get('/.well-known/protected-resource/api/v1/mcp', protectedResourceHandler);
-    this.app.get('/.well-known/oauth-authorization-server', (c) => {
+    this.app.get('/.well-known/oauth-authorization-server', c => {
       const publicUrl = getPublicUrl();
       console.log('[oauth] discovery probe', { path: c.req.path, resolved: Boolean(publicUrl) });
       if (!publicUrl) return c.notFound();
@@ -375,7 +395,9 @@ export class ApiServer {
     const srcDashboardPath = path.join(__dirname, '..', 'dashboard');
     const dashboardPath =
       this.config.dashboardPath ??
-      (fs.existsSync(path.join(distDashboardPath, 'index.html')) ? distDashboardPath : srcDashboardPath);
+      (fs.existsSync(path.join(distDashboardPath, 'index.html'))
+        ? distDashboardPath
+        : srcDashboardPath);
     const dashboardIndexPath = path.join(dashboardPath, 'index.html');
     const dashboardExists = fs.existsSync(dashboardIndexPath);
 

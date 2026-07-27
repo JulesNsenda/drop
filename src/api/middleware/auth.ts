@@ -69,6 +69,17 @@ export interface ApiKey {
   expiresAt?: string;
   /** Capability scopes for this key (e.g. 'users:create'). Orthogonal to role. */
   scopes?: string[];
+  /**
+   * The human this key acts on behalf of. `AuthContext.userId` resolves to
+   * this when set, so apps created through the key are owned by a real user
+   * and count against THAT user's quota.
+   *
+   * Absent on keys minted before this field existed: those keep the legacy
+   * behaviour (`userId` = the key's own id) so the apps they already own stay
+   * reachable. Re-parenting legacy keys is a data migration, deliberately not
+   * done here — see the DROP-075 commit message.
+   */
+  ownerUserId?: string;
 }
 
 // JWT payload
@@ -364,6 +375,18 @@ export async function createUser(
 }
 
 /**
+ * Verify a user's current password by id, without issuing a session or
+ * running the MFA flow. For re-authenticating a destructive action the caller
+ * is already authenticated for (e.g. account deletion).
+ */
+export function verifyUserPassword(userId: string, password: string): boolean {
+  if (!credentials) return false;
+  const user = credentials.users.find((u) => u.id === userId);
+  if (!user) return false;
+  return verifyPassword(password, user.passwordHash);
+}
+
+/**
  * Change a user's password
  */
 export async function changePassword(userId: string, currentPassword: string, newPassword: string): Promise<boolean> {
@@ -410,6 +433,10 @@ export async function deleteUser(userId: string): Promise<boolean> {
     if (adminCount <= 1) throw new Error('Cannot delete the last admin account');
   }
   credentials.users.splice(index, 1);
+  // Revoke every key that acts as this user. verifyApiKey also rejects an
+  // orphaned key, so this is defence in depth — but it keeps the stored state
+  // honest rather than leaving dangling credentials in the file.
+  credentials.apiKeys = credentials.apiKeys.filter((k) => k.ownerUserId !== userId);
   await saveCredentials(config.credentialsPath, credentials);
   return true;
 }
@@ -425,6 +452,11 @@ export async function suspendUser(userId: string): Promise<boolean> {
   if (!user) return false;
   if (user.role === 'admin') throw new Error('Cannot suspend an admin account');
   user.enabled = false;
+  // The docstring above has always promised this; it was never implemented,
+  // and it did nothing while a key's userId was its own id. Now that keys act
+  // as their owner, a suspended user's keys would otherwise keep full access
+  // to every app they own.
+  credentials.apiKeys = credentials.apiKeys.filter((k) => k.ownerUserId !== userId);
   await saveCredentials(config.credentialsPath, credentials);
   return true;
 }
@@ -892,7 +924,8 @@ export async function createApiKey(
   name: string,
   role: 'admin' | 'user' | 'readonly' | 'none' = 'user',
   expiresInDays?: number,
-  scopes?: string[]
+  scopes?: string[],
+  ownerUserId?: string
 ): Promise<{ key: string; apiKey: ApiKey }> {
   if (!credentials || !config) {
     throw new Error('Auth not initialized');
@@ -913,6 +946,7 @@ export async function createApiKey(
       ? new Date(Date.now() + expiresInDays * 24 * 60 * 60 * 1000).toISOString()
       : undefined,
     ...(scopes !== undefined ? { scopes } : {}),
+    ...(ownerUserId !== undefined ? { ownerUserId } : {}),
   };
 
   credentials.apiKeys.push(apiKey);
@@ -941,6 +975,18 @@ export async function verifyApiKey(key: string): Promise<ApiKey | null> {
     return null;
   }
 
+  // The key acts AS a human, so it must stop working when that human is
+  // deleted or suspended. Without this, deleting or suspending a user blocks
+  // their login while every key issued for them keeps authenticating as their
+  // userId — retaining canAccess to all their apps, with no account left to
+  // revoke it from. (Legacy keys have no owner and are unaffected.)
+  if (apiKey.ownerUserId) {
+    const owner = credentials.users.find((u) => u.id === apiKey.ownerUserId);
+    if (!owner || owner.enabled === false) {
+      return null;
+    }
+  }
+
   // Update last used in memory immediately, but persist at most once per
   // minute — otherwise every authenticated request rewrites the entire
   // credentials file (lock contention + needless I/O for a cosmetic field).
@@ -952,6 +998,30 @@ export async function verifyApiKey(key: string): Promise<ApiKey | null> {
   }
 
   return apiKey;
+}
+
+/**
+ * Build the AuthContext for an authenticated API key.
+ *
+ * `userId` resolves to the key's `ownerUserId` when set, so ownership checks
+ * (`canAccess`) and per-user quotas attribute the key's actions to the human
+ * it acts for. Without this, `userId` was the KEY's own id, which meant every
+ * key was a fresh principal owning zero apps — so each one carried a full
+ * `DROP_MAX_APPS_PER_USER` allowance, `getUserById` returned null (silently
+ * discarding any per-user `maxApps` override), and apps the key created were
+ * owned by an identity no human could log in as.
+ *
+ * Legacy keys (no `ownerUserId`) keep the old behaviour so the apps they
+ * already own remain reachable.
+ */
+function apiKeyAuthContext(key: ApiKey): AuthContext {
+  return {
+    userId: key.ownerUserId ?? key.id,
+    username: key.name,
+    role: key.role,
+    authMethod: 'apikey',
+    scopes: key.scopes,
+  };
 }
 
 /**
@@ -1110,13 +1180,7 @@ export function authMiddleware(requiredRole?: 'admin' | 'user' | 'readonly') {
         // semantics; only a non-JWT Bearer value is looked up as an API key.
         const key = await verifyApiKey(token);
         if (key) {
-          authContext = {
-            userId: key.id,
-            username: key.name,
-            role: key.role,
-            authMethod: 'apikey',
-            scopes: key.scopes,
-          };
+          authContext = apiKeyAuthContext(key);
         }
       }
     }
@@ -1127,13 +1191,7 @@ export function authMiddleware(requiredRole?: 'admin' | 'user' | 'readonly') {
       if (apiKey) {
         const key = await verifyApiKey(apiKey);
         if (key) {
-          authContext = {
-            userId: key.id,
-            username: key.name,
-            role: key.role,
-            authMethod: 'apikey',
-            scopes: key.scopes,
-          };
+          authContext = apiKeyAuthContext(key);
         }
       }
     }
@@ -1325,13 +1383,7 @@ export function optionalAuthMiddleware() {
         // authMiddleware). A valid-but-challenge token is intentionally skipped.
         const key = await verifyApiKey(token);
         if (key) {
-          c.set('auth', {
-            userId: key.id,
-            username: key.name,
-            role: key.role,
-            authMethod: 'apikey',
-            scopes: key.scopes,
-          });
+          c.set('auth', apiKeyAuthContext(key));
         }
       }
     }
@@ -1340,13 +1392,7 @@ export function optionalAuthMiddleware() {
     if (apiKey && !c.get('auth')) {
       const key = await verifyApiKey(apiKey);
       if (key) {
-        c.set('auth', {
-          userId: key.id,
-          username: key.name,
-          role: key.role,
-          authMethod: 'apikey',
-          scopes: key.scopes,
-        });
+        c.set('auth', apiKeyAuthContext(key));
       }
     }
 
