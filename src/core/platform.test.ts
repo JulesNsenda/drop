@@ -10,6 +10,7 @@ import * as fsPromises from 'fs/promises';
 import * as yaml from 'yaml';
 import { DropPlatform, createPlatform } from './platform';
 import { eventBus } from './event-bus';
+import { resetDeployBreaker } from '../managers/guardrail/deploy-breaker';
 import { getDetector, parseDropYaml, DetectionResult } from './detector';
 import * as diskUtils from '../utils/disk';
 import { createApiKey, deleteApiKeysByName } from '../api/middleware/auth';
@@ -1105,7 +1106,10 @@ describe('handleAppDetected — unknown type ends errored (M2 2g)', () => {
     expect(buildSpy).toHaveBeenCalledWith(
       path.join(tempDir, 'apps', 'known-app'),
       'known-app',
-      'nodejs'
+      'nodejs',
+      // The guardrail principal — absent here because the watcher, not a
+      // caller, triggered this detection.
+      undefined
     );
     expect(stateManager.setAppStatus).not.toHaveBeenCalled();
   });
@@ -2597,6 +2601,9 @@ describe('drop.yaml build/start overrides', () => {
       (platform as any).stateManager = {
         setAppStatus: jest.fn().mockResolvedValue(undefined),
         updateApp: jest.fn().mockResolvedValue(undefined),
+        // handleBuildApp's guardrail gate reads this to tell a redeploy from a
+        // new app, which decides the breaker key shape.
+        getApp: jest.fn().mockReturnValue(undefined),
       };
       (platform as any).appConfigService = {
         updateConfig: jest.fn().mockResolvedValue(undefined),
@@ -3429,5 +3436,107 @@ describe('Step 0 — one deploy id threaded through both build paths', () => {
 
     expect(published.length).toBeGreaterThan(0);
     expect(published[published.length - 1].deployId).toEqual(expect.any(String));
+  });
+});
+
+describe('Step 7 — deploy guardrail at the choke point', () => {
+  // Gated in handleBuildApp, NOT at the tool boundaries (SEC-15). It is the one
+  // path every deploy traverses — watcher, webhook, git, upload, MCP — so a
+  // tool-boundary gate would leave webhook- and watcher-driven redeploy loops
+  // completely unthrottled.
+  let platform: DropPlatform;
+  let tempDir: string;
+  let buildSpy: jest.Mock;
+
+  const PRINCIPAL = 'key:runaway-token';
+
+  beforeEach(async () => {
+    jest.clearAllMocks();
+    resetDeployBreaker();
+    tempDir = path.join(os.tmpdir(), `drop-guardrail-${Date.now()}`);
+    platform = createPlatform({
+      dropRoot: tempDir,
+      appsDirectory: path.join(tempDir, 'apps'),
+      logLevel: 'error',
+      autoBuild: true,
+      autoStart: false,
+      caddyfilePath: path.join(tempDir, 'Caddyfile'),
+    });
+    await platform.start();
+    (platform as any).buildLogService = null;
+
+    jest.spyOn(platform.getDetector()!, 'detect').mockResolvedValue({
+      type: 'nodejs',
+      framework: null,
+      suggestedConfig: {},
+    } as any);
+    buildSpy = jest.fn().mockResolvedValue({ success: false, errors: [{ message: 'boom' }] });
+    (platform as any).builder = { build: buildSpy };
+  });
+
+  afterEach(async () => {
+    if (platform && platform.isActive()) await platform.stop();
+    resetDeployBreaker();
+  });
+
+  const attempt = async () => {
+    await (platform as any).handleBuildApp(
+      path.join(tempDir, 'apps', 'loopy'),
+      'loopy',
+      'nodejs',
+      PRINCIPAL
+    );
+    (platform as any).appsInProgress.clear();
+  };
+
+  it('refuses further deploys once the same principal keeps failing', async () => {
+    for (let i = 0; i < 5; i++) await attempt();
+    const before = buildSpy.mock.calls.length;
+
+    await attempt();
+
+    // The build was never entered — the gate stopped it.
+    expect(buildSpy.mock.calls.length).toBe(before);
+  });
+
+  it('reports the refusal instead of leaving the caller to time out', async () => {
+    // A caller polling for a deploy outcome must get an answer. Silently
+    // dropping the request is the ~120s hang Step -1c existed to remove.
+    const failSpy = jest.spyOn(platform as any, 'failDeployEpisode');
+    for (let i = 0; i < 5; i++) await attempt();
+    failSpy.mockClear();
+
+    await attempt();
+
+    expect(failSpy).toHaveBeenCalled();
+    expect(String(failSpy.mock.calls[0][1])).toContain('Retry in');
+  });
+
+  it('does not throttle a DIFFERENT principal on the same app', async () => {
+    // One runaway agent must not block another agent working on the same app.
+    for (let i = 0; i < 5; i++) await attempt();
+    buildSpy.mockClear();
+
+    await (platform as any).handleBuildApp(
+      path.join(tempDir, 'apps', 'loopy'),
+      'loopy',
+      'nodejs',
+      'key:a-different-token'
+    );
+    (platform as any).appsInProgress.clear();
+
+    expect(buildSpy).toHaveBeenCalled();
+  });
+
+  it('does not throttle WATCHER-triggered deploys on a principal window', async () => {
+    // Automation gets its own key, so a looping agent cannot consume the
+    // budget of the human whose app the watcher is rebuilding.
+    for (let i = 0; i < 5; i++) await attempt();
+    buildSpy.mockClear();
+
+    await (platform as any).handleBuildApp(path.join(tempDir, 'apps', 'loopy'), 'loopy', 'nodejs');
+    (platform as any).appsInProgress.clear();
+
+    expect(buildSpy).toHaveBeenCalled();
   });
 });

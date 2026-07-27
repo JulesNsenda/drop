@@ -95,6 +95,15 @@ export interface AppDetectedPayload extends BaseEvent {
   type?: string;
   /** Set when detection was triggered by an upload-deploy (PRD-039), not the file watcher. */
   origin?: 'upload';
+  /**
+   * Who asked for this deploy, for guardrail keying — NOT for authorization,
+   * which happened at the route or tool boundary before this was published.
+   *
+   * Absent when DROP triggered the deploy itself (the file watcher, boot
+   * reconciliation), which is why the breaker has a separate automation key
+   * rather than lumping those in with an anonymous caller.
+   */
+  principalId?: string;
 }
 
 export interface AppCreatedPayload extends BaseEvent {
@@ -112,6 +121,8 @@ export interface AppUpdatePayload extends BaseEvent {
   name: string;
   path: string;
   reason: string;
+  /** See AppDetectedPayload.principalId. */
+  principalId?: string;
   /** Set by an explicit redeploy (git pull / webhook) so the anti-loop cooldown doesn't swallow it. */
   bypassCooldown?: boolean;
 }
