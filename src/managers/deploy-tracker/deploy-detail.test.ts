@@ -108,6 +108,69 @@ describe('DeployDetailStore', () => {
     });
   });
 
+  describe('runtime log offsets', () => {
+    const offsets = {
+      outFile: '/logs/app-2026-07-27-out.log',
+      errFile: '/logs/app-2026-07-27-err.log',
+      outStartOffset: 4096,
+      errStartOffset: 128,
+    };
+
+    it('attaches the offsets captured before start to a boot failure', async () => {
+      openEpisode('off', 'off-1');
+      store.noteRuntimeLog('off', offsets);
+      bus.publish('deploy:failed', { appId: 'off', phase: 'boot', reason: 'readiness-failed' });
+      await store.flush();
+
+      expect(store.getDetail('off-1')?.runtimeLog).toEqual(offsets);
+    });
+
+    it('does NOT attach them to a build failure', async () => {
+      // A build failure never reached runtime.start(), so any offsets on hand
+      // belong to a PREVIOUS deploy. Attaching them would point a caller at
+      // another deploy's output.
+      openEpisode('stale', 'stale-1');
+      store.noteRuntimeLog('stale', offsets);
+      bus.publish('build:failed', {
+        appId: 'stale',
+        buildId: 'b1',
+        error: new Error('x'),
+        stage: 'install',
+      });
+      await store.flush();
+
+      expect(store.getDetail('stale-1')?.runtimeLog).toBeUndefined();
+    });
+
+    it('ignores offsets for an app with no open deploy', async () => {
+      // restartApp reaches the same capture, but a restart is not a deploy and
+      // opens no episode — there is nothing to key the offsets to.
+      store.noteRuntimeLog('restarted', offsets);
+      bus.publish('deploy:failed', {
+        appId: 'restarted',
+        phase: 'boot',
+        reason: 'readiness-failed',
+      });
+      await store.flush();
+
+      expect(store.getDetails('restarted')).toEqual([]);
+    });
+
+    it('does not carry one deploy offsets into the next', async () => {
+      // The pending slot must clear when the episode closes, or a later boot
+      // failure inherits a stale byte offset into a file that has since grown.
+      openEpisode('carry', 'carry-1');
+      store.noteRuntimeLog('carry', offsets);
+      bus.publish('app:updated', { appId: 'carry', changes: { status: 'running' } });
+
+      openEpisode('carry', 'carry-2');
+      bus.publish('deploy:failed', { appId: 'carry', phase: 'boot', reason: 'readiness-failed' });
+      await store.flush();
+
+      expect(store.getDetail('carry-2')?.runtimeLog).toBeUndefined();
+    });
+  });
+
   describe('correlation', () => {
     it('ignores a failure with no open episode (orphan guard)', async () => {
       // app:updated{errored} also fires from startup reconcile and API

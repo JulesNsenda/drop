@@ -3248,6 +3248,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         redisEnvVars,
         buildOutputDir
       );
+      await this.noteRuntimeLogStart(appName);
       const status = await this.runtime.start(spec);
 
       this.logger.appEvent('started', appName, `PID ${status.pid}, port ${port}`);
@@ -3817,6 +3818,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         detection,
         buildResult.outputPath ?? undefined
       );
+      await this.noteRuntimeLogStart(appName);
       const status = await this.runtime.start(spec);
 
       this.logger.appEvent('started', appName, `PID ${status.pid}, port ${port} (hot-reloaded)`);
@@ -3984,6 +3986,10 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
 
         const detection = await this.detector.detect(appPath, { silent: true });
         const { spec, port } = await this.buildFreshStartSpec(appName, appPath, detection);
+        // Also here, even though a plain restart opens no deploy episode and
+        // the store will discard it — so that a start site is never the one
+        // that was forgotten if restarts later become addressable.
+        await this.noteRuntimeLogStart(appName);
         const status = await this.runtime.start(spec);
 
         this.logger.appEvent('started', appName, `PID ${status.pid}, port ${port} (restarted)`);
@@ -4837,6 +4843,46 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       limits,
       env,
     };
+  }
+
+  /**
+   * Record where this deploy's runtime output begins, immediately before the
+   * process starts.
+   *
+   * The one part of deploy-detail capture that cannot be a bus subscriber: it
+   * reads file sizes that `runtime.start()` is about to change, so it has to
+   * run inline, at every start site. Runtime logs are per-app and per-DAY, so
+   * the path alone cannot identify one deploy's output — the offset is what
+   * separates this deploy's lines from the previous one's.
+   *
+   * Best-effort and never throws: this is observability, and it sits directly
+   * in front of the start it must not be able to break.
+   */
+  private async noteRuntimeLogStart(appName: string): Promise<void> {
+    try {
+      const { outFile, errorFile } = await this.getAppLogPaths(appName);
+      const sizeOf = async (file: string): Promise<number> => {
+        try {
+          return (await fs.stat(file)).size;
+        } catch {
+          // Not created yet — this deploy's output starts at byte 0.
+          return 0;
+        }
+      };
+      const [outStartOffset, errStartOffset] = await Promise.all([
+        sizeOf(outFile),
+        sizeOf(errorFile),
+      ]);
+      getDeployDetailStore().noteRuntimeLog(appName, {
+        outFile,
+        errFile: errorFile,
+        outStartOffset,
+        errStartOffset,
+      });
+    } catch {
+      // Store not initialised (isolated tests), or the log dir is unreadable.
+      // A missing offset costs a log tail, never a deploy.
+    }
   }
 
   private async getAppLogPaths(appName: string): Promise<{ outFile: string; errorFile: string; logDir: string }> {
