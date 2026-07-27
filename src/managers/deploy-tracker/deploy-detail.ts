@@ -25,6 +25,7 @@
  */
 
 import * as fs from 'fs/promises';
+import { constants as fsConstants } from 'fs';
 import * as path from 'path';
 import { writeJsonAtomic } from '../../utils/atomic-write';
 import { getStateManager } from '../app/state-manager';
@@ -61,6 +62,14 @@ function isExpired(retainUntil: string | undefined, now = Date.now()): boolean {
 /** Ids that are safe to use as a store key or a path component. */
 const SAFE_DEPLOY_ID = /^[A-Za-z0-9_-]{1,128}$/;
 
+/**
+ * Hard cap on a retained copy. The window is already bounded by the recorded
+ * end offset; this is the backstop for a deploy that logged enormously before
+ * dying, and what keeps teardown from allocating a tenant-sized buffer in the
+ * single-process platform.
+ */
+const MAX_RETAINED_BYTES = 256 * 1024;
+
 /** Hours a torn-down app's deploy details survive. */
 function getRetentionHours(): number {
   const raw = process.env.DROP_DEPLOY_DETAIL_RETENTION_H;
@@ -70,6 +79,48 @@ function getRetentionHours(): number {
 
 interface DeployDetailStoreFile {
   details: DeployDetail[];
+}
+
+/**
+ * Read one deploy's slice of its runtime logs.
+ *
+ * REFUSES A SYMLINK. Under pm2 isolation the app process runs as the `drop`
+ * user and can unlink its own log file and symlink it at anything that user
+ * can read - api-credentials.json, the encryption key, another tenant's
+ * appdata. Following it here would make the platform copy that out on the
+ * app's behalf, into a file the app's own deploy record points at. lstat
+ * before open, and O_NOFOLLOW so the check cannot be raced.
+ */
+async function readDeploySlice(offsets: RuntimeLogOffsets): Promise<string> {
+  const one = async (file: string, start: number, end?: number): Promise<string> => {
+    try {
+      const stat = await fs.lstat(file);
+      if (stat.isSymbolicLink() || !stat.isFile()) return '';
+
+      // A file SHORTER than the recorded start means this deploy's bytes are
+      // gone; reading from 0 would return someone else's output.
+      const upper = Math.min(end ?? stat.size, stat.size);
+      if (upper <= start) return '';
+      const want = Math.min(upper - start, MAX_RETAINED_BYTES);
+
+      const handle = await fs.open(file, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+      try {
+        const buf = Buffer.alloc(want);
+        const { bytesRead } = await handle.read(buf, 0, want, start);
+        return buf.subarray(0, bytesRead).toString('utf-8');
+      } finally {
+        await handle.close();
+      }
+    } catch {
+      return '';
+    }
+  };
+
+  const [out, err] = await Promise.all([
+    one(offsets.outFile, offsets.outStartOffset, offsets.outEndOffset),
+    one(offsets.errFile, offsets.errStartOffset, offsets.errEndOffset),
+  ]);
+  return [out, err].filter((part) => part.length > 0).join('\n');
 }
 
 export class DeployDetailStore {
@@ -92,8 +143,12 @@ export class DeployDetailStore {
   private savePromise: Promise<void> | null = null;
   private dirty = false;
 
+  /** Directory holding retained per-deploy log copies, keyed by deployId. */
+  private readonly retainedDir: string;
+
   constructor(storePath: string) {
     this.storePath = storePath;
+    this.retainedDir = path.join(path.dirname(storePath), 'deploy-details');
   }
 
   async initialize(): Promise<void> {
@@ -112,8 +167,11 @@ export class DeployDetailStore {
       this.details = [];
     }
 
-    // Sweep anything whose window closed while the platform was down.
+    // Sweep anything whose window closed while the platform was down, then
+    // reclaim copies whose record is gone (the MAX_DETAILS trim drops records
+    // without unlinking, and nothing else walks this directory).
     await this.sweepExpired();
+    await this.sweepOrphanedLogs();
 
     this.initialized = true;
   }
@@ -225,53 +283,156 @@ export class DeployDetailStore {
   }
 
   /**
-   * Called at teardown. Severs each retained detail from the app's log files
-   * and stamps a retention window.
+   * Close the runtime-log window for an app's open deploy.
    *
-   * This is the SEC-3 fix. `runtimeLog` holds a path keyed on the app NAME
-   * plus a byte offset, and teardown FREES that name — so a record that kept
-   * them would, once another tenant registered the same name, resolve to
-   * THEIR stdout. Clearing the pointer is what closes that, and it closes it
-   * completely: there is no longer any path from a retained record to a log
-   * file.
-   *
-   * It does NOT copy the bytes out. The plan specifies a copy so a torn-down
-   * deploy's output stays readable, but nothing reads it yet — `get_deploy_logs`
-   * is a later step. Writing durable, uncapped copies of tenant stdout with no
-   * consumer is all of the cost and none of the benefit, and it would also
-   * mean `?keepData=false` — an explicit "destroy my data" — CREATING a new
-   * copy of output that routinely contains DATABASE_URL and injected secrets.
-   * The copy belongs with its reader, where bounding, symlink safety and the
-   * keepData interaction can be settled against a real consumer.
-   *
-   * What survives is the metadata: stage, exit code, command, reason. All
-   * DROP-generated, matching this store's documented invariant.
-   *
-   * `await`s the persist rather than firing it: the caller deletes the log
-   * directories immediately after, and a crash in between would otherwise
-   * leave the on-disk record holding live name-keyed offsets and no
-   * retainUntil — reloaded on restart in exactly the pre-fix state, and
-   * invisible to the serve-time guard, which keys on retainUntil.
+   * Called when the deploy FAILS — the only case that produces a record.
+   * Without an end offset a retained copy runs start-to-EOF, which is wrong
+   * three ways at once: overlapping copies across N deploys of one app, an
+   * unbounded tenant-controlled size, and anything appended after this deploy
+   * died (including by a re-registered app of the same name) swept in. See
+   * RuntimeLogOffsets.outEndOffset.
    */
-  async retainForApp(appName: string): Promise<void> {
+  noteRuntimeLogEnd(appName: string, ends: { outEndOffset: number; errEndOffset: number }): void {
+    const pending = this.pendingRuntimeLog.get(appName);
+    if (pending) {
+      this.pendingRuntimeLog.set(appName, { ...pending, ...ends });
+      return;
+    }
+    // The record already exists (deploy:failed landed first) — close the
+    // window on the detail itself.
+    const deployId = this.active.get(appName);
+    if (!deployId) return;
+    const detail = this.details.find((d) => d.deployId === deployId);
+    if (detail?.runtimeLog) {
+      detail.runtimeLog = { ...detail.runtimeLog, ...ends };
+    }
+  }
+
+  /**
+   * Called at teardown. Copies each retained deploy's own slice of the runtime
+   * log into a private file, severs the name-keyed pointer, and stamps a
+   * retention window.
+   *
+   * THE ORDERING IS THE SEC-3 FIX. runtimeLog.outFile is keyed on the app NAME
+   * and teardown FREES that name - a record that kept the pointer would, once
+   * another tenant registered the same name, resolve to THEIR stdout. Copying
+   * the bytes out makes the record self-contained; clearing the pointer makes
+   * the leak unreachable even when the copy fails.
+   *
+   * Bounded on three axes, each a finding from the security review of the
+   * first attempt at this:
+   *   - the recorded END offset, so a copy holds THIS deploy's output and not
+   *     everything appended since, including by a re-registered app;
+   *   - MAX_RETAINED_BYTES, against a deploy that logged enormously;
+   *   - a symlink refusal in readDeploySlice.
+   *
+   * THE COPY IS MADE ONLY WHEN keepData IS TRUE, i.e. never on a plain delete.
+   *
+   * This is deliberately conservative and worth stating, because it cuts
+   * against DROP-076's rule that logs are DROP-generated diagnostics and go
+   * unconditionally. A RETAINED COPY is different from the original: it is
+   * process output, the one exception to this store's DROP-generated-only
+   * rule, and stdout routinely carries DATABASE_URL and injected secrets. It
+   * also survives INTO A NEW LOCATION that outlives the delete. A caller who
+   * asked for an app to be destroyed will not expect a fresh copy of its
+   * stdout to appear elsewhere and live another 24 hours. Someone who wants
+   * post-teardown diagnostics can delete with keepData.
+   *
+   * The metadata (stage, exit code, reason) is retained either way — that is
+   * DROP-generated and carries no tenant output.
+   *
+   * awaits the persist: the caller deletes the log directories immediately
+   * after, and a crash in between would leave the on-disk record holding live
+   * name-keyed offsets and no retainUntil - reloaded on restart in the pre-fix
+   * state, and invisible to the serve-time guard, which keys on retainUntil.
+   */
+  async retainForApp(appName: string, opts: { keepData?: boolean } = {}): Promise<void> {
     const mine = this.details.filter((d) => d.appName === appName);
     if (mine.length === 0) return;
 
     const retainUntil = new Date(Date.now() + getRetentionHours() * 3600_000).toISOString();
+
+    // Unconditional, and deliberately NOT gated on keepData. Gating it would
+    // make the missing directory a second, accidental reason the copy does not
+    // happen — and a test for the keepData rule would then pass even with that
+    // rule deleted. One guard, one reason.
+    try {
+      await fs.mkdir(this.retainedDir, { recursive: true });
+    } catch {
+      // Cannot retain logs; records are still stamped so they expire.
+    }
+
     for (const detail of mine) {
       detail.retainUntil = retainUntil;
+      const offsets = detail.runtimeLog;
+      // Cleared unconditionally, before any copy is attempted. A dangling
+      // name-keyed pointer is the leak; a missing log is merely a missing log.
       detail.runtimeLog = undefined;
+
+      if (!offsets || !opts.keepData) continue;
+
+      try {
+        const body = await readDeploySlice(offsets);
+        if (body.length > 0) {
+          const target = path.join(this.retainedDir, detail.deployId + '.log');
+          await fs.writeFile(target, body, { encoding: 'utf-8', mode: 0o600 });
+          detail.retainedLogFile = target;
+        }
+      } catch (error) {
+        console.error('[deploy-detail] failed to retain log for ' + detail.deployId, error);
+      }
     }
 
     await this.sweepExpired();
     await this.persist();
   }
 
-  /** Drop details whose retention window has closed. */
+  /** Drop details whose retention window has closed, and their copied logs. */
   async sweepExpired(now = Date.now()): Promise<void> {
-    const before = this.details.length;
-    this.details = this.details.filter((d) => !isExpired(d.retainUntil, now));
-    if (this.details.length !== before) await this.persist();
+    const expired = this.details.filter((d) => isExpired(d.retainUntil, now));
+    if (expired.length === 0) return;
+
+    this.details = this.details.filter((d) => !expired.includes(d));
+    await Promise.all(expired.map((d) => this.unlinkRetained(d)));
+    await this.persist();
+  }
+
+  private async unlinkRetained(detail: DeployDetail): Promise<void> {
+    if (!detail.retainedLogFile) return;
+    try {
+      await fs.unlink(detail.retainedLogFile);
+    } catch {
+      // Already gone, or never written.
+    }
+  }
+
+  /**
+   * Delete any retained log file no live record references.
+   *
+   * The MAX_DETAILS trim drops records without unlinking their files, and
+   * nothing else sweeps this directory - LogRetentionService only walks the
+   * logs root. Without this, churn leaves app stdout on the platform's own
+   * volume indefinitely.
+   */
+  private async sweepOrphanedLogs(): Promise<void> {
+    let files: string[];
+    try {
+      files = await fs.readdir(this.retainedDir);
+    } catch {
+      return; // Directory does not exist yet.
+    }
+
+    const referenced = new Set(
+      this.details
+        .map((d) => (d.retainedLogFile ? path.basename(d.retainedLogFile) : undefined))
+        .filter((name): name is string => name !== undefined)
+    );
+
+    await Promise.all(
+      files
+        .filter((f) => f.endsWith('.log') && !referenced.has(f))
+        .map((f) => fs.unlink(path.join(this.retainedDir, f)).catch(() => undefined))
+    );
   }
 
   // ============ Reads ============
@@ -303,9 +464,11 @@ export class DeployDetailStore {
    */
   purgeApp(appName: string): void {
     const before = this.details.length;
+    const dropped = this.details.filter((d) => d.appName === appName);
     this.details = this.details.filter((d) => d.appName !== appName);
     this.active.delete(appName);
     this.pendingRuntimeLog.delete(appName);
+    void Promise.all(dropped.map((d) => this.unlinkRetained(d)));
     if (this.details.length !== before) void this.persist();
   }
 
