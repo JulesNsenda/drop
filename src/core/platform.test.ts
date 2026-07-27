@@ -10,7 +10,8 @@ import * as fsPromises from 'fs/promises';
 import * as yaml from 'yaml';
 import { DropPlatform, createPlatform } from './platform';
 import { eventBus } from './event-bus';
-import { resetDeployBreaker } from '../managers/guardrail/deploy-breaker';
+import { resetDeployBreaker, getDeployBreaker } from '../managers/guardrail/deploy-breaker';
+import * as detectorModule from './detector';
 import { getDetector, parseDropYaml, DetectionResult } from './detector';
 import * as diskUtils from '../utils/disk';
 import { createApiKey, deleteApiKeysByName } from '../api/middleware/auth';
@@ -2014,9 +2015,21 @@ describe('expandMonorepo (M2: monorepo -> per-service app expansion)', () => {
       group: repoName,
     });
 
-    // Builds were driven for both children (build itself is stubbed).
-    expect(buildSpy).toHaveBeenCalledWith(backendChildPath, `${repoName}-backend`, expect.any(String));
-    expect(buildSpy).toHaveBeenCalledWith(frontendChildPath, `${repoName}-frontend`, 'static');
+    // Builds were driven for both children (build itself is stubbed). The
+    // trailing arg is the guardrail actor the children inherit from the
+    // container — undefined here because no caller drove this expansion.
+    expect(buildSpy).toHaveBeenCalledWith(
+      backendChildPath,
+      `${repoName}-backend`,
+      expect.any(String),
+      undefined
+    );
+    expect(buildSpy).toHaveBeenCalledWith(
+      frontendChildPath,
+      `${repoName}-frontend`,
+      'static',
+      undefined
+    );
   });
 
   it('(f) skips a service whose derived name collides with a pre-existing app outside the group', async () => {
@@ -2749,7 +2762,9 @@ describe('handleAppUpdate — monorepo container guard (Bug 2 fix)', () => {
     expect(expandSpy).toHaveBeenCalledWith(
       appPath,
       appName,
-      expect.objectContaining({ services: expect.any(Object) })
+      expect.objectContaining({ services: expect.any(Object) }),
+      // The guardrail actor, threaded so the children key on the caller.
+      undefined
     );
     expect(infoSpy).toHaveBeenCalledWith(
       expect.stringContaining(`Re-expanding monorepo container '${appName}'`),
@@ -3187,14 +3202,19 @@ describe('build-drain queue', () => {
     expect(drainSpy).toHaveBeenCalled();
   });
 
-  it('drainPendingBuilds starts a queued build once a slot frees', async () => {
-    (platform as any).pendingBuilds.set('app1', { appPath: '/p', appType: 'static' });
+  it('drainPendingBuilds starts a queued build once a slot frees, KEEPING the actor', async () => {
+    // The actor must survive the queue. Without it the drain re-enters with no
+    // caller, so anyone who keeps every build slot busy has their subsequent
+    // deploys re-keyed as anonymous automation — no principal window, no owner
+    // window. Four parallel deploys is enough to arrange.
+    const actor = { principalId: 'key:queued-token', actorUserId: 'human-1' };
+    (platform as any).pendingBuilds.set('app1', { appPath: '/p', appType: 'static', actor });
     (platform as any).handleBuildApp = jest.fn().mockResolvedValue(undefined);
     // appsInProgress is empty here — below the cap of 1.
 
     await (platform as any).drainPendingBuilds();
 
-    expect((platform as any).handleBuildApp).toHaveBeenCalledWith('/p', 'app1', 'static');
+    expect((platform as any).handleBuildApp).toHaveBeenCalledWith('/p', 'app1', 'static', actor);
     expect((platform as any).pendingBuilds.has('app1')).toBe(false);
   });
 
@@ -3609,6 +3629,97 @@ describe('Step 7 — deploy guardrail at the choke points', () => {
     expect(buildSpy).not.toHaveBeenCalled();
   });
 
+  // These two drive recordDeployOutcome directly. A build that SUCCEEDS in this
+  // harness never reaches it — the success is recorded by handleStartApp, which
+  // autoStart:false skips — so letting a "successful" build stand in would test
+  // nothing at all: the window would be untouched either way.
+  const succeed = (appName: string, actor: Record<string, string>) => {
+    // isNewApp derived exactly as handleBuildApp derives it, so the success
+    // lands on the SAME key the failures did. Hard-coding it here silently
+    // cleared a different bucket whenever an earlier test left a getApp stub
+    // behind — mockReturnValue survives jest.clearAllMocks().
+    const existing = platform.getStateManager()!.getApp(appName);
+    (platform as any).breakerKeys.set(
+      appName,
+      (platform as any).guardrailKeys(appName, !existing, actor)
+    );
+    (platform as any).recordDeployOutcome(appName, true);
+  };
+
+  it('does NOT let one cheap success wipe the owner backstop', async () => {
+    // The cheapest possible bypass, and the one that would nullify the whole
+    // feature. `breakerKey(principal, undefined)` is a single shared
+    // `<principal>::__new__` bucket for every new-app deploy, and a success
+    // clears it — so four expensive failures followed by one trivial app that
+    // builds in a second would wipe both windows, repeatable forever, with
+    // neither ever reaching its threshold. The owner window therefore decays
+    // by time only.
+    const actor = { principalId: 'oauth:human-1::s1', actorUserId: 'human-1' };
+    // Pinned: these are all NEW apps, so every deploy shares the one
+    // `<principal>::__new__` bucket — which is what makes the bypass cheap.
+    (platform.getStateManager()!.getApp as jest.Mock).mockReturnValue(undefined);
+    const deploy = async (name: string) => {
+      await (platform as any).handleBuildApp(path.join(tempDir, 'apps', name), name, 'nodejs', actor);
+      (platform as any).appsInProgress.clear();
+    };
+
+    // Four failures then a success, four times over: 16 failures in total but
+    // never five between successes, so the per-principal window never trips.
+    for (let round = 0; round < 4; round++) {
+      for (let i = 0; i < 4; i++) await deploy(`fail-${round}-${i}`);
+      succeed(`cheap-${round}`, actor);
+    }
+    buildSpy.mockClear();
+
+    await deploy('one-more');
+
+    expect(buildSpy).not.toHaveBeenCalled();
+  });
+
+  it('still lets a success clear the PER-PRINCIPAL window, so progress is not punished', async () => {
+    // The other half of the same rule: the per-principal window must stay
+    // clearable, or an agent that is genuinely making progress gets throttled.
+    // Kept well under the owner threshold so this measures only that window.
+    const actor = { principalId: 'oauth:human-2::s1', actorUserId: 'human-2' };
+    (platform.getStateManager()!.getApp as jest.Mock).mockReturnValue(undefined);
+    const deploy = async () => {
+      await (platform as any).handleBuildApp(path.join(tempDir, 'apps', 'w'), 'w', 'nodejs', actor);
+      (platform as any).appsInProgress.clear();
+    };
+
+    for (let i = 0; i < 4; i++) await deploy();
+    succeed('w', actor);
+    for (let i = 0; i < 4; i++) await deploy();
+    buildSpy.mockClear();
+
+    await deploy();
+
+    expect(buildSpy).toHaveBeenCalled();
+  });
+
+  it('does not hand an app named "owner" the looser backstop budget', async () => {
+    // `owner` passes APP_NAME_RE, so breakerKey(p, 'owner') reads as
+    // `owner::<principal>`. Inferring the threshold from the key text would let
+    // an attacker-chosen app name buy a 15-failure budget instead of 5.
+    const actor = { principalId: 'key:t1' };
+    const deploy = async () => {
+      await (platform as any).handleBuildApp(path.join(tempDir, 'apps', 'owner'), 'owner', 'nodejs', actor);
+      (platform as any).appsInProgress.clear();
+    };
+    (platform.getStateManager()!.getApp as jest.Mock).mockReturnValue({
+      name: 'owner',
+      path: path.join(tempDir, 'apps', 'owner'),
+      status: 'running',
+    });
+
+    for (let i = 0; i < 5; i++) await deploy();
+    buildSpy.mockClear();
+
+    await deploy();
+
+    expect(buildSpy).not.toHaveBeenCalled();
+  });
+
   it("does not let one human's backstop touch ANOTHER human", async () => {
     // The failure mode of keying the backstop wrong: a shared bucket turns a
     // loop-stopper into a cross-tenant denial of service.
@@ -3656,6 +3767,83 @@ describe('Step 7 — deploy guardrail at the choke points', () => {
     );
 
     expect(buildSpy).toHaveBeenCalled();
+  });
+
+  it('gates the MONOREPO container re-expansion, which returns above the normal gate', async () => {
+    // expandMonorepo is one of the most expensive things on the box — a git
+    // pull plus an fs.rm/fs.cp of every child tree plus a build per service —
+    // and whether an app takes that branch is decided by the CALLER'S OWN
+    // drop.yaml (`services:`). Ungated, any caller could opt into an unmetered
+    // build loop by adding a services block.
+    const appPath = path.join(tempDir, 'apps', 'mono');
+    (platform.getStateManager()!.getApp as jest.Mock).mockReturnValue({
+      name: 'mono',
+      path: appPath,
+      status: 'running',
+      isGroupContainer: true,
+    });
+    jest.spyOn(detectorModule, 'parseDropYaml').mockResolvedValue({
+      success: true,
+      config: { services: { api: { path: 'api' } } },
+    } as never);
+    const expandSpy = jest
+      .spyOn(platform as any, 'expandMonorepo')
+      .mockRejectedValue(new Error('expansion failed'));
+
+    const reexpand = async () => {
+      await (platform as any)
+        .handleAppUpdate('mono', appPath, 'git redeploy', true, {
+          principalId: PRINCIPAL,
+          actorUserId: 'human-1',
+        })
+        .catch(() => undefined);
+      (platform as any).appsInProgress.clear();
+    };
+
+    for (let i = 0; i < 5; i++) await reexpand();
+    expect(expandSpy).toHaveBeenCalled();
+    expandSpy.mockClear();
+
+    await reexpand();
+
+    expect(expandSpy).not.toHaveBeenCalled();
+  });
+
+  it('does not let a REFUSED attempt extend its own cooldown', async () => {
+    // failDeployEpisode records a failure. If a key left over from an earlier
+    // aborted episode were still in breakerKeys at refusal time, every refused
+    // retry would push a fresh failure into the window that refused it and
+    // re-arm the cooldown — a lockout that extends itself for as long as the
+    // caller keeps asking, which is exactly what an autonomous agent does.
+    const actor = { principalId: 'key:retrier', actorUserId: 'human-9' };
+    (platform.getStateManager()!.getApp as jest.Mock).mockReturnValue(undefined);
+    const deploy = async () => {
+      await (platform as any).handleBuildApp(path.join(tempDir, 'apps', 'r'), 'r', 'nodejs', actor);
+      (platform as any).appsInProgress.clear();
+    };
+
+    for (let i = 0; i < 5; i++) await deploy();
+    const breaker = getDeployBreaker();
+    const key = `${actor.principalId}::__new__`;
+    const failuresWhenFirstRefused = breaker.check(key).failures;
+
+    for (let i = 0; i < 10; i++) {
+      // A key planted as if some path had reserved one and returned without
+      // recording. Every such path now releases, so this asserts the INVARIANT
+      // rather than today's plumbing: a refusal must never charge a key it did
+      // not itself reserve.
+      (platform as any).breakerKeys.set(
+        'r',
+        (platform as any).guardrailKeys('r', true, actor)
+      );
+      await deploy();
+    }
+
+    // Not one extra failure may have been recorded. Each would also re-arm
+    // openUntil from that moment, so the cooldown would outrun the caller for
+    // as long as they kept retrying — the count is simply the observable half.
+    expect(breaker.check(key).failures).toBe(failuresWhenFirstRefused);
+    expect((platform as any).breakerKeys.has('r')).toBe(false);
   });
 
   it("gives a WEBHOOK its own bucket rather than the app owner's", async () => {
