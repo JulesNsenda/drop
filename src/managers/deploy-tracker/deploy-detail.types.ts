@@ -42,6 +42,19 @@ export interface RuntimeLogOffsets {
   errFile: string;
   outStartOffset: number;
   errStartOffset: number;
+  /**
+   * Where this deploy's output ENDS, captured when the deploy failed.
+   *
+   * Without an end, a read runs start-to-EOF, which is wrong in three ways at
+   * once: N retained deploys of one app produce heavily OVERLAPPING copies
+   * (each contains everything the later ones do), the size is unbounded and
+   * tenant-controlled, and anything appended after this deploy died — by a
+   * RE-REGISTERED app of the same name — gets swept in.
+   *
+   * Absent for a deploy still running, or one whose end was never captured.
+   */
+  outEndOffset?: number;
+  errEndOffset?: number;
 }
 
 export interface DeployDetail {
@@ -78,16 +91,24 @@ export interface DeployDetail {
    * that name, so leaving the offsets in place would let a retained record
    * resolve to a path the NEXT tenant is now writing to (SEC-3).
    *
-   * The plan also specifies copying the bytes into a private, deployId-keyed
-   * file so the output survives teardown. That is deliberately NOT done yet —
-   * nothing reads it (`get_deploy_logs` is a later step), and writing durable
-   * uncapped copies of tenant stdout with no consumer is pure cost. It also
-   * would make `?keepData=false` create a fresh copy of output that routinely
-   * contains DATABASE_URL and injected secrets, which is both against the
-   * user's stated intent and against the invariant below. The copy belongs
-   * with its reader.
+   * At teardown the bytes are copied into `retainedLogFile` and this is
+   * cleared. The two are mutually exclusive by construction.
    */
   runtimeLog?: RuntimeLogOffsets;
+  /**
+   * A private copy of this deploy's runtime output, taken at teardown and
+   * keyed on deployId — so it cannot collide with a re-registered app the way
+   * a name-keyed path does. Absent when there was nothing to copy, when the
+   * copy failed, or when the caller asked for their data to be destroyed
+   * (`keepData: false`).
+   *
+   * This IS process output, and is the one exception to the DROP-generated
+   * rule stated at the top of this file. It is why the copy honours keepData:
+   * an explicit "destroy my data" must not leave a fresh copy of stdout —
+   * which routinely carries DATABASE_URL and injected secrets — sitting in a
+   * new location.
+   */
+  retainedLogFile?: string;
   /**
    * When this record may be swept. Set at teardown — a live app's details are
    * kept as long as the app is.
