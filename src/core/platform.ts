@@ -50,6 +50,12 @@ import { GitDeployService, getGitDeployService, resetGitDeployService } from './
 import { UploadDeployService, getUploadDeployService, resetUploadDeployService } from './upload-deploy';
 import { getActivityLog, resetActivityLog } from '../managers/activity';
 import {
+  getDeployBreaker,
+  breakerKey,
+  automationKey,
+  resetDeployBreaker,
+} from '../managers/guardrail/deploy-breaker';
+import {
   getDeployTracker,
   resetDeployTracker,
   getDeployDetailStore,
@@ -594,6 +600,16 @@ export class DropPlatform {
   // (see the drain-window fix in docs/plans/2026-07-06-p2-4-deploy-observability.md).
   private deployTrackerUnsub?: Unsubscribe;
   private deployDetailUnsub?: Unsubscribe;
+  /**
+   * appName -> the guardrail key this deploy was admitted under.
+   *
+   * Held so the OUTCOME is recorded against the same key the gate checked. The
+   * principal is known only where the deploy was triggered, and the success or
+   * failure surfaces much later in a different handler — recomputing the key
+   * there would silently key automation-triggered outcomes differently from the
+   * gate that let them through, so the window would never close.
+   */
+  private readonly breakerKeys: Map<string, string> = new Map();
   private isRunning = false;
   // Snapshot of each app's persisted status, taken in initializeServices
   // BEFORE syncStateWithConfigs/syncStateWithProcesses run — both reconcile
@@ -923,6 +939,8 @@ export class DropPlatform {
       // best-effort
     }
     resetDeployDetailStore();
+    this.breakerKeys.clear();
+    resetDeployBreaker();
 
     // Stop API server
     if (this.apiServer) {
@@ -2842,7 +2860,12 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     // Build the app if auto-build is enabled (skip if user stopped it)
     const currentApp = this.stateManager?.getApp(payload.name);
     if (this.config.autoBuild && payload.type !== 'unknown' && currentApp?.status !== 'stopped') {
-      await this.handleBuildApp(payload.path, payload.name, payload.type as string);
+      await this.handleBuildApp(
+        payload.path,
+        payload.name,
+        payload.type as string,
+        payload.principalId
+      );
     } else if (payload.type === 'unknown' && currentApp?.status !== 'stopped') {
       // Detection couldn't resolve a type: the build guard above never fires
       // for 'unknown', which used to leave the app registered at `pending`
@@ -2866,7 +2889,12 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     }
   }
 
-  private async handleBuildApp(appPath: string, appName: string, _appType: string): Promise<void> {
+  private async handleBuildApp(
+    appPath: string,
+    appName: string,
+    _appType: string,
+    principalId?: string
+  ): Promise<void> {
     if (!this.builder || !this.detector) return;
 
     // Skip if already processing this app
@@ -2874,6 +2902,34 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       this.logger.debug(`Skipping ${appName} - already in progress`, 'BUILD');
       return;
     }
+
+    // GUARDRAIL, gated HERE and not at the tool boundaries (SEC-15). This is
+    // the single choke point every deploy path traverses — watcher, webhook,
+    // git, upload, MCP. A tool-boundary gate would leave webhook- and
+    // watcher-driven redeploy loops completely unthrottled, and a stolen
+    // webhook secret buys an unmetered build loop, builds being the most
+    // expensive thing on the box.
+    //
+    // Automation gets its own key rather than being treated as an anonymous
+    // caller, so a looping watcher cannot consume the quota of the human who
+    // happens to own the app.
+    const existing = this.stateManager?.getApp(appName);
+    const guardKey = principalId
+      ? breakerKey(principalId, existing ? appName : undefined)
+      : automationKey('watcher', appName);
+    const verdict = getDeployBreaker().check(guardKey);
+    if (!verdict.allowed) {
+      const reason =
+        `Too many failed deploys (${verdict.failures}). ` +
+        `Retry in ${verdict.retryAfterSeconds}s.`;
+      this.logger.warn(`Deploy of ${appName} refused by guardrail: ${reason}`, 'BUILD');
+      // Reported as a normal deploy failure so a caller polling for an outcome
+      // gets an answer instead of waiting out its budget — the same reason
+      // failDeployEpisode exists.
+      this.failDeployEpisode(appName, new Error(reason), crypto.randomUUID());
+      return;
+    }
+    this.breakerKeys.set(appName, guardKey);
 
     // Enforce global concurrent build limit. Deferred builds are queued and
     // retried by drainPendingBuilds as slots free, rather than waiting for a
@@ -3025,6 +3081,11 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         // it retries when a slot frees, instead of leaving it permanently
         // failed after a transient burst.
         this.logger.warn(`Builder busy for ${appName}; re-queuing`, 'BUILD');
+        // Deliberately NOT a guardrail failure: the deploy is being retried,
+        // not rejected. Counting a queue wait as a failure would let a busy
+        // platform trip the breaker on apps that never actually failed — and
+        // the retry re-enters this method and re-gates itself.
+        this.breakerKeys.delete(appName);
         this.appsInProgress.delete(appName);
         this.pendingBuilds.set(appName, { appPath, appType: _appType });
         this.scheduleBuildDrain();
@@ -3035,6 +3096,12 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
             error: result.errors?.[0]?.message || 'Build failed',
           });
         }
+        // The COMMONEST failure, and the one a loop is actually made of: the
+        // build ran and returned unsuccessfully. failDeployEpisode does not
+        // fire here (the builder published its own episode), so without this
+        // the breaker counted only pre-build and readiness failures and would
+        // never trip on a repeatedly-failing build.
+        this.recordDeployOutcome(appName, false);
         this.appsInProgress.delete(appName);
       }
     } catch (error) {
@@ -3076,6 +3143,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
    * synthetic one is fine.
    */
   private failDeployEpisode(appName: string, error: Error, deployId?: string): void {
+    this.recordDeployOutcome(appName, false);
     try {
       const tracker = getDeployTracker();
       const buildId = `deploy-${appName}-${Date.now()}`;
@@ -3095,6 +3163,31 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     } catch {
       // Tracker not initialised (isolated tests) — observability only, never
       // allowed to interfere with the failure being reported.
+    }
+  }
+
+  /**
+   * Record a deploy outcome against the guardrail key this deploy was ADMITTED
+   * under, then forget it.
+   *
+   * Keyed from the map rather than recomputed: the principal is known only
+   * where the deploy was triggered, and the outcome surfaces later in a
+   * different handler. Recomputing here would key automation outcomes
+   * differently from the gate that admitted them, so their window would never
+   * close and a looping watcher would stay blocked forever.
+   *
+   * A deploy with no recorded key was never gated (it predates this, or the
+   * platform restarted mid-deploy) — nothing to record.
+   */
+  private recordDeployOutcome(appName: string, ok: boolean): void {
+    const key = this.breakerKeys.get(appName);
+    if (!key) return;
+    this.breakerKeys.delete(appName);
+    try {
+      if (ok) getDeployBreaker().recordSuccess(key);
+      else getDeployBreaker().recordFailure(key);
+    } catch {
+      // Guardrail state is best-effort; it must never fail a deploy.
     }
   }
 
@@ -3279,6 +3372,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         // Close the runtime-log window FIRST. Without an end offset a retained
         // copy runs start-to-EOF, which sweeps in anything appended after this
         // deploy died — including by a re-registered app of the same name.
+        this.recordDeployOutcome(appName, false);
         await this.noteRuntimeLogEnd(appName);
         // Published BEFORE the 'errored' status write below: that write is
         // what closes the deploy episode, and a subscriber correlating by app
@@ -3337,6 +3431,15 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           readinessUnverified: Boolean(readiness.warning),
         });
       }
+
+      // SUCCESS — clears the guardrail window.
+      //
+      // Including the readiness-WARNING case. Counting succeeded_unverified as
+      // a failure would contradict D1, which exists to preserve DROP-063's
+      // leniency: five legitimately-slow-but-healthy deploys would trip the
+      // breaker on a perfectly good app. The agent still gets the unverified
+      // status and a hint — that is the signal to act on, not a throttle.
+      this.recordDeployOutcome(appName, true);
 
       // App is fully deployed now - record deploy time for cooldown
       this.appDeployTimes.set(appName, Date.now());
