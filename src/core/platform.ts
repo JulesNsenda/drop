@@ -2829,7 +2829,10 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       // No build ever starts on this path, so without an episode an MCP deploy
       // of an undetectable folder waits out its full budget and reports "still
       // building" rather than this error.
-      this.failDeployEpisode(payload.name, detectError);
+      // It still gets its own deploy id: the episode is a real terminal
+      // outcome for a real deploy attempt, and one the caller must be able to
+      // name like any other.
+      this.failDeployEpisode(payload.name, detectError, crypto.randomUUID());
     }
   }
 
@@ -2871,6 +2874,16 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     // reported one. A throw BEFORE it has no episode at all, which is what
     // failDeployEpisode exists to fix.
     let builderEntered = false;
+
+    // One id for this deploy, minted HERE — at the call site that begins it —
+    // and threaded into the build log filename, the build's events, and the
+    // synthesized failure episode below, so the log, the tracker episode and
+    // the caller all name the same deploy.
+    //
+    // Minted BEFORE the try, not next to startBuild: a throw in detection never
+    // reaches the build, and those failures still have to report under a real
+    // id rather than one the tracker invents.
+    const deployId = crypto.randomUUID();
 
     try {
       // Update state to building. Kept inside the try: if this write throws it
@@ -2915,7 +2928,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
 
       const buildStartedAt = new Date();
       const logId = this.buildLogService
-        ? await this.buildLogService.startBuild(appName, buildStartedAt)
+        ? await this.buildLogService.startBuild(appName, buildStartedAt, deployId)
         : null;
 
       // Everything between startBuild and closeBuildLog must sit in this
@@ -2941,6 +2954,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         result = await this.builder.build({
           appName,
           appPath,
+          deployId,
           appType: detection.type,
           framework: detection.framework || null,
           config: {
@@ -3004,7 +3018,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       // so the MCP deploy tools would poll their full budget and report "still
       // building" instead of this error.
       if (!builderEntered) {
-        this.failDeployEpisode(appName, err);
+        this.failDeployEpisode(appName, err, deployId);
       }
       this.appsInProgress.delete(appName);
     }
@@ -3031,14 +3045,14 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
    * `buildId` is not used for correlation (the tracker keys on app name), so a
    * synthetic one is fine.
    */
-  private failDeployEpisode(appName: string, error: Error): void {
+  private failDeployEpisode(appName: string, error: Error, deployId?: string): void {
     try {
       const tracker = getDeployTracker();
       const buildId = `deploy-${appName}-${Date.now()}`;
       if (!tracker.hasOpenEpisode(appName)) {
-        eventBus.publish('build:started', { appId: appName, buildId });
+        eventBus.publish('build:started', { appId: appName, buildId, deployId });
       }
-      eventBus.publish('build:failed', { appId: appName, buildId, error });
+      eventBus.publish('build:failed', { appId: appName, buildId, error, deployId });
     } catch {
       // Tracker not initialised (isolated tests) — observability only, never
       // allowed to interfere with the failure being reported.
@@ -3652,8 +3666,13 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       }
 
       const workDir = await this.getBuildWorkDir(appName);
+      // Same mint-and-thread as handleBuildApp. This path must NOT be skipped:
+      // upload-deploy routes every EXISTING app here, so it is the dominant
+      // path for an agent redeploying, and threading only the fresh-deploy path
+      // would leave exactly those builds unaddressable.
+      const updateDeployId = crypto.randomUUID();
       const updateLogId = this.buildLogService
-        ? await this.buildLogService.startBuild(appName, new Date())
+        ? await this.buildLogService.startBuild(appName, new Date(), updateDeployId)
         : null;
       // Mark this app self-managed only around build(): the build:completed it
       // emits is dispatched synchronously inside build(), so buildSub sees the
@@ -3668,6 +3687,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         buildResult = await this.builder.build({
           appName,
           appPath,
+          deployId: updateDeployId,
           appType: detection.type,
           framework: detection.framework || null,
           config: {

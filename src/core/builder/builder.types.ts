@@ -47,6 +47,16 @@ export interface BuildContext {
   framework: string | null;
   config: BuildConfig;
   env: Record<string, string>;
+  /**
+   * Platform-minted deploy id for the deploy this build belongs to. Carried
+   * through onto the build:started/completed/failed payloads so DeployTracker
+   * correlates the episode to the same id the caller already knows — rather
+   * than minting its own, which nothing upstream could reference.
+   *
+   * Optional: the builder is callable without one (tests, direct use), and
+   * the tracker falls back to minting.
+   */
+  deployId?: string;
   previousBuild?: BuildResult;
   /**
    * Scratch directory for ephemeral build artifacts (tarballs, generated
