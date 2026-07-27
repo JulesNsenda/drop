@@ -29,7 +29,7 @@ import { getSecretManager } from '../../managers/secret';
 import { getLogger } from '../../utils/logger';
 import { hasEnoughDisk, getMinFreeDiskMb } from '../../utils/disk';
 import { eventBus } from '../event-bus';
-import { assertDeployAllowed } from '../../managers/guardrail/deploy-breaker';
+import { admitDeploy } from '../../managers/guardrail/deploy-breaker';
 
 const logger = getLogger();
 
@@ -97,7 +97,7 @@ export class GitDeployService {
     // event that would refuse it is even published. Always a new app here
     // (the conflict check above rejects existing ones), so the key is the
     // caller's shared `__new__` bucket.
-    assertDeployAllowed(appName, true, {
+    await admitDeploy(appName, true, {
       principalId: request.principalId,
       actorUserId: request.userId,
     });
@@ -225,6 +225,14 @@ export class GitDeployService {
     if (!app.gitSource) {
       throw new Error(`Application '${appName}' was not deployed from git`);
     }
+
+    // GUARDRAIL + QUOTA, before the pull. A redeploy is the request an agent
+    // repeats, and git pull + rebuild is not free.
+    await admitDeploy(appName, false, {
+      principalId: actor.principalId,
+      actorUserId: actor.userId,
+      automationSource: actor.automation,
+    });
 
     // Preflight: ensure enough free disk space before pulling
     const disk = await hasEnoughDisk(app.path);

@@ -95,3 +95,25 @@ describe('deriveErrorCode', () => {
     expect(() => deriveErrorCode({ phase: 'nonsense' as never })).not.toThrow();
   });
 });
+
+describe('refusal codes', () => {
+  it('names a guardrail refusal rather than deriving PREBUILD_FAILED from its stage', () => {
+    // The refusal is truthfully at the 'pre-build' stage — nothing was built —
+    // but "the deploy failed before the build ran" is the wrong answer: the
+    // deploy was never attempted, and its hint points at detection and
+    // drop.yaml, neither of which is the problem.
+    expect(
+      deriveErrorCode({ phase: 'build', stage: 'pre-build', builderCode: 'GUARDRAIL_TRIPPED' })
+    ).toBe('GUARDRAIL_TRIPPED');
+  });
+
+  it('names a quota refusal the same way', () => {
+    expect(
+      deriveErrorCode({ phase: 'build', stage: 'pre-build', builderCode: 'QUOTA_EXCEEDED' })
+    ).toBe('QUOTA_EXCEEDED');
+  });
+
+  it('still derives PREBUILD_FAILED for a genuine pre-build failure', () => {
+    expect(deriveErrorCode({ phase: 'build', stage: 'pre-build' })).toBe('PREBUILD_FAILED');
+  });
+});
