@@ -42,6 +42,26 @@ export interface AppState {
   createdAt: string;
   updatedAt: string;
   lastDeployedAt?: string;
+  /**
+   * Set alongside `status: 'running'` when the readiness gate RAN but the app
+   * did not prove ready — docker-mode bind-with-no-HTTP-answer, or a declared
+   * `healthCheck` whose port never bound. The app is left running (DROP-063's
+   * leniency: a slow starter must not be killed), but nothing has confirmed it
+   * serves.
+   *
+   * A FLAG, deliberately not an `AppStatus` member. There are ~20
+   * `status === 'running'` comparisons, and they answer at least four
+   * different questions — counts toward capacity / supervise it / something is
+   * serving, don't clobber it / did it prove healthy. A new status member
+   * silently fails two of them: the stop-before-swap guard in
+   * `handleAppUpdate` matches neither branch, making a redeploy a no-op while
+   * DROP reports success, and `lastDeployedAt` below is written only on
+   * 'running'.
+   *
+   * ABSENT is not the same as verified — it means legacy, or a path where
+   * readiness never ran. Only `=== true` is a positive "did not prove ready".
+   */
+  readinessUnverified?: boolean;
   buildDuration?: number;
   error?: string;
   gitSource?: GitSource;
@@ -205,6 +225,13 @@ export class AppStateManager {
       // Preserve important fields from existing state (for restart scenarios)
       port: existing?.port,
       lastDeployedAt: existing?.lastDeployedAt,
+      // registerApp REBUILDS AppState from a literal, so anything not named
+      // here is dropped. syncStateWithConfigs calls it for every config before
+      // reconcileAppsOnBoot reads state, so omitting this made the readiness
+      // flag write-only: set at deploy, destroyed unread on the next boot.
+      // (The same rebuild silently drops missingSecrets/group/customDomain —
+      // a real pre-existing bug; this literal wants to become a merge.)
+      readinessUnverified: existing?.readinessUnverified,
       buildDuration: existing?.buildDuration,
       gitSource: existing?.gitSource,
       userId: existing?.userId,
@@ -246,7 +273,7 @@ export class AppStateManager {
     return updated;
   }
 
-  async setAppStatus(name: string, status: AppStatus, details?: { port?: number; pid?: number; error?: string; missingSecrets?: string[] }): Promise<AppState | null> {
+  async setAppStatus(name: string, status: AppStatus, details?: { port?: number; pid?: number; error?: string; missingSecrets?: string[]; readinessUnverified?: boolean }): Promise<AppState | null> {
     const app = this.apps.get(name);
     if (!app) return null;
 
@@ -260,9 +287,26 @@ export class AppStateManager {
       delete app.missingSecrets;
     }
 
+    // The readiness verdict is CALLER-supplied, because only the caller knows
+    // whether the readiness gate actually ran. Keyed on the VALUE, matching the
+    // missingSecrets convention above — NOT on key presence, or an explicitly
+    // passed `undefined` would read as "verified" and clear a real failure:
+    //
+    //   undefined -> readiness did not run (handleAppUpdate, restartApp).
+    //                Leave any existing flag alone; asserting either way is a lie.
+    //   true      -> ran, and the app did not prove ready.
+    //   false     -> ran and passed. Actively CLEAR — updateApp is a spread
+    //                merge, so merely omitting the key would leave an app
+    //                flagged once flagged forever, through every clean redeploy.
+    const { readinessUnverified, ...rest } = details ?? {};
+    if (readinessUnverified === false) {
+      delete app.readinessUnverified;
+    }
+
     return this.updateApp(name, {
       status,
-      ...details,
+      ...rest,
+      ...(readinessUnverified === true ? { readinessUnverified: true } : {}),
       ...(status === 'running' ? { lastDeployedAt: new Date().toISOString() } : {}),
     });
   }
