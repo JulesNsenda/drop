@@ -122,6 +122,28 @@ export interface DeployEpisodeDto {
   stages: DeployStageDto[];
 }
 
+/**
+ * Client view of a DeployDetail.
+ *
+ * Two things are deliberately NOT projected:
+ *  - `userId`, the owner snapshot. Internal; the route filters on it.
+ *  - `runtimeLog`, which carries ABSOLUTE host paths
+ *    (/var/drop/data/logs/webapps/...). Those are internal plumbing for the
+ *    log-tail tool, and exposing them would leak the host's filesystem layout
+ *    to a tenant. Same discipline as DeployRow.detail's relative-paths-only
+ *    rule.
+ */
+export interface DeployDetailDto {
+  deployId: string;
+  appName: string;
+  phase: 'build' | 'boot';
+  stage?: string;
+  exitCode?: number;
+  command?: string;
+  reason?: string;
+  createdAt: string;
+}
+
 // Health DTOs
 export interface HealthDto {
   status: 'healthy' | 'degraded' | 'unhealthy';
