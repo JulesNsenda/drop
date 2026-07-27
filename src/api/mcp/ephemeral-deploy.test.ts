@@ -7,7 +7,31 @@
  * somebody's real app.
  */
 
+import * as fs from 'fs';
+import * as path from 'path';
+import * as os from 'os';
 import type { AuthContext } from '../middleware/auth';
+
+/**
+ * A writable staging root.
+ *
+ * `getTempDirectory()` resolves under DROP_ROOT, which defaults to `/var/drop`
+ * on Linux — absent and unwritable in CI, so the handler failed before ever
+ * reaching the deploy service and every assertion here read `undefined`. It
+ * passed locally only because the Windows default happens to be creatable.
+ */
+const stagingRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'drop-mcp-eph-'));
+
+jest.mock('../runtime-config', () => ({
+  getTempDirectory: () => stagingRoot,
+  getAppsDirectory: () => stagingRoot,
+}));
+
+// The shared upload preflight reads real config and disk; none of that is what
+// these tests are about.
+jest.mock('../upload-preflight', () => ({
+  runUploadPreflight: async () => ({ ok: true, release: () => undefined }),
+}));
 
 const deployMock = jest.fn().mockResolvedValue({ app: 'x', acceptedAt: 'now', isNew: true });
 
