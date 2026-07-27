@@ -1,0 +1,252 @@
+/**
+ * DeployDetailStore
+ *
+ * Bus-observer recording ONE diagnostic record per failed deploy, keyed by the
+ * platform-minted `deployId`. Sits alongside DeployTracker: rows say what
+ * happened and when, a detail says why it failed.
+ *
+ * WHY AN OBSERVER, not writes inside the platform's error branches. There are
+ * three start paths (handleStartApp, handleAppUpdate, restartApp) and the
+ * write sites would have to be duplicated across all of them — the redeploy
+ * path is the one such duplication has historically missed, and it is the
+ * dominant path for an agent. One subscriber covers all three by construction.
+ *
+ * Hard invariants, inherited from DeployTracker (do not relax):
+ *  - Handlers mutate in-memory state SYNCHRONOUSLY at the top, then fire
+ *    `void this.persist()`. EventBus publish is synchronous and cross-event
+ *    ordering depends on it. Never `await` before mutating.
+ *  - Never store a raw `error.message`. Every persisted field is
+ *    DROP-generated — see the field discipline note in deploy-detail.types.ts.
+ *
+ * Correlation mirrors DeployTracker exactly: `build:started` opens an entry
+ * keyed by app name, terminal events resolve it back to a deployId. The boot
+ * phase runs in a different handler from the one that minted the id, so
+ * resolving by app name here is what lets `deploy:failed` stay id-free.
+ */
+
+import * as fs from 'fs/promises';
+import * as path from 'path';
+import { writeJsonAtomic } from '../../utils/atomic-write';
+import { getStateManager } from '../app/state-manager';
+import type {
+  EventBus,
+  Unsubscribe,
+  BuildStartedPayload,
+  BuildFailedPayload,
+  AppUpdatedPayload,
+} from '../../core/event-bus';
+import type { DeployFailedPayload } from '../../core/event-bus/event-bus.types';
+import type { DeployDetail } from './deploy-detail.types';
+
+/**
+ * Cap. Lower than DeployTracker's 1000 rows because a detail is only written
+ * for a FAILED deploy, and one deploy produces many rows but at most one
+ * detail.
+ */
+const MAX_DETAILS = 500;
+
+interface DeployDetailStoreFile {
+  details: DeployDetail[];
+}
+
+export class DeployDetailStore {
+  private readonly storePath: string;
+  private details: DeployDetail[] = [];
+  private initialized = false;
+
+  /** appName -> deployId of the currently-open episode (mirrors DeployTracker.active). */
+  private readonly active: Map<string, string> = new Map();
+
+  private savePromise: Promise<void> | null = null;
+  private dirty = false;
+
+  constructor(storePath: string) {
+    this.storePath = storePath;
+  }
+
+  async initialize(): Promise<void> {
+    if (this.initialized) return;
+
+    await fs.mkdir(path.dirname(this.storePath), { recursive: true });
+
+    try {
+      const data = await fs.readFile(this.storePath, 'utf-8');
+      const parsed = JSON.parse(data) as Partial<DeployDetailStoreFile>;
+      this.details = Array.isArray(parsed.details) ? parsed.details : [];
+    } catch {
+      // No store file yet (ENOENT) or a corrupt one — start empty. Deploy
+      // diagnostics are observability, not a source of truth; quarantining a
+      // corrupt file is not worth the complexity. Same call as DeployTracker.
+      this.details = [];
+    }
+
+    this.initialized = true;
+  }
+
+  subscribe(bus: EventBus): Unsubscribe {
+    const unsubs: Unsubscribe[] = [
+      bus.subscribe('build:started', (payload) => this.handleBuildStarted(payload)),
+      bus.subscribe('build:failed', (payload) => this.handleBuildFailed(payload)),
+      bus.subscribe('deploy:failed', (payload) => this.handleDeployFailed(payload)),
+      bus.subscribe('app:updated', (payload) => this.handleAppUpdated(payload)),
+    ];
+
+    return () => {
+      for (const unsub of unsubs) unsub();
+    };
+  }
+
+  // ============ Event handlers ============
+
+  private handleBuildStarted(payload: BuildStartedPayload): void {
+    const appName = payload.appId;
+    // Adopt the publisher's id, like DeployTracker. Without one there is
+    // nothing to key a detail to, so this deploy simply gets no detail rather
+    // than one under an id nobody can reference.
+    if (!payload.deployId) {
+      this.active.delete(appName);
+      return;
+    }
+    this.active.set(appName, payload.deployId);
+  }
+
+  private handleBuildFailed(payload: BuildFailedPayload): void {
+    const appName = payload.appId;
+    const deployId = this.active.get(appName);
+    if (!deployId) return; // orphan guard, same shape as DeployTracker's
+
+    this.active.delete(appName); // terminal
+
+    this.record({
+      deployId,
+      appName,
+      userId: this.snapshotUserId(appName),
+      phase: 'build',
+      stage: payload.stage,
+      exitCode: payload.exitCode,
+      command: payload.command,
+      createdAt: payload.timestamp.toISOString(),
+    });
+  }
+
+  private handleDeployFailed(payload: DeployFailedPayload): void {
+    const appName = payload.appId;
+    const deployId = this.active.get(appName);
+    if (!deployId) return; // orphan guard
+
+    // NOT terminal for the episode — the platform writes status 'errored'
+    // immediately after, and that app:updated is what closes it. Deleting here
+    // would leave that close unable to resolve its id.
+    this.record({
+      deployId,
+      appName,
+      userId: this.snapshotUserId(appName),
+      phase: 'boot',
+      reason: payload.reason,
+      createdAt: payload.timestamp.toISOString(),
+    });
+  }
+
+  private handleAppUpdated(payload: AppUpdatedPayload): void {
+    const status = payload.changes?.status;
+    // Only terminal statuses close. Matches DeployTracker so the two stores
+    // never disagree about which episode is open for an app.
+    if (status !== 'running' && status !== 'errored') return;
+    this.active.delete(payload.appId);
+  }
+
+  // ============ Reads ============
+
+  /** The detail for a deploy, or undefined. Callers MUST tenant-filter on `userId`. */
+  getDetail(deployId: string): DeployDetail | undefined {
+    return this.details.find((d) => d.deployId === deployId);
+  }
+
+  /** Details for an app, newest first. Callers MUST tenant-filter on `userId`. */
+  getDetails(appName: string, limit = 20): DeployDetail[] {
+    return this.details.filter((d) => d.appName === appName).slice(0, limit);
+  }
+
+  /** Drop every detail for an app (used by teardown). */
+  purgeApp(appName: string): void {
+    const before = this.details.length;
+    this.details = this.details.filter((d) => d.appName !== appName);
+    this.active.delete(appName);
+    if (this.details.length !== before) void this.persist();
+  }
+
+  /** Await any in-flight persist. Tests and shutdown. */
+  async flush(): Promise<void> {
+    await this.savePromise;
+  }
+
+  // ============ Internals ============
+
+  private record(detail: DeployDetail): void {
+    // One detail per deploy. A build failure followed by a boot failure for
+    // the same id cannot happen (a failed build never boots), but a duplicate
+    // publish can — replace rather than accumulate, so a deployId always
+    // resolves to exactly one record.
+    const existing = this.details.findIndex((d) => d.deployId === detail.deployId);
+    if (existing !== -1) {
+      this.details[existing] = detail;
+    } else {
+      this.details.unshift(detail);
+    }
+    void this.persist();
+  }
+
+  private snapshotUserId(appName: string): string | undefined {
+    try {
+      return getStateManager().getApp(appName)?.userId;
+    } catch {
+      // StateManager not configured in this process (isolated tests).
+      return undefined;
+    }
+  }
+
+  private async persist(): Promise<void> {
+    this.dirty = true;
+    if (this.savePromise) return this.savePromise;
+    this.savePromise = this.runSaveLoop();
+    return this.savePromise;
+  }
+
+  private async runSaveLoop(): Promise<void> {
+    try {
+      while (this.dirty) {
+        this.dirty = false;
+        await this.doPersist();
+      }
+    } finally {
+      this.savePromise = null;
+    }
+  }
+
+  private async doPersist(): Promise<void> {
+    this.details = this.details.slice(0, MAX_DETAILS);
+    try {
+      await writeJsonAtomic(this.storePath, { details: this.details } as DeployDetailStoreFile);
+    } catch (error) {
+      console.error('[deploy-detail] failed to persist deploy details:', error);
+    }
+  }
+}
+
+// ============ Singleton ============
+
+let instance: DeployDetailStore | null = null;
+
+export function getDeployDetailStore(storePath?: string): DeployDetailStore {
+  if (!instance) {
+    if (!storePath) {
+      throw new Error('DeployDetailStore storePath required on first call');
+    }
+    instance = new DeployDetailStore(storePath);
+  }
+  return instance;
+}
+
+export function resetDeployDetailStore(): void {
+  instance = null;
+}
