@@ -100,6 +100,24 @@ export interface AuthContext {
   authMethod: 'jwt' | 'apikey' | 'oauth';
   /** Capability scopes carried by API-key auth. Always undefined on the JWT path — JWTs don't carry scopes. */
   scopes?: string[];
+  /**
+   * Who to RATE-LIMIT and attribute against, as opposed to `userId`, which is
+   * who OWNS things. The two differ on the OAuth path, where one human can
+   * have many concurrent agent sessions that must be metered separately.
+   *
+   *   jwt    -> sub          (an interactive session is the human)
+   *   apikey -> key.id       (each key is its own principal, even when several
+   *                           resolve to the same owner)
+   *   oauth  -> sub::sid     (per grant, NOT per token — see below)
+   *
+   * `jti` is deliberately NOT used. Access tokens live 15 minutes and
+   * `rotateRefreshToken` mints a fresh record on every use, so a `jti`
+   * principal RESETS on refresh: a per-hour quota would reset up to 4x an hour
+   * with no attacker effort, a per-principal store would accrete a permanent
+   * row per minted token, and the audit trail would fragment into unjoinable
+   * 15-minute slices.
+   */
+  principalId?: string;
 }
 
 /** A rotated-on-use opaque refresh token, hashed at rest (never the raw token). */
@@ -108,6 +126,14 @@ interface RefreshTokenRecord {
   userId: string;
   clientId: string;
   createdAt: string;
+  /**
+   * Stable session id for the GRANT, minted once at authorization-code
+   * exchange and carried through every rotation. This is what makes
+   * `principalId` survive a refresh; rotating it here would reintroduce
+   * exactly the resetting-principal bug the id exists to avoid. It rotates
+   * only on re-consent, which mints a new grant.
+   */
+  sid?: string;
 }
 
 // Credentials storage
@@ -437,6 +463,10 @@ export async function deleteUser(userId: string): Promise<boolean> {
   // orphaned key, so this is defence in depth — but it keeps the stored state
   // honest rather than leaving dangling credentials in the file.
   credentials.apiKeys = credentials.apiKeys.filter((k) => k.ownerUserId !== userId);
+  // Same for OAuth grants — see suspendUser.
+  credentials.refreshTokens = (credentials.refreshTokens ?? []).filter(
+    (r) => r.userId !== userId
+  );
   await saveCredentials(config.credentialsPath, credentials);
   return true;
 }
@@ -457,6 +487,14 @@ export async function suspendUser(userId: string): Promise<boolean> {
   // as their owner, a suspended user's keys would otherwise keep full access
   // to every app they own.
   credentials.apiKeys = credentials.apiKeys.filter((k) => k.ownerUserId !== userId);
+  // ...and their OAuth grants. Without this, suspension blocks login and
+  // purges keys while every outstanding refresh token keeps minting fresh
+  // 15-minute access tokens INDEFINITELY — refresh records carry no expiry and
+  // the refresh path never checked `enabled`. revokeAllRefreshTokensForUser
+  // existed for exactly this and had no caller at all.
+  credentials.refreshTokens = (credentials.refreshTokens ?? []).filter(
+    (r) => r.userId !== userId
+  );
   await saveCredentials(config.credentialsPath, credentials);
   return true;
 }
@@ -747,7 +785,11 @@ export async function verifyJwt(token: string): Promise<JwtPayload | null> {
  * OAuth token from reaching the general API — see
  * docs/plans/2026-07-10-mcp-oauth.md.
  */
-export async function mintOAuthAccessToken(user: User, audience: string): Promise<string> {
+export async function mintOAuthAccessToken(
+  user: User,
+  audience: string,
+  sid?: string
+): Promise<string> {
   if (!oauthTokenSecret) throw new Error('Auth not initialized');
   return new jose.SignJWT({
     sub: user.id,
@@ -755,6 +797,7 @@ export async function mintOAuthAccessToken(user: User, audience: string): Promis
     role: user.role,
     token_use: 'oauth_access',
     aud: audience,
+    ...(sid ? { sid } : {}),
   })
     .setProtectedHeader({ alg: 'HS256' })
     .setIssuedAt()
@@ -794,11 +837,25 @@ export async function verifyOAuthAccessToken(
       return null;
     }
 
+    // Per GRANT, not per token, and NAMESPACED.
+    //
+    // The prefix is not cosmetic: without it a JWT session (`sub`) and a
+    // sid-less OAuth grant (`userId`) produce a byte-identical principal, so a
+    // runaway agent session would trip the circuit breaker on the human's own
+    // dashboard deploys and spend their quota. Three disjoint spaces instead.
+    //
+    // A token minted before sid existed still falls back to the coarse form;
+    // its grant self-heals on the next refresh (see rotateRefreshToken).
+    const sid = p['sid'];
+    const principalId =
+      typeof sid === 'string' && sid ? `oauth:${userId}::${sid}` : `oauth:${userId}`;
+
     return {
       userId,
       username,
       role: role as AuthContext['role'],
       authMethod: 'oauth',
+      principalId,
     };
   } catch {
     return null;
@@ -814,7 +871,11 @@ function hashOpaqueToken(token: string): string {
  * Issue a new opaque OAuth refresh token for a user + OAuth client, hashed at
  * rest (the raw token is returned once and never stored).
  */
-export async function issueRefreshToken(userId: string, clientId: string): Promise<string> {
+export async function issueRefreshToken(
+  userId: string,
+  clientId: string,
+  sid?: string
+): Promise<string> {
   if (!credentials || !config) throw new Error('Auth not initialized');
 
   const token = crypto.randomBytes(32).toString('base64url');
@@ -823,6 +884,7 @@ export async function issueRefreshToken(userId: string, clientId: string): Promi
     userId,
     clientId,
     createdAt: new Date().toISOString(),
+    ...(sid ? { sid } : {}),
   };
 
   if (!credentials.refreshTokens) credentials.refreshTokens = [];
@@ -842,7 +904,7 @@ export async function issueRefreshToken(userId: string, clientId: string): Promi
  */
 export async function rotateRefreshToken(
   presented: string
-): Promise<{ refreshToken: string; userId: string; clientId: string } | null> {
+): Promise<{ refreshToken: string; userId: string; clientId: string; sid?: string } | null> {
   if (!credentials || !config) throw new Error('Auth not initialized');
 
   const tokenHash = hashOpaqueToken(presented);
@@ -850,7 +912,8 @@ export async function rotateRefreshToken(
   const index = records.findIndex((r) => r.tokenHash === tokenHash);
   if (index === -1) return null;
 
-  const { userId, clientId } = records[index];
+  const { userId, clientId, sid } = records[index];
+  const carried = sid ?? crypto.randomUUID();
   records.splice(index, 1);
 
   const refreshToken = crypto.randomBytes(32).toString('base64url');
@@ -859,12 +922,20 @@ export async function rotateRefreshToken(
     userId,
     clientId,
     createdAt: new Date().toISOString(),
+    // CARRIED, never re-minted. Rotating the sid here would reset the
+    // principal on every refresh — the whole defect this field exists to fix.
+    //
+    // A grant issued BEFORE sid existed has none, and `...(sid ? …)` would
+    // carry that `undefined` through unlimited rotations — so it would never
+    // heal, and its principal would stay permanently coarse. One transition
+    // per legacy grant is strictly better than permanent degradation.
+    sid: carried,
   });
 
   credentials.refreshTokens = records;
   await saveCredentials(config.credentialsPath, credentials);
 
-  return { refreshToken, userId, clientId };
+  return { refreshToken, userId, clientId, sid: carried };
 }
 
 /** Revoke a single presented refresh token. Returns false if it was not found. */
@@ -1021,6 +1092,10 @@ function apiKeyAuthContext(key: ApiKey): AuthContext {
     role: key.role,
     authMethod: 'apikey',
     scopes: key.scopes,
+    // The KEY, not its owner. Several keys can resolve to one human, and each
+    // must be metered and attributed separately — that is the point of issuing
+    // more than one. Ownership still flows through userId above.
+    principalId: `key:${key.id}`,
   };
 }
 
@@ -1172,6 +1247,8 @@ export function authMiddleware(requiredRole?: 'admin' | 'user' | 'readonly') {
           username: payload.username,
           role: payload.role as AuthContext['role'],
           authMethod: 'jwt',
+          // An interactive session IS the human — nothing finer to key on.
+          principalId: `jwt:${payload.sub}`,
         };
       } else {
         // Not a valid session JWT — accept a Bearer-presented API key too, so the
@@ -1376,6 +1453,7 @@ export function optionalAuthMiddleware() {
           userId: payload.sub,
           username: payload.username,
           role: payload.role,
+          principalId: `jwt:${payload.sub}`,
           authMethod: 'jwt',
         });
       } else if (!payload) {
