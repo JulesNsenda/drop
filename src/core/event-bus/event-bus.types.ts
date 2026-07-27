@@ -4,6 +4,12 @@
  * Defines all event types, payloads, and handlers for the DROP event system.
  */
 
+// Type-only, and acyclic: builder.types imports from detector only, never from
+// here. The build stage is genuinely a builder concept and the event carries
+// it, so the alternative — restating the union here — would just create a
+// second definition to drift.
+import type { BuildStage } from '../builder/builder.types';
+
 // Platform events
 export type PlatformEventType =
   | 'platform:starting'
@@ -200,6 +206,24 @@ export interface BuildFailedPayload extends BaseEvent {
   logs?: string;
   /** See BuildStartedPayload.deployId. */
   deployId?: string;
+  /**
+   * Which stage failed. REQUIRED, unlike the other additions here: the builder
+   * has always known this and simply never published it, so DeployTracker
+   * hardcoded `category: 'build-failed'` while its type documented three
+   * values — a constant that `GET /api/v1/deploys` reported as if it
+   * discriminated. Requiring it means a publisher cannot reintroduce that by
+   * omission.
+   */
+  stage: BuildStage;
+  /** Process exit code, when the failing stage ran a command that reported one. */
+  exitCode?: number;
+  /**
+   * The failing command, truncated by the publisher. DROP-generated (composed
+   * from the strategy and the app's drop.yaml `build`), NOT process output —
+   * which is what makes it safe to persist alongside a deploy row, where
+   * `error.message` is not.
+   */
+  command?: string;
 }
 
 // Deployment event payloads

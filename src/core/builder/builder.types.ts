@@ -116,6 +116,14 @@ export interface BuildStageResult {
   duration: number;
   output?: string;
   error?: string;
+  /** Process exit code, when this stage ran a command that reported one. */
+  exitCode?: number;
+  /**
+   * The command this stage ran. DROP-generated (composed from the strategy and
+   * the app's drop.yaml `build`), never raw process output — so unlike
+   * `error`/`output` it is safe to carry into a persisted deploy row.
+   */
+  command?: string;
 }
 
 /**
@@ -126,6 +134,10 @@ export interface BuildError {
   message: string;
   code?: string;
   details?: string;
+  /** See BuildStageResult.exitCode. */
+  exitCode?: number;
+  /** See BuildStageResult.command. */
+  command?: string;
 }
 
 /**
