@@ -36,7 +36,7 @@ import type {
   AppUpdatedPayload,
 } from '../../core/event-bus';
 import type { DeployFailedPayload } from '../../core/event-bus/event-bus.types';
-import type { DeployDetail } from './deploy-detail.types';
+import type { DeployDetail, RuntimeLogOffsets } from './deploy-detail.types';
 
 /**
  * Cap. Lower than DeployTracker's 1000 rows because a detail is only written
@@ -56,6 +56,15 @@ export class DeployDetailStore {
 
   /** appName -> deployId of the currently-open episode (mirrors DeployTracker.active). */
   private readonly active: Map<string, string> = new Map();
+
+  /**
+   * appName -> offsets captured just before the process started, held until a
+   * failure actually needs them. PENDING rather than written eagerly, mirroring
+   * DeployTracker.pendingTrigger: a detail is written only for a FAILED deploy,
+   * and recording offsets at start time would mint one for every successful
+   * deploy too — inflating the store and breaking the cap's rationale.
+   */
+  private readonly pendingRuntimeLog: Map<string, RuntimeLogOffsets> = new Map();
 
   private savePromise: Promise<void> | null = null;
   private dirty = false;
@@ -116,6 +125,10 @@ export class DeployDetailStore {
     if (!deployId) return; // orphan guard, same shape as DeployTracker's
 
     this.active.delete(appName); // terminal
+    // A build failure never reached runtime.start(), so there is no runtime
+    // log for THIS deploy. Drop anything a previous one left behind rather
+    // than attaching another deploy's offsets.
+    this.pendingRuntimeLog.delete(appName);
 
     this.record({
       deployId,
@@ -143,6 +156,7 @@ export class DeployDetailStore {
       userId: this.snapshotUserId(appName),
       phase: 'boot',
       reason: payload.reason,
+      runtimeLog: this.pendingRuntimeLog.get(appName),
       createdAt: payload.timestamp.toISOString(),
     });
   }
@@ -153,6 +167,24 @@ export class DeployDetailStore {
     // never disagree about which episode is open for an app.
     if (status !== 'running' && status !== 'errored') return;
     this.active.delete(payload.appId);
+    this.pendingRuntimeLog.delete(payload.appId);
+  }
+
+  /**
+   * Stash where this deploy's runtime output begins. Called by the platform
+   * immediately before `runtime.start()` — the one part of this feature that
+   * cannot be a bus subscriber, because it reads file sizes that the start is
+   * about to change.
+   *
+   * Takes an app name, not a deployId: the caller does not have one. The id is
+   * minted in handleBuildApp/handleAppUpdate but the start happens in a
+   * different handler, so this resolves it the same way every other handler
+   * here does. A start with no open episode (restartApp — a restart is not a
+   * deploy) simply stashes nothing.
+   */
+  noteRuntimeLog(appName: string, offsets: RuntimeLogOffsets): void {
+    if (!this.active.has(appName)) return;
+    this.pendingRuntimeLog.set(appName, offsets);
   }
 
   // ============ Reads ============
@@ -172,6 +204,7 @@ export class DeployDetailStore {
     const before = this.details.length;
     this.details = this.details.filter((d) => d.appName !== appName);
     this.active.delete(appName);
+    this.pendingRuntimeLog.delete(appName);
     if (this.details.length !== before) void this.persist();
   }
 
