@@ -29,6 +29,7 @@ import { getSecretManager } from '../../managers/secret';
 import { getLogger } from '../../utils/logger';
 import { hasEnoughDisk, getMinFreeDiskMb } from '../../utils/disk';
 import { eventBus } from '../event-bus';
+import { assertDeployAllowed } from '../../managers/guardrail/deploy-breaker';
 
 const logger = getLogger();
 
@@ -89,6 +90,17 @@ export class GitDeployService {
     if (stateManager.hasApp(appName)) {
       throw new Error(`Application '${appName}' already exists`);
     }
+
+    // GUARDRAIL PRE-CHECK, before the clone. The platform's gates sit at the
+    // BUILD, so a refused caller could still make DROP clone an arbitrary
+    // repository on every attempt — network, disk and time spent before the
+    // event that would refuse it is even published. Always a new app here
+    // (the conflict check above rejects existing ones), so the key is the
+    // caller's shared `__new__` bucket.
+    assertDeployAllowed(appName, true, {
+      principalId: request.principalId,
+      actorUserId: request.userId,
+    });
 
     const destPath = path.join(this.config.appsDirectory, appName);
 

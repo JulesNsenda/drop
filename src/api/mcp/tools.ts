@@ -56,6 +56,7 @@ import { classifyBuildFailure } from '../../core/builder/classify';
 import { computeAppUrl } from '../routes/apps';
 import { getPlatformVersion } from '../../utils/version';
 import { tryLogActivity } from '../../managers/activity';
+import { DeployRefusedError } from '../../managers/guardrail/deploy-breaker';
 
 /** ≤48 files per deploy_files call. */
 export const DEPLOY_FILES_MAX_FILES = 48;
@@ -403,6 +404,11 @@ export async function handleDeployFiles(
     if (err instanceof UploadValidationError || err instanceof InsufficientDiskSpaceError) {
       return toolError(err.message);
     }
+    if (err instanceof DeployRefusedError) {
+      // The message already names the wait, so an agent has something to act
+      // on rather than a bare failure it will immediately retry.
+      return toolError(err.message);
+    }
     return toolError(
       `deploy_files failed: ${err instanceof Error ? err.message : 'unknown error'}`
     );
@@ -505,6 +511,7 @@ export async function handleDeployFromGit(
 
     return await waitForDeployOutcome(result.appName, acceptedAt, true);
   } catch (err) {
+    if (err instanceof DeployRefusedError) return toolError(err.message);
     const message = err instanceof Error ? err.message : 'Deploy failed';
     if (message.includes('already exists')) return toolError(`Conflict: ${message}`);
     if (message.includes('Invalid')) return toolError(`Invalid input: ${message}`);
