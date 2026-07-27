@@ -54,6 +54,21 @@ export interface AppConfig {
    * ceiling for everything else.
    */
   maxDiskMb?: number;
+  /**
+   * Whether a new build goes live on its own. Unset falls back to
+   * DROP_DEFAULT_PROMOTION. A per-app value wins either way — an operator who
+   * marked one app `auto` on a `manual` platform meant it.
+   */
+  promotion?: 'auto' | 'manual';
+  /**
+   * A built-but-unpromoted deploy, when promotion is manual. Absent when
+   * nothing is held. The running version is untouched while this is set.
+   */
+  pendingPromotion?: {
+    deployId?: string;
+    builtAt: string;
+    outputDirectory?: string;
+  };
   sourceHash?: string;
   /**
    * SHA-256 fingerprint of the app's secret key/value set (sorted, hashed —

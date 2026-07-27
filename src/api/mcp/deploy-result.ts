@@ -40,6 +40,7 @@ export type DeployResultStatus =
   | 'succeeded_unverified'
   | 'failed'
   | 'needs_config'
+  | 'awaiting_promotion'
   | 'in_progress';
 
 /** Closed union of tool names. Never derived from output, never with arguments. */

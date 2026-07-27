@@ -144,7 +144,7 @@ describe('DELETE /api/v1/apps/:name — group-aware (M4)', () => {
   function makeOps(overrides?: Partial<PlatformOps>): PlatformOps {
     return {
       restartApp: jest.fn(),
-      isAppInProgress: jest.fn().mockReturnValue(false),
+      isAppInProgress: jest.fn().mockReturnValue(false), promoteApp: jest.fn(),
       removeGroup: jest.fn().mockResolvedValue({ removed: [] }),
       purgeAppArtifacts: jest.fn().mockResolvedValue(undefined),
       ...overrides,
@@ -468,7 +468,7 @@ describe('DELETE /api/v1/apps/:name — in-progress guard (M4)', () => {
   function makeOps(overrides?: Partial<PlatformOps>): PlatformOps {
     return {
       restartApp: jest.fn(),
-      isAppInProgress: jest.fn().mockReturnValue(false),
+      isAppInProgress: jest.fn().mockReturnValue(false), promoteApp: jest.fn(),
       removeGroup: jest.fn().mockResolvedValue({ removed: [] }),
       purgeAppArtifacts: jest.fn().mockResolvedValue(undefined),
       ...overrides,
