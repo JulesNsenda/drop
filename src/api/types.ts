@@ -137,6 +137,8 @@ export interface DeployDetailDto {
   deployId: string;
   appName: string;
   phase: 'build' | 'boot';
+  /** Closed-union cause. Safe to switch on; 'UNKNOWN' is a real member. */
+  errorCode: string;
   stage?: string;
   exitCode?: number;
   command?: string;
