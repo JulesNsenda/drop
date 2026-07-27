@@ -40,6 +40,10 @@ export type BuildEventType =
   | 'build:completed'
   | 'build:failed';
 
+// Deploy-outcome events (distinct from the legacy Deployment* family below,
+// which nothing currently publishes).
+export type DeployEventType = 'deploy:failed';
+
 // Deployment events
 export type DeploymentEventType =
   | 'deployment:started'
@@ -58,6 +62,7 @@ export type EventType =
   | PlatformEventType
   | AppEventType
   | BuildEventType
+  | DeployEventType
   | DeploymentEventType
   | WatcherEventType;
 
@@ -226,6 +231,37 @@ export interface BuildFailedPayload extends BaseEvent {
   command?: string;
 }
 
+/**
+ * Where a deploy died, for failures AFTER the build. `build:failed` already
+ * covers the build phase and carries its own stage.
+ */
+export type DeployFailurePhase = 'boot';
+
+/**
+ * Why a post-build deploy failed. A CLOSED SET of DROP-generated categories,
+ * never free-form text: this rides into a persisted record, and the
+ * never-store-a-raw-error-message rule (deploy-tracker.ts) applies to
+ * everything that lands there.
+ */
+export type DeployFailureReason = 'readiness-failed' | 'start-threw';
+
+/**
+ * A deploy that got past the build and then failed. Widens the boot-failure
+ * signal the way Step 1 widened build:failed, so ONE bus subscriber covers
+ * every start path instead of six write sites duplicated across
+ * handleStartApp / handleAppUpdate / restartApp.
+ *
+ * Carries no deployId: subscribers correlate by app name against the episode
+ * opened at build:started, exactly as DeployTracker already does. The boot
+ * phase runs in a different handler from the one that minted the id, so
+ * threading it here would mean plumbing it through the start spec for no gain.
+ */
+export interface DeployFailedPayload extends BaseEvent {
+  appId: string;
+  phase: DeployFailurePhase;
+  reason: DeployFailureReason;
+}
+
 // Deployment event payloads
 export interface DeploymentStartedPayload extends BaseEvent {
   appId: string;
@@ -289,6 +325,7 @@ export interface EventPayloadMap {
   'build:progress': BuildProgressPayload;
   'build:completed': BuildCompletedPayload;
   'build:failed': BuildFailedPayload;
+  'deploy:failed': DeployFailedPayload;
   'deployment:started': DeploymentStartedPayload;
   'deployment:completed': DeploymentCompletedPayload;
   'deployment:failed': DeploymentFailedPayload;
