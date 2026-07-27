@@ -256,7 +256,10 @@ describe('MCP tool handlers', () => {
         ]),
       } as unknown as ReturnType<typeof deployTrackerModule.getDeployTracker>);
       jest.spyOn(buildLogModule, 'getBuildLogService').mockReturnValue({
-        getLatestBuildLog: jest.fn().mockResolvedValue('line1\nline2\nERROR: build broke'),
+        // By deployId now, not "the newest log for the app" — that fallback was
+        // Gap B: under a concurrent deploy it reported a DIFFERENT deploy's
+        // output under this one's id.
+        getBuildLogByDeployId: jest.fn().mockResolvedValue('line1\nline2\nERROR: build broke'),
       } as unknown as ReturnType<typeof buildLogModule.getBuildLogService>);
 
       const result = await handleDeployFiles(alice, {
