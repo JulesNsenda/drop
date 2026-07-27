@@ -1107,10 +1107,11 @@ describe('handleAppDetected — unknown type ends errored (M2 2g)', () => {
       path.join(tempDir, 'apps', 'known-app'),
       'known-app',
       'nodejs',
-      // The guardrail principal — absent here because the watcher, not a
-      // caller, triggered this detection.
-      undefined
+      // The guardrail actor is the event payload itself.
+      expect.objectContaining({ name: 'known-app' })
     );
+    // Watcher-triggered, so it names no caller and keys as automation.
+    expect((buildSpy.mock.calls[0][3] as { principalId?: string }).principalId).toBeUndefined();
     expect(stateManager.setAppStatus).not.toHaveBeenCalled();
   });
 });

@@ -74,7 +74,7 @@ describe('git webhook activity logging (P2-4)', () => {
     });
 
     expect(res.status).toBe(200);
-    expect(redeploy).toHaveBeenCalledWith('myapp');
+    expect(redeploy).toHaveBeenCalledWith('myapp', { automation: 'webhook' });
     expect(logSpy).toHaveBeenCalledTimes(1);
     const entry = logSpy.mock.calls[0][0];
     expect(entry).toMatchObject({ action: 'redeploy', appName: 'myapp' });
