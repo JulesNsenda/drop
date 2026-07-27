@@ -49,6 +49,7 @@ function toDetailDto(detail: DeployDetail): DeployDetailDto {
     deployId: detail.deployId,
     appName: detail.appName,
     phase: detail.phase,
+    errorCode: detail.errorCode,
     stage: detail.stage,
     exitCode: detail.exitCode,
     command: detail.command,

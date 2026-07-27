@@ -21,8 +21,11 @@ export type {
   DeployFailureCategory,
 } from './deploy-tracker.types';
 
+export { deriveErrorCode } from './deploy-error-code';
+
 export type {
   DeployDetail,
+  DeployErrorCode,
   DeployFailurePhase,
   DeployFailureReason,
 } from './deploy-detail.types';

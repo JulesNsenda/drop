@@ -124,6 +124,7 @@ export class BuilderService {
         error: new Error(noStrategy.message),
         deployId: context.deployId,
         stage: noStrategy.stage,
+        code: noStrategy.code,
       });
 
       return this.createFailedResult(startedAt, [noStrategy], []);
@@ -217,6 +218,7 @@ export class BuilderService {
           stage: errors[0]?.stage ?? 'build',
           exitCode: errors[0]?.exitCode,
           command: truncateCommand(errors[0]?.command),
+          code: errors[0]?.code,
         });
       }
 
@@ -246,6 +248,7 @@ export class BuilderService {
         buildId,
         error: errorObj,
         deployId: context.deployId,
+        code: 'EXCEPTION',
         // Whatever stage was running when it threw. activeBuild.currentStage is
         // null only before the loop's first iteration, i.e. still pre-build.
         stage: activeBuild.currentStage ?? 'pre-build',
