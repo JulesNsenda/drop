@@ -1507,6 +1507,7 @@ backup:
       restartApp: (name) => this.restartApp(name),
       isAppInProgress: (name) => this.appsInProgress.has(name),
       removeGroup: (name) => this.removeGroup(name),
+      purgeAppArtifacts: (name, opts) => this.purgeAppArtifacts(name, opts),
     });
 
     this.logger.info(`API server running on port ${this.config.apiPort}`, 'API');
@@ -2818,11 +2819,17 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       // forever with no logs explaining why. Fail loudly instead — a later
       // file change re-detects (handleAppUpdate only skips `stopped` apps),
       // so adding a drop.yaml/Procfile/manifest recovers the app automatically.
+      const detectError = new Error(
+        'Could not detect application type — add a drop.yaml, Procfile, or a recognized manifest ' +
+          '(requirements.txt, package.json, go.mod, Dockerfile, index.html)'
+      );
       await this.stateManager?.setAppStatus(payload.name, 'errored', {
-        error:
-          'Could not detect application type — add a drop.yaml, Procfile, or a recognized manifest ' +
-          '(requirements.txt, package.json, go.mod, Dockerfile, index.html)',
+        error: detectError.message,
       });
+      // No build ever starts on this path, so without an episode an MCP deploy
+      // of an undetectable folder waits out its full budget and reports "still
+      // building" rather than this error.
+      this.failDeployEpisode(payload.name, detectError);
     }
   }
 
@@ -2856,6 +2863,14 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     this.appsInProgress.add(appName);
 
     this.logger.appEvent('building', appName);
+
+    // Whether builder.build() was entered. Declared out here so the catch can
+    // see it: the builder publishes its own build:started/build:failed, so a
+    // failure AFTER this point must not be given a synthesized episode — that
+    // would report a second, spurious failure for a deploy that already
+    // reported one. A throw BEFORE it has no episode at all, which is what
+    // failDeployEpisode exists to fix.
+    let builderEntered = false;
 
     try {
       // Update state to building. Kept inside the try: if this write throws it
@@ -2903,38 +2918,44 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         ? await this.buildLogService.startBuild(appName, buildStartedAt)
         : null;
 
-      // Fresh deploy — nothing is currently serving this app, so a low-disk
-      // abort is a hard failure: throw into the catch below, which marks the
-      // app 'errored' and releases appsInProgress.
-      const disk = await hasEnoughDisk(appPath);
-      if (!disk.ok) {
-        throw new Error(
-          `Insufficient disk space: ${Math.round(disk.freeMb)} MB free, need ${getMinFreeDiskMb()} MB`
-        );
-      }
+      // Everything between startBuild and closeBuildLog must sit in this
+      // try/finally: the disk check below throws on a low-disk box, and that
+      // used to skip finishBuild entirely — leaking the log's write stream and
+      // never running retention for the app.
+      let result;
+      try {
+        // Fresh deploy — nothing is currently serving this app, so a low-disk
+        // abort is a hard failure: throw into the catch below, which marks the
+        // app 'errored' and releases appsInProgress.
+        const disk = await hasEnoughDisk(appPath);
+        if (!disk.ok) {
+          throw new Error(
+            `Insufficient disk space: ${Math.round(disk.freeMb)} MB free, need ${getMinFreeDiskMb()} MB`
+          );
+        }
 
-      const buildEnv = await this.resolveBuildEnv(appPath, appName);
-      const buildOverride = (await parseDropYaml(appPath)).config?.build;
+        const buildEnv = await this.resolveBuildEnv(appPath, appName);
+        const buildOverride = (await parseDropYaml(appPath)).config?.build;
 
-      const result = await this.builder.build({
-        appName,
-        appPath,
-        appType: detection.type,
-        framework: detection.framework || null,
-        config: {
-          buildCommand: buildOverride ?? detection.suggestedConfig?.buildCommand,
-          installCommand: detection.suggestedConfig?.installCommand,
-        },
-        env: buildEnv,
-        workDir,
-        execCommand,
-        onBuildLog: logId && this.buildLogService
-          ? (line) => this.buildLogService!.writeLine(logId, line)
-          : undefined,
-      });
-
-      if (logId && this.buildLogService) {
-        await this.buildLogService.finishBuild(logId, appName);
+        builderEntered = true;
+        result = await this.builder.build({
+          appName,
+          appPath,
+          appType: detection.type,
+          framework: detection.framework || null,
+          config: {
+            buildCommand: buildOverride ?? detection.suggestedConfig?.buildCommand,
+            installCommand: detection.suggestedConfig?.installCommand,
+          },
+          env: buildEnv,
+          workDir,
+          execCommand,
+          onBuildLog: logId && this.buildLogService
+            ? (line) => this.buildLogService!.writeLine(logId, line)
+            : undefined,
+        });
+      } finally {
+        await this.closeBuildLog(logId, appName);
       }
 
       if (result.success) {
@@ -2973,13 +2994,70 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         this.appsInProgress.delete(appName);
       }
     } catch (error) {
-      this.logger.appEvent('error', appName, error instanceof Error ? error.message : 'Build failed');
+      const err = error instanceof Error ? error : new Error('Build failed');
+      this.logger.appEvent('error', appName, err.message);
       if (this.stateManager) {
-        await this.stateManager.setAppStatus(appName, 'errored', {
-          error: error instanceof Error ? error.message : 'Build failed',
-        });
+        await this.stateManager.setAppStatus(appName, 'errored', { error: err.message });
+      }
+      // A throw BEFORE builder.build() (detection, the disk check,
+      // resolveBuildEnv, a malformed drop.yaml) never opened a deploy episode,
+      // so the MCP deploy tools would poll their full budget and report "still
+      // building" instead of this error.
+      if (!builderEntered) {
+        this.failDeployEpisode(appName, err);
       }
       this.appsInProgress.delete(appName);
+    }
+  }
+
+  /**
+   * Make a deploy failure OBSERVABLE as a terminal deploy episode.
+   *
+   * Every MCP deploy tool polls `waitForDeployOutcome` for an episode that
+   * reaches a terminal status. A failure that never opened one therefore reads
+   * as "still in progress" until the caller's full wait budget (~120s) expires,
+   * and then reports "still building" instead of the failure. Two such paths
+   * exist, both reachable without anything unusual:
+   *
+   *  - `handleAppDetected`'s `unknown`-type branch, which errors the app
+   *    WITHOUT ever calling `handleBuildApp` — i.e. deploying a folder with no
+   *    recognizable manifest.
+   *  - anything throwing inside `handleBuildApp` BEFORE `builder.build()`:
+   *    detection, the disk-space check, `resolveBuildEnv`, or a malformed
+   *    drop.yaml.
+   *
+   * Synthesizes the open only when nothing is open, so a build that already
+   * reported its own failure isn't given a second, spurious episode. The
+   * `buildId` is not used for correlation (the tracker keys on app name), so a
+   * synthetic one is fine.
+   */
+  private failDeployEpisode(appName: string, error: Error): void {
+    try {
+      const tracker = getDeployTracker();
+      const buildId = `deploy-${appName}-${Date.now()}`;
+      if (!tracker.hasOpenEpisode(appName)) {
+        eventBus.publish('build:started', { appId: appName, buildId });
+      }
+      eventBus.publish('build:failed', { appId: appName, buildId, error });
+    } catch {
+      // Tracker not initialised (isolated tests) — observability only, never
+      // allowed to interfere with the failure being reported.
+    }
+  }
+
+  /**
+   * Close a build log stream. Never throws.
+   *
+   * Called from `finally` on both build paths, where a throw would replace the
+   * error actually being propagated with an unrelated logging failure. A no-op
+   * when the build log service is disabled or no log was opened.
+   */
+  private async closeBuildLog(logId: string | null, appName: string): Promise<void> {
+    if (!logId || !this.buildLogService) return;
+    try {
+      await this.buildLogService.finishBuild(logId, appName);
+    } catch (error) {
+      this.logger.warn(`Failed to close build log for ${appName}`, 'BUILD', error);
     }
   }
 
@@ -3604,9 +3682,11 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         });
       } finally {
         this.selfManagedUpdates.delete(appName);
-      }
-      if (updateLogId && this.buildLogService) {
-        await this.buildLogService.finishBuild(updateLogId, appName);
+        // Also in the finally: resolveBuildEnv/parseDropYaml above can throw,
+        // and the close used to sit after this block — so a throw leaked the
+        // log's write stream and skipped retention, exactly as on the fresh
+        // deploy path.
+        await this.closeBuildLog(updateLogId, appName);
       }
 
       if (!buildResult.success) {
@@ -3963,6 +4043,45 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       await fs.rm(appPath, { recursive: true, force: true });
     } catch {
       // Folder may already be gone
+    }
+
+    await this.purgeAppArtifacts(name, opts);
+  }
+
+  /**
+   * Remove the name-keyed artifacts that live OUTSIDE the app folder.
+   *
+   * Deleting an app frees its name, and all three of these are addressed by
+   * name, so leaving them behind hands the next registrant the previous
+   * tenant's data:
+   *  - `data/logs/webapps/<name>/` and `data/logs/builds/<name>/` —
+   *    `/logs/:name` and `/logs/:name/build[s]` authorize against the LIVE app
+   *    and then read by name (npm/pip output, `build_env` values, source
+   *    fragments, app stdout/stderr).
+   *  - `data/appdata/<name>/` — the app's `DROP_DATA_DIR`: SQLite files,
+   *    uploads, cached credentials, read-write to whoever gets the name next.
+   *
+   * Logs go unconditionally: `keepData` protects the user's DATA (database,
+   * Redis, and appdata), whereas logs are DROP-generated diagnostics about an
+   * app that no longer exists.
+   *
+   * Shared with `DELETE /apps/:name` through the platform-ops seam — that
+   * route runs its own inline teardown rather than calling `teardownApp`
+   * (which only `removeGroup` uses), so a fix applied here alone would miss
+   * essentially every real deletion. Best-effort; never throws.
+   */
+  async purgeAppArtifacts(name: string, opts: { keepData?: boolean } = {}): Promise<void> {
+    const targets = [
+      path.join(this.config.dropRoot, 'data', 'logs', 'webapps', name),
+      path.join(this.config.dropRoot, 'data', 'logs', 'builds', name),
+      ...(opts.keepData ? [] : [path.join(this.config.dropRoot, 'data', 'appdata', name)]),
+    ];
+    for (const dir of targets) {
+      try {
+        await fs.rm(dir, { recursive: true, force: true });
+      } catch (error) {
+        this.logger.warn(`Failed to remove ${dir}`, 'CLEANUP', error);
+      }
     }
   }
 

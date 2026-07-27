@@ -77,6 +77,23 @@ export interface PlatformOps {
    * children that were successfully removed.
    */
   removeGroup(groupName: string): Promise<{ removed: string[] }>;
+
+  /**
+   * Remove the name-keyed artifacts a deleted app leaves outside its own
+   * folder: `data/logs/webapps/<name>/`, `data/logs/builds/<name>/`, and —
+   * unless `keepData` — `data/appdata/<name>/`.
+   *
+   * Exists on the seam because only the platform knows `dropRoot`, while
+   * `DELETE /apps/:name` performs its own inline teardown and would otherwise
+   * leave all three behind. That matters because deletion FREES THE APP NAME:
+   * `/logs/:name` authorizes against the live app and then reads by name, and
+   * `DROP_DATA_DIR` is derived from the name, so whoever registers it next
+   * inherits the previous tenant's logs and persistent data.
+   *
+   * Best-effort and never throws — callers treat it as cleanup, not as part of
+   * the delete's success condition.
+   */
+  purgeAppArtifacts(appName: string, opts?: { keepData?: boolean }): Promise<void>;
 }
 
 let platformOps: PlatformOps | null = null;

@@ -68,7 +68,16 @@ export class BuilderService {
     const warnings: string[] = [];
     let outputPath: string | null = null;
 
-    // Check concurrent build limit
+    // Generate a build ID up front: the NO_STRATEGY path below needs it to
+    // report a failure, and it must match the one used for the rest of the run.
+    const buildId = `build-${context.appName}-${Date.now()}`;
+
+    // Check concurrent build limit.
+    // Deliberately emits NO events: this is a DEFERRAL, not a failure — the
+    // platform re-queues the app (see handleBuildApp's MAX_BUILDS branch) and
+    // the retry opens its own episode. Publishing build:started here would
+    // leave an episode that only ever derives as 'superseded', and publishing
+    // build:failed would report a queue wait as a failed deploy.
     if (this.activeBuilds.size >= this.config.maxConcurrentBuilds) {
       return this.createFailedResult(
         startedAt,
@@ -80,11 +89,31 @@ export class BuilderService {
     // Find appropriate strategy
     const strategy = this.findStrategy(context);
     if (!strategy) {
-      return this.createFailedResult(
-        startedAt,
-        [{ stage: 'pre-build', message: `No build strategy found for type: ${context.appType}`, code: 'NO_STRATEGY' }],
-        []
-      );
+      // Terminal failure, so it MUST open and close a deploy episode. Returning
+      // here without publishing left DeployTracker with nothing to correlate:
+      // the caller's later setAppStatus('errored') hit handleAppUpdated's
+      // orphan guard and no-opped, so no episode ever closed and every MCP
+      // deploy tool polled for its full wait budget (~120s) before reporting
+      // "still building". Reachable today: drop.yaml accepts `type: rust` and
+      // `type: php` (manifest.ts), neither of which has a build strategy.
+      eventBus.publish('build:started', {
+        appId: context.appName,
+        buildId,
+      });
+
+      const noStrategy: BuildError = {
+        stage: 'pre-build',
+        message: `No build strategy found for type: ${context.appType}`,
+        code: 'NO_STRATEGY',
+      };
+
+      eventBus.publish('build:failed', {
+        appId: context.appName,
+        buildId,
+        error: new Error(noStrategy.message),
+      });
+
+      return this.createFailedResult(startedAt, [noStrategy], []);
     }
 
     // Setup abort controller for cancellation
@@ -100,9 +129,6 @@ export class BuilderService {
       abortController,
     };
     this.activeBuilds.set(context.appName, activeBuild);
-
-    // Generate a build ID
-    const buildId = `build-${context.appName}-${Date.now()}`;
 
     // Emit build started event
     eventBus.publish('build:started', {
