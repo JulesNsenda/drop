@@ -696,9 +696,16 @@ auth.post('/agent-tokens', authMiddleware('user'), async (c) => {
   // everything via canAccess; anyone else only their own apps. A name that
   // does not resolve to a live app fails too — you cannot pre-grant against a
   // name you do not hold, which would otherwise be a way to claim one.
+  // The token's owner is the requester, so a scope must name an app the
+  // REQUESTER owns — not merely one they can reach. For everyone but an admin
+  // those are the same thing. For an admin they are not: canAccess passes on
+  // role, so an admin could mint app:<other-user's-app>:deploy and get back a
+  // 201 for a token that is rank-0 at check time and therefore fails
+  // canAccess forever. A credential that can never work is a footgun, not a
+  // grant.
   const check = assertMintable(body.scopes, (appName) => {
     const app = getStateManager().getApp(appName);
-    return !!app && canAccess(requester, app);
+    return !!app && canAccess(requester, app) && app.userId === requester?.userId;
   });
   if (!check.ok) {
     return c.json(error(ErrorCodes.VALIDATION_ERROR, check.reason ?? 'Invalid scopes'), 400);
@@ -731,6 +738,36 @@ auth.post('/agent-tokens', authMiddleware('user'), async (c) => {
     }),
     201
   );
+});
+
+/**
+ * DELETE /auth/agent-tokens/:id - revoke one of YOUR OWN agent tokens.
+ *
+ * Minting is gated at `user`, so revocation must be too. Without this a user
+ * who leaks a token has no kill switch at all: DELETE /auth/api-keys/:id is
+ * admin-only, and the expiry ceiling is a week. Creating a credential you
+ * cannot destroy is worse than not offering it.
+ *
+ * Deliberately narrow — it deletes only `kind: 'agent'` keys the caller owns,
+ * so it cannot become a back door to revoking someone else's key, or an
+ * admin's ordinary API key, from a `user` gate.
+ */
+auth.delete('/agent-tokens/:id', authMiddleware('user'), async (c) => {
+  const requester = (c.get as (k: string) => AuthContext | undefined)('auth');
+  const id = c.req.param('id');
+  if (!id) return c.json(error(ErrorCodes.VALIDATION_ERROR, 'Missing id'), 400);
+
+  const mine = listApiKeys().find(
+    (k) => k.id === id && k.kind === 'agent' && k.ownerUserId === requester?.userId
+  );
+  // One 404 for missing, foreign, and not-an-agent-token — no existence oracle
+  // over other people's key ids.
+  if (!mine) {
+    return c.json(error(ErrorCodes.NOT_FOUND, `No agent token found for '${id}'`), 404);
+  }
+
+  await deleteApiKey(id);
+  return c.json(success({ revoked: true }));
 });
 
 export default auth;

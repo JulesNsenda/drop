@@ -33,8 +33,14 @@ describe('parseAgentScope', () => {
     expect(parseAgentScope('app:myapp:read')?.verb).toBe('read');
   });
 
-  it('lower-cases the app name', () => {
-    expect(parseAgentScope('app:MyApp:deploy')?.appName).toBe('myapp');
+  it('preserves the app name EXACTLY, case included', () => {
+    // Names are case-sensitive here because the space they address is:
+    // APP_NAME_RE permits upper case and AppStateManager keys a plain Map.
+    // Folding disagreed with that in both directions — a scope for 'myapp'
+    // matched a different app named 'MyApp', while minting 'app:MyApp:deploy'
+    // folded to 'myapp', missed the lookup, and failed as "not yours" for an
+    // app the requester owned.
+    expect(parseAgentScope('app:MyApp:deploy')?.appName).toBe('MyApp');
   });
 
   it('requires EXACTLY three parts', () => {
@@ -87,9 +93,12 @@ describe('scopesAllow', () => {
     expect(scopesAllow(['app:myapp:deploy'], 'myapp', 'read')).toBe(false);
   });
 
-  it('matches across casing at both ends', () => {
-    expect(scopesAllow(['app:MyApp:deploy'], 'myapp', 'deploy')).toBe(true);
-    expect(scopesAllow(['app:myapp:deploy'], 'MyApp', 'deploy')).toBe(true);
+  it('does NOT match a differently-cased app name', () => {
+    // 'MyApp' and 'myapp' are two different apps as far as the state manager
+    // is concerned, so a scope for one must not reach the other.
+    expect(scopesAllow(['app:MyApp:deploy'], 'myapp', 'deploy')).toBe(false);
+    expect(scopesAllow(['app:myapp:deploy'], 'MyApp', 'deploy')).toBe(false);
+    expect(scopesAllow(['app:MyApp:deploy'], 'MyApp', 'deploy')).toBe(true);
   });
 
   it('ignores a malformed scope rather than trusting it', () => {
@@ -135,13 +144,21 @@ describe('assertMintable', () => {
     expect(assertMintable([SCOPE_APPS_CREATE], ALLOW_NONE).ok).toBe(true);
   });
 
-  it('normalizes and de-duplicates what it persists', () => {
-    // Two spellings of one grant must not become two stored scopes, or a
-    // revocation that removes one leaves the other.
-    const result = assertMintable(['app:MyApp:deploy', 'app:myapp:deploy'], ALLOW_ALL);
+  it('de-duplicates identical grants', () => {
+    // One grant repeated must not become two stored scopes, or a revocation
+    // that removes one leaves the other.
+    const result = assertMintable(['app:myapp:deploy', 'app:myapp:deploy'], ALLOW_ALL);
 
     expect(result.ok).toBe(true);
     expect(result.normalized).toEqual(['app:myapp:deploy']);
+  });
+
+  it('keeps two differently-cased names as DISTINCT grants', () => {
+    // They address different apps, so collapsing them would silently grant one
+    // of them authority it was never given.
+    const result = assertMintable(['app:MyApp:deploy', 'app:myapp:deploy'], ALLOW_ALL);
+
+    expect(result.normalized).toEqual(['app:MyApp:deploy', 'app:myapp:deploy']);
   });
 
   it('rejects an empty or non-array request', () => {

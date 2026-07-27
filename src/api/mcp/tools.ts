@@ -25,7 +25,8 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 
 import { AuthContext, getUserById } from '../middleware/auth';
-import { canAccess, canAccessScoped } from '../access';
+import { canAccessScoped } from '../access';
+import { scopesAllowCreate } from '../agent-scopes';
 import { isValidAppName } from '../middleware/validate';
 import { getStateManager } from '../../managers/app/state-manager';
 import { getAppRuntime } from '../../managers/runtime';
@@ -422,6 +423,25 @@ export async function handleDeployFromGit(
     return toolError('git CLI is not available on this server.');
   }
 
+  // SEC-5, the second door. This tool ALWAYS creates a new app
+  // (git-deploy.ts throws on an existing one), and it performed no scope check
+  // at all — only an app-count limit. So an agent token holding nothing but
+  // `app:something:read` could clone, build and RUN arbitrary code as its
+  // owner: the exact escalation the rank-0 admission gate was added to stop,
+  // arriving one tool over. Only apps:create is meaningful here, because the
+  // app being created has no name to have been granted.
+  if (auth?.role === 'none' && !scopesAllowCreate(auth.scopes)) {
+    return toolError('Creating a new app requires the apps:create scope.');
+  }
+
+  // A caller-supplied name reaches the git service, whose own regex is looser
+  // than isValidAppName — it admits '..' and leading dots. Containment today
+  // is accidental (an fs.access check happens to throw first), so validate it
+  // where the name enters rather than relying on that.
+  if (args.name && !isValidAppName(args.name)) {
+    return toolError(`Invalid app name: '${args.name}'`);
+  }
+
   // Per-user app limit — same policy as POST /git/deploy.
   if (auth?.userId && auth.role !== 'admin') {
     const maxApps = getAppLimit(auth.userId);
@@ -459,7 +479,7 @@ export function handleListApps(auth: AuthContext | undefined): CallToolResult {
   // never runnable apps — hidden here like in GET /apps.
   const apps = getStateManager()
     .getAllApps()
-    .filter(a => !a.isGroupContainer && canAccess(auth, a));
+    .filter(a => !a.isGroupContainer && canAccessScoped(auth, a, a.name, 'read'));
 
   if (apps.length === 0) {
     return toolText('No apps found.');
