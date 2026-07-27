@@ -565,6 +565,9 @@ export class ContainerManager implements AppRuntime {
       restarts: info.RestartCount ?? 0,
       createdAt,
       restartedAt,
+      // Authoritative when true. Docker clears it on the next run, so it is
+      // only observable while the container is down — see AppProcessInfo.
+      oomKilled: state.OOMKilled === true,
     };
   }
 
