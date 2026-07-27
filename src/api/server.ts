@@ -238,6 +238,10 @@ export class ApiServer {
     // token now, so bound it with the strict auth limiter. POST only, so admin
     // GET listing of users is not throttled. Registered unconditionally like the
     // login limiter above.
+    // Every mint appends to api-credentials.json and rewrites the whole file,
+    // which every later auth check must parse and scan linearly. Same strict
+    // bucket as the other credential-minting routes.
+    v1.use('/auth/agent-tokens', authRateLimitMiddleware());
     const usersCreateRateLimit = authRateLimitMiddleware();
     v1.use('/auth/users', (c, next) =>
       c.req.method === 'POST' ? usersCreateRateLimit(c, next) : next()

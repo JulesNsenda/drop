@@ -23,9 +23,14 @@
  * of `app:foo:deploy` authority over `foobar`, `foo-staging`, and every other
  * app whose name begins with `foo`.
  *
- * App names normalize to lower case at BOTH ends, so a scope minted for `Foo`
- * matches a request for `foo` and — more importantly — cannot be used to smuggle
- * a second, differently-cased grant past a de-duplication check.
+ * App names are NOT case-folded, because the name space they address is not:
+ * `APP_NAME_RE` permits upper case and `AppStateManager` keys a plain Map. An
+ * earlier version lowercased both ends, which disagreed with that space in two
+ * directions at once — a scope for `myapp` matched a genuinely different app
+ * named `MyApp` (over-grant), while minting `app:MyApp:deploy` normalized to
+ * `myapp`, missed the case-sensitive lookup and failed as "not yours" for an
+ * app the requester demonstrably owned (under-grant). Matching the name space
+ * exactly is the only version that is right in both directions.
  *
  * The `:` delimiter is safe because `APP_NAME_RE` excludes it, so a name can
  * never split into extra parts.
@@ -60,7 +65,7 @@ export function parseAgentScope(scope: string): ParsedAgentScope | null {
   if (parts.length !== 3) return null;
   if (parts[0] !== 'app') return null;
 
-  const appName = parts[1].toLowerCase();
+  const appName = parts[1];
   if (!isValidAppName(appName)) return null;
 
   const verb = parts[2];
@@ -78,7 +83,7 @@ export function normalizeAgentScope(scope: string): string | null {
 
 /** Build the canonical scope string for an app + verb. */
 export function agentScopeFor(appName: string, verb: AgentVerb): string {
-  return `app:${appName.toLowerCase()}:${verb}`;
+  return `app:${appName}:${verb}`;
 }
 
 /**

@@ -45,8 +45,17 @@ export function canAccessScoped(
   // A scope-only principal has NO role standing, so it can never satisfy
   // canAccess below. Its entire authority is the exact scope match — and it
   // must ALSO own the app, so a scope that outlived a transfer grants nothing.
+  //
+  // `kind === 'agent'` is checked HERE as well as at the MCP gate, so both
+  // halves of the SEC-5 pair live at the authorization boundary rather than
+  // relying on admission having been strict. Containment would otherwise rest
+  // on facts outside this file — that GRANTABLE_API_SCOPES stays a closed
+  // allowlist, and that no scoped boundary is ever mounted behind a role-less
+  // gate. Either could change without anyone touching this line.
   if (auth?.role === 'none') {
-    return scopesAllow(auth.scopes, appName, verb) && canAccess(auth, app);
+    return (
+      auth.kind === 'agent' && scopesAllow(auth.scopes, appName, verb) && canAccess(auth, app)
+    );
   }
   return canAccess(auth, app);
 }
