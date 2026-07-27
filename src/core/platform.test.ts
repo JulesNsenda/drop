@@ -3769,6 +3769,26 @@ describe('Step 7 — deploy guardrail at the choke points', () => {
     expect(buildSpy).toHaveBeenCalled();
   });
 
+  it('classifies a refusal as GUARDRAIL_TRIPPED, not PREBUILD_FAILED', async () => {
+    // A refusal shares the 'pre-build' stage with real pre-build failures, so
+    // without its own code it derives PREBUILD_FAILED — whose hint sends the
+    // caller to check detection, the environment and drop.yaml, none of which
+    // is wrong. Nothing was attempted at all.
+    //
+    // Asserted on the call rather than on the published event: failDeployEpisode
+    // swallows a missing deploy-tracker by design, so a bus assertion here would
+    // depend on whether some other test had torn the tracker down.
+    (platform.getStateManager()!.getApp as jest.Mock).mockReturnValue(undefined);
+    const failSpy = jest.spyOn(platform as any, 'failDeployEpisode');
+    for (let i = 0; i < 5; i++) await attempt();
+    failSpy.mockClear();
+
+    await attempt();
+
+    expect(failSpy).toHaveBeenCalledTimes(1);
+    expect(failSpy.mock.calls[0][3]).toBe('GUARDRAIL_TRIPPED');
+  });
+
   it('gates the MONOREPO container re-expansion, which returns above the normal gate', async () => {
     // expandMonorepo is one of the most expensive things on the box — a git
     // pull plus an fs.rm/fs.cp of every child tree plus a build per service —
