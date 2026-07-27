@@ -49,6 +49,13 @@ import { WebhookManager, getWebhookManager, resetWebhookManager } from './webhoo
 import { GitDeployService, getGitDeployService, resetGitDeployService } from './git-deploy';
 import { UploadDeployService, getUploadDeployService, resetUploadDeployService } from './upload-deploy';
 import { getActivityLog, resetActivityLog } from '../managers/activity';
+import { tryLogActivity } from '../managers/activity';
+import {
+  findOverCeiling,
+  toMb,
+  configuredCeilingBytes,
+  DISK_SWEEP_INTERVAL_MS,
+} from '../managers/guardrail/disk-ceiling';
 import {
   getDeployBreaker,
   guardrailKeysFor,
@@ -595,6 +602,8 @@ export class DropPlatform {
   private apiServer: ApiServer | null = null;
   private buildLogService: BuildLogService | null = null;
   private logRetention: LogRetentionService | null = null;
+  /** Periodic per-app disk accounting (Step 8c). */
+  private diskSweepTimer: NodeJS.Timeout | null = null;
 
   private subscriptions: Unsubscribe[] = [];
   // Held separately from `subscriptions`: must stay subscribed through
@@ -741,6 +750,7 @@ export class DropPlatform {
         this.config.logRetentionDays
       );
       this.logRetention.start();
+      this.startDiskCeilingSweep();
 
       // Initialize services
       await this.initializeServices();
@@ -818,6 +828,11 @@ export class DropPlatform {
       this.buildDrainTimer = null;
     }
     this.pendingBuilds.clear();
+
+    if (this.diskSweepTimer) {
+      clearInterval(this.diskSweepTimer);
+      this.diskSweepTimer = null;
+    }
 
     // Stop the log-retention sweep
     if (this.logRetention) {
@@ -4829,6 +4844,87 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     }, 30_000);
     interval.unref?.();
     this.crashLoopWatchers.set(appName, interval);
+  }
+
+  /**
+   * Periodic per-app disk accounting (Step 8c).
+   *
+   * Its own timer rather than riding the log-retention sweep: that one runs
+   * DAILY, and a day of unchecked growth is most of a disk. Hourly bounds the
+   * overshoot to what an app can write in an hour.
+   */
+  private startDiskCeilingSweep(): void {
+    if (this.diskSweepTimer) return;
+    if (configuredCeilingBytes() <= 0) {
+      this.logger.debug('Disk ceiling disabled (DROP_MAX_APP_DISK_MB=0)', 'DISK');
+      return;
+    }
+    void this.sweepDiskCeiling();
+    this.diskSweepTimer = setInterval(() => void this.sweepDiskCeiling(), DISK_SWEEP_INTERVAL_MS);
+    this.diskSweepTimer.unref?.();
+  }
+
+  /**
+   * Measure every app and park the ones over their ceiling.
+   *
+   * PARK = stop + an explicit reason, never a delete. The whole point is to
+   * stop growth while leaving the evidence — and the data — in place for an
+   * operator to look at. A ceiling that deleted would turn a misconfigured
+   * limit into data loss.
+   */
+  private async sweepDiskCeiling(): Promise<void> {
+    if (!this.stateManager || !this.runtime) return;
+    try {
+      const apps = this.stateManager.getAllApps().filter((a) => !a.isGroupContainer);
+      const targets = apps.map((app) => ({
+        name: app.name,
+        // Both trees the app can grow: its own source/build output, and its
+        // persistent data dir. Logs are excluded — those are DROP-generated and
+        // already bounded by log retention, and charging an app for DROP's own
+        // diagnostics would park apps for being verbose.
+        paths: [
+          app.path,
+          path.join(this.config.dropRoot, 'data', 'appdata', app.name),
+        ],
+        maxDiskMb: this.appConfigService?.getConfig(app.name)?.maxDiskMb,
+      }));
+
+      const over = await findOverCeiling(targets);
+      for (const verdict of over) {
+        const app = this.stateManager.getApp(verdict.name);
+        // Only a LIVE app is worth stopping. Parking something already stopped
+        // would rewrite its reason on every sweep and bury the real one.
+        if (!app || (app.status !== 'running' && app.status !== 'crash-looping')) continue;
+
+        const reason =
+          `Over its disk ceiling: ${toMb(verdict.bytes)} MB used of ` +
+          `${toMb(verdict.ceilingBytes)} MB allowed` +
+          (verdict.truncated ? ' (measured tree was truncated, so usage is at least this)' : '');
+        this.logger.warn(`Parking ${verdict.name} — ${reason}`, 'DISK');
+
+        this.stopHealthProber(verdict.name);
+        this.stopCrashLoopWatch(verdict.name);
+        try {
+          await this.runtime.stop(verdict.name);
+        } catch {
+          // Already down, or the runtime is unhappy. Record the park anyway —
+          // the operator still needs to know why, and a stop that failed is not
+          // a reason to leave the reason unwritten.
+        }
+        await this.stateManager.setAppStatus(verdict.name, 'stopped', { parkedReason: reason });
+        await tryLogActivity({
+          action: 'disk-park',
+          appName: verdict.name,
+          userId: app.userId,
+          detail: reason,
+        });
+      }
+    } catch (err) {
+      this.logger.debug(
+        `Disk ceiling sweep failed: ${err instanceof Error ? err.message : 'unknown'}`,
+        'DISK'
+      );
+    }
   }
 
   private stopCrashLoopWatch(appName: string): void {
