@@ -213,28 +213,37 @@ export class AppStateManager {
     const existing = this.apps.get(name);
 
     const app: AppState = {
+      // MERGE over `existing`, do not rebuild from a literal.
+      //
+      // This used to be a literal naming ~12 fields, which meant every field
+      // NOT named was silently dropped. registerApp runs for every app on
+      // every boot (syncStateWithConfigs), so a dropped field is lost on each
+      // restart — and each new AppState field inherits the trap. It cost
+      // `readinessUnverified` its entire purpose (written at deploy, destroyed
+      // unread on the next boot) before this was noticed, and it was already
+      // silently dropping `missingSecrets`, `group`, `isGroupContainer`,
+      // `customDomain` and `error` in shipped code.
+      //
+      // Preserve-by-default. The overrides below are the only fields
+      // registerApp genuinely owns.
+      ...existing,
       name,
       type,
-      // Preserve 'stopped' status so user-stopped apps don't auto-restart
-      status: existing?.status === 'stopped' ? 'stopped' : 'pending',
       path: appPath,
-      framework,
+      // The caller's value wins when it has one; otherwise keep what detection
+      // previously established rather than blanking it.
+      framework: framework ?? existing?.framework,
       hostname: `${name}.localhost`,
       createdAt: existing?.createdAt || now,
       updatedAt: now,
-      // Preserve important fields from existing state (for restart scenarios)
-      port: existing?.port,
-      lastDeployedAt: existing?.lastDeployedAt,
-      // registerApp REBUILDS AppState from a literal, so anything not named
-      // here is dropped. syncStateWithConfigs calls it for every config before
-      // reconcileAppsOnBoot reads state, so omitting this made the readiness
-      // flag write-only: set at deploy, destroyed unread on the next boot.
-      // (The same rebuild silently drops missingSecrets/group/customDomain —
-      // a real pre-existing bug; this literal wants to become a merge.)
-      readinessUnverified: existing?.readinessUnverified,
-      buildDuration: existing?.buildDuration,
-      gitSource: existing?.gitSource,
-      userId: existing?.userId,
+      // Preserve 'stopped' status so user-stopped apps don't auto-restart.
+      // Everything else resets: this app is about to be (re)deployed.
+      status: existing?.status === 'stopped' ? 'stopped' : 'pending',
+      // No process is claimed yet — status has just reset to 'pending', so a
+      // pid carried from the previous run would name a process this entry no
+      // longer stands behind. syncStateWithProcesses re-establishes it.
+      // (Same as the old behaviour, which dropped it; now it is deliberate.)
+      pid: undefined,
     };
 
     this.apps.set(name, app);
