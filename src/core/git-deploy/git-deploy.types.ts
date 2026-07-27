@@ -40,6 +40,9 @@ export interface GitDeployRequest {
   principalId?: string;
   /** See UploadDeployRequest.agentCaller — server-derived, first creation only. */
   agentCaller?: boolean;
+  /** See UploadDeployRequest.ephemeral. */
+  ephemeral?: boolean;
+  ttlMinutes?: number;
 }
 
 /** API request to store a GitHub token */

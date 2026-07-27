@@ -23,6 +23,10 @@ export interface UploadDeployRequest {
    * is new; a redeploy never changes it (SEC-11).
    */
   agentCaller?: boolean;
+  /** Create as a throwaway app that reaps itself (Step 10). */
+  ephemeral?: boolean;
+  /** Requested lifetime; clamped by DROP_MAX_EPHEMERAL_TTL_MIN. */
+  ttlMinutes?: number;
 }
 
 /**
