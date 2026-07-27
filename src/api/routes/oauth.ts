@@ -15,6 +15,7 @@
  * mounted externally in server.ts.
  */
 
+import { randomUUID } from 'crypto';
 import { Hono, type Context } from 'hono';
 import { success, error, ErrorCodes } from '../types';
 import { ValidationError } from '../middleware/error';
@@ -261,8 +262,12 @@ oauth.post('/token', async (c) => {
     const user = getUserById(record.userId) as User | null;
     if (!user) return tokenError('invalid_grant', 'User no longer exists');
 
-    const accessToken = await mintOAuthAccessToken(user, record.resource);
-    const refreshToken = await issueRefreshToken(user.id, record.clientId);
+    // One sid per GRANT, minted here at code exchange and carried through every
+    // later refresh. This is the stable half of principalId: without it the
+    // principal would change every 15 minutes when the access token rotates.
+    const sid = randomUUID();
+    const accessToken = await mintOAuthAccessToken(user, record.resource, sid);
+    const refreshToken = await issueRefreshToken(user.id, record.clientId, sid);
 
     c.header('Cache-Control', 'no-store');
     return c.json({
@@ -286,8 +291,20 @@ oauth.post('/token', async (c) => {
 
     const user = getUserById(rotated.userId) as User | null;
     if (!user) return tokenError('invalid_grant', 'User no longer exists');
+    // Existence is not enough. verifyApiKey has rejected a disabled owner
+    // since DROP-075; this path never did, so suspending a user blocked their
+    // login and purged their keys while their OAuth grant kept refreshing
+    // forever. Same rule, same reason.
+    if (user.enabled === false) {
+      return tokenError('invalid_grant', 'Account is disabled');
+    }
 
-    const accessToken = await mintOAuthAccessToken(user, getMcpResourceUrl(publicUrl));
+    // rotated.sid, NOT a fresh one — the grant's identity survives the refresh.
+    const accessToken = await mintOAuthAccessToken(
+      user,
+      getMcpResourceUrl(publicUrl),
+      rotated.sid
+    );
 
     c.header('Cache-Control', 'no-store');
     return c.json({
