@@ -28,6 +28,21 @@
 import type { BuildStage } from '../../core/builder/builder.types';
 import type { DeployFailurePhase, DeployFailureReason } from '../../core/event-bus/event-bus.types';
 
+/**
+ * Where this deploy's runtime output starts.
+ *
+ * Runtime log files are per-app and per-DAY (`<app>-YYYY-MM-DD-{out,err}.log`),
+ * shared by every deploy that day, so a file path alone cannot identify one
+ * deploy's output. The byte offset recorded immediately before the process
+ * started is what separates this deploy's lines from the previous one's.
+ */
+export interface RuntimeLogOffsets {
+  outFile: string;
+  errFile: string;
+  outStartOffset: number;
+  errStartOffset: number;
+}
+
 export interface DeployDetail {
   deployId: string;
   appName: string;
@@ -48,6 +63,11 @@ export interface DeployDetail {
   command?: string;
   /** Boot phase only: closed-set category from deploy:failed. */
   reason?: DeployFailureReason;
+  /**
+   * Where to start reading this deploy's runtime output. Absent for a build
+   * failure — nothing was ever started, so there is no runtime log.
+   */
+  runtimeLog?: RuntimeLogOffsets;
   createdAt: string;
 }
 
