@@ -77,6 +77,82 @@ describe('DropPlatform readiness gate (M3)', () => {
       }
     });
 
+    it('reports OOM as its own verdict, not as a generic exit', async () => {
+      // `container-manager` read State.OOMKilled and discarded it, so an app
+      // killed for exceeding its memory limit was indistinguishable from one
+      // that crashed on a bug. The two need opposite fixes — raise the ceiling
+      // vs fix the code — so an agent given PROCESS_EXITED debugs the wrong
+      // thing.
+      const getStatus = jest
+        .fn()
+        .mockResolvedValueOnce({ status: 'running', restarts: 0 })
+        .mockResolvedValue({ status: 'errored', restarts: 0, oomKilled: true });
+      (platform as any).runtime = { getStatus };
+
+      const result = await (platform as any).awaitReadiness(
+        'fatapp',
+        48110,
+        minimalSpec({ name: 'fatapp', port: 48110, limits: { memory: '256M' } })
+      );
+
+      expect(result.ok).toBe(false);
+      expect(result.failure).toBe('oom-killed');
+    });
+
+    it('names the configured limit, so the verdict is actionable', async () => {
+      const getStatus = jest
+        .fn()
+        .mockResolvedValueOnce({ status: 'running', restarts: 0 })
+        .mockResolvedValue({ status: 'errored', restarts: 0, oomKilled: true });
+      (platform as any).runtime = { getStatus };
+
+      const result = await (platform as any).awaitReadiness(
+        'fatapp',
+        48111,
+        minimalSpec({ name: 'fatapp', port: 48111, limits: { memory: '256M' } })
+      );
+
+      expect(result.reason).toContain('256M');
+    });
+
+    it('still reports a plain exit when the runtime did NOT confirm an OOM', async () => {
+      // The flag is authoritative only when true. PM2 leaves it undefined
+      // entirely, and Docker clears it on the next run — so a false must never
+      // be read as "definitely not memory", nor a crash reported as OOM.
+      const getStatus = jest
+        .fn()
+        .mockResolvedValueOnce({ status: 'running', restarts: 0 })
+        .mockResolvedValue({ status: 'errored', restarts: 0 });
+      (platform as any).runtime = { getStatus };
+
+      const result = await (platform as any).awaitReadiness(
+        'plainapp',
+        48112,
+        minimalSpec({ name: 'plainapp', port: 48112, limits: { memory: '256M' } })
+      );
+
+      expect(result.failure).toBe('process-exited');
+    });
+
+    it('does not claim OOM for a crash-loop, where the flag has already been cleared', async () => {
+      // Docker's RestartPolicy is on-failure, so a container that is back up
+      // after an OOM reports OOMKilled=false. Guessing there would be an
+      // inference dressed as a fact.
+      const getStatus = jest
+        .fn()
+        .mockResolvedValueOnce({ status: 'running', restarts: 0 })
+        .mockResolvedValue({ status: 'running', restarts: 5, oomKilled: false });
+      (platform as any).runtime = { getStatus };
+
+      const result = await (platform as any).awaitReadiness(
+        'loopapp',
+        48113,
+        minimalSpec({ name: 'loopapp', port: 48113, limits: { memory: '256M' } })
+      );
+
+      expect(result.failure).toBe('crash-looped');
+    });
+
     it('fails fast with a crash-loop reason once restarts climb above the baseline', async () => {
       // First call (the baseline read, before the poll loop starts) reports 0
       // restarts; every subsequent call (inside the poll loop) reports a
@@ -212,6 +288,68 @@ describe('DropPlatform readiness gate (M3)', () => {
       );
 
       (platform as any).stopCrashLoopWatch('flappy');
+    });
+
+    it('says OOM in the flag when the runtime confirms it, not "restarting repeatedly"', async () => {
+      // The two need opposite fixes. "Process is restarting repeatedly" sends
+      // an operator hunting a crash bug; the actual fix is a bigger ceiling.
+      jest.useFakeTimers();
+      let restarts = 0;
+      let oomKilled = false;
+      (platform as any).runtime = {
+        getStatus: jest.fn().mockImplementation(async () => ({
+          status: 'running',
+          restarts,
+          oomKilled,
+        })),
+      };
+      const setAppStatus = jest.fn().mockResolvedValue(undefined);
+      (platform as any).stateManager = {
+        getApp: jest.fn().mockReturnValue({ status: 'running' }),
+        setAppStatus,
+      };
+
+      (platform as any).startCrashLoopWatch('fatty');
+      await jest.advanceTimersByTimeAsync(30_000); // baseline
+
+      restarts = 3;
+      oomKilled = true; // a tick that caught it down, before Docker cleared it
+      await jest.advanceTimersByTimeAsync(30_000);
+
+      expect(setAppStatus).toHaveBeenCalledWith(
+        'fatty',
+        'crash-looping',
+        expect.objectContaining({ error: expect.stringMatching(/memory limit/i) })
+      );
+
+      (platform as any).stopCrashLoopWatch('fatty');
+    });
+
+    it('does not claim OOM when the runtime never confirmed one', async () => {
+      jest.useFakeTimers();
+      let restarts = 0;
+      (platform as any).runtime = {
+        getStatus: jest.fn().mockImplementation(async () => ({ status: 'running', restarts })),
+      };
+      const setAppStatus = jest.fn().mockResolvedValue(undefined);
+      (platform as any).stateManager = {
+        getApp: jest.fn().mockReturnValue({ status: 'running' }),
+        setAppStatus,
+      };
+
+      (platform as any).startCrashLoopWatch('plain');
+      await jest.advanceTimersByTimeAsync(30_000);
+
+      restarts = 3;
+      await jest.advanceTimersByTimeAsync(30_000);
+
+      expect(setAppStatus).toHaveBeenCalledWith(
+        'plain',
+        'crash-looping',
+        expect.objectContaining({ error: expect.not.stringMatching(/memory limit/i) })
+      );
+
+      (platform as any).stopCrashLoopWatch('plain');
     });
 
     it('does not flag a stable (non-climbing) app', async () => {
