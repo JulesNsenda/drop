@@ -58,6 +58,7 @@ import { getPlatformVersion } from '../../utils/version';
 import { tryLogActivity } from '../../managers/activity';
 import { DeployRefusedError } from '../../managers/guardrail/deploy-breaker';
 import { QuotaExceededError } from '../../managers/guardrail/principal-quota';
+import { ephemeralAppName, EphemeralQuotaError } from '../../managers/guardrail/ephemeral';
 
 /** ≤48 files per deploy_files call. */
 export const DEPLOY_FILES_MAX_FILES = 48;
@@ -352,18 +353,33 @@ function validateStagedRelativePath(stagingDir: string, candidate: string): Stag
 interface DeployFilesArgs {
   name: string;
   files: Array<{ path: string; content: string }>;
+  ephemeral?: boolean;
+  ttl_minutes?: number;
 }
 
 export async function handleDeployFiles(
   auth: AuthContext | undefined,
   args: DeployFilesArgs
 ): Promise<CallToolResult> {
-  const { name, files } = args;
+  const { files } = args;
+  let name = args.name;
 
   if (!isValidAppName(name)) {
     return toolError(
       `Invalid app name '${name}': must be 1-64 alphanumeric characters, hyphens, or underscores.`
     );
+  }
+
+  // An ephemeral always gets a fresh randomised name. Reusing the caller's name
+  // verbatim would let `ephemeral: true` attach a self-deleting deadline to an
+  // EXISTING app — deleting someone's real app on a timer — and it would make
+  // repeat calls collide instead of producing independent scratch deploys.
+  if (args.ephemeral) {
+    const generated = ephemeralAppName(name);
+    if (!generated) {
+      return toolError('Could not generate a valid ephemeral app name. Try a shorter name.');
+    }
+    name = generated;
   }
   if (!Array.isArray(files) || files.length === 0) {
     return toolError('files must be a non-empty array.');
@@ -427,6 +443,8 @@ export async function handleDeployFiles(
       principalId: auth?.principalId,
       // Derived from the credential, never from tool input.
       agentCaller: auth?.kind === 'agent',
+      ephemeral: args.ephemeral === true,
+      ttlMinutes: args.ttl_minutes,
     });
 
     // Logged on ACCEPTANCE, not on outcome: a deploy that was started matters
@@ -442,9 +460,13 @@ export async function handleDeployFiles(
     if (err instanceof UploadValidationError || err instanceof InsufficientDiskSpaceError) {
       return toolError(err.message);
     }
-    if (err instanceof DeployRefusedError || err instanceof QuotaExceededError) {
-      // The message already names the wait, so an agent has something to act
-      // on rather than a bare failure it will immediately retry.
+    if (
+      err instanceof DeployRefusedError ||
+      err instanceof QuotaExceededError ||
+      err instanceof EphemeralQuotaError
+    ) {
+      // The message already names the wait or the limit, so an agent has
+      // something to act on rather than a bare failure it will retry at once.
       return toolError(err.message);
     }
     return toolError(
@@ -807,6 +829,19 @@ export function buildMcpServer(auth: AuthContext | undefined): McpServer {
           )
           .describe(
             `Files to deploy (max ${DEPLOY_FILES_MAX_FILES} files, ${(DEPLOY_FILES_MAX_TOTAL_BYTES / (1024 * 1024)).toFixed(1)} MB summed content).`
+          ),
+        ephemeral: z
+          .boolean()
+          .optional()
+          .describe(
+            'Create a THROWAWAY app that deletes itself when its lifetime runs out, including its database. ' +
+              'The app gets a randomised name so it never collides with an existing one. Use for a scratch test, never for anything you want to keep.'
+          ),
+        ttl_minutes: z
+          .number()
+          .optional()
+          .describe(
+            'Lifetime of an ephemeral app in minutes (default 60). Clamped to the platform maximum; ignored unless `ephemeral` is true.'
           ),
       },
     },

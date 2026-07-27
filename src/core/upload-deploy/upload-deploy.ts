@@ -28,6 +28,11 @@ import { getLogger } from '../../utils/logger';
 import { hasEnoughDisk, getMinFreeDiskMb } from '../../utils/disk';
 import { eventBus } from '../event-bus';
 import { admitDeploy } from '../../managers/guardrail/deploy-breaker';
+import {
+  checkEphemeralQuota,
+  resolveTtlMinutes,
+  EphemeralQuotaError,
+} from '../../managers/guardrail/ephemeral';
 
 const logger = getLogger();
 
@@ -59,7 +64,8 @@ export class UploadDeployService {
 
   /** Deploy (or redeploy) an app from an already-staged tarball. */
   async deploy(request: UploadDeployRequest): Promise<UploadDeployResult> {
-    const { appName, archivePath, userId, principalId, agentCaller } = request;
+    const { appName, archivePath, userId, principalId, agentCaller, ephemeral, ttlMinutes } =
+      request;
 
     if (!isValidAppName(appName)) {
       throw new UploadValidationError(`Invalid app name: ${appName}`);
@@ -88,6 +94,27 @@ export class UploadDeployService {
     try {
       const existingApp = getStateManager().getApp(appName);
       await admitDeploy(appName, !existingApp, { principalId, actorUserId: userId });
+
+      // Ephemeral quota, checked here for the same reason the guardrail is:
+      // everything below extracts and lands files, and a refusal afterwards
+      // would not undo that. Only for a NEW app — a redeploy occupies no
+      // additional slot.
+      if (ephemeral && !existingApp) {
+        const configs = getAppConfigService().getAllConfigs();
+        const verdict = checkEphemeralQuota(
+          configs
+            .filter((c) => c.ephemeral)
+            .map((c) => ({
+              name: c.name,
+              principalId: c.ephemeralPrincipalId,
+              userId: getStateManager().getApp(c.name)?.userId,
+              expiresAt: c.expiresAt ?? '',
+            })),
+          { principalId, userId },
+          Date.now()
+        );
+        if (!verdict.allowed) throw new EphemeralQuotaError(verdict.reason ?? 'Quota exceeded');
+      }
     } catch (err) {
       this.activeUploads.delete(appName);
       throw err;
@@ -134,6 +161,17 @@ export class UploadDeployService {
         // otherwise flag it permanently.
         if (agentCaller) {
           await getAppConfigService().updateConfig(appName, { agentCreated: true });
+        }
+        if (ephemeral) {
+          const ttl = resolveTtlMinutes(ttlMinutes);
+          await getAppConfigService().updateConfig(appName, {
+            ephemeral: true,
+            expiresAt: new Date(Date.now() + ttl * 60_000).toISOString(),
+            ephemeralPrincipalId: principalId,
+            // An ephemeral is by definition agent-scale throwaway work, so it
+            // is reapable on idleness too — not only on its deadline.
+            agentCreated: true,
+          });
         }
       }
 
