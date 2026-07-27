@@ -27,6 +27,7 @@
 
 import type { BuildStage } from '../../core/builder/builder.types';
 import type { DeployFailurePhase, DeployFailureReason } from '../../core/event-bus/event-bus.types';
+import type { DeployErrorCode } from './deploy-error-code';
 
 /**
  * Where this deploy's runtime output starts.
@@ -55,6 +56,12 @@ export interface DeployDetail {
   userId?: string;
   /** Which phase the deploy died in. */
   phase: 'build' | 'boot';
+  /**
+   * Closed-union cause, derived from DROP-generated signals only — never
+   * pattern-matched out of process output. `UNKNOWN` is a first-class member:
+   * a miss must not change the verdict.
+   */
+  errorCode: DeployErrorCode;
   /** Build phase only: the stage that failed (from build:failed). */
   stage?: BuildStage;
   /** Build phase only: exit code of the failing command, when it reported one. */
@@ -90,3 +97,4 @@ export interface DeployDetail {
 }
 
 export type { DeployFailurePhase, DeployFailureReason };
+export type { DeployErrorCode } from './deploy-error-code';

@@ -37,6 +37,7 @@ import type {
 } from '../../core/event-bus';
 import type { DeployFailedPayload } from '../../core/event-bus/event-bus.types';
 import type { DeployDetail, RuntimeLogOffsets } from './deploy-detail.types';
+import { deriveErrorCode } from './deploy-error-code';
 
 /**
  * Cap. Lower than DeployTracker's 1000 rows because a detail is only written
@@ -165,6 +166,11 @@ export class DeployDetailStore {
       appName,
       userId: this.snapshotUserId(appName),
       phase: 'build',
+      errorCode: deriveErrorCode({
+        phase: 'build',
+        stage: payload.stage,
+        builderCode: payload.code,
+      }),
       stage: payload.stage,
       exitCode: payload.exitCode,
       command: payload.command,
@@ -185,6 +191,7 @@ export class DeployDetailStore {
       appName,
       userId: this.snapshotUserId(appName),
       phase: 'boot',
+      errorCode: deriveErrorCode({ phase: 'boot', reason: payload.reason }),
       reason: payload.reason,
       runtimeLog: this.pendingRuntimeLog.get(appName),
       createdAt: payload.timestamp.toISOString(),

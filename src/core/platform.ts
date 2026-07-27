@@ -10,6 +10,7 @@ import * as fs from 'fs/promises';
 import * as yaml from 'yaml';
 import * as crypto from 'crypto';
 import { EventBus, eventBus, Unsubscribe, AppDeletedPayload, AppDetectedPayload } from './event-bus';
+import type { DeployFailureReason } from './event-bus/event-bus.types';
 import { WatcherService } from './watcher';
 // Imported from the concrete file, NOT the './watcher' barrel: several test
 // suites mock './watcher' wholesale (only exporting WatcherService), and this
@@ -3283,7 +3284,11 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         eventBus.publish('deploy:failed', {
           appId: appName,
           phase: 'boot',
-          reason: 'readiness-failed',
+          // The category, not readiness.reason — that string is diagnostic
+          // text and must not reach a persisted record. Defaults to
+          // 'process-exited' only because every !ok path sets one today; the
+          // fallback exists so a future branch cannot publish undefined.
+          reason: readiness.failure ?? 'process-exited',
         });
         if (this.stateManager) {
           await this.stateManager.setAppStatus(appName, 'errored', {
@@ -4418,7 +4423,17 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     appName: string,
     port: number,
     spec: AppStartSpec
-  ): Promise<{ ok: boolean; reason?: string; warning?: string }> {
+  ): Promise<{
+    ok: boolean;
+    reason?: string;
+    /**
+     * DROP-generated category for the failure, alongside the human `reason`
+     * string. Consumers must key on this, never parse `reason` — that text is
+     * diagnostic and free to change.
+     */
+    failure?: DeployFailureReason;
+    warning?: string;
+  }> {
     if (!this.runtime) return { ok: true };
     const windowMs = this.readinessTimeoutMs;
     const isDocker = this.config.isolation === 'docker';
@@ -4439,8 +4454,14 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     // process dies or crash-loops.
     while (Date.now() - start < windowMs) {
       const l = await liveness();
-      if (l.dead) return { ok: false, reason: 'process exited during startup' };
-      if (l.crashed) return { ok: false, reason: 'process crash-looped during startup' };
+      if (l.dead)
+        return { ok: false, reason: 'process exited during startup', failure: 'process-exited' };
+      if (l.crashed)
+        return {
+          ok: false,
+          reason: 'process crash-looped during startup',
+          failure: 'crash-looped',
+        };
       if (await probePort('127.0.0.1', port, 1000)) {
         const r = await probeHttp('127.0.0.1', port, healthPath, 3000);
         if (r.responded) return { ok: true };
@@ -4450,8 +4471,10 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
 
     // Window elapsed with no HTTP success — classify the (stable) process.
     const l = await liveness();
-    if (l.dead) return { ok: false, reason: 'process exited during startup' };
-    if (l.crashed) return { ok: false, reason: 'process crash-looped during startup' };
+    if (l.dead)
+      return { ok: false, reason: 'process exited during startup', failure: 'process-exited' };
+    if (l.crashed)
+      return { ok: false, reason: 'process crash-looped during startup', failure: 'crash-looped' };
     const bound = await probePort('127.0.0.1', port, 1000);
     if (!bound && !spec.healthCheckPath) return { ok: true }; // worker: no port, no health check
     if (bound && !isDocker) return { ok: true }; // PM2: a bind proves it's listening
