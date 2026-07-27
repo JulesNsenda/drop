@@ -3273,11 +3273,19 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       // as available the instant runtime.start()/readiness settles.
       void this.recordDeploySignature(appName, appPath);
 
-      // Update state to running with port and pid
+      // Update state to running with port and pid.
+      //
+      // readinessUnverified is passed EXPLICITLY as a boolean, never omitted:
+      // this is the one path where the readiness gate actually ran, so it is
+      // the only path entitled to assert a verdict either way. Passing `false`
+      // on a clean pass is load-bearing — it clears a flag left by an earlier
+      // unverified deploy. The ungated paths (handleAppUpdate, restartApp)
+      // deliberately pass nothing at all.
       if (this.stateManager) {
         await this.stateManager.setAppStatus(appName, 'running', {
           port,
           pid: status.pid ?? undefined,
+          readinessUnverified: Boolean(readiness.warning),
         });
       }
 
@@ -4329,6 +4337,17 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
    * before the in-container app listens), so in docker mode the HTTP probe is
    * required; in PM2 mode a bind is sufficient (lenient for slow-booting apps).
    * Never throws.
+   *
+   * SCOPE of the `{ ok: true, warning }` branch — narrower than it looks, and
+   * the reason AppState.readinessUnverified does not catch every wrong-port
+   * app. It is reachable only for:
+   *   - docker + port bound + no HTTP answer, or
+   *   - a declared `healthCheckPath` whose port never bound.
+   * Under PM2 with no declared health check, an app listening on the WRONG
+   * port hits the background-worker exemption above and resolves to a plain
+   * `{ ok: true }` with no warning at all — so it is reported as verified.
+   * Any test asserting wrong-port detection must therefore run in docker mode
+   * or declare a healthCheck, or it asserts nothing.
    */
   private async awaitReadiness(
     appName: string,
