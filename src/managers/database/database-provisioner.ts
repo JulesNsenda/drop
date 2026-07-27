@@ -253,7 +253,16 @@ export class DatabaseProvisioner {
    * See docs/plans/2026-07-07-dump-then-drop-on-delete.md.
    */
   async backupAndDeleteAppDatabase(
-    appName: string
+    appName: string,
+    /**
+     * Skip the pre-delete dump.
+     *
+     * For an EPHEMERAL app only: its data is throwaway by construction, and
+     * dumping every scratch database on the way out would fill the box with
+     * backups nobody will ever read. Never set for an ordinary app — the dump
+     * is the only thing standing between a mistaken delete and data loss.
+     */
+    opts: { skipBackup?: boolean } = {}
   ): Promise<{ dropped: boolean; reason?: string; dumpPath?: string }> {
     const provisioned = this.provisionedDatabases.get(appName);
     if (!provisioned) {
@@ -281,7 +290,7 @@ export class DatabaseProvisioner {
 
     const ext = process.platform === 'win32' ? '.exe' : '';
     const pgDumpPath = path.join(this.dropRoot, 'apps', 'drop-svc', 'pgsql', 'bin', `pg_dump${ext}`);
-    if (!fssync.existsSync(pgDumpPath)) {
+    if (!opts.skipBackup && !fssync.existsSync(pgDumpPath)) {
       return { dropped: false, reason: 'pg_dump binary not found' };
     }
 
@@ -289,35 +298,42 @@ export class DatabaseProvisioner {
     const partial = path.join(preDeleteDir, `${database}-${stamp}.dump.partial`);
     const finalDump = partial.replace(/\.partial$/, '');
 
-    const result = await runPgDump(pgDumpPath, {
-      port: this.server.getPort(),
-      user: 'postgres',
-      dbName: database,
-      outFile: partial,
-      password: this.server.getSuperuserPassword(),
-    });
+    // An ephemeral skips the dump ENTIRELY — including the verification gate
+    // below, which would otherwise abort the drop when there is no dump to
+    // verify and leave the scratch database behind forever.
+    let finalDumpPath: string | undefined;
+    if (!opts.skipBackup) {
+      const result = await runPgDump(pgDumpPath, {
+        port: this.server.getPort(),
+        user: 'postgres',
+        dbName: database,
+        outFile: partial,
+        password: this.server.getSuperuserPassword(),
+      });
 
-    if (!result.ok) {
-      await fs.rm(partial, { force: true });
-      return { dropped: false, reason: `dump failed: ${result.error}` };
+      if (!result.ok) {
+        await fs.rm(partial, { force: true });
+        return { dropped: false, reason: `dump failed: ${result.error}` };
+      }
+
+      // Verify before touching the database: exists, non-empty, and begins
+      // with the pg_dump custom-format magic header ("PGDMP"). A corrupt or
+      // truncated dump must never be trusted as the safety net for a drop.
+      const verified = await this.verifyDumpFile(partial);
+      if (!verified) {
+        await fs.rm(partial, { force: true });
+        return { dropped: false, reason: 'dump verification failed (not a valid pg_dump archive)' };
+      }
+
+      // Dump is proven good — commit the artifacts BEFORE any drop. -Fc does
+      // not capture roles, so the owning role must be recreated separately at
+      // restore time.
+      const restoreRoleSqlPath = path.join(preDeleteDir, `${database}-${stamp}.restore-role.sql`);
+      await fs.writeFile(restoreRoleSqlPath, createRoleSql(user, password) + '\n', { mode: 0o600 });
+      await fs.rename(partial, finalDump);
+      await fs.chmod(finalDump, 0o600);
+      finalDumpPath = finalDump;
     }
-
-    // Verify before touching the database: exists, non-empty, and begins
-    // with the pg_dump custom-format magic header ("PGDMP"). A corrupt or
-    // truncated dump must never be trusted as the safety net for a drop.
-    const verified = await this.verifyDumpFile(partial);
-    if (!verified) {
-      await fs.rm(partial, { force: true });
-      return { dropped: false, reason: 'dump verification failed (not a valid pg_dump archive)' };
-    }
-
-    // Dump is proven good — commit the artifacts BEFORE any drop. -Fc does
-    // not capture roles, so the owning role must be recreated separately at
-    // restore time.
-    const restoreRoleSqlPath = path.join(preDeleteDir, `${database}-${stamp}.restore-role.sql`);
-    await fs.writeFile(restoreRoleSqlPath, createRoleSql(user, password) + '\n', { mode: 0o600 });
-    await fs.rename(partial, finalDump);
-    await fs.chmod(finalDump, 0o600);
 
     // Only now — drop. Uses the shared admin pool; never .end() it.
     const pool = await this.server.getPool();
@@ -354,7 +370,7 @@ export class DatabaseProvisioner {
 
     await this.prunePreDeleteBackups(preDeleteDir);
 
-    return { dropped: dbDropped && roleDropped, reason, dumpPath: finalDump };
+    return { dropped: dbDropped && roleDropped, reason, dumpPath: finalDumpPath };
   }
 
   /** True if `file` exists, is non-empty, and begins with the pg_dump custom-format magic header. */

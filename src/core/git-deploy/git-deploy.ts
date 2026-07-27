@@ -31,6 +31,11 @@ import { getLogger } from '../../utils/logger';
 import { hasEnoughDisk, getMinFreeDiskMb } from '../../utils/disk';
 import { eventBus } from '../event-bus';
 import { admitDeploy } from '../../managers/guardrail/deploy-breaker';
+import {
+  checkEphemeralQuota,
+  resolveTtlMinutes,
+  EphemeralQuotaError,
+} from '../../managers/guardrail/ephemeral';
 
 const logger = getLogger();
 
@@ -102,6 +107,25 @@ export class GitDeployService {
       principalId: request.principalId,
       actorUserId: request.userId,
     });
+
+    // Ephemeral quota, before the clone. Same reasoning as the guardrail: a
+    // refusal after the clone would not undo the network, disk and time.
+    if (request.ephemeral) {
+      const verdict = checkEphemeralQuota(
+        getAppConfigService()
+          .getAllConfigs()
+          .filter((c) => c.ephemeral)
+          .map((c) => ({
+            name: c.name,
+            principalId: c.ephemeralPrincipalId,
+            userId: stateManager.getApp(c.name)?.userId,
+            expiresAt: c.expiresAt ?? '',
+          })),
+        { principalId: request.principalId, userId: request.userId },
+        Date.now()
+      );
+      if (!verdict.allowed) throw new EphemeralQuotaError(verdict.reason ?? 'Quota exceeded');
+    }
 
     const destPath = path.join(this.config.appsDirectory, appName);
 
@@ -198,6 +222,15 @@ export class GitDeployService {
     // redeploy(), which never touches this flag.
     if (request.agentCaller) {
       await getAppConfigService().updateConfig(appName, { agentCreated: true });
+    }
+    if (request.ephemeral) {
+      const ttl = resolveTtlMinutes(request.ttlMinutes);
+      await getAppConfigService().updateConfig(appName, {
+        ephemeral: true,
+        expiresAt: new Date(Date.now() + ttl * 60_000).toISOString(),
+        ephemeralPrincipalId: request.principalId,
+        agentCreated: true,
+      });
     }
 
     eventBus.publish('app:detected', {

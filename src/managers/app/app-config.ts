@@ -69,6 +69,15 @@ export interface AppConfig {
    * included.
    */
   agentCreated?: boolean;
+  /**
+   * A throwaway app with a lifetime (Step 10). `expiresAt` is ISO-8601; the
+   * reap sweep tears the app down once it passes. Absent on ordinary apps, and
+   * a MALFORMED value counts as expired rather than immortal.
+   */
+  ephemeral?: boolean;
+  expiresAt?: string;
+  /** Who created it, for the per-caller ephemeral quota. */
+  ephemeralPrincipalId?: string;
   /** Operator opt-out from idle reaping. */
   noReap?: boolean;
   promotion?: 'auto' | 'manual';

@@ -2917,7 +2917,12 @@ describe('teardownApp / removeGroup (M4: group lifecycle)', () => {
       expect((platform as any).runtime.stop).toHaveBeenCalledWith('myapp');
       expect((platform as any).runtime.delete).toHaveBeenCalledWith('myapp');
       expect((platform as any).router.removeRoutesForApp).toHaveBeenCalledWith('myapp');
-      expect((platform as any).dbProvisioner.backupAndDeleteAppDatabase).toHaveBeenCalledWith('myapp');
+      expect((platform as any).dbProvisioner.backupAndDeleteAppDatabase).toHaveBeenCalledWith(
+        'myapp',
+        // An ordinary teardown always takes the pre-delete dump; only an
+        // ephemeral skips it.
+        { skipBackup: false }
+      );
       expect((platform as any).stateManager.removeApp).toHaveBeenCalledWith('myapp');
       expect((platform as any).secretManager.deleteAll).toHaveBeenCalledWith('myapp');
       expect((platform as any).appConfigService.deleteConfig).toHaveBeenCalledWith('myapp');
