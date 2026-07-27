@@ -573,9 +573,24 @@ export async function handleGetDeployLogs(
     return toolText(wrapUntrusted(`BUILD LOG: ${detail.appName}`, tail(content)));
   }
 
-  // Runtime phase. Read the DROP-owned tail files from the offsets recorded
-  // just before the process started — never `docker logs`, which the next
-  // deploy's removeIfExists has already destroyed.
+  // Runtime phase. Prefer the RETAINED copy: the app is gone, its name-keyed
+  // log path may now belong to someone else, and the copy is keyed on
+  // deployId precisely so it cannot collide.
+  if (detail.retainedLogFile) {
+    let retained = '';
+    try {
+      retained = await fsp.readFile(detail.retainedLogFile, 'utf-8');
+    } catch {
+      retained = '';
+    }
+    if (retained.trim()) {
+      return toolText(wrapUntrusted(`RUNTIME LOG: ${detail.appName}`, tail(retained)));
+    }
+  }
+
+  // Otherwise read the DROP-owned tail files from the offsets recorded just
+  // before the process started — never `docker logs`, which the next deploy's
+  // removeIfExists has already destroyed.
   const offsets = detail.runtimeLog;
   if (!offsets) {
     // Cleared at teardown (the app is gone), or the deploy never started one.

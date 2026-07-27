@@ -159,6 +159,23 @@ describe('handleGetDeployLogs', () => {
       expect(textOf(res)).not.toContain('PREVIOUS DEPLOY');
     });
 
+    it('prefers the retained copy for a torn-down app', async () => {
+      // After teardown the name-keyed path may belong to another tenant. The
+      // copy is keyed on deployId precisely so it cannot collide.
+      const copy = path.join(tmpDir, 'retained.log');
+      await fs.writeFile(copy, 'output from the deleted app\n', 'utf-8');
+      details.set('t', mkDetail({
+        deployId: 't',
+        phase: 'boot',
+        runtimeLog: undefined,
+        retainedLogFile: copy,
+      }));
+
+      const res = await handleGetDeployLogs(ALICE, { deploy_id: 't' });
+
+      expect(textOf(res)).toContain('output from the deleted app');
+    });
+
     it('says so plainly when the offsets are gone', async () => {
       // Cleared at teardown (SEC-3). Better an honest "not retained" than a
       // read of a path another tenant may now own.
