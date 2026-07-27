@@ -16,12 +16,14 @@ import { ApiServer } from '../server';
 import { createUser, resetAuth } from '../middleware/auth';
 import { getTestToken } from '../__testutils__/auth';
 import { getStateManager, resetStateManager } from '../../managers/app/state-manager';
+import { resetRateLimits } from '../middleware/rate-limit';
 
 describe('POST /api/v1/auth/agent-tokens', () => {
   let tempDir: string;
   let server: ApiServer;
   let app: ReturnType<ApiServer['getApp']>;
   let aliceId: string;
+  let adminId: string;
   let aliceToken: string;
   let bobToken: string;
   let adminToken: string;
@@ -42,6 +44,9 @@ describe('POST /api/v1/auth/agent-tokens', () => {
 
     resetStateManager();
     resetAuth();
+    // This route now sits in the strict credential-minting bucket, and these
+    // tests mint far more often than a human would.
+    resetRateLimits();
     getStateManager({ stateFilePath: path.join(tempDir, 'apps.json') });
 
     server = new ApiServer({
@@ -54,7 +59,8 @@ describe('POST /api/v1/auth/agent-tokens', () => {
 
     const alice = await createUser('alice', 'password123', 'user');
     await createUser('bob', 'password123', 'user');
-    await createUser('root', 'password123', 'admin');
+    const root = await createUser('root', 'password123', 'admin');
+    adminId = root.id;
     aliceId = alice.id;
     aliceToken = await getTestToken('alice', 'password123');
     bobToken = await getTestToken('bob', 'password123');
@@ -70,6 +76,7 @@ describe('POST /api/v1/auth/agent-tokens', () => {
     await getStateManager().close();
     resetStateManager();
     resetAuth();
+    resetRateLimits();
     jest.restoreAllMocks();
     await fs.rm(tempDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   });
@@ -123,10 +130,29 @@ describe('POST /api/v1/auth/agent-tokens', () => {
     expect(res.status).toBe(400);
   });
 
-  it('lets an admin grant any app', async () => {
+  it("refuses even an ADMIN a scope for an app they do not own", async () => {
+    // canAccess passes for an admin on role, so this looked mintable — but the
+    // token's owner is the REQUESTER, and at check time it is rank-0, where
+    // canAccess degenerates to ownership. The token would authenticate and
+    // then 404 on every call, forever. A 201 handing back a credential that
+    // can never work is a footgun, not a grant.
     const res = await mint(adminToken, {
       name: 'admin-bot',
       scopes: ['app:aliceapp:deploy'],
+    });
+
+    expect(res.status).toBe(400);
+  });
+
+  it('lets an admin grant an app they DO own', async () => {
+    const sm = getStateManager();
+    const adminUser = adminId;
+    await sm.registerApp('adminapp', path.join(tempDir, 'adminapp'), 'nodejs');
+    await sm.updateApp('adminapp', { userId: adminUser });
+
+    const res = await mint(adminToken, {
+      name: 'admin-own',
+      scopes: ['app:adminapp:deploy'],
     });
 
     expect(res.status).toBe(201);
