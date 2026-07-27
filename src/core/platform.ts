@@ -48,7 +48,12 @@ import { WebhookManager, getWebhookManager, resetWebhookManager } from './webhoo
 import { GitDeployService, getGitDeployService, resetGitDeployService } from './git-deploy';
 import { UploadDeployService, getUploadDeployService, resetUploadDeployService } from './upload-deploy';
 import { getActivityLog, resetActivityLog } from '../managers/activity';
-import { getDeployTracker, resetDeployTracker } from '../managers/deploy-tracker';
+import {
+  getDeployTracker,
+  resetDeployTracker,
+  getDeployDetailStore,
+  resetDeployDetailStore,
+} from '../managers/deploy-tracker';
 import { ApiServer, createApiServer } from '../api';
 import { AppInProgressError, AppNeedsConfigError, setPlatformOps, resetPlatformOps } from '../api/platform-ops';
 import { planSecretPreflight, generateSecretValue } from '../managers/secret/secret-preflight';
@@ -587,6 +592,7 @@ export class DropPlatform {
   // drainInProgress() in stop() so late-completing deploys still close out
   // (see the drain-window fix in docs/plans/2026-07-06-p2-4-deploy-observability.md).
   private deployTrackerUnsub?: Unsubscribe;
+  private deployDetailUnsub?: Unsubscribe;
   private isRunning = false;
   // Snapshot of each app's persisted status, taken in initializeServices
   // BEFORE syncStateWithConfigs/syncStateWithProcesses run — both reconcile
@@ -900,12 +906,22 @@ export class DropPlatform {
       this.deployTrackerUnsub();
       this.deployTrackerUnsub = undefined;
     }
+    if (this.deployDetailUnsub) {
+      this.deployDetailUnsub();
+      this.deployDetailUnsub = undefined;
+    }
     try {
       await getDeployTracker().flush();
     } catch {
       // best-effort
     }
     resetDeployTracker();
+    try {
+      await getDeployDetailStore().flush();
+    } catch {
+      // best-effort
+    }
+    resetDeployDetailStore();
 
     // Stop API server
     if (this.apiServer) {
@@ -1376,6 +1392,19 @@ backup:
     const deployTracker = getDeployTracker(deployStorePath);
     await deployTracker.initialize();
     this.deployTrackerUnsub = deployTracker.subscribe(this.eventBus);
+
+    // Per-deploy diagnostics, alongside the tracker's milestone rows. Same
+    // lifetime and the same held-separately unsubscribe, so a deploy failing
+    // during the shutdown drain still records why.
+    const detailStorePath = path.join(
+      this.config.dropRoot,
+      'data',
+      'drop-svc',
+      'deploy-details.json'
+    );
+    const deployDetails = getDeployDetailStore(detailStorePath);
+    await deployDetails.initialize();
+    this.deployDetailUnsub = deployDetails.subscribe(this.eventBus);
 
     // Snapshot pre-sync status for reconcileAppsOnBoot (M1) — see
     // bootStatusSnapshot's doc comment. Must be taken before the very first
@@ -3245,6 +3274,16 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       const readiness = await this.awaitReadiness(appName, port, spec);
       if (!readiness.ok) {
         this.logger.appEvent('error', appName, `readiness check failed: ${readiness.reason}`);
+        // Published BEFORE the 'errored' status write below: that write is
+        // what closes the deploy episode, and a subscriber correlating by app
+        // name needs the episode still open to resolve this app's deployId.
+        // Carries a closed-set reason, never readiness.reason — that string is
+        // diagnostic text and must not reach a persisted record.
+        eventBus.publish('deploy:failed', {
+          appId: appName,
+          phase: 'boot',
+          reason: 'readiness-failed',
+        });
         if (this.stateManager) {
           await this.stateManager.setAppStatus(appName, 'errored', {
             port,
@@ -4068,6 +4107,12 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       getDeployTracker().purgeApp(name);
     } catch {
       // Deploy tracker may not be initialised
+    }
+
+    try {
+      getDeployDetailStore().purgeApp(name);
+    } catch {
+      // Deploy detail store may not be initialised
     }
 
     try {
