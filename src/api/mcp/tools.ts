@@ -42,6 +42,14 @@ import { getBuildLogService } from '../../managers/build-log/build-log';
 import { getTempDirectory } from '../runtime-config';
 import { runUploadPreflight } from '../upload-preflight';
 import { wrapUntrusted } from './untrusted';
+import {
+  DeployResult,
+  DeployResultStatus,
+  commandKindForStage,
+  hintFor,
+  nextActionsFor,
+} from './deploy-result';
+import { getDeployDetailStore } from '../../managers/deploy-tracker';
 import { computeAppUrl } from '../routes/apps';
 import { getPlatformVersion } from '../../utils/version';
 
@@ -98,22 +106,51 @@ function getAppLimit(userId?: string): number {
 function successResult(appName: string, isNew: boolean): CallToolResult {
   const app = getStateManager().getApp(appName);
   const url = app ? computeAppUrl(app) : undefined;
+  // The consumer AppState.readinessUnverified was added for: the app is up,
+  // but the readiness gate RAN and it never proved it serves. Reporting that
+  // as a plain success is the lie the flag exists to prevent.
+  const status: DeployResultStatus = app?.readinessUnverified
+    ? 'succeeded_unverified'
+    : 'succeeded';
   const lines = [
-    `Deploy of '${appName}' succeeded (${isNew ? 'new app' : 'redeploy'}).`,
+    status === 'succeeded_unverified'
+      ? `Deploy of '${appName}' completed (${isNew ? 'new app' : 'redeploy'}), but the app never proved it was ready.`
+      : `Deploy of '${appName}' succeeded (${isNew ? 'new app' : 'redeploy'}).`,
     url
       ? `URL: ${url}`
       : 'No externally-reachable URL is configured for this app (localhost-only domain).',
   ];
-  return toolText(lines.join('\n'));
+  const structured: DeployResult = {
+    ok: true,
+    app: appName,
+    status,
+    url,
+    next_actions: nextActionsFor(status),
+  };
+  return {
+    content: [{ type: 'text', text: lines.join('\n') }],
+    structuredContent: { ...structured },
+  };
 }
 
 async function failureResult(appName: string, episode: DeployEpisode): Promise<CallToolResult> {
   const failedStage = episode.stages.find(s => s.stage === 'build-failed' || s.stage === 'errored');
   const category = failedStage?.category;
 
+  // The diagnosis, keyed by the SAME deployId the episode carries.
+  let detail;
+  try {
+    detail = getDeployDetailStore().getDetail(episode.deployId);
+  } catch {
+    // Store not initialised (isolated tests).
+  }
+
   let logTail = '';
   try {
-    const content = await getBuildLogService().getLatestBuildLog(appName);
+    // By deployId, not getLatest: Gap B was that this fell back to "the newest
+    // log for the app", which after a concurrent deploy is a DIFFERENT deploy's
+    // output reported under this one's id.
+    const content = await getBuildLogService().getBuildLogByDeployId(appName, episode.deployId);
     if (content) {
       logTail = content.split('\n').slice(-80).join('\n');
     }
@@ -122,10 +159,36 @@ async function failureResult(appName: string, episode: DeployEpisode): Promise<C
   }
 
   const summary = `Deploy of '${appName}' failed at stage '${failedStage?.stage ?? 'unknown'}'${category ? ` (${category})` : ''}.`;
-  const text = logTail
-    ? `${summary}\n\n${wrapUntrusted(`BUILD LOG: ${appName}`, logTail)}`
-    : summary;
-  return { content: [{ type: 'text', text }], isError: true };
+  // Fenced even though it also rides in structuredContent: this is the one
+  // piece of application output in the result, and a structured field is
+  // unfenced by default.
+  const fencedTail = logTail ? wrapUntrusted(`BUILD LOG: ${appName}`, logTail) : undefined;
+  const text = fencedTail ? `${summary}\n\n${fencedTail}` : summary;
+
+  const errorCode = detail?.errorCode ?? 'UNKNOWN';
+  const structured: DeployResult = {
+    ok: false,
+    deploy_id: episode.deployId,
+    app: appName,
+    status: 'failed',
+    phase: detail?.phase,
+    error_code: errorCode,
+    stage: detail?.stage,
+    exit_code: detail?.exitCode,
+    // An ENUM derived from the stage — never detail.command, which may be a
+    // tenant-authored drop.yaml `build:` override. The literal command line
+    // stays inside the fenced tail above.
+    command: detail?.stage ? commandKindForStage(detail.stage) : undefined,
+    hint: hintFor(errorCode),
+    output_tail: fencedTail,
+    next_actions: nextActionsFor('failed', detail?.phase),
+  };
+
+  return {
+    content: [{ type: 'text', text }],
+    structuredContent: { ...structured },
+    isError: true,
+  };
 }
 
 /**
