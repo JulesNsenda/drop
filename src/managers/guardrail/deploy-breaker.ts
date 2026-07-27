@@ -86,13 +86,46 @@ export function automationKey(source: 'webhook' | 'watcher', appName: string): s
  * every app a human has: it exists to stop a loop that keeps re-minting
  * identities, not to throttle someone working normally across several apps.
  */
-export function ownerKey(userId: string | undefined): string {
-  return `owner::${userId ?? 'anonymous'}`;
+export function ownerKey(userId: string): string {
+  return `owner::${userId}`;
+}
+
+/**
+ * A key together with the rules that apply to it.
+ *
+ * The threshold travels WITH the key rather than being inferred from its text:
+ * an app may legitimately be named `owner`, which makes `breakerKey(p, 'owner')`
+ * read as `owner::<principal>` and would otherwise hand an attacker-chosen app
+ * name the looser backstop budget.
+ */
+export interface GuardrailKey {
+  key: string;
+  /** Failures inside the window before this key opens. */
+  threshold: number;
+  /**
+   * Whether a success wipes this window.
+   *
+   * TRUE for the per-principal window: it exists to stop a loop, and a success
+   * proves the caller is making progress.
+   *
+   * FALSE for the owner backstop, and that difference is what makes it a
+   * backstop at all. `breakerKey(principal, undefined)` is one shared
+   * `<principal>::__new__` bucket for every new-app deploy, so if a success
+   * cleared the owner window too, four expensive failing deploys followed by
+   * one trivial static app that builds in a second would wipe both windows —
+   * repeatable forever, and neither would ever reach its threshold. The owner
+   * window decays only by time, which is sufficient: `prune` already drops
+   * anything older than the window, so a caller cannot accumulate toward it on
+   * a history of successes. (An earlier revision of this file claimed they
+   * could; that was simply wrong — only failures are ever stored.)
+   */
+  clearOnSuccess: boolean;
 }
 
 export class DeployBreaker {
-  private readonly threshold: number;
-  private readonly ownerThreshold: number;
+  /** Defaults. Callers pass the applicable one explicitly via GuardrailKey. */
+  readonly threshold: number;
+  readonly ownerThreshold: number;
   private readonly windowMs: number;
   private readonly cooldownMs: number;
   private readonly state: Map<string, KeyState> = new Map();
@@ -131,14 +164,13 @@ export class DeployBreaker {
    * Record a failed deploy. Returns the verdict for the NEXT attempt, so a
    * caller can report "this was your last one" in the same breath.
    */
-  recordFailure(key: string, now = Date.now()): BreakerVerdict {
+  recordFailure(key: string, now = Date.now(), threshold = this.threshold): BreakerVerdict {
     const entry = this.state.get(key) ?? { failures: [] };
     const failures = this.prune(entry, now);
     failures.push(now);
     entry.failures = failures;
 
-    const limit = key.startsWith('owner::') ? this.ownerThreshold : this.threshold;
-    if (failures.length >= limit) {
+    if (failures.length >= threshold) {
       entry.openUntil = now + this.cooldownMs;
     }
     this.state.set(key, entry);
