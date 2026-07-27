@@ -21,6 +21,7 @@ import {
   initializeAuth,
   authMiddleware,
   suspendUser,
+  updateUser,
   deleteUser,
   AuthContext,
   resetAuth,
@@ -257,6 +258,87 @@ describe('principalId', () => {
 
       expect(await verifyOAuthAccessToken(doomed, AUD)).toBeNull();
       expect(await verifyOAuthAccessToken(kept, AUD)).not.toBeNull();
+    });
+  });
+
+  describe('revocation survives a restart (the durable layer)', () => {
+    // The in-memory denylist alone was NOT enough, and the failure is
+    // specific: token minted at T, grant revoked at T+1m, platform restarts at
+    // T+2m -> the map is empty and the token works again until T+15m. On this
+    // platform a push to `develop` restarts it, so "revoke, then deploy the
+    // fix" is the expected incident sequence and would have restored access.
+    //
+    // resetAuth() + re-initialize against the SAME credentials file models
+    // exactly that: in-memory state gone, stored state intact.
+    const restart = async (credentialsPath: string) => {
+      resetAuth();
+      await initializeAuth({
+        credentialsPath,
+        enableJwt: true,
+        enableApiKeys: true,
+      });
+    };
+
+    it('a suspended user stays revoked ACROSS a restart', async () => {
+      const credentialsPath = path.join(tempDir, 'credentials.json');
+      const user = await createUser('olga', 'password123', 'user');
+      const token = await mintOAuthAccessToken(user, AUD, 'sid-restart');
+
+      await suspendUser(user.id);
+      expect(await verifyOAuthAccessToken(token, AUD)).toBeNull();
+
+      await restart(credentialsPath);
+
+      // The denylist is empty now. Only the durable check can still reject it.
+      expect(await verifyOAuthAccessToken(token, AUD)).toBeNull();
+    });
+
+    it('a deleted user stays revoked ACROSS a restart', async () => {
+      const credentialsPath = path.join(tempDir, 'credentials.json');
+      await createUser('root', 'password123', 'admin');
+      const user = await createUser('peter', 'password123', 'user');
+      const token = await mintOAuthAccessToken(user, AUD, 'sid-del');
+
+      await deleteUser(user.id);
+      await restart(credentialsPath);
+
+      expect(await verifyOAuthAccessToken(token, AUD)).toBeNull();
+    });
+
+    it('covers the dashboard disable path, which purges nothing', async () => {
+      // The admin UI sends PUT /auth/users/:id {enabled:false} -> updateUser,
+      // which sets the flag and does NOT purge keys, refresh tokens or deny
+      // anything. Two disable paths with different security semantics is a
+      // trap; the durable check makes them equivalent.
+      const user = await createUser('quinn', 'password123', 'user');
+      const token = await mintOAuthAccessToken(user, AUD, 'sid-ui');
+
+      await updateUser(user.id, { enabled: false });
+
+      expect(await verifyOAuthAccessToken(token, AUD)).toBeNull();
+    });
+
+    it('honours a DEMOTION immediately, rather than 15 minutes later', async () => {
+      // role rode in the claim, so a demoted admin kept admin standing for the
+      // rest of the token's life.
+      const user = await createUser('rita', 'password123', 'admin');
+      const token = await mintOAuthAccessToken(user, AUD, 'sid-demote');
+      expect((await verifyOAuthAccessToken(token, AUD))?.role).toBe('admin');
+
+      await updateUser(user.id, { role: 'readonly' });
+
+      expect((await verifyOAuthAccessToken(token, AUD))?.role).toBe('readonly');
+    });
+
+    it('leaves an untouched user working after a restart', async () => {
+      // A durable check that over-rejects is an outage.
+      const credentialsPath = path.join(tempDir, 'credentials.json');
+      const user = await createUser('sam', 'password123', 'user');
+      const token = await mintOAuthAccessToken(user, AUD, 'sid-fine');
+
+      await restart(credentialsPath);
+
+      expect(await verifyOAuthAccessToken(token, AUD)).not.toBeNull();
     });
   });
 

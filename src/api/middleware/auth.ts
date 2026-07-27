@@ -467,7 +467,6 @@ export async function deleteUser(userId: string): Promise<boolean> {
   credentials.refreshTokens = (credentials.refreshTokens ?? []).filter(
     (r) => r.userId !== userId
   );
-  denyUser(userId);
   await saveCredentials(config.credentialsPath, credentials);
   return true;
 }
@@ -496,9 +495,6 @@ export async function suspendUser(userId: string): Promise<boolean> {
   credentials.refreshTokens = (credentials.refreshTokens ?? []).filter(
     (r) => r.userId !== userId
   );
-  // And the access tokens already in the wild — otherwise a suspension takes
-  // up to 15 minutes to bite, which is the window an incident happens in.
-  denyUser(userId);
   await saveCredentials(config.credentialsPath, credentials);
   return true;
 }
@@ -805,7 +801,7 @@ export async function mintOAuthAccessToken(
   })
     .setProtectedHeader({ alg: 'HS256' })
     .setIssuedAt()
-    .setExpirationTime('15m')
+    .setExpirationTime(`${ACCESS_TOKEN_TTL_SECONDS}s`)
     .sign(oauthTokenSecret);
 }
 
@@ -835,16 +831,29 @@ export async function verifyOAuthAccessToken(
     if (p['aud'] !== expectedAudience) return null;
 
     const userId = p['sub'];
-    const username = p['username'];
-    const role = p['role'];
-    if (typeof userId !== 'string' || typeof username !== 'string' || typeof role !== 'string') {
+    // Shape check only — the values actually used come from the live record
+    // below, so a claim cannot outlive a change to the account.
+    if (
+      typeof userId !== 'string' ||
+      typeof p['username'] !== 'string' ||
+      typeof p['role'] !== 'string'
+    ) {
       return null;
     }
 
-    // Revoked? Checked BEFORE the principal is built, so a denied token never
-    // becomes an AuthContext at all.
     const rawSid = typeof p['sid'] === 'string' ? (p['sid'] as string) : undefined;
-    if (isDenied(userId, rawSid)) return null;
+
+    // DURABLE revocation, and the reason this survives a restart: re-read the
+    // account rather than trusting a 15-minute-old claim. Covers deletion,
+    // suspension, and the dashboard's PUT /auth/users/:id {enabled:false} —
+    // which purges nothing and would otherwise leave the token live.
+    // verifyApiKey has done exactly this since DROP-075.
+    const record = getUserById(userId);
+    if (!record || record.enabled === false) return null;
+
+    // Single-grant revocation, within this process lifetime. Not durable — see
+    // the note above the denylist.
+    if (isGrantDenied(rawSid)) return null;
 
     // Per GRANT, not per token, and NAMESPACED.
     //
@@ -861,8 +870,11 @@ export async function verifyOAuthAccessToken(
 
     return {
       userId,
-      username,
-      role: role as AuthContext['role'],
+      // From the RECORD, not the claim: a demotion must bite now, not in 15
+      // minutes. The claim is only used above to reject a structurally
+      // malformed token.
+      username: record.username,
+      role: record.role as AuthContext['role'],
       authMethod: 'oauth',
       principalId,
     };
@@ -872,58 +884,56 @@ export async function verifyOAuthAccessToken(
 }
 
 /**
- * Short-lived denylist for OAuth ACCESS tokens (Step 6e).
+ * OAuth access-token revocation (Step 6e).
  *
- * Revoking a refresh token or disabling a user stops NEW access tokens being
- * minted. It does nothing about one already in the wild, and those live 15
- * minutes — so "revoked" meant "revoked in up to a quarter of an hour", which
- * is exactly the window that matters during an incident.
+ * Revoking a refresh token or disabling a user stopped NEW access tokens being
+ * minted and did nothing about one already in the wild — and those live 15
+ * minutes, so "revoked" meant "revoked within a quarter of an hour", which is
+ * exactly the window an incident happens in.
  *
- * Keyed on the GRANT (sid) and the USER, not on `jti` as the plan sketched.
- * The revocation events know which grant and which user they are killing; they
- * do not know the id of an access token minted minutes ago and never stored.
- * A jti denylist could therefore only ever be populated by a caller that
- * already holds the token it wants to revoke — which is not the incident case.
+ * TWO LAYERS, and the DURABLE one is primary.
  *
- * In-memory and bounded by TTL, deliberately: entries are worthless after the
- * token lifetime, so this must not grow without limit or need persisting. A
- * platform restart drops it, which is safe — every token minted before the
- * restart has also expired or will within the window, and the durable half
- * (the refresh token) is already gone from the store.
+ * `verifyOAuthAccessToken` re-reads the user record on every call and rejects a
+ * missing or disabled account, sourcing role from the record rather than the
+ * claim. That is what makes revocation survive a restart, cover every disable
+ * path (`suspendUser`, `deleteUser`, and the dashboard's
+ * `PUT /auth/users/:id {enabled:false}`, which purges nothing), and make a
+ * demotion bite immediately instead of 15 minutes later.
+ *
+ * The in-memory grant denylist below is the SECOND layer, for the one case the
+ * record cannot express: revoking a single grant while leaving the user's other
+ * sessions alive. It is keyed on `sid`, not `jti` as the plan sketched — the
+ * revoking caller knows which grant it is killing, not the id of an access
+ * token minted minutes ago and never stored.
+ *
+ * It is explicitly NOT relied on across a restart. An earlier version of this
+ * comment claimed a restart was safe because the tokens would have expired;
+ * that was wrong. Token minted at T, grant revoked at T+1m, platform restarts
+ * at T+2m — the map is empty and the token works again until T+15m. On this
+ * platform a push to `develop` restarts it, so "revoke, then deploy the fix"
+ * is the expected incident sequence and would have restored access. The
+ * durable layer is what actually holds; this one only sharpens the
+ * single-grant case within a process lifetime.
  */
-const ACCESS_TOKEN_TTL_MS = 15 * 60 * 1000;
+export const ACCESS_TOKEN_TTL_SECONDS = 15 * 60;
+const ACCESS_TOKEN_TTL_MS = ACCESS_TOKEN_TTL_SECONDS * 1000;
 const revokedGrants = new Map<string, number>();
-const revokedUsers = new Map<string, number>();
 
-function denyUntil(map: Map<string, number>, key: string): void {
-  map.set(key, Date.now() + ACCESS_TOKEN_TTL_MS);
+function denyGrant(sid: string): void {
+  if (!sid) return;
+  revokedGrants.set(sid, Date.now() + ACCESS_TOKEN_TTL_MS);
   // Opportunistic sweep — no timer to leak, and the map only ever holds
-  // entries from the last 15 minutes of revocation activity.
+  // entries from the last token-lifetime of revocation activity.
   const now = Date.now();
-  for (const [k, expiry] of map) {
-    if (expiry <= now) map.delete(k);
+  for (const [k, expiry] of revokedGrants) {
+    if (expiry <= now) revokedGrants.delete(k);
   }
 }
 
-/** Deny every access token belonging to a grant (sid). */
-export function denyGrant(sid: string): void {
-  if (sid) denyUntil(revokedGrants, sid);
-}
-
-/** Deny every access token belonging to a user, across all their grants. */
-export function denyUser(userId: string): void {
-  if (userId) denyUntil(revokedUsers, userId);
-}
-
-function isDenied(userId: string, sid: string | undefined): boolean {
-  const now = Date.now();
-  const userUntil = revokedUsers.get(userId);
-  if (userUntil !== undefined && userUntil > now) return true;
-  if (sid) {
-    const grantUntil = revokedGrants.get(sid);
-    if (grantUntil !== undefined && grantUntil > now) return true;
-  }
-  return false;
+function isGrantDenied(sid: string | undefined): boolean {
+  if (!sid) return false;
+  const until = revokedGrants.get(sid);
+  return until !== undefined && until > Date.now();
 }
 
 /** Hash an opaque token the same way API keys are hashed (sha256 hex digest of the raw value). */
@@ -1025,7 +1035,6 @@ export async function revokeRefreshToken(presented: string): Promise<boolean> {
 
 /** Revoke every refresh token issued to a user, and deny their live access tokens. */
 export async function revokeAllRefreshTokensForUser(userId: string): Promise<void> {
-  denyUser(userId);
   if (!credentials || !config) throw new Error('Auth not initialized');
 
   const records = credentials.refreshTokens ?? [];
@@ -1271,7 +1280,6 @@ export function resetAuth(): void {
   lastUsedFlushAt = 0;
   challengeAttempts.clear();
   revokedGrants.clear();
-  revokedUsers.clear();
 }
 
 /**
@@ -1357,7 +1365,17 @@ export function authMiddleware(requiredRole?: 'admin' | 'user' | 'readonly') {
     // Force-password-change gate (JWT only — API keys are programmatic and exempt)
     if (authContext.authMethod === 'jwt') {
       const userRecord = getUserById(authContext.userId);
-      if (userRecord?.mustChangePassword) {
+      // A session JWT lives 24 HOURS and carries its role in the claim, so
+      // without this a deleted, suspended or demoted account kept full access
+      // for a day — while the OAuth path is now revoked in milliseconds.
+      // Making one immediate and leaving the other is worse than doing
+      // neither, because it reads as covered.
+      if (!userRecord || userRecord.enabled === false) {
+        return c.json(error(ErrorCodes.UNAUTHORIZED, 'Account is no longer active'), 401);
+      }
+      // Role from the RECORD, not the claim — a demotion must bite now.
+      authContext.role = userRecord.role as AuthContext['role'];
+      if (userRecord.mustChangePassword) {
         const p = c.req.path || '';
         const isExempt =
           (c.req.method === 'PUT' && p.endsWith('/auth/password')) ||
