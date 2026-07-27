@@ -36,16 +36,58 @@ import { ValidationError } from '../middleware/error';
 
 const auth = new Hono();
 
+/**
+ * Guard for self-service ACCOUNT routes — the ones that act on the caller's own
+ * credentials rather than on a resource.
+ *
+ * Resolving `AuthContext.userId` to a key's `ownerUserId` means a key now acts
+ * AS its owner. For app/resource routes that is the point. For these routes it
+ * is not: an API key is a credential handed to a CI job or a deployed app, and
+ * it must not be able to change, disable or re-enrol the human's own login
+ * factors — a leaked low-privilege key would otherwise convert into full
+ * account takeover. Each of these routes also compares a caller-supplied secret
+ * (password, TOTP code) and reports the mismatch, so without this guard they
+ * are online guessing oracles against the owner reachable with any key.
+ *
+ * Before ownership resolution these were accidentally inert: a key's id is
+ * never in `credentials.users`, so every lookup missed. The containment was a
+ * side effect of the bug, so it has to be restated as a decision.
+ *
+ * Fails CLOSED when auth is disabled. There is no principal at all in that
+ * mode (`authMiddleware` calls `next()` without setting a context), so
+ * `authMethod` cannot be evaluated and `userId` is `undefined` — the routes
+ * previously threw a TypeError into a 400 body. A single-operator box has no
+ * account to service here anyway.
+ */
+function interactiveSessionOnly(
+  requester: AuthContext | undefined,
+  action: string
+): { ok: true; requester: AuthContext } | { ok: false; message: string } {
+  if (!requester) {
+    return { ok: false, message: `${action} is unavailable when authentication is disabled.` };
+  }
+  if (requester.authMethod !== 'jwt') {
+    return {
+      ok: false,
+      message: `${action} requires an interactive session. API keys and OAuth tokens cannot be used.`,
+    };
+  }
+  return { ok: true, requester };
+}
+
 // GET /auth/status - Public endpoint to check if auth is enabled
-auth.get('/status', (c) => {
+auth.get('/status', c => {
   const enabled = isAuthEnabled();
   return c.json(success({ enabled }));
 });
 
 // POST /auth/signup - Self-service user registration
-auth.post('/signup', async (c) => {
+auth.post('/signup', async c => {
   if (!isSignupEnabled()) {
-    return c.json(error(ErrorCodes.UNAUTHORIZED, 'Self-service signup is not enabled on this instance'), 403);
+    return c.json(
+      error(ErrorCodes.UNAUTHORIZED, 'Self-service signup is not enabled on this instance'),
+      403
+    );
   }
 
   const body = await c.req.json<{ username: string; password: string; email: string }>();
@@ -55,7 +97,9 @@ auth.post('/signup', async (c) => {
   }
 
   if (body.username.length < 3 || !/^[a-zA-Z0-9_-]+$/.test(body.username)) {
-    throw new ValidationError('Username must be at least 3 characters (letters, numbers, hyphens, underscores)');
+    throw new ValidationError(
+      'Username must be at least 3 characters (letters, numbers, hyphens, underscores)'
+    );
   }
 
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(body.email)) {
@@ -69,12 +113,15 @@ auth.post('/signup', async (c) => {
   try {
     const user = await createUser(body.username, body.password, 'user', body.email);
     await tryLogActivity({ action: 'signup', userId: user.id, username: user.username });
-    return c.json(success({
-      id: user.id,
-      username: user.username,
-      role: user.role,
-      message: 'Account created. You can now sign in.',
-    }), 201);
+    return c.json(
+      success({
+        id: user.id,
+        username: user.username,
+        role: user.role,
+        message: 'Account created. You can now sign in.',
+      }),
+      201
+    );
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Registration failed';
     if (message.includes('already exists')) {
@@ -85,7 +132,7 @@ auth.post('/signup', async (c) => {
 });
 
 // POST /auth/login - Authenticate and get JWT token (or MFA challenge)
-auth.post('/login', async (c) => {
+auth.post('/login', async c => {
   const body = await c.req.json<{ username: string; password: string }>();
 
   if (!body.username || !body.password) {
@@ -111,19 +158,21 @@ auth.post('/login', async (c) => {
       token: result.token,
       tokenType: 'Bearer',
       expiresIn: 86400,
-      user: user ? {
-        id: user.id,
-        username: user.username,
-        role: user.role,
-        email: (user as any).email,
-        mustChangePassword: (user as any).mustChangePassword === true,
-      } : undefined,
+      user: user
+        ? {
+            id: user.id,
+            username: user.username,
+            role: user.role,
+            email: (user as any).email,
+            mustChangePassword: (user as any).mustChangePassword === true,
+          }
+        : undefined,
     })
   );
 });
 
 // POST /auth/api-keys - Create a new API key (admin only)
-auth.post('/api-keys', authMiddleware('admin'), async (c) => {
+auth.post('/api-keys', authMiddleware('admin'), async c => {
   const body = await c.req.json<{
     name: string;
     role?: 'admin' | 'user' | 'readonly';
@@ -218,13 +267,13 @@ auth.post('/api-keys', authMiddleware('admin'), async (c) => {
 });
 
 // GET /auth/api-keys - List all API keys (admin only)
-auth.get('/api-keys', authMiddleware('admin'), async (c) => {
+auth.get('/api-keys', authMiddleware('admin'), async c => {
   const keys = listApiKeys();
   return c.json(success(keys));
 });
 
 // DELETE /auth/api-keys/:id - Delete an API key (admin only)
-auth.delete('/api-keys/:id', authMiddleware('admin'), async (c) => {
+auth.delete('/api-keys/:id', authMiddleware('admin'), async c => {
   const id = c.req.param('id');
   if (!id) return c.json(error(ErrorCodes.VALIDATION_ERROR, 'Missing id'), 400);
   const deleted = await deleteApiKey(id);
@@ -237,9 +286,10 @@ auth.delete('/api-keys/:id', authMiddleware('admin'), async (c) => {
 });
 
 // GET /auth/me - Get current user info
-auth.get('/me', authMiddleware(), async (c) => {
+auth.get('/me', authMiddleware(), async c => {
   // Auth context is set by authMiddleware
-  const authContext = (c.req as unknown as { auth?: AuthContext }).auth ||
+  const authContext =
+    (c.req as unknown as { auth?: AuthContext }).auth ||
     (c.get as (key: string) => AuthContext | undefined)('auth');
 
   if (!authContext) {
@@ -260,8 +310,22 @@ auth.get('/me', authMiddleware(), async (c) => {
 });
 
 // PUT /auth/password - Change own password
-auth.put('/password', authMiddleware(), async (c) => {
-  const authCtx = (c.get as Function)('auth') as AuthContext;
+//
+// Interactive-session only. `changePassword` reports whether `currentPassword`
+// matched, so with a key acting as its owner this route is an online password
+// oracle against the owner — reachable with ANY key, including a `readonly`
+// one or one injected into a deployed app, and a correct guess hands over the
+// account outright. Keys minted without an explicit owner default to the
+// minting admin, so the default target is an admin.
+auth.put('/password', authMiddleware(), async c => {
+  const gate = interactiveSessionOnly(
+    (c.get as (k: string) => AuthContext | undefined)('auth'),
+    'Changing your password'
+  );
+  if (!gate.ok) {
+    return c.json(error(ErrorCodes.UNAUTHORIZED, gate.message), 403);
+  }
+  const authCtx = gate.requester;
   const body = await c.req.json<{ currentPassword: string; newPassword: string }>();
 
   if (!body.currentPassword || !body.newPassword) {
@@ -280,7 +344,7 @@ auth.put('/password', authMiddleware(), async (c) => {
 });
 
 // GET /auth/users - List all users with app counts (admin only)
-auth.get('/users', authMiddleware('admin'), async (c) => {
+auth.get('/users', authMiddleware('admin'), async c => {
   const users = listUsers();
 
   let allApps: Array<{ userId?: string }> = [];
@@ -290,18 +354,22 @@ auth.get('/users', authMiddleware('admin'), async (c) => {
     // State manager not initialized
   }
 
-  const enriched = users.map((u) => ({
+  const enriched = users.map(u => ({
     ...u,
     enabled: (u as any).enabled !== false,
-    appCount: allApps.filter((a) => a.userId === u.id).length,
+    appCount: allApps.filter(a => a.userId === u.id).length,
   }));
 
   return c.json(success(enriched));
 });
 
 // POST /auth/users - Create a new user (admin: any role; scoped 'users:create' caller: 'user' role only)
-auth.post('/users', authMiddleware(), requireCapability('users:create'), async (c) => {
-  const body = await c.req.json<{ username: string; password: string; role?: 'admin' | 'user' | 'readonly' }>();
+auth.post('/users', authMiddleware(), requireCapability('users:create'), async c => {
+  const body = await c.req.json<{
+    username: string;
+    password: string;
+    role?: 'admin' | 'user' | 'readonly';
+  }>();
 
   if (!body.username || !body.password) {
     throw new ValidationError('Username and password are required');
@@ -318,11 +386,20 @@ auth.post('/users', authMiddleware(), requireCapability('users:create'), async (
   // allowing any role is preserved.
   const authCtx = (c.get as Function)('auth') as AuthContext | undefined;
   if (authCtx && authCtx.role !== 'admin' && body.role !== undefined && body.role !== 'user') {
-    return c.json(error(ErrorCodes.UNAUTHORIZED, 'This token may only create user-role accounts'), 403);
+    return c.json(
+      error(ErrorCodes.UNAUTHORIZED, 'This token may only create user-role accounts'),
+      403
+    );
   }
 
   try {
-    const user = await createUser(body.username, body.password, body.role || 'user', undefined, true);
+    const user = await createUser(
+      body.username,
+      body.password,
+      body.role || 'user',
+      undefined,
+      true
+    );
     return c.json(
       success({
         id: user.id,
@@ -341,7 +418,7 @@ auth.post('/users', authMiddleware(), requireCapability('users:create'), async (
 });
 
 // PUT /auth/users/:id - Update user (admin only)
-auth.put('/users/:id', authMiddleware('admin'), async (c) => {
+auth.put('/users/:id', authMiddleware('admin'), async c => {
   const id = c.req.param('id');
   if (!id) return c.json(error(ErrorCodes.VALIDATION_ERROR, 'Missing id'), 400);
   const body = await c.req.json<{ enabled?: boolean; role?: 'admin' | 'user' | 'readonly' }>();
@@ -355,7 +432,7 @@ auth.put('/users/:id', authMiddleware('admin'), async (c) => {
 });
 
 // POST /auth/users/:id/reset-password - Admin reset user password
-auth.post('/users/:id/reset-password', authMiddleware('admin'), async (c) => {
+auth.post('/users/:id/reset-password', authMiddleware('admin'), async c => {
   const id = c.req.param('id');
   if (!id) return c.json(error(ErrorCodes.VALIDATION_ERROR, 'Missing id'), 400);
   const body = await c.req.json<{ newPassword: string }>();
@@ -384,32 +461,34 @@ auth.post('/users/:id/reset-password', authMiddleware('admin'), async (c) => {
  * `deleteUser` was a guaranteed no-op), so the containment was a side effect of
  * the bug rather than a decision.
  */
-auth.delete('/account', authMiddleware(), async (c) => {
-  const requester = (c.get as (k: string) => AuthContext | undefined)('auth');
-
-  if (requester && requester.authMethod !== 'jwt') {
-    return c.json(
-      error(
-        ErrorCodes.UNAUTHORIZED,
-        'Account deletion requires an interactive session. API keys and OAuth tokens cannot delete an account.'
-      ),
-      403
-    );
+auth.delete('/account', authMiddleware(), async c => {
+  const gate = interactiveSessionOnly(
+    (c.get as (k: string) => AuthContext | undefined)('auth'),
+    'Account deletion'
+  );
+  if (!gate.ok) {
+    return c.json(error(ErrorCodes.UNAUTHORIZED, gate.message), 403);
   }
+  const authCtx = gate.requester;
 
-  const confirmBody = await c.req.json<{ password?: string }>().catch(() => ({ password: undefined }));
+  const confirmBody = await c.req
+    .json<{ password?: string }>()
+    .catch(() => ({ password: undefined }));
   if (!confirmBody.password) {
     throw new ValidationError('Current password is required to delete your account');
   }
-  if (requester && !verifyUserPassword(requester.userId, confirmBody.password)) {
+  if (!verifyUserPassword(authCtx.userId, confirmBody.password)) {
     return c.json(error(ErrorCodes.UNAUTHORIZED, 'Current password is incorrect'), 401);
   }
 
-  const authCtx = (c.get as Function)('auth') as AuthContext;
-
   try {
     await deleteUser(authCtx.userId);
-    await tryLogActivity({ action: 'delete', userId: authCtx.userId, username: authCtx.username, detail: 'Account deleted' });
+    await tryLogActivity({
+      action: 'delete',
+      userId: authCtx.userId,
+      username: authCtx.username,
+      detail: 'Account deleted',
+    });
     return c.json(success({ message: 'Account deleted' }));
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Failed to delete account';
@@ -418,7 +497,7 @@ auth.delete('/account', authMiddleware(), async (c) => {
 });
 
 // POST /auth/mfa/verify - Complete MFA login (challengeToken + 6-digit code)
-auth.post('/mfa/verify', async (c) => {
+auth.post('/mfa/verify', async c => {
   const body = await c.req.json<{ challengeToken: string; code: string }>();
   if (!body.challengeToken || !body.code) {
     throw new ValidationError('challengeToken and code are required');
@@ -427,17 +506,27 @@ auth.post('/mfa/verify', async (c) => {
   const result = await completeMfaLogin(body.challengeToken, body.code);
 
   if (result.status === 'expired') {
-    return c.json(error(ErrorCodes.UNAUTHORIZED, 'Challenge token expired. Please log in again.'), 401);
+    return c.json(
+      error(ErrorCodes.UNAUTHORIZED, 'Challenge token expired. Please log in again.'),
+      401
+    );
   }
   if (result.status === 'attempt_limit') {
-    return c.json(error(ErrorCodes.UNAUTHORIZED, 'Too many failed attempts. Please log in again.'), 401);
+    return c.json(
+      error(ErrorCodes.UNAUTHORIZED, 'Too many failed attempts. Please log in again.'),
+      401
+    );
   }
   if (result.status === 'invalid') {
     return c.json(error(ErrorCodes.MFA_INVALID, 'Invalid authentication code.'), 401);
   }
 
   // status === 'ok'
-  await tryLogActivity({ action: 'login_mfa_ok', userId: result.user.id, username: result.user.username });
+  await tryLogActivity({
+    action: 'login_mfa_ok',
+    userId: result.user.id,
+    username: result.user.username,
+  });
   return c.json(
     success({
       token: result.token,
@@ -451,8 +540,20 @@ auth.post('/mfa/verify', async (c) => {
 });
 
 // POST /auth/mfa/setup - Generate a candidate TOTP secret (not persisted until enabled)
-auth.post('/mfa/setup', authMiddleware(), async (c) => {
-  const authCtx = (c.get as Function)('auth') as AuthContext;
+//
+// Interactive-session only: this mints a candidate TOTP secret and a
+// provisioning URI (which embeds the account label) FOR THE OWNER with no
+// password check. Enrolling a second factor is an account-credential
+// operation, not something a deployed app's key should perform.
+auth.post('/mfa/setup', authMiddleware(), async c => {
+  const gate = interactiveSessionOnly(
+    (c.get as (k: string) => AuthContext | undefined)('auth'),
+    'Two-factor enrolment'
+  );
+  if (!gate.ok) {
+    return c.json(error(ErrorCodes.UNAUTHORIZED, gate.message), 403);
+  }
+  const authCtx = gate.requester;
   const setup = setupMfa(authCtx.userId);
   if (!setup) {
     return c.json(error(ErrorCodes.NOT_FOUND, 'User not found'), 404);
@@ -461,8 +562,19 @@ auth.post('/mfa/setup', authMiddleware(), async (c) => {
 });
 
 // POST /auth/mfa/enable - Persist and activate TOTP for the authenticated user
-auth.post('/mfa/enable', authMiddleware(), async (c) => {
-  const authCtx = (c.get as Function)('auth') as AuthContext;
+//
+// Interactive-session only. It takes the account password, so with a key
+// acting as its owner this is a second password oracle alongside
+// PUT /auth/password.
+auth.post('/mfa/enable', authMiddleware(), async c => {
+  const gate = interactiveSessionOnly(
+    (c.get as (k: string) => AuthContext | undefined)('auth'),
+    'Enabling two-factor authentication'
+  );
+  if (!gate.ok) {
+    return c.json(error(ErrorCodes.UNAUTHORIZED, gate.message), 403);
+  }
+  const authCtx = gate.requester;
   const body = await c.req.json<{ password: string; secret: string; code: string }>();
   if (!body.password || !body.secret || !body.code) {
     throw new ValidationError('password, secret, and code are required');
@@ -477,16 +589,39 @@ auth.post('/mfa/enable', authMiddleware(), async (c) => {
     return c.json(error(ErrorCodes.MFA_INVALID, 'Code does not match the provided secret'), 400);
   }
   if (result.status === 'no_key') {
-    return c.json(error(ErrorCodes.INTERNAL_ERROR, 'MFA encryption key not available. Contact the server operator.'), 500);
+    return c.json(
+      error(
+        ErrorCodes.INTERNAL_ERROR,
+        'MFA encryption key not available. Contact the server operator.'
+      ),
+      500
+    );
   }
 
-  await tryLogActivity({ action: 'mfa_enabled', userId: authCtx.userId, username: authCtx.username });
+  await tryLogActivity({
+    action: 'mfa_enabled',
+    userId: authCtx.userId,
+    username: authCtx.username,
+  });
   return c.json(success({ message: 'Two-factor authentication enabled' }));
 });
 
 // POST /auth/mfa/disable - Disable TOTP (requires a valid current TOTP code)
-auth.post('/mfa/disable', authMiddleware(), async (c) => {
-  const authCtx = (c.get as Function)('auth') as AuthContext;
+//
+// Interactive-session only. `disableMfa` reports `invalid_code` and — unlike
+// the login MFA path, which limits attempts on the challenge token — keeps NO
+// failed-attempt counter. With a key acting as its owner that is an unlimited
+// online brute force against a 6-digit code that strips the owner's second
+// factor on success.
+auth.post('/mfa/disable', authMiddleware(), async c => {
+  const gate = interactiveSessionOnly(
+    (c.get as (k: string) => AuthContext | undefined)('auth'),
+    'Disabling two-factor authentication'
+  );
+  if (!gate.ok) {
+    return c.json(error(ErrorCodes.UNAUTHORIZED, gate.message), 403);
+  }
+  const authCtx = gate.requester;
   const body = await c.req.json<{ code: string }>();
   if (!body.code) {
     throw new ValidationError('code is required');
@@ -501,7 +636,11 @@ auth.post('/mfa/disable', authMiddleware(), async (c) => {
     return c.json(error(ErrorCodes.MFA_INVALID, 'Invalid authentication code'), 401);
   }
 
-  await tryLogActivity({ action: 'mfa_disabled', userId: authCtx.userId, username: authCtx.username });
+  await tryLogActivity({
+    action: 'mfa_disabled',
+    userId: authCtx.userId,
+    username: authCtx.username,
+  });
   return c.json(success({ message: 'Two-factor authentication disabled' }));
 });
 
