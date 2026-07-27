@@ -1,6 +1,6 @@
 # DROP
 
-**Deploy, Run, Operate, Publish** | v2.0.0-rc.1
+**Deploy, Run, Operate, Publish** | v2.0.0-rc.3
 
 A lightweight, self-hosted Platform as a Service (PaaS) engineered for the "drop folder and deploy" workflow. Zero-configuration deployment for Node.js, Python, static sites, and containerized applications.
 
