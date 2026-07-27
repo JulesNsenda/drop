@@ -38,6 +38,7 @@ function mkDetail(deployId: string, appName: string, userId: string | undefined)
     appName,
     userId,
     phase: 'build',
+    errorCode: 'INSTALL_FAILED',
     stage: 'install',
     exitCode: 127,
     command: 'npm ci',
@@ -107,9 +108,13 @@ describe('GET /api/v1/deploys/:deployId', () => {
     const res = await get('d-alice', aliceToken);
 
     expect(res.status).toBe(200);
-    const body = (await res.json()) as { data: { deployId: string; exitCode: number } };
+    const body = (await res.json()) as {
+      data: { deployId: string; exitCode: number; errorCode: string };
+    };
     expect(body.data.deployId).toBe('d-alice');
     expect(body.data.exitCode).toBe(127);
+    // The taxonomy is the point of the endpoint — a caller switches on this.
+    expect(body.data.errorCode).toBe('INSTALL_FAILED');
   });
 
   it("404s on another tenant's deploy", async () => {

@@ -212,6 +212,13 @@ export interface BuildFailedPayload extends BaseEvent {
   /** See BuildStartedPayload.deployId. */
   deployId?: string;
   /**
+   * The builder's own BuildError code when it has one — 'NO_STRATEGY',
+   * 'MAX_BUILDS', 'EXCEPTION'. DROP-generated. Lets a consumer tell a
+   * genuinely unbuildable app type apart from any other pre-build failure,
+   * which `stage` alone cannot ('pre-build' covers both).
+   */
+  code?: string;
+  /**
    * Which stage failed. REQUIRED, unlike the other additions here: the builder
    * has always known this and simply never published it, so DeployTracker
    * hardcoded `category: 'build-failed'` while its type documented three
@@ -242,8 +249,15 @@ export type DeployFailurePhase = 'boot';
  * never free-form text: this rides into a persisted record, and the
  * never-store-a-raw-error-message rule (deploy-tracker.ts) applies to
  * everything that lands there.
+ *
+ * These are exactly the two verdicts `awaitReadiness` can actually reach on
+ * its failure path. There is deliberately no 'never-answered' member: an app
+ * that binds but never answers HTTP is NOT a failure — it resolves
+ * `{ ok: true, warning }` and becomes `AppState.readinessUnverified` (DROP-063
+ * leniency for slow starters). Adding a member no publisher can produce would
+ * be the same unreachable-value defect as a constant field.
  */
-export type DeployFailureReason = 'readiness-failed' | 'start-threw';
+export type DeployFailureReason = 'process-exited' | 'crash-looped';
 
 /**
  * A deploy that got past the build and then failed. Widens the boot-failure

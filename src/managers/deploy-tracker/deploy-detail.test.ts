@@ -53,6 +53,7 @@ describe('DeployDetailStore', () => {
         deployId: 'd1',
         appName: 'app',
         phase: 'build',
+        errorCode: 'INSTALL_FAILED',
         stage: 'install',
         exitCode: 127,
         command: 'npm ci',
@@ -82,14 +83,15 @@ describe('DeployDetailStore', () => {
       // deploy:failed carries no deployId — the store resolves it by app name
       // from the episode build:started opened, the same way DeployTracker does.
       openEpisode('booty', 'boot-1');
-      bus.publish('deploy:failed', { appId: 'booty', phase: 'boot', reason: 'readiness-failed' });
+      bus.publish('deploy:failed', { appId: 'booty', phase: 'boot', reason: 'crash-looped' });
       await store.flush();
 
       expect(store.getDetail('boot-1')).toMatchObject({
         deployId: 'boot-1',
         appName: 'booty',
         phase: 'boot',
-        reason: 'readiness-failed',
+        errorCode: 'CRASH_LOOPED',
+        reason: 'crash-looped',
       });
     });
 
@@ -98,7 +100,7 @@ describe('DeployDetailStore', () => {
       // is also a close signal. Both reach this store; the outcome must be one
       // boot-phase record, not two and not a build-phase one overwriting it.
       openEpisode('seq', 'seq-1');
-      bus.publish('deploy:failed', { appId: 'seq', phase: 'boot', reason: 'readiness-failed' });
+      bus.publish('deploy:failed', { appId: 'seq', phase: 'boot', reason: 'crash-looped' });
       bus.publish('app:updated', { appId: 'seq', changes: { status: 'errored' } });
       await store.flush();
 
@@ -119,7 +121,7 @@ describe('DeployDetailStore', () => {
     it('attaches the offsets captured before start to a boot failure', async () => {
       openEpisode('off', 'off-1');
       store.noteRuntimeLog('off', offsets);
-      bus.publish('deploy:failed', { appId: 'off', phase: 'boot', reason: 'readiness-failed' });
+      bus.publish('deploy:failed', { appId: 'off', phase: 'boot', reason: 'crash-looped' });
       await store.flush();
 
       expect(store.getDetail('off-1')?.runtimeLog).toEqual(offsets);
@@ -149,7 +151,7 @@ describe('DeployDetailStore', () => {
       bus.publish('deploy:failed', {
         appId: 'restarted',
         phase: 'boot',
-        reason: 'readiness-failed',
+        reason: 'crash-looped',
       });
       await store.flush();
 
@@ -164,7 +166,7 @@ describe('DeployDetailStore', () => {
       bus.publish('app:updated', { appId: 'carry', changes: { status: 'running' } });
 
       openEpisode('carry', 'carry-2');
-      bus.publish('deploy:failed', { appId: 'carry', phase: 'boot', reason: 'readiness-failed' });
+      bus.publish('deploy:failed', { appId: 'carry', phase: 'boot', reason: 'crash-looped' });
       await store.flush();
 
       expect(store.getDetail('carry-2')?.runtimeLog).toBeUndefined();
@@ -258,7 +260,7 @@ describe('DeployDetailStore', () => {
     const failBoot = (app: string, deployId: string) => {
       openEpisode(app, deployId);
       store.noteRuntimeLog(app, offsets);
-      bus.publish('deploy:failed', { appId: app, phase: 'boot', reason: 'readiness-failed' });
+      bus.publish('deploy:failed', { appId: app, phase: 'boot', reason: 'crash-looped' });
     };
 
     it('CLEARS the name-keyed log offsets', async () => {
