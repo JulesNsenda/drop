@@ -51,6 +51,12 @@ import { UploadDeployService, getUploadDeployService, resetUploadDeployService }
 import { getActivityLog, resetActivityLog } from '../managers/activity';
 import { tryLogActivity } from '../managers/activity';
 import {
+  promotionModeFor,
+  shouldHoldForPromotion,
+  type PromotionMode,
+} from '../managers/guardrail/promotion';
+import { getPrincipalQuota, resetPrincipalQuota } from '../managers/guardrail/principal-quota';
+import {
   findOverCeiling,
   toMb,
   configuredCeilingBytes,
@@ -752,6 +758,18 @@ export class DropPlatform {
       this.logRetention.start();
       this.startDiskCeilingSweep();
 
+      // Anchor the deploy quota under DROP_ROOT. Its fallback path is relative
+      // and would resolve against whatever CWD `drop serve` was launched from,
+      // scattering the store — and silently handing every caller a fresh
+      // allowance whenever the service is started from a different directory.
+      const quotaStore = path.join(
+        this.config.dropRoot,
+        'data',
+        'drop-svc',
+        'principal-quotas.json'
+      );
+      await getPrincipalQuota(quotaStore).initialize();
+
       // Initialize services
       await this.initializeServices();
 
@@ -959,6 +977,7 @@ export class DropPlatform {
     resetDeployDetailStore();
     this.breakerKeys.clear();
     resetDeployBreaker();
+    resetPrincipalQuota();
 
     // Stop API server
     if (this.apiServer) {
@@ -1572,6 +1591,7 @@ backup:
     setPlatformOps({
       restartApp: (name) => this.restartApp(name),
       isAppInProgress: (name) => this.appsInProgress.has(name),
+      promoteApp: (name) => this.promoteApp(name),
       removeGroup: (name) => this.removeGroup(name),
       purgeAppArtifacts: (name, opts) => this.purgeAppArtifacts(name, opts),
     });
@@ -2265,6 +2285,13 @@ backup:
       const shouldStart = this.config.autoStart && app?.status !== 'stopped';
 
       if (shouldStart) {
+        // Manual promotion holds the build here, BEFORE anything starts. On a
+        // first deploy nothing has ever served, so nothing goes live; on a
+        // redeploy the running version is untouched.
+        if (await this.holdForPromotion(payload.appId, payload.outputPath, payload.deployId)) {
+          this.appsInProgress.delete(payload.appId);
+          return;
+        }
         // owns appsInProgress cleanup. outputPath rides the payload because
         // this dispatch happens synchronously inside build() — before
         // handleBuildApp can persist it to the app config.
@@ -4057,6 +4084,20 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         return;
       }
 
+      // Manual promotion holds HERE, before the stop. This is the branch SEC-9
+      // found broken in the withhold-the-route design: on a redeploy the route
+      // already exists, so gating it did nothing and unapproved code went live
+      // the instant the new process started. Holding before the stop leaves the
+      // approved version running and serving, untouched.
+      if (await this.holdForPromotion(appName, buildResult.outputPath ?? undefined, updateDeployId)) {
+        // A held build is not a failed one — the guardrail window must not be
+        // charged for a deploy the operator asked to be held.
+        this.releaseGuardrailKeys(appName);
+        await this.stateManager.setAppStatus(appName, appState.status);
+        this.appsInProgress.delete(appName);
+        return;
+      }
+
       // Build succeeded — now stop the old version and swap in the new one.
       // The port reservation is held throughout — no release here — because
       // buildFreshStartSpec's allocatePort() call below re-claims the same
@@ -4924,6 +4965,85 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         `Disk ceiling sweep failed: ${err instanceof Error ? err.message : 'unknown'}`,
         'DISK'
       );
+    }
+  }
+
+  /**
+   * Hold a finished build when the app is set to manual promotion.
+   *
+   * Returns true when the caller must NOT start or swap. The running version is
+   * left exactly as it is — see managers/guardrail/promotion.ts for why the
+   * hold is here rather than at a port swap.
+   */
+  private async holdForPromotion(
+    appName: string,
+    outputPath?: string,
+    deployId?: string
+  ): Promise<boolean> {
+    const mode: PromotionMode = promotionModeFor(
+      this.appConfigService?.getConfig(appName)?.promotion
+    );
+    if (!shouldHoldForPromotion(mode)) return false;
+
+    const pending = {
+      deployId,
+      builtAt: new Date().toISOString(),
+      outputDirectory: outputPath,
+    };
+    await this.appConfigService?.updateConfig(appName, { pendingPromotion: pending });
+
+    const app = this.stateManager?.getApp(appName);
+    // Status is left ALONE on purpose. A running app keeps `running` because
+    // the old version really is still serving; a new app keeps whatever it had
+    // because nothing has ever served. Overwriting it would make the flag lie
+    // about what is running.
+    await this.stateManager?.updateApp(appName, { awaitingPromotion: true });
+
+    this.logger.info(
+      `Build for ${appName} is held awaiting promotion (POST /api/v1/apps/${appName}/promote)`,
+      'PROMOTE'
+    );
+    await tryLogActivity({
+      action: 'promotion-held',
+      appName,
+      userId: app?.userId,
+      detail: `Build held; promotion is manual`,
+    });
+    return true;
+  }
+
+  /**
+   * Put a held build in front of traffic. Owner/admin only — see the route.
+   *
+   * Starts exactly what was built rather than rebuilding: a rebuild could pick
+   * up source that changed since the operator looked, which would promote
+   * something nobody approved.
+   */
+  async promoteApp(appName: string): Promise<void> {
+    const config = this.appConfigService?.getConfig(appName);
+    const pending = config?.pendingPromotion;
+    if (!pending) {
+      throw new Error(`No build is awaiting promotion for '${appName}'`);
+    }
+
+    await this.appConfigService?.updateConfig(appName, { pendingPromotion: undefined });
+    await this.stateManager?.updateApp(appName, { awaitingPromotion: false });
+
+    const app = this.stateManager?.getApp(appName);
+    await tryLogActivity({
+      action: 'promote',
+      appName,
+      userId: app?.userId,
+      detail: `Promoted build from ${pending.builtAt}`,
+    });
+
+    // The swap itself is the ordinary start path, so promotion has no second
+    // implementation of starting an app to drift from the first.
+    this.appsInProgress.add(appName);
+    try {
+      await this.handleStartApp(appName, pending.outputDirectory);
+    } finally {
+      this.appsInProgress.delete(appName);
     }
   }
 

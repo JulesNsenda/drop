@@ -237,6 +237,33 @@ function needsConfigResult(appName: string): CallToolResult {
 }
 
 /**
+ * A build that finished but is held for a human to promote (Step 6d).
+ *
+ * NOT reported as success. The build did succeed, but nothing is serving it,
+ * and an agent told "deployed" would go on to probe a URL that still returns
+ * the previous version — or nothing at all — and conclude its change did not
+ * work. Not reported as a failure either: there is nothing to fix.
+ *
+ * Every value here is DROP-generated. The app name is validated by
+ * `isValidAppName` well before this point.
+ */
+function awaitingPromotionResult(appName: string): CallToolResult {
+  return {
+    content: [
+      {
+        type: 'text',
+        text:
+          `Build for '${appName}' succeeded and is HELD awaiting promotion. ` +
+          `This app is set to manual promotion, so the new version is not serving yet and ` +
+          `the previously promoted version (if any) is still live. ` +
+          `A person with access must promote it: POST /api/v1/apps/${appName}/promote. ` +
+          `Agent credentials cannot promote — that is the point of the setting.`,
+      },
+    ],
+  };
+}
+
+/**
  * Poll the deploy tracker until the episode correlated with this deploy
  * (`startedAt >= acceptedAt`) reaches a terminal status, or the wait budget
  * (`DROP_MCP_DEPLOY_WAIT_MS`, default 120s) elapses.
@@ -257,6 +284,14 @@ async function waitForDeployOutcome(
     const app = getStateManager().getApp(appName);
     if (app?.status === 'needs-config' && new Date(app.updatedAt).getTime() >= acceptedAtMs) {
       return needsConfigResult(appName);
+    }
+
+    // A held build never reaches a terminal deploy status either — the episode
+    // stays open because nothing started. Same `updatedAt >= acceptedAt` guard
+    // as the park above, so a hold left over from an earlier deploy cannot
+    // return early for this one.
+    if (app?.awaitingPromotion === true && new Date(app.updatedAt).getTime() >= acceptedAtMs) {
+      return awaitingPromotionResult(appName);
     }
 
     const [episode] = getDeployTracker().getEpisodes(appName, 1);

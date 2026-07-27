@@ -20,6 +20,10 @@ import {
   DeployRefusedError,
   guardrailKeysFor,
 } from '../../managers/guardrail/deploy-breaker';
+import {
+  getPrincipalQuota,
+  resetPrincipalQuota,
+} from '../../managers/guardrail/principal-quota';
 import type { AppDetectedPayload } from '../event-bus';
 // AppUpdatePayload isn't re-exported by ../event-bus (index.ts) - see the same
 // note in src/core/git-deploy/git-deploy.test.ts.
@@ -41,6 +45,13 @@ describe('UploadDeployService', () => {
     resetStateManager();
     const stateManager = getStateManager({ stateFilePath: path.join(tempDir, 'apps.json') });
     await stateManager.initialize();
+
+    // The deploy quota is a singleton whose DEFAULT store path is a real file
+    // under the repo. Left alone, these tests would write to it and accumulate
+    // counts across runs until every deploy here is refused.
+    resetDeployBreaker();
+    resetPrincipalQuota();
+    getPrincipalQuota(path.join(tempDir, 'principal-quotas.json'));
 
     resetUploadDeployService();
     service = new UploadDeployService({

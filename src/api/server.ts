@@ -276,6 +276,10 @@ export class ApiServer {
       v1.use('/apps/*/start', authMiddleware('user'));
       v1.use('/apps/*/stop', authMiddleware('user'));
       v1.use('/apps/*/restart', authMiddleware('user'));
+      // Promotion is a human decision (Step 6d). The role floor is enforced
+      // here; the route ALSO rejects an agent credential outright, because a
+      // role alone does not distinguish an agent token from a session.
+      v1.use('/apps/*/promote', authMiddleware('user'));
       // Upload deploy is never anonymous, even on an auth-enabled box with a
       // readonly token in hand — it mutates the app the same way git-deploy
       // does. Register before the general /apps/* readonly guard.
