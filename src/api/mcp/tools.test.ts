@@ -274,6 +274,49 @@ describe('MCP tool handlers', () => {
       expect(firstText(result)).toContain('ERROR: build broke');
     });
 
+    it('puts the deploy id in the TEXT content, not only in structuredContent', async () => {
+      // get_deploy_logs takes the id as its one required argument, and
+      // next_actions tells the caller to call it. A client that renders the text
+      // of an isError result — claude.ai does — shows no structured field, so an
+      // id that lives only there makes the advice unfollowable and severs the
+      // whole diagnose-and-retry loop. Verified broken against the live
+      // connector before this assertion existed.
+      jest.spyOn(uploadDeployModule, 'getUploadDeployService').mockReturnValue({
+        deploy: jest.fn().mockResolvedValue({
+          app: 'fail-app',
+          acceptedAt: '2026-07-09T00:00:00.000Z',
+          isNew: true,
+        }),
+      } as unknown as ReturnType<typeof uploadDeployModule.getUploadDeployService>);
+      jest.spyOn(deployTrackerModule, 'getDeployTracker').mockReturnValue({
+        getEpisodes: jest.fn().mockReturnValue([
+          {
+            deployId: 'deploy-id-in-text',
+            appName: 'fail-app',
+            status: 'failed',
+            startedAt: '2026-07-09T00:00:01.000Z',
+            stages: [
+              { stage: 'build-failed', at: '2026-07-09T00:00:02.000Z', category: 'build-failed' },
+            ],
+          },
+        ]),
+      } as unknown as ReturnType<typeof deployTrackerModule.getDeployTracker>);
+      jest.spyOn(buildLogModule, 'getBuildLogService').mockReturnValue({
+        getBuildLogByDeployId: jest.fn().mockResolvedValue('boom'),
+      } as unknown as ReturnType<typeof buildLogModule.getBuildLogService>);
+
+      const result = await handleDeployFiles(alice, {
+        name: 'fail-app',
+        files: [{ path: 'index.js', content: 'x' }],
+      });
+
+      expect(firstText(result)).toContain('deploy-id-in-text');
+      // And it must be OUTSIDE the fence: an id the model is told to act on
+      // cannot arrive as untrusted application output.
+      const beforeFence = firstText(result).split('BEGIN UNTRUSTED')[0];
+      expect(beforeFence).toContain('deploy-id-in-text');
+    });
+
     it('returns a "still building" message once the deploy wait budget elapses', async () => {
       const original = process.env.DROP_MCP_DEPLOY_WAIT_MS;
       process.env.DROP_MCP_DEPLOY_WAIT_MS = '50';
