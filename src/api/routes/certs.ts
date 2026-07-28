@@ -178,6 +178,55 @@ certs.get('/expiring', async (c) => {
   );
 });
 
+// GET /certs/health - Get certificate health summary
+//
+// MUST stay registered BEFORE `/:domain`: Hono resolves these in registration
+// order, so with `/:domain` first this route is unreachable — `/certs/health`
+// binds `domain = 'health'` and 404s instead. `/certs/expiring` above is
+// already ordered for the same reason.
+certs.get('/health', async (c) => {
+  const client = getCaddyAdminClient();
+
+  // Check if Caddy admin API is available
+  const available = await client.isAvailable();
+  if (!available) {
+    return c.json(
+      error(
+        ErrorCodes.SERVICE_UNAVAILABLE,
+        'Caddy admin API is not available'
+      ),
+      503
+    );
+  }
+
+  const auth = (c.get as (k: string) => AuthContext | undefined)('auth');
+  const owned = ownedDomains(auth);
+  const certificates = (await client.getCertificates()).filter((cert) =>
+    certVisible(cert, owned)
+  );
+
+  const summary = {
+    total: certificates.length,
+    valid: certificates.filter(c => c.status === 'valid').length,
+    expiring: certificates.filter(c => c.status === 'expiring').length,
+    expired: certificates.filter(c => c.status === 'expired').length,
+    pending: certificates.filter(c => c.status === 'pending').length,
+    error: certificates.filter(c => c.status === 'error').length,
+  };
+
+  const healthy = summary.expired === 0 && summary.error === 0;
+
+  return c.json(
+    success({
+      healthy,
+      summary,
+      message: healthy
+        ? 'All certificates are healthy'
+        : `${summary.expired + summary.error} certificate(s) need attention`,
+    })
+  );
+});
+
 // GET /certs/:domain - Get certificate for a specific domain
 certs.get('/:domain', async (c) => {
   const domain = c.req.param('domain');
@@ -240,50 +289,6 @@ certs.post('/renew', async (c) => {
     success({
       message: 'Certificate renewal triggered',
       note: 'Certificates will be renewed if they are within the renewal window',
-    })
-  );
-});
-
-// GET /certs/health - Get certificate health summary
-certs.get('/health', async (c) => {
-  const client = getCaddyAdminClient();
-
-  // Check if Caddy admin API is available
-  const available = await client.isAvailable();
-  if (!available) {
-    return c.json(
-      error(
-        ErrorCodes.SERVICE_UNAVAILABLE,
-        'Caddy admin API is not available'
-      ),
-      503
-    );
-  }
-
-  const auth = (c.get as (k: string) => AuthContext | undefined)('auth');
-  const owned = ownedDomains(auth);
-  const certificates = (await client.getCertificates()).filter((cert) =>
-    certVisible(cert, owned)
-  );
-
-  const summary = {
-    total: certificates.length,
-    valid: certificates.filter(c => c.status === 'valid').length,
-    expiring: certificates.filter(c => c.status === 'expiring').length,
-    expired: certificates.filter(c => c.status === 'expired').length,
-    pending: certificates.filter(c => c.status === 'pending').length,
-    error: certificates.filter(c => c.status === 'error').length,
-  };
-
-  const healthy = summary.expired === 0 && summary.error === 0;
-
-  return c.json(
-    success({
-      healthy,
-      summary,
-      message: healthy
-        ? 'All certificates are healthy'
-        : `${summary.expired + summary.error} certificate(s) need attention`,
     })
   );
 });
