@@ -16,8 +16,11 @@ A lightweight, self-hosted Platform as a Service (PaaS) engineered for the "drop
 - **Hot Reload** - Edit files and your app rebuilds/restarts automatically
 - **PostgreSQL Auto-Provisioning** - Apps get their own database with `DATABASE_URL` injected
 - **Port Persistence** - Apps keep the same port across restarts
-- **Multi-Runtime Support** - Node.js, Python, Docker, static sites
-- **Framework Detection** - Recognizes Next.js, Nuxt, Express, FastAPI, Flask, and more
+- **Multi-Runtime Support** - Node.js, Python, Go, Docker, static sites
+- **Framework Detection** - Recognizes Next.js, Nuxt, SvelteKit, Astro, Express, FastAPI, Flask, and more
+- **Required Secrets** - Declare them in `drop.yaml`; DROP generates or prompts instead of crash-looping
+- **Monorepos** - Several services from one repo, sharing a hostname with same-origin `/api` routing
+- **MCP Server** - Deploy and manage apps from Claude, Claude Code, Cursor and other agents
 - **Process Management** - Built on PM2 for reliable process management with auto-restart
 - **REST API** - Full API with JWT and API key authentication
 - **Web Dashboard** - Real-time monitoring UI at `/dashboard`
@@ -140,6 +143,10 @@ Edit any file in your app - DROP detects changes and automatically rebuilds/rest
 drop serve                # Start DROP platform
 drop serve -d             # Start as background daemon
 drop serve -r /custom     # Custom root directory
+drop server status        # Background service status
+drop server logs -f       # Stream background service logs
+drop server restart       # Restart the background service
+drop server stop          # Stop the background service
 
 # Applications
 drop list                 # List running apps
@@ -158,13 +165,19 @@ drop remove my-app        # Remove app
 drop deploy ./my-app                    # Deploy from path
 drop deploy ./my-app --name custom      # Custom name
 drop deploy ./my-app --port 4000        # Specific port
+drop deploy --git <url> --branch main   # Deploy from a GitHub repo
 
 # Maintenance
 drop backup                             # Snapshot state + database
 drop backup --keep 14                   # Retain the last 14 backups
 drop restore <backup-dir>               # Preview a restore (writes nothing)
 drop restore <backup-dir> --confirm     # Restore from a backup (stop the platform first)
+drop migrate-runtime my-app --to docker # Move an app between PM2 and Docker
+drop mfa disable <username>             # Admin recovery for a lost TOTP device
+drop version                            # Show the CLI version
 ```
+
+Every command and flag is listed at `/reference` on a running DROP.
 
 ## Supported App Types
 
@@ -173,10 +186,11 @@ drop restore <backup-dir> --confirm     # Restore from a backup (stop the platfo
 | **Node.js** | `package.json` | `npm install` + runs start script |
 | **Next.js** | `next.config.*` | `npm install` + `npm run build` + starts |
 | **Express/Fastify/Hono** | Dependencies | `npm install` + runs start script |
+| **Python** | `requirements.txt`, `pyproject.toml`, `setup.py`, or `Pipfile` | Installs into an in-app `.venv` + runs app |
+| **Go** | `go.mod` | `go build` + runs the binary (gin, fiber, echo, chi, gorilla recognized) |
+| **Docker** | `Dockerfile` | `docker build` + `docker run` |
 | **Static Site** | `index.html` | Serves with built-in static server |
 | **SPA** | `index.html` + framework | Serves with SPA routing support |
-| **Python** | `requirements.txt` | Installs into an in-app `.venv` + runs app |
-| **Docker** | `Dockerfile` | `docker build` + `docker run` |
 
 ## Database Auto-Provisioning
 
@@ -195,28 +209,58 @@ const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 
 DROP includes a REST API for programmatic control:
 
+All routes are mounted under `/api/v1`, and auth is on by default:
+
 ```bash
 # List apps
-curl http://localhost:3000/api/apps
+curl http://localhost:3000/api/v1/apps \
+  -H "X-API-Key: <api-key>"
 
 # Get app status
-curl http://localhost:3000/api/apps/my-app
+curl http://localhost:3000/api/v1/apps/my-app \
+  -H "X-API-Key: <api-key>"
 
-# Deploy (with API key)
-curl -X POST http://localhost:3000/api/apps \
+# Deploy
+curl -X POST http://localhost:3000/api/v1/apps \
   -H "Authorization: Bearer <api-key>" \
   -H "Content-Type: application/json" \
   -d '{"name": "my-app", "path": "/path/to/app"}'
 ```
 
+Every endpoint, with the role each one requires, is catalogued at
+`/reference` on a running DROP.
+
+## Deploy From an AI Agent (MCP)
+
+DROP hosts a Model Context Protocol server at `/api/v1/mcp`, so Claude,
+Claude Code, Cursor and other MCP clients can deploy and manage apps as
+native tools — `deploy_files`, `deploy_from_git`, `list_apps`,
+`app_status`, `app_logs`, `get_deploy_logs`, `restart_app`. There is no
+tool for reading secrets or deleting an app.
+
+Clients that send headers authenticate with a `user`-role API key:
+
+```bash
+claude mcp add --transport http dropkit \
+  https://drop.example.com/api/v1/mcp \
+  --header "Authorization: Bearer <user-api-key>"
+```
+
+The claude.ai web connector uses OAuth instead, so nobody pastes a key
+into a browser — it needs `DROP_PUBLIC_URL` set to a public HTTPS
+origin. Full setup is at `/docs` on a running DROP.
+
 ## Web Dashboard
 
-Access the dashboard at `http://localhost:3000/dashboard`:
+Access the dashboard at `http://localhost:3000/dashboard`, with a public
+site at `/`, docs at `/docs`, and the CLI/API reference at `/reference`:
 
 - **Apps List** - View all deployed apps with status indicators
-- **App Detail** - Start/stop/restart apps, view configuration
+- **App Detail** - Start/stop/restart apps, secrets, custom domain, deploy history
+- **Deploy** - Deploy from a path or a GitHub repo
 - **Logs Viewer** - Real-time log display with download option
-- **Settings** - Platform configuration
+- **Users** - User management (admin)
+- **Settings** - Platform configuration, including the Claude (MCP) connector details
 
 ## Logging
 
@@ -281,16 +325,33 @@ For explicit configuration, create `drop.yaml` in your app:
 ```yaml
 name: my-app
 type: nodejs
+domains:
+  - app.example.com
+database: postgres
+redis: true
 
-build:
-  command: npm run build
-
-start:
-  command: node dist/server.js
+build: npm run build
+start: node dist/server.js
 
 env:
   NODE_ENV: production
+
+secrets:
+  JWT_SECRET: generate
 ```
+
+`build` and `start` are plain strings, not nested objects. Unknown
+top-level keys are rejected outright, so a typo fails the deploy instead
+of being silently ignored.
+
+Declaring `secrets:` makes DROP resolve them *before* the app starts —
+auto-generating what it can, and parking the app in a `needs-config`
+status naming the missing keys instead of letting it crash-loop.
+
+A repo holding several services deploys as one unit via `group:` and
+`services:`, which share a hostname so a frontend can call its backend
+same-origin at `/api`. See `/docs` on a running DROP for the full field
+list and examples.
 
 ## Environment Variables
 
@@ -299,7 +360,13 @@ env:
 |----------|---------|-------------|
 | `DROP_ROOT` | `C:\drop` or `/var/drop` | Base directory |
 | `DROP_APPS_DIR` | `{root}/data/webapps` | Apps directory |
+| `DROP_API_PORT` | `3000` | Port for the REST API and dashboard |
 | `DROP_LOG_LEVEL` | `info` | Log level: debug, info, warn, error |
+| `DROP_PUBLIC_URL` | *(unset)* | Public HTTPS origin. Required for the claude.ai connector — OAuth fails closed without it |
+| `DROP_DISABLE_AUTH` | `false` | Turn API auth off entirely. Auth is **on** by default |
+| `DROP_ISOLATION` | `none` | `none` runs apps under PM2, `docker` runs each in a container |
+| `DROP_ENABLE_REDIS` | `true` | Run the bundled managed Redis |
+| `DROP_MAX_APPS_PER_USER` | `5` | Default per-user app quota (a per-user override wins; admins are unlimited) |
 
 ### Variables Injected Into Apps
 | Variable | Description |
@@ -307,7 +374,9 @@ env:
 | `PORT` | Assigned port for the app to listen on |
 | `DROP_DATA_DIR` | Persistent data directory path |
 | `DATABASE_URL` | PostgreSQL connection string (if database provisioned) |
+| `REDIS_URL` | Managed Redis connection string (if `redis: true` in `drop.yaml`) |
 | `DROP_API_URL` | Base URL for DROP's own REST API (`http://drop-host:<apiPort>` under docker isolation, `http://127.0.0.1:<apiPort>` otherwise) |
+| `DROP_API_KEY` | Least-privilege scoped key for calling DROP's own API — only for apps an admin granted capabilities to |
 
 ## Hostname Routing (Caddy)
 
