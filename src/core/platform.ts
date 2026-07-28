@@ -3087,10 +3087,15 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         | 'static'
         | 'docker'
         | 'unknown';
-      // MCP endpoint label (Step 11). Resolved on every build so removing the
+      // MCP endpoint (Step 11). Resolved on every build so removing the
       // dependency or the `mcp:` block clears it — hence the explicit
-      // `undefined`, which is how pendingPromotion is cleared too. Purely
-      // descriptive: no routing, build or auth decision reads it.
+      // `undefined`, which is how pendingPromotion is cleared too.
+      //
+      // ROUTING READS THIS. `handleConfigureRoute` emits a Caddy forward_auth
+      // guard when `source === 'declared' && auth === 'drop'`, and `mcp.path`
+      // is rendered into the generated Caddyfile — so it must stay
+      // MCP_PATH_REGEX-validated at the parser, and any future writer of this
+      // field (an API setter, an MCP tool) inherits that requirement.
       const mcpEndpoint = detectMcp(
         await readMcpInputs(appPath, (await parseDropYaml(appPath)).config?.mcp)
       );
@@ -3780,6 +3785,54 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
             }
           : undefined;
 
+      // DROP-guarded MCP endpoint (Step 11, PR 2b). `source: 'declared'` AND
+      // `auth: 'drop'` — the same pair the verify endpoint requires, so the
+      // Caddy guard and the gateway can never disagree about which apps are
+      // protected. Inference is deliberately excluded: enrolling an app into a
+      // login gate because it depends on the MCP SDK is a decision its owner
+      // never made.
+      const mcpConfig = this.appConfigService?.getConfig(appName)?.mcp;
+      const apiPortUsable = Number.isInteger(this.config.apiPort) && this.config.apiPort > 0;
+      if (mcpConfig?.source === 'declared' && mcpConfig.auth === 'drop' && !apiPortUsable) {
+        // `apiPort` comes from parseInt(env), and `??` does not catch NaN. A
+        // `forward_auth localhost:NaN` fails to parse the WHOLE Caddyfile, not
+        // just this block — every site on the box loses its config. Refuse the
+        // guard instead, and say so: an app that asked to be protected and is
+        // not must never be silent.
+        this.logger.error(
+          `App '${appName}' declares mcp.auth: drop but the API port is not usable ` +
+            `(${String(this.config.apiPort)}); refusing to emit the auth guard. ` +
+            'Its MCP endpoint is NOT protected.',
+          'ROUTER'
+        );
+      }
+      const mcpGuard =
+        mcpConfig?.source === 'declared' && mcpConfig.auth === 'drop' && apiPortUsable
+          ? {
+              path: mcpConfig.path,
+              appName,
+              // 127.0.0.1, not `localhost`: on an IPv6-preferring resolver
+              // `localhost` is ::1, which a Node listener bound to 0.0.0.0 does
+              // not serve. Go's dialer usually falls back, but this removes the
+              // dependency on that.
+              verifyUpstream: `127.0.0.1:${this.config.apiPort}`,
+            }
+          : undefined;
+
+      if (mcpGuard && this.config.isolation !== 'docker') {
+        // The guard lives only in Caddy. Outside docker isolation an app binds
+        // its own port on the host, so the endpoint stays reachable directly on
+        // that port with no OAuth at all. Under docker, containers publish to
+        // 127.0.0.1 only and inter-container traffic is disabled, which closes
+        // it. Emit the guard either way — an edge control beats none — but do
+        // not let an operator believe it is complete.
+        this.logger.warn(
+          `App '${appName}' has a DROP-guarded MCP endpoint, but this platform is not in ` +
+            'docker isolation: the app port is reachable directly, bypassing the guard.',
+          'ROUTER'
+        );
+      }
+
       // Configure route for each domain
       let resolvedPublicUrl: string | undefined;
       for (const hostname of domains) {
@@ -3798,6 +3851,11 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
             ? { certFile: customTls.certFile, keyFile: customTls.keyFile }
             : (enableSsl ? { auto: true } : undefined),
           headers: tenantSecurityHeaders,
+          // DROP-guarded MCP endpoint (Step 11). Only for an app that DECLARED
+          // it — an inferred label must never put a login gate in front of
+          // someone's app — and only when the API port is known, since the
+          // guard is a proxy to DROP's own verify endpoint.
+          ...(mcpGuard ? { mcpAuth: mcpGuard } : {}),
         });
 
         const protocol = enableSsl ? 'https' : 'http';

@@ -88,6 +88,32 @@ export interface RouteConfig {
   timeout?: number;
   /** Max request body size (e.g., "100MB") */
   maxBodySize?: string;
+  /**
+   * Put DROP's OAuth in front of this app's MCP endpoint (Step 11, PR 2b).
+   *
+   * Set only for an app that DECLARED `mcp: {auth: drop}`. Produces a
+   * `forward_auth` guard on the MCP path, and — critically — strips DROP's own
+   * credentials from the hop to the tenant.
+   */
+  mcpAuth?: McpAuthConfig;
+}
+
+/**
+ * The forward_auth guard for one app's MCP endpoint.
+ *
+ * `appName` is written into the verify URI as a LITERAL when the Caddyfile is
+ * generated. It must never be derived at request time from `Host` or
+ * `X-Forwarded-Host`: a client controls those, and doing so would let one
+ * tenant present its own valid token while claiming to be another app's
+ * endpoint (SEC-2).
+ */
+export interface McpAuthConfig {
+  /** Path the MCP endpoint is served on, e.g. `/mcp`. */
+  path: string;
+  /** The app this endpoint belongs to — baked into the verify URI. */
+  appName: string;
+  /** DROP's own API address, e.g. `127.0.0.1:3000`. */
+  verifyUpstream: string;
 }
 
 /**
