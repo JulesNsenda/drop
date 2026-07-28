@@ -13,10 +13,9 @@
  * the first real candidate appeared. The guard could never fire.
  */
 
-import * as fs from 'fs/promises';
 import * as path from 'path';
-import * as os from 'os';
 import { DropPlatform, createPlatform } from './platform';
+import { tryLogActivity } from '../managers/activity';
 
 jest.mock('../managers/activity', () => ({
   tryLogActivity: jest.fn().mockResolvedValue(undefined),
@@ -29,7 +28,6 @@ const HOUR_MS = 60 * 60 * 1000;
 
 describe('idle reaper dry-run budget', () => {
   let platform: DropPlatform;
-  let tempDir: string;
   let teardownApp: jest.Mock;
   let infoLines: string[];
   /** Bumped between sweeps so the fleet always looks alive. */
@@ -45,33 +43,38 @@ describe('idle reaper dry-run budget', () => {
    *    nothing.
    *  - `idle` is the agent-created candidate, deliberately motionless.
    */
-  const seedApps = (idleCreatedHoursAgo: number) => {
+  const seedApps = (dormantCreatedHoursAgo: number, extra: string[] = []) => {
     const now = Date.now();
+    const dormant = ['dormant', ...extra];
     (platform as any).stateManager = {
       getAllApps: () => [
         { name: 'busy', status: 'running', createdAt: new Date(now - 100 * HOUR_MS).toISOString() },
-        {
-          name: 'idle',
+        ...dormant.map((name) => ({
+          name,
           status: 'running',
           userId: 'u1',
-          createdAt: new Date(now - idleCreatedHoursAgo * HOUR_MS).toISOString(),
-        },
+          createdAt: new Date(now - dormantCreatedHoursAgo * HOUR_MS).toISOString(),
+        })),
       ],
       getApp: (name: string) => ({ name, status: 'running', userId: 'u1' }),
     };
     (platform as any).appConfigService = {
-      getConfig: (name: string) => (name === 'idle' ? { agentCreated: true } : {}),
+      // `busy` is deliberately NOT agentCreated: it is the human's app, and the
+      // reaper must never touch it.
+      getConfig: (name: string) => (name === 'busy' ? {} : { agentCreated: true }),
     };
     (platform as any).runtime = {
       getStatus: async (name: string) => ({ cpuTotalNs: name === 'busy' ? busyCpu : 5_000 }),
     };
   };
 
-  /** Make `idle` look like it has been motionless for well over the window. */
-  const seedIdleHistory = (lastActiveHoursAgo: number) => {
+  /** Make the dormant apps look motionless for well over the window. */
+  const seedIdleHistory = (lastActiveHoursAgo: number, names: string[] = ['dormant']) => {
     const now = Date.now();
-    (platform as any).idleState.lastCpu.set('idle', 5_000);
-    (platform as any).idleState.lastActive.set('idle', now - lastActiveHoursAgo * HOUR_MS);
+    for (const name of names) {
+      (platform as any).idleState.lastCpu.set(name, 5_000);
+      (platform as any).idleState.lastActive.set(name, now - lastActiveHoursAgo * HOUR_MS);
+    }
   };
 
   const sweep = async () => {
@@ -79,16 +82,18 @@ describe('idle reaper dry-run budget', () => {
     await (platform as any).sweepIdleApps();
   };
 
-  beforeEach(async () => {
+  beforeEach(() => {
     process.env.DROP_IDLE_REAP_DRY_RUNS = '3';
     process.env.DROP_IDLE_REAP_HOURS = '24';
     busyCpu = 1_000_000_000;
+    (tryLogActivity as jest.Mock).mockClear();
 
-    tempDir = path.join(os.tmpdir(), `drop-reaper-${Date.now()}-${Math.random()}`);
-    await fs.mkdir(tempDir, { recursive: true });
+    // No temp directory: the constructor assembles config and a logger and
+    // touches no filesystem, and every collaborator this drives is stubbed.
+    const root = path.join('C:', 'drop-reaper-test-unused');
     platform = createPlatform({
-      dropRoot: tempDir,
-      appsDirectory: path.join(tempDir, 'apps'),
+      dropRoot: root,
+      appsDirectory: path.join(root, 'apps'),
       logLevel: 'error',
     });
 
@@ -104,12 +109,11 @@ describe('idle reaper dry-run budget', () => {
     };
   });
 
-  afterEach(async () => {
+  afterEach(() => {
     if (savedDryRuns === undefined) delete process.env.DROP_IDLE_REAP_DRY_RUNS;
     else process.env.DROP_IDLE_REAP_DRY_RUNS = savedDryRuns;
     if (savedHours === undefined) delete process.env.DROP_IDLE_REAP_HOURS;
     else process.env.DROP_IDLE_REAP_HOURS = savedHours;
-    await fs.rm(tempDir, { recursive: true, force: true }).catch(() => undefined);
   });
 
   it('does not spend the budget on sweeps that reap nothing', async () => {
@@ -120,28 +124,30 @@ describe('idle reaper dry-run budget', () => {
     for (let i = 0; i < 5; i += 1) await sweep();
 
     expect(teardownApp).not.toHaveBeenCalled();
-    expect((platform as any).idleSweepCount).toBe(0);
   });
 
   it('still dry-runs the FIRST sweep that finds a candidate, after many quiet ones', async () => {
-    // This is the regression. Before the fix these five no-op sweeps burned the
-    // whole 3-sweep budget, so the very first app that ever qualified was
-    // deleted for real with no dry-run line ever logged.
+    // This is the regression. Counting every sweep burned the whole 3-sweep
+    // budget on these five no-ops, so the very first app that ever qualified
+    // was deleted for real with no dry-run line ever logged.
     seedApps(2);
     seedIdleHistory(0.1);
     for (let i = 0; i < 5; i += 1) await sweep();
 
-    // Now the app becomes genuinely reapable: old enough, and motionless for
-    // longer than the window.
+    // Now it becomes genuinely reapable: old enough, and motionless for longer
+    // than the window.
     seedApps(100);
     seedIdleHistory(30);
     await sweep();
 
     expect(teardownApp).not.toHaveBeenCalled();
-    expect(infoLines.some((l) => l.includes('[dry run 1/3]') && l.includes('idle'))).toBe(true);
+    // The quotes matter: `would reap idle app '<name>'` contains the bare word
+    // "idle" regardless of which app it names, so an unquoted substring test
+    // would pass even if the line named the wrong app.
+    expect(infoLines.some((l) => l.includes('[dry run 1/3]') && l.includes("'dormant'"))).toBe(true);
   });
 
-  it('reaps for real once the budget is spent by reaping sweeps', async () => {
+  it('reaps for real once that app has used its own dry runs', async () => {
     seedApps(100);
 
     // Three reap-producing sweeps are dry runs...
@@ -155,6 +161,45 @@ describe('idle reaper dry-run budget', () => {
     seedIdleHistory(30);
     await sweep();
 
-    expect(teardownApp).toHaveBeenCalledWith('idle');
+    expect(teardownApp).toHaveBeenCalledWith('dormant');
+    // Never the human's app, which is not agentCreated.
+    expect(teardownApp).toHaveBeenCalledTimes(1);
+  });
+
+  it('gives a LATER app its own dry runs instead of deleting it outright', async () => {
+    // The budget is per app. A single process-wide counter would be spent by
+    // the first app that legitimately qualifies, so the next one — possibly
+    // months later, possibly the one a broken signal produced — would be
+    // deleted with no warning at all. That is the case the guard exists for.
+    seedApps(100);
+    for (let i = 0; i < 4; i += 1) {
+      seedIdleHistory(30);
+      await sweep();
+    }
+    expect(teardownApp).toHaveBeenCalledWith('dormant');
+    expect(teardownApp).toHaveBeenCalledTimes(1);
+
+    infoLines.length = 0;
+    // A second agent-created app now goes idle.
+    seedApps(100, ['latecomer']);
+    seedIdleHistory(30, ['latecomer']);
+    await sweep();
+
+    expect(teardownApp).toHaveBeenCalledTimes(1); // still just the first one
+    expect(infoLines.some((l) => l.includes('[dry run 1/3]') && l.includes("'latecomer'"))).toBe(
+      true
+    );
+  });
+
+  it('records each dry run durably, not only as a log line', async () => {
+    // An operator is not tailing logs at 3am. The dashboard activity feed is
+    // the reviewable record that a deletion was coming.
+    seedApps(100);
+    seedIdleHistory(30);
+    await sweep();
+
+    expect(tryLogActivity).toHaveBeenCalledWith(
+      expect.objectContaining({ action: 'idle-reap-dryrun', appName: 'dormant' })
+    );
   });
 });
