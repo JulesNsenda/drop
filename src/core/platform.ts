@@ -5226,10 +5226,26 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           userId: app?.userId,
           detail: `Expired at ${config.expiresAt}`,
         });
-        // skipDatabaseBackup: an ephemeral's data is throwaway by construction,
-        // and dumping it on the way out would fill the box with backups of
-        // scratch databases nobody will ever read.
-        await this.teardownApp(config.name, { skipDatabaseBackup: true }).catch((err) => {
+        // A monorepo container is not a single app. Only the CONTAINER carries
+        // the ephemeral flag (it is the app that was deployed; the children are
+        // synthesized later by expandMonorepo), so tearing down just the
+        // container would leave every child service running and routed, with
+        // nothing left that any sweep could ever collect them by. removeGroup
+        // is the existing group-aware path — children first, then the
+        // container, then the container folder. The sibling sweeps sidestep
+        // this by excluding containers outright; an expiry is a deadline the
+        // caller asked for, so the group goes instead of nothing going.
+        //
+        // removeGroup takes no skipDatabaseBackup, so a group's children keep
+        // their dump. That errs toward keeping data on the rarer path.
+        const reap =
+          app?.isGroupContainer && app.group
+            ? this.removeGroup(app.group).then(() => undefined)
+            : // skipDatabaseBackup: an ephemeral's data is throwaway by
+              // construction, and dumping it on the way out would fill the box
+              // with backups of scratch databases nobody will ever read.
+              this.teardownApp(config.name, { skipDatabaseBackup: true });
+        await reap.catch((err) => {
           this.logger.warn(
             `Ephemeral reap of '${config.name}' failed: ${err instanceof Error ? err.message : 'unknown'}`,
             'REAP'
