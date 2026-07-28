@@ -736,9 +736,35 @@ drop serve --domain example.com --https --wildcard --dns-provider cloudflare`}
       <Section id="databases" title="Databases">
         <p style={pStyle}>
           DROP bundles its own PostgreSQL — but it's a runtime service <em>for your deployed apps</em>, not where
-          the platform stores its own state (that lives in flat files under <code>data/drop-svc/</code>). When an
-          app's dependencies suggest it needs a database (<code>pg</code>, <code>mysql</code>, <code>prisma</code>,
-          etc.), DROP provisions a dedicated PostgreSQL database and injects <code>DATABASE_URL</code>:
+          the platform stores its own state (that lives in flat files under <code>data/drop-svc/</code>). When an app
+          needs a database, DROP provisions a dedicated one and injects <code>DATABASE_URL</code>:
+        </p>
+        <DocTable
+          headers={['DROP provisions when…', 'Details']}
+          rows={[
+            ['drop.yaml says database: postgres', 'The explicit form. Always wins, and the only way to ask for one from a non-Node app'],
+            ['A Postgres client or ORM is in package.json', 'pg, pg-promise, postgres, slonik, @prisma/client, prisma, drizzle-orm, knex, sequelize, typeorm, objection, @mikro-orm/postgresql — in dependencies or devDependencies'],
+            ['An ORM config file is present', 'prisma/schema.prisma, drizzle.config.*, knexfile.*, ormconfig.json, typeorm.config.ts, sequelize.config.js, .sequelizerc'],
+          ]}
+        />
+        <Callout tone="warn">
+          A <strong style={{ color: 'var(--text)' }}>MySQL, MongoDB or SQLite</strong> driver does not trigger
+          provisioning — DROP only runs PostgreSQL, and a <code>postgres://</code> URL an app can't use would be
+          worse than none. Those apps bring their own database. Detection also reads{' '}
+          <code>package.json</code> only, so a Python or Go app asks with <code>database: postgres</code> in{' '}
+          <code>drop.yaml</code>. (<code>database: sqlite</code> is accepted, but provisions PostgreSQL and logs a
+          warning — DROP has no SQLite provisioner.)
+        </Callout>
+        <p style={pStyle}>
+          Provisioning happens when an app is <em>deployed</em>, not on a plain restart — so an app that only just
+          became database-shaped needs a redeploy, not a <code>restart</code>. And if your per-user database quota
+          is already full, the app still starts, but without a <code>DATABASE_URL</code>: check the platform log for
+          a quota warning if one goes missing.
+        </p>
+        <p style={pStyle}>
+          Set your own <code>DATABASE_URL</code> secret and DROP steps aside: an app already pointed at a database
+          is never given a second one behind its back. An explicit <code>database: postgres</code> in{' '}
+          <code>drop.yaml</code> still wins, since that is asking for a DROP database in as many words.
         </p>
         <CodeBlock
           label="app.js"
