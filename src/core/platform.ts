@@ -2735,6 +2735,34 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     // name:/group:). Runs on every expansion, so a phantom left by an older
     // platform heals on the next redeploy. Folder-dropped containers were
     // never registered and no entry is created for them here.
+    // OWNERSHIP GUARD on the group tag itself.
+    //
+    // `group` comes from the tenant's own drop.yaml and is validated only as a
+    // non-empty string, yet it is treated downstream as an IDENTITY: it decides
+    // which apps a group teardown destroys, and (Step 11) which OAuth resource
+    // an app's MCP endpoint resolves to. A tenant naming another user's app as
+    // their group therefore reaches into that user's world — the same root as
+    // the deletion defect fixed in 026a712, closed here at the source rather
+    // than patched at each consumer.
+    //
+    // Refuse rather than silently renaming: an operator who wrote `group: x`
+    // and got `y` would have no idea why their services are not grouped.
+    const containerOwner = this.stateManager?.getApp(repoName)?.userId;
+    const groupClaimant = this.stateManager
+      ?.getAllApps()
+      .find((a) => a.name !== repoName && (a.name === group || a.group === group));
+    if (groupClaimant && groupClaimant.userId !== containerOwner) {
+      this.logger.error(
+        `Refusing monorepo group '${group}' for '${repoName}': the name is already held by ` +
+          `'${groupClaimant.name}', which belongs to a different owner.`,
+        'MONOREPO'
+      );
+      throw new Error(
+        `Monorepo group '${group}' is already in use by another account. ` +
+          'Choose a different `group:` in drop.yaml.'
+      );
+    }
+
     if (this.stateManager?.hasApp(repoName)) {
       await this.stateManager.updateApp(repoName, { group, isGroupContainer: true });
     }
