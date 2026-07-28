@@ -516,7 +516,7 @@ describe('MCP tool handlers', () => {
     it('app_status reports the composed endpoint AND that it is public', async () => {
       await getAppConfigService().upsertConfig('alice-app', {
         type: 'nodejs',
-        mcp: { path: '/mcp', auth: 'none' },
+        mcp: { path: '/mcp', auth: 'none', source: 'declared' },
       });
 
       const text = firstText(handleAppStatus(alice, { name: 'alice-app' }));
@@ -538,7 +538,7 @@ describe('MCP tool handlers', () => {
     it('list_apps marks an MCP app and leaves others unmarked', async () => {
       await getAppConfigService().upsertConfig('alice-app', {
         type: 'nodejs',
-        mcp: { path: '/mcp', auth: 'none' },
+        mcp: { path: '/mcp', auth: 'none', source: 'declared' },
       });
       await getStateManager().registerApp('plain-app', path.join(tempDir, 'plain-app'));
       await getStateManager().updateApp('plain-app', { userId: alice.userId });

@@ -246,14 +246,12 @@ export interface AppMcpConfig {
   /**
    * Who guards the endpoint.
    *
-   * `none` is the ONLY accepted value today, and it means the endpoint is
-   * PUBLIC unless the app authenticates callers itself. `drop` is rejected
-   * rather than accepted-and-ignored: silently treating it as `none` would tell
-   * a tenant DROP guards their endpoint while it is open to the internet, and a
-   * schema that lies about a security property is worse than one that changes
-   * twice.
+   * `none` (default) — PUBLIC unless the app authenticates callers itself.
+   * `drop` — DROP is the authorization server: callers present an OAuth token
+   * audienced at THIS app, and only DROP users who can access the app are
+   * admitted. Opting in is the owner's decision and is never inferred.
    */
-  auth?: 'none';
+  auth?: 'none' | 'drop';
 }
 
 /**
@@ -416,19 +414,11 @@ export function validateDropYamlConfig(
       }
     }
 
-    if (mcp.auth !== undefined) {
-      if (mcp.auth === 'drop') {
-        // Rejected, NOT accepted-and-ignored. See AppMcpConfig.auth.
-        return {
-          valid: false,
-          error:
-            "mcp.auth: 'drop' is not supported yet — DROP does not guard app MCP endpoints. " +
-            "Use 'none' and authenticate callers in the app itself; DROP-managed OAuth is coming separately.",
-        };
-      }
-      if (mcp.auth !== 'none') {
-        return { valid: false, error: `Invalid mcp.auth '${String(mcp.auth)}': must be 'none'` };
-      }
+    if (mcp.auth !== undefined && mcp.auth !== 'none' && mcp.auth !== 'drop') {
+      return {
+        valid: false,
+        error: `Invalid mcp.auth '${String(mcp.auth)}': must be 'none' or 'drop'`,
+      };
     }
   }
 

@@ -86,7 +86,24 @@ export interface AppConfig {
    * reverse_proxy already carries the path) and no auth: `none` means the
    * endpoint is public unless the app authenticates callers itself.
    */
-  mcp?: { path: string; auth: 'none' };
+  mcp?: {
+    path: string;
+    /**
+     * `none` — DROP guards nothing; the endpoint is public unless the app
+     * authenticates callers itself.
+     * `drop` — DROP is the authorization server for this endpoint. Only a
+     * DECLARED endpoint may be `drop`: opting an app into a login gate is a
+     * decision its owner makes, never one inferred from a dependency.
+     */
+    auth: 'none' | 'drop';
+    /**
+     * Whether the tenant DECLARED this endpoint in drop.yaml or DROP inferred
+     * it from a manifest. Load-bearing, not bookkeeping: only a declared
+     * endpoint becomes an OAuth resource, so inference stays cosmetic exactly
+     * as mcp-detect.ts claims.
+     */
+    source: 'declared' | 'inferred';
+  };
   promotion?: 'auto' | 'manual';
   /**
    * A built-but-unpromoted deploy, when promotion is manual. Absent when

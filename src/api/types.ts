@@ -78,7 +78,7 @@ export interface AppDto {
    * `'none'` today, meaning the endpoint is PUBLIC unless the app authenticates
    * callers itself; any UI that renders `url` must render that too.
    */
-  mcp?: { url: string; auth: 'none' };
+  mcp?: { url: string; auth: 'none' | 'drop' };
   /** Live memory usage in bytes (from runtime; null when not running or unavailable). */
   memory?: number | null;
   /** Live CPU usage percent (from runtime; null when not running or unavailable). */
