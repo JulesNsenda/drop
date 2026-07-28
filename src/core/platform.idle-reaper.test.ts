@@ -14,6 +14,8 @@
  */
 
 import * as path from 'path';
+import * as os from 'os';
+import * as fsp from 'fs/promises';
 import { DropPlatform, createPlatform } from './platform';
 import { tryLogActivity } from '../managers/activity';
 
@@ -219,8 +221,11 @@ describe('expired ephemeral sweep', () => {
   let teardownApp: jest.Mock;
   let removeGroup: jest.Mock;
 
-  /** One expired ephemeral config; `app` is what the state manager reports. */
-  const seed = (app: Record<string, unknown>) => {
+  /**
+   * One expired ephemeral config. `app` is what the state manager reports for
+   * it; `groupEntries` is the whole fleet the group cascade would consider.
+   */
+  const seed = (app: Record<string, unknown>, groupEntries?: Record<string, unknown>[]) => {
     (platform as any).appConfigService = {
       getAllConfigs: () => [
         {
@@ -230,7 +235,10 @@ describe('expired ephemeral sweep', () => {
         },
       ],
     };
-    (platform as any).stateManager = { getApp: () => app };
+    (platform as any).stateManager = {
+      getApp: () => app,
+      getAllApps: () => groupEntries ?? (app.group ? [app] : []),
+    };
   };
 
   beforeEach(() => {
@@ -255,7 +263,10 @@ describe('expired ephemeral sweep', () => {
   });
 
   it('removes the whole group when the expired ephemeral is a monorepo container', async () => {
-    seed({ name: 'scratch', userId: 'u1', isGroupContainer: true, group: 'scratch' });
+    seed({ name: 'scratch', userId: 'u1', isGroupContainer: true, group: 'scratch' }, [
+      { name: 'scratch', userId: 'u1', isGroupContainer: true, group: 'scratch' },
+      { name: 'scratch-api', userId: 'u1', group: 'scratch' },
+    ]);
 
     await (platform as any).sweepExpiredEphemerals();
 
@@ -263,6 +274,24 @@ describe('expired ephemeral sweep', () => {
     // The container must NOT also be torn down on its own: removeGroup already
     // does that last, and a second pass would race its own fs.rm.
     expect(teardownApp).not.toHaveBeenCalled();
+  });
+
+  it('refuses the group cascade when the group holds another owner\'s apps', async () => {
+    // The security regression. `group` is tenant-authored, so an attacker can
+    // tag their own throwaway app with a victim's group name; cascading on it
+    // would tear down the victim's apps and their databases from a timer, with
+    // no interactive step and no owner check.
+    seed({ name: 'scratch', userId: 'attacker', isGroupContainer: true, group: 'victim-group' }, [
+      { name: 'scratch', userId: 'attacker', isGroupContainer: true, group: 'victim-group' },
+      { name: 'victim-api', userId: 'victim', group: 'victim-group' },
+    ]);
+
+    await (platform as any).sweepExpiredEphemerals();
+
+    expect(removeGroup).not.toHaveBeenCalled();
+    // The attacker's own expired app is still reaped — the deadline it asked
+    // for is honoured, just without the cascade.
+    expect(teardownApp).toHaveBeenCalledWith('scratch', { skipDatabaseBackup: true });
   });
 
   it('tears down an ordinary ephemeral directly, skipping the database backup', async () => {
@@ -285,5 +314,101 @@ describe('expired ephemeral sweep', () => {
 
     expect(teardownApp).toHaveBeenCalledWith('scratch', { skipDatabaseBackup: true });
     expect(removeGroup).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * `removeGroup`'s trailing, NAME-DERIVED container-folder removal.
+ *
+ * `groupName` comes from a tenant's own drop.yaml `group:` field, and
+ * `<appsDirectory>/<groupName>` is exactly where every other app's source
+ * lives. The character-class guard on that path is containment — it proves the
+ * delete cannot escape the webapps directory, and nothing whatsoever about who
+ * owns the target.
+ */
+describe('removeGroup — name-derived container folder removal', () => {
+  let platform: DropPlatform;
+  let registeredNames: string[];
+  let tempDir: string;
+  let appsDir: string;
+
+  /** Real directories, so the assertion is on what actually survived. */
+  const makeAppFolder = async (name: string): Promise<string> => {
+    const dir = path.join(appsDir, name);
+    await fsp.mkdir(dir, { recursive: true });
+    await fsp.writeFile(path.join(dir, 'index.js'), 'console.log(1)');
+    return dir;
+  };
+
+  const exists = async (p: string): Promise<boolean> =>
+    fsp
+      .access(p)
+      .then(() => true)
+      .catch(() => false);
+
+  beforeEach(async () => {
+    tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'drop-removegroup-'));
+    appsDir = path.join(tempDir, 'webapps');
+    await fsp.mkdir(appsDir, { recursive: true });
+
+    platform = createPlatform({
+      dropRoot: tempDir,
+      appsDirectory: appsDir,
+      logLevel: 'error',
+    });
+
+    registeredNames = [];
+    (platform as any).stateManager = {
+      // No entry carries the group tag, so nothing is torn down by entry —
+      // isolating the trailing name-derived removal, which is the subject here.
+      getAllApps: () => [],
+      hasApp: (n: string) => registeredNames.includes(n),
+    };
+    (platform as any).appConfigService = { hasConfig: () => false };
+    (platform as any).logger = {
+      info: () => undefined,
+      warn: () => undefined,
+      debug: () => undefined,
+      error: () => undefined,
+    };
+  });
+
+  afterEach(async () => {
+    await fsp.rm(tempDir, { recursive: true, force: true, maxRetries: 5 }).catch(() => undefined);
+  });
+
+  it('REFUSES to delete a folder whose name belongs to a registered app', async () => {
+    // The exploit: a tenant sets `group: victim-app` in their own throwaway
+    // app's drop.yaml. expandMonorepo tags their container with it, and when
+    // that app expires the reaper calls removeGroup('victim-app') — which used
+    // to recursively delete the victim's entire source tree on the name alone.
+    const victim = await makeAppFolder('victim-app');
+    registeredNames = ['victim-app'];
+
+    await platform.removeGroup('victim-app');
+
+    expect(await exists(victim)).toBe(true);
+  });
+
+  it('still removes a genuinely orphaned container folder', async () => {
+    // The case the trailing removal exists for: a phantom left by an older
+    // platform version, with no state entry and no config of its own. Without
+    // this the watcher would re-detect the root drop.yaml and regenerate every
+    // child that was just deleted.
+    const orphan = await makeAppFolder('orphan-group');
+    registeredNames = [];
+
+    await platform.removeGroup('orphan-group');
+
+    expect(await exists(orphan)).toBe(false);
+  });
+
+  it('still refuses a name that could escape the webapps directory', async () => {
+    const outside = path.join(tempDir, 'not-an-app');
+    await fsp.mkdir(outside, { recursive: true });
+
+    await platform.removeGroup('../not-an-app');
+
+    expect(await exists(outside)).toBe(true);
   });
 });

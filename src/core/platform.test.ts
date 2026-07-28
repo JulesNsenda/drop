@@ -2877,6 +2877,12 @@ describe('teardownApp / removeGroup (M4: group lifecycle)', () => {
       removeApp: jest.fn().mockResolvedValue(true),
       getApp: jest.fn().mockReturnValue(undefined),
       getAllApps: jest.fn().mockReturnValue([]),
+      // removeGroup's name-derived folder removal refuses when a REGISTERED app
+      // holds the group name (a tenant could otherwise name a victim's app as
+      // their group). Default false = "nothing else claims it", which is what
+      // these group-lifecycle tests assume; the refusal itself is covered in
+      // platform.idle-reaper.test.ts.
+      hasApp: jest.fn().mockReturnValue(false),
       ...overrides.stateManager,
     };
     (platform as any).runtime = {
@@ -2895,6 +2901,7 @@ describe('teardownApp / removeGroup (M4: group lifecycle)', () => {
     (platform as any).appConfigService = {
       getConfig: jest.fn().mockReturnValue(undefined),
       deleteConfig: jest.fn().mockResolvedValue(true),
+      hasConfig: jest.fn().mockReturnValue(false),
       ...overrides.appConfigService,
     };
     (platform as any).secretManager = {
