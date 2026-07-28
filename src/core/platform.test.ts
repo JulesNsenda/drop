@@ -1950,6 +1950,10 @@ describe('expandMonorepo (M2: monorepo -> per-service app expansion)', () => {
       registerApp: jest.fn().mockResolvedValue(undefined),
       updateApp: jest.fn().mockResolvedValue(undefined),
       hasApp: jest.fn().mockReturnValue(false),
+      // expandMonorepo refuses a `group:` already held by another OWNER, so it
+      // reads the fleet before tagging the container.
+      getApp: jest.fn().mockReturnValue(undefined),
+      getAllApps: jest.fn().mockReturnValue([]),
     };
     const buildSpy = jest.fn().mockResolvedValue(undefined);
     (platform as any).handleBuildApp = buildSpy;
@@ -2053,6 +2057,10 @@ describe('expandMonorepo (M2: monorepo -> per-service app expansion)', () => {
       registerApp: jest.fn().mockResolvedValue(undefined),
       updateApp: jest.fn().mockResolvedValue(undefined),
       hasApp: jest.fn().mockReturnValue(false),
+      // expandMonorepo refuses a `group:` already held by another OWNER, so it
+      // reads the fleet before tagging the container.
+      getApp: jest.fn().mockReturnValue(undefined),
+      getAllApps: jest.fn().mockReturnValue([]),
     };
     (platform as any).handleBuildApp = jest.fn().mockResolvedValue(undefined);
     const warnSpy = jest.spyOn((platform as any).logger, 'warn').mockImplementation(() => undefined);
@@ -2095,6 +2103,10 @@ describe('expandMonorepo (M2: monorepo -> per-service app expansion)', () => {
       registerApp: jest.fn().mockResolvedValue(undefined),
       updateApp: jest.fn().mockResolvedValue(undefined),
       hasApp: jest.fn().mockReturnValue(false),
+      // expandMonorepo refuses a `group:` already held by another OWNER, so it
+      // reads the fleet before tagging the container.
+      getApp: jest.fn().mockReturnValue(undefined),
+      getAllApps: jest.fn().mockReturnValue([]),
     };
     (platform as any).handleBuildApp = jest.fn().mockResolvedValue(undefined);
 
@@ -2146,6 +2158,8 @@ describe('expandMonorepo (M2: monorepo -> per-service app expansion)', () => {
       updateApp,
       // The deploy-from-git path registered the repo just before expansion.
       hasApp: jest.fn((name: string) => name === repoName),
+      getApp: jest.fn().mockReturnValue(undefined),
+      getAllApps: jest.fn().mockReturnValue([]),
     };
     (platform as any).handleBuildApp = jest.fn().mockResolvedValue(undefined);
 
@@ -2187,6 +2201,8 @@ describe('expandMonorepo (M2: monorepo -> per-service app expansion)', () => {
       registerApp,
       updateApp,
       hasApp: jest.fn().mockReturnValue(false),
+      getApp: jest.fn().mockReturnValue(undefined),
+      getAllApps: jest.fn().mockReturnValue([]),
     };
     (platform as any).handleBuildApp = jest.fn().mockResolvedValue(undefined);
 
@@ -2197,6 +2213,85 @@ describe('expandMonorepo (M2: monorepo -> per-service app expansion)', () => {
     // Children are registered; the container itself is neither registered nor tagged.
     expect(registerApp).not.toHaveBeenCalledWith(repoName, expect.anything(), expect.anything());
     expect(updateApp).not.toHaveBeenCalledWith(repoName, expect.anything());
+  });
+
+  it('REFUSES a group name already held by another owner', async () => {
+    // `group` is tenant-authored and is treated downstream as an IDENTITY: it
+    // decides which apps a group teardown destroys, and which OAuth resource an
+    // MCP endpoint resolves to. Claiming another user's app as your group is
+    // how the deletion defect in 026a712 worked; this closes it at the source.
+    const repoName = 'attacker-repo';
+    const repoPath = path.join(appsDir, repoName);
+    await fsPromises.mkdir(path.join(repoPath, 'backend'), { recursive: true });
+
+    const updateApp = jest.fn().mockResolvedValue(undefined);
+    (platform as any).appConfigService = {
+      getConfig: jest.fn().mockReturnValue(undefined),
+      upsertConfig: jest.fn().mockResolvedValue({}),
+    };
+    (platform as any).stateManager = {
+      registerApp: jest.fn().mockResolvedValue(undefined),
+      updateApp,
+      hasApp: jest.fn().mockReturnValue(true),
+      getApp: jest.fn((name: string) =>
+        name === repoName ? { name: repoName, userId: 'attacker' } : undefined
+      ),
+      getAllApps: jest
+        .fn()
+        .mockReturnValue([
+          { name: repoName, userId: 'attacker' },
+          { name: 'victim-app', userId: 'victim' },
+        ]),
+    };
+    (platform as any).handleBuildApp = jest.fn().mockResolvedValue(undefined);
+
+    await expect(
+      (platform as any).expandMonorepo(repoPath, repoName, {
+        group: 'victim-app',
+        services: { backend: { path: 'backend' } },
+      })
+    ).rejects.toThrow(/already in use by another account/);
+
+    // And nothing was tagged with the stolen name before the refusal.
+    expect(updateApp).not.toHaveBeenCalledWith(
+      repoName,
+      expect.objectContaining({ group: 'victim-app' })
+    );
+  });
+
+  it('allows a group name held by the SAME owner', async () => {
+    // The ordinary case: a repo whose own name is the group, redeployed.
+    const repoName = 'ezsign';
+    const repoPath = path.join(appsDir, repoName);
+    await fsPromises.mkdir(path.join(repoPath, 'backend'), { recursive: true });
+
+    const updateApp = jest.fn().mockResolvedValue(undefined);
+    (platform as any).appConfigService = {
+      getConfig: jest.fn().mockReturnValue(undefined),
+      upsertConfig: jest.fn().mockResolvedValue({}),
+    };
+    (platform as any).stateManager = {
+      registerApp: jest.fn().mockResolvedValue(undefined),
+      updateApp,
+      hasApp: jest.fn().mockReturnValue(true),
+      getApp: jest.fn(() => ({ name: repoName, userId: 'owner' })),
+      getAllApps: jest
+        .fn()
+        .mockReturnValue([
+          { name: repoName, userId: 'owner' },
+          { name: 'ezsign-backend', userId: 'owner', group: 'ezsign' },
+        ]),
+    };
+    (platform as any).handleBuildApp = jest.fn().mockResolvedValue(undefined);
+
+    await (platform as any).expandMonorepo(repoPath, repoName, {
+      services: { backend: { path: 'backend' } },
+    });
+
+    expect(updateApp).toHaveBeenCalledWith(
+      repoName,
+      expect.objectContaining({ group: 'ezsign', isGroupContainer: true })
+    );
   });
 
   describe('handleConfigureRoute (M3: same-origin routing)', () => {
