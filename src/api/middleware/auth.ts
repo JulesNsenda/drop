@@ -880,11 +880,17 @@ export async function mintAppMcpAccessToken(
     .sign(oauthTokenSecret);
 }
 
-/** Identity a tenant app learns about its caller. Never an AuthContext. */
+/**
+ * Identity a tenant app learns about its caller. NEVER an AuthContext — this
+ * must not be assignable to anything that performs control-plane authorization.
+ * `role` is read LIVE from the user record for the gateway's own access check,
+ * never from the token (which deliberately carries no role claim).
+ */
 export interface AppMcpIdentity {
   userId: string;
   username: string;
   appName: string;
+  role: 'admin' | 'user' | 'readonly';
 }
 
 /**
@@ -926,6 +932,7 @@ export async function verifyAppMcpAccessToken(
       userId,
       username: user.username,
       appName: expectedApp,
+      role: user.role,
     };
   } catch {
     return null;

@@ -55,7 +55,14 @@ describe('app_mcp access tokens', () => {
 
     const identity = await verifyAppMcpAccessToken(token, APP_AUD, 'alpha');
 
-    expect(identity).toEqual({ userId: user.id, username: 'alice', appName: 'alpha' });
+    // `role` is read LIVE from the user record for the gateway's own access
+    // check — the token itself carries no role claim.
+    expect(identity).toEqual({
+      userId: user.id,
+      username: 'alice',
+      appName: 'alpha',
+      role: 'user',
+    });
   });
 
   it('is REJECTED at another app’s audience', async () => {

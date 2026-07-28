@@ -54,7 +54,7 @@ export interface App {
    * guards nothing — the endpoint is public unless the app authenticates
    * callers itself, and any UI showing the URL must say so.
    */
-  mcp?: { url: string; auth: 'none' };
+  mcp?: { url: string; auth: 'none' | 'drop' };
   /** Live memory usage in bytes (from runtime; present only while status === 'running'). */
   memory?: number | null;
   /** Live CPU usage percent (from runtime; present only while status === 'running'). */

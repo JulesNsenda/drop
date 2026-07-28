@@ -33,6 +33,7 @@ import {
 import { getStateManager } from '../../managers/app/state-manager';
 import { getAppConfigService } from '../../managers/app/app-config';
 import { computeAppUrl } from './apps';
+import { canAccess } from '../access';
 import {
   isAuthEnabled,
   getOAuthClientId,
@@ -57,22 +58,41 @@ import {
  * exists, and app names are reusable.
  */
 function listAppMcpResources(): AppMcpResource[] {
+  let configs;
   try {
-    const out: AppMcpResource[] = [];
-    for (const cfg of getAppConfigService().getAllConfigs()) {
-      if (!cfg.mcp) continue;
-      const app = getStateManager().getApp(cfg.name);
-      if (!app) continue;
-      const base = computeAppUrl(app);
-      if (!base) continue;
-      out.push({ appName: cfg.name, resource: getAppMcpResourceUrl(base, cfg.mcp.path) });
-    }
-    return out;
+    configs = getAppConfigService().getAllConfigs();
   } catch {
     // Managers not initialised (isolated route tests) — no app resources, so
     // only DROP's own resource resolves. Fails closed.
     return [];
   }
+
+  const out: AppMcpResource[] = [];
+  for (const cfg of configs) {
+    // PER-APP try. A single `try` around the whole loop meant one app could
+    // zero the list for EVERY tenant: `computeAppUrl` interpolates
+    // `app.customDomain` raw, that field is settable through PUT /apps/:name
+    // without the domain-format check the dedicated route applies, and a value
+    // WHATWG URL rejects (a space, a '[') throws inside canonicalizeUrl. The
+    // whole feature would then fail closed platform-wide until an operator
+    // found the one poisoned record. One bad app must cost only that app.
+    try {
+      // Only an EXPLICIT declaration registers an OAuth resource. Inference
+      // exists to label an app in the UI; letting it also mint an audience
+      // would enrol any app that merely depends on the MCP SDK — including an
+      // MCP *client* or a test harness — without its owner asking for it.
+      if (cfg.mcp?.source !== 'declared') continue;
+      if (cfg.mcp.auth !== 'drop') continue;
+      const app = getStateManager().getApp(cfg.name);
+      if (!app) continue;
+      const base = computeAppUrl(app);
+      if (!base) continue;
+      out.push({ appName: cfg.name, resource: getAppMcpResourceUrl(base, cfg.mcp.path) });
+    } catch {
+      continue;
+    }
+  }
+  return out;
 }
 
 /** Resolve a requested resource, or null to refuse. */
@@ -81,6 +101,29 @@ function resolveRequestedResource(
   publicUrl: string
 ): OAuthResourceTarget | null {
   return resolveOAuthResource(requested, getMcpResourceUrl(publicUrl), listAppMcpResources());
+}
+
+/**
+ * Whether this user may hold a token for this target.
+ *
+ * Authentication is not authorization: resolving a resource proves the app
+ * exists and opted in, not that the consenting user may use it. Checked at
+ * mint AND at every refresh, because ownership is not expressible in a token's
+ * claims — an app can be transferred, or deleted and its name re-registered by
+ * a different user, while a grant for that name is still alive.
+ */
+function mayHoldTokenFor(target: OAuthResourceTarget, user: User): boolean {
+  if (target.kind === 'drop') return true;
+  try {
+    const app = getStateManager().getApp(target.appName);
+    if (!app) return false;
+    return canAccess(
+      { userId: user.id, username: user.username, role: user.role, authMethod: 'jwt' },
+      app
+    );
+  } catch {
+    return false;
+  }
 }
 
 /** The only allowed redirect_uri — claude.ai's fixed MCP OAuth callback. Validated by raw string equality. */
@@ -248,6 +291,17 @@ oauth.post('/approve', async (c) => {
       400
     );
   }
+
+  const approver = getUserById(auth.userId) as User | null;
+  if (!approver || !mayHoldTokenFor(target, approver)) {
+    // Indistinguishable from an unknown resource: whether an app exists and
+    // who owns it is not something an unauthorized approver should learn here.
+    return c.json(
+      error(ErrorCodes.VALIDATION_ERROR, 'resource does not match a known MCP endpoint.'),
+      400
+    );
+  }
+
   const resolvedResource = audienceFor(target, getMcpResourceUrl(publicUrl));
 
   const code = mintAuthorizationCode({
@@ -316,6 +370,9 @@ oauth.post('/token', async (c) => {
     // mintable audience rather than silently falling back to DROP's own.
     const target = resolveRequestedResource(record.resource, publicUrl);
     if (!target) return tokenError('invalid_target', 'Resource is no longer a known MCP endpoint');
+    if (!mayHoldTokenFor(target, user)) {
+      return tokenError('invalid_target', 'Resource is no longer a known MCP endpoint');
+    }
 
     const accessToken =
       target.kind === 'app'
@@ -363,6 +420,13 @@ oauth.post('/token', async (c) => {
     const grantResource = rotated.resource ?? getMcpResourceUrl(publicUrl);
     const target = resolveRequestedResource(grantResource, publicUrl);
     if (!target) return tokenError('invalid_target', 'Resource is no longer a known MCP endpoint');
+    // Re-checked on EVERY refresh, not just at consent. Otherwise a grant
+    // outlives the access it was based on: delete an app, let someone else
+    // register the name, and the old refresh token keeps minting valid tokens
+    // against the new owner's app forever.
+    if (!mayHoldTokenFor(target, user)) {
+      return tokenError('invalid_target', 'Resource is no longer a known MCP endpoint');
+    }
 
     // rotated.sid, NOT a fresh one — the grant's identity survives the refresh.
     const accessToken =

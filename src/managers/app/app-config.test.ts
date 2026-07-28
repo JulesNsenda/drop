@@ -188,12 +188,18 @@ describe('AppConfigService runtime field', () => {
       await service.initialize();
       await service.upsertConfig('mcp-app', {
         type: 'nodejs',
-        mcp: { path: '/mcp', auth: 'none' },
+        mcp: { path: '/mcp', auth: 'none', source: 'declared' },
       });
 
       const reloaded = makeService();
       await reloaded.initialize();
-      expect(reloaded.getConfig('mcp-app')?.mcp).toEqual({ path: '/mcp', auth: 'none' });
+      expect(reloaded.getConfig('mcp-app')?.mcp).toEqual({
+        path: '/mcp',
+        auth: 'none',
+        // `source` decides whether the app is an OAuth resource at all, so it
+        // has to survive the round trip as much as the path does.
+        source: 'declared',
+      });
     });
 
     it('clears the label when a rebuild reports the app is no longer an MCP server', async () => {
@@ -204,7 +210,7 @@ describe('AppConfigService runtime field', () => {
 
       const service = makeService();
       await service.initialize();
-      await service.upsertConfig('was-mcp', { type: 'nodejs', mcp: { path: '/mcp', auth: 'none' } });
+      await service.upsertConfig('was-mcp', { type: 'nodejs', mcp: { path: '/mcp', auth: 'none', source: 'declared' } });
       await service.updateConfig('was-mcp', { mcp: undefined });
 
       const reloaded = makeService();
