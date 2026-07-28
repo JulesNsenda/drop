@@ -9,6 +9,7 @@ import {
   ExternalLink,
   Clock,
   Folder,
+  Plug,
   Key,
   Plus,
   X,
@@ -375,6 +376,26 @@ function AppDetailPage() {
             </span>
           )}
         </Card>
+
+        {app.mcp ? (
+          <Card>
+            <div className="mb-1 flex items-center gap-2" style={{ color: 'var(--text-2)' }}>
+              <Plug className="h-4 w-4" />
+              <span className="text-sm">MCP endpoint</span>
+            </div>
+            <p className="break-all text-sm font-semibold" style={{ color: 'var(--text)' }}>
+              {app.mcp.url}
+            </p>
+            {/*
+              Shown with the URL, never separately: DROP does not guard this
+              endpoint, and an operator handed only an address would reasonably
+              assume it did.
+            */}
+            <p className="mt-1 text-xs" style={{ color: 'var(--text-3)' }}>
+              Public — DROP does not authenticate callers to this endpoint.
+            </p>
+          </Card>
+        ) : null}
 
         {isAdmin && app.path ? (
           <Card>

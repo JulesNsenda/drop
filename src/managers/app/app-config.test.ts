@@ -176,6 +176,43 @@ describe('AppConfigService runtime field', () => {
     });
   });
 
+  describe('mcp field (Step 11)', () => {
+    it('persists and reloads the endpoint', async () => {
+      // Every consumer (app_status, list_apps, the DTO) reads this AFTER a
+      // restart, so surviving the round trip to disk is the property that
+      // matters — an in-memory assertion would pass on a write that never
+      // reached the file.
+      await fs.mkdir(path.join(webappsDir, 'mcp-app'), { recursive: true });
+
+      const service = makeService();
+      await service.initialize();
+      await service.upsertConfig('mcp-app', {
+        type: 'nodejs',
+        mcp: { path: '/mcp', auth: 'none' },
+      });
+
+      const reloaded = makeService();
+      await reloaded.initialize();
+      expect(reloaded.getConfig('mcp-app')?.mcp).toEqual({ path: '/mcp', auth: 'none' });
+    });
+
+    it('clears the label when a rebuild reports the app is no longer an MCP server', async () => {
+      // platform.ts writes `mcp: undefined` on every build, so removing the
+      // dependency or the drop.yaml block must actually unset it rather than
+      // leave a stale endpoint advertised forever.
+      await fs.mkdir(path.join(webappsDir, 'was-mcp'), { recursive: true });
+
+      const service = makeService();
+      await service.initialize();
+      await service.upsertConfig('was-mcp', { type: 'nodejs', mcp: { path: '/mcp', auth: 'none' } });
+      await service.updateConfig('was-mcp', { mcp: undefined });
+
+      const reloaded = makeService();
+      await reloaded.initialize();
+      expect(reloaded.getConfig('was-mcp')?.mcp).toBeFalsy();
+    });
+  });
+
   describe('write serialization (P1-2 lost-update)', () => {
     it('serializes concurrent updates so no field is dropped', async () => {
       const service = makeService();

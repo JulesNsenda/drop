@@ -24,6 +24,8 @@ import {
 } from './tools';
 import { AuthContext } from '../middleware/auth';
 import { getStateManager, resetStateManager } from '../../managers/app/state-manager';
+import { getAppConfigService, resetAppConfigService } from '../../managers/app/app-config';
+import { setApiRuntimeConfig } from '../runtime-config';
 import { setPlatformOps, resetPlatformOps, PlatformOps, AppInProgressError } from '../platform-ops';
 import { resetUploadPreflightState } from '../upload-preflight';
 import * as diskUtils from '../../utils/disk';
@@ -490,6 +492,61 @@ describe('MCP tool handlers', () => {
       const result = await handleRestartApp(alice, { name: 'alice-app' });
       expect(result.isError).toBe(true);
       expect(firstText(result)).toContain('operation in progress');
+    });
+  });
+
+  describe('MCP endpoint surfacing (Step 11)', () => {
+    beforeEach(async () => {
+      // A real config service: the label lives in the app config, and the
+      // helper swallows a missing service, so a mocked-away one would make
+      // these tests pass on an endpoint that was never surfaced.
+      resetAppConfigService();
+      await getAppConfigService({
+        configDir: path.join(tempDir, 'appconf'),
+        webappsDir: tempDir,
+      }).initialize();
+      setApiRuntimeConfig({ domainSuffix: 'example.test', enableHttps: true });
+    });
+
+    afterEach(() => {
+      resetAppConfigService();
+      setApiRuntimeConfig({ domainSuffix: 'localhost', enableHttps: false });
+    });
+
+    it('app_status reports the composed endpoint AND that it is public', async () => {
+      await getAppConfigService().upsertConfig('alice-app', {
+        type: 'nodejs',
+        mcp: { path: '/mcp', auth: 'none' },
+      });
+
+      const text = firstText(handleAppStatus(alice, { name: 'alice-app' }));
+
+      expect(text).toContain('mcp_url: https://alice-app.example.test/mcp');
+      // Not decoration: DROP guards nothing here, and an agent given only a URL
+      // would reasonably assume it did.
+      expect(text).toContain('PUBLIC');
+    });
+
+    it('app_status says nothing about MCP for an ordinary app', async () => {
+      await getAppConfigService().upsertConfig('alice-app', { type: 'nodejs' });
+
+      const text = firstText(handleAppStatus(alice, { name: 'alice-app' }));
+
+      expect(text).not.toContain('mcp_url');
+    });
+
+    it('list_apps marks an MCP app and leaves others unmarked', async () => {
+      await getAppConfigService().upsertConfig('alice-app', {
+        type: 'nodejs',
+        mcp: { path: '/mcp', auth: 'none' },
+      });
+      await getStateManager().registerApp('plain-app', path.join(tempDir, 'plain-app'));
+      await getStateManager().updateApp('plain-app', { userId: alice.userId });
+
+      const lines = firstText(handleListApps(alice)).split('\n');
+
+      expect(lines.find(l => l.startsWith('alice-app'))).toContain('mcp=yes');
+      expect(lines.find(l => l.startsWith('plain-app'))).not.toContain('mcp=yes');
     });
   });
 });

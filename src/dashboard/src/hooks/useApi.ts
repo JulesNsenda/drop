@@ -48,6 +48,13 @@ export interface App {
    * its own. Lets the dashboard offer a "Redeploy group" action on any child.
    */
   groupGitBacked?: boolean;
+  /**
+   * Present when the app speaks MCP (Step 11). `url` is composed server-side
+   * from the app's own hostname and a validated path. `auth: 'none'` means DROP
+   * guards nothing — the endpoint is public unless the app authenticates
+   * callers itself, and any UI showing the URL must say so.
+   */
+  mcp?: { url: string; auth: 'none' };
   /** Live memory usage in bytes (from runtime; present only while status === 'running'). */
   memory?: number | null;
   /** Live CPU usage percent (from runtime; present only while status === 'running'). */

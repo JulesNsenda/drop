@@ -48,4 +48,8 @@ export type {
   AppTlsConfig,
   AppEnvConfig,
   AppDependency,
+  AppMcpConfig,
 } from './drop-yaml-parser';
+
+export { detectMcp, readMcpInputs, DEFAULT_MCP_PATH } from './mcp-detect';
+export type { McpEndpoint, McpDetectInput } from './mcp-detect';
