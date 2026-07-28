@@ -10,6 +10,8 @@ import * as fs from 'fs/promises';
 import * as yaml from 'yaml';
 import * as crypto from 'crypto';
 import { EventBus, eventBus, Unsubscribe, AppDeletedPayload, AppDetectedPayload } from './event-bus';
+import { isReservedHost } from '../utils/reserved-hosts';
+import { getPublicUrl } from '../api/runtime-config';
 import type { DeployFailureReason } from './event-bus/event-bus.types';
 import { WatcherService } from './watcher';
 // Imported from the concrete file, NOT the './watcher' barrel: several test
@@ -3751,6 +3753,18 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       if (hasCustomDomains && this.appConfigService) {
         const owners = this.appConfigService.getDomainOwners(domainSuffix);
         acceptedCustomDomains = domains.filter((d) => {
+          // The platform's OWN host is not in `owners` — it is not an app — so
+          // it read as unclaimed, and unclaimed means available. A tenant
+          // claiming it gets a Caddy block for DROP's hostname pointing at
+          // their app, which serves DROP's OAuth and MCP endpoints: a victim's
+          // control-plane token delivered straight to a tenant.
+          if (isReservedHost(d, getPublicUrl(), domainSuffix)) {
+            this.logger.warn(
+              `Refusing domain '${d}' for ${appName}: reserved by the platform`,
+              'ROUTER'
+            );
+            return false;
+          }
           const owner = owners.get(d.toLowerCase());
           if (owner && owner !== appName) {
             this.logger.warn(
