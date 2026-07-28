@@ -220,15 +220,24 @@ export class GitDeployService {
     // ONLY on first creation (SEC-11) — deploy() rejects an existing app name
     // above, so reaching here always means new. A redeploy goes through
     // redeploy(), which never touches this flag.
+    //
+    // upsertConfig, NOT updateConfig — the config does not exist yet here (the
+    // app:detected handler below creates it) and updateConfig no-ops when it is
+    // missing, silently dropping every flag. Same defect as upload-deploy.ts;
+    // see the longer note there.
     if (request.agentCaller) {
-      await getAppConfigService().updateConfig(appName, { agentCreated: true });
+      await getAppConfigService().upsertConfig(appName, {
+        agentCreated: true,
+        path: destPath,
+      });
     }
     if (request.ephemeral) {
       const ttl = resolveTtlMinutes(request.ttlMinutes);
-      await getAppConfigService().updateConfig(appName, {
+      await getAppConfigService().upsertConfig(appName, {
         ephemeral: true,
         expiresAt: new Date(Date.now() + ttl * 60_000).toISOString(),
         ephemeralPrincipalId: request.principalId,
+        path: destPath,
         agentCreated: true,
       });
     }

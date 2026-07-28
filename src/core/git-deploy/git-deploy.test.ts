@@ -9,6 +9,11 @@ import { execFile } from 'child_process';
 import { GitDeployService, resetGitDeployService } from './git-deploy';
 import { resetStateManager, getStateManager } from '../../managers/app/state-manager';
 import { resetSecretManager, getSecretManager } from '../../managers/secret';
+import {
+  AppConfigService,
+  getAppConfigService,
+  resetAppConfigService,
+} from '../../managers/app/app-config';
 import * as diskUtils from '../../utils/disk';
 import { eventBus } from '../event-bus';
 // AppUpdatePayload isn't re-exported by ../event-bus (index.ts) - see the same
@@ -454,6 +459,56 @@ describe('GitDeployService', () => {
 
       const matches = service.findAppsForWebhook('https://github.com/user/normalize-test', 'main');
       expect(matches).toContain('normalize-test');
+    });
+  });
+
+  /**
+   * The same write-ordering seam as upload-deploy: these flags are set before
+   * `app:detected` is published, so the app's config does not exist yet and
+   * `updateConfig` silently wrote nothing. Asserted through a fresh service
+   * loading from disk, because every consumer reads the config after a restart.
+   */
+  describe('per-app flag persistence (config write ordering)', () => {
+    let configDir: string;
+    let webappsDir: string;
+
+    beforeEach(async () => {
+      configDir = path.join(tempDir, 'appconf');
+      webappsDir = path.join(tempDir, 'webapps');
+      resetAppConfigService();
+      await getAppConfigService({ configDir, webappsDir }).initialize();
+    });
+
+    afterEach(() => {
+      resetAppConfigService();
+    });
+
+    async function reloadConfig(appName: string) {
+      const fresh = new AppConfigService({ configDir, webappsDir });
+      await fresh.initialize();
+      return fresh.getConfig(appName);
+    }
+
+    it('persists agentCreated and the ephemeral deadline for a cloned app', async () => {
+      await service.deploy({
+        repoUrl: 'https://github.com/user/eph-clone',
+        userId: 'user-1',
+        principalId: 'oauth:sub-1::sid-1',
+        agentCaller: true,
+        ephemeral: true,
+        ttlMinutes: 5,
+      });
+
+      // git is mocked here, so the clone never creates the app folder — and a
+      // fresh service's cleanupStaleConfigs would (correctly) delete a config
+      // whose app directory is missing. A real clone lands this directory.
+      await fs.mkdir(path.join(webappsDir, 'eph-clone'), { recursive: true });
+
+      const config = await reloadConfig('eph-clone');
+      expect(config?.agentCreated).toBe(true);
+      expect(config?.ephemeral).toBe(true);
+      expect(config?.ephemeralPrincipalId).toBe('oauth:sub-1::sid-1');
+      expect(new Date(config?.expiresAt ?? '').getTime()).toBeGreaterThan(Date.now());
     });
   });
 });
