@@ -10,6 +10,7 @@ import {
   CaddyDirective,
   CaddyConfig,
   UpstreamConfig,
+  McpAuthConfig,
 } from './router.types';
 import { DnsProvider } from './dns-challenge';
 
@@ -125,9 +126,22 @@ export function generateRouteBlock(
     });
   }
 
+  // DROP-guarded MCP endpoint (Step 11). MUST precede the catch-all
+  // reverse_proxy below: Caddy evaluates `handle` blocks in order, and a
+  // preceding catch-all would serve the MCP path unguarded.
+  if (route.mcpAuth) {
+    directives.push(generateMcpAuthHandle(route, route.mcpAuth));
+  }
+
   // Reverse proxy
   const reverseProxyDirective = generateReverseProxyDirective(route);
-  directives.push(reverseProxyDirective);
+  // Wrapped in its own `handle` when an MCP guard exists, so the guard's block
+  // is not bypassed by a bare directive matching every path.
+  directives.push(
+    route.mcpAuth
+      ? { name: 'handle', block: [reverseProxyDirective] }
+      : reverseProxyDirective
+  );
 
   // Build address
   const address = buildAddress(route);
@@ -135,6 +149,76 @@ export function generateRouteBlock(
   return {
     address,
     directives,
+  };
+}
+
+/**
+ * The `handle` block guarding one app's MCP endpoint with DROP's OAuth.
+ *
+ * Two things here are load-bearing, both from SEC-2:
+ *
+ *  1. `?app=<name>` is a LITERAL written at generation time. `forward_auth`
+ *     proxies the ORIGINAL request to the verify endpoint, so anything derived
+ *     from `Host`/`X-Forwarded-Host` at request time would be client-controlled
+ *     — one tenant could present its own valid token while claiming to be
+ *     another app's endpoint.
+ *  2. `header_up -Authorization` / `-X-Api-Key` on the hop to the TENANT.
+ *     forward_auth only authorizes; without stripping, the original request —
+ *     DROP's bearer token included — is then proxied to the app, and a
+ *     malicious tenant simply harvests DROP-issued credentials from its own
+ *     inbound traffic. There is no access-token revocation, so a harvested
+ *     token is good until it expires.
+ *
+ * Inbound `X-Forwarded-*` are stripped too, so a client cannot pre-set what the
+ * verify endpoint or the tenant sees, and the identity headers DROP adds
+ * (`X-Drop-User-Id` / `X-Drop-Username`) are cleared on the way IN before
+ * `copy_headers` re-adds the authenticated values — otherwise a client could
+ * simply assert who it is.
+ */
+function generateMcpAuthHandle(route: RouteConfig, mcp: McpAuthConfig): CaddyDirective {
+  const upstreams = normalizeUpstreams(route.upstream).map(u => u.address);
+
+  return {
+    name: 'handle',
+    args: [`${mcp.path}*`],
+    block: [
+      {
+        name: 'request_header',
+        args: ['-X-Drop-User-Id'],
+      },
+      {
+        name: 'request_header',
+        args: ['-X-Drop-Username'],
+      },
+      {
+        name: 'request_header',
+        args: ['-X-Forwarded-Host'],
+      },
+      {
+        name: 'request_header',
+        args: ['-X-Forwarded-For'],
+      },
+      {
+        name: 'request_header',
+        args: ['-X-Forwarded-Proto'],
+      },
+      {
+        name: 'forward_auth',
+        args: [mcp.verifyUpstream],
+        block: [
+          { name: 'uri', args: [`/api/v1/mcp-gateway/verify?app=${mcp.appName}`] },
+          { name: 'copy_headers', args: ['X-Drop-User-Id', 'X-Drop-Username'] },
+        ],
+      },
+      {
+        name: 'reverse_proxy',
+        args: upstreams,
+        block: [
+          { name: 'header_up', args: ['-Authorization'] },
+          { name: 'header_up', args: ['-X-Api-Key'] },
+        ],
+      },
+    ],
   };
 }
 
