@@ -66,10 +66,25 @@ apps.use('/:name/*', validateAppName());
  */
 const UPDATABLE_APP_FIELDS = ['framework', 'customDomain'] as const;
 
+/**
+ * Same check `PUT /:name/domain` applies. This route accepted `customDomain`
+ * unvalidated, and the value is interpolated into a URL by `computeAppUrl` —
+ * a value WHATWG URL rejects (a space, a '[') therefore threw inside anything
+ * building an app URL. One tenant could poison a shared derivation that way.
+ */
+const CUSTOM_DOMAIN_RE = /^[a-zA-Z0-9][a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/;
+
 function pickUpdatableFields(body: Record<string, unknown>): Partial<AppState> {
   const updates: Partial<AppState> = {};
   for (const field of UPDATABLE_APP_FIELDS) {
     if (body[field] !== undefined) {
+      if (field === 'customDomain') {
+        const value = body[field];
+        // '' clears the domain, matching the dedicated route.
+        if (value !== '' && (typeof value !== 'string' || !CUSTOM_DOMAIN_RE.test(value))) {
+          throw new ValidationError('Invalid domain format');
+        }
+      }
       (updates as Record<string, unknown>)[field] = body[field];
     }
   }

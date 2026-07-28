@@ -48,6 +48,14 @@ function OAuthConsent() {
     resource: searchParams.get('resource') || '',
   };
 
+  /**
+   * Present when the grant is scoped to ONE app's MCP endpoint rather than to
+   * DROP's control plane. Set by /oauth/authorize after it resolves the
+   * requested resource; the server re-resolves independently at /approve, so
+   * this is display only and is never sent back as authority.
+   */
+  const appName = searchParams.get('app') || '';
+
   const isValid = params.client_id.length > 0 && params.redirect_uri.length > 0;
 
   const handleApprove = async () => {
@@ -171,9 +179,29 @@ function OAuthConsent() {
               ) : null}
               .
             </p>
-            <p className="mt-2 text-sm" style={{ color: 'var(--text-2)' }}>
-              This will allow claude.ai to deploy and manage your apps on your behalf.
-            </p>
+            {/*
+              What is actually being granted. Without this the screen reads
+              identically for a full control-plane grant and for a grant scoped
+              to a single app — the approver could not tell them apart, which
+              makes the audience separation invisible at the one moment a person
+              is asked to agree to it.
+            */}
+            {appName ? (
+              <p className="mt-2 text-sm" style={{ color: 'var(--text-2)' }}>
+                This grants access to <strong>{appName}</strong> only — one app's MCP
+                endpoint. It does <strong>not</strong> allow deploying or managing your
+                other apps.
+              </p>
+            ) : (
+              <p className="mt-2 text-sm" style={{ color: 'var(--text-2)' }}>
+                This will allow claude.ai to deploy and manage your apps on your behalf.
+              </p>
+            )}
+            {params.resource ? (
+              <p className="mt-2 break-all font-mono text-xs" style={{ color: 'var(--text-3)' }}>
+                {params.resource}
+              </p>
+            ) : null}
           </div>
         </div>
 
