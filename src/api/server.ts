@@ -46,6 +46,7 @@ import gitDeployRoutes from './routes/git-deploy';
 import adminRoutes from './routes/admin';
 import usageRoutes from './routes/usage';
 import oauthRoutes from './routes/oauth';
+import mcpGatewayRoutes from './routes/mcp-gateway';
 import { handleMcpRequest, methodNotAllowed } from './mcp/transport';
 import { getPlatformVersion } from '../utils/version';
 
@@ -340,6 +341,11 @@ export class ApiServer {
     v1.route('/git', gitDeployRoutes);
     v1.route('/admin', adminRoutes);
     v1.route('/oauth', oauthRoutes);
+    // Caddy's forward_auth target for tenant MCP endpoints (Step 11). NOT
+    // behind authMiddleware on purpose: it authenticates an app-audienced
+    // bearer itself and must reject every other credential class, which a
+    // general auth gate would instead admit.
+    v1.route('/mcp-gateway', mcpGatewayRoutes);
 
     // Hosted MCP endpoint (PRD-040): stateless Streamable HTTP, POST only.
     // GET/DELETE have no meaning in stateless mode (no sessions/streams) —

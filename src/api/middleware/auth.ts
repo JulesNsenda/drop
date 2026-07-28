@@ -155,6 +155,21 @@ interface RefreshTokenRecord {
    * only on re-consent, which mints a new grant.
    */
   sid?: string;
+  /**
+   * The resource identifier this grant was issued FOR (Step 11, PR 2).
+   *
+   * Carried through rotation like `sid`, and load-bearing: the refresh path used
+   * to recompute DROP's own MCP resource on every rotation, so once per-app
+   * audiences exist, refreshing a grant issued for a tenant's app would mint a
+   * token audienced at DROP itself — an app-scoped grant silently upgrading to
+   * full control-plane access over every app its user owns. The recorded value
+   * is the only truthful source; anything recomputed at refresh time is a guess.
+   *
+   * Absent on grants issued before this field existed; those are DROP-scoped by
+   * construction (no other resource could be named), so a missing value reads as
+   * DROP's own resource.
+   */
+  resource?: string;
 }
 
 // Credentials storage
@@ -827,6 +842,97 @@ export async function mintOAuthAccessToken(
 }
 
 /**
+ * Mint an access token for a TENANT APP's MCP endpoint (Step 11, PR 2).
+ *
+ * Structurally distinct from `mintOAuthAccessToken` in two ways, both
+ * deliberate:
+ *
+ *  - `token_use: 'app_mcp'` (≠ `'oauth_access'`), so the two classes stay
+ *    distinguishable even on an audience collision. `verifyOAuthAccessToken`
+ *    rejects on `token_use` before it ever looks at `aud`, so one of these can
+ *    never authenticate against DROP's own API or its `/mcp`.
+ *  - NO `role` claim. A control-plane role is meaningless to a tenant app and
+ *    would be a live escalation primitive if any future code path built an
+ *    `AuthContext` from these claims. The token answers exactly one question:
+ *    "which DROP user is calling THIS app?"
+ *
+ * The `app` claim is the app NAME, so the verifier can bind a token to the app
+ * it is presented to without re-deriving it from a spoofable request header.
+ */
+export async function mintAppMcpAccessToken(
+  user: User,
+  audience: string,
+  appName: string,
+  sid?: string
+): Promise<string> {
+  if (!oauthTokenSecret) throw new Error('Auth not initialized');
+  return new jose.SignJWT({
+    sub: user.id,
+    username: user.username,
+    token_use: 'app_mcp',
+    app: appName,
+    aud: audience,
+    ...(sid ? { sid } : {}),
+  })
+    .setProtectedHeader({ alg: 'HS256' })
+    .setIssuedAt()
+    .setExpirationTime(`${ACCESS_TOKEN_TTL_SECONDS}s`)
+    .sign(oauthTokenSecret);
+}
+
+/** Identity a tenant app learns about its caller. Never an AuthContext. */
+export interface AppMcpIdentity {
+  userId: string;
+  username: string;
+  appName: string;
+}
+
+/**
+ * Verify a token minted by `mintAppMcpAccessToken`, for ONE named app.
+ *
+ * Both the audience and the app name are supplied by the caller and compared
+ * with `===`. The gateway derives them from a value baked into the generated
+ * Caddy config at write time, never from `Host`/`X-Forwarded-Host`, which a
+ * client controls — otherwise one tenant could present its own valid token
+ * while claiming to be another app's endpoint.
+ *
+ * The user record is re-read live (never trusted from the claim), so a
+ * suspended or deleted account stops authenticating immediately — the same
+ * durable-revocation rule `verifyOAuthAccessToken` follows.
+ */
+export async function verifyAppMcpAccessToken(
+  token: string,
+  expectedAudience: string,
+  expectedApp: string
+): Promise<AppMcpIdentity | null> {
+  if (!oauthTokenSecret) return null;
+  try {
+    const { payload } = await jose.jwtVerify(token, oauthTokenSecret, { algorithms: ['HS256'] });
+    const p = payload as unknown as Record<string, unknown>;
+    if (p['token_use'] !== 'app_mcp') return null;
+    if (p['aud'] !== expectedAudience) return null;
+    if (p['app'] !== expectedApp) return null;
+
+    const userId = p['sub'];
+    if (typeof userId !== 'string' || !userId) return null;
+
+    const user = getUserById(userId);
+    if (!user || user.enabled === false) return null;
+
+    const sid = p['sid'];
+    if (typeof sid === 'string' && sid && isGrantDenied(sid)) return null;
+
+    return {
+      userId,
+      username: user.username,
+      appName: expectedApp,
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Verify an OAuth access token minted by `mintOAuthAccessToken`.
  *
  * Returns null unless the token verifies against the OAuth signing key AND
@@ -969,7 +1075,8 @@ function hashOpaqueToken(token: string): string {
 export async function issueRefreshToken(
   userId: string,
   clientId: string,
-  sid?: string
+  sid?: string,
+  resource?: string
 ): Promise<string> {
   if (!credentials || !config) throw new Error('Auth not initialized');
 
@@ -980,6 +1087,7 @@ export async function issueRefreshToken(
     clientId,
     createdAt: new Date().toISOString(),
     ...(sid ? { sid } : {}),
+    ...(resource ? { resource } : {}),
   };
 
   if (!credentials.refreshTokens) credentials.refreshTokens = [];
@@ -997,9 +1105,13 @@ export async function issueRefreshToken(
  * 6749 §10.4 reuse-detection is a documented fast-follow, not implemented
  * here).
  */
-export async function rotateRefreshToken(
-  presented: string
-): Promise<{ refreshToken: string; userId: string; clientId: string; sid?: string } | null> {
+export async function rotateRefreshToken(presented: string): Promise<{
+  refreshToken: string;
+  userId: string;
+  clientId: string;
+  sid?: string;
+  resource?: string;
+} | null> {
   if (!credentials || !config) throw new Error('Auth not initialized');
 
   const tokenHash = hashOpaqueToken(presented);
@@ -1007,7 +1119,7 @@ export async function rotateRefreshToken(
   const index = records.findIndex((r) => r.tokenHash === tokenHash);
   if (index === -1) return null;
 
-  const { userId, clientId, sid } = records[index];
+  const { userId, clientId, sid, resource } = records[index];
   const carried = sid ?? crypto.randomUUID();
   records.splice(index, 1);
 
@@ -1017,6 +1129,11 @@ export async function rotateRefreshToken(
     userId,
     clientId,
     createdAt: new Date().toISOString(),
+    // Carried for the same reason as `sid`, and with more at stake: the
+    // resource is this grant's AUDIENCE. Dropping it here would let the refresh
+    // path fall back to DROP's own resource and hand an app-scoped grant a
+    // control-plane token.
+    ...(resource ? { resource } : {}),
     // CARRIED, never re-minted. Rotating the sid here would reset the
     // principal on every refresh — the whole defect this field exists to fix.
     //
@@ -1030,7 +1147,7 @@ export async function rotateRefreshToken(
   credentials.refreshTokens = records;
   await saveCredentials(config.credentialsPath, credentials);
 
-  return { refreshToken, userId, clientId, sid: carried };
+  return { refreshToken, userId, clientId, sid: carried, resource };
 }
 
 /** Revoke a single presented refresh token. Returns false if it was not found. */
