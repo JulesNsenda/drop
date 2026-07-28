@@ -169,53 +169,66 @@ export function generateRouteBlock(
  *     inbound traffic. There is no access-token revocation, so a harvested
  *     token is good until it expires.
  *
- * Inbound `X-Forwarded-*` are stripped too, so a client cannot pre-set what the
- * verify endpoint or the tenant sees, and the identity headers DROP adds
- * (`X-Drop-User-Id` / `X-Drop-Username`) are cleared on the way IN before
- * `copy_headers` re-adds the authenticated values — otherwise a client could
- * simply assert who it is.
+ * The identity headers DROP adds (`X-Drop-User-Id` / `X-Drop-Username`) are
+ * cleared on the way IN before `copy_headers` re-adds the authenticated values,
+ * so a client cannot simply assert who it is.
+ *
+ * Inbound `X-Forwarded-*` are deliberately NOT stripped here: `reverse_proxy`
+ * re-sets them on the hop to the tenant regardless, and with no
+ * `trusted_proxies` configured Caddy overwrites a client-supplied value rather
+ * than appending to it. Directives that change nothing but read as a security
+ * control are worse than their absence.
  */
 function generateMcpAuthHandle(route: RouteConfig, mcp: McpAuthConfig): CaddyDirective {
-  const upstreams = normalizeUpstreams(route.upstream).map(u => u.address);
+  // The guarded proxy is the ordinary one plus the credential strips, so
+  // load-balancing and health config cannot silently diverge between the MCP
+  // path and the rest of the app.
+  const guardedProxy = generateReverseProxyDirective(route);
+  guardedProxy.block = [
+    ...(guardedProxy.block ?? []),
+    { name: 'header_up', args: ['-Authorization'] },
+    { name: 'header_up', args: ['-X-Api-Key'] },
+  ];
+
+  // The matcher is evaluated against the FULL request path, while the site
+  // address may already be restricted to a prefix (a same-origin monorepo child
+  // lives at `group.host/api*`). Matching `/mcp*` there could never be true —
+  // its real endpoint is `/api/mcp` — so every request, including the one this
+  // guard exists for, would fall through to the unguarded catch-all while the
+  // dashboard reported the endpoint as protected.
+  const prefix = (route.pathPrefix ?? '').replace(/\*+$/, '').replace(/\/$/, '');
+  const matcher = `${prefix}${mcp.path}*`;
 
   return {
     name: 'handle',
-    args: [`${mcp.path}*`],
+    args: [matcher],
+    // `route` INSIDE the handle, and this is load-bearing. Caddy sorts the
+    // children of a `handle` by its own directive-order table — only `route`
+    // preserves written order — and `forward_auth` sorts BEFORE
+    // `request_header`. Written as a bare list, the strips therefore ran AFTER
+    // the auth sub-request: they deleted the very identity headers
+    // `copy_headers` had just set, so the tenant received no identity at all,
+    // and the client's own X-Drop-* headers reached DROP's verify endpoint
+    // unfiltered. Both proven against Caddy 2.11.4. `route` cannot replace the
+    // enclosing `handle` — that is what keeps this mutually exclusive with the
+    // catch-all below.
     block: [
       {
-        name: 'request_header',
-        args: ['-X-Drop-User-Id'],
-      },
-      {
-        name: 'request_header',
-        args: ['-X-Drop-Username'],
-      },
-      {
-        name: 'request_header',
-        args: ['-X-Forwarded-Host'],
-      },
-      {
-        name: 'request_header',
-        args: ['-X-Forwarded-For'],
-      },
-      {
-        name: 'request_header',
-        args: ['-X-Forwarded-Proto'],
-      },
-      {
-        name: 'forward_auth',
-        args: [mcp.verifyUpstream],
+        name: 'route',
         block: [
-          { name: 'uri', args: [`/api/v1/mcp-gateway/verify?app=${mcp.appName}`] },
-          { name: 'copy_headers', args: ['X-Drop-User-Id', 'X-Drop-Username'] },
-        ],
-      },
-      {
-        name: 'reverse_proxy',
-        args: upstreams,
-        block: [
-          { name: 'header_up', args: ['-Authorization'] },
-          { name: 'header_up', args: ['-X-Api-Key'] },
+          // Strip the identity headers a client may have sent, so nothing can
+          // assert who it is; copy_headers re-adds the authenticated values.
+          { name: 'request_header', args: ['-X-Drop-User-Id'] },
+          { name: 'request_header', args: ['-X-Drop-Username'] },
+          {
+            name: 'forward_auth',
+            args: [mcp.verifyUpstream],
+            block: [
+              { name: 'uri', args: [`/api/v1/mcp-gateway/verify?app=${mcp.appName}`] },
+              { name: 'copy_headers', args: ['X-Drop-User-Id', 'X-Drop-Username'] },
+            ],
+          },
+          guardedProxy,
         ],
       },
     ],

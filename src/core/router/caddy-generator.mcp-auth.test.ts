@@ -61,14 +61,52 @@ describe('MCP forward_auth guard', () => {
     expect(lines.some(l => l.includes('{host}') || l.includes('X-Forwarded-Host}'))).toBe(false);
   });
 
-  it('clears client-supplied identity and forwarding headers on the way in', () => {
-    // Otherwise a client asserts who it is, or pre-sets what the verify
-    // endpoint and the tenant observe.
+  it('clears client-supplied identity headers on the way in', () => {
+    // Otherwise a client simply asserts who it is.
     const lines = flatten(generateRouteBlock(route({ mcpAuth: GUARD })).directives);
 
     expect(lines).toContain('request_header -X-Drop-User-Id');
     expect(lines).toContain('request_header -X-Drop-Username');
-    expect(lines).toContain('request_header -X-Forwarded-Host');
+  });
+
+  it('wraps the guard body in `route` so Caddy cannot re-order it', () => {
+    // THE load-bearing structural assertion, and the one whose absence made
+    // every other ordering test in this file vacuous.
+    //
+    // Caddy sorts the children of a `handle` by its own directive-order table;
+    // only `route` preserves written order. `forward_auth` sorts BEFORE
+    // `request_header`, so written as a bare list the strips ran AFTER the auth
+    // sub-request — deleting the identity headers `copy_headers` had just set
+    // (the tenant saw no identity at all) and forwarding the client's own
+    // X-Drop-* to DROP's verify endpoint. Proven against Caddy 2.11.4.
+    //
+    // Emission order in this tree therefore says nothing on its own; the
+    // `route` wrapper is what makes it mean anything.
+    const top = generateRouteBlock(route({ mcpAuth: GUARD })).directives;
+    const guard = top.find(d => d.name === 'handle' && d.args?.[0]?.startsWith('/mcp'));
+
+    expect(guard?.block).toHaveLength(1);
+    expect(guard?.block?.[0].name).toBe('route');
+
+    const inner = (guard?.block?.[0] as { block?: { name: string }[] }).block ?? [];
+    const order = inner.map(d => d.name);
+    expect(order.indexOf('request_header')).toBeLessThan(order.indexOf('forward_auth'));
+    expect(order.indexOf('forward_auth')).toBeLessThan(order.indexOf('reverse_proxy'));
+  });
+
+  it('matches the FULL path for a path-prefixed (monorepo child) route', () => {
+    // The site address for a same-origin child is `group.host/api*`, and the
+    // matcher is evaluated against the whole request path. A bare `/mcp*` could
+    // never match there — the real endpoint is `/api/mcp` — so every request
+    // fell through to the unguarded catch-all while the dashboard reported the
+    // endpoint as protected. A guard that silently does not apply is worse than
+    // no guard.
+    const top = generateRouteBlock(
+      route({ pathPrefix: '/api', mcpAuth: GUARD })
+    ).directives;
+    const guard = top.find(d => d.name === 'handle' && d.args?.[0]?.includes('/mcp'));
+
+    expect(guard?.args?.[0]).toBe('/api/mcp*');
   });
 
   it('copies the AUTHENTICATED identity from the verify response', () => {
