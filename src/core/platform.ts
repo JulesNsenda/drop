@@ -4607,25 +4607,50 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       }
     }
 
-    // Defense-in-depth before a recursive fs.rm: the container path is derived
-    // from a `group` tag. That tag is already transitively constrained to
-    // [A-Za-z0-9_-] (expandMonorepo only creates children whose `<group>-<svc>`
-    // name passes that regex), but re-assert it here so this destructive delete
-    // can never escape the webapps directory even if a group value is ever set
-    // by a future/other code path. Kept even with the entry-driven teardown
-    // above: it also covers unmarked phantoms from older platform versions
-    // (where the folder name equals the group name).
-    if (/^[a-zA-Z0-9_-]+$/.test(groupName)) {
+    // The name-derived sweep, for an UNMARKED PHANTOM: a container folder left
+    // by an older platform version with no state entry of its own. Every
+    // container that HAS an entry was already removed above through its own
+    // recorded path, and `teardownApp` deregisters state + config — so by this
+    // point a legitimately torn-down container no longer holds its name.
+    //
+    // `groupName` is TENANT-AUTHORED (drop.yaml `group:`, validated only as a
+    // non-empty string) and `<appsDirectory>/<groupName>` is exactly where every
+    // other app lives. Deleting that path on the NAME alone let one tenant
+    // declare another tenant's app as their group and have the folder recursively
+    // removed — reachable with no interactive step at all from the ephemeral
+    // reaper, which calls this on a timer.
+    //
+    // The character-class check is CONTAINMENT, never authorization: it proves
+    // the path cannot escape the webapps directory and proves nothing about who
+    // owns it. So refuse whenever the name still resolves to something
+    // REGISTERED — that is someone's app. If it belonged to this group it was
+    // torn down above via its own entry; if it did not, it is not ours to touch.
+    // Fails CLOSED. If the registry cannot be consulted there is no way to tell
+    // whose folder this is, and an unverifiable recursive delete of a path built
+    // from a tenant string is precisely what this guard exists to prevent.
+    const claimedByAnApp =
+      !this.stateManager ||
+      !this.appConfigService ||
+      this.stateManager.hasApp(groupName) ||
+      this.appConfigService.hasConfig(groupName);
+
+    if (!/^[a-zA-Z0-9_-]+$/.test(groupName)) {
+      this.logger.warn(
+        `Refusing to remove container folder for group '${groupName}': unsafe name`,
+        'MONOREPO'
+      );
+    } else if (claimedByAnApp) {
+      this.logger.warn(
+        `Refusing name-derived container-folder removal for group '${groupName}': ` +
+          'a registered app holds that name',
+        'MONOREPO'
+      );
+    } else {
       try {
         await fs.rm(path.join(this.config.appsDirectory, groupName), { recursive: true, force: true });
       } catch (err) {
         this.logger.warn(`Failed to remove group container folder for '${groupName}'`, 'MONOREPO', err);
       }
-    } else {
-      this.logger.warn(
-        `Refusing to remove container folder for group '${groupName}': unsafe name`,
-        'MONOREPO'
-      );
     }
 
     return { removed };
@@ -5256,8 +5281,32 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         //
         // removeGroup takes no skipDatabaseBackup, so a group's children keep
         // their dump. That errs toward keeping data on the rarer path.
-        const reap =
+        // The group cascade only when the WHOLE group is this owner's.
+        //
+        // `group` is tenant-authored, and removeGroup destroys every app
+        // carrying that tag. Without this check a tenant could name another
+        // tenant's group in their own throwaway app's drop.yaml and have the
+        // reaper tear down that group's children and databases. An automatic,
+        // timer-driven destructive path must be gated at least as tightly as
+        // the interactive one — DELETE /apps/:name checks ownership across
+        // every entry it would destroy, and this had no check at all.
+        const groupEntries =
           app?.isGroupContainer && app.group
+            ? (this.stateManager?.getAllApps().filter(a => a.group === app.group) ?? [])
+            : [];
+        const wholeGroupIsOwnedByThisApp =
+          groupEntries.length > 0 && groupEntries.every(a => a.userId === app?.userId);
+
+        if (app?.isGroupContainer && app.group && !wholeGroupIsOwnedByThisApp) {
+          this.logger.warn(
+            `Ephemeral '${config.name}' is tagged group '${app.group}' whose members are not all ` +
+              'its owner\'s; reaping only this app.',
+            'REAP'
+          );
+        }
+
+        const reap =
+          app?.isGroupContainer && app.group && wholeGroupIsOwnedByThisApp
             ? this.removeGroup(app.group).then(() => undefined)
             : // skipDatabaseBackup: an ephemeral's data is throwaway by
               // construction, and dumping it on the way out would fill the box
