@@ -5120,6 +5120,15 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         return;
       }
 
+      // The dry-run budget counts sweeps that WOULD REAP, not sweeps that RAN.
+      // Counting every sweep spent the whole budget on no-ops: nothing is
+      // reapable until the platform has been up for a full idle window (the
+      // first sweep after a restart re-baselines lastActive to now), while
+      // sweeps run every 15 minutes. So the budget was exhausted ~93 sweeps
+      // before the first real candidate could ever appear, and the first app
+      // that qualified was deleted — database included — with no dry-run line
+      // ever logged. The guard existed precisely to stop that.
+      if (reap.length === 0) return;
       this.idleSweepCount += 1;
       const dryRun = this.idleSweepCount <= dryRunSweeps();
       for (const name of reap) {
