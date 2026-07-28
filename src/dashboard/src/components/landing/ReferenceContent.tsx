@@ -34,12 +34,25 @@ export type HttpMethod = 'GET' | 'POST' | 'PUT' | 'DELETE';
  *     JWT/API key, regardless of role.
  *   - 'hmac': unauthenticated by DROP's auth system; the endpoint verifies
  *     its own HMAC signature instead.
+ *   - 'app-token': likewise outside authMiddleware, but far from open — the
+ *     endpoint verifies an access token audienced at ONE app itself, and
+ *     rejects every other credential class (session JWTs, API keys, and
+ *     DROP-scoped OAuth tokens included). Do NOT document these as 'public':
+ *     no auth middleware is not the same thing as no authentication.
  *   - 'readonly*': the group's general guard is `readonly` and server.ts does
  *     NOT upgrade this route, even though it mutates state. Only POST /apps
  *     is in this position today; documented as-is rather than aspirationally.
  *     See the callout on the Apps group.
  */
-export type EndpointRole = 'public' | 'readonly' | 'readonly*' | 'user' | 'admin' | 'authenticated' | 'hmac';
+export type EndpointRole =
+  | 'public'
+  | 'readonly'
+  | 'readonly*'
+  | 'user'
+  | 'admin'
+  | 'authenticated'
+  | 'hmac'
+  | 'app-token';
 
 export interface EndpointDef {
   method: HttpMethod;
@@ -301,7 +314,7 @@ export const ENDPOINT_GROUPS: EndpointGroupDef[] = [
       'auth gate would admit. The app name comes from a query parameter DROP itself bakes into the generated Caddy ' +
       'config, never from a client-controlled Host header.',
     endpoints: [
-      { method: 'GET', path: '/api/v1/mcp-gateway/verify?app=<name>', description: 'Verify an app-audienced bearer token. 2xx to admit, else one opaque 401 with a WWW-Authenticate challenge pointing at discovery.', role: 'public' },
+      { method: 'GET', path: '/api/v1/mcp-gateway/verify?app=<name>', description: 'Verify an app-audienced bearer token. 2xx to admit, else one opaque 401 with a WWW-Authenticate challenge pointing at discovery.', role: 'app-token' },
     ],
   },
 ];
@@ -590,6 +603,7 @@ const ROLE_LABEL: Record<EndpointRole, string> = {
   admin: 'admin',
   authenticated: 'any user',
   hmac: 'HMAC signed',
+  'app-token': 'app-audienced token',
 };
 
 function RoleTag({ role }: { role: EndpointRole }): JSX.Element {
