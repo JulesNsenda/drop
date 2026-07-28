@@ -32,6 +32,11 @@ export type HttpMethod = 'GET' | 'POST' | 'PUT' | 'DELETE';
  *   - 'public': no auth middleware applied at all.
  *   - 'authenticated': `authMiddleware()` with no role arg — any valid
  *     JWT/API key, regardless of role.
+ *   - 'session': `authMiddleware()` PLUS auth.ts's `interactiveSessionOnly`
+ *     gate, which requires `authMethod === 'jwt'` — an API key or OAuth token
+ *     is refused however privileged it is. The role tag alone cannot express
+ *     this, so it gets its own kind; documenting these as 'authenticated'
+ *     would tell people an API key works on routes that reject it.
  *   - 'hmac': unauthenticated by DROP's auth system; the endpoint verifies
  *     its own HMAC signature instead.
  *   - 'app-token': likewise outside authMiddleware, but far from open — the
@@ -51,6 +56,7 @@ export type EndpointRole =
   | 'user'
   | 'admin'
   | 'authenticated'
+  | 'session'
   | 'hmac'
   | 'app-token';
 
@@ -103,17 +109,21 @@ export const ENDPOINT_GROUPS: EndpointGroupDef[] = [
     basePath: '/api/v1/auth',
     sourceFile: 'src/api/routes/auth.ts',
     description: 'Login, signup, API keys, MFA, and user management. Role required per route (see Authentication above).',
+    note:
+      'The routes tagged “session only” need a browser session — they check the credential KIND, not just the role, ' +
+      'and refuse an API key or OAuth token however privileged it is. Changing your own password, deleting your own ' +
+      'account, and every MFA route are in that set: a stolen key must not be usable to take an account over.',
     endpoints: [
       { method: 'GET', path: '/api/v1/auth/status', description: 'Whether auth is enabled on this instance.', role: 'public' },
       { method: 'POST', path: '/api/v1/auth/signup', description: 'Self-service registration, only when signup is enabled.', role: 'public' },
       { method: 'POST', path: '/api/v1/auth/login', description: 'Authenticate; returns a JWT, or an MFA challenge token.', role: 'public' },
       { method: 'POST', path: '/api/v1/auth/mfa/verify', description: 'Complete an MFA login (challengeToken + 6-digit code) → JWT.', role: 'public' },
       { method: 'GET', path: '/api/v1/auth/me', description: 'Current authenticated user.', role: 'authenticated' },
-      { method: 'PUT', path: '/api/v1/auth/password', description: "Change your own password.", role: 'authenticated' },
-      { method: 'DELETE', path: '/api/v1/auth/account', description: 'Delete your own account.', role: 'authenticated' },
-      { method: 'POST', path: '/api/v1/auth/mfa/setup', description: 'Generate a candidate TOTP secret (not yet persisted).', role: 'authenticated' },
-      { method: 'POST', path: '/api/v1/auth/mfa/enable', description: 'Persist and activate TOTP for your account.', role: 'authenticated' },
-      { method: 'POST', path: '/api/v1/auth/mfa/disable', description: 'Disable TOTP (requires a valid current code).', role: 'authenticated' },
+      { method: 'PUT', path: '/api/v1/auth/password', description: "Change your own password. Rejects a right and a wrong current password identically to an API key, so it is no password oracle.", role: 'session' },
+      { method: 'DELETE', path: '/api/v1/auth/account', description: 'Delete your own account.', role: 'session' },
+      { method: 'POST', path: '/api/v1/auth/mfa/setup', description: 'Generate a candidate TOTP secret (not yet persisted).', role: 'session' },
+      { method: 'POST', path: '/api/v1/auth/mfa/enable', description: 'Persist and activate TOTP for your account.', role: 'session' },
+      { method: 'POST', path: '/api/v1/auth/mfa/disable', description: 'Disable TOTP (requires a valid current code).', role: 'session' },
       { method: 'POST', path: '/api/v1/auth/api-keys', description: 'Create an API key.', role: 'admin' },
       { method: 'GET', path: '/api/v1/auth/api-keys', description: 'List API keys.', role: 'admin' },
       { method: 'DELETE', path: '/api/v1/auth/api-keys/:id', description: 'Delete an API key.', role: 'admin' },
@@ -159,7 +169,7 @@ export const ENDPOINT_GROUPS: EndpointGroupDef[] = [
     sourceFile: 'src/api/routes/usage.ts',
     description: "The dashboard's app-limit indicator: your app count against your quota.",
     endpoints: [
-      { method: 'GET', path: '/api/v1/usage', description: "Current user's app count and limit (0 = unlimited).", role: 'readonly' },
+      { method: 'GET', path: '/api/v1/usage', description: "Current user's app count and effective limit — a per-user override if set, else DROP_MAX_APPS_PER_USER (default 5). Reports limit 0, meaning unlimited, for admins and for an auth-disabled instance.", role: 'readonly' },
     ],
   },
   {
@@ -602,6 +612,7 @@ const ROLE_LABEL: Record<EndpointRole, string> = {
   user: 'user+',
   admin: 'admin',
   authenticated: 'any user',
+  session: 'session only',
   hmac: 'HMAC signed',
   'app-token': 'app-audienced token',
 };
