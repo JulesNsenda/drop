@@ -1,3 +1,4 @@
+import { Link } from 'react-router-dom';
 import {
   Boxes,
   Database,
@@ -20,22 +21,44 @@ export interface LandingSectionsProps {
 type EnterProps = Pick<LandingSectionsProps, 'onEnter'>;
 type HeroProps = LandingSectionsProps;
 
-const GITHUB_URL = 'https://github.com/JulesNsenda/drop';
+// The landing CTAs now point at /docs and /reference, which ship in this same
+// site bundle (DROP-070) — they used to send readers to GitHub because those
+// pages did not exist yet. GitHub still has its links in SiteNav/SiteFooter.
 
-const AGENTS = ['Claude', 'Claude Code', 'Codex', 'Cursor', 'Cline', 'Windsurf'];
+const AGENTS =['Claude', 'Claude Code', 'Codex', 'Cursor', 'Cline', 'Windsurf'];
 
 const STATS: { v: string; l: string }[] = [
   { v: '~8s', l: 'median deploy' },
   { v: '0', l: 'config files needed' },
-  { v: '4', l: 'runtimes supported' },
+  { v: '5', l: 'runtimes supported' },
   { v: '100%', l: 'self-hosted' },
 ];
 
-const MCP_TOOLS = ['deploy_files', 'deploy_from_git', 'list_apps', 'app_status', 'app_logs', 'restart_app'];
+const MCP_TOOLS = [
+  'deploy_files',
+  'deploy_from_git',
+  'list_apps',
+  'app_status',
+  'app_logs',
+  'get_deploy_logs',
+  'restart_app',
+];
 
-const RUNTIMES = ['Node.js', 'Python', 'Docker', 'Static', 'Next.js', 'Nuxt', 'Express', 'FastAPI', 'Flask'];
+const RUNTIMES = [
+  'Node.js',
+  'Python',
+  'Go',
+  'Docker',
+  'Static',
+  'Next.js',
+  'Nuxt',
+  'SvelteKit',
+  'Astro',
+  'FastAPI',
+  'Flask',
+];
 
-const RT_CHIPS = ['Node.js', 'Python', 'Docker', 'Static'];
+const RT_CHIPS = ['Node.js', 'Python', 'Go', 'Docker', 'Static'];
 
 const STEPS: { n: string; tag: string; title: string; body: string }[] = [
   {
@@ -58,12 +81,13 @@ const STEPS: { n: string; tag: string; title: string; body: string }[] = [
   },
 ];
 
+// Mirrors the real dashboard nav (src/dashboard/src/components/Layout.tsx) —
+// a product shot promising sections that do not exist is a support ticket.
 const DASH_NAV: { label: string; active?: boolean }[] = [
-  { label: 'Applications', active: true },
-  { label: 'Deployments' },
-  { label: 'Databases' },
-  { label: 'Domains' },
-  { label: 'Logs' },
+  { label: 'Apps', active: true },
+  { label: 'Deploy' },
+  { label: 'Users' },
+  { label: 'Settings' },
 ];
 
 const DASH_STATS: { l: string; v: string }[] = [
@@ -80,10 +104,11 @@ const DASH_ROWS: { name: string; meta: string; cpu: string; dot: string }[] = [
 ];
 
 const CONFIG_POINTS = [
-  'Pin runtime & framework',
+  'Pin the app type & build/start commands',
   'Custom per-app domains',
   'Inject environment variables',
-  'Persistent data dirs (DROP_DATA_DIR)',
+  'Declare required secrets (auto-generated or prompted)',
+  'Attach Postgres & Redis',
 ];
 
 const CLI_CMDS: { cmd: string; desc: string }[] = [
@@ -180,7 +205,7 @@ function HeroSection({ onEnter, onSignup, authEnabled }: HeroProps): JSX.Element
           </h1>
           <p style={{ fontSize: 18, color: 'var(--text-2)', maxWidth: 470, marginBottom: 30 }}>
             The lightweight, self-hosted PaaS built for one move: point it at a folder, and it auto-detects, builds,
-            provisions a database, and ships. Node, Python, Docker, static — zero config.
+            provisions a database, and ships. Node, Python, Go, Docker, static — zero config.
           </p>
           <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', marginBottom: 26 }}>
             <button
@@ -204,10 +229,10 @@ function HeroSection({ onEnter, onSignup, authEnabled }: HeroProps): JSX.Element
             >
               Start deploying →
             </button>
-            <a
-              href={GITHUB_URL}
-              target="_blank"
-              rel="noopener noreferrer"
+            {/* Same site bundle (DROP-070) — /docs is a react-router route
+                here, not a cross-bundle jump, so Link is correct. */}
+            <Link
+              to="/docs"
               className="dl-hover-border"
               style={{
                 display: 'inline-flex',
@@ -224,7 +249,7 @@ function HeroSection({ onEnter, onSignup, authEnabled }: HeroProps): JSX.Element
               }}
             >
               Documentation
-            </a>
+            </Link>
           </div>
           {authEnabled && (
             <button
@@ -436,7 +461,8 @@ function McpSection(): JSX.Element {
           </h2>
           <p style={{ fontSize: 16, color: 'var(--text-2)', lineHeight: 1.7, marginBottom: 24 }}>
             DROP ships an MCP server, so Claude, Codex, Cursor and any MCP client can deploy, inspect logs, and manage
-            apps as native tools. Say &quot;ship this repo&quot; — your agent does the rest.
+            apps as native tools. Say &quot;ship this repo&quot; — your agent does the rest. Header auth for clients
+            that support it, and OAuth for the claude.ai connector, so nobody pastes a key into a browser.
           </p>
           <div
             style={{
@@ -478,7 +504,7 @@ function McpSection(): JSX.Element {
               {'      '}
               <span style={{ color: 'var(--accent-2)' }}>&quot;headers&quot;</span>: {'{ '}
               <span style={{ color: 'var(--accent-2)' }}>&quot;Authorization&quot;</span>:{' '}
-              <span style={{ color: 'var(--ok)' }}>&quot;Bearer drop_sk_live_…&quot;</span>
+              <span style={{ color: 'var(--ok)' }}>&quot;Bearer drop_&lt;your-api-key&gt;&quot;</span>
               {' }'}
               {'\n'}
               {'    '}
@@ -824,8 +850,8 @@ function FeaturesBento(): JSX.Element {
             Multi-runtime + framework detection
           </div>
           <p style={{ fontSize: 13.5, color: 'var(--text-2)', lineHeight: 1.6, marginBottom: 14 }}>
-            Node, Python, Docker and static sites — with Next.js, Nuxt, Express, FastAPI and Flask recognized
-            automatically.
+            Node, Python, Go, Docker and static sites — with Next.js, Nuxt, SvelteKit, Astro, FastAPI and Flask
+            recognized automatically.
           </p>
           <div style={{ display: 'flex', gap: 7, flexWrap: 'wrap', marginTop: 'auto' }}>
             {RT_CHIPS.map((c) => (
@@ -896,9 +922,9 @@ function DashboardPreview({ onEnter }: EnterProps): JSX.Element {
             A real-time UI for every app.
           </h2>
           <p style={{ fontSize: 15, color: 'var(--text-2)', lineHeight: 1.7, marginBottom: 22 }}>
-            Live process health, streaming logs, per-app metrics, databases, domains and routing — all in one place
-            at <span style={{ fontFamily: 'var(--mono)', color: 'var(--text)' }}>/dashboard</span>. Everything the
-            CLI and MCP do, visually.
+            Live process health, streaming logs, per-app metrics, secrets, custom domains and deploy history — all in
+            one place at <span style={{ fontFamily: 'var(--mono)', color: 'var(--text)' }}>/dashboard</span>.
+            Everything the CLI and MCP do, visually.
           </p>
           <button
             type="button"
@@ -1009,7 +1035,8 @@ function ConfigSection(): JSX.Element {
         </h2>
         <p style={{ fontSize: 15, color: 'var(--text-2)', lineHeight: 1.7, marginBottom: 20 }}>
           80% of apps need nothing. For the rest, drop a <span style={{ fontFamily: 'var(--mono)', color: 'var(--text)' }}>drop.yaml</span>{' '}
-          to pin runtime, custom domains, env, and persistent data that survives upgrades.
+          to pin the app type, claim domains, set env, declare the secrets it can&apos;t start without, and attach a
+          database. Unknown keys are rejected, so a typo fails loudly instead of doing nothing.
         </p>
         <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
           {CONFIG_POINTS.map((c) => (
@@ -1027,7 +1054,7 @@ function ConfigSection(): JSX.Element {
         <pre style={{ margin: 0, padding: 22, fontFamily: 'var(--mono)', fontSize: 13, lineHeight: 1.85, color: 'var(--text-2)', overflow: 'auto' }}>
           <span style={{ color: 'var(--accent-2)' }}>name</span>: <span style={{ color: 'var(--ok)' }}>myapp</span>
           {'\n'}
-          <span style={{ color: 'var(--accent-2)' }}>runtime</span>: <span style={{ color: 'var(--ok)' }}>node</span>
+          <span style={{ color: 'var(--accent-2)' }}>type</span>: <span style={{ color: 'var(--ok)' }}>nodejs</span>
           {'\n'}
           <span style={{ color: 'var(--accent-2)' }}>domains</span>:{'\n'}
           {'  - '}
@@ -1039,12 +1066,9 @@ function ConfigSection(): JSX.Element {
           {'  '}
           <span style={{ color: 'var(--accent-2)' }}>NODE_ENV</span>: <span style={{ color: 'var(--ok)' }}>production</span>
           {'\n'}
-          <span style={{ color: 'var(--accent-2)' }}>persist</span>:{'\n'}
-          {'  - '}
-          <span style={{ color: 'var(--ok)' }}>./uploads</span>
-          {'\n'}
-          {'  - '}
-          <span style={{ color: 'var(--ok)' }}>./data</span>
+          <span style={{ color: 'var(--accent-2)' }}>secrets</span>:{'\n'}
+          {'  '}
+          <span style={{ color: 'var(--accent-2)' }}>JWT_SECRET</span>: <span style={{ color: 'var(--ok)' }}>generate</span>
         </pre>
       </div>
     </section>
@@ -1069,9 +1093,9 @@ function CliSection(): JSX.Element {
             A full-featured CLI plus a REST API secured with JWT and API keys. Manage apps, logs, and domains from
             your terminal, CI, or AI agent.
           </p>
-          <a href={GITHUB_URL} target="_blank" rel="noopener noreferrer" style={{ fontFamily: 'var(--mono)', fontWeight: 600, fontSize: 14, color: 'var(--accent)' }}>
+          <Link to="/reference" style={{ fontFamily: 'var(--mono)', fontWeight: 600, fontSize: 14, color: 'var(--accent)' }}>
             Full CLI &amp; API reference →
-          </a>
+          </Link>
         </div>
         <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
           {CLI_CMDS.map((c) => (
@@ -1150,10 +1174,8 @@ function FinalCta({ onEnter }: EnterProps): JSX.Element {
             >
               Get started
             </button>
-            <a
-              href={GITHUB_URL}
-              target="_blank"
-              rel="noopener noreferrer"
+            <Link
+              to="/docs"
               className="dl-hover-border"
               style={{
                 fontFamily: 'var(--mono)',
@@ -1167,7 +1189,7 @@ function FinalCta({ onEnter }: EnterProps): JSX.Element {
               }}
             >
               Read the docs
-            </a>
+            </Link>
           </div>
         </div>
       </div>
