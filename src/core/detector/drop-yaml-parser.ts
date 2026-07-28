@@ -13,11 +13,22 @@ import * as yaml from 'yaml';
 const ALLOWED_TOP_KEYS = new Set([
   'name', 'domains', 'tls', 'env', 'build_env', 'secrets', 'depends_on', 'port',
   'build', 'start', 'healthCheck', 'maxBodySize', 'timeout',
-  'group', 'services', 'type', 'database', 'redis', 'route',
+  'group', 'services', 'type', 'database', 'redis', 'route', 'mcp',
 ]);
 
 /** Keys accepted under drop.yaml#tls */
 const ALLOWED_TLS_KEYS = new Set(['certFile', 'keyFile', 'disabled']);
+
+/** Keys accepted under drop.yaml#mcp (Step 11) */
+const ALLOWED_MCP_KEYS = new Set(['path', 'auth']);
+
+/**
+ * An MCP endpoint path. Tenant-authored and rendered in tool output and the
+ * dashboard (inside a DROP-composed URL), so it is allowlisted rather than
+ * merely length-checked: leading slash, a conservative character set, and no
+ * traversal or empty segments.
+ */
+const MCP_PATH_REGEX = /^\/[A-Za-z0-9._~/-]{0,100}$/;
 
 /** Keys accepted under a drop.yaml#services.<name> entry */
 const ALLOWED_SERVICE_KEYS = new Set([
@@ -217,6 +228,32 @@ export interface DropYamlConfig {
    * handleConfigureRoute as a Caddy path prefix (M3).
    */
   route?: AppRouteConfig;
+  /**
+   * Declares this app as an MCP server (Step 11). Presence is the declaration;
+   * DROP's whole-host reverse_proxy already carries `<app>.<domain><path>` to
+   * the app, so this changes no routing — it labels the app so its endpoint can
+   * be surfaced, and reserves the shape PR 2's per-app OAuth will extend.
+   */
+  mcp?: AppMcpConfig;
+}
+
+/**
+ * drop.yaml `mcp:` — an app that speaks MCP over Streamable HTTP.
+ */
+export interface AppMcpConfig {
+  /** Endpoint path on the app's own hostname. Defaults to `/mcp`. */
+  path?: string;
+  /**
+   * Who guards the endpoint.
+   *
+   * `none` is the ONLY accepted value today, and it means the endpoint is
+   * PUBLIC unless the app authenticates callers itself. `drop` is rejected
+   * rather than accepted-and-ignored: silently treating it as `none` would tell
+   * a tenant DROP guards their endpoint while it is open to the internet, and a
+   * schema that lies about a security property is worse than one that changes
+   * twice.
+   */
+  auth?: 'none';
 }
 
 /**
@@ -344,6 +381,53 @@ export function validateDropYamlConfig(
       }
       if (!isValidDomain(domain)) {
         return { valid: false, error: `Invalid domain: ${domain}` };
+      }
+    }
+  }
+
+  // Validate mcp (Step 11)
+  if (cfg.mcp !== undefined) {
+    if (typeof cfg.mcp !== 'object' || cfg.mcp === null || Array.isArray(cfg.mcp)) {
+      return { valid: false, error: 'mcp must be an object' };
+    }
+    const mcp = cfg.mcp as Record<string, unknown>;
+
+    for (const key of Object.keys(mcp)) {
+      if (!ALLOWED_MCP_KEYS.has(key)) {
+        return { valid: false, error: `Unknown field 'mcp.${key}' in drop.yaml` };
+      }
+    }
+
+    if (mcp.path !== undefined) {
+      if (typeof mcp.path !== 'string') {
+        return { valid: false, error: 'mcp.path must be a string' };
+      }
+      // Traversal and empty segments are rejected explicitly: the allowlist
+      // permits '.' and '/', so "/a/../b" and "/a//b" match it on their own.
+      if (
+        !MCP_PATH_REGEX.test(mcp.path) ||
+        mcp.path.includes('..') ||
+        mcp.path.includes('//')
+      ) {
+        return {
+          valid: false,
+          error: `Invalid mcp.path '${mcp.path}': must start with '/' and contain only letters, digits, '.', '_', '~', '-' or '/'`,
+        };
+      }
+    }
+
+    if (mcp.auth !== undefined) {
+      if (mcp.auth === 'drop') {
+        // Rejected, NOT accepted-and-ignored. See AppMcpConfig.auth.
+        return {
+          valid: false,
+          error:
+            "mcp.auth: 'drop' is not supported yet — DROP does not guard app MCP endpoints. " +
+            "Use 'none' and authenticate callers in the app itself; DROP-managed OAuth is coming separately.",
+        };
+      }
+      if (mcp.auth !== 'none') {
+        return { valid: false, error: `Invalid mcp.auth '${String(mcp.auth)}': must be 'none'` };
       }
     }
   }

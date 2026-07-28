@@ -19,7 +19,15 @@ import { WatcherService } from './watcher';
 // shape. watcher.config.ts itself has no WatcherService dependency, so this
 // stays a live import (no drift) without dragging chokidar/WatcherService in.
 import { DEFAULT_IGNORE_PATTERNS } from './watcher/watcher.config';
-import { DetectorService, getDetector, parseDropYaml, DetectionResult, DropYamlConfig } from './detector';
+import {
+  DetectorService,
+  getDetector,
+  parseDropYaml,
+  DetectionResult,
+  DropYamlConfig,
+  detectMcp,
+  readMcpInputs,
+} from './detector';
 import { getProcfileWebCommand } from './detector/procfile';
 import { BuilderService, getBuilder } from './builder';
 import { RouterService, getRouterService, resetRouterService } from './router';
@@ -3079,8 +3087,18 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         | 'static'
         | 'docker'
         | 'unknown';
+      // MCP endpoint label (Step 11). Resolved on every build so removing the
+      // dependency or the `mcp:` block clears it — hence the explicit
+      // `undefined`, which is how pendingPromotion is cleared too. Purely
+      // descriptive: no routing, build or auth decision reads it.
+      const mcpEndpoint = detectMcp(
+        await readMcpInputs(appPath, (await parseDropYaml(appPath)).config?.mcp)
+      );
       if (this.appConfigService) {
-        await this.appConfigService.updateConfig(appName, { type: detectedType });
+        await this.appConfigService.updateConfig(appName, {
+          type: detectedType,
+          mcp: mcpEndpoint ? { path: mcpEndpoint.path, auth: mcpEndpoint.auth } : undefined,
+        });
       }
       if (this.stateManager) {
         await this.stateManager.updateApp(appName, { type: detectedType });

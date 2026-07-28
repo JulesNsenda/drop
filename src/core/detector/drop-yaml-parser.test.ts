@@ -738,4 +738,77 @@ describe('Drop YAML Parser', () => {
       expect(domains).toBeNull();
     });
   });
+
+  describe('mcp block (Step 11)', () => {
+    it('accepts a minimal declaration', () => {
+      expect(validateDropYamlConfig({ mcp: { path: '/mcp', auth: 'none' } }).valid).toBe(true);
+      expect(validateDropYamlConfig({ mcp: {} }).valid).toBe(true);
+    });
+
+    it("REJECTS auth: 'drop' instead of silently treating it as none", () => {
+      // The load-bearing one. Accepting it would tell a tenant that DROP guards
+      // their MCP endpoint while it is open to the internet — a schema that
+      // lies about a security property. Rejecting means the schema changes
+      // again in PR 2, which is the cheaper of the two costs.
+      const result = validateDropYamlConfig({ mcp: { auth: 'drop' } });
+      expect(result.valid).toBe(false);
+      expect(result.error).toContain('not supported yet');
+    });
+
+    it('rejects any other auth value', () => {
+      expect(validateDropYamlConfig({ mcp: { auth: 'oauth' } }).valid).toBe(false);
+      expect(validateDropYamlConfig({ mcp: { auth: true } }).valid).toBe(false);
+    });
+
+    it('rejects an unknown nested key', () => {
+      expect(validateDropYamlConfig({ mcp: { transport: 'sse' } }).valid).toBe(false);
+    });
+
+    it('rejects a non-object mcp', () => {
+      expect(validateDropYamlConfig({ mcp: 'yes' }).valid).toBe(false);
+      expect(validateDropYamlConfig({ mcp: ['/mcp'] }).valid).toBe(false);
+    });
+
+    it.each([
+      ['mcp'], // no leading slash
+      ['/mcp/../admin'], // traversal — the allowlist alone permits '.' and '/'
+      ['//evil.com'], // protocol-relative, and an empty segment
+      ['/mcp?x=1'], // query
+      ['/mcp#frag'],
+      ['/mcp with space'],
+      ['/é'], // non-ASCII
+      [`/${'a'.repeat(101)}`], // over length
+    ])('rejects path %s', bad => {
+      const result = validateDropYamlConfig({ mcp: { path: bad } });
+      expect(result.valid).toBe(false);
+      expect(result.error).toContain('mcp.path');
+    });
+
+    it.each([['/mcp'], ['/'], ['/a/b/c'], ['/mcp-v2'], ['/mcp_v2'], ['/mcp.json'], ['/~x']])(
+      'accepts path %s',
+      good => {
+        expect(validateDropYamlConfig({ mcp: { path: good } }).valid).toBe(true);
+      }
+    );
+
+    it('parses end to end from a real file', async () => {
+      await fs.writeFile(
+        path.join(tmpDir, 'drop.yaml'),
+        'name: server\nmcp:\n  path: /tools\n  auth: none\n'
+      );
+
+      const result = await parseDropYaml(tmpDir);
+
+      expect(result.success).toBe(true);
+      expect(result.config?.mcp).toEqual({ path: '/tools', auth: 'none' });
+    });
+
+    it('fails the whole parse when auth is drop, rather than dropping the key', async () => {
+      await fs.writeFile(path.join(tmpDir, 'drop.yaml'), 'mcp:\n  auth: drop\n');
+
+      const result = await parseDropYaml(tmpDir);
+
+      expect(result.success).toBe(false);
+    });
+  });
 });

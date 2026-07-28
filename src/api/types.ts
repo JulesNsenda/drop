@@ -72,6 +72,13 @@ export interface AppDto {
    * and folder-dropped (non-git) groups.
    */
   groupGitBacked?: boolean;
+  /**
+   * This app speaks MCP (Step 11). `url` is DROP-composed from the app's own
+   * hostname and an allowlisted path — never a raw tenant string. `auth` is
+   * `'none'` today, meaning the endpoint is PUBLIC unless the app authenticates
+   * callers itself; any UI that renders `url` must render that too.
+   */
+  mcp?: { url: string; auth: 'none' };
   /** Live memory usage in bytes (from runtime; null when not running or unavailable). */
   memory?: number | null;
   /** Live CPU usage percent (from runtime; null when not running or unavailable). */

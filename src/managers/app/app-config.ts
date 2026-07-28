@@ -80,6 +80,13 @@ export interface AppConfig {
   ephemeralPrincipalId?: string;
   /** Operator opt-out from idle reaping. */
   noReap?: boolean;
+  /**
+   * This app speaks MCP on `path` (Step 11). Declared in drop.yaml or inferred
+   * from a manifest. A LABEL — it changes no routing (the whole-host
+   * reverse_proxy already carries the path) and no auth: `none` means the
+   * endpoint is public unless the app authenticates callers itself.
+   */
+  mcp?: { path: string; auth: 'none' };
   promotion?: 'auto' | 'manual';
   /**
    * A built-but-unpromoted deploy, when promotion is manual. Absent when
