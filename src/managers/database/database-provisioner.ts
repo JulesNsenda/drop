@@ -12,6 +12,7 @@ import { Pool } from 'pg';
 import { writeJsonAtomic } from '../../utils/atomic-write';
 import { PostgresServer } from './postgres-server';
 import { runPgDump, createRoleSql } from './pg-dump';
+import { buildConnectionString } from './connection-string';
 
 export interface DatabaseCredentials {
   host: string;
@@ -456,27 +457,8 @@ export class DatabaseProvisioner {
 
     if (opts?.pgSocketDir) {
       const socketDir = opts.pgSocketDir;
-      // libpq socket URI with the socket directory percent-encoded IN the host
-      // (authority) position, e.g.
-      //   postgresql://user:pw@%2Fvar%2Frun%2Fpg:5432/dbname
-      //
-      // This is the ONLY unix-socket URL form that is BOTH:
-      //   * WHATWG-parseable — `new URL()` accepts it, so a Node app that
-      //     validates DATABASE_URL with the URL constructor (or with
-      //     pg-connection-string, which `pg` and `node-pg-migrate` use) does
-      //     not reject it; and
-      //   * correctly decoded — pg-connection-string, psycopg, and libpq turn
-      //     the percent-encoded host back into the socket path and connect
-      //     over the socket (the ':<port>' selects the .s.PGSQL.<port> file).
-      //
-      // The older `postgresql://user:pw/db?host=<dir>&port=<n>` form has NO
-      // '@', which makes `new URL()` throw ERR_INVALID_URL and crash-loops
-      // Node apps at startup (only Python/libpq clients tolerated it, which is
-      // why it slipped through). See DROP-066.
-      const pw = encodeURIComponent(creds.password);
-      const connectionString =
-        `postgresql://${creds.user}:${pw}` +
-        `@${encodeURIComponent(socketDir)}:${creds.port}/${creds.database}`;
+      // URL form + DROP-066 rationale: buildConnectionString.
+      const connectionString = buildConnectionString(creds, { kind: 'socket', dir: socketDir });
       return {
         DATABASE_URL: connectionString,
         PGHOST: socketDir,
@@ -494,7 +476,7 @@ export class DatabaseProvisioner {
 
     const host = opts?.pgHost ?? creds.host;
     const connectionString = opts?.pgHost
-      ? `postgresql://${creds.user}:${creds.password}@${opts.pgHost}:${creds.port}/${creds.database}`
+      ? buildConnectionString(creds, { kind: 'tcp', host: opts.pgHost })
       : creds.connectionString;
 
     return {
