@@ -111,6 +111,28 @@ describe('certs authorization (P0-8)', () => {
     expect(res.status).toBe(404);
   });
 
+  // Regression: `/certs/health` used to be registered AFTER `/:domain`, and
+  // Hono resolves in registration order — so the documented health endpoint
+  // was unreachable, binding `domain = 'health'` and 404ing instead.
+  it('GET /certs/health returns the summary, not the :domain handler', async () => {
+    const res = await app.request('/api/v1/certs/health', { headers: authHeader(adminToken) });
+    expect(res.status).toBe(200);
+    const json = (await res.json()) as {
+      data: { healthy: boolean; summary: { total: number; valid: number } };
+    };
+    expect(json.data.summary).toBeDefined();
+    expect(json.data.summary.total).toBe(2);
+    expect(json.data.summary.valid).toBe(2);
+    expect(json.data.healthy).toBe(true);
+  });
+
+  it('GET /certs/health is scoped to the caller like the rest of the group', async () => {
+    const res = await app.request('/api/v1/certs/health', { headers: authHeader(aliceToken) });
+    expect(res.status).toBe(200);
+    const json = (await res.json()) as { data: { summary: { total: number } } };
+    expect(json.data.summary.total).toBe(1);
+  });
+
   it('POST /certs/renew is admin-only', async () => {
     const denied = await app.request('/api/v1/certs/renew', {
       method: 'POST',
