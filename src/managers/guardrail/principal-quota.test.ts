@@ -162,22 +162,23 @@ describe('PrincipalQuota', () => {
     expect(verdict.limit).toBe(2);
   });
 
-  it('persists across a restart, so a process bounce is not a free reset', () => {
+  it('persists across a restart, so a process bounce is not a free reset', async () => {
     // The file is durability; without it, anything that restarts the platform
     // hands every caller a clean allowance — and a push to develop restarts
     // this platform.
     const t = Date.now();
     for (let i = 0; i < 3; i++) quota.record(KEYS, t + i);
 
-    return new Promise<void>((resolve) => {
-      setTimeout(async () => {
-        const revived = new PrincipalQuota(path.join(tempDir, 'principal-quotas.json'));
-        await revived.initialize();
+    // `record` is deliberately fire-and-forget, which is why the class exposes
+    // flush(). Awaiting it is the whole point; this test used to sleep 50ms and
+    // hope the atomic write had landed, which loses under a loaded parallel run
+    // and fails as though persistence were broken.
+    await quota.flush();
 
-        expect(revived.check(KEYS, t + 4).allowed).toBe(false);
-        resolve();
-      }, 50);
-    });
+    const revived = new PrincipalQuota(path.join(tempDir, 'principal-quotas.json'));
+    await revived.initialize();
+
+    expect(revived.check(KEYS, t + 4).allowed).toBe(false);
   });
 
   it('does not fail OPEN when the store cannot be written', async () => {
