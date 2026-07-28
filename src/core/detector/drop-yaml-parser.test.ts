@@ -745,19 +745,17 @@ describe('Drop YAML Parser', () => {
       expect(validateDropYamlConfig({ mcp: {} }).valid).toBe(true);
     });
 
-    it("REJECTS auth: 'drop' instead of silently treating it as none", () => {
-      // The load-bearing one. Accepting it would tell a tenant that DROP guards
-      // their MCP endpoint while it is open to the internet — a schema that
-      // lies about a security property. Rejecting means the schema changes
-      // again in PR 2, which is the cheaper of the two costs.
-      const result = validateDropYamlConfig({ mcp: { auth: 'drop' } });
-      expect(result.valid).toBe(false);
-      expect(result.error).toContain('not supported yet');
+    it("accepts auth: 'drop' now that DROP can actually guard the endpoint", () => {
+      // PR 1 rejected this deliberately, because accepting it would have told a
+      // tenant DROP guarded their endpoint while it was open to the internet.
+      // PR 2 makes the claim true, so the value is now honest.
+      expect(validateDropYamlConfig({ mcp: { auth: 'drop' } }).valid).toBe(true);
     });
 
     it('rejects any other auth value', () => {
       expect(validateDropYamlConfig({ mcp: { auth: 'oauth' } }).valid).toBe(false);
       expect(validateDropYamlConfig({ mcp: { auth: true } }).valid).toBe(false);
+      expect(validateDropYamlConfig({ mcp: { auth: 'DROP' } }).valid).toBe(false);
     });
 
     it('rejects an unknown nested key', () => {
@@ -803,12 +801,13 @@ describe('Drop YAML Parser', () => {
       expect(result.config?.mcp).toEqual({ path: '/tools', auth: 'none' });
     });
 
-    it('fails the whole parse when auth is drop, rather than dropping the key', async () => {
+    it('parses a DROP-guarded declaration end to end', async () => {
       await fs.writeFile(path.join(tmpDir, 'drop.yaml'), 'mcp:\n  auth: drop\n');
 
       const result = await parseDropYaml(tmpDir);
 
-      expect(result.success).toBe(false);
+      expect(result.success).toBe(true);
+      expect(result.config?.mcp).toEqual({ auth: 'drop' });
     });
   });
 });

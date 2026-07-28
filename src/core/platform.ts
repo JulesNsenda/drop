@@ -3097,7 +3097,9 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       if (this.appConfigService) {
         await this.appConfigService.updateConfig(appName, {
           type: detectedType,
-          mcp: mcpEndpoint ? { path: mcpEndpoint.path, auth: mcpEndpoint.auth } : undefined,
+          mcp: mcpEndpoint
+            ? { path: mcpEndpoint.path, auth: mcpEndpoint.auth, source: mcpEndpoint.source }
+            : undefined,
         });
       }
       if (this.stateManager) {

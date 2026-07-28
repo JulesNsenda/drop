@@ -24,9 +24,14 @@ export const DEFAULT_MCP_PATH = '/mcp';
 /** A resolved MCP endpoint for an app. */
 export interface McpEndpoint {
   path: string;
-  /** Only 'none' exists today — DROP guards nothing. See AppMcpConfig.auth. */
-  auth: 'none';
-  /** Whether this came from drop.yaml or was inferred from a manifest. */
+  /** See AppMcpConfig.auth. Only a DECLARED endpoint may be 'drop'. */
+  auth: 'none' | 'drop';
+  /**
+   * Whether this came from drop.yaml or was inferred from a manifest.
+   *
+   * Load-bearing downstream: only a declared endpoint becomes an OAuth
+   * resource, which is what keeps a wrong inference cosmetic.
+   */
   source: 'declared' | 'inferred';
 }
 
@@ -81,14 +86,17 @@ export function detectMcp(input: McpDetectInput): McpEndpoint | undefined {
   if (input.declared) {
     return {
       path: input.declared.path ?? DEFAULT_MCP_PATH,
-      // The parser rejects every other value, so this cannot silently downgrade
-      // a stronger setting to 'none'.
-      auth: 'none',
+      // The parser rejects any other value, so an unrecognised string cannot
+      // silently downgrade a stronger setting to 'none' here.
+      auth: input.declared.auth === 'drop' ? 'drop' : 'none',
       source: 'declared',
     };
   }
 
   if (hasNodeSdk(input.packageJson) || hasPythonMcp(input.requirementsTxt)) {
+    // NEVER 'drop'. Enrolling an app into a login gate — and into being a
+    // mintable OAuth audience — because it happens to depend on the MCP SDK
+    // would be a security decision its owner never made.
     return { path: DEFAULT_MCP_PATH, auth: 'none', source: 'inferred' };
   }
 
