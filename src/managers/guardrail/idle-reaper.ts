@@ -23,7 +23,13 @@ const HOUR_MS = 60 * 60 * 1000;
 /** Default idle window before an agent-created app is reaped. */
 const DEFAULT_IDLE_HOURS = 24;
 /**
- * Sweeps to run in DRY-RUN before the first real reap.
+ * Sweeps that must DRY-RUN before a given app is really reaped.
+ *
+ * Counted PER APP, over the sweeps in which that app was actually a reap
+ * candidate — not per sweep run, and not once per process. Both of those were
+ * tried and both spent the budget somewhere harmless: per-sweep on the no-ops
+ * that make up almost every sweep, per-process on whichever app first
+ * legitimately qualified.
  *
  * This deletes apps and their databases. A signal that is subtly wrong — a
  * runtime that reports 0, a clock that jumped — should show up as logged
