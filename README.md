@@ -194,10 +194,27 @@ Every command and flag is listed at `/reference` on a running DROP.
 
 ## Database Auto-Provisioning
 
-Apps that need a database get one automatically. DROP:
-1. Detects database dependencies (pg, mysql, prisma, etc.)
-2. Provisions a PostgreSQL database
-3. Injects `DATABASE_URL` environment variable
+Apps that need a database get one automatically. DROP provisions and injects
+`DATABASE_URL` when any of these is true:
+
+1. `drop.yaml` says `database: postgres` — the explicit form, and the only way
+   to ask from a non-Node app
+2. A Postgres client or ORM is in `package.json` (`pg`, `pg-promise`,
+   `postgres`, `slonik`, `@prisma/client`, `prisma`, `drizzle-orm`, `knex`,
+   `sequelize`, `typeorm`, `objection`, `@mikro-orm/postgresql`)
+3. An ORM config file is present (`prisma/schema.prisma`, `drizzle.config.*`,
+   `knexfile.*`, `ormconfig.json`, `typeorm.config.ts`, `sequelize.config.js`,
+   `.sequelizerc`)
+
+A MySQL, MongoDB or SQLite driver does **not** trigger provisioning — DROP only
+runs PostgreSQL, and handing such an app a `postgres://` URL it cannot use is
+worse than handing it nothing. And if you supply your own `DATABASE_URL` — as a
+secret or in the `drop.yaml` `env:` block — DROP steps aside rather than
+overriding it (an explicit `database: postgres` still wins).
+
+Provisioning happens on **deploy**, not on a plain restart, and a full per-user
+database quota means the app starts without a `DATABASE_URL` (with a warning in
+the platform log).
 
 Your app just connects:
 ```javascript

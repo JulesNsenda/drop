@@ -2418,9 +2418,30 @@ backup:
   }
 
   /**
-   * Check if an app needs a database by looking at detection result or common ORM config files
+   * Whether an app needs a database.
+   *
+   * Three sources, in precedence order:
+   *   1. An explicit `database:` in drop.yaml — the owner said so, so it wins
+   *      outright.
+   *   2. An ORM config file on disk.
+   *   3. A Postgres client or ORM in package.json dependencies.
+   *
+   * (3) is why this exists in its current shape. It used to check only (1) and
+   * (2), so an app built the way an agent builds one — Express, the `pg`
+   * client, hand-written SQL, no drop.yaml and no ORM config file — got no
+   * database and started with no DATABASE_URL at all. Meanwhile appNeedsRedis
+   * right below has always read package.json. The asymmetry was the bug.
+   *
+   * Only clients DROP's PostgreSQL can actually serve are listed. A MySQL or
+   * Mongo driver is deliberately absent: handing that app a `postgres://`
+   * DATABASE_URL would be a connection string it cannot use, which is worse
+   * than none. Embedded SQLite needs no provisioning either.
    */
-  private async appNeedsDatabase(appPath: string, detectionDatabase?: boolean | string): Promise<boolean> {
+  private async appNeedsDatabase(
+    appName: string,
+    appPath: string,
+    detectionDatabase?: boolean | string
+  ): Promise<boolean> {
     // DROP has no SQLite provisioner — 'sqlite' still provisions PostgreSQL and
     // injects DATABASE_URL. Warn so the mismatch is visible instead of silent.
     if (detectionDatabase === 'sqlite') {
@@ -2435,6 +2456,24 @@ backup:
     // If detection already found database requirement, use that
     if (detectionDatabase === true || detectionDatabase === 'postgres' || detectionDatabase === 'sqlite') {
       return true;
+    }
+
+    // Everything below this line is INFERRED, not declared — so an owner who
+    // has already supplied a DATABASE_URL has answered the question, and
+    // inference must not overrule them. This is not merely tidiness: in the
+    // start env, `...dbEnvVars` is spread AFTER BOTH `...secretEnvVars` and the
+    // drop.yaml `env:` base layer, so provisioning here would override either
+    // one and silently repoint the app from its real database at a
+    // freshly-created empty one. An explicit `database:` in drop.yaml is exempt
+    // (handled above) because that is the owner asking for a DROP database in
+    // as many words.
+    const ownSource = await this.appDatabaseUrlSource(appName, appPath);
+    if (ownSource) {
+      this.logger.debug(
+        `${appName} supplies its own DATABASE_URL (${ownSource}) — skipping inferred database provisioning`,
+        'DATABASE'
+      );
+      return false;
     }
 
     // Otherwise, check for common ORM config files
@@ -2460,7 +2499,75 @@ backup:
       }
     }
 
+    // Finally, a Postgres client or ORM in package.json. Mirrors appNeedsRedis:
+    // an app that installed a driver intends to talk to a database, whether or
+    // not it also keeps an ORM config file. Non-Node apps declare `database:`
+    // in drop.yaml instead — requirements.txt and go.mod are not read here.
+    try {
+      const pkgRaw = await fs.readFile(path.join(appPath, 'package.json'), 'utf-8');
+      const pkg = JSON.parse(pkgRaw) as {
+        dependencies?: Record<string, string>;
+        devDependencies?: Record<string, string>;
+      };
+      const deps = { ...(pkg.dependencies ?? {}), ...(pkg.devDependencies ?? {}) };
+      const postgresClients = [
+        'pg',
+        'pg-promise',
+        'postgres',
+        'slonik',
+        'porsager-postgres',
+        '@prisma/client',
+        'prisma',
+        'drizzle-orm',
+        'knex',
+        'sequelize',
+        'typeorm',
+        'objection',
+        '@mikro-orm/postgresql',
+      ];
+      if (postgresClients.some((c) => c in deps)) {
+        return true;
+      }
+    } catch {
+      // No/unreadable package.json — not a Node app, or nothing to detect.
+    }
+
     return false;
+  }
+
+  /**
+   * Where the app's own DATABASE_URL comes from, if it has one — `'secret'`,
+   * `'drop.yaml env'`, or null. Both layers matter: `dbEnvVars` is spread after
+   * each of them when the start env is assembled, so provisioning would
+   * override either.
+   *
+   * Fail-soft in both directions: an unavailable secret store or an unparseable
+   * drop.yaml reports "no DATABASE_URL", which preserves the pre-existing
+   * provisioning behavior rather than silently withholding a database.
+   */
+  private async appDatabaseUrlSource(
+    appName: string,
+    appPath: string
+  ): Promise<'secret' | 'drop.yaml env' | null> {
+    try {
+      if (this.secretManager?.get(appName, 'DATABASE_URL')) return 'secret';
+    } catch {
+      // Secret store unavailable — fall through to the drop.yaml check.
+    }
+
+    try {
+      const dropYaml = await parseDropYaml(appPath);
+      const declared = dropYaml.success ? dropYaml.config?.env?.DATABASE_URL : undefined;
+      // `env:` values may be string | number | boolean; only a non-empty
+      // string is a usable connection string.
+      if (typeof declared === 'string' && declared.trim().length > 0) {
+        return 'drop.yaml env';
+      }
+    } catch {
+      // Unreadable/invalid drop.yaml — nothing declared.
+    }
+
+    return null;
   }
 
   /**
@@ -3486,7 +3593,11 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
 
       // Check if app needs a database and provision one.
       let dbEnvVars: Record<string, string> = {};
-      const needsDb = await this.appNeedsDatabase(appPath, detection.suggestedConfig?.database);
+      const needsDb = await this.appNeedsDatabase(
+        appName,
+        appPath,
+        detection.suggestedConfig?.database
+      );
       if (this.dbProvisioner && needsDb) {
         const pgSocketDir =
           this.config.isolation === 'docker'
