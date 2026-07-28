@@ -171,7 +171,29 @@ function toAppDto(app: AppState, isAdmin = false): AppDto {
     // folder-dropped groups aren't git-redeployable at all).
     groupGitBacked:
       !app.gitSource && app.group && isGroupGitBacked(app.group) ? true : undefined,
+    mcp: mcpDtoFor(app),
   };
+}
+
+/**
+ * The app's MCP endpoint for the DTO (Step 11), as a DROP-composed absolute URL
+ * plus the flag the UI needs to say "public".
+ *
+ * `auth` is carried explicitly rather than left implicit at 'none' so the UI
+ * cannot render an endpoint without also being able to render what guards it —
+ * and so PR 2 adding a second value is a compile-visible change here.
+ */
+function mcpDtoFor(app: AppState): AppDto['mcp'] {
+  try {
+    const mcp = getAppConfigService().getConfig(app.name)?.mcp;
+    if (!mcp) return undefined;
+    const base = computeAppUrl(app);
+    if (!base) return undefined;
+    return { url: `${base}${mcp.path}`, auth: mcp.auth };
+  } catch {
+    // Config service not initialised (isolated route tests).
+    return undefined;
+  }
 }
 
 /** Thrown by the byte-counting transform the moment the cap is crossed. */

@@ -29,6 +29,7 @@ import { canAccessScoped } from '../access';
 import { scopesAllowCreate } from '../agent-scopes';
 import { isValidAppName } from '../middleware/validate';
 import { getStateManager } from '../../managers/app/state-manager';
+import { getAppConfigService } from '../../managers/app/app-config';
 import { getAppRuntime } from '../../managers/runtime';
 import { getPlatformOps, AppInProgressError } from '../platform-ops';
 import {
@@ -596,6 +597,23 @@ export async function handleDeployFromGit(
 
 // ============ list_apps / app_status / app_logs / restart_app ============
 
+/**
+ * An app's declared/inferred MCP endpoint, or undefined.
+ *
+ * Reads the config rather than app state: the label is written there on every
+ * build (platform.ts), and the config is the source of truth that survives a
+ * restart. Best-effort — the config service is not initialized in isolated
+ * tests, and a missing label must never break a status call.
+ */
+function mcpEndpointFor(appName: string): { path: string } | undefined {
+  try {
+    const mcp = getAppConfigService().getConfig(appName)?.mcp;
+    return mcp ? { path: mcp.path } : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 export function handleListApps(auth: AuthContext | undefined): CallToolResult {
   // Monorepo container entries are internal bookkeeping (webhook matching),
   // never runnable apps — hidden here like in GET /apps.
@@ -609,7 +627,10 @@ export function handleListApps(auth: AuthContext | undefined): CallToolResult {
 
   const lines = apps.map(a => {
     const url = computeAppUrl(a);
-    return `${a.name}  status=${a.status}  type=${a.type}${url ? `  url=${url}` : ''}`;
+    // Marked, not expanded: the full endpoint and its public-by-default warning
+    // belong in app_status, where there is room to say it properly.
+    const mcp = mcpEndpointFor(a.name) ? '  mcp=yes' : '';
+    return `${a.name}  status=${a.status}  type=${a.type}${url ? `  url=${url}` : ''}${mcp}`;
   });
   return toolText(lines.join('\n'));
 }
@@ -632,6 +653,18 @@ export function handleAppStatus(
     url ? `url: ${url}` : 'url: (no externally-reachable domain configured)',
   ];
   if (app.lastDeployedAt) lines.push(`lastDeployedAt: ${app.lastDeployedAt}`);
+
+  // MCP endpoint (Step 11). The URL is COMPOSED by DROP from the app's own
+  // hostname and a path the drop.yaml parser allowlisted — a tenant string is
+  // never echoed on its own. The warning is not decoration: DROP guards nothing
+  // here, and an agent told only "mcp_url: ..." would reasonably assume it did.
+  const mcp = mcpEndpointFor(args.name);
+  if (mcp && url) {
+    lines.push(
+      `mcp_url: ${url}${mcp.path}`,
+      'mcp_auth: none — this endpoint is PUBLIC unless the app authenticates callers itself.'
+    );
+  }
   return toolText(lines.join('\n'));
 }
 
