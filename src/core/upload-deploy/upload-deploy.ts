@@ -159,15 +159,29 @@ export class UploadDeployService {
         // is what exposes an app to automatic deletion, database included, and
         // one agent-assisted redeploy of a long-lived human-owned app would
         // otherwise flag it permanently.
+        //
+        // upsertConfig, NOT updateConfig. This runs BEFORE the app:detected
+        // handler creates the config (platform.ts), and updateConfig writes
+        // nothing when none exists — it returns null, which all four call sites
+        // here and in git-deploy ignored. So these flags were dropped on
+        // precisely the path that sets them (new apps only), leaving the
+        // ephemeral quota, the ephemeral reap and the idle reaper's
+        // agentCreated filter inert in production. `path` rides along so a
+        // config created here is never pathless if the deploy dies before
+        // detection; app:detected upserts the same value.
         if (agentCaller) {
-          await getAppConfigService().updateConfig(appName, { agentCreated: true });
+          await getAppConfigService().upsertConfig(appName, {
+            agentCreated: true,
+            path: destPath,
+          });
         }
         if (ephemeral) {
           const ttl = resolveTtlMinutes(ttlMinutes);
-          await getAppConfigService().updateConfig(appName, {
+          await getAppConfigService().upsertConfig(appName, {
             ephemeral: true,
             expiresAt: new Date(Date.now() + ttl * 60_000).toISOString(),
             ephemeralPrincipalId: principalId,
+            path: destPath,
             // An ephemeral is by definition agent-scale throwaway work, so it
             // is reapable on idleness too — not only on its deadline.
             agentCreated: true,

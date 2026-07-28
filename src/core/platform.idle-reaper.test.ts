@@ -203,3 +203,87 @@ describe('idle reaper dry-run budget', () => {
     );
   });
 });
+
+/**
+ * Expired-ephemeral sweep (Step 10).
+ *
+ * Unlike the idle and disk sweeps, this one does NOT exclude group containers —
+ * and it must not, because an expiry is a deadline the caller asked for. That
+ * makes the teardown it chooses load-bearing: only the container ever carries
+ * the `ephemeral` flag (expandMonorepo synthesizes the children afterwards), so
+ * a per-app teardown would leave every child service running and routed with no
+ * flag of its own for any later sweep to collect it by.
+ */
+describe('expired ephemeral sweep', () => {
+  let platform: DropPlatform;
+  let teardownApp: jest.Mock;
+  let removeGroup: jest.Mock;
+
+  /** One expired ephemeral config; `app` is what the state manager reports. */
+  const seed = (app: Record<string, unknown>) => {
+    (platform as any).appConfigService = {
+      getAllConfigs: () => [
+        {
+          name: 'scratch',
+          ephemeral: true,
+          expiresAt: new Date(Date.now() - 60_000).toISOString(),
+        },
+      ],
+    };
+    (platform as any).stateManager = { getApp: () => app };
+  };
+
+  beforeEach(() => {
+    (tryLogActivity as jest.Mock).mockClear();
+    const root = path.join('C:', 'drop-reaper-test-unused');
+    platform = createPlatform({
+      dropRoot: root,
+      appsDirectory: path.join(root, 'apps'),
+      logLevel: 'error',
+    });
+
+    teardownApp = jest.fn().mockResolvedValue(undefined);
+    removeGroup = jest.fn().mockResolvedValue({ removed: [] });
+    (platform as any).teardownApp = teardownApp;
+    (platform as any).removeGroup = removeGroup;
+    (platform as any).logger = {
+      info: () => undefined,
+      warn: () => undefined,
+      debug: () => undefined,
+      error: () => undefined,
+    };
+  });
+
+  it('removes the whole group when the expired ephemeral is a monorepo container', async () => {
+    seed({ name: 'scratch', userId: 'u1', isGroupContainer: true, group: 'scratch' });
+
+    await (platform as any).sweepExpiredEphemerals();
+
+    expect(removeGroup).toHaveBeenCalledWith('scratch');
+    // The container must NOT also be torn down on its own: removeGroup already
+    // does that last, and a second pass would race its own fs.rm.
+    expect(teardownApp).not.toHaveBeenCalled();
+  });
+
+  it('tears down an ordinary ephemeral directly, skipping the database backup', async () => {
+    // The negative control: routing everything through removeGroup would lose
+    // skipDatabaseBackup and fill the box with dumps of scratch databases.
+    seed({ name: 'scratch', userId: 'u1' });
+
+    await (platform as any).sweepExpiredEphemerals();
+
+    expect(teardownApp).toHaveBeenCalledWith('scratch', { skipDatabaseBackup: true });
+    expect(removeGroup).not.toHaveBeenCalled();
+  });
+
+  it('does not route a child of a group through removeGroup', async () => {
+    // A child carries `group` but is not the container. Removing its whole
+    // group would delete its siblings — an expiry the caller never set on them.
+    seed({ name: 'scratch', userId: 'u1', group: 'some-group' });
+
+    await (platform as any).sweepExpiredEphemerals();
+
+    expect(teardownApp).toHaveBeenCalledWith('scratch', { skipDatabaseBackup: true });
+    expect(removeGroup).not.toHaveBeenCalled();
+  });
+});
