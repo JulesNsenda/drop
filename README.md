@@ -366,7 +366,7 @@ list and examples.
 | `DROP_DISABLE_AUTH` | `false` | Turn API auth off entirely. Auth is **on** by default |
 | `DROP_ISOLATION` | `none` | `none` runs apps under PM2, `docker` runs each in a container |
 | `DROP_ENABLE_REDIS` | `true` | Run the bundled managed Redis |
-| `DROP_MAX_APPS_PER_USER` | `5` | Per-user app quota |
+| `DROP_MAX_APPS_PER_USER` | `5` | Default per-user app quota (a per-user override wins; admins are unlimited) |
 
 ### Variables Injected Into Apps
 | Variable | Description |

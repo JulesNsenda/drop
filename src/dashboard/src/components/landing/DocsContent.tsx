@@ -629,7 +629,7 @@ services:
             ['DROP_DISABLE_AUTH', 'false', 'Turn API auth off entirely (single-operator boxes). Auth is on by default'],
             ['DROP_ISOLATION', 'none', 'Runtime isolation mode — none runs apps under PM2, docker runs each in a container'],
             ['DROP_ENABLE_REDIS', 'true', 'Run the bundled managed Redis'],
-            ['DROP_MAX_APPS_PER_USER', '5', 'Per-user app quota; companion limits exist for disk, memory, CPU, and databases'],
+            ['DROP_MAX_APPS_PER_USER', '5', 'Default per-user app quota — a per-user override wins, and admins are unlimited. Companion limits exist for disk, memory, CPU, and databases'],
           ]}
         />
         <h3 style={h3Style}>Injected into every app</h3>
