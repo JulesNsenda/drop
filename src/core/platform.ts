@@ -621,8 +621,15 @@ export class DropPlatform {
   /** Idle-reaper sweep (Step 9). */
   private idleSweepTimer: NodeJS.Timeout | null = null;
   private readonly idleState: IdleSweepState = createIdleSweepState();
-  /** Sweeps completed; the first few are dry runs before anything is deleted. */
-  private idleSweepCount = 0;
+  /**
+   * app name -> sweeps in which it was a reap candidate and was only logged.
+   *
+   * Per app, not per sweep and not per process: this is what guarantees that
+   * EVERY deletion is preceded by `DROP_IDLE_REAP_DRY_RUNS` logged warnings
+   * naming that app, rather than the budget being spent by whichever app
+   * happened to qualify first.
+   */
+  private readonly idleDryRuns = new Map<string, number>();
 
   private subscriptions: Unsubscribe[] = [];
   // Held separately from `subscriptions`: must stay subscribed through
@@ -5092,9 +5099,10 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
   /**
    * Reap agent-created apps that are demonstrably doing nothing.
    *
-   * This DELETES, database included, so the first `DROP_IDLE_REAP_DRY_RUNS`
-   * sweeps only log what they would have done. A signal that is subtly wrong
-   * should surface as would-have-reaped lines, not as a fleet that is gone.
+   * This DELETES, database included, so for each app the first
+   * `DROP_IDLE_REAP_DRY_RUNS` sweeps that would have reaped IT only log what
+   * they would have done. A signal that is subtly wrong should surface as
+   * would-have-reaped lines, not as a fleet that is gone.
    */
   private async sweepIdleApps(): Promise<void> {
     if (!this.stateManager || !this.runtime) return;
@@ -5120,14 +5128,43 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         return;
       }
 
-      this.idleSweepCount += 1;
-      const dryRun = this.idleSweepCount <= dryRunSweeps();
+      if (reap.length === 0) {
+        // Distinguishable from a dead timer when someone asks "is the reaper
+        // alive?" — which matters, because a healthy sweep reaps nothing the
+        // overwhelming majority of the time.
+        this.logger.debug('Idle sweep: no candidates', 'REAP');
+        return;
+      }
+
+      // The budget is PER APP, and counts only the sweeps in which that app was
+      // actually a reap candidate.
+      //
+      // Two defects are being avoided here. A budget counted per SWEEP was
+      // spent on no-ops: nothing is reapable until the platform has been up for
+      // a full idle window (the first sweep after a restart re-baselines
+      // lastActive to now) while sweeps run every 15 minutes, so it was gone
+      // ~93 sweeps before the first candidate could exist. A budget counted
+      // once per PROCESS is spent by the first app that legitimately qualifies,
+      // leaving nothing for the app reaped months later on a signal that has
+      // since broken — the case the guard was written for. Per app, per
+      // candidate sweep, every deletion is preceded by exactly N logged
+      // would-reap lines, forever.
       for (const name of reap) {
-        if (dryRun) {
+        const seen = (this.idleDryRuns.get(name) ?? 0) + 1;
+        if (seen <= dryRunSweeps()) {
+          this.idleDryRuns.set(name, seen);
           this.logger.info(
-            `[dry run ${this.idleSweepCount}/${dryRunSweeps()}] would reap idle app '${name}'`,
+            `[dry run ${seen}/${dryRunSweeps()}] would reap idle app '${name}'`,
             'REAP'
           );
+          // Also recorded durably: a log line nobody was tailing at 3am is not
+          // the operator warning this guard is supposed to be.
+          await tryLogActivity({
+            action: 'idle-reap-dryrun',
+            appName: name,
+            userId: this.stateManager.getApp(name)?.userId,
+            detail: `Idle beyond the reap window (dry run ${seen}/${dryRunSweeps()})`,
+          });
           continue;
         }
         const app = this.stateManager.getApp(name);
@@ -5146,9 +5183,12 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
             'REAP'
           );
         });
-        // Forget it, or a name reused later inherits this app's history.
+        // Forget it, or a name reused later inherits this app's history —
+        // including its spent dry-run budget, which would let a NEW app of the
+        // same name be deleted with no warning at all.
         this.idleState.lastCpu.delete(name);
         this.idleState.lastActive.delete(name);
+        this.idleDryRuns.delete(name);
       }
     } catch (err) {
       this.logger.debug(
@@ -5197,6 +5237,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         });
         this.idleState.lastCpu.delete(config.name);
         this.idleState.lastActive.delete(config.name);
+        this.idleDryRuns.delete(config.name);
       }
     } catch (err) {
       this.logger.debug(
