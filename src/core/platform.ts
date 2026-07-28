@@ -3780,6 +3780,22 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
             }
           : undefined;
 
+      // DROP-guarded MCP endpoint (Step 11, PR 2b). `source: 'declared'` AND
+      // `auth: 'drop'` — the same pair the verify endpoint requires, so the
+      // Caddy guard and the gateway can never disagree about which apps are
+      // protected. Inference is deliberately excluded: enrolling an app into a
+      // login gate because it depends on the MCP SDK is a decision its owner
+      // never made.
+      const mcpConfig = this.appConfigService?.getConfig(appName)?.mcp;
+      const mcpGuard =
+        mcpConfig?.source === 'declared' && mcpConfig.auth === 'drop'
+          ? {
+              path: mcpConfig.path,
+              appName,
+              verifyUpstream: `localhost:${this.config.apiPort}`,
+            }
+          : undefined;
+
       // Configure route for each domain
       let resolvedPublicUrl: string | undefined;
       for (const hostname of domains) {
@@ -3798,6 +3814,11 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
             ? { certFile: customTls.certFile, keyFile: customTls.keyFile }
             : (enableSsl ? { auto: true } : undefined),
           headers: tenantSecurityHeaders,
+          // DROP-guarded MCP endpoint (Step 11). Only for an app that DECLARED
+          // it — an inferred label must never put a login gate in front of
+          // someone's app — and only when the API port is known, since the
+          // guard is a proxy to DROP's own verify endpoint.
+          ...(mcpGuard ? { mcpAuth: mcpGuard } : {}),
         });
 
         const protocol = enableSsl ? 'https' : 'http';
