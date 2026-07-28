@@ -12,6 +12,11 @@ import { UploadDeployService, resetUploadDeployService } from './upload-deploy';
 import { UploadValidationError, InsufficientDiskSpaceError } from './upload-deploy.types';
 import { ArchiveRejectedError } from './tar-extract';
 import { resetStateManager, getStateManager } from '../../managers/app/state-manager';
+import {
+  AppConfigService,
+  getAppConfigService,
+  resetAppConfigService,
+} from '../../managers/app/app-config';
 import * as diskUtils from '../../utils/disk';
 import { eventBus } from '../event-bus';
 import {
@@ -502,6 +507,96 @@ describe('UploadDeployService', () => {
 
       const leftoverEntries = await fs.readdir(stagingDir);
       expect(leftoverEntries).toHaveLength(0);
+    });
+  });
+
+  /**
+   * The SEAM these flags shipped inert through.
+   *
+   * They are written before `app:detected` is published, i.e. before the
+   * platform's handler creates the app's config — and `updateConfig` writes
+   * nothing when no config exists yet. Every existing test still passed,
+   * because the MCP-layer test mocks this service wholesale and asserts only
+   * that `ephemeral: true` was passed IN. Nothing asserted it came back OUT.
+   *
+   * So these read through a FRESH AppConfigService loading from disk: the
+   * consumers (ephemeral quota, ephemeral reap, idle reaper) read a config that
+   * has survived a platform restart, and an in-memory assertion would pass on a
+   * write that never reached the file.
+   */
+  describe('per-app flag persistence (config write ordering)', () => {
+    let configDir: string;
+
+    beforeEach(async () => {
+      configDir = path.join(tempDir, 'appconf');
+      resetAppConfigService();
+      await getAppConfigService({ configDir, webappsDir: appsDir }).initialize();
+    });
+
+    afterEach(() => {
+      resetAppConfigService();
+    });
+
+    async function reloadConfig(appName: string) {
+      const fresh = new AppConfigService({ configDir, webappsDir: appsDir });
+      await fresh.initialize();
+      return fresh.getConfig(appName);
+    }
+
+    it('persists agentCreated for a new agent-created app', async () => {
+      // The idle reaper skips every app without this flag, so losing it here
+      // means no app on the platform is ever a reap candidate.
+      const archivePath = await buildArchive('agent-app', { 'index.js': 'x' });
+
+      await service.deploy({
+        appName: 'agent-app',
+        archivePath,
+        userId: 'user-1',
+        principalId: 'oauth:sub-1::sid-1',
+        agentCaller: true,
+      });
+
+      expect((await reloadConfig('agent-app'))?.agentCreated).toBe(true);
+    });
+
+    it('persists the ephemeral deadline and its owning principal', async () => {
+      const archivePath = await buildArchive('eph-app', { 'index.js': 'x' });
+      const before = Date.now();
+
+      await service.deploy({
+        appName: 'eph-app',
+        archivePath,
+        userId: 'user-1',
+        principalId: 'oauth:sub-1::sid-1',
+        agentCaller: true,
+        ephemeral: true,
+        ttlMinutes: 5,
+      });
+
+      const config = await reloadConfig('eph-app');
+      // `ephemeral` gates the reap sweep; `ephemeralPrincipalId` is the only
+      // thing the per-caller quota counts on.
+      expect(config?.ephemeral).toBe(true);
+      expect(config?.ephemeralPrincipalId).toBe('oauth:sub-1::sid-1');
+      expect(config?.agentCreated).toBe(true);
+
+      const expiresAt = new Date(config?.expiresAt ?? '').getTime();
+      expect(expiresAt).toBeGreaterThan(before + 4 * 60_000);
+      expect(expiresAt).toBeLessThan(Date.now() + 6 * 60_000);
+    });
+
+    it('leaves an ordinary human deploy unflagged', async () => {
+      // The other direction of SEC-11: nothing here may expose a human-owned
+      // app to automatic deletion. A plain deploy writes no config at all —
+      // app:detected creates it — so this asserts absence, not a false value.
+      const archivePath = await buildArchive('plain-app', { 'index.js': 'x' });
+
+      await service.deploy({ appName: 'plain-app', archivePath, userId: 'user-1' });
+
+      const config = await reloadConfig('plain-app');
+      expect(config?.agentCreated).toBeUndefined();
+      expect(config?.ephemeral).toBeUndefined();
+      expect(config?.expiresAt).toBeUndefined();
     });
   });
 });
