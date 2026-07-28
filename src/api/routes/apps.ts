@@ -33,8 +33,10 @@ import {
   getDomainSuffix,
   getTempDirectory,
   getUploadMaxBytes,
+  getPublicUrl,
 } from '../runtime-config';
 import { isPathWithin } from '../../utils/paths';
+import { isReservedHost } from '../../utils/reserved-hosts';
 import { isLocalhostDomain } from '../../utils/domain-validator';
 import { eventBus } from '../../core/event-bus';
 import {
@@ -83,6 +85,15 @@ function pickUpdatableFields(body: Record<string, unknown>): Partial<AppState> {
         // '' clears the domain, matching the dedicated route.
         if (value !== '' && (typeof value !== 'string' || !CUSTOM_DOMAIN_RE.test(value))) {
           throw new ValidationError('Invalid domain format');
+        }
+        // Same reservation as the dedicated route — this is the other writer,
+        // and a guard on only one of two doors is not a guard.
+        if (
+          typeof value === 'string' &&
+          value !== '' &&
+          isReservedHost(value, getPublicUrl(), getDomainSuffix())
+        ) {
+          throw new ValidationError('That domain is reserved by the platform');
         }
       }
       (updates as Record<string, unknown>)[field] = body[field];
@@ -1101,6 +1112,12 @@ apps.put('/:name/domain', async c => {
   // Basic domain validation
   if (domain && !/^[a-zA-Z0-9][a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/.test(domain)) {
     throw new ValidationError('Invalid domain format');
+  }
+  // The platform's own host is not an app, so the cross-tenant owner map does
+  // not cover it — claiming it here would put a tenant in front of DROP's own
+  // OAuth and MCP endpoints.
+  if (domain && isReservedHost(domain, getPublicUrl(), getDomainSuffix())) {
+    throw new ValidationError('That domain is reserved by the platform');
   }
 
   await stateManager.updateApp(name, { customDomain: domain || ('' as unknown as undefined) });
