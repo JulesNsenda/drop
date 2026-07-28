@@ -527,6 +527,21 @@ describe('MCP tool handlers', () => {
       expect(text).toContain('PUBLIC');
     });
 
+    it('app_status reports a GUARDED endpoint as guarded, not public', async () => {
+      // This line was hardcoded to "none", so the moment `auth: drop` became
+      // real it told an agent that a DROP-protected endpoint was open to the
+      // internet — the exact inversion of the warning it exists to give.
+      await getAppConfigService().upsertConfig('alice-app', {
+        type: 'nodejs',
+        mcp: { path: '/mcp', auth: 'drop', source: 'declared' },
+      });
+
+      const text = firstText(handleAppStatus(alice, { name: 'alice-app' }));
+
+      expect(text).toContain('mcp_auth: drop');
+      expect(text).not.toContain('PUBLIC');
+    });
+
     it('app_status says nothing about MCP for an ordinary app', async () => {
       await getAppConfigService().upsertConfig('alice-app', { type: 'nodejs' });
 

@@ -605,10 +605,10 @@ export async function handleDeployFromGit(
  * restart. Best-effort — the config service is not initialized in isolated
  * tests, and a missing label must never break a status call.
  */
-function mcpEndpointFor(appName: string): { path: string } | undefined {
+function mcpEndpointFor(appName: string): { path: string; auth: 'none' | 'drop' } | undefined {
   try {
     const mcp = getAppConfigService().getConfig(appName)?.mcp;
-    return mcp ? { path: mcp.path } : undefined;
+    return mcp ? { path: mcp.path, auth: mcp.auth } : undefined;
   } catch {
     return undefined;
   }
@@ -662,7 +662,13 @@ export function handleAppStatus(
   if (mcp && url) {
     lines.push(
       `mcp_url: ${url}${mcp.path}`,
-      'mcp_auth: none — this endpoint is PUBLIC unless the app authenticates callers itself.'
+      // DERIVED, never hardcoded. This line said "none" unconditionally, so the
+      // moment `auth: drop` became real it told an agent that a DROP-guarded
+      // endpoint was public — the exact inversion of the warning it exists to
+      // give. Caught by deploying a guarded app and reading the status back.
+      mcp.auth === 'drop'
+        ? 'mcp_auth: drop — DROP requires an OAuth token audienced at this app, from a user who may access it.'
+        : 'mcp_auth: none — this endpoint is PUBLIC unless the app authenticates callers itself.'
     );
   }
   return toolText(lines.join('\n'));
