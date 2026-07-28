@@ -171,7 +171,19 @@ async function failureResult(appName: string, episode: DeployEpisode): Promise<C
     // Build log service not initialized / no logs yet — proceed without a tail.
   }
 
-  const summary = `Deploy of '${appName}' failed at stage '${failedStage?.stage ?? 'unknown'}'${category ? ` (${category})` : ''}.`;
+  // The deploy id goes in the TEXT too, not only in structuredContent.
+  //
+  // `next_actions` tells the caller to run get_deploy_logs, and that tool's one
+  // required argument is this id — but a client that renders the text content of
+  // an `isError` result (claude.ai does) never shows a structured field, so the
+  // id never reaches the agent and the advice is unfollowable. Confirmed against
+  // the live connector: the whole diagnose-and-retry loop stops here.
+  //
+  // Safe unfenced under this module's field discipline: the id is DROP-minted in
+  // platform.ts, never derived from application output.
+  const summary =
+    `Deploy of '${appName}' failed at stage '${failedStage?.stage ?? 'unknown'}'${category ? ` (${category})` : ''}.\n` +
+    `Deploy id: ${episode.deployId} (pass it to get_deploy_logs for this deploy's full output).`;
   // Fenced even though it also rides in structuredContent: this is the one
   // piece of application output in the result, and a structured field is
   // unfenced by default.
