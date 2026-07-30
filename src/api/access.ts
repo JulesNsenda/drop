@@ -1,5 +1,7 @@
 /**
- * Shared ownership/access checks for app-scoped routes.
+ * Shared authorization helpers used across route files: ownership/access
+ * checks for app-scoped routes, plus the interactive-session-only guard for
+ * routes that must never be reachable with an API key or OAuth token.
  */
 
 import { AuthContext } from './middleware/auth';
@@ -58,4 +60,49 @@ export function canAccessScoped(
     );
   }
   return canAccess(auth, app);
+}
+
+/**
+ * Guard for self-service ACCOUNT routes — the ones that act on the caller's own
+ * credentials rather than on a resource.
+ *
+ * Resolving `AuthContext.userId` to a key's `ownerUserId` means a key now acts
+ * AS its owner. For app/resource routes that is the point. For these routes it
+ * is not: an API key is a credential handed to a CI job or a deployed app, and
+ * it must not be able to change, disable or re-enrol the human's own login
+ * factors — a leaked low-privilege key would otherwise convert into full
+ * account takeover. Each of these routes also compares a caller-supplied secret
+ * (password, TOTP code) and reports the mismatch, so without this guard they
+ * are online guessing oracles against the owner reachable with any key.
+ *
+ * Before ownership resolution these were accidentally inert: a key's id is
+ * never in `credentials.users`, so every lookup missed. The containment was a
+ * side effect of the bug, so it has to be restated as a decision.
+ *
+ * Fails CLOSED when auth is disabled. There is no principal at all in that
+ * mode (`authMiddleware` calls `next()` without setting a context), so
+ * `authMethod` cannot be evaluated and `userId` is `undefined` — the routes
+ * previously threw a TypeError into a 400 body. A single-operator box has no
+ * account to service here anyway.
+ *
+ * Also used to close the read paths of the database panel (DROP-120): on an
+ * auth-disabled box `canAccess(undefined, app)` returns `true`, so without
+ * this guard those GETs would be anonymous, network-reachable disclosure of
+ * every app's schema; and it closes the DROP-075 gap (an API key's role is
+ * never clamped to its owner's) for those routes too.
+ */
+export function interactiveSessionOnly(
+  requester: AuthContext | undefined,
+  action: string
+): { ok: true; requester: AuthContext } | { ok: false; message: string } {
+  if (!requester) {
+    return { ok: false, message: `${action} is unavailable when authentication is disabled.` };
+  }
+  if (requester.authMethod !== 'jwt') {
+    return {
+      ok: false,
+      message: `${action} requires an interactive session. API keys and OAuth tokens cannot be used.`,
+    };
+  }
+  return { ok: true, requester };
 }

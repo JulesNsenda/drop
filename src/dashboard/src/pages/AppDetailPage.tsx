@@ -18,6 +18,7 @@ import {
   Globe,
   Terminal,
   AlertTriangle,
+  Database,
 } from 'lucide-react';
 import { useApp, appAction, deleteApp, gitRedeploy } from '../hooks/useApi';
 import { getAuthHeaders, useAuth } from '../hooks/useAuth';
@@ -29,13 +30,17 @@ import DeployTimeline from '../components/DeployTimeline';
 import LogViewer from '../components/LogViewer';
 import Tabs, { TabDef } from '../components/Tabs';
 import MetricsTab from '../components/MetricsTab';
+import DatabaseTab from '../components/DatabaseTab';
 import Card from '../components/ui/Card';
 import Button from '../components/ui/Button';
 import Input from '../components/ui/Input';
 
+// Always visible — the "no database provisioned" state is first-class
+// content, not something to hide behind a conditional tab (see DROP-120 plan).
 const DETAIL_TABS: TabDef[] = [
   { id: 'logs', label: 'Logs', icon: Terminal },
   { id: 'metrics', label: 'Metrics', icon: Activity },
+  { id: 'database', label: 'Database', icon: Database },
   { id: 'environment', label: 'Environment', icon: Key },
   { id: 'domains', label: 'Domains', icon: Globe },
 ];
@@ -505,12 +510,14 @@ function AppDetailPage() {
         </div>
       )}
 
-      {/* Deep-view tabs: Logs / Metrics / Environment / Domains */}
+      {/* Deep-view tabs: Logs / Metrics / Database / Environment / Domains */}
       <Tabs tabs={DETAIL_TABS} active={activeTab} onChange={setActiveTab} />
 
       {activeTab === 'logs' && <LogViewer appName={app.name} appStatus={app.status} />}
 
       {activeTab === 'metrics' && <MetricsTab app={app} />}
+
+      {activeTab === 'database' && <DatabaseTab name={app.name} />}
 
       {activeTab === 'environment' && (
         <Card padded={false}>

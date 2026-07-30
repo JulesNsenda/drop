@@ -32,7 +32,7 @@ import {
 } from '../middleware/auth';
 import { tryLogActivity } from '../../managers/activity';
 import { getStateManager } from '../../managers/app/state-manager';
-import { canAccess } from '../access';
+import { canAccess, interactiveSessionOnly } from '../access';
 import { assertMintable } from '../agent-scopes';
 import { ValidationError } from '../middleware/error';
 
@@ -42,45 +42,6 @@ const auth = new Hono();
 const DEFAULT_AGENT_TOKEN_MINUTES = 60;
 /** Ceiling. A scope-only token is still a credential; a standing one defeats the point. */
 const MAX_AGENT_TOKEN_MINUTES = 60 * 24 * 7;
-
-/**
- * Guard for self-service ACCOUNT routes — the ones that act on the caller's own
- * credentials rather than on a resource.
- *
- * Resolving `AuthContext.userId` to a key's `ownerUserId` means a key now acts
- * AS its owner. For app/resource routes that is the point. For these routes it
- * is not: an API key is a credential handed to a CI job or a deployed app, and
- * it must not be able to change, disable or re-enrol the human's own login
- * factors — a leaked low-privilege key would otherwise convert into full
- * account takeover. Each of these routes also compares a caller-supplied secret
- * (password, TOTP code) and reports the mismatch, so without this guard they
- * are online guessing oracles against the owner reachable with any key.
- *
- * Before ownership resolution these were accidentally inert: a key's id is
- * never in `credentials.users`, so every lookup missed. The containment was a
- * side effect of the bug, so it has to be restated as a decision.
- *
- * Fails CLOSED when auth is disabled. There is no principal at all in that
- * mode (`authMiddleware` calls `next()` without setting a context), so
- * `authMethod` cannot be evaluated and `userId` is `undefined` — the routes
- * previously threw a TypeError into a 400 body. A single-operator box has no
- * account to service here anyway.
- */
-function interactiveSessionOnly(
-  requester: AuthContext | undefined,
-  action: string
-): { ok: true; requester: AuthContext } | { ok: false; message: string } {
-  if (!requester) {
-    return { ok: false, message: `${action} is unavailable when authentication is disabled.` };
-  }
-  if (requester.authMethod !== 'jwt') {
-    return {
-      ok: false,
-      message: `${action} requires an interactive session. API keys and OAuth tokens cannot be used.`,
-    };
-  }
-  return { ok: true, requester };
-}
 
 // GET /auth/status - Public endpoint to check if auth is enabled
 auth.get('/status', c => {

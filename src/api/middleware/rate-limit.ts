@@ -44,6 +44,15 @@ const OAUTH_CONFIG: RateLimitConfig = {
   windowMs: 60_000, // 1 minute - dedicated bucket for the OAuth 2.1 endpoints (PRD-041)
 };
 
+const DB_CONFIG: RateLimitConfig = {
+  maxRequests: 20,
+  windowMs: 60_000, // 1 minute - dedicated bucket for the database panel (DROP-120). The
+  // general bucket is 100/min per IP shared across every endpoint, so a burst
+  // of on-demand refreshes against the panel (overview + tables, no polling —
+  // see the plan) would otherwise 429 the operator out of the rest of the API
+  // mid-incident.
+};
+
 // In-memory stores per limiter instance
 const stores = new Map<string, Map<string, RateLimitEntry>>();
 
@@ -150,6 +159,11 @@ export function mcpRateLimitMiddleware(config?: Partial<RateLimitConfig>) {
 /** Dedicated rate limiter for the OAuth 2.1 endpoints (PRD-041) */
 export function oauthRateLimitMiddleware(config?: Partial<RateLimitConfig>) {
   return createRateLimiter('oauth', { ...OAUTH_CONFIG, ...config });
+}
+
+/** Dedicated rate limiter for the database panel (DROP-120) */
+export function dbRateLimitMiddleware(config?: Partial<RateLimitConfig>) {
+  return createRateLimiter('db', { ...DB_CONFIG, ...config });
 }
 
 /** Reset all rate limit stores (for testing) */
