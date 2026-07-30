@@ -421,4 +421,49 @@ Medium/low findings dropped without individual reasons: **11**.
 
 ## Run stats
 
-_To be filled at the end of Phase 2._
+```yaml
+date: 2026-07-28
+slug: database-panel
+gear: full
+effort_plan: high
+effort_diff: high
+findings_plan_actioned: 16
+findings_plan_rejected: 4
+findings_plan_dropped: 42
+findings_diff_actioned: 10
+findings_diff_rejected: 5
+findings_diff_dropped: 11
+escaped: 2
+agents_spawned: 16
+gates_failed_first_pass: 3
+escalated_from: none
+```
+
+**On `escaped: 2`** — both are worth naming, because the point of the number is
+to be honest about what the critics did not catch.
+
+1. **The `n_live_tup` inversion.** The architecture critic asserted at plan stage
+   that row estimates read 0 until autovacuum analyses a table. I believed it,
+   wrote it into the plan, and specified a UI rule on top of it. The Gate 2
+   critics repeated it rather than challenging it. **Gate 4 measured it against a
+   real PostgreSQL 16 and it is false** — `n_live_tup` is stats-collector
+   maintained on DML. The rule as specified would have hidden correct row counts
+   behind "not yet analysed" — a defect introduced *by* the review process and
+   caught only by running the thing.
+2. **The row-estimate heuristic had zero test coverage.** Flagged at Gate 3.
+   Closed by extracting it to a plain `.ts` sibling the root jest can reach, with
+   fixtures taken from the Gate 4 readings.
+
+**On `gates_failed_first_pass: 3`** — Gate 1 caught a plan item (the quarantined
+-credentials state) that no implementer had built; Gate 2 returned a
+nine-item fix batch; Gate 3 returned the coverage gap above. Gate 4 passed first
+time, which is the one I would have bet against.
+
+**On the ratio** — 17 critical/high findings at plan stage against 26 findings at
+diff stage, of which **zero** were critical or high. Read together, the plan
+review is where the design was wrong and the diff review is where the polish was
+missing, which is the shape you want. The single most valuable finding in the run
+(`values: []` does not select the extended protocol) was empirically verified by
+two independent critics from the pinned driver source, and it is what moved M2
+out of this plan.
+
