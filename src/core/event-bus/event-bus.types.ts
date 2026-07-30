@@ -93,8 +93,22 @@ export interface AppDetectedPayload extends BaseEvent {
   name: string;
   path: string;
   type?: string;
-  /** Set when detection was triggered by an upload-deploy (PRD-039), not the file watcher. */
-  origin?: 'upload';
+  /**
+   * Who published this detection.
+   *
+   * `'upload'` — an upload-deploy (PRD-039).
+   * `'watcher'` — the file watcher's own scan, i.e. DROP noticed a folder
+   *   rather than anyone asking for a deploy. Load-bearing: handleAppDetected
+   *   refuses to independently onboard a materialized monorepo child, and that
+   *   refusal must apply ONLY to watcher-fabricated events. An API-originated
+   *   detection (migrate-runtime, git deploy) is someone deliberately asking
+   *   for that app and must still be honoured — migrate-runtime in particular
+   *   STOPS the app before publishing, so swallowing its event would leave the
+   *   app down with no error.
+   *
+   * Absent for other publishers, which are all deliberate by construction.
+   */
+  origin?: 'upload' | 'watcher';
   /**
    * Who asked for this deploy, for guardrail keying — NOT for authorization,
    * which happened at the route or tool boundary before this was published.

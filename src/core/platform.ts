@@ -3032,6 +3032,28 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
    * real fs I/O inside `parseDropYaml` through the event bus's fire-and-forget
    * dispatch.
    */
+  /**
+   * Whether an app is a MATERIALIZED MONOREPO CHILD — a folder expandMonorepo
+   * copied out of a container's `services:` map, as opposed to a standalone
+   * app or the container itself.
+   *
+   * The discriminator is deliberate: expandMonorepo tags the container with
+   * `isGroupContainer: true` and tags each child with only `group`, so
+   * "grouped but not a container" is exactly the set whose lifecycle belongs
+   * to someone else. Both stores are consulted because the config file is the
+   * source of truth across restarts while state carries `isGroupContainer`.
+   *
+   * A standalone app is unaffected even if its own drop.yaml declares
+   * `group:` — nothing copies that into its AppConfig; only expandMonorepo
+   * writes the field.
+   */
+  private isGroupedChild(appName: string): boolean {
+    const config = this.appConfigService?.getConfig(appName);
+    const state = this.stateManager?.getApp(appName);
+    if (state?.isGroupContainer) return false;
+    return Boolean(config?.group || state?.group);
+  }
+
   private async handleAppDetected(payload: AppDetectedPayload): Promise<void> {
     // Skip apps currently being cloned
     if (this.gitDeployService?.isCloning(payload.name)) return;
@@ -3057,6 +3079,40 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       } finally {
         this.appsInProgress.delete(payload.name);
       }
+      return;
+    }
+
+    // A materialized monorepo CHILD must never be onboarded independently —
+    // its fate is entirely the container's, which re-copies and rebuilds every
+    // child as one atomic fs.rm+fs.cp+build (expandMonorepo). Without this the
+    // watcher's boot scan onboards `<group>-<service>` folders as ordinary
+    // apps: each publishes its own app:detected and starts building, and the
+    // container's expansion then lands fs.rm/fs.cp underneath — leaving a
+    // static child pointed at a build output that no longer exists (nginx
+    // 500s with a `try_files` redirect cycle, which is how this was found).
+    //
+    // boot-reconcile already refuses grouped apps for exactly this reason, but
+    // DROP_BOOT_RECONCILE defaults to 'off', so that guard does not run on a
+    // default box and this path was the one that actually executed.
+    //
+    // Safe against the container's own build path: expandMonorepo calls
+    // handleBuildApp DIRECTLY and never publishes app:detected for a child, so
+    // nothing here blocks a legitimate group build.
+    // Gated on ORIGIN, not just identity. Only a watcher-fabricated detection
+    // is refused: an API-originated one is someone deliberately asking for this
+    // app. migrate-runtime is the sharp case — it STOPS the app and then
+    // publishes app:detected to bring it back, so swallowing that event would
+    // leave a migrated child down permanently with nothing but a log line.
+    // The watcher already added the child to knownApps before publishing
+    // (watcher.ts), so there is nothing to mark here.
+    if (payload.origin === 'watcher' && this.isGroupedChild(payload.name)) {
+      // info, not debug: if the container later fails to expand (a bad
+      // drop.yaml, an ownership refusal), this line is the only trace that
+      // something is deliberately declining to build the child.
+      this.logger.info(
+        `Skipping watcher onboarding of grouped child '${payload.name}' — its monorepo container owns rebuilds`,
+        'MONOREPO'
+      );
       return;
     }
 
@@ -4149,6 +4205,30 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           'UPDATE'
         );
       }
+      return;
+    }
+
+    // The mirror of the container guard above, and deliberately AFTER it so the
+    // container is identified positively (by its own `services:` map) before
+    // anything is refused for being grouped — otherwise a container that ever
+    // gained a `group` in its AppConfig would stop re-expanding, silently.
+    //
+    // An INCIDENTAL file-settle on a materialized CHILD is almost always the
+    // container's own fs.cp landing in that folder, so rebuilding here races
+    // the expansion that is writing the files: the child rebuilds against a
+    // half-copied tree, and a static child ends up serving a build output that
+    // was replaced underneath it.
+    //
+    // Only the incidental path is refused. An explicit redeploy still runs —
+    // refusing it would be worse — though note such a build lands in a tree the
+    // container will fs.rm on its next expansion, so it survives only until the
+    // next group redeploy. Redirecting that path to the container is follow-up
+    // work, not something to guess at here.
+    if (!bypassCooldown && this.isGroupedChild(appName)) {
+      this.logger.debug(
+        `Skipping incidental update for grouped child '${appName}' — its monorepo container owns rebuilds`,
+        'MONOREPO'
+      );
       return;
     }
 
