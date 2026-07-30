@@ -83,13 +83,13 @@ threat model, and M1 delivers most of the operator value without any of it.
 
 ### Data access
 
-- [ ] `src/managers/database/connection-string.ts` — **new**. Extract one pure
+- [x] `src/managers/database/connection-string.ts` — **new**. Extract one pure
       `buildConnectionString(creds, target)` where `target` is
       `{kind:'tcp', host}` or `{kind:'socket', dir}`. `getEnvVars`
       (`database-provisioner.ts:448`) is refactored to call it, so there is one
       percent-encoding implementation rather than a second that drifts (DROP-066
       lives in this code path).
-- [ ] `src/managers/database/app-db-inspector.ts` — **new**
+- [x] `src/managers/database/app-db-inspector.ts` — **new**
   - `openClient(creds)` — takes **credentials, never an app name**, so there is
     no default that could silently fall back to a read-write role later.
     **Loopback TCP unconditionally**: the API process runs on the host and always
@@ -108,15 +108,21 @@ threat model, and M1 delivers most of the operator value without any of it.
   - Bounded gate: **N in flight, zero queue depth, immediate 503** with
     `Retry-After`. A queue would accumulate requests whose clients have gone.
     Global cap **plus** a per-app sub-cap so one app cannot starve the rest.
-- [ ] Row counts: report `n_live_tup` **explicitly labelled an estimate**, and
-      render "not yet analysed" when `last_analyze` and `last_autoanalyze` are
-      both null and the relation is non-empty by size. A bare `0` on a freshly
-      migrated database would reproduce the very confusion this feature exists to
-      remove. Exact `COUNT(*)` only for relations under a size threshold.
+- [~] Row counts: report `n_live_tup` **explicitly labelled an estimate**, shown
+      whenever it is positive — `n_live_tup` is maintained live by the stats
+      collector on every DML at commit, so it does *not* wait for ANALYZE; a
+      freshly migrated, never-analysed table already reports a correct count
+      (the column that genuinely stays unreliable until ANALYZE is
+      `pg_class.reltuples`, which this panel never reads). Render "not yet
+      analysed" only when the reported count is `0` **and** the relation is
+      non-empty by size: a real, non-empty table whose cumulative stats were
+      reset (e.g. `pg_stat_reset()`) can report `n_live_tup = 0` too, and a
+      confident wrong `0` there is the very confusion this feature exists to
+      remove. Exact `COUNT(*)` for small relations was CUT — see the diff-stage critiques.
 
 ### API
 
-- [ ] `src/api/routes/db.ts` — **new**, mounted at `/api/v1/db`
+- [x] `src/api/routes/db.ts` — **new**, mounted at `/api/v1/db`
   - `GET /:name` → `{ provisioned: boolean, … }`. **200, not an error**, when the
     app simply has no database — that is the normal case.
   - `GET /:name/tables`
@@ -144,18 +150,20 @@ threat model, and M1 delivers most of the operator value without any of it.
     SQLSTATE `53300` → 503 "connection limit reached"; `28P01` → 503 "stored
     credentials rejected". All via `HttpError` so the message survives
     `onError`'s deliberate 500-collapse (`server.ts:604-619`).
-- [ ] `src/api/access.ts` — move `interactiveSessionOnly` here from
+- [x] `src/api/access.ts` — move `interactiveSessionOnly` here from
       `routes/auth.ts` (**not** a new `auth-guards.ts`; `access.ts` is already the
       home for shared non-middleware authz helpers). No re-export — the existing
       guard test is HTTP-level and stays green untouched as proof.
-- [ ] `src/api/middleware/rate-limit.ts` — `dbRateLimitMiddleware()` (~20/min).
-      **In M1.** The general bucket is 100/min *per IP shared across all
-      endpoints*, so DB traffic would otherwise 429 the operator out of the whole
-      dashboard mid-incident.
-- [ ] `src/api/server.ts` — limiter registered **unconditionally** with the other
+- [x] `src/api/middleware/rate-limit.ts` — `dbRateLimitMiddleware()` (~20/min).
+      **In M1.** An ADDITIONAL, tighter cap on `/db/*` — not an exemption from
+      the general 100/min-per-IP-shared-across-all-endpoints bucket, which
+      still applies to `/db/*` too (it is mounted on `/api/*`); a db request
+      is throttled by both. 20/min is simply the saner ceiling for an
+      endpoint backed by a single shared PostgreSQL instance.
+- [x] `src/api/server.ts` — limiter registered **unconditionally** with the other
       route-specific limiters; auth guard **inside** the `enableAuth` block and
       **above** the mount; both `'/db/:name'` and `'/db/:name/*'` patterns.
-- [ ] `src/managers/activity/activity-log.ts` — **no new action, and no logging
+- [x] `src/managers/activity/activity-log.ts` — **no new action, and no logging
       of reads.** With the reveal cut from M1 there is no low-frequency,
       security-relevant event left to record, so this file is untouched.
       **Do not log the reads.** `ActivityLog` is a 500-entry ring
@@ -165,24 +173,24 @@ threat model, and M1 delivers most of the operator value without any of it.
 
 ### Dashboard
 
-- [ ] `src/dashboard/src/components/DatabaseTab.tsx` — **new**. Overview, table
+- [x] `src/dashboard/src/components/DatabaseTab.tsx` — **new**. Overview, table
       list. No connection string (cut from M1).
-- [ ] `src/dashboard/src/pages/AppDetailPage.tsx` — add `database` to the static
+- [x] `src/dashboard/src/pages/AppDetailPage.tsx` — add `database` to the static
       `DETAIL_TABS`. **Always visible**; the "no database provisioned" state is
       first-class content. Hiding the tab would leave the motivating question
       unanswerable and make `DETAIL_TABS` dynamic, which is a structural change
       to a 679-line component, not a one-liner.
-- [ ] **On-demand refresh only — no polling.** The house rate is 3 s; two polled
+- [x] **On-demand refresh only — no polling.** The house rate is 3 s; two polled
       endpoints would add 40 req/min against the shared bucket and hammer a
       shared PostgreSQL with SCRAM handshakes (4096 PBKDF2 iterations per
       connect). A visible Refresh button is correct for a panel backed by a
       shared database.
-- [ ] `src/dashboard/src/components/landing/ReferenceContent.tsx` — document the
+- [x] `src/dashboard/src/components/landing/ReferenceContent.tsx` — document the
       new group. Needs `npm run build:site`, not `build:dashboard`.
 
 ### Tests
 
-- [ ] Client always closed, including on throw; bounded gate rejects rather than
+- [x] Client always closed, including on throw; bounded gate rejects rather than
       queues; the three explicit states; ownership 404 for a foreign app;
       session-only 403 for an API key on **both** routes; `readonly` token 403
       (proves the middleware is actually bound); **no activity-log row written by
@@ -310,6 +318,106 @@ are folded into the file-level changes above and **4 are consciously rejected**
 - **`C8` — `drop_internal`/`postgres`/`template1` are PUBLIC-connectable.** Real,
   but **out of scope**: a pre-existing one-line hardening unrelated to this
   feature. Recorded here so it is not lost.
+
+## Agent critiques considered — diff stage
+
+Gate 2 re-ran `security-critic` and `architecture-critic` against the real diff
+(both read the working tree, including the uncommitted files). **Zero critical,
+zero high.** Security returned 8 findings, all `low`, plus an explicit
+clean-check on the load-bearing invariants — the `interactiveSessionOnly` move
+byte-identical, no path to the superuser pool for tenant data, `getEnvVars`
+output unchanged, middleware binding order correct. Architecture returned 18,
+six `medium`, the rest `low`.
+
+### M1 · pass 1 — actioned
+
+Nine fixes applied in one batch:
+
+1. **`listTables` reported the quarantine diagnostic for ordinary DB-less apps**
+   (architecture, *medium/high*) — it threw `credentials-missing` unconditionally
+   while `getOverview` only did so after confirming a live database. Added a
+   `not-provisioned` reason mapped to **404**; 503 implies retry-will-help, which
+   is wrong for a permanent state.
+2. **SQLSTATE `3D000` was unmapped** (architecture, *medium/high*) — stored
+   credentials pointing at a deleted database surfaced as "PostgreSQL is not
+   reachable", sending an operator to check a healthy cluster. Now
+   `database-missing`.
+3. **The headline invariant had no executable guard** (architecture,
+   *medium/high*) — `getAppCredentials('_internal')` can return superuser
+   credentials and nothing in the module refused them. Now throws, and the test
+   points at the guard rather than at a connection string, so it fails for ANY
+   future path that tries one.
+4. **Connection-string round-trip** (security, *low/low*) — the inspector fed a
+   URL back into `pg`, which re-parses it; a password containing `@` would
+   re-split the authority. Unreachable today, closed anyway: discrete fields now.
+5. **Log hygiene** (architecture, *low/high*) — `connect failed` was logged where
+   nothing had connected, over-counting the feature's only observability signal.
+   The raw driver message is no longer logged at all.
+6. **`DatabaseTab` latched its error state** (architecture, *medium/high*) — one
+   transient failure stuck the panel on the red card, and it fired on *every* dev
+   mount via StrictMode's double-invoke hitting the per-app cap of 1. Cleared on
+   success; cap raised to 2.
+7. **Empty vs. unanalysed rendering** (architecture, *medium/high*) — see the
+   correction below.
+8. **The rate-limit comment was false** (architecture, *medium/high*) — the db
+   bucket *stacks with* the general `/api/*` bucket, it does not exempt panel
+   traffic from it. Comment and plan corrected; wiring unchanged, since the
+   tighter cap is still worth having.
+9. Path encoding in the dashboard, and the reference page's `user` floor.
+
+### The correction Gate 4 forced
+
+Finding 7 was originally specified — by me — on the architecture critic's premise
+that `n_live_tup` reads 0 until autovacuum analyses a table. **Gate 4 measured
+that against a real PostgreSQL 16 and it is false.** `n_live_tup` is maintained
+live by the statistics collector on DML; `pg_class.reltuples` — which this panel
+does not read — is the field gated on ANALYZE. Measured, with 7 rows inserted and
+never analysed:
+
+```
+relname | n_live_tup | last_analyze | size
+todos   |          7 |              | 32768
+```
+
+The rule as originally specified would have hidden a correct `7` behind "not yet
+analysed", which is worse than the bug it was meant to fix. The implemented rule
+flags only the genuinely untrustworthy combination — zero rows reported against
+real bytes on disk, which is what a stats reset produces:
+
+```
+todos   |          0 |              | 32768   <- 7 real rows
+```
+
+Both states are now pinned by the Gate 4 harness.
+
+### Consciously rejected
+
+- **architecture · the provisioner singleton lives in the barrel**
+  (*medium/high*), forcing `app-db-inspector` to import `./index` and leaving a
+  latent `index -> app-db-inspector -> index` cycle if the barrel ever
+  re-exports the inspector. **Real, and deferred.** It is a pre-existing
+  inconsistency with `getPostgresServer` (which owns its own singleton); moving
+  it churns every existing call site for no behaviour change, which does not
+  belong in a feature branch. No cycle exists today — the barrel does not
+  re-export the inspector, and the routes deep-import deliberately.
+- **architecture · exact `COUNT(*)` for small relations was dropped**
+  (*medium/high*). **Cut, and the checkbox un-ticked** rather than left silently
+  marked done. It needs a second statement per relation against a shared server,
+  and Gate 4 showed `n_live_tup` is already correct in the ordinary case — so the
+  value is much lower than when the plan was written.
+- **security · four apps can hold the whole global gate** (*low/low*) and **the
+  `sanitizeName` collision existence-oracle** (*low/medium*). Accepted: the first
+  is <=5s of degradation on a read-only view behind a rate limit; the second
+  requires owning an app whose name collides in the first 32 sanitized characters
+  and yields a single boolean. Both are carried into the M2 plan, which has to
+  solve the collision class properly regardless.
+- **security · a hung `client.end()` leaks a gate slot permanently**
+  (*low/medium*). Accepted for M1 with the reasoning recorded: it needs a
+  blackholed TCP peer, and the fix — racing teardown against a timer — adds its
+  own failure mode. The `[db-panel]` lines exist to make it visible if it ever
+  happens.
+
+Medium/low findings dropped without individual reasons: **11**.
 
 ## Run stats
 

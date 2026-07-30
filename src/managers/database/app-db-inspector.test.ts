@@ -4,15 +4,25 @@
  * Coverage goals (see docs/plans/2026-07-28-database-panel.md, "Tests"):
  * - the client is end()ed when `fn` throws, not just on success
  * - ROLLBACK is issued before end()
- * - the gate rejects a 5th concurrent call (different apps), and a 2nd
+ * - the gate rejects a 5th concurrent call (different apps), and a 3rd
  *   concurrent call for the SAME app, immediately with reason 'busy' —
  *   never by queueing
  * - the gate releases slots after both success and failure
  * - no-credentials -> {provisioned:false}, no connection attempted
+ * - no-credentials + orphanDatabaseExists true -> DbUnavailableError('credentials-missing')
+ * - no-credentials + orphanDatabaseExists throwing -> fails soft to {provisioned:false}
+ * - listTables: no-credentials + orphanDatabaseExists false -> DbUnavailableError('not-provisioned')
+ * - listTables: no-credentials + orphanDatabaseExists true -> DbUnavailableError('credentials-missing')
  * - provisioner null -> DbUnavailableError('no-service')
- * - each pg error class maps to the right reason
+ * - each pg error class maps to the right reason, including 3D000 -> 'database-missing'
  * - analysed:false when both analyze timestamps are null
- * - the connection string used is the TCP form, never the superuser pool
+ * - discrete connection fields are passed to Client, never a connection string,
+ *   and never the superuser pool
+ * - the client-config builder refuses postgres-superuser creds and `_`-prefixed
+ *   app names, and that refusal is never relabelled by mapConnectError
+ * - non-connect states log '[db-panel] unavailable'; real connect/query
+ *   failures log '[db-panel] connect failed' with code/name only, never the
+ *   raw driver message
  */
 
 import { Client } from 'pg';
@@ -70,11 +80,19 @@ function createDeferred<T = void>() {
   return { promise, resolve, reject };
 }
 
-/** Point getDatabaseProvisioner() at a stub whose getAppCredentials looks up `creds`. */
-function stubProvisioner(creds: Record<string, DatabaseCredentials | null>) {
+/**
+ * Point getDatabaseProvisioner() at a stub whose getAppCredentials looks up
+ * `creds`. `orphanDatabaseExists` defaults to a stub resolving `false` (the
+ * common case); pass a jest.fn() to control it per-test.
+ */
+function stubProvisioner(
+  creds: Record<string, DatabaseCredentials | null>,
+  orphanDatabaseExists: jest.Mock = jest.fn().mockResolvedValue(false)
+) {
   const getAppCredentials = jest.fn((appName: string) => creds[appName] ?? null);
   jest.spyOn(databaseModule, 'getDatabaseProvisioner').mockReturnValue({
     getAppCredentials,
+    orphanDatabaseExists,
   } as unknown as databaseModule.DatabaseProvisioner);
   return getAppCredentials;
 }
@@ -103,12 +121,50 @@ describe('getOverview — service/credential states', () => {
     expect(MockClient).not.toHaveBeenCalled();
   });
 
+  it('throws DbUnavailableError("credentials-missing") when credentials are missing but a database still exists (quarantined credentials)', async () => {
+    const orphanDatabaseExists = jest.fn().mockResolvedValue(true);
+    stubProvisioner({}, orphanDatabaseExists);
+
+    await expect(getOverview('orphan-app')).rejects.toBeInstanceOf(DbUnavailableError);
+    await expect(getOverview('orphan-app')).rejects.toMatchObject({ reason: 'credentials-missing' });
+    expect(orphanDatabaseExists).toHaveBeenCalledWith('orphan-app');
+    expect(MockClient).not.toHaveBeenCalled();
+  });
+
+  it('fails soft to {provisioned:false} when orphanDatabaseExists itself throws', async () => {
+    const orphanDatabaseExists = jest.fn().mockRejectedValue(new Error('pg unreachable'));
+    stubProvisioner({}, orphanDatabaseExists);
+
+    const overview = await getOverview('ghost-app');
+
+    expect(overview).toEqual({ provisioned: false });
+    expect(MockClient).not.toHaveBeenCalled();
+  });
+
   it('throws DbUnavailableError("no-service") when the provisioner is unavailable', async () => {
     jest.spyOn(databaseModule, 'getDatabaseProvisioner').mockReturnValue(null);
 
     await expect(getOverview('any-app')).rejects.toBeInstanceOf(DbUnavailableError);
     await expect(getOverview('any-app')).rejects.toMatchObject({ reason: 'no-service' });
     expect(MockClient).not.toHaveBeenCalled();
+  });
+
+  it('logs "[db-panel] unavailable" (not "connect failed") for no-service and credentials-missing — nothing ever connected', async () => {
+    jest.spyOn(databaseModule, 'getDatabaseProvisioner').mockReturnValue(null);
+    await getOverview('any-app').catch(() => {});
+    expect(warnSpy).toHaveBeenCalledWith(
+      '[db-panel] unavailable',
+      expect.objectContaining({ appName: 'any-app', reason: 'no-service' })
+    );
+
+    warnSpy.mockClear();
+    const orphanDatabaseExists = jest.fn().mockResolvedValue(true);
+    stubProvisioner({}, orphanDatabaseExists);
+    await getOverview('orphan-app').catch(() => {});
+    expect(warnSpy).toHaveBeenCalledWith(
+      '[db-panel] unavailable',
+      expect.objectContaining({ appName: 'orphan-app', reason: 'credentials-missing' })
+    );
   });
 
   it('returns overview stats for a provisioned app', async () => {
@@ -128,11 +184,21 @@ describe('getOverview — service/credential states', () => {
 });
 
 describe('listTables — service/credential states', () => {
-  it('throws DbUnavailableError("credentials-missing") when no credentials exist, no connection attempted', async () => {
+  it('throws DbUnavailableError("not-provisioned") when no credentials exist and no orphan database, no connection attempted', async () => {
     stubProvisioner({});
 
     await expect(listTables('ghost-app')).rejects.toBeInstanceOf(DbUnavailableError);
-    await expect(listTables('ghost-app')).rejects.toMatchObject({ reason: 'credentials-missing' });
+    await expect(listTables('ghost-app')).rejects.toMatchObject({ reason: 'not-provisioned' });
+    expect(MockClient).not.toHaveBeenCalled();
+  });
+
+  it('throws DbUnavailableError("credentials-missing") when credentials are missing but a database still exists (quarantined credentials)', async () => {
+    const orphanDatabaseExists = jest.fn().mockResolvedValue(true);
+    stubProvisioner({}, orphanDatabaseExists);
+
+    await expect(listTables('orphan-app')).rejects.toBeInstanceOf(DbUnavailableError);
+    await expect(listTables('orphan-app')).rejects.toMatchObject({ reason: 'credentials-missing' });
+    expect(orphanDatabaseExists).toHaveBeenCalledWith('orphan-app');
     expect(MockClient).not.toHaveBeenCalled();
   });
 
@@ -141,6 +207,24 @@ describe('listTables — service/credential states', () => {
 
     await expect(listTables('any-app')).rejects.toMatchObject({ reason: 'no-service' });
     expect(MockClient).not.toHaveBeenCalled();
+  });
+
+  it('logs "[db-panel] unavailable" (not "connect failed") for not-provisioned and credentials-missing', async () => {
+    stubProvisioner({});
+    await listTables('ghost-app').catch(() => {});
+    expect(warnSpy).toHaveBeenCalledWith(
+      '[db-panel] unavailable',
+      expect.objectContaining({ appName: 'ghost-app', reason: 'not-provisioned' })
+    );
+
+    warnSpy.mockClear();
+    const orphanDatabaseExists = jest.fn().mockResolvedValue(true);
+    stubProvisioner({}, orphanDatabaseExists);
+    await listTables('orphan-app').catch(() => {});
+    expect(warnSpy).toHaveBeenCalledWith(
+      '[db-panel] unavailable',
+      expect.objectContaining({ appName: 'orphan-app', reason: 'credentials-missing' })
+    );
   });
 });
 
@@ -213,7 +297,7 @@ describe('listTables — row mapping', () => {
 // ── connection string / superuser-pool avoidance ────────────────────────────
 
 describe('connection construction', () => {
-  it('connects using the TCP connection-string form, never a socket form or the superuser pool config', async () => {
+  it('passes discrete connection fields to Client, never a connection string or the superuser pool config', async () => {
     const creds = makeCreds('myapp');
     stubProvisioner({ myapp: creds });
     MockClient.mockImplementation(() => makeMockClient() as unknown as Client);
@@ -221,15 +305,19 @@ describe('connection construction', () => {
     await getOverview('myapp');
 
     expect(MockClient).toHaveBeenCalledTimes(1);
-    const config = MockClient.mock.calls[0][0] as { connectionString?: string; database?: string };
+    const config = MockClient.mock.calls[0][0] as Record<string, unknown>;
 
-    expect(config.connectionString).toMatch(/^postgresql:\/\/.*@localhost:5433\/drop_myapp$/);
-    // Never the socket form (percent-encoded directory in the host position).
-    expect(config.connectionString).not.toContain('%2F');
-    // Never built from a superuser pool config — no bare `database` field
-    // pointing at 'postgres', and no 'postgres' user in the string.
-    expect(config.database).toBeUndefined();
-    expect(config.connectionString).not.toContain('postgres:');
+    // Discrete fields, taken verbatim from creds — never re-parsed by
+    // pg-connection-string (see DROP-120 Gate-2: a password containing `@`
+    // or `/` could re-split the authority of a connection string).
+    expect(config.connectionString).toBeUndefined();
+    expect(config.host).toBe(creds.host);
+    expect(config.port).toBe(creds.port);
+    expect(config.user).toBe(creds.user);
+    expect(config.password).toBe(creds.password);
+    expect(config.database).toBe(creds.database);
+    // Never the superuser pool config.
+    expect(config.user).not.toBe('postgres');
   });
 
   it('sets timeouts on the Client config, not via SET LOCAL', async () => {
@@ -244,6 +332,60 @@ describe('connection construction', () => {
     expect(config.query_timeout).toBe(2000);
     expect(config.statement_timeout).toBe(2000);
     expect(config.idle_in_transaction_session_timeout).toBe(5000);
+  });
+});
+
+// ── superuser-credential guard: THE ONE RULE, enforced in code ─────────────
+
+describe('client-config builder — refuses a superuser credential (THE ONE RULE)', () => {
+  it('refuses credentials whose user is "postgres", without ever constructing a Client', async () => {
+    const creds = { ...makeCreds('sneaky'), user: 'postgres' };
+    stubProvisioner({ sneaky: creds });
+
+    let caught: unknown;
+    try {
+      await getOverview('sneaky');
+    } catch (e) {
+      caught = e;
+    }
+
+    expect(caught).toBeDefined();
+    // Never relabelled by mapConnectError as a normal unavailable reason —
+    // this is a bug, and must fail loud instead.
+    expect(caught).not.toBeInstanceOf(DbUnavailableError);
+    expect(MockClient).not.toHaveBeenCalled();
+  });
+
+  it('refuses an app name in the `_`-prefixed internal namespace, without ever constructing a Client', async () => {
+    const creds = makeCreds('_internal');
+    stubProvisioner({ _internal: creds });
+
+    let caught: unknown;
+    try {
+      await getOverview('_internal');
+    } catch (e) {
+      caught = e;
+    }
+
+    expect(caught).toBeDefined();
+    expect(caught).not.toBeInstanceOf(DbUnavailableError);
+    expect(MockClient).not.toHaveBeenCalled();
+  });
+
+  it('also refuses a superuser credential from listTables', async () => {
+    const creds = { ...makeCreds('sneaky'), user: 'postgres' };
+    stubProvisioner({ sneaky: creds });
+
+    let caught: unknown;
+    try {
+      await listTables('sneaky');
+    } catch (e) {
+      caught = e;
+    }
+
+    expect(caught).toBeDefined();
+    expect(caught).not.toBeInstanceOf(DbUnavailableError);
+    expect(MockClient).not.toHaveBeenCalled();
   });
 });
 
@@ -317,9 +459,12 @@ describe('error mapping', () => {
   const cases: Array<{ code: string | undefined; expected: DbUnavailableError['reason'] }> = [
     { code: 'ECONNREFUSED', expected: 'unreachable' },
     { code: 'ETIMEDOUT', expected: 'unreachable' },
+    { code: 'ENOTFOUND', expected: 'unreachable' },
+    { code: 'EHOSTUNREACH', expected: 'unreachable' },
     { code: '53300', expected: 'conn-limit' },
     { code: '28P01', expected: 'auth-failed' },
     { code: '28000', expected: 'auth-failed' },
+    { code: '3D000', expected: 'database-missing' },
     { code: undefined, expected: 'unreachable' },
   ];
 
@@ -335,10 +480,10 @@ describe('error mapping', () => {
     await expect(getOverview('myapp')).rejects.toMatchObject({ reason: expected });
   });
 
-  it('logs one greppable [db-panel] warn line on a connect failure', async () => {
+  it('logs one greppable [db-panel] warn line on a connect failure, with code/name but never the raw driver message', async () => {
     const creds = makeCreds('myapp');
     stubProvisioner({ myapp: creds });
-    const err = Object.assign(new Error('refused'), { code: 'ECONNREFUSED' });
+    const err = Object.assign(new Error('refused: super secret internal detail'), { code: 'ECONNREFUSED' });
     MockClient.mockImplementation(
       () => makeMockClient({ connect: jest.fn().mockRejectedValue(err) }) as unknown as Client
     );
@@ -348,8 +493,11 @@ describe('error mapping', () => {
     expect(warnSpy).toHaveBeenCalledTimes(1);
     expect(warnSpy).toHaveBeenCalledWith(
       '[db-panel] connect failed',
-      expect.objectContaining({ appName: 'myapp', reason: 'unreachable' })
+      expect.objectContaining({ appName: 'myapp', reason: 'unreachable', code: 'ECONNREFUSED', name: 'Error' })
     );
+    const loggedFields = warnSpy.mock.calls[0][1] as Record<string, unknown>;
+    expect(loggedFields).not.toHaveProperty('message');
+    expect(Object.values(loggedFields)).not.toContain(err.message);
   });
 });
 
@@ -385,7 +533,7 @@ describe('gate — bounded, not a queue', () => {
     await Promise.allSettled([p1, p2, p3, p4]);
   });
 
-  it('rejects a 2nd concurrent call for the SAME app immediately with reason busy (per-app cap)', async () => {
+  it('allows 2 concurrent calls for the SAME app (raised per-app cap covers React StrictMode double-invoke)', async () => {
     stubProvisioner({ appX: makeCreds('appX') });
     const heldOpen = createDeferred<void>();
     MockClient.mockImplementation(
@@ -393,12 +541,28 @@ describe('gate — bounded, not a queue', () => {
     );
 
     const p1 = getOverview('appX');
+    const p2 = getOverview('appX');
+
+    heldOpen.resolve();
+    const results = await Promise.all([p1, p2]);
+    results.forEach((r) => expect(r.provisioned).toBe(true));
+  });
+
+  it('rejects a 3rd concurrent call for the SAME app immediately with reason busy (per-app cap)', async () => {
+    stubProvisioner({ appX: makeCreds('appX') });
+    const heldOpen = createDeferred<void>();
+    MockClient.mockImplementation(
+      () => makeMockClient({ connect: jest.fn(() => heldOpen.promise) }) as unknown as Client
+    );
+
+    const p1 = getOverview('appX');
+    const p2 = getOverview('appX');
     // Global cap (4) is nowhere near reached — this must be rejected by the
-    // PER-APP cap (1) specifically.
+    // PER-APP cap (2) specifically.
     await expect(getOverview('appX')).rejects.toMatchObject({ reason: 'busy' });
 
     heldOpen.resolve();
-    await Promise.allSettled([p1]);
+    await Promise.allSettled([p1, p2]);
   });
 
   it('logs one greppable [db-panel] warn line on a gate rejection', async () => {
@@ -409,16 +573,17 @@ describe('gate — bounded, not a queue', () => {
     );
 
     const p1 = getOverview('appX');
+    const p2 = getOverview('appX');
     await getOverview('appX').catch((e) => e);
 
     expect(warnSpy).toHaveBeenCalledTimes(1);
     expect(warnSpy).toHaveBeenCalledWith(
       '[db-panel] gate rejected (per-app cap)',
-      expect.objectContaining({ appName: 'appX', cap: 1 })
+      expect.objectContaining({ appName: 'appX', cap: 2 })
     );
 
     heldOpen.resolve();
-    await Promise.allSettled([p1]);
+    await Promise.allSettled([p1, p2]);
   });
 
   it('releases slots after success — sequential calls never see busy', async () => {

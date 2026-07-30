@@ -32,7 +32,7 @@ export type HttpMethod = 'GET' | 'POST' | 'PUT' | 'DELETE';
  *   - 'public': no auth middleware applied at all.
  *   - 'authenticated': `authMiddleware()` with no role arg — any valid
  *     JWT/API key, regardless of role.
- *   - 'session': `authMiddleware()` PLUS auth.ts's `interactiveSessionOnly`
+ *   - 'session': `authMiddleware()` PLUS access.ts's `interactiveSessionOnly`
  *     gate, which requires `authMethod === 'jwt'` — an API key or OAuth token
  *     is refused however privileged it is. The role tag alone cannot express
  *     this, so it gets its own kind; documenting these as 'authenticated'
@@ -251,6 +251,24 @@ export const ENDPOINT_GROUPS: EndpointGroupDef[] = [
       { method: 'GET', path: '/api/v1/git/tokens', description: 'List stored GitHub PATs (names only, no values).', role: 'user' },
       { method: 'POST', path: '/api/v1/git/tokens', description: 'Store a GitHub personal access token.', role: 'user' },
       { method: 'DELETE', path: '/api/v1/git/tokens/:id', description: 'Remove a stored token.', role: 'user' },
+    ],
+  },
+  {
+    id: 'db',
+    title: 'Database',
+    basePath: '/api/v1/db',
+    sourceFile: 'src/api/routes/db.ts',
+    description:
+      "Read-only visibility into an app's provisioned database — whether one exists, its size, and its tables. " +
+      'Fixed catalogue queries only; there is no endpoint that runs app-authored SQL.',
+    note:
+      'Session only, on both routes — an API key or OAuth token is refused however privileged it is, closing the ' +
+      "same anonymous-disclosure gap an auth-disabled instance would otherwise open. provisioned: false is a normal " +
+      '200, not an error: most apps have no database. The `session` role below is a floor on top of another: ' +
+      "server.ts also requires the `user` role, so a readonly operator's session is refused here too.",
+    endpoints: [
+      { method: 'GET', path: '/api/v1/db/:name', description: 'Whether a database is provisioned, its name, size in bytes, and table count.', role: 'session' },
+      { method: 'GET', path: '/api/v1/db/:name/tables', description: 'Per-table name, estimated row count (null/unanalysed until ANALYZE has run), and size in bytes.', role: 'session' },
     ],
   },
   {

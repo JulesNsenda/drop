@@ -499,6 +499,29 @@ export class DatabaseProvisioner {
     return this.provisionedDatabases.has(appName);
   }
 
+  /**
+   * Whether a database exists on the server for this app despite no stored
+   * credentials — e.g. `db-credentials.json` was quarantined after failing to
+   * parse (see `quarantineCorruptCredentials`), which clears the in-memory
+   * registry but leaves the actual databases behind on disk. This is a
+   * control-plane *metadata existence* check (does a database with this name
+   * exist), not tenant data access, which is why it is allowed to use the
+   * server's admin pool while the app-db-inspector itself never may.
+   *
+   * Returns `false` on any error — this is a diagnostic used to decide whether
+   * to raise a louder warning, and it must never turn a working panel into a
+   * failing one.
+   */
+  async orphanDatabaseExists(appName: string): Promise<boolean> {
+    try {
+      const safeName = this.sanitizeName(appName);
+      const dbName = `${APP_DB_PREFIX}${safeName}`;
+      return await this.server.databaseExists(dbName);
+    } catch {
+      return false;
+    }
+  }
+
   // ============ Private Methods ============
 
   private sanitizeName(name: string): string {

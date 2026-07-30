@@ -274,6 +274,46 @@ describe('DatabaseProvisioner.getEnvVars', () => {
   });
 });
 
+describe('DatabaseProvisioner.orphanDatabaseExists (DROP-120)', () => {
+  let provisioner: DatabaseProvisioner;
+  let dropRoot: string;
+  let mockServer: ReturnType<typeof makeMockServer>;
+
+  beforeEach(async () => {
+    dropRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'drop-prov-'));
+    mockServer = makeMockServer();
+    provisioner = new DatabaseProvisioner(mockServer, dropRoot);
+  });
+
+  afterEach(async () => {
+    await fs.rm(dropRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  });
+
+  it('applies the same sanitized-name convention as provisionAppDatabase before checking existence', async () => {
+    mockServer.databaseExists.mockResolvedValue(true);
+
+    const exists = await provisioner.orphanDatabaseExists('My App!!');
+
+    expect(exists).toBe(true);
+    // sanitizeName lowercases, collapses non-alphanumerics to '_', and trims
+    // — 'My App!!' -> 'my_app'; the prefix matches provisionAppDatabase's
+    // own dbName construction.
+    expect(mockServer.databaseExists).toHaveBeenCalledWith('drop_my_app');
+  });
+
+  it('returns false when no database exists for the sanitized name', async () => {
+    mockServer.databaseExists.mockResolvedValue(false);
+
+    await expect(provisioner.orphanDatabaseExists('myapp')).resolves.toBe(false);
+  });
+
+  it('returns false (fails soft) when the server check throws', async () => {
+    mockServer.databaseExists.mockRejectedValue(new Error('connection refused'));
+
+    await expect(provisioner.orphanDatabaseExists('myapp')).resolves.toBe(false);
+  });
+});
+
 describe('DatabaseProvisioner.provisionAppDatabase — REVOKE FROM PUBLIC', () => {
   let provisioner: DatabaseProvisioner;
   let dropRoot: string;
