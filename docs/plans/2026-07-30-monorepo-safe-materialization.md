@@ -234,3 +234,84 @@ Medium/low findings dropped without individual reasons: **9**.
 ## Run stats
 
 _To be filled at the end of Phase 2._
+
+---
+
+# Gate 2 outcome: v2 REJECTED, branch not merged
+
+The v2 implementation passed Gate 1 (conformance) and the full suite, and was
+then **rejected at Gate 2**. Two critics returned 3 critical/high findings that
+each independently defeat it. The branch `fix/DROP-122-safe-materialization` is
+abandoned; nothing was committed beyond this plan.
+
+Recorded because the reasoning is the deliverable.
+
+## Why v2 does not work
+
+1. **The transaction never happens.** `expandMonorepo` calls
+   `stateManager.registerApp(childName, …)` *before* `handleAppUpdate`, and
+   `registerApp` forces `status` back to `pending` (`state-manager.ts:265`). So
+   `handleAppUpdate`'s `wasRunning` is always false for a running child. On
+   success the old process is never stopped and `ProcessManager.start`
+   early-returns on `online` — new build on disk, old code still serving, deploy
+   reported green. On failure the child is marked `errored` while its old process
+   is still alive. Both halves of the contract v2 was buying are inverted.
+
+2. **v2 reproduced the exact failure it rejected v1 for.**
+   `StaticBuildStrategy.preBuild` returns early when it finds an existing
+   `index.html`, leaving `buildCommand` unset. With the `fs.rm` gone the child's
+   previous `dist/` survives, so a static child with no explicit `build:` **never
+   rebuilds again** and `validate()` passes against the stale bundle. The plan
+   argued this exact mechanism on page 1 to reject v1 and then recreated it on
+   page 2. The claimed mitigation (Vite's `emptyOutDir`) only applies when a
+   build command is configured, which is what `preBuild` declines to do.
+
+3. **Tenant build commands escape the build container.** `handleBuildApp` sets
+   `execCommand = createContainerExecCommand(...)` under docker isolation so
+   tenant-authored `install`/`build`/`preBuild` run in a locked-down container.
+   `handleAppUpdate` never sets it, so the builder falls back to host
+   `child_process` as the platform user — who is in the `docker` group and
+   therefore root-equivalent. v2 newly routed every existing monorepo child
+   through that path.
+
+## The load-bearing lesson
+
+**The prune is not optional.** v2 deferred it as "the riskiest part, a separate
+follow-up". It is in fact what makes removing the `fs.rm` safe at all. Without
+it, removing the wipe turns an availability bug into confidentiality
+regressions:
+
+- a file deleted from the source stays deployed and, for a static child, stays
+  publicly served — "delete the secret and redeploy" silently no-ops
+- changing `services.<svc>.path` leaves the child holding the union of both
+  trees, publishing the old subtree, and lets a leftover manifest steer detection
+  and the start command
+- a symlink planted in the child tree by a `postinstall` outside the source's
+  path set now survives forever, and under `isolation: 'none'` the static server
+  follows it; removing the malicious source no longer remediates
+- `fs.cp` throws `ERR_FS_CP_DIR_TO_NON_DIR` on a file→directory flip and abandons
+  the copy mid-tree, leaving a half-old/half-new tree serving, permanently
+
+## What a v3 must contain
+
+Not a patch on v2 — these are its preconditions:
+
+1. `execCommand` parity between `handleBuildApp` and `handleAppUpdate`, lifted
+   into one shared helper. **Security-critical and pre-existing**: every upload
+   and git redeploy of a *standalone* app already builds on the host today.
+2. The prune, as a first-class part, shared with `UploadDeployService.pruneStale`
+   (which has the same defect on a busier path).
+3. `updateApp` instead of `registerApp` for an existing child, so status survives.
+4. A decision on stale `dist` vs. `StaticBuildStrategy.preBuild` ordering.
+5. The stopped-child check moved *above* the `fs.cp` — v2 refreshed a stopped
+   child's source while skipping its build, so a later `drop start` serves new,
+   unbuilt source.
+
+## Recommended sequencing
+
+The two pre-existing security holes now outrank the original 500:
+
+1. `execCommand` parity (tenant builds on the host).
+2. `validateContainedPath` realpath + the collision guard's fail-open.
+3. The shared prune helper.
+4. Only then, the materialization change that depends on all three.
