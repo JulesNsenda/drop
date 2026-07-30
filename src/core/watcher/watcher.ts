@@ -267,6 +267,11 @@ export class WatcherService {
       name: appName,
       path: appPath,
       type: undefined,
+      // Marks this as DROP noticing a folder rather than anyone asking for a
+      // deploy. The platform refuses to independently onboard a materialized
+      // monorepo child, and that refusal keys off this — an API-originated
+      // detection for the same app must still be honoured.
+      origin: 'watcher',
     });
   }
 
