@@ -112,6 +112,32 @@ describe('DatabaseProvisioner.getEnvVars', () => {
     expect(vars!['PGPASSWORD']).toBe('testpassword');
   });
 
+  it('no-opts DATABASE_URL passes through the stored connectionString verbatim (post-connection-string.ts refactor)', () => {
+    // The no-opts branch must keep using the STORED connectionString rather
+    // than rebuilding one via buildConnectionString() — a rebuild is not
+    // always possible (e.g. the `_internal` fallback credential's stored
+    // string percent-encodes the password while its `password` field stays
+    // raw). Seed a stored string that a naive TCP rebuild would NOT
+    // reproduce, so this test would fail if the no-opts branch were ever
+    // routed through the builder.
+    const creds = {
+      host: 'localhost',
+      port: 5433,
+      database: 'drop_myapp',
+      user: 'drop_myapp_user',
+      password: 'testpassword',
+      connectionString: 'postgresql://drop_myapp_user:%74estpassword@localhost:5433/drop_myapp?sslmode=disable',
+    };
+    (provisioner as any).provisionedDatabases.set('myapp', {
+      appName: 'myapp',
+      credentials: creds,
+      createdAt: new Date(),
+    });
+
+    const vars = provisioner.getEnvVars('myapp');
+    expect(vars!['DATABASE_URL']).toBe(creds.connectionString);
+  });
+
   it('rewrites PGHOST and DATABASE_URL when pgHost is provided', () => {
     injectCredentials(provisioner, 'myapp');
     const vars = provisioner.getEnvVars('myapp', { pgHost: 'host-gateway' });
@@ -136,6 +162,15 @@ describe('DatabaseProvisioner.getEnvVars', () => {
 
   it('returns null with pgHost opt when app is unknown', () => {
     expect(provisioner.getEnvVars('ghost', { pgHost: 'host-gateway' })).toBeNull();
+  });
+
+  it('TCP DATABASE_URL is byte-identical to the pre-connection-string.ts-refactor construction', () => {
+    injectCredentials(provisioner, 'myapp');
+    const vars = provisioner.getEnvVars('myapp', { pgHost: 'host-gateway' });
+
+    expect(vars!['DATABASE_URL']).toBe(
+      'postgresql://drop_myapp_user:testpassword@host-gateway:5433/drop_myapp'
+    );
   });
 
   it('returns a WHATWG-parseable socket DATABASE_URL when pgSocketDir is provided (DROP-066)', () => {
@@ -201,6 +236,15 @@ describe('DatabaseProvisioner.getEnvVars', () => {
     expect(raw).not.toContain('p@ss');
   });
 
+  it('socket DATABASE_URL is byte-identical to the pre-connection-string.ts-refactor construction', () => {
+    injectCredentials(provisioner, 'myapp');
+    const vars = provisioner.getEnvVars('myapp', { pgSocketDir: '/var/drop/data/db/pgdata' });
+
+    expect(vars!['DATABASE_URL']).toBe(
+      'postgresql://drop_myapp_user:testpassword@%2Fvar%2Fdrop%2Fdata%2Fdb%2Fpgdata:5433/drop_myapp'
+    );
+  });
+
   it('returns null with pgSocketDir opt when app is unknown', () => {
     expect(provisioner.getEnvVars('ghost', { pgSocketDir: '/var/drop/data/db/pgdata' })).toBeNull();
   });
@@ -227,6 +271,46 @@ describe('DatabaseProvisioner.getEnvVars', () => {
     expect(url).not.toContain('?host=');
     expect(decodeURIComponent(new URL(url).hostname)).toBe('/var/drop/data/pgsock');
     expect(new URL(url).port).toBe('5433');
+  });
+});
+
+describe('DatabaseProvisioner.orphanDatabaseExists (DROP-120)', () => {
+  let provisioner: DatabaseProvisioner;
+  let dropRoot: string;
+  let mockServer: ReturnType<typeof makeMockServer>;
+
+  beforeEach(async () => {
+    dropRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'drop-prov-'));
+    mockServer = makeMockServer();
+    provisioner = new DatabaseProvisioner(mockServer, dropRoot);
+  });
+
+  afterEach(async () => {
+    await fs.rm(dropRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  });
+
+  it('applies the same sanitized-name convention as provisionAppDatabase before checking existence', async () => {
+    mockServer.databaseExists.mockResolvedValue(true);
+
+    const exists = await provisioner.orphanDatabaseExists('My App!!');
+
+    expect(exists).toBe(true);
+    // sanitizeName lowercases, collapses non-alphanumerics to '_', and trims
+    // — 'My App!!' -> 'my_app'; the prefix matches provisionAppDatabase's
+    // own dbName construction.
+    expect(mockServer.databaseExists).toHaveBeenCalledWith('drop_my_app');
+  });
+
+  it('returns false when no database exists for the sanitized name', async () => {
+    mockServer.databaseExists.mockResolvedValue(false);
+
+    await expect(provisioner.orphanDatabaseExists('myapp')).resolves.toBe(false);
+  });
+
+  it('returns false (fails soft) when the server check throws', async () => {
+    mockServer.databaseExists.mockRejectedValue(new Error('connection refused'));
+
+    await expect(provisioner.orphanDatabaseExists('myapp')).resolves.toBe(false);
   });
 });
 

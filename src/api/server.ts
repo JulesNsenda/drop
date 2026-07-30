@@ -25,6 +25,7 @@ import {
   uploadRateLimitMiddleware,
   mcpRateLimitMiddleware,
   oauthRateLimitMiddleware,
+  dbRateLimitMiddleware,
 } from './middleware/rate-limit';
 import { securityHeadersMiddleware } from './middleware/security-headers';
 import { auditMiddleware, initializeAuditLog, closeAuditLog } from './middleware/audit';
@@ -41,6 +42,7 @@ import authRoutes from './routes/auth';
 import certsRoutes from './routes/certs';
 import deploysRoutes from './routes/deploys';
 import secretsRoutes from './routes/secrets';
+import dbRoutes from './routes/db';
 import webhooksRoutes from './routes/webhooks';
 import gitDeployRoutes from './routes/git-deploy';
 import adminRoutes from './routes/admin';
@@ -263,6 +265,14 @@ export class ApiServer {
     // OAuth isn't configured/enabled, but the rate limit applies regardless.
     v1.use('/oauth/*', oauthRateLimitMiddleware());
 
+    // The database panel (DROP-120) gets an ADDITIONAL, tighter cap here —
+    // not instead of the general bucket registered above (`/api/*`, which
+    // `/db/*` still matches too): a request here is throttled by BOTH, this
+    // one is just stricter (20/min vs 100/min) because it is sized for a
+    // single shared PostgreSQL instance, not the whole API. Registered
+    // unconditionally — an auth-disabled (single-operator) box still gets it.
+    v1.use('/db/*', dbRateLimitMiddleware());
+
     // Apply auth middleware to protected routes when auth is enabled
     if (this.config.enableAuth && isAuthEnabled()) {
       // migrate-runtime is admin-only — register before the general /apps/* guard.
@@ -322,6 +332,11 @@ export class ApiServer {
       v1.use('/certs/renew', authMiddleware('admin'));
       v1.use('/certs/*', authMiddleware('readonly'));
       v1.use('/secrets/*', authMiddleware('user'));
+      // Database panel reads (DROP-120) — 'user' floor so a `readonly` token
+      // is rejected by this middleware before the route's own
+      // interactiveSessionOnly guard ever runs; the route guard alone is not
+      // enough since it only distinguishes session vs API key, not role.
+      v1.use('/db/*', authMiddleware('user'));
       v1.use('/webhooks/*', authMiddleware('admin'));
       v1.use('/git/deploy', authMiddleware('user'));
       v1.use('/git/redeploy/*', authMiddleware('user'));
@@ -337,6 +352,7 @@ export class ApiServer {
     v1.route('/certs', certsRoutes);
     v1.route('/deploys', deploysRoutes);
     v1.route('/secrets', secretsRoutes);
+    v1.route('/db', dbRoutes);
     v1.route('/webhooks', webhooksRoutes);
     v1.route('/git', gitDeployRoutes);
     v1.route('/admin', adminRoutes);
