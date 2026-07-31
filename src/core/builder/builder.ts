@@ -412,9 +412,24 @@ export class BuilderService {
     context: BuildContext,
     startTime: number
   ): Promise<BuildStageResult> {
-    // Merge environment variables
+    // Merge environment variables.
+    //
+    // `process.env` is deliberately NOT merged in here. It used to be, and that
+    // silently defeated the platform's only secret boundary: `sanitizeBuildEnv`
+    // strips DROP_*/AWS_*/CF_* out of the parent env and then spreads the
+    // caller's overrides back on top — so seeding `context.env` from
+    // `process.env` laundered every stripped secret straight back into the
+    // environment handed to tenant-authored install/build commands, on BOTH the
+    // host and container runners. `DROP_MASTER_KEY` (the passphrase for every
+    // app's encrypted secrets), the GitHub webhook secret and the DNS API
+    // tokens were all reachable from a one-line `postinstall`.
+    //
+    // Nothing is lost by dropping it: the parent env (PATH, SystemRoot,
+    // proxies, npm_config_*, …) is still supplied — filtered — by
+    // `sanitizeBuildEnv` at the point each command is actually executed. What
+    // remains here is exactly what SHOULD be an override: the app's own
+    // drop.yaml `env`/`build_env`, its depends_on URLs, and NODE_ENV.
     const env = {
-      ...process.env,
       ...context.config.env,
       ...context.env,
       NODE_ENV: 'production',
