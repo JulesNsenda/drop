@@ -26,6 +26,7 @@ import { getStateManager } from '../../managers/app/state-manager';
 import { getAppConfigService } from '../../managers/app/app-config';
 import { getLogger } from '../../utils/logger';
 import { hasEnoughDisk, getMinFreeDiskMb } from '../../utils/disk';
+import { syncTree, DEFAULT_PRESERVE } from '../../utils/tree-sync';
 import { eventBus } from '../event-bus';
 import { admitDeploy } from '../../managers/guardrail/deploy-breaker';
 import {
@@ -246,6 +247,12 @@ export class UploadDeployService {
    * filesystems). For a redeploy over an existing app dir, sync the staged
    * tree over the target and then delete stale target entries that aren't
    * present in the staged tree, so nothing lingers from a previous upload.
+   *
+   * `node_modules` survives that prune (`DEFAULT_PRESERVE`): a tarball never
+   * carries it, and deleting it used to pull a running app's dependencies out
+   * from under it on every redeploy. Build output is NOT preserved — see the
+   * note on `DEFAULT_PRESERVE` for why that is required rather than an
+   * oversight.
    */
   private async landFiles(stagingDir: string, destPath: string): Promise<void> {
     const destExists = fssync.existsSync(destPath);
@@ -256,70 +263,17 @@ export class UploadDeployService {
         return;
       } catch (err) {
         if ((err as NodeJS.ErrnoException).code !== 'EXDEV') throw err;
-        await this.copyTree(stagingDir, destPath);
+        // syncTree prunes as well as copies, where the old copy-only helper
+        // did not. Harmless here: the prune only removes what the copy didn't
+        // just land, and on a destination that didn't exist there is nothing
+        // else. If residue somehow raced in between the existsSync above and
+        // the failed rename, clearing it is what a fresh deploy should do.
+        await syncTree(stagingDir, destPath, { preserve: DEFAULT_PRESERVE });
         return;
       }
     }
 
-    await this.copyTree(stagingDir, destPath);
-    await this.pruneStale(stagingDir, destPath);
-  }
-
-  /** Recursively copy every file/directory from srcDir into destDir. */
-  private async copyTree(srcDir: string, destDir: string): Promise<void> {
-    await fs.mkdir(destDir, { recursive: true });
-    const entries = await fs.readdir(srcDir, { withFileTypes: true });
-
-    for (const entry of entries) {
-      const srcPath = path.join(srcDir, entry.name);
-      const destEntryPath = path.join(destDir, entry.name);
-
-      if (entry.isDirectory()) {
-        // A previous deploy may have left a plain file at this name; clear
-        // it so mkdir doesn't collide with a same-named non-directory.
-        const existing = await this.lstatOrNull(destEntryPath);
-        if (existing && !existing.isDirectory()) {
-          await fs.rm(destEntryPath, { force: true });
-        }
-        await this.copyTree(srcPath, destEntryPath);
-      } else if (entry.isFile()) {
-        const existing = await this.lstatOrNull(destEntryPath);
-        if (existing && existing.isDirectory()) {
-          await fs.rm(destEntryPath, { recursive: true, force: true });
-        }
-        await fs.copyFile(srcPath, destEntryPath);
-      }
-      // tar-extract never writes symlinks/devices/etc, so the staged tree
-      // has no other entry kinds to copy.
-    }
-  }
-
-  /** Delete anything under destDir that isn't present in the staged srcDir. */
-  private async pruneStale(srcDir: string, destDir: string): Promise<void> {
-    const [srcEntries, destEntries] = await Promise.all([
-      fs.readdir(srcDir, { withFileTypes: true }),
-      fs.readdir(destDir, { withFileTypes: true }),
-    ]);
-    const srcByName = new Map(srcEntries.map((e) => [e.name, e]));
-
-    for (const destEntry of destEntries) {
-      const srcEntry = srcByName.get(destEntry.name);
-      if (!srcEntry) {
-        await fs.rm(path.join(destDir, destEntry.name), { recursive: true, force: true });
-        continue;
-      }
-      if (destEntry.isDirectory() && srcEntry.isDirectory()) {
-        await this.pruneStale(path.join(srcDir, destEntry.name), path.join(destDir, destEntry.name));
-      }
-    }
-  }
-
-  private async lstatOrNull(p: string): Promise<fssync.Stats | null> {
-    try {
-      return await fs.lstat(p);
-    } catch {
-      return null;
-    }
+    await syncTree(stagingDir, destPath, { preserve: DEFAULT_PRESERVE });
   }
 }
 
