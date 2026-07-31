@@ -315,3 +315,59 @@ The two pre-existing security holes now outrank the original 500:
 2. `validateContainedPath` realpath + the collision guard's fail-open.
 3. The shared prune helper.
 4. Only then, the materialization change that depends on all three.
+
+---
+
+# Progress against that sequencing
+
+**Step 1 — DONE, on develop.** `execCommand` parity shipped as DROP-123
+(PR #155, `fbf8564`): `buildExecCommandFor` (`platform.ts:4136`) is now the
+single helper both `handleBuildApp` (`:3309`) and `handleAppUpdate` (`:4440`)
+call, so tenant build commands run in the container on both paths. DROP-124
+(PR #156) followed up by keeping platform secrets out of those commands.
+
+**Step 2 — DONE, this branch (`1ca2fa7`).** Both holes closed in
+`expandMonorepo`, with `platform.monorepo-source-safety.test.ts` covering them.
+
+The symlink mechanism was **verified rather than assumed, and the plan above had
+it wrong**. It claimed `fs.cp` "copies another tenant's tree, `.env` and all".
+It does not — `fs.cp` does not dereference, it **recreates** the symlink at the
+destination (probed directly on Node 22 Linux via Docker). The consequences are
+worse than a copy:
+
+- a symlinked `services.<x>.path` makes the **child app directory itself a
+  symlink** aliasing the target — a live alias, not a snapshot
+- a nested symlink is reproduced verbatim inside the child
+
+Both are served by a static child. The fix therefore has two halves — realpath
+containment of the service root (`isPathWithin`, which the codebase already
+had) *and* a walk refusing symlinks anywhere in the copied set. Realpathing the
+root alone would have missed the nested case entirely.
+
+Placement note: the realpath check went next to the `fs.stat` in
+`expandMonorepo`, **not** into `validateContainedPath` as the plan proposed.
+The parser's helper is sync inside an async `parseDropYaml`, so making it
+realpath ripples through its callers, and parse time is the wrong moment
+anyway — the check now runs immediately before the copy that consumes it.
+
+Exclusions are honoured (`MONOREPO_COPY_EXCLUDE_RE`), so a pnpm workspace's
+`node_modules` link farm is not refused for no security gain.
+
+**A test that proved nothing, caught by mutation.** The first version of the
+symlinked-root test asserted only "no child directory was created". That passes
+with the guard disabled: on Windows `fs.cp` throws `EPERM` trying to recreate
+the link, so the directory is absent either way. The assertion now keys on
+`watcher.markAppKnown`, which the guard returns *before* and the EPERM path has
+already called — a discriminator that holds on both platforms. Both guards were
+then mutation-verified: each test fails when and only when its own guard is
+neutered.
+
+**Still open — steps 3 and 4**, unchanged, plus everything under _Follow-ups_.
+Note that the `UploadDeployService.pruneStale` defect (follow-up 1) and the
+`MONOREPO_COPY_EXCLUDE_RE` absolute-path quirk (follow-up 5) are both still
+live.
+
+**Not runtime-verified.** These guards are refusal paths in `expandMonorepo`;
+exercising them end to end needs a real monorepo deploy on a Linux host. The
+underlying `fs.cp` behaviour was confirmed on Linux, and the suite is green
+(153 suites / 2503 tests), but nothing has run on dropkit.sh.
