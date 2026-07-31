@@ -571,10 +571,20 @@ export class BuilderService {
       await strategy.postBuild(context, outputPath);
     }
 
-    // Execute custom post-build hooks
+    // Execute custom post-build hooks.
+    //
+    // Routed through `context.execCommand` like preBuild/install/build above —
+    // this was the one hook site still calling `executeCommand` directly, i.e.
+    // on the host regardless of isolation. Not currently reachable (nothing
+    // populates `config.postBuild`: platform.ts passes only buildCommand and
+    // installCommand, and drop.yaml has no such key), so this is closing the
+    // hole before it opens rather than fixing a live one — but the day
+    // `postBuild` is wired to drop.yaml it would otherwise be a silent host
+    // escape for a tenant-authored command.
     if (context.config.postBuild?.length) {
+      const exec = context.execCommand ?? executeCommand;
       for (const hook of context.config.postBuild) {
-        const result = await executeCommand(hook, context.appPath, context.env);
+        const result = await exec(hook, context.appPath, context.env);
         if (result.exitCode !== 0) {
           return {
             stage: 'post-build',
