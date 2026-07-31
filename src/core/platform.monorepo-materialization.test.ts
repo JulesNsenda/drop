@@ -224,6 +224,31 @@ describe('expandMonorepo re-materializing a live child', () => {
     });
   });
 
+  describe('group ownership across repeated expansions (DROP-128)', () => {
+    it('adopts unowned children and keeps re-expanding', async () => {
+      // The dropkit.sh failure was self-perpetuating: the ownership guard
+      // matched the container's OWN children, which carried no userId, so
+      // every expansion after the first threw. Asserting `updateApp` was
+      // CALLED would only prove intent — this drives the real state manager
+      // twice and reads the persisted result, which is what has to survive
+      // registerApp's merge and setAppStatus's in-place edits.
+      await stateManager.registerApp(repoName, repoPath, 'unknown');
+      await stateManager.updateApp(repoName, { userId: 'owner', isGroupContainer: true });
+      // A legacy child: on disk, in state, no owner — exactly the box's shape.
+      await stateManager.registerApp(childName, childPath(), 'static');
+      await stateManager.updateApp(childName, { group: repoName, status: 'running' });
+      expect(stateManager.getApp(childName)?.userId).toBeUndefined();
+
+      await expect(expand()).resolves.toBeUndefined();
+      expect(stateManager.getApp(childName)?.userId).toBe('owner');
+
+      // The second expansion is the one that used to throw.
+      await expect(expand()).resolves.toBeUndefined();
+      expect(stateManager.getApp(childName)?.userId).toBe('owner');
+      expect(stateManager.getApp(childName)?.group).toBe(repoName);
+    });
+  });
+
   describe('the generated child drop.yaml', () => {
     it('round-trips through the parser handleAppUpdate will run it through', async () => {
       // handleAppUpdate re-parses the child's drop.yaml (platform.ts:4338) and

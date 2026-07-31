@@ -2972,9 +2972,13 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       // Another CONTAINER for the same group: two tenants racing one name.
       if (a.isGroupContainer) return true;
       // Otherwise a MEMBER — a child of this group. Only a claimant when it is
-      // demonstrably someone's: an unowned member is a legacy child from before
-      // ownership was propagated (below), and adopting it is the whole point.
-      // One carrying a userId still faces the comparison underneath.
+      // demonstrably someone's; an unowned member is adopted below instead.
+      //
+      // This clause is NOT purely transitional. A folder-dropped container has
+      // no userId of its own, so `containerOwner` is undefined and its children
+      // stay unowned permanently — for those groups this is the steady state,
+      // not a migration window. Removing it once "everything has a userId"
+      // would break every folder-dropped group.
       return a.userId !== undefined;
     });
     if (groupClaimant && groupClaimant.userId !== containerOwner) {
