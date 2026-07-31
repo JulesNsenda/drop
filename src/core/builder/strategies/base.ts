@@ -17,14 +17,48 @@ import { AppType } from '../../detector/detector.types';
  */
 const SECRET_ENV_PREFIXES = ['DROP_', 'AWS_', 'CF_'];
 
-/** Build a child-process env from the parent env minus platform secrets, plus overrides. */
+/**
+ * Build a child-process env from the parent env minus platform secrets, plus
+ * overrides.
+ *
+ * The prefix filter is applied to the overrides as well, not just to
+ * `process.env`. That is the whole point rather than belt-and-braces: this
+ * function used to spread overrides back on top unfiltered, so any caller that
+ * seeded them from `process.env` — as `BuilderService.executeEnvironment` did —
+ * re-introduced every secret the filter had just removed, and the boundary was
+ * a no-op for exactly the stages that run tenant-authored commands.
+ *
+ * The caller-side bug is fixed too, but a security boundary that only holds
+ * when its callers are careful is not one. `DROP_`/`AWS_`/`CF_` are reserved
+ * prefixes; a dropped override is warned about rather than removed silently, so
+ * an app that had (legitimately, if unwisely) set its own `DROP_*` build var
+ * gets a diagnosable failure instead of a mystery.
+ */
 export function sanitizeBuildEnv(overrides: Record<string, string> = {}): NodeJS.ProcessEnv {
+  const isSecretKey = (key: string): boolean =>
+    SECRET_ENV_PREFIXES.some((prefix) => key.startsWith(prefix));
+
   const out: NodeJS.ProcessEnv = {};
   for (const [key, value] of Object.entries(process.env)) {
-    if (SECRET_ENV_PREFIXES.some((prefix) => key.startsWith(prefix))) continue;
+    if (isSecretKey(key)) continue;
     out[key] = value;
   }
-  return { ...out, ...overrides };
+
+  const refused: string[] = [];
+  for (const [key, value] of Object.entries(overrides)) {
+    if (isSecretKey(key)) {
+      refused.push(key);
+      continue;
+    }
+    out[key] = value;
+  }
+  if (refused.length > 0) {
+    console.warn(
+      `[build-env] refusing to pass reserved-prefix variables to a build command: ${refused.join(', ')}`
+    );
+  }
+
+  return out;
 }
 
 /** Default hard ceiling for a single build command (overridable via timeoutMs). */
