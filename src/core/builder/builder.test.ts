@@ -152,6 +152,7 @@ describe('Node.js Build Strategy', () => {
       framework: 'next',
       config: {},
       env: {},
+      execCommand: undefined,
     };
 
     expect(nodejsBuildStrategy.canBuild(context)).toBe(true);
@@ -165,6 +166,7 @@ describe('Node.js Build Strategy', () => {
       framework: null,
       config: {},
       env: {},
+      execCommand: undefined,
     };
 
     expect(nodejsBuildStrategy.canBuild(context)).toBe(false);
@@ -178,6 +180,7 @@ describe('Node.js Build Strategy', () => {
       framework: null,
       config: {},
       env: {},
+      execCommand: undefined,
     };
 
     expect(nodejsBuildStrategy.getInstallCommand(context)).toBe('npm install');
@@ -191,6 +194,7 @@ describe('Node.js Build Strategy', () => {
       framework: null,
       config: { installCommand: 'yarn install' },
       env: {},
+      execCommand: undefined,
     };
 
     expect(nodejsBuildStrategy.getInstallCommand(context)).toBe('yarn install');
@@ -204,6 +208,7 @@ describe('Node.js Build Strategy', () => {
       framework: 'next',
       config: {},
       env: {},
+      execCommand: undefined,
     };
 
     expect(nodejsBuildStrategy.getBuildCommand(context)).toBe('npm run build');
@@ -217,6 +222,7 @@ describe('Node.js Build Strategy', () => {
       framework: 'express',
       config: {},
       env: {},
+      execCommand: undefined,
     };
 
     expect(nodejsBuildStrategy.getBuildCommand(context)).toBeNull();
@@ -230,6 +236,7 @@ describe('Node.js Build Strategy', () => {
       framework: 'next',
       config: {},
       env: {},
+      execCommand: undefined,
     };
 
     expect(nodejsBuildStrategy.getOutputDirectory(context)).toBe('.next');
@@ -252,6 +259,7 @@ describe('Python Build Strategy', () => {
       framework: null,
       config: {},
       env: {},
+      execCommand: undefined,
     };
 
     // Deps are installed into an in-app-dir venv (both isolation modes) so they
@@ -271,6 +279,7 @@ describe('Python Build Strategy', () => {
       framework: 'django',
       config: {},
       env: {},
+      execCommand: undefined,
     };
 
     expect(pythonBuildStrategy.getBuildCommand(context)).toBe('python manage.py collectstatic --noinput');
@@ -284,6 +293,7 @@ describe('Python Build Strategy', () => {
       framework: 'flask',
       config: {},
       env: {},
+      execCommand: undefined,
     };
 
     expect(pythonBuildStrategy.getBuildCommand(context)).toBeNull();
@@ -304,6 +314,7 @@ describe('Static Build Strategy', () => {
       framework: null,
       config: {},
       env: {},
+      execCommand: undefined,
     };
 
     expect(staticBuildStrategy.getInstallCommand(context)).toBeNull();
@@ -317,6 +328,7 @@ describe('Static Build Strategy', () => {
       framework: null,
       config: {},
       env: {},
+      execCommand: undefined,
     };
 
     expect(staticBuildStrategy.getBuildCommand(context)).toBeNull();
@@ -336,6 +348,7 @@ describe('Docker Build Strategy', () => {
       framework: null,
       config: {},
       env: {},
+      execCommand: undefined,
     };
 
     expect(dockerBuildStrategy.getBuildCommand(context)).toContain('docker build');
@@ -349,6 +362,7 @@ describe('Docker Build Strategy', () => {
       framework: null,
       config: {},
       env: {},
+      execCommand: undefined,
     };
 
     expect(dockerBuildStrategy.getInstallCommand(context)).toBeNull();
@@ -555,6 +569,7 @@ describe('BuilderService Integration', () => {
       framework: null,
       config: {},
       env: {},
+      execCommand: undefined,
     };
 
     const result = await service.build(context);
@@ -582,6 +597,7 @@ describe('BuilderService Integration', () => {
       framework: null,
       config: {},
       env: {},
+      execCommand: undefined,
     });
 
     const events = (eventBus.publish as jest.Mock).mock.calls.map(
@@ -613,6 +629,7 @@ describe('BuilderService Integration', () => {
       framework: null,
       config: {},
       env: {},
+      execCommand: undefined,
     });
 
     const failed = (eventBus.publish as jest.Mock).mock.calls.find(
@@ -701,6 +718,7 @@ describe('BuilderService Integration', () => {
       framework: null,
       config: {},
       env: {},
+      execCommand: undefined,
     });
 
     expect(result.errors.some(e => e.code === 'MAX_BUILDS')).toBe(true);
@@ -721,6 +739,7 @@ describe('BuilderService Integration', () => {
       framework: null,
       config: {},
       env: {},
+      execCommand: undefined,
     };
 
     const result = await service.build(context);
@@ -748,6 +767,7 @@ describe('BuilderService Integration', () => {
       framework: null,
       config: {},
       env: {},
+      execCommand: undefined,
     });
 
     // Try to start second build immediately
@@ -758,6 +778,7 @@ describe('BuilderService Integration', () => {
       framework: null,
       config: {},
       env: {},
+      execCommand: undefined,
     });
 
     const [result1, result2] = await Promise.all([build1Promise, build2Promise]);
@@ -785,6 +806,7 @@ describe('BuilderService Integration', () => {
       framework: null,
       config: {},
       env: {},
+      execCommand: undefined,
     });
 
     await buildPromise;
