@@ -409,6 +409,31 @@ describe('UploadDeployService', () => {
       expect(fssync.readFileSync(path.join(appsDir, 'stale-app', 'keep.js'), 'utf8')).toBe('keep updated');
     });
 
+    it('keeps node_modules but not build output across a redeploy', async () => {
+      // A tarball never carries either. Deleting node_modules pulled a RUNNING
+      // app's dependencies out from under it on every redeploy; deleting build
+      // output is required, because StaticBuildStrategy.preBuild treats a
+      // surviving dist/index.html as "already built" and skips the rebuild,
+      // leaving the previous bundle served while the deploy reports green.
+      const archive1 = await buildArchive('preserve-app-v1', { 'index.js': 'v1' });
+      await service.deploy({ appName: 'preserve-app', archivePath: archive1 });
+
+      const appDir = path.join(appsDir, 'preserve-app');
+      await fs.mkdir(path.join(appDir, 'node_modules', 'dep'), { recursive: true });
+      await fs.writeFile(path.join(appDir, 'node_modules', 'dep', 'index.js'), 'installed');
+      await fs.mkdir(path.join(appDir, 'dist'), { recursive: true });
+      await fs.writeFile(path.join(appDir, 'dist', 'index.html'), '<h1>v1</h1>');
+
+      const archive2 = await buildArchive('preserve-app-v2', { 'index.js': 'v2' });
+      await service.deploy({ appName: 'preserve-app', archivePath: archive2 });
+
+      expect(fssync.readFileSync(path.join(appDir, 'index.js'), 'utf8')).toBe('v2');
+      expect(fssync.readFileSync(path.join(appDir, 'node_modules', 'dep', 'index.js'), 'utf8')).toBe(
+        'installed'
+      );
+      expect(fssync.existsSync(path.join(appDir, 'dist'))).toBe(false);
+    });
+
     it('clears isUploading before publishing app:update (platform guard must not drop the redeploy)', async () => {
       // Same ordering hazard as the app:detected case above, on the redeploy
       // path: the platform's app:update subscriber (and handleAppUpdate)
