@@ -99,6 +99,7 @@ import { ApiServer, createApiServer } from '../api';
 import { AppInProgressError, AppNeedsConfigError, setPlatformOps, resetPlatformOps } from '../api/platform-ops';
 import { planSecretPreflight, generateSecretValue } from '../managers/secret/secret-preflight';
 import { Logger, createLogger } from '../utils/logger';
+import { isPathWithin } from '../utils/paths';
 import {
   validateDomain,
   validateDomainFormat,
@@ -2809,6 +2810,75 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
   private static readonly MONOREPO_COPY_EXCLUDE_RE = /(^|[\\/])(node_modules|\.git|dist|build)([\\/]|$)/;
 
   /**
+   * Verify a service's source subtree is safe to materialize, immediately
+   * before the copy that consumes it.
+   *
+   * `services.<x>.path` is validated at parse time by the drop.yaml parser's
+   * `validateContainedPath`, but that check is purely lexical — it rejects
+   * absolute paths and `..` traversal without ever touching the disk, so it
+   * cannot see a symlink. `fs.stat` then *follows* symlinks, so a link
+   * pointing out of the repo satisfies the "is it a directory?" check too.
+   *
+   * That matters because `fs.cp` does not dereference — it RECREATES each
+   * symlink at the destination. A symlinked `services.<x>.path` makes the
+   * child app directory itself a symlink aliasing the target, and a symlink
+   * nested inside the subtree is reproduced verbatim inside the child. Either
+   * way a static child serves whatever sits on the other end, including
+   * another tenant's tree. `git clone` materializes symlinks, so this is
+   * tenant-controlled input.
+   *
+   * Posture matches the upload path, which aborts an entire archive rather
+   * than silently dropping a symlink entry (`tar-extract.ts`): refuse the
+   * service and name the offending path, rather than materializing a
+   * partially-correct tree.
+   *
+   * Only entries the copy would actually take are inspected — the same
+   * exclusions the `fs.cp` filter applies — so a pnpm workspace's
+   * `node_modules` link farm is irrelevant, never having been copied.
+   */
+  private async assertServiceSourceSafe(
+    repoPath: string,
+    srcDir: string
+  ): Promise<{ ok: true } | { ok: false; reason: string }> {
+    // Realpaths both sides, so a symlinked/junctioned segment can't escape.
+    if (!(await isPathWithin(repoPath, srcDir))) {
+      return {
+        ok: false,
+        reason: 'it resolves outside the repository (symlinked or otherwise redirected)',
+      };
+    }
+
+    const findSymlink = async (dir: string): Promise<string | null> => {
+      const entries = await fs.readdir(dir, { withFileTypes: true });
+      for (const entry of entries) {
+        const full = path.join(dir, entry.name);
+        if (DropPlatform.MONOREPO_COPY_EXCLUDE_RE.test(full)) continue;
+        // readdir(withFileTypes) reports the entry's own type (lstat
+        // semantics), so this sees the link itself, not its target — and
+        // never follows it, so a link cycle can't spin this walk.
+        if (entry.isSymbolicLink()) return full;
+        if (entry.isDirectory()) {
+          const found = await findSymlink(full);
+          if (found) return found;
+        }
+      }
+      return null;
+    };
+
+    const symlink = await findSymlink(srcDir);
+    if (symlink) {
+      return {
+        ok: false,
+        reason:
+          `it contains a symlink ('${path.relative(repoPath, symlink)}'), which the copy would ` +
+          `recreate inside the app directory`,
+      };
+    }
+
+    return { ok: true };
+  }
+
+  /**
    * Expand a monorepo container (a repo whose root drop.yaml declares a
    * `services:` map) into N ordinary top-level DROP apps — one per service.
    *
@@ -2896,6 +2966,8 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           continue;
         }
 
+        const childPath = path.join(this.config.appsDirectory, childName);
+
         // Collision guard: refuse to clobber a standalone app (or an app from
         // a different group) that already owns this name. Allow refresh when
         // the existing config already belongs to this same group (redeploy).
@@ -2904,6 +2976,24 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           this.logger.warn(
             `Skipping service '${svcName}': app '${childName}' already exists and does not ` +
               `belong to monorepo group '${group}'`,
+            'MONOREPO'
+          );
+          continue;
+        }
+
+        // ...and fail CLOSED when nothing vouches for the name but a directory
+        // is already sitting there. Materialization below wipes childPath, so
+        // "no config" must not read as "free to delete": a folder owns its name
+        // from the moment it exists on disk, but only acquires an AppConfig once
+        // the `app:detected` handler has run. `existing === undefined` therefore
+        // also covers a real app mid-onboarding, one whose detection failed, and
+        // an earlier expansion that crashed between the copy and the config
+        // write — none of them ours to remove. A legitimate re-expansion is
+        // unaffected: it matched the `existing` branch above.
+        if (!existing && (await this.pathExists(childPath))) {
+          this.logger.warn(
+            `Skipping service '${svcName}': '${childPath}' already exists on disk with no app ` +
+              `config to vouch for it; refusing to delete it. Remove it manually if it is stale.`,
             'MONOREPO'
           );
           continue;
@@ -2927,7 +3017,18 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           continue;
         }
 
-        const childPath = path.join(this.config.appsDirectory, childName);
+        // Symlink containment — the parse-time check is lexical and the stat
+        // above follows links, so neither can see one. Resolved here, against
+        // the tree that is about to be copied.
+        const safety = await this.assertServiceSourceSafe(repoPath, srcDir);
+        if (!safety.ok) {
+          this.logger.warn(
+            `Skipping service '${svcName}': path '${svc.path}' in '${repoName}' rejected — ` +
+              `${safety.reason}`,
+            'MONOREPO'
+          );
+          continue;
+        }
 
         // Suppress the watcher's own onboarding of the folder we're about to
         // write — we onboard it ourselves below, same as the interception
