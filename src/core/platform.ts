@@ -2952,10 +2952,31 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     //
     // Refuse rather than silently renaming: an operator who wrote `group: x`
     // and got `y` would have no idea why their services are not grouped.
+    // A CLAIMANT is someone else's hold on the name — never this container's
+    // own group members.
+    //
+    // The original `a.group === group` matched the children expandMonorepo
+    // itself materializes, and since children were never given a userId they
+    // read as belonging to a different owner than their own container. So the
+    // FIRST expansion succeeded (no children yet) and every one after it threw:
+    // a container refused because of its own offspring. On dropkit.sh that left
+    // the `ezsign` group un-redeployable for three days, and the guard's own
+    // regression test hid it by seeding a child with a userId that production
+    // never writes.
     const containerOwner = this.stateManager?.getApp(repoName)?.userId;
-    const groupClaimant = this.stateManager
-      ?.getAllApps()
-      .find((a) => a.name !== repoName && (a.name === group || a.group === group));
+    const groupClaimant = this.stateManager?.getAllApps().find((a) => {
+      if (a.name === repoName) return false;
+      // An app literally NAMED the group — the attack this guard exists for.
+      if (a.name === group) return true;
+      if (a.group !== group) return false;
+      // Another CONTAINER for the same group: two tenants racing one name.
+      if (a.isGroupContainer) return true;
+      // Otherwise a MEMBER — a child of this group. Only a claimant when it is
+      // demonstrably someone's: an unowned member is a legacy child from before
+      // ownership was propagated (below), and adopting it is the whole point.
+      // One carrying a userId still faces the comparison underneath.
+      return a.userId !== undefined;
+    });
     if (groupClaimant && groupClaimant.userId !== containerOwner) {
       this.logger.error(
         `Refusing monorepo group '${group}' for '${repoName}': the name is already held by ` +
@@ -3168,16 +3189,27 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         // (new build on disk, old code still serving, deploy reported green);
         // on failure the child is marked 'errored' while its old process is
         // still alive. This inversion is precisely what got v2 rejected.
+        // Children inherit the CONTAINER'S OWNER. Without this they were
+        // written with no userId at all, which (a) made the ownership guard
+        // above refuse the container on its own children, and (b) left group
+        // apps invisible to their own non-admin owner, since listings filter by
+        // userId. Safe to set unconditionally: the guard has already refused
+        // any member owned by someone other than `containerOwner`, so by here a
+        // member is either unowned or already ours.
         if (this.stateManager) {
           if (childState) {
             await this.stateManager.updateApp(childName, {
               type: narrowedType,
               path: childPath,
               group,
+              ...(containerOwner ? { userId: containerOwner } : {}),
             });
           } else {
             await this.stateManager.registerApp(childName, childPath, narrowedType);
-            await this.stateManager.updateApp(childName, { group });
+            await this.stateManager.updateApp(childName, {
+              group,
+              ...(containerOwner ? { userId: containerOwner } : {}),
+            });
           }
         }
 

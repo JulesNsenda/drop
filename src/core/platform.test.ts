@@ -2279,7 +2279,11 @@ describe('expandMonorepo (M2: monorepo -> per-service app expansion)', () => {
         .fn()
         .mockReturnValue([
           { name: repoName, userId: 'owner' },
-          { name: 'ezsign-backend', userId: 'owner', group: 'ezsign' },
+          // NOTE the missing userId. This fixture used to carry `userId:
+          // 'owner'`, which expandMonorepo never actually wrote on a child —
+          // so the test passed while every real re-expansion threw. Keep it
+          // unowned: that is what a legacy child on disk looks like.
+          { name: 'ezsign-backend', group: 'ezsign' },
         ]),
     };
     (platform as any).handleBuildApp = jest.fn().mockResolvedValue(undefined);
@@ -2292,6 +2296,118 @@ describe('expandMonorepo (M2: monorepo -> per-service app expansion)', () => {
       repoName,
       expect.objectContaining({ group: 'ezsign', isGroupContainer: true })
     );
+  });
+
+  it('re-expands when its OWN children already hold the group name', async () => {
+    // THE dropkit.sh REGRESSION. `a.group === group` matched the container's
+    // own children, and children were written with no userId, so a container
+    // was refused because of its own offspring: first expansion fine (no
+    // children yet), every one after it threw. The `ezsign` group was
+    // un-redeployable for three days and its backend stayed dead after a
+    // crash because nothing could re-materialize it.
+    const repoName = 'ezsign';
+    const repoPath = path.join(appsDir, repoName);
+    await fsPromises.mkdir(path.join(repoPath, 'backend'), { recursive: true });
+
+    const updateApp = jest.fn().mockResolvedValue(undefined);
+    (platform as any).appConfigService = {
+      getConfig: jest.fn().mockReturnValue(undefined),
+      upsertConfig: jest.fn().mockResolvedValue({}),
+    };
+    (platform as any).stateManager = {
+      registerApp: jest.fn().mockResolvedValue(undefined),
+      updateApp,
+      hasApp: jest.fn().mockReturnValue(true),
+      getApp: jest.fn((name: string) =>
+        name === repoName ? { name: repoName, userId: 'owner' } : undefined
+      ),
+      // Exactly what dropkit.sh had: an owned container, unowned children.
+      getAllApps: jest.fn().mockReturnValue([
+        { name: repoName, userId: 'owner', isGroupContainer: true, group: 'ezsign' },
+        { name: 'ezsign-backend', group: 'ezsign' },
+        { name: 'ezsign-frontend', group: 'ezsign' },
+      ]),
+    };
+    (platform as any).handleBuildApp = jest.fn().mockResolvedValue(undefined);
+
+    await expect(
+      (platform as any).expandMonorepo(repoPath, repoName, {
+        services: { backend: { path: 'backend' } },
+      })
+    ).resolves.toBeUndefined();
+
+    // ...and the child is adopted, so this can't recur once ownership lands.
+    expect(updateApp).toHaveBeenCalledWith(
+      'ezsign-backend',
+      expect.objectContaining({ group: 'ezsign', userId: 'owner' })
+    );
+  });
+
+  it('still REFUSES a member of the same group owned by someone else', async () => {
+    // The relaxation must not become "any app claiming my group is fine".
+    // An unowned member is adoptable; one carrying a different owner is not.
+    const repoName = 'ezsign';
+    const repoPath = path.join(appsDir, repoName);
+    await fsPromises.mkdir(path.join(repoPath, 'backend'), { recursive: true });
+
+    (platform as any).appConfigService = {
+      getConfig: jest.fn().mockReturnValue(undefined),
+      upsertConfig: jest.fn().mockResolvedValue({}),
+    };
+    (platform as any).stateManager = {
+      registerApp: jest.fn().mockResolvedValue(undefined),
+      updateApp: jest.fn().mockResolvedValue(undefined),
+      hasApp: jest.fn().mockReturnValue(true),
+      getApp: jest.fn((name: string) =>
+        name === repoName ? { name: repoName, userId: 'owner' } : undefined
+      ),
+      getAllApps: jest
+        .fn()
+        .mockReturnValue([
+          { name: repoName, userId: 'owner' },
+          { name: 'ezsign-backend', userId: 'someone-else', group: 'ezsign' },
+        ]),
+    };
+    (platform as any).handleBuildApp = jest.fn().mockResolvedValue(undefined);
+
+    await expect(
+      (platform as any).expandMonorepo(repoPath, repoName, {
+        services: { backend: { path: 'backend' } },
+      })
+    ).rejects.toThrow(/already in use by another account/);
+  });
+
+  it('still REFUSES another CONTAINER holding the same group name', async () => {
+    const repoName = 'attacker-repo';
+    const repoPath = path.join(appsDir, repoName);
+    await fsPromises.mkdir(path.join(repoPath, 'backend'), { recursive: true });
+
+    (platform as any).appConfigService = {
+      getConfig: jest.fn().mockReturnValue(undefined),
+      upsertConfig: jest.fn().mockResolvedValue({}),
+    };
+    (platform as any).stateManager = {
+      registerApp: jest.fn().mockResolvedValue(undefined),
+      updateApp: jest.fn().mockResolvedValue(undefined),
+      hasApp: jest.fn().mockReturnValue(true),
+      getApp: jest.fn((name: string) =>
+        name === repoName ? { name: repoName, userId: 'attacker' } : undefined
+      ),
+      getAllApps: jest
+        .fn()
+        .mockReturnValue([
+          { name: repoName, userId: 'attacker' },
+          { name: 'victim-repo', userId: 'victim', group: 'ezsign', isGroupContainer: true },
+        ]),
+    };
+    (platform as any).handleBuildApp = jest.fn().mockResolvedValue(undefined);
+
+    await expect(
+      (platform as any).expandMonorepo(repoPath, repoName, {
+        group: 'ezsign',
+        services: { backend: { path: 'backend' } },
+      })
+    ).rejects.toThrow(/already in use by another account/);
   });
 
   describe('handleConfigureRoute (M3: same-origin routing)', () => {
