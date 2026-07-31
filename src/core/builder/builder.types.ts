@@ -74,8 +74,19 @@ export interface BuildContext {
    * The BuilderService uses `context.execCommand ?? executeCommand`
    * everywhere, so callers that don't care about the distinction get the
    * right behaviour for free.
+   *
+   * REQUIRED, though it may be `undefined`. Deliberately not optional: this is
+   * the boundary that decides whether a tenant-authored install/build command
+   * runs inside the build container or as a host process owned by the platform
+   * user (who is in the `docker` group, i.e. root-equivalent, on an
+   * isolation=docker box). `handleAppUpdate` once omitted it silently — every
+   * redeploy of an existing app therefore built on the host — and nothing
+   * caught that because the property was optional. Making it required turns
+   * that entire regression class into a compile error at every call site, in
+   * every module, instead of something a test has to remember to look for.
+   * Pass `execCommand: undefined` explicitly when host execution is intended.
    */
-  execCommand?: ExecCommandFn;
+  execCommand: ExecCommandFn | undefined;
   /**
    * Optional callback for build log lines (install/build output).
    * Called by BuilderService.emitLog() when set. Used by the platform to
