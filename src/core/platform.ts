@@ -100,6 +100,7 @@ import { AppInProgressError, AppNeedsConfigError, setPlatformOps, resetPlatformO
 import { planSecretPreflight, generateSecretValue } from '../managers/secret/secret-preflight';
 import { Logger, createLogger } from '../utils/logger';
 import { isPathWithin } from '../utils/paths';
+import { syncTree, DEFAULT_PRESERVE } from '../utils/tree-sync';
 import {
   validateDomain,
   validateDomainFormat,
@@ -3062,19 +3063,45 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           continue;
         }
 
+        // A user-stopped child is skipped BEFORE anything is written. Both
+        // downstream paths refuse to build one (`handleAppUpdate:4439`,
+        // `buildSub`), but they refuse AFTER the copy would have landed —
+        // which would leave a stopped child holding new, unbuilt source for
+        // the next `drop start` to serve.
+        const childState = this.stateManager?.getApp(childName);
+        if (childState?.status === 'stopped') {
+          this.logger.info(
+            `Skipping service '${svcName}': '${childName}' was stopped by the user`,
+            'MONOREPO'
+          );
+          continue;
+        }
+
         // Suppress the watcher's own onboarding of the folder we're about to
         // write — we onboard it ourselves below, same as the interception
         // above does for the container.
         this.watcher?.markAppKnown(childName);
 
-        // Materialize (idempotent): drop any previous copy, then copy fresh,
-        // excluding node_modules/.git/dist/build so redeploys stay cheap and
-        // don't duplicate installed dependencies or build output.
-        await fs.rm(childPath, { recursive: true, force: true });
-        await fs.cp(srcDir, childPath, {
-          recursive: true,
-          force: true,
-          filter: (src: string) => !DropPlatform.MONOREPO_COPY_EXCLUDE_RE.test(src),
+        // Materialize IN PLACE (idempotent). This used to be
+        // `fs.rm(childPath)` + `fs.cp`, which deleted a RUNNING child's whole
+        // tree — build output and installed dependencies included — and left
+        // its document root empty for the entire install + build. A docker
+        // static child's nginx returned 500 throughout, and any early return
+        // in the build path made that permanent (DROP-122).
+        //
+        // syncTree lands the source over the child, prunes what the source no
+        // longer has, and keeps `node_modules` — so nothing is reinstalled
+        // from scratch and no window exists where the tree is simply gone.
+        //
+        // `exclude` and `preserve` do different jobs here, deliberately:
+        // `dist`/`build` are excluded from the source AND not preserved, so
+        // the prune deletes the child's stale output. That is what forces a
+        // rebuild — `StaticBuildStrategy.preBuild` treats a surviving
+        // `dist/index.html` as "already built" and skips the build entirely,
+        // which is the trap that got v2 of this change rejected.
+        await syncTree(srcDir, childPath, {
+          exclude: DropPlatform.MONOREPO_COPY_EXCLUDE_RE,
+          preserve: DEFAULT_PRESERVE,
         });
 
         // Resolve type: honor an explicit override, else detect from the
@@ -3130,9 +3157,28 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
             group,
           });
         }
+        // An EXISTING child is UPDATED, never re-registered.
+        //
+        // `registerApp` forces `status` back to 'pending' for anything not
+        // already 'stopped' (state-manager.ts:265). That is correct for a
+        // fresh deploy and fatal for a running child: `handleAppUpdate` reads
+        // `wasRunning` from this status, and with it false BOTH halves of its
+        // transaction invert — on success the stop is skipped and
+        // `ProcessManager.start` early-returns on an already-online process
+        // (new build on disk, old code still serving, deploy reported green);
+        // on failure the child is marked 'errored' while its old process is
+        // still alive. This inversion is precisely what got v2 rejected.
         if (this.stateManager) {
-          await this.stateManager.registerApp(childName, childPath, narrowedType);
-          await this.stateManager.updateApp(childName, { group });
+          if (childState) {
+            await this.stateManager.updateApp(childName, {
+              type: narrowedType,
+              path: childPath,
+              group,
+            });
+          } else {
+            await this.stateManager.registerApp(childName, childPath, narrowedType);
+            await this.stateManager.updateApp(childName, { group });
+          }
         }
 
         // Sequential await: gives declared-order onboarding for the common
@@ -3146,7 +3192,49 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           // Children inherit the container's actor. Left undefined they would
           // each key as automation on their OWN name, so a loop that varies
           // service names would accumulate nowhere.
-          await this.handleBuildApp(childPath, childName, childType, actor);
+          //
+          // An EXISTING child goes through the update transaction every other
+          // app on this platform already gets: build in place while the old
+          // process keeps serving, stop only after the build succeeds, restart
+          // on the same port, and restore 'running' if it fails. A FIRST-EVER
+          // child has nothing to keep serving, so it takes the ordinary fresh
+          // deploy path.
+          //
+          // The child is deliberately NOT added to `appsInProgress`: that set
+          // holds the CONTAINER for the duration of the expansion, and adding
+          // the child would make handleAppUpdate's own in-progress guard
+          // (:4320) drop it — silently skipping the build on 100% of
+          // expansions. All three critics found that independently in v1.
+          // Re-read rather than reuse `childState`: that was captured before
+          // the copy, and the copy is real I/O. `appsInProgress` holds the
+          // CONTAINER, which does not stop a `drop stop` on the child, so the
+          // child can be stopped mid-expansion. Routing a now-stopped child to
+          // handleAppUpdate would have it refuse at :4439 — after the source
+          // had landed — reproducing the "new source, never built" state the
+          // pre-copy check above exists to prevent.
+          //
+          // The two reads answer different questions and are not
+          // interchangeable: `childState` (pre-copy) is "did this child exist
+          // before this expansion?", which decides the routing — re-reading
+          // for that would always say yes, because the registration above has
+          // since run. `stateNow` is only "has it been stopped since?".
+          const stateNow = this.stateManager?.getApp(childName);
+          if (stateNow?.status === 'stopped') {
+            this.logger.info(
+              `Not building service '${svcName}': '${childName}' was stopped during expansion`,
+              'MONOREPO'
+            );
+          } else if (childState) {
+            await this.handleAppUpdate(
+              childName,
+              childPath,
+              'monorepo re-expansion',
+              true,
+              actor
+            );
+          } else {
+            await this.handleBuildApp(childPath, childName, childType, actor);
+          }
         }
       } catch (error) {
         this.logger.error(

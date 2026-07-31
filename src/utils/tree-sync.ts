@@ -31,6 +31,21 @@ export interface SyncTreeOptions {
    * not an absolute exemption from deletion.
    */
   preserve?: readonly string[];
+
+  /**
+   * Source-side filter: entries whose path matches are treated as though the
+   * source does not have them — not copied, and **not protected from the
+   * prune**. That second half is the point. `exclude` and `preserve` are
+   * opposites, not synonyms: excluding `dist` from the source is what makes
+   * the prune delete a stale `dist` from the destination, which is what
+   * forces a static app to rebuild.
+   *
+   * Matched against the path RELATIVE to the sync root, so a root that itself
+   * sits under a matching name still copies. (Matching the absolute path —
+   * what `expandMonorepo`'s `fs.cp` filter did — meant a service at
+   * `packages/build` rejected its own copy root and silently copied nothing.)
+   */
+  exclude?: RegExp;
 }
 
 /**
@@ -64,12 +79,29 @@ export async function syncTree(
   destDir: string,
   options: SyncTreeOptions = {}
 ): Promise<void> {
-  const preserve = new Set(options.preserve ?? []);
-  await copyInto(srcDir, destDir);
-  await prune(srcDir, destDir, preserve);
+  const ctx: SyncContext = {
+    root: srcDir,
+    preserve: new Set(options.preserve ?? []),
+    exclude: options.exclude,
+  };
+  await copyInto(srcDir, destDir, ctx);
+  await prune(srcDir, destDir, ctx);
 }
 
-async function copyInto(srcDir: string, destDir: string): Promise<void> {
+interface SyncContext {
+  /** Sync root, so `exclude` can be matched relative to it. */
+  root: string;
+  preserve: Set<string>;
+  exclude?: RegExp;
+}
+
+/** Whether the source filter hides this path from both halves of the sync. */
+function isExcluded(srcPath: string, ctx: SyncContext): boolean {
+  if (!ctx.exclude) return false;
+  return ctx.exclude.test(path.relative(ctx.root, srcPath));
+}
+
+async function copyInto(srcDir: string, destDir: string, ctx: SyncContext): Promise<void> {
   await fs.mkdir(destDir, { recursive: true });
   const entries = await fs.readdir(srcDir, { withFileTypes: true });
 
@@ -77,13 +109,15 @@ async function copyInto(srcDir: string, destDir: string): Promise<void> {
     const srcPath = path.join(srcDir, entry.name);
     const destPath = path.join(destDir, entry.name);
 
+    if (isExcluded(srcPath, ctx)) continue;
+
     if (entry.isDirectory()) {
       // A previous deploy may have left a file (or a link) at this name.
       // `fs.cp` throws ERR_FS_CP_DIR_TO_NON_DIR on that flip and abandons the
       // copy mid-tree, leaving a permanently half-old/half-new directory —
       // clear the entry instead so the kind change lands.
       await removeIfKind(destPath, (st) => !st.isDirectory());
-      await copyInto(srcPath, destPath);
+      await copyInto(srcPath, destPath, ctx);
     } else if (entry.isFile()) {
       // Same flip in the other direction.
       await removeIfKind(destPath, (st) => st.isDirectory());
@@ -94,15 +128,21 @@ async function copyInto(srcDir: string, destDir: string): Promise<void> {
   }
 }
 
-async function prune(srcDir: string, destDir: string, preserve: Set<string>): Promise<void> {
+async function prune(srcDir: string, destDir: string, ctx: SyncContext): Promise<void> {
   const [srcEntries, destEntries] = await Promise.all([
     fs.readdir(srcDir, { withFileTypes: true }),
     fs.readdir(destDir, { withFileTypes: true }),
   ]);
-  const srcByName = new Map(srcEntries.map((e) => [e.name, e]));
+  // Excluded source entries are filtered out HERE too, so the destination sees
+  // them as absent and the prune removes them. Skipping this would let a
+  // source `dist/` — never copied — still vouch for a stale `dist/` in the
+  // destination, and a static app would go on serving the old bundle.
+  const srcByName = new Map(
+    srcEntries.filter((e) => !isExcluded(path.join(srcDir, e.name), ctx)).map((e) => [e.name, e])
+  );
 
   for (const destEntry of destEntries) {
-    if (preserve.has(destEntry.name)) continue;
+    if (ctx.preserve.has(destEntry.name)) continue;
 
     const srcEntry = srcByName.get(destEntry.name);
     if (!srcEntry) {
@@ -115,7 +155,7 @@ async function prune(srcDir: string, destDir: string, preserve: Set<string>): Pr
     // already resolved by the copy above, and `isDirectory()` here is lstat
     // semantics, so a link is never followed into.
     if (destEntry.isDirectory() && srcEntry.isDirectory()) {
-      await prune(path.join(srcDir, destEntry.name), path.join(destDir, destEntry.name), preserve);
+      await prune(path.join(srcDir, destEntry.name), path.join(destDir, destEntry.name), ctx);
     }
   }
 }
