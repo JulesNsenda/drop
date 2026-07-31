@@ -2021,10 +2021,42 @@ backup:
       const { config, appPath } = result;
 
       if (result.kind === 'group') {
-        this.logger.info(
-          `Boot reconcile: leaving group child '${config.name}' to its container's own detection`,
-          'BOOT'
-        );
+        // A group child's BUILD belongs to its container. Its ROUTING does not.
+        //
+        // Deferring both left a running child with no Caddy route whenever the
+        // container's expansion then failed — and because a group's children
+        // share ONE hostname, that took the entire host out of Caddy: no site
+        // block, so no certificate served and the TLS handshake refused
+        // outright. Observed on dropkit.sh, where `ezsign.dropkit.sh` was
+        // unreachable for hours while every other subdomain served fine and the
+        // frontend process was alive the whole time. The trigger that day was
+        // the group-ownership guard throwing (DROP-128), but any expansion
+        // failure does it: a guardrail refusal, a full build queue, a parse
+        // error. The blast radius is the worst part — one child's problem takes
+        // down the healthy sibling too.
+        //
+        // So routing is reconciled here regardless, from the config that is
+        // already the source of truth for ports.
+        //
+        // Only for a child the RUNTIME reports running: pointing Caddy at a
+        // dead port would trade "host missing" for "502 on every path of a
+        // shared host", and a deliberately-stopped child must not be published.
+        const port = config.port;
+        if (mode === 'on' && typeof port === 'number' && runningByName.has(config.name)) {
+          await this.handleConfigureRoute(config.name, port, { skipCaddyReload: true });
+          // Joins the same batched reload the skip branch below uses.
+          anySkipped = true;
+          this.logger.info(
+            `Boot reconcile: group child '${config.name}' routing reconciled — ` +
+              `build left to its container`,
+            'BOOT'
+          );
+        } else {
+          this.logger.info(
+            `Boot reconcile: leaving group child '${config.name}' to its container's own detection`,
+            'BOOT'
+          );
+        }
         continue;
       }
 

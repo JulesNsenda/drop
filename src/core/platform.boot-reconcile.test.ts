@@ -421,6 +421,81 @@ describe('DropPlatform boot reconciliation (M1) integration', () => {
     ).toBe(true);
   }, 30000);
 
+  it('mode on, RUNNING group child: reconciles its routing while leaving the build to its container', async () => {
+    // THE dropkit.sh OUTAGE (DROP-129). Boot deferred a group child entirely
+    // to its container, so when the container's expansion then failed the
+    // child kept running with NO Caddy route. Because a group's children share
+    // one hostname, that removed the whole host from Caddy — no site block, no
+    // certificate served, TLS handshake refused. `ezsign.dropkit.sh` was
+    // unreachable for hours while every other subdomain was fine and the
+    // frontend process was alive throughout.
+    platform = makePlatform();
+    await platform.start();
+    const appPath = await createStaticApp('ezsign-frontend');
+    await deploy('ezsign-frontend', appPath);
+    // Now make it a group child exactly as expandMonorepo leaves one: `group`
+    // on the AppConfig, and a generated drop.yaml carrying `route:`. That
+    // `route:` block is what makes handleConfigureRoute resolve the SHARED
+    // group hostname rather than the child's own name — without it this test
+    // would pass on the weaker property (some route exists) while production
+    // still had no `ezsign.*` host, which is the entire bug.
+    await fs.writeFile(
+      path.join(appPath, 'drop.yaml'),
+      'name: ezsign-frontend\nroute:\n  path: /\n'
+    );
+    await getAppConfigService().updateConfig('ezsign-frontend', { group: 'ezsign' });
+    await crossPlatformRestart();
+
+    const buildStarted: string[] = [];
+    const unsub = eventBus.subscribe('build:started', (p) => {
+      buildStarted.push(p.appId);
+    });
+
+    platform2 = makePlatform({ bootReconcileMode: 'on' });
+    addRouteSpy.mockClear();
+    await platform2.start();
+
+    // The route is reconciled from config — the fix. Assert the HOSTNAME, not
+    // just that some route was added: the group host is the thing that went
+    // missing from Caddy, and a route on `ezsign-frontend.*` would leave
+    // `ezsign.*` just as dark.
+    const groupRoute = addRouteSpy.mock.calls
+      .map((call) => call[0] as { owner?: string; hostname?: string })
+      .find((cfg) => cfg.owner === 'ezsign-frontend');
+    expect(groupRoute).toBeDefined();
+    expect(groupRoute?.hostname).toBe('ezsign.localhost');
+
+    // ...and the BUILD is still the container's job, unchanged.
+    await new Promise((r) => setTimeout(r, 300));
+    expect(buildStarted).not.toContain('ezsign-frontend');
+
+    unsub();
+  }, 30000);
+
+  it('mode on, group child NOT running: leaves it alone rather than routing a dead port', async () => {
+    // Routing a stopped child would trade "host missing" for "502 on every
+    // path of a shared host", and would republish a deliberately-stopped app.
+    platform = makePlatform();
+    await platform.start();
+    const appPath = await createStaticApp('ezsign-frontend');
+    await deploy('ezsign-frontend', appPath);
+    await getAppConfigService().updateConfig('ezsign-frontend', { group: 'ezsign' });
+    await crossPlatformRestart();
+    // Nothing is running after this: the runtime forgets the process, which is
+    // what boot sees when a child died while the platform was down.
+    fakeRuntime.reset();
+
+    platform2 = makePlatform({ bootReconcileMode: 'on' });
+    addRouteSpy.mockClear();
+    await platform2.start();
+
+    expect(
+      addRouteSpy.mock.calls.some(
+        (call) => (call[0] as { owner?: string }).owner === 'ezsign-frontend'
+      )
+    ).toBe(false);
+  }, 30000);
+
   it('mode on, unchanged signature: reconciles routing only — no build:started, no runtime.start, markAppKnown called', async () => {
     platform = makePlatform();
     await platform.start();
