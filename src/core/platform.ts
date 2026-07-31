@@ -27,6 +27,7 @@ import {
   parseDropYaml,
   DetectionResult,
   DropYamlConfig,
+  AppType,
   detectMcp,
   readMcpInputs,
 } from './detector';
@@ -3305,14 +3306,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       }
       const workDir = await this.getBuildWorkDir(appName);
 
-      const execCommand =
-        this.config.isolation === 'docker' && this.runtime?.type === 'docker'
-          ? createContainerExecCommand(
-              (this.runtime as import('../managers/runtime').ContainerManager).docker,
-              detection.type,
-              appName
-            )
-          : undefined;
+      const execCommand = this.buildExecCommandFor(detection.type, appName);
 
       const buildStartedAt = new Date();
       const logId = this.buildLogService
@@ -4119,6 +4113,55 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
   }
 
   /**
+   * The shim tenant-authored build commands are executed through.
+   *
+   * Under docker isolation this returns a runner that executes `install`,
+   * `build` and any drop.yaml hook INSIDE an ephemeral build container (own
+   * user, `CapDrop: ALL`, no docker socket). Returning `undefined` makes the
+   * builder fall back to `executeCommand`, i.e. a plain host `child_process`
+   * running as the platform user — who is in the `docker` group on an
+   * isolation=docker box and therefore root-equivalent. A tenant `postinstall`
+   * on that path reaches every other tenant's data, `encryption.key` and
+   * `api-credentials.json`.
+   *
+   * It exists as a helper because BOTH build entry points must use it and one
+   * of them silently did not: `handleBuildApp` built this inline while
+   * `handleAppUpdate` — the path every upload and git REDEPLOY of an existing
+   * app takes — passed no `execCommand` at all. Keep both call sites on this
+   * method; a third build path must call it too.
+   */
+  private buildExecCommandFor(
+    appType: AppType,
+    appName: string
+  ): ReturnType<typeof createContainerExecCommand> | undefined {
+    // Host isolation: there is no build container, and running the command on
+    // the host is the intended behaviour, not a fallback.
+    if (this.config.isolation !== 'docker') {
+      return undefined;
+    }
+
+    // FAIL CLOSED. Configured for docker isolation but without a container
+    // runtime is not "run it on the host anyway" — that silently converts a
+    // misconfiguration (or a shutdown window, where stop() nulls the runtime
+    // while a build is still going) into executing an untrusted command
+    // unconfined as a user in the docker group. Refuse instead: the build
+    // fails loudly, the previously-deployed version keeps serving, and the
+    // operator sees a config error rather than an invisible sandbox bypass.
+    if (this.runtime?.type !== 'docker') {
+      throw new Error(
+        'Refusing to build: DROP_ISOLATION=docker but no container runtime is available. ' +
+          'Building would run this app’s install/build commands directly on the host.'
+      );
+    }
+
+    return createContainerExecCommand(
+      (this.runtime as import('../managers/runtime').ContainerManager).docker,
+      appType,
+      appName
+    );
+  }
+
+  /**
    * Handle app update events (file changes in existing apps)
    * Stops the running process, rebuilds, and restarts on the same port
    */
@@ -4389,6 +4432,12 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           },
           env: buildEnv,
           workDir,
+          // Parity with handleBuildApp — see buildExecCommandFor. Without this
+          // every redeploy of an EXISTING app ran its tenant-authored install
+          // and build commands on the host instead of inside the build
+          // container, and this is the path upload-deploy and git redeploy both
+          // take, i.e. the common one.
+          execCommand: this.buildExecCommandFor(detection.type, appName),
           onBuildLog: updateLogId && this.buildLogService
             ? (line) => this.buildLogService!.writeLine(updateLogId, line)
             : undefined,
