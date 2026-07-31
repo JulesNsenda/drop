@@ -23,6 +23,12 @@ export interface SyncTreeOptions {
    * Entry names that survive the prune even when absent from the source,
    * matched by NAME at any depth (segment semantics, like the monorepo copy
    * exclusions) — so a nested package's `node_modules` is kept too.
+   *
+   * More precisely: at any depth **whose ancestors also survive**. A
+   * directory the source no longer has is removed whole, without consulting
+   * this list for its children — which is the intent (a package that is gone
+   * has no meaningful dependencies left behind), but it does mean preserve is
+   * not an absolute exemption from deletion.
    */
   preserve?: readonly string[];
 }

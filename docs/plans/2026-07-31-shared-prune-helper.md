@@ -93,6 +93,23 @@ deleted exactly as today, so static rebuild behaviour is **unchanged**.
 Each guard mutation-verified — a test that passes with the guard neutered gets
 rewritten, per the two vacuous tests PR #158 caught.
 
+## Step 4 cannot drop this in as-is — one gap, named deliberately
+
+`expandMonorepo`'s `fs.cp` applies `MONOREPO_COPY_EXCLUDE_RE` as a filter on
+the **source** side, so `node_modules`, `.git`, `dist` and `build` are never
+copied out of the container in the first place. `syncTree` has **no
+source-side filter** — its `preserve` list is a *destination*-side exemption,
+which is a different thing.
+
+Swapping `fs.cp` for `syncTree` naively would therefore start copying the
+container's `node_modules` and `.git` into every child: a behaviour change
+nobody asked for and a disk blowup on a real repo.
+
+So step 4 must first add an `exclude` option (source-side, segment-matched)
+to `syncTree`. Not added here on purpose — an unused option written against a
+guessed call site is how it ends up the wrong shape. Step 4 knows what it
+needs.
+
 ## What this does NOT do
 
 - **Does not fix the ezsign 500.** That is step 4.
