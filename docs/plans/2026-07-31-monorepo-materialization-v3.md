@@ -91,11 +91,24 @@ here.
 wholesale tree deletion, permanent breakage on `handleBuildApp`'s early
 returns, and the loss of rollback-on-failure.
 
-**Not eliminated:** a static child is still unserved during **its own build**,
-because the prune removes `dist` before the build regenerates it. That window
-is **platform-wide** — every static app already has it on every redeploy — and
-this change makes a monorepo child exactly as safe as any other app, no safer.
-Closing it needs staging or an output-dir swap and belongs to the static path.
+**Not eliminated:** a static child is still unserved from the moment the prune
+removes `dist` until its build regenerates one.
+
+Be precise about what that is and isn't parity with, because "same as every
+other app" is too generous:
+
+- **Identical to the upload redeploy path** — the dominant one, and the one an
+  agent loop rides. `landFiles` calls the same `syncTree` with the same
+  `DEFAULT_PRESERVE`, so a standalone static app uploaded as a tarball also
+  loses `dist` before `handleAppUpdate` builds. Same helper, same ordering,
+  same window.
+- **Longer than a watcher-triggered in-place rebuild**, which prunes nothing:
+  there the old `dist` survives until the build tool empties it, so the gap is
+  only the build's own output phase.
+
+So the honest claim is parity with the busiest redeploy path, not with every
+path. Closing the window properly needs staging or an output-dir swap and
+belongs to the static path, not to monorepo.
 
 **So: this reduces the ezsign 500 from "the whole install + build, permanent
 on four failure paths" to "the child's own build, self-healing" — it does not
