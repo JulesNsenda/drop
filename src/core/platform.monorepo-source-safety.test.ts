@@ -190,6 +190,32 @@ describe('expandMonorepo refuses unsafe service sources', () => {
     expect(handleBuildApp).not.toHaveBeenCalled();
   });
 
+  it('refuses a child name occupied by a dangling symlink', async () => {
+    // `fs.access` (what the platform's pathExists uses) FOLLOWS links, so a
+    // link whose target is gone reads as "nothing here" and the guard would
+    // fall through to the fs.rm. The guard's question is whether the name is
+    // occupied, which lstat answers and access does not.
+    //
+    // PLATFORM ASYMMETRY, measured — this test only bites on Linux. On a
+    // dangling link `fs.access` throws ENOENT there (guard falls through: the
+    // bug is real) but SUCCEEDS on a Windows junction (guard refuses anyway:
+    // no bug to catch). So a green run on Windows proves nothing here; CI and
+    // production are Linux, which is where it counts. Don't "simplify" this
+    // back to pathExists because it passes locally either way.
+    const gone = path.join(tempDir, 'deleted-target');
+    await fs.mkdir(gone, { recursive: true });
+    linkDir(gone, childPathOf('frontend'));
+    await fs.rm(gone, { recursive: true, force: true });
+
+    expect((await fs.lstat(childPathOf('frontend'))).isSymbolicLink()).toBe(true);
+
+    await expand({ frontend: { path: 'frontend', type: 'static' } });
+
+    // The entry is still there, untouched, and nothing was built over it.
+    expect((await fs.lstat(childPathOf('frontend'))).isSymbolicLink()).toBe(true);
+    expect(handleBuildApp).not.toHaveBeenCalled();
+  });
+
   it('still refreshes a child that a config confirms belongs to this group', async () => {
     const childPath = childPathOf('frontend');
     await fs.mkdir(childPath, { recursive: true });

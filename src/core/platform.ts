@@ -2841,6 +2841,13 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     srcDir: string
   ): Promise<{ ok: true } | { ok: false; reason: string }> {
     // Realpaths both sides, so a symlinked/junctioned segment can't escape.
+    //
+    // `isPathWithin` degrades to a LEXICAL resolve if realpath throws, which
+    // would silently reduce this to the parse-time check it exists to
+    // strengthen. That fallback is unreachable here: the caller has already
+    // `fs.stat`ed srcDir, so it exists and every component is traversable —
+    // and a symlink cycle throws ELOOP from that stat, skipping the service
+    // before this runs. Keep the stat gate ahead of this call.
     if (!(await isPathWithin(repoPath, srcDir))) {
       return {
         ok: false,
@@ -2876,6 +2883,25 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     }
 
     return { ok: true };
+  }
+
+  /**
+   * Whether anything at all occupies `p` — deliberately `lstat`, not the
+   * `fs.access` of `pathExists`.
+   *
+   * `access` follows symlinks, so a DANGLING link reports "nothing here" and
+   * the collision guard below would delete it. The guard's question is "does
+   * this name already belong to something?", and a link occupies the name
+   * whether or not its target resolves — the same follow-vs-don't distinction
+   * that let a symlinked service path through `fs.stat` above.
+   */
+  private async entryExists(p: string): Promise<boolean> {
+    try {
+      await fs.lstat(p);
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   /**
@@ -2990,7 +3016,13 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         // an earlier expansion that crashed between the copy and the config
         // write — none of them ours to remove. A legitimate re-expansion is
         // unaffected: it matched the `existing` branch above.
-        if (!existing && (await this.pathExists(childPath))) {
+        //
+        // If `appConfigService` were unset, `existing` is always undefined and
+        // this refuses every child whose folder exists. That is the safe
+        // direction, and unreachable in practice: `initializeServices` assigns
+        // it unconditionally, and both callers are event handlers that only
+        // fire once the watcher is running.
+        if (!existing && (await this.entryExists(childPath))) {
           this.logger.warn(
             `Skipping service '${svcName}': '${childPath}' already exists on disk with no app ` +
               `config to vouch for it; refusing to delete it. Remove it manually if it is stale.`,
