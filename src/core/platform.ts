@@ -3205,7 +3205,26 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           // the child would make handleAppUpdate's own in-progress guard
           // (:4320) drop it — silently skipping the build on 100% of
           // expansions. All three critics found that independently in v1.
-          if (childState) {
+          // Re-read rather than reuse `childState`: that was captured before
+          // the copy, and the copy is real I/O. `appsInProgress` holds the
+          // CONTAINER, which does not stop a `drop stop` on the child, so the
+          // child can be stopped mid-expansion. Routing a now-stopped child to
+          // handleAppUpdate would have it refuse at :4439 — after the source
+          // had landed — reproducing the "new source, never built" state the
+          // pre-copy check above exists to prevent.
+          //
+          // The two reads answer different questions and are not
+          // interchangeable: `childState` (pre-copy) is "did this child exist
+          // before this expansion?", which decides the routing — re-reading
+          // for that would always say yes, because the registration above has
+          // since run. `stateNow` is only "has it been stopped since?".
+          const stateNow = this.stateManager?.getApp(childName);
+          if (stateNow?.status === 'stopped') {
+            this.logger.info(
+              `Not building service '${svcName}': '${childName}' was stopped during expansion`,
+              'MONOREPO'
+            );
+          } else if (childState) {
             await this.handleAppUpdate(
               childName,
               childPath,

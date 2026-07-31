@@ -224,6 +224,41 @@ describe('expandMonorepo re-materializing a live child', () => {
     });
   });
 
+  describe('the generated child drop.yaml', () => {
+    it('round-trips through the parser handleAppUpdate will run it through', async () => {
+      // handleAppUpdate re-parses the child's drop.yaml (platform.ts:4338) and
+      // drives build/start commands and secrets from the result. This config is
+      // generated, not authored, so nobody would notice it failing validation —
+      // every re-expansion would silently take the parse-failure path. The repo
+      // already pins published sample configs to this parser for the same
+      // reason: a sample it rejected shipped live once.
+      await (platform as any).expandMonorepo(repoPath, repoName, {
+        services: {
+          frontend: {
+            path: 'frontend',
+            type: 'static',
+            domains: ['app.example.com'],
+            env: { API_BASE: '/api' },
+            build: 'npm run build',
+            start: 'npm start',
+            route: { path: '/' },
+            depends_on: [{ name: 'backend', env: 'API_URL' }],
+          },
+          backend: { path: 'frontend', type: 'nodejs', database: 'postgres' },
+        },
+      });
+
+      const { parseDropYaml } = await import('./detector/drop-yaml-parser');
+      const parsed = await parseDropYaml(childPath());
+
+      expect(parsed.error).toBeUndefined();
+      expect(parsed.success).toBe(true);
+      expect(parsed.config?.name).toBe(childName);
+      // depends_on was rewritten to the group-qualified sibling name.
+      expect(parsed.config?.depends_on?.[0]?.name).toBe(`${repoName}-backend`);
+    });
+  });
+
   describe('source-side exclusions', () => {
     it("does not copy the container's node_modules or .git into the child", async () => {
       await expand();
