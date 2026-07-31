@@ -263,7 +263,11 @@ export class UploadDeployService {
         return;
       } catch (err) {
         if ((err as NodeJS.ErrnoException).code !== 'EXDEV') throw err;
-        // Nothing at the destination yet, so the prune half is a no-op.
+        // syncTree prunes as well as copies, where the old copy-only helper
+        // did not. Harmless here: the prune only removes what the copy didn't
+        // just land, and on a destination that didn't exist there is nothing
+        // else. If residue somehow raced in between the existsSync above and
+        // the failed rename, clearing it is what a fresh deploy should do.
         await syncTree(stagingDir, destPath, { preserve: DEFAULT_PRESERVE });
         return;
       }
