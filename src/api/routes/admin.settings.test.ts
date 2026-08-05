@@ -294,15 +294,15 @@ describe('admin settings routes (PRD-041)', () => {
     });
 
     it('records an audit entry with no secret value', async () => {
-      const logSpy = jest.spyOn(activityModule, 'tryLogActivity').mockResolvedValue();
+      const logSpy = jest.spyOn(activityModule, 'logActivityFor').mockResolvedValue();
 
       const res = await generateGithubWebhookSecret();
       const body = (await res.json()) as ApiEnvelope<{ secret: string }>;
 
       expect(logSpy).toHaveBeenCalledTimes(1);
-      const entry = logSpy.mock.calls[0][0];
+      const entry = logSpy.mock.calls[0][1];
       expect(entry).toMatchObject({ action: 'github-webhook-secret-generate' });
-      expect(JSON.stringify(entry)).not.toContain(body.data!.secret);
+      expect(JSON.stringify(logSpy.mock.calls)).not.toContain(body.data!.secret);
     });
 
     it('rejects a non-admin request with 403', async () => {
@@ -414,14 +414,14 @@ describe('admin settings routes (PRD-041)', () => {
     });
 
     it('records "set" and "clear" audit entries with no secret value', async () => {
-      const logSpy = jest.spyOn(activityModule, 'tryLogActivity').mockResolvedValue();
+      const logSpy = jest.spyOn(activityModule, 'logActivityFor').mockResolvedValue();
 
       await putGithubWebhookSecret('my-secret-value-for-audit');
       await putGithubWebhookSecret(null);
 
       expect(logSpy).toHaveBeenCalledTimes(2);
-      expect(logSpy.mock.calls[0][0]).toMatchObject({ action: 'github-webhook-secret-set' });
-      expect(logSpy.mock.calls[1][0]).toMatchObject({ action: 'github-webhook-secret-clear' });
+      expect(logSpy.mock.calls[0][1]).toMatchObject({ action: 'github-webhook-secret-set' });
+      expect(logSpy.mock.calls[1][1]).toMatchObject({ action: 'github-webhook-secret-clear' });
       expect(JSON.stringify(logSpy.mock.calls)).not.toContain('my-secret-value-for-audit');
     });
 

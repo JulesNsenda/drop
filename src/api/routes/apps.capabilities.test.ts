@@ -59,7 +59,7 @@ describe('PUT /apps/:name/capabilities', () => {
     tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'drop-capabilities-route-test-'));
     jest.spyOn(console, 'log').mockImplementation();
     jest.spyOn(console, 'warn').mockImplementation();
-    jest.spyOn(activity, 'tryLogActivity').mockResolvedValue();
+    jest.spyOn(activity, 'logActivityFor').mockResolvedValue();
 
     resetStateManager();
     resetAuth();

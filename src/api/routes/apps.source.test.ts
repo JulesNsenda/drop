@@ -78,7 +78,7 @@ describe('POST /apps/:name/source (upload deploy)', () => {
     } as unknown as ReturnType<typeof uploadDeployModule.getUploadDeployService>);
 
     setPlatformOps(makeOps());
-    activitySpy = jest.spyOn(activity, 'tryLogActivity').mockResolvedValue();
+    activitySpy = jest.spyOn(activity, 'logActivityFor').mockResolvedValue();
 
     getStateManager({ stateFilePath: path.join(tempDir, 'apps.json') });
 
@@ -150,8 +150,9 @@ describe('POST /apps/:name/source (upload deploy)', () => {
       agentCaller: false,
     });
 
-    const entry = activitySpy.mock.calls.find((call) => call[0].action === 'upload-deploy')?.[0];
-    expect(entry).toMatchObject({ action: 'upload-deploy', appName: 'alice-app', userId: aliceId });
+    const call = activitySpy.mock.calls.find((call) => call[1].action === 'upload-deploy');
+    expect(call?.[1]).toMatchObject({ action: 'upload-deploy', appName: 'alice-app' });
+    expect(call?.[0]).toMatchObject({ userId: aliceId });
   });
 
   it("lets an admin upload to another user's app — 202", async () => {
