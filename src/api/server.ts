@@ -307,16 +307,18 @@ export class ApiServer {
       v1.use('/oauth/approve', authMiddleware('user'));
       v1.use('/oauth/revoke', authMiddleware('user'));
       v1.use('/oauth/client', authMiddleware('admin'));
-      // DELETE/PUT on an app (delete, rename, re-domain) are destructive and
-      // must not be reachable with a read-only token. They used to fall through
-      // to the readonly guard below and rely on `canAccess` alone — which was
-      // inert for API keys only because a key's userId was its own id and
-      // therefore owned nothing. Now that a key resolves to its owner, that
-      // accident no longer contains it, so the tier is stated explicitly.
-      // Method-scoped: GET /apps/:name must stay readable at `readonly`.
+      // DELETE/PUT/PATCH on an app (delete, rename, re-domain) and POST on the
+      // apps collection (deploy a new app) are destructive/mutating and must
+      // not be reachable with a read-only token. DELETE/PUT/PATCH used to fall
+      // through to the readonly guard below and rely on `canAccess` alone —
+      // which was inert for API keys only because a key's userId was its own
+      // id and therefore owned nothing. Now that a key resolves to its owner,
+      // that accident no longer contains it, so the tier is stated explicitly.
+      // Method-scoped: GET /apps/:name (and GET /apps) must stay readable at
+      // `readonly`.
       v1.use('/apps/*', async (c, next) => {
         const method = c.req.method;
-        if (method === 'DELETE' || method === 'PUT' || method === 'PATCH') {
+        if (method === 'DELETE' || method === 'PUT' || method === 'PATCH' || method === 'POST') {
           return authMiddleware('user')(c, next);
         }
         return next();
