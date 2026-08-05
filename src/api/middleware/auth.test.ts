@@ -20,6 +20,7 @@ import {
   optionalAuthMiddleware,
   resetAuth,
   minRole,
+  resetUserPassword,
 } from './auth';
 import { getTestToken } from '../__testutils__/auth';
 
@@ -177,6 +178,16 @@ describe('Auth Middleware', () => {
       expect(adminUser.role).toBe('admin');
       expect(readonlyUser.role).toBe('readonly');
     });
+
+    it('DROP-130 Item 6: does not stamp createdByScope by default', async () => {
+      const user = await createUser('unmarked-user', 'password123', 'user');
+      expect(user.createdByScope).toBeUndefined();
+    });
+
+    it('DROP-130 Item 6: stamps createdByScope only when the caller explicitly requests it', async () => {
+      const user = await createUser('marked-user', 'password123', 'user', undefined, true, true);
+      expect(user.createdByScope).toBe(true);
+    });
   });
 
   describe('authenticateUser', () => {
@@ -211,6 +222,31 @@ describe('Auth Middleware', () => {
     it('should return status invalid for non-existent user', async () => {
       const result = await authenticateUser('nonexistent', 'password');
       expect(result.status).toBe('invalid');
+    });
+
+    it('DROP-130 Item 6: refuses login for a createdByScope account, even with the correct password', async () => {
+      await createUser('scoped-account', 'correctpassword2', 'user', undefined, true, true);
+      const result = await authenticateUser('scoped-account', 'correctpassword2');
+      expect(result.status).toBe('awaiting_admin_password');
+    });
+
+    it('DROP-130 Item 6: a wrong password on a createdByScope account still reports plain invalid (no enumeration)', async () => {
+      await createUser('scoped-account-2', 'correctpassword3', 'user', undefined, true, true);
+      const result = await authenticateUser('scoped-account-2', 'wrongpassword');
+      expect(result.status).toBe('invalid');
+    });
+
+    it('DROP-130 Item 6: resetUserPassword clears the marker, and login then succeeds', async () => {
+      const user = await createUser('scoped-account-3', 'correctpassword4', 'user', undefined, true, true);
+
+      const blocked = await authenticateUser('scoped-account-3', 'correctpassword4');
+      expect(blocked.status).toBe('awaiting_admin_password');
+
+      const reset = await resetUserPassword(user.id, 'admin-chosen-password');
+      expect(reset).toBe(true);
+
+      const afterReset = await authenticateUser('scoped-account-3', 'admin-chosen-password');
+      expect(afterReset.status).toBe('ok');
     });
   });
 

@@ -54,6 +54,22 @@ export interface User {
    * clearing it would resurrect every credential the stamp was meant to kill.
    */
   credentialsInvalidBefore?: string;
+  /**
+   * DROP-130 Item 6: set only when this account was minted through the
+   * SCOPED (non-admin, capability-only) path — a rank-0 `users:create`
+   * caller acting on `POST /auth/users`, never an admin. `authenticateUser`
+   * refuses to log this account in while the marker is present, which is
+   * what closes the escalation chain: scoped key -> POST /auth/users with a
+   * caller-chosen password -> POST /auth/login -> PUT /auth/password
+   * (JWT-only, so it passes `interactiveSessionOnly` and is explicitly
+   * exempt from the `mustChangePassword` 403) -> full `user` JWT ->
+   * POST /apps/:name/source, whose new-app scope check
+   * (`upload-preflight.ts`) applies only to rank-0 callers. Cleared by
+   * `resetUserPassword` — an admin (or an out-of-band operator) setting the
+   * password is what proves a human, not the scoped caller, now controls
+   * the account.
+   */
+  createdByScope?: true;
   /** MFA enabled flag */
   mfaEnabled?: boolean;
   /** Encrypted TOTP secret (AES-256-GCM via platform encryption key) */
@@ -524,6 +540,16 @@ export async function createUser(
   role: 'admin' | 'user' | 'readonly' = 'user',
   email?: string,
   mustChangePassword?: boolean,
+  /**
+   * DROP-130 Item 6: stamp `createdByScope` on the record. Only
+   * `POST /auth/users` sets this, and only when the caller driving the
+   * request is not an admin (a scoped `users:create` capability holder) —
+   * see `User.createdByScope`'s doc comment for the full chain this closes.
+   * Every other caller (signup, the bootstrap default admin) leaves it
+   * `undefined`, which is what keeps admin-created and self-service
+   * accounts able to log in immediately.
+   */
+  createdByScope?: boolean,
 ): Promise<User> {
   if (!credentials || !config) {
     throw new Error('Auth not initialized');
@@ -543,6 +569,7 @@ export async function createUser(
     email,
     createdAt: new Date().toISOString(),
     ...(mustChangePassword ? { mustChangePassword: true } : {}),
+    ...(createdByScope ? { createdByScope: true } : {}),
   };
 
   credentials.users.push(user);
@@ -595,6 +622,12 @@ export async function changePassword(userId: string, currentPassword: string, ne
  * reason: the account most likely to need a forced reset is one whose
  * credentials may already be in someone else's hands, and the JWT-only
  * `mustChangePassword` gate never reached any of those.
+ *
+ * DROP-130 Item 6: also clears `createdByScope`. This IS the "admin-initiated
+ * or out-of-band password set" that `authenticateUser` waits for before it
+ * will log a scoped-created account in — an admin choosing the new password
+ * (rather than the scoped caller who minted the account) is what proves a
+ * human, not the capability holder, now controls it.
  */
 export async function resetUserPassword(userId: string, newPassword: string): Promise<boolean> {
   if (!credentials || !config) throw new Error('Auth not initialized');
@@ -604,6 +637,7 @@ export async function resetUserPassword(userId: string, newPassword: string): Pr
   user.passwordHash = hash;
   user.mustChangePassword = true;
   user.credentialsInvalidBefore = new Date().toISOString();
+  delete user.createdByScope;
   await saveCredentials(config.credentialsPath, credentials);
   return true;
 }
@@ -698,7 +732,8 @@ export type AuthenticateResult =
   | { status: 'ok'; token: string }
   | { status: 'mfa_required'; challengeToken: string; userId: string }
   | { status: 'invalid' }
-  | { status: 'disabled' };
+  | { status: 'disabled' }
+  | { status: 'awaiting_admin_password' };
 
 /**
  * Authenticate a user.
@@ -706,6 +741,9 @@ export type AuthenticateResult =
  * - Returns { status: 'mfa_required', challengeToken } when the user has MFA enabled.
  * - Returns { status: 'invalid' } for wrong credentials.
  * - Returns { status: 'disabled' } for suspended accounts.
+ * - Returns { status: 'awaiting_admin_password' } for an account created
+ *   through the scoped `users:create` path whose password has never been set
+ *   by an admin (DROP-130 Item 6 — see `User.createdByScope`).
  */
 export async function authenticateUser(username: string, password: string): Promise<AuthenticateResult> {
   if (!credentials || !jwtSecret || !config) {
@@ -719,6 +757,18 @@ export async function authenticateUser(username: string, password: string): Prom
 
   if (user.enabled === false) {
     return { status: 'disabled' };
+  }
+
+  // DROP-130 Item 6: an account minted through the scoped (non-admin)
+  // `users:create` path must not be able to log ITSELF in — that is the step
+  // that turns "can call POST /auth/users" into a full session, and from
+  // there into arbitrary code execution via POST /apps/:name/source (see
+  // `User.createdByScope`). Checked only after the password has already
+  // matched above, so this reveals nothing to anyone who has not already
+  // authenticated as this account — a wrong password on a scoped-created
+  // account still returns the same `invalid` status as any other account.
+  if (user.createdByScope === true) {
+    return { status: 'awaiting_admin_password' };
   }
 
   // Opportunistically upgrade legacy SHA-256 hashes to scrypt on successful login.

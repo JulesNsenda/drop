@@ -569,6 +569,138 @@ describe('Auth Routes', () => {
     });
   });
 
+  describe('DROP-130 Item 6 — users:create escalation containment', () => {
+    it('a scoped users:create key cannot log in as the account it just created, closing the chain to PUT /auth/password and POST /apps/:name/source', async () => {
+      // Step 1: a rank-0 key holding only the `users:create` capability
+      // (ownerless, exactly the shape DROP_API_KEY is minted in) mints a
+      // user with a caller-chosen password.
+      const { key: scopedKey } = await createApiKey(
+        'escalation-provision-key',
+        'none',
+        undefined,
+        ['users:create']
+      );
+
+      const createRes = await app.request('/auth/users', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-API-Key': scopedKey,
+        },
+        body: JSON.stringify({ username: 'escalation-target', password: 'attacker-chosen-pw' }),
+      });
+      expect(createRes.status).toBe(201);
+
+      // Step 2: logging in with the SAME password the caller just chose is
+      // refused — and with the exact same response shape as a wrong
+      // password, so nothing distinguishes "blocked because scope-created"
+      // from an ordinary failed login.
+      const loginRes = await app.request('/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: 'escalation-target', password: 'attacker-chosen-pw' }),
+      });
+      expect(loginRes.status).toBe(401);
+      const loginData = (await loginRes.json()) as ApiResponse<LoginResponse>;
+      expect(loginData.success).toBe(false);
+      expect(loginData.error?.message).toBe('Invalid username or password');
+      expect(loginData.data).toBeUndefined();
+
+      // Step 3: with no JWT ever issued, the next link in the published
+      // escalation chain — PUT /auth/password, gated JWT-only by
+      // interactiveSessionOnly, and the step that would have cleared
+      // mustChangePassword on the way to a full `user` session — is
+      // structurally unreachable: there is no Authorization header the
+      // caller can present.
+      const passwordChangeRes = await app.request('/auth/password', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          currentPassword: 'attacker-chosen-pw',
+          newPassword: 'irrelevant-new-pw',
+        }),
+      });
+      expect(passwordChangeRes.status).toBe(401);
+    });
+
+    it('an admin-created account is NOT marked and can log in immediately', async () => {
+      const createRes = await app.request('/auth/users', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${adminToken}`,
+        },
+        body: JSON.stringify({ username: 'admin-created-user', password: 'admin-chosen-pw' }),
+      });
+      expect(createRes.status).toBe(201);
+
+      const loginRes = await app.request('/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: 'admin-created-user', password: 'admin-chosen-pw' }),
+      });
+      expect(loginRes.status).toBe(200);
+      const loginData = (await loginRes.json()) as ApiResponse<LoginResponse>;
+      expect(loginData.success).toBe(true);
+      expect(loginData.data.token).toBeDefined();
+    });
+
+    it('an admin resetting the password clears the marker, and login then works', async () => {
+      const { key: scopedKey } = await createApiKey(
+        'escalation-provision-key-2',
+        'none',
+        undefined,
+        ['users:create']
+      );
+
+      const createRes = await app.request('/auth/users', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-API-Key': scopedKey,
+        },
+        body: JSON.stringify({
+          username: 'escalation-target-2',
+          password: 'attacker-chosen-pw',
+        }),
+      });
+      const created = (await createRes.json()) as ApiResponse<CreatedUserResponse>;
+
+      const blockedLogin = await app.request('/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          username: 'escalation-target-2',
+          password: 'attacker-chosen-pw',
+        }),
+      });
+      expect(blockedLogin.status).toBe(401);
+
+      const resetRes = await app.request(`/auth/users/${created.data.id}/reset-password`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${adminToken}`,
+        },
+        body: JSON.stringify({ newPassword: 'admin-set-password-123' }),
+      });
+      expect(resetRes.status).toBe(200);
+
+      const loginAfterReset = await app.request('/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          username: 'escalation-target-2',
+          password: 'admin-set-password-123',
+        }),
+      });
+      expect(loginAfterReset.status).toBe(200);
+      const loginData = (await loginAfterReset.json()) as ApiResponse<LoginResponse>;
+      expect(loginData.success).toBe(true);
+      expect(loginData.data.token).toBeDefined();
+    });
+  });
+
   describe('PUT /auth/users/:id', () => {
     let targetUserId: string;
 
