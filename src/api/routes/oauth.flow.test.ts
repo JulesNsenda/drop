@@ -22,7 +22,14 @@ import { getStateManager, resetStateManager } from '../../managers/app/state-man
 import { setPlatformOps, resetPlatformOps, PlatformOps } from '../platform-ops';
 import { resetRateLimits } from '../middleware/rate-limit';
 import { resetUploadPreflightState } from '../upload-preflight';
-import { createUser, resetAuth, suspendUser, updateUser } from '../middleware/auth';
+import {
+  createUser,
+  resetAuth,
+  initializeAuth,
+  suspendUser,
+  updateUser,
+  resetUserPassword,
+} from '../middleware/auth';
 import { __resetAuthCodeStore } from '../oauth/authorization-code';
 
 const PORT = 39481;
@@ -300,6 +307,133 @@ describe('OAuth 2.1 flow (PRD-041 integration)', () => {
     expect(refreshRes.status).toBe(400);
     const refreshBody = (await refreshRes.json()) as { error: string };
     expect(refreshBody.error).toBe('invalid_grant');
+  });
+
+  it('DROP-130 MEDIUM-5: an authorization code minted BEFORE suspension cannot be exchanged after', async () => {
+    // The `authorization_code` branch of /oauth/token checked `!user` but
+    // not `enabled`/the stamp — unlike the `refresh_token` branch
+    // (DROP-075/Item 5, exercised above). A code approved just before an
+    // incident could still be exchanged after, and the refresh token it
+    // mints carries its OWN fresh `createdAt`, so it would outlive the
+    // incident permanently. NOTE: `suspendUser` sets BOTH `enabled: false`
+    // AND `credentialsInvalidBefore` (DROP-130 HIGH-1), so this end-to-end
+    // scenario alone does not distinguish which of the two checks below is
+    // doing the rejecting — see the two more targeted tests that follow.
+    const { codeVerifier, codeChallenge } = makePkcePair();
+    const approveRes = await fetch(`${BASE_URL}/api/v1/oauth/approve`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${userToken}` },
+      body: JSON.stringify({
+        client_id: clientId,
+        redirect_uri: CLAUDE_REDIRECT_URI,
+        code_challenge: codeChallenge,
+        code_challenge_method: 'S256',
+        state: 'medium-5-enabled-state',
+      }),
+    });
+    const approveBody = (await approveRes.json()) as ApiEnvelope<{ redirect: string }>;
+    const code = new URL(approveBody.data!.redirect).searchParams.get('code')!;
+
+    // Suspend to contain a suspected leak — the code was approved before this.
+    await suspendUser(oauthUserId);
+
+    const tokenRes = await fetch(`${BASE_URL}/api/v1/oauth/token`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        grant_type: 'authorization_code',
+        code,
+        code_verifier: codeVerifier,
+        client_id: clientId,
+        redirect_uri: CLAUDE_REDIRECT_URI,
+      }).toString(),
+    });
+    expect(tokenRes.status).toBe(400);
+    const tokenBody = (await tokenRes.json()) as { error: string };
+    expect(tokenBody.error).toBe('invalid_grant');
+  });
+
+  it('DROP-130 MEDIUM-5: rejects on `enabled` alone, isolated from the stamp check', async () => {
+    // Every PUBLIC path that disables a user also stamps
+    // `credentialsInvalidBefore` (DROP-130 HIGH-1), so there is no reachable
+    // route to `enabled: false` with no stamp — the raw-store edit below
+    // (mirroring auth.credential-invalidation.test.ts's technique) simulates
+    // a record that predates that invariant, or a future regression in it,
+    // so the `enabled` check is proven load-bearing on its own rather than
+    // riding on the stamp check that happens to sit beside it.
+    const { codeVerifier, codeChallenge } = makePkcePair();
+    const approveRes = await fetch(`${BASE_URL}/api/v1/oauth/approve`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${userToken}` },
+      body: JSON.stringify({
+        client_id: clientId,
+        redirect_uri: CLAUDE_REDIRECT_URI,
+        code_challenge: codeChallenge,
+        code_challenge_method: 'S256',
+        state: 'medium-5-enabled-only-state',
+      }),
+    });
+    const approveBody = (await approveRes.json()) as ApiEnvelope<{ redirect: string }>;
+    const code = new URL(approveBody.data!.redirect).searchParams.get('code')!;
+
+    const store = JSON.parse(await fs.readFile(credentialsPath, 'utf-8'));
+    const rec = (store.users as Array<Record<string, unknown>>).find((u) => u.id === oauthUserId);
+    (rec as Record<string, unknown>).enabled = false;
+    await fs.writeFile(credentialsPath, JSON.stringify(store));
+    resetAuth();
+    await initializeAuth({ credentialsPath, enableJwt: true, enableApiKeys: true });
+
+    const tokenRes = await fetch(`${BASE_URL}/api/v1/oauth/token`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        grant_type: 'authorization_code',
+        code,
+        code_verifier: codeVerifier,
+        client_id: clientId,
+        redirect_uri: CLAUDE_REDIRECT_URI,
+      }).toString(),
+    });
+    expect(tokenRes.status).toBe(400);
+    const tokenBody = (await tokenRes.json()) as { error: string };
+    expect(tokenBody.error).toBe('invalid_grant');
+  });
+
+  it('DROP-130 MEDIUM-5: an authorization code minted BEFORE a forced password reset cannot be exchanged after (the stamp check, isolated from the enabled check)', async () => {
+    // `resetUserPassword` stamps `credentialsInvalidBefore` WITHOUT disabling
+    // the account, so this isolates the stamp comparison from the `enabled`
+    // check proven above.
+    const { codeVerifier, codeChallenge } = makePkcePair();
+    const approveRes = await fetch(`${BASE_URL}/api/v1/oauth/approve`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${userToken}` },
+      body: JSON.stringify({
+        client_id: clientId,
+        redirect_uri: CLAUDE_REDIRECT_URI,
+        code_challenge: codeChallenge,
+        code_challenge_method: 'S256',
+        state: 'medium-5-stamp-state',
+      }),
+    });
+    const approveBody = (await approveRes.json()) as ApiEnvelope<{ redirect: string }>;
+    const code = new URL(approveBody.data!.redirect).searchParams.get('code')!;
+
+    await resetUserPassword(oauthUserId, 'new-password-123456');
+
+    const tokenRes = await fetch(`${BASE_URL}/api/v1/oauth/token`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        grant_type: 'authorization_code',
+        code,
+        code_verifier: codeVerifier,
+        client_id: clientId,
+        redirect_uri: CLAUDE_REDIRECT_URI,
+      }).toString(),
+    });
+    expect(tokenRes.status).toBe(400);
+    const tokenBody = (await tokenRes.json()) as { error: string };
+    expect(tokenBody.error).toBe('invalid_grant');
   });
 
   it('redirect_uri mismatch is a 400 error page, not a redirect', async () => {

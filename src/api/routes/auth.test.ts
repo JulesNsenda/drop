@@ -7,7 +7,7 @@ import * as fs from 'fs/promises';
 import * as path from 'path';
 import * as os from 'os';
 import authRoutes from './auth';
-import { initializeAuth, createUser, createApiKey } from '../middleware/auth';
+import { initializeAuth, createUser, createApiKey, resetAuth, listUsers } from '../middleware/auth';
 import { HttpError } from '../middleware/error';
 import { error, ErrorCodes } from '../types';
 
@@ -466,6 +466,33 @@ describe('Auth Routes', () => {
       expect(res.status).toBe(409);
     });
 
+    it('DROP-130 HIGH-4: should return 400 (and not persist) for an arbitrary/garbage role string, even from an admin', async () => {
+      // Unlike PUT /auth/users/:id, this route never validated `role` at
+      // all — `body.role || 'user'` reached `createUser` unguarded, so a
+      // corrupted role could be persisted and later rank 0 under
+      // roleHierarchy's defensive `?? 0`, clamping every key this user owns
+      // down to nothing (the HIGH-2 reachability vector).
+      const res = await app.request('/auth/users', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${adminToken}`,
+        },
+        body: JSON.stringify({
+          username: 'garbage-role-user',
+          password: 'password123',
+          role: 'superadmin',
+        }),
+      });
+
+      expect(res.status).toBe(400);
+      const data = (await res.json()) as ApiResponse;
+      expect(data.error?.code).toBe('VALIDATION_ERROR');
+
+      const created = listUsers().find((u) => u.username === 'garbage-role-user');
+      expect(created).toBeUndefined();
+    });
+
     describe('scoped users:create capability', () => {
       let scopedKey: string;
       let plainUserKey: string;
@@ -698,6 +725,82 @@ describe('Auth Routes', () => {
       const loginData = (await loginAfterReset.json()) as ApiResponse<LoginResponse>;
       expect(loginData.success).toBe(true);
       expect(loginData.data.token).toBeDefined();
+    });
+
+    it('does not mark an account created with no AuthContext at all (the open-box path), and it can log in immediately', async () => {
+      // `createdByScope` is computed as `authCtx !== undefined && authCtx.role
+      // !== 'admin'` — deliberately NOT `authCtx?.role !== 'admin'`. The two
+      // read as equivalent refactors of each other but diverge exactly when
+      // `authCtx` is undefined: the `?.` form evaluates `undefined !== 'admin'`
+      // to `true` and marks the account anyway, locking every account out the
+      // moment auth's gates are open (isAuthEnabled() false) — the "open
+      // single-operator box" case the code comment names. Reached here by
+      // initializing auth with both `enableJwt`/`enableApiKeys` false: the
+      // primitives (createUser, login) still work, but authMiddleware() and
+      // requireCapability() both no-op via isAuthEnabled(), so `POST
+      // /auth/users` is reached with no Authorization header and no AuthContext
+      // at all — not just a non-admin one.
+      resetAuth();
+      await initializeAuth({ credentialsPath, enableJwt: false, enableApiKeys: false });
+
+      const createRes = await app.request('/auth/users', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: 'open-box-user', password: 'open-box-pw-123456' }),
+      });
+      expect(createRes.status).toBe(201);
+
+      const created = listUsers().find((u) => u.username === 'open-box-user');
+      expect(created).toBeDefined();
+      expect(created!.createdByScope).toBeUndefined();
+
+      const loginRes = await app.request('/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: 'open-box-user', password: 'open-box-pw-123456' }),
+      });
+      expect(loginRes.status).toBe(200);
+      const loginData = (await loginRes.json()) as ApiResponse<LoginResponse>;
+      expect(loginData.success).toBe(true);
+      expect(loginData.data.token).toBeDefined();
+    });
+  });
+
+  describe('POST /auth/users/:id/reset-password', () => {
+    it('DROP-130 MEDIUM-8: records an activity entry attributing the containment action', async () => {
+      // resetUserPassword stamps `credentialsInvalidBefore` — killing every
+      // API key, agent token and refresh token the user holds — and clears
+      // `createdByScope`, with no trace anywhere until now. Without a row
+      // here, the activity log can't explain why a fleet of keys stopped
+      // authenticating right after this request.
+      const activityModule = await import('../../managers/activity');
+      const logSpy = jest.spyOn(activityModule, 'logActivityFor').mockResolvedValue();
+
+      const createRes = await app.request('/auth/users', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${adminToken}`,
+        },
+        body: JSON.stringify({ username: 'reset-target', password: 'password123' }),
+      });
+      const created = (await createRes.json()) as ApiResponse<CreatedUserResponse>;
+      logSpy.mockClear();
+
+      const res = await app.request(`/auth/users/${created.data.id}/reset-password`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${adminToken}`,
+        },
+        body: JSON.stringify({ newPassword: 'admin-set-password-123' }),
+      });
+      expect(res.status).toBe(200);
+
+      expect(logSpy).toHaveBeenCalledTimes(1);
+      const entry = logSpy.mock.calls[0][1];
+      expect(entry).toMatchObject({ action: 'password-reset' });
+      logSpy.mockRestore();
     });
   });
 

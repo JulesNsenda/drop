@@ -28,6 +28,7 @@ import {
   createUser,
   createApiKey,
   verifyApiKey,
+  listApiKeys,
   suspendUser,
   updateUser,
   resetUserPassword,
@@ -253,6 +254,101 @@ describe('credentialsInvalidBefore (DROP-130 Items 4 & 5)', () => {
 
       expect(await verifyAppMcpAccessToken(token, AUD, 'my-app')).not.toBeNull();
     }, 10_000);
+
+    it('rejects an app-mcp token minted BEFORE suspension, even after re-enable — the resurrection case', async () => {
+      // Same shape as the rotateRefreshToken/verifyOAuthAccessToken resurrection
+      // tests above, for the fourth predatesInvalidationStamp call site: a
+      // token live AT suspension time must not come back to life just because
+      // the account was later re-enabled.
+      const bob = await createUser('bob-appmcp-3', PASSWORD, 'user');
+      const token = await mintAppMcpAccessToken(bob, AUD, 'my-app', 'sid-app-3');
+      expect(await verifyAppMcpAccessToken(token, AUD, 'my-app')).not.toBeNull();
+
+      await suspendUser(bob.id);
+      await updateUser(bob.id, { enabled: true });
+
+      expect(await verifyAppMcpAccessToken(token, AUD, 'my-app')).toBeNull();
+    });
+
+    it('accepts an app-mcp token minted AFTER re-enable', async () => {
+      const bob = await createUser('bob-appmcp-4', PASSWORD, 'user');
+      await suspendUser(bob.id);
+      await updateUser(bob.id, { enabled: true });
+      await waitPastSecondBoundary();
+
+      const token = await mintAppMcpAccessToken(bob, AUD, 'my-app', 'sid-app-4');
+
+      expect(await verifyAppMcpAccessToken(token, AUD, 'my-app')).not.toBeNull();
+    }, 10_000);
+  });
+
+  describe('authMiddleware — session JWT (DROP-130 HIGH-3)', () => {
+    // Until this item, a 24h session JWT — the credential class most likely
+    // to be stolen — was the ONE type exempt from `credentialsInvalidBefore`
+    // entirely, making `suspendUser`'s "every credential that already
+    // existed stops authenticating" false for it. Same resurrection shape as
+    // the verifyApiKey/rotateRefreshToken/verifyOAuthAccessToken/
+    // verifyAppMcpAccessToken tests above, for the fifth call site.
+    const probeJwt = async (token: string): Promise<{ status: number }> => {
+      const app = new Hono<TestEnv>();
+      app.get('/probe', authMiddleware(), (c) => c.json({ ok: true }));
+      const res = await app.request('/probe', { headers: { Authorization: `Bearer ${token}` } });
+      return { status: res.status };
+    };
+
+    const loginToken = async (username: string, password: string): Promise<string> => {
+      const result = await authenticateUser(username, password);
+      if (result.status !== 'ok') throw new Error(`login failed: ${JSON.stringify(result)}`);
+      return result.token;
+    };
+
+    it('rejects a session JWT issued BEFORE suspension, even after re-enable — the resurrection case', async () => {
+      const bob = await createUser('bob-jwt-suspend', PASSWORD, 'user');
+      const before = await loginToken('bob-jwt-suspend', PASSWORD);
+
+      await suspendUser(bob.id);
+      await updateUser(bob.id, { enabled: true });
+
+      expect((await probeJwt(before)).status).toBe(401);
+    });
+
+    it('accepts a session JWT issued AFTER re-enable', async () => {
+      const bob = await createUser('bob-jwt-suspend-2', PASSWORD, 'user');
+      await suspendUser(bob.id);
+      await updateUser(bob.id, { enabled: true });
+      await waitPastSecondBoundary();
+
+      const after = await loginToken('bob-jwt-suspend-2', PASSWORD);
+
+      expect((await probeJwt(after)).status).toBe(200);
+    }, 10_000);
+
+    it('rejects a session JWT issued BEFORE a forced password reset', async () => {
+      const bob = await createUser('bob-jwt-reset-pre', PASSWORD, 'user');
+      const before = await loginToken('bob-jwt-reset-pre', PASSWORD);
+
+      await resetUserPassword(bob.id, 'new-password-123456');
+
+      expect((await probeJwt(before)).status).toBe(401);
+    });
+
+    it('fails CLOSED when the JWT carries no iat claim', async () => {
+      const bob = await createUser('bob-jwt-noiat', PASSWORD, 'user');
+      await resetUserPassword(bob.id, 'new-password-123456');
+
+      // Hand-crafted to match the `jose` mock's format (header.payload.signature,
+      // base64url JSON parts, signature === base64url('mock-signature')) but
+      // deliberately omitting `iat` — a structurally valid, signature-verifying
+      // session token that simply never went through `.setIssuedAt()`.
+      const header = Buffer.from(JSON.stringify({ alg: 'HS256' })).toString('base64url');
+      const payload = Buffer.from(
+        JSON.stringify({ sub: bob.id, username: bob.username, role: bob.role })
+      ).toString('base64url');
+      const signature = Buffer.from('mock-signature').toString('base64url');
+      const noIatToken = `${header}.${payload}.${signature}`;
+
+      expect((await probeJwt(noIatToken)).status).toBe(401);
+    });
   });
 
   describe('resetUserPassword — containment, not onboarding', () => {
@@ -306,6 +402,39 @@ describe('credentialsInvalidBefore (DROP-130 Items 4 & 5)', () => {
 
       const { key: freshKey } = await createApiKey('bob-reset-3-ci-2', 'user', undefined, undefined, bob.id);
       expect(await verifyApiKey(freshKey)).not.toBeNull();
+    });
+  });
+
+  describe('listApiKeys — DROP-130 MEDIUM-7: killed credentials must not list as live', () => {
+    it('flags a key invalidated once it predates the owner\'s containment stamp', async () => {
+      const bob = await createUser('bob-listed', PASSWORD, 'user');
+      const { apiKey } = await createApiKey('bob-listed-ci', 'user', undefined, undefined, bob.id);
+
+      const before = listApiKeys().find((k) => k.id === apiKey.id);
+      expect(before?.invalidated).toBeFalsy();
+
+      await suspendUser(bob.id);
+
+      const after = listApiKeys().find((k) => k.id === apiKey.id);
+      expect(after?.invalidated).toBe(true);
+    });
+
+    it('does not flag a fresh key minted AFTER the stamp', async () => {
+      const bob = await createUser('bob-listed-2', PASSWORD, 'user');
+      await suspendUser(bob.id);
+      await updateUser(bob.id, { enabled: true });
+
+      const { apiKey } = await createApiKey('bob-listed-2-ci', 'user', undefined, undefined, bob.id);
+
+      const listed = listApiKeys().find((k) => k.id === apiKey.id);
+      expect(listed?.invalidated).toBeFalsy();
+    });
+
+    it('never flags a legacy ownerless key — there is no owner stamp to compare against', async () => {
+      const { apiKey } = await createApiKey('legacy-listed', 'admin');
+
+      const listed = listApiKeys().find((k) => k.id === apiKey.id);
+      expect(listed?.invalidated).toBeFalsy();
     });
   });
 
@@ -394,7 +523,17 @@ describe('credentialsInvalidBefore (DROP-130 Items 4 & 5)', () => {
       expect((await probeJwt(token)).status).toBe(200);
     });
 
-    it('403s a JWT session after resetUserPassword (containment sets mustChangePassword too)', async () => {
+    it('DROP-130 HIGH-3: 401s (not 403) a JWT re-issued within the same wall-clock second as a reset', async () => {
+      // `resetUserPassword`'s stamp is millisecond-precision ISO; a JWT
+      // `iat` truncates to whole SECONDS. A login that happens (as this one
+      // does, synchronously, right after the reset) within the same second
+      // floors to a moment at-or-before the stamp, so HIGH-3's check — which
+      // runs BEFORE the mustChangePassword gate — correctly rejects it as
+      // predating. This used to be the "403s a JWT session after
+      // resetUserPassword" test; 401 is the right answer once the stamp
+      // check exists, per `predatesInvalidationStamp`'s fail-closed contract
+      // and `waitPastSecondBoundary`'s documented granularity limit (not
+      // test flakiness — see its docstring above).
       const bob = await createUser('bob-jwt-reset', PASSWORD, 'user');
       const before = await loginToken('bob-jwt-reset', PASSWORD);
       expect((await probeJwt(before)).status).toBe(200);
@@ -402,8 +541,23 @@ describe('credentialsInvalidBefore (DROP-130 Items 4 & 5)', () => {
       await resetUserPassword(bob.id, 'new-password-123456');
       const after = await loginToken('bob-jwt-reset', 'new-password-123456');
 
+      expect((await probeJwt(after)).status).toBe(401);
+    });
+
+    it('still 403s (mustChangePassword) a JWT issued well AFTER a reset, once the stamp no longer applies', async () => {
+      // Proves the mustChangePassword gate itself is untouched by HIGH-3 —
+      // only a JWT minted close enough to the stamp to lose the
+      // second-granularity race gets the 401 above.
+      const bob = await createUser('bob-jwt-reset-2', PASSWORD, 'user');
+      const before = await loginToken('bob-jwt-reset-2', PASSWORD);
+      expect((await probeJwt(before)).status).toBe(200);
+
+      await resetUserPassword(bob.id, 'new-password-123456');
+      await waitPastSecondBoundary();
+      const after = await loginToken('bob-jwt-reset-2', 'new-password-123456');
+
       expect((await probeJwt(after)).status).toBe(403);
       expect((await probeJwt(after, { method: 'PUT', path: '/auth/password' })).status).toBe(200);
-    });
+    }, 10_000);
   });
 });

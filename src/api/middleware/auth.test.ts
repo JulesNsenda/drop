@@ -17,10 +17,10 @@ import {
   listUsers,
   isAuthEnabled,
   authMiddleware,
-  optionalAuthMiddleware,
   resetAuth,
   minRole,
   resetUserPassword,
+  roleHierarchy,
 } from './auth';
 import { getTestToken } from '../__testutils__/auth';
 
@@ -549,70 +549,43 @@ describe('Auth Middleware', () => {
 
       expect(next).toHaveBeenCalled();
     });
-  });
 
-  describe('optionalAuthMiddleware', () => {
-    let validToken: string;
+    it('DROP-130 HIGH-2: rejects a role that collides with an inherited Object.prototype name', async () => {
+      // `roleHierarchy['toString']` resolves through the prototype chain to
+      // `Function.prototype.toString` — truthy, so a bare
+      // `roleHierarchy[role] ?? 0` lookup never falls back to 0, and
+      // `NaN < roleHierarchy['admin']` (a function coerced to a number) is
+      // always false: a corrupted `role: 'toString'` record would pass
+      // authMiddleware('admin') on every admin route. An ownerless key
+      // returns `role: key.role` verbatim (see `apiKeyAuthContext`), so
+      // corrupting the stored key record reaches the vulnerable comparison
+      // directly.
+      const { key, apiKey } = await createApiKey('corrupt-role-key', 'user');
+      const rawStore = JSON.parse(await fs.readFile(credentialsPath, 'utf-8'));
+      const rec = (rawStore.apiKeys as Array<Record<string, unknown>>).find(
+        (k) => k.id === apiKey.id
+      );
+      expect(rec).toBeDefined();
 
-    beforeEach(async () => {
-      jest.spyOn(console, 'log').mockImplementation();
-      resetAuth();
-      await initializeAuth({
-        credentialsPath,
-        enableJwt: true,
-        enableApiKeys: true,
-      });
-      await createUser('testuser', 'password123', 'user');
-      validToken = await getTestToken('testuser', 'password123');
-    });
+      for (const badRole of ['toString', 'constructor', 'valueOf']) {
+        (rec as Record<string, unknown>).role = badRole;
+        await fs.writeFile(credentialsPath, JSON.stringify(rawStore));
+        resetAuth();
+        await initializeAuth({ credentialsPath, enableJwt: true, enableApiKeys: true });
 
-    afterEach(() => {
-      jest.restoreAllMocks();
-    });
+        const { c, next } = createMockContext({ 'X-API-Key': key });
+        const middleware = authMiddleware('admin');
+        await middleware(c as never, next);
 
-    function createMockContext(headers: Record<string, string> = {}): {
-      c: { req: { header: (name: string) => string | undefined }; set: jest.Mock; get: jest.Mock };
-      next: jest.Mock;
-    } {
-      let authValue: unknown = undefined;
-      return {
-        c: {
-          req: {
-            header: (name: string) => headers[name],
-          },
-          set: jest.fn((key: string, value: unknown) => {
-            if (key === 'auth') authValue = value;
-          }),
-          get: jest.fn((key: string) => key === 'auth' ? authValue : undefined),
-        },
-        next: jest.fn().mockResolvedValue(undefined),
-      };
-    }
-
-    it('should parse auth if present', async () => {
-      const { c, next } = createMockContext({
-        Authorization: `Bearer ${validToken}`,
-      });
-
-      const middleware = optionalAuthMiddleware();
-      await middleware(c as never, next);
-
-      expect(next).toHaveBeenCalled();
-      expect(c.set).toHaveBeenCalledWith('auth', expect.objectContaining({
-        username: 'testuser',
-      }));
-    });
-
-    it('should continue without auth if not present', async () => {
-      const { c, next } = createMockContext({});
-
-      const middleware = optionalAuthMiddleware();
-      await middleware(c as never, next);
-
-      expect(next).toHaveBeenCalled();
-      expect(c.set).not.toHaveBeenCalled();
+        expect(next).not.toHaveBeenCalled();
+      }
     });
   });
+
+  // DROP-130 LOW-9: `optionalAuthMiddleware` (and its describe block here)
+  // was deleted — dead code with no non-test callers whose JWT branch
+  // bypassed HIGH-2, HIGH-3 and Item 5 simultaneously. See its removal note
+  // in auth.ts.
 });
 
 /**
@@ -674,5 +647,19 @@ describe('minRole', () => {
     // "unranked-and-undefeated" instead of clamping it to the bottom.
     expect(minRole('toString', 'readonly')).toBe('none');
     expect(minRole('constructor', 'admin')).toBe('none');
+  });
+});
+
+/** DROP-130 LOW-9: exported AND module-scope means any importer could otherwise mutate the one table every rank check reads. */
+describe('roleHierarchy', () => {
+  it('is frozen — a mutation attempt has no effect', () => {
+    expect(Object.isFrozen(roleHierarchy)).toBe(true);
+    try {
+      (roleHierarchy as Record<string, number>).admin = 0;
+    } catch {
+      // Strict mode throws on a frozen-object write — either way, the value
+      // below must not have changed.
+    }
+    expect(roleHierarchy.admin).toBe(3);
   });
 });

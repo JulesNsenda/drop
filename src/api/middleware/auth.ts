@@ -48,9 +48,12 @@ export interface User {
    * DROP-130 Items 4 & 5: an ISO timestamp stamped by `suspendUser`
    * (reversible suspension) and `resetUserPassword` (admin-forced containment,
    * as opposed to onboarding's `mustChangePassword`). Any API key, refresh
-   * token or OAuth/app-MCP access token minted BEFORE this stamp is rejected
-   * going forward, even after the account is re-enabled or the password is
-   * changed — see `predatesInvalidationStamp`. Never cleared automatically:
+   * token, session JWT, or OAuth/app-MCP access token minted/issued BEFORE
+   * this stamp is rejected going forward, even after the account is
+   * re-enabled or the password is changed — see `predatesInvalidationStamp`.
+   * The session-JWT check (DROP-130 HIGH-3) is the one closed latest: a 24h
+   * JWT is the class most likely to be a stolen credential, and until then it
+   * was the one type this stamp did not reach. Never cleared automatically:
    * clearing it would resurrect every credential the stamp was meant to kill.
    */
   credentialsInvalidBefore?: string;
@@ -180,8 +183,17 @@ export interface AuthContext {
  * reads from — `authMiddleware`'s own role gate below and `minRole()` both
  * key off this table; a second, function-local copy is the exact drift this
  * constant exists to prevent.
+ *
+ * `Object.freeze`d (DROP-130 LOW-9): module-scope AND exported means any
+ * module that imports it could otherwise mutate a shared table every
+ * principal's rank is checked against — silently promoting everyone.
  */
-export const roleHierarchy: Record<string, number> = { admin: 3, user: 2, readonly: 1, none: 0 };
+export const roleHierarchy: Record<string, number> = Object.freeze({
+  admin: 3,
+  user: 2,
+  readonly: 1,
+  none: 0,
+}) as Record<string, number>;
 
 /**
  * `roleHierarchy[role]`, defensively defaulted to 0 for anything not in the
@@ -234,8 +246,13 @@ export function minRole(a: string, b: string): 'admin' | 'user' | 'readonly' | '
  * fails open — that would be OUR OWN data corruption, not something a caller
  * can control by mis-shaping a credential, and every stamp we ever write is
  * `new Date().toISOString()`.
+ *
+ * Exported (DROP-130 HIGH-3/MEDIUM-5/MEDIUM-7) so the JWT branch of
+ * `authMiddleware` below, `listApiKeys`, and `oauth.ts`'s
+ * `authorization_code` exchange can all reuse the one primitive rather than
+ * re-implementing the same comparison.
  */
-function predatesInvalidationStamp(
+export function predatesInvalidationStamp(
   mintedAt: string | number | undefined,
   stamp: string | undefined
 ): boolean {
@@ -532,6 +549,19 @@ function isLegacyPasswordHash(storedHash: string): boolean {
 }
 
 /**
+ * The only three standing roles a `User` record may carry (never `'none'` —
+ * that value exists only on `ApiKey.role`, for scope-only keys; there are no
+ * "service users"). Shared by `createUser` and `updateUser` (DROP-130
+ * HIGH-4) so a role write is validated at the ONE primitive both routes call
+ * through, rather than at a route that a future caller could bypass — a
+ * corrupted role ranks 0 under `roleHierarchy`'s defensive `?? 0`, which
+ * clamps every API key the user owns down to nothing the moment a key's
+ * standing is derived from its owner (Item 3 / HIGH-2's reachability
+ * vector).
+ */
+const VALID_USER_ROLES: ReadonlySet<string> = new Set(['admin', 'user', 'readonly']);
+
+/**
  * Create a new user
  */
 export async function createUser(
@@ -553,6 +583,16 @@ export async function createUser(
 ): Promise<User> {
   if (!credentials || !config) {
     throw new Error('Auth not initialized');
+  }
+
+  // DROP-130 HIGH-4: `role` is only a TypeScript annotation at the HTTP
+  // boundary — POST /auth/users passed `body.role || 'user'` straight
+  // through with no runtime check (unlike PUT /auth/users/:id, which
+  // validates at its own route). Checked HERE so every caller — including
+  // any future one — inherits it, rather than duplicating the check at a
+  // second route.
+  if (!VALID_USER_ROLES.has(role)) {
+    throw new Error(`Invalid role: ${role}`);
   }
 
   // Check if user already exists
@@ -616,12 +656,12 @@ export async function changePassword(userId: string, currentPassword: string, ne
  * / self-service signup's `mustChangePassword`, which is onboarding ("set
  * your own password") and does NOT touch `credentialsInvalidBefore`.
  *
- * DROP-130 Item 5: reuses Item 4's stamp, so every API key, refresh token and
- * OAuth/app-MCP access token that existed before this call stops
- * authenticating — the same mechanism `suspendUser` uses, and for the same
- * reason: the account most likely to need a forced reset is one whose
- * credentials may already be in someone else's hands, and the JWT-only
- * `mustChangePassword` gate never reached any of those.
+ * DROP-130 Item 5: reuses Item 4's stamp, so every API key, refresh token,
+ * session JWT (HIGH-3) and OAuth/app-MCP access token that existed before
+ * this call stops authenticating — the same mechanism `suspendUser` uses,
+ * and for the same reason: the account most likely to need a forced reset is
+ * one whose credentials may already be in someone else's hands, and the
+ * JWT-only `mustChangePassword` gate alone never reached any of the others.
  *
  * DROP-130 Item 6: also clears `createdByScope`. This IS the "admin-initiated
  * or out-of-band password set" that `authenticateUser` waits for before it
@@ -672,10 +712,39 @@ export async function deleteUser(userId: string): Promise<boolean> {
 }
 
 /**
+ * Set `user.enabled` and, whenever the TARGET state is disabled, stamp
+ * `credentialsInvalidBefore` — the ONE shared primitive `suspendUser` and
+ * `updateUser` (the dashboard's `PUT /auth/users/:id {enabled:false}` disable
+ * path — `UsersPage.tsx` never calls `POST /admin/users/:id/suspend`) both go
+ * through (DROP-130 HIGH-1).
+ *
+ * Before this, `suspendUser` stamped and `updateUser` did not: two
+ * independent sites deciding the same thing is exactly what let the
+ * dashboard's disable button bypass containment — a disable -> re-enable
+ * cycle through `updateUser` alone resurrected every API key, agent token
+ * and refresh token verbatim, with `suspendUser`'s own reversibility
+ * guarantee never in the picture.
+ *
+ * Stamped on every transition TO disabled, not only a `true -> false` one:
+ * `enabled === undefined` reads as "enabled" everywhere else in this file
+ * (`listUsers`'s `!== false`), so a never-touched account IS the common
+ * "was enabled" case, and gating on a literal `true -> false` transition
+ * would skip it. Re-stamping an already-disabled account only moves the
+ * stamp forward, which is harmless — nothing minted while disabled could
+ * have authenticated anyway.
+ */
+function setUserEnabled(user: User, enabled: boolean): void {
+  user.enabled = enabled;
+  if (enabled === false) {
+    user.credentialsInvalidBefore = new Date().toISOString();
+  }
+}
+
+/**
  * Suspend a user: disables their account and stamps `credentialsInvalidBefore`
- * so every API key, refresh token and OAuth/app-MCP access token that already
- * existed stops authenticating — WITHOUT deleting them. Login is blocked
- * immediately; existing JWTs expire naturally (within 24h).
+ * (via `setUserEnabled`) so every API key, refresh token, session JWT and
+ * OAuth/app-MCP access token that already existed stops authenticating —
+ * WITHOUT deleting them. Login is blocked immediately.
  *
  * DROP-130 Item 4: this used to hard-delete `apiKeys` and `refreshTokens`,
  * which is exactly wrong at re-enable. `POST /admin/users/:id/unsuspend` only
@@ -690,7 +759,8 @@ export async function deleteUser(userId: string): Promise<boolean> {
  * credential minted before the stamp never authenticates again, re-enabled or
  * not; one minted after does. See `predatesInvalidationStamp` and its callers
  * (`verifyApiKey`, `rotateRefreshToken`, `verifyOAuthAccessToken`,
- * `verifyAppMcpAccessToken`).
+ * `verifyAppMcpAccessToken`, and — DROP-130 HIGH-3 — `authMiddleware`'s own
+ * JWT branch).
  *
  * Returns false if the user was not found.
  */
@@ -699,12 +769,19 @@ export async function suspendUser(userId: string): Promise<boolean> {
   const user = credentials.users.find((u) => u.id === userId);
   if (!user) return false;
   if (user.role === 'admin') throw new Error('Cannot suspend an admin account');
-  user.enabled = false;
-  user.credentialsInvalidBefore = new Date().toISOString();
+  setUserEnabled(user, false);
   await saveCredentials(config.credentialsPath, credentials);
   return true;
 }
 
+/**
+ * Update a user's properties (admin function). `enabled` goes through
+ * `setUserEnabled` (DROP-130 HIGH-1) — this is the dashboard's disable path
+ * (`PUT /auth/users/:id {enabled:false}`), so it must stamp
+ * `credentialsInvalidBefore` exactly like `suspendUser` does, or a disable ->
+ * re-enable cycle through here alone resurrects every credential the
+ * disable was meant to kill.
+ */
 export async function updateUser(userId: string, updates: { enabled?: boolean; role?: 'admin' | 'user' | 'readonly'; maxApps?: number; email?: string }): Promise<boolean> {
   if (!credentials || !config) throw new Error('Auth not initialized');
 
@@ -719,7 +796,15 @@ export async function updateUser(userId: string, updates: { enabled?: boolean; r
     if (adminCount <= 1) throw new Error('Cannot demote the last admin account');
   }
 
-  if (updates.enabled !== undefined) user.enabled = updates.enabled;
+  // DROP-130 HIGH-4 (symmetry): PUT /auth/users/:id validates `role` at its
+  // own route today, which means this primitive stays safe only as long as
+  // that ONE caller keeps validating — checked here too so a future caller
+  // inherits it for free, same reasoning as `createUser`'s check.
+  if (updates.role !== undefined && !VALID_USER_ROLES.has(updates.role)) {
+    throw new Error(`Invalid role: ${updates.role}`);
+  }
+
+  if (updates.enabled !== undefined) setUserEnabled(user, updates.enabled);
   if (updates.role) user.role = updates.role;
   if (updates.maxApps !== undefined) user.maxApps = updates.maxApps;
   if (updates.email !== undefined) user.email = updates.email;
@@ -1495,6 +1580,19 @@ export async function createApiKey(
  * granted something. A key with the right kind and no usable scope is not an
  * agent token in any meaningful sense, and admitting it would put a principal
  * with zero authority in front of every tool's own checks.
+ *
+ * DROP-130 MEDIUM-6: also requires the OWNER to still rank at least `user`.
+ * An agent token's OWN role is always `'none'` — the floor — so
+ * `minRole(key.role, owner.role)` inside `apiKeyAuthContext` is a permanent
+ * no-op for this entire class, and `clampControlPlaneScopes` only suppresses
+ * CONTROL-PLANE scopes, never the agent-grammar ones
+ * (`app:<name>:deploy|read`, `apps:create`) this class is built from. Without
+ * this check, an agent token minted while its owner was `user` kept full
+ * deploy/create-app authority forever, even after the owner was demoted to
+ * `readonly` — the clamp Item 3 exists to enforce silently did not apply to
+ * the one credential class most likely to be left running unattended.
+ * Mirrors the same floor `POST /auth/agent-tokens` already requires to MINT
+ * a token (`authMiddleware('user')`), applied again at USE time.
  */
 async function resolveAgentToken(
   bearerToken: string | undefined,
@@ -1510,6 +1608,12 @@ async function resolveAgentToken(
     return null;
   }
   if (!verified || verified.key.kind !== 'agent') return null;
+
+  // A dangling/legacy ownerless agent token keeps today's behaviour — this
+  // is the same "keys with no ownerUserId keep today's behaviour exactly"
+  // invariant `apiKeyAuthContext` documents. In practice every agent token
+  // has an owner (POST /auth/agent-tokens always sets `requester?.userId`).
+  if (verified.owner && rankOf(verified.owner.role) < rankOf('user')) return null;
 
   const usable = (verified.key.scopes ?? []).some((scope) => normalizeAgentScope(scope) !== null);
   if (!usable) return null;
@@ -1694,20 +1798,35 @@ export async function deleteApiKeysByName(name: string): Promise<void> {
 }
 
 /**
- * List all API keys (without revealing the actual keys)
+ * List all API keys (without revealing the actual keys).
+ *
+ * DROP-130 MEDIUM-7: also derives `invalidated: true` for a key that
+ * predates its owner's `credentialsInvalidBefore` stamp. `verifyApiKey`
+ * already refuses such a key outright, but this list had no notion of the
+ * stamp at all — so `GET /auth/api-keys` (and the dashboard behind it) kept
+ * showing a killed key as an ordinary live one, and "revoke the leaked key"
+ * via suspend/reset looked like a no-op. Ownerless keys are unaffected (no
+ * owner to compare against — narrows the same way the clamp itself does).
  */
-export function listApiKeys(): Omit<ApiKey, 'keyHash'>[] {
+export function listApiKeys(): Array<Omit<ApiKey, 'keyHash'> & { invalidated?: true }> {
   if (!credentials) {
     throw new Error('Auth not initialized');
   }
 
-  return credentials.apiKeys.map(({ keyHash: _, ...key }) => key);
+  const users = credentials.users;
+  return credentials.apiKeys.map(({ keyHash: _, ...key }) => {
+    const owner = key.ownerUserId ? users.find((u) => u.id === key.ownerUserId) : undefined;
+    if (owner && predatesInvalidationStamp(key.createdAt, owner.credentialsInvalidBefore)) {
+      return { ...key, invalidated: true as const };
+    }
+    return key;
+  });
 }
 
 /**
  * List all users (without revealing password hashes or MFA secrets)
  */
-export function listUsers(): Omit<User, 'passwordHash' | 'mfaSecret'>[] {
+export function listUsers(): SafeUser[] {
   if (!credentials) {
     throw new Error('Auth not initialized');
   }
@@ -1718,7 +1837,7 @@ export function listUsers(): Omit<User, 'passwordHash' | 'mfaSecret'>[] {
 /**
  * Get a user by username (without password hash or MFA secret)
  */
-export function getUser(username: string): Omit<User, 'passwordHash' | 'mfaSecret'> | null {
+export function getUser(username: string): SafeUser | null {
   if (!credentials) return null;
   const user = credentials.users.find((u) => u.username === username);
   if (!user) return null;
@@ -1726,7 +1845,7 @@ export function getUser(username: string): Omit<User, 'passwordHash' | 'mfaSecre
   return safe;
 }
 
-export function getUserById(userId: string): Omit<User, 'passwordHash' | 'mfaSecret'> | null {
+export function getUserById(userId: string): SafeUser | null {
   if (!credentials) return null;
   const user = credentials.users.find((u) => u.id === userId);
   if (!user) return null;
@@ -1780,6 +1899,11 @@ export function authMiddleware(requiredRole?: 'admin' | 'user' | 'readonly') {
     }
 
     let authContext: AuthContext | null = null;
+    // DROP-130 HIGH-3: only set on the JWT-SUCCESS path below — never for a
+    // Bearer-presented API key falling through the `else` branch, which has
+    // no `iat` claim of this shape at all. Read alongside `jwtUserRecord`
+    // further down.
+    let jwtIssuedAt: number | undefined;
 
     // Try JWT authentication
     const authHeader = c.req.header('Authorization');
@@ -1817,6 +1941,7 @@ export function authMiddleware(requiredRole?: 'admin' | 'user' | 'readonly') {
           // An interactive session IS the human — nothing finer to key on.
           principalId: `jwt:${payload.sub}`,
         };
+        jwtIssuedAt = payload.iat;
       } else {
         // Not a valid session JWT — accept a Bearer-presented API key too, so the
         // conventional `Authorization: Bearer <key>` works (keys are also accepted
@@ -1875,6 +2000,18 @@ export function authMiddleware(requiredRole?: 'admin' | 'user' | 'readonly') {
       if (!jwtUserRecord || jwtUserRecord.enabled === false) {
         return c.json(error(ErrorCodes.UNAUTHORIZED, 'Account is no longer active'), 401);
       }
+      // DROP-130 HIGH-3: a session JWT lives 24 HOURS — the credential class
+      // most likely to be stolen — and until now was exempt from
+      // `credentialsInvalidBefore` entirely, which made `suspendUser`'s
+      // promise ("every credential that already existed stops
+      // authenticating") false for it: suspend -> unsuspend handed a stolen
+      // session back verbatim for the rest of its 24h life. `jwtIssuedAt` is
+      // `payload.iat`, set by `issueSessionJwt`'s `.setIssuedAt()` — Unix
+      // SECONDS, which `predatesInvalidationStamp` already accepts (see the
+      // two OAuth call sites).
+      if (predatesInvalidationStamp(jwtIssuedAt, jwtUserRecord.credentialsInvalidBefore)) {
+        return c.json(error(ErrorCodes.UNAUTHORIZED, 'Account is no longer active'), 401);
+      }
       // Role from the RECORD, not the claim — a demotion must bite now.
       authContext.role = jwtUserRecord.role as AuthContext['role'];
     }
@@ -1900,14 +2037,17 @@ export function authMiddleware(requiredRole?: 'admin' | 'user' | 'readonly') {
 
     // Check role if required
     if (requiredRole) {
-      // Defensive `?? 0`: a 'none' (scope-only) role, or any malformed/unknown
-      // role that somehow ends up on a persisted record, ranks 0 rather than
-      // `undefined` — `undefined < roleHierarchy[requiredRole]` is always
-      // `false`, which would have let an unrecognized role pass every gate.
-      // `roleHierarchy` is the module-scope table above — `minRole()` reads
-      // the same one, so there is exactly one ranking to keep in sync.
-      const rank = roleHierarchy[authContext.role] ?? 0;
-      if (rank < roleHierarchy[requiredRole]) {
+      // `rankOf()` on BOTH sides (DROP-130 HIGH-2) — not a bare
+      // `roleHierarchy[role] ?? 0` lookup. A bare lookup resolves an
+      // inherited `Object.prototype` name (`toString`, `constructor`, …) to
+      // a truthy function via the prototype chain, so `?? 0` never fires:
+      // `roleHierarchy['toString']` is `Function.prototype.toString`, and
+      // `fn < 3` is `NaN < 3` — always `false` — so a record with
+      // `role: 'toString'` passed this gate on every admin route with no
+      // 403. `rankOf()`'s `hasOwnProperty` guard is what `minRole()` already
+      // relies on for exactly this reason; this is the one site that had not
+      // been switched over to it.
+      if (rankOf(authContext.role) < rankOf(requiredRole)) {
         return c.json(
           error(ErrorCodes.UNAUTHORIZED, `Insufficient permissions. Required role: ${requiredRole}`),
           403
@@ -2057,43 +2197,12 @@ export function requireCapability(cap: string) {
   };
 }
 
-/**
- * Optional auth middleware - doesn't require auth but parses it if present
- */
-export function optionalAuthMiddleware() {
-  return async (c: Context, next: Next): Promise<Response | void> => {
-    // Try to parse auth but don't require it
-    const authHeader = c.req.header('Authorization');
-    if (authHeader?.startsWith('Bearer ')) {
-      const token = authHeader.substring(7);
-      const payload = await verifyJwt(token);
-      // Reject challenge tokens — never treat them as session tokens
-      if (payload && (payload as unknown as Record<string, unknown>)['typ'] !== 'mfa_challenge') {
-        c.set('auth', {
-          userId: payload.sub,
-          username: payload.username,
-          role: payload.role,
-          principalId: `jwt:${payload.sub}`,
-          authMethod: 'jwt',
-        });
-      } else if (!payload) {
-        // Not a valid JWT — accept a Bearer-presented API key too (mirrors
-        // authMiddleware). A valid-but-challenge token is intentionally skipped.
-        const verified = await verifyApiKey(token);
-        if (verified) {
-          c.set('auth', apiKeyAuthContext(verified.key, verified.owner));
-        }
-      }
-    }
-
-    const apiKey = c.req.header('X-API-Key');
-    if (apiKey && !c.get('auth')) {
-      const verified = await verifyApiKey(apiKey);
-      if (verified) {
-        c.set('auth', apiKeyAuthContext(verified.key, verified.owner));
-      }
-    }
-
-    return next();
-  };
-}
+// DROP-130 LOW-9: `optionalAuthMiddleware` was deleted here. It had no
+// non-test callers (confirmed: not mounted anywhere in server.ts, not
+// imported by any production module), its JWT branch trusted a 24h claim
+// outright with no `enabled` re-check, no role re-source from the live
+// record, and no `credentialsInvalidBefore` stamp check — so it bypassed
+// HIGH-2, HIGH-3 and Item 5 simultaneously while looking maintained (this
+// branch had touched it three times). `revokeAllRefreshTokensForUser` was
+// deleted for the identical reason (dead code carrying a false safety
+// claim) — see Item 4.

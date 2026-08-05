@@ -3,10 +3,12 @@
  *
  * DROP historically accepted API keys only via the `X-API-Key` header, while
  * `Authorization: Bearer` was JWT-only — which broke hosted apps using the
- * conventional `Authorization: Bearer <api-key>` scheme. authMiddleware and
- * optionalAuthMiddleware now try JWT first and fall back to API-key verification
- * for a Bearer value that isn't a valid JWT, so both header styles authenticate
- * the same key without changing session semantics.
+ * conventional `Authorization: Bearer <api-key>` scheme. authMiddleware now
+ * tries JWT first and falls back to API-key verification for a Bearer value
+ * that isn't a valid JWT, so both header styles authenticate the same key
+ * without changing session semantics. (`optionalAuthMiddleware` did the same
+ * fallback and was covered here too, until DROP-130 LOW-9 deleted it as dead
+ * code.)
  */
 
 import { Hono } from 'hono';
@@ -19,7 +21,6 @@ import {
   createApiKey,
   authMiddleware,
   requireCapability,
-  optionalAuthMiddleware,
   resetAuth,
   AuthContext,
 } from './auth';
@@ -55,10 +56,6 @@ describe('Bearer-presented API keys', () => {
       requireCapability('users:create'),
       (c) => c.json({ ok: true })
     );
-    app.get('/optional', optionalAuthMiddleware(), (c) => {
-      const auth = c.get('auth');
-      return c.json({ authMethod: auth?.authMethod ?? null });
-    });
     return app;
   }
 
@@ -117,14 +114,4 @@ describe('Bearer-presented API keys', () => {
     expect(body.authMethod).toBe('apikey');
   });
 
-  it('optionalAuthMiddleware also resolves a Bearer-presented API key', async () => {
-    const app = buildApp();
-    const { key } = await createApiKey('opt-key', 'user');
-
-    const res = await app.request('/optional', { headers: bearer(key) });
-
-    expect(res.status).toBe(200);
-    const body = (await res.json()) as { authMethod: string | null };
-    expect(body.authMethod).toBe('apikey');
-  });
 });
