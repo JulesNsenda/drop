@@ -13,7 +13,9 @@ clients that would rather make typed tool calls than shell out to `curl`.
   behind Caddy).
 - An API key with role `user` (mint one in the dashboard, or
   `POST /api/v1/auth/api-keys` as admin). A `user`-role key is automatically
-  scoped to the apps it creates — never hand an agent an `admin` key.
+  scoped to the apps it creates — never hand an agent an `admin` key. A key's
+  role is a ceiling, not a fixed grant: it's capped by its owner's own account
+  role, so demoting the owner demotes the key too.
 - Send the key as `Authorization: Bearer <key>` on every call.
 
 ## The loop
@@ -151,7 +153,8 @@ claude mcp add --transport http dropkit https://<host>/api/v1/mcp --header "Auth
 
 Use a `user`-role API key — never an `admin` key. A `user` key is
 automatically scoped to the apps it creates; an `admin` key can see and touch
-every app on the box.
+every app on the box. A key's role is also capped by its owner's own account
+role, so it can never outrank the human it was minted for.
 
 ### Tools
 
@@ -242,4 +245,14 @@ header works exactly like the CLI config above.
 Treat the API key like any other credential: store it in your agent's secret
 manager or environment, never commit it, and mint a fresh `user`-role key per
 agent/integration so a leaked key can be revoked without rotating every
-integration at once.
+integration at once. Remember too that a key's role is a ceiling capped by its
+owner's account role, not a fixed grant — keep the owner account itself at the
+right role.
+
+If your key or token was minted through a scoped `users:create` capability
+(rather than an admin key) and it created an account for another
+agent/integration, that account cannot log in yet: it's marked and refused at
+`POST /auth/login` until an admin (or an out-of-band operator) sets its
+password, which is what proves a human — not the scoped caller that minted
+it — now controls the account. This does not affect accounts an admin key
+creates directly; those can log in immediately.

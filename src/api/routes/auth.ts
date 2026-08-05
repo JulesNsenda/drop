@@ -30,7 +30,7 @@ import {
   completeMfaLogin,
   AuthContext,
 } from '../middleware/auth';
-import { tryLogActivity } from '../../managers/activity';
+import { tryLogActivity, logActivityFor } from '../../managers/activity';
 import { getStateManager } from '../../managers/app/state-manager';
 import { canAccess, interactiveSessionOnly } from '../access';
 import { assertMintable } from '../agent-scopes';
@@ -80,6 +80,9 @@ auth.post('/signup', async c => {
 
   try {
     const user = await createUser(body.username, body.password, 'user', body.email);
+    // Stays on tryLogActivity, not logActivityFor: identity here is the
+    // account this request just created, not an ambient AuthContext — there
+    // is no request auth to derive it from (signup precedes it).
     await tryLogActivity({ action: 'signup', userId: user.id, username: user.username });
     return c.json(
       success({
@@ -109,10 +112,22 @@ auth.post('/login', async c => {
 
   const result = await authenticateUser(body.username, body.password);
 
-  if (result.status === 'invalid' || result.status === 'disabled') {
+  // DROP-130 Item 6: `awaiting_admin_password` (a scoped-`users:create`
+  // account whose password has never been set by an admin) maps to the exact
+  // same response as `invalid` / `disabled` — a distinct message here would
+  // tell a caller who already knows the account exists (they created it)
+  // that their escalation attempt was specifically recognised, rather than
+  // just rejected like any other failed login.
+  if (
+    result.status === 'invalid' ||
+    result.status === 'disabled' ||
+    result.status === 'awaiting_admin_password'
+  ) {
     return c.json(error(ErrorCodes.UNAUTHORIZED, 'Invalid username or password'), 401);
   }
 
+  // Both of these stay on tryLogActivity, not logActivityFor: this request
+  // IS the authentication, so there is no AuthContext yet to derive from.
   if (result.status === 'mfa_required') {
     await tryLogActivity({ action: 'login_mfa_challenge', username: body.username });
     return c.json(success({ mfaRequired: true, challengeToken: result.challengeToken }));
@@ -212,10 +227,8 @@ auth.post('/api-keys', authMiddleware('admin'), async c => {
   // key name, so without this an admin could mint {ownerUserId: <other-admin>,
   // name: "<their-username>"} and have every later action attributed to them —
   // with the minting itself leaving no trace at all.
-  await tryLogActivity({
+  await logActivityFor(callerAuth, {
     action: 'apikey-create',
-    userId: callerAuth?.userId,
-    username: callerAuth?.username,
     detail: `key=${apiKey.id} name=${apiKey.name} role=${apiKey.role} owner=${apiKey.ownerUserId ?? 'none'}`,
   });
 
@@ -360,13 +373,29 @@ auth.post('/users', authMiddleware(), requireCapability('users:create'), async c
     );
   }
 
+  // DROP-130 Item 6: mark the account as created through the SCOPED
+  // (non-admin, capability-only) path whenever the caller itself is not an
+  // admin — the same test the role-clamp check above uses, since both ask
+  // "is a non-admin capability holder driving this request", not "did the
+  // request body ask for a non-default role". `createUser` stamps
+  // `createdByScope` on the record; `authenticateUser` then refuses to log
+  // this account in until an admin resets its password (`resetUserPassword`,
+  // which clears the marker) — closing the chain this credential would
+  // otherwise reach: login -> PUT /auth/password (JWT-only, exempt from the
+  // mustChangePassword 403) -> POST /apps/:name/source, whose new-app scope
+  // check in upload-preflight.ts applies only to rank-0 callers. Never set
+  // when auth is disabled (no authCtx) — that preserves the pre-existing,
+  // effectively-admin behaviour of an open single-operator box.
+  const createdByScope = authCtx !== undefined && authCtx.role !== 'admin';
+
   try {
     const user = await createUser(
       body.username,
       body.password,
       body.role || 'user',
       undefined,
-      true
+      true,
+      createdByScope
     );
     return c.json(
       success({
@@ -381,6 +410,12 @@ auth.post('/users', authMiddleware(), requireCapability('users:create'), async c
     if (err instanceof Error && err.message.includes('already exists')) {
       return c.json(error(ErrorCodes.CONFLICT, err.message), 409);
     }
+    // DROP-130 HIGH-4: `createUser` now validates `role` itself (this route
+    // never did, unlike PUT /auth/users/:id) — translate its plain Error
+    // into the same VALIDATION_ERROR shape that route uses.
+    if (err instanceof Error && err.message.startsWith('Invalid role:')) {
+      return c.json(error(ErrorCodes.VALIDATION_ERROR, err.message), 400);
+    }
     throw err;
   }
 });
@@ -389,11 +424,45 @@ auth.post('/users', authMiddleware(), requireCapability('users:create'), async c
 auth.put('/users/:id', authMiddleware('admin'), async c => {
   const id = c.req.param('id');
   if (!id) return c.json(error(ErrorCodes.VALIDATION_ERROR, 'Missing id'), 400);
-  const body = await c.req.json<{ enabled?: boolean; role?: 'admin' | 'user' | 'readonly' }>();
+  const body = await c.req.json<{
+    enabled?: boolean;
+    role?: 'admin' | 'user' | 'readonly';
+    maxApps?: number;
+    email?: string;
+  }>();
 
-  const updated = await updateUser(id, body);
-  if (!updated) {
-    return c.json(error(ErrorCodes.NOT_FOUND, 'User not found'), 404);
+  // `role` and `maxApps` are only TypeScript annotations on `body` — validate
+  // at runtime, or an arbitrary string / non-numeric value is persisted onto
+  // the user record. Same shape as POST /auth/api-keys' `role` check. This
+  // matters beyond this route: a corrupted role ranks 0 under `roleHierarchy`'s
+  // defensive `?? 0`, which would clamp every API key this user owns down to
+  // nothing the moment their standing is derived from it.
+  if (body.role !== undefined && !['admin', 'user', 'readonly'].includes(body.role)) {
+    throw new ValidationError('role must be one of: admin, user, readonly');
+  }
+  if (
+    body.maxApps !== undefined &&
+    !(typeof body.maxApps === 'number' && Number.isInteger(body.maxApps) && body.maxApps >= 0)
+  ) {
+    throw new ValidationError('maxApps must be a non-negative integer');
+  }
+
+  try {
+    const updated = await updateUser(id, body);
+    if (!updated) {
+      return c.json(error(ErrorCodes.NOT_FOUND, 'User not found'), 404);
+    }
+  } catch (err) {
+    // updateUser throws a plain Error for exactly one business-rule guard
+    // (mirroring deleteUser's own last-admin guard) — match that specific
+    // message and translate it to 400. Anything else (e.g. the credentials
+    // write itself failing) is an infrastructure error, not bad input, and
+    // must fall through to the global error handler rather than be reported
+    // to the client as a VALIDATION_ERROR with the raw message attached.
+    if (err instanceof Error && err.message === 'Cannot demote the last admin account') {
+      return c.json(error(ErrorCodes.VALIDATION_ERROR, err.message), 400);
+    }
+    throw err;
   }
 
   return c.json(success({ message: 'User updated' }));
@@ -413,6 +482,17 @@ auth.post('/users/:id/reset-password', authMiddleware('admin'), async c => {
   if (!reset) {
     return c.json(error(ErrorCodes.NOT_FOUND, 'User not found'), 404);
   }
+
+  // DROP-130 MEDIUM-8: this call stamps `credentialsInvalidBefore` — killing
+  // every API key, agent token and refresh token the user holds — and clears
+  // `createdByScope`, with no trace anywhere until now. Without an activity
+  // row, the activity log can't explain why a fleet of keys stopped
+  // authenticating right after this request.
+  const callerAuth = (c.get as (k: string) => AuthContext | undefined)('auth');
+  await logActivityFor(callerAuth, {
+    action: 'password-reset',
+    detail: `user=${id}`,
+  });
 
   return c.json(success({ message: 'Password reset' }));
 });
@@ -451,10 +531,8 @@ auth.delete('/account', authMiddleware(), async c => {
 
   try {
     await deleteUser(authCtx.userId);
-    await tryLogActivity({
+    await logActivityFor(authCtx, {
       action: 'delete',
-      userId: authCtx.userId,
-      username: authCtx.username,
       detail: 'Account deleted',
     });
     return c.json(success({ message: 'Account deleted' }));
@@ -490,6 +568,8 @@ auth.post('/mfa/verify', async c => {
   }
 
   // status === 'ok'
+  // Stays on tryLogActivity, not logActivityFor: completing the MFA
+  // challenge IS the authentication — there is no AuthContext yet.
   await tryLogActivity({
     action: 'login_mfa_ok',
     userId: result.user.id,
@@ -566,10 +646,8 @@ auth.post('/mfa/enable', authMiddleware(), async c => {
     );
   }
 
-  await tryLogActivity({
+  await logActivityFor(authCtx, {
     action: 'mfa_enabled',
-    userId: authCtx.userId,
-    username: authCtx.username,
   });
   return c.json(success({ message: 'Two-factor authentication enabled' }));
 });
@@ -604,10 +682,8 @@ auth.post('/mfa/disable', authMiddleware(), async c => {
     return c.json(error(ErrorCodes.MFA_INVALID, 'Invalid authentication code'), 401);
   }
 
-  await tryLogActivity({
+  await logActivityFor(authCtx, {
     action: 'mfa_disabled',
-    userId: authCtx.userId,
-    username: authCtx.username,
   });
   return c.json(success({ message: 'Two-factor authentication disabled' }));
 });
@@ -681,10 +757,8 @@ auth.post('/agent-tokens', authMiddleware('user'), async (c) => {
     { expiresInMinutes: minutes, kind: 'agent' }
   );
 
-  await tryLogActivity({
+  await logActivityFor(requester, {
     action: 'agent-token-issue',
-    userId: requester?.userId,
-    username: requester?.username,
     detail: `${check.normalized?.length ?? 0} scope(s), ${minutes}m`,
   });
 

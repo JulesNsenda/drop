@@ -44,15 +44,10 @@ export type HttpMethod = 'GET' | 'POST' | 'PUT' | 'DELETE';
  *     rejects every other credential class (session JWTs, API keys, and
  *     DROP-scoped OAuth tokens included). Do NOT document these as 'public':
  *     no auth middleware is not the same thing as no authentication.
- *   - 'readonly*': the group's general guard is `readonly` and server.ts does
- *     NOT upgrade this route, even though it mutates state. Only POST /apps
- *     is in this position today; documented as-is rather than aspirationally.
- *     See the callout on the Apps group.
  */
 export type EndpointRole =
   | 'public'
   | 'readonly'
-  | 'readonly*'
   | 'user'
   | 'admin'
   | 'authenticated'
@@ -142,14 +137,14 @@ export const ENDPOINT_GROUPS: EndpointGroupDef[] = [
     sourceFile: 'src/api/routes/apps.ts',
     description: 'Deploy, inspect, and manage applications.',
     note:
-      "Source-verified role floors (server.ts). DELETE/PUT/PATCH anywhere under /apps/* are raised to " +
-      "authMiddleware('user'), so update, delete, and domain are user+ — as are start, stop, restart, promote, and " +
-      'source (upload-deploy), each via its own route-specific override; migrate-runtime and capabilities are admin. ' +
-      'The one route still sitting on the general readonly guard is POST /apps (the collection route), marked * below.',
+      "Source-verified role floors (server.ts). DELETE/PUT/PATCH/POST anywhere under /apps/* are raised to " +
+      "authMiddleware('user'), so create, update, delete, and domain are user+ — as are start, stop, restart, " +
+      'promote, and source (upload-deploy), each via its own route-specific override; migrate-runtime and ' +
+      'capabilities are admin. Only the two GETs stay on the general readonly guard.',
     endpoints: [
       { method: 'GET', path: '/api/v1/apps', description: 'List apps (filtered to your own unless admin).', role: 'readonly' },
       { method: 'GET', path: '/api/v1/apps/:name', description: 'Get one app, with live runtime stats.', role: 'readonly' },
-      { method: 'POST', path: '/api/v1/apps', description: 'Register/deploy a new app from a local path.', role: 'readonly*' },
+      { method: 'POST', path: '/api/v1/apps', description: 'Register/deploy a new app from a local path.', role: 'user' },
       { method: 'PUT', path: '/api/v1/apps/:name', description: 'Update editable fields (framework, customDomain).', role: 'user' },
       { method: 'DELETE', path: '/api/v1/apps/:name', description: "Remove an app (?keepData=true preserves its database).", role: 'user' },
       { method: 'POST', path: '/api/v1/apps/:name/source', description: 'Deploy/redeploy from an uploaded gzipped tarball.', role: 'user' },
@@ -626,7 +621,6 @@ function MethodDots({ methods }: { methods: HttpMethod[] }): JSX.Element {
 const ROLE_LABEL: Record<EndpointRole, string> = {
   public: 'public',
   readonly: 'readonly+',
-  'readonly*': 'readonly+ *',
   user: 'user+',
   admin: 'admin',
   authenticated: 'any user',

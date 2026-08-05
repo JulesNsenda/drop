@@ -7,7 +7,7 @@ import * as fs from 'fs/promises';
 import * as path from 'path';
 import * as os from 'os';
 import authRoutes from './auth';
-import { initializeAuth, createUser, createApiKey } from '../middleware/auth';
+import { initializeAuth, createUser, createApiKey, resetAuth, listUsers } from '../middleware/auth';
 import { HttpError } from '../middleware/error';
 import { error, ErrorCodes } from '../types';
 
@@ -466,6 +466,33 @@ describe('Auth Routes', () => {
       expect(res.status).toBe(409);
     });
 
+    it('DROP-130 HIGH-4: should return 400 (and not persist) for an arbitrary/garbage role string, even from an admin', async () => {
+      // Unlike PUT /auth/users/:id, this route never validated `role` at
+      // all — `body.role || 'user'` reached `createUser` unguarded, so a
+      // corrupted role could be persisted and later rank 0 under
+      // roleHierarchy's defensive `?? 0`, clamping every key this user owns
+      // down to nothing (the HIGH-2 reachability vector).
+      const res = await app.request('/auth/users', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${adminToken}`,
+        },
+        body: JSON.stringify({
+          username: 'garbage-role-user',
+          password: 'password123',
+          role: 'superadmin',
+        }),
+      });
+
+      expect(res.status).toBe(400);
+      const data = (await res.json()) as ApiResponse;
+      expect(data.error?.code).toBe('VALIDATION_ERROR');
+
+      const created = listUsers().find((u) => u.username === 'garbage-role-user');
+      expect(created).toBeUndefined();
+    });
+
     describe('scoped users:create capability', () => {
       let scopedKey: string;
       let plainUserKey: string;
@@ -566,6 +593,398 @@ describe('Auth Routes', () => {
 
         expect(res.status).toBe(403);
       });
+    });
+  });
+
+  describe('DROP-130 Item 6 — users:create escalation containment', () => {
+    it('a scoped users:create key cannot log in as the account it just created, closing the chain to PUT /auth/password and POST /apps/:name/source', async () => {
+      // Step 1: a rank-0 key holding only the `users:create` capability
+      // (ownerless, exactly the shape DROP_API_KEY is minted in) mints a
+      // user with a caller-chosen password.
+      const { key: scopedKey } = await createApiKey(
+        'escalation-provision-key',
+        'none',
+        undefined,
+        ['users:create']
+      );
+
+      const createRes = await app.request('/auth/users', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-API-Key': scopedKey,
+        },
+        body: JSON.stringify({ username: 'escalation-target', password: 'attacker-chosen-pw' }),
+      });
+      expect(createRes.status).toBe(201);
+
+      // Step 2: logging in with the SAME password the caller just chose is
+      // refused — and with the exact same response shape as a wrong
+      // password, so nothing distinguishes "blocked because scope-created"
+      // from an ordinary failed login.
+      const loginRes = await app.request('/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: 'escalation-target', password: 'attacker-chosen-pw' }),
+      });
+      expect(loginRes.status).toBe(401);
+      const loginData = (await loginRes.json()) as ApiResponse<LoginResponse>;
+      expect(loginData.success).toBe(false);
+      expect(loginData.error?.message).toBe('Invalid username or password');
+      expect(loginData.data).toBeUndefined();
+
+      // Step 3: with no JWT ever issued, the next link in the published
+      // escalation chain — PUT /auth/password, gated JWT-only by
+      // interactiveSessionOnly, and the step that would have cleared
+      // mustChangePassword on the way to a full `user` session — is
+      // structurally unreachable: there is no Authorization header the
+      // caller can present.
+      const passwordChangeRes = await app.request('/auth/password', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          currentPassword: 'attacker-chosen-pw',
+          newPassword: 'irrelevant-new-pw',
+        }),
+      });
+      expect(passwordChangeRes.status).toBe(401);
+    });
+
+    it('an admin-created account is NOT marked and can log in immediately', async () => {
+      const createRes = await app.request('/auth/users', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${adminToken}`,
+        },
+        body: JSON.stringify({ username: 'admin-created-user', password: 'admin-chosen-pw' }),
+      });
+      expect(createRes.status).toBe(201);
+
+      const loginRes = await app.request('/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: 'admin-created-user', password: 'admin-chosen-pw' }),
+      });
+      expect(loginRes.status).toBe(200);
+      const loginData = (await loginRes.json()) as ApiResponse<LoginResponse>;
+      expect(loginData.success).toBe(true);
+      expect(loginData.data.token).toBeDefined();
+    });
+
+    it('an admin resetting the password clears the marker, and login then works', async () => {
+      const { key: scopedKey } = await createApiKey(
+        'escalation-provision-key-2',
+        'none',
+        undefined,
+        ['users:create']
+      );
+
+      const createRes = await app.request('/auth/users', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-API-Key': scopedKey,
+        },
+        body: JSON.stringify({
+          username: 'escalation-target-2',
+          password: 'attacker-chosen-pw',
+        }),
+      });
+      const created = (await createRes.json()) as ApiResponse<CreatedUserResponse>;
+
+      const blockedLogin = await app.request('/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          username: 'escalation-target-2',
+          password: 'attacker-chosen-pw',
+        }),
+      });
+      expect(blockedLogin.status).toBe(401);
+
+      const resetRes = await app.request(`/auth/users/${created.data.id}/reset-password`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${adminToken}`,
+        },
+        body: JSON.stringify({ newPassword: 'admin-set-password-123' }),
+      });
+      expect(resetRes.status).toBe(200);
+
+      const loginAfterReset = await app.request('/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          username: 'escalation-target-2',
+          password: 'admin-set-password-123',
+        }),
+      });
+      expect(loginAfterReset.status).toBe(200);
+      const loginData = (await loginAfterReset.json()) as ApiResponse<LoginResponse>;
+      expect(loginData.success).toBe(true);
+      expect(loginData.data.token).toBeDefined();
+    });
+
+    it('does not mark an account created with no AuthContext at all (the open-box path), and it can log in immediately', async () => {
+      // `createdByScope` is computed as `authCtx !== undefined && authCtx.role
+      // !== 'admin'` — deliberately NOT `authCtx?.role !== 'admin'`. The two
+      // read as equivalent refactors of each other but diverge exactly when
+      // `authCtx` is undefined: the `?.` form evaluates `undefined !== 'admin'`
+      // to `true` and marks the account anyway, locking every account out the
+      // moment auth's gates are open (isAuthEnabled() false) — the "open
+      // single-operator box" case the code comment names. Reached here by
+      // initializing auth with both `enableJwt`/`enableApiKeys` false: the
+      // primitives (createUser, login) still work, but authMiddleware() and
+      // requireCapability() both no-op via isAuthEnabled(), so `POST
+      // /auth/users` is reached with no Authorization header and no AuthContext
+      // at all — not just a non-admin one.
+      resetAuth();
+      await initializeAuth({ credentialsPath, enableJwt: false, enableApiKeys: false });
+
+      const createRes = await app.request('/auth/users', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: 'open-box-user', password: 'open-box-pw-123456' }),
+      });
+      expect(createRes.status).toBe(201);
+
+      const created = listUsers().find((u) => u.username === 'open-box-user');
+      expect(created).toBeDefined();
+      expect(created!.createdByScope).toBeUndefined();
+
+      const loginRes = await app.request('/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: 'open-box-user', password: 'open-box-pw-123456' }),
+      });
+      expect(loginRes.status).toBe(200);
+      const loginData = (await loginRes.json()) as ApiResponse<LoginResponse>;
+      expect(loginData.success).toBe(true);
+      expect(loginData.data.token).toBeDefined();
+    });
+  });
+
+  describe('POST /auth/users/:id/reset-password', () => {
+    it('DROP-130 MEDIUM-8: records an activity entry attributing the containment action', async () => {
+      // resetUserPassword stamps `credentialsInvalidBefore` — killing every
+      // API key, agent token and refresh token the user holds — and clears
+      // `createdByScope`, with no trace anywhere until now. Without a row
+      // here, the activity log can't explain why a fleet of keys stopped
+      // authenticating right after this request.
+      const activityModule = await import('../../managers/activity');
+      const logSpy = jest.spyOn(activityModule, 'logActivityFor').mockResolvedValue();
+
+      const createRes = await app.request('/auth/users', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${adminToken}`,
+        },
+        body: JSON.stringify({ username: 'reset-target', password: 'password123' }),
+      });
+      const created = (await createRes.json()) as ApiResponse<CreatedUserResponse>;
+      logSpy.mockClear();
+
+      const res = await app.request(`/auth/users/${created.data.id}/reset-password`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${adminToken}`,
+        },
+        body: JSON.stringify({ newPassword: 'admin-set-password-123' }),
+      });
+      expect(res.status).toBe(200);
+
+      expect(logSpy).toHaveBeenCalledTimes(1);
+      const entry = logSpy.mock.calls[0][1];
+      expect(entry).toMatchObject({ action: 'password-reset' });
+      logSpy.mockRestore();
+    });
+  });
+
+  describe('PUT /auth/users/:id', () => {
+    let targetUserId: string;
+
+    beforeEach(async () => {
+      const res = await app.request('/auth/users', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${adminToken}`,
+        },
+        body: JSON.stringify({ username: 'update-target', password: 'password123', role: 'user' }),
+      });
+      const data = (await res.json()) as ApiResponse<CreatedUserResponse>;
+      targetUserId = data.data.id;
+    });
+
+    it('should update role for admin', async () => {
+      const res = await app.request(`/auth/users/${targetUserId}`, {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${adminToken}`,
+        },
+        body: JSON.stringify({ role: 'readonly' }),
+      });
+
+      expect(res.status).toBe(200);
+    });
+
+    it('should return 400 (and not persist) for an arbitrary/garbage role string', async () => {
+      // `role` is only a TypeScript annotation on the parsed body — without
+      // runtime validation an arbitrary string would persist onto the user
+      // record, and rank 0 under roleHierarchy's defensive `?? 0`, clamping
+      // every API key this user owns down to nothing the moment a key's
+      // standing is derived from its owner.
+      const res = await app.request(`/auth/users/${targetUserId}`, {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${adminToken}`,
+        },
+        body: JSON.stringify({ role: 'superadmin' }),
+      });
+
+      expect(res.status).toBe(400);
+      const data = (await res.json()) as ApiResponse;
+      expect(data.error?.code).toBe('VALIDATION_ERROR');
+
+      const listRes = await app.request('/auth/users', {
+        method: 'GET',
+        headers: { Authorization: `Bearer ${adminToken}` },
+      });
+      const listData = (await listRes.json()) as ApiResponse<Array<{ id: string; role: string }>>;
+      expect(listData.data.find(u => u.id === targetUserId)?.role).toBe('user');
+    });
+
+    it('should return 400 for a negative maxApps', async () => {
+      const res = await app.request(`/auth/users/${targetUserId}`, {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${adminToken}`,
+        },
+        body: JSON.stringify({ maxApps: -1 }),
+      });
+
+      expect(res.status).toBe(400);
+      const data = (await res.json()) as ApiResponse;
+      expect(data.error?.code).toBe('VALIDATION_ERROR');
+    });
+
+    it('should return 400 (not 500) for a non-numeric maxApps', async () => {
+      const res = await app.request(`/auth/users/${targetUserId}`, {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${adminToken}`,
+        },
+        body: JSON.stringify({ maxApps: 'unlimited' }),
+      });
+
+      expect(res.status).toBe(400);
+      const data = (await res.json()) as ApiResponse;
+      expect(data.error?.code).toBe('VALIDATION_ERROR');
+    });
+
+    it('should accept maxApps: 0 (use global default)', async () => {
+      const res = await app.request(`/auth/users/${targetUserId}`, {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${adminToken}`,
+        },
+        body: JSON.stringify({ maxApps: 0 }),
+      });
+
+      expect(res.status).toBe(200);
+    });
+
+    it('should refuse to demote the LAST admin account', async () => {
+      // `initializeAuth` auto-creates a default 'admin' account on first
+      // boot, so at this point two admins exist ('admin' and 'testadmin').
+      // Demote the auto-created one down to 'user' first — that must
+      // succeed, since a second admin remains — leaving 'testadmin' as the
+      // sole admin, which must then refuse to demote itself further.
+      const listRes = await app.request('/auth/users', {
+        method: 'GET',
+        headers: { Authorization: `Bearer ${adminToken}` },
+      });
+      const listData = (await listRes.json()) as ApiResponse<Array<{ id: string; username: string; role: string }>>;
+      const defaultAdmin = listData.data.find(u => u.username === 'admin' && u.role === 'admin');
+      expect(defaultAdmin).toBeDefined();
+
+      const firstDemotion = await app.request(`/auth/users/${defaultAdmin!.id}`, {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${adminToken}`,
+        },
+        body: JSON.stringify({ role: 'user' }),
+      });
+      expect(firstDemotion.status).toBe(200);
+
+      const meRes = await app.request('/auth/me', {
+        method: 'GET',
+        headers: { Authorization: `Bearer ${adminToken}` },
+      });
+      const me = (await meRes.json()) as ApiResponse<UserResponse>;
+
+      const res = await app.request(`/auth/users/${me.data.userId}`, {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${adminToken}`,
+        },
+        body: JSON.stringify({ role: 'user' }),
+      });
+
+      expect(res.status).toBe(400);
+      const data = (await res.json()) as ApiResponse;
+      expect(data.error?.code).toBe('VALIDATION_ERROR');
+    });
+
+    it('allows demoting an admin when another admin remains', async () => {
+      const secondAdminRes = await app.request('/auth/users', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${adminToken}`,
+        },
+        body: JSON.stringify({
+          username: 'second-admin-demote',
+          password: 'password123',
+          role: 'admin',
+        }),
+      });
+      const secondAdmin = (await secondAdminRes.json()) as ApiResponse<CreatedUserResponse>;
+
+      const res = await app.request(`/auth/users/${secondAdmin.data.id}`, {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${adminToken}`,
+        },
+        body: JSON.stringify({ role: 'user' }),
+      });
+
+      expect(res.status).toBe(200);
+    });
+
+    it('should return 404 for a non-existent user id', async () => {
+      const res = await app.request('/auth/users/non-existent-id', {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${adminToken}`,
+        },
+        body: JSON.stringify({ role: 'readonly' }),
+      });
+
+      expect(res.status).toBe(404);
     });
   });
 });

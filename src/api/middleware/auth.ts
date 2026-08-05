@@ -44,6 +44,35 @@ export interface User {
   enabled?: boolean; // default true
   maxApps?: number; // per-user override (0 = use global default)
   mustChangePassword?: boolean;
+  /**
+   * DROP-130 Items 4 & 5: an ISO timestamp stamped by `suspendUser`
+   * (reversible suspension) and `resetUserPassword` (admin-forced containment,
+   * as opposed to onboarding's `mustChangePassword`). Any API key, refresh
+   * token, session JWT, or OAuth/app-MCP access token minted/issued BEFORE
+   * this stamp is rejected going forward, even after the account is
+   * re-enabled or the password is changed — see `predatesInvalidationStamp`.
+   * The session-JWT check (DROP-130 HIGH-3) is the one closed latest: a 24h
+   * JWT is the class most likely to be a stolen credential, and until then it
+   * was the one type this stamp did not reach. Never cleared automatically:
+   * clearing it would resurrect every credential the stamp was meant to kill.
+   */
+  credentialsInvalidBefore?: string;
+  /**
+   * DROP-130 Item 6: set only when this account was minted through the
+   * SCOPED (non-admin, capability-only) path — a rank-0 `users:create`
+   * caller acting on `POST /auth/users`, never an admin. `authenticateUser`
+   * refuses to log this account in while the marker is present, which is
+   * what closes the escalation chain: scoped key -> POST /auth/users with a
+   * caller-chosen password -> POST /auth/login -> PUT /auth/password
+   * (JWT-only, so it passes `interactiveSessionOnly` and is explicitly
+   * exempt from the `mustChangePassword` 403) -> full `user` JWT ->
+   * POST /apps/:name/source, whose new-app scope check
+   * (`upload-preflight.ts`) applies only to rank-0 callers. Cleared by
+   * `resetUserPassword` — an admin (or an out-of-band operator) setting the
+   * password is what proves a human, not the scoped caller, now controls
+   * the account.
+   */
+  createdByScope?: true;
   /** MFA enabled flag */
   mfaEnabled?: boolean;
   /** Encrypted TOTP secret (AES-256-GCM via platform encryption key) */
@@ -51,6 +80,14 @@ export interface User {
   /** Last step index that was accepted — prevents replay */
   mfaLastUsedStep?: number;
 }
+
+/**
+ * A `User` record with its authentication secrets stripped — what
+ * `getUserById`/`getUser`/`listUsers` return, and what `apiKeyAuthContext`
+ * (DROP-130 Item 3) derives an owned API key's standing from at request
+ * time. Threaded in rather than re-looked-up, so the derivation stays pure.
+ */
+export type SafeUser = Omit<User, 'passwordHash' | 'mfaSecret'>;
 
 // API key record
 export interface ApiKey {
@@ -139,6 +176,96 @@ export interface AuthContext {
    * at the MCP gate — see mcpAuthMiddleware.
    */
   kind?: 'agent';
+}
+
+/**
+ * Canonical role ranking. The single source every ordinal role comparison
+ * reads from — `authMiddleware`'s own role gate below and `minRole()` both
+ * key off this table; a second, function-local copy is the exact drift this
+ * constant exists to prevent.
+ *
+ * `Object.freeze`d (DROP-130 LOW-9): module-scope AND exported means any
+ * module that imports it could otherwise mutate a shared table every
+ * principal's rank is checked against — silently promoting everyone.
+ */
+export const roleHierarchy: Record<string, number> = Object.freeze({
+  admin: 3,
+  user: 2,
+  readonly: 1,
+  none: 0,
+}) as Record<string, number>;
+
+/**
+ * `roleHierarchy[role]`, defensively defaulted to 0 for anything not in the
+ * table — including inherited `Object.prototype` names (`toString`,
+ * `constructor`, …), which a bare `roleHierarchy[role]` lookup would
+ * otherwise return truthy for and skip the `?? 0` fallback entirely.
+ */
+function rankOf(role: string): number {
+  return Object.prototype.hasOwnProperty.call(roleHierarchy, role) ? roleHierarchy[role] : 0;
+}
+
+/**
+ * Returns whichever of two roles ranks lower in `roleHierarchy` — used to
+ * clamp one role to another (e.g. an API key can never outrank the human it
+ * acts for).
+ *
+ * Always returns a REAL role, never a passthrough of a malformed input. Rank
+ * alone is not enough here: several downstream gates
+ * (`canAccessScoped`/`access.ts`, `upload-preflight.ts`, the scope arm of
+ * `requireCapability`) test `role === 'none'` by STRING equality, not by
+ * rank. An unrecognized/corrupted role string that merely *ranked* 0 would
+ * still fail every one of those equality checks and fall through to their
+ * LESS restrictive branch — the opposite of "clamped down". So when the
+ * lower-ranked side isn't itself a recognized role, the result is
+ * normalized to `'none'`, the actual lowest standing, rather than echoed
+ * back verbatim.
+ */
+export function minRole(a: string, b: string): 'admin' | 'user' | 'readonly' | 'none' {
+  const picked = rankOf(a) <= rankOf(b) ? a : b;
+  return (Object.prototype.hasOwnProperty.call(roleHierarchy, picked) ? picked : 'none') as
+    | 'admin'
+    | 'user'
+    | 'readonly'
+    | 'none';
+}
+
+/**
+ * Whether a credential predates the owner's `credentialsInvalidBefore` stamp
+ * (DROP-130 Items 4 & 5) — the one primitive `suspendUser` (reversible
+ * suspension) and `resetUserPassword` (forced-reset containment) both rely on
+ * to kill every credential that existed BEFORE the incident, without deleting
+ * them and without touching anything minted after.
+ *
+ * `mintedAt` accepts either an ISO string (`ApiKey.createdAt` /
+ * `RefreshTokenRecord.createdAt`) or Unix seconds (a JWT `iat` claim), so the
+ * OAuth/app-MCP access-token checks — which have no stored record, only a
+ * signed claim — can reuse the same primitive. A missing or unparseable
+ * `mintedAt` fails CLOSED (treated as predating the stamp): an
+ * un-timestamped credential must not be assumed safe. An unparseable `stamp`
+ * fails open — that would be OUR OWN data corruption, not something a caller
+ * can control by mis-shaping a credential, and every stamp we ever write is
+ * `new Date().toISOString()`.
+ *
+ * Exported (DROP-130 HIGH-3/MEDIUM-5/MEDIUM-7) so the JWT branch of
+ * `authMiddleware` below, `listApiKeys`, and `oauth.ts`'s
+ * `authorization_code` exchange can all reuse the one primitive rather than
+ * re-implementing the same comparison.
+ */
+export function predatesInvalidationStamp(
+  mintedAt: string | number | undefined,
+  stamp: string | undefined
+): boolean {
+  if (!stamp) return false; // no incident recorded — nothing to invalidate
+  if (mintedAt === undefined) return true; // fail closed
+
+  const mintedMs = typeof mintedAt === 'number' ? mintedAt * 1000 : Date.parse(mintedAt);
+  if (Number.isNaN(mintedMs)) return true; // unparseable — fail closed
+
+  const stampMs = Date.parse(stamp);
+  if (Number.isNaN(stampMs)) return false; // malformed stamp — see docstring
+
+  return mintedMs < stampMs;
 }
 
 /** A rotated-on-use opaque refresh token, hashed at rest (never the raw token). */
@@ -280,6 +407,27 @@ export async function initializeAuth(authConfig: AuthConfig): Promise<void> {
     console.log('IMPORTANT: Change this password on first login.');
     console.log('='.repeat(60));
   }
+
+  // DROP-130 Item 3: an owned key's role is now CLAMPED down to its owner's
+  // at request time, never echoed verbatim. `POST /auth/api-keys` has always
+  // permitted an explicit `ownerUserId` naming any user, so a key minted
+  // above its owner's standing is a shape the API allows today — and after
+  // this clamp it would silently start losing authority on every request. A
+  // key that begins 403ing with no signal anywhere is not acceptable, so
+  // name every such key once, at boot, rather than let the demotion be
+  // discovered as an unexplained outage. One pass over `credentials.apiKeys`.
+  for (const key of credentials.apiKeys) {
+    if (!key.ownerUserId) continue; // legacy/ownerless — not clamped, nothing to warn about
+    const owner = credentials.users.find((u) => u.id === key.ownerUserId);
+    if (!owner) continue; // dangling owner — already fails closed at request time
+    if (rankOf(key.role) > rankOf(owner.role)) {
+      console.warn(
+        `[Auth] API key '${key.name}' (${key.id}) has role '${key.role}', which outranks its ` +
+          `owner '${owner.username}' (role '${owner.role}'). Requests through this key are now ` +
+          `clamped to '${owner.role}'.`
+      );
+    }
+  }
 }
 
 /**
@@ -401,6 +549,19 @@ function isLegacyPasswordHash(storedHash: string): boolean {
 }
 
 /**
+ * The only three standing roles a `User` record may carry (never `'none'` —
+ * that value exists only on `ApiKey.role`, for scope-only keys; there are no
+ * "service users"). Shared by `createUser` and `updateUser` (DROP-130
+ * HIGH-4) so a role write is validated at the ONE primitive both routes call
+ * through, rather than at a route that a future caller could bypass — a
+ * corrupted role ranks 0 under `roleHierarchy`'s defensive `?? 0`, which
+ * clamps every API key the user owns down to nothing the moment a key's
+ * standing is derived from its owner (Item 3 / HIGH-2's reachability
+ * vector).
+ */
+const VALID_USER_ROLES: ReadonlySet<string> = new Set(['admin', 'user', 'readonly']);
+
+/**
  * Create a new user
  */
 export async function createUser(
@@ -409,9 +570,29 @@ export async function createUser(
   role: 'admin' | 'user' | 'readonly' = 'user',
   email?: string,
   mustChangePassword?: boolean,
+  /**
+   * DROP-130 Item 6: stamp `createdByScope` on the record. Only
+   * `POST /auth/users` sets this, and only when the caller driving the
+   * request is not an admin (a scoped `users:create` capability holder) —
+   * see `User.createdByScope`'s doc comment for the full chain this closes.
+   * Every other caller (signup, the bootstrap default admin) leaves it
+   * `undefined`, which is what keeps admin-created and self-service
+   * accounts able to log in immediately.
+   */
+  createdByScope?: boolean,
 ): Promise<User> {
   if (!credentials || !config) {
     throw new Error('Auth not initialized');
+  }
+
+  // DROP-130 HIGH-4: `role` is only a TypeScript annotation at the HTTP
+  // boundary — POST /auth/users passed `body.role || 'user'` straight
+  // through with no runtime check (unlike PUT /auth/users/:id, which
+  // validates at its own route). Checked HERE so every caller — including
+  // any future one — inherits it, rather than duplicating the check at a
+  // second route.
+  if (!VALID_USER_ROLES.has(role)) {
+    throw new Error(`Invalid role: ${role}`);
   }
 
   // Check if user already exists
@@ -428,6 +609,7 @@ export async function createUser(
     email,
     createdAt: new Date().toISOString(),
     ...(mustChangePassword ? { mustChangePassword: true } : {}),
+    ...(createdByScope ? { createdByScope: true } : {}),
   };
 
   credentials.users.push(user);
@@ -468,7 +650,24 @@ export async function changePassword(userId: string, currentPassword: string, ne
  * Update a user's properties (admin function)
  */
 /**
- * Admin reset a user's password
+ * Admin reset a user's password — CONTAINMENT, not onboarding. This is an
+ * admin forcing a reset on a possibly-compromised account (reachable from the
+ * dashboard's "Reset password" button), distinct from `createUser(..., true)`
+ * / self-service signup's `mustChangePassword`, which is onboarding ("set
+ * your own password") and does NOT touch `credentialsInvalidBefore`.
+ *
+ * DROP-130 Item 5: reuses Item 4's stamp, so every API key, refresh token,
+ * session JWT (HIGH-3) and OAuth/app-MCP access token that existed before
+ * this call stops authenticating — the same mechanism `suspendUser` uses,
+ * and for the same reason: the account most likely to need a forced reset is
+ * one whose credentials may already be in someone else's hands, and the
+ * JWT-only `mustChangePassword` gate alone never reached any of the others.
+ *
+ * DROP-130 Item 6: also clears `createdByScope`. This IS the "admin-initiated
+ * or out-of-band password set" that `authenticateUser` waits for before it
+ * will log a scoped-created account in — an admin choosing the new password
+ * (rather than the scoped caller who minted the account) is what proves a
+ * human, not the capability holder, now controls it.
  */
 export async function resetUserPassword(userId: string, newPassword: string): Promise<boolean> {
   if (!credentials || !config) throw new Error('Auth not initialized');
@@ -477,6 +676,8 @@ export async function resetUserPassword(userId: string, newPassword: string): Pr
   const { hash } = hashPassword(newPassword);
   user.passwordHash = hash;
   user.mustChangePassword = true;
+  user.credentialsInvalidBefore = new Date().toISOString();
+  delete user.createdByScope;
   await saveCredentials(config.credentialsPath, credentials);
   return true;
 }
@@ -499,7 +700,10 @@ export async function deleteUser(userId: string): Promise<boolean> {
   // orphaned key, so this is defence in depth — but it keeps the stored state
   // honest rather than leaving dangling credentials in the file.
   credentials.apiKeys = credentials.apiKeys.filter((k) => k.ownerUserId !== userId);
-  // Same for OAuth grants — see suspendUser.
+  // Same for OAuth grants. Unlike `suspendUser` (DROP-130 Item 4), a deletion
+  // is not reversible — there is no re-enable to protect against — so purging
+  // the records outright (rather than stamping `credentialsInvalidBefore`) is
+  // still correct here.
   credentials.refreshTokens = (credentials.refreshTokens ?? []).filter(
     (r) => r.userId !== userId
   );
@@ -508,8 +712,56 @@ export async function deleteUser(userId: string): Promise<boolean> {
 }
 
 /**
- * Suspend a user: disables their account and revokes all their API keys.
- * Login is blocked immediately; existing JWTs expire naturally (within 24h).
+ * Set `user.enabled` and, whenever the TARGET state is disabled, stamp
+ * `credentialsInvalidBefore` — the ONE shared primitive `suspendUser` and
+ * `updateUser` (the dashboard's `PUT /auth/users/:id {enabled:false}` disable
+ * path — `UsersPage.tsx` never calls `POST /admin/users/:id/suspend`) both go
+ * through (DROP-130 HIGH-1).
+ *
+ * Before this, `suspendUser` stamped and `updateUser` did not: two
+ * independent sites deciding the same thing is exactly what let the
+ * dashboard's disable button bypass containment — a disable -> re-enable
+ * cycle through `updateUser` alone resurrected every API key, agent token
+ * and refresh token verbatim, with `suspendUser`'s own reversibility
+ * guarantee never in the picture.
+ *
+ * Stamped on every transition TO disabled, not only a `true -> false` one:
+ * `enabled === undefined` reads as "enabled" everywhere else in this file
+ * (`listUsers`'s `!== false`), so a never-touched account IS the common
+ * "was enabled" case, and gating on a literal `true -> false` transition
+ * would skip it. Re-stamping an already-disabled account only moves the
+ * stamp forward, which is harmless — nothing minted while disabled could
+ * have authenticated anyway.
+ */
+function setUserEnabled(user: User, enabled: boolean): void {
+  user.enabled = enabled;
+  if (enabled === false) {
+    user.credentialsInvalidBefore = new Date().toISOString();
+  }
+}
+
+/**
+ * Suspend a user: disables their account and stamps `credentialsInvalidBefore`
+ * (via `setUserEnabled`) so every API key, refresh token, session JWT and
+ * OAuth/app-MCP access token that already existed stops authenticating —
+ * WITHOUT deleting them. Login is blocked immediately.
+ *
+ * DROP-130 Item 4: this used to hard-delete `apiKeys` and `refreshTokens`,
+ * which is exactly wrong at re-enable. `POST /admin/users/:id/unsuspend` only
+ * flips `enabled` back to true — a purge's value is not *during* suspension
+ * (every auth path already rejects a disabled owner), it is *at re-enable*:
+ * without the stamp, every key, agent token and refresh token live at
+ * suspension time comes back verbatim the moment the account is re-enabled.
+ * The canonical incident sequence is *suspend to contain a suspected leak ->
+ * remediate -> unsuspend*, and that would silently hand the attacker back
+ * their stolen credential. Stamping instead of purging gives reversibility to
+ * the ACCOUNT without giving it to the account's outstanding credentials — a
+ * credential minted before the stamp never authenticates again, re-enabled or
+ * not; one minted after does. See `predatesInvalidationStamp` and its callers
+ * (`verifyApiKey`, `rotateRefreshToken`, `verifyOAuthAccessToken`,
+ * `verifyAppMcpAccessToken`, and — DROP-130 HIGH-3 — `authMiddleware`'s own
+ * JWT branch).
+ *
  * Returns false if the user was not found.
  */
 export async function suspendUser(userId: string): Promise<boolean> {
@@ -517,31 +769,42 @@ export async function suspendUser(userId: string): Promise<boolean> {
   const user = credentials.users.find((u) => u.id === userId);
   if (!user) return false;
   if (user.role === 'admin') throw new Error('Cannot suspend an admin account');
-  user.enabled = false;
-  // The docstring above has always promised this; it was never implemented,
-  // and it did nothing while a key's userId was its own id. Now that keys act
-  // as their owner, a suspended user's keys would otherwise keep full access
-  // to every app they own.
-  credentials.apiKeys = credentials.apiKeys.filter((k) => k.ownerUserId !== userId);
-  // ...and their OAuth grants. Without this, suspension blocks login and
-  // purges keys while every outstanding refresh token keeps minting fresh
-  // 15-minute access tokens INDEFINITELY — refresh records carry no expiry and
-  // the refresh path never checked `enabled`. revokeAllRefreshTokensForUser
-  // existed for exactly this and had no caller at all.
-  credentials.refreshTokens = (credentials.refreshTokens ?? []).filter(
-    (r) => r.userId !== userId
-  );
+  setUserEnabled(user, false);
   await saveCredentials(config.credentialsPath, credentials);
   return true;
 }
 
+/**
+ * Update a user's properties (admin function). `enabled` goes through
+ * `setUserEnabled` (DROP-130 HIGH-1) — this is the dashboard's disable path
+ * (`PUT /auth/users/:id {enabled:false}`), so it must stamp
+ * `credentialsInvalidBefore` exactly like `suspendUser` does, or a disable ->
+ * re-enable cycle through here alone resurrects every credential the
+ * disable was meant to kill.
+ */
 export async function updateUser(userId: string, updates: { enabled?: boolean; role?: 'admin' | 'user' | 'readonly'; maxApps?: number; email?: string }): Promise<boolean> {
   if (!credentials || !config) throw new Error('Auth not initialized');
 
   const user = credentials.users.find((u) => u.id === userId);
   if (!user) return false;
 
-  if (updates.enabled !== undefined) user.enabled = updates.enabled;
+  // Mirrors deleteUser's last-admin guard: demoting the last admin locks the
+  // platform out of its own admin surface just as surely as deleting the
+  // account would.
+  if (updates.role !== undefined && updates.role !== 'admin' && user.role === 'admin') {
+    const adminCount = credentials.users.filter((u) => u.role === 'admin').length;
+    if (adminCount <= 1) throw new Error('Cannot demote the last admin account');
+  }
+
+  // DROP-130 HIGH-4 (symmetry): PUT /auth/users/:id validates `role` at its
+  // own route today, which means this primitive stays safe only as long as
+  // that ONE caller keeps validating — checked here too so a future caller
+  // inherits it for free, same reasoning as `createUser`'s check.
+  if (updates.role !== undefined && !VALID_USER_ROLES.has(updates.role)) {
+    throw new Error(`Invalid role: ${updates.role}`);
+  }
+
+  if (updates.enabled !== undefined) setUserEnabled(user, updates.enabled);
   if (updates.role) user.role = updates.role;
   if (updates.maxApps !== undefined) user.maxApps = updates.maxApps;
   if (updates.email !== undefined) user.email = updates.email;
@@ -554,7 +817,8 @@ export type AuthenticateResult =
   | { status: 'ok'; token: string }
   | { status: 'mfa_required'; challengeToken: string; userId: string }
   | { status: 'invalid' }
-  | { status: 'disabled' };
+  | { status: 'disabled' }
+  | { status: 'awaiting_admin_password' };
 
 /**
  * Authenticate a user.
@@ -562,6 +826,9 @@ export type AuthenticateResult =
  * - Returns { status: 'mfa_required', challengeToken } when the user has MFA enabled.
  * - Returns { status: 'invalid' } for wrong credentials.
  * - Returns { status: 'disabled' } for suspended accounts.
+ * - Returns { status: 'awaiting_admin_password' } for an account created
+ *   through the scoped `users:create` path whose password has never been set
+ *   by an admin (DROP-130 Item 6 — see `User.createdByScope`).
  */
 export async function authenticateUser(username: string, password: string): Promise<AuthenticateResult> {
   if (!credentials || !jwtSecret || !config) {
@@ -575,6 +842,18 @@ export async function authenticateUser(username: string, password: string): Prom
 
   if (user.enabled === false) {
     return { status: 'disabled' };
+  }
+
+  // DROP-130 Item 6: an account minted through the scoped (non-admin)
+  // `users:create` path must not be able to log ITSELF in — that is the step
+  // that turns "can call POST /auth/users" into a full session, and from
+  // there into arbitrary code execution via POST /apps/:name/source (see
+  // `User.createdByScope`). Checked only after the password has already
+  // matched above, so this reveals nothing to anyone who has not already
+  // authenticated as this account — a wrong password on a scoped-created
+  // account still returns the same `invalid` status as any other account.
+  if (user.createdByScope === true) {
+    return { status: 'awaiting_admin_password' };
   }
 
   // Opportunistically upgrade legacy SHA-256 hashes to scrypt on successful login.
@@ -925,6 +1204,14 @@ export async function verifyAppMcpAccessToken(
     const user = getUserById(userId);
     if (!user || user.enabled === false) return null;
 
+    // DROP-130 Item 5: mcpAuthMiddleware never reaches authMiddleware, so this
+    // is the only gate an app-MCP token passes through. A token MINTED before
+    // the owner was suspended or force-reset must not keep authenticating for
+    // the rest of its 15-minute lifetime just because the account was later
+    // re-enabled or the password changed.
+    const iat = typeof p['iat'] === 'number' ? (p['iat'] as number) : undefined;
+    if (predatesInvalidationStamp(iat, user.credentialsInvalidBefore)) return null;
+
     const sid = p['sid'];
     if (typeof sid === 'string' && sid && isGrantDenied(sid)) return null;
 
@@ -984,6 +1271,14 @@ export async function verifyOAuthAccessToken(
     // verifyApiKey has done exactly this since DROP-075.
     const record = getUserById(userId);
     if (!record || record.enabled === false) return null;
+
+    // DROP-130 Item 5: mcpAuthMiddleware never reaches authMiddleware, so this
+    // is the only gate an OAuth access token passes through. A token MINTED
+    // before the owner was suspended or force-reset must not keep
+    // authenticating for the rest of its 15-minute lifetime just because the
+    // account was later re-enabled or the password changed.
+    const iat = typeof p['iat'] === 'number' ? (p['iat'] as number) : undefined;
+    if (predatesInvalidationStamp(iat, record.credentialsInvalidBefore)) return null;
 
     // Single-grant revocation, within this process lifetime. Not durable — see
     // the note above the denylist.
@@ -1110,7 +1405,11 @@ export async function issueRefreshToken(
  * Returns null if the presented token is unknown (already rotated/revoked,
  * or never issued) — the caller should treat this as a hard failure (RFC
  * 6749 §10.4 reuse-detection is a documented fast-follow, not implemented
- * here).
+ * here). Also returns null if the record's owner no longer exists or is
+ * disabled — checked HERE, not left to the caller (`oauth.ts`'s refresh
+ * route also checks `enabled`, but that runs after this function has already
+ * rotated the token; a caller-only check means containment rests on every
+ * caller staying careful, which is not a boundary).
  */
 export async function rotateRefreshToken(presented: string): Promise<{
   refreshToken: string;
@@ -1126,7 +1425,25 @@ export async function rotateRefreshToken(presented: string): Promise<{
   const index = records.findIndex((r) => r.tokenHash === tokenHash);
   if (index === -1) return null;
 
-  const { userId, clientId, sid, resource } = records[index];
+  const { userId, clientId, sid, resource, createdAt } = records[index];
+
+  // Checked BEFORE the record is consumed below. Doing this after the splice
+  // (and after a fresh record has already been minted and persisted) would
+  // still return null to the caller, but it would also burn the presented
+  // token — the disabled owner's outstanding grant would be silently
+  // destroyed on every retried attempt, and a fresh (unreturned, orphaned)
+  // record would accrete in the store on each one. Checking first leaves the
+  // record untouched, so a retry costs nothing and mutates nothing.
+  const owner = credentials.users.find((u) => u.id === userId);
+  if (!owner || owner.enabled === false) return null;
+
+  // DROP-130 Items 4 & 5: same rule, same reason — a refresh record minted
+  // BEFORE the owner was suspended or force-reset must not keep minting fresh
+  // access tokens after a later re-enable or password change. Checked here,
+  // before the record is consumed, for the same reason as the `enabled`
+  // check above.
+  if (predatesInvalidationStamp(createdAt, owner.credentialsInvalidBefore)) return null;
+
   const carried = sid ?? crypto.randomUUID();
   records.splice(index, 1);
 
@@ -1176,18 +1493,6 @@ export async function revokeRefreshToken(presented: string): Promise<boolean> {
   credentials.refreshTokens = records;
   await saveCredentials(config.credentialsPath, credentials);
   return true;
-}
-
-/** Revoke every refresh token issued to a user, and deny their live access tokens. */
-export async function revokeAllRefreshTokensForUser(userId: string): Promise<void> {
-  if (!credentials || !config) throw new Error('Auth not initialized');
-
-  const records = credentials.refreshTokens ?? [];
-  const filtered = records.filter((r) => r.userId !== userId);
-  if (filtered.length === records.length) return;
-
-  credentials.refreshTokens = filtered;
-  await saveCredentials(config.credentialsPath, credentials);
 }
 
 /**
@@ -1275,6 +1580,19 @@ export async function createApiKey(
  * granted something. A key with the right kind and no usable scope is not an
  * agent token in any meaningful sense, and admitting it would put a principal
  * with zero authority in front of every tool's own checks.
+ *
+ * DROP-130 MEDIUM-6: also requires the OWNER to still rank at least `user`.
+ * An agent token's OWN role is always `'none'` — the floor — so
+ * `minRole(key.role, owner.role)` inside `apiKeyAuthContext` is a permanent
+ * no-op for this entire class, and `clampControlPlaneScopes` only suppresses
+ * CONTROL-PLANE scopes, never the agent-grammar ones
+ * (`app:<name>:deploy|read`, `apps:create`) this class is built from. Without
+ * this check, an agent token minted while its owner was `user` kept full
+ * deploy/create-app authority forever, even after the owner was demoted to
+ * `readonly` — the clamp Item 3 exists to enforce silently did not apply to
+ * the one credential class most likely to be left running unattended.
+ * Mirrors the same floor `POST /auth/agent-tokens` already requires to MINT
+ * a token (`authMiddleware('user')`), applied again at USE time.
  */
 async function resolveAgentToken(
   bearerToken: string | undefined,
@@ -1283,24 +1601,39 @@ async function resolveAgentToken(
   const raw = apiKeyHeader ?? bearerToken;
   if (!raw) return null;
 
-  let key: ApiKey | null = null;
+  let verified: { key: ApiKey; owner: SafeUser | null } | null = null;
   try {
-    key = await verifyApiKey(raw);
+    verified = await verifyApiKey(raw);
   } catch {
     return null;
   }
-  if (!key || key.kind !== 'agent') return null;
+  if (!verified || verified.key.kind !== 'agent') return null;
 
-  const usable = (key.scopes ?? []).some((scope) => normalizeAgentScope(scope) !== null);
+  // A dangling/legacy ownerless agent token keeps today's behaviour — this
+  // is the same "keys with no ownerUserId keep today's behaviour exactly"
+  // invariant `apiKeyAuthContext` documents. In practice every agent token
+  // has an owner (POST /auth/agent-tokens always sets `requester?.userId`).
+  if (verified.owner && rankOf(verified.owner.role) < rankOf('user')) return null;
+
+  const usable = (verified.key.scopes ?? []).some((scope) => normalizeAgentScope(scope) !== null);
   if (!usable) return null;
 
-  return apiKeyAuthContext(key);
+  return apiKeyAuthContext(verified.key, verified.owner);
 }
 
 /**
- * Verify an API key
+ * Verify an API key.
+ *
+ * Returns the key together with its resolved owner (`null` for a legacy,
+ * ownerless key) — never a bare `ApiKey` — so every caller can hand both
+ * straight to `apiKeyAuthContext` without re-resolving the owner itself
+ * (DROP-130 Item 3). `apiKeyAuthContext` has no module-global fallback for a
+ * missing owner; threading it here is what makes that structural rather than
+ * a convention callers have to remember.
  */
-export async function verifyApiKey(key: string): Promise<ApiKey | null> {
+export async function verifyApiKey(
+  key: string
+): Promise<{ key: ApiKey; owner: SafeUser | null } | null> {
   if (!credentials || !config) {
     throw new Error('Auth not initialized');
   }
@@ -1322,9 +1655,16 @@ export async function verifyApiKey(key: string): Promise<ApiKey | null> {
   // their login while every key issued for them keeps authenticating as their
   // userId — retaining canAccess to all their apps, with no account left to
   // revoke it from. (Legacy keys have no owner and are unaffected.)
+  let owner: SafeUser | null = null;
   if (apiKey.ownerUserId) {
-    const owner = credentials.users.find((u) => u.id === apiKey.ownerUserId);
+    owner = getUserById(apiKey.ownerUserId);
     if (!owner || owner.enabled === false) {
+      return null;
+    }
+    // DROP-130 Items 4 & 5: a key minted BEFORE the owner was suspended or had
+    // their password force-reset must not keep authenticating just because
+    // the account was later re-enabled or the password changed.
+    if (predatesInvalidationStamp(apiKey.createdAt, owner.credentialsInvalidBefore)) {
       return null;
     }
   }
@@ -1339,7 +1679,29 @@ export async function verifyApiKey(key: string): Promise<ApiKey | null> {
     await saveCredentials(config.credentialsPath, credentials);
   }
 
-  return apiKey;
+  return { key: apiKey, owner };
+}
+
+/**
+ * Suppress control-plane capability scopes (e.g. `users:create`) once the
+ * owner-clamped role ranks below `user`.
+ *
+ * `requireCapability`'s scope arm (`auth.role === 'admin' ||
+ * auth.scopes?.includes(cap)`) never consults role, so clamping `role` alone
+ * leaves the whole capability surface frozen: a key holding `users:create`
+ * whose owner was demoted below `user` would still reach `POST /auth/users`.
+ *
+ * Must NOT touch the agent-scope grammar (`app:<name>:deploy|read`,
+ * `apps:create` — see `agent-scopes.ts`), which is DESIGNED to work at
+ * `role: 'none'`. Every agent token carries `role: 'none'` by construction,
+ * so suppressing that grammar here would break every agent token.
+ */
+function clampControlPlaneScopes(
+  scopes: string[] | undefined,
+  clampedRole: AuthContext['role']
+): string[] | undefined {
+  if (!scopes || rankOf(clampedRole) >= rankOf('user')) return scopes;
+  return scopes.filter((scope) => normalizeAgentScope(scope) !== null);
 }
 
 /**
@@ -1353,19 +1715,55 @@ export async function verifyApiKey(key: string): Promise<ApiKey | null> {
  * discarding any per-user `maxApps` override), and apps the key created were
  * owned by an identity no human could log in as.
  *
- * Legacy keys (no `ownerUserId`) keep the old behaviour so the apps they
- * already own remain reachable.
+ * DROP-130 Item 3: for an OWNED key, `role`, `username` and control-plane
+ * `scopes` are now derived from the owner at REQUEST time, never frozen at
+ * mint time — the same reason the JWT branch below re-reads `userRecord.role`
+ * on every request instead of trusting the claim. A key can never outrank
+ * the human it acts for.
+ *
+ * Legacy keys (no `ownerUserId`) keep the old behaviour EXACTLY — this is
+ * deliberate, not an oversight. `DROP_API_KEY` (injected into every tenant
+ * container, `platform.ts`) and the CLI's `cli-local` key (also `platform.ts`,
+ * itself minted with `role: 'admin'`) are both minted ownerless, and clamping
+ * either would either brick a tenant container's ability to call back into
+ * DROP or brick the CLI outright. This narrows finding A rather than
+ * eliminating it — legacy unowned keys, including the unowned admin
+ * `cli-local` key, stay unclamped. See the DROP-130 plan's Risks section.
  */
-function apiKeyAuthContext(key: ApiKey): AuthContext {
+function apiKeyAuthContext(key: ApiKey, owner: SafeUser | null): AuthContext {
+  if (!key.ownerUserId) {
+    return {
+      userId: key.id,
+      username: key.name,
+      role: key.role,
+      authMethod: 'apikey',
+      scopes: key.scopes,
+      // The KEY, not its owner. Several keys can resolve to one human, and each
+      // must be metered and attributed separately — that is the point of issuing
+      // more than one. Ownership still flows through userId above.
+      principalId: `key:${key.id}`,
+      ...(key.kind ? { kind: key.kind } : {}),
+    };
+  }
+
+  // A dangling ownerUserId fails CLOSED to 'none', never to key.role.
+  // verifyApiKey already refuses a missing/disabled owner outright, so this
+  // branch is unreached through the real auth paths today — but it must be a
+  // REAL branch here too, or the fail-closed behaviour is merely unreached
+  // rather than structurally impossible for a future/direct caller.
+  const ownerRole = owner?.role ?? 'none';
+  const role = minRole(key.role, ownerRole);
+
   return {
-    userId: key.ownerUserId ?? key.id,
-    username: key.name,
-    role: key.role,
+    userId: key.ownerUserId,
+    // Names the accountable human, not the credential. Safe only because
+    // Item 1 already landed `principalId` (below) on both the activity log
+    // and the security audit log, so the credential itself stays
+    // identifiable even though the row no longer names it here.
+    username: owner?.username ?? key.name,
+    role,
     authMethod: 'apikey',
-    scopes: key.scopes,
-    // The KEY, not its owner. Several keys can resolve to one human, and each
-    // must be metered and attributed separately — that is the point of issuing
-    // more than one. Ownership still flows through userId above.
+    scopes: clampControlPlaneScopes(key.scopes, role),
     principalId: `key:${key.id}`,
     ...(key.kind ? { kind: key.kind } : {}),
   };
@@ -1400,20 +1798,35 @@ export async function deleteApiKeysByName(name: string): Promise<void> {
 }
 
 /**
- * List all API keys (without revealing the actual keys)
+ * List all API keys (without revealing the actual keys).
+ *
+ * DROP-130 MEDIUM-7: also derives `invalidated: true` for a key that
+ * predates its owner's `credentialsInvalidBefore` stamp. `verifyApiKey`
+ * already refuses such a key outright, but this list had no notion of the
+ * stamp at all — so `GET /auth/api-keys` (and the dashboard behind it) kept
+ * showing a killed key as an ordinary live one, and "revoke the leaked key"
+ * via suspend/reset looked like a no-op. Ownerless keys are unaffected (no
+ * owner to compare against — narrows the same way the clamp itself does).
  */
-export function listApiKeys(): Omit<ApiKey, 'keyHash'>[] {
+export function listApiKeys(): Array<Omit<ApiKey, 'keyHash'> & { invalidated?: true }> {
   if (!credentials) {
     throw new Error('Auth not initialized');
   }
 
-  return credentials.apiKeys.map(({ keyHash: _, ...key }) => key);
+  const users = credentials.users;
+  return credentials.apiKeys.map(({ keyHash: _, ...key }) => {
+    const owner = key.ownerUserId ? users.find((u) => u.id === key.ownerUserId) : undefined;
+    if (owner && predatesInvalidationStamp(key.createdAt, owner.credentialsInvalidBefore)) {
+      return { ...key, invalidated: true as const };
+    }
+    return key;
+  });
 }
 
 /**
  * List all users (without revealing password hashes or MFA secrets)
  */
-export function listUsers(): Omit<User, 'passwordHash' | 'mfaSecret'>[] {
+export function listUsers(): SafeUser[] {
   if (!credentials) {
     throw new Error('Auth not initialized');
   }
@@ -1424,7 +1837,7 @@ export function listUsers(): Omit<User, 'passwordHash' | 'mfaSecret'>[] {
 /**
  * Get a user by username (without password hash or MFA secret)
  */
-export function getUser(username: string): Omit<User, 'passwordHash' | 'mfaSecret'> | null {
+export function getUser(username: string): SafeUser | null {
   if (!credentials) return null;
   const user = credentials.users.find((u) => u.username === username);
   if (!user) return null;
@@ -1432,7 +1845,7 @@ export function getUser(username: string): Omit<User, 'passwordHash' | 'mfaSecre
   return safe;
 }
 
-export function getUserById(userId: string): Omit<User, 'passwordHash' | 'mfaSecret'> | null {
+export function getUserById(userId: string): SafeUser | null {
   if (!credentials) return null;
   const user = credentials.users.find((u) => u.id === userId);
   if (!user) return null;
@@ -1486,6 +1899,11 @@ export function authMiddleware(requiredRole?: 'admin' | 'user' | 'readonly') {
     }
 
     let authContext: AuthContext | null = null;
+    // DROP-130 HIGH-3: only set on the JWT-SUCCESS path below — never for a
+    // Bearer-presented API key falling through the `else` branch, which has
+    // no `iat` claim of this shape at all. Read alongside `jwtUserRecord`
+    // further down.
+    let jwtIssuedAt: number | undefined;
 
     // Try JWT authentication
     const authHeader = c.req.header('Authorization');
@@ -1523,14 +1941,15 @@ export function authMiddleware(requiredRole?: 'admin' | 'user' | 'readonly') {
           // An interactive session IS the human — nothing finer to key on.
           principalId: `jwt:${payload.sub}`,
         };
+        jwtIssuedAt = payload.iat;
       } else {
         // Not a valid session JWT — accept a Bearer-presented API key too, so the
         // conventional `Authorization: Bearer <key>` works (keys are also accepted
         // via X-API-Key below). JWT is tried first, so real sessions keep their
         // semantics; only a non-JWT Bearer value is looked up as an API key.
-        const key = await verifyApiKey(token);
-        if (key) {
-          authContext = apiKeyAuthContext(key);
+        const verified = await verifyApiKey(token);
+        if (verified) {
+          authContext = apiKeyAuthContext(verified.key, verified.owner);
         }
       }
     }
@@ -1539,9 +1958,9 @@ export function authMiddleware(requiredRole?: 'admin' | 'user' | 'readonly') {
     if (!authContext) {
       const apiKey = c.req.header('X-API-Key');
       if (apiKey) {
-        const key = await verifyApiKey(apiKey);
-        if (key) {
-          authContext = apiKeyAuthContext(key);
+        const verified = await verifyApiKey(apiKey);
+        if (verified) {
+          authContext = apiKeyAuthContext(verified.key, verified.owner);
         }
       }
     }
@@ -1554,42 +1973,81 @@ export function authMiddleware(requiredRole?: 'admin' | 'user' | 'readonly') {
       );
     }
 
-    // Force-password-change gate (JWT only — API keys are programmatic and exempt)
+    // Account-liveness check (JWT only — API keys are programmatic and exempt).
+    //
+    // `jwtUserRecord` is populated ONLY on the JWT path, and that is
+    // load-bearing, not incidental (DROP-130 Item 5) — do not add a lookup
+    // here for any other `authMethod`. For an ownerless key `authContext.userId`
+    // is the KEY's own id, not a real user id, so an unconditional
+    // `getUserById` lookup would 401 every ownerless key: `DROP_API_KEY` in
+    // every tenant container and the `cli-local` CLI key. For an OWNED key it
+    // IS a real user id, so running the `mustChangePassword` 403 below against
+    // it would re-arm the exact danger this item exists to avoid: an admin's
+    // "Reset password" click (`resetUserPassword`) would then instantly 403
+    // every CI key and agent token that user owns, with no programmatic
+    // recovery — a key cannot change its owner's password. Containment for
+    // those non-JWT credentials is instead handled by `credentialsInvalidBefore`
+    // inside `verifyApiKey` / `rotateRefreshToken` / `verifyOAuthAccessToken` /
+    // `verifyAppMcpAccessToken` (Items 4 & 5).
+    let jwtUserRecord: SafeUser | null = null;
     if (authContext.authMethod === 'jwt') {
-      const userRecord = getUserById(authContext.userId);
+      jwtUserRecord = getUserById(authContext.userId);
       // A session JWT lives 24 HOURS and carries its role in the claim, so
       // without this a deleted, suspended or demoted account kept full access
       // for a day — while the OAuth path is now revoked in milliseconds.
       // Making one immediate and leaving the other is worse than doing
       // neither, because it reads as covered.
-      if (!userRecord || userRecord.enabled === false) {
+      if (!jwtUserRecord || jwtUserRecord.enabled === false) {
+        return c.json(error(ErrorCodes.UNAUTHORIZED, 'Account is no longer active'), 401);
+      }
+      // DROP-130 HIGH-3: a session JWT lives 24 HOURS — the credential class
+      // most likely to be stolen — and until now was exempt from
+      // `credentialsInvalidBefore` entirely, which made `suspendUser`'s
+      // promise ("every credential that already existed stops
+      // authenticating") false for it: suspend -> unsuspend handed a stolen
+      // session back verbatim for the rest of its 24h life. `jwtIssuedAt` is
+      // `payload.iat`, set by `issueSessionJwt`'s `.setIssuedAt()` — Unix
+      // SECONDS, which `predatesInvalidationStamp` already accepts (see the
+      // two OAuth call sites).
+      if (predatesInvalidationStamp(jwtIssuedAt, jwtUserRecord.credentialsInvalidBefore)) {
         return c.json(error(ErrorCodes.UNAUTHORIZED, 'Account is no longer active'), 401);
       }
       // Role from the RECORD, not the claim — a demotion must bite now.
-      authContext.role = userRecord.role as AuthContext['role'];
-      if (userRecord.mustChangePassword) {
-        const p = c.req.path || '';
-        const isExempt =
-          (c.req.method === 'PUT' && p.endsWith('/auth/password')) ||
-          (c.req.method === 'GET' && p.endsWith('/auth/me'));
-        if (!isExempt) {
-          return c.json(
-            error(ErrorCodes.MUST_CHANGE_PASSWORD, 'Password change required before accessing this resource.'),
-            403
-          );
-        }
+      authContext.role = jwtUserRecord.role as AuthContext['role'];
+    }
+
+    // Force-password-change gate. Structurally separate from the 401 above —
+    // see the comment on `jwtUserRecord`: it stays `null` for every
+    // non-JWT-authenticated request, so this remains JWT-only in practice
+    // (onboarding's `mustChangePassword`, from `createUser`/signup, is meant
+    // to be JWT-only; the split is what keeps it that way rather than an
+    // accident of what happened to assign the variable).
+    if (jwtUserRecord?.mustChangePassword) {
+      const p = c.req.path || '';
+      const isExempt =
+        (c.req.method === 'PUT' && p.endsWith('/auth/password')) ||
+        (c.req.method === 'GET' && p.endsWith('/auth/me'));
+      if (!isExempt) {
+        return c.json(
+          error(ErrorCodes.MUST_CHANGE_PASSWORD, 'Password change required before accessing this resource.'),
+          403
+        );
       }
     }
 
     // Check role if required
     if (requiredRole) {
-      const roleHierarchy: Record<string, number> = { admin: 3, user: 2, readonly: 1, none: 0 };
-      // Defensive `?? 0`: a 'none' (scope-only) role, or any malformed/unknown
-      // role that somehow ends up on a persisted record, ranks 0 rather than
-      // `undefined` — `undefined < roleHierarchy[requiredRole]` is always
-      // `false`, which would have let an unrecognized role pass every gate.
-      const rank = (roleHierarchy as Record<string, number>)[authContext.role] ?? 0;
-      if (rank < roleHierarchy[requiredRole]) {
+      // `rankOf()` on BOTH sides (DROP-130 HIGH-2) — not a bare
+      // `roleHierarchy[role] ?? 0` lookup. A bare lookup resolves an
+      // inherited `Object.prototype` name (`toString`, `constructor`, …) to
+      // a truthy function via the prototype chain, so `?? 0` never fires:
+      // `roleHierarchy['toString']` is `Function.prototype.toString`, and
+      // `fn < 3` is `NaN < 3` — always `false` — so a record with
+      // `role: 'toString'` passed this gate on every admin route with no
+      // 403. `rankOf()`'s `hasOwnProperty` guard is what `minRole()` already
+      // relies on for exactly this reason; this is the one site that had not
+      // been switched over to it.
+      if (rankOf(authContext.role) < rankOf(requiredRole)) {
         return c.json(
           error(ErrorCodes.UNAUTHORIZED, `Insufficient permissions. Required role: ${requiredRole}`),
           403
@@ -1739,43 +2197,12 @@ export function requireCapability(cap: string) {
   };
 }
 
-/**
- * Optional auth middleware - doesn't require auth but parses it if present
- */
-export function optionalAuthMiddleware() {
-  return async (c: Context, next: Next): Promise<Response | void> => {
-    // Try to parse auth but don't require it
-    const authHeader = c.req.header('Authorization');
-    if (authHeader?.startsWith('Bearer ')) {
-      const token = authHeader.substring(7);
-      const payload = await verifyJwt(token);
-      // Reject challenge tokens — never treat them as session tokens
-      if (payload && (payload as unknown as Record<string, unknown>)['typ'] !== 'mfa_challenge') {
-        c.set('auth', {
-          userId: payload.sub,
-          username: payload.username,
-          role: payload.role,
-          principalId: `jwt:${payload.sub}`,
-          authMethod: 'jwt',
-        });
-      } else if (!payload) {
-        // Not a valid JWT — accept a Bearer-presented API key too (mirrors
-        // authMiddleware). A valid-but-challenge token is intentionally skipped.
-        const key = await verifyApiKey(token);
-        if (key) {
-          c.set('auth', apiKeyAuthContext(key));
-        }
-      }
-    }
-
-    const apiKey = c.req.header('X-API-Key');
-    if (apiKey && !c.get('auth')) {
-      const key = await verifyApiKey(apiKey);
-      if (key) {
-        c.set('auth', apiKeyAuthContext(key));
-      }
-    }
-
-    return next();
-  };
-}
+// DROP-130 LOW-9: `optionalAuthMiddleware` was deleted here. It had no
+// non-test callers (confirmed: not mounted anywhere in server.ts, not
+// imported by any production module), its JWT branch trusted a 24h claim
+// outright with no `enabled` re-check, no role re-source from the live
+// record, and no `credentialsInvalidBefore` stamp check — so it bypassed
+// HIGH-2, HIGH-3 and Item 5 simultaneously while looking maintained (this
+// branch had touched it three times). `revokeAllRefreshTokensForUser` was
+// deleted for the identical reason (dead code carrying a false safety
+// claim) — see Item 4.

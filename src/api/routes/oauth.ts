@@ -45,6 +45,7 @@ import {
   rotateRefreshToken,
   revokeRefreshToken,
   getUserById,
+  predatesInvalidationStamp,
   type AuthContext,
   type User,
 } from '../middleware/auth';
@@ -359,6 +360,21 @@ oauth.post('/token', async (c) => {
 
     const user = getUserById(record.userId) as User | null;
     if (!user) return tokenError('invalid_grant', 'User no longer exists');
+    // DROP-130 MEDIUM-5: this branch checked `!user` but not `enabled` — the
+    // `refresh_token` branch below has checked `enabled` since DROP-075. An
+    // authorization code minted before suspension could still be exchanged
+    // after, and the refresh token it mints has its OWN fresh `createdAt`,
+    // so every later `predatesInvalidationStamp` check on that refresh token
+    // would pass forever: a pre-incident credential laundered into one that
+    // outlives the incident permanently.
+    if (user.enabled === false) {
+      return tokenError('invalid_grant', 'Account is disabled');
+    }
+    // Same reasoning, for the stamp itself: a code minted BEFORE containment
+    // must not be exchangeable after, even within its own 60s TTL.
+    if (predatesInvalidationStamp(record.createdAt, user.credentialsInvalidBefore)) {
+      return tokenError('invalid_grant', 'Authorization code predates a credential invalidation');
+    }
 
     // One sid per GRANT, minted here at code exchange and carried through every
     // later refresh. This is the stable half of principalId: without it the

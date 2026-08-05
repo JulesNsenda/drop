@@ -13,10 +13,21 @@ import type { AuthContext } from '../middleware/auth';
 
 const logged: Array<Record<string, unknown>> = [];
 
+// Also stubs `logActivityFor` (unused by this suite today): DROP-130 doubled
+// the module's export surface, and the MCP tools are the most likely next
+// place to gain an attributed row — a factory naming only `tryLogActivity`
+// would then throw `logActivityFor is not a function` from inside a tool
+// handler, reading as an unrelated failure.
+// Also stubs `logActivityFor` (unused by this suite today): DROP-130 doubled
+// the module's export surface, and the MCP tools are the most likely next
+// place to gain an attributed row — a factory naming only `tryLogActivity`
+// would then throw `logActivityFor is not a function` from inside a tool
+// handler, reading as an unrelated failure.
 jest.mock('../../managers/activity', () => ({
   tryLogActivity: async (entry: Record<string, unknown>) => {
     logged.push(entry);
   },
+  logActivityFor: jest.fn(),
 }));
 
 const apps = new Map<string, { name: string; userId?: string; status?: string }>();

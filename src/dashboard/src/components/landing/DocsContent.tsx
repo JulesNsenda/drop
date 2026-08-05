@@ -880,9 +880,10 @@ fs.appendFileSync(\`\${logDir}/logs/app.json\`, JSON.stringify(logEntry) + '\\n'
         </p>
         <Callout>
           The connection is scoped to your DROP user — Claude only sees and touches{' '}
-          <strong style={{ color: 'var(--text)' }}>your</strong> apps, exactly like a <code>user</code>-role API key.
-          There is no <code>set_secrets</code> or <code>remove_app</code> tool, so a connected agent can never read
-          secrets or delete apps through MCP.
+          <strong style={{ color: 'var(--text)' }}>your</strong> apps, exactly like a <code>user</code>-role API key
+          (whose role is itself a ceiling capped by its owner's account role, never a fixed grant). There is no{' '}
+          <code>set_secrets</code> or <code>remove_app</code> tool, so a connected agent can never read secrets or
+          delete apps through MCP.
         </Callout>
 
         <h3 style={h3Style}>4. Use it</h3>
@@ -899,7 +900,8 @@ fs.appendFileSync(\`\${logDir}/logs/app.json\`, JSON.stringify(logEntry) + '\\n'
           <strong style={{ color: 'var(--text)' }}>Claude Desktop</strong>, and{' '}
           <strong style={{ color: 'var(--text)' }}>Cursor</strong> — skip OAuth and authenticate with a DROP API key.
           Mint a <code>user</code>-role key in the dashboard (never an admin key — a <code>user</code> key is
-          automatically scoped to the apps it creates).
+          automatically scoped to the apps it creates). A key's role is a ceiling capped by its owner's own account
+          role, not a fixed grant.
         </p>
         <CodeBlock
           label="Claude Code"

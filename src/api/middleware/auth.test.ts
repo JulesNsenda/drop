@@ -17,8 +17,10 @@ import {
   listUsers,
   isAuthEnabled,
   authMiddleware,
-  optionalAuthMiddleware,
   resetAuth,
+  minRole,
+  resetUserPassword,
+  roleHierarchy,
 } from './auth';
 import { getTestToken } from '../__testutils__/auth';
 
@@ -176,6 +178,16 @@ describe('Auth Middleware', () => {
       expect(adminUser.role).toBe('admin');
       expect(readonlyUser.role).toBe('readonly');
     });
+
+    it('DROP-130 Item 6: does not stamp createdByScope by default', async () => {
+      const user = await createUser('unmarked-user', 'password123', 'user');
+      expect(user.createdByScope).toBeUndefined();
+    });
+
+    it('DROP-130 Item 6: stamps createdByScope only when the caller explicitly requests it', async () => {
+      const user = await createUser('marked-user', 'password123', 'user', undefined, true, true);
+      expect(user.createdByScope).toBe(true);
+    });
   });
 
   describe('authenticateUser', () => {
@@ -210,6 +222,31 @@ describe('Auth Middleware', () => {
     it('should return status invalid for non-existent user', async () => {
       const result = await authenticateUser('nonexistent', 'password');
       expect(result.status).toBe('invalid');
+    });
+
+    it('DROP-130 Item 6: refuses login for a createdByScope account, even with the correct password', async () => {
+      await createUser('scoped-account', 'correctpassword2', 'user', undefined, true, true);
+      const result = await authenticateUser('scoped-account', 'correctpassword2');
+      expect(result.status).toBe('awaiting_admin_password');
+    });
+
+    it('DROP-130 Item 6: a wrong password on a createdByScope account still reports plain invalid (no enumeration)', async () => {
+      await createUser('scoped-account-2', 'correctpassword3', 'user', undefined, true, true);
+      const result = await authenticateUser('scoped-account-2', 'wrongpassword');
+      expect(result.status).toBe('invalid');
+    });
+
+    it('DROP-130 Item 6: resetUserPassword clears the marker, and login then succeeds', async () => {
+      const user = await createUser('scoped-account-3', 'correctpassword4', 'user', undefined, true, true);
+
+      const blocked = await authenticateUser('scoped-account-3', 'correctpassword4');
+      expect(blocked.status).toBe('awaiting_admin_password');
+
+      const reset = await resetUserPassword(user.id, 'admin-chosen-password');
+      expect(reset).toBe(true);
+
+      const afterReset = await authenticateUser('scoped-account-3', 'admin-chosen-password');
+      expect(afterReset.status).toBe('ok');
     });
   });
 
@@ -282,8 +319,10 @@ describe('Auth Middleware', () => {
       const verified = await verifyApiKey(key);
 
       expect(verified).toBeDefined();
-      expect(verified!.name).toBe('verify-key');
-      expect(verified!.role).toBe('admin');
+      expect(verified!.key.name).toBe('verify-key');
+      expect(verified!.key.role).toBe('admin');
+      // Ownerless key — no owner to resolve.
+      expect(verified!.owner).toBeNull();
     });
 
     it('should return null for invalid API key', async () => {
@@ -510,68 +549,117 @@ describe('Auth Middleware', () => {
 
       expect(next).toHaveBeenCalled();
     });
+
+    it('DROP-130 HIGH-2: rejects a role that collides with an inherited Object.prototype name', async () => {
+      // `roleHierarchy['toString']` resolves through the prototype chain to
+      // `Function.prototype.toString` — truthy, so a bare
+      // `roleHierarchy[role] ?? 0` lookup never falls back to 0, and
+      // `NaN < roleHierarchy['admin']` (a function coerced to a number) is
+      // always false: a corrupted `role: 'toString'` record would pass
+      // authMiddleware('admin') on every admin route. An ownerless key
+      // returns `role: key.role` verbatim (see `apiKeyAuthContext`), so
+      // corrupting the stored key record reaches the vulnerable comparison
+      // directly.
+      const { key, apiKey } = await createApiKey('corrupt-role-key', 'user');
+      const rawStore = JSON.parse(await fs.readFile(credentialsPath, 'utf-8'));
+      const rec = (rawStore.apiKeys as Array<Record<string, unknown>>).find(
+        (k) => k.id === apiKey.id
+      );
+      expect(rec).toBeDefined();
+
+      for (const badRole of ['toString', 'constructor', 'valueOf']) {
+        (rec as Record<string, unknown>).role = badRole;
+        await fs.writeFile(credentialsPath, JSON.stringify(rawStore));
+        resetAuth();
+        await initializeAuth({ credentialsPath, enableJwt: true, enableApiKeys: true });
+
+        const { c, next } = createMockContext({ 'X-API-Key': key });
+        const middleware = authMiddleware('admin');
+        await middleware(c as never, next);
+
+        expect(next).not.toHaveBeenCalled();
+      }
+    });
   });
 
-  describe('optionalAuthMiddleware', () => {
-    let validToken: string;
+  // DROP-130 LOW-9: `optionalAuthMiddleware` (and its describe block here)
+  // was deleted — dead code with no non-test callers whose JWT branch
+  // bypassed HIGH-2, HIGH-3 and Item 5 simultaneously. See its removal note
+  // in auth.ts.
+});
 
-    beforeEach(async () => {
-      jest.spyOn(console, 'log').mockImplementation();
-      resetAuth();
-      await initializeAuth({
-        credentialsPath,
-        enableJwt: true,
-        enableApiKeys: true,
-      });
-      await createUser('testuser', 'password123', 'user');
-      validToken = await getTestToken('testuser', 'password123');
-    });
+/**
+ * minRole — the module-scope role ranking, hoisted so authMiddleware's own
+ * gate and the clamp Item 3 threads through apiKeyAuthContext read exactly
+ * one table.
+ *
+ * Both directions matter: agent tokens deliberately mint `role: 'none'`
+ * BELOW their owner's role, so an "owner wins"/highest-rank implementation
+ * would promote every admin-minted agent token to `admin`, skip
+ * `canAccessScoped`'s rank-0 branch, auto-pass `requireCapability`, and
+ * dissolve the SEC-5 fence. Only a genuine "lower of the two, in either
+ * argument order" implementation is safe to build Item 3 on.
+ */
+describe('minRole', () => {
+  it('clamps a HIGH-standing key down to its LOW-standing owner', () => {
+    expect(minRole('admin', 'readonly')).toBe('readonly');
+  });
 
-    afterEach(() => {
-      jest.restoreAllMocks();
-    });
+  it('clamps a LOW-standing key down even when the owner outranks it', () => {
+    // The direction a naive "return the higher rank" bug would get backwards.
+    expect(minRole('none', 'admin')).toBe('none');
+  });
 
-    function createMockContext(headers: Record<string, string> = {}): {
-      c: { req: { header: (name: string) => string | undefined }; set: jest.Mock; get: jest.Mock };
-      next: jest.Mock;
-    } {
-      let authValue: unknown = undefined;
-      return {
-        c: {
-          req: {
-            header: (name: string) => headers[name],
-          },
-          set: jest.fn((key: string, value: unknown) => {
-            if (key === 'auth') authValue = value;
-          }),
-          get: jest.fn((key: string) => key === 'auth' ? authValue : undefined),
-        },
-        next: jest.fn().mockResolvedValue(undefined),
-      };
+  it('is order-independent — the lower rank wins regardless of argument position', () => {
+    expect(minRole('readonly', 'admin')).toBe('readonly');
+    expect(minRole('user', 'none')).toBe('none');
+    expect(minRole('none', 'user')).toBe('none');
+  });
+
+  it('returns the shared rank when both roles tie', () => {
+    expect(minRole('user', 'user')).toBe('user');
+  });
+
+  it('clamps an unrecognized/garbage role to a REAL bottom role, not an echoed string', () => {
+    // Mirrors authMiddleware's own defensive `?? 0`: a role that isn't in
+    // `roleHierarchy` at all must rank as the LOWEST standing, never as
+    // unranked-and-therefore-undefeated. `undefined < roleHierarchy[x]` is
+    // always `false`, so a naive rank lookup without the `?? 0` fallback
+    // would let garbage win instead of losing.
+    //
+    // Normalizing to 'none' (rather than echoing the garbage string back) is
+    // load-bearing, not cosmetic: `canAccessScoped`, `upload-preflight.ts`
+    // and `requireCapability`'s scope arm all gate on `role === 'none'` by
+    // STRING equality. An echoed-back garbage string would rank 0 but fail
+    // every one of those equality checks, falling through to their LESS
+    // restrictive branch — the opposite of "clamped down".
+    expect(minRole('bogus-role', 'admin')).toBe('none');
+    expect(minRole('admin', 'bogus-role')).toBe('none');
+    // A malformed role is even beneath 'readonly' (rank 1), not just below
+    // 'admin' — proves it's genuinely treated as rank 0, not merely "low".
+    expect(minRole('bogus-role', 'readonly')).toBe('none');
+  });
+
+  it('does not fall for Object.prototype-inherited property names', () => {
+    // `roleHierarchy['toString']` resolves via the prototype chain to a
+    // (truthy, non-numeric) function unless the lookup is an own-property
+    // check — which would skip the `?? 0` fallback and rank it as
+    // "unranked-and-undefeated" instead of clamping it to the bottom.
+    expect(minRole('toString', 'readonly')).toBe('none');
+    expect(minRole('constructor', 'admin')).toBe('none');
+  });
+});
+
+/** DROP-130 LOW-9: exported AND module-scope means any importer could otherwise mutate the one table every rank check reads. */
+describe('roleHierarchy', () => {
+  it('is frozen — a mutation attempt has no effect', () => {
+    expect(Object.isFrozen(roleHierarchy)).toBe(true);
+    try {
+      (roleHierarchy as Record<string, number>).admin = 0;
+    } catch {
+      // Strict mode throws on a frozen-object write — either way, the value
+      // below must not have changed.
     }
-
-    it('should parse auth if present', async () => {
-      const { c, next } = createMockContext({
-        Authorization: `Bearer ${validToken}`,
-      });
-
-      const middleware = optionalAuthMiddleware();
-      await middleware(c as never, next);
-
-      expect(next).toHaveBeenCalled();
-      expect(c.set).toHaveBeenCalledWith('auth', expect.objectContaining({
-        username: 'testuser',
-      }));
-    });
-
-    it('should continue without auth if not present', async () => {
-      const { c, next } = createMockContext({});
-
-      const middleware = optionalAuthMiddleware();
-      await middleware(c as never, next);
-
-      expect(next).toHaveBeenCalled();
-      expect(c.set).not.toHaveBeenCalled();
-    });
+    expect(roleHierarchy.admin).toBe(3);
   });
 });

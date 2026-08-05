@@ -164,16 +164,41 @@ describe('principalId', () => {
   });
 
   describe('revocation', () => {
-    it('kills an OAuth grant when the user is SUSPENDED', async () => {
+    it('kills an OAuth grant when the user is SUSPENDED — via the enabled check itself, not the purge', async () => {
       // Suspension blocked login and purged API keys, but every outstanding
       // refresh token kept minting fresh 15-minute access tokens forever:
       // refresh records carry no expiry and the refresh path never checked
       // `enabled`. revokeAllRefreshTokensForUser existed for exactly this and
       // had no caller anywhere.
+      //
+      // `suspendUser` ALSO purges outstanding refresh records today — but
+      // that purge is what Item 4 removes (un-suspending must not silently
+      // resurrect every credential live at suspension time), and this test
+      // must keep passing once it's gone. Issuing the refresh token AFTER
+      // suspension proves `rotateRefreshToken`'s own `enabled` check on its
+      // own terms: this record was never present at suspension time, so no
+      // purge — present or future-removed — could be why rotation fails.
       const user = await createUser('eve', 'password123', 'user');
-      const refreshToken = await issueRefreshToken(user.id, 'client-1', 'sid-e');
 
       await suspendUser(user.id);
+      const refreshToken = await issueRefreshToken(user.id, 'client-1', 'sid-e');
+
+      expect(await rotateRefreshToken(refreshToken)).toBeNull();
+    });
+
+    it('rejects rotation when the record still exists but its owner is disabled', async () => {
+      // The exact shape suspendUser's purge currently short-circuits: today
+      // that purge deletes the record, so rotateRefreshToken hits its
+      // `index === -1` early return before ever reaching the `enabled` check.
+      // `updateUser({enabled: false})` disables the account without touching
+      // refreshTokens at all (see "covers the dashboard disable path, which
+      // purges nothing" above), so the record here definitely survives —
+      // pinning that rotation still fails because the OWNER is disabled, the
+      // exact primitive Item 4 needs once suspendUser stops purging too.
+      const user = await createUser('frank2', 'password123', 'user');
+      const refreshToken = await issueRefreshToken(user.id, 'client-1', 'sid-f2');
+
+      await updateUser(user.id, { enabled: false });
 
       expect(await rotateRefreshToken(refreshToken)).toBeNull();
     });
