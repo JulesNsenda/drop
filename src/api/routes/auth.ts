@@ -392,11 +392,45 @@ auth.post('/users', authMiddleware(), requireCapability('users:create'), async c
 auth.put('/users/:id', authMiddleware('admin'), async c => {
   const id = c.req.param('id');
   if (!id) return c.json(error(ErrorCodes.VALIDATION_ERROR, 'Missing id'), 400);
-  const body = await c.req.json<{ enabled?: boolean; role?: 'admin' | 'user' | 'readonly' }>();
+  const body = await c.req.json<{
+    enabled?: boolean;
+    role?: 'admin' | 'user' | 'readonly';
+    maxApps?: number;
+    email?: string;
+  }>();
 
-  const updated = await updateUser(id, body);
-  if (!updated) {
-    return c.json(error(ErrorCodes.NOT_FOUND, 'User not found'), 404);
+  // `role` and `maxApps` are only TypeScript annotations on `body` — validate
+  // at runtime, or an arbitrary string / non-numeric value is persisted onto
+  // the user record. Same shape as POST /auth/api-keys' `role` check. This
+  // matters beyond this route: a corrupted role ranks 0 under `roleHierarchy`'s
+  // defensive `?? 0`, which would clamp every API key this user owns down to
+  // nothing the moment their standing is derived from it.
+  if (body.role !== undefined && !['admin', 'user', 'readonly'].includes(body.role)) {
+    throw new ValidationError('role must be one of: admin, user, readonly');
+  }
+  if (
+    body.maxApps !== undefined &&
+    !(typeof body.maxApps === 'number' && Number.isInteger(body.maxApps) && body.maxApps >= 0)
+  ) {
+    throw new ValidationError('maxApps must be a non-negative integer');
+  }
+
+  try {
+    const updated = await updateUser(id, body);
+    if (!updated) {
+      return c.json(error(ErrorCodes.NOT_FOUND, 'User not found'), 404);
+    }
+  } catch (err) {
+    // updateUser throws a plain Error for exactly one business-rule guard
+    // (mirroring deleteUser's own last-admin guard) — match that specific
+    // message and translate it to 400. Anything else (e.g. the credentials
+    // write itself failing) is an infrastructure error, not bad input, and
+    // must fall through to the global error handler rather than be reported
+    // to the client as a VALIDATION_ERROR with the raw message attached.
+    if (err instanceof Error && err.message === 'Cannot demote the last admin account') {
+      return c.json(error(ErrorCodes.VALIDATION_ERROR, err.message), 400);
+    }
+    throw err;
   }
 
   return c.json(success({ message: 'User updated' }));
