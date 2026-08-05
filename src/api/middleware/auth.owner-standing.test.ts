@@ -123,6 +123,55 @@ describe('owner-derived API-key standing', () => {
     });
   });
 
+  describe('DROP-130 MEDIUM-6: agent tokens are not exempt from the owner-standing clamp', () => {
+    it('a user-owned agent token loses MCP admission once its owner is demoted below user', async () => {
+      // An agent token's OWN role is always 'none' — the floor — so
+      // minRole(key.role, owner.role) inside apiKeyAuthContext is a
+      // permanent no-op for this class, and clampControlPlaneScopes only
+      // touches control-plane scopes, never the agent-grammar ones this
+      // class is built from. Without resolveAgentToken's own floor check, a
+      // token minted while its owner was 'user' kept full deploy/create-app
+      // authority forever, even after the owner was demoted to 'readonly'.
+      const owner = await createUser('ivan-agent-owner', 'password123', 'user');
+      const { key } = await createApiKey(
+        'ivan-agent-bot',
+        'none',
+        undefined,
+        ['app:demo:deploy'],
+        owner.id,
+        { kind: 'agent' }
+      );
+
+      const before = await probeWith(mcpGate, key);
+      expect(before.status).toBe(200);
+      expect(before.auth?.kind).toBe('agent');
+
+      await updateUser(owner.id, { role: 'readonly' });
+
+      // Falls through to authMiddleware('user') once resolveAgentToken
+      // refuses it — a role:'none' principal 403s a user-gated route.
+      const after = await probeWith(mcpGate, key);
+      expect(after.status).toBe(403);
+    });
+
+    it('an admin-owned agent token is unaffected — the owner still ranks at least user', async () => {
+      const owner = await createUser('ivan-agent-owner-2', 'password123', 'admin');
+      const { key } = await createApiKey(
+        'ivan-agent-bot-2',
+        'none',
+        undefined,
+        ['app:demo:deploy'],
+        owner.id,
+        { kind: 'agent' }
+      );
+
+      const { status, auth } = await probeWith(mcpGate, key);
+
+      expect(status).toBe(200);
+      expect(auth?.kind).toBe('agent');
+    });
+  });
+
   it("a demoted owner's admin-role key loses admin standing on the very next request", async () => {
     const owner = await createUser('carol-demoted', 'password123', 'admin');
     const { key } = await createApiKey('carol-admin-key', 'admin', undefined, undefined, owner.id);

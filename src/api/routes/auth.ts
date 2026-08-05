@@ -410,6 +410,12 @@ auth.post('/users', authMiddleware(), requireCapability('users:create'), async c
     if (err instanceof Error && err.message.includes('already exists')) {
       return c.json(error(ErrorCodes.CONFLICT, err.message), 409);
     }
+    // DROP-130 HIGH-4: `createUser` now validates `role` itself (this route
+    // never did, unlike PUT /auth/users/:id) — translate its plain Error
+    // into the same VALIDATION_ERROR shape that route uses.
+    if (err instanceof Error && err.message.startsWith('Invalid role:')) {
+      return c.json(error(ErrorCodes.VALIDATION_ERROR, err.message), 400);
+    }
     throw err;
   }
 });
@@ -476,6 +482,17 @@ auth.post('/users/:id/reset-password', authMiddleware('admin'), async c => {
   if (!reset) {
     return c.json(error(ErrorCodes.NOT_FOUND, 'User not found'), 404);
   }
+
+  // DROP-130 MEDIUM-8: this call stamps `credentialsInvalidBefore` — killing
+  // every API key, agent token and refresh token the user holds — and clears
+  // `createdByScope`, with no trace anywhere until now. Without an activity
+  // row, the activity log can't explain why a fleet of keys stopped
+  // authenticating right after this request.
+  const callerAuth = (c.get as (k: string) => AuthContext | undefined)('auth');
+  await logActivityFor(callerAuth, {
+    action: 'password-reset',
+    detail: `user=${id}`,
+  });
 
   return c.json(success({ message: 'Password reset' }));
 });

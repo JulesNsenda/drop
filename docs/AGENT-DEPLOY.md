@@ -248,3 +248,11 @@ agent/integration so a leaked key can be revoked without rotating every
 integration at once. Remember too that a key's role is a ceiling capped by its
 owner's account role, not a fixed grant — keep the owner account itself at the
 right role.
+
+If your key or token was minted through a scoped `users:create` capability
+(rather than an admin key) and it created an account for another
+agent/integration, that account cannot log in yet: it's marked and refused at
+`POST /auth/login` until an admin (or an out-of-band operator) sets its
+password, which is what proves a human — not the scoped caller that minted
+it — now controls the account. This does not affect accounts an admin key
+creates directly; those can log in immediately.

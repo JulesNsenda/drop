@@ -283,10 +283,30 @@ const DROP_YAML_NAMES = ['drop.yaml', 'drop.yml', '.drop.yaml', '.drop.yml'];
  * would spam the log dozens of times. Keyed on the yaml path, with the file's
  * mtime as the value: an edit changes mtime and re-warns (the fix might have
  * introduced a NEW mistake worth seeing), an unchanged bad file warns at most
- * once per process lifetime. Module-level and never pruned — bounded by the
- * number of apps that have ever had a malformed manifest, which stays small.
+ * once per process lifetime. Module-level, capped at `MAX_WARNED_PARSE_FAILURES`
+ * (DROP-130 item 2a) — NOT bounded by "the number of apps that have ever had a
+ * malformed manifest", which does not stay small: agent-created ephemeral apps
+ * are TTL'd, reaped and recreated under fresh random names, so a churning
+ * principal grows this map without limit in a long-lived process. Once the cap
+ * is hit, the oldest tracked path (Map preserves insertion order) is evicted
+ * to make room, trading an occasional re-warn for unbounded growth.
  */
 const warnedParseFailures = new Map<string, number>();
+
+/** Upper bound on distinct manifest paths tracked by `warnedParseFailures`. */
+const MAX_WARNED_PARSE_FAILURES = 500;
+
+/**
+ * Test-only reset for the parse-failure dedupe cache. Process-global mutable
+ * state with no reset function is a cross-test coupling hazard: a later test
+ * that parses a malformed manifest at the same path+mtime as an earlier test
+ * would silently get no warning, and the failure mode is a vacuously passing
+ * assertion, not a red one. Mirrors the existing `__resetAuthCodeStore`
+ * precedent (`src/api/oauth/authorization-code.ts`).
+ */
+export function __resetDropYamlParseWarnings(): void {
+  warnedParseFailures.clear();
+}
 
 /** Cap on the validation-error text this module writes to the log. */
 const MAX_LOGGED_ERROR_CHARS = 200;
@@ -304,7 +324,17 @@ const MAX_LOGGED_ERROR_CHARS = 200;
  * plus the `<250` char test), applied here to every validation message.
  */
 function sanitizeForLog(value: string): string {
-  const collapsed = value.replace(/\s+/g, ' ').trim();
+  // Strip C0 (\x00-\x1F, incl. ESC \x1b) and C1 (\x7F, \x80-\x9F, incl. NEL
+  // \x85) control characters BEFORE the whitespace collapse below — `\s`
+  // matches neither ESC nor NEL, so a manifest key carrying either would
+  // otherwise survive this sanitizer intact. An ESC sequence can clear and
+  // rewrite the operator's terminal line; NEL is treated as a line break by
+  // some terminals/log viewers. Plain `\n`/`\r` forgery is already closed by
+  // the collapse, but that regex class does not cover this one (DROP-130
+  // item 1).
+  // eslint-disable-next-line no-control-regex -- deliberately matching C0/C1 control chars to strip them.
+  const stripped = value.replace(/[\x00-\x1F\x7F-\x9F]/g, '');
+  const collapsed = stripped.replace(/\s+/g, ' ').trim();
   return collapsed.length > MAX_LOGGED_ERROR_CHARS
     ? `${collapsed.slice(0, MAX_LOGGED_ERROR_CHARS)}…`
     : collapsed;
@@ -331,6 +361,15 @@ async function warnParseFailure(appPath: string, yamlPath: string, error: string
 
   if (warnedParseFailures.get(yamlPath) === mtimeMs) {
     return;
+  }
+  // Evict the oldest tracked path once the cap is reached, but only when
+  // this is a genuinely new key — updating an existing path's mtime must
+  // not count against the cap or count as growth.
+  if (warnedParseFailures.size >= MAX_WARNED_PARSE_FAILURES && !warnedParseFailures.has(yamlPath)) {
+    const oldestKey = warnedParseFailures.keys().next().value;
+    if (oldestKey !== undefined) {
+      warnedParseFailures.delete(oldestKey);
+    }
   }
   warnedParseFailures.set(yamlPath, mtimeMs);
 

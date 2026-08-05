@@ -7,6 +7,7 @@ import {
   validateDropYamlConfig,
   mergeWithDefaults,
   getCustomDomains,
+  __resetDropYamlParseWarnings,
 } from './drop-yaml-parser';
 
 describe('Drop YAML Parser', () => {
@@ -14,6 +15,12 @@ describe('Drop YAML Parser', () => {
 
   beforeEach(async () => {
     tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'drop-yaml-test-'));
+    // DROP-130 item 2b: the parse-failure dedupe cache is process-global
+    // module state with no test isolation of its own — without this reset a
+    // later test parsing a malformed manifest at a path+mtime an earlier
+    // test already warned about would silently get no warning, which fails
+    // vacuously rather than red.
+    __resetDropYamlParseWarnings();
   });
 
   afterEach(async () => {
@@ -188,6 +195,62 @@ describe('Drop YAML Parser', () => {
       // an exact byte count of this test's own wrapper text.
       expect(message.length).toBeLessThan(600);
     });
+
+    it('strips ESC and NEL control characters that \\s does not match (DROP-130 item 1)', async () => {
+      // \s does not match \x1b (ESC) or \x85 (NEL). An ESC sequence can clear
+      // and rewrite the operator's terminal line; NEL is treated as a line
+      // break by some terminals/log viewers — both would otherwise reach the
+      // console verbatim through "Unknown field '<key>'", the same forgery
+      // the newline case above already closes for plain \n/\r.
+      const esc = String.fromCharCode(0x1b);
+      const nel = String.fromCharCode(0x85);
+      const forged = `clear${esc}[2K${esc}[1G[INFO] all good${nel}forged-line`;
+      // YAML double-quoted scalars support \e (ESC) and \N (NEL) escapes.
+      const yamlEscaped = forged.replace(new RegExp(esc, 'g'), '\\e').replace(new RegExp(nel, 'g'), '\\N');
+      await fs.writeFile(path.join(tmpDir, 'drop.yaml'), `"${yamlEscaped}": true\n`);
+
+      const result = await parseDropYaml(tmpDir);
+
+      expect(result.success).toBe(false);
+      // The raw (unsanitized) message returned to callers still carries both.
+      expect(result.error).toContain(esc);
+      expect(result.error).toContain(nel);
+
+      expect(warnSpy).toHaveBeenCalledTimes(1);
+      const [message] = warnSpy.mock.calls[0];
+      expect(message.includes(esc)).toBe(false);
+      expect(message.includes(nel)).toBe(false);
+    });
+
+    it('evicts the oldest tracked path once the cap is reached, so a churning ephemeral-app population re-warns instead of growing without limit (DROP-130 item 2a)', async () => {
+      // The docstring's old claim — "bounded by the number of apps that have
+      // ever had a malformed manifest, which stays small" — is false for
+      // agent-created ephemeral apps: they are TTL'd, reaped and recreated
+      // under fresh random names, so a churning principal grows the map
+      // without limit in a long-lived process. This exercises the real cap
+      // through the public API (the cap constant is not exported), so it
+      // also acts as a change-detector if the cap value ever moves.
+      const dirs: string[] = [];
+      for (let i = 0; i < 501; i++) {
+        const dir = path.join(tmpDir, `app-${i}`);
+        await fs.mkdir(dir);
+        await fs.writeFile(path.join(dir, 'drop.yaml'), 'domains:\n  - "invalid domain!!"');
+        dirs.push(dir);
+      }
+
+      // Fill the cap exactly (dirs[0..499]), then push one more (dirs[500])
+      // to force an eviction — the oldest tracked path, dirs[0], should be
+      // the one that goes.
+      for (const dir of dirs) {
+        await parseDropYaml(dir);
+      }
+      expect(warnSpy).toHaveBeenCalledTimes(501);
+
+      // dirs[0]'s file is unchanged (same mtime) but it was evicted, so
+      // re-parsing it must warn again rather than dedupe.
+      await parseDropYaml(dirs[0]);
+      expect(warnSpy).toHaveBeenCalledTimes(502);
+    }, 30000);
   });
 
   describe('validateDropYamlConfig', () => {

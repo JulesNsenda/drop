@@ -51,7 +51,15 @@ jest.mock('../../managers/app/state-manager', () => ({
   }),
 }));
 
-jest.mock('../../managers/activity', () => ({ tryLogActivity: async () => undefined }));
+// Also stubs `logActivityFor` (unused by this suite today): DROP-130 doubled
+// the module's export surface, and the MCP tools are the most likely next
+// place to gain an attributed row — a factory naming only `tryLogActivity`
+// would then throw `logActivityFor is not a function` from inside a tool
+// handler, reading as an unrelated failure.
+jest.mock('../../managers/activity', () => ({
+  tryLogActivity: async () => undefined,
+  logActivityFor: jest.fn(),
+}));
 
 jest.mock('../../managers/deploy-tracker', () => ({
   getDeployTracker: () => ({ getEpisodes: () => [], hasOpenEpisode: () => false }),

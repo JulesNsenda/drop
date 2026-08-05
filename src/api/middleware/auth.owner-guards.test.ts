@@ -106,6 +106,34 @@ describe('API-key ownership guards', () => {
       expect(await verifyApiKey(freshKey)).not.toBeNull();
     });
 
+    it('DROP-130 HIGH-1: the DASHBOARD disable path (updateUser, not suspendUser) is reversible-safe too', async () => {
+      // UsersPage.tsx disables a user via PUT /auth/users/:id {enabled:false}
+      // -> updateUser — never POST /admin/users/:id/suspend -> suspendUser.
+      // Before HIGH-1, only suspendUser stamped `credentialsInvalidBefore`;
+      // updateUser just flipped the flag. A disable -> re-enable cycle through
+      // the ACTUAL dashboard path therefore resurrected every key verbatim,
+      // even though the test above (which goes through suspendUser) looked
+      // green the whole time.
+      const bob = await createUser('bob-dashboard-disable', PASSWORD, 'user');
+      const { key } = await createApiKey('bob-dashboard-ci', 'user', undefined, undefined, bob.id);
+
+      await updateUser(bob.id, { enabled: false });
+      expect(await verifyApiKey(key)).toBeNull();
+
+      await updateUser(bob.id, { enabled: true });
+
+      // The pre-existing key must NOT come back just because the account did.
+      expect(await verifyApiKey(key)).toBeNull();
+      const { key: freshKey } = await createApiKey(
+        'bob-dashboard-ci-2',
+        'user',
+        undefined,
+        undefined,
+        bob.id
+      );
+      expect(await verifyApiKey(freshKey)).not.toBeNull();
+    });
+
     it('leaves legacy ownerless keys alone when an unrelated user is deleted', async () => {
       const bob = await createUser('bob', PASSWORD, 'user');
       const { key } = await createApiKey('legacy', 'user');
