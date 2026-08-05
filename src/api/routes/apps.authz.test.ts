@@ -152,4 +152,29 @@ describe('app route authorization', () => {
     });
     expect(res.status).toBe(507);
   });
+
+  it('gates POST /apps at the user role (E)', async () => {
+    // readonly must not reach the collection route at all.
+    await createUser('viewer', 'password123', 'readonly');
+    const viewerToken = await getTestToken('viewer', 'password123');
+    const dir = path.join(tempDir, 'role-gate-dir');
+    await fs.mkdir(dir, { recursive: true });
+
+    const blocked = await app.request('/api/v1/apps', {
+      method: 'POST',
+      headers: { ...authHeader(viewerToken), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: dir, name: 'role-gate-app' }),
+    });
+    expect(blocked.status).toBe(403);
+
+    // user clears the role gate (the route's own path-containment check may
+    // still reject the request — bob's dir isn't under the webapps root — but
+    // that must not be a 403, or the two failure modes are indistinguishable).
+    const allowed = await app.request('/api/v1/apps', {
+      method: 'POST',
+      headers: { ...authHeader(bobToken), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: dir, name: 'role-gate-app' }),
+    });
+    expect(allowed.status).not.toBe(403);
+  });
 });
