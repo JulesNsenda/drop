@@ -141,6 +141,49 @@ export interface AuthContext {
   kind?: 'agent';
 }
 
+/**
+ * Canonical role ranking. The single source every ordinal role comparison
+ * reads from — `authMiddleware`'s own role gate below and `minRole()` both
+ * key off this table; a second, function-local copy is the exact drift this
+ * constant exists to prevent.
+ */
+export const roleHierarchy: Record<string, number> = { admin: 3, user: 2, readonly: 1, none: 0 };
+
+/**
+ * `roleHierarchy[role]`, defensively defaulted to 0 for anything not in the
+ * table — including inherited `Object.prototype` names (`toString`,
+ * `constructor`, …), which a bare `roleHierarchy[role]` lookup would
+ * otherwise return truthy for and skip the `?? 0` fallback entirely.
+ */
+function rankOf(role: string): number {
+  return Object.prototype.hasOwnProperty.call(roleHierarchy, role) ? roleHierarchy[role] : 0;
+}
+
+/**
+ * Returns whichever of two roles ranks lower in `roleHierarchy` — used to
+ * clamp one role to another (e.g. an API key can never outrank the human it
+ * acts for).
+ *
+ * Always returns a REAL role, never a passthrough of a malformed input. Rank
+ * alone is not enough here: several downstream gates
+ * (`canAccessScoped`/`access.ts`, `upload-preflight.ts`, the scope arm of
+ * `requireCapability`) test `role === 'none'` by STRING equality, not by
+ * rank. An unrecognized/corrupted role string that merely *ranked* 0 would
+ * still fail every one of those equality checks and fall through to their
+ * LESS restrictive branch — the opposite of "clamped down". So when the
+ * lower-ranked side isn't itself a recognized role, the result is
+ * normalized to `'none'`, the actual lowest standing, rather than echoed
+ * back verbatim.
+ */
+export function minRole(a: string, b: string): 'admin' | 'user' | 'readonly' | 'none' {
+  const picked = rankOf(a) <= rankOf(b) ? a : b;
+  return (Object.prototype.hasOwnProperty.call(roleHierarchy, picked) ? picked : 'none') as
+    | 'admin'
+    | 'user'
+    | 'readonly'
+    | 'none';
+}
+
 /** A rotated-on-use opaque refresh token, hashed at rest (never the raw token). */
 interface RefreshTokenRecord {
   tokenHash: string;
@@ -540,6 +583,14 @@ export async function updateUser(userId: string, updates: { enabled?: boolean; r
 
   const user = credentials.users.find((u) => u.id === userId);
   if (!user) return false;
+
+  // Mirrors deleteUser's last-admin guard: demoting the last admin locks the
+  // platform out of its own admin surface just as surely as deleting the
+  // account would.
+  if (updates.role !== undefined && updates.role !== 'admin' && user.role === 'admin') {
+    const adminCount = credentials.users.filter((u) => u.role === 'admin').length;
+    if (adminCount <= 1) throw new Error('Cannot demote the last admin account');
+  }
 
   if (updates.enabled !== undefined) user.enabled = updates.enabled;
   if (updates.role) user.role = updates.role;
@@ -1110,7 +1161,11 @@ export async function issueRefreshToken(
  * Returns null if the presented token is unknown (already rotated/revoked,
  * or never issued) — the caller should treat this as a hard failure (RFC
  * 6749 §10.4 reuse-detection is a documented fast-follow, not implemented
- * here).
+ * here). Also returns null if the record's owner no longer exists or is
+ * disabled — checked HERE, not left to the caller (`oauth.ts`'s refresh
+ * route also checks `enabled`, but that runs after this function has already
+ * rotated the token; a caller-only check means containment rests on every
+ * caller staying careful, which is not a boundary).
  */
 export async function rotateRefreshToken(presented: string): Promise<{
   refreshToken: string;
@@ -1127,6 +1182,17 @@ export async function rotateRefreshToken(presented: string): Promise<{
   if (index === -1) return null;
 
   const { userId, clientId, sid, resource } = records[index];
+
+  // Checked BEFORE the record is consumed below. Doing this after the splice
+  // (and after a fresh record has already been minted and persisted) would
+  // still return null to the caller, but it would also burn the presented
+  // token — the disabled owner's outstanding grant would be silently
+  // destroyed on every retried attempt, and a fresh (unreturned, orphaned)
+  // record would accrete in the store on each one. Checking first leaves the
+  // record untouched, so a retry costs nothing and mutates nothing.
+  const owner = credentials.users.find((u) => u.id === userId);
+  if (!owner || owner.enabled === false) return null;
+
   const carried = sid ?? crypto.randomUUID();
   records.splice(index, 1);
 
@@ -1583,12 +1649,13 @@ export function authMiddleware(requiredRole?: 'admin' | 'user' | 'readonly') {
 
     // Check role if required
     if (requiredRole) {
-      const roleHierarchy: Record<string, number> = { admin: 3, user: 2, readonly: 1, none: 0 };
       // Defensive `?? 0`: a 'none' (scope-only) role, or any malformed/unknown
       // role that somehow ends up on a persisted record, ranks 0 rather than
       // `undefined` — `undefined < roleHierarchy[requiredRole]` is always
       // `false`, which would have let an unrecognized role pass every gate.
-      const rank = (roleHierarchy as Record<string, number>)[authContext.role] ?? 0;
+      // `roleHierarchy` is the module-scope table above — `minRole()` reads
+      // the same one, so there is exactly one ranking to keep in sync.
+      const rank = roleHierarchy[authContext.role] ?? 0;
       if (rank < roleHierarchy[requiredRole]) {
         return c.json(
           error(ErrorCodes.UNAUTHORIZED, `Insufficient permissions. Required role: ${requiredRole}`),

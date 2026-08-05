@@ -19,6 +19,7 @@ import {
   authMiddleware,
   optionalAuthMiddleware,
   resetAuth,
+  minRole,
 } from './auth';
 import { getTestToken } from '../__testutils__/auth';
 
@@ -573,5 +574,67 @@ describe('Auth Middleware', () => {
       expect(next).toHaveBeenCalled();
       expect(c.set).not.toHaveBeenCalled();
     });
+  });
+});
+
+/**
+ * minRole — the module-scope role ranking, hoisted so authMiddleware's own
+ * gate and the clamp Item 3 threads through apiKeyAuthContext read exactly
+ * one table.
+ *
+ * Both directions matter: agent tokens deliberately mint `role: 'none'`
+ * BELOW their owner's role, so an "owner wins"/highest-rank implementation
+ * would promote every admin-minted agent token to `admin`, skip
+ * `canAccessScoped`'s rank-0 branch, auto-pass `requireCapability`, and
+ * dissolve the SEC-5 fence. Only a genuine "lower of the two, in either
+ * argument order" implementation is safe to build Item 3 on.
+ */
+describe('minRole', () => {
+  it('clamps a HIGH-standing key down to its LOW-standing owner', () => {
+    expect(minRole('admin', 'readonly')).toBe('readonly');
+  });
+
+  it('clamps a LOW-standing key down even when the owner outranks it', () => {
+    // The direction a naive "return the higher rank" bug would get backwards.
+    expect(minRole('none', 'admin')).toBe('none');
+  });
+
+  it('is order-independent — the lower rank wins regardless of argument position', () => {
+    expect(minRole('readonly', 'admin')).toBe('readonly');
+    expect(minRole('user', 'none')).toBe('none');
+    expect(minRole('none', 'user')).toBe('none');
+  });
+
+  it('returns the shared rank when both roles tie', () => {
+    expect(minRole('user', 'user')).toBe('user');
+  });
+
+  it('clamps an unrecognized/garbage role to a REAL bottom role, not an echoed string', () => {
+    // Mirrors authMiddleware's own defensive `?? 0`: a role that isn't in
+    // `roleHierarchy` at all must rank as the LOWEST standing, never as
+    // unranked-and-therefore-undefeated. `undefined < roleHierarchy[x]` is
+    // always `false`, so a naive rank lookup without the `?? 0` fallback
+    // would let garbage win instead of losing.
+    //
+    // Normalizing to 'none' (rather than echoing the garbage string back) is
+    // load-bearing, not cosmetic: `canAccessScoped`, `upload-preflight.ts`
+    // and `requireCapability`'s scope arm all gate on `role === 'none'` by
+    // STRING equality. An echoed-back garbage string would rank 0 but fail
+    // every one of those equality checks, falling through to their LESS
+    // restrictive branch — the opposite of "clamped down".
+    expect(minRole('bogus-role', 'admin')).toBe('none');
+    expect(minRole('admin', 'bogus-role')).toBe('none');
+    // A malformed role is even beneath 'readonly' (rank 1), not just below
+    // 'admin' — proves it's genuinely treated as rank 0, not merely "low".
+    expect(minRole('bogus-role', 'readonly')).toBe('none');
+  });
+
+  it('does not fall for Object.prototype-inherited property names', () => {
+    // `roleHierarchy['toString']` resolves via the prototype chain to a
+    // (truthy, non-numeric) function unless the lookup is an own-property
+    // check — which would skip the `?? 0` fallback and rank it as
+    // "unranked-and-undefeated" instead of clamping it to the bottom.
+    expect(minRole('toString', 'readonly')).toBe('none');
+    expect(minRole('constructor', 'admin')).toBe('none');
   });
 });

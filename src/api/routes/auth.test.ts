@@ -568,4 +568,188 @@ describe('Auth Routes', () => {
       });
     });
   });
+
+  describe('PUT /auth/users/:id', () => {
+    let targetUserId: string;
+
+    beforeEach(async () => {
+      const res = await app.request('/auth/users', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${adminToken}`,
+        },
+        body: JSON.stringify({ username: 'update-target', password: 'password123', role: 'user' }),
+      });
+      const data = (await res.json()) as ApiResponse<CreatedUserResponse>;
+      targetUserId = data.data.id;
+    });
+
+    it('should update role for admin', async () => {
+      const res = await app.request(`/auth/users/${targetUserId}`, {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${adminToken}`,
+        },
+        body: JSON.stringify({ role: 'readonly' }),
+      });
+
+      expect(res.status).toBe(200);
+    });
+
+    it('should return 400 (and not persist) for an arbitrary/garbage role string', async () => {
+      // `role` is only a TypeScript annotation on the parsed body — without
+      // runtime validation an arbitrary string would persist onto the user
+      // record, and rank 0 under roleHierarchy's defensive `?? 0`, clamping
+      // every API key this user owns down to nothing the moment a key's
+      // standing is derived from its owner.
+      const res = await app.request(`/auth/users/${targetUserId}`, {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${adminToken}`,
+        },
+        body: JSON.stringify({ role: 'superadmin' }),
+      });
+
+      expect(res.status).toBe(400);
+      const data = (await res.json()) as ApiResponse;
+      expect(data.error?.code).toBe('VALIDATION_ERROR');
+
+      const listRes = await app.request('/auth/users', {
+        method: 'GET',
+        headers: { Authorization: `Bearer ${adminToken}` },
+      });
+      const listData = (await listRes.json()) as ApiResponse<Array<{ id: string; role: string }>>;
+      expect(listData.data.find(u => u.id === targetUserId)?.role).toBe('user');
+    });
+
+    it('should return 400 for a negative maxApps', async () => {
+      const res = await app.request(`/auth/users/${targetUserId}`, {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${adminToken}`,
+        },
+        body: JSON.stringify({ maxApps: -1 }),
+      });
+
+      expect(res.status).toBe(400);
+      const data = (await res.json()) as ApiResponse;
+      expect(data.error?.code).toBe('VALIDATION_ERROR');
+    });
+
+    it('should return 400 (not 500) for a non-numeric maxApps', async () => {
+      const res = await app.request(`/auth/users/${targetUserId}`, {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${adminToken}`,
+        },
+        body: JSON.stringify({ maxApps: 'unlimited' }),
+      });
+
+      expect(res.status).toBe(400);
+      const data = (await res.json()) as ApiResponse;
+      expect(data.error?.code).toBe('VALIDATION_ERROR');
+    });
+
+    it('should accept maxApps: 0 (use global default)', async () => {
+      const res = await app.request(`/auth/users/${targetUserId}`, {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${adminToken}`,
+        },
+        body: JSON.stringify({ maxApps: 0 }),
+      });
+
+      expect(res.status).toBe(200);
+    });
+
+    it('should refuse to demote the LAST admin account', async () => {
+      // `initializeAuth` auto-creates a default 'admin' account on first
+      // boot, so at this point two admins exist ('admin' and 'testadmin').
+      // Demote the auto-created one down to 'user' first — that must
+      // succeed, since a second admin remains — leaving 'testadmin' as the
+      // sole admin, which must then refuse to demote itself further.
+      const listRes = await app.request('/auth/users', {
+        method: 'GET',
+        headers: { Authorization: `Bearer ${adminToken}` },
+      });
+      const listData = (await listRes.json()) as ApiResponse<Array<{ id: string; username: string; role: string }>>;
+      const defaultAdmin = listData.data.find(u => u.username === 'admin' && u.role === 'admin');
+      expect(defaultAdmin).toBeDefined();
+
+      const firstDemotion = await app.request(`/auth/users/${defaultAdmin!.id}`, {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${adminToken}`,
+        },
+        body: JSON.stringify({ role: 'user' }),
+      });
+      expect(firstDemotion.status).toBe(200);
+
+      const meRes = await app.request('/auth/me', {
+        method: 'GET',
+        headers: { Authorization: `Bearer ${adminToken}` },
+      });
+      const me = (await meRes.json()) as ApiResponse<UserResponse>;
+
+      const res = await app.request(`/auth/users/${me.data.userId}`, {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${adminToken}`,
+        },
+        body: JSON.stringify({ role: 'user' }),
+      });
+
+      expect(res.status).toBe(400);
+      const data = (await res.json()) as ApiResponse;
+      expect(data.error?.code).toBe('VALIDATION_ERROR');
+    });
+
+    it('allows demoting an admin when another admin remains', async () => {
+      const secondAdminRes = await app.request('/auth/users', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${adminToken}`,
+        },
+        body: JSON.stringify({
+          username: 'second-admin-demote',
+          password: 'password123',
+          role: 'admin',
+        }),
+      });
+      const secondAdmin = (await secondAdminRes.json()) as ApiResponse<CreatedUserResponse>;
+
+      const res = await app.request(`/auth/users/${secondAdmin.data.id}`, {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${adminToken}`,
+        },
+        body: JSON.stringify({ role: 'user' }),
+      });
+
+      expect(res.status).toBe(200);
+    });
+
+    it('should return 404 for a non-existent user id', async () => {
+      const res = await app.request('/auth/users/non-existent-id', {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${adminToken}`,
+        },
+        body: JSON.stringify({ role: 'readonly' }),
+      });
+
+      expect(res.status).toBe(404);
+    });
+  });
 });
