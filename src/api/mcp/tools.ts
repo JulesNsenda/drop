@@ -589,9 +589,14 @@ export async function handleDeployFromGit(
       return toolError(err.message);
     }
     const message = err instanceof Error ? err.message : 'Deploy failed';
-    if (message.includes('already exists')) return toolError(`Conflict: ${message}`);
-    if (message.includes('Invalid')) return toolError(`Invalid input: ${message}`);
-    return toolError(`deploy_from_git failed: ${message}`);
+    // message is git-derived (git-deploy.ts / git-client.ts stderr, token-sanitized
+    // but never fenced) — fence once here so none of the three sibling returns below
+    // ships raw git text unfenced. Fencing only one of the three would read as
+    // covered while leaving the other two exposed.
+    const fenced = wrapUntrusted(`GIT: ${args.url}`, message);
+    if (message.includes('already exists')) return toolError(`Conflict: ${fenced}`);
+    if (message.includes('Invalid')) return toolError(`Invalid input: ${fenced}`);
+    return toolError(`deploy_from_git failed: ${fenced}`);
   }
 }
 
@@ -908,15 +913,26 @@ export function buildMcpServer(auth: AuthContext | undefined): McpServer {
         'or that already live in a git repo. This tool always creates a new app — it does not redeploy an existing one. ' +
         'Waits for the build to finish and returns the app URL on success, or the failing build stage and an untrusted build-log tail on failure.',
       inputSchema: {
+        // Bounded because the failure path now uses `url` as a FENCE LABEL
+        // (see handleDeployFromGit's catch). sanitizeLabel strips newlines and
+        // defangs markers, so an unbounded label cannot forge a boundary — but
+        // it can still be echoed twice, in both the BEGIN and END markers, so
+        // an unbounded input is an unbounded response. Every other label in
+        // this file is an isValidAppName-validated app name; this is the one
+        // caller-supplied label, which is exactly the case sanitizeLabel's
+        // docstring flags. 512 is far beyond any real repo URL.
         url: z
           .string()
+          .max(512)
           .describe('GitHub repository URL (https://github.com/owner/repo, or owner/repo).'),
         name: z
           .string()
+          .max(128)
           .optional()
           .describe('App name to create. Defaults to the repository name if omitted.'),
         branch: z
           .string()
+          .max(255)
           .optional()
           .describe('Branch to clone. Defaults to the repository default branch.'),
       },
