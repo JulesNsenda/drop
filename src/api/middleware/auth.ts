@@ -52,6 +52,14 @@ export interface User {
   mfaLastUsedStep?: number;
 }
 
+/**
+ * A `User` record with its authentication secrets stripped — what
+ * `getUserById`/`getUser`/`listUsers` return, and what `apiKeyAuthContext`
+ * (DROP-130 Item 3) derives an owned API key's standing from at request
+ * time. Threaded in rather than re-looked-up, so the derivation stays pure.
+ */
+export type SafeUser = Omit<User, 'passwordHash' | 'mfaSecret'>;
+
 // API key record
 export interface ApiKey {
   id: string;
@@ -322,6 +330,27 @@ export async function initializeAuth(authConfig: AuthConfig): Promise<void> {
     console.log('='.repeat(60));
     console.log('IMPORTANT: Change this password on first login.');
     console.log('='.repeat(60));
+  }
+
+  // DROP-130 Item 3: an owned key's role is now CLAMPED down to its owner's
+  // at request time, never echoed verbatim. `POST /auth/api-keys` has always
+  // permitted an explicit `ownerUserId` naming any user, so a key minted
+  // above its owner's standing is a shape the API allows today — and after
+  // this clamp it would silently start losing authority on every request. A
+  // key that begins 403ing with no signal anywhere is not acceptable, so
+  // name every such key once, at boot, rather than let the demotion be
+  // discovered as an unexplained outage. One pass over `credentials.apiKeys`.
+  for (const key of credentials.apiKeys) {
+    if (!key.ownerUserId) continue; // legacy/ownerless — not clamped, nothing to warn about
+    const owner = credentials.users.find((u) => u.id === key.ownerUserId);
+    if (!owner) continue; // dangling owner — already fails closed at request time
+    if (rankOf(key.role) > rankOf(owner.role)) {
+      console.warn(
+        `[Auth] API key '${key.name}' (${key.id}) has role '${key.role}', which outranks its ` +
+          `owner '${owner.username}' (role '${owner.role}'). Requests through this key are now ` +
+          `clamped to '${owner.role}'.`
+      );
+    }
   }
 }
 
@@ -1349,24 +1378,33 @@ async function resolveAgentToken(
   const raw = apiKeyHeader ?? bearerToken;
   if (!raw) return null;
 
-  let key: ApiKey | null = null;
+  let verified: { key: ApiKey; owner: SafeUser | null } | null = null;
   try {
-    key = await verifyApiKey(raw);
+    verified = await verifyApiKey(raw);
   } catch {
     return null;
   }
-  if (!key || key.kind !== 'agent') return null;
+  if (!verified || verified.key.kind !== 'agent') return null;
 
-  const usable = (key.scopes ?? []).some((scope) => normalizeAgentScope(scope) !== null);
+  const usable = (verified.key.scopes ?? []).some((scope) => normalizeAgentScope(scope) !== null);
   if (!usable) return null;
 
-  return apiKeyAuthContext(key);
+  return apiKeyAuthContext(verified.key, verified.owner);
 }
 
 /**
- * Verify an API key
+ * Verify an API key.
+ *
+ * Returns the key together with its resolved owner (`null` for a legacy,
+ * ownerless key) — never a bare `ApiKey` — so every caller can hand both
+ * straight to `apiKeyAuthContext` without re-resolving the owner itself
+ * (DROP-130 Item 3). `apiKeyAuthContext` has no module-global fallback for a
+ * missing owner; threading it here is what makes that structural rather than
+ * a convention callers have to remember.
  */
-export async function verifyApiKey(key: string): Promise<ApiKey | null> {
+export async function verifyApiKey(
+  key: string
+): Promise<{ key: ApiKey; owner: SafeUser | null } | null> {
   if (!credentials || !config) {
     throw new Error('Auth not initialized');
   }
@@ -1388,8 +1426,9 @@ export async function verifyApiKey(key: string): Promise<ApiKey | null> {
   // their login while every key issued for them keeps authenticating as their
   // userId — retaining canAccess to all their apps, with no account left to
   // revoke it from. (Legacy keys have no owner and are unaffected.)
+  let owner: SafeUser | null = null;
   if (apiKey.ownerUserId) {
-    const owner = credentials.users.find((u) => u.id === apiKey.ownerUserId);
+    owner = getUserById(apiKey.ownerUserId);
     if (!owner || owner.enabled === false) {
       return null;
     }
@@ -1405,7 +1444,29 @@ export async function verifyApiKey(key: string): Promise<ApiKey | null> {
     await saveCredentials(config.credentialsPath, credentials);
   }
 
-  return apiKey;
+  return { key: apiKey, owner };
+}
+
+/**
+ * Suppress control-plane capability scopes (e.g. `users:create`) once the
+ * owner-clamped role ranks below `user`.
+ *
+ * `requireCapability`'s scope arm (`auth.role === 'admin' ||
+ * auth.scopes?.includes(cap)`) never consults role, so clamping `role` alone
+ * leaves the whole capability surface frozen: a key holding `users:create`
+ * whose owner was demoted below `user` would still reach `POST /auth/users`.
+ *
+ * Must NOT touch the agent-scope grammar (`app:<name>:deploy|read`,
+ * `apps:create` — see `agent-scopes.ts`), which is DESIGNED to work at
+ * `role: 'none'`. Every agent token carries `role: 'none'` by construction,
+ * so suppressing that grammar here would break every agent token.
+ */
+function clampControlPlaneScopes(
+  scopes: string[] | undefined,
+  clampedRole: AuthContext['role']
+): string[] | undefined {
+  if (!scopes || rankOf(clampedRole) >= rankOf('user')) return scopes;
+  return scopes.filter((scope) => normalizeAgentScope(scope) !== null);
 }
 
 /**
@@ -1419,19 +1480,55 @@ export async function verifyApiKey(key: string): Promise<ApiKey | null> {
  * discarding any per-user `maxApps` override), and apps the key created were
  * owned by an identity no human could log in as.
  *
- * Legacy keys (no `ownerUserId`) keep the old behaviour so the apps they
- * already own remain reachable.
+ * DROP-130 Item 3: for an OWNED key, `role`, `username` and control-plane
+ * `scopes` are now derived from the owner at REQUEST time, never frozen at
+ * mint time — the same reason the JWT branch below re-reads `userRecord.role`
+ * on every request instead of trusting the claim. A key can never outrank
+ * the human it acts for.
+ *
+ * Legacy keys (no `ownerUserId`) keep the old behaviour EXACTLY — this is
+ * deliberate, not an oversight. `DROP_API_KEY` (injected into every tenant
+ * container, `platform.ts`) and the CLI's `cli-local` key (also `platform.ts`,
+ * itself minted with `role: 'admin'`) are both minted ownerless, and clamping
+ * either would either brick a tenant container's ability to call back into
+ * DROP or brick the CLI outright. This narrows finding A rather than
+ * eliminating it — legacy unowned keys, including the unowned admin
+ * `cli-local` key, stay unclamped. See the DROP-130 plan's Risks section.
  */
-function apiKeyAuthContext(key: ApiKey): AuthContext {
+function apiKeyAuthContext(key: ApiKey, owner: SafeUser | null): AuthContext {
+  if (!key.ownerUserId) {
+    return {
+      userId: key.id,
+      username: key.name,
+      role: key.role,
+      authMethod: 'apikey',
+      scopes: key.scopes,
+      // The KEY, not its owner. Several keys can resolve to one human, and each
+      // must be metered and attributed separately — that is the point of issuing
+      // more than one. Ownership still flows through userId above.
+      principalId: `key:${key.id}`,
+      ...(key.kind ? { kind: key.kind } : {}),
+    };
+  }
+
+  // A dangling ownerUserId fails CLOSED to 'none', never to key.role.
+  // verifyApiKey already refuses a missing/disabled owner outright, so this
+  // branch is unreached through the real auth paths today — but it must be a
+  // REAL branch here too, or the fail-closed behaviour is merely unreached
+  // rather than structurally impossible for a future/direct caller.
+  const ownerRole = owner?.role ?? 'none';
+  const role = minRole(key.role, ownerRole);
+
   return {
-    userId: key.ownerUserId ?? key.id,
-    username: key.name,
-    role: key.role,
+    userId: key.ownerUserId,
+    // Names the accountable human, not the credential. Safe only because
+    // Item 1 already landed `principalId` (below) on both the activity log
+    // and the security audit log, so the credential itself stays
+    // identifiable even though the row no longer names it here.
+    username: owner?.username ?? key.name,
+    role,
     authMethod: 'apikey',
-    scopes: key.scopes,
-    // The KEY, not its owner. Several keys can resolve to one human, and each
-    // must be metered and attributed separately — that is the point of issuing
-    // more than one. Ownership still flows through userId above.
+    scopes: clampControlPlaneScopes(key.scopes, role),
     principalId: `key:${key.id}`,
     ...(key.kind ? { kind: key.kind } : {}),
   };
@@ -1594,9 +1691,9 @@ export function authMiddleware(requiredRole?: 'admin' | 'user' | 'readonly') {
         // conventional `Authorization: Bearer <key>` works (keys are also accepted
         // via X-API-Key below). JWT is tried first, so real sessions keep their
         // semantics; only a non-JWT Bearer value is looked up as an API key.
-        const key = await verifyApiKey(token);
-        if (key) {
-          authContext = apiKeyAuthContext(key);
+        const verified = await verifyApiKey(token);
+        if (verified) {
+          authContext = apiKeyAuthContext(verified.key, verified.owner);
         }
       }
     }
@@ -1605,9 +1702,9 @@ export function authMiddleware(requiredRole?: 'admin' | 'user' | 'readonly') {
     if (!authContext) {
       const apiKey = c.req.header('X-API-Key');
       if (apiKey) {
-        const key = await verifyApiKey(apiKey);
-        if (key) {
-          authContext = apiKeyAuthContext(key);
+        const verified = await verifyApiKey(apiKey);
+        if (verified) {
+          authContext = apiKeyAuthContext(verified.key, verified.owner);
         }
       }
     }
@@ -1828,18 +1925,18 @@ export function optionalAuthMiddleware() {
       } else if (!payload) {
         // Not a valid JWT — accept a Bearer-presented API key too (mirrors
         // authMiddleware). A valid-but-challenge token is intentionally skipped.
-        const key = await verifyApiKey(token);
-        if (key) {
-          c.set('auth', apiKeyAuthContext(key));
+        const verified = await verifyApiKey(token);
+        if (verified) {
+          c.set('auth', apiKeyAuthContext(verified.key, verified.owner));
         }
       }
     }
 
     const apiKey = c.req.header('X-API-Key');
     if (apiKey && !c.get('auth')) {
-      const key = await verifyApiKey(apiKey);
-      if (key) {
-        c.set('auth', apiKeyAuthContext(key));
+      const verified = await verifyApiKey(apiKey);
+      if (verified) {
+        c.set('auth', apiKeyAuthContext(verified.key, verified.owner));
       }
     }
 
