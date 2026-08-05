@@ -283,8 +283,10 @@ describe('Auth Middleware', () => {
       const verified = await verifyApiKey(key);
 
       expect(verified).toBeDefined();
-      expect(verified!.name).toBe('verify-key');
-      expect(verified!.role).toBe('admin');
+      expect(verified!.key.name).toBe('verify-key');
+      expect(verified!.key.role).toBe('admin');
+      // Ownerless key — no owner to resolve.
+      expect(verified!.owner).toBeNull();
     });
 
     it('should return null for invalid API key', async () => {
