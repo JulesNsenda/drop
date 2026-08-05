@@ -11,7 +11,7 @@ import { getActivityLog } from '../../managers/activity';
 import { suspendUser, updateUser, listUsers, AuthContext } from '../middleware/auth';
 import { getStateManager } from '../../managers/app/state-manager';
 import { getAppRuntime } from '../../managers/runtime';
-import { tryLogActivity } from '../../managers/activity';
+import { logActivityFor } from '../../managers/activity';
 import { getDiskFreeMb } from '../../utils/disk';
 import { getSettingsManager } from '../../managers/settings/settings-manager';
 import { normalizePublicUrl } from '../../utils/url-validator';
@@ -101,10 +101,8 @@ admin.post('/users/:id/suspend', async (c) => {
     }
   }
 
-  await tryLogActivity({
+  await logActivityFor(authCtx, {
     action: 'suspend',
-    userId: authCtx?.userId,
-    username: authCtx?.username,
     detail: `Suspended user ${userId}; stopped ${userApps.length} app(s)`,
   });
 
@@ -127,10 +125,8 @@ admin.post('/users/:id/unsuspend', async (c) => {
     return c.json(error(ErrorCodes.NOT_FOUND, 'User not found'), 404);
   }
 
-  await tryLogActivity({
+  await logActivityFor(authCtx, {
     action: 'unsuspend',
-    userId: authCtx?.userId,
-    username: authCtx?.username,
     detail: `Unsuspended user ${userId}`,
   });
 
@@ -193,10 +189,8 @@ admin.post('/apps/:name/suspend', async (c) => {
   }
   await stateManager.setAppStatus(appName, 'stopped', { error: 'Suspended by admin' });
 
-  await tryLogActivity({
+  await logActivityFor(authCtx, {
     action: 'suspend',
-    userId: authCtx?.userId,
-    username: authCtx?.username,
     appName,
     detail: 'App suspended by admin',
   });
@@ -250,10 +244,8 @@ admin.post('/settings/github-webhook-secret/generate', async (c) => {
   const secret = crypto.randomBytes(32).toString('hex');
   await getSettingsManager().setGithubWebhookSecret(secret);
 
-  await tryLogActivity({
+  await logActivityFor(authCtx, {
     action: 'github-webhook-secret-generate',
-    userId: authCtx?.userId,
-    username: authCtx?.username,
   });
 
   return c.json(success({ secret, ...buildGithubWebhookPayload() }));
@@ -275,10 +267,8 @@ admin.put('/settings/github-webhook-secret', async (c) => {
 
   if (input === null || input === undefined || (typeof input === 'string' && input.trim() === '')) {
     await getSettingsManager().setGithubWebhookSecret(undefined);
-    await tryLogActivity({
+    await logActivityFor(authCtx, {
       action: 'github-webhook-secret-clear',
-      userId: authCtx?.userId,
-      username: authCtx?.username,
     });
     return c.json(success(buildGithubWebhookPayload()));
   }
@@ -308,10 +298,8 @@ admin.put('/settings/github-webhook-secret', async (c) => {
   }
 
   await getSettingsManager().setGithubWebhookSecret(trimmed);
-  await tryLogActivity({
+  await logActivityFor(authCtx, {
     action: 'github-webhook-secret-set',
-    userId: authCtx?.userId,
-    username: authCtx?.username,
   });
 
   return c.json(success(buildGithubWebhookPayload()));

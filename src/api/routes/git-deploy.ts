@@ -14,7 +14,7 @@ import { getStateManager } from '../../managers/app/state-manager';
 import { getSettingsManager } from '../../managers/settings/settings-manager';
 import { getUserById } from '../middleware/auth';
 import { canAccess } from '../access';
-import { tryLogActivity } from '../../managers/activity';
+import { logActivityFor } from '../../managers/activity';
 import { DeployRefusedError } from '../../managers/guardrail/deploy-breaker';
 import { QuotaExceededError } from '../../managers/guardrail/principal-quota';
 import type { GitDeployRequest, GitTokenCreateRequest } from '../../core/git-deploy';
@@ -87,7 +87,7 @@ gitDeploy.post('/deploy', async (c) => {
     body.agentCaller = auth?.kind === 'agent';
 
     const result = await service.deploy(body);
-    await tryLogActivity({ action: 'git-deploy', userId: auth?.userId, username: auth?.username, appName: result.appName, detail: result.repoUrl });
+    await logActivityFor(auth, { action: 'git-deploy', appName: result.appName, detail: result.repoUrl });
     return c.json(success(result), 201);
   } catch (err) {
     if (err instanceof DeployRefusedError || err instanceof QuotaExceededError) {
@@ -146,7 +146,7 @@ gitDeploy.post('/redeploy/:name', async (c) => {
       principalId: auth?.principalId,
       userId: auth?.userId,
     });
-    await tryLogActivity({ action: 'redeploy', userId: auth?.userId, username: auth?.username, appName: target.name });
+    await logActivityFor(auth, { action: 'redeploy', appName: target.name });
     return c.json(success(result));
   } catch (err) {
     if (err instanceof DeployRefusedError || err instanceof QuotaExceededError) {
@@ -244,7 +244,7 @@ gitDeploy.post('/webhook', async (c) => {
       // Webhook auto-redeploys are unattended and had no audit trail — record
       // them (system action, no user). The API /git/redeploy route logs its
       // own; this webhook path is distinct, so there is no double-count.
-      await tryLogActivity({ action: 'redeploy', appName, detail: `webhook: ${branch}` });
+      await logActivityFor(undefined, { action: 'redeploy', appName, detail: `webhook: ${branch}` });
       results.push({ app: appName, status: 'redeploying' });
     } catch (err) {
       results.push({

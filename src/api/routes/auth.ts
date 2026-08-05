@@ -30,7 +30,7 @@ import {
   completeMfaLogin,
   AuthContext,
 } from '../middleware/auth';
-import { tryLogActivity } from '../../managers/activity';
+import { tryLogActivity, logActivityFor } from '../../managers/activity';
 import { getStateManager } from '../../managers/app/state-manager';
 import { canAccess, interactiveSessionOnly } from '../access';
 import { assertMintable } from '../agent-scopes';
@@ -80,6 +80,9 @@ auth.post('/signup', async c => {
 
   try {
     const user = await createUser(body.username, body.password, 'user', body.email);
+    // Stays on tryLogActivity, not logActivityFor: identity here is the
+    // account this request just created, not an ambient AuthContext — there
+    // is no request auth to derive it from (signup precedes it).
     await tryLogActivity({ action: 'signup', userId: user.id, username: user.username });
     return c.json(
       success({
@@ -113,6 +116,8 @@ auth.post('/login', async c => {
     return c.json(error(ErrorCodes.UNAUTHORIZED, 'Invalid username or password'), 401);
   }
 
+  // Both of these stay on tryLogActivity, not logActivityFor: this request
+  // IS the authentication, so there is no AuthContext yet to derive from.
   if (result.status === 'mfa_required') {
     await tryLogActivity({ action: 'login_mfa_challenge', username: body.username });
     return c.json(success({ mfaRequired: true, challengeToken: result.challengeToken }));
@@ -212,10 +217,8 @@ auth.post('/api-keys', authMiddleware('admin'), async c => {
   // key name, so without this an admin could mint {ownerUserId: <other-admin>,
   // name: "<their-username>"} and have every later action attributed to them —
   // with the minting itself leaving no trace at all.
-  await tryLogActivity({
+  await logActivityFor(callerAuth, {
     action: 'apikey-create',
-    userId: callerAuth?.userId,
-    username: callerAuth?.username,
     detail: `key=${apiKey.id} name=${apiKey.name} role=${apiKey.role} owner=${apiKey.ownerUserId ?? 'none'}`,
   });
 
@@ -451,10 +454,8 @@ auth.delete('/account', authMiddleware(), async c => {
 
   try {
     await deleteUser(authCtx.userId);
-    await tryLogActivity({
+    await logActivityFor(authCtx, {
       action: 'delete',
-      userId: authCtx.userId,
-      username: authCtx.username,
       detail: 'Account deleted',
     });
     return c.json(success({ message: 'Account deleted' }));
@@ -490,6 +491,8 @@ auth.post('/mfa/verify', async c => {
   }
 
   // status === 'ok'
+  // Stays on tryLogActivity, not logActivityFor: completing the MFA
+  // challenge IS the authentication — there is no AuthContext yet.
   await tryLogActivity({
     action: 'login_mfa_ok',
     userId: result.user.id,
@@ -566,10 +569,8 @@ auth.post('/mfa/enable', authMiddleware(), async c => {
     );
   }
 
-  await tryLogActivity({
+  await logActivityFor(authCtx, {
     action: 'mfa_enabled',
-    userId: authCtx.userId,
-    username: authCtx.username,
   });
   return c.json(success({ message: 'Two-factor authentication enabled' }));
 });
@@ -604,10 +605,8 @@ auth.post('/mfa/disable', authMiddleware(), async c => {
     return c.json(error(ErrorCodes.MFA_INVALID, 'Invalid authentication code'), 401);
   }
 
-  await tryLogActivity({
+  await logActivityFor(authCtx, {
     action: 'mfa_disabled',
-    userId: authCtx.userId,
-    username: authCtx.username,
   });
   return c.json(success({ message: 'Two-factor authentication disabled' }));
 });
@@ -681,10 +680,8 @@ auth.post('/agent-tokens', authMiddleware('user'), async (c) => {
     { expiresInMinutes: minutes, kind: 'agent' }
   );
 
-  await tryLogActivity({
+  await logActivityFor(requester, {
     action: 'agent-token-issue',
-    userId: requester?.userId,
-    username: requester?.username,
     detail: `${check.normalized?.length ?? 0} scope(s), ${minutes}m`,
   });
 

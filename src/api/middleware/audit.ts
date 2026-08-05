@@ -18,6 +18,8 @@ export interface AuditLogEntry {
   ip: string;
   userId?: string;
   username?: string;
+  /** WHICH credential acted — see ActivityEntry.principalId for the rationale; this is the second forensic surface that needs it. */
+  principalId?: string;
   role?: string;
   authMethod?: string;
   statusCode: number;
@@ -113,6 +115,7 @@ export function auditMiddleware() {
       ip: getClientIp(c),
       userId: authContext?.userId,
       username: authContext?.username,
+      principalId: authContext?.principalId,
       role: authContext?.role,
       authMethod: authContext?.authMethod,
       statusCode: c.res.status,

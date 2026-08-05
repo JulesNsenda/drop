@@ -26,7 +26,7 @@ import { getAppConfigService } from '../../managers/app/app-config';
 import { getDatabaseProvisioner } from '../../managers/database';
 import { getRedisProvisioner } from '../../managers/redis';
 import { getRouterService } from '../../core/router';
-import { tryLogActivity } from '../../managers/activity';
+import { logActivityFor } from '../../managers/activity';
 import {
   getAppsDirectory,
   isHttpsEnabled,
@@ -440,10 +440,8 @@ apps.post('/', async c => {
     await stateManager.updateApp(appName, { userId: auth.userId });
   }
 
-  await tryLogActivity({
+  await logActivityFor(auth, {
     action: 'deploy',
-    userId: auth?.userId,
-    username: auth?.username,
     appName,
   });
   return c.json(success(toAppDto({ ...app, userId: auth?.userId }, auth?.role === 'admin')), 201);
@@ -507,10 +505,8 @@ apps.post('/:name/source', async c => {
       agentCaller: auth?.kind === 'agent',
     });
 
-    await tryLogActivity({
+    await logActivityFor(auth, {
       action: 'upload-deploy',
-      userId: auth?.userId,
-      username: auth?.username,
       appName: name,
     });
 
@@ -648,10 +644,8 @@ apps.delete('/:name', async c => {
 
     const { removed } = await ops.removeGroup(groupName);
 
-    await tryLogActivity({
+    await logActivityFor(auth, {
       action: 'delete',
-      userId: auth?.userId,
-      username: auth?.username,
       appName: groupName,
     });
 
@@ -811,10 +805,8 @@ apps.delete('/:name', async c => {
     }
   }
 
-  await tryLogActivity({
+  await logActivityFor(auth, {
     action: 'delete',
-    userId: auth?.userId,
-    username: auth?.username,
     appName: name,
   });
   return c.json(success({ message: `Application '${name}' removed`, database: dbStatus }));
@@ -841,10 +833,8 @@ apps.post('/:name/start', async c => {
     // (delete-then-fresh-start with a rebuilt spec); only the activity-log
     // action and response message differ.
     const status = await ops.restartApp(name);
-    await tryLogActivity({
+    await logActivityFor(auth, {
       action: 'start',
-      userId: auth?.userId,
-      username: auth?.username,
       appName: name,
     });
     return c.json(success({ message: `Application '${name}' started`, status }));
@@ -893,10 +883,8 @@ apps.post('/:name/stop', async c => {
       // Router may not be initialised (tests / standalone ApiServer)
     }
 
-    await tryLogActivity({
+    await logActivityFor(auth, {
       action: 'stop',
-      userId: auth?.userId,
-      username: auth?.username,
       appName: name,
     });
     return c.json(success({ message: `Application '${name}' stopped` }));
@@ -946,12 +934,8 @@ apps.post('/:name/promote', async c => {
 
   try {
     await ops.promoteApp(name);
-    await tryLogActivity({
+    await logActivityFor(auth, {
       action: 'promote',
-      userId: auth?.userId,
-      username: auth?.username,
-      principalId: auth?.principalId,
-      authMethod: auth?.authMethod,
       appName: name,
     });
     return c.json(success({ app: name, promoted: true }));
@@ -981,10 +965,8 @@ apps.post('/:name/restart', async c => {
 
   try {
     const status = await ops.restartApp(name);
-    await tryLogActivity({
+    await logActivityFor(auth, {
       action: 'restart',
-      userId: auth?.userId,
-      username: auth?.username,
       appName: name,
     });
     return c.json(success({ message: `Application '${name}' restarted`, status }));
@@ -1077,10 +1059,8 @@ apps.put('/:name/capabilities', async c => {
     return c.json(error(ErrorCodes.INTERNAL_ERROR, message), 500);
   }
 
-  await tryLogActivity({
+  await logActivityFor(auth, {
     action: 'grant-capabilities',
-    userId: auth?.userId,
-    username: auth?.username,
     appName: name,
   });
 
@@ -1176,10 +1156,8 @@ apps.post('/:name/migrate-runtime', async c => {
       });
     }
 
-    await tryLogActivity({
+    await logActivityFor(authCtx, {
       action: 'migrate-runtime',
-      userId: authCtx?.userId,
-      username: authCtx?.username,
       appName,
     });
 
