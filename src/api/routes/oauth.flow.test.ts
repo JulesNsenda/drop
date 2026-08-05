@@ -22,7 +22,7 @@ import { getStateManager, resetStateManager } from '../../managers/app/state-man
 import { setPlatformOps, resetPlatformOps, PlatformOps } from '../platform-ops';
 import { resetRateLimits } from '../middleware/rate-limit';
 import { resetUploadPreflightState } from '../upload-preflight';
-import { createUser, resetAuth } from '../middleware/auth';
+import { createUser, resetAuth, suspendUser, updateUser } from '../middleware/auth';
 import { __resetAuthCodeStore } from '../oauth/authorization-code';
 
 const PORT = 39481;
@@ -58,6 +58,7 @@ describe('OAuth 2.1 flow (PRD-041 integration)', () => {
   let adminToken: string;
   let userToken: string;
   let clientId: string;
+  let oauthUserId: string;
 
   async function login(username: string, password: string): Promise<string> {
     const res = await fetch(`${BASE_URL}/api/v1/auth/login`, {
@@ -102,7 +103,7 @@ describe('OAuth 2.1 flow (PRD-041 integration)', () => {
     // (consents + exchanges tokens) via the real auth module — mirrors how
     // an operator + an already-logged-in browser session would exist.
     await createUser('oauth-admin', 'adminpass123', 'admin');
-    await createUser('oauth-user', 'userpass123', 'user');
+    oauthUserId = (await createUser('oauth-user', 'userpass123', 'user')).id;
 
     adminToken = await login('oauth-admin', 'adminpass123');
     userToken = await login('oauth-user', 'userpass123');
@@ -245,6 +246,60 @@ describe('OAuth 2.1 flow (PRD-041 integration)', () => {
     expect(reuseRes.status).toBe(400);
     const reuseBody = (await reuseRes.json()) as { error: string };
     expect(reuseBody.error).toBe('invalid_grant');
+  });
+
+  it('DROP-130 Item 5: a refresh token issued BEFORE a forced containment (suspend + re-enable) is rejected at /oauth/token, not just at the primitive', async () => {
+    // Drives the actual HTTP refresh branch (oauth.ts:395-413), not
+    // `rotateRefreshToken` directly — proves the `credentialsInvalidBefore`
+    // check inside the primitive is what the route's OWN `enabled` check sits
+    // beside, exactly where the DROP-130 plan names this coverage.
+    const { codeVerifier, codeChallenge } = makePkcePair();
+    const approveRes = await fetch(`${BASE_URL}/api/v1/oauth/approve`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${userToken}` },
+      body: JSON.stringify({
+        client_id: clientId,
+        redirect_uri: CLAUDE_REDIRECT_URI,
+        code_challenge: codeChallenge,
+        code_challenge_method: 'S256',
+        state: 'containment-state',
+      }),
+    });
+    const approveBody = (await approveRes.json()) as ApiEnvelope<{ redirect: string }>;
+    const code = new URL(approveBody.data!.redirect).searchParams.get('code')!;
+
+    const tokenRes = await fetch(`${BASE_URL}/api/v1/oauth/token`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        grant_type: 'authorization_code',
+        code,
+        code_verifier: codeVerifier,
+        client_id: clientId,
+        redirect_uri: CLAUDE_REDIRECT_URI,
+      }).toString(),
+    });
+    const tokenBody = (await tokenRes.json()) as { refresh_token: string };
+    expect(tokenBody.refresh_token).toBeTruthy();
+
+    // Suspend to contain a suspected leak, then remediate + unsuspend — the
+    // canonical incident sequence DROP-130 Item 4 exists for. The refresh
+    // token was minted BEFORE this, so it must not come back to life.
+    await suspendUser(oauthUserId);
+    await updateUser(oauthUserId, { enabled: true });
+
+    const refreshRes = await fetch(`${BASE_URL}/api/v1/oauth/token`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        grant_type: 'refresh_token',
+        refresh_token: tokenBody.refresh_token,
+        client_id: clientId,
+      }).toString(),
+    });
+    expect(refreshRes.status).toBe(400);
+    const refreshBody = (await refreshRes.json()) as { error: string };
+    expect(refreshBody.error).toBe('invalid_grant');
   });
 
   it('redirect_uri mismatch is a 400 error page, not a redirect', async () => {

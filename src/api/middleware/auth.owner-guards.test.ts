@@ -85,12 +85,25 @@ describe('API-key ownership guards', () => {
     });
 
     it('suspending a user revokes their keys, as its docstring always promised', async () => {
+      // The MECHANISM changed (DROP-130 Item 4): the key is no longer purged
+      // from the store — it is stamped out of standing instead — but the
+      // promise the docstring makes (the key stops working) still holds.
       const bob = await createUser('bob', PASSWORD, 'user');
-      await createApiKey('bob-ci', 'user', undefined, undefined, bob.id);
+      const { key } = await createApiKey('bob-ci', 'user', undefined, undefined, bob.id);
 
       await suspendUser(bob.id);
 
-      expect(listApiKeys().map(k => k.name)).not.toContain('bob-ci');
+      expect(await verifyApiKey(key)).toBeNull();
+
+      // The reversibility test: un-suspending must NOT resurrect a credential
+      // that existed at suspension time — that would silently hand back
+      // whatever the suspension was meant to contain. A key minted AFTER
+      // re-enable must work normally.
+      await updateUser(bob.id, { enabled: true });
+
+      expect(await verifyApiKey(key)).toBeNull();
+      const { key: freshKey } = await createApiKey('bob-ci-2', 'user', undefined, undefined, bob.id);
+      expect(await verifyApiKey(freshKey)).not.toBeNull();
     });
 
     it('leaves legacy ownerless keys alone when an unrelated user is deleted', async () => {

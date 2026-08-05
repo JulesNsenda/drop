@@ -44,6 +44,16 @@ export interface User {
   enabled?: boolean; // default true
   maxApps?: number; // per-user override (0 = use global default)
   mustChangePassword?: boolean;
+  /**
+   * DROP-130 Items 4 & 5: an ISO timestamp stamped by `suspendUser`
+   * (reversible suspension) and `resetUserPassword` (admin-forced containment,
+   * as opposed to onboarding's `mustChangePassword`). Any API key, refresh
+   * token or OAuth/app-MCP access token minted BEFORE this stamp is rejected
+   * going forward, even after the account is re-enabled or the password is
+   * changed — see `predatesInvalidationStamp`. Never cleared automatically:
+   * clearing it would resurrect every credential the stamp was meant to kill.
+   */
+  credentialsInvalidBefore?: string;
   /** MFA enabled flag */
   mfaEnabled?: boolean;
   /** Encrypted TOTP secret (AES-256-GCM via platform encryption key) */
@@ -190,6 +200,39 @@ export function minRole(a: string, b: string): 'admin' | 'user' | 'readonly' | '
     | 'user'
     | 'readonly'
     | 'none';
+}
+
+/**
+ * Whether a credential predates the owner's `credentialsInvalidBefore` stamp
+ * (DROP-130 Items 4 & 5) — the one primitive `suspendUser` (reversible
+ * suspension) and `resetUserPassword` (forced-reset containment) both rely on
+ * to kill every credential that existed BEFORE the incident, without deleting
+ * them and without touching anything minted after.
+ *
+ * `mintedAt` accepts either an ISO string (`ApiKey.createdAt` /
+ * `RefreshTokenRecord.createdAt`) or Unix seconds (a JWT `iat` claim), so the
+ * OAuth/app-MCP access-token checks — which have no stored record, only a
+ * signed claim — can reuse the same primitive. A missing or unparseable
+ * `mintedAt` fails CLOSED (treated as predating the stamp): an
+ * un-timestamped credential must not be assumed safe. An unparseable `stamp`
+ * fails open — that would be OUR OWN data corruption, not something a caller
+ * can control by mis-shaping a credential, and every stamp we ever write is
+ * `new Date().toISOString()`.
+ */
+function predatesInvalidationStamp(
+  mintedAt: string | number | undefined,
+  stamp: string | undefined
+): boolean {
+  if (!stamp) return false; // no incident recorded — nothing to invalidate
+  if (mintedAt === undefined) return true; // fail closed
+
+  const mintedMs = typeof mintedAt === 'number' ? mintedAt * 1000 : Date.parse(mintedAt);
+  if (Number.isNaN(mintedMs)) return true; // unparseable — fail closed
+
+  const stampMs = Date.parse(stamp);
+  if (Number.isNaN(stampMs)) return false; // malformed stamp — see docstring
+
+  return mintedMs < stampMs;
 }
 
 /** A rotated-on-use opaque refresh token, hashed at rest (never the raw token). */
@@ -540,7 +583,18 @@ export async function changePassword(userId: string, currentPassword: string, ne
  * Update a user's properties (admin function)
  */
 /**
- * Admin reset a user's password
+ * Admin reset a user's password — CONTAINMENT, not onboarding. This is an
+ * admin forcing a reset on a possibly-compromised account (reachable from the
+ * dashboard's "Reset password" button), distinct from `createUser(..., true)`
+ * / self-service signup's `mustChangePassword`, which is onboarding ("set
+ * your own password") and does NOT touch `credentialsInvalidBefore`.
+ *
+ * DROP-130 Item 5: reuses Item 4's stamp, so every API key, refresh token and
+ * OAuth/app-MCP access token that existed before this call stops
+ * authenticating — the same mechanism `suspendUser` uses, and for the same
+ * reason: the account most likely to need a forced reset is one whose
+ * credentials may already be in someone else's hands, and the JWT-only
+ * `mustChangePassword` gate never reached any of those.
  */
 export async function resetUserPassword(userId: string, newPassword: string): Promise<boolean> {
   if (!credentials || !config) throw new Error('Auth not initialized');
@@ -549,6 +603,7 @@ export async function resetUserPassword(userId: string, newPassword: string): Pr
   const { hash } = hashPassword(newPassword);
   user.passwordHash = hash;
   user.mustChangePassword = true;
+  user.credentialsInvalidBefore = new Date().toISOString();
   await saveCredentials(config.credentialsPath, credentials);
   return true;
 }
@@ -571,7 +626,10 @@ export async function deleteUser(userId: string): Promise<boolean> {
   // orphaned key, so this is defence in depth — but it keeps the stored state
   // honest rather than leaving dangling credentials in the file.
   credentials.apiKeys = credentials.apiKeys.filter((k) => k.ownerUserId !== userId);
-  // Same for OAuth grants — see suspendUser.
+  // Same for OAuth grants. Unlike `suspendUser` (DROP-130 Item 4), a deletion
+  // is not reversible — there is no re-enable to protect against — so purging
+  // the records outright (rather than stamping `credentialsInvalidBefore`) is
+  // still correct here.
   credentials.refreshTokens = (credentials.refreshTokens ?? []).filter(
     (r) => r.userId !== userId
   );
@@ -580,8 +638,26 @@ export async function deleteUser(userId: string): Promise<boolean> {
 }
 
 /**
- * Suspend a user: disables their account and revokes all their API keys.
- * Login is blocked immediately; existing JWTs expire naturally (within 24h).
+ * Suspend a user: disables their account and stamps `credentialsInvalidBefore`
+ * so every API key, refresh token and OAuth/app-MCP access token that already
+ * existed stops authenticating — WITHOUT deleting them. Login is blocked
+ * immediately; existing JWTs expire naturally (within 24h).
+ *
+ * DROP-130 Item 4: this used to hard-delete `apiKeys` and `refreshTokens`,
+ * which is exactly wrong at re-enable. `POST /admin/users/:id/unsuspend` only
+ * flips `enabled` back to true — a purge's value is not *during* suspension
+ * (every auth path already rejects a disabled owner), it is *at re-enable*:
+ * without the stamp, every key, agent token and refresh token live at
+ * suspension time comes back verbatim the moment the account is re-enabled.
+ * The canonical incident sequence is *suspend to contain a suspected leak ->
+ * remediate -> unsuspend*, and that would silently hand the attacker back
+ * their stolen credential. Stamping instead of purging gives reversibility to
+ * the ACCOUNT without giving it to the account's outstanding credentials — a
+ * credential minted before the stamp never authenticates again, re-enabled or
+ * not; one minted after does. See `predatesInvalidationStamp` and its callers
+ * (`verifyApiKey`, `rotateRefreshToken`, `verifyOAuthAccessToken`,
+ * `verifyAppMcpAccessToken`).
+ *
  * Returns false if the user was not found.
  */
 export async function suspendUser(userId: string): Promise<boolean> {
@@ -590,19 +666,7 @@ export async function suspendUser(userId: string): Promise<boolean> {
   if (!user) return false;
   if (user.role === 'admin') throw new Error('Cannot suspend an admin account');
   user.enabled = false;
-  // The docstring above has always promised this; it was never implemented,
-  // and it did nothing while a key's userId was its own id. Now that keys act
-  // as their owner, a suspended user's keys would otherwise keep full access
-  // to every app they own.
-  credentials.apiKeys = credentials.apiKeys.filter((k) => k.ownerUserId !== userId);
-  // ...and their OAuth grants. Without this, suspension blocks login and
-  // purges keys while every outstanding refresh token keeps minting fresh
-  // 15-minute access tokens INDEFINITELY — refresh records carry no expiry and
-  // the refresh path never checked `enabled`. revokeAllRefreshTokensForUser
-  // existed for exactly this and had no caller at all.
-  credentials.refreshTokens = (credentials.refreshTokens ?? []).filter(
-    (r) => r.userId !== userId
-  );
+  user.credentialsInvalidBefore = new Date().toISOString();
   await saveCredentials(config.credentialsPath, credentials);
   return true;
 }
@@ -1005,6 +1069,14 @@ export async function verifyAppMcpAccessToken(
     const user = getUserById(userId);
     if (!user || user.enabled === false) return null;
 
+    // DROP-130 Item 5: mcpAuthMiddleware never reaches authMiddleware, so this
+    // is the only gate an app-MCP token passes through. A token MINTED before
+    // the owner was suspended or force-reset must not keep authenticating for
+    // the rest of its 15-minute lifetime just because the account was later
+    // re-enabled or the password changed.
+    const iat = typeof p['iat'] === 'number' ? (p['iat'] as number) : undefined;
+    if (predatesInvalidationStamp(iat, user.credentialsInvalidBefore)) return null;
+
     const sid = p['sid'];
     if (typeof sid === 'string' && sid && isGrantDenied(sid)) return null;
 
@@ -1064,6 +1136,14 @@ export async function verifyOAuthAccessToken(
     // verifyApiKey has done exactly this since DROP-075.
     const record = getUserById(userId);
     if (!record || record.enabled === false) return null;
+
+    // DROP-130 Item 5: mcpAuthMiddleware never reaches authMiddleware, so this
+    // is the only gate an OAuth access token passes through. A token MINTED
+    // before the owner was suspended or force-reset must not keep
+    // authenticating for the rest of its 15-minute lifetime just because the
+    // account was later re-enabled or the password changed.
+    const iat = typeof p['iat'] === 'number' ? (p['iat'] as number) : undefined;
+    if (predatesInvalidationStamp(iat, record.credentialsInvalidBefore)) return null;
 
     // Single-grant revocation, within this process lifetime. Not durable — see
     // the note above the denylist.
@@ -1210,7 +1290,7 @@ export async function rotateRefreshToken(presented: string): Promise<{
   const index = records.findIndex((r) => r.tokenHash === tokenHash);
   if (index === -1) return null;
 
-  const { userId, clientId, sid, resource } = records[index];
+  const { userId, clientId, sid, resource, createdAt } = records[index];
 
   // Checked BEFORE the record is consumed below. Doing this after the splice
   // (and after a fresh record has already been minted and persisted) would
@@ -1221,6 +1301,13 @@ export async function rotateRefreshToken(presented: string): Promise<{
   // record untouched, so a retry costs nothing and mutates nothing.
   const owner = credentials.users.find((u) => u.id === userId);
   if (!owner || owner.enabled === false) return null;
+
+  // DROP-130 Items 4 & 5: same rule, same reason — a refresh record minted
+  // BEFORE the owner was suspended or force-reset must not keep minting fresh
+  // access tokens after a later re-enable or password change. Checked here,
+  // before the record is consumed, for the same reason as the `enabled`
+  // check above.
+  if (predatesInvalidationStamp(createdAt, owner.credentialsInvalidBefore)) return null;
 
   const carried = sid ?? crypto.randomUUID();
   records.splice(index, 1);
@@ -1271,18 +1358,6 @@ export async function revokeRefreshToken(presented: string): Promise<boolean> {
   credentials.refreshTokens = records;
   await saveCredentials(config.credentialsPath, credentials);
   return true;
-}
-
-/** Revoke every refresh token issued to a user, and deny their live access tokens. */
-export async function revokeAllRefreshTokensForUser(userId: string): Promise<void> {
-  if (!credentials || !config) throw new Error('Auth not initialized');
-
-  const records = credentials.refreshTokens ?? [];
-  const filtered = records.filter((r) => r.userId !== userId);
-  if (filtered.length === records.length) return;
-
-  credentials.refreshTokens = filtered;
-  await saveCredentials(config.credentialsPath, credentials);
 }
 
 /**
@@ -1430,6 +1505,12 @@ export async function verifyApiKey(
   if (apiKey.ownerUserId) {
     owner = getUserById(apiKey.ownerUserId);
     if (!owner || owner.enabled === false) {
+      return null;
+    }
+    // DROP-130 Items 4 & 5: a key minted BEFORE the owner was suspended or had
+    // their password force-reset must not keep authenticating just because
+    // the account was later re-enabled or the password changed.
+    if (predatesInvalidationStamp(apiKey.createdAt, owner.credentialsInvalidBefore)) {
       return null;
     }
   }
@@ -1717,30 +1798,53 @@ export function authMiddleware(requiredRole?: 'admin' | 'user' | 'readonly') {
       );
     }
 
-    // Force-password-change gate (JWT only — API keys are programmatic and exempt)
+    // Account-liveness check (JWT only — API keys are programmatic and exempt).
+    //
+    // `jwtUserRecord` is populated ONLY on the JWT path, and that is
+    // load-bearing, not incidental (DROP-130 Item 5) — do not add a lookup
+    // here for any other `authMethod`. For an ownerless key `authContext.userId`
+    // is the KEY's own id, not a real user id, so an unconditional
+    // `getUserById` lookup would 401 every ownerless key: `DROP_API_KEY` in
+    // every tenant container and the `cli-local` CLI key. For an OWNED key it
+    // IS a real user id, so running the `mustChangePassword` 403 below against
+    // it would re-arm the exact danger this item exists to avoid: an admin's
+    // "Reset password" click (`resetUserPassword`) would then instantly 403
+    // every CI key and agent token that user owns, with no programmatic
+    // recovery — a key cannot change its owner's password. Containment for
+    // those non-JWT credentials is instead handled by `credentialsInvalidBefore`
+    // inside `verifyApiKey` / `rotateRefreshToken` / `verifyOAuthAccessToken` /
+    // `verifyAppMcpAccessToken` (Items 4 & 5).
+    let jwtUserRecord: SafeUser | null = null;
     if (authContext.authMethod === 'jwt') {
-      const userRecord = getUserById(authContext.userId);
+      jwtUserRecord = getUserById(authContext.userId);
       // A session JWT lives 24 HOURS and carries its role in the claim, so
       // without this a deleted, suspended or demoted account kept full access
       // for a day — while the OAuth path is now revoked in milliseconds.
       // Making one immediate and leaving the other is worse than doing
       // neither, because it reads as covered.
-      if (!userRecord || userRecord.enabled === false) {
+      if (!jwtUserRecord || jwtUserRecord.enabled === false) {
         return c.json(error(ErrorCodes.UNAUTHORIZED, 'Account is no longer active'), 401);
       }
       // Role from the RECORD, not the claim — a demotion must bite now.
-      authContext.role = userRecord.role as AuthContext['role'];
-      if (userRecord.mustChangePassword) {
-        const p = c.req.path || '';
-        const isExempt =
-          (c.req.method === 'PUT' && p.endsWith('/auth/password')) ||
-          (c.req.method === 'GET' && p.endsWith('/auth/me'));
-        if (!isExempt) {
-          return c.json(
-            error(ErrorCodes.MUST_CHANGE_PASSWORD, 'Password change required before accessing this resource.'),
-            403
-          );
-        }
+      authContext.role = jwtUserRecord.role as AuthContext['role'];
+    }
+
+    // Force-password-change gate. Structurally separate from the 401 above —
+    // see the comment on `jwtUserRecord`: it stays `null` for every
+    // non-JWT-authenticated request, so this remains JWT-only in practice
+    // (onboarding's `mustChangePassword`, from `createUser`/signup, is meant
+    // to be JWT-only; the split is what keeps it that way rather than an
+    // accident of what happened to assign the variable).
+    if (jwtUserRecord?.mustChangePassword) {
+      const p = c.req.path || '';
+      const isExempt =
+        (c.req.method === 'PUT' && p.endsWith('/auth/password')) ||
+        (c.req.method === 'GET' && p.endsWith('/auth/me'));
+      if (!isExempt) {
+        return c.json(
+          error(ErrorCodes.MUST_CHANGE_PASSWORD, 'Password change required before accessing this resource.'),
+          403
+        );
       }
     }
 
