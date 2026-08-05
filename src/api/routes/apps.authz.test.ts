@@ -152,4 +152,44 @@ describe('app route authorization', () => {
     });
     expect(res.status).toBe(507);
   });
+
+  it('gates POST /apps at the user role (E)', async () => {
+    // readonly must not reach the collection route at all.
+    await createUser('viewer', 'password123', 'readonly');
+    const viewerToken = await getTestToken('viewer', 'password123');
+    const dir = path.join(tempDir, 'role-gate-dir');
+    await fs.mkdir(dir, { recursive: true });
+
+    const blocked = await app.request('/api/v1/apps', {
+      method: 'POST',
+      headers: { ...authHeader(viewerToken), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: dir, name: 'role-gate-app' }),
+    });
+    expect(blocked.status).toBe(403);
+
+    // user clears the role gate (the route's own path-containment check may
+    // still reject the request — bob's dir isn't under the webapps root — but
+    // that must not be a 403, or the two failure modes are indistinguishable).
+    const allowed = await app.request('/api/v1/apps', {
+      method: 'POST',
+      headers: { ...authHeader(bobToken), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: dir, name: 'role-gate-app' }),
+    });
+    expect(allowed.status).not.toBe(403);
+  });
+
+  it('leaves GET /apps (the collection/list route) readable at readonly (E, negative half)', async () => {
+    // The method-scoped guard in server.ts is only exercised on the POST side
+    // above — this pins the OTHER half of that same predicate: an
+    // implementation that collapsed the method check (e.g. gating every verb,
+    // not just DELETE/PUT/PATCH/POST) would still go green without this. GET
+    // /apps must stay open at readonly, same as GET /apps/:name already is
+    // (auth.apps-role-gate.route.test.ts).
+    await createUser('viewer2', 'password123', 'readonly');
+    const viewerToken = await getTestToken('viewer2', 'password123');
+
+    const res = await app.request('/api/v1/apps', { headers: authHeader(viewerToken) });
+
+    expect(res.status).toBe(200);
+  });
 });

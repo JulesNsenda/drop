@@ -59,7 +59,7 @@ describe('POST /apps/:name/start and /apps/:name/restart (platform ops)', () => 
     tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'drop-restart-route-test-'));
     jest.spyOn(console, 'log').mockImplementation();
     jest.spyOn(console, 'warn').mockImplementation();
-    logSpy = jest.spyOn(activity, 'tryLogActivity').mockResolvedValue();
+    logSpy = jest.spyOn(activity, 'logActivityFor').mockResolvedValue();
 
     resetStateManager();
     resetAuth();
@@ -194,8 +194,9 @@ describe('POST /apps/:name/start and /apps/:name/restart (platform ops)', () => 
       expect(body.data.status).toMatchObject({ pid: RUNNING_PROCESS.pid, port: RUNNING_PROCESS.port });
       expect(ops.restartApp).toHaveBeenCalledWith('test-app');
 
-      const entry = logSpy.mock.calls.find((call) => call[0].action === 'restart')?.[0];
-      expect(entry).toMatchObject({ action: 'restart', appName: 'test-app', userId: ownerId });
+      const call = logSpy.mock.calls.find((call) => call[1].action === 'restart');
+      expect(call?.[1]).toMatchObject({ action: 'restart', appName: 'test-app' });
+      expect(call?.[0]).toMatchObject({ userId: ownerId });
     });
 
     it('starts the app, returns the status, and logs a start activity', async () => {
@@ -211,8 +212,9 @@ describe('POST /apps/:name/start and /apps/:name/restart (platform ops)', () => 
       expect(body.data.status).toMatchObject({ pid: RUNNING_PROCESS.pid, port: RUNNING_PROCESS.port });
       expect(ops.restartApp).toHaveBeenCalledWith('test-app');
 
-      const entry = logSpy.mock.calls.find((call) => call[0].action === 'start')?.[0];
-      expect(entry).toMatchObject({ action: 'start', appName: 'test-app', userId: ownerId });
+      const call = logSpy.mock.calls.find((call) => call[1].action === 'start');
+      expect(call?.[1]).toMatchObject({ action: 'start', appName: 'test-app' });
+      expect(call?.[0]).toMatchObject({ userId: ownerId });
     });
   });
 

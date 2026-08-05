@@ -132,26 +132,34 @@ describe('API key ownership attribution', () => {
 
     const reloaded = await verifyApiKey(key);
     expect(reloaded).not.toBeNull();
-    expect(reloaded!.ownerUserId).toBe(bob.id);
+    expect(reloaded!.key.ownerUserId).toBe(bob.id);
+    expect(reloaded!.owner?.id).toBe(bob.id);
 
     const auth = await authenticateWithKey(key);
     expect(auth!.userId).toBe(bob.id);
   });
 
-  it('does not disturb scopes or role on the resolved context', async () => {
+  it('resolves role from the owner, and leaves an agent-grammar scope untouched', async () => {
+    // DROP-130 Item 3 makes role AND scopes owner-derived: a control-plane
+    // scope like `users:create` on this same key would now be suppressed,
+    // because a role:'none' key always clamps to 'none' (min with anything
+    // is 'none') — see auth.owner-standing.test.ts for that behaviour end to
+    // end. An agent-grammar scope is explicitly exempt from that
+    // suppression, so it is what proves ownership resolution alone still
+    // leaves a legitimate scope alone.
     const bob = await createUser('bob', 'pw-bob-123456', 'user');
     const { key } = await createApiKey(
       'scoped',
       'none',
       undefined,
-      ['users:create'],
+      ['app:demo:deploy'],
       bob.id
     );
 
     const auth = await authenticateWithKey(key);
 
     expect(auth!.role).toBe('none');
-    expect(auth!.scopes).toEqual(['users:create']);
+    expect(auth!.scopes).toEqual(['app:demo:deploy']);
     expect(auth!.userId).toBe(bob.id);
   });
 });

@@ -18,6 +18,19 @@ export type AuthCodeRecord = {
   codeChallenge: string;
   resource: string;
   expiresAt: number;
+  /**
+   * DROP-130 MEDIUM-5: when the code was minted, always set by
+   * `mintAuthorizationCode` regardless of what the caller passes. Lets
+   * `POST /oauth/token`'s `authorization_code` exchange reject a code that
+   * predates the user's `credentialsInvalidBefore` stamp — without this, a
+   * code alive at suspension time could still be exchanged after, laundering
+   * a pre-incident credential into a refresh token whose own `createdAt` is
+   * fresh and therefore survives every future stamp check. Optional (rather
+   * than added to `mintAuthorizationCode`'s own Omit) so no caller — the one
+   * production call site or the existing test file's `baseParams` — needs to
+   * change shape to keep compiling.
+   */
+  createdAt?: string;
 };
 
 const codes = new Map<string, AuthCodeRecord>();
@@ -37,7 +50,11 @@ export function mintAuthorizationCode(params: Omit<AuthCodeRecord, 'expiresAt'>)
   pruneExpired();
 
   const code = crypto.randomBytes(32).toString('base64url');
-  codes.set(code, { ...params, expiresAt: Date.now() + AUTH_CODE_TTL_MS });
+  codes.set(code, {
+    ...params,
+    expiresAt: Date.now() + AUTH_CODE_TTL_MS,
+    createdAt: new Date().toISOString(),
+  });
 
   return code;
 }
