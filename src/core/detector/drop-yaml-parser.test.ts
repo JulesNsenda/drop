@@ -100,6 +100,96 @@ describe('Drop YAML Parser', () => {
     });
   });
 
+  // DROP-130 item 9: a parse failure discards the WHOLE manifest (build,
+  // start, domains, env, secrets, database, redis, depends_on, services —
+  // not just the offending field), and none of parseDropYaml's ~14 callers
+  // in platform.ts read `.error`. This is the one site that can make that
+  // visible at all.
+  describe('parseDropYaml - surfaces parse failures (DROP-130 item 9)', () => {
+    let warnSpy: jest.SpyInstance;
+
+    beforeEach(() => {
+      warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    });
+
+    afterEach(() => {
+      warnSpy.mockRestore();
+    });
+
+    it('surfaces exactly one warning naming the app and the validation message for a malformed secret name', async () => {
+      // JWT-SECRET fails SECRET_NAME_REGEX (hyphens aren't a valid env var
+      // char) and discards the entire document, not just `secrets`.
+      await fs.writeFile(path.join(tmpDir, 'drop.yaml'), 'secrets:\n  JWT-SECRET: true\n');
+
+      const result = await parseDropYaml(tmpDir);
+
+      expect(result.success).toBe(false);
+      expect(warnSpy).toHaveBeenCalledTimes(1);
+      const [message] = warnSpy.mock.calls[0];
+      expect(message).toContain(path.basename(tmpDir));
+      expect(message).toContain(result.error);
+    });
+
+    it('does not warn for a valid drop.yaml', async () => {
+      await fs.writeFile(path.join(tmpDir, 'drop.yaml'), 'name: my-app\nport: 8080\n');
+
+      const result = await parseDropYaml(tmpDir);
+
+      expect(result.success).toBe(true);
+      expect(warnSpy).not.toHaveBeenCalled();
+    });
+
+    it('dedupes repeated warnings across repeated parses of the same unchanged file', async () => {
+      await fs.writeFile(path.join(tmpDir, 'drop.yaml'), 'secrets:\n  JWT-SECRET: true\n');
+
+      await parseDropYaml(tmpDir);
+      await parseDropYaml(tmpDir);
+      await parseDropYaml(tmpDir);
+
+      expect(warnSpy).toHaveBeenCalledTimes(1);
+    });
+
+    it('warns again once the file is actually edited (mtime changes)', async () => {
+      const yamlPath = path.join(tmpDir, 'drop.yaml');
+      await fs.writeFile(yamlPath, 'secrets:\n  JWT-SECRET: true\n');
+      await parseDropYaml(tmpDir);
+      expect(warnSpy).toHaveBeenCalledTimes(1);
+
+      // Force a distinct mtime explicitly: some filesystems have coarse mtime
+      // resolution, so a same-tick rewrite could alias to the same value and
+      // hide a real bug in the dedupe key.
+      await fs.writeFile(yamlPath, 'secrets:\n  ANOTHER-BAD: true\n');
+      const future = new Date(Date.now() + 5000);
+      await fs.utimes(yamlPath, future, future);
+
+      await parseDropYaml(tmpDir);
+      expect(warnSpy).toHaveBeenCalledTimes(2);
+    });
+
+    it('flattens a newline-bearing, oversized error to a single bounded log line', async () => {
+      // A quoted YAML key can carry an embedded newline; validateDropYamlConfig
+      // echoes it verbatim in "Unknown field '<key>'" since it isn't in
+      // ALLOWED_TOP_KEYS. Unsanitized, that would let a hostile drop.yaml forge
+      // fake log lines in the warning this item adds.
+      const forged = 'A' + '\n[2026-01-01T00:00:00Z] [ERROR] [AUTH] fake entry '.repeat(50) + 'B';
+      expect(forged.length).toBeGreaterThan(1000);
+      await fs.writeFile(path.join(tmpDir, 'drop.yaml'), `"${forged.replace(/\n/g, '\\n')}": true\n`);
+
+      const result = await parseDropYaml(tmpDir);
+
+      expect(result.success).toBe(false);
+      // The raw (unsanitized) message is still returned to callers.
+      expect(result.error).toContain('\n');
+
+      expect(warnSpy).toHaveBeenCalledTimes(1);
+      const [message] = warnSpy.mock.calls[0];
+      expect(message.includes('\n')).toBe(false);
+      // Bounded well below the ~1000+ char forged value — proves the cap, not
+      // an exact byte count of this test's own wrapper text.
+      expect(message.length).toBeLessThan(600);
+    });
+  });
+
   describe('validateDropYamlConfig', () => {
     it('should accept null/undefined config', () => {
       expect(validateDropYamlConfig(null).valid).toBe(true);
