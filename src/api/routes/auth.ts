@@ -112,7 +112,17 @@ auth.post('/login', async c => {
 
   const result = await authenticateUser(body.username, body.password);
 
-  if (result.status === 'invalid' || result.status === 'disabled') {
+  // DROP-130 Item 6: `awaiting_admin_password` (a scoped-`users:create`
+  // account whose password has never been set by an admin) maps to the exact
+  // same response as `invalid` / `disabled` — a distinct message here would
+  // tell a caller who already knows the account exists (they created it)
+  // that their escalation attempt was specifically recognised, rather than
+  // just rejected like any other failed login.
+  if (
+    result.status === 'invalid' ||
+    result.status === 'disabled' ||
+    result.status === 'awaiting_admin_password'
+  ) {
     return c.json(error(ErrorCodes.UNAUTHORIZED, 'Invalid username or password'), 401);
   }
 
@@ -363,13 +373,29 @@ auth.post('/users', authMiddleware(), requireCapability('users:create'), async c
     );
   }
 
+  // DROP-130 Item 6: mark the account as created through the SCOPED
+  // (non-admin, capability-only) path whenever the caller itself is not an
+  // admin — the same test the role-clamp check above uses, since both ask
+  // "is a non-admin capability holder driving this request", not "did the
+  // request body ask for a non-default role". `createUser` stamps
+  // `createdByScope` on the record; `authenticateUser` then refuses to log
+  // this account in until an admin resets its password (`resetUserPassword`,
+  // which clears the marker) — closing the chain this credential would
+  // otherwise reach: login -> PUT /auth/password (JWT-only, exempt from the
+  // mustChangePassword 403) -> POST /apps/:name/source, whose new-app scope
+  // check in upload-preflight.ts applies only to rank-0 callers. Never set
+  // when auth is disabled (no authCtx) — that preserves the pre-existing,
+  // effectively-admin behaviour of an open single-operator box.
+  const createdByScope = authCtx !== undefined && authCtx.role !== 'admin';
+
   try {
     const user = await createUser(
       body.username,
       body.password,
       body.role || 'user',
       undefined,
-      true
+      true,
+      createdByScope
     );
     return c.json(
       success({
