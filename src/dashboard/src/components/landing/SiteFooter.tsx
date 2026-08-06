@@ -26,7 +26,7 @@ const FOOTER_COLUMNS: FooterColumn[] = [
     key: 'product',
     title: 'Product',
     links: [
-      { label: 'Features', href: '#features' },
+      { label: 'What you get', href: '#features' },
       { label: 'Dashboard', enter: true },
       { label: 'Runtimes', href: '#runtimes' },
       { label: 'Changelog', href: GITHUB_URL, external: true },
