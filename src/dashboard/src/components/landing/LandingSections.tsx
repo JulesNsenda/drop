@@ -22,12 +22,20 @@ import {
 
 export interface LandingSectionsProps {
   onEnter: () => void;
-  onSignup: () => void;
-  authEnabled: boolean;
 }
 
 type EnterProps = Pick<LandingSectionsProps, 'onEnter'>;
 type HeroProps = LandingSectionsProps;
+
+// Access to the hosted instance is by invitation — `allowSignup` defaults to
+// false (DROP_ALLOW_SIGNUP, platform.ts) and dropkit.sh runs it that way, so
+// sending a new visitor to /dashboard/signup funnels them into a page that
+// refuses them. Every "get started" CTA points here instead.
+//
+// This is the one host-specific string on the page. If you are self-hosting
+// DROP and have opened signup, change this to '/dashboard/signup' (or drop the
+// CTA) — everything else here is deliberately host-neutral.
+const REQUEST_ACCESS_URL = 'https://waitlist.dropkit.sh';
 
 // Page order is deliberate and audience-driven: a reader meets the *outcome*
 // (hero → what you get → who it's for → how it works → how to run it) before
@@ -142,7 +150,11 @@ const AUDIENCES: {
   },
 ];
 
-const HOSTED_POINTS = ['Nothing to install', 'Sign in and deploy', 'Someone else handles updates and backups'];
+const HOSTED_POINTS = [
+  'Nothing to install, nothing to maintain',
+  'Someone else handles updates and backups',
+  'Currently invitation-only',
+];
 
 const SELFHOST_POINTS = [
   'Runs on a small Linux VPS',
@@ -239,7 +251,7 @@ function ProofLine({ children }: { children: ReactNode }): JSX.Element {
   );
 }
 
-function HeroSection({ onEnter, onSignup, authEnabled }: HeroProps): JSX.Element {
+function HeroSection({ onEnter }: HeroProps): JSX.Element {
   return (
     <section style={{ position: 'relative', overflow: 'hidden' }}>
       <div
@@ -333,36 +345,34 @@ function HeroSection({ onEnter, onSignup, authEnabled }: HeroProps): JSX.Element
             Node · Python · Go · Docker · static — detected automatically. No Dockerfile required.
           </p>
           <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', marginBottom: 26 }}>
-            <button type="button" onClick={onEnter} style={primaryBtnStyle}>
-              Get started →
-            </button>
+            <a href={REQUEST_ACCESS_URL} target="_blank" rel="noopener noreferrer" style={primaryBtnStyle}>
+              Request access →
+            </a>
             {/* Same site bundle (DROP-070) — an in-page anchor, not a
                 cross-bundle jump. */}
             <a href="#how-it-works" className="dl-hover-border" style={secondaryBtnStyle}>
               See how it works
             </a>
           </div>
-          {authEnabled && (
-            <button
-              type="button"
-              onClick={onSignup}
-              className="dl-hover-text"
-              style={{
-                display: 'block',
-                fontFamily: 'var(--mono)',
-                fontSize: 13,
-                color: 'var(--text-2)',
-                background: 'none',
-                border: 'none',
-                padding: 0,
-                marginBottom: 20,
-                cursor: 'pointer',
-                font: 'inherit',
-              }}
-            >
-              Create an account
-            </button>
-          )}
+          <button
+            type="button"
+            onClick={onEnter}
+            className="dl-hover-text"
+            style={{
+              display: 'block',
+              fontFamily: 'var(--mono)',
+              fontSize: 13,
+              color: 'var(--text-2)',
+              background: 'none',
+              border: 'none',
+              padding: 0,
+              marginBottom: 20,
+              cursor: 'pointer',
+              font: 'inherit',
+            }}
+          >
+            Already have an account? Sign in
+          </button>
           <div style={{ display: 'flex', alignItems: 'center', gap: 16, flexWrap: 'wrap' }}>
             <span style={{ fontFamily: 'var(--mono)', fontSize: 11, letterSpacing: 0.5, color: 'var(--text-3)' }}>
               WORKS WITH
@@ -950,15 +960,33 @@ function TwoWaysToRun({ onEnter }: EnterProps): JSX.Element {
             Use a hosted DROP
           </div>
           <p style={{ fontSize: 14.5, color: 'var(--text-2)', lineHeight: 1.65, marginBottom: 20 }}>
-            Sign in to a DROP someone already runs — this one, or your company&apos;s — and start deploying. You do
-            not touch a server, and you are shipping in the next ten minutes.
+            Deploy onto a DROP someone already runs — this one, or your company&apos;s. You never touch a server.
+            Access here is by invitation while the platform is in beta; ask for one and we&apos;ll be in touch.
           </p>
           <div style={{ display: 'flex', flexDirection: 'column', gap: 10, marginBottom: 26 }}>
             {HOSTED_POINTS.map(bullet)}
           </div>
-          <button type="button" onClick={onEnter} style={{ ...primaryBtnStyle, marginTop: 'auto', alignSelf: 'flex-start' }}>
-            Get started →
-          </button>
+          <div style={{ marginTop: 'auto', display: 'flex', flexDirection: 'column', alignItems: 'flex-start', gap: 12 }}>
+            <a href={REQUEST_ACCESS_URL} target="_blank" rel="noopener noreferrer" style={primaryBtnStyle}>
+              Request access →
+            </a>
+            <button
+              type="button"
+              onClick={onEnter}
+              className="dl-hover-text"
+              style={{
+                fontFamily: 'var(--mono)',
+                fontSize: 13,
+                color: 'var(--text-2)',
+                background: 'none',
+                border: 'none',
+                padding: 0,
+                cursor: 'pointer',
+              }}
+            >
+              Already have an account? Sign in
+            </button>
+          </div>
         </div>
 
         <div
@@ -1422,7 +1450,7 @@ function McpSection(): JSX.Element {
   );
 }
 
-function FinalCta({ onEnter }: EnterProps): JSX.Element {
+function FinalCta(): JSX.Element {
   return (
     <section style={{ maxWidth: 1200, margin: '0 auto', padding: '56px 28px 88px' }}>
       <div
@@ -1462,12 +1490,17 @@ function FinalCta({ onEnter }: EnterProps): JSX.Element {
             Drop a folder. Get a URL.
           </h2>
           <p style={{ fontSize: 17, color: 'var(--text-2)', maxWidth: 520, margin: '0 auto 30px', lineHeight: 1.6 }}>
-            Sign in and deploy on a DROP that is already running, or put it on your own server in an afternoon.
+            Ask for access to the hosted platform, or put DROP on your own server in an afternoon.
           </p>
           <div style={{ display: 'flex', gap: 12, justifyContent: 'center', flexWrap: 'wrap' }}>
-            <button type="button" onClick={onEnter} style={{ ...primaryBtnStyle, padding: '14px 26px' }}>
-              Get started
-            </button>
+            <a
+              href={REQUEST_ACCESS_URL}
+              target="_blank"
+              rel="noopener noreferrer"
+              style={{ ...primaryBtnStyle, padding: '14px 26px' }}
+            >
+              Request access
+            </a>
             <Link to="/docs#installation" className="dl-hover-border" style={{ ...secondaryBtnStyle, padding: '14px 26px' }}>
               Run it on your own server
             </Link>
@@ -1478,10 +1511,10 @@ function FinalCta({ onEnter }: EnterProps): JSX.Element {
   );
 }
 
-export function LandingSections({ onEnter, onSignup, authEnabled }: LandingSectionsProps): JSX.Element {
+export function LandingSections({ onEnter }: LandingSectionsProps): JSX.Element {
   return (
     <>
-      <HeroSection onEnter={onEnter} onSignup={onSignup} authEnabled={authEnabled} />
+      <HeroSection onEnter={onEnter} />
       <WhatYouGet />
       <WhoItsFor />
       <HowItWorks />
@@ -1492,7 +1525,7 @@ export function LandingSections({ onEnter, onSignup, authEnabled }: LandingSecti
       <ConfigSection />
       <CliSection />
       <McpSection />
-      <FinalCta onEnter={onEnter} />
+      <FinalCta />
     </>
   );
 }
