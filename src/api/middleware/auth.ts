@@ -1391,6 +1391,47 @@ function hashOpaqueToken(token: string): string {
 }
 
 /**
+ * Per-user cap on live `RefreshTokenRecord`s (Item 6, DROP-131). Records have
+ * no TTL and are pruned only by rotation, an explicit revoke, or user
+ * deletion, and `api-credentials.json` is parsed linearly on every
+ * authenticated request — broadening connectors from a handful of admins to
+ * every account makes unbounded growth here bite. Exported so a test can
+ * reference it rather than hardcoding the literal in two places.
+ */
+export const MAX_REFRESH_TOKENS_PER_USER = 10;
+
+/**
+ * Evict this user's OLDEST-by-`createdAt` records, in place, down to one
+ * slot short of the cap — leaving room for exactly one more record to be
+ * added by the caller. Silently disconnects that user's oldest OTHER
+ * connector; that is the deliberate trade against unbounded growth in a file
+ * parsed on every authenticated request.
+ *
+ * MUST be called on an array that does not yet contain the record about to
+ * be issued: `issueRefreshToken` calls this before pushing its new record,
+ * and `rotateRefreshToken` calls this after splicing out the presented
+ * record but before pushing its replacement. Either order keeps the
+ * newly-created (or being-rotated) record out of the candidate set, so a
+ * user sitting at the cap can never lose the very grant they are using.
+ */
+function evictOldestRefreshTokens(records: RefreshTokenRecord[], userId: string): void {
+  const userIndices = records
+    .map((_, i) => i)
+    .filter((i) => records[i].userId === userId)
+    .sort((a, b) => records[a].createdAt.localeCompare(records[b].createdAt));
+
+  const excess = userIndices.length - (MAX_REFRESH_TOKENS_PER_USER - 1);
+  if (excess <= 0) return;
+
+  const toEvict = new Set(userIndices.slice(0, excess));
+  // Remove in descending index order so earlier removals don't shift the
+  // indices still pending removal.
+  for (let i = records.length - 1; i >= 0; i--) {
+    if (toEvict.has(i)) records.splice(i, 1);
+  }
+}
+
+/**
  * Issue a new opaque OAuth refresh token for a user + OAuth client, hashed at
  * rest (the raw token is returned once and never stored).
  */
@@ -1413,6 +1454,7 @@ export async function issueRefreshToken(
   };
 
   if (!credentials.refreshTokens) credentials.refreshTokens = [];
+  evictOldestRefreshTokens(credentials.refreshTokens, userId);
   credentials.refreshTokens.push(record);
   await saveCredentials(config.credentialsPath, credentials);
 
@@ -1490,6 +1532,14 @@ export async function rotateRefreshToken(presented: string): Promise<{
 
   const carried = sid ?? crypto.randomUUID();
   records.splice(index, 1);
+
+  // Item 6 (DROP-131): cap AFTER the splice above and BEFORE the push below —
+  // the presented record is already gone from `records` and its replacement
+  // is not yet in it, so eviction can only remove this user's oldest OTHER
+  // record, never the one being rotated. A user sitting at the cap must be
+  // able to refresh forever without losing their own grant; see
+  // `evictOldestRefreshTokens`'s header for the general contract.
+  evictOldestRefreshTokens(records, userId);
 
   const refreshToken = crypto.randomBytes(32).toString('base64url');
   records.push({
