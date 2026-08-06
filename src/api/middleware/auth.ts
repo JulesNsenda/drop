@@ -15,6 +15,10 @@ import { error, ErrorCodes } from '../types';
 import { normalizeAgentScope } from '../agent-scopes';
 import { getPublicUrl } from '../runtime-config';
 import { getMcpResourceUrl, canonicalizeUrl } from '../oauth/metadata';
+// Own module, not routes/oauth.ts: that file imports heavily from this one,
+// so co-locating the helper there would make the pair cyclic. See
+// connector-policy.ts's header.
+import { mayUseConnectors } from '../connector-policy';
 
 // Auth configuration
 export interface AuthConfig {
@@ -1204,6 +1208,14 @@ export async function verifyAppMcpAccessToken(
     const user = getUserById(userId);
     if (!user || user.enabled === false) return null;
 
+    // Global connector-policy gate — site 5 of 5, see `mayUseConnectors`'
+    // header (routes/oauth.ts). `user.role`, re-read live: this is the only
+    // gate an app-MCP token passes through (mcpAuthMiddleware never reaches
+    // authMiddleware), and since this function already re-reads the user
+    // record on every call for revocation, flipping the toggle takes effect
+    // immediately rather than after this token's 15-minute lifetime.
+    if (!mayUseConnectors(user.role)) return null;
+
     // DROP-130 Item 5: mcpAuthMiddleware never reaches authMiddleware, so this
     // is the only gate an app-MCP token passes through. A token MINTED before
     // the owner was suspended or force-reset must not keep authenticating for
@@ -1271,6 +1283,14 @@ export async function verifyOAuthAccessToken(
     // verifyApiKey has done exactly this since DROP-075.
     const record = getUserById(userId);
     if (!record || record.enabled === false) return null;
+
+    // Global connector-policy gate — site 4 of 5, see `mayUseConnectors`'
+    // header (routes/oauth.ts). `record.role`, re-read live above for
+    // exactly this reason: it is what makes the toggle take effect
+    // immediately rather than after this token's 15-minute TTL — no new
+    // durable store is needed because this function already re-reads the
+    // user record per request.
+    if (!mayUseConnectors(record.role)) return null;
 
     // DROP-130 Item 5: mcpAuthMiddleware never reaches authMiddleware, so this
     // is the only gate an OAuth access token passes through. A token MINTED
@@ -1443,6 +1463,30 @@ export async function rotateRefreshToken(presented: string): Promise<{
   // before the record is consumed, for the same reason as the `enabled`
   // check above.
   if (predatesInvalidationStamp(createdAt, owner.credentialsInvalidBefore)) return null;
+
+  // Global connector-policy gate — site 3 of 5, see `mayUseConnectors`'
+  // header (routes/oauth.ts). THIS PLACEMENT IS THE WHOLE POINT: checked
+  // here, pre-splice, for the exact reason given in the `enabled` check's own
+  // comment above — a refusal AFTER the splice would still return null to
+  // the caller, but it would also burn the presented refresh token and leave
+  // a fresh, unreturned replacement orphaned in the store. Checking first
+  // leaves the record untouched, so flipping the toggle back ON restores the
+  // connector with no re-consent required. `owner.role`, not an AuthContext
+  // — there is none in scope here, only the `User` record.
+  if (!mayUseConnectors(owner.role)) {
+    // Without this line a policy refusal is indistinguishable in journald
+    // from a genuinely dead token: the caller only ever sees
+    // rotateRefreshToken's generic null -> 'Unknown or already-used refresh
+    // token'. This is the trace Gate 4's `journalctl | grep '\[oauth\]'`
+    // looks for. Rare by construction — a refused grant is not retried in a
+    // tight loop the way a verify-path rejection would be.
+    console.log('[oauth] connectors disabled', {
+      grant: 'refresh_token',
+      userId: owner.id,
+      role: owner.role,
+    });
+    return null;
+  }
 
   const carried = sid ?? crypto.randomUUID();
   records.splice(index, 1);
