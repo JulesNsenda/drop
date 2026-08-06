@@ -121,6 +121,14 @@ export default function McpConnectorTab(): JSX.Element {
   // can silently drop one field even though both requests return 200.
   const busy = saving || savingConnectors;
 
+  // `undefined` (not just a falsy `enabled`) means we don't actually know the
+  // state yet — GET /admin/settings failed, or a rolled-back server omitted
+  // the field. Render the checkbox ONLY once this is defined; otherwise it
+  // would default to checked ("ON") for a security control whose entire
+  // purpose is being an off switch, i.e. fail open instead of matching the
+  // fail-closed choice the server itself makes for this same setting.
+  const userConnectorsState = settings?.userConnectors;
+
   const load = useCallback(async () => {
     setLoading(true);
     setError(null);
@@ -251,13 +259,13 @@ export default function McpConnectorTab(): JSX.Element {
           />
         )}
 
-        {!settingsLoading && (
+        {!settingsLoading && userConnectorsState !== undefined && (
           <div className="rounded-lg border p-4" style={{ borderColor: 'var(--border)', background: 'var(--bg-2)' }}>
             <div className="flex items-center gap-3">
               <input
                 type="checkbox"
                 id="userConnectorsEnabled"
-                checked={settings?.userConnectors?.enabled ?? true}
+                checked={userConnectorsState.enabled}
                 onChange={e => void setConnectorsEnabled(e.target.checked)}
                 className="h-4 w-4 rounded"
                 style={{ accentColor: 'var(--accent)' }}
@@ -279,6 +287,15 @@ export default function McpConnectorTab(): JSX.Element {
               <code style={{ fontFamily: 'var(--mono)', color: 'var(--text)' }}>mcp: auth: drop</code>{' '}
               tenant apps from refreshing their tokens (symptom: a 401 from the gateway).
             </p>
+          </div>
+        )}
+
+        {!settingsLoading && userConnectorsState === undefined && (
+          <div
+            className="rounded-lg border p-4 text-sm"
+            style={{ borderColor: 'var(--border)', background: 'var(--bg-2)', color: 'var(--text-2)' }}
+          >
+            Non-admin connector setting: current state unknown &mdash; reload to try again.
           </div>
         )}
 

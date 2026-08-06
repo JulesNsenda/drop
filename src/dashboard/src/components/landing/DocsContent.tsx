@@ -839,8 +839,8 @@ fs.appendFileSync(\`\${logDir}/logs/app.json\`, JSON.stringify(logEntry) + '\\n'
         <h3 style={h3Style}>1. Get your connector details</h3>
         <p style={pStyle}>
           In the DROP dashboard, open{' '}
-          <strong style={{ color: 'var(--text)' }}>Settings → Claude (MCP)</strong>. Any signed-in user sees this
-          tab, not just admins — it shows the{' '}
+          <strong style={{ color: 'var(--text)' }}>Settings → Claude (MCP)</strong>. Admin and user accounts see
+          this tab (a read-only account does not) — it shows the{' '}
           <strong style={{ color: 'var(--text)' }}>MCP Server URL</strong> and{' '}
           <strong style={{ color: 'var(--text)' }}>OAuth Client ID</strong> with copy buttons, and confirms the Client
           Secret stays blank. The Client ID is the same for the whole server and is not a secret — hand it to anyone
@@ -861,6 +861,15 @@ fs.appendFileSync(\`\${logDir}/logs/app.json\`, JSON.stringify(logEntry) + '\\n'
 #       "client_secret": null,
 #       "redirect_uri": "https://claude.ai/api/mcp/auth_callback",
 #       "mcp_url": "https://drop.example.com/api/v1/mcp" } }`}
+        />
+        <p style={pStyle}>
+          That call reads an already-minted client_id — on a fresh install where no one has opened the tab yet, it
+          404s. An admin mints it once (opening the tab does this automatically, or run it directly):
+        </p>
+        <CodeBlock
+          label="shell"
+          code={`curl -X POST https://drop.example.com/api/v1/oauth/client \\
+  -H "Authorization: Bearer <admin-api-key>"   # one-time, admin`}
         />
 
         <h3 style={h3Style}>2. Add the connector in claude.ai</h3>

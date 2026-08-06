@@ -85,3 +85,26 @@ export function mayUseConnectors(role: GatedRole): boolean {
   if (role === 'admin') return true;
   return getSettingsManager().getUserConnectorsEnabled();
 }
+
+/**
+ * Marker on the `details` of a policy refusal, so a client can tell THIS
+ * refusal apart from an ordinary insufficient-role rejection.
+ *
+ * Both come back as HTTP 403 with `ErrorCodes.UNAUTHORIZED` — `types.ts`
+ * records that there is deliberately no FORBIDDEN code, so that collision is
+ * permanent by convention, not an oversight to be fixed later. Without a
+ * marker the dashboard cannot distinguish "your administrator turned this
+ * off" (a togglable policy, worth asking about) from "your account may never
+ * do this" (a permanent boundary), and a `readonly` user was being told to go
+ * ask an admin to flip a switch that would not help them.
+ *
+ * Server-side tests pin this string precisely because the dashboard has no
+ * test infrastructure to pin it from the consuming end.
+ *
+ * MIRRORED, not imported: `src/dashboard` is its own npm package and cannot
+ * import from `src/api`, so the same literal is declared in
+ * `src/dashboard/src/api/client.ts`. Changing it here without changing it
+ * there silently drops both consuming components back to their generic
+ * permission message — which is why the server-side test exists.
+ */
+export const CONNECTORS_DISABLED_REASON = 'connectors_disabled';

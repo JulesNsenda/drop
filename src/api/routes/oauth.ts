@@ -8,10 +8,13 @@
  * to consent. See docs/plans/2026-07-10-mcp-oauth.md and
  * docs/plans/2026-07-11-mcp-oauth-execution.md for the design.
  *
- * `/authorize` and `/token` are deliberately NOT behind `authMiddleware` —
- * `/authorize` self-gates via the SPA session redirect and `/token`
- * authenticates via PKCE (mounting session auth on either breaks claude.ai's
- * calls). `/approve`, `/revoke`, `/client`, and `/connector-info` ARE behind
+ * `/authorize`, `/token`, and `/revoke` are deliberately NOT behind
+ * `authMiddleware` — `/authorize` self-gates via the SPA session redirect,
+ * `/token` authenticates via PKCE, and `/revoke` (RFC 7009) authenticates via
+ * the presented token itself: for a public PKCE client the token IS the
+ * credential, so a session adds nothing (mounting session auth on any of the
+ * three breaks the caller that actually hits it — claude.ai holds no DROP
+ * session). `/approve`, `/client`, and `/connector-info` ARE behind
  * `authMiddleware`, mounted externally in server.ts — each on its own exact
  * path, never `/oauth/*`.
  */
@@ -33,7 +36,7 @@ import {
 } from '../oauth/app-resources';
 import { getStateManager } from '../../managers/app/state-manager';
 import { getAppConfigService } from '../../managers/app/app-config';
-import { mayUseConnectors } from '../connector-policy';
+import { mayUseConnectors, CONNECTORS_DISABLED_REASON } from '../connector-policy';
 import { computeAppUrl } from './apps';
 import { canAccess } from '../access';
 import {
@@ -319,7 +322,8 @@ oauth.post('/approve', async (c) => {
     return c.json(
       error(
         ErrorCodes.UNAUTHORIZED,
-        'MCP connectors are disabled for non-admin accounts on this server.'
+        'MCP connectors are disabled for non-admin accounts on this server.',
+        { reason: CONNECTORS_DISABLED_REASON }
       ),
       403
     );
@@ -566,7 +570,8 @@ oauth.get('/connector-info', (c) => {
     return c.json(
       error(
         ErrorCodes.UNAUTHORIZED,
-        'MCP connectors are disabled for non-admin accounts on this server.'
+        'MCP connectors are disabled for non-admin accounts on this server.',
+        { reason: CONNECTORS_DISABLED_REASON }
       ),
       403
     );
@@ -593,25 +598,56 @@ oauth.get('/connector-info', (c) => {
   return c.json(success(buildConnectorPayload(clientId, publicUrl)));
 });
 
-// POST /oauth/revoke — bearer-authenticated (authMiddleware('user'), mounted
-// in server.ts). Revokes a single presented refresh token.
+// POST /oauth/revoke — RFC 7009 token revocation. Deliberately NOT behind
+// authMiddleware (see server.ts and this file's header): the presented token
+// IS the credential for a public PKCE client, so an unauthenticated caller
+// who holds it is exactly who is allowed to revoke it. claude.ai's disconnect
+// flow calls this with no DROP session at all — gating it here made the
+// advertised revocation_endpoint 401 for the only caller that ever hits it.
 oauth.post('/revoke', async (c) => {
   const pre = requireOAuthPreconditions(c);
   if (pre instanceof Response) return pre;
 
-  const auth = (c.get as (key: string) => AuthContext | undefined)('auth');
-  if (!auth) {
-    return c.json(error(ErrorCodes.UNAUTHORIZED, 'Authentication required.'), 401);
+  // RFC 7009 §2.1 specifies form-urlencoded `token` (+ optional
+  // `token_type_hint`, which we don't need — DROP only ever revokes by the
+  // refresh-token record, so any hint value is accepted and ignored). Also
+  // tolerant of the legacy JSON `{refresh_token}` shape this endpoint
+  // published before this fix, so anything already integrated against it
+  // keeps working. Decided by Content-Type, not by trying one then the other.
+  const contentType = c.req.header('content-type') ?? '';
+  let token: string;
+  let clientId: string;
+  if (contentType.includes('application/json')) {
+    const body = await c.req
+      .json<{ refresh_token?: string; token?: string; client_id?: string }>()
+      .catch(() => ({}) as { refresh_token?: string; token?: string; client_id?: string });
+    token = body.token || body.refresh_token || '';
+    clientId = body.client_id ?? '';
+  } else {
+    const body = await c.req.parseBody();
+    token = formStr(body['token']);
+    clientId = formStr(body['client_id']);
   }
 
-  const body = await c.req.json<{ refresh_token?: string }>();
-  const refreshToken = body.refresh_token ?? '';
-  if (!refreshToken) {
-    throw new ValidationError('refresh_token is required');
+  // Missing token entirely is the ONE malformed-request case that may be a
+  // 400 — everything past this point must respond 200 (see below).
+  if (!token) {
+    throw new ValidationError('token is required');
   }
 
-  const revoked = await revokeRefreshToken(refreshToken);
-  return c.json(success({ revoked }));
+  // client_id is validated when present, but a mismatch is treated exactly
+  // like an unknown token below (still 200, just no-op) rather than a
+  // distinct error: RFC 7009 §2.2 requires the response never reveal
+  // anything about the presented token — including which of "wrong client"
+  // or "unknown token" applies.
+  if (!clientId || clientId === getOAuthClientId()) {
+    // Return value intentionally unused — RFC 7009 §2.2: the client cannot
+    // observe (and must not be able to infer) whether a token existed. Both
+    // "revoked" and "was never valid" answer 200 with an empty body.
+    await revokeRefreshToken(token);
+  }
+
+  return c.body(null, 200);
 });
 
 export default oauth;

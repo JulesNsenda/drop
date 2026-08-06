@@ -312,13 +312,15 @@ export const ENDPOINT_GROUPS: EndpointGroupDef[] = [
       'hosted MCP endpoint without anyone pasting an API key. Public PKCE client — there is no client secret.',
     note:
       'Every endpoint here fails closed until DROP_PUBLIC_URL is set (503/400 on the routes, 404 on discovery): ' +
-      'the issuer is never derived from the Host header. /authorize and /token are deliberately NOT behind session ' +
-      'auth — /authorize self-gates by redirecting to the dashboard consent screen, and /token authenticates by PKCE.',
+      'the issuer is never derived from the Host header. /authorize, /token, and /revoke are deliberately NOT behind ' +
+      'session auth — /authorize self-gates by redirecting to the dashboard consent screen, /token authenticates by ' +
+      'PKCE, and /revoke authenticates by the presented token itself (RFC 7009 — for a public PKCE client the token ' +
+      'IS the credential).',
     endpoints: [
       { method: 'GET', path: '/api/v1/oauth/authorize', description: 'Authorization endpoint — validates the request, then bounces the browser to the dashboard consent screen.', role: 'public' },
       { method: 'POST', path: '/api/v1/oauth/token', description: 'Token endpoint. Form-urlencoded, and replies in the plain RFC 6749 shape — not DROP’s { success, data } envelope.', role: 'public' },
       { method: 'POST', path: '/api/v1/oauth/approve', description: 'Called by the consent screen once the operator approves; returns the redirect carrying the authorization code.', role: 'user' },
-      { method: 'POST', path: '/api/v1/oauth/revoke', description: 'Revoke one presented refresh token.', role: 'user' },
+      { method: 'POST', path: '/api/v1/oauth/revoke', description: 'RFC 7009 token revocation. No session required — the presented token is its own credential, so this is reachable unauthenticated (form-encoded token, or legacy JSON { refresh_token }). Always 200, even for an unknown token.', role: 'public' },
       { method: 'POST', path: '/api/v1/oauth/client', description: 'Mint (once) and return the static client_id to paste into a connector. client_secret is always null.', role: 'admin' },
       { method: 'GET', path: '/api/v1/oauth/connector-info', description: 'Read-only connector details (client_id, client_secret: null, redirect_uri, mcp_url) for the caller to set up their own connector. Never mints — 404 if an admin hasn’t called POST /oauth/client yet, 403 if the non-admin connector toggle is off, 503 if no Public URL is set.', role: 'user' },
       { method: 'GET', path: '/.well-known/oauth-authorization-server', description: 'RFC 8414 authorization-server metadata. Root path, not under /api/v1 — the spec fixes the location.', role: 'public' },

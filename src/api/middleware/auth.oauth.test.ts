@@ -266,5 +266,112 @@ describe('OAuth refresh tokens (PRD-041)', () => {
       const finalRotation = await rotateRefreshToken(current);
       expect(finalRotation).not.toBeNull();
     });
+
+    it('tolerates a missing createdAt on a stored record and evicts it first', async () => {
+      const user = await createUser('capuserD', 'password123', 'user');
+
+      // Simulate a legacy/hand-edited/restored record — no schema validates
+      // `api-credentials.json`, and `createdAt` is exactly the field
+      // `predatesInvalidationStamp` already tolerates being absent elsewhere
+      // in this file.
+      const raw = JSON.parse(await fs.readFile(credentialsPath, 'utf-8')) as {
+        refreshTokens?: Array<Record<string, unknown>>;
+      };
+      raw.refreshTokens = raw.refreshTokens ?? [];
+      raw.refreshTokens.push({
+        tokenHash: 'legacy-hash-no-createdAt',
+        userId: user.id,
+        clientId: 'client-legacy',
+        // createdAt intentionally omitted
+      });
+      await fs.writeFile(credentialsPath, JSON.stringify(raw, null, 2));
+
+      // Reload the module's in-memory store from the file just hand-edited.
+      resetAuth();
+      await initializeAuth({ credentialsPath, enableJwt: true, enableApiKeys: true });
+
+      // Push the user over the cap. This must not throw despite the
+      // undated record, and the undated record — sorting oldest — must be
+      // the one that goes.
+      for (let i = 0; i < MAX_REFRESH_TOKENS_PER_USER; i++) {
+        await expect(issueRefreshToken(user.id, `client-fresh-${i}`)).resolves.toEqual(
+          expect.any(String)
+        );
+      }
+
+      const stored = await readStoredRefreshTokens();
+      const userRecords = stored.filter((r) => r.userId === user.id);
+      expect(userRecords).toHaveLength(MAX_REFRESH_TOKENS_PER_USER);
+      expect(userRecords.some((r) => r.clientId === 'client-legacy')).toBe(false);
+    });
+
+    it("kills an evicted grant's outstanding access token immediately (denyGrant)", async () => {
+      const user = await createUser('capuserE', 'password123', 'user');
+      const sid = 'sid-evicted-grant';
+
+      // The oldest record for this user — carries the sid whose access
+      // token must die the instant this record is evicted.
+      await issueRefreshToken(user.id, 'client-oldest', sid);
+      const accessToken = await mintOAuthAccessToken(user, AUDIENCE, sid);
+      expect(await verifyOAuthAccessToken(accessToken, AUDIENCE)).not.toBeNull();
+
+      // Push this user over the cap — the oldest record (issued above,
+      // carrying `sid`) is the one evicted.
+      for (let i = 0; i < MAX_REFRESH_TOKENS_PER_USER; i++) {
+        await issueRefreshToken(user.id, `client-fresh-${i}`);
+      }
+
+      const stored = await readStoredRefreshTokens();
+      expect(stored.filter((r) => r.userId === user.id)).toHaveLength(MAX_REFRESH_TOKENS_PER_USER);
+
+      // Removing the refresh record alone would only stop NEW access tokens
+      // being minted — the outstanding one would keep working for the rest
+      // of its 15-minute TTL. This proves eviction also calls `denyGrant`.
+      expect(await verifyOAuthAccessToken(accessToken, AUDIENCE)).toBeNull();
+    });
+
+    // Mutation-testing note: the "AT the cap" test above never actually
+    // reaches `trimToCap`'s eviction branch — a rotation removes the
+    // presented record and adds one back, so the user's count is unchanged
+    // and `excess` is always 0. Natural ascending-by-createdAt sort ALSO
+    // never picks the just-pushed record on its own, because it is always
+    // inserted last and `new Date().toISOString()` is monotonic, so it never
+    // sorts earlier than a genuinely older sibling — the `keepHash`
+    // exclusion is unreachable by every other test in this file. This test
+    // is the one scenario that reaches it: hand-edited records (same gap as
+    // the missing-`createdAt` test above) dated in the future sort AHEAD of
+    // a brand-new record's real timestamp, so an eviction that didn't
+    // exclude the new record by hash would pick the new record itself.
+    it('protects the just-issued record even when existing records carry bogus future timestamps', async () => {
+      const user = await createUser('capuserF', 'password123', 'user');
+
+      const raw = JSON.parse(await fs.readFile(credentialsPath, 'utf-8')) as {
+        refreshTokens?: Array<Record<string, unknown>>;
+      };
+      raw.refreshTokens = raw.refreshTokens ?? [];
+      for (let i = 0; i < MAX_REFRESH_TOKENS_PER_USER; i++) {
+        raw.refreshTokens.push({
+          tokenHash: `future-hash-${i}`,
+          userId: user.id,
+          clientId: `client-future-${i}`,
+          createdAt: '2099-01-01T00:00:00.000Z',
+        });
+      }
+      await fs.writeFile(credentialsPath, JSON.stringify(raw, null, 2));
+
+      resetAuth();
+      await initializeAuth({ credentialsPath, enableJwt: true, enableApiKeys: true });
+
+      const token = await issueRefreshToken(user.id, 'client-brand-new');
+
+      const stored = await readStoredRefreshTokens();
+      const userRecords = stored.filter((r) => r.userId === user.id);
+      expect(userRecords).toHaveLength(MAX_REFRESH_TOKENS_PER_USER);
+      expect(userRecords.some((r) => r.clientId === 'client-brand-new')).toBe(true);
+
+      // Genuinely live, not merely present in the file.
+      const rotated = await rotateRefreshToken(token);
+      expect(rotated).not.toBeNull();
+    });
   });
 });

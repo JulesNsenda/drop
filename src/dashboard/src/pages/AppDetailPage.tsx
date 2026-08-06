@@ -398,14 +398,20 @@ function AppDetailPage() {
 
               This used to say "Public" unconditionally, ignoring `mcp.auth`
               — wrong for every `auth: drop` app, where the Caddy forward_auth
-              gateway DOES verify an audience-bound token before the app is
-              reached (see routes/mcp-gateway.ts). Harmless-looking because it
-              understates protection rather than overstating it, but it flatly
-              contradicts what the app's own drop.yaml asked for.
+              gateway DOES verify an audience-bound token (see
+              routes/mcp-gateway.ts).
+
+              The wording is deliberately "guarded at the proxy", not
+              "protected": the guard lives ONLY in Caddy. platform.ts logs the
+              two counter-cases itself — outside docker isolation the app binds
+              a host port that is reachable directly, bypassing it, and when
+              apiPort is unusable the guard is not emitted at all. `mcp.auth`
+              is the tenant's DECLARATION, not proof of enforcement, so this
+              must not promise more than the declaration supports.
             */}
             <p className="mt-1 text-xs" style={{ color: 'var(--text-3)' }}>
               {app.mcp.auth === 'drop'
-                ? 'Protected — DROP verifies an audience-bound token before forwarding to this endpoint.'
+                ? 'Guarded at the proxy — DROP verifies an audience-bound token on requests that arrive through it. Traffic reaching the app’s own port directly is not covered.'
                 : 'Public — DROP does not authenticate callers to this endpoint.'}
             </p>
           </Card>
