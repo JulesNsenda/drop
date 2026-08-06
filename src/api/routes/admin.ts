@@ -329,8 +329,17 @@ admin.put('/settings/github-webhook-secret', async (c) => {
 // treated as a clear.
 admin.put('/settings/user-connectors', async (c) => {
   const authCtx = (c.get as Function)('auth') as AuthContext | undefined;
-  const body = (await c.req.json()) as { enabled?: unknown };
-  const input = body.enabled;
+  const body = (await c.req.json()) as unknown;
+
+  // Same object guard as PUT /settings/github-webhook-secret above. Without
+  // it a body of `null` dereferences to a TypeError and surfaces as a 500,
+  // which is a poor answer from a validator whose whole contract is "strict
+  // boolean, reject rather than coerce".
+  if (typeof body !== 'object' || body === null || Array.isArray(body)) {
+    return c.json(error(ErrorCodes.VALIDATION_ERROR, 'Request body must be a JSON object'), 400);
+  }
+
+  const input = (body as { enabled?: unknown }).enabled;
 
   if (typeof input !== 'boolean') {
     return c.json(error(ErrorCodes.VALIDATION_ERROR, 'enabled must be a boolean'), 400);

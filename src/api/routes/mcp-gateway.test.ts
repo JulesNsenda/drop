@@ -26,6 +26,7 @@ import {
 } from '../middleware/auth';
 import { getStateManager, resetStateManager } from '../../managers/app/state-manager';
 import { getAppConfigService, resetAppConfigService } from '../../managers/app/app-config';
+import { getSettingsManager, resetSettingsManager } from '../../managers/settings/settings-manager';
 import { setApiRuntimeConfig } from '../runtime-config';
 
 const APP = 'alpha';
@@ -45,6 +46,12 @@ describe('GET /mcp-gateway/verify', () => {
     resetAuth();
     resetStateManager();
     resetAppConfigService();
+    // `verifyAppMcpAccessToken` reads `mayUseConnectors`, which self-instantiates
+    // `SettingsManager` at the real system path if nothing has pointed it at a
+    // temp file first — without this the suite silently reads/writes the
+    // developer's actual `C:\drop\data\drop-svc\settings.json`.
+    resetSettingsManager();
+    getSettingsManager({ settingsFilePath: path.join(tempDir, 'settings.json') });
 
     await initializeAuth({
       credentialsPath: path.join(tempDir, 'credentials.json'),
@@ -78,6 +85,7 @@ describe('GET /mcp-gateway/verify', () => {
     resetAuth();
     resetStateManager();
     resetAppConfigService();
+    resetSettingsManager();
     setApiRuntimeConfig({ domainSuffix: 'localhost', enableHttps: false });
     await fs.rm(tempDir, { recursive: true, force: true, maxRetries: 5 }).catch(() => undefined);
   });
@@ -195,5 +203,47 @@ describe('GET /mcp-gateway/verify', () => {
     const res = await get(`?app=${APP}`, bearer(token));
 
     expect(res.status).toBe(401);
+  });
+
+  describe('connector-policy gate (site 5 of 5, DROP-131)', () => {
+    // `verifyAppMcpAccessToken` is the widest-blast-radius of the five
+    // `mayUseConnectors` call sites: it fronts every tenant app's own MCP
+    // endpoint via this gateway. Pin it directly rather than trusting that
+    // the other four sites' coverage implies this one is wired too.
+    const ADMIN_APP = 'adminapp';
+    const ADMIN_AUD = 'https://adminapp.example.test/mcp';
+    let admin: User;
+
+    beforeEach(async () => {
+      admin = await createUser('admin-owner', 'correct-horse-battery-staple', 'admin');
+
+      await getStateManager().registerApp(ADMIN_APP, path.join(tempDir, ADMIN_APP));
+      await getStateManager().updateApp(ADMIN_APP, { userId: admin.id } as Record<string, unknown>);
+      await getAppConfigService().upsertConfig(ADMIN_APP, {
+        type: 'nodejs',
+        mcp: { path: '/mcp', auth: 'drop', source: 'declared' },
+      });
+    });
+
+    it('gates a non-admin owner’s app-MCP token live, with an admin carve-out', async () => {
+      const token = await mintAppMcpAccessToken(owner, AUD, APP, 'sid-policy-1');
+
+      // Toggle at its default (unset key == ON): the non-admin owner is admitted.
+      let res = await get(`?app=${APP}`, bearer(token));
+      expect(res.status).toBe(204);
+
+      // Flip OFF — the SAME still-unexpired token is rejected on the very next
+      // request, not after its 15-minute TTL: mayUseConnectors is read live,
+      // not cached from the token or from a snapshot taken at mint time.
+      await getSettingsManager().setUserConnectorsEnabled(false);
+      res = await get(`?app=${APP}`, bearer(token));
+      expect(res.status).toBe(401);
+
+      // The carve-out: an admin-owned app-MCP token is unaffected by the same
+      // OFF toggle — an admin must never be able to lock themselves out.
+      const adminToken = await mintAppMcpAccessToken(admin, ADMIN_AUD, ADMIN_APP, 'sid-policy-2');
+      res = await get(`?app=${ADMIN_APP}`, bearer(adminToken));
+      expect(res.status).toBe(204);
+    });
   });
 });

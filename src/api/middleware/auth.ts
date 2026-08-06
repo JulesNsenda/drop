@@ -1209,7 +1209,7 @@ export async function verifyAppMcpAccessToken(
     if (!user || user.enabled === false) return null;
 
     // Global connector-policy gate — site 5 of 5, see `mayUseConnectors`'
-    // header (routes/oauth.ts). `user.role`, re-read live: this is the only
+    // header (connector-policy.ts). `user.role`, re-read live: this is the only
     // gate an app-MCP token passes through (mcpAuthMiddleware never reaches
     // authMiddleware), and since this function already re-reads the user
     // record on every call for revocation, flipping the toggle takes effect
@@ -1285,7 +1285,7 @@ export async function verifyOAuthAccessToken(
     if (!record || record.enabled === false) return null;
 
     // Global connector-policy gate — site 4 of 5, see `mayUseConnectors`'
-    // header (routes/oauth.ts). `record.role`, re-read live above for
+    // header (connector-policy.ts). `record.role`, re-read live above for
     // exactly this reason: it is what makes the toggle take effect
     // immediately rather than after this token's 15-minute TTL — no new
     // durable store is needed because this function already re-reads the
@@ -1465,7 +1465,7 @@ export async function rotateRefreshToken(presented: string): Promise<{
   if (predatesInvalidationStamp(createdAt, owner.credentialsInvalidBefore)) return null;
 
   // Global connector-policy gate — site 3 of 5, see `mayUseConnectors`'
-  // header (routes/oauth.ts). THIS PLACEMENT IS THE WHOLE POINT: checked
+  // header (connector-policy.ts). THIS PLACEMENT IS THE WHOLE POINT: checked
   // here, pre-splice, for the exact reason given in the `enabled` check's own
   // comment above — a refusal AFTER the splice would still return null to
   // the caller, but it would also burn the presented refresh token and leave

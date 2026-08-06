@@ -52,7 +52,13 @@ function defaultSettingsFilePath(): string {
 
 function parseSettings(raw: string): PlatformSettings {
   const parsed = JSON.parse(raw);
-  if (!parsed || typeof parsed !== 'object') return {};
+  // A valid-JSON-but-non-object document (`null`, `5`, `"x"`) is just as
+  // untrustworthy as unparseable bytes — throw rather than `return {}` so
+  // load()'s existing catch treats it as corrupt (sets `corrupt`) instead of
+  // silently reading as "never set".
+  if (!parsed || typeof parsed !== 'object') {
+    throw new Error('Settings file does not contain a JSON object');
+  }
   const publicUrl = (parsed as Record<string, unknown>).publicUrl;
   const githubWebhookSecret = (parsed as Record<string, unknown>).githubWebhookSecret;
   const userConnectorsEnabled = (parsed as Record<string, unknown>).userConnectorsEnabled;
@@ -88,8 +94,16 @@ export class SettingsManager {
     let data: string;
     try {
       data = await fs.readFile(this.settingsFilePath, 'utf-8');
-    } catch {
-      // No settings file yet — first run, or nothing has ever been set.
+    } catch (err) {
+      // ENOENT means no settings file yet — first run, or nothing has ever
+      // been set — which is "never set", not corrupt. Anything else (EACCES,
+      // EIO, EISDIR — e.g. a root-owned settings.json after a restore) means
+      // the file exists but couldn't be read, which is exactly as
+      // untrustworthy as unparseable JSON, so it must fail closed the same
+      // way a parse failure does.
+      if ((err as NodeJS.ErrnoException)?.code !== 'ENOENT') {
+        this.corrupt = true;
+      }
       this.settings = {};
       return;
     }
@@ -180,6 +194,14 @@ export class SettingsManager {
     // match the other security-adjacent stores (secrets.json,
     // api-credentials.json, webhooks.json) instead of inheriting umask.
     await writeJsonAtomic(this.settingsFilePath, next, { mode: 0o600 });
+    // A successful write has just replaced whatever unparseable/unreadable
+    // bytes were on disk with a valid document, so the store is no longer
+    // corrupt regardless of what load() previously found. Without this, a
+    // fix-it admin PUT after a parse failure would commit `next` in memory
+    // but leave getUserConnectorsEnabled() stuck returning `false` forever —
+    // the exact "no in-product remedy short of a restart" bug this flag
+    // exists to avoid causing.
+    this.corrupt = false;
   }
 
   async close(): Promise<void> {
