@@ -31,6 +31,11 @@ export interface PlatformSettings {
   publicUrl?: string;
   /** Admin-set GitHub webhook HMAC secret (falls back to DROP_GITHUB_WEBHOOK_SECRET env when unset). */
   githubWebhookSecret?: string;
+  /**
+   * Gates whether non-admin (`user`-role) accounts may set up a claude.ai
+   * MCP connector. Defaults to enabled (`true`) when unset.
+   */
+  userConnectorsEnabled?: boolean;
 }
 
 export interface SettingsManagerConfig {
@@ -47,21 +52,37 @@ function defaultSettingsFilePath(): string {
 
 function parseSettings(raw: string): PlatformSettings {
   const parsed = JSON.parse(raw);
-  if (!parsed || typeof parsed !== 'object') return {};
+  // A valid-JSON-but-non-object document (`null`, `5`, `"x"`) is just as
+  // untrustworthy as unparseable bytes — throw rather than `return {}` so
+  // load()'s existing catch treats it as corrupt (sets `corrupt`) instead of
+  // silently reading as "never set".
+  if (!parsed || typeof parsed !== 'object') {
+    throw new Error('Settings file does not contain a JSON object');
+  }
   const publicUrl = (parsed as Record<string, unknown>).publicUrl;
   const githubWebhookSecret = (parsed as Record<string, unknown>).githubWebhookSecret;
+  const userConnectorsEnabled = (parsed as Record<string, unknown>).userConnectorsEnabled;
   return {
     publicUrl: typeof publicUrl === 'string' ? publicUrl : undefined,
     githubWebhookSecret:
       typeof githubWebhookSecret === 'string' && githubWebhookSecret.length > 0
         ? githubWebhookSecret
         : undefined,
+    userConnectorsEnabled: typeof userConnectorsEnabled === 'boolean' ? userConnectorsEnabled : undefined,
   };
 }
 
 export class SettingsManager {
   private readonly settingsFilePath: string;
   private settings: PlatformSettings = {};
+  // True only while the on-disk file exists but failed to parse. A missing
+  // file is "never set", not corrupt, so it does NOT set this. Exists so
+  // getUserConnectorsEnabled() can fail closed: without it, `?? true` would
+  // make that setting the store's only fail-open member — an admin's OFF
+  // would silently revert to ON after a parse failure, and console.error
+  // reaches no log file on this platform. publicUrl and githubWebhookSecret
+  // both already fail closed (undefined) when lost this way.
+  private corrupt = false;
 
   constructor(config?: SettingsManagerConfig) {
     this.settingsFilePath = config?.settingsFilePath || defaultSettingsFilePath();
@@ -69,11 +90,20 @@ export class SettingsManager {
 
   /** (Re)load settings from disk. Tolerates a missing or corrupt file (starts/stays empty). */
   async load(): Promise<void> {
+    this.corrupt = false;
     let data: string;
     try {
       data = await fs.readFile(this.settingsFilePath, 'utf-8');
-    } catch {
-      // No settings file yet — first run, or nothing has ever been set.
+    } catch (err) {
+      // ENOENT means no settings file yet — first run, or nothing has ever
+      // been set — which is "never set", not corrupt. Anything else (EACCES,
+      // EIO, EISDIR — e.g. a root-owned settings.json after a restore) means
+      // the file exists but couldn't be read, which is exactly as
+      // untrustworthy as unparseable JSON, so it must fail closed the same
+      // way a parse failure does.
+      if ((err as NodeJS.ErrnoException)?.code !== 'ENOENT') {
+        this.corrupt = true;
+      }
       this.settings = {};
       return;
     }
@@ -86,6 +116,7 @@ export class SettingsManager {
       // AppStateManager does for its larger, less-recoverable store.
       console.error('[settings-manager] Corrupt settings file, starting with empty settings');
       this.settings = {};
+      this.corrupt = true;
     }
   }
 
@@ -131,6 +162,30 @@ export class SettingsManager {
     this.settings = next;
   }
 
+  /**
+   * Whether non-admin users may set up a claude.ai MCP connector. Defaults
+   * to enabled, but fails closed to `false` if the settings file exists and
+   * failed to parse (see `corrupt` above) — an unreadable store must never
+   * silently behave as "on".
+   *
+   * Uses `??`, never `||`: `||` would discard a stored `false`, which is
+   * the security-relevant value here.
+   */
+  getUserConnectorsEnabled(): boolean {
+    if (this.corrupt) return false;
+    return this.settings.userConnectorsEnabled ?? true;
+  }
+
+  /** Set (or, with `undefined`, clear) the stored connectors-enabled override. Persists atomically. */
+  async setUserConnectorsEnabled(enabled: boolean | undefined): Promise<void> {
+    const next: PlatformSettings = { ...this.settings, userConnectorsEnabled: enabled };
+    // Same persist-then-commit-in-memory shape as setPublicUrl above — see
+    // that method's comment for why this isn't queued through a chained
+    // savePromise.
+    await this.doSave(next);
+    this.settings = next;
+  }
+
   private async doSave(next: PlatformSettings): Promise<void> {
     const dir = path.dirname(this.settingsFilePath);
     await fs.mkdir(dir, { recursive: true });
@@ -139,6 +194,14 @@ export class SettingsManager {
     // match the other security-adjacent stores (secrets.json,
     // api-credentials.json, webhooks.json) instead of inheriting umask.
     await writeJsonAtomic(this.settingsFilePath, next, { mode: 0o600 });
+    // A successful write has just replaced whatever unparseable/unreadable
+    // bytes were on disk with a valid document, so the store is no longer
+    // corrupt regardless of what load() previously found. Without this, a
+    // fix-it admin PUT after a parse failure would commit `next` in memory
+    // but leave getUserConnectorsEnabled() stuck returning `false` forever —
+    // the exact "no in-product remedy short of a restart" bug this flag
+    // exists to avoid causing.
+    this.corrupt = false;
   }
 
   async close(): Promise<void> {

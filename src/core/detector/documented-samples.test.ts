@@ -16,6 +16,7 @@
  *   - src/dashboard/src/components/landing/DocsContent.tsx  (/docs)
  *   - src/dashboard/src/components/landing/LandingSections.tsx  (/)
  *   - README.md
+ *   - docs/AGENT-DEPLOY.md
  */
 
 import * as os from 'os';
@@ -67,6 +68,12 @@ services:
 `,
 
   'docs: mcp server declaration': `
+mcp:
+  path: /mcp
+  auth: drop
+`,
+
+  'AGENT-DEPLOY: mcp server declaration': `
 mcp:
   path: /mcp
   auth: drop

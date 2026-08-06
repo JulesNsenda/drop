@@ -28,11 +28,16 @@ interface GithubWebhookPayload {
   payloadUrl: string | null;
 }
 
+interface UserConnectorsPayload {
+  enabled: boolean;
+}
+
 interface SettingsPayload {
   publicUrl: string | null;
   source: 'stored' | 'env' | 'unset';
   storedPublicUrl: string | null;
   githubWebhook: GithubWebhookPayload;
+  userConnectors: UserConnectorsPayload;
 }
 
 interface ApiEnvelope<T> {
@@ -72,6 +77,13 @@ describe('admin settings routes (PRD-041)', () => {
       method: 'PUT',
       headers: authHeader(token ?? adminToken),
       body: JSON.stringify({ secret }),
+    });
+
+  const putUserConnectors = (enabled: unknown, token?: string) =>
+    hono.request('/api/v1/admin/settings/user-connectors', {
+      method: 'PUT',
+      headers: authHeader(token ?? adminToken),
+      body: JSON.stringify({ enabled }),
     });
 
   beforeEach(async () => {
@@ -128,6 +140,7 @@ describe('admin settings routes (PRD-041)', () => {
         source: 'unset',
         storedPublicUrl: null,
         githubWebhook: { configured: false, source: 'unset', payloadUrl: null },
+        userConnectors: { enabled: true },
       });
     });
 
@@ -144,6 +157,7 @@ describe('admin settings routes (PRD-041)', () => {
           source: 'unset',
           payloadUrl: 'https://env.example.com/api/v1/git/webhook',
         },
+        userConnectors: { enabled: true },
       });
     });
 
@@ -163,6 +177,7 @@ describe('admin settings routes (PRD-041)', () => {
           source: 'unset',
           payloadUrl: 'https://stored.example.com/api/v1/git/webhook',
         },
+        userConnectors: { enabled: true },
       });
     });
   });
@@ -437,6 +452,77 @@ describe('admin settings routes (PRD-041)', () => {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ secret: 'some-valid-secret-value' }),
+      });
+      expect(res.status).toBe(401);
+    });
+  });
+
+  describe('GET /admin/settings — userConnectors block', () => {
+    it('reports enabled:true by default (key absent)', async () => {
+      const res = await getSettings();
+      const body = (await res.json()) as ApiEnvelope<SettingsPayload>;
+      expect(body.data?.userConnectors).toEqual({ enabled: true });
+    });
+  });
+
+  describe('PUT /admin/settings/user-connectors', () => {
+    it('persists false and a subsequent GET reports it', async () => {
+      const res = await putUserConnectors(false);
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as ApiEnvelope<UserConnectorsPayload>;
+      expect(body.data).toEqual({ enabled: false });
+
+      const getRes = await getSettings();
+      const getBody = (await getRes.json()) as ApiEnvelope<SettingsPayload>;
+      expect(getBody.data?.userConnectors).toEqual({ enabled: false });
+
+      // Persisted to disk — a fresh manager instance reading the same file sees it.
+      resetSettingsManager();
+      getSettingsManager({ settingsFilePath: path.join(tempDir, 'settings.json') });
+      await getSettingsManager().load();
+      expect(getSettingsManager().getUserConnectorsEnabled()).toBe(false);
+    });
+
+    it('persists true explicitly and a subsequent GET reports it', async () => {
+      await putUserConnectors(false);
+      const res = await putUserConnectors(true);
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as ApiEnvelope<UserConnectorsPayload>;
+      expect(body.data).toEqual({ enabled: true });
+    });
+
+    it('rejects a non-boolean "enabled" value with 400 and does not mutate state', async () => {
+      for (const bad of ['false', 1, null, undefined]) {
+        const res = await putUserConnectors(bad);
+        expect(res.status).toBe(400);
+        const body = (await res.json()) as ApiEnvelope<never>;
+        expect(body.success).toBe(false);
+        expect(body.error?.code).toBe('VALIDATION_ERROR');
+      }
+      expect(getSettingsManager().getUserConnectorsEnabled()).toBe(true);
+    });
+
+    it('records an audit entry reflecting the new value', async () => {
+      const logSpy = jest.spyOn(activityModule, 'logActivityFor').mockResolvedValue();
+
+      await putUserConnectors(false);
+
+      expect(logSpy).toHaveBeenCalledTimes(1);
+      expect(logSpy.mock.calls[0][1]).toMatchObject({ action: 'user-connectors-set' });
+    });
+
+    it('rejects a non-admin request with 403', async () => {
+      await createUser('regular3', 'password123', 'user');
+      const userToken = await getTestToken('regular3', 'password123');
+      const res = await putUserConnectors(false, userToken);
+      expect(res.status).toBe(403);
+    });
+
+    it('rejects an unauthenticated request with 401', async () => {
+      const res = await hono.request('/api/v1/admin/settings/user-connectors', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled: false }),
       });
       expect(res.status).toBe(401);
     });

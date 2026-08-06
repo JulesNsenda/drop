@@ -15,6 +15,10 @@ import { error, ErrorCodes } from '../types';
 import { normalizeAgentScope } from '../agent-scopes';
 import { getPublicUrl } from '../runtime-config';
 import { getMcpResourceUrl, canonicalizeUrl } from '../oauth/metadata';
+// Own module, not routes/oauth.ts: that file imports heavily from this one,
+// so co-locating the helper there would make the pair cyclic. See
+// connector-policy.ts's header.
+import { mayUseConnectors } from '../connector-policy';
 
 // Auth configuration
 export interface AuthConfig {
@@ -1204,6 +1208,14 @@ export async function verifyAppMcpAccessToken(
     const user = getUserById(userId);
     if (!user || user.enabled === false) return null;
 
+    // Global connector-policy gate — site 5 of 5, see `mayUseConnectors`'
+    // header (connector-policy.ts). `user.role`, re-read live: this is the only
+    // gate an app-MCP token passes through (mcpAuthMiddleware never reaches
+    // authMiddleware), and since this function already re-reads the user
+    // record on every call for revocation, flipping the toggle takes effect
+    // immediately rather than after this token's 15-minute lifetime.
+    if (!mayUseConnectors(user.role)) return null;
+
     // DROP-130 Item 5: mcpAuthMiddleware never reaches authMiddleware, so this
     // is the only gate an app-MCP token passes through. A token MINTED before
     // the owner was suspended or force-reset must not keep authenticating for
@@ -1271,6 +1283,14 @@ export async function verifyOAuthAccessToken(
     // verifyApiKey has done exactly this since DROP-075.
     const record = getUserById(userId);
     if (!record || record.enabled === false) return null;
+
+    // Global connector-policy gate — site 4 of 5, see `mayUseConnectors`'
+    // header (connector-policy.ts). `record.role`, re-read live above for
+    // exactly this reason: it is what makes the toggle take effect
+    // immediately rather than after this token's 15-minute TTL — no new
+    // durable store is needed because this function already re-reads the
+    // user record per request.
+    if (!mayUseConnectors(record.role)) return null;
 
     // DROP-130 Item 5: mcpAuthMiddleware never reaches authMiddleware, so this
     // is the only gate an OAuth access token passes through. A token MINTED
@@ -1371,6 +1391,83 @@ function hashOpaqueToken(token: string): string {
 }
 
 /**
+ * Per-user cap on live `RefreshTokenRecord`s (Item 6, DROP-131). Records have
+ * no TTL and are pruned only by rotation, an explicit revoke, or user
+ * deletion, and `api-credentials.json` is parsed linearly on every
+ * authenticated request — broadening connectors from a handful of admins to
+ * every account makes unbounded growth here bite. Exported so a test can
+ * reference it rather than hardcoding the literal in two places.
+ */
+export const MAX_REFRESH_TOKENS_PER_USER = 10;
+
+/**
+ * Push a new refresh record and enforce the per-user cap as one operation.
+ * The ordering invariant this replaces used to live only in a docstring
+ * ("call the evictor on an array that doesn't yet contain the new record")
+ * plus an off-by-one (`MAX - 1`) standing in for "the caller pushes exactly
+ * one more" — a third call site, or a refactor that moved a push before the
+ * evict, would silently start evicting the very grant being issued. Routing
+ * both operations through here removes the possibility: the record is
+ * already IN `records` by the time `trimToCap` runs, and `trimToCap` is
+ * handed that record's hash so it can never select its own input as the
+ * thing to evict.
+ */
+function pushRefreshRecord(records: RefreshTokenRecord[], record: RefreshTokenRecord): void {
+  records.push(record);
+  trimToCap(records, record.userId, record.tokenHash);
+}
+
+/**
+ * Evict `userId`'s OLDEST-by-`createdAt` records, in place, down to
+ * `MAX_REFRESH_TOKENS_PER_USER`, excluding the record whose hash is
+ * `keepHash` from the candidate set — see `pushRefreshRecord`, the only
+ * caller. Silently disconnects that user's oldest OTHER connector; that is
+ * the deliberate trade against unbounded growth in a file parsed on every
+ * authenticated request.
+ *
+ * `createdAt` is treated as possibly absent: `api-credentials.json` has no
+ * schema validation, and `predatesInvalidationStamp` in this same file
+ * already tolerates the same gap. A record missing it sorts as the OLDEST
+ * (`?? ''` sorts before any real ISO string) and is evicted first — the
+ * fail-safe direction — rather than throwing out of `.localeCompare` and
+ * 500ing every caller of `/oauth/token`.
+ *
+ * Also kills each evicted record's grant via `denyGrant`: removing the
+ * refresh record alone only stops NEW access tokens being minted, exactly
+ * the reason `revokeRefreshToken` calls `denyGrant` too — eviction is
+ * another way a record disappears and must carry the same guarantee. Logs
+ * one `[oauth]` line per eviction EVENT (not per record), so an operator
+ * looking at journald has a reason to suspect the cap instead of reuse or
+ * revocation — both produce the identical `invalid_grant` at the caller.
+ */
+function trimToCap(records: RefreshTokenRecord[], userId: string, keepHash: string): void {
+  const totalForUser = records.reduce((n, r) => (r.userId === userId ? n + 1 : n), 0);
+  const excess = totalForUser - MAX_REFRESH_TOKENS_PER_USER;
+  if (excess <= 0) return;
+
+  const evictable = records
+    .map((_, i) => i)
+    .filter((i) => records[i].userId === userId && records[i].tokenHash !== keepHash)
+    .sort((a, b) => (records[a].createdAt ?? '').localeCompare(records[b].createdAt ?? ''));
+
+  const toEvict = new Set(evictable.slice(0, excess));
+  if (toEvict.size === 0) return;
+
+  for (const i of toEvict) {
+    const sid = records[i].sid;
+    if (sid) denyGrant(sid);
+  }
+
+  // Remove in descending index order so earlier removals don't shift the
+  // indices still pending removal.
+  for (let i = records.length - 1; i >= 0; i--) {
+    if (toEvict.has(i)) records.splice(i, 1);
+  }
+
+  console.log('[oauth] refresh record evicted', { userId, evicted: toEvict.size });
+}
+
+/**
  * Issue a new opaque OAuth refresh token for a user + OAuth client, hashed at
  * rest (the raw token is returned once and never stored).
  */
@@ -1393,7 +1490,7 @@ export async function issueRefreshToken(
   };
 
   if (!credentials.refreshTokens) credentials.refreshTokens = [];
-  credentials.refreshTokens.push(record);
+  pushRefreshRecord(credentials.refreshTokens, record);
   await saveCredentials(config.credentialsPath, credentials);
 
   return token;
@@ -1444,11 +1541,39 @@ export async function rotateRefreshToken(presented: string): Promise<{
   // check above.
   if (predatesInvalidationStamp(createdAt, owner.credentialsInvalidBefore)) return null;
 
+  // Global connector-policy gate — site 3 of 5, see `mayUseConnectors`'
+  // header (connector-policy.ts). THIS PLACEMENT IS THE WHOLE POINT: checked
+  // here, pre-splice, for the exact reason given in the `enabled` check's own
+  // comment above — a refusal AFTER the splice would still return null to
+  // the caller, but it would also burn the presented refresh token and leave
+  // a fresh, unreturned replacement orphaned in the store. Checking first
+  // leaves the record untouched, so flipping the toggle back ON restores the
+  // connector with no re-consent required. `owner.role`, not an AuthContext
+  // — there is none in scope here, only the `User` record.
+  if (!mayUseConnectors(owner.role)) {
+    // Without this line a policy refusal is indistinguishable in journald
+    // from a genuinely dead token: the caller only ever sees
+    // rotateRefreshToken's generic null -> 'Unknown or already-used refresh
+    // token'. This is the trace Gate 4's `journalctl | grep '\[oauth\]'`
+    // looks for. Rare by construction — a refused grant is not retried in a
+    // tight loop the way a verify-path rejection would be.
+    console.log('[oauth] connectors disabled', {
+      grant: 'refresh_token',
+      userId: owner.id,
+      role: owner.role,
+    });
+    return null;
+  }
+
   const carried = sid ?? crypto.randomUUID();
   records.splice(index, 1);
 
   const refreshToken = crypto.randomBytes(32).toString('base64url');
-  records.push({
+  // Item 6 (DROP-131): `pushRefreshRecord` pushes this record THEN enforces
+  // the cap, excluding its own hash from the eviction candidates — so it can
+  // only remove this user's oldest OTHER record, never the one just rotated
+  // in. See `pushRefreshRecord`'s header for the general contract.
+  pushRefreshRecord(records, {
     tokenHash: hashOpaqueToken(refreshToken),
     userId,
     clientId,

@@ -88,12 +88,28 @@ describe('buildAuthServerMetadata', () => {
       issuer: 'https://example.com',
       authorization_endpoint: 'https://example.com/api/v1/oauth/authorize',
       token_endpoint: 'https://example.com/api/v1/oauth/token',
+      revocation_endpoint: 'https://example.com/api/v1/oauth/revoke',
       response_types_supported: ['code'],
       grant_types_supported: ['authorization_code', 'refresh_token'],
       code_challenge_methods_supported: ['S256'],
       token_endpoint_auth_methods_supported: ['none'],
+      revocation_endpoint_auth_methods_supported: ['none'],
       scopes_supported: ['offline_access'],
     });
+  });
+
+  it('the revocation_endpoint is derived the same way as authorization/token (same issuer, /oauth/revoke suffix)', () => {
+    const doc = buildAuthServerMetadata('https://example.com/') as {
+      issuer: string;
+      authorization_endpoint: string;
+      token_endpoint: string;
+      revocation_endpoint: string;
+    };
+    expect(doc.revocation_endpoint).toBe(`${doc.issuer}/api/v1/oauth/revoke`);
+    expect(doc.revocation_endpoint.replace('/revoke', '')).toBe(
+      doc.authorization_endpoint.replace('/authorize', '')
+    );
+    expect(doc.revocation_endpoint.replace('/revoke', '')).toBe(doc.token_endpoint.replace('/token', ''));
   });
 
   it('never includes a registration_endpoint (dynamic client registration is cut)', () => {
