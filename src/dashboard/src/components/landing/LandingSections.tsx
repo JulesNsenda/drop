@@ -1,6 +1,12 @@
+import type { CSSProperties, ReactNode } from 'react';
 import { Link } from 'react-router-dom';
 import {
+  Bot,
   Boxes,
+  Briefcase,
+  Building2,
+  Check,
+  Cloud,
   Database,
   Layers,
   Lock,
@@ -8,8 +14,10 @@ import {
   Repeat,
   Rocket,
   ScrollText,
+  Server,
   Settings2,
   Sparkles,
+  Users,
 } from 'lucide-react';
 
 export interface LandingSectionsProps {
@@ -21,17 +29,30 @@ export interface LandingSectionsProps {
 type EnterProps = Pick<LandingSectionsProps, 'onEnter'>;
 type HeroProps = LandingSectionsProps;
 
-// The landing CTAs now point at /docs and /reference, which ship in this same
-// site bundle (DROP-070) — they used to send readers to GitHub because those
-// pages did not exist yet. GitHub still has its links in SiteNav/SiteFooter.
+// Page order is deliberate and audience-driven: a reader meets the *outcome*
+// (hero → what you get → who it's for → how it works → how to run it) before
+// meeting any mechanism. Everything from `TechnicalDivider` down is the
+// technical proof — runtimes, drop.yaml, CLI, MCP — kept intact for the person
+// who will actually operate the box, and explicitly signposted so a business
+// reader knows they can stop. Rewriting sentences alone did not fix this page;
+// the section order was the problem.
+//
+// Host-neutrality matters here: this same bundle is served at "/" by *every*
+// DROP install, not just dropkit.sh. No copy may name a specific host, and the
+// "hosted" path must read as "this instance", never "our SaaS".
+//
+// The landing CTAs point at /docs and /reference, which ship in this same site
+// bundle (DROP-070). GitHub still has its links in SiteNav/SiteFooter.
 
-const AGENTS =['Claude', 'Claude Code', 'Codex', 'Cursor', 'Cline', 'Windsurf'];
+const AGENTS = ['Claude', 'Claude Code', 'Codex', 'Cursor', 'Cline', 'Windsurf'];
 
+// Outcome metrics, not mechanism metrics — "5 runtimes supported" told a
+// non-technical reader nothing about what they get.
 const STATS: { v: string; l: string }[] = [
-  { v: '~8s', l: 'median deploy' },
-  { v: '0', l: 'config files needed' },
-  { v: '5', l: 'runtimes supported' },
-  { v: '100%', l: 'self-hosted' },
+  { v: '~8s', l: 'from folder to live URL' },
+  { v: '0', l: 'setup files to write' },
+  { v: '1', l: 'server runs all your apps' },
+  { v: '24/7', l: 'crashed apps restart themselves' },
 ];
 
 const MCP_TOOLS = [
@@ -64,21 +85,84 @@ const STEPS: { n: string; tag: string; title: string; body: string }[] = [
   {
     n: '01',
     tag: 'DROP',
-    title: 'Drop a folder',
-    body: 'Point DROP at any project directory. No Dockerfile, no build script, no config file to begin.',
+    title: 'Hand it a folder',
+    body: 'Point DROP at the project folder your developer gives you. There is no file to write first and no form to fill in.',
   },
   {
     n: '02',
     tag: 'DETECT',
-    title: 'Auto-detect & build',
-    body: 'It recognizes the runtime and framework, then installs and builds automatically.',
+    title: 'It works out the rest',
+    body: 'DROP recognises what the app is built with, installs everything it needs, and builds it — the way that project expects to be built.',
   },
   {
     n: '03',
     tag: 'DEPLOY',
-    title: 'Get a URL',
-    body: 'Online at myapp.localhost with a persistent port, PM2 supervision, and automatic HTTPS.',
+    title: 'You get a link',
+    body: 'The app is online at its own web address, with a valid HTTPS certificate, and it is restarted automatically if it ever falls over.',
   },
+];
+
+// Who it's for, in the reader's own words. Each card names the situation the
+// reader is actually in and what DROP takes off the invoice — "what it
+// replaces" is the question a business reader is really asking.
+const AUDIENCES: {
+  key: string;
+  icon: JSX.Element;
+  who: string;
+  body: string;
+  replaces: string;
+}[] = [
+  {
+    key: 'founder',
+    icon: <Briefcase size={17} style={{ color: 'var(--accent)' }} />,
+    who: 'Founders & small business owners',
+    body: 'Your developer says the app is finished — “we just need to sort out hosting.” That sentence is a whole other project. This is that project, already done.',
+    replaces: 'paying someone to set up servers',
+  },
+  {
+    key: 'agency',
+    icon: <Users size={17} style={{ color: 'var(--accent)' }} />,
+    who: 'Agencies & freelance dev shops',
+    body: 'Twelve client projects should not mean twelve hosting bills and twelve control panels. Run them all on one server — each with its own domain, database and logs.',
+    replaces: 'a separate hosting plan per client',
+  },
+  {
+    key: 'lead',
+    icon: <Building2 size={17} style={{ color: 'var(--accent)' }} />,
+    who: 'Technical leads at small companies',
+    body: 'You need a platform team you are never going to get headcount for. DROP is the part of one that actually earns its keep — without adopting Kubernetes to get there.',
+    replaces: 'a platform team, or Kubernetes',
+  },
+  {
+    key: 'agents',
+    icon: <Bot size={17} style={{ color: 'var(--accent)' }} />,
+    who: 'Anyone building with AI assistants',
+    body: 'Claude, Cursor and Codex can deploy to DROP themselves. You describe the change, the assistant ships it and reads the logs back to you when something looks wrong.',
+    replaces: 'pasting the assistant’s output into a terminal',
+  },
+];
+
+const HOSTED_POINTS = ['Nothing to install', 'Sign in and deploy', 'Someone else handles updates and backups'];
+
+const SELFHOST_POINTS = [
+  'Runs on a small Linux VPS',
+  'Your code and customer data stay on your machine',
+  'MIT licensed — the source is public',
+];
+
+const CONFIG_POINTS = [
+  'Pin the app type & build/start commands',
+  'Custom per-app domains',
+  'Inject environment variables',
+  'Declare required secrets (auto-generated or prompted)',
+  'Attach Postgres & Redis',
+];
+
+const CLI_CMDS: { cmd: string; desc: string }[] = [
+  { cmd: 'deploy ./app', desc: 'ship it' },
+  { cmd: 'logs myapp', desc: 'tail logs' },
+  { cmd: 'list', desc: 'list apps' },
+  { cmd: 'status myapp', desc: 'app status' },
 ];
 
 // Mirrors the real dashboard nav (src/dashboard/src/components/Layout.tsx) —
@@ -103,20 +187,57 @@ const DASH_ROWS: { name: string; meta: string; cpu: string; dot: string }[] = [
   { name: 'docs-site', meta: ':4313 · static', cpu: '0.0%', dot: '#39D98A' },
 ];
 
-const CONFIG_POINTS = [
-  'Pin the app type & build/start commands',
-  'Custom per-app domains',
-  'Inject environment variables',
-  'Declare required secrets (auto-generated or prompted)',
-  'Attach Postgres & Redis',
-];
+/* ------------------------------------------------------------------ */
+/* Shared bits of the design system, so the new sections match the old */
+/* ------------------------------------------------------------------ */
 
-const CLI_CMDS: { cmd: string; desc: string }[] = [
-  { cmd: 'deploy ./app', desc: 'ship it' },
-  { cmd: 'logs myapp', desc: 'tail logs' },
-  { cmd: 'list', desc: 'list apps' },
-  { cmd: 'status myapp', desc: 'app status' },
-];
+const eyebrowStyle: CSSProperties = {
+  fontFamily: 'var(--mono)',
+  fontSize: 12,
+  letterSpacing: 2,
+  textTransform: 'uppercase',
+  color: 'var(--accent)',
+  marginBottom: 14,
+};
+
+const primaryBtnStyle: CSSProperties = {
+  display: 'inline-flex',
+  alignItems: 'center',
+  gap: 10,
+  fontFamily: 'var(--mono)',
+  fontWeight: 600,
+  fontSize: 14,
+  background: 'linear-gradient(180deg,var(--accent-2),var(--accent))',
+  color: 'var(--accent-ink)',
+  padding: '13px 22px',
+  borderRadius: 11,
+  boxShadow: 'var(--btn)',
+  border: 'none',
+  cursor: 'pointer',
+};
+
+const secondaryBtnStyle: CSSProperties = {
+  display: 'inline-flex',
+  alignItems: 'center',
+  gap: 8,
+  fontFamily: 'var(--mono)',
+  fontWeight: 500,
+  fontSize: 14,
+  background: 'var(--bg-3)',
+  color: 'var(--text)',
+  border: '1px solid var(--border)',
+  padding: '13px 22px',
+  borderRadius: 11,
+};
+
+/** Small mono line under a plain-English claim — the technical proof. */
+function ProofLine({ children }: { children: ReactNode }): JSX.Element {
+  return (
+    <div style={{ fontFamily: 'var(--mono)', fontSize: 11, color: 'var(--text-3)', marginTop: 10 }}>
+      {children}
+    </div>
+  );
+}
 
 function HeroSection({ onEnter, onSignup, authEnabled }: HeroProps): JSX.Element {
   return (
@@ -173,7 +294,7 @@ function HeroSection({ onEnter, onSignup, authEnabled }: HeroProps): JSX.Element
           >
             <span style={{ color: 'var(--accent)' }}>New</span>
             <span style={{ width: 1, height: 12, background: 'var(--border)' }} />
-            Deploy from Claude, Codex & Cursor via MCP
+            Your AI assistant can deploy for you
             <span style={{ background: 'var(--accent-soft)', color: 'var(--accent)', borderRadius: 999, padding: '2px 8px' }}>
               →
             </span>
@@ -189,8 +310,8 @@ function HeroSection({ onEnter, onSignup, authEnabled }: HeroProps): JSX.Element
               marginBottom: 22,
             }}
           >
-            Drop a folder.<br />
-            Get a{' '}
+            Your app goes live<br />
+            in about{' '}
             <span
               style={{
                 background: 'linear-gradient(120deg,var(--accent),var(--accent-2))',
@@ -200,56 +321,26 @@ function HeroSection({ onEnter, onSignup, authEnabled }: HeroProps): JSX.Element
                 color: 'transparent',
               }}
             >
-              URL.
+              eight seconds.
             </span>
           </h1>
-          <p style={{ fontSize: 18, color: 'var(--text-2)', maxWidth: 470, marginBottom: 30 }}>
-            The lightweight, self-hosted PaaS built for one move: point it at a folder, and it auto-detects, builds,
-            provisions a database, and ships. Node, Python, Go, Docker, static — zero config.
+          <p style={{ fontSize: 18, color: 'var(--text-2)', maxWidth: 470, marginBottom: 18, lineHeight: 1.6 }}>
+            DROP takes a folder of code and puts it on the internet — with its own web address, a security
+            certificate, a database and round-the-clock monitoring already set up. There is no server to configure
+            and no hosting console to learn.
+          </p>
+          <p style={{ fontFamily: 'var(--mono)', fontSize: 12.5, color: 'var(--text-3)', marginBottom: 28 }}>
+            Node · Python · Go · Docker · static — detected automatically. No Dockerfile required.
           </p>
           <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', marginBottom: 26 }}>
-            <button
-              type="button"
-              onClick={onEnter}
-              style={{
-                display: 'inline-flex',
-                alignItems: 'center',
-                gap: 10,
-                fontFamily: 'var(--mono)',
-                fontWeight: 600,
-                fontSize: 14,
-                background: 'linear-gradient(180deg,var(--accent-2),var(--accent))',
-                color: 'var(--accent-ink)',
-                padding: '13px 22px',
-                borderRadius: 11,
-                boxShadow: 'var(--btn)',
-                border: 'none',
-                cursor: 'pointer',
-              }}
-            >
-              Start deploying →
+            <button type="button" onClick={onEnter} style={primaryBtnStyle}>
+              Get started →
             </button>
-            {/* Same site bundle (DROP-070) — /docs is a react-router route
-                here, not a cross-bundle jump, so Link is correct. */}
-            <Link
-              to="/docs"
-              className="dl-hover-border"
-              style={{
-                display: 'inline-flex',
-                alignItems: 'center',
-                gap: 8,
-                fontFamily: 'var(--mono)',
-                fontWeight: 500,
-                fontSize: 14,
-                background: 'var(--bg-3)',
-                color: 'var(--text)',
-                border: '1px solid var(--border)',
-                padding: '13px 22px',
-                borderRadius: 11,
-              }}
-            >
-              Documentation
-            </Link>
+            {/* Same site bundle (DROP-070) — an in-page anchor, not a
+                cross-bundle jump. */}
+            <a href="#how-it-works" className="dl-hover-border" style={secondaryBtnStyle}>
+              See how it works
+            </a>
           </div>
           {authEnabled && (
             <button
@@ -308,6 +399,10 @@ function HeroSection({ onEnter, onSignup, authEnabled }: HeroProps): JSX.Element
               pointerEvents: 'none',
             }}
           />
+          {/* Terminal + the overhanging "deployed by an assistant" badge share
+              their own positioning context, so the caption below can never be
+              what the badge is anchored against. */}
+          <div style={{ position: 'relative' }}>
           <div
             style={{
               position: 'relative',
@@ -350,7 +445,7 @@ function HeroSection({ onEnter, onSignup, authEnabled }: HeroProps): JSX.Element
                 <span style={{ color: 'var(--accent-2)' }}>→</span> Building… done in <span style={{ color: 'var(--text)' }}>8.2s</span>
               </div>
               <div style={{ color: 'var(--text-2)' }}>
-                <span style={{ color: 'var(--accent-2)' }}>→</span> Starting via PM2… <span style={{ color: 'var(--ok)' }}>online ✓</span>
+                <span style={{ color: 'var(--accent-2)' }}>→</span> Starting… <span style={{ color: 'var(--ok)' }}>online ✓</span>
               </div>
               <div style={{ marginTop: 8, color: 'var(--ok)' }}>
                 ✔ Deployed →{' '}
@@ -384,6 +479,7 @@ function HeroSection({ onEnter, onSignup, authEnabled }: HeroProps): JSX.Element
             </div>
           </div>
           <div
+            className="dl-hide-sm"
             style={{
               position: 'absolute',
               bottom: -37,
@@ -414,11 +510,17 @@ function HeroSection({ onEnter, onSignup, authEnabled }: HeroProps): JSX.Element
             </span>
             <div>
               <div style={{ fontFamily: 'var(--mono)', fontSize: 12, color: 'var(--text)' }}>
-                deploy_files <span style={{ color: 'var(--text-3)' }}>via MCP</span>
+                deployed by an assistant
               </div>
               <div style={{ fontFamily: 'var(--mono)', fontSize: 11, color: 'var(--ok)' }}>✔ api.localhost · 8.2s</div>
             </div>
           </div>
+          </div>
+          {/* Plain-English caption so the terminal is not an opaque black box
+              to a non-technical reader. Sits clear of the badge's overhang. */}
+          <p style={{ marginTop: 52, fontSize: 13, color: 'var(--text-3)', textAlign: 'center' }}>
+            That is the entire deployment — one command, and the app is online.
+          </p>
         </div>
       </div>
 
@@ -448,21 +550,709 @@ function HeroSection({ onEnter, onSignup, authEnabled }: HeroProps): JSX.Element
   );
 }
 
+/**
+ * "What you get" — the old FeaturesBento, re-led in plain English with the
+ * mechanism kept underneath as a `ProofLine`. Keeps `id="features"` because
+ * SiteNav and SiteFooter both anchor to it.
+ */
+function WhatYouGet(): JSX.Element {
+  return (
+    <section id="features" style={{ maxWidth: 1200, margin: '0 auto', padding: '52px 28px' }}>
+      <div style={{ marginBottom: 36, maxWidth: 660 }}>
+        <div style={eyebrowStyle}>What you get</div>
+        <h2 style={{ fontFamily: 'var(--mono)', fontWeight: 700, fontSize: 38, letterSpacing: -1, marginBottom: 14 }}>
+          Everything a live app needs, already switched on.
+        </h2>
+        <p style={{ fontSize: 16, color: 'var(--text-2)', lineHeight: 1.7 }}>
+          This is not a list of things to set up. It is a list of things nobody on your side has to think about
+          again.
+        </p>
+      </div>
+      <div className="dl-bento" style={{ display: 'grid', gridTemplateColumns: 'repeat(4,1fr)', gridAutoRows: 164, gap: 14 }}>
+        <div
+          style={{
+            gridColumn: 'span 2',
+            gridRow: 'span 2',
+            border: '1px solid var(--border)',
+            borderRadius: 16,
+            padding: 26,
+            background: 'var(--bg-2)',
+            boxShadow: 'var(--elev)',
+            display: 'flex',
+            flexDirection: 'column',
+          }}
+        >
+          <div
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              width: 38,
+              height: 38,
+              borderRadius: 10,
+              background: 'linear-gradient(135deg,var(--accent),var(--accent-2))',
+              color: 'var(--accent-ink)',
+              marginBottom: 16,
+            }}
+          >
+            <Rocket size={20} style={{ color: 'var(--accent-ink)' }} />
+          </div>
+          <div style={{ fontFamily: 'var(--mono)', fontWeight: 600, fontSize: 20, marginBottom: 8 }}>
+            It goes live, and you configured nothing
+          </div>
+          <p style={{ fontSize: 14, color: 'var(--text-2)', lineHeight: 1.6, marginBottom: 'auto', maxWidth: 340 }}>
+            Point DROP at a folder. It works out what the app is, installs what it needs, builds it and starts it.
+            No setup wizard, no checklist, no Dockerfile to write.
+          </p>
+          <div style={{ border: '1px solid var(--border)', borderRadius: 10, background: 'var(--panel)', padding: '13px 15px', fontFamily: 'var(--mono)', fontSize: 12.5, color: 'var(--text-2)', marginTop: 18 }}>
+            <span style={{ color: 'var(--accent)' }}>$</span> drop deploy ./app
+            <br />
+            <span style={{ color: 'var(--ok)' }}>✔ https://app.localhost</span>
+          </div>
+        </div>
+
+        <div style={{ gridColumn: 'span 2', border: '1px solid var(--border)', borderRadius: 16, padding: 24, background: 'var(--bg-2)', boxShadow: 'var(--elev)' }}>
+          <div
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              width: 34,
+              height: 34,
+              borderRadius: 9,
+              background: 'var(--accent-soft)',
+              color: 'var(--accent)',
+              marginBottom: 14,
+            }}
+          >
+            <Lock size={18} style={{ color: 'var(--accent)' }} />
+          </div>
+          <div style={{ fontFamily: 'var(--mono)', fontWeight: 600, fontSize: 16, marginBottom: 7 }}>
+            A real web address, with the padlock
+          </div>
+          <p style={{ fontSize: 13.5, color: 'var(--text-2)', lineHeight: 1.6 }}>
+            Every app gets its own address and a valid HTTPS certificate, issued and renewed for it. Point your own
+            domain name at it whenever you are ready.
+          </p>
+          <ProofLine>Caddy reverse proxy · Let&apos;s Encrypt · auto-renewed</ProofLine>
+        </div>
+
+        <div style={{ border: '1px solid var(--border)', borderRadius: 16, padding: 22, background: 'var(--bg-2)', boxShadow: 'var(--elev)' }}>
+          <div
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              width: 32,
+              height: 32,
+              borderRadius: 9,
+              background: 'var(--accent-soft)',
+              color: 'var(--accent)',
+              marginBottom: 12,
+            }}
+          >
+            <Database size={16} style={{ color: 'var(--accent)' }} />
+          </div>
+          <div style={{ fontFamily: 'var(--mono)', fontWeight: 600, fontSize: 14.5, marginBottom: 6 }}>
+            A database, already plugged in
+          </div>
+          <p style={{ fontSize: 12.5, color: 'var(--text-2)', lineHeight: 1.55 }}>
+            Each app gets its own, connected before it starts. Nobody copies a password around.
+          </p>
+        </div>
+
+        <div style={{ border: '1px solid var(--border)', borderRadius: 16, padding: 22, background: 'var(--bg-2)', boxShadow: 'var(--elev)' }}>
+          <div
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              width: 32,
+              height: 32,
+              borderRadius: 9,
+              background: 'var(--accent-soft)',
+              color: 'var(--accent)',
+              marginBottom: 12,
+            }}
+          >
+            <RefreshCw size={16} style={{ color: 'var(--accent)' }} />
+          </div>
+          <div style={{ fontFamily: 'var(--mono)', fontWeight: 600, fontSize: 14.5, marginBottom: 6 }}>
+            Change the code, it redeploys
+          </div>
+          <p style={{ fontSize: 12.5, color: 'var(--text-2)', lineHeight: 1.55 }}>
+            Edit the files and DROP rebuilds and restarts the app on its own.
+          </p>
+        </div>
+
+        <div
+          style={{
+            gridColumn: 'span 2',
+            border: '1px solid var(--border)',
+            borderRadius: 16,
+            padding: 24,
+            background: 'var(--bg-2)',
+            boxShadow: 'var(--elev)',
+            display: 'flex',
+            flexDirection: 'column',
+          }}
+        >
+          <div
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              width: 34,
+              height: 34,
+              borderRadius: 9,
+              background: 'var(--accent-soft)',
+              color: 'var(--accent)',
+              marginBottom: 14,
+            }}
+          >
+            <Layers size={18} style={{ color: 'var(--accent)' }} />
+          </div>
+          <div style={{ fontFamily: 'var(--mono)', fontWeight: 600, fontSize: 16, marginBottom: 7 }}>
+            It runs whatever your developer built
+          </div>
+          <p style={{ fontSize: 13.5, color: 'var(--text-2)', lineHeight: 1.6, marginBottom: 14 }}>
+            Node, Python, Go, Docker and plain websites — and it recognises Next.js, Nuxt, SvelteKit, Astro, FastAPI
+            and Flask without being told which one it is looking at.
+          </p>
+          <div style={{ display: 'flex', gap: 7, flexWrap: 'wrap', marginTop: 'auto' }}>
+            {RT_CHIPS.map((c) => (
+              <span key={c} style={{ fontFamily: 'var(--mono)', fontSize: 11, color: 'var(--text-2)', border: '1px solid var(--border)', borderRadius: 6, padding: '3px 9px', background: 'var(--panel)' }}>
+                {c}
+              </span>
+            ))}
+          </div>
+        </div>
+
+        <div style={{ border: '1px solid var(--border)', borderRadius: 16, padding: 22, background: 'var(--bg-2)', boxShadow: 'var(--elev)' }}>
+          <div
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              width: 32,
+              height: 32,
+              borderRadius: 9,
+              background: 'var(--accent-soft)',
+              color: 'var(--accent)',
+              marginBottom: 12,
+            }}
+          >
+            <Repeat size={16} style={{ color: 'var(--accent)' }} />
+          </div>
+          <div style={{ fontFamily: 'var(--mono)', fontWeight: 600, fontSize: 14.5, marginBottom: 6 }}>
+            It picks itself back up
+          </div>
+          <p style={{ fontSize: 12.5, color: 'var(--text-2)', lineHeight: 1.55 }}>
+            If an app crashes it is restarted automatically, day or night.
+          </p>
+        </div>
+
+        <div style={{ border: '1px solid var(--border)', borderRadius: 16, padding: 22, background: 'var(--bg-2)', boxShadow: 'var(--elev)' }}>
+          <div
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              width: 32,
+              height: 32,
+              borderRadius: 9,
+              background: 'var(--accent-soft)',
+              color: 'var(--accent)',
+              marginBottom: 12,
+            }}
+          >
+            <ScrollText size={16} style={{ color: 'var(--accent)' }} />
+          </div>
+          <div style={{ fontFamily: 'var(--mono)', fontWeight: 600, fontSize: 14.5, marginBottom: 6 }}>
+            You can see what happened
+          </div>
+          <p style={{ fontSize: 12.5, color: 'var(--text-2)', lineHeight: 1.55 }}>
+            Everything an app prints is kept and searchable, so a problem has an answer.
+          </p>
+        </div>
+      </div>
+    </section>
+  );
+}
+
+/** Who it's for + what it replaces — the section a business reader looks for and never found. */
+function WhoItsFor(): JSX.Element {
+  return (
+    <section id="who" style={{ maxWidth: 1200, margin: '0 auto', padding: '52px 28px' }}>
+      <div style={{ marginBottom: 36, maxWidth: 660 }}>
+        <div style={eyebrowStyle}>Who it&apos;s for</div>
+        <h2 style={{ fontFamily: 'var(--mono)', fontWeight: 700, fontSize: 38, letterSpacing: -1, marginBottom: 14 }}>
+          If one of these is you, this is the missing piece.
+        </h2>
+        <p style={{ fontSize: 16, color: 'var(--text-2)', lineHeight: 1.7 }}>
+          DROP replaces the step between “the app is built” and “the app is online” — the step that usually needs a
+          specialist.
+        </p>
+      </div>
+      <div className="dl-grid-4" style={{ display: 'grid', gridTemplateColumns: 'repeat(4,1fr)', gap: 14 }}>
+        {AUDIENCES.map((a) => (
+          <div
+            key={a.key}
+            style={{
+              display: 'flex',
+              flexDirection: 'column',
+              border: '1px solid var(--border)',
+              borderRadius: 16,
+              padding: 24,
+              background: 'var(--bg-2)',
+              boxShadow: 'var(--elev)',
+            }}
+          >
+            <div
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                width: 34,
+                height: 34,
+                borderRadius: 9,
+                background: 'var(--accent-soft)',
+                marginBottom: 14,
+              }}
+            >
+              {a.icon}
+            </div>
+            <div style={{ fontFamily: 'var(--mono)', fontWeight: 600, fontSize: 15, marginBottom: 10, lineHeight: 1.35 }}>
+              {a.who}
+            </div>
+            <p style={{ fontSize: 13.5, color: 'var(--text-2)', lineHeight: 1.65, marginBottom: 18 }}>{a.body}</p>
+            <div
+              style={{
+                marginTop: 'auto',
+                paddingTop: 14,
+                borderTop: '1px solid var(--border)',
+              }}
+            >
+              <div style={{ fontFamily: 'var(--mono)', fontSize: 10, letterSpacing: 1, textTransform: 'uppercase', color: 'var(--text-3)', marginBottom: 5 }}>
+                Replaces
+              </div>
+              <div style={{ fontSize: 13, color: 'var(--text)' }}>{a.replaces}</div>
+            </div>
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function HowItWorks(): JSX.Element {
+  return (
+    <section id="how-it-works" style={{ maxWidth: 1200, margin: '0 auto', padding: '52px 28px 32px' }}>
+      <div style={{ textAlign: 'center', marginBottom: 44 }}>
+        <div style={eyebrowStyle}>How it works</div>
+        <h2 style={{ fontFamily: 'var(--mono)', fontWeight: 700, fontSize: 38, letterSpacing: -1 }}>
+          Three steps. Nothing to fill in.
+        </h2>
+      </div>
+      <div className="dl-grid-3" style={{ display: 'grid', gridTemplateColumns: 'repeat(3,1fr)', gap: 18 }}>
+        {STEPS.map((s) => (
+          <div key={s.n} style={{ position: 'relative', border: '1px solid var(--border)', borderRadius: 16, padding: 28, background: 'var(--bg-2)', boxShadow: 'var(--elev)' }}>
+            <div
+              style={{
+                display: 'inline-flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                width: 34,
+                height: 34,
+                borderRadius: 9,
+                background: 'var(--accent-soft)',
+                color: 'var(--accent)',
+                fontFamily: 'var(--mono)',
+                fontWeight: 700,
+                fontSize: 13,
+                marginBottom: 16,
+              }}
+            >
+              {s.n}
+            </div>
+            <div style={{ fontFamily: 'var(--mono)', fontSize: 11, letterSpacing: 1, color: 'var(--text-3)', marginBottom: 8 }}>
+              {s.tag}
+            </div>
+            <div style={{ fontFamily: 'var(--mono)', fontWeight: 600, fontSize: 19, marginBottom: 10 }}>{s.title}</div>
+            <p style={{ fontSize: 14, color: 'var(--text-2)', lineHeight: 1.65 }}>{s.body}</p>
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+/**
+ * Hosted vs self-hosted, side by side. Deliberately host-neutral: this bundle
+ * is served by every DROP install, so the hosted column says "this instance",
+ * never a specific domain.
+ */
+function TwoWaysToRun({ onEnter }: EnterProps): JSX.Element {
+  const bullet = (text: string): JSX.Element => (
+    <div key={text} style={{ display: 'flex', alignItems: 'flex-start', gap: 10, fontSize: 14, color: 'var(--text-2)', lineHeight: 1.55 }}>
+      <Check size={15} style={{ color: 'var(--accent)', flexShrink: 0, marginTop: 3 }} />
+      {text}
+    </div>
+  );
+
+  return (
+    <section id="run" style={{ maxWidth: 1200, margin: '0 auto', padding: '52px 28px' }}>
+      <div style={{ marginBottom: 36, maxWidth: 660 }}>
+        <div style={eyebrowStyle}>Two ways to run it</div>
+        <h2 style={{ fontFamily: 'var(--mono)', fontWeight: 700, fontSize: 38, letterSpacing: -1, marginBottom: 14 }}>
+          Use someone else&apos;s DROP, or run your own.
+        </h2>
+        <p style={{ fontSize: 16, color: 'var(--text-2)', lineHeight: 1.7 }}>
+          Same platform either way. The only question is who keeps the server running — and you can start on one and
+          move to the other.
+        </p>
+      </div>
+      <div className="dl-grid-2" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 18 }}>
+        <div
+          style={{
+            display: 'flex',
+            flexDirection: 'column',
+            border: '1px solid var(--border)',
+            borderRadius: 18,
+            padding: 32,
+            background: 'var(--bg-2)',
+            boxShadow: 'var(--elev)',
+          }}
+        >
+          <div
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              width: 38,
+              height: 38,
+              borderRadius: 10,
+              background: 'var(--accent-soft)',
+              marginBottom: 16,
+            }}
+          >
+            <Cloud size={19} style={{ color: 'var(--accent)' }} />
+          </div>
+          <div style={{ fontFamily: 'var(--mono)', fontWeight: 600, fontSize: 21, marginBottom: 10 }}>
+            Use a hosted DROP
+          </div>
+          <p style={{ fontSize: 14.5, color: 'var(--text-2)', lineHeight: 1.65, marginBottom: 20 }}>
+            Sign in to a DROP someone already runs — this one, or your company&apos;s — and start deploying. You do
+            not touch a server, and you are shipping in the next ten minutes.
+          </p>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 10, marginBottom: 26 }}>
+            {HOSTED_POINTS.map(bullet)}
+          </div>
+          <button type="button" onClick={onEnter} style={{ ...primaryBtnStyle, marginTop: 'auto', alignSelf: 'flex-start' }}>
+            Get started →
+          </button>
+        </div>
+
+        <div
+          style={{
+            display: 'flex',
+            flexDirection: 'column',
+            border: '1px solid var(--border)',
+            borderRadius: 18,
+            padding: 32,
+            background: 'var(--bg-2)',
+            boxShadow: 'var(--elev)',
+          }}
+        >
+          <div
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              width: 38,
+              height: 38,
+              borderRadius: 10,
+              background: 'var(--accent-soft)',
+              marginBottom: 16,
+            }}
+          >
+            <Server size={19} style={{ color: 'var(--accent)' }} />
+          </div>
+          <div style={{ fontFamily: 'var(--mono)', fontWeight: 600, fontSize: 21, marginBottom: 10 }}>
+            Run it on your own server
+          </div>
+          <p style={{ fontSize: 14.5, color: 'var(--text-2)', lineHeight: 1.65, marginBottom: 20 }}>
+            One install script on any Linux machine — a small VPS is plenty for a portfolio of apps. Nothing leaves
+            hardware you control, and there is no per-app fee because there is no bill but the server.
+          </p>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 10, marginBottom: 26 }}>
+            {SELFHOST_POINTS.map(bullet)}
+          </div>
+          <Link
+            to="/docs#installation"
+            className="dl-hover-border"
+            style={{ ...secondaryBtnStyle, marginTop: 'auto', alignSelf: 'flex-start' }}
+          >
+            Installation guide →
+          </Link>
+        </div>
+      </div>
+    </section>
+  );
+}
+
+function DashboardPreview({ onEnter }: EnterProps): JSX.Element {
+  return (
+    <section id="dashboard" style={{ maxWidth: 1200, margin: '0 auto', padding: '52px 28px' }}>
+      <div style={{ border: '1px solid var(--border)', borderRadius: 20, overflow: 'hidden', background: 'var(--bg-2)', boxShadow: 'var(--elev)' }}>
+        <div style={{ padding: '44px 44px 8px', maxWidth: 640 }}>
+          <div style={eyebrowStyle}>The dashboard</div>
+          <h2 style={{ fontFamily: 'var(--mono)', fontWeight: 700, fontSize: 32, letterSpacing: -0.5, marginBottom: 14 }}>
+            One screen that answers &ldquo;is everything OK?&rdquo;
+          </h2>
+          <p style={{ fontSize: 15, color: 'var(--text-2)', lineHeight: 1.7, marginBottom: 22 }}>
+            Which apps are up, how hard they are working, what they last printed, what changed and when — plus
+            domains, passwords and databases. If you would rather click than type, everything the command line does
+            is here too.
+          </p>
+          <button type="button" onClick={onEnter} style={{ ...primaryBtnStyle, padding: '12px 20px' }}>
+            Open the dashboard →
+          </button>
+        </div>
+        <div style={{ padding: '32px 44px 0' }}>
+          <div
+            style={{
+              border: '1px solid var(--border)',
+              borderTopLeftRadius: 14,
+              borderTopRightRadius: 14,
+              borderBottom: 0,
+              background: 'var(--panel)',
+              overflow: 'hidden',
+              boxShadow: '0 -8px 40px rgba(0,0,0,.12)',
+            }}
+          >
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '11px 15px', borderBottom: '1px solid var(--border)', background: 'var(--bg-3)', fontFamily: 'var(--mono)', fontSize: 11, color: 'var(--text-3)' }}>
+              <span style={{ width: 9, height: 9, borderRadius: '50%', background: '#FF5F57', display: 'inline-block' }} />
+              <span style={{ width: 9, height: 9, borderRadius: '50%', background: '#FEBC2E', display: 'inline-block' }} />
+              <span style={{ width: 9, height: 9, borderRadius: '50%', background: '#28C840', display: 'inline-block' }} />
+              <span style={{ marginLeft: 8 }}>myapp.localhost/dashboard</span>
+            </div>
+            <div className="dl-grid-sidebar" style={{ display: 'grid', gridTemplateColumns: '180px 1fr', minHeight: 280 }}>
+              <div style={{ borderRight: '1px solid var(--border)', padding: '16px 12px', background: 'var(--bg-2)' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 16, fontFamily: 'var(--mono)', fontWeight: 700, fontSize: 13, letterSpacing: 2 }}>
+                  <span style={{ width: 13, height: 13, background: 'var(--accent)', borderRadius: '50% 50% 50% 2px', transform: 'rotate(45deg)' }} />
+                  DROP
+                </div>
+                {DASH_NAV.map((n) => (
+                  <div
+                    key={n.label}
+                    style={{
+                      fontFamily: 'var(--mono)',
+                      fontSize: 12,
+                      padding: '7px 10px',
+                      borderRadius: 7,
+                      marginBottom: 2,
+                      color: n.active ? 'var(--text)' : 'var(--text-2)',
+                      background: n.active ? 'var(--accent-soft)' : 'transparent',
+                    }}
+                  >
+                    {n.label}
+                  </div>
+                ))}
+              </div>
+              <div style={{ padding: 18 }}>
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3,1fr)', gap: 10, marginBottom: 16 }}>
+                  {DASH_STATS.map((s) => (
+                    <div key={s.l} style={{ border: '1px solid var(--border)', borderRadius: 9, padding: '12px 14px', background: 'var(--bg-2)' }}>
+                      <div style={{ fontFamily: 'var(--mono)', fontSize: 10, textTransform: 'uppercase', letterSpacing: 1, color: 'var(--text-3)' }}>
+                        {s.l}
+                      </div>
+                      <div style={{ fontFamily: 'var(--mono)', fontWeight: 700, fontSize: 20, marginTop: 4 }}>{s.v}</div>
+                    </div>
+                  ))}
+                </div>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                  {DASH_ROWS.map((r) => (
+                    <div key={r.name} style={{ display: 'flex', alignItems: 'center', gap: 11, padding: '11px 13px', border: '1px solid var(--border)', borderRadius: 9, background: 'var(--bg-2)' }}>
+                      <span style={{ width: 8, height: 8, borderRadius: '50%', background: r.dot, boxShadow: `0 0 8px ${r.dot}` }} />
+                      <span style={{ fontFamily: 'var(--mono)', fontSize: 12.5, color: 'var(--text)', flex: 1 }}>{r.name}</span>
+                      <span style={{ fontFamily: 'var(--mono)', fontSize: 11, color: 'var(--text-3)' }}>{r.meta}</span>
+                      <span style={{ fontFamily: 'var(--mono)', fontSize: 11, color: 'var(--text-2)' }}>{r.cpu}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+  );
+}
+
+/**
+ * Explicit hand-off between the two audiences. A business reader is told they
+ * can stop; a technical reader is told the proof starts here. Without this the
+ * jargon below reads as the page failing rather than as an appendix.
+ */
+function TechnicalDivider(): JSX.Element {
+  return (
+    <section style={{ maxWidth: 1200, margin: '0 auto', padding: '64px 28px 8px' }}>
+      <div style={{ borderTop: '1px solid var(--border)', paddingTop: 44, maxWidth: 660 }}>
+        <div style={eyebrowStyle}>For whoever will run it</div>
+        <h2 style={{ fontFamily: 'var(--mono)', fontWeight: 700, fontSize: 34, letterSpacing: -1, marginBottom: 14 }}>
+          The technical part.
+        </h2>
+        <p style={{ fontSize: 16, color: 'var(--text-2)', lineHeight: 1.7 }}>
+          If you were deciding whether DROP is for you, you already have what you need. Everything below is for the
+          person who will actually operate it — what it detects, how to override it, and how to drive it from a
+          terminal or an AI assistant.
+        </p>
+      </div>
+    </section>
+  );
+}
+
+function RuntimesStrip(): JSX.Element {
+  return (
+    <section id="runtimes" style={{ maxWidth: 1200, margin: '0 auto', padding: '36px 28px' }}>
+      <div
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          gap: 22,
+          flexWrap: 'wrap',
+          justifyContent: 'center',
+          padding: '20px 28px',
+          border: '1px solid var(--border)',
+          borderRadius: 14,
+          background: 'var(--bg-2)',
+        }}
+      >
+        <span style={{ fontFamily: 'var(--mono)', fontSize: 11, letterSpacing: 1, textTransform: 'uppercase', color: 'var(--text-3)' }}>
+          Detects &amp; runs
+        </span>
+        {RUNTIMES.map((r) => (
+          <span key={r} style={{ fontFamily: 'var(--mono)', fontSize: 14, fontWeight: 500, color: 'var(--text-2)' }}>
+            {r}
+          </span>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function ConfigSection(): JSX.Element {
+  return (
+    <section
+      id="config"
+      className="dl-grid-2"
+      style={{ maxWidth: 1200, margin: '0 auto', padding: '52px 28px', display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 48, alignItems: 'center' }}
+    >
+      <div>
+        <div style={eyebrowStyle}>Escape hatch</div>
+        <h2 style={{ fontFamily: 'var(--mono)', fontWeight: 700, fontSize: 32, letterSpacing: -0.5, marginBottom: 16 }}>
+          Zero config by default. Full control when you want it.
+        </h2>
+        <p style={{ fontSize: 15, color: 'var(--text-2)', lineHeight: 1.7, marginBottom: 20 }}>
+          Most apps need nothing at all. For the rest, drop a <span style={{ fontFamily: 'var(--mono)', color: 'var(--text)' }}>drop.yaml</span>{' '}
+          in the folder to pin the app type, claim domains, set env, declare the secrets it can&apos;t start without,
+          and attach a database. Unknown keys are rejected, so a typo fails loudly instead of doing nothing.
+        </p>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+          {CONFIG_POINTS.map((c) => (
+            <div key={c} style={{ display: 'flex', alignItems: 'center', gap: 10, fontSize: 14, color: 'var(--text-2)' }}>
+              <span style={{ color: 'var(--accent)' }}>▸</span>
+              {c}
+            </div>
+          ))}
+        </div>
+      </div>
+      {/* This sample is pinned byte-for-byte by
+          src/core/detector/documented-samples.test.ts ('landing: escape-hatch
+          drop.yaml') — a published sample the parser rejects has shipped
+          before. Change it there in the same commit or not at all. */}
+      <div style={{ border: '1px solid var(--border)', borderRadius: 14, overflow: 'hidden', background: 'var(--panel)', boxShadow: 'var(--elev)' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '11px 16px', borderBottom: '1px solid var(--border)', background: 'var(--bg-2)', fontFamily: 'var(--mono)', fontSize: 11, color: 'var(--text-3)' }}>
+          drop.yaml
+        </div>
+        <pre style={{ margin: 0, padding: 22, fontFamily: 'var(--mono)', fontSize: 13, lineHeight: 1.85, color: 'var(--text-2)', overflow: 'auto' }}>
+          <span style={{ color: 'var(--accent-2)' }}>name</span>: <span style={{ color: 'var(--ok)' }}>myapp</span>
+          {'\n'}
+          <span style={{ color: 'var(--accent-2)' }}>type</span>: <span style={{ color: 'var(--ok)' }}>nodejs</span>
+          {'\n'}
+          <span style={{ color: 'var(--accent-2)' }}>domains</span>:{'\n'}
+          {'  - '}
+          <span style={{ color: 'var(--ok)' }}>app.example.com</span>
+          {'\n'}
+          <span style={{ color: 'var(--accent-2)' }}>database</span>: <span style={{ color: 'var(--ok)' }}>postgres</span>
+          {'\n'}
+          <span style={{ color: 'var(--accent-2)' }}>env</span>:{'\n'}
+          {'  '}
+          <span style={{ color: 'var(--accent-2)' }}>NODE_ENV</span>: <span style={{ color: 'var(--ok)' }}>production</span>
+          {'\n'}
+          <span style={{ color: 'var(--accent-2)' }}>secrets</span>:{'\n'}
+          {'  '}
+          <span style={{ color: 'var(--accent-2)' }}>JWT_SECRET</span>: <span style={{ color: 'var(--ok)' }}>generate</span>
+        </pre>
+      </div>
+    </section>
+  );
+}
+
+function CliSection(): JSX.Element {
+  return (
+    <section id="cli" style={{ maxWidth: 1200, margin: '0 auto', padding: '52px 28px' }}>
+      <div
+        className="dl-grid-2"
+        style={{ border: '1px solid var(--border)', borderRadius: 18, background: 'var(--bg-2)', boxShadow: 'var(--elev)', padding: 44, display: 'grid', gridTemplateColumns: '1fr 1.1fr', gap: 48, alignItems: 'center' }}
+      >
+        <div>
+          <div style={eyebrowStyle}>Command line + API</div>
+          <h2 style={{ fontFamily: 'var(--mono)', fontWeight: 700, fontSize: 30, letterSpacing: -0.5, marginBottom: 16 }}>
+            Install once. Deploy anything.
+          </h2>
+          <p style={{ fontSize: 15, color: 'var(--text-2)', lineHeight: 1.7, marginBottom: 22 }}>
+            A full-featured CLI plus a REST API secured with JWT and API keys. Manage apps, logs, and domains from
+            your terminal, your CI pipeline, or an AI agent.
+          </p>
+          <Link to="/reference" style={{ fontFamily: 'var(--mono)', fontWeight: 600, fontSize: 14, color: 'var(--accent)' }}>
+            Full CLI &amp; API reference →
+          </Link>
+        </div>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+          {CLI_CMDS.map((c) => (
+            <div key={c.cmd} style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '14px 16px', border: '1px solid var(--border)', borderRadius: 10, background: 'var(--panel)', fontFamily: 'var(--mono)', fontSize: 13.5 }}>
+              <span style={{ color: 'var(--accent)' }}>$</span>
+              <span style={{ color: 'var(--text)', flex: 1 }}>
+                <span style={{ color: 'var(--accent)' }}>drop</span> {c.cmd}
+              </span>
+              <span style={{ color: 'var(--text-3)', fontSize: 11 }}>{c.desc}</span>
+            </div>
+          ))}
+        </div>
+      </div>
+    </section>
+  );
+}
+
 function McpSection(): JSX.Element {
   return (
-    <section id="mcp" style={{ maxWidth: 1200, margin: '0 auto', padding: '64px 28px' }}>
+    <section id="mcp" style={{ maxWidth: 1200, margin: '0 auto', padding: '52px 28px' }}>
       <div className="dl-grid-2" style={{ display: 'grid', gridTemplateColumns: '1fr 1.02fr', gap: 48, alignItems: 'center' }}>
         <div>
-          <div style={{ fontFamily: 'var(--mono)', fontSize: 12, letterSpacing: 2, textTransform: 'uppercase', color: 'var(--accent)', marginBottom: 14 }}>
-            Model Context Protocol
-          </div>
+          <div style={eyebrowStyle}>Deploy from an AI assistant</div>
           <h2 style={{ fontFamily: 'var(--mono)', fontWeight: 700, fontSize: 38, letterSpacing: -1, marginBottom: 16 }}>
-            Ship straight from your AI agent.
+            Let the assistant do the deploy.
           </h2>
-          <p style={{ fontSize: 16, color: 'var(--text-2)', lineHeight: 1.7, marginBottom: 24 }}>
-            DROP ships an MCP server, so Claude, Codex, Cursor and any MCP client can deploy, inspect logs, and manage
-            apps as native tools. Say &quot;ship this repo&quot; — your agent does the rest. Header auth for clients
-            that support it, and OAuth for the claude.ai connector, so nobody pastes a key into a browser.
+          <p style={{ fontSize: 16, color: 'var(--text-2)', lineHeight: 1.7, marginBottom: 16 }}>
+            Say &ldquo;ship this folder&rdquo; to Claude, Codex or Cursor and it does — then reads the logs back to
+            you if something went wrong. Nobody copies commands out of a chat window into a terminal.
+          </p>
+          <p style={{ fontSize: 14.5, color: 'var(--text-2)', lineHeight: 1.7, marginBottom: 24 }}>
+            The technical version: DROP ships an MCP (Model Context Protocol) server, so any MCP client gets deploy,
+            log and status calls as native tools. Header auth for clients that support it, and OAuth for the
+            claude.ai connector — so nobody pastes an API key into a browser.
           </p>
           <div
             style={{
@@ -624,495 +1414,6 @@ function McpSection(): JSX.Element {
   );
 }
 
-function RuntimesStrip(): JSX.Element {
-  return (
-    <section id="runtimes" style={{ maxWidth: 1200, margin: '0 auto', padding: '44px 28px' }}>
-      <div
-        style={{
-          display: 'flex',
-          alignItems: 'center',
-          gap: 22,
-          flexWrap: 'wrap',
-          justifyContent: 'center',
-          padding: '20px 28px',
-          border: '1px solid var(--border)',
-          borderRadius: 14,
-          background: 'var(--bg-2)',
-        }}
-      >
-        <span style={{ fontFamily: 'var(--mono)', fontSize: 11, letterSpacing: 1, textTransform: 'uppercase', color: 'var(--text-3)' }}>
-          Detects &amp; runs
-        </span>
-        {RUNTIMES.map((r) => (
-          <span key={r} style={{ fontFamily: 'var(--mono)', fontSize: 14, fontWeight: 500, color: 'var(--text-2)' }}>
-            {r}
-          </span>
-        ))}
-      </div>
-    </section>
-  );
-}
-
-function HowItWorks(): JSX.Element {
-  return (
-    <section style={{ maxWidth: 1200, margin: '0 auto', padding: '52px 28px 32px' }}>
-      <div style={{ textAlign: 'center', marginBottom: 44 }}>
-        <div style={{ fontFamily: 'var(--mono)', fontSize: 12, letterSpacing: 2, textTransform: 'uppercase', color: 'var(--accent)', marginBottom: 14 }}>
-          How it works
-        </div>
-        <h2 style={{ fontFamily: 'var(--mono)', fontWeight: 700, fontSize: 38, letterSpacing: -1 }}>
-          Three steps. No YAML required.
-        </h2>
-      </div>
-      <div className="dl-grid-3" style={{ display: 'grid', gridTemplateColumns: 'repeat(3,1fr)', gap: 18 }}>
-        {STEPS.map((s) => (
-          <div key={s.n} style={{ position: 'relative', border: '1px solid var(--border)', borderRadius: 16, padding: 28, background: 'var(--bg-2)', boxShadow: 'var(--elev)' }}>
-            <div
-              style={{
-                display: 'inline-flex',
-                alignItems: 'center',
-                justifyContent: 'center',
-                width: 34,
-                height: 34,
-                borderRadius: 9,
-                background: 'var(--accent-soft)',
-                color: 'var(--accent)',
-                fontFamily: 'var(--mono)',
-                fontWeight: 700,
-                fontSize: 13,
-                marginBottom: 16,
-              }}
-            >
-              {s.n}
-            </div>
-            <div style={{ fontFamily: 'var(--mono)', fontSize: 11, letterSpacing: 1, color: 'var(--text-3)', marginBottom: 8 }}>
-              {s.tag}
-            </div>
-            <div style={{ fontFamily: 'var(--mono)', fontWeight: 600, fontSize: 19, marginBottom: 10 }}>{s.title}</div>
-            <p style={{ fontSize: 14, color: 'var(--text-2)', lineHeight: 1.65 }}>{s.body}</p>
-          </div>
-        ))}
-      </div>
-    </section>
-  );
-}
-
-function FeaturesBento(): JSX.Element {
-  return (
-    <section id="features" style={{ maxWidth: 1200, margin: '0 auto', padding: '52px 28px' }}>
-      <div style={{ marginBottom: 36, maxWidth: 640 }}>
-        <div style={{ fontFamily: 'var(--mono)', fontSize: 12, letterSpacing: 2, textTransform: 'uppercase', color: 'var(--accent)', marginBottom: 14 }}>
-          Features
-        </div>
-        <h2 style={{ fontFamily: 'var(--mono)', fontWeight: 700, fontSize: 38, letterSpacing: -1, marginBottom: 14 }}>
-          Everything a deploy needs. Nothing it doesn&apos;t.
-        </h2>
-        <p style={{ fontSize: 16, color: 'var(--text-2)' }}>
-          Detection, build, routing, TLS, databases, processes and logs — handled, so your folder is the only config.
-        </p>
-      </div>
-      <div className="dl-bento" style={{ display: 'grid', gridTemplateColumns: 'repeat(4,1fr)', gridAutoRows: 164, gap: 14 }}>
-        <div
-          style={{
-            gridColumn: 'span 2',
-            gridRow: 'span 2',
-            border: '1px solid var(--border)',
-            borderRadius: 16,
-            padding: 26,
-            background: 'var(--bg-2)',
-            boxShadow: 'var(--elev)',
-            display: 'flex',
-            flexDirection: 'column',
-          }}
-        >
-          <div
-            style={{
-              display: 'flex',
-              alignItems: 'center',
-              justifyContent: 'center',
-              width: 38,
-              height: 38,
-              borderRadius: 10,
-              background: 'linear-gradient(135deg,var(--accent),var(--accent-2))',
-              color: 'var(--accent-ink)',
-              marginBottom: 16,
-            }}
-          >
-            <Rocket size={20} style={{ color: 'var(--accent-ink)' }} />
-          </div>
-          <div style={{ fontFamily: 'var(--mono)', fontWeight: 600, fontSize: 20, marginBottom: 8 }}>Zero-config deployment</div>
-          <p style={{ fontSize: 14, color: 'var(--text-2)', lineHeight: 1.6, marginBottom: 'auto', maxWidth: 340 }}>
-            Auto-detects the app type, builds, and starts it — no Dockerfile, no build script, no setup for most
-            projects.
-          </p>
-          <div style={{ border: '1px solid var(--border)', borderRadius: 10, background: 'var(--panel)', padding: '13px 15px', fontFamily: 'var(--mono)', fontSize: 12.5, color: 'var(--text-2)', marginTop: 18 }}>
-            <span style={{ color: 'var(--accent)' }}>$</span> drop deploy ./app
-            <br />
-            <span style={{ color: 'var(--ok)' }}>✔ https://app.localhost</span>
-          </div>
-        </div>
-
-        <div style={{ gridColumn: 'span 2', border: '1px solid var(--border)', borderRadius: 16, padding: 24, background: 'var(--bg-2)', boxShadow: 'var(--elev)' }}>
-          <div
-            style={{
-              display: 'flex',
-              alignItems: 'center',
-              justifyContent: 'center',
-              width: 34,
-              height: 34,
-              borderRadius: 9,
-              background: 'var(--accent-soft)',
-              color: 'var(--accent)',
-              marginBottom: 14,
-            }}
-          >
-            <Lock size={18} style={{ color: 'var(--accent)' }} />
-          </div>
-          <div style={{ fontFamily: 'var(--mono)', fontWeight: 600, fontSize: 16, marginBottom: 7 }}>Automatic HTTPS &amp; routing</div>
-          <p style={{ fontSize: 13.5, color: 'var(--text-2)', lineHeight: 1.6 }}>
-            Reach apps at <span style={{ fontFamily: 'var(--mono)', color: 'var(--text)' }}>*.localhost</span> via Caddy,
-            with Let&apos;s Encrypt certificates provisioned and renewed automatically.
-          </p>
-        </div>
-
-        <div style={{ border: '1px solid var(--border)', borderRadius: 16, padding: 22, background: 'var(--bg-2)', boxShadow: 'var(--elev)' }}>
-          <div
-            style={{
-              display: 'flex',
-              alignItems: 'center',
-              justifyContent: 'center',
-              width: 32,
-              height: 32,
-              borderRadius: 9,
-              background: 'var(--accent-soft)',
-              color: 'var(--accent)',
-              marginBottom: 12,
-            }}
-          >
-            <Database size={16} style={{ color: 'var(--accent)' }} />
-          </div>
-          <div style={{ fontFamily: 'var(--mono)', fontWeight: 600, fontSize: 14.5, marginBottom: 6 }}>Postgres auto-provisioning</div>
-          <p style={{ fontSize: 12.5, color: 'var(--text-2)', lineHeight: 1.55 }}>
-            Each app gets its own DB with <span style={{ fontFamily: 'var(--mono)', color: 'var(--text-2)' }}>DATABASE_URL</span> injected.
-          </p>
-        </div>
-
-        <div style={{ border: '1px solid var(--border)', borderRadius: 16, padding: 22, background: 'var(--bg-2)', boxShadow: 'var(--elev)' }}>
-          <div
-            style={{
-              display: 'flex',
-              alignItems: 'center',
-              justifyContent: 'center',
-              width: 32,
-              height: 32,
-              borderRadius: 9,
-              background: 'var(--accent-soft)',
-              color: 'var(--accent)',
-              marginBottom: 12,
-            }}
-          >
-            <RefreshCw size={16} style={{ color: 'var(--accent)' }} />
-          </div>
-          <div style={{ fontFamily: 'var(--mono)', fontWeight: 600, fontSize: 14.5, marginBottom: 6 }}>Hot reload</div>
-          <p style={{ fontSize: 12.5, color: 'var(--text-2)', lineHeight: 1.55 }}>
-            Edit files and the app rebuilds and restarts on its own.
-          </p>
-        </div>
-
-        <div
-          style={{
-            gridColumn: 'span 2',
-            border: '1px solid var(--border)',
-            borderRadius: 16,
-            padding: 24,
-            background: 'var(--bg-2)',
-            boxShadow: 'var(--elev)',
-            display: 'flex',
-            flexDirection: 'column',
-          }}
-        >
-          <div
-            style={{
-              display: 'flex',
-              alignItems: 'center',
-              justifyContent: 'center',
-              width: 34,
-              height: 34,
-              borderRadius: 9,
-              background: 'var(--accent-soft)',
-              color: 'var(--accent)',
-              marginBottom: 14,
-            }}
-          >
-            <Layers size={18} style={{ color: 'var(--accent)' }} />
-          </div>
-          <div style={{ fontFamily: 'var(--mono)', fontWeight: 600, fontSize: 16, marginBottom: 7 }}>
-            Multi-runtime + framework detection
-          </div>
-          <p style={{ fontSize: 13.5, color: 'var(--text-2)', lineHeight: 1.6, marginBottom: 14 }}>
-            Node, Python, Go, Docker and static sites — with Next.js, Nuxt, SvelteKit, Astro, FastAPI and Flask
-            recognized automatically.
-          </p>
-          <div style={{ display: 'flex', gap: 7, flexWrap: 'wrap', marginTop: 'auto' }}>
-            {RT_CHIPS.map((c) => (
-              <span key={c} style={{ fontFamily: 'var(--mono)', fontSize: 11, color: 'var(--text-2)', border: '1px solid var(--border)', borderRadius: 6, padding: '3px 9px', background: 'var(--panel)' }}>
-                {c}
-              </span>
-            ))}
-          </div>
-        </div>
-
-        <div style={{ border: '1px solid var(--border)', borderRadius: 16, padding: 22, background: 'var(--bg-2)', boxShadow: 'var(--elev)' }}>
-          <div
-            style={{
-              display: 'flex',
-              alignItems: 'center',
-              justifyContent: 'center',
-              width: 32,
-              height: 32,
-              borderRadius: 9,
-              background: 'var(--accent-soft)',
-              color: 'var(--accent)',
-              marginBottom: 12,
-            }}
-          >
-            <Repeat size={16} style={{ color: 'var(--accent)' }} />
-          </div>
-          <div style={{ fontFamily: 'var(--mono)', fontWeight: 600, fontSize: 14.5, marginBottom: 6 }}>PM2 process management</div>
-          <p style={{ fontSize: 12.5, color: 'var(--text-2)', lineHeight: 1.55 }}>
-            Reliable supervision with auto-restart on failure.
-          </p>
-        </div>
-
-        <div style={{ border: '1px solid var(--border)', borderRadius: 16, padding: 22, background: 'var(--bg-2)', boxShadow: 'var(--elev)' }}>
-          <div
-            style={{
-              display: 'flex',
-              alignItems: 'center',
-              justifyContent: 'center',
-              width: 32,
-              height: 32,
-              borderRadius: 9,
-              background: 'var(--accent-soft)',
-              color: 'var(--accent)',
-              marginBottom: 12,
-            }}
-          >
-            <ScrollText size={16} style={{ color: 'var(--accent)' }} />
-          </div>
-          <div style={{ fontFamily: 'var(--mono)', fontWeight: 600, fontSize: 14.5, marginBottom: 6 }}>Auto-capture logging</div>
-          <p style={{ fontSize: 12.5, color: 'var(--text-2)', lineHeight: 1.55 }}>
-            stdout/stderr saved to dated files and streamed live.
-          </p>
-        </div>
-      </div>
-    </section>
-  );
-}
-
-function DashboardPreview({ onEnter }: EnterProps): JSX.Element {
-  return (
-    <section id="dashboard" style={{ maxWidth: 1200, margin: '0 auto', padding: '52px 28px' }}>
-      <div style={{ border: '1px solid var(--border)', borderRadius: 20, overflow: 'hidden', background: 'var(--bg-2)', boxShadow: 'var(--elev)' }}>
-        <div style={{ padding: '44px 44px 8px', maxWidth: 620 }}>
-          <div style={{ fontFamily: 'var(--mono)', fontSize: 12, letterSpacing: 2, textTransform: 'uppercase', color: 'var(--accent)', marginBottom: 14 }}>
-            The dashboard
-          </div>
-          <h2 style={{ fontFamily: 'var(--mono)', fontWeight: 700, fontSize: 32, letterSpacing: -0.5, marginBottom: 14 }}>
-            A real-time UI for every app.
-          </h2>
-          <p style={{ fontSize: 15, color: 'var(--text-2)', lineHeight: 1.7, marginBottom: 22 }}>
-            Live process health, streaming logs, per-app metrics, secrets, custom domains and deploy history — all in
-            one place at <span style={{ fontFamily: 'var(--mono)', color: 'var(--text)' }}>/dashboard</span>.
-            Everything the CLI and MCP do, visually.
-          </p>
-          <button
-            type="button"
-            onClick={onEnter}
-            style={{
-              display: 'inline-flex',
-              alignItems: 'center',
-              gap: 8,
-              fontFamily: 'var(--mono)',
-              fontWeight: 600,
-              fontSize: 14,
-              background: 'linear-gradient(180deg,var(--accent-2),var(--accent))',
-              color: 'var(--accent-ink)',
-              padding: '12px 20px',
-              borderRadius: 11,
-              boxShadow: 'var(--btn)',
-              border: 'none',
-              cursor: 'pointer',
-            }}
-          >
-            Open the dashboard →
-          </button>
-        </div>
-        <div style={{ padding: '32px 44px 0' }}>
-          <div
-            style={{
-              border: '1px solid var(--border)',
-              borderTopLeftRadius: 14,
-              borderTopRightRadius: 14,
-              borderBottom: 0,
-              background: 'var(--panel)',
-              overflow: 'hidden',
-              boxShadow: '0 -8px 40px rgba(0,0,0,.12)',
-            }}
-          >
-            <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '11px 15px', borderBottom: '1px solid var(--border)', background: 'var(--bg-3)', fontFamily: 'var(--mono)', fontSize: 11, color: 'var(--text-3)' }}>
-              <span style={{ width: 9, height: 9, borderRadius: '50%', background: '#FF5F57', display: 'inline-block' }} />
-              <span style={{ width: 9, height: 9, borderRadius: '50%', background: '#FEBC2E', display: 'inline-block' }} />
-              <span style={{ width: 9, height: 9, borderRadius: '50%', background: '#28C840', display: 'inline-block' }} />
-              <span style={{ marginLeft: 8 }}>myapp.localhost/dashboard</span>
-            </div>
-            <div className="dl-grid-sidebar" style={{ display: 'grid', gridTemplateColumns: '180px 1fr', minHeight: 280 }}>
-              <div style={{ borderRight: '1px solid var(--border)', padding: '16px 12px', background: 'var(--bg-2)' }}>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 16, fontFamily: 'var(--mono)', fontWeight: 700, fontSize: 13, letterSpacing: 2 }}>
-                  <span style={{ width: 13, height: 13, background: 'var(--accent)', borderRadius: '50% 50% 50% 2px', transform: 'rotate(45deg)' }} />
-                  DROP
-                </div>
-                {DASH_NAV.map((n) => (
-                  <div
-                    key={n.label}
-                    style={{
-                      fontFamily: 'var(--mono)',
-                      fontSize: 12,
-                      padding: '7px 10px',
-                      borderRadius: 7,
-                      marginBottom: 2,
-                      color: n.active ? 'var(--text)' : 'var(--text-2)',
-                      background: n.active ? 'var(--accent-soft)' : 'transparent',
-                    }}
-                  >
-                    {n.label}
-                  </div>
-                ))}
-              </div>
-              <div style={{ padding: 18 }}>
-                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3,1fr)', gap: 10, marginBottom: 16 }}>
-                  {DASH_STATS.map((s) => (
-                    <div key={s.l} style={{ border: '1px solid var(--border)', borderRadius: 9, padding: '12px 14px', background: 'var(--bg-2)' }}>
-                      <div style={{ fontFamily: 'var(--mono)', fontSize: 10, textTransform: 'uppercase', letterSpacing: 1, color: 'var(--text-3)' }}>
-                        {s.l}
-                      </div>
-                      <div style={{ fontFamily: 'var(--mono)', fontWeight: 700, fontSize: 20, marginTop: 4 }}>{s.v}</div>
-                    </div>
-                  ))}
-                </div>
-                <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-                  {DASH_ROWS.map((r) => (
-                    <div key={r.name} style={{ display: 'flex', alignItems: 'center', gap: 11, padding: '11px 13px', border: '1px solid var(--border)', borderRadius: 9, background: 'var(--bg-2)' }}>
-                      <span style={{ width: 8, height: 8, borderRadius: '50%', background: r.dot, boxShadow: `0 0 8px ${r.dot}` }} />
-                      <span style={{ fontFamily: 'var(--mono)', fontSize: 12.5, color: 'var(--text)', flex: 1 }}>{r.name}</span>
-                      <span style={{ fontFamily: 'var(--mono)', fontSize: 11, color: 'var(--text-3)' }}>{r.meta}</span>
-                      <span style={{ fontFamily: 'var(--mono)', fontSize: 11, color: 'var(--text-2)' }}>{r.cpu}</span>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            </div>
-          </div>
-        </div>
-      </div>
-    </section>
-  );
-}
-
-function ConfigSection(): JSX.Element {
-  return (
-    <section
-      id="config"
-      className="dl-grid-2"
-      style={{ maxWidth: 1200, margin: '0 auto', padding: '52px 28px', display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 48, alignItems: 'center' }}
-    >
-      <div>
-        <div style={{ fontFamily: 'var(--mono)', fontSize: 12, letterSpacing: 2, textTransform: 'uppercase', color: 'var(--accent)', marginBottom: 14 }}>
-          Escape hatch
-        </div>
-        <h2 style={{ fontFamily: 'var(--mono)', fontWeight: 700, fontSize: 32, letterSpacing: -0.5, marginBottom: 16 }}>
-          Zero config by default. Full control when you want it.
-        </h2>
-        <p style={{ fontSize: 15, color: 'var(--text-2)', lineHeight: 1.7, marginBottom: 20 }}>
-          80% of apps need nothing. For the rest, drop a <span style={{ fontFamily: 'var(--mono)', color: 'var(--text)' }}>drop.yaml</span>{' '}
-          to pin the app type, claim domains, set env, declare the secrets it can&apos;t start without, and attach a
-          database. Unknown keys are rejected, so a typo fails loudly instead of doing nothing.
-        </p>
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-          {CONFIG_POINTS.map((c) => (
-            <div key={c} style={{ display: 'flex', alignItems: 'center', gap: 10, fontSize: 14, color: 'var(--text-2)' }}>
-              <span style={{ color: 'var(--accent)' }}>▸</span>
-              {c}
-            </div>
-          ))}
-        </div>
-      </div>
-      <div style={{ border: '1px solid var(--border)', borderRadius: 14, overflow: 'hidden', background: 'var(--panel)', boxShadow: 'var(--elev)' }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '11px 16px', borderBottom: '1px solid var(--border)', background: 'var(--bg-2)', fontFamily: 'var(--mono)', fontSize: 11, color: 'var(--text-3)' }}>
-          drop.yaml
-        </div>
-        <pre style={{ margin: 0, padding: 22, fontFamily: 'var(--mono)', fontSize: 13, lineHeight: 1.85, color: 'var(--text-2)', overflow: 'auto' }}>
-          <span style={{ color: 'var(--accent-2)' }}>name</span>: <span style={{ color: 'var(--ok)' }}>myapp</span>
-          {'\n'}
-          <span style={{ color: 'var(--accent-2)' }}>type</span>: <span style={{ color: 'var(--ok)' }}>nodejs</span>
-          {'\n'}
-          <span style={{ color: 'var(--accent-2)' }}>domains</span>:{'\n'}
-          {'  - '}
-          <span style={{ color: 'var(--ok)' }}>app.example.com</span>
-          {'\n'}
-          <span style={{ color: 'var(--accent-2)' }}>database</span>: <span style={{ color: 'var(--ok)' }}>postgres</span>
-          {'\n'}
-          <span style={{ color: 'var(--accent-2)' }}>env</span>:{'\n'}
-          {'  '}
-          <span style={{ color: 'var(--accent-2)' }}>NODE_ENV</span>: <span style={{ color: 'var(--ok)' }}>production</span>
-          {'\n'}
-          <span style={{ color: 'var(--accent-2)' }}>secrets</span>:{'\n'}
-          {'  '}
-          <span style={{ color: 'var(--accent-2)' }}>JWT_SECRET</span>: <span style={{ color: 'var(--ok)' }}>generate</span>
-        </pre>
-      </div>
-    </section>
-  );
-}
-
-function CliSection(): JSX.Element {
-  return (
-    <section id="cli" style={{ maxWidth: 1200, margin: '0 auto', padding: '52px 28px' }}>
-      <div
-        className="dl-grid-2"
-        style={{ border: '1px solid var(--border)', borderRadius: 18, background: 'var(--bg-2)', boxShadow: 'var(--elev)', padding: 44, display: 'grid', gridTemplateColumns: '1fr 1.1fr', gap: 48, alignItems: 'center' }}
-      >
-        <div>
-          <div style={{ fontFamily: 'var(--mono)', fontSize: 12, letterSpacing: 2, textTransform: 'uppercase', color: 'var(--accent)', marginBottom: 14 }}>
-            Command line + API
-          </div>
-          <h2 style={{ fontFamily: 'var(--mono)', fontWeight: 700, fontSize: 30, letterSpacing: -0.5, marginBottom: 16 }}>
-            Install once. Deploy anything.
-          </h2>
-          <p style={{ fontSize: 15, color: 'var(--text-2)', lineHeight: 1.7, marginBottom: 22 }}>
-            A full-featured CLI plus a REST API secured with JWT and API keys. Manage apps, logs, and domains from
-            your terminal, CI, or AI agent.
-          </p>
-          <Link to="/reference" style={{ fontFamily: 'var(--mono)', fontWeight: 600, fontSize: 14, color: 'var(--accent)' }}>
-            Full CLI &amp; API reference →
-          </Link>
-        </div>
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-          {CLI_CMDS.map((c) => (
-            <div key={c.cmd} style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '14px 16px', border: '1px solid var(--border)', borderRadius: 10, background: 'var(--panel)', fontFamily: 'var(--mono)', fontSize: 13.5 }}>
-              <span style={{ color: 'var(--accent)' }}>$</span>
-              <span style={{ color: 'var(--text)', flex: 1 }}>
-                <span style={{ color: 'var(--accent)' }}>drop</span> {c.cmd}
-              </span>
-              <span style={{ color: 'var(--text-3)', fontSize: 11 }}>{c.desc}</span>
-            </div>
-          ))}
-        </div>
-      </div>
-    </section>
-  );
-}
-
 function FinalCta({ onEnter }: EnterProps): JSX.Element {
   return (
     <section style={{ maxWidth: 1200, margin: '0 auto', padding: '56px 28px 88px' }}>
@@ -1152,43 +1453,15 @@ function FinalCta({ onEnter }: EnterProps): JSX.Element {
           <h2 style={{ fontFamily: 'var(--mono)', fontWeight: 700, fontSize: 42, letterSpacing: -1.5, marginBottom: 16 }}>
             Drop a folder. Get a URL.
           </h2>
-          <p style={{ fontSize: 17, color: 'var(--text-2)', maxWidth: 520, margin: '0 auto 30px' }}>
-            Self-host DROP in minutes, then deploy from your terminal, the dashboard, or straight from your AI agent.
+          <p style={{ fontSize: 17, color: 'var(--text-2)', maxWidth: 520, margin: '0 auto 30px', lineHeight: 1.6 }}>
+            Sign in and deploy on a DROP that is already running, or put it on your own server in an afternoon.
           </p>
           <div style={{ display: 'flex', gap: 12, justifyContent: 'center', flexWrap: 'wrap' }}>
-            <button
-              type="button"
-              onClick={onEnter}
-              style={{
-                fontFamily: 'var(--mono)',
-                fontWeight: 600,
-                fontSize: 14,
-                background: 'linear-gradient(180deg,var(--accent-2),var(--accent))',
-                color: 'var(--accent-ink)',
-                padding: '14px 26px',
-                borderRadius: 11,
-                boxShadow: 'var(--btn)',
-                border: 'none',
-                cursor: 'pointer',
-              }}
-            >
+            <button type="button" onClick={onEnter} style={{ ...primaryBtnStyle, padding: '14px 26px' }}>
               Get started
             </button>
-            <Link
-              to="/docs"
-              className="dl-hover-border"
-              style={{
-                fontFamily: 'var(--mono)',
-                fontWeight: 500,
-                fontSize: 14,
-                background: 'var(--bg-3)',
-                color: 'var(--text)',
-                border: '1px solid var(--border)',
-                padding: '14px 26px',
-                borderRadius: 11,
-              }}
-            >
-              Read the docs
+            <Link to="/docs#installation" className="dl-hover-border" style={{ ...secondaryBtnStyle, padding: '14px 26px' }}>
+              Run it on your own server
             </Link>
           </div>
         </div>
@@ -1201,13 +1474,16 @@ export function LandingSections({ onEnter, onSignup, authEnabled }: LandingSecti
   return (
     <>
       <HeroSection onEnter={onEnter} onSignup={onSignup} authEnabled={authEnabled} />
-      <McpSection />
-      <RuntimesStrip />
+      <WhatYouGet />
+      <WhoItsFor />
       <HowItWorks />
-      <FeaturesBento />
+      <TwoWaysToRun onEnter={onEnter} />
       <DashboardPreview onEnter={onEnter} />
+      <TechnicalDivider />
+      <RuntimesStrip />
       <ConfigSection />
       <CliSection />
+      <McpSection />
       <FinalCta onEnter={onEnter} />
     </>
   );
