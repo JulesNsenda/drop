@@ -159,6 +159,25 @@ function requireOAuthPreconditions(c: Context): { publicUrl: string } | Response
   return { publicUrl };
 }
 
+/**
+ * The connector details an operator or user pastes into claude.ai.
+ *
+ * Shared by `POST /oauth/client` (admin, mints) and `GET /oauth/connector-info`
+ * (any `user`, read-only) so the two cannot drift: the dashboard consumes both
+ * through one TypeScript type and one shared component, so a field added to
+ * only one would surface as a UI bug for exactly one role.
+ */
+function buildConnectorPayload(clientId: string, publicUrl: string) {
+  return {
+    client_id: clientId,
+    // DROP is a public PKCE client — there is no client secret. Surfaced
+    // explicitly so the UI can tell the operator to leave that field blank.
+    client_secret: null,
+    redirect_uri: CLAUDE_REDIRECT_URI,
+    mcp_url: getMcpResourceUrl(publicUrl),
+  };
+}
+
 /** Extract a string field from a parsed x-www-form-urlencoded body (Hono types values as string | File). */
 function formStr(value: unknown): string {
   return typeof value === 'string' ? value : '';
@@ -284,7 +303,7 @@ oauth.post('/approve', async (c) => {
   }
 
   // Global connector-policy gate — site 1 of 5, see `mayUseConnectors`'
-  // header above. Evaluated against `auth.role` (the AuthContext role from
+  // header (connector-policy.ts). Evaluated against `auth.role` (the AuthContext role from
   // the bearer session), NOT an account lookup: since DROP-130 an API key
   // resolves to its owner via minRole(key.role, owner.role), so reading the
   // account role here would let a deliberately-downscoped `user`-role key
@@ -297,10 +316,6 @@ oauth.post('/approve', async (c) => {
   // app MCP declarations — the most expensive wrong path.
   if (!mayUseConnectors(auth.role)) {
     console.log('[oauth] connectors disabled', { userId: auth.userId, role: auth.role });
-    // No ErrorCodes.FORBIDDEN exists in this codebase; ErrorCodes.UNAUTHORIZED
-    // paired with an explicit 403 is the established convention for a
-    // valid-credential-but-insufficient-standing refusal (see apps.ts, db.ts,
-    // auth.ts's own gate.message pattern).
     return c.json(
       error(
         ErrorCodes.UNAUTHORIZED,
@@ -406,7 +421,7 @@ oauth.post('/token', async (c) => {
     }
 
     // Global connector-policy gate — site 2 of 5, see `mayUseConnectors`'
-    // header above. No AuthContext exists at this endpoint (PKCE only, no
+    // header (connector-policy.ts). No AuthContext exists at this endpoint (PKCE only, no
     // bearer session), so — unlike site 1's `auth.role` — the `User` record
     // is the only role available. `consumeAuthorizationCode` above has
     // already burned the one-time code by this point regardless of outcome,
@@ -524,16 +539,7 @@ oauth.post('/client', async (c) => {
   const { publicUrl } = pre;
 
   const clientId = await getOrCreateOAuthClientId();
-  return c.json(
-    success({
-      client_id: clientId,
-      // DROP is a public PKCE client — there is no client secret. Surfaced
-      // explicitly so the UI can tell the operator to leave that field blank.
-      client_secret: null,
-      redirect_uri: CLAUDE_REDIRECT_URI,
-      mcp_url: getMcpResourceUrl(publicUrl),
-    })
-  );
+  return c.json(success(buildConnectorPayload(clientId, publicUrl)));
 });
 
 // GET /oauth/connector-info — bearer-authenticated (authMiddleware('user'),
@@ -542,16 +548,19 @@ oauth.post('/client', async (c) => {
 // themselves, without granting the minting capability POST /oauth/client
 // keeps admin-only.
 oauth.get('/connector-info', (c) => {
-  const pre = requireOAuthPreconditions(c);
-  if (pre instanceof Response) return pre;
-  const { publicUrl } = pre;
-
   const auth = (c.get as (key: string) => AuthContext | undefined)('auth');
   if (!auth) {
     return c.json(error(ErrorCodes.UNAUTHORIZED, 'Authentication required.'), 401);
   }
 
-  // Global connector-policy gate, same convention as /approve above.
+  // Global connector-policy gate, same convention as /approve above — but
+  // checked BEFORE requireOAuthPreconditions, unlike every other handler in
+  // this file. The policy answer does not depend on the public URL, and on an
+  // install where no public URL is set the 503 would otherwise mask the 403,
+  // so a gated user's dashboard could never render "disabled by your
+  // administrator" — precisely the state an operator most needs named. No
+  // information leaks by ordering it first: the toggle is global and carries
+  // no per-resource existence oracle.
   if (!mayUseConnectors(auth.role)) {
     console.log('[oauth] connectors disabled', { userId: auth.userId, role: auth.role });
     return c.json(
@@ -562,6 +571,10 @@ oauth.get('/connector-info', (c) => {
       403
     );
   }
+
+  const pre = requireOAuthPreconditions(c);
+  if (pre instanceof Response) return pre;
+  const { publicUrl } = pre;
 
   // Read-only lookup — NEVER getOrCreateOAuthClientId(). That is the one
   // minting path in the product and it must stay behind POST /oauth/client
@@ -577,15 +590,7 @@ oauth.get('/connector-info', (c) => {
     );
   }
 
-  // Mirrors the POST /oauth/client response shape exactly.
-  return c.json(
-    success({
-      client_id: clientId,
-      client_secret: null,
-      redirect_uri: CLAUDE_REDIRECT_URI,
-      mcp_url: getMcpResourceUrl(publicUrl),
-    })
-  );
+  return c.json(success(buildConnectorPayload(clientId, publicUrl)));
 });
 
 // POST /oauth/revoke — bearer-authenticated (authMiddleware('user'), mounted

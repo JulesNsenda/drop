@@ -40,7 +40,21 @@ const MCP_CONFIG: RateLimitConfig = {
 };
 
 const OAUTH_CONFIG: RateLimitConfig = {
-  maxRequests: 30,
+  // Raised from 30 for DROP-131 (multi-user connectors). This bucket is keyed
+  // per client IP, and claude.ai's server-to-server /token refreshes all
+  // arrive from a small set of Anthropic egress IPs sharing ONE counter — so
+  // the ceiling is shared across every connected user, not per user. At ~30
+  // users refreshing every 15 minutes, plus consent bursts and the dashboard's
+  // new GET /oauth/connector-info, 30/min starts 429ing refreshes, and a 429
+  // on /token reads to claude.ai as a dead connector.
+  //
+  // Deliberately NOT re-keyed on client_id+grant_type (the first draft of the
+  // plan said to): there is exactly one static client_id on this platform, so
+  // that keying would collapse the whole installation into two buckets and let
+  // any single user starve everyone else — the global-cap anti-pattern
+  // principal-quota.ts exists to avoid. Per-user fairness on refreshes, if it
+  // is ever wanted, belongs in that layer, not in the IP limiter.
+  maxRequests: 120,
   windowMs: 60_000, // 1 minute - dedicated bucket for the OAuth 2.1 endpoints (PRD-041)
 };
 
