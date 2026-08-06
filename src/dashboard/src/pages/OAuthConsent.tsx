@@ -2,7 +2,7 @@ import { useState } from 'react';
 import { Navigate, useLocation, useSearchParams } from 'react-router-dom';
 import { AlertTriangle, Check, Loader2, ShieldCheck, X } from 'lucide-react';
 import { useAuth } from '../hooks/useAuth';
-import { apiFetch, jsonBody } from '../api/client';
+import { apiJsonWithStatus, CONNECTORS_DISABLED_REASON, jsonBody } from '../api/client';
 import AuthLayout from '../components/AuthLayout';
 import Button from '../components/ui/Button';
 import Card from '../components/ui/Card';
@@ -76,30 +76,39 @@ function OAuthConsent() {
     if (params.resource) body.resource = params.resource;
 
     // apiJson (used elsewhere) discards the HTTP status, and this 403 shares
-    // its error CODE with the plain "no credential" 401 — status is the only
-    // reliable way to tell "connectors disabled" apart from any other refusal.
-    const res = await apiFetch('/oauth/approve', { method: 'POST', ...jsonBody(body) });
-    let json: { success?: boolean; data?: { redirect: string }; error?: { code?: string; message?: string } };
-    try {
-      json = await res.json();
-    } catch {
-      json = {};
-    }
+    // its status+code with a plain insufficient-role rejection — there is
+    // deliberately no FORBIDDEN code, so `details.reason` below is the only
+    // reliable way to tell "connectors disabled" apart from any other
+    // refusal. apiJsonWithStatus keeps apiJson's network-error handling, so a
+    // fetch rejection lands in the ordinary error state instead of leaving
+    // Approve spinning forever.
+    const res = await apiJsonWithStatus<{ redirect: string }>('/oauth/approve', {
+      method: 'POST',
+      ...jsonBody(body),
+    });
 
-    if (json.success && json.data?.redirect) {
-      window.location.href = json.data.redirect;
+    if (res.success && res.data?.redirect) {
+      window.location.href = res.data.redirect;
       return;
     }
 
-    if (res.status === 403 && json.error?.code === 'UNAUTHORIZED') {
-      setDisabledMessage(
-        json.error?.message || 'MCP connectors are disabled for non-admin accounts on this server.'
-      );
+    if (res.status === 403 && res.error?.code === 'UNAUTHORIZED') {
+      const details = res.error.details as { reason?: string } | undefined;
+      if (details?.reason === CONNECTORS_DISABLED_REASON) {
+        setDisabledMessage(
+          res.error?.message || 'MCP connectors are disabled for non-admin accounts on this server.'
+        );
+      } else {
+        // Same status+code, but NOT the policy toggle (e.g. a `readonly`
+        // account) — the "ask an administrator to turn it on" copy below
+        // would be wrong, so this stays a plain retryable inline error.
+        setError('Your account does not have permission to approve this connection.');
+      }
       setPending(false);
       return;
     }
 
-    setError(json.error?.message || 'Failed to authorize. Please try again.');
+    setError(res.error?.message || 'Failed to authorize. Please try again.');
     setPending(false);
   };
 

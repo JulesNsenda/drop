@@ -303,9 +303,14 @@ export class ApiServer {
       // OAuth 2.1 endpoints (PRD-041): selective auth only. /authorize and
       // /token are deliberately NOT gated here — /authorize self-gates via
       // the SPA session redirect and /token authenticates via PKCE; mounting
-      // session auth on either would break claude.ai's calls.
+      // session auth on either would break claude.ai's calls. /revoke (RFC
+      // 7009) is the same shape: for a public PKCE client the presented
+      // token IS the credential — you can only revoke a token you already
+      // hold — so a session adds nothing and gating it here made the
+      // advertised revocation_endpoint 401 for the only caller that ever
+      // hits it (claude.ai holds no DROP session, only the OAuth token
+      // itself). See oauth.ts's own handler comment.
       v1.use('/oauth/approve', authMiddleware('user'));
-      v1.use('/oauth/revoke', authMiddleware('user'));
       v1.use('/oauth/client', authMiddleware('admin'));
       // Read-only connector info (DROP-131 Item 4) — a separate, explicit
       // path so this never touches the /oauth/client line above: any

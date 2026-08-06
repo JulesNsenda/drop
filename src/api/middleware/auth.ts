@@ -1401,34 +1401,70 @@ function hashOpaqueToken(token: string): string {
 export const MAX_REFRESH_TOKENS_PER_USER = 10;
 
 /**
- * Evict this user's OLDEST-by-`createdAt` records, in place, down to one
- * slot short of the cap — leaving room for exactly one more record to be
- * added by the caller. Silently disconnects that user's oldest OTHER
- * connector; that is the deliberate trade against unbounded growth in a file
- * parsed on every authenticated request.
- *
- * MUST be called on an array that does not yet contain the record about to
- * be issued: `issueRefreshToken` calls this before pushing its new record,
- * and `rotateRefreshToken` calls this after splicing out the presented
- * record but before pushing its replacement. Either order keeps the
- * newly-created (or being-rotated) record out of the candidate set, so a
- * user sitting at the cap can never lose the very grant they are using.
+ * Push a new refresh record and enforce the per-user cap as one operation.
+ * The ordering invariant this replaces used to live only in a docstring
+ * ("call the evictor on an array that doesn't yet contain the new record")
+ * plus an off-by-one (`MAX - 1`) standing in for "the caller pushes exactly
+ * one more" — a third call site, or a refactor that moved a push before the
+ * evict, would silently start evicting the very grant being issued. Routing
+ * both operations through here removes the possibility: the record is
+ * already IN `records` by the time `trimToCap` runs, and `trimToCap` is
+ * handed that record's hash so it can never select its own input as the
+ * thing to evict.
  */
-function evictOldestRefreshTokens(records: RefreshTokenRecord[], userId: string): void {
-  const userIndices = records
-    .map((_, i) => i)
-    .filter((i) => records[i].userId === userId)
-    .sort((a, b) => records[a].createdAt.localeCompare(records[b].createdAt));
+function pushRefreshRecord(records: RefreshTokenRecord[], record: RefreshTokenRecord): void {
+  records.push(record);
+  trimToCap(records, record.userId, record.tokenHash);
+}
 
-  const excess = userIndices.length - (MAX_REFRESH_TOKENS_PER_USER - 1);
+/**
+ * Evict `userId`'s OLDEST-by-`createdAt` records, in place, down to
+ * `MAX_REFRESH_TOKENS_PER_USER`, excluding the record whose hash is
+ * `keepHash` from the candidate set — see `pushRefreshRecord`, the only
+ * caller. Silently disconnects that user's oldest OTHER connector; that is
+ * the deliberate trade against unbounded growth in a file parsed on every
+ * authenticated request.
+ *
+ * `createdAt` is treated as possibly absent: `api-credentials.json` has no
+ * schema validation, and `predatesInvalidationStamp` in this same file
+ * already tolerates the same gap. A record missing it sorts as the OLDEST
+ * (`?? ''` sorts before any real ISO string) and is evicted first — the
+ * fail-safe direction — rather than throwing out of `.localeCompare` and
+ * 500ing every caller of `/oauth/token`.
+ *
+ * Also kills each evicted record's grant via `denyGrant`: removing the
+ * refresh record alone only stops NEW access tokens being minted, exactly
+ * the reason `revokeRefreshToken` calls `denyGrant` too — eviction is
+ * another way a record disappears and must carry the same guarantee. Logs
+ * one `[oauth]` line per eviction EVENT (not per record), so an operator
+ * looking at journald has a reason to suspect the cap instead of reuse or
+ * revocation — both produce the identical `invalid_grant` at the caller.
+ */
+function trimToCap(records: RefreshTokenRecord[], userId: string, keepHash: string): void {
+  const totalForUser = records.reduce((n, r) => (r.userId === userId ? n + 1 : n), 0);
+  const excess = totalForUser - MAX_REFRESH_TOKENS_PER_USER;
   if (excess <= 0) return;
 
-  const toEvict = new Set(userIndices.slice(0, excess));
+  const evictable = records
+    .map((_, i) => i)
+    .filter((i) => records[i].userId === userId && records[i].tokenHash !== keepHash)
+    .sort((a, b) => (records[a].createdAt ?? '').localeCompare(records[b].createdAt ?? ''));
+
+  const toEvict = new Set(evictable.slice(0, excess));
+  if (toEvict.size === 0) return;
+
+  for (const i of toEvict) {
+    const sid = records[i].sid;
+    if (sid) denyGrant(sid);
+  }
+
   // Remove in descending index order so earlier removals don't shift the
   // indices still pending removal.
   for (let i = records.length - 1; i >= 0; i--) {
     if (toEvict.has(i)) records.splice(i, 1);
   }
+
+  console.log('[oauth] refresh record evicted', { userId, evicted: toEvict.size });
 }
 
 /**
@@ -1454,8 +1490,7 @@ export async function issueRefreshToken(
   };
 
   if (!credentials.refreshTokens) credentials.refreshTokens = [];
-  evictOldestRefreshTokens(credentials.refreshTokens, userId);
-  credentials.refreshTokens.push(record);
+  pushRefreshRecord(credentials.refreshTokens, record);
   await saveCredentials(config.credentialsPath, credentials);
 
   return token;
@@ -1533,16 +1568,12 @@ export async function rotateRefreshToken(presented: string): Promise<{
   const carried = sid ?? crypto.randomUUID();
   records.splice(index, 1);
 
-  // Item 6 (DROP-131): cap AFTER the splice above and BEFORE the push below —
-  // the presented record is already gone from `records` and its replacement
-  // is not yet in it, so eviction can only remove this user's oldest OTHER
-  // record, never the one being rotated. A user sitting at the cap must be
-  // able to refresh forever without losing their own grant; see
-  // `evictOldestRefreshTokens`'s header for the general contract.
-  evictOldestRefreshTokens(records, userId);
-
   const refreshToken = crypto.randomBytes(32).toString('base64url');
-  records.push({
+  // Item 6 (DROP-131): `pushRefreshRecord` pushes this record THEN enforces
+  // the cap, excluding its own hash from the eviction candidates — so it can
+  // only remove this user's oldest OTHER record, never the one just rotated
+  // in. See `pushRefreshRecord`'s header for the general contract.
+  pushRefreshRecord(records, {
     tokenHash: hashOpaqueToken(refreshToken),
     userId,
     clientId,

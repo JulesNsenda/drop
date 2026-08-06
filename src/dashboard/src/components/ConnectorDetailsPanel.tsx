@@ -8,6 +8,9 @@ import { useToast } from './Toast';
  * (GET /oauth/connector-info, read-only) render the exact same claude.ai
  * setup steps and client-secret note instead of two copies that drift —
  * only the fetch differs per caller. `CopyField` stays private to this file.
+ *
+ * Admin-bundle only: it imports `useToast` (Toast), which is admin-only —
+ * never import this from `components/landing/` (DROP-070 bundle split).
  */
 
 export interface ConnectorDetails {

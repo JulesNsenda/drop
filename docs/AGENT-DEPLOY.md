@@ -279,9 +279,17 @@ mcp:
 public unless your app authenticates callers itself, and the dashboard labels
 it that way. `auth: drop` puts DROP's own OAuth in front of it instead: only
 DROP users who can access the app (its owner, or an admin) can obtain a token
-for it, verified by DROP's Caddy gateway on every request before your app
-ever sees it. Opting in is your decision as the app's owner — DROP never
-infers it.
+for it, verified by DROP's Caddy gateway before your app ever sees the
+request. Opting in is your decision as the app's owner — DROP never infers it.
+
+**Know where that guard stops.** It lives in Caddy, so it covers traffic that
+arrives through DROP's proxy — which is everything, under `isolation: docker`,
+because containers publish only to loopback. Under `isolation: none` (the
+default, and what a dev box runs) your app binds a port on the host itself, and
+anything that reaches that port directly bypasses the guard entirely. The
+platform warns about this in its own log at route time. So: run docker
+isolation, or authenticate in the app as well — do not treat `auth: drop` as a
+substitute for the latter on a non-docker box.
 
 An app with `auth: drop` is gated by the **same** non-admin connector toggle
 described above, since it is one setting covering both DROP-scoped and
