@@ -516,9 +516,13 @@ function HeroSection({ onEnter, onSignup, authEnabled }: HeroProps): JSX.Element
             </div>
           </div>
           </div>
+          {/* Clearance for the badge's overhang, carrying the same dl-hide-sm
+              as the badge — so when the badge is hidden below 960px the gap
+              disappears with it instead of leaving dead space. */}
+          <div className="dl-hide-sm" style={{ height: 30 }} />
           {/* Plain-English caption so the terminal is not an opaque black box
-              to a non-technical reader. Sits clear of the badge's overhang. */}
-          <p style={{ marginTop: 52, fontSize: 13, color: 'var(--text-3)', textAlign: 'center' }}>
+              to a non-technical reader. */}
+          <p style={{ marginTop: 22, fontSize: 13, color: 'var(--text-3)', textAlign: 'center' }}>
             That is the entire deployment — one command, and the app is online.
           </p>
         </div>
@@ -568,7 +572,11 @@ function WhatYouGet(): JSX.Element {
           again.
         </p>
       </div>
-      <div className="dl-bento" style={{ display: 'grid', gridTemplateColumns: 'repeat(4,1fr)', gridAutoRows: 164, gap: 14 }}>
+      {/* `minmax(164px,auto)`, not a flat 164px: the plain-English copy is
+          longer than the jargon it replaced and none of these cards clip, so a
+          fixed row height spills text through the rounded border on desktop.
+          (Below 960px landing.css already forces grid-auto-rows:auto.) */}
+      <div className="dl-bento" style={{ display: 'grid', gridTemplateColumns: 'repeat(4,1fr)', gridAutoRows: 'minmax(164px, auto)', gap: 14 }}>
         <div
           style={{
             gridColumn: 'span 2',
