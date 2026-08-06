@@ -282,6 +282,7 @@ export const ENDPOINT_GROUPS: EndpointGroupDef[] = [
       { method: 'PUT', path: '/api/v1/admin/settings/public-url', description: 'Set or clear the DROP_PUBLIC_URL override. HTTPS-only (localhost excepted), applied live without a restart, and fails closed — it never infers an issuer from the Host header.', role: 'admin' },
       { method: 'POST', path: '/api/v1/admin/settings/github-webhook-secret/generate', description: 'Generate and store a random webhook HMAC secret, revealed exactly once in this response.', role: 'admin' },
       { method: 'PUT', path: '/api/v1/admin/settings/github-webhook-secret', description: 'Set the webhook HMAC secret, or clear it with null/empty. The value is never echoed back.', role: 'admin' },
+      { method: 'PUT', path: '/api/v1/admin/settings/user-connectors', description: 'Gate whether non-admin (user-role) accounts may set up their own claude.ai MCP connector. Strict boolean body — rejects a non-boolean rather than coercing it. Defaults to true.', role: 'admin' },
     ],
   },
   {
@@ -319,6 +320,7 @@ export const ENDPOINT_GROUPS: EndpointGroupDef[] = [
       { method: 'POST', path: '/api/v1/oauth/approve', description: 'Called by the consent screen once the operator approves; returns the redirect carrying the authorization code.', role: 'user' },
       { method: 'POST', path: '/api/v1/oauth/revoke', description: 'Revoke one presented refresh token.', role: 'user' },
       { method: 'POST', path: '/api/v1/oauth/client', description: 'Mint (once) and return the static client_id to paste into a connector. client_secret is always null.', role: 'admin' },
+      { method: 'GET', path: '/api/v1/oauth/connector-info', description: 'Read-only connector details (client_id, client_secret: null, redirect_uri, mcp_url) for the caller to set up their own connector. Never mints — 404 if an admin hasn’t called POST /oauth/client yet, 403 if the non-admin connector toggle is off, 503 if no Public URL is set.', role: 'user' },
       { method: 'GET', path: '/.well-known/oauth-authorization-server', description: 'RFC 8414 authorization-server metadata. Root path, not under /api/v1 — the spec fixes the location.', role: 'public' },
       { method: 'GET', path: '/.well-known/oauth-protected-resource', description: 'RFC 9728 protected-resource metadata. Also served at /.well-known/oauth-protected-resource/api/v1/mcp and /.well-known/protected-resource/api/v1/mcp, since clients probe both spellings.', role: 'public' },
     ],

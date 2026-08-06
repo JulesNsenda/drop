@@ -836,20 +836,25 @@ fs.appendFileSync(\`\${logDir}/logs/app.json\`, JSON.stringify(logEntry) + '\\n'
           claude.ai cannot reach a <code>localhost</code> DROP — for a local box, use Claude Code or Cursor (below).
         </Callout>
 
-        <h3 style={h3Style}>1. Get your connector details (admin)</h3>
+        <h3 style={h3Style}>1. Get your connector details</h3>
         <p style={pStyle}>
           In the DROP dashboard, open{' '}
-          <strong style={{ color: 'var(--text)' }}>Settings → Claude (MCP)</strong> (admin only). It shows the{' '}
+          <strong style={{ color: 'var(--text)' }}>Settings → Claude (MCP)</strong>. Any signed-in user sees this
+          tab, not just admins — it shows the{' '}
           <strong style={{ color: 'var(--text)' }}>MCP Server URL</strong> and{' '}
           <strong style={{ color: 'var(--text)' }}>OAuth Client ID</strong> with copy buttons, and confirms the Client
           Secret stays blank. The Client ID is the same for the whole server and is not a secret — hand it to anyone
           who should connect.
         </p>
-        <p style={pStyle}>Prefer a script? The same values come from the admin API:</p>
+        <p style={pStyle}>
+          If the tab says connector setup isn't available, an administrator has either turned it off or hasn't
+          finished the one-time setup yet — ask them to check Settings → Claude (MCP) on their own account.
+        </p>
+        <p style={pStyle}>Prefer a script? The same values come from the API:</p>
         <CodeBlock
           label="shell"
-          code={`curl -X POST https://drop.example.com/api/v1/oauth/client \\
-  -H "Authorization: Bearer <admin-api-key>"
+          code={`curl https://drop.example.com/api/v1/oauth/connector-info \\
+  -H "Authorization: Bearer <api-key>"
 
 # → { "success": true, "data": {
 #       "client_id": "a1b2c3…",
