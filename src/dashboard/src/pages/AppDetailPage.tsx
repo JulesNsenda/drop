@@ -392,12 +392,21 @@ function AppDetailPage() {
               {app.mcp.url}
             </p>
             {/*
-              Shown with the URL, never separately: DROP does not guard this
-              endpoint, and an operator handed only an address would reasonably
-              assume it did.
+              Shown with the URL, never separately: an operator handed only an
+              address would reasonably assume DROP guards it, and for `auth:
+              none` it does not.
+
+              This used to say "Public" unconditionally, ignoring `mcp.auth`
+              — wrong for every `auth: drop` app, where the Caddy forward_auth
+              gateway DOES verify an audience-bound token before the app is
+              reached (see routes/mcp-gateway.ts). Harmless-looking because it
+              understates protection rather than overstating it, but it flatly
+              contradicts what the app's own drop.yaml asked for.
             */}
             <p className="mt-1 text-xs" style={{ color: 'var(--text-3)' }}>
-              Public — DROP does not authenticate callers to this endpoint.
+              {app.mcp.auth === 'drop'
+                ? 'Protected — DROP verifies an audience-bound token before forwarding to this endpoint.'
+                : 'Public — DROP does not authenticate callers to this endpoint.'}
             </p>
           </Card>
         ) : null}
