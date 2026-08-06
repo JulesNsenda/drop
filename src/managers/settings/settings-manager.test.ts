@@ -208,6 +208,96 @@ describe('SettingsManager', () => {
     });
   });
 
+  describe('userConnectorsEnabled', () => {
+    it('defaults to true when the key is absent', async () => {
+      await manager.load();
+      expect(manager.getUserConnectorsEnabled()).toBe(true);
+    });
+
+    it('sets and persists a value, readable via getUserConnectorsEnabled', async () => {
+      await manager.setUserConnectorsEnabled(false);
+      expect(manager.getUserConnectorsEnabled()).toBe(false);
+
+      const raw = await fs.readFile(settingsFilePath, 'utf-8');
+      expect(JSON.parse(raw)).toEqual({ userConnectorsEnabled: false });
+    });
+
+    it('persists across a reload (new manager instance, same file)', async () => {
+      await manager.setUserConnectorsEnabled(false);
+
+      const reloaded = new SettingsManager({ settingsFilePath });
+      await reloaded.load();
+      expect(reloaded.getUserConnectorsEnabled()).toBe(false);
+      await reloaded.close();
+    });
+
+    it('a stored false survives a reload as false (guards against an `||` regression)', async () => {
+      await manager.setUserConnectorsEnabled(false);
+
+      const reloaded = new SettingsManager({ settingsFilePath });
+      await reloaded.load();
+      // If the getter used `settings.userConnectorsEnabled || true` instead
+      // of `?? true`, a stored `false` would be discarded and this would
+      // read back `true`.
+      expect(reloaded.getUserConnectorsEnabled()).toBe(false);
+      await reloaded.close();
+    });
+
+    it('clears the value when set to undefined', async () => {
+      await manager.setUserConnectorsEnabled(false);
+      expect(manager.getUserConnectorsEnabled()).toBe(false);
+
+      await manager.setUserConnectorsEnabled(undefined);
+      expect(manager.getUserConnectorsEnabled()).toBe(true);
+
+      const reloaded = new SettingsManager({ settingsFilePath });
+      await reloaded.load();
+      expect(reloaded.getUserConnectorsEnabled()).toBe(true);
+      await reloaded.close();
+    });
+
+    it('a corrupt settings file fails closed: getter returns false (and publicUrl is undefined)', async () => {
+      await fs.mkdir(path.dirname(settingsFilePath), { recursive: true });
+      await fs.writeFile(settingsFilePath, 'not valid json');
+
+      await manager.load();
+
+      expect(manager.getUserConnectorsEnabled()).toBe(false);
+      expect(manager.getStoredPublicUrl()).toBeUndefined();
+    });
+
+    it('a hand-written non-boolean value (string "false") is discarded — fails open to true only because it was never validly set', async () => {
+      await fs.mkdir(path.dirname(settingsFilePath), { recursive: true });
+      await fs.writeFile(settingsFilePath, JSON.stringify({ userConnectorsEnabled: 'false' }));
+
+      await manager.load();
+
+      expect(manager.getUserConnectorsEnabled()).toBe(true);
+    });
+
+    it('a hand-written non-boolean value (null) is discarded — fails open to true only because it was never validly set', async () => {
+      await fs.mkdir(path.dirname(settingsFilePath), { recursive: true });
+      await fs.writeFile(settingsFilePath, JSON.stringify({ userConnectorsEnabled: null }));
+
+      await manager.load();
+
+      expect(manager.getUserConnectorsEnabled()).toBe(true);
+    });
+
+    it('is independent of publicUrl and githubWebhookSecret across a reload (three-way independence — catches the parseSettings whitelist bug)', async () => {
+      await manager.setPublicUrl('https://drop.example.com');
+      await manager.setGithubWebhookSecret('a'.repeat(64));
+      await manager.setUserConnectorsEnabled(false);
+
+      const reloaded = new SettingsManager({ settingsFilePath });
+      await reloaded.load();
+      expect(reloaded.getStoredPublicUrl()).toBe('https://drop.example.com');
+      expect(reloaded.getGithubWebhookSecret()).toBe('a'.repeat(64));
+      expect(reloaded.getUserConnectorsEnabled()).toBe(false);
+      await reloaded.close();
+    });
+  });
+
   describe('file permissions', () => {
     // POSIX mode bits aren't meaningful on Windows (no chmod-style ACL model).
     const itPosix = process.platform === 'win32' ? it.skip : it;
