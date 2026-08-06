@@ -115,8 +115,8 @@ export function SiteFooter({ onEnter }: SiteFooterProps): JSX.Element {
               maxWidth: 280,
             }}
           >
-            Deploy · Run · Operate · Publish. A lightweight, self-hosted PaaS for the drop-folder-and-deploy
-            workflow.
+            Deploy · Run · Operate · Publish. Hand it a folder of code, get a live app — on someone
+            else&apos;s DROP, or on your own server.
           </p>
           <div
             style={{
