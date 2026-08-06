@@ -929,12 +929,6 @@ export class DropPlatform {
       resetStateManager();
     }
 
-    // Close settings manager
-    if (this.settingsManager) {
-      await this.settingsManager.close();
-      resetSettingsManager();
-    }
-
     // Reset app config service
     if (this.appConfigService) {
       resetAppConfigService();
@@ -1021,6 +1015,23 @@ export class DropPlatform {
     if (this.apiServer) {
       await this.apiServer.stop();
       this.apiServer = null;
+    }
+
+    // Close settings manager — AFTER the API server, deliberately.
+    //
+    // This used to sit up with the state-manager resets, ~90 lines earlier,
+    // which left a multi-second window (Postgres and Redis shutdown, then
+    // Caddy) during which the API was still serving requests while the
+    // singleton had been reset. `getSettingsManager()` self-defaults rather
+    // than throwing, so a caller in that window got a FRESH manager with
+    // empty settings and `corrupt = false` — meaning
+    // `getUserConnectorsEnabled()` returned its `?? true` default and the
+    // connector gate silently FAILED OPEN while Caddy was still routing to
+    // us. Every push to `develop` restarts this service, so that window
+    // opened on every deploy. Torn down last, after its last consumer.
+    if (this.settingsManager) {
+      await this.settingsManager.close();
+      resetSettingsManager();
     }
 
     this.isRunning = false;

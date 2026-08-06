@@ -215,6 +215,10 @@ export const ErrorCodes = {
   INTERNAL_ERROR: 'INTERNAL_ERROR',
   CONFLICT: 'CONFLICT',
   BAD_REQUEST: 'BAD_REQUEST',
+  // There is deliberately no FORBIDDEN code. The convention across the API is
+  // UNAUTHORIZED paired with an explicit 403 status for a
+  // valid-credential-but-insufficient-standing refusal (apps.ts, db.ts,
+  // oauth.ts); 401 is reserved for no/invalid credentials.
   UNAUTHORIZED: 'UNAUTHORIZED',
   RATE_LIMITED: 'RATE_LIMITED',
   SERVICE_UNAVAILABLE: 'SERVICE_UNAVAILABLE',

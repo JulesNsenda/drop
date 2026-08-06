@@ -27,6 +27,7 @@ import {
 import Tabs, { TabDef } from '../components/Tabs';
 import ApiKeysTab from '../components/ApiKeysTab';
 import McpConnectorTab from '../components/McpConnectorTab';
+import UserConnectorTab from '../components/UserConnectorTab';
 import GitWebhooksTab from '../components/GitWebhooksTab';
 import Button from '../components/ui/Button';
 import Card from '../components/ui/Card';
@@ -111,6 +112,11 @@ function SettingsPage() {
   const { health, loading } = useHealth();
   const { role, mfaEnabled, refreshMe } = useAuth();
   const isAdmin = role === 'admin';
+  // `readonly` can never complete POST /oauth/approve (authMiddleware('user')
+  // there) and would only ever see a 403, so the tab is admin+user only —
+  // never unconditional. `role` is briefly undefined while useAuth loads, so
+  // this stays false (not a crash or flash) until it resolves.
+  const canUseConnectors = role === 'admin' || role === 'user';
   const { toast } = useToast();
   const confirmDialog = useConfirm();
   const [searchParams, setSearchParams] = useSearchParams();
@@ -318,12 +324,16 @@ function SettingsPage() {
     if (isAdmin) tabs.push({ id: 'system', label: 'System', icon: Server });
     tabs.push({ id: 'account', label: 'Account', icon: Lock });
     if (isAdmin) tabs.push({ id: 'api-keys', label: 'API Keys', icon: KeyRound });
-    if (isAdmin) tabs.push({ id: 'mcp-connector', label: 'Claude (MCP)', icon: Plug });
+    if (canUseConnectors) tabs.push({ id: 'mcp-connector', label: 'Claude (MCP)', icon: Plug });
     if (isAdmin) tabs.push({ id: 'git-webhooks', label: 'Git webhooks', icon: GitBranch });
     if (isAdmin) tabs.push({ id: 'activity', label: 'Activity', icon: Clock });
     tabs.push({ id: 'about', label: 'About', icon: Info });
     return tabs;
-  }, [isAdmin]);
+    // `canUseConnectors` must be its own dep, not folded into `isAdmin`: role
+    // going undefined -> 'user' flips canUseConnectors but not isAdmin, so a
+    // memo keyed on isAdmin alone would never recompute and the freshly
+    // loaded 'user' account's tab would never appear.
+  }, [isAdmin, canUseConnectors]);
 
   // Invalid or role-forbidden ?tab= values fall back to the role's default
   // without rewriting the URL, so a deep link survives async role loading.
@@ -840,8 +850,9 @@ function SettingsPage() {
       {/* API Keys tab (admin only) */}
       {isAdmin && activeTab === 'api-keys' && <ApiKeysTab />}
 
-      {/* Claude (MCP) connector tab (admin only) */}
+      {/* Claude (MCP) connector tab (admin + user; readonly never sees it) */}
       {isAdmin && activeTab === 'mcp-connector' && <McpConnectorTab />}
+      {!isAdmin && canUseConnectors && activeTab === 'mcp-connector' && <UserConnectorTab />}
 
       {/* Git webhooks tab (admin only) */}
       {isAdmin && activeTab === 'git-webhooks' && <GitWebhooksTab />}

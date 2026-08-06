@@ -228,13 +228,73 @@ it**, so don't count on it. Three paths, in the order to try them:
    your box, and it appears in your own access logs — use a long random
    token, treat the URL like a key, rotate it by editing the file.
 
-3. **OAuth 2.1 (PRD-041, ready to build).** The native path the connector
-   dialog is built for — its optional *OAuth Client ID/Secret* fields take a
-   DROP-minted client_id, and claude.ai runs the full authorization-code + PKCE
-   flow against DROP's OAuth metadata, giving a real sign-in/consent screen and
-   no URL-as-credential exposure. This is the durable answer when the
-   Request-headers field (path 1) isn't available. Design fully reconciled in
-   `docs/plans/2026-07-10-mcp-oauth.md`; not yet implemented.
+3. **OAuth 2.1 (implemented).** The native path the connector dialog is built
+   for — its optional *OAuth Client ID/Secret* fields take a DROP-minted
+   client_id, and claude.ai runs the full authorization-code + PKCE flow
+   against DROP's OAuth metadata, giving a real sign-in/consent screen and no
+   URL-as-credential exposure. This is the durable answer when the
+   Request-headers field (path 1) isn't available.
+
+   **Any `user`-role account can set this up for themselves**, not just
+   admins — open the dashboard's **Settings → Claude (MCP)** tab. It shows
+   the same **MCP Server URL**, **OAuth Client ID**, and (leave blank) Client
+   Secret an admin sees, read from `GET /api/v1/oauth/connector-info`; only
+   the one-time minting step (`POST /api/v1/oauth/client`) stays admin-only.
+   If an administrator hasn't opened that tab yet, or hasn't set the server's
+   Public URL, the tab says so instead of failing silently.
+
+   An administrator can turn this capability off for everyone but themselves,
+   from the same tab (or `PUT /api/v1/admin/settings/user-connectors`). It
+   defaults to **on**. Before relying on it as a kill switch, read what it
+   actually covers — the caveat below is not optional reading:
+
+   - It disables **claude.ai connector setup only**. It does **not** disable
+     agent tokens — `POST /api/v1/auth/agent-tokens` is deliberately
+     `user`-tier — or `POST /api/v1/mcp` itself, so any user can still mint an
+     agent token and drive DROP's own MCP server from Claude Code or the raw
+     API while the toggle is off. If you need to stop that too, revoke or
+     rotate the user's tokens/keys directly; the toggle does not reach them.
+   - It also stops a non-admin's own apps that declare `mcp: auth: drop` in
+     their `drop.yaml` (see "Your own app as an MCP server" below) from
+     refreshing their access tokens — the symptom is a 401 from the Caddy
+     gateway on the app's MCP endpoint. Admin-owned apps are unaffected.
+   - It takes effect immediately, on the very next request — a live
+     connector session (DROP's own, or a tenant app's) is cut without waiting
+     for the access token's ~15-minute lifetime to expire, and flipping the
+     toggle back on restores it with no re-consent needed.
+
+### Your own app as an MCP server
+
+Separately from DROP's own hosted MCP endpoint above, an app you deploy can
+speak MCP itself and be added as its own claude.ai connector. Declare it in
+that app's `drop.yaml`:
+
+```yaml
+mcp:
+  path: /mcp      # default
+  auth: drop      # or 'none' (the default)
+```
+
+`auth: none` (the default) means DROP does not guard the endpoint — it is
+public unless your app authenticates callers itself, and the dashboard labels
+it that way. `auth: drop` puts DROP's own OAuth in front of it instead: only
+DROP users who can access the app (its owner, or an admin) can obtain a token
+for it, verified by DROP's Caddy gateway before your app ever sees the
+request. Opting in is your decision as the app's owner — DROP never infers it.
+
+**Know where that guard stops.** It lives in Caddy, so it covers traffic that
+arrives through DROP's proxy — which is everything, under `isolation: docker`,
+because containers publish only to loopback. Under `isolation: none` (the
+default, and what a dev box runs) your app binds a port on the host itself, and
+anything that reaches that port directly bypasses the guard entirely. The
+platform warns about this in its own log at route time. So: run docker
+isolation, or authenticate in the app as well — do not treat `auth: drop` as a
+substitute for the latter on a non-docker box.
+
+An app with `auth: drop` is gated by the **same** non-admin connector toggle
+described above, since it is one setting covering both DROP-scoped and
+app-scoped grants: while it is off, a non-admin owner's connector to their
+own app is refused immediately, the same as a connector to DROP itself.
 
 Note: Claude Code **on the web** (claude.ai/code) is not the connectors UI —
 it reads a project `.mcp.json`, where the http transport + `Authorization`

@@ -392,12 +392,27 @@ function AppDetailPage() {
               {app.mcp.url}
             </p>
             {/*
-              Shown with the URL, never separately: DROP does not guard this
-              endpoint, and an operator handed only an address would reasonably
-              assume it did.
+              Shown with the URL, never separately: an operator handed only an
+              address would reasonably assume DROP guards it, and for `auth:
+              none` it does not.
+
+              This used to say "Public" unconditionally, ignoring `mcp.auth`
+              — wrong for every `auth: drop` app, where the Caddy forward_auth
+              gateway DOES verify an audience-bound token (see
+              routes/mcp-gateway.ts).
+
+              The wording is deliberately "guarded at the proxy", not
+              "protected": the guard lives ONLY in Caddy. platform.ts logs the
+              two counter-cases itself — outside docker isolation the app binds
+              a host port that is reachable directly, bypassing it, and when
+              apiPort is unusable the guard is not emitted at all. `mcp.auth`
+              is the tenant's DECLARATION, not proof of enforcement, so this
+              must not promise more than the declaration supports.
             */}
             <p className="mt-1 text-xs" style={{ color: 'var(--text-3)' }}>
-              Public — DROP does not authenticate callers to this endpoint.
+              {app.mcp.auth === 'drop'
+                ? 'Guarded at the proxy — DROP verifies an audience-bound token on requests that arrive through it. Traffic reaching the app’s own port directly is not covered.'
+                : 'Public — DROP does not authenticate callers to this endpoint.'}
             </p>
           </Card>
         ) : null}

@@ -27,6 +27,7 @@ import {
   revokeRefreshToken,
   authMiddleware,
   AuthContext,
+  MAX_REFRESH_TOKENS_PER_USER,
 } from './auth';
 
 const AUDIENCE = 'https://drop.example.com/api/v1/mcp';
@@ -187,5 +188,190 @@ describe('OAuth refresh tokens (PRD-041)', () => {
   it('rotating an unknown refresh token returns null', async () => {
     const result = await rotateRefreshToken('this-token-was-never-issued');
     expect(result).toBeNull();
+  });
+
+  // Item 6 (DROP-131): per-user cap, evicting oldest-first.
+  describe('per-user cap on refresh-token records', () => {
+    async function readStoredRefreshTokens(): Promise<Array<{ userId: string; clientId: string }>> {
+      const raw = JSON.parse(await fs.readFile(credentialsPath, 'utf-8')) as {
+        refreshTokens?: Array<{ userId: string; clientId: string }>;
+      };
+      return raw.refreshTokens ?? [];
+    }
+
+    it('keeps exactly the cap for one user and drops the OLDEST records first', async () => {
+      const user = await createUser('capuser', 'password123', 'user');
+      const overflow = 5;
+
+      for (let i = 0; i < MAX_REFRESH_TOKENS_PER_USER + overflow; i++) {
+        // clientId doubles as a label so survivors are identifiable below.
+        await issueRefreshToken(user.id, `client-${i}`);
+      }
+
+      const stored = await readStoredRefreshTokens();
+      const userRecords = stored.filter((r) => r.userId === user.id);
+      expect(userRecords).toHaveLength(MAX_REFRESH_TOKENS_PER_USER);
+
+      // The survivors are the LAST MAX_REFRESH_TOKENS_PER_USER issued —
+      // client-{overflow}..client-{overflow + cap - 1} — never the first ones.
+      const survivorIds = userRecords.map((r) => r.clientId).sort();
+      const expectedIds = Array.from(
+        { length: MAX_REFRESH_TOKENS_PER_USER },
+        (_, i) => `client-${i + overflow}`
+      ).sort();
+      expect(survivorIds).toEqual(expectedIds);
+    });
+
+    it("never evicts another user's records when one user hits the cap", async () => {
+      const userA = await createUser('capuserA', 'password123', 'user');
+      const userB = await createUser('capuserB', 'password123', 'user');
+      const tokenB = await issueRefreshToken(userB.id, 'client-b');
+
+      for (let i = 0; i < MAX_REFRESH_TOKENS_PER_USER + 3; i++) {
+        await issueRefreshToken(userA.id, `client-a-${i}`);
+      }
+
+      const stored = await readStoredRefreshTokens();
+      expect(stored.filter((r) => r.userId === userA.id)).toHaveLength(MAX_REFRESH_TOKENS_PER_USER);
+      expect(stored.filter((r) => r.userId === userB.id)).toHaveLength(1);
+
+      // userB's own (untouched) grant still rotates fine.
+      const rotated = await rotateRefreshToken(tokenB);
+      expect(rotated).not.toBeNull();
+    });
+
+    it('lets a user AT the cap rotate repeatedly without ever losing their grant', async () => {
+      const user = await createUser('capuserC', 'password123', 'user');
+      // The token under test is the FIRST (oldest) one issued — the exact
+      // record eviction would reach for if it ran on the un-spliced array,
+      // since the rest of the loop below issues nine newer siblings that
+      // push this user to the cap.
+      let current = '';
+      for (let i = 0; i < MAX_REFRESH_TOKENS_PER_USER; i++) {
+        const issued = await issueRefreshToken(user.id, `client-c-${i}`);
+        if (i === 0) current = issued;
+      }
+      // user now holds exactly MAX_REFRESH_TOKENS_PER_USER records — at the cap.
+
+      for (let i = 0; i < 5; i++) {
+        const rotated = await rotateRefreshToken(current);
+        expect(rotated).not.toBeNull();
+        current = rotated!.refreshToken;
+
+        const stored = await readStoredRefreshTokens();
+        expect(stored.filter((r) => r.userId === user.id)).toHaveLength(MAX_REFRESH_TOKENS_PER_USER);
+      }
+
+      // The token from the last rotation is still a live, working grant.
+      const finalRotation = await rotateRefreshToken(current);
+      expect(finalRotation).not.toBeNull();
+    });
+
+    it('tolerates a missing createdAt on a stored record and evicts it first', async () => {
+      const user = await createUser('capuserD', 'password123', 'user');
+
+      // Simulate a legacy/hand-edited/restored record — no schema validates
+      // `api-credentials.json`, and `createdAt` is exactly the field
+      // `predatesInvalidationStamp` already tolerates being absent elsewhere
+      // in this file.
+      const raw = JSON.parse(await fs.readFile(credentialsPath, 'utf-8')) as {
+        refreshTokens?: Array<Record<string, unknown>>;
+      };
+      raw.refreshTokens = raw.refreshTokens ?? [];
+      raw.refreshTokens.push({
+        tokenHash: 'legacy-hash-no-createdAt',
+        userId: user.id,
+        clientId: 'client-legacy',
+        // createdAt intentionally omitted
+      });
+      await fs.writeFile(credentialsPath, JSON.stringify(raw, null, 2));
+
+      // Reload the module's in-memory store from the file just hand-edited.
+      resetAuth();
+      await initializeAuth({ credentialsPath, enableJwt: true, enableApiKeys: true });
+
+      // Push the user over the cap. This must not throw despite the
+      // undated record, and the undated record — sorting oldest — must be
+      // the one that goes.
+      for (let i = 0; i < MAX_REFRESH_TOKENS_PER_USER; i++) {
+        await expect(issueRefreshToken(user.id, `client-fresh-${i}`)).resolves.toEqual(
+          expect.any(String)
+        );
+      }
+
+      const stored = await readStoredRefreshTokens();
+      const userRecords = stored.filter((r) => r.userId === user.id);
+      expect(userRecords).toHaveLength(MAX_REFRESH_TOKENS_PER_USER);
+      expect(userRecords.some((r) => r.clientId === 'client-legacy')).toBe(false);
+    });
+
+    it("kills an evicted grant's outstanding access token immediately (denyGrant)", async () => {
+      const user = await createUser('capuserE', 'password123', 'user');
+      const sid = 'sid-evicted-grant';
+
+      // The oldest record for this user — carries the sid whose access
+      // token must die the instant this record is evicted.
+      await issueRefreshToken(user.id, 'client-oldest', sid);
+      const accessToken = await mintOAuthAccessToken(user, AUDIENCE, sid);
+      expect(await verifyOAuthAccessToken(accessToken, AUDIENCE)).not.toBeNull();
+
+      // Push this user over the cap — the oldest record (issued above,
+      // carrying `sid`) is the one evicted.
+      for (let i = 0; i < MAX_REFRESH_TOKENS_PER_USER; i++) {
+        await issueRefreshToken(user.id, `client-fresh-${i}`);
+      }
+
+      const stored = await readStoredRefreshTokens();
+      expect(stored.filter((r) => r.userId === user.id)).toHaveLength(MAX_REFRESH_TOKENS_PER_USER);
+
+      // Removing the refresh record alone would only stop NEW access tokens
+      // being minted — the outstanding one would keep working for the rest
+      // of its 15-minute TTL. This proves eviction also calls `denyGrant`.
+      expect(await verifyOAuthAccessToken(accessToken, AUDIENCE)).toBeNull();
+    });
+
+    // Mutation-testing note: the "AT the cap" test above never actually
+    // reaches `trimToCap`'s eviction branch — a rotation removes the
+    // presented record and adds one back, so the user's count is unchanged
+    // and `excess` is always 0. Natural ascending-by-createdAt sort ALSO
+    // never picks the just-pushed record on its own, because it is always
+    // inserted last and `new Date().toISOString()` is monotonic, so it never
+    // sorts earlier than a genuinely older sibling — the `keepHash`
+    // exclusion is unreachable by every other test in this file. This test
+    // is the one scenario that reaches it: hand-edited records (same gap as
+    // the missing-`createdAt` test above) dated in the future sort AHEAD of
+    // a brand-new record's real timestamp, so an eviction that didn't
+    // exclude the new record by hash would pick the new record itself.
+    it('protects the just-issued record even when existing records carry bogus future timestamps', async () => {
+      const user = await createUser('capuserF', 'password123', 'user');
+
+      const raw = JSON.parse(await fs.readFile(credentialsPath, 'utf-8')) as {
+        refreshTokens?: Array<Record<string, unknown>>;
+      };
+      raw.refreshTokens = raw.refreshTokens ?? [];
+      for (let i = 0; i < MAX_REFRESH_TOKENS_PER_USER; i++) {
+        raw.refreshTokens.push({
+          tokenHash: `future-hash-${i}`,
+          userId: user.id,
+          clientId: `client-future-${i}`,
+          createdAt: '2099-01-01T00:00:00.000Z',
+        });
+      }
+      await fs.writeFile(credentialsPath, JSON.stringify(raw, null, 2));
+
+      resetAuth();
+      await initializeAuth({ credentialsPath, enableJwt: true, enableApiKeys: true });
+
+      const token = await issueRefreshToken(user.id, 'client-brand-new');
+
+      const stored = await readStoredRefreshTokens();
+      const userRecords = stored.filter((r) => r.userId === user.id);
+      expect(userRecords).toHaveLength(MAX_REFRESH_TOKENS_PER_USER);
+      expect(userRecords.some((r) => r.clientId === 'client-brand-new')).toBe(true);
+
+      // Genuinely live, not merely present in the file.
+      const rotated = await rotateRefreshToken(token);
+      expect(rotated).not.toBeNull();
+    });
   });
 });

@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useState } from 'react';
-import { Plug, Copy, RefreshCw } from 'lucide-react';
+import { Plug, RefreshCw } from 'lucide-react';
 import { apiJson, jsonBody } from '../api/client';
 import { useToast } from './Toast';
 import Card from './ui/Card';
 import Button from './ui/Button';
 import Input from './ui/Input';
+import ConnectorDetailsPanel, { ConnectorDetails } from './ConnectorDetailsPanel';
 
 /**
  * Admin-only Settings panel that surfaces the claude.ai (web) MCP connector
@@ -12,71 +13,35 @@ import Input from './ui/Input';
  * POST /api/v1/oauth/client (idempotent create-or-return), so an admin can
  * copy them into claude.ai's custom-connector dialog instead of curling. The
  * endpoint fails closed (503) until DROP_PUBLIC_URL is set on the server.
+ * This is the only minting path in the product — the non-admin panel
+ * (UserConnectorTab) reads the already-minted client_id read-only.
  *
- * Also lets the admin set/edit the server's Public URL (DROP_PUBLIC_URL)
- * directly from the UI via GET/PUT /api/v1/admin/settings — no restart
- * required — since that's the prerequisite for the connector to work at all.
+ * Also lets the admin set/edit the server's Public URL (DROP_PUBLIC_URL) and
+ * the non-admin connector-setup toggle directly from the UI via
+ * GET/PUT /api/v1/admin/settings — no restart required.
  */
-
-interface ConnectorDetails {
-  client_id: string;
-  client_secret: string | null;
-  redirect_uri: string;
-  mcp_url: string;
-}
 
 interface AdminSettings {
   publicUrl: string | null;
   source: 'stored' | 'env' | 'unset';
   storedPublicUrl: string | null;
+  // Optional, not required: PUT /admin/settings/public-url's response
+  // (buildSettingsPayload) deliberately does NOT carry this field (Item 2 —
+  // it's shared with a second endpoint's shape), so a naive `setSettings` of
+  // that response would blank it out. GET /admin/settings and
+  // PUT /admin/settings/user-connectors are the only responses that set it.
+  userConnectors?: { enabled: boolean };
 }
 
-const labelStyle = { color: 'var(--text-3)', letterSpacing: 0.5 } as const;
-const valueBoxStyle = { borderColor: 'var(--border)', background: 'var(--bg-2)' } as const;
-
-function CopyField({
-  label,
-  value,
-  onCopy,
-}: {
-  label: string;
-  value: string;
-  onCopy: () => void;
-}): JSX.Element {
-  return (
-    <div>
-      <div className="mb-1 text-xs font-medium uppercase" style={labelStyle}>
-        {label}
-      </div>
-      <div
-        className="flex items-center gap-2 rounded-lg border px-3 py-2"
-        style={valueBoxStyle}
-      >
-        <code
-          className="flex-1 truncate text-sm"
-          style={{ fontFamily: 'var(--mono)', color: 'var(--text)' }}
-        >
-          {value}
-        </code>
-        <button
-          type="button"
-          onClick={onCopy}
-          aria-label={`Copy ${label}`}
-          className="shrink-0"
-          style={{ color: 'var(--text-3)', cursor: 'pointer' }}
-        >
-          <Copy className="h-4 w-4" />
-        </button>
-      </div>
-    </div>
-  );
-}
+/** Shape actually returned by PUT /admin/settings/public-url — no userConnectors. */
+type PublicUrlSettings = Omit<AdminSettings, 'userConnectors'>;
 
 function PublicUrlSection({
   value,
   onChange,
   onSave,
   saving,
+  disabled,
   error,
   source,
   prominent,
@@ -85,6 +50,8 @@ function PublicUrlSection({
   onChange: (value: string) => void;
   onSave: () => void;
   saving: boolean;
+  /** True while a DIFFERENT save (the connectors toggle) is in flight — cross-disables this section's controls so the two read-modify-write settings writes can't race. */
+  disabled: boolean;
   error: string | null;
   source: AdminSettings['source'];
   /** Style as the primary call-to-action (unconfigured state). */
@@ -113,9 +80,10 @@ function PublicUrlSection({
             onChange={(e) => onChange(e.target.value)}
             placeholder="https://drop.example.com"
             error={error ?? undefined}
+            disabled={disabled}
           />
         </div>
-        <Button onClick={onSave} loading={saving} disabled={saving}>
+        <Button onClick={onSave} loading={saving} disabled={saving || disabled}>
           Save
         </Button>
       </div>
@@ -146,6 +114,20 @@ export default function McpConnectorTab(): JSX.Element {
   const [urlInput, setUrlInput] = useState('');
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
+  const [savingConnectors, setSavingConnectors] = useState(false);
+
+  // Cross-disable the two settings writers: SettingsManager setters are
+  // read-modify-write, so a Public URL save racing the connectors-toggle save
+  // can silently drop one field even though both requests return 200.
+  const busy = saving || savingConnectors;
+
+  // `undefined` (not just a falsy `enabled`) means we don't actually know the
+  // state yet — GET /admin/settings failed, or a rolled-back server omitted
+  // the field. Render the checkbox ONLY once this is defined; otherwise it
+  // would default to checked ("ON") for a security control whose entire
+  // purpose is being an off switch, i.e. fail open instead of matching the
+  // fail-closed choice the server itself makes for this same setting.
+  const userConnectorsState = settings?.userConnectors;
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -183,26 +165,20 @@ export default function McpConnectorTab(): JSX.Element {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const copy = async (value: string, what: string) => {
-    try {
-      await navigator.clipboard.writeText(value);
-      toast('success', `${what} copied`);
-    } catch {
-      toast('error', 'Could not copy — select and copy manually');
-    }
-  };
-
   const savePublicUrl = async () => {
     setSaving(true);
     setSaveError(null);
     const trimmed = urlInput.trim();
     const payload = { publicUrl: trimmed === '' ? null : trimmed };
-    const json = await apiJson<AdminSettings>(
+    const json = await apiJson<PublicUrlSettings>(
       '/admin/settings/public-url',
       { method: 'PUT', ...jsonBody(payload) }
     );
     if (json.success && json.data) {
-      setSettings(json.data);
+      // Merge, don't replace — this response has no userConnectors field, and
+      // a bare setSettings(json.data) would blank the toggle's state out from
+      // under the checkbox (settings.userConnectors.enabled would throw).
+      setSettings(prev => ({ ...json.data!, userConnectors: prev?.userConnectors }));
       setUrlInput(json.data.publicUrl ?? '');
       toast('success', json.data.publicUrl ? 'Public URL saved' : 'Public URL cleared');
       // Refresh the connector details now that the public URL (and thus the
@@ -214,6 +190,21 @@ export default function McpConnectorTab(): JSX.Element {
       toast('error', msg);
     }
     setSaving(false);
+  };
+
+  const setConnectorsEnabled = async (enabled: boolean) => {
+    setSavingConnectors(true);
+    const json = await apiJson<{ enabled: boolean }>(
+      '/admin/settings/user-connectors',
+      { method: 'PUT', ...jsonBody({ enabled }) }
+    );
+    if (json.success && json.data) {
+      setSettings(prev => (prev ? { ...prev, userConnectors: json.data! } : prev));
+      toast('success', json.data.enabled ? 'Non-admin connectors enabled' : 'Non-admin connectors disabled');
+    } else {
+      toast('error', json.error?.message ?? 'Failed to update the setting.');
+    }
+    setSavingConnectors(false);
   };
 
   return (
@@ -261,10 +252,51 @@ export default function McpConnectorTab(): JSX.Element {
             onChange={setUrlInput}
             onSave={() => void savePublicUrl()}
             saving={saving}
+            disabled={savingConnectors}
             error={saveError}
             source={settings?.source ?? 'unset'}
             prominent={notConfigured}
           />
+        )}
+
+        {!settingsLoading && userConnectorsState !== undefined && (
+          <div className="rounded-lg border p-4" style={{ borderColor: 'var(--border)', background: 'var(--bg-2)' }}>
+            <div className="flex items-center gap-3">
+              <input
+                type="checkbox"
+                id="userConnectorsEnabled"
+                checked={userConnectorsState.enabled}
+                onChange={e => void setConnectorsEnabled(e.target.checked)}
+                className="h-4 w-4 rounded"
+                style={{ accentColor: 'var(--accent)' }}
+                disabled={busy}
+              />
+              <label
+                htmlFor="userConnectorsEnabled"
+                className="text-sm font-semibold"
+                style={{ color: 'var(--text)' }}
+              >
+                Let non-admin users set up their own claude.ai connector
+              </label>
+            </div>
+            <p className="mt-2 text-xs" style={{ color: 'var(--text-3)', lineHeight: 1.6 }}>
+              Turning this off disables <strong>claude.ai connector setup</strong> for non-admin
+              accounts only &mdash; it does not disable agent tokens or{' '}
+              <code style={{ fontFamily: 'var(--mono)', color: 'var(--text)' }}>POST /api/v1/mcp</code>,
+              which any user can still drive from Claude Code. It also stops non-admin users' own{' '}
+              <code style={{ fontFamily: 'var(--mono)', color: 'var(--text)' }}>mcp: auth: drop</code>{' '}
+              tenant apps from refreshing their tokens (symptom: a 401 from the gateway).
+            </p>
+          </div>
+        )}
+
+        {!settingsLoading && userConnectorsState === undefined && (
+          <div
+            className="rounded-lg border p-4 text-sm"
+            style={{ borderColor: 'var(--border)', background: 'var(--bg-2)', color: 'var(--text-2)' }}
+          >
+            Non-admin connector setting: current state unknown &mdash; reload to try again.
+          </div>
         )}
 
         {!loading && !settingsLoading && error && (
@@ -278,52 +310,7 @@ export default function McpConnectorTab(): JSX.Element {
           </div>
         )}
 
-        {!loading && !settingsLoading && details && (
-          <>
-            <div className="grid gap-3">
-              <CopyField
-                label="MCP Server URL"
-                value={details.mcp_url}
-                onCopy={() => void copy(details.mcp_url, 'MCP Server URL')}
-              />
-              <CopyField
-                label="OAuth Client ID"
-                value={details.client_id}
-                onCopy={() => void copy(details.client_id, 'Client ID')}
-              />
-              <div>
-                <div className="mb-1 text-xs font-medium uppercase" style={labelStyle}>
-                  OAuth Client Secret
-                </div>
-                <div
-                  className="rounded-lg border px-3 py-2 text-sm"
-                  style={{ ...valueBoxStyle, color: 'var(--text-2)' }}
-                >
-                  Leave blank &mdash; DROP uses PKCE, so there is no client secret.
-                </div>
-              </div>
-            </div>
-
-            <p className="text-xs" style={{ color: 'var(--text-3)', lineHeight: 1.6 }}>
-              The Client ID is not a secret &mdash; share it with anyone who should connect. It is the
-              same for this whole server and stays stable across restarts.
-            </p>
-
-            <div>
-              <h3 className="mb-2 text-sm font-semibold" style={{ color: 'var(--text)' }}>
-                Set it up in claude.ai
-              </h3>
-              <ol
-                className="space-y-1 pl-5 text-sm"
-                style={{ color: 'var(--text-2)', lineHeight: 1.7, listStyleType: 'decimal' }}
-              >
-                <li>Open Settings &rarr; Connectors &rarr; Add custom connector.</li>
-                <li>Paste the MCP Server URL and Client ID above; leave the secret blank.</li>
-                <li>Click Connect, sign in to DROP, and approve access.</li>
-              </ol>
-            </div>
-          </>
-        )}
+        {!loading && !settingsLoading && details && <ConnectorDetailsPanel details={details} />}
       </div>
     </Card>
   );

@@ -2,7 +2,7 @@ import { useState } from 'react';
 import { Navigate, useLocation, useSearchParams } from 'react-router-dom';
 import { AlertTriangle, Check, Loader2, ShieldCheck, X } from 'lucide-react';
 import { useAuth } from '../hooks/useAuth';
-import { apiJson, jsonBody } from '../api/client';
+import { apiJsonWithStatus, CONNECTORS_DISABLED_REASON, jsonBody } from '../api/client';
 import AuthLayout from '../components/AuthLayout';
 import Button from '../components/ui/Button';
 import Card from '../components/ui/Card';
@@ -37,6 +37,10 @@ function OAuthConsent() {
   const auth = useAuth();
   const [pending, setPending] = useState(false);
   const [error, setError] = useState('');
+  // Set only for the connector-policy 403 — a distinct, non-retryable state
+  // (approving again cannot succeed while the toggle is off), so it replaces
+  // the consent card instead of appearing as a dismissable inline error.
+  const [disabledMessage, setDisabledMessage] = useState('');
 
   const params: OAuthParams = {
     client_id: searchParams.get('client_id') || '',
@@ -71,17 +75,40 @@ function OAuthConsent() {
     if (params.scope) body.scope = params.scope;
     if (params.resource) body.resource = params.resource;
 
-    const json = await apiJson<{ redirect: string }>('/oauth/approve', {
+    // apiJson (used elsewhere) discards the HTTP status, and this 403 shares
+    // its status+code with a plain insufficient-role rejection — there is
+    // deliberately no FORBIDDEN code, so `details.reason` below is the only
+    // reliable way to tell "connectors disabled" apart from any other
+    // refusal. apiJsonWithStatus keeps apiJson's network-error handling, so a
+    // fetch rejection lands in the ordinary error state instead of leaving
+    // Approve spinning forever.
+    const res = await apiJsonWithStatus<{ redirect: string }>('/oauth/approve', {
       method: 'POST',
       ...jsonBody(body),
     });
 
-    if (json.success && json.data?.redirect) {
-      window.location.href = json.data.redirect;
+    if (res.success && res.data?.redirect) {
+      window.location.href = res.data.redirect;
       return;
     }
 
-    setError(json.error?.message || 'Failed to authorize. Please try again.');
+    if (res.status === 403 && res.error?.code === 'UNAUTHORIZED') {
+      const details = res.error.details as { reason?: string } | undefined;
+      if (details?.reason === CONNECTORS_DISABLED_REASON) {
+        setDisabledMessage(
+          res.error?.message || 'MCP connectors are disabled for non-admin accounts on this server.'
+        );
+      } else {
+        // Same status+code, but NOT the policy toggle (e.g. a `readonly`
+        // account) — the "ask an administrator to turn it on" copy below
+        // would be wrong, so this stays a plain retryable inline error.
+        setError('Your account does not have permission to approve this connection.');
+      }
+      setPending(false);
+      return;
+    }
+
+    setError(res.error?.message || 'Failed to authorize. Please try again.');
     setPending(false);
   };
 
@@ -109,6 +136,34 @@ function OAuthConsent() {
             <p className="text-sm" style={{ color: 'var(--text-2)' }}>
               We couldn't find a valid <code>client_id</code> and <code>redirect_uri</code> in this request. Please
               restart the connection from claude.ai.
+            </p>
+          </div>
+        </Card>
+      </AuthLayout>
+    );
+  }
+
+  // Connector-policy 403 from /approve — the admin toggle is off. Not
+  // retryable (approving again cannot succeed), so this replaces the consent
+  // card entirely rather than showing an inline error next to a live
+  // Approve button that would just fail again.
+  if (disabledMessage) {
+    return (
+      <AuthLayout>
+        <div className="mb-6 text-center">
+          <h1 className="text-2xl font-semibold" style={{ color: 'var(--text)' }}>
+            Connector setup disabled
+          </h1>
+          <p className="mt-1 text-sm" style={{ color: 'var(--text-2)' }}>
+            {disabledMessage}
+          </p>
+        </div>
+        <Card>
+          <div className="flex items-start gap-3">
+            <AlertTriangle className="h-5 w-5 flex-shrink-0" style={{ color: 'var(--err)' }} aria-hidden="true" />
+            <p className="text-sm" style={{ color: 'var(--text-2)' }}>
+              Ask an administrator to turn on non-admin connector setup in Settings, or connect using
+              an agent token from Claude Code instead.
             </p>
           </div>
         </Card>
