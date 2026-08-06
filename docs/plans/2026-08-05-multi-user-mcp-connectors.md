@@ -436,9 +436,18 @@ push is the deploy.
    **Default ON confirmed; the "no startup constraint" call stands**, since the
    toggle genuinely only affects accounts that already exist and can already
    deploy. Re-check this if signup is ever enabled.
-2. Whether the live `publicUrl` is `stored` or `env`
-   (`GET /admin/settings` → `source`) sets the severity of an Item-1 mistake.
-   Mitigation is identical either way; worth knowing before the deploy.
+2. ~~Whether the live `publicUrl` is `stored` or `env`.~~ **RESOLVED
+   2026-08-06: it is STORED.** `settings.json` on dropkit.sh parses and holds
+   exactly `['githubWebhookSecret', 'publicUrl']` — there is no
+   `DROP_PUBLIC_URL` in `/etc/drop/drop.env`, so that file is the *sole* source
+   of the OAuth issuer. This is the higher-severity branch: because
+   `parseSettings` rebuilds from a whitelist and `doSave` persists the whole
+   object, an Item-1 key it failed to re-extract would have **erased
+   `publicUrl` from disk on the next admin write**, 404-ing `/.well-known/*`,
+   503-ing every `/oauth/*` route, and killing the live admin connector — not
+   just the new feature. Covered by the three-way independence test; recorded
+   because it makes that test load-bearing rather than belt-and-braces.
+   Both files backed up on the box as `*.pre-DROP-131`.
 3. One toggle covers app-scoped grants (above). Accepted; must be in the copy.
 4. The toggle does not gate agent tokens (above). Accepted; must be in the copy.
 5. Rollback limit: once the pre-splice placement is correct, a refusal leaves
