@@ -19,6 +19,7 @@ import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/
 
 import { ApiServer } from '../server';
 import { getStateManager, resetStateManager } from '../../managers/app/state-manager';
+import { getSettingsManager, resetSettingsManager } from '../../managers/settings/settings-manager';
 import { setPlatformOps, resetPlatformOps, PlatformOps } from '../platform-ops';
 import { resetRateLimits } from '../middleware/rate-limit';
 import { resetUploadPreflightState } from '../upload-preflight';
@@ -80,6 +81,77 @@ describe('OAuth 2.1 flow (PRD-041 integration)', () => {
     return body.data.token;
   }
 
+  // Mirrors the "DROP-130 Item 5" tests above (no prior /authorize call —
+  // /approve alone is sufficient to mint a code).
+  async function approve(bearerToken: string, codeChallenge: string, state: string): Promise<Response> {
+    return fetch(`${BASE_URL}/api/v1/oauth/approve`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${bearerToken}` },
+      body: JSON.stringify({
+        client_id: clientId,
+        redirect_uri: CLAUDE_REDIRECT_URI,
+        code_challenge: codeChallenge,
+        code_challenge_method: 'S256',
+        state,
+      }),
+    });
+  }
+
+  async function exchangeCode(code: string, codeVerifier: string): Promise<Response> {
+    return fetch(`${BASE_URL}/api/v1/oauth/token`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        grant_type: 'authorization_code',
+        code,
+        code_verifier: codeVerifier,
+        client_id: clientId,
+        redirect_uri: CLAUDE_REDIRECT_URI,
+      }).toString(),
+    });
+  }
+
+  async function refresh(refreshToken: string): Promise<Response> {
+    return fetch(`${BASE_URL}/api/v1/oauth/token`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        grant_type: 'refresh_token',
+        refresh_token: refreshToken,
+        client_id: clientId,
+      }).toString(),
+    });
+  }
+
+  async function mcpToolsList(accessToken: string): Promise<string[]> {
+    const mcpClient = new Client({ name: 'oauth-flow-test-client', version: '1.0.0' });
+    const transport = new StreamableHTTPClientTransport(new URL(`${BASE_URL}/api/v1/mcp`), {
+      requestInit: { headers: { Authorization: `Bearer ${accessToken}` } },
+    });
+    try {
+      await mcpClient.connect(transport);
+      const { tools } = await mcpClient.listTools();
+      return tools.map((t) => t.name);
+    } finally {
+      await mcpClient.close();
+    }
+  }
+
+  // DROP-131 Item 3: flips the admin-settable multi-user-connectors toggle
+  // through the REAL admin route, not a direct SettingsManager call — this
+  // file drives everything else end-to-end too, and the admin route is what
+  // an operator actually uses.
+  async function setUserConnectorsEnabled(enabled: boolean): Promise<void> {
+    const res = await fetch(`${BASE_URL}/api/v1/admin/settings/user-connectors`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${adminToken}` },
+      body: JSON.stringify({ enabled }),
+    });
+    if (res.status !== 200) {
+      throw new Error(`setUserConnectorsEnabled(${enabled}) failed with status ${res.status}`);
+    }
+  }
+
   beforeEach(async () => {
     tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'drop-oauth-flow-test-'));
     credentialsPath = path.join(tempDir, 'credentials.json');
@@ -92,10 +164,17 @@ describe('OAuth 2.1 flow (PRD-041 integration)', () => {
     resetUploadPreflightState();
     resetAuth();
     __resetAuthCodeStore();
+    // Must run BEFORE `new ApiServer(...)` below, which calls
+    // getSettingsManager() with no args on construction — without a reset +
+    // an explicit tempDir path here, the singleton (and its file writes from
+    // setUserConnectorsEnabled()) would leak across tests in this file and
+    // default to a real on-disk path outside tempDir.
+    resetSettingsManager();
 
     process.env.DROP_PUBLIC_URL = BASE_URL;
 
     getStateManager({ stateFilePath: path.join(tempDir, 'apps.json') });
+    getSettingsManager({ settingsFilePath: path.join(tempDir, 'settings.json') });
     setPlatformOps(makeOps());
 
     server = new ApiServer({
@@ -136,6 +215,7 @@ describe('OAuth 2.1 flow (PRD-041 integration)', () => {
     resetUploadPreflightState();
     await getStateManager().close();
     resetStateManager();
+    resetSettingsManager();
     resetAuth();
     __resetAuthCodeStore();
     jest.restoreAllMocks();
@@ -521,6 +601,154 @@ describe('OAuth 2.1 flow (PRD-041 integration)', () => {
     const location = new URL(res.headers.get('location')!);
     expect(location.searchParams.get('error')).toBe('invalid_target');
     expect(location.searchParams.get('state')).toBe('resource-state');
+  });
+
+  describe('DROP-131 Item 3: user-connectors toggle enforcement', () => {
+    it('toggle key ABSENT + admin: the full happy path succeeds, including the refresh leg (catches an inverted default or an inverted admin carve-out)', async () => {
+      const { codeVerifier, codeChallenge } = makePkcePair();
+
+      const approveRes = await approve(adminToken, codeChallenge, 'absent-admin-state');
+      expect(approveRes.status).toBe(200);
+      const approveBody = (await approveRes.json()) as ApiEnvelope<{ redirect: string }>;
+      const code = new URL(approveBody.data!.redirect).searchParams.get('code')!;
+
+      const tokenRes = await exchangeCode(code, codeVerifier);
+      expect(tokenRes.status).toBe(200);
+      const tokenBody = (await tokenRes.json()) as { access_token: string; refresh_token: string };
+      expect(tokenBody.access_token).toBeTruthy();
+      expect(tokenBody.refresh_token).toBeTruthy();
+
+      const tools = await mcpToolsList(tokenBody.access_token);
+      expect(tools.length).toBeGreaterThan(0);
+
+      const refreshRes = await refresh(tokenBody.refresh_token);
+      expect(refreshRes.status).toBe(200);
+      const refreshBody = (await refreshRes.json()) as { access_token: string; refresh_token: string };
+      expect(refreshBody.access_token).toBeTruthy();
+      expect(refreshBody.refresh_token).toBeTruthy();
+    });
+
+    it('toggle OFF + admin: the full happy path still succeeds, including the refresh leg — an admin is never gated by its own switch', async () => {
+      await setUserConnectorsEnabled(false);
+      const { codeVerifier, codeChallenge } = makePkcePair();
+
+      const approveRes = await approve(adminToken, codeChallenge, 'off-admin-state');
+      expect(approveRes.status).toBe(200);
+      const approveBody = (await approveRes.json()) as ApiEnvelope<{ redirect: string }>;
+      const code = new URL(approveBody.data!.redirect).searchParams.get('code')!;
+
+      const tokenRes = await exchangeCode(code, codeVerifier);
+      expect(tokenRes.status).toBe(200);
+      const tokenBody = (await tokenRes.json()) as { access_token: string; refresh_token: string };
+      expect(tokenBody.access_token).toBeTruthy();
+
+      const tools = await mcpToolsList(tokenBody.access_token);
+      expect(tools.length).toBeGreaterThan(0);
+
+      const refreshRes = await refresh(tokenBody.refresh_token);
+      expect(refreshRes.status).toBe(200);
+    });
+
+    it('toggle OFF + non-admin: refused at all three grant-side sites — /approve (403), grant_type=authorization_code, and grant_type=refresh_token', async () => {
+      // Mint a code AND a refresh token while the toggle is still on, so
+      // sites 2 and 3 can be probed against grants that legitimately predate
+      // the flip — the interesting case, not one that could never exist.
+      const preFlip = makePkcePair();
+      const preFlipApprove = await approve(userToken, preFlip.codeChallenge, 'pre-flip-state');
+      expect(preFlipApprove.status).toBe(200);
+      const preFlipApproveBody = (await preFlipApprove.json()) as ApiEnvelope<{ redirect: string }>;
+      const preFlipCode = new URL(preFlipApproveBody.data!.redirect).searchParams.get('code')!;
+      const preFlipTokenRes = await exchangeCode(preFlipCode, preFlip.codeVerifier);
+      expect(preFlipTokenRes.status).toBe(200);
+      const preFlipTokenBody = (await preFlipTokenRes.json()) as { refresh_token: string };
+
+      // A second code, minted but NOT YET exchanged, to probe site 2 in
+      // isolation from site 3.
+      const unexchanged = makePkcePair();
+      const unexchangedApprove = await approve(userToken, unexchanged.codeChallenge, 'pre-flip-unexchanged-state');
+      expect(unexchangedApprove.status).toBe(200);
+      const unexchangedApproveBody = (await unexchangedApprove.json()) as ApiEnvelope<{ redirect: string }>;
+      const unexchangedCode = new URL(unexchangedApproveBody.data!.redirect).searchParams.get('code')!;
+
+      await setUserConnectorsEnabled(false);
+
+      // Site 1: /approve.
+      const postFlip = makePkcePair();
+      const blockedApprove = await approve(userToken, postFlip.codeChallenge, 'post-flip-state');
+      expect(blockedApprove.status).toBe(403);
+      const blockedApproveBody = (await blockedApprove.json()) as ApiEnvelope<never>;
+      expect(blockedApproveBody.success).toBe(false);
+
+      // Site 2: grant_type=authorization_code, against a code minted before the flip.
+      const blockedExchange = await exchangeCode(unexchangedCode, unexchanged.codeVerifier);
+      expect(blockedExchange.status).toBe(400);
+      const blockedExchangeBody = (await blockedExchange.json()) as { error: string };
+      expect(blockedExchangeBody.error).toBe('invalid_grant');
+
+      // Site 3: grant_type=refresh_token, against a refresh token minted before the flip.
+      const blockedRefresh = await refresh(preFlipTokenBody.refresh_token);
+      expect(blockedRefresh.status).toBe(400);
+      const blockedRefreshBody = (await blockedRefresh.json()) as { error: string };
+      expect(blockedRefreshBody.error).toBe('invalid_grant');
+    });
+
+    it('toggle OFF refusal on refresh does not consume the grant: flip back ON and the ORIGINAL refresh token still works (pins the pre-splice placement in rotateRefreshToken)', async () => {
+      const { codeVerifier, codeChallenge } = makePkcePair();
+      const approveRes = await approve(userToken, codeChallenge, 'pre-splice-state');
+      expect(approveRes.status).toBe(200);
+      const approveBody = (await approveRes.json()) as ApiEnvelope<{ redirect: string }>;
+      const code = new URL(approveBody.data!.redirect).searchParams.get('code')!;
+      const tokenRes = await exchangeCode(code, codeVerifier);
+      expect(tokenRes.status).toBe(200);
+      const tokenBody = (await tokenRes.json()) as { refresh_token: string };
+      expect(tokenBody.refresh_token).toBeTruthy();
+
+      await setUserConnectorsEnabled(false);
+
+      const blockedRefresh = await refresh(tokenBody.refresh_token);
+      expect(blockedRefresh.status).toBe(400);
+      const blockedRefreshBody = (await blockedRefresh.json()) as { error: string };
+      expect(blockedRefreshBody.error).toBe('invalid_grant');
+
+      await setUserConnectorsEnabled(true);
+
+      // If the toggle check had run AFTER rotateRefreshToken already spliced
+      // out the presented record (and persisted a replacement nobody
+      // received), this second attempt with the SAME token would also fail.
+      const restoredRefresh = await refresh(tokenBody.refresh_token);
+      expect(restoredRefresh.status).toBe(200);
+      const restoredBody = (await restoredRefresh.json()) as {
+        access_token: string;
+        refresh_token: string;
+      };
+      expect(restoredBody.access_token).toBeTruthy();
+      expect(restoredBody.refresh_token).toBeTruthy();
+    });
+
+    it('toggle OFF: a previously-minted, still-unexpired access token is rejected at POST /api/v1/mcp immediately, not after its 15-minute TTL', async () => {
+      const { codeVerifier, codeChallenge } = makePkcePair();
+      const approveRes = await approve(userToken, codeChallenge, 'immediate-kill-state');
+      expect(approveRes.status).toBe(200);
+      const approveBody = (await approveRes.json()) as ApiEnvelope<{ redirect: string }>;
+      const code = new URL(approveBody.data!.redirect).searchParams.get('code')!;
+      const tokenRes = await exchangeCode(code, codeVerifier);
+      expect(tokenRes.status).toBe(200);
+      const tokenBody = (await tokenRes.json()) as { access_token: string };
+      expect(tokenBody.access_token).toBeTruthy();
+
+      // Proves the token is live before the flip.
+      const tools = await mcpToolsList(tokenBody.access_token);
+      expect(tools.length).toBeGreaterThan(0);
+
+      await setUserConnectorsEnabled(false);
+
+      const mcpRes = await fetch(`${BASE_URL}/api/v1/mcp`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${tokenBody.access_token}` },
+        body: JSON.stringify({ jsonrpc: '2.0', method: 'tools/list', id: 1 }),
+      });
+      expect(mcpRes.status).toBe(401);
+    });
   });
 
   describe('discovery', () => {

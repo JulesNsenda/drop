@@ -307,6 +307,11 @@ export class ApiServer {
       v1.use('/oauth/approve', authMiddleware('user'));
       v1.use('/oauth/revoke', authMiddleware('user'));
       v1.use('/oauth/client', authMiddleware('admin'));
+      // Read-only connector info (DROP-131 Item 4) — a separate, explicit
+      // path so this never touches the /oauth/client line above: any
+      // non-admin session may read the already-minted client_id, but minting
+      // stays admin-only via POST /oauth/client.
+      v1.use('/oauth/connector-info', authMiddleware('user'));
       // DELETE/PUT/PATCH on an app (delete, rename, re-domain) and POST on the
       // apps collection (deploy a new app) are destructive/mutating and must
       // not be reachable with a read-only token. DELETE/PUT/PATCH used to fall

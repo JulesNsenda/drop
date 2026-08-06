@@ -11,8 +11,9 @@
  * `/authorize` and `/token` are deliberately NOT behind `authMiddleware` —
  * `/authorize` self-gates via the SPA session redirect and `/token`
  * authenticates via PKCE (mounting session auth on either breaks claude.ai's
- * calls). `/approve`, `/revoke`, and `/client` ARE behind `authMiddleware`,
- * mounted externally in server.ts.
+ * calls). `/approve`, `/revoke`, `/client`, and `/connector-info` ARE behind
+ * `authMiddleware`, mounted externally in server.ts — each on its own exact
+ * path, never `/oauth/*`.
  */
 
 import { randomUUID } from 'crypto';
@@ -32,6 +33,7 @@ import {
 } from '../oauth/app-resources';
 import { getStateManager } from '../../managers/app/state-manager';
 import { getAppConfigService } from '../../managers/app/app-config';
+import { mayUseConnectors } from '../connector-policy';
 import { computeAppUrl } from './apps';
 import { canAccess } from '../access';
 import {
@@ -281,6 +283,33 @@ oauth.post('/approve', async (c) => {
     );
   }
 
+  // Global connector-policy gate — site 1 of 5, see `mayUseConnectors`'
+  // header above. Evaluated against `auth.role` (the AuthContext role from
+  // the bearer session), NOT an account lookup: since DROP-130 an API key
+  // resolves to its owner via minRole(key.role, owner.role), so reading the
+  // account role here would let a deliberately-downscoped `user`-role key
+  // owned by an admin bypass the toggle.
+  //
+  // Returns a DISTINCT refusal from `mayHoldTokenFor`'s below, deliberately.
+  // The toggle is global platform policy and carries no per-resource
+  // existence information, so reusing that indistinguishable message would
+  // buy no secrecy while sending the operator debugging DROP_PUBLIC_URL and
+  // app MCP declarations — the most expensive wrong path.
+  if (!mayUseConnectors(auth.role)) {
+    console.log('[oauth] connectors disabled', { userId: auth.userId, role: auth.role });
+    // No ErrorCodes.FORBIDDEN exists in this codebase; ErrorCodes.UNAUTHORIZED
+    // paired with an explicit 403 is the established convention for a
+    // valid-credential-but-insufficient-standing refusal (see apps.ts, db.ts,
+    // auth.ts's own gate.message pattern).
+    return c.json(
+      error(
+        ErrorCodes.UNAUTHORIZED,
+        'MCP connectors are disabled for non-admin accounts on this server.'
+      ),
+      403
+    );
+  }
+
   // Re-resolved here, not trusted from the body: /authorize and /approve are
   // separate requests, and the app set can change between them (an app can stop
   // advertising MCP, or be deleted and its name re-registered by someone else).
@@ -374,6 +403,29 @@ oauth.post('/token', async (c) => {
     // must not be exchangeable after, even within its own 60s TTL.
     if (predatesInvalidationStamp(record.createdAt, user.credentialsInvalidBefore)) {
       return tokenError('invalid_grant', 'Authorization code predates a credential invalidation');
+    }
+
+    // Global connector-policy gate — site 2 of 5, see `mayUseConnectors`'
+    // header above. No AuthContext exists at this endpoint (PKCE only, no
+    // bearer session), so — unlike site 1's `auth.role` — the `User` record
+    // is the only role available. `consumeAuthorizationCode` above has
+    // already burned the one-time code by this point regardless of outcome,
+    // so there is no pre-splice hazard here the way there is for refresh
+    // tokens (site 3): a refused exchange costs the caller nothing they
+    // wouldn't already lose from any other refusal on this branch.
+    if (!mayUseConnectors(user.role)) {
+      // Logged for the same reason as site 1: the client-facing code is the
+      // opaque RFC 6749 `invalid_grant`, so journald is the only place an
+      // operator can tell "policy refused this" from "bad code".
+      console.log('[oauth] connectors disabled', {
+        grant: 'authorization_code',
+        userId: user.id,
+        role: user.role,
+      });
+      return tokenError(
+        'invalid_grant',
+        'MCP connectors are disabled for non-admin accounts on this server.'
+      );
     }
 
     // One sid per GRANT, minted here at code exchange and carried through every
@@ -477,6 +529,58 @@ oauth.post('/client', async (c) => {
       client_id: clientId,
       // DROP is a public PKCE client — there is no client secret. Surfaced
       // explicitly so the UI can tell the operator to leave that field blank.
+      client_secret: null,
+      redirect_uri: CLAUDE_REDIRECT_URI,
+      mcp_url: getMcpResourceUrl(publicUrl),
+    })
+  );
+});
+
+// GET /oauth/connector-info — bearer-authenticated (authMiddleware('user'),
+// mounted in server.ts on the exact path, NOT `/oauth/*`). Lets a non-admin
+// discover the already-minted client_id so they can set up a connector
+// themselves, without granting the minting capability POST /oauth/client
+// keeps admin-only.
+oauth.get('/connector-info', (c) => {
+  const pre = requireOAuthPreconditions(c);
+  if (pre instanceof Response) return pre;
+  const { publicUrl } = pre;
+
+  const auth = (c.get as (key: string) => AuthContext | undefined)('auth');
+  if (!auth) {
+    return c.json(error(ErrorCodes.UNAUTHORIZED, 'Authentication required.'), 401);
+  }
+
+  // Global connector-policy gate, same convention as /approve above.
+  if (!mayUseConnectors(auth.role)) {
+    console.log('[oauth] connectors disabled', { userId: auth.userId, role: auth.role });
+    return c.json(
+      error(
+        ErrorCodes.UNAUTHORIZED,
+        'MCP connectors are disabled for non-admin accounts on this server.'
+      ),
+      403
+    );
+  }
+
+  // Read-only lookup — NEVER getOrCreateOAuthClientId(). That is the one
+  // minting path in the product and it must stay behind POST /oauth/client
+  // (admin-only).
+  const clientId = getOAuthClientId();
+  if (!clientId) {
+    return c.json(
+      error(
+        ErrorCodes.NOT_FOUND,
+        'Connector setup has not been completed by an administrator yet.'
+      ),
+      404
+    );
+  }
+
+  // Mirrors the POST /oauth/client response shape exactly.
+  return c.json(
+    success({
+      client_id: clientId,
       client_secret: null,
       redirect_uri: CLAUDE_REDIRECT_URI,
       mcp_url: getMcpResourceUrl(publicUrl),
