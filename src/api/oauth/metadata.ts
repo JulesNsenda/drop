@@ -64,10 +64,18 @@ export function buildAuthServerMetadata(publicUrl: string): object {
     issuer,
     authorization_endpoint: `${issuer}/api/v1/oauth/authorize`,
     token_endpoint: `${issuer}/api/v1/oauth/token`,
+    // Discoverable so claude.ai can call POST /api/v1/oauth/revoke when a
+    // user disconnects the connector from its UI — without this, that
+    // disconnect only removes claude.ai's copy of the token and the grant
+    // stays valid server-side forever (Item 6, DROP-131).
+    revocation_endpoint: `${issuer}/api/v1/oauth/revoke`,
     response_types_supported: ['code'],
     grant_types_supported: ['authorization_code', 'refresh_token'],
     code_challenge_methods_supported: ['S256'],
     token_endpoint_auth_methods_supported: ['none'],
+    // Same public-PKCE-client reasoning as token_endpoint_auth_methods_supported:
+    // DROP has no client secret, so revocation carries no client authentication.
+    revocation_endpoint_auth_methods_supported: ['none'],
     scopes_supported: ['offline_access'],
   };
 }

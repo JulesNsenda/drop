@@ -27,6 +27,7 @@ import {
   revokeRefreshToken,
   authMiddleware,
   AuthContext,
+  MAX_REFRESH_TOKENS_PER_USER,
 } from './auth';
 
 const AUDIENCE = 'https://drop.example.com/api/v1/mcp';
@@ -187,5 +188,83 @@ describe('OAuth refresh tokens (PRD-041)', () => {
   it('rotating an unknown refresh token returns null', async () => {
     const result = await rotateRefreshToken('this-token-was-never-issued');
     expect(result).toBeNull();
+  });
+
+  // Item 6 (DROP-131): per-user cap, evicting oldest-first.
+  describe('per-user cap on refresh-token records', () => {
+    async function readStoredRefreshTokens(): Promise<Array<{ userId: string; clientId: string }>> {
+      const raw = JSON.parse(await fs.readFile(credentialsPath, 'utf-8')) as {
+        refreshTokens?: Array<{ userId: string; clientId: string }>;
+      };
+      return raw.refreshTokens ?? [];
+    }
+
+    it('keeps exactly the cap for one user and drops the OLDEST records first', async () => {
+      const user = await createUser('capuser', 'password123', 'user');
+      const overflow = 5;
+
+      for (let i = 0; i < MAX_REFRESH_TOKENS_PER_USER + overflow; i++) {
+        // clientId doubles as a label so survivors are identifiable below.
+        await issueRefreshToken(user.id, `client-${i}`);
+      }
+
+      const stored = await readStoredRefreshTokens();
+      const userRecords = stored.filter((r) => r.userId === user.id);
+      expect(userRecords).toHaveLength(MAX_REFRESH_TOKENS_PER_USER);
+
+      // The survivors are the LAST MAX_REFRESH_TOKENS_PER_USER issued —
+      // client-{overflow}..client-{overflow + cap - 1} — never the first ones.
+      const survivorIds = userRecords.map((r) => r.clientId).sort();
+      const expectedIds = Array.from(
+        { length: MAX_REFRESH_TOKENS_PER_USER },
+        (_, i) => `client-${i + overflow}`
+      ).sort();
+      expect(survivorIds).toEqual(expectedIds);
+    });
+
+    it("never evicts another user's records when one user hits the cap", async () => {
+      const userA = await createUser('capuserA', 'password123', 'user');
+      const userB = await createUser('capuserB', 'password123', 'user');
+      const tokenB = await issueRefreshToken(userB.id, 'client-b');
+
+      for (let i = 0; i < MAX_REFRESH_TOKENS_PER_USER + 3; i++) {
+        await issueRefreshToken(userA.id, `client-a-${i}`);
+      }
+
+      const stored = await readStoredRefreshTokens();
+      expect(stored.filter((r) => r.userId === userA.id)).toHaveLength(MAX_REFRESH_TOKENS_PER_USER);
+      expect(stored.filter((r) => r.userId === userB.id)).toHaveLength(1);
+
+      // userB's own (untouched) grant still rotates fine.
+      const rotated = await rotateRefreshToken(tokenB);
+      expect(rotated).not.toBeNull();
+    });
+
+    it('lets a user AT the cap rotate repeatedly without ever losing their grant', async () => {
+      const user = await createUser('capuserC', 'password123', 'user');
+      // The token under test is the FIRST (oldest) one issued — the exact
+      // record eviction would reach for if it ran on the un-spliced array,
+      // since the rest of the loop below issues nine newer siblings that
+      // push this user to the cap.
+      let current = '';
+      for (let i = 0; i < MAX_REFRESH_TOKENS_PER_USER; i++) {
+        const issued = await issueRefreshToken(user.id, `client-c-${i}`);
+        if (i === 0) current = issued;
+      }
+      // user now holds exactly MAX_REFRESH_TOKENS_PER_USER records — at the cap.
+
+      for (let i = 0; i < 5; i++) {
+        const rotated = await rotateRefreshToken(current);
+        expect(rotated).not.toBeNull();
+        current = rotated!.refreshToken;
+
+        const stored = await readStoredRefreshTokens();
+        expect(stored.filter((r) => r.userId === user.id)).toHaveLength(MAX_REFRESH_TOKENS_PER_USER);
+      }
+
+      // The token from the last rotation is still a live, working grant.
+      const finalRotation = await rotateRefreshToken(current);
+      expect(finalRotation).not.toBeNull();
+    });
   });
 });
