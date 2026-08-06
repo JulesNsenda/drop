@@ -13,9 +13,8 @@ import { LandingSections } from '../components/landing/LandingSections';
 // The marketing bundle makes no API calls (DROP-070) — there is no
 // `/api/v1/auth/status` probe here anymore. Auth is on by default (see
 // .claude/CLAUDE.md), so this is a fixed assumption rather than a runtime
-// value; it only affects CTA copy ("Sign in" vs "Enter") and whether the
-// secondary signup link renders. Every CTA below crosses into the dashboard
-// bundle via a full page navigation regardless.
+// value; it only affects SiteNav's CTA copy ("Sign in" vs "Enter"). Every CTA
+// crosses into the dashboard bundle via a full page navigation regardless.
 const AUTH_ENABLED = true;
 
 function LandingPage() {
@@ -41,9 +40,9 @@ function LandingPage() {
   const handleEnter = () => {
     window.location.href = '/dashboard/login';
   };
-  const handleSignup = () => {
-    window.location.href = '/dashboard/signup';
-  };
+  // No handleSignup: self-service signup is off (DROP_ALLOW_SIGNUP defaults to
+  // false), so the landing's CTAs point at the invite request instead — see
+  // REQUEST_ACCESS_URL in LandingSections.
   const onToggleTheme = () => setTheme(isDark ? 'light' : 'dark');
 
   return (
@@ -55,7 +54,7 @@ function LandingPage() {
         authEnabled={AUTH_ENABLED}
         current="landing"
       />
-      <LandingSections onEnter={handleEnter} onSignup={handleSignup} authEnabled={AUTH_ENABLED} />
+      <LandingSections onEnter={handleEnter} />
       <SiteFooter onEnter={handleEnter} />
     </div>
   );

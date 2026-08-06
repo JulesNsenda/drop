@@ -35,15 +35,16 @@ function Layout() {
   const { toast } = useToast();
   const location = useLocation();
 
-  // PRD-026: explicit redirect to the landing page + confirmation on logout.
-  // The marketing landing page now lives in a separate bundle at "/"
-  // (DROP-070) — a react-router navigate('/') would just re-render the
-  // dashboard SPA's own index route (which redirects a logged-out visitor to
-  // /dashboard/login, see App.tsx), not the real site. Full page load instead.
+  // PRD-026: explicit redirect + confirmation on logout. Signing out lands on
+  // the login page, not the marketing site — someone who just signed out is far
+  // more likely to want back in than to want the sales pitch. This stays inside
+  // the dashboard bundle (BrowserRouter basename="/dashboard", see main.tsx),
+  // so react-router's navigate() is correct here and the toast survives the
+  // transition — a full page load would discard it before it painted.
   const handleLogout = () => {
     logout();
     toast('success', 'Signed out');
-    window.location.href = '/';
+    navigate('/login', { replace: true });
   };
 
   const ThemeIcon = theme === 'dark' ? Moon : theme === 'light' ? Sun : Monitor;
