@@ -21,6 +21,7 @@ import { eventBus } from '../../core/event-bus';
 import {
   DROP_NETWORK,
   selectBaseImage,
+  selectBuildImage,
   selectImageUser,
   DEFAULT_PIDS_LIMIT,
   CONTAINER_CAP_DROP,
@@ -802,6 +803,43 @@ describe('ContainerManager', () => {
 });
 
 // ── container-config helpers ──────────────────────────────────────────────────
+
+describe('selectBuildImage (DROP-137)', () => {
+  // A source SPA is SERVED by nginx but BUILT with npm, and nginx:alpine has
+  // neither node nor npm — so building in the runtime image died at the first
+  // command with "/bin/sh: npm: not found". Found by actually deploying a Vite
+  // repo to a docker-isolation box; it affects every SPA deployed from source,
+  // which is the platform's headline use case.
+  //
+  // Third instance of one mistake: assuming a single image can both build and
+  // run an app. django/flask/fastapi were the first (pip missing from node),
+  // `spa: nginx:alpine` itself was the second (nginx start command missing from
+  // node) — and fixing that runtime broke the build, the symmetric half.
+  it('builds static in node:20-slim while still SERVING it from nginx:alpine', () => {
+    expect(selectBuildImage('static')).toBe('node:20-slim');
+    expect(selectBaseImage('static')).toBe('nginx:alpine');
+  });
+
+  it('builds spa in node:20-slim while still SERVING it from nginx:alpine', () => {
+    expect(selectBuildImage('spa')).toBe('node:20-slim');
+    expect(selectBaseImage('spa')).toBe('nginx:alpine');
+  });
+
+  it.each(['nodejs', 'python', 'django', 'flask', 'fastapi', 'go'] as const)(
+    'leaves %s building in the image it runs in',
+    (type) => {
+      expect(selectBuildImage(type)).toBe(selectBaseImage(type));
+    }
+  );
+
+  it('honours an explicitly pinned image on the build path too', () => {
+    expect(selectBuildImage('spa', 'node:20-slim')).toBe('node:20-slim');
+  });
+
+  it('still enforces the image allowlist on the build path', () => {
+    expect(() => selectBuildImage('spa', 'evil:latest')).toThrow(/allowlist/i);
+  });
+});
 
 describe('selectBaseImage', () => {
   it('returns node:20-slim for nodejs', () => {
