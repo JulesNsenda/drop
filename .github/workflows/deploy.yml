@@ -7,9 +7,20 @@ on:
       - develop
       - 'feature/DROP-v2*'
 
+# Serialize ALL deploys against each other, not per-branch. The group was
+# previously keyed on github.ref, which put a `main` deploy and a `develop`
+# deploy in DIFFERENT groups -- so they did not queue, they raced: two jobs
+# each running `systemctl stop drop-platform`, `rm -rf dist/ install.sh` and
+# untarring into /opt/drop on the same host. Interleaving them can leave the
+# box with dist/ from one build and the dependency-lock witness from another,
+# or a health check that passes against the other job's restart.
+#
+# cancel-in-progress is false deliberately: a deploy that has already stopped
+# the service must be allowed to finish and restart it. Cancelling mid-run is
+# how you get a box left stopped.
 concurrency:
-  group: deploy-${{ github.ref }}
-  cancel-in-progress: true
+  group: deploy
+  cancel-in-progress: false
 
 jobs:
   build-and-test:
