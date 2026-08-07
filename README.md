@@ -83,6 +83,11 @@ gh release download --repo JulesNsenda/drop -p drop-dist.tar.gz
 gh attestation verify drop-dist.tar.gz --repo JulesNsenda/drop
 ```
 
+> Attestations are attached by the release workflow on every release built
+> after this repository became public. If `gh attestation verify` reports no
+> attestation for a given release, that release predates it — fall back to the
+> published `drop-dist.tar.gz.sha256`, which `install.sh` checks automatically.
+
 Once the service is up, retrieve the one-time admin password from the
 platform log and change it immediately:
 

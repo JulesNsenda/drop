@@ -261,12 +261,26 @@ jobs:
       # not authenticity -- whoever can publish the asset publishes both halves.
       # Provenance attestation is the part users can actually verify:
       #   gh attestation verify drop-dist.tar.gz --repo JulesNsenda/drop
+      # Attestation is unavailable on user-owned PRIVATE repos -- the API
+      # returns "Feature not available for user-owned private repositories".
+      # Gating on visibility rather than letting it hard-fail keeps the release
+      # publishable before the repo goes public, and makes the step switch
+      # itself on afterwards with no edit. Re-run the release once public if
+      # you want an existing tag's assets attested.
       - name: Attest build provenance
+        if: github.event.repository.private == false
         uses: actions/attest-build-provenance@v2
         with:
           subject-path: |
             drop-dist.tar.gz
             install.sh
+
+      - name: Note skipped attestation
+        if: github.event.repository.private == true
+        run: |
+          echo "::warning::Repository is private, so build provenance attestation was skipped." \
+               "These assets are verifiable by SHA-256 only. Re-run this release once the" \
+               "repository is public to attach an attestation."
 
       # install.sh is uploaded as a standalone asset, not only inside the
       # tarball: the documented install command curls
