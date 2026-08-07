@@ -5,98 +5,203 @@ All notable changes to DROP will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+<!--
+  Release notes are machine-extracted from this file by the release workflow,
+  so the section shape below is load-bearing, not just formatting:
+
+  - A version heading MUST look exactly like this — no extra text, no
+    trailing punctuation, ISO date:
+      `## [X.Y.Z] - YYYY-MM-DD`
+  - The extractor opens on that exact heading for the version being released
+    and reads until the next line matching `^## ` (another heading), OR
+    `^\[.*\]:` (a link-reference footer line), OR `^---$` (a horizontal
+    rule) — whichever comes first.
+
+  Changing the heading text, the date format, or introducing an unindented
+  line that matches one of those three terminators inside a version's body
+  will silently break extraction: a release ships with an empty body, a
+  truncated one, or the wrong section entirely. If you need to show an
+  example heading or footer line inside this file, indent it or wrap it in
+  backticks so it can't be mistaken for a real one.
+-->
+
 ## [Unreleased]
 
-Work toward the **v1.0.0** production release. Tracked in
-`docs/plans/2026-06-11-production-release-plan.md`. Scope: self-hosted with
-trusted/semi-trusted tenants; container isolation and SQLite state remain on
-the v2.0 roadmap (see the README "Security & Trust Model" section).
+## [1.0.0] - 2026-08-07
+
+First public release. DROP now runs tenant apps under either PM2 or Docker
+container isolation behind one runtime interface, exposes itself to coding
+agents through a hosted MCP server with OAuth 2.1, and adds the guardrails,
+monorepo support, and managed services needed to let an agent deploy safely
+and unattended. This section also carries everything shipped but never
+previously published since 0.1.0.
 
 ### Security
 
-- **Access control:** `PUT /apps/:name` and the log endpoints now enforce
-  ownership (fixes IDOR — a user could previously take over or read any app),
-  and `PUT` accepts only a safe field allowlist (no more `userId`/`path`
-  overwrites). `POST /apps` contains the deploy path inside the webapps dir
-  (realpath, defeats symlink/junction/.. escapes).
-- **Webhooks:** GitHub webhook verification no longer skips when the signature
-  header is omitted, guards `JSON.parse`, and length-checks before
-  `timingSafeEqual`. Missing-secret deliveries warn now and will be rejected in
-  a future release. Outbound webhook URLs reject localhost/private/link-local
-  targets (SSRF).
-- **Auth:** authentication is on by default (set `DROP_DISABLE_AUTH=true` to
-  disable); JWT verification pinned to HS256; legacy password hashes compared
-  in constant time and upgraded to scrypt on login; `/auth/signup` rate-limited.
-- **Secrets:** app secrets are encrypted with the standalone `encryption.key`
+- **Access control:** ownership enforcement on app mutation and log
+  endpoints (`PUT /apps/:name` accepts only a safe field allowlist — no more
+  `userId`/`path` overwrites); every deploy path (upload, git, agent
+  tooling) contains itself inside the webapps directory via a realpath
+  check that defeats symlink/junction/`..` escapes.
+- **Multi-tenant isolation:** a tenant-authored group or domain name can no
+  longer collide with, delete, or route-hijack another owner's app; a
+  colliding database name is refused instead of silently reused; deleting
+  an app now purges its logs and retained deploy artifacts instead of
+  leaving them readable by the next owner of that name; monorepo
+  materialization no longer lets one service's build escape into a
+  sibling's directory, and a dangling symlink can no longer squat a child
+  app's name.
+- **Auth & API keys:** authentication is on by default (`DROP_DISABLE_AUTH=true`
+  to disable); JWT verification pinned to HS256; legacy password hashes are
+  compared in constant time and upgraded to scrypt on login; `/auth/signup`
+  is rate-limited; an API key's standing now derives from its owner instead
+  of the key being its own principal (which had let a suspended owner's
+  keys keep working, and orphaned apps/quotas); suspension and password
+  resets are reversible and contained rather than destructive; the
+  `users:create` capability can no longer be escalated into arbitrary code
+  execution.
+- **Agent & MCP surfaces:** the untrusted-output fence around tenant-
+  controlled text — which stops a deployed app's text from acting as a
+  prompt injection against a model reading it — can no longer be forged or
+  bypassed; the MCP `forward_auth` guard in front of a tenant's own MCP
+  endpoint now actually rejects every credential class except an
+  app-audienced bearer, instead of admitting others; per-app OAuth
+  audiences stop one app's token from reaching another app's MCP endpoint;
+  agent tokens carry an explicit scope grammar and are admitted narrowly at
+  the deploy gate.
+- **Guardrails:** closed several bypasses a dedicated security review found
+  in the agent-deploy guardrails — the circuit breaker and per-principal
+  quotas were inert on the exact code path an autonomous deploy loop rides,
+  and the idle reaper's dry-run budget was being spent by no-op sweeps
+  instead of real ones.
+- **Build isolation:** tenant build commands no longer inherit platform
+  secrets, on both the host and containerized build paths; `install.sh` no
+  longer lets root execute drop-authored code, and the bundled Postgres
+  gets its own hardened, dedicated socket directory.
+- **Webhooks:** GitHub webhook signature verification no longer skips when
+  the header is omitted, guards `JSON.parse`, and length-checks before
+  `timingSafeEqual`; outbound webhook URLs reject localhost/private/
+  link-local targets (SSRF).
+- **Secrets:** app secrets are encrypted with a standalone `encryption.key`
   (or `DROP_MASTER_KEY`) instead of a key derived from the store itself;
   existing stores migrate transparently.
 - **Misc:** CORS defaults to same-origin (`DROP_CORS_ORIGINS` to allowlist);
-  added a Content-Security-Policy; git branch names validated; build
-  subprocesses no longer inherit platform secrets; `webhooks.json` is `0600`;
-  500 responses no longer leak internal error text.
+  a Content-Security-Policy is set; git branch names are validated;
+  `webhooks.json` is `0600`; 500 responses no longer leak internal error
+  text.
 
 ### Added
 
-- Dashboard log viewer: Runtime/Build tabs (build logs were previously not
-  surfaced in the dashboard at all), stdout/stderr filter, text search with
-  highlighting, line-count selector, pause/resume, copy/download, severity
-  color-coding, ANSI/control-byte sanitization, and auto-scroll that only
-  sticks when already at the bottom.
-- Dashboard settings page reorganized into tabs (System / Account / Activity /
-  About), with the active tab kept in the URL (`?tab=`) and admin-only tabs
-  hidden per role.
+- **Docker isolation mode.** `AppRuntime` is a formal seam with two
+  implementations — PM2 (`isolation: none`, the default) and Docker
+  containers (`isolation: docker`) — chosen once at boot from
+  `config.isolation`/`DROP_ISOLATION`. Container builds run in ephemeral,
+  non-root containers; static/SPA apps are served by an unprivileged nginx
+  with zero capabilities; Postgres has its own container-mode topology; live
+  stats and log streaming work the same way under both runtimes. `drop
+  migrate-runtime` moves an existing app between the two.
+- **Hosted MCP server + OAuth 2.1.** `POST /api/v1/mcp` (PRD-040) exposes
+  DROP's own deploy/status/logs tools to Claude and other MCP clients.
+  OAuth 2.1 with PKCE (PRD-041) authorizes claude.ai's web connector,
+  including per-app MCP audiences and a `revocation_endpoint`.
+- **Agent-deploy guardrails.** A circuit breaker trips on a failing deploy
+  loop and resets on the first success; per-principal *and* per-owning-user
+  deploy quotas cap throughput regardless of outcome; ephemeral, TTL'd apps
+  (default 60 minutes, promotable to permanent) give agents a safe scratch
+  space; an idle reaper tears down abandoned agent-created apps; a per-app
+  disk ceiling blocks a deploy before it exhausts the box. Every limit
+  returns a structured refusal instead of a silent kill.
+- **Monorepo / multi-service deploys.** A `services:` block in `drop.yaml`
+  expands one repository into N apps sharing a hostname, with
+  browser-reachable `depends_on` URLs, same-origin `/api` routing, and
+  group-aware start/stop/teardown/redeploy.
+- **Managed Redis (PRD-050).** A bundled Redis server provisions a per-app
+  logical database and injects `REDIS_URL` for apps that opt in via
+  `drop.yaml`.
+- **Public site, docs, and reference — split from the dashboard (DROP-070).**
+  `/`, `/docs` (PRD-043) and `/reference` (PRD-044) build as a separate
+  bundle from the authenticated `/dashboard` SPA, so a marketing visitor's
+  download never carries admin-only code.
+- **Database panel.** The dashboard's App Details page can browse an app's
+  provisioned database, reading it as the app's own database role rather
+  than an admin credential.
+- **Multi-user MCP connectors.** Non-admin users can set up their own
+  claude.ai connector; an admin-controlled `userConnectorsEnabled` platform
+  setting gates whether the capability is offered at all.
+- **Agent-native deploy tooling:** tarball upload deploys
+  (`POST /apps/:name/source`, PRD-039); scoped agent tokens
+  (`POST /auth/agent-tokens`) with a stable principal identity per caller;
+  a structured result for every deploy — a real error code, build-failure
+  classification from the log tail, and `GET /deploys/:deployId` /
+  `get_deploy_logs` to see why a specific deploy failed, with logs retained
+  past teardown.
+- **Required secrets preflight (PRD-051).** A deploy with `drop.yaml`
+  `secrets:` missing is parked in a `needs-config` status instead of
+  crash-looping, surfaced in both the API and dashboard.
+- **Boot reconciliation.** A platform restart no longer rebuilds every app
+  on the box; already-running apps are reconciled against their config
+  instead of redeployed.
+- **`DROP_API_URL` + scoped `DROP_API_KEY`.** Apps an admin grants
+  control-plane capabilities can call DROP's own REST API from inside their
+  own container/process with a least-privilege key, instead of needing the
+  admin key.
+- **Auth:** opt-in TOTP two-factor authentication; forced password change on
+  first login; admin-manageable GitHub webhook secret with a reveal-once
+  flow in the dashboard's Git settings tab.
+- **CLI:** `drop restore` reverses `drop backup`; `drop backup` now also
+  captures every per-app database, not just platform state.
+- **Dashboard:** a log viewer (Runtime/Build tabs, stdout/stderr filter,
+  search with highlighting, pause/resume, copy/download, severity
+  color-coding, ANSI sanitization); settings reorganized into tabs (System /
+  Account / Activity / About) with the active tab kept in the URL; a
+  deploy-timeline panel and app-level Metrics tab (CPU/mem/uptime); a
+  redesigned auth flow, app shell, and design system; session-expiry
+  handling, a 404 page, logout redirect, an app-limit indicator
+  (`GET /api/v1/usage`), and a signup-success notice.
 - Continuous integration (GitHub Actions): lint, server build, tests, and
-  dashboard build on every PR to `main`/`develop`.
-- `drop backup` command: snapshots the file stores + a `pg_dump` of the
-  internal database, with retention.
-- Atomic, crash-safe writes (temp + fsync + rename) for every JSON/YAML state
-  store; corrupt `apps.json` is quarantined instead of silently wiped.
-- Dashboard v1.0 UX: session-expiry handling with redirect (PRD-024), 404 page
-  (PRD-025), logout redirect + toast (PRD-026), app-limit indicator and
-  `GET /api/v1/usage` (PRD-027), signup-success notice (PRD-028); app links and
-  the API endpoint derive from the current host instead of `localhost`.
-- `.env.example`, a LICENSE file, and a `files`/`prepublishOnly` package config.
-- `scripts/create-migration.ts` restored; `.sql` migrations are copied into
-  `dist` so a built deployment can run them.
+  both dashboard builds on every PR to `main`/`develop`.
+- Atomic, crash-safe writes (temp + fsync + rename) for every JSON/YAML
+  state store; a corrupt store is quarantined instead of silently wiped.
+- `.env.example`, a LICENSE file, and a `files`/`prepublishOnly` package
+  config.
 
 ### Changed
 
-- Version set to `1.0.0-rc.0`.
 - `drop serve -d` now applies the `--root/--domain/--https/...` flags it
-  forwards (previously ignored). **Review forwarded flags before upgrading.**
+  forwards (previously ignored).
 - Boot recovery: apps whose process died while marked `running` are set to
   `pending` (and restarted by the startup scan) instead of `stopped`.
-- `/health`, the CLI, and `drop version` read the version from `package.json`.
-- Dashboard assets served with immutable cache headers; `index.html` is
+- Version — `/health`, the CLI, `drop version`, and the dashboard — is read
+  from `package.json` everywhere, replacing several hardcoded, stale
+  version strings.
+- Dashboard assets are served with immutable cache headers; `index.html` is
   `no-cache`.
-- Git redeploy (API + webhook) now always triggers a rebuild+restart after a
-  successful pull, including no-change pulls, instead of relying on the
-  watcher to notice file changes.
+- Git redeploy (API + webhook) always triggers a rebuild+restart after a
+  successful pull, including no-change pulls, and onboards a freshly cloned
+  app deterministically instead of waiting on the file watcher.
+- `getAppRuntime()` returns whichever runtime is already active instead of
+  defaulting to PM2, so a caller can no longer accidentally target the
+  wrong adapter.
 
 ### Fixed
 
-- Static/SPA apps under docker isolation crash-looped at startup: root-nginx
-  could not `chown`/`setuid` under `CapDrop: ALL`, and SPA-detected apps got
-  the `node:20-slim` fallback image (no nginx). Static/SPA containers now run
-  nginx fully unprivileged (uid 101, zero capabilities) with a DROP-generated
-  complete `nginx.conf` (pid/temp paths in `/tmp`, logs to stdout/stderr)
-  started via `nginx -c` from the bind-mounted data dir, and `spa` maps to
-  `nginx:alpine`. Already-deployed static apps must be redeployed (not just
-  restarted) to pick up the new container config.
-- Git deploys whose clone writes for longer than the watcher's flush window
-  could register but never build/start until a platform restart; `deploy()`
-  now publishes the detection itself instead of relying on the watcher.
+- Deploy pipeline: `build:completed` carries a `success` flag and the
+  platform no longer starts an app after a failed build; the
+  `appsInProgress` guard no longer leaks (which had permanently dead-ended
+  hot reload).
+- Process safety: `unhandledRejection`/`uncaughtException` handlers and a
+  bounded, guarded shutdown; `waitForStatus` throws on timeout; build
+  commands hard-timeout and kill the process tree; app logs are tail-read
+  (no OOM on multi-GB files).
+- Caddy stderr/unexpected exit is logged at warn and surfaced via
+  `platform:error` instead of being swallowed at debug; a Caddy-rejected
+  config is no longer misreported as "Caddy not running".
+- The readiness gate no longer marks a healthy, slow-starting app as
+  errored.
+- Static apps now serve their built output directory instead of their
+  source root.
 - Resolved all ESLint errors; activity logging consolidated behind a
   best-effort `tryLogActivity` helper.
-- Deploy pipeline: `build:completed` carries a `success` flag and the platform
-  no longer starts an app after a failed build; the `appsInProgress` guard no
-  longer leaks (which had permanently dead-ended hot reload).
-- Process safety: `unhandledRejection`/`uncaughtException` handlers and a
-  bounded, guarded shutdown; `waitForStatus` throws on timeout; build commands
-  hard-timeout and kill the process tree; app logs are tail-read (no OOM on
-  multi-GB files); `certExpiryTimer` is `unref()`'d.
-- Caddy stderr/unexpected exit logged at warn and surfaced via `platform:error`
-  instead of being swallowed at debug.
 
 ## [0.1.0] - 2026-01-18
 
@@ -216,18 +321,6 @@ First stable release of DROP with full deployment pipeline, hot-reload, and data
 
 ---
 
-## Roadmap
-
-### 0.2.0 (Planned)
-- Caddy reverse proxy integration
-- Hostname routing (myapp.localhost)
-- Automatic HTTPS with Let's Encrypt
-
-### 0.3.0 (Planned)
-- Web dashboard UI
-- Real-time log streaming
-- App metrics and monitoring
-
-[Unreleased]: https://github.com/techamat/drop/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/techamat/drop/compare/v0.1.0-alpha.1...v0.1.0
-[0.1.0-alpha.1]: https://github.com/techamat/drop/releases/tag/v0.1.0-alpha.1
+[Unreleased]: https://github.com/JulesNsenda/drop/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/JulesNsenda/drop/compare/v0.1.0...v1.0.0
+[0.1.0]: https://github.com/JulesNsenda/drop/releases/tag/v0.1.0
