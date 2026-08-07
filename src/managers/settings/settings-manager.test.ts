@@ -208,6 +208,167 @@ describe('SettingsManager', () => {
     });
   });
 
+  describe('userConnectorsEnabled', () => {
+    it('defaults to true when the key is absent', async () => {
+      await manager.load();
+      expect(manager.getUserConnectorsEnabled()).toBe(true);
+    });
+
+    it('sets and persists a value, readable via getUserConnectorsEnabled', async () => {
+      await manager.setUserConnectorsEnabled(false);
+      expect(manager.getUserConnectorsEnabled()).toBe(false);
+
+      const raw = await fs.readFile(settingsFilePath, 'utf-8');
+      expect(JSON.parse(raw)).toEqual({ userConnectorsEnabled: false });
+    });
+
+    it('persists across a reload (new manager instance, same file)', async () => {
+      await manager.setUserConnectorsEnabled(false);
+
+      const reloaded = new SettingsManager({ settingsFilePath });
+      await reloaded.load();
+      expect(reloaded.getUserConnectorsEnabled()).toBe(false);
+      await reloaded.close();
+    });
+
+    it('a stored false survives a reload as false (guards against an `||` regression)', async () => {
+      await manager.setUserConnectorsEnabled(false);
+
+      const reloaded = new SettingsManager({ settingsFilePath });
+      await reloaded.load();
+      // If the getter used `settings.userConnectorsEnabled || true` instead
+      // of `?? true`, a stored `false` would be discarded and this would
+      // read back `true`.
+      expect(reloaded.getUserConnectorsEnabled()).toBe(false);
+      await reloaded.close();
+    });
+
+    it('clears the value when set to undefined', async () => {
+      await manager.setUserConnectorsEnabled(false);
+      expect(manager.getUserConnectorsEnabled()).toBe(false);
+
+      await manager.setUserConnectorsEnabled(undefined);
+      expect(manager.getUserConnectorsEnabled()).toBe(true);
+
+      const reloaded = new SettingsManager({ settingsFilePath });
+      await reloaded.load();
+      expect(reloaded.getUserConnectorsEnabled()).toBe(true);
+      await reloaded.close();
+    });
+
+    it('a corrupt settings file fails closed: getter returns false (and publicUrl is undefined)', async () => {
+      await fs.mkdir(path.dirname(settingsFilePath), { recursive: true });
+      await fs.writeFile(settingsFilePath, 'not valid json');
+
+      await manager.load();
+
+      expect(manager.getUserConnectorsEnabled()).toBe(false);
+      expect(manager.getStoredPublicUrl()).toBeUndefined();
+    });
+
+    it('a hand-written non-boolean value (string "false") is discarded — fails open to true only because it was never validly set', async () => {
+      await fs.mkdir(path.dirname(settingsFilePath), { recursive: true });
+      await fs.writeFile(settingsFilePath, JSON.stringify({ userConnectorsEnabled: 'false' }));
+
+      await manager.load();
+
+      expect(manager.getUserConnectorsEnabled()).toBe(true);
+    });
+
+    it('a hand-written non-boolean value (null) is discarded — fails open to true only because it was never validly set', async () => {
+      await fs.mkdir(path.dirname(settingsFilePath), { recursive: true });
+      await fs.writeFile(settingsFilePath, JSON.stringify({ userConnectorsEnabled: null }));
+
+      await manager.load();
+
+      expect(manager.getUserConnectorsEnabled()).toBe(true);
+    });
+
+    it('a settings file that is valid JSON but not an object (`null`) fails closed', async () => {
+      await fs.mkdir(path.dirname(settingsFilePath), { recursive: true });
+      await fs.writeFile(settingsFilePath, 'null');
+
+      await manager.load();
+
+      expect(manager.getUserConnectorsEnabled()).toBe(false);
+    });
+
+    it('a settings file that is valid JSON but not an object (a bare number) fails closed', async () => {
+      await fs.mkdir(path.dirname(settingsFilePath), { recursive: true });
+      await fs.writeFile(settingsFilePath, '5');
+
+      await manager.load();
+
+      expect(manager.getUserConnectorsEnabled()).toBe(false);
+    });
+
+    it('a settings file that is valid JSON but not an object (a bare string) fails closed', async () => {
+      await fs.mkdir(path.dirname(settingsFilePath), { recursive: true });
+      await fs.writeFile(settingsFilePath, '"x"');
+
+      await manager.load();
+
+      expect(manager.getUserConnectorsEnabled()).toBe(false);
+    });
+
+    it('a missing settings file (ENOENT) does NOT fail closed — a fresh install has no file yet', async () => {
+      // Regression guard distinguishing "never set" from "unreadable": only
+      // the latter should flip `corrupt`. Deliberately does not touch
+      // settingsFilePath at all, so load() hits ENOENT.
+      await manager.load();
+
+      expect(manager.getUserConnectorsEnabled()).toBe(true);
+    });
+
+    it('a settings path that is a directory (non-ENOENT readFile error) fails closed', async () => {
+      // Portable way to induce a non-ENOENT fs.readFile error: point the
+      // "file" path at a directory. Yields EISDIR (or, on some Windows
+      // configurations, EPERM) rather than ENOENT — either way it is a
+      // readable-but-not-a-file error, which must be treated the same as a
+      // parse failure, not as "never set".
+      await fs.mkdir(settingsFilePath, { recursive: true });
+
+      await manager.load();
+
+      expect(manager.getUserConnectorsEnabled()).toBe(false);
+    });
+
+    it('clearing corrupt: setUserConnectorsEnabled after a corrupt load recovers immediately, no restart needed', async () => {
+      await fs.mkdir(path.dirname(settingsFilePath), { recursive: true });
+      await fs.writeFile(settingsFilePath, 'not valid json');
+
+      await manager.load();
+      expect(manager.getUserConnectorsEnabled()).toBe(false);
+
+      // The admin's fix-it PUT: a successful write must clear `corrupt`,
+      // not just commit the new value into memory — otherwise the getter
+      // stays stuck returning false regardless of what was just written.
+      await manager.setUserConnectorsEnabled(true);
+      expect(manager.getUserConnectorsEnabled()).toBe(true);
+
+      // And the recovery must itself be durable — a fresh manager reloading
+      // from the now-valid file must not re-derive `corrupt` from anything
+      // stale.
+      const reloaded = new SettingsManager({ settingsFilePath });
+      await reloaded.load();
+      expect(reloaded.getUserConnectorsEnabled()).toBe(true);
+      await reloaded.close();
+    });
+
+    it('is independent of publicUrl and githubWebhookSecret across a reload (three-way independence — catches the parseSettings whitelist bug)', async () => {
+      await manager.setPublicUrl('https://drop.example.com');
+      await manager.setGithubWebhookSecret('a'.repeat(64));
+      await manager.setUserConnectorsEnabled(false);
+
+      const reloaded = new SettingsManager({ settingsFilePath });
+      await reloaded.load();
+      expect(reloaded.getStoredPublicUrl()).toBe('https://drop.example.com');
+      expect(reloaded.getGithubWebhookSecret()).toBe('a'.repeat(64));
+      expect(reloaded.getUserConnectorsEnabled()).toBe(false);
+      await reloaded.close();
+    });
+  });
+
   describe('file permissions', () => {
     // POSIX mode bits aren't meaningful on Windows (no chmod-style ACL model).
     const itPosix = process.platform === 'win32' ? it.skip : it;

@@ -8,16 +8,36 @@
 import * as path from 'path';
 import * as fs from 'fs/promises';
 import * as yaml from 'yaml';
+import * as crypto from 'crypto';
 import { EventBus, eventBus, Unsubscribe, AppDeletedPayload, AppDetectedPayload } from './event-bus';
+import { isReservedHost } from '../utils/reserved-hosts';
+import { getPublicUrl } from '../api/runtime-config';
+import type { DeployFailureReason } from './event-bus/event-bus.types';
 import { WatcherService } from './watcher';
-import { DetectorService, getDetector, parseDropYaml, DetectionResult, DropYamlConfig } from './detector';
+// Imported from the concrete file, NOT the './watcher' barrel: several test
+// suites mock './watcher' wholesale (only exporting WatcherService), and this
+// constant is read at platform.ts module-load time — going through the
+// barrel would make loading this module depend on every consumer's mock
+// shape. watcher.config.ts itself has no WatcherService dependency, so this
+// stays a live import (no drift) without dragging chokidar/WatcherService in.
+import { DEFAULT_IGNORE_PATTERNS } from './watcher/watcher.config';
+import {
+  DetectorService,
+  getDetector,
+  parseDropYaml,
+  DetectionResult,
+  DropYamlConfig,
+  AppType,
+  detectMcp,
+  readMcpInputs,
+} from './detector';
 import { getProcfileWebCommand } from './detector/procfile';
 import { BuilderService, getBuilder } from './builder';
 import { RouterService, getRouterService, resetRouterService } from './router';
 import { AppRuntime, AppProcessInfo, AppStartSpec, getAppRuntime, resetAppRuntime } from '../managers/runtime';
-import { AppStateManager, getStateManager, resetStateManager } from '../managers/app/state-manager';
+import { AppStateManager, AppStatus, getStateManager, resetStateManager } from '../managers/app/state-manager';
 import { SettingsManager, getSettingsManager, resetSettingsManager } from '../managers/settings/settings-manager';
-import { AppConfigService, getAppConfigService, resetAppConfigService } from '../managers/app/app-config';
+import { AppConfig, AppConfigService, getAppConfigService, resetAppConfigService } from '../managers/app/app-config';
 import {
   PostgresServer,
   getPostgresServer,
@@ -40,11 +60,47 @@ import { WebhookManager, getWebhookManager, resetWebhookManager } from './webhoo
 import { GitDeployService, getGitDeployService, resetGitDeployService } from './git-deploy';
 import { UploadDeployService, getUploadDeployService, resetUploadDeployService } from './upload-deploy';
 import { getActivityLog, resetActivityLog } from '../managers/activity';
-import { getDeployTracker, resetDeployTracker } from '../managers/deploy-tracker';
+import { tryLogActivity } from '../managers/activity';
+import {
+  promotionModeFor,
+  shouldHoldForPromotion,
+  type PromotionMode,
+} from '../managers/guardrail/promotion';
+import { getPrincipalQuota, resetPrincipalQuota } from '../managers/guardrail/principal-quota';
+import { isExpired } from '../managers/guardrail/ephemeral';
+import {
+  planIdleSweep,
+  createIdleSweepState,
+  dryRunSweeps,
+  idleWindowMs,
+  type IdleSweepState,
+} from '../managers/guardrail/idle-reaper';
+import {
+  findOverCeiling,
+  toMb,
+  configuredCeilingBytes,
+  DISK_SWEEP_INTERVAL_MS,
+} from '../managers/guardrail/disk-ceiling';
+import {
+  getDeployBreaker,
+  guardrailKeysFor,
+  checkGuardrailKeys,
+  resetDeployBreaker,
+  type GuardrailKey,
+  type DeployActorInfo,
+} from '../managers/guardrail/deploy-breaker';
+import {
+  getDeployTracker,
+  resetDeployTracker,
+  getDeployDetailStore,
+  resetDeployDetailStore,
+} from '../managers/deploy-tracker';
 import { ApiServer, createApiServer } from '../api';
 import { AppInProgressError, AppNeedsConfigError, setPlatformOps, resetPlatformOps } from '../api/platform-ops';
 import { planSecretPreflight, generateSecretValue } from '../managers/secret/secret-preflight';
 import { Logger, createLogger } from '../utils/logger';
+import { isPathWithin } from '../utils/paths';
+import { syncTree, DEFAULT_PRESERVE } from '../utils/tree-sync';
 import {
   validateDomain,
   validateDomainFormat,
@@ -54,7 +110,7 @@ import { createApiKey, deleteApiKeysByName } from '../api/middleware/auth';
 import { IsolationMode, assertStartupConstraints } from './startup-constraints';
 import { createContainerExecCommand } from './builder/container-build-runner';
 import { migrateAllToDocker } from '../managers/runtime/runtime-migrator';
-import { HOST_ALIAS } from '../managers/runtime/container-config';
+import { HOST_ALIAS, containerPolicyFingerprint } from '../managers/runtime/container-config';
 import { buildNginxConf } from '../utils/nginx-conf';
 import { BuildLogService, getBuildLogService, resetBuildLogService } from '../managers/build-log/build-log';
 import {
@@ -64,6 +120,31 @@ import {
 } from '../managers/log-retention/log-retention';
 import { hasEnoughDisk, getMinFreeDiskMb } from '../utils/disk';
 import { probePort, probeHttp } from '../utils/http-probe';
+
+/** See PlatformConfig.bootReconcileMode. */
+export type BootReconcileMode = 'off' | 'observe' | 'on';
+
+/**
+ * Parses DROP_BOOT_RECONCILE. Accepts the literal mode names plus common
+ * boolean spellings for the plan's kill switch (`DROP_BOOT_RECONCILE=false`)
+ * so an operator writing `=true`/`=false` gets the side they expect rather
+ * than a silent 'off'. An unrecognized value warns and falls back to 'off' —
+ * the safest, today-unchanged default.
+ */
+function parseBootReconcileMode(raw: string | undefined): BootReconcileMode {
+  const value = (raw ?? '').trim().toLowerCase();
+  if (value === '' || value === 'off' || value === 'false' || value === '0' || value === 'no') {
+    return 'off';
+  }
+  if (value === 'observe') {
+    return 'observe';
+  }
+  if (value === 'on' || value === 'true' || value === '1' || value === 'yes') {
+    return 'on';
+  }
+  console.warn(`[platform] Unrecognized DROP_BOOT_RECONCILE value '${raw}', defaulting to 'off'`);
+  return 'off';
+}
 
 export interface PlatformConfig {
   /** Root directory for DROP */
@@ -138,6 +219,22 @@ export interface PlatformConfig {
    * Default true; the escape hatch is DROP_ENABLE_SECRET_PREFLIGHT=false.
    */
   enableSecretPreflight: boolean;
+  /**
+   * Boot reconciliation (M1): stops the watcher's initial scan from
+   * fabricating `app:detected` — and therefore a full rebuild — for every
+   * existing app dir on every platform restart.
+   * - 'off'     — default; today's behaviour, unchanged, no boot-reconcile logs.
+   * - 'observe' — computes and LOGS the skip/redeploy decision it would make
+   *               per app, but changes nothing (validates the logic against a
+   *               real fleet before flipping the default).
+   * - 'on'      — acts on the decision: an already-running app with an
+   *               unchanged source signature is routing-reconciled only (no
+   *               detect/install/build/runtime.start); anything ambiguous
+   *               still redeploys in full.
+   * Settable via DROP_BOOT_RECONCILE in /etc/drop/drop.env — the kill switch
+   * lives there, not in code, so backing out is edit-and-restart.
+   */
+  bootReconcileMode: BootReconcileMode;
   /** Global limit on simultaneous builds (0 = unlimited). */
   maxConcurrentBuilds: number;
   /**
@@ -229,6 +326,7 @@ const DEFAULT_CONFIG: PlatformConfig = {
   redisPort: parseInt(process.env.DROP_REDIS_PORT || '6380', 10),
   maxRedisPerUser: parseInt(process.env.DROP_MAX_REDIS_PER_USER || '3', 10),
   enableSecretPreflight: process.env.DROP_ENABLE_SECRET_PREFLIGHT !== 'false',
+  bootReconcileMode: parseBootReconcileMode(process.env.DROP_BOOT_RECONCILE),
   maxConcurrentBuilds: parseInt(process.env.DROP_MAX_CONCURRENT_BUILDS || '3', 10),
   maxConcurrentApps: parseInt(process.env.DROP_MAX_CONCURRENT_APPS || '0', 10),
   maxMemoryMbPerApp: parseInt(process.env.DROP_MAX_MEMORY_MB_PER_APP || '0', 10),
@@ -238,6 +336,273 @@ const DEFAULT_CONFIG: PlatformConfig = {
   maxUploadSizeMb: parseInt(process.env.DROP_MAX_UPLOAD_SIZE_MB || '100', 10),
   maxUploadUnpackedMb: parseInt(process.env.DROP_MAX_UPLOAD_UNPACKED_MB || '1024', 10),
 };
+
+/**
+ * Directory names skipped when computing an app's source-mtime signature
+ * (see computeSourceMtimeMs) — derived from the watcher's own ignore globs
+ * (`**\/<name>\/**`, imported straight from watcher.config.ts, see the
+ * DEFAULT_IGNORE_PATTERNS import above) so the two can never drift apart.
+ * File-level ignore patterns (e.g. `**\/*.log`) don't apply to a directory
+ * walk and are dropped; a build's writes to a plain file inside the source
+ * tree (not a whole ignored dir) still counts toward the signature, which is
+ * intentional — see decideBootReconciliation's fail-toward-redeploy doctrine.
+ */
+const BOOT_RECONCILE_IGNORE_DIRS = new Set(
+  DEFAULT_IGNORE_PATTERNS
+    .map((p) => p.match(/^\*\*\/(.+)\/\*\*$/)?.[1])
+    .filter((name): name is string => Boolean(name))
+);
+
+/**
+ * Bounds on computeSourceMtimeMs's recursive walk (M1 review item F): under
+ * isolation 'none' a tenant controls their own app directory and could
+ * otherwise hold platform startup hostage with a huge/deep tree, since the
+ * walk runs serially per app inside start(), before the API server comes up.
+ * Exceeding any bound fails the scan (caught by the caller) — fail toward
+ * redeploying, never toward a false "unchanged" from a partial scan.
+ */
+const BOOT_RECONCILE_SCAN_MAX_DEPTH = 12;
+const BOOT_RECONCILE_SCAN_MAX_ENTRIES = 20_000;
+const BOOT_RECONCILE_SCAN_TIMEOUT_MS = 5_000;
+
+/**
+ * Max apps decided concurrently during boot reconciliation (M1 review item 9,
+ * round-2 diff pass) — see reconcileAppsOnBoot's doc comment for why the
+ * decide/act split exists and why there is no global deadline alongside this.
+ */
+const BOOT_RECONCILE_CONCURRENCY = 4;
+
+/**
+ * A source-tree scan result (M1 review item 2, round-2 diff pass): a SHA-256
+ * hash over the sorted (relativePath, mtimeMs, size) tuple of every file/dir
+ * in the app's source tree, plus the newest mtime's path for the log line
+ * only. The ORIGINAL signal — the max mtime alone — missed a deletion or
+ * rename that didn't touch whichever file held that max, and missed a
+ * replaced file whose (tar/upload-archived) mtime happened to land below it;
+ * both are exactly the tar/upload redeploy path this exists to protect,
+ * since git clone and the monorepo copy always write fresh mtimes. The hash
+ * has no notion of "before/after" — any difference in the tuple set redeploys.
+ */
+export interface SourceSignature {
+  hash: string;
+  /** Path of the newest file/dir relative to the app root, e.g. 'src/index.ts' — diagnostics only, not part of the comparison. */
+  newestPath: string;
+}
+
+export type BootReconcileAction = 'leave' | 'skip' | 'redeploy';
+
+export interface BootReconcileDecision {
+  action: BootReconcileAction;
+  reason: string;
+}
+
+/**
+ * The cheap half of the skip predicate — pure in-memory state, no I/O.
+ * Checked FIRST (M1 review item F) so an app that's already decidable never
+ * pays for the source-mtime walk or the secret-fingerprint computation.
+ */
+export interface CheapBootReconcileInput {
+  /**
+   * The app's persisted status as of boot, BEFORE syncStateWithConfigs /
+   * syncStateWithProcesses reconcile it against the live runtime (which can
+   * overwrite 'errored'/'needs-config'/'crash-looping' with 'running' for an
+   * app whose broken process the runtime still reports as up) — see
+   * DropPlatform.bootStatusSnapshot.
+   */
+  status: AppStatus | undefined;
+  /** Whether the runtime (PM2/Docker) reports this app running RIGHT NOW — queried fresh, not trusted from status alone. */
+  isRuntimeRunning: boolean;
+  /** Whether the persisted config carries a port to reconcile routing against. */
+  hasPort: boolean;
+  /**
+   * Whether the runtime's own reported port for this (running) app differs
+   * from the persisted AppConfig.port. A skip trusts config.port to
+   * reconcile routing — if the two disagree, routing the app's hostname to
+   * config.port would point it at whatever else is actually bound there.
+   */
+  portDrifted: boolean;
+  /**
+   * Monorepo group tag (AppConfig.group), or undefined for a standalone app.
+   * A grouped app's container is never seeded (it has no AppConfig of its
+   * own — see the plan's monorepo limitation) and so still fires its own
+   * app:detected on boot, which unconditionally re-copies and rebuilds every
+   * child via expandMonorepo — a routing-only skip here would be clobbered
+   * moments later. Never skip a grouped app.
+   */
+  group: string | undefined;
+  /**
+   * Count of admin-granted control-plane API scopes (AppConfig.grantedApiScopes).
+   * DROP_API_KEY is minted fresh (and the previous key deleted) only inside
+   * buildStartSpec, which a skip never calls — skipping an app with a
+   * non-empty grant would leave a scoped key valid indefinitely and break
+   * the revocation repair PUT /apps/:name/capabilities depends on.
+   */
+  grantedApiScopesCount: number;
+  /**
+   * Whether AppConfig.runtimeSpecFingerprint matches
+   * containerPolicyFingerprint() computed right now (M1 review item 4,
+   * round-2 diff pass — see container-config.ts). Checked for every app
+   * regardless of isolation mode: several of the fingerprinted inputs
+   * (apiPort, maxMemoryMbPerApp, maxCpusPerApp) affect a PM2 app's
+   * env/max_memory_restart just as much as a container's spec, so gating
+   * this to docker-only (the original design) meant an operator raising
+   * DROP_MAX_MEMORY_MB_PER_APP or changing the API port never reached an
+   * already-running PM2 app either. The docker-only constants in the
+   * fingerprint (CAP_DROP, SECURITY_OPT, ...) are static under PM2 and never
+   * cause a mismatch there on their own.
+   */
+  runtimeSpecCurrent: boolean;
+}
+
+/**
+ * The expensive half of the skip predicate — only reached when the cheap
+ * gate above is undecided. Requires a filesystem walk (currentSignature) and
+ * a secret-store read (secretFingerprintChanged), which reconcileAppsOnBoot
+ * defers until it knows they're actually needed.
+ */
+export interface SignatureBootReconcileInput {
+  /** Source signature hash recorded at the app's last deploy (AppConfig.sourceHash), or undefined if never recorded. */
+  recordedHash: string | undefined;
+  /** Signature computed right now, or undefined when the scan failed (missing app dir, read error, over a scan bound, ...). */
+  currentSignature: SourceSignature | undefined;
+  /**
+   * Whether the app's CURRENT secret key/value set differs from the
+   * fingerprint recorded at its last deploy (AppConfig.secretFingerprint —
+   * see DropPlatform.hasSecretFingerprintChanged). `PUT`/`DELETE
+   * /api/v1/secrets/:name` has no restart hook, so the next start is the
+   * only apply point; skipping would leave a revoked secret live forever.
+   */
+  secretFingerprintChanged: boolean;
+}
+
+export type BootReconcileInput = CheapBootReconcileInput & SignatureBootReconcileInput;
+
+/**
+ * The cheap phase of the boot-reconciliation verdict — see
+ * docs/plans/2026-07-25-restart-isolation-and-marketing-split.md M1. Pure and
+ * side-effect-free. Returns `null` when undecided, meaning the caller must
+ * proceed to the (expensive) signature phase; every non-null return is
+ * final — the signature is never even computed.
+ */
+export function decideBootReconciliationCheap(
+  input: CheapBootReconcileInput
+): BootReconcileDecision | null {
+  const { status, isRuntimeRunning, hasPort, portDrifted, group, grantedApiScopesCount, runtimeSpecCurrent } =
+    input;
+
+  // A user-stopped app is deliberately not running — leave it alone exactly
+  // like the normal app:detected path does today (handleAppDetected gates on
+  // status !== 'stopped' before ever calling handleBuildApp). Redeploying (or
+  // even route-reconciling) it here would resurrect an app the user stopped.
+  if (status === 'stopped') {
+    return { action: 'leave', reason: 'app is stopped' };
+  }
+
+  if (group) {
+    return { action: 'redeploy', reason: `app belongs to monorepo group '${group}'` };
+  }
+
+  // Allowlist, not a denylist: only a CONFIRMED-running app may be skipped.
+  // 'pending'/'starting'/'building'/undefined all fall through here too — a
+  // platform killed inside awaitReadiness persists 'starting' with a live
+  // process and a matching signature, and would otherwise be silently
+  // adopted as skip-worthy despite never proving it was ready. This also
+  // folds in the previous denylist (errored/needs-config/crash-looping):
+  // none of those is 'running', so all redeploy via this one check.
+  if (status !== 'running') {
+    return { action: 'redeploy', reason: `status is ${status ?? 'unknown'}, not running` };
+  }
+
+  if (!isRuntimeRunning) {
+    return { action: 'redeploy', reason: 'runtime does not report the app running' };
+  }
+
+  if (!hasPort) {
+    return { action: 'redeploy', reason: 'no persisted port to reconcile routing against' };
+  }
+
+  if (portDrifted) {
+    return {
+      action: 'redeploy',
+      reason: 'runtime-reported port differs from the persisted port',
+    };
+  }
+
+  if (grantedApiScopesCount > 0) {
+    return { action: 'redeploy', reason: 'app holds granted API scopes — DROP_API_KEY must rotate on start' };
+  }
+
+  if (!runtimeSpecCurrent) {
+    return { action: 'redeploy', reason: 'runtime spec revision is stale' };
+  }
+
+  return null; // undecided — proceed to the signature phase
+}
+
+/**
+ * The signature phase of the boot-reconciliation verdict — only reached when
+ * decideBootReconciliationCheap returns null. Still pure/side-effect-free;
+ * the I/O (the scan, the secret read) happens in the caller, before this is
+ * invoked.
+ */
+export function decideBootReconciliationSignature(
+  input: SignatureBootReconcileInput
+): BootReconcileDecision {
+  const { recordedHash, currentSignature, secretFingerprintChanged } = input;
+
+  if (recordedHash === undefined) {
+    return { action: 'redeploy', reason: 'no recorded source signature' };
+  }
+
+  if (!currentSignature) {
+    return { action: 'redeploy', reason: 'source signature computation failed' };
+  }
+
+  if (currentSignature.hash !== recordedHash) {
+    // Any difference redeploys. A hash has no notion of "before/after" the
+    // way a raw mtime did — there's no "newer"/"older" direction to report
+    // any more, only "changed or not" — but that's strictly stronger: the
+    // old max-mtime-only signal missed a deletion/rename that didn't touch
+    // the single newest file, and missed a replaced file whose (tar/upload-
+    // archived) mtime happened to land below the tree's existing max. This
+    // hashes every (relativePath, mtimeMs, size) tuple, so any addition,
+    // deletion, rename, or in-place edit anywhere in the tree changes it.
+    return {
+      action: 'redeploy',
+      reason:
+        'source changed (hash mismatch, ' +
+        // JSON.stringify, not raw interpolation: under isolation 'none' a
+        // tenant controls their own filenames and could otherwise forge a
+        // fake log line via a crafted path (control chars, embedded newlines).
+        `newest: ${JSON.stringify(currentSignature.newestPath)})`,
+    };
+  }
+
+  if (secretFingerprintChanged) {
+    return { action: 'redeploy', reason: 'secret set changed since last deploy' };
+  }
+
+  return { action: 'skip', reason: 'signature unchanged' };
+}
+
+/**
+ * Full boot-reconciliation verdict for one already-known (persisted-config)
+ * app — runs both phases unconditionally. This is the entry point used by
+ * unit tests that exercise the whole matrix in one call; reconcileAppsOnBoot
+ * itself calls the two phases separately so it can skip the expensive one
+ * (see decideBootReconciliationCheap's doc comment).
+ *
+ * The governing failure mode is silent staleness: a wrong 'skip' leaves an
+ * app serving old code with no error and nothing to notice, which is worse
+ * than today's rebuild-everything behaviour. Every ambiguous case therefore
+ * redeploys; 'skip' is returned only for the single narrow case of a known,
+ * non-grouped, unscoped app under a current runtime spec that the runtime
+ * reports running right now, with a port to reconcile, an unchanged source
+ * signature, and an unchanged secret set.
+ */
+export function decideBootReconciliation(input: BootReconcileInput): BootReconcileDecision {
+  return decideBootReconciliationCheap(input) ?? decideBootReconciliationSignature(input);
+}
 
 export class DropPlatform {
   private readonly config: PlatformConfig;
@@ -264,13 +629,47 @@ export class DropPlatform {
   private apiServer: ApiServer | null = null;
   private buildLogService: BuildLogService | null = null;
   private logRetention: LogRetentionService | null = null;
+  /** Periodic per-app disk accounting (Step 8c). */
+  private diskSweepTimer: NodeJS.Timeout | null = null;
+  /** Idle-reaper sweep (Step 9). */
+  private idleSweepTimer: NodeJS.Timeout | null = null;
+  private readonly idleState: IdleSweepState = createIdleSweepState();
+  /**
+   * app name -> sweeps in which it was a reap candidate and was only logged.
+   *
+   * Per app, not per sweep and not per process: this is what guarantees that
+   * EVERY deletion is preceded by `DROP_IDLE_REAP_DRY_RUNS` logged warnings
+   * naming that app, rather than the budget being spent by whichever app
+   * happened to qualify first.
+   */
+  private readonly idleDryRuns = new Map<string, number>();
 
   private subscriptions: Unsubscribe[] = [];
   // Held separately from `subscriptions`: must stay subscribed through
   // drainInProgress() in stop() so late-completing deploys still close out
   // (see the drain-window fix in docs/plans/2026-07-06-p2-4-deploy-observability.md).
   private deployTrackerUnsub?: Unsubscribe;
+  private deployDetailUnsub?: Unsubscribe;
+  /**
+   * appName -> the guardrail key this deploy was admitted under.
+   *
+   * Held so the OUTCOME is recorded against the same key the gate checked. The
+   * principal is known only where the deploy was triggered, and the success or
+   * failure surfaces much later in a different handler — recomputing the key
+   * there would silently key automation-triggered outcomes differently from the
+   * gate that let them through, so the window would never close.
+   */
+  private readonly breakerKeys: Map<string, GuardrailKey[]> = new Map();
   private isRunning = false;
+  // Snapshot of each app's persisted status, taken in initializeServices
+  // BEFORE syncStateWithConfigs/syncStateWithProcesses run — both reconcile
+  // status against the live runtime and can overwrite 'errored'/'needs-config'/
+  // 'crash-looping' with 'running' for an app whose (broken) process the
+  // runtime still reports as up. reconcileAppsOnBoot (M1) reads status from
+  // here, not post-sync, so its always-redeploy rule for those statuses is
+  // reachable for the exact case it exists for. Cleared after boot
+  // reconciliation runs so it can't leak into a later start() on this instance.
+  private bootStatusSnapshot: Map<string, AppStatus> | null = null;
   private usedPorts: Map<number, string> = new Map(); // port -> appName ownership
   private appsInProgress: Set<string> = new Set(); // Track apps being built/started
   // Builds deferred because the concurrent-build cap was full (appName -> its
@@ -279,7 +678,8 @@ export class DropPlatform {
   // holds a build slot for a while — and without a drain those deferred builds
   // wait for a file change that may never come, so a static/other app "never
   // starts automatically". `drainPendingBuilds` retries them as slots free.
-  private pendingBuilds: Map<string, { appPath: string; appType: string }> = new Map();
+  private pendingBuilds: Map<string, { appPath: string; appType: string; actor?: DeployActorInfo }> =
+    new Map();
   private buildDrainTimer: ReturnType<typeof setTimeout> | null = null;
   private appDeployTimes: Map<string, number> = new Map(); // Track when apps were last deployed
   // Apps whose rebuild+restart is being managed as a single transaction by
@@ -389,6 +789,20 @@ export class DropPlatform {
         this.config.logRetentionDays
       );
       this.logRetention.start();
+      this.startDiskCeilingSweep();
+      this.startIdleReaper();
+
+      // Anchor the deploy quota under DROP_ROOT. Its fallback path is relative
+      // and would resolve against whatever CWD `drop serve` was launched from,
+      // scattering the store — and silently handing every caller a fresh
+      // allowance whenever the service is started from a different directory.
+      const quotaStore = path.join(
+        this.config.dropRoot,
+        'data',
+        'drop-svc',
+        'principal-quotas.json'
+      );
+      await getPrincipalQuota(quotaStore).initialize();
 
       // Initialize services
       await this.initializeServices();
@@ -401,6 +815,18 @@ export class DropPlatform {
 
       // Wire up event handlers
       this.setupEventHandlers();
+
+      // M1 boot reconciliation (DROP_BOOT_RECONCILE): decide skip vs redeploy
+      // per known app BEFORE the watcher starts, so a stable app's own
+      // initial scan never fabricates an app:detected for it. No-op unless
+      // the flag is set — see reconcileAppsOnBoot. 'observe' is deferred
+      // below (M1 review item 9, round-2 diff pass): it never seeds the
+      // watcher or gates anything (pure logging), so running it here would
+      // needlessly delay the watcher/API server coming up for a mode whose
+      // entire purpose is passive measurement.
+      if (this.config.bootReconcileMode !== 'observe') {
+        await this.reconcileAppsOnBoot();
+      }
 
       // Start watching for apps
       if (this.watcher) {
@@ -415,6 +841,13 @@ export class DropPlatform {
       // Start certificate expiry monitoring if HTTPS is enabled
       if (this.config.enableHttps && !isLocalhostDomain(this.config.domainSuffix || 'localhost')) {
         this.startCertificateMonitoring();
+      }
+
+      // 'observe' mode's boot reconciliation pass, deferred (see above) —
+      // fire-and-forget: it only logs, never seeds/gates, and must not delay
+      // `platform:started` for the rest of the fleet.
+      if (this.config.bootReconcileMode === 'observe') {
+        void this.reconcileAppsOnBoot();
       }
 
       this.isRunning = true;
@@ -447,6 +880,15 @@ export class DropPlatform {
       this.buildDrainTimer = null;
     }
     this.pendingBuilds.clear();
+
+    if (this.diskSweepTimer) {
+      clearInterval(this.diskSweepTimer);
+      this.diskSweepTimer = null;
+    }
+    if (this.idleSweepTimer) {
+      clearInterval(this.idleSweepTimer);
+      this.idleSweepTimer = null;
+    }
 
     // Stop the log-retention sweep
     if (this.logRetention) {
@@ -485,12 +927,6 @@ export class DropPlatform {
     if (this.stateManager) {
       await this.stateManager.close();
       resetStateManager();
-    }
-
-    // Close settings manager
-    if (this.settingsManager) {
-      await this.settingsManager.close();
-      resetSettingsManager();
     }
 
     // Reset app config service
@@ -555,17 +991,47 @@ export class DropPlatform {
       this.deployTrackerUnsub();
       this.deployTrackerUnsub = undefined;
     }
+    if (this.deployDetailUnsub) {
+      this.deployDetailUnsub();
+      this.deployDetailUnsub = undefined;
+    }
     try {
       await getDeployTracker().flush();
     } catch {
       // best-effort
     }
     resetDeployTracker();
+    try {
+      await getDeployDetailStore().flush();
+    } catch {
+      // best-effort
+    }
+    resetDeployDetailStore();
+    this.breakerKeys.clear();
+    resetDeployBreaker();
+    resetPrincipalQuota();
 
     // Stop API server
     if (this.apiServer) {
       await this.apiServer.stop();
       this.apiServer = null;
+    }
+
+    // Close settings manager — AFTER the API server, deliberately.
+    //
+    // This used to sit up with the state-manager resets, ~90 lines earlier,
+    // which left a multi-second window (Postgres and Redis shutdown, then
+    // Caddy) during which the API was still serving requests while the
+    // singleton had been reset. `getSettingsManager()` self-defaults rather
+    // than throwing, so a caller in that window got a FRESH manager with
+    // empty settings and `corrupt = false` — meaning
+    // `getUserConnectorsEnabled()` returned its `?? true` default and the
+    // connector gate silently FAILED OPEN while Caddy was still routing to
+    // us. Every push to `develop` restarts this service, so that window
+    // opened on every deploy. Torn down last, after its last consumer.
+    if (this.settingsManager) {
+      await this.settingsManager.close();
+      resetSettingsManager();
     }
 
     this.isRunning = false;
@@ -1032,6 +1498,29 @@ backup:
     await deployTracker.initialize();
     this.deployTrackerUnsub = deployTracker.subscribe(this.eventBus);
 
+    // Per-deploy diagnostics, alongside the tracker's milestone rows. Same
+    // lifetime and the same held-separately unsubscribe, so a deploy failing
+    // during the shutdown drain still records why.
+    const detailStorePath = path.join(
+      this.config.dropRoot,
+      'data',
+      'drop-svc',
+      'deploy-details.json'
+    );
+    const deployDetails = getDeployDetailStore(detailStorePath);
+    await deployDetails.initialize();
+    this.deployDetailUnsub = deployDetails.subscribe(this.eventBus);
+
+    // Snapshot pre-sync status for reconcileAppsOnBoot (M1) — see
+    // bootStatusSnapshot's doc comment. Must be taken before the very first
+    // reconciling call below. Gated on the mode so 'off' (default) stays a
+    // true no-op — no scan, no seeding, no logs, not even this Map build.
+    if (this.stateManager && this.config.bootReconcileMode !== 'off') {
+      this.bootStatusSnapshot = new Map(
+        this.stateManager.getAllApps().map((a) => [a.name, a.status])
+      );
+    }
+
     // Sync state manager with app configs (configs are source of truth for ports)
     await this.syncStateWithConfigs();
 
@@ -1104,9 +1593,14 @@ backup:
     // Initialize watcher (watches apps directory).
     // isAppLocked tells the watcher to silently drop rebuild events while a
     // deploy is in flight — important for Docker builds that can take minutes.
+    // No ignorePatterns override here: createWatcherConfig MERGES overrides
+    // with DEFAULT_IGNORE_PATTERNS rather than replacing it, and
+    // node_modules/.git/dist/build are already in that default set — a
+    // hardcoded duplicate here was a no-op that undermined
+    // DEFAULT_IGNORE_PATTERNS as the single source of truth (see
+    // BOOT_RECONCILE_IGNORE_DIRS above, which derives from it).
     this.watcher = new WatcherService({
       appsDir: this.config.appsDirectory,
-      ignorePatterns: ['**/node_modules/**', '**/.git/**', '**/dist/**', '**/build/**'],
       debounceMs: 1000,
       maxDepth: 2,
       isAppLocked: (name) => this.appsInProgress.has(name),
@@ -1146,7 +1640,9 @@ backup:
     setPlatformOps({
       restartApp: (name) => this.restartApp(name),
       isAppInProgress: (name) => this.appsInProgress.has(name),
+      promoteApp: (name) => this.promoteApp(name),
       removeGroup: (name) => this.removeGroup(name),
+      purgeAppArtifacts: (name, opts) => this.purgeAppArtifacts(name, opts),
     });
 
     this.logger.info(`API server running on port ${this.config.apiPort}`, 'API');
@@ -1262,6 +1758,574 @@ backup:
     }
   }
 
+  /**
+   * Source-tree signature across an app's source tree, skipping
+   * BOOT_RECONCILE_IGNORE_DIRS — the signature phase of boot reconciliation
+   * (M1) compares the returned hash against AppConfig.sourceHash. Throws
+   * (ENOENT, permission error, over a scan bound, ...) when appPath is
+   * missing/unreadable/too large; callers must treat that as "redeploy",
+   * never swallow it into a false "unchanged".
+   *
+   * M1 review item 2 (round-2 diff pass): hashes the sorted
+   * (relativePath, mtimeMs, size) tuple of every file/dir, not just the
+   * single newest mtime — a max-mtime-only signal missed a deletion/rename
+   * that didn't touch whichever file held the max, and missed a replaced
+   * file whose (tar/upload-archived) mtime happened to land below it. Git
+   * clone and the monorepo copy always write fresh mtimes, so they were
+   * never at risk; the tar/upload path — the whole reason mtime-to-mtime was
+   * chosen over lastDeployedAt in the first place — was.
+   *
+   * Bounded on depth, entry count, and wall-clock time (M1 review item F):
+   * under isolation 'none' a tenant controls their own app directory and
+   * this runs serially per app inside start(), before the API server comes
+   * up — an unbounded walk would let one huge/deep tree hold platform
+   * startup hostage. Each bound throws a DISTINCT message (not a generic
+   * catch-all) so reconcileAppsOnBoot's logs can tell "app dir deleted"
+   * apart from "tree too big to scan" — both still redeploy either way, but
+   * only one of them is actionable by an operator reading the boot log.
+   */
+  private async computeSourceMtimeMs(appPath: string): Promise<SourceSignature> {
+    const deadline = Date.now() + BOOT_RECONCILE_SCAN_TIMEOUT_MS;
+    let entriesVisited = 0;
+
+    const rootStat = await fs.stat(appPath);
+    let newestMtimeMs = rootStat.mtimeMs;
+    let newestPath = '.';
+    // (relativePath, mtimeMs, size) per entry — the actual signature. The
+    // root itself is included so a bare touch of the app dir (no children
+    // changed) still registers.
+    const entries: Array<[string, number, number]> = [['.', rootStat.mtimeMs, rootStat.size]];
+
+    const walk = async (dir: string, depth: number): Promise<void> => {
+      if (depth > BOOT_RECONCILE_SCAN_MAX_DEPTH) {
+        throw new Error(`boot-reconcile scan exceeded depth cap (${BOOT_RECONCILE_SCAN_MAX_DEPTH})`);
+      }
+      // Checked between awaits (readdir/lstat), not preemptively — a single
+      // slow syscall can still overrun this, which is an accepted tradeoff:
+      // the bound exists to stop an unbounded WALK, not to guarantee a hard
+      // wall-clock ceiling.
+      if (Date.now() > deadline) {
+        throw new Error(`boot-reconcile scan exceeded timeout (${BOOT_RECONCILE_SCAN_TIMEOUT_MS}ms)`);
+      }
+
+      const dirEntries = await fs.readdir(dir, { withFileTypes: true });
+      for (const entry of dirEntries) {
+        if (BOOT_RECONCILE_IGNORE_DIRS.has(entry.name)) continue;
+
+        entriesVisited++;
+        if (entriesVisited > BOOT_RECONCILE_SCAN_MAX_ENTRIES) {
+          throw new Error(`boot-reconcile scan exceeded entry cap (${BOOT_RECONCILE_SCAN_MAX_ENTRIES})`);
+        }
+
+        const full = path.join(dir, entry.name);
+        const stat = await fs.lstat(full);
+        const relative = path.relative(appPath, full);
+        entries.push([relative, stat.mtimeMs, stat.size]);
+        if (stat.mtimeMs > newestMtimeMs) {
+          newestMtimeMs = stat.mtimeMs;
+          newestPath = relative;
+        }
+        if (entry.isDirectory()) {
+          await walk(full, depth + 1);
+        }
+      }
+    };
+    await walk(appPath, 0);
+
+    // Sorted for determinism — readdir's order is not guaranteed to be
+    // stable across calls/platforms, and an unsorted hash would flag a
+    // no-op re-scan as "changed".
+    entries.sort((a, b) => a[0].localeCompare(b[0]));
+    const hash = crypto.createHash('sha256').update(JSON.stringify(entries)).digest('hex');
+
+    return { hash, newestPath };
+  }
+
+  /**
+   * Whether the app's current secret set differs from the fingerprint
+   * recorded at its last deploy (AppConfig.secretFingerprint). Delegates to
+   * SecretManager.fingerprint (M1 review item 5, round-2 diff pass — hashes
+   * each key with its STORED CIPHERTEXT, never a decrypted value, so no
+   * plaintext ever crosses into AppConfig, a much weaker boundary — a 0644
+   * YAML file — than the secrets store's own 0600 encrypted JSON). An
+   * unavailable secretManager counts as changed — fail toward redeploying
+   * rather than assume "unchanged" from a comparison we can't actually make,
+   * the same doctrine as every other ambiguous signal in
+   * decideBootReconciliation.
+   */
+  private hasSecretFingerprintChanged(config: AppConfig): boolean {
+    if (!this.secretManager) return true;
+    const current = this.secretManager.fingerprint(config.name);
+    return current !== config.secretFingerprint;
+  }
+
+  /**
+   * Record the source-mtime signature, secret-set fingerprint, and current
+   * runtime-spec revision observed at THIS successful deploy — read back by
+   * reconcileAppsOnBoot (M1) on the NEXT boot to decide skip vs redeploy.
+   * Called from every path that confirms a real process/container is up
+   * (handleStartApp after readiness succeeds, handleAppUpdate and
+   * restartApp after runtime.start() succeeds — neither of those two gates
+   * on readiness today, so "runtime.start() succeeded" is their equivalent
+   * success point). A git/upload redeploy that never recorded here would
+   * look "unchanged" for a whole extra boot cycle before the fresh state was
+   * ever compared against.
+   *
+   * Deliberately NEVER awaited by its callers (`void this.recordDeploySignature(...)`)
+   * and never throws (every step, including the config write, is
+   * try/caught): this is pure post-success bookkeeping, not part of the
+   * deploy's own success/failure contract, and MUST NOT delay the
+   * 'running' state-manager write or appsInProgress's release — either
+   * would reopen a window between "runtime/state report the app up" and
+   * "the deploy is actually finished" that a concurrent caller (another
+   * restart, a readiness-polling test) can race into. Best-effort in the
+   * fullest sense: on any failure the field is just left unrecorded, which
+   * reconcileAppsOnBoot already treats as "redeploy" next time (fail toward
+   * redeploying), same as any other ambiguous case. Still logically "after
+   * the app is confirmed up" per its call sites — capturing it earlier would
+   * race the app's own startup writes into its tree (migrations, generated
+   * files, first-run bootstrapping) and make skip/redeploy nondeterministic.
+   */
+  private async recordDeploySignature(appName: string, appPath: string): Promise<void> {
+    try {
+      if (!this.appConfigService) return;
+
+      let sourceHash: string | undefined;
+      try {
+        sourceHash = (await this.computeSourceMtimeMs(appPath)).hash;
+      } catch {
+        sourceHash = undefined;
+      }
+
+      const secretFingerprint = this.secretManager?.fingerprint(appName);
+
+      await this.appConfigService.updateConfig(appName, {
+        ...(sourceHash !== undefined ? { sourceHash } : {}),
+        ...(secretFingerprint !== undefined ? { secretFingerprint } : {}),
+        runtimeSpecFingerprint: containerPolicyFingerprint({
+          apiPort: this.config.apiPort,
+          maxMemoryMbPerApp: this.config.maxMemoryMbPerApp,
+          maxCpusPerApp: this.config.maxCpusPerApp,
+          // DROP-072: same gating as the actual mount/env-var call sites
+          // (buildStartSpec) — undefined outside docker isolation.
+          pgSocketDir:
+            this.config.isolation === 'docker'
+              ? (this.postgresServer?.getSocketDir() ?? undefined)
+              : undefined,
+        }),
+      });
+    } catch (error) {
+      this.logger.warn(`Failed to record deploy signature for ${appName}`, 'BOOT', error);
+    }
+  }
+
+  /**
+   * M1 boot reconciliation (DROP_BOOT_RECONCILE). Runs once at startup,
+   * AFTER setupEventHandlers (the app:detected subscriber the redeploy path
+   * publishes to must already exist) and AFTER runFirstBootMigration (docker
+   * mode's runtime status must reflect the migration). Modes 'off' and 'on'
+   * run BEFORE watcher.start() — the watcher's own initial scan would
+   * otherwise fabricate app:detected for every existing app dir against its
+   * empty in-memory knownApps set. Mode 'observe' is the one exception
+   * (M1 review item 9, round-2 diff pass): it never seeds the watcher or
+   * gates anything, so `start()` defers and fire-and-forgets it until AFTER
+   * watcher.start()/startApiServer() — running it before either needlessly
+   * delayed boot for a mode whose entire purpose is passive measurement. See
+   * docs/plans/2026-07-25-restart-isolation-and-marketing-split.md M1.
+   *
+   * 'off' (default) is a pure no-op: no scan, no seeding, no logs — today's
+   * behaviour, byte-for-byte. 'observe' computes and logs the decision it
+   * would make per app without seeding the watcher or acting on it, so the
+   * normal app:detected pipeline still runs unchanged. 'on' seeds the
+   * watcher's knownApps from persisted config (suppressing its fabricated
+   * detection) and acts: 'skip' reconciles routing only (handleConfigureRoute
+   * — no detect/install/build/runtime.start) and re-arms the health prober +
+   * crash-loop watch (armPostDeployWatches) so a left-running app is
+   * supervised exactly like a freshly deployed one, 'redeploy' publishes
+   * app:detected (the SAME event and subscriber a real watcher-driven
+   * detection uses) so the monorepo services: interception and the
+   * isCloning/isUploading/autoBuild guards all apply exactly once, in their
+   * one normal place — fire-and-forget, the same way the watcher's own
+   * dispatch is fire-and-forget (EventBus.publish never awaits its
+   * subscribers), so a rebuilding app never blocks the rest of startup.
+   *
+   * The cheap half of the predicate (status/running/port/group/scopes/spec)
+   * is checked before the expensive half (source-mtime walk, secret
+   * fingerprint, item-1 readiness probe) so an app that's already decidable
+   * costs no I/O. The whole DECIDE half (decideOneAppOnBoot) runs with
+   * bounded concurrency across apps (M1 review item 9); the ACT half
+   * (markAppKnown/routing/watches/publish) stays serial, in original config
+   * order, so nothing here introduces new concurrent access to shared
+   * platform state (see decideOneAppOnBoot's and reconcileAppsOnBoot's
+   * internal comments). Every per-app decision AND act step is independently
+   * try/caught: an unexpected failure anywhere redeploys just that one app
+   * rather than aborting reconciliation for the rest of the fleet.
+   */
+  private async reconcileAppsOnBoot(): Promise<void> {
+    const mode = this.config.bootReconcileMode;
+    if (mode === 'off') {
+      this.bootStatusSnapshot = null;
+      return;
+    }
+    if (!this.appConfigService || !this.stateManager || !this.runtime || !this.watcher) {
+      this.bootStatusSnapshot = null;
+      return;
+    }
+
+    const configs = this.appConfigService.getAllConfigs();
+    if (configs.length === 0) {
+      this.bootStatusSnapshot = null;
+      return;
+    }
+
+    let runningByName: Map<string, AppProcessInfo>;
+    try {
+      const processes = await this.runtime.getAllStatus();
+      runningByName = new Map(
+        processes.filter((p) => p.status === 'running').map((p) => [p.name, p])
+      );
+    } catch (error) {
+      // Can't tell what's actually running — fail toward today's behaviour
+      // (leave the watcher to fabricate app:detected as usual) rather than
+      // guess and possibly skip a genuinely-dead app.
+      this.logger.warn('Boot reconcile: failed to read runtime status, skipping', 'BOOT', error);
+      this.bootStatusSnapshot = null;
+      return;
+    }
+
+    // M1 review item 9 (round-2 diff pass): the DECIDE half of each app's
+    // reconciliation (the source-tree walk, up to 5s, plus — for a skip
+    // candidate — the readiness probe, up to ~4s) is the expensive part and
+    // reads no shared platform state, so it runs with BOUNDED CONCURRENCY
+    // (4 workers) rather than fully serially — on a large fleet that's the
+    // difference between "boot takes minutes" and "boot takes seconds". The
+    // ACT half (markAppKnown, handleConfigureRoute, armPostDeployWatches,
+    // eventBus.publish) stays SERIAL, in original config order, run only
+    // after every decision is in: RouterService.addRoute's regenerateConfig
+    // reads the full routes map and writes the WHOLE Caddyfile per call —
+    // two concurrent writes for different apps race on which one lands
+    // last, and the loser's route silently disappears from disk. Splitting
+    // decide/act avoids that without touching RouterService's own locking
+    // (out of scope here).
+    //
+    // Deliberately NO global deadline for the whole pass: an app "not yet
+    // reached" under a deadline would get no markAppKnown and no
+    // app:detected — and since item 6 replaced the watcher's boot-epoch with
+    // chokidar's own `ignoreInitial: true`, nothing else would ever detect
+    // it either. The per-app 5s scan bound (item F) already caps the
+    // pathological single-app case; bounding the WHOLE pass has no
+    // fail-safe fallback to bound toward.
+    const decisions = await this.mapWithConcurrency(
+      configs,
+      BOOT_RECONCILE_CONCURRENCY,
+      (config) => this.decideOneAppOnBoot(config, this.bootStatusSnapshot, runningByName)
+    );
+
+    // Batches the Caddy reload (M1 review item G): a skip's route is added
+    // via router.addRoute (which writes/regenerates the Caddyfile on its
+    // own), but the actual `caddy reload` is deferred to ONE call after every
+    // app in this pass has been decided — N skipped apps cost one reload,
+    // not N serialized ones on the boot path.
+    let anySkipped = false;
+
+    for (const result of decisions) {
+      const { config, appPath } = result;
+
+      if (result.kind === 'group') {
+        // A group child's BUILD belongs to its container. Its ROUTING does not.
+        //
+        // Deferring both left a running child with no Caddy route whenever the
+        // container's expansion then failed — and because a group's children
+        // share ONE hostname, that took the entire host out of Caddy: no site
+        // block, so no certificate served and the TLS handshake refused
+        // outright. Observed on dropkit.sh, where `ezsign.dropkit.sh` was
+        // unreachable for hours while every other subdomain served fine and the
+        // frontend process was alive the whole time. The trigger that day was
+        // the group-ownership guard throwing (DROP-128), but any expansion
+        // failure does it: a guardrail refusal, a full build queue, a parse
+        // error. The blast radius is the worst part — one child's problem takes
+        // down the healthy sibling too.
+        //
+        // So routing is reconciled here regardless, from the config that is
+        // already the source of truth for ports.
+        //
+        // Only for a child the RUNTIME reports running: pointing Caddy at a
+        // dead port would trade "host missing" for "502 on every path of a
+        // shared host", and a deliberately-stopped child must not be published.
+        const port = config.port;
+        if (mode === 'on' && typeof port === 'number' && runningByName.has(config.name)) {
+          await this.handleConfigureRoute(config.name, port, { skipCaddyReload: true });
+          // Joins the same batched reload the skip branch below uses.
+          anySkipped = true;
+          this.logger.info(
+            `Boot reconcile: group child '${config.name}' routing reconciled — ` +
+              `build left to its container`,
+            'BOOT'
+          );
+        } else {
+          this.logger.info(
+            `Boot reconcile: leaving group child '${config.name}' to its container's own detection`,
+            'BOOT'
+          );
+        }
+        continue;
+      }
+
+      if (result.kind === 'error') {
+        if (mode === 'observe') {
+          this.logger.info(`Boot reconcile (observe): would redeploy '${config.name}' — ${result.reason}`, 'BOOT');
+          continue;
+        }
+        this.logger.warn(`Boot reconcile: '${config.name}' errored during decision, redeploying`, 'BOOT', result.error);
+        this.watcher.markAppKnown(config.name);
+        this.eventBus.publish('app:detected', { name: config.name, path: appPath, type: undefined });
+        continue;
+      }
+
+      // result.kind === 'decided'
+      const { decision, scanned, healthCheckPath } = result;
+
+      if (mode === 'observe') {
+        // "(no scan)" makes clear the source/secret comparison never ran —
+        // without it the M0 measurement can't tell "didn't scan" (cheap
+        // gate decided) from "scanned and matched" (signature phase ran).
+        this.logger.info(
+          `Boot reconcile (observe): would ${decision.action} '${config.name}' — ${decision.reason}` +
+            (scanned ? '' : ' (no scan)'),
+          'BOOT'
+        );
+        continue;
+      }
+
+      let published = false; // guards the catch block against a double-publish
+      try {
+        // mode === 'on': suppress the watcher's own fabricated detection for
+        // this app regardless of the verdict below — we're handling it here.
+        this.watcher.markAppKnown(config.name);
+
+        if (decision.action === 'leave') {
+          this.logger.info(`Boot reconcile: leaving '${config.name}' alone — ${decision.reason}`, 'BOOT');
+        } else if (decision.action === 'skip') {
+          this.logger.info(`Boot reconcile: '${config.name}' unchanged — reconciling routing only`, 'BOOT');
+          const port = config.port as number;
+          await this.handleConfigureRoute(config.name, port, { skipCaddyReload: true });
+          anySkipped = true;
+          // Re-arm the same supervision a fresh deploy gets (health prober +
+          // crash-loop watch): this app is being left running, UNattended,
+          // for the rest of the process's life, and the watches from its
+          // ORIGINAL deploy (this platform process, if any) do not survive a
+          // restart — without this, a skip would silently stop noticing a
+          // dead or crash-looping app until the next full redeploy.
+          // healthCheckPath was already parsed during the decide phase (as
+          // part of the item 1 readiness probe) — reused here instead of
+          // re-parsing drop.yaml.
+          this.armPostDeployWatches(config.name, port, healthCheckPath);
+        } else {
+          this.logger.info(`Boot reconcile: redeploying '${config.name}' — ${decision.reason}`, 'BOOT');
+          // Publish, don't call handleBuildApp directly: this is the exact
+          // same event/subscriber a real watcher-driven detection uses, so
+          // the monorepo services: interception and the
+          // isCloning/isUploading/autoBuild guards inside handleAppDetected
+          // all apply automatically instead of being bypassed.
+          published = true;
+          this.eventBus.publish('app:detected', { name: config.name, path: appPath, type: undefined });
+        }
+      } catch (error) {
+        // Any unexpected failure anywhere above must not strand this app OR
+        // abort reconciliation for the rest of the fleet — fail toward
+        // redeploying it, the same doctrine as every other ambiguous case.
+        this.logger.warn(`Boot reconcile: '${config.name}' errored acting on decision, redeploying`, 'BOOT', error);
+        this.watcher.markAppKnown(config.name);
+        if (!published) {
+          this.eventBus.publish('app:detected', { name: config.name, path: appPath, type: undefined });
+        }
+      }
+    }
+
+    if (anySkipped) {
+      await this.reloadCaddyIfRunning();
+    }
+
+    // One-shot: never read on a later start() of this same instance.
+    this.bootStatusSnapshot = null;
+  }
+
+  /**
+   * Bounded-concurrency map — runs `mapper` over `items` with at most
+   * `limit` in flight at once, preserving result order (M1 review item 9,
+   * round-2 diff pass). A plain worker pool: each of `limit` workers pulls
+   * the next unclaimed index until the queue is empty.
+   */
+  private async mapWithConcurrency<T, R>(
+    items: T[],
+    limit: number,
+    mapper: (item: T, index: number) => Promise<R>
+  ): Promise<R[]> {
+    const results: R[] = new Array(items.length);
+    let nextIndex = 0;
+    const workerCount = Math.max(1, Math.min(limit, items.length));
+    const workers = Array.from({ length: workerCount }, async () => {
+      for (;;) {
+        const i = nextIndex++;
+        if (i >= items.length) return;
+        results[i] = await mapper(items[i], i);
+      }
+    });
+    await Promise.all(workers);
+    return results;
+  }
+
+  /**
+   * The DECIDE half of one app's boot reconciliation — everything up to and
+   * including the item-1 readiness probe, but none of the platform-state
+   * mutation (markAppKnown, route configuration, watch arming, the
+   * app:detected publish). Side-effect-free enough to run concurrently
+   * across apps (M1 review item 9) — see reconcileAppsOnBoot's doc comment
+   * for why the ACT half stays serial. Never throws: any failure is
+   * captured into an `{ kind: 'error' }` result so one app's problem can't
+   * abort the whole batch.
+   */
+  private async decideOneAppOnBoot(
+    config: AppConfig,
+    bootStatusSnapshot: Map<string, AppStatus> | null,
+    runningByName: Map<string, AppProcessInfo>
+  ): Promise<
+    | { kind: 'group'; config: AppConfig; appPath: string }
+    | { kind: 'error'; config: AppConfig; appPath: string; reason: string; error: unknown }
+    | {
+        kind: 'decided';
+        config: AppConfig;
+        appPath: string;
+        decision: BootReconcileDecision;
+        scanned: boolean;
+        healthCheckPath: string | undefined;
+      }
+  > {
+    const appPath = config.path || path.join(this.config.appsDirectory, config.name);
+
+    try {
+      // M1 review item 3 (round-2 diff pass): a grouped child's fate is
+      // entirely the monorepo CONTAINER's — expandMonorepo re-copies +
+      // rebuilds EVERY child as one atomic fs.rm+fs.cp+build whenever the
+      // container's own (unrelated, never-seeded) app:detected fires.
+      // Treating the child itself as a reconcile candidate — even to
+      // "redeploy" it — publishes the CHILD's own app:detected seconds-to-
+      // minutes before the container's detection ever fires, so a build is
+      // already in flight when expandMonorepo's fs.rm/fs.cp lands under it.
+      // NEVER touch a grouped app here: no markAppKnown, no decision, no
+      // publish, in EITHER mode — checked before anything else (including
+      // the 'stopped' status below) so a user-stopped grouped child gets
+      // the identical true no-op, not the leave+markAppKnown branch a
+      // stopped standalone app takes.
+      if (config.group) {
+        return { kind: 'group', config, appPath };
+      }
+
+      if (!this.stateManager) {
+        throw new Error('state manager unavailable');
+      }
+
+      // Prefer the PRE-sync snapshot: syncStateWithConfigs/syncStateWithProcesses
+      // reconcile status against the live runtime and can overwrite
+      // 'errored'/'needs-config'/'crash-looping' with 'running' for an app
+      // whose broken process the runtime still reports as up (e.g. a failed
+      // readiness check never stops the process) — reading post-sync status
+      // here would make the always-redeploy rule for those statuses
+      // unreachable for exactly the case it exists for.
+      const status = bootStatusSnapshot?.get(config.name) ?? this.stateManager.getApp(config.name)?.status;
+      const runtimeProc = runningByName.get(config.name);
+      const isRuntimeRunning = runtimeProc !== undefined;
+      // M1 review item 4 (round-2 diff pass): isolation-agnostic — see
+      // CheapBootReconcileInput.runtimeSpecCurrent's doc comment.
+      const runtimeSpecCurrent =
+        config.runtimeSpecFingerprint ===
+        containerPolicyFingerprint({
+          apiPort: this.config.apiPort,
+          maxMemoryMbPerApp: this.config.maxMemoryMbPerApp,
+          maxCpusPerApp: this.config.maxCpusPerApp,
+          // DROP-072: same gating as the actual mount/env-var call sites
+          // (buildStartSpec) — undefined outside docker isolation.
+          pgSocketDir:
+            this.config.isolation === 'docker'
+              ? (this.postgresServer?.getSocketDir() ?? undefined)
+              : undefined,
+        });
+      // Port drift (M1 review item H): the skip path trusts config.port to
+      // reconcile routing, but the runtime's own report is right there —
+      // if they disagree, a routing-only skip would publish the app's
+      // hostname to whatever else is actually bound at config.port.
+      const portDrifted =
+        isRuntimeRunning &&
+        runtimeProc!.port !== null &&
+        config.port !== undefined &&
+        runtimeProc!.port !== config.port;
+
+      let decision = decideBootReconciliationCheap({
+        status,
+        isRuntimeRunning,
+        hasPort: Boolean(config.port),
+        portDrifted,
+        group: config.group,
+        grantedApiScopesCount: config.grantedApiScopes?.length ?? 0,
+        runtimeSpecCurrent,
+      });
+      let scanned = false;
+
+      if (!decision) {
+        scanned = true;
+        let currentSignature: SourceSignature | undefined;
+        try {
+          currentSignature = await this.computeSourceMtimeMs(appPath);
+        } catch (scanError) {
+          // Distinct log line (item F): "deleted" vs "too big to scan" are
+          // both a redeploy, but only one is actionable by an operator.
+          this.logger.warn(
+            `Boot reconcile: source scan failed for '${config.name}', redeploying`,
+            'BOOT',
+            scanError
+          );
+          currentSignature = undefined;
+        }
+
+        decision = decideBootReconciliationSignature({
+          recordedHash: config.sourceHash,
+          currentSignature,
+          secretFingerprintChanged: this.hasSecretFingerprintChanged(config),
+        });
+      }
+
+      // M1 review item 1 (round-2 diff pass, CRITICAL): the runtime
+      // reporting "running" only proves the OS considers the process/
+      // container alive — restartApp and handleAppUpdate write 'running'
+      // immediately after runtime.start() with NO readiness gate of their
+      // own, so a wedged app can carry status 'running' + a matching
+      // signature straight through to here. Before committing to skip,
+      // positively probe it — one bounded single-shot check (NOT the
+      // polling awaitReadiness, whose per-deploy 60s retry window would
+      // reintroduce the very boot-blocking item 9 exists to avoid).
+      // Probed in BOTH modes, not just 'on': observe's numbers must
+      // reflect exactly what 'on' would actually decide, not a rosier
+      // subset of it that never checked.
+      let healthCheckPath: string | undefined;
+      if (decision.action === 'skip') {
+        const dropYaml = await parseDropYaml(appPath);
+        healthCheckPath = dropYaml.success ? dropYaml.config?.healthCheck : undefined;
+        const answers = await this.probeSkipReadiness(config.port as number, healthCheckPath);
+        if (!answers) {
+          decision = {
+            action: 'redeploy',
+            reason: 'skip candidate did not answer a readiness probe',
+          };
+        }
+      }
+
+      return { kind: 'decided', config, appPath, decision, scanned, healthCheckPath };
+    } catch (error) {
+      const reason = `error during decision: ${error instanceof Error ? error.message : String(error)}`;
+      return { kind: 'error', config, appPath, reason, error };
+    }
+  }
+
   private setupEventHandlers(): void {
     // App onboarding is driven by the watcher publishing app:detected directly
     // (WatcherService.handleAppDetected); the detector resolves the type and
@@ -1302,6 +2366,13 @@ backup:
       const shouldStart = this.config.autoStart && app?.status !== 'stopped';
 
       if (shouldStart) {
+        // Manual promotion holds the build here, BEFORE anything starts. On a
+        // first deploy nothing has ever served, so nothing goes live; on a
+        // redeploy the running version is untouched.
+        if (await this.holdForPromotion(payload.appId, payload.outputPath, payload.deployId)) {
+          this.appsInProgress.delete(payload.appId);
+          return;
+        }
         // owns appsInProgress cleanup. outputPath rides the payload because
         // this dispatch happens synchronously inside build() — before
         // handleBuildApp can persist it to the app config.
@@ -1327,7 +2398,13 @@ backup:
       if (this.gitDeployService?.isCloning(payload.name)) return;
       // Skip apps currently being uploaded (PRD-039)
       if (this.uploadDeployService?.isUploading(payload.name)) return;
-      await this.handleAppUpdate(payload.name, payload.path, payload.reason, payload.bypassCooldown);
+      await this.handleAppUpdate(
+        payload.name,
+        payload.path,
+        payload.reason,
+        payload.bypassCooldown,
+        payload
+      );
     });
     this.subscriptions.push(updateSub);
 
@@ -1387,9 +2464,30 @@ backup:
   }
 
   /**
-   * Check if an app needs a database by looking at detection result or common ORM config files
+   * Whether an app needs a database.
+   *
+   * Three sources, in precedence order:
+   *   1. An explicit `database:` in drop.yaml — the owner said so, so it wins
+   *      outright.
+   *   2. An ORM config file on disk.
+   *   3. A Postgres client or ORM in package.json dependencies.
+   *
+   * (3) is why this exists in its current shape. It used to check only (1) and
+   * (2), so an app built the way an agent builds one — Express, the `pg`
+   * client, hand-written SQL, no drop.yaml and no ORM config file — got no
+   * database and started with no DATABASE_URL at all. Meanwhile appNeedsRedis
+   * right below has always read package.json. The asymmetry was the bug.
+   *
+   * Only clients DROP's PostgreSQL can actually serve are listed. A MySQL or
+   * Mongo driver is deliberately absent: handing that app a `postgres://`
+   * DATABASE_URL would be a connection string it cannot use, which is worse
+   * than none. Embedded SQLite needs no provisioning either.
    */
-  private async appNeedsDatabase(appPath: string, detectionDatabase?: boolean | string): Promise<boolean> {
+  private async appNeedsDatabase(
+    appName: string,
+    appPath: string,
+    detectionDatabase?: boolean | string
+  ): Promise<boolean> {
     // DROP has no SQLite provisioner — 'sqlite' still provisions PostgreSQL and
     // injects DATABASE_URL. Warn so the mismatch is visible instead of silent.
     if (detectionDatabase === 'sqlite') {
@@ -1404,6 +2502,24 @@ backup:
     // If detection already found database requirement, use that
     if (detectionDatabase === true || detectionDatabase === 'postgres' || detectionDatabase === 'sqlite') {
       return true;
+    }
+
+    // Everything below this line is INFERRED, not declared — so an owner who
+    // has already supplied a DATABASE_URL has answered the question, and
+    // inference must not overrule them. This is not merely tidiness: in the
+    // start env, `...dbEnvVars` is spread AFTER BOTH `...secretEnvVars` and the
+    // drop.yaml `env:` base layer, so provisioning here would override either
+    // one and silently repoint the app from its real database at a
+    // freshly-created empty one. An explicit `database:` in drop.yaml is exempt
+    // (handled above) because that is the owner asking for a DROP database in
+    // as many words.
+    const ownSource = await this.appDatabaseUrlSource(appName, appPath);
+    if (ownSource) {
+      this.logger.debug(
+        `${appName} supplies its own DATABASE_URL (${ownSource}) — skipping inferred database provisioning`,
+        'DATABASE'
+      );
+      return false;
     }
 
     // Otherwise, check for common ORM config files
@@ -1429,7 +2545,75 @@ backup:
       }
     }
 
+    // Finally, a Postgres client or ORM in package.json. Mirrors appNeedsRedis:
+    // an app that installed a driver intends to talk to a database, whether or
+    // not it also keeps an ORM config file. Non-Node apps declare `database:`
+    // in drop.yaml instead — requirements.txt and go.mod are not read here.
+    try {
+      const pkgRaw = await fs.readFile(path.join(appPath, 'package.json'), 'utf-8');
+      const pkg = JSON.parse(pkgRaw) as {
+        dependencies?: Record<string, string>;
+        devDependencies?: Record<string, string>;
+      };
+      const deps = { ...(pkg.dependencies ?? {}), ...(pkg.devDependencies ?? {}) };
+      const postgresClients = [
+        'pg',
+        'pg-promise',
+        'postgres',
+        'slonik',
+        'porsager-postgres',
+        '@prisma/client',
+        'prisma',
+        'drizzle-orm',
+        'knex',
+        'sequelize',
+        'typeorm',
+        'objection',
+        '@mikro-orm/postgresql',
+      ];
+      if (postgresClients.some((c) => c in deps)) {
+        return true;
+      }
+    } catch {
+      // No/unreadable package.json — not a Node app, or nothing to detect.
+    }
+
     return false;
+  }
+
+  /**
+   * Where the app's own DATABASE_URL comes from, if it has one — `'secret'`,
+   * `'drop.yaml env'`, or null. Both layers matter: `dbEnvVars` is spread after
+   * each of them when the start env is assembled, so provisioning would
+   * override either.
+   *
+   * Fail-soft in both directions: an unavailable secret store or an unparseable
+   * drop.yaml reports "no DATABASE_URL", which preserves the pre-existing
+   * provisioning behavior rather than silently withholding a database.
+   */
+  private async appDatabaseUrlSource(
+    appName: string,
+    appPath: string
+  ): Promise<'secret' | 'drop.yaml env' | null> {
+    try {
+      if (this.secretManager?.get(appName, 'DATABASE_URL')) return 'secret';
+    } catch {
+      // Secret store unavailable — fall through to the drop.yaml check.
+    }
+
+    try {
+      const dropYaml = await parseDropYaml(appPath);
+      const declared = dropYaml.success ? dropYaml.config?.env?.DATABASE_URL : undefined;
+      // `env:` values may be string | number | boolean; only a non-empty
+      // string is a usable connection string.
+      if (typeof declared === 'string' && declared.trim().length > 0) {
+        return 'drop.yaml env';
+      }
+    } catch {
+      // Unreadable/invalid drop.yaml — nothing declared.
+    }
+
+    return null;
   }
 
   /**
@@ -1670,6 +2854,101 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
   private static readonly MONOREPO_COPY_EXCLUDE_RE = /(^|[\\/])(node_modules|\.git|dist|build)([\\/]|$)/;
 
   /**
+   * Verify a service's source subtree is safe to materialize, immediately
+   * before the copy that consumes it.
+   *
+   * `services.<x>.path` is validated at parse time by the drop.yaml parser's
+   * `validateContainedPath`, but that check is purely lexical — it rejects
+   * absolute paths and `..` traversal without ever touching the disk, so it
+   * cannot see a symlink. `fs.stat` then *follows* symlinks, so a link
+   * pointing out of the repo satisfies the "is it a directory?" check too.
+   *
+   * That matters because `fs.cp` does not dereference — it RECREATES each
+   * symlink at the destination. A symlinked `services.<x>.path` makes the
+   * child app directory itself a symlink aliasing the target, and a symlink
+   * nested inside the subtree is reproduced verbatim inside the child. Either
+   * way a static child serves whatever sits on the other end, including
+   * another tenant's tree. `git clone` materializes symlinks, so this is
+   * tenant-controlled input.
+   *
+   * Posture matches the upload path, which aborts an entire archive rather
+   * than silently dropping a symlink entry (`tar-extract.ts`): refuse the
+   * service and name the offending path, rather than materializing a
+   * partially-correct tree.
+   *
+   * Only entries the copy would actually take are inspected — the same
+   * exclusions the `fs.cp` filter applies — so a pnpm workspace's
+   * `node_modules` link farm is irrelevant, never having been copied.
+   */
+  private async assertServiceSourceSafe(
+    repoPath: string,
+    srcDir: string
+  ): Promise<{ ok: true } | { ok: false; reason: string }> {
+    // Realpaths both sides, so a symlinked/junctioned segment can't escape.
+    //
+    // `isPathWithin` degrades to a LEXICAL resolve if realpath throws, which
+    // would silently reduce this to the parse-time check it exists to
+    // strengthen. That fallback is unreachable here: the caller has already
+    // `fs.stat`ed srcDir, so it exists and every component is traversable —
+    // and a symlink cycle throws ELOOP from that stat, skipping the service
+    // before this runs. Keep the stat gate ahead of this call.
+    if (!(await isPathWithin(repoPath, srcDir))) {
+      return {
+        ok: false,
+        reason: 'it resolves outside the repository (symlinked or otherwise redirected)',
+      };
+    }
+
+    const findSymlink = async (dir: string): Promise<string | null> => {
+      const entries = await fs.readdir(dir, { withFileTypes: true });
+      for (const entry of entries) {
+        const full = path.join(dir, entry.name);
+        if (DropPlatform.MONOREPO_COPY_EXCLUDE_RE.test(full)) continue;
+        // readdir(withFileTypes) reports the entry's own type (lstat
+        // semantics), so this sees the link itself, not its target — and
+        // never follows it, so a link cycle can't spin this walk.
+        if (entry.isSymbolicLink()) return full;
+        if (entry.isDirectory()) {
+          const found = await findSymlink(full);
+          if (found) return found;
+        }
+      }
+      return null;
+    };
+
+    const symlink = await findSymlink(srcDir);
+    if (symlink) {
+      return {
+        ok: false,
+        reason:
+          `it contains a symlink ('${path.relative(repoPath, symlink)}'), which the copy would ` +
+          `recreate inside the app directory`,
+      };
+    }
+
+    return { ok: true };
+  }
+
+  /**
+   * Whether anything at all occupies `p` — deliberately `lstat`, not the
+   * `fs.access` of `pathExists`.
+   *
+   * `access` follows symlinks, so a DANGLING link reports "nothing here" and
+   * the collision guard below would delete it. The guard's question is "does
+   * this name already belong to something?", and a link occupies the name
+   * whether or not its target resolves — the same follow-vs-don't distinction
+   * that let a symlinked service path through `fs.stat` above.
+   */
+  private async entryExists(p: string): Promise<boolean> {
+    try {
+      await fs.lstat(p);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
    * Expand a monorepo container (a repo whose root drop.yaml declares a
    * `services:` map) into N ordinary top-level DROP apps — one per service.
    *
@@ -1688,7 +2967,9 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
   private async expandMonorepo(
     repoPath: string,
     repoName: string,
-    config: DropYamlConfig
+    config: DropYamlConfig,
+    /** The caller whose redeploy triggered this, for guardrail keying. */
+    actor?: DeployActorInfo
   ): Promise<void> {
     const group = (config.group || config.name || repoName).trim();
     const services = config.services ?? {};
@@ -1702,6 +2983,59 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     // name:/group:). Runs on every expansion, so a phantom left by an older
     // platform heals on the next redeploy. Folder-dropped containers were
     // never registered and no entry is created for them here.
+    // OWNERSHIP GUARD on the group tag itself.
+    //
+    // `group` comes from the tenant's own drop.yaml and is validated only as a
+    // non-empty string, yet it is treated downstream as an IDENTITY: it decides
+    // which apps a group teardown destroys, and (Step 11) which OAuth resource
+    // an app's MCP endpoint resolves to. A tenant naming another user's app as
+    // their group therefore reaches into that user's world — the same root as
+    // the deletion defect fixed in 026a712, closed here at the source rather
+    // than patched at each consumer.
+    //
+    // Refuse rather than silently renaming: an operator who wrote `group: x`
+    // and got `y` would have no idea why their services are not grouped.
+    // A CLAIMANT is someone else's hold on the name — never this container's
+    // own group members.
+    //
+    // The original `a.group === group` matched the children expandMonorepo
+    // itself materializes, and since children were never given a userId they
+    // read as belonging to a different owner than their own container. So the
+    // FIRST expansion succeeded (no children yet) and every one after it threw:
+    // a container refused because of its own offspring. On dropkit.sh that left
+    // the `ezsign` group un-redeployable for three days, and the guard's own
+    // regression test hid it by seeding a child with a userId that production
+    // never writes.
+    const containerOwner = this.stateManager?.getApp(repoName)?.userId;
+    const groupClaimant = this.stateManager?.getAllApps().find((a) => {
+      if (a.name === repoName) return false;
+      // An app literally NAMED the group — the attack this guard exists for.
+      if (a.name === group) return true;
+      if (a.group !== group) return false;
+      // Another CONTAINER for the same group: two tenants racing one name.
+      if (a.isGroupContainer) return true;
+      // Otherwise a MEMBER — a child of this group. Only a claimant when it is
+      // demonstrably someone's; an unowned member is adopted below instead.
+      //
+      // This clause is NOT purely transitional. A folder-dropped container has
+      // no userId of its own, so `containerOwner` is undefined and its children
+      // stay unowned permanently — for those groups this is the steady state,
+      // not a migration window. Removing it once "everything has a userId"
+      // would break every folder-dropped group.
+      return a.userId !== undefined;
+    });
+    if (groupClaimant && groupClaimant.userId !== containerOwner) {
+      this.logger.error(
+        `Refusing monorepo group '${group}' for '${repoName}': the name is already held by ` +
+          `'${groupClaimant.name}', which belongs to a different owner.`,
+        'MONOREPO'
+      );
+      throw new Error(
+        `Monorepo group '${group}' is already in use by another account. ` +
+          'Choose a different `group:` in drop.yaml.'
+      );
+    }
+
     if (this.stateManager?.hasApp(repoName)) {
       await this.stateManager.updateApp(repoName, { group, isGroupContainer: true });
     }
@@ -1727,6 +3061,8 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           continue;
         }
 
+        const childPath = path.join(this.config.appsDirectory, childName);
+
         // Collision guard: refuse to clobber a standalone app (or an app from
         // a different group) that already owns this name. Allow refresh when
         // the existing config already belongs to this same group (redeploy).
@@ -1735,6 +3071,30 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           this.logger.warn(
             `Skipping service '${svcName}': app '${childName}' already exists and does not ` +
               `belong to monorepo group '${group}'`,
+            'MONOREPO'
+          );
+          continue;
+        }
+
+        // ...and fail CLOSED when nothing vouches for the name but a directory
+        // is already sitting there. Materialization below wipes childPath, so
+        // "no config" must not read as "free to delete": a folder owns its name
+        // from the moment it exists on disk, but only acquires an AppConfig once
+        // the `app:detected` handler has run. `existing === undefined` therefore
+        // also covers a real app mid-onboarding, one whose detection failed, and
+        // an earlier expansion that crashed between the copy and the config
+        // write — none of them ours to remove. A legitimate re-expansion is
+        // unaffected: it matched the `existing` branch above.
+        //
+        // If `appConfigService` were unset, `existing` is always undefined and
+        // this refuses every child whose folder exists. That is the safe
+        // direction, and unreachable in practice: `initializeServices` assigns
+        // it unconditionally, and both callers are event handlers that only
+        // fire once the watcher is running.
+        if (!existing && (await this.entryExists(childPath))) {
+          this.logger.warn(
+            `Skipping service '${svcName}': '${childPath}' already exists on disk with no app ` +
+              `config to vouch for it; refusing to delete it. Remove it manually if it is stale.`,
             'MONOREPO'
           );
           continue;
@@ -1758,21 +3118,58 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           continue;
         }
 
-        const childPath = path.join(this.config.appsDirectory, childName);
+        // Symlink containment — the parse-time check is lexical and the stat
+        // above follows links, so neither can see one. Resolved here, against
+        // the tree that is about to be copied.
+        const safety = await this.assertServiceSourceSafe(repoPath, srcDir);
+        if (!safety.ok) {
+          this.logger.warn(
+            `Skipping service '${svcName}': path '${svc.path}' in '${repoName}' rejected — ` +
+              `${safety.reason}`,
+            'MONOREPO'
+          );
+          continue;
+        }
+
+        // A user-stopped child is skipped BEFORE anything is written. Both
+        // downstream paths refuse to build one (`handleAppUpdate:4439`,
+        // `buildSub`), but they refuse AFTER the copy would have landed —
+        // which would leave a stopped child holding new, unbuilt source for
+        // the next `drop start` to serve.
+        const childState = this.stateManager?.getApp(childName);
+        if (childState?.status === 'stopped') {
+          this.logger.info(
+            `Skipping service '${svcName}': '${childName}' was stopped by the user`,
+            'MONOREPO'
+          );
+          continue;
+        }
 
         // Suppress the watcher's own onboarding of the folder we're about to
         // write — we onboard it ourselves below, same as the interception
         // above does for the container.
         this.watcher?.markAppKnown(childName);
 
-        // Materialize (idempotent): drop any previous copy, then copy fresh,
-        // excluding node_modules/.git/dist/build so redeploys stay cheap and
-        // don't duplicate installed dependencies or build output.
-        await fs.rm(childPath, { recursive: true, force: true });
-        await fs.cp(srcDir, childPath, {
-          recursive: true,
-          force: true,
-          filter: (src: string) => !DropPlatform.MONOREPO_COPY_EXCLUDE_RE.test(src),
+        // Materialize IN PLACE (idempotent). This used to be
+        // `fs.rm(childPath)` + `fs.cp`, which deleted a RUNNING child's whole
+        // tree — build output and installed dependencies included — and left
+        // its document root empty for the entire install + build. A docker
+        // static child's nginx returned 500 throughout, and any early return
+        // in the build path made that permanent (DROP-122).
+        //
+        // syncTree lands the source over the child, prunes what the source no
+        // longer has, and keeps `node_modules` — so nothing is reinstalled
+        // from scratch and no window exists where the tree is simply gone.
+        //
+        // `exclude` and `preserve` do different jobs here, deliberately:
+        // `dist`/`build` are excluded from the source AND not preserved, so
+        // the prune deletes the child's stale output. That is what forces a
+        // rebuild — `StaticBuildStrategy.preBuild` treats a surviving
+        // `dist/index.html` as "already built" and skips the build entirely,
+        // which is the trap that got v2 of this change rejected.
+        await syncTree(srcDir, childPath, {
+          exclude: DropPlatform.MONOREPO_COPY_EXCLUDE_RE,
+          preserve: DEFAULT_PRESERVE,
         });
 
         // Resolve type: honor an explicit override, else detect from the
@@ -1828,9 +3225,39 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
             group,
           });
         }
+        // An EXISTING child is UPDATED, never re-registered.
+        //
+        // `registerApp` forces `status` back to 'pending' for anything not
+        // already 'stopped' (state-manager.ts:265). That is correct for a
+        // fresh deploy and fatal for a running child: `handleAppUpdate` reads
+        // `wasRunning` from this status, and with it false BOTH halves of its
+        // transaction invert — on success the stop is skipped and
+        // `ProcessManager.start` early-returns on an already-online process
+        // (new build on disk, old code still serving, deploy reported green);
+        // on failure the child is marked 'errored' while its old process is
+        // still alive. This inversion is precisely what got v2 rejected.
+        // Children inherit the CONTAINER'S OWNER. Without this they were
+        // written with no userId at all, which (a) made the ownership guard
+        // above refuse the container on its own children, and (b) left group
+        // apps invisible to their own non-admin owner, since listings filter by
+        // userId. Safe to set unconditionally: the guard has already refused
+        // any member owned by someone other than `containerOwner`, so by here a
+        // member is either unowned or already ours.
         if (this.stateManager) {
-          await this.stateManager.registerApp(childName, childPath, narrowedType);
-          await this.stateManager.updateApp(childName, { group });
+          if (childState) {
+            await this.stateManager.updateApp(childName, {
+              type: narrowedType,
+              path: childPath,
+              group,
+              ...(containerOwner ? { userId: containerOwner } : {}),
+            });
+          } else {
+            await this.stateManager.registerApp(childName, childPath, narrowedType);
+            await this.stateManager.updateApp(childName, {
+              group,
+              ...(containerOwner ? { userId: containerOwner } : {}),
+            });
+          }
         }
 
         // Sequential await: gives declared-order onboarding for the common
@@ -1841,7 +3268,52 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         // flags oversized groups — but it also won't auto-retrigger; that's
         // acceptable for the common small-N case and left for a future pass.
         if (this.config.autoBuild) {
-          await this.handleBuildApp(childPath, childName, childType);
+          // Children inherit the container's actor. Left undefined they would
+          // each key as automation on their OWN name, so a loop that varies
+          // service names would accumulate nowhere.
+          //
+          // An EXISTING child goes through the update transaction every other
+          // app on this platform already gets: build in place while the old
+          // process keeps serving, stop only after the build succeeds, restart
+          // on the same port, and restore 'running' if it fails. A FIRST-EVER
+          // child has nothing to keep serving, so it takes the ordinary fresh
+          // deploy path.
+          //
+          // The child is deliberately NOT added to `appsInProgress`: that set
+          // holds the CONTAINER for the duration of the expansion, and adding
+          // the child would make handleAppUpdate's own in-progress guard
+          // (:4320) drop it — silently skipping the build on 100% of
+          // expansions. All three critics found that independently in v1.
+          // Re-read rather than reuse `childState`: that was captured before
+          // the copy, and the copy is real I/O. `appsInProgress` holds the
+          // CONTAINER, which does not stop a `drop stop` on the child, so the
+          // child can be stopped mid-expansion. Routing a now-stopped child to
+          // handleAppUpdate would have it refuse at :4439 — after the source
+          // had landed — reproducing the "new source, never built" state the
+          // pre-copy check above exists to prevent.
+          //
+          // The two reads answer different questions and are not
+          // interchangeable: `childState` (pre-copy) is "did this child exist
+          // before this expansion?", which decides the routing — re-reading
+          // for that would always say yes, because the registration above has
+          // since run. `stateNow` is only "has it been stopped since?".
+          const stateNow = this.stateManager?.getApp(childName);
+          if (stateNow?.status === 'stopped') {
+            this.logger.info(
+              `Not building service '${svcName}': '${childName}' was stopped during expansion`,
+              'MONOREPO'
+            );
+          } else if (childState) {
+            await this.handleAppUpdate(
+              childName,
+              childPath,
+              'monorepo re-expansion',
+              true,
+              actor
+            );
+          } else {
+            await this.handleBuildApp(childPath, childName, childType, actor);
+          }
         }
       } catch (error) {
         this.logger.error(
@@ -1861,6 +3333,28 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
    * real fs I/O inside `parseDropYaml` through the event bus's fire-and-forget
    * dispatch.
    */
+  /**
+   * Whether an app is a MATERIALIZED MONOREPO CHILD — a folder expandMonorepo
+   * copied out of a container's `services:` map, as opposed to a standalone
+   * app or the container itself.
+   *
+   * The discriminator is deliberate: expandMonorepo tags the container with
+   * `isGroupContainer: true` and tags each child with only `group`, so
+   * "grouped but not a container" is exactly the set whose lifecycle belongs
+   * to someone else. Both stores are consulted because the config file is the
+   * source of truth across restarts while state carries `isGroupContainer`.
+   *
+   * A standalone app is unaffected even if its own drop.yaml declares
+   * `group:` — nothing copies that into its AppConfig; only expandMonorepo
+   * writes the field.
+   */
+  private isGroupedChild(appName: string): boolean {
+    const config = this.appConfigService?.getConfig(appName);
+    const state = this.stateManager?.getApp(appName);
+    if (state?.isGroupContainer) return false;
+    return Boolean(config?.group || state?.group);
+  }
+
   private async handleAppDetected(payload: AppDetectedPayload): Promise<void> {
     // Skip apps currently being cloned
     if (this.gitDeployService?.isCloning(payload.name)) return;
@@ -1882,10 +3376,44 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       // finally-guaranteed release — a stuck entry would wedge the app.
       this.appsInProgress.add(payload.name);
       try {
-        await this.expandMonorepo(payload.path, payload.name, rootYaml.config);
+        await this.expandMonorepo(payload.path, payload.name, rootYaml.config, payload);
       } finally {
         this.appsInProgress.delete(payload.name);
       }
+      return;
+    }
+
+    // A materialized monorepo CHILD must never be onboarded independently —
+    // its fate is entirely the container's, which re-copies and rebuilds every
+    // child as one atomic fs.rm+fs.cp+build (expandMonorepo). Without this the
+    // watcher's boot scan onboards `<group>-<service>` folders as ordinary
+    // apps: each publishes its own app:detected and starts building, and the
+    // container's expansion then lands fs.rm/fs.cp underneath — leaving a
+    // static child pointed at a build output that no longer exists (nginx
+    // 500s with a `try_files` redirect cycle, which is how this was found).
+    //
+    // boot-reconcile already refuses grouped apps for exactly this reason, but
+    // DROP_BOOT_RECONCILE defaults to 'off', so that guard does not run on a
+    // default box and this path was the one that actually executed.
+    //
+    // Safe against the container's own build path: expandMonorepo calls
+    // handleBuildApp DIRECTLY and never publishes app:detected for a child, so
+    // nothing here blocks a legitimate group build.
+    // Gated on ORIGIN, not just identity. Only a watcher-fabricated detection
+    // is refused: an API-originated one is someone deliberately asking for this
+    // app. migrate-runtime is the sharp case — it STOPS the app and then
+    // publishes app:detected to bring it back, so swallowing that event would
+    // leave a migrated child down permanently with nothing but a log line.
+    // The watcher already added the child to knownApps before publishing
+    // (watcher.ts), so there is nothing to mark here.
+    if (payload.origin === 'watcher' && this.isGroupedChild(payload.name)) {
+      // info, not debug: if the container later fails to expand (a bad
+      // drop.yaml, an ownership refusal), this line is the only trace that
+      // something is deliberately declining to build the child.
+      this.logger.info(
+        `Skipping watcher onboarding of grouped child '${payload.name}' — its monorepo container owns rebuilds`,
+        'MONOREPO'
+      );
       return;
     }
 
@@ -1915,22 +3443,36 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     // Build the app if auto-build is enabled (skip if user stopped it)
     const currentApp = this.stateManager?.getApp(payload.name);
     if (this.config.autoBuild && payload.type !== 'unknown' && currentApp?.status !== 'stopped') {
-      await this.handleBuildApp(payload.path, payload.name, payload.type as string);
+      await this.handleBuildApp(payload.path, payload.name, payload.type as string, payload);
     } else if (payload.type === 'unknown' && currentApp?.status !== 'stopped') {
       // Detection couldn't resolve a type: the build guard above never fires
       // for 'unknown', which used to leave the app registered at `pending`
       // forever with no logs explaining why. Fail loudly instead — a later
       // file change re-detects (handleAppUpdate only skips `stopped` apps),
       // so adding a drop.yaml/Procfile/manifest recovers the app automatically.
+      const detectError = new Error(
+        'Could not detect application type — add a drop.yaml, Procfile, or a recognized manifest ' +
+          '(requirements.txt, package.json, go.mod, Dockerfile, index.html)'
+      );
       await this.stateManager?.setAppStatus(payload.name, 'errored', {
-        error:
-          'Could not detect application type — add a drop.yaml, Procfile, or a recognized manifest ' +
-          '(requirements.txt, package.json, go.mod, Dockerfile, index.html)',
+        error: detectError.message,
       });
+      // No build ever starts on this path, so without an episode an MCP deploy
+      // of an undetectable folder waits out its full budget and reports "still
+      // building" rather than this error.
+      // It still gets its own deploy id: the episode is a real terminal
+      // outcome for a real deploy attempt, and one the caller must be able to
+      // name like any other.
+      this.failDeployEpisode(payload.name, detectError, crypto.randomUUID());
     }
   }
 
-  private async handleBuildApp(appPath: string, appName: string, _appType: string): Promise<void> {
+  private async handleBuildApp(
+    appPath: string,
+    appName: string,
+    _appType: string,
+    actor?: DeployActorInfo
+  ): Promise<void> {
     if (!this.builder || !this.detector) return;
 
     // Skip if already processing this app
@@ -1938,6 +3480,35 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       this.logger.debug(`Skipping ${appName} - already in progress`, 'BUILD');
       return;
     }
+
+    // GUARDRAIL, gated HERE and not at the tool boundaries (SEC-15). This is
+    // the single choke point every deploy path traverses — watcher, webhook,
+    // git, upload, MCP. A tool-boundary gate would leave webhook- and
+    // watcher-driven redeploy loops completely unthrottled, and a stolen
+    // webhook secret buys an unmetered build loop, builds being the most
+    // expensive thing on the box.
+    //
+    // Automation gets its own key rather than being treated as an anonymous
+    // caller, so a looping watcher cannot consume the quota of the human who
+    // happens to own the app.
+    const existing = this.stateManager?.getApp(appName);
+    const guardKeys = this.guardrailKeys(appName, !existing, actor ?? {});
+    const verdict = this.checkGuardrails(guardKeys);
+    if (!verdict.allowed) {
+      const reason =
+        `Too many failed deploys (${verdict.failures}). ` +
+        `Retry in ${verdict.retryAfterSeconds}s.`;
+      this.logger.warn(`Deploy of ${appName} refused by guardrail: ${reason}`, 'BUILD');
+      // See the matching release in handleAppUpdate: a stale key would turn
+      // this refusal into a counted failure against the window that refused it.
+      this.releaseGuardrailKeys(appName);
+      // Reported as a normal deploy failure so a caller polling for an outcome
+      // gets an answer instead of waiting out its budget — the same reason
+      // failDeployEpisode exists.
+      this.failDeployEpisode(appName, new Error(reason), crypto.randomUUID(), 'GUARDRAIL_TRIPPED');
+      return;
+    }
+    this.breakerKeys.set(appName, guardKeys);
 
     // Enforce global concurrent build limit. Deferred builds are queued and
     // retried by drainPendingBuilds as slots free, rather than waiting for a
@@ -1949,7 +3520,14 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         `deferring ${appName}`,
         'BUILD'
       );
-      this.pendingBuilds.set(appName, { appPath, appType: _appType });
+      // The actor rides along. Without it the drain re-enters with no caller,
+      // so anyone who keeps maxConcurrentBuilds slots busy has their next
+      // deploys re-keyed as anonymous automation — no principal window, no
+      // owner window. Four parallel deploys is enough to arrange.
+      this.pendingBuilds.set(appName, { appPath, appType: _appType, actor });
+      // Reserved above, but nothing will be recorded for this attempt: the
+      // retry re-enters handleBuildApp and re-reserves.
+      this.releaseGuardrailKeys(appName);
       this.scheduleBuildDrain();
       return;
     }
@@ -1960,6 +3538,24 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     this.appsInProgress.add(appName);
 
     this.logger.appEvent('building', appName);
+
+    // Whether builder.build() was entered. Declared out here so the catch can
+    // see it: the builder publishes its own build:started/build:failed, so a
+    // failure AFTER this point must not be given a synthesized episode — that
+    // would report a second, spurious failure for a deploy that already
+    // reported one. A throw BEFORE it has no episode at all, which is what
+    // failDeployEpisode exists to fix.
+    let builderEntered = false;
+
+    // One id for this deploy, minted HERE — at the call site that begins it —
+    // and threaded into the build log filename, the build's events, and the
+    // synthesized failure episode below, so the log, the tracker episode and
+    // the caller all name the same deploy.
+    //
+    // Minted BEFORE the try, not next to startBuild: a throw in detection never
+    // reaches the build, and those failures still have to report under a real
+    // id rather than one the tracker invents.
+    const deployId = crypto.randomUUID();
 
     try {
       // Update state to building. Kept inside the try: if this write throws it
@@ -1985,60 +3581,77 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         | 'static'
         | 'docker'
         | 'unknown';
+      // MCP endpoint (Step 11). Resolved on every build so removing the
+      // dependency or the `mcp:` block clears it — hence the explicit
+      // `undefined`, which is how pendingPromotion is cleared too.
+      //
+      // ROUTING READS THIS. `handleConfigureRoute` emits a Caddy forward_auth
+      // guard when `source === 'declared' && auth === 'drop'`, and `mcp.path`
+      // is rendered into the generated Caddyfile — so it must stay
+      // MCP_PATH_REGEX-validated at the parser, and any future writer of this
+      // field (an API setter, an MCP tool) inherits that requirement.
+      const mcpEndpoint = detectMcp(
+        await readMcpInputs(appPath, (await parseDropYaml(appPath)).config?.mcp)
+      );
       if (this.appConfigService) {
-        await this.appConfigService.updateConfig(appName, { type: detectedType });
+        await this.appConfigService.updateConfig(appName, {
+          type: detectedType,
+          mcp: mcpEndpoint
+            ? { path: mcpEndpoint.path, auth: mcpEndpoint.auth, source: mcpEndpoint.source }
+            : undefined,
+        });
       }
       if (this.stateManager) {
         await this.stateManager.updateApp(appName, { type: detectedType });
       }
       const workDir = await this.getBuildWorkDir(appName);
 
-      const execCommand =
-        this.config.isolation === 'docker' && this.runtime?.type === 'docker'
-          ? createContainerExecCommand(
-              (this.runtime as import('../managers/runtime').ContainerManager).docker,
-              detection.type,
-              appName
-            )
-          : undefined;
+      const execCommand = this.buildExecCommandFor(detection.type, appName);
 
       const buildStartedAt = new Date();
       const logId = this.buildLogService
-        ? await this.buildLogService.startBuild(appName, buildStartedAt)
+        ? await this.buildLogService.startBuild(appName, buildStartedAt, deployId)
         : null;
 
-      // Fresh deploy — nothing is currently serving this app, so a low-disk
-      // abort is a hard failure: throw into the catch below, which marks the
-      // app 'errored' and releases appsInProgress.
-      const disk = await hasEnoughDisk(appPath);
-      if (!disk.ok) {
-        throw new Error(
-          `Insufficient disk space: ${Math.round(disk.freeMb)} MB free, need ${getMinFreeDiskMb()} MB`
-        );
-      }
+      // Everything between startBuild and closeBuildLog must sit in this
+      // try/finally: the disk check below throws on a low-disk box, and that
+      // used to skip finishBuild entirely — leaking the log's write stream and
+      // never running retention for the app.
+      let result;
+      try {
+        // Fresh deploy — nothing is currently serving this app, so a low-disk
+        // abort is a hard failure: throw into the catch below, which marks the
+        // app 'errored' and releases appsInProgress.
+        const disk = await hasEnoughDisk(appPath);
+        if (!disk.ok) {
+          throw new Error(
+            `Insufficient disk space: ${Math.round(disk.freeMb)} MB free, need ${getMinFreeDiskMb()} MB`
+          );
+        }
 
-      const buildEnv = await this.resolveBuildEnv(appPath, appName);
-      const buildOverride = (await parseDropYaml(appPath)).config?.build;
+        const buildEnv = await this.resolveBuildEnv(appPath, appName);
+        const buildOverride = (await parseDropYaml(appPath)).config?.build;
 
-      const result = await this.builder.build({
-        appName,
-        appPath,
-        appType: detection.type,
-        framework: detection.framework || null,
-        config: {
-          buildCommand: buildOverride ?? detection.suggestedConfig?.buildCommand,
-          installCommand: detection.suggestedConfig?.installCommand,
-        },
-        env: buildEnv,
-        workDir,
-        execCommand,
-        onBuildLog: logId && this.buildLogService
-          ? (line) => this.buildLogService!.writeLine(logId, line)
-          : undefined,
-      });
-
-      if (logId && this.buildLogService) {
-        await this.buildLogService.finishBuild(logId, appName);
+        builderEntered = true;
+        result = await this.builder.build({
+          appName,
+          appPath,
+          deployId,
+          appType: detection.type,
+          framework: detection.framework || null,
+          config: {
+            buildCommand: buildOverride ?? detection.suggestedConfig?.buildCommand,
+            installCommand: detection.suggestedConfig?.installCommand,
+          },
+          env: buildEnv,
+          workDir,
+          execCommand,
+          onBuildLog: logId && this.buildLogService
+            ? (line) => this.buildLogService!.writeLine(logId, line)
+            : undefined,
+        });
+      } finally {
+        await this.closeBuildLog(logId, appName);
       }
 
       if (result.success) {
@@ -2064,8 +3677,13 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         // it retries when a slot frees, instead of leaving it permanently
         // failed after a transient burst.
         this.logger.warn(`Builder busy for ${appName}; re-queuing`, 'BUILD');
+        // Deliberately NOT a guardrail failure: the deploy is being retried,
+        // not rejected. Counting a queue wait as a failure would let a busy
+        // platform trip the breaker on apps that never actually failed — and
+        // the retry re-enters this method and re-gates itself.
+        this.releaseGuardrailKeys(appName);
         this.appsInProgress.delete(appName);
-        this.pendingBuilds.set(appName, { appPath, appType: _appType });
+        this.pendingBuilds.set(appName, { appPath, appType: _appType, actor });
         this.scheduleBuildDrain();
       } else {
         this.logger.appEvent('error', appName, result.errors?.[0]?.message || 'Build failed');
@@ -2074,16 +3692,168 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
             error: result.errors?.[0]?.message || 'Build failed',
           });
         }
+        // The COMMONEST failure, and the one a loop is actually made of: the
+        // build ran and returned unsuccessfully. failDeployEpisode does not
+        // fire here (the builder published its own episode), so without this
+        // the breaker counted only pre-build and readiness failures and would
+        // never trip on a repeatedly-failing build.
+        this.recordDeployOutcome(appName, false);
         this.appsInProgress.delete(appName);
       }
     } catch (error) {
-      this.logger.appEvent('error', appName, error instanceof Error ? error.message : 'Build failed');
+      const err = error instanceof Error ? error : new Error('Build failed');
+      this.logger.appEvent('error', appName, err.message);
       if (this.stateManager) {
-        await this.stateManager.setAppStatus(appName, 'errored', {
-          error: error instanceof Error ? error.message : 'Build failed',
-        });
+        await this.stateManager.setAppStatus(appName, 'errored', { error: err.message });
+      }
+      // A throw BEFORE builder.build() (detection, the disk check,
+      // resolveBuildEnv, a malformed drop.yaml) never opened a deploy episode,
+      // so the MCP deploy tools would poll their full budget and report "still
+      // building" instead of this error.
+      if (!builderEntered) {
+        this.failDeployEpisode(appName, err, deployId);
       }
       this.appsInProgress.delete(appName);
+    }
+  }
+
+  /**
+   * Make a deploy failure OBSERVABLE as a terminal deploy episode.
+   *
+   * Every MCP deploy tool polls `waitForDeployOutcome` for an episode that
+   * reaches a terminal status. A failure that never opened one therefore reads
+   * as "still in progress" until the caller's full wait budget (~120s) expires,
+   * and then reports "still building" instead of the failure. Two such paths
+   * exist, both reachable without anything unusual:
+   *
+   *  - `handleAppDetected`'s `unknown`-type branch, which errors the app
+   *    WITHOUT ever calling `handleBuildApp` — i.e. deploying a folder with no
+   *    recognizable manifest.
+   *  - anything throwing inside `handleBuildApp` BEFORE `builder.build()`:
+   *    detection, the disk-space check, `resolveBuildEnv`, or a malformed
+   *    drop.yaml.
+   *
+   * Synthesizes the open only when nothing is open, so a build that already
+   * reported its own failure isn't given a second, spurious episode. The
+   * `buildId` is not used for correlation (the tracker keys on app name), so a
+   * synthetic one is fine.
+   */
+  private failDeployEpisode(
+    appName: string,
+    error: Error,
+    deployId?: string,
+    /**
+     * Names the refusal so it does not classify as PREBUILD_FAILED.
+     *
+     * Every other caller of this genuinely failed before the build — detection,
+     * the disk check, a malformed drop.yaml — and 'pre-build' is the truthful
+     * stage for those. A guardrail refusal shares the stage but not the cause:
+     * nothing was attempted, so the PREBUILD_FAILED hint ("check detection, the
+     * environment, or drop.yaml") sends the caller to look at something that is
+     * not wrong.
+     */
+    code?: 'GUARDRAIL_TRIPPED' | 'QUOTA_EXCEEDED'
+  ): void {
+    this.recordDeployOutcome(appName, false);
+    try {
+      const tracker = getDeployTracker();
+      const buildId = `deploy-${appName}-${Date.now()}`;
+      if (!tracker.hasOpenEpisode(appName)) {
+        eventBus.publish('build:started', { appId: appName, buildId, deployId });
+      }
+      // 'pre-build' is the truthful stage for every caller of this: detection
+      // failures, the disk check, resolveBuildEnv, a malformed drop.yaml — all
+      // of them end the deploy before builder.build() is entered.
+      eventBus.publish('build:failed', {
+        appId: appName,
+        buildId,
+        error,
+        deployId,
+        stage: 'pre-build',
+        code,
+      });
+    } catch {
+      // Tracker not initialised (isolated tests) — observability only, never
+      // allowed to interfere with the failure being reported.
+    }
+  }
+
+  /**
+   * Record a deploy outcome against the guardrail key this deploy was ADMITTED
+   * under, then forget it.
+   *
+   * Keyed from the map rather than recomputed: the principal is known only
+   * where the deploy was triggered, and the outcome surfaces later in a
+   * different handler. Recomputing here would key automation outcomes
+   * differently from the gate that admitted them, so their window would never
+   * close and a looping watcher would stay blocked forever.
+   *
+   * A deploy with no recorded key was never gated (it predates this, or the
+   * platform restarted mid-deploy) — nothing to record.
+   */
+  private guardrailKeys(
+    appName: string,
+    isNewApp: boolean,
+    actor: DeployActorInfo
+  ): GuardrailKey[] {
+    return guardrailKeysFor(appName, isNewApp, actor);
+  }
+
+  private checkGuardrails(keys: GuardrailKey[]): {
+    allowed: boolean;
+    failures: number;
+    retryAfterSeconds?: number;
+  } {
+    return checkGuardrailKeys(keys);
+  }
+
+  /**
+   * Abandon an episode's guardrail keys without recording anything.
+   *
+   * Must be called on every path that reserved keys and then returned without
+   * deploying. A key left behind is charged to the NEXT outcome recorded for
+   * that app — including the failure that `failDeployEpisode` records when a
+   * later attempt is refused, which would let a refusal extend its own
+   * cooldown indefinitely, or charge principal A for principal B's episode.
+   */
+  private releaseGuardrailKeys(appName: string): void {
+    this.breakerKeys.delete(appName);
+  }
+
+  private recordDeployOutcome(appName: string, ok: boolean): void {
+    const keys = this.breakerKeys.get(appName);
+    if (!keys) return;
+    this.breakerKeys.delete(appName);
+    try {
+      const breaker = getDeployBreaker();
+      for (const entry of keys) {
+        if (!ok) {
+          breaker.recordFailure(entry.key, Date.now(), entry.threshold);
+        } else if (entry.clearOnSuccess) {
+          breaker.recordSuccess(entry.key);
+        }
+        // A success does NOT clear a decay-only key. See
+        // GuardrailKey.clearOnSuccess: the owner backstop must not be wipeable
+        // by one cheap deploy, or it stops being a backstop.
+      }
+    } catch {
+      // Guardrail state is best-effort; it must never fail a deploy.
+    }
+  }
+
+  /**
+   * Close a build log stream. Never throws.
+   *
+   * Called from `finally` on both build paths, where a throw would replace the
+   * error actually being propagated with an unrelated logging failure. A no-op
+   * when the build log service is disabled or no log was opened.
+   */
+  private async closeBuildLog(logId: string | null, appName: string): Promise<void> {
+    if (!logId || !this.buildLogService) return;
+    try {
+      await this.buildLogService.finishBuild(logId, appName);
+    } catch (error) {
+      this.logger.warn(`Failed to close build log for ${appName}`, 'BUILD', error);
     }
   }
 
@@ -2118,7 +3888,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         continue;
       }
       this.pendingBuilds.delete(appName);
-      void this.handleBuildApp(info.appPath, appName, info.appType);
+      void this.handleBuildApp(info.appPath, appName, info.appType, info.actor);
     }
     if (this.pendingBuilds.size > 0) this.scheduleBuildDrain();
   }
@@ -2131,7 +3901,14 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       return;
     }
 
-    const appPath = path.join(this.config.appsDirectory, appName);
+    // Resolve identically to reconcileAppsOnBoot (M1 review item K): prefer
+    // the persisted AppConfig.path (set at detection time, and — for a
+    // monorepo child — the copied per-service folder, not appsDirectory/name)
+    // over the hardcoded join, falling back to the join only when no config
+    // (or no path on it) exists yet.
+    const appPath =
+      this.appConfigService?.getConfig(appName)?.path ||
+      path.join(this.config.appsDirectory, appName);
 
     try {
       // Update state to starting. Kept inside the try: if this write throws it
@@ -2166,7 +3943,11 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
 
       // Check if app needs a database and provision one.
       let dbEnvVars: Record<string, string> = {};
-      const needsDb = await this.appNeedsDatabase(appPath, detection.suggestedConfig?.database);
+      const needsDb = await this.appNeedsDatabase(
+        appName,
+        appPath,
+        detection.suggestedConfig?.database
+      );
       if (this.dbProvisioner && needsDb) {
         const pgSocketDir =
           this.config.isolation === 'docker'
@@ -2215,6 +3996,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         redisEnvVars,
         buildOutputDir
       );
+      await this.noteRuntimeLogStart(appName);
       const status = await this.runtime.start(spec);
 
       this.logger.appEvent('started', appName, `PID ${status.pid}, port ${port}`);
@@ -2241,6 +4023,25 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       const readiness = await this.awaitReadiness(appName, port, spec);
       if (!readiness.ok) {
         this.logger.appEvent('error', appName, `readiness check failed: ${readiness.reason}`);
+        // Close the runtime-log window FIRST. Without an end offset a retained
+        // copy runs start-to-EOF, which sweeps in anything appended after this
+        // deploy died — including by a re-registered app of the same name.
+        this.recordDeployOutcome(appName, false);
+        await this.noteRuntimeLogEnd(appName);
+        // Published BEFORE the 'errored' status write below: that write is
+        // what closes the deploy episode, and a subscriber correlating by app
+        // name needs the episode still open to resolve this app's deployId.
+        // Carries a closed-set reason, never readiness.reason — that string is
+        // diagnostic text and must not reach a persisted record.
+        eventBus.publish('deploy:failed', {
+          appId: appName,
+          phase: 'boot',
+          // The category, not readiness.reason — that string is diagnostic
+          // text and must not reach a persisted record. Defaults to
+          // 'process-exited' only because every !ok path sets one today; the
+          // fallback exists so a future branch cannot publish undefined.
+          reason: readiness.failure ?? 'process-exited',
+        });
         if (this.stateManager) {
           await this.stateManager.setAppStatus(appName, 'errored', {
             port,
@@ -2259,27 +4060,49 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         );
       }
 
-      // Update state to running with port and pid
+      // Record the signature (source mtime, secret fingerprint, runtime-spec
+      // revision) observed at THIS deploy — read back by reconcileAppsOnBoot
+      // (M1) on the NEXT boot to decide skip vs redeploy. AFTER readiness
+      // succeeds, logically (capturing it earlier races the app's own
+      // startup writes into its tree) — but fire-and-forget (`void`), not
+      // awaited: it must never delay the 'running' status write or the
+      // eventual appsInProgress release, which several callers/tests treat
+      // as available the instant runtime.start()/readiness settles.
+      void this.recordDeploySignature(appName, appPath);
+
+      // Update state to running with port and pid.
+      //
+      // readinessUnverified is passed EXPLICITLY as a boolean, never omitted:
+      // this is the one path where the readiness gate actually ran, so it is
+      // the only path entitled to assert a verdict either way. Passing `false`
+      // on a clean pass is load-bearing — it clears a flag left by an earlier
+      // unverified deploy. The ungated paths (handleAppUpdate, restartApp)
+      // deliberately pass nothing at all.
       if (this.stateManager) {
         await this.stateManager.setAppStatus(appName, 'running', {
           port,
           pid: status.pid ?? undefined,
+          readinessUnverified: Boolean(readiness.warning),
         });
       }
+
+      // SUCCESS — clears the guardrail window.
+      //
+      // Including the readiness-WARNING case. Counting succeeded_unverified as
+      // a failure would contradict D1, which exists to preserve DROP-063's
+      // leniency: five legitimately-slow-but-healthy deploys would trip the
+      // breaker on a perfectly good app. The agent still gets the unverified
+      // status and a hint — that is the signal to act on, not a throttle.
+      this.recordDeployOutcome(appName, true);
 
       // App is fully deployed now - record deploy time for cooldown
       this.appDeployTimes.set(appName, Date.now());
 
-      // Start health prober in PM2 mode (Docker uses its own HEALTHCHECK mechanism)
-      if (spec.healthCheckPath && this.runtime?.type === 'pm2') {
-        this.startHealthProber(appName, port, spec.healthCheckPath);
-      }
-      // Watch for a post-deploy crash-loop (both modes) — flips a running app to
-      // 'crash-looping' when its runtime restart count climbs. Keyed on restart
-      // count, not an HTTP rule, so a healthy JSON API (4xx at `/`) is never
-      // mis-flagged. The deploy episode has already closed on 'running', so this
-      // status change does not affect deploy_files.
-      this.startCrashLoopWatch(appName);
+      // Arm the health prober + crash-loop watch that keep this app supervised
+      // for the rest of its running life. The deploy episode has already
+      // closed on 'running', so a later crash-loop status change does not
+      // affect deploy_files.
+      this.armPostDeployWatches(appName, port, spec.healthCheckPath);
     } catch (error) {
       // Secret preflight park (PRD-051): not a failure — the app declared
       // required secrets that aren't set. Record them and stop, so the operator
@@ -2296,6 +4119,11 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
             missingSecrets: error.missingSecrets,
           });
         }
+        // COUNTED. buildFreshStartSpec throws this AFTER the build completed,
+        // so the install and build were already paid for, and the `secrets:`
+        // block that triggers it is tenant-controlled — leaving it uncounted
+        // made `deploy → full build → park → deploy` a free, unbounded loop.
+        this.recordDeployOutcome(appName, false);
         return;
       }
       this.logger.appEvent('error', appName, error instanceof Error ? error.message : 'Failed to start');
@@ -2304,6 +4132,11 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           error: error instanceof Error ? error.message : 'Failed to start',
         });
       }
+      // A whole class of expensive, caller-reproducible failures reaches here
+      // rather than the readiness verdict — port allocation, secret/env
+      // resolution, runtime spec assembly, runtime.start() itself. Uncounted,
+      // they were invisible to the breaker AND left a stale key behind.
+      this.recordDeployOutcome(appName, false);
     } finally {
       // Terminal handler: always release the in-progress guard on every settled
       // path (success, error, or a throw from the initial 'starting' write), so
@@ -2312,7 +4145,18 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     }
   }
 
-  private async handleConfigureRoute(appName: string, port: number): Promise<void> {
+  /**
+   * @param opts.skipCaddyReload Defer the actual `caddy reload` to the
+   * caller — router.addRoute below still writes/regenerates the Caddyfile
+   * itself. Used by reconcileAppsOnBoot (M1 review item G) to batch N
+   * skipped apps' routes into ONE reload instead of N serialized ones on
+   * the boot path; every other caller reloads immediately as before.
+   */
+  private async handleConfigureRoute(
+    appName: string,
+    port: number,
+    opts?: { skipCaddyReload?: boolean }
+  ): Promise<void> {
     if (!this.router || !port) return;
 
     try {
@@ -2398,6 +4242,18 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       if (hasCustomDomains && this.appConfigService) {
         const owners = this.appConfigService.getDomainOwners(domainSuffix);
         acceptedCustomDomains = domains.filter((d) => {
+          // The platform's OWN host is not in `owners` — it is not an app — so
+          // it read as unclaimed, and unclaimed means available. A tenant
+          // claiming it gets a Caddy block for DROP's hostname pointing at
+          // their app, which serves DROP's OAuth and MCP endpoints: a victim's
+          // control-plane token delivered straight to a tenant.
+          if (isReservedHost(d, getPublicUrl(), domainSuffix)) {
+            this.logger.warn(
+              `Refusing domain '${d}' for ${appName}: reserved by the platform`,
+              'ROUTER'
+            );
+            return false;
+          }
           const owner = owners.get(d.toLowerCase());
           if (owner && owner !== appName) {
             this.logger.warn(
@@ -2432,6 +4288,54 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
             }
           : undefined;
 
+      // DROP-guarded MCP endpoint (Step 11, PR 2b). `source: 'declared'` AND
+      // `auth: 'drop'` — the same pair the verify endpoint requires, so the
+      // Caddy guard and the gateway can never disagree about which apps are
+      // protected. Inference is deliberately excluded: enrolling an app into a
+      // login gate because it depends on the MCP SDK is a decision its owner
+      // never made.
+      const mcpConfig = this.appConfigService?.getConfig(appName)?.mcp;
+      const apiPortUsable = Number.isInteger(this.config.apiPort) && this.config.apiPort > 0;
+      if (mcpConfig?.source === 'declared' && mcpConfig.auth === 'drop' && !apiPortUsable) {
+        // `apiPort` comes from parseInt(env), and `??` does not catch NaN. A
+        // `forward_auth localhost:NaN` fails to parse the WHOLE Caddyfile, not
+        // just this block — every site on the box loses its config. Refuse the
+        // guard instead, and say so: an app that asked to be protected and is
+        // not must never be silent.
+        this.logger.error(
+          `App '${appName}' declares mcp.auth: drop but the API port is not usable ` +
+            `(${String(this.config.apiPort)}); refusing to emit the auth guard. ` +
+            'Its MCP endpoint is NOT protected.',
+          'ROUTER'
+        );
+      }
+      const mcpGuard =
+        mcpConfig?.source === 'declared' && mcpConfig.auth === 'drop' && apiPortUsable
+          ? {
+              path: mcpConfig.path,
+              appName,
+              // 127.0.0.1, not `localhost`: on an IPv6-preferring resolver
+              // `localhost` is ::1, which a Node listener bound to 0.0.0.0 does
+              // not serve. Go's dialer usually falls back, but this removes the
+              // dependency on that.
+              verifyUpstream: `127.0.0.1:${this.config.apiPort}`,
+            }
+          : undefined;
+
+      if (mcpGuard && this.config.isolation !== 'docker') {
+        // The guard lives only in Caddy. Outside docker isolation an app binds
+        // its own port on the host, so the endpoint stays reachable directly on
+        // that port with no OAuth at all. Under docker, containers publish to
+        // 127.0.0.1 only and inter-container traffic is disabled, which closes
+        // it. Emit the guard either way — an edge control beats none — but do
+        // not let an operator believe it is complete.
+        this.logger.warn(
+          `App '${appName}' has a DROP-guarded MCP endpoint, but this platform is not in ` +
+            'docker isolation: the app port is reachable directly, bypassing the guard.',
+          'ROUTER'
+        );
+      }
+
       // Configure route for each domain
       let resolvedPublicUrl: string | undefined;
       for (const hostname of domains) {
@@ -2450,6 +4354,11 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
             ? { certFile: customTls.certFile, keyFile: customTls.keyFile }
             : (enableSsl ? { auto: true } : undefined),
           headers: tenantSecurityHeaders,
+          // DROP-guarded MCP endpoint (Step 11). Only for an app that DECLARED
+          // it — an inferred label must never put a login gate in front of
+          // someone's app — and only when the API port is known, since the
+          // guard is a proxy to DROP's own verify endpoint.
+          ...(mcpGuard ? { mcpAuth: mcpGuard } : {}),
         });
 
         const protocol = enableSsl ? 'https' : 'http';
@@ -2483,9 +4392,10 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         await this.appConfigService.updateConfig(appName, { publicUrl: resolvedPublicUrl });
       }
 
-      // Reload Caddy to apply new routes
-      if (this.caddyServer && this.caddyServer.getStatus() === 'running') {
-        await this.caddyServer.reload();
+      // Reload Caddy to apply new routes — unless the caller is batching
+      // several of these into one trailing reload (opts.skipCaddyReload).
+      if (!opts?.skipCaddyReload) {
+        await this.reloadCaddyIfRunning();
       }
     } catch (error) {
       // Surface at error level: a failed reload means this (and every
@@ -2493,6 +4403,62 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       // intervenes — not a benign "route already exists".
       this.logger.error(`Failed to configure route for ${appName}`, 'ROUTER', error);
     }
+  }
+
+  /** Reload Caddy iff it's actually running — the guard every caller of caddyServer.reload() already repeated inline. */
+  private async reloadCaddyIfRunning(): Promise<void> {
+    if (this.caddyServer && this.caddyServer.getStatus() === 'running') {
+      await this.caddyServer.reload();
+    }
+  }
+
+  /**
+   * The shim tenant-authored build commands are executed through.
+   *
+   * Under docker isolation this returns a runner that executes `install`,
+   * `build` and any drop.yaml hook INSIDE an ephemeral build container (own
+   * user, `CapDrop: ALL`, no docker socket). Returning `undefined` makes the
+   * builder fall back to `executeCommand`, i.e. a plain host `child_process`
+   * running as the platform user — who is in the `docker` group on an
+   * isolation=docker box and therefore root-equivalent. A tenant `postinstall`
+   * on that path reaches every other tenant's data, `encryption.key` and
+   * `api-credentials.json`.
+   *
+   * It exists as a helper because BOTH build entry points must use it and one
+   * of them silently did not: `handleBuildApp` built this inline while
+   * `handleAppUpdate` — the path every upload and git REDEPLOY of an existing
+   * app takes — passed no `execCommand` at all. Keep both call sites on this
+   * method; a third build path must call it too.
+   */
+  private buildExecCommandFor(
+    appType: AppType,
+    appName: string
+  ): ReturnType<typeof createContainerExecCommand> | undefined {
+    // Host isolation: there is no build container, and running the command on
+    // the host is the intended behaviour, not a fallback.
+    if (this.config.isolation !== 'docker') {
+      return undefined;
+    }
+
+    // FAIL CLOSED. Configured for docker isolation but without a container
+    // runtime is not "run it on the host anyway" — that silently converts a
+    // misconfiguration (or a shutdown window, where stop() nulls the runtime
+    // while a build is still going) into executing an untrusted command
+    // unconfined as a user in the docker group. Refuse instead: the build
+    // fails loudly, the previously-deployed version keeps serving, and the
+    // operator sees a config error rather than an invisible sandbox bypass.
+    if (this.runtime?.type !== 'docker') {
+      throw new Error(
+        'Refusing to build: DROP_ISOLATION=docker but no container runtime is available. ' +
+          'Building would run this app’s install/build commands directly on the host.'
+      );
+    }
+
+    return createContainerExecCommand(
+      (this.runtime as import('../managers/runtime').ContainerManager).docker,
+      appType,
+      appName
+    );
   }
 
   /**
@@ -2503,7 +4469,8 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     appName: string,
     appPath: string,
     reason: string,
-    bypassCooldown?: boolean
+    bypassCooldown?: boolean,
+    actor?: DeployActorInfo
   ): Promise<void> {
     if (!this.runtime || !this.stateManager || !this.detector || !this.builder) return;
 
@@ -2542,13 +4509,36 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       Object.keys(containerYaml.config.services).length > 0
     ) {
       if (bypassCooldown) {
+        // GUARDRAIL. This branch RETURNS below, above the gate on the ordinary
+        // rebuild path, and expandMonorepo is one of the most expensive things
+        // on the box: a git pull plus an fs.rm/fs.cp of every child tree plus a
+        // build per service. Whether an app takes this branch is decided by the
+        // caller's own drop.yaml (`services:`), so leaving it ungated let any
+        // caller opt into an unmetered build loop.
+        const containerKeys = this.guardrailKeys(appName, false, actor ?? {});
+        const containerVerdict = this.checkGuardrails(containerKeys);
+        if (!containerVerdict.allowed) {
+          const refusal =
+            `Too many failed deploys (${containerVerdict.failures}). ` +
+            `Retry in ${containerVerdict.retryAfterSeconds}s.`;
+          this.logger.warn(`Re-expansion of '${appName}' refused by guardrail: ${refusal}`, 'MONOREPO');
+          this.releaseGuardrailKeys(appName);
+          this.failDeployEpisode(appName, new Error(refusal), crypto.randomUUID(), 'GUARDRAIL_TRIPPED');
+          return;
+        }
+        this.breakerKeys.set(appName, containerKeys);
+
         this.logger.info(`Re-expanding monorepo container '${appName}' (explicit redeploy)`, 'MONOREPO');
         // Same in-progress bracket as the app:detected interception: blocks a
         // concurrent DELETE (409) and re-entrant updates while child folders
         // are re-materialized out from under running apps.
         this.appsInProgress.add(appName);
         try {
-          await this.expandMonorepo(appPath, appName, containerYaml.config);
+          await this.expandMonorepo(appPath, appName, containerYaml.config, actor);
+          this.recordDeployOutcome(appName, true);
+        } catch (err) {
+          this.recordDeployOutcome(appName, false);
+          throw err;
         } finally {
           this.appsInProgress.delete(appName);
         }
@@ -2558,6 +4548,30 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           'UPDATE'
         );
       }
+      return;
+    }
+
+    // The mirror of the container guard above, and deliberately AFTER it so the
+    // container is identified positively (by its own `services:` map) before
+    // anything is refused for being grouped — otherwise a container that ever
+    // gained a `group` in its AppConfig would stop re-expanding, silently.
+    //
+    // An INCIDENTAL file-settle on a materialized CHILD is almost always the
+    // container's own fs.cp landing in that folder, so rebuilding here races
+    // the expansion that is writing the files: the child rebuilds against a
+    // half-copied tree, and a static child ends up serving a build output that
+    // was replaced underneath it.
+    //
+    // Only the incidental path is refused. An explicit redeploy still runs —
+    // refusing it would be worse — though note such a build lands in a tree the
+    // container will fs.rm on its next expansion, so it survives only until the
+    // next group redeploy. Redirecting that path to the container is follow-up
+    // work, not something to guess at here.
+    if (!bypassCooldown && this.isGroupedChild(appName)) {
+      this.logger.debug(
+        `Skipping incidental update for grouped child '${appName}' — its monorepo container owns rebuilds`,
+        'MONOREPO'
+      );
       return;
     }
 
@@ -2602,6 +4616,43 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     const originalPort = appState.port;
     const wasRunning = appState.status === 'running';
 
+    // GUARDRAIL. A SECOND choke point, not a duplicate: handleAppUpdate does
+    // not route through handleBuildApp — it has its own build — so the Step 7
+    // gate covered only FIRST deploys. Redeploy is the path an agent loop
+    // actually rides (deploy, fail, "fix", redeploy, fail), and it is where
+    // upload-deploy and git-redeploy send every app that already exists.
+    //
+    // Deliberately here, below every skip guard above (in-progress, monorepo
+    // container, cooldown, unregistered, user-stopped) and below the
+    // `reason`/`wasRunning` reads: each of those returns without deploying, and
+    // an update that never deploys must neither be refused nor leave a key in
+    // breakerKeys for some later episode's outcome to be recorded against.
+    const guardKeys = this.guardrailKeys(appName, false, actor ?? {});
+    const verdict = this.checkGuardrails(guardKeys);
+    if (!verdict.allowed) {
+      const refusal =
+        `Too many failed deploys (${verdict.failures}). Retry in ${verdict.retryAfterSeconds}s.`;
+      this.logger.warn(`Redeploy of ${appName} refused by guardrail: ${refusal}`, 'UPDATE');
+      // Released BEFORE reporting. failDeployEpisode records a failure, and a
+      // key left over from an earlier aborted episode would receive it — so
+      // every refused retry would push a new failure into the window that
+      // refused it and re-arm the cooldown, extending its own lockout forever.
+      this.releaseGuardrailKeys(appName);
+      // Suppress the watcher's follow-up. upload-deploy LANDS the files before
+      // publishing app:update, so a refusal here does not undo the write — and
+      // those writes are inside the watched tree. Without this the watcher's
+      // debounced flush would republish app:update with NO actor moments later,
+      // laundering the refused build into the `watcher::<app>` bucket and
+      // running it anyway. An explicit redeploy still bypasses this and is
+      // re-gated above, which is the intended behaviour.
+      this.appDeployTimes.set(appName, Date.now());
+      // Reported as a normal deploy failure so a caller polling for an outcome
+      // gets an answer instead of waiting out its budget.
+      this.failDeployEpisode(appName, new Error(refusal), crypto.randomUUID(), 'GUARDRAIL_TRIPPED');
+      return;
+    }
+    this.breakerKeys.set(appName, guardKeys);
+
     this.logger.info(`Hot-reload triggered for ${appName}: ${reason}`, 'UPDATE');
     this.appsInProgress.add(appName);
 
@@ -2617,6 +4668,10 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         `Skipping hot-reload of ${appName}: insufficient disk (${Math.round(disk.freeMb)} MB free, need ${getMinFreeDiskMb()} MB)`,
         'UPDATE'
       );
+      // Released, not counted: the build never ran, and the box being full is
+      // not evidence the caller is looping. Leaving the key set would hand this
+      // episode's slot to whatever outcome is recorded next.
+      this.releaseGuardrailKeys(appName);
       this.appsInProgress.delete(appName);
       return;
     }
@@ -2647,8 +4702,13 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       }
 
       const workDir = await this.getBuildWorkDir(appName);
+      // Same mint-and-thread as handleBuildApp. This path must NOT be skipped:
+      // upload-deploy routes every EXISTING app here, so it is the dominant
+      // path for an agent redeploying, and threading only the fresh-deploy path
+      // would leave exactly those builds unaddressable.
+      const updateDeployId = crypto.randomUUID();
       const updateLogId = this.buildLogService
-        ? await this.buildLogService.startBuild(appName, new Date())
+        ? await this.buildLogService.startBuild(appName, new Date(), updateDeployId)
         : null;
       // Mark this app self-managed only around build(): the build:completed it
       // emits is dispatched synchronously inside build(), so buildSub sees the
@@ -2663,6 +4723,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         buildResult = await this.builder.build({
           appName,
           appPath,
+          deployId: updateDeployId,
           appType: detection.type,
           framework: detection.framework || null,
           config: {
@@ -2671,15 +4732,23 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           },
           env: buildEnv,
           workDir,
+          // Parity with handleBuildApp — see buildExecCommandFor. Without this
+          // every redeploy of an EXISTING app ran its tenant-authored install
+          // and build commands on the host instead of inside the build
+          // container, and this is the path upload-deploy and git redeploy both
+          // take, i.e. the common one.
+          execCommand: this.buildExecCommandFor(detection.type, appName),
           onBuildLog: updateLogId && this.buildLogService
             ? (line) => this.buildLogService!.writeLine(updateLogId, line)
             : undefined,
         });
       } finally {
         this.selfManagedUpdates.delete(appName);
-      }
-      if (updateLogId && this.buildLogService) {
-        await this.buildLogService.finishBuild(updateLogId, appName);
+        // Also in the finally: resolveBuildEnv/parseDropYaml above can throw,
+        // and the close used to sit after this block — so a throw leaked the
+        // log's write stream and skipped retention, exactly as on the fresh
+        // deploy path.
+        await this.closeBuildLog(updateLogId, appName);
       }
 
       if (!buildResult.success) {
@@ -2695,6 +4764,21 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         } else {
           await this.stateManager.setAppStatus(appName, 'errored', { error: buildError });
         }
+        this.recordDeployOutcome(appName, false);
+        this.appsInProgress.delete(appName);
+        return;
+      }
+
+      // Manual promotion holds HERE, before the stop. This is the branch SEC-9
+      // found broken in the withhold-the-route design: on a redeploy the route
+      // already exists, so gating it did nothing and unapproved code went live
+      // the instant the new process started. Holding before the stop leaves the
+      // approved version running and serving, untouched.
+      if (await this.holdForPromotion(appName, buildResult.outputPath ?? undefined, updateDeployId)) {
+        // A held build is not a failed one — the guardrail window must not be
+        // charged for a deploy the operator asked to be held.
+        this.releaseGuardrailKeys(appName);
+        await this.stateManager.setAppStatus(appName, appState.status);
         this.appsInProgress.delete(appName);
         return;
       }
@@ -2734,9 +4818,18 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         detection,
         buildResult.outputPath ?? undefined
       );
+      await this.noteRuntimeLogStart(appName);
       const status = await this.runtime.start(spec);
 
       this.logger.appEvent('started', appName, `PID ${status.pid}, port ${port} (hot-reloaded)`);
+
+      // Record the signature this hot-reload landed at (M1) — a git/upload
+      // redeploy that never recorded here would look "unchanged" for a whole
+      // extra boot cycle. runtime.start() (above) always recreates the
+      // container in docker mode, so the runtime-spec revision recorded here
+      // is accurate too. Fire-and-forget (`void`), not awaited: must never
+      // delay the 'running' status write or appsInProgress's release.
+      void this.recordDeploySignature(appName, appPath);
 
       await this.stateManager.setAppStatus(appName, 'running', {
         port,
@@ -2746,12 +4839,13 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       // Record deploy time for cooldown
       this.appDeployTimes.set(appName, Date.now());
 
-      // Re-arm the health prober — stopHealthProber above tore it down and it
-      // must restart against the new (hot-reloaded) process.
-      if (spec.healthCheckPath && this.runtime?.type === 'pm2') {
-        this.startHealthProber(appName, port, spec.healthCheckPath);
-      }
+      // Re-arm the health prober AND the crash-loop watch — stopHealthProber
+      // above tore the prober down, and armPostDeployWatches re-baselines the
+      // crash-loop watch's restart count against the NEW (hot-reloaded)
+      // process rather than continuing to watch the old one's count.
+      this.armPostDeployWatches(appName, port, spec.healthCheckPath);
 
+      this.recordDeployOutcome(appName, true);
       this.appsInProgress.delete(appName);
     } catch (error) {
       // Secret preflight park (PRD-051) on a hot-reload — e.g. the edited
@@ -2767,6 +4861,15 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         await this.stateManager.setAppStatus(appName, 'needs-config', {
           missingSecrets: error.missingSecrets,
         });
+        // COUNTED, unlike the pre-build deferrals. AppNeedsConfigError is
+        // thrown from buildFreshStartSpec, which runs AFTER builder.build() has
+        // completed — so the install and build were already paid for. The
+        // `secrets:` block that triggers it is tenant-controlled and both
+        // upload-deploy and git-redeploy publish with bypassCooldown, so
+        // leaving it uncounted made `deploy → full build → park → deploy` a
+        // free, unbounded loop. (An earlier revision likened this to MAX_BUILDS;
+        // that was wrong — MAX_BUILDS aborts BEFORE the build.)
+        this.recordDeployOutcome(appName, false);
         this.appsInProgress.delete(appName);
         return;
       }
@@ -2774,6 +4877,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       await this.stateManager.setAppStatus(appName, 'errored', {
         error: error instanceof Error ? error.message : 'Hot-reload failed',
       });
+      this.recordDeployOutcome(appName, false);
       this.appsInProgress.delete(appName);
     }
   }
@@ -2893,9 +4997,21 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
 
         const detection = await this.detector.detect(appPath, { silent: true });
         const { spec, port } = await this.buildFreshStartSpec(appName, appPath, detection);
+        // Also here, even though a plain restart opens no deploy episode and
+        // the store will discard it — so that a start site is never the one
+        // that was forgotten if restarts later become addressable.
+        await this.noteRuntimeLogStart(appName);
         const status = await this.runtime.start(spec);
 
         this.logger.appEvent('started', appName, `PID ${status.pid}, port ${port} (restarted)`);
+
+        // Record the signature this restart landed at (M1) — a restart is
+        // the only apply point for a rotated secret (no other restart hook
+        // exists), and runtime.delete()+start() above always recreates the
+        // container in docker mode, so the runtime-spec revision recorded
+        // here is accurate too. Fire-and-forget (`void`), not awaited: must
+        // never delay the 'running' status write or appsInProgress's release.
+        void this.recordDeploySignature(appName, appPath);
 
         await this.stateManager.setAppStatus(appName, 'running', {
           port,
@@ -2908,9 +5024,11 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         // user change and trigger a spurious hot-reload.
         this.appDeployTimes.set(appName, Date.now());
 
-        if (spec.healthCheckPath && this.runtime.type === 'pm2') {
-          this.startHealthProber(appName, port, spec.healthCheckPath);
-        }
+        // Re-arm the health prober AND the crash-loop watch. Note: this
+        // resets crash-loop detection's restart-count baseline rather than
+        // continuing whatever watch (if any) was already running — correct,
+        // since delete()+start() above is a genuinely new process/container.
+        this.armPostDeployWatches(appName, port, spec.healthCheckPath);
 
         return status;
       } catch (error) {
@@ -2947,7 +5065,10 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
    * (e.g. no provisioned database, PM2 already gone) never aborts the rest
    * of the teardown.
    */
-  private async teardownApp(name: string, opts: { keepData?: boolean } = {}): Promise<void> {
+  private async teardownApp(
+    name: string,
+    opts: { keepData?: boolean; skipDatabaseBackup?: boolean } = {}
+  ): Promise<void> {
     // Resolve the on-disk path BEFORE removing config/state — both are the
     // only places it's recorded, and both get deleted below.
     const appPath =
@@ -2977,7 +5098,9 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
 
     if (!opts.keepData) {
       try {
-        await this.dbProvisioner?.backupAndDeleteAppDatabase(name);
+        await this.dbProvisioner?.backupAndDeleteAppDatabase(name, {
+          skipBackup: opts.skipDatabaseBackup === true,
+        });
       } catch (err) {
         this.logger.warn(`Database teardown failed for ${name}`, 'DATABASE', err);
       }
@@ -3008,6 +5131,12 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       // Deploy tracker may not be initialised
     }
 
+    // Deploy DETAILS are deliberately NOT purged here. They are retained for a
+    // window instead (purgeAppArtifacts -> retainForApp), which is the whole
+    // point of D4: a deploy that failed and was then torn down is exactly the
+    // one a caller still wants to ask about. Hard-purging here would also run
+    // BEFORE purgeAppArtifacts, so retention would find nothing left to copy.
+
     try {
       await this.appConfigService?.deleteConfig(name);
     } catch {
@@ -3018,6 +5147,59 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       await fs.rm(appPath, { recursive: true, force: true });
     } catch {
       // Folder may already be gone
+    }
+
+    await this.purgeAppArtifacts(name, opts);
+  }
+
+  /**
+   * Remove the name-keyed artifacts that live OUTSIDE the app folder.
+   *
+   * Deleting an app frees its name, and all three of these are addressed by
+   * name, so leaving them behind hands the next registrant the previous
+   * tenant's data:
+   *  - `data/logs/webapps/<name>/` and `data/logs/builds/<name>/` —
+   *    `/logs/:name` and `/logs/:name/build[s]` authorize against the LIVE app
+   *    and then read by name (npm/pip output, `build_env` values, source
+   *    fragments, app stdout/stderr).
+   *  - `data/appdata/<name>/` — the app's `DROP_DATA_DIR`: SQLite files,
+   *    uploads, cached credentials, read-write to whoever gets the name next.
+   *
+   * Logs go unconditionally: `keepData` protects the user's DATA (database,
+   * Redis, and appdata), whereas logs are DROP-generated diagnostics about an
+   * app that no longer exists.
+   *
+   * Shared with `DELETE /apps/:name` through the platform-ops seam — that
+   * route runs its own inline teardown rather than calling `teardownApp`
+   * (which only `removeGroup` uses), so a fix applied here alone would miss
+   * essentially every real deletion. Best-effort; never throws.
+   */
+  async purgeAppArtifacts(name: string, opts: { keepData?: boolean } = {}): Promise<void> {
+    // BEFORE the deletes below, not after. Deploy details hold byte offsets
+    // into the very log files this is about to remove, and those paths are
+    // keyed on the app NAME — which this teardown frees for anyone to
+    // re-register. Copying each retained deploy's slice out first is what
+    // stops a retained record later resolving to the NEXT tenant's output
+    // (SEC-3). Hooked here rather than at the two delete call sites because
+    // this method is the single funnel both of them go through.
+    try {
+      await getDeployDetailStore().retainForApp(name, opts);
+    } catch (error) {
+      // Never block a delete that is already happening.
+      this.logger.warn(`Failed to retain deploy details for ${name}`, 'CLEANUP', error);
+    }
+
+    const targets = [
+      path.join(this.config.dropRoot, 'data', 'logs', 'webapps', name),
+      path.join(this.config.dropRoot, 'data', 'logs', 'builds', name),
+      ...(opts.keepData ? [] : [path.join(this.config.dropRoot, 'data', 'appdata', name)]),
+    ];
+    for (const dir of targets) {
+      try {
+        await fs.rm(dir, { recursive: true, force: true });
+      } catch (error) {
+        this.logger.warn(`Failed to remove ${dir}`, 'CLEANUP', error);
+      }
     }
   }
 
@@ -3067,25 +5249,50 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       }
     }
 
-    // Defense-in-depth before a recursive fs.rm: the container path is derived
-    // from a `group` tag. That tag is already transitively constrained to
-    // [A-Za-z0-9_-] (expandMonorepo only creates children whose `<group>-<svc>`
-    // name passes that regex), but re-assert it here so this destructive delete
-    // can never escape the webapps directory even if a group value is ever set
-    // by a future/other code path. Kept even with the entry-driven teardown
-    // above: it also covers unmarked phantoms from older platform versions
-    // (where the folder name equals the group name).
-    if (/^[a-zA-Z0-9_-]+$/.test(groupName)) {
+    // The name-derived sweep, for an UNMARKED PHANTOM: a container folder left
+    // by an older platform version with no state entry of its own. Every
+    // container that HAS an entry was already removed above through its own
+    // recorded path, and `teardownApp` deregisters state + config — so by this
+    // point a legitimately torn-down container no longer holds its name.
+    //
+    // `groupName` is TENANT-AUTHORED (drop.yaml `group:`, validated only as a
+    // non-empty string) and `<appsDirectory>/<groupName>` is exactly where every
+    // other app lives. Deleting that path on the NAME alone let one tenant
+    // declare another tenant's app as their group and have the folder recursively
+    // removed — reachable with no interactive step at all from the ephemeral
+    // reaper, which calls this on a timer.
+    //
+    // The character-class check is CONTAINMENT, never authorization: it proves
+    // the path cannot escape the webapps directory and proves nothing about who
+    // owns it. So refuse whenever the name still resolves to something
+    // REGISTERED — that is someone's app. If it belonged to this group it was
+    // torn down above via its own entry; if it did not, it is not ours to touch.
+    // Fails CLOSED. If the registry cannot be consulted there is no way to tell
+    // whose folder this is, and an unverifiable recursive delete of a path built
+    // from a tenant string is precisely what this guard exists to prevent.
+    const claimedByAnApp =
+      !this.stateManager ||
+      !this.appConfigService ||
+      this.stateManager.hasApp(groupName) ||
+      this.appConfigService.hasConfig(groupName);
+
+    if (!/^[a-zA-Z0-9_-]+$/.test(groupName)) {
+      this.logger.warn(
+        `Refusing to remove container folder for group '${groupName}': unsafe name`,
+        'MONOREPO'
+      );
+    } else if (claimedByAnApp) {
+      this.logger.warn(
+        `Refusing name-derived container-folder removal for group '${groupName}': ` +
+          'a registered app holds that name',
+        'MONOREPO'
+      );
+    } else {
       try {
         await fs.rm(path.join(this.config.appsDirectory, groupName), { recursive: true, force: true });
       } catch (err) {
         this.logger.warn(`Failed to remove group container folder for '${groupName}'`, 'MONOREPO', err);
       }
-    } else {
-      this.logger.warn(
-        `Refusing to remove container folder for group '${groupName}': unsafe name`,
-        'MONOREPO'
-      );
     }
 
     return { removed };
@@ -3115,6 +5322,65 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       this.DEPLOY_COOLDOWN_MS_MAX,
       Math.max(this.DEPLOY_COOLDOWN_MS_MIN, last * 2)
     );
+  }
+
+  /**
+   * One bounded, single-shot probe of a boot-reconciliation SKIP candidate
+   * (M1 review item 1, round-2 diff pass — CRITICAL). Deliberately NOT
+   * awaitReadiness: that's a per-deploy 60s polling loop, and running it here
+   * — serially per app, on the boot path — would reintroduce exactly the
+   * blocking-startup problem item 9 exists to bound. This mirrors only
+   * awaitReadiness's TAIL classification (a bound alone satisfies PM2, but
+   * not Docker, whose userland proxy accepts connections before the
+   * in-container app listens; an unbound port with no declared healthCheck
+   * is the same "background worker" exemption), with no retry — the app is
+   * already believed running, so one answer (or one silence) is the verdict.
+   * Converts "the runtime says it's up" into "it answers": restartApp and
+   * handleAppUpdate write status 'running' immediately after runtime.start()
+   * with no readiness gate of their own, so a wedged app can otherwise carry
+   * a matching signature straight through to a routing-only skip that never
+   * actually checks it.
+   */
+  private async probeSkipReadiness(port: number, healthCheckPath: string | undefined): Promise<boolean> {
+    const isDocker = this.config.isolation === 'docker';
+    const bound = await probePort('127.0.0.1', port, 1000);
+    if (bound) {
+      const r = await probeHttp('127.0.0.1', port, healthCheckPath || '/', 3000);
+      if (r.responded) return true;
+      // Bound but no HTTP answer: PM2 accepts a bare bind (awaitReadiness's
+      // own leniency for a slow-booting app); Docker's userland proxy
+      // accepts connections before the in-container app listens, so a bind
+      // alone proves nothing there — the HTTP answer is required.
+      return !isDocker;
+    }
+    // Not bound: a declared healthCheck means this app is expected to serve
+    // HTTP, so an unbound port is a real failure. No healthCheck at all is
+    // awaitReadiness's own "background worker" exemption — never expected to
+    // bind, so absence proves nothing.
+    return !healthCheckPath;
+  }
+
+  /**
+   * Arm the two watches that keep an already-running app supervised: the
+   * health prober (PM2 mode only, and only when the app declares a
+   * healthCheckPath — Docker uses its own HEALTHCHECK mechanism) and the
+   * crash-loop watch (both modes, unconditional — see startCrashLoopWatch,
+   * which re-baselines the restart count each time this is called, so a
+   * fresh process/container always starts its crash-loop watch from zero).
+   * Shared by every path that leaves an app running and must supervise it:
+   * handleStartApp (a fresh deploy), handleAppUpdate (hot-reload),
+   * restartApp, and reconcileAppsOnBoot's skip path (M1: an app left
+   * running, unbuilt, across a restart) — a boot-skipped app is never
+   * watched worse than a freshly deployed one, and neither a hot-reloaded
+   * nor a restarted app is left with a prober but no crash-loop watch. A
+   * skip (or any of these) with no crash-loop watch would silently stop
+   * noticing a dead or crash-looping app for the rest of the process's life.
+   */
+  private armPostDeployWatches(appName: string, port: number, healthCheckPath: string | undefined): void {
+    if (healthCheckPath && this.runtime?.type === 'pm2') {
+      this.startHealthProber(appName, port, healthCheckPath);
+    }
+    this.startCrashLoopWatch(appName);
   }
 
   /**
@@ -3177,12 +5443,33 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
    * before the in-container app listens), so in docker mode the HTTP probe is
    * required; in PM2 mode a bind is sufficient (lenient for slow-booting apps).
    * Never throws.
+   *
+   * SCOPE of the `{ ok: true, warning }` branch — narrower than it looks, and
+   * the reason AppState.readinessUnverified does not catch every wrong-port
+   * app. It is reachable only for:
+   *   - docker + port bound + no HTTP answer, or
+   *   - a declared `healthCheckPath` whose port never bound.
+   * Under PM2 with no declared health check, an app listening on the WRONG
+   * port hits the background-worker exemption above and resolves to a plain
+   * `{ ok: true }` with no warning at all — so it is reported as verified.
+   * Any test asserting wrong-port detection must therefore run in docker mode
+   * or declare a healthCheck, or it asserts nothing.
    */
   private async awaitReadiness(
     appName: string,
     port: number,
     spec: AppStartSpec
-  ): Promise<{ ok: boolean; reason?: string; warning?: string }> {
+  ): Promise<{
+    ok: boolean;
+    reason?: string;
+    /**
+     * DROP-generated category for the failure, alongside the human `reason`
+     * string. Consumers must key on this, never parse `reason` — that text is
+     * diagnostic and free to change.
+     */
+    failure?: DeployFailureReason;
+    warning?: string;
+  }> {
     if (!this.runtime) return { ok: true };
     const windowMs = this.readinessTimeoutMs;
     const isDocker = this.config.isolation === 'docker';
@@ -3190,21 +5477,48 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     const baselineRestarts = (await this.runtime.getStatus(appName))?.restarts ?? 0;
     const start = Date.now();
 
-    /** Whether the process died or restarted (crash-loop) since start. */
-    const liveness = async (): Promise<{ dead: boolean; crashed: boolean }> => {
+    /**
+     * Whether the process died or restarted (crash-loop) since start, and
+     * whether the runtime CONFIRMED an OOM kill.
+     *
+     * `oomKilled` rides on the `dead` branch only, and that is not an
+     * oversight: DROP runs containers with `RestartPolicy: on-failure`, and
+     * Docker clears `State.OOMKilled` on the new run — so a container that is
+     * back up after an OOM reports `false`. The flag is therefore readable
+     * exactly when the app has stopped for good, which is the `dead` case.
+     * A crash-loop that happens to be OOM is reported as `crash-looped`,
+     * because at that moment nothing can prove otherwise.
+     */
+    const liveness = async (): Promise<{ dead: boolean; crashed: boolean; oomKilled: boolean }> => {
       const info = await this.runtime?.getStatus(appName);
       if (!info || info.status === 'stopped' || info.status === 'errored') {
-        return { dead: true, crashed: false };
+        return { dead: true, crashed: false, oomKilled: info?.oomKilled === true };
       }
-      return { dead: false, crashed: info.restarts > baselineRestarts };
+      return { dead: false, crashed: info.restarts > baselineRestarts, oomKilled: false };
     };
+
+    /** The configured ceiling, named in the reason so the app owner can act. */
+    const limitText = spec.limits?.memory ? ` (memory limit ${spec.limits.memory})` : '';
+    const oomVerdict = () => ({
+      ok: false,
+      reason: `killed for exceeding its memory limit${limitText}`,
+      failure: 'oom-killed' as const,
+    });
 
     // Poll: succeed as soon as an HTTP probe answers; fail as soon as the
     // process dies or crash-loops.
     while (Date.now() - start < windowMs) {
       const l = await liveness();
-      if (l.dead) return { ok: false, reason: 'process exited during startup' };
-      if (l.crashed) return { ok: false, reason: 'process crash-looped during startup' };
+      if (l.dead) {
+        if (l.oomKilled) return oomVerdict();
+        return { ok: false, reason: 'process exited during startup', failure: 'process-exited' };
+      }
+      if (l.crashed)
+        return {
+          ok: false,
+          reason: 'process crash-looped during startup',
+          failure: 'crash-looped',
+        };
       if (await probePort('127.0.0.1', port, 1000)) {
         const r = await probeHttp('127.0.0.1', port, healthPath, 3000);
         if (r.responded) return { ok: true };
@@ -3214,8 +5528,12 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
 
     // Window elapsed with no HTTP success — classify the (stable) process.
     const l = await liveness();
-    if (l.dead) return { ok: false, reason: 'process exited during startup' };
-    if (l.crashed) return { ok: false, reason: 'process crash-looped during startup' };
+    if (l.dead) {
+      if (l.oomKilled) return oomVerdict();
+      return { ok: false, reason: 'process exited during startup', failure: 'process-exited' };
+    }
+    if (l.crashed)
+      return { ok: false, reason: 'process crash-looped during startup', failure: 'crash-looped' };
     const bound = await probePort('127.0.0.1', port, 1000);
     if (!bound && !spec.healthCheckPath) return { ok: true }; // worker: no port, no health check
     if (bound && !isDocker) return { ok: true }; // PM2: a bind proves it's listening
@@ -3256,13 +5574,23 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         }
         if (this.stateManager?.getApp(appName)?.status !== 'running') return;
         if (info.restarts - baseline >= this.CRASHLOOP_RESTART_THRESHOLD) {
+          // Docker clears OOMKilled on the next run, so this is true only on a
+          // tick that catches the app down. When it does, say so — "restarting
+          // repeatedly" sends an operator looking for a crash bug, and raising
+          // the memory limit is a different fix entirely.
+          const oom = info.oomKilled === true;
           this.logger.appEvent(
             'error',
             appName,
-            `crash-looping (${info.restarts - baseline} restarts since deploy)`
+            oom
+              ? `crash-looping — killed for exceeding its memory limit ` +
+                  `(${info.restarts - baseline} restarts since deploy)`
+              : `crash-looping (${info.restarts - baseline} restarts since deploy)`
           );
           await this.stateManager?.setAppStatus(appName, 'crash-looping', {
-            error: 'Process is restarting repeatedly',
+            error: oom
+              ? 'Killed for exceeding its memory limit'
+              : 'Process is restarting repeatedly',
           });
           baseline = info.restarts; // re-baseline so we don't re-flag every tick
         }
@@ -3272,6 +5600,376 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     }, 30_000);
     interval.unref?.();
     this.crashLoopWatchers.set(appName, interval);
+  }
+
+  /**
+   * Periodic per-app disk accounting (Step 8c).
+   *
+   * Its own timer rather than riding the log-retention sweep: that one runs
+   * DAILY, and a day of unchecked growth is most of a disk. Hourly bounds the
+   * overshoot to what an app can write in an hour.
+   */
+  private startDiskCeilingSweep(): void {
+    if (this.diskSweepTimer) return;
+    if (configuredCeilingBytes() <= 0) {
+      this.logger.debug('Disk ceiling disabled (DROP_MAX_APP_DISK_MB=0)', 'DISK');
+      return;
+    }
+    void this.sweepDiskCeiling();
+    this.diskSweepTimer = setInterval(() => void this.sweepDiskCeiling(), DISK_SWEEP_INTERVAL_MS);
+    this.diskSweepTimer.unref?.();
+  }
+
+  /**
+   * Measure every app and park the ones over their ceiling.
+   *
+   * PARK = stop + an explicit reason, never a delete. The whole point is to
+   * stop growth while leaving the evidence — and the data — in place for an
+   * operator to look at. A ceiling that deleted would turn a misconfigured
+   * limit into data loss.
+   */
+  private async sweepDiskCeiling(): Promise<void> {
+    if (!this.stateManager || !this.runtime) return;
+    try {
+      const apps = this.stateManager.getAllApps().filter((a) => !a.isGroupContainer);
+      const targets = apps.map((app) => ({
+        name: app.name,
+        // Both trees the app can grow: its own source/build output, and its
+        // persistent data dir. Logs are excluded — those are DROP-generated and
+        // already bounded by log retention, and charging an app for DROP's own
+        // diagnostics would park apps for being verbose.
+        paths: [
+          app.path,
+          path.join(this.config.dropRoot, 'data', 'appdata', app.name),
+        ],
+        maxDiskMb: this.appConfigService?.getConfig(app.name)?.maxDiskMb,
+      }));
+
+      const over = await findOverCeiling(targets);
+      for (const verdict of over) {
+        const app = this.stateManager.getApp(verdict.name);
+        // Only a LIVE app is worth stopping. Parking something already stopped
+        // would rewrite its reason on every sweep and bury the real one.
+        if (!app || (app.status !== 'running' && app.status !== 'crash-looping')) continue;
+
+        const reason =
+          `Over its disk ceiling: ${toMb(verdict.bytes)} MB used of ` +
+          `${toMb(verdict.ceilingBytes)} MB allowed` +
+          (verdict.truncated ? ' (measured tree was truncated, so usage is at least this)' : '');
+        this.logger.warn(`Parking ${verdict.name} — ${reason}`, 'DISK');
+
+        this.stopHealthProber(verdict.name);
+        this.stopCrashLoopWatch(verdict.name);
+        try {
+          await this.runtime.stop(verdict.name);
+        } catch {
+          // Already down, or the runtime is unhappy. Record the park anyway —
+          // the operator still needs to know why, and a stop that failed is not
+          // a reason to leave the reason unwritten.
+        }
+        await this.stateManager.setAppStatus(verdict.name, 'stopped', { parkedReason: reason });
+        await tryLogActivity({
+          action: 'disk-park',
+          appName: verdict.name,
+          userId: app.userId,
+          detail: reason,
+        });
+      }
+    } catch (err) {
+      this.logger.debug(
+        `Disk ceiling sweep failed: ${err instanceof Error ? err.message : 'unknown'}`,
+        'DISK'
+      );
+    }
+  }
+
+  /**
+   * Hold a finished build when the app is set to manual promotion.
+   *
+   * Returns true when the caller must NOT start or swap. The running version is
+   * left exactly as it is — see managers/guardrail/promotion.ts for why the
+   * hold is here rather than at a port swap.
+   */
+  private async holdForPromotion(
+    appName: string,
+    outputPath?: string,
+    deployId?: string
+  ): Promise<boolean> {
+    const mode: PromotionMode = promotionModeFor(
+      this.appConfigService?.getConfig(appName)?.promotion
+    );
+    if (!shouldHoldForPromotion(mode)) return false;
+
+    const pending = {
+      deployId,
+      builtAt: new Date().toISOString(),
+      outputDirectory: outputPath,
+    };
+    await this.appConfigService?.updateConfig(appName, { pendingPromotion: pending });
+
+    const app = this.stateManager?.getApp(appName);
+    // Status is left ALONE on purpose. A running app keeps `running` because
+    // the old version really is still serving; a new app keeps whatever it had
+    // because nothing has ever served. Overwriting it would make the flag lie
+    // about what is running.
+    await this.stateManager?.updateApp(appName, { awaitingPromotion: true });
+
+    this.logger.info(
+      `Build for ${appName} is held awaiting promotion (POST /api/v1/apps/${appName}/promote)`,
+      'PROMOTE'
+    );
+    await tryLogActivity({
+      action: 'promotion-held',
+      appName,
+      userId: app?.userId,
+      detail: `Build held; promotion is manual`,
+    });
+    return true;
+  }
+
+  /**
+   * Put a held build in front of traffic. Owner/admin only — see the route.
+   *
+   * Starts exactly what was built rather than rebuilding: a rebuild could pick
+   * up source that changed since the operator looked, which would promote
+   * something nobody approved.
+   */
+  async promoteApp(appName: string): Promise<void> {
+    const config = this.appConfigService?.getConfig(appName);
+    const pending = config?.pendingPromotion;
+    if (!pending) {
+      throw new Error(`No build is awaiting promotion for '${appName}'`);
+    }
+
+    await this.appConfigService?.updateConfig(appName, { pendingPromotion: undefined });
+    await this.stateManager?.updateApp(appName, { awaitingPromotion: false });
+
+    const app = this.stateManager?.getApp(appName);
+    await tryLogActivity({
+      action: 'promote',
+      appName,
+      userId: app?.userId,
+      detail: `Promoted build from ${pending.builtAt}`,
+    });
+
+    // The swap itself is the ordinary start path, so promotion has no second
+    // implementation of starting an app to drift from the first.
+    this.appsInProgress.add(appName);
+    try {
+      await this.handleStartApp(appName, pending.outputDirectory);
+    } finally {
+      this.appsInProgress.delete(appName);
+    }
+  }
+
+  /**
+   * Idle reaper (Step 9). Sweeps every 15 minutes so a CPU delta reflects a
+   * useful slice of time — an hourly sample would miss short bursts of work
+   * and a one-minute sample is mostly noise.
+   */
+  private startIdleReaper(): void {
+    if (this.idleSweepTimer) return;
+    // NOT gated on idleWindowMs: disabling idle reaping must not also disable
+    // ephemeral expiry, which is a deadline the caller explicitly asked for.
+    // planIdleSweep itself no-ops when the window is 0.
+    if (idleWindowMs() <= 0) {
+      this.logger.debug('Idle reaping disabled; ephemeral expiry still runs', 'REAP');
+    }
+    this.idleSweepTimer = setInterval(() => {
+      void this.sweepExpiredEphemerals().then(() => this.sweepIdleApps());
+    }, 15 * 60 * 1000);
+    this.idleSweepTimer.unref?.();
+  }
+
+  /**
+   * Reap agent-created apps that are demonstrably doing nothing.
+   *
+   * This DELETES, database included, so for each app the first
+   * `DROP_IDLE_REAP_DRY_RUNS` sweeps that would have reaped IT only log what
+   * they would have done. A signal that is subtly wrong should surface as
+   * would-have-reaped lines, not as a fleet that is gone.
+   */
+  private async sweepIdleApps(): Promise<void> {
+    if (!this.stateManager || !this.runtime) return;
+    try {
+      const apps = this.stateManager.getAllApps().filter((a) => !a.isGroupContainer);
+      const candidates = [];
+      for (const app of apps) {
+        const info = await this.runtime.getStatus(app.name).catch(() => null);
+        const config = this.appConfigService?.getConfig(app.name);
+        candidates.push({
+          name: app.name,
+          agentCreated: config?.agentCreated,
+          noReap: config?.noReap,
+          createdAt: app.createdAt,
+          cpuTotalNs: info?.cpuTotalNs,
+          status: app.status,
+        });
+      }
+
+      const { reap, abortReason } = planIdleSweep(candidates, this.idleState, Date.now());
+      if (abortReason) {
+        this.logger.debug(`Idle sweep took no action: ${abortReason}`, 'REAP');
+        return;
+      }
+
+      if (reap.length === 0) {
+        // Distinguishable from a dead timer when someone asks "is the reaper
+        // alive?" — which matters, because a healthy sweep reaps nothing the
+        // overwhelming majority of the time.
+        this.logger.debug('Idle sweep: no candidates', 'REAP');
+        return;
+      }
+
+      // The budget is PER APP, and counts only the sweeps in which that app was
+      // actually a reap candidate.
+      //
+      // Two defects are being avoided here. A budget counted per SWEEP was
+      // spent on no-ops: nothing is reapable until the platform has been up for
+      // a full idle window (the first sweep after a restart re-baselines
+      // lastActive to now) while sweeps run every 15 minutes, so it was gone
+      // ~93 sweeps before the first candidate could exist. A budget counted
+      // once per PROCESS is spent by the first app that legitimately qualifies,
+      // leaving nothing for the app reaped months later on a signal that has
+      // since broken — the case the guard was written for. Per app, per
+      // candidate sweep, every deletion is preceded by exactly N logged
+      // would-reap lines, forever.
+      for (const name of reap) {
+        const seen = (this.idleDryRuns.get(name) ?? 0) + 1;
+        if (seen <= dryRunSweeps()) {
+          this.idleDryRuns.set(name, seen);
+          this.logger.info(
+            `[dry run ${seen}/${dryRunSweeps()}] would reap idle app '${name}'`,
+            'REAP'
+          );
+          // Also recorded durably: a log line nobody was tailing at 3am is not
+          // the operator warning this guard is supposed to be.
+          await tryLogActivity({
+            action: 'idle-reap-dryrun',
+            appName: name,
+            userId: this.stateManager.getApp(name)?.userId,
+            detail: `Idle beyond the reap window (dry run ${seen}/${dryRunSweeps()})`,
+          });
+          continue;
+        }
+        const app = this.stateManager.getApp(name);
+        this.logger.info(`Reaping idle agent-created app '${name}'`, 'REAP');
+        await tryLogActivity({
+          action: 'idle-reap',
+          appName: name,
+          userId: app?.userId,
+          detail: 'Idle beyond the reap window',
+        });
+        // The existing teardown, not a second one — it is the only path that
+        // knows about routes, the database, secrets and deploy history.
+        await this.teardownApp(name).catch((err) => {
+          this.logger.warn(
+            `Idle reap of '${name}' failed: ${err instanceof Error ? err.message : 'unknown'}`,
+            'REAP'
+          );
+        });
+        // Forget it, or a name reused later inherits this app's history —
+        // including its spent dry-run budget, which would let a NEW app of the
+        // same name be deleted with no warning at all.
+        this.idleState.lastCpu.delete(name);
+        this.idleState.lastActive.delete(name);
+        this.idleDryRuns.delete(name);
+      }
+    } catch (err) {
+      this.logger.debug(
+        `Idle sweep failed: ${err instanceof Error ? err.message : 'unknown'}`,
+        'REAP'
+      );
+    }
+  }
+
+  /**
+   * Reap ephemerals whose lifetime has run out (Step 10).
+   *
+   * Runs on the idle sweep's timer rather than its own: both tear apps down,
+   * and two timers racing to delete the same app is a needless hazard.
+   *
+   * Deliberately NOT subject to the idle reaper's liveness precondition. That
+   * exists because idleness is INFERRED and a broken signal looks like a dead
+   * fleet; an expiry is a recorded deadline the caller asked for, so there is
+   * no inference to get wrong.
+   */
+  private async sweepExpiredEphemerals(): Promise<void> {
+    if (!this.appConfigService) return;
+    const now = Date.now();
+    try {
+      const expired = this.appConfigService
+        .getAllConfigs()
+        .filter((c) => c.ephemeral === true && isExpired({ expiresAt: c.expiresAt }, now));
+
+      for (const config of expired) {
+        const app = this.stateManager?.getApp(config.name);
+        this.logger.info(`Reaping expired ephemeral app '${config.name}'`, 'REAP');
+        await tryLogActivity({
+          action: 'ephemeral-reap',
+          appName: config.name,
+          userId: app?.userId,
+          detail: `Expired at ${config.expiresAt}`,
+        });
+        // A monorepo container is not a single app. Only the CONTAINER carries
+        // the ephemeral flag (it is the app that was deployed; the children are
+        // synthesized later by expandMonorepo), so tearing down just the
+        // container would leave every child service running and routed, with
+        // nothing left that any sweep could ever collect them by. removeGroup
+        // is the existing group-aware path — children first, then the
+        // container, then the container folder. The sibling sweeps sidestep
+        // this by excluding containers outright; an expiry is a deadline the
+        // caller asked for, so the group goes instead of nothing going.
+        //
+        // removeGroup takes no skipDatabaseBackup, so a group's children keep
+        // their dump. That errs toward keeping data on the rarer path.
+        // The group cascade only when the WHOLE group is this owner's.
+        //
+        // `group` is tenant-authored, and removeGroup destroys every app
+        // carrying that tag. Without this check a tenant could name another
+        // tenant's group in their own throwaway app's drop.yaml and have the
+        // reaper tear down that group's children and databases. An automatic,
+        // timer-driven destructive path must be gated at least as tightly as
+        // the interactive one — DELETE /apps/:name checks ownership across
+        // every entry it would destroy, and this had no check at all.
+        const groupEntries =
+          app?.isGroupContainer && app.group
+            ? (this.stateManager?.getAllApps().filter(a => a.group === app.group) ?? [])
+            : [];
+        const wholeGroupIsOwnedByThisApp =
+          groupEntries.length > 0 && groupEntries.every(a => a.userId === app?.userId);
+
+        if (app?.isGroupContainer && app.group && !wholeGroupIsOwnedByThisApp) {
+          this.logger.warn(
+            `Ephemeral '${config.name}' is tagged group '${app.group}' whose members are not all ` +
+              'its owner\'s; reaping only this app.',
+            'REAP'
+          );
+        }
+
+        const reap =
+          app?.isGroupContainer && app.group && wholeGroupIsOwnedByThisApp
+            ? this.removeGroup(app.group).then(() => undefined)
+            : // skipDatabaseBackup: an ephemeral's data is throwaway by
+              // construction, and dumping it on the way out would fill the box
+              // with backups of scratch databases nobody will ever read.
+              this.teardownApp(config.name, { skipDatabaseBackup: true });
+        await reap.catch((err) => {
+          this.logger.warn(
+            `Ephemeral reap of '${config.name}' failed: ${err instanceof Error ? err.message : 'unknown'}`,
+            'REAP'
+          );
+        });
+        this.idleState.lastCpu.delete(config.name);
+        this.idleState.lastActive.delete(config.name);
+        this.idleDryRuns.delete(config.name);
+      }
+    } catch (err) {
+      this.logger.debug(
+        `Ephemeral sweep failed: ${err instanceof Error ? err.message : 'unknown'}`,
+        'REAP'
+      );
+    }
   }
 
   private stopCrashLoopWatch(appName: string): void {
@@ -3507,8 +6205,17 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
 
     // In docker mode, pass the Postgres socket dir so ContainerManager can
     // bind-mount it; containers connect via unix socket instead of TCP.
+    // DROP-072 follow-up (security review item 2): gated on the app actually
+    // HAVING a database (dbEnvVars carries a DATABASE_URL), not merely on
+    // isolation mode — without this, every docker container (a static site,
+    // a Go binary, anything with no DB at all) got a direct bind-mounted
+    // channel to the bundled Postgres and could attempt to authenticate as
+    // any role, the same least-privilege gap this ticket set out to close,
+    // one layer up. This also makes the runtimeSpecFingerprint (below,
+    // recordDeploySignature/decideOneAppOnBoot) correctly diverge per-app:
+    // non-DB docker apps stop being force-redeployed by a socket-dir change.
     const pgSocketDir =
-      this.config.isolation === 'docker'
+      this.config.isolation === 'docker' && dbEnvVars['DATABASE_URL']
         ? (this.postgresServer?.getSocketDir() ?? undefined)
         : undefined;
 
@@ -3534,15 +6241,25 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
 
     // Admin-conferred capability grant (PR2): apps with a non-empty
     // grantedApiScopes get a fresh, scope-only (role: 'none') provisioning
-    // key minted and rotated on every start — the previous key (if any) is
-    // deleted first so a stale key never remains valid. Ungranted apps get
-    // no DROP_API_KEY at all. Minting is best-effort: if auth isn't
-    // initialized (e.g. DROP_DISABLE_AUTH), skip rather than fail the deploy.
+    // key minted and rotated on every start. Ungranted apps get no
+    // DROP_API_KEY at all. Minting is best-effort: if auth isn't initialized
+    // (e.g. DROP_DISABLE_AUTH), skip rather than fail the deploy.
     const grantedScopes = this.appConfigService?.getConfig(appName)?.grantedApiScopes ?? [];
+    // M1 review item 8 (round-2 diff pass): delete the previous key
+    // UNCONDITIONALLY, before the grant check — not just when re-minting.
+    // Revoking a capability (PUT .../capabilities with an empty scope list)
+    // must actually invalidate the old key; with the delete nested inside
+    // `if (grantedScopes.length > 0)` a revocation to `[]` never reached this
+    // branch at all, so the previous key stayed valid indefinitely — and the
+    // app is skip-eligible on top of that (grantedApiScopesCount is now 0).
+    try {
+      await deleteApiKeysByName(`app:${appName}:provision`);
+    } catch (err) {
+      this.logger.warn(`Could not delete previous provisioning key for ${appName}`, 'SECURITY', err);
+    }
     let dropApiKey: string | undefined;
     if (grantedScopes.length > 0) {
       try {
-        await deleteApiKeysByName(`app:${appName}:provision`);
         const { key } = await createApiKey(`app:${appName}:provision`, 'none', undefined, grantedScopes);
         dropApiKey = key;
       } catch (err) {
@@ -3602,6 +6319,72 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       limits,
       env,
     };
+  }
+
+  /**
+   * Record where this deploy's runtime output begins, immediately before the
+   * process starts.
+   *
+   * The one part of deploy-detail capture that cannot be a bus subscriber: it
+   * reads file sizes that `runtime.start()` is about to change, so it has to
+   * run inline, at every start site. Runtime logs are per-app and per-DAY, so
+   * the path alone cannot identify one deploy's output — the offset is what
+   * separates this deploy's lines from the previous one's.
+   *
+   * Best-effort and never throws: this is observability, and it sits directly
+   * in front of the start it must not be able to break.
+   */
+  private async noteRuntimeLogStart(appName: string): Promise<void> {
+    try {
+      const { outFile, errorFile } = await this.getAppLogPaths(appName);
+      const sizeOf = async (file: string): Promise<number> => {
+        try {
+          return (await fs.stat(file)).size;
+        } catch {
+          // Not created yet — this deploy's output starts at byte 0.
+          return 0;
+        }
+      };
+      const [outStartOffset, errStartOffset] = await Promise.all([
+        sizeOf(outFile),
+        sizeOf(errorFile),
+      ]);
+      getDeployDetailStore().noteRuntimeLog(appName, {
+        outFile,
+        errFile: errorFile,
+        outStartOffset,
+        errStartOffset,
+      });
+    } catch {
+      // Store not initialised (isolated tests), or the log dir is unreadable.
+      // A missing offset costs a log tail, never a deploy.
+    }
+  }
+
+  /**
+   * Record where this deploy's runtime output ENDS. Mirror of
+   * noteRuntimeLogStart, called on the failure path — the only path that
+   * produces a retained record. Best-effort; a missing end just means the
+   * copy falls back to its byte cap.
+   */
+  private async noteRuntimeLogEnd(appName: string): Promise<void> {
+    try {
+      const { outFile, errorFile } = await this.getAppLogPaths(appName);
+      const sizeOf = async (file: string): Promise<number> => {
+        try {
+          return (await fs.stat(file)).size;
+        } catch {
+          return 0;
+        }
+      };
+      const [outEndOffset, errEndOffset] = await Promise.all([
+        sizeOf(outFile),
+        sizeOf(errorFile),
+      ]);
+      getDeployDetailStore().noteRuntimeLogEnd(appName, { outEndOffset, errEndOffset });
+    } catch {
+      // Store not initialised, or the log dir is unreadable.
+    }
   }
 
   private async getAppLogPaths(appName: string): Promise<{ outFile: string; errorFile: string; logDir: string }> {

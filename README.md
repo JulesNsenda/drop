@@ -1,6 +1,8 @@
 # DROP
 
-**Deploy, Run, Operate, Publish** | v2.0.0-rc.1
+**Deploy, Run, Operate, Publish**
+
+![Release](https://img.shields.io/github/v/release/JulesNsenda/drop)
 
 A lightweight, self-hosted Platform as a Service (PaaS) engineered for the "drop folder and deploy" workflow. Zero-configuration deployment for Node.js, Python, static sites, and containerized applications.
 
@@ -16,9 +18,12 @@ A lightweight, self-hosted Platform as a Service (PaaS) engineered for the "drop
 - **Hot Reload** - Edit files and your app rebuilds/restarts automatically
 - **PostgreSQL Auto-Provisioning** - Apps get their own database with `DATABASE_URL` injected
 - **Port Persistence** - Apps keep the same port across restarts
-- **Multi-Runtime Support** - Node.js, Python, Docker, static sites
-- **Framework Detection** - Recognizes Next.js, Nuxt, Express, FastAPI, Flask, and more
-- **Process Management** - Built on PM2 for reliable process management with auto-restart
+- **Multi-Runtime Support** - Node.js, Python, Go, Docker, static sites
+- **Framework Detection** - Recognizes Next.js, Nuxt, SvelteKit, Astro, Express, FastAPI, Flask, and more
+- **Required Secrets** - Declare them in `drop.yaml`; DROP generates or prompts instead of crash-looping
+- **Monorepos** - Several services from one repo, sharing a hostname with same-origin `/api` routing
+- **MCP Server** - Deploy and manage apps from Claude, Claude Code, Cursor and other agents
+- **Process Management** - Apps run as PM2-managed processes (default) or Docker containers (`isolation: docker`), both with auto-restart
 - **REST API** - Full API with JWT and API key authentication
 - **Web Dashboard** - Real-time monitoring UI at `/dashboard`
 - **Auto-Capture Logging** - Stdout/stderr captured to dated log files automatically
@@ -29,6 +34,12 @@ A lightweight, self-hosted Platform as a Service (PaaS) engineered for the "drop
 
 ## Requirements
 
+**Release install (recommended, Linux):** a fresh Debian/Ubuntu box with root
+access. `install.sh` provisions Node.js, PostgreSQL, Caddy, and (if you
+choose `--isolation=docker`) Docker Engine for you — no toolchain to
+install yourself.
+
+**Build from source:**
 - Node.js 20+
 - npm 9+
 - Caddy 2.0+ (optional, for hostname routing)
@@ -37,38 +48,55 @@ A lightweight, self-hosted Platform as a Service (PaaS) engineered for the "drop
 
 ### 1. Install
 
-> The repository is **private**, so the old public `curl … | sudo bash`
-> one-liner no longer works (the raw URL 404s without auth). Use the owner
-> bootstrap below instead.
+**Quick install (Linux)**
 
-**Server bootstrap (owner / operator)**
-
-A freshly-provisioned box is brought up in two parts: a one-time `--bootstrap`
-that installs the system dependencies, and the GitHub Actions pipeline
-(`.github/workflows/deploy.yml`) that ships and runs the built code on every push.
+`install.sh` refuses to run piped straight from `curl` — it needs an
+on-disk copy of itself to work from — so save it first, then run it:
 
 ```bash
-# From your laptop (you have the repo checked out — no GitHub token needed):
-scp install.sh root@<NEW_IP>:/tmp/install.sh
-ssh root@<NEW_IP> "bash /tmp/install.sh --bootstrap --domain=dropkit.sh \
-    --deploy-pubkey='$(cat drop-deploy.pub)'"
-#   add --https --acme-email=you@example.com on a later run, once HTTP works
+curl -fsSL https://github.com/JulesNsenda/drop/releases/latest/download/install.sh -o install.sh && sudo bash install.sh --from-release --isolation=docker
 ```
 
-`--bootstrap` installs Node.js 20, PostgreSQL, Caddy, a C toolchain (for native
-deps), creates the `drop` user + `/opt/drop`, seeds the CI deploy key into
-`authorized_keys`, and registers the `drop-platform` systemd service **without**
-fetching or starting any code. Then set the `hetzner`-environment secrets
-(`DEPLOY_HOST`, `DEPLOY_USER=drop`, `DEPLOY_KEY_B64`) and push — CI builds the
-server + dashboard, scps the artifact, and starts the service.
+`--from-release` installs the latest published release — no `git clone`, no
+Node toolchain, no build step. It requires you to pick an isolation mode
+explicitly on a first install:
 
-Full step-by-step (DNS, firewall, deploy keypair, HTTPS) lives in
-`docs/plans/2026-06-19-one-command-bootstrap.md`.
+- **`--isolation=docker`** (recommended) — tenant apps build and run in
+  Docker containers with resource limits and no access to the platform's
+  secrets.
+- **`--isolation=none`** — tenant apps run as the `drop` system user, the
+  same user that owns the platform's encryption key and JWT/OAuth secrets.
+  Only choose this on a single machine where every deployer is fully
+  trusted; see [Security & Trust Model](#security--trust-model).
 
-> **Windows** (`install.bat`) does not yet support the private repo — clone with
-> your own credentials and run a manual/dev install for now.
+Add `--domain=example.com --https --acme-email=you@example.com` once DNS
+points at the box, or pin a specific version with `--from-release=v1.0.0`
+instead of the latest.
 
-**Development / manual install**
+`install.sh` verifies the downloaded tarball's SHA-256 checksum itself
+before installing anything. To also verify it was built by this repo's own
+GitHub Actions (not just that the checksum matches whatever shipped),
+download the artifact yourself and check its build provenance attestation:
+
+```bash
+gh release download --repo JulesNsenda/drop -p drop-dist.tar.gz
+gh attestation verify drop-dist.tar.gz --repo JulesNsenda/drop
+```
+
+Once the service is up, retrieve the one-time admin password from the
+platform log and change it immediately:
+
+```bash
+journalctl -u drop-platform -b --no-pager | grep -A1 'Default Admin Credentials'
+```
+
+> **Windows**: `install.sh` targets systemd/apt Linux boxes. On Windows, run
+> `install.bat` (or the "Build from source" steps below) and start with
+> `drop serve` directly — Windows is fully supported under `isolation: none`.
+
+**Build from source**
+
+For contributors, or to run from a branch instead of a release:
 
 ```bash
 git clone https://github.com/JulesNsenda/drop.git
@@ -83,8 +111,8 @@ npm link             # makes the 'drop' command available globally
 > If you only changed backend code, `npm run build:server` skips the dashboard
 > build.
 
-On first start, DROP prints a one-time random admin password to the console.
-Change it immediately.
+On first start, `drop serve` prints the one-time admin password to the
+console. Change it immediately.
 
 ### 2. Start DROP
 
@@ -140,6 +168,10 @@ Edit any file in your app - DROP detects changes and automatically rebuilds/rest
 drop serve                # Start DROP platform
 drop serve -d             # Start as background daemon
 drop serve -r /custom     # Custom root directory
+drop server status        # Background service status
+drop server logs -f       # Stream background service logs
+drop server restart       # Restart the background service
+drop server stop          # Stop the background service
 
 # Applications
 drop list                 # List running apps
@@ -158,13 +190,19 @@ drop remove my-app        # Remove app
 drop deploy ./my-app                    # Deploy from path
 drop deploy ./my-app --name custom      # Custom name
 drop deploy ./my-app --port 4000        # Specific port
+drop deploy --git <url> --branch main   # Deploy from a GitHub repo
 
 # Maintenance
 drop backup                             # Snapshot state + database
 drop backup --keep 14                   # Retain the last 14 backups
 drop restore <backup-dir>               # Preview a restore (writes nothing)
 drop restore <backup-dir> --confirm     # Restore from a backup (stop the platform first)
+drop migrate-runtime my-app --to docker # Move an app between PM2 and Docker
+drop mfa disable <username>             # Admin recovery for a lost TOTP device
+drop version                            # Show the CLI version
 ```
+
+Every command and flag is listed at `/reference` on a running DROP.
 
 ## Supported App Types
 
@@ -173,17 +211,35 @@ drop restore <backup-dir> --confirm     # Restore from a backup (stop the platfo
 | **Node.js** | `package.json` | `npm install` + runs start script |
 | **Next.js** | `next.config.*` | `npm install` + `npm run build` + starts |
 | **Express/Fastify/Hono** | Dependencies | `npm install` + runs start script |
+| **Python** | `requirements.txt`, `pyproject.toml`, `setup.py`, or `Pipfile` | Installs into an in-app `.venv` + runs app |
+| **Go** | `go.mod` | `go build` + runs the binary (gin, fiber, echo, chi, gorilla recognized) |
+| **Docker** | `Dockerfile` | `docker build` + `docker run` |
 | **Static Site** | `index.html` | Serves with built-in static server |
 | **SPA** | `index.html` + framework | Serves with SPA routing support |
-| **Python** | `requirements.txt` | Installs into an in-app `.venv` + runs app |
-| **Docker** | `Dockerfile` | `docker build` + `docker run` |
 
 ## Database Auto-Provisioning
 
-Apps that need a database get one automatically. DROP:
-1. Detects database dependencies (pg, mysql, prisma, etc.)
-2. Provisions a PostgreSQL database
-3. Injects `DATABASE_URL` environment variable
+Apps that need a database get one automatically. DROP provisions and injects
+`DATABASE_URL` when any of these is true:
+
+1. `drop.yaml` says `database: postgres` — the explicit form, and the only way
+   to ask from a non-Node app
+2. A Postgres client or ORM is in `package.json` (`pg`, `pg-promise`,
+   `postgres`, `slonik`, `@prisma/client`, `prisma`, `drizzle-orm`, `knex`,
+   `sequelize`, `typeorm`, `objection`, `@mikro-orm/postgresql`)
+3. An ORM config file is present (`prisma/schema.prisma`, `drizzle.config.*`,
+   `knexfile.*`, `ormconfig.json`, `typeorm.config.ts`, `sequelize.config.js`,
+   `.sequelizerc`)
+
+A MySQL, MongoDB or SQLite driver does **not** trigger provisioning — DROP only
+runs PostgreSQL, and handing such an app a `postgres://` URL it cannot use is
+worse than handing it nothing. And if you supply your own `DATABASE_URL` — as a
+secret or in the `drop.yaml` `env:` block — DROP steps aside rather than
+overriding it (an explicit `database: postgres` still wins).
+
+Provisioning happens on **deploy**, not on a plain restart, and a full per-user
+database quota means the app starts without a `DATABASE_URL` (with a warning in
+the platform log).
 
 Your app just connects:
 ```javascript
@@ -195,28 +251,58 @@ const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 
 DROP includes a REST API for programmatic control:
 
+All routes are mounted under `/api/v1`, and auth is on by default:
+
 ```bash
 # List apps
-curl http://localhost:3000/api/apps
+curl http://localhost:3000/api/v1/apps \
+  -H "X-API-Key: <api-key>"
 
 # Get app status
-curl http://localhost:3000/api/apps/my-app
+curl http://localhost:3000/api/v1/apps/my-app \
+  -H "X-API-Key: <api-key>"
 
-# Deploy (with API key)
-curl -X POST http://localhost:3000/api/apps \
+# Deploy
+curl -X POST http://localhost:3000/api/v1/apps \
   -H "Authorization: Bearer <api-key>" \
   -H "Content-Type: application/json" \
   -d '{"name": "my-app", "path": "/path/to/app"}'
 ```
 
+Every endpoint, with the role each one requires, is catalogued at
+`/reference` on a running DROP.
+
+## Deploy From an AI Agent (MCP)
+
+DROP hosts a Model Context Protocol server at `/api/v1/mcp`, so Claude,
+Claude Code, Cursor and other MCP clients can deploy and manage apps as
+native tools — `deploy_files`, `deploy_from_git`, `list_apps`,
+`app_status`, `app_logs`, `get_deploy_logs`, `restart_app`. There is no
+tool for reading secrets or deleting an app.
+
+Clients that send headers authenticate with a `user`-role API key:
+
+```bash
+claude mcp add --transport http dropkit \
+  https://drop.example.com/api/v1/mcp \
+  --header "Authorization: Bearer <user-api-key>"
+```
+
+The claude.ai web connector uses OAuth instead, so nobody pastes a key
+into a browser — it needs `DROP_PUBLIC_URL` set to a public HTTPS
+origin. Full setup is at `/docs` on a running DROP.
+
 ## Web Dashboard
 
-Access the dashboard at `http://localhost:3000/dashboard`:
+Access the dashboard at `http://localhost:3000/dashboard`, with a public
+site at `/`, docs at `/docs`, and the CLI/API reference at `/reference`:
 
 - **Apps List** - View all deployed apps with status indicators
-- **App Detail** - Start/stop/restart apps, view configuration
+- **App Detail** - Start/stop/restart apps, secrets, custom domain, deploy history
+- **Deploy** - Deploy from a path or a GitHub repo
 - **Logs Viewer** - Real-time log display with download option
-- **Settings** - Platform configuration
+- **Users** - User management (admin)
+- **Settings** - Platform configuration, including the Claude (MCP) connector details
 
 ## Logging
 
@@ -281,16 +367,33 @@ For explicit configuration, create `drop.yaml` in your app:
 ```yaml
 name: my-app
 type: nodejs
+domains:
+  - app.example.com
+database: postgres
+redis: true
 
-build:
-  command: npm run build
-
-start:
-  command: node dist/server.js
+build: npm run build
+start: node dist/server.js
 
 env:
   NODE_ENV: production
+
+secrets:
+  JWT_SECRET: generate
 ```
+
+`build` and `start` are plain strings, not nested objects. Unknown
+top-level keys are rejected outright, so a typo fails the deploy instead
+of being silently ignored.
+
+Declaring `secrets:` makes DROP resolve them *before* the app starts —
+auto-generating what it can, and parking the app in a `needs-config`
+status naming the missing keys instead of letting it crash-loop.
+
+A repo holding several services deploys as one unit via `group:` and
+`services:`, which share a hostname so a frontend can call its backend
+same-origin at `/api`. See `/docs` on a running DROP for the full field
+list and examples.
 
 ## Environment Variables
 
@@ -299,7 +402,13 @@ env:
 |----------|---------|-------------|
 | `DROP_ROOT` | `C:\drop` or `/var/drop` | Base directory |
 | `DROP_APPS_DIR` | `{root}/data/webapps` | Apps directory |
+| `DROP_API_PORT` | `3000` | Port for the REST API and dashboard |
 | `DROP_LOG_LEVEL` | `info` | Log level: debug, info, warn, error |
+| `DROP_PUBLIC_URL` | *(unset)* | Public HTTPS origin. Required for the claude.ai connector — OAuth fails closed without it |
+| `DROP_DISABLE_AUTH` | `false` | Turn API auth off entirely. Auth is **on** by default |
+| `DROP_ISOLATION` | `none` | `none` runs apps under PM2, `docker` runs each in a container |
+| `DROP_ENABLE_REDIS` | `true` | Run the bundled managed Redis |
+| `DROP_MAX_APPS_PER_USER` | `5` | Default per-user app quota (a per-user override wins; admins are unlimited) |
 
 ### Variables Injected Into Apps
 | Variable | Description |
@@ -307,7 +416,9 @@ env:
 | `PORT` | Assigned port for the app to listen on |
 | `DROP_DATA_DIR` | Persistent data directory path |
 | `DATABASE_URL` | PostgreSQL connection string (if database provisioned) |
+| `REDIS_URL` | Managed Redis connection string (if `redis: true` in `drop.yaml`) |
 | `DROP_API_URL` | Base URL for DROP's own REST API (`http://drop-host:<apiPort>` under docker isolation, `http://127.0.0.1:<apiPort>` otherwise) |
+| `DROP_API_KEY` | Least-privilege scoped key for calling DROP's own API — only for apps an admin granted capabilities to |
 
 ## Hostname Routing (Caddy)
 
@@ -389,7 +500,7 @@ See [HTTPS Setup Guide](docs/HTTPS-SETUP.md) for complete documentation.
 
 **Read this before exposing DROP to anyone you don't fully trust.**
 
-DROP v2.0 ships two explicit isolation modes with different trust guarantees:
+DROP ships two explicit isolation modes with different trust guarantees:
 
 ### `isolation: none` (default) — single-user / trusted deployments
 
@@ -416,14 +527,14 @@ cannot reach the LAN or cloud-metadata endpoints.
 - **Shared kernel**: containers are not VMs. A kernel exploit grants full host
   access. This is documented here, not mitigated.
 - **Egress**: containers can reach the internet (package installs need it).
-  Container→LAN/metadata is blocked; full egress policy is v2.1.
+  Container→LAN/metadata is blocked; full egress policy is a future release.
 - **Shared-domain cookies**: subdomains of one registrable domain share the
   same-site context. Apps at `a.yourdomain.com` and `b.yourdomain.com` can
   read each other's cookies. Use a dedicated `baseDomain` for multi-tenant use,
   or submit it to the Public Suffix List.
 - **Open signup** (`allowSignup: true`) enables self-service registration.
   Abuse tooling, takedown runbooks, and egress enforcement for hostile public
-  access are v2.1 territory. Treat open-internet signup as documented residual
+  access are future work. Treat open-internet signup as documented residual
   risk until then.
 - **Deps must land in the app dir.** Build and run happen in separate ephemeral
   containers sharing only the `/app` bind mount (no image commit), so only
@@ -456,8 +567,7 @@ DROP will not run an untrusted build as root to work around it).
 - Audit log for all deploy/build/start/secret/suspend operations
 - Bundled PostgreSQL locked to scram-sha-256; unix socket restricted to peer auth
 
-See `.env.example` for all security-relevant settings and
-`docs/MIGRATION-v1-to-v2.md` if you are upgrading from v1.0.
+See `.env.example` for all security-relevant settings.
 
 ## Backup & Restore
 
@@ -578,13 +688,10 @@ npm run format       # Format code
 
 ## Roadmap
 
-- [x] ~~Web dashboard UI~~ (v0.1.0)
-- [x] ~~PostgreSQL auto-provisioning~~ (v0.1.0)
-- [x] ~~Hot reload~~ (v0.1.0)
-- [x] ~~REST API with authentication~~ (v0.1.0)
-- [x] ~~Caddy reverse proxy integration~~ (v0.2.0)
-- [x] ~~Automatic HTTPS with Let's Encrypt~~ (v0.3.0)
-- [x] ~~Custom domains per app~~ (v0.3.0)
+- [x] ~~Zero-config deploy, hot reload, PostgreSQL auto-provisioning, REST API
+  + web dashboard, Caddy reverse proxy, automatic HTTPS~~ (0.1.0–0.3.0)
+- [x] ~~Docker isolation, hosted MCP server + OAuth 2.1, monorepo/multi-service
+  deploys, managed Redis, custom domains~~ (1.0.0)
 - [ ] Log aggregation and search
 - [ ] Multi-node clustering
 

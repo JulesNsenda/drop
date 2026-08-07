@@ -26,15 +26,17 @@ import { getAppConfigService } from '../../managers/app/app-config';
 import { getDatabaseProvisioner } from '../../managers/database';
 import { getRedisProvisioner } from '../../managers/redis';
 import { getRouterService } from '../../core/router';
-import { tryLogActivity } from '../../managers/activity';
+import { logActivityFor } from '../../managers/activity';
 import {
   getAppsDirectory,
   isHttpsEnabled,
   getDomainSuffix,
   getTempDirectory,
   getUploadMaxBytes,
+  getPublicUrl,
 } from '../runtime-config';
 import { isPathWithin } from '../../utils/paths';
+import { isReservedHost } from '../../utils/reserved-hosts';
 import { isLocalhostDomain } from '../../utils/domain-validator';
 import { eventBus } from '../../core/event-bus';
 import {
@@ -43,6 +45,8 @@ import {
   UploadValidationError,
   InsufficientDiskSpaceError,
 } from '../../core/upload-deploy';
+import { DeployRefusedError } from '../../managers/guardrail/deploy-breaker';
+import { QuotaExceededError } from '../../managers/guardrail/principal-quota';
 import { runUploadPreflight } from '../upload-preflight';
 import type { RuntimeType } from '../../managers/runtime/app-runtime.types';
 
@@ -64,10 +68,34 @@ apps.use('/:name/*', validateAppName());
  */
 const UPDATABLE_APP_FIELDS = ['framework', 'customDomain'] as const;
 
+/**
+ * Same check `PUT /:name/domain` applies. This route accepted `customDomain`
+ * unvalidated, and the value is interpolated into a URL by `computeAppUrl` —
+ * a value WHATWG URL rejects (a space, a '[') therefore threw inside anything
+ * building an app URL. One tenant could poison a shared derivation that way.
+ */
+const CUSTOM_DOMAIN_RE = /^[a-zA-Z0-9][a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/;
+
 function pickUpdatableFields(body: Record<string, unknown>): Partial<AppState> {
   const updates: Partial<AppState> = {};
   for (const field of UPDATABLE_APP_FIELDS) {
     if (body[field] !== undefined) {
+      if (field === 'customDomain') {
+        const value = body[field];
+        // '' clears the domain, matching the dedicated route.
+        if (value !== '' && (typeof value !== 'string' || !CUSTOM_DOMAIN_RE.test(value))) {
+          throw new ValidationError('Invalid domain format');
+        }
+        // Same reservation as the dedicated route — this is the other writer,
+        // and a guard on only one of two doors is not a guard.
+        if (
+          typeof value === 'string' &&
+          value !== '' &&
+          isReservedHost(value, getPublicUrl(), getDomainSuffix())
+        ) {
+          throw new ValidationError('That domain is reserved by the platform');
+        }
+      }
       (updates as Record<string, unknown>)[field] = body[field];
     }
   }
@@ -169,7 +197,29 @@ function toAppDto(app: AppState, isAdmin = false): AppDto {
     // folder-dropped groups aren't git-redeployable at all).
     groupGitBacked:
       !app.gitSource && app.group && isGroupGitBacked(app.group) ? true : undefined,
+    mcp: mcpDtoFor(app),
   };
+}
+
+/**
+ * The app's MCP endpoint for the DTO (Step 11), as a DROP-composed absolute URL
+ * plus the flag the UI needs to say "public".
+ *
+ * `auth` is carried explicitly rather than left implicit at 'none' so the UI
+ * cannot render an endpoint without also being able to render what guards it —
+ * and so PR 2 adding a second value is a compile-visible change here.
+ */
+function mcpDtoFor(app: AppState): AppDto['mcp'] {
+  try {
+    const mcp = getAppConfigService().getConfig(app.name)?.mcp;
+    if (!mcp) return undefined;
+    const base = computeAppUrl(app);
+    if (!base) return undefined;
+    return { url: `${base}${mcp.path}`, auth: mcp.auth };
+  } catch {
+    // Config service not initialised (isolated route tests).
+    return undefined;
+  }
 }
 
 /** Thrown by the byte-counting transform the moment the cap is crossed. */
@@ -255,7 +305,14 @@ apps.get('/', async c => {
       filtered.map(a => {
         const dto = toAppDto(a, isAdmin);
         const stats = statsMap.get(a.name);
-        if (stats && a.status === 'running') {
+        // A zero here can mean "measurement failed", not "idle": the docker
+        // adapter degrades to {cpu:0, memory:0} whenever the stats call throws.
+        // Memory is the discriminator — a running container is never
+        // legitimately at 0 bytes, whereas an idle app really can sit at 0.0%
+        // CPU, so a positive memory reading is what marks the whole sample as
+        // real. Without one, omit the fields entirely and let the dashboard
+        // hide its "Avg CPU" card rather than publish a fabricated 0.0%.
+        if (stats && a.status === 'running' && stats.memory > 0) {
           dto.memory = stats.memory;
           dto.cpu = stats.cpu;
           dto.uptime = stats.uptime;
@@ -286,6 +343,14 @@ apps.get('/:name', async c => {
   try {
     const procInfo = await pm.getStatus(name);
     if (procInfo) {
+      // NOTE: deliberately NOT gated on `memory > 0` the way the list route
+      // above is. That guard is safe there because the fleet-average card is
+      // the confirmed bug and the reading is docker-only in practice; here it
+      // would change PM2 behaviour too, and PM2 reports a legitimate zero for a
+      // live process whose monit has not sampled yet (pm2-client.ts: `proc.monit
+      // || {}` then `monit.memory || 0`). Gating here would blank the Metrics
+      // tab on a healthy pm2 app — a regression on the isolation mode that
+      // never had the bug.
       return c.json(
         success({
           ...toAppDto(app, isAdmin),
@@ -390,10 +455,8 @@ apps.post('/', async c => {
     await stateManager.updateApp(appName, { userId: auth.userId });
   }
 
-  await tryLogActivity({
+  await logActivityFor(auth, {
     action: 'deploy',
-    userId: auth?.userId,
-    username: auth?.username,
     appName,
   });
   return c.json(success(toAppDto({ ...app, userId: auth?.userId }, auth?.role === 'admin')), 201);
@@ -453,12 +516,12 @@ apps.post('/:name/source', async c => {
       appName: name,
       archivePath,
       userId: auth?.userId,
+      principalId: auth?.principalId,
+      agentCaller: auth?.kind === 'agent',
     });
 
-    await tryLogActivity({
+    await logActivityFor(auth, {
       action: 'upload-deploy',
-      userId: auth?.userId,
-      username: auth?.username,
       appName: name,
     });
 
@@ -481,6 +544,16 @@ apps.post('/:name/source', async c => {
     }
     if (err instanceof InsufficientDiskSpaceError) {
       return c.json(error(ErrorCodes.INTERNAL_ERROR, err.message), 507 as any);
+    }
+    if (err instanceof QuotaExceededError) {
+      c.header('Retry-After', String(err.retryAfterSeconds));
+      return c.json(error(ErrorCodes.RATE_LIMITED, err.message), 429);
+    }
+    if (err instanceof DeployRefusedError) {
+      // 429 with Retry-After, so a caller backs off on its own rather than
+      // hammering a refusal it cannot read.
+      c.header('Retry-After', String(err.retryAfterSeconds));
+      return c.json(error(ErrorCodes.RATE_LIMITED, err.message), 429);
     }
     // Anything else (validation errors thrown above, unexpected failures)
     // rethrows to the global error handler: HttpErrors map to their own
@@ -586,10 +659,8 @@ apps.delete('/:name', async c => {
 
     const { removed } = await ops.removeGroup(groupName);
 
-    await tryLogActivity({
+    await logActivityFor(auth, {
       action: 'delete',
-      userId: auth?.userId,
-      username: auth?.username,
       appName: groupName,
     });
 
@@ -699,6 +770,18 @@ apps.delete('/:name', async c => {
     }
   }
 
+  // Remove the name-keyed artifacts that live outside the app folder (logs,
+  // and DROP_DATA_DIR unless keepData). This route does its own inline
+  // teardown rather than calling platform.teardownApp, so without this the
+  // previous tenant's logs and persistent data survive under a name that is
+  // now free for anyone to re-register. Best-effort — never fails the delete.
+  try {
+    await getPlatformOps()?.purgeAppArtifacts(name, { keepData });
+  } catch {
+    // Platform not wired (direct ApiServer construction in tests) or cleanup
+    // failed; the delete itself has already succeeded.
+  }
+
   // If this app was a monorepo group child and is now the LAST remaining
   // child of its group, also remove the group's CONTAINER folder
   // (webapps/<group>/, holding the root drop.yaml with `services:`) — left
@@ -719,6 +802,12 @@ apps.delete('/:name', async c => {
           if (container.path) {
             await fs.rm(container.path, { recursive: true, force: true });
           }
+          // The container is detected and built before expansion, so it can
+          // have deploy details of its own — and its log directory. This
+          // cascade never went through purgeAppArtifacts, so those details
+          // kept live name-keyed log offsets with no retention stamp, which
+          // also put them outside the serve-time guard.
+          await getPlatformOps()?.purgeAppArtifacts(container.name, { keepData });
         } catch {
           // Container entry/folder may already be gone
         }
@@ -731,10 +820,8 @@ apps.delete('/:name', async c => {
     }
   }
 
-  await tryLogActivity({
+  await logActivityFor(auth, {
     action: 'delete',
-    userId: auth?.userId,
-    username: auth?.username,
     appName: name,
   });
   return c.json(success({ message: `Application '${name}' removed`, database: dbStatus }));
@@ -761,10 +848,8 @@ apps.post('/:name/start', async c => {
     // (delete-then-fresh-start with a rebuilt spec); only the activity-log
     // action and response message differ.
     const status = await ops.restartApp(name);
-    await tryLogActivity({
+    await logActivityFor(auth, {
       action: 'start',
-      userId: auth?.userId,
-      username: auth?.username,
       appName: name,
     });
     return c.json(success({ message: `Application '${name}' started`, status }));
@@ -813,10 +898,8 @@ apps.post('/:name/stop', async c => {
       // Router may not be initialised (tests / standalone ApiServer)
     }
 
-    await tryLogActivity({
+    await logActivityFor(auth, {
       action: 'stop',
-      userId: auth?.userId,
-      username: auth?.username,
       appName: name,
     });
     return c.json(success({ message: `Application '${name}' stopped` }));
@@ -827,6 +910,59 @@ apps.post('/:name/stop', async c => {
 });
 
 // POST /apps/:name/restart - Restart application
+// POST /:name/promote — put a held build in front of traffic (Step 6d).
+//
+// Owner or admin only, at role >= `user`, and NEVER an agent token: promotion
+// is the human decision the manual mode exists to require. An agent that could
+// promote its own build would make the gate a formality — so this checks the
+// credential KIND, not just the role, because an agent token can carry a role
+// and a scope can carry an app.
+apps.post('/:name/promote', async c => {
+  const auth = (c.get as Function)('auth') as AuthContext | undefined;
+  const name = c.req.param('name');
+  const stateManager = getStateManager();
+  const app = stateManager.getApp(name);
+
+  if (!app || !canAccess(auth, app)) {
+    throw new NotFoundError(`Application '${name}' not found`);
+  }
+
+  // Checked even though auth may be disabled: with auth off there is no agent
+  // context to speak of, and with it on this is the whole point of the gate.
+  if (auth?.kind === 'agent') {
+    return c.json(
+      error(
+        ErrorCodes.UNAUTHORIZED,
+        'Promotion requires a human session. Agent credentials cannot promote a build.'
+      ),
+      403
+    );
+  }
+  if (auth && auth.role !== 'admin' && auth.role !== 'user') {
+    return c.json(error(ErrorCodes.UNAUTHORIZED, 'Promotion requires at least the `user` role'), 403);
+  }
+
+  const ops = getPlatformOps();
+  if (!ops) {
+    return c.json(error(ErrorCodes.SERVICE_UNAVAILABLE, 'Platform operations unavailable'), 503);
+  }
+
+  try {
+    await ops.promoteApp(name);
+    await logActivityFor(auth, {
+      action: 'promote',
+      appName: name,
+    });
+    return c.json(success({ app: name, promoted: true }));
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Promote failed';
+    if (message.includes('awaiting promotion')) {
+      return c.json(error(ErrorCodes.BAD_REQUEST, message), 400);
+    }
+    return c.json(error(ErrorCodes.INTERNAL_ERROR, message), 500);
+  }
+});
+
 apps.post('/:name/restart', async c => {
   const auth = (c.get as Function)('auth') as AuthContext | undefined;
   const name = c.req.param('name');
@@ -844,10 +980,8 @@ apps.post('/:name/restart', async c => {
 
   try {
     const status = await ops.restartApp(name);
-    await tryLogActivity({
+    await logActivityFor(auth, {
       action: 'restart',
-      userId: auth?.userId,
-      username: auth?.username,
       appName: name,
     });
     return c.json(success({ message: `Application '${name}' restarted`, status }));
@@ -940,10 +1074,8 @@ apps.put('/:name/capabilities', async c => {
     return c.json(error(ErrorCodes.INTERNAL_ERROR, message), 500);
   }
 
-  await tryLogActivity({
+  await logActivityFor(auth, {
     action: 'grant-capabilities',
-    userId: auth?.userId,
-    username: auth?.username,
     appName: name,
   });
 
@@ -975,6 +1107,12 @@ apps.put('/:name/domain', async c => {
   // Basic domain validation
   if (domain && !/^[a-zA-Z0-9][a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/.test(domain)) {
     throw new ValidationError('Invalid domain format');
+  }
+  // The platform's own host is not an app, so the cross-tenant owner map does
+  // not cover it — claiming it here would put a tenant in front of DROP's own
+  // OAuth and MCP endpoints.
+  if (domain && isReservedHost(domain, getPublicUrl(), getDomainSuffix())) {
+    throw new ValidationError('That domain is reserved by the platform');
   }
 
   await stateManager.updateApp(name, { customDomain: domain || ('' as unknown as undefined) });
@@ -1026,13 +1164,15 @@ apps.post('/:name/migrate-runtime', async c => {
         path: appPath,
         type: config.type,
         timestamp: new Date(),
+        // The last app:detected publisher with a real caller behind it. Left
+        // unnamed the rebuild keys as watcher automation rather than the admin.
+        principalId: authCtx?.principalId,
+        actorUserId: authCtx?.userId,
       });
     }
 
-    await tryLogActivity({
+    await logActivityFor(authCtx, {
       action: 'migrate-runtime',
-      userId: authCtx?.userId,
-      username: authCtx?.username,
       appName,
     });
 

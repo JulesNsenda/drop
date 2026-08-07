@@ -1,6 +1,6 @@
 # Local Testing Guide
 
-How to run DROP on your dev machine and exercise the v2.0 features.
+How to run DROP on your dev machine and exercise the 1.0 features.
 
 ---
 
@@ -43,7 +43,7 @@ The compiled output lands in `dist/`.
 ## 2. Verify the CLI (one-time)
 
 ```bash
-drop --version   # should print 2.0.0-rc.1
+drop --version   # should match the release you installed
 ```
 
 If `drop` isn't found after building manually, run `npm link` from the project root.
@@ -156,7 +156,7 @@ curl -s -H "Authorization: Bearer $TOKEN" \
 
 ---
 
-## 6. Test specific v2.0 features
+## 6. Test specific 1.0 features
 
 ### M5.2 — Build logs
 

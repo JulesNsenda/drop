@@ -30,8 +30,9 @@ type DeployMock = jest.Mock;
 function makeOps(overrides?: Partial<PlatformOps>): PlatformOps {
   return {
     restartApp: jest.fn(),
-    isAppInProgress: jest.fn().mockReturnValue(false),
+    isAppInProgress: jest.fn().mockReturnValue(false), promoteApp: jest.fn(),
     removeGroup: jest.fn().mockResolvedValue({ removed: [] }),
+    purgeAppArtifacts: jest.fn().mockResolvedValue(undefined),
     ...overrides,
   };
 }
@@ -77,7 +78,7 @@ describe('POST /apps/:name/source (upload deploy)', () => {
     } as unknown as ReturnType<typeof uploadDeployModule.getUploadDeployService>);
 
     setPlatformOps(makeOps());
-    activitySpy = jest.spyOn(activity, 'tryLogActivity').mockResolvedValue();
+    activitySpy = jest.spyOn(activity, 'logActivityFor').mockResolvedValue();
 
     getStateManager({ stateFilePath: path.join(tempDir, 'apps.json') });
 
@@ -141,10 +142,17 @@ describe('POST /apps/:name/source (upload deploy)', () => {
       appName: 'alice-app',
       archivePath: expect.any(String),
       userId: aliceId,
+      // Threaded for the deploy guardrail, so a looping agent is keyed on its
+      // own credential rather than on the human it acts for.
+      principalId: `jwt:${aliceId}`,
+      // Derived from the credential kind, never from request input — it is what
+      // exposes an app to automatic reaping.
+      agentCaller: false,
     });
 
-    const entry = activitySpy.mock.calls.find((call) => call[0].action === 'upload-deploy')?.[0];
-    expect(entry).toMatchObject({ action: 'upload-deploy', appName: 'alice-app', userId: aliceId });
+    const call = activitySpy.mock.calls.find((call) => call[1].action === 'upload-deploy');
+    expect(call?.[1]).toMatchObject({ action: 'upload-deploy', appName: 'alice-app' });
+    expect(call?.[0]).toMatchObject({ userId: aliceId });
   });
 
   it("lets an admin upload to another user's app — 202", async () => {
@@ -296,6 +304,10 @@ describe('POST /apps/:name/source (upload deploy)', () => {
         appName: 'alice-app',
         archivePath: expect.any(String),
         userId: undefined,
+        principalId: undefined,
+        // With auth disabled there is no credential at all, so nothing can be
+        // an agent — and an app created here is never auto-reapable.
+        agentCaller: false,
       });
     });
   });

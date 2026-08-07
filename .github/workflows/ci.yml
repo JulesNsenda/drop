@@ -41,3 +41,30 @@ jobs:
       - name: Build dashboard
         working-directory: src/dashboard
         run: npm run build
+
+      # The site build and its two guards live in deploy.yml and release.yml as
+      # well. They belong HERE most of all: this is the only workflow that runs
+      # on a pull request, and a merge to develop is itself a production deploy
+      # -- so without these, a regression under components/landing/ or the
+      # Landing/Docs/Reference pages passes review green and first fails in
+      # prod. (Plan item 8 extracts all three copies into a composite action;
+      # until then this list is duplicated by hand and must be kept in step.)
+      - name: Build public site
+        working-directory: src/dashboard
+        run: npm run build:site
+
+      - name: Verify site bundle exists
+        run: |
+          set -euo pipefail
+          if [ ! -f dist/site/index.html ]; then
+            echo "::error::dist/site/index.html missing after build:site -- the marketing site would ship with no frontend" >&2
+            exit 1
+          fi
+
+      - name: Verify dashboard/site bundle split (DROP-070)
+        run: |
+          set -euo pipefail
+          if grep -q 'drop-token\|ConfirmDialog\|qrcode' dist/site/assets/*.js; then
+            echo "::error::dist/site JS references admin-only code -- the marketing/dashboard bundle split has regressed" >&2
+            exit 1
+          fi

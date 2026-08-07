@@ -144,8 +144,9 @@ describe('DELETE /api/v1/apps/:name — group-aware (M4)', () => {
   function makeOps(overrides?: Partial<PlatformOps>): PlatformOps {
     return {
       restartApp: jest.fn(),
-      isAppInProgress: jest.fn().mockReturnValue(false),
+      isAppInProgress: jest.fn().mockReturnValue(false), promoteApp: jest.fn(),
       removeGroup: jest.fn().mockResolvedValue({ removed: [] }),
+      purgeAppArtifacts: jest.fn().mockResolvedValue(undefined),
       ...overrides,
     };
   }
@@ -220,6 +221,49 @@ describe('DELETE /api/v1/apps/:name — group-aware (M4)', () => {
     expect(removeGroup).toHaveBeenCalledWith('grp');
     const body = (await res.json()) as { data: { removed: string[] } };
     expect(body.data.removed.sort()).toEqual(['grp-backend', 'grp-frontend']);
+  });
+
+  it('purges the deleted app name-keyed artifacts (logs + appdata)', async () => {
+    // DELETE /apps/:name runs its own inline teardown rather than calling
+    // platform.teardownApp (which only removeGroup uses), so cleaning up in
+    // teardownApp alone would miss essentially every real deletion — and
+    // deletion FREES THE NAME, so the residue becomes the next registrant's.
+    const purgeAppArtifacts = jest.fn().mockResolvedValue(undefined);
+    setPlatformOps(makeOps({ removeGroup, purgeAppArtifacts }));
+
+    const res = await hono.request('/api/v1/apps/grp-backend', {
+      method: 'DELETE',
+      headers: authHeader(ownerToken),
+    });
+
+    expect(res.status).toBe(200);
+    expect(purgeAppArtifacts).toHaveBeenCalledWith('grp-backend', { keepData: false });
+  });
+
+  it('honours ?keepData=true when purging artifacts', async () => {
+    const purgeAppArtifacts = jest.fn().mockResolvedValue(undefined);
+    setPlatformOps(makeOps({ removeGroup, purgeAppArtifacts }));
+
+    const res = await hono.request('/api/v1/apps/grp-backend?keepData=true', {
+      method: 'DELETE',
+      headers: authHeader(ownerToken),
+    });
+
+    expect(res.status).toBe(200);
+    expect(purgeAppArtifacts).toHaveBeenCalledWith('grp-backend', { keepData: true });
+  });
+
+  it('still succeeds when artifact purging fails', async () => {
+    // Cleanup is best-effort; it must never fail a delete that already happened.
+    const purgeAppArtifacts = jest.fn().mockRejectedValue(new Error('disk gone'));
+    setPlatformOps(makeOps({ removeGroup, purgeAppArtifacts }));
+
+    const res = await hono.request('/api/v1/apps/grp-backend', {
+      method: 'DELETE',
+      headers: authHeader(ownerToken),
+    });
+
+    expect(res.status).toBe(200);
   });
 
   it('503s the group branch when platform ops is unavailable', async () => {
@@ -424,8 +468,9 @@ describe('DELETE /api/v1/apps/:name — in-progress guard (M4)', () => {
   function makeOps(overrides?: Partial<PlatformOps>): PlatformOps {
     return {
       restartApp: jest.fn(),
-      isAppInProgress: jest.fn().mockReturnValue(false),
+      isAppInProgress: jest.fn().mockReturnValue(false), promoteApp: jest.fn(),
       removeGroup: jest.fn().mockResolvedValue({ removed: [] }),
+      purgeAppArtifacts: jest.fn().mockResolvedValue(undefined),
       ...overrides,
     };
   }

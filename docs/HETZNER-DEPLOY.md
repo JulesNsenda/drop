@@ -23,7 +23,7 @@ Push to `develop` → GitHub Actions builds and tests → auto-deploys to your H
    - **SSH keys**: click **Add SSH key** and paste your local public key (usually at `~/.ssh/id_ed25519.pub` or `~/.ssh/id_rsa.pub`)
    - **Name**: `drop-test-1`
 4. Click **Create & Buy now**.
-5. Copy the server's **IP address** from the project dashboard — you'll use it throughout. (203.0.113.10)
+5. Copy the server's **IP address** from the project dashboard — you'll use it throughout. (this guide uses `203.0.113.10` as a placeholder — substitute your own)
 
 ---
 
@@ -55,8 +55,8 @@ Run the install script. It creates a `drop` system user, installs Node.js 20 + P
 
 ```bash
 apt-get update -qq && apt-get install -y curl git build-essential
-curl -fsSL https://raw.githubusercontent.com/JulesNsenda/drop/develop/install.sh \
-  | bash -s -- --root=/var/drop
+curl -fsSL https://raw.githubusercontent.com/JulesNsenda/drop/develop/install.sh -o install.sh
+sudo bash install.sh --root=/var/drop
 ```
 
 This serves the dashboard/API on port 3000 over plain HTTP. To publish on a real
@@ -64,11 +64,15 @@ domain with automatic HTTPS instead, add the domain flags (see
 [Custom domain + HTTPS](#custom-domain--https)):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/JulesNsenda/drop/develop/install.sh \
-  | bash -s -- --root=/var/drop --domain=example.com --https --acme-email=you@example.com
+curl -fsSL https://raw.githubusercontent.com/JulesNsenda/drop/develop/install.sh -o install.sh
+sudo bash install.sh --root=/var/drop --domain=example.com --https --acme-email=you@example.com
 ```
 
-> **Note:** The script lives on the `develop` branch until the next merge to `main`. If the curl returns a 404 (e.g. private repo or branch not yet merged), use the manual install below instead.
+> **Note:** For a released version, prefer the prebuilt artifact — download
+> `install.sh` from the [latest release](https://github.com/JulesNsenda/drop/releases/latest)
+> and run it with `--from-release`, which skips building from source entirely.
+> The URL above tracks `develop` and may be ahead of the latest release. If the
+> curl returns a 404, use the manual install below instead.
 
 <details>
 <summary>Manual install (if the curl above fails)</summary>
@@ -81,8 +85,8 @@ apt-get install -y nodejs
 # Create drop user and clone the repo
 useradd -m -s /bin/bash drop
 git clone --branch develop https://github.com/JulesNsenda/drop.git /opt/drop
-cd /opt/drop && npm ci && npm run build:server
 chown -R drop:drop /opt/drop
+sudo -u drop bash -c "cd /opt/drop && npm ci && npm run build:server"
 mkdir -p /var/drop && chown -R drop:drop /var/drop
 
 # Create the systemd service
@@ -147,7 +151,7 @@ cat ~/.ssh/drop_deploy.pub
 GitHub Actions stops the service, unpacks the new build, then starts it again. Add a passwordless sudo rule for those commands:
 
 ```bash
-echo "drop ALL=(ALL) NOPASSWD: /bin/systemctl stop drop-platform, /bin/systemctl start drop-platform, /bin/systemctl restart drop-platform, /bin/systemctl status drop-platform" \
+echo "drop ALL=(root) NOPASSWD: /bin/systemctl stop drop-platform, /bin/systemctl start drop-platform, /bin/systemctl restart drop-platform, /bin/systemctl status drop-platform" \
   > /etc/sudoers.d/drop-deploy
 chmod 440 /etc/sudoers.d/drop-deploy
 ```
@@ -163,7 +167,10 @@ Look for this line — it contains the one-time admin password:
 Admin password: <password>   ← copy this, you'll need it to log in
 ```
 
-The password is also saved at `/var/drop/data/drop-svc/api-credentials.json` if you miss it.
+This line is only printed once, the first time DROP creates its default admin
+account. It is **not** recoverable afterwards — `api-credentials.json` stores
+a scrypt hash of the password, never the password itself. If you miss it, see
+[Can't find the admin password](#troubleshooting) below for how to reset it.
 
 Press `Ctrl+C` to exit the log view.
 
@@ -178,15 +185,22 @@ Add these inbound rules:
 | Name | Protocol | Port | Source |
 |---|---|---|---|
 | SSH | TCP | 22 | `0.0.0.0/0` |
-| DROP API & Dashboard | TCP | 3000 | `0.0.0.0/0` |
+| DROP API & Dashboard | TCP | 3000 | `<your-ip>/32` |
 | HTTP | TCP | 80 | `0.0.0.0/0` |
 | HTTPS | TCP | 443 | `0.0.0.0/0` |
+
+Replace `<your-ip>/32` with your current public IP (e.g. from
+`curl -s ifconfig.me`). Port 3000 serves the dashboard/API over **plain
+HTTP** — admin login, session tokens and API keys all travel in cleartext
+over it — so it must never be opened to `0.0.0.0/0`.
 
 Click **Create firewall** and apply it to `drop-test-1`.
 
 > Ports **80 and 443 are required** if you use a custom domain — Let's Encrypt
-> validates over port 80 and serves HTTPS on 443. Port 3000 stays open as a
-> direct backdoor to the dashboard/API; you can close it once your domain works.
+> validates over port 80 and serves HTTPS on 443. Once your domain works, the
+> dashboard/API are reachable over HTTPS on 443 instead, so remove the port
+> 3000 rule above entirely rather than leaving it scoped to your IP — it must
+> not stay internet-exposed.
 
 **Test it works:**
 
@@ -217,7 +231,7 @@ Add these three secrets:
 
 | Secret name | Value |
 |---|---|
-| `DEPLOY_HOST` | Your Hetzner server IP (e.g. `65.21.100.42`) |
+| `DEPLOY_HOST` | Your Hetzner server IP (e.g. `203.0.113.10`) |
 | `DEPLOY_USER` | `drop` |
 | `DEPLOY_KEY_B64` | Your private key **base64-encoded** (see below) |
 
@@ -329,8 +343,8 @@ The apex serves the **dashboard**; each deployed app is served at
 on a fresh box or an existing one (it auto-detects upgrade):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/JulesNsenda/drop/develop/install.sh \
-  | sudo bash -s -- --upgrade --domain=example.com --https --acme-email=you@example.com
+curl -fsSL https://raw.githubusercontent.com/JulesNsenda/drop/develop/install.sh -o install.sh
+sudo bash install.sh --upgrade --domain=example.com --https --acme-email=you@example.com
 ```
 
 This installs Caddy (granting it permission to bind 80/443 as the `drop` user),
@@ -346,10 +360,36 @@ Certificates are fetched on first request to each hostname (a few seconds).
 ### How config persists across deploys
 
 Domain/HTTPS settings live in `/etc/drop/drop.env`, which the systemd unit reads
-on every start — so a normal `git push` deploy keeps them. The deploy also runs
-`install.sh --provision` on the server, so **infra changes in `install.sh`
-(Caddy, the systemd unit, the apex route) are applied automatically** on each
-deploy; you don't need to re-run the installer by hand after the first time.
+on every start — so a normal `git push` deploy keeps them.
+
+> **Provisioning changes are NOT applied automatically (DROP-071).** The deploy
+> runs the *root-owned* `/usr/local/sbin/drop-provision`, not `/opt/drop/install.sh`
+> — because `/opt/drop` is owned by the `drop` user, and letting root execute a
+> file that user can rewrite was an unconditional privilege escalation. That
+> root-owned copy is only refreshed by a root-authenticated run
+> (`--bootstrap`/`--upgrade`/a fresh install), so **a change to `install.sh`'s
+> infra logic (Caddy, the systemd unit, sudoers, the apex route) ships in the
+> repo and does not reach the box until you re-run the installer as root.**
+>
+> The deploy compares the shipped `install.sh` against the installed copy and
+> emits a GitHub `::warning::` when they differ, so this is visible rather than
+> silent. To apply, copy a **trusted** `install.sh` to the box and run it as
+> root — do not run `/opt/drop/install.sh`, which the `drop` user can write:
+>
+> ```bash
+> scp install.sh root@<host>:/tmp/
+> ssh root@<host> 'bash /tmp/install.sh --bootstrap'
+> ```
+>
+> `--bootstrap` (not `--upgrade`): `/opt/drop` here is populated by the CI
+> tarball, not a git clone, so `--upgrade`'s `git fetch` would fail.
+>
+> Scope note: this hardening is a real privilege boundary under
+> `DROP_ISOLATION=none`, where deployed apps run as the same `drop` user that
+> owns the platform's keys. Under `DROP_ISOLATION=docker` the `drop` user is
+> also a member of the `docker` group — which is root-equivalent on its own —
+> so there it's defence-in-depth rather than a hard boundary. Check
+> `DROP_ISOLATION` in `/etc/drop/drop.env` before relying on it.
 
 To change config later, either re-run the installer with new flags, or edit
 `/etc/drop/drop.env` directly and `sudo systemctl restart drop-platform`.
@@ -384,4 +424,11 @@ When you're done testing, delete the server from Hetzner Cloud Console to stop b
 - The dashboard build may not have run yet. SSH in and run: `cd /opt/drop/src/dashboard && npm ci && npm run build`
 
 **Can't find the admin password**
-- `cat /var/drop/data/drop-svc/api-credentials.json`
+- It is not recoverable — `api-credentials.json` stores a scrypt hash, never
+  the plaintext password. If another admin account exists, have them reset
+  yours: `POST /api/v1/auth/users/:id/reset-password`. If not, rename or
+  delete `/var/drop/data/drop-svc/api-credentials.json` and restart the
+  service (`sudo systemctl restart drop-platform`) — DROP bootstraps a fresh
+  one-time admin the same way it did on first install, and logs the new
+  password once. This clears **all** existing users and API keys, not just
+  the admin password.

@@ -27,7 +27,6 @@
       "Bash(gh issue:*)",
       "LSP(*)",
       "Read(./src/**)",
-      "Read(./tests/**)",
       "Read(./docs/**)",
       "Read(./tsconfig.json)",
       "Read(./package.json)",
@@ -36,7 +35,6 @@
       "Read(./.prettierrc*)",
       "Read(./jest.config*)",
       "Edit(./src/**)",
-      "Edit(./tests/**)",
       "Edit(./docs/**)"
     ],
     "deny": [
@@ -72,17 +70,6 @@
     "DROP_LOG_LEVEL": "debug"
   },
   "hooks": {
-    "PostToolUse": [
-      {
-        "matcher": "Edit|Write",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "node -e \"const p=process.env.CLAUDE_FILE_PATH||''; if(p.endsWith('.ts')||p.endsWith('.tsx')||p.endsWith('.js')||p.endsWith('.jsx')||p.endsWith('.json')) { require('child_process').execSync('npx prettier --write ' + p, {stdio:'inherit'}); }\""
-          }
-        ]
-      }
-    ],
     "PreToolUse": [
       {
         "matcher": "Edit|Write",

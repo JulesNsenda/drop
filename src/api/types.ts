@@ -72,6 +72,13 @@ export interface AppDto {
    * and folder-dropped (non-git) groups.
    */
   groupGitBacked?: boolean;
+  /**
+   * This app speaks MCP (Step 11). `url` is DROP-composed from the app's own
+   * hostname and an allowlisted path — never a raw tenant string. `auth` is
+   * `'none'` today, meaning the endpoint is PUBLIC unless the app authenticates
+   * callers itself; any UI that renders `url` must render that too.
+   */
+  mcp?: { url: string; auth: 'none' | 'drop' };
   /** Live memory usage in bytes (from runtime; null when not running or unavailable). */
   memory?: number | null;
   /** Live CPU usage percent (from runtime; null when not running or unavailable). */
@@ -120,6 +127,30 @@ export interface DeployEpisodeDto {
   endedAt?: string;
   durationMs?: number;
   stages: DeployStageDto[];
+}
+
+/**
+ * Client view of a DeployDetail.
+ *
+ * Two things are deliberately NOT projected:
+ *  - `userId`, the owner snapshot. Internal; the route filters on it.
+ *  - `runtimeLog`, which carries ABSOLUTE host paths
+ *    (/var/drop/data/logs/webapps/...). Those are internal plumbing for the
+ *    log-tail tool, and exposing them would leak the host's filesystem layout
+ *    to a tenant. Same discipline as DeployRow.detail's relative-paths-only
+ *    rule.
+ */
+export interface DeployDetailDto {
+  deployId: string;
+  appName: string;
+  phase: 'build' | 'boot';
+  /** Closed-union cause. Safe to switch on; 'UNKNOWN' is a real member. */
+  errorCode: string;
+  stage?: string;
+  exitCode?: number;
+  command?: string;
+  reason?: string;
+  createdAt: string;
 }
 
 // Health DTOs
@@ -184,6 +215,10 @@ export const ErrorCodes = {
   INTERNAL_ERROR: 'INTERNAL_ERROR',
   CONFLICT: 'CONFLICT',
   BAD_REQUEST: 'BAD_REQUEST',
+  // There is deliberately no FORBIDDEN code. The convention across the API is
+  // UNAUTHORIZED paired with an explicit 403 status for a
+  // valid-credential-but-insufficient-standing refusal (apps.ts, db.ts,
+  // oauth.ts); 401 is reserved for no/invalid credentials.
   UNAUTHORIZED: 'UNAUTHORIZED',
   RATE_LIMITED: 'RATE_LIMITED',
   SERVICE_UNAVAILABLE: 'SERVICE_UNAVAILABLE',

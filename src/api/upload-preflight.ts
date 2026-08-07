@@ -32,7 +32,8 @@ import {
   RateLimitedError,
   InsufficientDiskError,
 } from './middleware/error';
-import { canAccess } from './access';
+import { canAccessScoped } from './access';
+import { scopesAllowCreate } from './agent-scopes';
 import { isValidAppName } from './middleware/validate';
 import { getStateManager } from '../managers/app/state-manager';
 import { getPlatformOps } from './platform-ops';
@@ -91,7 +92,9 @@ export async function runUploadPreflight(
 
   if (existingApp) {
     // No existence oracle: a foreign-owned app and an unknown app both 404.
-    if (!canAccess(auth, existingApp)) {
+    // Scoped, so an agent token needs app:<name>:deploy for THIS app — a
+    // read-only grant, or a grant for a different app, gets the same 404.
+    if (!canAccessScoped(auth, existingApp, appName, 'deploy')) {
       return { ok: false, error: new NotFoundError(`Application '${appName}' not found`) };
     }
     // A stopped app's rebuilds are deliberately dropped by the platform — a
@@ -105,6 +108,17 @@ export async function runUploadPreflight(
       };
     }
   } else if (auth?.userId && auth.role !== 'admin') {
+    // NEW app. SEC-5: this branch performed no scope check at all — only an app
+    // count — so any rank-0 principal admitted at /mcp could create and run
+    // arbitrary apps. A scope-only caller must hold apps:create explicitly;
+    // holding app:<other>:deploy grants nothing here, because the app being
+    // created has no name to have been granted.
+    if (auth.role === 'none' && !scopesAllowCreate(auth.scopes)) {
+      return {
+        ok: false,
+        error: new NotFoundError(`Application '${appName}' not found`),
+      };
+    }
     // Same limit/behavior/status as POST /apps (first-time create only).
     const maxApps = getAppLimit(auth.userId);
     if (maxApps > 0) {

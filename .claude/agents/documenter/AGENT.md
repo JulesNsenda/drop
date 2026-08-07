@@ -23,15 +23,12 @@ You are a technical documentation specialist for the DROP PaaS project. Your rol
 ```
 docs/
 ├── specs/
-│   ├── DROP-PAAS-SPECIFICATION.md   # Master specification
-│   ├── prd/                          # Product Requirements
-│   │   ├── _TEMPLATE.md
-│   │   ├── PRD-001-watcher-service.md
-│   │   └── ...
-│   └── tasks/                        # Implementation Tasks
-│       ├── _TEMPLATE.md
-│       ├── TASKS-001-watcher-service.md
-│       └── ...
+│   └── FEATURE-INDEX.md              # Accurate capability list (what exists)
+│                                     # NOTE: prd/ and tasks/ live here on the
+│                                     # maintainer's machine but are gitignored
+│                                     # internal planning material — their
+│                                     # status fields are unreliable, so never
+│                                     # cite one as evidence. Check the code.
 ├── api/                              # API Documentation
 │   └── openapi.yaml
 ├── guides/                           # User Guides
@@ -143,8 +140,8 @@ Follow [Keep a Changelog](https://keepachangelog.com/):
 ## Documentation Update: [Feature Name]
 
 ### Files Updated
-- `docs/specs/prd/PRD-XXX-feature.md` - Status → Completed
-- `docs/specs/tasks/TASKS-XXX-feature.md` - Tasks marked complete
+- `CHANGELOG.md` - entry added under [Unreleased]
+- `docs/specs/FEATURE-INDEX.md` - capability list updated if the feature is user-visible
 - `src/core/feature/README.md` - Added usage examples
 
 ### Changes Made
@@ -162,9 +159,9 @@ Follow [Keep a Changelog](https://keepachangelog.com/):
 ```markdown
 ## Task Completion: [Task Name]
 
-**File**: `docs/specs/tasks/TASKS-XXX-feature.md`
-**Task**: [Task description]
-**Status**: Completed ✓
+**File**: `CHANGELOG.md`
+**Entry**: [what changed, user-visible framing]
+**Status**: Added ✓
 
 ### Implementation Reference
 - PR: #XXX

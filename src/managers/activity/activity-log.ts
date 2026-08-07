@@ -7,12 +7,25 @@
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import { writeJsonAtomic } from '../../utils/atomic-write';
+import type { AuthContext } from '../../api/middleware/auth';
 
 export interface ActivityEntry {
   id: string;
-  action: 'deploy' | 'git-deploy' | 'upload-deploy' | 'start' | 'stop' | 'restart' | 'delete' | 'login' | 'signup' | 'redeploy' | 'migrate-runtime' | 'suspend' | 'unsuspend' | 'login_mfa_challenge' | 'login_mfa_ok' | 'mfa_enabled' | 'mfa_disabled' | 'grant-capabilities' | 'github-webhook-secret-generate' | 'github-webhook-secret-set' | 'github-webhook-secret-clear';
+  action: 'deploy' | 'git-deploy' | 'upload-deploy' | 'start' | 'stop' | 'restart' | 'delete' | 'login' | 'signup' | 'redeploy' | 'migrate-runtime' | 'suspend' | 'unsuspend' | 'login_mfa_challenge' | 'login_mfa_ok' | 'mfa_enabled' | 'mfa_disabled' | 'grant-capabilities' | 'github-webhook-secret-generate' | 'github-webhook-secret-set' | 'github-webhook-secret-clear' | 'user-connectors-set' | 'apikey-create' | 'agent-token-issue' | 'agent-deploy' | 'disk-park' | 'promotion-held' | 'promote' | 'idle-reap' | 'idle-reap-dryrun' | 'ephemeral-reap' | 'password-reset';
   userId?: string;
   username?: string;
+  /**
+   * WHICH CREDENTIAL acted, as opposed to `userId`'s which human it acted for.
+   *
+   * The two differ exactly where it matters: several API keys and several
+   * concurrent agent sessions all resolve to one human, so `userId` alone
+   * cannot answer "which deploys were that leaked token's?" — the question an
+   * incident actually asks. Namespaced (`jwt:` / `key:` / `oauth:`) so the
+   * spaces cannot alias.
+   */
+  principalId?: string;
+  /** How the caller authenticated. Cheap to record, and it splits agent traffic from human. */
+  authMethod?: 'jwt' | 'apikey' | 'oauth';
   appName?: string;
   detail?: string;
   timestamp: string;
@@ -85,6 +98,38 @@ export async function tryLogActivity(entry: Omit<ActivityEntry, 'id' | 'timestam
   } catch (err) {
     console.debug('[activity-log] failed to record activity:', err instanceof Error ? err.message : err);
   }
+}
+
+/**
+ * Attribution-safe variant of `tryLogActivity`. `ActivityEntry`'s four actor
+ * fields (`userId`, `username`, `principalId`, `authMethod`) are all
+ * optional, so a bare `tryLogActivity({...})` call compiles fine with none
+ * of them set — an unattributable row, and the exact defect this helper
+ * exists to make structurally hard to reintroduce. `auth` derives all four;
+ * a caller cannot hand-set them wrong, and `entry` cannot carry them at all
+ * (see the `Omit`), so omitting the `auth` argument is a compile error
+ * rather than a silent gap.
+ *
+ * Fields absent on `auth` stay absent on the logged entry — never
+ * defaulted to an `undefined`-valued key. System-context call sites (e.g.
+ * the unauthenticated GitHub webhook redeploy) pass `auth` as `undefined`
+ * explicitly, which this spreads to nothing at all.
+ */
+export async function logActivityFor(
+  auth: AuthContext | undefined,
+  entry: Omit<ActivityEntry, 'id' | 'timestamp' | 'userId' | 'username' | 'principalId' | 'authMethod'>
+): Promise<void> {
+  return tryLogActivity({
+    ...entry,
+    ...(auth
+      ? {
+          userId: auth.userId,
+          username: auth.username,
+          authMethod: auth.authMethod,
+          ...(auth.principalId !== undefined ? { principalId: auth.principalId } : {}),
+        }
+      : {}),
+  });
 }
 
 // Singleton

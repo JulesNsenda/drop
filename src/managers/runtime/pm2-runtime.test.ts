@@ -216,3 +216,28 @@ describe('getAppRuntime singleton', () => {
     expect(runtime.type).toBe('docker');
   });
 });
+
+describe('OOM reporting', () => {
+  it('leaves oomKilled UNDEFINED, never false', () => {
+    // PM2 cannot report this: max_memory_restart RESTARTS on exceed rather
+    // than capping, so an OOM is indistinguishable from any other crash-loop.
+    // `undefined` and `false` must stay distinct — "cannot know" is not the
+    // same claim as "not memory", and a consumer that treats them alike would
+    // report a confident negative PM2 has no basis for.
+    const info = (new Pm2Runtime() as any).toProcessInfo({
+      name: 'app',
+      status: 'online',
+      pid: 1,
+      port: 3000,
+      memory: 100,
+      cpu: 1,
+      uptime: 10,
+      restarts: 0,
+      createdAt: null,
+      restartedAt: null,
+    });
+
+    expect(info.oomKilled).toBeUndefined();
+    expect('oomKilled' in info).toBe(false);
+  });
+});

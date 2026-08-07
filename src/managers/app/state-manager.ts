@@ -42,6 +42,26 @@ export interface AppState {
   createdAt: string;
   updatedAt: string;
   lastDeployedAt?: string;
+  /**
+   * Set alongside `status: 'running'` when the readiness gate RAN but the app
+   * did not prove ready — docker-mode bind-with-no-HTTP-answer, or a declared
+   * `healthCheck` whose port never bound. The app is left running (DROP-063's
+   * leniency: a slow starter must not be killed), but nothing has confirmed it
+   * serves.
+   *
+   * A FLAG, deliberately not an `AppStatus` member. There are ~20
+   * `status === 'running'` comparisons, and they answer at least four
+   * different questions — counts toward capacity / supervise it / something is
+   * serving, don't clobber it / did it prove healthy. A new status member
+   * silently fails two of them: the stop-before-swap guard in
+   * `handleAppUpdate` matches neither branch, making a redeploy a no-op while
+   * DROP reports success, and `lastDeployedAt` below is written only on
+   * 'running'.
+   *
+   * ABSENT is not the same as verified — it means legacy, or a path where
+   * readiness never ran. Only `=== true` is a positive "did not prove ready".
+   */
+  readinessUnverified?: boolean;
   buildDuration?: number;
   error?: string;
   gitSource?: GitSource;
@@ -54,6 +74,30 @@ export interface AppState {
    * exactly what to set.
    */
   missingSecrets?: string[];
+  /**
+   * Why DROP stopped this app on its own, when it did.
+   *
+   * A FLAG, deliberately not an `AppStatus` member (ARCH-14) — the same
+   * reasoning as `readinessUnverified` above. There are ~20
+   * `status === 'running'` comparisons answering at least four different
+   * questions, and a new status member silently fails some of them.
+   *
+   * A parked app carries `status: 'stopped'`, so every existing consumer keeps
+   * working; this only explains WHY, so the operator is not left staring at an
+   * app that stopped for no visible reason. Cleared when the app starts again.
+   */
+  parkedReason?: string;
+  /**
+   * A build finished and is waiting for a human to promote it (Step 6d).
+   *
+   * A FLAG, not an `AppStatus` member (ARCH-14). The app's status is whatever
+   * it already was — a previously-running app keeps `running`, because the OLD
+   * version is still serving and untouched; a brand-new app stays `stopped`,
+   * because nothing has ever served. Both are true statements about what is
+   * running, which is what `status` answers; this answers a different
+   * question, so it gets its own field.
+   */
+  awaitingPromotion?: boolean;
   /**
    * Grouping tag for apps expanded from a single monorepo deploy (e.g.
    * `ezsign-backend` / `ezsign-frontend` both tagged `group: ezsign`). Set via
@@ -193,21 +237,37 @@ export class AppStateManager {
     const existing = this.apps.get(name);
 
     const app: AppState = {
+      // MERGE over `existing`, do not rebuild from a literal.
+      //
+      // This used to be a literal naming ~12 fields, which meant every field
+      // NOT named was silently dropped. registerApp runs for every app on
+      // every boot (syncStateWithConfigs), so a dropped field is lost on each
+      // restart — and each new AppState field inherits the trap. It cost
+      // `readinessUnverified` its entire purpose (written at deploy, destroyed
+      // unread on the next boot) before this was noticed, and it was already
+      // silently dropping `missingSecrets`, `group`, `isGroupContainer`,
+      // `customDomain` and `error` in shipped code.
+      //
+      // Preserve-by-default. The overrides below are the only fields
+      // registerApp genuinely owns.
+      ...existing,
       name,
       type,
-      // Preserve 'stopped' status so user-stopped apps don't auto-restart
-      status: existing?.status === 'stopped' ? 'stopped' : 'pending',
       path: appPath,
-      framework,
+      // The caller's value wins when it has one; otherwise keep what detection
+      // previously established rather than blanking it.
+      framework: framework ?? existing?.framework,
       hostname: `${name}.localhost`,
       createdAt: existing?.createdAt || now,
       updatedAt: now,
-      // Preserve important fields from existing state (for restart scenarios)
-      port: existing?.port,
-      lastDeployedAt: existing?.lastDeployedAt,
-      buildDuration: existing?.buildDuration,
-      gitSource: existing?.gitSource,
-      userId: existing?.userId,
+      // Preserve 'stopped' status so user-stopped apps don't auto-restart.
+      // Everything else resets: this app is about to be (re)deployed.
+      status: existing?.status === 'stopped' ? 'stopped' : 'pending',
+      // No process is claimed yet — status has just reset to 'pending', so a
+      // pid carried from the previous run would name a process this entry no
+      // longer stands behind. syncStateWithProcesses re-establishes it.
+      // (Same as the old behaviour, which dropped it; now it is deliberate.)
+      pid: undefined,
     };
 
     this.apps.set(name, app);
@@ -246,7 +306,7 @@ export class AppStateManager {
     return updated;
   }
 
-  async setAppStatus(name: string, status: AppStatus, details?: { port?: number; pid?: number; error?: string; missingSecrets?: string[] }): Promise<AppState | null> {
+  async setAppStatus(name: string, status: AppStatus, details?: { port?: number; pid?: number; error?: string; missingSecrets?: string[]; readinessUnverified?: boolean; parkedReason?: string; awaitingPromotion?: boolean }): Promise<AppState | null> {
     const app = this.apps.get(name);
     if (!app) return null;
 
@@ -260,9 +320,34 @@ export class AppStateManager {
       delete app.missingSecrets;
     }
 
+    // The readiness verdict is CALLER-supplied, because only the caller knows
+    // whether the readiness gate actually ran. Keyed on the VALUE, matching the
+    // missingSecrets convention above — NOT on key presence, or an explicitly
+    // passed `undefined` would read as "verified" and clear a real failure:
+    //
+    //   undefined -> readiness did not run (handleAppUpdate, restartApp).
+    //                Leave any existing flag alone; asserting either way is a lie.
+    //   true      -> ran, and the app did not prove ready.
+    //   false     -> ran and passed. Actively CLEAR — updateApp is a spread
+    //                merge, so merely omitting the key would leave an app
+    //                flagged once flagged forever, through every clean redeploy.
+    const { readinessUnverified, ...rest } = details ?? {};
+    if (readinessUnverified === false) {
+      delete app.readinessUnverified;
+    }
+
+    // A park explains why DROP stopped the app itself. Any transition to a
+    // LIVE state clears it: the reason no longer holds, and updateApp is a
+    // spread merge, so leaving it would keep explaining a stop that has since
+    // been undone. Set only by the caller that parks.
+    if (status === 'running' || status === 'building' || status === 'starting') {
+      delete app.parkedReason;
+    }
+
     return this.updateApp(name, {
       status,
-      ...details,
+      ...rest,
+      ...(readinessUnverified === true ? { readinessUnverified: true } : {}),
       ...(status === 'running' ? { lastDeployedAt: new Date().toISOString() } : {}),
     });
   }

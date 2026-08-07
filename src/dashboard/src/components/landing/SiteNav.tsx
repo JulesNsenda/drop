@@ -22,7 +22,9 @@ interface NavLinkItem {
 }
 
 const NAV_LINKS: NavLinkItem[] = [
-  { key: 'features', label: 'Features', href: '#features' },
+  // Label tracks the section's own heading ("What you get"); the #features id
+  // stays put because SiteFooter anchors to it too.
+  { key: 'features', label: 'What you get', href: '#features' },
   { key: 'docs', label: 'Docs', to: '/docs' },
   { key: 'api', label: 'API', to: '/reference' },
   { key: 'dashboard', label: 'Dashboard', enter: true },
@@ -77,7 +79,7 @@ export function SiteNav({ isDark, onToggleTheme, onEnter, authEnabled, current }
             letterSpacing: 0.5,
           }}
         >
-          v2.0.0-rc.1
+          v{__DROP_VERSION__}
         </span>
       </Link>
 

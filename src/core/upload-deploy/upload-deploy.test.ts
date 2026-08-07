@@ -12,8 +12,23 @@ import { UploadDeployService, resetUploadDeployService } from './upload-deploy';
 import { UploadValidationError, InsufficientDiskSpaceError } from './upload-deploy.types';
 import { ArchiveRejectedError } from './tar-extract';
 import { resetStateManager, getStateManager } from '../../managers/app/state-manager';
+import {
+  AppConfigService,
+  getAppConfigService,
+  resetAppConfigService,
+} from '../../managers/app/app-config';
 import * as diskUtils from '../../utils/disk';
 import { eventBus } from '../event-bus';
+import {
+  getDeployBreaker,
+  resetDeployBreaker,
+  DeployRefusedError,
+  guardrailKeysFor,
+} from '../../managers/guardrail/deploy-breaker';
+import {
+  getPrincipalQuota,
+  resetPrincipalQuota,
+} from '../../managers/guardrail/principal-quota';
 import type { AppDetectedPayload } from '../event-bus';
 // AppUpdatePayload isn't re-exported by ../event-bus (index.ts) - see the same
 // note in src/core/git-deploy/git-deploy.test.ts.
@@ -35,6 +50,13 @@ describe('UploadDeployService', () => {
     resetStateManager();
     const stateManager = getStateManager({ stateFilePath: path.join(tempDir, 'apps.json') });
     await stateManager.initialize();
+
+    // The deploy quota is a singleton whose DEFAULT store path is a real file
+    // under the repo. Left alone, these tests would write to it and accumulate
+    // counts across runs until every deploy here is refused.
+    resetDeployBreaker();
+    resetPrincipalQuota();
+    getPrincipalQuota(path.join(tempDir, 'principal-quotas.json'));
 
     resetUploadDeployService();
     service = new UploadDeployService({
@@ -163,6 +185,187 @@ describe('UploadDeployService', () => {
     });
   });
 
+  describe('deploy - guardrail pre-check', () => {
+    // The platform's gates sit at the BUILD. Everything before it was unmetered:
+    // the archive is extracted and LANDED over the live app tree before any
+    // event is published, so a downstream refusal could not undo the write and
+    // never stopped the work.
+    afterEach(() => resetDeployBreaker());
+
+    const actor = { userId: 'human-1', principalId: 'key:looper' };
+
+    const trip = () => {
+      const keys = guardrailKeysFor('blocked-app', true, {
+        principalId: actor.principalId,
+        actorUserId: actor.userId,
+      });
+      const breaker = getDeployBreaker();
+      for (let i = 0; i < 5; i++) breaker.recordFailure(keys[0].key, Date.now(), keys[0].threshold);
+    };
+
+    it('refuses BEFORE extracting or landing anything', async () => {
+      const archivePath = await buildArchive('blocked-app', { 'index.js': 'x' });
+      trip();
+
+      await expect(
+        service.deploy({ appName: 'blocked-app', archivePath, ...actor })
+      ).rejects.toBeInstanceOf(DeployRefusedError);
+
+      // Nothing landed — the whole point.
+      expect(fssync.existsSync(path.join(appsDir, 'blocked-app'))).toBe(false);
+    });
+
+    it('does not overwrite a live app tree when a REDEPLOY is refused', async () => {
+      // The damaging half: landFiles syncs over the running app, so a refusal
+      // that arrives after the write leaves new source under an old process.
+      const v1 = await buildArchive('live-app-v1', { 'index.js': 'v1' });
+      await service.deploy({ appName: 'live-app', archivePath: v1, ...actor });
+      expect(fssync.readFileSync(path.join(appsDir, 'live-app', 'index.js'), 'utf8')).toBe('v1');
+
+      const keys = guardrailKeysFor('live-app', false, {
+        principalId: actor.principalId,
+        actorUserId: actor.userId,
+      });
+      const breaker = getDeployBreaker();
+      for (let i = 0; i < 5; i++) breaker.recordFailure(keys[0].key, Date.now(), keys[0].threshold);
+
+      const v2 = await buildArchive('live-app-v2', { 'index.js': 'v2' });
+      await expect(
+        service.deploy({ appName: 'live-app', archivePath: v2, ...actor })
+      ).rejects.toBeInstanceOf(DeployRefusedError);
+
+      expect(fssync.readFileSync(path.join(appsDir, 'live-app', 'index.js'), 'utf8')).toBe('v1');
+    });
+
+    it('reports how long to wait, so a caller can back off', async () => {
+      const archivePath = await buildArchive('blocked-app', { 'index.js': 'x' });
+      trip();
+
+      await expect(
+        service.deploy({ appName: 'blocked-app', archivePath, ...actor })
+      ).rejects.toMatchObject({ retryAfterSeconds: expect.any(Number) });
+    });
+
+    it('lets an UNRELATED caller through', async () => {
+      // A pre-check that refused everyone would be worse than none at all.
+      const archivePath = await buildArchive('other-app', { 'index.js': 'x' });
+      trip();
+
+      await expect(
+        service.deploy({
+          appName: 'other-app',
+          archivePath,
+          userId: 'human-2',
+          principalId: 'key:innocent',
+        })
+      ).resolves.toBeDefined();
+    });
+
+    it('records nothing itself — the platform owns the outcome', async () => {
+      // A pre-check that counted would double-charge every deploy.
+      const archivePath = await buildArchive('counted-app', { 'index.js': 'x' });
+      const keys = guardrailKeysFor('counted-app', true, {
+        principalId: actor.principalId,
+        actorUserId: actor.userId,
+      });
+
+      await service.deploy({ appName: 'counted-app', archivePath, ...actor });
+
+      expect(getDeployBreaker().check(keys[0].key).failures).toBe(0);
+    });
+  });
+
+  describe('deploy - actor identity for the deploy guardrail', () => {
+    // Without this the guardrail is INERT on the upload path: `principalId`
+    // exists on the payload but nothing populates it, so every deploy keys as
+    // anonymous automation and the per-principal window never fills. Exactly
+    // the structurally-constant-field defect, in the one place that decides
+    // whether an agent loop can be stopped.
+
+    it('carries the credential AND its human onto app:detected', async () => {
+      const archivePath = await buildArchive('actor-new', { 'index.js': 'x' });
+      const received: AppDetectedPayload[] = [];
+      const unsubscribe = eventBus.subscribe('app:detected', (p) => {
+        received.push(p);
+      });
+
+      try {
+        await service.deploy({
+          appName: 'actor-new',
+          archivePath,
+          userId: 'human-1',
+          principalId: 'oauth:human-1::sess-a',
+        });
+
+        expect(received).toHaveLength(1);
+        expect(received[0].principalId).toBe('oauth:human-1::sess-a');
+        expect(received[0].actorUserId).toBe('human-1');
+      } finally {
+        unsubscribe();
+      }
+    });
+
+    it('carries them onto app:update too — the REDEPLOY path an agent loop rides', async () => {
+      // The branch that mattered most and is easiest to miss: fix, re-upload,
+      // fail, repeat all lands here, never on app:detected.
+      const first = await buildArchive('actor-redeploy-v1', { 'index.js': 'v1' });
+      await service.deploy({ appName: 'actor-redeploy', archivePath: first });
+
+      const second = await buildArchive('actor-redeploy-v2', { 'index.js': 'v2' });
+      const received: AppUpdatePayload[] = [];
+      const unsubscribe = eventBus.subscribe('app:update', (p) => {
+        received.push(p);
+      });
+
+      try {
+        await service.deploy({
+          appName: 'actor-redeploy',
+          archivePath: second,
+          userId: 'human-1',
+          principalId: 'key:token-abc',
+        });
+
+        expect(received).toHaveLength(1);
+        expect(received[0].principalId).toBe('key:token-abc');
+        expect(received[0].actorUserId).toBe('human-1');
+      } finally {
+        unsubscribe();
+      }
+    });
+
+    it('distinguishes two credentials belonging to the SAME human', async () => {
+      // The load-bearing assertion: if the publisher dropped principalId and
+      // only actorUserId survived, both deploys would key identically and one
+      // agent could throttle another. userId alone cannot separate them.
+      const a = await buildArchive('actor-two-a', { 'index.js': 'a' });
+      const b = await buildArchive('actor-two-b', { 'index.js': 'b' });
+      const received: AppDetectedPayload[] = [];
+      const unsubscribe = eventBus.subscribe('app:detected', (p) => {
+        received.push(p);
+      });
+
+      try {
+        await service.deploy({
+          appName: 'actor-two-a',
+          archivePath: a,
+          userId: 'human-1',
+          principalId: 'key:token-1',
+        });
+        await service.deploy({
+          appName: 'actor-two-b',
+          archivePath: b,
+          userId: 'human-1',
+          principalId: 'key:token-2',
+        });
+
+        expect(received.map((p) => p.actorUserId)).toEqual(['human-1', 'human-1']);
+        expect(received.map((p) => p.principalId)).toEqual(['key:token-1', 'key:token-2']);
+      } finally {
+        unsubscribe();
+      }
+    });
+  });
+
   describe('deploy - redeploy', () => {
     it('publishes app:update with bypassCooldown and reason "upload deploy"', async () => {
       const archive1 = await buildArchive('redeploy-app-v1', { 'index.js': 'v1' });
@@ -204,6 +407,31 @@ describe('UploadDeployService', () => {
 
       expect(fssync.existsSync(path.join(appsDir, 'stale-app', 'remove-me.js'))).toBe(false);
       expect(fssync.readFileSync(path.join(appsDir, 'stale-app', 'keep.js'), 'utf8')).toBe('keep updated');
+    });
+
+    it('keeps node_modules but not build output across a redeploy', async () => {
+      // A tarball never carries either. Deleting node_modules pulled a RUNNING
+      // app's dependencies out from under it on every redeploy; deleting build
+      // output is required, because StaticBuildStrategy.preBuild treats a
+      // surviving dist/index.html as "already built" and skips the rebuild,
+      // leaving the previous bundle served while the deploy reports green.
+      const archive1 = await buildArchive('preserve-app-v1', { 'index.js': 'v1' });
+      await service.deploy({ appName: 'preserve-app', archivePath: archive1 });
+
+      const appDir = path.join(appsDir, 'preserve-app');
+      await fs.mkdir(path.join(appDir, 'node_modules', 'dep'), { recursive: true });
+      await fs.writeFile(path.join(appDir, 'node_modules', 'dep', 'index.js'), 'installed');
+      await fs.mkdir(path.join(appDir, 'dist'), { recursive: true });
+      await fs.writeFile(path.join(appDir, 'dist', 'index.html'), '<h1>v1</h1>');
+
+      const archive2 = await buildArchive('preserve-app-v2', { 'index.js': 'v2' });
+      await service.deploy({ appName: 'preserve-app', archivePath: archive2 });
+
+      expect(fssync.readFileSync(path.join(appDir, 'index.js'), 'utf8')).toBe('v2');
+      expect(fssync.readFileSync(path.join(appDir, 'node_modules', 'dep', 'index.js'), 'utf8')).toBe(
+        'installed'
+      );
+      expect(fssync.existsSync(path.join(appDir, 'dist'))).toBe(false);
     });
 
     it('clears isUploading before publishing app:update (platform guard must not drop the redeploy)', async () => {
@@ -304,6 +532,96 @@ describe('UploadDeployService', () => {
 
       const leftoverEntries = await fs.readdir(stagingDir);
       expect(leftoverEntries).toHaveLength(0);
+    });
+  });
+
+  /**
+   * The SEAM these flags shipped inert through.
+   *
+   * They are written before `app:detected` is published, i.e. before the
+   * platform's handler creates the app's config — and `updateConfig` writes
+   * nothing when no config exists yet. Every existing test still passed,
+   * because the MCP-layer test mocks this service wholesale and asserts only
+   * that `ephemeral: true` was passed IN. Nothing asserted it came back OUT.
+   *
+   * So these read through a FRESH AppConfigService loading from disk: the
+   * consumers (ephemeral quota, ephemeral reap, idle reaper) read a config that
+   * has survived a platform restart, and an in-memory assertion would pass on a
+   * write that never reached the file.
+   */
+  describe('per-app flag persistence (config write ordering)', () => {
+    let configDir: string;
+
+    beforeEach(async () => {
+      configDir = path.join(tempDir, 'appconf');
+      resetAppConfigService();
+      await getAppConfigService({ configDir, webappsDir: appsDir }).initialize();
+    });
+
+    afterEach(() => {
+      resetAppConfigService();
+    });
+
+    async function reloadConfig(appName: string) {
+      const fresh = new AppConfigService({ configDir, webappsDir: appsDir });
+      await fresh.initialize();
+      return fresh.getConfig(appName);
+    }
+
+    it('persists agentCreated for a new agent-created app', async () => {
+      // The idle reaper skips every app without this flag, so losing it here
+      // means no app on the platform is ever a reap candidate.
+      const archivePath = await buildArchive('agent-app', { 'index.js': 'x' });
+
+      await service.deploy({
+        appName: 'agent-app',
+        archivePath,
+        userId: 'user-1',
+        principalId: 'oauth:sub-1::sid-1',
+        agentCaller: true,
+      });
+
+      expect((await reloadConfig('agent-app'))?.agentCreated).toBe(true);
+    });
+
+    it('persists the ephemeral deadline and its owning principal', async () => {
+      const archivePath = await buildArchive('eph-app', { 'index.js': 'x' });
+      const before = Date.now();
+
+      await service.deploy({
+        appName: 'eph-app',
+        archivePath,
+        userId: 'user-1',
+        principalId: 'oauth:sub-1::sid-1',
+        agentCaller: true,
+        ephemeral: true,
+        ttlMinutes: 5,
+      });
+
+      const config = await reloadConfig('eph-app');
+      // `ephemeral` gates the reap sweep; `ephemeralPrincipalId` is the only
+      // thing the per-caller quota counts on.
+      expect(config?.ephemeral).toBe(true);
+      expect(config?.ephemeralPrincipalId).toBe('oauth:sub-1::sid-1');
+      expect(config?.agentCreated).toBe(true);
+
+      const expiresAt = new Date(config?.expiresAt ?? '').getTime();
+      expect(expiresAt).toBeGreaterThan(before + 4 * 60_000);
+      expect(expiresAt).toBeLessThan(Date.now() + 6 * 60_000);
+    });
+
+    it('leaves an ordinary human deploy unflagged', async () => {
+      // The other direction of SEC-11: nothing here may expose a human-owned
+      // app to automatic deletion. A plain deploy writes no config at all —
+      // app:detected creates it — so this asserts absence, not a false value.
+      const archivePath = await buildArchive('plain-app', { 'index.js': 'x' });
+
+      await service.deploy({ appName: 'plain-app', archivePath, userId: 'user-1' });
+
+      const config = await reloadConfig('plain-app');
+      expect(config?.agentCreated).toBeUndefined();
+      expect(config?.ephemeral).toBeUndefined();
+      expect(config?.expiresAt).toBeUndefined();
     });
   });
 });

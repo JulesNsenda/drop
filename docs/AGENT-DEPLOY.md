@@ -13,7 +13,9 @@ clients that would rather make typed tool calls than shell out to `curl`.
   behind Caddy).
 - An API key with role `user` (mint one in the dashboard, or
   `POST /api/v1/auth/api-keys` as admin). A `user`-role key is automatically
-  scoped to the apps it creates — never hand an agent an `admin` key.
+  scoped to the apps it creates — never hand an agent an `admin` key. A key's
+  role is a ceiling, not a fixed grant: it's capped by its owner's own account
+  role, so demoting the owner demotes the key too.
 - Send the key as `Authorization: Bearer <key>` on every call.
 
 ## The loop
@@ -114,7 +116,7 @@ Never include .env/keys in the tarball; set secrets via PUT $DROP_URL/api/v1/sec
   redeploy fails this way, stop the app first, re-upload, then start it. Linux
   hosts don't have this restriction.
 - **Isolation**: on multi-user boxes DROP requires `isolation: docker`
-  (v2 posture). Even on a single-user box, prefer docker isolation when the
+  (the 1.0 posture). Even on a single-user box, prefer docker isolation when the
   deploys are agent-generated — code nobody read shouldn't run unsandboxed.
 - **App names**: 1–64 chars, alphanumeric plus `-` and `_`.
 
@@ -151,7 +153,8 @@ claude mcp add --transport http dropkit https://<host>/api/v1/mcp --header "Auth
 
 Use a `user`-role API key — never an `admin` key. A `user` key is
 automatically scoped to the apps it creates; an `admin` key can see and touch
-every app on the box.
+every app on the box. A key's role is also capped by its owner's own account
+role, so it can never outrank the human it was minted for.
 
 ### Tools
 
@@ -225,13 +228,73 @@ it**, so don't count on it. Three paths, in the order to try them:
    your box, and it appears in your own access logs — use a long random
    token, treat the URL like a key, rotate it by editing the file.
 
-3. **OAuth 2.1 (PRD-041, ready to build).** The native path the connector
-   dialog is built for — its optional *OAuth Client ID/Secret* fields take a
-   DROP-minted client_id, and claude.ai runs the full authorization-code + PKCE
-   flow against DROP's OAuth metadata, giving a real sign-in/consent screen and
-   no URL-as-credential exposure. This is the durable answer when the
-   Request-headers field (path 1) isn't available. Design fully reconciled in
-   `docs/plans/2026-07-10-mcp-oauth.md`; not yet implemented.
+3. **OAuth 2.1 (implemented).** The native path the connector dialog is built
+   for — its optional *OAuth Client ID/Secret* fields take a DROP-minted
+   client_id, and claude.ai runs the full authorization-code + PKCE flow
+   against DROP's OAuth metadata, giving a real sign-in/consent screen and no
+   URL-as-credential exposure. This is the durable answer when the
+   Request-headers field (path 1) isn't available.
+
+   **Any `user`-role account can set this up for themselves**, not just
+   admins — open the dashboard's **Settings → Claude (MCP)** tab. It shows
+   the same **MCP Server URL**, **OAuth Client ID**, and (leave blank) Client
+   Secret an admin sees, read from `GET /api/v1/oauth/connector-info`; only
+   the one-time minting step (`POST /api/v1/oauth/client`) stays admin-only.
+   If an administrator hasn't opened that tab yet, or hasn't set the server's
+   Public URL, the tab says so instead of failing silently.
+
+   An administrator can turn this capability off for everyone but themselves,
+   from the same tab (or `PUT /api/v1/admin/settings/user-connectors`). It
+   defaults to **on**. Before relying on it as a kill switch, read what it
+   actually covers — the caveat below is not optional reading:
+
+   - It disables **claude.ai connector setup only**. It does **not** disable
+     agent tokens — `POST /api/v1/auth/agent-tokens` is deliberately
+     `user`-tier — or `POST /api/v1/mcp` itself, so any user can still mint an
+     agent token and drive DROP's own MCP server from Claude Code or the raw
+     API while the toggle is off. If you need to stop that too, revoke or
+     rotate the user's tokens/keys directly; the toggle does not reach them.
+   - It also stops a non-admin's own apps that declare `mcp: auth: drop` in
+     their `drop.yaml` (see "Your own app as an MCP server" below) from
+     refreshing their access tokens — the symptom is a 401 from the Caddy
+     gateway on the app's MCP endpoint. Admin-owned apps are unaffected.
+   - It takes effect immediately, on the very next request — a live
+     connector session (DROP's own, or a tenant app's) is cut without waiting
+     for the access token's ~15-minute lifetime to expire, and flipping the
+     toggle back on restores it with no re-consent needed.
+
+### Your own app as an MCP server
+
+Separately from DROP's own hosted MCP endpoint above, an app you deploy can
+speak MCP itself and be added as its own claude.ai connector. Declare it in
+that app's `drop.yaml`:
+
+```yaml
+mcp:
+  path: /mcp      # default
+  auth: drop      # or 'none' (the default)
+```
+
+`auth: none` (the default) means DROP does not guard the endpoint — it is
+public unless your app authenticates callers itself, and the dashboard labels
+it that way. `auth: drop` puts DROP's own OAuth in front of it instead: only
+DROP users who can access the app (its owner, or an admin) can obtain a token
+for it, verified by DROP's Caddy gateway before your app ever sees the
+request. Opting in is your decision as the app's owner — DROP never infers it.
+
+**Know where that guard stops.** It lives in Caddy, so it covers traffic that
+arrives through DROP's proxy — which is everything, under `isolation: docker`,
+because containers publish only to loopback. Under `isolation: none` (the
+default, and what a dev box runs) your app binds a port on the host itself, and
+anything that reaches that port directly bypasses the guard entirely. The
+platform warns about this in its own log at route time. So: run docker
+isolation, or authenticate in the app as well — do not treat `auth: drop` as a
+substitute for the latter on a non-docker box.
+
+An app with `auth: drop` is gated by the **same** non-admin connector toggle
+described above, since it is one setting covering both DROP-scoped and
+app-scoped grants: while it is off, a non-admin owner's connector to their
+own app is refused immediately, the same as a connector to DROP itself.
 
 Note: Claude Code **on the web** (claude.ai/code) is not the connectors UI —
 it reads a project `.mcp.json`, where the http transport + `Authorization`
@@ -242,4 +305,14 @@ header works exactly like the CLI config above.
 Treat the API key like any other credential: store it in your agent's secret
 manager or environment, never commit it, and mint a fresh `user`-role key per
 agent/integration so a leaked key can be revoked without rotating every
-integration at once.
+integration at once. Remember too that a key's role is a ceiling capped by its
+owner's account role, not a fixed grant — keep the owner account itself at the
+right role.
+
+If your key or token was minted through a scoped `users:create` capability
+(rather than an admin key) and it created an account for another
+agent/integration, that account cannot log in yet: it's marked and refused at
+`POST /auth/login` until an admin (or an out-of-band operator) sets its
+password, which is what proves a human — not the scoped caller that minted
+it — now controls the account. This does not affect accounts an admin key
+creates directly; those can log in immediately.

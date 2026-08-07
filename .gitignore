@@ -65,6 +65,20 @@ data/
 # Claude Code local settings (user-specific)
 .claude/settings.local.json
 
+# Stale agent/skill definitions kept locally but not published: they describe a
+# SQLite store, npm run db:migrate/rollback/seed, a `drop deploy --host` flag
+# and a git-receive deploy path -- none of which exist. As *agent instructions*
+# they would make a contributor's assistant confidently run failing commands.
+#
+# Ignored, not merely `git rm --cached`'d: untracking alone is not stable,
+# because any later `git add -A` silently re-adds them.
+.claude/agents/database-expert/
+.claude/skills/db-migrate/
+.claude/skills/deploy-app/
+# Same reason: its entire workflow is "read the PRD, read the TASKS file", and
+# those live under the gitignored docs/specs.
+.claude/skills/implement-feature/
+
 # Package manager locks (choose one and keep it)
 # package-lock.json
 # yarn.lock
@@ -79,10 +93,64 @@ docker-compose.override.yml
 .eslintcache
 .stylelintcache
 
-# Reference repositories (external)
-docs
-docs/**
+# ─── Reference repositories (external) ───────────────────────────────────────
+# Third-party / client source trees. NEVER publish. Both the directory form and
+# the glob are kept deliberately: this is the highest-consequence rule in this
+# file, and a single-pattern typo would expose proprietary code into a public
+# repo irreversibly.
 docs/.reference/
 docs/.reference/**
+
+# ─── docs/ is INTERNAL BY DEFAULT ────────────────────────────────────────────
+# Fail-closed. Everything under docs/ is ignored unless explicitly re-included
+# in the allowlist below, so a new internal note dropped into docs/ can never
+# become publishable by accident.
+#
+# To publish a doc: add an explicit `!docs/<name>` line — and read the file for
+# host specifics (IPs, the live box's topology, credentials) BEFORE you do.
+docs/*
+
+# Internal implementation plans — never published. Both spellings are listed:
+# `docs/plan/` (singular) exists on disk and is NOT matched by `docs/plans/**`.
+docs/plan/
+docs/plan/**
+docs/plans/
+docs/plans/**
+
+# Public docs — explicit allowlist.
+!docs/AGENT-DEPLOY.md
+!docs/CLEAN-CODE-GUIDELINES.md
+!docs/GIT-BRANCHING-MODEL.md
+!docs/GIT-REDEPLOY-AND-CUSTOM-DOMAINS.md
+!docs/HETZNER-DEPLOY.md
+!docs/HTTPS-SETUP.md
+!docs/LOCAL-TESTING.md
+!docs/VERSION-ROADMAP.md
+# docs/specs and docs/examples publish by FILE TYPE, not wholesale. A bare
+# `!docs/specs/` would re-include the entire subtree, making it opt-OUT — so an
+# internal note dropped in there would be publishable, defeating the scheme.
+#
+# The dance below is required by a gitignore rule: a file cannot be re-included
+# if a parent DIRECTORY is excluded, because git never descends into it. So
+# re-include the directory, re-exclude its contents, re-include subdirectories
+# so git keeps descending, then re-include the file types we actually publish.
+!docs/examples/
+docs/examples/**
+!docs/examples/**/
+!docs/examples/**/*.example
+
+# docs/specs is INTERNAL. The PRD/TASKS/specification set is planning material
+# written for one maintainer: statuses were never maintained (shipped features
+# read "Not Started", deleted code reads "In Progress"), and the 4,940-line
+# DROP-PAAS-SPECIFICATION.md presents SQLite, a drop.db platform store,
+# Prometheus and built-in clustering as the shipped architecture -- none of
+# which exist. Published, it would misinform every reader.
+#
+# FEATURE-INDEX.md is the one exception: rewritten as a standalone, accurate
+# feature list that links to nothing under here.
+!docs/specs/
+docs/specs/**
+!docs/specs/FEATURE-INDEX.md
+
 drop-test/**
 

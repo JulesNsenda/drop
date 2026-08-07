@@ -11,8 +11,13 @@ import { Lock, Network } from 'lucide-react';
  * `drop db`, `drop domain`, `drop keys`) that do not exist in this codebase.
  * Source of truth:
  *   - Endpoints: src/api/routes/*.ts, mounted under /api/v1 in src/api/server.ts.
- *   - Auth model: src/api/middleware/auth.ts.
+ *     (Plus the two mounted outside a route file: POST /api/v1/mcp, and the
+ *     root-level /.well-known/* OAuth discovery documents.)
+ *   - Auth model: src/api/middleware/auth.ts, with the per-route role floors
+ *     wired in server.ts#setupRoutes — read BOTH, since several routes are
+ *     raised above their group's general guard there.
  *   - CLI: src/cli/commands/*.ts, registered in src/cli/index.ts.
+ *   - MCP tools: the registerTool() calls in src/api/mcp/tools.ts.
  *
  * Each `EndpointGroupDef` below carries `sourceFile` for traceability, and
  * `ReferenceBody` prints it under each group as a quiet caption.
@@ -27,13 +32,28 @@ export type HttpMethod = 'GET' | 'POST' | 'PUT' | 'DELETE';
  *   - 'public': no auth middleware applied at all.
  *   - 'authenticated': `authMiddleware()` with no role arg — any valid
  *     JWT/API key, regardless of role.
+ *   - 'session': `authMiddleware()` PLUS access.ts's `interactiveSessionOnly`
+ *     gate, which requires `authMethod === 'jwt'` — an API key or OAuth token
+ *     is refused however privileged it is. The role tag alone cannot express
+ *     this, so it gets its own kind; documenting these as 'authenticated'
+ *     would tell people an API key works on routes that reject it.
  *   - 'hmac': unauthenticated by DROP's auth system; the endpoint verifies
  *     its own HMAC signature instead.
- *   - 'readonly*': the group's general guard is `readonly`, applied even to
- *     routes that mutate state — server.ts does not upgrade them. Documented
- *     as-is; see the callout on the Apps group.
+ *   - 'app-token': likewise outside authMiddleware, but far from open — the
+ *     endpoint verifies an access token audienced at ONE app itself, and
+ *     rejects every other credential class (session JWTs, API keys, and
+ *     DROP-scoped OAuth tokens included). Do NOT document these as 'public':
+ *     no auth middleware is not the same thing as no authentication.
  */
-export type EndpointRole = 'public' | 'readonly' | 'readonly*' | 'user' | 'admin' | 'authenticated' | 'hmac';
+export type EndpointRole =
+  | 'public'
+  | 'readonly'
+  | 'user'
+  | 'admin'
+  | 'authenticated'
+  | 'session'
+  | 'hmac'
+  | 'app-token';
 
 export interface EndpointDef {
   method: HttpMethod;
@@ -84,17 +104,21 @@ export const ENDPOINT_GROUPS: EndpointGroupDef[] = [
     basePath: '/api/v1/auth',
     sourceFile: 'src/api/routes/auth.ts',
     description: 'Login, signup, API keys, MFA, and user management. Role required per route (see Authentication above).',
+    note:
+      'The routes tagged “session only” need a browser session: they check the credential KIND, not just the role, ' +
+      'and refuse an API key or OAuth token however privileged it is. Changing your own password, deleting your own ' +
+      'account, and every MFA route are in that set: a stolen key must not be usable to take an account over.',
     endpoints: [
       { method: 'GET', path: '/api/v1/auth/status', description: 'Whether auth is enabled on this instance.', role: 'public' },
       { method: 'POST', path: '/api/v1/auth/signup', description: 'Self-service registration, only when signup is enabled.', role: 'public' },
       { method: 'POST', path: '/api/v1/auth/login', description: 'Authenticate; returns a JWT, or an MFA challenge token.', role: 'public' },
       { method: 'POST', path: '/api/v1/auth/mfa/verify', description: 'Complete an MFA login (challengeToken + 6-digit code) → JWT.', role: 'public' },
       { method: 'GET', path: '/api/v1/auth/me', description: 'Current authenticated user.', role: 'authenticated' },
-      { method: 'PUT', path: '/api/v1/auth/password', description: "Change your own password.", role: 'authenticated' },
-      { method: 'DELETE', path: '/api/v1/auth/account', description: 'Delete your own account.', role: 'authenticated' },
-      { method: 'POST', path: '/api/v1/auth/mfa/setup', description: 'Generate a candidate TOTP secret (not yet persisted).', role: 'authenticated' },
-      { method: 'POST', path: '/api/v1/auth/mfa/enable', description: 'Persist and activate TOTP for your account.', role: 'authenticated' },
-      { method: 'POST', path: '/api/v1/auth/mfa/disable', description: 'Disable TOTP (requires a valid current code).', role: 'authenticated' },
+      { method: 'PUT', path: '/api/v1/auth/password', description: "Change your own password. Rejects a right and a wrong current password identically to an API key, so it is no password oracle.", role: 'session' },
+      { method: 'DELETE', path: '/api/v1/auth/account', description: 'Delete your own account.', role: 'session' },
+      { method: 'POST', path: '/api/v1/auth/mfa/setup', description: 'Generate a candidate TOTP secret (not yet persisted).', role: 'session' },
+      { method: 'POST', path: '/api/v1/auth/mfa/enable', description: 'Persist and activate TOTP for your account.', role: 'session' },
+      { method: 'POST', path: '/api/v1/auth/mfa/disable', description: 'Disable TOTP (requires a valid current code).', role: 'session' },
       { method: 'POST', path: '/api/v1/auth/api-keys', description: 'Create an API key.', role: 'admin' },
       { method: 'GET', path: '/api/v1/auth/api-keys', description: 'List API keys.', role: 'admin' },
       { method: 'DELETE', path: '/api/v1/auth/api-keys/:id', description: 'Delete an API key.', role: 'admin' },
@@ -102,6 +126,8 @@ export const ENDPOINT_GROUPS: EndpointGroupDef[] = [
       { method: 'POST', path: '/api/v1/auth/users', description: 'Create a user.', role: 'admin' },
       { method: 'PUT', path: '/api/v1/auth/users/:id', description: "Update a user's enabled state / role.", role: 'admin' },
       { method: 'POST', path: '/api/v1/auth/users/:id/reset-password', description: "Admin reset of a user's password.", role: 'admin' },
+      { method: 'POST', path: '/api/v1/auth/agent-tokens', description: 'Mint a short-lived, app-scoped agent token ({ name, scopes[], expiresInMinutes? }). Scopes may only name apps you own.', role: 'user' },
+      { method: 'DELETE', path: '/api/v1/auth/agent-tokens/:id', description: 'Revoke an agent token you minted.', role: 'user' },
     ],
   },
   {
@@ -111,20 +137,22 @@ export const ENDPOINT_GROUPS: EndpointGroupDef[] = [
     sourceFile: 'src/api/routes/apps.ts',
     description: 'Deploy, inspect, and manage applications.',
     note:
-      'Source-verified: the general guard on this group is authMiddleware(\'readonly\') for both /apps and /apps/* ' +
-      '(server.ts) — it is NOT upgraded for the mutating routes below (create/update/delete/domain). Only ' +
-      'start, stop, restart, source (upload-deploy), and migrate-runtime have a stricter, route-specific override.',
+      "Source-verified role floors (server.ts). DELETE/PUT/PATCH/POST anywhere under /apps/* are raised to " +
+      "authMiddleware('user'), so create, update, delete, and domain are user+, as are start, stop, restart, " +
+      'promote, and source (upload-deploy), each via its own route-specific override; migrate-runtime and ' +
+      'capabilities are admin. Only the two GETs stay on the general readonly guard.',
     endpoints: [
       { method: 'GET', path: '/api/v1/apps', description: 'List apps (filtered to your own unless admin).', role: 'readonly' },
       { method: 'GET', path: '/api/v1/apps/:name', description: 'Get one app, with live runtime stats.', role: 'readonly' },
-      { method: 'POST', path: '/api/v1/apps', description: 'Register/deploy a new app from a local path.', role: 'readonly*' },
-      { method: 'PUT', path: '/api/v1/apps/:name', description: 'Update editable fields (framework, customDomain).', role: 'readonly*' },
-      { method: 'DELETE', path: '/api/v1/apps/:name', description: "Remove an app (?keepData=true preserves its database).", role: 'readonly*' },
+      { method: 'POST', path: '/api/v1/apps', description: 'Register/deploy a new app from a local path.', role: 'user' },
+      { method: 'PUT', path: '/api/v1/apps/:name', description: 'Update editable fields (framework, customDomain).', role: 'user' },
+      { method: 'DELETE', path: '/api/v1/apps/:name', description: "Remove an app (?keepData=true preserves its database).", role: 'user' },
       { method: 'POST', path: '/api/v1/apps/:name/source', description: 'Deploy/redeploy from an uploaded gzipped tarball.', role: 'user' },
       { method: 'POST', path: '/api/v1/apps/:name/start', description: 'Start a stopped app.', role: 'user' },
       { method: 'POST', path: '/api/v1/apps/:name/stop', description: 'Stop a running app.', role: 'user' },
       { method: 'POST', path: '/api/v1/apps/:name/restart', description: 'Restart an app.', role: 'user' },
-      { method: 'PUT', path: '/api/v1/apps/:name/domain', description: 'Set or clear a custom domain.', role: 'readonly*' },
+      { method: 'POST', path: '/api/v1/apps/:name/promote', description: 'Put a held build in front of traffic. Human sessions only. An agent token is refused (403) whatever its role.', role: 'user' },
+      { method: 'PUT', path: '/api/v1/apps/:name/domain', description: 'Set or clear a custom domain.', role: 'user' },
       { method: 'POST', path: '/api/v1/apps/:name/migrate-runtime', description: 'Move an app between PM2 and Docker runtimes.', role: 'admin' },
       { method: 'PUT', path: '/api/v1/apps/:name/capabilities', description: "Grant/clear the control-plane API capabilities DROP mints into this app's injected DROP_API_KEY (e.g. users:create). Empty array clears.", role: 'admin' },
     ],
@@ -136,7 +164,7 @@ export const ENDPOINT_GROUPS: EndpointGroupDef[] = [
     sourceFile: 'src/api/routes/usage.ts',
     description: "The dashboard's app-limit indicator: your app count against your quota.",
     endpoints: [
-      { method: 'GET', path: '/api/v1/usage', description: "Current user's app count and limit (0 = unlimited).", role: 'readonly' },
+      { method: 'GET', path: '/api/v1/usage', description: "Current user's app count and effective limit: a per-user override if set, else DROP_MAX_APPS_PER_USER (default 5). Reports limit 0, meaning unlimited, for admins and for an auth-disabled instance.", role: 'readonly' },
     ],
   },
   {
@@ -171,9 +199,10 @@ export const ENDPOINT_GROUPS: EndpointGroupDef[] = [
     title: 'Deploys',
     basePath: '/api/v1/deploys',
     sourceFile: 'src/api/routes/deploys.ts',
-    description: 'Read-only deploy-pipeline observability — per-stage timelines for past deploys.',
+    description: 'Read-only deploy-pipeline observability: per-stage timelines for past deploys.',
     endpoints: [
       { method: 'GET', path: '/api/v1/deploys', description: 'Deploy episode history, newest first (?app=&limit=, max 200).', role: 'readonly' },
+      { method: 'GET', path: '/api/v1/deploys/:deployId', description: 'One deploy episode in full: every stage, and why it failed.', role: 'readonly' },
     ],
   },
   {
@@ -213,10 +242,28 @@ export const ENDPOINT_GROUPS: EndpointGroupDef[] = [
     endpoints: [
       { method: 'POST', path: '/api/v1/git/deploy', description: 'Clone a GitHub repo into webapps/ and deploy it.', role: 'user' },
       { method: 'POST', path: '/api/v1/git/redeploy/:name', description: 'git pull + rebuild an existing git-deployed app.', role: 'user' },
-      { method: 'POST', path: '/api/v1/git/webhook', description: 'GitHub push webhook receiver — verified via X-Hub-Signature-256, not a DROP token.', role: 'hmac' },
+      { method: 'POST', path: '/api/v1/git/webhook', description: 'GitHub push webhook receiver, verified via X-Hub-Signature-256, not a DROP token.', role: 'hmac' },
       { method: 'GET', path: '/api/v1/git/tokens', description: 'List stored GitHub PATs (names only, no values).', role: 'user' },
       { method: 'POST', path: '/api/v1/git/tokens', description: 'Store a GitHub personal access token.', role: 'user' },
       { method: 'DELETE', path: '/api/v1/git/tokens/:id', description: 'Remove a stored token.', role: 'user' },
+    ],
+  },
+  {
+    id: 'db',
+    title: 'Database',
+    basePath: '/api/v1/db',
+    sourceFile: 'src/api/routes/db.ts',
+    description:
+      "Read-only visibility into an app's provisioned database: whether one exists, its size, and its tables. " +
+      'Fixed catalogue queries only; there is no endpoint that runs app-authored SQL.',
+    note:
+      'Session only, on both routes. An API key or OAuth token is refused however privileged it is, closing the ' +
+      "same anonymous-disclosure gap an auth-disabled instance would otherwise open. provisioned: false is a normal " +
+      '200, not an error: most apps have no database. The `session` role below is a floor on top of another: ' +
+      "server.ts also requires the `user` role, so a readonly operator's session is refused here too.",
+    endpoints: [
+      { method: 'GET', path: '/api/v1/db/:name', description: 'Whether a database is provisioned, its name, size in bytes, and table count.', role: 'session' },
+      { method: 'GET', path: '/api/v1/db/:name/tables', description: 'Per-table name, estimated row count (null/unanalysed until ANALYZE has run), and size in bytes.', role: 'session' },
     ],
   },
   {
@@ -224,13 +271,18 @@ export const ENDPOINT_GROUPS: EndpointGroupDef[] = [
     title: 'Admin',
     basePath: '/api/v1/admin',
     sourceFile: 'src/api/routes/admin.ts',
-    description: 'Platform administration: activity log, user suspension, quota.',
+    description: 'Platform administration: activity log, user suspension, quota, and platform settings.',
     endpoints: [
       { method: 'GET', path: '/api/v1/admin/activity', description: 'Paginated activity/audit log (?limit=&offset=).', role: 'admin' },
       { method: 'POST', path: '/api/v1/admin/users/:id/suspend', description: 'Suspend a user; stops all their running apps.', role: 'admin' },
       { method: 'POST', path: '/api/v1/admin/users/:id/unsuspend', description: 'Re-enable a suspended user.', role: 'admin' },
       { method: 'GET', path: '/api/v1/admin/quota', description: 'Platform-wide app/user/disk quota summary.', role: 'admin' },
       { method: 'POST', path: '/api/v1/admin/apps/:name/suspend', description: 'Stop an app and mark it suspended.', role: 'admin' },
+      { method: 'GET', path: '/api/v1/admin/settings', description: 'Platform settings: the public base URL (OAuth issuer) and whether a GitHub webhook secret is set. Never returns the secret itself.', role: 'admin' },
+      { method: 'PUT', path: '/api/v1/admin/settings/public-url', description: 'Set or clear the DROP_PUBLIC_URL override. HTTPS-only (localhost excepted), applied live without a restart, and fails closed. It never infers an issuer from the Host header.', role: 'admin' },
+      { method: 'POST', path: '/api/v1/admin/settings/github-webhook-secret/generate', description: 'Generate and store a random webhook HMAC secret, revealed exactly once in this response.', role: 'admin' },
+      { method: 'PUT', path: '/api/v1/admin/settings/github-webhook-secret', description: 'Set the webhook HMAC secret, or clear it with null/empty. The value is never echoed back.', role: 'admin' },
+      { method: 'PUT', path: '/api/v1/admin/settings/user-connectors', description: 'Gate whether non-admin (user-role) accounts may set up their own claude.ai MCP connector. Strict boolean body, so a non-boolean is rejected rather than coerced. Defaults to true.', role: 'admin' },
     ],
   },
   {
@@ -238,13 +290,105 @@ export const ENDPOINT_GROUPS: EndpointGroupDef[] = [
     title: 'MCP',
     basePath: '/api/v1/mcp',
     sourceFile: 'src/api/mcp/transport.ts (mounted directly in src/api/server.ts)',
-    description: 'Hosted Model Context Protocol endpoint — stateless Streamable HTTP, JSON-RPC over POST only.',
+    description:
+      'Hosted Model Context Protocol endpoint: stateless Streamable HTTP, JSON-RPC over POST only. Authenticates a ' +
+      'session JWT or API key at user+, or an OAuth access token audienced at this DROP (see OAuth below).',
+    note:
+      'The tools this endpoint exposes are catalogued under MCP tools above. The endpoint itself is a single ' +
+      'JSON-RPC door, not one route per tool.',
     endpoints: [
-      { method: 'POST', path: '/api/v1/mcp', description: 'Single JSON-RPC request/response — no session state between calls.', role: 'user' },
-      { method: 'GET', path: '/api/v1/mcp', description: 'Not supported in stateless mode — returns a JSON-RPC-shaped 405.', role: 'user' },
-      { method: 'DELETE', path: '/api/v1/mcp', description: 'Not supported in stateless mode — returns a JSON-RPC-shaped 405.', role: 'user' },
+      { method: 'POST', path: '/api/v1/mcp', description: 'Single JSON-RPC request/response, with no session state between calls.', role: 'user' },
+      { method: 'GET', path: '/api/v1/mcp', description: 'Not supported in stateless mode; returns a JSON-RPC-shaped 405.', role: 'user' },
+      { method: 'DELETE', path: '/api/v1/mcp', description: 'Not supported in stateless mode; returns a JSON-RPC-shaped 405.', role: 'user' },
     ],
   },
+  {
+    id: 'oauth',
+    title: 'OAuth 2.1',
+    basePath: '/api/v1/oauth',
+    sourceFile: 'src/api/routes/oauth.ts (+ discovery mounted at the root in src/api/server.ts)',
+    description:
+      'DROP acting as an OAuth 2.1 authorization server, so a browser client like claude.ai can connect to the ' +
+      'hosted MCP endpoint without anyone pasting an API key. Public PKCE client, so there is no client secret.',
+    note:
+      'Every endpoint here fails closed until DROP_PUBLIC_URL is set (503/400 on the routes, 404 on discovery): ' +
+      'the issuer is never derived from the Host header. /authorize, /token, and /revoke are deliberately NOT behind ' +
+      'session auth: /authorize self-gates by redirecting to the dashboard consent screen, /token authenticates by ' +
+      'PKCE, and /revoke authenticates by the presented token itself (RFC 7009: for a public PKCE client the token ' +
+      'IS the credential).',
+    endpoints: [
+      { method: 'GET', path: '/api/v1/oauth/authorize', description: 'Authorization endpoint. Validates the request, then bounces the browser to the dashboard consent screen.', role: 'public' },
+      { method: 'POST', path: '/api/v1/oauth/token', description: 'Token endpoint. Form-urlencoded, and replies in the plain RFC 6749 shape, not DROP’s { success, data } envelope.', role: 'public' },
+      { method: 'POST', path: '/api/v1/oauth/approve', description: 'Called by the consent screen once the operator approves; returns the redirect carrying the authorization code.', role: 'user' },
+      { method: 'POST', path: '/api/v1/oauth/revoke', description: 'RFC 7009 token revocation. No session required: the presented token is its own credential, so this is reachable unauthenticated (form-encoded token, or legacy JSON { refresh_token }). Always 200, even for an unknown token.', role: 'public' },
+      { method: 'POST', path: '/api/v1/oauth/client', description: 'Mint (once) and return the static client_id to paste into a connector. client_secret is always null.', role: 'admin' },
+      { method: 'GET', path: '/api/v1/oauth/connector-info', description: 'Read-only connector details (client_id, client_secret: null, redirect_uri, mcp_url) for the caller to set up their own connector. Never mints. Returns 404 if an admin hasn’t called POST /oauth/client yet, 403 if the non-admin connector toggle is off, 503 if no Public URL is set.', role: 'user' },
+      { method: 'GET', path: '/.well-known/oauth-authorization-server', description: 'RFC 8414 authorization-server metadata. Root path, not under /api/v1, because the spec fixes the location.', role: 'public' },
+      { method: 'GET', path: '/.well-known/oauth-protected-resource', description: 'RFC 9728 protected-resource metadata. Also served at /.well-known/oauth-protected-resource/api/v1/mcp and /.well-known/protected-resource/api/v1/mcp, since clients probe both spellings.', role: 'public' },
+    ],
+  },
+  {
+    id: 'mcp-gateway',
+    title: 'MCP gateway',
+    basePath: '/api/v1/mcp-gateway',
+    sourceFile: 'src/api/routes/mcp-gateway.ts',
+    description:
+      "Caddy's forward_auth target for a tenant app that declares mcp.auth: drop in its drop.yaml. Not a client-facing " +
+      'endpoint: Caddy calls it before proxying, and a 2xx is what lets the request reach the app.',
+    note:
+      'Deliberately outside authMiddleware: it verifies an access token audienced at ONE app and must reject every ' +
+      'other credential class: session JWTs, API keys, and DROP-scoped OAuth tokens included, all of which a general ' +
+      'auth gate would admit. The app name comes from a query parameter DROP itself bakes into the generated Caddy ' +
+      'config, never from a client-controlled Host header.',
+    endpoints: [
+      { method: 'GET', path: '/api/v1/mcp-gateway/verify?app=<name>', description: 'Verify an app-audienced bearer token. 2xx to admit, else one opaque 401 with a WWW-Authenticate challenge pointing at discovery.', role: 'app-token' },
+    ],
+  },
+];
+
+/* ------------------------------------------------------------------------ */
+/* MCP tools — registered in src/api/mcp/tools.ts                           */
+/* ------------------------------------------------------------------------ */
+
+export interface McpToolDef {
+  name: string;
+  description: string;
+}
+
+export const MCP_TOOLS: McpToolDef[] = [
+  {
+    name: 'deploy_files',
+    description:
+      'Deploy from inline file contents, with no shell, tar, or git needed. Creates the app on first use and redeploys ' +
+      'it on later calls (files omitted from a call are removed). Optionally ephemeral: a randomly-named throwaway ' +
+      'app that deletes itself, database included, when ttlMinutes runs out.',
+  },
+  {
+    name: 'deploy_from_git',
+    description:
+      'Deploy a NEW app by cloning a GitHub repo, optionally at a branch. For projects too large for deploy_files. ' +
+      'Never redeploys an existing app.',
+  },
+  { name: 'list_apps', description: 'List the apps you can see: your own, or all of them with an admin key.' },
+  {
+    name: 'app_status',
+    description:
+      "One app's status, type, port, and URL. No existence oracle: an app owned by someone else and an app that " +
+      'does not exist return the same answer.',
+  },
+  {
+    name: 'app_logs',
+    description:
+      'Recent runtime stdout/stderr. Returned inside a nonce-carrying BEGIN/END UNTRUSTED fence, because the app controls ' +
+      'its own log text, so only a closing marker bearing the opening nonce ends the block.',
+  },
+  {
+    name: 'get_deploy_logs',
+    description:
+      'Build or runtime output for a specific deploy, defaulting to the phase it actually died in. This is the one ' +
+      'to reach for after a failed deploy: app_logs shows only what is running now, and a failed deploy is not.',
+  },
+  { name: 'restart_app', description: 'Stop and restart an app on its existing port. Also how to bring a stopped or freshly-deployed app up.' },
 ];
 
 /* ------------------------------------------------------------------------ */
@@ -321,7 +465,7 @@ export const CLI_COMMANDS: CliCommandDef[] = [
   },
   {
     command: 'drop restore <backupDir>',
-    description: 'Restore state from a drop backup snapshot. Destructive — requires the platform to be stopped.',
+    description: 'Restore state from a drop backup snapshot. Destructive, and requires the platform to be stopped.',
     flags: [
       '-r, --root <dir>',
       '--confirm — execute the restore (otherwise only the plan is printed)',
@@ -481,11 +625,12 @@ function MethodDots({ methods }: { methods: HttpMethod[] }): JSX.Element {
 const ROLE_LABEL: Record<EndpointRole, string> = {
   public: 'public',
   readonly: 'readonly+',
-  'readonly*': 'readonly+ *',
   user: 'user+',
   admin: 'admin',
   authenticated: 'any user',
+  session: 'session only',
   hmac: 'HMAC signed',
+  'app-token': 'app-audienced token',
 };
 
 function RoleTag({ role }: { role: EndpointRole }): JSX.Element {
@@ -557,6 +702,27 @@ function EndpointGroupSection({ group }: { group: EndpointGroupDef }): JSX.Eleme
   );
 }
 
+function McpToolTable(): JSX.Element {
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+      {MCP_TOOLS.map(tool => (
+        <div
+          key={tool.name}
+          style={{
+            border: '1px solid var(--border)',
+            borderRadius: 10,
+            padding: '12px 15px',
+            background: 'var(--panel)',
+          }}
+        >
+          <code style={{ fontSize: 13 }}>{tool.name}</code>
+          <div style={{ fontSize: 13, color: 'var(--text-2)', marginTop: 5, lineHeight: 1.6 }}>{tool.description}</div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 function CliTable(): JSX.Element {
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
@@ -583,8 +749,12 @@ function CliTable(): JSX.Element {
             <ul style={{ margin: '8px 0 0', paddingLeft: 18, fontSize: 12, color: 'var(--text-3)', lineHeight: 1.8 }}>
               {cmd.flags.map(f => (
                 <li key={f}>
+                  {/* ' — ' is the DATA delimiter in the `flags` arrays, not
+                      punctuation: it is what this split parses on. Leave it
+                      alone in the data and change only what renders, or every
+                      flag loses its description. Readers see a middot. */}
                   <code style={{ fontSize: 11.5 }}>{f.split(' — ')[0]}</code>
-                  {f.includes(' — ') ? ` — ${f.split(' — ').slice(1).join(' — ')}` : ''}
+                  {f.includes(' — ') ? ` · ${f.split(' — ').slice(1).join(' — ')}` : ''}
                 </li>
               ))}
             </ul>
@@ -620,6 +790,7 @@ export const REF_NAV_GROUPS: RefNavGroup[] = [
     items: [
       { id: 'authentication', title: 'Authentication' },
       { id: 'cli', title: 'CLI' },
+      { id: 'mcp-tools', title: 'MCP tools' },
     ],
   },
   {
@@ -750,15 +921,27 @@ export function ReferenceBody(): JSX.Element {
         </p>
         <ul style={{ margin: '0 0 16px', paddingLeft: 20, color: 'var(--text-2)', fontSize: 14.5, lineHeight: 1.85 }}>
           <li>
-            <strong style={{ color: 'var(--text)' }}>JWT</strong> — from <code>POST /api/v1/auth/login</code>, sent as{' '}
+            <strong style={{ color: 'var(--text)' }}>JWT</strong>, from <code>POST /api/v1/auth/login</code>, sent as{' '}
             <code>Authorization: Bearer &lt;token&gt;</code>. Expires in 24 hours (<code>expiresIn: 86400</code>).
           </li>
           <li>
-            <strong style={{ color: 'var(--text)' }}>API key</strong> — created via{' '}
+            <strong style={{ color: 'var(--text)' }}>API key</strong>, created via{' '}
             <code>POST /api/v1/auth/api-keys</code> (admin-only), sent as{' '}
             <code>X-API-Key: &lt;key&gt;</code> or <code>Authorization: Bearer &lt;key&gt;</code> (either header works).
           </li>
         </ul>
+        <p style={pStyle}>
+          Two narrower credential classes exist alongside those, each accepted only where it belongs:{' '}
+          <strong style={{ color: 'var(--text)' }}>OAuth access tokens</strong> (see{' '}
+          <a href="#oauth" style={linkStyle}>
+            OAuth 2.1
+          </a>
+          ) are audience-bound and reach the MCP endpoint only, and{' '}
+          <strong style={{ color: 'var(--text)' }}>agent tokens</strong> (
+          <code>POST /api/v1/auth/agent-tokens</code>) are short-lived and scoped to named apps you own. An agent token
+          is recognisable as one at every check. <code>POST /apps/:name/promote</code> refuses it outright, whatever
+          role it carries, because promotion is meant to be a human decision.
+        </p>
         <p style={pStyle}>
           Every user and API key has one of three cumulative roles:{' '}
           <code>readonly</code> &lt; <code>user</code> &lt; <code>admin</code>. An endpoint documented as{' '}
@@ -768,7 +951,7 @@ export function ReferenceBody(): JSX.Element {
           Log in and call an endpoint
         </h3>
         <CodeBlock
-          label="shell — JWT"
+          label="shell · JWT"
           code={`curl -X POST http://localhost:3000/api/v1/auth/login \\
   -H "Content-Type: application/json" \\
   -d '{"username":"admin","password":"<password>"}'
@@ -778,7 +961,7 @@ curl http://localhost:3000/api/v1/apps \\
   -H "Authorization: Bearer <token>"`}
         />
         <CodeBlock
-          label="shell — API key"
+          label="shell · API key"
           code={`curl http://localhost:3000/api/v1/apps \\
   -H "X-API-Key: drop_<48-hex-chars>"`}
         />
@@ -813,11 +996,27 @@ curl http://localhost:3000/api/v1/apps \\
         >
           {CLI_GLOBAL_FLAGS.map(f => (
             <div key={f.command}>
-              <code style={{ fontSize: 12.5 }}>{f.command}</code> — {f.description}
+              <code style={{ fontSize: 12.5 }}>{f.command}</code> · {f.description}
             </div>
           ))}
         </div>
         <CliTable />
+      </Section>
+
+      <Section id="mcp-tools" title="MCP tools">
+        <p style={pStyle}>
+          The hosted MCP endpoint (<code>POST /api/v1/mcp</code>) exposes these seven tools to any MCP client,
+          claude.ai over OAuth, or Claude Code / Cursor with an API key in a header. There is deliberately no tool for
+          reading secrets or deleting an app: a connected agent cannot do either.
+        </p>
+        <McpToolTable />
+        <Callout>
+          Setup for each client, both the claude.ai connector flow and the Claude Code / Cursor header form, is in the{' '}
+          <Link to="/docs" style={linkStyle}>
+            docs
+          </Link>
+          .
+        </Callout>
       </Section>
 
       <div style={{ marginBottom: 8 }}>

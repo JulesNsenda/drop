@@ -114,6 +114,35 @@ export interface AppProcessInfo {
   restarts: number;
   createdAt: Date | null;
   restartedAt: Date | null;
+  /**
+   * Whether the kernel OOM-killed this app, from `State.OOMKilled`.
+   *
+   * DOCKER ONLY, and only while the container is actually down. DROP runs
+   * containers with `RestartPolicy: on-failure` (max 5), and Docker clears the
+   * flag on the new run — so an app that is up again after an OOM reads
+   * `false`, not `true`. It is authoritative when true and says nothing when
+   * false.
+   *
+   * Always `undefined` under PM2, which cannot report this at all:
+   * `max_memory_restart` RESTARTS on exceed rather than capping, so an OOM is
+   * indistinguishable from any other crash-loop. Left undefined rather than
+   * `false` so the two cases stay distinguishable — "not OOM" vs "cannot know".
+   */
+  oomKilled?: boolean;
+  /**
+   * CUMULATIVE CPU time consumed by this app, in nanoseconds.
+   *
+   * Monotonic for the life of one process, which is what makes it usable as an
+   * "did this app do any work since the last sweep?" signal — `cpu` above is an
+   * instantaneous percentage, and a request served between two samples leaves
+   * no trace in it at all.
+   *
+   * DOCKER ONLY. PM2 reports only an instantaneous percentage, so it is left
+   * `undefined` rather than 0 — "cannot know" must stay distinguishable from
+   * "did no work", or an idle reaper would read every PM2 app as permanently
+   * idle and delete the fleet.
+   */
+  cpuTotalNs?: number;
 }
 
 /**

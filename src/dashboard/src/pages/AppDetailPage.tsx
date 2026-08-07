@@ -9,6 +9,7 @@ import {
   ExternalLink,
   Clock,
   Folder,
+  Plug,
   Key,
   Plus,
   X,
@@ -17,6 +18,7 @@ import {
   Globe,
   Terminal,
   AlertTriangle,
+  Database,
 } from 'lucide-react';
 import { useApp, appAction, deleteApp, gitRedeploy } from '../hooks/useApi';
 import { getAuthHeaders, useAuth } from '../hooks/useAuth';
@@ -28,13 +30,17 @@ import DeployTimeline from '../components/DeployTimeline';
 import LogViewer from '../components/LogViewer';
 import Tabs, { TabDef } from '../components/Tabs';
 import MetricsTab from '../components/MetricsTab';
+import DatabaseTab from '../components/DatabaseTab';
 import Card from '../components/ui/Card';
 import Button from '../components/ui/Button';
 import Input from '../components/ui/Input';
 
+// Always visible — the "no database provisioned" state is first-class
+// content, not something to hide behind a conditional tab (see DROP-120 plan).
 const DETAIL_TABS: TabDef[] = [
   { id: 'logs', label: 'Logs', icon: Terminal },
   { id: 'metrics', label: 'Metrics', icon: Activity },
+  { id: 'database', label: 'Database', icon: Database },
   { id: 'environment', label: 'Environment', icon: Key },
   { id: 'domains', label: 'Domains', icon: Globe },
 ];
@@ -192,7 +198,7 @@ function AppDetailPage() {
     return (
       <div className="p-6">
         <Link
-          to="/"
+          to="/apps"
           className="mb-6 inline-flex items-center gap-2 text-sm transition-opacity hover:opacity-70"
           style={{ color: 'var(--text-2)' }}
         >
@@ -217,7 +223,7 @@ function AppDetailPage() {
     <div className="p-6">
       {/* Back link */}
       <Link
-        to="/"
+        to="/apps"
         className="mb-6 inline-flex items-center gap-2 text-sm transition-opacity hover:opacity-70"
         style={{ color: 'var(--text-2)' }}
       >
@@ -376,6 +382,41 @@ function AppDetailPage() {
           )}
         </Card>
 
+        {app.mcp ? (
+          <Card>
+            <div className="mb-1 flex items-center gap-2" style={{ color: 'var(--text-2)' }}>
+              <Plug className="h-4 w-4" />
+              <span className="text-sm">MCP endpoint</span>
+            </div>
+            <p className="break-all text-sm font-semibold" style={{ color: 'var(--text)' }}>
+              {app.mcp.url}
+            </p>
+            {/*
+              Shown with the URL, never separately: an operator handed only an
+              address would reasonably assume DROP guards it, and for `auth:
+              none` it does not.
+
+              This used to say "Public" unconditionally, ignoring `mcp.auth`
+              — wrong for every `auth: drop` app, where the Caddy forward_auth
+              gateway DOES verify an audience-bound token (see
+              routes/mcp-gateway.ts).
+
+              The wording is deliberately "guarded at the proxy", not
+              "protected": the guard lives ONLY in Caddy. platform.ts logs the
+              two counter-cases itself — outside docker isolation the app binds
+              a host port that is reachable directly, bypassing it, and when
+              apiPort is unusable the guard is not emitted at all. `mcp.auth`
+              is the tenant's DECLARATION, not proof of enforcement, so this
+              must not promise more than the declaration supports.
+            */}
+            <p className="mt-1 text-xs" style={{ color: 'var(--text-3)' }}>
+              {app.mcp.auth === 'drop'
+                ? 'Guarded at the proxy — DROP verifies an audience-bound token on requests that arrive through it. Traffic reaching the app’s own port directly is not covered.'
+                : 'Public — DROP does not authenticate callers to this endpoint.'}
+            </p>
+          </Card>
+        ) : null}
+
         {isAdmin && app.path ? (
           <Card>
             <div className="mb-1 flex items-center gap-2" style={{ color: 'var(--text-2)' }}>
@@ -484,12 +525,14 @@ function AppDetailPage() {
         </div>
       )}
 
-      {/* Deep-view tabs: Logs / Metrics / Environment / Domains */}
+      {/* Deep-view tabs: Logs / Metrics / Database / Environment / Domains */}
       <Tabs tabs={DETAIL_TABS} active={activeTab} onChange={setActiveTab} />
 
       {activeTab === 'logs' && <LogViewer appName={app.name} appStatus={app.status} />}
 
       {activeTab === 'metrics' && <MetricsTab app={app} />}
+
+      {activeTab === 'database' && <DatabaseTab name={app.name} />}
 
       {activeTab === 'environment' && (
         <Card padded={false}>

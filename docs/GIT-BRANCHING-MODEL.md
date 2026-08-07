@@ -27,7 +27,12 @@ main (production)
 ### `develop`
 - **Purpose**: Integration branch for features
 - **Protection**: Requires PR review, passing CI
-- **Deploys to**: Staging environment
+- **Deploys to**: **Production.** There is no staging environment.
+  `.github/workflows/deploy.yml` triggers on pushes to *both* `main` and
+  `develop`, and its `deploy` job is not branch-gated — so any push to
+  `develop`, including a back-merge with no content change, stops the live
+  service, ships the artifact and restarts it. Treat every merge to `develop`
+  as a production deploy.
 - **Merges from**: `feature/*`, `bugfix/*`
 
 ## Supporting Branches

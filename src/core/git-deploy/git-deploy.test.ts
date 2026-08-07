@@ -9,6 +9,11 @@ import { execFile } from 'child_process';
 import { GitDeployService, resetGitDeployService } from './git-deploy';
 import { resetStateManager, getStateManager } from '../../managers/app/state-manager';
 import { resetSecretManager, getSecretManager } from '../../managers/secret';
+import {
+  AppConfigService,
+  getAppConfigService,
+  resetAppConfigService,
+} from '../../managers/app/app-config';
 import * as diskUtils from '../../utils/disk';
 import { eventBus } from '../event-bus';
 // AppUpdatePayload isn't re-exported by ../event-bus (index.ts) - see the same
@@ -61,12 +66,30 @@ jest.mock('child_process', () => ({
   }),
 }));
 
+import {
+  getDeployBreaker,
+  resetDeployBreaker,
+  DeployRefusedError,
+  guardrailKeysFor,
+} from '../../managers/guardrail/deploy-breaker';
+import {
+  getPrincipalQuota,
+  resetPrincipalQuota,
+} from '../../managers/guardrail/principal-quota';
+
 describe('GitDeployService', () => {
   let service: GitDeployService;
   let tempDir: string;
 
   beforeEach(async () => {
     tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'drop-git-test-'));
+
+    // The deploy quota is a singleton whose DEFAULT store path is relative and
+    // resolves against the process CWD. Left alone these tests would write into
+    // the repo and accumulate counts across runs until every deploy is refused.
+    resetDeployBreaker();
+    resetPrincipalQuota();
+    getPrincipalQuota(path.join(tempDir, 'principal-quotas.json'));
 
     // Initialize state manager
     resetStateManager();
@@ -249,6 +272,56 @@ describe('GitDeployService', () => {
     });
   });
 
+  describe('deploy - guardrail pre-check', () => {
+    // The platform's gates sit at the BUILD, so without this a refused caller
+    // could still make DROP clone an arbitrary repository on every attempt —
+    // network, disk and time spent before the event that would refuse it is
+    // even published.
+    afterEach(() => resetDeployBreaker());
+
+    const actor = { userId: 'human-1', principalId: 'key:looper' };
+
+    const trip = (appName: string) => {
+      const keys = guardrailKeysFor(appName, true, {
+        principalId: actor.principalId,
+        actorUserId: actor.userId,
+      });
+      const breaker = getDeployBreaker();
+      for (let i = 0; i < 5; i++) breaker.recordFailure(keys[0].key, Date.now(), keys[0].threshold);
+    };
+
+    it('refuses BEFORE cloning', async () => {
+      trip('test-app');
+
+      await expect(
+        service.deploy({ repoUrl: 'https://github.com/user/test-app', ...actor })
+      ).rejects.toBeInstanceOf(DeployRefusedError);
+    });
+
+    it('keys on the caller, not the app name — a fresh name does not reset it', async () => {
+      // Every new-app deploy shares one `<principal>::__new__` bucket precisely
+      // so that inventing a new repo name each time accumulates rather than
+      // starting over.
+      trip('test-app');
+
+      await expect(
+        service.deploy({ repoUrl: 'https://github.com/user/a-different-name', ...actor })
+      ).rejects.toBeInstanceOf(DeployRefusedError);
+    });
+
+    it('lets an UNRELATED caller clone', async () => {
+      trip('test-app');
+
+      await expect(
+        service.deploy({
+          repoUrl: 'https://github.com/user/test-app',
+          userId: 'human-2',
+          principalId: 'key:innocent',
+        })
+      ).resolves.toBeDefined();
+    });
+  });
+
   describe('redeploy', () => {
     it('publishes app:update with bypassCooldown after a successful pull', async () => {
       const appName = 'redeploy-app';
@@ -386,6 +459,56 @@ describe('GitDeployService', () => {
 
       const matches = service.findAppsForWebhook('https://github.com/user/normalize-test', 'main');
       expect(matches).toContain('normalize-test');
+    });
+  });
+
+  /**
+   * The same write-ordering seam as upload-deploy: these flags are set before
+   * `app:detected` is published, so the app's config does not exist yet and
+   * `updateConfig` silently wrote nothing. Asserted through a fresh service
+   * loading from disk, because every consumer reads the config after a restart.
+   */
+  describe('per-app flag persistence (config write ordering)', () => {
+    let configDir: string;
+    let webappsDir: string;
+
+    beforeEach(async () => {
+      configDir = path.join(tempDir, 'appconf');
+      webappsDir = path.join(tempDir, 'webapps');
+      resetAppConfigService();
+      await getAppConfigService({ configDir, webappsDir }).initialize();
+    });
+
+    afterEach(() => {
+      resetAppConfigService();
+    });
+
+    async function reloadConfig(appName: string) {
+      const fresh = new AppConfigService({ configDir, webappsDir });
+      await fresh.initialize();
+      return fresh.getConfig(appName);
+    }
+
+    it('persists agentCreated and the ephemeral deadline for a cloned app', async () => {
+      await service.deploy({
+        repoUrl: 'https://github.com/user/eph-clone',
+        userId: 'user-1',
+        principalId: 'oauth:sub-1::sid-1',
+        agentCaller: true,
+        ephemeral: true,
+        ttlMinutes: 5,
+      });
+
+      // git is mocked here, so the clone never creates the app folder — and a
+      // fresh service's cleanupStaleConfigs would (correctly) delete a config
+      // whose app directory is missing. A real clone lands this directory.
+      await fs.mkdir(path.join(webappsDir, 'eph-clone'), { recursive: true });
+
+      const config = await reloadConfig('eph-clone');
+      expect(config?.agentCreated).toBe(true);
+      expect(config?.ephemeral).toBe(true);
+      expect(config?.ephemeralPrincipalId).toBe('oauth:sub-1::sid-1');
+      expect(new Date(config?.expiresAt ?? '').getTime()).toBeGreaterThan(Date.now());
     });
   });
 });

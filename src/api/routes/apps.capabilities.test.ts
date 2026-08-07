@@ -40,8 +40,9 @@ const RUNNING_PROCESS: AppProcessInfo = {
 function makeOps(overrides?: Partial<PlatformOps>): PlatformOps {
   return {
     restartApp: jest.fn().mockResolvedValue(RUNNING_PROCESS),
-    isAppInProgress: jest.fn().mockReturnValue(false),
+    isAppInProgress: jest.fn().mockReturnValue(false), promoteApp: jest.fn(),
     removeGroup: jest.fn().mockResolvedValue({ removed: [] }),
+    purgeAppArtifacts: jest.fn().mockResolvedValue(undefined),
     ...overrides,
   };
 }
@@ -58,7 +59,7 @@ describe('PUT /apps/:name/capabilities', () => {
     tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'drop-capabilities-route-test-'));
     jest.spyOn(console, 'log').mockImplementation();
     jest.spyOn(console, 'warn').mockImplementation();
-    jest.spyOn(activity, 'tryLogActivity').mockResolvedValue();
+    jest.spyOn(activity, 'logActivityFor').mockResolvedValue();
 
     resetStateManager();
     resetAuth();

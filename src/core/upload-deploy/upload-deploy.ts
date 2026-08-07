@@ -23,9 +23,17 @@ import {
 } from './upload-deploy.types';
 import { isValidAppName } from '../../api/middleware/validate';
 import { getStateManager } from '../../managers/app/state-manager';
+import { getAppConfigService } from '../../managers/app/app-config';
 import { getLogger } from '../../utils/logger';
 import { hasEnoughDisk, getMinFreeDiskMb } from '../../utils/disk';
+import { syncTree, DEFAULT_PRESERVE } from '../../utils/tree-sync';
 import { eventBus } from '../event-bus';
+import { admitDeploy } from '../../managers/guardrail/deploy-breaker';
+import {
+  checkEphemeralQuota,
+  resolveTtlMinutes,
+  EphemeralQuotaError,
+} from '../../managers/guardrail/ephemeral';
 
 const logger = getLogger();
 
@@ -57,13 +65,62 @@ export class UploadDeployService {
 
   /** Deploy (or redeploy) an app from an already-staged tarball. */
   async deploy(request: UploadDeployRequest): Promise<UploadDeployResult> {
-    const { appName, archivePath, userId } = request;
+    const { appName, archivePath, userId, principalId, agentCaller, ephemeral, ttlMinutes } =
+      request;
 
     if (!isValidAppName(appName)) {
       throw new UploadValidationError(`Invalid app name: ${appName}`);
     }
 
+    // GUARDRAIL PRE-CHECK, before any expensive work.
+    //
+    // The platform's gates sit at the BUILD, which leaves everything up to it
+    // unmetered: the archive is extracted and LANDED over the live app tree
+    // before app:detected/app:update is ever published, so a refusal downstream
+    // could not undo the write and never stopped the work. Worse, those writes
+    // are inside the watched directory, so the watcher's debounced flush would
+    // republish with no actor and launder the refused build into the automation
+    // bucket.
+    //
+    // Records nothing against the breaker — that outcome is recorded once, by
+    // the platform, for the episode this admits. It DOES spend quota, which is
+    // counted on admission rather than on outcome.
+    //
+    // Marked in-flight BEFORE the await. `isUploading` is what the platform's
+    // app:detected/app:update subscribers consult to drop watcher events mid
+    // upload, and this method used to set it synchronously; awaiting first
+    // would open a window where the deploy has begun and nothing says so.
+    // Released again if admission refuses, since nothing was started.
     this.activeUploads.add(appName);
+    try {
+      const existingApp = getStateManager().getApp(appName);
+      await admitDeploy(appName, !existingApp, { principalId, actorUserId: userId });
+
+      // Ephemeral quota, checked here for the same reason the guardrail is:
+      // everything below extracts and lands files, and a refusal afterwards
+      // would not undo that. Only for a NEW app — a redeploy occupies no
+      // additional slot.
+      if (ephemeral && !existingApp) {
+        const configs = getAppConfigService().getAllConfigs();
+        const verdict = checkEphemeralQuota(
+          configs
+            .filter((c) => c.ephemeral)
+            .map((c) => ({
+              name: c.name,
+              principalId: c.ephemeralPrincipalId,
+              userId: getStateManager().getApp(c.name)?.userId,
+              expiresAt: c.expiresAt ?? '',
+            })),
+          { principalId, userId },
+          Date.now()
+        );
+        if (!verdict.allowed) throw new EphemeralQuotaError(verdict.reason ?? 'Quota exceeded');
+      }
+    } catch (err) {
+      this.activeUploads.delete(appName);
+      throw err;
+    }
+
     let stagingDir: string | undefined;
 
     try {
@@ -99,6 +156,38 @@ export class UploadDeployService {
         if (userId) {
           await stateManager.updateApp(appName, { userId } as Record<string, unknown>);
         }
+        // ONLY on first creation (SEC-11). A redeploy must never set this: it
+        // is what exposes an app to automatic deletion, database included, and
+        // one agent-assisted redeploy of a long-lived human-owned app would
+        // otherwise flag it permanently.
+        //
+        // upsertConfig, NOT updateConfig. This runs BEFORE the app:detected
+        // handler creates the config (platform.ts), and updateConfig writes
+        // nothing when none exists — it returns null, which all four call sites
+        // here and in git-deploy ignored. So these flags were dropped on
+        // precisely the path that sets them (new apps only), leaving the
+        // ephemeral quota, the ephemeral reap and the idle reaper's
+        // agentCreated filter inert in production. `path` rides along so a
+        // config created here is never pathless if the deploy dies before
+        // detection; app:detected upserts the same value.
+        if (agentCaller) {
+          await getAppConfigService().upsertConfig(appName, {
+            agentCreated: true,
+            path: destPath,
+          });
+        }
+        if (ephemeral) {
+          const ttl = resolveTtlMinutes(ttlMinutes);
+          await getAppConfigService().upsertConfig(appName, {
+            ephemeral: true,
+            expiresAt: new Date(Date.now() + ttl * 60_000).toISOString(),
+            ephemeralPrincipalId: principalId,
+            path: destPath,
+            // An ephemeral is by definition agent-scale throwaway work, so it
+            // is reapable on idleness too — not only on its deadline.
+            agentCreated: true,
+          });
+        }
       }
 
       await this.landFiles(stagingDir, destPath);
@@ -120,13 +209,20 @@ export class UploadDeployService {
           path: destPath,
           type: undefined,
           origin: 'upload',
+          principalId,
+          actorUserId: userId,
         });
       } else {
+        // The REDEPLOY branch, and the one an agent loop actually rides: fix,
+        // re-upload, fail, repeat. Leaving the actor off here would have left
+        // the guardrail keying every retry as anonymous automation.
         eventBus.publish('app:update', {
           name: appName,
           path: destPath,
           reason: 'upload deploy',
           bypassCooldown: true,
+          principalId,
+          actorUserId: userId,
         });
       }
 
@@ -151,6 +247,12 @@ export class UploadDeployService {
    * filesystems). For a redeploy over an existing app dir, sync the staged
    * tree over the target and then delete stale target entries that aren't
    * present in the staged tree, so nothing lingers from a previous upload.
+   *
+   * `node_modules` survives that prune (`DEFAULT_PRESERVE`): a tarball never
+   * carries it, and deleting it used to pull a running app's dependencies out
+   * from under it on every redeploy. Build output is NOT preserved — see the
+   * note on `DEFAULT_PRESERVE` for why that is required rather than an
+   * oversight.
    */
   private async landFiles(stagingDir: string, destPath: string): Promise<void> {
     const destExists = fssync.existsSync(destPath);
@@ -161,70 +263,17 @@ export class UploadDeployService {
         return;
       } catch (err) {
         if ((err as NodeJS.ErrnoException).code !== 'EXDEV') throw err;
-        await this.copyTree(stagingDir, destPath);
+        // syncTree prunes as well as copies, where the old copy-only helper
+        // did not. Harmless here: the prune only removes what the copy didn't
+        // just land, and on a destination that didn't exist there is nothing
+        // else. If residue somehow raced in between the existsSync above and
+        // the failed rename, clearing it is what a fresh deploy should do.
+        await syncTree(stagingDir, destPath, { preserve: DEFAULT_PRESERVE });
         return;
       }
     }
 
-    await this.copyTree(stagingDir, destPath);
-    await this.pruneStale(stagingDir, destPath);
-  }
-
-  /** Recursively copy every file/directory from srcDir into destDir. */
-  private async copyTree(srcDir: string, destDir: string): Promise<void> {
-    await fs.mkdir(destDir, { recursive: true });
-    const entries = await fs.readdir(srcDir, { withFileTypes: true });
-
-    for (const entry of entries) {
-      const srcPath = path.join(srcDir, entry.name);
-      const destEntryPath = path.join(destDir, entry.name);
-
-      if (entry.isDirectory()) {
-        // A previous deploy may have left a plain file at this name; clear
-        // it so mkdir doesn't collide with a same-named non-directory.
-        const existing = await this.lstatOrNull(destEntryPath);
-        if (existing && !existing.isDirectory()) {
-          await fs.rm(destEntryPath, { force: true });
-        }
-        await this.copyTree(srcPath, destEntryPath);
-      } else if (entry.isFile()) {
-        const existing = await this.lstatOrNull(destEntryPath);
-        if (existing && existing.isDirectory()) {
-          await fs.rm(destEntryPath, { recursive: true, force: true });
-        }
-        await fs.copyFile(srcPath, destEntryPath);
-      }
-      // tar-extract never writes symlinks/devices/etc, so the staged tree
-      // has no other entry kinds to copy.
-    }
-  }
-
-  /** Delete anything under destDir that isn't present in the staged srcDir. */
-  private async pruneStale(srcDir: string, destDir: string): Promise<void> {
-    const [srcEntries, destEntries] = await Promise.all([
-      fs.readdir(srcDir, { withFileTypes: true }),
-      fs.readdir(destDir, { withFileTypes: true }),
-    ]);
-    const srcByName = new Map(srcEntries.map((e) => [e.name, e]));
-
-    for (const destEntry of destEntries) {
-      const srcEntry = srcByName.get(destEntry.name);
-      if (!srcEntry) {
-        await fs.rm(path.join(destDir, destEntry.name), { recursive: true, force: true });
-        continue;
-      }
-      if (destEntry.isDirectory() && srcEntry.isDirectory()) {
-        await this.pruneStale(path.join(srcDir, destEntry.name), path.join(destDir, destEntry.name));
-      }
-    }
-  }
-
-  private async lstatOrNull(p: string): Promise<fssync.Stats | null> {
-    try {
-      return await fs.lstat(p);
-    } catch {
-      return null;
-    }
+    await syncTree(stagingDir, destPath, { preserve: DEFAULT_PRESERVE });
   }
 }
 

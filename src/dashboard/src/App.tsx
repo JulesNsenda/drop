@@ -1,4 +1,4 @@
-import { useEffect, lazy, Suspense } from 'react';
+import { useEffect } from 'react';
 import { Routes, Route, Navigate, useNavigate } from 'react-router-dom';
 import Layout from './components/Layout';
 import { ErrorBoundary } from './components/ErrorBoundary';
@@ -6,9 +6,6 @@ import { ToastProvider } from './components/Toast';
 import { ConfirmProvider } from './components/ConfirmDialog';
 import { AuthContext, useAuthProvider } from './hooks/useAuth';
 import { UNAUTHORIZED_EVENT, MUST_CHANGE_PASSWORD_EVENT } from './api/client';
-const LandingPage = lazy(() => import('./pages/LandingPage'));
-const DocsPage = lazy(() => import('./pages/DocsPage'));
-const ReferencePage = lazy(() => import('./pages/ReferencePage'));
 import AppsPage from './pages/AppsPage';
 import AppDetailPage from './pages/AppDetailPage';
 import SettingsPage from './pages/SettingsPage';
@@ -51,6 +48,9 @@ function App() {
         <ErrorBoundary>
           <Routes>
             {/* Public routes */}
+            {/* The marketing landing page moved to its own bundle at "/"
+                (DROP-070) — the dashboard's index route no longer renders it;
+                a logged-out visitor here goes straight to login instead. */}
             <Route index element={
               auth.loading ? (
                 <div className="min-h-screen flex items-center justify-center bg-gray-50 dark:bg-gray-900">
@@ -59,13 +59,7 @@ function App() {
               ) : auth.authenticated ? (
                 auth.mustChangePassword ? <Navigate to="/change-password" replace /> : <Navigate to="/apps" replace />
               ) : (
-                <Suspense fallback={
-                  <div className="min-h-screen flex items-center justify-center bg-gray-50 dark:bg-gray-900">
-                    <div className="animate-pulse text-gray-400">Loading...</div>
-                  </div>
-                }>
-                  <LandingPage />
-                </Suspense>
+                <Navigate to="/login" replace />
               )
             } />
             <Route path="login" element={
@@ -83,27 +77,10 @@ function App() {
                 execution plan). */}
             <Route path="oauth-consent" element={<OAuthConsent />} />
 
-            {/* Public docs site (PRD-043) — no auth, not wrapped in Layout */}
-            <Route path="docs" element={
-              <Suspense fallback={
-                <div className="min-h-screen flex items-center justify-center bg-gray-50 dark:bg-gray-900">
-                  <div className="animate-pulse text-gray-400">Loading...</div>
-                </div>
-              }>
-                <DocsPage />
-              </Suspense>
-            } />
-
-            {/* Public API/CLI reference (PRD-044) — no auth, not wrapped in Layout */}
-            <Route path="reference" element={
-              <Suspense fallback={
-                <div className="min-h-screen flex items-center justify-center bg-gray-50 dark:bg-gray-900">
-                  <div className="animate-pulse text-gray-400">Loading...</div>
-                </div>
-              }>
-                <ReferencePage />
-              </Suspense>
-            } />
+            {/* Docs (PRD-043) and API/CLI reference (PRD-044) moved to the
+                marketing site bundle at /docs and /reference (DROP-070) —
+                server.ts 301-redirects the old /dashboard/docs and
+                /dashboard/reference paths there instead of routing here. */}
 
             {/* Force-password-change — accessible while authenticated */}
             <Route path="change-password" element={

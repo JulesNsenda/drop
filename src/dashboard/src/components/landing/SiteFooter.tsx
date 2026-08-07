@@ -26,7 +26,7 @@ const FOOTER_COLUMNS: FooterColumn[] = [
     key: 'product',
     title: 'Product',
     links: [
-      { label: 'Features', href: '#features' },
+      { label: 'What you get', href: '#features' },
       { label: 'Dashboard', enter: true },
       { label: 'Runtimes', href: '#runtimes' },
       { label: 'Changelog', href: GITHUB_URL, external: true },
@@ -115,8 +115,8 @@ export function SiteFooter({ onEnter }: SiteFooterProps): JSX.Element {
               maxWidth: 280,
             }}
           >
-            Deploy · Run · Operate · Publish. A lightweight, self-hosted PaaS for the drop-folder-and-deploy
-            workflow.
+            Deploy · Run · Operate · Publish. Hand it a folder of code, get a live app. On someone
+            else&apos;s DROP, or on your own server.
           </p>
           <div
             style={{

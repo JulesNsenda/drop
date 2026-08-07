@@ -40,8 +40,31 @@ const MCP_CONFIG: RateLimitConfig = {
 };
 
 const OAUTH_CONFIG: RateLimitConfig = {
-  maxRequests: 30,
+  // Raised from 30 for DROP-131 (multi-user connectors). This bucket is keyed
+  // per client IP, and claude.ai's server-to-server /token refreshes all
+  // arrive from a small set of Anthropic egress IPs sharing ONE counter — so
+  // the ceiling is shared across every connected user, not per user. At ~30
+  // users refreshing every 15 minutes, plus consent bursts and the dashboard's
+  // new GET /oauth/connector-info, 30/min starts 429ing refreshes, and a 429
+  // on /token reads to claude.ai as a dead connector.
+  //
+  // Deliberately NOT re-keyed on client_id+grant_type (the first draft of the
+  // plan said to): there is exactly one static client_id on this platform, so
+  // that keying would collapse the whole installation into two buckets and let
+  // any single user starve everyone else — the global-cap anti-pattern
+  // principal-quota.ts exists to avoid. Per-user fairness on refreshes, if it
+  // is ever wanted, belongs in that layer, not in the IP limiter.
+  maxRequests: 120,
   windowMs: 60_000, // 1 minute - dedicated bucket for the OAuth 2.1 endpoints (PRD-041)
+};
+
+const DB_CONFIG: RateLimitConfig = {
+  maxRequests: 20,
+  windowMs: 60_000, // 1 minute - dedicated bucket for the database panel (DROP-120). The
+  // general bucket is 100/min per IP shared across every endpoint, so a burst
+  // of on-demand refreshes against the panel (overview + tables, no polling —
+  // see the plan) would otherwise 429 the operator out of the rest of the API
+  // mid-incident.
 };
 
 // In-memory stores per limiter instance
@@ -65,7 +88,14 @@ function getClientIp(c: Context): string {
   // Normalise IPv6-mapped IPv4 (e.g. "::ffff:127.0.0.1" → "127.0.0.1")
   const peerIp = socketIp?.replace(/^::ffff:/i, '') ?? 'unknown';
 
-  const isLocalPeer = peerIp === '127.0.0.1' || peerIp === '::1' || peerIp === 'unknown';
+  // Fail closed: only a genuine loopback peer is trusted (Caddy runs on the
+  // same host). An unresolved socket ('unknown') must NOT be treated the
+  // same way — trusting it would make X-Forwarded-For client-controlled
+  // whenever the peer address happens to be unavailable, bypassing every
+  // limiter. Falling through to `return peerIp` below instead buckets every
+  // such request under the single literal key 'unknown', so a missing peer
+  // address throttles harder than a normal client, never softer.
+  const isLocalPeer = peerIp === '127.0.0.1' || peerIp === '::1';
 
   if (isLocalPeer) {
     // Trust XFF only from a local reverse proxy (Caddy runs on the same host).
@@ -150,6 +180,11 @@ export function mcpRateLimitMiddleware(config?: Partial<RateLimitConfig>) {
 /** Dedicated rate limiter for the OAuth 2.1 endpoints (PRD-041) */
 export function oauthRateLimitMiddleware(config?: Partial<RateLimitConfig>) {
   return createRateLimiter('oauth', { ...OAUTH_CONFIG, ...config });
+}
+
+/** Dedicated rate limiter for the database panel (DROP-120) */
+export function dbRateLimitMiddleware(config?: Partial<RateLimitConfig>) {
+  return createRateLimiter('db', { ...DB_CONFIG, ...config });
 }
 
 /** Reset all rate limit stores (for testing) */

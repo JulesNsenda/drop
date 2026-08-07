@@ -8,16 +8,28 @@
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import * as yaml from 'yaml';
+import { getLogger } from '../../utils/logger';
 
 /** Keys accepted at the top level of drop.yaml. Any others are rejected. */
 const ALLOWED_TOP_KEYS = new Set([
   'name', 'domains', 'tls', 'env', 'build_env', 'secrets', 'depends_on', 'port',
   'build', 'start', 'healthCheck', 'maxBodySize', 'timeout',
-  'group', 'services', 'type', 'database', 'redis', 'route',
+  'group', 'services', 'type', 'database', 'redis', 'route', 'mcp',
 ]);
 
 /** Keys accepted under drop.yaml#tls */
 const ALLOWED_TLS_KEYS = new Set(['certFile', 'keyFile', 'disabled']);
+
+/** Keys accepted under drop.yaml#mcp (Step 11) */
+const ALLOWED_MCP_KEYS = new Set(['path', 'auth']);
+
+/**
+ * An MCP endpoint path. Tenant-authored and rendered in tool output and the
+ * dashboard (inside a DROP-composed URL), so it is allowlisted rather than
+ * merely length-checked: leading slash, a conservative character set, and no
+ * traversal or empty segments.
+ */
+const MCP_PATH_REGEX = /^\/[A-Za-z0-9._~/-]{0,100}$/;
 
 /** Keys accepted under a drop.yaml#services.<name> entry */
 const ALLOWED_SERVICE_KEYS = new Set([
@@ -30,6 +42,14 @@ const ALLOWED_ROUTE_KEYS = new Set(['path', 'strip']);
 
 /** Safe service name: letters, digits, hyphens, underscores only. */
 const SERVICE_NAME_REGEX = /^[a-zA-Z0-9_-]+$/;
+
+/**
+ * A declared secret's key must be a real environment variable name. This is a
+ * security boundary, not just tidiness: the key is echoed into API errors and
+ * into the MCP `needs-config` tool result, and drop.yaml is attacker-authored
+ * on the `deploy_from_git` path. See validateSecretsObject.
+ */
+const SECRET_NAME_REGEX = /^[A-Za-z_][A-Za-z0-9_]{0,63}$/;
 
 /**
  * Custom TLS configuration for an app
@@ -209,6 +229,30 @@ export interface DropYamlConfig {
    * handleConfigureRoute as a Caddy path prefix (M3).
    */
   route?: AppRouteConfig;
+  /**
+   * Declares this app as an MCP server (Step 11). Presence is the declaration;
+   * DROP's whole-host reverse_proxy already carries `<app>.<domain><path>` to
+   * the app, so this changes no routing — it labels the app so its endpoint can
+   * be surfaced, and reserves the shape PR 2's per-app OAuth will extend.
+   */
+  mcp?: AppMcpConfig;
+}
+
+/**
+ * drop.yaml `mcp:` — an app that speaks MCP over Streamable HTTP.
+ */
+export interface AppMcpConfig {
+  /** Endpoint path on the app's own hostname. Defaults to `/mcp`. */
+  path?: string;
+  /**
+   * Who guards the endpoint.
+   *
+   * `none` (default) — PUBLIC unless the app authenticates callers itself.
+   * `drop` — DROP is the authorization server: callers present an OAuth token
+   * audienced at THIS app, and only DROP users who can access the app are
+   * admitted. Opting in is the owner's decision and is never inferred.
+   */
+  auth?: 'none' | 'drop';
 }
 
 /**
@@ -231,6 +275,112 @@ export interface DropYamlParseResult {
  * Standard drop.yaml file names to search for
  */
 const DROP_YAML_NAMES = ['drop.yaml', 'drop.yml', '.drop.yaml', '.drop.yml'];
+
+/**
+ * De-dupes repeated parse-failure warnings for the same unchanged file. The
+ * same manifest is parsed by ~14 call sites in platform.ts across a single
+ * deploy plus every boot reconciliation pass, so without this a single typo
+ * would spam the log dozens of times. Keyed on the yaml path, with the file's
+ * mtime as the value: an edit changes mtime and re-warns (the fix might have
+ * introduced a NEW mistake worth seeing), an unchanged bad file warns at most
+ * once per process lifetime. Module-level, capped at `MAX_WARNED_PARSE_FAILURES`
+ * (DROP-130 item 2a) — NOT bounded by "the number of apps that have ever had a
+ * malformed manifest", which does not stay small: agent-created ephemeral apps
+ * are TTL'd, reaped and recreated under fresh random names, so a churning
+ * principal grows this map without limit in a long-lived process. Once the cap
+ * is hit, the oldest tracked path (Map preserves insertion order) is evicted
+ * to make room, trading an occasional re-warn for unbounded growth.
+ */
+const warnedParseFailures = new Map<string, number>();
+
+/** Upper bound on distinct manifest paths tracked by `warnedParseFailures`. */
+const MAX_WARNED_PARSE_FAILURES = 500;
+
+/**
+ * Test-only reset for the parse-failure dedupe cache. Process-global mutable
+ * state with no reset function is a cross-test coupling hazard: a later test
+ * that parses a malformed manifest at the same path+mtime as an earlier test
+ * would silently get no warning, and the failure mode is a vacuously passing
+ * assertion, not a red one. Mirrors the existing `__resetAuthCodeStore`
+ * precedent (`src/api/oauth/authorization-code.ts`).
+ */
+export function __resetDropYamlParseWarnings(): void {
+  warnedParseFailures.clear();
+}
+
+/** Cap on the validation-error text this module writes to the log. */
+const MAX_LOGGED_ERROR_CHARS = 200;
+
+/**
+ * `error` is tenant-controlled at several validateDropYamlConfig sites — an
+ * unknown top-level/nested key (`Unknown field '${key}'`) or an invalid
+ * domain/mcp.path echo the offending value verbatim and unbounded, and (per
+ * the SECRET_NAME_REGEX comment above) a YAML key can carry embedded
+ * newlines. Before this warning, that string was returned to callers but
+ * read by none of them; now that it reaches a log, a hostile manifest could
+ * otherwise forge fake log lines (a `\n[...] [ERROR] ...`-shaped key). Flatten
+ * to one line and cap the length — the same treatment the secret-name path
+ * already gives its own error text (`validateSecretsObject`'s `.slice(0, 40)`
+ * plus the `<250` char test), applied here to every validation message.
+ */
+function sanitizeForLog(value: string): string {
+  // Strip C0 (\x00-\x1F, incl. ESC \x1b) and C1 (\x7F, \x80-\x9F, incl. NEL
+  // \x85) control characters BEFORE the whitespace collapse below — `\s`
+  // matches neither ESC nor NEL, so a manifest key carrying either would
+  // otherwise survive this sanitizer intact. An ESC sequence can clear and
+  // rewrite the operator's terminal line; NEL is treated as a line break by
+  // some terminals/log viewers. Plain `\n`/`\r` forgery is already closed by
+  // the collapse, but that regex class does not cover this one (DROP-130
+  // item 1).
+  // eslint-disable-next-line no-control-regex -- deliberately matching C0/C1 control chars to strip them.
+  const stripped = value.replace(/[\x00-\x1F\x7F-\x9F]/g, '');
+  const collapsed = stripped.replace(/\s+/g, ' ').trim();
+  return collapsed.length > MAX_LOGGED_ERROR_CHARS
+    ? `${collapsed.slice(0, MAX_LOGGED_ERROR_CHARS)}…`
+    : collapsed;
+}
+
+/**
+ * Log (at most once per unchanged file) that a drop.yaml failed to parse and
+ * was discarded in FULL — not just the offending field. `parseDropYaml`'s
+ * ~14 callers in platform.ts all check `success` and drop `.error`, so this
+ * is the one site that can make the failure visible at all; see DROP-130
+ * item 9. Uses the shared `getLogger()` singleton (unconfigured file target,
+ * console only) rather than the platform's own `this.logger` instance —
+ * this module has no reference to the running platform and must not acquire
+ * one, matching the existing pattern in git-deploy.ts / upload-deploy.ts.
+ */
+async function warnParseFailure(appPath: string, yamlPath: string, error: string): Promise<void> {
+  let mtimeMs = -1;
+  try {
+    mtimeMs = (await fs.stat(yamlPath)).mtimeMs;
+  } catch {
+    // The file vanished between read and stat — fall back to a fixed
+    // sentinel so repeated failures still dedupe instead of spamming.
+  }
+
+  if (warnedParseFailures.get(yamlPath) === mtimeMs) {
+    return;
+  }
+  // Evict the oldest tracked path once the cap is reached, but only when
+  // this is a genuinely new key — updating an existing path's mtime must
+  // not count against the cap or count as growth.
+  if (warnedParseFailures.size >= MAX_WARNED_PARSE_FAILURES && !warnedParseFailures.has(yamlPath)) {
+    const oldestKey = warnedParseFailures.keys().next().value;
+    if (oldestKey !== undefined) {
+      warnedParseFailures.delete(oldestKey);
+    }
+  }
+  warnedParseFailures.set(yamlPath, mtimeMs);
+
+  const appName = path.basename(appPath);
+  getLogger().warn(
+    `drop.yaml for '${appName}' is invalid and is being ignored IN FULL — not just the ` +
+      `offending field. build, start, domains, env, secrets, database, redis, depends_on ` +
+      `and services are all silently discarded until this is fixed: ${sanitizeForLog(error)}`,
+    'DROP-YAML',
+  );
+}
 
 /**
  * Find drop.yaml file in an app directory
@@ -270,10 +420,12 @@ export async function parseDropYaml(appPath: string): Promise<DropYamlParseResul
     // Validate the parsed config (pass appPath for TLS path containment)
     const validationResult = validateDropYamlConfig(parsed, appPath);
     if (!validationResult.valid) {
+      const error = validationResult.error ?? 'invalid drop.yaml';
+      await warnParseFailure(appPath, yamlPath, error);
       return {
         config: null,
         success: false,
-        error: validationResult.error,
+        error,
         path: yamlPath,
         exists: true,
       };
@@ -286,10 +438,12 @@ export async function parseDropYaml(appPath: string): Promise<DropYamlParseResul
       exists: true,
     };
   } catch (error) {
+    const message = error instanceof Error ? error.message : 'Failed to parse drop.yaml';
+    await warnParseFailure(appPath, yamlPath, message);
     return {
       config: null,
       success: false,
-      error: error instanceof Error ? error.message : 'Failed to parse drop.yaml',
+      error: message,
       path: yamlPath,
       exists: true,
     };
@@ -337,6 +491,45 @@ export function validateDropYamlConfig(
       if (!isValidDomain(domain)) {
         return { valid: false, error: `Invalid domain: ${domain}` };
       }
+    }
+  }
+
+  // Validate mcp (Step 11)
+  if (cfg.mcp !== undefined) {
+    if (typeof cfg.mcp !== 'object' || cfg.mcp === null || Array.isArray(cfg.mcp)) {
+      return { valid: false, error: 'mcp must be an object' };
+    }
+    const mcp = cfg.mcp as Record<string, unknown>;
+
+    for (const key of Object.keys(mcp)) {
+      if (!ALLOWED_MCP_KEYS.has(key)) {
+        return { valid: false, error: `Unknown field 'mcp.${key}' in drop.yaml` };
+      }
+    }
+
+    if (mcp.path !== undefined) {
+      if (typeof mcp.path !== 'string') {
+        return { valid: false, error: 'mcp.path must be a string' };
+      }
+      // Traversal and empty segments are rejected explicitly: the allowlist
+      // permits '.' and '/', so "/a/../b" and "/a//b" match it on their own.
+      if (
+        !MCP_PATH_REGEX.test(mcp.path) ||
+        mcp.path.includes('..') ||
+        mcp.path.includes('//')
+      ) {
+        return {
+          valid: false,
+          error: `Invalid mcp.path '${mcp.path}': must start with '/' and contain only letters, digits, '.', '_', '~', '-' or '/'`,
+        };
+      }
+    }
+
+    if (mcp.auth !== undefined && mcp.auth !== 'none' && mcp.auth !== 'drop') {
+      return {
+        valid: false,
+        error: `Invalid mcp.auth '${String(mcp.auth)}': must be 'none' or 'drop'`,
+      };
     }
   }
 
@@ -541,6 +734,23 @@ function validateSecretsObject(
   for (const [name, decl] of entries) {
     if (!name || typeof name !== 'string') {
       return { valid: false, error: `${label} keys must be non-empty strings` };
+    }
+    // A declared secret's key is an ENV VAR NAME, but it was previously only
+    // checked for being a non-empty string — so any text at all was accepted,
+    // including newlines. That key is carried verbatim into
+    // AppNeedsConfigError.missingSecrets, persisted onto AppState, and
+    // interpolated raw into the `needs-config` MCP tool result. Since
+    // deploy_from_git clones a third-party repo, the drop.yaml is
+    // attacker-authored, so an unconstrained key was a direct injection path
+    // into a calling agent's context — reached on the FIRST deploy attempt,
+    // before any log is ever read. Constrain it to a real env var name.
+    if (!SECRET_NAME_REGEX.test(name)) {
+      return {
+        valid: false,
+        error:
+          `Invalid ${label} key '${name.slice(0, 40)}': must be a valid environment ` +
+          `variable name (letters, digits, underscore; not starting with a digit; max 64 chars)`,
+      };
     }
     if (typeof decl === 'boolean') {
       continue;

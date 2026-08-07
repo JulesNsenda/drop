@@ -42,7 +42,7 @@ describe('git webhook activity logging (P2-4)', () => {
       findAppsForWebhook: () => ['myapp'],
       redeploy,
     } as unknown as ReturnType<typeof gitDeployModule.getGitDeployService>);
-    logSpy = jest.spyOn(activity, 'tryLogActivity').mockResolvedValue();
+    logSpy = jest.spyOn(activity, 'logActivityFor').mockResolvedValue();
 
     process.env.DROP_GITHUB_WEBHOOK_SECRET = secret;
     server = new ApiServer({
@@ -74,14 +74,16 @@ describe('git webhook activity logging (P2-4)', () => {
     });
 
     expect(res.status).toBe(200);
-    expect(redeploy).toHaveBeenCalledWith('myapp');
+    expect(redeploy).toHaveBeenCalledWith('myapp', { automation: 'webhook' });
     expect(logSpy).toHaveBeenCalledTimes(1);
-    const entry = logSpy.mock.calls[0][0];
+    const [auth, entry] = logSpy.mock.calls[0];
     expect(entry).toMatchObject({ action: 'redeploy', appName: 'myapp' });
     expect(entry.detail).toContain('webhook');
-    // Automated — no user attribution.
-    expect(entry.userId).toBeUndefined();
-    expect(entry.username).toBeUndefined();
+    // Automated — no AuthContext at all, which is what "no user attribution"
+    // now reduces to: logActivityFor derives userId/username from `auth`, so
+    // asserting on the pre-merge `entry` here would be vacuous (it can never
+    // carry those fields, by the helper's own type).
+    expect(auth).toBeUndefined();
   });
 
   it('does not log when the redeploy itself fails', async () => {

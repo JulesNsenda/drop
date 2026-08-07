@@ -73,7 +73,20 @@ export class WatcherService {
       this.watcher = chokidar.watch(this.config.appsDir, {
         ignored: this.config.ignorePatterns,
         persistent: this.config.persistent,
-        ignoreInitial: false,
+        // M1 review item 6 (round-2 diff pass): true, not false. chokidar's
+        // OWN initial-scan events (an 'add'/'addDir' for every pre-existing
+        // file/dir at startup) are not real changes — the previous fix
+        // (a WatcherService "boot epoch" tagging every observed change
+        // fromInitialScan, and processChange dropping tagged ones) worked
+        // but was strictly more machinery than needed: getWatched() below
+        // (handleReady's dir-scan loop) is populated by chokidar regardless
+        // of ignoreInitial, so app-level onboarding for a pre-existing dir
+        // never depended on the 'addDir' event in the first place. Letting
+        // chokidar suppress the initial batch at the source removes an
+        // entire class of bug (the epoch never clearing if 'ready' never
+        // fires, a genuine change landing mid-scan being misclassified) for
+        // one line.
+        ignoreInitial: true,
         followSymlinks: this.config.followSymlinks,
         depth: this.config.maxDepth,
         usePolling: this.config.usePolling,
@@ -254,6 +267,11 @@ export class WatcherService {
       name: appName,
       path: appPath,
       type: undefined,
+      // Marks this as DROP noticing a folder rather than anyone asking for a
+      // deploy. The platform refuses to independently onboard a materialized
+      // monorepo child, and that refusal keys off this — an API-originated
+      // detection for the same app must still be honoured.
+      origin: 'watcher',
     });
   }
 
@@ -374,7 +392,10 @@ export class WatcherService {
   }
 
   private handleReady(): void {
-    // Scan for existing apps on startup
+    // Scan for existing apps on startup. getWatched() is populated by
+    // chokidar regardless of ignoreInitial — this loop is how a pre-existing
+    // app dir (not yet in knownApps) is onboarded at boot, independent of
+    // whichever 'add'/'addDir' events chokidar chose to suppress.
     const watched = this.watcher?.getWatched() || {};
 
     for (const dir of Object.keys(watched)) {

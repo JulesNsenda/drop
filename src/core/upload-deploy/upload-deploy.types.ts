@@ -11,6 +11,22 @@ export interface UploadDeployRequest {
   appName: string;
   archivePath: string;
   userId?: string;
+  /**
+   * The credential that asked for this deploy, for guardrail keying — NOT for
+   * authorization, which happened at the route or tool boundary. Absent when
+   * DROP triggered the deploy itself.
+   */
+  principalId?: string;
+  /**
+   * Whether the CALLER is an agent credential, derived server-side from the
+   * auth context — never read from a request body. Only consulted when the app
+   * is new; a redeploy never changes it (SEC-11).
+   */
+  agentCaller?: boolean;
+  /** Create as a throwaway app that reaps itself (Step 10). */
+  ephemeral?: boolean;
+  /** Requested lifetime; clamped by DROP_MAX_EPHEMERAL_TTL_MIN. */
+  ttlMinutes?: number;
 }
 
 /**

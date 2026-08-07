@@ -35,11 +35,16 @@ function Layout() {
   const { toast } = useToast();
   const location = useLocation();
 
-  // PRD-026: explicit redirect to the landing page + confirmation on logout.
+  // PRD-026: explicit redirect + confirmation on logout. Signing out lands on
+  // the login page, not the marketing site — someone who just signed out is far
+  // more likely to want back in than to want the sales pitch. This stays inside
+  // the dashboard bundle (BrowserRouter basename="/dashboard", see main.tsx),
+  // so react-router's navigate() is correct here and the toast survives the
+  // transition — a full page load would discard it before it painted.
   const handleLogout = () => {
     logout();
     toast('success', 'Signed out');
-    navigate('/', { replace: true });
+    navigate('/login', { replace: true });
   };
 
   const ThemeIcon = theme === 'dark' ? Moon : theme === 'light' ? Sun : Monitor;
@@ -92,7 +97,7 @@ function Layout() {
         )}
 
         <div className="px-3 pt-2 text-xs" style={{ color: 'var(--text-3)' }}>
-          DROP v2.0.0-rc.1
+          DROP v{__DROP_VERSION__}
         </div>
       </div>
     </>

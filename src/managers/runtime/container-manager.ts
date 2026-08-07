@@ -57,6 +57,85 @@ function appNameFromContainer(cName: string): string {
   return cName.startsWith(NAME_PREFIX) ? cName.slice(NAME_PREFIX.length) : cName;
 }
 
+/** Size of Docker's per-frame stream header on a non-TTY log stream. */
+const LOG_FRAME_HEADER_SIZE = 8;
+
+/**
+ * De-multiplex Docker's non-TTY log stream into PM2-shaped `[out] `/`[err] `
+ * lines.
+ *
+ * Every frame is an 8-byte header — byte 0 is the stream, bytes 1-3 are
+ * reserved zeros, bytes 4-7 a big-endian uint32 payload length — followed by
+ * the payload. Layout and stream enum verified against moby's own reference
+ * de-multiplexer (`api/pkg/stdcopy/stdcopy.go`: `stdWriterPrefixLen = 8`,
+ * `stdWriterSizeIndex = 4`, `binary.BigEndian.Uint32`).
+ *
+ * Stream values are 0 = stdin, 1 = stdout, 2 = stderr, 3 = systemerr. StdCopy
+ * folds stdin into stdout for backward compatibility and writes systemerr
+ * nowhere, terminating the stream — both mirrored below, so daemon errors are
+ * never passed off as the tenant's own output.
+ *
+ * Reading that with a plain `.toString()`
+ * leaks the header bytes into the text AND discards the stdout/stderr
+ * distinction entirely, which is the only signal the logs API carries: the
+ * dashboard splits streams on the `[out] `/`[err] ` prefixes PM2 emits, so
+ * under docker isolation every line parsed as stdout and the Logs tab's "err"
+ * filter matched nothing, ever.
+ *
+ * Prefixing here (rather than teaching the dashboard that docker has no
+ * prefixes) is what actually restores the filter, and it honours the
+ * AppRuntime contract that both adapters present logs identically.
+ */
+function demuxDockerLogs(buf: Buffer): string {
+  const chunks: { type: 'out' | 'err'; text: string }[] = [];
+  let offset = 0;
+
+  while (offset + LOG_FRAME_HEADER_SIZE <= buf.length) {
+    const streamType = buf[offset];
+    const framed =
+      streamType <= 3 && buf[offset + 1] === 0 && buf[offset + 2] === 0 && buf[offset + 3] === 0;
+
+    if (!framed) {
+      // Unframed at offset 0 means the container has a TTY, so the stream was
+      // never multiplexed — hand back the raw text rather than mangling it.
+      // Mid-buffer it means `tail` sliced through a frame; keep what parsed.
+      // (Checking the reserved zero bytes is stricter than StdCopy, which only
+      // switches on byte 0 — the extra bytes are what make this a usable
+      // "is this framed at all?" probe on a buffer we did not read framed.)
+      if (offset === 0) return buf.toString();
+      break;
+    }
+
+    // Systemerr: daemon-level errors, not app output. StdCopy writes them
+    // nowhere and stops processing; anything after this is not tenant output.
+    if (streamType === 3) break;
+
+    const length = buf.readUInt32BE(offset + 4);
+    const start = offset + LOG_FRAME_HEADER_SIZE;
+    const end = Math.min(start + length, buf.length);
+    const type: 'out' | 'err' = streamType === 2 ? 'err' : 'out';
+    const text = buf.toString('utf8', start, end);
+
+    // Merge adjacent same-stream frames before splitting: a single log line can
+    // span frames, and splitting per frame would cut it in half.
+    const prev = chunks[chunks.length - 1];
+    if (prev && prev.type === type) prev.text += text;
+    else chunks.push({ type, text });
+
+    offset = start + length;
+  }
+
+  if (chunks.length === 0) return buf.toString();
+
+  const lines: string[] = [];
+  for (const chunk of chunks) {
+    for (const line of chunk.text.split('\n')) {
+      if (line.length > 0) lines.push(`[${chunk.type}] ${line}`);
+    }
+  }
+  return lines.join('\n');
+}
+
 function mapDockerState(state: Docker.ContainerInspectInfo['State']): AppRuntimeState {
   if (state.Running) return 'running';
   if (state.Restarting) return 'starting';
@@ -304,18 +383,32 @@ export class ContainerManager implements AppRuntime {
       filters: JSON.stringify({ label: [`${MANAGED_LABEL}=true`] }),
     });
 
-    const results: AppProcessInfo[] = [];
-    for (const c of containers) {
-      const appName = c.Labels?.['drop.app'] ?? appNameFromContainer(c.Names?.[0] ?? '');
-      try {
-        const container = this.docker.getContainer(c.Id);
-        const info = await container.inspect();
-        results.push(this.inspectToInfo(appName, info));
-      } catch {
-        // Container disappeared between list and inspect — skip.
-      }
-    }
-    return results;
+    // Parity with getStatus(): a RUNNING container must carry live cpu/memory.
+    // inspect() alone leaves both at 0 (see inspectToInfo), and 0 is
+    // indistinguishable from a genuinely idle app — so the /apps list reported
+    // a whole healthy fleet as "Avg CPU 0.0%" under docker isolation while each
+    // app's own detail page (getStatus) showed real numbers.
+    //
+    // Concurrent, not serial: container.stats({stream:false}) samples twice so
+    // precpu_stats is valid, costing ~1s per container, and this endpoint is
+    // polled by the dashboard. Serially, a six-app fleet would cost six seconds
+    // per poll. The try/catch stays INSIDE the mapped function so one container
+    // disappearing between list and inspect can't drop the rest.
+    const results = await Promise.all(
+      containers.map(async (c) => {
+        const appName = c.Labels?.['drop.app'] ?? appNameFromContainer(c.Names?.[0] ?? '');
+        try {
+          const container = this.docker.getContainer(c.Id);
+          const base = this.inspectToInfo(appName, await container.inspect());
+          if (base.status !== 'running') return base;
+          return { ...base, ...(await this.fetchContainerStats(container)) };
+        } catch {
+          // Container disappeared between list and inspect — skip.
+          return null;
+        }
+      })
+    );
+    return results.filter((r): r is AppProcessInfo => r !== null);
   }
 
   // ── Logs ───────────────────────────────────────────────────────────────────
@@ -329,8 +422,11 @@ export class ContainerManager implements AppRuntime {
         tail: lines,
         follow: false,
       });
-      // dockerode returns Buffer in non-stream mode
-      return logStream.toString();
+      // dockerode returns Buffer in non-stream mode. The bytes are Docker's
+      // multiplexed frames, not plain text — demux them so stderr survives the
+      // trip to the logs API (see demuxDockerLogs).
+      const raw = logStream as unknown;
+      return demuxDockerLogs(Buffer.isBuffer(raw) ? raw : Buffer.from(String(raw)));
     } catch (err: unknown) {
       if (this.isNotFound(err)) return '';
       throw err;
@@ -538,18 +634,36 @@ export class ContainerManager implements AppRuntime {
         ? Date.now() - new Date(state.StartedAt).getTime()
         : 0;
 
+    // Host-published port (M1 review item 7, round-2 diff pass): the
+    // published port lives at NetworkSettings.Ports['<containerPort>/tcp'][0]
+    // .HostPort. This doesn't know the container-side port key ahead of
+    // time, but DROP's own container spec always publishes exactly ONE port
+    // binding, host==container (see start()'s PortBindings/ExposedPorts:
+    // `${hostPort}/tcp` -> HostPort: hostPort) — so taking the first
+    // published binding, whatever its key, is exactly as specific as
+    // knowing the key. Previously always null ("not re-derived from
+    // inspect"); this activates boot reconciliation's portDrifted check for
+    // docker for the first time — it was structurally inert before.
+    const publishedPort = Object.values(info.NetworkSettings?.Ports ?? {}).find(
+      (bindings) => bindings && bindings.length > 0
+    )?.[0]?.HostPort;
+    const port = publishedPort ? parseInt(publishedPort, 10) : null;
+
     return {
       name: appName,
       status: mapDockerState(state),
       runtime: this.type,
       pid,
-      port: null, // port lives in the appconf; not re-derived from inspect
+      port,
       memory: 0,  // populated by fetchContainerStats in getStatus when running
       cpu: 0,
       uptime,
       restarts: info.RestartCount ?? 0,
       createdAt,
       restartedAt,
+      // Authoritative when true. Docker clears it on the next run, so it is
+      // only observable while the container is down — see AppProcessInfo.
+      oomKilled: state.OOMKilled === true,
     };
   }
 
@@ -560,7 +674,7 @@ export class ContainerManager implements AppRuntime {
    */
   private async fetchContainerStats(
     container: Docker.Container
-  ): Promise<{ memory: number; cpu: number }> {
+  ): Promise<{ memory: number; cpu: number; cpuTotalNs?: number }> {
     try {
       const raw = await container.stats({ stream: false }) as unknown as Record<string, unknown>;
       const memStats = raw.memory_stats as Record<string, number> | undefined;
@@ -581,8 +695,21 @@ export class ContainerManager implements AppRuntime {
       const cpuPercent =
         systemDelta > 0 ? (cpuDelta / systemDelta) * numCpus * 100 : 0;
 
-      return { memory: memUsage, cpu: Math.round(cpuPercent * 10) / 10 };
+      // The CUMULATIVE counter, not the derived percentage. Idle detection
+      // needs "did any work happen between these two moments", which a sampled
+      // percentage cannot answer — a request served between samples is invisible
+      // to it.
+      const cpuTotalNs = (cpuStats?.cpu_usage as Record<string, number>)?.total_usage;
+
+      return {
+        memory: memUsage,
+        cpu: Math.round(cpuPercent * 10) / 10,
+        ...(typeof cpuTotalNs === 'number' ? { cpuTotalNs } : {}),
+      };
     } catch {
+      // No cpuTotalNs on failure — absent means "unknown", and a 0 here would
+      // read as "did no work" and count toward reaping an app we simply could
+      // not measure.
       return { memory: 0, cpu: 0 };
     }
   }

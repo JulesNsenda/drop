@@ -28,6 +28,222 @@ describe('DeployTracker', () => {
     await fs.rm(tmpDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   });
 
+  describe('deployId adoption', () => {
+    // The tracker used to mint the deployId itself, which meant the id
+    // identifying an episode was one nothing upstream could reference — the
+    // caller, the build log and the episode all named the deploy differently.
+    it('adopts the deployId supplied by the publisher', async () => {
+      bus.publish('build:started', {
+        appId: 'adopt-app',
+        buildId: 'b1',
+        deployId: 'caller-minted-id',
+      });
+      bus.publish('app:updated', { appId: 'adopt-app', changes: { status: 'running' } });
+      await tracker.flush();
+
+      const [episode] = tracker.getEpisodes('adopt-app', 1);
+      expect(episode.deployId).toBe('caller-minted-id');
+    });
+
+    it('keeps the adopted id across every row of the episode', async () => {
+      // Rows are correlated by deployId, so adopting on open but minting on a
+      // later row would split one deploy into two episodes.
+      bus.publish('build:started', { appId: 'multi', buildId: 'b1', deployId: 'stable-id' });
+      bus.publish('build:failed', {
+        appId: 'multi',
+        buildId: 'b1',
+        error: new Error('boom'),
+        deployId: 'stable-id',
+        stage: 'build',
+      });
+      await tracker.flush();
+
+      const episodes = tracker.getEpisodes('multi', 10);
+      expect(episodes).toHaveLength(1);
+      expect(episodes[0].deployId).toBe('stable-id');
+    });
+
+    it('still mints one when the publisher supplies none', async () => {
+      // The fallback must stay live — a hand-built payload or a publisher that
+      // has not been threaded yet still gets a working episode.
+      bus.publish('build:started', { appId: 'no-id-app', buildId: 'b1' });
+      bus.publish('app:updated', { appId: 'no-id-app', changes: { status: 'running' } });
+      await tracker.flush();
+
+      const [episode] = tracker.getEpisodes('no-id-app', 1);
+      expect(episode.deployId).toEqual(expect.any(String));
+      expect(episode.deployId.length).toBeGreaterThan(0);
+    });
+
+    it('logs the degraded case rather than falling back silently', async () => {
+      // A deploy arriving with no id means a call site was missed. That is
+      // invisible otherwise, and the whole point of the change is that every
+      // deploy is addressable.
+      const debug = jest.spyOn(console, 'debug').mockImplementation();
+
+      bus.publish('build:started', { appId: 'quiet-app', buildId: 'b1' });
+      await tracker.flush();
+
+      expect(debug).toHaveBeenCalledWith(expect.stringContaining('carried no deployId'));
+      debug.mockRestore();
+    });
+
+    it('does not log when an id was supplied', async () => {
+      const debug = jest.spyOn(console, 'debug').mockImplementation();
+
+      bus.publish('build:started', { appId: 'loud-app', buildId: 'b1', deployId: 'given' });
+      await tracker.flush();
+
+      expect(debug).not.toHaveBeenCalledWith(expect.stringContaining('carried no deployId'));
+      debug.mockRestore();
+    });
+  });
+
+  describe('failure category is derived, not hardcoded', () => {
+    // Gap A: builder.ts always knew which stage failed but published only
+    // {appId, buildId, error}, so this handler hardcoded 'build-failed' while
+    // DeployRow.category documented three values. GET /api/v1/deploys reported
+    // a constant as though it discriminated.
+    const categoryAfter = async (app: string, stage: string): Promise<string | undefined> => {
+      bus.publish('build:started', { appId: app, buildId: 'b1' });
+      bus.publish('build:failed', {
+        appId: app,
+        buildId: 'b1',
+        error: new Error('boom'),
+        stage: stage as never,
+      });
+      await tracker.flush();
+      const [episode] = tracker.getEpisodes(app, 1);
+      return episode.stages.find((s) => s.stage === 'build-failed')?.category;
+    };
+
+    it('maps install to install-failed', async () => {
+      expect(await categoryAfter('a-install', 'install')).toBe('install-failed');
+    });
+
+    it('maps build to build-failed', async () => {
+      expect(await categoryAfter('a-build', 'build')).toBe('build-failed');
+    });
+
+    it('maps pre-build and environment to prebuild-failed', async () => {
+      expect(await categoryAfter('a-pre', 'pre-build')).toBe('prebuild-failed');
+      expect(await categoryAfter('a-env', 'environment')).toBe('prebuild-failed');
+    });
+
+    it('maps the post-compile stages to postbuild-failed', async () => {
+      // These three fit none of the original three documented values, which is
+      // why the category type gained a fourth rather than folding them into
+      // 'build-failed' and reporting a compile failure that never happened.
+      expect(await categoryAfter('a-opt', 'optimize')).toBe('postbuild-failed');
+      expect(await categoryAfter('a-post', 'post-build')).toBe('postbuild-failed');
+      expect(await categoryAfter('a-val', 'validate')).toBe('postbuild-failed');
+    });
+
+    it('actually discriminates — two stages do not produce the same category', async () => {
+      // The assertion the old code would fail. Each test above passes on its
+      // own against a hardcoded 'build-failed' only if that happens to be the
+      // expected value; this one cannot.
+      const install = await categoryAfter('d-install', 'install');
+      const build = await categoryAfter('d-build', 'build');
+      const pre = await categoryAfter('d-pre', 'pre-build');
+      expect(new Set([install, build, pre]).size).toBe(3);
+    });
+
+    it('persists exitCode and command on the failed row', async () => {
+      bus.publish('build:started', { appId: 'with-detail', buildId: 'b1' });
+      bus.publish('build:failed', {
+        appId: 'with-detail',
+        buildId: 'b1',
+        error: new Error('npm ERR! code ELIFECYCLE'),
+        stage: 'install',
+        exitCode: 127,
+        command: 'npm ci',
+      });
+      await tracker.flush();
+
+      const [episode] = tracker.getEpisodes('with-detail', 1);
+      const failed = episode.stages.find((s) => s.stage === 'build-failed');
+      expect(failed?.exitCode).toBe(127);
+      expect(failed?.command).toBe('npm ci');
+    });
+
+    it('still never persists the raw error message', async () => {
+      // The invariant the new fields must not erode: stage/exitCode/command are
+      // DROP-generated, error.message is process output and stays out.
+      bus.publish('build:started', { appId: 'no-leak', buildId: 'b1' });
+      bus.publish('build:failed', {
+        appId: 'no-leak',
+        buildId: 'b1',
+        error: new Error('/etc/secret leaked DATABASE_URL=postgres://user:pw@host/db'),
+        stage: 'install',
+        exitCode: 1,
+        command: 'npm ci',
+      });
+      await tracker.flush();
+
+      const raw = JSON.stringify(tracker.getEpisodes('no-leak', 1));
+      expect(raw).not.toContain('DATABASE_URL');
+      expect(raw).not.toContain('/etc/secret');
+    });
+  });
+
+  describe('hasOpenEpisode', () => {
+    // Lets the platform distinguish "nothing ever opened an episode for this
+    // deploy" from "one opened and already closed" — without that it would
+    // either no-op a pre-build failure (the close hits the orphan guard) or
+    // manufacture a second, spurious failed episode.
+    it('is false for an app with no episode at all', () => {
+      expect(tracker.hasOpenEpisode('never-seen')).toBe(false);
+    });
+
+    it('is true between build:started and a terminal event', async () => {
+      bus.publish('build:started', { appId: 'open-app', buildId: 'b1' });
+      expect(tracker.hasOpenEpisode('open-app')).toBe(true);
+      await tracker.flush();
+    });
+
+    it('is false once the episode closes as succeeded', async () => {
+      bus.publish('build:started', { appId: 'ok-app', buildId: 'b1' });
+      bus.publish('app:updated', { appId: 'ok-app', changes: { status: 'running' } });
+      await tracker.flush();
+
+      expect(tracker.hasOpenEpisode('ok-app')).toBe(false);
+    });
+
+    it('is false once the episode closes as failed', async () => {
+      bus.publish('build:started', { appId: 'bad-app', buildId: 'b1' });
+      bus.publish('build:failed', {
+        appId: 'bad-app',
+        buildId: 'b1',
+        error: new Error('boom'),
+        stage: 'build',
+      });
+      await tracker.flush();
+
+      expect(tracker.hasOpenEpisode('bad-app')).toBe(false);
+    });
+
+    it('a synthesized open/close pair produces one terminal failed episode', async () => {
+      // Exactly the sequence platform.failDeployEpisode emits for a failure
+      // that never reached the builder (undetectable type, disk check,
+      // malformed drop.yaml).
+      bus.publish('build:started', { appId: 'pre-fail', buildId: 'synthetic-1' });
+      bus.publish('build:failed', {
+        appId: 'pre-fail',
+        buildId: 'synthetic-1',
+        error: new Error('Could not detect application type'),
+        stage: 'pre-build',
+      });
+      await tracker.flush();
+
+      const episodes = tracker.getEpisodes('pre-fail');
+      expect(episodes).toHaveLength(1);
+      expect(episodes[0].status).toBe('failed');
+      expect(episodes[0].endedAt).toBeDefined();
+      expect(tracker.hasOpenEpisode('pre-fail')).toBe(false);
+    });
+  });
+
   it('PM2 happy path: detect -> build -> running closes with a full stage timeline', async () => {
     bus.publish('app:detected', { name: 'app1', path: '/webapps/app1' });
     bus.publish('build:started', { appId: 'app1', buildId: 'b1' });
@@ -119,6 +335,7 @@ describe('DeployTracker', () => {
       appId: 'app4',
       buildId: 'b1',
       error: new Error('/etc/secret/abs/path leaked DATABASE_URL=postgres://user:pw@host/db'),
+      stage: 'build',
     });
     await tracker.flush();
 
@@ -169,7 +386,12 @@ describe('DeployTracker', () => {
   });
 
   it('orphan-close guard: a stray build:failed with no open episode is ignored', async () => {
-    bus.publish('build:failed', { appId: 'app7', buildId: 'bx', error: new Error('boom') });
+    bus.publish('build:failed', {
+      appId: 'app7',
+      buildId: 'bx',
+      error: new Error('boom'),
+      stage: 'build',
+    });
     await tracker.flush();
 
     expect(tracker.getEpisodes('app7')).toEqual([]);
@@ -249,6 +471,7 @@ describe('DeployTracker', () => {
       appId: 'app12',
       buildId: 'b1',
       error: new Error(`ENOENT: ${path.join(tmpDir, 'node_modules', 'missing')}`),
+      stage: 'build',
     });
     await tracker.flush();
 

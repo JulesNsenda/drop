@@ -28,8 +28,9 @@ const MCP_URL = `http://127.0.0.1:${PORT}/api/v1/mcp`;
 function makeOps(overrides?: Partial<PlatformOps>): PlatformOps {
   return {
     restartApp: jest.fn(),
-    isAppInProgress: jest.fn().mockReturnValue(false),
+    isAppInProgress: jest.fn().mockReturnValue(false), promoteApp: jest.fn(),
     removeGroup: jest.fn().mockResolvedValue({ removed: [] }),
+    purgeAppArtifacts: jest.fn().mockResolvedValue(undefined),
     ...overrides,
   };
 }
@@ -66,7 +67,7 @@ describe('Hosted MCP endpoint (integration)', () => {
     await fs.rm(tempDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   });
 
-  it('lists exactly the 6 MCP tools', async () => {
+  it('lists exactly the 7 MCP tools', async () => {
     const client = new Client({ name: 'test-client', version: '1.0.0' });
     const transport = new StreamableHTTPClientTransport(new URL(MCP_URL));
     try {
@@ -79,6 +80,7 @@ describe('Hosted MCP endpoint (integration)', () => {
           'app_status',
           'deploy_files',
           'deploy_from_git',
+          'get_deploy_logs',
           'list_apps',
           'restart_app',
         ].sort()

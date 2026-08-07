@@ -64,10 +64,26 @@ export function buildAuthServerMetadata(publicUrl: string): object {
     issuer,
     authorization_endpoint: `${issuer}/api/v1/oauth/authorize`,
     token_endpoint: `${issuer}/api/v1/oauth/token`,
+    // Discoverable so claude.ai can call POST /api/v1/oauth/revoke when a
+    // user disconnects the connector from its UI — without this, that
+    // disconnect only removes claude.ai's copy of the token and the grant
+    // stays valid server-side forever (Item 6, DROP-131). The route is
+    // genuinely reachable with no session (see oauth.ts's /revoke handler and
+    // server.ts) — an earlier version of this advertised the endpoint while
+    // it still sat behind authMiddleware, which 401'd the only caller that
+    // was ever going to hit it.
+    revocation_endpoint: `${issuer}/api/v1/oauth/revoke`,
     response_types_supported: ['code'],
     grant_types_supported: ['authorization_code', 'refresh_token'],
     code_challenge_methods_supported: ['S256'],
     token_endpoint_auth_methods_supported: ['none'],
+    // 'none' per RFC 8414's registry (inherited from OpenID Connect Discovery):
+    // no client authentication is used at the endpoint. True here for the
+    // same public-PKCE-client reason as token_endpoint_auth_methods_supported
+    // — DROP has no client secret — but also literally true of the route
+    // itself now: it is not behind a session, and the presented token is its
+    // own credential (RFC 7009).
+    revocation_endpoint_auth_methods_supported: ['none'],
     scopes_supported: ['offline_access'],
   };
 }

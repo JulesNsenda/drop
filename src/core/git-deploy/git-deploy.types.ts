@@ -15,6 +15,20 @@ export interface GitSource {
 }
 
 /** API request to deploy from git */
+/**
+ * Who asked for a deploy, for guardrail keying only.
+ *
+ * `automation` is set when DROP triggered the deploy itself and there is no
+ * caller at all. It is a separate field rather than "principalId is undefined"
+ * because the two must NOT share a bucket: a webhook firing in a loop would
+ * otherwise consume the quota of whichever human happens to own the app.
+ */
+export interface DeployActor {
+  principalId?: string;
+  userId?: string;
+  automation?: 'webhook';
+}
+
 export interface GitDeployRequest {
   repoUrl: string;
   branch?: string;
@@ -22,6 +36,13 @@ export interface GitDeployRequest {
   autoRedeploy?: boolean;
   tokenId?: string;
   userId?: string;
+  /** See UploadDeployRequest.principalId — guardrail keying, not authorization. */
+  principalId?: string;
+  /** See UploadDeployRequest.agentCaller — server-derived, first creation only. */
+  agentCaller?: boolean;
+  /** See UploadDeployRequest.ephemeral. */
+  ephemeral?: boolean;
+  ttlMinutes?: number;
 }
 
 /** API request to store a GitHub token */

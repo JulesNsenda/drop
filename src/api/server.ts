@@ -25,12 +25,14 @@ import {
   uploadRateLimitMiddleware,
   mcpRateLimitMiddleware,
   oauthRateLimitMiddleware,
+  dbRateLimitMiddleware,
 } from './middleware/rate-limit';
 import { securityHeadersMiddleware } from './middleware/security-headers';
 import { auditMiddleware, initializeAuditLog, closeAuditLog } from './middleware/audit';
 import { validateBodySize } from './middleware/validate';
 import { setApiRuntimeConfig, getPublicUrl } from './runtime-config';
 import { getSettingsManager } from '../managers/settings/settings-manager';
+import { isPathWithin } from '../utils/paths';
 import { buildProtectedResourceMetadata, buildAuthServerMetadata } from './oauth/metadata';
 import { error, ErrorCodes } from './types';
 import healthRoutes from './routes/health';
@@ -40,12 +42,15 @@ import authRoutes from './routes/auth';
 import certsRoutes from './routes/certs';
 import deploysRoutes from './routes/deploys';
 import secretsRoutes from './routes/secrets';
+import dbRoutes from './routes/db';
 import webhooksRoutes from './routes/webhooks';
 import gitDeployRoutes from './routes/git-deploy';
 import adminRoutes from './routes/admin';
 import usageRoutes from './routes/usage';
 import oauthRoutes from './routes/oauth';
+import mcpGatewayRoutes from './routes/mcp-gateway';
 import { handleMcpRequest, methodNotAllowed } from './mcp/transport';
+import { getPlatformVersion } from '../utils/version';
 
 /** Matches POST /api/v1/apps/:name/source — the upload-deploy endpoint (PRD-039). */
 const UPLOAD_SOURCE_PATH_RE = /^\/api\/v1\/apps\/[A-Za-z0-9_-]+\/source$/;
@@ -81,6 +86,21 @@ export interface ApiServerConfig {
   tempDirectory?: string;
   /** Cap on the compressed (as-uploaded) archive size for POST /apps/:name/source, in MB. */
   maxUploadSizeMb?: number;
+  /**
+   * Override the resolved dashboard directory (normally dist/dashboard, or
+   * src/dashboard as a dev fallback — see setupRoutes). Defaults to that
+   * resolution when unset; exists so tests can point at an isolated fixture
+   * instead of the real repo-relative dist/dashboard.
+   */
+  dashboardPath?: string;
+  /**
+   * Override the resolved site directory (normally dist/site — see
+   * setupRoutes). Defaults to that resolution when unset; exists so tests
+   * can point at an isolated fixture instead of the real repo-relative
+   * dist/site, which every `new ApiServer(...)` in the suite would otherwise
+   * share as a real, mutable, non-parallel-safe path.
+   */
+  sitePath?: string;
 }
 
 export class ApiServer {
@@ -211,10 +231,20 @@ export class ApiServer {
     v1.use('/auth/login', authRateLimitMiddleware());
     v1.use('/auth/signup', authRateLimitMiddleware());
     v1.use('/auth/mfa/*', authRateLimitMiddleware());
+    // PUT /auth/password compares `currentPassword` and reports the mismatch,
+    // so it is a password-guessing surface exactly like /auth/login and needs
+    // the same bucket — the general /api/* limiter is far too generous for it.
+    // The route is additionally interactive-session-only (see auth.ts), which
+    // closes it to API keys; this bucket is what bounds the JWT path.
+    v1.use('/auth/password', authRateLimitMiddleware());
     // Account creation (POST /auth/users) — reachable by a scoped provisioning
     // token now, so bound it with the strict auth limiter. POST only, so admin
     // GET listing of users is not throttled. Registered unconditionally like the
     // login limiter above.
+    // Every mint appends to api-credentials.json and rewrites the whole file,
+    // which every later auth check must parse and scan linearly. Same strict
+    // bucket as the other credential-minting routes.
+    v1.use('/auth/agent-tokens', authRateLimitMiddleware());
     const usersCreateRateLimit = authRateLimitMiddleware();
     v1.use('/auth/users', (c, next) =>
       c.req.method === 'POST' ? usersCreateRateLimit(c, next) : next()
@@ -235,6 +265,14 @@ export class ApiServer {
     // OAuth isn't configured/enabled, but the rate limit applies regardless.
     v1.use('/oauth/*', oauthRateLimitMiddleware());
 
+    // The database panel (DROP-120) gets an ADDITIONAL, tighter cap here —
+    // not instead of the general bucket registered above (`/api/*`, which
+    // `/db/*` still matches too): a request here is throttled by BOTH, this
+    // one is just stricter (20/min vs 100/min) because it is sized for a
+    // single shared PostgreSQL instance, not the whole API. Registered
+    // unconditionally — an auth-disabled (single-operator) box still gets it.
+    v1.use('/db/*', dbRateLimitMiddleware());
+
     // Apply auth middleware to protected routes when auth is enabled
     if (this.config.enableAuth && isAuthEnabled()) {
       // migrate-runtime is admin-only — register before the general /apps/* guard.
@@ -249,6 +287,10 @@ export class ApiServer {
       v1.use('/apps/*/start', authMiddleware('user'));
       v1.use('/apps/*/stop', authMiddleware('user'));
       v1.use('/apps/*/restart', authMiddleware('user'));
+      // Promotion is a human decision (Step 6d). The role floor is enforced
+      // here; the route ALSO rejects an agent credential outright, because a
+      // role alone does not distinguish an agent token from a session.
+      v1.use('/apps/*/promote', authMiddleware('user'));
       // Upload deploy is never anonymous, even on an auth-enabled box with a
       // readonly token in hand — it mutates the app the same way git-deploy
       // does. Register before the general /apps/* readonly guard.
@@ -261,10 +303,36 @@ export class ApiServer {
       // OAuth 2.1 endpoints (PRD-041): selective auth only. /authorize and
       // /token are deliberately NOT gated here — /authorize self-gates via
       // the SPA session redirect and /token authenticates via PKCE; mounting
-      // session auth on either would break claude.ai's calls.
+      // session auth on either would break claude.ai's calls. /revoke (RFC
+      // 7009) is the same shape: for a public PKCE client the presented
+      // token IS the credential — you can only revoke a token you already
+      // hold — so a session adds nothing and gating it here made the
+      // advertised revocation_endpoint 401 for the only caller that ever
+      // hits it (claude.ai holds no DROP session, only the OAuth token
+      // itself). See oauth.ts's own handler comment.
       v1.use('/oauth/approve', authMiddleware('user'));
-      v1.use('/oauth/revoke', authMiddleware('user'));
       v1.use('/oauth/client', authMiddleware('admin'));
+      // Read-only connector info (DROP-131 Item 4) — a separate, explicit
+      // path so this never touches the /oauth/client line above: any
+      // non-admin session may read the already-minted client_id, but minting
+      // stays admin-only via POST /oauth/client.
+      v1.use('/oauth/connector-info', authMiddleware('user'));
+      // DELETE/PUT/PATCH on an app (delete, rename, re-domain) and POST on the
+      // apps collection (deploy a new app) are destructive/mutating and must
+      // not be reachable with a read-only token. DELETE/PUT/PATCH used to fall
+      // through to the readonly guard below and rely on `canAccess` alone —
+      // which was inert for API keys only because a key's userId was its own
+      // id and therefore owned nothing. Now that a key resolves to its owner,
+      // that accident no longer contains it, so the tier is stated explicitly.
+      // Method-scoped: GET /apps/:name (and GET /apps) must stay readable at
+      // `readonly`.
+      v1.use('/apps/*', async (c, next) => {
+        const method = c.req.method;
+        if (method === 'DELETE' || method === 'PUT' || method === 'PATCH' || method === 'POST') {
+          return authMiddleware('user')(c, next);
+        }
+        return next();
+      });
       v1.use('/apps/*', authMiddleware('readonly'));
       v1.use('/apps', authMiddleware('readonly'));
       v1.use('/usage', authMiddleware('readonly'));
@@ -276,6 +344,11 @@ export class ApiServer {
       v1.use('/certs/renew', authMiddleware('admin'));
       v1.use('/certs/*', authMiddleware('readonly'));
       v1.use('/secrets/*', authMiddleware('user'));
+      // Database panel reads (DROP-120) — 'user' floor so a `readonly` token
+      // is rejected by this middleware before the route's own
+      // interactiveSessionOnly guard ever runs; the route guard alone is not
+      // enough since it only distinguishes session vs API key, not role.
+      v1.use('/db/*', authMiddleware('user'));
       v1.use('/webhooks/*', authMiddleware('admin'));
       v1.use('/git/deploy', authMiddleware('user'));
       v1.use('/git/redeploy/*', authMiddleware('user'));
@@ -291,10 +364,16 @@ export class ApiServer {
     v1.route('/certs', certsRoutes);
     v1.route('/deploys', deploysRoutes);
     v1.route('/secrets', secretsRoutes);
+    v1.route('/db', dbRoutes);
     v1.route('/webhooks', webhooksRoutes);
     v1.route('/git', gitDeployRoutes);
     v1.route('/admin', adminRoutes);
     v1.route('/oauth', oauthRoutes);
+    // Caddy's forward_auth target for tenant MCP endpoints (Step 11). NOT
+    // behind authMiddleware on purpose: it authenticates an app-audienced
+    // bearer itself and must reject every other credential class, which a
+    // general auth gate would instead admit.
+    v1.route('/mcp-gateway', mcpGatewayRoutes);
 
     // Hosted MCP endpoint (PRD-040): stateless Streamable HTTP, POST only.
     // GET/DELETE have no meaning in stateless mode (no sessions/streams) —
@@ -323,7 +402,7 @@ export class ApiServer {
     // Newer non-`oauth-`prefixed spelling some MCP clients probe — serve the
     // same doc so discovery can't 404 on either variant.
     this.app.get('/.well-known/protected-resource/api/v1/mcp', protectedResourceHandler);
-    this.app.get('/.well-known/oauth-authorization-server', (c) => {
+    this.app.get('/.well-known/oauth-authorization-server', c => {
       const publicUrl = getPublicUrl();
       console.log('[oauth] discovery probe', { path: c.req.path, resolved: Boolean(publicUrl) });
       if (!publicUrl) return c.notFound();
@@ -333,13 +412,49 @@ export class ApiServer {
     // Mount v1 under /api/v1
     this.app.route('/api/v1', v1);
 
+    // Content-type map shared by the dashboard and site static-asset routes
+    // below.
+    const MIME_TYPES: Record<string, string> = {
+      '.js': 'application/javascript',
+      '.mjs': 'application/javascript',
+      '.css': 'text/css',
+      '.svg': 'image/svg+xml',
+      '.png': 'image/png',
+      '.jpg': 'image/jpeg',
+      '.jpeg': 'image/jpeg',
+      '.ico': 'image/x-icon',
+      '.json': 'application/json',
+      '.map': 'application/json',
+      '.woff': 'font/woff',
+      '.woff2': 'font/woff2',
+      '.ttf': 'font/ttf',
+    };
+
+    /**
+     * Icon files served at BOTH the site root and under /dashboard.
+     *
+     * `drop.svg` is the source of truth for the mark; the rasters exist because
+     * many icon consumers request `/favicon.ico` directly and do not render
+     * SVG. Regenerate with `node scripts/generate-favicons.js` if the mark
+     * changes — nothing rebuilds them automatically.
+     */
+    const ICON_FILES: Record<string, string> = {
+      'drop.svg': 'image/svg+xml',
+      'favicon.ico': 'image/x-icon',
+      'favicon-32.png': 'image/png',
+      'apple-touch-icon.png': 'image/png',
+    };
+
     // Dashboard static files
-    // Prefer built dashboard (dist/dashboard) over source (src/dashboard)
+    // Prefer built dashboard (dist/dashboard) over source (src/dashboard),
+    // unless a test/caller overrides the resolved path directly.
     const distDashboardPath = path.join(__dirname, '..', '..', 'dist', 'dashboard');
     const srcDashboardPath = path.join(__dirname, '..', 'dashboard');
-    const dashboardPath = fs.existsSync(path.join(distDashboardPath, 'index.html'))
-      ? distDashboardPath
-      : srcDashboardPath;
+    const dashboardPath =
+      this.config.dashboardPath ??
+      (fs.existsSync(path.join(distDashboardPath, 'index.html'))
+        ? distDashboardPath
+        : srcDashboardPath);
     const dashboardIndexPath = path.join(dashboardPath, 'index.html');
     const dashboardExists = fs.existsSync(dashboardIndexPath);
 
@@ -347,22 +462,6 @@ export class ApiServer {
     console.log('[Dashboard] Index exists:', dashboardExists);
 
     if (dashboardExists) {
-      const MIME_TYPES: Record<string, string> = {
-        '.js': 'application/javascript',
-        '.mjs': 'application/javascript',
-        '.css': 'text/css',
-        '.svg': 'image/svg+xml',
-        '.png': 'image/png',
-        '.jpg': 'image/jpeg',
-        '.jpeg': 'image/jpeg',
-        '.ico': 'image/x-icon',
-        '.json': 'application/json',
-        '.map': 'application/json',
-        '.woff': 'font/woff',
-        '.woff2': 'font/woff2',
-        '.ttf': 'font/ttf',
-      };
-
       const readIndexHtml = (): Promise<string> => fsp.readFile(dashboardIndexPath, 'utf-8');
 
       // Serve static assets. Vite emits content-hashed filenames under
@@ -371,7 +470,10 @@ export class ApiServer {
         const assetPath = c.req.path.replace('/dashboard/', '');
         const filePath = path.join(dashboardPath, assetPath);
         // Containment: never serve outside the dashboard directory.
-        if (!path.resolve(filePath).startsWith(path.resolve(dashboardPath))) {
+        // isPathWithin realpaths both sides, so a symlink/junction planted
+        // under the dashboard dir can't escape it either (plain lexical
+        // path.relative would miss that).
+        if (!(await isPathWithin(dashboardPath, filePath))) {
           return c.notFound();
         }
         try {
@@ -386,18 +488,20 @@ export class ApiServer {
         }
       });
 
-      // Serve favicon
-      this.app.get('/dashboard/drop.svg', async c => {
-        try {
-          const content = await fsp.readFile(path.join(dashboardPath, 'drop.svg'));
-          return c.body(content, 200, {
-            'Content-Type': 'image/svg+xml',
-            'Cache-Control': 'public, max-age=86400',
-          });
-        } catch {
-          return c.notFound();
-        }
-      });
+      // Serve favicons (see the site block's note on why raster fallbacks exist).
+      for (const [file, contentType] of Object.entries(ICON_FILES)) {
+        this.app.get(`/dashboard/${file}`, async c => {
+          try {
+            const content = await fsp.readFile(path.join(dashboardPath, file));
+            return c.body(content, 200, {
+              'Content-Type': contentType,
+              'Cache-Control': 'public, max-age=86400',
+            });
+          } catch {
+            return c.notFound();
+          }
+        });
+      }
 
       // SPA fallback — index.html must never be cached, or clients get a stale
       // shell pointing at old asset hashes after a deploy.
@@ -408,6 +512,16 @@ export class ApiServer {
       };
 
       this.app.get('/dashboard', serveIndex);
+
+      // Moved public URLs (DROP-070): /docs and /reference used to live
+      // under /dashboard. Permanently redirect inbound links and
+      // search-index entries to their new home. MUST be registered
+      // immediately above the /dashboard/* fallback below — that wildcard
+      // would otherwise match these two paths first and serve the dashboard
+      // SPA shell instead of redirecting.
+      this.app.get('/dashboard/docs', c => c.redirect('/docs', 301));
+      this.app.get('/dashboard/reference', c => c.redirect('/reference', 301));
+
       this.app.get('/dashboard/*', async c => {
         if (!c.req.path.includes('/assets/') && !c.req.path.endsWith('.svg')) {
           return serveIndex(c);
@@ -416,21 +530,101 @@ export class ApiServer {
       });
     }
 
-    // Root - redirect to dashboard if available, otherwise show API info
-    this.app.get('/', c => {
-      const dashboardExists =
-        fs.existsSync(path.join(distDashboardPath, 'index.html')) ||
-        fs.existsSync(path.join(srcDashboardPath, 'index.html'));
-      if (dashboardExists) {
-        return c.redirect('/dashboard');
-      }
-      return c.json({
-        name: 'DROP API',
-        version: '1.0.0',
-        docs: '/api/v1',
-        auth: this.config.enableAuth ? 'enabled' : 'disabled',
+    // Public site static files (marketing landing + /docs + /reference,
+    // DROP-070) — a separate Vite build (vite.site.config.ts) from the admin
+    // dashboard, so a marketing visitor never downloads the admin bundle or
+    // calls the API. Built-only: unlike the dashboard block above, this does
+    // NOT fall back to raw source (src/dashboard/site/index.html isn't a
+    // servable bundle without Vite), so a box with no `dist/site` build
+    // falls through to the API-info JSON fallback below, not a broken shell.
+    const distSitePath = this.config.sitePath ?? path.join(__dirname, '..', '..', 'dist', 'site');
+    const siteIndexPath = path.join(distSitePath, 'index.html');
+    const siteExists = fs.existsSync(siteIndexPath);
+
+    console.log('[Site] Path:', distSitePath);
+    console.log('[Site] Index exists:', siteExists);
+
+    if (siteExists) {
+      const readSiteIndexHtml = (): Promise<string> => fsp.readFile(siteIndexPath, 'utf-8');
+
+      // Serve static assets. Vite emits content-hashed filenames under
+      // /assets, so they can be cached immutably.
+      this.app.get('/assets/*', async c => {
+        const assetPath = c.req.path.replace(/^\//, '');
+        const filePath = path.join(distSitePath, assetPath);
+        // Containment: never serve outside the site directory (see the
+        // isPathWithin comment on the dashboard's asset route above).
+        if (!(await isPathWithin(distSitePath, filePath))) {
+          return c.notFound();
+        }
+        try {
+          const content = await fsp.readFile(filePath);
+          const contentType = MIME_TYPES[path.extname(filePath)] || 'application/octet-stream';
+          return c.body(content, 200, {
+            'Content-Type': contentType,
+            'Cache-Control': 'public, max-age=31536000, immutable',
+          });
+        } catch {
+          return c.notFound();
+        }
       });
-    });
+
+      // Serve favicons.
+      //
+      // The SVG alone was not enough: plenty of icon consumers never look at
+      // the `<link rel="icon">` tag at all and just request `/favicon.ico`
+      // from the origin, and many of them do not render SVG. With
+      // explicit-routes-only registration (see the comment below) that request
+      // 404'd, so those clients showed a generic placeholder. Raster fallbacks
+      // are generated by `scripts/generate-favicons.js`.
+      for (const [file, contentType] of Object.entries(ICON_FILES)) {
+        this.app.get(`/${file}`, async c => {
+          try {
+            const content = await fsp.readFile(path.join(distSitePath, file));
+            return c.body(content, 200, {
+              'Content-Type': contentType,
+              'Cache-Control': 'public, max-age=86400',
+            });
+          } catch {
+            return c.notFound();
+          }
+        });
+      }
+
+      // Explicit routes only — deliberately NOT a bare `/*` catch-all.
+      // Mirroring the dashboard's `/dashboard/*` fallback to the root would
+      // swallow /.well-known/oauth-protected-resource and
+      // /.well-known/oauth-authorization-server (registered above),
+      // returning a 200 HTML shell and silently breaking the claude.ai MCP
+      // connector. index.html must never be cached, or clients get a stale
+      // shell pointing at old asset hashes after a deploy.
+      const serveSiteIndex = async (c: import('hono').Context) => {
+        const html = await readSiteIndexHtml();
+        c.header('Cache-Control', 'no-cache');
+        return c.html(html);
+      };
+
+      this.app.get('/', serveSiteIndex);
+      this.app.get('/docs', serveSiteIndex);
+      this.app.get('/reference', serveSiteIndex);
+      // Canonicalize the trailing-slash variants (the old /dashboard/*
+      // SPA fallback served these too, since react-router ignores a
+      // trailing slash when matching a leaf route) rather than silently
+      // 404ing or double-serving the same content at two URLs.
+      this.app.get('/docs/', c => c.redirect('/docs', 301));
+      this.app.get('/reference/', c => c.redirect('/reference', 301));
+    } else {
+      // No built site available — surface API info instead of a 404 at the
+      // root, for installs with no frontend built yet.
+      this.app.get('/', c => {
+        return c.json({
+          name: 'DROP API',
+          version: getPlatformVersion(),
+          docs: '/api/v1',
+          auth: this.config.enableAuth ? 'enabled' : 'disabled',
+        });
+      });
+    }
   }
 
   private setupErrorHandling(): void {

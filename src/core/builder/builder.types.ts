@@ -47,6 +47,16 @@ export interface BuildContext {
   framework: string | null;
   config: BuildConfig;
   env: Record<string, string>;
+  /**
+   * Platform-minted deploy id for the deploy this build belongs to. Carried
+   * through onto the build:started/completed/failed payloads so DeployTracker
+   * correlates the episode to the same id the caller already knows — rather
+   * than minting its own, which nothing upstream could reference.
+   *
+   * Optional: the builder is callable without one (tests, direct use), and
+   * the tracker falls back to minting.
+   */
+  deployId?: string;
   previousBuild?: BuildResult;
   /**
    * Scratch directory for ephemeral build artifacts (tarballs, generated
@@ -64,8 +74,19 @@ export interface BuildContext {
    * The BuilderService uses `context.execCommand ?? executeCommand`
    * everywhere, so callers that don't care about the distinction get the
    * right behaviour for free.
+   *
+   * REQUIRED, though it may be `undefined`. Deliberately not optional: this is
+   * the boundary that decides whether a tenant-authored install/build command
+   * runs inside the build container or as a host process owned by the platform
+   * user (who is in the `docker` group, i.e. root-equivalent, on an
+   * isolation=docker box). `handleAppUpdate` once omitted it silently — every
+   * redeploy of an existing app therefore built on the host — and nothing
+   * caught that because the property was optional. Making it required turns
+   * that entire regression class into a compile error at every call site, in
+   * every module, instead of something a test has to remember to look for.
+   * Pass `execCommand: undefined` explicitly when host execution is intended.
    */
-  execCommand?: ExecCommandFn;
+  execCommand: ExecCommandFn | undefined;
   /**
    * Optional callback for build log lines (install/build output).
    * Called by BuilderService.emitLog() when set. Used by the platform to
@@ -106,6 +127,14 @@ export interface BuildStageResult {
   duration: number;
   output?: string;
   error?: string;
+  /** Process exit code, when this stage ran a command that reported one. */
+  exitCode?: number;
+  /**
+   * The command this stage ran. DROP-generated (composed from the strategy and
+   * the app's drop.yaml `build`), never raw process output — so unlike
+   * `error`/`output` it is safe to carry into a persisted deploy row.
+   */
+  command?: string;
 }
 
 /**
@@ -116,6 +145,10 @@ export interface BuildError {
   message: string;
   code?: string;
   details?: string;
+  /** See BuildStageResult.exitCode. */
+  exitCode?: number;
+  /** See BuildStageResult.command. */
+  command?: string;
 }
 
 /**

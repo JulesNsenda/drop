@@ -152,6 +152,7 @@ describe('Node.js Build Strategy', () => {
       framework: 'next',
       config: {},
       env: {},
+      execCommand: undefined,
     };
 
     expect(nodejsBuildStrategy.canBuild(context)).toBe(true);
@@ -165,6 +166,7 @@ describe('Node.js Build Strategy', () => {
       framework: null,
       config: {},
       env: {},
+      execCommand: undefined,
     };
 
     expect(nodejsBuildStrategy.canBuild(context)).toBe(false);
@@ -178,6 +180,7 @@ describe('Node.js Build Strategy', () => {
       framework: null,
       config: {},
       env: {},
+      execCommand: undefined,
     };
 
     expect(nodejsBuildStrategy.getInstallCommand(context)).toBe('npm install');
@@ -191,6 +194,7 @@ describe('Node.js Build Strategy', () => {
       framework: null,
       config: { installCommand: 'yarn install' },
       env: {},
+      execCommand: undefined,
     };
 
     expect(nodejsBuildStrategy.getInstallCommand(context)).toBe('yarn install');
@@ -204,6 +208,7 @@ describe('Node.js Build Strategy', () => {
       framework: 'next',
       config: {},
       env: {},
+      execCommand: undefined,
     };
 
     expect(nodejsBuildStrategy.getBuildCommand(context)).toBe('npm run build');
@@ -217,6 +222,7 @@ describe('Node.js Build Strategy', () => {
       framework: 'express',
       config: {},
       env: {},
+      execCommand: undefined,
     };
 
     expect(nodejsBuildStrategy.getBuildCommand(context)).toBeNull();
@@ -230,6 +236,7 @@ describe('Node.js Build Strategy', () => {
       framework: 'next',
       config: {},
       env: {},
+      execCommand: undefined,
     };
 
     expect(nodejsBuildStrategy.getOutputDirectory(context)).toBe('.next');
@@ -252,6 +259,7 @@ describe('Python Build Strategy', () => {
       framework: null,
       config: {},
       env: {},
+      execCommand: undefined,
     };
 
     // Deps are installed into an in-app-dir venv (both isolation modes) so they
@@ -271,6 +279,7 @@ describe('Python Build Strategy', () => {
       framework: 'django',
       config: {},
       env: {},
+      execCommand: undefined,
     };
 
     expect(pythonBuildStrategy.getBuildCommand(context)).toBe('python manage.py collectstatic --noinput');
@@ -284,6 +293,7 @@ describe('Python Build Strategy', () => {
       framework: 'flask',
       config: {},
       env: {},
+      execCommand: undefined,
     };
 
     expect(pythonBuildStrategy.getBuildCommand(context)).toBeNull();
@@ -304,6 +314,7 @@ describe('Static Build Strategy', () => {
       framework: null,
       config: {},
       env: {},
+      execCommand: undefined,
     };
 
     expect(staticBuildStrategy.getInstallCommand(context)).toBeNull();
@@ -317,6 +328,7 @@ describe('Static Build Strategy', () => {
       framework: null,
       config: {},
       env: {},
+      execCommand: undefined,
     };
 
     expect(staticBuildStrategy.getBuildCommand(context)).toBeNull();
@@ -336,6 +348,7 @@ describe('Docker Build Strategy', () => {
       framework: null,
       config: {},
       env: {},
+      execCommand: undefined,
     };
 
     expect(dockerBuildStrategy.getBuildCommand(context)).toContain('docker build');
@@ -349,6 +362,7 @@ describe('Docker Build Strategy', () => {
       framework: null,
       config: {},
       env: {},
+      execCommand: undefined,
     };
 
     expect(dockerBuildStrategy.getInstallCommand(context)).toBeNull();
@@ -555,12 +569,160 @@ describe('BuilderService Integration', () => {
       framework: null,
       config: {},
       env: {},
+      execCommand: undefined,
     };
 
     const result = await service.build(context);
 
     expect(result.success).toBe(false);
     expect(result.errors.some(e => e.code === 'NO_STRATEGY')).toBe(true);
+  });
+
+  it('opens AND closes a deploy episode when no strategy matches', async () => {
+    // Regression: this path used to return before build:started was published,
+    // so DeployTracker never opened an episode. The caller's later
+    // setAppStatus('errored') then hit the tracker's orphan guard and no-opped,
+    // leaving the episode permanently unclosed — every MCP deploy tool polled
+    // for its full ~120s budget and reported "still building" instead of the
+    // failure. Reachable via drop.yaml `type: rust` / `type: php`, neither of
+    // which has a strategy.
+    const { eventBus } = jest.requireMock('../event-bus');
+    (eventBus.publish as jest.Mock).mockClear();
+
+    const service = new BuilderService();
+    await service.build({
+      appName: 'no-strategy-app',
+      appPath: tempDir,
+      appType: 'unknown',
+      framework: null,
+      config: {},
+      env: {},
+      execCommand: undefined,
+    });
+
+    const events = (eventBus.publish as jest.Mock).mock.calls.map(
+      ([name, payload]: [string, { appId: string; buildId: string }]) => ({ name, payload })
+    );
+
+    const started = events.find(e => e.name === 'build:started');
+    const failed = events.find(e => e.name === 'build:failed');
+
+    expect(started).toBeDefined();
+    expect(failed).toBeDefined();
+    // Same buildId on both, or the tracker cannot correlate open with close.
+    expect(started!.payload.buildId).toBe(failed!.payload.buildId);
+    expect(started!.payload.appId).toBe('no-strategy-app');
+  });
+
+  it('publishes the failing STAGE, not a constant (Gap A)', async () => {
+    // builder.ts always knew which stage failed but published only
+    // {appId, buildId, error}, so DeployTracker hardcoded a category. A
+    // no-strategy failure is genuinely pre-build, and must say so.
+    const { eventBus } = jest.requireMock('../event-bus');
+    (eventBus.publish as jest.Mock).mockClear();
+
+    const service = new BuilderService();
+    await service.build({
+      appName: 'stage-app',
+      appPath: tempDir,
+      appType: 'unknown',
+      framework: null,
+      config: {},
+      env: {},
+      execCommand: undefined,
+    });
+
+    const failed = (eventBus.publish as jest.Mock).mock.calls.find(
+      ([name]: [string]) => name === 'build:failed'
+    );
+    expect(failed![1].stage).toBe('pre-build');
+  });
+
+  it('carries the failing command and exit code off a real stage failure', async () => {
+    // executeInstall/executeBuild have always held both; they stopped at the
+    // BuildStageResult and never reached the payload.
+    const { eventBus } = jest.requireMock('../event-bus');
+    (eventBus.publish as jest.Mock).mockClear();
+
+    const service = new BuilderService();
+    const execCommand = jest.fn().mockResolvedValue({
+      exitCode: 127,
+      stdout: '',
+      stderr: 'sh: vite: not found',
+      duration: 3,
+    });
+
+    await service.build({
+      appName: 'cmd-app',
+      appPath: tempDir,
+      appType: 'nodejs',
+      framework: null,
+      config: { buildCommand: 'npm run build', installCommand: 'npm ci' },
+      env: {},
+      execCommand,
+    } as never);
+
+    const failed = (eventBus.publish as jest.Mock).mock.calls.find(
+      ([name]: [string]) => name === 'build:failed'
+    );
+    expect(failed![1].exitCode).toBe(127);
+    expect(typeof failed![1].command).toBe('string');
+    expect(failed![1].command.length).toBeGreaterThan(0);
+    // Still a real stage, not the 'build' default.
+    expect(['install', 'build']).toContain(failed![1].stage);
+  });
+
+  it('truncates an oversized command rather than publishing it whole', async () => {
+    // drop.yaml `build` is app-authored and unbounded, and this value ends up
+    // in a persisted deploy row.
+    const { eventBus } = jest.requireMock('../event-bus');
+    (eventBus.publish as jest.Mock).mockClear();
+
+    const service = new BuilderService();
+    const huge = 'x'.repeat(5000);
+    const execCommand = jest.fn().mockResolvedValue({
+      exitCode: 1,
+      stdout: '',
+      stderr: 'boom',
+      duration: 3,
+    });
+
+    await service.build({
+      appName: 'huge-cmd-app',
+      appPath: tempDir,
+      appType: 'nodejs',
+      framework: null,
+      config: { buildCommand: huge, installCommand: huge },
+      env: {},
+      execCommand,
+    } as never);
+
+    const failed = (eventBus.publish as jest.Mock).mock.calls.find(
+      ([name]: [string]) => name === 'build:failed'
+    );
+    expect(failed![1].command.length).toBe(512);
+  });
+
+  it('emits no events when deferred by the concurrent-build cap', async () => {
+    // MAX_BUILDS is a deferral, not a failure: the platform re-queues the app
+    // and the retry opens its own episode. Publishing here would either strand
+    // a 'superseded' episode or report a queue wait as a failed deploy.
+    const { eventBus } = jest.requireMock('../event-bus');
+    const service = new BuilderService({ maxConcurrentBuilds: 0 });
+    (eventBus.publish as jest.Mock).mockClear();
+
+    const result = await service.build({
+      appName: 'deferred-app',
+      appPath: tempDir,
+      appType: 'nodejs',
+      framework: null,
+      config: {},
+      env: {},
+      execCommand: undefined,
+    });
+
+    expect(result.errors.some(e => e.code === 'MAX_BUILDS')).toBe(true);
+    expect(eventBus.publish).not.toHaveBeenCalled();
   });
 
   it('should build static site successfully', async () => {
@@ -577,6 +739,7 @@ describe('BuilderService Integration', () => {
       framework: null,
       config: {},
       env: {},
+      execCommand: undefined,
     };
 
     const result = await service.build(context);
@@ -604,6 +767,7 @@ describe('BuilderService Integration', () => {
       framework: null,
       config: {},
       env: {},
+      execCommand: undefined,
     });
 
     // Try to start second build immediately
@@ -614,6 +778,7 @@ describe('BuilderService Integration', () => {
       framework: null,
       config: {},
       env: {},
+      execCommand: undefined,
     });
 
     const [result1, result2] = await Promise.all([build1Promise, build2Promise]);
@@ -641,6 +806,7 @@ describe('BuilderService Integration', () => {
       framework: null,
       config: {},
       env: {},
+      execCommand: undefined,
     });
 
     await buildPromise;

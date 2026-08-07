@@ -5,9 +5,8 @@
       "command": "npx",
       "args": [
         "-y",
-        "@anthropic/mcp-server-filesystem",
+        "@modelcontextprotocol/server-filesystem",
         "./src",
-        "./tests",
         "./docs"
       ]
     }

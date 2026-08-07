@@ -2,10 +2,14 @@
  * DeployTracker
  *
  * Bus-observer that appends flat milestone rows to a durable store as
- * pipeline events fire, correlated by an observer-minted `deployId`. Deploy
- * *status* is never persisted — it is derived at read time from the rows
- * (see `getEpisodes`). See docs/plans/2026-07-06-p2-4-deploy-observability.md
- * for the full design rationale.
+ * pipeline events fire, correlated by a `deployId` the observer ADOPTS from
+ * `build:started` when the publisher supplies one, and mints itself otherwise.
+ * (It was mint-only until deploy-id threading; an observer-minted id is not
+ * something the caller can reference, so the platform now mints at the call
+ * site that begins the deploy and threads it through.) Deploy *status* is
+ * never persisted — it is derived at read time from the rows (see
+ * `getEpisodes`). See docs/plans/2026-07-06-p2-4-deploy-observability.md for
+ * the full design rationale.
  *
  * Hard invariants (do not relax without re-reading the plan):
  *  - Every handler mutates in-memory state SYNCHRONOUSLY at the top, then
@@ -38,14 +42,39 @@ import type {
 // types module directly rather than editing the barrel, which is outside
 // this module's scope.
 import type { AppUpdatePayload } from '../../core/event-bus/event-bus.types';
+import type { BuildStage } from '../../core/builder/builder.types';
 import type {
   DeployRow,
   DeployEpisode,
   DeployStage,
   DeployStatus,
+  DeployFailureCategory,
 } from './deploy-tracker.types';
 
 const MAX_ROWS = 1000;
+
+/**
+ * Map a failing build stage to a persisted failure category.
+ *
+ * Total over BuildStage rather than a lookup with a default, so adding a stage
+ * is a compile error here instead of silently becoming 'build-failed' — which
+ * is exactly how the previous hardcoded constant went unnoticed.
+ */
+function categoryForStage(stage: BuildStage): DeployFailureCategory {
+  switch (stage) {
+    case 'pre-build':
+    case 'environment':
+      return 'prebuild-failed';
+    case 'install':
+      return 'install-failed';
+    case 'build':
+      return 'build-failed';
+    case 'optimize':
+    case 'post-build':
+    case 'validate':
+      return 'postbuild-failed';
+  }
+}
 
 type DeployTrigger = 'deploy' | 'hot-reload' | 'upload';
 
@@ -140,11 +169,26 @@ export class DeployTracker {
     const appName = this.resolveAppName(payload);
     const at = payload.timestamp.toISOString();
 
-    // Mint a new deployId. If one was already open for this app (a new build
-    // fired before the previous one closed), it is simply overwritten here —
-    // the old episode stays un-terminated and derives as 'superseded' at read
-    // time; we do not need to do anything special with it.
-    const deployId = randomUUID();
+    // ADOPT the publisher's deployId when there is one, so the episode carries
+    // the same id the caller already holds (and the same one encoded into the
+    // build log filename). Minting here unconditionally, as this did, produced
+    // an id nothing upstream could reference.
+    //
+    // The fallback stays: any publisher without one still gets a working
+    // episode. It is logged rather than silent — a deploy arriving with no id
+    // means a call site was missed, and that is invisible otherwise.
+    //
+    // Either way, if an episode was already open for this app (a new build
+    // fired before the previous one closed) it is simply overwritten — the old
+    // episode stays un-terminated and derives as 'superseded' at read time.
+    let deployId = payload.deployId;
+    if (!deployId) {
+      deployId = randomUUID();
+      console.debug(
+        `[DeployTracker] build:started for '${appName}' carried no deployId; minted ${deployId}. ` +
+          'The publisher is not threading one — the deploy is not addressable end to end.'
+      );
+    }
     this.active.set(appName, deployId);
 
     const pending = this.pendingTrigger.get(appName);
@@ -199,9 +243,13 @@ export class DeployTracker {
       appName,
       stage: 'build-failed',
       at: payload.timestamp.toISOString(),
-      // Never store payload.error.message (raw npm stderr can carry absolute
-      // paths / env dumps) — category only.
-      category: 'build-failed',
+      // Still never payload.error.message — raw npm stderr can carry absolute
+      // paths and env dumps. What IS stored is structured and DROP-generated:
+      // the failing stage's category, its exit code, and the command DROP
+      // composed and ran.
+      category: categoryForStage(payload.stage),
+      exitCode: payload.exitCode,
+      command: payload.command,
     });
 
     void this.persist();
@@ -259,6 +307,20 @@ export class DeployTracker {
     episodes.sort((a, b) => (a.startedAt < b.startedAt ? 1 : a.startedAt > b.startedAt ? -1 : 0));
 
     return typeof limit === 'number' ? episodes.slice(0, limit) : episodes;
+  }
+
+  /**
+   * Whether an episode is currently OPEN for this app (a `build:started` has
+   * been seen with no terminal row yet).
+   *
+   * Exists so the platform can tell "nothing ever opened an episode for this
+   * deploy" from "an episode opened and already closed". Without that
+   * distinction a caller trying to report a pre-build failure would either
+   * no-op (the close hits the orphan guard) or manufacture a second, spurious
+   * failed episode for a deploy that already reported one.
+   */
+  hasOpenEpisode(appName: string): boolean {
+    return this.active.has(appName);
   }
 
   /** Drop all rows for an app (delete-time) and clear its in-memory state. */
@@ -322,6 +384,8 @@ export class DeployTracker {
         at: row.at,
         ok: row.ok,
         category: row.category,
+        exitCode: row.exitCode,
+        command: row.command,
       };
       if (previousAt) {
         stage.durationMs = new Date(row.at).getTime() - new Date(previousAt).getTime();

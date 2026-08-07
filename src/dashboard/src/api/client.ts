@@ -16,7 +16,7 @@ export const MUST_CHANGE_PASSWORD_EVENT = 'drop:must-change-password';
 export interface ApiResponse<T> {
   success: boolean;
   data?: T;
-  error?: { code: string; message: string };
+  error?: { code: string; message: string; details?: unknown };
 }
 
 function getAuthHeaders(): Record<string, string> {
@@ -73,6 +73,43 @@ export async function apiJson<T>(path: string, init: RequestInit = {}): Promise<
     };
   }
 }
+
+/**
+ * Like `apiJson`, but also returns the HTTP status alongside the parsed
+ * envelope. For callers that must discriminate two refusals sharing the same
+ * status+code pair by something other than the code (e.g. the connector-policy
+ * 403, which carries `error.details.reason` and otherwise looks identical to
+ * an insufficient-role 403) — `apiJson` throws the status away. Same
+ * try/catch shape and NETWORK_ERROR envelope as `apiJson`; a fetch rejection
+ * (or a response that fails to parse) reports `status: 0` since no usable
+ * response ever arrived.
+ */
+export async function apiJsonWithStatus<T>(
+  path: string,
+  init: RequestInit = {}
+): Promise<{ status: number } & ApiResponse<T>> {
+  try {
+    const res = await apiFetch(path, init);
+    const body = (await res.json()) as ApiResponse<T>;
+    return { status: res.status, ...body };
+  } catch (err) {
+    return {
+      status: 0,
+      success: false,
+      error: { code: 'NETWORK_ERROR', message: err instanceof Error ? err.message : 'Network error' },
+    };
+  }
+}
+
+/**
+ * Marker on a connector-policy refusal's `error.details.reason` (mirrors
+ * `CONNECTORS_DISABLED_REASON` in `src/api/connector-policy.ts`). Both the
+ * policy gate and a plain insufficient-role rejection come back as HTTP 403
+ * with `ErrorCodes.UNAUTHORIZED` — there is deliberately no FORBIDDEN code —
+ * so this is the only reliable way to tell "your administrator turned this
+ * off" apart from "your account may never do this".
+ */
+export const CONNECTORS_DISABLED_REASON = 'connectors_disabled';
 
 /** JSON body + content-type helper for mutations. */
 export function jsonBody(value: unknown): RequestInit {

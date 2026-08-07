@@ -8,7 +8,13 @@
 
 import * as path from 'path';
 import * as fs from 'fs/promises';
-import { GitDeployRequest, GitDeployResult, GitSource, GitTokenInfo } from './git-deploy.types';
+import {
+  DeployActor,
+  GitDeployRequest,
+  GitDeployResult,
+  GitSource,
+  GitTokenInfo,
+} from './git-deploy.types';
 import {
   gitClone,
   gitPull,
@@ -19,10 +25,17 @@ import {
   isGitAvailable,
 } from './git-client';
 import { getStateManager } from '../../managers/app/state-manager';
+import { getAppConfigService } from '../../managers/app/app-config';
 import { getSecretManager } from '../../managers/secret';
 import { getLogger } from '../../utils/logger';
 import { hasEnoughDisk, getMinFreeDiskMb } from '../../utils/disk';
 import { eventBus } from '../event-bus';
+import { admitDeploy } from '../../managers/guardrail/deploy-breaker';
+import {
+  checkEphemeralQuota,
+  resolveTtlMinutes,
+  EphemeralQuotaError,
+} from '../../managers/guardrail/ephemeral';
 
 const logger = getLogger();
 
@@ -82,6 +95,36 @@ export class GitDeployService {
     const stateManager = getStateManager();
     if (stateManager.hasApp(appName)) {
       throw new Error(`Application '${appName}' already exists`);
+    }
+
+    // GUARDRAIL PRE-CHECK, before the clone. The platform's gates sit at the
+    // BUILD, so a refused caller could still make DROP clone an arbitrary
+    // repository on every attempt — network, disk and time spent before the
+    // event that would refuse it is even published. Always a new app here
+    // (the conflict check above rejects existing ones), so the key is the
+    // caller's shared `__new__` bucket.
+    await admitDeploy(appName, true, {
+      principalId: request.principalId,
+      actorUserId: request.userId,
+    });
+
+    // Ephemeral quota, before the clone. Same reasoning as the guardrail: a
+    // refusal after the clone would not undo the network, disk and time.
+    if (request.ephemeral) {
+      const verdict = checkEphemeralQuota(
+        getAppConfigService()
+          .getAllConfigs()
+          .filter((c) => c.ephemeral)
+          .map((c) => ({
+            name: c.name,
+            principalId: c.ephemeralPrincipalId,
+            userId: stateManager.getApp(c.name)?.userId,
+            expiresAt: c.expiresAt ?? '',
+          })),
+        { principalId: request.principalId, userId: request.userId },
+        Date.now()
+      );
+      if (!verdict.allowed) throw new EphemeralQuotaError(verdict.reason ?? 'Quota exceeded');
     }
 
     const destPath = path.join(this.config.appsDirectory, appName);
@@ -174,10 +217,37 @@ export class GitDeployService {
     // app:detected dropped mid-clone (isCloning guard) and never re-emitted -
     // the app would sit registered but never built until a lucky file change.
     // Same shape as the watcher's own publish; the detector resolves the type.
+    // ONLY on first creation (SEC-11) — deploy() rejects an existing app name
+    // above, so reaching here always means new. A redeploy goes through
+    // redeploy(), which never touches this flag.
+    //
+    // upsertConfig, NOT updateConfig — the config does not exist yet here (the
+    // app:detected handler below creates it) and updateConfig no-ops when it is
+    // missing, silently dropping every flag. Same defect as upload-deploy.ts;
+    // see the longer note there.
+    if (request.agentCaller) {
+      await getAppConfigService().upsertConfig(appName, {
+        agentCreated: true,
+        path: destPath,
+      });
+    }
+    if (request.ephemeral) {
+      const ttl = resolveTtlMinutes(request.ttlMinutes);
+      await getAppConfigService().upsertConfig(appName, {
+        ephemeral: true,
+        expiresAt: new Date(Date.now() + ttl * 60_000).toISOString(),
+        ephemeralPrincipalId: request.principalId,
+        path: destPath,
+        agentCreated: true,
+      });
+    }
+
     eventBus.publish('app:detected', {
       name: appName,
       path: destPath,
       type: undefined,
+      principalId: request.principalId,
+      actorUserId: request.userId,
     });
 
     return {
@@ -190,7 +260,7 @@ export class GitDeployService {
   }
 
   /** Redeploy a git-deployed app (git pull + trigger rebuild) */
-  async redeploy(appName: string): Promise<GitDeployResult> {
+  async redeploy(appName: string, actor: DeployActor = {}): Promise<GitDeployResult> {
     if (!this.gitAvailable) {
       throw new Error('git CLI is not available on this system');
     }
@@ -205,6 +275,14 @@ export class GitDeployService {
     if (!app.gitSource) {
       throw new Error(`Application '${appName}' was not deployed from git`);
     }
+
+    // GUARDRAIL + QUOTA, before the pull. A redeploy is the request an agent
+    // repeats, and git pull + rebuild is not free.
+    await admitDeploy(appName, false, {
+      principalId: actor.principalId,
+      actorUserId: actor.userId,
+      automationSource: actor.automation,
+    });
 
     // Preflight: ensure enough free disk space before pulling
     const disk = await hasEnoughDisk(app.path);
@@ -266,6 +344,9 @@ export class GitDeployService {
       path: app.path,
       reason: 'git redeploy',
       bypassCooldown: true,
+      principalId: actor.principalId,
+      actorUserId: actor.userId,
+      automationSource: actor.automation,
     });
 
     return {

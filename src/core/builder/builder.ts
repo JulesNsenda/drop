@@ -31,6 +31,16 @@ const DEFAULT_CONFIG: BuilderConfig = {
   customStrategies: [],
 };
 
+/**
+ * Cap on the `command` carried in a build:failed payload. The command is
+ * DROP-composed, but an app's drop.yaml `build` is app-authored and
+ * unbounded, and this value ends up in a persisted deploy row.
+ */
+const MAX_FAILED_COMMAND_CHARS = 512;
+
+const truncateCommand = (cmd?: string): string | undefined =>
+  cmd === undefined ? undefined : cmd.slice(0, MAX_FAILED_COMMAND_CHARS);
+
 const BUILD_STAGES: BuildStage[] = [
   'pre-build',
   'environment',
@@ -68,7 +78,16 @@ export class BuilderService {
     const warnings: string[] = [];
     let outputPath: string | null = null;
 
-    // Check concurrent build limit
+    // Generate a build ID up front: the NO_STRATEGY path below needs it to
+    // report a failure, and it must match the one used for the rest of the run.
+    const buildId = `build-${context.appName}-${Date.now()}`;
+
+    // Check concurrent build limit.
+    // Deliberately emits NO events: this is a DEFERRAL, not a failure — the
+    // platform re-queues the app (see handleBuildApp's MAX_BUILDS branch) and
+    // the retry opens its own episode. Publishing build:started here would
+    // leave an episode that only ever derives as 'superseded', and publishing
+    // build:failed would report a queue wait as a failed deploy.
     if (this.activeBuilds.size >= this.config.maxConcurrentBuilds) {
       return this.createFailedResult(
         startedAt,
@@ -80,11 +99,35 @@ export class BuilderService {
     // Find appropriate strategy
     const strategy = this.findStrategy(context);
     if (!strategy) {
-      return this.createFailedResult(
-        startedAt,
-        [{ stage: 'pre-build', message: `No build strategy found for type: ${context.appType}`, code: 'NO_STRATEGY' }],
-        []
-      );
+      // Terminal failure, so it MUST open and close a deploy episode. Returning
+      // here without publishing left DeployTracker with nothing to correlate:
+      // the caller's later setAppStatus('errored') hit handleAppUpdated's
+      // orphan guard and no-opped, so no episode ever closed and every MCP
+      // deploy tool polled for its full wait budget (~120s) before reporting
+      // "still building". Reachable today: drop.yaml accepts `type: rust` and
+      // `type: php` (manifest.ts), neither of which has a build strategy.
+      eventBus.publish('build:started', {
+        appId: context.appName,
+        buildId,
+        deployId: context.deployId,
+      });
+
+      const noStrategy: BuildError = {
+        stage: 'pre-build',
+        message: `No build strategy found for type: ${context.appType}`,
+        code: 'NO_STRATEGY',
+      };
+
+      eventBus.publish('build:failed', {
+        appId: context.appName,
+        buildId,
+        error: new Error(noStrategy.message),
+        deployId: context.deployId,
+        stage: noStrategy.stage,
+        code: noStrategy.code,
+      });
+
+      return this.createFailedResult(startedAt, [noStrategy], []);
     }
 
     // Setup abort controller for cancellation
@@ -101,13 +144,11 @@ export class BuilderService {
     };
     this.activeBuilds.set(context.appName, activeBuild);
 
-    // Generate a build ID
-    const buildId = `build-${context.appName}-${Date.now()}`;
-
     // Emit build started event
     eventBus.publish('build:started', {
       appId: context.appName,
       buildId,
+      deployId: context.deployId,
     });
 
     try {
@@ -139,6 +180,8 @@ export class BuilderService {
           errors.push({
             stage,
             message: stageResult.error || 'Stage failed',
+            exitCode: stageResult.exitCode,
+            command: stageResult.command,
           });
 
           // Stop on failure
@@ -162,12 +205,20 @@ export class BuilderService {
         durationMs: Date.now() - startedAt.getTime(),
         success,
         outputPath: outputPath ?? undefined,
+        deployId: context.deployId,
       });
       if (!success) {
         eventBus.publish('build:failed', {
           appId: context.appName,
           buildId,
           error: new Error(errors[0]?.message || 'Build failed'),
+          deployId: context.deployId,
+          // The stage was known here all along and simply never left the
+          // builder — this is Gap A.
+          stage: errors[0]?.stage ?? 'build',
+          exitCode: errors[0]?.exitCode,
+          command: truncateCommand(errors[0]?.command),
+          code: errors[0]?.code,
         });
       }
 
@@ -196,6 +247,11 @@ export class BuilderService {
         appId: context.appName,
         buildId,
         error: errorObj,
+        deployId: context.deployId,
+        code: 'EXCEPTION',
+        // Whatever stage was running when it threw. activeBuild.currentStage is
+        // null only before the loop's first iteration, i.e. still pre-build.
+        stage: activeBuild.currentStage ?? 'pre-build',
       });
 
       return this.createFailedResult(startedAt, errors, stages);
@@ -356,9 +412,24 @@ export class BuilderService {
     context: BuildContext,
     startTime: number
   ): Promise<BuildStageResult> {
-    // Merge environment variables
+    // Merge environment variables.
+    //
+    // `process.env` is deliberately NOT merged in here. It used to be, and that
+    // silently defeated the platform's only secret boundary: `sanitizeBuildEnv`
+    // strips DROP_*/AWS_*/CF_* out of the parent env and then spreads the
+    // caller's overrides back on top — so seeding `context.env` from
+    // `process.env` laundered every stripped secret straight back into the
+    // environment handed to tenant-authored install/build commands, on BOTH the
+    // host and container runners. `DROP_MASTER_KEY` (the passphrase for every
+    // app's encrypted secrets), the GitHub webhook secret and the DNS API
+    // tokens were all reachable from a one-line `postinstall`.
+    //
+    // Nothing is lost by dropping it: the parent env (PATH, SystemRoot,
+    // proxies, npm_config_*, …) is still supplied — filtered — by
+    // `sanitizeBuildEnv` at the point each command is actually executed. What
+    // remains here is exactly what SHOULD be an override: the app's own
+    // drop.yaml `env`/`build_env`, its depends_on URLs, and NODE_ENV.
     const env = {
-      ...process.env,
       ...context.config.env,
       ...context.env,
       NODE_ENV: 'production',
@@ -413,6 +484,8 @@ export class BuilderService {
         duration: result.duration,
         output: result.stdout,
         error: result.stderr || `Install failed with exit code ${result.exitCode}`,
+        exitCode: result.exitCode,
+        command: installCommand,
       };
     }
 
@@ -478,6 +551,8 @@ export class BuilderService {
           duration: result.duration,
           output: result.stdout,
           error: result.stderr || `Build failed with exit code ${result.exitCode}`,
+          exitCode: result.exitCode,
+          command: buildCommand,
         };
       }
 
@@ -488,11 +563,14 @@ export class BuilderService {
         output: result.stdout,
       };
     } catch (error) {
+      // A throw (timeout, spawn failure) yields no exit code — but the command
+      // is still known and is the more useful of the two for a caller.
       return {
         stage: 'build',
         status: 'failed',
         duration: Date.now() - startTime,
         error: error instanceof Error ? error.message : 'Build failed',
+        command: buildCommand,
       };
     }
   }
@@ -508,10 +586,20 @@ export class BuilderService {
       await strategy.postBuild(context, outputPath);
     }
 
-    // Execute custom post-build hooks
+    // Execute custom post-build hooks.
+    //
+    // Routed through `context.execCommand` like preBuild/install/build above —
+    // this was the one hook site still calling `executeCommand` directly, i.e.
+    // on the host regardless of isolation. Not currently reachable (nothing
+    // populates `config.postBuild`: platform.ts passes only buildCommand and
+    // installCommand, and drop.yaml has no such key), so this is closing the
+    // hole before it opens rather than fixing a live one — but the day
+    // `postBuild` is wired to drop.yaml it would otherwise be a silent host
+    // escape for a tenant-authored command.
     if (context.config.postBuild?.length) {
+      const exec = context.execCommand ?? executeCommand;
       for (const hook of context.config.postBuild) {
-        const result = await executeCommand(hook, context.appPath, context.env);
+        const result = await exec(hook, context.appPath, context.env);
         if (result.exitCode !== 0) {
           return {
             stage: 'post-build',

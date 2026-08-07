@@ -11,7 +11,7 @@ import { getActivityLog } from '../../managers/activity';
 import { suspendUser, updateUser, listUsers, AuthContext } from '../middleware/auth';
 import { getStateManager } from '../../managers/app/state-manager';
 import { getAppRuntime } from '../../managers/runtime';
-import { tryLogActivity } from '../../managers/activity';
+import { logActivityFor } from '../../managers/activity';
 import { getDiskFreeMb } from '../../utils/disk';
 import { getSettingsManager } from '../../managers/settings/settings-manager';
 import { normalizePublicUrl } from '../../utils/url-validator';
@@ -53,6 +53,16 @@ function buildGithubWebhookPayload(): GithubWebhookPayload {
     source,
     payloadUrl: publicUrl ? `${publicUrl}/api/v1/git/webhook` : null,
   };
+}
+
+/**
+ * Status block for the non-admin MCP-connector toggle (PRD: multi-user MCP
+ * connectors). Kept separate from buildSettingsPayload() — that helper is
+ * also used by the "cleared" branch of PUT /settings/public-url, and adding
+ * this field there would silently change that endpoint's response shape too.
+ */
+function buildUserConnectorsPayload(): { enabled: boolean } {
+  return { enabled: getSettingsManager().getUserConnectorsEnabled() };
 }
 
 const GITHUB_WEBHOOK_SECRET_MIN_LENGTH = 8;
@@ -101,10 +111,8 @@ admin.post('/users/:id/suspend', async (c) => {
     }
   }
 
-  await tryLogActivity({
+  await logActivityFor(authCtx, {
     action: 'suspend',
-    userId: authCtx?.userId,
-    username: authCtx?.username,
     detail: `Suspended user ${userId}; stopped ${userApps.length} app(s)`,
   });
 
@@ -127,10 +135,8 @@ admin.post('/users/:id/unsuspend', async (c) => {
     return c.json(error(ErrorCodes.NOT_FOUND, 'User not found'), 404);
   }
 
-  await tryLogActivity({
+  await logActivityFor(authCtx, {
     action: 'unsuspend',
-    userId: authCtx?.userId,
-    username: authCtx?.username,
     detail: `Unsuspended user ${userId}`,
   });
 
@@ -193,10 +199,8 @@ admin.post('/apps/:name/suspend', async (c) => {
   }
   await stateManager.setAppStatus(appName, 'stopped', { error: 'Suspended by admin' });
 
-  await tryLogActivity({
+  await logActivityFor(authCtx, {
     action: 'suspend',
-    userId: authCtx?.userId,
-    username: authCtx?.username,
     appName,
     detail: 'App suspended by admin',
   });
@@ -205,9 +209,16 @@ admin.post('/apps/:name/suspend', async (c) => {
 });
 
 // GET /admin/settings - Platform settings: the public base URL / OAuth
-// issuer override (PRD-041) plus the GitHub webhook secret status.
+// issuer override (PRD-041) plus the GitHub webhook secret status and the
+// non-admin MCP-connector toggle.
 admin.get('/settings', async (c) => {
-  return c.json(success({ ...buildSettingsPayload(), githubWebhook: buildGithubWebhookPayload() }));
+  return c.json(
+    success({
+      ...buildSettingsPayload(),
+      githubWebhook: buildGithubWebhookPayload(),
+      userConnectors: buildUserConnectorsPayload(),
+    })
+  );
 });
 
 // PUT /admin/settings/public-url - Set or clear the admin override for
@@ -250,10 +261,8 @@ admin.post('/settings/github-webhook-secret/generate', async (c) => {
   const secret = crypto.randomBytes(32).toString('hex');
   await getSettingsManager().setGithubWebhookSecret(secret);
 
-  await tryLogActivity({
+  await logActivityFor(authCtx, {
     action: 'github-webhook-secret-generate',
-    userId: authCtx?.userId,
-    username: authCtx?.username,
   });
 
   return c.json(success({ secret, ...buildGithubWebhookPayload() }));
@@ -275,10 +284,8 @@ admin.put('/settings/github-webhook-secret', async (c) => {
 
   if (input === null || input === undefined || (typeof input === 'string' && input.trim() === '')) {
     await getSettingsManager().setGithubWebhookSecret(undefined);
-    await tryLogActivity({
+    await logActivityFor(authCtx, {
       action: 'github-webhook-secret-clear',
-      userId: authCtx?.userId,
-      username: authCtx?.username,
     });
     return c.json(success(buildGithubWebhookPayload()));
   }
@@ -308,13 +315,44 @@ admin.put('/settings/github-webhook-secret', async (c) => {
   }
 
   await getSettingsManager().setGithubWebhookSecret(trimmed);
-  await tryLogActivity({
+  await logActivityFor(authCtx, {
     action: 'github-webhook-secret-set',
-    userId: authCtx?.userId,
-    username: authCtx?.username,
   });
 
   return c.json(success(buildGithubWebhookPayload()));
+});
+
+// PUT /admin/settings/user-connectors - Gate whether non-admin (`user`-role)
+// accounts may set up a claude.ai MCP connector. Strict boolean: this is a
+// two-state policy toggle, not a "clear to fall back" field like publicUrl
+// or the webhook secret, so a non-boolean is rejected rather than coerced or
+// treated as a clear.
+admin.put('/settings/user-connectors', async (c) => {
+  const authCtx = (c.get as Function)('auth') as AuthContext | undefined;
+  const body = (await c.req.json()) as unknown;
+
+  // Same object guard as PUT /settings/github-webhook-secret above. Without
+  // it a body of `null` dereferences to a TypeError and surfaces as a 500,
+  // which is a poor answer from a validator whose whole contract is "strict
+  // boolean, reject rather than coerce".
+  if (typeof body !== 'object' || body === null || Array.isArray(body)) {
+    return c.json(error(ErrorCodes.VALIDATION_ERROR, 'Request body must be a JSON object'), 400);
+  }
+
+  const input = (body as { enabled?: unknown }).enabled;
+
+  if (typeof input !== 'boolean') {
+    return c.json(error(ErrorCodes.VALIDATION_ERROR, 'enabled must be a boolean'), 400);
+  }
+
+  await getSettingsManager().setUserConnectorsEnabled(input);
+
+  await logActivityFor(authCtx, {
+    action: 'user-connectors-set',
+    detail: `Non-admin MCP connectors ${input ? 'enabled' : 'disabled'}`,
+  });
+
+  return c.json(success(buildUserConnectorsPayload()));
 });
 
 export default admin;
