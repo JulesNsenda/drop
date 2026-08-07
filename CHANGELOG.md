@@ -27,48 +27,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [1.0.1] - 2026-08-07
-
-Fixes the release-install path, which did not work in 1.0.0. **If you are
-installing DROP for the first time, use this release, not 1.0.0.**
-
-### Fixed
-
-- **`install.sh --from-release` aborted partway through.** The installer
-  copied the platform code and its dependencies into place and then failed at
-  the provisioning step with `install: cannot stat
-  '/root/.drop-release-XXXX/unpacked/install.sh'`, leaving a box with the code
-  on disk but no systemd service, no Caddy configuration and no sudoers rule —
-  so the platform never started. The installer prepared the root-owned
-  provisioning script from a path it had already moved the file away from.
-  Upgrading an existing install was affected the same way.
-- Static and marketing pages now link the release. The landing page had no
-  download route at all — its only calls to action were an invitation-only
-  waitlist and an in-page anchor — and the documentation's Installation
-  section opened with `git clone`, never mentioning that a prebuilt bundle
-  exists. The README additionally lists each release asset with a direct link,
-  so an operator can fetch and check the tarball by hand before running
-  anything as root.
-
-### Changed
-
-- The documented prerequisites are now accurate per install method. Installing
-  from a release needs only a systemd Linux host — the installer provisions
-  Node.js, PostgreSQL and Caddy — while building from source needs Node.js 20+
-  and npm 9+ already present. The previous wording implied a Node toolchain was
-  required either way, and did not mention that npm logs a harmless failed
-  build for `cpu-features`, an optional native accelerator.
-
-### Internal
-
-- The release workflow's artifact check reported `dist/index.js` missing while
-  it was present: `tar -tzf … | grep -q` under `set -o pipefail` fails when
-  `grep` exits early and `tar` takes SIGPIPE, which only happens on an archive
-  large enough that `tar` is still writing.
-- Build provenance attestation is skipped, with a warning, while the repository
-  is private — GitHub does not offer it for user-owned private repositories,
-  and it previously failed the whole publish step.
-
 ## [1.0.0] - 2026-08-07
 
 First public release. DROP now runs tenant apps under either PM2 or Docker
@@ -134,6 +92,18 @@ previously published since 0.1.0.
 
 ### Added
 
+- **Install from a published release.** `install.sh --from-release` downloads
+  the prebuilt bundle attached to a GitHub release, verifies its SHA-256 before
+  extracting anything, and installs without a `git clone` or any TypeScript or
+  Vite build on the target machine. It requires an explicit `--isolation=docker`
+  or `--isolation=none` on a first install, because that choice decides whether
+  tenant apps run in containers or as the system user that owns the platform's
+  encryption key — a one-line install command should not pick that silently.
+  Node.js, PostgreSQL and Caddy are provisioned for you; no C toolchain is
+  needed, since the last native dependency was removed. Every release also
+  attaches `install.sh` and both checksums as individual assets, and the
+  landing page, documentation and README link them directly, so the bundle can
+  be fetched and inspected by hand before anything runs as root.
 - **Docker isolation mode.** `AppRuntime` is a formal seam with two
   implementations — PM2 (`isolation: none`, the default) and Docker
   containers (`isolation: docker`) — chosen once at boot from
