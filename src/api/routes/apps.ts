@@ -411,6 +411,17 @@ apps.post('/', async c => {
     );
   }
 
+  // Every app gets a computed default hostname `<name>.<domainSuffix>` whether
+  // or not it declares custom `domains` — handleConfigureRoute routes that
+  // hostname unconditionally. Refuse a name that would collide with the
+  // platform's own host (or the apex) here, at creation, rather than letting
+  // the app register successfully and then silently fail to get a route.
+  if (isReservedHost(`${appName}.${getDomainSuffix()}`, getPublicUrl(), getDomainSuffix())) {
+    throw new ValidationError(
+      `Invalid app name: '${appName}' is reserved by the platform`
+    );
+  }
+
   // Check if app already exists
   const stateManager = getStateManager();
   if (stateManager.hasApp(appName)) {

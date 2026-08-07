@@ -15,6 +15,7 @@ import * as detectorModule from './detector';
 import { getDetector, parseDropYaml, DetectionResult } from './detector';
 import * as diskUtils from '../utils/disk';
 import { createApiKey, deleteApiKeysByName } from '../api/middleware/auth';
+import { setPublicUrl } from '../api/runtime-config';
 
 // These are pipeline/service unit tests — they never exercise the HTTP API, so
 // disable it (createPlatform reads DROP_ENABLE_API when no enableApi is passed).
@@ -2599,6 +2600,65 @@ describe('expandMonorepo (M2: monorepo -> per-service app expansion)', () => {
       expect(call.hostname).toBe('solo-app.localhost');
       expect(call.pathPrefix).toBeUndefined();
       expect(call.upstream).toBe('localhost:4003');
+    });
+
+    describe('reserved derived hostname (DROP-135)', () => {
+      afterEach(() => {
+        // A live-update singleton (runtime-config.ts) — never leave a test's
+        // publicUrl set for the rest of the file's tests.
+        setPublicUrl(undefined);
+      });
+
+      it('refuses to route an app whose DERIVED default hostname collides with the platform host (no domains: needed)', async () => {
+        // The bug this closes: isReservedHost was only ever reached inside the
+        // custom-`domains` branch. An app named 'dashboard' declares no
+        // drop.yaml domains at all, yet its computed default hostname
+        // '<name>.<suffix>' is exactly the platform's own public host once the
+        // control plane moves to a subdomain.
+        (platform as any).config.domainSuffix = 'dropkit.sh';
+        setPublicUrl('https://dashboard.dropkit.sh');
+
+        const addRoute = jest.fn().mockResolvedValue(undefined);
+        (platform as any).router = { addRoute };
+        (platform as any).appConfigService = {
+          getConfig: jest.fn().mockReturnValue(undefined),
+          updateConfig: jest.fn(),
+        };
+        (platform as any).caddyServer = undefined;
+        const warnSpy = jest.spyOn((platform as any).logger, 'warn').mockImplementation(() => undefined);
+
+        await (platform as any).handleConfigureRoute('dashboard', 4009);
+
+        expect(addRoute).not.toHaveBeenCalled();
+        // Pin the REASON, not just the app name — 'dashboard' alone would also
+        // match an unrelated warning that happens to mention the app.
+        expect(warnSpy).toHaveBeenCalledWith(
+          expect.stringMatching(/dashboard.*reserved/),
+          'ROUTER'
+        );
+      });
+
+      it('still routes a normal (non-colliding) app name once a reserved host is configured', async () => {
+        // Proves the guard is selective, not a blanket refusal once
+        // reservedHosts() is non-empty.
+        (platform as any).config.domainSuffix = 'dropkit.sh';
+        setPublicUrl('https://dashboard.dropkit.sh');
+
+        const addRoute = jest.fn().mockResolvedValue(undefined);
+        (platform as any).router = { addRoute };
+        (platform as any).appConfigService = {
+          getConfig: jest.fn().mockReturnValue(undefined),
+          updateConfig: jest.fn(),
+        };
+        (platform as any).caddyServer = undefined;
+
+        await (platform as any).handleConfigureRoute('myapp', 4010);
+
+        expect(addRoute).toHaveBeenCalledTimes(1);
+        const call = addRoute.mock.calls[0][0];
+        expect(call.hostname).toBe('myapp.dropkit.sh');
+        expect(call.upstream).toBe('localhost:4010');
+      });
     });
   });
 });
