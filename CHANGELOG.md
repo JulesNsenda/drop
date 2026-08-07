@@ -27,6 +27,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.1]
+
+Fixes the release-install path, which did not work in 1.0.0. **If you are
+installing DROP for the first time, use this release, not 1.0.0.**
+
+### Fixed
+
+- **`install.sh --from-release` aborted partway through.** The installer
+  copied the platform code and its dependencies into place and then failed at
+  the provisioning step with `install: cannot stat
+  '/root/.drop-release-XXXX/unpacked/install.sh'`, leaving a box with the code
+  on disk but no systemd service, no Caddy configuration and no sudoers rule —
+  so the platform never started. The installer prepared the root-owned
+  provisioning script from a path it had already moved the file away from.
+  Upgrading an existing install was affected the same way.
+- Static and marketing pages now link the release. The landing page had no
+  download route at all — its only calls to action were an invitation-only
+  waitlist and an in-page anchor — and the documentation's Installation
+  section opened with `git clone`, never mentioning that a prebuilt bundle
+  exists. The README additionally lists each release asset with a direct link,
+  so an operator can fetch and check the tarball by hand before running
+  anything as root.
+
+### Changed
+
+- The documented prerequisites are now accurate per install method. Installing
+  from a release needs only a systemd Linux host — the installer provisions
+  Node.js, PostgreSQL and Caddy — while building from source needs Node.js 20+
+  and npm 9+ already present. The previous wording implied a Node toolchain was
+  required either way, and did not mention that npm logs a harmless failed
+  build for `cpu-features`, an optional native accelerator.
+
+### Internal
+
+- The release workflow's artifact check reported `dist/index.js` missing while
+  it was present: `tar -tzf … | grep -q` under `set -o pipefail` fails when
+  `grep` exits early and `tar` takes SIGPIPE, which only happens on an archive
+  large enough that `tar` is still writing.
+- Build provenance attestation is skipped, with a warning, while the repository
+  is private — GitHub does not offer it for user-owned private repositories,
+  and it previously failed the whole publish step.
+
 ## [1.0.0] - 2026-08-07
 
 First public release. DROP now runs tenant apps under either PM2 or Docker
