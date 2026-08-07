@@ -89,7 +89,7 @@ function makeStats(memory = 50 * 1024 * 1024): Record<string, unknown> {
  * One frame of Docker's multiplexed non-TTY log stream: an 8-byte header
  * (byte 0 = stream, bytes 4-7 = big-endian payload length) then the payload.
  */
-function logFrame(stream: 1 | 2, text: string): Buffer {
+function logFrame(stream: 0 | 1 | 2 | 3, text: string): Buffer {
   const payload = Buffer.from(text, 'utf8');
   const header = Buffer.alloc(8);
   header[0] = stream;
@@ -758,6 +758,35 @@ describe('ContainerManager', () => {
       const mgr = new ContainerManager(docker);
 
       expect(await mgr.getLogs('my-app')).toBe('[out] half a line');
+    });
+
+    // Stream 0 (stdin) is folded into stdout, matching StdCopy's documented
+    // backward-compatibility behaviour.
+    it('folds the stdin stream into [out]', async () => {
+      const container = makeMockContainer('my-app', makeInspectInfo('my-app', makeState(true)));
+      container.logs = jest.fn().mockResolvedValue(logFrame(0, 'echoed\n'));
+      const docker = makeDockerMock({ 'my-app': container }) as any;
+      const mgr = new ContainerManager(docker);
+
+      expect(await mgr.getLogs('my-app')).toBe('[out] echoed');
+    });
+
+    // Stream 3 (systemerr) is a daemon error, not tenant output. StdCopy writes
+    // it nowhere and terminates — surfacing it as app logs would attribute a
+    // daemon failure to the tenant's process.
+    it('stops at a systemerr frame and never reports it as app output', async () => {
+      const container = makeMockContainer('my-app', makeInspectInfo('my-app', makeState(true)));
+      container.logs = jest
+        .fn()
+        .mockResolvedValue(
+          Buffer.concat([logFrame(1, 'real output\n'), logFrame(3, 'daemon exploded\n')])
+        );
+      const docker = makeDockerMock({ 'my-app': container }) as any;
+      const mgr = new ContainerManager(docker);
+
+      const logs = await mgr.getLogs('my-app');
+      expect(logs).toBe('[out] real output');
+      expect(logs).not.toContain('daemon exploded');
     });
 
     // A TTY container emits an unframed stream; demuxing it would be mangling.
