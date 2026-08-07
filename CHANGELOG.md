@@ -27,7 +27,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [1.0.1]
+## [1.0.1] - 2026-08-07
 
 Fixes the release-install path, which did not work in 1.0.0. **If you are
 installing DROP for the first time, use this release, not 1.0.0.**
