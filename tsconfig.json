@@ -33,5 +33,13 @@
     }
   },
   "include": ["src/**/*"],
-  "exclude": ["node_modules", "dist", "**/*.test.ts", "**/*.spec.ts", "src/dashboard/**"]
+  "exclude": [
+    "node_modules",
+    "dist",
+    "**/*.test.ts",
+    "**/*.spec.ts",
+    "src/dashboard/**",
+    "src/__mocks__/**",
+    "src/__test-setup__/**"
+  ]
 }

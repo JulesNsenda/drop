@@ -88,7 +88,14 @@ function getClientIp(c: Context): string {
   // Normalise IPv6-mapped IPv4 (e.g. "::ffff:127.0.0.1" → "127.0.0.1")
   const peerIp = socketIp?.replace(/^::ffff:/i, '') ?? 'unknown';
 
-  const isLocalPeer = peerIp === '127.0.0.1' || peerIp === '::1' || peerIp === 'unknown';
+  // Fail closed: only a genuine loopback peer is trusted (Caddy runs on the
+  // same host). An unresolved socket ('unknown') must NOT be treated the
+  // same way — trusting it would make X-Forwarded-For client-controlled
+  // whenever the peer address happens to be unavailable, bypassing every
+  // limiter. Falling through to `return peerIp` below instead buckets every
+  // such request under the single literal key 'unknown', so a missing peer
+  // address throttles harder than a normal client, never softer.
+  const isLocalPeer = peerIp === '127.0.0.1' || peerIp === '::1';
 
   if (isLocalPeer) {
     // Trust XFF only from a local reverse proxy (Caddy runs on the same host).

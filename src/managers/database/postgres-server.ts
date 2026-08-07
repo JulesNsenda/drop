@@ -7,7 +7,7 @@
 import { spawn, ChildProcess, execSync } from 'child_process';
 import * as fs from 'fs/promises';
 import * as path from 'path';
-import { Pool, PoolConfig } from 'pg';
+import { Pool, PoolConfig, escapeIdentifier, escapeLiteral } from 'pg';
 import { PostgresBinaries, BinaryPaths } from './postgres-binaries';
 import {
   resolveSuperuserPassword,
@@ -425,7 +425,13 @@ export class PostgresServer {
   async createUser(username: string, password: string): Promise<void> {
     const safeUsername = username.replace(/[^a-zA-Z0-9_]/g, '_');
     const pool = await this.getPool();
-    await pool.query(`CREATE USER "${safeUsername}" WITH PASSWORD '${password}'`);
+    // CREATE USER doesn't accept a bind parameter for a role name or for its
+    // PASSWORD clause, so pool.query(sql, [values]) can't be used here —
+    // escape the identifier and the literal explicitly instead of relying on
+    // the caller's password never containing a quote character.
+    await pool.query(
+      `CREATE USER ${escapeIdentifier(safeUsername)} WITH PASSWORD ${escapeLiteral(password)}`
+    );
     this.log(`Created user: ${safeUsername}`);
   }
 

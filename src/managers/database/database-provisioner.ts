@@ -8,7 +8,7 @@ import * as crypto from 'crypto';
 import * as fs from 'fs/promises';
 import * as fssync from 'fs';
 import * as path from 'path';
-import { Pool } from 'pg';
+import { Pool, escapeIdentifier, escapeLiteral } from 'pg';
 import { writeJsonAtomic } from '../../utils/atomic-write';
 import { PostgresServer } from './postgres-server';
 import { runPgDump, createRoleSql } from './pg-dump';
@@ -174,7 +174,13 @@ export class DatabaseProvisioner {
       // already rejects any *existing* database, so there is no live DB to adopt.)
       if (String(error).includes('already exists')) {
         const pool = await this.server.getPool();
-        await pool.query(`ALTER USER "${userName}" WITH PASSWORD '${password}'`);
+        // ALTER USER doesn't accept a bind parameter for a role name or for
+        // its PASSWORD clause, so pool.query(sql, [values]) can't be used
+        // here — escape the identifier and the literal explicitly instead of
+        // relying on generatePassword() never producing a quote character.
+        await pool.query(
+          `ALTER USER ${escapeIdentifier(userName)} WITH PASSWORD ${escapeLiteral(password)}`
+        );
       } else {
         throw error;
       }

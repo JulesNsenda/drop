@@ -39,6 +39,19 @@ module.exports = [
     },
   },
   {
-    ignores: ['dist/**', 'node_modules/**', '**/*.test.ts', 'jest.config.js', '*.js', 'src/dashboard/**'],
+    // Every entry in tsconfig.json's `exclude` needs a match here: `files`
+    // below globs all of src/**/*.ts, but parserOptions.project points at
+    // tsconfig.json, so anything tsc excludes is not in the TS program and
+    // @typescript-eslint/parser cannot parse it.
+    ignores: [
+      'dist/**',
+      'node_modules/**',
+      '**/*.test.ts',
+      'jest.config.js',
+      '*.js',
+      'src/dashboard/**',
+      'src/__mocks__/**',
+      'src/__test-setup__/**',
+    ],
   },
 ];
