@@ -9,7 +9,10 @@
 #   # Public the platform on a real domain with automatic HTTPS:
 #   sudo bash install.sh --domain=example.com --https --acme-email=you@example.com
 #     • apps are served at  https://<app>.example.com
-#     • the apex (example.com) serves the DROP dashboard
+#     • the apex (example.com) serves the DROP dashboard the first time this
+#       runs; if you later hand-edit the generated Caddy host file to route
+#       the apex elsewhere, every later run (including --provision on CI
+#       deploys) leaves it alone — delete the file to restore the default.
 #   These settings persist in /etc/drop/drop.env and survive upgrades/deploys.
 set -euo pipefail
 
@@ -449,22 +452,58 @@ resolve_https() {
 # ── apex route: serve the DROP dashboard/API at the bare domain over HTTPS ─────
 # DROP imports hosts/*.caddy and never rewrites hand-managed files there, so this
 # persists. Apps are still served at <app>.<domain> via the domain suffix.
+#
+# create-if-absent: only ever written once. provision_system() runs this on
+# every --provision (i.e. every CI deploy), so unconditionally overwriting here
+# would silently reclaim the apex the moment an operator hand-edits the file to
+# route it at something else (e.g. a deployed site app instead of the control
+# plane). Guarding on the "Managed by install.sh" header the file carries would
+# get this backwards — a hand-edited live file still has that header, so that
+# check would read "safe to overwrite" and reclaim the apex anyway. Plain
+# existence is the only correct signal. Once the file exists, this function
+# just logs and returns; delete the file to restore the default apex route on
+# the next provision.
 ensure_apex_route() {
   resolve_domain
   [[ -z "$DOMAIN" ]] && return 0
+  # Resolve unconditionally, before the existence check — --provision runs
+  # with no flags (deploy.yml), so this is what backfills the global
+  # ENABLE_HTTPS from the persisted env on every run, skip path included.
+  # Nothing downstream of this function currently reads it, but that's an
+  # accident of today's control flow, not a contract this function should own;
+  # keep the global state identical to what an unconditional overwrite left it
+  # at.
   resolve_https
+  local hosts_dir="$DROP_ROOT/data/appconf/caddy/hosts"
+  local host_file="$hosts_dir/${DOMAIN}.caddy"
+  # A symlink here is never legitimate, and -f alone would not catch a DANGLING
+  # one: it reads false, so `cat >` below would follow the link and write this
+  # Caddy block as root wherever it points. $hosts_dir is chown'd to $DROP_USER,
+  # which under isolation:none is the user tenant code runs as — so that is a
+  # tenant-plantable arbitrary-file write as root. Refuse loudly rather than
+  # unlinking: an unexpected symlink on the control plane's own route file is an
+  # anomaly an operator should see, not something to silently repair.
+  if [[ -L "$host_file" ]]; then
+    error "$host_file is a symlink. Refusing to write the apex route through it — remove it and re-run."
+  fi
+  if [[ -e "$host_file" ]]; then
+    info "Apex route for $DOMAIN already exists ($host_file) — leaving it alone."
+    return 0
+  fi
   # In HTTP-only mode bind the apex explicitly on :80 (http://). A bare hostname
   # makes Caddy serve the site on :443, which has no certificate until HTTPS is
   # enabled — so plain HTTP would never be served. With HTTPS on, the bare
   # hostname lets Caddy auto-manage the cert and add the :80→:443 redirect.
   local site="$DOMAIN"
   [[ "$ENABLE_HTTPS" != "true" ]] && site="http://$DOMAIN"
-  local hosts_dir="$DROP_ROOT/data/appconf/caddy/hosts"
   info "Routing apex $site → dashboard (localhost:$API_PORT)..."
   mkdir -p "$hosts_dir"
-  cat > "$hosts_dir/${DOMAIN}.caddy" <<EOF
-# Managed by install.sh — the apex domain serves the DROP dashboard/API.
-# Delete this file to stop routing $DOMAIN to the control plane.
+  cat > "$host_file" <<EOF
+# Managed by install.sh — the apex domain served the DROP dashboard/API the
+# first time this ran. DROP will NOT overwrite this file once it exists, even
+# on --provision, so it is safe to hand-edit (e.g. to route the apex at a
+# deployed app instead). Delete the file to restore this default apex route
+# on the next provision.
 ${site} {
     encode gzip zstd
     reverse_proxy localhost:${API_PORT}
