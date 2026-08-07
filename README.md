@@ -103,6 +103,28 @@ journalctl -u drop-platform -b --no-pager | grep -A1 'Default Admin Credentials'
 > `install.bat` (or the "Build from source" steps below) and start with
 > `drop serve` directly — Windows is fully supported under `isolation: none`.
 
+**Download the artifacts directly**
+
+Every release attaches a prebuilt bundle you can fetch and inspect by hand,
+rather than letting the installer do it — useful for air-gapped boxes, or to
+audit what you are about to run as root:
+
+| Asset | What it is |
+|---|---|
+| [`drop-dist.tar.gz`](https://github.com/JulesNsenda/drop/releases/latest/download/drop-dist.tar.gz) | Compiled server, CLI, dashboard and site, plus `package.json` and lockfile |
+| [`drop-dist.tar.gz.sha256`](https://github.com/JulesNsenda/drop/releases/latest/download/drop-dist.tar.gz.sha256) | Checksum — `install.sh` verifies this before extracting |
+| [`install.sh`](https://github.com/JulesNsenda/drop/releases/latest/download/install.sh) | The installer itself |
+
+```bash
+curl -fsSLO https://github.com/JulesNsenda/drop/releases/latest/download/drop-dist.tar.gz
+curl -fsSLO https://github.com/JulesNsenda/drop/releases/latest/download/drop-dist.tar.gz.sha256
+sha256sum -c drop-dist.tar.gz.sha256
+tar -tzf drop-dist.tar.gz | head       # inspect before you run anything
+```
+
+All release pages, including older versions, are at
+[github.com/JulesNsenda/drop/releases](https://github.com/JulesNsenda/drop/releases).
+
 **Build from source**
 
 For contributors, or to run from a branch instead of a release:

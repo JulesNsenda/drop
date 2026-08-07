@@ -37,6 +37,15 @@ type HeroProps = LandingSectionsProps;
 // CTA) — everything else here is deliberately host-neutral.
 const REQUEST_ACCESS_URL = 'https://waitlist.dropkit.sh';
 
+// The self-host path. Unlike REQUEST_ACCESS_URL this is NOT host-specific: it
+// points at the project's own repository, which is the same for every DROP
+// install serving this bundle, so it does not violate the host-neutrality rule
+// above. /releases/latest always resolves to the newest stable release, so this
+// never needs bumping at release time — which is the whole reason 1.0.0 was cut
+// as a stable version rather than an rc (GitHub does not resolve /latest to a
+// prerelease).
+const RELEASES_URL = 'https://github.com/JulesNsenda/drop/releases/latest';
+
 // Page order is deliberate and audience-driven: a reader meets the *outcome*
 // (hero → what you get → who it's for → how it works → how to run it) before
 // meeting any mechanism. Everything from `TechnicalDivider` down is the
@@ -358,6 +367,18 @@ function HeroSection({ onEnter }: HeroProps): JSX.Element {
           <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', marginBottom: 26 }}>
             <a href={REQUEST_ACCESS_URL} target="_blank" rel="noopener noreferrer" style={primaryBtnStyle}>
               Request access →
+            </a>
+            {/* The second audience this page has always had but never served:
+                the reader who wants to run it on their own box. Without this,
+                the only route off the hero was an invitation-only waitlist. */}
+            <a
+              href={RELEASES_URL}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="dl-hover-border"
+              style={secondaryBtnStyle}
+            >
+              Download &amp; self-host
             </a>
             {/* Same site bundle (DROP-070) — an in-page anchor, not a
                 cross-bundle jump. */}
@@ -1514,6 +1535,15 @@ function FinalCta(): JSX.Element {
               style={{ ...primaryBtnStyle, padding: '14px 26px' }}
             >
               Request access
+            </a>
+            <a
+              href={RELEASES_URL}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="dl-hover-border"
+              style={{ ...secondaryBtnStyle, padding: '14px 26px' }}
+            >
+              Download the latest release
             </a>
             <Link to="/docs#installation" className="dl-hover-border" style={{ ...secondaryBtnStyle, padding: '14px 26px' }}>
               Run it on your own server

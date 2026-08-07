@@ -410,11 +410,47 @@ export function DocsBody(): JSX.Element {
 
       <Section id="installation" title="Installation">
         <p style={pStyle}>
-          Requirements: <strong style={{ color: 'var(--text)' }}>Node.js 20+</strong>,{' '}
-          <strong style={{ color: 'var(--text)' }}>npm 9+</strong>, and optionally{' '}
+          Installing from a release needs a systemd Linux box and nothing else — the installer sets up{' '}
+          <strong style={{ color: 'var(--text)' }}>Node.js 20</strong>, PostgreSQL and Caddy for you. Building from
+          source additionally needs <strong style={{ color: 'var(--text)' }}>Node.js 20+</strong> and{' '}
+          <strong style={{ color: 'var(--text)' }}>npm 9+</strong> already installed, plus optionally{' '}
           <strong style={{ color: 'var(--text)' }}>Caddy 2.0+</strong> for hostname routing and automatic HTTPS.
         </p>
-        <h3 style={h3Style}>Development / manual install</h3>
+        <h3 style={h3Style}>Install from a release (recommended)</h3>
+        <p style={pStyle}>
+          Every release ships a prebuilt bundle, so there is no TypeScript or Vite build on your machine. Download{' '}
+          <code>install.sh</code> from the{' '}
+          <a
+            href="https://github.com/JulesNsenda/drop/releases/latest"
+            target="_blank"
+            rel="noopener noreferrer"
+            style={linkStyle}
+          >
+            latest release
+          </a>{' '}
+          and run it. Save it to disk first — <code>install.sh</code> refuses to run piped from <code>curl</code>.
+        </p>
+        <CodeBlock
+          label="shell"
+          code={`curl -fsSL https://github.com/JulesNsenda/drop/releases/latest/download/install.sh -o install.sh
+sudo bash install.sh --from-release --isolation=docker`}
+        />
+        <p style={pStyle}>
+          <code>--from-release</code> requires you to choose an isolation mode explicitly.{' '}
+          <code>--isolation=docker</code> runs each app in its own container; <code>--isolation=none</code> runs them
+          as the <code>drop</code> system user, which can read the platform's own secrets — only pick that on a
+          machine where every deployer is trusted. The installer verifies the bundle's SHA-256 before installing
+          anything.
+        </p>
+        <Callout>
+          Upgrading a release install: download the newer <code>install.sh</code> and run it again with{' '}
+          <code>--from-release</code>. It detects the existing install and restarts the service.
+        </Callout>
+
+        <h3 style={h3Style}>Development / build from source</h3>
+        <p style={pStyle}>
+          For contributors, or to run an unreleased branch:
+        </p>
         <CodeBlock
           label="shell"
           code={`git clone https://github.com/JulesNsenda/drop.git
