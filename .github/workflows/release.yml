@@ -206,10 +206,23 @@ jobs:
           # Everything else gated above is frontend: without this, a change to
           # tsc's outDir/rootDir or copy-assets.js publishes green and every
           # install then fails on the user's box with "missing dist/index.js".
+          #
+          # List ONCE into a file rather than piping tar into grep per entry.
+          # `tar -tzf big.tar.gz | grep -q X` is a trap under `set -o pipefail`:
+          # grep -q exits at the first match, tar then takes SIGPIPE writing to
+          # the closed pipe, and pipefail propagates TAR's failure -- so the
+          # check reports the file missing precisely when it IS present. It only
+          # shows up on an archive big enough that tar is still writing when
+          # grep quits, which is why it passed every small-scale test and failed
+          # on the real 2.5 MB, 4000-entry artifact.
+          tar -tzf drop-dist.tar.gz > artifact-contents.txt
           for required in dist/index.js dist/cli/index.js package.json; do
-            tar -tzf drop-dist.tar.gz | grep -qx "$required" || {
-              echo "::error::release artifact is missing $required" >&2; exit 1; }
+            grep -qx "$required" artifact-contents.txt || {
+              echo "::error::release artifact is missing $required" >&2
+              echo "artifact contains $(wc -l < artifact-contents.txt) entries" >&2
+              exit 1; }
           done
+          rm -f artifact-contents.txt
 
           sha256sum drop-dist.tar.gz > drop-dist.tar.gz.sha256
           sha256sum install.sh > install.sh.sha256
