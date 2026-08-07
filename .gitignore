@@ -65,6 +65,17 @@ data/
 # Claude Code local settings (user-specific)
 .claude/settings.local.json
 
+# Stale agent/skill definitions kept locally but not published: they describe a
+# SQLite store, npm run db:migrate/rollback/seed, a `drop deploy --host` flag
+# and a git-receive deploy path -- none of which exist. As *agent instructions*
+# they would make a contributor's assistant confidently run failing commands.
+#
+# Ignored, not merely `git rm --cached`'d: untracking alone is not stable,
+# because any later `git add -A` silently re-adds them.
+.claude/agents/database-expert/
+.claude/skills/db-migrate/
+.claude/skills/deploy-app/
+
 # Package manager locks (choose one and keep it)
 # package-lock.json
 # yarn.lock
