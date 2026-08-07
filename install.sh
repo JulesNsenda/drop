@@ -70,6 +70,17 @@ ACME_EMAIL=""
 ENABLE_HTTPS=false
 DEPLOY_PUBKEY=""
 ISOLATION=""       # "docker" to enable container isolation; empty to leave unchanged
+FROM_RELEASE=false # install the prebuilt GitHub Release artifact instead of building from source
+RELEASE_TAG=""     # specific release tag to install; empty means "latest"
+# Written by fetch_release into $INSTALL_DIR, recording which release tag is
+# installed. A release install has no .git, so this marker is the ONLY thing
+# that lets a later run tell "already installed" from "fresh box" — see the
+# upgrade auto-detection below.
+RELEASE_MARKER=".drop-release"
+# Staging dir used by fetch_release; cleaned up on any exit path.
+DROP_STAGING=""
+cleanup_staging() { [[ -n "$DROP_STAGING" && -d "$DROP_STAGING" ]] && rm -rf "$DROP_STAGING"; return 0; }
+trap cleanup_staging EXIT
 
 # ── colour helpers ───────────────────────────────────────────────────────────
 GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'; NC='\033[0m'
@@ -101,15 +112,63 @@ while [[ $# -gt 0 ]]; do
     --deploy-pubkey=*) DEPLOY_PUBKEY="${1#*=}" ;;
     --port=*)          API_PORT="${1#*=}" ;;
     --isolation=*)     ISOLATION="${1#*=}" ;;
-    *) error "Unknown option: $1 (try --bootstrap, --upgrade, --provision, --domain=, --https, --acme-email=, --deploy-pubkey=, --isolation=docker, --dir=, --root=, --branch=, --link)" ;;
+    --from-release)    FROM_RELEASE=true ;;
+    --from-release=*)  FROM_RELEASE=true; RELEASE_TAG="${1#*=}" ;;
+    *) error "Unknown option: $1 (try --bootstrap, --upgrade, --provision, --from-release[=vX.Y.Z], --domain=, --https, --acme-email=, --deploy-pubkey=, --isolation=docker, --dir=, --root=, --branch=, --link)" ;;
   esac
   shift
 done
 
 [[ $EUID -ne 0 ]] && error "Run as root: sudo bash install.sh"
 
-# Auto-detect upgrade when install dir already contains a clone
-[[ -d "$INSTALL_DIR/.git" ]] && UPGRADE=true
+# ── acquisition-mode guards ──────────────────────────────────────────────────
+if $FROM_RELEASE; then
+  # --branch selects a source ref, --from-release installs a built artifact.
+  # They mean opposite things, so silently honouring one would be worse than
+  # refusing both.
+  [[ "$BRANCH" != "main" ]] && \
+    error "--from-release and --branch= are mutually exclusive (one installs a built artifact, the other builds from source)"
+
+  # Validate BEFORE the tag is concatenated into a URL. A value containing ../
+  # walks the GitHub release path to an artifact from another repository.
+  if [[ -n "$RELEASE_TAG" && ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z]+)*$ ]]; then
+    error "Invalid --from-release tag '$RELEASE_TAG' (expected vX.Y.Z or vX.Y.Z-suffix)"
+  fi
+
+  # Refuse to convert a source clone in place. Extracting a release over a git
+  # worktree leaves it permanently dirty, and the next plain --upgrade `git
+  # pull` then fails on local modifications — a one-way door for the operator.
+  [[ -d "$INSTALL_DIR/.git" ]] && \
+    error "$INSTALL_DIR is a git clone; --from-release would leave it permanently dirty. Move it aside first, or keep using the source upgrade path."
+
+  # Isolation mode is the single biggest trust decision in a DROP install:
+  # under 'none', tenant app code runs as $DROP_USER, which owns the platform's
+  # encryption key, its JWT/OAuth secrets and an admin-scoped local API key.
+  # A one-line public install command must not put a stranger there silently,
+  # so require the choice to be made explicitly on a first install.
+  if [[ -z "$ISOLATION" && ! -f "$ENV_FILE" ]]; then
+    error "--from-release requires an explicit --isolation=docker or --isolation=none.
+  docker  container-isolated tenant apps (recommended; installs Docker Engine)
+  none    tenant apps run as the '$DROP_USER' user, which can read the platform's
+          secrets and encryption key — only for a single trusted operator"
+  fi
+fi
+
+# Auto-detect upgrade when the install dir already holds an install.
+#
+# The .git check alone is not enough once --from-release exists: a release
+# install has no .git, so a re-run would fall through to the FRESH-INSTALL
+# branch, whose last runtime action is `systemctl start` — a no-op on an
+# already-running unit. The operator would get new code on disk, the old code
+# still serving, and a "DROP is running!" success banner.
+if [[ -d "$INSTALL_DIR/.git" ]]; then
+  UPGRADE=true
+elif [[ -f "$INSTALL_DIR/$RELEASE_MARKER" ]]; then
+  UPGRADE=true
+  # Symmetric refusal to the git-clone guard above.
+  $FROM_RELEASE || \
+    error "$INSTALL_DIR was installed from a release (see $RELEASE_MARKER); upgrade it with --from-release, not the source path."
+fi
 
 # ── Node.js ──────────────────────────────────────────────────────────────────
 ensure_node() {
@@ -530,6 +589,82 @@ fetch_code() {
   fi
 }
 
+# ── code: prebuilt GitHub Release ────────────────────────────────────────────
+# Installs the artifact published by .github/workflows/release.yml rather than
+# building from source: no tsc, no Vite, no dashboard toolchain on the box.
+#
+# The staging dance is deliberate and load-bearing. $INSTALL_DIR is chown'd to
+# $DROP_USER, and under isolation:none tenant app code runs AS that user. So on
+# an upgrade the directory is attacker-pre-populatable: untarring into it as
+# root would let a tenant plant symlinks that root's tar then writes THROUGH,
+# and the follow-up chown -R would walk the same tree. That is a local
+# privilege escalation to root, triggered by a routine operator upgrade.
+# Stage in a root-only dir, verify there, then swap into place.
+fetch_release() {
+  local url base
+  base="https://github.com/JulesNsenda/drop/releases"
+  if [[ -n "$RELEASE_TAG" ]]; then
+    url="$base/download/$RELEASE_TAG/drop-dist.tar.gz"
+    info "Downloading DROP $RELEASE_TAG..."
+  else
+    url="$base/latest/download/drop-dist.tar.gz"
+    info "Downloading the latest DROP release..."
+  fi
+
+  command -v curl &>/dev/null || { aptget update -qq && aptget install -y curl; }
+
+  # Under /root, not /tmp: /tmp is world-writable, so a local user could
+  # pre-create the paths we are about to write to as root.
+  DROP_STAGING="$(mktemp -d /root/.drop-release-XXXXXXXX)"
+  chmod 700 "$DROP_STAGING"
+
+  curl -fsSL "$url" -o "$DROP_STAGING/drop-dist.tar.gz" \
+    || error "Download failed: $url"
+  curl -fsSL "$url.sha256" -o "$DROP_STAGING/drop-dist.tar.gz.sha256" \
+    || error "Could not fetch the checksum for $url"
+
+  info "Verifying checksum..."
+  ( cd "$DROP_STAGING" && sha256sum -c drop-dist.tar.gz.sha256 >/dev/null ) \
+    || error "Checksum mismatch — refusing to install."
+
+  # --no-same-owner: extracting as root, GNU tar would otherwise restore the
+  # CI runner's numeric uid onto every file in the archive.
+  mkdir -p "$DROP_STAGING/unpacked"
+  tar -xzf "$DROP_STAGING/drop-dist.tar.gz" -C "$DROP_STAGING/unpacked" \
+      --no-same-owner --no-same-permissions \
+    || error "Extraction failed"
+
+  [[ -f "$DROP_STAGING/unpacked/dist/index.js" ]] \
+    || error "Release artifact is missing dist/index.js — refusing to install."
+
+  info "Installing into $INSTALL_DIR..."
+  mkdir -p "$INSTALL_DIR"
+  # rm-then-mv rather than copying over the top: a stale file from a previous
+  # version must not survive an upgrade. mv also replaces the inode, so this
+  # script is never rewritten in place — extracting install.sh over $SELF would
+  # otherwise truncate the file bash is still reading by byte offset and resume
+  # mid-execution on arbitrary bytes, as root.
+  rm -rf "$INSTALL_DIR/dist"
+  mv "$DROP_STAGING/unpacked/dist" "$INSTALL_DIR/dist"
+  local f
+  for f in package.json package-lock.json install.sh LICENSE README.md CHANGELOG.md VERSION; do
+    [[ -f "$DROP_STAGING/unpacked/$f" ]] && mv -f "$DROP_STAGING/unpacked/$f" "$INSTALL_DIR/$f"
+  done
+
+  echo "${RELEASE_TAG:-latest}" > "$INSTALL_DIR/$RELEASE_MARKER"
+  chown -R "$DROP_USER:$DROP_USER" "$INSTALL_DIR"
+  cleanup_staging
+}
+
+# ── dependencies for a prebuilt install ──────────────────────────────────────
+# The artifact ships compiled dist/, so only runtime deps are needed. Runs as
+# $DROP_USER for the same reason build_drop does: as root, every dependency's
+# install/postinstall lifecycle script would execute as root.
+install_runtime_deps() {
+  info "Installing runtime dependencies..."
+  sudo -u "$DROP_USER" bash -c "cd '$INSTALL_DIR' && npm ci --omit=dev"
+}
+
 # ── build ────────────────────────────────────────────────────────────────────
 build_drop() {
   info "Installing server dependencies..."
@@ -550,10 +685,29 @@ build_drop() {
     info "Building site..."
     sudo -u "$DROP_USER" bash -c "cd '$INSTALL_DIR/src/dashboard' && npm run build:site"
   fi
-  if $DO_LINK; then
-    info "Linking CLI globally (drop command)..."
-    bash -c "cd '$INSTALL_DIR' && npm link"
+}
+
+# Linking the CLI is independent of HOW the code got here, so it lives outside
+# build_drop — otherwise `--from-release --link` silently produces no `drop`
+# command, since the release path never calls build_drop.
+link_cli() {
+  $DO_LINK || return 0
+  info "Linking CLI globally (drop command)..."
+  bash -c "cd '$INSTALL_DIR' && npm link"
+}
+
+# Single entry point for "get the code onto the box and make it runnable", so
+# the two acquisition modes cannot drift apart across the install and upgrade
+# call sites.
+acquire_code() {
+  if $FROM_RELEASE; then
+    fetch_release
+    install_runtime_deps
+  else
+    fetch_code
+    build_drop
   fi
+  link_cli
 }
 
 # ── systemd service ──────────────────────────────────────────────────────────
@@ -700,8 +854,7 @@ elif $PROVISION; then
   info "Provision complete."
 elif $UPGRADE; then
   info "Upgrading DROP..."
-  fetch_code
-  build_drop
+  acquire_code
   # Refresh the root-owned provisioning script from the code this real root
   # session just pulled — this (not --provision) is how provisioning-logic
   # changes reach an already-bootstrapped box. See install_provision_script.
@@ -715,11 +868,12 @@ else
   ensure_node
   ensure_postgres
   ensure_user
-  ensure_build_tools
+  # The release artifact ships prebuilt, and bcrypt (the only native module)
+  # was removed in v1.0.0 — so a --from-release install needs no C toolchain.
+  $FROM_RELEASE || ensure_build_tools
   [[ "$ISOLATION" == "docker" ]] && ensure_docker
   ensure_root_dir
-  fetch_code
-  build_drop
+  acquire_code
   install_provision_script
   provision_system
   systemctl start "$SERVICE_NAME"

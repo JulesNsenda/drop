@@ -1,0 +1,22 @@
+# Normalize text to LF in the repository.
+#
+# Shell scripts MUST stay LF in the worktree too, not just in git: install.sh
+# is downloaded and executed directly on Linux boxes, and a CRLF line ending
+# turns the shebang into `#!/usr/bin/env bash\r`, which fails with a "bad
+# interpreter" error before a single line runs. Contributors on Windows have
+# core.autocrlf=true by default, so without this the checkout would rewrite it.
+* text=auto
+
+*.sh text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+Dockerfile text eol=lf
+*.example text eol=lf
+
+# Binary — never touch these.
+*.png binary
+*.jpg binary
+*.ico binary
+*.woff binary
+*.woff2 binary
+*.tar.gz binary
