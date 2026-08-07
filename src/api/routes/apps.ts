@@ -305,7 +305,14 @@ apps.get('/', async c => {
       filtered.map(a => {
         const dto = toAppDto(a, isAdmin);
         const stats = statsMap.get(a.name);
-        if (stats && a.status === 'running') {
+        // A zero here can mean "measurement failed", not "idle": the docker
+        // adapter degrades to {cpu:0, memory:0} whenever the stats call throws.
+        // Memory is the discriminator — a running container is never
+        // legitimately at 0 bytes, whereas an idle app really can sit at 0.0%
+        // CPU, so a positive memory reading is what marks the whole sample as
+        // real. Without one, omit the fields entirely and let the dashboard
+        // hide its "Avg CPU" card rather than publish a fabricated 0.0%.
+        if (stats && a.status === 'running' && stats.memory > 0) {
           dto.memory = stats.memory;
           dto.cpu = stats.cpu;
           dto.uptime = stats.uptime;
@@ -336,12 +343,17 @@ apps.get('/:name', async c => {
   try {
     const procInfo = await pm.getStatus(name);
     if (procInfo) {
+      // Same "0 means unknown, not idle" rule as the list route above: a failed
+      // stats call degrades to zeros, and reporting those as a measurement puts
+      // "0.0% / 0 KB" on the Metrics tab. Gate on memory (never legitimately 0
+      // for a live process) so the tab says "no metrics" instead of lying.
+      const hasSample = procInfo.memory > 0;
       return c.json(
         success({
           ...toAppDto(app, isAdmin),
           pid: isAdmin ? (procInfo.pid ?? app.pid) : undefined,
-          memory: isOwner ? procInfo.memory : undefined,
-          cpu: isOwner ? procInfo.cpu : undefined,
+          memory: isOwner && hasSample ? procInfo.memory : undefined,
+          cpu: isOwner && hasSample ? procInfo.cpu : undefined,
           uptime: isOwner ? procInfo.uptime : undefined,
           restarts: procInfo.restarts,
         })
