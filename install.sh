@@ -689,6 +689,14 @@ fetch_release() {
   #   - rm-then-mv also stops a stale file from a previous version surviving an
   #     upgrade, and replaces the inode rather than truncating in place — so
   #     this script is never rewritten while bash is still reading it.
+  # Keep a root-owned COPY of the verified install.sh for $PROVISION_BIN before
+  # the loop below moves the original into $INSTALL_DIR. Pointing PROVISION_SRC
+  # straight at unpacked/install.sh does not work: `mv` empties that path, so
+  # install_provision_script later fails with "cannot stat". Copy first, and the
+  # copy stays inside the 0700 root-owned staging dir until the EXIT trap.
+  cp "$DROP_STAGING/unpacked/install.sh" "$DROP_STAGING/provision-src.sh"
+  PROVISION_SRC="$DROP_STAGING/provision-src.sh"
+
   rm -rf "$INSTALL_DIR/dist"
   mv -fT "$DROP_STAGING/unpacked/dist" "$INSTALL_DIR/dist"
   local f
@@ -712,15 +720,13 @@ fetch_release() {
     echo "${RELEASE_TAG:-unknown}" > "$RELEASE_MARKER"
   fi
 
-  # Seed the provisioning script from the STAGED copy, not from $SELF.
-  # install_provision_script would otherwise copy $SELF into $PROVISION_BIN --
-  # and on the upgrade path $SELF is typically $INSTALL_DIR/install.sh, which
-  # this function has just re-materialized and chown'd to $DROP_USER. Since
-  # $PROVISION_BIN is the target of a NOPASSWD sudoers rule, letting root copy
-  # drop-writable bytes there is a straight privilege escalation, with the
-  # `npm ci` below as a comfortable window. The staging copy is root-owned,
-  # 0700, checksum-verified, and unreachable by $DROP_USER.
-  PROVISION_SRC="$DROP_STAGING/unpacked/install.sh"
+  # PROVISION_SRC was set above, before the moves. It deliberately points at the
+  # staged copy rather than $SELF: install_provision_script would otherwise copy
+  # $SELF into $PROVISION_BIN, and on the upgrade path $SELF is typically
+  # $INSTALL_DIR/install.sh, which this function has just re-materialized and
+  # chown'd to $DROP_USER. Since $PROVISION_BIN is the target of a NOPASSWD
+  # sudoers rule, letting root copy drop-writable bytes there is a straight
+  # privilege escalation, with the `npm ci` below as a comfortable window.
 
   chown -R "$DROP_USER:$DROP_USER" "$INSTALL_DIR"
   # NOTE: staging is deliberately NOT cleaned here -- PROVISION_SRC points into
