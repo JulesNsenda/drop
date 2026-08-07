@@ -109,7 +109,7 @@ const STEPS: { n: string; tag: string; title: string; body: string }[] = [
     n: '02',
     tag: 'DETECT',
     title: 'It works out the rest',
-    body: 'DROP recognises what the app is built with, installs everything it needs, and builds it — the way that project expects to be built.',
+    body: 'DROP recognises what the app is built with, installs everything it needs, and builds it the way that project expects to be built.',
   },
   {
     n: '03',
@@ -133,21 +133,21 @@ const AUDIENCES: {
     key: 'founder',
     icon: <Briefcase size={17} style={{ color: 'var(--accent)' }} />,
     who: 'Founders & small business owners',
-    body: 'Your developer says the app is finished — “we just need to sort out hosting.” That sentence is a whole other project. This is that project, already done.',
+    body: 'Your developer says the app is finished, then adds: “we just need to sort out hosting.” That sentence is a whole other project. This is that project, already done.',
     replaces: 'paying someone to set up servers',
   },
   {
     key: 'agency',
     icon: <Users size={17} style={{ color: 'var(--accent)' }} />,
     who: 'Agencies & freelance dev shops',
-    body: 'Twelve client projects should not mean twelve hosting bills and twelve control panels. Run them all on one server — each with its own domain, database and logs.',
+    body: 'Twelve client projects should not mean twelve hosting bills and twelve control panels. Run them all on one server, each with its own domain, database and logs.',
     replaces: 'a separate hosting plan per client',
   },
   {
     key: 'lead',
     icon: <Building2 size={17} style={{ color: 'var(--accent)' }} />,
     who: 'Technical leads at small companies',
-    body: 'You need a platform team you are never going to get headcount for. DROP is the part of one that actually earns its keep — without adopting Kubernetes to get there.',
+    body: 'You need a platform team you are never going to get headcount for. DROP is the part of one that actually earns its keep, without adopting Kubernetes to get there.',
     replaces: 'a platform team, or Kubernetes',
   },
   {
@@ -168,7 +168,7 @@ const HOSTED_POINTS = [
 const SELFHOST_POINTS = [
   'Runs on a small Linux VPS',
   'Your code and customer data stay on your machine',
-  'MIT licensed — the source is public',
+  'MIT licensed, and the source is public',
 ];
 
 const CONFIG_POINTS = [
@@ -348,12 +348,12 @@ function HeroSection({ onEnter }: HeroProps): JSX.Element {
             to run servers.
           </h1>
           <p style={{ fontSize: 18, color: 'var(--text-2)', maxWidth: 470, marginBottom: 18, lineHeight: 1.6 }}>
-            DROP takes a folder of code and puts it on the internet — with its own web address, a security
-            certificate, a database and round-the-clock monitoring already set up. There is no server to configure
-            and no hosting console to learn.
+            DROP takes a folder of code and puts it on the internet. It arrives with its own web address, a security
+            certificate, a database and round-the-clock monitoring. There is no server to configure and no hosting
+            console to learn.
           </p>
           <p style={{ fontFamily: 'var(--mono)', fontSize: 12.5, color: 'var(--text-3)', marginBottom: 28 }}>
-            Node · Python · Go · Docker · static — detected automatically. No Dockerfile required.
+            Node · Python · Go · Docker · static. Detected automatically, no Dockerfile required.
           </p>
           <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', marginBottom: 26 }}>
             <a href={REQUEST_ACCESS_URL} target="_blank" rel="noopener noreferrer" style={primaryBtnStyle}>
@@ -547,7 +547,7 @@ function HeroSection({ onEnter }: HeroProps): JSX.Element {
           {/* Plain-English caption so the terminal is not an opaque black box
               to a non-technical reader. */}
           <p style={{ marginTop: 22, fontSize: 13, color: 'var(--text-3)', textAlign: 'center' }}>
-            That is the entire deployment — one command, and the app is online.
+            That is the entire deployment. One command, and the app is online.
           </p>
         </div>
       </div>
@@ -748,7 +748,7 @@ function WhatYouGet(): JSX.Element {
             It runs whatever your developer built
           </div>
           <p style={{ fontSize: 13.5, color: 'var(--text-2)', lineHeight: 1.6, marginBottom: 14 }}>
-            Node, Python, Go, Docker and plain websites — and it recognises Next.js, Nuxt, SvelteKit, Astro, FastAPI
+            Node, Python, Go, Docker and plain websites. It also recognises Next.js, Nuxt, SvelteKit, Astro, FastAPI
             and Flask without being told which one it is looking at.
           </p>
           <div style={{ display: 'flex', gap: 7, flexWrap: 'wrap', marginTop: 'auto' }}>
@@ -822,7 +822,7 @@ function WhoItsFor(): JSX.Element {
           If one of these is you, this is the missing piece.
         </h2>
         <p style={{ fontSize: 16, color: 'var(--text-2)', lineHeight: 1.7 }}>
-          DROP replaces the step between “the app is built” and “the app is online” — the step that usually needs a
+          DROP replaces the step between “the app is built” and “the app is online”, the one that usually needs a
           specialist.
         </p>
       </div>
@@ -940,7 +940,7 @@ function TwoWaysToRun({ onEnter }: EnterProps): JSX.Element {
           Use someone else&apos;s DROP, or run your own.
         </h2>
         <p style={{ fontSize: 16, color: 'var(--text-2)', lineHeight: 1.7 }}>
-          Same platform either way. The only question is who keeps the server running — and you can start on one and
+          Same platform either way. The only question is who keeps the server running. You can start on one and
           move to the other.
         </p>
       </div>
@@ -974,7 +974,7 @@ function TwoWaysToRun({ onEnter }: EnterProps): JSX.Element {
             Use a hosted DROP
           </div>
           <p style={{ fontSize: 14.5, color: 'var(--text-2)', lineHeight: 1.65, marginBottom: 20 }}>
-            Deploy onto a DROP someone already runs — this one, or your company&apos;s. You never touch a server.
+            Deploy onto a DROP someone already runs: this one, or your company&apos;s. You never touch a server.
             Access here is by invitation while the platform is in beta; ask for one and we&apos;ll be in touch.
           </p>
           <div style={{ display: 'flex', flexDirection: 'column', gap: 10, marginBottom: 26 }}>
@@ -1032,7 +1032,7 @@ function TwoWaysToRun({ onEnter }: EnterProps): JSX.Element {
             Run it on your own server
           </div>
           <p style={{ fontSize: 14.5, color: 'var(--text-2)', lineHeight: 1.65, marginBottom: 20 }}>
-            One install script on any Linux machine — a small VPS is plenty for a portfolio of apps. Nothing leaves
+            One install script on any Linux machine. A small VPS is plenty for a portfolio of apps. Nothing leaves
             hardware you control, and there is no per-app fee because there is no bill but the server.
           </p>
           <div style={{ display: 'flex', flexDirection: 'column', gap: 10, marginBottom: 26 }}>
@@ -1061,7 +1061,7 @@ function DashboardPreview({ onEnter }: EnterProps): JSX.Element {
             One screen that answers &ldquo;is everything OK?&rdquo;
           </h2>
           <p style={{ fontSize: 15, color: 'var(--text-2)', lineHeight: 1.7, marginBottom: 22 }}>
-            Which apps are up, how hard they are working, what they last printed, what changed and when — plus
+            Which apps are up, how hard they are working, what they last printed, what changed and when, plus
             domains, passwords and databases. If you would rather click than type, everything the command line does
             is here too.
           </p>
@@ -1155,7 +1155,7 @@ function TechnicalDivider(): JSX.Element {
         </h2>
         <p style={{ fontSize: 16, color: 'var(--text-2)', lineHeight: 1.7 }}>
           If you were deciding whether DROP is for you, you already have what you need. Everything below is for the
-          person who will actually operate it — what it detects, how to override it, and how to drive it from a
+          person who will actually operate it: what it detects, how to override it, and how to drive it from a
           terminal or an AI assistant.
         </p>
       </div>
@@ -1296,13 +1296,13 @@ function McpSection(): JSX.Element {
             Let the assistant do the deploy.
           </h2>
           <p style={{ fontSize: 16, color: 'var(--text-2)', lineHeight: 1.7, marginBottom: 16 }}>
-            Say &ldquo;ship this folder&rdquo; to Claude, Codex or Cursor and it does — then reads the logs back to
+            Say &ldquo;ship this folder&rdquo; to Claude, Codex or Cursor and it does, then reads the logs back to
             you if something went wrong. Nobody copies commands out of a chat window into a terminal.
           </p>
           <p style={{ fontSize: 14.5, color: 'var(--text-2)', lineHeight: 1.7, marginBottom: 24 }}>
             The technical version: DROP ships an MCP (Model Context Protocol) server, so any MCP client gets deploy,
             log and status calls as native tools. Header auth for clients that support it, and OAuth for the
-            claude.ai connector — so nobody pastes an API key into a browser.
+            claude.ai connector, so nobody pastes an API key into a browser.
           </p>
           <div
             style={{
@@ -1421,7 +1421,7 @@ function McpSection(): JSX.Element {
               >
                 Deploy the <span style={{ fontFamily: 'var(--mono)' }}>./api</span> folder and attach a database.
               </div>
-              <div style={{ fontSize: 13.5, color: 'var(--text-2)' }}>On it — deploying with DROP.</div>
+              <div style={{ fontSize: 13.5, color: 'var(--text-2)' }}>On it. Deploying with DROP.</div>
               <div style={{ border: '1px solid var(--border)', borderRadius: 10, background: 'var(--bg-2)', overflow: 'hidden' }}>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 9, padding: '10px 13px', borderBottom: '1px solid var(--border)', fontFamily: 'var(--mono)', fontSize: 12, color: 'var(--text)' }}>
                   <Settings2 size={14} style={{ color: 'var(--accent)' }} /> called <span style={{ color: 'var(--accent)' }}>deploy_files</span>
