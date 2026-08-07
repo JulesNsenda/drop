@@ -57,8 +57,12 @@ on-disk copy of itself to work from — so save it first, then run it:
 curl -fsSL https://github.com/JulesNsenda/drop/releases/latest/download/install.sh -o install.sh && sudo bash install.sh --from-release --isolation=docker
 ```
 
-`--from-release` installs the latest published release — no `git clone`, no
-Node toolchain, no build step. It requires you to pick an isolation mode
+`--from-release` installs the latest published release: no `git clone`, and no
+TypeScript or Vite build on your machine. (Node.js is still required and the
+installer sets it up for you. `npm` may log a failed optional build for
+`cpu-features` — that is harmless; it is an optional native accelerator for
+`ssh2` and the install completes without it.) It requires you to pick an
+isolation mode
 explicitly on a first install:
 
 - **`--isolation=docker`** (recommended) — tenant apps build and run in
