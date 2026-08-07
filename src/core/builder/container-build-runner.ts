@@ -28,7 +28,7 @@ import {
   CONTAINER_SECURITY_OPT,
   NON_ROOT_UID,
   NON_ROOT_GID,
-  selectBaseImage,
+  selectBuildImage,
 } from '../../managers/runtime/container-config';
 
 /** Pids limit for build containers — higher than runtime (npm/cargo can fork many). */
@@ -72,7 +72,9 @@ export async function executeCommandInContainer(
     timeoutMs = DEFAULT_BUILD_TIMEOUT_MS,
   } = opts;
 
-  const image = selectBaseImage(appType);
+  // The BUILD image, not the runtime one: a source SPA is served by nginx but
+  // built with npm, and nginx:alpine has neither node nor npm.
+  const image = selectBuildImage(appType);
   await ensureBuildImage(docker, image);
 
   // Unique name to avoid collisions in concurrent builds.

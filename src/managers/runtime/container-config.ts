@@ -80,6 +80,44 @@ export function selectBaseImage(appType: AppType, runtimeImage?: string): string
 }
 
 /**
+ * Types whose BUILD toolchain differs from what SERVES them.
+ *
+ * static/spa are served by nginx, but a *source* SPA (a Vite/CRA/Svelte repo
+ * with a package.json) is built with npm — and `nginx:alpine` has no npm, so
+ * building in the runtime image fails at the first command with
+ * `/bin/sh: npm: not found`. A pre-built static app has no build command at
+ * all, so nothing regresses for it.
+ *
+ * This is the third instance of one mistake: assuming a single image can both
+ * build and run an app. See the comments on BASE_IMAGES above — django/flask/
+ * fastapi were fixed by letting the BUILD select from the wide detector type
+ * while the runtime uses the narrowed one, and `spa: nginx:alpine` was itself
+ * added to fix the runtime after SPAs fell back to node and could not start
+ * nginx. Fixing the runtime that way broke the build, which is the symmetric
+ * half nobody closed.
+ *
+ * Keep this table minimal: it is an override list, not a second source of
+ * truth. A type absent here builds in whatever it runs in, which is correct
+ * for every other type today.
+ */
+const BUILD_IMAGE_OVERRIDES: Partial<Record<AppType, string>> = {
+  static: 'node:20-slim',
+  spa: 'node:20-slim',
+};
+
+/**
+ * Image for the ephemeral BUILD container, as distinct from the runtime one.
+ *
+ * Callers running an app use `selectBaseImage`; callers running a build step
+ * must use this. Honours an explicit `runtimeImage` for the same reason
+ * `selectBaseImage` does — an operator pinning an image means it for both.
+ */
+export function selectBuildImage(appType: AppType, runtimeImage?: string): string {
+  if (runtimeImage !== undefined) return selectBaseImage(appType, runtimeImage);
+  return BUILD_IMAGE_OVERRIDES[appType] ?? selectBaseImage(appType);
+}
+
+/**
  * Non-root user per base image.  Used in Docker `User` field so deployed apps
  * do not run as root inside the container.
  *
