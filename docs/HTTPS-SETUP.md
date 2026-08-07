@@ -205,6 +205,30 @@ curl -X POST http://localhost:3000/api/v1/certs/renew
 2. Ports 80/443 don't need to be publicly accessible
 3. Useful for internal/private deployments
 
+## Custom Caddy Directives
+
+DROP generates and owns `data/appconf/Caddyfile`, and rewrites it from the
+current app configs whenever routing changes. **Hand-edits to that file are
+overwritten.** Back it up before any upgrade if you have modified it:
+
+```bash
+cp data/appconf/Caddyfile data/appconf/Caddyfile.backup
+```
+
+To add directives DROP does not manage — custom TLS options, matchers, headers
+— put them in a separate file and pull it in with an `import`, which survives
+regeneration:
+
+```caddyfile
+# data/appconf/caddy/hosts/custom.caddy — not managed by DROP
+example.com {
+    header /api/* Access-Control-Allow-Origin "https://trusted.example.com"
+}
+```
+
+Files under `data/appconf/caddy/hosts/` are included by the generated
+Caddyfile and are left alone.
+
 ## Troubleshooting
 
 ### Domain Doesn't Resolve

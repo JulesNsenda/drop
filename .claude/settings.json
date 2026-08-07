@@ -72,17 +72,6 @@
     "DROP_LOG_LEVEL": "debug"
   },
   "hooks": {
-    "PostToolUse": [
-      {
-        "matcher": "Edit|Write",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "node -e \"const p=process.env.CLAUDE_FILE_PATH||''; if(p.endsWith('.ts')||p.endsWith('.tsx')||p.endsWith('.js')||p.endsWith('.jsx')||p.endsWith('.json')) { require('child_process').execSync('npx prettier --write ' + p, {stdio:'inherit'}); }\""
-          }
-        ]
-      }
-    ],
     "PreToolUse": [
       {
         "matcher": "Edit|Write",

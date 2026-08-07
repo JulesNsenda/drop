@@ -10,7 +10,7 @@ DROP (Deploy, Run, Operate, Publish) is a self-hosted PaaS for "drop folder and 
 
 The platform itself is a long-running Node.js service (`drop serve`) that runs a file watcher, a deployment pipeline, an app runtime (PM2 processes *or* Docker containers — see the runtime seam below), a bundled PostgreSQL, an optional bundled Redis, an optional Caddy reverse proxy, a Hono REST API + hosted MCP server, and a React dashboard — all in one process.
 
-**Isolation mode is the single biggest behavioural switch.** `config.isolation` is `'none'` (default) or `'docker'` (`DROP_ISOLATION` env / `--isolation` flag), and it decides whether tenant code runs as a host process under PM2 or in a container — which in turn changes builds, `DATABASE_URL` shape, `DROP_API_URL`, health probing (PM2 uses a poller; Docker uses `HEALTHCHECK`), and whether multi-user mode is even allowed. Production (dropkit.sh) runs `docker`; a Windows dev box runs `none`. Always check which mode a code path is reasoning about.
+**Isolation mode is the single biggest behavioural switch.** `config.isolation` is `'none'` (default) or `'docker'` (`DROP_ISOLATION` env / `--isolation` flag), and it decides whether tenant code runs as a host process under PM2 or in a container — which in turn changes builds, `DATABASE_URL` shape, `DROP_API_URL`, health probing (PM2 uses a poller; Docker uses `HEALTHCHECK`), and whether multi-user mode is even allowed. Both modes are exercised in real deployments — a Docker host and a `none`-isolation dev box behave differently for the same code path. Always check which mode a code path is reasoning about.
 
 ## Commands
 
@@ -228,10 +228,10 @@ Roadmap and conventions live in `docs/VERSION-ROADMAP.md`, `docs/GIT-BRANCHING-M
 ### Git Conventions
 
 - Never commit directly to `main` or `develop`.
-- **A push to `develop` deploys production.** `.github/workflows/deploy.yml` triggers on `main`, `develop` and `feature/DROP-v2*`, and its `deploy` job is *not* branch-gated — it ssh's into the `hetzner` environment host (`secrets.DEPLOY_HOST`; dropkit.sh in this project), runs `sudo systemctl stop drop-platform`, ships the artifact, and brings the service back. Treat any push to `develop` — including a zero-content back-merge — as a production deploy and get explicit consent for it, not just for the push.
+- **A push to `develop` deploys production.** `.github/workflows/deploy.yml` triggers on `main`, `develop` and `feature/DROP-v2*`, and its `deploy` job is *not* branch-gated — it ssh's into the `hetzner` environment host (`secrets.DEPLOY_HOST`), runs `sudo systemctl stop drop-platform`, ships the artifact, and brings the service back. Treat any push to `develop` — including a zero-content back-merge — as a production deploy and get explicit consent for it, not just for the push.
 - Branch naming: `feature/`, `bugfix/`, `hotfix/`, `release/`.
 - Conventional commits: `feat(scope): description`, `fix(scope): description`.
-- `deploy.yml` also enforces two guards worth knowing before editing it: the remote deploy script must contain **exactly two apostrophes** (the `ssh` argument delimiters — a stray apostrophe, even in a comment, once truncated the script and took production down, DROP-074), and the built `dist/site` JS must not reference admin-only code (the DROP-070 bundle split).
+- `deploy.yml` also enforces two guards worth knowing before editing it: the remote deploy script must contain **exactly two apostrophes** (the `ssh` argument delimiters — a stray apostrophe, even in a comment, silently truncates the script mid-execution), and the built `dist/site` JS must not reference admin-only code (the DROP-070 bundle split).
 
 ## Key Patterns
 
@@ -243,4 +243,4 @@ Roadmap and conventions live in `docs/VERSION-ROADMAP.md`, `docs/GIT-BRANCHING-M
 - **Two-phase config reconciliation**: app config files are authoritative for ports; state and the runtime are reconciled against them on startup (`syncStateWithConfigs`, `syncStateWithProcesses`, `loadUsedPorts`).
 - **Runtime-agnostic code paths**: anything touching start/stop/restart/logs goes through `getAppRuntime()` (no argument). If a change only works under one isolation mode, that's a bug — see the `platform.build-exec-parity` / `platform.restart` tests for the shape of the parity checks.
 - **Atomic file writes**: new platform state goes through `writeJsonAtomic`; boot-time reconciliation assumes stores are never half-written.
-- **Security helpers have callers**: several past incidents came from a helper that was correct in isolation while a caller bypassed it (build env sanitization, group-name path containment). When touching one, read every call site — and prefer a type-level invariant over a test asserting "every caller passes X". Related utils worth reusing rather than re-implementing: `ssrf-guard`, `url-safety`/`url-validator`, `domain-validator`, `reserved-hosts`, `paths`.
+- **Security helpers have callers**: several past incidents came from a helper that was correct in isolation while a caller bypassed it (build env sanitization, group-name path containment). When touching one, read every call site — and prefer a type-level invariant over a test asserting "every caller passes X". Search for an existing validation/sanitization utility before writing new logic inline — several already exist in the codebase for URL, hostname and path safety.

@@ -101,9 +101,9 @@ describe('ComponentName', () => {
 - Response formatting
 
 ### Database Tests
-- SQLite operations
-- PostgreSQL provisioning
-- Migration execution
+- PostgreSQL provisioning (per-app database + DATABASE_URL injection)
+- File-backed platform state (apps.json, per-app config) — DROP keeps its own
+  state in flat files; there is no SQLite store and no migration runner.
 
 ## Output Format
 

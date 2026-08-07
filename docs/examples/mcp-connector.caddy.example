@@ -10,7 +10,7 @@
 # 1. Copy this file to the Caddy hosts dir on the box (imported automatically,
 #    survives every Caddyfile regeneration):
 #        <DROP_ROOT>/data/appconf/caddy/hosts/mcp-connector.caddy
-#    (on dropkit.sh: /var/drop/data/appconf/caddy/hosts/mcp-connector.caddy)
+#    (on example.com: /var/drop/data/appconf/caddy/hosts/mcp-connector.caddy)
 # 2. Replace the three placeholders below.
 # 3. Ensure DNS resolves the subdomain to the box (a *.<domain> wildcard covers
 #    it). Use a DEDICATED subdomain, never the apex — two site blocks for one
@@ -28,7 +28,7 @@
 # path 3 (OAuth, PRD-041) if either is available to you.
 #
 # Placeholders:
-#   mcp.<YOUR_DOMAIN>   — a dedicated subdomain (e.g. mcp.dropkit.sh)
+#   mcp.<YOUR_DOMAIN>   — a dedicated subdomain (e.g. mcp.example.com)
 #   <SECRET_PATH_TOKEN> — long random string, e.g. openssl rand -hex 24
 #   <USER_ROLE_API_KEY> — a DROP user-role key (never admin); mint in dashboard
 #   127.0.0.1:3000      — the DROP API port (default 3000; change if customized)
