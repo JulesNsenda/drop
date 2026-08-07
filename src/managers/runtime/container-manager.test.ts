@@ -66,6 +66,37 @@ function makeInspectInfo(
   };
 }
 
+/**
+ * A Docker stats payload shaped like the one `fetchContainerStats` parses.
+ * Defaults work out to 50 MB and 2.0% CPU: cpu delta 100 / system delta 10000
+ * × 2 cpus × 100.
+ */
+function makeStats(memory = 50 * 1024 * 1024): Record<string, unknown> {
+  return {
+    memory_stats: { usage: memory },
+    cpu_stats: {
+      cpu_usage: { total_usage: 200, percpu_usage: [1, 1] },
+      system_cpu_usage: 20000,
+    },
+    precpu_stats: {
+      cpu_usage: { total_usage: 100 },
+      system_cpu_usage: 10000,
+    },
+  };
+}
+
+/**
+ * One frame of Docker's multiplexed non-TTY log stream: an 8-byte header
+ * (byte 0 = stream, bytes 4-7 = big-endian payload length) then the payload.
+ */
+function logFrame(stream: 0 | 1 | 2 | 3, text: string): Buffer {
+  const payload = Buffer.from(text, 'utf8');
+  const header = Buffer.alloc(8);
+  header[0] = stream;
+  header.writeUInt32BE(payload.length, 4);
+  return Buffer.concat([header, payload]);
+}
+
 // eslint-disable-next-line @typescript-eslint/no-unused-vars
 function makeMockContainer(_name: string, inspectData: Record<string, unknown>): any {
   return {
@@ -613,6 +644,65 @@ describe('ContainerManager', () => {
       expect(all).toHaveLength(1);
       expect(all[0].name).toBe('my-app');
     });
+
+    // Regression: getAllStatus() used to inspect() only, and inspectToInfo
+    // hardcodes cpu/memory to 0 — so `GET /apps` reported a whole healthy
+    // fleet as 0.0% CPU under docker isolation while each app's own detail
+    // page (getStatus) showed real numbers. The two must agree.
+    it('populates live cpu/memory for running containers, matching getStatus', async () => {
+      const container = makeMockContainer('my-app', makeInspectInfo('my-app', makeState(true)));
+      container.stats = jest.fn().mockResolvedValue(makeStats());
+      const docker = makeDockerMock({ 'my-app': container }) as any;
+      // Id must resolve to the fixture: the mock's getContainer() looks the
+      // container up by whatever string it is handed.
+      docker.listContainers.mockResolvedValue([
+        { Id: 'my-app', Names: ['/drop-my-app'], Labels: { 'drop.app': 'my-app' } },
+      ]);
+      const mgr = new ContainerManager(docker);
+
+      const [fromList] = await mgr.getAllStatus();
+      const fromDetail = await mgr.getStatus('my-app');
+
+      expect(fromList.memory).toBe(50 * 1024 * 1024);
+      expect(fromList.cpu).toBe(2);
+      expect(fromList.memory).toBe(fromDetail!.memory);
+      expect(fromList.cpu).toBe(fromDetail!.cpu);
+    });
+
+    it('does not fetch stats for a container that is not running', async () => {
+      const container = makeMockContainer('my-app', makeInspectInfo('my-app', makeState(false)));
+      container.stats = jest.fn().mockResolvedValue(makeStats());
+      const docker = makeDockerMock({ 'my-app': container }) as any;
+      docker.listContainers.mockResolvedValue([
+        { Id: 'my-app', Names: ['/drop-my-app'], Labels: { 'drop.app': 'my-app' } },
+      ]);
+      const mgr = new ContainerManager(docker);
+
+      const [info] = await mgr.getAllStatus();
+      expect(container.stats).not.toHaveBeenCalled();
+      expect(info.status).not.toBe('running');
+    });
+
+    // The per-container try/catch has to stay INSIDE the mapped function, or
+    // one container vanishing between list and inspect drops the whole fleet.
+    it('skips a vanished container without dropping its healthy siblings', async () => {
+      const alive = makeMockContainer('alive', makeInspectInfo('alive', makeState(true)));
+      alive.stats = jest.fn().mockResolvedValue(makeStats());
+      const gone = makeMockContainer('gone', makeInspectInfo('gone', makeState(true)));
+      gone.inspect = jest.fn().mockRejectedValue(new Error('No such container: 404'));
+
+      const docker = makeDockerMock({ alive, gone }) as any;
+      docker.listContainers.mockResolvedValue([
+        { Id: 'gone', Names: ['/drop-gone'], Labels: { 'drop.app': 'gone' } },
+        { Id: 'alive', Names: ['/drop-alive'], Labels: { 'drop.app': 'alive' } },
+      ]);
+      const mgr = new ContainerManager(docker);
+
+      const all = await mgr.getAllStatus();
+      expect(all).toHaveLength(1);
+      expect(all[0].name).toBe('alive');
+      expect(all[0].cpu).toBe(2);
+    });
   });
 
   describe('getLogs()', () => {
@@ -635,6 +725,78 @@ describe('ContainerManager', () => {
 
       const logs = await mgr.getLogs('missing');
       expect(logs).toBe('');
+    });
+
+    // Regression: the raw multiplexed buffer was returned via .toString(), so
+    // the 8-byte frame headers leaked into the text and — worse — the
+    // stdout/stderr split was lost entirely. The dashboard filters on the
+    // [out]/[err] prefixes PM2 emits, so its "err" filter matched nothing at
+    // all under docker isolation.
+    it('demultiplexes frames into [out]/[err] prefixed lines', async () => {
+      const container = makeMockContainer('my-app', makeInspectInfo('my-app', makeState(true)));
+      container.logs = jest
+        .fn()
+        .mockResolvedValue(
+          Buffer.concat([logFrame(1, 'started ok\n'), logFrame(2, 'boom failed\n')])
+        );
+      const docker = makeDockerMock({ 'my-app': container }) as any;
+      const mgr = new ContainerManager(docker);
+
+      const logs = await mgr.getLogs('my-app');
+
+      expect(logs.split('\n')).toEqual(['[out] started ok', '[err] boom failed']);
+      // No header bytes survived into the text.
+      expect(logs).not.toMatch(/[\x00-\x08]/);
+    });
+
+    it('rejoins a line split across two same-stream frames', async () => {
+      const container = makeMockContainer('my-app', makeInspectInfo('my-app', makeState(true)));
+      container.logs = jest
+        .fn()
+        .mockResolvedValue(Buffer.concat([logFrame(1, 'half a '), logFrame(1, 'line\n')]));
+      const docker = makeDockerMock({ 'my-app': container }) as any;
+      const mgr = new ContainerManager(docker);
+
+      expect(await mgr.getLogs('my-app')).toBe('[out] half a line');
+    });
+
+    // Stream 0 (stdin) is folded into stdout, matching StdCopy's documented
+    // backward-compatibility behaviour.
+    it('folds the stdin stream into [out]', async () => {
+      const container = makeMockContainer('my-app', makeInspectInfo('my-app', makeState(true)));
+      container.logs = jest.fn().mockResolvedValue(logFrame(0, 'echoed\n'));
+      const docker = makeDockerMock({ 'my-app': container }) as any;
+      const mgr = new ContainerManager(docker);
+
+      expect(await mgr.getLogs('my-app')).toBe('[out] echoed');
+    });
+
+    // Stream 3 (systemerr) is a daemon error, not tenant output. StdCopy writes
+    // it nowhere and terminates — surfacing it as app logs would attribute a
+    // daemon failure to the tenant's process.
+    it('stops at a systemerr frame and never reports it as app output', async () => {
+      const container = makeMockContainer('my-app', makeInspectInfo('my-app', makeState(true)));
+      container.logs = jest
+        .fn()
+        .mockResolvedValue(
+          Buffer.concat([logFrame(1, 'real output\n'), logFrame(3, 'daemon exploded\n')])
+        );
+      const docker = makeDockerMock({ 'my-app': container }) as any;
+      const mgr = new ContainerManager(docker);
+
+      const logs = await mgr.getLogs('my-app');
+      expect(logs).toBe('[out] real output');
+      expect(logs).not.toContain('daemon exploded');
+    });
+
+    // A TTY container emits an unframed stream; demuxing it would be mangling.
+    it('returns unframed (TTY) output untouched', async () => {
+      const container = makeMockContainer('my-app', makeInspectInfo('my-app', makeState(true)));
+      container.logs = jest.fn().mockResolvedValue(Buffer.from('plain tty output'));
+      const docker = makeDockerMock({ 'my-app': container }) as any;
+      const mgr = new ContainerManager(docker);
+
+      expect(await mgr.getLogs('my-app')).toBe('plain tty output');
     });
   });
 });

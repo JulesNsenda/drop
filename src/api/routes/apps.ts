@@ -305,7 +305,14 @@ apps.get('/', async c => {
       filtered.map(a => {
         const dto = toAppDto(a, isAdmin);
         const stats = statsMap.get(a.name);
-        if (stats && a.status === 'running') {
+        // A zero here can mean "measurement failed", not "idle": the docker
+        // adapter degrades to {cpu:0, memory:0} whenever the stats call throws.
+        // Memory is the discriminator — a running container is never
+        // legitimately at 0 bytes, whereas an idle app really can sit at 0.0%
+        // CPU, so a positive memory reading is what marks the whole sample as
+        // real. Without one, omit the fields entirely and let the dashboard
+        // hide its "Avg CPU" card rather than publish a fabricated 0.0%.
+        if (stats && a.status === 'running' && stats.memory > 0) {
           dto.memory = stats.memory;
           dto.cpu = stats.cpu;
           dto.uptime = stats.uptime;
@@ -336,6 +343,14 @@ apps.get('/:name', async c => {
   try {
     const procInfo = await pm.getStatus(name);
     if (procInfo) {
+      // NOTE: deliberately NOT gated on `memory > 0` the way the list route
+      // above is. That guard is safe there because the fleet-average card is
+      // the confirmed bug and the reading is docker-only in practice; here it
+      // would change PM2 behaviour too, and PM2 reports a legitimate zero for a
+      // live process whose monit has not sampled yet (pm2-client.ts: `proc.monit
+      // || {}` then `monit.memory || 0`). Gating here would blank the Metrics
+      // tab on a healthy pm2 app — a regression on the isolation mode that
+      // never had the bug.
       return c.json(
         success({
           ...toAppDto(app, isAdmin),
