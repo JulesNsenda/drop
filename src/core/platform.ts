@@ -4336,6 +4336,33 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         );
       }
 
+      // Reserved-hostname guard on the FINAL domain list, whatever produced
+      // it. The custom-domain branch above already runs requested `domains`
+      // through isReservedHost, but its fallback on `domains.length === 0`
+      // reuses `defaultHostname` unchecked — and an app with no custom
+      // domains at all never reaches that branch, so `defaultHostname` is
+      // used as-is. Both paths land here: an app named e.g. `dashboard`
+      // would otherwise get a Caddy block for the platform's own host
+      // unconditionally, with no drop.yaml `domains:` required to trigger it.
+      const routableDomains = domains.filter((hostname) => {
+        if (isReservedHost(hostname, getPublicUrl(), domainSuffix)) {
+          this.logger.warn(
+            `Refusing route for ${appName}: hostname '${hostname}' is reserved by the platform`,
+            'ROUTER'
+          );
+          return false;
+        }
+        return true;
+      });
+      if (routableDomains.length === 0) {
+        this.logger.warn(
+          `App '${appName}' has no routable hostname (every candidate is reserved by the ` +
+            'platform); no route was configured',
+          'ROUTER'
+        );
+      }
+      domains = routableDomains;
+
       // Configure route for each domain
       let resolvedPublicUrl: string | undefined;
       for (const hostname of domains) {
