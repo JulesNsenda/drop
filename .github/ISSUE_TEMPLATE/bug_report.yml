@@ -1,0 +1,65 @@
+name: Bug Report
+description: Something isn't working the way it should
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug. Please fill in as much as
+        you can — isolation mode and version in particular make a big
+        difference in what could be going wrong.
+  - type: input
+    id: version
+    attributes:
+      label: DROP version
+      description: Output of `drop version`, or the release tag / commit you installed
+      placeholder: v1.0.0
+    validations:
+      required: true
+  - type: dropdown
+    id: isolation
+    attributes:
+      label: Isolation mode
+      description: Value of `DROP_ISOLATION` / `--isolation`, or "not sure"
+      options:
+        - "none (PM2, default)"
+        - "docker"
+        - "not sure"
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      description: e.g. Ubuntu 24.04, Windows 11, macOS 14
+      placeholder: Ubuntu 24.04
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you expect, and what happened instead?
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Run `drop deploy ...`
+        2. ...
+    validations:
+      required: false
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: |
+        Platform logs (`drop server logs` or `journalctl -u drop-platform`) and/or
+        app logs (`drop logs <app>`). Remove secrets/tokens before pasting.
+      render: shell
+    validations:
+      required: false
