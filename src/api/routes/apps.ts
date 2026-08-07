@@ -343,17 +343,20 @@ apps.get('/:name', async c => {
   try {
     const procInfo = await pm.getStatus(name);
     if (procInfo) {
-      // Same "0 means unknown, not idle" rule as the list route above: a failed
-      // stats call degrades to zeros, and reporting those as a measurement puts
-      // "0.0% / 0 KB" on the Metrics tab. Gate on memory (never legitimately 0
-      // for a live process) so the tab says "no metrics" instead of lying.
-      const hasSample = procInfo.memory > 0;
+      // NOTE: deliberately NOT gated on `memory > 0` the way the list route
+      // above is. That guard is safe there because the fleet-average card is
+      // the confirmed bug and the reading is docker-only in practice; here it
+      // would change PM2 behaviour too, and PM2 reports a legitimate zero for a
+      // live process whose monit has not sampled yet (pm2-client.ts: `proc.monit
+      // || {}` then `monit.memory || 0`). Gating here would blank the Metrics
+      // tab on a healthy pm2 app — a regression on the isolation mode that
+      // never had the bug.
       return c.json(
         success({
           ...toAppDto(app, isAdmin),
           pid: isAdmin ? (procInfo.pid ?? app.pid) : undefined,
-          memory: isOwner && hasSample ? procInfo.memory : undefined,
-          cpu: isOwner && hasSample ? procInfo.cpu : undefined,
+          memory: isOwner ? procInfo.memory : undefined,
+          cpu: isOwner ? procInfo.cpu : undefined,
           uptime: isOwner ? procInfo.uptime : undefined,
           restarts: procInfo.restarts,
         })
