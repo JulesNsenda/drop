@@ -64,9 +64,18 @@ const LOG_FRAME_HEADER_SIZE = 8;
  * De-multiplex Docker's non-TTY log stream into PM2-shaped `[out] `/`[err] `
  * lines.
  *
- * Every frame is an 8-byte header — byte 0 is the stream (1 = stdout,
- * 2 = stderr), bytes 1-3 are reserved zeros, bytes 4-7 a big-endian payload
- * length — followed by the payload. Reading that with a plain `.toString()`
+ * Every frame is an 8-byte header — byte 0 is the stream, bytes 1-3 are
+ * reserved zeros, bytes 4-7 a big-endian uint32 payload length — followed by
+ * the payload. Layout and stream enum verified against moby's own reference
+ * de-multiplexer (`api/pkg/stdcopy/stdcopy.go`: `stdWriterPrefixLen = 8`,
+ * `stdWriterSizeIndex = 4`, `binary.BigEndian.Uint32`).
+ *
+ * Stream values are 0 = stdin, 1 = stdout, 2 = stderr, 3 = systemerr. StdCopy
+ * folds stdin into stdout for backward compatibility and writes systemerr
+ * nowhere, terminating the stream — both mirrored below, so daemon errors are
+ * never passed off as the tenant's own output.
+ *
+ * Reading that with a plain `.toString()`
  * leaks the header bytes into the text AND discards the stdout/stderr
  * distinction entirely, which is the only signal the logs API carries: the
  * dashboard splits streams on the `[out] `/`[err] ` prefixes PM2 emits, so
@@ -84,15 +93,22 @@ function demuxDockerLogs(buf: Buffer): string {
   while (offset + LOG_FRAME_HEADER_SIZE <= buf.length) {
     const streamType = buf[offset];
     const framed =
-      streamType <= 2 && buf[offset + 1] === 0 && buf[offset + 2] === 0 && buf[offset + 3] === 0;
+      streamType <= 3 && buf[offset + 1] === 0 && buf[offset + 2] === 0 && buf[offset + 3] === 0;
 
     if (!framed) {
       // Unframed at offset 0 means the container has a TTY, so the stream was
       // never multiplexed — hand back the raw text rather than mangling it.
       // Mid-buffer it means `tail` sliced through a frame; keep what parsed.
+      // (Checking the reserved zero bytes is stricter than StdCopy, which only
+      // switches on byte 0 — the extra bytes are what make this a usable
+      // "is this framed at all?" probe on a buffer we did not read framed.)
       if (offset === 0) return buf.toString();
       break;
     }
+
+    // Systemerr: daemon-level errors, not app output. StdCopy writes them
+    // nowhere and stops processing; anything after this is not tenant output.
+    if (streamType === 3) break;
 
     const length = buf.readUInt32BE(offset + 4);
     const start = offset + LOG_FRAME_HEADER_SIZE;
