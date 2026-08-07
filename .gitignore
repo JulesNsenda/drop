@@ -126,14 +126,5 @@ docs/plans/**
 !docs/examples/
 !docs/specs/
 
-# ...except the unapproved design PRDs (045-049): an unbuilt dashboard
-# redesign. Publishing them would advertise features that do not exist.
-# Listed after the allowlist above so these patterns win (last match wins).
-docs/specs/prd/PRD-045-*
-docs/specs/prd/PRD-046-*
-docs/specs/prd/PRD-047-*
-docs/specs/prd/PRD-048-*
-docs/specs/prd/PRD-049-*
-
 drop-test/**
 
