@@ -56,10 +56,19 @@ const AGENTS = ['Claude', 'Claude Code', 'Codex', 'Cursor', 'Cline', 'Windsurf']
 
 // Outcome metrics, not mechanism metrics — "5 runtimes supported" told a
 // non-technical reader nothing about what they get.
+//
+// Every one of these must be something the code actually guarantees. The tile
+// this replaced said "~8s from folder to live URL", inherited from an older
+// version of the page, and no measurement anywhere in the repo backed it — the
+// platform's own `readinessTimeoutMs` budget is 60s (platform.ts), raised under
+// DROP-063 precisely because healthy apps were being failed at 20s. Deploy
+// speed is also a developer metric: a business reader deploys rarely, so it
+// optimised for the thing they experience least. Don't put a number here you
+// cannot point at code or a measurement for.
 const STATS: { v: string; l: string }[] = [
-  { v: '~8s', l: 'from folder to live URL' },
+  { v: '0', l: 'DevOps hires needed' },
   { v: '0', l: 'setup files to write' },
-  { v: '1', l: 'server runs all your apps' },
+  { v: '1', l: 'server runs every app you build' },
   { v: '24/7', l: 'crashed apps restart themselves' },
 ];
 
@@ -322,8 +331,8 @@ function HeroSection({ onEnter }: HeroProps): JSX.Element {
               marginBottom: 22,
             }}
           >
-            Your app goes live<br />
-            in about{' '}
+            Get your app online<br />
+            without{' '}
             <span
               style={{
                 background: 'linear-gradient(120deg,var(--accent),var(--accent-2))',
@@ -333,8 +342,10 @@ function HeroSection({ onEnter }: HeroProps): JSX.Element {
                 color: 'transparent',
               }}
             >
-              eight seconds.
+              hiring anyone
             </span>
+            <br />
+            to run servers.
           </h1>
           <p style={{ fontSize: 18, color: 'var(--text-2)', maxWidth: 470, marginBottom: 18, lineHeight: 1.6 }}>
             DROP takes a folder of code and puts it on the internet — with its own web address, a security
@@ -452,7 +463,10 @@ function HeroSection({ onEnter }: HeroProps): JSX.Element {
                 <span style={{ color: 'var(--text)' }}>DATABASE_URL</span> <span style={{ color: 'var(--ok)' }}>✓</span>
               </div>
               <div style={{ color: 'var(--text-2)' }}>
-                <span style={{ color: 'var(--accent-2)' }}>→</span> Building… done in <span style={{ color: 'var(--text)' }}>8.2s</span>
+                {/* A plausible figure for a Next.js install+build, not a
+                    flattering one. The old 8.2s matched the "~8s median
+                    deploy" stat that nothing in the repo measured. */}
+                <span style={{ color: 'var(--accent-2)' }}>→</span> Building… done in <span style={{ color: 'var(--text)' }}>41.6s</span>
               </div>
               <div style={{ color: 'var(--text-2)' }}>
                 <span style={{ color: 'var(--accent-2)' }}>→</span> Starting… <span style={{ color: 'var(--ok)' }}>online ✓</span>
@@ -522,7 +536,7 @@ function HeroSection({ onEnter }: HeroProps): JSX.Element {
               <div style={{ fontFamily: 'var(--mono)', fontSize: 12, color: 'var(--text)' }}>
                 deployed by an assistant
               </div>
-              <div style={{ fontFamily: 'var(--mono)', fontSize: 11, color: 'var(--ok)' }}>✔ api.localhost · 8.2s</div>
+              <div style={{ fontFamily: 'var(--mono)', fontSize: 11, color: 'var(--ok)' }}>✔ api.localhost · deployed</div>
             </div>
           </div>
           </div>
