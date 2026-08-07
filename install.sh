@@ -72,15 +72,27 @@ DEPLOY_PUBKEY=""
 ISOLATION=""       # "docker" to enable container isolation; empty to leave unchanged
 FROM_RELEASE=false # install the prebuilt GitHub Release artifact instead of building from source
 RELEASE_TAG=""     # specific release tag to install; empty means "latest"
-# Written by fetch_release into $INSTALL_DIR, recording which release tag is
-# installed. A release install has no .git, so this marker is the ONLY thing
-# that lets a later run tell "already installed" from "fresh box" — see the
-# upgrade auto-detection below.
-RELEASE_MARKER=".drop-release"
+# Records which release tag is installed. A release install has no .git, so this
+# marker is the ONLY thing that lets a later run tell "already installed" from
+# "fresh box" — see the upgrade auto-detection below.
+#
+# Deliberately OUTSIDE $INSTALL_DIR, in a root-owned directory. $INSTALL_DIR is
+# chown'd to $DROP_USER, which under isolation:none is the user tenant code runs
+# as — so a marker inside it would be attacker-controlled in two ways: it could
+# be pre-planted as a symlink (root's `>` follows symlinks, letting a tenant get
+# any file on the box truncated and overwritten — /etc/drop/drop.env being the
+# high-value target, since wiping DROP_ISOLATION silently drops the next restart
+# back to isolation:none), and it could be created or deleted to flip root's
+# upgrade-vs-fresh-install decision.
+RELEASE_MARKER="/etc/drop/drop-release"
 # Staging dir used by fetch_release; cleaned up on any exit path.
 DROP_STAGING=""
 cleanup_staging() { [[ -n "$DROP_STAGING" && -d "$DROP_STAGING" ]] && rm -rf "$DROP_STAGING"; return 0; }
 trap cleanup_staging EXIT
+# File that install_provision_script copies into the root-owned $PROVISION_BIN.
+# Defaults to this script; fetch_release repoints it at the checksum-verified
+# staging copy, because on the release path $SELF can be drop-writable.
+PROVISION_SRC="$SELF"
 
 # ── colour helpers ───────────────────────────────────────────────────────────
 GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'; NC='\033[0m'
@@ -121,6 +133,15 @@ done
 
 [[ $EUID -ne 0 ]] && error "Run as root: sudo bash install.sh"
 
+# Validate --isolation at parse time. Without this the value is only ever
+# checked for non-emptiness, so a typo (--isolation=dokcer, --isolation=Docker)
+# passes every gate, skips ensure_docker, is written verbatim to $ENV_FILE, and
+# the platform then falls back to 'none' -- handing the operator the weaker
+# trust model with a success banner and no warning.
+if [[ -n "$ISOLATION" && ! "$ISOLATION" =~ ^(docker|none)$ ]]; then
+  error "Invalid --isolation='$ISOLATION' (expected 'docker' or 'none')"
+fi
+
 # ── acquisition-mode guards ──────────────────────────────────────────────────
 if $FROM_RELEASE; then
   # --branch selects a source ref, --from-release installs a built artifact.
@@ -146,7 +167,11 @@ if $FROM_RELEASE; then
   # encryption key, its JWT/OAuth secrets and an admin-scoped local API key.
   # A one-line public install command must not put a stranger there silently,
   # so require the choice to be made explicitly on a first install.
-  if [[ -z "$ISOLATION" && ! -f "$ENV_FILE" ]]; then
+  # Gate on "no isolation has ever been CHOSEN", not "the env file exists":
+  # write_env_config creates $ENV_FILE for a --domain-only run, so keying on
+  # mere existence lets a two-step install reach --from-release having never
+  # picked a mode.
+  if [[ -z "$ISOLATION" ]] && ! grep -qE '^DROP_ISOLATION=(docker|none)$' "$ENV_FILE" 2>/dev/null; then
     error "--from-release requires an explicit --isolation=docker or --isolation=none.
   docker  container-isolated tenant apps (recommended; installs Docker Engine)
   none    tenant apps run as the '$DROP_USER' user, which can read the platform's
@@ -163,11 +188,23 @@ fi
 # still serving, and a "DROP is running!" success banner.
 if [[ -d "$INSTALL_DIR/.git" ]]; then
   UPGRADE=true
-elif [[ -f "$INSTALL_DIR/$RELEASE_MARKER" ]]; then
+elif [[ -f "$RELEASE_MARKER" ]]; then
   UPGRADE=true
-  # Symmetric refusal to the git-clone guard above.
-  $FROM_RELEASE || \
+  # Symmetric refusal to the git-clone guard above -- but ONLY on the paths
+  # that actually acquire code.
+  #
+  # --provision and --bootstrap never fetch anything, so the git-vs-release
+  # distinction is meaningless to them. Erroring there would be actively
+  # destructive: write_sudoers grants the drop user exactly
+  #   NOPASSWD: /usr/bin/bash $PROVISION_BIN --provision
+  # and sudo matches that command line literally, so the drop user CANNOT
+  # append --from-release to satisfy the guard. The same install that writes
+  # the marker would permanently break the only privileged re-provision path
+  # it also installs -- taking CI deploys, `--domain=`/`--https` runs and the
+  # documented --bootstrap remediation with it.
+  if ! $PROVISION && ! $BOOTSTRAP && ! $FROM_RELEASE; then
     error "$INSTALL_DIR was installed from a release (see $RELEASE_MARKER); upgrade it with --from-release, not the source path."
+  fi
 fi
 
 # ── Node.js ──────────────────────────────────────────────────────────────────
@@ -505,7 +542,8 @@ install_provision_script() {
   # no-op rather than aborting: this runs after fetch_code/build_drop, and an
   # abort here would leave the box mid-upgrade — code rebuilt, provisioning
   # not yet (re)applied.
-  [[ "$SELF" -ef "$PROVISION_BIN" ]] || install -o root -g root -m 0755 "$SELF" "$PROVISION_BIN"
+  [[ "$PROVISION_SRC" -ef "$PROVISION_BIN" ]] || \
+    install -o root -g root -m 0755 "$PROVISION_SRC" "$PROVISION_BIN"
 }
 
 # Root-owned, non-group-writable home for $PROVISION_BIN. Called
@@ -639,21 +677,54 @@ fetch_release() {
 
   info "Installing into $INSTALL_DIR..."
   mkdir -p "$INSTALL_DIR"
-  # rm-then-mv rather than copying over the top: a stale file from a previous
-  # version must not survive an upgrade. mv also replaces the inode, so this
-  # script is never rewritten in place — extracting install.sh over $SELF would
-  # otherwise truncate the file bash is still reading by byte offset and resume
-  # mid-execution on arbitrary bytes, as root.
+  # Every move below uses `mv -fT` (--no-target-directory) and rm's the
+  # destination first. Both matter, and neither is paranoia:
+  #
+  #   - Plain `mv src dst` decides "move INTO a directory" by stat()ing dst,
+  #     which FOLLOWS a symlink-to-directory. $DROP_USER owns $INSTALL_DIR, so
+  #     it can pre-plant e.g. `LICENSE -> /etc/sudoers.d` and root would write
+  #     $INSTALL_DIR/LICENSE straight into /etc/sudoers.d/LICENSE. These
+  #     destinations persist across upgrades, so no race is needed. -T removes
+  #     the ambiguity entirely: rename(2) replaces the link itself.
+  #   - rm-then-mv also stops a stale file from a previous version surviving an
+  #     upgrade, and replaces the inode rather than truncating in place — so
+  #     this script is never rewritten while bash is still reading it.
   rm -rf "$INSTALL_DIR/dist"
-  mv "$DROP_STAGING/unpacked/dist" "$INSTALL_DIR/dist"
+  mv -fT "$DROP_STAGING/unpacked/dist" "$INSTALL_DIR/dist"
   local f
   for f in package.json package-lock.json install.sh LICENSE README.md CHANGELOG.md VERSION; do
-    [[ -f "$DROP_STAGING/unpacked/$f" ]] && mv -f "$DROP_STAGING/unpacked/$f" "$INSTALL_DIR/$f"
+    if [[ -f "$DROP_STAGING/unpacked/$f" ]]; then
+      rm -rf "${INSTALL_DIR:?}/$f"
+      mv -fT "$DROP_STAGING/unpacked/$f" "$INSTALL_DIR/$f"
+    fi
   done
 
-  echo "${RELEASE_TAG:-latest}" > "$INSTALL_DIR/$RELEASE_MARKER"
+  # Root-owned marker directory; see the RELEASE_MARKER comment at the top.
+  install -d -o root -g root -m 0755 "$(dirname "$RELEASE_MARKER")"
+  rm -f "$RELEASE_MARKER"
+  # Prefer the VERSION file the artifact ships: on the documented (unpinned)
+  # install command $RELEASE_TAG is empty, so recording it would write the
+  # literal "latest" and the marker could never answer "which version is on
+  # this box" -- the one question it exists to answer.
+  if [[ -s "$INSTALL_DIR/VERSION" ]]; then
+    cat "$INSTALL_DIR/VERSION" > "$RELEASE_MARKER"
+  else
+    echo "${RELEASE_TAG:-unknown}" > "$RELEASE_MARKER"
+  fi
+
+  # Seed the provisioning script from the STAGED copy, not from $SELF.
+  # install_provision_script would otherwise copy $SELF into $PROVISION_BIN --
+  # and on the upgrade path $SELF is typically $INSTALL_DIR/install.sh, which
+  # this function has just re-materialized and chown'd to $DROP_USER. Since
+  # $PROVISION_BIN is the target of a NOPASSWD sudoers rule, letting root copy
+  # drop-writable bytes there is a straight privilege escalation, with the
+  # `npm ci` below as a comfortable window. The staging copy is root-owned,
+  # 0700, checksum-verified, and unreachable by $DROP_USER.
+  PROVISION_SRC="$DROP_STAGING/unpacked/install.sh"
+
   chown -R "$DROP_USER:$DROP_USER" "$INSTALL_DIR"
-  cleanup_staging
+  # NOTE: staging is deliberately NOT cleaned here -- PROVISION_SRC points into
+  # it and install_provision_script runs later. The EXIT trap clears it.
 }
 
 # ── dependencies for a prebuilt install ──────────────────────────────────────
@@ -868,15 +939,28 @@ else
   ensure_node
   ensure_postgres
   ensure_user
-  # The release artifact ships prebuilt, and bcrypt (the only native module)
-  # was removed in v1.0.0 — so a --from-release install needs no C toolchain.
-  $FROM_RELEASE || ensure_build_tools
+  # ensure_build_tools installs two unrelated things: the C toolchain (needed
+  # only to build the platform from source — and bcrypt, the last native
+  # module, is gone as of v1.0.0) AND python3-venv, which is what lets a Python
+  # tenant app build at all under isolation:none. --from-release removes the
+  # need for the former, not the latter. Gate on isolation, not acquisition
+  # mode, or a `--from-release --isolation=none` box fails every Python deploy
+  # with an opaque "ensurepip is not available".
+  if ! $FROM_RELEASE || [[ "$ISOLATION" != "docker" ]]; then
+    ensure_build_tools
+  fi
   [[ "$ISOLATION" == "docker" ]] && ensure_docker
   ensure_root_dir
   acquire_code
   install_provision_script
   provision_system
-  systemctl start "$SERVICE_NAME"
+  # restart, not start: `systemctl start` is a NO-OP on an already-running
+  # unit. A box provisioned some other way (e.g. CI untars into /opt/drop, so
+  # it has neither .git nor the release marker) reaches this arm with the
+  # service already up -- and would get new code on disk, the old process
+  # still serving, and a "DROP is running!" banner. restart is idempotent:
+  # it starts a stopped unit and restarts a running one.
+  systemctl restart "$SERVICE_NAME"
   echo ""
   info "DROP is running!"
   if [[ -n "$DOMAIN" ]]; then

@@ -123,8 +123,23 @@ docs/plans/**
 !docs/HTTPS-SETUP.md
 !docs/LOCAL-TESTING.md
 !docs/VERSION-ROADMAP.md
+# docs/specs and docs/examples publish by FILE TYPE, not wholesale. A bare
+# `!docs/specs/` would re-include the entire subtree, making it opt-OUT — so an
+# internal note dropped in there would be publishable, defeating the scheme.
+#
+# The dance below is required by a gitignore rule: a file cannot be re-included
+# if a parent DIRECTORY is excluded, because git never descends into it. So
+# re-include the directory, re-exclude its contents, re-include subdirectories
+# so git keeps descending, then re-include the file types we actually publish.
 !docs/examples/
+docs/examples/**
+!docs/examples/**/
+!docs/examples/**/*.example
+
 !docs/specs/
+docs/specs/**
+!docs/specs/**/
+!docs/specs/**/*.md
 
 drop-test/**
 

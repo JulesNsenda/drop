@@ -202,6 +202,15 @@ jobs:
           tar -czf drop-dist.tar.gz \
             dist/ install.sh package.json package-lock.json \
             LICENSE README.md CHANGELOG.md VERSION
+          # Assert the artifact contains what the platform actually executes.
+          # Everything else gated above is frontend: without this, a change to
+          # tsc's outDir/rootDir or copy-assets.js publishes green and every
+          # install then fails on the user's box with "missing dist/index.js".
+          for required in dist/index.js dist/cli/index.js package.json; do
+            tar -tzf drop-dist.tar.gz | grep -qx "$required" || {
+              echo "::error::release artifact is missing $required" >&2; exit 1; }
+          done
+
           sha256sum drop-dist.tar.gz > drop-dist.tar.gz.sha256
           sha256sum install.sh > install.sh.sha256
           cat drop-dist.tar.gz.sha256 install.sh.sha256

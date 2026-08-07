@@ -27,7 +27,6 @@
       "Bash(gh issue:*)",
       "LSP(*)",
       "Read(./src/**)",
-      "Read(./tests/**)",
       "Read(./docs/**)",
       "Read(./tsconfig.json)",
       "Read(./package.json)",
@@ -36,7 +35,6 @@
       "Read(./.prettierrc*)",
       "Read(./jest.config*)",
       "Edit(./src/**)",
-      "Edit(./tests/**)",
       "Edit(./docs/**)"
     ],
     "deny": [

@@ -116,7 +116,7 @@ Never include .env/keys in the tarball; set secrets via PUT $DROP_URL/api/v1/sec
   redeploy fails this way, stop the app first, re-upload, then start it. Linux
   hosts don't have this restriction.
 - **Isolation**: on multi-user boxes DROP requires `isolation: docker`
-  (v2 posture). Even on a single-user box, prefer docker isolation when the
+  (the 1.0 posture). Even on a single-user box, prefer docker isolation when the
   deploys are agent-generated — code nobody read shouldn't run unsandboxed.
 - **App names**: 1–64 chars, alphanumeric plus `-` and `_`.
 

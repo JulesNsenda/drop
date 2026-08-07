@@ -303,7 +303,10 @@ export class PostgresServer {
     try {
       // Set/refresh the superuser password (scram-hashed). Works under trust.
       await this.pool.query(`SET password_encryption = 'scram-sha-256'`);
-      await this.pool.query(`ALTER ROLE postgres PASSWORD '${this.superuserPassword.replace(/'/g, "''")}'`);
+      // escapeLiteral rather than hand-doubling quotes: ''-doubling is only
+      // correct while standard_conforming_strings is on, and this is the last
+      // hand-escaped literal in this file after the rest moved to pg's helpers.
+      await this.pool.query(`ALTER ROLE postgres PASSWORD ${escapeLiteral(this.superuserPassword)}`);
 
       const hbaPath = path.join(this.paths.dataDir, 'pg_hba.conf');
       const hba = await fs.readFile(hbaPath, 'utf-8');
