@@ -75,47 +75,73 @@ logs.get('/:name/stream', async (c) => {
   const stream = new ReadableStream({
     async start(controller) {
       const encoder = new TextEncoder();
+      let closed = false;
+      let stopTail: (() => void) | null = null;
 
-      // Send initial logs
+      const send = (line: string, type: 'out' | 'err') => {
+        if (closed) return;
+        const payload = { line, type, timestamp: new Date().toISOString() };
+        try {
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify(payload)}\n\n`));
+        } catch {
+          // Consumer went away mid-write; the abort handler tears the rest down.
+        }
+      };
+
+      const shutdown = () => {
+        if (closed) return;
+        closed = true;
+        try {
+          stopTail?.();
+        } catch {
+          // Tailer already torn down.
+        }
+        try {
+          controller.close();
+        } catch {
+          // Stream already closed.
+        }
+      };
+
+      c.req.raw.signal.addEventListener('abort', shutdown);
+
+      // Backfill, so a client attaching mid-life isn't staring at a blank pane.
+      // Both runtimes prefix combined logs with [out]/[err]; lift that into the
+      // `type` field and strip it, so backfilled and live lines have one shape.
       try {
         const initialLogs = await pm.getLogs(name, 50);
-        if (initialLogs) {
-          const lines = initialLogs.split('\n').filter(Boolean);
-          for (const line of lines) {
-            const data = `data: ${JSON.stringify({ line, timestamp: new Date().toISOString() })}\n\n`;
-            controller.enqueue(encoder.encode(data));
-          }
+        for (const raw of (initialLogs || '').split('\n')) {
+          if (!raw) continue;
+          if (raw.startsWith('[err] ')) send(raw.slice(6), 'err');
+          else if (raw.startsWith('[out] ')) send(raw.slice(6), 'out');
+          else send(raw, 'out');
         }
       } catch {
-        // Continue even if initial logs fail
+        // No logs yet — the live tail below is still worth opening.
       }
 
-      // Set up log tailing interval
-      let lastLogCount = 0;
-      const interval = setInterval(async () => {
-        try {
-          const logContent = await pm.getLogs(name, 10);
-          if (logContent) {
-            const logLines = logContent.split('\n').filter(Boolean);
-            if (logLines.length > lastLogCount) {
-              const newLogs = logLines.slice(lastLogCount);
-              for (const line of newLogs) {
-                const data = `data: ${JSON.stringify({ line, timestamp: new Date().toISOString() })}\n\n`;
-                controller.enqueue(encoder.encode(data));
-              }
-              lastLogCount = logLines.length;
-            }
-          }
-        } catch {
-          // Ignore errors during streaming
-        }
-      }, 1000);
+      if (closed) return;
 
-      // Clean up on close
-      c.req.raw.signal.addEventListener('abort', () => {
-        clearInterval(interval);
-        controller.close();
-      });
+      // Live tail via the runtime's own follower. This replaces a 1s poll of
+      // getLogs(name, 10) that compared the length of a fixed 10-line tail
+      // window against a running counter: after the first tick the counter
+      // equalled the window size, so `logLines.length > lastLogCount` never
+      // held again and the stream silently went dead for the rest of its life.
+      try {
+        stopTail = await pm.streamLogs(
+          name,
+          (chunk, type) => {
+            for (const line of chunk.split('\n')) {
+              if (line) send(line, type);
+            }
+          },
+          shutdown
+        );
+        // Aborted while the tailer was still being attached.
+        if (closed) stopTail();
+      } catch {
+        shutdown();
+      }
     },
   });
 
