@@ -1,0 +1,295 @@
+name: Release
+
+# Tag-triggered ONLY. This must never gain a `branches:` trigger: deploy.yml
+# fires on branch pushes and ships to production, and keeping the two trigger
+# surfaces disjoint is what guarantees cutting a release can never deploy prod.
+#
+# `on: push: tags` also cannot be fired by a fork or a pull request, so no
+# outside actor can trigger this workflow once the repo is public. Adding
+# `workflow_dispatch` or `pull_request` here would be a change of security
+# posture, not a convenience.
+on:
+  push:
+    tags:
+      - 'v*'
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  # ───────────────────────────────────────────────────────────────────────────
+  # Build and verify. Runs `npm ci` twice (root + dashboard), so it must NOT
+  # hold a token that can write releases -- one compromised transitive
+  # postinstall would otherwise be able to republish the artifact every user
+  # installs. Publishing is a separate job with the write scope.
+  # ───────────────────────────────────────────────────────────────────────────
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.gates.outputs.version }}
+      prerelease: ${{ steps.gates.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Do not leave a credential in .git/config for every later step.
+          persist-credentials: false
+
+      # ── Cheap gates FIRST ──────────────────────────────────────────────────
+      # Everything here is seconds of work and no network. Running these before
+      # `npm ci` means a bad tag fails immediately instead of after a full
+      # lint + test + two-Vite-build cycle -- which on a tag push is the worst
+      # possible place to fail, because the tag is already public by then.
+      - name: Validate tag, version and changelog
+        id: gates
+        env:
+          # NEVER interpolate ${{ }} directly into a run: block. Actions
+          # substitutes the literal text before the shell parses it, and git
+          # tag names legally contain backticks, $(), ; and quotes -- which
+          # would be arbitrary command execution on the runner.
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z]+)*$ ]]; then
+            echo "::error::Tag '$TAG' is not a valid release tag (expected vX.Y.Z[-suffix])" >&2
+            exit 1
+          fi
+
+          # The tag carries a leading v; package.json does not.
+          VERSION="${TAG#v}"
+          PKG_VERSION="$(node -p "require('./package.json').version")"
+          if [[ "$VERSION" != "$PKG_VERSION" ]]; then
+            echo "::error::Tag $TAG implies version $VERSION but package.json says $PKG_VERSION. Run 'npm run release $VERSION' and re-tag." >&2
+            exit 1
+          fi
+
+          # The CHANGELOG section for this exact version must exist. This is
+          # what keeps the changelog current without generating it: no section,
+          # no release.
+          if ! grep -qF "## [$VERSION]" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md has no '## [$VERSION]' section. Release notes are extracted from it, so add one before tagging." >&2
+            exit 1
+          fi
+
+          # GitHub treats any tag with a prerelease suffix as not-Latest.
+          if [[ "$VERSION" == *-* ]]; then PRERELEASE=true; else PRERELEASE=false; fi
+
+          {
+            echo "version=$VERSION"
+            echo "prerelease=$PRERELEASE"
+          } >> "$GITHUB_OUTPUT"
+          echo "Releasing $VERSION (prerelease=$PRERELEASE)"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install server dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Build server
+        run: npm run build:server
+
+      - name: Test
+        run: npm test
+
+      - name: Install dashboard dependencies
+        working-directory: src/dashboard
+        run: npm ci
+
+      - name: Build dashboard
+        working-directory: src/dashboard
+        run: npm run build
+
+      - name: Build public site
+        working-directory: src/dashboard
+        run: npm run build:site
+
+      # ── Guards mirrored from deploy.yml ────────────────────────────────────
+      # Keep these in step with deploy.yml. (Better: extract a composite action
+      # so all three workflows share one definition -- ci.yml has already
+      # drifted and lost both of these.)
+      - name: Verify site bundle exists
+        run: |
+          set -euo pipefail
+          if [ ! -f dist/site/index.html ]; then
+            echo "::error::dist/site/index.html missing after build:site -- the marketing site would ship with no frontend" >&2
+            exit 1
+          fi
+
+      - name: Verify dashboard/site bundle split (DROP-070)
+        run: |
+          set -euo pipefail
+          if grep -q 'drop-token\|ConfirmDialog\|qrcode' dist/site/assets/*.js; then
+            echo "::error::dist/site JS references admin-only code -- the marketing/dashboard bundle split has regressed" >&2
+            exit 1
+          fi
+
+      # ── Version gate ───────────────────────────────────────────────────────
+      # The UI version is a BUILD-TIME Vite `define` (__DROP_VERSION__ from the
+      # root package.json), so it can only be verified in built output -- this
+      # is the DROP-077 lesson, where three components carried a hardcoded
+      # version through two release cuts.
+      #
+      # grep -F is load-bearing. As a REGEX, "1.0.0" matches lucide-react SVG
+      # path data (`a2 2 0 0 0`, where . matches the spaces) -- measured at 28
+      # false hits in dist/site. The quoted form has exactly one hit per bundle.
+      #
+      # Match the bare quoted version, NOT `v$VERSION`: SiteNav renders
+      # `v{__DROP_VERSION__}`, which compiles to children:["v","1.0.0"] -- so
+      # `v1.0.0` is not contiguous in the site bundle and would fail there
+      # while passing in the dashboard.
+      - name: Verify built bundles carry the release version
+        env:
+          VERSION: ${{ steps.gates.outputs.version }}
+        run: |
+          set -euo pipefail
+          for bundle_dir in dist/dashboard/assets dist/site/assets; do
+            if ! grep -qrF "\"$VERSION\"" "$bundle_dir"/*.js; then
+              echo "::error::$bundle_dir does not contain \"$VERSION\" -- the __DROP_VERSION__ define did not reach this bundle" >&2
+              exit 1
+            fi
+            echo "OK: $bundle_dir carries \"$VERSION\""
+          done
+
+      - name: Extract release notes from CHANGELOG
+        env:
+          VERSION: ${{ steps.gates.outputs.version }}
+        run: |
+          set -euo pipefail
+          # sed, NOT awk. `awk '/start/,/end/'` tests the end pattern against
+          # the START line too, so the range collapses to the heading alone --
+          # and the "section exists" gate above would still pass, shipping a
+          # one-line release body. sed never tests addr2 on the addr1 line.
+          #
+          # Anchored on the specific version, never positionally: a positional
+          # "first section" extractor silently grabs [Unreleased].
+          #
+          # Terminator is `## ` (any h2, since `## Roadmap` exists and is not a
+          # version), a link-reference line, or a horizontal rule.
+          ESCAPED="${VERSION//./\\.}"
+          sed -n -E "/^## \[${ESCAPED}\]/,/^(## |\[.*\]:|---$)/p" CHANGELOG.md \
+            | sed -E '$ { /^(## |\[.*\]:|---$)/d }' > RELEASE_NOTES.md
+
+          if [ "$(wc -l < RELEASE_NOTES.md)" -lt 2 ]; then
+            echo "::error::Extracted release notes are empty beyond the heading. Check the CHANGELOG heading format." >&2
+            cat RELEASE_NOTES.md >&2
+            exit 1
+          fi
+          echo "Extracted $(wc -l < RELEASE_NOTES.md) lines of release notes."
+
+      # ── Package ────────────────────────────────────────────────────────────
+      # Unlike deploy.yml's internal artifact, the public tarball carries
+      # LICENSE, README and CHANGELOG: this is an MIT-licensed public download
+      # and the notice must accompany it. package.json's own `files` field says
+      # the same. VERSION lets a user identify an already-downloaded archive.
+      - name: Package release artifact
+        env:
+          VERSION: ${{ steps.gates.outputs.version }}
+        run: |
+          set -euo pipefail
+          echo "$VERSION" > VERSION
+          tar -czf drop-dist.tar.gz \
+            dist/ install.sh package.json package-lock.json \
+            LICENSE README.md CHANGELOG.md VERSION
+          sha256sum drop-dist.tar.gz > drop-dist.tar.gz.sha256
+          sha256sum install.sh > install.sh.sha256
+          cat drop-dist.tar.gz.sha256 install.sh.sha256
+
+      - name: Upload artifact for publish job
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-assets
+          path: |
+            drop-dist.tar.gz
+            drop-dist.tar.gz.sha256
+            install.sh
+            install.sh.sha256
+            RELEASE_NOTES.md
+          retention-days: 1
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # Publish. Holds the write scope; runs no npm and no project code.
+  # ───────────────────────────────────────────────────────────────────────────
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      # Required by attest-build-provenance for keyless signing.
+      id-token: write
+      attestations: write
+    steps:
+      - name: Download built assets
+        uses: actions/download-artifact@v4
+        with:
+          name: release-assets
+
+      # A .sha256 fetched from the same origin as the artifact proves integrity,
+      # not authenticity -- whoever can publish the asset publishes both halves.
+      # Provenance attestation is the part users can actually verify:
+      #   gh attestation verify drop-dist.tar.gz --repo JulesNsenda/drop
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            drop-dist.tar.gz
+            install.sh
+
+      # install.sh is uploaded as a standalone asset, not only inside the
+      # tarball: the documented install command curls
+      # releases/latest/download/install.sh, and that path resolves ONLY for
+      # uploaded release assets.
+      #
+      # create-or-edit rather than plain create, so re-tagging after a bad cut
+      # does not fail at the last step following a full build.
+      - name: Publish GitHub Release
+        env:
+          # `permissions:` sets the token's SCOPE; the gh CLI still reads the
+          # token from the environment and exits with an auth error otherwise.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+          VERSION: ${{ needs.build.outputs.version }}
+          PRERELEASE: ${{ needs.build.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+
+          PRERELEASE_FLAG=""
+          if [ "$PRERELEASE" = "true" ]; then PRERELEASE_FLAG="--prerelease"; fi
+
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $TAG exists -- updating notes and clobbering assets."
+            gh release edit "$TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "DROP $VERSION" \
+              --notes-file RELEASE_NOTES.md
+          else
+            gh release create "$TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "DROP $VERSION" \
+              --notes-file RELEASE_NOTES.md \
+              $PRERELEASE_FLAG
+          fi
+
+          gh release upload "$TAG" \
+            drop-dist.tar.gz \
+            drop-dist.tar.gz.sha256 \
+            install.sh \
+            install.sh.sha256 \
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber
+
+          echo "Published: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/tag/$TAG"
+
+      # Recovery, if you ever need it:
+      #   gh release delete vX.Y.Z --yes && git push --delete origin vX.Y.Z
