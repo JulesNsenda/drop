@@ -97,6 +97,51 @@ async function waitPastSecondBoundary(): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, 1100));
 }
 
+/**
+ * Sleep until just after the next whole-second boundary.
+ *
+ * The mirror image of `waitPastSecondBoundary`. A test that needs two
+ * operations to land in the SAME wall-clock second (because it is pinning the
+ * `iat`-floors-to-seconds behaviour) is racing whatever fraction of a second
+ * happens to be left when it starts. Beginning right after a boundary gives
+ * the pair a full second of slack instead of a random remainder.
+ *
+ * Not sufficient alone — see `withinOneSecond` — but it turns a coin flip
+ * into an unlikely loss.
+ */
+async function alignToSecondStart(): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, 1000 - (Date.now() % 1000) + 5));
+}
+
+/**
+ * Run `attempt` until its two halves provably landed in the same wall-clock
+ * second, or give up loudly.
+ *
+ * `DROP-130 HIGH-3` pins what happens when a JWT is re-issued inside the same
+ * second as a reset: `iat` truncates to whole seconds, so it floors to at-or-
+ * before the millisecond-precision stamp and the credential is correctly
+ * rejected. Reproducing that state means winning a race, and losing it does
+ * not produce a different assertion — it produces a DIFFERENT SCENARIO (the
+ * token now postdates the stamp, so the mustChangePassword gate answers 403
+ * instead). That is not a flaky assertion, it is a test that silently stopped
+ * testing what it claims to.
+ *
+ * So: detect the lost race explicitly and retry, rather than asserting into
+ * it. Bounded, so a pathologically slow machine fails with a clear message
+ * instead of looping. This file has twice gone red in CI on exactly this.
+ */
+async function inSameSecondAs<T>(attempt: () => Promise<{ ok: boolean; value: T }>): Promise<T> {
+  for (let i = 0; i < 8; i++) {
+    await alignToSecondStart();
+    const { ok, value } = await attempt();
+    if (ok) return value;
+  }
+  throw new Error(
+    'Could not complete a reset+login pair inside one wall-clock second after 8 attempts — ' +
+      'the machine is too slow for this scenario to be reproduced.'
+  );
+}
+
 describe('credentialsInvalidBefore (DROP-130 Items 4 & 5)', () => {
   let tmpDir: string;
   let credentialsPath: string;
@@ -570,8 +615,19 @@ describe('credentialsInvalidBefore (DROP-130 Items 4 & 5)', () => {
       const before = await loginToken('bob-jwt-reset', PASSWORD);
       expect((await probeJwt(before)).status).toBe(200);
 
-      await resetUserPassword(bob.id, 'new-password-123456');
-      const after = await loginToken('bob-jwt-reset', 'new-password-123456');
+      // Retry until the reset and the re-login provably share a second. If
+      // they straddle a boundary the token postdates the stamp, which is a
+      // different scenario entirely (403 from the mustChangePassword gate) —
+      // asserting into it would mean the test quietly stopped covering HIGH-3.
+      const after = await inSameSecondAs(async () => {
+        const resetAt = Date.now();
+        await resetUserPassword(bob.id, 'new-password-123456');
+        const token = await loginToken('bob-jwt-reset', 'new-password-123456');
+        return {
+          ok: Math.floor(resetAt / 1000) === Math.floor(Date.now() / 1000),
+          value: token,
+        };
+      });
 
       expect((await probeJwt(after)).status).toBe(401);
     });
