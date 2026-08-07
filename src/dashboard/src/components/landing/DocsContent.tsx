@@ -378,7 +378,7 @@ export function DocsBody(): JSX.Element {
         <p style={pStyle}>
           <strong style={{ color: 'var(--text)' }}>DROP</strong> (Deploy, Run, Operate, Publish) is a lightweight,
           self-hosted Platform-as-a-Service built for one move: point it at a folder, and it detects the app type,
-          installs dependencies, builds, provisions a database if the app needs one, and starts it — no Dockerfile,
+          installs dependencies, builds, provisions a database if the app needs one, and starts it. No Dockerfile,
           no build script, no config file for most projects.
         </p>
         <p style={pStyle}>
@@ -389,7 +389,7 @@ export function DocsBody(): JSX.Element {
           <li>
             Hostname routing (<code>myapp.localhost</code>) and automatic HTTPS via Caddy + Let&apos;s Encrypt
           </li>
-          <li>Hot reload — edit files, DROP rebuilds and restarts on the same port</li>
+          <li>Hot reload: edit files, DROP rebuilds and restarts on the same port</li>
           <li>
             PostgreSQL auto-provisioning with <code>DATABASE_URL</code> injected
           </li>
@@ -420,7 +420,7 @@ export function DocsBody(): JSX.Element {
           code={`git clone https://github.com/JulesNsenda/drop.git
 cd drop
 npm install
-# The dashboard is a separate package — install its deps once:
+# The dashboard is a separate package. Install its deps once:
 (cd src/dashboard && npm install)
 npm run build        # compiles the server AND builds the dashboard
 npm link             # makes the 'drop' command available globally`}
@@ -434,7 +434,7 @@ npm link             # makes the 'drop' command available globally`}
         <h3 style={h3Style}>Production bootstrap</h3>
         <p style={pStyle}>
           For a real server, <code>install.sh --bootstrap</code> installs Node.js 20, PostgreSQL, Caddy, and a C
-          toolchain, creates a dedicated system user, and registers a systemd service —{' '}
+          toolchain, creates a dedicated system user, and registers a systemd service.{' '}
           <strong style={{ color: 'var(--text)' }}>without</strong> fetching or starting any application code. Wire
           it to a CI pipeline (or an scp'd build) to ship the actual code on every push.
         </p>
@@ -474,7 +474,7 @@ cp -r my-app /var/drop/data/webapps/`}
           <li>Starts it on an assigned port</li>
         </ol>
         <p style={pStyle}>
-          Reach it directly at <code>http://localhost:&lt;port&gt;</code>, or — with Caddy installed — at{' '}
+          Reach it directly at <code>http://localhost:&lt;port&gt;</code>, or, with Caddy installed, at{' '}
           <code>http://my-app.localhost</code>. Edit any file in the app afterward and DROP detects the change,
           rebuilds, and restarts it on the same port automatically.
         </p>
@@ -487,7 +487,7 @@ cp -r my-app /var/drop/data/webapps/`}
           <a href="/dashboard/apps" style={linkStyle}>
             dashboard
           </a>{' '}
-          or the CLI — see the{' '}
+          or the CLI. See the{' '}
           <Link to="/reference" style={linkStyle}>
             CLI &amp; API reference
           </Link>{' '}
@@ -497,7 +497,7 @@ cp -r my-app /var/drop/data/webapps/`}
 
       <Section id="drop-yaml" title="drop.yaml">
         <p style={pStyle}>
-          Zero config covers most apps. For the rest, drop a <code>drop.yaml</code> in the app's root — DROP rejects
+          Zero config covers most apps. For the rest, drop a <code>drop.yaml</code> in the app's root. DROP rejects
           any field that isn't in the schema below, so typos fail loudly instead of silently doing nothing.
         </p>
         <CodeBlock
@@ -534,24 +534,24 @@ timeout: 30`}
             ['domains', 'Custom hostnames routed to this app'],
             ['tls.certFile / tls.keyFile / tls.disabled', 'Bring your own certificate, or disable HTTPS for this app'],
             ['database', 'Provision a database for this app (e.g. postgres) and inject DATABASE_URL'],
-            ['redis', 'Provision managed Redis — a per-app logical DB, injected as REDIS_URL'],
+            ['redis', 'Provision managed Redis: a per-app logical DB, injected as REDIS_URL'],
             ['env', 'Static environment variables, available at build and run time (string, number, or boolean)'],
-            ['build_env', "Build-only variables — merged into the build, never into the running app. For values a bundler inlines (Vite's VITE_*) that shouldn't linger in the runtime env"],
-            ['secrets', 'Declare the secrets this app cannot start without — see below'],
+            ['build_env', "Build-only variables, merged into the build and never into the running app. For values a bundler inlines (Vite's VITE_*) that shouldn't linger in the runtime env"],
+            ['secrets', 'Declare the secrets this app cannot start without (see below)'],
             ['depends_on', "Inject another app's URL into an env var: { name, env, path? }"],
             ['port', 'Pin a specific port instead of auto-assignment'],
             ['build / start', 'Override the detected build/start command'],
             ['healthCheck', 'Path used for readiness checks'],
             ['maxBodySize', 'Max request body size for this app (e.g. 100MB)'],
             ['timeout', 'Request timeout in seconds'],
-            ['group / services', 'Deploy several services from one repo — see Monorepos below'],
+            ['group / services', 'Deploy several services from one repo (see Monorepos below)'],
             ['route', 'Mount this app under a path prefix on a shared group hostname: { path, strip? }'],
-            ['mcp', 'Declare this app an MCP server: { path, auth } — see below'],
+            ['mcp', 'Declare this app an MCP server: { path, auth } (see below)'],
           ]}
         />
         <p style={pStyle}>
           Unknown top-level or <code>tls</code> keys are rejected outright, and <code>drop.yaml</code> values never
-          reach container run arguments or mount specs directly — it's config, not a code-execution surface.
+          reach container run arguments or mount specs directly. It is config, not a code-execution surface.
         </p>
 
         <h3 style={h3Style}>Required secrets</h3>
@@ -564,12 +564,12 @@ timeout: 30`}
           rows={[
             ['KEY: generate', 'DROP fills a strong random value if the secret is unset'],
             ['KEY: true (or "required")', 'Required, supplied by you'],
-            ['KEY: { required, generate, description }', 'Long form — description is shown in the dashboard prompt'],
+            ['KEY: { required, generate, description }', 'Long form; the description is shown in the dashboard prompt'],
           ]}
         />
         <p style={pStyle}>
           If a required secret has no value and cannot be generated, the app is parked in a{' '}
-          <code>needs-config</code> status rather than started — it appears that way in the dashboard, the API, and
+          <code>needs-config</code> status rather than started, and it appears that way in the dashboard, the API, and
           MCP tool results, naming the keys it is waiting for. Set them (dashboard, or{' '}
           <code>PUT /api/v1/secrets/:name</code>) and restart.
         </p>
@@ -578,7 +578,7 @@ timeout: 30`}
         <p style={pStyle}>
           A repo holding a backend and a frontend deploys as one unit. The root <code>drop.yaml</code> names a{' '}
           <code>group</code> and lists <code>services</code>; each service becomes its own app, and they share one
-          hostname — so the frontend can call the backend same-origin at <code>/api</code>, with no CORS:
+          hostname, so the frontend can call the backend same-origin at <code>/api</code>, with no CORS:
         </p>
         <CodeBlock
           label="drop.yaml"
@@ -598,7 +598,7 @@ services:
         />
         <p style={pStyle}>
           Both are then reachable under <code>ezsign.&lt;your-domain&gt;</code>. Each service entry accepts most of
-          the per-app fields above — <code>type</code>, <code>build</code>, <code>start</code>, <code>env</code>,{' '}
+          the per-app fields above: <code>type</code>, <code>build</code>, <code>start</code>, <code>env</code>,{' '}
           <code>build_env</code>, <code>secrets</code>, <code>database</code>, <code>redis</code>,{' '}
           <code>healthCheck</code>, <code>domains</code>, and <code>depends_on</code>.
         </p>
@@ -609,7 +609,7 @@ services:
         </p>
         <CodeBlock label="drop.yaml" code={`mcp:\n  path: /mcp      # default\n  auth: drop      # or 'none' (the default)`} />
         <p style={pStyle}>
-          <code>auth: none</code> means DROP does not guard the endpoint — it is public unless your app authenticates
+          <code>auth: none</code> means DROP does not guard the endpoint, so it is public unless your app authenticates
           callers itself, and the dashboard says so plainly. <code>auth: drop</code> puts DROP's OAuth in front of it:
           callers present a token audienced at <em>that</em> app, and only DROP users who can access the app get
           through. Opting in is your decision; DROP never infers it.
@@ -625,29 +625,29 @@ services:
             ['DROP_APPS_DIR', '{root}/data/webapps', 'Apps directory watched for deploys'],
             ['DROP_API_PORT', '3000', 'Port for the REST API and dashboard'],
             ['DROP_LOG_LEVEL', 'info', 'Log level: debug, info, warn, error'],
-            ['DROP_PUBLIC_URL', '(unset)', 'The public HTTPS origin of this DROP. Required for the claude.ai connector — every OAuth endpoint fails closed without it, rather than trusting the Host header'],
+            ['DROP_PUBLIC_URL', '(unset)', 'The public HTTPS origin of this DROP. Required for the claude.ai connector, since every OAuth endpoint fails closed without it, rather than trusting the Host header'],
             ['DROP_DISABLE_AUTH', 'false', 'Turn API auth off entirely (single-operator boxes). Auth is on by default'],
-            ['DROP_ISOLATION', 'none', 'Runtime isolation mode — none runs apps under PM2, docker runs each in a container'],
+            ['DROP_ISOLATION', 'none', 'Runtime isolation mode: none runs apps under PM2, docker runs each in a container'],
             ['DROP_ENABLE_REDIS', 'true', 'Run the bundled managed Redis'],
-            ['DROP_MAX_APPS_PER_USER', '5', 'Default per-user app quota — a per-user override wins, and admins are unlimited. Companion limits exist for disk, memory, CPU, and databases'],
+            ['DROP_MAX_APPS_PER_USER', '5', 'Default per-user app quota; a per-user override wins, and admins are unlimited. Companion limits exist for disk, memory, CPU, and databases'],
           ]}
         />
         <h3 style={h3Style}>Injected into every app</h3>
         <DocTable
           headers={['Variable', 'Description']}
           rows={[
-            ['PORT', 'The port assigned to the app — bind to this, not a hardcoded port'],
+            ['PORT', 'The port assigned to the app. Bind to this, not a hardcoded port'],
             ['DROP_DATA_DIR', 'Persistent data directory that survives redeploys (see below)'],
             ['DATABASE_URL', 'PostgreSQL connection string, only if a database was provisioned'],
             ['REDIS_URL', "Managed Redis connection string, only if the app's drop.yaml asked for redis: true"],
-            ['DROP_API_URL', "Base URL for DROP's own REST API — http://drop-host:<apiPort> under docker isolation, http://127.0.0.1:<apiPort> otherwise"],
-            ['DROP_API_KEY', "Least-privilege, scoped API key for calling DROP's own API — injected only for apps an admin has granted capabilities (never a full admin key)"],
+            ['DROP_API_URL', "Base URL for DROP's own REST API: http://drop-host:<apiPort> under docker isolation, http://127.0.0.1:<apiPort> otherwise"],
+            ['DROP_API_KEY', "Least-privilege, scoped API key for calling DROP's own API, injected only for apps an admin has granted capabilities (never a full admin key)"],
           ]}
         />
         <p style={pStyle}>
           On top of those, DROP injects any per-app secrets set via the secrets API/dashboard, static values from{' '}
           <code>drop.yaml</code>'s <code>env</code> block, and <code>depends_on</code>-resolved URLs from other apps.
-          Values in <code>build_env</code> are the exception — they reach the build and stop there.
+          Values in <code>build_env</code> are the exception: they reach the build and stop there.
         </p>
       </Section>
 
@@ -663,15 +663,15 @@ const uploadsPath = path.join(dataDir, 'uploads', filename);`}
         />
         <p style={pStyle}>
           Typical layout: <code>uploads/</code> for user-uploaded files, <code>logs/</code> for custom app logs, and{' '}
-          <code>cache/</code> for anything disposable. Anything written outside <code>DROP_DATA_DIR</code> — inside
-          the app's own source folder — is not guaranteed to survive a redeploy.
+          <code>cache/</code> for anything disposable. Anything written outside <code>DROP_DATA_DIR</code>, inside
+          the app's own source folder, is not guaranteed to survive a redeploy.
         </p>
       </Section>
 
       <Section id="runtimes" title="Runtimes &amp; framework detection">
         <p style={pStyle}>
-          On every deploy, DROP runs a detector chain in priority order — manifest override → Node.js → Python → Go →
-          Docker → static — and takes the best match. Static sits last on purpose: it's the fallback, so a project
+          On every deploy, DROP runs a detector chain in priority order (manifest override → Node.js → Python → Go →
+          Docker → static) and takes the best match. Static sits last on purpose: it's the fallback, so a project
           that is also something else is never mistaken for one.
         </p>
         <DocTable
@@ -682,7 +682,7 @@ const uploadsPath = path.join(dataDir, 'uploads', filename);`}
             ['Express / Fastify / Hono', 'Dependencies in package.json', 'npm install + runs the start script'],
             ['Python', 'requirements.txt, pyproject.toml, setup.py, or Pipfile', 'Creates a venv, installs, and runs the entry point (app.py, main.py, wsgi.py, manage.py, …)'],
             ['FastAPI / Flask / Django', 'Declared dependencies', 'Installed and started with the right server for the framework'],
-            ['Go', 'go.mod', 'go build + runs the binary — gin, fiber, echo, chi, gorilla and others are recognised'],
+            ['Go', 'go.mod', 'go build + runs the binary; gin, fiber, echo, chi, gorilla and others are recognised'],
             ['Docker', 'Dockerfile', 'docker build + docker run'],
             ['Static site', 'index.html (root or a build output dir)', 'Served with the built-in static server'],
             ['SPA', 'index.html + a framework', 'Served with SPA fallback routing'],
@@ -696,7 +696,7 @@ const uploadsPath = path.join(dataDir, 'uploads', filename);`}
 
       <Section id="routing-https" title="Routing &amp; HTTPS">
         <p style={pStyle}>
-          When Caddy is installed, DROP configures hostname-based routing automatically — each deployed app gets a{' '}
+          When Caddy is installed, DROP configures hostname-based routing automatically, and each deployed app gets a{' '}
           <code>.localhost</code> hostname that modern browsers resolve without editing <code>/etc/hosts</code>:
         </p>
         <CodeBlock
@@ -716,7 +716,7 @@ api.localhost     →  localhost:3002`}
         <p style={pStyle}>DROP provisions and renews Let's Encrypt certificates with zero extra configuration:</p>
         <CodeBlock label="shell" code={`drop serve --domain example.com --https --acme-email admin@example.com`} />
         <p style={pStyle}>
-          For wildcard certificates (<code>*.example.com</code>), use a DNS-01 challenge — supported providers:{' '}
+          For wildcard certificates (<code>*.example.com</code>), use a DNS-01 challenge. Supported providers:{' '}
           <code>cloudflare</code>, <code>route53</code>, <code>digitalocean</code>, <code>godaddy</code>.
         </p>
         <CodeBlock
@@ -735,7 +735,7 @@ drop serve --domain example.com --https --wildcard --dns-provider cloudflare`}
 
       <Section id="databases" title="Databases">
         <p style={pStyle}>
-          DROP bundles its own PostgreSQL — but it's a runtime service <em>for your deployed apps</em>, not where
+          DROP bundles its own PostgreSQL, but it is a runtime service <em>for your deployed apps</em>, not where
           the platform stores its own state (that lives in flat files under <code>data/drop-svc/</code>). When an app
           needs a database, DROP provisions a dedicated one and injects <code>DATABASE_URL</code>:
         </p>
@@ -743,20 +743,20 @@ drop serve --domain example.com --https --wildcard --dns-provider cloudflare`}
           headers={['DROP provisions when…', 'Details']}
           rows={[
             ['drop.yaml says database: postgres', 'The explicit form. Always wins, and the only way to ask for one from a non-Node app'],
-            ['A Postgres client or ORM is in package.json', 'pg, pg-promise, postgres, slonik, @prisma/client, prisma, drizzle-orm, knex, sequelize, typeorm, objection, @mikro-orm/postgresql — in dependencies or devDependencies'],
+            ['A Postgres client or ORM is in package.json', 'pg, pg-promise, postgres, slonik, @prisma/client, prisma, drizzle-orm, knex, sequelize, typeorm, objection, @mikro-orm/postgresql, in dependencies or devDependencies'],
             ['An ORM config file is present', 'prisma/schema.prisma, drizzle.config.*, knexfile.*, ormconfig.json, typeorm.config.ts, sequelize.config.js, .sequelizerc'],
           ]}
         />
         <Callout tone="warn">
           A <strong style={{ color: 'var(--text)' }}>MySQL, MongoDB or SQLite</strong> driver does not trigger
-          provisioning — DROP only runs PostgreSQL, and a <code>postgres://</code> URL an app can't use would be
+          provisioning. DROP only runs PostgreSQL, and a <code>postgres://</code> URL an app cannot use would be
           worse than none. Those apps bring their own database. Detection also reads{' '}
           <code>package.json</code> only, so a Python or Go app asks with <code>database: postgres</code> in{' '}
           <code>drop.yaml</code>. (<code>database: sqlite</code> is accepted, but provisions PostgreSQL and logs a
-          warning — DROP has no SQLite provisioner.)
+          warning, since DROP has no SQLite provisioner.)
         </Callout>
         <p style={pStyle}>
-          Provisioning happens when an app is <em>deployed</em>, not on a plain restart — so an app that only just
+          Provisioning happens when an app is <em>deployed</em>, not on a plain restart, so an app that only just
           became database-shaped needs a redeploy, not a <code>restart</code>. And if your per-user database quota
           is already full, the app still starts, but without a <code>DATABASE_URL</code>: check the platform log for
           a quota warning if one goes missing.
@@ -773,7 +773,7 @@ const pool = new Pool({ connectionString: process.env.DATABASE_URL });`}
         />
         <p style={pStyle}>
           The bundled server is locked to <code>scram-sha-256</code> authentication with its unix socket restricted
-          to peer auth. Snapshot everything — file stores and every provisioned database — with{' '}
+          to peer auth. Snapshot everything, file stores and every provisioned database, with{' '}
           <code>drop backup</code>; see the{' '}
           <Link to="/reference" style={linkStyle}>
             CLI reference
@@ -782,7 +782,7 @@ const pool = new Pool({ connectionString: process.env.DATABASE_URL });`}
         </p>
         <h3 style={h3Style}>Redis</h3>
         <p style={pStyle}>
-          DROP also bundles a managed Redis. Unlike Postgres it is opt-in — ask for it with <code>redis: true</code>{' '}
+          DROP also bundles a managed Redis. Unlike Postgres it is opt-in: ask for it with <code>redis: true</code>{' '}
           in <code>drop.yaml</code> and the app gets its own logical database with <code>REDIS_URL</code> injected:
         </p>
         <CodeBlock
@@ -792,13 +792,13 @@ const pool = new Pool({ connectionString: process.env.DATABASE_URL });`}
         <p style={pStyle}>
           It is a convenience, not a hard dependency: on a platform where Redis is disabled (
           <code>DROP_ENABLE_REDIS=false</code>) apps simply start without <code>REDIS_URL</code>, the same way they
-          do when Postgres is unavailable — so an app that can fall back should check for the variable.
+          do when Postgres is unavailable, so an app that can fall back should check for the variable.
         </p>
       </Section>
 
       <Section id="logs" title="Logs">
         <p style={pStyle}>
-          DROP automatically captures every app's stdout/stderr to dated log files — no setup required:
+          DROP automatically captures every app's stdout/stderr to dated log files, with no setup required:
         </p>
         <CodeBlock
           label="data/logs/webapps/my-app/"
@@ -825,30 +825,30 @@ fs.appendFileSync(\`\${logDir}/logs/app.json\`, JSON.stringify(logEntry) + '\\n'
         <p style={pStyle}>
           DROP runs a hosted <strong style={{ color: 'var(--text)' }}>MCP server</strong> at{' '}
           <code>/api/v1/mcp</code>. Connect <strong style={{ color: 'var(--text)' }}>claude.ai</strong> to it as a
-          custom connector and Claude can deploy and manage your apps in plain language — through the tools{' '}
+          custom connector and Claude can deploy and manage your apps in plain language, through the tools{' '}
           <code>deploy_files</code>, <code>deploy_from_git</code>, <code>list_apps</code>, <code>app_status</code>,{' '}
           <code>app_logs</code>, <code>get_deploy_logs</code>, and <code>restart_app</code>. The web connector
-          authenticates with OAuth, so you sign into your own DROP account and approve access — no API keys to paste.
+          authenticates with OAuth, so you sign into your own DROP account and approve access. There are no API keys to paste.
         </p>
         <Callout tone="warn">
           The web connector needs a DROP reachable over public HTTPS, with <code>DROP_PUBLIC_URL</code> set to that
           origin (e.g. <code>https://drop.example.com</code>). Every OAuth endpoint fails closed until it is set, and
-          claude.ai cannot reach a <code>localhost</code> DROP — for a local box, use Claude Code or Cursor (below).
+          claude.ai cannot reach a <code>localhost</code> DROP. For a local box, use Claude Code or Cursor (below).
         </Callout>
 
         <h3 style={h3Style}>1. Get your connector details</h3>
         <p style={pStyle}>
           In the DROP dashboard, open{' '}
           <strong style={{ color: 'var(--text)' }}>Settings → Claude (MCP)</strong>. Admin and user accounts see
-          this tab (a read-only account does not) — it shows the{' '}
+          this tab (a read-only account does not). It shows the{' '}
           <strong style={{ color: 'var(--text)' }}>MCP Server URL</strong> and{' '}
           <strong style={{ color: 'var(--text)' }}>OAuth Client ID</strong> with copy buttons, and confirms the Client
-          Secret stays blank. The Client ID is the same for the whole server and is not a secret — hand it to anyone
+          Secret stays blank. The Client ID is the same for the whole server and is not a secret, so hand it to anyone
           who should connect.
         </p>
         <p style={pStyle}>
           If the tab says connector setup isn't available, an administrator has either turned it off or hasn't
-          finished the one-time setup yet — ask them to check Settings → Claude (MCP) on their own account.
+          finished the one-time setup yet. Ask them to check Settings → Claude (MCP) on their own account.
         </p>
         <p style={pStyle}>Prefer a script? The same values come from the API:</p>
         <CodeBlock
@@ -863,7 +863,7 @@ fs.appendFileSync(\`\${logDir}/logs/app.json\`, JSON.stringify(logEntry) + '\\n'
 #       "mcp_url": "https://drop.example.com/api/v1/mcp" } }`}
         />
         <p style={pStyle}>
-          That call reads an already-minted client_id — on a fresh install where no one has opened the tab yet, it
+          That call reads an already-minted client_id, so on a fresh install where no one has opened the tab yet, it
           404s. An admin mints it once (opening the tab does this automatically, or run it directly):
         </p>
         <CodeBlock
@@ -882,7 +882,7 @@ fs.appendFileSync(\`\${logDir}/logs/app.json\`, JSON.stringify(logEntry) + '\\n'
           rows={[
             ['Remote MCP server URL', 'https://drop.example.com/api/v1/mcp'],
             ['OAuth Client ID', 'the client_id from step 1'],
-            ['OAuth Client Secret', 'leave blank — DROP uses PKCE, no client secret'],
+            ['OAuth Client Secret', 'leave blank; DROP uses PKCE, no client secret'],
           ]}
         />
 
@@ -893,7 +893,7 @@ fs.appendFileSync(\`\${logDir}/logs/app.json\`, JSON.stringify(logEntry) + '\\n'
           the connector live.
         </p>
         <Callout>
-          The connection is scoped to your DROP user — Claude only sees and touches{' '}
+          The connection is scoped to your DROP user, so Claude only sees and touches{' '}
           <strong style={{ color: 'var(--text)' }}>your</strong> apps, exactly like a <code>user</code>-role API key
           (whose role is itself a ceiling capped by its owner's account role, never a fixed grant). There is no{' '}
           <code>set_secrets</code> or <code>remove_app</code> tool, so a connected agent can never read secrets or
@@ -910,10 +910,10 @@ fs.appendFileSync(\`\${logDir}/logs/app.json\`, JSON.stringify(logEntry) + '\\n'
 
       <Section id="mcp-clients" title="Claude Code, Cursor &amp; agents">
         <p style={pStyle}>
-          MCP clients that support request headers — <strong style={{ color: 'var(--text)' }}>Claude Code</strong>,{' '}
+          MCP clients that support request headers, such as <strong style={{ color: 'var(--text)' }}>Claude Code</strong>,{' '}
           <strong style={{ color: 'var(--text)' }}>Claude Desktop</strong>, and{' '}
-          <strong style={{ color: 'var(--text)' }}>Cursor</strong> — skip OAuth and authenticate with a DROP API key.
-          Mint a <code>user</code>-role key in the dashboard (never an admin key — a <code>user</code> key is
+          <strong style={{ color: 'var(--text)' }}>Cursor</strong>, skip OAuth and authenticate with a DROP API key.
+          Mint a <code>user</code>-role key in the dashboard (never an admin key; a <code>user</code> key is
           automatically scoped to the apps it creates). A key's role is a ceiling capped by its owner's own account
           role, not a fixed grant.
         </p>
@@ -924,7 +924,7 @@ fs.appendFileSync(\`\${logDir}/logs/app.json\`, JSON.stringify(logEntry) + '\\n'
   --header "Authorization: Bearer <user-api-key>"`}
         />
         <CodeBlock
-          label="Cursor — .cursor/mcp.json"
+          label="Cursor · .cursor/mcp.json"
           code={`{
   "mcpServers": {
     "dropkit": {
@@ -938,23 +938,23 @@ fs.appendFileSync(\`\${logDir}/logs/app.json\`, JSON.stringify(logEntry) + '\\n'
         <DocTable
           headers={['Tool', 'What it does']}
           rows={[
-            ['deploy_files', 'Deploy from inline file contents — small/AI-generated apps (≤48 files, 1.5 MB text)'],
+            ['deploy_files', 'Deploy from inline file contents, for small/AI-generated apps (≤48 files, 1.5 MB text)'],
             ['deploy_from_git', 'Deploy a new app by cloning a GitHub repo (optional branch)'],
             ['list_apps', 'List the apps you can see'],
             ['app_status', "An app's status, type, port, and URL"],
             ['app_logs', 'Recent runtime stdout/stderr (returned as untrusted data)'],
-            ['get_deploy_logs', 'Build or runtime output for a specific deploy — the one to use after a failure, since app_logs only sees a running app'],
+            ['get_deploy_logs', 'Build or runtime output for a specific deploy. The one to use after a failure, since app_logs only sees a running app'],
             ['restart_app', 'Stop and restart an app on its existing port'],
           ]}
         />
         <Callout>
           <code>deploy_files</code> can also create an <strong style={{ color: 'var(--text)' }}>ephemeral</strong> app:
           pass <code>ephemeral: true</code> (with an optional <code>ttlMinutes</code>, default 60) and DROP hands back
-          a randomly-named throwaway that deletes itself — database included — when its lifetime runs out. Good for a
+          a randomly-named throwaway that deletes itself, database included, when its lifetime runs out. Good for a
           scratch test an agent runs and forgets; never for anything you want to keep.
         </Callout>
         <p style={pStyle}>
-          The same key drives the shell-only tarball-upload recipe (no MCP client needed) — see the{' '}
+          The same key drives the shell-only tarball-upload recipe (no MCP client needed). See the{' '}
           <Link to="/reference" style={linkStyle}>
             reference
           </Link>{' '}
