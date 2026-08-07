@@ -47,6 +47,33 @@ import {
 const PASSWORD = 'pw-bob-123456';
 const AUD = 'https://drop.example.com/api/v1/mcp';
 
+/**
+ * Block until the wall clock advances at least one millisecond.
+ *
+ * `predatesInvalidationStamp` compares `mintedMs < stampMs` — STRICTLY less
+ * than — and both sides are `new Date().toISOString()` at millisecond
+ * resolution. So a credential minted in the SAME millisecond as the
+ * invalidation stamp does not count as predating it.
+ *
+ * Every test here asserting "issued before suspension" (or "issued after
+ * re-enable") is really asserting an ordering the clock has to be able to
+ * express. Without this, the two operations can complete inside one
+ * millisecond and the assertion inverts — which is a flaky test, not a
+ * product bug, and it fails on FAST machines rather than loaded ones. It cost
+ * a red CI run on `Deploy develop` at 1.0.0 while the same commit passed CI.
+ *
+ * Deliberately not fixed by relaxing the comparison to `<=`: that would just
+ * move the tie-break, making the mirror-image "accepts a token issued AFTER
+ * re-enable" tests flaky instead. The ambiguity at an exact millisecond tie is
+ * real; the tests should not depend on which way it resolves.
+ */
+async function clockTick(): Promise<void> {
+  const start = Date.now();
+  while (Date.now() === start) {
+    await new Promise((resolve) => setTimeout(resolve, 1));
+  }
+}
+
 /** Read the raw credentials file as loosely-typed JSON, for corrupting a record by hand. */
 async function readRawStore(credentialsPath: string): Promise<Record<string, unknown>> {
   return JSON.parse(await fs.readFile(credentialsPath, 'utf-8'));
@@ -127,6 +154,7 @@ describe('credentialsInvalidBefore (DROP-130 Items 4 & 5)', () => {
       const bob = await createUser('bob-key-badcreated', PASSWORD, 'user');
       await suspendUser(bob.id);
       await updateUser(bob.id, { enabled: true });
+      await clockTick();
       const { key } = await createApiKey('bob-key-badcreated-ci', 'user', undefined, undefined, bob.id);
 
       const store = await readRawStore(credentialsPath);
@@ -147,6 +175,7 @@ describe('credentialsInvalidBefore (DROP-130 Items 4 & 5)', () => {
     it('rejects a refresh token issued BEFORE suspension, even after re-enable', async () => {
       const bob = await createUser('bob-refresh', PASSWORD, 'user');
       const refreshToken = await issueRefreshToken(bob.id, 'client-1', 'sid-1');
+      await clockTick();
 
       await suspendUser(bob.id);
       await updateUser(bob.id, { enabled: true });
@@ -158,6 +187,7 @@ describe('credentialsInvalidBefore (DROP-130 Items 4 & 5)', () => {
       const bob = await createUser('bob-refresh-2', PASSWORD, 'user');
       await suspendUser(bob.id);
       await updateUser(bob.id, { enabled: true });
+      await clockTick();
 
       const refreshToken = await issueRefreshToken(bob.id, 'client-1', 'sid-2');
 
@@ -188,6 +218,7 @@ describe('credentialsInvalidBefore (DROP-130 Items 4 & 5)', () => {
     it('rejects an access token minted BEFORE suspension, for the rest of its lifetime', async () => {
       const bob = await createUser('bob-oauth', PASSWORD, 'user');
       const token = await mintOAuthAccessToken(bob, AUD, 'sid-oauth-1');
+      await clockTick();
       expect(await verifyOAuthAccessToken(token, AUD)).not.toBeNull();
 
       await suspendUser(bob.id);
@@ -305,6 +336,7 @@ describe('credentialsInvalidBefore (DROP-130 Items 4 & 5)', () => {
     it('rejects a session JWT issued BEFORE suspension, even after re-enable — the resurrection case', async () => {
       const bob = await createUser('bob-jwt-suspend', PASSWORD, 'user');
       const before = await loginToken('bob-jwt-suspend', PASSWORD);
+      await clockTick();
 
       await suspendUser(bob.id);
       await updateUser(bob.id, { enabled: true });
