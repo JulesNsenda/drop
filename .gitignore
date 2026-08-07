@@ -75,6 +75,9 @@ data/
 .claude/agents/database-expert/
 .claude/skills/db-migrate/
 .claude/skills/deploy-app/
+# Same reason: its entire workflow is "read the PRD, read the TASKS file", and
+# those live under the gitignored docs/specs.
+.claude/skills/implement-feature/
 
 # Package manager locks (choose one and keep it)
 # package-lock.json
@@ -136,10 +139,18 @@ docs/examples/**
 !docs/examples/**/
 !docs/examples/**/*.example
 
+# docs/specs is INTERNAL. The PRD/TASKS/specification set is planning material
+# written for one maintainer: statuses were never maintained (shipped features
+# read "Not Started", deleted code reads "In Progress"), and the 4,940-line
+# DROP-PAAS-SPECIFICATION.md presents SQLite, a drop.db platform store,
+# Prometheus and built-in clustering as the shipped architecture -- none of
+# which exist. Published, it would misinform every reader.
+#
+# FEATURE-INDEX.md is the one exception: rewritten as a standalone, accurate
+# feature list that links to nothing under here.
 !docs/specs/
 docs/specs/**
-!docs/specs/**/
-!docs/specs/**/*.md
+!docs/specs/FEATURE-INDEX.md
 
 drop-test/**
 

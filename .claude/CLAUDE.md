@@ -218,10 +218,17 @@ Two traps worth knowing before debugging env problems:
 
 ### Before Implementing Features
 
-1. Read the PRD: `docs/specs/prd/PRD-XXX-feature-name.md` (51 PRDs exist; index by number — `docs/specs/FEATURE-INDEX.md`).
-2. Read the tasks: `docs/specs/tasks/TASKS-XXX-feature-name.md`.
-3. Create a feature branch from `develop`: `feature/DROP-XXX-description`.
-4. Mark tasks complete in the task file after implementation.
+1. Establish what already exists — `docs/specs/FEATURE-INDEX.md` is the accurate
+   capability list, and `CHANGELOG.md` is the change history. Prefer both over
+   any narrative doc: the code is the only real source of truth.
+2. Create a feature branch from `develop`: `feature/DROP-XXX-description`.
+
+> The per-feature PRD and TASKS documents are **internal planning material and
+> are not in the repository**. They exist on the maintainer's machine under
+> `docs/specs/`, which is gitignored. Their status fields were maintained
+> inconsistently — shipped features read "Not Started", removed code reads
+> "In Progress" — so never treat a PRD as evidence that something does or does
+> not exist. Check the code.
 
 Roadmap and conventions live in `docs/VERSION-ROADMAP.md`, `docs/GIT-BRANCHING-MODEL.md`, and `docs/CLEAN-CODE-GUIDELINES.md`.
 
