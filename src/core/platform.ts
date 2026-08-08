@@ -3932,7 +3932,8 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       }
 
       const detection = await this.detector.detect(appPath, { silent: true });
-      const port = this.allocatePort(appName);
+      const declaredPort = (await parseDropYaml(appPath))?.config?.port;
+      const port = this.allocatePort(appName, declaredPort);
 
       this.logger.appEvent('starting', appName, `port ${port}`);
 
@@ -4931,7 +4932,10 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     detection: DetectionResult,
     buildOutputDir?: string
   ): Promise<{ spec: AppStartSpec; port: number }> {
-    const port = this.allocatePort(appName);
+    // Restart path: honour a declared `port:` here too, or a restart would
+    // quietly hand back the previously auto-allocated port and undo it.
+    const declaredPort = (await parseDropYaml(appPath))?.config?.port;
+    const port = this.allocatePort(appName, declaredPort);
 
     // Ensure data directory exists (preserved across upgrades)
     const dataDir = await this.ensureAppDataDirectory(appName);
@@ -6486,7 +6490,69 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
    * If the app already has a port in config/state and it's available, reuse it
    * Otherwise allocate a new port from the configured range
    */
-  private allocatePort(appName?: string): number {
+  /**
+   * Honour a `port:` declared in the app's own drop.yaml, as a PREFERENCE.
+   *
+   * The field has always been accepted and validated by the parser and then
+   * silently ignored — it never reached this allocator, so an operator who
+   * declared one got an arbitrary port anyway. That matters wherever something
+   * outside DROP hardcodes the port (the apex Caddy host file being the case
+   * that prompted this): a remembered port is stable in practice, but a
+   * declared one is stable by construction.
+   *
+   * Deliberately a preference, not a claim. drop.yaml is tenant-authored, and
+   * on the deploy_from_git path it is attacker-authored, so a hard claim would
+   * let a tenant contend for the control plane's own port or evict another
+   * app. Anything unavailable or out of bounds falls through to normal
+   * allocation with a warning rather than failing the deploy.
+   */
+  private preferredPortFor(appName: string, declared: number | undefined): number | undefined {
+    if (!declared) return undefined;
+
+    // The control plane's own port is never available, whatever the range says.
+    if (declared === this.config.apiPort) {
+      this.logger.warn(
+        `Ignoring declared port ${declared} for ${appName}: it is the DROP API port`,
+        'PORT'
+      );
+      return undefined;
+    }
+    if (declared < this.config.portRangeStart || declared > this.config.portRangeEnd) {
+      this.logger.warn(
+        `Ignoring declared port ${declared} for ${appName}: outside the configured range ` +
+          `${this.config.portRangeStart}-${this.config.portRangeEnd}`,
+        'PORT'
+      );
+      return undefined;
+    }
+    const owner = this.usedPorts.get(declared);
+    if (owner && owner !== appName) {
+      this.logger.warn(
+        `Ignoring declared port ${declared} for ${appName}: already used by ${owner}`,
+        'PORT'
+      );
+      return undefined;
+    }
+    return declared;
+  }
+
+  private allocatePort(appName?: string, declaredPort?: number): number {
+    // A port the app declared in its own drop.yaml wins over a previously
+    // auto-allocated one — otherwise adding `port:` to an existing app would
+    // never take effect, since the persisted port below always matched first.
+    // Passed in rather than read from AppConfig: the declaration must apply on
+    // the SAME deploy that introduces it, and updateConfig silently no-ops
+    // before an app's config exists, so a persist-then-read round trip would
+    // lag by one deploy and do nothing at all on the first.
+    if (appName) {
+      const preferred = this.preferredPortFor(appName, declaredPort);
+      if (preferred !== undefined) {
+        this.logger.debug(`Using declared port ${preferred} for ${appName}`, 'PORT');
+        this.usedPorts.set(preferred, appName);
+        return preferred;
+      }
+    }
+
     // Check if app already has a port assigned in config file (source of truth)
     if (appName && this.appConfigService) {
       const config = this.appConfigService.getConfig(appName);
