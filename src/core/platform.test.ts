@@ -628,6 +628,56 @@ describe('DropPlatform', () => {
   });
 
   describe('port allocation', () => {
+    // `port:` in drop.yaml was accepted by the parser and validated, then
+    // never read by the allocator — a documented field that did nothing. It is
+    // honoured as a PREFERENCE, not a claim: drop.yaml is tenant-authored (and
+    // attacker-authored on the deploy_from_git path), so every refusal below
+    // must fall through to normal allocation rather than fail the deploy.
+    describe('declared port (DROP-138)', () => {
+      it('honours a declared port that is free and in range', () => {
+        expect((platform as any).allocatePort('site', 3010)).toBe(3010);
+        expect((platform as any).usedPorts.get(3010)).toBe('site');
+      });
+
+      it('honours it over a different previously-allocated port', () => {
+        const auto = (platform as any).allocatePort('site');
+        expect((platform as any).allocatePort('site', 3010)).toBe(3010);
+        expect(auto).not.toBe(3010);
+      });
+
+      it('REFUSES the DROP API port even when it falls INSIDE the port range', () => {
+        // Must place apiPort inside the range, or this passes on the range
+        // guard alone and never exercises the API-port guard at all. Caught by
+        // mutation: disabling that guard left this test green.
+        (platform as any).config.apiPort = 3005;
+        const got = (platform as any).allocatePort('greedy', 3005);
+        expect(got).not.toBe(3005);
+        expect((platform as any).usedPorts.get(3005)).toBeUndefined();
+      });
+
+      it('REFUSES a port outside the configured range', () => {
+        const got = (platform as any).allocatePort('greedy', 65000);
+        expect(got).not.toBe(65000);
+        expect(got).toBeGreaterThanOrEqual((platform as any).config.portRangeStart);
+      });
+
+      it('REFUSES a port another app already holds, leaving that claim intact', () => {
+        const victimPort = (platform as any).allocatePort('victim');
+        const got = (platform as any).allocatePort('thief', victimPort);
+        expect(got).not.toBe(victimPort);
+        expect((platform as any).usedPorts.get(victimPort)).toBe('victim');
+      });
+
+      it('allows an app to re-declare the port it already holds', () => {
+        const first = (platform as any).allocatePort('site', 3010);
+        expect((platform as any).allocatePort('site', 3010)).toBe(first);
+      });
+
+      it('ignores an undefined declaration (every app that declares nothing)', () => {
+        expect((platform as any).allocatePort('plain', undefined)).toBe(3001);
+      });
+    });
+
     it('should allocate ports in sequence', () => {
       const port1 = (platform as any).allocatePort();
       const port2 = (platform as any).allocatePort();
