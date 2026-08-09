@@ -150,6 +150,122 @@ describe('extractTarball', () => {
     expect(fssync.existsSync(destDir)).toBe(false);
   });
 
+  it('rejects a root-level .git path component and cleans up', async () => {
+    const tarBuf = buildTar([buildEntry('.git/config', 'malicious')]);
+    const archivePath = await writeGzArchive(tempDir, 'git-root.tgz', tarBuf);
+
+    await expectRejected(extractTarball(archivePath, destDir, DEFAULT_LIMITS), 'vcs_metadata');
+    expect(fssync.existsSync(destDir)).toBe(false);
+  });
+
+  it('rejects a nested .git path component (a/.git/config)', async () => {
+    const tarBuf = buildTar([buildEntry('a/.git/config', 'malicious')]);
+    const archivePath = await writeGzArchive(tempDir, 'git-nested.tgz', tarBuf);
+
+    await expectRejected(extractTarball(archivePath, destDir, DEFAULT_LIMITS), 'vcs_metadata');
+    expect(fssync.existsSync(destDir)).toBe(false);
+  });
+
+  it('rejects a .git path component case-insensitively (.GIT)', async () => {
+    const tarBuf = buildTar([buildEntry('.GIT/config', 'malicious')]);
+    const archivePath = await writeGzArchive(tempDir, 'git-case.tgz', tarBuf);
+
+    await expectRejected(extractTarball(archivePath, destDir, DEFAULT_LIMITS), 'vcs_metadata');
+    expect(fssync.existsSync(destDir)).toBe(false);
+  });
+
+  // Win32 strips trailing dots and spaces during path normalization, so both
+  // of these materialize as `.git` when mkdir runs on a Windows host.
+  // `GIT~1` is the 8.3 short-name alias Windows generates for `.git`, and
+  // `.git::$INDEX_ALLOCATION` is an NTFS alternate data stream hanging off
+  // the same `.git` directory — both resolve to the real `.git` on a Windows
+  // host even though none of these spell the name exactly. Harmless on the
+  // Linux production box, but the guard must not depend on which OS is
+  // extracting.
+  it.each([
+    '.git./config',
+    '.git /config',
+    'a/.GIT../config',
+    'GIT~1/config',
+    '.git::$INDEX_ALLOCATION/config',
+  ])('rejects a .git component that Win32 normalization would collapse (%s)', async entryPath => {
+    const tarBuf = buildTar([buildEntry(entryPath, 'malicious')]);
+    const archivePath = await writeGzArchive(tempDir, 'git-normalized.tgz', tarBuf);
+
+    await expectRejected(extractTarball(archivePath, destDir, DEFAULT_LIMITS), 'vcs_metadata');
+    expect(fssync.existsSync(destDir)).toBe(false);
+  });
+
+  // The bypass worth proving absent: node-tar consumes a PAX extended header
+  // (typeflag 'x') INTERNALLY and applies its `path=` record to the following
+  // entry, so the 'x' block never reaches the entry-type allowlist. If the
+  // override were applied after the 'entry' event, the guard would see the
+  // innocuous name and wave a `.git/config` write through.
+  it('rejects a .git path smuggled through a PAX extended header', async () => {
+    // PAX record framing is "<total-length> <key>=<value>\n", where the length
+    // counts its own digits: 2 + 1 + 17 = 20.
+    const paxPayload = Buffer.from('20 path=.git/config\n', 'utf8');
+    expect(paxPayload.length).toBe(20);
+
+    const paxBlock = Buffer.alloc(512, 0);
+    paxPayload.copy(paxBlock);
+    const paxEntry = Buffer.concat([
+      buildHeader({ name: 'PaxHeader/innocuous.txt', size: paxPayload.length, typeflag: 'x' }),
+      paxBlock,
+    ]);
+
+    const tarBuf = buildTar([paxEntry, buildEntry('innocuous.txt', 'malicious')]);
+    const archivePath = await writeGzArchive(tempDir, 'pax-git.tgz', tarBuf);
+
+    await expectRejected(extractTarball(archivePath, destDir, DEFAULT_LIMITS), 'vcs_metadata');
+    expect(fssync.existsSync(destDir)).toBe(false);
+  });
+
+  // Same bypass shape as the PAX case above, but via GNU tar's older
+  // long-name mechanism: a '././@LongLink' entry (typeflag 'L') carries the
+  // real path as its data payload, and node-tar applies it to the FOLLOWING
+  // entry before emitting it. Only the PAX variant was pinned before; this
+  // proves the GNU variant is caught by the same entry.path-based guard.
+  it('rejects a .git path smuggled through a GNU long-name (LongLink) header', async () => {
+    const longNamePayload = Buffer.from('.git/config\0', 'utf8');
+    const paddedSize = Math.ceil(longNamePayload.length / 512) * 512 || 512;
+    const longNameBlock = Buffer.alloc(paddedSize, 0);
+    longNamePayload.copy(longNameBlock);
+    const longLinkEntry = Buffer.concat([
+      buildHeader({ name: '././@LongLink', size: longNamePayload.length, typeflag: 'L' }),
+      longNameBlock,
+    ]);
+
+    const tarBuf = buildTar([longLinkEntry, buildEntry('innocuous.txt', 'malicious')]);
+    const archivePath = await writeGzArchive(tempDir, 'longlink-git.tgz', tarBuf);
+
+    await expectRejected(extractTarball(archivePath, destDir, DEFAULT_LIMITS), 'vcs_metadata');
+    expect(fssync.existsSync(destDir)).toBe(false);
+  });
+
+  it('rejects a bare .git/ directory entry (no child file)', async () => {
+    const tarBuf = buildTar([buildEntry('.git/', '', '5')]);
+    const archivePath = await writeGzArchive(tempDir, 'git-bare-dir.tgz', tarBuf);
+
+    await expectRejected(extractTarball(archivePath, destDir, DEFAULT_LIMITS), 'vcs_metadata');
+    expect(fssync.existsSync(destDir)).toBe(false);
+  });
+
+  // The stripping must not over-match: these are ordinary files whose names
+  // merely begin with `.git`, and every real repo has them.
+  it.each(['.gitignore', '.gitattributes', '.git.txt', 'gitconfig'])(
+    'extracts an ordinary %s without rejecting it',
+    async name => {
+      const tarBuf = buildTar([buildEntry(name, 'content')]);
+      const archivePath = await writeGzArchive(tempDir, 'git-lookalike.tgz', tarBuf);
+
+      const result = await extractTarball(archivePath, destDir, DEFAULT_LIMITS);
+
+      expect(result.fileCount).toBe(1);
+      expect(fssync.readFileSync(path.join(destDir, name), 'utf8')).toBe('content');
+    }
+  );
+
   it('rejects a case-insensitive path collision (A.txt vs a.txt)', async () => {
     const tarBuf = buildTar([buildEntry('A.txt', 'first'), buildEntry('a.txt', 'second')]);
     const archivePath = await writeGzArchive(tempDir, 'case-collision.tgz', tarBuf);
@@ -215,7 +331,10 @@ describe('extractTarball', () => {
     const tarBuf = buildTar([]);
     const archivePath = await writeGzArchive(tempDir, 'empty.tgz', tarBuf);
 
-    await expectRejected(extractTarball(archivePath, destDir, DEFAULT_LIMITS), 'empty_archive');
+    await expect(extractTarball(archivePath, destDir, DEFAULT_LIMITS)).rejects.toMatchObject({
+      reason: 'empty_archive',
+      message: 'Archive contains no regular files',
+    });
     expect(fssync.existsSync(destDir)).toBe(false);
   });
 
@@ -223,7 +342,70 @@ describe('extractTarball', () => {
     const tarBuf = buildTar([buildEntry('sub/', '', '5')]);
     const archivePath = await writeGzArchive(tempDir, 'dirs-only.tgz', tarBuf);
 
-    await expectRejected(extractTarball(archivePath, destDir, DEFAULT_LIMITS), 'empty_archive');
+    await expect(extractTarball(archivePath, destDir, DEFAULT_LIMITS)).rejects.toMatchObject({
+      reason: 'empty_archive',
+      message: 'Archive contains no regular files',
+    });
+    expect(fssync.existsSync(destDir)).toBe(false);
+  });
+
+  it('rejects an archive whose only entry has a corrupt checksum, as invalid_archive', async () => {
+    const entry = buildEntry('bad.txt', 'hi');
+    // Corrupt the checksum field (offset 148, 8 bytes) so node-tar treats the
+    // header as invalid and emits a 'warn' instead of an 'entry' event — a
+    // parser warning is now fatal rather than silently dropping the entry.
+    entry.write('00000000', 148, 8, 'ascii');
+    const tarBuf = buildTar([entry]);
+    const archivePath = await writeGzArchive(tempDir, 'bad-checksum.tgz', tarBuf);
+
+    // Assert only the reason plus that the message is non-empty — not the
+    // literal node-tar warn code, which would couple this suite to node-tar's
+    // warn-code vocabulary and turn a minor dependency bump into a red CI
+    // that reads like a security regression.
+    let caught: ArchiveRejectedError | undefined;
+    try {
+      await extractTarball(archivePath, destDir, DEFAULT_LIMITS);
+    } catch (err) {
+      caught = err as ArchiveRejectedError;
+    }
+    expect(caught).toBeInstanceOf(ArchiveRejectedError);
+    expect(caught?.reason).toBe('invalid_archive');
+    expect(caught?.message.length).toBeGreaterThan(0);
+    expect(fssync.existsSync(destDir)).toBe(false);
+  });
+
+  // Pins a KNOWN, ACCEPTED limitation rather than desired behaviour, so that a
+  // future node-tar release which starts warning here is noticed as a
+  // behaviour change rather than silently turning these uploads into 400s.
+  // Measured against tar 7.5.19: a valid entry followed by a truncated header
+  // emits NO 'warn' and NO 'error' — the parser just ends. So the fatal-warning
+  // rule above cannot reach it, and the truncated tail is ignored. In practice
+  // a truncated UPLOAD is caught earlier, by the gzip layer; reaching this
+  // needs an intact gzip wrapper around an already-truncated tar.
+  it('KNOWN GAP: silently ignores a truncated tar tail (node-tar reports nothing)', async () => {
+    const tarBuf = Buffer.concat([buildEntry('good.txt', 'ok'), Buffer.alloc(256, 0x41)]);
+    const archivePath = await writeGzArchive(tempDir, 'truncated-tail.tgz', tarBuf);
+
+    const result = await extractTarball(archivePath, destDir, DEFAULT_LIMITS);
+
+    expect(result.fileCount).toBe(1);
+    expect(fssync.readFileSync(path.join(destDir, 'good.txt'), 'utf8')).toBe('ok');
+  });
+
+  it('rejects an archive with one valid entry and one corrupt-checksum entry, without landing a partial tree', async () => {
+    // The regression this pins: a corrupt entry used to be silently dropped
+    // while the valid entry still extracted, so fileCount > 0 and
+    // extractTarball resolved with a partial tree — which landFiles/syncTree
+    // would then treat as authoritative and prune the destination to match,
+    // silently deleting files. The valid entry comes first so its write can
+    // genuinely be in flight when the warning for the corrupt entry fires.
+    const good = buildEntry('good.txt', 'hello');
+    const bad = buildEntry('bad.txt', 'hi');
+    bad.write('00000000', 148, 8, 'ascii');
+    const tarBuf = buildTar([good, bad]);
+    const archivePath = await writeGzArchive(tempDir, 'partial.tgz', tarBuf);
+
+    await expectRejected(extractTarball(archivePath, destDir, DEFAULT_LIMITS), 'invalid_archive');
     expect(fssync.existsSync(destDir)).toBe(false);
   });
 

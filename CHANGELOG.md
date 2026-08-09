@@ -27,18 +27,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added
+### Security
 
-- **A git credential can be attached to an app that already exists**
-  (DROP-142). `POST /api/v1/git/redeploy/:name` takes an optional
-  `{ "tokenId": … }`: absent leaves the app's stored credential unchanged,
-  `null` clears it, a `git_…` id attaches or replaces one. Answers "a repo
-  that was public and went private can no longer be updated" — the token was
-  always stored by reference and re-read at redeploy, but nothing could write
-  that reference after creation. The dashboard exposes it as a credential
-  picker next to the existing Redeploy button on an app's detail page.
+- **Uploaded archives containing `.git` metadata are now rejected.** An
+  archive with a `.git` path component — at any depth, case-insensitively —
+  is refused with `reason: vcs_metadata` and nothing is extracted. Previously
+  a tenant with the `user` role could upload a crafted `.git/` to
+  `POST /apps/<app>/source`, where it overwrote the app's real one, and a
+  subsequent `POST /git/redeploy/<app>` ran `git pull` in that directory **on
+  the host** — never containerized in either isolation mode — so a poisoned
+  `.git/config` (an `ext::sh -c …` remote URL, `core.fsmonitor`) executed
+  arbitrary commands as the `drop` user, which is in the `docker` group and
+  therefore root-equivalent.
 
-### Fixed
+  The guard reads the parser's resolved entry path rather than the raw tar
+  header name, because a PAX extended header can override the path of the
+  entry that follows it — a check against the header name would have closed
+  nothing.
+
+  **Behaviour change for hand-rolled clients:** `tar -czf app.tgz .` from a
+  working tree now fails instead of silently deploying the repository's git
+  metadata. Exclude it (`--exclude .git`), or use `POST /git/deploy` to
+  deploy a repository. The MCP `deploy_files` tool rejects such paths before
+  staging.
+
+- **Dotenv files are excluded from a dashboard folder upload.** `.env`,
+  `.env.local`, `.env.production` and the like are skipped (templates —
+  `.env.example`, `.env.sample`, `.env.template`, `.env.dist` — still ship),
+  and the upload panel lists exactly what it left out. For a static app the
+  uploaded tree root is the web server's document root, so a shipped `.env`
+  was fetchable at `/.env` on the public URL. Use the secrets API
+  (`PUT /api/v1/secrets/<app>`) for values the app needs at runtime.
 
 - **Personal access tokens no longer reach disk on either git path**
   (DROP-142). `git clone https://TOKEN@github.com/…` recorded the URL
@@ -50,6 +69,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   helper that reads it from the git child's own environment (never argv,
   which is world-readable via `ps`), scoped to `https://github.com` so a
   tampered remote URL cannot redirect the credential to another host.
+
 - **Existing repositories are cleaned up on their next redeploy** (DROP-142).
   Closing the leak above does nothing for apps already on disk, and git
   *prefers* a credential embedded in the remote URL — so on exactly those
@@ -57,15 +77,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   from `remote.origin.url` before pulling. **Operator note:** an app that is
   never redeployed keeps the old value; grep for it with
   `sudo grep -hE '^\s*url\s*=' /var/drop/data/webapps/*/.git/config | grep '@'`.
-- **Clearing a credential actually clears it** (DROP-142). A clear is
-  persisted before the pull rather than after it — otherwise the now
-  unauthenticated pull fails against a private repo and the clear is
-  discarded, leaving no way to detach a compromised token.
-- **Git operations are pinned to the app's own repository** (DROP-142).
-  They ran with only a working directory, so an app whose `.git` had been
-  removed — by an upload deploy's prune, or a monorepo re-materialization —
-  resolved to whatever repository existed *above* it and reported that
-  repo's commit as the app's own.
+
+  Not fully closed by this change: Caddy's `file_server` has no `hide`
+  directive, so a plain-root static app still serves `/.git/config` — and its
+  history — to the internet.
+
+### Added
+
+- **A git credential can be attached to an app that already exists**
+  (DROP-142). `POST /api/v1/git/redeploy/:name` takes an optional
+  `{ "tokenId": … }`: absent leaves the app's stored credential unchanged,
+  `null` clears it, a `git_…` id attaches or replaces one. Answers "a repo
+  that was public and went private can no longer be updated" — the token was
+  always stored by reference and re-read at redeploy, but nothing could write
+  that reference after creation. The dashboard exposes it as a credential
+  picker next to the existing Redeploy button on an app's detail page.
 
 ### Changed
 
@@ -74,6 +100,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   admin tier, and `gitSource.repoUrl` has any userinfo stripped. The
   `gitSource` field itself stays present at every tier. Potentially breaking
   for a script or agent that read `tokenId` from an app record.
+
+### Fixed
+
+- **An archive whose entries the tar parser rejects no longer deploys as a
+  partial tree.** node-tar runs non-strict here, so an entry with a bad
+  checksum was silently dropped while extraction still reported success — and
+  the destination was then pruned to match, deleting files that had gone
+  missing. Any parser warning is now fatal (`reason: invalid_archive`), except
+  the one node-tar emits for an archive with no entries at all, which still
+  reports `empty_archive`.
+
+  This closes the cases the parser *reports*. A tar stream truncated mid-way
+  inside an otherwise-valid gzip wrapper is still extracted up to the
+  truncation point, because node-tar signals nothing at all in that case —
+  measured, and not something a warning-based check can reach.
+
+- **Clearing a git credential actually clears it** (DROP-142). A clear is
+  persisted before the pull rather than after it — otherwise the now
+  unauthenticated pull fails against a private repo and the clear is
+  discarded, leaving no way to detach a compromised token.
+
+- **Git operations are pinned to the app's own repository** (DROP-142).
+  They ran with only a working directory, so an app whose `.git` had been
+  removed — by an upload deploy's prune, or a monorepo re-materialization —
+  resolved to whatever repository existed *above* it and reported that
+  repo's commit as the app's own.
 
 ## [1.1.0] - 2026-08-09
 
