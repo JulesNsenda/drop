@@ -27,6 +27,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- The marketing site, docs and API reference now live in their own repo,
+  deployed as a separate app at dropkit.sh — the platform no longer builds
+  or serves `/`, `/docs` or `/reference`. `/` now 301-redirects to
+  `/dashboard`; self-hosted installs that relied on the API-info JSON
+  previously returned at `/` will see a redirect instead.
+
 ## [1.0.0] - 2026-08-07
 
 First public release. DROP now runs tenant apps under either PM2 or Docker

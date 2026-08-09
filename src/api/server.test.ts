@@ -7,18 +7,10 @@ import * as path from 'path';
 import * as os from 'os';
 import { ApiServer, createApiServer } from './server';
 import { isPathWithin } from '../utils/paths';
-import { getPlatformVersion } from '../utils/version';
 
 interface ApiResponse<T = unknown> {
   success: boolean;
   data: T;
-}
-
-interface RootResponse {
-  name: string;
-  version: string;
-  docs: string;
-  auth: string;
 }
 
 interface HealthResponse {
@@ -103,32 +95,15 @@ describe('ApiServer', () => {
       await server.initialize();
     });
 
-    it('should respond to root endpoint', async () => {
+    it('should respond to root endpoint with a redirect to /dashboard', async () => {
       const app = server.getApp();
-      const res = await app.request('/');
+      // DROP-139: the marketing site (and its API-info JSON fallback) no
+      // longer lives in the platform — it's a separate app at dropkit.sh.
+      // The platform root now always 301s to /dashboard.
+      const res = await app.request('/', { redirect: 'manual' });
 
-      // DROP-070: the root no longer redirects to /dashboard (never 302) —
-      // it serves the marketing site bundle directly when dist/site has been
-      // built, or falls back to API-info JSON otherwise. Tolerant of both,
-      // same as the pre-DROP-070 test was tolerant of [200, 302]: whether
-      // dist/site exists depends on local build state (CI always runs tests
-      // before building the frontend, but a dev running `npm test` after
-      // `npm run build` will see the built branch).
-      expect(res.status).toBe(200);
-      const contentType = res.headers.get('content-type') || '';
-      if (contentType.includes('application/json')) {
-        const data = (await res.json()) as RootResponse;
-        expect(data.name).toBe('DROP API');
-        // Assert against package.json, not a literal. This assertion used to
-        // hardcode '1.0.0' and matched only because server.ts hardcoded the
-        // same stale string — it would have gone on passing while the endpoint
-        // reported a version the platform hadn't been for two majors. Note it
-        // is reached only on the JSON branch above, i.e. when dist/site is NOT
-        // built: that is CI, but not a dev box that has run `npm run build`.
-        expect(data.version).toBe(getPlatformVersion());
-      } else {
-        expect(contentType).toContain('text/html');
-      }
+      expect(res.status).toBe(301);
+      expect(res.headers.get('location')).toBe('/dashboard');
     });
 
     it('should respond to health check without hanging', async () => {
@@ -154,7 +129,7 @@ describe('ApiServer', () => {
     });
   });
 
-  describe('marketing site split (DROP-070)', () => {
+  describe('root/dashboard static routes (DROP-070 dashboard split, DROP-139 site removal)', () => {
     describe('isPathWithin (asset containment, src/utils/paths.ts)', () => {
       // Guaranteed not to exist on disk, so isPathWithin's realpath step
       // always falls back to a lexical resolve on both sides — keeps this
@@ -184,78 +159,73 @@ describe('ApiServer', () => {
       });
     });
 
-    describe('serving / (isolated site fixture via ApiServerConfig.sitePath)', () => {
-      // ApiServerConfig.sitePath overrides the resolved site directory, so
-      // this never touches the repo's real dist/site — that path is shared,
-      // mutable global state: 18 test files construct an ApiServer, Jest
-      // runs files in parallel workers, and a backup/rm/restore dance around
-      // one real, fixed directory is exactly the kind of shared state that
-      // can be observed mid-mutation by an unrelated parallel test, or left
-      // clobbered if a run is interrupted before the restore step.
-      let siteDir: string;
-
-      beforeEach(async () => {
-        siteDir = await fs.mkdtemp(path.join(os.tmpdir(), 'drop-site-fixture-'));
-        await fs.writeFile(path.join(siteDir, 'index.html'), '<html><body>SITE-SHELL</body></html>', 'utf-8');
-      });
-
-      afterEach(async () => {
-        await fs.rm(siteDir, { recursive: true, force: true });
-      });
-
-      it('serves the site bundle at /, /docs, and /reference when the site path exists', async () => {
-        server = new ApiServer({ port: 3006, enableAuth: false, sitePath: siteDir });
-        await server.initialize();
-        const app = server.getApp();
-
-        for (const route of ['/', '/docs', '/reference']) {
-          const res = await app.request(route);
-          expect(res.status).toBe(200);
-          expect(res.headers.get('content-type') || '').toContain('text/html');
-          expect(await res.text()).toContain('SITE-SHELL');
-        }
-      });
-
-      it('301-redirects the trailing-slash variants /docs/ and /reference/ to their canonical form', async () => {
-        server = new ApiServer({ port: 3010, enableAuth: false, sitePath: siteDir });
-        await server.initialize();
-        const app = server.getApp();
-
-        const docsSlash = await app.request('/docs/', { redirect: 'manual' });
-        expect(docsSlash.status).toBe(301);
-        expect(docsSlash.headers.get('location')).toBe('/docs');
-
-        const refSlash = await app.request('/reference/', { redirect: 'manual' });
-        expect(refSlash.status).toBe(301);
-        expect(refSlash.headers.get('location')).toBe('/reference');
-      });
-
-      // These two assertions only mean something when the site's own root-
-      // level routes (/, /docs, /reference) are actually registered — CI
-      // runs `npm test` before `npm run build:site` (deploy.yml), so without
-      // this fixture, siteExists is false and the site routes never exist at
-      // all, which would make "not swallowed" trivially, vacuously true.
-      it('does not let the site routes swallow /.well-known/oauth-protected-resource', async () => {
-        server = new ApiServer({ port: 3009, enableAuth: false, sitePath: siteDir });
+    describe('root routes do not swallow other origin routes (DROP-139)', () => {
+      // DROP-139: the marketing site (which used to own /, /docs and
+      // /reference and was gated on an explicit-routes-only registration for
+      // this exact reason) is gone — the root now only redirects to
+      // /dashboard and serves the four favicon files. These assertions used
+      // to matter only when a site fixture was registered (siteExists true);
+      // now the root routes are always registered, so the well-known and API
+      // routes still needing to win is the invariant worth keeping.
+      it('does not let the root redirect swallow /.well-known/oauth-protected-resource', async () => {
+        server = new ApiServer({ port: 3009, enableAuth: false });
         await server.initialize();
         const app = server.getApp();
         const res = await app.request('/.well-known/oauth-protected-resource');
 
         // No DROP_PUBLIC_URL is configured on this test server, so the
         // well-known handler itself 404s — the point is this is a JSON 404
-        // from the registered well-known route, never a 200 HTML shell from
-        // a root catch-all that would otherwise shadow it.
+        // from the registered well-known route, never a redirect/HTML shell
+        // from a root catch-all that would otherwise shadow it.
         expect(res.status).toBe(404);
         expect(res.headers.get('content-type') || '').not.toContain('text/html');
       });
 
-      it('does not let the site routes swallow /api/v1/health', async () => {
-        server = new ApiServer({ port: 3013, enableAuth: false, sitePath: siteDir });
+      it('does not let the root redirect swallow /api/v1/health', async () => {
+        server = new ApiServer({ port: 3013, enableAuth: false });
         await server.initialize();
         const app = server.getApp();
         const res = await app.request('/api/v1/health');
 
         expect(res.headers.get('content-type') || '').not.toContain('text/html');
+      });
+    });
+
+    describe('root icon routes read from the dashboard bundle (DROP-139)', () => {
+      // Isolated fixture via ApiServerConfig.dashboardPath, same reasoning as
+      // the old sitePath fixture it replaces: never touch the repo's real
+      // dist/dashboard, which every ApiServer in the suite would otherwise
+      // share as mutable global state.
+      let dashboardDir: string;
+
+      beforeEach(async () => {
+        dashboardDir = await fs.mkdtemp(path.join(os.tmpdir(), 'drop-dashboard-fixture-'));
+        await fs.writeFile(path.join(dashboardDir, 'index.html'), '<html><body>DASHBOARD-SHELL</body></html>', 'utf-8');
+        await fs.writeFile(path.join(dashboardDir, 'favicon.ico'), 'FAVICON-BYTES', 'utf-8');
+      });
+
+      afterEach(async () => {
+        await fs.rm(dashboardDir, { recursive: true, force: true });
+      });
+
+      it('serves /favicon.ico at the root from the dashboard bundle', async () => {
+        server = new ApiServer({ port: 3011, enableAuth: false, dashboardPath: dashboardDir });
+        await server.initialize();
+        const app = server.getApp();
+
+        const res = await app.request('/favicon.ico');
+        expect(res.status).toBe(200);
+        expect(res.headers.get('content-type')).toBe('image/x-icon');
+        expect(await res.text()).toBe('FAVICON-BYTES');
+      });
+
+      it('404s an icon route the fixture does not provide (drop.svg)', async () => {
+        server = new ApiServer({ port: 3012, enableAuth: false, dashboardPath: dashboardDir });
+        await server.initialize();
+        const app = server.getApp();
+
+        const res = await app.request('/drop.svg');
+        expect(res.status).toBe(404);
       });
     });
 
@@ -277,20 +247,22 @@ describe('ApiServer', () => {
         await server.initialize();
       });
 
-      it('redirects /dashboard/docs to /docs', async () => {
+      // DROP-139: the docs/reference site no longer lives in the platform
+      // at all — these now point off-box at the public drop-site app.
+      it('redirects /dashboard/docs to https://dropkit.sh/docs', async () => {
         const app = server.getApp();
         const res = await app.request('/dashboard/docs', { redirect: 'manual' });
 
         expect(res.status).toBe(301);
-        expect(res.headers.get('location')).toBe('/docs');
+        expect(res.headers.get('location')).toBe('https://dropkit.sh/docs');
       });
 
-      it('redirects /dashboard/reference to /reference', async () => {
+      it('redirects /dashboard/reference to https://dropkit.sh/docs/api', async () => {
         const app = server.getApp();
         const res = await app.request('/dashboard/reference', { redirect: 'manual' });
 
         expect(res.status).toBe(301);
-        expect(res.headers.get('location')).toBe('/reference');
+        expect(res.headers.get('location')).toBe('https://dropkit.sh/docs/api');
       });
     });
   });

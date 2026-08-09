@@ -1,10 +1,13 @@
 /*
- * Shared design tokens for the marketing site (`.drop-landing`) and the admin
- * dashboard (`.drop-ui`) — one palette scoped to both classes so the two
- * Vite entry points (vite.config.ts / vite.site.config.ts, DROP-070) render
- * identically without duplicating the color/font values across two
- * stylesheets. Theming is driven off the existing `html.dark` class (owned
- * by useTheme()), not a parallel signal.
+ * Design tokens for the admin dashboard (`.drop-ui`). Theming is driven off
+ * the existing `html.dark` class (owned by useTheme()), not a parallel signal.
+ *
+ * DUPLICATED, deliberately: an identical copy lives in the drop-site repo,
+ * which owns the marketing site, docs and API reference since DROP-139 split
+ * them out of this one. Both scopes (`.drop-ui` here, `.drop-landing` there)
+ * are still defined below so the two stay visually identical. A shared package
+ * was considered and rejected — it would be a fourth thing to version for one
+ * small, diffable file. If you change a token here, change it there too.
  *
  * Light values are the base (matches the repo's light-is-base convention);
  * `html.dark` supplies the dark palette. `landing.css` and `app-ui.css` each
