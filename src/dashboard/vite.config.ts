@@ -7,7 +7,7 @@ import path from 'path';
 // that is the one `getPlatformVersion()` serves from /api/v1/health, so the
 // UI and the API report the same string. Injected rather than hardcoded in a
 // component: three components carried a literal and all three still read
-// v2.0.0-rc.1 two releases later. Mirrored in vite.site.config.ts.
+// v2.0.0-rc.1 two releases later.
 const platformVersion = (
   JSON.parse(
     fs.readFileSync(path.resolve(__dirname, '../../package.json'), 'utf-8')

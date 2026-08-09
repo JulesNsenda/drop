@@ -111,30 +111,6 @@ jobs:
         working-directory: src/dashboard
         run: npm run build
 
-      - name: Build public site
-        working-directory: src/dashboard
-        run: npm run build:site
-
-      # ── Guards mirrored from deploy.yml ────────────────────────────────────
-      # Keep these in step with deploy.yml. (Better: extract a composite action
-      # so all three workflows share one definition -- ci.yml has already
-      # drifted and lost both of these.)
-      - name: Verify site bundle exists
-        run: |
-          set -euo pipefail
-          if [ ! -f dist/site/index.html ]; then
-            echo "::error::dist/site/index.html missing after build:site -- the marketing site would ship with no frontend" >&2
-            exit 1
-          fi
-
-      - name: Verify dashboard/site bundle split (DROP-070)
-        run: |
-          set -euo pipefail
-          if grep -q 'drop-token\|ConfirmDialog\|qrcode' dist/site/assets/*.js; then
-            echo "::error::dist/site JS references admin-only code -- the marketing/dashboard bundle split has regressed" >&2
-            exit 1
-          fi
-
       # ── Version gate ───────────────────────────────────────────────────────
       # The UI version is a BUILD-TIME Vite `define` (__DROP_VERSION__ from the
       # root package.json), so it can only be verified in built output -- this
@@ -142,19 +118,19 @@ jobs:
       # version through two release cuts.
       #
       # grep -F is load-bearing. As a REGEX, "1.0.0" matches lucide-react SVG
-      # path data (`a2 2 0 0 0`, where . matches the spaces) -- measured at 28
-      # false hits in dist/site. The quoted form has exactly one hit per bundle.
+      # path data (`a2 2 0 0 0`, where . matches the spaces) -- the quoted
+      # form has exactly one hit in the bundle.
       #
-      # Match the bare quoted version, NOT `v$VERSION`: SiteNav renders
-      # `v{__DROP_VERSION__}`, which compiles to children:["v","1.0.0"] -- so
-      # `v1.0.0` is not contiguous in the site bundle and would fail there
-      # while passing in the dashboard.
+      # DROP-139: this used to also check dist/site/assets (the marketing
+      # site build, now a separate repo/app -- the platform no longer builds
+      # it). Narrowed to the dashboard bundle only; do not delete this step,
+      # it's the DROP-077 regression guard.
       - name: Verify built bundles carry the release version
         env:
           VERSION: ${{ steps.gates.outputs.version }}
         run: |
           set -euo pipefail
-          for bundle_dir in dist/dashboard/assets dist/site/assets; do
+          for bundle_dir in dist/dashboard/assets; do
             if ! grep -qrF "\"$VERSION\"" "$bundle_dir"/*.js; then
               echo "::error::$bundle_dir does not contain \"$VERSION\" -- the __DROP_VERSION__ define did not reach this bundle" >&2
               exit 1

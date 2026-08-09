@@ -50,7 +50,6 @@ import usageRoutes from './routes/usage';
 import oauthRoutes from './routes/oauth';
 import mcpGatewayRoutes from './routes/mcp-gateway';
 import { handleMcpRequest, methodNotAllowed } from './mcp/transport';
-import { getPlatformVersion } from '../utils/version';
 
 /** Matches POST /api/v1/apps/:name/source — the upload-deploy endpoint (PRD-039). */
 const UPLOAD_SOURCE_PATH_RE = /^\/api\/v1\/apps\/[A-Za-z0-9_-]+\/source$/;
@@ -93,14 +92,6 @@ export interface ApiServerConfig {
    * instead of the real repo-relative dist/dashboard.
    */
   dashboardPath?: string;
-  /**
-   * Override the resolved site directory (normally dist/site — see
-   * setupRoutes). Defaults to that resolution when unset; exists so tests
-   * can point at an isolated fixture instead of the real repo-relative
-   * dist/site, which every `new ApiServer(...)` in the suite would otherwise
-   * share as a real, mutable, non-parallel-safe path.
-   */
-  sitePath?: string;
 }
 
 export class ApiServer {
@@ -412,8 +403,7 @@ export class ApiServer {
     // Mount v1 under /api/v1
     this.app.route('/api/v1', v1);
 
-    // Content-type map shared by the dashboard and site static-asset routes
-    // below.
+    // Content-type map used by the dashboard's static-asset route below.
     const MIME_TYPES: Record<string, string> = {
       '.js': 'application/javascript',
       '.mjs': 'application/javascript',
@@ -431,12 +421,16 @@ export class ApiServer {
     };
 
     /**
-     * Icon files served at BOTH the site root and under /dashboard.
+     * Icon files served at BOTH the platform root and under /dashboard, from
+     * the dashboard bundle's public/ directory in both cases (DROP-139: the
+     * marketing site — and its own copy of these files — moved to a separate
+     * repo/app, so the dashboard build is now the only source).
      *
      * `drop.svg` is the source of truth for the mark; the rasters exist because
-     * many icon consumers request `/favicon.ico` directly and do not render
-     * SVG. Regenerate with `node scripts/generate-favicons.js` if the mark
-     * changes — nothing rebuilds them automatically.
+     * many icon consumers request `/favicon.ico` directly from the origin,
+     * regardless of the `<link rel="icon">` tag, and many of them do not
+     * render SVG. Regenerate with `node scripts/generate-favicons.js` if the
+     * mark changes — nothing rebuilds them automatically.
      */
     const ICON_FILES: Record<string, string> = {
       'drop.svg': 'image/svg+xml',
@@ -488,7 +482,8 @@ export class ApiServer {
         }
       });
 
-      // Serve favicons (see the site block's note on why raster fallbacks exist).
+      // Serve favicons (see the ICON_FILES comment above for why raster
+      // fallbacks exist).
       for (const [file, contentType] of Object.entries(ICON_FILES)) {
         this.app.get(`/dashboard/${file}`, async c => {
           try {
@@ -513,14 +508,16 @@ export class ApiServer {
 
       this.app.get('/dashboard', serveIndex);
 
-      // Moved public URLs (DROP-070): /docs and /reference used to live
-      // under /dashboard. Permanently redirect inbound links and
-      // search-index entries to their new home. MUST be registered
-      // immediately above the /dashboard/* fallback below — that wildcard
-      // would otherwise match these two paths first and serve the dashboard
-      // SPA shell instead of redirecting.
-      this.app.get('/dashboard/docs', c => c.redirect('/docs', 301));
-      this.app.get('/dashboard/reference', c => c.redirect('/reference', 301));
+      // Moved public URLs (DROP-070, re-pointed by DROP-139): /docs and
+      // /reference used to live under /dashboard, then moved to the
+      // platform's own root, and now live on the public drop-site app —
+      // the platform no longer serves either. Permanently redirect inbound
+      // links and search-index entries to their new home. MUST be
+      // registered immediately above the /dashboard/* fallback below — that
+      // wildcard would otherwise match these two paths first and serve the
+      // dashboard SPA shell instead of redirecting.
+      this.app.get('/dashboard/docs', c => c.redirect('https://dropkit.sh/docs', 301));
+      this.app.get('/dashboard/reference', c => c.redirect('https://dropkit.sh/docs/api', 301));
 
       this.app.get('/dashboard/*', async c => {
         if (!c.req.path.includes('/assets/') && !c.req.path.endsWith('.svg')) {
@@ -530,101 +527,33 @@ export class ApiServer {
       });
     }
 
-    // Public site static files (marketing landing + /docs + /reference,
-    // DROP-070) — a separate Vite build (vite.site.config.ts) from the admin
-    // dashboard, so a marketing visitor never downloads the admin bundle or
-    // calls the API. Built-only: unlike the dashboard block above, this does
-    // NOT fall back to raw source (src/dashboard/site/index.html isn't a
-    // servable bundle without Vite), so a box with no `dist/site` build
-    // falls through to the API-info JSON fallback below, not a broken shell.
-    const distSitePath = this.config.sitePath ?? path.join(__dirname, '..', '..', 'dist', 'site');
-    const siteIndexPath = path.join(distSitePath, 'index.html');
-    const siteExists = fs.existsSync(siteIndexPath);
-
-    console.log('[Site] Path:', distSitePath);
-    console.log('[Site] Index exists:', siteExists);
-
-    if (siteExists) {
-      const readSiteIndexHtml = (): Promise<string> => fsp.readFile(siteIndexPath, 'utf-8');
-
-      // Serve static assets. Vite emits content-hashed filenames under
-      // /assets, so they can be cached immutably.
-      this.app.get('/assets/*', async c => {
-        const assetPath = c.req.path.replace(/^\//, '');
-        const filePath = path.join(distSitePath, assetPath);
-        // Containment: never serve outside the site directory (see the
-        // isPathWithin comment on the dashboard's asset route above).
-        if (!(await isPathWithin(distSitePath, filePath))) {
-          return c.notFound();
-        }
+    // Root icon routes (DROP-139). The marketing site used to serve these at
+    // the platform root; it now lives in its own repo/app at dropkit.sh, so
+    // the platform no longer builds or serves it. Browsers and link-preview
+    // crawlers request `/favicon.ico` etc. from the origin regardless of
+    // which app is mounted at `/` — see the ICON_FILES comment above — so
+    // these stay registered at the root, reading from the dashboard bundle
+    // (dashboardPath) instead of the now-gone site bundle.
+    for (const [file, contentType] of Object.entries(ICON_FILES)) {
+      this.app.get(`/${file}`, async c => {
         try {
-          const content = await fsp.readFile(filePath);
-          const contentType = MIME_TYPES[path.extname(filePath)] || 'application/octet-stream';
+          const content = await fsp.readFile(path.join(dashboardPath, file));
           return c.body(content, 200, {
             'Content-Type': contentType,
-            'Cache-Control': 'public, max-age=31536000, immutable',
+            'Cache-Control': 'public, max-age=86400',
           });
         } catch {
           return c.notFound();
         }
       });
-
-      // Serve favicons.
-      //
-      // The SVG alone was not enough: plenty of icon consumers never look at
-      // the `<link rel="icon">` tag at all and just request `/favicon.ico`
-      // from the origin, and many of them do not render SVG. With
-      // explicit-routes-only registration (see the comment below) that request
-      // 404'd, so those clients showed a generic placeholder. Raster fallbacks
-      // are generated by `scripts/generate-favicons.js`.
-      for (const [file, contentType] of Object.entries(ICON_FILES)) {
-        this.app.get(`/${file}`, async c => {
-          try {
-            const content = await fsp.readFile(path.join(distSitePath, file));
-            return c.body(content, 200, {
-              'Content-Type': contentType,
-              'Cache-Control': 'public, max-age=86400',
-            });
-          } catch {
-            return c.notFound();
-          }
-        });
-      }
-
-      // Explicit routes only — deliberately NOT a bare `/*` catch-all.
-      // Mirroring the dashboard's `/dashboard/*` fallback to the root would
-      // swallow /.well-known/oauth-protected-resource and
-      // /.well-known/oauth-authorization-server (registered above),
-      // returning a 200 HTML shell and silently breaking the claude.ai MCP
-      // connector. index.html must never be cached, or clients get a stale
-      // shell pointing at old asset hashes after a deploy.
-      const serveSiteIndex = async (c: import('hono').Context) => {
-        const html = await readSiteIndexHtml();
-        c.header('Cache-Control', 'no-cache');
-        return c.html(html);
-      };
-
-      this.app.get('/', serveSiteIndex);
-      this.app.get('/docs', serveSiteIndex);
-      this.app.get('/reference', serveSiteIndex);
-      // Canonicalize the trailing-slash variants (the old /dashboard/*
-      // SPA fallback served these too, since react-router ignores a
-      // trailing slash when matching a leaf route) rather than silently
-      // 404ing or double-serving the same content at two URLs.
-      this.app.get('/docs/', c => c.redirect('/docs', 301));
-      this.app.get('/reference/', c => c.redirect('/reference', 301));
-    } else {
-      // No built site available — surface API info instead of a 404 at the
-      // root, for installs with no frontend built yet.
-      this.app.get('/', c => {
-        return c.json({
-          name: 'DROP API',
-          version: getPlatformVersion(),
-          docs: '/api/v1',
-          auth: this.config.enableAuth ? 'enabled' : 'disabled',
-        });
-      });
     }
+
+    // Root (DROP-139): the marketing site, docs and API reference are no
+    // longer built or served by the platform — they live at dropkit.sh,
+    // served by their own drop-site app. A self-hosted install has nothing
+    // of its own to show at `/`, so redirect straight to the dashboard
+    // rather than 404ing or serving the old API-info JSON blob.
+    this.app.get('/', c => c.redirect('/dashboard', 301));
   }
 
   private setupErrorHandling(): void {

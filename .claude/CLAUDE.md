@@ -20,7 +20,6 @@ npm run dev              # Start platform with ts-node (src/index.ts)
 npm run build            # Compile TS (tsc) AND build the dashboard + public site (Vite, both configs)
 npm run build:server     # tsc + scripts/copy-assets.js — skips the dashboard/site builds
 npm run build:dashboard  # Build only the React admin dashboard (cd src/dashboard && vite build)
-npm run build:site       # Build only the public marketing/docs/reference site (cd src/dashboard && vite build --config vite.site.config.ts)
 npm run build:watch      # tsc --watch (server only)
 npm start                # Run compiled dist/index.js
 
@@ -50,7 +49,9 @@ drop migrate-runtime     # Move apps between the PM2 and Docker runtimes
 drop version
 ```
 
-**Building gotcha**: `npm run build` invokes both frontend builds — the admin dashboard AND the public site (DROP-070: one `src/dashboard` npm package, two Vite configs/entry points — `vite.config.ts` for `/dashboard`, `vite.site.config.ts` for `/`, `/docs`, `/reference` — not two packages). Both require the same `src/dashboard` deps. Run `cd src/dashboard && npm install` once first, or use `npm run build:server` when you only changed backend code. If you only changed frontend code, `npm run build:dashboard` / `npm run build:site` build just one side; a change under `src/dashboard/src/components/landing/`, `src/dashboard/src/pages/{Landing,Docs,Reference}Page.tsx`, `src/dashboard/src/{SiteApp,site-main}.tsx`, or `src/dashboard/src/styles/{landing,tokens,site-reset}.css` needs `build:site`, not `build:dashboard`.
+**Building gotcha**: `npm run build` builds the server AND the admin dashboard. The dashboard is a separate npm package, so run `cd src/dashboard && npm install` once first, or use `npm run build:server` when you only changed backend code.
+
+**The marketing site, docs and API reference are NOT in this repo** (DROP-139). They live in `drop-site` (github.com/JulesNsenda/drop-site), are deployed as an ordinary DROP static app, and serve `dropkit.sh/`, `/docs` and `/docs/api` via a hand-written apex Caddy host file. This repo builds `dist/dashboard` only — there is no `dist/site`, no `build:site`, and no `vite.site.config.ts`.
 
 **Testing note**: `jose` (used for JWT) is mocked in tests via `src/__mocks__/jose.ts` (wired through `jest.config.js` `moduleNameMapper`). Tests run on `ts-jest` against `src/**/*.test.ts` — tests are colocated next to the code they cover, with shared helpers in `src/core/__testutils__/` and `src/api/__testutils__/`.
 
@@ -130,7 +131,7 @@ Exceeding a limit returns a **structured refusal**, never a silent kill.
 
 ### REST API (`src/api/`)
 
-Hono-based, served by `ApiServer` (`src/api/server.ts`) on `apiPort` (default 3000). Routes are mounted under **`/api/v1`** (`health`, `auth`, `apps`, `usage`, `logs`, `certs`, `deploys`, `secrets`, `db`, `webhooks`, `git`, `admin`, `oauth`, `mcp-gateway`, plus `POST /mcp`). `ApiServer` also serves both frontend bundles directly at the root level: `/`, `/docs`, `/reference` (the public site, DROP-070) and `/dashboard` (the admin SPA), each behind an explicit-routes-only registration — no bare `/*` catch-all, since that would swallow the `/.well-known/oauth-*` discovery routes below. `/dashboard/docs` and `/dashboard/reference` 301-redirect to their new `/docs` / `/reference` homes.
+Hono-based, served by `ApiServer` (`src/api/server.ts`) on `apiPort` (default 3000). Routes are mounted under **`/api/v1`** (`health`, `auth`, `apps`, `usage`, `logs`, `certs`, `deploys`, `secrets`, `db`, `webhooks`, `git`, `admin`, `oauth`, `mcp-gateway`, plus `POST /mcp`). `ApiServer` serves the admin SPA at `/dashboard`, plus the four root icon routes (`/favicon.ico`, `/drop.svg`, …) from the dashboard bundle — behind explicit-routes-only registration, never a bare `/*` catch-all, since that would swallow the `/.well-known/oauth-*` discovery routes below. `/` 301-redirects to `/dashboard`; `/dashboard/docs` and `/dashboard/reference` redirect out to the public docs site.
 
 Middleware stack (applied in `setupMiddleware`): security headers → CORS → body-size limit → rate limiting (`/api/*`, stricter on `/auth/login`) → request logger → audit logging → error handler. Auth middleware is applied per-route-group only when auth is enabled, with role tiers **`readonly` / `user` / `admin`** (`authMiddleware(role)`).
 
@@ -150,9 +151,11 @@ Three separate things that are easy to confuse:
 
 ### Web Dashboard + public site (`src/dashboard/`)
 
-A **separate npm package** (React 18 + Vite + Tailwind + react-router-dom) — but **two Vite surfaces** sharing one `src/` tree (DROP-070): `vite.config.ts` builds the admin dashboard (`base: /dashboard/`, entry `index.html` → `dist/dashboard/`), and `vite.site.config.ts` builds the public marketing/docs/reference site (`base: /`, entry `site/index.html` → `dist/site/`). Same `package.json`/`node_modules`/`tsconfig.json` for both — not a second package. `ApiServer` prefers the built `dist/dashboard` / `dist/site` over the raw `src/dashboard` (dashboard only; the site build has no source fallback — see `server.ts`). Treat `src/dashboard` as its own frontend project — run `npm` commands from inside it (`npm run build` / `build:site`, `npm run dev` / `dev:site`).
+A **separate npm package** (React 18 + Vite + Tailwind + react-router-dom) with ONE Vite surface: `vite.config.ts` builds the admin dashboard (`base: /dashboard/`, entry `index.html` → `dist/dashboard/`). `ApiServer` prefers the built `dist/dashboard` over the raw source. Treat `src/dashboard` as its own frontend project — run `npm` commands from inside it.
 
-**Invariant the split depends on:** the site bundle (`src/dashboard/src/{SiteApp,site-main}.tsx`, `pages/{Landing,Docs,Reference,SiteNotFound}Page.tsx`, `components/landing/*`) must never import `hooks/useAuth`, `api/client`, `components/Layout`, `Toast`, or `ConfirmDialog` — that's the admin-only code the split exists to keep out of a marketing visitor's download (CI enforces this with a `grep` over the built `dist/site` JS, `deploy.yml`). Cross-bundle navigation (e.g. a "Sign in" link, or the dashboard's logout redirect) is a plain `window.location.href` / `<a href>`, never react-router's `Link`/`navigate()` — each bundle has its own `BrowserRouter` with no shared history.
+**Invariant the split depends on:** admin code must never reach the public marketing/docs bundle. This used to be enforced by a CI `grep` over `dist/site`; since DROP-139 it is **structural** — the site lives in a different repository and cannot import from this one. `styles/tokens.css` is duplicated in both repos deliberately; keep them in sync by hand.
+
+Cross-repo navigation (the site's "Sign in", the dashboard's logout redirect) is a full page load to an absolute URL — the dashboard is on a different HOST now (`dashboard.dropkit.sh`), so a relative `/dashboard/...` path from the site resolves to the apex and 404s.
 
 ### Persistence Model (two file-based layers — important)
 
@@ -238,7 +241,7 @@ Roadmap and conventions live in `docs/VERSION-ROADMAP.md`, `docs/GIT-BRANCHING-M
 - **A push to `develop` deploys production.** `.github/workflows/deploy.yml` triggers on `main`, `develop` and `feature/DROP-v2*`, and its `deploy` job is *not* branch-gated — it ssh's into the `hetzner` environment host (`secrets.DEPLOY_HOST`), runs `sudo systemctl stop drop-platform`, ships the artifact, and brings the service back. Treat any push to `develop` — including a zero-content back-merge — as a production deploy and get explicit consent for it, not just for the push.
 - Branch naming: `feature/`, `bugfix/`, `hotfix/`, `release/`.
 - Conventional commits: `feat(scope): description`, `fix(scope): description`.
-- `deploy.yml` also enforces two guards worth knowing before editing it: the remote deploy script must contain **exactly two apostrophes** (the `ssh` argument delimiters — a stray apostrophe, even in a comment, silently truncates the script mid-execution), and the built `dist/site` JS must not reference admin-only code (the DROP-070 bundle split).
+- `deploy.yml` also enforces two guards worth knowing before editing it: the remote deploy script must contain **exactly two apostrophes** (the `ssh` argument delimiters — a stray apostrophe, even in a comment, silently truncates the script mid-execution).
 
 ## Key Patterns
 
