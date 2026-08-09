@@ -115,6 +115,27 @@ gitDeploy.post('/redeploy/:name', async (c) => {
     return c.json(error(ErrorCodes.SERVICE_UNAVAILABLE, 'git CLI is not available on this system'), 503);
   }
 
+  // Tolerant parse: the body is optional and absent from every caller today
+  // (the dashboard's redeploy button, every existing test request, the
+  // webhook path below) — an unguarded c.req.json() would 500 all of them on
+  // an empty body.
+  const body = await c.req.json<{ tokenId?: unknown }>().catch(() => ({}) as { tokenId?: unknown });
+
+  // Strict shape check: null clears the stored token, a `git_...` id
+  // attaches/replaces one, an omitted key leaves it unchanged. Anything else
+  // 400s — unvalidated input here would land arbitrary JSON in
+  // gitSource.tokenId (apps.json) and flow into `keys.find(k =>
+  // k.startsWith(...))`. Every other body key is ignored.
+  let tokenId: string | null | undefined;
+  if (Object.prototype.hasOwnProperty.call(body, 'tokenId')) {
+    const raw = body.tokenId;
+    if (raw === null || (typeof raw === 'string' && /^git_[A-Za-z0-9]+$/.test(raw))) {
+      tokenId = raw;
+    } else {
+      throw new ValidationError("tokenId must be null or a string matching /^git_[A-Za-z0-9]+$/");
+    }
+  }
+
   const stateManager = getStateManager();
   const app = stateManager.getApp(name);
   if (!app || !canAccess(auth, app)) {
@@ -142,9 +163,13 @@ gitDeploy.post('/redeploy/:name', async (c) => {
   }
 
   try {
+    // Persist to target.name, the RESOLVED app, never c.req.param('name') —
+    // registerApp spreads ...existing, so a gitSource written to a monorepo
+    // child would be permanent and re-expansion could never clear it.
     const result = await service.redeploy(target.name, {
       principalId: auth?.principalId,
       userId: auth?.userId,
+      tokenId,
     });
     await logActivityFor(auth, { action: 'redeploy', appName: target.name });
     return c.json(success(result));
@@ -157,7 +182,7 @@ gitDeploy.post('/redeploy/:name', async (c) => {
     if (message.includes('not found')) {
       return c.json(error(ErrorCodes.NOT_FOUND, message), 404);
     }
-    if (message.includes('not deployed from git')) {
+    if (message.includes('not deployed from git') || message.includes('has no git repository on disk')) {
       return c.json(error(ErrorCodes.BAD_REQUEST, message), 400);
     }
     return c.json(error(ErrorCodes.INTERNAL_ERROR, message), 500);

@@ -169,6 +169,23 @@ function isGroupGitBacked(group: string): boolean {
   }
 }
 
+/**
+ * Strip userinfo from a git repoUrl before it reaches the DTO — a user may
+ * have pasted `https://user:pat@github.com/...`, which would otherwise echo
+ * the credential straight back out to anyone who can read the app. Left
+ * untouched if it doesn't parse as a URL at all.
+ */
+function sanitizeRepoUrl(repoUrl: string): string {
+  try {
+    const u = new URL(repoUrl);
+    u.username = '';
+    u.password = '';
+    return u.toString();
+  } catch {
+    return repoUrl;
+  }
+}
+
 // Helper to convert AppState to AppDto (role-aware)
 function toAppDto(app: AppState, isAdmin = false): AppDto {
   return {
@@ -187,7 +204,17 @@ function toAppDto(app: AppState, isAdmin = false): AppDto {
     buildDuration: app.buildDuration,
     error: app.error,
     missingSecrets: app.missingSecrets,
-    gitSource: app.gitSource,
+    // Keep the FIELD present for non-admins — the dashboard's upload
+    // pre-flight reads gitSource to refuse a git-backed target — but narrow
+    // its contents: repoUrl may carry pasted userinfo credentials, and
+    // tokenId is a correlation handle gated on isAdmin like pid/path above.
+    gitSource: app.gitSource
+      ? {
+          ...app.gitSource,
+          repoUrl: sanitizeRepoUrl(app.gitSource.repoUrl),
+          tokenId: isAdmin ? app.gitSource.tokenId : undefined,
+        }
+      : app.gitSource,
     userId: app.userId,
     ownerName: isAdmin ? resolveUsername(app.userId) : undefined,
     customDomain: app.customDomain,

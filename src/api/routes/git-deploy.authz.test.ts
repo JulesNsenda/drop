@@ -193,6 +193,105 @@ describe('git redeploy route authorization', () => {
     });
   });
 
+  describe('redeploy tokenId attach (DROP-142)', () => {
+    // POST /redeploy/:name has never taken a body before this — every current
+    // caller (the dashboard's redeploy button, every test above) sends none,
+    // so an unguarded c.req.json() would 500 them all.
+    it('a request with no body at all still redeploys (regression: no 500 on empty body)', async () => {
+      const res = await app.request('/api/v1/git/redeploy/alice-app', {
+        method: 'POST',
+        headers: bearer(aliceToken),
+      });
+      expect(res.status).toBe(200);
+      expect(redeploy).toHaveBeenCalledWith('alice-app', expect.objectContaining({ tokenId: undefined }));
+    });
+
+    it('a tokenId in the body is forwarded to the resolved app', async () => {
+      const res = await app.request('/api/v1/git/redeploy/alice-app', {
+        method: 'POST',
+        headers: { ...bearer(aliceToken), 'Content-Type': 'application/json' },
+        body: JSON.stringify({ tokenId: 'git_abc123' }),
+      });
+      expect(res.status).toBe(200);
+      expect(redeploy).toHaveBeenCalledWith('alice-app', expect.objectContaining({ tokenId: 'git_abc123' }));
+    });
+
+    it('tokenId: null is forwarded as-is to clear the stored token', async () => {
+      const res = await app.request('/api/v1/git/redeploy/alice-app', {
+        method: 'POST',
+        headers: { ...bearer(aliceToken), 'Content-Type': 'application/json' },
+        body: JSON.stringify({ tokenId: null }),
+      });
+      expect(res.status).toBe(200);
+      expect(redeploy).toHaveBeenCalledWith('alice-app', expect.objectContaining({ tokenId: null }));
+    });
+
+    it('a malformed tokenId 400s and never reaches the service', async () => {
+      const res = await app.request('/api/v1/git/redeploy/alice-app', {
+        method: 'POST',
+        headers: { ...bearer(aliceToken), 'Content-Type': 'application/json' },
+        body: JSON.stringify({ tokenId: 'DROP TABLE apps' }),
+      });
+      expect(res.status).toBe(400);
+      expect(redeploy).not.toHaveBeenCalled();
+    });
+
+    it('a non-string, non-null tokenId 400s and never reaches the service', async () => {
+      const res = await app.request('/api/v1/git/redeploy/alice-app', {
+        method: 'POST',
+        headers: { ...bearer(aliceToken), 'Content-Type': 'application/json' },
+        body: JSON.stringify({ tokenId: 12345 }),
+      });
+      expect(res.status).toBe(400);
+      expect(redeploy).not.toHaveBeenCalled();
+    });
+
+    it('other body keys are ignored', async () => {
+      const res = await app.request('/api/v1/git/redeploy/alice-app', {
+        method: 'POST',
+        headers: { ...bearer(aliceToken), 'Content-Type': 'application/json' },
+        body: JSON.stringify({ tokenId: 'git_abc123', role: 'admin', userId: 'someone-else' }),
+      });
+      expect(res.status).toBe(200);
+      expect(redeploy).toHaveBeenCalledWith(
+        'alice-app',
+        expect.objectContaining({ tokenId: 'git_abc123', userId: aliceId })
+      );
+    });
+
+    describe('monorepo group child resolution', () => {
+      beforeEach(async () => {
+        const sm = getStateManager();
+        await sm.registerApp('tok-grp-repo', path.join(tempDir, 'tok-grp-repo'));
+        await sm.updateApp('tok-grp-repo', {
+          userId: aliceId,
+          group: 'tok-grp',
+          isGroupContainer: true,
+          gitSource: {
+            repoUrl: 'https://github.com/acme/tok-grp',
+            branch: 'main',
+            autoRedeploy: true,
+          },
+        });
+        await sm.registerApp('tok-grp-backend', path.join(tempDir, 'tok-grp-backend'));
+        await sm.updateApp('tok-grp-backend', { userId: aliceId, group: 'tok-grp' });
+      });
+
+      it('a tokenId attached while redeploying a group CHILD is forwarded to the CONTAINER, not the child', async () => {
+        const res = await app.request('/api/v1/git/redeploy/tok-grp-backend', {
+          method: 'POST',
+          headers: { ...bearer(aliceToken), 'Content-Type': 'application/json' },
+          body: JSON.stringify({ tokenId: 'git_abc123' }),
+        });
+        expect(res.status).toBe(200);
+        expect(redeploy).toHaveBeenCalledWith(
+          'tok-grp-repo',
+          expect.objectContaining({ tokenId: 'git_abc123' })
+        );
+      });
+    });
+  });
+
   describe('caller identity is never read from the request body', () => {
     // POST /git/deploy parses the client body AS GitDeployRequest, and that
     // type carries the two identity fields. A caller that can name its own

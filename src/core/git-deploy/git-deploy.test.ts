@@ -7,7 +7,7 @@ import * as path from 'path';
 import * as os from 'os';
 import { execFile } from 'child_process';
 import { GitDeployService, resetGitDeployService } from './git-deploy';
-import { resetStateManager, getStateManager } from '../../managers/app/state-manager';
+import { resetStateManager, getStateManager, AppStateManager } from '../../managers/app/state-manager';
 import { resetSecretManager, getSecretManager } from '../../managers/secret';
 import {
   AppConfigService,
@@ -323,9 +323,19 @@ describe('GitDeployService', () => {
   });
 
   describe('redeploy', () => {
+    // service.deploy()'s clone is mocked (see the module mock above) and never
+    // creates a real directory, but redeploy() now fails fast when `.git` is
+    // missing on disk (DROP-142 Fix 4) — every test below that expects the
+    // pull itself to run must create it, the same workaround the config
+    // write-ordering tests below already use for the missing clone side effect.
+    async function makeGitDir(appName: string): Promise<void> {
+      await fs.mkdir(path.join(tempDir, 'webapps', appName, '.git'), { recursive: true });
+    }
+
     it('publishes app:update with bypassCooldown after a successful pull', async () => {
       const appName = 'redeploy-app';
       await service.deploy({ repoUrl: `https://github.com/user/${appName}`, branch: 'main' });
+      await makeGitDir(appName);
 
       const received: AppUpdatePayload[] = [];
       const unsubscribe = eventBus.subscribe('app:update', (payload) => {
@@ -348,6 +358,7 @@ describe('GitDeployService', () => {
     it('clears isCloning before publishing app:update', async () => {
       const appName = 'redeploy-cloning-app';
       await service.deploy({ repoUrl: `https://github.com/user/${appName}`, branch: 'main' });
+      await makeGitDir(appName);
 
       let isCloningWhenEventFired: boolean | undefined;
       const unsubscribe = eventBus.subscribe('app:update', (payload) => {
@@ -367,6 +378,7 @@ describe('GitDeployService', () => {
     it('does not publish app:update and rejects when git pull fails', async () => {
       const appName = 'redeploy-fail-app';
       await service.deploy({ repoUrl: `https://github.com/user/${appName}`, branch: 'main' });
+      await makeGitDir(appName);
 
       // Override the NEXT execFile call only - the pull inside redeploy() is
       // the first (and, without a token, only) execFile call it makes.
@@ -387,6 +399,205 @@ describe('GitDeployService', () => {
       } finally {
         unsubscribe();
       }
+    });
+
+    it('rejects fast when .git is missing on disk, without attempting a pull (Fix 4)', async () => {
+      const appName = 'redeploy-no-git-app';
+      await service.deploy({ repoUrl: `https://github.com/user/${appName}`, branch: 'main' });
+      // Deliberately do NOT create .git — simulates an upload-deploy prune or
+      // a monorepo re-materialization that removed the real repository while
+      // gitSource stayed behind in state.
+
+      const pullCallsBefore = (execFile as unknown as jest.Mock).mock.calls.filter(
+        (call) => call[1]?.[0] === 'pull' || call[1]?.includes('pull')
+      ).length;
+
+      await expect(service.redeploy(appName)).rejects.toThrow(/has no git repository on disk/);
+
+      const pullCallsAfter = (execFile as unknown as jest.Mock).mock.calls.filter(
+        (call) => call[1]?.[0] === 'pull' || call[1]?.includes('pull')
+      ).length;
+      expect(pullCallsAfter).toBe(pullCallsBefore);
+    });
+
+    describe('token attach (DROP-142)', () => {
+      it('a successfully attached tokenId is persisted after a SUCCESSFUL pull — the inverted case', async () => {
+        // A naive fix that spreads the STALE captured `app.gitSource` when
+        // building the post-pull update would silently revert this attach on
+        // exactly this path; a test that only covers a failing pull cannot
+        // catch that (see the test below and the comment on git-deploy.ts).
+        const appName = 'redeploy-attach-success';
+        await service.deploy({ repoUrl: `https://github.com/user/${appName}`, branch: 'main' });
+        await makeGitDir(appName);
+        const stored = await service.setToken('recovery-token', 'ghp_recoveryvalue');
+
+        const result = await service.redeploy(appName, { tokenId: stored.id });
+
+        expect(result.appName).toBe(appName);
+        const app = getStateManager().getApp(appName);
+        expect(app?.gitSource?.tokenId).toBe(stored.id);
+      });
+
+      it('attaching a tokenId whose pull then FAILS does not persist the attach — resend it on retry', async () => {
+        // redeploy() writes gitSource exactly once, after a successful pull —
+        // there is no separate pre-pull write to revert. On a failing pull the
+        // function throws before that write is ever reached, so a fresh
+        // attach requested on THIS call is not recorded; a caller must resend
+        // tokenId on the next attempt.
+        const appName = 'redeploy-attach-fails';
+        await service.deploy({ repoUrl: `https://github.com/user/${appName}`, branch: 'main' });
+        await makeGitDir(appName);
+        const stored = await service.setToken('doomed-token', 'ghp_doomedvalue');
+
+        (execFile as unknown as jest.Mock).mockImplementationOnce(
+          (_cmd: string, _args: string[], _opts: unknown, cb?: (err: Error) => void) => {
+            if (cb) cb(new Error('fatal: could not read from remote repository'));
+            return {} as unknown;
+          }
+        );
+
+        await expect(service.redeploy(appName, { tokenId: stored.id })).rejects.toThrow();
+        const app = getStateManager().getApp(appName);
+        expect(app?.gitSource?.tokenId).toBeUndefined();
+      });
+
+      it('an already-stored tokenId survives a redeploy call whose pull fails (no unrelated token change)', async () => {
+        // Complements the test above: a redeploy that does NOT request a
+        // token change (actor.tokenId omitted) and then fails must not wipe
+        // out a token attached by an earlier, successful redeploy.
+        const appName = 'redeploy-keeps-token-on-fail';
+        await service.deploy({ repoUrl: `https://github.com/user/${appName}`, branch: 'main' });
+        await makeGitDir(appName);
+        const stored = await service.setToken('kept-token', 'ghp_keptvalue');
+        await service.redeploy(appName, { tokenId: stored.id });
+        expect(getStateManager().getApp(appName)?.gitSource?.tokenId).toBe(stored.id);
+
+        (execFile as unknown as jest.Mock).mockImplementationOnce(
+          (_cmd: string, _args: string[], _opts: unknown, cb?: (err: Error) => void) => {
+            if (cb) cb(new Error('fatal: could not read from remote repository'));
+            return {} as unknown;
+          }
+        );
+
+        await expect(service.redeploy(appName)).rejects.toThrow();
+        expect(getStateManager().getApp(appName)?.gitSource?.tokenId).toBe(stored.id);
+      });
+
+      it('tokenId: null clears a previously attached token', async () => {
+        const appName = 'redeploy-clear-token';
+        await service.deploy({ repoUrl: `https://github.com/user/${appName}`, branch: 'main' });
+        await makeGitDir(appName);
+        const stored = await service.setToken('to-clear', 'ghp_toclear');
+        await service.redeploy(appName, { tokenId: stored.id });
+        expect(getStateManager().getApp(appName)?.gitSource?.tokenId).toBe(stored.id);
+
+        await service.redeploy(appName, { tokenId: null });
+
+        const app = getStateManager().getApp(appName);
+        expect(app?.gitSource?.tokenId).toBeUndefined();
+        // Cleared as `undefined`, never persisted as the literal string "null".
+        expect(app?.gitSource?.tokenId).not.toBe('null');
+      });
+
+      it('an omitted tokenId leaves a previously attached token unchanged', async () => {
+        const appName = 'redeploy-leave-token';
+        await service.deploy({ repoUrl: `https://github.com/user/${appName}`, branch: 'main' });
+        await makeGitDir(appName);
+        const stored = await service.setToken('unchanged', 'ghp_unchanged');
+        await service.redeploy(appName, { tokenId: stored.id });
+
+        await service.redeploy(appName);
+
+        expect(getStateManager().getApp(appName)?.gitSource?.tokenId).toBe(stored.id);
+      });
+
+      it('a redeploy with no actor at all (webhook shape) is unaffected by the tokenId change', async () => {
+        // routes/git-deploy.ts's webhook handler calls redeploy(appName,
+        // { automation: 'webhook' }) with no tokenId — must keep working
+        // exactly as before.
+        const appName = 'redeploy-webhook-app';
+        await service.deploy({ repoUrl: `https://github.com/user/${appName}`, branch: 'main' });
+        await makeGitDir(appName);
+
+        const result = await service.redeploy(appName, { automation: 'webhook' });
+
+        expect(result.appName).toBe(appName);
+        expect(getStateManager().getApp(appName)?.gitSource?.tokenId).toBeUndefined();
+      });
+
+      it('leaves no token text in any execFile argv (ps-visibility)', async () => {
+        const appName = 'redeploy-no-argv-leak';
+        await service.deploy({ repoUrl: `https://github.com/user/${appName}`, branch: 'main' });
+        await makeGitDir(appName);
+        const secretValue = 'ghp_totallysecretvalue';
+        const stored = await service.setToken('argv-check', secretValue);
+
+        await service.redeploy(appName, { tokenId: stored.id });
+
+        for (const call of (execFile as unknown as jest.Mock).mock.calls) {
+          const args = (call[1] ?? []) as string[];
+          for (const arg of args) {
+            expect(String(arg)).not.toContain(secretValue);
+          }
+        }
+      });
+
+      it('a monorepo child resolution invariant: redeploying the container writes gitSource there, never to a sibling child', async () => {
+        // Mirrors what routes/git-deploy.ts does (resolve a child to its
+        // container, then call redeploy(target.name, ...)) at the service
+        // level, with a REAL state manager rather than a mocked route.
+        const sm = getStateManager();
+        await sm.registerApp('grp-container', path.join(tempDir, 'webapps', 'grp-container'));
+        await sm.updateApp('grp-container', {
+          group: 'grp',
+          isGroupContainer: true,
+          gitSource: {
+            repoUrl: 'https://github.com/acme/grp',
+            branch: 'main',
+            autoRedeploy: true,
+          },
+        });
+        await sm.registerApp('grp-child', path.join(tempDir, 'webapps', 'grp-child'));
+        await fs.mkdir(path.join(tempDir, 'webapps', 'grp-container', '.git'), { recursive: true });
+        const stored = await service.setToken('group-token', 'ghp_groupvalue');
+
+        await service.redeploy('grp-container', { tokenId: stored.id });
+
+        expect(sm.getApp('grp-container')?.gitSource?.tokenId).toBe(stored.id);
+        expect(sm.getApp('grp-child')?.gitSource).toBeUndefined();
+      });
+    });
+  });
+
+  describe('attached tokenId survives a platform restart (DROP-142)', () => {
+    // gitSource has no second store (unlike port, mirrored into
+    // data/appconf/webapps/): it lives ONLY in apps.json. A fresh
+    // StateManager instance re-reading that file IS the persistence boundary
+    // a platform restart crosses.
+    it('is present after a fresh StateManager reloads apps.json, and survives boot reconciliation re-registering the app', async () => {
+      const appName = 'redeploy-restart-app';
+      await service.deploy({ repoUrl: `https://github.com/user/${appName}`, branch: 'main' });
+      await fs.mkdir(path.join(tempDir, 'webapps', appName, '.git'), { recursive: true });
+      const stored = await service.setToken('restart-token', 'ghp_restartvalue');
+      await service.redeploy(appName, { tokenId: stored.id });
+
+      // Flush the debounced save and tear down the live instance, mirroring
+      // an actual shutdown.
+      await getStateManager().close();
+
+      const stateFilePath = path.join(tempDir, 'apps.json');
+      const reloaded = new AppStateManager({ stateFilePath });
+      await reloaded.initialize();
+      expect(reloaded.getApp(appName)?.gitSource?.tokenId).toBe(stored.id);
+
+      // Boot reconciliation's syncStateWithConfigs calls registerApp() for
+      // every app on every boot, which MERGES over the existing entry
+      // (`...existing`) rather than rebuilding it from a literal — confirm
+      // that pass doesn't drop the attach either.
+      await reloaded.registerApp(appName, path.join(tempDir, 'webapps', appName));
+      expect(reloaded.getApp(appName)?.gitSource?.tokenId).toBe(stored.id);
+
+      await reloaded.close();
     });
   });
 

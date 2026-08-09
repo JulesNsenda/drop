@@ -199,6 +199,56 @@ describe('GET /api/v1/apps/:name DTO contract', () => {
     const body = (await res.json()) as { data: Record<string, unknown> };
     expect(body.data.groupGitBacked).toBeUndefined();
   });
+
+  describe('gitSource narrowing (DROP-142)', () => {
+    beforeEach(async () => {
+      await getStateManager().updateApp('test-app', {
+        gitSource: {
+          repoUrl: 'https://ghost:ghp_supersecretpat@github.com/acme/test-app',
+          branch: 'main',
+          autoRedeploy: true,
+          tokenId: 'git_abc123',
+        },
+      });
+    });
+
+    it('non-admin owner sees a credential-stripped repoUrl and no tokenId, but gitSource itself is still present', async () => {
+      const res = await hono.request('/api/v1/apps/test-app', { headers: authHeader(userToken) });
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as { data: Record<string, unknown> };
+      expect(body.data.gitSource).toBeDefined();
+      const gitSource = body.data.gitSource as Record<string, unknown>;
+      // No userinfo — the pasted credential must not echo back.
+      expect(gitSource.repoUrl).toBe('https://github.com/acme/test-app');
+      expect(gitSource.tokenId).toBeUndefined();
+      // Untouched fields still come through.
+      expect(gitSource.branch).toBe('main');
+    });
+
+    it('admin sees both the tokenId and a credential-stripped repoUrl', async () => {
+      const res = await hono.request('/api/v1/apps/test-app', { headers: authHeader(adminToken) });
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as { data: Record<string, unknown> };
+      const gitSource = body.data.gitSource as Record<string, unknown>;
+      expect(gitSource.tokenId).toBe('git_abc123');
+      // Admin is not exempt from the userinfo strip either.
+      expect(gitSource.repoUrl).toBe('https://github.com/acme/test-app');
+    });
+
+    it('leaves an already-clean repoUrl untouched', async () => {
+      await getStateManager().updateApp('test-app', {
+        gitSource: {
+          repoUrl: 'https://github.com/acme/test-app',
+          branch: 'main',
+          autoRedeploy: true,
+        },
+      });
+      const res = await hono.request('/api/v1/apps/test-app', { headers: authHeader(adminToken) });
+      const body = (await res.json()) as { data: Record<string, unknown> };
+      const gitSource = body.data.gitSource as Record<string, unknown>;
+      expect(gitSource.repoUrl).toBe('https://github.com/acme/test-app');
+    });
+  });
 });
 
 describe('GET /api/v1/apps list DTO contract', () => {

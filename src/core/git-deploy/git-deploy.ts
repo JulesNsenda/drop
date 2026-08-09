@@ -276,6 +276,17 @@ export class GitDeployService {
       throw new Error(`Application '${appName}' was not deployed from git`);
     }
 
+    // Fail fast if the source tree no longer has a git repository. An upload
+    // deploy (syncTree's prune) or a monorepo re-materialization can remove
+    // the real .git while state still carries a gitSource; without this check
+    // `git pull` walks UP the ancestor chain looking for a repository instead
+    // of failing with a clear message.
+    try {
+      await fs.access(path.join(app.path, '.git'));
+    } catch {
+      throw new Error(`Application '${appName}' has no git repository on disk (.git is missing)`);
+    }
+
     // GUARDRAIL + QUOTA, before the pull. A redeploy is the request an agent
     // repeats, and git pull + rebuild is not free.
     await admitDeploy(appName, false, {
@@ -292,14 +303,22 @@ export class GitDeployService {
       );
     }
 
-    const { repoUrl, branch, tokenId } = app.gitSource;
+    const { repoUrl, branch } = app.gitSource;
+
+    // undefined (the default, via omission) leaves the stored token
+    // unchanged; null clears it; a string attaches/replaces it. Resolved once
+    // and used for BOTH the pull and the final gitSource below — `app` is a
+    // snapshot captured above, and updateApp REPLACES the map entry rather
+    // than mutating it, so a second read of app.gitSource after this point
+    // would still see the pre-redeploy value.
+    const effectiveTokenId = actor.tokenId !== undefined ? actor.tokenId : app.gitSource.tokenId;
 
     // Resolve token if needed
     let token: string | undefined;
-    if (tokenId) {
-      token = await this.getTokenValue(tokenId);
+    if (effectiveTokenId) {
+      token = await this.getTokenValue(effectiveTokenId);
       if (!token) {
-        logger.warn(`Token '${tokenId}' not found for ${appName} - trying without auth`, 'GIT-DEPLOY');
+        logger.warn(`Token '${effectiveTokenId}' not found for ${appName} - trying without auth`, 'GIT-DEPLOY');
       }
     }
 
@@ -325,8 +344,12 @@ export class GitDeployService {
 
     const clonedAt = new Date().toISOString();
 
+    // Built from effectiveTokenId, NOT app.gitSource.tokenId — see the note
+    // above. Spreading the stale field here would silently revert an attach
+    // on this success path (the defect two independent reviewers found).
     const gitSource: GitSource = {
       ...app.gitSource,
+      tokenId: effectiveTokenId === null ? undefined : effectiveTokenId,
       lastCommitSha: commitSha,
       lastClonedAt: clonedAt,
     };

@@ -27,6 +27,14 @@ export interface DeployActor {
   principalId?: string;
   userId?: string;
   automation?: 'webhook';
+  /**
+   * Attach/clear a stored token at redeploy time (DROP-142 — lets an operator
+   * recover an app whose repo went public → private). `undefined` (the
+   * default, via omission) leaves the stored token unchanged; `null` clears
+   * it; a string replaces it. Rides this existing actor rather than a third
+   * `redeploy()` parameter — see the arity note on `GitDeployService.redeploy`.
+   */
+  tokenId?: string | null;
 }
 
 export interface GitDeployRequest {
