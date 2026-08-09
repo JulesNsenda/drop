@@ -264,7 +264,7 @@ function DeployPage() {
    * bytes read, so a name is available before the pre-flight check below —
    * which must run before the possibly-large archive is built.
    */
-  const deriveRootDirectoryName = (files: FileList): string | null => {
+  const deriveRootDirectoryName = (files: ArrayLike<File>): string | null => {
     const normalized: string[] = [];
     for (let i = 0; i < files.length; i++) {
       try {
@@ -328,11 +328,24 @@ function DeployPage() {
   };
 
   const uploadFiles = async (files: FileList) => {
+    // Re-entrancy guard. The drop zone's onClick is gated on this, but a DROP
+    // is not, and the tabs share `status`/`deployStep`/`deployedApp` — so a
+    // second selection (or a switch to this tab mid-git-deploy) could start a
+    // parallel run. Two consequences, both worse than a no-op: the two poll
+    // loops race to write the same state, and `ConfirmProvider` holds exactly
+    // one pending resolve, so a second confirmDialog() overwrites the first —
+    // whose `await` then never settles at all.
+    if (status === 'deploying') return;
     if (files.length === 0) return;
+
+    // Snapshot the FileList. It comes from a live `DataTransfer` on the drop
+    // path, and the two awaits below (pre-flight, confirmation) yield the
+    // event loop before the bytes are read.
+    const picked = Array.from(files);
 
     // /:name/source takes the app name from the URL path — unlike git
     // deploy, there is no server-side auto-generation to fall back on.
-    const name = uploadAppName.trim() || deriveRootDirectoryName(files) || '';
+    const name = uploadAppName.trim() || deriveRootDirectoryName(picked) || '';
     if (!name) {
       setStatus('error');
       setMessage('Enter an application name, or select a folder — its name is used.');
@@ -392,7 +405,7 @@ function DeployPage() {
       }
 
       setDeployStep('Building archive...');
-      const archive = await buildArchiveFromFiles(files);
+      const archive = await buildArchiveFromFiles(picked);
       setUploadFileCount(archive.fileCount);
       setUploadBytes(archive.bytes);
       setUploadSkipped(archive.skipped);
@@ -481,7 +494,23 @@ function DeployPage() {
             <p className="mb-6 text-sm leading-relaxed" style={{ color: 'var(--text-2)' }}>
               {message}
             </p>
-            <Button variant="primary" onClick={() => setStatus('idle')}>
+            {/* Clear the upload-derived display state too, not just the
+                status. `uploadFiles` resets these only just before the
+                pre-flight, so a failure AFTER the archive was built (409, 413,
+                429) leaves them populated — and the skipped-paths panel would
+                then show the abandoned attempt's file count and skip list on
+                the idle form, as though it described the next upload. The git
+                fields are deliberately preserved: those are inputs to correct
+                and resubmit, whereas these are outputs of one specific run. */}
+            <Button
+              variant="primary"
+              onClick={() => {
+                setStatus('idle');
+                setUploadFileCount(0);
+                setUploadBytes(0);
+                setUploadSkipped([]);
+              }}
+            >
               Try again
             </Button>
           </Card>

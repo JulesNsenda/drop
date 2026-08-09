@@ -184,6 +184,60 @@ describe('buildTar', () => {
     expect(REGULAR_FILE_TYPES.has(parsed[1].type)).toBe(true);
   });
 
+  // The exact field widths are what discriminate `writeBytes` (no NUL
+  // terminator, correct for name/prefix) from `writeTerminatedString` (which
+  // would silently drop the field's last byte). Nothing else in this suite
+  // lands on those boundaries, so a regression that swapped the two helpers
+  // would pass every other test here.
+  it('round-trips a name of exactly 100 bytes, which must not be NUL-terminated', async () => {
+    const name = 'a'.repeat(100);
+    expect(Buffer.byteLength(name, 'utf8')).toBe(100);
+
+    const [entry] = await parseThroughNodeTar(toBuffer(buildTar([{ path: name, data: encoder.encode('x') }])));
+    expect(entry.path).toBe(name); // a terminator would truncate this to 99
+  });
+
+  it('round-trips a prefix of exactly 155 bytes', async () => {
+    // 155-byte prefix + '/' + a 40-byte name: both fields at/inside their
+    // limits, with the prefix exactly full.
+    const prefix = 'p'.repeat(155);
+    const base = 'b'.repeat(40);
+    const full = `${prefix}/${base}`;
+
+    const [entry] = await parseThroughNodeTar(toBuffer(buildTar([{ path: full, data: encoder.encode('y') }])));
+    expect(entry.path).toBe(full);
+  });
+
+  it('emits a well-formed terminator and nothing else for no entries', () => {
+    // `buildTar` is exported with no precondition against an empty list — the
+    // dashboard refuses that case earlier, but the contract should still hold.
+    // Asserted on the bytes rather than round-tripped: node-tar emits
+    // TAR_BAD_ARCHIVE for an archive with no entries (measured), and the
+    // helper above treats any warning as fatal, which is the behaviour the
+    // server's own extractor relies on.
+    const buf = toBuffer(buildTar([]));
+
+    expect(buf.length).toBe(1024);
+    expect(buf.every((b) => b === 0)).toBe(true);
+  });
+
+  it('refuses a size that would overflow its octal field rather than corrupting the header', () => {
+    // padStart pads but never truncates, so without the guard an oversized
+    // value runs into the next field — and the checksum, computed last, makes
+    // the corruption verify. A real buffer this size cannot be allocated, so
+    // the guard is checked against a stubbed byteLength.
+    const oversized = { path: 'big.bin', data: { byteLength: 0o77777777777 + 1 } as Uint8Array };
+    expect(() => buildTar([oversized as TarEntry])).toThrow(TarWriteError);
+  });
+
+  it('refuses a path whose only "/" is its final byte, which would empty the name field', () => {
+    // node-tar reads `prefix + '/'` with an empty name as a DIRECTORY and
+    // discards the body. `normalizeEntryPath` strips trailing slashes, so the
+    // dashboard cannot reach this — but `buildTar` is a public export.
+    const trailing = `${'d'.repeat(120)}/`;
+    expect(() => buildTar([{ path: trailing, data: encoder.encode('z') }])).toThrow(TarWriteError);
+  });
+
   it('throws when a single-segment path alone exceeds 100 bytes', () => {
     const longPath = 'a'.repeat(150);
     expect(() => buildTar([{ path: longPath, data: new Uint8Array(0) }])).toThrow(TarWriteError);

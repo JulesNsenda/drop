@@ -63,7 +63,12 @@ export interface BuiltArchive {
 }
 
 /**
- * Build a gzipped tar `Blob` from a `FileList`.
+ * Build a gzipped tar `Blob` from a picked set of files.
+ *
+ * Takes `ArrayLike<File>` rather than `FileList` so the caller can snapshot a
+ * live `DataTransfer` list with `Array.from` before awaiting — the drop path
+ * yields the event loop twice (pre-flight, confirmation) before any byte is
+ * read here.
  *
  * Order matters: normalize + strip the common root first so exclusion and
  * collision checks see the same paths the tar writer will use; exclude
@@ -71,7 +76,7 @@ export interface BuiltArchive {
  * be able to trigger either; check budgets before reading any bytes, since
  * that's the whole point of a client-side cap.
  */
-export async function buildArchiveFromFiles(files: FileList): Promise<BuiltArchive> {
+export async function buildArchiveFromFiles(files: ArrayLike<File>): Promise<BuiltArchive> {
   if (typeof CompressionStream === 'undefined') {
     throw new UploadArchiveError(
       `This browser can't compress uploads in-tab (needs CompressionStream: Chrome 80+, Firefox 113+, Safari 16.4+). ${CLI_ALTERNATIVE}`
