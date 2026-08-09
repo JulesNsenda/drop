@@ -12,9 +12,15 @@
  * public surface, change it here too — a rendering test proves the string
  * appears on the page, not that a reader can use it.
  *
+ * DROP-139 moved the marketing site and docs to their own repository, so four
+ * of these sources are no longer in this tree and no build here can fail when
+ * one of them drifts. The copies below are therefore the only mechanism left:
+ * keep them, and treat a change in drop-site as requiring a change here.
+ *
  * Sources:
- *   - src/dashboard/src/components/landing/DocsContent.tsx  (/docs)
- *   - src/dashboard/src/components/landing/LandingSections.tsx  (/)
+ *   - drop-site: src/components/landing/DocsContent.tsx  (dropkit.sh/docs)
+ *   - drop-site: src/components/landing/LandingSections.tsx  (dropkit.sh/)
+ *   - drop-site: public/llms.txt  (dropkit.sh/llms.txt — read by agents)
  *   - README.md
  *   - docs/AGENT-DEPLOY.md
  */
@@ -89,6 +95,25 @@ env:
   NODE_ENV: production
 secrets:
   JWT_SECRET: generate
+`,
+
+  // llms.txt is fetched and acted on by agents rather than read by a person,
+  // so an invalid sample here becomes a failed deploy attempt, not a puzzled
+  // reader who tries something else.
+  'llms.txt: quickstart drop.yaml': `
+name: my-app
+type: nodejs
+domains:
+  - app.example.com
+port: 4001
+build: npm run build
+start: node dist/server.js
+database: postgres
+env:
+  NODE_ENV: production
+secrets:
+  JWT_SECRET: generate
+healthCheck: /healthz
 `,
 
   'README: configuration example': `
