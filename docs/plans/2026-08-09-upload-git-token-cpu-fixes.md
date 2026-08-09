@@ -206,6 +206,20 @@ is reached by root tsc, eslint and jest. Only DOM glue stays in the dashboard.
         `node_modules` alone exceeds the 20 000-entry cap, and `.git` pack files
         are near-incompressible against the 100 MB cap. Fail fast in the client
         above 20 000 entries, naming the cap.
+      - **`.git` is load-bearing after Item 0.** The server now *rejects* an
+        archive containing it (`reason: vcs_metadata`) — this is the deliberate
+        client-strips / server-refuses split recorded under Item 0's diff-stage
+        critiques. So the client MUST strip `.git` and show it in the skipped
+        list, or every folder drop from a checked-out repo 400s. Share the rule
+        rather than re-deriving it, so the two layers cannot drift — but **move
+        `isVcsMetadataComponent` into `src/utils/upload-paths.ts` and re-point
+        `tar-extract.ts` at it**. Item 0 exports it from `tar-extract.ts`, which
+        is correct there (nothing in a browser touches it yet) but must NOT be
+        the browser's import source: that module pulls in `node:fs`,
+        `node:zlib`, `node:path` and node-tar, so importing it from the
+        dashboard would drag all of that into the Vite bundle — either failing
+        to resolve the `node:` specifiers or polyfilling them in. `upload-paths.ts`
+        is already specced as the DOM-free, node-free home for exactly this.
 - [ ] **`src/utils/tar-writer.test.ts`**, **`src/utils/upload-paths.test.ts`**
       (new) — round-trip generated archives through **node-tar** (the backend's
       own parser, already a root dep) and `zlib.gunzipSync`, not through
@@ -619,6 +633,89 @@ CVE-2019-1353 class).
 finding returned by the two completed critics is recorded above.
 
 ---
+
+## Agent critiques considered — diff stage
+
+### Item 0 · pass 1
+
+Panel: `security-critic` (`model: opus`), `architecture-critic` (`model: opus`),
+`code-reviewer` (`model: Sonnet 5`) — all three on the real diff. The
+code-reviewer returned **APPROVED**.
+
+**The disagreement, and how it was broken.** The two senior critics reached
+opposite conclusions on the central design choice:
+
+- `security-critic` (finding 8, low/high): *"reject-whole-archive is the **right**
+  call here — I'd keep it; skipping the entry would mean a silently modified
+  extraction."*
+- `architecture-critic` (high/high): *"Strip rather than reject… The security
+  delta is zero… Reject-vs-strip is purely a UX call."*
+
+Both are right on their own terms — the architecture critic is correct that
+stripping is *equally safe for this vector*, since `syncTree`'s prune removes any
+pre-existing `.git` and an uploaded one can only land because the archive
+carried it. It is a UX call, not a security one.
+
+**Resolved as a layering decision, not a single answer — the client strips, the
+server refuses.** An earlier draft of this section justified reject on the
+grounds that stripping would be a "silent modification" inconsistent with making
+dropped corrupt entries fatal. That argument does not survive scrutiny and is
+withdrawn: a corrupt entry is an archive the caller *believes* is intact, while
+`.git` is a known, named, documented exclusion — the same class as
+`node_modules`, which Item 1 strips client-side without anyone calling it
+silent. Keeping it would also have put Items 0 and 1 in direct contradiction,
+with the UI stripping `.git` and the server rejecting it.
+
+The honest split:
+
+- **Item 1's browser client strips `.git` before building the archive and shows
+  the user exactly what it skipped**, so the dashboard path never trips the
+  server guard. Convenience layer, informed user.
+- **`extractTarball` refuses**, because its callers are hand-rolled clients and
+  agents where a hard, named error (`reason: vcs_metadata`) is a better signal
+  than a tree that quietly differs from the archive they believe they sent.
+  Boundary layer, no guessing about intent.
+
+Cost accepted, and recorded rather than discounted: `admitDeploy` runs *before*
+extraction, so a rejected retry burns principal quota, and `tar -czf app.tgz .`
+from a working tree is a breaking change for existing hand-rolled callers. Both
+are mitigated by the doc and changelog entries below, and by rejecting in the
+MCP tool before staging. The architecture critic's operational consequences were
+all actioned.
+
+| Severity / confidence | Finding | Disposition |
+|---|---|---|
+| **high/high (arch) + medium/high (security), independently** | `firstWarning` is read only when `fileCount === 0`, so a non-empty archive with a corrupt entry extracts a **partial tree**, reports success, and `syncTree` then prunes the destination to match — deleting files. The diff *observed* the condition and discarded it. Measured by both. | **Actioned** — any parser warning is now fatal (`invalid_archive`) in the listener; deletes `ExtractionOutcome`, the widened return type and the runtime type-leak with it |
+| high/high (arch) | If reject is kept, the diff is incomplete: `AGENT-DEPLOY.md` presents `--exclude .git` as *advice*, and `CHANGELOG.md` `[Unreleased]` is empty while release notes are machine-extracted from it | **Actioned** — both updated; the doc now states rejection is mandatory and why |
+| high/high (arch) | MCP `deploy_files` accepts a `.git/config` entry, stages it, tars it, **burns quota via `admitDeploy`**, and only then fails in the extractor | **Actioned** — rejected in `validateStagedRelativePath`, before staging |
+| low/medium (security) + low/medium (arch) | Windows aliases reach a real `.git` past the guard: NTFS 8.3 short names (`GIT~1`) resolve via lstat in `syncTree`'s `copyInto`; alternate data streams (`.git::$INDEX_ALLOCATION`) likewise | **Actioned** — both normalized in the predicate |
+| low/medium (arch) | The comment mislabels trailing-dot/space as "the CVE-2019-1353 class" — 1353 is the 8.3 short-name issue, 1352 is ADS | **Actioned** — CVE numbers dropped entirely rather than risk another mislabel; mechanisms described plainly. A wrong CVE reference is worse than none |
+| low/high (security) | `entry.path` (≈256 bytes of arbitrary attacker UTF-8) reaches an **unfenced** MCP tool result, in a file that wraps third-party text in `wrapUntrusted` three lines away | **Actioned** |
+| low/high (security) + low/high (arch) + low/high (code-review) | Test gaps: GNU `L` long-name smuggling unpinned (only PAX covered); bare `.git/` directory entry (typeflag 5) untested; legitimately-empty archives don't assert the *absence* of a suffix; the warning test couples to node-tar's warn-code vocabulary | **All actioned** |
+| low/high (security) | The `.git` invariant is enforced in one place and documented in none of the callers — `tree-sync.ts`'s header states only the symlink obligation. CLAUDE.md: *"a boundary that holds only when callers are careful is not a boundary."* | **Actioned** — predicate exported as a named policy; obligation recorded in `tree-sync.ts` and `upload-deploy.ts` headers |
+| low/medium (security) | After the prune deletes a git app's real `.git`, `gitPull` walks **up** the ancestor chain looking for a repository (no `--git-dir`, no `GIT_CEILING_DIRECTORIES`) | **Deferred to Item 2**, which owns `git-client.ts`. Not exploitable today (no ancestor is a repo) but it converts a clear failure into "git operates on whatever repo it finds above the app." Strengthens the case for refusing uploads onto git-backed apps |
+| low/medium (arch) | `vcs_metadata` is category-shaped where its neighbours are mechanism-shaped, and promises `.hg`/`.svn` coverage it doesn't implement | **Rejected.** `.hg`/`.svn` lack the execution property that makes `.git` dangerous — nothing runs `hg pull` on the host — so covering them is surface for no gain. Renaming to `disallowed_path` churns a shipped reason string for a naming preference; no consumer switches on it |
+| low/high (code-review) | The "kept off the public `TarExtractResult`" comment overstates what is hidden — the field is present at runtime | **Moot** — the interface is deleted by the first row |
+| low/high (security) | Whole-archive rejection is a hard break for `tar -czf .` from a working tree | **Accepted, no code change** — see the tie-break above; mitigated by the doc and changelog entries |
+
+**One decision made in passing, recorded so it is not rediscovered:**
+`invalid_archive` now labels two distinct failure modes — a corrupt gzip stream
+(`gunzip.on('error')`, the pre-existing use) and a tar entry node-tar dropped
+(the new fatal-warning path). Those are different problems for a caller: the
+first means the upload itself is damaged, the second means the archive was
+built wrong. **Left shared deliberately**, on the same grounds that
+`disallowed_path` was rejected above — no consumer switches on `reason`; both
+surfaces (`apps.ts:544-552` → 400, `tools.ts:470-472` → `toolError`)
+interpolate it into a message, and the message carries the discriminating
+detail verbatim (`TAR_ENTRY_INVALID: checksum failure` vs zlib's `incorrect
+header check`). A new reason would be enum churn for a distinction the message
+already makes.
+
+**`medium`/`low` findings dropped without individual reasons: 0.**
+
+One critic reported the plan file's path as `docs/specs/plans/…` and inferred a
+gitignore-convention problem. Verified false: it is `docs/plans/…`, force-added
+deliberately past `.gitignore:117`.
 
 ## Run stats
 

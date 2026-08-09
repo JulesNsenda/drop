@@ -27,6 +27,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **Uploaded archives containing `.git` metadata are now rejected.** An
+  archive with a `.git` path component — at any depth, case-insensitively —
+  is refused with `reason: vcs_metadata` and nothing is extracted. Previously
+  a tenant with the `user` role could upload a crafted `.git/` to
+  `POST /apps/<app>/source`, where it overwrote the app's real one, and a
+  subsequent `POST /git/redeploy/<app>` ran `git pull` in that directory **on
+  the host** — never containerized in either isolation mode — so a poisoned
+  `.git/config` (an `ext::sh -c …` remote URL, `core.fsmonitor`) executed
+  arbitrary commands as the `drop` user, which is in the `docker` group and
+  therefore root-equivalent.
+
+  The guard reads the parser's resolved entry path rather than the raw tar
+  header name, because a PAX extended header can override the path of the
+  entry that follows it — a check against the header name would have closed
+  nothing.
+
+  **Behaviour change for hand-rolled clients:** `tar -czf app.tgz .` from a
+  working tree now fails instead of silently deploying the repository's git
+  metadata. Exclude it (`--exclude .git`), or use `POST /git/deploy` to
+  deploy a repository. The MCP `deploy_files` tool rejects such paths before
+  staging.
+
+### Fixed
+
+- **An archive whose entries the tar parser rejects no longer deploys as a
+  partial tree.** node-tar runs non-strict here, so an entry with a bad
+  checksum was silently dropped while extraction still reported success — and
+  the destination was then pruned to match, deleting files that had gone
+  missing. Any parser warning is now fatal (`reason: invalid_archive`), except
+  the one node-tar emits for an archive with no entries at all, which still
+  reports `empty_archive`.
+
+  This closes the cases the parser *reports*. A tar stream truncated mid-way
+  inside an otherwise-valid gzip wrapper is still extracted up to the
+  truncation point, because node-tar signals nothing at all in that case —
+  measured, and not something a warning-based check can reach.
+
 ## [1.1.0] - 2026-08-09
 
 The marketing site moves out of the platform, a `drop.yaml` field that was
