@@ -38,6 +38,7 @@ import {
   UploadValidationError,
   InsufficientDiskSpaceError,
 } from '../../core/upload-deploy';
+import { isVcsMetadataComponent } from '../../utils/upload-paths';
 import { getGitDeployService } from '../../core/git-deploy';
 import { getDeployTracker } from '../../managers/deploy-tracker';
 import type { DeployEpisode } from '../../managers/deploy-tracker';
@@ -353,6 +354,19 @@ function validateStagedRelativePath(stagingDir: string, candidate: string): Stag
   if (path.isAbsolute(candidate) || WINDOWS_DRIVE_RE.test(candidate)) {
     return { ok: false, reason: `path '${candidate}' must be relative` };
   }
+  // Same policy tar-extract.ts enforces on tar entries, applied here before a
+  // single byte is staged: rejecting a `.git` path component only once it
+  // reaches extractTarball means the file was already written to staging,
+  // tarred, and admitted through the quota/preflight gate for an archive that
+  // was always going to be rejected.
+  // Split on both separators, matching the extractor. On a Windows host
+  // `path.resolve` treats `foo\.git\config` as a nested path, so a `/`-only
+  // split would stage a real `.git` directory and leave the rejection to the
+  // extractor — correct in the end, but after the write this check exists to
+  // avoid.
+  if (candidate.split(/[\\/]/).some(isVcsMetadataComponent)) {
+    return { ok: false, reason: `path '${candidate}' contains a '.git' path component` };
+  }
 
   const root = path.resolve(stagingDir);
   const resolved = path.resolve(root, candidate);
@@ -468,7 +482,13 @@ export async function handleDeployFiles(
     return await waitForDeployOutcome(name, result.acceptedAt ?? acceptedAt, result.isNew);
   } catch (err) {
     if (err instanceof ArchiveRejectedError) {
-      return toolError(`Archive rejected: ${err.message} (reason: ${err.reason})`);
+      // err.message interpolates entry.path (tar-extract.ts) — up to ~256
+      // bytes of attacker-controlled UTF-8, newlines included, since the
+      // caller-supplied `files` array is what got tarred. Fence it like any
+      // other untrusted third-party text before it reaches the model (see the
+      // deploy_from_git handler below for the same pattern).
+      const fenced = wrapUntrusted(`ARCHIVE: ${name}`, err.message);
+      return toolError(`Archive rejected (reason: ${err.reason}): ${fenced}`);
     }
     if (err instanceof UploadValidationError || err instanceof InsufficientDiskSpaceError) {
       return toolError(err.message);

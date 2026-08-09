@@ -134,7 +134,9 @@ export class UploadDeployService {
 
       // extractTarball rejects (and cleans up) empty archives, symlink/
       // hardlink/device entries, tar-slip, collisions, oversize/overcount,
-      // and non-gzip payloads on its own — nothing further to validate here.
+      // non-gzip payloads, and any `.git` path component on its own —
+      // nothing further to validate here (don't add a duplicate `.git` check
+      // downstream of this call).
       await extractTarball(archivePath, stagingDir, limits);
 
       // Re-check disk space nearer to the write than the route's own

@@ -5,6 +5,10 @@ import AuthLayout from '../components/AuthLayout';
 import Button from '../components/ui/Button';
 import Input from '../components/ui/Input';
 import Card from '../components/ui/Card';
+import { deriveSiteOrigin } from '../lib/site-url';
+
+/** Module scope: the host cannot change without a full page load. */
+const siteOrigin = deriveSiteOrigin(window.location.protocol, window.location.hostname);
 
 function SignupPage() {
   const [username, setUsername] = useState('');
@@ -136,19 +140,19 @@ function SignupPage() {
             Sign in
           </Link>
         </p>
-        {/* The marketing home lives in a separate bundle at "/" (DROP-070) —
-            a react-router Link would resolve inside this dashboard router
-            (basename /dashboard) instead, which the anonymous index route
-            now sends straight back to /login (see App.tsx), turning this
-            into a no-op loop. Full page navigation instead. */}
-        <a
-          href="/"
-          className="inline-flex items-center gap-1.5 text-sm transition-colors"
-          style={{ color: 'var(--text-2)' }}
-        >
-          <ArrowLeft className="h-3.5 w-3.5" />
-          Back to home
-        </a>
+        {/* Absolute cross-origin link — see the note in LoginPage.tsx and the
+            rationale in lib/site-url.ts. `null` means this install has no
+            separate marketing site, so render nothing rather than a loop. */}
+        {siteOrigin && (
+          <a
+            href={siteOrigin}
+            className="inline-flex items-center gap-1.5 text-sm transition-colors"
+            style={{ color: 'var(--text-2)' }}
+          >
+            <ArrowLeft className="h-3.5 w-3.5" />
+            Back to home
+          </a>
+        )}
       </div>
     </AuthLayout>
   );

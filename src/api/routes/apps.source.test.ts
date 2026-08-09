@@ -206,6 +206,59 @@ describe('POST /apps/:name/source (upload deploy)', () => {
     expect(deployMock).not.toHaveBeenCalled();
   });
 
+  it('409s uploading onto a git-deployed app instead of severing its git link', async () => {
+    // syncTree's prune would delete the app's real .git (DEFAULT_PRESERVE is
+    // node_modules only) while gitSource survives in apps.json, so the app
+    // would still look git-backed and every later redeploy would fail in
+    // `git remote get-url origin`.
+    await getStateManager().updateApp('alice-app', {
+      gitSource: {
+        repoUrl: 'https://github.com/alice/app',
+        branch: 'main',
+        autoRedeploy: true,
+      },
+    } as Record<string, unknown>);
+
+    const res = await hono.request('/api/v1/apps/alice-app/source', {
+      method: 'POST',
+      headers: authHeader(aliceToken),
+      body: Buffer.from('fake-archive-bytes'),
+    });
+
+    expect(res.status).toBe(409);
+    expect(deployMock).not.toHaveBeenCalled();
+    const body = (await res.json()) as { error?: { message?: string } };
+    expect(body.error?.message).toContain('git/redeploy');
+  });
+
+  it('409s uploading onto a monorepo child whose group container is git-deployed', async () => {
+    // The child carries no gitSource of its own — expandMonorepo never sets
+    // one — so a check on gitSource alone would leave the whole group
+    // clobberable by targeting any single child.
+    const sm = getStateManager();
+    await sm.registerApp('alice-group', path.join(tempDir, 'alice-group'));
+    await sm.updateApp('alice-group', {
+      userId: aliceId,
+      isGroupContainer: true,
+      group: 'alice-group',
+      gitSource: {
+        repoUrl: 'https://github.com/alice/mono',
+        branch: 'main',
+        autoRedeploy: true,
+      },
+    } as Record<string, unknown>);
+    await sm.updateApp('alice-app', { group: 'alice-group' } as Record<string, unknown>);
+
+    const res = await hono.request('/api/v1/apps/alice-app/source', {
+      method: 'POST',
+      headers: authHeader(aliceToken),
+      body: Buffer.from('fake-archive-bytes'),
+    });
+
+    expect(res.status).toBe(409);
+    expect(deployMock).not.toHaveBeenCalled();
+  });
+
   it('429s a concurrent upload from the same account while the first is still in flight', async () => {
     let resolveDeploy: (value: { app: string; acceptedAt: string; isNew: boolean }) => void;
     let resolveEntered: () => void;

@@ -18,6 +18,7 @@ import { logActivityFor } from '../../managers/activity';
 import { DeployRefusedError } from '../../managers/guardrail/deploy-breaker';
 import { QuotaExceededError } from '../../managers/guardrail/principal-quota';
 import type { GitDeployRequest, GitTokenCreateRequest } from '../../core/git-deploy';
+import { GIT_TOKEN_ID_RE } from '../../core/git-deploy/git-deploy.types';
 
 const gitDeploy = new Hono();
 
@@ -141,12 +142,56 @@ gitDeploy.post('/redeploy/:name', async (c) => {
     }
   }
 
+  // Body handling runs AFTER the access check, deliberately: a caller with no
+  // access to this app should be refused before we parse and validate what
+  // they sent. The 400 is not an existence oracle today (it does not depend on
+  // the app at all), but any future validation with a side effect — consuming
+  // a limiter, logging the supplied id — would inherit the ordering.
+  //
+  // Tolerant parse: the body is optional and absent from every caller today
+  // (the dashboard's redeploy button, every existing test request, the
+  // webhook path below) — an unguarded c.req.json() would 500 all of them on
+  // an empty body.
+  const body = await c.req.json<{ tokenId?: unknown }>().catch(() => ({}) as { tokenId?: unknown });
+
+  // Strict shape check: null clears the stored token, a `git_...` id
+  // attaches/replaces one, an omitted key leaves it unchanged. Anything else
+  // 400s — unvalidated input here would land arbitrary JSON in
+  // gitSource.tokenId (apps.json) and flow into `keys.find(k =>
+  // k.startsWith(...))`. Every other body key is ignored.
+  let tokenId: string | null | undefined;
+  if (Object.prototype.hasOwnProperty.call(body, 'tokenId')) {
+    const raw = body.tokenId;
+    if (raw === null || (typeof raw === 'string' && GIT_TOKEN_ID_RE.test(raw))) {
+      tokenId = raw;
+    } else {
+      throw new ValidationError(`tokenId must be null or a string matching ${GIT_TOKEN_ID_RE}`);
+    }
+  }
+
   try {
+    // Persist to target.name, the RESOLVED app, never c.req.param('name') —
+    // registerApp spreads ...existing, so a gitSource written to a monorepo
+    // child would be permanent and re-expansion could never clear it.
     const result = await service.redeploy(target.name, {
       principalId: auth?.principalId,
       userId: auth?.userId,
+      tokenId,
     });
-    await logActivityFor(auth, { action: 'redeploy', appName: target.name });
+    // A redeploy that changed the app's credential is a credential-scope
+    // change to a tenant app — on a monorepo group it also re-credentials
+    // every future unattended webhook redeploy of the whole group — so it must
+    // be distinguishable in the trail from an ordinary redeploy.
+    await logActivityFor(auth, {
+      action: 'redeploy',
+      appName: target.name,
+      detail:
+        tokenId === undefined
+          ? undefined
+          : tokenId === null
+            ? 'credential cleared'
+            : `credential ${tokenId}`,
+    });
     return c.json(success(result));
   } catch (err) {
     if (err instanceof DeployRefusedError || err instanceof QuotaExceededError) {
@@ -154,10 +199,15 @@ gitDeploy.post('/redeploy/:name', async (c) => {
       return c.json(error(ErrorCodes.RATE_LIMITED, err.message), 429);
     }
     const message = err instanceof Error ? err.message : 'Redeploy failed';
+    // A token id the caller supplied that resolves to nothing is their input
+    // error, not a missing app — must not fall into the 404 below.
+    if (message.startsWith('GitHub token ')) {
+      return c.json(error(ErrorCodes.VALIDATION_ERROR, message), 400);
+    }
     if (message.includes('not found')) {
       return c.json(error(ErrorCodes.NOT_FOUND, message), 404);
     }
-    if (message.includes('not deployed from git')) {
+    if (message.includes('not deployed from git') || message.includes('has no git repository on disk')) {
       return c.json(error(ErrorCodes.BAD_REQUEST, message), 400);
     }
     return c.json(error(ErrorCodes.INTERNAL_ERROR, message), 500);

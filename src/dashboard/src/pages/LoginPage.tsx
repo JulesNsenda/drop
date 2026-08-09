@@ -6,6 +6,10 @@ import AuthLayout from '../components/AuthLayout';
 import Button from '../components/ui/Button';
 import Input from '../components/ui/Input';
 import Card from '../components/ui/Card';
+import { deriveSiteOrigin } from '../lib/site-url';
+
+/** Module scope: the host cannot change without a full page load. */
+const siteOrigin = deriveSiteOrigin(window.location.protocol, window.location.hostname);
 
 interface LoginLocationState {
   sessionExpired?: boolean;
@@ -230,19 +234,22 @@ function LoginPage() {
               Sign up
             </Link>
           </p>
-          {/* The marketing home lives in a separate bundle at "/" (DROP-070)
-              — a react-router Link would resolve inside this dashboard
-              router (basename /dashboard) instead, which the anonymous index
-              route now sends straight back to /login (see App.tsx), turning
-              this into a no-op loop. Full page navigation instead. */}
-          <a
-            href="/"
-            className="inline-flex items-center gap-1.5 text-sm transition-colors"
-            style={{ color: 'var(--text-2)' }}
-          >
-            <ArrowLeft className="h-3.5 w-3.5" />
-            Back to home
-          </a>
+          {/* The marketing home is a different HOST since the site split
+              (DROP-139), so this must be an absolute cross-origin link and a
+              full page navigation. A relative "/" resolves to the dashboard
+              host, which 301s to /dashboard, which sends a logged-out visitor
+              back to /login — the no-op loop this replaces. `null` means the
+              install has no separate site, so render nothing at all. */}
+          {siteOrigin && (
+            <a
+              href={siteOrigin}
+              className="inline-flex items-center gap-1.5 text-sm transition-colors"
+              style={{ color: 'var(--text-2)' }}
+            >
+              <ArrowLeft className="h-3.5 w-3.5" />
+              Back to home
+            </a>
+          )}
         </div>
       )}
     </AuthLayout>

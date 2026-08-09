@@ -4,12 +4,13 @@
  * Extracts an uploaded gzipped tarball into a destination directory with the
  * defenses a remote, agent-uploaded archive requires: a magic-byte check
  * before any decompression happens, an entry-type allowlist (regular files
- * and directories only — everything else aborts the whole archive), our own
- * path-containment check on every entry (never trusting node-tar's internal
- * guard alone), case/Unicode-collision rejection within one archive,
- * incremental caps on decompressed bytes and entry count enforced mid-stream,
- * and a wall-clock timeout on the whole extraction. Any rejection cleans up
- * whatever was partially written.
+ * and directories only — everything else aborts the whole archive), a
+ * `.git`-metadata rejection (including Windows path aliases that resolve to
+ * the same directory), our own path-containment check on every entry (never
+ * trusting node-tar's internal guard alone), case/Unicode-collision rejection
+ * within one archive, incremental caps on decompressed bytes and entry count
+ * enforced mid-stream, and a wall-clock timeout on the whole extraction. Any
+ * rejection cleans up whatever was partially written.
  */
 
 import * as fs from 'fs';
@@ -17,6 +18,7 @@ import * as fsp from 'fs/promises';
 import * as path from 'path';
 import * as zlib from 'zlib';
 import { Parser as TarParser, ReadEntry } from 'tar';
+import { isVcsMetadataComponent } from '../../utils/upload-paths';
 
 export interface TarExtractLimits {
   /** Abort once the cumulative decompressed byte count across all entries exceeds this. */
@@ -39,6 +41,7 @@ export type ArchiveRejectReason =
   | 'disallowed_entry_type'
   | 'path_escape'
   | 'path_collision'
+  | 'vcs_metadata'
   | 'too_many_bytes'
   | 'too_many_entries'
   | 'timeout'
@@ -119,6 +122,13 @@ function resolveContained(destDir: string, entryPath: string): string {
   return resolved;
 }
 
+// `isVcsMetadataComponent` (case/alias-aware `.git` component match) now
+// lives in `src/utils/upload-paths.ts`, imported above, so the dashboard's
+// browser-side archive builder (DROP-141) can share the exact same rule
+// without pulling `node:fs`/`node:zlib`/`node:path`/node-tar into its bundle.
+// `src/api/mcp/tools.ts`'s `validateStagedRelativePath` imports it from
+// there too, rather than from this file.
+
 function runExtraction(
   archivePath: string,
   destDir: string,
@@ -136,7 +146,34 @@ function runExtraction(
 
     const readStream = fs.createReadStream(archivePath);
     const gunzip = zlib.createGunzip();
+    // Left non-strict rather than passing `strict: true` — the 'warn' listener
+    // below is the control point instead. node-tar's own defects (a bad
+    // checksum, an unrecognized archive format, ...) surface as 'warn' events
+    // rather than throwing, and treating any of them as advisory would let the
+    // entry that triggered it be silently dropped: `fileCount` would still
+    // reflect every OTHER entry, `extractTarball` would resolve, and the
+    // caller's `syncTree` would then prune the destination to match this
+    // partial tree — deleting files that were never part of the upload.
+    // Every warning is therefore fatal (settling with the same cleanup path
+    // as any other rejection), with one narrow, deliberate carve-out inside
+    // the listener itself — see its own comment.
     const parser = new TarParser();
+    parser.on('warn', (code: string, message: string) => {
+      // TAR_BAD_ARCHIVE is emitted unconditionally when the parser reaches
+      // 'done' having seen no valid entry at all — including a legitimately
+      // empty archive, which has nothing to do with a dropped entry. Every
+      // other warning means an entry the parser saw was rejected internally
+      // (e.g. a bad checksum), which is exactly the case that must not be
+      // treated as advisory: letting it through would silently drop that
+      // entry, still resolve with a partial tree, and let syncTree's prune
+      // treat that partial tree as authoritative. This carve-out is safe
+      // specifically because it can only fire when fileCount is also 0 (a
+      // real entry would have set the parser's own "saw a valid entry" flag
+      // and suppressed TAR_BAD_ARCHIVE), so `extractTarball` still rejects
+      // that archive below via `empty_archive` — nothing gets a free pass.
+      if (code === 'TAR_BAD_ARCHIVE') return;
+      settle(new ArchiveRejectedError('invalid_archive', `${code}: ${message}`));
+    });
 
     const timer = setTimeout(() => {
       settle(new ArchiveRejectedError('timeout', `Extraction exceeded ${limits.timeoutMs}ms wall-clock limit`));
@@ -209,6 +246,39 @@ function runExtraction(
           new ArchiveRejectedError(
             'disallowed_entry_type',
             `Entry '${entry.path}' has disallowed type '${entry.type}'`
+          )
+        );
+        return;
+      }
+
+      // Reject any entry with a `.git` path component, at any depth
+      // (`vendor/foo/.git/config`, not just a root-level `.git/`), including
+      // the case, trailing-dot/space, and Windows-alias variants normalized
+      // away by `isVcsMetadataComponent` (see its own doc comment). An
+      // uploaded `.git/` can overwrite the app's real one (syncTree's
+      // DEFAULT_PRESERVE is `['node_modules']` only), and
+      // `POST /git/redeploy/<app>` later runs `git pull` in that directory ON
+      // THE HOST as the `drop` user — a poisoned `.git/config` (e.g. an
+      // `ext::sh -c ...` remote URL) is then arbitrary command execution.
+      // Rejecting the whole archive rather than stripping the entry is
+      // deliberate and mirrors this file's stance on REGULAR_FILE_TYPES
+      // above: a hostile archive never gets a partial, silently-modified
+      // extraction. Adding `.git` to DEFAULT_PRESERVE instead would be wrong
+      // — that list is shared with monorepo materialization and has nothing
+      // to do with rejecting untrusted input.
+      // Read `entry.path`, NEVER the raw header name field: node-tar consumes a
+      // PAX extended header (typeflag 'x') internally and applies its `path=`
+      // record to the following entry before emitting it, so a header claiming
+      // `innocuous.txt` can carry `.git/config`. Measured — with this guard
+      // removed, such an archive extracts successfully. `entry.path` is the
+      // post-override value and is the only safe thing to check here.
+      const pathComponents = entry.path.split(/[\\/]/);
+      if (pathComponents.some(isVcsMetadataComponent)) {
+        entry.resume();
+        settle(
+          new ArchiveRejectedError(
+            'vcs_metadata',
+            `Entry '${entry.path}' contains a '.git' path component`
           )
         );
         return;

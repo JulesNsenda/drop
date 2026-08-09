@@ -8,6 +8,7 @@
 
 import * as path from 'path';
 import * as fs from 'fs/promises';
+import * as crypto from 'crypto';
 import {
   DeployActor,
   GitDeployRequest,
@@ -276,6 +277,17 @@ export class GitDeployService {
       throw new Error(`Application '${appName}' was not deployed from git`);
     }
 
+    // Fail fast if the source tree no longer has a git repository. An upload
+    // deploy (syncTree's prune) or a monorepo re-materialization can remove
+    // the real .git while state still carries a gitSource; without this check
+    // `git pull` walks UP the ancestor chain looking for a repository instead
+    // of failing with a clear message.
+    try {
+      await fs.access(path.join(app.path, '.git'));
+    } catch {
+      throw new Error(`Application '${appName}' has no git repository on disk (.git is missing)`);
+    }
+
     // GUARDRAIL + QUOTA, before the pull. A redeploy is the request an agent
     // repeats, and git pull + rebuild is not free.
     await admitDeploy(appName, false, {
@@ -292,14 +304,49 @@ export class GitDeployService {
       );
     }
 
-    const { repoUrl, branch, tokenId } = app.gitSource;
+    const { repoUrl, branch } = app.gitSource;
+
+    // undefined (the default, via omission) leaves the stored token
+    // unchanged; null clears it; a string attaches/replaces it. Resolved once
+    // and used for BOTH the pull and the final gitSource below — `app` is a
+    // snapshot captured above, and updateApp REPLACES the map entry rather
+    // than mutating it, so a second read of app.gitSource after this point
+    // would still see the pre-redeploy value.
+    const effectiveTokenId = actor.tokenId !== undefined ? actor.tokenId : app.gitSource.tokenId;
+
+    // A CLEAR is a revocation, not a deploy outcome, so it is persisted BEFORE
+    // the pull — the one deliberate asymmetry with the attach direction.
+    //
+    // Both directions cannot use the post-pull write: clearing a credential
+    // makes the very next pull unauthenticated, so on a private repo it throws
+    // and the write below never runs. The clear would be silently discarded
+    // every time, which leaves NO route to detach a compromised PAT short of
+    // hand-editing apps.json. The stale-snapshot trap that forced the attach
+    // AFTER the pull does not apply here: there is nothing a later spread can
+    // resurrect once the field is gone, and `effectiveTokenId` (null) drives
+    // the post-pull write too, so the two agree.
+    if (actor.tokenId === null && app.gitSource.tokenId) {
+      const cleared: GitSource = { ...app.gitSource, tokenId: undefined };
+      await stateManager.updateApp(appName, { gitSource: cleared } as Record<string, unknown>);
+      logger.info(`Cleared the stored git credential for ${appName}`, 'GIT-DEPLOY');
+    }
 
     // Resolve token if needed
     let token: string | undefined;
-    if (tokenId) {
-      token = await this.getTokenValue(tokenId);
+    if (effectiveTokenId) {
+      token = await this.getTokenValue(effectiveTokenId);
       if (!token) {
-        logger.warn(`Token '${tokenId}' not found for ${appName} - trying without auth`, 'GIT-DEPLOY');
+        // Branch on PROVENANCE. An id the caller supplied on THIS request that
+        // resolves to nothing is a caller error — deploy() throws for exactly
+        // this condition — and warning past it returns 200 while persisting a
+        // dangling reference that silently degrades every later unattended
+        // webhook redeploy to unauthenticated. An INHERITED id is different:
+        // the token may have been deleted since, and refusing to redeploy an
+        // existing app over that is worse than trying.
+        if (actor.tokenId) {
+          throw new Error(`GitHub token '${actor.tokenId}' not found`);
+        }
+        logger.warn(`Token '${effectiveTokenId}' not found for ${appName} - trying without auth`, 'GIT-DEPLOY');
       }
     }
 
@@ -325,8 +372,12 @@ export class GitDeployService {
 
     const clonedAt = new Date().toISOString();
 
+    // Built from effectiveTokenId, NOT app.gitSource.tokenId — see the note
+    // above. Spreading the stale field here would silently revert an attach
+    // on this success path (the defect two independent reviewers found).
     const gitSource: GitSource = {
       ...app.gitSource,
+      tokenId: effectiveTokenId === null ? undefined : effectiveTokenId,
       lastCommitSha: commitSha,
       lastClonedAt: clonedAt,
     };
@@ -360,8 +411,24 @@ export class GitDeployService {
 
   /** Store a GitHub Personal Access Token */
   async setToken(name: string, tokenValue: string): Promise<GitTokenInfo> {
+    // The credential helper emits the token as a LINE in git's credential
+    // protocol (`password=<token>`), so a value carrying a newline would
+    // append further `key=value` attributes of the caller's choosing —
+    // `username=`, `url=`, `quit=1`. Every real PAT is printable ASCII, so
+    // refuse anything else at the door rather than escaping it downstream.
+    if (!/^[\x21-\x7e]+$/.test(tokenValue)) {
+      throw new Error('Invalid token: must be printable ASCII with no whitespace');
+    }
     const sm = getSecretManager();
-    const id = `git_${Date.now().toString(36)}`;
+    // Random, not `Date.now().toString(36)`: two tokens created in the same
+    // millisecond shared an id, and ids are resolved by prefix match
+    // (`startsWith(`${id}:`)`), so `getTokenValue` would return whichever the
+    // store listed first. Harmless while ids were only picked from a UI list;
+    // now that an id is persisted into `gitSource` and re-read on every
+    // unattended webhook redeploy, a collision means an app quietly
+    // authenticating with a different tenant's PAT. Still matches
+    // GIT_TOKEN_ID_RE, so existing ids keep resolving — no migration.
+    const id = `git_${crypto.randomBytes(8).toString('hex')}`;
     const key = `${id}:${name}`;
 
     await sm.set(GIT_TOKEN_APP_NAME, key, tokenValue);
