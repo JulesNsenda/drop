@@ -54,6 +54,28 @@ export function buildNginxConf(port: number, outputSubdir: string): string {
     `        root ${root};`,
     `        index index.html index.htm;`,
     ``,
+    // Dotfiles are never web content, and for a PLAIN-ROOT static app the
+    // document root IS the app directory — so `.git/` and `.env` sit directly
+    // under it and `try_files $uri` below would happily serve them. A
+    // git-deployed static app therefore published its full history, and (for
+    // any app cloned before the DROP-142 credential fix) the PAT baked into
+    // `.git/config`, at `https://<app>/.git/config`.
+    //
+    // An SPA is not affected — its root is `/app/<outputSubdir>`, so `.git`
+    // sits outside the document root entirely. That asymmetry is why this went
+    // unnoticed: the SPA case, which is most apps, was always safe.
+    //
+    // 404 rather than `deny all`'s 403: a 403 confirms the file is there,
+    // which is the existence oracle the rest of the platform avoids.
+    //
+    // `.well-known` is carved out because it is legitimately public content
+    // (security.txt, apple-app-site-association, assetlinks.json). The
+    // negative lookahead needs a PCRE-enabled nginx; nginx:alpine, the only
+    // image this conf is ever used with, is built with PCRE.
+    `        location ~ /\\.(?!well-known/) {`,
+    `            return 404;`,
+    `        }`,
+    ``,
     `        location / {`,
     `            try_files $uri $uri/ /index.html;`,
     `        }`,
