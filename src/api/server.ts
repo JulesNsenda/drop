@@ -251,6 +251,13 @@ export class ApiServer {
     // unconditionally.
     v1.use('/mcp', mcpRateLimitMiddleware());
 
+    // Redeploy became a credential-ATTACHING surface with DROP-142: its body
+    // can write `gitSource.tokenId`, so it belongs in the same strict,
+    // unconditionally-registered bucket as the other credential routes rather
+    // than only in the general `/api/*` one. Stacks with that bucket, does not
+    // replace it. The webhook path is a different route and is unaffected.
+    v1.use('/git/redeploy/*', authRateLimitMiddleware());
+
     // OAuth 2.1 endpoints (PRD-041) get their own bucket too, registered
     // unconditionally — the handlers themselves fail closed (503/400) when
     // OAuth isn't configured/enabled, but the rate limit applies regardless.

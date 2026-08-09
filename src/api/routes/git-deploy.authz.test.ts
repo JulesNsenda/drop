@@ -14,6 +14,7 @@ import { ApiServer } from '../server';
 import { createUser, resetAuth } from '../middleware/auth';
 import { getTestToken } from '../__testutils__/auth';
 import { getStateManager, resetStateManager } from '../../managers/app/state-manager';
+import { resetRateLimits } from '../middleware/rate-limit';
 import * as gitDeployModule from '../../core/git-deploy';
 
 describe('git redeploy route authorization', () => {
@@ -44,6 +45,12 @@ describe('git redeploy route authorization', () => {
 
     resetStateManager();
     resetAuth();
+    // /git/redeploy/* now has its own strict bucket (10/min, the same one the
+    // credential-minting routes use) because its body can write
+    // gitSource.tokenId. Counters are per-IP and process-global, so without
+    // this the file's own requests 429 each other partway through — the same
+    // beforeEach every other rate-limited route test already does.
+    resetRateLimits();
     getStateManager({ stateFilePath: path.join(tempDir, 'apps.json') });
 
     server = new ApiServer({
@@ -243,6 +250,35 @@ describe('git redeploy route authorization', () => {
         body: JSON.stringify({ tokenId: 12345 }),
       });
       expect(res.status).toBe(400);
+      expect(redeploy).not.toHaveBeenCalled();
+    });
+
+    it('a well-formed tokenId the service cannot resolve is a 400, not a 404', async () => {
+      // The service throws "GitHub token '<id>' not found" for an id the
+      // CALLER supplied on this request. Without its own mapping that message
+      // falls into the generic `includes('not found')` branch and comes back
+      // as a 404, which reads as "no such app" — the app is right there.
+      redeploy.mockRejectedValueOnce(new Error("GitHub token 'git_nosuch' not found"));
+      const res = await app.request('/api/v1/git/redeploy/alice-app', {
+        method: 'POST',
+        headers: { ...bearer(aliceToken), 'Content-Type': 'application/json' },
+        body: JSON.stringify({ tokenId: 'git_nosuch' }),
+      });
+      expect(res.status).toBe(400);
+    });
+
+    it('a non-owner is refused BEFORE the body is parsed or validated', async () => {
+      // Ordering, asserted rather than assumed: a malformed body from a caller
+      // with no access must produce the access refusal, not a 400 that
+      // confirms the request was worth validating. Nothing in the validator
+      // has a side effect today; the point is that adding one later cannot
+      // quietly become reachable pre-authorization.
+      const res = await app.request('/api/v1/git/redeploy/alice-app', {
+        method: 'POST',
+        headers: { ...bearer(bobToken), 'Content-Type': 'application/json' },
+        body: JSON.stringify({ tokenId: 'not a valid id' }),
+      });
+      expect(res.status).toBe(404);
       expect(redeploy).not.toHaveBeenCalled();
     });
 

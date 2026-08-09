@@ -178,6 +178,12 @@ function isGroupGitBacked(group: string): boolean {
 function sanitizeRepoUrl(repoUrl: string): string {
   try {
     const u = new URL(repoUrl);
+    // An opaque-path URL (`javascript:...`) parses fine and its username /
+    // password setters are silent no-ops, so `toString()` would hand the
+    // dashboard the original string — which it renders as an <a href>. No
+    // write path can currently store one (isValidGitHubUrl gates the only
+    // setter), so this is a floor under a new sanitizer, not a live XSS fix.
+    if (u.protocol !== 'https:' && u.protocol !== 'http:') return '';
     u.username = '';
     u.password = '';
     return u.toString();

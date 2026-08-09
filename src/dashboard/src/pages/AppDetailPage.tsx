@@ -20,9 +20,21 @@ import {
   AlertTriangle,
   Database,
 } from 'lucide-react';
-import { useApp, appAction, deleteApp, gitRedeploy } from '../hooks/useApi';
+import {
+  useApp,
+  appAction,
+  deleteApp,
+  gitRedeploy,
+  getGitTokens,
+  GitTokenInfo,
+} from '../hooks/useApi';
 import { getAuthHeaders, useAuth } from '../hooks/useAuth';
 import { appLinkInfo } from '../api/client';
+import {
+  CREDENTIAL_CLEAR,
+  CREDENTIAL_UNCHANGED,
+  credentialChoiceToTokenId,
+} from '../lib/redeploy-credential';
 import { useToast } from '../components/Toast';
 import { useConfirm } from '../components/ConfirmDialog';
 import StatusBadge from '../components/StatusBadge';
@@ -37,6 +49,9 @@ import Input from '../components/ui/Input';
 
 // Always visible — the "no database provisioned" state is first-class
 // content, not something to hide behind a conditional tab (see DROP-120 plan).
+/** Matches the `Input` primitive's look for a native control it doesn't cover (mirrors DeployPage's `inlineFieldClass`). */
+const inlineSelectClass = 'rounded-lg px-3 py-2 text-sm outline-none transition-colors dui-input';
+
 const DETAIL_TABS: TabDef[] = [
   { id: 'logs', label: 'Logs', icon: Terminal },
   { id: 'metrics', label: 'Metrics', icon: Activity },
@@ -55,6 +70,10 @@ function AppDetailPage() {
   const confirmDialog = useConfirm();
   const [actionLoading, setActionLoading] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<string>('logs');
+
+  // Git credential to send with the next redeploy (DROP-142)
+  const [gitTokens, setGitTokens] = useState<GitTokenInfo[]>([]);
+  const [credentialChoice, setCredentialChoice] = useState<string>(CREDENTIAL_UNCHANGED);
 
   // Env vars state — keys only; values are never returned by the API
   const [envVars, setEnvVars] = useState<string[]>([]);
@@ -104,12 +123,59 @@ function AppDetailPage() {
   const isGroupChild = !app?.gitSource && !!app?.groupGitBacked;
   const canRedeploy = !!app?.gitSource || isGroupChild;
 
+  // Stored git credentials, for attaching one to an app whose repo went
+  // private. `/git/tokens` is a `user`-role route while this page is reachable
+  // at `readonly`, so gate the FETCH, not just the render — an ungated call
+  // 403s for every read-only viewer.
+  const canManageCredential = canRedeploy && role !== 'readonly';
+
+  // Rendered for admins ONLY, deliberately: `toAppDto` gates `tokenId` on the
+  // admin tier (it is a correlation handle), so a `user` always reads
+  // `undefined` here and would be told "None" about an app that does have a
+  // credential attached. A lie is worse than an absent field.
+  const attachedTokenId = app?.gitSource?.tokenId;
+  const attachedTokenLabel = attachedTokenId
+    ? (gitTokens.find(t => t.id === attachedTokenId)?.name ??
+      'attached (no longer in the token store)')
+    : 'None — public repo';
+  // `apps/:name` has no route `key`, so React Router REUSES this component
+  // instance when only the name changes — every other name-scoped value here
+  // is re-derived from `name`, but a plain useState is not. Without this,
+  // picking a token on app A and then navigating to app B and pressing
+  // Redeploy attaches A's credential to B (and "Clear stored credential"
+  // carries over the same way, stripping B's).
+  useEffect(() => {
+    setCredentialChoice(CREDENTIAL_UNCHANGED);
+  }, [name]);
+
+  useEffect(() => {
+    if (!canManageCredential) return;
+    let cancelled = false;
+    getGitTokens()
+      .then(list => {
+        if (!cancelled) setGitTokens(list);
+      })
+      .catch(() => {
+        // Token list is an enhancement to the redeploy button, not a
+        // prerequisite for it — a failure here must not break the page.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [canManageCredential]);
+
   const handleRedeploy = async () => {
     if (!name) return;
     setActionLoading('redeploy');
-    const result = await gitRedeploy(name);
+    // Three states, deliberately: neutral → omit the key (leave the stored
+    // token alone), CLEAR → null, an id → attach/replace.
+    const result = await gitRedeploy(name, credentialChoiceToTokenId(credentialChoice));
     if (result.success) {
       toast('success', isGroupChild ? `Redeploying group ${app?.group}...` : `Redeploying ${name}...`);
+      // Back to neutral so the NEXT redeploy doesn't re-send the change. Only
+      // on success: a redeploy whose pull fails does not persist a
+      // newly-supplied token, so the selection has to survive for the retry.
+      setCredentialChoice(CREDENTIAL_UNCHANGED);
     } else {
       toast('error', result.error || `Failed to redeploy ${name}`);
     }
@@ -281,22 +347,57 @@ function AppDetailPage() {
             </Button>
           )}
           {canRedeploy && (
-            <Button
-              variant="secondary"
-              onClick={handleRedeploy}
-              disabled={actionLoading !== null}
-              style={{ color: 'var(--accent)' }}
-              title={
-                isGroupChild
-                  ? `Re-pull and rebuild the whole ${app.group} monorepo group`
-                  : undefined
-              }
-            >
-              <RotateCw
-                className={`h-4 w-4 ${actionLoading === 'redeploy' ? 'animate-spin' : ''}`}
-              />
-              {isGroupChild ? 'Redeploy group' : 'Redeploy'}
-            </Button>
+            <>
+              {/* Feeds the EXISTING Redeploy button rather than adding a second
+                  one. Lives here, not in the Git Source card below, because
+                  that card is gated on `app.gitSource` and a monorepo child has
+                  none — it would silently lose the picker on the group path. */}
+              {/* Gated on the ROLE alone, never on `gitTokens.length` — the
+                  operator who has just deleted a leaked PAT from the token
+                  store is exactly the one who needs "Clear stored credential",
+                  and an empty list would have taken the whole control away. */}
+              {canManageCredential && (
+                <select
+                  value={credentialChoice}
+                  onChange={e => setCredentialChoice(e.target.value)}
+                  className={inlineSelectClass}
+                  disabled={actionLoading !== null}
+                  aria-label="Git credential for this redeploy"
+                  title={
+                    gitTokens.length === 0
+                      ? 'No stored credentials yet — add one on the Deploy page'
+                      : 'Attach a stored credential — for a repo that has become private'
+                  }
+                >
+                  {/* Every option must carry either a sentinel or a real token
+                      id: a duplicated value would break the controlled select,
+                      and an unrecognised one is sent verbatim and 400s. */}
+                  <option value={CREDENTIAL_UNCHANGED}>Credential: leave as is</option>
+                  {gitTokens.map(t => (
+                    <option key={t.id} value={t.id}>
+                      Use token: {t.name}
+                    </option>
+                  ))}
+                  <option value={CREDENTIAL_CLEAR}>Clear stored credential</option>
+                </select>
+              )}
+              <Button
+                variant="secondary"
+                onClick={handleRedeploy}
+                disabled={actionLoading !== null}
+                style={{ color: 'var(--accent)' }}
+                title={
+                  isGroupChild
+                    ? `Re-pull and rebuild the whole ${app.group} monorepo group`
+                    : undefined
+                }
+              >
+                <RotateCw
+                  className={`h-4 w-4 ${actionLoading === 'redeploy' ? 'animate-spin' : ''}`}
+                />
+                {isGroupChild ? 'Redeploy group' : 'Redeploy'}
+              </Button>
+            </>
           )}
           <Button variant="danger" onClick={handleDelete} disabled={actionLoading !== null}>
             <Trash2 className="h-4 w-4" />
@@ -507,6 +608,12 @@ function AppDetailPage() {
                 {app.gitSource.autoRedeploy ? 'Enabled' : 'Disabled'}
               </span>
             </div>
+            {isAdmin && (
+              <div>
+                <span style={{ color: 'var(--text-2)' }}>Credential: </span>
+                <span style={{ color: 'var(--text)' }}>{attachedTokenLabel}</span>
+              </div>
+            )}
           </div>
         </Card>
       )}

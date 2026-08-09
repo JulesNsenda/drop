@@ -31,32 +31,44 @@ jest.mock('child_process', () => ({
       return { stdout: '', stderr: '' };
     }
 
-    if (args[0] === '--version') {
+    // Dispatch on the SUBCOMMAND, not args[0]. git-client prepends global
+    // options — `-c credential.…` for an authenticated call and
+    // `--git-dir`/`--work-tree` to stop repository discovery walking up the
+    // ancestor chain — so args[0] is routinely a flag. Matching on args[0]
+    // silently fell through to the empty default for every one of those,
+    // which reads as "git succeeded and printed nothing" rather than as a
+    // broken fixture.
+    const GLOBAL_OPTS_WITH_VALUE = new Set(['-c', '-C', '--git-dir', '--work-tree']);
+    let i = 0;
+    while (i < args.length && GLOBAL_OPTS_WITH_VALUE.has(args[i])) i += 2;
+    const sub = args.slice(i);
+
+    if (sub[0] === '--version') {
       callback(null, { stdout: 'git version 2.40.0', stderr: '' });
       return {} as any;
     }
 
-    if (args[0] === 'clone') {
+    if (sub[0] === 'clone') {
       callback(null, { stdout: '', stderr: '' });
       return {} as any;
     }
 
-    if (args[0] === 'rev-parse' && args[1] === 'HEAD') {
+    if (sub[0] === 'rev-parse' && sub[1] === 'HEAD') {
       callback(null, { stdout: 'abc123def456\n', stderr: '' });
       return {} as any;
     }
 
-    if (args[0] === 'rev-parse' && args[1] === '--abbrev-ref') {
+    if (sub[0] === 'rev-parse' && sub[1] === '--abbrev-ref') {
       callback(null, { stdout: 'main\n', stderr: '' });
       return {} as any;
     }
 
-    if (args[0] === 'pull') {
+    if (sub[0] === 'pull') {
       callback(null, { stdout: '', stderr: '' });
       return {} as any;
     }
 
-    if (args[0] === 'remote') {
+    if (sub[0] === 'remote') {
       callback(null, { stdout: 'https://github.com/user/repo\n', stderr: '' });
       return {} as any;
     }
@@ -332,6 +344,34 @@ describe('GitDeployService', () => {
       await fs.mkdir(path.join(tempDir, 'webapps', appName, '.git'), { recursive: true });
     }
 
+    /**
+     * Make the next `git pull` fail, whatever else redeploy() runs around it.
+     *
+     * These tests used to call `mockImplementationOnce` on the premise that
+     * "the pull is the first execFile call redeploy() makes". It is not, and
+     * the premise is the fragile part, not the mock: `gitPull` now runs a
+     * `git remote get-url origin` first to evict a PAT an older DROP baked
+     * into the remote URL, and that helper SWALLOWS its own errors. So the
+     * once-mock landed on the strip instead, the pull then succeeded, and
+     * three tests asserting a rejection inverted at once. Matching on the
+     * subcommand cannot drift that way again.
+     */
+    function failNextPull(message = 'fatal: could not read from remote repository'): void {
+      const mock = execFile as unknown as jest.Mock;
+      const original = mock.getMockImplementation() as (...a: unknown[]) => unknown;
+      let fired = false;
+      mock.mockImplementation((cmd: string, args: string[], opts: unknown, cb?: Function) => {
+        if (!fired && Array.isArray(args) && args.includes('pull')) {
+          fired = true;
+          mock.mockImplementation(original);
+          const callback = cb || (typeof opts === 'function' ? opts : undefined);
+          if (callback) (callback as (e: Error) => void)(new Error(message));
+          return {} as unknown;
+        }
+        return original(cmd, args, opts, cb);
+      });
+    }
+
     it('publishes app:update with bypassCooldown after a successful pull', async () => {
       const appName = 'redeploy-app';
       await service.deploy({ repoUrl: `https://github.com/user/${appName}`, branch: 'main' });
@@ -380,14 +420,7 @@ describe('GitDeployService', () => {
       await service.deploy({ repoUrl: `https://github.com/user/${appName}`, branch: 'main' });
       await makeGitDir(appName);
 
-      // Override the NEXT execFile call only - the pull inside redeploy() is
-      // the first (and, without a token, only) execFile call it makes.
-      (execFile as unknown as jest.Mock).mockImplementationOnce(
-        (_cmd: string, _args: string[], _opts: unknown, cb?: (err: Error) => void) => {
-          if (cb) cb(new Error('fatal: could not read from remote repository'));
-          return {} as unknown;
-        }
-      );
+      failNextPull();
 
       const handler = jest.fn();
       const unsubscribe = eventBus.subscribe('app:update', handler);
@@ -449,12 +482,7 @@ describe('GitDeployService', () => {
         await makeGitDir(appName);
         const stored = await service.setToken('doomed-token', 'ghp_doomedvalue');
 
-        (execFile as unknown as jest.Mock).mockImplementationOnce(
-          (_cmd: string, _args: string[], _opts: unknown, cb?: (err: Error) => void) => {
-            if (cb) cb(new Error('fatal: could not read from remote repository'));
-            return {} as unknown;
-          }
-        );
+        failNextPull();
 
         await expect(service.redeploy(appName, { tokenId: stored.id })).rejects.toThrow();
         const app = getStateManager().getApp(appName);
@@ -472,12 +500,7 @@ describe('GitDeployService', () => {
         await service.redeploy(appName, { tokenId: stored.id });
         expect(getStateManager().getApp(appName)?.gitSource?.tokenId).toBe(stored.id);
 
-        (execFile as unknown as jest.Mock).mockImplementationOnce(
-          (_cmd: string, _args: string[], _opts: unknown, cb?: (err: Error) => void) => {
-            if (cb) cb(new Error('fatal: could not read from remote repository'));
-            return {} as unknown;
-          }
-        );
+        failNextPull();
 
         await expect(service.redeploy(appName)).rejects.toThrow();
         expect(getStateManager().getApp(appName)?.gitSource?.tokenId).toBe(stored.id);
@@ -497,6 +520,55 @@ describe('GitDeployService', () => {
         expect(app?.gitSource?.tokenId).toBeUndefined();
         // Cleared as `undefined`, never persisted as the literal string "null".
         expect(app?.gitSource?.tokenId).not.toBe('null');
+      });
+
+      it('a CLEAR survives a pull that then fails — revocation is not a deploy outcome', async () => {
+        // The asymmetry with the attach direction, and the reason for it: a
+        // cleared credential makes the very next pull unauthenticated, so on
+        // a private repo that pull throws. If the clear were written only
+        // after a successful pull (as the attach is), it would be discarded
+        // every single time and there would be NO route to detach a
+        // compromised PAT short of hand-editing apps.json.
+        const appName = 'redeploy-clear-survives-failure';
+        await service.deploy({ repoUrl: `https://github.com/user/${appName}`, branch: 'main' });
+        await makeGitDir(appName);
+        const stored = await service.setToken('leaked-token', 'ghp_leaked');
+        await service.redeploy(appName, { tokenId: stored.id });
+        expect(getStateManager().getApp(appName)?.gitSource?.tokenId).toBe(stored.id);
+
+        failNextPull();
+
+        await expect(service.redeploy(appName, { tokenId: null })).rejects.toThrow();
+        expect(getStateManager().getApp(appName)?.gitSource?.tokenId).toBeUndefined();
+      });
+
+      it('a tokenId supplied on THIS request that resolves to nothing is rejected, not warned past', async () => {
+        // deploy() throws for the identical condition. Warning past it here
+        // returned 200 while persisting a dangling reference, which then
+        // degraded every later unattended webhook redeploy to unauthenticated.
+        const appName = 'redeploy-unknown-token';
+        await service.deploy({ repoUrl: `https://github.com/user/${appName}`, branch: 'main' });
+        await makeGitDir(appName);
+
+        await expect(
+          service.redeploy(appName, { tokenId: 'git_doesnotexist' })
+        ).rejects.toThrow(/GitHub token 'git_doesnotexist' not found/);
+        expect(getStateManager().getApp(appName)?.gitSource?.tokenId).toBeUndefined();
+      });
+
+      it('an INHERITED tokenId that no longer resolves still redeploys, unauthenticated', async () => {
+        // The other half of the provenance branch: the operator deleted the
+        // token from the store after attaching it. Refusing to redeploy an
+        // existing app over that is worse than trying — and a public repo
+        // still pulls fine.
+        const appName = 'redeploy-inherited-missing-token';
+        await service.deploy({ repoUrl: `https://github.com/user/${appName}`, branch: 'main' });
+        await makeGitDir(appName);
+        const stored = await service.setToken('vanishing', 'ghp_vanishing');
+        await service.redeploy(appName, { tokenId: stored.id });
+        await service.removeToken(stored.id);
+
+        await expect(service.redeploy(appName)).resolves.toBeDefined();
       });
 
       it('an omitted tokenId leaves a previously attached token unchanged', async () => {

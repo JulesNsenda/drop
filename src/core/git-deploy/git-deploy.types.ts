@@ -4,6 +4,17 @@
  * Types for deploying applications from GitHub repositories.
  */
 
+/**
+ * The shape of a stored git token's id, as minted by `GitDeployService.setToken`.
+ *
+ * Defined once because three layers depend on it agreeing: the REST route
+ * validates an incoming `tokenId` against it, the store resolves an id by
+ * prefix match, and the dashboard's unit test asserts its sentinels cannot
+ * collide with it. A copy in any of those catches a widening only by accident
+ * and a narrowing not at all.
+ */
+export const GIT_TOKEN_ID_RE = /^git_[A-Za-z0-9]+$/;
+
 /** Git source metadata stored per-app */
 export interface GitSource {
   repoUrl: string;

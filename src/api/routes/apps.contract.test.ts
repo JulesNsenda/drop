@@ -201,6 +201,13 @@ describe('GET /api/v1/apps/:name DTO contract', () => {
   });
 
   describe('gitSource narrowing (DROP-142)', () => {
+    // No CURRENT writer can produce this repoUrl: `deploy()` is the only one,
+    // and `isValidGitHubUrl` rejects userinfo. So this pins the DTO's own
+    // transform against legacy apps.json entries and future writers — do not
+    // read it as evidence that a live echo path exists, and do not drop
+    // `isValidGitHubUrl` believing the DTO is the guard. (The DROP-128 fixture
+    // trap, benign here only because the code under test is a pure string
+    // transform that does not care how the field got there.)
     beforeEach(async () => {
       await getStateManager().updateApp('test-app', {
         gitSource: {
