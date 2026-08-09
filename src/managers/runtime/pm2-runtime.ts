@@ -62,6 +62,15 @@ export class Pm2Runtime implements AppRuntime {
     return status ? this.toProcessInfo(status) : null;
   }
 
+  /**
+   * Liveness only. PM2's list is already cheap (no per-process sampling), so
+   * this simply counts it — but it stays a separate method so the health probe
+   * never depends on whatever getAllStatus grows into. See the AppRuntime docs.
+   */
+  async countManaged(): Promise<number> {
+    return (await this.getAllStatus()).length;
+  }
+
   async getAllStatus(): Promise<AppProcessInfo[]> {
     const statuses = await this.processManager.getAllStatus();
     return statuses.map((s) => this.toProcessInfo(s));

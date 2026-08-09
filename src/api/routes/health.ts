@@ -52,9 +52,16 @@ function withTimeout<T>(p: Promise<T>, ms: number): Promise<T | typeof TIMED_OUT
 
 async function probeProcessManager(): Promise<ComponentHealth> {
   try {
-    const processes = await withTimeout(getAppRuntime().getAllStatus(), PROBE_TIMEOUT_MS);
-    if (processes === TIMED_OUT) return { status: 'down', message: 'process manager probe timed out' };
-    return { status: 'up', message: `${processes.length} process(es) tracked` };
+    // countManaged, NOT getAllStatus: the latter fetches live CPU/memory for
+    // every container under docker isolation (~1s each, DROP-133), which put
+    // this probe exactly on its 2s budget. Measured on a 5-container fleet:
+    // 2028ms and 2022ms timed out while 1978-2010ms passed, so health flapped
+    // between healthy and degraded — and emitted 503s — on jitter alone, with
+    // the runtime perfectly fine throughout. Liveness needs a reachability
+    // check and a count, not performance telemetry.
+    const count = await withTimeout(getAppRuntime().countManaged(), PROBE_TIMEOUT_MS);
+    if (count === TIMED_OUT) return { status: 'down', message: 'process manager probe timed out' };
+    return { status: 'up', message: `${count} process(es) tracked` };
   } catch (err) {
     return { status: 'down', message: err instanceof Error ? err.message : 'Unknown error' };
   }
