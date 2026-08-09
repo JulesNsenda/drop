@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, DragEvent } from 'react';
+import { useState, useRef, useEffect, DragEvent, InputHTMLAttributes } from 'react';
 import { useNavigate, Link } from 'react-router-dom';
 import {
   FolderUp,
@@ -21,6 +21,7 @@ import {
   addGitToken,
   deleteGitToken,
   GitTokenInfo,
+  App,
   useHealth,
 } from '../hooks/useApi';
 import { appLinkInfo } from '../api/client';
@@ -28,6 +29,9 @@ import Tabs, { TabDef } from '../components/Tabs';
 import Button from '../components/ui/Button';
 import Card from '../components/ui/Card';
 import Input from '../components/ui/Input';
+import { buildArchiveFromFiles, UploadArchiveError } from '../lib/upload-archive';
+import { APP_NAME_RE, commonRootName, normalizeEntryPath } from '../../../utils/upload-paths';
+import { formatBytes } from '../components/db-format';
 
 type Tab = 'github' | 'upload';
 type DeployStatus = 'idle' | 'deploying' | 'success' | 'error';
@@ -80,7 +84,11 @@ function DeployPage() {
   // Upload state
   const [dragOver, setDragOver] = useState(false);
   const [uploadAppName, setUploadAppName] = useState('');
+  const [uploadFileCount, setUploadFileCount] = useState(0);
+  const [uploadBytes, setUploadBytes] = useState(0);
+  const [uploadSkipped, setUploadSkipped] = useState<string[]>([]);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const folderInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     getGitTokens().then(setTokens);
@@ -94,7 +102,11 @@ function DeployPage() {
     setGitAppName('');
     setBranch('main');
     setUploadAppName('');
+    setUploadFileCount(0);
+    setUploadBytes(0);
+    setUploadSkipped([]);
     if (fileInputRef.current) fileInputRef.current.value = '';
+    if (folderInputRef.current) folderInputRef.current.value = '';
   };
 
   // --- Git Deploy ---
@@ -198,43 +210,219 @@ function DeployPage() {
   const handleDrop = async (e: DragEvent) => {
     e.preventDefault();
     setDragOver(false);
+
+    // A dropped FOLDER still appears in `dataTransfer.files`, as a single
+    // zero-byte pseudo-file whose `arrayBuffer()` rejects with an opaque
+    // NotReadableError. Recursive directory reading (webkitGetAsEntry
+    // traversal) is deliberately out of scope, so detect the case and say
+    // what to do instead of surfacing a raw DOM error for the gesture this
+    // product is named after. Read synchronously: the item list is neutered
+    // once the handler yields.
+    const items = e.dataTransfer.items;
+    for (let i = 0; i < (items?.length ?? 0); i++) {
+      if (items[i].webkitGetAsEntry?.()?.isDirectory) {
+        setStatus('error');
+        setMessage(
+          "Dropping a folder isn't supported yet — click the drop zone to choose your app's folder instead."
+        );
+        return;
+      }
+    }
+
     if (e.dataTransfer.files.length > 0) await uploadFiles(e.dataTransfer.files);
   };
 
   const handleFileSelect = async () => {
-    const files = fileInputRef.current?.files;
-    if (files && files.length > 0) await uploadFiles(files);
+    const input = fileInputRef.current;
+    const files = input?.files;
+    if (!files || files.length === 0) return;
+    try {
+      await uploadFiles(files);
+    } finally {
+      // Clear so re-picking the SAME file(s) fires `change` again — e.g.
+      // after cancelling the "replace existing app" confirmation below.
+      if (input) input.value = '';
+    }
+  };
+
+  const handleFolderSelect = async () => {
+    const input = folderInputRef.current;
+    const files = input?.files;
+    if (!files || files.length === 0) return;
+    try {
+      await uploadFiles(files);
+    } finally {
+      if (input) input.value = '';
+    }
+  };
+
+  /**
+   * Best-effort app name from the selection's shared root directory — the
+   * same "shared first segment" rule `stripCommonRoot` applies to entry
+   * paths (`upload-archive.ts` applies it again, independently, while
+   * actually building the archive). Computed here, cheaply and with no
+   * bytes read, so a name is available before the pre-flight check below —
+   * which must run before the possibly-large archive is built.
+   */
+  const deriveRootDirectoryName = (files: FileList): string | null => {
+    const normalized: string[] = [];
+    for (let i = 0; i < files.length; i++) {
+      try {
+        normalized.push(normalizeEntryPath(files[i].webkitRelativePath || files[i].name));
+      } catch {
+        // A path the archive builder will reject anyway — let it report the
+        // real reason rather than failing here with a name-derivation error.
+        return null;
+      }
+    }
+    // Shared with stripCommonRoot, so the name shown here and the root the
+    // uploaded paths actually lose can never disagree.
+    return commonRootName(normalized);
+  };
+
+  /** Maps a failed `/:name/source` response to a message worth showing —
+   * the server's own `error.message` names the specific reason (e.g. a 409
+   * naming `git/redeploy`, or a 400 naming `vcs_metadata`/`invalid_archive`),
+   * so it's always preferred over a generic fallback. */
+  const uploadErrorMessage = (status: number, json: { error?: { message?: string } }): string => {
+    if (json?.error?.message) return json.error.message;
+    if (status === 413) return "Upload exceeds the server's size limit (100 MB compressed).";
+    if (status === 429) return 'Too many uploads recently — wait a moment and try again.';
+    return `Upload failed (${status})`;
+  };
+
+  // Poll app status until running or errored — mirrors handleGitDeploy's poll
+  // loop above. A 202 from /:name/source means "accepted", not "finished":
+  // the archive still has to extract, build and start.
+  const pollUploadedApp = (appName: string) => {
+    let attempts = 0;
+    const poll = setInterval(async () => {
+      attempts++;
+      try {
+        const res = await fetch(`/api/v1/apps/${appName}`, { headers: getAuthHeaders() });
+        const json = await res.json();
+        if (json.success && json.data) {
+          const appStatus = json.data.status;
+          if (appStatus === 'building') setDeployStep('Building application...');
+          else if (appStatus === 'starting') setDeployStep('Starting application...');
+          else if (appStatus === 'running') {
+            clearInterval(poll);
+            setStatus('success');
+            const { label } = appLinkInfo(json.data);
+            setMessage(`${appName} is live${label ? ` at ${label}` : ''}`);
+            toast('success', `${appName} deployed!`);
+          } else if (appStatus === 'errored') {
+            clearInterval(poll);
+            setStatus('error');
+            setMessage(json.data.error || 'Application failed to start');
+          }
+        }
+      } catch {}
+      if (attempts > 60) {
+        // 30 second timeout
+        clearInterval(poll);
+        setStatus('success');
+        setMessage(`${appName} is being deployed. Check the app detail for status.`);
+      }
+    }, 500);
   };
 
   const uploadFiles = async (files: FileList) => {
+    if (files.length === 0) return;
+
+    // /:name/source takes the app name from the URL path — unlike git
+    // deploy, there is no server-side auto-generation to fall back on.
+    const name = uploadAppName.trim() || deriveRootDirectoryName(files) || '';
+    if (!name) {
+      setStatus('error');
+      setMessage('Enter an application name, or select a folder — its name is used.');
+      return;
+    }
+    if (!APP_NAME_RE.test(name)) {
+      setStatus('error');
+      setMessage(
+        `"${name}" isn't a valid app name — use 1-64 letters, digits, hyphens or underscores, starting with a letter or digit.`
+      );
+      return;
+    }
+
     setStatus('deploying');
     setMessage('');
-
-    const formData = new FormData();
-    for (let i = 0; i < files.length; i++) formData.append('files', files[i]);
-    if (uploadAppName.trim()) formData.append('name', uploadAppName.trim());
+    setUploadFileCount(0);
+    setUploadBytes(0);
+    setUploadSkipped([]);
+    setDeployStep('Checking for an existing app...');
 
     try {
-      const res = await fetch('/api/v1/apps/deploy', {
+      // Pre-flight: does an app by this name already exist? Does double
+      // duty — refuses (client-side, before spending a build) an upload
+      // that would sever a git-deployed app's link, and requires
+      // confirmation before an upload that would otherwise silently prune
+      // an existing app's files to match the new archive.
+      const existingRes = await fetch(`/api/v1/apps/${name}`, { headers: getAuthHeaders() });
+      if (existingRes.status === 200) {
+        const existingJson = await existingRes.json();
+        const existingApp = existingJson?.data as App | undefined;
+        // `groupGitBacked` covers a monorepo child, which carries no
+        // `gitSource` of its own (the hidden group container holds it) —
+        // without this, uploading over a child pays the full tar+gzip
+        // before the server's 409 tells us the same thing.
+        if (existingApp?.gitSource || existingApp?.groupGitBacked) {
+          setStatus('error');
+          setMessage(
+            `"${name}" is deployed from git; uploading would sever the git link. Redeploy from the GitHub tab instead, or delete the app first to switch to uploads.`
+          );
+          return;
+        }
+        const confirmed = await confirmDialog({
+          title: `Replace "${name}"?`,
+          message: `An app named "${name}" already exists. Uploading will replace its files with your selection — anything not included will be deleted.`,
+          confirmText: `Replace ${name}`,
+          variant: 'danger',
+        });
+        if (!confirmed) {
+          setStatus('idle');
+          return;
+        }
+      } else if (existingRes.status !== 404) {
+        const json = await existingRes.json().catch(() => ({}));
+        setStatus('error');
+        setMessage(json?.error?.message || `Couldn't check for an existing app (${existingRes.status}).`);
+        return;
+      }
+
+      setDeployStep('Building archive...');
+      const archive = await buildArchiveFromFiles(files);
+      setUploadFileCount(archive.fileCount);
+      setUploadBytes(archive.bytes);
+      setUploadSkipped(archive.skipped);
+
+      setDeployStep('Uploading...');
+      const res = await fetch(`/api/v1/apps/${name}/source`, {
         method: 'POST',
-        headers: getAuthHeaders(),
-        body: formData,
+        headers: { ...getAuthHeaders(), 'Content-Type': 'application/gzip' },
+        body: archive.blob,
       });
       const json = await res.json();
-      if (json.success) {
-        setStatus('success');
-        setDeployedApp(json.data?.name || '');
-        setMessage(json.data?.message || 'Application deployed successfully');
-        toast('success', `Deployed ${json.data?.name || 'application'}`);
-      } else {
-        setStatus('error');
-        setMessage(json.error?.message || 'Deployment failed');
-        toast('error', json.error?.message || 'Deployment failed');
+
+      // 202 body is { app, acceptedAt, isNew } — `app` is the app NAME
+      // (a string), not a DTO (UploadDeployResult in
+      // upload-deploy.types.ts).
+      if (res.status === 202 && json.success && json.data?.app) {
+        const appName = json.data.app as string;
+        setDeployedApp(appName);
+        setDeployStep('Building application...');
+        pollUploadedApp(appName);
+        return;
       }
+
+      setStatus('error');
+      setMessage(uploadErrorMessage(res.status, json));
     } catch (err) {
       setStatus('error');
-      setMessage(err instanceof Error ? err.message : 'Network error');
-      toast('error', 'Failed to connect to server');
+      setMessage(
+        err instanceof UploadArchiveError || err instanceof Error ? err.message : 'Network error'
+      );
     }
   };
 
@@ -503,20 +691,22 @@ function DeployPage() {
         <Card className="max-w-2xl space-y-5">
           {/* App name */}
           <Input
-            label="Application name (optional)"
+            label="Application name"
             type="text"
             value={uploadAppName}
             onChange={e => setUploadAppName(e.target.value)}
-            placeholder="Auto-generated if empty"
+            placeholder="Uses the selected folder's name if left blank"
             disabled={status === 'deploying'}
           />
 
-          {/* Drop zone */}
+          {/* Drop zone — click opens a folder picker (webkitdirectory), since
+              a whole app folder is the expected input; the loose-file
+              fallback below covers a plain multi-file selection. */}
           <div
             onDragOver={handleDragOver}
             onDragLeave={handleDragLeave}
             onDrop={handleDrop}
-            onClick={() => status !== 'deploying' && fileInputRef.current?.click()}
+            onClick={() => status !== 'deploying' && folderInputRef.current?.click()}
             className="cursor-pointer rounded-xl border-2 border-dashed p-10 text-center transition-colors"
             style={{
               borderColor: dragOver ? 'var(--accent)' : 'var(--border)',
@@ -524,12 +714,12 @@ function DeployPage() {
             }}
           >
             <input
-              ref={fileInputRef}
+              ref={folderInputRef}
               type="file"
               multiple
-              onChange={handleFileSelect}
+              onChange={handleFolderSelect}
               className="hidden"
-              accept=".js,.ts,.jsx,.tsx,.py,.go,.html,.css,.json,.yaml,.yml,.toml,.mod,.sum,.txt,.md,.env,.lock"
+              {...({ webkitdirectory: '' } as InputHTMLAttributes<HTMLInputElement>)}
             />
             {status === 'deploying' ? (
               <>
@@ -538,21 +728,61 @@ function DeployPage() {
                   style={{ color: 'var(--accent)' }}
                 />
                 <p className="text-sm font-medium" style={{ color: 'var(--text)' }}>
-                  Uploading and deploying...
+                  {deployStep || 'Uploading and deploying...'}
                 </p>
+                {(uploadFileCount > 0 || uploadSkipped.length > 0) && (
+                  <p className="mt-1 text-xs" style={{ color: 'var(--text-2)' }}>
+                    {uploadFileCount} file{uploadFileCount === 1 ? '' : 's'}, {formatBytes(uploadBytes)} compressed
+                  </p>
+                )}
               </>
             ) : (
               <>
                 <FolderUp className="mx-auto mb-3 h-10 w-10" style={{ color: 'var(--text-3)' }} />
                 <p className="mb-1 text-sm font-medium" style={{ color: 'var(--text)' }}>
-                  Drag &amp; drop files here, or click to browse
+                  Click to choose your app's folder, or drag &amp; drop files here
                 </p>
                 <p className="text-xs" style={{ color: 'var(--text-2)' }}>
-                  Upload your application files to deploy
+                  A folder is expected — <code>.git</code> and <code>node_modules</code> are excluded
+                  automatically.
                 </p>
               </>
             )}
           </div>
+
+          {/* Skipped-paths list — shown while/after building the archive so
+              the user can see what a folder drop excluded (.git is a hard
+              server-side rejection, not just hygiene, so this must be
+              visible rather than a silent difference). */}
+          {uploadSkipped.length > 0 && (
+            <div
+              className="rounded-lg border p-3 text-xs"
+              style={{ background: 'var(--bg-2)', borderColor: 'var(--border)', color: 'var(--text-3)' }}
+            >
+              <p className="mb-1 font-medium" style={{ color: 'var(--text-2)' }}>
+                Skipped {uploadSkipped.length} path{uploadSkipped.length === 1 ? '' : 's'} (.git, node_modules)
+              </p>
+              <ul className="space-y-0.5 font-mono">
+                {uploadSkipped.slice(0, 5).map(p => (
+                  <li key={p} className="truncate">
+                    {p}
+                  </li>
+                ))}
+                {uploadSkipped.length > 5 && <li>+{uploadSkipped.length - 5} more</li>}
+              </ul>
+            </div>
+          )}
+
+          {/* Loose-file fallback */}
+          {status !== 'deploying' && (
+            <p className="-mt-3 text-center text-xs" style={{ color: 'var(--text-3)' }}>
+              Not a folder?{' '}
+              <button type="button" onClick={() => fileInputRef.current?.click()} className="underline">
+                Select individual files instead
+              </button>
+              <input ref={fileInputRef} type="file" multiple onChange={handleFileSelect} className="hidden" />
+            </p>
+          )}
 
           {/* CLI hint */}
           {filesystemHint && (

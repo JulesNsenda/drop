@@ -254,6 +254,16 @@ is reached by root tsc, eslint and jest. Only DOM glue stays in the dashboard.
   (`my.app`) is a likely derived default and would otherwise also miss the
   body-size carve-out `UPLOAD_SOURCE_PATH_RE` (`server.ts:55`) and fail with a
   misleading "Request body too large".
+- **The git-backed 409 is a first-class UI case, pre-empted AND handled.**
+  DROP-146 makes an upload onto a git-deployed app return 409 with a message
+  naming `git/redeploy`. Dragging the folder of an app originally deployed from
+  GitHub is the single most likely accidental rejection, so: (1) the existing
+  `GET /api/v1/apps/:name` pre-check below does double duty — `toAppDto`
+  returns `gitSource`, so the client can refuse **before** spending a tar+gzip
+  of up to 100 MB and an upload; and (2) the 409 is still rendered with the
+  server's own message as a backstop, never as a generic "Deployment failed".
+  Same for a `vcs_metadata` 400, which the client-side `.git` strip should make
+  unreachable but which must read correctly if it ever surfaces.
 - **Overwrite confirmation.** `/:name/source` is deploy-*or-redeploy*, and
   `landFiles` prunes the target (`upload-deploy.ts:257-277`). With an
   auto-derived name, dropping a folder that shares a name with a live app
@@ -498,6 +508,52 @@ is a hard failure.
   `npm run build:dashboard` first or use `cd src/dashboard && npm run dev` with
   its `/api` proxy — and do not mix the two. Same class as the
   `__DROP_VERSION__` trap: verify in the built output.
+  Because this branch is **stacked on Item 0**, the local run exercises the new
+  UI against the `.git` rejection and the git-app 409 together — which is the
+  ideal integration test, not a complication. Two named steps, not a generic
+  "drive the UI":
+  1. Drag a folder that **contains `.git`** and confirm the client strips it
+     silently (listing it as skipped) rather than the server returning a
+     `vcs_metadata` 400.
+  2. Drag onto an app that is **git-deployed** and confirm the 409 renders with
+     the server's own `git/redeploy` message, not "Deployment failed".
+  **PARTIALLY SATISFIED without a browser.** The Chrome extension was not
+  connected this session, but the two observations that mattered did not need
+  it: Node 22 implements `File`, `Blob` and `CompressionStream` natively — the
+  blocker was only the *type* layer (`lib: ["ES2022"]`), not the runtime. So
+  `upload-archive.ts` was bundled unmodified with esbuild and executed against
+  a realistic checked-out-repo selection, then its output handed to the
+  **production `extractTarball`**:
+
+  ```
+  skipped    : [".git/config",".git/HEAD","node_modules/left-pad/index.js"]
+  tar entries: ["package.json","src/index.js",".gitignore"]
+  magic      : 1f 8b        IS_GZIP: true
+  extract    : {"fileCount":3,"dirCount":0,"bytesWritten":44}
+  landed     : [".gitignore","package.json","src","src/index.js"]
+  ```
+
+  That is the real glue, the real `buildTar`, the real `CompressionStream`, and
+  the real hardened extractor. It proves: `.git` is stripped client-side (so a
+  repo folder does not 400), `.gitignore` is NOT over-matched, the `my-app/`
+  common root is removed (the server has no strip-components), the body is a
+  genuine gzip stream, and the endpoint's own extractor accepts it.
+
+  **Still unverified — the React layer only**: folder picker, replace
+  confirmation, the git-backed pre-flight refusal, error-message rendering, and
+  the poll loop. Those need a browser. Do not report Item 1 as fully runtime
+  verified until they are driven.
+
+  3. **Inspect the request body's first two bytes — they must be `1f 8b`** —
+     and confirm a 202 rather than a `not_gzip` 400. This is the one step the
+     unit tests structurally cannot reach: every `buildTar` test round-trips
+     through `zlib`/node-tar or `extractTarball`, so `new Blob(chunks)` →
+     `CompressionStream('gzip')` has never actually executed. It can't be
+     tested under jest either (`testEnvironment: 'node'`, no `CompressionStream`
+     without jsdom). "The upload worked" would also be satisfied by luck, so
+     read the payload, not just the status. Watch specifically for `entry.data`
+     being a *view* onto a larger `ArrayBuffer` — `new Blob([view])` is a
+     classic place to silently ship the wrong bytes.
 - **Item 2** — needs a real private GitHub repo and a PAT. Token injection is
   HTTPS-only (`git-client.ts:21-22`), so a `file://` bare repo would make the
   test **vacuous**. Plus a platform restart to prove `gitSource.tokenId`
@@ -520,6 +576,20 @@ branch-gated and stops/restarts the service. This plan ends at **PRs opened**.
    change that does not deserve its own outage.
 
 Consent is required for each window, on the *deploy*, not merely the push.
+
+### Branches and their ordering
+
+| Branch | Contains | Constraint |
+|---|---|---|
+| `bugfix/DROP-145-login-back-home` | Item 4 | Independent — may merge at any time, in either window |
+| `feature/DROP-144-reject-vcs-metadata` | Item 0 (3 commits, incl. DROP-146) | **Window 1**, merges first |
+| `feature/DROP-141-dashboard-upload` | Item 1 | **Stacked on DROP-144** — must merge after it, or be rebased onto `develop` once DROP-144 lands |
+
+DROP-145 and DROP-141 both add files under `src/dashboard/src/lib/`, but
+different ones (`site-url.ts` vs `upload-archive.ts`), so they do not conflict.
+Consequence while working: **`site-url.ts` is absent on the DROP-141 branch**, so
+a Gate 4 run there still shows the old, broken "Back to home" link. That is the
+branch layout, not a regression — verify Item 4 from its own branch.
 
 ---
 
