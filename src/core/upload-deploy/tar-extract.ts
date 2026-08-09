@@ -33,12 +33,27 @@ export interface TarExtractResult {
   bytesWritten: number;
 }
 
+/**
+ * Internal extension of `TarExtractResult` carrying the first parser warning
+ * observed during extraction (e.g. a `TAR_ENTRY_INVALID` checksum failure or
+ * `TAR_BAD_ARCHIVE`), if any. The parser runs in non-strict mode (see
+ * `runExtraction`) so warnings never abort extraction on their own, but the
+ * first one is surfaced in the `empty_archive` message so a malformed archive
+ * says why it produced no files instead of looking identical to a
+ * legitimately empty one. Kept off the public `TarExtractResult` — callers of
+ * `extractTarball` have no use for it.
+ */
+interface ExtractionOutcome extends TarExtractResult {
+  firstWarning?: string;
+}
+
 export type ArchiveRejectReason =
   | 'not_gzip'
   | 'invalid_archive'
   | 'disallowed_entry_type'
   | 'path_escape'
   | 'path_collision'
+  | 'vcs_metadata'
   | 'too_many_bytes'
   | 'too_many_entries'
   | 'timeout'
@@ -79,7 +94,8 @@ export async function extractTarball(
 
   if (result.fileCount === 0) {
     await fsp.rm(destDir, { recursive: true, force: true });
-    throw new ArchiveRejectedError('empty_archive', 'Archive contains no regular files');
+    const suffix = result.firstWarning ? ` (${result.firstWarning})` : '';
+    throw new ArchiveRejectedError('empty_archive', `Archive contains no regular files${suffix}`);
   }
 
   return result;
@@ -123,7 +139,7 @@ function runExtraction(
   archivePath: string,
   destDir: string,
   limits: TarExtractLimits
-): Promise<TarExtractResult> {
+): Promise<ExtractionOutcome> {
   return new Promise((resolve, reject) => {
     let settled = false;
     let fileCount = 0;
@@ -132,11 +148,24 @@ function runExtraction(
     let totalBytes = 0;
     let activeWrites = 0;
     let parserEnded = false;
+    let firstWarning: string | undefined;
     const seenKeys = new Set<string>();
 
     const readStream = fs.createReadStream(archivePath);
     const gunzip = zlib.createGunzip();
+    // Left non-strict deliberately (a strict parser would throw on the first
+    // warning, changing behaviour for existing callers) — but non-strict mode
+    // means node-tar's own defects (a bad checksum, an unrecognized archive
+    // format, ...) surface only as 'warn' events, and with nothing listening
+    // they'd be silently discarded, leaving every malformed archive to look
+    // identical to a legitimately empty one below. Capture the first warning
+    // so `empty_archive` can say why.
     const parser = new TarParser();
+    parser.on('warn', (code: string, message: string) => {
+      if (!firstWarning) {
+        firstWarning = `${code}: ${message}`;
+      }
+    });
 
     const timer = setTimeout(() => {
       settle(new ArchiveRejectedError('timeout', `Extraction exceeded ${limits.timeoutMs}ms wall-clock limit`));
@@ -169,7 +198,7 @@ function runExtraction(
           .catch(() => undefined)
           .finally(() => reject(err));
       } else {
-        resolve({ fileCount, dirCount, bytesWritten: totalBytes });
+        resolve({ fileCount, dirCount, bytesWritten: totalBytes, firstWarning });
       }
     }
 
@@ -209,6 +238,45 @@ function runExtraction(
           new ArchiveRejectedError(
             'disallowed_entry_type',
             `Entry '${entry.path}' has disallowed type '${entry.type}'`
+          )
+        );
+        return;
+      }
+
+      // Reject any entry with a `.git` path component, at any depth
+      // (`vendor/foo/.git/config`, not just a root-level `.git/`) and
+      // case-insensitively (`.GIT`/`.Git` name the same directory on
+      // case-insensitive filesystems — the CVE-2014-9390 class). An uploaded
+      // `.git/` can overwrite the app's real one (syncTree's DEFAULT_PRESERVE
+      // is `['node_modules']` only), and `POST /git/redeploy/<app>` later runs
+      // `git pull` in that directory ON THE HOST as the `drop` user — a
+      // poisoned `.git/config` (e.g. an `ext::sh -c ...` remote URL) is then
+      // arbitrary command execution. Rejecting the whole archive rather than
+      // stripping the entry is deliberate and mirrors this file's stance on
+      // REGULAR_FILE_TYPES above: a hostile archive never gets a partial,
+      // silently-modified extraction. Adding `.git` to DEFAULT_PRESERVE
+      // instead would be wrong — that list is shared with monorepo
+      // materialization and has nothing to do with rejecting untrusted input.
+      // Read `entry.path`, NEVER the raw header name field: node-tar consumes a
+      // PAX extended header (typeflag 'x') internally and applies its `path=`
+      // record to the following entry before emitting it, so a header claiming
+      // `innocuous.txt` can carry `.git/config`. Measured — with this guard
+      // removed, such an archive extracts successfully. `entry.path` is the
+      // post-override value and is the only safe thing to check here.
+      //
+      // Trailing dots and spaces are stripped by Win32 path normalization, so
+      // `.git.` and `.git ` both materialize as `.git` when mkdir runs on a
+      // Windows host (DROP_ROOT is C:\drop there) — the CVE-2019-1353 class.
+      // Harmless on the Linux production box, where they are distinct
+      // directories git cannot read, but the guard is cheap and this is a
+      // boundary against host command execution: normalize before comparing.
+      const pathComponents = entry.path.split(/[\\/]/);
+      if (pathComponents.some((component) => component.toLowerCase().replace(/[. ]+$/, '') === '.git')) {
+        entry.resume();
+        settle(
+          new ArchiveRejectedError(
+            'vcs_metadata',
+            `Entry '${entry.path}' contains a '.git' path component`
           )
         );
         return;
