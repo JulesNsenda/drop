@@ -27,6 +27,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-08-09
+
+Two security fixes that change behaviour, and the recovery path for a repo
+that goes private after it was deployed.
+
+**Read before upgrading — two compatibility breaks, both security-driven:**
+
+1. **An upload carrying `.git` is now refused.** `tar -czf app.tgz .` from a
+   working tree fails instead of silently deploying the repository's git
+   metadata. Exclude it (`--exclude .git`), or deploy via `POST /git/deploy`.
+2. **`gitSource.tokenId` is no longer returned below the admin tier**, and
+   `gitSource.repoUrl` is normalized. Breaking for any script or agent that
+   read `tokenId` from `GET /api/v1/apps/:name`.
+
 ### Security
 
 - **Uploaded archives containing `.git` metadata are now rejected.** An
