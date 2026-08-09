@@ -1,6 +1,6 @@
 {
   "name": "drop",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "DROP - Deploy, Run, Operate, Publish. A lightweight, self-hosted PaaS.",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
