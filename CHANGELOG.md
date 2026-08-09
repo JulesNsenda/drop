@@ -127,6 +127,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   resolved to whatever repository existed *above* it and reported that
   repo's commit as the app's own.
 
+- **Container CPU is no longer under-reported by the host core count**
+  (DROP-143). The core count was derived from `percpu_usage`, a cgroup
+  v1-only field. Under cgroup v2 — the default on current Debian and Ubuntu —
+  Docker omits it and reports `online_cpus` instead, so the divisor fell back
+  to 1 and every reading on the dashboard was the true figure divided by the
+  number of host cores.
+
+- **"Back to home" on the login and signup pages works again** (DROP-145).
+  It linked to `/`, which since the site split resolves to the dashboard's
+  own host, redirects to `/dashboard`, and sends a logged-out visitor
+  straight back to `/login` — a closed loop. It now points at the marketing
+  host, and renders nothing at all on a single-host install, which has no
+  landing page to return to.
+
 ## [1.1.0] - 2026-08-09
 
 The marketing site moves out of the platform, a `drop.yaml` field that was
