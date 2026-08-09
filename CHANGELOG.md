@@ -27,7 +27,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [1.1.0]
+## [1.1.0] - 2026-08-09
 
 The marketing site moves out of the platform, a `drop.yaml` field that was
 accepted but never read starts working, and four fixes land — every one of
