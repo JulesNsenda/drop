@@ -27,13 +27,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.0]
+
+The marketing site moves out of the platform, a `drop.yaml` field that was
+accepted but never read starts working, and four fixes land — every one of
+them found by running the site split, not by reviewing it.
+
+### Added
+
+- **`port:` in `drop.yaml` is now honoured.** It has always been an
+  accepted, typed, validated field that nothing ever read, so an app that
+  declared a port still got an arbitrary one and had no way to find out. It
+  applies as a *preference*, never a claim: a port already held by another
+  app, one outside the configured range, or the DROP API port itself falls
+  through to normal allocation with a warning rather than failing the
+  deploy. Useful wherever something outside DROP hardcodes the upstream
+  port — a hand-written reverse-proxy host file, say. Check the app's
+  actual port after declaring one.
+
 ### Changed
 
 - The marketing site, docs and API reference now live in their own repo,
   deployed as a separate app at dropkit.sh — the platform no longer builds
   or serves `/`, `/docs` or `/reference`. `/` now 301-redirects to
   `/dashboard`; self-hosted installs that relied on the API-info JSON
-  previously returned at `/` will see a redirect instead.
+  previously returned at `/` will see a redirect instead. Release bundles
+  no longer contain a `dist/site` directory.
+
+### Fixed
+
+- **`/api/v1/health` no longer flaps between healthy and degraded.** Under
+  Docker isolation the liveness probe was collecting live CPU and memory
+  for every container — roughly a second each — against its own 2000ms
+  budget. It emitted intermittent 503s on jitter while the runtime was
+  perfectly healthy, and degraded monotonically with every app added. The
+  probe now asks the runtime only whether it is reachable and how many apps
+  it manages; per-app stats are unchanged for the dashboard's own views.
+- **Single-page apps deployed from source can be built under Docker
+  isolation at all.** The build and the runtime shared one image choice, so
+  a static/SPA app was built in `nginx:alpine` — which has no npm, so the
+  build could not succeed. Builds now select their own image and the app is
+  still served from nginx.
+- A tenant can no longer claim a hostname another app derives from its own
+  name: the reserved-host check saw only hostnames declared under
+  `domains:`, missing every implicit `<name>.<suffix>`.
+- `install.sh --provision` no longer overwrites a hand-edited apex Caddy
+  host file on each run. It creates the route only when absent, and refuses
+  to write through a symlink.
 
 ## [1.0.0] - 2026-08-07
 
@@ -341,6 +381,7 @@ First stable release of DROP with full deployment pipeline, hot-reload, and data
 
 ---
 
-[Unreleased]: https://github.com/JulesNsenda/drop/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/JulesNsenda/drop/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/JulesNsenda/drop/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/JulesNsenda/drop/compare/v0.1.0...v1.0.0
 [0.1.0]: https://github.com/JulesNsenda/drop/releases/tag/v0.1.0
