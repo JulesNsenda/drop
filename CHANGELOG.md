@@ -51,6 +51,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   deploy a repository. The MCP `deploy_files` tool rejects such paths before
   staging.
 
+- **Dotenv files are excluded from a dashboard folder upload.** `.env`,
+  `.env.local`, `.env.production` and the like are skipped (templates —
+  `.env.example`, `.env.sample`, `.env.template`, `.env.dist` — still ship),
+  and the upload panel lists exactly what it left out. For a static app the
+  uploaded tree root is the web server's document root, so a shipped `.env`
+  was fetchable at `/.env` on the public URL. Use the secrets API
+  (`PUT /api/v1/secrets/<app>`) for values the app needs at runtime.
+
 ### Fixed
 
 - **An archive whose entries the tar parser rejects no longer deploys as a

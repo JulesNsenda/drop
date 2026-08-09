@@ -324,8 +324,24 @@ Correct shape: resolve once at the top —
 — use it for `getTokenValue`/`gitPull` **and** build the final `gitSource` from
 it rather than from `app.gitSource`.
 
+### Carried in from the Item 1 security review — fix here, not there
+
+`toAppDto` (`apps.ts:190`) returns the **whole `gitSource`** at the non-admin
+tier: `repoUrl`, which echoes back userinfo credentials if a user pasted
+`https://user:pat@github.com/...`, and `tokenId`, a correlation handle. Rated
+`low`/`high`, pre-existing, and **not** widened by Item 1 (which only reads the
+field the DTO already exposed) — but this item owns token handling, so it is
+fixed here rather than deferred again. Strip userinfo from `repoUrl` via a
+`new URL()` round-trip clearing `username`/`password`, and gate `tokenId` on
+`isAdmin` the way `pid` and `path` already are.
+
 ### File-level changes
 
+- [ ] **`src/api/routes/apps.ts`** — `toAppDto`: strip `repoUrl` userinfo; gate
+      `tokenId` on `isAdmin`. Note the dashboard's own upload pre-flight reads
+      `gitSource` to refuse a git-backed target, so keep the FIELD present for
+      non-admins — narrow its contents, don't remove it, or DROP-141's
+      client-side refusal silently stops working.
 - [ ] **`src/core/git-deploy/git-deploy.types.ts`** — add `tokenId?: string | null`
       to the existing **`DeployActor`**, *not* a third `redeploy()` parameter.
       Five assertions in `git-deploy.authz.test.ts` (`:97, :106, :133, :165,
@@ -786,6 +802,47 @@ already makes.
 One critic reported the plan file's path as `docs/specs/plans/…` and inferred a
 gitignore-convention problem. Verified false: it is `docs/plans/…`, force-added
 deliberately past `.gitignore:117`.
+
+### Item 1 · pass 1
+
+Panel: `security-critic` (`model: opus`) — reported; `code-reviewer` —
+outstanding at time of writing, to be read against the CURRENT tree, since the
+all-excluded refusal below is a new early-return path it did not see.
+
+The security critic closed five of its six asked angles with evidence and no
+finding: the `isVcsMetadataComponent` move is a byte-identical symbol move with
+the call site unchanged; no client-crafted path escapes `resolveContained`,
+because node-tar's post-PAX `entry.path` is both what the guard checks and what
+gets written, so client and server cannot diverge on the resolved path; the
+client caps sit under the server's and the 100 MB compressed cap plus the
+10/min bucket still apply (the new URL matches `UPLOAD_SOURCE_PATH_RE` because
+`APP_NAME_RE` is a subset of `[A-Za-z0-9_-]+`); `Content-Type` is never read by
+the route; and `gitSource` was already in `toAppDto` before this branch, so the
+pre-flight reads it without widening exposure.
+
+| Severity / confidence | Finding | Disposition |
+|---|---|---|
+| **low / high** | **Exclusion ran AFTER `stripCommonRoot`, exempting the selected root from its own rules** — picking the `node_modules` or `.git` folder itself makes it the common root, strips it, and every file inside sails through. `node_modules` as a root also passes `APP_NAME_RE`, so nothing downstream catches it | **Actioned** — tests the pre-strip path. Rated `low` by the critic only because the `.git` case additionally needs a typed app name; the `node_modules` case has no such brake, so this was treated as the real bug it is. Re-verified on the bundled glue: both rooted selections now keep zero files |
+| low / medium | Folder picker archives the whole tree with no `.gitignore` awareness — a `.env` is fetchable at `/.env` for a static app, whose doc root IS the uploaded tree | **Actioned** — `.env*` excluded except templates, listed in the skipped panel, changelogged |
+| low / high | `normalizeEntryPath` rejects `..` and `\` but not NUL — which truncates the USTAR name field, so the path the UI validated is not the path the server writes | **Actioned** — all control characters rejected |
+| low / high | `writeOctal`'s `padStart` pads but never truncates: an oversized value overflows into the next header field and the checksum, computed last, makes it verify | **Actioned** — unreachable today, but this is a shared util now imported by two bundles and the failure is silent |
+| low / medium | `splitPath` could split at the final byte, leaving an empty `name`; node-tar retypes the entry as a directory and discards its body | **Actioned** |
+| low / high | `MAX_ENTRIES` checked against the KEPT count only, so a 200 000-file selection builds three arrays that size and the excluded entries escape the cap | **Actioned** — bounded before normalizing |
+| low / low | The `.git` guard now lives in a module whose stated contract is "DOM-free so the dashboard can bundle it", inviting a browser-motivated edit to a security control | **Actioned** — SECURITY CONTROL banner at the top of the file |
+| low / high, pre-existing | `toAppDto` returns the whole `gitSource` — `repoUrl` (possibly with userinfo credentials) and `tokenId` — at the non-admin tier | **Moved to Item 2**, which owns token handling, and written into that item's file list rather than left as a note |
+
+Also fixed while in the file, not from a critic: an all-excluded selection used
+to build an empty archive and defer to the server's `empty_archive` 400, which
+says nothing about why; it now refuses locally and names the reason.
+
+**A process note worth keeping.** Writing the control-character class with
+literal bytes made git and grep treat the source as **binary**, and made the
+character class invisible in review — three separate edit attempts then failed
+to match it. The regex is now written with explicit escapes and the tests build
+control characters via `String.fromCharCode`. Never type a control character
+into source.
+
+**`medium`/`low` findings dropped without individual reasons: 0.**
 
 ## Run stats
 
