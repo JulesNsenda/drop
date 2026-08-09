@@ -169,15 +169,23 @@ function AppDetailPage() {
     setActionLoading('redeploy');
     // Three states, deliberately: neutral → omit the key (leave the stored
     // token alone), CLEAR → null, an id → attach/replace.
+    const wasClear = credentialChoice === CREDENTIAL_CLEAR;
     const result = await gitRedeploy(name, credentialChoiceToTokenId(credentialChoice));
     if (result.success) {
       toast('success', isGroupChild ? `Redeploying group ${app?.group}...` : `Redeploying ${name}...`);
-      // Back to neutral so the NEXT redeploy doesn't re-send the change. Only
-      // on success: a redeploy whose pull fails does not persist a
-      // newly-supplied token, so the selection has to survive for the retry.
-      setCredentialChoice(CREDENTIAL_UNCHANGED);
     } else {
       toast('error', result.error || `Failed to redeploy ${name}`);
+    }
+    // Back to neutral so the next redeploy doesn't re-send the change — but
+    // the two directions clear at different times, because the server
+    // persists them at different times. An ATTACH is written only after a
+    // successful pull, so on failure the selection must survive for the
+    // retry. A CLEAR is written BEFORE the pull (revocation is not a deploy
+    // outcome), so it has already happened whatever the pull did, and leaving
+    // the select on "Clear stored credential" would describe a pending change
+    // that isn't pending.
+    if (result.success || wasClear) {
+      setCredentialChoice(CREDENTIAL_UNCHANGED);
     }
     await refresh();
     setActionLoading(null);
