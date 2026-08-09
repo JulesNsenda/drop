@@ -670,6 +670,70 @@ describe('ContainerManager', () => {
       expect(fromList.cpu).toBe(fromDetail!.cpu);
     });
 
+    // DROP-143. `percpu_usage` is a cgroup **v1** field. Under cgroup v2 --
+    // the default on current Debian/Ubuntu, including the production box --
+    // Docker omits it and reports `online_cpus` instead, so the old
+    // `percpu_usage?.length ?? 1` fell back to 1 and divided every reported
+    // percentage by the host's core count. A separate fixture rather than an
+    // edit to makeStats(): three assertions above depend on that one yielding
+    // cpu === 2.
+    describe('cgroup CPU-count source', () => {
+      /** Same 1% raw ratio as makeStats(); only the CPU-count source varies. */
+      function statsWithCpuCount(cpuCountFields: Record<string, unknown>) {
+        return {
+          memory_stats: { usage: 50 * 1024 * 1024 },
+          cpu_stats: {
+            cpu_usage: { total_usage: 200, ...(cpuCountFields.cpu_usage as object) },
+            system_cpu_usage: 20000,
+            ...(cpuCountFields.top as object),
+          },
+          precpu_stats: { cpu_usage: { total_usage: 100 }, system_cpu_usage: 10000 },
+        };
+      }
+
+      async function cpuFor(stats: unknown): Promise<number> {
+        const container = makeMockContainer('my-app', makeInspectInfo('my-app', makeState(true)));
+        container.stats = jest.fn().mockResolvedValue(stats);
+        const docker = makeDockerMock({ 'my-app': container }) as any;
+        const info = await new ContainerManager(docker).getStatus('my-app');
+        return info!.cpu;
+      }
+
+      it('uses online_cpus under cgroup v2, where percpu_usage is absent', async () => {
+        // Without the fix this reports 1% -- a quarter of the truth on a
+        // 4-core host, which is exactly the under-report DROP-143 is about.
+        expect(await cpuFor(statsWithCpuCount({ top: { online_cpus: 4 } }))).toBe(4);
+      });
+
+      it('falls back to percpu_usage on an older cgroup v1 daemon', async () => {
+        expect(
+          await cpuFor(statsWithCpuCount({ cpu_usage: { percpu_usage: [1, 1] } }))
+        ).toBe(2);
+      });
+
+      it('prefers online_cpus when a v1 daemon reports both', async () => {
+        expect(
+          await cpuFor(
+            statsWithCpuCount({ top: { online_cpus: 4 }, cpu_usage: { percpu_usage: [1, 1] } })
+          )
+        ).toBe(4);
+      });
+
+      it('falls back to a single CPU when neither field is present', async () => {
+        expect(await cpuFor(statsWithCpuCount({}))).toBe(1);
+      });
+
+      it('ignores a nonsensical online_cpus of 0 rather than reporting a flat 0%', async () => {
+        // Taking it literally multiplies the ratio by zero, which is the same
+        // permanent under-report this fix removes.
+        expect(
+          await cpuFor(
+            statsWithCpuCount({ top: { online_cpus: 0 }, cpu_usage: { percpu_usage: [1, 1] } })
+          )
+        ).toBe(2);
+      });
+    });
+
     it('does not fetch stats for a container that is not running', async () => {
       const container = makeMockContainer('my-app', makeInspectInfo('my-app', makeState(false)));
       container.stats = jest.fn().mockResolvedValue(makeStats());

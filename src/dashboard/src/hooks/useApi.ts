@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback } from 'react';
 import { apiJson, jsonBody } from '../api/client';
+import { redeployBody } from '../lib/redeploy-credential';
 
 export interface GitSource {
   repoUrl: string;
@@ -286,8 +287,25 @@ export async function gitDeploy(request: {
   return { success: json.success, data: json.data, error: json.error?.message };
 }
 
-export async function gitRedeploy(name: string): Promise<{ success: boolean; error?: string }> {
-  const json = await apiJson(`/git/redeploy/${name}`, { method: 'POST' });
+/**
+ * Redeploy a git-backed app, optionally attaching a stored credential to it
+ * (DROP-142 — a repo that went public → private is otherwise unrecoverable).
+ *
+ * `tokenId` has THREE states at the API boundary: **omitted** leaves the app's
+ * stored token unchanged, **null** clears it, a **`git_...` id** attaches or
+ * replaces it. `redeployBody` owns that decision — see its file for why the
+ * omitted case is the one that matters and why it is tested there rather than
+ * inline here.
+ */
+export async function gitRedeploy(
+  name: string,
+  tokenId?: string | null
+): Promise<{ success: boolean; error?: string }> {
+  const body = redeployBody(tokenId);
+  const json = await apiJson(`/git/redeploy/${name}`, {
+    method: 'POST',
+    ...(body === undefined ? {} : jsonBody(body)),
+  });
   return { success: json.success, error: json.error?.message };
 }
 

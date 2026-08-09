@@ -59,6 +59,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   was fetchable at `/.env` on the public URL. Use the secrets API
   (`PUT /api/v1/secrets/<app>`) for values the app needs at runtime.
 
+- **Personal access tokens no longer reach disk on either git path**
+  (DROP-142). `git clone https://TOKEN@github.com/…` recorded the URL
+  verbatim as `remote.origin.url`, so every app deployed from a private repo
+  carried its PAT in cleartext inside its own directory — which is the served
+  document root for a static app and is bind-mounted into the tenant's
+  container under docker isolation. `gitPull` wrote the same value for the
+  duration of a pull. Both now pass the token through a one-shot credential
+  helper that reads it from the git child's own environment (never argv,
+  which is world-readable via `ps`), scoped to `https://github.com` so a
+  tampered remote URL cannot redirect the credential to another host.
+
+- **Existing repositories are cleaned up on their next redeploy** (DROP-142).
+  Closing the leak above does nothing for apps already on disk, and git
+  *prefers* a credential embedded in the remote URL — so on exactly those
+  apps the new helper would never fire. A redeploy now strips the userinfo
+  from `remote.origin.url` before pulling. **Operator note:** an app that is
+  never redeployed keeps the old value; grep for it with
+  `sudo grep -hE '^\s*url\s*=' /var/drop/data/webapps/*/.git/config | grep '@'`.
+
+  Not fully closed by this change: Caddy's `file_server` has no `hide`
+  directive, so a plain-root static app still serves `/.git/config` — and its
+  history — to the internet.
+
+### Added
+
+- **A git credential can be attached to an app that already exists**
+  (DROP-142). `POST /api/v1/git/redeploy/:name` takes an optional
+  `{ "tokenId": … }`: absent leaves the app's stored credential unchanged,
+  `null` clears it, a `git_…` id attaches or replaces one. Answers "a repo
+  that was public and went private can no longer be updated" — the token was
+  always stored by reference and re-read at redeploy, but nothing could write
+  that reference after creation. The dashboard exposes it as a credential
+  picker next to the existing Redeploy button on an app's detail page.
+
+### Changed
+
+- **`gitSource` is narrower for non-admin API consumers** (DROP-142).
+  `GET /api/v1/apps/:name` no longer returns `gitSource.tokenId` below the
+  admin tier, and `gitSource.repoUrl` has any userinfo stripped. The
+  `gitSource` field itself stays present at every tier. Potentially breaking
+  for a script or agent that read `tokenId` from an app record.
+
 ### Fixed
 
 - **An archive whose entries the tar parser rejects no longer deploys as a
@@ -73,6 +115,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   inside an otherwise-valid gzip wrapper is still extracted up to the
   truncation point, because node-tar signals nothing at all in that case —
   measured, and not something a warning-based check can reach.
+
+- **Clearing a git credential actually clears it** (DROP-142). A clear is
+  persisted before the pull rather than after it — otherwise the now
+  unauthenticated pull fails against a private repo and the clear is
+  discarded, leaving no way to detach a compromised token.
+
+- **Git operations are pinned to the app's own repository** (DROP-142).
+  They ran with only a working directory, so an app whose `.git` had been
+  removed — by an upload deploy's prune, or a monorepo re-materialization —
+  resolved to whatever repository existed *above* it and reported that
+  repo's commit as the app's own.
+
+- **Container CPU is no longer under-reported by the host core count**
+  (DROP-143). The core count was derived from `percpu_usage`, a cgroup
+  v1-only field. Under cgroup v2 — the default on current Debian and Ubuntu —
+  Docker omits it and reports `online_cpus` instead, so the divisor fell back
+  to 1 and every reading on the dashboard was the true figure divided by the
+  number of host cores.
+
+- **"Back to home" on the login and signup pages works again** (DROP-145).
+  It linked to `/`, which since the site split resolves to the dashboard's
+  own host, redirects to `/dashboard`, and sends a logged-out visitor
+  straight back to `/login` — a closed loop. It now points at the marketing
+  host, and renders nothing at all on a single-host install, which has no
+  landing page to return to.
 
 ## [1.1.0] - 2026-08-09
 

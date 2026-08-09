@@ -337,18 +337,18 @@ fixed here rather than deferred again. Strip userinfo from `repoUrl` via a
 
 ### File-level changes
 
-- [ ] **`src/api/routes/apps.ts`** — `toAppDto`: strip `repoUrl` userinfo; gate
+- [x] **`src/api/routes/apps.ts`** — `toAppDto`: strip `repoUrl` userinfo; gate
       `tokenId` on `isAdmin`. Note the dashboard's own upload pre-flight reads
       `gitSource` to refuse a git-backed target, so keep the FIELD present for
       non-admins — narrow its contents, don't remove it, or DROP-141's
       client-side refusal silently stops working.
-- [ ] **`src/core/git-deploy/git-deploy.types.ts`** — add `tokenId?: string | null`
+- [x] **`src/core/git-deploy/git-deploy.types.ts`** — add `tokenId?: string | null`
       to the existing **`DeployActor`**, *not* a third `redeploy()` parameter.
       Five assertions in `git-deploy.authz.test.ts` (`:97, :106, :133, :165,
       :174`) are arity-exact `toHaveBeenCalledWith('<app>', expect.anything())`,
       and `toHaveBeenCalledWith` fails on a third argument. Riding the existing
       second argument keeps `expect.anything()` matching and touches no test.
-- [ ] **`src/core/git-deploy/git-deploy.ts`** — `effectiveTokenId` resolved once
+- [x] **`src/core/git-deploy/git-deploy.ts`** — `effectiveTokenId` resolved once
       and used for both the pull and the final `gitSource`. The webhook caller
       (`routes/git-deploy.ts:243`) passes `{automation:'webhook'}` with no
       `tokenId` and is unaffected.
@@ -366,7 +366,7 @@ fixed here rather than deferred again. Strip userinfo from `repoUrl` via a
         `tokenId` is also what unattended **webhook** redeploys use
         (`:243, :295-304`), so attaching a token re-credentials every future
         automatic redeploy of that group.
-- [ ] **`src/core/git-deploy/git-client.ts`** — `gitPull` must **stop** doing
+- [x] **`src/core/git-deploy/git-client.ts`** — `gitPull` must **stop** doing
       `git remote set-url origin https://TOKEN@…` (`:111-121`), which writes the
       PAT in cleartext into `<app>/.git/config` — inside the tenant's document
       root (a static app can serve it), bind-mounted into their container under
@@ -376,20 +376,36 @@ fixed here rather than deferred again. Strip userinfo from `repoUrl` via a
       the file header at `:5`, which asserts PATs are "never written to disk",
       and note that `sanitizeOutput`'s `https://[^@]+@` regex becomes **inert**
       rather than wrong — it must not be read as proof of stripping afterwards.
-- [ ] **`src/api/routes/git-deploy.ts`** — tolerant body parse on
+      - **Portability of the helper — measured, not assumed.** A `!f(){…};f`
+        helper makes git spawn a shell, which raised whether `sh` exists on a
+        Windows host (DROP supports `C:\drop`). Tested on this box against
+        **Git for Windows 2.50.0**: `git -c credential.helper=!f(){…};f
+        credential fill` returned the username and the password read from the
+        child `env`. Git for Windows bundles its own `sh`, so this is portable
+        to both platforms. Alternatives rejected knowingly: `http.extraHeader`
+        is shell-free but puts the credential in **argv**, world-readable via
+        `ps`; `GIT_ASKPASS` needs a script file on disk.
+      - The token goes in `execFileAsync`'s `env` option (spread over
+        `process.env`), **never assigned into `process.env` itself** — that
+        would expose it to every later child the platform spawns.
+      - Three distinct states at the route/service boundary, easy to collapse:
+        `tokenId` **absent** leaves the stored value unchanged, **`null`**
+        clears it, a **string** replaces it. If the route passes `null` where
+        the body simply omitted the key, "omitted" silently becomes "clear".
+- [x] **`src/api/routes/git-deploy.ts`** — tolerant body parse on
       `/redeploy/:name` (the body is absent today and must stay optional), with
       a **strict** shape check: accept only `null` or
       `/^git_[A-Za-z0-9]+$/`, ignore all other keys, 400 otherwise. Unvalidated
       input here would land arbitrary JSON in `gitSource.tokenId` in `apps.json`
       and flow into `keys.find(k => k.startsWith(...))`.
-- [ ] **`src/dashboard/src/pages/AppDetailPage.tsx`** — a token `<select>` (from
+- [x] **`src/dashboard/src/pages/AppDetailPage.tsx`** — a token `<select>` (from
       `GET /git/tokens`) feeding the **existing** Redeploy button at `:283-298`
       (gated on `canRedeploy`, `:105`) — do not add a second one. The page does
       not currently fetch tokens (`:23` imports only `useApp, appAction,
       deleteApp, gitRedeploy`). **Gate the picker on role**: AppDetailPage is
       reachable at `readonly`, but `/git/tokens` requires `user`
       (`server.ts:346`), so an ungated picker 403s for readonly viewers.
-- [ ] **Tests** — extend `git-deploy.authz.test.ts` and `git-deploy.test.ts`
+- [x] **Tests** — extend `git-deploy.authz.test.ts` and `git-deploy.test.ts`
       following `src/api/routes/secrets.authz.test.ts` and the shared helpers in
       `src/api/__testutils__/` rather than a fresh harness. Must cover:
       the tokenId survives a **successful** pull (the inverted case above);
@@ -398,6 +414,20 @@ fixed here rather than deferred again. Strip userinfo from `repoUrl` via a
       (`gitSource` lives in `apps.json`, and boot reconciles config > runtime >
       `apps.json`); a malformed `tokenId` 400s; the webhook path still works
       with no `opts`.
+
+      **Prove the pull AUTHENTICATES, not just that nothing leaked.** Asserting
+      "no token text in `.git/config`" passes equally well if the helper never
+      fires and the pull succeeded because the repo was public — which is
+      exactly what a fixture is. Fix 4 replaces the mechanism by which the
+      credential reaches git, so the test has to exercise that mechanism.
+      `git credential fill` does it with no network: feed
+      `protocol=https\nhost=github.com\n` to
+      `git -c credential.helper= -c credential.helper=<the helper string the
+      code builds> credential fill` with the token in the child env, and assert
+      the token comes back as `password=`. That is the difference between "we
+      stopped writing the PAT to disk" and "we stopped writing the PAT to disk
+      **and the pull still works**". Verified as a working shape on Git for
+      Windows 2.50.0 while scoping this.
 
 ---
 
@@ -571,9 +601,22 @@ is a hard failure.
      being a *view* onto a larger `ArrayBuffer` — `new Blob([view])` is a
      classic place to silently ship the wrong bytes.
 - **Item 2** — needs a real private GitHub repo and a PAT. Token injection is
-  HTTPS-only (`git-client.ts:21-22`), so a `file://` bare repo would make the
-  test **vacuous**. Plus a platform restart to prove `gitSource.tokenId`
-  survives boot.
+  HTTPS-only, so a `file://` bare repo would make the test **vacuous**. Plus a
+  platform restart to prove `gitSource.tokenId` survives boot.
+  **NOT SATISFIED — and the honest label is "unverified", not "partially".**
+  What the unit suite does reach, against real git (2.50.0) rather than a
+  mock: the credential helper executes and returns the token for
+  `github.com`; it returns nothing for another host; a legacy userinfo remote
+  URL is rewritten on disk; `gitPull` invokes that rewrite (asserted through
+  a pull that fails against a refused port, so no network); and
+  `getCommitSha` refuses a directory whose `.git` is gone instead of
+  resolving an ancestor repository. All five were mutation-checked —
+  reverting each fix fails exactly its own test and nothing else.
+  **Still unverified:** that an attached PAT authenticates a real private
+  GitHub pull; that a token attached through the dashboard survives a real
+  platform restart (the restart is covered against a reloaded
+  `AppStateManager`, not a live boot); and the React layer — the picker, the
+  role gate, and the reset-on-navigation — which no test executes.
 - **Item 3** — not verifiable from this box (no Docker on Windows;
   `container-manager.smoke.test.ts` self-skips). Unit test only; magnitude
   confirmed later by the user on the box.
@@ -862,6 +905,67 @@ closed in-session.
 | low / — | `uploadErrorMessage`'s 413/429 fallback strings are unreachable (both server paths always populate `error.message`) | **Kept** — harmless defensive code |
 
 **`medium`/`low` findings dropped without individual reasons: 0.**
+
+### Item 2 · pass 1 (`security-critic` + `architecture-critic`, on the combined server + dashboard diff)
+
+Both ran against the committed `f17a274` plus the uncommitted dashboard work.
+**They independently found the same `high`**, from opposite directions, and it
+is the finding that mattered most: the fix was forward-only.
+
+| Severity / confidence | Finding | Disposition |
+|---|---|---|
+| **high / high** (BOTH critics) | **Every app cloned before this branch still holds its PAT in `remote.origin.url`, and git PREFERS a URL-embedded credential — so on exactly those apps the new helper never fires and the whole change is a silent no-op.** Both measured it: `credential fill` against a userinfo-bearing URL returns the embedded token and never invokes the helper. Worse than "not fixed": the *rotation* half of DROP-142 fails on the population it exists for — attaching a fresh token to an app whose old PAT was revoked still authenticates with the revoked one. Exposure is real, not theoretical: `.git` is bind-mounted into the tenant's container, and a plain static app's Caddy `file_server` has no `hide`, so `/.git/config` is fetchable | **Actioned** — `stripRemoteUrlCredentials` self-heals on the next pull, before it, unconditionally. Mutation-checked. **Not fully closed:** an app that is never redeployed keeps the value, and the `file_server` `hide` gap is a router change on a git-token branch — [see the follow-ups](#found-during-item-2-review--out-of-scope-here) |
+| **high / high** (arch) | **"Clear stored credential" could never detach anything.** The single `updateApp` sits after the pull; clearing makes that pull unauthenticated, so on a private repo it throws and the clear is discarded. Every time. No route to revoke short of editing `apps.json` | **Actioned** — a clear is persisted BEFORE the pull. The stale-snapshot trap that forced the attach *after* the pull does not apply in the clear direction: there is nothing a later spread can resurrect. New test covers a clear that survives a failed pull |
+| **high / high** (arch), **low / high** (sec) | **The new file header claimed the clone path still injects the PAT into the URL — the same commit had fixed it.** The plan scoped only `gitPull`; the implementation went further; the header was written to the plan | **Actioned.** The plan asked for a header that overclaimed safety to be fixed; it had been replaced by one that *under*claimed, which is equally load-bearing — it points an auditor at the wrong residual leak |
+| **medium / high** (sec, measured) | **The credential helper was host-unscoped.** The URL injection it replaced was host-pinned by construction; a bare `credential.helper` answers for every host, and `gitPull` runs against whatever `remote.origin.url` says on disk. Chain: tenant writes their own `.git/config` (the unmerged DROP-144 hole), points origin at their server, attaches any stored PAT via the new body, redeploys → PAT in cleartext to them. Survives the DROP-144 fix; the old behaviour would not have | **Actioned** — scoped to `credential.https://github.com.helper`. Measured on Git for Windows 2.50.0 both ways. `isValidGitHubUrl` admits only github.com, so the scope costs nothing |
+| **medium / high** (sec) | **`sanitizeOutput`'s docblock said "now INERT"** — false for the installed base, where a failed pull still prints the embedded PAT into a 500 body. An invitation to delete a live control | **Actioned** — documented as load-bearing *for legacy repos*, with the condition under which it stops being |
+| **medium / high** (arch) | **A syntactically valid but nonexistent `tokenId` returned 200** and persisted a dangling reference that silently degraded every later webhook redeploy to unauthenticated. `deploy()` throws for the identical condition | **Actioned** — branch on PROVENANCE: an id supplied on *this* request throws (400, mapped separately so it is not a 404); an *inherited* id that no longer resolves still warns and continues, because refusing to redeploy an existing app over a deleted token is worse |
+| **medium / high** (BOTH) | **`credentialChoice` was not reset on `:name` change** — `apps/:name` has no route `key`, so a token picked on app A attaches to app B | **Actioned** — reset effect keyed on `name`, matching the file's own convention |
+| **medium / high** (arch) | **The picker was gated on `gitTokens.length > 0`**, so deleting a leaked PAT from the store removed the "Clear stored credential" option from every app — unreachable exactly when needed | **Actioned** — gated on role alone |
+| **medium / medium** (arch) | **The `.git` fail-fast was a caller-side precondition, not an invariant.** `getCommitSha` had no equivalent guard and swallows errors, so a `.git` that vanished mid-redeploy meant persisting an ANCESTOR repository's HEAD as the app's commit. The CLAUDE.md "security helpers have callers" pattern | **Actioned** — `--git-dir`/`--work-tree` on every git call in the client. Measured both halves: cwd-only returns the ancestor SHA and exits 0; `--git-dir` refuses |
+| **medium / high** (arch) | No CHANGELOG entry for a REST body addition and a DTO narrowing | **Actioned** — Added / Fixed / Changed entries, with the DTO narrowing called out as potentially breaking |
+| **low / high** (sec) | `/git/redeploy/*` became a credential-attaching route but stayed only in the general `/api/*` bucket, against the repo's own stated convention | **Actioned** — added to the strict `authRateLimitMiddleware` bucket, registered unconditionally. Consequence found immediately: the route's own test file 429'd itself, fixed with the `resetRateLimits()` every other rate-limited route test already does |
+| **low / medium** (sec) | A stored token containing a newline would inject extra lines into git's credential protocol (`quit=1`, `url=`) | **Actioned at the door** — `setToken` rejects non-printable-ASCII. Deliberately NOT by switching the helper to `printf '%s\n'`: measured that MSYS argument conversion mangles `\n` to `/n` on Windows, which emits one malformed line |
+| **low / medium** (arch) | Token ids are `Date.now().toString(36)` and resolved by prefix match; two in the same millisecond collide. Newly load-bearing now that an id is persisted and re-read by unattended redeploys | **Actioned** — `crypto.randomBytes(8)`. Still matches `GIT_TOKEN_ID_RE`, so existing ids resolve unchanged |
+| **low / low** (sec) | `sanitizeRepoUrl` passed non-HTTP schemes through into an `href` (`new URL('javascript:…')` parses; the userinfo setters are no-ops on an opaque path) | **Actioned** — scheme allow-list. Defence in depth: no writer can store one, since `isValidGitHubUrl` gates the only setter |
+| **low / low** (arch) | Body parsed and validated before the app lookup and `canAccess` | **Actioned** — moved below, with a test. Not an oracle today; the point is that a future validator with a side effect would inherit the ordering |
+| low / high (arch) | No audit detail distinguishing a credential-changing redeploy from an ordinary one | **Actioned** — `detail` on the activity entry |
+| low / high (arch) | `apps.contract.test.ts` seeds a `repoUrl` shape no current writer can produce (`isValidGitHubUrl` rejects userinfo) — the DROP-128 fixture trap, benign here | **Actioned as a comment**, not a rewrite: the fixture is right (it pins the transform against legacy `apps.json` state), the risk was someone reading it as proof of a live echo path |
+| low / medium (arch) | The three-state contract is re-derived in three places and the dashboard test copied the route's regex | **Half actioned** — `GIT_TOKEN_ID_RE` is now defined once in `git-deploy.types.ts` and imported by the route. The dashboard test still holds a copy: importing `@core/*` there would work under root jest but the dashboard's own `tsc` would then pull server types into the frontend program |
+| **medium / high** (arch) | Gating `tokenId` on `isAdmin` is inert while `GET /git/tokens` lists every tenant's ids at the `user` tier | **Not actioned — recorded.** The gate stays (it costs nothing and is right if 2b ever lands), but it must NOT be read as having closed the correlation-handle exposure. The real boundary is `/git/tokens`, which is deferred 2b |
+| low / high (arch) | `inlineSelectClass` duplicates DeployPage's `inlineFieldClass` | **Not actioned, deliberately** — the shared fix edits `DeployPage.tsx`, which DROP-141 rewrites on another branch. A conflict for a style constant is a worse trade than the duplicate; belongs to whoever lands second |
+| low / high (arch) | The lib header claimed `src/dashboard/**` escapes tsc; only eslint skips it (`build:dashboard` runs the package's own `tsc`, and CI runs that) | **Actioned** — header corrected. Placement kept: `components/db-format.ts` is the same shape and the same home, and no dashboard file imports across the package boundary today |
+| **low / high** (sec) | `validateBodySize` is `Content-Length`-only, so a chunked body bypasses the cap on every JSON route | **Deferred** — pre-existing and global, not specific to this diff. [Follow-up](#found-during-item-2-review--out-of-scope-here) |
+| low / high (arch) | The branch carries the `release/v1.1.0` merge relative to `develop`, so its PR is a feature PR *and* a back-merge | **Recorded** — review with `git diff develop...HEAD` (three-dot); noted in the PR body |
+
+**`medium`/`low` findings dropped without individual reasons: 0.**
+
+Explicitly checked and clean, per the security critic (recorded so nobody
+re-spends the time): prototype pollution via `__proto__` in the body
+(`hasOwnProperty` is the correct guard and `JSON.parse` does not pollute);
+CSRF (auth is header-only, no cookie path); array/number/boolean `tokenId`;
+`toAppDto` being the sole serializer on every app-returning route; the
+resolved-container write invariant; no token in argv, logs or `process.env` on
+the new path; and `effectiveTokenId` having no surviving stale read.
+
+## Found during Item 2 review — out of scope here
+
+Three things this branch should not absorb, each with the reason:
+
+1. **A static app's `.git` is fetchable over HTTP.** `caddy-generator.ts`'s
+   `file_server` has no `hide` directive, so any plain-root static app serves
+   `/.git/config` — and its whole history — to the internet. That is the
+   exposure path that made the legacy PAT leak reachable, but the fix is a
+   router change affecting every static app's Caddy host file, and it deserves
+   its own verification pass, not a ride on a git-token branch.
+2. **`validateBodySize` trusts `Content-Length`.** A `Transfer-Encoding:
+   chunked` request has none, so `c.req.json()` buffers unbounded on every
+   JSON route. Global and pre-existing; `routes/apps.ts` already counts bytes
+   off the stream and is the model.
+3. **The git token store is unowned** (the plan's deferred 2b). Any
+   `user`-role caller can list, delete, or borrow any tenant's PAT. Unchanged
+   by this item, and the reason the `isAdmin` gate on `tokenId` buys nothing
+   today.
 
 ## Run stats
 
