@@ -844,6 +844,25 @@ into source.
 
 **`medium`/`low` findings dropped without individual reasons: 0.**
 
+### Item 1 · pass 2 (`code-reviewer`, verdict NEEDS CHANGES)
+
+Reported after the pass-1 fixes had already landed; it re-verified against the
+current tree and independently found the all-excluded-archive gap that had been
+closed in-session.
+
+| Severity / confidence | Finding | Disposition |
+|---|---|---|
+| **medium-high / high** | **No re-entrancy guard.** `onClick` was gated on `status !== 'deploying'`, `onDrop` was not, and both tabs share the status state. The sharp edge is not the racing poll loops: `ConfirmProvider` holds exactly ONE pending resolve, so a second `confirmDialog()` overwrites the first, whose `await` **never settles** — a silent permanent hang | **Actioned** — guarded in `uploadFiles`, covering both entry points |
+| **medium / high** | "Try again" reset only `status`, so a failure AFTER the archive was built (409/413/429) left the previous attempt's file count and skip list rendered on the idle form as though they described the next upload | **Actioned** |
+| medium / high | `tar-writer.test.ts` never hit `name` at exactly 100 bytes or `prefix` at exactly 155 — the boundaries that discriminate `writeBytes` from `writeTerminatedString`, which the file's own doc comment distinguishes. Swapping the two helpers would have passed the whole suite. Also: `buildTar([])` untested, and the two hardening branches added in pass 1 untested | **Actioned** — all covered |
+| low / low-medium | `dataTransfer.files` read after two awaits; `File` objects should outlive `DataTransfer` protected mode but this was unverified cross-engine | **Actioned** — `Array.from` snapshot, `buildArchiveFromFiles` widened to `ArrayLike<File>`. Zero-downside, removes the question |
+| low-medium / high | A comment in `upload-paths.test.ts` claims the NFC/NFD literals are built from escapes; they are raw characters | **Not actioned** — the adjacent `expect(nfc).not.toBe(nfd)` is a live assertion that fails loudly if a tool ever normalizes the file, so the property is enforced even though the comment describes the wrong mechanism. Recorded rather than churned |
+| low-medium / high | Poll loop has no unmount cleanup | **Not actioned, deliberately** — identical to the git tab's pre-existing loop and self-terminating in 30 s; fixing only the new copy is the inconsistent choice. A shared `usePollAppStatus` hook is the right fix and belongs to whoever touches both |
+| low / — | An app name owned by ANOTHER tenant 404s indistinguishably from a free name, so the pre-flight cannot warn and the user pays a full archive build before a confusing "not found" | **Not actionable** — the server's deliberate no-existence-oracle posture. Recorded because it is the one behaviour the client genuinely cannot improve |
+| low / — | `uploadErrorMessage`'s 413/429 fallback strings are unreachable (both server paths always populate `error.message`) | **Kept** — harmless defensive code |
+
+**`medium`/`low` findings dropped without individual reasons: 0.**
+
 ## Run stats
 
 _To be filled in after the last plan-item commit._
