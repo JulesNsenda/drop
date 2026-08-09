@@ -46,6 +46,23 @@ export interface AppRuntime {
   /** Status of every app this runtime knows about */
   getAllStatus(): Promise<AppProcessInfo[]>;
 
+  /**
+   * Cheap liveness check: is the runtime reachable, and how many apps does it
+   * know about? Returns the count; throws if the runtime cannot be reached.
+   *
+   * Deliberately NOT `getAllStatus().length`. Under docker isolation
+   * getAllStatus fetches live CPU/memory for EVERY container, and
+   * `container.stats({stream:false})` samples twice so precpu_stats is valid —
+   * ~1s per container even run concurrently. The health endpoint's probe
+   * budget is 2s, so a five-container fleet sat exactly on the boundary and
+   * flapped between healthy and degraded on ±30ms of jitter, returning
+   * intermittent 503s. It also got monotonically worse per app added.
+   *
+   * Liveness does not need performance telemetry. Implementations must answer
+   * this without collecting per-app stats.
+   */
+  countManaged(): Promise<number>;
+
   /** Last `lines` lines of combined logs */
   getLogs(name: string, lines?: number): Promise<string>;
 

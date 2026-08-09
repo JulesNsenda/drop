@@ -106,6 +106,11 @@ export class FakeRuntime implements AppRuntime {
     return [...this.apps.values()].map((a) => ({ ...a }));
   }
 
+  /** Counted directly, not via getAllStatus — mirrors the real contract. */
+  async countManaged(): Promise<number> {
+    return this.apps.size;
+  }
+
   async getLogs(): Promise<string> {
     return '';
   }

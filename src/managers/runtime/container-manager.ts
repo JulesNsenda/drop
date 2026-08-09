@@ -377,6 +377,19 @@ export class ContainerManager implements AppRuntime {
     }
   }
 
+  /**
+   * Liveness only — `listContainers` and nothing else. Crucially does NOT call
+   * fetchContainerStats: that is what made the health probe cost ~1s per
+   * container and time out against its 2s budget. See the AppRuntime docs.
+   */
+  async countManaged(): Promise<number> {
+    const containers = await this.docker.listContainers({
+      all: true,
+      filters: JSON.stringify({ label: [`${MANAGED_LABEL}=true`] }),
+    });
+    return containers.length;
+  }
+
   async getAllStatus(): Promise<AppProcessInfo[]> {
     const containers = await this.docker.listContainers({
       all: true,
