@@ -254,6 +254,16 @@ is reached by root tsc, eslint and jest. Only DOM glue stays in the dashboard.
   (`my.app`) is a likely derived default and would otherwise also miss the
   body-size carve-out `UPLOAD_SOURCE_PATH_RE` (`server.ts:55`) and fail with a
   misleading "Request body too large".
+- **The git-backed 409 is a first-class UI case, pre-empted AND handled.**
+  DROP-146 makes an upload onto a git-deployed app return 409 with a message
+  naming `git/redeploy`. Dragging the folder of an app originally deployed from
+  GitHub is the single most likely accidental rejection, so: (1) the existing
+  `GET /api/v1/apps/:name` pre-check below does double duty — `toAppDto`
+  returns `gitSource`, so the client can refuse **before** spending a tar+gzip
+  of up to 100 MB and an upload; and (2) the 409 is still rendered with the
+  server's own message as a backstop, never as a generic "Deployment failed".
+  Same for a `vcs_metadata` 400, which the client-side `.git` strip should make
+  unreachable but which must read correctly if it ever surfaces.
 - **Overwrite confirmation.** `/:name/source` is deploy-*or-redeploy*, and
   `landFiles` prunes the target (`upload-deploy.ts:257-277`). With an
   auto-derived name, dropping a folder that shares a name with a live app
@@ -314,8 +324,24 @@ Correct shape: resolve once at the top —
 — use it for `getTokenValue`/`gitPull` **and** build the final `gitSource` from
 it rather than from `app.gitSource`.
 
+### Carried in from the Item 1 security review — fix here, not there
+
+`toAppDto` (`apps.ts:190`) returns the **whole `gitSource`** at the non-admin
+tier: `repoUrl`, which echoes back userinfo credentials if a user pasted
+`https://user:pat@github.com/...`, and `tokenId`, a correlation handle. Rated
+`low`/`high`, pre-existing, and **not** widened by Item 1 (which only reads the
+field the DTO already exposed) — but this item owns token handling, so it is
+fixed here rather than deferred again. Strip userinfo from `repoUrl` via a
+`new URL()` round-trip clearing `username`/`password`, and gate `tokenId` on
+`isAdmin` the way `pid` and `path` already are.
+
 ### File-level changes
 
+- [ ] **`src/api/routes/apps.ts`** — `toAppDto`: strip `repoUrl` userinfo; gate
+      `tokenId` on `isAdmin`. Note the dashboard's own upload pre-flight reads
+      `gitSource` to refuse a git-backed target, so keep the FIELD present for
+      non-admins — narrow its contents, don't remove it, or DROP-141's
+      client-side refusal silently stops working.
 - [ ] **`src/core/git-deploy/git-deploy.types.ts`** — add `tokenId?: string | null`
       to the existing **`DeployActor`**, *not* a third `redeploy()` parameter.
       Five assertions in `git-deploy.authz.test.ts` (`:97, :106, :133, :165,
@@ -498,6 +524,52 @@ is a hard failure.
   `npm run build:dashboard` first or use `cd src/dashboard && npm run dev` with
   its `/api` proxy — and do not mix the two. Same class as the
   `__DROP_VERSION__` trap: verify in the built output.
+  Because this branch is **stacked on Item 0**, the local run exercises the new
+  UI against the `.git` rejection and the git-app 409 together — which is the
+  ideal integration test, not a complication. Two named steps, not a generic
+  "drive the UI":
+  1. Drag a folder that **contains `.git`** and confirm the client strips it
+     silently (listing it as skipped) rather than the server returning a
+     `vcs_metadata` 400.
+  2. Drag onto an app that is **git-deployed** and confirm the 409 renders with
+     the server's own `git/redeploy` message, not "Deployment failed".
+  **PARTIALLY SATISFIED without a browser.** The Chrome extension was not
+  connected this session, but the two observations that mattered did not need
+  it: Node 22 implements `File`, `Blob` and `CompressionStream` natively — the
+  blocker was only the *type* layer (`lib: ["ES2022"]`), not the runtime. So
+  `upload-archive.ts` was bundled unmodified with esbuild and executed against
+  a realistic checked-out-repo selection, then its output handed to the
+  **production `extractTarball`**:
+
+  ```
+  skipped    : [".git/config",".git/HEAD","node_modules/left-pad/index.js"]
+  tar entries: ["package.json","src/index.js",".gitignore"]
+  magic      : 1f 8b        IS_GZIP: true
+  extract    : {"fileCount":3,"dirCount":0,"bytesWritten":44}
+  landed     : [".gitignore","package.json","src","src/index.js"]
+  ```
+
+  That is the real glue, the real `buildTar`, the real `CompressionStream`, and
+  the real hardened extractor. It proves: `.git` is stripped client-side (so a
+  repo folder does not 400), `.gitignore` is NOT over-matched, the `my-app/`
+  common root is removed (the server has no strip-components), the body is a
+  genuine gzip stream, and the endpoint's own extractor accepts it.
+
+  **Still unverified — the React layer only**: folder picker, replace
+  confirmation, the git-backed pre-flight refusal, error-message rendering, and
+  the poll loop. Those need a browser. Do not report Item 1 as fully runtime
+  verified until they are driven.
+
+  3. **Inspect the request body's first two bytes — they must be `1f 8b`** —
+     and confirm a 202 rather than a `not_gzip` 400. This is the one step the
+     unit tests structurally cannot reach: every `buildTar` test round-trips
+     through `zlib`/node-tar or `extractTarball`, so `new Blob(chunks)` →
+     `CompressionStream('gzip')` has never actually executed. It can't be
+     tested under jest either (`testEnvironment: 'node'`, no `CompressionStream`
+     without jsdom). "The upload worked" would also be satisfied by luck, so
+     read the payload, not just the status. Watch specifically for `entry.data`
+     being a *view* onto a larger `ArrayBuffer` — `new Blob([view])` is a
+     classic place to silently ship the wrong bytes.
 - **Item 2** — needs a real private GitHub repo and a PAT. Token injection is
   HTTPS-only (`git-client.ts:21-22`), so a `file://` bare repo would make the
   test **vacuous**. Plus a platform restart to prove `gitSource.tokenId`
@@ -520,6 +592,20 @@ branch-gated and stops/restarts the service. This plan ends at **PRs opened**.
    change that does not deserve its own outage.
 
 Consent is required for each window, on the *deploy*, not merely the push.
+
+### Branches and their ordering
+
+| Branch | Contains | Constraint |
+|---|---|---|
+| `bugfix/DROP-145-login-back-home` | Item 4 | Independent — may merge at any time, in either window |
+| `feature/DROP-144-reject-vcs-metadata` | Item 0 (3 commits, incl. DROP-146) | **Window 1**, merges first |
+| `feature/DROP-141-dashboard-upload` | Item 1 | **Stacked on DROP-144** — must merge after it, or be rebased onto `develop` once DROP-144 lands |
+
+DROP-145 and DROP-141 both add files under `src/dashboard/src/lib/`, but
+different ones (`site-url.ts` vs `upload-archive.ts`), so they do not conflict.
+Consequence while working: **`site-url.ts` is absent on the DROP-141 branch**, so
+a Gate 4 run there still shows the old, broken "Back to home" link. That is the
+branch layout, not a regression — verify Item 4 from its own branch.
 
 ---
 
@@ -716,6 +802,66 @@ already makes.
 One critic reported the plan file's path as `docs/specs/plans/…` and inferred a
 gitignore-convention problem. Verified false: it is `docs/plans/…`, force-added
 deliberately past `.gitignore:117`.
+
+### Item 1 · pass 1
+
+Panel: `security-critic` (`model: opus`) — reported; `code-reviewer` —
+outstanding at time of writing, to be read against the CURRENT tree, since the
+all-excluded refusal below is a new early-return path it did not see.
+
+The security critic closed five of its six asked angles with evidence and no
+finding: the `isVcsMetadataComponent` move is a byte-identical symbol move with
+the call site unchanged; no client-crafted path escapes `resolveContained`,
+because node-tar's post-PAX `entry.path` is both what the guard checks and what
+gets written, so client and server cannot diverge on the resolved path; the
+client caps sit under the server's and the 100 MB compressed cap plus the
+10/min bucket still apply (the new URL matches `UPLOAD_SOURCE_PATH_RE` because
+`APP_NAME_RE` is a subset of `[A-Za-z0-9_-]+`); `Content-Type` is never read by
+the route; and `gitSource` was already in `toAppDto` before this branch, so the
+pre-flight reads it without widening exposure.
+
+| Severity / confidence | Finding | Disposition |
+|---|---|---|
+| **low / high** | **Exclusion ran AFTER `stripCommonRoot`, exempting the selected root from its own rules** — picking the `node_modules` or `.git` folder itself makes it the common root, strips it, and every file inside sails through. `node_modules` as a root also passes `APP_NAME_RE`, so nothing downstream catches it | **Actioned** — tests the pre-strip path. Rated `low` by the critic only because the `.git` case additionally needs a typed app name; the `node_modules` case has no such brake, so this was treated as the real bug it is. Re-verified on the bundled glue: both rooted selections now keep zero files |
+| low / medium | Folder picker archives the whole tree with no `.gitignore` awareness — a `.env` is fetchable at `/.env` for a static app, whose doc root IS the uploaded tree | **Actioned** — `.env*` excluded except templates, listed in the skipped panel, changelogged |
+| low / high | `normalizeEntryPath` rejects `..` and `\` but not NUL — which truncates the USTAR name field, so the path the UI validated is not the path the server writes | **Actioned** — all control characters rejected |
+| low / high | `writeOctal`'s `padStart` pads but never truncates: an oversized value overflows into the next header field and the checksum, computed last, makes it verify | **Actioned** — unreachable today, but this is a shared util now imported by two bundles and the failure is silent |
+| low / medium | `splitPath` could split at the final byte, leaving an empty `name`; node-tar retypes the entry as a directory and discards its body | **Actioned** |
+| low / high | `MAX_ENTRIES` checked against the KEPT count only, so a 200 000-file selection builds three arrays that size and the excluded entries escape the cap | **Actioned** — bounded before normalizing |
+| low / low | The `.git` guard now lives in a module whose stated contract is "DOM-free so the dashboard can bundle it", inviting a browser-motivated edit to a security control | **Actioned** — SECURITY CONTROL banner at the top of the file |
+| low / high, pre-existing | `toAppDto` returns the whole `gitSource` — `repoUrl` (possibly with userinfo credentials) and `tokenId` — at the non-admin tier | **Moved to Item 2**, which owns token handling, and written into that item's file list rather than left as a note |
+
+Also fixed while in the file, not from a critic: an all-excluded selection used
+to build an empty archive and defer to the server's `empty_archive` 400, which
+says nothing about why; it now refuses locally and names the reason.
+
+**A process note worth keeping.** Writing the control-character class with
+literal bytes made git and grep treat the source as **binary**, and made the
+character class invisible in review — three separate edit attempts then failed
+to match it. The regex is now written with explicit escapes and the tests build
+control characters via `String.fromCharCode`. Never type a control character
+into source.
+
+**`medium`/`low` findings dropped without individual reasons: 0.**
+
+### Item 1 · pass 2 (`code-reviewer`, verdict NEEDS CHANGES)
+
+Reported after the pass-1 fixes had already landed; it re-verified against the
+current tree and independently found the all-excluded-archive gap that had been
+closed in-session.
+
+| Severity / confidence | Finding | Disposition |
+|---|---|---|
+| **medium-high / high** | **No re-entrancy guard.** `onClick` was gated on `status !== 'deploying'`, `onDrop` was not, and both tabs share the status state. The sharp edge is not the racing poll loops: `ConfirmProvider` holds exactly ONE pending resolve, so a second `confirmDialog()` overwrites the first, whose `await` **never settles** — a silent permanent hang | **Actioned** — guarded in `uploadFiles`, covering both entry points |
+| **medium / high** | "Try again" reset only `status`, so a failure AFTER the archive was built (409/413/429) left the previous attempt's file count and skip list rendered on the idle form as though they described the next upload | **Actioned** |
+| medium / high | `tar-writer.test.ts` never hit `name` at exactly 100 bytes or `prefix` at exactly 155 — the boundaries that discriminate `writeBytes` from `writeTerminatedString`, which the file's own doc comment distinguishes. Swapping the two helpers would have passed the whole suite. Also: `buildTar([])` untested, and the two hardening branches added in pass 1 untested | **Actioned** — all covered |
+| low / low-medium | `dataTransfer.files` read after two awaits; `File` objects should outlive `DataTransfer` protected mode but this was unverified cross-engine | **Actioned** — `Array.from` snapshot, `buildArchiveFromFiles` widened to `ArrayLike<File>`. Zero-downside, removes the question |
+| low-medium / high | A comment in `upload-paths.test.ts` claims the NFC/NFD literals are built from escapes; they are raw characters | **Not actioned** — the adjacent `expect(nfc).not.toBe(nfd)` is a live assertion that fails loudly if a tool ever normalizes the file, so the property is enforced even though the comment describes the wrong mechanism. Recorded rather than churned |
+| low-medium / high | Poll loop has no unmount cleanup | **Not actioned, deliberately** — identical to the git tab's pre-existing loop and self-terminating in 30 s; fixing only the new copy is the inconsistent choice. A shared `usePollAppStatus` hook is the right fix and belongs to whoever touches both |
+| low / — | An app name owned by ANOTHER tenant 404s indistinguishably from a free name, so the pre-flight cannot warn and the user pays a full archive build before a confusing "not found" | **Not actionable** — the server's deliberate no-existence-oracle posture. Recorded because it is the one behaviour the client genuinely cannot improve |
+| low / — | `uploadErrorMessage`'s 413/429 fallback strings are unreachable (both server paths always populate `error.message`) | **Kept** — harmless defensive code |
+
+**`medium`/`low` findings dropped without individual reasons: 0.**
 
 ## Run stats
 

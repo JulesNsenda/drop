@@ -18,6 +18,7 @@ import * as fsp from 'fs/promises';
 import * as path from 'path';
 import * as zlib from 'zlib';
 import { Parser as TarParser, ReadEntry } from 'tar';
+import { isVcsMetadataComponent } from '../../utils/upload-paths';
 
 export interface TarExtractLimits {
   /** Abort once the cumulative decompressed byte count across all entries exceeds this. */
@@ -121,37 +122,12 @@ function resolveContained(destDir: string, entryPath: string): string {
   return resolved;
 }
 
-/**
- * True if `component` (one `/`- or `\`-separated segment of an entry path)
- * names `.git`, case-insensitively, once the Windows aliases below are
- * normalized away. Exported so the same policy can be applied to
- * caller-supplied paths before they ever reach this file (see
- * `validateStagedRelativePath` in `src/api/mcp/tools.ts`) rather than being
- * duplicated inline.
- *
- * Covers three ways a component can name `.git` without spelling it exactly:
- *  - case (`.GIT`/`.Git` name the same directory on a case-insensitive
- *    filesystem);
- *  - a trailing run of dots/spaces, which Win32 strips during path
- *    normalization, so `.git.` and `.git ` both materialize as `.git` when
- *    mkdir runs on a Windows host (DROP_ROOT is C:\drop there);
- *  - an NTFS alternate data stream suffix (`.git::$INDEX_ALLOCATION`,
- *    `.git::$DATA`) — the part before `::` is the real filesystem name the
- *    stream hangs off, so it's stripped before the rest of the comparison;
- *  - an 8.3 short name (`GIT~1`) — Windows generates these automatically for
- *    long/mixed-case names, and resolving the alias reaches the same `.git`
- *    directory, so `lstat`/`copyInto` in `syncTree` would follow it straight
- *    through.
- *
- * These are Windows-host normalizations specifically (checked against how
- * NTFS and Win32 path handling resolve a name to a directory) — this does not
- * claim to catch every OS-specific path alias, only the ones a Windows
- * DROP_ROOT is known to apply.
- */
-export function isVcsMetadataComponent(component: string): boolean {
-  const c = component.toLowerCase().split('::')[0].replace(/[. ]+$/, '');
-  return c === '.git' || /^git~\d+$/.test(c);
-}
+// `isVcsMetadataComponent` (case/alias-aware `.git` component match) now
+// lives in `src/utils/upload-paths.ts`, imported above, so the dashboard's
+// browser-side archive builder (DROP-141) can share the exact same rule
+// without pulling `node:fs`/`node:zlib`/`node:path`/node-tar into its bundle.
+// `src/api/mcp/tools.ts`'s `validateStagedRelativePath` imports it from
+// there too, rather than from this file.
 
 function runExtraction(
   archivePath: string,

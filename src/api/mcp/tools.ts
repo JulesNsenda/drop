@@ -38,7 +38,7 @@ import {
   UploadValidationError,
   InsufficientDiskSpaceError,
 } from '../../core/upload-deploy';
-import { isVcsMetadataComponent } from '../../core/upload-deploy/tar-extract';
+import { isVcsMetadataComponent } from '../../utils/upload-paths';
 import { getGitDeployService } from '../../core/git-deploy';
 import { getDeployTracker } from '../../managers/deploy-tracker';
 import type { DeployEpisode } from '../../managers/deploy-tracker';
