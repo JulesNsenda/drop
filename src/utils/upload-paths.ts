@@ -9,6 +9,17 @@
  */
 
 /**
+ * SECURITY CONTROL — server-side callers depend on this.
+ *
+ * This module's stated contract is "DOM-free and node-free so the dashboard
+ * can bundle it", but `isVcsMetadataComponent` below is the guard that blocks
+ * host command execution via `gitPull` (see `tar-extract.ts`'s entry handler
+ * and `validateStagedRelativePath` in `api/mcp/tools.ts`). Do not weaken it
+ * for browser-bundling reasons. End-to-end `vcs_metadata` coverage through
+ * `extractTarball` is what would catch a removed call site.
+ */
+
+/**
  * True if `component` (one `/`- or `\`-separated segment of an entry path)
  * names `.git`, case-insensitively, once the Windows aliases below are
  * normalized away. Exported so the same policy can be applied to
@@ -85,6 +96,15 @@ export class PathNormalizationError extends Error {
 export function normalizeEntryPath(p: string): string {
   if (p.includes('\\')) {
     throw new PathNormalizationError(`Path contains a backslash, which is not portable across platforms: ${p}`);
+  }
+  // A NUL truncates the USTAR `name` field, so the path the UI validated and
+  // displayed would not be the path the server writes — `.git\0x/config` looks
+  // unexcluded here and extracts as `.git`, caught only by the server guard.
+  // Other control characters flow verbatim into server log lines and the
+  // activity log (`Entry '${entry.path}' ...`).
+  // eslint-disable-next-line no-control-regex -- matching control characters is the point
+  if (/[\u0000-\u001f\u007f]/.test(p)) {
+    throw new PathNormalizationError(`Path contains a control character: ${JSON.stringify(p)}`);
   }
 
   let stripped = p;
@@ -192,10 +212,38 @@ export function findCollisions(paths: string[]): [string, string][] {
  * `node_modules` alone can exceed the 20 000-entry archive cap. */
 export const DEFAULT_EXCLUDES: readonly string[] = ['node_modules'];
 
+/**
+ * True for a dotenv file carrying real values (`.env`, `.env.local`,
+ * `.env.production`), false for the committed templates (`.env.example`,
+ * `.env.sample`, `.env.template`) that are meant to ship.
+ *
+ * Excluded because for a static app the uploaded tree root IS the Caddy
+ * document root (`caddy-generator.ts` sets `root * <staticPath>` +
+ * `file_server`), so a shipped `.env` is fetchable at `/.env` on the public
+ * URL. The old, broken upload control filtered by extension and could never
+ * carry one; a folder picker archives the whole tree, which makes this a
+ * one-click credential leak rather than a theoretical one. `docs/AGENT-DEPLOY.md`
+ * already tells callers to keep secrets out of the archive and use the secrets
+ * API — this enforces what the docs ask for.
+ *
+ * The exclusion is surfaced in the UI's skipped list, never silent.
+ */
+function isDotenvWithValues(component: string): boolean {
+  const c = component.toLowerCase();
+  if (c !== '.env' && !c.startsWith('.env.')) return false;
+  return !/\.(example|sample|template|dist)$/.test(c);
+}
+
 /** True if `entryPath` (forward-slash-separated) has a component that is
- * `.git` or an exact match in `DEFAULT_EXCLUDES`. */
+ * `.git`, a value-bearing dotenv file, or an exact match in
+ * `DEFAULT_EXCLUDES`. */
 export function isExcludedByDefault(entryPath: string): boolean {
   return entryPath
     .split('/')
-    .some((component) => isVcsMetadataComponent(component) || DEFAULT_EXCLUDES.includes(component));
+    .some(
+      (component) =>
+        isVcsMetadataComponent(component) ||
+        isDotenvWithValues(component) ||
+        DEFAULT_EXCLUDES.includes(component)
+    );
 }

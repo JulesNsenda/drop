@@ -78,6 +78,15 @@ export async function buildArchiveFromFiles(files: FileList): Promise<BuiltArchi
     );
   }
 
+  // Bound the selection BEFORE normalizing every path. Checking only the kept
+  // count lets a 200 000-file `node_modules` build three arrays that size —
+  // and the excluded ones are never subject to the cap at all.
+  if (files.length > MAX_ENTRIES) {
+    throw new UploadArchiveError(
+      `Too many files selected (${files.length}); the server accepts at most ${MAX_ENTRIES} per archive. ${CLI_ALTERNATIVE}`
+    );
+  }
+
   const rawFiles: File[] = [];
   const rawPaths: string[] = [];
   for (let i = 0; i < files.length; i++) {
@@ -98,24 +107,36 @@ export async function buildArchiveFromFiles(files: FileList): Promise<BuiltArchi
   const skipped: string[] = [];
   const kept: { file: File; path: string }[] = [];
   for (let i = 0; i < rawFiles.length; i++) {
-    const path = strippedPaths[i];
-    if (isExcludedByDefault(path)) {
-      skipped.push(path);
-    } else {
-      kept.push({ file: rawFiles[i], path });
+    // Exclusion is tested against the PRE-strip path, and reported with it —
+    // that is also the path the user picked, so it reads correctly in the
+    // skipped list. Testing the STRIPPED path would exempt the selected root
+    // from its own rules: choose a `node_modules` (or `.git`) folder in the
+    // picker and it becomes the common root, gets removed before the check,
+    // and every file inside sails through. `node_modules` as a root even
+    // passes APP_NAME_RE, so nothing downstream would catch it.
+    if (isExcludedByDefault(rawPaths[i])) {
+      skipped.push(rawPaths[i]);
+      continue;
     }
+    kept.push({ file: rawFiles[i], path: strippedPaths[i] });
+  }
+
+  // Everything was excluded — e.g. the user picked the `node_modules` or
+  // `.git` folder itself. Building the archive anyway produces just the
+  // terminator blocks and defers to the server's `empty_archive` 400, which
+  // says nothing about WHY. Name the reason here instead.
+  if (kept.length === 0) {
+    throw new UploadArchiveError(
+      skipped.length > 0
+        ? `Everything selected was excluded (${skipped.length} path${skipped.length === 1 ? '' : 's'}): .git, node_modules and .env files are never uploaded. Choose your application's folder instead.`
+        : 'No files selected.'
+    );
   }
 
   const collisions = findCollisions(kept.map((k) => k.path));
   if (collisions.length > 0) {
     const [a, b] = collisions[0];
     throw new UploadArchiveError(`Two files would collide once uploaded: "${a}" and "${b}"`);
-  }
-
-  if (kept.length > MAX_ENTRIES) {
-    throw new UploadArchiveError(
-      `Too many files (${kept.length}); the server accepts at most ${MAX_ENTRIES} per archive. ${CLI_ALTERNATIVE}`
-    );
   }
 
   const totalBytes = kept.reduce((sum, k) => sum + k.file.size, 0);

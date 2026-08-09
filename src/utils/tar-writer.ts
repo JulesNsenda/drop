@@ -65,6 +65,15 @@ const PREFIX = { offset: 345, length: 155 };
  * which has its own layout (see `writeChecksum`). */
 function writeOctal(header: Uint8Array, field: { offset: number; length: number }, value: number): void {
   const digits = value.toString(8).padStart(field.length - 1, '0');
+  // padStart pads but never truncates, so an oversized value would run past
+  // the field into the next one — and `writeChecksum`, computed last, would
+  // then make that corruption verify. Unreachable through today's callers
+  // (size is guarded by MAX_ENTRY_SIZE, mtime overflows in 2242, the rest are
+  // constants), but this is a shared util reachable from two bundles and the
+  // failure would be silent, so refuse rather than rely on the callers.
+  if (digits.length > field.length - 1) {
+    throw new TarWriteError(`Value ${value} does not fit a ${field.length}-byte octal tar field`);
+  }
   header.set(encoder.encode(digits + '\0'), field.offset);
 }
 
@@ -126,7 +135,12 @@ function splitPath(path: string): { name: Uint8Array; prefix: Uint8Array } {
   }
 
   const minIndex = Math.max(0, full.length - NAME.length - 1);
-  const maxIndex = Math.min(PREFIX.length, full.length - 1);
+  // `- 2`, not `- 1`: splitting at the FINAL byte leaves `name` empty, and
+  // node-tar reads the result as `prefix + '/'`, retypes the entry as a
+  // directory and silently discards its body. `normalizeEntryPath` strips
+  // trailing slashes so the only current caller cannot reach it, but
+  // `buildTar` is exported with no such precondition on `TarEntry.path`.
+  const maxIndex = Math.min(PREFIX.length, full.length - 2);
   for (let i = minIndex; i <= maxIndex; i++) {
     if (full[i] === 0x2f /* '/' */) {
       return { prefix: full.slice(0, i), name: full.slice(i + 1) };

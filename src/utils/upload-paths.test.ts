@@ -86,6 +86,49 @@ describe('normalizeEntryPath', () => {
   });
 });
 
+describe('dotenv exclusion', () => {
+  // For a static app the uploaded tree root IS the Caddy document root, so a
+  // shipped `.env` is fetchable at `/.env` on the public URL.
+  it.each(['.env', '.env.local', '.env.production', 'sub/.ENV'])(
+    'excludes %s, which would otherwise be served',
+    p => expect(isExcludedByDefault(p)).toBe(true)
+  );
+
+  // Templates carry no values and are meant to ship.
+  it.each(['.env.example', '.env.sample', '.env.template', '.env.dist', 'environment.ts'])(
+    'keeps %s',
+    p => expect(isExcludedByDefault(p)).toBe(false)
+  );
+});
+
+describe('normalizeEntryPath control characters', () => {
+  // Built from char codes, never typed literally — a literal control byte in a
+  // source file makes git and grep treat it as binary and is invisible in review.
+  const ch = (code: number): string => String.fromCharCode(code);
+
+  it('rejects a NUL, which would desync the displayed path from the written one', () => {
+    // node-tar reads the USTAR name field up to the NUL, so a path like
+    // `.git<NUL>x/config` looks unexcluded to the client and extracts as
+    // `.git` on the server — caught only by the server-side guard.
+    expect(() => normalizeEntryPath(`.git${ch(0x00)}x/config`)).toThrow(PathNormalizationError);
+  });
+
+  it.each([
+    ['newline', 0x0a],
+    ['carriage return', 0x0d],
+    ['escape', 0x1b],
+    ['DEL', 0x7f],
+  ])('rejects a %s, which would flow verbatim into server log lines', (_label, code) => {
+    expect(() => normalizeEntryPath(`a${ch(code as number)}b.txt`)).toThrow(
+      PathNormalizationError
+    );
+  });
+
+  it('still accepts an ordinary path', () => {
+    expect(normalizeEntryPath('src/index.ts')).toBe('src/index.ts');
+  });
+});
+
 describe('a realistic checked-out-repo folder selection', () => {
   // Pins what an end-to-end run of the browser glue was measured to produce.
   // This is the single most load-bearing behaviour in the upload path: the
@@ -115,6 +158,21 @@ describe('a realistic checked-out-repo folder selection', () => {
       'my-app/.git/HEAD',
       'my-app/node_modules/left-pad/index.js',
     ]);
+  });
+
+  // Pins the ORDER the glue must apply these in. Exclusion has to be tested
+  // against the PRE-strip path: if the user picks the `node_modules` (or
+  // `.git`) folder itself, it becomes the common root, and stripping first
+  // removes it before the check — exempting the selected root from its own
+  // rules. `node_modules` as a root also passes APP_NAME_RE, so nothing
+  // downstream would catch it.
+  it('excludes a selection whose root IS the excluded directory', () => {
+    const picked = ['node_modules/left-pad/index.js', 'node_modules/foo/x.js'].map(
+      normalizeEntryPath
+    );
+
+    expect(picked.every(isExcludedByDefault)).toBe(true); // pre-strip: caught
+    expect(stripCommonRoot(picked).some(isExcludedByDefault)).toBe(false); // post-strip: missed
   });
 
   it('leaves no .git component for the server guard to reject', () => {
