@@ -111,7 +111,7 @@ audit what you are about to run as root:
 
 | Asset | What it is |
 |---|---|
-| [`drop-dist.tar.gz`](https://github.com/JulesNsenda/drop/releases/latest/download/drop-dist.tar.gz) | Compiled server, CLI, dashboard and site, plus `package.json` and lockfile |
+| [`drop-dist.tar.gz`](https://github.com/JulesNsenda/drop/releases/latest/download/drop-dist.tar.gz) | Compiled server, CLI and dashboard, plus `package.json` and lockfile |
 | [`drop-dist.tar.gz.sha256`](https://github.com/JulesNsenda/drop/releases/latest/download/drop-dist.tar.gz.sha256) | Checksum — `install.sh` verifies this before extracting |
 | [`install.sh`](https://github.com/JulesNsenda/drop/releases/latest/download/install.sh) | The installer itself |
 
