@@ -703,8 +703,22 @@ export class ContainerManager implements AppRuntime {
       const systemDelta =
         ((cpuStats as Record<string, number>)?.system_cpu_usage ?? 0) -
         ((preCpuStats as Record<string, number>)?.system_cpu_usage ?? 0);
+      // `online_cpus` FIRST: `percpu_usage` is a cgroup **v1** field, and v2 is
+      // the default on current Debian/Ubuntu — including the production box —
+      // where Docker omits it entirely and reports `online_cpus` instead. The
+      // old `percpu_usage?.length ?? 1` therefore fell back to 1 on every
+      // modern host, dividing every reported percentage by the host's core
+      // count. `online_cpus` has been present since Docker API v1.27, so it is
+      // available on v1 too; the `percpu_usage` fallback is kept for an older
+      // daemon, and is what the existing v1 test fixture exercises.
+      // `||` rather than `??` on the first term deliberately: a reported
+      // `online_cpus: 0` is nonsense for a running container, and taking it
+      // literally would multiply the ratio by zero and report a permanent 0%
+      // — the same under-report this fix exists to remove. Fall through.
       const numCpus =
-        ((cpuStats?.cpu_usage as Record<string, number[]>)?.percpu_usage?.length) ?? 1;
+        ((cpuStats as Record<string, number>)?.online_cpus ||
+          (cpuStats?.cpu_usage as Record<string, number[]>)?.percpu_usage?.length) ??
+        1;
       const cpuPercent =
         systemDelta > 0 ? (cpuDelta / systemDelta) * numCpus * 100 : 0;
 
