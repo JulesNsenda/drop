@@ -27,6 +27,13 @@ tar --exclude node_modules --exclude .git --exclude dist --exclude build \
     -czf app.tar.gz -C ./my-app .
 ```
 
+Excluding `.git` is **required**, not advice: an archive containing a `.git`
+path component is rejected outright with `reason: vcs_metadata` and nothing is
+extracted. Uploaded git metadata would land in the app's directory, where a
+later `POST /api/v1/git/redeploy/<app>` runs `git pull` on the host — so a
+tenant-supplied `.git/config` would be arbitrary command execution. Deploy a
+repository with `POST /api/v1/git/deploy` instead of packing its `.git`.
+
 Do **not** include `.env` files, keys, or credentials — anything in the
 archive lands on the server in the app's directory. Inject secrets via the
 secrets API instead (`PUT /api/v1/secrets/<app>`).

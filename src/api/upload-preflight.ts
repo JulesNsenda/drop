@@ -35,7 +35,7 @@ import {
 import { canAccessScoped } from './access';
 import { scopesAllowCreate } from './agent-scopes';
 import { isValidAppName } from './middleware/validate';
-import { getStateManager } from '../managers/app/state-manager';
+import { getStateManager, AppState } from '../managers/app/state-manager';
 import { getPlatformOps } from './platform-ops';
 import { hasEnoughDisk, getMinFreeDiskMb } from '../utils/disk';
 import { getAppsDirectory } from './runtime-config';
@@ -51,6 +51,26 @@ const uploadsInFlight = new Set<string>();
 export type UploadPreflightOutcome =
   | { ok: true; release: () => void }
   | { ok: false; error: HttpError };
+
+/**
+ * The name of the git-deployed app an upload to `app` would damage, or
+ * `undefined` if it is not git-backed.
+ *
+ * Returns the app's own name when it carries a `gitSource` directly. For a
+ * monorepo child it returns the CONTAINER's name: `expandMonorepo` gives
+ * children no `gitSource` of their own — the hidden container holds it — so a
+ * check on `gitSource` alone would leave the whole group clobberable by
+ * targeting any one child, whose materialized copy the next expansion would
+ * overwrite anyway. Mirrors the container resolution in
+ * `routes/git-deploy.ts`, which is what "redeploy this child" already means.
+ */
+function resolveGitBackedName(app: AppState): string | undefined {
+  if (app.gitSource) return app.name;
+  if (!app.group) return undefined;
+  return getStateManager()
+    .getAllApps()
+    .find(a => a.isGroupContainer && a.group === app.group && a.gitSource)?.name;
+}
 
 /** Effective per-user app limit: per-user override > global default. Mirrors apps.ts/git-deploy.ts. */
 function getAppLimit(userId?: string): number {
@@ -104,6 +124,27 @@ export async function runUploadPreflight(
         ok: false,
         error: new ConflictError(
           `Application '${appName}' is stopped; start or remove it before uploading`
+        ),
+      };
+    }
+    // An upload onto a git-backed app is destructive and irreversible in a way
+    // the caller cannot see coming: landFiles syncs the staged tree over the
+    // app directory and then PRUNES whatever the tarball didn't carry, and
+    // DEFAULT_PRESERVE covers only `node_modules` — so the app's real `.git`
+    // is deleted. Its gitSource survives in apps.json, so the app still looks
+    // git-backed, but the next `POST /git/redeploy/<app>` fails in
+    // `git remote get-url origin` with no repository present. Re-uploading a
+    // tarball carrying `.git` cannot repair it either: that is now refused
+    // outright (tar-extract's vcs_metadata guard). Refuse the upload instead
+    // of silently severing the link — one deploy source per app.
+    const gitBackedName = resolveGitBackedName(existingApp);
+    if (gitBackedName) {
+      return {
+        ok: false,
+        error: new ConflictError(
+          gitBackedName === appName
+            ? `Application '${appName}' is deployed from git; use POST /api/v1/git/redeploy/${appName}, or delete it first to switch to uploads`
+            : `Application '${appName}' belongs to git-deployed group '${gitBackedName}'; redeploy the group with POST /api/v1/git/redeploy/${appName} instead of uploading over a materialized copy`
         ),
       };
     }

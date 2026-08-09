@@ -12,6 +12,12 @@
  * entry, and `expandMonorepo` refuses a service whose subtree contains a link.
  * Links in the source are therefore skipped rather than reproduced, because
  * copying one would recreate the aliasing hole closed in PR #158.
+ *
+ * Callers must also guarantee `srcDir` carries no `.git` metadata from
+ * untrusted input — enforced today by `extractTarball`'s `.git`-component
+ * guard, not by anything in this file. `DEFAULT_PRESERVE` below deliberately
+ * does NOT protect `.git`: preserve exempts a name from the prune, it does
+ * not stop a hostile source tree from landing one in the first place.
  */
 
 import * as path from 'path';
