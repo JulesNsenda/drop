@@ -27,6 +27,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **A static app no longer serves its own dotfiles.** The generated nginx
+  config now returns 404 for any path with a `.`-prefixed segment, at any
+  depth, with `.well-known/` carved out. For a **plain-root** static app the
+  document root *is* the app directory, so `try_files $uri` happily served
+  `/.git/config` — the full repository history, and for an app cloned before
+  1.2.0 the personal access token baked into it — and `/.env`. Measured
+  against `nginx:alpine` before and after: `GET /.git/config` returned **200
+  with the token in the body**, and now returns 404.
+
+  This corrects the note published with 1.2.0, which named Caddy's
+  `file_server` as the culprit. It is not: `staticPath` is never set, so that
+  branch is dead code. Static apps are served by nginx in their own container
+  and Caddy only reverse-proxies to it. The exposure was real, the component
+  named was wrong.
+
+  An **SPA is unaffected** — its root is `/app/<outputDirectory>`, so `.git`
+  sits outside the document root. That asymmetry is why this went unnoticed:
+  the SPA case, which is most apps, was always safe.
+
+  Takes effect on an app's next deploy, when its nginx config is regenerated.
+
 ## [1.2.0] - 2026-08-09
 
 Two security fixes that change behaviour, and the recovery path for a repo
