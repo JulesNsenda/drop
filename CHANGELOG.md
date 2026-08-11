@@ -27,6 +27,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.1] - 2026-08-11
+
+One security fix, and a correction to the note published with 1.2.0.
+
+**Upgrading is not enough on its own — restart your static apps.** The nginx
+config is regenerated from `buildStartSpec`, which runs on start *and* on
+restart, so `drop restart <app>` (or the dashboard's Restart button, or the
+MCP `restart_app` tool) applies the fix. A full redeploy is not required.
+To check an app before and after:
+
+```bash
+curl -o /dev/null -w '%{http_code}\n' https://<app>/.git/config   # 200 = exposed
+```
+
+If it returned 200 and the app was git-deployed before 1.2.0, its
+`.git/config` contained a personal access token — **rotate that token**; the
+404 stops the bleeding but does not un-publish what was already fetched.
+
 ### Security
 
 - **A static app no longer serves its own dotfiles.** The generated nginx
@@ -48,7 +66,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   sits outside the document root. That asymmetry is why this went unnoticed:
   the SPA case, which is most apps, was always safe.
 
-  Takes effect on an app's next deploy, when its nginx config is regenerated.
+  Takes effect when the app's nginx config is next regenerated — a restart is
+  enough, see the upgrade note above.
 
 ## [1.2.0] - 2026-08-09
 
@@ -115,9 +134,13 @@ that goes private after it was deployed.
   never redeployed keeps the old value; grep for it with
   `sudo grep -hE '^\s*url\s*=' /var/drop/data/webapps/*/.git/config | grep '@'`.
 
-  Not fully closed by this change: Caddy's `file_server` has no `hide`
-  directive, so a plain-root static app still serves `/.git/config` — and its
-  history — to the internet.
+  Not fully closed by this change: a plain-root static app still serves
+  `/.git/config` — and its history — to the internet.
+
+  **Correction, added in 1.2.1:** as published, this paragraph named Caddy's
+  `file_server` as the component at fault. It is not — that branch is dead
+  code, and static apps are served by nginx in their own container. The
+  exposure was real and is fixed in 1.2.1; only the attribution was wrong.
 
 ### Added
 
@@ -532,7 +555,9 @@ First stable release of DROP with full deployment pipeline, hot-reload, and data
 
 ---
 
-[Unreleased]: https://github.com/JulesNsenda/drop/compare/v1.1.0...HEAD
+[Unreleased]: https://github.com/JulesNsenda/drop/compare/v1.2.1...HEAD
+[1.2.1]: https://github.com/JulesNsenda/drop/compare/v1.2.0...v1.2.1
+[1.2.0]: https://github.com/JulesNsenda/drop/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/JulesNsenda/drop/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/JulesNsenda/drop/compare/v0.1.0...v1.0.0
 [0.1.0]: https://github.com/JulesNsenda/drop/releases/tag/v0.1.0
