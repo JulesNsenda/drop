@@ -35,15 +35,25 @@ One security fix, and a correction to the note published with 1.2.0.
 config is regenerated from `buildStartSpec`, which runs on start *and* on
 restart, so `drop restart <app>` (or the dashboard's Restart button, or the
 MCP `restart_app` tool) applies the fix. A full redeploy is not required.
-To check an app before and after:
+
+**Before restarting**, this tells you whether an app is exposed:
 
 ```bash
 curl -o /dev/null -w '%{http_code}\n' https://<app>/.git/config   # 200 = exposed
 ```
 
-If it returned 200 and the app was git-deployed before 1.2.0, its
-`.git/config` contained a personal access token — **rotate that token**; the
-404 stops the bleeding but does not un-publish what was already fetched.
+**After restarting it reads 404 either way**, so it can no longer answer "was
+I exposed, do I need to rotate a token?". That question is settled on the box,
+and upgrading does not erase the evidence:
+
+```bash
+sudo grep -hE '^\s*url\s*=' /var/drop/data/webapps/*/.git/config | grep '@'
+```
+
+Any app listed there was cloned with a personal access token in its remote
+URL. If it is also a **plain-root** static app (`outputDirectory` is the app
+root, not `dist`/`build`), that token was publicly fetchable — **rotate it**.
+The 404 stops the bleeding but does not un-publish what was already fetched.
 
 ### Security
 
