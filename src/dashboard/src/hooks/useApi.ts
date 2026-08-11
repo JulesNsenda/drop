@@ -201,10 +201,15 @@ function usePolledJson<T>(
 /**
  * Stable empty-array identities. `data ?? []` would mint a new array on every
  * render, which defeats the `useMemo([apps])` filtering/grouping in AppsPage.
- * Frozen because a single shared array is handed to every mounted consumer —
- * one in-place `sort()` added later would corrupt it for all of them.
+ *
+ * Not frozen, deliberately. One shared array does reach every mounted
+ * consumer, so an in-place `sort()`/`push()` added later would corrupt it for
+ * all of them — but `Object.freeze` behind a cast to a mutable type only turns
+ * that into a runtime TypeError in production with no compile-time warning.
+ * Every consumer today copies (`filter`, `slice`) rather than mutating; make
+ * these `readonly` if that ever stops being true.
  */
-const NO_APPS = Object.freeze([]) as unknown as App[];
+const NO_APPS: App[] = [];
 
 export function useApps() {
   const { data, ...rest } = usePolledJson<App[]>('/apps', 5000, 'Failed to fetch apps');
@@ -245,8 +250,8 @@ export interface DeployEpisodeDto {
   stages: DeployStageDto[];
 }
 
-/** Same shared-and-frozen rationale as NO_APPS above. */
-const NO_EPISODES = Object.freeze([]) as unknown as DeployEpisodeDto[];
+/** Same stable-identity rationale as NO_APPS above. */
+const NO_EPISODES: DeployEpisodeDto[] = [];
 
 export function useDeployTimeline(appName: string) {
   const { data, ...rest } = usePolledJson<DeployEpisodeDto[]>(
