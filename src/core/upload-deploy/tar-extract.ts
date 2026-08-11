@@ -17,6 +17,7 @@ import * as fs from 'fs';
 import * as fsp from 'fs/promises';
 import * as path from 'path';
 import * as zlib from 'zlib';
+import { Transform } from 'stream';
 import { Parser as TarParser, ReadEntry } from 'tar';
 import { isVcsMetadataComponent } from '../../utils/upload-paths';
 
@@ -333,22 +334,58 @@ function runExtraction(
       activeWrites++;
       const ws = fs.createWriteStream(resolved);
 
-      entry.on('data', (chunk: Buffer) => {
-        if (settled) return;
-        totalBytes += chunk.length;
-        if (totalBytes > limits.maxUncompressedBytes) {
-          // Abort mid-stream as soon as the cap is crossed, not after the
-          // entry (or the archive) finishes.
-          settle(
-            new ArchiveRejectedError(
-              'too_many_bytes',
-              `Archive exceeds the maximum of ${limits.maxUncompressedBytes} uncompressed bytes`
-            )
-          );
-        }
+      // Byte accounting lives INSIDE the pipeline, as a Transform between the
+      // entry and the file, rather than on a side `entry.on('data')` listener.
+      // That is not a style choice — a side listener is wrong in both possible
+      // orderings, and each ordering fails in a different, silent way:
+      //
+      //   listener BEFORE pipe()  ->  DATA LOSS. Attaching a 'data' handler is
+      //     what puts the stream into flowing mode, so the entry starts
+      //     emitting before pipe() has wired up the write stream. Every chunk
+      //     in that window is counted and then DROPPED. The file lands on disk
+      //     missing a whole number of leading 512-byte tar blocks and the
+      //     archive still extracts "successfully" — no warning, no error, and
+      //     fileCount/bytesWritten both look right, because totalBytes counted
+      //     precisely the bytes that were lost. Observed on a real 164-file
+      //     upload: 12 files truncated by 512-10240 bytes, one 2044-byte file
+      //     written as 0 bytes. The damage only surfaces much later, as a
+      //     nonsense parse error inside the uploaded app's own source (a .ts
+      //     file starting mid-token), naming a different file on each deploy
+      //     depending on chunk scheduling — which reads as a bug in the
+      //     customer's code rather than in this extractor.
+      //
+      //   listener AFTER pipe()   ->  UNDER-COUNTING. Content is written
+      //     correctly, but the chunks pipe() already consumed never reach the
+      //     listener, so totalBytes lands short (measured ~7% low on the test
+      //     archive below). maxUncompressedBytes is the decompression-bomb
+      //     control, so under-counting silently raises the real ceiling.
+      //
+      // A Transform sees exactly the bytes that reach the file, exactly once,
+      // and still allows the mid-stream abort below. Both failure modes are
+      // covered by "writes every entry byte-for-byte across a many-file
+      // archive" in tar-extract.test.ts, which asserts content integrity AND
+      // that bytesWritten matches what is actually on disk.
+      const counter = new Transform({
+        transform(chunk: Buffer, _enc, cb) {
+          if (!settled) {
+            totalBytes += chunk.length;
+            if (totalBytes > limits.maxUncompressedBytes) {
+              // Abort mid-stream as soon as the cap is crossed, not after the
+              // entry (or the archive) finishes.
+              settle(
+                new ArchiveRejectedError(
+                  'too_many_bytes',
+                  `Archive exceeds the maximum of ${limits.maxUncompressedBytes} uncompressed bytes`
+                )
+              );
+            }
+          }
+          cb(null, chunk);
+        },
       });
 
       entry.on('error', (err) => settle(err as Error));
+      counter.on('error', (err) => settle(err));
       ws.on('error', (err) => settle(err));
       ws.on('finish', () => {
         fileCount++;
@@ -356,7 +393,7 @@ function runExtraction(
         maybeFinish();
       });
 
-      entry.pipe(ws);
+      entry.pipe(counter).pipe(ws);
     });
 
     parser.on('end', () => {

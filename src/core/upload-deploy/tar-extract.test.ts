@@ -426,6 +426,78 @@ describe('extractTarball', () => {
     expect(fssync.existsSync(destDir)).toBe(false);
   });
 
+  it('writes every entry byte-for-byte across a many-file archive', async () => {
+    // Regression guard for silent content loss. The entry handler attaches a
+    // byte-counting 'data' listener AND pipes the entry to a write stream;
+    // attaching 'data' is what starts flowing mode, so if it is attached
+    // before pipe(), the chunks emitted in that window are counted and then
+    // dropped. Files land truncated by whole 512-byte tar blocks while the
+    // extraction still reports success — nothing is rejected, and
+    // fileCount/bytesWritten both look correct.
+    //
+    // The happy-path test above cannot catch it: three tiny entries all fit in
+    // one gunzip chunk, so nothing is ever buffered ahead. Two properties of
+    // the archive below are what actually make the bug reproduce, and both
+    // were established by bisecting real failures — do not "simplify" them
+    // away:
+    //
+    //   VARIED file sizes. An archive of uniformly-sized entries does not
+    //   reproduce it at all (60 x 8 kB: 0 corrupted). Mixed sizes make gunzip
+    //   chunk boundaries land mid-entry, which is the window where data is
+    //   emitted before pipe() attaches.
+    //
+    //   LOW-COMPRESSIBILITY content. `'ab'.repeat(n)` gzips to almost nothing,
+    //   so the whole archive arrives in one chunk and the window never opens.
+    //
+    // With both, the unfixed handler corrupts ~25-29 of these 160 entries.
+    const srcDir = path.join(tempDir, 'many');
+    await fs.mkdir(srcDir, { recursive: true });
+
+    const names: string[] = [];
+    const expected = new Map<string, string>();
+    for (let i = 0; i < 160; i++) {
+      const name = `file-${String(i).padStart(3, '0')}.txt`;
+      // Deterministic pseudo-random filler (no Math.random - a flaky
+      // regression test is worse than none). Distinct HEAD/TAIL markers so a
+      // lost leading block shows up as a changed prefix, not just a length.
+      const size = 2000 + (i % 11) * 3000;
+      let body = `HEAD-${i}-`;
+      let x = (i * 2654435761) % 4294967296;
+      while (body.length < size) {
+        x = (x * 1103515245 + 12345) % 2147483648;
+        body += x.toString(36);
+      }
+      body += `-TAIL-${i}`;
+      await fs.writeFile(path.join(srcDir, name), body);
+      names.push(name);
+      expected.set(name, body);
+    }
+
+    const archivePath = path.join(tempDir, 'many.tgz');
+    await tar.create({ gzip: true, file: archivePath, cwd: srcDir }, names);
+
+    const result = await extractTarball(archivePath, destDir, {
+      ...DEFAULT_LIMITS,
+      maxUncompressedBytes: 100 * 1024 * 1024,
+    });
+
+    expect(result.fileCount).toBe(names.length);
+
+    const corrupted: string[] = [];
+    for (const name of names) {
+      const actual = fssync.readFileSync(path.join(destDir, name), 'utf8');
+      if (actual !== expected.get(name)) {
+        corrupted.push(`${name} (${actual.length} bytes, expected ${expected.get(name)!.length})`);
+      }
+    }
+    expect(corrupted).toEqual([]);
+
+    // bytesWritten must describe what actually reached disk, not what passed
+    // through the counter — those two diverge under the bug above.
+    const onDisk = names.reduce((n, f) => n + fssync.statSync(path.join(destDir, f)).size, 0);
+    expect(result.bytesWritten).toBe(onDisk);
+  });
+
   it('rejects and does not throw a non-ArchiveRejectedError for a truncated gzip stream', async () => {
     const tarBuf = buildTar([buildEntry('hello.txt', 'hi')]);
     const fullGz = zlib.gzipSync(tarBuf);
