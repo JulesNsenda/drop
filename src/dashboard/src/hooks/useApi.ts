@@ -1,6 +1,7 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { apiJson, jsonBody } from '../api/client';
 import { redeployBody } from '../lib/redeploy-credential';
+import { createPollTracker } from '../lib/poll-tracker';
 
 export interface GitSource {
   repoUrl: string;
@@ -94,56 +95,97 @@ export interface AppHealthCheck {
   healthy: boolean;
 }
 
-export function useApps() {
-  const [apps, setApps] = useState<App[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+export interface PolledResource<T> {
+  data: T | null;
+  /**
+   * First load for the current path ONLY — never a background poll. Consumers
+   * gate skeletons and empty states on this, so flipping it back on every poll
+   * makes the page blank itself on a timer (see lib/poll-tracker.ts).
+   */
+  loading: boolean;
+  /** Any request in flight, first or not. This is what a Refresh button wants. */
+  refreshing: boolean;
+  error: string | null;
+  refresh: () => Promise<void>;
+}
 
-  const fetchApps = useCallback(async () => {
-    setLoading(true);
-    const json = await apiJson<App[]>('/apps');
-    if (json.success && json.data) {
-      setApps(json.data);
+/**
+ * One polled GET, shared by the apps-list, app-detail and deploy-timeline
+ * hooks. Each used to hand-roll this and each carried the same two defects:
+ * `loading` was re-raised on every poll, and responses were applied in
+ * whatever order they happened to arrive.
+ */
+function usePolledJson<T>(
+  path: string,
+  intervalMs: number,
+  failureMessage: string
+): PolledResource<T> {
+  const [data, setData] = useState<T | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const trackerRef = useRef(createPollTracker());
+
+  const fetchNow = useCallback(async () => {
+    const tracker = trackerRef.current;
+    const ticket = tracker.begin();
+    setRefreshing(true);
+
+    const json = await apiJson<T>(path);
+    const applies = tracker.settle(ticket);
+
+    // The path changed while this was in flight, so its tracker was replaced
+    // below and this response describes a resource we are no longer showing.
+    // Returning here is what stops one app's data painting another app's page.
+    if (trackerRef.current !== tracker) return;
+
+    setRefreshing(tracker.inFlight() > 0);
+
+    // A newer response for this same path already landed. Drop this one whole:
+    // applying it would overwrite fresher data, or clear a fresher error.
+    if (!applies) return;
+
+    if (json.success && json.data !== undefined) {
+      setData(json.data);
       setError(null);
     } else {
-      setError(json.error?.message || 'Failed to fetch apps');
+      setError(json.error?.message || failureMessage);
     }
     setLoading(false);
-  }, []);
+  }, [path, failureMessage]);
 
   useEffect(() => {
-    fetchApps();
-    const interval = setInterval(fetchApps, 5000);
-    return () => clearInterval(interval);
-  }, [fetchApps]);
+    // A different path is a genuine first load again: drop the previous
+    // resource's data and show the skeleton rather than the wrong app's
+    // details. The fresh tracker is also what invalidates any in-flight
+    // response for the old path.
+    trackerRef.current = createPollTracker();
+    setData(null);
+    setError(null);
+    setLoading(true);
 
-  return { apps, loading, error, refresh: fetchApps };
+    fetchNow();
+    const interval = setInterval(fetchNow, intervalMs);
+    return () => clearInterval(interval);
+  }, [fetchNow, intervalMs]);
+
+  return { data, loading, refreshing, error, refresh: fetchNow };
+}
+
+/**
+ * Stable empty-array identities. `data ?? []` would mint a new array on every
+ * render, which defeats the `useMemo([apps])` filtering/grouping in AppsPage.
+ */
+const NO_APPS: App[] = [];
+
+export function useApps() {
+  const { data, ...rest } = usePolledJson<App[]>('/apps', 5000, 'Failed to fetch apps');
+  return { apps: data ?? NO_APPS, ...rest };
 }
 
 export function useApp(name: string) {
-  const [app, setApp] = useState<App | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-
-  const fetchApp = useCallback(async () => {
-    setLoading(true);
-    const json = await apiJson<App>(`/apps/${name}`);
-    if (json.success && json.data) {
-      setApp(json.data);
-      setError(null);
-    } else {
-      setError(json.error?.message || 'Failed to fetch app');
-    }
-    setLoading(false);
-  }, [name]);
-
-  useEffect(() => {
-    fetchApp();
-    const interval = setInterval(fetchApp, 3000);
-    return () => clearInterval(interval);
-  }, [fetchApp]);
-
-  return { app, loading, error, refresh: fetchApp };
+  const { data, ...rest } = usePolledJson<App>(`/apps/${name}`, 3000, 'Failed to fetch app');
+  return { app: data, ...rest };
 }
 
 // Deploy Timeline API (P2-4 deploy observability)
@@ -175,30 +217,15 @@ export interface DeployEpisodeDto {
   stages: DeployStageDto[];
 }
 
+const NO_EPISODES: DeployEpisodeDto[] = [];
+
 export function useDeployTimeline(appName: string) {
-  const [episodes, setEpisodes] = useState<DeployEpisodeDto[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-
-  const fetchEpisodes = useCallback(async () => {
-    setLoading(true);
-    const json = await apiJson<DeployEpisodeDto[]>(`/deploys?app=${encodeURIComponent(appName)}`);
-    if (json.success && json.data) {
-      setEpisodes(json.data);
-      setError(null);
-    } else {
-      setError(json.error?.message || 'Failed to fetch deploy timeline');
-    }
-    setLoading(false);
-  }, [appName]);
-
-  useEffect(() => {
-    fetchEpisodes();
-    const interval = setInterval(fetchEpisodes, 5000);
-    return () => clearInterval(interval);
-  }, [fetchEpisodes]);
-
-  return { episodes, loading, error, refresh: fetchEpisodes };
+  const { data, ...rest } = usePolledJson<DeployEpisodeDto[]>(
+    `/deploys?app=${encodeURIComponent(appName)}`,
+    5000,
+    'Failed to fetch deploy timeline'
+  );
+  return { episodes: data ?? NO_EPISODES, ...rest };
 }
 
 export interface UsageInfo {

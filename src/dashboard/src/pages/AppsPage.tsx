@@ -120,7 +120,7 @@ function AppListCard({ app, isAdmin }: { app: App; isAdmin: boolean }) {
 }
 
 function AppsPage() {
-  const { apps, loading, error, refresh } = useApps();
+  const { apps, loading, refreshing, error, refresh } = useApps();
   const { role } = useAuth();
   const isAdmin = role === 'admin';
   const navigate = useNavigate();
@@ -202,8 +202,10 @@ function AppsPage() {
             {apps.length} app{apps.length !== 1 ? 's' : ''} deployed
           </p>
         </div>
-        <Button variant="secondary" onClick={refresh} disabled={loading}>
-          <RefreshCw className={`h-4 w-4 ${loading ? 'animate-spin' : ''}`} />
+        {/* `refreshing`, not `loading` — the button must react to every fetch,
+            while the body below must only blank itself on the first one. */}
+        <Button variant="secondary" onClick={refresh} disabled={refreshing}>
+          <RefreshCw className={`h-4 w-4 ${refreshing ? 'animate-spin' : ''}`} />
           Refresh
         </Button>
       </div>
@@ -273,6 +275,17 @@ function AppsPage() {
           }}
         >
           {error}
+        </div>
+      )}
+
+      {/* First load only. Without this the body was empty until the first
+          response arrived — every block below is gated on either `!loading` or
+          `apps.length > 0`, so there was nothing at all to render at t=0. */}
+      {loading && (
+        <div className="flex animate-pulse flex-col gap-3" aria-hidden="true">
+          {[0, 1, 2].map(i => (
+            <div key={i} className="h-20 rounded-xl" style={{ background: 'var(--bg-2)' }} />
+          ))}
         </div>
       )}
 
