@@ -120,12 +120,25 @@ function AppListCard({ app, isAdmin }: { app: App; isAdmin: boolean }) {
 }
 
 function AppsPage() {
-  const { apps, loading, refreshing, error, refresh } = useApps();
+  const { apps, loading, error, refresh } = useApps();
   const { role } = useAuth();
   const isAdmin = role === 'admin';
   const navigate = useNavigate();
   const [search, setSearch] = useState('');
   const [statusFilter, setStatusFilter] = useState<string>('all');
+
+  // Spinner feedback for a CLICK, not for the 5s background poll. Sourcing it
+  // from the hook's in-flight state instead would leave the button dead — and
+  // twitching — for a slice of every interval on a page nobody is touching.
+  const [manualRefreshing, setManualRefreshing] = useState(false);
+  const handleRefresh = async () => {
+    setManualRefreshing(true);
+    try {
+      await refresh();
+    } finally {
+      setManualRefreshing(false);
+    }
+  };
 
   const filteredApps = useMemo(() => {
     return apps.filter(app => {
@@ -202,10 +215,8 @@ function AppsPage() {
             {apps.length} app{apps.length !== 1 ? 's' : ''} deployed
           </p>
         </div>
-        {/* `refreshing`, not `loading` — the button must react to every fetch,
-            while the body below must only blank itself on the first one. */}
-        <Button variant="secondary" onClick={refresh} disabled={refreshing}>
-          <RefreshCw className={`h-4 w-4 ${refreshing ? 'animate-spin' : ''}`} />
+        <Button variant="secondary" onClick={handleRefresh} disabled={manualRefreshing}>
+          <RefreshCw className={`h-4 w-4 ${manualRefreshing ? 'animate-spin' : ''}`} />
           Refresh
         </Button>
       </div>
@@ -289,8 +300,11 @@ function AppsPage() {
         </div>
       )}
 
-      {/* Empty state - onboarding */}
-      {!loading && apps.length === 0 && (
+      {/* Empty state - onboarding. Gated on `!error` too: a failed first load
+          leaves `apps` empty without ever having loaded, and telling someone
+          whose API is down to "deploy your first app" is a lie — that is
+          exactly the population reporting this page. */}
+      {!loading && !error && apps.length === 0 && (
         <Card className="mx-auto max-w-lg p-10 text-center">
           <div
             className="mx-auto mb-6 flex h-16 w-16 items-center justify-center rounded-2xl"

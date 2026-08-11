@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
-import { apiJson, jsonBody } from '../api/client';
+import { apiJson, apiJsonWithStatus, jsonBody } from '../api/client';
 import { redeployBody } from '../lib/redeploy-credential';
-import { createPollTracker } from '../lib/poll-tracker';
+import { createPollTracker, PollTracker } from '../lib/poll-tracker';
 
 export interface GitSource {
   repoUrl: string;
@@ -101,13 +101,20 @@ export interface PolledResource<T> {
    * First load for the current path ONLY — never a background poll. Consumers
    * gate skeletons and empty states on this, so flipping it back on every poll
    * makes the page blank itself on a timer (see lib/poll-tracker.ts).
+   *
+   * There is deliberately no companion "a request is in flight" flag: a button
+   * that disables itself on background polls is dead for a slice of every
+   * interval, and any flag derived from an in-flight count sticks forever when
+   * a request neither resolves nor rejects. A control that wants click feedback
+   * owns that state itself — see AppsPage's Refresh button.
    */
   loading: boolean;
-  /** Any request in flight, first or not. This is what a Refresh button wants. */
-  refreshing: boolean;
   error: string | null;
   refresh: () => Promise<void>;
 }
+
+/** Statuses that mean the resource is gone, not that the network hiccuped. */
+const GONE_STATUSES = new Set([404, 410]);
 
 /**
  * One polled GET, shared by the apps-list, app-detail and deploy-timeline
@@ -122,42 +129,54 @@ function usePolledJson<T>(
 ): PolledResource<T> {
   const [data, setData] = useState<T | null>(null);
   const [loading, setLoading] = useState(true);
-  const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const trackerRef = useRef(createPollTracker());
+  // Lazily initialised: `useRef(createPollTracker())` would build and discard a
+  // tracker on every render. The effect below installs the real one.
+  const trackerRef = useRef<PollTracker | null>(null);
+  if (trackerRef.current === null) trackerRef.current = createPollTracker();
 
   const fetchNow = useCallback(async () => {
     const tracker = trackerRef.current;
+    if (!tracker) return;
     const ticket = tracker.begin();
-    setRefreshing(true);
 
-    const json = await apiJson<T>(path);
+    const json = await apiJsonWithStatus<T>(path);
     const applies = tracker.settle(ticket);
 
-    // The path changed while this was in flight, so its tracker was replaced
-    // below and this response describes a resource we are no longer showing.
-    // Returning here is what stops one app's data painting another app's page.
+    // Two ways this response is obsolete. Either the path changed or the hook
+    // unmounted while it was in flight — both replace/clear the tracker below,
+    // so identity is the check, and it is what stops one app's data painting
+    // another app's page (and stops a setState after unmount).
     if (trackerRef.current !== tracker) return;
 
-    setRefreshing(tracker.inFlight() > 0);
+    // `isFirstLoad` is the ONLY input to `loading`. Note this runs even for a
+    // response that lost its race, which is correct: a newer response already
+    // ended the first load, so reporting `loading` again would be a lie.
+    setLoading(tracker.isFirstLoad());
 
     // A newer response for this same path already landed. Drop this one whole:
     // applying it would overwrite fresher data, or clear a fresher error.
     if (!applies) return;
 
-    if (json.success && json.data !== undefined) {
+    if (json.success && json.data != null) {
       setData(json.data);
       setError(null);
-    } else {
-      setError(json.error?.message || failureMessage);
+      return;
     }
-    setLoading(false);
+
+    setError(json.error?.message || failureMessage);
+    // A transient failure keeps the last good snapshot on screen; a resource
+    // that is GONE must not, or a deleted app leaves a fully-actionable page
+    // up forever with live Start/Stop/Delete buttons on a name the server no
+    // longer knows. `apiJson` throws the status away, which is why this uses
+    // `apiJsonWithStatus`.
+    if (GONE_STATUSES.has(json.status)) setData(null);
   }, [path, failureMessage]);
 
   useEffect(() => {
     // A different path is a genuine first load again: drop the previous
     // resource's data and show the skeleton rather than the wrong app's
-    // details. The fresh tracker is also what invalidates any in-flight
+    // details. Minting a fresh tracker is also what invalidates any in-flight
     // response for the old path.
     trackerRef.current = createPollTracker();
     setData(null);
@@ -166,17 +185,26 @@ function usePolledJson<T>(
 
     fetchNow();
     const interval = setInterval(fetchNow, intervalMs);
-    return () => clearInterval(interval);
+    return () => {
+      clearInterval(interval);
+      // Clearing it makes the identity guard above cover unmount too, not just
+      // a path change — otherwise an in-flight response setStates into a
+      // component that is gone. React 18 dropped the warning for that, so it
+      // would be silent.
+      trackerRef.current = null;
+    };
   }, [fetchNow, intervalMs]);
 
-  return { data, loading, refreshing, error, refresh: fetchNow };
+  return { data, loading, error, refresh: fetchNow };
 }
 
 /**
  * Stable empty-array identities. `data ?? []` would mint a new array on every
  * render, which defeats the `useMemo([apps])` filtering/grouping in AppsPage.
+ * Frozen because a single shared array is handed to every mounted consumer —
+ * one in-place `sort()` added later would corrupt it for all of them.
  */
-const NO_APPS: App[] = [];
+const NO_APPS = Object.freeze([]) as unknown as App[];
 
 export function useApps() {
   const { data, ...rest } = usePolledJson<App[]>('/apps', 5000, 'Failed to fetch apps');
@@ -217,7 +245,8 @@ export interface DeployEpisodeDto {
   stages: DeployStageDto[];
 }
 
-const NO_EPISODES: DeployEpisodeDto[] = [];
+/** Same shared-and-frozen rationale as NO_APPS above. */
+const NO_EPISODES = Object.freeze([]) as unknown as DeployEpisodeDto[];
 
 export function useDeployTimeline(appName: string) {
   const { data, ...rest } = usePolledJson<DeployEpisodeDto[]>(
