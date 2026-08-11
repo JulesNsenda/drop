@@ -268,7 +268,12 @@ function AppDetailPage() {
     );
   }
 
-  if (error || !app) {
+  // `!app`, NOT `error || !app`. This page polls every 3s, so gating on `error`
+  // meant a single transient poll failure tore down a fully-rendered page —
+  // tabs, logs, scroll position and all — and the next poll built it again. An
+  // error we can show *beside* the data belongs in a banner (see below), not in
+  // place of it.
+  if (!app) {
     return (
       <div className="p-6">
         <Link
@@ -304,6 +309,22 @@ function AppDetailPage() {
         <ArrowLeft className="h-4 w-4" />
         Back to apps
       </Link>
+
+      {/* A refresh that failed while the page already had data: surfaced, but
+          non-destructive — the last good snapshot stays on screen. */}
+      {error && (
+        <div
+          role="alert"
+          className="mb-6 rounded-lg border p-4 text-sm"
+          style={{
+            borderColor: 'var(--err)',
+            background: 'color-mix(in srgb, var(--err) 10%, transparent)',
+            color: 'var(--err)',
+          }}
+        >
+          {error}
+        </div>
+      )}
 
       {/* Header: name, status, type + destructive/lifecycle actions (visible regardless of tab) */}
       <div className="mb-6 flex flex-wrap items-start justify-between gap-4">
