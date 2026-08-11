@@ -134,9 +134,13 @@ that goes private after it was deployed.
   never redeployed keeps the old value; grep for it with
   `sudo grep -hE '^\s*url\s*=' /var/drop/data/webapps/*/.git/config | grep '@'`.
 
-  Not fully closed by this change: Caddy's `file_server` has no `hide`
-  directive, so a plain-root static app still serves `/.git/config` — and its
-  history — to the internet.
+  Not fully closed by this change: a plain-root static app still serves
+  `/.git/config` — and its history — to the internet.
+
+  **Correction, added in 1.2.1:** as published, this paragraph named Caddy's
+  `file_server` as the component at fault. It is not — that branch is dead
+  code, and static apps are served by nginx in their own container. The
+  exposure was real and is fixed in 1.2.1; only the attribution was wrong.
 
 ### Added
 
