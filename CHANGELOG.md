@@ -82,7 +82,14 @@ simply served.
 
   Affects both upload entry points: `POST /api/v1/apps/:name/source` and the
   MCP `deploy_files` tool. Present since the upload deploy path first shipped
-  (PRD-039), so no released version carries the fix.
+  (PRD-039), so every release before this one carries it.
+
+  This is **not** the truncation 1.2.0 addressed, despite both being described
+  as truncation. That one was about entries the tar parser *rejects*, which
+  were silently dropped whole and are now fatal; its closing note about a
+  stream cut off mid-way describes a case 1.2.0 explicitly left open. Here the
+  entry arrives intact and the parser is perfectly happy — the bytes are lost
+  between the parser and the file. Upgrading to 1.2.0 did nothing for it.
 
 - **The dashboard's app list no longer blanks itself on every poll.** The
   polling hooks re-raised `loading` on each interval and the apps page gates
