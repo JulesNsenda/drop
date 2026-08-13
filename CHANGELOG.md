@@ -36,11 +36,15 @@ the deploy as successful. Upgrading stops it happening again; it does not
 repair a tree that already landed short. Only a re-upload does, and a rebuild
 does not: rebuilding from truncated source reproduces the truncated output.
 
-**Checking is not a substitute for re-uploading.** Which files are hit depends
-on chunk scheduling, so it varies per deploy and a clean tree today says
-nothing about the deploy before it. If you want a signal anyway, empty files
-are the loudest one — a small file can lose its only chunk and land at zero
-bytes:
+**Checking is not a substitute for re-uploading, and a clean scan is not an
+all-clear.** Which files are hit depends on chunk scheduling, so it varies per
+deploy and a clean tree today says nothing about the deploy before it. The one
+signal available finds only the extreme case — a small file losing its only
+chunk and landing at zero bytes — and it will happily report clean on a tree
+that lost 512 bytes off the front of a file, which is the ordinary outcome.
+Measured that way on one fleet: the scan came back clean while an app on it had
+been uploaded on the affected code. Use it to find damage, never to rule it
+out:
 
 ```bash
 sudo find /var/drop/data/webapps -type f -empty -not -path '*/node_modules/*'
