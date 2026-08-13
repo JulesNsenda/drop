@@ -135,12 +135,30 @@ function DeployTimeline({ appName }: DeployTimelineProps) {
         </h2>
       </div>
       <div className="p-4">
+        {/* An error REPLACES the timeline only when there is nothing to show.
+            This polls every 5s, so gating the whole card on `error` meant one
+            transient failure tore down a rendered timeline and the next poll
+            rebuilt it — same defect AppDetailPage carries above this card.
+            With data on screen the error is a banner instead (below). */}
+        {error && episodes.length > 0 && (
+          <div
+            role="alert"
+            className="mb-4 p-3 border rounded-lg text-sm"
+            style={{
+              background: 'color-mix(in srgb, var(--err) 15%, transparent)',
+              borderColor: 'color-mix(in srgb, var(--err) 35%, transparent)',
+              color: 'var(--err)',
+            }}
+          >
+            {error}
+          </div>
+        )}
         {loading && episodes.length === 0 ? (
           <div className="animate-pulse space-y-2">
             <div className="h-4 w-64 rounded" style={{ background: 'var(--border-2)' }} />
             <div className="h-4 w-48 rounded" style={{ background: 'var(--border-2)' }} />
           </div>
-        ) : error ? (
+        ) : error && episodes.length === 0 ? (
           <div
             className="p-3 border rounded-lg text-sm"
             style={{
