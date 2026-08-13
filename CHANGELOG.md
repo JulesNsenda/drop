@@ -27,6 +27,69 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+One data-loss fix on the upload deploy path, and a dashboard fix.
+
+**If you have ever deployed by upload, re-upload those apps after upgrading.**
+Every release that has the upload path — 1.0.0, 1.1.0, 1.2.0 and 1.2.1 — can
+write an uploaded file to disk with its opening bytes missing and still report
+the deploy as successful. Upgrading stops it happening again; it does not
+repair a tree that already landed short. Only a re-upload does, and a rebuild
+does not: rebuilding from truncated source reproduces the truncated output.
+
+**Checking is not a substitute for re-uploading.** Which files are hit depends
+on chunk scheduling, so it varies per deploy and a clean tree today says
+nothing about the deploy before it. If you want a signal anyway, empty files
+are the loudest one — a small file can lose its only chunk and land at zero
+bytes:
+
+```bash
+sudo find /var/drop/data/webapps -type f -empty -not -path '*/node_modules/*'
+```
+
+**A running app is not evidence of a clean tree.** Extraction lands files over
+the live app directory *before* the build is published, so when the truncation
+breaks the build the corrupted tree is already on disk while the previously
+built process keeps serving. A prebuilt static app is served as-is with no
+install or build at all, so nothing there ever fails — a truncated asset is
+simply served.
+
+### Fixed
+
+- **Uploaded files could land truncated, with the deploy reported as
+  successful.** `extractTarball` attached a byte-counting `entry.on('data')`
+  listener and then called `entry.pipe(ws)`. Attaching a `'data'` handler is
+  what puts the stream into flowing mode, so the entry began emitting before
+  `pipe()` had wired up the write stream, and every chunk in that window was
+  counted and then dropped. The file landed missing a whole number of leading
+  512-byte tar blocks. Nothing detected it: no warning, no error, and both
+  `fileCount` and `bytesWritten` looked correct, because the byte count had
+  counted precisely the bytes that never reached disk.
+
+  Observed on a real 164-file upload: **12 files truncated by 512-10240 bytes,
+  including a 2044-byte file written as 0 bytes.** The damage surfaces much
+  later and points the wrong way — the build fails inside the uploaded
+  application's own source with a parse error like `Unexpected "}"` on a file
+  that now starts mid-token, naming a different file on each deploy. It reads
+  as a bug in the customer's code.
+
+  Byte accounting now sits inside the pipeline as a `Transform`
+  (`entry.pipe(counter).pipe(ws)`) rather than on a side listener. Swapping the
+  two statements is not sufficient and was rejected: it fixes content integrity
+  but then under-counts, because the chunks `pipe()` consumes never reach a
+  listener attached afterwards (measured ~7% low on the test archive), and
+  `maxUncompressedBytes` is the decompression-bomb control — under-counting
+  silently raises the real ceiling.
+
+  Affects both upload entry points: `POST /api/v1/apps/:name/source` and the
+  MCP `deploy_files` tool. Present since the upload deploy path first shipped
+  (PRD-039), so no released version carries the fix.
+
+- **The dashboard's app list no longer blanks itself on every poll.** The
+  polling hooks re-raised `loading` on each interval and the apps page gates
+  its empty state on `!loading`, so a refresh cleared the list before repainting
+  it — which read as "slow to load" at first paint and "refresh deletes
+  everything" five seconds later. Both were the same bug.
+
 ## [1.2.1] - 2026-08-11
 
 One security fix, and a correction to the note published with 1.2.0.
