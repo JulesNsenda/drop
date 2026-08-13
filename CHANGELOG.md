@@ -27,6 +27,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.2] - 2026-08-13
+
 One data-loss fix on the upload deploy path, and a dashboard fix.
 
 **If you have ever deployed by upload, re-upload those apps after upgrading.**
