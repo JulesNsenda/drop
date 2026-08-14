@@ -2676,10 +2676,28 @@ backup:
   /**
    * Provision (or fetch the existing) managed-Redis env vars for an app.
    * Idempotent and fail-soft: returns {} when Redis is unavailable, the app
-   * doesn't need it, or the user's quota is exceeded. Shared by the first-deploy
-   * start path and the hot-reload/restart path (which just re-fetches the
-   * existing allocation). The app-facing host is the container-reachable
-   * `drop-host` alias under docker isolation, loopback otherwise.
+   * doesn't need it, or the user's quota is exceeded. The app-facing host is
+   * the container-reachable `drop-host` alias under docker isolation, loopback
+   * otherwise.
+   *
+   * **This ALLOCATES on the restart path, and that is the one asymmetry to
+   * know about here.** It is shared by the first-deploy start path and the
+   * hot-reload/restart path (`buildFreshStartSpec`), and it does not care
+   * which one is calling: an app with no existing allocation runs the full
+   * `appNeedsRedis` -> quota -> `provisionAppRedis` sequence either way. So an
+   * app that becomes Redis-shaped gets Redis on a plain `restart`.
+   *
+   * Postgres does the opposite. `buildFreshStartSpec` only ever re-reads an
+   * existing database allocation, so an app that newly needs a *database*
+   * needs a redeploy, not a restart (see `handleStartApp`, the sole caller of
+   * the provisioning branch). The two services genuinely differ; this comment
+   * used to claim the restart path "just re-fetches the existing allocation",
+   * which is true of Postgres and false of Redis.
+   *
+   * Whether allocate-on-restart is *desirable* has never been decided — it is
+   * recorded as an open question in the backing-service plan. It is pinned by
+   * a test asserting allocation actually occurs, so a future change to it is
+   * deliberate rather than accidental.
    */
   private async provisionRedisEnvVars(
     appName: string,
@@ -4956,10 +4974,17 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
 
   /**
    * Rebuild the start spec for an app the platform already knows about: port
-   * resolution, the persistent data dir, and env vars for an
-   * already-provisioned database (no new provisioning here — that only
-   * happens on a fresh deploy, see handleStartApp). Shared by handleAppUpdate
-   * (hot-reload) and restartApp so the two paths can't drift apart.
+   * resolution, the persistent data dir, and service env vars. Shared by
+   * handleAppUpdate (hot-reload) and restartApp so the two paths can't drift
+   * apart.
+   *
+   * Provisioning here is NOT uniform across services, despite what this
+   * comment used to say ("no new provisioning here — that only happens on a
+   * fresh deploy"). That holds for the **database**: this path only re-reads
+   * an already-provisioned one, so an app that newly needs a database needs a
+   * redeploy rather than a restart. It is **false for Redis**:
+   * `provisionRedisEnvVars` below allocates when there is no existing
+   * allocation, on this path as much as on the deploy path.
    *
    * State writes, health-prober (re)arming, and appDeployTimes bookkeeping
    * are NOT done here — they stay with the caller, which knows whether this
@@ -4997,8 +5022,9 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       ) || {};
     }
 
-    // Re-fetch the existing Redis allocation (idempotent; no new provisioning
-    // on a hot-reload of an already-running app).
+    // Redis: re-fetches an existing allocation, and ALLOCATES a new one if
+    // there isn't one — unlike the database lines above, which only re-read.
+    // See provisionRedisEnvVars' own comment for why the two differ.
     const redisEnvVars = await this.provisionRedisEnvVars(appName, appPath);
 
     const spec = await this.buildStartSpec(
