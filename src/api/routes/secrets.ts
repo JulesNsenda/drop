@@ -11,11 +11,17 @@ import { NotFoundError, ValidationError } from '../middleware/error';
 import { isValidAppName } from '../middleware/validate';
 import { canAccess } from '../access';
 import { getStateManager } from '../../managers/app/state-manager';
+import { getDatabaseProvisioner } from '../../managers/database';
 import type { AuthContext } from '../middleware/auth';
 
 // Keys that platform controls and must never be overridden by user secrets.
+// DATABASE_URL is deliberately NOT here: an app with no DROP-provisioned
+// database is free to hold its own (Supabase/Neon/RDS/external MySQL) as an
+// encrypted secret — see the contextual check in the PUT handler below. The
+// defence against a tenant hijacking an injected DATABASE_URL is precedence
+// (`dbEnvVars` spread last in platform.ts's start env), not this set.
 const RESERVED_KEYS = new Set([
-  'PORT', 'DROP_DATA_DIR', 'DATABASE_URL', 'NODE_ENV',
+  'PORT', 'DROP_DATA_DIR', 'NODE_ENV',
   'PGHOST', 'PGPORT', 'PGUSER', 'PGPASSWORD', 'PGDATABASE',
 ]);
 
@@ -72,6 +78,20 @@ secrets.put('/:name', async (c) => {
   // Deny reserved platform keys
   if (RESERVED_KEYS.has(body.key.toUpperCase())) {
     throw new ValidationError(`'${body.key}' is a reserved platform key and cannot be stored as a secret`);
+  }
+
+  // DATABASE_URL is refused CONTEXTUALLY, not unconditionally: an app that
+  // already has a DROP-provisioned database still cannot be repointed by a
+  // secret (dbEnvVars is spread last and would override it either way), so
+  // storing one here would be silently ineffective. There is no way to
+  // deprovision a database without deleting the whole app, so the message
+  // must not suggest that as a next step. Fails OPEN if the provisioner is
+  // unavailable (e.g. auth-disabled/test paths where the DB layer never
+  // booted) — the precedence still protects a provisioned app either way.
+  if (body.key.toUpperCase() === 'DATABASE_URL' && getDatabaseProvisioner()?.isProvisioned(r.name)) {
+    throw new ValidationError(
+      `'${r.name}' already has a DROP-managed database; its DATABASE_URL is platform-owned and would override this secret`
+    );
   }
 
   // Cap value size

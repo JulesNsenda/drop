@@ -280,6 +280,39 @@ describe('Drop YAML Parser', () => {
       expect(invalid.valid).toBe(false);
     });
 
+    // DROP-150 / B1: neither the SHAPE of a depends_on[].env nor its collision
+    // with a platform-injected name is judged here, and that is deliberate —
+    // both refusals live in platform.ts's resolveDependencies, where a bad
+    // entry is skipped on its own. Failing validation here would discard the
+    // WHOLE manifest (B2's bug): breaking for an already-deployed
+    // `env: API-URL`, and fail-OPEN, since a discarded config leaves
+    // `declaredSecrets` undefined and the required-secret preflight then finds
+    // nothing missing. These pin the parser staying permissive so a later
+    // "tighten it at parse time" cannot quietly reintroduce that.
+    it('accepts a depends_on[].env that is not a valid environment variable name — platform.ts skips it', () => {
+      const result = validateDropYamlConfig({
+        depends_on: [{ name: 'api', env: 'API-URL' }],
+      });
+      expect(result.valid).toBe(true);
+    });
+
+    it('accepts a depends_on[].env naming a platform-reserved var — platform.ts refuses the collision separately', () => {
+      const result = validateDropYamlConfig({
+        depends_on: [{ name: 'api', env: 'DROP_API_URL' }],
+      });
+      expect(result.valid).toBe(true);
+    });
+
+    it('keeps the rest of the manifest when a per-service depends_on[].env is malformed', () => {
+      const result = validateDropYamlConfig({
+        secrets: { JWT_SECRET: 'generate' },
+        services: { backend: { path: 'backend', depends_on: [{ name: 'db', env: 'bad name' }] } },
+      });
+      // The whole point: `secrets` must survive, or the preflight gate that
+      // depends on it silently stops firing.
+      expect(result.valid).toBe(true);
+    });
+
     it('should accept build_env with string, number, and boolean values', () => {
       const result = validateDropYamlConfig({
         build_env: {
@@ -441,6 +474,74 @@ describe('Drop YAML Parser', () => {
       });
       expect(result.valid).toBe(false);
       expect(result.error).toContain('services.backend.secrets.A.generate');
+    });
+  });
+
+  // DROP-150 / B2: `database` used to sit in the string-only field loop, so
+  // `database: true` failed validation and parseDropYaml discarded the WHOLE
+  // config — not just `database` — even though detector.types.ts's
+  // DatabaseType and platform.ts's own provisioning check (`=== true`) both
+  // treat `true` as valid.
+  describe('validateDropYamlConfig - database (DROP-150 / B2)', () => {
+    it('accepts database: true, matching DatabaseType', () => {
+      expect(validateDropYamlConfig({ database: true }).valid).toBe(true);
+    });
+
+    it('accepts database: false', () => {
+      expect(validateDropYamlConfig({ database: false }).valid).toBe(true);
+    });
+
+    it('still accepts a string database value', () => {
+      expect(validateDropYamlConfig({ database: 'postgres' }).valid).toBe(true);
+      expect(validateDropYamlConfig({ database: 'sqlite' }).valid).toBe(true);
+    });
+
+    it('rejects a database value that is neither a string nor a boolean', () => {
+      const result = validateDropYamlConfig({ database: { nested: true } });
+      expect(result.valid).toBe(false);
+      expect(result.error).toContain('database');
+    });
+
+    it('accepts database: true on a per-service entry, consistent with the top-level rule', () => {
+      const result = validateDropYamlConfig({
+        services: { backend: { path: 'backend', database: true } },
+      });
+      expect(result.valid).toBe(true);
+    });
+
+    it('rejects a non-string/non-boolean per-service database value', () => {
+      const result = validateDropYamlConfig({
+        services: { backend: { path: 'backend', database: { nested: true } } },
+      });
+      expect(result.valid).toBe(false);
+      expect(result.error).toContain('services.backend.database');
+    });
+
+    // The actual bug: prove env/secrets/services SURVIVE alongside
+    // `database: true` through the real parseDropYaml round-trip — a test
+    // that only checked `success: true` would pass without proving anything,
+    // since the pre-fix parser discarded exactly those three fields.
+    it('preserves env, secrets and services alongside database: true through parseDropYaml', async () => {
+      await fs.writeFile(
+        path.join(tmpDir, 'drop.yaml'),
+        [
+          'database: true',
+          'env:',
+          '  FOO: bar',
+          'secrets:',
+          '  JWT_SECRET: generate',
+          'services:',
+          '  backend:',
+          '    path: backend',
+        ].join('\n')
+      );
+
+      const result = await parseDropYaml(tmpDir);
+      expect(result.success).toBe(true);
+      expect(result.config?.database).toBe(true);
+      expect(result.config?.env).toEqual({ FOO: 'bar' });
+      expect(result.config?.secrets).toEqual({ JWT_SECRET: 'generate' });
+      expect(result.config?.services?.backend?.path).toBe('backend');
     });
   });
 

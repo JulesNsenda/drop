@@ -365,6 +365,45 @@ describe('DropPlatform.restartApp', () => {
     expect(spec.env!.DROP_DATA_DIR).toBe(path.join(tempDir, 'data', 'appdata', 'site'));
   }, 20000);
 
+  // DROP-150 / B3: DATABASE_URL is no longer unconditionally reserved — an app
+  // with no DROP-provisioned database may hold its own (external) DATABASE_URL
+  // as a secret. buildFreshStartSpec (the restart path) re-fetches dbEnvVars
+  // from the provisioner on every restart, independent of the initial deploy;
+  // this pins that an app the provisioner reports as NOT provisioned still
+  // gets its own secret in the restart env, not a silently dropped one.
+  it('preserves an external DATABASE_URL secret on restart when the app has no DROP-provisioned database', async () => {
+    platform = makePlatform();
+    await platform.start();
+
+    const secretManager = (platform as unknown as { secretManager: { set: Function } }).secretManager;
+    await secretManager.set('site', 'DATABASE_URL', 'postgresql://user:pw@external-host/db');
+
+    const appPath = await createStaticApp('site');
+    // The secret is set before deploy, so appNeedsDatabase() reports the app
+    // already has its own DATABASE_URL and skips provisioning — dbProvisioner
+    // .getEnvVars is never called on this path (see platform.database-detection
+    // .test.ts). Restart is different: buildFreshStartSpec calls getEnvVars
+    // unconditionally, so override it ONCE, for the restart call below, to
+    // model what an unprovisioned app's provisioner actually returns (null).
+    // The shared mock (top of file) otherwise always returns a DATABASE_URL,
+    // modelling an app that DOES have a DROP-provisioned database.
+    await deploy('site', appPath);
+    const getEnvVars = (platform as any).dbProvisioner.getEnvVars as jest.Mock;
+    getEnvVars.mockClear();
+    getEnvVars.mockReturnValueOnce(null);
+
+    const startSpy = jest.spyOn(fakeRuntime, 'start');
+    await platform!.restartApp('site');
+
+    // mockReturnValueOnce only models "unprovisioned" if the restart makes
+    // exactly one call — a second would fall through to the shared mock's
+    // DATABASE_URL and the assertion below would pass for the wrong reason.
+    expect(getEnvVars).toHaveBeenCalledTimes(1);
+
+    const spec = startSpy.mock.calls[startSpy.mock.calls.length - 1][0];
+    expect(spec.env!.DATABASE_URL).toBe('postgresql://user:pw@external-host/db');
+  }, 20000);
+
   it('includes DROP_API_URL in the restart spec env (re-injected via buildFreshStartSpec -> buildStartSpec)', async () => {
     platform = makePlatform({ isolation: 'none', apiPort: 4114 });
     await platform.start();
@@ -373,6 +412,64 @@ describe('DropPlatform.restartApp', () => {
 
     const startSpy = jest.spyOn(fakeRuntime, 'start');
     await platform!.restartApp('site');
+
+    const spec = startSpy.mock.calls[startSpy.mock.calls.length - 1][0];
+    expect(spec.env!.DROP_API_URL).toBe('http://127.0.0.1:4114');
+  }, 20000);
+
+  // ── depends_on cannot hijack a reserved var (DROP-150 / B1) ────────────────
+  //
+  // depEnvVars (resolveDependencies' output) is spread LAST in the ASSEMBLED
+  // start env — after DROP_API_URL, DROP_API_KEY, dbEnvVars, redisEnvVars —
+  // so before this fix a drop.yaml `depends_on: [{name: <registered app>,
+  // env: DATABASE_URL}]` silently redirected the tenant's real database URL
+  // (or DROP's own scoped API URL) to wherever that dependency resolves.
+  // These assert on the real `spec.env` FakeRuntime.start() is handed, not on
+  // resolveDependencies' own return value (see platform.test.ts for the
+  // mechanism-level check across every reserved var).
+
+  it('preserves the injected DATABASE_URL when a depends_on entry claims it', async () => {
+    platform = makePlatform();
+    await platform.start();
+
+    const depPath = await createStaticApp('dep-app');
+    await deploy('dep-app', depPath);
+
+    const appPath = await createStaticApp('site');
+    await deploy('site', appPath);
+    // Written AFTER the initial deploy, same reasoning as the secrets tests
+    // above: a hostile depends_on trying to claim DATABASE_URL.
+    await fs.writeFile(
+      path.join(appPath, 'drop.yaml'),
+      'type: static\ndepends_on:\n  - name: dep-app\n    env: DATABASE_URL\n'
+    );
+
+    const startSpy = jest.spyOn(fakeRuntime, 'start');
+    const result = await platform!.restartApp('site');
+    // The collision is REFUSED, not fatal — the deploy still succeeds.
+    expect(result.status).toBe('running');
+
+    const spec = startSpy.mock.calls[startSpy.mock.calls.length - 1][0];
+    expect(spec.env!.DATABASE_URL).toBe('postgresql://mock-db/app');
+  }, 20000);
+
+  it('preserves the injected DROP_API_URL when a depends_on entry claims it', async () => {
+    platform = makePlatform({ isolation: 'none', apiPort: 4114 });
+    await platform.start();
+
+    const depPath = await createStaticApp('dep-app');
+    await deploy('dep-app', depPath);
+
+    const appPath = await createStaticApp('site');
+    await deploy('site', appPath);
+    await fs.writeFile(
+      path.join(appPath, 'drop.yaml'),
+      'type: static\ndepends_on:\n  - name: dep-app\n    env: DROP_API_URL\n'
+    );
+
+    const startSpy = jest.spyOn(fakeRuntime, 'start');
+    const result = await platform!.restartApp('site');
+    expect(result.status).toBe('running');
 
     const spec = startSpy.mock.calls[startSpy.mock.calls.length - 1][0];
     expect(spec.env!.DROP_API_URL).toBe('http://127.0.0.1:4114');

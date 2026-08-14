@@ -139,6 +139,35 @@ describe('appNeedsDatabase', () => {
     });
   });
 
+  // DROP-150 / B2 pins the CURRENT semantics of `database: false`, which are
+  // "no opinion", not "no database". The validator now accepts the boolean —
+  // that was the fix, since `database: true` used to fail validation and take
+  // the whole manifest (env, secrets, services) with it — but `false` still
+  // falls through to inference exactly as before.
+  //
+  // Making `false` an opt-out was written and then deliberately backed out:
+  // `appNeedsDatabase` runs only on the deploy path (buildFreshStartSpec
+  // re-reads the provisioner unconditionally), so an opt-out here makes deploy
+  // and restart disagree; and an app that already has a provisioned database
+  // cannot hand it back short of being deleted, so `false` would strand live
+  // data that still counts against the user's quota. These tests exist to make
+  // that a decision someone changes on purpose rather than a gap.
+  describe('database: false is not (yet) an opt-out (DROP-150 / B2)', () => {
+    it('does not overrule a postgres client in dependencies', async () => {
+      await writePackageJson({ name: 'todo-app', dependencies: { pg: '^8.11.5' } });
+      await expect(needsDb(false)).resolves.toBe(true);
+    });
+
+    it('does not overrule an ORM config file on disk', async () => {
+      await fs.writeFile(path.join(appPath, 'knexfile.js'), '', 'utf-8');
+      await expect(needsDb(false)).resolves.toBe(true);
+    });
+
+    it('still provisions nothing when there is no signal at all', async () => {
+      await expect(needsDb(false)).resolves.toBe(false);
+    });
+  });
+
   describe('a DATABASE_URL in the drop.yaml env: block', () => {
     const writeDropYaml = (body: string): Promise<void> =>
       fs.writeFile(path.join(appPath, 'drop.yaml'), body, 'utf-8');
