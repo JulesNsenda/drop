@@ -144,8 +144,12 @@ export interface ServiceConfig {
   build_env?: AppEnvConfig;
   /** Declared required secrets for this service (see DropYamlConfig.secrets) */
   secrets?: AppSecretsConfig;
-  /** Provision a database for this service only (e.g. "postgres") */
-  database?: string;
+  /**
+   * Provision a database for this service only. A string ("postgres" /
+   * "sqlite") or `true` — matching `DatabaseType` in detector.types.ts, which
+   * is what platform.ts's provisioning check (`=== true`) actually acts on.
+   */
+  database?: string | boolean;
   /** Provision managed Redis (per-app logical DB + injected REDIS_URL) for this service. */
   redis?: boolean;
   /** Health check path */
@@ -172,10 +176,13 @@ export interface DropYamlConfig {
    */
   type?: string;
   /**
-   * Database requirement (e.g. "postgres"). Accepted at the top level for the
-   * same reason as `type`; drives per-app DB provisioning via the detector.
+   * Database requirement. A string ("postgres" / "sqlite") or `true` —
+   * matching `DatabaseType` in detector.types.ts, which is what
+   * platform.ts's provisioning check (`=== true`) actually acts on. Accepted
+   * at the top level for the same reason as `type`; drives per-app DB
+   * provisioning via the detector.
    */
-  database?: string;
+  database?: string | boolean;
   /** Provision managed Redis (per-app logical DB + injected REDIS_URL). */
   redis?: boolean;
   /** Custom domains for this app */
@@ -582,10 +589,19 @@ export function validateDropYamlConfig(
   }
 
   // Validate string fields
-  for (const field of ['name', 'type', 'database', 'build', 'start', 'healthCheck', 'maxBodySize'] as const) {
+  for (const field of ['name', 'type', 'build', 'start', 'healthCheck', 'maxBodySize'] as const) {
     if (cfg[field] !== undefined && typeof cfg[field] !== 'string') {
       return { valid: false, error: `${field} must be a string` };
     }
+  }
+
+  // database is `string | boolean` (DatabaseType, detector.types.ts), not
+  // string-only — it used to sit in the loop above, so `database: true`
+  // failed validation and parseDropYaml discarded the WHOLE config (env,
+  // secrets, services included, per the warnParseFailure text above) even
+  // though platform.ts's own provisioning check acts on `=== true`.
+  if (cfg.database !== undefined && typeof cfg.database !== 'string' && typeof cfg.database !== 'boolean') {
+    return { valid: false, error: 'database must be a string or boolean' };
   }
 
   // Validate boolean fields
@@ -805,6 +821,19 @@ function validateDependsOn(
     if (typeof d.env !== 'string' || !d.env) {
       return { valid: false, error: `${label}[].env must be a non-empty string` };
     }
+    // NOTE: `d.env`'s *shape* is deliberately NOT validated here, even though
+    // `secrets.<NAME>` is (SECRET_NAME_REGEX, validateSecretsObject above).
+    // Failing validation here discards the ENTIRE manifest — build, start,
+    // domains, env, secrets, services, the lot (see warnParseFailure) — which
+    // is B2's exact bug. `secrets:` can afford that because a malformed secret
+    // name was never accepted; `depends_on[].env` was, so tightening it here
+    // would break already-deployed manifests (`env: API-URL`) and, worse, do
+    // it fail-OPEN: a discarded config means `declaredSecrets` is undefined,
+    // so the required-secret preflight finds nothing missing and the app
+    // starts WITHOUT the secrets it declared instead of parking in
+    // `needs-config`. The shape check lives in platform.ts's
+    // `resolveDependencies` instead, where a bad entry is skipped on its own
+    // and the rest of the manifest survives.
     if (d.path !== undefined && typeof d.path !== 'string') {
       return { valid: false, error: `${label}[].path must be a string` };
     }
@@ -911,10 +940,17 @@ function validateServiceConfig(
   if (!pathResult.valid) return pathResult;
 
   // Optional string fields
-  for (const field of ['type', 'build', 'start', 'healthCheck', 'database'] as const) {
+  for (const field of ['type', 'build', 'start', 'healthCheck'] as const) {
     if (svc[field] !== undefined && typeof svc[field] !== 'string') {
       return { valid: false, error: `services.${name}.${field} must be a string` };
     }
+  }
+
+  // database is `string | boolean` (DatabaseType) — same rule as the
+  // top-level field above, kept consistent so a child service can also
+  // declare `database: true`.
+  if (svc.database !== undefined && typeof svc.database !== 'string' && typeof svc.database !== 'boolean') {
+    return { valid: false, error: `services.${name}.database must be a string or boolean` };
   }
 
   // Optional boolean fields

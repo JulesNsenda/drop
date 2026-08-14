@@ -13,6 +13,7 @@ import { createUser, resetAuth } from '../middleware/auth';
 import { getTestToken } from '../__testutils__/auth';
 import { getStateManager, resetStateManager } from '../../managers/app/state-manager';
 import { getSecretManager, resetSecretManager } from '../../managers/secret';
+import * as databaseModule from '../../managers/database';
 
 describe('secrets route authorization', () => {
   let tempDir: string;
@@ -157,13 +158,41 @@ describe('secrets route authorization', () => {
     expect(res.status).toBe(400);
   });
 
-  it('returns 400 when setting a reserved platform key (DATABASE_URL)', async () => {
+  // --- DATABASE_URL: contextual, not unconditional (DROP-150 / B3) ---
+  //
+  // DATABASE_URL is no longer in the unconditional RESERVED_KEYS denylist:
+  // it is the only encrypted route to point an app at an external database
+  // (Supabase/Neon/RDS). It is refused only when the app already has a
+  // DROP-provisioned database, since the platform-injected value would
+  // override the secret anyway (dbEnvVars is spread last in the start env).
+
+  it('allows setting DATABASE_URL for an app with no DROP-provisioned database', async () => {
+    // No DatabaseProvisioner is initialized in this suite, so
+    // getDatabaseProvisioner() returns null and the app-level check for a
+    // provisioned database can't run — this exercises that fail-open path.
+    const res = await app.request('/api/v1/secrets/alice-app', {
+      method: 'PUT',
+      headers: { ...bearer(aliceToken), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ key: 'DATABASE_URL', value: 'postgres://external-host/db' }),
+    });
+    expect(res.status).toBe(200);
+  });
+
+  it('refuses setting DATABASE_URL for an app that already has a DROP-provisioned database', async () => {
+    jest.spyOn(databaseModule, 'getDatabaseProvisioner').mockReturnValue({
+      isProvisioned: jest.fn().mockReturnValue(true),
+    } as unknown as databaseModule.DatabaseProvisioner);
+
     const res = await app.request('/api/v1/secrets/alice-app', {
       method: 'PUT',
       headers: { ...bearer(aliceToken), 'Content-Type': 'application/json' },
       body: JSON.stringify({ key: 'DATABASE_URL', value: 'postgres://evil/db' }),
     });
     expect(res.status).toBe(400);
+    const json = (await res.json()) as { error: { message: string } };
+    // Must not claim a deprovision action that doesn't exist.
+    expect(json.error.message).not.toMatch(/delete/i);
+    expect(json.error.message).toMatch(/DROP-managed database/i);
   });
 
   it('returns 400 when setting a reserved platform key (PORT)', async () => {
