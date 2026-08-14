@@ -821,22 +821,19 @@ function validateDependsOn(
     if (typeof d.env !== 'string' || !d.env) {
       return { valid: false, error: `${label}[].env must be a non-empty string` };
     }
-    // depends_on[].env names the env var DROP injects a resolved dependency
-    // URL into (platform.ts) — it was previously only checked for being a
-    // non-empty string, the same gap secrets.<NAME> had (see
-    // validateSecretsObject above) before SECRET_NAME_REGEX closed it there.
-    // drop.yaml is attacker-authored on the deploy_from_git path, so an
-    // unconstrained env name is a direct injection path; the platform-side
-    // reserved-name refusal (platform.ts's depEnvVars assembly) is a separate,
-    // independent check on top of this shape check.
-    if (!SECRET_NAME_REGEX.test(d.env)) {
-      return {
-        valid: false,
-        error:
-          `Invalid ${label}[].env '${d.env.slice(0, 40)}': must be a valid environment ` +
-          `variable name (letters, digits, underscore; not starting with a digit; max 64 chars)`,
-      };
-    }
+    // NOTE: `d.env`'s *shape* is deliberately NOT validated here, even though
+    // `secrets.<NAME>` is (SECRET_NAME_REGEX, validateSecretsObject above).
+    // Failing validation here discards the ENTIRE manifest — build, start,
+    // domains, env, secrets, services, the lot (see warnParseFailure) — which
+    // is B2's exact bug. `secrets:` can afford that because a malformed secret
+    // name was never accepted; `depends_on[].env` was, so tightening it here
+    // would break already-deployed manifests (`env: API-URL`) and, worse, do
+    // it fail-OPEN: a discarded config means `declaredSecrets` is undefined,
+    // so the required-secret preflight finds nothing missing and the app
+    // starts WITHOUT the secrets it declared instead of parking in
+    // `needs-config`. The shape check lives in platform.ts's
+    // `resolveDependencies` instead, where a bad entry is skipped on its own
+    // and the rest of the manifest survives.
     if (d.path !== undefined && typeof d.path !== 'string') {
       return { valid: false, error: `${label}[].path must be a string` };
     }

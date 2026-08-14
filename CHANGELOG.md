@@ -38,9 +38,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   deploying a third-party repository, where the manifest author and the app
   owner are not the same person. Reserved names are now refused: the
   collision is logged and that one injection is skipped, so an unrelated
-  hijack attempt cannot fail an otherwise valid deploy. `depends_on[].env`
-  must also now be a syntactically valid environment variable name, the same
-  constraint `secrets:` has always had.
+  hijack attempt cannot fail an otherwise valid deploy. A `depends_on[].env`
+  that is not a usable environment variable name is skipped the same way —
+  deliberately skipped rather than rejected during parsing, because a failed
+  `drop.yaml` validation discards the entire manifest, which would both break
+  already-deployed entries and disable the required-secret preflight that
+  depends on the discarded `secrets:` block.
 
 ### Added
 
@@ -50,6 +53,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tenant's own `drop.yaml` as the only way to point an app at one. It is now
   refused only when the app already has a DROP-managed database, whose
   injected URL takes precedence over any secret and would override it anyway.
+  `PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD` and `PGDATABASE` stay reserved,
+  alongside `PORT`, `NODE_ENV` and `DROP_DATA_DIR`.
 
 ### Fixed
 

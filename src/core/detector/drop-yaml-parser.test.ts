@@ -280,35 +280,37 @@ describe('Drop YAML Parser', () => {
       expect(invalid.valid).toBe(false);
     });
 
-    // DROP-150 / B1: depends_on[].env previously accepted ANY non-empty
-    // string, so a drop.yaml could name a platform-injected var (DROP_API_URL,
-    // DATABASE_URL, ...) and rely on the start env's spread order to override
-    // it. This is the SHAPE half of the fix, mirroring secrets.<NAME>'s
-    // SECRET_NAME_REGEX above. The reserved-name refusal itself lives in
-    // platform.ts's depEnvVars assembly (not here): rejecting at parse time
-    // would discard the whole config (env/secrets/services too — DROP-150 /
-    // B2's exact failure mode).
-    it('rejects a depends_on[].env that is not a valid environment variable name', () => {
+    // DROP-150 / B1: neither the SHAPE of a depends_on[].env nor its collision
+    // with a platform-injected name is judged here, and that is deliberate —
+    // both refusals live in platform.ts's resolveDependencies, where a bad
+    // entry is skipped on its own. Failing validation here would discard the
+    // WHOLE manifest (B2's bug): breaking for an already-deployed
+    // `env: API-URL`, and fail-OPEN, since a discarded config leaves
+    // `declaredSecrets` undefined and the required-secret preflight then finds
+    // nothing missing. These pin the parser staying permissive so a later
+    // "tighten it at parse time" cannot quietly reintroduce that.
+    it('accepts a depends_on[].env that is not a valid environment variable name — platform.ts skips it', () => {
       const result = validateDropYamlConfig({
-        depends_on: [{ name: 'api', env: 'not a var name' }],
+        depends_on: [{ name: 'api', env: 'API-URL' }],
       });
-      expect(result.valid).toBe(false);
-      expect(result.error).toContain('environment variable name');
+      expect(result.valid).toBe(true);
     });
 
-    it('still accepts a depends_on[].env naming a platform-reserved var at the shape level — platform.ts refuses the collision separately', () => {
+    it('accepts a depends_on[].env naming a platform-reserved var — platform.ts refuses the collision separately', () => {
       const result = validateDropYamlConfig({
         depends_on: [{ name: 'api', env: 'DROP_API_URL' }],
       });
       expect(result.valid).toBe(true);
     });
 
-    it('applies the same depends_on[].env rule to per-service depends_on', () => {
+    it('keeps the rest of the manifest when a per-service depends_on[].env is malformed', () => {
       const result = validateDropYamlConfig({
+        secrets: { JWT_SECRET: 'generate' },
         services: { backend: { path: 'backend', depends_on: [{ name: 'db', env: 'bad name' }] } },
       });
-      expect(result.valid).toBe(false);
-      expect(result.error).toContain('environment variable name');
+      // The whole point: `secrets` must survive, or the preflight gate that
+      // depends on it silently stops firing.
+      expect(result.valid).toBe(true);
     });
 
     it('should accept build_env with string, number, and boolean values', () => {

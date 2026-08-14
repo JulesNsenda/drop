@@ -22,9 +22,8 @@
  * `depends_on` injects the URL of another DROP app, so a manifest naming
  * `env: DATABASE_URL` or `env: DB_HOST` would have received an `http://…` URL
  * where a DSN or a hostname belongs — already broken before it was refused.
- * Unconditional also keeps the build path (`resolveBuildEnv`, which assembles
- * no platform vars at all and feeds `generateStaticConfig`'s browser-served
- * config file) behaving identically to the start path.
+ * Unconditional also keeps the build path (`resolveBuildEnv`) behaving
+ * identically to the start path, since both share `resolveDependencies`.
  *
  * This is the canonical list for that check. `src/api/routes/secrets.ts`'s
  * own `RESERVED_KEYS` is a DELIBERATE SUBSET, not a copy of this one — it
@@ -54,7 +53,31 @@ export const RESERVED_ENV_VARS: readonly string[] = [
   'DB_USER',
   'DB_PASSWORD',
   'REDIS_URL',
+  'REDIS_DB',
 ];
 
 /** Set form of {@link RESERVED_ENV_VARS} for O(1) membership checks. */
 export const RESERVED_ENV_VAR_SET: ReadonlySet<string> = new Set(RESERVED_ENV_VARS);
+
+/**
+ * A syntactically usable environment variable name. Mirrors the parser's
+ * `SECRET_NAME_REGEX`, deliberately duplicated rather than exported from
+ * `drop-yaml-parser.ts` so this module stays free of detector imports.
+ *
+ * This is a *shape* check, not an authorization one — its job is to stop a
+ * tenant-authored name from carrying characters that break the env encoding
+ * downstream. A container's env is assembled as `${k}=${v}`
+ * (`container-manager.ts`), so a name containing `=` or a newline would
+ * forge an extra variable rather than merely being odd.
+ *
+ * It lives here, and is applied in `resolveDependencies`, rather than in the
+ * parser: a parse-time rejection discards the whole manifest, which is both
+ * a breaking change for already-deployed `depends_on` entries and fail-open
+ * on the required-secret gate. See the note in `validateDependsOn`.
+ */
+const ENV_VAR_NAME_REGEX = /^[A-Za-z_][A-Za-z0-9_]{0,63}$/;
+
+/** True if `name` is usable as an environment variable name. */
+export function isValidEnvVarName(name: string): boolean {
+  return ENV_VAR_NAME_REGEX.test(name);
+}

@@ -11,7 +11,7 @@ import * as yaml from 'yaml';
 import * as crypto from 'crypto';
 import { EventBus, eventBus, Unsubscribe, AppDeletedPayload, AppDetectedPayload } from './event-bus';
 import { isReservedHost } from '../utils/reserved-hosts';
-import { RESERVED_ENV_VAR_SET } from '../utils/reserved-env-vars';
+import { RESERVED_ENV_VAR_SET, isValidEnvVarName } from '../utils/reserved-env-vars';
 import { getPublicUrl } from '../api/runtime-config';
 import type { DeployFailureReason } from './event-bus/event-bus.types';
 import { WatcherService } from './watcher';
@@ -2759,6 +2759,21 @@ backup:
         this.logger.warn(
           `${appName}: depends_on '${dep.name}' claims reserved env var '${dep.env}' — ` +
             `refusing to override the platform-injected value`,
+          'DEPS'
+        );
+        continue;
+      }
+
+      // Shape check, deliberately here and not in the parser: rejecting a
+      // malformed name at parse time discards the WHOLE manifest (B2's bug),
+      // which would break already-deployed entries like `env: API-URL` and
+      // fail OPEN on the required-secret gate. Skipping the one entry keeps
+      // the rest of the config — and the preflight — intact.
+      if (!isValidEnvVarName(dep.env)) {
+        this.logger.warn(
+          `${appName}: depends_on '${dep.name}' names '${dep.env.slice(0, 40)}', which is not a ` +
+            `valid environment variable name (letters, digits, underscore; not starting with a ` +
+            `digit; max 64 chars) — skipping this injection`,
           'DEPS'
         );
         continue;

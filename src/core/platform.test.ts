@@ -2050,6 +2050,68 @@ describe('resolveBuildEnv / resolveDependencies (M1: build-time env + browser-re
           expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining(varName), 'DEPS');
         }
       );
+
+      // The shape check lives here rather than in the parser precisely so a
+      // malformed name costs one injection instead of the whole manifest.
+      // `API-URL` is the realistic case: it parsed and injected fine before
+      // DROP-150, so a parse-time rejection would break a live app AND leave
+      // `declaredSecrets` undefined, disabling the required-secret preflight.
+      it.each(['API-URL', 'bad name', '2ND_URL', 'FOO=BAR', 'a\nb'])(
+        'skips a depends_on entry whose env name %j is not a usable variable name',
+        async (badName) => {
+          platform = createPlatform({
+            dropRoot: tempDir,
+            appsDirectory: path.join(tempDir, 'apps'),
+            logLevel: 'error',
+          });
+          (platform as any).appConfigService = {
+            getConfig: jest.fn().mockReturnValue({ port: 4005 }),
+          };
+          const warnSpy = jest.spyOn((platform as any).logger, 'warn').mockImplementation(() => undefined);
+
+          dropYamlContent = ['depends_on:', '  - name: backend', `    env: ${JSON.stringify(badName)}`].join('\n');
+
+          const result = await (platform as any).resolveDependencies(
+            path.join(tempDir, 'apps', 'frontend'),
+            'frontend'
+          );
+
+          expect(result[badName]).toBeUndefined();
+          expect(warnSpy).toHaveBeenCalledWith(
+            expect.stringContaining('not a valid environment variable name'),
+            'DEPS'
+          );
+        }
+      );
+
+      it('still injects a well-formed, non-reserved dependency alongside a skipped one', async () => {
+        platform = createPlatform({
+          dropRoot: tempDir,
+          appsDirectory: path.join(tempDir, 'apps'),
+          logLevel: 'error',
+        });
+        (platform as any).appConfigService = {
+          getConfig: jest.fn().mockReturnValue({ port: 4005 }),
+        };
+        jest.spyOn((platform as any).logger, 'warn').mockImplementation(() => undefined);
+
+        dropYamlContent = [
+          'depends_on:',
+          '  - name: backend',
+          '    env: API-URL',
+          '  - name: backend',
+          '    env: GOOD_URL',
+        ].join('\n');
+
+        const result = await (platform as any).resolveDependencies(
+          path.join(tempDir, 'apps', 'frontend'),
+          'frontend'
+        );
+
+        // One bad entry must not take its siblings down with it.
+        expect(result['API-URL']).toBeUndefined();
+        expect(result.GOOD_URL).toBeDefined();
+      });
     });
   });
 });
