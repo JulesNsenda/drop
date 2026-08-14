@@ -16,6 +16,7 @@ import { getDetector, parseDropYaml, DetectionResult } from './detector';
 import * as diskUtils from '../utils/disk';
 import { createApiKey, deleteApiKeysByName } from '../api/middleware/auth';
 import { setPublicUrl } from '../api/runtime-config';
+import { RESERVED_ENV_VARS } from '../utils/reserved-env-vars';
 
 // These are pipeline/service unit tests — they never exercise the HTTP API, so
 // disable it (createPlatform reads DROP_ENABLE_API when no enableApi is passed).
@@ -1515,6 +1516,137 @@ describe('buildStartSpec — DROP_API_URL injection (PR1)', () => {
   });
 });
 
+describe('buildStartSpec — external DATABASE_URL secret survives to the deploy env (DROP-150 / B3)', () => {
+  let platform: DropPlatform;
+  let tempDir: string;
+
+  const detection = {
+    type: 'nodejs',
+    framework: null,
+    suggestedConfig: { startCommand: 'node index.js' },
+  } as any;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    tempDir = path.join(os.tmpdir(), `drop-test-${Date.now()}`);
+  });
+
+  afterEach(async () => {
+    if (platform && platform.isActive()) {
+      await platform.stop();
+    }
+  });
+
+  it('carries a DATABASE_URL secret into the start env when the app has no DROP-provisioned database', async () => {
+    platform = createPlatform({
+      dropRoot: tempDir,
+      logLevel: 'error',
+      apiPort: 4115,
+      isolation: 'none',
+    });
+    await platform.start();
+    (platform as any).secretManager = {
+      hasSecrets: jest.fn().mockReturnValue(true),
+      getAll: jest.fn().mockReturnValue({ DATABASE_URL: 'postgresql://user:pw@external-host/db' }),
+    };
+
+    // dbEnvVars ({}) mirrors what the deploy path passes when appNeedsDatabase()
+    // returned false because the app already supplies its own DATABASE_URL — see
+    // platform.database-detection.test.ts. Spread order (platform.ts:6301-6318)
+    // puts ...secretEnvVars ahead of ...dbEnvVars, so an EMPTY dbEnvVars is what
+    // lets the secret survive; this only proves the spread once dbEnvVars is empty.
+    const spec = await (platform as any).buildStartSpec(
+      'app-external-db',
+      path.join(tempDir, 'app-external-db'),
+      detection,
+      3009,
+      path.join(tempDir, 'data'),
+      {}
+    );
+
+    expect(spec.env.DATABASE_URL).toBe('postgresql://user:pw@external-host/db');
+  });
+});
+
+describe('buildStartSpec — the reserved list covers what it injects (DROP-150 / B1)', () => {
+  let platform: DropPlatform;
+  let tempDir: string;
+
+  const detection = {
+    type: 'nodejs',
+    framework: null,
+    suggestedConfig: { startCommand: 'node index.js' },
+  } as any;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    tempDir = path.join(os.tmpdir(), `drop-test-${Date.now()}`);
+  });
+
+  afterEach(async () => {
+    if (platform && platform.isActive()) {
+      await platform.stop();
+    }
+  });
+
+  // The non-circular half of the reserved-list coverage.
+  //
+  // The `it.each(RESERVED_ENV_VARS)` suite below drives its cases FROM the
+  // list, so it is structurally incapable of noticing a name the list is
+  // MISSING — which is how REDIS_URL and the whole DB_* family were nearly
+  // shipped unprotected (both are written by ...redisEnvVars/...dbEnvVars,
+  // one line above ...depEnvVars). This test derives its expectation from the
+  // real assembled `spec.env` instead: with no drop.yaml, no secrets and no
+  // depends_on, every key in it is platform-injected by definition, so the
+  // reserved list must contain all of them. A future provisioner var (say
+  // DB_SSLMODE) fails here the day it is added, not the day it is exploited.
+  it('reserves every name buildStartSpec injects ahead of depEnvVars', async () => {
+    platform = createPlatform({
+      dropRoot: tempDir,
+      logLevel: 'error',
+      apiPort: 4116,
+      isolation: 'none',
+    });
+    await platform.start();
+    (platform as any).secretManager = { hasSecrets: jest.fn().mockReturnValue(false) };
+
+    // The real shapes, not a sample: DatabaseProvisioner.getEnvVars returns
+    // DATABASE_URL + PG* + DB_*, RedisProvisioner.getEnvVars returns REDIS_URL.
+    const dbEnvVars = {
+      DATABASE_URL: 'postgresql://u:p@127.0.0.1:5433/app',
+      PGHOST: '127.0.0.1',
+      PGPORT: '5433',
+      PGDATABASE: 'app',
+      PGUSER: 'u',
+      PGPASSWORD: 'p',
+      DB_HOST: '127.0.0.1',
+      DB_PORT: '5433',
+      DB_NAME: 'app',
+      DB_USER: 'u',
+      DB_PASSWORD: 'p',
+    };
+    const redisEnvVars = { REDIS_URL: 'redis://:s@127.0.0.1:6380/1' };
+
+    const spec = await (platform as any).buildStartSpec(
+      'app-all-vars',
+      path.join(tempDir, 'app-all-vars'),
+      detection,
+      3010,
+      path.join(tempDir, 'data'),
+      dbEnvVars,
+      redisEnvVars
+    );
+
+    const unreserved = Object.keys(spec.env).filter((k) => !RESERVED_ENV_VARS.includes(k));
+    expect(unreserved).toEqual([]);
+    // Guard the guard: if the spread ever stopped injecting these, the filter
+    // above would be trivially satisfied by an almost-empty env.
+    expect(Object.keys(spec.env).length).toBeGreaterThanOrEqual(
+      Object.keys(dbEnvVars).length + Object.keys(redisEnvVars).length
+    );
+  });
+});
+
 describe('buildStartSpec — DROP_API_KEY provisioning grant (PR2)', () => {
   let platform: DropPlatform;
   let tempDir: string;
@@ -1873,6 +2005,51 @@ describe('resolveBuildEnv / resolveDependencies (M1: build-time env + browser-re
       );
 
       expect(result).toEqual({});
+    });
+
+    // DROP-150 / B1: depends_on[].env must never be able to name a
+    // platform-reserved var. depEnvVars (this function's return value) is
+    // spread LAST in the start env (buildStartSpec — after DROP_API_URL,
+    // DROP_API_KEY, dbEnvVars, redisEnvVars), so a returned reserved key
+    // would silently win over the platform's own value. Driven by the
+    // exported RESERVED_ENV_VARS array so a name added there automatically
+    // gets a case here.
+    //
+    // This checks the MECHANISM — resolveDependencies' own output omits the
+    // reserved key — not the fully assembled start env; see
+    // platform.restart.test.ts's DATABASE_URL/DROP_API_URL tests for
+    // assertions on the real assembled `spec.env`.
+    describe('reserved-name collisions (DROP-150 / B1)', () => {
+      it.each(RESERVED_ENV_VARS)(
+        'refuses a depends_on entry claiming %s — omits it and does not throw',
+        async (varName) => {
+          platform = createPlatform({
+            dropRoot: tempDir,
+            appsDirectory: path.join(tempDir, 'apps'),
+            logLevel: 'error',
+          });
+          (platform as any).appConfigService = {
+            getConfig: jest.fn().mockReturnValue({ port: 4005 }),
+          };
+          const warnSpy = jest.spyOn((platform as any).logger, 'warn').mockImplementation(() => undefined);
+
+          dropYamlContent = [
+            'depends_on:',
+            '  - name: backend',
+            `    env: ${varName}`,
+          ].join('\n');
+
+          const result = await (platform as any).resolveDependencies(
+            path.join(tempDir, 'apps', 'frontend'),
+            'frontend'
+          );
+
+          // Refused, not hijacked: the reserved key is simply absent, so the
+          // spread in buildStartSpec leaves the platform's own value intact.
+          expect(result[varName]).toBeUndefined();
+          expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining(varName), 'DEPS');
+        }
+      );
     });
   });
 });

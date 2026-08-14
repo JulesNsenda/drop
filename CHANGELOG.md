@@ -27,6 +27,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **`depends_on` in `drop.yaml` could repoint a platform-injected variable.**
+  Resolved dependency URLs are spread last into an app's start environment, so
+  a `depends_on` entry naming `DROP_API_URL`, `DATABASE_URL`, `REDIS_URL`, a
+  `DB_*`/`PG*` connection variable, `PORT` or `DROP_DATA_DIR` silently
+  overwrote the platform's own value — including redirecting where an app
+  sends the scoped control-plane key DROP mints for it. This matters most when
+  deploying a third-party repository, where the manifest author and the app
+  owner are not the same person. Reserved names are now refused: the
+  collision is logged and that one injection is skipped, so an unrelated
+  hijack attempt cannot fail an otherwise valid deploy. `depends_on[].env`
+  must also now be a syntactically valid environment variable name, the same
+  constraint `secrets:` has always had.
+
+### Added
+
+- **External databases can now be configured through the encrypted secret
+  store.** Storing a `DATABASE_URL` secret (Supabase, Neon, RDS, an external
+  MySQL) was refused outright, which left a plaintext `env:` entry in the
+  tenant's own `drop.yaml` as the only way to point an app at one. It is now
+  refused only when the app already has a DROP-managed database, whose
+  injected URL takes precedence over any secret and would override it anyway.
+
+### Fixed
+
+- **`database: true` silently discarded an app's `env:`, `secrets:` and
+  `services:`.** The validator required `database` to be a string, so
+  `database: true` failed validation and the whole manifest was dropped —
+  while a second, unvalidated reader went on provisioning the database, making
+  the loss easy to miss. `database` now accepts a boolean at the top level and
+  per service, matching what the platform actually acts on.
+- **`database: false` is honoured as an opt-out**, matching `redis: false`,
+  instead of falling through to dependency and ORM-config inference and
+  handing the app a database it declined. A monorepo service's
+  `database: false` now also survives materialisation into its generated child
+  config rather than being dropped as a falsy value.
+
 ## [1.2.2] - 2026-08-13
 
 One data-loss fix on the upload deploy path, and a dashboard fix.

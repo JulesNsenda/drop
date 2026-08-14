@@ -282,6 +282,44 @@ describe('expandMonorepo re-materializing a live child', () => {
       // depends_on was rewritten to the group-qualified sibling name.
       expect(parsed.config?.depends_on?.[0]?.name).toBe(`${repoName}-backend`);
     });
+
+    // DROP-150 / B2: the writer used a truthy test for `database`, so a
+    // service declaring `database: false` — now an explicit opt-out that
+    // appNeedsDatabase honours — lost the declaration at materialisation and
+    // the child fell back to inference, quietly getting the database it
+    // declined. Same silent-drop class as the historically missing `userId`.
+    // The `true` case is asserted alongside so this pins "the value survives",
+    // not just "false is written".
+    it.each([[false], [true], ['postgres']])(
+      'carries a service-level database: %s into the generated child config',
+      async (declared) => {
+        await (platform as any).expandMonorepo(repoPath, repoName, {
+          services: {
+            frontend: { path: 'frontend', type: 'static', database: declared },
+          },
+        });
+
+        const { parseDropYaml } = await import('./detector/drop-yaml-parser');
+        const parsed = await parseDropYaml(childPath());
+
+        expect(parsed.success).toBe(true);
+        expect(parsed.config?.database).toBe(declared);
+      }
+    );
+
+    it('omits database entirely when the service does not declare one', async () => {
+      await (platform as any).expandMonorepo(repoPath, repoName, {
+        services: { frontend: { path: 'frontend', type: 'static' } },
+      });
+
+      const { parseDropYaml } = await import('./detector/drop-yaml-parser');
+      const parsed = await parseDropYaml(childPath());
+
+      // Absent must stay absent — writing `database: false` here would turn
+      // "no opinion" into "declined" and suppress inference for every child.
+      expect(parsed.success).toBe(true);
+      expect(parsed.config?.database).toBeUndefined();
+    });
   });
 
   describe('source-side exclusions', () => {

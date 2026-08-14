@@ -11,6 +11,7 @@ import * as yaml from 'yaml';
 import * as crypto from 'crypto';
 import { EventBus, eventBus, Unsubscribe, AppDeletedPayload, AppDetectedPayload } from './event-bus';
 import { isReservedHost } from '../utils/reserved-hosts';
+import { RESERVED_ENV_VAR_SET } from '../utils/reserved-env-vars';
 import { getPublicUrl } from '../api/runtime-config';
 import type { DeployFailureReason } from './event-bus/event-bus.types';
 import { WatcherService } from './watcher';
@@ -2504,6 +2505,23 @@ backup:
       return true;
     }
 
+    // DROP-150 / B2: `database: false` is an explicit opt-out, in the same way
+    // `redis: false` already is for appNeedsRedis (`typeof … === 'boolean'`
+    // returns the declared value either way). Without this, B2 — which makes
+    // the validator ACCEPT `database: false` instead of failing the whole
+    // config — would ship a value that is documented, accepted, and then
+    // silently overruled by the package.json/ORM-file inference below: an app
+    // declaring `database: false` with `pg` in its dependencies would still be
+    // handed a database. That is the same tenant-facing lie as `database:
+    // sqlite` (B4), and it would be one this change introduced.
+    if (detectionDatabase === false) {
+      this.logger.debug(
+        `${appName} declares 'database: false' — skipping database provisioning and inference`,
+        'DATABASE'
+      );
+      return false;
+    }
+
     // Everything below this line is INFERRED, not declared — so an owner who
     // has already supplied a DATABASE_URL has answered the question, and
     // inference must not overrule them. This is not merely tidiness: in the
@@ -2728,6 +2746,24 @@ backup:
     }
 
     for (const dep of dropYaml.config.depends_on) {
+      // DROP-150 / B1: `depEnvVars` (this function's return value) is spread
+      // LAST in the start env (after DROP_API_URL, DROP_API_KEY, dbEnvVars,
+      // redisEnvVars — see buildStartSpec), precisely so a tenant cannot
+      // hijack a platform-injected credential. depends_on[].env sat outside
+      // that protection: a drop.yaml naming `env: DROP_API_URL` or
+      // `env: DATABASE_URL` would silently redirect where DROP's own scoped
+      // API key or database URL point. Refuse the collision and SKIP just
+      // that injection — never throw, so an unrelated hijack attempt can't
+      // fail the whole deploy (a structured refusal, not a silent drop).
+      if (RESERVED_ENV_VAR_SET.has(dep.env)) {
+        this.logger.warn(
+          `${appName}: depends_on '${dep.name}' claims reserved env var '${dep.env}' — ` +
+            `refusing to override the platform-injected value`,
+          'DEPS'
+        );
+        continue;
+      }
+
       const baseUrl = this.resolveDependencyUrl(dep.name);
       if (!baseUrl) {
         this.logger.warn(`Dependency ${dep.name} not found or not configured for ${appName}`, 'DEPS');
@@ -3198,7 +3234,13 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         const childConfig: DropYamlConfig = {
           name: childName,
           type: childType,
-          ...(svc.database ? { database: svc.database } : {}),
+          // `!== undefined`, not a truthy check: `database: false` is now an
+          // explicit opt-out (see appNeedsDatabase), and a truthy test drops
+          // it here — the child would silently fall back to inference and get
+          // a database its manifest declined. Same silent-drop class as the
+          // historically missing `userId`. The `redis` line below has always
+          // used `typeof … === 'boolean'` for exactly this reason.
+          ...(svc.database !== undefined ? { database: svc.database } : {}),
           ...(typeof svc.redis === 'boolean' ? { redis: svc.redis } : {}),
           ...(svc.domains && svc.domains.length > 0 ? { domains: svc.domains } : {}),
           ...(svc.env ? { env: svc.env } : {}),

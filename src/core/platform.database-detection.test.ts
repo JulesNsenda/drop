@@ -139,6 +139,34 @@ describe('appNeedsDatabase', () => {
     });
   });
 
+  // DROP-150 / B2: `database: false` is an opt-out, mirroring `redis: false`.
+  // B2 makes the validator accept `false` (it previously failed validation and
+  // took env/secrets/services down with it); without the opt-out, `false`
+  // would be accepted and then silently overruled by the inference below —
+  // a lie this change would have introduced. Each case pairs `false` with a
+  // signal that WOULD otherwise provision, so a test that merely returned
+  // `false` for an app with nothing to infer from cannot pass by accident.
+  describe('database: false is an explicit opt-out (DROP-150 / B2)', () => {
+    it('overrules a postgres client in dependencies', async () => {
+      await writePackageJson({ name: 'todo-app', dependencies: { pg: '^8.11.5' } });
+      await expect(needsDb(false)).resolves.toBe(false);
+      // Same app, no declaration: proves the dependency really is a provisioning
+      // signal, so the `false` above is what suppressed it.
+      await expect(needsDb(undefined)).resolves.toBe(true);
+    });
+
+    it('overrules an ORM config file on disk', async () => {
+      await fs.writeFile(path.join(appPath, 'knexfile.js'), '', 'utf-8');
+      await expect(needsDb(false)).resolves.toBe(false);
+      await expect(needsDb(undefined)).resolves.toBe(true);
+    });
+
+    it('leaves `undefined` inferring — absent is not the same as declined', async () => {
+      await writePackageJson({ name: 'todo-app', dependencies: { prisma: '^5.0.0' } });
+      await expect(needsDb(undefined)).resolves.toBe(true);
+    });
+  });
+
   describe('a DATABASE_URL in the drop.yaml env: block', () => {
     const writeDropYaml = (body: string): Promise<void> =>
       fs.writeFile(path.join(appPath, 'drop.yaml'), body, 'utf-8');
