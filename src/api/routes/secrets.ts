@@ -82,12 +82,35 @@ secrets.put('/:name', async (c) => {
 
   // DATABASE_URL is refused CONTEXTUALLY, not unconditionally: an app that
   // already has a DROP-provisioned database still cannot be repointed by a
-  // secret (dbEnvVars is spread last and would override it either way), so
-  // storing one here would be silently ineffective. There is no way to
-  // deprovision a database without deleting the whole app, so the message
-  // must not suggest that as a next step. Fails OPEN if the provisioner is
-  // unavailable (e.g. auth-disabled/test paths where the DB layer never
-  // booted) — the precedence still protects a provisioned app either way.
+  // secret (dbEnvVars is spread after secretEnvVars and would override it
+  // either way), so storing one here would be silently ineffective. There is
+  // no way to deprovision a database without deleting the whole app, so the
+  // message must not suggest that as a next step.
+  //
+  // It fails OPEN in two cases, and the reason that is SAFE is not the one an
+  // earlier version of this comment gave. It claimed "the precedence still
+  // protects a provisioned app either way", which is false — in the second
+  // case below there is no precedence left to protect anything:
+  //
+  //   1. No provisioner at all (`getDatabaseProvisioner()` returns null until
+  //      something constructs it with a server + dropRoot) — e.g. test paths,
+  //      or a boot where the DB layer never came up.
+  //   2. The provisioner exists but its registry is empty, which is what
+  //      `loadCredentials` leaves behind after quarantining a corrupt
+  //      `db-credentials.json`. The databases are still on the server; DROP
+  //      has just lost the credentials for them.
+  //
+  // Both are safe for the same structural reason: `isProvisioned` and
+  // `getAppCredentials` read the SAME map, so they flip together. Whenever
+  // this check is skipped, `getEnvVars` also returns null, `dbEnvVars` is
+  // empty, and nothing would have overridden the secret. **The refusal is
+  // skipped exactly when the override it exists to prevent cannot happen** —
+  // correct by construction rather than by the precedence argument.
+  //
+  // Do not "harden" case 2 by also consulting `orphanDatabaseExists`. In
+  // quarantine the app is getting no DATABASE_URL from DROP at all, so
+  // letting the owner supply one is the recovery path; refusing would close
+  // it while DROP cannot serve the database anyway.
   if (body.key.toUpperCase() === 'DATABASE_URL' && getDatabaseProvisioner()?.isProvisioned(r.name)) {
     throw new ValidationError(
       `'${r.name}' already has a DROP-managed database; its DATABASE_URL is platform-owned and would override this secret`
