@@ -417,6 +417,94 @@ describe('DropPlatform.restartApp', () => {
     expect(spec.env!.DROP_API_URL).toBe('http://127.0.0.1:4114');
   }, 20000);
 
+  // ── Redis ALLOCATES on the restart path; Postgres does not ────────────────
+  //
+  // Two comments in platform.ts used to claim buildFreshStartSpec does no new
+  // provisioning. That is true of the database (it only re-reads an existing
+  // allocation, which is why an app that newly needs one must be redeployed
+  // rather than restarted) and FALSE of Redis: provisionRedisEnvVars runs the
+  // full appNeedsRedis -> quota -> provisionAppRedis sequence regardless of
+  // which path calls it.
+  //
+  // Whether that asymmetry is desirable has never been decided. It is pinned
+  // here so a change to it is deliberate — and pinned on `provisionAppRedis`
+  // ACTUALLY BEING CALLED, not on env equality, because a stubbed provisioner
+  // returns the same REDIS_URL either way and an env-only assertion would pass
+  // just as happily if allocation had been removed.
+  //
+  // No other test file stubs the Redis provisioner (the platform leaves it
+  // null without a redis-server), so this is also the only place the branch
+  // runs at all.
+  describe('Redis on the restart path', () => {
+    const fakeRedisProvisioner = () => ({
+      isProvisioned: jest.fn().mockReturnValue(false),
+      provisionAppRedis: jest.fn().mockResolvedValue({ db: 3 }),
+      getEnvVars: jest.fn().mockReturnValue({
+        REDIS_URL: 'redis://127.0.0.1:6380/3',
+        REDIS_DB: '3',
+      }),
+    });
+
+    it('allocates for an app that has become Redis-shaped since its deploy', async () => {
+      platform = makePlatform();
+      await platform.start();
+      const appPath = await createStaticApp('site');
+      await deploy('site', appPath);
+
+      // Written AFTER the deploy, so the app genuinely has no allocation yet —
+      // this models an owner adding `redis: true` and restarting.
+      await fs.writeFile(path.join(appPath, 'drop.yaml'), 'redis: true\n');
+      const redis = fakeRedisProvisioner();
+      (platform as any).redisProvisioner = redis;
+
+      const startSpy = jest.spyOn(fakeRuntime, 'start');
+      await platform!.restartApp('site');
+
+      // The point of the test: a restart provisioned Redis.
+      expect(redis.provisionAppRedis).toHaveBeenCalledWith('site');
+
+      const spec = startSpy.mock.calls[startSpy.mock.calls.length - 1][0];
+      expect(spec.env!.REDIS_URL).toBe('redis://127.0.0.1:6380/3');
+    }, 20000);
+
+    it('does not re-allocate when an allocation already exists', async () => {
+      platform = makePlatform();
+      await platform.start();
+      const appPath = await createStaticApp('site');
+      await deploy('site', appPath);
+
+      await fs.writeFile(path.join(appPath, 'drop.yaml'), 'redis: true\n');
+      const redis = fakeRedisProvisioner();
+      redis.isProvisioned.mockReturnValue(true);
+      (platform as any).redisProvisioner = redis;
+
+      await platform!.restartApp('site');
+
+      // Idempotent: an existing allocation is re-read, never re-provisioned.
+      expect(redis.provisionAppRedis).not.toHaveBeenCalled();
+      expect(redis.getEnvVars).toHaveBeenCalled();
+    }, 20000);
+
+    it('leaves an app that does not want Redis alone', async () => {
+      platform = makePlatform();
+      await platform.start();
+      const appPath = await createStaticApp('site');
+      await deploy('site', appPath);
+
+      // No drop.yaml `redis:` and no redis client in a package.json, so
+      // appNeedsRedis is false and the allocate branch must not be reached.
+      const redis = fakeRedisProvisioner();
+      (platform as any).redisProvisioner = redis;
+
+      const startSpy = jest.spyOn(fakeRuntime, 'start');
+      await platform!.restartApp('site');
+
+      expect(redis.provisionAppRedis).not.toHaveBeenCalled();
+      const spec = startSpy.mock.calls[startSpy.mock.calls.length - 1][0];
+      expect(spec.env!.REDIS_URL).toBeUndefined();
+    }, 20000);
+  });
+
   // ── depends_on cannot hijack a reserved var (DROP-150 / B1) ────────────────
   //
   // depEnvVars (resolveDependencies' output) is spread LAST in the ASSEMBLED
