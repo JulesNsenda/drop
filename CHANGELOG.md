@@ -29,21 +29,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
-- **`depends_on` in `drop.yaml` could repoint a platform-injected variable.**
-  Resolved dependency URLs are spread last into an app's start environment, so
-  a `depends_on` entry naming `DROP_API_URL`, `DATABASE_URL`, `REDIS_URL`, a
-  `DB_*`/`PG*` connection variable, `PORT` or `DROP_DATA_DIR` silently
-  overwrote the platform's own value — including redirecting where an app
-  sends the scoped control-plane key DROP mints for it. This matters most when
-  deploying a third-party repository, where the manifest author and the app
-  owner are not the same person. Reserved names are now refused: the
-  collision is logged and that one injection is skipped, so an unrelated
-  hijack attempt cannot fail an otherwise valid deploy. A `depends_on[].env`
-  that is not a usable environment variable name is skipped the same way —
-  deliberately skipped rather than rejected during parsing, because a failed
-  `drop.yaml` validation discards the entire manifest, which would both break
-  already-deployed entries and disable the required-secret preflight that
-  depends on the discarded `secrets:` block.
+- **`depends_on` in `drop.yaml` could overwrite anything in an app's start
+  environment.** Resolved dependency URLs were applied last, so a `depends_on`
+  entry could name any variable and silently win — a platform value such as
+  `DROP_API_URL` (redirecting where the app sends the scoped control-plane key
+  DROP mints for it), a provisioned `DATABASE_URL` or `REDIS_URL`, **or any
+  secret the app's owner had set**. The last of those is the sharpest: an
+  overwritten secret also satisfied the required-secret preflight, because that
+  check reads the merged environment — so instead of parking in `needs-config`,
+  the app started with a session or signing key the manifest author chose.
+  This matters most when deploying a third-party repository, where the manifest
+  author and the app owner are not the same person.
+
+  A `depends_on` entry may now only fill a gap in the environment, never
+  overwrite an entry already in it. The collision is logged and that one
+  injection is skipped, so an unrelated attempt cannot fail an otherwise valid
+  deploy. The check compares against the environment actually assembled rather
+  than a list of protected names, so a variable added in future is covered
+  without anything to keep in sync. `depends_on[].env` values that are not
+  usable environment variable names are skipped the same way — skipped rather
+  than rejected during parsing, because a failed `drop.yaml` validation
+  discards the entire manifest, which would both break already-deployed entries
+  and disable the required-secret preflight that depends on the discarded
+  `secrets:` block.
 
 ### Added
 
@@ -64,11 +72,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   while a second, unvalidated reader went on provisioning the database, making
   the loss easy to miss. `database` now accepts a boolean at the top level and
   per service, matching what the platform actually acts on.
-- **`database: false` is honoured as an opt-out**, matching `redis: false`,
-  instead of falling through to dependency and ORM-config inference and
-  handing the app a database it declined. A monorepo service's
-  `database: false` now also survives materialisation into its generated child
-  config rather than being dropped as a falsy value.
+- **A monorepo service's `database` declaration survives materialisation.** The
+  generated child config was written with a truthy test, so `database: false`
+  was dropped entirely rather than passed down. Note that `database: false`
+  still does not decline a database — it falls through to auto-detection, as it
+  always has. Making it a real opt-out needs a deprovision story first, since an
+  app that already has a DROP-managed database cannot hand it back.
 
 ## [1.2.2] - 2026-08-13
 

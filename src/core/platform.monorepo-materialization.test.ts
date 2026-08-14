@@ -284,12 +284,14 @@ describe('expandMonorepo re-materializing a live child', () => {
     });
 
     // DROP-150 / B2: the writer used a truthy test for `database`, so a
-    // service declaring `database: false` — now an explicit opt-out that
-    // appNeedsDatabase honours — lost the declaration at materialisation and
-    // the child fell back to inference, quietly getting the database it
-    // declined. Same silent-drop class as the historically missing `userId`.
-    // The `true` case is asserted alongside so this pins "the value survives",
-    // not just "false is written".
+    // service declaring `database: false` lost the declaration entirely at
+    // materialisation — the same silent-drop class as the historically missing
+    // `userId`. `false` does not currently change provisioning (see
+    // platform.database-detection.test.ts), so this pins the WRITER, not the
+    // behaviour: whatever the service declared must reach the child config, or
+    // the day `false` does mean something the child will quietly not honour it.
+    // The `true`/`'postgres'` cases are asserted alongside so this reads as
+    // "the value survives", not "false is written".
     it.each([[false], [true], ['postgres']])(
       'carries a service-level database: %s into the generated child config',
       async (declared) => {

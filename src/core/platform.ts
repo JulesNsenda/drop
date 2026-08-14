@@ -11,7 +11,7 @@ import * as yaml from 'yaml';
 import * as crypto from 'crypto';
 import { EventBus, eventBus, Unsubscribe, AppDeletedPayload, AppDetectedPayload } from './event-bus';
 import { isReservedHost } from '../utils/reserved-hosts';
-import { RESERVED_ENV_VAR_SET, isValidEnvVarName } from '../utils/reserved-env-vars';
+import { isValidEnvVarName } from '../utils/env-var-names';
 import { getPublicUrl } from '../api/runtime-config';
 import type { DeployFailureReason } from './event-bus/event-bus.types';
 import { WatcherService } from './watcher';
@@ -2505,22 +2505,22 @@ backup:
       return true;
     }
 
-    // DROP-150 / B2: `database: false` is an explicit opt-out, in the same way
-    // `redis: false` already is for appNeedsRedis (`typeof … === 'boolean'`
-    // returns the declared value either way). Without this, B2 — which makes
-    // the validator ACCEPT `database: false` instead of failing the whole
-    // config — would ship a value that is documented, accepted, and then
-    // silently overruled by the package.json/ORM-file inference below: an app
-    // declaring `database: false` with `pg` in its dependencies would still be
-    // handed a database. That is the same tenant-facing lie as `database:
-    // sqlite` (B4), and it would be one this change introduced.
-    if (detectionDatabase === false) {
-      this.logger.debug(
-        `${appName} declares 'database: false' — skipping database provisioning and inference`,
-        'DATABASE'
-      );
-      return false;
-    }
+    // NOTE: `database: false` is NOT an opt-out — it falls through to the
+    // inference below, exactly as it did before DROP-150. B2 makes the
+    // validator accept the boolean (so `database: true` stops discarding the
+    // whole manifest), which is a parsing fix and stands on its own; making
+    // `false` actually decline a database is a separate, behaviour-changing
+    // question that was deliberately left out of that change.
+    //
+    // It is not just a missing branch. `appNeedsDatabase` is consulted only on
+    // the deploy path — `buildFreshStartSpec` (restart, hot-reload) re-reads
+    // the provisioner unconditionally — so an opt-out here would make deploy
+    // and restart disagree about whether the app has a DATABASE_URL. And for
+    // an app that already has a provisioned database there is no way to hand
+    // it back short of deleting the app, so `false` would strand a database
+    // that still holds tenant data and still counts against the per-user
+    // quota. Both need answering before this becomes an opt-out; see the
+    // `database: sqlite` question (B4), which is the same shape.
 
     // Everything below this line is INFERRED, not declared — so an owner who
     // has already supplied a DATABASE_URL has answered the question, and
@@ -2746,29 +2746,16 @@ backup:
     }
 
     for (const dep of dropYaml.config.depends_on) {
-      // DROP-150 / B1: `depEnvVars` (this function's return value) is spread
-      // LAST in the start env (after DROP_API_URL, DROP_API_KEY, dbEnvVars,
-      // redisEnvVars — see buildStartSpec), precisely so a tenant cannot
-      // hijack a platform-injected credential. depends_on[].env sat outside
-      // that protection: a drop.yaml naming `env: DROP_API_URL` or
-      // `env: DATABASE_URL` would silently redirect where DROP's own scoped
-      // API key or database URL point. Refuse the collision and SKIP just
-      // that injection — never throw, so an unrelated hijack attempt can't
-      // fail the whole deploy (a structured refusal, not a silent drop).
-      if (RESERVED_ENV_VAR_SET.has(dep.env)) {
-        this.logger.warn(
-          `${appName}: depends_on '${dep.name}' claims reserved env var '${dep.env}' — ` +
-            `refusing to override the platform-injected value`,
-          'DEPS'
-        );
-        continue;
-      }
-
-      // Shape check, deliberately here and not in the parser: rejecting a
-      // malformed name at parse time discards the WHOLE manifest (B2's bug),
-      // which would break already-deployed entries like `env: API-URL` and
-      // fail OPEN on the required-secret gate. Skipping the one entry keeps
-      // the rest of the config — and the preflight — intact.
+      // Shape check only. Whether this name COLLIDES with something DROP
+      // already sets is decided in buildStartSpec, positionally, against the
+      // env it actually assembled — not here against a list. (A list cannot
+      // express it: the protected set includes every owner-set secret.)
+      //
+      // Deliberately here and not in the parser: rejecting a malformed name at
+      // parse time discards the WHOLE manifest (B2's bug), which would break
+      // already-deployed entries like `env: API-URL` and fail OPEN on the
+      // required-secret gate. Skipping the one entry keeps the rest of the
+      // config — and the preflight — intact.
       if (!isValidEnvVarName(dep.env)) {
         this.logger.warn(
           `${appName}: depends_on '${dep.name}' names '${dep.env.slice(0, 40)}', which is not a ` +
@@ -6245,13 +6232,6 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
 
     const depEnvVars = await this.resolveDependencies(appPath, appName);
 
-    if (
-      (detection.type === 'static' || detection.type === 'spa') &&
-      Object.keys(depEnvVars).length > 0
-    ) {
-      await this.generateStaticConfig(appPath, depEnvVars);
-    }
-
     // Secret preflight — generation (PRD-051). Auto-fill any declared
     // `generate` secret that isn't set yet, BEFORE reading the secret env below
     // so the generated value is injected. Names (never values) are logged.
@@ -6355,14 +6335,10 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       }
     }
 
-    const env: Record<string, string> = {
-      // drop.yaml `env` (tenant config) is the base layer — now injected at
-      // START as well as build, so `env:` is honored end-to-end. Placed
-      // FIRST so secrets and every platform-authoritative var (PORT,
-      // DROP_DATA_DIR, DROP_API_URL/KEY, DATABASE_URL) still override it and
-      // a tenant cannot hijack them. `build_env` is intentionally NOT
-      // injected here — it is build-only by design.
-      ...this.coerceEnvRecord(dropYamlCfg.success ? dropYamlCfg.config?.env : undefined),
+    // Everything that is NOT tenant-authored free text: the app's own secrets
+    // plus every value DROP derives for it. Assembled as one object so the
+    // `depends_on` filter below has something concrete to compare against.
+    const platformEnv: Record<string, string> = {
       ...secretEnvVars,
       NODE_ENV: 'production',
       PORT: port.toString(),
@@ -6371,7 +6347,66 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       ...(dropApiKey ? { DROP_API_KEY: dropApiKey } : {}),
       ...dbEnvVars,
       ...redisEnvVars,
-      ...depEnvVars,
+    };
+
+    // DROP-150 / B1: resolved `depends_on` URLs used to be spread LAST, so
+    // whatever name a manifest chose silently won. A reserved-NAME list cannot
+    // make that safe, because the hijackable set includes every owner-set
+    // secret and those names are unbounded: on the deploy_from_git path (where
+    // the manifest author is not the app owner) `depends_on: [{name: <any
+    // registered app>, env: SESSION_SECRET}]` replaced the owner's encrypted
+    // secret with a fully predictable `http://<dep>` URL.
+    //
+    // So refuse POSITIONALLY instead — a dependency may fill a gap, never
+    // overwrite something already assembled. That is complete by construction:
+    // a provisioner variable added later (REDIS_DB, a future DB_SSLMODE) is
+    // covered the day it appears, with no list to keep in sync.
+    //
+    // This also keeps the required-secret gate below honest. `providedKeys` is
+    // read from the MERGED env, so a dependency overwriting a declared secret
+    // used to satisfy the preflight with an attacker-chosen value — the app
+    // booted with a known signing key instead of parking in `needs-config`.
+    //
+    // Skip-and-warn, never throw: one collision must not fail a deploy that is
+    // otherwise valid.
+    const safeDepEnvVars: Record<string, string> = {};
+    for (const [key, value] of Object.entries(depEnvVars)) {
+      if (key in platformEnv) {
+        this.logger.warn(
+          `${appName}: depends_on claims '${key}', which DROP already sets for this app — ` +
+            `refusing to override it`,
+          'DEPS'
+        );
+        continue;
+      }
+      safeDepEnvVars[key] = value;
+    }
+
+    // Static/SPA apps get the dependency URLs written into a browser-served
+    // config file. It gets the FILTERED set, so what the browser reads matches
+    // what the app actually runs with.
+    if (
+      (detection.type === 'static' || detection.type === 'spa') &&
+      Object.keys(safeDepEnvVars).length > 0
+    ) {
+      await this.generateStaticConfig(appPath, safeDepEnvVars);
+    }
+
+    const env: Record<string, string> = {
+      // drop.yaml `env` (tenant config) is the base layer — now injected at
+      // START as well as build, so `env:` is honored end-to-end. Placed
+      // FIRST so secrets and every platform-authoritative var (PORT,
+      // DROP_DATA_DIR, DROP_API_URL/KEY, DATABASE_URL) still override it and
+      // a tenant cannot hijack them. `build_env` is intentionally NOT
+      // injected here — it is build-only by design.
+      //
+      // `dropYaml.env` is deliberately outside `platformEnv`, so a dependency
+      // still overrides it — that precedence predates this change and is the
+      // point of `depends_on` (a build must see the current dependency URL,
+      // not a stale default baked into `env:`).
+      ...this.coerceEnvRecord(dropYamlCfg.success ? dropYamlCfg.config?.env : undefined),
+      ...platformEnv,
+      ...safeDepEnvVars,
     };
 
     // Secret preflight — gate (PRD-051). A declared-required secret that is
