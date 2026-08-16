@@ -43,6 +43,13 @@ describe('appNeedsDatabase', () => {
     };
   };
 
+  /** DROP-151: stub AppConfigService the way appServiceIntent reads it. */
+  const withServiceIntent = (services: Record<string, 'attached' | 'detached'>) => {
+    (platform as any).appConfigService = {
+      getConfig: jest.fn().mockReturnValue({ services }),
+    };
+  };
+
   beforeEach(async () => {
     tempDir = path.join(os.tmpdir(), `drop-db-detect-${Date.now()}-${Math.random()}`);
     appPath = path.join(tempDir, 'apps', 'todo-app');
@@ -261,6 +268,50 @@ describe('appNeedsDatabase', () => {
       (platform as any).secretManager = { get };
       await needsDb(undefined);
       expect(get).toHaveBeenCalledWith('todo-app', 'DATABASE_URL');
+    });
+  });
+
+  // DROP-151: AppConfig.services.postgres — the owner's own attach/detach
+  // intent — sits ABOVE the manifest declaration, not merely above inference.
+  // See appServiceIntent's own comment in platform.ts for why.
+  describe('AppConfig.services intent (DROP-151)', () => {
+    it("'attached' wins with no signal at all — the durability bug this exists to fix", async () => {
+      // No package.json, no ORM file, no drop.yaml database: — every existing
+      // signal says no. An app added via the catalog's Attach button has
+      // exactly this shape, which is the bug the whole phase exists to fix.
+      withServiceIntent({ postgres: 'attached' });
+      await expect(needsDb(undefined)).resolves.toBe(true);
+    });
+
+    it("'detached' overrides an explicit drop.yaml database: postgres declaration", async () => {
+      withServiceIntent({ postgres: 'detached' });
+      await expect(needsDb('postgres')).resolves.toBe(false);
+    });
+
+    it("'detached' overrides an inferred postgres client dependency", async () => {
+      await writePackageJson({ name: 'todo-app', dependencies: { pg: '^8.11.5' } });
+      withServiceIntent({ postgres: 'detached' });
+      await expect(needsDb(undefined)).resolves.toBe(false);
+    });
+
+    it("'detached' overrides an ORM config file on disk", async () => {
+      await fs.writeFile(path.join(appPath, 'knexfile.js'), '', 'utf-8');
+      withServiceIntent({ postgres: 'detached' });
+      await expect(needsDb(undefined)).resolves.toBe(false);
+    });
+
+    it('an intent recorded for a different service key is ignored', async () => {
+      // Only 'redis' is recorded — 'postgres' has no entry, so this must fall
+      // through to the (here, negative) precedence below it unaffected.
+      withServiceIntent({ redis: 'attached' });
+      await expect(needsDb(undefined)).resolves.toBe(false);
+    });
+
+    it("'detached' suppresses the sqlite mismatch warning, not just the provisioning decision", async () => {
+      withServiceIntent({ postgres: 'detached' });
+      const warnSpy = jest.spyOn((platform as any).logger, 'warn');
+      await expect(needsDb('sqlite')).resolves.toBe(false);
+      expect(warnSpy).not.toHaveBeenCalled();
     });
   });
 });

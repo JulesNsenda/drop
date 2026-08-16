@@ -2465,11 +2465,41 @@ backup:
   }
 
   /**
+   * DROP-151: the owner's persisted attach/detach intent for a backing
+   * service, if any — the TOP of the precedence order every call site below
+   * must honour:
+   *
+   *   AppConfig.services  >  manifest declaration (`database:` / `redis:`)  >  inference
+   *
+   * Intent sits ABOVE the manifest, not merely above inference. The
+   * justification is temporal, and it is the same rule as the owner-wins
+   * precedent elsewhere in this file (appDatabaseUrlSource): the button was
+   * clicked AFTER the manifest was written, so it is the newer intent. And on
+   * the `deploy_from_git` path the manifest author is a third party, not
+   * necessarily the app's owner — so a stale upstream pinning
+   * `database: postgres` must not permanently deny the owner the ability to
+   * detach their own database while it keeps counting against their quota.
+   * Once an app has been attached or detached through this mechanism, its
+   * manifest key stops being authoritative for that service; re-attaching is
+   * what hands authority back.
+   */
+  private appServiceIntent(
+    appName: string,
+    serviceId: 'postgres' | 'redis'
+  ): 'attached' | 'detached' | undefined {
+    return this.appConfigService?.getConfig(appName)?.services?.[serviceId];
+  }
+
+  /**
    * Whether an app needs a database.
    *
-   * Three sources, in precedence order:
+   * Four sources, in precedence order:
+   *   0. `AppConfig.services.postgres` — the owner's own attach/detach
+   *      intent. Wins over everything below, including an explicit
+   *      drop.yaml `database:` — see appServiceIntent's own comment for why
+   *      intent outranks the manifest.
    *   1. An explicit `database:` in drop.yaml — the owner said so, so it wins
-   *      outright.
+   *      outright otherwise.
    *   2. An ORM config file on disk.
    *   3. A Postgres client or ORM in package.json dependencies.
    *
@@ -2489,6 +2519,12 @@ backup:
     appPath: string,
     detectionDatabase?: boolean | string
   ): Promise<boolean> {
+    // Intent wins outright, above even the sqlite warning below — a detached
+    // app must not log a mismatch warning for a database it no longer has.
+    const intent = this.appServiceIntent(appName, 'postgres');
+    if (intent === 'attached') return true;
+    if (intent === 'detached') return false;
+
     // DROP has no SQLite provisioner — 'sqlite' still provisions PostgreSQL and
     // injects DATABASE_URL. Warn so the mismatch is visible instead of silent.
     if (detectionDatabase === 'sqlite') {
@@ -2635,13 +2671,21 @@ backup:
   }
 
   /**
-   * Whether an app wants managed Redis. An explicit `redis:` in drop.yaml wins
-   * (true opts in, false opts out); otherwise auto-detect a Redis client in the
-   * app's package.json dependencies — the same "detect from project files"
-   * approach appNeedsDatabase uses for ORM config. Non-Node apps opt in via
-   * `redis: true` in drop.yaml.
+   * Whether an app wants managed Redis.
+   *
+   * `AppConfig.services.redis` — the owner's own attach/detach intent — wins
+   * over everything below, same precedence as appNeedsDatabase (see
+   * appServiceIntent's own comment). Otherwise: an explicit `redis:` in
+   * drop.yaml wins (true opts in, false opts out); failing that, auto-detect a
+   * Redis client in the app's package.json dependencies — the same "detect
+   * from project files" approach appNeedsDatabase uses for ORM config.
+   * Non-Node apps opt in via `redis: true` in drop.yaml.
    */
-  private async appNeedsRedis(appPath: string): Promise<boolean> {
+  private async appNeedsRedis(appName: string, appPath: string): Promise<boolean> {
+    const intent = this.appServiceIntent(appName, 'redis');
+    if (intent === 'attached') return true;
+    if (intent === 'detached') return false;
+
     const dropYaml = await parseDropYaml(appPath);
     if (dropYaml.success && typeof dropYaml.config?.redis === 'boolean') {
       return dropYaml.config.redis;
@@ -2706,6 +2750,17 @@ backup:
     if (!this.redisProvisioner) {
       return {};
     }
+
+    // A 'detached' intent must win here, ABOVE the "already provisioned" early
+    // return just below — otherwise a still-allocated Redis DB (deprovision
+    // failed, or simply hasn't run yet on this restart) would keep coming back
+    // on every restart regardless of the owner's explicit Detach, silently
+    // ignoring it on exactly the path (buildFreshStartSpec) detach most needs
+    // to reach.
+    if (this.appServiceIntent(appName, 'redis') === 'detached') {
+      return {};
+    }
+
     const redisHost = this.config.isolation === 'docker' ? HOST_ALIAS : '127.0.0.1';
 
     // Already provisioned (e.g. hot-reload/restart) — just return its URL.
@@ -2713,24 +2768,20 @@ backup:
       return this.redisProvisioner.getEnvVars(appName, { host: redisHost }) || {};
     }
 
-    if (!(await this.appNeedsRedis(appPath))) {
+    if (!(await this.appNeedsRedis(appName, appPath))) {
       return {};
     }
 
     // Per-user quota (mirrors the Postgres DB quota).
     const ownerUserId = this.stateManager?.getApp(appName)?.userId;
-    if (ownerUserId !== undefined && this.config.maxRedisPerUser > 0) {
-      const count = (this.stateManager?.getAllApps() ?? []).filter(
-        (a) => a.userId === ownerUserId && this.redisProvisioner!.isProvisioned(a.name)
-      ).length;
-      if (count >= this.config.maxRedisPerUser) {
-        this.logger.warn(
-          `Redis quota reached for user ${ownerUserId} (${count}/${this.config.maxRedisPerUser}), ` +
-            `skipping Redis for ${appName}`,
-          'REDIS'
-        );
-        return {};
-      }
+    const redisQuota = this.checkRedisQuota(ownerUserId);
+    if (!redisQuota.allowed) {
+      this.logger.warn(
+        `Redis quota reached for user ${ownerUserId} (${redisQuota.used}/${redisQuota.limit}), ` +
+          `skipping Redis for ${appName}`,
+        'REDIS'
+      );
+      return {};
     }
 
     try {
@@ -2741,6 +2792,59 @@ backup:
       this.logger.warn(`Redis provisioning failed for ${appName}`, 'REDIS', err);
       return {};
     }
+  }
+
+  /**
+   * Postgres per-user database quota. Extracted from what used to be an
+   * inline branch in handleStartApp so a future attach route (DROP-151 Phase
+   * 2) can refuse explicitly instead of the deploy path's own silent
+   * warn-and-skip. Never throws; handleStartApp's behaviour on `allowed:
+   * false` is unchanged — it still just skips provisioning and logs.
+   *
+   * Deliberately a TRUTHY test on `ownerUserId`, not `!== undefined` — an
+   * ownerless app (a `DROP_API_KEY`/`cli-local` deploy) skips this quota
+   * entirely. This diverges from checkRedisQuota below ON PURPOSE: unifying
+   * the two either caps every ownerless app on the box under one shared
+   * Postgres-shaped bucket, or gives Redis an unlimited ownerless path.
+   * Neither is a decision this change makes — see the extension-catalog
+   * plan's open question 1. Preserve this divergence; do not normalise it.
+   */
+  private checkDbQuota(
+    ownerUserId: string | undefined
+  ): { allowed: true } | { allowed: false; used: number; limit: number } {
+    if (!ownerUserId || this.config.maxDbsPerUser <= 0 || !this.dbProvisioner) {
+      return { allowed: true };
+    }
+    const used = (this.stateManager?.getAllApps() ?? []).filter(
+      (a) => a.userId === ownerUserId && this.dbProvisioner!.isProvisioned(a.name)
+    ).length;
+    if (used >= this.config.maxDbsPerUser) {
+      return { allowed: false, used, limit: this.config.maxDbsPerUser };
+    }
+    return { allowed: true };
+  }
+
+  /**
+   * Redis per-user quota. Extracted from what used to be an inline branch in
+   * provisionRedisEnvVars, mirroring checkDbQuota above — with the one
+   * deliberate divergence documented there: this uses `ownerUserId !==
+   * undefined`, not a truthy test, so an ownerless app IS subject to this
+   * quota (shared across every ownerless app on the box). Do not normalise
+   * the two checks to agree.
+   */
+  private checkRedisQuota(
+    ownerUserId: string | undefined
+  ): { allowed: true } | { allowed: false; used: number; limit: number } {
+    if (ownerUserId === undefined || this.config.maxRedisPerUser <= 0 || !this.redisProvisioner) {
+      return { allowed: true };
+    }
+    const used = (this.stateManager?.getAllApps() ?? []).filter(
+      (a) => a.userId === ownerUserId && this.redisProvisioner!.isProvisioned(a.name)
+    ).length;
+    if (used >= this.config.maxRedisPerUser) {
+      return { allowed: false, used, limit: this.config.maxRedisPerUser };
+    }
+    return { allowed: true };
   }
 
   /**
@@ -4020,23 +4124,13 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
 
         const appState = this.stateManager?.getApp(appName);
         const ownerUserId = appState?.userId;
-        if (ownerUserId && this.config.maxDbsPerUser > 0) {
-          const allApps = this.stateManager?.getAllApps() ?? [];
-          const userDbCount = allApps.filter(
-            (a) => a.userId === ownerUserId && this.dbProvisioner!.isProvisioned(a.name)
-          ).length;
-          if (userDbCount >= this.config.maxDbsPerUser) {
-            this.logger.warn(
-              `DB quota reached for user ${ownerUserId} (${userDbCount}/${this.config.maxDbsPerUser}), ` +
-              `skipping database provisioning for ${appName}`,
-              'DATABASE'
-            );
-          } else {
-            this.logger.info(`Provisioning database for ${appName}...`, 'DATABASE');
-            const dbCreds = await this.dbProvisioner.provisionAppDatabase(appName);
-            dbEnvVars = this.dbProvisioner.getEnvVars(appName, dbOpts) || {};
-            this.logger.info(`Database provisioned: ${dbCreds.database}`, 'DATABASE');
-          }
+        const dbQuota = this.checkDbQuota(ownerUserId);
+        if (!dbQuota.allowed) {
+          this.logger.warn(
+            `DB quota reached for user ${ownerUserId} (${dbQuota.used}/${dbQuota.limit}), ` +
+            `skipping database provisioning for ${appName}`,
+            'DATABASE'
+          );
         } else {
           this.logger.info(`Provisioning database for ${appName}...`, 'DATABASE');
           const dbCreds = await this.dbProvisioner.provisionAppDatabase(appName);
@@ -5010,8 +5104,15 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     const dataDir = await this.ensureAppDataDirectory(appName);
 
     // Get env vars for an already-provisioned DB (no new provisioning here).
+    // Skip entirely when the owner's intent is 'detached'. This is defensive
+    // rather than load-bearing today — detach only persists 'detached' after
+    // a successful deprovision, at which point getEnvVars already returns
+    // null — but it closes the partial-failure window where `DROP DATABASE`
+    // succeeded and `DROP USER` failed: the registry entry stays alive and
+    // getEnvVars would otherwise still hand back a DSN for a database that no
+    // longer exists.
     let dbEnvVars: Record<string, string> = {};
-    if (this.dbProvisioner) {
+    if (this.dbProvisioner && this.appServiceIntent(appName, 'postgres') !== 'detached') {
       const pgSocketDir =
         this.config.isolation === 'docker'
           ? (this.postgresServer?.getSocketDir() ?? undefined)
