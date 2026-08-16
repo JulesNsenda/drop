@@ -43,6 +43,7 @@ import certsRoutes from './routes/certs';
 import deploysRoutes from './routes/deploys';
 import secretsRoutes from './routes/secrets';
 import dbRoutes from './routes/db';
+import extensionsRoutes from './routes/extensions';
 import webhooksRoutes from './routes/webhooks';
 import gitDeployRoutes from './routes/git-deploy';
 import adminRoutes from './routes/admin';
@@ -347,6 +348,22 @@ export class ApiServer {
       // interactiveSessionOnly guard ever runs; the route guard alone is not
       // enough since it only distinguishes session vs API key, not role.
       v1.use('/db/*', authMiddleware('user'));
+      // Extension catalog (DROP-151 Phase 1) — read-only, so 'readonly' is
+      // enough. Load-bearing: setupRoutes has NO default-deny, so without this
+      // line a new top-level path is anonymous even on an auth-enabled box.
+      //
+      // The `/*` form is deliberate and covers BOTH `/extensions` and
+      // `/extensions/<sub>` — verified empirically against this tree's Hono
+      // with the real nesting (`app.route('/api/v1', v1)` →
+      // `v1.route('/extensions', …)`). A bare `v1.use('/extensions', …)`
+      // alongside it is NOT harmless: it does not match the sub-path at all,
+      // and on the collection path both middlewares run, so every catalog
+      // request would pay two full auth passes (two JWT verifies, two user
+      // lookups, two `apiKey.lastUsed` writes). One line, the `/*` one.
+      //
+      // Testing this on a flat Hono app gives the opposite answer — matching
+      // depends on the `route()` nesting, so check it the way it is mounted.
+      v1.use('/extensions/*', authMiddleware('readonly'));
       v1.use('/webhooks/*', authMiddleware('admin'));
       v1.use('/git/deploy', authMiddleware('user'));
       v1.use('/git/redeploy/*', authMiddleware('user'));
@@ -363,6 +380,7 @@ export class ApiServer {
     v1.route('/deploys', deploysRoutes);
     v1.route('/secrets', secretsRoutes);
     v1.route('/db', dbRoutes);
+    v1.route('/extensions', extensionsRoutes);
     v1.route('/webhooks', webhooksRoutes);
     v1.route('/git', gitDeployRoutes);
     v1.route('/admin', adminRoutes);

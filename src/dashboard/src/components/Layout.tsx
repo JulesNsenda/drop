@@ -1,6 +1,7 @@
 import { Outlet, NavLink, Link, useLocation, useNavigate } from 'react-router-dom';
 import {
   LayoutGrid,
+  Blocks,
   Settings,
   Upload,
   Users,
@@ -73,6 +74,15 @@ function Layout() {
               Deploy
             </NavLink>
           </li>
+          {/* Catalog is read-only (DROP-151 Phase 1) and its API route is
+              guarded at 'readonly', so it is deliberately NOT role-gated —
+              every signed-in viewer can browse what this platform supports. */}
+          <li>
+            <NavLink to="/catalog" className={navLinkClass}>
+              <Blocks className="h-5 w-5" />
+              Catalog
+            </NavLink>
+          </li>
           {role === 'admin' && (
             <li>
               <NavLink to="/users" className={navLinkClass}>
@@ -122,6 +132,8 @@ function Layout() {
     breadcrumb = <span style={{ color: 'var(--text)' }}>Applications</span>;
   } else if (location.pathname.startsWith('/deploy')) {
     breadcrumb = <span style={{ color: 'var(--text)' }}>Deploy</span>;
+  } else if (location.pathname.startsWith('/catalog')) {
+    breadcrumb = <span style={{ color: 'var(--text)' }}>Catalog</span>;
   } else if (location.pathname.startsWith('/settings')) {
     breadcrumb = <span style={{ color: 'var(--text)' }}>Settings</span>;
   } else if (location.pathname.startsWith('/users')) {

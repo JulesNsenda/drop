@@ -8,6 +8,7 @@ import { AuthContext, useAuthProvider } from './hooks/useAuth';
 import { UNAUTHORIZED_EVENT, MUST_CHANGE_PASSWORD_EVENT } from './api/client';
 import AppsPage from './pages/AppsPage';
 import AppDetailPage from './pages/AppDetailPage';
+import CatalogPage from './pages/CatalogPage';
 import SettingsPage from './pages/SettingsPage';
 import DeployPage from './pages/DeployPage';
 import LoginPage from './pages/LoginPage';
@@ -103,6 +104,7 @@ function App() {
             }>
               <Route path="apps" element={<AppsPage />} />
               <Route path="apps/:name" element={<AppDetailPage />} />
+              <Route path="catalog" element={<CatalogPage />} />
               <Route path="deploy" element={<DeployPage />} />
               <Route path="settings" element={<SettingsPage />} />
               <Route path="users" element={<UsersPage />} />
