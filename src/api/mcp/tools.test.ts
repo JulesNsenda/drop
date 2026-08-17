@@ -50,6 +50,7 @@ function firstText(result: CallToolResult): string {
 function makeOps(overrides?: Partial<PlatformOps>): PlatformOps {
   return {
     restartApp: jest.fn(),
+    attachService: jest.fn(),
     isAppInProgress: jest.fn().mockReturnValue(false), promoteApp: jest.fn(),
     removeGroup: jest.fn().mockResolvedValue({ removed: [] }),
     purgeAppArtifacts: jest.fn().mockResolvedValue(undefined),

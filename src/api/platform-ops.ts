@@ -45,6 +45,58 @@ export class AppNeedsConfigError extends Error {
   }
 }
 
+/** Backing services attachable through POST /apps/:name/services/:id (DROP-151 Phase 2). */
+export type AttachableServiceId = 'postgres' | 'redis';
+
+/**
+ * Result of `PlatformOps.attachService`. A refusal is a returned value, not a
+ * thrown error — the caller (the route) must be able to map it to a specific
+ * HTTP response without string-matching a message. Busy (`AppInProgressError`)
+ * is the one exception: it is thrown, matching `restartApp`'s existing
+ * contract and the route-level catch both already share.
+ *
+ * `envVarNames` is deliberately NAMES ONLY — the Postgres binding is a DSN
+ * containing the role's plaintext password, and this result crosses the wire.
+ */
+export type AttachServiceResult =
+  | { attached: true; envVarNames: string[] }
+  | {
+      attached: false;
+      reason:
+        | 'ephemeral'
+        | 'has-own-database-url'
+        /**
+         * The Redis counterpart. Both exist because `dbEnvVars` and
+         * `redisEnvVars` are each spread after `secretEnvVars`, so either one
+         * provisioned over an owner-supplied URL silently repoints the app at
+         * an empty store — for Redis, that means destroying live session state.
+         */
+        | 'has-own-redis-url'
+        | 'quota-exceeded'
+        /**
+         * The app has runtime state but no AppConfig (an out-of-tree or
+         * admin-registered app). Refused rather than attached because
+         * `upsertConfig` would mint a skeleton config with `type: 'unknown'`
+         * and no `path` — and `syncStateWithConfigs` iterates CONFIGS on the
+         * next boot and calls `registerApp(name, config.path || <webapps>/name,
+         * config.type, ...)`, which overwrites the app's real path, type and
+         * hostname. Attaching a database would silently relocate the app at
+         * the next restart.
+         */
+        | 'no-app-config'
+        /**
+         * The provisioner for this service is absent on this instance (Redis
+         * disabled or failed to start; the database layer never booted). A
+         * permanent, correct configuration state — a refusal the route maps to
+         * 503, NOT a thrown error mapped to 500, which would read as a crash
+         * and alert as one on every Postgres-less install.
+         */
+        | 'service-unavailable';
+      detail: string;
+      /** Present only for `reason: 'quota-exceeded'`. */
+      quota?: { used: number; limit: number };
+    };
+
 export interface PlatformOps {
   /**
    * Stop-if-running, rebuild the start spec from current state (secrets,
@@ -55,6 +107,20 @@ export interface PlatformOps {
    * to a fresh start. Rejects with AppInProgressError when the app is busy.
    */
   restartApp(appName: string): Promise<AppProcessInfo>;
+
+  /**
+   * Attach a backing service (postgres|redis) to an app: quota check,
+   * provision, persist the owner's explicit intent (`AppConfig.services`,
+   * DROP-151), then restart so the env var is actually injected. Resolves
+   * only once that restart resolves — a caller that gets `attached: true`
+   * back has a running app with the var set, not just a provisioned service.
+   *
+   * Rejects with AppInProgressError when the app already has a deploy/build/
+   * restart in flight — the whole operation is guarded, not just the restart
+   * at the end, so provisioning can never race a concurrent deploy for the
+   * same app.
+   */
+  attachService(appName: string, serviceId: AttachableServiceId): Promise<AttachServiceResult>;
 
   /**
    * Synchronous check for whether the app currently has a build/restart/

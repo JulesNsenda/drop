@@ -25,6 +25,10 @@ interface ApiRuntimeConfig {
   maxUploadSizeMb?: number;
   /** Public base URL of the API (e.g. "https://drop.example.com"), used as the OAuth issuer. */
   publicUrl?: string;
+  /** Per-user Postgres database cap, mirroring PlatformConfig.maxDbsPerUser. */
+  maxDbsPerUser?: number;
+  /** Per-user managed-Redis cap, mirroring PlatformConfig.maxRedisPerUser. */
+  maxRedisPerUser?: number;
 }
 
 const runtimeConfig: ApiRuntimeConfig = {};
@@ -36,6 +40,8 @@ export function setApiRuntimeConfig(config: ApiRuntimeConfig): void {
   if (config.tempDirectory) runtimeConfig.tempDirectory = config.tempDirectory;
   if (config.maxUploadSizeMb !== undefined) runtimeConfig.maxUploadSizeMb = config.maxUploadSizeMb;
   if (config.publicUrl !== undefined) runtimeConfig.publicUrl = config.publicUrl;
+  if (config.maxDbsPerUser !== undefined) runtimeConfig.maxDbsPerUser = config.maxDbsPerUser;
+  if (config.maxRedisPerUser !== undefined) runtimeConfig.maxRedisPerUser = config.maxRedisPerUser;
 }
 
 /** Resolved webapps directory: explicit config > DROP_APPS_DIR env > platform default. */
@@ -106,4 +112,23 @@ export function getPublicUrl(): string | undefined {
  */
 export function setPublicUrl(url: string | undefined): void {
   runtimeConfig.publicUrl = url;
+}
+
+/**
+ * Per-user Postgres database cap: explicit config > DROP_MAX_DBS_PER_USER env
+ * > default (3) — the same precedence `PlatformConfig.maxDbsPerUser` resolves
+ * with. Read by GET /db/:name (DROP-151 Phase 2) to report quota state
+ * alongside the enforcement path (`DropPlatform.checkDbQuota`), which lives on
+ * the platform and is not reachable from a route file. Kept here rather than a
+ * hardcoded env read in the route so the two never see different defaults.
+ */
+export function getMaxDbsPerUser(): number {
+  if (runtimeConfig.maxDbsPerUser !== undefined) return runtimeConfig.maxDbsPerUser;
+  return parseInt(process.env.DROP_MAX_DBS_PER_USER || '3', 10);
+}
+
+/** Per-user managed-Redis cap — mirrors getMaxDbsPerUser() above. */
+export function getMaxRedisPerUser(): number {
+  if (runtimeConfig.maxRedisPerUser !== undefined) return runtimeConfig.maxRedisPerUser;
+  return parseInt(process.env.DROP_MAX_REDIS_PER_USER || '3', 10);
 }
