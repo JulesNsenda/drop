@@ -86,6 +86,10 @@ export interface ApiServerConfig {
   tempDirectory?: string;
   /** Cap on the compressed (as-uploaded) archive size for POST /apps/:name/source, in MB. */
   maxUploadSizeMb?: number;
+  /** Per-user Postgres database cap (passed through to runtime-config for GET /db/:name). */
+  maxDbsPerUser?: number;
+  /** Per-user managed-Redis cap (passed through to runtime-config for GET /db/:name). */
+  maxRedisPerUser?: number;
   /**
    * Override the resolved dashboard directory (normally dist/dashboard, or
    * src/dashboard as a dev fallback — see setupRoutes). Defaults to that
@@ -124,6 +128,8 @@ export class ApiServer {
       domainSuffix: this.config.domainSuffix,
       tempDirectory: this.config.tempDirectory,
       maxUploadSizeMb: this.config.maxUploadSizeMb,
+      maxDbsPerUser: this.config.maxDbsPerUser,
+      maxRedisPerUser: this.config.maxRedisPerUser,
       // Admin-stored override (PRD-041 settings UI) takes precedence over
       // DROP_PUBLIC_URL — see getPublicUrl()'s precedence. Reads whatever
       // the settings manager singleton has loaded so far: the real platform
@@ -271,6 +277,21 @@ export class ApiServer {
     // single shared PostgreSQL instance, not the whole API. Registered
     // unconditionally — an auth-disabled (single-operator) box still gets it.
     v1.use('/db/*', dbRateLimitMiddleware());
+
+    // Backing-service attach (DROP-151 Phase 2) provisions a real Postgres
+    // database/role or a Redis logical DB — the same shared-instance cost the
+    // /db/* bucket above exists for, so it reuses it rather than adding a new
+    // config knob for one route. Registered unconditionally, like the other
+    // dedicated buckets. Only the NESTED form is registered: verified
+    // empirically in this tree that '/apps/*/services' matches
+    // '/apps/x/services' but NOT '/apps/x/services/postgres', and the nested
+    // path is the only one with a handler — the collection route was
+    // deliberately not built (that data lives on GET /db/:name). Registering
+    // the non-nested form too would rate-limit a 404: these buckets run
+    // BEFORE the auth block below, so it would let an unauthenticated caller
+    // drain the shared db budget through a path that does nothing. Add it
+    // back if and when a collection route exists.
+    v1.use('/apps/*/services/*', dbRateLimitMiddleware());
 
     // Apply auth middleware to protected routes when auth is enabled
     if (this.config.enableAuth && isAuthEnabled()) {

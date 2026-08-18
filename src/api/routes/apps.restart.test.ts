@@ -38,6 +38,7 @@ const RUNNING_PROCESS: AppProcessInfo = {
 function makeOps(overrides?: Partial<PlatformOps>): PlatformOps {
   return {
     restartApp: jest.fn().mockResolvedValue(RUNNING_PROCESS),
+    attachService: jest.fn(),
     isAppInProgress: jest.fn().mockReturnValue(false), promoteApp: jest.fn(),
     removeGroup: jest.fn().mockResolvedValue({ removed: [] }),
     purgeAppArtifacts: jest.fn().mockResolvedValue(undefined),
@@ -149,6 +150,7 @@ describe('POST /apps/:name/start and /apps/:name/restart (platform ops)', () => 
       setPlatformOps(
         makeOps({
           restartApp: jest.fn().mockRejectedValue(new AppNeedsConfigError('test-app', ['JWT_SECRET', 'API_KEY'])),
+          attachService: jest.fn(),
         })
       );
 
@@ -167,6 +169,7 @@ describe('POST /apps/:name/start and /apps/:name/restart (platform ops)', () => 
       setPlatformOps(
         makeOps({
           restartApp: jest.fn().mockRejectedValue(new AppNeedsConfigError('test-app', ['JWT_SECRET'])),
+          attachService: jest.fn(),
         })
       );
 

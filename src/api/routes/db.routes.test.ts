@@ -4,14 +4,20 @@
  * Follows the standalone-ApiServer harness in certs.authz.test.ts. The
  * inspector module is mocked (no real PostgreSQL on this box); `DbUnavailableError`
  * is the REAL class (via jest.requireActual) so the route's `instanceof` checks
- * behave exactly as they do in production.
+ * behave exactly as they do in production. The database/redis provisioner
+ * singletons are mocked the same way (requireActual passthrough, only the
+ * getters stubbed) so the DROP-151 Phase 2 extended-payload fields (redis
+ * flag, quota) can be driven without a real PostgreSQL/Redis on this box.
  *
  * Proves: no existence oracle (foreign/missing app both 404), the read paths
  * are session-only (an API key is refused even with admin role), the 'user'
  * role floor is actually bound (a readonly JWT is refused), `provisioned:false`
  * is a normal 200, every `DbUnavailableError` reason survives the onError
- * 500-collapse with its intended message, and reads never touch the activity
- * log.
+ * 500-collapse with its intended message, reads never touch the activity
+ * log, and the extended GET /db/:name payload (redis flag, persisted services
+ * intent, per-service quota state) is correct — including the deliberately
+ * divergent ownerless `constrained` rule between postgres and redis that
+ * `serviceQuotaState`'s own header comment calls out as not-to-be-normalised.
  */
 
 import * as fs from 'fs/promises';
@@ -21,9 +27,12 @@ import { ApiServer } from '../server';
 import { createUser, createApiKey, resetAuth } from '../middleware/auth';
 import { getTestToken } from '../__testutils__/auth';
 import { getStateManager, resetStateManager } from '../../managers/app/state-manager';
+import { getAppConfigService, resetAppConfigService } from '../../managers/app/app-config';
 import { resetRateLimits } from '../middleware/rate-limit';
 import { getActivityLog, resetActivityLog } from '../../managers/activity';
+import { getMaxDbsPerUser, getMaxRedisPerUser } from '../runtime-config';
 import type { DbOverview, DbTable } from '../../managers/database/app-db-inspector';
+import { serviceQuotaState } from './db';
 
 jest.mock('../../managers/database/app-db-inspector', () => {
   const actual = jest.requireActual('../../managers/database/app-db-inspector');
@@ -34,20 +43,37 @@ jest.mock('../../managers/database/app-db-inspector', () => {
   };
 });
 
+jest.mock('../../managers/database', () => {
+  const actual = jest.requireActual('../../managers/database');
+  return { ...actual, getDatabaseProvisioner: jest.fn() };
+});
+
+jest.mock('../../managers/redis', () => {
+  const actual = jest.requireActual('../../managers/redis');
+  return { ...actual, getRedisProvisioner: jest.fn() };
+});
+
 import {
   getOverview,
   listTables,
   DbUnavailableError,
 } from '../../managers/database/app-db-inspector';
+import { getDatabaseProvisioner } from '../../managers/database';
+import { getRedisProvisioner } from '../../managers/redis';
 
 const mockGetOverview = getOverview as jest.MockedFunction<typeof getOverview>;
 const mockListTables = listTables as jest.MockedFunction<typeof listTables>;
+const mockGetDatabaseProvisioner = getDatabaseProvisioner as jest.MockedFunction<
+  typeof getDatabaseProvisioner
+>;
+const mockGetRedisProvisioner = getRedisProvisioner as jest.MockedFunction<typeof getRedisProvisioner>;
 
 describe('database panel routes (DROP-120)', () => {
   let tempDir: string;
   let server: ApiServer;
   let app: ReturnType<ApiServer['getApp']>;
   let aliceToken: string;
+  let aliceId: string;
   let readonlyToken: string;
   let adminApiKey: string;
 
@@ -60,13 +86,31 @@ describe('database panel routes (DROP-120)', () => {
 
     mockGetOverview.mockReset();
     mockListTables.mockReset();
+    // Default to "no provisioner wired" (matches production on a box where
+    // the DB/Redis layer never booted) — the same shape GET /db/:name already
+    // has to tolerate. Individual tests override this to exercise the
+    // redis-flag / quota fields.
+    mockGetDatabaseProvisioner.mockReset();
+    mockGetDatabaseProvisioner.mockReturnValue(null);
+    mockGetRedisProvisioner.mockReset();
+    mockGetRedisProvisioner.mockReturnValue(null);
 
     resetStateManager();
     resetAuth();
     resetRateLimits();
     resetActivityLog();
+    resetAppConfigService();
     getActivityLog(path.join(tempDir, 'activity-log.json'));
     getStateManager({ stateFilePath: path.join(tempDir, 'apps.json') });
+    // GET /db/:name now reads the persisted services intent (DROP-151 Phase
+    // 2) — getAppConfigService() throws on first use if never initialized
+    // with options, so every test in this file needs it seeded, not just the
+    // ones that assert on `services`.
+    getAppConfigService({
+      configDir: path.join(tempDir, 'appconf', 'webapps'),
+      webappsDir: path.join(tempDir, 'webapps'),
+    });
+    await getAppConfigService().initialize();
 
     server = new ApiServer({
       port: 3097,
@@ -80,6 +124,7 @@ describe('database panel routes (DROP-120)', () => {
     const bob = await createUser('bob', 'password123', 'user');
     const admin = await createUser('root', 'password123', 'admin');
     await createUser('ro', 'password123', 'readonly');
+    aliceId = alice.id;
 
     aliceToken = await getTestToken('alice', 'password123');
     readonlyToken = await getTestToken('ro', 'password123');
@@ -99,6 +144,7 @@ describe('database panel routes (DROP-120)', () => {
     resetAuth();
     resetRateLimits();
     resetActivityLog();
+    resetAppConfigService();
     jest.restoreAllMocks();
     await fs.rm(tempDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   });
@@ -175,7 +221,11 @@ describe('database panel routes (DROP-120)', () => {
       const res = await app.request('/api/v1/db/alice-app', { headers: authHeader(aliceToken) });
       expect(res.status).toBe(200);
       const json = (await res.json()) as { data: DbOverview };
-      expect(json.data).toEqual({
+      // The overview fields are spread alongside the DROP-151 Phase 2
+      // additions (redis flag, services intent, quota) — see the "extended
+      // payload" describe block below for dedicated coverage of those three;
+      // this asserts they don't corrupt or drop the base overview fields.
+      expect(json.data).toMatchObject({
         provisioned: true,
         database: 'alice_app',
         sizeBytes: 1234,
@@ -302,6 +352,126 @@ describe('database panel routes (DROP-120)', () => {
       await app.request('/api/v1/db/alice-app', { headers: authHeader(aliceToken) });
 
       expect(getActivityLog().getEntries().total).toBe(0);
+    });
+  });
+
+  // DROP-151 Phase 2: the additions GET /db/:name carries alongside the base
+  // overview — redis provisioned flag, the persisted attach/detach services
+  // intent, and per-service quota state (see db.ts's own comment on why the
+  // two quotas' `constrained` rule deliberately diverges for an ownerless
+  // app; serviceQuotaState's own unit tests below lock in that divergence
+  // directly).
+  describe('extended payload (DROP-151 Phase 2): redis flag, services intent, quota state', () => {
+    it('defaults redis.provisioned=false, services={}, and both quotas unconstrained when neither provisioner is wired', async () => {
+      mockGetOverview.mockResolvedValue({ provisioned: false });
+
+      const res = await app.request('/api/v1/db/alice-app', { headers: authHeader(aliceToken) });
+      expect(res.status).toBe(200);
+      const json = (await res.json()) as {
+        data: {
+          redis: { provisioned: boolean };
+          services: Record<string, string>;
+          quota: {
+            postgres: { used: number; limit: number; constrained: boolean };
+            redis: { used: number; limit: number; constrained: boolean };
+          };
+        };
+      };
+      expect(json.data.redis).toEqual({ provisioned: false });
+      expect(json.data.services).toEqual({});
+      expect(json.data.quota).toEqual({
+        postgres: { used: 0, limit: getMaxDbsPerUser(), constrained: false },
+        redis: { used: 0, limit: getMaxRedisPerUser(), constrained: false },
+      });
+    });
+
+    it('reports redis.provisioned=true from the redis provisioner independently of the postgres overview', async () => {
+      mockGetOverview.mockResolvedValue({ provisioned: false });
+      mockGetRedisProvisioner.mockReturnValue({
+        isProvisioned: jest.fn().mockReturnValue(true),
+      } as unknown as ReturnType<typeof getRedisProvisioner>);
+
+      const res = await app.request('/api/v1/db/alice-app', { headers: authHeader(aliceToken) });
+      expect(res.status).toBe(200);
+      const json = (await res.json()) as { data: { redis: { provisioned: boolean } } };
+      expect(json.data.redis).toEqual({ provisioned: true });
+    });
+
+    it('surfaces the persisted services attach/detach intent from AppConfigService', async () => {
+      mockGetOverview.mockResolvedValue({ provisioned: false });
+      await getAppConfigService().upsertConfig('alice-app', {
+        services: { postgres: 'attached' },
+      });
+
+      const res = await app.request('/api/v1/db/alice-app', { headers: authHeader(aliceToken) });
+      expect(res.status).toBe(200);
+      const json = (await res.json()) as { data: { services: Record<string, string> } };
+      expect(json.data.services).toEqual({ postgres: 'attached' });
+    });
+
+    it('reports constrained quota usage counted against the owner once a provisioner is wired', async () => {
+      mockGetOverview.mockResolvedValue({ provisioned: false });
+      mockGetDatabaseProvisioner.mockReturnValue({
+        isProvisioned: jest.fn((name: string) => name === 'alice-app'),
+      } as unknown as ReturnType<typeof getDatabaseProvisioner>);
+
+      const res = await app.request('/api/v1/db/alice-app', { headers: authHeader(aliceToken) });
+      expect(res.status).toBe(200);
+      const json = (await res.json()) as {
+        data: { quota: { postgres: { used: number; limit: number; constrained: boolean } } };
+      };
+      expect(json.data.quota.postgres).toEqual({
+        used: 1,
+        limit: getMaxDbsPerUser(),
+        constrained: true,
+      });
+    });
+  });
+
+  // Pure unit coverage of serviceQuotaState itself — exercised through the
+  // route above for the common case, but the ownerless divergence between
+  // postgres (truthy-gated `applicable`) and redis (`!== undefined`-gated) is
+  // easiest to pin precisely at the function boundary, matching how the
+  // route computes each `applicable` argument (see db.ts's GET /:name).
+  describe('serviceQuotaState — the deliberately divergent ownerless "constrained" rule', () => {
+    it('is unconstrained for postgres but constrained for redis when ownerUserId is an empty string (the divergent case)', () => {
+      const isProvisioned = () => false;
+      const postgres = serviceQuotaState('', 3, Boolean(''), isProvisioned);
+      const redis = serviceQuotaState('', 3, ('' as string | undefined) !== undefined, isProvisioned);
+      expect(postgres).toEqual({ used: 0, limit: 3, constrained: false });
+      expect(redis).toEqual({ used: 0, limit: 3, constrained: true });
+    });
+
+    it('is unconstrained for BOTH when the app is fully ownerless (userId undefined)', () => {
+      const isProvisioned = () => false;
+      const ownerUserId: string | undefined = undefined;
+      const postgres = serviceQuotaState(ownerUserId, 3, Boolean(ownerUserId), isProvisioned);
+      const redis = serviceQuotaState(ownerUserId, 3, ownerUserId !== undefined, isProvisioned);
+      expect(postgres).toEqual({ used: 0, limit: 3, constrained: false });
+      expect(redis).toEqual({ used: 0, limit: 3, constrained: false });
+    });
+
+    it('is unconstrained when the limit is zero or negative, even with an owner and applicable=true', () => {
+      const result = serviceQuotaState('alice-id', 0, true, () => true);
+      expect(result).toEqual({ used: 0, limit: 0, constrained: false });
+    });
+
+    it('is unconstrained when no isProvisioned function is supplied (provisioner unwired)', () => {
+      const result = serviceQuotaState('alice-id', 3, true, undefined);
+      expect(result).toEqual({ used: 0, limit: 3, constrained: false });
+    });
+
+    it('counts zero used for an owner who owns no provisioned app under this service', () => {
+      // Exercised against the REAL state manager seeded in the outer
+      // beforeEach (alice-app/bob-app), so this also proves the counting
+      // filters by owner correctly rather than counting every provisioned app.
+      const result = serviceQuotaState('nobody-owns-this-app', 5, true, () => true);
+      expect(result).toEqual({ used: 0, limit: 5, constrained: true });
+    });
+
+    it("counts only the owner's own provisioned apps against the limit", () => {
+      const result = serviceQuotaState(aliceId, 5, true, (name) => name === 'alice-app');
+      expect(result).toEqual({ used: 1, limit: 5, constrained: true });
     });
   });
 });

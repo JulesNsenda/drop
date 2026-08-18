@@ -189,6 +189,16 @@ export interface AppConfig {
    * standalone apps. See docs/plans/2026-07-12-monorepo-multi-service.md (M2).
    */
   group?: string;
+  /**
+   * The owner's explicit attach/detach intent per backing service, keyed by the
+   * catalog's extension id ('postgres' | 'redis'). SYSTEM-OWNED: written only by
+   * the attach/detach routes from fixed literals, NEVER from a request body.
+   * That containment is complete by construction today — the one route that
+   * accepts a body goes through `pickUpdatableFields` (apps.ts), an ALLOWLIST
+   * over `UPDATABLE_APP_FIELDS` that writes `AppState`, not `AppConfig`. Keep it
+   * that way: do not add a route that spreads a body into upsert/updateConfig.
+   */
+  services?: Record<string, 'attached' | 'detached'>;
 }
 
 export interface AppConfigServiceOptions {

@@ -16,7 +16,12 @@ import { AuthContext, listUsers, getUserById } from '../middleware/auth';
 import { canAccess } from '../access';
 import { isValidAppName, validateAppName } from '../middleware/validate';
 import { getAppRuntime } from '../../managers/runtime';
-import { getPlatformOps, AppInProgressError, AppNeedsConfigError } from '../platform-ops';
+import {
+  getPlatformOps,
+  AppInProgressError,
+  AppNeedsConfigError,
+  type AttachableServiceId,
+} from '../platform-ops';
 import { getSecretManager } from '../../managers/secret';
 import { getDeployTracker } from '../../managers/deploy-tracker';
 import { migrateAppRuntime } from '../../managers/runtime/runtime-migrator';
@@ -1043,6 +1048,96 @@ apps.post('/:name/restart', async c => {
       );
     }
     const message = err instanceof Error ? err.message : 'Failed to restart';
+    return c.json(error(ErrorCodes.INTERNAL_ERROR, message), 500);
+  }
+});
+
+/**
+ * Backing services attachable via POST /:name/services/:id — a closed set, not
+ * "any string". Mirrors `AttachableServiceId` (platform-ops.ts); kept as a
+ * separate literal array here (rather than importing a value from a type-only
+ * module) so an unrecognized id is rejected with a clear message before ever
+ * reaching the platform op.
+ */
+const ATTACHABLE_SERVICE_IDS = ['postgres', 'redis'] as const;
+
+// POST /apps/:name/services/:id - Attach a backing service (DROP-151 Phase 2).
+// Quota check -> provision -> persist intent -> restart; see
+// DropPlatform.attachService for the full ordering and its refusal reasons.
+// No detach here (Phase 3) and no GET collection route — that data lives on
+// GET /db/:name instead (see db.ts).
+apps.post('/:name/services/:id', async c => {
+  const auth = (c.get as Function)('auth') as AuthContext | undefined;
+  const name = c.req.param('name');
+  const serviceId = c.req.param('id');
+
+  if (!(ATTACHABLE_SERVICE_IDS as readonly string[]).includes(serviceId)) {
+    throw new ValidationError(
+      `Unknown service '${serviceId}' — must be one of: ${ATTACHABLE_SERVICE_IDS.join(', ')}`
+    );
+  }
+
+  const stateManager = getStateManager();
+  const app = stateManager.getApp(name);
+
+  if (!app || !canAccess(auth, app)) {
+    throw new NotFoundError(`Application '${name}' not found`);
+  }
+
+  const ops = getPlatformOps();
+  if (!ops) {
+    return c.json(error(ErrorCodes.SERVICE_UNAVAILABLE, 'Platform operations unavailable'), 503);
+  }
+
+  try {
+    const result = await ops.attachService(name, serviceId as AttachableServiceId);
+    if (!result.attached) {
+      // 'service-unavailable' is not a conflict — the instance simply has no
+      // such service, permanently and correctly. 503 says "not here", 409
+      // would say "you asked at a bad time" and invite a pointless retry.
+      const status = result.reason === 'service-unavailable' ? 503 : 409;
+      const code =
+        result.reason === 'service-unavailable'
+          ? ErrorCodes.SERVICE_UNAVAILABLE
+          : ErrorCodes.CONFLICT;
+      return c.json(error(code, result.detail, { reason: result.reason, quota: result.quota }), status);
+    }
+
+    await logActivityFor(auth, {
+      action: 'attach-service',
+      appName: name,
+      detail: serviceId,
+    });
+
+    // envVarNames only — NEVER the provisioned values. The Postgres binding
+    // is a DSN containing the role's plaintext password.
+    return c.json(
+      success({ message: `${serviceId} attached to '${name}'`, envVarNames: result.envVarNames })
+    );
+  } catch (err) {
+    if (err instanceof AppInProgressError) {
+      return c.json(error(ErrorCodes.CONFLICT, err.message), 409);
+    }
+    // The restart at the end of an attach runs the secret preflight, so this
+    // is reachable — and it matters more here than on a plain restart: by the
+    // time it throws, the database and the persisted intent are REAL. Without
+    // this branch the caller gets an opaque 500 and never learns which
+    // secrets to set, while a database sits provisioned against their quota.
+    // The activity entry below is deliberately written for this case too, so
+    // an attach that provisioned real resources is never invisible in the
+    // audit trail just because the restart parked the app.
+    if (err instanceof AppNeedsConfigError) {
+      await logActivityFor(auth, { action: 'attach-service', appName: name, detail: serviceId });
+      return c.json(
+        error(
+          ErrorCodes.CONFLICT,
+          `'${serviceId}' was attached to '${name}', but the app needs configuration before it ` +
+            `can start — set required secret(s): ${err.missingSecrets.join(', ')}, then restart`
+        ),
+        409
+      );
+    }
+    const message = err instanceof Error ? err.message : 'Failed to attach service';
     return c.json(error(ErrorCodes.INTERNAL_ERROR, message), 500);
   }
 });

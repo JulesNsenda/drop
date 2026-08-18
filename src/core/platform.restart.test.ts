@@ -684,4 +684,179 @@ describe('DropPlatform.restartApp', () => {
 
     expect(proberSpy).toHaveBeenCalledWith('site', port, '/health');
   }, 20000);
+
+  // ── DROP-151: AppConfig.services attach/detach intent ──────────────────────
+  //
+  // The critical bug this phase exists to fix: the draft persisted DETACH
+  // intent only, so the very user who clicks Add — the one whose app didn't
+  // infer a database — lost DATABASE_URL on the next deploy while the
+  // database survived and kept burning a maxDbsPerUser slot. These exercise
+  // the real deploy path (handleStartApp) and the real restart path
+  // (buildFreshStartSpec), not just the appNeedsDatabase/appNeedsRedis
+  // predicates in isolation — see platform.database-detection.test.ts and
+  // platform.redis-detection.test.ts for those, and
+  // platform.service-quota.test.ts for the quota checks this phase extracted.
+  describe('DROP-151: AppConfig.services attach/detach intent', () => {
+    const fakeRedisProvisioner = () => ({
+      isProvisioned: jest.fn().mockReturnValue(false),
+      provisionAppRedis: jest.fn().mockResolvedValue({ db: 3 }),
+      getEnvVars: jest.fn().mockReturnValue({
+        REDIS_URL: 'redis://127.0.0.1:6380/3',
+        REDIS_DB: '3',
+      }),
+    });
+
+    it('attach is durable across a (re)deploy — an app with NO db signal at all still gets DATABASE_URL (the critical bug)', async () => {
+      platform = makePlatform();
+      await platform.start();
+
+      // Pre-seed the intent BEFORE the app is even known to the platform —
+      // upsertConfig merges (...existing, ...updates), so handleAppDetected's
+      // own upsertConfig call below (type/path/hostname) preserves it.
+      await getAppConfigService().upsertConfig('site', {
+        services: { postgres: 'attached' },
+      });
+
+      // index.html only — no package.json, no ORM file, no drop.yaml
+      // database: — every existing signal says no database is needed.
+      const appPath = await createStaticApp('site');
+      const startSpy = jest.spyOn(fakeRuntime, 'start');
+      await deploy('site', appPath);
+
+      const spec = startSpy.mock.calls[startSpy.mock.calls.length - 1][0];
+      expect(spec.env!.DATABASE_URL).toBe('postgresql://mock-db/app');
+    }, 20000);
+
+    it('detach is honoured on deploy — no DATABASE_URL is injected and nothing is provisioned', async () => {
+      platform = makePlatform();
+      await platform.start();
+
+      await getAppConfigService().upsertConfig('site', {
+        services: { postgres: 'detached' },
+      });
+
+      const appPath = await createStaticApp('site');
+      const startSpy = jest.spyOn(fakeRuntime, 'start');
+      // The shared dbProvisioner mock is a module-level singleton (jest.mock
+      // factory, not per-test) whose call history is NOT reset by
+      // jest.restoreAllMocks() in afterEach — that only restores jest.spyOn
+      // spies. Clear it immediately before the assertion-relevant call so an
+      // earlier test's provisioning doesn't make this pass for the wrong
+      // reason.
+      ((platform as any).dbProvisioner.provisionAppDatabase as jest.Mock).mockClear();
+      await deploy('site', appPath);
+
+      expect((platform as any).dbProvisioner.provisionAppDatabase).not.toHaveBeenCalled();
+      const spec = startSpy.mock.calls[startSpy.mock.calls.length - 1][0];
+      expect(spec.env!.DATABASE_URL).toBeUndefined();
+    }, 20000);
+
+    it('detach is honoured on restart, even though the provisioner still reports a DATABASE_URL for an existing allocation', async () => {
+      platform = makePlatform();
+      await platform.start();
+      const appPath = await createStaticApp('site');
+      // Deploy normally — the shared dbProvisioner mock's getEnvVars always
+      // reports a DATABASE_URL, modelling an app with an existing allocation.
+      await deploy('site', appPath);
+
+      // Detach clicked AFTER the deploy — the deprovision may have failed
+      // partway (DROP DATABASE succeeded, DROP USER did not), so the
+      // provisioner's registry entry is still alive and getEnvVars would
+      // otherwise still hand back a DSN for a database that no longer exists.
+      await getAppConfigService().updateConfig('site', {
+        services: { postgres: 'detached' },
+      });
+
+      const startSpy = jest.spyOn(fakeRuntime, 'start');
+      await platform!.restartApp('site');
+
+      const spec = startSpy.mock.calls[startSpy.mock.calls.length - 1][0];
+      expect(spec.env!.DATABASE_URL).toBeUndefined();
+    }, 20000);
+
+    it('attach is durable across a (re)deploy for Redis too — an app with no redis signal at all still gets REDIS_URL', async () => {
+      platform = makePlatform();
+      await platform.start();
+
+      await getAppConfigService().upsertConfig('site', {
+        services: { redis: 'attached' },
+      });
+
+      const redis = fakeRedisProvisioner();
+      (platform as any).redisProvisioner = redis;
+
+      const appPath = await createStaticApp('site');
+      const startSpy = jest.spyOn(fakeRuntime, 'start');
+      await deploy('site', appPath);
+
+      expect(redis.provisionAppRedis).toHaveBeenCalledWith('site');
+      const spec = startSpy.mock.calls[startSpy.mock.calls.length - 1][0];
+      expect(spec.env!.REDIS_URL).toBe('redis://127.0.0.1:6380/3');
+    }, 20000);
+
+    it('detach on the restart path wins even though isProvisioned still reports an existing Redis allocation', async () => {
+      platform = makePlatform();
+      await platform.start();
+      const appPath = await createStaticApp('site');
+      await deploy('site', appPath);
+
+      const redis = fakeRedisProvisioner();
+      // Simulates a still-live logical DB — deprovision failed, or simply
+      // hasn't run yet — which is exactly the case provisionRedisEnvVars'
+      // detached check must catch BEFORE the "already provisioned" early
+      // return, or detach would be silently ignored here.
+      redis.isProvisioned.mockReturnValue(true);
+      (platform as any).redisProvisioner = redis;
+
+      await getAppConfigService().updateConfig('site', {
+        services: { redis: 'detached' },
+      });
+
+      const startSpy = jest.spyOn(fakeRuntime, 'start');
+      await platform!.restartApp('site');
+
+      expect(redis.getEnvVars).not.toHaveBeenCalled();
+      const spec = startSpy.mock.calls[startSpy.mock.calls.length - 1][0];
+      expect(spec.env!.REDIS_URL).toBeUndefined();
+    }, 20000);
+
+    it("intent beats an explicit manifest declaration, in both directions", async () => {
+      platform = makePlatform();
+      await platform.start();
+      const startSpy = jest.spyOn(fakeRuntime, 'start');
+
+      // Direction 1: manifest silent (no drop.yaml at all), intent attaches anyway.
+      await getAppConfigService().upsertConfig('attach-wins', {
+        services: { postgres: 'attached' },
+      });
+      const attachPath = await createStaticApp('attach-wins');
+      await deploy('attach-wins', attachPath);
+      const attachSpec = startSpy.mock.calls.find((c) => c[0].name === 'attach-wins')![0];
+      expect(attachSpec.env!.DATABASE_URL).toBe('postgresql://mock-db/app');
+
+      // Direction 2: manifest explicitly declares database: postgres, intent
+      // detaches anyway — the owner's click outranks a stale/third-party
+      // manifest (e.g. deploy_from_git).
+      await getAppConfigService().upsertConfig('detach-wins', {
+        services: { postgres: 'detached' },
+      });
+      const detachPath = await createStaticApp('detach-wins');
+      // manifestDetector fires on ANY drop.yaml at confidence 1.0 and
+      // resolves to type 'unknown' (no build strategy) unless the manifest
+      // also names a real type — 'type' IS a valid top-level key (unlike
+      // addHealthCheck's comment above, written for a restart where the
+      // resulting 'unknown' is harmless because FakeRuntime never executes
+      // the spec); this is a first deploy, so it must actually build.
+      await fs.writeFile(
+        path.join(detachPath, 'drop.yaml'),
+        'type: static\ndatabase: postgres\n'
+      );
+      const provisionSpy = (platform as any).dbProvisioner.provisionAppDatabase as jest.Mock;
+      provisionSpy.mockClear();
+      await deploy('detach-wins', detachPath);
+      const detachSpec = startSpy.mock.calls.find((c) => c[0].name === 'detach-wins')![0];
+      expect(detachSpec.env!.DATABASE_URL).toBeUndefined();
+      expect(provisionSpy).not.toHaveBeenCalled();
+    }, 30000);
+  });
 });

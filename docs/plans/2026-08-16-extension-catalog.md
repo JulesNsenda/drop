@@ -537,6 +537,95 @@ Separate corpus from the plan-stage panel above. Panel: `security-critic`,
 **Dropped without individual reasons:** security 0 medium / 3 low (2 were
 "verified, not a finding"); architecture 1 medium / 2 low.
 
+### Phase 2 · pass 1 (backend)
+
+Panel: `security-critic`, `architecture-critic`, two `test-runner` passes.
+Phase 2 attracted far more review debt than Phase 1 — it touches `platform.ts`,
+provisions real resources, and its guards are ordering-sensitive.
+
+**Actioned**
+
+- **Skeleton `AppConfig` → boot-time corruption** (architecture, *high/high*;
+  security, *low/medium*). Attach on a state-only app would mint a config with
+  `type: 'unknown'` and no `path`; `syncStateWithConfigs` then calls
+  `registerApp(name, config.path || <appsDirectory>/name, config.type)` on the
+  next boot, relocating an out-of-tree app and resetting its type. Now a
+  `no-app-config` refusal.
+- **Redis had no owner-supplied-URL refusal** (security, *medium/high*). The
+  guard was built for Postgres only; `redisEnvVars` is spread after
+  `secretEnvVars` too, so attaching over an owner's `REDIS_URL` silently
+  empties a live session store. Added `appRedisUrlSource` + a
+  `has-own-redis-url` refusal + the deploy-path warning. Mutation-verified.
+- **Per-user quota race** (security, *medium/high*). `appsInProgress` is keyed
+  per app; the quota is per user. Added an owner-keyed serialisation lock over
+  the whole check-then-provision span.
+- **`service-unavailable` was a throw → 500** (architecture, *medium/high*).
+  Now a structured refusal → 503.
+- **`AppNeedsConfigError` unhandled** (architecture, *medium/high*; security,
+  *low/high*). By then the database and intent are real; the opaque 500
+  stranded a quota-consuming database with no audit entry. Handled, and
+  audited in that arm.
+- **`resetRedisProvisioner()`** in the soft-failure catch — open question 8,
+  which the plan had explicitly scheduled for this phase (architecture,
+  *medium/high*; security, *low/medium*).
+- **Rate-limit bucket on a nonexistent route** (architecture, *low/high*).
+  Removed; it ran before auth, so it only let unauthenticated callers drain the
+  shared budget through a 404.
+- **`attachService` had no test at any level** (architecture, *high/high*) —
+  every route test mocks it. Now 28 platform-level tests pinning guard
+  *ordering*, not just outcomes; three mutations verified.
+- **`serviceQuotaState`'s doc comment was wrong** about the ownerless
+  divergence (test-runner). Corrected: for `undefined` BOTH report `false`; the
+  divergence is the empty-string case. Both pinned by tests.
+
+**Rejected — recorded**
+
+- **Move intent `'attached'` below the `appDatabaseUrlSource` check**
+  (architecture, *medium-high/high*; security, *medium/high*). **Partly
+  rejected.** An explicit `database: postgres` already outranks the app's own
+  URL by design — the code says so — so making a button click behave
+  differently would be a new inconsistency, and it breaks the plan's own
+  `intent > manifest > inference` rule. The hazard is real but pre-existing and
+  shared with `database:`. Actioned as a loud warning on both services instead;
+  the precedence question belongs in its own change. **The security critic's
+  admin angle is the strongest counter-argument and is NOT dismissed**: an
+  admin can now persist an intent that outranks the owner's own `DATABASE_URL`
+  secret, which they previously had no API path to. Recorded as open question
+  12.
+
+**Open — deliberately not fixed, carried forward**
+
+10. **Display and enforcement read different handles.** `db.ts` reimplements
+    quota against module singletons; `checkDbQuota` uses instance fields. The
+    right fix deletes code: expose `getServiceQuota` via `PlatformOps` and drop
+    `serviceQuotaState` plus both `runtime-config` accessors and their
+    `ApiServerConfig` plumbing (architecture, *medium-high/high* and
+    *medium/high*; security, *low/medium*).
+11. **The `AppConfig` setter split was specified and not built** (architecture,
+    *high/high*; security, *low/high*). Containment holds today — every writer
+    passes fixed literals and the one body-accepting route uses an allowlist
+    over `AppState` — but nothing structural keeps it holding, and `services`
+    now decides whether real Postgres roles exist. Also: `attachService`
+    spreads a pre-`await` config snapshot, a lost update once Phase 3 adds a
+    second writer.
+12. **Attach-time-only conflict evaluation**, incl. the admin override above.
+13. **`GET /db/:name` couples Redis/intent readability to Postgres health** —
+    the new fields are computed inside the `try`, so a `DbUnavailableError`
+    hides them. On a Postgres-less box the Redis attach state is unreadable
+    (architecture, *medium/high*).
+14. **Attach restarts a deliberately stopped app** (security, *low/medium*).
+15. **Refusals are unaudited** — only success is logged (security, *low/high*).
+16. **`NaN` quota fails open** on a malformed env value (security,
+    *low/medium*). Pre-existing; load-bearing for the first time.
+17. **Ephemeral check is not transitive** for monorepo children (security,
+    *low/high*).
+18. **Rate-limit matching is a property of the whole route set**, not the
+    pattern — needs a behavioural 429 test, not a comment (security,
+    *low/low*).
+19. **Phase 3 must add**: `secrets.ts` gates on `isProvisioned`, which a
+    partial detach makes wrong (hard lockout); and detach must restart, or
+    `services` must join the boot-reconcile skip inputs.
+
 ### Test pass
 
 `npm test`: **2955 passed, 6 failed, 8 skipped / 2969**. All 5 failing suites

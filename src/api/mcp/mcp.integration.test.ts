@@ -28,6 +28,7 @@ const MCP_URL = `http://127.0.0.1:${PORT}/api/v1/mcp`;
 function makeOps(overrides?: Partial<PlatformOps>): PlatformOps {
   return {
     restartApp: jest.fn(),
+    attachService: jest.fn(),
     isAppInProgress: jest.fn().mockReturnValue(false), promoteApp: jest.fn(),
     removeGroup: jest.fn().mockResolvedValue({ removed: [] }),
     purgeAppArtifacts: jest.fn().mockResolvedValue(undefined),
