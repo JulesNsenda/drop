@@ -1,8 +1,6 @@
 name: CI
 
 on:
-  push:
-    branches: [main, develop]
   pull_request:
     branches: [main, develop]
 
@@ -22,73 +20,13 @@ jobs:
     # postinstall scripts, on every PR (including from forks).
     # upload-artifact defaults to false: CI never ships anything, so there is
     # nothing here worth packaging.
-
-  # One mechanism, not two: files or updates a single GitHub issue rather than
-  # a webhook conditioned on a secret that may not exist.
-  #
-  # `!cancelled()` (not bare `!success()`) is the concurrency-aware form for
-  # THIS workflow specifically: `concurrency: cancel-in-progress: true` above
-  # means a second push to the same branch routinely cancels the first run's
-  # jobs mid-flight, and bare `!success()` would file/comment on the ci-failure
-  # issue for that ordinary event -- the exact "alarm that cries wolf gets
-  # muted" failure this notify job exists to avoid reintroducing (see the
-  # plan's reasoning for cutting the old hourly drift check). deploy.yml's
-  # notify job keeps plain `!success()` because ITS concurrency group has
-  # cancel-in-progress: false, so a cancellation there means something did.
-  #
-  # Restricted to main/develop pushes only: `github.ref_name` on a
-  # pull_request run is the PR's merge ref (e.g. "42/merge"), never "main" or
-  # "develop", so this also keeps PR runs quiet without a separate check --
-  # but the event_name guard is asserted explicitly rather than relied on
-  # implicitly, so this does not silently start firing on PRs if GitHub ever
-  # changes that ref shape.
-  notify:
-    needs: [verify]
-    if: >-
-      ${{ !success() && !cancelled() && github.event_name == 'push' &&
-          (github.ref_name == 'main' || github.ref_name == 'develop') }}
-    runs-on: ubuntu-latest
-    permissions:
-      issues: write
-    steps:
-      - name: File or update a CI failure issue
-        env:
-          # NEVER interpolate ${{ }} directly into a run: block -- see
-          # release.yml's identical comment. A crafted commit message or
-          # branch name would otherwise execute on a runner in the same
-          # workflow that (in deploy.yml) also holds the deploy key. Values
-          # arrive as env vars and are referenced as "$VAR" below instead.
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPO: ${{ github.repository }}
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          WORKFLOW: ${{ github.workflow }}
-          BRANCH: ${{ github.ref_name }}
-          SHA: ${{ github.sha }}
-          VERIFY_RESULT: ${{ needs.verify.result }}
-        run: |
-          set -euo pipefail
-
-          LABEL="ci-failure"
-          TITLE="CI failing on $BRANCH"
-
-          BODY="$(cat <<EOF
-          Run: $RUN_URL
-          Workflow: $WORKFLOW
-          Branch: $BRANCH
-          Commit: $SHA
-          Job: verify=$VERIFY_RESULT
-          EOF
-          )"
-
-          # gh issue create --label fails outright if the label does not yet
-          # exist on the repo. Idempotent: a no-op once the label exists.
-          gh label create "$LABEL" --repo "$REPO" --color "d73a4a" \
-            --description "Automated CI/deploy failure notification" 2>/dev/null || true
-
-          EXISTING=$(gh issue list --repo "$REPO" --label "$LABEL" --state open --json number --jq '.[0].number // empty')
-
-          if [ -n "$EXISTING" ]; then
-            gh issue comment "$EXISTING" --repo "$REPO" --body "$BODY"
-          else
-            gh issue create --repo "$REPO" --title "$TITLE" --body "$BODY" --label "$LABEL"
-          fi
+    #
+    # No `on: push` and no notify job here: this workflow used to trigger on
+    # push to main/develop too, which duplicated deploy.yml's identical
+    # _verify.yml call for zero extra signal (deploy.yml already runs on a
+    # superset of branches) and raced deploy.yml's notify job over the same
+    # ci-failure label -- both queried it, both saw nothing, both filed,
+    # after which the second issue's `.[0]` comment attached a DEPLOY failure
+    # to an issue titled "CI failing". Now pull_request-only: a PR's own
+    # checks UI already surfaces a failure to the person who can fix it, and
+    # deploy.yml's notify job is the one mechanism for push failures.

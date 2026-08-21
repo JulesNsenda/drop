@@ -13,22 +13,31 @@ on:
     inputs:
       upload-artifact:
         description: >-
-          Package drop-dist.tar.gz, upload it as a build artifact, and emit
-          its sha256 as a workflow output. ci.yml runs on every push AND
-          every pull_request (including from forks) and never ships
-          anything, so it leaves this false and skips packaging entirely.
-          deploy.yml is the only caller that needs the artifact -- it
-          downloads it in the deploy job and verifies the digest before
-          shipping.
+          Upload drop-dist.tar.gz as a build artifact. The tarball is always
+          packaged and hashed (both ~1s) regardless of this input, so on any
+          successful verify run the tarball-sha256 output below is populated
+          whether or not this flag is set -- only the upload itself (and the
+          runner-to-runner transfer it implies) is gated, since ci.yml runs
+          on every pull_request (including from forks) and never ships
+          anything. deploy.yml is the only caller that sets this true -- it
+          downloads the artifact in the deploy job and verifies the digest
+          before shipping.
         type: boolean
         default: false
     outputs:
       tarball-sha256:
         description: >-
-          sha256 of drop-dist.tar.gz, populated only when upload-artifact is
-          true (empty string otherwise). Reusable-workflow outputs are
-          strings, so the digest travels to the caller even though the
-          artifact itself is run-scoped and must be downloaded separately.
+          sha256 of drop-dist.tar.gz. Populated on any successful verify run
+          regardless of upload-artifact -- packaging and hashing are
+          unconditional, not gated on the flag, so this is never empty
+          because of upload-artifact being false. It IS still empty if the
+          job fails before the Hash artifact step (e.g. Test), which is why
+          deploy.yml's digest-check step still guards against an empty
+          EXPECTED_SHA256 rather than trusting this to always be set --
+          belt-and-braces, not the only thing standing between a skipped
+          step and a production ship. When upload-artifact is false there is
+          no artifact to download, only this digest of a tarball that was
+          built and hashed but not uploaded.
         value: ${{ jobs.verify.outputs.tarball-sha256 }}
 
 # No `secrets:` block: this workflow needs none, and a called workflow can
@@ -38,6 +47,19 @@ on:
 # there is nothing here for a secret to do, and passing one would hand it to
 # every future step added to this file, including two `npm ci` runs' worth of
 # transitive postinstall scripts.
+#
+# That isolation currently rests on CALLER DISCIPLINE, not on scope, and it
+# is worth being honest about that: verified against the repo, DEPLOY_HOST,
+# DEPLOY_KEY_B64 and DEPLOY_USER are REPOSITORY-level secrets (`gh secret
+# list`), and the `hetzner` environment they are read from at the deploy job
+# has zero secrets of its own (`gh api .../environments/hetzner/secrets` ->
+# `total_count: 0`). A repository secret is available to `secrets: inherit`
+# from ANY caller, environment-scoped or not -- nothing about `hetzner`'s
+# approval/branch-protection gate keeps a `secrets: inherit` on this file
+# from handing the deploy key to a PR-triggered `npm ci`. The durable fix is
+# moving those three secrets onto the `hetzner` environment itself, so scope
+# enforces what today only the "never write `secrets: inherit`" convention
+# does.
 #
 # Also deliberately no `environment:` anywhere in this file -- `deploy.yml`'s
 # `hetzner` environment carries approval/branch protection rules, and a
@@ -72,6 +94,17 @@ jobs:
 
       - name: Lint
         run: npm run lint
+
+      # shellcheck ships preinstalled on ubuntu-latest -- no third-party
+      # action to pin. install.sh is 1018 lines and was never linted before
+      # this (a deferred item from the original bootstrap plan).
+      # --severity=warning, not the default (which includes style/info):
+      # install.sh:279 trips SC1091 ("not following: /etc/os-release was not
+      # specified as input") at info level, and it is cosmetic here -- that
+      # file is a real target's /etc/os-release, not something in this repo
+      # shellcheck could follow with -x either. Warning-and-above is clean.
+      - name: Shellcheck install.sh
+        run: shellcheck --severity=warning install.sh
 
       # Moved here from deploy.yml (Landing B): this step parses
       # .github/workflows/deploy.yml directly off the checkout, so it works
@@ -123,8 +156,15 @@ jobs:
       # Tarball, not raw dist/: an artifact upload does not preserve the
       # executable bit, and `bin: ./dist/cli/index.js` in package.json
       # depends on it. Same command deploy.yml has always run.
+      #
+      # Unconditional, not gated on upload-artifact: packaging and hashing
+      # are both ~1s, so the cost of doing them on every ci.yml run is
+      # negligible, and it means tarball-sha256 is populated on any
+      # successful verify run regardless of the flag -- one definition of
+      # "good" instead of two (a packaged-and-hashed run and an unpackaged
+      # one). Only the Upload artifact step below, which actually ships
+      # bytes off the runner, is worth gating.
       - name: Package artifact
-        if: ${{ inputs.upload-artifact }}
         run: |
           tar -czf drop-dist.tar.gz dist/ install.sh package.json package-lock.json
 
@@ -133,7 +173,6 @@ jobs:
       # the deploy job could recompute from a tarball that already passed
       # through an extra hop (download-artifact, then scp).
       - name: Hash artifact
-        if: ${{ inputs.upload-artifact }}
         id: hash
         run: |
           echo "sha256=$(sha256sum drop-dist.tar.gz | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"

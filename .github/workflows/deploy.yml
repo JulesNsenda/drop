@@ -48,13 +48,19 @@ jobs:
         with:
           name: drop-dist
 
-      # A compromised transitive postinstall in the verify job's two `npm ci`
-      # runs could otherwise write straight to production with nothing
-      # comparing digests between the build and deploy jobs. The verify job
-      # hashes the tarball it just built, in the same job that built it
-      # (trustworthy evidence about what CI actually produced); this
-      # re-hashes the copy that came back through download-artifact and
-      # refuses to ship on any mismatch, loudly, before it ever reaches scp.
+      # This protects TRANSPORT integrity, not build-time integrity: the
+      # digest is computed after `npm ci`, in the same job, on the same tree
+      # that produced the artifact, so a compromised transitive postinstall
+      # in the verify job's two `npm ci` runs would be faithfully hashed and
+      # certified along with everything else -- this step cannot catch that
+      # class of compromise. What it does catch is corruption or tampering
+      # introduced by the upload-artifact / download-artifact hop itself
+      # (the only untrusted transfer the tarball makes between being built
+      # and being shipped): the verify job hashes the tarball it just built,
+      # in the same job that built it, and this re-hashes the copy that came
+      # back through download-artifact, refusing to ship on any mismatch.
+      # Closing the build-time gap needs `npm ci --ignore-scripts` or build
+      # provenance attestation -- a separate change, not this one.
       - name: Verify artifact digest
         env:
           EXPECTED_SHA256: ${{ needs.verify.outputs.tarball-sha256 }}
@@ -222,14 +228,28 @@ jobs:
         run: rm -f /tmp/deploy_key
 
   # One mechanism, not two: files or updates a single GitHub issue rather than
-  # a webhook conditioned on a secret that may not exist. `!success()` is
-  # deliberate over `failure()` -- `failure()` does not fire for a CANCELLED
-  # run, and a cancelled deploy is exactly the shape that can leave the box
-  # stopped with the old code not yet fully torn down. This workflow's
-  # concurrency group has cancel-in-progress: false (see the block above), so
-  # unlike ci.yml a cancellation here is never an ordinary superseded-push
-  # event -- it means something genuinely stopped an in-flight deploy, which
-  # is exactly the signal worth keeping.
+  # a webhook conditioned on a secret that may not exist.
+  #
+  # The condition distinguishes by JOB RESULT, not by concurrency policy.
+  # `cancel-in-progress: false` (see the block above) protects a deploy that
+  # is already IN PROGRESS -- it does not stop a second push from superseding
+  # a PENDING one: GitHub allows only one pending run per concurrency group,
+  # so a third push cancels a queued middle run before its `verify` job ever
+  # starts. That is an ordinary superseded-push event, same as ci.yml sees
+  # constantly, and a bare `!success()` (which is true for a cancelled run,
+  # since `!cancelled()` is not part of it) would file a false "Deploy
+  # failing" issue for it. A prior version of this comment claimed
+  # cancel-in-progress: false made that impossible; it does not -- it only
+  # covers the in-progress case.
+  #
+  # `verify.result == 'failure'` / `deploy.result == 'failure'` catch a real
+  # failure in either job. `deploy.result == 'cancelled'` catches the
+  # genuinely dangerous shape this job exists for: a deploy cancelled
+  # mid-flight, e.g. after `systemctl stop` but before the restart, leaving
+  # production down. `always()` is required for the job to evaluate at all
+  # when an upstream job failed or was cancelled -- the default `if` on a job
+  # with `needs:` is `success()`, which would skip this job in exactly the
+  # cases it must run.
   #
   # Deliberately NO branch restriction here, unlike ci.yml's notify job:
   # deploy.yml triggers on main, develop AND feature/DROP-v2*, and the deploy
@@ -240,9 +260,17 @@ jobs:
   # exact scenario this job exists for.
   notify:
     needs: [verify, deploy]
-    if: ${{ !success() && github.event_name == 'push' }}
+    if: ${{ always() && (needs.verify.result == 'failure' || needs.deploy.result == 'failure' || needs.deploy.result == 'cancelled') }}
     runs-on: ubuntu-latest
+    # Job-level `permissions:` REPLACES the workflow default rather than
+    # extending it, so leaving `contents: read` out here (as a prior version
+    # of this job did) would run the token with NO contents scope at all,
+    # not with the top-of-file default. Neither step below reads repo
+    # content, but `contents: read` costs nothing and matches the workflow's
+    # own top-level default rather than silently dropping it for this job.
+    # `issues: write` is the only elevated scope this job needs.
     permissions:
+      contents: read
       issues: write
     steps:
       - name: File or update a deploy failure issue
