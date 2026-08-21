@@ -1,0 +1,98 @@
+# SHA pins (see the `uses:` comments in .github/workflows/*.yml) and this file
+# are paired deliberately: pins without dependabot rot into a mutable checkout
+# frozen forever, and dependabot without pins leaves the mutable-tag exposure
+# a pin exists to close. Neither is a complete answer on its own.
+#
+# TWO THINGS THIS FILE CANNOT DO BY ITSELF, both verified against the API on
+# 2026-08-21 — do not assume dependency safety until they are done:
+#
+#   1. Dependabot reads this config ONLY from the repository's DEFAULT branch,
+#      which is `main`. The branching model lands everything on `develop`, so
+#      this file raises nothing until the next develop -> main release merge.
+#      `target-branch: develop` below controls where PRs are OPENED, not where
+#      the config is READ from.
+#   2. Dependabot ALERTS and SECURITY UPDATES are repository settings, not
+#      config, and both are currently DISABLED (alerts return 404). So this file
+#      delivers scheduled VERSION updates only. Until they are enabled there is
+#      no vulnerability signal at all on a tarball that install.sh ships to
+#      every self-hosted user — and no `npm audit` gate either, which was
+#      declined on the grounds that security PRs would supersede it.
+#
+# Note also that security updates always target the DEFAULT branch and ignore
+# entries carrying `target-branch`, so once enabled they will open against
+# `main`, ungrouped, and unaffected by the limits below.
+version: 2
+updates:
+  # Root package.json / package-lock.json — the platform server.
+  - package-ecosystem: npm
+    directory: /
+    target-branch: develop
+    schedule:
+      # Monthly, not weekly. The limit below is not about review minutes: every
+      # merge to develop stops, ships and restarts production, so the scarce
+      # resource is service interruptions. Batch a month's updates into one
+      # deploy rather than paying three.
+      interval: monthly
+    # Per ENTRY, not global: with three entries the real ceiling is 9 open PRs,
+    # each a production deploy on merge. Batch-merge them into one push.
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: chore
+      include: scope
+    # Bump the lockfile, leave declared ranges alone: package.json encodes
+    # deliberate intent (zod is exact-pinned while everything else is caret)
+    # that the default `auto` strategy would widen silently.
+    versioning-strategy: increase-if-necessary
+    groups:
+      minor-and-patch:
+        update-types:
+          - minor
+          - patch
+    ignore:
+      # A green suite is not evidence for either of these, so a major bump must
+      # be read by a human rather than merged on a checkmark.
+      #   jose  — mocked file-wide via jest.config.js moduleNameMapper
+      #           (src/__mocks__/jose.ts), so no test exercises the real JWT
+      #           sign/verify path that dashboard login, API bearer auth, the
+      #           OAuth connector and MCP all depend on.
+      #   tar   — tar-extract.ts's path-traversal hardening depends on node-tar's
+      #           PAX-override semantics; a major bump there is a silent
+      #           regression in the upload deploy path.
+      - dependency-name: jose
+        update-types: ['version-update:semver-major']
+      - dependency-name: tar
+        update-types: ['version-update:semver-major']
+
+  # src/dashboard has its own package.json / package-lock.json — the React
+  # admin dashboard is a separate npm package, not a workspace of the root.
+  - package-ecosystem: npm
+    directory: /src/dashboard
+    target-branch: develop
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: chore
+      include: scope
+    versioning-strategy: increase-if-necessary
+    groups:
+      minor-and-patch:
+        update-types:
+          - minor
+          - patch
+
+  # The SHA-pinned actions in .github/workflows/*.yml.
+  - package-ecosystem: github-actions
+    directory: /
+    target-branch: develop
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: chore
+      include: scope
+    groups:
+      minor-and-patch:
+        update-types:
+          - minor
+          - patch

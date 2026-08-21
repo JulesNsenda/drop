@@ -57,7 +57,7 @@ exposure open.
 
 `permissions: contents: read` at the top of every workflow, with narrower grants
 only on the job that needs them. `release.yml` already models this
-(`release.yml:24-29`); the other two declare nothing and run at the repository
+(top-level `contents: read`; job-scoped write grants on `publish`); the other two declare nothing and run at the repository
 default, while executing `npm ci` — the full transitive postinstall surface — in
 a job whose token may be write-scoped.
 
@@ -217,6 +217,11 @@ little.
   observed reality minus a margin → ratchet, and `--coverage` on ts-jest adds
   40-100% to a 104s step, so it wants its own job. Follow-up, and now *possible*
   precisely because sharding was cut.
+- **`runs-on: ubuntu-latest`** — itself a mutable tag, and the one that bites in
+  practice (glibc/node/docker CLI rollovers under every job, including the
+  production deploy, with no PR signal). Pinning it is a real tradeoff: a pinned
+  image eventually goes unsupported and hard-fails. Recorded so the supply-chain
+  work is not read as complete when it covers only half the mutable surface.
 - **Host-key pinning** — `StrictHostKeyChecking=no` is carried forward
   unchanged. Worth a `DEPLOY_HOST_KEY` secret, but it is a pre-existing posture,
   not something this change introduces.
@@ -392,6 +397,129 @@ SHA-pinned actions were omitted and outrank everything in the draft**
 or recorded.
 
 ---
+
+## Agent critiques considered — diff stage
+
+### Landing A · pass 1
+
+**Actioned — blocking**
+
+- **Landing A was not inert** (architecture, *critical/high*). The implementer
+  silently upgraded four actions a full major (`@v4` → `v5.x`), two of them on
+  the production deploy path — falsifying §A's "touches nothing that runs" and
+  destroying the bisect property the three-landing split exists to buy. **And the
+  pins were 2-3 majors stale anyway** (*high/high*): checkout is at v7.0.1,
+  setup-node v7.0.0, upload-artifact v7.0.1, download-artifact v8.0.1, so the
+  diff neither preserved what runs nor adopted what is current — it was a
+  mid-2025 snapshot, the fingerprint of versions recalled rather than queried.
+  **Actioned**: repinned to the v4 tips, and verified the floating `@v4` ref
+  resolves to exactly those SHAs for all four actions, so the pins are a provable
+  no-op — the same bytes that ran on the last green deploy.
+  My own Gate 1 check missed this: I verified SHA↔tag correspondence and never
+  asked whether the tag was current.
+- **`persist-credentials: false` was missing** on the `ci.yml`/`deploy.yml`
+  checkouts (security #8, *low/high*) while `release.yml` sets it with a comment
+  explaining exactly why. Checkout writes `GITHUB_TOKEN` into `.git/config`,
+  where two `npm ci` runs of arbitrary postinstall scripts can read it. Graded
+  low by the critic because `contents: read` caps the damage; actioned anyway
+  because it is behaviour-neutral and squarely this landing's remit.
+
+**Actioned — the file's own claims**
+
+- `open-pull-requests-limit` is **per entry**, so the real ceiling is 9 open PRs,
+  not 3, each a production deploy on merge (security #7, *low/high*). The comment
+  asserted a safety property the config did not have; corrected.
+- Cadence moved weekly → monthly, because the scarce resource is service
+  interruptions rather than review minutes (architecture, *high/high*).
+- `jose` and `tar` majors are now ignored, with the reason named in the file
+  (architecture, *high/high*): `jose` is mocked file-wide via
+  `jest.config.js`'s `moduleNameMapper`, so a green suite is not evidence for a
+  JWT bump; `tar-extract.ts`'s path-traversal hardening depends on node-tar's
+  PAX-override semantics. This is the same vacuous-green class as the
+  `fs/promises`-mocked-in-`platform.test.ts` trap.
+- `commit-message` prefix (repo uses conventional commits) and
+  `versioning-strategy: increase-if-necessary` so declared ranges are not
+  widened silently — `zod` is exact-pinned deliberately while everything else is
+  caret.
+
+**Two findings that change what this landing MEANS — surfaced, not silently absorbed**
+
+Both API-verified by me independently, not taken on the critic's word:
+
+1. **Dependabot alerts and security updates are DISABLED on the repository**
+   (security #1, *high/high*). `vulnerability-alerts` returns 404;
+   `dependabot_security_updates` is `disabled`. A config file cannot enable
+   them. So plan §G item 6 — which declined `npm audit` because "Dependabot's
+   security PRs supersede a non-blocking report nobody reads" — rests on a
+   mechanism that does not exist. **Until the setting is enabled there is no
+   vulnerability signal at all** on a tarball `install.sh` ships to every
+   self-hosted user.
+2. **Dependabot reads this config only from the DEFAULT branch, which is `main`**
+   (security #2, *medium/high*). The branching model lands everything on
+   `develop`, so the file is inert on arrival and stays inert until the next
+   `develop` → `main` release merge — a window this repo's own history says is
+   long (the 1.3.0 bump sat on `main` unmerged for a week). `target-branch`
+   governs where PRs open, not where config is read.
+
+Both are recorded in the file's header comment so the next reader cannot mistake
+the file's presence for dependency safety. Neither is fixed here: enabling repo
+settings is the maintainer's call, and landing the config on `main` would deploy
+production from a divergent tree.
+
+**Disagreement resolved — the two critics wanted opposite pins**
+
+Security #4 (*medium/high*) argued for pinning the **current** majors now, so
+dependabot has no major to propose in week one, noting that `download-artifact`
+v8 makes artifact digest mismatch a hard error — a real security gain on the path
+that ships to production. Architecture (*critical/high*) argued for the **v4
+tips**, to keep the landing inert.
+
+**Sided with architecture.** The deciding factor is the plan's own sequencing
+rationale: Landing A exists to be eliminable as a cause when Landing C touches
+production. Jumping four actions across 2-3 majors inside the landing that claims
+to touch nothing that runs reintroduces precisely the defect being fixed, and the
+majors are exactly what dependabot is for — a separate, reviewable PR. The
+underlying digest concern is better answered by security #5's cheaper fix
+(hash the tarball in the build job and re-verify in deploy), which needs no major
+bump; recorded for Landing B.
+
+**Recorded, not actioned**
+
+- **Artifact digest is never verified between the build and deploy jobs**
+  (security #5, *medium/high*) — a compromised postinstall writes straight to
+  production, and §B's "verified artifact" language reads as if this were
+  covered. Deferred because it changes a `run:` step, which Landing A must not.
+  **Landing B.**
+- **Secret scanning and push protection are disabled** on a public repo whose
+  workflows hold a production SSH key, and which has a prior credential-in-repo
+  incident (security #6, *medium/high*). Repo setting; maintainer's call.
+- **The `hetzner` environment has no deployment-branch policy**, so a
+  `feature/DROP-v2*` scratch branch can draw the production SSH key
+  (security #9, *low/medium*). Repo setting; pre-existing.
+- **Deploy-path actions get zero PR validation** — `upload-artifact`/
+  `download-artifact` and the DROP-074 guard's `yaml` dependency appear only in
+  workflows that never run on `pull_request` (architecture, *medium/high*).
+  Landing B mostly dissolves this by moving the upload into `_verify.yml`.
+- **`runs-on: ubuntu-latest` is itself a mutable tag** (architecture,
+  *low/high*) — the supply-chain section covers only half the mutable surface.
+  Added to §G.
+- **`${{ env.SHIPPED_HASH }}` is interpolated into the ssh `run:` block**
+  (security #10, *low/low*) — shape, not exploit, since the value is hex. The
+  comment justifying it points at an `env:` block that does not exist. Landing C
+  rewrites that step entirely.
+- **Duplicating pins across workflow files is deliberate and self-liquidating**
+  (architecture, *low/high*): same-repo reusable workflows are referenced by
+  path and take no SHA, so `_verify.yml` adds zero pins and Landing B reduces the
+  net count. No composite action needed. Recorded so the question is not
+  reopened.
+- **Plan line citations had drifted** (architecture, *low/high*) — §A cited
+  `release.yml:24-29` for the permissions model; it is `:20-21` and `:32-33`.
+  Corrected below. Landing C requires copying a `sudo` invocation verbatim, so
+  stale citations in this document are a live hazard: prefer anchor text to line
+  numbers there.
+
+**Dropped without individual reasons:** architecture 2 medium, 1 low; security
+1 medium, 1 low.
 
 ## Run stats
 
