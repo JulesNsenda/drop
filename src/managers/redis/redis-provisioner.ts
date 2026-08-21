@@ -42,6 +42,13 @@ export class RedisProvisioner {
   private readonly server: RedisServer;
   private readonly allocationsPath: string;
   private allocations: Map<string, RedisAllocation> = new Map();
+  /**
+   * Logical DB numbers whose last deprovision failed to FLUSHDB. Keyed on the
+   * NUMBER, not the app name that used to hold it (see `deprovisionAppRedis`
+   * for why) — a tombstoned number can be handed to any app, not just the one
+   * that vacated it.
+   */
+  private pendingFlushDbs: Set<number> = new Set();
 
   constructor(server: RedisServer, dropRoot: string) {
     this.server = server;
@@ -55,9 +62,17 @@ export class RedisProvisioner {
 
   /**
    * Provision (or return the existing) logical Redis DB for an app. Assigns the
-   * lowest free DB number in [1,15]; throws when the pool is exhausted. A freshly
-   * assigned number is flushed first so a reused DB never leaks a previous
-   * tenant's keys (best-effort — a flush failure never blocks provisioning).
+   * lowest free DB number in [1,15]; throws when the pool is exhausted.
+   *
+   * `nextFreeDb` prefers a free, non-tombstoned number and only falls back to
+   * one tombstoned in `pendingFlushDbs` (its previous tenant's
+   * deprovision failed to FLUSHDB — see `deprovisionAppRedis`) when every
+   * free number is tombstoned. For a tombstoned number the flush is
+   * FAIL-HARD: a failure here throws (same shape as pool exhaustion) rather
+   * than handing out a database that may still hold a deleted tenant's
+   * keys. A non-tombstoned number is flushed best-effort, as before — belt-
+   * and-braces against a number that was freed without ever being
+   * tombstoned.
    */
   async provisionAppRedis(appName: string): Promise<RedisAllocation> {
     const existing = this.allocations.get(appName);
@@ -74,12 +89,32 @@ export class RedisProvisioner {
       );
     }
 
-    // A reused number may belong to a previously-deleted app whose FLUSHDB
-    // failed; flush on assignment so keys never leak across tenants.
-    await this.flushDb(db).catch(() => undefined);
+    if (this.pendingFlushDbs.has(db)) {
+      try {
+        await this.flushDb(db);
+      } catch (err) {
+        throw new Error(
+          `Redis logical database ${db} still could not be flushed (a previous deprovision also ` +
+            `failed to flush it) — refusing to hand it to "${appName}" while it may still hold a ` +
+            `deleted tenant's keys. Retry once Redis is healthy: ${
+              err instanceof Error ? err.message : String(err)
+            }`
+        );
+      }
+      this.pendingFlushDbs.delete(db);
+    } else {
+      // A reused number may belong to a previously-deleted app whose FLUSHDB
+      // failed without ever being tombstoned; flush on assignment so keys
+      // never leak across tenants.
+      await this.flushDb(db).catch(() => undefined);
+    }
 
     const allocation: RedisAllocation = { appName, db, createdAt: new Date() };
     this.allocations.set(appName, allocation);
+    // One save for both mutations (the tombstone removal above, if any, and
+    // this allocation) — a crash between them just leaves the number looking
+    // still-tombstoned on next load, which only costs an unnecessary reflush
+    // next time it's handed out, never a correctness issue.
     await this.saveAllocations();
     return allocation;
   }
@@ -122,41 +157,78 @@ export class RedisProvisioner {
     return Array.from(this.allocations.values());
   }
 
+  /** Logical DB numbers currently tombstoned pending a re-flush (see `deprovisionAppRedis`). */
+  listPendingFlushDbs(): number[] {
+    return Array.from(this.pendingFlushDbs);
+  }
+
   /**
-   * Free an app's logical DB on delete: FLUSHDB (best-effort) then forget it so
-   * the number can be reused. Never throws — a flush failure must not block an
-   * app delete; the number is still released and re-flushed on next assignment.
+   * Free an app's logical DB on delete: FLUSHDB then forget it so the number
+   * can be reused.
+   *
+   * The allocation is freed EITHER WAY — unlike the old retain-on-failure
+   * behaviour, keeping the allocation on a failed flush left no reclaim path
+   * once the app itself is deleted: the caller (delete/teardown) removes the
+   * app right after this call, `nextFreeDb` never considers a number "used"
+   * by a name nobody holds anymore, and the number was gone for good. A
+   * failed flush now tombstones the NUMBER instead (`pendingFlushDbs`, keyed
+   * on the db, not the app), so a later reprovision — of this app or any
+   * other — can still be handed that number, just never unflushed: see
+   * `provisionAppRedis`'s fail-hard flush for a tombstoned number. Never
+   * throws — a flush failure must not block an app delete.
    */
-  async deprovisionAppRedis(appName: string): Promise<{ removed: boolean; flushed: boolean }> {
+  async deprovisionAppRedis(appName: string): Promise<{ removed: boolean; flushed: boolean; hadAllocation: boolean }> {
     const alloc = this.allocations.get(appName);
     if (!alloc) {
-      return { removed: false, flushed: false };
+      return { removed: false, flushed: false, hadAllocation: false };
     }
 
-    let flushed = false;
+    // The allocation is deliberately left in place across the `await` below
+    // (rather than deleted up front) so a concurrent `provisionAppRedis` for
+    // a DIFFERENT app can't see this DB number as free — and therefore skip
+    // the tombstone's fail-hard flush entirely — while this flush is still
+    // in flight.
     try {
       await this.flushDb(alloc.db);
-      flushed = true;
     } catch (err) {
-      console.warn(`[redis-provisioner] FLUSHDB failed for ${appName} (db ${alloc.db}):`, err);
+      console.warn(`[redis-provisioner] FLUSHDB failed for ${appName} (db ${alloc.db}) — allocation freed, db tombstoned pending flush:`, err);
+      this.allocations.delete(appName);
+      this.pendingFlushDbs.add(alloc.db);
+      await this.saveAllocations();
+      return { removed: false, flushed: false, hadAllocation: true };
     }
 
     this.allocations.delete(appName);
+    this.pendingFlushDbs.delete(alloc.db);
     await this.saveAllocations();
-    return { removed: true, flushed };
+    return { removed: true, flushed: true, hadAllocation: true };
   }
 
   // ============ Private Methods ============
 
-  /** Lowest unused logical DB number, or null if all are allocated. */
+  /**
+   * Lowest unused (currently allocated) logical DB number, or null if all
+   * are allocated. Prefers a free number that is NOT tombstoned in
+   * `pendingFlushDbs` — the prior version ignored the tombstone set entirely
+   * and always returned the lowest free number regardless, so a single
+   * failed flush on db 1 made EVERY subsequent provision fail-hard retry
+   * (and fail) on db 1 while dbs 2-15 sat free and clean. A tombstoned
+   * number is only returned when every free number is tombstoned —
+   * `provisionAppRedis` is what fail-hard re-flushes it before handing it
+   * out in that case.
+   */
   private nextFreeDb(): number | null {
     const used = new Set(Array.from(this.allocations.values()).map((a) => a.db));
+    let tombstonedFallback: number | null = null;
     for (let db = MIN_APP_DB; db <= MAX_APP_DB; db++) {
-      if (!used.has(db)) {
-        return db;
+      if (used.has(db)) continue;
+      if (this.pendingFlushDbs.has(db)) {
+        if (tombstonedFallback === null) tombstonedFallback = db;
+        continue;
       }
+      return db;
     }
-    return null;
+    return tombstonedFallback;
   }
 
   /**
@@ -192,6 +264,7 @@ export class RedisProvisioner {
     } catch {
       // No file yet — first run. Start empty.
       this.allocations.clear();
+      this.pendingFlushDbs.clear();
       return;
     }
 
@@ -201,6 +274,7 @@ export class RedisProvisioner {
     } catch (err) {
       await this.quarantineCorrupt(err);
       this.allocations.clear();
+      this.pendingFlushDbs.clear();
       return;
     }
 
@@ -211,6 +285,7 @@ export class RedisProvisioner {
     ) {
       await this.quarantineCorrupt(new Error('redis-allocations.json has an unexpected shape'));
       this.allocations.clear();
+      this.pendingFlushDbs.clear();
       return;
     }
 
@@ -232,6 +307,19 @@ export class RedisProvisioner {
         db: row.db,
         createdAt: new Date(row.createdAt as string),
       });
+    }
+
+    this.pendingFlushDbs.clear();
+    const pendingRows = (parsed as { pendingFlushDbs?: unknown }).pendingFlushDbs;
+    if (Array.isArray(pendingRows)) {
+      for (const n of pendingRows) {
+        // Defensive, same posture as the allocations loop above: a
+        // hand-edited or corrupt entry is dropped rather than crashing the
+        // load or tombstoning a nonsense number.
+        if (typeof n === 'number' && n >= MIN_APP_DB && n <= MAX_APP_DB) {
+          this.pendingFlushDbs.add(n);
+        }
+      }
     }
   }
 
@@ -259,6 +347,7 @@ export class RedisProvisioner {
         db: a.db,
         createdAt: a.createdAt.toISOString(),
       })),
+      pendingFlushDbs: Array.from(this.pendingFlushDbs),
     };
 
     await fs.mkdir(path.dirname(this.allocationsPath), { recursive: true });
