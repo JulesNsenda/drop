@@ -228,6 +228,13 @@ undone by reverting the code.
 
 ### Phase 3 — detach
 
+> **Superseded 2026-08-20** by "Phase 3 — detach: final plan" at the end of this
+> file, after its own adversarial panel. Two lines below are explicitly amended
+> there: "persist `'detached'` only after the deprovision reports success"
+> (replaced by persist-intent-first with converging retries) and "surface the
+> provider's own result verbatim, including `dumpPath`" (basename to the client,
+> full path server-side only). The rest carries forward.
+
 - [ ] Per-app cooldown **and** a total-size ceiling on `data/backup/pre-delete/`,
       refusing the detach when either is hit. Today `backupAndDeleteAppDatabase`
       runs once per app, terminally; as a button it becomes a repeatable
@@ -686,3 +693,692 @@ The two escapes, recorded plainly rather than rounded away:
 blocking architecture finding plus six security findings). Gates 3 and 4 passed
 first time; the six initial failures in the Gate 4 UI run were a bug in my
 verification harness, not the product, and are not counted as a gate failure.
+
+---
+
+# Phase 3 — detach: final plan (2026-08-20)
+
+**Status:** awaiting approval. Folds in carried debts **#11** (AppConfig setter
+split) and **#19** (secrets gate + detach-must-restart), per explicit user
+scope. Reviewed by a fresh three-critic panel (security, architecture,
+correctness/edge-case — 44 findings, 8 scenarios verified clean); reconciliation
+below.
+
+## Goal
+
+`DELETE /api/v1/apps/:name/services/:id` — detach postgres or redis: record the
+owner's intent durably, deprovision (postgres: verified dump then drop; redis:
+flush then free the logical DB number), and restart the app so the injected env
+var actually drops. Postgres detach is the platform's only user-facing
+irreversible action; the design's first duty is that no failure arm strands a
+state that cannot be retried, displayed, or reasoned about.
+
+## The invariant that reorganised the draft
+
+**Persist intent first; let retries converge; render divergence honestly.**
+
+`AppConfig.services[id] = 'detached'` is written *after every refusal gate and
+before any destruction*. Intent records the owner's decision; the provisioner
+registries record physical state; a retry converges the two; the UI shows the
+gap as its own card state ("detach incomplete — retry"). This **replaces the
+original plan's "persist `'detached'` only after the deprovision reports
+success"**, which three critics independently broke:
+
+- the partial state (db dropped, role-drop failed) became a **permanent wedge**
+  — every retry re-entered `pg_dump` against a nonexistent database and died
+  before the drops, with the quota slot burned forever (correctness C1,
+  *high/high*);
+- a crash between the drops and the intent write **silently re-provisions an
+  empty database on boot** via manifest/inference (correctness C5, *low/high*);
+- an owner whose provisioning was skipped (quota, provisioner down) could
+  **never record a detach at all** against a third-party manifest — the exact
+  override the intent field exists for (architecture A12, *medium/medium*).
+
+Persist-first is safe because `'detached'` intent with a live database is
+already a fully-handled state: all four injection/provisioning read sites
+honour it (`appNeedsDatabase` platform.ts:2546, `appNeedsRedis` :2764,
+`buildFreshStartSpec` :5210, `provisionRedisEnvVars` :2855) — which is also the
+**restated justification for #19b**: boot reconciliation needs no `services`
+input because intent is enforced at every read site, not because "boot rebuilds
+on failure" (architecture A16 corrected the draft's weaker argument; a future
+deletion of any of those four guards must argue with this list).
+
+## `detachService(appName, serviceId)` — platform.ts, mirroring attach
+
+**No owner lock.** Detach only *frees* quota, so every interleaving with
+attach's check-then-provision errs toward over-refusal, never over-admission
+(architecture A4, *high/medium-high*); `appsInProgress` already serialises the
+app itself. This also moots the panel's lock-poisoning attack (security S1
+half), and attach's lock keeps its name — no churn through the 28-test suite.
+
+Guards, in order (structured refusals, attach's result-union style):
+
+1. **busy** — `appsInProgress` add / finally-delete; concurrent → thrown
+   `AppInProgressError` → 409.
+2. **not-found** — no config AND no state.
+3. **group-app** — refuse on group containers/children with a structured
+   reason: children never consult the container's config, so a container
+   detach would report destruction that did not happen (security S11,
+   *low/medium*). Attach has the same gap; recorded under debt #17.
+4. **service-unavailable** — the *named* service's provisioner is null
+   (postgres → dbProvisioner, redis → redisProvisioner — per-service, never
+   generic; security S12) → 503.
+5. **not provisioned** — two sub-cases:
+   - postgres with `orphanDatabaseExists(name)` (quarantined
+     `db-credentials.json`) → refusal **`credentials-missing`** — "nothing to
+     detach" would be a lie about an app with a live database (security S12,
+     *low/high*);
+   - otherwise: **not a refusal.** Persist `'detached'` and return
+     `{detached: true, deprovisioned: false}` — records intent against a
+     manifest the owner does not control, and makes double-click idempotent
+     (architecture A12). `setServiceIntent` returning null (no config) is the
+     `no-app-config` refusal, enforced at the write site (A13).
+6. **detach-limit** → **429 + retryAfter** (not 409 — the client's one useful
+   fact is *when to retry*; architecture A21, *low/medium*):
+   - **per-app cooldown**: `lastDetachAt` stored in `AppConfig` beside
+     `services` (no new store, survives restarts, test-resettable for free —
+     architecture A11 over the draft's in-memory map), env
+     `DROP_DETACH_COOLDOWN_MINUTES` default 10;
+   - **per-owner dump-byte budget** — NOT the draft's global ceiling, which was
+     a cross-tenant DoS in the exact shape CLAUDE.md forbids (security S2 +
+     architecture A3, both *high*): sum the sizes of `pre-delete/*.dump` files
+     mapping to the owner's apps (flat `readdir` — no `measureTree`, no
+     truncation fail-open; A15), refuse at `DROP_PREDELETE_MAX_MB` (default
+     2048). Ownerless apps share one bucket — admin-only surface, recorded.
+   - **retry exemption**: intent already `'detached'` && still provisioned
+     skips the *cooldown* (repair is not abuse — architecture A10), never the
+     byte budget.
+   - Both new envs parse via one shared helper, invalid → default (fail
+     closed); the same helper retrofits `DROP_PREDELETE_RETENTION_DAYS`, which
+     today fails **open** to keep-forever (security S10, *medium/high*).
+7. **manifest conflict** — not a refusal; `manifestConflict: true` in the
+   result (owner-wins, sec #8, unchanged from the original plan).
+
+Execution:
+
+8. **Persist `'detached'` + `lastDetachAt`** via `setServiceIntent` (the
+   converging-retry pivot).
+9. **Stop, properly.** Liveness from the **runtime**
+   (`runtime.getStatus`), not state status — `'errored'` and
+   `'crash-looping'` apps hold live processes whose stale env and open
+   connections are exactly what must die before a Redis number frees or a
+   `DROP ... FORCE` fires (correctness C2, *high/high*). If live:
+   `stopHealthProber` + `stopCrashLoopWatch`, `setAppStatus('stopped')`
+   (honest state + tears down watches via the :2435 subscriber), then
+   `runtime.stop` — the prober otherwise *restarts the app ~90s into a long
+   dump* (architecture A2, *high/high*; correctness C4). `wasRunning` (by
+   state, read before the stop) decides step 11 only.
+10. **Deprovision.**
+    - **postgres** — `backupAndDeleteAppDatabase`, extended not replaced
+      (architecture A8: it has **two** production callers — apps.ts:757 AND
+      `teardownApp` platform.ts:5664 — the draft's "sole caller" was wrong):
+      *keep* `dropped` (= both succeeded) and *add* `databaseDropped`,
+      `roleDropped`. New behaviour, all inside the provisioner:
+      - `skipBackup` when `config.ephemeral` — mirrors `teardownApp`'s own
+        choice; without it, N cheap ephemerals = N dumps of throwaway data
+        (architecture A5, *medium-high/high*);
+      - **cleanup arm**: registry entry exists but `databaseExists()` is false
+        → skip the dump, drop the role, remove the entry — the arm that makes
+        partial-detach retries converge (C1);
+      - registry entry removed iff `databaseDropped` (regardless of
+        `roleDropped`) — a credentials record pointing at a dropped database
+        protects nothing and permanently burns a `checkDbQuota` slot
+        (architecture A10; the surviving *role* is the tracked orphan);
+      - `*.restore-role.sql` **unlinked when `roleDropped === false`** — with
+        the role alive it is a live plaintext credential, not a restore
+        artifact (security S3, *high/medium*);
+      - `runPgDump` gains a timeout + `SIGKILL` + partial-file cleanup
+        (`DROP_PG_DUMP_TIMEOUT_MS`, default 10min) — today it can await
+        forever on a tenant-held `ACCESS EXCLUSIVE` lock, wedging
+        `appsInProgress` for the app until a platform restart (security S1,
+        *high/high*).
+      - dump failure → nothing dropped, return `backup-failed`; intent stays
+        `'detached'` (retry state), app restarted per step 11.
+    - **redis** — `deprovisionAppRedis` modified: **keep the allocation when
+      `FLUSHDB` fails** (return `{removed:false, flushed:false}`) — today it
+      frees the number anyway, and two tolerated Redis blips hand one tenant's
+      session keys to the next allocation (security S9, *medium/medium*).
+      Retry converges when Redis is back. App already stopped → the freed
+      number cannot be written by the old process (C3 from the original plan,
+      now actually closed given step 9's runtime-liveness fix).
+11. **Start iff `wasRunning`, via `doRestart` — never a hand-rolled
+    `runtime.start(spec)`**: PM2 merges env on a bare start over an existing
+    process entry, so the removed `DATABASE_URL` would *keep being injected*
+    under `isolation: none` while docker behaves — an isolation-parity bug
+    invisible in prod (architecture A1, *high/medium-high*). `doRestart`
+    already does delete-then-start plus the state write and watch re-arming.
+    `AppNeedsConfigError` → `restart: 'needs-config'` + `missingSecrets`,
+    mapped like attach's :1129-1138 arm — never an opaque 500 after an
+    irreversible drop (architecture A6, *medium-high/high*). Other failure →
+    `restart: 'failed'`.
+12. **Result**: `{detached, deprovisioned, databaseDropped?, roleDropped?,
+    flushed?, backup?: {written, file}, manifestConflict?, restart}` where
+    `backup.file` is the **basename only** — the draft's "dumpPath verbatim"
+    reversed the delete route's own hardening (apps.ts:765-769 refuses to
+    return `reason` precisely because it leaks host paths; security S4,
+    *medium/high*). Full path and provider `reason` go to the server log and
+    the ActivityLog detail. **This amends the original plan's "surface the
+    provider's own result verbatim, including dumpPath" item** — the
+    discriminated shape survives; the host path does not.
+13. **Audit**: ActivityLog on success and both failure arms. **Refusals go to
+    the platform logger, never the ActivityLog ring** — the ring holds 500
+    entries and cheap repeatable refusals at 20/min would let one tenant evict
+    every security-relevant entry in ~25 minutes (security S5, *medium/high*).
+    Applied to attach refusals too (same change, ~3 lines), which closes the
+    asymmetry architecture A22 objected to and **resolves debt #15 by
+    decision**: refusals are observable in logs, deliberately not in the ring.
+
+## Folded debt #11 — AppConfig setter split (own plan item, own commit)
+
+- `setServiceIntent(appName, serviceId, intent, extras?)` — reads the current
+  config **inside the write chain** (`enqueueWrite` semantics verified:
+  app-config.ts:369-382 invokes the op at execution time), merges one key,
+  **`updateConfig` semantics**: returns null when no config exists, so the
+  skeleton-config/boot-corruption hazard is enforced where the write happens,
+  not re-derived per caller (architecture A13, *medium/medium*). Also carries
+  `lastDetachAt`. `attachService` :5556-5558 switches to it — its snapshot
+  spread is unreachable today (single writer + sync busy-guard; correctness
+  verified-clean #5) but becomes a real lost-update the moment detach lands.
+- `upsertConfig`/`updateConfig` parameter types narrow to
+  `Partial<Omit<AppConfig, SystemConfigField>>` **and the system keys are
+  stripped at runtime** — the type narrowing alone is defeated by any cast or
+  non-literal object (excess-property checks fire only on fresh literals;
+  architecture A7 *medium/high* + security S13 *low/high*). The runtime strip
+  is the guarantee; the types are documentation.
+- `upsertSystemConfig` — the unstripped writer; migrated callers:
+  upload-deploy.ts:176, git-deploy.ts:~223-234, capabilities route
+  apps.ts:1184, plus test fixtures.
+- `SYSTEM_CONFIG_FIELDS`: `services`, `grantedApiScopes`, `agentCreated`,
+  `ephemeral`, `ephemeralPrincipalId`, `expiresAt`, `lastDetachAt` (verify the
+  member list against the type at implementation).
+
+## Folded debt #19a — intent-aware secrets gate
+
+secrets.ts:114 refuses `DATABASE_URL` iff `isProvisioned(name) && intent !==
+'detached'`. Intent is read via a new **`PlatformOps.getServiceIntent`** — not
+a fresh `getAppConfigService()` read in the route — so the precedence rule has
+one authority; this also gives debt #10's prescribed seam its second caller
+(architecture A20, *low/medium*). The gate's comment block is rewritten: its
+current "safe by construction — both read the same map" argument is dissolved
+by partial detach, and the new invariant (every DSN-injecting site checks
+intent) is pinned by tests on all injection sites in the state
+`intent === 'detached' && isProvisioned() === true` (security S6,
+*medium/high*).
+
+## Debt #13 — closed here, no longer optional
+
+`GET /db/:name` computes `redis`/`services`/`quota` inside the Postgres `try`,
+and `app-db-inspector` maps a dropped database to `DbUnavailableError`
+(3D000 → `database-missing`) → the route 503s → `DatabaseTab` replaces the
+whole tab with a dead error card. **The partial-detach state this plan designs
+for is therefore a state the UI cannot render** — no Detach button, no retry,
+the honest message unreachable (correctness C3, *medium/high*). Fix: move the
+Phase-2 fields out of the `try`; map `database-missing` to a renderable
+payload (`provisioned: false` + a `broken` marker) instead of a 503.
+
+## API, dashboard, limits
+
+- **Route**: `DELETE /apps/:name/services/:id` in apps.ts after attach — same
+  allowlist + `canAccess`; status map: thrown busy → 409, refusals → 409,
+  `detach-limit` → 429 + `Retry-After`, `service-unavailable` → 503,
+  `needs-config` restart arm → 409 with attach's message shape.
+- **server.ts**: `/apps/*/services/*` gets its **own** rate bucket — sharing
+  the 20/min `/db/*` bucket means detach traffic 429s the database panel for
+  the same client mid-incident, the exact failure that bucket's comment says
+  it exists to prevent (security S15, *low/high*). Existing method-scoped auth
+  covers DELETE at `user` (server.ts:349-356); no new auth line. Both pinned
+  by a behavioural test (retires debt #18's ask for this route pair).
+- **apps.delete route**: gains `pruneOwnerDumpsToFit` (oldest-own-dumps) before
+  its dump rather than a refusal — deletes must never be blocked by the
+  budget, but unmetered they reproduce the full amplification through
+  create→attach→delete loops (security S2c + correctness C7, confirmed against
+  apps.ts:757).
+- **Dashboard**: `attach-state.ts` gains a third state —
+  `provisioned && intent === 'detached'` → `detachIncomplete`, label "Retry
+  detach" — the current derivation from `provisioned` alone would show
+  **"Attached"** after a partial detach, hiding the only repair affordance and
+  contradicting the plan's own open question 2 (architecture A9,
+  *medium/high*); pinned in `attach-state.test.ts`. DatabaseTab: Detach button
+  (role ≠ readonly), per-service danger confirm — postgres names the backup
+  directory ("a compressed dump is written under the platform backup directory
+  first"; the basename appears in the result), **ephemeral postgres says "no
+  backup is written"**, redis says "data is flushed immediately; there is NO
+  backup". In-flight guard generalised to one `pendingAction` slot. `api.ts`
+  client function.
+
+## File-level changes
+
+- [x] Shared env-int parse helper (invalid → default, fail closed); retrofit
+      `DROP_PREDELETE_RETENTION_DAYS`.
+- [x] `src/managers/database/pg-dump.ts` — timeout + SIGKILL + partial cleanup.
+- [x] `src/managers/database/database-provisioner.ts` + tests — extended return
+      (add `databaseDropped`/`roleDropped`, keep `dropped`), ephemeral
+      `skipBackup`, cleanup arm, entry-removal-iff-databaseDropped,
+      restore-role.sql unlink on failed role drop.
+- [x] `src/managers/redis/redis-provisioner.ts` + tests — retain allocation on
+      flush failure.
+- [x] `src/managers/guardrail/detach-limits.ts` + tests — pure cooldown check,
+      per-owner dump-byte budget (flat readdir), `pruneOwnerDumpsToFit`.
+- [x] `src/managers/app/app-config.ts` + tests — **#11 item, own commit**:
+      `setServiceIntent`, narrowed+stripped `upsertConfig`/`updateConfig`,
+      `upsertSystemConfig`.
+- [x] `src/core/upload-deploy.ts`, `src/core/git-deploy/`, apps.ts capabilities
+      route — migrate to `upsertSystemConfig` (mechanical, same commit as #11).
+- [x] `src/core/platform.ts` + tests — `detachService` (guards 1-7, execution
+      8-13), attach switched to `setServiceIntent`, attach refusal audit moved
+      to logger; guard-ordering test suite mirroring attach's; isolation-parity
+      test asserting the restarted spec carries no `DATABASE_URL`/`REDIS_URL`
+      under **both** runtimes.
+- [x] `src/api/platform-ops.ts` — `detachService`, `getServiceIntent`,
+      `DetachServiceResult`.
+- [x] `src/api/routes/apps.ts` + route tests — DELETE route, status map, audit;
+      delete route's `pruneOwnerDumpsToFit`.
+- [x] `src/api/routes/secrets.ts` + tests — #19a gate + comment rewrite +
+      injection-site pin tests.
+- [x] `src/api/routes/db.ts` + tests — #13: fields out of the try,
+      `database-missing` renderable.
+- [x] `src/api/server.ts` + behavioural 429 test — dedicated services bucket.
+- [x] `src/dashboard/src/lib/attach-state.ts` + test — third card state.
+- [x] `src/dashboard/src/components/DatabaseTab.tsx`, `src/dashboard/src/lib/api.ts`
+      — detach UI (no component test possible — logic stays in the pure `.ts`
+      sibling; Gate 4 covers behaviour).
+
+## Risks & open questions — Phase 3
+
+20. **Two original plan lines amended** (persist-after-success → persist-first;
+    verbatim dumpPath → basename): both amendments were demanded by this
+    panel's high findings and are recorded above with their reasons.
+21. **Ownerless apps and group children share one budget/lock-free bucket** —
+    admin-only surface today; acceptable, recorded (security S11/S1 context).
+22. **`doRestart`'s capacity guard** can refuse the post-detach start on a
+    `DROP_MAX_CONCURRENT_APPS`-capped box (default 0 = disabled), stranding the
+    app stopped after a successful detach (architecture A18, *low/medium*).
+    Accepted: the `restart:'failed'` arm reports it; a hint-flag is not worth
+    the plumbing for a non-default config.
+23. **NEW DEBT — hot-reload env staleness**: platform.ts:5075-5101
+    (`stop`+`start`, no delete) and :5303-5312 (`delete` because "start is a
+    merge") assert contradictory things about PM2; whichever is wrong means a
+    revoked secret survives a hot-reload today, independent of detach
+    (architecture A19, *low/medium*). The parity test added here covers the
+    detach path only; the hot-reload path needs its own fix.
+24. **The secrets gate now reads a file tenant code can write under
+    `isolation: 'none'`** — `data/appconf/` is owned by the `drop` user, so an
+    app writing `services: {postgres: 'detached'}` into its own config unlocks
+    the DATABASE_URL secret path. Blast radius under `none` isolation is
+    already unbounded (drop ≈ root-equivalent there); recorded, not mitigated
+    (security S14, *low/medium*).
+25. **Cooldown records at intent-persist time; the `backup-failed` arm retries
+    cooldown-exempt** (intent already `'detached'`). A repeatedly-failing dump
+    therefore costs pg_dump streams bounded only by the route rate limit and
+    the byte budget (failed dumps commit no bytes) — accepted; the timeout
+    (S1) bounds each attempt (correctness C6 residue).
+
+**Debt ledger after Phase 3**: #11 closed, #13 closed, #15 resolved by
+decision, #19 closed; #10 **half-closed** (`getServiceIntent` gives PlatformOps
+the seam; the quota-accessor half — `serviceQuotaState` + `runtime-config`
+plumbing deletion — still open); #12, #14 (attach side), #16 (pre-existing
+envs), #17 (now covering both attach and detach on group apps), #18
+(half-retired: the services-bucket test lands here; other buckets still
+untested) remain. Plus new #23/#24 above.
+
+## Agent critiques considered — Phase 3 plan stage
+
+Separate corpus from the Phase 1/2 sections. Panel: `security-critic` (15
+findings), `architecture-critic` (22), plus a correctness/edge-case auditor
+(`general-purpose`, read-only, 7 findings + 8 mandatory scenarios verified
+clean with file:line evidence). **44 findings: 0 critical, 9 high, 20
+medium(-high), 15 low. Every finding actioned or recorded; 0 dropped.**
+Severities quoted verbatim; none re-graded.
+
+**Actioned — high** (all nine): S1 pg_dump timeout/lock-poisoning
+(*high/high*); S2 guardrail keyed backwards — per-owner budget + AppConfig
+cooldown + delete-route metering (*high/high*); S3 restore-role.sql live
+credential (*high/medium*); C1 partial-detach permanent wedge → cleanup arm
+(*high/high*); C2 runtime-liveness stop (*high/high*); A1 doRestart-not-start,
+PM2 env merge (*high/medium-high*); A2 prober resurrection mid-dump
+(*high/high*); A3 global ceiling is cross-tenant DoS (*high/medium*); A4 owner
+lock unnecessary for detach (*high/medium-high*).
+
+**Actioned — medium/low**, compressed: S4 basename-not-path; S5 refusals off
+the ring; S6 gate-invariant tests; S8+A8 extend-don't-replace return shape
+(the draft's "sole caller" fact was **wrong** — `teardownApp` is the second);
+S9 Redis tombstone-on-flush-failure; S10 retention fail-open; S11 group
+refusal; S12 per-service provisioner + `credentials-missing`; S13+A7 runtime
+strip; S15 dedicated bucket; C3 #13 load-bearing; C4 stop recipe; C5+A12
+persist-first; C6 cooldown timing; C7+S2c delete-route metering; A5 ephemeral
+skipBackup; A6 needs-config arm; A9 third card state; A10 entry
+removal + retry exemption; A11 cooldown in AppConfig; A13 setServiceIntent
+null-refusal; A15 shared env parse; A16 #19b restated; A17 state write before
+stop; A20 getServiceIntent on PlatformOps; A21 429+Retry-After.
+
+**Partly rejected — recorded**
+
+- **S7 (*medium/high*): "re-attach after partial detach hands the app a DSN
+  for a dropped database with no path back".** The scenario half is
+  **rejected on traced evidence**: `provisionAppDatabase` short-circuits to
+  existing credentials only when `existing && dbAlreadyExists`
+  (database-provisioner.ts:134-139); with the database dropped it takes the
+  fresh-provision path and `ALTER USER`s the surviving role — re-attach
+  self-heals (correctness verified-clean 1b, two critics disagreeing and the
+  one who traced the code winning). The quota half is actioned (entry removal
+  on `databaseDropped`).
+- **S2a's fix as specified** ("persist the cooldown per principal in a
+  principal-quota-shaped store"): the *finding* (per-app in-memory keying is
+  bypassable) is actioned, but via A11's shape — per-app `lastDetachAt` in
+  `AppConfig` + the per-owner **byte budget** as the loop bound. A
+  per-principal detach *count* adds a store without adding a bound the byte
+  budget doesn't already impose.
+- **A14 (*medium/medium*): "carry the setter split as its own change"** —
+  partly rejected: the user explicitly scoped #11 into Phase 3. Its substance
+  is honoured — the split is its own plan item and own commit, and the
+  runtime-strip shape cuts the caller migration to three sites.
+
+**Disagreements resolved**
+
+- **S5 vs A22** (audit refusals: never-in-ring vs symmetric-in-ring): sided
+  with security — the ring is evictable by design; symmetry restored by
+  logging both operations' refusals to the platform logger. Debt #15 closes by
+  decision rather than by ring-writes.
+- **A4 vs S1** (fix the lock vs drop the lock): dropping the lock for detach
+  satisfies both — S1's timeout is actioned independently because
+  `appsInProgress` alone can still wedge one app on a hung dump.
+- **A11 vs S2** (where cooldown state lives): AppConfig, because it survives
+  restarts *and* deletes no abuse margin the byte budget doesn't hold.
+
+**Dropped without individual reasons:** none — `findings_plan_dropped: 0` for
+this stage. Two draft "verified facts" corrected by the panel: the sole-caller
+claim (A8) and `wasRunning`-by-state (C2).
+
+## Agent critiques considered — Phase 3 diff stage
+
+Separate corpus from the plan-stage panel. Panel: `security-critic` (13
+findings) and `architecture-critic` (17) on the real diff. The `/code-review`
+correctness pass died on a session limit mid-fan-out and was re-run against the
+fixed tree instead — recorded here rather than quietly omitted.
+
+### Phase 3 · pass 1 (whole diff)
+
+**Actioned — blocking**
+
+- **The destructive span has no `try`/`finally`** (architecture, *critical/high*;
+  security #1, *high/high* — both found it independently). Steps 9-11 stop the
+  app, then deprovision, and `restartAfterDetach` is reached only through the
+  `return` arms. This diff *added* the first throw path into that span: the
+  cleanup arm's `databaseExists` probe is the one call in
+  `backupAndDeleteAppDatabase` not wrapped, so a Postgres blip mid-detach leaves
+  a previously-running app stopped indefinitely, 500 to the caller, no audit
+  entry, intent already flipped. Pre-diff every failure was a returned result,
+  which is exactly why no test caught it: 33 detach tests, none makes the
+  deprovisioner throw. **Actioned**: single restart site covering return *and*
+  throw; probe wrapped so a failed probe is never read as "the database is
+  gone".
+- **The Redis tombstone burns a logical DB number permanently**
+  (architecture, *high/high*; security #7, *medium/medium*). My own follow-up
+  commission caused this: retaining the *allocation* on a failed FLUSHDB is
+  right for detach, which retries, and wrong for delete, where the app is gone
+  a moment later. All three candidate reclaim paths were checked and none
+  applies to a deleted app; `nextFreeDb` then treats the number as in use
+  forever, and 15 tolerated blips disable managed Redis platform-wide for every
+  tenant. The cure/disease ratio decided it: the key-leak it closed needed
+  *two* independent flush failures (assignment already re-flushes), the
+  permanent burn needs one. **Actioned**: tombstone moved from the allocation to
+  the DB *number* — the allocation frees as before, the number stays flagged,
+  and the existing flush-before-handout turns fail-hard for flagged numbers
+  only. Same safety property, no leak.
+
+**Actioned — one root cause behind three findings**
+
+Dump ownership was re-derived from the live app list via
+`dbNameForApp(app.name)` prefixes. That single choice produced:
+*evadable metering* (security #3, *medium/high*; architecture, *medium/high*) —
+a `create → attach → fill → delete` loop with a fresh name each iteration
+writes dumps attributable to nobody, so the byte budget that plan risk 25
+explicitly leans on does not bound the loop it was accepted against;
+*cross-app eviction* (security #5, *medium/high*) — the delete-path prune sorts
+**all** of an owner's dumps oldest-first, so deleting app A destroys app B's
+only surviving pre-drop dump, breaking the invariant
+`prunePreDeleteBackups`'s own doc states; and *collision* (security #8,
+*medium/medium*) — `sanitizeName` is lossy and prefixes are built from app
+names with no requirement the app ever had a database, so a tenant can register
+a name that sanitizes onto a victim's database name and have their own delete
+prune the victim's dumps. **Actioned** with one structural change rather than
+three patches: dumps move into per-owner subdirectories, so attribution is a
+property of where the file *is* rather than a guess re-derived from mutable
+state — and it survives the app's deletion, which is the case all three
+findings turn on.
+
+**Actioned — the rest**
+
+- **Raw `err.message` to a `user`-role tenant** on the detach 500 (security #2,
+  *medium/high*) — pg errors embed the socket path under `dropRoot`, fs errors
+  the pre-delete path. Reverses this same change's own basename hardening, and
+  the delete route two hundred lines away already refuses to return
+  `outcome.reason` for that reason.
+- **Ephemeral deletes write a full dump with metering disabled** (security #4,
+  *medium/high*) — the new comment says the prune is skipped because the dump is
+  skipped too, and the call passes no `skipBackup`. The comment was true of the
+  intent and false of the code, on the highest-volume app class.
+- **Restart decision disagreed with the stop decision, then misreported it**
+  (architecture, *medium-high/high*). Stop keys on runtime liveness, restart on
+  state status, so an `errored`-but-live app is stopped and never restarted —
+  and the result says `not-restarted`, which the dashboard renders as "the app
+  was not running", about an app DROP had just killed. "My database is broken,
+  let me detach it" is the archetypal call. **Actioned**: one liveness
+  authority.
+- **Confirm dialog promises a backup ephemeral apps never get** (security #9,
+  *low/high*; architecture, *medium/high*) — consent to the platform's only
+  irreversible action, on a false premise, and the UI had no `ephemeral` field
+  to tell the truth with. The plan had specified this copy; it was not built.
+- Route discarded `restart`/`missingSecrets` on the failure arms — the arms
+  where durable state changed (architecture, *medium/high*). `lstat` over
+  `stat` in the budget walk (security #12, *low/low*). Redis "no allocation"
+  vs "flush failed" collapsed into one retriable-looking refusal (security #13,
+  *low/medium*). Budget charged before a dump that will be skipped
+  (architecture, *low/high*). `db.ts` phase-2 fields could now 500 on an
+  uninitialised config service (architecture, *low/medium*). `manifestConflict`
+  and `broken` plumbed across four layers with no reader (architecture, two
+  *low/high*). Client/server wire-type drift — `backup.file` optional one side,
+  required the other, the second such drift after the restart union
+  (architecture, *low/high*). `SERVICES_CONFIG` duplicated literals
+  (architecture, *low/medium*). No authz regression pin on the new irreversible
+  route (security #10, *low/high*).
+
+**Recorded, not actioned**
+
+- **No free-space check before an unbounded dump** (security #6,
+  *medium/medium*). The byte budget gates accumulated bytes, never the incoming
+  dump, and the pre-delete tree shares a filesystem with the Postgres data
+  directory and platform state. Real, and now self-service rather than
+  operator-initiated. Deferred as new debt #26 rather than fixed here: a
+  correct fix needs a free-space/`pg_database_size` probe and a refusal policy
+  of its own, and bolting it onto this diff would ship an untested guess at the
+  threshold.
+- **Delete-path role orphans are invisible** (architecture, *low-medium/high*).
+  Entry removal now keys on `databaseDropped`, so a delete whose role drop
+  fails leaves a live role with a live password and no registry record, and —
+  unlike detach — no retry path, because the app is gone. The compensating
+  `restore-role.sql` unlink is in and does reduce exposure. New debt #27: the
+  fix is an `orphanedRoles` list swept at boot, which is its own change.
+- **Four config writers plus `setServiceIntent`** (architecture, *medium/high*).
+  The (upsert|update) × (stripped|unstripped) matrix is orthogonal in two axes
+  and will be re-reasoned by every future caller. Correct, and it is a Gate 5
+  concern rather than a defect — deferred to the simplify gate in this same
+  change, not to a later one.
+- **`stripSystemFields` warns rather than throws** (architecture,
+  *medium/medium-high*). Verified clean today — all eleven call sites pass fresh
+  literals, so the excess-property check does fire — but a `console.warn` in a
+  long-lived server is not a signal anyone reads. New debt #28; the argument for
+  throwing (a system field at a general-purpose writer is a programming error,
+  never a runtime condition) is recorded with it.
+- **Cooldown-exempt retries fan out concurrently across an owner's apps**
+  (architecture, *low/medium*) — `appsInProgress` serialises per app, not per
+  owner, so N failing dumps run at once against the shared bundled Postgres.
+  Plan risk 25 accepted the retry rate but not this dimension; amended there.
+- **Detach is anonymous on an auth-disabled box** (security #11, *low/high*) —
+  identical posture to `DELETE /apps/:name`, so consistent rather than novel,
+  but worth stating: `db.ts` deliberately gates *reads* in that mode while data
+  destruction stays open. Recorded, unchanged.
+
+**Dropped without individual reasons:** none.
+
+### Phase 3 · pass 2 (correctness, against the fixed tree)
+
+The `/code-review` correctness pass died on a session limit mid-fan-out, so it
+was replaced by a dedicated correctness/edge-case reviewer run against the
+*fixed* tree — better ordering as it turned out, because **the two highest
+findings were defects introduced by the fix round itself**, which a review of
+the original diff could not have seen.
+
+- **The byte budget bounded nothing** (*high/high*). `detachService` measured
+  `pre-delete/<owner>/` but called `backupAndDeleteAppDatabase` without
+  `ownerUserId`, so every detach dump landed in `_ownerless` while the gate read
+  a perpetually empty directory — the amplification loop wide open again, owned
+  dumps polluting the admin bucket, and the delete-route prune unable to reach
+  them. Two tests **pinned the bug** by asserting the argument's absence. Root
+  cause worth naming: the parameter was made *optional* so two parallel agents
+  would keep compiling, and that optionality is exactly what hid the defect.
+  Fixed, and `ownerUserId` is now required so a future caller cannot repeat it.
+- **The try/catch opened one step too late** (*high/high*). The critical Gate-2
+  fix wrapped the deprovision but not step 9's stop, and `ContainerManager.stop`
+  rethrows any non-not-found error — so on docker isolation (production) a
+  daemon hiccup still stranded an app with intent flipped, database intact,
+  watches disarmed and no restart. The same end state, relocated one step.
+- **A failed Redis flush was reported as a refusal** (*medium/high*) although the
+  allocation was freed, the number tombstoned and the app restarted without
+  `REDIS_URL` — a success. The 409 told the owner "nothing was removed, retry",
+  and the retry then said "nothing was provisioned to remove". The `flush-failed`
+  refusal arm was deleted; `deprovision-failed` now covers genuine throws only.
+- Also actioned: the not-provisioned early return hard-coded `not-restarted` and
+  the UI rendered "the app was not running" about a running app (new
+  `not-needed` arm); the `database-missing` card named two affordances it then
+  hid, because `canDetach` keyed on `provisioned` (*medium/high* — debt #13's
+  dead end in a new shape); `nextFreeDb` preferred the tombstoned number, so a
+  Redis outage failed provisions on db 1 while 14 clean numbers sat unused; the
+  **attach** route still leaked raw `err.message` one function above the detach
+  catch that had just been hardened, and the tombstone added a new throw path
+  into it; `attachService` ignored `setServiceIntent`'s null return on the
+  strength of a comment describing a race as an invariant; one per-app
+  `lastDetachAt` let a Postgres detach 429 a Redis detach with a message naming
+  neither service (now per-service).
+
+**Verified clean** (traced with evidence, not assumed): `appsInProgress` releases
+on every path and the single restart site cannot double-restart; tombstone
+persistence and reload reconciliation; the prune's one-level walk cannot follow a
+symlinked subdirectory or delete a directory, and its prefix match cannot
+under/over-match (`foo` vs `foo_bar`); every union arm is mapped end to end; no
+request-derived data reaches a system config field; and the secrets gate cannot
+disagree with the injection path, because all four intent read sites were
+checked individually.
+
+### Gate 5 — simplify
+
+Four cleanup reviewers (reuse, simplification, efficiency, altitude). The
+readability finding that mattered most: **48 references to unresolvable review
+IDs** — `FIX X5`, `Gate-2 finding #2`, `debt #13`, `security S15`, `A21` — had
+accumulated across ten production files and even into test titles, pointing at
+planning documents that are gitignored and absent from the repo. Every one of
+those comments already stated the fact its label stood for, so the labels were
+stripped and the prose kept. That is Gate 5's bar exactly: a reader who does not
+have this plan file must still be able to follow the code.
+
+Structural cleanups applied: the pre-delete dump layout was being constructed
+**four** ways (provisioner from `this.dropRoot`, platform from `config.dropRoot`,
+the delete route by string-surgery on `path.dirname(getTempDirectory())`, and
+`detach-limits` re-listing the artifact suffixes) — three reviewers converged on
+it independently, and it is the same multi-writer shape whose divergence caused
+the `_ownerless` bug above; now one owner (`preDeleteRootDir`/`ownerDumpDir`).
+The budget also **undercounted**, charging only `.dump` while the retention sweep
+knew about `.restore-role.sql` and `.dump.partial` — a fail-closed gate must not
+undercount, so both scanners now share one artifact predicate. The third
+hand-copy of the detach wire contract inside `platform.ts` (kept compiling by an
+`as` cast that would have absorbed any drift) was replaced by a zero-import leaf
+types module the dashboard imports directly, retiring a mirror that had already
+drifted twice. Sixteen refusal sites now route through a helper that returns what
+it logs, so a refusal cannot be returned unlogged. The four-writer
+`(upsert|update) × (stripped|unstripped)` matrix collapsed to one private
+`write()`. One genuine defect surfaced and was fixed: attach and detach refusals
+lived in separate maps rendered with `??`, so a detach refusal following an
+attach refusal on the same service was masked by the stale attach banner.
+
+**Recorded, not applied** (new debt): **#26** no free-space check before an
+unbounded dump; **#27** delete-path role orphans are invisible with no retry path
+once the app is gone; **#28** `stripSystemFields` warns rather than throws;
+**#29** `getOverview` still throws `database-missing` and the route rewrites it
+into a success payload — it should return that state (touches
+`app-db-inspector.ts`, outside this diff); **#30** the four intent read sites
+should collapse into one filter in `buildStartSpec`, which would make the
+invariant structural rather than a conjunction of four deletable guards (behaviour
+change on monorepo/hot-reload paths — needs its own parity tests); **#31** four
+pre-existing guardrail env parses still bypass `parsePositiveIntEnv` (migrating
+them changes behaviour on malformed input); **#32** the retention sweep now walks
+every tenant's dump directory serially on a user-facing request — it wants a
+boot/idle sweep instead. Also noted honestly: one of the three assertions in the
+wire-contract pin became tautological once the dashboard imported the shared
+union, and `DetachServiceSuccess` is still hand-mirrored deliberately.
+
+## Run stats — Phase 3 (detach)
+
+Separate run from the Phase 1 block above, on the same plan file. The number
+worth reading is `escaped: 2`, and the more useful fact behind it: **the two
+highest-severity findings of the whole run were introduced by the fix round for
+the previous review**, not by the original implementation. Reviewing the *fixed*
+tree rather than the original diff is what caught them, and that only happened
+because the correctness pass died on a session limit and had to be re-run later.
+
+```yaml
+date: 2026-08-21
+slug: extension-catalog
+gear: full
+effort_plan: high
+effort_diff: high
+findings_plan_actioned: 41
+findings_plan_rejected: 3
+findings_plan_dropped: 0
+findings_diff_actioned: 59
+findings_diff_rejected: 13
+findings_diff_dropped: 0
+escaped: 2
+agents_spawned: 37
+gates_failed_first_pass: 3
+escalated_from: none
+```
+
+Counting notes, so the numbers are reproducible rather than tidy:
+
+- **Plan stage** = the three critics on the draft plan (security 15,
+  architecture 22, correctness 7 + 8 scenarios verified clean). The 3 rejections
+  are the ones recorded with written reasons above.
+- **Diff stage** folds together Gate 2 (security 13 + architecture 17, then a
+  second correctness pass of 10 against the fixed tree) and Gate 5's four
+  cleanup reviewers. Rejections are the "recorded, not actioned" items — new
+  debt #26-#32 — each with its reason.
+- **`escaped: 2`.** (1) A cross-slice contract drift: the dashboard's restart
+  union said `'ok'` where the server said `'restarted'`. Both plan critics saw
+  only a plan, and the code was split across five agents, so nothing but the
+  conformance walk could have caught it — I did, at Gate 1. (2) The attach and
+  detach refusal maps rendered with `??` while detach cleared only its own, so a
+  detach refusal following an attach refusal on the same service was masked by
+  the stale attach banner. That survived all three Gate 2 reviewers and was
+  found by a Gate 5 cleanup reviewer looking at duplicated state, not at
+  correctness.
+- **`gates_failed_first_pass: 3`** — Gate 1 (the union drift), Gate 2 (two full
+  fix rounds), Gate 5 (cleanups applied, including the escape above). Gates 3
+  and 4 passed first time: the dedicated test pass found no product bug, and
+  runtime verification passed 5/5 against a real PostgreSQL 16 with no defects.
+- **`agents_spawned: 37`** includes 6 finder agents from a `/code-review`
+  invocation that died on a session limit and produced nothing usable, plus
+  three resumed agents (resumes are not counted as new spawns).
+
+### What this run should change about the next one
+
+- **An optional parameter added to keep parallel agents compiling is a defect
+  waiting to happen.** `ownerUserId` was made optional so two agents editing
+  different files would both typecheck; the default silently mis-attributed
+  every detach dump and defeated the byte budget, and two tests pinned the bug
+  by asserting the argument's absence. Prefer a required parameter and a brief
+  moment of red.
+- **Verify the fixed tree, not just the original diff.** Both high findings in
+  the second pass were introduced by the first pass's fixes.
+- **Runtime verification earned its place on the irreversible path.** The unit
+  suite proved a dump file appeared; only `pg_restore` proved the dump contained
+  the tenant's rows as they were *before* the drop.
