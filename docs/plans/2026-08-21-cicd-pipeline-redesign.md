@@ -1,7 +1,8 @@
 # CI/CD pipeline redesign
 
 **Date:** 2026-08-21
-**Status:** DRAFT — awaiting approval. No production code written.
+**Status:** APPROVED. Landing A shipped (PR #200, CI green, awaiting merge).
+Landings B and C not started.
 
 ---
 
@@ -244,8 +245,9 @@ one can take production down. That is unbisectable while prod is down.
 
 ## File-level changes
 
-- [ ] `.github/dependabot.yml` — npm (root), npm (`src/dashboard`), github-actions.
-- [ ] All workflows — pin 11 action refs to SHAs; add `permissions:` blocks.
+- [x] `.github/dependabot.yml` — npm (root), npm (`src/dashboard`), github-actions.
+- [x] All workflows — pin 11 action refs to SHAs; add `permissions:` blocks,
+      plus `persist-credentials: false` on both `npm ci`-bearing checkouts.
 - [ ] `.github/workflows/_verify.yml` — reusable; lint, shellcheck, typecheck,
       test, build; uploads the **tarball**; `contents: read`; no secrets.
 - [ ] `.github/workflows/ci.yml` — thin caller + notify.
