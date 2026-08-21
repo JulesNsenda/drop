@@ -74,6 +74,20 @@ jest.mock('../managers/database', () => {
     hasAppDatabase: jest.fn().mockReturnValue(false),
     listDatabases: jest.fn().mockReturnValue([]),
     deleteAppDatabase: jest.fn().mockResolvedValue(undefined),
+    // DROP-151 Phase 3 (detachService, isolation-parity block below): a
+    // provisioned app by default, whose dump-then-drop succeeds cleanly.
+    isProvisioned: jest.fn().mockReturnValue(true),
+    orphanDatabaseExists: jest.fn().mockResolvedValue(false),
+    backupAndDeleteAppDatabase: jest
+      .fn()
+      .mockResolvedValue({ dropped: true, databaseDropped: true, roleDropped: true, dumpPath: undefined }),
+    dbNameForApp: jest.fn((name: string) => `drop_${name}`),
+    // detachService's byte-budget gate calls this directly. The directory
+    // never exists on disk in this suite, which is fine — checkDumpByteBudget
+    // treats a missing owner directory as "nothing charged yet" (allowed).
+    ownerDumpDir: jest.fn(
+      (userId?: string | null) => `/nonexistent-pre-delete/${userId ?? '_ownerless'}`
+    ),
   };
   return {
     PostgresBinaries: jest.fn(),
@@ -704,6 +718,9 @@ describe('DropPlatform.restartApp', () => {
         REDIS_URL: 'redis://127.0.0.1:6380/3',
         REDIS_DB: '3',
       }),
+      // DROP-151 Phase 3 (detachService isolation-parity block below only —
+      // unused by the attach/detach-on-restart tests above).
+      deprovisionAppRedis: jest.fn().mockResolvedValue({ removed: true, flushed: true }),
     });
 
     it('attach is durable across a (re)deploy — an app with NO db signal at all still gets DATABASE_URL (the critical bug)', async () => {
@@ -711,9 +728,10 @@ describe('DropPlatform.restartApp', () => {
       await platform.start();
 
       // Pre-seed the intent BEFORE the app is even known to the platform —
-      // upsertConfig merges (...existing, ...updates), so handleAppDetected's
-      // own upsertConfig call below (type/path/hostname) preserves it.
-      await getAppConfigService().upsertConfig('site', {
+      // upsertSystemConfig merges (...existing, ...updates), so
+      // handleAppDetected's own upsertConfig call below (type/path/hostname)
+      // preserves it. `services` is a SYSTEM_CONFIG_FIELD.
+      await getAppConfigService().upsertSystemConfig('site', {
         services: { postgres: 'attached' },
       });
 
@@ -731,7 +749,7 @@ describe('DropPlatform.restartApp', () => {
       platform = makePlatform();
       await platform.start();
 
-      await getAppConfigService().upsertConfig('site', {
+      await getAppConfigService().upsertSystemConfig('site', {
         services: { postgres: 'detached' },
       });
 
@@ -763,7 +781,7 @@ describe('DropPlatform.restartApp', () => {
       // partway (DROP DATABASE succeeded, DROP USER did not), so the
       // provisioner's registry entry is still alive and getEnvVars would
       // otherwise still hand back a DSN for a database that no longer exists.
-      await getAppConfigService().updateConfig('site', {
+      await getAppConfigService().upsertSystemConfig('site', {
         services: { postgres: 'detached' },
       });
 
@@ -778,7 +796,7 @@ describe('DropPlatform.restartApp', () => {
       platform = makePlatform();
       await platform.start();
 
-      await getAppConfigService().upsertConfig('site', {
+      await getAppConfigService().upsertSystemConfig('site', {
         services: { redis: 'attached' },
       });
 
@@ -808,7 +826,7 @@ describe('DropPlatform.restartApp', () => {
       redis.isProvisioned.mockReturnValue(true);
       (platform as any).redisProvisioner = redis;
 
-      await getAppConfigService().updateConfig('site', {
+      await getAppConfigService().upsertSystemConfig('site', {
         services: { redis: 'detached' },
       });
 
@@ -826,7 +844,7 @@ describe('DropPlatform.restartApp', () => {
       const startSpy = jest.spyOn(fakeRuntime, 'start');
 
       // Direction 1: manifest silent (no drop.yaml at all), intent attaches anyway.
-      await getAppConfigService().upsertConfig('attach-wins', {
+      await getAppConfigService().upsertSystemConfig('attach-wins', {
         services: { postgres: 'attached' },
       });
       const attachPath = await createStaticApp('attach-wins');
@@ -837,7 +855,7 @@ describe('DropPlatform.restartApp', () => {
       // Direction 2: manifest explicitly declares database: postgres, intent
       // detaches anyway — the owner's click outranks a stale/third-party
       // manifest (e.g. deploy_from_git).
-      await getAppConfigService().upsertConfig('detach-wins', {
+      await getAppConfigService().upsertSystemConfig('detach-wins', {
         services: { postgres: 'detached' },
       });
       const detachPath = await createStaticApp('detach-wins');
@@ -858,5 +876,72 @@ describe('DropPlatform.restartApp', () => {
       expect(detachSpec.env!.DATABASE_URL).toBeUndefined();
       expect(provisionSpy).not.toHaveBeenCalled();
     }, 30000);
+
+    // ── DROP-151 Phase 3: detachService — restart-spec parity between
+    // isolation modes ─────────────────────────────────────────────────────
+    //
+    // The detached-intent check short-circuits BEFORE the isolation-specific
+    // branch in both buildFreshStartSpec (dbEnvVars: the pgSocketDir choice)
+    // and provisionRedisEnvVars (the drop-host-alias-vs-loopback choice), so
+    // today the two isolation modes take an IDENTICAL path once intent is
+    // 'detached'. These are a regression guard against someone duplicating
+    // that check INTO each branch separately and breaking the symmetry — not
+    // evidence the two modes currently behave differently.
+    describe('detachService restart-spec parity (real doRestart, both isolation modes)', () => {
+      // Booting a real platform WITH isolation:'docker' runs the real startup
+      // constraints check (Caddy-on-PATH), which this box/CI runner doesn't
+      // satisfy — and isn't what these tests are about anyway. So: boot
+      // normally (isolation:'none'), deploy, then flip `config.isolation` on
+      // the already-started instance right before the docker-mode call —
+      // same technique platform.attach-service.test.ts's own isolation-parity
+      // block uses. buildFreshStartSpec reads `this.config.isolation`
+      // directly, so this exercises the real branch without a real container
+      // runtime.
+      it.each([
+        ['isolation: none (pm2)', undefined],
+        ['isolation: docker', 'docker' as const],
+      ])('postgres: the restarted spec carries NO DATABASE_URL after detach, under %s', async (_label, isolation) => {
+        platform = makePlatform();
+        await platform.start();
+        const appPath = await createStaticApp('site');
+        await deploy('site', appPath);
+        expect(getStateManager().getApp('site')?.status).toBe('running');
+        if (isolation) {
+          (platform as any).config.isolation = isolation;
+        }
+
+        const startSpy = jest.spyOn(fakeRuntime, 'start');
+        const result = await platform!.detachService('site', 'postgres');
+
+        expect(result).toMatchObject({ detached: true, deprovisioned: true, restart: 'restarted' });
+        const spec = startSpy.mock.calls[startSpy.mock.calls.length - 1][0];
+        expect(spec.env!.DATABASE_URL).toBeUndefined();
+      }, 20000);
+
+      it.each([
+        ['isolation: none (pm2)', undefined],
+        ['isolation: docker', 'docker' as const],
+      ])('redis: the restarted spec carries NO REDIS_URL after detach, under %s', async (_label, isolation) => {
+        platform = makePlatform();
+        await platform.start();
+        const appPath = await createStaticApp('site');
+        await deploy('site', appPath);
+
+        const redis = fakeRedisProvisioner();
+        redis.isProvisioned.mockReturnValue(true); // an existing allocation, per the method doc
+        (platform as any).redisProvisioner = redis;
+        if (isolation) {
+          (platform as any).config.isolation = isolation;
+        }
+
+        const startSpy = jest.spyOn(fakeRuntime, 'start');
+        const result = await platform!.detachService('site', 'redis');
+
+        expect(result).toMatchObject({ detached: true, deprovisioned: true, restart: 'restarted' });
+        expect(redis.deprovisionAppRedis).toHaveBeenCalledWith('site');
+        const spec = startSpy.mock.calls[startSpy.mock.calls.length - 1][0];
+        expect(spec.env!.REDIS_URL).toBeUndefined();
+      }, 20000);
+    });
   });
 });

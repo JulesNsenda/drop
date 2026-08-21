@@ -3555,6 +3555,14 @@ describe('teardownApp / removeGroup (M4: group lifecycle)', () => {
           getConfig: jest.fn().mockReturnValue({ path: path.join(appsDir, 'myapp') }),
           deleteConfig: jest.fn().mockResolvedValue(true),
         },
+        // teardownApp must resolve the same owner the delete route's own
+        // inline byte-budget gate would (apps.ts's `app.userId`). Other
+        // `wireMocks()` calls in this describe block default `getApp` to
+        // `undefined` (no owner) and don't assert this call's args, so they
+        // exercise `ownerUserId: null` incidentally, not as a named case.
+        stateManager: {
+          getApp: jest.fn().mockReturnValue({ userId: 'user-1' }),
+        },
       });
 
       await (platform as any).teardownApp('myapp');
@@ -3565,8 +3573,11 @@ describe('teardownApp / removeGroup (M4: group lifecycle)', () => {
       expect((platform as any).dbProvisioner.backupAndDeleteAppDatabase).toHaveBeenCalledWith(
         'myapp',
         // An ordinary teardown always takes the pre-delete dump; only an
-        // ephemeral skips it.
-        { skipBackup: false }
+        // ephemeral skips it. `ownerUserId` is the same owner the
+        // byte-budget gate would resolve — omitting it attributed every
+        // group-child dump to the shared `_ownerless` bucket regardless of
+        // the app's real owner.
+        { skipBackup: false, ownerUserId: 'user-1' }
       );
       expect((platform as any).stateManager.removeApp).toHaveBeenCalledWith('myapp');
       expect((platform as any).secretManager.deleteAll).toHaveBeenCalledWith('myapp');

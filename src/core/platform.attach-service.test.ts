@@ -29,7 +29,7 @@
  *   7. service-unavailable (checked INSIDE the provisioning branch, i.e.
  *      textually after quota — see the dedicated describe block below for why
  *      that is not a defect)
- *   8. provision -> persist (upsertConfig) -> restart (doRestart)
+ *   8. provision -> persist (setServiceIntent) -> restart (doRestart)
  */
 
 import * as path from 'path';
@@ -39,39 +39,24 @@ import { AppInProgressError } from '../api/platform-ops';
 import { HOST_ALIAS } from '../managers/runtime/container-config';
 import type { AppState } from '../managers/app/state-manager';
 import type { AppConfig } from '../managers/app/app-config';
+import {
+  baseConfig as baseConfigFixture,
+  baseState as baseStateFixture,
+  stubAppConfigService as stubAppConfigServiceFixture,
+} from './__testutils__/service-fixtures';
 
 describe('DropPlatform.attachService', () => {
   let platform: DropPlatform;
   const appName = 'myapp';
 
-  const baseConfig = (overrides?: Partial<AppConfig>): AppConfig => ({
-    name: appName,
-    type: 'nodejs',
-    createdAt: new Date().toISOString(),
-    path: `/apps/${appName}`,
-    ...overrides,
-  });
-
-  const baseState = (overrides?: Partial<AppState>): AppState => ({
-    name: appName,
-    type: 'nodejs',
-    status: 'running',
-    path: `/apps/${appName}`,
-    createdAt: new Date().toISOString(),
-    updatedAt: new Date().toISOString(),
-    userId: 'user-1',
-    ...overrides,
-  });
-
-  /** Stub AppConfigService the way attachService reads/writes it. Returns the upsertConfig mock. */
-  const stubAppConfigService = (config: AppConfig | undefined): jest.Mock => {
-    const upsertConfig = jest.fn().mockResolvedValue(undefined);
-    (platform as any).appConfigService = {
-      getConfig: jest.fn().mockReturnValue(config),
-      upsertConfig,
-    };
-    return upsertConfig;
-  };
+  // Thin closures over `appName`/`platform` so every call site below stays
+  // `baseConfig(...)`/`stubAppConfigService(...)` — see
+  // __testutils__/service-fixtures.ts for the shared bodies (also used by
+  // platform.detach-service.test.ts).
+  const baseConfig = (overrides?: Partial<AppConfig>): AppConfig => baseConfigFixture(appName, overrides);
+  const baseState = (overrides?: Partial<AppState>): AppState => baseStateFixture(appName, overrides);
+  const stubAppConfigService = (config: AppConfig | undefined): jest.Mock =>
+    stubAppConfigServiceFixture(platform, config);
 
   /** Stub AppStateManager: getApp resolves the app, getAllApps backs the quota count. */
   const stubStateManager = (state: AppState | undefined, allApps: AppState[] = []): void => {
@@ -148,19 +133,19 @@ describe('DropPlatform.attachService', () => {
 
   /**
    * Shared "nothing irreversible happened" assertion for a refusal. Provided
-   * provisioners are asserted un-touched; upsertConfig and doRestart are
+   * provisioners are asserted un-touched; setServiceIntent and doRestart are
    * always asserted not-called (the load-bearing pair when a provisioner
    * argument is null, since "not called" on a null object is vacuous).
    */
   const expectNoSideEffects = (
     dbProvisioner: DbProvisionerStub | null,
     redisProvisioner: RedisProvisionerStub | null,
-    upsertConfig: jest.Mock,
+    setServiceIntent: jest.Mock,
     doRestartSpy: jest.SpyInstance
   ): void => {
     if (dbProvisioner) expect(dbProvisioner.provisionAppDatabase).not.toHaveBeenCalled();
     if (redisProvisioner) expect(redisProvisioner.provisionAppRedis).not.toHaveBeenCalled();
-    expect(upsertConfig).not.toHaveBeenCalled();
+    expect(setServiceIntent).not.toHaveBeenCalled();
     expect(doRestartSpy).not.toHaveBeenCalled();
   };
 
@@ -191,13 +176,13 @@ describe('DropPlatform.attachService', () => {
     expectNoSideEffects(
       dbProvisioner,
       redisProvisioner,
-      (platform as any).appConfigService.upsertConfig,
+      (platform as any).appConfigService.setServiceIntent,
       doRestartSpy
     );
   });
 
   it('refuses no-app-config when the app has runtime state but no AppConfig, before provisioning', async () => {
-    const upsertConfig = stubAppConfigService(undefined);
+    const setServiceIntent = stubAppConfigService(undefined);
     stubStateManager(baseState());
     stubSecrets(null);
     const dbProvisioner = stubDbProvisioner();
@@ -211,13 +196,13 @@ describe('DropPlatform.attachService', () => {
       reason: 'no-app-config',
       detail: expect.any(String),
     });
-    expectNoSideEffects(dbProvisioner, redisProvisioner, upsertConfig, doRestartSpy);
+    expectNoSideEffects(dbProvisioner, redisProvisioner, setServiceIntent, doRestartSpy);
   });
 
   // ── ephemeral ────────────────────────────────────────────────────────────
 
   it('refuses ephemeral apps, before provisioning', async () => {
-    const upsertConfig = stubAppConfigService(baseConfig({ ephemeral: true }));
+    const setServiceIntent = stubAppConfigService(baseConfig({ ephemeral: true }));
     stubStateManager(baseState());
     stubSecrets(null);
     const dbProvisioner = stubDbProvisioner();
@@ -231,13 +216,13 @@ describe('DropPlatform.attachService', () => {
       reason: 'ephemeral',
       detail: expect.any(String),
     });
-    expectNoSideEffects(dbProvisioner, redisProvisioner, upsertConfig, doRestartSpy);
+    expectNoSideEffects(dbProvisioner, redisProvisioner, setServiceIntent, doRestartSpy);
   });
 
   // ── has-own-database-url (postgres only) ────────────────────────────────
 
   it('refuses has-own-database-url for postgres when the app already has its own DATABASE_URL secret, before provisioning', async () => {
-    const upsertConfig = stubAppConfigService(baseConfig());
+    const setServiceIntent = stubAppConfigService(baseConfig());
     stubStateManager(baseState());
     stubSecrets('postgresql://elsewhere/prod');
     const dbProvisioner = stubDbProvisioner();
@@ -251,7 +236,7 @@ describe('DropPlatform.attachService', () => {
       reason: 'has-own-database-url',
       detail: expect.any(String),
     });
-    expectNoSideEffects(dbProvisioner, redisProvisioner, upsertConfig, doRestartSpy);
+    expectNoSideEffects(dbProvisioner, redisProvisioner, setServiceIntent, doRestartSpy);
   });
 
   it('does NOT check has-own-database-url for redis (an own DATABASE_URL secret does not block attaching Redis)', async () => {
@@ -277,7 +262,7 @@ describe('DropPlatform.attachService', () => {
   // auth state rather than merely losing a cached value.
 
   it('refuses has-own-redis-url for redis when the app already has its own REDIS_URL secret, before provisioning', async () => {
-    const upsertConfig = stubAppConfigService(baseConfig());
+    const setServiceIntent = stubAppConfigService(baseConfig());
     stubStateManager(baseState());
     stubSecrets(null, 'redis://elsewhere:6379/0');
     const dbProvisioner = stubDbProvisioner();
@@ -291,7 +276,7 @@ describe('DropPlatform.attachService', () => {
       reason: 'has-own-redis-url',
       detail: expect.any(String),
     });
-    expectNoSideEffects(dbProvisioner, redisProvisioner, upsertConfig, doRestartSpy);
+    expectNoSideEffects(dbProvisioner, redisProvisioner, setServiceIntent, doRestartSpy);
   });
 
   it('does NOT check has-own-redis-url for postgres (an own REDIS_URL secret does not block attaching Postgres)', async () => {
@@ -311,7 +296,7 @@ describe('DropPlatform.attachService', () => {
   // ── quota-exceeded ───────────────────────────────────────────────────────
 
   it('refuses quota-exceeded for postgres once the owner is at the configured limit, before provisioning', async () => {
-    const upsertConfig = stubAppConfigService(baseConfig());
+    const setServiceIntent = stubAppConfigService(baseConfig());
     stubStateManager(baseState({ userId: 'user-1' }), [
       baseState({ name: 'other1', userId: 'user-1' }),
       baseState({ name: 'other2', userId: 'user-1' }),
@@ -329,11 +314,11 @@ describe('DropPlatform.attachService', () => {
       detail: expect.any(String),
       quota: { used: 2, limit: 2 },
     });
-    expectNoSideEffects(dbProvisioner, redisProvisioner, upsertConfig, doRestartSpy);
+    expectNoSideEffects(dbProvisioner, redisProvisioner, setServiceIntent, doRestartSpy);
   });
 
   it('refuses quota-exceeded for redis once the owner is at the configured limit, before provisioning', async () => {
-    const upsertConfig = stubAppConfigService(baseConfig());
+    const setServiceIntent = stubAppConfigService(baseConfig());
     stubStateManager(baseState({ userId: 'user-1' }), [
       baseState({ name: 'other1', userId: 'user-1' }),
       baseState({ name: 'other2', userId: 'user-1' }),
@@ -351,13 +336,13 @@ describe('DropPlatform.attachService', () => {
       detail: expect.any(String),
       quota: { used: 2, limit: 2 },
     });
-    expectNoSideEffects(dbProvisioner, redisProvisioner, upsertConfig, doRestartSpy);
+    expectNoSideEffects(dbProvisioner, redisProvisioner, setServiceIntent, doRestartSpy);
   });
 
   // ── service-unavailable ──────────────────────────────────────────────────
 
   it('refuses service-unavailable for postgres when no database provisioner exists, before persisting or restarting', async () => {
-    const upsertConfig = stubAppConfigService(baseConfig());
+    const setServiceIntent = stubAppConfigService(baseConfig());
     stubStateManager(baseState());
     stubSecrets(null);
     stubDbProvisioner({ present: false });
@@ -374,11 +359,11 @@ describe('DropPlatform.attachService', () => {
     // "provisionAppDatabase not called" would be vacuous (the provisioner is
     // null) — the load-bearing assertions here are the other provisioner
     // untouched, plus persist/restart untouched.
-    expectNoSideEffects(null, redisProvisioner, upsertConfig, doRestartSpy);
+    expectNoSideEffects(null, redisProvisioner, setServiceIntent, doRestartSpy);
   });
 
   it('refuses service-unavailable for redis when managed Redis is unavailable, before persisting or restarting', async () => {
-    const upsertConfig = stubAppConfigService(baseConfig());
+    const setServiceIntent = stubAppConfigService(baseConfig());
     stubStateManager(baseState());
     stubSecrets(null);
     const dbProvisioner = stubDbProvisioner();
@@ -392,7 +377,7 @@ describe('DropPlatform.attachService', () => {
       reason: 'service-unavailable',
       detail: expect.any(String),
     });
-    expectNoSideEffects(dbProvisioner, null, upsertConfig, doRestartSpy);
+    expectNoSideEffects(dbProvisioner, null, setServiceIntent, doRestartSpy);
   });
 
   // The brief lists service-unavailable (5) before quota-exceeded (6); the
@@ -463,15 +448,16 @@ describe('DropPlatform.attachService', () => {
 
   it('provisions, then persists intent, then restarts — in that order (postgres)', async () => {
     const callOrder: string[] = [];
-    const upsertConfig = stubAppConfigService(baseConfig());
+    const setServiceIntent = stubAppConfigService(baseConfig());
     stubStateManager(baseState());
     stubSecrets(null);
     const dbProvisioner = stubDbProvisioner();
     dbProvisioner!.provisionAppDatabase.mockImplementation(async () => {
       callOrder.push('provision');
     });
-    upsertConfig.mockImplementation(async () => {
+    setServiceIntent.mockImplementation(async () => {
       callOrder.push('upsert');
+      return baseConfig();
     });
     const doRestartSpy = jest
       .spyOn(platform as any, 'doRestart')
@@ -488,7 +474,7 @@ describe('DropPlatform.attachService', () => {
 
   it('provisions, then persists intent, then restarts — in that order (redis)', async () => {
     const callOrder: string[] = [];
-    const upsertConfig = stubAppConfigService(baseConfig());
+    const setServiceIntent = stubAppConfigService(baseConfig());
     stubStateManager(baseState());
     stubSecrets(null);
     const redisProvisioner = stubRedisProvisioner();
@@ -496,8 +482,9 @@ describe('DropPlatform.attachService', () => {
       callOrder.push('provision');
       return { db: 3 };
     });
-    upsertConfig.mockImplementation(async () => {
+    setServiceIntent.mockImplementation(async () => {
       callOrder.push('upsert');
+      return baseConfig();
     });
     const doRestartSpy = jest
       .spyOn(platform as any, 'doRestart')
@@ -512,8 +499,8 @@ describe('DropPlatform.attachService', () => {
     expect(doRestartSpy).toHaveBeenCalledWith(appName);
   });
 
-  it('persists services[serviceId] = "attached", merging any existing services', async () => {
-    const upsertConfig = stubAppConfigService(baseConfig({ services: { redis: 'detached' } }));
+  it('persists intent via setServiceIntent(appName, serviceId, "attached") — merging siblings is setServiceIntent\'s own job now (#11), not platform.ts\'s', async () => {
+    const setServiceIntent = stubAppConfigService(baseConfig({ services: { redis: 'detached' } }));
     stubStateManager(baseState());
     stubSecrets(null);
     stubDbProvisioner();
@@ -521,13 +508,37 @@ describe('DropPlatform.attachService', () => {
 
     await platform.attachService(appName, 'postgres');
 
-    expect(upsertConfig).toHaveBeenCalledWith(appName, {
-      services: { redis: 'detached', postgres: 'attached' },
+    expect(setServiceIntent).toHaveBeenCalledWith(appName, 'postgres', 'attached');
+  });
+
+  it('refuses no-app-config when setServiceIntent resolves null AFTER provisioning succeeded (a deleteConfig landed in the gap) — never silently drops the intent, never restarts', async () => {
+    const setServiceIntent = stubAppConfigService(baseConfig());
+    setServiceIntent.mockResolvedValue(null);
+    stubStateManager(baseState());
+    stubSecrets(null);
+    const dbProvisioner = stubDbProvisioner();
+    const doRestartSpy = jest.spyOn(platform as any, 'doRestart').mockResolvedValue(undefined);
+
+    const result = await platform.attachService(appName, 'postgres');
+
+    expect(result).toEqual({
+      attached: false,
+      reason: 'no-app-config',
+      detail: expect.any(String),
     });
+    // Provisioning already ran (setServiceIntent's own read happens INSIDE
+    // its write chain, at execution time — after the provisioning awaits
+    // above it in the method body) — this is the "provisioned but
+    // unlabeled" gap the ordering-note comment already flags, not a new
+    // one. The point of the fix is that the refusal is now RETURNED rather
+    // than silently ignored, and the restart never fires for it.
+    expect(dbProvisioner!.provisionAppDatabase).toHaveBeenCalledWith(appName);
+    expect(doRestartSpy).not.toHaveBeenCalled();
+    expect((platform as any).appsInProgress.has(appName)).toBe(false);
   });
 
   it('when provisioning rejects, nothing is persisted or restarted, and the busy guard is released', async () => {
-    const upsertConfig = stubAppConfigService(baseConfig());
+    const setServiceIntent = stubAppConfigService(baseConfig());
     stubStateManager(baseState());
     stubSecrets(null);
     const dbProvisioner = stubDbProvisioner();
@@ -536,7 +547,7 @@ describe('DropPlatform.attachService', () => {
 
     await expect(platform.attachService(appName, 'postgres')).rejects.toThrow('provision failed');
 
-    expect(upsertConfig).not.toHaveBeenCalled();
+    expect(setServiceIntent).not.toHaveBeenCalled();
     expect(doRestartSpy).not.toHaveBeenCalled();
     expect((platform as any).appsInProgress.has(appName)).toBe(false);
   });
@@ -611,7 +622,9 @@ describe('DropPlatform.attachService', () => {
     };
     (platform as any).appConfigService = {
       getConfig: jest.fn((name: string) => baseConfig({ name, path: `/apps/${name}` })),
-      upsertConfig: jest.fn().mockResolvedValue(undefined),
+      // Truthy (attach checks this return value) — the specific shape isn't
+      // asserted by this test, only that attach isn't refused over it.
+      setServiceIntent: jest.fn().mockResolvedValue(baseConfig()),
     };
     stubSecrets(null);
     const dbProvisioner = stubDbProvisioner();
