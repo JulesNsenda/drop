@@ -35,7 +35,7 @@ jobs:
       version: ${{ steps.gates.outputs.version }}
       prerelease: ${{ steps.gates.outputs.prerelease }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           # Do not leave a credential in .git/config for every later step.
           persist-credentials: false
@@ -86,7 +86,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
           echo "Releasing $VERSION (prerelease=$PRERELEASE)"
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 20
           cache: npm
@@ -205,7 +205,7 @@ jobs:
           cat drop-dist.tar.gz.sha256 install.sh.sha256
 
       - name: Upload artifact for publish job
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: release-assets
           path: |
@@ -229,7 +229,7 @@ jobs:
       attestations: write
     steps:
       - name: Download built assets
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: release-assets
 
@@ -245,7 +245,7 @@ jobs:
       # you want an existing tag's assets attested.
       - name: Attest build provenance
         if: github.event.repository.private == false
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
         with:
           subject-path: |
             drop-dist.tar.gz
