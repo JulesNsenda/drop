@@ -250,4 +250,74 @@ describe('AppConfigService runtime field', () => {
       expect(created.port).toBe(4000);
     });
   });
+
+  describe('setServiceIntent', () => {
+    it('merges one service key without clobbering sibling entries', async () => {
+      const service = makeService();
+      await service.initialize();
+      await service.upsertSystemConfig('app', {
+        type: 'nodejs',
+        services: { postgres: 'attached', redis: 'attached' },
+      });
+
+      await service.setServiceIntent('app', 'postgres', 'detached');
+
+      const cfg = service.getConfig('app');
+      expect(cfg?.services).toEqual({ postgres: 'detached', redis: 'attached' });
+    });
+
+    it('returns null and writes nothing when no config exists', async () => {
+      const service = makeService();
+      await service.initialize();
+
+      const result = await service.setServiceIntent('ghost', 'postgres', 'detached');
+
+      expect(result).toBeNull();
+      expect(service.hasConfig('ghost')).toBe(false);
+    });
+
+    it('persists lastDetachAt alongside the intent, keyed by service', async () => {
+      const service = makeService();
+      await service.initialize();
+      await service.upsertSystemConfig('app', { type: 'nodejs' });
+
+      const now = Date.now();
+      await service.setServiceIntent('app', 'postgres', 'detached', { lastDetachAt: now });
+
+      expect(service.getConfig('app')?.lastDetachAt).toEqual({ postgres: now });
+    });
+
+    it('keys lastDetachAt per service — detaching one does not clobber or gate another\'s cooldown', async () => {
+      const service = makeService();
+      await service.initialize();
+      await service.upsertSystemConfig('app', { type: 'nodejs' });
+
+      const t1 = Date.now();
+      await service.setServiceIntent('app', 'postgres', 'detached', { lastDetachAt: t1 });
+      const t2 = t1 + 1000;
+      await service.setServiceIntent('app', 'redis', 'detached', { lastDetachAt: t2 });
+
+      expect(service.getConfig('app')?.lastDetachAt).toEqual({ postgres: t1, redis: t2 });
+    });
+  });
+
+  describe('runtime strip of SYSTEM_CONFIG_FIELDS', () => {
+    it('drops `services` from an upsertConfig call, even cast past the parameter types, applying the rest', async () => {
+      const service = makeService();
+      await service.initialize();
+
+      // The Omit<AppConfig, SystemConfigField> parameter type only catches a
+      // fresh object literal — a cast defeats it, which is why the strip has
+      // to happen at runtime too.
+      await service.upsertConfig('app', {
+        type: 'nodejs',
+        port: 3000,
+        services: { postgres: 'attached' },
+      } as any);
+
+      const cfg = service.getConfig('app');
+      expect(cfg?.services).toBeUndefined();
+      expect(cfg?.port).toBe(3000);
+    });
+  });
 });
