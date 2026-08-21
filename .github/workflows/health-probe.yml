@@ -1,0 +1,71 @@
+name: Health probe
+
+# Replaces an hourly SHA-drift check that was broken by design: deploy.yml
+# fires on main, develop AND feature/DROP-v2*, so "most recent successful
+# Deploy run's SHA == develop head" is permanently false after any main
+# deploy, and the hetzner environment's approval gate makes "develop head !=
+# deployed SHA" a NORMAL steady state (measured waits on real deploys range
+# 17s to 12m12s). An alarm that cries wolf gets muted, which reinstates the
+# blind spot it was meant to close.
+#
+# This is deliberately an OBSERVATION, not a gate: it records the version
+# production reports rather than asserting it equals package.json on this
+# branch. Many commits share a version between releases, and an equality
+# assertion would alarm constantly for reasons that are not incidents. It
+# cannot distinguish "deployed" from "deployed then rolled back" -- a real
+# answer needs the box to report the SHA it is running, which is a follow-up,
+# not built here.
+#
+# INERT ON ARRIVAL, same as .github/dependabot.yml (Landing A): `schedule`
+# only fires for a workflow file present on the repository's DEFAULT branch,
+# which is `main` here, while this repo lands everything on `develop` first.
+# `workflow_dispatch` is the same story -- the "Run workflow" button only
+# appears for a workflow present on the default branch. So neither trigger
+# is live until the next develop -> main release merge, and this is not
+# monitoring coverage until then.
+on:
+  schedule:
+    - cron: '0 6 * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Probe production health endpoint
+        env:
+          URL: https://dashboard.dropkit.sh/api/v1/health
+        run: |
+          set -euo pipefail
+
+          # Deliberately no -f: with -f, curl exits nonzero itself on a 4xx/5xx
+          # and this script never reaches the status check below, so the
+          # error message loses the actual status code. Letting curl succeed
+          # and asserting the status explicitly is the check that reports.
+          HTTP_STATUS=$(curl -sS -o response.json -w '%{http_code}' "$URL") || {
+            echo "::error::Health probe request to $URL failed outright." >&2
+            exit 1
+          }
+
+          if [ "$HTTP_STATUS" != "200" ]; then
+            echo "::error::Health probe returned HTTP $HTTP_STATUS (expected 200)." >&2
+            cat response.json >&2 || true
+            exit 1
+          fi
+
+          VERSION=$(jq -r '.version // "unknown"' response.json)
+
+          {
+            echo "## Health probe"
+            echo ""
+            echo "- Status: 200"
+            echo "- Reported version: \`$VERSION\`"
+            echo ""
+            echo "This is an observation, not a gate against this branch's package.json --"
+            echo "see the workflow file header for why."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "Health probe OK -- production reports version $VERSION"

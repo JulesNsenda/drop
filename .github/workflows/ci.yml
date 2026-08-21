@@ -14,39 +14,81 @@ permissions:
   contents: read
 
 jobs:
-  build-and-test:
+  verify:
+    uses: ./.github/workflows/_verify.yml
+    # No `secrets: inherit` -- _verify.yml declares no `secrets:` block and
+    # needs none. Passing secrets here would hand them to every future step
+    # added to that file, including two `npm ci` runs' worth of transitive
+    # postinstall scripts, on every PR (including from forks).
+    # upload-artifact defaults to false: CI never ships anything, so there is
+    # nothing here worth packaging.
+
+  # One mechanism, not two: files or updates a single GitHub issue rather than
+  # a webhook conditioned on a secret that may not exist.
+  #
+  # `!cancelled()` (not bare `!success()`) is the concurrency-aware form for
+  # THIS workflow specifically: `concurrency: cancel-in-progress: true` above
+  # means a second push to the same branch routinely cancels the first run's
+  # jobs mid-flight, and bare `!success()` would file/comment on the ci-failure
+  # issue for that ordinary event -- the exact "alarm that cries wolf gets
+  # muted" failure this notify job exists to avoid reintroducing (see the
+  # plan's reasoning for cutting the old hourly drift check). deploy.yml's
+  # notify job keeps plain `!success()` because ITS concurrency group has
+  # cancel-in-progress: false, so a cancellation there means something did.
+  #
+  # Restricted to main/develop pushes only: `github.ref_name` on a
+  # pull_request run is the PR's merge ref (e.g. "42/merge"), never "main" or
+  # "develop", so this also keeps PR runs quiet without a separate check --
+  # but the event_name guard is asserted explicitly rather than relied on
+  # implicitly, so this does not silently start firing on PRs if GitHub ever
+  # changes that ref shape.
+  notify:
+    needs: [verify]
+    if: >-
+      ${{ !success() && !cancelled() && github.event_name == 'push' &&
+          (github.ref_name == 'main' || github.ref_name == 'develop') }}
     runs-on: ubuntu-latest
+    permissions:
+      issues: write
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-        with:
-          # Do not leave a credential in .git/config for every later step:
-          # `npm ci` below runs arbitrary transitive postinstall scripts, and
-          # checkout persists GITHUB_TOKEN there by default. Same reason
-          # release.yml sets it. Nothing here runs git after checkout.
-          persist-credentials: false
+      - name: File or update a CI failure issue
+        env:
+          # NEVER interpolate ${{ }} directly into a run: block -- see
+          # release.yml's identical comment. A crafted commit message or
+          # branch name would otherwise execute on a runner in the same
+          # workflow that (in deploy.yml) also holds the deploy key. Values
+          # arrive as env vars and are referenced as "$VAR" below instead.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          WORKFLOW: ${{ github.workflow }}
+          BRANCH: ${{ github.ref_name }}
+          SHA: ${{ github.sha }}
+          VERIFY_RESULT: ${{ needs.verify.result }}
+        run: |
+          set -euo pipefail
 
-      - name: Set up Node.js
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
-        with:
-          node-version: 20
-          cache: npm
+          LABEL="ci-failure"
+          TITLE="CI failing on $BRANCH"
 
-      - name: Install server dependencies
-        run: npm ci
+          BODY="$(cat <<EOF
+          Run: $RUN_URL
+          Workflow: $WORKFLOW
+          Branch: $BRANCH
+          Commit: $SHA
+          Job: verify=$VERIFY_RESULT
+          EOF
+          )"
 
-      - name: Lint
-        run: npm run lint
+          # gh issue create --label fails outright if the label does not yet
+          # exist on the repo. Idempotent: a no-op once the label exists.
+          gh label create "$LABEL" --repo "$REPO" --color "d73a4a" \
+            --description "Automated CI/deploy failure notification" 2>/dev/null || true
 
-      - name: Build server
-        run: npm run build:server
+          EXISTING=$(gh issue list --repo "$REPO" --label "$LABEL" --state open --json number --jq '.[0].number // empty')
 
-      - name: Test
-        run: npm test
-
-      - name: Install dashboard dependencies
-        working-directory: src/dashboard
-        run: npm ci
-
-      - name: Build dashboard
-        working-directory: src/dashboard
-        run: npm run build
+          if [ -n "$EXISTING" ]; then
+            gh issue comment "$EXISTING" --repo "$REPO" --body "$BODY"
+          else
+            gh issue create --repo "$REPO" --title "$TITLE" --body "$BODY" --label "$LABEL"
+          fi
