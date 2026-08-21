@@ -11,7 +11,7 @@ import * as os from 'os';
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import { Pool } from 'pg';
-import { DatabaseProvisioner } from './database-provisioner';
+import { DatabaseProvisioner, ownerDumpDirName, OWNERLESS_DUMP_DIR } from './database-provisioner';
 import { runPgDump } from './pg-dump';
 
 // jest.mock factory is hoisted — keep the factory a pure jest.fn() stub so
@@ -438,6 +438,10 @@ describe('DatabaseProvisioner.backupAndDeleteAppDatabase', () => {
     queryMock = jest.fn().mockResolvedValue({ rows: [] });
     server = makeMockServer();
     server.getPool = jest.fn().mockResolvedValue({ query: queryMock });
+    // The normal (non-cleanup) arm assumes the database is actually there —
+    // that's what these tests exercise. The cleanup-arm describe block below
+    // overrides this back to false per test.
+    server.databaseExists.mockResolvedValue(true);
 
     provisioner = new DatabaseProvisioner(server, dropRoot);
     mockRunPgDump.mockReset();
@@ -457,12 +461,33 @@ describe('DatabaseProvisioner.backupAndDeleteAppDatabase', () => {
     return path.join(dropRoot, 'data', 'backup', 'pre-delete');
   }
 
+  /**
+   * Flattens BOTH layers `backupAndDeleteAppDatabase` can write/prune: legacy
+   * files directly under the top-level dir (pre-existing, never migrated to
+   * the per-owner layout) and files one level down in a per-owner
+   * subdirectory (the current layout). Existing assertions only care about
+   * basenames, so this keeps them layout-agnostic.
+   */
   async function listPreDeleteFiles(): Promise<string[]> {
+    const base = preDeleteDir();
+    let entries: string[];
     try {
-      return await fs.readdir(preDeleteDir());
+      entries = await fs.readdir(base);
     } catch {
       return [];
     }
+    const out: string[] = [];
+    for (const entry of entries) {
+      const full = path.join(base, entry);
+      const stat = await fs.stat(full).catch(() => null);
+      if (!stat) continue;
+      if (stat.isDirectory()) {
+        out.push(...(await fs.readdir(full).catch(() => [])));
+      } else {
+        out.push(entry);
+      }
+    }
+    return out;
   }
 
   /** Default happy-path runPgDump stub: writes a valid PGDMP-magic file to outFile. */
@@ -474,9 +499,14 @@ describe('DatabaseProvisioner.backupAndDeleteAppDatabase', () => {
   }
 
   it('no provisioned entry -> no-op', async () => {
-    const result = await provisioner.backupAndDeleteAppDatabase('ghost-app');
+    const result = await provisioner.backupAndDeleteAppDatabase('ghost-app', { ownerUserId: null });
 
-    expect(result).toEqual({ dropped: false, reason: 'no database provisioned' });
+    expect(result).toEqual({
+      dropped: false,
+      databaseDropped: false,
+      roleDropped: false,
+      reason: 'no database provisioned',
+    });
     expect(mockRunPgDump).not.toHaveBeenCalled();
     expect(queryMock).not.toHaveBeenCalled();
   });
@@ -485,9 +515,11 @@ describe('DatabaseProvisioner.backupAndDeleteAppDatabase', () => {
     const creds = injectCredentials(provisioner, 'myapp');
     stubSuccessfulDump();
 
-    const result = await provisioner.backupAndDeleteAppDatabase('myapp');
+    const result = await provisioner.backupAndDeleteAppDatabase('myapp', { ownerUserId: null });
 
     expect(result.dropped).toBe(true);
+    expect(result.databaseDropped).toBe(true);
+    expect(result.roleDropped).toBe(true);
     expect(result.reason).toBeUndefined();
     expect(result.dumpPath).toBeDefined();
     expect(provisioner.isProvisioned('myapp')).toBe(false);
@@ -504,11 +536,58 @@ describe('DatabaseProvisioner.backupAndDeleteAppDatabase', () => {
     expect(files.some((f) => f.endsWith('.partial'))).toBe(false);
   });
 
+  it('with a null ownerUserId, the dump lands under the shared _ownerless subdirectory', async () => {
+    injectCredentials(provisioner, 'myapp');
+    stubSuccessfulDump();
+
+    await provisioner.backupAndDeleteAppDatabase('myapp', { ownerUserId: null });
+
+    const ownerlessFiles = await fs.readdir(path.join(preDeleteDir(), OWNERLESS_DUMP_DIR)).catch(() => []);
+    expect(ownerlessFiles.some((f) => f.endsWith('.dump'))).toBe(true);
+  });
+
+  it('with an ownerUserId, the dump lands under that owner\'s own sanitized subdirectory — not _ownerless', async () => {
+    injectCredentials(provisioner, 'myapp');
+    stubSuccessfulDump();
+
+    const ownerUserId = '11111111-2222-3333-4444-555555555555';
+    await provisioner.backupAndDeleteAppDatabase('myapp', { ownerUserId });
+
+    const ownerDir = path.join(preDeleteDir(), ownerDumpDirName(ownerUserId));
+    const ownerFiles = await fs.readdir(ownerDir).catch(() => []);
+    expect(ownerFiles.some((f) => f.endsWith('.dump'))).toBe(true);
+
+    const ownerlessFiles = await fs.readdir(path.join(preDeleteDir(), OWNERLESS_DUMP_DIR)).catch(() => []);
+    expect(ownerlessFiles.some((f) => f.endsWith('.dump'))).toBe(false);
+  });
+
+  it('two different owners deleting same-named-prefix dumps never share a directory', async () => {
+    // Regression guard for the collision finding this per-owner layout
+    // closes: two distinct owners each get their OWN sanitized subdirectory,
+    // even though both write a "drop_myapp-..." file.
+    const ownerA = 'aaaaaaaa-0000-0000-0000-000000000000';
+    const ownerB = 'bbbbbbbb-0000-0000-0000-000000000000';
+
+    injectCredentials(provisioner, 'myapp');
+    stubSuccessfulDump();
+    await provisioner.backupAndDeleteAppDatabase('myapp', { ownerUserId: ownerA });
+
+    injectCredentials(provisioner, 'myapp');
+    stubSuccessfulDump();
+    await provisioner.backupAndDeleteAppDatabase('myapp', { ownerUserId: ownerB });
+
+    const dirA = path.join(preDeleteDir(), ownerDumpDirName(ownerA));
+    const dirB = path.join(preDeleteDir(), ownerDumpDirName(ownerB));
+    expect(dirA).not.toBe(dirB);
+    expect((await fs.readdir(dirA)).some((f) => f.endsWith('.dump'))).toBe(true);
+    expect((await fs.readdir(dirB)).some((f) => f.endsWith('.dump'))).toBe(true);
+  });
+
   it('dump fails -> no drop issued, entry retained, no leftover .partial', async () => {
     injectCredentials(provisioner, 'myapp');
     mockRunPgDump.mockResolvedValue({ ok: false, error: 'disk full' });
 
-    const result = await provisioner.backupAndDeleteAppDatabase('myapp');
+    const result = await provisioner.backupAndDeleteAppDatabase('myapp', { ownerUserId: null });
 
     expect(result.dropped).toBe(false);
     expect(result.reason).toMatch(/dump failed/);
@@ -527,7 +606,7 @@ describe('DatabaseProvisioner.backupAndDeleteAppDatabase', () => {
     });
     injectCredentials(provisioner, 'myapp');
 
-    const result = await provisioner.backupAndDeleteAppDatabase('myapp');
+    const result = await provisioner.backupAndDeleteAppDatabase('myapp', { ownerUserId: null });
 
     expect(result.dropped).toBe(false);
     expect(result.reason).toMatch(/not found/);
@@ -536,7 +615,7 @@ describe('DatabaseProvisioner.backupAndDeleteAppDatabase', () => {
     expect(provisioner.isProvisioned('myapp')).toBe(true);
   });
 
-  it('DROP USER fails after a good dump + DROP DATABASE -> dropped:false, entry retained (both-gate)', async () => {
+  it('DROP USER fails after a good dump + DROP DATABASE -> entry removed (databaseDropped-gate), restore-role.sql unlinked', async () => {
     injectCredentials(provisioner, 'myapp');
     stubSuccessfulDump();
     queryMock.mockImplementation((sql: string) => {
@@ -546,15 +625,25 @@ describe('DatabaseProvisioner.backupAndDeleteAppDatabase', () => {
       return Promise.resolve({ rows: [] });
     });
 
-    const result = await provisioner.backupAndDeleteAppDatabase('myapp');
+    const result = await provisioner.backupAndDeleteAppDatabase('myapp', { ownerUserId: null });
 
+    // Both-succeeded is still false (`dropped` keeps its old "both" meaning),
+    // but the entry is removed on `databaseDropped` alone — a registry entry
+    // pointing at a database that no longer exists protects nothing. The
+    // surviving role is the tracked orphan (see the reason string).
     expect(result.dropped).toBe(false);
+    expect(result.databaseDropped).toBe(true);
+    expect(result.roleDropped).toBe(false);
     expect(result.reason).toMatch(/database drop ok, role drop FAILED/);
-    expect(provisioner.isProvisioned('myapp')).toBe(true);
+    expect(provisioner.isProvisioned('myapp')).toBe(false);
+
     // The dump itself is still committed to disk — it's the safety net,
-    // independent of whether the drop half-succeeded.
+    // independent of whether the drop half-succeeded. The restore-role.sql
+    // is NOT: with the role still alive, it's a live plaintext credential,
+    // not a restore artifact, so it must be unlinked.
     const files = await listPreDeleteFiles();
     expect(files.some((f) => f.endsWith('.dump'))).toBe(true);
+    expect(files.some((f) => f.endsWith('.restore-role.sql'))).toBe(false);
   });
 
   it('dump "succeeds" but is not a valid pg_dump archive -> verification fails, no drop, entry retained', async () => {
@@ -564,7 +653,7 @@ describe('DatabaseProvisioner.backupAndDeleteAppDatabase', () => {
       return { ok: true };
     });
 
-    const result = await provisioner.backupAndDeleteAppDatabase('myapp');
+    const result = await provisioner.backupAndDeleteAppDatabase('myapp', { ownerUserId: null });
 
     expect(result.dropped).toBe(false);
     expect(result.reason).toMatch(/verification failed/);
@@ -586,11 +675,162 @@ describe('DatabaseProvisioner.backupAndDeleteAppDatabase', () => {
     injectCredentials(provisioner, 'myapp');
     stubSuccessfulDump();
 
-    await provisioner.backupAndDeleteAppDatabase('myapp');
+    await provisioner.backupAndDeleteAppDatabase('myapp', { ownerUserId: null });
 
     const files = await listPreDeleteFiles();
     expect(files).not.toContain('drop_old-app-2020-01-01T00-00-00-000Z.dump');
     expect(files.some((f) => f.startsWith('drop_myapp-') && f.endsWith('.dump'))).toBe(true);
+  });
+
+  it('retention: ages out a stale dump inside a DIFFERENT owner\'s subdirectory too (two-level walk)', async () => {
+    // prunePreDeleteBackups walks the base dir AND one level into every
+    // per-owner subdirectory — not just the one this call happens to write
+    // to — so a stale dump under some OTHER owner's directory is swept too.
+    const otherOwnerDir = path.join(preDeleteDir(), ownerDumpDirName('other-owner-id'));
+    await fs.mkdir(otherOwnerDir, { recursive: true, mode: 0o700 });
+    const oldDump = path.join(otherOwnerDir, 'drop_other-app-2020-01-01T00-00-00-000Z.dump');
+    await fs.writeFile(oldDump, 'stale dump content');
+    const fourDaysAgo = new Date(Date.now() - 4 * 24 * 60 * 60 * 1000);
+    await fs.utimes(oldDump, fourDaysAgo, fourDaysAgo);
+
+    injectCredentials(provisioner, 'myapp');
+    stubSuccessfulDump();
+    await provisioner.backupAndDeleteAppDatabase('myapp', { ownerUserId: null });
+
+    const remaining = await fs.readdir(otherOwnerDir).catch(() => []);
+    expect(remaining).not.toContain('drop_other-app-2020-01-01T00-00-00-000Z.dump');
+  });
+
+  it('retention: an explicit "0" is a deliberate keep-forever opt-out', async () => {
+    process.env.DROP_PREDELETE_RETENTION_DAYS = '0';
+    await fs.mkdir(preDeleteDir(), { recursive: true, mode: 0o700 });
+    const oldDump = path.join(preDeleteDir(), 'drop_old-app-2020-01-01T00-00-00-000Z.dump');
+    await fs.writeFile(oldDump, 'stale dump content');
+    const fourDaysAgo = new Date(Date.now() - 4 * 24 * 60 * 60 * 1000);
+    await fs.utimes(oldDump, fourDaysAgo, fourDaysAgo);
+
+    injectCredentials(provisioner, 'myapp');
+    stubSuccessfulDump();
+    await provisioner.backupAndDeleteAppDatabase('myapp', { ownerUserId: null });
+
+    const files = await listPreDeleteFiles();
+    expect(files).toContain('drop_old-app-2020-01-01T00-00-00-000Z.dump');
+  });
+
+  it('retention: an explicit "off" is a deliberate keep-forever opt-out', async () => {
+    process.env.DROP_PREDELETE_RETENTION_DAYS = 'off';
+    await fs.mkdir(preDeleteDir(), { recursive: true, mode: 0o700 });
+    const oldDump = path.join(preDeleteDir(), 'drop_old-app-2020-01-01T00-00-00-000Z.dump');
+    await fs.writeFile(oldDump, 'stale dump content');
+    const fourDaysAgo = new Date(Date.now() - 4 * 24 * 60 * 60 * 1000);
+    await fs.utimes(oldDump, fourDaysAgo, fourDaysAgo);
+
+    injectCredentials(provisioner, 'myapp');
+    stubSuccessfulDump();
+    await provisioner.backupAndDeleteAppDatabase('myapp', { ownerUserId: null });
+
+    const files = await listPreDeleteFiles();
+    expect(files).toContain('drop_old-app-2020-01-01T00-00-00-000Z.dump');
+  });
+
+  it('retention: an invalid value (typo) falls back to the 3-day default rather than keep-forever — the fixed fail-open', async () => {
+    // Before the env-int retrofit, `Number('3d')` is NaN, and the old guard
+    // `!Number.isFinite(days) || days <= 0` treated NaN the same as a
+    // deliberate "disable" — a typo silently meant keep-forever forever.
+    process.env.DROP_PREDELETE_RETENTION_DAYS = '3d';
+    await fs.mkdir(preDeleteDir(), { recursive: true, mode: 0o700 });
+    const oldDump = path.join(preDeleteDir(), 'drop_old-app-2020-01-01T00-00-00-000Z.dump');
+    await fs.writeFile(oldDump, 'stale dump content');
+    const fourDaysAgo = new Date(Date.now() - 4 * 24 * 60 * 60 * 1000);
+    await fs.utimes(oldDump, fourDaysAgo, fourDaysAgo);
+
+    injectCredentials(provisioner, 'myapp');
+    stubSuccessfulDump();
+    await provisioner.backupAndDeleteAppDatabase('myapp', { ownerUserId: null });
+
+    const files = await listPreDeleteFiles();
+    expect(files).not.toContain('drop_old-app-2020-01-01T00-00-00-000Z.dump');
+  });
+});
+
+describe('DatabaseProvisioner.backupAndDeleteAppDatabase — cleanup arm', () => {
+  // A registry entry can outlive its database: a previous call dropped the
+  // database but failed to drop the role, or the database was dropped
+  // out-of-band. This is what makes a retry converge instead of repeating
+  // pg_dump against a database that no longer exists.
+  let dropRoot: string;
+  let queryMock: jest.Mock;
+  let server: ReturnType<typeof makeMockServer>;
+  let provisioner: DatabaseProvisioner;
+
+  beforeEach(async () => {
+    dropRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'drop-prov-cleanup-'));
+    await seedPgDumpBinary(dropRoot);
+
+    queryMock = jest.fn().mockResolvedValue({ rows: [] });
+    server = makeMockServer();
+    server.getPool = jest.fn().mockResolvedValue({ query: queryMock });
+    server.databaseExists.mockResolvedValue(false); // the database is already gone
+
+    provisioner = new DatabaseProvisioner(server, dropRoot);
+    mockRunPgDump.mockReset();
+  });
+
+  afterEach(async () => {
+    await fs.rm(dropRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+    jest.clearAllMocks();
+  });
+
+  it('entry + missing db -> no dump, role dropped, entry removed', async () => {
+    const creds = injectCredentials(provisioner, 'myapp');
+
+    const result = await provisioner.backupAndDeleteAppDatabase('myapp', { ownerUserId: null });
+
+    expect(mockRunPgDump).not.toHaveBeenCalled();
+    expect(result.dropped).toBe(true);
+    expect(result.databaseDropped).toBe(true);
+    expect(result.roleDropped).toBe(true);
+    expect(result.dumpPath).toBeUndefined();
+    expect(provisioner.isProvisioned('myapp')).toBe(false);
+
+    const queries = queryMock.mock.calls.map((c: unknown[]) => c[0] as string);
+    expect(queries.some((q) => q.includes(`DROP USER IF EXISTS "${creds.user}"`))).toBe(true);
+    expect(queries.some((q) => /DROP DATABASE/i.test(q))).toBe(false);
+  });
+
+  it('entry + missing db + role drop fails -> entry retained as a tracked orphan, no dump attempted', async () => {
+    injectCredentials(provisioner, 'myapp');
+    queryMock.mockRejectedValue(new Error('role has dependent privileges'));
+
+    const result = await provisioner.backupAndDeleteAppDatabase('myapp', { ownerUserId: null });
+
+    expect(mockRunPgDump).not.toHaveBeenCalled();
+    expect(result.dropped).toBe(false);
+    expect(result.databaseDropped).toBe(true);
+    expect(result.roleDropped).toBe(false);
+    expect(result.reason).toMatch(/database already gone/);
+    expect(provisioner.isProvisioned('myapp')).toBe(true);
+  });
+
+  it('existence-probe failure (e.g. Postgres unreachable) returns a structured failure, never throws', async () => {
+    // Every OTHER failure in backupAndDeleteAppDatabase returns a structured
+    // result rather than throwing; the existence probe used to be the one
+    // call that wasn't wrapped, so a probe failure would propagate as an
+    // uncaught rejection instead of a `databaseDropped: false` result.
+    injectCredentials(provisioner, 'myapp');
+    server.databaseExists.mockRejectedValue(new Error('connection refused'));
+
+    const result = await provisioner.backupAndDeleteAppDatabase('myapp', { ownerUserId: null });
+
+    expect(result.dropped).toBe(false);
+    expect(result.databaseDropped).toBe(false);
+    expect(result.roleDropped).toBe(false);
+    expect(result.reason).toMatch(/existence probe failed/);
+    expect(mockRunPgDump).not.toHaveBeenCalled();
+    expect(queryMock).not.toHaveBeenCalled();
+    // A probe failure must not be mistaken for "the database is gone" — the
+    // registry entry (and thus the live database/role) stays intact.
+    expect(provisioner.isProvisioned('myapp')).toBe(true);
   });
 });
 
