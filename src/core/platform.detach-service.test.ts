@@ -662,7 +662,11 @@ describe('DropPlatform.detachService', () => {
     stubAppConfigService(baseConfig());
     stubStateManager(baseState({ status: 'running' }));
     stubRuntime();
-    const dumpPath = 'C:\\drop\\data\\backup\\pre-delete\\drop_myapp-stamp.dump';
+    // Build the fixture with path.join, never a hardcoded separator: a literal
+    // Windows path passes on Windows and fails on Linux CI, because
+    // path.basename only treats '\' as a separator on win32.
+    const dumpFile = `drop_${appName}-stamp.dump`;
+    const dumpPath = path.join(dropRoot, 'data', 'backup', 'pre-delete', dumpFile);
     stubDbProvisioner({
       provisionedNames: [appName],
       backupResult: { dropped: true, databaseDropped: true, roleDropped: true, dumpPath },
@@ -676,7 +680,7 @@ describe('DropPlatform.detachService', () => {
       deprovisioned: true,
       databaseDropped: true,
       roleDropped: true,
-      backup: { written: true, file: 'drop_myapp-stamp.dump' },
+      backup: { written: true, file: dumpFile },
       manifestConflict: false,
       restart: 'restarted',
     });

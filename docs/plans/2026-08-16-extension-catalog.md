@@ -1337,7 +1337,7 @@ findings_plan_dropped: 0
 findings_diff_actioned: 59
 findings_diff_rejected: 13
 findings_diff_dropped: 0
-escaped: 2
+escaped: 3
 agents_spawned: 37
 gates_failed_first_pass: 3
 escalated_from: none
@@ -1361,6 +1361,14 @@ Counting notes, so the numbers are reproducible rather than tidy:
   the stale attach banner. That survived all three Gate 2 reviewers and was
   found by a Gate 5 cleanup reviewer looking at duplicated state, not at
   correctness.
+- **The third escape was found by CI, and could not have been found locally.**
+  `platform.detach-service.test.ts` asserted `backup.file` against a hardcoded
+  Windows dump path (`C:\drop\...`). `path.basename` only treats `\` as a
+  separator on win32, so the fixture passed on this dev box and failed on
+  Linux CI, where basename returned the whole string. Product code was correct
+  either way — the fixture was not portable. This is the
+  Windows-dev-box-vs-Linux-CI divergence class again, and no amount of local
+  running would have surfaced it.
 - **`gates_failed_first_pass: 3`** — Gate 1 (the union drift), Gate 2 (two full
   fix rounds), Gate 5 (cleanups applied, including the escape above). Gates 3
   and 4 passed first time: the dedicated test pass found no product bug, and
