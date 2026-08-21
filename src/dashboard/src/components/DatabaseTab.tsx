@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react';
-import { Database, RefreshCw, Table2, AlertTriangle, Server, Plug } from 'lucide-react';
+import { Database, RefreshCw, Table2, AlertTriangle, Server, Plug, Unplug } from 'lucide-react';
 import { apiJson, apiJsonWithStatus } from '../api/client';
 import { useAuth } from '../hooks/useAuth';
 import { useToast } from './Toast';
@@ -24,10 +24,18 @@ import {
 import {
   describeAttachCard,
   describeAttachRefusal,
+  describeDetachConfirm,
+  describeDetachOutcome,
+  describeDetachRefusal,
   formatQuotaUsage,
+  isControlBlocked,
+  recordServiceRefusal,
+  type DetachServiceSuccess,
+  type PendingServiceAction,
   type QuotaState,
   type ServiceId,
   type ServiceIntent,
+  type ServiceRefusals,
 } from './attach-state';
 
 /**
@@ -42,6 +50,14 @@ interface DbOverviewResponse extends DbOverview {
   redis: { provisioned: boolean };
   services: Partial<Record<ServiceId, ServiceIntent>>;
   quota: { postgres: QuotaState; redis: QuotaState };
+  /** Whether this app is ephemeral — the Detach confirm
+   * dialog needs this so it never promises a Postgres backup an ephemeral
+   * app's detach doesn't actually write. */
+  ephemeral: boolean;
+  /** Set instead of a 503 when the database named in this app's stored
+   * credentials no longer exists — a renderable, repairable
+   * state, not a dead end. See the `!overview.provisioned` branch below. */
+  broken?: 'database-missing';
 }
 
 /** Used only when `overview` hasn't loaded yet (or a service is genuinely
@@ -61,17 +77,22 @@ const SERVICE_ICON: Record<ServiceId, typeof Database> = {
 interface ServiceRowProps {
   id: ServiceId;
   provisioned: boolean;
+  /** Postgres only — `overview.broken`. Absent for redis, which has
+   * no equivalent stale-registry-entry state on the wire. */
+  broken?: 'database-missing';
   intent: ServiceIntent | undefined;
   quota: QuotaState;
   role: 'admin' | 'user' | 'readonly' | undefined;
-  attaching: boolean;
-  /** A DIFFERENT service is currently attaching. Disables this row's button
-   * too — `handleAttach`'s single in-flight guard already refuses a second
-   * click functionally, but leaving the other button visually enabled would
-   * invite one that silently does nothing. */
-  blockedByOtherAttach: boolean;
+  /** DatabaseTab.tsx's single in-flight slot, or null when nothing is
+   * pending. `attaching`/`detaching`/`attachBlocked`/`detachBlocked` are all
+   * derived from this plus `id` below via `isControlBlocked` — handing down
+   * four separate booleans the parent had to keep in sync by hand (two of
+   * them longhand complements of `isControlBlocked` itself) let them drift
+   * from the helper that actually owns the relationship. */
+  pending: PendingServiceAction | null;
   refusal: { message: string; quota?: { used: number; limit: number } } | undefined;
   onAttach: (id: ServiceId) => void;
+  onDetach: (id: ServiceId) => void;
 }
 
 /**
@@ -84,17 +105,29 @@ interface ServiceRowProps {
 function ServiceRow({
   id,
   provisioned,
+  broken,
   intent,
   quota,
   role,
-  attaching,
-  blockedByOtherAttach,
+  pending,
   refusal,
   onAttach,
+  onDetach,
 }: ServiceRowProps) {
-  const view = describeAttachCard({ provisioned, intent, quota, role });
+  const view = describeAttachCard({ provisioned, broken, intent, quota, role });
   const Icon = SERVICE_ICON[id];
   const label = SERVICE_LABEL[id];
+  const attaching = pending?.service === id && pending.kind === 'attach';
+  const detaching = pending?.service === id && pending.kind === 'detach';
+  // A DIFFERENT action (any other service's, OR this same service's OTHER
+  // control) currently has an attach or detach in flight — see
+  // `isControlBlocked`'s doc. The single `pendingAction` in-flight guard in
+  // `handleAttach`/`handleDetach` already refuses a second click
+  // functionally, but leaving a control visually enabled would invite one
+  // that silently does nothing. Split per-button: a pending attach on THIS
+  // service must not leave THIS service's own Detach button enabled.
+  const attachBlocked = isControlBlocked(pending, id, 'attach');
+  const detachBlocked = isControlBlocked(pending, id, 'detach');
 
   return (
     <div
@@ -109,13 +142,35 @@ function ServiceRow({
           </span>
         </div>
 
-        {view.attached ? (
-          <Badge tone="ok">Attached</Badge>
+        {view.detachIncomplete || view.attached ? (
+          // Still provisioned. `detachIncomplete` means the last recorded
+          // intent is 'detached' — a prior detach persisted its intent
+          // (persist-first, Phase 3) but didn't finish deprovisioning; never
+          // render that as plain "Attached", that would hide the only repair
+          // affordance. Otherwise this is a cleanly attached service. Only
+          // the badge differs between the two — the Detach control itself is
+          // identical either way.
+          <div className="flex items-center gap-3">
+            <Badge tone={view.detachIncomplete ? 'warn' : 'ok'}>
+              {view.detachIncomplete ? 'Detach incomplete' : 'Attached'}
+            </Badge>
+            {view.canDetach && (
+              <Button
+                variant="danger"
+                loading={detaching}
+                disabled={detachBlocked}
+                onClick={() => onDetach(id)}
+              >
+                <Unplug className="h-4 w-4" />
+                {view.detachActionLabel}
+              </Button>
+            )}
+          </div>
         ) : role === 'readonly' ? (
-          // The API gates POST at `user` — a readonly viewer must not see a
-          // button that would 403. Omitted outright, not rendered disabled:
-          // matches AppDetailPage.tsx:130's `canManageCredential`, which
-          // hides its git-credential control the same way rather than
+          // The API gates POST/DELETE at `user` — a readonly viewer must not
+          // see a button that would 403. Omitted outright, not rendered
+          // disabled: matches AppDetailPage.tsx:130's `canManageCredential`,
+          // which hides its git-credential control the same way rather than
           // showing a dead one with an explanation.
           <Badge tone="neutral">Not attached</Badge>
         ) : (
@@ -130,12 +185,13 @@ function ServiceRow({
               loading={attaching}
               // `!view.canAttach` is defense-in-depth, not the primary gate
               // for readonly (the branch above never lets this Button render
-              // for that case at all). `blockedByOtherAttach` is the primary
-              // gate for the in-flight guard: it keeps this row's control
-              // from inviting a click that `handleAttach` would silently
-              // no-op while the other service's attach (and its confirm
-              // dialog) is in flight.
-              disabled={!view.canAttach || blockedByOtherAttach}
+              // for that case at all). `attachBlocked` is the primary gate
+              // for the in-flight guard: it keeps this control from inviting
+              // a click that `handleAttach`/`handleDetach` would silently
+              // no-op while another action (and its confirm dialog) is in
+              // flight — including THIS service's own Detach (see
+              // `isControlBlocked`'s doc).
+              disabled={!view.canAttach || attachBlocked}
               onClick={() => onAttach(id)}
             >
               <Plug className="h-4 w-4" />
@@ -145,12 +201,17 @@ function ServiceRow({
         )}
       </div>
 
-      {!view.attached && role !== 'readonly' && view.disabledReason === 'quota-exceeded' && (
+      {view.detachIncomplete && view.canDetach && (
+        <p className="text-xs" style={{ color: 'var(--warn)' }}>
+          A previous detach did not finish — retry to complete it.
+        </p>
+      )}
+      {!view.attached && !view.detachIncomplete && role !== 'readonly' && view.disabledReason === 'quota-exceeded' && (
         <p className="text-xs" style={{ color: 'var(--warn)' }}>
           {label} quota reached — free up a service before attaching another.
         </p>
       )}
-      {!view.attached && role !== 'readonly' && !view.disabledReason && view.previouslyDetached && (
+      {!view.attached && !view.detachIncomplete && role !== 'readonly' && !view.disabledReason && view.previouslyDetached && (
         <p className="text-xs" style={{ color: 'var(--text-3)' }}>
           Previously detached — attaching will re-provision it.
         </p>
@@ -200,15 +261,28 @@ function DatabaseTab({ name }: { name: string }) {
   const { toast } = useToast();
   const confirmDialog = useConfirm();
 
+  // Whether this app is ephemeral (`overview.ephemeral`, DROP-151 Phase 2
+  // payload) — read once here rather than inline in handleDetach so the
+  // callback's dependency array can key off this boolean instead of the
+  // whole `overview` object.
+  const ephemeral = overview?.ephemeral === true;
+
   // Component-owned — `usePolledJson` deliberately carries no in-flight flag
-  // (hooks/useApi.ts), and this tab doesn't even poll. Attach provisions a
-  // resource AND restarts the app, which can take up to the readiness
-  // timeout (60s default), so the button needs its own loading state for
-  // that whole span, not just the network round trip.
-  const [attachingService, setAttachingService] = useState<ServiceId | null>(null);
-  const [attachRefusals, setAttachRefusals] = useState<
-    Partial<Record<ServiceId, { message: string; quota?: { used: number; limit: number } }>>
-  >({});
+  // (hooks/useApi.ts), and this tab doesn't even poll. Attach/detach each
+  // provision-or-deprovision a resource AND restart the app, which can take
+  // up to the readiness timeout (60s default), so the button needs its own
+  // loading state for that whole span, not just the network round trip.
+  //
+  // One slot, not two booleans: `ConfirmProvider` (ConfirmDialog.tsx) holds
+  // exactly one pending `resolve`, so an attach confirm and a detach confirm
+  // can never be in flight at once regardless of which service or action
+  // triggered them — a single `pendingAction` makes that constraint the
+  // type, rather than two independently-settable flags that could disagree.
+  const [pendingAction, setPendingAction] = useState<PendingServiceAction | null>(null);
+  // One map, not two — see `recordServiceRefusal`'s doc (attach-state.ts)
+  // for why a separate attach/detach pair let a stale attach banner survive
+  // a later detach refusal on the same service.
+  const [serviceRefusals, setServiceRefusals] = useState<ServiceRefusals>({});
 
   const load = useCallback(
     async (isRefresh: boolean) => {
@@ -218,14 +292,14 @@ function DatabaseTab({ name }: { name: string }) {
       setTablesError('');
       // A refusal banner is a snapshot of the moment it happened (e.g. a
       // quota-exceeded reading) — it goes stale the instant fresher data
-      // arrives, whether from this same Refresh, a successful attach's own
-      // refresh, or (since this component has no route `key` and React
+      // arrives, whether from this same Refresh, a successful attach/detach's
+      // own refresh, or (since this component has no route `key` and React
       // reuses the instance across app navigation, same trap as
       // `credentialChoice` at AppDetailPage.tsx:141-149) a switch to a
       // different app. Clearing per-service state here, not just at the
-      // start of the next attach attempt, is what stops a fixed quota still
-      // reading "reached" next to a badge that now shows headroom.
-      setAttachRefusals({});
+      // start of the next attempt, is what stops a fixed quota still reading
+      // "reached" next to a badge that now shows headroom.
+      setServiceRefusals({});
 
       const overviewJson = await apiJson<DbOverviewResponse>(`/db/${encodeURIComponent(name)}`);
       if (!overviewJson.success || !overviewJson.data) {
@@ -282,11 +356,12 @@ function DatabaseTab({ name }: { name: string }) {
       // confirmDialog — not after, like that precedent could get away with
       // for a single upload flow. The dialog itself awaits a user click, so
       // arming only after it resolves leaves the guard disarmed for the
-      // dialog's entire lifetime: the OTHER service's button is still
-      // enabled behind the modal, and a click (or Tab+Enter — the dialog
-      // traps no focus) opens a second confirm() and strands the first.
-      if (attachingService) return;
-      setAttachingService(serviceId);
+      // dialog's entire lifetime: another button (this service's Detach, or
+      // any other row's control) is still enabled behind the modal, and a
+      // click (or Tab+Enter — the dialog traps no focus) opens a second
+      // confirm() and strands the first.
+      if (pendingAction) return;
+      setPendingAction({ service: serviceId, kind: 'attach' });
 
       const label = SERVICE_LABEL[serviceId];
       const confirmed = await confirmDialog({
@@ -299,11 +374,11 @@ function DatabaseTab({ name }: { name: string }) {
         variant: 'danger',
       });
       if (!confirmed) {
-        setAttachingService(null);
+        setPendingAction(null);
         return;
       }
 
-      setAttachRefusals(prev => ({ ...prev, [serviceId]: undefined }));
+      setServiceRefusals(prev => recordServiceRefusal(prev, serviceId, undefined));
 
       const result = await apiJsonWithStatus<{ message: string; envVarNames: string[] }>(
         `/apps/${encodeURIComponent(name)}/services/${serviceId}`,
@@ -312,7 +387,7 @@ function DatabaseTab({ name }: { name: string }) {
 
       if (result.success) {
         toast('success', `${label} attached to ${name}`);
-        setAttachingService(null);
+        setPendingAction(null);
         // On-demand refresh, matching the Refresh button — this tab is
         // deliberately non-polling (see the header comment), so a successful
         // attach is the one place besides a manual click that must re-fetch.
@@ -323,16 +398,82 @@ function DatabaseTab({ name }: { name: string }) {
       const details = result.error?.details as
         | { reason?: string; quota?: { used: number; limit: number } }
         | undefined;
-      setAttachRefusals(prev => ({
-        ...prev,
-        [serviceId]: {
+      setServiceRefusals(prev =>
+        recordServiceRefusal(prev, serviceId, {
           message: describeAttachRefusal(details?.reason, result.error?.message),
           quota: details?.reason === 'quota-exceeded' ? details.quota : undefined,
-        },
-      }));
-      setAttachingService(null);
+        })
+      );
+      setPendingAction(null);
     },
-    [attachingService, confirmDialog, name, toast, load]
+    [pendingAction, confirmDialog, name, toast, load]
+  );
+
+  const handleDetach = useCallback(
+    async (serviceId: ServiceId) => {
+      // Same single in-flight guard as handleAttach — see its comment above.
+      if (pendingAction) return;
+      setPendingAction({ service: serviceId, kind: 'detach' });
+
+      const label = SERVICE_LABEL[serviceId];
+      // Per-service (and, for postgres, per-ephemeral) copy lives in
+      // describeDetachConfirm — see its doc for why an ephemeral app's
+      // postgres detach must not repeat the "a backup is written" promise.
+      const detail = describeDetachConfirm(serviceId, ephemeral);
+      const confirmed = await confirmDialog({
+        title: `Detach ${label}`,
+        message:
+          `DROP will remove ${label} from "${name}" and restart the app so the connection ` +
+          `details are no longer injected. ${detail} This can't be undone from the dashboard.`,
+        confirmText: 'Detach',
+        variant: 'danger',
+      });
+      if (!confirmed) {
+        setPendingAction(null);
+        return;
+      }
+
+      setServiceRefusals(prev => recordServiceRefusal(prev, serviceId, undefined));
+
+      const result = await apiJsonWithStatus<DetachServiceSuccess>(
+        `/apps/${encodeURIComponent(name)}/services/${serviceId}`,
+        { method: 'DELETE' }
+      );
+
+      if (result.success) {
+        // Mirrors handleAttach's `result.success`-only check — a detach that
+        // succeeded but arrived without the expected `data` shape (a
+        // contract mismatch, not a refusal) still gets a success toast, not
+        // a red refusal banner over an operation that already happened.
+        toast(
+          'success',
+          result.data ? describeDetachOutcome(label, result.data) : `${label} detached from "${name}".`
+        );
+        setPendingAction(null);
+        // On-demand refresh, matching the Refresh button and handleAttach —
+        // this tab is deliberately non-polling (see the header comment), so
+        // a successful detach is the one place besides a manual click that
+        // must re-fetch. It's also how a `detachIncomplete` retry gets to
+        // see whether it actually converged.
+        await load(true);
+        return;
+      }
+
+      const details = result.error?.details as
+        | { reason?: string; retryAfterSeconds?: number }
+        | undefined;
+      setServiceRefusals(prev =>
+        recordServiceRefusal(prev, serviceId, {
+          message: describeDetachRefusal(
+            details?.reason,
+            result.error?.message,
+            details?.retryAfterSeconds
+          ),
+        })
+      );
+      setPendingAction(null);
+    },
+    [pendingAction, confirmDialog, name, toast, load, ephemeral]
   );
 
   const servicesCard = (
@@ -350,13 +491,14 @@ function DatabaseTab({ name }: { name: string }) {
         <ServiceRow
           id="postgres"
           provisioned={overview?.provisioned ?? false}
+          broken={overview?.broken}
           intent={overview?.services?.postgres}
           quota={overview?.quota?.postgres ?? NO_QUOTA}
           role={role}
-          attaching={attachingService === 'postgres'}
-          blockedByOtherAttach={attachingService !== null && attachingService !== 'postgres'}
-          refusal={attachRefusals.postgres}
+          pending={pendingAction}
+          refusal={serviceRefusals.postgres}
           onAttach={handleAttach}
+          onDetach={handleDetach}
         />
         <ServiceRow
           id="redis"
@@ -364,10 +506,10 @@ function DatabaseTab({ name }: { name: string }) {
           intent={overview?.services?.redis}
           quota={overview?.quota?.redis ?? NO_QUOTA}
           role={role}
-          attaching={attachingService === 'redis'}
-          blockedByOtherAttach={attachingService !== null && attachingService !== 'redis'}
-          refusal={attachRefusals.redis}
+          pending={pendingAction}
+          refusal={serviceRefusals.redis}
           onAttach={handleAttach}
+          onDetach={handleDetach}
         />
       </div>
     </Card>
@@ -402,17 +544,34 @@ function DatabaseTab({ name }: { name: string }) {
   }
 
   if (!overview || !overview.provisioned) {
+    // `broken: 'database-missing'` is a distinct state
+    // from ordinary "never provisioned": the database is gone, but this
+    // app's credentials — and possibly its role — are still on record. The
+    // generic copy below would wrongly read as "nothing was ever here", so
+    // this gets its own honest line instead; the repair
+    // affordance is the Attach/Detach row already rendered in `servicesCard`.
+    const missingDatabase = overview?.broken === 'database-missing';
     return (
       <div className="space-y-4">
         <Card className="py-12 text-center">
           <Database className="mx-auto mb-3 h-8 w-8" style={{ color: 'var(--text-3)' }} />
           <h3 className="mb-1 text-base font-semibold" style={{ color: 'var(--text)' }}>
-            No database provisioned for this app
+            {missingDatabase ? 'Database missing' : 'No database provisioned for this app'}
           </h3>
           <p className="mx-auto max-w-md text-sm" style={{ color: 'var(--text-2)' }}>
-            DROP provisions one automatically when an app declares <code>database: postgres</code>{' '}
-            in its <code>drop.yaml</code>, or ships a Postgres client in <code>package.json</code>
-            — or attach one directly below.
+            {missingDatabase ? (
+              <>
+                The database named in this app&apos;s stored credentials no longer exists, though
+                its credentials — and possibly its role — are still on record. Use Detach below to
+                clear the stale record, or Attach to provision a fresh one.
+              </>
+            ) : (
+              <>
+                DROP provisions one automatically when an app declares <code>database: postgres</code>{' '}
+                in its <code>drop.yaml</code>, or ships a Postgres client in <code>package.json</code>
+                — or attach one directly below.
+              </>
+            )}
           </p>
         </Card>
         {servicesCard}

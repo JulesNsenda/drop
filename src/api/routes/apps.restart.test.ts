@@ -17,6 +17,7 @@ import { createUser, resetAuth } from '../middleware/auth';
 import { getTestToken } from '../__testutils__/auth';
 import { getStateManager, resetStateManager } from '../../managers/app/state-manager';
 import { setPlatformOps, resetPlatformOps, AppInProgressError, AppNeedsConfigError, PlatformOps } from '../platform-ops';
+import { makePlatformOpsStub } from '../__testutils__/platform-ops';
 import * as activity from '../../managers/activity';
 import type { AppProcessInfo } from '../../managers/runtime';
 import { ErrorCodes } from '../types';
@@ -35,15 +36,10 @@ const RUNNING_PROCESS: AppProcessInfo = {
   restartedAt: new Date('2026-01-01T00:00:05Z'),
 };
 
+// `restartApp` resolves to this suite's own RUNNING_PROCESS by default —
+// several tests below assert on its pid/port without overriding it.
 function makeOps(overrides?: Partial<PlatformOps>): PlatformOps {
-  return {
-    restartApp: jest.fn().mockResolvedValue(RUNNING_PROCESS),
-    attachService: jest.fn(),
-    isAppInProgress: jest.fn().mockReturnValue(false), promoteApp: jest.fn(),
-    removeGroup: jest.fn().mockResolvedValue({ removed: [] }),
-    purgeAppArtifacts: jest.fn().mockResolvedValue(undefined),
-    ...overrides,
-  };
+  return makePlatformOpsStub({ restartApp: jest.fn().mockResolvedValue(RUNNING_PROCESS), ...overrides });
 }
 
 describe('POST /apps/:name/start and /apps/:name/restart (platform ops)', () => {

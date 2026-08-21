@@ -12,6 +12,7 @@ import { isValidAppName } from '../middleware/validate';
 import { canAccess } from '../access';
 import { getStateManager } from '../../managers/app/state-manager';
 import { getDatabaseProvisioner } from '../../managers/database';
+import { getPlatformOps } from '../platform-ops';
 import type { AuthContext } from '../middleware/auth';
 
 // Keys that platform controls and must never be overridden by user secrets.
@@ -87,34 +88,48 @@ secrets.put('/:name', async (c) => {
   // no way to deprovision a database without deleting the whole app, so the
   // message must not suggest that as a next step.
   //
-  // It fails OPEN in two cases, and the reason that is SAFE is not the one an
-  // earlier version of this comment gave. It claimed "the precedence still
-  // protects a provisioned app either way", which is false — in the second
-  // case below there is no precedence left to protect anything:
+  // DROP-151 Phase 3 dissolved the previous version of this comment's
+  // argument. It claimed "safe by construction — `isProvisioned` and
+  // `getAppCredentials` read the SAME map, so they flip together", which held
+  // only while attach/detach had no owner-facing intent. Detach now persists
+  // `AppConfig.services[id] = 'detached'` BEFORE deprovisioning (the
+  // persist-first invariant — see the detach plan), so a database can be
+  // registry-`isProvisioned() === true` while the owner's recorded intent is
+  // already `'detached'`: the partial-detach repair state (dump/drop
+  // succeeded or is retried, `services.postgres` says "gone" while the
+  // registry hasn't converged yet). In that state the owner must be able to
+  // set their own DATABASE_URL — DROP is not going to inject one — so the
+  // gate now checks intent via `PlatformOps.getServiceIntent` (the same
+  // authority `appNeedsDatabase`/`buildFreshStartSpec` consult on the
+  // platform side) rather than re-deriving precedence from `isProvisioned`
+  // alone.
   //
-  //   1. No provisioner at all (`getDatabaseProvisioner()` returns null until
-  //      something constructs it with a server + dropRoot) — e.g. test paths,
-  //      or a boot where the DB layer never came up.
-  //   2. The provisioner exists but its registry is empty, which is what
-  //      `loadCredentials` leaves behind after quarantining a corrupt
-  //      `db-credentials.json`. The databases are still on the server; DROP
-  //      has just lost the credentials for them.
+  // The new invariant: refuse iff `isProvisioned(name) && intent !==
+  // 'detached'`. Every DSN-injecting site on the platform (`appNeedsDatabase`,
+  // `buildFreshStartSpec`) honours the same `'detached'` intent, so this gate
+  // and the injection path can never disagree about which DATABASE_URL wins.
   //
-  // Both are safe for the same structural reason: `isProvisioned` and
-  // `getAppCredentials` read the SAME map, so they flip together. Whenever
-  // this check is skipped, `getEnvVars` also returns null, `dbEnvVars` is
-  // empty, and nothing would have overridden the secret. **The refusal is
-  // skipped exactly when the override it exists to prevent cannot happen** —
-  // correct by construction rather than by the precedence argument.
-  //
-  // Do not "harden" case 2 by also consulting `orphanDatabaseExists`. In
-  // quarantine the app is getting no DATABASE_URL from DROP at all, so
-  // letting the owner supply one is the recovery path; refusing would close
-  // it while DROP cannot serve the database anyway.
-  if (body.key.toUpperCase() === 'DATABASE_URL' && getDatabaseProvisioner()?.isProvisioned(r.name)) {
-    throw new ValidationError(
-      `'${r.name}' already has a DROP-managed database; its DATABASE_URL is platform-owned and would override this secret`
-    );
+  // Still fails OPEN in the pre-existing cases where nothing could override
+  // the secret anyway: no provisioner wired at all (`getDatabaseProvisioner()`
+  // null — test paths, or a boot where the DB layer never came up), or the
+  // provisioner's registry is empty after quarantining a corrupt
+  // `db-credentials.json` (databases still live on the server; DROP has just
+  // lost the credentials). Do not "harden" the quarantine case by also
+  // consulting `orphanDatabaseExists` — the app is getting no DATABASE_URL
+  // from DROP at all in that state, so letting the owner supply one is the
+  // recovery path, not a hole.
+  // Short-circuit on the key first: `getDatabaseProvisioner()`/`isProvisioned`/
+  // `getServiceIntent` are otherwise paid on every secret write, not just a
+  // DATABASE_URL one.
+  if (body.key.toUpperCase() === 'DATABASE_URL') {
+    const dbProvisioner = getDatabaseProvisioner();
+    const isDbProvisioned = dbProvisioner?.isProvisioned(r.name) ?? false;
+    const dbIntent = getPlatformOps()?.getServiceIntent(r.name, 'postgres');
+    if (isDbProvisioned && dbIntent !== 'detached') {
+      throw new ValidationError(
+        `'${r.name}' already has a DROP-managed database; its DATABASE_URL is platform-owned and would override this secret`
+      );
+    }
   }
 
   // Cap value size

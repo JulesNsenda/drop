@@ -26,6 +26,7 @@ import {
   mcpRateLimitMiddleware,
   oauthRateLimitMiddleware,
   dbRateLimitMiddleware,
+  servicesRateLimitMiddleware,
 } from './middleware/rate-limit';
 import { securityHeadersMiddleware } from './middleware/security-headers';
 import { auditMiddleware, initializeAuditLog, closeAuditLog } from './middleware/audit';
@@ -278,10 +279,14 @@ export class ApiServer {
     // unconditionally — an auth-disabled (single-operator) box still gets it.
     v1.use('/db/*', dbRateLimitMiddleware());
 
-    // Backing-service attach (DROP-151 Phase 2) provisions a real Postgres
-    // database/role or a Redis logical DB — the same shared-instance cost the
-    // /db/* bucket above exists for, so it reuses it rather than adding a new
-    // config knob for one route. Registered unconditionally, like the other
+    // Backing-service attach/detach (DROP-151 Phase 2 attach, Phase 3 detach)
+    // provisions/deprovisions a real Postgres database+role or a Redis
+    // logical DB — the same shared-instance cost the /db/* bucket above
+    // exists for, but it gets its OWN dedicated bucket rather than sharing
+    // that one: a detach burst (or a client hammering a refusal) would
+    // otherwise 429 the database panel for the same client mid-incident —
+    // exactly the failure the /db/* bucket's own comment says it exists to
+    // prevent (security S15). Registered unconditionally, like the other
     // dedicated buckets. Only the NESTED form is registered: verified
     // empirically in this tree that '/apps/*/services' matches
     // '/apps/x/services' but NOT '/apps/x/services/postgres', and the nested
@@ -289,9 +294,9 @@ export class ApiServer {
     // deliberately not built (that data lives on GET /db/:name). Registering
     // the non-nested form too would rate-limit a 404: these buckets run
     // BEFORE the auth block below, so it would let an unauthenticated caller
-    // drain the shared db budget through a path that does nothing. Add it
+    // drain the services budget through a path that does nothing. Add it
     // back if and when a collection route exists.
-    v1.use('/apps/*/services/*', dbRateLimitMiddleware());
+    v1.use('/apps/*/services/*', servicesRateLimitMiddleware());
 
     // Apply auth middleware to protected routes when auth is enabled
     if (this.config.enableAuth && isAuthEnabled()) {

@@ -11,7 +11,7 @@ import type { AuthContext } from '../../api/middleware/auth';
 
 export interface ActivityEntry {
   id: string;
-  action: 'deploy' | 'git-deploy' | 'upload-deploy' | 'start' | 'stop' | 'restart' | 'delete' | 'login' | 'signup' | 'redeploy' | 'migrate-runtime' | 'suspend' | 'unsuspend' | 'login_mfa_challenge' | 'login_mfa_ok' | 'mfa_enabled' | 'mfa_disabled' | 'grant-capabilities' | 'github-webhook-secret-generate' | 'github-webhook-secret-set' | 'github-webhook-secret-clear' | 'user-connectors-set' | 'apikey-create' | 'agent-token-issue' | 'agent-deploy' | 'disk-park' | 'promotion-held' | 'promote' | 'idle-reap' | 'idle-reap-dryrun' | 'ephemeral-reap' | 'password-reset' | 'attach-service';
+  action: 'deploy' | 'git-deploy' | 'upload-deploy' | 'start' | 'stop' | 'restart' | 'delete' | 'login' | 'signup' | 'redeploy' | 'migrate-runtime' | 'suspend' | 'unsuspend' | 'login_mfa_challenge' | 'login_mfa_ok' | 'mfa_enabled' | 'mfa_disabled' | 'grant-capabilities' | 'github-webhook-secret-generate' | 'github-webhook-secret-set' | 'github-webhook-secret-clear' | 'user-connectors-set' | 'apikey-create' | 'agent-token-issue' | 'agent-deploy' | 'disk-park' | 'promotion-held' | 'promote' | 'idle-reap' | 'idle-reap-dryrun' | 'ephemeral-reap' | 'password-reset' | 'attach-service' | 'detach-service';
   userId?: string;
   username?: string;
   /**

@@ -187,6 +187,22 @@ export function dbRateLimitMiddleware(config?: Partial<RateLimitConfig>) {
   return createRateLimiter('db', { ...DB_CONFIG, ...config });
 }
 
+/**
+ * Dedicated rate limiter for backing-service attach/detach (DROP-151 Phase 3).
+ * Same numbers as DB_CONFIG on purpose — attach/detach and the database panel
+ * are the same shared-Postgres-instance cost, so there is no reason to size
+ * this bucket differently. What has to differ is the STORE: this bucket is
+ * deliberately its OWN `createRateLimiter` instance rather than a share of
+ * the /db/* one, so a detach burst (or a client hammering a refusal) can't
+ * 429 the database panel for the same client mid-incident — the exact
+ * failure the /db/* bucket's own comment says it exists to prevent. An
+ * operator tuning /db/* should NOT assume this bucket follows — bump both
+ * explicitly if the two ever need to move together.
+ */
+export function servicesRateLimitMiddleware(config?: Partial<RateLimitConfig>) {
+  return createRateLimiter('services', { ...DB_CONFIG, ...config });
+}
+
 /** Reset all rate limit stores (for testing) */
 export function resetRateLimits(): void {
   stores.clear();

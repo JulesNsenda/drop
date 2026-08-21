@@ -105,7 +105,7 @@ describe('RedisProvisioner', () => {
       await provisioner.provisionAppRedis('app-b'); // db 2
 
       const res = await provisioner.deprovisionAppRedis('app-a');
-      expect(res).toEqual({ removed: true, flushed: true });
+      expect(res).toEqual({ removed: true, flushed: true, hadAllocation: true });
       // FLUSHDB connected to the app's own DB, authenticated.
       expect(redisCtor).toHaveBeenCalledWith(expect.objectContaining({ db: a.db, password: 'sekret' }));
       expect(flushdb).toHaveBeenCalled();
@@ -116,18 +116,100 @@ describe('RedisProvisioner', () => {
       expect(c.db).toBe(MIN_APP_DB);
     });
 
-    it('is a no-op for an app that was never provisioned', async () => {
+    it('is a no-op for an app that was never provisioned — hadAllocation:false distinguishes it from a flush failure', async () => {
       const res = await provisioner.deprovisionAppRedis('ghost');
-      expect(res).toEqual({ removed: false, flushed: false });
+      expect(res).toEqual({ removed: false, flushed: false, hadAllocation: false });
     });
 
-    it('still removes the allocation when FLUSHDB fails (fail-soft)', async () => {
-      await provisioner.provisionAppRedis('app-a');
+    it('FREES the allocation even when FLUSHDB fails, and tombstones the DB NUMBER instead of the app name — no leaked reclaim path once the app is deleted', async () => {
+      const a = await provisioner.provisionAppRedis('app-a');
       // Reject only the deprovision's FLUSHDB (provision does its own flush-on-assign).
       flushdb.mockRejectedValueOnce(new Error('redis down'));
       const res = await provisioner.deprovisionAppRedis('app-a');
-      expect(res).toEqual({ removed: true, flushed: false });
+      expect(res).toEqual({ removed: false, flushed: false, hadAllocation: true });
+      // Unlike the old retain-on-failure behaviour: the allocation is GONE
+      // (an app-delete right after this call has somewhere to actually free
+      // it), and the tombstone lives on the number instead.
       expect(provisioner.hasAppRedis('app-a')).toBe(false);
+      expect(provisioner.getAllocation('app-a')).toBeNull();
+      expect(provisioner.listPendingFlushDbs()).toEqual([a.db]);
+    });
+
+    it('a DIFFERENT app can be handed the tombstoned number later, once it is the ONLY free number left — provisionAppRedis fail-hard flushes it first', async () => {
+      const a = await provisioner.provisionAppRedis('app-a');
+      flushdb.mockRejectedValueOnce(new Error('redis down'));
+      await provisioner.deprovisionAppRedis('app-a');
+      expect(provisioner.listPendingFlushDbs()).toEqual([a.db]);
+
+      // Exhaust every OTHER free (clean) number first — nextFreeDb prefers
+      // a clean number over a tombstoned one, so the tombstoned one is only
+      // reachable once nothing else is free.
+      for (let i = 0; i < MAX_APP_DB - 1; i++) {
+        const filler = await provisioner.provisionAppRedis(`filler-${i}`);
+        expect(filler.db).not.toBe(a.db);
+      }
+
+      flushdb.mockClear();
+      const b = await provisioner.provisionAppRedis('app-b');
+      expect(b.db).toBe(a.db); // the reclaimed, formerly-tombstoned number
+      expect(flushdb).toHaveBeenCalledTimes(1);
+      expect(provisioner.listPendingFlushDbs()).toEqual([]);
+    });
+  });
+
+  describe('nextFreeDb ordering', () => {
+    it('prefers a free non-tombstoned number over a tombstoned one — a provision during a Redis outage on db1 succeeds on db2 rather than fail-hard retrying db1', async () => {
+      const a = await provisioner.provisionAppRedis('app-a'); // db 1
+      flushdb.mockRejectedValueOnce(new Error('redis down'));
+      await provisioner.deprovisionAppRedis('app-a'); // tombstones db 1, frees the allocation
+      expect(provisioner.listPendingFlushDbs()).toEqual([a.db]);
+
+      flushdb.mockClear();
+      const b = await provisioner.provisionAppRedis('app-b');
+      expect(b.db).not.toBe(a.db);
+      expect(b.db).toBe(MIN_APP_DB + 1);
+      // Only ONE flush attempt — db2's own flush-on-assign — never touching
+      // the still-tombstoned, still-unhealthy db1.
+      expect(flushdb).toHaveBeenCalledTimes(1);
+      expect(provisioner.listPendingFlushDbs()).toEqual([a.db]); // db1 untouched
+    });
+  });
+
+  describe('pendingFlushDbs tombstone (reprovisioning a number whose last deprovision failed to flush)', () => {
+    it('flushes and clears the tombstone once it is reached (all other numbers taken) — the SAME app name being reprovisioned is incidental, not special', async () => {
+      const a = await provisioner.provisionAppRedis('app-a');
+      flushdb.mockRejectedValueOnce(new Error('redis down'));
+      await provisioner.deprovisionAppRedis('app-a');
+      expect(provisioner.listPendingFlushDbs()).toEqual([a.db]);
+
+      // Clean numbers are preferred — exhaust them first so the tombstoned
+      // number is the only one left.
+      for (let i = 0; i < MAX_APP_DB - 1; i++) {
+        await provisioner.provisionAppRedis(`filler-${i}`);
+      }
+
+      flushdb.mockClear();
+      const reprovisioned = await provisioner.provisionAppRedis('app-a');
+      expect(reprovisioned.db).toBe(a.db);
+      expect(flushdb).toHaveBeenCalledTimes(1);
+      expect(provisioner.listPendingFlushDbs()).toEqual([]);
+    });
+
+    it('refuses to hand out a tombstoned number when the flush also fails, regardless of which app asks (only free number left)', async () => {
+      const a = await provisioner.provisionAppRedis('app-a');
+      flushdb.mockRejectedValueOnce(new Error('redis down'));
+      await provisioner.deprovisionAppRedis('app-a');
+      expect(provisioner.listPendingFlushDbs()).toEqual([a.db]);
+
+      for (let i = 0; i < MAX_APP_DB - 1; i++) {
+        await provisioner.provisionAppRedis(`filler-${i}`);
+      }
+
+      flushdb.mockRejectedValueOnce(new Error('still down'));
+      await expect(provisioner.provisionAppRedis('app-b')).rejects.toThrow(/still could not be flushed/);
+      // The tombstone survives the failed retry — nothing is silently handed out.
+      expect(provisioner.listPendingFlushDbs()).toEqual([a.db]);
+      expect(provisioner.hasAppRedis('app-b')).toBe(false);
     });
   });
 
@@ -155,6 +237,19 @@ describe('RedisProvisioner', () => {
       expect(dirEntries.some((e) => e.startsWith('redis-allocations.json.corrupt-'))).toBe(true);
     });
 
+    it('round-trips a pendingFlushDbs tombstone across a reload', async () => {
+      const a = await provisioner.provisionAppRedis('app-a');
+      flushdb.mockRejectedValueOnce(new Error('redis down'));
+      await provisioner.deprovisionAppRedis('app-a');
+
+      const reloaded = new RedisProvisioner(server, tmpDir);
+      await reloaded.initialize();
+      // The allocation itself is gone (freed on deprovision) — only the DB
+      // NUMBER's tombstone survives the reload.
+      expect(reloaded.hasAppRedis('app-a')).toBe(false);
+      expect(reloaded.listPendingFlushDbs()).toEqual([a.db]);
+    });
+
     it('drops duplicate/out-of-range DB numbers from a hand-edited file', async () => {
       const allocPath = path.join(tmpDir, 'data', 'drop-svc', 'redis-allocations.json');
       await fs.mkdir(path.dirname(allocPath), { recursive: true });
@@ -175,6 +270,23 @@ describe('RedisProvisioner', () => {
       expect(p.getAllocation('a')?.db).toBe(1);
       expect(p.hasAppRedis('b')).toBe(false);
       expect(p.hasAppRedis('c')).toBe(false);
+    });
+
+    it('drops out-of-range/non-numeric pendingFlushDbs entries from a hand-edited file', async () => {
+      const allocPath = path.join(tmpDir, 'data', 'drop-svc', 'redis-allocations.json');
+      await fs.mkdir(path.dirname(allocPath), { recursive: true });
+      await fs.writeFile(
+        allocPath,
+        JSON.stringify({
+          version: 1,
+          allocations: [],
+          pendingFlushDbs: [3, 99, 'nope', -1],
+        })
+      );
+
+      const p = new RedisProvisioner(server, tmpDir);
+      await p.initialize();
+      expect(p.listPendingFlushDbs()).toEqual([3]);
     });
   });
 });

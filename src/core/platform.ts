@@ -69,6 +69,7 @@ import {
 } from '../managers/guardrail/promotion';
 import { getPrincipalQuota, resetPrincipalQuota } from '../managers/guardrail/principal-quota';
 import { isExpired } from '../managers/guardrail/ephemeral';
+import { checkDetachCooldown, checkDumpByteBudget } from '../managers/guardrail/detach-limits';
 import {
   planIdleSweep,
   createIdleSweepState,
@@ -104,6 +105,9 @@ import {
   resetPlatformOps,
   type AttachableServiceId,
   type AttachServiceResult,
+  type DetachServiceOutcome,
+  type DetachServiceResult,
+  type DetachServiceRestartOutcome,
 } from '../api/platform-ops';
 import { planSecretPreflight, generateSecretValue } from '../managers/secret/secret-preflight';
 import { Logger, createLogger } from '../utils/logger';
@@ -1666,6 +1670,8 @@ backup:
       removeGroup: (name) => this.removeGroup(name),
       purgeAppArtifacts: (name, opts) => this.purgeAppArtifacts(name, opts),
       attachService: (name, serviceId) => this.attachService(name, serviceId),
+      detachService: (name, serviceId) => this.detachService(name, serviceId),
+      getServiceIntent: (name, serviceId) => this.getServiceIntent(name, serviceId),
     });
 
     this.logger.info(`API server running on port ${this.config.apiPort}`, 'API');
@@ -5199,13 +5205,17 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     const dataDir = await this.ensureAppDataDirectory(appName);
 
     // Get env vars for an already-provisioned DB (no new provisioning here).
-    // Skip entirely when the owner's intent is 'detached'. This is defensive
-    // rather than load-bearing today — detach only persists 'detached' after
-    // a successful deprovision, at which point getEnvVars already returns
-    // null — but it closes the partial-failure window where `DROP DATABASE`
-    // succeeded and `DROP USER` failed: the registry entry stays alive and
-    // getEnvVars would otherwise still hand back a DSN for a database that no
-    // longer exists.
+    // Skip entirely when the owner's intent is 'detached'. This is LOAD-
+    // BEARING, not defensive: detachService persists 'detached' BEFORE
+    // deprovisioning (the persist-first invariant — see its own method doc),
+    // so a 'detached' intent with a still-live registry entry is the
+    // EXPECTED shape of a partial detach (a crash or a failed `DROP DATABASE`
+    // /`DROP USER` between the persist and the drop), not a rare edge case.
+    // This guard is the only thing stopping this restart path from
+    // re-injecting a DSN for a database the owner explicitly asked to
+    // remove. Its two siblings, `appNeedsDatabase` and `provisionRedisEnvVars`
+    // (which guards the same way for Redis, and `appNeedsRedis` beneath it),
+    // check the same intent for the same reason on the deploy/attach path.
     let dbEnvVars: Record<string, string> = {};
     if (this.dbProvisioner && this.appServiceIntent(appName, 'postgres') !== 'detached') {
       const pgSocketDir =
@@ -5363,6 +5373,51 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
   }
 
   /**
+   * Attach/detach refusals go to the platform logger, never the ActivityLog
+   * ring. The ring holds only 500 entries, and a caller hammering a cheap,
+   * repeatable refusal (the route's rate limit permits ~20/min) could evict
+   * every security-relevant entry in it within about 25 minutes. Both
+   * operations log through this one place so that stays true by construction
+   * rather than by two call sites happening to agree.
+   */
+  private logServiceRefusal(
+    op: 'attach' | 'detach',
+    appName: string,
+    serviceId: AttachableServiceId,
+    reason: string
+  ): void {
+    this.logger.warn(`${op} refused for '${appName}' (${serviceId}): ${reason}`, 'SERVICES');
+  }
+
+  /**
+   * Log a refusal and hand it straight back, so attachService/detachService's
+   * ~15 refusal sites are each a single `return this.refuse(...)` instead of
+   * a `logServiceRefusal(...)` call hand-paired with a `return { ... }` a few
+   * lines below it — the "every refusal is logged" invariant used to hold
+   * only because 15 call sites happened to remember both halves; now it holds
+   * because there is only one half to remember. Generic over the refusal
+   * shape so it serves both attachService's and detachService's differently-
+   * shaped refusal arms (both always carry a string `reason`) — `const T` so
+   * a call site's object literal (e.g. `reason: 'no-app-config'`,
+   * `attached: false`) keeps its literal type through the call instead of
+   * widening to `string`/`boolean`, which would make every refusal fail to
+   * satisfy AttachServiceResult/DetachServiceResult's discriminated unions.
+   * `label` overrides the string actually logged, for the two detach-limit
+   * refusals whose wire `reason` ('detach-limit') is too coarse on its own to
+   * tell the cooldown and dump-budget limiters apart in the platform log.
+   */
+  private refuse<const T extends { reason: string }>(
+    op: 'attach' | 'detach',
+    appName: string,
+    serviceId: AttachableServiceId,
+    refusal: T,
+    label?: string
+  ): T {
+    this.logServiceRefusal(op, appName, serviceId, label ?? refusal.reason);
+    return refusal;
+  }
+
+  /**
    * DROP-151 Phase 2: attach a backing service (postgres|redis) to an app —
    * quota check, provision, persist the owner's explicit intent
    * (`AppConfig.services`), then restart so the env var is actually injected.
@@ -5393,7 +5448,11 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
    *      database.
    *   5. Provision (see point 1 for why no extra lock is needed here).
    *   6. Persist `services[serviceId] = 'attached'` — the precedence
-   *      `appServiceIntent` reads back everywhere.
+   *      `appServiceIntent` reads back everywhere. `setServiceIntent`
+   *      re-reads the config INSIDE its own write chain (at execution time,
+   *      not at this method's call time), so it can still resolve null here
+   *      — a second, later no-app-config refusal, guarded the same way
+   *      detachService's own two call sites are.
    *   7. Restart, so the freshly-provisioned var is actually injected.
    *      Resolves only once that restart resolves.
    */
@@ -5424,6 +5483,13 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         throw new Error(`Application not found: ${appName}`);
       }
 
+      // Shared verbatim by both no-app-config refusals below (the up-front
+      // guard and the post-provisioning setServiceIntent race) — hoisted so
+      // the two can't drift apart.
+      const noAppConfigDetail =
+        `'${appName}' has no platform config yet, so its service attachment cannot be ` +
+        'persisted safely. Deploy the app once through DROP before attaching a service.';
+
       // An app with runtime state but NO AppConfig must not be attached to.
       // Persisting intent means `upsertConfig`, which would mint a config
       // carrying `type: 'unknown'` and no `path`/`hostname` — and
@@ -5436,13 +5502,11 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       // instead; every app deployed through the normal pipeline has a config
       // by the time it is running.
       if (!config) {
-        return {
+        return this.refuse('attach', appName, serviceId, {
           attached: false,
           reason: 'no-app-config',
-          detail:
-            `'${appName}' has no platform config yet, so its service attachment cannot be ` +
-            'persisted safely. Deploy the app once through DROP before attaching a service.',
-        };
+          detail: noAppConfigDetail,
+        });
       }
       // Same resolution restartApp/doRestart use — a hardcoded appsDirectory
       // join would read the wrong (or no) drop.yaml for an out-of-tree or
@@ -5451,12 +5515,12 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       const appPath = config?.path || state?.path || path.join(this.config.appsDirectory, appName);
 
       if (config?.ephemeral) {
-        return {
+        return this.refuse('attach', appName, serviceId, {
           attached: false,
           reason: 'ephemeral',
           detail:
             'This app is ephemeral and will be torn down on its TTL without a database backup — attach is refused to avoid unrecoverable data loss.',
-        };
+        });
       }
 
       // Both services need this guard, not just Postgres. dbEnvVars AND
@@ -5469,20 +5533,20 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       if (serviceId === 'postgres') {
         const ownSource = await this.appDatabaseUrlSource(appName, appPath);
         if (ownSource) {
-          return {
+          return this.refuse('attach', appName, serviceId, {
             attached: false,
             reason: 'has-own-database-url',
             detail: `This app already supplies its own DATABASE_URL (via ${ownSource}) — attaching would silently repoint it at a freshly-created, empty database.`,
-          };
+          });
         }
       } else {
         const ownSource = await this.appRedisUrlSource(appName, appPath);
         if (ownSource) {
-          return {
+          return this.refuse('attach', appName, serviceId, {
             attached: false,
             reason: 'has-own-redis-url',
             detail: `This app already supplies its own REDIS_URL (via ${ownSource}) — attaching would silently repoint it at a freshly-created, empty Redis instance.`,
-          };
+          });
         }
       }
 
@@ -5491,12 +5555,12 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         ? this.checkDbQuota(ownerUserId)
         : this.checkRedisQuota(ownerUserId);
       if (!quota.allowed) {
-        return {
+        return this.refuse('attach', appName, serviceId, {
           attached: false,
           reason: 'quota-exceeded',
           detail: `${serviceId === 'postgres' ? 'Database' : 'Redis'} quota reached (${quota.used}/${quota.limit}).`,
           quota: { used: quota.used, limit: quota.limit },
-        };
+        });
       }
 
       // Ordering note: intent is persisted AFTER provisioning succeeds, not
@@ -5520,11 +5584,11 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           // A refusal, not a throw: an instance with no database layer is a
           // permanent, correct configuration — mapping it to a 500 would read
           // as a crash and alert as one on every Postgres-less install.
-          return {
+          return this.refuse('attach', appName, serviceId, {
             attached: false,
             reason: 'service-unavailable',
             detail: 'The database service is not available on this instance.',
-          };
+          });
         }
         await this.dbProvisioner.provisionAppDatabase(appName);
         const pgSocketDir =
@@ -5539,13 +5603,13 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           // See the Postgres branch above — a refusal, not a throw. This is
           // the ordinary state of any box with managed Redis disabled or
           // absent.
-          return {
+          return this.refuse('attach', appName, serviceId, {
             attached: false,
             reason: 'service-unavailable',
             detail:
               'Managed Redis is not available on this instance — it may be disabled in the ' +
               'platform configuration, or it may have failed to start.',
-          };
+          });
         }
         await this.redisProvisioner.provisionAppRedis(appName);
         const redisHost = this.config.isolation === 'docker' ? HOST_ALIAS : '127.0.0.1';
@@ -5553,9 +5617,25 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         envVarNames = Object.keys(envVars);
       }
 
-      await this.appConfigService.upsertConfig(appName, {
-        services: { ...(config?.services ?? {}), [serviceId]: 'attached' },
-      });
+      // setServiceIntent, not upsertSystemConfig's snapshot-spread — it
+      // reads the CURRENT config inside the write chain and merges one
+      // key, so a concurrent write for this app is never lost to a stale
+      // `config` closed over above. The `!config` guard above only proves
+      // config was non-null when THIS call started; setServiceIntent reads
+      // the config again INSIDE the write chain, at execution time, after
+      // every provisioning await above — a `deleteConfig` landing in that
+      // gap makes it resolve null here, same as detachService's own two call
+      // sites. Guard it the same way, rather than leaving a provisioned,
+      // quota-consuming service whose owner intent silently never got
+      // recorded.
+      const persisted = await this.appConfigService.setServiceIntent(appName, serviceId, 'attached');
+      if (!persisted) {
+        return this.refuse('attach', appName, serviceId, {
+          attached: false,
+          reason: 'no-app-config',
+          detail: noAppConfigDetail,
+        });
+      }
 
       // Only report success once the restart (and its env re-injection)
       // actually resolves — a provisioned-but-not-yet-running database is
@@ -5615,6 +5695,450 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     return release;
   }
 
+  /** `AppConfig.services[serviceId]` — the owner's persisted attach/detach intent, or undefined. */
+  getServiceIntent(appName: string, serviceId: AttachableServiceId): 'attached' | 'detached' | undefined {
+    return this.appServiceIntent(appName, serviceId);
+  }
+
+  /**
+   * DROP-151 Phase 3: detach a backing service (postgres|redis) — record the
+   * owner's intent durably, deprovision (postgres: verified dump then drop;
+   * redis: flush then free the logical DB number), then restart the app so
+   * the injected env var actually drops. See platform-ops.ts's
+   * DetachServiceResult for the discriminated return shape; a refusal is a
+   * RETURN VALUE (never thrown) except for "busy", which throws
+   * AppInProgressError — matching attachService's own contract.
+   *
+   * **No owner lock**, unlike attachService. Detach only ever FREES quota, so
+   * every interleaving with a concurrent attach errs toward over-refusal,
+   * never over-admission — `appsInProgress` (per-app) is all the
+   * serialisation this needs. See docs/plans/2026-08-16-extension-catalog.md
+   * ("Phase 3 — detach: final plan") for the full guard-by-guard rationale;
+   * this comment only summarises the ordering, which is deliberate and
+   * pinned by platform.detach-service.test.ts:
+   *   1. busy (AppInProgressError, spans the WHOLE operation)
+   *   2. not-found (both config and state absent)
+   *   3. group-app (monorepo container OR child — refused outright; children
+   *      never consult the container's config, so a container-level detach
+   *      would report destruction that never happened)
+   *   4. service-unavailable (the NAMED service's provisioner, per-service —
+   *      never a generic "any provisioner missing" check)
+   *   5. not provisioned: postgres + an orphaned (unregistered) live database
+   *      -> 'credentials-missing'; otherwise NOT a refusal — persist
+   *      'detached' and return early with `restart: 'not-needed'` (distinct
+   *      from `'not-restarted'`: nothing was ever stopped here, so reporting
+   *      liveness would be beside the point, and the old literal read as a
+   *      false "was running, but chose not to restart"). Nothing to
+   *      stop/drop, so guards 6-7 and the destructive steps below never run
+   *      for this branch.
+   *   6. detach-limit: per-SERVICE cooldown (keyed on
+   *      `AppConfig.lastDetachAt[serviceId]`, not one shared per-app value —
+   *      see that field's own doc, app-config.ts — so detaching postgres can
+   *      no longer 429 an unrelated redis detach for the same app; skipped
+   *      when intent is already 'detached' and still provisioned — a retry
+   *      is not abuse), then (postgres only, and skipped entirely for an
+   *      ephemeral app — its dump is about to be skipped too, so nothing is
+   *      charged against a budget it will never write to) the owner's
+   *      pre-delete dump-byte budget.
+   *   7. manifest conflict — NOT a refusal; carried into the result so the UI
+   *      can show owner-intent-wins without a second round trip.
+   *   8. Persist 'detached' + lastDetachAt via setServiceIntent — BEFORE any
+   *      destruction (the plan's core invariant: persist-first, so a crash or
+   *      a partial deprovision still leaves a retriable, honest state).
+   *      Returning null here (no AppConfig) is the 'no-app-config' refusal,
+   *      enforced at the write site rather than as an up-front guard.
+   *   9. Stop, properly: liveness from the RUNTIME (not state status) — an
+   *      'errored'/'crash-looping' app can still hold a live process whose
+   *      stale env and open connections must die before a Redis number frees
+   *      or a `DROP ... FORCE` fires. Both `wasRunning` (STATE, before the
+   *      stop) and `wasLive` (RUNTIME, the same read that decides whether to
+   *      stop) feed step 11 — see the inline comment just above the try
+   *      block (step 9-10's code) for why both are needed and why this
+   *      liveness read and the stop itself are inside the SAME try/catch as
+   *      step 10.
+   *  10. Deprovision (dump-then-drop / flush-then-free), wrapped — together
+   *      with step 9 above — so EVERY exit (a reported failure, a THROWN
+   *      error from either step, or success) resolves to a result shape
+   *      first and restarts exactly once after, at a single call site. A
+   *      previously-live app must never be left stopped with no restart
+   *      attempt just because the stop or the deprovision step threw instead
+   *      of returning a failure. The 'detached' intent stays persisted
+   *      either way (already written in step 8 — that IS the design). A
+   *      redis flush that FAILS but still freed+tombstoned the allocation is
+   *      a SUCCESS (`deprovisioned: true, flushed: false`), not a refusal —
+   *      see `RedisProvisioner.deprovisionAppRedis`'s own doc for why.
+   *      `reason: 'deprovision-failed'` is what's left for a THROWN error
+   *      (either step, either service); the old `flush-failed` refusal that
+   *      used to cover the REPORTED-failure arm is gone, not renamed — that
+   *      arm is a success now.
+   *  11. Restart iff `wasLive || wasRunning`, via doRestart — never a
+   *      hand-rolled runtime.start (PM2 merges env on a bare start, so a
+   *      removed DATABASE_URL would keep being injected under
+   *      isolation:none).
+   *  12. Refusals are logged via the platform logger, never ActivityLog (see
+   *      logServiceRefusal) — the route slice adds ActivityLog for outcomes.
+   */
+  async detachService(
+    appName: string,
+    serviceId: AttachableServiceId
+  ): Promise<DetachServiceResult> {
+    if (this.appsInProgress.has(appName)) {
+      throw new AppInProgressError(appName);
+    }
+    this.appsInProgress.add(appName);
+    try {
+      if (!this.appConfigService || !this.stateManager || !this.runtime) {
+        throw new Error('Platform is not fully initialized');
+      }
+
+      const config = this.appConfigService.getConfig(appName);
+      const state = this.stateManager.getApp(appName);
+
+      // Shared verbatim by both no-app-config refusals below (the
+      // not-provisioned branch and the main persist-before-destruction step)
+      // — hoisted so the two can't drift apart.
+      const noAppConfigDetail = `'${appName}' has no platform config yet, so its detach intent cannot be persisted safely.`;
+
+      // 2. not-found
+      if (!config && !state) {
+        return this.refuse('detach', appName, serviceId, {
+          detached: false,
+          reason: 'not-found',
+          detail: `Application '${appName}' not found.`,
+        });
+      }
+
+      // 3. group-app. Containers carry isGroupContainer:true; children carry
+      // only `group` — refuse both (see the method doc; attach has the same
+      // gap).
+      if (state?.isGroupContainer || state?.group) {
+        return this.refuse('detach', appName, serviceId, {
+          detached: false,
+          reason: 'group-app',
+          detail: `'${appName}' is part of a monorepo group. Group children never consult the container's own config, so a group-level detach could report a service removed that was never actually attached to this app — detach the individual app's own database/Redis outside the group tooling, or contact an operator.`,
+        });
+      }
+
+      // 4. service-unavailable — per-service, never a generic null check.
+      const provisioner: DatabaseProvisioner | RedisProvisioner | null =
+        serviceId === 'postgres' ? this.dbProvisioner : this.redisProvisioner;
+      if (!provisioner) {
+        return this.refuse('detach', appName, serviceId, {
+          detached: false,
+          reason: 'service-unavailable',
+          detail:
+            serviceId === 'postgres'
+              ? 'The database service is not available on this instance.'
+              : 'Managed Redis is not available on this instance.',
+        });
+      }
+
+      // Same resolution attachService/doRestart use.
+      const appPath = config?.path || state?.path || path.join(this.config.appsDirectory, appName);
+      // Not a refusal (guard 7) — its position can't be observed since it
+      // never blocks anything. Lazy and memoised: a parse+validate of
+      // drop.yaml on every call would be paid even by refusals below that
+      // never carry it (guard 5's credentials-missing, guard 6/7's
+      // detach-limit) — the cooldown refusal in particular is the
+      // cheap-to-hammer path (~20/min). `getManifestConflict()` awaits the
+      // parse at most once, on first read from whichever success arm reaches it.
+      let manifestConflictPromise: Promise<boolean> | undefined;
+      const getManifestConflict = (): Promise<boolean> => {
+        if (!manifestConflictPromise) {
+          manifestConflictPromise = this.detachManifestConflict(appPath, serviceId);
+        }
+        return manifestConflictPromise;
+      };
+
+      // 5. not provisioned
+      if (!provisioner.isProvisioned(appName)) {
+        if (serviceId === 'postgres' && (await this.dbProvisioner!.orphanDatabaseExists(appName))) {
+          return this.refuse('detach', appName, serviceId, {
+            detached: false,
+            reason: 'credentials-missing',
+            detail: `'${appName}' has a live database on the server with no tracked credentials for it — "nothing to detach" would be dishonest. Contact an operator to recover or clear the orphaned database.`,
+          });
+        }
+
+        // Not a refusal: record the owner's intent even against a manifest
+        // they don't control, and make a double-click idempotent.
+        const persisted = await this.appConfigService.setServiceIntent(appName, serviceId, 'detached');
+        if (!persisted) {
+          return this.refuse('detach', appName, serviceId, {
+            detached: false,
+            reason: 'no-app-config',
+            detail: noAppConfigDetail,
+          });
+        }
+        // 'not-needed', not 'not-restarted': nothing was ever stopped on
+        // this branch, so a liveness-based restart value would either be a
+        // needless bounce (running) or, worse, the old dishonest "was not
+        // running, so it was not restarted" for an app that WAS running the
+        // whole time — its service was just never provisioned in the first
+        // place.
+        return {
+          detached: true,
+          deprovisioned: false,
+          manifestConflict: await getManifestConflict(),
+          restart: 'not-needed',
+        };
+      }
+
+      // Hoisted above guard 6: an ephemeral app's dump is always skipped at
+      // step 10, so charging its owner's byte budget for a dump that will
+      // never be written would refuse a detach over nothing — mirrors the
+      // delete route's own ephemeral skip (apps.ts).
+      const skipBackup = config?.ephemeral === true;
+
+      // 6. detach-limit. Retry exemption: intent already 'detached' while
+      // still provisioned (established above) is a repair, not abuse — skip
+      // the COOLDOWN only, never the byte budget.
+      const isRetry = this.appServiceIntent(appName, serviceId) === 'detached';
+      if (!isRetry) {
+        // Per-SERVICE, not one shared per-app epoch — see AppConfig.
+        // lastDetachAt's own doc (app-config.ts) for why. Keyed here the
+        // same way `services` is (by AttachableServiceId) — see
+        // `setServiceIntent`'s own per-service merge.
+        const cooldown = checkDetachCooldown({ lastDetachAt: config?.lastDetachAt?.[serviceId] });
+        if (!cooldown.allowed) {
+          return this.refuse(
+            'detach',
+            appName,
+            serviceId,
+            {
+              detached: false,
+              reason: 'detach-limit',
+              limit: 'cooldown',
+              retryAfterSeconds: cooldown.retryAfterSeconds,
+              detail: `'${appName}' had its ${serviceId} service detached too recently — retry in ${cooldown.retryAfterSeconds}s.`,
+            },
+            'detach-limit (cooldown)'
+          );
+        }
+      }
+      if (serviceId === 'postgres' && !skipBackup) {
+        // Per-OWNER, not global (a global ceiling is a cross-tenant DoS).
+        // Dump attribution is now keyed on a per-owner DIRECTORY, fixed at
+        // write time (`DatabaseProvisioner.ownerDumpDir`) — not re-derived
+        // from the live app list, which is what let a deleted app's dumps
+        // evade metering. Ownerless apps share the fixed `_ownerless`
+        // bucket, same as before.
+        const ownerDir = this.dbProvisioner!.ownerDumpDir(state?.userId);
+        const budget = await checkDumpByteBudget(ownerDir);
+        if (!budget.allowed) {
+          return this.refuse(
+            'detach',
+            appName,
+            serviceId,
+            {
+              detached: false,
+              reason: 'detach-limit',
+              limit: 'dump-budget',
+              detail: `This owner's pre-delete dump budget is exhausted (${Math.round(budget.usedBytes / (1024 * 1024))}MB used of ${Math.round(budget.limitBytes / (1024 * 1024))}MB) — an operator must prune old dumps before another Postgres detach can proceed.`,
+            },
+            'detach-limit (dump budget)'
+          );
+        }
+      }
+
+      // 8. Persist 'detached' + lastDetachAt — the converging-retry pivot —
+      // BEFORE any destruction below.
+      const persisted = await this.appConfigService.setServiceIntent(appName, serviceId, 'detached', {
+        lastDetachAt: Date.now(),
+      });
+      if (!persisted) {
+        return this.refuse('detach', appName, serviceId, {
+          detached: false,
+          reason: 'no-app-config',
+          detail: noAppConfigDetail,
+        });
+      }
+
+      // 9-10. Stop, then deprovision — ONE try/catch wrapping BOTH: the try
+      // used to open only at step 10, so a `runtime.stop` that RETHROWS
+      // (ContainerManager does, for anything that isn't not-found/not-
+      // running) escaped detachService entirely on a docker-isolation box —
+      // intent already 'detached', database still provisioned and counting
+      // quota, watches disarmed, state said 'stopped', no restart attempted,
+      // no audit, an opaque 500. Both steps now funnel into the same
+      // `outcome` and the single `restartAfterDetach` call at step 11.
+      // `deprovisionStarted` lets the one catch below tell a stop failure
+      // (nothing destructive was even attempted) from a deprovision failure
+      // (which needs a service-specific reason) without a second try block.
+      //
+      // `wasRunning` is read from STATE, before either step; `wasLive` is
+      // the RUNTIME read, inside the try, that decides whether to stop — an
+      // 'errored'/'crash-looping' app can still hold a live process. Both
+      // feed step 11: restarting on `wasRunning` alone would leave a
+      // live-but-errored app dead after detach while reporting the
+      // dishonest "was not running, so it was not restarted".
+      const freshState = this.stateManager.getApp(appName);
+      const wasRunning = freshState?.status === 'running';
+      // DetachServiceOutcome (platform-ops.ts / services-wire.types.ts) is
+      // this same shape — imported rather than hand-mirrored here, so the two
+      // can no longer drift apart.
+      let outcome: DetachServiceOutcome;
+      let wasLive = false;
+      let deprovisionStarted = false;
+      try {
+        const runtimeStatus = await this.runtime.getStatus(appName);
+        wasLive = runtimeStatus?.status === 'running';
+        if (wasLive) {
+          this.stopHealthProber(appName);
+          this.stopCrashLoopWatch(appName);
+          await this.stateManager.setAppStatus(appName, 'stopped');
+          await this.runtime.stop(appName);
+        }
+
+        deprovisionStarted = true;
+        if (serviceId === 'postgres') {
+          // Attributed to the SAME owner directory the byte-budget gate
+          // above measured (`this.dbProvisioner!.ownerDumpDir(state?.userId)`)
+          // — without this the budget bounded nothing: every dump landed in
+          // the shared `_ownerless` bucket while the gate kept reading the
+          // owner's own, perpetually-empty directory, so a create->attach->
+          // fill->detach loop was unbounded. Matches the delete route's own
+          // `ownerUserId: app.userId` (apps.ts).
+          const result = await this.dbProvisioner!.backupAndDeleteAppDatabase(appName, {
+            skipBackup,
+            ownerUserId: state?.userId ?? null,
+          });
+          if (!result.databaseDropped) {
+            // Full reason/dumpPath (may embed pg_dump stderr) — server log only.
+            this.logger.warn(`detach: postgres backup/drop failed for '${appName}': ${result.reason ?? 'unknown'}`, 'SERVICES');
+            outcome = {
+              detached: false,
+              reason: 'backup-failed',
+              detail:
+                'The database backup could not be completed, so nothing was dropped. The detach intent has been recorded — retry once the underlying issue is resolved.',
+            };
+          } else {
+            outcome = {
+              detached: true,
+              deprovisioned: true,
+              databaseDropped: result.databaseDropped,
+              roleDropped: result.roleDropped,
+              backup: {
+                written: Boolean(result.dumpPath),
+                file: result.dumpPath ? path.basename(result.dumpPath) : undefined,
+              },
+              manifestConflict: await getManifestConflict(),
+            };
+          }
+        } else {
+          const result = await this.redisProvisioner!.deprovisionAppRedis(appName);
+          if (!result.removed && !result.hadAllocation) {
+            // The allocation vanished between guard 5's isProvisioned check
+            // and this call — a race, not a failure. The owner's intent is
+            // already persisted and there is genuinely nothing left to
+            // flush, so this is a SUCCESSFUL no-op detach, not a "retry once
+            // Redis is healthy" refusal about a healthy Redis.
+            outcome = { detached: true, deprovisioned: false, manifestConflict: await getManifestConflict() };
+          } else if (!result.removed) {
+            // A failed FLUSHDB is still a successful detach, not a refusal —
+            // see `RedisProvisioner.deprovisionAppRedis`'s own doc for why
+            // (the allocation is freed and the number tombstoned either
+            // way). `flushed: false` is the honest signal the result
+            // already carries; the tenant's keys sit in the tombstoned DB
+            // until it is next flushed (provisionAppRedis's fail-hard
+            // reflush).
+            this.logger.warn(`detach: redis flush failed for '${appName}' — number tombstoned pending flush, allocation freed (detach succeeded)`, 'SERVICES');
+            outcome = {
+              detached: true,
+              deprovisioned: true,
+              flushed: false,
+              manifestConflict: await getManifestConflict(),
+            };
+          } else {
+            outcome = {
+              detached: true,
+              deprovisioned: true,
+              flushed: result.flushed,
+              manifestConflict: await getManifestConflict(),
+            };
+          }
+        }
+      } catch (err) {
+        if (!deprovisionStarted) {
+          this.logger.error(`detach: failed to stop '${appName}' before deprovisioning could run (${serviceId})`, 'SERVICES', err);
+          outcome = {
+            detached: false,
+            reason: 'deprovision-failed',
+            detail: `'${appName}' could not be safely stopped, so its ${serviceId === 'postgres' ? 'database' : 'Redis data'} was left untouched. The detach intent has been recorded — retry once the app can be stopped.`,
+          };
+        } else {
+          this.logger.error(`detach: deprovision threw for '${appName}' (${serviceId})`, 'SERVICES', err);
+          outcome = {
+            detached: false,
+            reason: serviceId === 'postgres' ? 'backup-failed' : 'deprovision-failed',
+            detail:
+              serviceId === 'postgres'
+                ? 'The database backup could not be completed, so nothing was dropped. The detach intent has been recorded — retry once the underlying issue is resolved.'
+                : 'The Redis data could not be flushed. The detach intent has been recorded — retry once Redis is healthy.',
+          };
+        }
+      }
+      const shouldRestart = wasLive || wasRunning;
+
+      // 11. Restart iff `shouldRestart` — the one call site every branch
+      // above (a stop failure, a deprovision failure/throw, or success)
+      // funnels through.
+      const restartOutcome = await this.restartAfterDetach(appName, shouldRestart);
+      return { ...outcome, ...restartOutcome };
+    } finally {
+      this.appsInProgress.delete(appName);
+    }
+  }
+
+  /**
+   * True when drop.yaml still declares this service (`database:` for
+   * postgres, `redis:` for redis) — informational only (guard 7): owner
+   * intent always wins, this just lets the UI say so without a second round
+   * trip. Fails soft to false on any parse error, matching
+   * appDatabaseUrlSource/appRedisUrlSource's own posture.
+   */
+  private async detachManifestConflict(
+    appPath: string,
+    serviceId: AttachableServiceId
+  ): Promise<boolean> {
+    try {
+      const dropYaml = await parseDropYaml(appPath);
+      if (!dropYaml.success) return false;
+      return serviceId === 'postgres' ? Boolean(dropYaml.config?.database) : Boolean(dropYaml.config?.redis);
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Step 11 of detachService: restart iff `shouldRestart` (`wasLive ||
+   * wasRunning` at the call site — see step 9's doc comment), always via
+   * `doRestart` — never a hand-rolled `runtime.start(spec)` (PM2 merges env
+   * on a bare start over an existing process entry, so a removed
+   * DATABASE_URL/REDIS_URL would keep being injected under isolation:none).
+   * `doRestart` itself already parks the app in 'needs-config' or 'errored'
+   * on failure — this only translates that outcome into the detach result
+   * shape, it does not duplicate the state write.
+   */
+  private async restartAfterDetach(
+    appName: string,
+    shouldRestart: boolean
+  ): Promise<DetachServiceRestartOutcome> {
+    if (!shouldRestart) {
+      return { restart: 'not-restarted' };
+    }
+    try {
+      await this.doRestart(appName);
+      return { restart: 'restarted' };
+    } catch (error) {
+      if (error instanceof AppNeedsConfigError) {
+        return { restart: 'needs-config', missingSecrets: error.missingSecrets };
+      }
+      this.logger.error(`detach: restart failed for '${appName}' after a successful detach`, 'SERVICES', error);
+      return { restart: 'failed' };
+    }
+  }
+
   /**
    * Full app teardown — mirrors the steps DELETE /apps/:name performs
    * (stop+delete the runtime process, remove Caddy routes, dump-then-drop
@@ -5638,6 +6162,11 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       this.appConfigService?.getConfig(name)?.path ??
       this.stateManager?.getApp(name)?.path ??
       path.join(this.config.appsDirectory, name);
+    // Same source detachService's byte-budget gate and dump call both key
+    // on: omitting it here attributed every group-child dump to the shared
+    // `_ownerless` bucket regardless of the app's real owner — matches the
+    // delete route's own `ownerUserId: app.userId` (apps.ts).
+    const ownerUserId = this.stateManager?.getApp(name)?.userId;
 
     try {
       await this.runtime?.stop(name);
@@ -5663,6 +6192,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       try {
         await this.dbProvisioner?.backupAndDeleteAppDatabase(name, {
           skipBackup: opts.skipDatabaseBackup === true,
+          ownerUserId: ownerUserId ?? null,
         });
       } catch (err) {
         this.logger.warn(`Database teardown failed for ${name}`, 'DATABASE', err);

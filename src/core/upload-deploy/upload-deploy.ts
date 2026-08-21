@@ -163,24 +163,26 @@ export class UploadDeployService {
         // one agent-assisted redeploy of a long-lived human-owned app would
         // otherwise flag it permanently.
         //
-        // upsertConfig, NOT updateConfig. This runs BEFORE the app:detected
-        // handler creates the config (platform.ts), and updateConfig writes
-        // nothing when none exists — it returns null, which all four call sites
-        // here and in git-deploy ignored. So these flags were dropped on
-        // precisely the path that sets them (new apps only), leaving the
-        // ephemeral quota, the ephemeral reap and the idle reaper's
-        // agentCreated filter inert in production. `path` rides along so a
-        // config created here is never pathless if the deploy dies before
-        // detection; app:detected upserts the same value.
+        // upsertSystemConfig, NOT updateConfig. This runs BEFORE the
+        // app:detected handler creates the config (platform.ts), and
+        // updateConfig writes nothing when none exists — it returns null,
+        // which all four call sites here and in git-deploy ignored. So these
+        // flags were dropped on precisely the path that sets them (new apps
+        // only), leaving the ephemeral quota, the ephemeral reap and the idle
+        // reaper's agentCreated filter inert in production. `path` rides
+        // along so a config created here is never pathless if the deploy
+        // dies before detection; app:detected upserts the same value.
+        // upsertSystemConfig (not upsertConfig) because agentCreated/
+        // ephemeral/expiresAt/ephemeralPrincipalId are SYSTEM_CONFIG_FIELDS.
         if (agentCaller) {
-          await getAppConfigService().upsertConfig(appName, {
+          await getAppConfigService().upsertSystemConfig(appName, {
             agentCreated: true,
             path: destPath,
           });
         }
         if (ephemeral) {
           const ttl = resolveTtlMinutes(ttlMinutes);
-          await getAppConfigService().upsertConfig(appName, {
+          await getAppConfigService().upsertSystemConfig(appName, {
             ephemeral: true,
             expiresAt: new Date(Date.now() + ttl * 60_000).toISOString(),
             ephemeralPrincipalId: principalId,

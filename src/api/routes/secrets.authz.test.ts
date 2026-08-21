@@ -14,6 +14,8 @@ import { getTestToken } from '../__testutils__/auth';
 import { getStateManager, resetStateManager } from '../../managers/app/state-manager';
 import { getSecretManager, resetSecretManager } from '../../managers/secret';
 import * as databaseModule from '../../managers/database';
+import { setPlatformOps, resetPlatformOps, PlatformOps } from '../platform-ops';
+import { makePlatformOpsStub } from '../__testutils__/platform-ops';
 
 describe('secrets route authorization', () => {
   let tempDir: string;
@@ -34,6 +36,7 @@ describe('secrets route authorization', () => {
     resetStateManager();
     resetSecretManager();
     resetAuth();
+    resetPlatformOps();
 
     getStateManager({ stateFilePath: path.join(tempDir, 'apps.json') });
     const sm = getSecretManager({ storePath: path.join(tempDir, 'secrets.json'), masterKey: 'test-key' });
@@ -69,6 +72,7 @@ describe('secrets route authorization', () => {
     resetStateManager();
     resetSecretManager();
     resetAuth();
+    resetPlatformOps();
     jest.restoreAllMocks();
     await fs.rm(tempDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   });
@@ -193,6 +197,44 @@ describe('secrets route authorization', () => {
     // Must not claim a deprovision action that doesn't exist.
     expect(json.error.message).not.toMatch(/delete/i);
     expect(json.error.message).toMatch(/DROP-managed database/i);
+  });
+
+  // --- DROP-151 Phase 3: the gate is INTENT-aware, not just
+  // provisioned-aware — a 'detached' intent with a still-live registry entry
+  // is the partial-detach repair state, and the owner must be able to set
+  // their own DATABASE_URL in it. ---
+
+  function makeOps(overrides?: Partial<PlatformOps>): PlatformOps {
+    return makePlatformOpsStub(overrides);
+  }
+
+  it('still refuses when provisioned and PlatformOps reports no intent (or is unwired)', async () => {
+    jest.spyOn(databaseModule, 'getDatabaseProvisioner').mockReturnValue({
+      isProvisioned: jest.fn().mockReturnValue(true),
+    } as unknown as databaseModule.DatabaseProvisioner);
+    // Deliberately not calling setPlatformOps — mirrors a standalone
+    // ApiServer / a boot before the platform wires ops.
+
+    const res = await app.request('/api/v1/secrets/alice-app', {
+      method: 'PUT',
+      headers: { ...bearer(aliceToken), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ key: 'DATABASE_URL', value: 'postgres://evil/db' }),
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it("allows setting DATABASE_URL when provisioned but the owner's intent is 'detached' (partial-detach repair state)", async () => {
+    jest.spyOn(databaseModule, 'getDatabaseProvisioner').mockReturnValue({
+      isProvisioned: jest.fn().mockReturnValue(true),
+    } as unknown as databaseModule.DatabaseProvisioner);
+    setPlatformOps(makeOps({ getServiceIntent: jest.fn().mockReturnValue('detached') }));
+
+    const res = await app.request('/api/v1/secrets/alice-app', {
+      method: 'PUT',
+      headers: { ...bearer(aliceToken), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ key: 'DATABASE_URL', value: 'postgres://external-host/db' }),
+    });
+    expect(res.status).toBe(200);
   });
 
   it('returns 400 when setting a reserved platform key (PORT)', async () => {

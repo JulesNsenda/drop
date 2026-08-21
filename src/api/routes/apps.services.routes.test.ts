@@ -33,21 +33,20 @@ import {
   PlatformOps,
   AttachServiceResult,
 } from '../platform-ops';
+import { makePlatformOpsStub } from '../__testutils__/platform-ops';
 import { ErrorCodes } from '../types';
 
+// This suite's own attach default carries a realistic envVarNames value;
+// everything else (including the working detach default) comes from the
+// shared stub.
 function makeOps(overrides?: Partial<PlatformOps>): PlatformOps {
-  return {
-    restartApp: jest.fn(),
-    isAppInProgress: jest.fn().mockReturnValue(false),
-    promoteApp: jest.fn(),
-    removeGroup: jest.fn().mockResolvedValue({ removed: [] }),
-    purgeAppArtifacts: jest.fn().mockResolvedValue(undefined),
+  return makePlatformOpsStub({
     attachService: jest.fn().mockResolvedValue({
       attached: true,
       envVarNames: ['DATABASE_URL'],
     } satisfies AttachServiceResult),
     ...overrides,
-  };
+  });
 }
 
 describe('POST /apps/:name/services/:id (DROP-151 Phase 2 attach)', () => {
@@ -319,6 +318,47 @@ describe('POST /apps/:name/services/:id (DROP-151 Phase 2 attach)', () => {
       expect(res.status).toBe(409);
       const body = (await res.json()) as { error: { code: string } };
       expect(body.error.code).toBe(ErrorCodes.CONFLICT);
+    });
+  });
+
+  // --- 5b. Unexpected throw never leaks raw error text ----------------------
+  describe('unexpected throw', () => {
+    // Mirrors apps.services.detach.authz.test.ts's identical hardening check
+    // for the DELETE route — this one pins the POST (attach) route, whose
+    // catch was NOT hardened the same way even after the redis tombstone
+    // arm (RedisProvisioner.provisionAppRedis) started throwing with a raw
+    // connection-error message embedded, reachable from here.
+    it('a redis tombstone-flush failure never leaks the raw connection error text', async () => {
+      const sensitive =
+        'Redis logical database 3 still could not be flushed (a previous deprovision also failed ' +
+        'to flush it) — refusing to hand it to "test-app" while it may still hold a deleted ' +
+        'tenant\'s keys. Retry once Redis is healthy: connect ECONNREFUSED 127.0.0.1:9999';
+      const ops = makeOps({
+        attachService: jest.fn().mockRejectedValue(new Error(sensitive)),
+      });
+      setPlatformOps(ops);
+
+      const res = await attach('test-app', 'redis', ownerToken);
+      expect(res.status).toBe(500);
+      const body = (await res.json()) as { error: { message: string } };
+      expect(body.error.message).toBe('Failed to attach service');
+      expect(body.error.message).not.toContain('ECONNREFUSED');
+      expect(JSON.stringify(body)).not.toContain('9999');
+    });
+
+    it('an unexpected pg-shaped throw never leaks the socket path either', async () => {
+      const sensitive = `pg_dump: error: connection failed: No such file or directory\n\tsocket "${tempDir}\\data\\db\\.s.PGSQL.5433"?`;
+      const ops = makeOps({
+        attachService: jest.fn().mockRejectedValue(new Error(sensitive)),
+      });
+      setPlatformOps(ops);
+
+      const res = await attach('test-app', 'postgres', ownerToken);
+      expect(res.status).toBe(500);
+      const body = (await res.json()) as { error: { message: string } };
+      expect(body.error.message).toBe('Failed to attach service');
+      expect(body.error.message).not.toContain(tempDir);
+      expect(JSON.stringify(body)).not.toContain('PGSQL');
     });
   });
 
