@@ -27,6 +27,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-08-14
+
+A security fix in how `depends_on` reaches an app's environment, and support
+for external databases through the encrypted secret store.
+
+**Prioritise this upgrade if you deploy a `drop.yaml` you did not write** — a
+third-party repository via `deploy_from_git`, or an agent-authored manifest. On
+those paths the manifest author and the app owner are different people, and a
+`depends_on` entry could overwrite any variable in the app's start environment,
+the owner's own secrets included. A box that only ever deploys its operator's
+own code was never exposed to the sharp half of this.
+
 ### Security
 
 - **`depends_on` in `drop.yaml` could overwrite anything in an app's start
