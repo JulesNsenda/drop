@@ -14,12 +14,16 @@ import { ApiServer } from '../server';
 import { createUser, resetAuth } from '../middleware/auth';
 import { getTestToken } from '../__testutils__/auth';
 import { getStateManager, resetStateManager } from '../../managers/app/state-manager';
+import { getAppConfigService, resetAppConfigService } from '../../managers/app/app-config';
 import * as runtimeModule from '../../managers/runtime';
 import type { AppRuntime } from '../../managers/runtime';
 import * as databaseModule from '../../managers/database';
 import type { DatabaseProvisioner } from '../../managers/database';
+import { ownerDumpDirName } from '../../managers/database/database-provisioner';
+import * as detachLimitsModule from '../../managers/guardrail/detach-limits';
 import * as routerModule from '../../core/router';
 import { setPlatformOps, resetPlatformOps, PlatformOps } from '../platform-ops';
+import { makePlatformOpsStub } from '../__testutils__/platform-ops';
 import { ErrorCodes } from '../types';
 
 function makeMockRuntime(): AppRuntime {
@@ -55,19 +59,29 @@ describe('DELETE /api/v1/apps/:name — database teardown', () => {
 
     resetStateManager();
     resetAuth();
+    resetAppConfigService();
     getStateManager({ stateFilePath: path.join(tempDir, 'apps.json') });
 
     jest.spyOn(runtimeModule, 'getAppRuntime').mockReturnValue(makeMockRuntime());
 
-    backupAndDeleteAppDatabase = jest.fn().mockResolvedValue({ dropped: true });
+    backupAndDeleteAppDatabase = jest.fn().mockResolvedValue({
+      dropped: true,
+      databaseDropped: true,
+      roleDropped: true,
+    });
     jest.spyOn(databaseModule, 'getDatabaseProvisioner').mockReturnValue({
       backupAndDeleteAppDatabase,
+      dbNameForApp: jest.fn((n: string) => `drop_${n}`),
+      ownerDumpDir: jest.fn((userId?: string | null) =>
+        path.join(tempDir, 'backup', 'pre-delete', ownerDumpDirName(userId))
+      ),
     } as unknown as DatabaseProvisioner);
 
     server = new ApiServer({
       port: 3098,
       enableAuth: true,
       credentialsPath: path.join(tempDir, 'credentials.json'),
+      tempDirectory: path.join(tempDir, 'temp'),
     });
     await server.initialize();
     hono = server.getApp();
@@ -85,6 +99,7 @@ describe('DELETE /api/v1/apps/:name — database teardown', () => {
     if (server) await server.stop();
     await getStateManager().close();
     resetStateManager();
+    resetAppConfigService();
     jest.restoreAllMocks();
     await fs.rm(tempDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   });
@@ -96,7 +111,10 @@ describe('DELETE /api/v1/apps/:name — database teardown', () => {
     });
 
     expect(res.status).toBe(200);
-    expect(backupAndDeleteAppDatabase).toHaveBeenCalledWith('db-app');
+    expect(backupAndDeleteAppDatabase).toHaveBeenCalledWith('db-app', {
+      skipBackup: false,
+      ownerUserId: ownerId,
+    });
     const body = (await res.json()) as { data: { database: string } };
     expect(body.data.database).toBe('dropped');
     expect(getStateManager().getApp('db-app')).toBeUndefined();
@@ -124,10 +142,104 @@ describe('DELETE /api/v1/apps/:name — database teardown', () => {
     });
 
     expect(res.status).toBe(200);
-    expect(backupAndDeleteAppDatabase).toHaveBeenCalledWith('db-app');
+    expect(backupAndDeleteAppDatabase).toHaveBeenCalledWith('db-app', {
+      skipBackup: false,
+      ownerUserId: ownerId,
+    });
     const body = (await res.json()) as { data: { database: string } };
     expect(body.data.database).toBe('retained');
     expect(getStateManager().getApp('db-app')).toBeUndefined();
+  });
+
+  // DROP-151: dbStatus is now keyed on databaseDropped, not the combined
+  // `dropped` (= both database AND role dropped) — a database-dropped-but-
+  // role-drop-failed outcome must report 'dropped' (the database really is
+  // gone and untracked), not 'retained'.
+  it("reports 'dropped' (not 'retained') when the database drop succeeded but the role drop failed", async () => {
+    backupAndDeleteAppDatabase.mockResolvedValueOnce({
+      dropped: false,
+      databaseDropped: true,
+      roleDropped: false,
+      reason: 'database drop FAILED, role drop FAILED',
+    });
+
+    const res = await hono.request('/api/v1/apps/db-app', {
+      method: 'DELETE',
+      headers: authHeader(ownerToken),
+    });
+
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { data: { database: string } };
+    expect(body.data.database).toBe('dropped');
+    expect(console.warn).toHaveBeenCalledWith(expect.stringContaining('role survived (orphaned)'));
+  });
+
+  // DROP-151 Phase 3 / debt S2c+C7: pruning must run (and never block the
+  // delete) before the dump, scoped to THIS APP's own dumps within the
+  // owner's directory — see detach-limits.test.ts for eviction behaviour
+  // itself; this only pins that the route actually invokes it, scoped
+  // correctly, before the drop.
+  it("prunes this app's own oldest pre-delete dumps (never a sibling's) before the drop, and never blocks the delete", async () => {
+    const pruneSpy = jest
+      .spyOn(detachLimitsModule, 'pruneOwnerDumpsToFit')
+      .mockResolvedValue({ prunedFiles: [], prunedBytes: 0 });
+
+    const res = await hono.request('/api/v1/apps/db-app', {
+      method: 'DELETE',
+      headers: authHeader(ownerToken),
+    });
+
+    expect(res.status).toBe(200);
+    expect(pruneSpy).toHaveBeenCalledTimes(1);
+    const [ownerDir, , , dbNamePrefix] = pruneSpy.mock.calls[0];
+    expect(ownerDir).toBe(path.join(tempDir, 'backup', 'pre-delete', ownerDumpDirName(ownerId)));
+    expect(dbNamePrefix).toBe('drop_db-app');
+    // The prune call must complete (and the drop proceed) before removeApp —
+    // already covered by the 200 + database:'dropped' assertions above.
+  });
+
+  it('still fully removes the app when the dump-budget prune throws (non-fatal, never blocks the delete)', async () => {
+    jest.spyOn(detachLimitsModule, 'pruneOwnerDumpsToFit').mockRejectedValueOnce(new Error('disk gone'));
+
+    const res = await hono.request('/api/v1/apps/db-app', {
+      method: 'DELETE',
+      headers: authHeader(ownerToken),
+    });
+
+    expect(res.status).toBe(200);
+    expect(backupAndDeleteAppDatabase).toHaveBeenCalledWith('db-app', {
+      skipBackup: false,
+      ownerUserId: ownerId,
+    });
+    expect(getStateManager().getApp('db-app')).toBeUndefined();
+  });
+
+  it('skips the dump-budget prune entirely for an ephemeral app, and skips the dump itself too', async () => {
+    getAppConfigService({
+      configDir: path.join(tempDir, 'appconf', 'webapps'),
+      webappsDir: path.join(tempDir, 'webapps'),
+    });
+    await getAppConfigService().initialize();
+    await getAppConfigService().upsertSystemConfig('db-app', { ephemeral: true });
+    const pruneSpy = jest
+      .spyOn(detachLimitsModule, 'pruneOwnerDumpsToFit')
+      .mockResolvedValue({ prunedFiles: [], prunedBytes: 0 });
+
+    const res = await hono.request('/api/v1/apps/db-app', {
+      method: 'DELETE',
+      headers: authHeader(ownerToken),
+    });
+
+    expect(res.status).toBe(200);
+    expect(pruneSpy).not.toHaveBeenCalled();
+    // The comment above the prune-skip explicitly says the dump is "about to
+    // be skipped below too" — this pins that skipBackup actually reaches
+    // backupAndDeleteAppDatabase for an ephemeral app, so metering isn't
+    // disabled (prune skipped) while a full dump is still written.
+    expect(backupAndDeleteAppDatabase).toHaveBeenCalledWith('db-app', {
+      skipBackup: true,
+      ownerUserId: ownerId,
+    });
   });
 });
 
@@ -142,14 +254,7 @@ describe('DELETE /api/v1/apps/:name — group-aware (M4)', () => {
   const authHeader = (token: string) => ({ Authorization: `Bearer ${token}` });
 
   function makeOps(overrides?: Partial<PlatformOps>): PlatformOps {
-    return {
-      restartApp: jest.fn(),
-      attachService: jest.fn(),
-      isAppInProgress: jest.fn().mockReturnValue(false), promoteApp: jest.fn(),
-      removeGroup: jest.fn().mockResolvedValue({ removed: [] }),
-      purgeAppArtifacts: jest.fn().mockResolvedValue(undefined),
-      ...overrides,
-    };
+    return makePlatformOpsStub(overrides);
   }
 
   beforeEach(async () => {
@@ -467,14 +572,7 @@ describe('DELETE /api/v1/apps/:name — in-progress guard (M4)', () => {
   const authHeader = (token: string) => ({ Authorization: `Bearer ${token}` });
 
   function makeOps(overrides?: Partial<PlatformOps>): PlatformOps {
-    return {
-      restartApp: jest.fn(),
-      attachService: jest.fn(),
-      isAppInProgress: jest.fn().mockReturnValue(false), promoteApp: jest.fn(),
-      removeGroup: jest.fn().mockResolvedValue({ removed: [] }),
-      purgeAppArtifacts: jest.fn().mockResolvedValue(undefined),
-      ...overrides,
-    };
+    return makePlatformOpsStub(overrides);
   }
 
   beforeEach(async () => {

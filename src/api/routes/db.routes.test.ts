@@ -274,16 +274,14 @@ describe('database panel routes (DROP-120)', () => {
   });
 
   describe('DbUnavailableError -> 503 (survives the onError 500-collapse)', () => {
-    const cases: Array<[Exclude<DbUnavailableError['reason'], 'not-provisioned'>, string]> = [
+    // 'database-missing' is deliberately EXCLUDED here — it now maps to a
+    // renderable 200, not a 503; see its own describe block below.
+    const cases: Array<[Exclude<DbUnavailableError['reason'], 'not-provisioned' | 'database-missing'>, string]> = [
       ['no-service', 'Database service is not available on this instance'],
       ['busy', 'Database panel is busy, retry shortly'],
       ['unreachable', 'PostgreSQL is not reachable'],
       ['conn-limit', 'Database connection limit reached'],
       ['auth-failed', 'Stored database credentials were rejected'],
-      [
-        'database-missing',
-        "The database named in this app's stored credentials no longer exists — it may need reprovisioning",
-      ],
       [
         'credentials-missing',
         'No database credentials are stored for this app; if a database exists for it anyway, ' +
@@ -337,6 +335,59 @@ describe('database panel routes (DROP-120)', () => {
         'No database credentials are stored for this app; if a database exists for it anyway, ' +
           'its credentials file may have been quarantined after failing to parse'
       );
+    });
+  });
+
+  // A dropped-out-from-under-its-credentials database (SQLSTATE 3D000 ->
+  // 'database-missing') is exactly the state a partial Postgres detach
+  // leaves behind before its retry converges — the dashboard needs a
+  // renderable 200 with a repair marker, not a dead 503 error card that
+  // hides redis/services/quota (and with them, the Detach/retry button).
+  describe("DbUnavailableError('database-missing') -> renderable 200, not 503", () => {
+    it('returns 200 with provisioned:false and a broken:"database-missing" marker', async () => {
+      mockGetOverview.mockRejectedValue(new DbUnavailableError('database-missing', 'raw driver detail'));
+
+      const res = await app.request('/api/v1/db/alice-app', { headers: authHeader(aliceToken) });
+      expect(res.status).toBe(200);
+      const json = (await res.json()) as { data: { provisioned: boolean; broken?: string } };
+      expect(json.data.provisioned).toBe(false);
+      expect(json.data.broken).toBe('database-missing');
+    });
+
+    it('still carries the Phase-2 fields (redis, services, quota) instead of hiding them behind the failed overview', async () => {
+      mockGetOverview.mockRejectedValue(new DbUnavailableError('database-missing', 'raw driver detail'));
+      mockGetRedisProvisioner.mockReturnValue({
+        isProvisioned: jest.fn().mockReturnValue(true),
+      } as unknown as ReturnType<typeof getRedisProvisioner>);
+      await getAppConfigService().upsertSystemConfig('alice-app', {
+        services: { postgres: 'detached' },
+      });
+
+      const res = await app.request('/api/v1/db/alice-app', { headers: authHeader(aliceToken) });
+      expect(res.status).toBe(200);
+      const json = (await res.json()) as {
+        data: {
+          redis: { provisioned: boolean };
+          services: Record<string, string>;
+          quota: { postgres: unknown; redis: unknown };
+        };
+      };
+      expect(json.data.redis).toEqual({ provisioned: true });
+      expect(json.data.services).toEqual({ postgres: 'detached' });
+      expect(json.data.quota.postgres).toBeDefined();
+      expect(json.data.quota.redis).toBeDefined();
+    });
+
+    it('maps database-missing on GET /db/:name/tables unchanged (still 503) — the renderable-200 fix is GET /:name only', async () => {
+      // listTables has no {provisioned:false}-shaped success answer to fall
+      // back to (see DbUnavailableError's own doc), so the 200 remap is
+      // deliberately scoped to the overview route only.
+      mockListTables.mockRejectedValue(new DbUnavailableError('database-missing', 'raw driver detail'));
+
+      const res = await app.request('/api/v1/db/alice-app/tables', {
+        headers: authHeader(aliceToken),
+      });
+      expect(res.status).toBe(503);
     });
   });
 
@@ -399,7 +450,7 @@ describe('database panel routes (DROP-120)', () => {
 
     it('surfaces the persisted services attach/detach intent from AppConfigService', async () => {
       mockGetOverview.mockResolvedValue({ provisioned: false });
-      await getAppConfigService().upsertConfig('alice-app', {
+      await getAppConfigService().upsertSystemConfig('alice-app', {
         services: { postgres: 'attached' },
       });
 
@@ -425,6 +476,45 @@ describe('database panel routes (DROP-120)', () => {
         limit: getMaxDbsPerUser(),
         constrained: true,
       });
+    });
+
+    // The Detach confirm dialog needs to know an app is
+    // ephemeral BEFORE it promises a Postgres backup `detachService` never
+    // actually writes for one (`skipBackup: config?.ephemeral === true` in
+    // platform.ts). GET /db/:name is the only place that can tell it.
+    it('defaults ephemeral=false when the app has no config', async () => {
+      mockGetOverview.mockResolvedValue({ provisioned: false });
+
+      const res = await app.request('/api/v1/db/alice-app', { headers: authHeader(aliceToken) });
+      expect(res.status).toBe(200);
+      const json = (await res.json()) as { data: { ephemeral: boolean } };
+      expect(json.data.ephemeral).toBe(false);
+    });
+
+    it('reports ephemeral=true for an app whose AppConfig says so', async () => {
+      mockGetOverview.mockResolvedValue({ provisioned: false });
+      await getAppConfigService().upsertSystemConfig('alice-app', { ephemeral: true });
+
+      const res = await app.request('/api/v1/db/alice-app', { headers: authHeader(aliceToken) });
+      expect(res.status).toBe(200);
+      const json = (await res.json()) as { data: { ephemeral: boolean } };
+      expect(json.data.ephemeral).toBe(true);
+    });
+
+    // An uninitialised AppConfigService must degrade to
+    // the safe defaults (services: {}, ephemeral: false), not a 500 — the
+    // same defensive posture apps.ts's own ephemeral read already takes.
+    it('degrades to services={} and ephemeral=false instead of 500ing when AppConfigService is not initialised', async () => {
+      mockGetOverview.mockResolvedValue({ provisioned: false });
+      resetAppConfigService();
+
+      const res = await app.request('/api/v1/db/alice-app', { headers: authHeader(aliceToken) });
+      expect(res.status).toBe(200);
+      const json = (await res.json()) as {
+        data: { services: Record<string, string>; ephemeral: boolean };
+      };
+      expect(json.data.services).toEqual({});
+      expect(json.data.ephemeral).toBe(false);
     });
   });
 

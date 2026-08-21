@@ -19,6 +19,7 @@ import { getTestToken } from '../__testutils__/auth';
 import { getStateManager, resetStateManager } from '../../managers/app/state-manager';
 import { getAppConfigService, resetAppConfigService } from '../../managers/app/app-config';
 import { setPlatformOps, resetPlatformOps, AppInProgressError, PlatformOps } from '../platform-ops';
+import { makePlatformOpsStub } from '../__testutils__/platform-ops';
 import * as activity from '../../managers/activity';
 import type { AppProcessInfo } from '../../managers/runtime';
 import { ErrorCodes } from '../types';
@@ -37,15 +38,10 @@ const RUNNING_PROCESS: AppProcessInfo = {
   restartedAt: new Date('2026-01-01T00:00:05Z'),
 };
 
+// `restartApp` resolves to this suite's own RUNNING_PROCESS by default —
+// several tests below assert on its pid/port without overriding it.
 function makeOps(overrides?: Partial<PlatformOps>): PlatformOps {
-  return {
-    restartApp: jest.fn().mockResolvedValue(RUNNING_PROCESS),
-    attachService: jest.fn(),
-    isAppInProgress: jest.fn().mockReturnValue(false), promoteApp: jest.fn(),
-    removeGroup: jest.fn().mockResolvedValue({ removed: [] }),
-    purgeAppArtifacts: jest.fn().mockResolvedValue(undefined),
-    ...overrides,
-  };
+  return makePlatformOpsStub({ restartApp: jest.fn().mockResolvedValue(RUNNING_PROCESS), ...overrides });
 }
 
 describe('PUT /apps/:name/capabilities', () => {
@@ -87,8 +83,9 @@ describe('PUT /apps/:name/capabilities', () => {
 
     const sm = getStateManager();
     await sm.registerApp('test-app', path.join(tempDir, 'test-app'));
-    // Seed a persisted config so updateConfig() has an existing record to
-    // update (an app with state but no config is the "no config yet" 404 case).
+    // Seed a persisted config so updateSystemConfig() has an existing record
+    // to update (an app with state but no config is the "no config yet" 404
+    // case).
     await getAppConfigService().upsertConfig('test-app', { type: 'nodejs' });
   });
 
@@ -163,6 +160,26 @@ describe('PUT /apps/:name/capabilities', () => {
       body: JSON.stringify({ scopes: ['users:create'] }),
     });
     expect(res.status).toBe(404);
+  });
+
+  it('404s for an app with runtime state but no persisted config yet', async () => {
+    // updateSystemConfig's null-on-missing check runs INSIDE the write
+    // chain, not via a hasConfig() pre-check — this is the case that
+    // distinction protects: nothing to grant against, and no skeleton
+    // config gets minted in the process.
+    const ops = makeOps();
+    setPlatformOps(ops);
+    await getStateManager().registerApp('configless-app', path.join(tempDir, 'configless-app'));
+
+    const res = await hono.request('/api/v1/apps/configless-app/capabilities', {
+      method: 'PUT',
+      headers: authHeader(adminToken),
+      body: JSON.stringify({ scopes: ['users:create'] }),
+    });
+
+    expect(res.status).toBe(404);
+    expect(getAppConfigService().hasConfig('configless-app')).toBe(false);
+    expect(ops.restartApp).not.toHaveBeenCalled();
   });
 
   it('409s when the app has a restart in flight (AppInProgressError)', async () => {
