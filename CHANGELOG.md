@@ -27,7 +27,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [1.4.0] - PENDING
+## [1.4.0] - 2026-08-22
 
 Backing services can now be attached to and detached from a running app, from
 the dashboard or the API, and everything the platform can attach is listed in a
