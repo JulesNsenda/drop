@@ -27,6 +27,82 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-08-22
+
+Backing services can now be attached to and detached from a running app, from
+the dashboard or the API, and everything the platform can attach is listed in a
+searchable catalog.
+
+**Detach destroys data, and the two services differ.** Postgres is dumped on the
+platform host before the database and its role are dropped; that dump is an
+operator-side artifact with its own retention window, not a restore button in
+the dashboard. Redis is flushed immediately with no backup at all. The
+confirmation dialog states which of the two you are about to do.
+
+### Added
+
+- **Extension catalog.** `GET /api/v1/extensions` lists every backing service
+  and app type this build ships, with its availability on this instance
+  (installed, disabled by configuration, or unsupported under the current
+  isolation mode). A Catalog page in the dashboard makes the same list
+  searchable and filterable. Availability is platform-scoped: per-app facts,
+  such as whether a service is already attached or the owner's quota is full,
+  come from `GET /api/v1/db/<app>`.
+- **Attach a backing service.** `POST /api/v1/apps/<app>/services/<id>` (`<id>`
+  is `postgres` or `redis`) provisions the service, records the choice, and
+  restarts the app with its URL injected. The response names the injected
+  variables but never their values. Available from an app's Database tab.
+- **Detach a backing service.** `DELETE /api/v1/apps/<app>/services/<id>`
+  deprovisions it and restarts the app without the variable, so it is genuinely
+  gone rather than merely unused.
+- **Attach and detach outrank `drop.yaml`.** The choice is recorded durably, so
+  a redeploy cannot quietly undo it: without that, the next deploy would re-read
+  `database: postgres`, or re-detect a Postgres client in `package.json`, and
+  provision a fresh database straight back. Resolution order is
+  `attach/detach > drop.yaml > auto-detection`. Once a service has been attached
+  or detached for an app, that manifest key stops deciding the question for it,
+  and re-attaching hands authority back. On an app deployed from a repository
+  you do not own, this is what stops a stale upstream manifest re-provisioning
+  against your quota.
+- `GET /api/v1/db/<app>` also reports whether Redis is provisioned, the recorded
+  intent per service, per-service quota state, and whether the app is ephemeral.
+  A database recorded but missing on the server is now reported as a renderable
+  state rather than an error, so the tab still offers its repair controls.
+
+### Fixed
+
+- **An app with a DROP-managed database can now be repointed at an external
+  one.** Setting a `DATABASE_URL` secret was refused whenever a database was
+  provisioned, on the grounds that the injected URL would override the secret
+  anyway. With detach available that refusal became a lock-out: the data could
+  be gone and the owner still could not supply their own URL. The gate now
+  consults the recorded intent, so once a database is detached the secret is
+  accepted. The published documentation claimed a provisioned database "cannot
+  be handed back short of deleting the app", which detach makes untrue; it has
+  been corrected.
+- `pg_dump` is now bounded by a timeout and killed on expiry. A tenant holding
+  an `ACCESS EXCLUSIVE` lock on its own database could otherwise make a dump
+  wait forever, holding the platform's per-app lock until a restart.
+- `DROP_PREDELETE_RETENTION_DAYS` no longer fails open. Any unparseable value
+  disabled pruning entirely and kept full database dumps, plus their plaintext
+  role-recreation files, forever.
+- A failed Redis `FLUSHDB` no longer releases the logical database number. Two
+  tolerated Redis blips could previously hand one app's keys to the next
+  allocation.
+- Pre-delete database dumps are attributed to their owner by location rather
+  than by matching app names, so attribution survives the app's deletion and one
+  owner's cleanup can no longer evict another's only surviving dump.
+
+### Changed
+
+- Platform-owned fields on an app's config (its recorded service intent, granted
+  API scopes, ephemeral flags) are now written through a separate path from
+  caller-supplied fields, and stripped from the general one.
+- CI actions are pinned to commit SHAs with Dependabot configured to propose
+  updates, build and test are defined once and shared by the CI and Deploy
+  workflows, and the deploy artifact's digest is verified before it is shipped.
+
+
 ## [1.3.0] - 2026-08-14
 
 A security fix in how `depends_on` reaches an app's environment, and support
