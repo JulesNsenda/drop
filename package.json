@@ -53,7 +53,7 @@
     "node": ">=20.0.0"
   },
   "dependencies": {
-    "@hono/node-server": "^1.19.9",
+    "@hono/node-server": "^2.1.1",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "chokidar": "^3.6.0",
     "commander": "^12.1.0",
