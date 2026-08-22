@@ -173,6 +173,25 @@ describe('Drop YAML Parser', () => {
       expect(warnSpy).toHaveBeenCalledTimes(2);
     });
 
+    it('rejects a tenant-authored `access:` key (DROP-152)', async () => {
+      // The access gate is an AUTHORIZATION field, set only by the admin route.
+      // `mcp` is the cautionary precedent: there, `source: 'declared'` means the
+      // TENANT wrote it here, and the whole field is recomputed from tenant
+      // source on every build. A tenant able to author `access:` would author
+      // their own allow-list; one able to author it and have it overwritten on
+      // every build would silently reset a governance decision on redeploy.
+      // Neither happens, and the parser's strict schema is what makes it so.
+      await fs.writeFile(
+        path.join(tmpDir, 'drop.yaml'),
+        ['access:', '  mode: drop-users', '  allow: [attacker]', ''].join('\n')
+      );
+
+      const result = await parseDropYaml(tmpDir);
+
+      expect(result.success).toBe(false);
+      expect(result.error).toContain('access');
+    });
+
     it('flattens a newline-bearing, oversized error to a single bounded log line', async () => {
       // A quoted YAML key can carry an embedded newline; validateDropYamlConfig
       // echoes it verbatim in "Unknown field '<key>'" since it isn't in

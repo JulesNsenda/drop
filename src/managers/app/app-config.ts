@@ -11,6 +11,30 @@ import * as yaml from 'yaml';
 import { writeFileAtomic } from '../../utils/atomic-write';
 import type { RuntimeType } from '../runtime/app-runtime.types';
 
+/**
+ * Who may OPEN an app in a browser — deliberately a different question from
+ * who may MANAGE it (DROP-152).
+ *
+ * `canAccess` (api/access.ts) answers management: admin-or-owner, over
+ * `AppState.userId`. This answers access, and the two must not be conflated —
+ * an app gated to a review board is not thereby manageable by that board.
+ *
+ * `mode` is a FIELD, not an interface seam. When OIDC federation lands it
+ * becomes `'drop-users' | 'oidc'` and the resolver branches on it; extracting
+ * an `IdentitySource` interface before a second implementation exists buys
+ * documentation and pre-commits a shape whose real constraints are unknown
+ * (this repo has declined that exact seam twice — see
+ * docs/plans/2026-08-13-service-provider-plugins.md).
+ */
+export interface AppAccessPolicy {
+  mode: 'drop-users';
+  /**
+   * User ids (NOT usernames) permitted to open the app, on top of the owner
+   * and any admin. Validated against the credential store at write time.
+   */
+  allow: string[];
+}
+
 export interface AppConfig {
   name: string;
   type: 'nodejs' | 'python' | 'go' | 'static' | 'docker' | 'unknown';
@@ -210,6 +234,27 @@ export interface AppConfig {
    * given service's first detach.
    */
   lastDetachAt?: Record<string, number>;
+  /**
+   * The browser access gate's policy (DROP-152). Absent on every app that has
+   * not been explicitly gated, and absent is NOT "gated to nobody" — it is
+   * "not gated", the behaviour every app has today.
+   *
+   * RESTRICTED, a strictly stronger tier than SYSTEM_CONFIG_FIELDS: only
+   * `setAccessPolicy` may write it, and every other writer — the system ones
+   * included — strips it at runtime. That matters because the deploy paths
+   * (`upload-deploy.ts`, `git-deploy.ts`) already call the UNSTRIPPED system
+   * writers with data derived from a request, so "system-owned" alone would
+   * not keep a tenant-supplied `access` out of an authorization decision.
+   *
+   * Deliberately NOT modelled on `mcp`. For `mcp`, `source: 'declared'` means
+   * the TENANT wrote it in their own drop.yaml, and the whole field is
+   * recomputed and overwritten via `updateConfig` on every build
+   * (platform.ts's handleBuildApp). An authorization field with that lifecycle
+   * would let a tenant author their own allow-list and reset it on every
+   * redeploy. `access` is set only by the admin route, never derived from app
+   * source, and never touched by a build.
+   */
+  access?: AppAccessPolicy;
 }
 
 /**
@@ -229,6 +274,28 @@ const SYSTEM_CONFIG_FIELDS = [
 ] as const satisfies readonly (keyof AppConfig)[];
 
 type SystemConfigField = (typeof SYSTEM_CONFIG_FIELDS)[number];
+
+/**
+ * A strictly stronger tier than SYSTEM_CONFIG_FIELDS: fields that even the
+ * UNSTRIPPED system writers may not touch. Only the dedicated setter for each
+ * one (`setAccessPolicy`) passes `restricted: true`.
+ *
+ * The tier exists because "system-owned" is not containment on this codebase's
+ * actual call graph: `upsertSystemConfig`/`updateSystemConfig` are already
+ * called from `upload-deploy.ts` and `git-deploy.ts` on the agent/upload deploy
+ * path, so a field that only SYSTEM_CONFIG_FIELDS protected would be reachable
+ * from request-derived data. An authorization field cannot rely on every
+ * caller happening to be careful — see the build-secret boundary and
+ * group-name containment incidents, both of which were correct helpers with a
+ * bypassing caller.
+ *
+ * These are NOT also listed in SYSTEM_CONFIG_FIELDS: this tier already strips
+ * them on every writer that one covers, and listing them twice would emit two
+ * warnings for one dropped field.
+ */
+const RESTRICTED_CONFIG_FIELDS = ['access'] as const satisfies readonly (keyof AppConfig)[];
+
+type RestrictedConfigField = (typeof RESTRICTED_CONFIG_FIELDS)[number];
 
 export interface AppConfigServiceOptions {
   configDir: string; // e.g., /var/drop/data/appconf/webapps
@@ -438,6 +505,31 @@ export class AppConfigService {
   }
 
   /**
+   * Strips RESTRICTED_CONFIG_FIELDS from EVERY write that is not the field's
+   * own dedicated setter — the system writers included. The narrowed
+   * `Partial<Omit<AppConfig, RestrictedConfigField>>` parameter types are
+   * documentation only (an excess-property check fires on a fresh object
+   * literal but not on a cast or a spread); this is the actual guarantee.
+   */
+  private stripRestrictedFields(appName: string, updates: Partial<AppConfig>): Partial<AppConfig> {
+    const stripped: Partial<AppConfig> = { ...updates };
+    const dropped: string[] = [];
+    for (const field of RESTRICTED_CONFIG_FIELDS) {
+      if (field in stripped) {
+        delete stripped[field];
+        dropped.push(field);
+      }
+    }
+    if (dropped.length > 0) {
+      console.warn(
+        `[app-config] stripped restricted field(s) [${dropped.join(', ')}] from a config write ` +
+          `for '${appName}' — only the field's own dedicated setter may write it`
+      );
+    }
+    return stripped;
+  }
+
+  /**
    * The one read-merge-save body shared by all four general-purpose/system
    * writers plus setServiceIntent below — previously reimplemented once per
    * writer as four near-identical copies, orthogonal in exactly two axes:
@@ -461,14 +553,20 @@ export class AppConfigService {
   private write(
     appName: string,
     updates: Partial<AppConfig> | ((existing: AppConfig | undefined) => Partial<AppConfig>),
-    opts: { create: boolean; system: boolean }
+    opts: { create: boolean; system: boolean; restricted?: boolean }
   ): Promise<AppConfig | null> {
     return this.enqueueWrite(appName, async () => {
       const existing = this.configs.get(appName);
       if (!existing && !opts.create) return null;
 
       const rawUpdates = typeof updates === 'function' ? updates(existing) : updates;
-      const safeUpdates = opts.system ? rawUpdates : this.stripSystemFields(appName, rawUpdates);
+      const systemSafe = opts.system ? rawUpdates : this.stripSystemFields(appName, rawUpdates);
+      // The restricted tier is applied INDEPENDENTLY of `system`, not nested
+      // inside its else-branch: the whole point is that `system: true` does
+      // not buy access to it.
+      const safeUpdates = opts.restricted
+        ? systemSafe
+        : this.stripRestrictedFields(appName, systemSafe);
       const now = new Date().toISOString();
 
       // Cast, not a type hole: `opts.create` is a runtime boolean, not a
@@ -534,9 +632,15 @@ export class AppConfigService {
    * updateSystemConfig for a caller that must refuse rather than mint a
    * config when none exists.
    */
-  async upsertSystemConfig(appName: string, updates: Partial<AppConfig>): Promise<AppConfig> {
+  async upsertSystemConfig(
+    appName: string,
+    updates: Partial<Omit<AppConfig, RestrictedConfigField>>
+  ): Promise<AppConfig> {
     // `create: true` never resolves null (see `write`'s own doc).
-    return (await this.write(appName, updates, { create: true, system: true })) as AppConfig;
+    return (await this.write(appName, updates as Partial<AppConfig>, {
+      create: true,
+      system: true,
+    })) as AppConfig;
   }
 
   /**
@@ -549,8 +653,35 @@ export class AppConfigService {
    * concurrent deleteConfig can land in between and the upsert would then
    * mint exactly the skeleton config the check exists to refuse).
    */
-  async updateSystemConfig(appName: string, updates: Partial<AppConfig>): Promise<AppConfig | null> {
-    return this.write(appName, updates, { create: false, system: true });
+  async updateSystemConfig(
+    appName: string,
+    updates: Partial<Omit<AppConfig, RestrictedConfigField>>
+  ): Promise<AppConfig | null> {
+    return this.write(appName, updates as Partial<AppConfig>, { create: false, system: true });
+  }
+
+  /**
+   * The ONLY writer for `AppConfig.access` (DROP-152) — every other writer,
+   * `upsertSystemConfig`/`updateSystemConfig` included, strips the field at
+   * runtime (see RESTRICTED_CONFIG_FIELDS).
+   *
+   * `create: false`, for the same reason the capabilities route needs
+   * `updateSystemConfig`: a `PUT /apps/<nonexistent>/access` must REFUSE, not
+   * mint a skeleton `AppConfig`. A minted skeleton would then make the app
+   * "exist" to `syncStateWithConfigs` on the next boot — configs are
+   * authoritative there — so an authorization write against a typo would
+   * fabricate an app.
+   *
+   * `undefined` clears the gate. It is written as an explicit `undefined`
+   * rather than deleted from the merged object: `yaml.stringify` omits
+   * undefined values, so the field leaves the file entirely (the same
+   * clear-by-undefined `publicUrl` already relies on).
+   */
+  async setAccessPolicy(
+    appName: string,
+    access: AppAccessPolicy | undefined
+  ): Promise<AppConfig | null> {
+    return this.write(appName, { access }, { create: false, system: true, restricted: true });
   }
 
   /**
