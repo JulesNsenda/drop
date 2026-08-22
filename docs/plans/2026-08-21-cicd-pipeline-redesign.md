@@ -1,7 +1,8 @@
 # CI/CD pipeline redesign
 
 **Date:** 2026-08-21
-**Status:** APPROVED. Landing A merged + deployed (PR #200). Landing B shipped (PR #202, CI green, awaiting merge). Landing C not started.
+**Status:** APPROVED. Landing A shipped (PR #200, CI green, awaiting merge).
+Landings B and C not started.
 
 ---
 
@@ -244,9 +245,10 @@ one can take production down. That is unbisectable while prod is down.
 
 ## File-level changes
 
-- [ ] `.github/dependabot.yml` — npm (root), npm (`src/dashboard`), github-actions.
-- [ ] All workflows — pin 11 action refs to SHAs; add `permissions:` blocks.
-- [x] `.github/workflows/_verify.yml` — reusable; lint, shellcheck, typecheck,
+- [x] `.github/dependabot.yml` — npm (root), npm (`src/dashboard`), github-actions.
+- [x] All workflows — pin 11 action refs to SHAs; add `permissions:` blocks,
+      plus `persist-credentials: false` on both `npm ci`-bearing checkouts.
+- [ ] `.github/workflows/_verify.yml` — reusable; lint, shellcheck, typecheck,
       test, build; uploads the **tarball**; `contents: read`; no secrets.
 - [x] `.github/workflows/ci.yml` - thin caller, pull_request-only. No notify job: its push trigger was redundant with deploy.yml and the two notify jobs raced for one label.
 - [ ] `.github/workflows/deploy.yml` — caller + deploy job; inline remote script
