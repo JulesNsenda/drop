@@ -7,6 +7,7 @@
 import { AuthContext } from './middleware/auth';
 import { AppState } from '../managers/app/state-manager';
 import { scopesAllow, AgentVerb } from './agent-scopes';
+import type { AppAccessPolicy } from '../managers/app/app-config';
 
 /**
  * Whether the current request may access an app: owns it, is an admin, or
@@ -105,4 +106,45 @@ export function interactiveSessionOnly(
     };
   }
   return { ok: true, requester };
+}
+
+/**
+ * Whether the current request may OPEN an app in a browser — the ACCESS
+ * question, as distinct from the management question `canAccess` answers
+ * (DROP-152).
+ *
+ * A SIBLING of `canAccess`, deliberately not a widening of it, for the same
+ * reason `canAccessScoped` is: `canAccess` has 34 non-test call sites, all of
+ * them management boundaries, and the existing `*.authz.test.ts` files are a
+ * valid regression net only while its behaviour is untouched.
+ *
+ * It does NOT inherit `canAccess`'s `if (!auth) return true`. That posture is
+ * defensible for a single-operator box's management API, where the operator IS
+ * the only principal; it is indefensible for a gate whose entire product claim
+ * is "only these people can open this app". With no auth context there is no
+ * identity to compare, so the answer is no. `interactiveSessionOnly` had to
+ * restate exactly this, having found that copying `canAccess`'s posture was
+ * wrong there too — this is the third boundary where it would have been.
+ *
+ * The route that SETS a policy refuses outright when auth is disabled, so this
+ * fail-closed branch should be unreachable in a correctly configured platform.
+ * It is not the enforcement point of that refusal — it is what makes a
+ * misconfiguration deny rather than admit.
+ *
+ * `policy` undefined means the app is NOT GATED, which is every app today and
+ * is not the same as "gated to nobody". Callers pass `AppConfig.access`
+ * straight through; the ungated answer is the caller's to act on (no gate is
+ * emitted at all), and returning true here keeps this function total rather
+ * than making every call site pre-branch.
+ */
+export function canOpen(
+  auth: AuthContext | undefined,
+  app: Pick<AppState, 'userId'>,
+  policy: AppAccessPolicy | undefined
+): boolean {
+  if (!policy) return true; // Not gated — unchanged behaviour for every app.
+  if (!auth) return false; // Fails CLOSED — see above.
+  if (auth.role === 'admin') return true;
+  if (auth.userId !== undefined && app.userId === auth.userId) return true;
+  return auth.userId !== undefined && policy.allow.includes(auth.userId);
 }
