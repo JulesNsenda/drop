@@ -126,19 +126,30 @@ export function generateRouteBlock(
     });
   }
 
-  // DROP-guarded MCP endpoint (Step 11). MUST precede the catch-all
+  // Every DROP-owned guard for this route. MUST precede the catch-all
   // reverse_proxy below: Caddy evaluates `handle` blocks in order, and a
-  // preceding catch-all would serve the MCP path unguarded.
-  if (route.mcpAuth) {
-    directives.push(generateMcpAuthHandle(route, route.mcpAuth));
-  }
+  // preceding catch-all would serve a guarded path unguarded.
+  const guards = generateGuardHandles(route);
+  directives.push(...guards);
 
   // Reverse proxy
   const reverseProxyDirective = generateReverseProxyDirective(route);
-  // Wrapped in its own `handle` when an MCP guard exists, so the guard's block
-  // is not bypassed by a bare directive matching every path.
+  // Wrapped in its own `handle` whenever ANY guard exists, so no guard's block
+  // is bypassed by a bare directive matching every path.
+  //
+  // The condition is derived from `guards.length`, not from a hand-maintained
+  // `route.mcpAuth || route.somethingElse` disjunction. That is the whole point
+  // of the refactor: adding a guard to generateGuardHandles widens this
+  // automatically. A second guard added without widening a boolean would emit a
+  // block where a PATH-SCOPED guard sits beside a bare catch-all, and every
+  // request outside that guard's matcher reaches the tenant unguarded — while
+  // the dashboard reports the app as protected. (Measured against Caddy 2.11.4:
+  // a MATCH-ALL guard beside a bare `reverse_proxy` does hold, because `handle`
+  // sorts first and is terminal. A dead bare directive inside a
+  // security-relevant block is still a trap, and the path-scoped case is a real
+  // bypass, so the wrapping is unconditional whenever a guard is present.)
   directives.push(
-    route.mcpAuth
+    guards.length > 0
       ? { name: 'handle', block: [reverseProxyDirective] }
       : reverseProxyDirective
   );
@@ -150,6 +161,47 @@ export function generateRouteBlock(
     address,
     directives,
   };
+}
+
+/**
+ * Every DROP-owned guard `handle` this route needs, in emission order.
+ *
+ * The single place that answers "is this route guarded?" — `generateRouteBlock`
+ * derives the catch-all's `handle` wrapping from the length of what this
+ * returns rather than from its own copy of the condition, so the two can never
+ * disagree.
+ *
+ * Ordering note for whoever adds the second guard: guards that must BOTH apply
+ * to the same path do not compose as siblings here. Measured against Caddy
+ * 2.11.4, a browser gate and the MCP bearer gate emitted as sibling `handle`s
+ * silently diverge — `/mcp` answers 401 instead of redirecting, and a request
+ * carrying only a bearer reaches the tenant with no browser session at all.
+ * Composition is done by NESTING one guard's handle inside the other's `route`,
+ * not by pushing another entry into this list.
+ */
+function generateGuardHandles(route: RouteConfig): CaddyDirective[] {
+  const handles: CaddyDirective[] = [];
+  if (route.mcpAuth) {
+    handles.push(generateMcpAuthHandle(route, route.mcpAuth));
+  }
+  return handles;
+}
+
+/**
+ * The path prefix a guard's matcher must carry, derived from the route's own
+ * site address.
+ *
+ * A matcher is evaluated against the FULL request path, while the site address
+ * may already be restricted to a prefix (a same-origin monorepo child lives at
+ * `group.host/api*`). A guard matching a bare `/mcp*` there could never be true
+ * — the real endpoint is `/api/mcp` — so every request, including the one the
+ * guard exists for, falls through to the catch-all while the dashboard reports
+ * the endpoint as protected.
+ *
+ * Extracted so a second guard cannot re-derive it slightly differently.
+ */
+export function routeMatcherPrefix(route: RouteConfig): string {
+  return (route.pathPrefix ?? '').replace(/\*+$/, '').replace(/\/$/, '');
 }
 
 /**
@@ -190,14 +242,9 @@ function generateMcpAuthHandle(route: RouteConfig, mcp: McpAuthConfig): CaddyDir
     { name: 'header_up', args: ['-X-Api-Key'] },
   ];
 
-  // The matcher is evaluated against the FULL request path, while the site
-  // address may already be restricted to a prefix (a same-origin monorepo child
-  // lives at `group.host/api*`). Matching `/mcp*` there could never be true —
-  // its real endpoint is `/api/mcp` — so every request, including the one this
-  // guard exists for, would fall through to the unguarded catch-all while the
-  // dashboard reported the endpoint as protected.
-  const prefix = (route.pathPrefix ?? '').replace(/\*+$/, '').replace(/\/$/, '');
-  const matcher = `${prefix}${mcp.path}*`;
+  // See routeMatcherPrefix for why the site address's prefix has to be folded
+  // into the matcher.
+  const matcher = `${routeMatcherPrefix(route)}${mcp.path}*`;
 
   return {
     name: 'handle',
