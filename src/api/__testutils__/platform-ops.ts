@@ -37,6 +37,7 @@ export function makePlatformOpsStub(overrides?: Partial<PlatformOps>): PlatformO
     promoteApp: jest.fn().mockResolvedValue(undefined),
     removeGroup: jest.fn().mockResolvedValue({ removed: [] }),
     purgeAppArtifacts: jest.fn().mockResolvedValue(undefined),
+    reconfigureRoute: jest.fn().mockResolvedValue(undefined),
     ...overrides,
   };
 }

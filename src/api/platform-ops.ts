@@ -163,6 +163,28 @@ export interface PlatformOps {
    * the delete's success condition.
    */
   purgeAppArtifacts(appName: string, opts?: { keepData?: boolean }): Promise<void>;
+
+  /**
+   * Re-emit this app's Caddy route blocks from its CURRENT config and reload
+   * Caddy — without stopping, rebuilding or restarting it (DROP-152).
+   *
+   * Exists because route configuration is otherwise reachable only from
+   * `app:started` and boot reconciliation. A route-level policy — the browser
+   * access gate — that is toggled through the API would therefore write its
+   * YAML and change nothing in the running Caddyfile until the app happened to
+   * be redeployed: fail-OPEN in the enable direction, with the dashboard
+   * reporting the app as gated. (Revocation is unaffected either way; the
+   * verify endpoint reads the policy live.)
+   *
+   * Deliberately not solved with a config fingerprint that forces a redeploy:
+   * boot reconciliation re-emits guards anyway, so a fingerprint would buy
+   * pointless full rebuilds and still leave the live toggle broken.
+   *
+   * A no-op (resolves) for an app with no known port — there is no route to
+   * re-emit. Rejects with AppInProgressError when a deploy/build/restart is in
+   * flight, so it cannot race the route write that deploy will do itself.
+   */
+  reconfigureRoute(appName: string): Promise<void>;
 }
 
 let platformOps: PlatformOps | null = null;

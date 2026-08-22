@@ -150,6 +150,28 @@ function mapDockerState(state: Docker.ContainerInspectInfo['State']): AppRuntime
  * replace it with a mock — the real client is constructed when `client` is
  * omitted (production path).
  */
+/**
+ * Whether tenant containers are isolated from each other on `drop-net`.
+ *
+ * `'unknown'` until `ensureNetwork()` has run in this process — which happens
+ * on the first container start, so it is the normal state at boot and on a
+ * PM2-isolation box. `'shared'` is the one value that means something is
+ * actually wrong: the network predates ICC-disabling and could not be
+ * recreated because containers were attached, so every tenant container can
+ * reach every other tenant's port directly, walking past Caddy.
+ *
+ * Read by the DROP-152 access gate, which cannot be enforced at the Caddy
+ * layer on a box in that state. Deliberately NOT treated as a refusal when
+ * `'unknown'`: that would refuse a correctly configured box for the whole
+ * window before its first container starts.
+ */
+let tenantNetworkIsolation: 'unknown' | 'isolated' | 'shared' = 'unknown';
+
+/** See `tenantNetworkIsolation`. */
+export function getTenantNetworkIsolation(): 'unknown' | 'isolated' | 'shared' {
+  return tenantNetworkIsolation;
+}
+
 export class ContainerManager implements AppRuntime {
   readonly type = 'docker' as const;
 
@@ -532,6 +554,7 @@ export class ContainerManager implements AppRuntime {
     }
 
     if (networkExists && iccDisabled) {
+      tenantNetworkIsolation = 'isolated';
       // Already correctly configured. The subnet is deliberately NOT required to
       // match DROP_NET_SUBNET: `drop-host` is mapped to the network's ACTUAL
       // gateway at container start (resolveHostGatewayIp), so an in-place upgrade
@@ -555,6 +578,11 @@ export class ContainerManager implements AppRuntime {
             'communication ENABLED and could not be recreated because containers are ' +
             'still attached. Restart DROP with no running containers to re-disable ICC.'
         );
+        // Record it, don't just warn: on this box every tenant container can
+        // reach every other tenant's port on the bridge, bypassing Caddy — so
+        // a Caddy-level access gate is not enforceable here for the same
+        // reason it is not enforceable under isolation: none (DROP-152).
+        tenantNetworkIsolation = 'shared';
         return;
       }
     }
@@ -573,6 +601,7 @@ export class ContainerManager implements AppRuntime {
         // gives new installs a stable, uncommon range.
         IPAM: { Config: [{ Subnet: DROP_NET_SUBNET, Gateway: DROP_NET_GATEWAY }] },
       });
+      tenantNetworkIsolation = 'isolated';
     }
   }
 
@@ -834,6 +863,7 @@ export function getContainerManager(docker?: Docker): ContainerManager {
 }
 
 export function resetContainerManager(): void {
+  tenantNetworkIsolation = 'unknown';
   if (containerManagerInstance) {
     containerManagerInstance.disconnect();
   }

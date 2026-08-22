@@ -131,6 +131,18 @@ import {
   resetLogRetentionService,
 } from '../managers/log-retention/log-retention';
 import { hasEnoughDisk, getMinFreeDiskMb } from '../utils/disk';
+import {
+  assessAccessGate,
+  describeAccessGateRefusal,
+  resolveGateHostnames,
+  resolveHttpsEffective,
+  type AccessGateVerdict,
+} from '../managers/guardrail/access-gate';
+// Imported from the concrete file, NOT the '../managers/runtime' barrel: five
+// platform test suites mock that barrel wholesale and would hand back
+// `undefined` for anything they did not list -- the same reason
+// DEFAULT_IGNORE_PATTERNS is imported from watcher.config.ts above.
+import { getTenantNetworkIsolation } from '../managers/runtime/container-manager';
 import { probePort, probeHttp } from '../utils/http-probe';
 
 /** See PlatformConfig.bootReconcileMode. */
@@ -827,6 +839,12 @@ export class DropPlatform {
 
       // Wire up event handlers
       this.setupEventHandlers();
+
+      // DROP-152: report any persisted access-gate policy this box cannot
+      // enforce. Placed HERE, after initializeServices() has loaded the app
+      // configs -- assertStartupConstraints above runs before that and can see
+      // no app's policy at all -- and deliberately non-fatal.
+      await this.sweepAccessGates();
 
       // M1 boot reconciliation (DROP_BOOT_RECONCILE): decide skip vs redeploy
       // per known app BEFORE the watcher starts, so a stable app's own
@@ -1656,6 +1674,11 @@ backup:
       // runtime-config so a route file never has to re-derive them.
       maxDbsPerUser: this.config.maxDbsPerUser,
       maxRedisPerUser: this.config.maxRedisPerUser,
+      // DROP-152: the access-gate route refuses to enable a gate outside
+      // docker isolation. Passed through rather than re-read from the env in
+      // the route, so the route and the platform can never disagree about
+      // which mode is actually running.
+      isolation: this.config.isolation === 'docker' ? 'docker' : 'none',
     });
 
     await this.apiServer.initialize();
@@ -1672,6 +1695,7 @@ backup:
       attachService: (name, serviceId) => this.attachService(name, serviceId),
       detachService: (name, serviceId) => this.detachService(name, serviceId),
       getServiceIntent: (name, serviceId) => this.getServiceIntent(name, serviceId),
+      reconfigureRoute: (name) => this.reconfigureRoute(name),
     });
 
     this.logger.info(`API server running on port ${this.config.apiPort}`, 'API');
@@ -4621,6 +4645,32 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       }
       domains = routableDomains;
 
+      // DROP-152 browser access gate. Assessed HERE, at emission, and not only
+      // at the route that sets the policy: the two are separated in time by
+      // anything from a redeploy to a platform upgrade, and a box can stop
+      // satisfying the premise in between (HTTPS turned off, a drop.yaml
+      // `tls: {disabled: true}` landing on the next deploy, an in-place upgrade
+      // leaving drop-net with ICC enabled). An app asked to be protected and
+      // not protected must never be silent -- the dashboard would otherwise
+      // report it as gated on the strength of the persisted policy alone.
+      const accessPolicy = this.appConfigService?.getConfig(appName)?.access;
+      if (accessPolicy) {
+        const verdict = this.assessAccessGateFor(appName, domains, dropYaml.config?.tls?.disabled);
+        if (!verdict.enforceable) {
+          this.logger.error(
+            `${describeAccessGateRefusal(appName, verdict)}. Refusing to emit the access guard: ` +
+              'this app is NOT protected.',
+            'ROUTER'
+          );
+        }
+        // Recorded either way, so a box that starts satisfying the premise
+        // clears the flag on its next route configuration rather than staying
+        // marked forever.
+        await this.stateManager?.updateApp(appName, {
+          accessGateUnapplied: !verdict.enforceable,
+        });
+      }
+
       // Configure route for each domain
       let resolvedPublicUrl: string | undefined;
       for (const hostname of domains) {
@@ -4694,6 +4744,105 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
   private async reloadCaddyIfRunning(): Promise<void> {
     if (this.caddyServer && this.caddyServer.getStatus() === 'running') {
       await this.caddyServer.reload();
+    }
+  }
+
+  /**
+   * Whether a browser access gate (DROP-152) can actually be enforced for this
+   * app, from the platform's own live view. The one place the three refusal
+   * points get their inputs from, so the route, route emission and the boot
+   * sweep can never disagree about the same app.
+   *
+   * `hostnames` is the app's FINAL routable domain list where the caller has
+   * one; an empty list means nothing is routed, which is reported as no-https
+   * rather than as a vacuous pass.
+   */
+  private assessAccessGateFor(
+    appName: string,
+    hostnames: string[],
+    tlsDisabled?: boolean
+  ): AccessGateVerdict {
+    const httpsEffective = resolveHttpsEffective(hostnames, {
+      enableHttps: this.config.enableHttps,
+      tlsDisabled,
+      isLocalhost: isLocalhostDomain,
+    });
+
+    return assessAccessGate({
+      isolation: this.config.isolation === 'docker' ? 'docker' : 'none',
+      authEnabled: this.config.enableApiAuth,
+      httpsEffective,
+      networkIsolation: getTenantNetworkIsolation(),
+      group: this.appConfigService?.getConfig(appName)?.group,
+    });
+  }
+
+  /**
+   * Re-emit one app's Caddy route blocks from its CURRENT config and reload
+   * Caddy, without stopping, rebuilding or restarting it. See
+   * `PlatformOps.reconfigureRoute` for why this exists.
+   */
+  private async reconfigureRoute(appName: string): Promise<void> {
+    if (this.appsInProgress.has(appName)) {
+      // A deploy in flight will write the route itself when it starts the app;
+      // racing it here could emit a block for a port that is about to change.
+      throw new AppInProgressError(appName);
+    }
+
+    // AppConfig is the source of truth for ports (see the two-phase
+    // reconciliation in syncStateWithConfigs); AppState is the fallback for an
+    // app whose config has not been written yet.
+    const port =
+      this.appConfigService?.getConfig(appName)?.port ?? this.stateManager?.getApp(appName)?.port;
+    if (!port) {
+      // Nothing is routed for an app with no port. Not an error: a stopped or
+      // never-deployed app's gate takes effect the next time it is routed.
+      this.logger.info(
+        `No route to reconfigure for '${appName}' - it has no assigned port`,
+        'ROUTER'
+      );
+      return;
+    }
+
+    await this.handleConfigureRoute(appName, port);
+  }
+
+  /**
+   * Report every persisted access-gate policy this box cannot enforce
+   * (DROP-152).
+   *
+   * A SWEEP, not a startup constraint. `assertStartupConstraints` runs before
+   * the config layer loads -- so it cannot see any app's policy -- and it
+   * throws to exit the process, which would let one tenant's gate declaration
+   * refuse to boot the entire fleet. This logs and returns.
+   */
+  private async sweepAccessGates(): Promise<void> {
+    const configs = this.appConfigService?.getAllConfigs() ?? [];
+    const unenforceable: string[] = [];
+
+    for (const config of configs) {
+      if (!config.access) continue;
+      const hostnames = resolveGateHostnames(
+        config.name,
+        config.domains,
+        this.config.domainSuffix || 'localhost'
+      );
+      const verdict = this.assessAccessGateFor(config.name, hostnames, config.tls?.disabled);
+      if (!verdict.enforceable) {
+        unenforceable.push(config.name);
+        this.logger.error(describeAccessGateRefusal(config.name, verdict), 'ROUTER');
+      }
+      await this.stateManager?.updateApp(config.name, {
+        accessGateUnapplied: !verdict.enforceable,
+      });
+    }
+
+    if (unenforceable.length > 0) {
+      this.logger.error(
+        `${unenforceable.length} app(s) have an access-gate policy this platform cannot enforce: ` +
+          `${unenforceable.join(', ')}. They are NOT protected.`,
+        'ROUTER'
+      );
     }
   }
 

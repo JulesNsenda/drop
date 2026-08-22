@@ -99,6 +99,21 @@ export interface AppState {
    */
   awaitingPromotion?: boolean;
   /**
+   * True when this app carries a browser access-gate policy (DROP-152) that
+   * the platform could NOT enforce, and false once it can.
+   *
+   * A FLAG, not an `AppStatus` member, for the same reason
+   * `readinessUnverified` above is one: it answers a different question from
+   * "what is running", and the ~20 `status === 'running'` comparisons would
+   * silently mis-answer several of theirs if it became a status.
+   *
+   * Written on every route configuration and by the boot sweep, in BOTH
+   * directions -- an app must clear the flag when the box starts satisfying
+   * the premise, not stay marked forever. Absent means the app has no gate
+   * policy at all, which is not the same as an enforced one.
+   */
+  accessGateUnapplied?: boolean;
+  /**
    * Grouping tag for apps expanded from a single monorepo deploy (e.g.
    * `ezsign-backend` / `ezsign-frontend` both tagged `group: ezsign`). Set via
    * `updateApp(name, { group })`, not `registerApp` — `AppConfig` (app-config.ts)

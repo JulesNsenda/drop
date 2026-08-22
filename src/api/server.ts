@@ -92,6 +92,13 @@ export interface ApiServerConfig {
   /** Per-user managed-Redis cap (passed through to runtime-config for GET /db/:name). */
   maxRedisPerUser?: number;
   /**
+   * Tenant isolation mode (passed through to runtime-config). Read by the
+   * access-gate route, which refuses to enable a gate the platform cannot
+   * enforce — outside docker isolation the tenant binds the host port itself
+   * and `host:port` walks straight past Caddy.
+   */
+  isolation?: 'none' | 'docker';
+  /**
    * Override the resolved dashboard directory (normally dist/dashboard, or
    * src/dashboard as a dev fallback — see setupRoutes). Defaults to that
    * resolution when unset; exists so tests can point at an isolated fixture
@@ -131,6 +138,7 @@ export class ApiServer {
       maxUploadSizeMb: this.config.maxUploadSizeMb,
       maxDbsPerUser: this.config.maxDbsPerUser,
       maxRedisPerUser: this.config.maxRedisPerUser,
+      isolation: this.config.isolation,
       // Admin-stored override (PRD-041 settings UI) takes precedence over
       // DROP_PUBLIC_URL — see getPublicUrl()'s precedence. Reads whatever
       // the settings manager singleton has loaded so far: the real platform
@@ -306,6 +314,12 @@ export class ApiServer {
       // scoped DROP_API_KEY) is admin-only — register before the general /apps/*
       // guard so a readonly/user token can't confer capabilities.
       v1.use('/apps/*/capabilities', authMiddleware('admin'));
+      // The browser access gate (DROP-152) is a GOVERNANCE control: who may
+      // OPEN an app, set by whoever governs the estate. Admin-only, and
+      // registered before the general /apps/* guard — a `user`-role owner must
+      // not be able to widen (or clear) an allow-list an admin set on their
+      // app, which the general 'readonly'/'user' guard would permit.
+      v1.use('/apps/*/access', authMiddleware('admin'));
       // start/stop/restart mutate runtime state (and, on restart, tear down
       // and recreate the process/container) — read-only tokens must not
       // reach them. Register before the general /apps/* guard.
