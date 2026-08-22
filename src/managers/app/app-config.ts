@@ -280,22 +280,38 @@ type SystemConfigField = (typeof SYSTEM_CONFIG_FIELDS)[number];
  * UNSTRIPPED system writers may not touch. Only the dedicated setter for each
  * one (`setAccessPolicy`) passes `restricted: true`.
  *
- * The tier exists because "system-owned" is not containment on this codebase's
- * actual call graph: `upsertSystemConfig`/`updateSystemConfig` are already
+ * Why a second tier rather than adding `access` to SYSTEM_CONFIG_FIELDS: that
+ * list's runtime strip runs ONLY on the `system: false` writers, and
+ * `upsertSystemConfig`/`updateSystemConfig` — the unstripped ones — are already
  * called from `upload-deploy.ts` and `git-deploy.ts` on the agent/upload deploy
- * path, so a field that only SYSTEM_CONFIG_FIELDS protected would be reachable
- * from request-derived data. An authorization field cannot rely on every
- * caller happening to be careful — see the build-secret boundary and
- * group-name containment incidents, both of which were correct helpers with a
- * bypassing caller.
+ * path. Those four call sites pass fixed object literals today, so the
+ * excess-property check would in fact have caught a mistake there; the reason
+ * that is not enough is that an excess-property check is not a boundary. It
+ * fires on a fresh literal and on nothing else — not a cast, not a spread, not
+ * a variable — which is precisely how the build-secret boundary and the
+ * group-name containment were bypassed, both of them correct helpers with a
+ * careless caller. An authorization field gets a RUNTIME strip on every writer
+ * without exception, and this is the tier that provides one.
  *
  * These are NOT also listed in SYSTEM_CONFIG_FIELDS: this tier already strips
  * them on every writer that one covers, and listing them twice would emit two
- * warnings for one dropped field.
+ * warnings for one dropped field. `assertConfigTiersDisjoint` below pins that.
  */
 const RESTRICTED_CONFIG_FIELDS = ['access'] as const satisfies readonly (keyof AppConfig)[];
 
 type RestrictedConfigField = (typeof RESTRICTED_CONFIG_FIELDS)[number];
+
+/**
+ * The two tiers must stay disjoint — a field in both would be stripped twice
+ * and warn twice for one write. Exported for the test that pins it rather than
+ * asserted at module load, so adding a field to the wrong list fails CI rather
+ * than the platform's boot.
+ */
+export function configTierOverlap(): string[] {
+  return (RESTRICTED_CONFIG_FIELDS as readonly string[]).filter(field =>
+    (SYSTEM_CONFIG_FIELDS as readonly string[]).includes(field)
+  );
+}
 
 export interface AppConfigServiceOptions {
   configDir: string; // e.g., /var/drop/data/appconf/webapps
@@ -421,9 +437,16 @@ export class AppConfigService {
   }
 
   /**
-   * Save an app config to file
+   * Save an app config to file.
+   *
+   * PRIVATE, and load-bearing that it stays so: this writes a whole config
+   * object straight to disk and into the in-memory map, bypassing BOTH
+   * `stripSystemFields` and `stripRestrictedFields`. The entire containment
+   * story of those tiers rests on `write()` being the only way in. It was
+   * public with a single internal caller, which is how every bypassing-caller
+   * incident in this repo started.
    */
-  async saveConfig(config: AppConfig): Promise<void> {
+  private async saveConfig(config: AppConfig): Promise<void> {
     const configPath = this.getConfigPath(config.name);
     const content = yaml.stringify(config, { indent: 2 });
     // M1 review item 5 (round-2 diff pass): 0600, matching secrets.json — a
@@ -511,10 +534,15 @@ export class AppConfigService {
    * documentation only (an excess-property check fires on a fresh object
    * literal but not on a cast or a spread); this is the actual guarantee.
    */
-  private stripRestrictedFields(appName: string, updates: Partial<AppConfig>): Partial<AppConfig> {
+  private stripRestrictedFields(
+    appName: string,
+    updates: Partial<AppConfig>,
+    allowed?: RestrictedConfigField
+  ): Partial<AppConfig> {
     const stripped: Partial<AppConfig> = { ...updates };
     const dropped: string[] = [];
     for (const field of RESTRICTED_CONFIG_FIELDS) {
+      if (field === allowed) continue;
       if (field in stripped) {
         delete stripped[field];
         dropped.push(field);
@@ -553,7 +581,7 @@ export class AppConfigService {
   private write(
     appName: string,
     updates: Partial<AppConfig> | ((existing: AppConfig | undefined) => Partial<AppConfig>),
-    opts: { create: boolean; system: boolean; restricted?: boolean }
+    opts: { create: boolean; system: boolean; restricted?: RestrictedConfigField }
   ): Promise<AppConfig | null> {
     return this.enqueueWrite(appName, async () => {
       const existing = this.configs.get(appName);
@@ -563,10 +591,10 @@ export class AppConfigService {
       const systemSafe = opts.system ? rawUpdates : this.stripSystemFields(appName, rawUpdates);
       // The restricted tier is applied INDEPENDENTLY of `system`, not nested
       // inside its else-branch: the whole point is that `system: true` does
-      // not buy access to it.
-      const safeUpdates = opts.restricted
-        ? systemSafe
-        : this.stripRestrictedFields(appName, systemSafe);
+      // not buy access to it. `opts.restricted` names ONE field — a blanket
+      // boolean would let each dedicated setter write every other restricted
+      // field too, which is not what the tier claims once a second one exists.
+      const safeUpdates = this.stripRestrictedFields(appName, systemSafe, opts.restricted);
       const now = new Date().toISOString();
 
       // Cast, not a type hole: `opts.create` is a runtime boolean, not a
@@ -600,7 +628,7 @@ export class AppConfigService {
    */
   async upsertConfig(
     appName: string,
-    updates: Partial<Omit<AppConfig, SystemConfigField>>
+    updates: Partial<Omit<AppConfig, SystemConfigField | RestrictedConfigField>>
   ): Promise<AppConfig> {
     // `create: true` never resolves null (see `write`'s own doc).
     return (await this.write(appName, updates as Partial<AppConfig>, {
@@ -616,7 +644,7 @@ export class AppConfigService {
    */
   async updateConfig(
     appName: string,
-    updates: Partial<Omit<AppConfig, SystemConfigField>>
+    updates: Partial<Omit<AppConfig, SystemConfigField | RestrictedConfigField>>
   ): Promise<AppConfig | null> {
     return this.write(appName, updates as Partial<AppConfig>, { create: false, system: false });
   }
@@ -681,7 +709,7 @@ export class AppConfigService {
     appName: string,
     access: AppAccessPolicy | undefined
   ): Promise<AppConfig | null> {
-    return this.write(appName, { access }, { create: false, system: true, restricted: true });
+    return this.write(appName, { access }, { create: false, system: true, restricted: 'access' });
   }
 
   /**

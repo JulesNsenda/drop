@@ -18,6 +18,7 @@ import { AppProcessInfo } from '../managers/runtime';
 // DetachServiceOutcome/DetachServiceRestartOutcome are re-exported (below)
 // but not used in this file's own signatures.
 import type { AttachableServiceId, AttachServiceResult, DetachServiceResult } from './services-wire.types';
+import type { AccessGateVerdict } from '../managers/guardrail/access-gate';
 
 /**
  * The attach/detach wire contract itself lives in `services-wire.types.ts` —
@@ -185,6 +186,21 @@ export interface PlatformOps {
    * flight, so it cannot race the route write that deploy will do itself.
    */
   reconfigureRoute(appName: string): Promise<void>;
+
+  /**
+   * Whether a browser access gate (DROP-152) can be ENFORCED for this app, and
+   * why not when it cannot.
+   *
+   * On the seam because the platform is the only thing that can answer it. The
+   * route previously re-derived the same five inputs from `runtime-config` and
+   * `AppConfig`, which made two sources of truth for one authorization
+   * question: `authEnabled` came from `enableApiAuth` on one side and
+   * `isAuthEnabled()` on the other, `httpsEffective` from `enableHttps` vs
+   * `isHttpsEnabled()`, the hostnames from persisted config vs the live
+   * `drop.yaml`. The claim that the route could only ever err optimistically
+   * was a comment with nothing enforcing it.
+   */
+  assessAccessGate(appName: string): Promise<AccessGateVerdict>;
 }
 
 let platformOps: PlatformOps | null = null;

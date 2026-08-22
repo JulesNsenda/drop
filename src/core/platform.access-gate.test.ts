@@ -16,10 +16,12 @@
  * refuse to boot the whole fleet.
  */
 
+import * as fs from 'fs/promises';
 import * as path from 'path';
 import * as os from 'os';
 import { DropPlatform, createPlatform } from './platform';
 import type { AppConfig } from '../managers/app/app-config';
+import { ACCESS_GATE_ENFORCEMENT_AVAILABLE } from '../managers/guardrail/access-gate';
 
 const POLICY: AppConfig['access'] = { mode: 'drop-users', allow: ['user-1'] };
 
@@ -58,6 +60,9 @@ describe('platform access-gate refusals (DROP-152)', () => {
       getConfig: jest.fn().mockReturnValue(config),
       getAllConfigs: jest.fn().mockReturnValue(all),
       updateConfig: jest.fn().mockResolvedValue(undefined),
+      // Reached by the custom-domain ownership guard; an empty map means
+      // "unclaimed", which is what the cases here want.
+      getDomainOwners: jest.fn().mockReturnValue(new Map<string, string>()),
     };
     (platform as unknown as Record<string, unknown>).stateManager = {
       updateApp,
@@ -81,9 +86,20 @@ describe('platform access-gate refusals (DROP-152)', () => {
       domainSuffix: 'example.com',
     });
 
+  /**
+   * A REAL drop.yaml on disk. The gate's hostname/TLS resolution reads the
+   * live file (the same source route emission reads), so a stubbed config
+   * object cannot exercise it.
+   */
+  const writeDropYaml = async (appName: string, contents: string) => {
+    const dir = path.join(tempDir, 'apps', appName);
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(path.join(dir, 'drop.yaml'), contents);
+  };
+
   beforeEach(() => {
     jest.clearAllMocks();
-    tempDir = path.join(os.tmpdir(), `drop-access-gate-${Date.now()}`);
+    tempDir = path.join(os.tmpdir(), `drop-access-gate-${Date.now()}-${Math.floor(performance.now())}`);
     platform = makeEnforceablePlatform();
 
     errors = [];
@@ -95,6 +111,10 @@ describe('platform access-gate refusals (DROP-152)', () => {
       appEvent: () => undefined,
       platformEvent: () => undefined,
     } as never;
+  });
+
+  afterEach(async () => {
+    await fs.rm(tempDir, { recursive: true, force: true }).catch(() => undefined);
   });
 
   describe('route emission', () => {
@@ -114,11 +134,17 @@ describe('platform access-gate refusals (DROP-152)', () => {
       expect(setAccessGateUnapplied).toHaveBeenCalledWith('myapp', undefined);
     });
 
-    it('clears the flag when the gate IS enforceable', async () => {
+    it('flags a gated app even when the BOX could enforce one', async () => {
+      // `ACCESS_GATE_ENFORCEMENT_AVAILABLE` is false: this build emits no
+      // guard at all, so a policy that exists is by definition not applied.
+      // The flag is a statement about traffic, not about the box's capability
+      // — reporting `false` here would assert a control that does not exist.
       wire(configFor({ access: POLICY }));
       await configureRoute();
-      expect(setAccessGateUnapplied).toHaveBeenCalledWith('myapp', false);
-      expect(errors.filter(e => e.includes('access guard'))).toHaveLength(0);
+      expect(ACCESS_GATE_ENFORCEMENT_AVAILABLE).toBe(false);
+      expect(setAccessGateUnapplied).toHaveBeenCalledWith('myapp', true);
+      // ...but with no refusal logged, because nothing about the box is wrong.
+      expect(errors.filter(e => e.includes('NOT protected'))).toHaveLength(0);
     });
 
     it('flags and logs when the platform is not in docker isolation', async () => {
@@ -141,6 +167,74 @@ describe('platform access-gate refusals (DROP-152)', () => {
 
       expect(setAccessGateUnapplied).toHaveBeenCalledWith('myapp', true);
       expect(errors.find(e => e.includes('NOT protected'))).toContain('Secure');
+    });
+
+    it('ignores a tenant-authored `tls: {disabled: true}` for a gated app', async () => {
+      // The input is authored in the app's OWN drop.yaml. Honouring it would
+      // let the governed party switch off the control governing them by
+      // editing one line in a file they own.
+      await writeDropYaml('myapp', 'name: myapp\ntls:\n  disabled: true\n');
+      wire(configFor({ access: POLICY }));
+
+      await configureRoute();
+
+      const { addRoute } = (platform as unknown as { router: { addRoute: jest.Mock } }).router;
+      expect(addRoute).toHaveBeenCalledTimes(1);
+      expect(addRoute.mock.calls[0][0].ssl).toBe(true);
+      // ...and the verdict is not `no-https` either.
+      expect(errors.filter(e => e.includes('NOT protected'))).toHaveLength(0);
+    });
+
+    it('honours a tenant `tls: {disabled: true}` on an UNGATED app, as before', async () => {
+      await writeDropYaml('myapp', 'name: myapp\ntls:\n  disabled: true\n');
+      wire(configFor());
+
+      await configureRoute();
+
+      const { addRoute } = (platform as unknown as { router: { addRoute: jest.Mock } }).router;
+      expect(addRoute.mock.calls[0][0].ssl).toBe(false);
+    });
+
+    it('refuses to route a gated app on a plaintext hostname', async () => {
+      // One `.localhost` entry would otherwise flip httpsEffective false for
+      // the app's real HTTPS hostname too, disabling the gate for both.
+      await writeDropYaml(
+        'myapp',
+        'name: myapp\ndomains:\n  - real.example.com\n  - dev.localhost\n'
+      );
+      wire(configFor({ access: POLICY }));
+
+      await configureRoute();
+
+      const { addRoute } = (platform as unknown as { router: { addRoute: jest.Mock } }).router;
+      const hostnames = addRoute.mock.calls.map((call: unknown[]) => (call[0] as { hostname: string }).hostname);
+      expect(hostnames).toEqual(['real.example.com']);
+    });
+
+    it('does NOT write the flag when the config service is unavailable', async () => {
+      // "Cannot tell whether this app is gated" must not read as "not gated" —
+      // the same permissive-read-of-an-absent-input defect canOpen's optional
+      // policy parameter was.
+      wire(configFor({ access: POLICY }));
+      (platform as unknown as Record<string, unknown>).appConfigService = undefined;
+
+      await configureRoute();
+
+      expect(setAccessGateUnapplied).not.toHaveBeenCalled();
+    });
+
+    it('flags the app when route emission THROWS', async () => {
+      // handleConfigureRoute's body is wrapped in a catch that only logs, so a
+      // throw leaves Caddy on its previous, ungated block. Recording "applied"
+      // before that point asserted a control that was never installed.
+      wire(configFor({ access: POLICY }));
+      (platform as unknown as Record<string, unknown>).router = {
+        addRoute: jest.fn().mockRejectedValue(new Error('caddy validation failed')),
+      };
+
+      await configureRoute();
+
+      expect(setAccessGateUnapplied).toHaveBeenCalledWith('myapp', true);
     });
 
     it('still configures the route rather than refusing to serve the app', async () => {
@@ -199,14 +293,16 @@ describe('platform access-gate refusals (DROP-152)', () => {
       expect(summary).toContain('beta');
     });
 
-    it('clears the flag for a policy this box CAN enforce', async () => {
+    it('logs nothing for a policy this box CAN enforce, but still flags it unapplied', async () => {
       const gated = [configFor({ name: 'alpha', domains: ['alpha.example.com'], access: POLICY })];
       wire(gated[0], gated);
 
       await sweep();
 
-      expect(setAccessGateUnapplied).toHaveBeenCalledWith('alpha', false);
+      // Nothing is wrong with the box, so no refusal is logged...
       expect(errors).toHaveLength(0);
+      // ...and nothing is enforcing the gate either, so it is not "applied".
+      expect(setAccessGateUnapplied).toHaveBeenCalledWith('alpha', true);
     });
 
     it('RESOLVES rather than throwing — it must never abort the boot', async () => {

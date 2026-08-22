@@ -138,7 +138,6 @@ export class ApiServer {
       maxUploadSizeMb: this.config.maxUploadSizeMb,
       maxDbsPerUser: this.config.maxDbsPerUser,
       maxRedisPerUser: this.config.maxRedisPerUser,
-      isolation: this.config.isolation,
       // Admin-stored override (PRD-041 settings UI) takes precedence over
       // DROP_PUBLIC_URL — see getPublicUrl()'s precedence. Reads whatever
       // the settings manager singleton has loaded so far: the real platform
@@ -305,6 +304,16 @@ export class ApiServer {
     // drain the services budget through a path that does nothing. Add it
     // back if and when a collection route exists.
     v1.use('/apps/*/services/*', servicesRateLimitMiddleware());
+
+    // The access-gate policy routes (DROP-152) get the services bucket too.
+    // Part 9 of the plan declined a bucket on the grounds that the route is
+    // "admin-only and cheap"; the call graph says otherwise — every PUT/DELETE
+    // runs `reconfigureRoute`, which regenerates the WHOLE Caddyfile and
+    // reloads Caddy once per routed domain. A scripted loop (or a stolen admin
+    // key) is an estate-wide routing DoS, and a failed reload mid-storm takes
+    // every tenant on the box with it. Registered unconditionally, like the
+    // other dedicated buckets, so an auth-disabled box gets it too.
+    v1.use('/apps/*/access', servicesRateLimitMiddleware());
 
     // Apply auth middleware to protected routes when auth is enabled
     if (this.config.enableAuth && isAuthEnabled()) {

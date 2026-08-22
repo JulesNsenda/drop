@@ -29,8 +29,6 @@ interface ApiRuntimeConfig {
   maxDbsPerUser?: number;
   /** Per-user managed-Redis cap, mirroring PlatformConfig.maxRedisPerUser. */
   maxRedisPerUser?: number;
-  /** Tenant isolation mode, mirroring PlatformConfig.isolation. */
-  isolation?: 'none' | 'docker';
 }
 
 const runtimeConfig: ApiRuntimeConfig = {};
@@ -44,7 +42,6 @@ export function setApiRuntimeConfig(config: ApiRuntimeConfig): void {
   if (config.publicUrl !== undefined) runtimeConfig.publicUrl = config.publicUrl;
   if (config.maxDbsPerUser !== undefined) runtimeConfig.maxDbsPerUser = config.maxDbsPerUser;
   if (config.maxRedisPerUser !== undefined) runtimeConfig.maxRedisPerUser = config.maxRedisPerUser;
-  if (config.isolation !== undefined) runtimeConfig.isolation = config.isolation;
 }
 
 /** Resolved webapps directory: explicit config > DROP_APPS_DIR env > platform default. */
@@ -134,18 +131,4 @@ export function getMaxDbsPerUser(): number {
 export function getMaxRedisPerUser(): number {
   if (runtimeConfig.maxRedisPerUser !== undefined) return runtimeConfig.maxRedisPerUser;
   return parseInt(process.env.DROP_MAX_REDIS_PER_USER || '3', 10);
-}
-
-/**
- * Active tenant isolation mode: explicit config > DROP_ISOLATION env >
- * 'none' (the platform's own default).
- *
- * Read by the access-gate route (DROP-152) to refuse enabling a browser gate
- * it cannot enforce. Fail-closed in the sense that matters here: anything
- * other than the exact literal 'docker' reads as 'none', so an unset or
- * misspelled value refuses the gate rather than promising one.
- */
-export function getIsolationMode(): 'none' | 'docker' {
-  if (runtimeConfig.isolation !== undefined) return runtimeConfig.isolation;
-  return process.env.DROP_ISOLATION === 'docker' ? 'docker' : 'none';
 }

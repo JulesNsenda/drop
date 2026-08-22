@@ -49,11 +49,21 @@ export interface AccessGateContext {
    */
   networkIsolation: 'unknown' | 'isolated' | 'shared';
   /**
-   * `AppConfig.group` — set for a monorepo child. Group children share ONE
+   * The app's monorepo group, if any. Resolved from `AppConfig.group` for a
+   * CHILD and from `AppState.group` for the container — `expandMonorepo`
+   * writes the container's tag to state only, so reading the config alone made
+   * the container invisible to this blocker. Group children share ONE
    * hostname, and the unit of Caddy enforcement is a site block keyed on
    * host+prefix, so a gate on one child is not a gate on the group.
    */
   group?: string;
+  /**
+   * Whether this app is the monorepo CONTAINER (the cloned repo folder) rather
+   * than one of its services. It serves nothing itself — its children serve
+   * the group host — so a policy on it is a governance record over an app
+   * nobody can reach, with the origin holding the data left open.
+   */
+  isGroupContainer?: boolean;
 }
 
 /** A machine-readable reason a gate cannot be enforced. */
@@ -62,7 +72,8 @@ export type AccessGateBlocker =
   | 'auth-disabled'
   | 'no-https'
   | 'tenant-network-shared'
-  | 'monorepo-group-child';
+  | 'monorepo-group-child'
+  | 'monorepo-group-container';
 
 export interface AccessGateVerdict {
   enforceable: boolean;
@@ -87,7 +98,25 @@ const BLOCKER_REASONS: Record<AccessGateBlocker, string> = {
   'monorepo-group-child':
     'the app is a monorepo group child: group children share one hostname, so a gate on one child ' +
     'leaves its siblings open on the same origin — gate the group, not a single child',
+  'monorepo-group-container':
+    'the app is a monorepo container, not a service: it serves nothing itself, so a gate on it ' +
+    'would be a governance record over an address nobody can reach while its children stay open',
 };
+
+/**
+ * Whether this build can actually ENFORCE an access gate.
+ *
+ * `false` until the `forward_auth` guard emitter and the verify endpoint land
+ * (the next slice). Everything in this module — the rule, the three refusal
+ * points, the policy store — is the enforceability half; nothing yet puts a
+ * guard in front of a single request.
+ *
+ * It exists so that no affirmative signal is a lie in the meantime: an app
+ * with a policy on this build is NOT protected, whatever the verdict says
+ * about the box, and the route and the state flag both say so. Flipping this
+ * to `true` alongside the emitter is the one line that turns the claims on.
+ */
+export const ACCESS_GATE_ENFORCEMENT_AVAILABLE = false;
 
 /**
  * The verdict. Every blocker is reported, not just the first: an operator
@@ -104,7 +133,8 @@ export function assessAccessGate(ctx: AccessGateContext): AccessGateVerdict {
   // starts — and refusing on it would refuse every correctly configured box
   // during its whole boot window.
   if (ctx.networkIsolation === 'shared') blockers.push('tenant-network-shared');
-  if (ctx.group) blockers.push('monorepo-group-child');
+  if (ctx.isGroupContainer) blockers.push('monorepo-group-container');
+  else if (ctx.group) blockers.push('monorepo-group-child');
 
   return {
     enforceable: blockers.length === 0,
@@ -114,40 +144,24 @@ export function assessAccessGate(ctx: AccessGateContext): AccessGateVerdict {
 }
 
 /**
- * The hostnames an app is actually routed on: its explicit `domains:` when it
- * has any, otherwise the computed `<name>.<suffix>` default.
- *
- * Shared by the route and the boot sweep so neither re-derives it. The route
- * emission path passes its own already-filtered list instead — by that point
- * reserved and cross-tenant-claimed hostnames have been dropped, and the
- * verdict must be about what is really being emitted.
- */
-export function resolveGateHostnames(
-  appName: string,
-  domains: string[] | undefined,
-  domainSuffix: string
-): string[] {
-  if (domains && domains.length > 0) return domains;
-  return [`${appName}.${domainSuffix || 'localhost'}`];
-}
-
-/**
  * Whether EVERY hostname the app is routed on is served over HTTPS.
  *
  * Per hostname, not per app: each `domains:` entry gets its own Caddy route,
- * so a user authenticated on one domain is not authenticated on another, and
- * one plaintext entry is enough to break the Secure cookie the gate depends
- * on. An empty list is `false` — nothing is routed, so nothing is gated, and
+ * so a user authenticated on one is not authenticated on another, and one
+ * plaintext entry is enough to break the Secure cookie the gate depends on.
+ * An empty list is `false` — nothing is routed, so nothing is gated, and
  * reporting that as a pass would be vacuous.
+ *
+ * There is deliberately NO `tlsDisabled` input. It used to take one, read from
+ * the tenant's own `drop.yaml`, which handed the governed party a one-line off
+ * switch for the control governing them. A gated app's transport is not the
+ * tenant's decision; the caller drops plaintext hostnames instead.
  */
 export function resolveHttpsEffective(
   hostnames: string[],
-  opts: { enableHttps: boolean; tlsDisabled?: boolean; isLocalhost: (hostname: string) => boolean }
+  opts: { enableHttps: boolean; isLocalhost: (hostname: string) => boolean }
 ): boolean {
-  return (
-    hostnames.length > 0 &&
-    hostnames.every((h) => opts.enableHttps && !opts.isLocalhost(h) && !opts.tlsDisabled)
-  );
+  return hostnames.length > 0 && hostnames.every((h) => opts.enableHttps && !opts.isLocalhost(h));
 }
 
 /** The refusal message for a route or a log line, from a verdict. */

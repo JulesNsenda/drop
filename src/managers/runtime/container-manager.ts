@@ -150,25 +150,61 @@ function mapDockerState(state: Docker.ContainerInspectInfo['State']): AppRuntime
  * replace it with a mock — the real client is constructed when `client` is
  * omitted (production path).
  */
+export type TenantNetworkIsolation = 'unknown' | 'isolated' | 'shared';
+
 /**
  * Whether tenant containers are isolated from each other on `drop-net`.
  *
- * `'unknown'` until `ensureNetwork()` has run in this process — which happens
- * on the first container start, so it is the normal state at boot and on a
- * PM2-isolation box. `'shared'` is the one value that means something is
- * actually wrong: the network predates ICC-disabling and could not be
- * recreated because containers were attached, so every tenant container can
- * reach every other tenant's port directly, walking past Caddy.
+ * `'shared'` is the value that means something is actually wrong: the network
+ * predates ICC-disabling and could not be recreated because containers were
+ * attached, so every tenant container can reach every other tenant's port
+ * directly, walking past Caddy. Read by the DROP-152 access gate, which cannot
+ * be enforced at the Caddy layer on a box in that state.
  *
- * Read by the DROP-152 access gate, which cannot be enforced at the Caddy
- * layer on a box in that state. Deliberately NOT treated as a refusal when
- * `'unknown'`: that would refuse a correctly configured box for the whole
- * window before its first container starts.
+ * `'unknown'` means nothing has looked yet, and it is deliberately NOT a
+ * refusal — on a PM2 box nothing ever will, and refusing there would refuse
+ * for a reason that does not apply. It is the platform's job to make sure the
+ * answer is known before anything reads it under docker isolation: see
+ * `probeTenantNetworkIsolation`, which the platform calls at boot. Left to
+ * `ensureNetwork` alone the value stayed `'unknown'` for the life of a docker
+ * box that skipped every app at boot reconciliation — i.e. the steady-state
+ * restart — so the blocker could never fire on the boxes it describes.
+ *
+ * Module-level rather than per-instance so a PM2 box, which never constructs a
+ * ContainerManager at all, can still be asked the question and answer
+ * `'unknown'` honestly. `resetContainerManager()` clears it.
  */
-let tenantNetworkIsolation: 'unknown' | 'isolated' | 'shared' = 'unknown';
+let tenantNetworkIsolation: TenantNetworkIsolation = 'unknown';
 
 /** See `tenantNetworkIsolation`. */
-export function getTenantNetworkIsolation(): 'unknown' | 'isolated' | 'shared' {
+export function getTenantNetworkIsolation(): TenantNetworkIsolation {
+  return tenantNetworkIsolation;
+}
+
+/**
+ * Determine `tenantNetworkIsolation` WITHOUT creating or recreating anything.
+ *
+ * `ensureNetwork` also sets it, but only as a side effect of starting a
+ * container. This is the read-only path the platform calls once at boot so the
+ * answer is established before the access-gate sweep and any route emission
+ * consults it. A network that does not exist yet reads as `'isolated'`: the
+ * only way one gets created is `ensureNetwork` below, which always sets
+ * `enable_icc=false`.
+ */
+export async function probeTenantNetworkIsolation(
+  docker?: Docker
+): Promise<TenantNetworkIsolation> {
+  const client = docker ?? new Docker();
+  try {
+    const net = (await client.getNetwork(DROP_NETWORK).inspect()) as {
+      Options?: Record<string, string>;
+    };
+    tenantNetworkIsolation =
+      net.Options?.['com.docker.network.bridge.enable_icc'] === 'false' ? 'isolated' : 'shared';
+  } catch {
+    // No such network yet — the next ensureNetwork() creates it with ICC off.
+    tenantNetworkIsolation = 'isolated';
+  }
   return tenantNetworkIsolation;
 }
 

@@ -13,8 +13,8 @@
 import {
   assessAccessGate,
   describeAccessGateRefusal,
-  resolveGateHostnames,
   resolveHttpsEffective,
+  ACCESS_GATE_ENFORCEMENT_AVAILABLE,
   type AccessGateContext,
 } from './access-gate';
 
@@ -74,6 +74,26 @@ describe('assessAccessGate', () => {
     expect(verdict.blockers).toContain('monorepo-group-child');
   });
 
+  it('refuses the monorepo CONTAINER, which serves nothing at all', () => {
+    // The container's `group` tag lives in AppState, not AppConfig, so an
+    // earlier version read `undefined` here and let an admin gate it: a
+    // governance record over an address nobody can reach, while the children
+    // holding the data stayed open on the group host.
+    const verdict = assessAccessGate({ ...ENFORCEABLE, group: 'ezsign', isGroupContainer: true });
+    expect(verdict.enforceable).toBe(false);
+    expect(verdict.blockers).toContain('monorepo-group-container');
+    // One blocker, not both — they are the same problem described twice.
+    expect(verdict.blockers).not.toContain('monorepo-group-child');
+  });
+
+  it('reports enforcement as UNAVAILABLE in this build', () => {
+    // The verdict answers "could this box enforce a gate", which is not the
+    // same question as "is anything enforcing one". Until the guard emitter
+    // ships, nothing is — and every affirmative signal in the API is gated on
+    // this constant so none of them can claim otherwise.
+    expect(ACCESS_GATE_ENFORCEMENT_AVAILABLE).toBe(false);
+  });
+
   it('reports EVERY blocker, not just the first', () => {
     const verdict = assessAccessGate({
       isolation: 'none',
@@ -104,23 +124,6 @@ describe('assessAccessGate', () => {
   });
 });
 
-describe('resolveGateHostnames', () => {
-  it('uses the explicit domains when the app has any', () => {
-    expect(resolveGateHostnames('myapp', ['a.example.com', 'b.example.com'], 'example.com')).toEqual(
-      ['a.example.com', 'b.example.com']
-    );
-  });
-
-  it('falls back to <name>.<suffix> when it has none', () => {
-    expect(resolveGateHostnames('myapp', undefined, 'example.com')).toEqual(['myapp.example.com']);
-    expect(resolveGateHostnames('myapp', [], 'example.com')).toEqual(['myapp.example.com']);
-  });
-
-  it('falls back to localhost when no suffix is configured', () => {
-    expect(resolveGateHostnames('myapp', undefined, '')).toEqual(['myapp.localhost']);
-  });
-});
-
 describe('resolveHttpsEffective', () => {
   const isLocalhost = (h: string) => h === 'localhost' || h.endsWith('.localhost');
 
@@ -138,14 +141,18 @@ describe('resolveHttpsEffective', () => {
     ).toBe(false);
   });
 
-  it('is false when the app disabled TLS in its own drop.yaml', () => {
+  it('ignores a tenant-authored TLS opt-out — there is no input for it', () => {
+    // It used to take `tlsDisabled`, read from the app's own drop.yaml, which
+    // handed the governed party a one-line off switch for the control
+    // governing them. The caller drops plaintext hostnames instead.
     expect(
       resolveHttpsEffective(['a.example.com'], {
         enableHttps: true,
+        // @ts-expect-error — no such input, deliberately.
         tlsDisabled: true,
         isLocalhost,
       })
-    ).toBe(false);
+    ).toBe(true);
   });
 
   it('is false when the platform has HTTPS off', () => {

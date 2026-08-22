@@ -26,6 +26,7 @@ import {
   DetectorService,
   getDetector,
   parseDropYaml,
+  type DropYamlParseResult,
   DetectionResult,
   DropYamlConfig,
   AppType,
@@ -134,15 +135,18 @@ import { hasEnoughDisk, getMinFreeDiskMb } from '../utils/disk';
 import {
   assessAccessGate,
   describeAccessGateRefusal,
-  resolveGateHostnames,
   resolveHttpsEffective,
+  ACCESS_GATE_ENFORCEMENT_AVAILABLE,
   type AccessGateVerdict,
 } from '../managers/guardrail/access-gate';
 // Imported from the concrete file, NOT the '../managers/runtime' barrel: five
 // platform test suites mock that barrel wholesale and would hand back
 // `undefined` for anything they did not list -- the same reason
 // DEFAULT_IGNORE_PATTERNS is imported from watcher.config.ts above.
-import { getTenantNetworkIsolation } from '../managers/runtime/container-manager';
+import {
+  getTenantNetworkIsolation,
+  probeTenantNetworkIsolation,
+} from '../managers/runtime/container-manager';
 import { probePort, probeHttp } from '../utils/http-probe';
 
 /** See PlatformConfig.bootReconcileMode. */
@@ -840,10 +844,23 @@ export class DropPlatform {
       // Wire up event handlers
       this.setupEventHandlers();
 
-      // DROP-152: report any persisted access-gate policy this box cannot
-      // enforce. Placed HERE, after initializeServices() has loaded the app
-      // configs -- assertStartupConstraints above runs before that and can see
-      // no app's policy at all -- and deliberately non-fatal.
+      // DROP-152: establish whether tenant containers are isolated from each
+      // other BEFORE anything reads the answer. `ensureNetwork` otherwise runs
+      // only on the first container start, and a docker box restarting into
+      // steady state skips every app at boot reconciliation and starts none —
+      // so the value stayed 'unknown' for the whole process lifetime and the
+      // `tenant-network-shared` blocker could never fire on precisely the box
+      // it exists to describe.
+      if (this.config.isolation === 'docker') {
+        await probeTenantNetworkIsolation().catch((error) => {
+          this.logger.warn('Could not determine tenant network isolation', 'RUNTIME', error);
+        });
+      }
+
+      // Report any persisted access-gate policy this box cannot enforce.
+      // Placed HERE, after initializeServices() has loaded the app configs --
+      // assertStartupConstraints above runs before that and can see no app's
+      // policy at all -- and deliberately non-fatal.
       await this.sweepAccessGates();
 
       // M1 boot reconciliation (DROP_BOOT_RECONCILE): decide skip vs redeploy
@@ -1696,6 +1713,7 @@ backup:
       detachService: (name, serviceId) => this.detachService(name, serviceId),
       getServiceIntent: (name, serviceId) => this.getServiceIntent(name, serviceId),
       reconfigureRoute: (name) => this.reconfigureRoute(name),
+      assessAccessGate: (name) => this.assessAccessGate(name),
     });
 
     this.logger.info(`API server running on port ${this.config.apiPort}`, 'API');
@@ -4437,7 +4455,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
   private async handleConfigureRoute(
     appName: string,
     port: number,
-    opts?: { skipCaddyReload?: boolean }
+    opts?: { skipCaddyReload?: boolean; routeOnly?: boolean }
   ): Promise<void> {
     if (!this.router || !port) return;
 
@@ -4550,10 +4568,19 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
 
         // Persist only the accepted domains as the source of truth — never the
         // raw, possibly-hijacking request.
-        await this.appConfigService.updateConfig(appName, {
-          domains: acceptedCustomDomains,
-          tls: dropYaml.config?.tls,
-        });
+        //
+        // Skipped under `routeOnly`. This method is now reachable from an
+        // authorization write (`reconfigureRoute`), and persisting whatever
+        // `domains:`/`tls:` the tenant's drop.yaml happens to contain RIGHT
+        // NOW would make an admin's access-policy change an apply path for
+        // tenant edits made since the last deploy, with no deploy and no
+        // review. A route re-emission must not mutate persisted config.
+        if (!opts?.routeOnly) {
+          await this.appConfigService.updateConfig(appName, {
+            domains: acceptedCustomDomains,
+            tls: dropYaml.config?.tls,
+          });
+        }
       }
 
       // In docker (multi-user) mode inject security headers on all tenant routes.
@@ -4653,10 +4680,16 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       // leaving drop-net with ICC enabled). An app asked to be protected and
       // not protected must never be silent -- the dashboard would otherwise
       // report it as gated on the strength of the persisted policy alone.
-      const accessPolicy = this.appConfigService?.getConfig(appName)?.access;
-      const accessVerdict = accessPolicy
-        ? this.assessAccessGateFor(appName, domains, dropYaml.config?.tls?.disabled)
+      // The config service is the ONLY way to know an app is gated. If it is
+      // unavailable we cannot tell, and "cannot tell" must not read as "not
+      // gated" — that is the same permissive-read-of-an-absent-input defect
+      // that `canOpen`'s optional policy parameter was. Leave the flag alone
+      // and say so rather than clearing it.
+      const accessPolicy = this.appConfigService
+        ? this.appConfigService.getConfig(appName)?.access
         : undefined;
+      const accessKnown = Boolean(this.appConfigService);
+      const accessVerdict = accessPolicy ? await this.assessAccessGate(appName, dropYaml) : undefined;
       if (accessVerdict && !accessVerdict.enforceable) {
         this.logger.error(
           `${describeAccessGateRefusal(appName, accessVerdict)}. Refusing to emit the access ` +
@@ -4664,21 +4697,33 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           'ROUTER'
         );
       }
-      // Recorded on EVERY pass, including the no-policy one. A box that starts
-      // satisfying the premise clears the flag on its next route
-      // configuration, and an app whose gate was REMOVED loses the flag
-      // entirely rather than reading "gate not applied" forever -- writing it
-      // only inside an `if (accessPolicy)` was exactly that bug.
-      await this.stateManager?.setAccessGateUnapplied(
-        appName,
-        accessVerdict ? !accessVerdict.enforceable : undefined
-      );
+      if (accessPolicy) {
+        // A gated app is not served on a plaintext or reserved hostname. The
+        // inputs that would otherwise disable the gate — a `.localhost` entry
+        // in `domains:`, `tls: {disabled: true}` — are TENANT-authored, so
+        // honouring them would hand the governed party an off switch for the
+        // control governing them. Dropping the hostname keeps the app's real
+        // HTTPS address serving and gated.
+        const gateSafe = this.gateRoutableHostnames(domains, domainSuffix);
+        if (gateSafe.length !== domains.length) {
+          this.logger.warn(
+            `App '${appName}' carries an access policy; refusing to route it on ` +
+              `${domains.length - gateSafe.length} plaintext/reserved hostname(s) that would ` +
+              'disable the gate',
+            'ROUTER'
+          );
+        }
+        domains = gateSafe;
+      }
 
       // Configure route for each domain
       let resolvedPublicUrl: string | undefined;
       for (const hostname of domains) {
         const isLocalhost = isLocalhostDomain(hostname);
-        const enableSsl = this.config.enableHttps && !isLocalhost && !dropYaml.config?.tls?.disabled;
+        // `tls.disabled` is tenant-authored; a gated app does not get to opt
+        // out of the transport its session cookie requires.
+        const tlsDisabled = accessPolicy ? false : dropYaml.config?.tls?.disabled;
+        const enableSsl = this.config.enableHttps && !isLocalhost && !tlsDisabled;
 
         await this.router.addRoute({
           appName: `${appName}-${hostname.replace(/\./g, '-')}`, // Unique route name per domain
@@ -4726,7 +4771,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       // CLEARS a stale one, so computeAppUrl can never link to the group host
       // for an app no longer served there (which would load a sibling's app).
       // The change-guard avoids a config write per app on every start.
-      if (this.appConfigService && resolvedPublicUrl !== appConfig?.publicUrl) {
+      if (!opts?.routeOnly && this.appConfigService && resolvedPublicUrl !== appConfig?.publicUrl) {
         await this.appConfigService.updateConfig(appName, { publicUrl: resolvedPublicUrl });
       }
 
@@ -4735,7 +4780,34 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       if (!opts?.skipCaddyReload) {
         await this.reloadCaddyIfRunning();
       }
+
+      // Written HERE, after the routes are actually emitted and reloaded, not
+      // beside the verdict above. Everything in this method runs inside a
+      // catch that only logs, so a throw from addRoute or the Caddy reload
+      // leaves the PREVIOUS block live — recording "gate applied" before that
+      // point asserted a control that had not been installed. The catch arm
+      // below records the opposite.
+      //
+      // The value is `true` for every gated app while ACCESS_GATE_ENFORCEMENT
+      // is unavailable: this build emits no access guard at all, so a policy
+      // that exists is by definition not applied. It is not a verdict about
+      // the box; it is a fact about the binary.
+      if (accessKnown) {
+        await this.stateManager?.setAccessGateUnapplied(
+          appName,
+          accessVerdict
+            ? !(accessVerdict.enforceable && ACCESS_GATE_ENFORCEMENT_AVAILABLE)
+            : undefined
+        );
+      }
     } catch (error) {
+      // A gated app whose route configuration threw is NOT protected: Caddy
+      // kept whatever block it had, which does not carry the guard.
+      if (this.appConfigService?.getConfig(appName)?.access) {
+        await this.stateManager
+          ?.setAccessGateUnapplied(appName, true)
+          .catch(() => undefined);
+      }
       // Surface at error level: a failed reload means this (and every
       // subsequent) route change silently stops applying until an operator
       // intervenes — not a benign "route already exists".
@@ -4752,32 +4824,85 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
 
   /**
    * Whether a browser access gate (DROP-152) can actually be enforced for this
-   * app, from the platform's own live view. The one place the three refusal
-   * points get their inputs from, so the route, route emission and the boot
-   * sweep can never disagree about the same app.
+   * app, resolved from the platform's own live view.
    *
-   * `hostnames` is the app's FINAL routable domain list where the caller has
-   * one; an empty list means nothing is routed, which is reported as no-https
-   * rather than as a vacuous pass.
+   * THE only resolution. The route reaches it through `PlatformOps`, route
+   * emission and the boot sweep call it directly — so there is one answer per
+   * app, not a platform answer and a route answer that have to be argued into
+   * agreement. An earlier shape had the route re-derive the same five inputs
+   * from `runtime-config` + `AppConfig`; the claim that it could only ever be
+   * optimistic was prose with nothing pinning it, and it was already
+   * falsifiable on `authEnabled`.
+   *
+   * Two resolution rules are load-bearing:
+   *
+   *  - **Tenant `tls: {disabled: true}` is IGNORED.** It is authored in the
+   *    app's own `drop.yaml`, so honouring it would let the tenant switch off
+   *    a governance control an admin set, by editing one line in a file they
+   *    own. `handleConfigureRoute` correspondingly refuses to honour it for a
+   *    gated app, so this is not an optimistic read — it is the policy.
+   *  - **Non-HTTPS hostnames are dropped, not tolerated.** A `.localhost`
+   *    entry in a tenant's `domains:` would otherwise flip `httpsEffective`
+   *    false for the app's real HTTPS hostname too. A gated app is not routed
+   *    on a plaintext host at all (again enforced at emission); if that leaves
+   *    no hostname, the verdict is `no-https`.
+   *
+   * `parsed` lets `handleConfigureRoute` hand over the `drop.yaml` it has
+   * already read, so the common path parses once.
    */
-  private assessAccessGateFor(
+  private async assessAccessGate(
     appName: string,
-    hostnames: string[],
-    tlsDisabled?: boolean
-  ): AccessGateVerdict {
-    const httpsEffective = resolveHttpsEffective(hostnames, {
-      enableHttps: this.config.enableHttps,
-      tlsDisabled,
-      isLocalhost: isLocalhostDomain,
-    });
+    parsed?: DropYamlParseResult
+  ): Promise<AccessGateVerdict> {
+    const dropYaml =
+      parsed ?? (await parseDropYaml(path.join(this.config.appsDirectory, appName)));
+    const config = this.appConfigService?.getConfig(appName);
+    const state = this.stateManager?.getApp(appName);
+    const suffix = this.config.domainSuffix || 'localhost';
+
+    const declared = dropYaml.success ? dropYaml.config?.domains : undefined;
+    const hasCustomDomains = Boolean(declared && declared.length > 0);
+    let hostnames: string[] = hasCustomDomains
+      ? (declared as string[])
+      : [`${appName}.${suffix}`];
+    // A same-origin monorepo child is routed onto the shared group host —
+    // mirroring handleConfigureRoute's own branch, which is also why a gate on
+    // a single child is refused outright below.
+    if (config?.group && dropYaml.success && dropYaml.config?.route && !hasCustomDomains) {
+      hostnames = [`${config.group}.${suffix}`];
+    }
+    hostnames = this.gateRoutableHostnames(hostnames, suffix);
 
     return assessAccessGate({
       isolation: this.config.isolation === 'docker' ? 'docker' : 'none',
       authEnabled: this.config.enableApiAuth,
-      httpsEffective,
+      httpsEffective: resolveHttpsEffective(hostnames, {
+        enableHttps: this.config.enableHttps,
+        isLocalhost: isLocalhostDomain,
+      }),
       networkIsolation: getTenantNetworkIsolation(),
-      group: this.appConfigService?.getConfig(appName)?.group,
+      // `group` lives in AppConfig for a CHILD and in AppState for the
+      // container (expandMonorepo writes `{ group, isGroupContainer }` to state
+      // only). Reading config alone left the container gateable: an admin could
+      // persist a policy on an app that serves nothing, while the children
+      // holding the data stayed open on the group host.
+      group: config?.group ?? state?.group,
+      isGroupContainer: state?.isGroupContainer === true,
     });
+  }
+
+  /**
+   * The hostnames a GATED app may be routed on: reserved hosts and plaintext
+   * hosts removed. Shared by the verdict and by route emission so the set the
+   * verdict is about is the set that is actually served.
+   */
+  private gateRoutableHostnames(hostnames: string[], suffix: string): string[] {
+    return hostnames.filter(
+      (hostname) =>
+        !isReservedHost(hostname, getPublicUrl(), suffix) &&
+        this.config.enableHttps &&
+        !isLocalhostDomain(hostname)
+    );
   }
 
   /**
@@ -4791,23 +4916,31 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       // racing it here could emit a block for a port that is about to change.
       throw new AppInProgressError(appName);
     }
+    // CHECK-then-ACT is not enough: a deploy starting immediately after the
+    // check would race this, and because DROP reuses freed ports the losing
+    // write can point a hostname at a port a different tenant's app now owns.
+    // Hold the guard for the duration, like every other lifecycle path.
+    this.appsInProgress.add(appName);
+    try {
+      // AppConfig is the source of truth for ports (see the two-phase
+      // reconciliation in syncStateWithConfigs); AppState is the fallback for
+      // an app whose config has not been written yet.
+      const port =
+        this.appConfigService?.getConfig(appName)?.port ?? this.stateManager?.getApp(appName)?.port;
+      if (!port) {
+        // Nothing is routed for an app with no port. Not an error: a stopped or
+        // never-deployed app's gate takes effect the next time it is routed.
+        this.logger.info(
+          `No route to reconfigure for '${appName}' - it has no assigned port`,
+          'ROUTER'
+        );
+        return;
+      }
 
-    // AppConfig is the source of truth for ports (see the two-phase
-    // reconciliation in syncStateWithConfigs); AppState is the fallback for an
-    // app whose config has not been written yet.
-    const port =
-      this.appConfigService?.getConfig(appName)?.port ?? this.stateManager?.getApp(appName)?.port;
-    if (!port) {
-      // Nothing is routed for an app with no port. Not an error: a stopped or
-      // never-deployed app's gate takes effect the next time it is routed.
-      this.logger.info(
-        `No route to reconfigure for '${appName}' - it has no assigned port`,
-        'ROUTER'
-      );
-      return;
+      await this.handleConfigureRoute(appName, port, { routeOnly: true });
+    } finally {
+      this.appsInProgress.delete(appName);
     }
-
-    await this.handleConfigureRoute(appName, port);
   }
 
   /**
@@ -4832,17 +4965,15 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         await this.stateManager?.setAccessGateUnapplied(config.name, undefined);
         continue;
       }
-      const hostnames = resolveGateHostnames(
-        config.name,
-        config.domains,
-        this.config.domainSuffix || 'localhost'
-      );
-      const verdict = this.assessAccessGateFor(config.name, hostnames, config.tls?.disabled);
+      const verdict = await this.assessAccessGate(config.name);
       if (!verdict.enforceable) {
         unenforceable.push(config.name);
         this.logger.error(describeAccessGateRefusal(config.name, verdict), 'ROUTER');
       }
-      await this.stateManager?.setAccessGateUnapplied(config.name, !verdict.enforceable);
+      await this.stateManager?.setAccessGateUnapplied(
+        config.name,
+        !(verdict.enforceable && ACCESS_GATE_ENFORCEMENT_AVAILABLE)
+      );
     }
 
     if (unenforceable.length > 0) {

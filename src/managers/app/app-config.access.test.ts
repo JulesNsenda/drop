@@ -20,11 +20,21 @@ import * as os from 'os';
 import * as yaml from 'yaml';
 import {
   AppConfigService,
+  configTierOverlap,
   type AppConfig,
   type AppAccessPolicy,
 } from './app-config';
 
 const POLICY: AppAccessPolicy = { mode: 'drop-users', allow: ['user-1'] };
+
+describe('config field tiers', () => {
+  it('SYSTEM and RESTRICTED stay disjoint', () => {
+    // A field in both is stripped twice and warns twice for one write. The
+    // doc says they must not overlap; without this nothing checks it, and the
+    // obvious "make access extra safe" edit is to add it to both lists.
+    expect(configTierOverlap()).toEqual([]);
+  });
+});
 
 describe('AppConfig.access containment', () => {
   let tempDir: string;

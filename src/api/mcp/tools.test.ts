@@ -27,6 +27,7 @@ import { getStateManager, resetStateManager } from '../../managers/app/state-man
 import { getAppConfigService, resetAppConfigService } from '../../managers/app/app-config';
 import { setApiRuntimeConfig } from '../runtime-config';
 import { setPlatformOps, resetPlatformOps, PlatformOps, AppInProgressError } from '../platform-ops';
+import { makePlatformOpsStub } from '../__testutils__/platform-ops';
 import { resetUploadPreflightState } from '../upload-preflight';
 import * as diskUtils from '../../utils/disk';
 import * as runtimeConfigModule from '../runtime-config';
@@ -47,18 +48,19 @@ function firstText(result: CallToolResult): string {
   return block.text;
 }
 
+// Delegates to the shared stub rather than hand-rolling the object: this copy
+// broke on three separate PlatformOps additions, which is exactly what
+// `__testutils__/platform-ops.ts` exists to prevent. The overrides below keep
+// this suite's own deliberate defaults.
 function makeOps(overrides?: Partial<PlatformOps>): PlatformOps {
-  return {
+  return makePlatformOpsStub({
     restartApp: jest.fn(),
     attachService: jest.fn(),
     detachService: jest.fn(),
     getServiceIntent: jest.fn(),
-    isAppInProgress: jest.fn().mockReturnValue(false), promoteApp: jest.fn(),
-    removeGroup: jest.fn().mockResolvedValue({ removed: [] }),
-    purgeAppArtifacts: jest.fn().mockResolvedValue(undefined),
-    reconfigureRoute: jest.fn().mockResolvedValue(undefined),
+    promoteApp: jest.fn(),
     ...overrides,
-  };
+  });
 }
 
 const alice: AuthContext = {
