@@ -130,12 +130,28 @@ jobs:
           VERSION: ${{ steps.gates.outputs.version }}
         run: |
           set -euo pipefail
+          # Match the version as a JS string literal in ANY quoting style.
+          # The old check grepped for a double-quoted "$VERSION" and so
+          # asserted the BUNDLER'S OUTPUT SHAPE rather than the property it
+          # cares about: src/dashboard's toolchain now emits backticks
+          # (`1.4.0`) where it used to emit double quotes, and the v1.4.0
+          # release failed on a bundle that was entirely correct.
+          #
+          # Reproducing that needs `npm ci` INSIDE src/dashboard -- a local
+          # build with no src/dashboard/node_modules silently resolves the
+          # root's hoisted deps, a different tree from the one CI installs,
+          # and passes.
+          #
+          # Still fails closed for DROP-077, the reason this gate exists: a
+          # bundle carrying a stale hardcoded version has no literal matching
+          # the version being released, whatever the quoting.
+          escaped=${VERSION//./\.}
           for bundle_dir in dist/dashboard/assets; do
-            if ! grep -qrF "\"$VERSION\"" "$bundle_dir"/*.js; then
-              echo "::error::$bundle_dir does not contain \"$VERSION\" -- the __DROP_VERSION__ define did not reach this bundle" >&2
+            if ! grep -qrE "[\"'\`]${escaped}[\"'\`]" "$bundle_dir"/*.js; then
+              echo "::error::$bundle_dir carries no string literal $VERSION -- the __DROP_VERSION__ define did not reach this bundle" >&2
               exit 1
             fi
-            echo "OK: $bundle_dir carries \"$VERSION\""
+            echo "OK: $bundle_dir carries the literal $VERSION"
           done
 
       - name: Extract release notes from CHANGELOG
