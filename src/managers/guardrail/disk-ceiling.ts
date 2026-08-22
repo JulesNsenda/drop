@@ -24,7 +24,7 @@ import * as path from 'path';
 import * as fsp from 'fs/promises';
 import type { Dirent } from 'fs';
 
-const MB = 1024 * 1024;
+export const MB = 1024 * 1024;
 /** Default ceiling per app, in MB. Generous — this catches a leak, not a spike. */
 const DEFAULT_MAX_APP_DISK_MB = 2048;
 const SWEEP_INTERVAL_MS = 60 * 60 * 1000;

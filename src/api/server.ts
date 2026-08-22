@@ -26,6 +26,7 @@ import {
   mcpRateLimitMiddleware,
   oauthRateLimitMiddleware,
   dbRateLimitMiddleware,
+  servicesRateLimitMiddleware,
 } from './middleware/rate-limit';
 import { securityHeadersMiddleware } from './middleware/security-headers';
 import { auditMiddleware, initializeAuditLog, closeAuditLog } from './middleware/audit';
@@ -43,6 +44,7 @@ import certsRoutes from './routes/certs';
 import deploysRoutes from './routes/deploys';
 import secretsRoutes from './routes/secrets';
 import dbRoutes from './routes/db';
+import extensionsRoutes from './routes/extensions';
 import webhooksRoutes from './routes/webhooks';
 import gitDeployRoutes from './routes/git-deploy';
 import adminRoutes from './routes/admin';
@@ -85,6 +87,10 @@ export interface ApiServerConfig {
   tempDirectory?: string;
   /** Cap on the compressed (as-uploaded) archive size for POST /apps/:name/source, in MB. */
   maxUploadSizeMb?: number;
+  /** Per-user Postgres database cap (passed through to runtime-config for GET /db/:name). */
+  maxDbsPerUser?: number;
+  /** Per-user managed-Redis cap (passed through to runtime-config for GET /db/:name). */
+  maxRedisPerUser?: number;
   /**
    * Override the resolved dashboard directory (normally dist/dashboard, or
    * src/dashboard as a dev fallback — see setupRoutes). Defaults to that
@@ -123,6 +129,8 @@ export class ApiServer {
       domainSuffix: this.config.domainSuffix,
       tempDirectory: this.config.tempDirectory,
       maxUploadSizeMb: this.config.maxUploadSizeMb,
+      maxDbsPerUser: this.config.maxDbsPerUser,
+      maxRedisPerUser: this.config.maxRedisPerUser,
       // Admin-stored override (PRD-041 settings UI) takes precedence over
       // DROP_PUBLIC_URL — see getPublicUrl()'s precedence. Reads whatever
       // the settings manager singleton has loaded so far: the real platform
@@ -271,6 +279,25 @@ export class ApiServer {
     // unconditionally — an auth-disabled (single-operator) box still gets it.
     v1.use('/db/*', dbRateLimitMiddleware());
 
+    // Backing-service attach/detach (DROP-151 Phase 2 attach, Phase 3 detach)
+    // provisions/deprovisions a real Postgres database+role or a Redis
+    // logical DB — the same shared-instance cost the /db/* bucket above
+    // exists for, but it gets its OWN dedicated bucket rather than sharing
+    // that one: a detach burst (or a client hammering a refusal) would
+    // otherwise 429 the database panel for the same client mid-incident —
+    // exactly the failure the /db/* bucket's own comment says it exists to
+    // prevent (security S15). Registered unconditionally, like the other
+    // dedicated buckets. Only the NESTED form is registered: verified
+    // empirically in this tree that '/apps/*/services' matches
+    // '/apps/x/services' but NOT '/apps/x/services/postgres', and the nested
+    // path is the only one with a handler — the collection route was
+    // deliberately not built (that data lives on GET /db/:name). Registering
+    // the non-nested form too would rate-limit a 404: these buckets run
+    // BEFORE the auth block below, so it would let an unauthenticated caller
+    // drain the services budget through a path that does nothing. Add it
+    // back if and when a collection route exists.
+    v1.use('/apps/*/services/*', servicesRateLimitMiddleware());
+
     // Apply auth middleware to protected routes when auth is enabled
     if (this.config.enableAuth && isAuthEnabled()) {
       // migrate-runtime is admin-only — register before the general /apps/* guard.
@@ -347,6 +374,22 @@ export class ApiServer {
       // interactiveSessionOnly guard ever runs; the route guard alone is not
       // enough since it only distinguishes session vs API key, not role.
       v1.use('/db/*', authMiddleware('user'));
+      // Extension catalog (DROP-151 Phase 1) — read-only, so 'readonly' is
+      // enough. Load-bearing: setupRoutes has NO default-deny, so without this
+      // line a new top-level path is anonymous even on an auth-enabled box.
+      //
+      // The `/*` form is deliberate and covers BOTH `/extensions` and
+      // `/extensions/<sub>` — verified empirically against this tree's Hono
+      // with the real nesting (`app.route('/api/v1', v1)` →
+      // `v1.route('/extensions', …)`). A bare `v1.use('/extensions', …)`
+      // alongside it is NOT harmless: it does not match the sub-path at all,
+      // and on the collection path both middlewares run, so every catalog
+      // request would pay two full auth passes (two JWT verifies, two user
+      // lookups, two `apiKey.lastUsed` writes). One line, the `/*` one.
+      //
+      // Testing this on a flat Hono app gives the opposite answer — matching
+      // depends on the `route()` nesting, so check it the way it is mounted.
+      v1.use('/extensions/*', authMiddleware('readonly'));
       v1.use('/webhooks/*', authMiddleware('admin'));
       v1.use('/git/deploy', authMiddleware('user'));
       v1.use('/git/redeploy/*', authMiddleware('user'));
@@ -363,6 +406,7 @@ export class ApiServer {
     v1.route('/deploys', deploysRoutes);
     v1.route('/secrets', secretsRoutes);
     v1.route('/db', dbRoutes);
+    v1.route('/extensions', extensionsRoutes);
     v1.route('/webhooks', webhooksRoutes);
     v1.route('/git', gitDeployRoutes);
     v1.route('/admin', adminRoutes);

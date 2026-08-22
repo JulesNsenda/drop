@@ -29,15 +29,10 @@ import type { AppRuntime } from '../../managers/runtime';
 import * as databaseModule from '../../managers/database';
 import type { DatabaseProvisioner } from '../../managers/database';
 import { setPlatformOps, resetPlatformOps, PlatformOps } from '../platform-ops';
+import { makePlatformOpsStub } from '../__testutils__/platform-ops';
 
 function makeOps(overrides?: Partial<PlatformOps>): PlatformOps {
-  return {
-    restartApp: jest.fn(),
-    isAppInProgress: jest.fn().mockReturnValue(false), promoteApp: jest.fn(),
-    removeGroup: jest.fn().mockResolvedValue({ removed: [] }),
-    purgeAppArtifacts: jest.fn().mockResolvedValue(undefined),
-    ...overrides,
-  };
+  return makePlatformOpsStub(overrides);
 }
 
 function makeMockRuntime(): AppRuntime {

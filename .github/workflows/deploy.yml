@@ -22,85 +22,60 @@ concurrency:
   group: deploy
   cancel-in-progress: false
 
+permissions:
+  contents: read
+
 jobs:
-  build-and-test:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 20
-          cache: npm
-
-      - name: Install server dependencies
-        run: npm ci
-
-      - name: Lint
-        run: npm run lint
-
-      # DROP-074. The remote deploy script is passed to ssh as ONE
-      # single-quoted argument, so a single apostrophe anywhere inside it —
-      # including in a comment (chown'd, install.sh's, exec'ing) — closes the
-      # string early and silently corrupts every command after it. That took
-      # production down: both provisioning arms and the fallback
-      # `systemctl restart` were mangled into unrecognisable commands, so the
-      # deploy stopped the service and never restarted it. Nothing in bash,
-      # YAML, or shellcheck catches it, because each half parses fine on its
-      # own. Fail the build instead.
-      - name: Deploy script must contain no apostrophes (DROP-074)
-        run: |
-          node -e '
-            const fs = require("fs");
-            const yaml = require("yaml");
-            const wf = yaml.parse(fs.readFileSync(".github/workflows/deploy.yml", "utf8"));
-            const step = wf.jobs.deploy.steps.find(s => s.name === "Deploy on server");
-            if (!step) { console.error("Deploy on server step not found"); process.exit(1); }
-            const quotes = (step.run.match(/’|\x27/g) || []).length;
-            if (quotes !== 2) {
-              console.error("Deploy step has " + quotes + " single-quotes; expected exactly 2 (the ssh argument delimiters).");
-              console.error("An apostrophe inside the remote script closes the quoted argument early and corrupts the deploy.");
-              step.run.split("\n").forEach((l, i) => { if (l.includes("\x27")) console.error("  line " + (i + 1) + ": " + l.trim()); });
-              process.exit(1);
-            }
-            console.log("Deploy script quoting OK (2 delimiters, no stray apostrophes).");
-          '
-
-      - name: Build server
-        run: npm run build:server
-
-      - name: Test
-        run: npm test
-
-      - name: Install dashboard dependencies
-        working-directory: src/dashboard
-        run: npm ci
-
-      - name: Build dashboard
-        working-directory: src/dashboard
-        run: npm run build
-
-      - name: Package artifact
-        run: |
-          tar -czf drop-dist.tar.gz dist/ install.sh package.json package-lock.json
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: drop-dist
-          path: drop-dist.tar.gz
-          retention-days: 1
+  # Same verified definition of "good" as ci.yml -- see _verify.yml. This is
+  # the only caller that needs the tarball, so it's the only one that sets
+  # upload-artifact: true.
+  verify:
+    uses: ./.github/workflows/_verify.yml
+    with:
+      upload-artifact: true
+    # No `secrets: inherit` -- _verify.yml declares no `secrets:` block and
+    # needs none. Passing secrets here would hand them to every future step
+    # added to that file, including two `npm ci` runs' worth of transitive
+    # postinstall scripts.
 
   deploy:
-    needs: build-and-test
+    needs: verify
     runs-on: ubuntu-latest
     environment: hetzner
     steps:
       - name: Download artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: drop-dist
+
+      # This protects TRANSPORT integrity, not build-time integrity: the
+      # digest is computed after `npm ci`, in the same job, on the same tree
+      # that produced the artifact, so a compromised transitive postinstall
+      # in the verify job's two `npm ci` runs would be faithfully hashed and
+      # certified along with everything else -- this step cannot catch that
+      # class of compromise. What it does catch is corruption or tampering
+      # introduced by the upload-artifact / download-artifact hop itself
+      # (the only untrusted transfer the tarball makes between being built
+      # and being shipped): the verify job hashes the tarball it just built,
+      # in the same job that built it, and this re-hashes the copy that came
+      # back through download-artifact, refusing to ship on any mismatch.
+      # Closing the build-time gap needs `npm ci --ignore-scripts` or build
+      # provenance attestation -- a separate change, not this one.
+      - name: Verify artifact digest
+        env:
+          EXPECTED_SHA256: ${{ needs.verify.outputs.tarball-sha256 }}
+        run: |
+          set -euo pipefail
+          if [ -z "$EXPECTED_SHA256" ]; then
+            echo "::error::verify job did not report a tarball digest -- refusing to deploy an unverified artifact." >&2
+            exit 1
+          fi
+          ACTUAL_SHA256=$(sha256sum drop-dist.tar.gz | cut -d' ' -f1)
+          if [ "$ACTUAL_SHA256" != "$EXPECTED_SHA256" ]; then
+            echo "::error::Artifact digest mismatch: verify job produced $EXPECTED_SHA256 but the downloaded tarball hashes to $ACTUAL_SHA256. Refusing to ship a tarball that does not match what was verified." >&2
+            exit 1
+          fi
+          echo "Artifact digest verified: $ACTUAL_SHA256"
 
       - name: Set up SSH key
         run: |
@@ -251,3 +226,92 @@ jobs:
       - name: Remove deploy key
         if: always()
         run: rm -f /tmp/deploy_key
+
+  # One mechanism, not two: files or updates a single GitHub issue rather than
+  # a webhook conditioned on a secret that may not exist.
+  #
+  # The condition distinguishes by JOB RESULT, not by concurrency policy.
+  # `cancel-in-progress: false` (see the block above) protects a deploy that
+  # is already IN PROGRESS -- it does not stop a second push from superseding
+  # a PENDING one: GitHub allows only one pending run per concurrency group,
+  # so a third push cancels a queued middle run before its `verify` job ever
+  # starts. That is an ordinary superseded-push event, same as ci.yml sees
+  # constantly, and a bare `!success()` (which is true for a cancelled run,
+  # since `!cancelled()` is not part of it) would file a false "Deploy
+  # failing" issue for it. A prior version of this comment claimed
+  # cancel-in-progress: false made that impossible; it does not -- it only
+  # covers the in-progress case.
+  #
+  # `verify.result == 'failure'` / `deploy.result == 'failure'` catch a real
+  # failure in either job. `deploy.result == 'cancelled'` catches the
+  # genuinely dangerous shape this job exists for: a deploy cancelled
+  # mid-flight, e.g. after `systemctl stop` but before the restart, leaving
+  # production down. `always()` is required for the job to evaluate at all
+  # when an upstream job failed or was cancelled -- the default `if` on a job
+  # with `needs:` is `success()`, which would skip this job in exactly the
+  # cases it must run.
+  #
+  # Deliberately NO branch restriction here, unlike ci.yml's notify job:
+  # deploy.yml triggers on main, develop AND feature/DROP-v2*, and the deploy
+  # job is not branch-gated on any of them -- a feature/DROP-v2* push ships
+  # to the same production box. "No PR noise" (the reason ci.yml restricts to
+  # main/develop) buys nothing here: this workflow has no pull_request
+  # trigger to filter out. Narrowing to main/develop would silently drop the
+  # exact scenario this job exists for.
+  notify:
+    needs: [verify, deploy]
+    if: ${{ always() && (needs.verify.result == 'failure' || needs.deploy.result == 'failure' || needs.deploy.result == 'cancelled') }}
+    runs-on: ubuntu-latest
+    # Job-level `permissions:` REPLACES the workflow default rather than
+    # extending it, so leaving `contents: read` out here (as a prior version
+    # of this job did) would run the token with NO contents scope at all,
+    # not with the top-of-file default. Neither step below reads repo
+    # content, but `contents: read` costs nothing and matches the workflow's
+    # own top-level default rather than silently dropping it for this job.
+    # `issues: write` is the only elevated scope this job needs.
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: File or update a deploy failure issue
+        env:
+          # NEVER interpolate ${{ }} directly into a run: block -- see
+          # release.yml's identical comment. A crafted commit message or
+          # branch name would otherwise execute on a runner in the same
+          # workflow that holds the deploy SSH key. Values arrive as env vars
+          # and are referenced as "$VAR" below instead.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          WORKFLOW: ${{ github.workflow }}
+          BRANCH: ${{ github.ref_name }}
+          SHA: ${{ github.sha }}
+          VERIFY_RESULT: ${{ needs.verify.result }}
+          DEPLOY_RESULT: ${{ needs.deploy.result }}
+        run: |
+          set -euo pipefail
+
+          LABEL="ci-failure"
+          TITLE="Deploy failing on $BRANCH"
+
+          BODY="$(cat <<EOF
+          Run: $RUN_URL
+          Workflow: $WORKFLOW
+          Branch: $BRANCH
+          Commit: $SHA
+          Job: verify=$VERIFY_RESULT deploy=$DEPLOY_RESULT
+          EOF
+          )"
+
+          # gh issue create --label fails outright if the label does not yet
+          # exist on the repo. Idempotent: a no-op once the label exists.
+          gh label create "$LABEL" --repo "$REPO" --color "d73a4a" \
+            --description "Automated CI/deploy failure notification" 2>/dev/null || true
+
+          EXISTING=$(gh issue list --repo "$REPO" --label "$LABEL" --state open --json number --jq '.[0].number // empty')
+
+          if [ -n "$EXISTING" ]; then
+            gh issue comment "$EXISTING" --repo "$REPO" --body "$BODY"
+          else
+            gh issue create --repo "$REPO" --title "$TITLE" --body "$BODY" --label "$LABEL"
+          fi

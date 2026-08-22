@@ -16,13 +16,18 @@ import { AuthContext, listUsers, getUserById } from '../middleware/auth';
 import { canAccess } from '../access';
 import { isValidAppName, validateAppName } from '../middleware/validate';
 import { getAppRuntime } from '../../managers/runtime';
-import { getPlatformOps, AppInProgressError, AppNeedsConfigError } from '../platform-ops';
+import {
+  getPlatformOps,
+  AppInProgressError,
+  AppNeedsConfigError,
+  type AttachableServiceId,
+} from '../platform-ops';
 import { getSecretManager } from '../../managers/secret';
 import { getDeployTracker } from '../../managers/deploy-tracker';
 import { migrateAppRuntime } from '../../managers/runtime/runtime-migrator';
 import { hasEnoughDisk, getMinFreeDiskMb } from '../../utils/disk';
 import { getStateManager, AppState } from '../../managers/app/state-manager';
-import { getAppConfigService } from '../../managers/app/app-config';
+import { getAppConfigService, getAppConfigServiceOrNull } from '../../managers/app/app-config';
 import { getDatabaseProvisioner } from '../../managers/database';
 import { getRedisProvisioner } from '../../managers/redis';
 import { getRouterService } from '../../core/router';
@@ -47,6 +52,7 @@ import {
 } from '../../core/upload-deploy';
 import { DeployRefusedError } from '../../managers/guardrail/deploy-breaker';
 import { QuotaExceededError } from '../../managers/guardrail/principal-quota';
+import { pruneOwnerDumpsToFit, predeleteMaxBytes } from '../../managers/guardrail/detach-limits';
 import { runUploadPreflight } from '../upload-preflight';
 import type { RuntimeType } from '../../managers/runtime/app-runtime.types';
 
@@ -749,17 +755,62 @@ apps.delete('/:name', async c => {
         );
         dbStatus = 'none';
       } else {
-        const outcome = await provisioner.backupAndDeleteAppDatabase(name);
-        if (outcome.dropped) {
+        // Meter, don't refuse: an unmetered create->attach->delete loop
+        // reproduces the exact per-owner dump-byte amplification DROP-151
+        // Phase 3's detach-limit budget exists to bound — a delete must never
+        // be BLOCKED by the budget, so this prunes THIS APP'S OWN oldest
+        // dumps first rather than checking the budget. Scoped to
+        // `dbNamePrefix` (this app only), never the
+        // owner's whole directory — pruning to make room for a delete must
+        // not evict a SIBLING app's only surviving dump (the cross-app-
+        // eviction finding the per-owner directory layout closes; see
+        // detach-limits.ts's module doc). Skipped for an ephemeral app: its
+        // dump is skipped below too via `skipBackup` (nothing new is being
+        // written that needs room made for it).
+        // Read defensively via the null-returning accessor — an
+        // uninitialised AppConfigService (tests / early failures) must NOT
+        // abort the real drop below; default to "not ephemeral" (pruning
+        // still proceeds, which is always safe).
+        const isEphemeral = getAppConfigServiceOrNull()?.getConfig(name)?.ephemeral === true;
+        if (!isEphemeral) {
+          try {
+            const ownerDir = provisioner.ownerDumpDir(app.userId);
+            const dbNamePrefix = provisioner.dbNameForApp(name);
+            await pruneOwnerDumpsToFit(ownerDir, predeleteMaxBytes(), 0, dbNamePrefix);
+          } catch (err) {
+            // pruneOwnerDumpsToFit is already best-effort per file; this only
+            // guards a directory-level throw from blocking the delete itself.
+            console.warn(`[apps.delete] dump-budget prune threw for ${name}:`, err);
+          }
+        }
+
+        const outcome = await provisioner.backupAndDeleteAppDatabase(name, {
+          skipBackup: isEphemeral,
+          ownerUserId: app.userId ?? null,
+        });
+        // Re-keyed on databaseDropped, not the combined `dropped` (DROP-151):
+        // `dropped` is true only when BOTH the database and its role were
+        // dropped, so a database-dropped-but-role-drop-failed outcome used to
+        // report 'retained' for a database that was actually gone and no
+        // longer tracked anywhere.
+        if (outcome.databaseDropped) {
           dbStatus = 'dropped';
         } else if (outcome.reason === 'no database provisioned') {
           dbStatus = 'none';
         } else {
           dbStatus = 'retained';
         }
+        // A database that was dropped but whose role survived is a tracked
+        // orphan, not a silent no-op — logged distinctly from the "nothing
+        // happened" warning below so it isn't lost in an identical message.
+        if (outcome.databaseDropped && !outcome.roleDropped) {
+          console.warn(
+            `[apps.delete] database dropped for ${name} but its role survived (orphaned): ${outcome.reason ?? 'unknown'}`
+          );
+        }
         // The full reason (which may embed raw pg_dump stderr, i.e. a path leak)
         // is logged server-side only — never returned to the client.
-        if (!outcome.dropped && outcome.reason !== 'no database provisioned') {
+        if (!outcome.databaseDropped && outcome.reason !== 'no database provisioned') {
           console.warn(`[apps.delete] database retained for ${name}: ${outcome.reason}`);
         }
       }
@@ -1048,6 +1099,216 @@ apps.post('/:name/restart', async c => {
 });
 
 /**
+ * Backing services attachable via POST /:name/services/:id — a closed set, not
+ * "any string". Mirrors `AttachableServiceId` (platform-ops.ts); kept as a
+ * separate literal array here (rather than importing a value from a type-only
+ * module) so an unrecognized id is rejected with a clear message before ever
+ * reaching the platform op.
+ */
+const ATTACHABLE_SERVICE_IDS = ['postgres', 'redis'] as const;
+
+// POST /apps/:name/services/:id - Attach a backing service (DROP-151 Phase 2).
+// Quota check -> provision -> persist intent -> restart; see
+// DropPlatform.attachService for the full ordering and its refusal reasons.
+// No detach here (Phase 3) and no GET collection route — that data lives on
+// GET /db/:name instead (see db.ts).
+apps.post('/:name/services/:id', async c => {
+  const auth = (c.get as Function)('auth') as AuthContext | undefined;
+  const name = c.req.param('name');
+  const serviceId = c.req.param('id');
+
+  if (!(ATTACHABLE_SERVICE_IDS as readonly string[]).includes(serviceId)) {
+    throw new ValidationError(
+      `Unknown service '${serviceId}' — must be one of: ${ATTACHABLE_SERVICE_IDS.join(', ')}`
+    );
+  }
+
+  const stateManager = getStateManager();
+  const app = stateManager.getApp(name);
+
+  if (!app || !canAccess(auth, app)) {
+    throw new NotFoundError(`Application '${name}' not found`);
+  }
+
+  const ops = getPlatformOps();
+  if (!ops) {
+    return c.json(error(ErrorCodes.SERVICE_UNAVAILABLE, 'Platform operations unavailable'), 503);
+  }
+
+  try {
+    const result = await ops.attachService(name, serviceId as AttachableServiceId);
+    if (!result.attached) {
+      // 'service-unavailable' is not a conflict — the instance simply has no
+      // such service, permanently and correctly. 503 says "not here", 409
+      // would say "you asked at a bad time" and invite a pointless retry.
+      const status = result.reason === 'service-unavailable' ? 503 : 409;
+      const code =
+        result.reason === 'service-unavailable'
+          ? ErrorCodes.SERVICE_UNAVAILABLE
+          : ErrorCodes.CONFLICT;
+      return c.json(error(code, result.detail, { reason: result.reason, quota: result.quota }), status);
+    }
+
+    await logActivityFor(auth, {
+      action: 'attach-service',
+      appName: name,
+      detail: serviceId,
+    });
+
+    // envVarNames only — NEVER the provisioned values. The Postgres binding
+    // is a DSN containing the role's plaintext password.
+    return c.json(
+      success({ message: `${serviceId} attached to '${name}'`, envVarNames: result.envVarNames })
+    );
+  } catch (err) {
+    if (err instanceof AppInProgressError) {
+      return c.json(error(ErrorCodes.CONFLICT, err.message), 409);
+    }
+    // The restart at the end of an attach runs the secret preflight, so this
+    // is reachable — and it matters more here than on a plain restart: by the
+    // time it throws, the database and the persisted intent are REAL. Without
+    // this branch the caller gets an opaque 500 and never learns which
+    // secrets to set, while a database sits provisioned against their quota.
+    // The activity entry below is deliberately written for this case too, so
+    // an attach that provisioned real resources is never invisible in the
+    // audit trail just because the restart parked the app.
+    if (err instanceof AppNeedsConfigError) {
+      await logActivityFor(auth, { action: 'attach-service', appName: name, detail: serviceId });
+      return c.json(
+        error(
+          ErrorCodes.CONFLICT,
+          `'${serviceId}' was attached to '${name}', but the app needs configuration before it ` +
+            `can start — set required secret(s): ${err.missingSecrets.join(', ')}, then restart`
+        ),
+        409
+      );
+    }
+    // Never return err.message here: the redis tombstone arm
+    // (RedisProvisioner.provisionAppRedis) throws with a still-failing
+    // client's connection error embedded, and a pg error can embed the
+    // Postgres socket path under dropRoot — both leak server filesystem/
+    // network layout to a `user`-role tenant. Same posture as the detach
+    // route's catch below (deliberately hardened there first) — log the
+    // detail server-side, return a fixed message.
+    console.warn(`[apps.attach] '${name}'/${serviceId} threw:`, err);
+    return c.json(error(ErrorCodes.INTERNAL_ERROR, 'Failed to attach service'), 500);
+  }
+});
+
+// DELETE /apps/:name/services/:id - Detach a backing service (DROP-151 Phase 3).
+// Persist 'detached' intent -> stop if live -> dump-then-drop (postgres) or
+// flush-then-free (redis) -> restart iff the app was running; see
+// DropPlatform.detachService for the full guard ordering and refusal reasons.
+// Same allowlist + canAccess posture as the attach route above.
+apps.delete('/:name/services/:id', async c => {
+  const auth = (c.get as Function)('auth') as AuthContext | undefined;
+  const name = c.req.param('name');
+  const serviceId = c.req.param('id');
+
+  if (!(ATTACHABLE_SERVICE_IDS as readonly string[]).includes(serviceId)) {
+    throw new ValidationError(
+      `Unknown service '${serviceId}' — must be one of: ${ATTACHABLE_SERVICE_IDS.join(', ')}`
+    );
+  }
+
+  const stateManager = getStateManager();
+  const app = stateManager.getApp(name);
+
+  if (!app || !canAccess(auth, app)) {
+    throw new NotFoundError(`Application '${name}' not found`);
+  }
+
+  const ops = getPlatformOps();
+  if (!ops) {
+    return c.json(error(ErrorCodes.SERVICE_UNAVAILABLE, 'Platform operations unavailable'), 503);
+  }
+
+  try {
+    const result = await ops.detachService(name, serviceId as AttachableServiceId);
+
+    if (!result.detached) {
+      // detach-limit is 429 + Retry-After, not 409 — the client's one useful
+      // fact is WHEN to retry (cooldown) or that pruning, not waiting, is
+      // what unblocks it (dump-budget, no retryAfterSeconds at all).
+      if (result.reason === 'detach-limit') {
+        if (result.limit === 'cooldown' && result.retryAfterSeconds !== undefined) {
+          c.header('Retry-After', String(result.retryAfterSeconds));
+        }
+        return c.json(
+          error(ErrorCodes.RATE_LIMITED, result.detail, {
+            reason: result.reason,
+            limit: result.limit,
+            retryAfterSeconds: result.retryAfterSeconds,
+          }),
+          429
+        );
+      }
+
+      // backup-failed/deprovision-failed happen AFTER 'detached' intent was
+      // already persisted (the persist-first invariant) — real state changed
+      // even though the deprovision itself didn't complete, so this is
+      // audited the same way the attach route's provisioned-but-restart-
+      // failed arm is. A REPORTED redis flush failure is no longer a refusal
+      // at all — see 'flushed: false' on the success branch below:
+      // the allocation was freed and the number tombstoned either way, so a
+      // reported-but-failed flush is a real detach, not a refusal, and is
+      // audited unconditionally alongside every other success.
+      // 'deprovision-failed' is what remains a genuine refusal here: the
+      // runtime failing to stop before deprovisioning ever ran, or a THROWN
+      // (not just reported) redis error.
+      if (result.reason === 'backup-failed' || result.reason === 'deprovision-failed') {
+        await logActivityFor(auth, { action: 'detach-service', appName: name, detail: serviceId });
+      }
+
+      // 'service-unavailable' is a permanent "not here" -> 503. 'not-found' is
+      // a defense-in-depth arm (the app lookup above already 404s on a
+      // missing state entry; this only fires on a race) -> 404 for the same
+      // reason attach's own missing-app case is a 404, not a 409. Everything
+      // else (group-app, no-app-config, credentials-missing, backup-failed,
+      // deprovision-failed) -> 409, matching attach's refusal mapping.
+      const status =
+        result.reason === 'service-unavailable' ? 503 : result.reason === 'not-found' ? 404 : 409;
+      const code =
+        result.reason === 'service-unavailable'
+          ? ErrorCodes.SERVICE_UNAVAILABLE
+          : result.reason === 'not-found'
+            ? ErrorCodes.NOT_FOUND
+            : ErrorCodes.CONFLICT;
+      // backup-failed/deprovision-failed is exactly the arm where durable
+      // state already changed (the intent was persisted) and the app may be
+      // down — dropping `restart`/`missingSecrets` here left the client with
+      // no way to tell "detach refused, app untouched" from "detach refused,
+      // app failed to come back up and needs a secret".
+      const details: Record<string, unknown> = { reason: result.reason };
+      if (result.reason === 'backup-failed' || result.reason === 'deprovision-failed') {
+        details.restart = result.restart;
+        if (result.restart === 'needs-config') {
+          details.missingSecrets = result.missingSecrets;
+        }
+      }
+      return c.json(error(code, result.detail, details), status);
+    }
+
+    await logActivityFor(auth, { action: 'detach-service', appName: name, detail: serviceId });
+
+    // The result already carries only a BASENAME for backup.file (platform.ts
+    // strips the full path/reason before returning) — safe to return verbatim.
+    return c.json(success(result));
+  } catch (err) {
+    if (err instanceof AppInProgressError) {
+      return c.json(error(ErrorCodes.CONFLICT, err.message), 409);
+    }
+    // Never return err.message here: a pg error can embed the Postgres
+    // socket path under dropRoot, and an fs error can embed the pre-delete
+    // dump path — both leak server filesystem layout to a `user`-role
+    // tenant. Same posture as the delete route's refusal to return
+    // outcome.reason — log the detail server-side, return a fixed message.
+    console.warn(`[apps.detach] '${name}'/${serviceId} threw:`, err);
+    return c.json(error(ErrorCodes.INTERNAL_ERROR, 'Failed to detach service'), 500);
+  }
+});
+
+/**
  * Scopes an admin may grant via PUT /:name/capabilities. Deliberately a fixed
  * allowlist (not "any string") — this is the only write path that populates
  * `grantedApiScopes`, which platform.ts mints into a real DROP_API_KEY, so an
@@ -1086,7 +1347,13 @@ apps.put('/:name/capabilities', async c => {
     throw new ValidationError(`Unknown scope(s): ${unknownScopes.join(', ')}`);
   }
 
-  const updatedConfig = await getAppConfigService().updateConfig(name, {
+  // grantedApiScopes is a SYSTEM_CONFIG_FIELD — updateConfig strips it, so
+  // this uses its unstripped mirror. updateSystemConfig (not
+  // upsertSystemConfig): the null-on-missing check has to happen INSIDE the
+  // write, or a hasConfig() pre-check would race a concurrent deleteConfig
+  // and an upsert would mint exactly the skeleton config this refusal exists
+  // to prevent.
+  const updatedConfig = await getAppConfigService().updateSystemConfig(name, {
     grantedApiScopes: scopes,
   });
   if (!updatedConfig) {

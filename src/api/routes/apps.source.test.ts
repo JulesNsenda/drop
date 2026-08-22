@@ -18,6 +18,7 @@ import { createUser, resetAuth } from '../middleware/auth';
 import { getTestToken } from '../__testutils__/auth';
 import { getStateManager, resetStateManager } from '../../managers/app/state-manager';
 import { setPlatformOps, resetPlatformOps, PlatformOps } from '../platform-ops';
+import { makePlatformOpsStub } from '../__testutils__/platform-ops';
 import * as diskUtils from '../../utils/disk';
 import * as runtimeConfigModule from '../runtime-config';
 import * as uploadDeployModule from '../../core/upload-deploy';
@@ -28,13 +29,7 @@ import { resetRateLimits } from '../middleware/rate-limit';
 type DeployMock = jest.Mock;
 
 function makeOps(overrides?: Partial<PlatformOps>): PlatformOps {
-  return {
-    restartApp: jest.fn(),
-    isAppInProgress: jest.fn().mockReturnValue(false), promoteApp: jest.fn(),
-    removeGroup: jest.fn().mockResolvedValue({ removed: [] }),
-    purgeAppArtifacts: jest.fn().mockResolvedValue(undefined),
-    ...overrides,
-  };
+  return makePlatformOpsStub(overrides);
 }
 
 describe('POST /apps/:name/source (upload deploy)', () => {

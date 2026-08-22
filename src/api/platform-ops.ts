@@ -14,6 +14,26 @@
  */
 
 import { AppProcessInfo } from '../managers/runtime';
+// Only the three the PlatformOps interface below actually references —
+// DetachServiceOutcome/DetachServiceRestartOutcome are re-exported (below)
+// but not used in this file's own signatures.
+import type { AttachableServiceId, AttachServiceResult, DetachServiceResult } from './services-wire.types';
+
+/**
+ * The attach/detach wire contract itself lives in `services-wire.types.ts` —
+ * a leaf module with zero imports, so a type-only consumer (the dashboard,
+ * across the package boundary) doesn't have to resolve this file's own
+ * `../managers/runtime` import graph just to see the result shapes.
+ * Re-exported here so every existing importer of `platform-ops.ts` is
+ * unaffected by the split.
+ */
+export type {
+  AttachableServiceId,
+  AttachServiceResult,
+  DetachServiceOutcome,
+  DetachServiceRestartOutcome,
+  DetachServiceResult,
+} from './services-wire.types';
 
 /** Thrown by platform ops when the app has a deploy/build/restart in flight. */
 export class AppInProgressError extends Error {
@@ -55,6 +75,46 @@ export interface PlatformOps {
    * to a fresh start. Rejects with AppInProgressError when the app is busy.
    */
   restartApp(appName: string): Promise<AppProcessInfo>;
+
+  /**
+   * Attach a backing service (postgres|redis) to an app: quota check,
+   * provision, persist the owner's explicit intent (`AppConfig.services`,
+   * DROP-151), then restart so the env var is actually injected. Resolves
+   * only once that restart resolves — a caller that gets `attached: true`
+   * back has a running app with the var set, not just a provisioned service.
+   *
+   * Rejects with AppInProgressError when the app already has a deploy/build/
+   * restart in flight — the whole operation is guarded, not just the restart
+   * at the end, so provisioning can never race a concurrent deploy for the
+   * same app.
+   */
+  attachService(appName: string, serviceId: AttachableServiceId): Promise<AttachServiceResult>;
+
+  /**
+   * Detach a backing service (postgres|redis): persist the owner's
+   * 'detached' intent BEFORE any destruction (so a crash or a partial
+   * deprovision still leaves a retriable, honest state — see the detach
+   * plan's "persist intent first" invariant), stop the app if a runtime
+   * process is actually live, dump-then-drop (postgres) or flush-then-free
+   * (redis), then restart iff the app was running so the env var actually
+   * drops. Resolves once that conditional restart settles (or is skipped).
+   *
+   * Refusals are RETURNED (see `DetachServiceResult`), never thrown — the
+   * one exception is `AppInProgressError` for a concurrent operation on the
+   * same app, matching `attachService`'s own contract. No owner-level lock:
+   * detach only ever FREES quota, so every interleaving with a concurrent
+   * attach errs toward over-refusal, never over-admission.
+   */
+  detachService(appName: string, serviceId: AttachableServiceId): Promise<DetachServiceResult>;
+
+  /**
+   * The owner's persisted attach/detach intent for one service on one app
+   * (`AppConfig.services[serviceId]`), or undefined when no intent has ever
+   * been recorded. On the seam so the secrets preflight gate and any other
+   * route-level reader has one authority for the precedence rule,
+   * instead of each re-deriving it from a fresh `getAppConfigService()` read.
+   */
+  getServiceIntent(appName: string, serviceId: AttachableServiceId): 'attached' | 'detached' | undefined;
 
   /**
    * Synchronous check for whether the app currently has a build/restart/

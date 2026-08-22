@@ -14,6 +14,10 @@ import { NotFoundError } from '../middleware/error';
 import type { AuthContext } from '../middleware/auth';
 import { canAccess, interactiveSessionOnly } from '../access';
 import { getStateManager } from '../../managers/app/state-manager';
+import { getAppConfigServiceOrNull } from '../../managers/app/app-config';
+import { getDatabaseProvisioner } from '../../managers/database';
+import { getRedisProvisioner } from '../../managers/redis';
+import { getMaxDbsPerUser, getMaxRedisPerUser } from '../runtime-config';
 import { validateAppName } from '../middleware/validate';
 import {
   getOverview,
@@ -91,7 +95,50 @@ function resolveApp(c: Context, auth: AuthContext | undefined): string {
   return name;
 }
 
-// GET /db/:name - database overview (provisioned?, size, table count)
+/**
+ * Per-app quota state for one backing service — DROP-151 Phase 2, read side
+ * for the (not-yet-built) Attach button. Mirrors `DropPlatform.checkDbQuota`/
+ * `checkRedisQuota` (`platform.ts`), which are private to the platform and
+ * unreachable from a route file — reimplemented here against the same public
+ * accessors (`getStateManager`, `getDatabaseProvisioner`/`getRedisProvisioner`,
+ * `getMaxDbsPerUser`/`getMaxRedisPerUser`) rather than duplicating the
+ * *enforcement*: this only computes what to DISPLAY, never gates an attempt.
+ *
+ * `constrained` preserves the two quotas' deliberately divergent ownerless
+ * rule (see checkDbQuota's own comment for why). Stated precisely, because the
+ * obvious summary of it is wrong:
+ *
+ * - `userId === undefined` — the ordinary ownerless app (a
+ *   `DROP_API_KEY`/`cli-local` deploy): BOTH report `constrained: false`.
+ *   Postgres because `Boolean(undefined)` is false, Redis because
+ *   `undefined !== undefined` is false. The two agree here.
+ * - `userId === ''` — the empty-string case is where they actually diverge:
+ *   Postgres stays `false` (`Boolean('')`), Redis flips to `true`
+ *   (`'' !== undefined`).
+ *
+ * Both cases are pinned by tests in `db.routes.test.ts`. Do not normalise the
+ * two to agree — that would silently change enforcement in
+ * checkDbQuota/checkRedisQuota too.
+ */
+export function serviceQuotaState(
+  ownerUserId: string | undefined,
+  limit: number,
+  applicable: boolean,
+  isProvisioned: ((appName: string) => boolean) | undefined
+): { used: number; limit: number; constrained: boolean } {
+  const constrained = applicable && limit > 0 && Boolean(isProvisioned);
+  if (!constrained) {
+    return { used: 0, limit, constrained: false };
+  }
+  const used = getStateManager()
+    .getAllApps()
+    .filter((a) => a.userId === ownerUserId && isProvisioned!(a.name)).length;
+  return { used, limit, constrained: true };
+}
+
+// GET /db/:name - database overview (provisioned?, size, table count), plus
+// the DROP-151 Phase 2 additions the (future) Attach UI needs: whether Redis
+// is provisioned, the persisted attach/detach intent, and per-app quota state.
 db.get('/:name', async c => {
   const auth = (c.get as (k: string) => AuthContext | undefined)('auth');
 
@@ -111,11 +158,80 @@ db.get('/:name', async c => {
   // reads would evict the platform's entire deploy/login/delete history
   // within minutes of a dashboard tab being left open on this tab. Do not add
   // one.
+  //
+  // The Phase-2 fields (redis/services/ephemeral/quota) are computed HERE,
+  // outside the Postgres `try` below, not inside it as before. They never
+  // depend on `getOverview` succeeding, but living inside the try meant a
+  // `DbUnavailableError` — in particular `database-missing`, which the
+  // partial-detach retry state produces — hid them entirely and the route
+  // 503'd, leaving the dashboard with no Detach/retry affordance to render at
+  // all.
+  const app = getStateManager().getApp(name);
+  const ownerUserId = app?.userId;
+
+  // Read via the null-returning accessor, same shape as apps.ts's own
+  // ephemeral read (~774): an uninitialised AppConfigService (tests / early
+  // failures) must not turn this route's graceful 404/503/200 into an
+  // opaque 500. `services`/`ephemeral` default to "no intent" / "not
+  // ephemeral" on failure — the same default `config?.ephemeral === true`
+  // degrades to in platform.ts:5857.
+  const appConfig = getAppConfigServiceOrNull()?.getConfig(name);
+  const services: Record<string, 'attached' | 'detached'> = appConfig?.services ?? {};
+  const ephemeral = appConfig?.ephemeral === true;
+
+  const redisProvisioner = getRedisProvisioner();
+  const dbProvisioner = getDatabaseProvisioner();
+  const serviceFields = {
+    redis: { provisioned: redisProvisioner?.isProvisioned(name) ?? false },
+    // The owner's persisted attach/detach intent, if any (platform.ts's
+    // appServiceIntent reads the same field). Absent keys mean "no
+    // explicit intent" — precedence falls through to the manifest/
+    // inference, exactly as appNeedsDatabase/appNeedsRedis do.
+    services,
+    // Whether this app is ephemeral (mirrors `config?.ephemeral === true` in
+    // platform.ts's `detachService`, which passes it straight through as
+    // `skipBackup`) — the Detach confirm dialog needs this to stop promising
+    // a Postgres backup an ephemeral app's detach never actually writes.
+    ephemeral,
+    quota: {
+      postgres: serviceQuotaState(
+        ownerUserId,
+        getMaxDbsPerUser(),
+        Boolean(ownerUserId),
+        dbProvisioner ? (n) => dbProvisioner.isProvisioned(n) : undefined
+      ),
+      redis: serviceQuotaState(
+        ownerUserId,
+        getMaxRedisPerUser(),
+        ownerUserId !== undefined,
+        redisProvisioner ? (n) => redisProvisioner.isProvisioned(n) : undefined
+      ),
+    },
+  };
+
   try {
     const overview = await getOverview(name);
-    return c.json(success(overview));
+    return c.json(success({ ...overview, ...serviceFields }));
   } catch (err) {
     if (err instanceof DbUnavailableError) {
+      // `database-missing` (SQLSTATE 3D000 — the database named in stored
+      // credentials no longer exists) is a RENDERABLE state, not a dead end:
+      // it is exactly what a partial Postgres detach leaves behind before a
+      // retry converges (or an out-of-band drop). A 503 here used to replace
+      // the whole DatabaseTab with an error card and hide the repair
+      // affordance the intent field exists to enable — so this reports 200
+      // with `provisioned: false` plus a `broken` marker instead of throwing
+      // the request away. Every other DbUnavailableError reason keeps its
+      // existing 404/503 mapping unchanged.
+      if (err.reason === 'database-missing') {
+        return c.json(
+          success({
+            provisioned: false,
+            broken: 'database-missing' as const,
+            ...serviceFields,
+          })
+        );
+      }
       return respondDbUnavailable(c, err);
     }
     throw err;

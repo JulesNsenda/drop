@@ -1,8 +1,6 @@
 name: CI
 
 on:
-  push:
-    branches: [main, develop]
   pull_request:
     branches: [main, develop]
 
@@ -10,34 +8,25 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 jobs:
-  build-and-test:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 20
-          cache: npm
-
-      - name: Install server dependencies
-        run: npm ci
-
-      - name: Lint
-        run: npm run lint
-
-      - name: Build server
-        run: npm run build:server
-
-      - name: Test
-        run: npm test
-
-      - name: Install dashboard dependencies
-        working-directory: src/dashboard
-        run: npm ci
-
-      - name: Build dashboard
-        working-directory: src/dashboard
-        run: npm run build
+  verify:
+    uses: ./.github/workflows/_verify.yml
+    # No `secrets: inherit` -- _verify.yml declares no `secrets:` block and
+    # needs none. Passing secrets here would hand them to every future step
+    # added to that file, including two `npm ci` runs' worth of transitive
+    # postinstall scripts, on every PR (including from forks).
+    # upload-artifact defaults to false: CI never ships anything, so there is
+    # nothing here worth packaging.
+    #
+    # No `on: push` and no notify job here: this workflow used to trigger on
+    # push to main/develop too, which duplicated deploy.yml's identical
+    # _verify.yml call for zero extra signal (deploy.yml already runs on a
+    # superset of branches) and raced deploy.yml's notify job over the same
+    # ci-failure label -- both queried it, both saw nothing, both filed,
+    # after which the second issue's `.[0]` comment attached a DEPLOY failure
+    # to an issue titled "CI failing". Now pull_request-only: a PR's own
+    # checks UI already surfaces a failure to the person who can fix it, and
+    # deploy.yml's notify job is the one mechanism for push failures.

@@ -1,5 +1,5 @@
 /**
- * RFC 7009 tests for POST /oauth/revoke (DROP-131 Gate-2 pass-2 finding).
+ * RFC 7009 tests for POST /oauth/revoke.
  *
  * Starts a REAL ApiServer bound to a real TCP port (auth ENABLED), mirroring
  * `oauth.flow.test.ts`'s harness — the interesting behaviour here (no
@@ -17,6 +17,7 @@ import { ApiServer } from '../server';
 import { getStateManager, resetStateManager } from '../../managers/app/state-manager';
 import { getSettingsManager, resetSettingsManager } from '../../managers/settings/settings-manager';
 import { setPlatformOps, resetPlatformOps, PlatformOps } from '../platform-ops';
+import { makePlatformOpsStub } from '../__testutils__/platform-ops';
 import { resetRateLimits } from '../middleware/rate-limit';
 import { resetUploadPreflightState } from '../upload-preflight';
 import { createUser, resetAuth } from '../middleware/auth';
@@ -33,14 +34,7 @@ interface ApiEnvelope<T> {
 }
 
 function makeOps(overrides?: Partial<PlatformOps>): PlatformOps {
-  return {
-    restartApp: jest.fn(),
-    isAppInProgress: jest.fn().mockReturnValue(false),
-    promoteApp: jest.fn(),
-    removeGroup: jest.fn().mockResolvedValue({ removed: [] }),
-    purgeAppArtifacts: jest.fn().mockResolvedValue(undefined),
-    ...overrides,
-  };
+  return makePlatformOpsStub(overrides);
 }
 
 function makePkcePair(): { codeVerifier: string; codeChallenge: string } {

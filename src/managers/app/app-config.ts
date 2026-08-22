@@ -189,7 +189,46 @@ export interface AppConfig {
    * standalone apps. See docs/plans/2026-07-12-monorepo-multi-service.md (M2).
    */
   group?: string;
+  /**
+   * The owner's explicit attach/detach intent per backing service, keyed by the
+   * catalog's extension id ('postgres' | 'redis'). SYSTEM-OWNED: written only by
+   * the attach/detach routes from fixed literals, NEVER from a request body.
+   * That containment is complete by construction today — the one route that
+   * accepts a body goes through `pickUpdatableFields` (apps.ts), an ALLOWLIST
+   * over `UPDATABLE_APP_FIELDS` that writes `AppState`, not `AppConfig`. Keep it
+   * that way: do not add a route that spreads a body into upsert/updateConfig.
+   */
+  services?: Record<string, 'attached' | 'detached'>;
+  /**
+   * When each backing service's detach cooldown last fired (epoch ms),
+   * keyed the same way `services` is (by the catalog's extension id).
+   * SYSTEM-OWNED, written only by `setServiceIntent` alongside `services` —
+   * beside it rather than in a separate store so it survives restarts and
+   * resets for free in tests. Per-SERVICE, not one shared per-app value: a
+   * single epoch let detaching one service open a cooldown window that also
+   * 429'd an unrelated service's detach for the same app. Absent until a
+   * given service's first detach.
+   */
+  lastDetachAt?: Record<string, number>;
 }
+
+/**
+ * Platform-controlled AppConfig fields — never settable from a request body.
+ * `upsertConfig`/`updateConfig` (the general-purpose writers) strip these at
+ * runtime regardless of what their caller passes; `upsertSystemConfig` and
+ * `setServiceIntent` are the only writers allowed to touch them.
+ */
+const SYSTEM_CONFIG_FIELDS = [
+  'services',
+  'grantedApiScopes',
+  'agentCreated',
+  'ephemeral',
+  'ephemeralPrincipalId',
+  'expiresAt',
+  'lastDetachAt',
+] as const satisfies readonly (keyof AppConfig)[];
+
+type SystemConfigField = (typeof SYSTEM_CONFIG_FIELDS)[number];
 
 export interface AppConfigServiceOptions {
   configDir: string; // e.g., /var/drop/data/appconf/webapps
@@ -372,21 +411,85 @@ export class AppConfigService {
   }
 
   /**
-   * Create or update an app config
+   * Strips SYSTEM_CONFIG_FIELDS from a general-purpose write's updates at
+   * runtime. The `Omit<AppConfig, SystemConfigField>` parameter type on
+   * upsertConfig/updateConfig is documentation only — an excess-property
+   * check fires on a fresh object literal but not on a cast or a spread, so
+   * this is the actual guarantee that a system field can never reach
+   * saveConfig through the general-purpose writers, however a caller got
+   * there.
    */
-  async upsertConfig(appName: string, updates: Partial<AppConfig>): Promise<AppConfig> {
+  private stripSystemFields(appName: string, updates: Partial<AppConfig>): Partial<AppConfig> {
+    const stripped: Partial<AppConfig> = { ...updates };
+    const dropped: string[] = [];
+    for (const field of SYSTEM_CONFIG_FIELDS) {
+      if (field in stripped) {
+        delete stripped[field];
+        dropped.push(field);
+      }
+    }
+    if (dropped.length > 0) {
+      console.warn(
+        `[app-config] stripped system field(s) [${dropped.join(', ')}] from a general-purpose ` +
+          `config write for '${appName}' — use upsertSystemConfig/setServiceIntent instead`
+      );
+    }
+    return stripped;
+  }
+
+  /**
+   * The one read-merge-save body shared by all four general-purpose/system
+   * writers plus setServiceIntent below — previously reimplemented once per
+   * writer as four near-identical copies, orthogonal in exactly two axes:
+   * whether a missing config is created (`create`) or refused with null, and
+   * whether SYSTEM_CONFIG_FIELDS are stripped (`system`). `updates` may be an
+   * updater function instead of a plain object so a caller (setServiceIntent)
+   * can merge against the CURRENT config read inside the write chain rather
+   * than a snapshot taken before it settled — same reason enqueueWrite's own
+   * doc gives for reading `existing` inside the op.
+   *
+   * `create: true` forces `type`/`runtime`/`createdAt` exactly as
+   * upsertConfig/upsertSystemConfig always have — `createdAt` in particular
+   * IGNORES any caller-supplied value and is always `existing?.createdAt ??
+   * now`. `create: false` (updateConfig/updateSystemConfig/setServiceIntent)
+   * applies none of that: whatever `updates` carries for those fields (or
+   * nothing) passes straight through unchanged, exactly as updateConfig
+   * always has. This split is deliberate, not an oversight — collapsing it to
+   * one behaviour would silently change what an explicit `updates.createdAt`
+   * does on the update path.
+   */
+  private write(
+    appName: string,
+    updates: Partial<AppConfig> | ((existing: AppConfig | undefined) => Partial<AppConfig>),
+    opts: { create: boolean; system: boolean }
+  ): Promise<AppConfig | null> {
     return this.enqueueWrite(appName, async () => {
       const existing = this.configs.get(appName);
+      if (!existing && !opts.create) return null;
+
+      const rawUpdates = typeof updates === 'function' ? updates(existing) : updates;
+      const safeUpdates = opts.system ? rawUpdates : this.stripSystemFields(appName, rawUpdates);
       const now = new Date().toISOString();
 
-      const config: AppConfig = {
+      // Cast, not a type hole: `opts.create` is a runtime boolean, not a
+      // literal type, so TS can't narrow the ternary spread's two branches
+      // into a definitely-required `type`/`runtime`/`createdAt` — but the
+      // invariant holds either way. `create: true` always sets all three
+      // right here; `create: false` only reaches this line when `existing`
+      // is defined (guarded above), so they already came from its own
+      // spread.
+      const config = {
         ...existing,
-        ...updates,
+        ...safeUpdates,
         name: appName, // Ensure name is always correct
-        type: updates.type ?? existing?.type ?? 'unknown',
-        runtime: updates.runtime ?? existing?.runtime ?? 'pm2',
-        createdAt: existing?.createdAt ?? now,
-      };
+        ...(opts.create
+          ? {
+              type: safeUpdates.type ?? existing?.type ?? 'unknown',
+              runtime: safeUpdates.runtime ?? existing?.runtime ?? 'pm2',
+              createdAt: existing?.createdAt ?? now,
+            }
+          : {}),
+      } as AppConfig;
 
       await this.saveConfig(config);
       return config;
@@ -394,22 +497,91 @@ export class AppConfigService {
   }
 
   /**
-   * Update specific fields of an app config
+   * Create or update an app config with owner/caller-supplied fields. Never
+   * accepts SYSTEM_CONFIG_FIELDS — see upsertSystemConfig for those.
    */
-  async updateConfig(appName: string, updates: Partial<AppConfig>): Promise<AppConfig | null> {
-    return this.enqueueWrite(appName, async () => {
-      const existing = this.configs.get(appName);
-      if (!existing) return null;
+  async upsertConfig(
+    appName: string,
+    updates: Partial<Omit<AppConfig, SystemConfigField>>
+  ): Promise<AppConfig> {
+    // `create: true` never resolves null (see `write`'s own doc).
+    return (await this.write(appName, updates as Partial<AppConfig>, {
+      create: true,
+      system: false,
+    })) as AppConfig;
+  }
 
-      const config: AppConfig = {
-        ...existing,
-        ...updates,
-        name: appName, // Ensure name is always correct
-      };
+  /**
+   * Update specific fields of an app config with owner/caller-supplied
+   * fields. Never accepts SYSTEM_CONFIG_FIELDS — see upsertSystemConfig for
+   * those.
+   */
+  async updateConfig(
+    appName: string,
+    updates: Partial<Omit<AppConfig, SystemConfigField>>
+  ): Promise<AppConfig | null> {
+    return this.write(appName, updates as Partial<AppConfig>, { create: false, system: false });
+  }
 
-      await this.saveConfig(config);
-      return config;
-    });
+  /**
+   * Unstripped writer for SYSTEM_CONFIG_FIELDS (services, grantedApiScopes,
+   * agentCreated, ephemeral, ephemeralPrincipalId, expiresAt, lastDetachAt).
+   * Same upsert semantics as upsertConfig (creates a config when none
+   * exists) — trusted callers only: upload-deploy.ts and git-deploy.ts write
+   * agentCreated/ephemeral/expiresAt/ephemeralPrincipalId here BEFORE
+   * app:detected creates the config, so updateConfig's null-on-missing would
+   * silently drop them. Never wire a request body into this directly. See
+   * updateSystemConfig for a caller that must refuse rather than mint a
+   * config when none exists.
+   */
+  async upsertSystemConfig(appName: string, updates: Partial<AppConfig>): Promise<AppConfig> {
+    // `create: true` never resolves null (see `write`'s own doc).
+    return (await this.write(appName, updates, { create: true, system: true })) as AppConfig;
+  }
+
+  /**
+   * Unstripped mirror of updateConfig for SYSTEM_CONFIG_FIELDS: reads the
+   * CURRENT config INSIDE the write chain and returns null when none
+   * exists, rather than minting one. A caller that must refuse (not
+   * upsert) when an app has runtime state but no persisted config — e.g.
+   * the capabilities route — needs this, not upsertSystemConfig: checking
+   * `hasConfig()` before an upsert is a snapshot-then-write race (a
+   * concurrent deleteConfig can land in between and the upsert would then
+   * mint exactly the skeleton config the check exists to refuse).
+   */
+  async updateSystemConfig(appName: string, updates: Partial<AppConfig>): Promise<AppConfig | null> {
+    return this.write(appName, updates, { create: false, system: true });
+  }
+
+  /**
+   * Persist ONE service's attach/detach intent, merging into `services`
+   * without clobbering sibling entries, plus an optional `lastDetachAt` for
+   * THAT service — merged into the per-service `lastDetachAt` record the
+   * same way, so detaching one service never clobbers or gates another's
+   * cooldown (see that field's own doc above). Uses `write`'s updater-
+   * function form so the merge reads the CURRENT config INSIDE the write
+   * chain (enqueueWrite invokes the op at execution time, not at call time),
+   * so a concurrent write for the same app can never be lost to a stale
+   * snapshot. `create: false`: returns null when no config exists — this
+   * writer must never create a skeleton config, which is exactly the
+   * boot-corruption hazard the attach/detach guards exist to keep out.
+   */
+  async setServiceIntent(
+    appName: string,
+    serviceId: string,
+    intent: 'attached' | 'detached',
+    extras?: { lastDetachAt?: number }
+  ): Promise<AppConfig | null> {
+    return this.write(
+      appName,
+      (existing) => ({
+        services: { ...(existing?.services ?? {}), [serviceId]: intent },
+        ...(extras?.lastDetachAt !== undefined
+          ? { lastDetachAt: { ...(existing?.lastDetachAt ?? {}), [serviceId]: extras.lastDetachAt } }
+          : {}),
+      }),
+      { create: false, system: true }
+    );
   }
 
   /**
@@ -512,4 +684,21 @@ export function getAppConfigService(options?: AppConfigServiceOptions): AppConfi
 
 export function resetAppConfigService(): void {
   appConfigServiceInstance = null;
+}
+
+/**
+ * `getAppConfigService()`, but null instead of throwing when the service was
+ * never initialized (tests / early failures) — for a defensive read that
+ * should degrade gracefully (e.g. "no recorded intent") rather than fail the
+ * whole request. Several routes were hand-rolling this exact try/catch
+ * around `getAppConfigService()` (apps.ts, db.ts); this is the one place it
+ * lives now, mirroring the null-returning posture `getDatabaseProvisioner`/
+ * `getRedisProvisioner` already have for the same "not booted yet" case.
+ */
+export function getAppConfigServiceOrNull(): AppConfigService | null {
+  try {
+    return getAppConfigService();
+  } catch {
+    return null;
+  }
 }
