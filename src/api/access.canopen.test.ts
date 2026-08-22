@@ -24,9 +24,14 @@ const ctx = (over: Partial<AuthContext>): AuthContext => ({
 const gated = (allow: string[]): AppAccessPolicy => ({ mode: 'drop-users', allow });
 
 describe('canOpen', () => {
-  it('is true for an UNGATED app — absent policy means not gated, unchanged behaviour', () => {
-    expect(canOpen(ctx({ userId: 'nobody' }), { userId: 'owner-1' }, undefined)).toBe(true);
-    expect(canOpen(undefined, { userId: 'owner-1' }, undefined)).toBe(true);
+  it('will not compile with a missing policy — "no policy" is a MISSED LOOKUP here', () => {
+    // Not a runtime assertion, and deliberately so. This function is reached
+    // only through the forward_auth on a gated app's Caddy block, where an
+    // absent policy means the config read failed on an app Caddy has already
+    // said is gated — not "this app is not gated". An optional parameter
+    // answering `true` for `undefined` would open every such app.
+    // @ts-expect-error — the policy parameter is required by design.
+    expect(() => canOpen(ctx({}), { userId: 'owner-1' })).toBeDefined();
   });
 
   it('fails CLOSED with no auth context, where canAccess fails open', () => {

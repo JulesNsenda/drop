@@ -4654,22 +4654,25 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       // not protected must never be silent -- the dashboard would otherwise
       // report it as gated on the strength of the persisted policy alone.
       const accessPolicy = this.appConfigService?.getConfig(appName)?.access;
-      if (accessPolicy) {
-        const verdict = this.assessAccessGateFor(appName, domains, dropYaml.config?.tls?.disabled);
-        if (!verdict.enforceable) {
-          this.logger.error(
-            `${describeAccessGateRefusal(appName, verdict)}. Refusing to emit the access guard: ` +
-              'this app is NOT protected.',
-            'ROUTER'
-          );
-        }
-        // Recorded either way, so a box that starts satisfying the premise
-        // clears the flag on its next route configuration rather than staying
-        // marked forever.
-        await this.stateManager?.updateApp(appName, {
-          accessGateUnapplied: !verdict.enforceable,
-        });
+      const accessVerdict = accessPolicy
+        ? this.assessAccessGateFor(appName, domains, dropYaml.config?.tls?.disabled)
+        : undefined;
+      if (accessVerdict && !accessVerdict.enforceable) {
+        this.logger.error(
+          `${describeAccessGateRefusal(appName, accessVerdict)}. Refusing to emit the access ` +
+            'guard: this app is NOT protected.',
+          'ROUTER'
+        );
       }
+      // Recorded on EVERY pass, including the no-policy one. A box that starts
+      // satisfying the premise clears the flag on its next route
+      // configuration, and an app whose gate was REMOVED loses the flag
+      // entirely rather than reading "gate not applied" forever -- writing it
+      // only inside an `if (accessPolicy)` was exactly that bug.
+      await this.stateManager?.setAccessGateUnapplied(
+        appName,
+        accessVerdict ? !accessVerdict.enforceable : undefined
+      );
 
       // Configure route for each domain
       let resolvedPublicUrl: string | undefined;
@@ -4821,7 +4824,14 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     const unenforceable: string[] = [];
 
     for (const config of configs) {
-      if (!config.access) continue;
+      if (!config.access) {
+        // Not `continue`: a gate removed while the platform was down must
+        // clear the flag, or the estate view reports "gate not applied" for an
+        // app that no longer has a gate. The write is change-guarded, so this
+        // is a no-op for the overwhelming majority of apps that never had one.
+        await this.stateManager?.setAccessGateUnapplied(config.name, undefined);
+        continue;
+      }
       const hostnames = resolveGateHostnames(
         config.name,
         config.domains,
@@ -4832,9 +4842,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         unenforceable.push(config.name);
         this.logger.error(describeAccessGateRefusal(config.name, verdict), 'ROUTER');
       }
-      await this.stateManager?.updateApp(config.name, {
-        accessGateUnapplied: !verdict.enforceable,
-      });
+      await this.stateManager?.setAccessGateUnapplied(config.name, !verdict.enforceable);
     }
 
     if (unenforceable.length > 0) {

@@ -131,18 +131,22 @@ export function interactiveSessionOnly(
  * It is not the enforcement point of that refusal — it is what makes a
  * misconfiguration deny rather than admit.
  *
- * `policy` undefined means the app is NOT GATED, which is every app today and
- * is not the same as "gated to nobody". Callers pass `AppConfig.access`
- * straight through; the ungated answer is the caller's to act on (no gate is
- * emitted at all), and returning true here keeps this function total rather
- * than making every call site pre-branch.
+ * `policy` is REQUIRED, and that is a deliberate type-level invariant rather
+ * than a convenience. This is reached only through the `forward_auth` on a
+ * gated app's Caddy block, so at that point "no policy" never means "not
+ * gated" — it means the config lookup MISSED on an app Caddy has already said
+ * is gated (service not initialized, a name that no longer resolves, a
+ * `deleteConfig` racing the request). An optional parameter that answered
+ * `true` for `undefined` would turn every one of those into an open door.
+ * The caller resolves the policy and refuses when it cannot, exactly as
+ * `mcp-gateway.ts` re-asserts `source: 'declared' && auth: 'drop'` live rather
+ * than trusting that Caddy would not have routed it otherwise.
  */
 export function canOpen(
   auth: AuthContext | undefined,
   app: Pick<AppState, 'userId'>,
-  policy: AppAccessPolicy | undefined
+  policy: AppAccessPolicy
 ): boolean {
-  if (!policy) return true; // Not gated — unchanged behaviour for every app.
   if (!auth) return false; // Fails CLOSED — see above.
   if (auth.role === 'admin') return true;
   if (auth.userId !== undefined && app.userId === auth.userId) return true;

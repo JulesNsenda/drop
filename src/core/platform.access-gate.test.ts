@@ -37,6 +37,7 @@ describe('platform access-gate refusals (DROP-152)', () => {
   let platform: DropPlatform;
   let tempDir: string;
   let updateApp: jest.Mock;
+  let setAccessGateUnapplied: jest.Mock;
   let errors: string[];
 
   /**
@@ -48,6 +49,7 @@ describe('platform access-gate refusals (DROP-152)', () => {
    */
   const wire = (config: AppConfig | undefined, all: AppConfig[] = []) => {
     updateApp = jest.fn().mockResolvedValue(undefined);
+    setAccessGateUnapplied = jest.fn().mockResolvedValue(undefined);
     (platform as unknown as Record<string, unknown>).router = {
       addRoute: jest.fn().mockResolvedValue(undefined),
     };
@@ -59,6 +61,7 @@ describe('platform access-gate refusals (DROP-152)', () => {
     };
     (platform as unknown as Record<string, unknown>).stateManager = {
       updateApp,
+      setAccessGateUnapplied,
       getApp: jest.fn().mockReturnValue(undefined),
     };
   };
@@ -100,19 +103,21 @@ describe('platform access-gate refusals (DROP-152)', () => {
         handleConfigureRoute: (n: string, p: number) => Promise<void>;
       }).handleConfigureRoute(name, port);
 
-    it('does not touch the flag for an app with NO gate policy', async () => {
+    it('CLEARS the flag for an app with no gate policy', async () => {
+      // Not "leaves it alone": DELETE /apps/:name/access clears the policy and
+      // then re-emits the route, so this is the pass that has to remove a flag
+      // an earlier, unenforceable gate left behind. Writing it only inside an
+      // `if (policy)` guard left the app reading "gate not applied" forever —
+      // the same spread-merge trap readinessUnverified records.
       wire(configFor());
       await configureRoute();
-      expect(updateApp).not.toHaveBeenCalledWith(
-        'myapp',
-        expect.objectContaining({ accessGateUnapplied: expect.anything() })
-      );
+      expect(setAccessGateUnapplied).toHaveBeenCalledWith('myapp', undefined);
     });
 
     it('clears the flag when the gate IS enforceable', async () => {
       wire(configFor({ access: POLICY }));
       await configureRoute();
-      expect(updateApp).toHaveBeenCalledWith('myapp', { accessGateUnapplied: false });
+      expect(setAccessGateUnapplied).toHaveBeenCalledWith('myapp', false);
       expect(errors.filter(e => e.includes('access guard'))).toHaveLength(0);
     });
 
@@ -122,7 +127,7 @@ describe('platform access-gate refusals (DROP-152)', () => {
 
       await configureRoute();
 
-      expect(updateApp).toHaveBeenCalledWith('myapp', { accessGateUnapplied: true });
+      expect(setAccessGateUnapplied).toHaveBeenCalledWith('myapp', true);
       const refusal = errors.find(e => e.includes('NOT protected'));
       expect(refusal).toBeDefined();
       expect(refusal).toContain('docker isolation');
@@ -134,7 +139,7 @@ describe('platform access-gate refusals (DROP-152)', () => {
 
       await configureRoute();
 
-      expect(updateApp).toHaveBeenCalledWith('myapp', { accessGateUnapplied: true });
+      expect(setAccessGateUnapplied).toHaveBeenCalledWith('myapp', true);
       expect(errors.find(e => e.includes('NOT protected'))).toContain('Secure');
     });
 
@@ -157,11 +162,15 @@ describe('platform access-gate refusals (DROP-152)', () => {
     const sweep = () =>
       (platform as unknown as { sweepAccessGates: () => Promise<void> }).sweepAccessGates();
 
-    it('is silent when no app carries a policy', async () => {
+    it('logs nothing when no app carries a policy, but still clears stale flags', async () => {
+      // The clear is what makes a gate removed while the platform was DOWN
+      // stop being reported. It is change-guarded inside the state manager, so
+      // it is a no-op for every app that never had a gate.
       wire(undefined, [configFor(), configFor({ name: 'other' })]);
       await sweep();
       expect(errors).toHaveLength(0);
-      expect(updateApp).not.toHaveBeenCalled();
+      expect(setAccessGateUnapplied).toHaveBeenCalledWith('myapp', undefined);
+      expect(setAccessGateUnapplied).toHaveBeenCalledWith('other', undefined);
     });
 
     it('reports every unenforceable policy and names the apps', async () => {
@@ -180,9 +189,9 @@ describe('platform access-gate refusals (DROP-152)', () => {
 
       await sweep();
 
-      expect(updateApp).toHaveBeenCalledWith('alpha', { accessGateUnapplied: true });
-      expect(updateApp).toHaveBeenCalledWith('beta', { accessGateUnapplied: true });
-      expect(updateApp).not.toHaveBeenCalledWith('ungated', expect.anything());
+      expect(setAccessGateUnapplied).toHaveBeenCalledWith('alpha', true);
+      expect(setAccessGateUnapplied).toHaveBeenCalledWith('beta', true);
+      expect(setAccessGateUnapplied).toHaveBeenCalledWith('ungated', undefined);
 
       const summary = errors.find(e => e.includes('2 app(s)'));
       expect(summary).toBeDefined();
@@ -196,7 +205,7 @@ describe('platform access-gate refusals (DROP-152)', () => {
 
       await sweep();
 
-      expect(updateApp).toHaveBeenCalledWith('alpha', { accessGateUnapplied: false });
+      expect(setAccessGateUnapplied).toHaveBeenCalledWith('alpha', false);
       expect(errors).toHaveLength(0);
     });
 
