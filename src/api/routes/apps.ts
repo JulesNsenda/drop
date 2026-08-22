@@ -28,6 +28,7 @@ import { migrateAppRuntime } from '../../managers/runtime/runtime-migrator';
 import { hasEnoughDisk, getMinFreeDiskMb } from '../../utils/disk';
 import { getStateManager, AppState } from '../../managers/app/state-manager';
 import { getAppConfigService, getAppConfigServiceOrNull } from '../../managers/app/app-config';
+import type { AppAccessPolicy } from '../../managers/app/app-config';
 import { getDatabaseProvisioner } from '../../managers/database';
 import { getRedisProvisioner } from '../../managers/redis';
 import { getRouterService } from '../../core/router';
@@ -39,6 +40,7 @@ import {
   getTempDirectory,
   getUploadMaxBytes,
   getPublicUrl,
+  getIsolationMode,
 } from '../runtime-config';
 import { isPathWithin } from '../../utils/paths';
 import { isReservedHost } from '../../utils/reserved-hosts';
@@ -50,6 +52,14 @@ import {
   UploadValidationError,
   InsufficientDiskSpaceError,
 } from '../../core/upload-deploy';
+import {
+  assessAccessGate,
+  describeAccessGateRefusal,
+  resolveGateHostnames,
+  resolveHttpsEffective,
+} from '../../managers/guardrail/access-gate';
+import { getTenantNetworkIsolation } from '../../managers/runtime/container-manager';
+import { isAuthEnabled } from '../middleware/auth';
 import { DeployRefusedError } from '../../managers/guardrail/deploy-breaker';
 import { QuotaExceededError } from '../../managers/guardrail/principal-quota';
 import { pruneOwnerDumpsToFit, predeleteMaxBytes } from '../../managers/guardrail/detach-limits';
@@ -1306,6 +1316,188 @@ apps.delete('/:name/services/:id', async c => {
     console.warn(`[apps.detach] '${name}'/${serviceId} threw:`, err);
     return c.json(error(ErrorCodes.INTERNAL_ERROR, 'Failed to detach service'), 500);
   }
+});
+
+/**
+ * Cap on an access-gate allow-list (DROP-152).
+ *
+ * A bound, not a product limit: every id is validated against the credential
+ * store on write, so a large list is a large number of lookups on a request an
+ * admin controls. A governance allow-list that genuinely needs more than this
+ * is a group, and groups are the next slice.
+ */
+const MAX_ACCESS_ALLOW_ENTRIES = 200;
+
+/**
+ * The enforceability verdict for one app, from a ROUTE's view of the platform.
+ *
+ * Reads the same `assessAccessGate` rule the platform's own emission path and
+ * boot sweep read; only the input resolution differs, because a route reaches
+ * the platform through runtime-config rather than PlatformConfig.
+ */
+function assessGateFromRoute(appName: string) {
+  const config = getAppConfigServiceOrNull()?.getConfig(appName);
+  const hostnames = resolveGateHostnames(appName, config?.domains, getDomainSuffix());
+  return assessAccessGate({
+    isolation: getIsolationMode(),
+    authEnabled: isAuthEnabled(),
+    httpsEffective: resolveHttpsEffective(hostnames, {
+      enableHttps: isHttpsEnabled(),
+      tlsDisabled: config?.tls?.disabled,
+      isLocalhost: isLocalhostDomain,
+    }),
+    networkIsolation: getTenantNetworkIsolation(),
+    group: config?.group,
+  });
+}
+
+// GET /apps/:name/access - Admin: read the browser access gate policy.
+// Admin-only gating is applied in server.ts, not here. Reports the verdict
+// alongside the policy so the dashboard can show "gate not applied" rather
+// than implying protection the platform is not delivering.
+apps.get('/:name/access', async c => {
+  const name = c.req.param('name');
+  const app = getStateManager().getApp(name);
+  if (!app) {
+    throw new NotFoundError(`Application '${name}' not found`);
+  }
+
+  const policy = getAppConfigServiceOrNull()?.getConfig(name)?.access;
+  const verdict = assessGateFromRoute(name);
+
+  return c.json(
+    success({
+      access: policy ?? null,
+      enforceable: verdict.enforceable,
+      blockers: verdict.blockers,
+      reasons: verdict.reasons,
+    })
+  );
+});
+
+// PUT /apps/:name/access - Admin: gate this app to an explicit list of users.
+//
+// Refuses (409) when the platform cannot ENFORCE the gate rather than writing
+// a policy that would do nothing — the first of the three refusal points; the
+// other two are route emission and the boot sweep, which cover the case where
+// the box stops satisfying the premise after this write succeeded.
+apps.put('/:name/access', async c => {
+  const auth = (c.get as Function)('auth') as AuthContext | undefined;
+  const name = c.req.param('name');
+  const app = getStateManager().getApp(name);
+  if (!app) {
+    throw new NotFoundError(`Application '${name}' not found`);
+  }
+
+  const body = (await c.req.json()) as { allow?: unknown };
+  const allow = body.allow;
+
+  if (!Array.isArray(allow) || !allow.every(id => typeof id === 'string' && id.length > 0)) {
+    throw new ValidationError('allow must be an array of non-empty user id strings');
+  }
+  if (allow.length > MAX_ACCESS_ALLOW_ENTRIES) {
+    throw new ValidationError(
+      `allow may contain at most ${MAX_ACCESS_ALLOW_ENTRIES} entries (got ${allow.length})`
+    );
+  }
+  if (new Set(allow).size !== allow.length) {
+    throw new ValidationError('allow must not contain duplicate user ids');
+  }
+
+  // Validated against the credential store at write time. An unvalidated id is
+  // not merely untidy: the list is read on every request the gate handles, and
+  // ids that never resolve accumulate silently until nobody can say who a gate
+  // actually admits. USER IDs, not usernames — a username can be reassigned.
+  const unknown = allow.filter(id => !getUserById(id));
+  if (unknown.length > 0) {
+    throw new ValidationError(`Unknown user id(s): ${unknown.join(', ')}`);
+  }
+
+  const verdict = assessGateFromRoute(name);
+  if (!verdict.enforceable) {
+    return c.json(
+      {
+        success: false,
+        error: {
+          code: ErrorCodes.CONFLICT,
+          message: describeAccessGateRefusal(name, verdict),
+          details: { blockers: verdict.blockers, reasons: verdict.reasons },
+        },
+      },
+      409
+    );
+  }
+
+  const policy: AppAccessPolicy = { mode: 'drop-users', allow };
+
+  // setAccessPolicy, not updateConfig/updateSystemConfig: `access` is a
+  // RESTRICTED field that every other writer strips at runtime. It does not
+  // create a config when none exists, so an access write against a name that
+  // has runtime state but no persisted config refuses rather than minting a
+  // skeleton config that the next boot's reconciliation would then treat as a
+  // real app.
+  const updated = await getAppConfigService().setAccessPolicy(name, policy);
+  if (!updated) {
+    throw new NotFoundError(`Application '${name}' not found`);
+  }
+
+  const ops = getPlatformOps();
+  if (!ops) {
+    return c.json(error(ErrorCodes.SERVICE_UNAVAILABLE, 'Platform operations unavailable'), 503);
+  }
+  try {
+    // Without this the policy is written and NOTHING in the running Caddyfile
+    // changes until the app happens to be redeployed — fail-open in the enable
+    // direction, with the dashboard reporting the app as gated.
+    await ops.reconfigureRoute(name);
+  } catch (err) {
+    if (err instanceof AppInProgressError) {
+      return c.json(error(ErrorCodes.CONFLICT, err.message), 409);
+    }
+    const message = err instanceof Error ? err.message : 'Failed to reconfigure route';
+    return c.json(error(ErrorCodes.INTERNAL_ERROR, message), 500);
+  }
+
+  await logActivityFor(auth, { action: 'access-gate-set', appName: name });
+
+  return c.json(success({ message: `Access gate set for '${name}'`, access: policy }));
+});
+
+// DELETE /apps/:name/access - Admin: remove the gate entirely.
+//
+// Deliberately NOT gated on enforceability: an operator must always be able to
+// REMOVE a control, including on a box that can no longer enforce it. Refusing
+// here would strand a policy that the platform itself reports as not applied.
+apps.delete('/:name/access', async c => {
+  const auth = (c.get as Function)('auth') as AuthContext | undefined;
+  const name = c.req.param('name');
+  const app = getStateManager().getApp(name);
+  if (!app) {
+    throw new NotFoundError(`Application '${name}' not found`);
+  }
+
+  const updated = await getAppConfigService().setAccessPolicy(name, undefined);
+  if (!updated) {
+    throw new NotFoundError(`Application '${name}' not found`);
+  }
+
+  const ops = getPlatformOps();
+  if (!ops) {
+    return c.json(error(ErrorCodes.SERVICE_UNAVAILABLE, 'Platform operations unavailable'), 503);
+  }
+  try {
+    await ops.reconfigureRoute(name);
+  } catch (err) {
+    if (err instanceof AppInProgressError) {
+      return c.json(error(ErrorCodes.CONFLICT, err.message), 409);
+    }
+    const message = err instanceof Error ? err.message : 'Failed to reconfigure route';
+    return c.json(error(ErrorCodes.INTERNAL_ERROR, message), 500);
+  }
+
+  await logActivityFor(auth, { action: 'access-gate-clear', appName: name });
+
+  return c.json(success({ message: `Access gate removed for '${name}'` }));
 });
 
 /**
