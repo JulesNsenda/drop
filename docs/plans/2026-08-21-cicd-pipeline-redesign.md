@@ -250,11 +250,11 @@ one can take production down. That is unbisectable while prod is down.
       plus `persist-credentials: false` on both `npm ci`-bearing checkouts.
 - [ ] `.github/workflows/_verify.yml` — reusable; lint, shellcheck, typecheck,
       test, build; uploads the **tarball**; `contents: read`; no secrets.
-- [ ] `.github/workflows/ci.yml` — thin caller + notify.
+- [x] `.github/workflows/ci.yml` - thin caller, pull_request-only. No notify job: its push trigger was redundant with deploy.yml and the two notify jobs raced for one label.
 - [ ] `.github/workflows/deploy.yml` — caller + deploy job; inline remote script
       replaced by the packaged file; apostrophe guard replaced by a structural
       assertion (below); notify job.
-- [ ] `.github/workflows/health-probe.yml` — daily version probe.
+- [x] `.github/workflows/health-probe.yml` - daily; /health/live gates, /api/v1/health observed non-fatally. Inert until it reaches `main`.
 - [ ] `scripts/deploy/remote-deploy.sh` — the sequence in C, snapshot + rollback
       in D, gate in E. Shellcheck-clean, `flock`'d against `rollback.sh`.
 - [ ] `scripts/deploy/rollback.sh` — manual restore from the snapshot; same lock;
@@ -522,6 +522,93 @@ bump; recorded for Landing B.
 
 **Dropped without individual reasons:** architecture 2 medium, 1 low; security
 1 medium, 1 low.
+
+### Landing B * pass 1
+
+Panel: `security-critic` (9 findings), `architecture-critic` (9). **The
+correctness pass was done by me directly rather than via `/code-review`**: the
+diff is workflow configuration with no code paths, and that skill's agent
+fan-out exhausted the session limit twice earlier in this run. Recorded as a
+substitution, not a skip - I traced the needs/outputs/if semantics and the
+digest chain end to end myself.
+
+**Actioned - the two that mattered most**
+
+- **The health probe contradicted its own header** (architecture, *high/high*).
+  It called itself "an observation, not a gate" while exiting 1 on any non-200
+  from `/api/v1/health` - which returns **503 routinely** when PM2 or Postgres
+  probe down, as deploy.yml's own health-gate comment already says. A daily cron
+  that reds on a component blip gets muted, reinstating the exact cry-wolf
+  failure section F cut the hourly drift check to avoid. Split: `/health/live`
+  gates, `/api/v1/health` is read non-fatally.
+- **The probe read the wrong JSON path** (security #4 *low/high*; architecture
+  *high/high* - found independently by both). The envelope is
+  `{success, data, meta}`, so the version is at `.data.version`. Its single
+  observation would have been the string `unknown` on **every** run while the
+  job stayed green: a monitor reporting success while measuring nothing, which
+  is the defect it exists to detect, reproduced inside the detector.
+
+**Actioned - the rest**
+
+- ci.yml's `push` trigger was wholly redundant post-consolidation, and both
+  notify jobs raced for the same `ci-failure` label - after which `.[0]`
+  attached a *deploy* failure to an issue titled "CI failing" (architecture,
+  *medium/high*; security #5, *low/high*). Deleting the trigger and ci.yml's
+  notify job removed the duplicate ~155s spend, the race, and a duplicated
+  40-line block in one edit.
+- **The notify condition was wrong in both directions.** Security #3
+  (*medium/medium*): a bare `!success()` contains neither `always()` nor
+  `cancelled()`, so it is skipped on a cancelled run - missing the
+  abort-after-systemctl-stop case its comment claimed it existed for.
+  Architecture (*medium/medium*): that comment's justification is *also* false,
+  because `cancel-in-progress: false` protects an in-progress run, not a
+  **pending** one, so a third push supersedes the queued middle run and would
+  file a false alarm. **Synthesised rather than picking a side**: key on job
+  results, so `needs.deploy.result` of failure or cancelled alerts on a
+  mid-flight abort while a cancelled verify with deploy skipped stays quiet.
+- **shellcheck was in the approved plan and absent from the implementation**
+  (architecture, *medium/high*) - a deviation surfaced rather than absorbed.
+  Added over install.sh; **observed passing on the runner**, which also retires
+  the "locally verified only" caveat. Landing C now only has to add a path to a
+  step that already runs green, instead of introducing the script and its only
+  static check together.
+- Package/hash made unconditional so the digest output is not empty by design
+  (architecture, *medium/medium*); `permissions: {}` on the probe (security #9);
+  bounded `head -c 200` instead of dumping a body carrying host paths into a
+  public log, `--max-time 30`, and the version sanitised before it reaches a
+  markdown-rendering summary (security #6).
+
+**Two comments that claimed protection they do not provide** - corrected,
+because false assurance in a security comment is worse than no comment:
+
+- The **digest check** covers artifact *transport* between upload and download,
+  not a poisoned tree: the hash is computed after `npm ci`, in the same job, on
+  the same files, so a compromised postinstall is faithfully certified
+  (security #2, *medium/high*). Closing that needs `--ignore-scripts` or
+  provenance attestation.
+- **_verify.yml's isolation from the deploy key is caller discipline, not
+  scope** (security #1, *medium/high*). API-verified: the DEPLOY_* values are
+  *repository* secrets and the `hetzner` environment holds none, so the
+  environment gates approval and branches, not secret visibility. **OPEN, needs
+  the maintainer**: re-create the three as environment secrets on `hetzner` and
+  delete the repo-level copies, after which `secrets: inherit` in any future
+  caller provably resolves to nothing.
+
+**Recorded, not actioned**
+
+- **No CODEOWNERS and no branch protection on develop**, so the DROP-074 guard
+  is self-hosting: a PR can weaken the guard and the file it guards in one
+  commit and CI reports green (security #7, *low/medium*). Smallest fix is a
+  CODEOWNERS over /.github/workflows/** plus required review.
+- Markdown injection into a filed issue via a branch name (security #8,
+  *low/medium*) - needs push access, small actor set.
+- The status-check name is now `verify / verify`, which future branch protection
+  must reference and which a rename inside _verify.yml would silently break
+  (architecture, *low/high*).
+- A `_notify.yml` third reusable workflow was proposed (architecture,
+  *low/high*); moot once ci.yml's notify job was deleted, leaving one copy.
+
+**Dropped without individual reasons:** security 1 low; architecture 1 low.
 
 ## Run stats
 

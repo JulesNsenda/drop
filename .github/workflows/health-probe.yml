@@ -1,0 +1,148 @@
+name: Health probe
+
+# Replaces an hourly SHA-drift check that was broken by design: deploy.yml
+# fires on main, develop AND feature/DROP-v2*, so "most recent successful
+# Deploy run's SHA == develop head" is permanently false after any main
+# deploy, and the hetzner environment's approval gate makes "develop head !=
+# deployed SHA" a NORMAL steady state (measured waits on real deploys range
+# 17s to 12m12s). An alarm that cries wolf gets muted, which reinstates the
+# blind spot it was meant to close.
+#
+# Two separate concerns, not one conflated step:
+#
+# - GATE on /api/v1/health/live. It is unconditionally 200 when the process
+#   is serving at all, so a non-200 (or a failed request) here is a real
+#   "production is down" signal and fails the run.
+# - OBSERVE /api/v1/health, non-fatally. It records the version and
+#   per-component status production reports rather than asserting the
+#   version equals package.json on this branch. Many commits share a version
+#   between releases, and an equality assertion would alarm constantly for
+#   reasons that are not incidents. /api/v1/health also returns 503 whenever
+#   PM2 or Postgres probe down -- deploy.yml's own health-gate comment says
+#   this happens routinely on a slow boot (DROP-063) -- so treating THIS
+#   endpoint as fatal would cry wolf on exactly the transient blips this
+#   workflow was rewritten to stop alarming on, and the alarm would get
+#   muted, reinstating the blind spot it exists to close. This observation
+#   also cannot distinguish "deployed" from "deployed then rolled back" -- a
+#   real answer needs the box to report the SHA it is running, which is a
+#   follow-up, not built here.
+#
+# INERT ON ARRIVAL, same as .github/dependabot.yml (Landing A): `schedule`
+# only fires for a workflow file present on the repository's DEFAULT branch,
+# which is `main` here, while this repo lands everything on `develop` first.
+# `workflow_dispatch` is the same story -- the "Run workflow" button only
+# appears for a workflow present on the default branch. So neither trigger
+# is live until the next develop -> main release merge, and this is not
+# monitoring coverage until then.
+on:
+  schedule:
+    - cron: '0 6 * * *'
+  workflow_dispatch: {}
+
+# No job here does a checkout or touches repo content -- both steps only
+# speak HTTP to the production box and write to the job summary.
+permissions: {}
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      # GATE: /api/v1/health/live is unconditionally 200 when the process is
+      # serving requests at all (see health.ts -- it does no subsystem
+      # probing). A non-200 or a failed request here is a real "production is
+      # down" signal, so this step is fatal. This is the same endpoint and the
+      # same reasoning deploy.yml's own health gate uses.
+      - name: Gate on liveness
+        env:
+          URL: https://dashboard.dropkit.sh/api/v1/health/live
+        run: |
+          set -euo pipefail
+
+          # Deliberately no -f: with -f, curl exits nonzero itself on a 4xx/5xx
+          # and this script never reaches the status check below, so the
+          # error message loses the actual status code. Letting curl succeed
+          # and asserting the status explicitly is the check that reports.
+          HTTP_STATUS=$(curl -sS --max-time 30 -o live.json -w '%{http_code}' "$URL") || {
+            echo "::error::Liveness probe request to $URL failed outright." >&2
+            exit 1
+          }
+
+          if [ "$HTTP_STATUS" != "200" ]; then
+            # Bounded, not the whole body: /health/live's own body is just
+            # `{ alive: true }`, but a non-200 here means something ELSE
+            # answered -- an error page, a proxy's own response, anything --
+            # and this is a PUBLIC repo's action log, so an unbounded dump of
+            # an unknown response body is not a risk worth taking for a debug
+            # convenience.
+            echo "::error::Liveness probe returned HTTP $HTTP_STATUS (expected 200). First 200 bytes:" >&2
+            head -c 200 live.json >&2 || true
+            exit 1
+          fi
+
+          echo "Liveness probe OK -- production is serving requests."
+
+      # OBSERVE: /api/v1/health is allowed to 503 whenever PM2 or Postgres
+      # probe down (see health.ts -- the same DROP-063 readiness trap
+      # deploy.yml's gate comment warns about), so this step never fails the
+      # run regardless of status code. It only records what it saw.
+      #
+      # No `if:` here -- the default step conditional already skips this
+      # step when the previous one exits nonzero, so it never runs (and
+      # never writes a summary) when liveness failed. The hardcoded
+      # "Liveness: OK" line below relies on exactly that: don't add
+      # `if: always()` without also making that line conditional.
+      - name: Observe reported version and component status
+        env:
+          URL: https://dashboard.dropkit.sh/api/v1/health
+        run: |
+          set -uo pipefail
+
+          HTTP_STATUS=$(curl -sS --max-time 30 -o response.json -w '%{http_code}' "$URL") || {
+            {
+              echo "## Health probe"
+              echo ""
+              echo "- Liveness: OK (see previous step)"
+              echo "- /api/v1/health request failed outright -- no observation recorded."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::warning::Observation request to $URL failed outright -- non-fatal, see summary." >&2
+            exit 0
+          }
+
+          # The payload is `{ success, data: { ... }, meta }` -- the version is at
+          # .data.version, NOT .version. Reading the wrong path would resolve to
+          # the fallback on every run while the job stayed green, i.e. a monitor
+          # reporting success while measuring nothing.
+          VERSION=$(jq -r '.data.version // "unknown"' response.json 2>/dev/null || echo unknown)
+
+          # The box could be compromised and control this string; it is written
+          # into a public job summary that renders as markdown.
+          SAFE_VERSION=$(printf '%s' "$VERSION" | tr -cd 'A-Za-z0-9.+-')
+          [ -n "$SAFE_VERSION" ] || SAFE_VERSION=unknown
+
+          # health.ts's ComponentHealth.status is a TS-level enum
+          # (up/down/unknown), not a runtime guarantee -- the box, if
+          # compromised, controls the raw JSON same as version does. Same
+          # sanitizing, same reason: this is a public markdown summary.
+          sanitize_status() { printf '%s' "$1" | tr -cd 'a-z' | head -c 16; }
+          PROCESS_MANAGER=$(sanitize_status "$(jq -r '.data.components.processManager.status // "unknown"' response.json 2>/dev/null || echo unknown)")
+          DATABASE=$(sanitize_status "$(jq -r '.data.components.database.status // "unknown"' response.json 2>/dev/null || echo unknown)")
+          WATCHER=$(sanitize_status "$(jq -r '.data.components.watcher.status // "unknown"' response.json 2>/dev/null || echo unknown)")
+          CADDY=$(sanitize_status "$(jq -r '.data.components.caddy.status // "unknown"' response.json 2>/dev/null || echo unknown)")
+          [ -n "$PROCESS_MANAGER" ] || PROCESS_MANAGER=unknown
+          [ -n "$DATABASE" ] || DATABASE=unknown
+          [ -n "$WATCHER" ] || WATCHER=unknown
+          [ -n "$CADDY" ] || CADDY=unknown
+
+          {
+            echo "## Health probe"
+            echo ""
+            echo "- Liveness: OK (see previous step)"
+            echo "- /api/v1/health HTTP status: $HTTP_STATUS (a 503 here is routine, not an incident -- see the workflow file header)"
+            echo "- Reported version: \`$SAFE_VERSION\`"
+            echo "- Components: processManager=$PROCESS_MANAGER database=$DATABASE watcher=$WATCHER caddy=$CADDY"
+            echo ""
+            echo "This is an observation, not a gate against this branch's package.json --"
+            echo "see the workflow file header for why."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "Observation recorded -- production reports version $VERSION (HTTP $HTTP_STATUS)."

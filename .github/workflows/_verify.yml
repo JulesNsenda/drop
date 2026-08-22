@@ -1,0 +1,186 @@
+name: Verify
+
+# Reusable. `ci.yml` and `deploy.yml` used to duplicate this sequence and had
+# already drifted from each other before this file existed -- one definition
+# of "good" for both. `release.yml` deliberately does NOT call this: its
+# tarball assertion must prove things about the tree it just built (not a
+# transported blob), its build job must never hold release-write scope while
+# running `npm ci`, and its cheap tag/version/CHANGELOG gates must run BEFORE
+# `npm ci` so a bad tag fails in seconds -- none of which this shared shape
+# preserves.
+on:
+  workflow_call:
+    inputs:
+      upload-artifact:
+        description: >-
+          Upload drop-dist.tar.gz as a build artifact. The tarball is always
+          packaged and hashed (both ~1s) regardless of this input, so on any
+          successful verify run the tarball-sha256 output below is populated
+          whether or not this flag is set -- only the upload itself (and the
+          runner-to-runner transfer it implies) is gated, since ci.yml runs
+          on every pull_request (including from forks) and never ships
+          anything. deploy.yml is the only caller that sets this true -- it
+          downloads the artifact in the deploy job and verifies the digest
+          before shipping.
+        type: boolean
+        default: false
+    outputs:
+      tarball-sha256:
+        description: >-
+          sha256 of drop-dist.tar.gz. Populated on any successful verify run
+          regardless of upload-artifact -- packaging and hashing are
+          unconditional, not gated on the flag, so this is never empty
+          because of upload-artifact being false. It IS still empty if the
+          job fails before the Hash artifact step (e.g. Test), which is why
+          deploy.yml's digest-check step still guards against an empty
+          EXPECTED_SHA256 rather than trusting this to always be set --
+          belt-and-braces, not the only thing standing between a skipped
+          step and a production ship. When upload-artifact is false there is
+          no artifact to download, only this digest of a tarball that was
+          built and hashed but not uploaded.
+        value: ${{ jobs.verify.outputs.tarball-sha256 }}
+
+# No `secrets:` block: this workflow needs none, and a called workflow can
+# only further RESTRICT the permissions its job token ends up with relative
+# to the caller -- so pinning `contents: read` here holds no matter what the
+# caller's own token looks like. Callers must never pass `secrets: inherit`;
+# there is nothing here for a secret to do, and passing one would hand it to
+# every future step added to this file, including two `npm ci` runs' worth of
+# transitive postinstall scripts.
+#
+# That isolation currently rests on CALLER DISCIPLINE, not on scope, and it
+# is worth being honest about that: verified against the repo, DEPLOY_HOST,
+# DEPLOY_KEY_B64 and DEPLOY_USER are REPOSITORY-level secrets (`gh secret
+# list`), and the `hetzner` environment they are read from at the deploy job
+# has zero secrets of its own (`gh api .../environments/hetzner/secrets` ->
+# `total_count: 0`). A repository secret is available to `secrets: inherit`
+# from ANY caller, environment-scoped or not -- nothing about `hetzner`'s
+# approval/branch-protection gate keeps a `secrets: inherit` on this file
+# from handing the deploy key to a PR-triggered `npm ci`. The durable fix is
+# moving those three secrets onto the `hetzner` environment itself, so scope
+# enforces what today only the "never write `secrets: inherit`" convention
+# does.
+#
+# Also deliberately no `environment:` anywhere in this file -- `deploy.yml`'s
+# `hetzner` environment carries approval/branch protection rules, and a
+# reusable workflow declaring its own environment would bypass them for
+# whatever job calls it next.
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    outputs:
+      tarball-sha256: ${{ steps.hash.outputs.sha256 }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # Do not leave a credential in .git/config for every later step:
+          # two `npm ci` runs below execute arbitrary transitive postinstall
+          # scripts, and checkout persists GITHUB_TOKEN there by default.
+          # Same reason release.yml sets it. Nothing here runs git after
+          # checkout.
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install server dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      # shellcheck ships preinstalled on ubuntu-latest -- no third-party
+      # action to pin. install.sh is 1018 lines and was never linted before
+      # this (a deferred item from the original bootstrap plan).
+      # --severity=warning, not the default (which includes style/info):
+      # install.sh:279 trips SC1091 ("not following: /etc/os-release was not
+      # specified as input") at info level, and it is cosmetic here -- that
+      # file is a real target's /etc/os-release, not something in this repo
+      # shellcheck could follow with -x either. Warning-and-above is clean.
+      - name: Shellcheck install.sh
+        run: shellcheck --severity=warning install.sh
+
+      # Moved here from deploy.yml (Landing B): this step parses
+      # .github/workflows/deploy.yml directly off the checkout, so it works
+      # unchanged from this reusable workflow -- and moving it here means it
+      # now runs on every PR via ci.yml too, not only on the deploy path,
+      # which it did not before.
+      #
+      # DROP-074. The remote deploy script is passed to ssh as ONE
+      # single-quoted argument, so a single apostrophe anywhere inside it —
+      # including in a comment (chown'd, install.sh's, exec'ing) — closes the
+      # string early and silently corrupts every command after it. That took
+      # production down: both provisioning arms and the fallback
+      # `systemctl restart` were mangled into unrecognisable commands, so the
+      # deploy stopped the service and never restarted it. Nothing in bash,
+      # YAML, or shellcheck catches it, because each half parses fine on its
+      # own. Fail the build instead.
+      - name: Deploy script must contain no apostrophes (DROP-074)
+        run: |
+          node -e '
+            const fs = require("fs");
+            const yaml = require("yaml");
+            const wf = yaml.parse(fs.readFileSync(".github/workflows/deploy.yml", "utf8"));
+            const step = wf.jobs.deploy.steps.find(s => s.name === "Deploy on server");
+            if (!step) { console.error("Deploy on server step not found"); process.exit(1); }
+            const quotes = (step.run.match(/’|\x27/g) || []).length;
+            if (quotes !== 2) {
+              console.error("Deploy step has " + quotes + " single-quotes; expected exactly 2 (the ssh argument delimiters).");
+              console.error("An apostrophe inside the remote script closes the quoted argument early and corrupts the deploy.");
+              step.run.split("\n").forEach((l, i) => { if (l.includes("\x27")) console.error("  line " + (i + 1) + ": " + l.trim()); });
+              process.exit(1);
+            }
+            console.log("Deploy script quoting OK (2 delimiters, no stray apostrophes).");
+          '
+
+      - name: Build server
+        run: npm run build:server
+
+      - name: Test
+        run: npm test
+
+      - name: Install dashboard dependencies
+        working-directory: src/dashboard
+        run: npm ci
+
+      - name: Build dashboard
+        working-directory: src/dashboard
+        run: npm run build
+
+      # Tarball, not raw dist/: an artifact upload does not preserve the
+      # executable bit, and `bin: ./dist/cli/index.js` in package.json
+      # depends on it. Same command deploy.yml has always run.
+      #
+      # Unconditional, not gated on upload-artifact: packaging and hashing
+      # are both ~1s, so the cost of doing them on every ci.yml run is
+      # negligible, and it means tarball-sha256 is populated on any
+      # successful verify run regardless of the flag -- one definition of
+      # "good" instead of two (a packaged-and-hashed run and an unpackaged
+      # one). Only the Upload artifact step below, which actually ships
+      # bytes off the runner, is worth gating.
+      - name: Package artifact
+        run: |
+          tar -czf drop-dist.tar.gz dist/ install.sh package.json package-lock.json
+
+      # Computed here, in the job that built the tree, so the digest is
+      # trustworthy evidence about what CI actually produced -- not a value
+      # the deploy job could recompute from a tarball that already passed
+      # through an extra hop (download-artifact, then scp).
+      - name: Hash artifact
+        id: hash
+        run: |
+          echo "sha256=$(sha256sum drop-dist.tar.gz | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifact
+        if: ${{ inputs.upload-artifact }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: drop-dist
+          path: drop-dist.tar.gz
+          retention-days: 1
