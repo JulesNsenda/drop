@@ -18,6 +18,7 @@ import { AppProcessInfo } from '../managers/runtime';
 // DetachServiceOutcome/DetachServiceRestartOutcome are re-exported (below)
 // but not used in this file's own signatures.
 import type { AttachableServiceId, AttachServiceResult, DetachServiceResult } from './services-wire.types';
+import type { AccessGateVerdict } from '../managers/guardrail/access-gate';
 
 /**
  * The attach/detach wire contract itself lives in `services-wire.types.ts` —
@@ -163,6 +164,43 @@ export interface PlatformOps {
    * the delete's success condition.
    */
   purgeAppArtifacts(appName: string, opts?: { keepData?: boolean }): Promise<void>;
+
+  /**
+   * Re-emit this app's Caddy route blocks from its CURRENT config and reload
+   * Caddy — without stopping, rebuilding or restarting it (DROP-152).
+   *
+   * Exists because route configuration is otherwise reachable only from
+   * `app:started` and boot reconciliation. A route-level policy — the browser
+   * access gate — that is toggled through the API would therefore write its
+   * YAML and change nothing in the running Caddyfile until the app happened to
+   * be redeployed: fail-OPEN in the enable direction, with the dashboard
+   * reporting the app as gated. (Revocation is unaffected either way; the
+   * verify endpoint reads the policy live.)
+   *
+   * Deliberately not solved with a config fingerprint that forces a redeploy:
+   * boot reconciliation re-emits guards anyway, so a fingerprint would buy
+   * pointless full rebuilds and still leave the live toggle broken.
+   *
+   * A no-op (resolves) for an app with no known port — there is no route to
+   * re-emit. Rejects with AppInProgressError when a deploy/build/restart is in
+   * flight, so it cannot race the route write that deploy will do itself.
+   */
+  reconfigureRoute(appName: string): Promise<void>;
+
+  /**
+   * Whether a browser access gate (DROP-152) can be ENFORCED for this app, and
+   * why not when it cannot.
+   *
+   * On the seam because the platform is the only thing that can answer it. The
+   * route previously re-derived the same five inputs from `runtime-config` and
+   * `AppConfig`, which made two sources of truth for one authorization
+   * question: `authEnabled` came from `enableApiAuth` on one side and
+   * `isAuthEnabled()` on the other, `httpsEffective` from `enableHttps` vs
+   * `isHttpsEnabled()`, the hostnames from persisted config vs the live
+   * `drop.yaml`. The claim that the route could only ever err optimistically
+   * was a comment with nothing enforcing it.
+   */
+  assessAccessGate(appName: string): Promise<AccessGateVerdict>;
 }
 
 let platformOps: PlatformOps | null = null;

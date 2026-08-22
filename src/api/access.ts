@@ -7,6 +7,7 @@
 import { AuthContext } from './middleware/auth';
 import { AppState } from '../managers/app/state-manager';
 import { scopesAllow, AgentVerb } from './agent-scopes';
+import type { AppAccessPolicy } from '../managers/app/app-config';
 
 /**
  * Whether the current request may access an app: owns it, is an admin, or
@@ -105,4 +106,73 @@ export function interactiveSessionOnly(
     };
   }
   return { ok: true, requester };
+}
+
+/**
+ * Whether the current request may OPEN an app in a browser — the ACCESS
+ * question, as distinct from the management question `canAccess` answers
+ * (DROP-152).
+ *
+ * A SIBLING of `canAccess`, deliberately not a widening of it, for the same
+ * reason `canAccessScoped` is: `canAccess` has 34 non-test call sites, all of
+ * them management boundaries, and the existing `*.authz.test.ts` files are a
+ * valid regression net only while its behaviour is untouched.
+ *
+ * It does NOT inherit `canAccess`'s `if (!auth) return true`. That posture is
+ * defensible for a single-operator box's management API, where the operator IS
+ * the only principal; it is indefensible for a gate whose entire product claim
+ * is "only these people can open this app". With no auth context there is no
+ * identity to compare, so the answer is no. `interactiveSessionOnly` had to
+ * restate exactly this, having found that copying `canAccess`'s posture was
+ * wrong there too — this is the third boundary where it would have been.
+ *
+ * The route that SETS a policy refuses outright when auth is disabled, so this
+ * fail-closed branch should be unreachable in a correctly configured platform.
+ * It is not the enforcement point of that refusal — it is what makes a
+ * misconfiguration deny rather than admit.
+ *
+ * `policy` is REQUIRED, and that is a deliberate type-level invariant rather
+ * than a convenience. This is reached only through the `forward_auth` on a
+ * gated app's Caddy block, so at that point "no policy" never means "not
+ * gated" — it means the config lookup MISSED on an app Caddy has already said
+ * is gated (service not initialized, a name that no longer resolves, a
+ * `deleteConfig` racing the request). An optional parameter that answered
+ * `true` for `undefined` would turn every one of those into an open door.
+ * The caller resolves the policy and refuses when it cannot, exactly as
+ * `mcp-gateway.ts` re-asserts `source: 'declared' && auth: 'drop'` live rather
+ * than trusting that Caddy would not have routed it otherwise.
+ */
+export function canOpen(
+  auth: AuthContext | undefined,
+  app: Pick<AppState, 'userId'>,
+  policy: AppAccessPolicy
+): boolean {
+  if (!auth) return false; // Fails CLOSED — see above.
+
+  // A BROWSER SESSION, or nothing. `interactiveSessionOnly` exists in this
+  // file because "a role alone does not distinguish an agent token from a
+  // session", and the same is true here for a harder reason: `forward_auth`
+  // proxies the ORIGINAL request to the verify hop, so a tenant-controlled
+  // `Authorization` / `X-Api-Key` header arrives with it unless stripped by
+  // name in the generated Caddy block. Without this clause an admin-role API
+  // key opens every gated app, and the scoped `DROP_API_KEY` DROP itself
+  // injects into a tenant app — which resolves to its owner's user id —
+  // satisfies the owner clause of a gate that owner set.
+  //
+  // `authMethod === 'jwt'` is the fail-closed choice, not a prediction: the
+  // session the gate mints is a jose-signed token and surfaces as `jwt`. If a
+  // later change gives it a distinct method, this refuses until someone
+  // widens it deliberately, which is the direction an authorization check
+  // should fail in.
+  if (auth.authMethod !== 'jwt' || auth.role === 'none' || auth.kind === 'agent') return false;
+
+  if (auth.role === 'admin') return true;
+  // `userId` is a required `string` on the type and NOT always one at runtime:
+  // the `DROP_API_KEY` and `cli-local` principals are ownerless, and a
+  // monorepo group child has no `AppState.userId` at all. Two `undefined`s
+  // must not compare equal into an admission. The clause above already
+  // excludes those principals; this stays because the reason it was written
+  // is a fact about the data, not about the credential class.
+  if (auth.userId !== undefined && app.userId === auth.userId) return true;
+  return auth.userId !== undefined && policy.allow.includes(auth.userId);
 }

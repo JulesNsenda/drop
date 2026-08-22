@@ -19,6 +19,7 @@
  */
 
 import type { PlatformOps, AttachServiceResult, DetachServiceResult } from '../platform-ops';
+import type { AccessGateVerdict } from '../../managers/guardrail/access-gate';
 
 export function makePlatformOpsStub(overrides?: Partial<PlatformOps>): PlatformOps {
   return {
@@ -37,6 +38,12 @@ export function makePlatformOpsStub(overrides?: Partial<PlatformOps>): PlatformO
     promoteApp: jest.fn().mockResolvedValue(undefined),
     removeGroup: jest.fn().mockResolvedValue({ removed: [] }),
     purgeAppArtifacts: jest.fn().mockResolvedValue(undefined),
+    reconfigureRoute: jest.fn().mockResolvedValue(undefined),
+    assessAccessGate: jest.fn().mockResolvedValue({
+      enforceable: true,
+      blockers: [],
+      reasons: [],
+    } satisfies AccessGateVerdict),
     ...overrides,
   };
 }

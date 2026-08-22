@@ -12,7 +12,7 @@ import { Readable, Transform } from 'stream';
 import { pipeline } from 'stream/promises';
 import { success, error, ErrorCodes, AppDto, CreateAppDto } from '../types';
 import { NotFoundError, ValidationError } from '../middleware/error';
-import { AuthContext, listUsers, getUserById } from '../middleware/auth';
+import { AuthContext, listUsers, getUserById, isAuthEnabled } from '../middleware/auth';
 import { canAccess } from '../access';
 import { isValidAppName, validateAppName } from '../middleware/validate';
 import { getAppRuntime } from '../../managers/runtime';
@@ -28,6 +28,7 @@ import { migrateAppRuntime } from '../../managers/runtime/runtime-migrator';
 import { hasEnoughDisk, getMinFreeDiskMb } from '../../utils/disk';
 import { getStateManager, AppState } from '../../managers/app/state-manager';
 import { getAppConfigService, getAppConfigServiceOrNull } from '../../managers/app/app-config';
+import type { AppAccessPolicy } from '../../managers/app/app-config';
 import { getDatabaseProvisioner } from '../../managers/database';
 import { getRedisProvisioner } from '../../managers/redis';
 import { getRouterService } from '../../core/router';
@@ -50,6 +51,10 @@ import {
   UploadValidationError,
   InsufficientDiskSpaceError,
 } from '../../core/upload-deploy';
+import {
+  describeAccessGateRefusal,
+  ACCESS_GATE_ENFORCEMENT_AVAILABLE,
+} from '../../managers/guardrail/access-gate';
 import { DeployRefusedError } from '../../managers/guardrail/deploy-breaker';
 import { QuotaExceededError } from '../../managers/guardrail/principal-quota';
 import { pruneOwnerDumpsToFit, predeleteMaxBytes } from '../../managers/guardrail/detach-limits';
@@ -1306,6 +1311,271 @@ apps.delete('/:name/services/:id', async c => {
     console.warn(`[apps.detach] '${name}'/${serviceId} threw:`, err);
     return c.json(error(ErrorCodes.INTERNAL_ERROR, 'Failed to detach service'), 500);
   }
+});
+
+/**
+ * Cap on an access-gate allow-list (DROP-152).
+ *
+ * A bound, not a product limit: every id is validated against the credential
+ * store on write, so a large list is a large number of lookups on a request an
+ * admin controls. A governance allow-list that genuinely needs more than this
+ * is a group, and groups are the next slice.
+ */
+const MAX_ACCESS_ALLOW_ENTRIES = 200;
+
+/**
+ * Per-entry cap. Ids are UUIDs; the bound exists so an unvalidated string
+ * cannot be echoed into the refusal message, the error log and a persisted
+ * YAML file at body-size scale.
+ */
+const MAX_USER_ID_LENGTH = 128;
+
+/**
+ * Guard shared by all three `/access` handlers.
+ *
+ * The admin role floor is applied in `server.ts`, but that registration lives
+ * inside `if (this.config.enableAuth && isAuthEnabled())` — so on an
+ * auth-disabled box no middleware is registered for these paths at all and
+ * these handlers are the only thing standing between an anonymous caller and
+ * an app's allow-list (a set of real DROP user ids) or, on DELETE, removal of
+ * a governance policy. This is the `interactiveSessionOnly` posture, restated
+ * for the same reason it had to be restated there.
+ */
+function requireAuthForAccessRoutes(): string | null {
+  if (!isAuthEnabled()) {
+    return 'Access-gate policy is unavailable when authentication is disabled.';
+  }
+  return null;
+}
+
+/**
+ * Whether a gate is actually ENFORCED for this app right now — as opposed to
+ * whether the box could enforce one. A persisted policy on a build with no
+ * guard emitter is a record, not a control, and every response says so.
+ */
+function gateEnforced(verdict: { enforceable: boolean }, hasPolicy: boolean): boolean {
+  return hasPolicy && verdict.enforceable && ACCESS_GATE_ENFORCEMENT_AVAILABLE;
+}
+
+// GET /apps/:name/access - Admin: read the browser access gate policy.
+// Reports what is ENFORCED, not merely what is persisted: an admin must be
+// able to tell a recorded policy from a live control.
+apps.get('/:name/access', async c => {
+  const name = c.req.param('name');
+  const refusal = requireAuthForAccessRoutes();
+  if (refusal) return c.json(error(ErrorCodes.UNAUTHORIZED, refusal), 401);
+
+  const app = getStateManager().getApp(name);
+  if (!app) {
+    throw new NotFoundError(`Application '${name}' not found`);
+  }
+
+  const ops = getPlatformOps();
+  if (!ops) {
+    return c.json(error(ErrorCodes.SERVICE_UNAVAILABLE, 'Platform operations unavailable'), 503);
+  }
+
+  const policy = getAppConfigServiceOrNull()?.getConfig(name)?.access;
+  const verdict = await ops.assessAccessGate(name);
+
+  return c.json(
+    success({
+      access: policy ?? null,
+      // What is true of traffic right now.
+      enforced: gateEnforced(verdict, Boolean(policy)),
+      // What is true of the box, independent of whether a policy exists.
+      enforceable: verdict.enforceable,
+      blockers: verdict.blockers,
+      reasons: verdict.reasons,
+      // The platform's own record of whether the last route emission actually
+      // installed the guard. Distinct from `enforceable`: the box can be
+      // capable and the emission still have failed.
+      gateApplied: app.accessGateUnapplied === undefined ? null : !app.accessGateUnapplied,
+    })
+  );
+});
+
+// PUT /apps/:name/access - Admin: gate this app to an explicit list of users.
+//
+// Refuses (409) when the platform cannot ENFORCE the gate rather than writing
+// a policy that would do nothing — the first of the three refusal points; the
+// other two are route emission and the boot sweep, which cover the case where
+// the box stops satisfying the premise after this write succeeded.
+apps.put('/:name/access', async c => {
+  const auth = (c.get as Function)('auth') as AuthContext | undefined;
+  const name = c.req.param('name');
+  const refusal = requireAuthForAccessRoutes();
+  if (refusal) return c.json(error(ErrorCodes.UNAUTHORIZED, refusal), 401);
+
+  const app = getStateManager().getApp(name);
+  if (!app) {
+    throw new NotFoundError(`Application '${name}' not found`);
+  }
+
+  const ops = getPlatformOps();
+  if (!ops) {
+    return c.json(error(ErrorCodes.SERVICE_UNAVAILABLE, 'Platform operations unavailable'), 503);
+  }
+  // Pre-check, before anything is persisted: a deploy in flight makes the
+  // route re-emission below throw, and by then the policy would already be on
+  // disk with a 409 telling the caller it was not. The delete route uses the
+  // same synchronous pre-check for the same reason.
+  if (ops.isAppInProgress(name)) {
+    return c.json(error(ErrorCodes.CONFLICT, `Application '${name}' has an operation in progress`), 409);
+  }
+
+  // The enforceability refusal comes BEFORE allow-list validation. Reversed,
+  // an auth-disabled box answers "Unknown user id(s)" — `getUserById` returns
+  // null for everything when there are no credentials — and the operator is
+  // told their ids are wrong when the real problem is that the platform has no
+  // principals at all, with the structured refusal never firing.
+  const verdict = await ops.assessAccessGate(name);
+  if (!verdict.enforceable) {
+    return c.json(
+      {
+        success: false,
+        error: {
+          code: ErrorCodes.CONFLICT,
+          message: describeAccessGateRefusal(name, verdict),
+          details: { blockers: verdict.blockers, reasons: verdict.reasons },
+        },
+      },
+      409
+    );
+  }
+
+  const body = (await c.req.json()) as { allow?: unknown };
+  const allow = body.allow;
+
+  if (
+    !Array.isArray(allow) ||
+    !allow.every(id => typeof id === 'string' && id.length > 0 && id.length <= MAX_USER_ID_LENGTH)
+  ) {
+    throw new ValidationError(
+      `allow must be an array of non-empty user id strings (max ${MAX_USER_ID_LENGTH} chars each)`
+    );
+  }
+  if (allow.length > MAX_ACCESS_ALLOW_ENTRIES) {
+    throw new ValidationError(
+      `allow may contain at most ${MAX_ACCESS_ALLOW_ENTRIES} entries (got ${allow.length})`
+    );
+  }
+  if (new Set(allow).size !== allow.length) {
+    throw new ValidationError('allow must not contain duplicate user ids');
+  }
+
+  // Validated against the credential store at write time. An unvalidated id is
+  // not merely untidy: the list is read on every request the gate handles, and
+  // ids that never resolve accumulate silently until nobody can say who a gate
+  // actually admits. USER IDs, not usernames — a username can be reassigned.
+  const unknown = allow.filter(id => !getUserById(id));
+  if (unknown.length > 0) {
+    throw new ValidationError(`Unknown user id(s): ${unknown.slice(0, 10).join(', ')}`);
+  }
+
+  const policy: AppAccessPolicy = { mode: 'drop-users', allow };
+
+  // setAccessPolicy, not updateConfig/updateSystemConfig: `access` is a
+  // RESTRICTED field that every other writer strips at runtime. It does not
+  // create a config when none exists, so an access write against a name that
+  // has runtime state but no persisted config refuses rather than minting a
+  // skeleton config that the next boot's reconciliation would then treat as a
+  // real app.
+  const updated = await getAppConfigService().setAccessPolicy(name, policy);
+  if (!updated) {
+    throw new NotFoundError(`Application '${name}' not found`);
+  }
+
+  let applied = true;
+  let applyError: string | undefined;
+  try {
+    // Without this the policy is written and NOTHING in the running Caddyfile
+    // changes until the app happens to be redeployed — fail-open in the enable
+    // direction, with the dashboard reporting the app as gated.
+    await ops.reconfigureRoute(name);
+  } catch (err) {
+    // The policy is already persisted, so an error STATUS here would describe
+    // the opposite of the stored state. Report success-with-`applied: false`
+    // and let the state flag (written by the emission path's own catch) carry
+    // the same news to the estate view.
+    applied = false;
+    applyError = err instanceof Error ? err.message : 'Failed to re-emit the route';
+  }
+
+  await logActivityFor(auth, { action: 'access-gate-set', appName: name });
+
+  const enforced = applied && gateEnforced(verdict, true);
+  return c.json(
+    success({
+      message: enforced
+        ? `Access gate set for '${name}'`
+        : `Access policy recorded for '${name}', but it is NOT being enforced`,
+      access: policy,
+      enforced,
+      ...(ACCESS_GATE_ENFORCEMENT_AVAILABLE
+        ? {}
+        : {
+            // Slice 0 ships the policy store and the refusals; nothing emits a
+            // guard yet. Saying "gate set" here would be the platform's own
+            // API asserting a control that does not exist.
+            notEnforcedReason:
+              'this build records access policies but does not yet enforce them',
+          }),
+      ...(applyError ? { applyError } : {}),
+    })
+  );
+});
+
+// DELETE /apps/:name/access - Admin: remove the gate entirely.
+//
+// Deliberately NOT gated on enforceability: an operator must always be able to
+// REMOVE a control, including on a box that can no longer enforce it. Refusing
+// here would strand a policy that the platform itself reports as not applied.
+apps.delete('/:name/access', async c => {
+  const auth = (c.get as Function)('auth') as AuthContext | undefined;
+  const name = c.req.param('name');
+  const refusal = requireAuthForAccessRoutes();
+  if (refusal) return c.json(error(ErrorCodes.UNAUTHORIZED, refusal), 401);
+
+  const app = getStateManager().getApp(name);
+  if (!app) {
+    throw new NotFoundError(`Application '${name}' not found`);
+  }
+
+  const ops = getPlatformOps();
+  if (!ops) {
+    return c.json(error(ErrorCodes.SERVICE_UNAVAILABLE, 'Platform operations unavailable'), 503);
+  }
+  // Before the write, for the same reason PUT pre-checks: a 409 after the
+  // policy is already gone tells the operator the gate is still in place when
+  // it is not — the worst possible direction for this particular lie.
+  if (ops.isAppInProgress(name)) {
+    return c.json(error(ErrorCodes.CONFLICT, `Application '${name}' has an operation in progress`), 409);
+  }
+
+  const updated = await getAppConfigService().setAccessPolicy(name, undefined);
+  if (!updated) {
+    throw new NotFoundError(`Application '${name}' not found`);
+  }
+
+  let applyError: string | undefined;
+  try {
+    await ops.reconfigureRoute(name);
+  } catch (err) {
+    // The gate is already gone from the store, so the removal SUCCEEDED. Only
+    // the re-emission failed, which for a removal leaves a stale guard in
+    // Caddy — restrictive, not permissive — so this is reported, not an error.
+    applyError = err instanceof Error ? err.message : 'Failed to re-emit the route';
+  }
+
+  await logActivityFor(auth, { action: 'access-gate-clear', appName: name });
+
+  return c.json(
+    success({
+      message: `Access gate removed for '${name}'`,
+      ...(applyError ? { applyError } : {}),
+    })
+  );
 });
 
 /**

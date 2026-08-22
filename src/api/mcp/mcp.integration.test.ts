@@ -19,23 +19,26 @@ import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/
 import { ApiServer } from '../server';
 import { getStateManager, resetStateManager } from '../../managers/app/state-manager';
 import { setPlatformOps, resetPlatformOps, PlatformOps } from '../platform-ops';
+import { makePlatformOpsStub } from '../__testutils__/platform-ops';
 import { resetRateLimits } from '../middleware/rate-limit';
 import { resetUploadPreflightState } from '../upload-preflight';
 
 const PORT = 39471;
 const MCP_URL = `http://127.0.0.1:${PORT}/api/v1/mcp`;
 
+// Delegates to the shared stub rather than hand-rolling the object: this copy
+// broke on three separate PlatformOps additions, which is exactly what
+// `__testutils__/platform-ops.ts` exists to prevent. The overrides below keep
+// this suite's own deliberate defaults.
 function makeOps(overrides?: Partial<PlatformOps>): PlatformOps {
-  return {
+  return makePlatformOpsStub({
     restartApp: jest.fn(),
     attachService: jest.fn(),
     detachService: jest.fn(),
     getServiceIntent: jest.fn(),
-    isAppInProgress: jest.fn().mockReturnValue(false), promoteApp: jest.fn(),
-    removeGroup: jest.fn().mockResolvedValue({ removed: [] }),
-    purgeAppArtifacts: jest.fn().mockResolvedValue(undefined),
+    promoteApp: jest.fn(),
     ...overrides,
-  };
+  });
 }
 
 describe('Hosted MCP endpoint (integration)', () => {

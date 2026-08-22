@@ -92,6 +92,13 @@ export interface ApiServerConfig {
   /** Per-user managed-Redis cap (passed through to runtime-config for GET /db/:name). */
   maxRedisPerUser?: number;
   /**
+   * Tenant isolation mode (passed through to runtime-config). Read by the
+   * access-gate route, which refuses to enable a gate the platform cannot
+   * enforce — outside docker isolation the tenant binds the host port itself
+   * and `host:port` walks straight past Caddy.
+   */
+  isolation?: 'none' | 'docker';
+  /**
    * Override the resolved dashboard directory (normally dist/dashboard, or
    * src/dashboard as a dev fallback — see setupRoutes). Defaults to that
    * resolution when unset; exists so tests can point at an isolated fixture
@@ -298,6 +305,16 @@ export class ApiServer {
     // back if and when a collection route exists.
     v1.use('/apps/*/services/*', servicesRateLimitMiddleware());
 
+    // The access-gate policy routes (DROP-152) get the services bucket too.
+    // Part 9 of the plan declined a bucket on the grounds that the route is
+    // "admin-only and cheap"; the call graph says otherwise — every PUT/DELETE
+    // runs `reconfigureRoute`, which regenerates the WHOLE Caddyfile and
+    // reloads Caddy once per routed domain. A scripted loop (or a stolen admin
+    // key) is an estate-wide routing DoS, and a failed reload mid-storm takes
+    // every tenant on the box with it. Registered unconditionally, like the
+    // other dedicated buckets, so an auth-disabled box gets it too.
+    v1.use('/apps/*/access', servicesRateLimitMiddleware());
+
     // Apply auth middleware to protected routes when auth is enabled
     if (this.config.enableAuth && isAuthEnabled()) {
       // migrate-runtime is admin-only — register before the general /apps/* guard.
@@ -306,6 +323,12 @@ export class ApiServer {
       // scoped DROP_API_KEY) is admin-only — register before the general /apps/*
       // guard so a readonly/user token can't confer capabilities.
       v1.use('/apps/*/capabilities', authMiddleware('admin'));
+      // The browser access gate (DROP-152) is a GOVERNANCE control: who may
+      // OPEN an app, set by whoever governs the estate. Admin-only, and
+      // registered before the general /apps/* guard — a `user`-role owner must
+      // not be able to widen (or clear) an allow-list an admin set on their
+      // app, which the general 'readonly'/'user' guard would permit.
+      v1.use('/apps/*/access', authMiddleware('admin'));
       // start/stop/restart mutate runtime state (and, on restart, tear down
       // and recreate the process/container) — read-only tokens must not
       // reach them. Register before the general /apps/* guard.
