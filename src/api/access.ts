@@ -148,7 +148,31 @@ export function canOpen(
   policy: AppAccessPolicy
 ): boolean {
   if (!auth) return false; // Fails CLOSED — see above.
+
+  // A BROWSER SESSION, or nothing. `interactiveSessionOnly` exists in this
+  // file because "a role alone does not distinguish an agent token from a
+  // session", and the same is true here for a harder reason: `forward_auth`
+  // proxies the ORIGINAL request to the verify hop, so a tenant-controlled
+  // `Authorization` / `X-Api-Key` header arrives with it unless stripped by
+  // name in the generated Caddy block. Without this clause an admin-role API
+  // key opens every gated app, and the scoped `DROP_API_KEY` DROP itself
+  // injects into a tenant app — which resolves to its owner's user id —
+  // satisfies the owner clause of a gate that owner set.
+  //
+  // `authMethod === 'jwt'` is the fail-closed choice, not a prediction: the
+  // session the gate mints is a jose-signed token and surfaces as `jwt`. If a
+  // later change gives it a distinct method, this refuses until someone
+  // widens it deliberately, which is the direction an authorization check
+  // should fail in.
+  if (auth.authMethod !== 'jwt' || auth.role === 'none' || auth.kind === 'agent') return false;
+
   if (auth.role === 'admin') return true;
+  // `userId` is a required `string` on the type and NOT always one at runtime:
+  // the `DROP_API_KEY` and `cli-local` principals are ownerless, and a
+  // monorepo group child has no `AppState.userId` at all. Two `undefined`s
+  // must not compare equal into an admission. The clause above already
+  // excludes those principals; this stays because the reason it was written
+  // is a fact about the data, not about the credential class.
   if (auth.userId !== undefined && app.userId === auth.userId) return true;
   return auth.userId !== undefined && policy.allow.includes(auth.userId);
 }

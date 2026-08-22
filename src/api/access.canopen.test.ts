@@ -80,4 +80,40 @@ describe('canOpen', () => {
     const agent = ctx({ userId: 'user-9', role: 'none', kind: 'agent', authMethod: 'apikey' });
     expect(canOpen(agent, { userId: 'owner-1' }, gated(['user-1']))).toBe(false);
   });
+
+  describe('credential class', () => {
+    // `forward_auth` proxies the ORIGINAL request to the verify hop, so a
+    // tenant-controlled Authorization / X-Api-Key header arrives with it
+    // unless stripped by name in the generated Caddy block. A role alone does
+    // not distinguish an agent token from a browser session.
+
+    it('refuses an ADMIN-role API key', () => {
+      const key = ctx({ userId: 'admin-1', role: 'admin', authMethod: 'apikey' });
+      expect(canOpen(key, { userId: 'owner-1' }, gated([]))).toBe(false);
+    });
+
+    it('refuses the OWNER presenting an API key rather than a session', () => {
+      // The scoped DROP_API_KEY that DROP injects into a tenant app resolves
+      // to its owner's user id — so without this the app can open its own
+      // owner's gate from inside the container.
+      const key = ctx({ userId: 'owner-1', role: 'user', authMethod: 'apikey' });
+      expect(canOpen(key, { userId: 'owner-1' }, gated([]))).toBe(false);
+    });
+
+    it('refuses an OAuth access token', () => {
+      const oauth = ctx({ userId: 'user-1', role: 'user', authMethod: 'oauth' });
+      expect(canOpen(oauth, { userId: 'owner-1' }, gated(['user-1']))).toBe(false);
+    });
+
+    it('refuses an agent-kind credential even on the jwt path', () => {
+      const agent = ctx({ userId: 'user-1', role: 'user', authMethod: 'jwt', kind: 'agent' });
+      expect(canOpen(agent, { userId: 'owner-1' }, gated(['user-1']))).toBe(false);
+    });
+
+    it('admits an ordinary interactive session', () => {
+      expect(
+        canOpen(ctx({ userId: 'user-1', authMethod: 'jwt' }), { userId: 'owner-1' }, gated(['user-1']))
+      ).toBe(true);
+    });
+  });
 });
