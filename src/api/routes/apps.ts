@@ -12,7 +12,7 @@ import { Readable, Transform } from 'stream';
 import { pipeline } from 'stream/promises';
 import { success, error, ErrorCodes, AppDto, CreateAppDto } from '../types';
 import { NotFoundError, ValidationError } from '../middleware/error';
-import { AuthContext, listUsers, getUserById } from '../middleware/auth';
+import { AuthContext, listUsers, getUserById, isAuthEnabled } from '../middleware/auth';
 import { canAccess } from '../access';
 import { isValidAppName, validateAppName } from '../middleware/validate';
 import { getAppRuntime } from '../../managers/runtime';
@@ -59,7 +59,6 @@ import {
   resolveHttpsEffective,
 } from '../../managers/guardrail/access-gate';
 import { getTenantNetworkIsolation } from '../../managers/runtime/container-manager';
-import { isAuthEnabled } from '../middleware/auth';
 import { DeployRefusedError } from '../../managers/guardrail/deploy-breaker';
 import { QuotaExceededError } from '../../managers/guardrail/principal-quota';
 import { pruneOwnerDumpsToFit, predeleteMaxBytes } from '../../managers/guardrail/detach-limits';
@@ -1334,6 +1333,16 @@ const MAX_ACCESS_ALLOW_ENTRIES = 200;
  * Reads the same `assessAccessGate` rule the platform's own emission path and
  * boot sweep read; only the input resolution differs, because a route reaches
  * the platform through runtime-config rather than PlatformConfig.
+ *
+ * That difference is real and bounded in ONE direction. A route sees
+ * `AppConfig`, which lags `drop.yaml` for `tls:` (persisted only on the
+ * custom-domain branch of handleConfigureRoute) and does not know which
+ * hostnames the reserved-host and cross-tenant filters will drop. So this can
+ * be OPTIMISTIC where emission is not — never the reverse, since every input it
+ * reads is a superset constraint. Emission is the authoritative point: it
+ * refuses the guard and flags the app, so the outcome of a divergence is a
+ * visible "gate not applied", never a silently unprotected app that reports
+ * as gated.
  */
 function assessGateFromRoute(appName: string) {
   const config = getAppConfigServiceOrNull()?.getConfig(appName);
