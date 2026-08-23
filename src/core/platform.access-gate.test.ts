@@ -140,17 +140,60 @@ describe('platform access-gate refusals (DROP-152)', () => {
       expect(setAccessGateUnapplied).toHaveBeenCalledWith('myapp', undefined);
     });
 
-    it('flags a gated app even when the BOX could enforce one', async () => {
-      // `ACCESS_GATE_ENFORCEMENT_AVAILABLE` is false: this build emits no
-      // guard at all, so a policy that exists is by definition not applied.
-      // The flag is a statement about traffic, not about the box's capability
-      // — reporting `false` here would assert a control that does not exist.
+    it('flags a gated app when the reload never reached Caddy', async () => {
+      // The box CAN enforce a gate and this build HAS an emitter — but no
+      // Caddy is wired here, so `reloadCaddyIfRunning` reports 'skipped' and
+      // nothing is carrying the guard. All three conditions have to hold; this
+      // is the third one failing on its own.
+      expect(ACCESS_GATE_ENFORCEMENT_AVAILABLE).toBe(true);
       wire(configFor({ access: POLICY }));
       await configureRoute();
-      expect(ACCESS_GATE_ENFORCEMENT_AVAILABLE).toBe(false);
       expect(setAccessGateUnapplied).toHaveBeenCalledWith('myapp', true);
-      // ...but with no refusal logged, because nothing about the box is wrong.
+      // ...and no refusal is logged, because nothing about the BOX is wrong.
       expect(errors.filter(e => e.includes('NOT protected'))).toHaveLength(0);
+    });
+
+    it('records the gate as APPLIED when Caddy accepted the config', async () => {
+      wire(configFor({ access: POLICY }));
+      (platform as unknown as Record<string, unknown>).caddyServer = {
+        getStatus: () => 'running',
+        reload: jest.fn().mockResolvedValue(true),
+      };
+
+      await configureRoute();
+
+      expect(setAccessGateUnapplied).toHaveBeenCalledWith('myapp', false);
+    });
+
+    it('emits the access guard into the route', async () => {
+      wire(configFor({ access: POLICY }));
+      (platform as unknown as Record<string, unknown>).caddyServer = {
+        getStatus: () => 'running',
+        reload: jest.fn().mockResolvedValue(true),
+      };
+
+      await configureRoute();
+
+      const { addRoute } = (platform as unknown as { router: { addRoute: jest.Mock } }).router;
+      const emitted = addRoute.mock.calls[0][0] as { accessAuth?: Record<string, string> };
+      expect(emitted.accessAuth).toMatchObject({
+        appName: 'myapp',
+        cookieName: '__Host-drop-session-myapp',
+      });
+      // The origin is a GENERATION-TIME literal for the hostname this block
+      // serves — never derived at request time from a header forward_auth
+      // carries from the client.
+      expect(emitted.accessAuth?.origin).toBe('https://myapp.example.com');
+    });
+
+    it('emits NO access guard when the verdict refuses', async () => {
+      (platform as unknown as { config: { isolation: string } }).config.isolation = 'none';
+      wire(configFor({ access: POLICY }));
+
+      await configureRoute();
+
+      const { addRoute } = (platform as unknown as { router: { addRoute: jest.Mock } }).router;
+      expect((addRoute.mock.calls[0][0] as { accessAuth?: unknown }).accessAuth).toBeUndefined();
     });
 
     it('flags and logs when the platform is not in docker isolation', async () => {

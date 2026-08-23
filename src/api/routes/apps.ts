@@ -1391,6 +1391,17 @@ apps.get('/:name/access', async c => {
       // installed the guard. Distinct from `enforceable`: the box can be
       // capable and the emission still have failed.
       gateApplied: app.accessGateUnapplied === undefined ? null : !app.accessGateUnapplied,
+      // AC3: who has opened it, and when it was last opened at all.
+      //
+      // Deliberately on THIS route rather than on the app DTO. It is personal
+      // data about third parties — the visitor set — and `/apps/*` is reachable
+      // by every `readonly` principal and by the app's owner, while this route
+      // is admin-only. Source IP is never recorded anywhere, so there is none
+      // to leak here.
+      lastOpenedAt: app.lastOpenedAt ?? null,
+      recentOpeners: app.recentOpeners ?? [],
+      owner: app.userId ?? null,
+      reviewBy: getAppConfigServiceOrNull()?.getConfig(name)?.reviewBy ?? null,
     })
   );
 });
@@ -1475,6 +1486,17 @@ apps.put('/:name/access', async c => {
 
   const policy: AppAccessPolicy = { mode: 'drop-users', allow };
 
+  // A governance review date. Metadata, not authorization — so it goes on the
+  // SYSTEM tier with the existing narrowed writers rather than joining the
+  // RESTRICTED tier, which exists for fields that decide who may do something
+  // and costs a dedicated setter per field.
+  const reviewBy = typeof (body as { reviewBy?: unknown }).reviewBy === 'string'
+    ? (body as { reviewBy: string }).reviewBy
+    : undefined;
+  if (reviewBy !== undefined && Number.isNaN(Date.parse(reviewBy))) {
+    throw new ValidationError('reviewBy must be an ISO-8601 date');
+  }
+
   // setAccessPolicy, not updateConfig/updateSystemConfig: `access` is a
   // RESTRICTED field that every other writer strips at runtime. It does not
   // create a config when none exists, so an access write against a name that
@@ -1484,6 +1506,9 @@ apps.put('/:name/access', async c => {
   const updated = await getAppConfigService().setAccessPolicy(name, policy);
   if (!updated) {
     throw new NotFoundError(`Application '${name}' not found`);
+  }
+  if (reviewBy !== undefined) {
+    await getAppConfigService().updateSystemConfig(name, { reviewBy });
   }
 
   let applied = true;

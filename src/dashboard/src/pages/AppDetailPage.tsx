@@ -19,6 +19,7 @@ import {
   Terminal,
   AlertTriangle,
   Database,
+  Lock,
 } from 'lucide-react';
 import {
   useApp,
@@ -43,6 +44,7 @@ import LogViewer from '../components/LogViewer';
 import Tabs, { TabDef } from '../components/Tabs';
 import MetricsTab from '../components/MetricsTab';
 import DatabaseTab from '../components/DatabaseTab';
+import AccessTab from '../components/AccessTab';
 import Card from '../components/ui/Card';
 import Button from '../components/ui/Button';
 import Input from '../components/ui/Input';
@@ -58,6 +60,10 @@ const DETAIL_TABS: TabDef[] = [
   { id: 'database', label: 'Database', icon: Database },
   { id: 'environment', label: 'Environment', icon: Key },
   { id: 'domains', label: 'Domains', icon: Globe },
+  // Governance, not runtime — but it belongs beside the app it governs rather
+  // than in a separate estate screen, because the question "who may open this"
+  // is asked while looking at the app.
+  { id: 'access', label: 'Access', icon: Lock },
 ];
 
 function AppDetailPage() {
@@ -669,6 +675,8 @@ function AppDetailPage() {
       {activeTab === 'metrics' && <MetricsTab app={app} />}
 
       {activeTab === 'database' && <DatabaseTab name={app.name} />}
+
+      {activeTab === 'access' && <AccessTab appName={app.name} />}
 
       {activeTab === 'environment' && (
         <Card padded={false}>

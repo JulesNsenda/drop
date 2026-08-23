@@ -26,6 +26,7 @@ import {
   mcpRateLimitMiddleware,
   oauthRateLimitMiddleware,
   dbRateLimitMiddleware,
+  accessVerifyRateLimitMiddleware,
   servicesRateLimitMiddleware,
 } from './middleware/rate-limit';
 import { securityHeadersMiddleware } from './middleware/security-headers';
@@ -51,10 +52,13 @@ import adminRoutes from './routes/admin';
 import usageRoutes from './routes/usage';
 import oauthRoutes from './routes/oauth';
 import mcpGatewayRoutes from './routes/mcp-gateway';
+import appAccessRoutes from './routes/app-access';
 import { handleMcpRequest, methodNotAllowed } from './mcp/transport';
 
 /** Matches POST /api/v1/apps/:name/source — the upload-deploy endpoint (PRD-039). */
 const UPLOAD_SOURCE_PATH_RE = /^\/api\/v1\/apps\/[A-Za-z0-9_-]+\/source$/;
+/** Matches the access gate's verify hop, which is exempt from the general limiter. */
+const ACCESS_VERIFY_PATH_RE = /^\/api\/v1\/app-access\/[A-Za-z0-9_-]+\/verify$/;
 /** Matches /api/v1/mcp — the hosted MCP endpoint (PRD-040). */
 const MCP_PATH_RE = /^\/api\/v1\/mcp$/;
 /** deploy_files allows up to 1.5 MB of summed file content — comfortably over the global 1 MB body cap. */
@@ -214,7 +218,13 @@ export class ApiServer {
     });
 
     // Rate limiting
-    this.app.use('/api/*', rateLimitMiddleware());
+    // The access gate's verify hop is exempt: it is a per-request authorization
+    // sub-request rather than API traffic, and it has its own much larger
+    // bucket registered below. Stacking the two would defeat that one.
+    this.app.use('/api/*', async (c, next) => {
+      if (ACCESS_VERIFY_PATH_RE.test(new URL(c.req.url).pathname)) return next();
+      return rateLimitMiddleware()(c, next as never);
+    });
 
     // Request logging
     this.app.use('*', logger());
@@ -305,6 +315,26 @@ export class ApiServer {
     // back if and when a collection route exists.
     v1.use('/apps/*/services/*', servicesRateLimitMiddleware());
 
+    // The access gate's CREDENTIAL-minting hops get the strict bucket:
+    // `/authorize` and `/code` each hand out something that becomes a session.
+    // Registered unconditionally, like every other dedicated bucket.
+    v1.use('/app-access/authorize', authRateLimitMiddleware());
+    v1.use('/app-access/code', authRateLimitMiddleware());
+
+    // `verify` gets its OWN, deliberately LARGE bucket, and is exempted from
+    // the general `/api/*` limiter above.
+    //
+    // It is not a credential surface — it is a per-HTTP-REQUEST authorization
+    // sub-request. `forward_auth` fires for every JS chunk, image and XHR of
+    // every gated page, so one ordinary SPA page load is 30-80 hits. On the
+    // general 100/min bucket that breaks a gated app under normal browsing
+    // AND throttles the same visitor out of the dashboard, because
+    // `getClientIp` trusts the XFF Caddy forwards from loopback — so the
+    // bucket is keyed per END USER, not per proxy. Caddy copies a non-2xx
+    // from this hop straight to the browser, so a 429 here is a visible
+    // outage, not a refusal.
+    v1.use('/app-access/*/verify', accessVerifyRateLimitMiddleware());
+
     // The access-gate policy routes (DROP-152) get the services bucket too.
     // Part 9 of the plan declined a bucket on the grounds that the route is
     // "admin-only and cheap"; the call graph says otherwise — every PUT/DELETE
@@ -323,6 +353,12 @@ export class ApiServer {
       // scoped DROP_API_KEY) is admin-only — register before the general /apps/*
       // guard so a readonly/user token can't confer capabilities.
       v1.use('/apps/*/capabilities', authMiddleware('admin'));
+      // The SPA consent hop presents the visitor's dashboard bearer. Only this
+      // one endpoint of the gate is behind a role guard — `verify`,
+      // `authorize` and `exchange` each authenticate their own credential
+      // class (or none), exactly as `/oauth/approve` is guarded while
+      // `/oauth/authorize` is not.
+      v1.use('/app-access/code', authMiddleware('readonly'));
       // The browser access gate (DROP-152) is a GOVERNANCE control: who may
       // OPEN an app, set by whoever governs the estate. Admin-only, and
       // registered before the general /apps/* guard — a `user`-role owner must
@@ -439,6 +475,7 @@ export class ApiServer {
     // bearer itself and must reject every other credential class, which a
     // general auth gate would instead admit.
     v1.route('/mcp-gateway', mcpGatewayRoutes);
+    v1.route('/app-access', appAccessRoutes);
 
     // Hosted MCP endpoint (PRD-040): stateless Streamable HTTP, POST only.
     // GET/DELETE have no meaning in stateless mode (no sessions/streams) —

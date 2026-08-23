@@ -1368,9 +1368,20 @@ export const ACCESS_TOKEN_TTL_SECONDS = 15 * 60;
 const ACCESS_TOKEN_TTL_MS = ACCESS_TOKEN_TTL_SECONDS * 1000;
 const revokedGrants = new Map<string, number>();
 
-function denyGrant(sid: string): void {
+/**
+ * Revoke one grant until the credential carrying it would have expired anyway.
+ *
+ * `ttlMs` defaults to the OAuth access-token lifetime, which is what every
+ * caller wanted while `oauth_access` and `app_mcp` were the only classes using
+ * it. The browser session class (`app_access/session-token.ts`) lives for
+ * HOURS, so a denial retained for 15 minutes would silently stop denying it —
+ * the entry would be swept and the still-valid token would work again. A
+ * denylist that expires before the thing it denies is worse than no denylist,
+ * because it reads as coverage.
+ */
+export function denyGrant(sid: string, ttlMs: number = ACCESS_TOKEN_TTL_MS): void {
   if (!sid) return;
-  revokedGrants.set(sid, Date.now() + ACCESS_TOKEN_TTL_MS);
+  revokedGrants.set(sid, Date.now() + ttlMs);
   // Opportunistic sweep — no timer to leak, and the map only ever holds
   // entries from the last token-lifetime of revocation activity.
   const now = Date.now();
@@ -1379,10 +1390,35 @@ function denyGrant(sid: string): void {
   }
 }
 
-function isGrantDenied(sid: string | undefined): boolean {
+/**
+ * Whether a specific grant (`sid`) has been revoked.
+ *
+ * Exported for the sibling credential class in `src/api/app-access/`, which
+ * needs the same denylist this module's own verifiers consult. A credential
+ * class that could not be reached by `denyGrant` would be revocable only by
+ * suspending the whole account.
+ */
+export function isGrantDenied(sid: string | undefined): boolean {
   if (!sid) return false;
   const until = revokedGrants.get(sid);
   return until !== undefined && until > Date.now();
+}
+
+/**
+ * The signing key for the app-audienced token classes.
+ *
+ * Exported ONLY for `src/api/app-access/session-token.ts`, which mints and
+ * verifies the browser session for a gated app. That module lives outside this
+ * file for size and cohesion — `auth.ts` is ~2k lines and imported by every
+ * route file — not because a trust boundary runs between them: three
+ * mint/verify pairs already use this key inside this module, and the fourth is
+ * the same kind of thing sitting next door.
+ *
+ * Do not widen this beyond that use. Anything that needs to SIGN with it is a
+ * new credential class and should be reviewed as one.
+ */
+export function getOAuthTokenSecret(): Uint8Array | null {
+  return oauthTokenSecret;
 }
 
 /** Hash an opaque token the same way API keys are hashed (sha256 hex digest of the raw value). */

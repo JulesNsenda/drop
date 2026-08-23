@@ -11,6 +11,7 @@ import {
   CaddyConfig,
   UpstreamConfig,
   McpAuthConfig,
+  AccessAuthConfig,
 } from './router.types';
 import { DnsProvider } from './dns-challenge';
 
@@ -126,6 +127,16 @@ export function generateRouteBlock(
     });
   }
 
+  // The browser access gate restructures the whole tail of the block, so it
+  // is handled as one unit rather than as another entry in the guard list.
+  // Everything below is the shape for a route with NO access gate, and it must
+  // stay byte-identical to what shipped before the gate existed —
+  // caddy-generator.golden.test.ts is what proves that.
+  if (route.accessAuth) {
+    directives.push(...generateAccessGatedTail(route, route.accessAuth));
+    return { address: buildAddress(route), directives };
+  }
+
   // Every DROP-owned guard for this route. MUST precede the catch-all
   // reverse_proxy below: Caddy evaluates `handle` blocks in order, and a
   // preceding catch-all would serve a guarded path unguarded.
@@ -162,6 +173,167 @@ export function generateRouteBlock(
     directives,
   };
 }
+
+/**
+ * The tail of a route block that carries the browser access gate: an exchange
+ * carve-out, then everything else inside the gate.
+ *
+ * Two composition rules, and they are OPPOSITE — which is why this cannot be
+ * one more entry in `generateGuardHandles`:
+ *
+ *  - the **exchange** handle is a SIBLING, emitted FIRST, and is never gated.
+ *    Its entire purpose is to obtain the session cookie, so a request to it
+ *    cannot be required to already have one. Nested inside the gate, the
+ *    browser arrives with no cookie, is bounced to the login, comes back to the
+ *    exchange, is bounced again — a permanent loop that burns a code per lap.
+ *  - the **MCP** handle is NESTED inside the gate's `route`, so `/mcp*`
+ *    requires the browser session AND the bearer. Measured against Caddy
+ *    2.11.4: as siblings the two guards silently diverge — `/mcp` answers 401
+ *    instead of redirecting, and a bearer-only request reaches the tenant with
+ *    no browser session at all.
+ *
+ * `handle` blocks are mutually exclusive and Caddy preserves their written
+ * order among themselves, so "first" is meaningful here.
+ */
+function generateAccessGatedTail(route: RouteConfig, access: AccessAuthConfig): CaddyDirective[] {
+  return [generateExchangeHandle(route, access), generateAccessGuardHandle(route, access)];
+}
+
+/**
+ * The DROP-owned endpoint that turns a signed code into the session cookie.
+ *
+ * Served on the TENANT's hostname because that is the only origin a cookie for
+ * that host can be set from — but proxied to DROP, never to the tenant.
+ *
+ * The rewrite target is a FIXED LITERAL. Part 3.5 of the design sketched
+ * `rewrite * /api/v1/app-access{path}?{query}`, and that is wrong twice over:
+ * `handle` (unlike `handle_path`) does not strip the matched prefix, so
+ * `{path}` still carries `/.drop-session/exchange` and the composed target is
+ * not the route anyone will write a handler for; and everything after the
+ * prefix is client-controlled being concatenated into a DROP API path, which
+ * is a route-selection primitive against `/api/v1/*`. The app name goes in the
+ * PATH, where a client cannot append a second one — measured: a query literal
+ * survives only because Hono happens to take the first value.
+ *
+ * `X-Frame-Options: DENY` is re-asserted here because the site-level `header`
+ * block sets `SAMEORIGIN` on every response in the block, and the tenant is
+ * exactly who this endpoint must not be framed by. Measured: an inner
+ * `handle`'s `header` beats the site-level one.
+ */
+function generateExchangeHandle(route: RouteConfig, access: AccessAuthConfig): CaddyDirective {
+  const matcher = `${routeMatcherPrefix(route)}${EXCHANGE_PATH}`;
+  return {
+    name: 'handle',
+    args: [matcher],
+    block: [
+      { name: 'header', args: ['X-Frame-Options', 'DENY'] },
+      // The code transits this URL and Caddy logs request URIs. It is
+      // single-use with a 60s TTL for that reason; `no-store` keeps it out of
+      // the browser's cache and history-restore as well.
+      { name: 'header', args: ['Cache-Control', 'no-store'] },
+      {
+        name: 'rewrite',
+        args: ['*', `/api/v1/app-access/${access.appName}/exchange?{query}`],
+      },
+      { name: 'reverse_proxy', args: [access.verifyUpstream] },
+    ],
+  };
+}
+
+/**
+ * The gate itself: everything the tenant would otherwise serve, behind
+ * `forward_auth`.
+ *
+ * `route` inside `handle` for the same reason `generateMcpAuthHandle` needs it
+ * — Caddy sorts a `handle`'s children by its own table and `forward_auth`
+ * sorts BEFORE `request_header`, so written as a bare list the identity strips
+ * would run AFTER the auth sub-request and delete what `copy_headers` just set.
+ *
+ * The header names are the gate's OWN (`X-Drop-Session-*`), deliberately not
+ * the MCP guard's `X-Drop-User-*`. The MCP handle nests inside this one and
+ * strips-then-re-copies its own names; sharing them would mean the browser
+ * identity is deleted and replaced by the bearer's on `/mcp*`, leaving the
+ * tenant unable to tell the two apart.
+ */
+function generateAccessGuardHandle(route: RouteConfig, access: AccessAuthConfig): CaddyDirective {
+  const inner: CaddyDirective[] = [
+    // A client must not be able to assert who it is; copy_headers re-adds the
+    // authenticated values after the sub-request.
+    { name: 'request_header', args: ['-X-Drop-Session-User-Id'] },
+    { name: 'request_header', args: ['-X-Drop-Session-Username'] },
+    {
+      name: 'forward_auth',
+      args: [access.verifyUpstream],
+      block: [
+        { name: 'uri', args: [`/api/v1/app-access/${access.appName}/verify`] },
+        { name: 'copy_headers', args: ['X-Drop-Session-User-Id', 'X-Drop-Session-Username'] },
+        // forward_auth proxies the ORIGINAL request, so a tenant-controlled
+        // bearer would otherwise arrive at DROP's verify endpoint. Measured:
+        // without these the verify hop receives them.
+        { name: 'header_up', args: ['-Authorization'] },
+        { name: 'header_up', args: ['-X-Api-Key'] },
+        // Narrow the cookie header to DROP's own. Caddy has no per-cookie
+        // primitive; this REPLACEMENT form is the expressible one, and it
+        // keeps every visitor's tenant cookies from reaching DROP on every
+        // page load. When the cookie is absent Caddy forwards the placeholder
+        // text literally, so the verify endpoint treats an unparseable value
+        // as "no session" rather than as one.
+        {
+          name: 'header_up',
+          args: ['Cookie', `"${access.cookieName}={http.request.cookie.${access.cookieName}}"`],
+        },
+      ],
+    },
+  ];
+
+  // The MCP guard nests INSIDE, so a guarded MCP endpoint on a gated app needs
+  // both credentials.
+  if (route.mcpAuth) {
+    inner.push(generateMcpAuthHandle(route, route.mcpAuth));
+  }
+
+  inner.push({
+    name: 'handle',
+    block: [generateTenantProxy(route, access)],
+  });
+
+  return { name: 'handle', block: [{ name: 'route', block: inner }] };
+}
+
+/**
+ * The proxy to the tenant, with DROP's own credentials removed.
+ *
+ * Measured, and not hypothetical: without these the tenant receives the
+ * visitor's `__Host-drop-session-<app>` cookie, their `Authorization` and their
+ * `X-Api-Key` on every single request. A malicious or merely compromised
+ * tenant harvests the session from its own inbound traffic and replays it as
+ * that visitor for the token's lifetime.
+ *
+ * The cookie is removed by ANCHORED REGEX REPLACEMENT rather than by
+ * `header_up -Cookie`, which would delete the whole header and break every
+ * tenant app's own sessions.
+ */
+function generateTenantProxy(route: RouteConfig, access: AccessAuthConfig): CaddyDirective {
+  const proxy = generateReverseProxyDirective(route);
+  proxy.block = [
+    ...(proxy.block ?? []),
+    { name: 'header_up', args: ['-Authorization'] },
+    { name: 'header_up', args: ['-X-Api-Key'] },
+    {
+      name: 'header_up',
+      args: ['Cookie', `"${escapeRegex(access.cookieName)}=[^;]*;?\\s*"`, '""'],
+    },
+  ];
+  return proxy;
+}
+
+/** Escape a literal for use inside a Caddy `header_up` replacement regex. */
+function escapeRegex(literal: string): string {
+  return literal.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/** The path, on the tenant's own hostname, that DROP owns for the code exchange. */
+export const EXCHANGE_PATH = '/.drop-session/exchange';
 
 /**
  * Every DROP-owned guard `handle` this route needs, in emission order.

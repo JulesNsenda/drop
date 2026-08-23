@@ -138,17 +138,17 @@ describe('/apps/:name/access (DROP-152 access gate)', () => {
       expect(reconfigureRoute).toHaveBeenCalledWith('myapp');
     });
 
-    it('does NOT claim the gate is enforced on a build with no guard emitter', async () => {
-      // The whole point of the `enforced` field. A 200 saying "Access gate set"
-      // for a control that does not exist is worse than the pre-change state,
-      // which made no claim at all.
+    it('reports the gate as ENFORCED once the emitter exists', async () => {
+      // The `enforced` field is the API's claim about traffic, distinct from
+      // `enforceable` (a claim about the box). It was false for the whole of
+      // Slice 1a because nothing emitted a guard; it is true now.
       const res = await put('myapp', adminToken, { allow: [outsiderId] });
       const body = (await res.json()) as {
         data: { enforced: boolean; message: string; notEnforcedReason?: string };
       };
-      expect(body.data.enforced).toBe(false);
-      expect(body.data.message).toContain('NOT being enforced');
-      expect(body.data.notEnforcedReason).toBeDefined();
+      expect(body.data.enforced).toBe(true);
+      expect(body.data.message).toContain('Access gate set');
+      expect(body.data.notEnforcedReason).toBeUndefined();
     });
 
     it('records an activity entry on success', async () => {
@@ -287,6 +287,11 @@ describe('/apps/:name/access (DROP-152 access gate)', () => {
 
   describe('GET', () => {
     it('separates "enforced" from "enforceable" from "applied"', async () => {
+      // Three different questions, and the estate view needs all three:
+      //   enforceable — could this BOX enforce a gate?
+      //   enforced    — is this build's API claiming this app is gated?
+      //   gateApplied — did the platform's last emission actually reach Caddy?
+      // A box can be capable and the emission still have failed.
       await put('myapp', adminToken, { allow: [outsiderId] });
       await getStateManager().setAccessGateUnapplied('myapp', true);
 
@@ -301,11 +306,10 @@ describe('/apps/:name/access (DROP-152 access gate)', () => {
         };
       };
       expect(body.data.access.allow).toEqual([outsiderId]);
-      // The box could enforce one...
       expect(body.data.enforceable).toBe(true);
-      // ...this build does not...
-      expect(body.data.enforced).toBe(false);
-      // ...and the platform's last emission says so independently.
+      expect(body.data.enforced).toBe(true);
+      // ...but the platform's own record says the guard is NOT in Caddy, which
+      // is exactly the disagreement this field exists to surface.
       expect(body.data.gateApplied).toBe(false);
     });
 

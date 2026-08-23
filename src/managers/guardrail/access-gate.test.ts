@@ -133,12 +133,14 @@ describe('assessAccessGate', () => {
     });
   });
 
-  it('reports enforcement as UNAVAILABLE in this build', () => {
+  it('reports enforcement as AVAILABLE in this build', () => {
     // The verdict answers "could this box enforce a gate", which is not the
-    // same question as "is anything enforcing one". Until the guard emitter
-    // ships, nothing is — and every affirmative signal in the API is gated on
-    // this constant so none of them can claim otherwise.
-    expect(ACCESS_GATE_ENFORCEMENT_AVAILABLE).toBe(false);
+    // same question as "is anything enforcing one". This build has the
+    // emitter, the verify endpoint and the exchange, so the answer is yes —
+    // and every affirmative signal in the API is gated on this constant, so
+    // flipping it back is what would keep them honest if the emitter ever
+    // went away.
+    expect(ACCESS_GATE_ENFORCEMENT_AVAILABLE).toBe(true);
   });
 
   it('reports EVERY blocker, not just the first', () => {

@@ -135,6 +135,8 @@ import {
   resetLogRetentionService,
 } from '../managers/log-retention/log-retention';
 import { hasEnoughDisk, getMinFreeDiskMb } from '../utils/disk';
+import { getAccessLog, resetAccessLog } from '../managers/access-log/access-log';
+import { sessionCookieName as appSessionCookieName } from '../api/routes/app-access';
 import {
   assessAccessGate,
   describeAccessGateRefusal,
@@ -816,6 +818,10 @@ export class DropPlatform {
 
       // Prune old logs so a long-lived box can't fill its disk (per-app, Caddy,
       // build and platform logs all live under data/logs). Sweeps now + daily.
+      // The gate's evidence trail. Under data/logs so the EXISTING retention
+      // sweep prunes it — which is why its files end `.access.log`.
+      getAccessLog(path.join(this.config.dropRoot, 'data', 'logs'));
+
       this.logRetention = getLogRetentionService(
         path.join(this.config.dropRoot, 'data', 'logs'),
         this.config.logRetentionDays
@@ -1046,6 +1052,16 @@ export class DropPlatform {
       this.deployDetailUnsub();
       this.deployDetailUnsub = undefined;
     }
+    // The access log aggregates in memory between flushes, and `deploy.yml`
+    // stops this process on every push to `develop` — so without this the
+    // current window is lost on every deploy.
+    try {
+      await getAccessLog().flush();
+    } catch {
+      // Never block shutdown on log hygiene.
+    }
+    resetAccessLog();
+
     try {
       await getDeployTracker().flush();
     } catch {
@@ -4720,6 +4736,21 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         domains = gateSafe;
       }
 
+      // The browser access gate (DROP-152). Computed as ONE value, beside
+      // mcpGuard, rather than as a section inside the per-domain loop — that
+      // loop already sits 60 lines deep in a 340-line method, and the next
+      // guard should be able to follow this shape rather than deepen it.
+      const accessGuard =
+        accessPolicy && accessVerdict?.enforceable && ACCESS_GATE_ENFORCEMENT_AVAILABLE
+          ? {
+              appName,
+              // Filled in per hostname below.
+              origin: '',
+              verifyUpstream: `127.0.0.1:${this.config.apiPort}`,
+              cookieName: appSessionCookieName(appName),
+            }
+          : undefined;
+
       // Configure route for each domain
       let resolvedPublicUrl: string | undefined;
       for (const hostname of domains) {
@@ -4752,6 +4783,13 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           // is indistinguishable from "unchanged". Turning a guard off used to
           // leave it in the Caddyfile for the life of the process.
           mcpAuth: mcpGuard,
+          // The browser access gate. `origin` is the hostname THIS block
+          // serves, baked in at generation time — never derived at request
+          // time from `Host`/`X-Forwarded-Host`, which `forward_auth` carries
+          // from the client (SEC-2).
+          accessAuth: accessGuard
+            ? { ...accessGuard, origin: `${enableSsl ? 'https' : 'http'}://${hostname}` }
+            : undefined,
         });
 
         const protocol = enableSsl ? 'https' : 'http';

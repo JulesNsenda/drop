@@ -255,6 +255,13 @@ export interface AppConfig {
    * source, and never touched by a build.
    */
   access?: AppAccessPolicy;
+  /**
+   * When this app's access policy should next be reviewed (ISO-8601, DROP-152
+   * AC3). Governance METADATA, not authorization — so it sits on the SYSTEM
+   * tier rather than the RESTRICTED one, which exists for fields that decide
+   * who may do something and costs a dedicated setter per field.
+   */
+  reviewBy?: string;
 }
 
 /**
@@ -264,6 +271,7 @@ export interface AppConfig {
  * `setServiceIntent` are the only writers allowed to touch them.
  */
 const SYSTEM_CONFIG_FIELDS = [
+  'reviewBy',
   'services',
   'grantedApiScopes',
   'agentCreated',
