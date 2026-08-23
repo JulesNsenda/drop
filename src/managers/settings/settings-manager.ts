@@ -92,10 +92,13 @@ function defaultSettingsFilePath(): string {
 type SettingsFieldType = 'string' | 'number' | 'boolean';
 
 /**
- * One entry per key in PlatformSettings. `parseSettings()` derives its
- * whitelist + type check from this table instead of a hand-written line per
- * field — this store started at four fields, each needing its own whitelist
- * line, accessor pair and `corrupt` decision, and grows past that here.
+ * One entry per key in PlatformSettings, keyed as `Record<keyof
+ * PlatformSettings, SettingsFieldType>` rather than an array of `{ key,
+ * type }` pairs — that shape is the whole reason this table earns its place
+ * over a hand-written line per field: a `PlatformSettings` field added
+ * without a matching entry HERE is a compile error, not a silent drop at
+ * `parseSettings()` time the way an array-of-specs whitelist (or the
+ * hand-written whitelist this replaced) would allow.
  *
  * This table is ONLY a type-checked whitelist for `parseSettings()` — it
  * does not mark or enforce anything about which fields are sensitive, or
@@ -107,27 +110,24 @@ type SettingsFieldType = 'string' | 'number' | 'boolean';
  * every getter" pass would have silently flipped one of them. Each getter
  * below keeps its own explicit `corrupt` check and default.
  */
-interface SettingsFieldSpec {
-  key: keyof PlatformSettings;
-  type: SettingsFieldType;
-}
-
-const SETTINGS_FIELDS: readonly SettingsFieldSpec[] = [
-  { key: 'publicUrl', type: 'string' },
-  { key: 'githubWebhookSecret', type: 'string' },
-  { key: 'userConnectorsEnabled', type: 'boolean' },
-  { key: 'appSharingEnabled', type: 'boolean' },
-  { key: 'smtpHost', type: 'string' },
-  { key: 'smtpPort', type: 'number' },
-  { key: 'smtpSecure', type: 'boolean' },
-  { key: 'smtpUser', type: 'string' },
-  { key: 'mailFrom', type: 'string' },
-  { key: 'shareNotificationsEnabled', type: 'boolean' },
-  // The SMTP password is deliberately NOT here. It lives encrypted in its
-  // own store (mail-credential.ts), owned by the mailer — adding it to this
-  // table would make parseSettings silently DROP the ciphertext object on
-  // load (it's neither a string, number nor boolean).
-];
+const SETTINGS_FIELDS: Record<keyof PlatformSettings, SettingsFieldType> = {
+  publicUrl: 'string',
+  githubWebhookSecret: 'string',
+  userConnectorsEnabled: 'boolean',
+  appSharingEnabled: 'boolean',
+  smtpHost: 'string',
+  smtpPort: 'number',
+  smtpSecure: 'boolean',
+  smtpUser: 'string',
+  mailFrom: 'string',
+  shareNotificationsEnabled: 'boolean',
+  // The SMTP password is deliberately NOT here — and cannot be, since it is
+  // not a key of `PlatformSettings` at all. It lives encrypted in its own
+  // store (mail-credential.ts), owned by the mailer; adding it to
+  // `PlatformSettings` (and, by the compiler, here too) would make
+  // parseSettings silently DROP the ciphertext object on load (it's neither
+  // a string, number nor boolean).
+};
 
 function parseSettings(raw: string): PlatformSettings {
   const parsed = JSON.parse(raw);
@@ -140,14 +140,14 @@ function parseSettings(raw: string): PlatformSettings {
   }
   const record = parsed as Record<string, unknown>;
   const result: Record<string, unknown> = {};
-  for (const field of SETTINGS_FIELDS) {
-    const value = record[field.key];
+  for (const key of Object.keys(SETTINGS_FIELDS) as (keyof PlatformSettings)[]) {
+    const value = record[key];
     // A key missing from this table round-trips as `undefined` — never
     // reaches `result` at all — and reads as "never set". That silent drop
     // is the whole reason this table exists (see the `mail-credential.ts`
     // ciphertext, which must NEVER be whitelisted here).
-    if (typeof value === field.type) {
-      result[field.key] = value;
+    if (typeof value === SETTINGS_FIELDS[key]) {
+      result[key] = value;
     }
   }
   // githubWebhookSecret's empty-string-means-absent behaviour is enforced by

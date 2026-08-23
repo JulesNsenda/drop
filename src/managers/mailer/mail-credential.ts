@@ -34,11 +34,10 @@
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import { writeJsonAtomic } from '../../utils/atomic-write';
-import { encrypt, decrypt, EncryptedData } from '../secret/encryption';
+import { encrypt, decrypt, loadPlatformMasterKey, EncryptedData } from '../secret/encryption';
 
 const isWindows = process.platform === 'win32';
 const DEFAULT_DROP_ROOT = isWindows ? 'C:\\drop' : '/var/drop';
-const KEY_LENGTH = 32;
 
 function defaultCredentialFilePath(): string {
   const dropRoot = process.env.DROP_ROOT || DEFAULT_DROP_ROOT;
@@ -81,23 +80,12 @@ export class MailCredentialStore {
   /**
    * Loads the platform's 32-byte encryption key. Returns `null` (never
    * throws) when the file is missing or the wrong length — the fail-closed
-   * `no_key` posture `auth.ts` established for TOTP secrets.
+   * `no_key` posture `auth.ts` established for TOTP secrets. Delegates to
+   * `encryption.ts`'s `loadPlatformMasterKey`, which every other reader of
+   * this same on-disk key should also go through.
    */
   private async loadKey(): Promise<Buffer | null> {
-    let hex: string;
-    try {
-      hex = (await fs.readFile(this.keyFilePath, 'utf-8')).trim();
-    } catch {
-      return null;
-    }
-    const key = Buffer.from(hex, 'hex');
-    if (key.length !== KEY_LENGTH) {
-      console.warn(
-        '[mail-credential] encryption.key is not 32 bytes — the SMTP password will not be stored or read'
-      );
-      return null;
-    }
-    return key;
+    return loadPlatformMasterKey(this.keyFilePath);
   }
 
   /**
@@ -164,29 +152,11 @@ export class MailCredentialStore {
     const key = await this.loadKey();
     if (!key) return null;
 
-    let data: string;
-    try {
-      data = await fs.readFile(this.credentialFilePath, 'utf-8');
-    } catch {
-      // No stored credential — not an error, just "not configured".
-      return null;
-    }
-
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(data);
-    } catch {
-      console.error('[mail-credential] Corrupt mail-credential.json — treating as absent');
-      return null;
-    }
-
-    if (!isValidMailCredentialFile(parsed)) {
-      console.error('[mail-credential] mail-credential.json has an unexpected shape — treating as absent');
-      return null;
-    }
+    const file = await this.readStoredCredential();
+    if (!file) return null;
 
     try {
-      return decrypt(parsed.password, key);
+      return decrypt(file.password, key);
     } catch {
       console.error(
         '[mail-credential] Failed to decrypt the stored SMTP password (key mismatch or tampering) — treating as absent'
@@ -212,22 +182,39 @@ export class MailCredentialStore {
    */
   async hasStoredCredential(): Promise<boolean> {
     if (process.env.DROP_SMTP_PASSWORD) return true;
+    return !!(await this.readStoredCredential());
+  }
 
+  /**
+   * Reads, parses and structurally validates the stored credential file —
+   * the read/parse/validate sequence `resolveMailPassword` and
+   * `hasStoredCredential` both need, factored out so the two cannot disagree
+   * about what "present" means. Returns `null` (never throws) on a missing
+   * file, corrupt JSON, or an unexpected shape.
+   */
+  private async readStoredCredential(): Promise<MailCredentialFile | null> {
     let data: string;
     try {
       data = await fs.readFile(this.credentialFilePath, 'utf-8');
     } catch {
-      return false;
+      // No stored credential — not an error, just "not configured".
+      return null;
     }
 
     let parsed: unknown;
     try {
       parsed = JSON.parse(data);
     } catch {
-      return false;
+      console.error('[mail-credential] Corrupt mail-credential.json — treating as absent');
+      return null;
     }
 
-    return isValidMailCredentialFile(parsed);
+    if (!isValidMailCredentialFile(parsed)) {
+      console.error('[mail-credential] mail-credential.json has an unexpected shape — treating as absent');
+      return null;
+    }
+
+    return parsed;
   }
 
   /**

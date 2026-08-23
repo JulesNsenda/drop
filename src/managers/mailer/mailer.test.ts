@@ -2,7 +2,7 @@ import nodemailer from 'nodemailer';
 import { getSettingsManager } from '../settings/settings-manager';
 import { getMailCredentialStore } from './mail-credential';
 import { hostnameResolvesToBlockedIp } from '../../utils/ssrf-guard';
-import { sendTemplatedMail, SEND_DEADLINE_MS } from './mailer';
+import { sendTemplatedMail, SEND_DEADLINE_MS, resetRelayHostCache } from './mailer';
 import type { MailSettings } from '../settings/settings-manager';
 
 // Nothing here ever touches a real socket or does a real DNS lookup —
@@ -59,6 +59,11 @@ describe('sendTemplatedMail', () => {
 
   beforeEach(() => {
     jest.clearAllMocks();
+    // The relay-host SSRF verdict is now cached per host (DROP-154 Gate 5
+    // §4) — without this reset, an earlier test's cached verdict for the
+    // same host would leak into a later test that reconfigures the mock for
+    // that host, and the SSRF check below it would never actually run.
+    resetRelayHostCache();
     delete process.env.DROP_SMTP_ALLOW_INSECURE_TLS;
     delete process.env.DROP_SMTP_ALLOW_PRIVATE_RELAY;
     mockSettings();
@@ -148,6 +153,15 @@ describe('sendTemplatedMail', () => {
       await sendTemplatedMail('test', 'user@example.com', { platformUrl: 'https://drop.example.com' });
 
       expect(hostnameResolvesToBlockedIp).toHaveBeenCalledWith('internal.corp');
+    });
+
+    it('resolves a given host only once — the verdict is cached across sends', async () => {
+      mockTransport(async () => ({ messageId: '1' }));
+
+      await sendTemplatedMail('test', 'user@example.com', { platformUrl: 'https://drop.example.com' });
+      await sendTemplatedMail('test', 'user@example.com', { platformUrl: 'https://drop.example.com' });
+
+      expect(hostnameResolvesToBlockedIp).toHaveBeenCalledTimes(1);
     });
 
     it('dials a blocked host anyway when DROP_SMTP_ALLOW_PRIVATE_RELAY=true', async () => {

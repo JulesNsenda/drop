@@ -20,6 +20,7 @@ import { getPublicUrl, setPublicUrl, isAccessGateEnabled } from '../runtime-conf
 import { getMailCredentialStore, clearMailCredential } from '../../managers/mailer/mail-credential';
 import { sendTemplatedMail } from '../../managers/mailer/mailer';
 import { getMailQuota } from '../../managers/guardrail/principal-quota';
+import { checkMailQuota } from './mail-quota';
 
 const admin = new Hono();
 
@@ -510,6 +511,26 @@ function normalizeMailStringField(
 }
 
 /**
+ * Validates and applies one of the two single-address `MailSettings` fields
+ * (`user`/`from`) onto `partial`, in place — `user` and `from` differ only in
+ * which field they read/write and name in the error, so this is the one
+ * place that distinction lives; `host`/`port`/`secure` genuinely differ from
+ * each other (and from these two) and stay as their own inline blocks below.
+ */
+function applyMailAddressField(
+  body: Record<string, unknown>,
+  field: 'user' | 'from',
+  partial: MailSettings
+): { ok: true } | { ok: false; message: string } {
+  const result = normalizeMailStringField(body[field], { rejectAddressSeparators: true });
+  if (!result.ok) {
+    return { ok: false, message: `${field} must be a single-address string or null` };
+  }
+  partial[field] = result.value;
+  return { ok: true };
+}
+
+/**
  * Guard for the mail routes that can reach or exfiltrate the relay
  * credential (`PUT /settings/mail`, `PUT /settings/mail/credential`,
  * `POST /mail/test`). Mirrors `requireAuthForAccessRoutes`
@@ -593,19 +614,13 @@ admin.put('/settings/mail', async (c) => {
   }
 
   if ('user' in body) {
-    const result = normalizeMailStringField(body.user, { rejectAddressSeparators: true });
-    if (!result.ok) {
-      return c.json(error(ErrorCodes.VALIDATION_ERROR, 'user must be a single-address string or null'), 400);
-    }
-    partial.user = result.value;
+    const result = applyMailAddressField(body, 'user', partial);
+    if (!result.ok) return c.json(error(ErrorCodes.VALIDATION_ERROR, result.message), 400);
   }
 
   if ('from' in body) {
-    const result = normalizeMailStringField(body.from, { rejectAddressSeparators: true });
-    if (!result.ok) {
-      return c.json(error(ErrorCodes.VALIDATION_ERROR, 'from must be a single-address string or null'), 400);
-    }
-    partial.from = result.value;
+    const result = applyMailAddressField(body, 'from', partial);
+    if (!result.ok) return c.json(error(ErrorCodes.VALIDATION_ERROR, result.message), 400);
   }
 
   let shareNotificationsEnabled: boolean | undefined;
@@ -730,29 +745,34 @@ admin.post('/mail/test', async (c) => {
     return c.json(error(ErrorCodes.VALIDATION_ERROR, 'to must be a non-empty string'), 400);
   }
 
-  // Same keysFor/check/record sequence apps.share.ts's notifyShareGrant uses
-  // against this same singleton — but this route ADMITS or REFUSES on it
-  // (a structured 429, mirroring admitDeploy's guardrail shape in
+  // checkMailQuota (mail-quota.ts) — shared with apps.share.ts's notifyShareGrant
+  // against this same singleton — but this route ADMITS or REFUSES on it (a
+  // structured 429, mirroring admitDeploy's guardrail shape in
   // deploy-breaker.ts) rather than skipping silently, since sending is this
   // route's entire purpose rather than a best-effort side effect of one.
-  const quota = getMailQuota();
-  const keys = quota.keysFor({ principalId: authCtx?.principalId, actorUserId: authCtx?.userId });
-  if (!keys.metered) {
-    return c.json(error(ErrorCodes.RATE_LIMITED, 'Mail quota unavailable for this request.'), 429);
-  }
-  const verdict = quota.check(keys.keys);
-  if (!verdict.allowed) {
-    if (verdict.retryAfterSeconds) c.header('Retry-After', String(verdict.retryAfterSeconds));
-    return c.json(error(ErrorCodes.RATE_LIMITED, 'Mail quota exceeded. Try again later.'), 429);
-  }
-  if (!quota.record(keys.keys)) {
-    // failClosedWhenFull refused the record — the tracked-principal table
-    // itself is at capacity, not this key's own window.
-    return c.json(error(ErrorCodes.RATE_LIMITED, 'Mail quota unavailable for this request.'), 429);
+  const admission = checkMailQuota({ principalId: authCtx?.principalId, actorUserId: authCtx?.userId });
+  if (!admission.allowed) {
+    if (admission.retryAfterSeconds) c.header('Retry-After', String(admission.retryAfterSeconds));
+    const message =
+      admission.reason === 'no_principal'
+        ? 'Mail quota unavailable for this request.'
+        : 'Mail quota exceeded. Try again later.';
+    return c.json(error(ErrorCodes.RATE_LIMITED, message), 429);
   }
 
   const result = await sendTemplatedMail('test', to.trim(), { platformUrl: getPublicUrl() ?? '' });
   const failure = result.status === 'attempted' ? result.failure : undefined;
+
+  // Charge the allowance only once the relay was actually dialed — the same
+  // rule notifyShareGrant follows (apps.share.ts) and for the identical
+  // reason: an unconfigured relay (`status: 'unavailable'`) never opens a
+  // socket, and counting it against the quota would refuse the first REAL
+  // sends once an operator finally configures mail. This route used to record
+  // BEFORE sending, which is exactly that bug — reconciled with the share
+  // path's rule here (DROP-154 Gate 5 finding).
+  if (result.status !== 'unavailable') {
+    getMailQuota().record(admission.keys);
+  }
 
   // This module has no ActivityLog write of its own (DROP-154 Gate 2 §4) —
   // every caller owns its own attribution, and admin's own principal is what

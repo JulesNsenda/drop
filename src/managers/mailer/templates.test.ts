@@ -86,38 +86,4 @@ describe('renderTemplate', () => {
       expect(() => renderTemplate('test', { platformUrl: 'https://x\r\ny' })).toThrow(/CR\/LF\/NUL/);
     });
   });
-
-  describe('invite (unused until Slice C)', () => {
-    const vars = {
-      appName: 'my-app',
-      sharerName: 'alice',
-      inviteUrl: 'https://drop.example.com/invite/abc123',
-      platformUrl: 'https://drop.example.com',
-    };
-
-    it('renders every variable', () => {
-      const rendered = renderTemplate('invite', vars);
-
-      expect(rendered.subject).toContain('alice');
-      expect(rendered.subject).toContain('my-app');
-      expect(rendered.html).toContain('https://drop.example.com/invite/abc123');
-      expect(rendered.text).toContain('https://drop.example.com/invite/abc123');
-    });
-
-    it('HTML-escapes every variable', () => {
-      const rendered = renderTemplate('invite', {
-        ...vars,
-        sharerName: '<script>alert(1)</script>',
-      });
-
-      expect(rendered.html).not.toContain('<script>alert(1)</script>');
-      expect(rendered.html).toContain('&lt;script&gt;');
-    });
-
-    it('rejects CRLF in a variable', () => {
-      expect(() =>
-        renderTemplate('invite', { ...vars, inviteUrl: 'https://x\r\nBcc: victim@example.com' })
-      ).toThrow(/CR\/LF\/NUL/);
-    });
-  });
 });

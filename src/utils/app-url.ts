@@ -1,15 +1,15 @@
 /**
  * Compute an app's externally-reachable URL.
  *
- * Lives in `utils/` rather than `apps.ts` (its original home) because
- * DROP-154 gave it a second call site inside `apps.share.ts`, which is
- * itself mounted onto `apps.ts` (`apps.route('/', shareRoutes)`) — an import
- * of `computeAppUrl` FROM `apps.ts` closed a require cycle that only worked
- * by accident of CommonJS's late-bound exports object, and broke depending on
- * which module happened to load first. Every other caller (mcp/tools.ts,
- * app-access.ts, mcp-gateway.ts, oauth.ts) moved here too, so there is one
- * definition instead of one cycle-prone one plus a growing set of importers
- * reaching into a route file for a pure function.
+ * Lives in `utils/` rather than `apps.ts` (its original home) so its real
+ * callers (mcp/tools.ts, app-access.ts, mcp-gateway.ts, oauth.ts) don't have
+ * to reach into a route file for a pure function, and so importing it FROM
+ * `apps.ts` can't close a require cycle that would only work by accident of
+ * CommonJS's late-bound exports object, breaking depending on which module
+ * happened to load first.
+ *
+ * `apps.share.ts` does NOT call this function, deliberately — see
+ * `ComputeAppUrlOptions.forceHttps` below for why.
  *
  * The served host is DERIVED, never read from `app.hostname` — that field is the
  * persisted `<name>.localhost` placeholder; the host an app actually serves on is
@@ -30,11 +30,19 @@ export interface ComputeAppUrlOptions {
   /**
    * Force `https` regardless of the app's own `tls: {disabled: true}` or the
    * platform's own HTTP mode. Every caller that puts the result somewhere a
-   * tenant-authored downgrade would be a confidentiality problem (a mailed
-   * link, a session audience) sets this — see `app-access.ts`'s `appOrigin`
-   * and `apps.share.ts`'s `notifyShareGrant` for the two current examples.
-   * Handled HERE, once, instead of a `.replace(/^http:\/\//, 'https://')` at
-   * every call site.
+   * tenant-authored downgrade would be a confidentiality problem (a session
+   * audience) sets this — see `app-access.ts`'s `appOrigin` for the current
+   * example. Handled HERE, once, instead of a
+   * `.replace(/^http:\/\//, 'https://')` at every call site.
+   *
+   * NOT `apps.share.ts`'s `notifyShareGrant` — that mailed link deliberately
+   * never calls `computeAppUrl` at all (forced-https or otherwise): this
+   * function resolves from the app's OWN `domains`/`customDomain`, which are
+   * tenant-authored, and a mail sent from the operator's DKIM/SPF-aligned
+   * relay carrying an attacker-chosen domain would be a phishing primitive
+   * borrowing the operator's sender reputation. `notifyShareGrant` hand-rolls
+   * `${app.name}.${getDomainSuffix()}` instead — see that function's own doc
+   * comment.
    */
   forceHttps?: boolean;
 }

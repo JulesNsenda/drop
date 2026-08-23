@@ -49,7 +49,7 @@ Get these three right with your relay provider **before** relying on
 `POST /api/v1/admin/mail/test` succeeding as proof that real recipients will
 receive mail — a successful relay handshake only means the relay accepted the
 message for delivery, not that it survived the receiving side's spam
-filtering. If invites or notifications aren't arriving, run
+filtering. If share notifications aren't arriving, run
 `POST /admin/mail/test` first: a `failure` in its response is the relay
 telling you something concrete (see "What DROP tells you" below). If it comes
 back `'attempted'` with no `failure`, DROP has nothing further to diagnose on
@@ -88,7 +88,7 @@ goes to two places for the operator to find: the platform's own stderr
 systemd box, not a file DROP manages), and — for `POST /admin/mail/test`
 specifically — the activity log, as an `mail-test-sent` entry whose `detail`
 includes `failure=<reason>` whenever the send didn't cleanly succeed. If
-invites or notifications aren't arriving even though a test send comes back
+share notifications aren't arriving even though a test send comes back
 `'attempted'` with no `failure`, that's exactly the case DROP has nothing
 further to diagnose on — check the DNS records above and the relay
 provider's own delivery/bounce reporting instead.
@@ -232,6 +232,16 @@ controls for different reasons: the bucket caps *how fast* one caller can
 hit the route, the quota caps *how much* real relay send volume any principal
 or user burns over an hour, however they're spread out.
 
+**Changing either mail cap needs a platform restart — the deploy limits do
+not.** `DROP_MAX_MAILS_PER_HOUR(_PER_USER)` are read once, when the mail
+quota singleton is first constructed at platform startup, and then held for
+the life of the process; editing the environment and sending `SIGHUP` (or
+anything short of a restart) has no effect. `DROP_MAX_REDEPLOYS_PER_HOUR(_PER_USER)`
+are the opposite: the deploy quota re-reads its env vars on every call, so a
+changed value takes effect on the next deploy with no restart needed. If a
+changed mail cap doesn't seem to be taking effect, this is why — restart the
+platform.
+
 ---
 
 ## The share-notification consumer defaults OFF
@@ -267,11 +277,15 @@ call shown below.
 
 Mail configuration is spread across three different stores, each with a
 reason: `settings.json` for anything an admin may click, its own encrypted
-file for the one secret, and env-only for anything that is either a
-credential or a safety opt-out an admin session should not be able to flip.
-The API body field names also don't match the `settings.json` keys they're
-stored under — that mismatch is the single biggest reason it's hard to
-predict where to look, so both are listed here.
+file for the one secret, and env-only for the rest — a credential, a safety
+opt-out an admin session should not be able to flip, or a volume cap
+mirroring the equivalent deploy-guardrail limits' own env-only shape (see
+"Outbound volume is capped" above for the restart caveat that comes with
+that last category — it does not apply to the credential/safety-opt-out
+vars, which are read fresh on every send). The API body field names also
+don't match the `settings.json` keys they're stored under — that mismatch is
+the single biggest reason it's hard to predict where to look, so both are
+listed here.
 
 | Setting | `PUT /admin/settings/mail` body field | `settings.json` key | Env var | Notes |
 |---|---|---|---|---|

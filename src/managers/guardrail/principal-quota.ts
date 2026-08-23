@@ -139,25 +139,6 @@ function mailOwnerLimit(): number {
   return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_MAIL_OWNER_LIMIT;
 }
 
-/**
- * Shared key-building shape for a principal-bearing actor, factored out so
- * the instance method `keysFor` below has one place to build a key list from —
- * a second implementation copy is exactly the fork this file exists to avoid.
- */
-function buildQuotaKeys(
-  actor: DeployActorInfo,
-  principalLimitValue: number,
-  ownerLimitValue: number
-): QuotaKey[] {
-  const keys: QuotaKey[] = [
-    { key: actor.principalId as string, limit: principalLimitValue, kind: 'principal' },
-  ];
-  if (actor.actorUserId) {
-    keys.push({ key: `owner::${actor.actorUserId}`, limit: ownerLimitValue, kind: 'owner' });
-  }
-  return keys;
-}
-
 interface QuotaStore {
   /** key -> deploy timestamps (ms), all inside the window. */
   deploys: Record<string, number[]>;
@@ -166,8 +147,6 @@ interface QuotaStore {
 export interface PrincipalQuotaOptions {
   /** Override the tracked-principal cap. Tests, and per-box tuning. */
   maxTrackedPrincipals?: number;
-  /** Override the rolling window. Deploys use one hour; tests, and mail. */
-  windowMs?: number;
   /**
    * Override the per-principal limit used by `keysFor`. Falls back to the
    * env-var-backed default for the calling instance (deploy's or mail's — see
@@ -206,7 +185,6 @@ export interface PrincipalQuotaOptions {
 export class PrincipalQuota {
   private readonly storePath: string;
   private readonly maxTrackedPrincipals: number;
-  private readonly windowMs: number;
   private readonly principalLimitOverride?: number;
   private readonly ownerLimitOverride?: number;
   private readonly unmeteredWithoutPrincipal: boolean;
@@ -227,7 +205,6 @@ export class PrincipalQuota {
   constructor(storePath: string, opts: PrincipalQuotaOptions = {}) {
     this.storePath = storePath;
     this.maxTrackedPrincipals = opts.maxTrackedPrincipals ?? MAX_TRACKED_PRINCIPALS;
-    this.windowMs = opts.windowMs ?? WINDOW_MS;
     this.principalLimitOverride = opts.principalLimit;
     this.ownerLimitOverride = opts.ownerLimit;
     this.unmeteredWithoutPrincipal = opts.unmeteredWithoutPrincipal ?? true;
@@ -255,14 +232,17 @@ export class PrincipalQuota {
         ? { metered: true, keys: [] }
         : { metered: false, reason: 'no_principal' };
     }
-    return {
-      metered: true,
-      keys: buildQuotaKeys(
-        actor,
-        this.principalLimitOverride ?? principalLimit(),
-        this.ownerLimitOverride ?? ownerLimit()
-      ),
-    };
+    const keys: QuotaKey[] = [
+      { key: actor.principalId, limit: this.principalLimitOverride ?? principalLimit(), kind: 'principal' },
+    ];
+    if (actor.actorUserId) {
+      keys.push({
+        key: `owner::${actor.actorUserId}`,
+        limit: this.ownerLimitOverride ?? ownerLimit(),
+        kind: 'owner',
+      });
+    }
+    return { metered: true, keys };
   }
 
   async initialize(): Promise<void> {
@@ -309,7 +289,7 @@ export class PrincipalQuota {
       if (used >= limit) {
         // Room frees when the OLDEST deploy in the window ages out.
         const oldest = this.store.deploys[key][0];
-        const retryAfterSeconds = Math.max(1, Math.ceil((oldest + this.windowMs - now) / 1000));
+        const retryAfterSeconds = Math.max(1, Math.ceil((oldest + WINDOW_MS - now) / 1000));
         return { allowed: false, limit, used, retryAfterSeconds };
       }
     }
@@ -374,7 +354,7 @@ export class PrincipalQuota {
 
   /** Timestamps still inside the window, pruned in place. */
   private prune(key: string, now: number): number[] {
-    const cutoff = now - this.windowMs;
+    const cutoff = now - WINDOW_MS;
     const kept = (this.store.deploys[key] ?? []).filter((at) => at > cutoff);
     if (kept.length === 0) delete this.store.deploys[key];
     else this.store.deploys[key] = kept;

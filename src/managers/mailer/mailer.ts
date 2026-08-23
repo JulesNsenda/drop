@@ -31,13 +31,17 @@
  * with a self-signed cert, not something that belongs one click away in the
  * dashboard).
  *
- * The relay host is validated before every dial (`isRelayHostAllowed`)
- * against the same private/loopback/link-local ranges `ssrf-guard.ts`
- * already blocks for tenant-controlled URLs — an admin-set `smtpHost` (or an
- * admin-supplied `to` on the test route) must not turn this module into an
- * internal-network scanner reachable through the admin API. Opt out per-box
- * with `DROP_SMTP_ALLOW_PRIVATE_RELAY=true`, for the legitimate case of an
- * internal relay on a private range.
+ * The relay host is validated before the first dial of every host
+ * (`isRelayHostAllowed`) against the same private/loopback/link-local ranges
+ * `ssrf-guard.ts` already blocks for tenant-controlled URLs — an admin-set
+ * `smtpHost` (or an admin-supplied `to` on the test route) must not turn this
+ * module into an internal-network scanner reachable through the admin API.
+ * The DNS verdict is cached per host (`relayHostVerdictCache`) rather than
+ * re-resolved on every send — the host only changes on an admin PUT, and
+ * nodemailer resolves the same host again immediately after anyway, so an
+ * uncached check was two `getaddrinfo` calls per send for no benefit. Opt out
+ * per-box with `DROP_SMTP_ALLOW_PRIVATE_RELAY=true`, for the legitimate case
+ * of an internal relay on a private range.
  */
 
 import nodemailer from 'nodemailer';
@@ -53,11 +57,18 @@ import type {
 } from './mailer.types';
 
 /**
- * Hard total deadline for a send attempt. Enforced by OUR OWN race, not by
- * nodemailer's connection/greeting/socket timeouts (set below as a
- * defense-in-depth backstop, not the primary control) — the plan is explicit
- * that the tests must cover this rather than assuming nodemailer's own
- * timeouts save us.
+ * Hard deadline for the relay CONVERSATION — the race in `doSend` below,
+ * covering everything from `transport.sendMail()` to a reply or give-up.
+ * Enforced by OUR OWN race, not by nodemailer's connection/greeting/socket
+ * timeouts (set below as a defense-in-depth backstop, not the primary
+ * control) — the plan is explicit that the tests must cover this rather than
+ * assuming nodemailer's own timeouts save us.
+ *
+ * NOT a bound on the whole send attempt: `isRelayHostAllowed`'s DNS lookup
+ * runs before this race starts, and is uncached on a cache miss — a slow or
+ * hanging resolver can add its own timeout on top, once per host. In
+ * practice this is bounded by a single lookup per host for the life of the
+ * process (see `relayHostVerdictCache`), not per send.
  */
 export const SEND_DEADLINE_MS = 5000;
 
@@ -88,18 +99,41 @@ function assertSingleAddress(field: string, value: string): void {
 }
 
 /**
+ * Per-host SSRF verdict cache (`host` -> "resolves to a blocked address").
+ * `hostnameResolvesToBlockedIp` is a real `dns.lookup`, and nodemailer
+ * resolves the same host again immediately after dialing — caching means
+ * that happens at most once per host per process, not once per send. Safe to
+ * cache indefinitely for the same reason the plan calls out: the relay host
+ * only changes via an admin PUT, which is infrequent, not per-send.
+ */
+const relayHostVerdictCache = new Map<string, boolean>();
+
+/** Test-only: clears the per-host SSRF verdict cache between runs. */
+export function resetRelayHostCache(): void {
+  relayHostVerdictCache.clear();
+}
+
+/**
  * True if `host` is safe to dial — mirrors the private/loopback/link-local
  * blocklist `ssrf-guard.ts` already applies to tenant-controlled URLs
  * (webhooks, git clones, `depends_on`). An admin-set `smtpHost` reaches this
- * same check on every send: without it, the admin API becomes a usable
- * internal-network probe (an admin-supplied host + any port, distinguishable
- * by timing — instant `ECONNREFUSED` vs. the full deadline on an
- * open-but-silent port). `DROP_SMTP_ALLOW_PRIVATE_RELAY=true` is the
- * explicit, box-level opt-out for a legitimate internal relay.
+ * check on every send (a cache hit after the first): without it, the admin
+ * API becomes a usable internal-network probe (an admin-supplied host + any
+ * port, distinguishable by timing — instant `ECONNREFUSED` vs. the full
+ * deadline on an open-but-silent port). `DROP_SMTP_ALLOW_PRIVATE_RELAY=true`
+ * is the explicit, box-level opt-out for a legitimate internal relay, and
+ * deliberately short-circuits before touching the cache or the resolver at
+ * all.
  */
 async function isRelayHostAllowed(host: string): Promise<boolean> {
   if (process.env.DROP_SMTP_ALLOW_PRIVATE_RELAY === 'true') return true;
-  return !(await hostnameResolvesToBlockedIp(host));
+
+  const cached = relayHostVerdictCache.get(host);
+  if (cached !== undefined) return !cached;
+
+  const blocked = await hostnameResolvesToBlockedIp(host);
+  relayHostVerdictCache.set(host, blocked);
+  return !blocked;
 }
 
 /**
@@ -238,5 +272,5 @@ async function doSend(
     failure = { reason: `no relay response within ${SEND_DEADLINE_MS}ms` };
   }
 
-  return failure ? { status: 'attempted', failure } : { status: 'attempted' };
+  return { status: 'attempted', failure };
 }

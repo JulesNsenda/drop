@@ -116,6 +116,7 @@ import { getMailQuota } from '../../managers/guardrail/principal-quota';
 import { sendTemplatedMail } from '../../managers/mailer/mailer';
 import { isLocalhostDomain } from '../../utils/domain-validator';
 import { MAX_ACCESS_ALLOW_ENTRIES, MAX_USER_ID_LENGTH, requireAuthForAccessRoutes } from './access-limits';
+import { checkMailQuota } from './mail-quota';
 
 const shareRoutes = new Hono();
 
@@ -203,17 +204,12 @@ async function notifyShareGrant(requester: AuthContext, app: AppState, targetUse
     // logging.
     if (!appUrl || !platformUrl) return;
 
-    const quota = getMailQuota();
-    const keys = quota.keysFor({ principalId: requester.principalId, actorUserId: requester.userId });
-    // Mail's `keysFor` has no unmetered branch (unlike deploys) — an absent
-    // principal refuses rather than sending unmetered.
-    if (!keys.metered) {
-      await refuse(`share notification refused: ${keys.reason}`);
-      return;
-    }
-    const verdict = quota.check(keys.keys);
-    if (!verdict.allowed) {
-      await refuse(`share notification refused: quota exceeded (${verdict.reason ?? 'limit reached'})`);
+    // checkMailQuota (mail-quota.ts) — shared with POST /admin/mail/test against
+    // this same singleton. Mail's `keysFor` has no unmetered branch (unlike
+    // deploys) — an absent principal refuses rather than sending unmetered.
+    const admission = checkMailQuota({ principalId: requester.principalId, actorUserId: requester.userId });
+    if (!admission.allowed) {
+      await refuse(`share notification refused: ${admission.reason}`);
       return;
     }
 
@@ -230,9 +226,11 @@ async function notifyShareGrant(requester: AuthContext, app: AppState, targetUse
     // Charge the allowance only once the relay was actually dialed — an
     // unconfigured relay (`status: 'unavailable'`) never contacts anything,
     // and counting it against the quota would refuse the first REAL sends
-    // once an operator finally configures mail (Gate 2 finding).
+    // once an operator finally configures mail (Gate 2 finding). POST
+    // /admin/mail/test now follows this same rule (Gate 5 — it used to
+    // record before sending).
     if (result.status === 'unavailable') return;
-    quota.record(keys.keys);
+    getMailQuota().record(admission.keys);
     if (result.failure) {
       // ADMIN-FACING ONLY (`MailFailureDetail`'s own doc comment) — logged
       // for whoever reads the activity log, never surfaced on this

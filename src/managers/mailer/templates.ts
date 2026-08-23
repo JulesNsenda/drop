@@ -20,7 +20,6 @@ import type {
   RenderedMail,
   ShareNotificationVars,
   TestMailVars,
-  InviteMailVars,
 } from './mailer.types';
 
 const HEADER_INJECTION_RE = /[\r\n\0]/;
@@ -70,23 +69,6 @@ function renderTest(vars: TestMailVars): RenderedMail {
   return { subject, html, text };
 }
 
-/** Unused until Slice C adds a caller (plan §5) — kept here so that slice adds a caller, not a template. */
-function renderInvite(vars: InviteMailVars): RenderedMail {
-  const appName = safe('appName', vars.appName);
-  const sharerName = safe('sharerName', vars.sharerName);
-  const inviteUrl = safe('inviteUrl', vars.inviteUrl);
-  const platformUrl = safe('platformUrl', vars.platformUrl);
-
-  const subject = `${sharerName} invited you to "${appName}"`;
-  const html =
-    `<p>${escapeHtml(sharerName)} invited you to <strong>${escapeHtml(appName)}</strong>.</p>` +
-    `<p><a href="${escapeHtml(inviteUrl)}">Accept the invite</a></p>` +
-    `<p style="color:#666;font-size:0.9em">Sent by your DROP platform at ${escapeHtml(platformUrl)}.</p>`;
-  const text = `${sharerName} invited you to ${appName}.\n\n${inviteUrl}\n\nSent by your DROP platform at ${platformUrl}.`;
-
-  return { subject, html, text };
-}
-
 export function renderTemplate<T extends MailTemplate>(
   template: T,
   vars: MailTemplateVars[T]
@@ -99,8 +81,6 @@ export function renderTemplate<T extends MailTemplate>(
       return renderShareNotification(vars as ShareNotificationVars);
     case 'test':
       return renderTest(vars as TestMailVars);
-    case 'invite':
-      return renderInvite(vars as InviteMailVars);
     default: {
       const exhaustive: never = template as never;
       throw new Error(`mailer: unknown template "${String(exhaustive)}"`);
