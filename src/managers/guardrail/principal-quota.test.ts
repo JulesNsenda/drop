@@ -9,7 +9,156 @@
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import * as os from 'os';
-import { PrincipalQuota, quotaKeysFor, resetPrincipalQuota } from './principal-quota';
+import {
+  PrincipalQuota,
+  quotaKeysFor,
+  resetPrincipalQuota,
+  getMailQuota,
+  resetMailQuota,
+} from './principal-quota';
+
+/**
+ * DROP-154: two carry-over hazards flagged when a second (mail) instance
+ * reuses this engine via options. Each gets a test that fails if the flag is
+ * flipped the other way — asserting the REFUSAL, not just that a call
+ * returns, per the plan.
+ */
+describe('PrincipalQuota — mail-instance option carry-over hazards', () => {
+  let tempDir: string;
+
+  beforeEach(async () => {
+    tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'drop-mail-quota-'));
+  });
+
+  afterEach(async () => {
+    resetPrincipalQuota();
+    await fs.rm(tempDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+  });
+
+  describe('unmeteredWithoutPrincipal', () => {
+    it('deploy default: an actor with no principal is unmetered (keysFor allows through)', () => {
+      const deploy = new PrincipalQuota(path.join(tempDir, 'deploy.json'));
+
+      const result = deploy.keysFor({});
+
+      expect(result).toEqual({ metered: true, keys: [] });
+    });
+
+    it('mail (unmeteredWithoutPrincipal: false): an actor with no principal REFUSES', () => {
+      // The discriminating assertion: flipping this flag back to the deploy
+      // default would turn this into `{ metered: true, keys: [] }`, which
+      // `check([])` always allows — an unmetered outbound channel.
+      const mail = new PrincipalQuota(path.join(tempDir, 'mail.json'), {
+        unmeteredWithoutPrincipal: false,
+      });
+
+      const result = mail.keysFor({});
+
+      expect(result).toEqual({ metered: false, reason: 'no_principal' });
+    });
+
+    it('mail still meters a real principal normally', async () => {
+      const mail = new PrincipalQuota(path.join(tempDir, 'mail2.json'), {
+        unmeteredWithoutPrincipal: false,
+      });
+      await mail.initialize();
+
+      const result = mail.keysFor({ principalId: 'user:u1' });
+
+      expect(result.metered).toBe(true);
+      if (result.metered) {
+        expect(result.keys).toEqual([
+          { key: 'user:u1', limit: expect.any(Number), kind: 'principal' },
+        ]);
+      }
+    });
+  });
+
+  describe('failClosedWhenFull', () => {
+    const t = 1_000_000;
+
+    it('deploy default: a new principal past the cap is silently left untracked, never refused', async () => {
+      const deploy = new PrincipalQuota(path.join(tempDir, 'deploy-cap.json'), {
+        maxTrackedPrincipals: 2,
+      });
+      await deploy.initialize();
+      deploy.record([{ key: 'key:a', limit: 3, kind: 'principal' }], t);
+      deploy.record([{ key: 'key:b', limit: 3, kind: 'principal' }], t);
+      // Table is now at its cap of 2.
+
+      const freshKeys = [{ key: 'key:new', limit: 3, kind: 'principal' as const }];
+      expect(deploy.check(freshKeys, t).allowed).toBe(true);
+      const recorded = deploy.record(freshKeys, t);
+
+      expect(recorded).toBe(true);
+      await deploy.flush();
+      // Left untracked — the pre-existing degrade-gracefully behaviour, kept
+      // for deploys.
+      expect(deploy.used('key:new', t)).toBe(0);
+    });
+
+    it('mail (failClosedWhenFull: true): a new principal past the cap REFUSES on check() and record()', async () => {
+      // The discriminating assertion: flipping this flag back to the deploy
+      // default would make both calls below succeed instead, silently
+      // leaving `key:new` untracked forever — a caller who can mint
+      // principals would then face no per-principal limit at all once the
+      // table fills.
+      const mail = new PrincipalQuota(path.join(tempDir, 'mail-cap.json'), {
+        maxTrackedPrincipals: 2,
+        failClosedWhenFull: true,
+      });
+      await mail.initialize();
+      mail.record([{ key: 'key:a', limit: 3, kind: 'principal' }], t);
+      mail.record([{ key: 'key:b', limit: 3, kind: 'principal' }], t);
+      // Table is now at its cap of 2.
+
+      const freshKeys = [{ key: 'key:new', limit: 3, kind: 'principal' as const }];
+      const verdict = mail.check(freshKeys, t);
+      expect(verdict.allowed).toBe(false);
+      expect(verdict.reason).toBe('table_full');
+
+      const recorded = mail.record(freshKeys, t);
+      expect(recorded).toBe(false);
+      await mail.flush();
+      expect(mail.used('key:new', t)).toBe(0);
+    });
+
+    it('mail still admits a principal it already knows about, even at a full table', async () => {
+      const mail = new PrincipalQuota(path.join(tempDir, 'mail-cap2.json'), {
+        maxTrackedPrincipals: 2,
+        failClosedWhenFull: true,
+      });
+      await mail.initialize();
+      const known = [{ key: 'key:known', limit: 3, kind: 'principal' as const }];
+      mail.record(known, t);
+      mail.record([{ key: 'key:b', limit: 3, kind: 'principal' }], t + 1);
+      // Table is now at its cap of 2, and `key:known` is already tracked.
+
+      expect(mail.check(known, t + 2).allowed).toBe(true);
+      expect(mail.record(known, t + 2)).toBe(true);
+    });
+
+    it('mail keeps enforcing the OWNER window even when the principal table is full', async () => {
+      // Pinning the `kind === 'principal'` narrowing on `wouldOverflowTable`:
+      // owner keys never count toward the cap, and are never refused by it.
+      const mail = new PrincipalQuota(path.join(tempDir, 'mail-cap3.json'), {
+        maxTrackedPrincipals: 2,
+        failClosedWhenFull: true,
+      });
+      await mail.initialize();
+      mail.record([{ key: 'key:a', limit: 3, kind: 'principal' }], t);
+      mail.record([{ key: 'key:b', limit: 3, kind: 'principal' }], t);
+      // Table is now at its cap of 2 (principal entries only).
+
+      const owner = [{ key: 'owner::u1', limit: 2, kind: 'owner' as const }];
+      expect(mail.check(owner, t + 1).allowed).toBe(true);
+      expect(mail.record(owner, t + 1)).toBe(true);
+      expect(mail.record(owner, t + 2)).toBe(true);
+
+      expect(mail.check(owner, t + 3).allowed).toBe(false);
+    });
+  });
+});
 
 describe('quotaKeysFor', () => {
   const savedPrincipal = process.env.DROP_MAX_REDEPLOYS_PER_HOUR;
@@ -228,5 +377,24 @@ describe('PrincipalQuota', () => {
     quota.record(owner, t + 2);
 
     expect(quota.check(owner, t + 3).allowed).toBe(false);
+  });
+});
+
+describe('getMailQuota', () => {
+  afterEach(() => {
+    resetMailQuota();
+  });
+
+  it('bakes in both mail differences: unmetered off, fail-closed on', () => {
+    const mail = getMailQuota(path.join(os.tmpdir(), 'drop-mail-quota-singleton.json'));
+
+    expect(mail.keysFor({})).toEqual({ metered: false, reason: 'no_principal' });
+  });
+
+  it('is a singleton, like getPrincipalQuota', () => {
+    const first = getMailQuota();
+    const second = getMailQuota();
+
+    expect(first).toBe(second);
   });
 });
