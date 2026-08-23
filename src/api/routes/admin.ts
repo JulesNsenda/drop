@@ -65,6 +65,17 @@ function buildUserConnectorsPayload(): { enabled: boolean } {
   return { enabled: getSettingsManager().getUserConnectorsEnabled() };
 }
 
+/**
+ * Status block for the DROP-153 app-sharing toggle. Kept separate from
+ * buildUserConnectorsPayload() for the same reason that one is kept separate
+ * from buildSettingsPayload() — a distinct product surface with its own
+ * default (DISABLED — see the `appSharingEnabled` field comment in
+ * SettingsManager), not a variant to fold into an existing payload shape.
+ */
+function buildAppSharingPayload(): { enabled: boolean } {
+  return { enabled: getSettingsManager().getAppSharingEnabled() };
+}
+
 const GITHUB_WEBHOOK_SECRET_MIN_LENGTH = 8;
 const GITHUB_WEBHOOK_SECRET_MAX_LENGTH = 256;
 // eslint-disable-next-line no-control-regex -- deliberately matching ASCII control chars (incl. DEL) to reject them.
@@ -217,6 +228,7 @@ admin.get('/settings', async (c) => {
       ...buildSettingsPayload(),
       githubWebhook: buildGithubWebhookPayload(),
       userConnectors: buildUserConnectorsPayload(),
+      appSharing: buildAppSharingPayload(),
     })
   );
 });
@@ -353,6 +365,39 @@ admin.put('/settings/user-connectors', async (c) => {
   });
 
   return c.json(success(buildUserConnectorsPayload()));
+});
+
+// PUT /admin/settings/app-sharing - Gate whether an app's OWNER may share it
+// (DROP-153's `/apps/:name/share` routes). Same strict-boolean shape as PUT
+// /settings/user-connectors above: a two-state policy toggle, not a
+// "clear to fall back" field, so a non-boolean is rejected rather than
+// coerced or treated as a clear.
+admin.put('/settings/app-sharing', async (c) => {
+  const authCtx = (c.get as Function)('auth') as AuthContext | undefined;
+  const body = (await c.req.json()) as unknown;
+
+  // Same object guard as PUT /settings/user-connectors above. Without it a
+  // body of `null` dereferences to a TypeError and surfaces as a 500, which
+  // is a poor answer from a validator whose whole contract is "strict
+  // boolean, reject rather than coerce".
+  if (typeof body !== 'object' || body === null || Array.isArray(body)) {
+    return c.json(error(ErrorCodes.VALIDATION_ERROR, 'Request body must be a JSON object'), 400);
+  }
+
+  const input = (body as { enabled?: unknown }).enabled;
+
+  if (typeof input !== 'boolean') {
+    return c.json(error(ErrorCodes.VALIDATION_ERROR, 'enabled must be a boolean'), 400);
+  }
+
+  await getSettingsManager().setAppSharingEnabled(input);
+
+  await logActivityFor(authCtx, {
+    action: 'app-sharing-set',
+    detail: `App sharing ${input ? 'enabled' : 'disabled'}`,
+  });
+
+  return c.json(success(buildAppSharingPayload()));
 });
 
 export default admin;

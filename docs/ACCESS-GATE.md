@@ -35,6 +35,58 @@ who can reach the app open it.
 
 ---
 
+## Letting owners share their own app
+
+By default, only an administrator can gate an app or edit its allow-list — the
+`/access` route above is admin-only. A separate, admin-controlled toggle lets
+an app's **owner** manage their own app's allow-list without filing an admin
+ticket for every add or remove:
+
+```bash
+curl -X PUT https://<your-drop>/api/v1/admin/settings/app-sharing \
+  -H "Authorization: Bearer $ADMIN" -H 'Content-Type: application/json' \
+  -d '{"enabled":true}'
+```
+
+This ships **disabled by default** — a new product surface, not something
+turned on to preserve existing behaviour. Once enabled, an app's owner can, at
+`/apps/<app>/share`:
+
+- turn a gate on or off for their own app, and add or remove entries they
+  themselves granted;
+- see their own grant plus a count of everyone else's — never another user's
+  id or username.
+
+An owner can never touch an entry an administrator placed on their app, and
+`reviewBy` and removing a policy that carries any admin-authored entry both
+stay admin-only — an owner-reachable route governs only what the owner
+themselves granted, never the admin-authored governance list.
+
+---
+
+## Turning the whole gate off
+
+`DROP_FEATURE_ACCESS_GATE` (env, boot-time, default **on**) is the operator
+kill switch for the feature as a whole — distinct from clearing an individual
+app's policy. Set it to `false` to disable the gate platform-wide:
+
+- **guards are withdrawn at the next boot sweep or route re-emission** — an
+  existing policy is not deleted, just no longer carried into Caddy;
+- **the verify hop admits every request** in the meantime, so nobody is locked
+  out behind a guard that Caddy is still holding stale (the flag is read live,
+  not only at emission);
+- **the routing narrowing a gated app normally gets is lifted** — an app
+  carrying a policy is ordinarily kept off any plaintext or reserved hostname
+  so it can't disable its own gate by adding one; with the kill switch off,
+  that narrowing is relaxed too, so the app keeps serving instead of being
+  routed nowhere.
+
+Turning it back on does not retroactively re-apply anything — it takes effect
+the same way turning an individual app's gate on does, at the next route
+emission.
+
+---
+
 ## Why it might refuse
 
 A gate lives in Caddy, so it protects exactly what Caddy is the only way in to.

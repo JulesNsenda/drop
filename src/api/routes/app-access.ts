@@ -43,7 +43,7 @@ import { success, error, ErrorCodes } from '../types';
 import { isValidAppName } from '../middleware/validate';
 import { getStateManager } from '../../managers/app/state-manager';
 import { getAppConfigServiceOrNull } from '../../managers/app/app-config';
-import { getPublicUrl } from '../runtime-config';
+import { getPublicUrl, isAccessGateEnabled } from '../runtime-config';
 import { canOpen, canOpenSession } from '../access';
 import { AuthContext, getUserById } from '../middleware/auth';
 import {
@@ -171,6 +171,33 @@ appAccess.get('/:app/verify', async c => {
   const appName = c.req.param('app');
   try {
     if (!isValidAppName(appName)) return forbidden(c, appName, 'Unknown application.');
+
+    // DROP-153 kill switch. Checked before the policy lookup and before any
+    // identity work, so a disabled gate does no per-request credential
+    // handling at all. ADMITS rather than refuses: the guard is emitted by
+    // DROP, but a Caddy block emitted before the operator flipped this flag
+    // off can still be loaded, and without this check turning the switch off
+    // would leave that stale guard refusing traffic while the API and
+    // dashboard report the app as ungated — an operator told the control is
+    // off while users stay locked out. That inversion is the exact thing
+    // access-gate.ts exists to prevent, and it lands in the one window
+    // someone reaches for a kill switch: incident response. See
+    // isAccessGateEnabled()'s own doc comment for why it fails closed
+    // (ENFORCING) rather than admitting when nothing has wired the flag.
+    if (!isAccessGateEnabled()) {
+      // Logged ONLY for an app that exists — see the identical guard on the
+      // policy-lookup branch below. This endpoint is unauthenticated and
+      // reachable directly on the platform host, and the log's byte cap is
+      // per app per day, so a caller rotating invented names would get a
+      // fresh budget for each one and append without bound. `admit` is never
+      // suppressed by that cap either, which makes the unbounded case worse
+      // here, not better.
+      if (getStateManager().getApp(appName)) {
+        recordAccess({ appName, decision: 'admit', reason: 'gate-disabled' });
+      }
+      noStore(c);
+      return c.body(null, 204);
+    }
 
     // The guard is emitted by DROP, but the POLICY is read live — a stale Caddy
     // block for an app whose gate was removed must not keep refusing traffic

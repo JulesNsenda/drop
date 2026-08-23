@@ -12,7 +12,7 @@ import { Readable, Transform } from 'stream';
 import { pipeline } from 'stream/promises';
 import { success, error, ErrorCodes, AppDto, CreateAppDto } from '../types';
 import { NotFoundError, ValidationError } from '../middleware/error';
-import { AuthContext, listUsers, getUserById, isAuthEnabled } from '../middleware/auth';
+import { AuthContext, listUsers, getUserById } from '../middleware/auth';
 import { canAccess } from '../access';
 import { isValidAppName, validateAppName } from '../middleware/validate';
 import { getAppRuntime } from '../../managers/runtime';
@@ -27,8 +27,10 @@ import { getDeployTracker } from '../../managers/deploy-tracker';
 import { migrateAppRuntime } from '../../managers/runtime/runtime-migrator';
 import { hasEnoughDisk, getMinFreeDiskMb } from '../../utils/disk';
 import { getStateManager, AppState } from '../../managers/app/state-manager';
-import { getAppConfigService, getAppConfigServiceOrNull } from '../../managers/app/app-config';
-import type { AppAccessPolicy } from '../../managers/app/app-config';
+import {
+  getAppConfigService,
+  getAppConfigServiceOrNull,
+} from '../../managers/app/app-config';
 import { getDatabaseProvisioner } from '../../managers/database';
 import { getRedisProvisioner } from '../../managers/redis';
 import { getRouterService } from '../../core/router';
@@ -60,6 +62,12 @@ import { QuotaExceededError } from '../../managers/guardrail/principal-quota';
 import { pruneOwnerDumpsToFit, predeleteMaxBytes } from '../../managers/guardrail/detach-limits';
 import { runUploadPreflight } from '../upload-preflight';
 import type { RuntimeType } from '../../managers/runtime/app-runtime.types';
+import {
+  MAX_ACCESS_ALLOW_ENTRIES,
+  MAX_USER_ID_LENGTH,
+  requireAuthForAccessRoutes,
+} from './access-limits';
+import shareRoutes from './apps.share';
 
 const apps = new Hono();
 
@@ -1314,41 +1322,6 @@ apps.delete('/:name/services/:id', async c => {
 });
 
 /**
- * Cap on an access-gate allow-list (DROP-152).
- *
- * A bound, not a product limit: every id is validated against the credential
- * store on write, so a large list is a large number of lookups on a request an
- * admin controls. A governance allow-list that genuinely needs more than this
- * is a group, and groups are the next slice.
- */
-const MAX_ACCESS_ALLOW_ENTRIES = 200;
-
-/**
- * Per-entry cap. Ids are UUIDs; the bound exists so an unvalidated string
- * cannot be echoed into the refusal message, the error log and a persisted
- * YAML file at body-size scale.
- */
-const MAX_USER_ID_LENGTH = 128;
-
-/**
- * Guard shared by all three `/access` handlers.
- *
- * The admin role floor is applied in `server.ts`, but that registration lives
- * inside `if (this.config.enableAuth && isAuthEnabled())` — so on an
- * auth-disabled box no middleware is registered for these paths at all and
- * these handlers are the only thing standing between an anonymous caller and
- * an app's allow-list (a set of real DROP user ids) or, on DELETE, removal of
- * a governance policy. This is the `interactiveSessionOnly` posture, restated
- * for the same reason it had to be restated there.
- */
-function requireAuthForAccessRoutes(): string | null {
-  if (!isAuthEnabled()) {
-    return 'Access-gate policy is unavailable when authentication is disabled.';
-  }
-  return null;
-}
-
-/**
  * Whether a gate is actually ENFORCED for this app right now — as opposed to
  * whether the box could enforce one. A persisted policy on a build with no
  * guard emitter is a record, not a control, and every response says so.
@@ -1484,8 +1457,6 @@ apps.put('/:name/access', async c => {
     throw new ValidationError(`Unknown user id(s): ${unknown.slice(0, 10).join(', ')}`);
   }
 
-  const policy: AppAccessPolicy = { mode: 'drop-users', allow };
-
   // A governance review date. Metadata, not authorization — so it goes on the
   // SYSTEM tier with the existing narrowed writers rather than joining the
   // RESTRICTED tier, which exists for fields that decide who may do something
@@ -1503,7 +1474,23 @@ apps.put('/:name/access', async c => {
   // has runtime state but no persisted config refuses rather than minting a
   // skeleton config that the next boot's reconciliation would then treat as a
   // real app.
-  const updated = await getAppConfigService().setAccessPolicy(name, policy);
+  //
+  // The updater form (DROP-153), not a whole-policy literal: this route replaces
+  // the WHOLE `allow` array on every write, and `setAccessPolicy` replaces
+  // `access` wholesale.
+  //
+  // Provenance (`grantedBy`) is NOT built here on purpose. An updater result
+  // that omits the key entirely means "I have no opinion", and
+  // `setAccessPolicy` then carries provenance forward itself for every id still
+  // present in `allow`, dropping it for ids this write removes. That merge used
+  // to live in this route as an exported helper every caller had to remember to
+  // call — which is the shape `.claude/CLAUDE.md` warns about, since the next
+  // writer of `access` would compile clean and one-way convert every
+  // owner-authored grant into an unrevokable admin-authored one.
+  const updated = await getAppConfigService().setAccessPolicy(name, () => ({
+    mode: 'drop-users' as const,
+    allow,
+  }));
   if (!updated) {
     throw new NotFoundError(`Application '${name}' not found`);
   }
@@ -1535,7 +1522,9 @@ apps.put('/:name/access', async c => {
       message: enforced
         ? `Access gate set for '${name}'`
         : `Access policy recorded for '${name}', but it is NOT being enforced`,
-      access: policy,
+      // The persisted value (including the carried-forward `grantedBy`), not
+      // a locally-built literal — the two can now differ.
+      access: updated.access,
       enforced,
       ...(ACCESS_GATE_ENFORCEMENT_AVAILABLE
         ? {}
@@ -1606,6 +1595,12 @@ apps.delete('/:name/access', async c => {
     })
   );
 });
+
+// GET/POST/DELETE /apps/:name/share — owner-initiated sharing (DROP-153).
+// Mounted via `apps.route(...)` rather than a second `v1.route('/apps', …)`
+// in server.ts, so `apps.use('/:name/*', validateAppName())` above covers
+// these paths too (a second top-level mount would bypass it).
+apps.route('/', shareRoutes);
 
 /**
  * Scopes an admin may grant via PUT /:name/capabilities. Deliberately a fixed

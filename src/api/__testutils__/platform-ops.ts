@@ -43,6 +43,7 @@ export function makePlatformOpsStub(overrides?: Partial<PlatformOps>): PlatformO
       enforceable: true,
       blockers: [],
       reasons: [],
+      featureEnabled: true,
     } satisfies AccessGateVerdict),
     ...overrides,
   };

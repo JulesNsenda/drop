@@ -33,6 +33,114 @@ export interface AppAccessPolicy {
    * and any admin. Validated against the credential store at write time.
    */
   allow: string[];
+  /**
+   * Provenance for `allow`, DROP-153: granted user id → the user id that
+   * granted it. `evaluateAccessPolicy` (api/access.ts) never reads this — it
+   * decides only from `allow`, so this map cannot widen or narrow who may
+   * open the app, only who may administer their own entry in the list.
+   *
+   * An id present in `allow` but ABSENT from this map is ADMIN-authored. That
+   * is the correct reading of every policy that exists today (none of them
+   * carry this field yet) and the conservative direction for the migration:
+   * an owner cannot revoke, or even see, a grant they did not make.
+   */
+  grantedBy?: Record<string, string>;
+}
+
+/**
+ * Sentinel a `setAccessPolicy` updater can return to mean "I looked, and
+ * nothing needs to change" — `write()` honours this by skipping `saveConfig`
+ * entirely: no file rewrite, no mtime bump, no in-memory map replacement, and
+ * the app's write chain isn't occupied by a no-op. Every refusal branch in a
+ * grant/revoke/prune updater (already-granted, cap-exceeded, unknown target,
+ * nothing to revoke, ...) used to `return current` — a config that reads
+ * identically to what was already on disk, but `write()` had no way to tell
+ * that from a real change and rewrote the file anyway, turning every refused
+ * share request into a disk write. Distinct from returning `undefined`, which
+ * means "clear the policy" (a real, saved change) — NO_CHANGE means "there is
+ * nothing to save at all".
+ */
+export const NO_CHANGE = Symbol('app-config:access-no-change');
+
+/**
+ * Given an existing policy and the `allow` array a write is about to replace
+ * it with, return a `grantedBy` map containing only the ids still present in
+ * the new `allow` — i.e. provenance for entries the write is dropping is
+ * dropped with them, and provenance for everything else carries forward.
+ * Returns `undefined` (not `{}`) when nothing carries forward, so a merged
+ * `{ ...policy, grantedBy: carryForwardGrantedBy(...) }` gets the same "field
+ * absent, not empty" shape `grantedBy` has everywhere else.
+ *
+ * NOT exported. This used to be an opt-in helper a caller (the admin
+ * `PUT /access` route) had to remember to call — which is exactly this
+ * codebase's own named trap: a helper that is correct in isolation while a
+ * caller bypasses it. `setAccessPolicy` now calls this itself, via
+ * `mergeAccessProvenance` below, on every updater-form write whose result
+ * doesn't explicitly manage `grantedBy` — so the next writer of `access` (a
+ * group route, a migration, the CLI) cannot silently launder an
+ * owner-authored grant into an unrevokable admin one just by returning a
+ * fresh `{ mode, allow }`.
+ */
+function carryForwardGrantedBy(
+  existing: AppAccessPolicy | undefined,
+  allow: readonly string[]
+): Record<string, string> | undefined {
+  const grantedBy = existing?.grantedBy;
+  if (!grantedBy) return undefined;
+  const allowSet = new Set(allow);
+  const next: Record<string, string> = {};
+  for (const [userId, grantorId] of Object.entries(grantedBy)) {
+    if (allowSet.has(userId)) next[userId] = grantorId;
+  }
+  return Object.keys(next).length > 0 ? next : undefined;
+}
+
+/**
+ * Applied to every `setAccessPolicy` updater result before it reaches
+ * `write()` (see `setAccessPolicy` below). `result === undefined` is a
+ * clear — nothing to merge. `'grantedBy' in result` (checked with `in`, not
+ * truthiness, so an explicit `grantedBy: undefined` counts as "handled")
+ * means the updater already decided provenance for this write, including
+ * deciding to drop it — e.g. `pruneAllowListEntries` stripping a deleted
+ * grantor's entries — and that decision is respected untouched. Only when
+ * the key is entirely ABSENT does this fall back to `carryForwardGrantedBy`,
+ * carrying provenance forward for every id still present in the new `allow`
+ * — the structural safety net for an updater that never touches `grantedBy`
+ * at all.
+ */
+function mergeAccessProvenance(
+  existing: AppAccessPolicy | undefined,
+  result: AppAccessPolicy | undefined
+): AppAccessPolicy | undefined {
+  if (!result) return result;
+  if ('grantedBy' in result) return result;
+  const grantedBy = carryForwardGrantedBy(existing, result.allow);
+  return grantedBy ? { ...result, grantedBy } : result;
+}
+
+/**
+ * Drop every `grantedBy` entry whose GRANTOR is `deletedGrantorId` — used by
+ * `pruneAllowListEntries` when that account is deleted. An entry attributed
+ * to a grantor who no longer exists can never be verified against a live
+ * requester again (`DELETE /share/:userId`'s `grantedBy[id] ===
+ * requester.userId` check can't match a deleted id), so it is stranded, not
+ * merely orphaned: unrevokable through the owner route, while still reading
+ * as owner-authored to an `allOwnerAuthored`-style check. Dropping the key
+ * falls through to the established "absent means ADMIN-authored" reading
+ * (`AppAccessPolicy.grantedBy`'s own doc) — the conservative direction: an
+ * inert admin-authored entry beats an unrevokable one with no owner left to
+ * revoke it.
+ */
+function dropStaleGrants(
+  grantedBy: Record<string, string> | undefined,
+  deletedGrantorId: string
+): Record<string, string> | undefined {
+  if (!grantedBy) return grantedBy;
+  const next: Record<string, string> = {};
+  for (const [granteeId, grantorId] of Object.entries(grantedBy)) {
+    if (grantorId !== deletedGrantorId) next[granteeId] = grantorId;
+  }
+  return Object.keys(next).length > 0 ? next : undefined;
 }
 
 export interface AppConfig {
@@ -574,7 +682,9 @@ export class AppConfigService {
    * updater function instead of a plain object so a caller (setServiceIntent)
    * can merge against the CURRENT config read inside the write chain rather
    * than a snapshot taken before it settled — same reason enqueueWrite's own
-   * doc gives for reading `existing` inside the op.
+   * doc gives for reading `existing` inside the op. An updater may also
+   * return NO_CHANGE, which skips `saveConfig` and returns the untouched
+   * `existing` config — see that sentinel's own doc.
    *
    * `create: true` forces `type`/`runtime`/`createdAt` exactly as
    * upsertConfig/upsertSystemConfig always have — `createdAt` in particular
@@ -588,7 +698,9 @@ export class AppConfigService {
    */
   private write(
     appName: string,
-    updates: Partial<AppConfig> | ((existing: AppConfig | undefined) => Partial<AppConfig>),
+    updates:
+      | Partial<AppConfig>
+      | ((existing: AppConfig | undefined) => Partial<AppConfig> | typeof NO_CHANGE),
     opts: { create: boolean; system: boolean; restricted?: RestrictedConfigField }
   ): Promise<AppConfig | null> {
     return this.enqueueWrite(appName, async () => {
@@ -596,6 +708,13 @@ export class AppConfigService {
       if (!existing && !opts.create) return null;
 
       const rawUpdates = typeof updates === 'function' ? updates(existing) : updates;
+      // An updater-form write can signal "nothing to persist" — skip
+      // saveConfig entirely rather than rewriting an unchanged config (see
+      // NO_CHANGE's own doc). `existing` is guaranteed defined here: the
+      // early `!existing && !opts.create` return above already refused
+      // before the updater ran, and `opts.create` paths always have
+      // `existing` merged in below regardless.
+      if (rawUpdates === NO_CHANGE) return existing ?? null;
       const systemSafe = opts.system ? rawUpdates : this.stripSystemFields(appName, rawUpdates);
       // The restricted tier is applied INDEPENDENTLY of `system`, not nested
       // inside its else-branch: the whole point is that `system: true` does
@@ -711,13 +830,65 @@ export class AppConfigService {
    * `undefined` clears the gate. It is written as an explicit `undefined`
    * rather than deleted from the merged object: `yaml.stringify` omits
    * undefined values, so the field leaves the file entirely (the same
-   * clear-by-undefined `publicUrl` already relies on).
+   * clear-by-undefined `publicUrl` already relies on). This is the ONLY
+   * non-updater form left — a caller cannot pass a whole `AppAccessPolicy`
+   * literal here (see the removed overload's history: DROP-153 Gate 2). A
+   * literal write bypasses `mergeAccessProvenance` below by construction —
+   * there is no "existing" to merge against a value the caller already
+   * fully decided — so it silently erases every owner-authored grant's
+   * provenance on every write. The admin `PUT /access` route hit exactly
+   * this, one `carryForwardGrantedBy(...)` call away from doing it by
+   * accident. Every write of a real policy now goes through the updater
+   * overload below, where the merge is structural rather than opt-in.
+   *
+   * Also accepts an updater function, for the same reason `setServiceIntent`
+   * does (see its own doc above): a per-entry mutation — a grant, a revoke, a
+   * prune — must read the CURRENT policy INSIDE the write chain
+   * (`enqueueWrite` invokes it at execution time, not at call time), not a
+   * snapshot taken outside it, or a concurrent write for the same app is
+   * silently lost. Concrete losses this closes: an owner grant racing an
+   * admin `DELETE /access` resurrecting the policy the admin just cleared; a
+   * grant racing `pruneAllowListEntries` writing a deleted user's id back
+   * onto the list; two concurrent grants/revokes losing one.
+   *
+   * The updater's result passes through `mergeAccessProvenance` before it
+   * reaches `write()`: an updater that returns a fresh policy without an own
+   * `grantedBy` gets provenance carried forward for it automatically (see
+   * that function's own doc) — this is what makes the DROP-153 Gate 2
+   * provenance fix structural rather than a per-caller convention. An
+   * updater may also return NO_CHANGE to skip the save entirely (see that
+   * sentinel's own doc) — for every refusal branch (already-granted,
+   * cap-exceeded, nothing to revoke, ...) that used to `return current` and
+   * cause a needless rewrite.
+   *
+   * `write()` only invokes its `updates` function once it has confirmed a
+   * config exists (this writer always passes `create: false`), so by the time
+   * the updater below runs, `existing` is guaranteed defined — the cast is
+   * not a type hole, it documents that guarantee at the one call site that
+   * needs it.
    */
+  async setAccessPolicy(appName: string, access: undefined): Promise<AppConfig | null>;
   async setAccessPolicy(
     appName: string,
-    access: AppAccessPolicy | undefined
+    updater: (existing: AppConfig) => AppAccessPolicy | undefined | typeof NO_CHANGE
+  ): Promise<AppConfig | null>;
+  async setAccessPolicy(
+    appName: string,
+    accessOrUpdater:
+      | undefined
+      | ((existing: AppConfig) => AppAccessPolicy | undefined | typeof NO_CHANGE)
   ): Promise<AppConfig | null> {
-    return this.write(appName, { access }, { create: false, system: true, restricted: 'access' });
+    const updates:
+      | Partial<AppConfig>
+      | ((existing: AppConfig | undefined) => Partial<AppConfig> | typeof NO_CHANGE) =
+      typeof accessOrUpdater === 'function'
+        ? (existing: AppConfig | undefined) => {
+            const result = accessOrUpdater(existing as AppConfig);
+            if (result === NO_CHANGE) return NO_CHANGE;
+            return { access: mergeAccessProvenance(existing?.access, result) };
+          }
+        : { access: accessOrUpdater };
+    return this.write(appName, updates, { create: false, system: true, restricted: 'access' });
   }
 
   /**
@@ -765,19 +936,62 @@ export class AppConfigService {
    * index this plan declined twice: the work is bounded by app count and runs
    * once per account deletion.
    *
-   * Writes through `setAccessPolicy`, so the RESTRICTED tier still holds — this
-   * is not a back door into `access`.
+   * Writes through `setAccessPolicy`'s updater form (DROP-153), not the
+   * whole-policy form: this loop's own `getAllConfigs()` snapshot is taken
+   * BEFORE any of its awaits, and `saveConfig` replaces the map entry with a
+   * new object on every write — so a grant made moments earlier (by an
+   * unrelated request racing this sweep) would otherwise be silently
+   * reverted, and a policy cleared moments earlier would be resurrected with
+   * this snapshot's stale entries. The updater re-reads the CURRENT policy
+   * inside the write chain instead, so it only ever removes `userId` from
+   * whatever is actually there when the write runs. Returns NO_CHANGE
+   * (rather than the unmodified policy) when there is nothing to do, so a
+   * stale pre-filter hit never costs a disk write.
+   *
+   * `userId` can be deleted as a GRANTEE (their own `allow` entry), a
+   * GRANTOR (a value in someone else's `grantedBy` entry), or both — an
+   * account that shared an app it doesn't itself have access to is only the
+   * latter, and would otherwise be missed entirely. Grantee removal also
+   * drops `userId`'s own `grantedBy` key, if any — an entry can't stay
+   * attributed to a user id that no longer appears in `allow`. Grantor
+   * removal drops every `grantedBy` entry `userId` granted, via
+   * `dropStaleGrants` — see that helper's own doc for why leaving those in
+   * place strands them (unrevokable through the owner route, forever) rather
+   * than merely orphaning them.
    */
   async pruneAllowListEntries(userId: string): Promise<string[]> {
     const touched: string[] = [];
-    for (const config of this.getAllConfigs()) {
-      const allow = config.access?.allow;
-      if (!allow?.includes(userId)) continue;
-      await this.setAccessPolicy(config.name, {
-        ...config.access!,
-        allow: allow.filter(id => id !== userId),
+    // A cheap pre-filter, not the correctness check — see the doc above. This
+    // only narrows which apps are worth an updater round-trip; the updater
+    // re-checks presence against the config it actually reads. Matches on
+    // EITHER role: a grantee entry in `allow`, or a grantor value in
+    // `grantedBy`.
+    const candidates = this.getAllConfigs().filter(config => {
+      const access = config.access;
+      if (!access) return false;
+      if (access.allow.includes(userId)) return true;
+      return Object.values(access.grantedBy ?? {}).includes(userId);
+    });
+    for (const config of candidates) {
+      let changed = false;
+      await this.setAccessPolicy(config.name, existing => {
+        const access = existing.access;
+        if (!access) return NO_CHANGE; // already gone by the time we got here
+        const isGrantee = access.allow.includes(userId);
+        const grantedBy = access.grantedBy;
+        const isGrantor = grantedBy ? Object.values(grantedBy).includes(userId) : false;
+        if (!isGrantee && !isGrantor) return NO_CHANGE; // already gone by the time we got here
+        changed = true;
+        let nextGrantedBy = grantedBy ? { ...grantedBy } : undefined;
+        if (nextGrantedBy) delete nextGrantedBy[userId]; // userId's own entry (they were the grantee)
+        nextGrantedBy = dropStaleGrants(nextGrantedBy, userId); // entries userId granted (they were the grantor)
+        return {
+          ...access,
+          allow: access.allow.filter(id => id !== userId),
+          grantedBy: nextGrantedBy,
+        };
       });
-      touched.push(config.name);
+      if (changed) touched.push(config.name);
     }
     return touched;
   }

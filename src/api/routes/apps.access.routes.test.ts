@@ -42,9 +42,20 @@ import {
 } from '../../managers/app/app-config';
 import type { AccessGateVerdict, AccessGateBlocker } from '../../managers/guardrail/access-gate';
 
-const ENFORCEABLE: AccessGateVerdict = { enforceable: true, blockers: [], reasons: [] };
+// `featureEnabled` mirrors the operator kill switch (DROP-153) and is distinct
+// from `enforceable`: these fixtures describe a box where the gate is switched
+// ON, so every refusal below is a genuine misconfiguration rather than an
+// operator's choice. The `feature-disabled` blocker has its own coverage in
+// access-gate.test.ts and platform.access-gate.test.ts.
+const ENFORCEABLE: AccessGateVerdict = {
+  enforceable: true,
+  featureEnabled: true,
+  blockers: [],
+  reasons: [],
+};
 const refused = (...blockers: AccessGateBlocker[]): AccessGateVerdict => ({
   enforceable: false,
+  featureEnabled: true,
   blockers,
   reasons: blockers.map(b => `because ${b}`),
 });

@@ -28,6 +28,7 @@ import {
   dbRateLimitMiddleware,
   accessVerifyRateLimitMiddleware,
   servicesRateLimitMiddleware,
+  shareRateLimitMiddleware,
 } from './middleware/rate-limit';
 import { securityHeadersMiddleware } from './middleware/security-headers';
 import { auditMiddleware, initializeAuditLog, closeAuditLog } from './middleware/audit';
@@ -103,6 +104,13 @@ export interface ApiServerConfig {
    */
   isolation?: 'none' | 'docker';
   /**
+   * The DROP-152 access gate's operator kill switch (`PlatformConfig.enableAccessGate`,
+   * `DROP_FEATURE_ACCESS_GATE` env, boot-time), passed through to runtime-config
+   * so the access-gate route and platform.ts's sweep/emission paths read the
+   * same flag the platform resolved rather than defaulting independently.
+   */
+  accessGateEnabled?: boolean;
+  /**
    * Override the resolved dashboard directory (normally dist/dashboard, or
    * src/dashboard as a dev fallback — see setupRoutes). Defaults to that
    * resolution when unset; exists so tests can point at an isolated fixture
@@ -142,6 +150,7 @@ export class ApiServer {
       maxUploadSizeMb: this.config.maxUploadSizeMb,
       maxDbsPerUser: this.config.maxDbsPerUser,
       maxRedisPerUser: this.config.maxRedisPerUser,
+      accessGateEnabled: this.config.accessGateEnabled,
       // Admin-stored override (PRD-041 settings UI) takes precedence over
       // DROP_PUBLIC_URL — see getPublicUrl()'s precedence. Reads whatever
       // the settings manager singleton has loaded so far: the real platform
@@ -359,6 +368,28 @@ export class ApiServer {
     // other dedicated buckets, so an auth-disabled box gets it too.
     v1.use('/apps/*/access', servicesRateLimitMiddleware());
 
+    // Owner-initiated app sharing (DROP-153) gets its OWN bucket, not the
+    // `services` one above — that bucket's budget is already spent by
+    // attach/detach and the admin access-gate routes. Both path forms are
+    // required, not just the nested one: unlike `/apps/*/services`, this
+    // surface has handlers on the TWO-segment path (GET/POST /apps/:name/share)
+    // as well as the three-segment one (DELETE /apps/:name/share/:userId), so
+    // the '/apps/*/services'-vs-'/apps/x/services/postgres' asymmetry noted
+    // above cuts the other way here: registering only the two-segment pattern
+    // would leave DELETE /apps/:name/share/:userId with no dedicated bucket
+    // at all. Registered unconditionally, like the other dedicated buckets,
+    // so an auth-disabled box gets it too.
+    //
+    // Named-param patterns, not wildcards: a wildcard pair here
+    // (`/apps/*/share` + `/apps/*/share/*`) double-counts the two-segment
+    // form, because '/apps/*/share/*' matches it too once the sibling pattern
+    // is registered (see server.share-routes.test.ts for the measured
+    // before/after). `:name` and `:userId` each bind exactly one segment, so
+    // the two patterns below match disjoint path shapes and every request is
+    // counted once.
+    v1.use('/apps/:name/share', shareRateLimitMiddleware());
+    v1.use('/apps/:name/share/:userId', shareRateLimitMiddleware());
+
     // Apply auth middleware to protected routes when auth is enabled
     if (this.config.enableAuth && isAuthEnabled()) {
       // migrate-runtime is admin-only — register before the general /apps/* guard.
@@ -379,6 +410,15 @@ export class ApiServer {
       // not be able to widen (or clear) an allow-list an admin set on their
       // app, which the general 'readonly'/'user' guard would permit.
       v1.use('/apps/*/access', authMiddleware('admin'));
+      // Owner-initiated app sharing (DROP-153): the owner OR an admin may
+      // grant/revoke/clear, so the floor here is 'user' — the routes
+      // themselves refuse a non-owner, non-admin caller with a 404. Both path
+      // forms are registered, same reasoning as the rate-limit bucket above:
+      // the two-segment form alone would leave DELETE /apps/:name/share/:userId
+      // with no explicit role floor, falling through to the general /apps/*
+      // guard below instead of failing closed on its own.
+      v1.use('/apps/*/share', authMiddleware('user'));
+      v1.use('/apps/*/share/*', authMiddleware('user'));
       // start/stop/restart mutate runtime state (and, on restart, tear down
       // and recreate the process/container) — read-only tokens must not
       // reach them. Register before the general /apps/* guard.

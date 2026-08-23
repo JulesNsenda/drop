@@ -369,6 +369,139 @@ describe('SettingsManager', () => {
     });
   });
 
+  describe('appSharingEnabled', () => {
+    it('defaults to false when the key is absent (opt-in, unlike userConnectorsEnabled)', async () => {
+      await manager.load();
+      expect(manager.getAppSharingEnabled()).toBe(false);
+    });
+
+    it('sets and persists a value, readable via getAppSharingEnabled', async () => {
+      await manager.setAppSharingEnabled(true);
+      expect(manager.getAppSharingEnabled()).toBe(true);
+
+      const raw = await fs.readFile(settingsFilePath, 'utf-8');
+      expect(JSON.parse(raw)).toEqual({ appSharingEnabled: true });
+    });
+
+    it('persists across a reload (new manager instance, same file)', async () => {
+      await manager.setAppSharingEnabled(true);
+
+      const reloaded = new SettingsManager({ settingsFilePath });
+      await reloaded.load();
+      expect(reloaded.getAppSharingEnabled()).toBe(true);
+      await reloaded.close();
+    });
+
+    it('clears the value when set to undefined (reverts to the false default)', async () => {
+      await manager.setAppSharingEnabled(true);
+      expect(manager.getAppSharingEnabled()).toBe(true);
+
+      await manager.setAppSharingEnabled(undefined);
+      expect(manager.getAppSharingEnabled()).toBe(false);
+
+      const reloaded = new SettingsManager({ settingsFilePath });
+      await reloaded.load();
+      expect(reloaded.getAppSharingEnabled()).toBe(false);
+      await reloaded.close();
+    });
+
+    it('a corrupt settings file fails closed: getter returns false (and publicUrl is undefined)', async () => {
+      await fs.mkdir(path.dirname(settingsFilePath), { recursive: true });
+      await fs.writeFile(settingsFilePath, 'not valid json');
+
+      await manager.load();
+
+      expect(manager.getAppSharingEnabled()).toBe(false);
+      expect(manager.getStoredPublicUrl()).toBeUndefined();
+    });
+
+    it('a hand-written non-boolean value (string "true") is discarded — parseSettings drops it, stays at the false default', async () => {
+      await fs.mkdir(path.dirname(settingsFilePath), { recursive: true });
+      await fs.writeFile(settingsFilePath, JSON.stringify({ appSharingEnabled: 'true' }));
+
+      await manager.load();
+
+      expect(manager.getAppSharingEnabled()).toBe(false);
+    });
+
+    it('a hand-written non-boolean value (null) is discarded — stays at the false default', async () => {
+      await fs.mkdir(path.dirname(settingsFilePath), { recursive: true });
+      await fs.writeFile(settingsFilePath, JSON.stringify({ appSharingEnabled: null }));
+
+      await manager.load();
+
+      expect(manager.getAppSharingEnabled()).toBe(false);
+    });
+
+    it('a settings file that is valid JSON but not an object (`null`) fails closed', async () => {
+      await fs.mkdir(path.dirname(settingsFilePath), { recursive: true });
+      await fs.writeFile(settingsFilePath, 'null');
+
+      await manager.load();
+
+      expect(manager.getAppSharingEnabled()).toBe(false);
+    });
+
+    it('a settings path that is a directory (non-ENOENT readFile error) fails closed', async () => {
+      // Portable way to induce a non-ENOENT fs.readFile error — see the
+      // matching userConnectorsEnabled test above for why this must be
+      // treated as corrupt, not as "never set".
+      await fs.mkdir(settingsFilePath, { recursive: true });
+
+      await manager.load();
+
+      expect(manager.getAppSharingEnabled()).toBe(false);
+    });
+
+    it('a missing settings file (ENOENT) reads as the false default, same as "never set"', async () => {
+      // Unlike userConnectorsEnabled (default true), ENOENT and a corrupt
+      // read are NOT distinguishable here by return value alone — both land
+      // on `false`. Kept anyway, mirroring the userConnectorsEnabled test
+      // it's paired with, to pin that ENOENT does not (and must not) set
+      // `corrupt` — see the two `readFile` branches in `load()`.
+      await manager.load();
+
+      expect(manager.getAppSharingEnabled()).toBe(false);
+    });
+
+    it('clearing corrupt: setAppSharingEnabled after a corrupt load recovers immediately, no restart needed', async () => {
+      await fs.mkdir(path.dirname(settingsFilePath), { recursive: true });
+      await fs.writeFile(settingsFilePath, 'not valid json');
+
+      await manager.load();
+      expect(manager.getAppSharingEnabled()).toBe(false);
+
+      // The admin's fix-it PUT: a successful write must clear `corrupt`, not
+      // just commit the new value into memory — otherwise the getter stays
+      // stuck returning false regardless of what was just written.
+      await manager.setAppSharingEnabled(true);
+      expect(manager.getAppSharingEnabled()).toBe(true);
+
+      // And the recovery must itself be durable — a fresh manager reloading
+      // from the now-valid file must not re-derive `corrupt` from anything
+      // stale.
+      const reloaded = new SettingsManager({ settingsFilePath });
+      await reloaded.load();
+      expect(reloaded.getAppSharingEnabled()).toBe(true);
+      await reloaded.close();
+    });
+
+    it('is independent of publicUrl, githubWebhookSecret and userConnectorsEnabled across a reload (catches the parseSettings whitelist bug)', async () => {
+      await manager.setPublicUrl('https://drop.example.com');
+      await manager.setGithubWebhookSecret('a'.repeat(64));
+      await manager.setUserConnectorsEnabled(false);
+      await manager.setAppSharingEnabled(true);
+
+      const reloaded = new SettingsManager({ settingsFilePath });
+      await reloaded.load();
+      expect(reloaded.getStoredPublicUrl()).toBe('https://drop.example.com');
+      expect(reloaded.getGithubWebhookSecret()).toBe('a'.repeat(64));
+      expect(reloaded.getUserConnectorsEnabled()).toBe(false);
+      expect(reloaded.getAppSharingEnabled()).toBe(true);
+      await reloaded.close();
+    });
+  });
+
   describe('file permissions', () => {
     // POSIX mode bits aren't meaningful on Windows (no chmod-style ACL model).
     const itPosix = process.platform === 'win32' ? it.skip : it;
