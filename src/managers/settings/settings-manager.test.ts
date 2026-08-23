@@ -7,6 +7,11 @@ import * as path from 'path';
 import * as os from 'os';
 import { SettingsManager, getSettingsManager, resetSettingsManager } from './settings-manager';
 import * as atomicWrite from '../../utils/atomic-write';
+import { clearMailCredential } from '../mailer/mail-credential';
+
+jest.mock('../mailer/mail-credential', () => ({
+  clearMailCredential: jest.fn().mockResolvedValue(undefined),
+}));
 
 describe('SettingsManager', () => {
   let tempDir: string;
@@ -17,6 +22,7 @@ describe('SettingsManager', () => {
     tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'drop-settings-test-'));
     settingsFilePath = path.join(tempDir, 'settings.json');
     manager = new SettingsManager({ settingsFilePath });
+    (clearMailCredential as jest.Mock).mockClear();
   });
 
   afterEach(async () => {
@@ -499,6 +505,198 @@ describe('SettingsManager', () => {
       expect(reloaded.getUserConnectorsEnabled()).toBe(false);
       expect(reloaded.getAppSharingEnabled()).toBe(true);
       await reloaded.close();
+    });
+  });
+
+  describe('mail settings', () => {
+    it('defaults to an all-undefined object when nothing is set', async () => {
+      await manager.load();
+      expect(manager.getMailSettings()).toEqual({
+        host: undefined,
+        port: undefined,
+        secure: undefined,
+        user: undefined,
+        from: undefined,
+      });
+    });
+
+    it('sets and persists all fields, readable via getMailSettings', async () => {
+      await manager.setMailSettings({
+        host: 'smtp.example.com',
+        port: 587,
+        secure: false,
+        user: 'relay-user',
+        from: 'drop@example.com',
+      });
+
+      expect(manager.getMailSettings()).toEqual({
+        host: 'smtp.example.com',
+        port: 587,
+        secure: false,
+        user: 'relay-user',
+        from: 'drop@example.com',
+      });
+
+      const raw = await fs.readFile(settingsFilePath, 'utf-8');
+      expect(JSON.parse(raw)).toEqual({
+        smtpHost: 'smtp.example.com',
+        smtpPort: 587,
+        smtpSecure: false,
+        smtpUser: 'relay-user',
+        mailFrom: 'drop@example.com',
+      });
+    });
+
+    it('persists across a reload (new manager instance, same file)', async () => {
+      await manager.setMailSettings({ host: 'smtp.example.com', port: 587 });
+
+      const reloaded = new SettingsManager({ settingsFilePath });
+      await reloaded.load();
+      expect(reloaded.getMailSettings()).toEqual(
+        expect.objectContaining({ host: 'smtp.example.com', port: 587 })
+      );
+      await reloaded.close();
+    });
+
+    it('only updates the fields included in the partial, leaving the rest unchanged', async () => {
+      await manager.setMailSettings({ host: 'smtp.example.com', port: 587, from: 'drop@example.com' });
+
+      await manager.setMailSettings({ port: 465 });
+
+      expect(manager.getMailSettings()).toEqual({
+        host: 'smtp.example.com',
+        port: 465,
+        secure: undefined,
+        user: undefined,
+        from: 'drop@example.com',
+      });
+    });
+
+    it('does not clear the mail credential when smtpHost is not included in the partial', async () => {
+      await manager.setMailSettings({ host: 'smtp.example.com' });
+      (clearMailCredential as jest.Mock).mockClear();
+
+      await manager.setMailSettings({ port: 465 });
+
+      expect(clearMailCredential).not.toHaveBeenCalled();
+    });
+
+    it('does not clear the mail credential when smtpHost is set to the same value it already had', async () => {
+      await manager.setMailSettings({ host: 'smtp.example.com' });
+      (clearMailCredential as jest.Mock).mockClear();
+
+      await manager.setMailSettings({ host: 'smtp.example.com' });
+
+      expect(clearMailCredential).not.toHaveBeenCalled();
+    });
+
+    it('clears the mail credential when smtpHost changes to a different value', async () => {
+      await manager.setMailSettings({ host: 'smtp.example.com' });
+      (clearMailCredential as jest.Mock).mockClear();
+
+      await manager.setMailSettings({ host: 'smtp2.example.com' });
+
+      expect(clearMailCredential).toHaveBeenCalledTimes(1);
+    });
+
+    it('clears the mail credential when smtpHost is cleared to undefined (was previously set)', async () => {
+      await manager.setMailSettings({ host: 'smtp.example.com' });
+      (clearMailCredential as jest.Mock).mockClear();
+
+      await manager.setMailSettings({ host: undefined });
+
+      expect(clearMailCredential).toHaveBeenCalledTimes(1);
+      expect(manager.getMailSettings().host).toBeUndefined();
+    });
+
+    it('clears on the very first host set too (unset -> value is still a change)', async () => {
+      await manager.load();
+
+      await manager.setMailSettings({ host: 'smtp.example.com' });
+
+      // Unset -> set is still a "different value" and must trigger the clear
+      // call — a stale credential saved before any host existed is exactly
+      // as wrong to keep as one saved against a different host.
+      expect(clearMailCredential).toHaveBeenCalledTimes(1);
+    });
+
+    it('clearing the credential happens BEFORE the new host is persisted, so a failed clear leaves the old host on disk', async () => {
+      await manager.setMailSettings({ host: 'smtp.example.com' });
+      (clearMailCredential as jest.Mock).mockClear();
+      (clearMailCredential as jest.Mock).mockRejectedValueOnce(new Error('key unavailable'));
+
+      await expect(manager.setMailSettings({ host: 'smtp2.example.com' })).rejects.toThrow(
+        'key unavailable'
+      );
+
+      // The host must NOT have changed — neither in memory nor on disk —
+      // otherwise the (now-uncleared) credential saved for the old host
+      // would be sent to the new one on the next test-send.
+      expect(manager.getMailSettings().host).toBe('smtp.example.com');
+      const raw = await fs.readFile(settingsFilePath, 'utf-8');
+      expect(JSON.parse(raw).smtpHost).toBe('smtp.example.com');
+    });
+
+    it('a partial that explicitly includes `host: undefined` alongside another field still wipes host and clears the credential (key-presence, not value-truthiness)', async () => {
+      await manager.setMailSettings({ host: 'smtp.example.com', port: 587 });
+      (clearMailCredential as jest.Mock).mockClear();
+
+      // Mirrors a caller building the object by mapping every possible field
+      // rather than omitting ones a request didn't send.
+      await manager.setMailSettings({ host: undefined, port: 465 });
+
+      expect(clearMailCredential).toHaveBeenCalledTimes(1);
+      expect(manager.getMailSettings()).toEqual(
+        expect.objectContaining({ host: undefined, port: 465 })
+      );
+    });
+  });
+
+  describe('shareNotificationsEnabled', () => {
+    it('defaults to false when the key is absent (opt-in, unverified-email tradeoff)', async () => {
+      await manager.load();
+      expect(manager.getShareNotificationsEnabled()).toBe(false);
+    });
+
+    it('sets and persists a value, readable via getShareNotificationsEnabled', async () => {
+      await manager.setShareNotificationsEnabled(true);
+      expect(manager.getShareNotificationsEnabled()).toBe(true);
+
+      const raw = await fs.readFile(settingsFilePath, 'utf-8');
+      expect(JSON.parse(raw)).toEqual({ shareNotificationsEnabled: true });
+    });
+
+    it('persists across a reload (new manager instance, same file)', async () => {
+      await manager.setShareNotificationsEnabled(true);
+
+      const reloaded = new SettingsManager({ settingsFilePath });
+      await reloaded.load();
+      expect(reloaded.getShareNotificationsEnabled()).toBe(true);
+      await reloaded.close();
+    });
+
+    it('clears the value when set to undefined (reverts to the false default)', async () => {
+      await manager.setShareNotificationsEnabled(true);
+      await manager.setShareNotificationsEnabled(undefined);
+      expect(manager.getShareNotificationsEnabled()).toBe(false);
+    });
+
+    it('a corrupt settings file fails closed', async () => {
+      await fs.mkdir(path.dirname(settingsFilePath), { recursive: true });
+      await fs.writeFile(settingsFilePath, 'not valid json');
+
+      await manager.load();
+
+      expect(manager.getShareNotificationsEnabled()).toBe(false);
+    });
+
+    it('a hand-written non-boolean value (string "true") is discarded — stays at the false default', async () => {
+      await fs.mkdir(path.dirname(settingsFilePath), { recursive: true });
+      await fs.writeFile(settingsFilePath, JSON.stringify({ shareNotificationsEnabled: 'true' }));
+
+      await manager.load();
+
+      expect(manager.getShareNotificationsEnabled()).toBe(false);
     });
   });
 

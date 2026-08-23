@@ -25,6 +25,19 @@
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import { writeJsonAtomic } from '../../utils/atomic-write';
+import { clearMailCredential } from '../mailer/mail-credential';
+
+/**
+ * Non-secret SMTP settings. Deliberately excludes the password — that's
+ * encrypted in its own store (`mail-credential.ts`), owned by the mailer.
+ */
+export interface MailSettings {
+  host?: string;
+  port?: number;
+  secure?: boolean;
+  user?: string;
+  from?: string;
+}
 
 export interface PlatformSettings {
   /** Admin-set public base URL override (falls back to DROP_PUBLIC_URL env when unset). */
@@ -45,6 +58,24 @@ export interface PlatformSettings {
    * behaviour for, so it ships opt-in rather than opt-out.
    */
   appSharingEnabled?: boolean;
+  /** SMTP relay hostname. NOT the password — see `mail-credential.ts`. */
+  smtpHost?: string;
+  /** SMTP relay port. */
+  smtpPort?: number;
+  /** Whether to use implicit TLS (as opposed to STARTTLS) against the relay. */
+  smtpSecure?: boolean;
+  /** SMTP auth username. NOT the password — see `mail-credential.ts`. */
+  smtpUser?: string;
+  /** The `From:` address DROP-sent mail is sent as. */
+  mailFrom?: string;
+  /**
+   * Gates the `share-notification` mail (DROP-154 §7): whether granting an
+   * app access also emails the recipient. Defaults to DISABLED (`false`)
+   * when unset, matching `appSharingEnabled`'s reasoning above — DROP does
+   * not verify email addresses, so this is an operator accepting a known
+   * disclosure tradeoff rather than a default nobody chose.
+   */
+  shareNotificationsEnabled?: boolean;
 }
 
 export interface SettingsManagerConfig {
@@ -91,6 +122,16 @@ const SETTINGS_FIELDS: readonly SettingsFieldSpec[] = [
   { key: 'githubWebhookSecret', type: 'string', sensitive: true },
   { key: 'userConnectorsEnabled', type: 'boolean', sensitive: false, failClosedDefault: false },
   { key: 'appSharingEnabled', type: 'boolean', sensitive: false, failClosedDefault: false },
+  { key: 'smtpHost', type: 'string', sensitive: false },
+  { key: 'smtpPort', type: 'number', sensitive: false },
+  { key: 'smtpSecure', type: 'boolean', sensitive: false },
+  { key: 'smtpUser', type: 'string', sensitive: false },
+  { key: 'mailFrom', type: 'string', sensitive: false },
+  { key: 'shareNotificationsEnabled', type: 'boolean', sensitive: false, failClosedDefault: false },
+  // The SMTP password is deliberately NOT here. It lives encrypted in its
+  // own store (mail-credential.ts), owned by the mailer — adding it to this
+  // table would make parseSettings silently DROP the ciphertext object on
+  // load (it's neither a string, number nor boolean).
 ];
 
 function parseSettings(raw: string): PlatformSettings {
@@ -116,7 +157,13 @@ function parseSettings(raw: string): PlatformSettings {
   }
   // githubWebhookSecret's empty-string-means-absent behaviour is enforced by
   // its own getter (`|| undefined`), not here — an empty string is still a
-  // valid `string` and must pass this generic type check unchanged.
+  // valid `string` and must pass this generic type check unchanged. One
+  // byte-level difference from the old hand-written check this replaces: a
+  // hand-written `{"githubWebhookSecret":""}` on disk now round-trips as
+  // `''` in `this.settings` (previously dropped to `undefined` at parse
+  // time), so it can reappear verbatim in the next doSave() write. Every
+  // public read still returns `undefined` either way — this is invisible
+  // through the class's own API and not covered by a test.
   return result as PlatformSettings;
 }
 
@@ -259,6 +306,83 @@ export class SettingsManager {
   /** Set (or, with `undefined`, clear) the stored app-sharing-enabled override. Persists atomically. */
   async setAppSharingEnabled(enabled: boolean | undefined): Promise<void> {
     const next: PlatformSettings = { ...this.settings, appSharingEnabled: enabled };
+    // Same persist-then-commit-in-memory shape as setPublicUrl above — see
+    // that method's comment for why this isn't queued through a chained
+    // savePromise.
+    await this.doSave(next);
+    this.settings = next;
+  }
+
+  /** Non-secret SMTP settings. The password is never here — see `MailSettings`. */
+  getMailSettings(): MailSettings {
+    return {
+      host: this.settings.smtpHost,
+      port: this.settings.smtpPort,
+      secure: this.settings.smtpSecure,
+      user: this.settings.smtpUser,
+      from: this.settings.mailFrom,
+    };
+  }
+
+  /**
+   * Set (only) the given fields; a key that is ABSENT from `partial` is left
+   * unchanged, but a key present with value `undefined` (e.g.
+   * `{ host: undefined }`) explicitly clears that field — same as every
+   * other setter in this file. This is key-presence, not value-truthiness:
+   * a caller must build `partial` by including only the keys an admin PUT
+   * actually sent (e.g. `value !== undefined ? { host: value } : {}`), never
+   * by spreading a body's fields unconditionally — `{ host: body.smtpHost,
+   * ... }` from a body that omitted `smtpHost` would still include the
+   * `host` key (with value `undefined`) and wipe the stored host + clear the
+   * credential below on every PUT that didn't intend to touch it.
+   *
+   * When `host` is included and differs from the currently-stored host
+   * (including a change to `undefined`), clears the stored SMTP credential
+   * FIRST, before persisting the new host (DROP-154 §3): the password was
+   * saved against the OLD host, and `POST /admin/mail/test` against an
+   * admin-settable `smtpHost` would otherwise let an admin exfiltrate the
+   * relay password to any host they can name. Clearing before the write
+   * means a failed clear aborts here with the OLD host still on disk — the
+   * credential and the host it was saved against are never allowed to point
+   * at different hosts, even transiently. (The other failure order — save
+   * succeeds, clear then fails — would leave the new host persisted with the
+   * old password still valid on disk, which is exactly the leak this
+   * ordering avoids.)
+   */
+  async setMailSettings(partial: MailSettings): Promise<void> {
+    const next: PlatformSettings = { ...this.settings };
+    if ('host' in partial) next.smtpHost = partial.host;
+    if ('port' in partial) next.smtpPort = partial.port;
+    if ('secure' in partial) next.smtpSecure = partial.secure;
+    if ('user' in partial) next.smtpUser = partial.user;
+    if ('from' in partial) next.mailFrom = partial.from;
+
+    const hostChanged = 'host' in partial && partial.host !== this.settings.smtpHost;
+
+    if (hostChanged) {
+      await clearMailCredential();
+    }
+
+    // Same persist-then-commit-in-memory shape as setPublicUrl above — see
+    // that method's comment for why this isn't queued through a chained
+    // savePromise.
+    await this.doSave(next);
+    this.settings = next;
+  }
+
+  /**
+   * Whether granting an app access also emails the recipient (DROP-154 §7).
+   * Defaults to DISABLED, same shape as getAppSharingEnabled() above — see
+   * the field comment on `shareNotificationsEnabled` for the reasoning.
+   */
+  getShareNotificationsEnabled(): boolean {
+    if (this.corrupt) return false;
+    return this.settings.shareNotificationsEnabled ?? false;
+  }
+
+  /** Set (or, with `undefined`, clear) the stored share-notifications-enabled override. Persists atomically. */
+  async setShareNotificationsEnabled(enabled: boolean | undefined): Promise<void> {
+    const next: PlatformSettings = { ...this.settings, shareNotificationsEnabled: enabled };
     // Same persist-then-commit-in-memory shape as setPublicUrl above — see
     // that method's comment for why this isn't queued through a chained
     // savePromise.
