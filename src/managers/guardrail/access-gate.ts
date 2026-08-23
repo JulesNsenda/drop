@@ -64,6 +64,45 @@ export interface AccessGateContext {
    * nobody can reach, with the origin holding the data left open.
    */
   isGroupContainer?: boolean;
+  /**
+   * DROP's own public base URL (`getPublicUrl()`), or undefined when none is
+   * configured.
+   *
+   * The gate's very first hop redirects the visitor here to authenticate. With
+   * no public URL there is nowhere to send them, so the guard would be emitted
+   * in front of an app that then answers nothing to anyone — bricked, not
+   * merely ungated. It also decides whether the platform's own host is in
+   * `reservedHosts()` at all: that set is derived from this value, so without
+   * it the login host is not reserved and a tenant can claim it.
+   */
+  publicUrl?: string;
+  /**
+   * How many hostnames the app is routed on.
+   *
+   * The session cookie is `__Host-`-prefixed and therefore host-only, while
+   * routes are emitted per hostname — so a session minted on one hostname does
+   * not exist on another, and `computeAppUrl` can name only one origin to
+   * redirect back to. A visitor arriving on any other hostname would loop
+   * through the login forever, silently teleported off the address they asked
+   * for. Refusing is the smaller, honest slice; per-hostname origins can come
+   * later.
+   */
+  hostnameCount?: number;
+  /**
+   * Whether DROP's own API port is usable. `forward_auth 127.0.0.1:NaN` fails
+   * to parse the WHOLE Caddyfile, so every site on the box loses its config at
+   * the next Caddy start. Slice 0's inline `apiPortUsable` check covered the
+   * MCP guard only.
+   */
+  apiPortUsable?: boolean;
+  /**
+   * Whether the app's name is safe to interpolate into a Caddyfile literal.
+   * Folder-dropped names are validated only weakly, while the API's strict
+   * pattern applies to API-created apps — so a name carrying a space or a
+   * brace produces an unparseable directive and Caddy rejects the entire
+   * config. The gate adds two more interpolation sites, so it checks.
+   */
+  appNameSafe?: boolean;
 }
 
 /** A machine-readable reason a gate cannot be enforced. */
@@ -73,7 +112,11 @@ export type AccessGateBlocker =
   | 'no-https'
   | 'tenant-network-shared'
   | 'monorepo-group-child'
-  | 'monorepo-group-container';
+  | 'monorepo-group-container'
+  | 'no-public-url'
+  | 'multi-hostname'
+  | 'api-port-unusable'
+  | 'invalid-app-name';
 
 export interface AccessGateVerdict {
   enforceable: boolean;
@@ -101,6 +144,20 @@ const BLOCKER_REASONS: Record<AccessGateBlocker, string> = {
   'monorepo-group-container':
     'the app is a monorepo container, not a service: it serves nothing itself, so a gate on it ' +
     'would be a governance record over an address nobody can reach while its children stay open',
+  'no-public-url':
+    'this platform has no public URL configured, so there is nowhere to send a visitor to sign ' +
+    'in — a gate here would make the app unreachable rather than protected, and the login host ' +
+    'would not be reserved against tenants claiming it',
+  'multi-hostname':
+    'the app is routed on more than one hostname: the session cookie is host-only, so a visitor ' +
+    'arriving on any hostname but the primary one would be redirected to the primary and loop ' +
+    'forever on the address they actually asked for',
+  'api-port-unusable':
+    'DROP\'s API port is not usable, and a guard pointing at it would produce a Caddyfile that ' +
+    'fails to parse — taking every site on this box down with it, not just this app',
+  'invalid-app-name':
+    'the app name cannot be safely written into a Caddy directive, and an unparseable directive ' +
+    'rejects the entire configuration for every site on this box',
 };
 
 /**
@@ -135,6 +192,14 @@ export function assessAccessGate(ctx: AccessGateContext): AccessGateVerdict {
   if (ctx.networkIsolation === 'shared') blockers.push('tenant-network-shared');
   if (ctx.isGroupContainer) blockers.push('monorepo-group-container');
   else if (ctx.group) blockers.push('monorepo-group-child');
+  // Each of these four is a way for a gate to be emitted in front of an app it
+  // then makes UNREACHABLE, rather than merely unprotected — the failure mode
+  // the whole assessment exists to keep out, arrived at from four directions
+  // that Slice 0 had no input for.
+  if (!ctx.publicUrl) blockers.push('no-public-url');
+  if ((ctx.hostnameCount ?? 1) > 1) blockers.push('multi-hostname');
+  if (ctx.apiPortUsable === false) blockers.push('api-port-unusable');
+  if (ctx.appNameSafe === false) blockers.push('invalid-app-name');
 
   return {
     enforceable: blockers.length === 0,

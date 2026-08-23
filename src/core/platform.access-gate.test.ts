@@ -22,6 +22,7 @@ import * as os from 'os';
 import { DropPlatform, createPlatform } from './platform';
 import type { AppConfig } from '../managers/app/app-config';
 import { ACCESS_GATE_ENFORCEMENT_AVAILABLE } from '../managers/guardrail/access-gate';
+import { setPublicUrl } from '../api/runtime-config';
 
 const POLICY: AppConfig['access'] = { mode: 'drop-users', allow: ['user-1'] };
 
@@ -84,6 +85,7 @@ describe('platform access-gate refusals (DROP-152)', () => {
       enableApiAuth: true,
       enableHttps: true,
       domainSuffix: 'example.com',
+      apiPort: 3000,
     });
 
   /**
@@ -99,6 +101,9 @@ describe('platform access-gate refusals (DROP-152)', () => {
 
   beforeEach(() => {
     jest.clearAllMocks();
+    // The gate's first hop redirects here; without it every verdict is
+    // `no-public-url` and the refusal tests would pass for the wrong reason.
+    setPublicUrl('https://dashboard.example.com');
     tempDir = path.join(os.tmpdir(), `drop-access-gate-${Date.now()}-${Math.floor(performance.now())}`);
     platform = makeEnforceablePlatform();
 
@@ -114,6 +119,7 @@ describe('platform access-gate refusals (DROP-152)', () => {
   });
 
   afterEach(async () => {
+    setPublicUrl(undefined);
     await fs.rm(tempDir, { recursive: true, force: true }).catch(() => undefined);
   });
 
@@ -233,6 +239,37 @@ describe('platform access-gate refusals (DROP-152)', () => {
       };
 
       await configureRoute();
+
+      expect(setAccessGateUnapplied).toHaveBeenCalledWith('myapp', true);
+    });
+
+    it('does NOT record the gate as applied when Caddy REJECTED the config', async () => {
+      // A rejected `/load` returns false rather than throwing, so the
+      // surrounding catch never sees it and the previous — ungated — block
+      // stays live. Recording "applied" here asserted a control that was never
+      // installed.
+      wire(configFor({ access: POLICY }));
+      (platform as unknown as Record<string, unknown>).caddyServer = {
+        getStatus: () => 'running',
+        reload: jest.fn().mockResolvedValue(false),
+      };
+
+      await configureRoute();
+
+      expect(setAccessGateUnapplied).toHaveBeenCalledWith('myapp', true);
+      expect(errors.find(e => e.includes('REJECTED'))).toBeDefined();
+    });
+
+    it('does NOT record it as applied when the reload was SKIPPED', async () => {
+      // The boot path batches reloads (`skipCaddyReload`), so at this point
+      // nothing has reached Caddy at all — which is not the same as Caddy
+      // having accepted it.
+      wire(configFor({ access: POLICY }));
+      await (
+        platform as unknown as {
+          handleConfigureRoute: (n: string, p: number, o: unknown) => Promise<void>;
+        }
+      ).handleConfigureRoute('myapp', 4000, { skipCaddyReload: true });
 
       expect(setAccessGateUnapplied).toHaveBeenCalledWith('myapp', true);
     });
