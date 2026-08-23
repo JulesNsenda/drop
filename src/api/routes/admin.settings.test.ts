@@ -887,6 +887,49 @@ describe('admin settings routes (PRD-041)', () => {
       expect(body.data?.credentialConfigured).toBe(true);
     });
 
+    // DROP-154 Gate 2 §1 — the whole reason `clearMailCredential()` runs
+    // BEFORE `setMailSettings()` rather than after (see the handler's own
+    // comment): if the clear fails, the new host must NEVER reach disk next
+    // to a password that was saved for the old one — that pairing is exactly
+    // what lets an admin repoint `smtpHost` at a host they control and have
+    // `POST /admin/mail/test` hand them the operator's real relay password.
+    // A test that only checks the HAPPY-path ordering (clear succeeds, host
+    // changes) cannot tell "clear-then-persist" apart from
+    // "persist-then-clear" — both produce the same observable result when
+    // the clear itself never fails. This is the one that can.
+    it('aborts the whole write — old host AND old credential both left in place — when the pre-change credential clear fails', async () => {
+      await writeValidEncryptionKey();
+      await putMail({ host: 'smtp.example.com' });
+      await putMailCredential('super-secret-relay-password');
+
+      const store = getMailCredentialStore();
+      const clearSpy = jest.spyOn(store, 'clear').mockRejectedValue(new Error('disk error'));
+
+      const res = await putMail({ host: 'attacker-controlled.example' });
+      expect(res.status).toBe(500);
+      const body = (await res.json()) as ApiEnvelope<never>;
+      expect(body.error?.code).toBe('INTERNAL_ERROR');
+      expect(clearSpy).toHaveBeenCalledTimes(1);
+
+      // The new host must NOT have been persisted — a mutation that moves
+      // the clear to AFTER setMailSettings() would fail this assertion,
+      // because the settings write would have already landed before the
+      // (now-too-late) clear rejected.
+      expect(getSettingsManager().getMailSettings().host).toBe('smtp.example.com');
+
+      // ...and the OLD credential (saved against the OLD host) must still be
+      // readable — it was never actually cleared.
+      clearSpy.mockRestore();
+      expect(await getMailCredentialStore().resolveMailPassword('smtp.example.com')).toBe(
+        'super-secret-relay-password'
+      );
+
+      const getRes = await getSettings();
+      const getBody = (await getRes.json()) as ApiEnvelope<SettingsPayload>;
+      expect(getBody.data?.mail.host).toBe('smtp.example.com');
+      expect(getBody.data?.mail.credentialConfigured).toBe(true);
+    });
+
     it('rejects a non-boolean "secure" with 400 and does not mutate state', async () => {
       await putMail({ host: 'smtp.example.com' });
       const res = await putMail({ secure: 'yes' });
