@@ -197,6 +197,13 @@ appAccess.get('/:app/verify', async c => {
           userId: identity.userId,
           username: identity.username,
         });
+        // The estate view's "who has opened it". Fire-and-forget for the same
+        // reason the log is: this runs once per HTTP request, and a summary
+        // nobody has read yet must never delay or fail the authorization it
+        // describes.
+        void getStateManager()
+          .recordAppOpened(appName, identity.userId, identity.username)
+          .catch(() => undefined);
         // The tenant learns WHO is calling without ever seeing DROP's cookie —
         // the generated block strips it on the hop to them.
         c.header('X-Drop-Session-User-Id', identity.userId);
