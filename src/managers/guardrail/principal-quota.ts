@@ -115,11 +115,34 @@ function ownerLimit(): number {
   return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_OWNER_LIMIT;
 }
 
+/** Mails per principal per window. Looser than a deploy — see `getMailQuota`. */
+const DEFAULT_MAIL_PRINCIPAL_LIMIT = 20;
+/** Mails per human per window, across every session and credential they have. */
+const DEFAULT_MAIL_OWNER_LIMIT = 50;
+
+/**
+ * Mail's own env-var-backed limits — deliberately NOT the deploy vars above.
+ * Sharing them would mean an operator tightening redeploy limits silently
+ * tightened outbound mail too, which is a surprising coupling between two
+ * unrelated controls. Guarded the same way `principalLimit`/`ownerLimit` are:
+ * a malformed value (`parseInt` -> `NaN`, or <= 0) falls back to the default
+ * rather than being taken at face value, which for `NaN` would otherwise
+ * disable the quota entirely (`used >= NaN` is always false).
+ */
+function mailPrincipalLimit(): number {
+  const raw = parseInt(process.env.DROP_MAX_MAILS_PER_HOUR || '', 10);
+  return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_MAIL_PRINCIPAL_LIMIT;
+}
+
+function mailOwnerLimit(): number {
+  const raw = parseInt(process.env.DROP_MAX_MAILS_PER_HOUR_PER_USER || '', 10);
+  return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_MAIL_OWNER_LIMIT;
+}
+
 /**
  * Shared key-building shape for a principal-bearing actor, factored out so
- * the deploy free function below and the instance method `keysFor` cannot
- * silently diverge — a second implementation copy is exactly the fork this
- * file exists to avoid.
+ * the instance method `keysFor` below has one place to build a key list from —
+ * a second implementation copy is exactly the fork this file exists to avoid.
  */
 function buildQuotaKeys(
   actor: DeployActorInfo,
@@ -135,23 +158,6 @@ function buildQuotaKeys(
   return keys;
 }
 
-/**
- * The quota keys for a caller.
- *
- * Automation (no principal) is deliberately NOT quota'd: it has no human to
- * attribute volume to, and every platform restart re-deploys the whole fleet
- * through the watcher — which would otherwise spend every owner's allowance on
- * a reboot. Its runaway case is the breaker's automation key.
- *
- * Deploy-only: reads the env-var-backed limits directly. The mail instance
- * uses `PrincipalQuota#keysFor` instead, which has no unmetered branch — see
- * the module doc comment.
- */
-export function quotaKeysFor(actor: DeployActorInfo): QuotaKey[] {
-  if (!actor.principalId) return [];
-  return buildQuotaKeys(actor, principalLimit(), ownerLimit());
-}
-
 interface QuotaStore {
   /** key -> deploy timestamps (ms), all inside the window. */
   deploys: Record<string, number[]>;
@@ -163,9 +169,9 @@ export interface PrincipalQuotaOptions {
   /** Override the rolling window. Deploys use one hour; tests, and mail. */
   windowMs?: number;
   /**
-   * Override the per-principal limit used by `keysFor` (NOT by the free
-   * `quotaKeysFor`, which always reads the deploy env var). Falls back to
-   * the same env-var-backed default as deploys when unset, so a caller that
+   * Override the per-principal limit used by `keysFor`. Falls back to the
+   * env-var-backed default for the calling instance (deploy's or mail's — see
+   * `principalLimit()`/`mailPrincipalLimit()`) when unset, so a caller that
    * does not pass this explicitly gets the same number either way rather
    * than two limit sources silently drifting apart.
    */
@@ -174,7 +180,7 @@ export interface PrincipalQuotaOptions {
   ownerLimit?: number;
   /**
    * Whether an actor with no `principalId` is unmetered (deploy's automation
-   * escape hatch — see `quotaKeysFor`) or refused outright.
+   * escape hatch — see `keysFor`) or refused outright.
    *
    * Default `true`, preserving deploy behaviour exactly. Mail sets this
    * `false`: an absent principal on an outbound channel is not automation
@@ -229,7 +235,13 @@ export class PrincipalQuota {
   }
 
   /**
-   * Instance-scoped equivalent of the module-level `quotaKeysFor`.
+   * The single key-building entry point — every caller (deploy's
+   * `admitDeploy`, mail's `apps.share.ts`) goes through this, on its own
+   * `PrincipalQuota` instance, rather than a free function reading the env
+   * vars directly. That used to fork (a free `quotaKeysFor` for deploys, this
+   * method for mail); one entry point means constructing an instance with
+   * limit overrides always configures something, instead of silently doing
+   * nothing when a caller reached for the free function out of habit.
    *
    * Returns a discriminated union rather than `QuotaKey[] | null` on
    * purpose: `[]` already means "no gating needed" (`check([])` allows), so
@@ -407,42 +419,55 @@ export function resetPrincipalQuota(): void {
 }
 
 let mailInstance: PrincipalQuota | null = null;
+/** The store path `mailInstance` was actually constructed with, for the reconfiguration guard below. */
+let mailInstanceStorePath: string | null = null;
 
 /**
- * The mail singleton (DROP-154). Same engine, same RELATIVE-fallback caveat
- * as `getPrincipalQuota` above, but the two DELIBERATE option differences
+ * The mail singleton (DROP-154), wired up by `platform.ts`'s `start()`
+ * (initialized before `initializeServices()`) and flushed in its `stop()`
+ * alongside the deploy singleton. Same engine as `getPrincipalQuota` above,
+ * same RELATIVE-fallback caveat, but the two DELIBERATE option differences
  * described on the module doc comment: no unmetered branch, and fails closed
- * when the tracked-principal table is full. A caller needing different
+ * when the tracked-principal table is full. Its limits read
+ * `DROP_MAX_MAILS_PER_HOUR(_PER_USER)` — see `mailPrincipalLimit`/
+ * `mailOwnerLimit` — never the deploy env vars. A caller needing different
  * limits or window can construct its own `PrincipalQuota` directly — this
  * singleton exists for the common case of one shared mail quota.
  *
- * Not wired into any route or into `platform.ts` here — that is a later
- * slice's job (§7/§9 of the plan). Note for that wiring: nothing calls
- * `flush()` on this instance today (the deploy singleton's is flushed in
- * `platform.stop()`), and `QuotaExceededError`'s message is worded for
- * deploys ("Deploy quota exceeded... Retry in Xs") — a mail caller catching
- * it should not surface that string to a user.
+ * Passing a `storePath` that conflicts with an already-constructed instance
+ * THROWS rather than silently keeping whichever call landed first — the same
+ * precedent `getAppRuntime()` sets for a conflicting runtime type. A bare
+ * call (no argument) never throws and just returns whatever instance exists,
+ * matching `getAppRuntime()`'s and `getPrincipalQuota()`'s own shape.
  */
-export function getMailQuota(
-  storePath?: string,
-  opts?: Pick<PrincipalQuotaOptions, 'principalLimit' | 'ownerLimit' | 'windowMs'>
-): PrincipalQuota {
-  if (!mailInstance) {
-    mailInstance = new PrincipalQuota(storePath ?? 'data/drop-svc/mail-quotas.json', {
-      ...opts,
-      // Not overridable by a caller: these two are what make this instance a
-      // MAIL limiter rather than a second deploy one. An absent principal is
-      // refused (an unmetered outbound channel is not the same thing as
-      // automation with nothing to attribute volume to), and a full tracking
-      // table fails closed (otherwise anyone who can mint principals evades
-      // the per-principal cap entirely).
-      unmeteredWithoutPrincipal: false,
-      failClosedWhenFull: true,
-    });
+export function getMailQuota(storePath?: string): PrincipalQuota {
+  const resolvedPath = storePath ?? 'data/drop-svc/mail-quotas.json';
+  if (mailInstance) {
+    if (storePath !== undefined && resolvedPath !== mailInstanceStorePath) {
+      throw new Error(
+        `Mail quota already initialized at '${mailInstanceStorePath}'; ` +
+          `cannot reconfigure to '${resolvedPath}' without resetMailQuota()`
+      );
+    }
+    return mailInstance;
   }
+  mailInstanceStorePath = resolvedPath;
+  mailInstance = new PrincipalQuota(resolvedPath, {
+    principalLimit: mailPrincipalLimit(),
+    ownerLimit: mailOwnerLimit(),
+    // Not overridable by a caller: these two are what make this instance a
+    // MAIL limiter rather than a second deploy one. An absent principal is
+    // refused (an unmetered outbound channel is not the same thing as
+    // automation with nothing to attribute volume to), and a full tracking
+    // table fails closed (otherwise anyone who can mint principals evades
+    // the per-principal cap entirely).
+    unmeteredWithoutPrincipal: false,
+    failClosedWhenFull: true,
+  });
   return mailInstance;
 }
 
 export function resetMailQuota(): void {
   mailInstance = null;
+  mailInstanceStorePath = null;
 }

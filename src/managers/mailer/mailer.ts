@@ -13,30 +13,43 @@
  * reply (see `MailSendResult` in `mailer.types.ts`): surfacing 550/552 to a
  * caller turns any send path into a directory enumeration oracle against the
  * operator's mail domain. A send failure never fails its caller's
- * operation — this function never throws.
+ * operation — this function never throws. The relay-conversation detail
+ * (connection refusal, auth/TLS failure, or the relay's own reply) is
+ * returned alongside `status` as an OPTIONAL `failure` — see
+ * `MailFailureDetail` in `mailer.types.ts` for exactly who is allowed to
+ * read it. This module has no `AuthContext` and does not write to
+ * `ActivityLog` itself; each caller logs with its own actor via
+ * `logActivityFor`.
  *
- * Transport security is forced, not configured: `requireTLS` and
- * `tls.rejectUnauthorized` are always on unless the operator has explicitly
- * opted out via `DROP_SMTP_ALLOW_INSECURE_TLS=true` (an env, deliberately
- * NOT one of `MailSettings`' admin-clickable fields — relaxing certificate
+ * Transport security is forced, not configured: `requireTLS` is always on,
+ * unconditionally — there is no env or setting that relaxes it, because a
+ * relay that doesn't advertise STARTTLS must fail the connection, not fall
+ * back to cleartext. `tls.rejectUnauthorized` is the ONLY thing
+ * `DROP_SMTP_ALLOW_INSECURE_TLS=true` relaxes (an env, deliberately NOT one
+ * of `MailSettings`' admin-clickable fields — relaxing certificate
  * validation is a rare, deliberate operator decision for an internal relay
  * with a self-signed cert, not something that belongs one click away in the
- * dashboard). Without this, `smtpSecure: false` on port 587 is opportunistic
- * STARTTLS, which an on-path attacker strips to harvest the relay password
- * and every message body in cleartext.
+ * dashboard).
+ *
+ * The relay host is validated before every dial (`isRelayHostAllowed`)
+ * against the same private/loopback/link-local ranges `ssrf-guard.ts`
+ * already blocks for tenant-controlled URLs — an admin-set `smtpHost` (or an
+ * admin-supplied `to` on the test route) must not turn this module into an
+ * internal-network scanner reachable through the admin API. Opt out per-box
+ * with `DROP_SMTP_ALLOW_PRIVATE_RELAY=true`, for the legitimate case of an
+ * internal relay on a private range.
  */
 
 import nodemailer from 'nodemailer';
 import { getSettingsManager } from '../settings/settings-manager';
 import { getMailCredentialStore } from './mail-credential';
 import { renderTemplate } from './templates';
-import { tryLogActivity } from '../activity/activity-log';
+import { hostnameResolvesToBlockedIp } from '../../utils/ssrf-guard';
 import type {
   MailTemplate,
   MailTemplateVars,
   MailSendResult,
-  ShareNotificationVars,
-  InviteMailVars,
+  MailFailureDetail,
 } from './mailer.types';
 
 /**
@@ -74,26 +87,39 @@ function assertSingleAddress(field: string, value: string): void {
   }
 }
 
-/** `share-notification` and `invite` carry an `appName`; `test` does not — narrows `vars` for the failure-log write below. */
-function isAppNamedTemplate(
-  template: MailTemplate,
-  _vars: MailTemplateVars[MailTemplate]
-): _vars is ShareNotificationVars | InviteMailVars {
-  return template === 'share-notification' || template === 'invite';
+/**
+ * True if `host` is safe to dial — mirrors the private/loopback/link-local
+ * blocklist `ssrf-guard.ts` already applies to tenant-controlled URLs
+ * (webhooks, git clones, `depends_on`). An admin-set `smtpHost` reaches this
+ * same check on every send: without it, the admin API becomes a usable
+ * internal-network probe (an admin-supplied host + any port, distinguishable
+ * by timing — instant `ECONNREFUSED` vs. the full deadline on an
+ * open-but-silent port). `DROP_SMTP_ALLOW_PRIVATE_RELAY=true` is the
+ * explicit, box-level opt-out for a legitimate internal relay.
+ */
+async function isRelayHostAllowed(host: string): Promise<boolean> {
+  if (process.env.DROP_SMTP_ALLOW_PRIVATE_RELAY === 'true') return true;
+  return !(await hostnameResolvesToBlockedIp(host));
 }
 
-function resolveDeadline<T>(promise: Promise<T>, ms: number): Promise<T | undefined> {
-  return new Promise<T | undefined>((resolve) => {
-    const timer = setTimeout(() => resolve(undefined), ms);
+/**
+ * Races `promise` against a `ms` deadline and reports which one won —
+ * `'timeout'` is itself a distinct, reportable outcome (a deadline with no
+ * relay contact at all is one of the failure modes `MailFailureDetail`
+ * exists to surface, not silence), not merely "the same as no error yet".
+ */
+function resolveDeadline(promise: Promise<unknown>, ms: number): Promise<'settled' | 'timeout'> {
+  return new Promise<'settled' | 'timeout'>((resolve) => {
+    const timer = setTimeout(() => resolve('timeout'), ms);
     timer.unref?.();
     promise.then(
-      (value) => {
+      () => {
         clearTimeout(timer);
-        resolve(value);
+        resolve('settled');
       },
       () => {
         clearTimeout(timer);
-        resolve(undefined);
+        resolve('settled');
       }
     );
   });
@@ -118,7 +144,14 @@ async function doSend(
     return { status: 'unavailable' };
   }
 
-  const password = await getMailCredentialStore().resolveMailPassword();
+  if (!(await isRelayHostAllowed(mailSettings.host))) {
+    console.error(
+      `[mailer] refused to dial relay host — private/loopback/link-local address: ${mailSettings.host}`
+    );
+    return { status: 'unavailable' };
+  }
+
+  const password = await getMailCredentialStore().resolveMailPassword(mailSettings.host);
   if (!password) {
     return { status: 'unavailable' };
   }
@@ -152,7 +185,10 @@ async function doSend(
     // is truthy (see `nodemailer.js`'s `if (options.pool) { ... } else {
     // transporter = new SMTPTransport(options); }`). Omitting it is what
     // gives the one-shot, non-pooled transport this module is built around.
-    requireTLS: !allowInsecureTls,
+    //
+    // `requireTLS` is unconditional — see the file header. Only
+    // `rejectUnauthorized` moves with `DROP_SMTP_ALLOW_INSECURE_TLS`.
+    requireTLS: true,
     tls: { rejectUnauthorized: !allowInsecureTls },
     connectionTimeout: SEND_DEADLINE_MS,
     greetingTimeout: SEND_DEADLINE_MS,
@@ -161,8 +197,10 @@ async function doSend(
 
   // `status` is fixed here, before the relay conversation even starts (see
   // the file header and `MailSendResult`) — nothing below this line can
-  // change what we return.
-  const result: MailSendResult = { status: 'sent' };
+  // change what we return. `failure` is populated if the relay conversation
+  // errors, OR (below, after the race) if the deadline elapses with no
+  // response at all — the only case left unpopulated is a genuine success.
+  let failure: MailFailureDetail | undefined;
 
   const sendPromise = transport
     .sendMail({ from: mailSettings.from, to, subject, html, text })
@@ -170,32 +208,35 @@ async function doSend(
       console.log(`[mailer] send attempt completed for template=${template}`);
     })
     .catch((err) => {
-      // Relay diagnostics go to the log, never to the return value — see the
-      // file header. console.error stays (an unowned sibling test asserts on
-      // it); ActivityLog is the durable, admin-visible home for the same
-      // diagnostic — `tryLogActivity` is used directly (no `AuthContext` is
-      // available inside this function) and never throws, so a logging
-      // failure can't turn into a second, unrelated send failure. Note this
-      // write is inside the same floating `.catch()` chain that
-      // `resolveDeadline` abandons past the deadline below — a caller
-      // observing `sendTemplatedMail` resolve is NOT a guarantee this entry
-      // has been written yet.
+      // The relay diagnostic (which may be the raw SMTP reply, e.g. "550 no
+      // such user") goes to the log always, and to `failure` for the caller
+      // to decide who gets to see it — see `MailFailureDetail`'s doc for why
+      // this module itself never writes it anywhere durable: it has no
+      // `AuthContext` to attribute the write to, and `to` is exactly the
+      // recipient the enumeration-oracle rule exists to protect. Note this
+      // assignment is inside the same floating `.catch()` chain that
+      // `resolveDeadline` abandons past the deadline below — a relay error
+      // that arrives after the deadline is never reflected in the value this
+      // function already returned.
       const message = err instanceof Error ? err.message : String(err);
       console.error(`[mailer] send attempt failed for template=${template}:`, message);
-      void tryLogActivity({
-        action: 'mail-send-failed',
-        appName: isAppNamedTemplate(template, vars) ? vars.appName : undefined,
-        detail: `template=${template} to=${to}: ${message}`,
-      });
+      failure = { reason: message };
     })
     .finally(() => {
       transport.close();
     });
 
   // Await up to the deadline; a still-pending attempt is abandoned here (its
-  // own .catch/.finally above still runs whenever it eventually settles) —
-  // the caller is never made to wait past SEND_DEADLINE_MS.
-  await resolveDeadline(sendPromise, SEND_DEADLINE_MS);
+  // own .catch/.finally above still runs whenever it eventually settles,
+  // possibly setting `failure` after this function has already returned) —
+  // the caller is never made to wait past SEND_DEADLINE_MS. A deadline with
+  // no relay contact at all is itself a failure mode (plan §1), not silence:
+  // synthesize a generic `failure` for it rather than leaving the caller
+  // unable to tell "the relay accepted it" from "we gave up waiting".
+  const outcome = await resolveDeadline(sendPromise, SEND_DEADLINE_MS);
+  if (outcome === 'timeout' && !failure) {
+    failure = { reason: `no relay response within ${SEND_DEADLINE_MS}ms` };
+  }
 
-  return result;
+  return failure ? { status: 'attempted', failure } : { status: 'attempted' };
 }

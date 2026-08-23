@@ -60,7 +60,7 @@ import {
 import { validateReturnPath } from '../app-access/return-path';
 import { sessionCookieName, flowCookieName, EXCHANGE_PATH } from '../app-access/names';
 import { getAccessLog, type AccessLogEntry } from '../../managers/access-log/access-log';
-import { computeAppUrl } from './apps';
+import { computeAppUrl } from '../../utils/app-url';
 
 const appAccess = new Hono();
 
@@ -103,19 +103,18 @@ function readCookie(c: Context, name: string): string | undefined {
  * routed on more than one hostname: there is exactly one, so this and the
  * hostname baked into the Caddy block cannot disagree.
  *
- * Forced to `https`. `computeAppUrl` is the dashboard's URL-DISPLAY helper and
+ * Forced to `https` via `computeAppUrl`'s own `forceHttps` option:
+ * `computeAppUrl` is the dashboard's URL-DISPLAY helper and by default
  * honours the tenant's own `tls: {disabled: true}` — which for a gated app
  * would put a single-use code on the wire in cleartext, and mint an audience
  * the visitor's browser can never reach over the transport the `Secure` cookie
  * requires. Route emission already ignores that flag for a gated app; so does
- * this. It is the third place the same tenant-authored field has had to be
- * neutralised.
+ * this.
  */
 function appOrigin(appName: string): string | undefined {
   const app = getStateManager().getApp(appName);
   if (!app) return undefined;
-  const url = computeAppUrl(app);
-  return url?.replace(/^http:\/\//, 'https://');
+  return computeAppUrl(app, { forceHttps: true });
 }
 
 /** The policy, or null when this app is not gated. */

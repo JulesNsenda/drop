@@ -25,7 +25,6 @@
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import { writeJsonAtomic } from '../../utils/atomic-write';
-import { clearMailCredential } from '../mailer/mail-credential';
 
 /**
  * Non-secret SMTP settings. Deliberately excludes the password — that's
@@ -98,36 +97,32 @@ type SettingsFieldType = 'string' | 'number' | 'boolean';
  * field — this store started at four fields, each needing its own whitelist
  * line, accessor pair and `corrupt` decision, and grows past that here.
  *
- * `sensitive` marks a field a future admin GET must redact (e.g. a secret or
- * credential) so that becomes structural rather than a habit; nothing in
- * this file reads it yet.
- *
- * `failClosedDefault` documents — for the boolean fields with a dedicated
- * getter — the value that getter returns when the store is `corrupt`. It is
- * NOT wired into the getters below (they keep their own explicit
- * `if (this.corrupt) return false;`, matching the pre-existing per-field
- * unset-default, which can legitimately differ from the corrupt fallback —
- * see `userConnectorsEnabled` vs `appSharingEnabled` below); it exists here
- * so a future consumer doesn't have to re-derive it per field.
+ * This table is ONLY a type-checked whitelist for `parseSettings()` — it
+ * does not mark or enforce anything about which fields are sensitive, or
+ * what a getter should return when the store is `corrupt`. An earlier
+ * version carried `sensitive`/`failClosedDefault` columns that nothing read
+ * (DROP-154 Gate 2 §3); they were removed rather than wired in, because
+ * `userConnectorsEnabled` and `appSharingEnabled` deliberately have
+ * DIFFERENT unset-vs-corrupt defaults — a generic "wire the column into
+ * every getter" pass would have silently flipped one of them. Each getter
+ * below keeps its own explicit `corrupt` check and default.
  */
 interface SettingsFieldSpec {
   key: keyof PlatformSettings;
   type: SettingsFieldType;
-  sensitive: boolean;
-  failClosedDefault?: boolean;
 }
 
 const SETTINGS_FIELDS: readonly SettingsFieldSpec[] = [
-  { key: 'publicUrl', type: 'string', sensitive: false },
-  { key: 'githubWebhookSecret', type: 'string', sensitive: true },
-  { key: 'userConnectorsEnabled', type: 'boolean', sensitive: false, failClosedDefault: false },
-  { key: 'appSharingEnabled', type: 'boolean', sensitive: false, failClosedDefault: false },
-  { key: 'smtpHost', type: 'string', sensitive: false },
-  { key: 'smtpPort', type: 'number', sensitive: false },
-  { key: 'smtpSecure', type: 'boolean', sensitive: false },
-  { key: 'smtpUser', type: 'string', sensitive: false },
-  { key: 'mailFrom', type: 'string', sensitive: false },
-  { key: 'shareNotificationsEnabled', type: 'boolean', sensitive: false, failClosedDefault: false },
+  { key: 'publicUrl', type: 'string' },
+  { key: 'githubWebhookSecret', type: 'string' },
+  { key: 'userConnectorsEnabled', type: 'boolean' },
+  { key: 'appSharingEnabled', type: 'boolean' },
+  { key: 'smtpHost', type: 'string' },
+  { key: 'smtpPort', type: 'number' },
+  { key: 'smtpSecure', type: 'boolean' },
+  { key: 'smtpUser', type: 'string' },
+  { key: 'mailFrom', type: 'string' },
+  { key: 'shareNotificationsEnabled', type: 'boolean' },
   // The SMTP password is deliberately NOT here. It lives encrypted in its
   // own store (mail-credential.ts), owned by the mailer — adding it to this
   // table would make parseSettings silently DROP the ciphertext object on
@@ -313,8 +308,16 @@ export class SettingsManager {
     this.settings = next;
   }
 
-  /** Non-secret SMTP settings. The password is never here — see `MailSettings`. */
+  /**
+   * Non-secret SMTP settings. The password is never here — see
+   * `MailSettings`. Checks `corrupt` explicitly, matching
+   * `getAppSharingEnabled()`'s reasoning above — an all-`undefined` result is
+   * already what an empty/never-set store returns, so this guard isn't
+   * covering a live bug today, but it keeps the method correct on its own
+   * rather than by accident.
+   */
   getMailSettings(): MailSettings {
+    if (this.corrupt) return {};
     return {
       host: this.settings.smtpHost,
       port: this.settings.smtpPort,
@@ -333,21 +336,27 @@ export class SettingsManager {
    * actually sent (e.g. `value !== undefined ? { host: value } : {}`), never
    * by spreading a body's fields unconditionally — `{ host: body.smtpHost,
    * ... }` from a body that omitted `smtpHost` would still include the
-   * `host` key (with value `undefined`) and wipe the stored host + clear the
-   * credential below on every PUT that didn't intend to touch it.
+   * `host` key (with value `undefined`) and wipe the stored host (and, via
+   * the caller's own host-change handling described below, the credential
+   * with it) on every PUT that didn't intend to touch it.
    *
-   * When `host` is included and differs from the currently-stored host
-   * (including a change to `undefined`), clears the stored SMTP credential
-   * FIRST, before persisting the new host (DROP-154 §3): the password was
-   * saved against the OLD host, and `POST /admin/mail/test` against an
-   * admin-settable `smtpHost` would otherwise let an admin exfiltrate the
-   * relay password to any host they can name. Clearing before the write
-   * means a failed clear aborts here with the OLD host still on disk — the
-   * credential and the host it was saved against are never allowed to point
-   * at different hosts, even transiently. (The other failure order — save
-   * succeeds, clear then fails — would leave the new host persisted with the
-   * old password still valid on disk, which is exactly the leak this
-   * ordering avoids.)
+   * IMPORTANT — credential/host coupling, enforced by the CALLER, not here:
+   * when `host` is included and differs from the currently-stored host
+   * (including a change to `undefined`), the stored SMTP credential
+   * (`mail-credential.ts`) was saved against the OLD host, and
+   * `POST /admin/mail/test` against an admin-settable `smtpHost` would
+   * otherwise let an admin exfiltrate the relay password to any host they
+   * can name. This method does NOT clear it — `settings-manager.ts` is a
+   * platform-generic store loaded before `ApiServer` exists and must not
+   * import the mailer (DROP-154 Gate 2 §4). The admin mail-settings route
+   * MUST call `clearMailCredential()` FIRST, before calling this method,
+   * whenever it detects a host change, and must NOT call this method at all
+   * if that clear fails — clearing before the write means a failed clear
+   * leaves the OLD host on disk, so the credential and the host it was saved
+   * against are never allowed to point at different hosts, even transiently.
+   * (The other failure order — this method persists the new host, the clear
+   * then fails — would leave the new host persisted with the old password
+   * still valid on disk, which is exactly the leak this ordering avoids.)
    */
   async setMailSettings(partial: MailSettings): Promise<void> {
     const next: PlatformSettings = { ...this.settings };
@@ -356,12 +365,6 @@ export class SettingsManager {
     if ('secure' in partial) next.smtpSecure = partial.secure;
     if ('user' in partial) next.smtpUser = partial.user;
     if ('from' in partial) next.mailFrom = partial.from;
-
-    const hostChanged = 'host' in partial && partial.host !== this.settings.smtpHost;
-
-    if (hostChanged) {
-      await clearMailCredential();
-    }
 
     // Same persist-then-commit-in-memory shape as setPublicUrl above — see
     // that method's comment for why this isn't queued through a chained
@@ -392,7 +395,7 @@ export class SettingsManager {
 
   private async doSave(next: PlatformSettings): Promise<void> {
     const dir = path.dirname(this.settingsFilePath);
-    await fs.mkdir(dir, { recursive: true });
+    await fs.mkdir(dir, { recursive: true, mode: 0o700 });
     // Mode 0600: this store holds the GitHub webhook secret in plaintext at
     // rest (a deliberate choice — an HMAC secret must stay recoverable) —
     // match the other security-adjacent stores (secrets.json,

@@ -25,7 +25,7 @@ import { getAppConfigService } from '../../managers/app/app-config';
 import { getAppMcpResourceUrl } from '../oauth/app-resources';
 import { canAccess } from '../access';
 import { verifyAppMcpAccessToken } from '../middleware/auth';
-import { computeAppUrl } from './apps';
+import { computeAppUrl } from '../../utils/app-url';
 
 const mcpGateway = new Hono();
 

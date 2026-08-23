@@ -7,11 +7,6 @@ import * as path from 'path';
 import * as os from 'os';
 import { SettingsManager, getSettingsManager, resetSettingsManager } from './settings-manager';
 import * as atomicWrite from '../../utils/atomic-write';
-import { clearMailCredential } from '../mailer/mail-credential';
-
-jest.mock('../mailer/mail-credential', () => ({
-  clearMailCredential: jest.fn().mockResolvedValue(undefined),
-}));
 
 describe('SettingsManager', () => {
   let tempDir: string;
@@ -22,7 +17,6 @@ describe('SettingsManager', () => {
     tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'drop-settings-test-'));
     settingsFilePath = path.join(tempDir, 'settings.json');
     manager = new SettingsManager({ settingsFilePath });
-    (clearMailCredential as jest.Mock).mockClear();
   });
 
   afterEach(async () => {
@@ -572,83 +566,37 @@ describe('SettingsManager', () => {
       });
     });
 
-    it('does not clear the mail credential when smtpHost is not included in the partial', async () => {
-      await manager.setMailSettings({ host: 'smtp.example.com' });
-      (clearMailCredential as jest.Mock).mockClear();
-
-      await manager.setMailSettings({ port: 465 });
-
-      expect(clearMailCredential).not.toHaveBeenCalled();
-    });
-
-    it('does not clear the mail credential when smtpHost is set to the same value it already had', async () => {
-      await manager.setMailSettings({ host: 'smtp.example.com' });
-      (clearMailCredential as jest.Mock).mockClear();
-
-      await manager.setMailSettings({ host: 'smtp.example.com' });
-
-      expect(clearMailCredential).not.toHaveBeenCalled();
-    });
-
-    it('clears the mail credential when smtpHost changes to a different value', async () => {
-      await manager.setMailSettings({ host: 'smtp.example.com' });
-      (clearMailCredential as jest.Mock).mockClear();
-
-      await manager.setMailSettings({ host: 'smtp2.example.com' });
-
-      expect(clearMailCredential).toHaveBeenCalledTimes(1);
-    });
-
-    it('clears the mail credential when smtpHost is cleared to undefined (was previously set)', async () => {
-      await manager.setMailSettings({ host: 'smtp.example.com' });
-      (clearMailCredential as jest.Mock).mockClear();
-
-      await manager.setMailSettings({ host: undefined });
-
-      expect(clearMailCredential).toHaveBeenCalledTimes(1);
-      expect(manager.getMailSettings().host).toBeUndefined();
-    });
-
-    it('clears on the very first host set too (unset -> value is still a change)', async () => {
-      await manager.load();
-
-      await manager.setMailSettings({ host: 'smtp.example.com' });
-
-      // Unset -> set is still a "different value" and must trigger the clear
-      // call — a stale credential saved before any host existed is exactly
-      // as wrong to keep as one saved against a different host.
-      expect(clearMailCredential).toHaveBeenCalledTimes(1);
-    });
-
-    it('clearing the credential happens BEFORE the new host is persisted, so a failed clear leaves the old host on disk', async () => {
-      await manager.setMailSettings({ host: 'smtp.example.com' });
-      (clearMailCredential as jest.Mock).mockClear();
-      (clearMailCredential as jest.Mock).mockRejectedValueOnce(new Error('key unavailable'));
-
-      await expect(manager.setMailSettings({ host: 'smtp2.example.com' })).rejects.toThrow(
-        'key unavailable'
-      );
-
-      // The host must NOT have changed — neither in memory nor on disk —
-      // otherwise the (now-uncleared) credential saved for the old host
-      // would be sent to the new one on the next test-send.
-      expect(manager.getMailSettings().host).toBe('smtp.example.com');
-      const raw = await fs.readFile(settingsFilePath, 'utf-8');
-      expect(JSON.parse(raw).smtpHost).toBe('smtp.example.com');
-    });
-
-    it('a partial that explicitly includes `host: undefined` alongside another field still wipes host and clears the credential (key-presence, not value-truthiness)', async () => {
+    it('a partial that explicitly includes `host: undefined` alongside another field still wipes host (key-presence, not value-truthiness)', async () => {
       await manager.setMailSettings({ host: 'smtp.example.com', port: 587 });
-      (clearMailCredential as jest.Mock).mockClear();
 
       // Mirrors a caller building the object by mapping every possible field
       // rather than omitting ones a request didn't send.
       await manager.setMailSettings({ host: undefined, port: 465 });
 
-      expect(clearMailCredential).toHaveBeenCalledTimes(1);
       expect(manager.getMailSettings()).toEqual(
         expect.objectContaining({ host: undefined, port: 465 })
       );
+    });
+
+    // The credential-clearing-on-host-change tests that used to live here
+    // (asserting `clearMailCredential()` was called) moved out with the call
+    // itself (DROP-154 Gate 2 §4) — `setMailSettings()` no longer reaches
+    // into the mailer; the admin mail-settings route now owns that ordering
+    // and is where that behaviour must be covered.
+
+    it('a corrupt settings file fails closed: getMailSettings returns all-undefined', async () => {
+      await fs.mkdir(path.dirname(settingsFilePath), { recursive: true });
+      await fs.writeFile(settingsFilePath, 'not valid json');
+
+      await manager.load();
+
+      expect(manager.getMailSettings()).toEqual({
+        host: undefined,
+        port: undefined,
+        secure: undefined,
+        user: undefined,
+        from: undefined,
+      });
     });
   });
 

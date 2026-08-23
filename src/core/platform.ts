@@ -867,20 +867,18 @@ export class DropPlatform {
       // the bypass `failClosedWhenFull` exists to close, arriving by the back
       // door.
       //
-      // Its limits are its own env vars rather than the deploy ones. Sharing
-      // them would mean an operator tightening redeploy limits silently
-      // tightened outbound mail too, which is a surprising coupling between two
-      // unrelated controls.
+      // Initialized here, BEFORE `initializeServices()`, so it is ready before
+      // any route that sends mail can reach it. Its limits are baked in by
+      // `getMailQuota` itself (its own env vars, distinct from the deploy ones
+      // above — see `mailPrincipalLimit`/`mailOwnerLimit` in
+      // principal-quota.ts), not passed here.
       const mailQuotaStore = path.join(
         this.config.dropRoot,
         'data',
         'drop-svc',
         'mail-quotas.json'
       );
-      await getMailQuota(mailQuotaStore, {
-        principalLimit: parseInt(process.env.DROP_MAX_MAILS_PER_HOUR || '20', 10),
-        ownerLimit: parseInt(process.env.DROP_MAX_MAILS_PER_HOUR_PER_USER || '50', 10),
-      }).initialize();
+      await getMailQuota(mailQuotaStore).initialize();
 
       // Initialize services
       await this.initializeServices();

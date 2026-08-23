@@ -8,7 +8,7 @@ import { Hono } from 'hono';
 import * as crypto from 'crypto';
 import { success, error, ErrorCodes } from '../types';
 import { getActivityLog } from '../../managers/activity';
-import { suspendUser, updateUser, listUsers, AuthContext } from '../middleware/auth';
+import { suspendUser, updateUser, listUsers, isAuthEnabled, AuthContext } from '../middleware/auth';
 import { getStateManager } from '../../managers/app/state-manager';
 import { getAppRuntime } from '../../managers/runtime';
 import { logActivityFor } from '../../managers/activity';
@@ -17,8 +17,9 @@ import { getSettingsManager } from '../../managers/settings/settings-manager';
 import type { MailSettings } from '../../managers/settings/settings-manager';
 import { normalizePublicUrl } from '../../utils/url-validator';
 import { getPublicUrl, setPublicUrl, isAccessGateEnabled } from '../runtime-config';
-import { getMailCredentialStore } from '../../managers/mailer/mail-credential';
+import { getMailCredentialStore, clearMailCredential } from '../../managers/mailer/mail-credential';
 import { sendTemplatedMail } from '../../managers/mailer/mailer';
+import { getMailQuota } from '../../managers/guardrail/principal-quota';
 
 const admin = new Hono();
 
@@ -88,15 +89,19 @@ interface MailPayload {
   shareNotificationsEnabled: boolean;
   /**
    * Whether the mailer currently has a password to authenticate with (env
-   * `DROP_SMTP_PASSWORD`, or the stored, encrypted credential). Computed via
-   * `resolveMailPassword()` and reduced to a boolean here — the plaintext
-   * itself must never reach a route response (see that function's own
-   * warning in `mail-credential.ts`). This is honest about the DROP-154 §3
-   * host/credential coupling: changing `smtpHost` clears the stored
-   * credential (a different host means the saved password is for a relay
-   * that no longer matches), so this flips to `false` immediately after a
-   * `PUT /settings/mail` that changes `host`, even though nobody explicitly
-   * cleared the credential.
+   * `DROP_SMTP_PASSWORD`, or a structurally-valid stored credential file).
+   * Computed via `hasStoredCredential()`, never `resolveMailPassword()` —
+   * the latter decrypts the live plaintext into the heap, which this status
+   * block has no reason to do just to compute a boolean (see
+   * `hasStoredCredential()`'s own doc in `mail-credential.ts`); the
+   * plaintext itself must never reach a route response either way. This is
+   * honest about the DROP-154 §3 host/credential coupling: changing
+   * `smtpHost` clears the stored credential (a different host means the
+   * saved password is for a relay that no longer matches), so this flips to
+   * `false` immediately after a `PUT /settings/mail` that changes `host` —
+   * the route below now calls `clearMailCredential()` explicitly, before
+   * persisting the new host, rather than that being an implicit side effect
+   * of the settings write.
    */
   credentialConfigured: boolean;
 }
@@ -111,7 +116,7 @@ interface MailPayload {
  */
 async function buildMailPayload(): Promise<MailPayload> {
   const mail = getSettingsManager().getMailSettings();
-  const credentialConfigured = (await getMailCredentialStore().resolveMailPassword()) !== null;
+  const credentialConfigured = await getMailCredentialStore().hasStoredCredential();
   return {
     host: mail.host,
     port: mail.port,
@@ -472,6 +477,15 @@ admin.put('/settings/app-sharing', async (c) => {
 const MAIL_PORT_MIN = 1;
 const MAIL_PORT_MAX = 65535;
 
+// `,`/`;` are the address-LIST separators `mailer.ts`'s own
+// `ADDRESS_SEPARATOR_RE` rejects at send time (nodemailer fans a list out to
+// every address it finds). Rejecting them here too, for `from`/`user` only,
+// means `PUT /settings/mail {"from":"a@b.c,d@e.f"}` 400s at configuration
+// time instead of returning 200 and then failing every subsequent send
+// `unavailable` forever with nothing anywhere to explain why — `host` has no
+// such reason to reject a comma, so it keeps the plain form.
+const MAIL_ADDRESS_SEPARATOR_PATTERN = /[,;]/;
+
 /**
  * Validates one of `MailSettings`' free-text fields (`host`/`user`/`from`):
  * `null` or an empty/whitespace-only string clears the field (mirrors
@@ -479,14 +493,38 @@ const MAIL_PORT_MAX = 65535;
  * character (including CR/LF/NUL — `CONTROL_CHAR_PATTERN` covers `\x00-\x1f`)
  * is refused rather than persisted, so a header-injection payload never even
  * reaches disk — `mailer.ts` re-checks independently at send time, but this
- * is the route's own boundary, not a substitute for that one.
+ * is the route's own boundary, not a substitute for that one. `from`/`user`
+ * additionally reject `,`/`;` via `rejectAddressSeparators` — see
+ * `MAIL_ADDRESS_SEPARATOR_PATTERN` above.
  */
-function normalizeMailStringField(value: unknown): { ok: true; value: string | undefined } | { ok: false } {
+function normalizeMailStringField(
+  value: unknown,
+  opts: { rejectAddressSeparators?: boolean } = {}
+): { ok: true; value: string | undefined } | { ok: false } {
   if (value === null) return { ok: true, value: undefined };
   if (typeof value !== 'string') return { ok: false };
   const trimmed = value.trim();
   if (CONTROL_CHAR_PATTERN.test(trimmed)) return { ok: false };
+  if (opts.rejectAddressSeparators && MAIL_ADDRESS_SEPARATOR_PATTERN.test(trimmed)) return { ok: false };
   return { ok: true, value: trimmed === '' ? undefined : trimmed };
+}
+
+/**
+ * Guard for the mail routes that can reach or exfiltrate the relay
+ * credential (`PUT /settings/mail`, `PUT /settings/mail/credential`,
+ * `POST /mail/test`). Mirrors `requireAuthForAccessRoutes`
+ * (`access-limits.ts`): the admin role floor for `/admin/*` is applied in
+ * `server.ts`, but that registration lives inside
+ * `if (this.config.enableAuth && isAuthEnabled())` — so on an auth-disabled
+ * box no middleware is registered for these paths at all, and these routes
+ * are the only thing standing between an anonymous caller and the operator's
+ * real SMTP relay password.
+ */
+function requireAuthForMailRoutes(): string | null {
+  if (!isAuthEnabled()) {
+    return 'Mail settings are unavailable when authentication is disabled.';
+  }
+  return null;
 }
 
 // PUT /admin/settings/mail - Set (or, per field, clear) the non-secret SMTP
@@ -494,15 +532,27 @@ function normalizeMailStringField(value: unknown): { ok: true; value: string | u
 // password — see PUT /settings/mail/credential below.
 //
 // `setMailSettings` distinguishes KEY PRESENCE from value truthiness
-// (`{ host: undefined }` deliberately wipes the host and, via the host-change
-// check inside it, clears the stored credential) — so `partial` below is
+// (`{ host: undefined }` deliberately wipes the host) — so `partial` below is
 // built field-by-field from what the body actually CONTAINS, never by
 // spreading the body in. A field omitted from the body is left untouched.
 //
 // Every field is validated BEFORE either settings-manager write below, so a
 // bad field 400s without any partial mutation — `setMailSettings` is called
 // at most once, and only after every field in the body has passed.
+//
+// The host-change credential clear (DROP-154 Gate 2 §1) is enforced HERE,
+// not inside `setMailSettings` — that write is a platform-generic store that
+// must not import the mailer (see `setMailSettings`'s own doc). `clearMailCredential()`
+// runs BEFORE `setMailSettings()`, and only when it succeeds does the new
+// host get persisted: the old ordering (persist-then-clear) would leave the
+// new host on disk with the OLD password still valid if the clear then
+// failed — exactly the exfiltration path this exists to close (an admin
+// repoints `smtpHost` at a host they control, then `POST /admin/mail/test`
+// hands them the operator's real relay password via SMTP AUTH).
 admin.put('/settings/mail', async (c) => {
+  const authRefusal = requireAuthForMailRoutes();
+  if (authRefusal) return c.json(error(ErrorCodes.UNAUTHORIZED, authRefusal), 401);
+
   const authCtx = (c.get as Function)('auth') as AuthContext | undefined;
   const body = (await c.req.json()) as unknown;
 
@@ -543,17 +593,17 @@ admin.put('/settings/mail', async (c) => {
   }
 
   if ('user' in body) {
-    const result = normalizeMailStringField(body.user);
+    const result = normalizeMailStringField(body.user, { rejectAddressSeparators: true });
     if (!result.ok) {
-      return c.json(error(ErrorCodes.VALIDATION_ERROR, 'user must be a string or null'), 400);
+      return c.json(error(ErrorCodes.VALIDATION_ERROR, 'user must be a single-address string or null'), 400);
     }
     partial.user = result.value;
   }
 
   if ('from' in body) {
-    const result = normalizeMailStringField(body.from);
+    const result = normalizeMailStringField(body.from, { rejectAddressSeparators: true });
     if (!result.ok) {
-      return c.json(error(ErrorCodes.VALIDATION_ERROR, 'from must be a string or null'), 400);
+      return c.json(error(ErrorCodes.VALIDATION_ERROR, 'from must be a single-address string or null'), 400);
     }
     partial.from = result.value;
   }
@@ -566,10 +616,40 @@ admin.put('/settings/mail', async (c) => {
     }
   }
 
-  // setMailSettings first: it's the write that can clear the stored
-  // credential (on a host change), so it goes first — if the second write
-  // below fails, the relay config + credential are still internally
-  // consistent with each other, only the notification toggle is stale.
+  // Ordering is the control (see the handler comment above): the clear must
+  // land, and be seen to land, before the new host is ever persisted. Strict
+  // `!==` rather than `resolveMailPassword()`'s case-insensitive host
+  // comparison — deliberately: a case-only edit (`Smtp.Example.com` ->
+  // `smtp.example.com`) still clears here. Over-clearing on a same-host,
+  // different-case PUT is a false positive, never a false negative, so it
+  // stays on the fail-safe side of this control.
+  const hostChanging = 'host' in partial && partial.host !== getSettingsManager().getMailSettings().host;
+  if (hostChanging) {
+    try {
+      await clearMailCredential();
+    } catch {
+      // Abort — do NOT call setMailSettings below. Leaving the old host (and
+      // its now-unclearable credential) on disk is safer than persisting a
+      // new host next to a password that was saved for the old one.
+      return c.json(
+        error(
+          ErrorCodes.INTERNAL_ERROR,
+          'Failed to clear the stored SMTP credential ahead of the host change. The new host was not saved.'
+        ),
+        500
+      );
+    }
+  }
+
+  // setMailSettings and setShareNotificationsEnabled are two separate
+  // atomic writes on SettingsManager (settings-manager.ts) — a failure
+  // between them leaves the notification toggle stale rather than corrupting
+  // either write (there is no rollback of the mail-settings write itself;
+  // the credential-clear abort above already happens BEFORE either write).
+  // Collapsing them into one write would need a combined setter on
+  // SettingsManager itself, which this route does not own — kept as two
+  // awaited, sequenced writes (mail config first, matching the credential
+  // clear's own ordering above) rather than fired in parallel.
   await getSettingsManager().setMailSettings(partial);
   if (shareNotificationsEnabled !== undefined) {
     await getSettingsManager().setShareNotificationsEnabled(shareNotificationsEnabled);
@@ -588,6 +668,9 @@ admin.put('/settings/mail', async (c) => {
 // (mail-credential.ts). Never read back — GET /settings only ever reports
 // `mail.credentialConfigured` (a boolean), never the value.
 admin.put('/settings/mail/credential', async (c) => {
+  const authRefusal = requireAuthForMailRoutes();
+  if (authRefusal) return c.json(error(ErrorCodes.UNAUTHORIZED, authRefusal), 401);
+
   const authCtx = (c.get as Function)('auth') as AuthContext | undefined;
   const body = (await c.req.json()) as unknown;
 
@@ -621,11 +704,20 @@ admin.put('/settings/mail/credential', async (c) => {
 });
 
 // POST /admin/mail/test - Send the fixed `test` template to an admin-supplied
-// address to confirm the relay settings actually work. Reports only the
-// two-value `MailSendResult` status ('sent' | 'unavailable') — the relay's
-// own reply (e.g. 550/552) never reaches this response; see mailer.ts's file
-// header for why that would be a directory-enumeration oracle.
+// address to confirm the relay settings actually work. Reports the full
+// `MailSendResult`, INCLUDING `failure` when present — unlike every other
+// mailer caller in this codebase, this is the one route the enumeration-
+// oracle rule in mailer.types.ts's `MailFailureDetail` doc does not apply
+// to: the caller is the operator, they own the relay, and they supplied the
+// recipient address themselves, so there is no third party to enumerate
+// against. Metered by the mail quota (DROP-154 Gate 2 §3) — separately from,
+// and in addition to, the dedicated 10/min per-IP bucket in rate-limit.ts:
+// that bucket alone would let a caller retained across many IPs (or many
+// admin sessions) still dial the operator's real relay 600 times an hour.
 admin.post('/mail/test', async (c) => {
+  const authRefusal = requireAuthForMailRoutes();
+  if (authRefusal) return c.json(error(ErrorCodes.UNAUTHORIZED, authRefusal), 401);
+
   const authCtx = (c.get as Function)('auth') as AuthContext | undefined;
   const body = (await c.req.json()) as unknown;
 
@@ -638,14 +730,43 @@ admin.post('/mail/test', async (c) => {
     return c.json(error(ErrorCodes.VALIDATION_ERROR, 'to must be a non-empty string'), 400);
   }
 
-  const result = await sendTemplatedMail('test', to.trim(), { platformUrl: getPublicUrl() ?? '' });
+  // Same keysFor/check/record sequence apps.share.ts's notifyShareGrant uses
+  // against this same singleton — but this route ADMITS or REFUSES on it
+  // (a structured 429, mirroring admitDeploy's guardrail shape in
+  // deploy-breaker.ts) rather than skipping silently, since sending is this
+  // route's entire purpose rather than a best-effort side effect of one.
+  const quota = getMailQuota();
+  const keys = quota.keysFor({ principalId: authCtx?.principalId, actorUserId: authCtx?.userId });
+  if (!keys.metered) {
+    return c.json(error(ErrorCodes.RATE_LIMITED, 'Mail quota unavailable for this request.'), 429);
+  }
+  const verdict = quota.check(keys.keys);
+  if (!verdict.allowed) {
+    if (verdict.retryAfterSeconds) c.header('Retry-After', String(verdict.retryAfterSeconds));
+    return c.json(error(ErrorCodes.RATE_LIMITED, 'Mail quota exceeded. Try again later.'), 429);
+  }
+  if (!quota.record(keys.keys)) {
+    // failClosedWhenFull refused the record — the tracked-principal table
+    // itself is at capacity, not this key's own window.
+    return c.json(error(ErrorCodes.RATE_LIMITED, 'Mail quota unavailable for this request.'), 429);
+  }
 
+  const result = await sendTemplatedMail('test', to.trim(), { platformUrl: getPublicUrl() ?? '' });
+  const failure = result.status === 'attempted' ? result.failure : undefined;
+
+  // This module has no ActivityLog write of its own (DROP-154 Gate 2 §4) —
+  // every caller owns its own attribution, and admin's own principal is what
+  // this row is attributed to. Includes the failure reason (admin-facing
+  // only, per MailFailureDetail's doc) so an operator diagnosing a broken
+  // relay has it in the audit trail, not just this one response.
   await logActivityFor(authCtx, {
     action: 'mail-test-sent',
-    detail: `to=${to.trim()} status=${result.status}`,
+    detail: failure
+      ? `to=${to.trim()} status=${result.status} failure=${failure.reason}`
+      : `to=${to.trim()} status=${result.status}`,
   });
 
-  return c.json(success({ status: result.status }));
+  return c.json(success(failure ? { status: result.status, failure } : { status: result.status }));
 });
 
 export default admin;

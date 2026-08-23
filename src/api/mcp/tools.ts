@@ -55,7 +55,7 @@ import {
 } from './deploy-result';
 import { getDeployDetailStore } from '../../managers/deploy-tracker';
 import { classifyBuildFailure } from '../../core/builder/classify';
-import { computeAppUrl } from '../routes/apps';
+import { computeAppUrl } from '../../utils/app-url';
 import { getPlatformVersion } from '../../utils/version';
 import { tryLogActivity } from '../../managers/activity';
 import { DeployRefusedError } from '../../managers/guardrail/deploy-breaker';

@@ -1,12 +1,14 @@
 import nodemailer from 'nodemailer';
 import { getSettingsManager } from '../settings/settings-manager';
 import { getMailCredentialStore } from './mail-credential';
+import { hostnameResolvesToBlockedIp } from '../../utils/ssrf-guard';
 import { sendTemplatedMail, SEND_DEADLINE_MS } from './mailer';
 import type { MailSettings } from '../settings/settings-manager';
 
-// Nothing here ever touches a real socket — nodemailer, the settings
-// manager and the credential store are all mocked. `createTransport`'s
-// return value is controlled per test via its own mock.
+// Nothing here ever touches a real socket or does a real DNS lookup —
+// nodemailer, the settings manager, the credential store, and the SSRF host
+// check are all mocked. `createTransport`'s return value is controlled per
+// test via its own mock.
 jest.mock('nodemailer', () => ({
   __esModule: true,
   default: { createTransport: jest.fn() },
@@ -18,6 +20,10 @@ jest.mock('../settings/settings-manager', () => ({
 
 jest.mock('./mail-credential', () => ({
   getMailCredentialStore: jest.fn(),
+}));
+
+jest.mock('../../utils/ssrf-guard', () => ({
+  hostnameResolvesToBlockedIp: jest.fn(),
 }));
 
 const DEFAULT_SETTINGS: MailSettings = {
@@ -49,12 +55,17 @@ function mockTransport(sendMailImpl: () => Promise<unknown>): { sendMail: jest.M
 
 describe('sendTemplatedMail', () => {
   const originalAllowInsecure = process.env.DROP_SMTP_ALLOW_INSECURE_TLS;
+  const originalAllowPrivateRelay = process.env.DROP_SMTP_ALLOW_PRIVATE_RELAY;
 
   beforeEach(() => {
     jest.clearAllMocks();
     delete process.env.DROP_SMTP_ALLOW_INSECURE_TLS;
+    delete process.env.DROP_SMTP_ALLOW_PRIVATE_RELAY;
     mockSettings();
     mockCredential();
+    // Default: the configured relay host is NOT a blocked address — most
+    // tests exercise send behaviour, not the SSRF check itself.
+    (hostnameResolvesToBlockedIp as jest.Mock).mockResolvedValue(false);
   });
 
   afterEach(() => {
@@ -63,6 +74,11 @@ describe('sendTemplatedMail', () => {
       delete process.env.DROP_SMTP_ALLOW_INSECURE_TLS;
     } else {
       process.env.DROP_SMTP_ALLOW_INSECURE_TLS = originalAllowInsecure;
+    }
+    if (originalAllowPrivateRelay === undefined) {
+      delete process.env.DROP_SMTP_ALLOW_PRIVATE_RELAY;
+    } else {
+      process.env.DROP_SMTP_ALLOW_PRIVATE_RELAY = originalAllowPrivateRelay;
     }
   });
 
@@ -98,6 +114,55 @@ describe('sendTemplatedMail', () => {
 
       expect(result).toEqual({ status: 'unavailable' });
       expect(nodemailer.createTransport).not.toHaveBeenCalled();
+    });
+
+    it('resolves the credential against the configured host', async () => {
+      const store = { resolveMailPassword: jest.fn().mockResolvedValue('test-password') };
+      (getMailCredentialStore as jest.Mock).mockReturnValue(store);
+      mockTransport(async () => ({ messageId: '1' }));
+
+      await sendTemplatedMail('test', 'user@example.com', { platformUrl: 'https://drop.example.com' });
+
+      expect(store.resolveMailPassword).toHaveBeenCalledWith('smtp.example.com');
+    });
+  });
+
+  describe('relay host validation (SSRF)', () => {
+    it('returns unavailable and never dials when the configured host resolves to a blocked address', async () => {
+      (hostnameResolvesToBlockedIp as jest.Mock).mockResolvedValue(true);
+
+      const result = await sendTemplatedMail('test', 'user@example.com', {
+        platformUrl: 'https://drop.example.com',
+      });
+
+      expect(result).toEqual({ status: 'unavailable' });
+      expect(nodemailer.createTransport).not.toHaveBeenCalled();
+      // The credential is never even resolved for a refused host.
+      expect(getMailCredentialStore).not.toHaveBeenCalled();
+    });
+
+    it('checks the host that is actually configured', async () => {
+      mockSettings({ host: 'internal.corp' });
+      (hostnameResolvesToBlockedIp as jest.Mock).mockResolvedValue(true);
+
+      await sendTemplatedMail('test', 'user@example.com', { platformUrl: 'https://drop.example.com' });
+
+      expect(hostnameResolvesToBlockedIp).toHaveBeenCalledWith('internal.corp');
+    });
+
+    it('dials a blocked host anyway when DROP_SMTP_ALLOW_PRIVATE_RELAY=true', async () => {
+      process.env.DROP_SMTP_ALLOW_PRIVATE_RELAY = 'true';
+      (hostnameResolvesToBlockedIp as jest.Mock).mockResolvedValue(true);
+      mockTransport(async () => ({ messageId: '1' }));
+
+      const result = await sendTemplatedMail('test', 'user@example.com', {
+        platformUrl: 'https://drop.example.com',
+      });
+
+      expect(result).toEqual({ status: 'attempted' });
+      expect(nodemailer.createTransport).toHaveBeenCalled();
+      // The opt-out short-circuits the check entirely — it never even asks.
+      expect(hostnameResolvesToBlockedIp).not.toHaveBeenCalled();
     });
   });
 
@@ -202,14 +267,14 @@ describe('sendTemplatedMail', () => {
       );
     });
 
-    it('relaxes TLS enforcement only when DROP_SMTP_ALLOW_INSECURE_TLS=true', async () => {
+    it('relaxes certificate verification only — never requireTLS — when DROP_SMTP_ALLOW_INSECURE_TLS=true', async () => {
       process.env.DROP_SMTP_ALLOW_INSECURE_TLS = 'true';
       mockTransport(async () => ({ messageId: '1' }));
 
       await sendTemplatedMail('test', 'user@example.com', { platformUrl: 'https://drop.example.com' });
 
       expect(nodemailer.createTransport).toHaveBeenCalledWith(
-        expect.objectContaining({ requireTLS: false, tls: { rejectUnauthorized: false } })
+        expect.objectContaining({ requireTLS: true, tls: { rejectUnauthorized: false } })
       );
     });
 
@@ -225,19 +290,19 @@ describe('sendTemplatedMail', () => {
     });
   });
 
-  describe('status is relay-independent', () => {
-    it('returns sent when the relay accepts the message', async () => {
+  describe('status is relay-independent, but `failure` carries what actually happened', () => {
+    it('returns attempted with no failure when the relay accepts the message', async () => {
       const { close } = mockTransport(async () => ({ messageId: '1' }));
 
       const result = await sendTemplatedMail('test', 'user@example.com', {
         platformUrl: 'https://drop.example.com',
       });
 
-      expect(result).toEqual({ status: 'sent' });
+      expect(result).toEqual({ status: 'attempted' });
       expect(close).toHaveBeenCalled();
     });
 
-    it('still returns sent when the relay rejects the send — status is never derived from the SMTP reply', async () => {
+    it('still returns attempted (not unavailable) when the relay rejects the send — status is never derived from the SMTP reply', async () => {
       const consoleErrorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
       const { close } = mockTransport(async () => {
         throw new Error('550 no such user');
@@ -247,14 +312,17 @@ describe('sendTemplatedMail', () => {
         platformUrl: 'https://drop.example.com',
       });
 
-      expect(result).toEqual({ status: 'sent' });
+      expect(result.status).toBe('attempted');
       expect(close).toHaveBeenCalled();
-      // The relay diagnostic went to the log, not the return value.
+      // The relay diagnostic went to the log AND to `failure` — never
+      // anywhere else. It's the caller's job to decide who gets to read
+      // `failure` (see mailer.types.ts's `MailFailureDetail`).
       expect(consoleErrorSpy).toHaveBeenCalled();
+      expect(result).toEqual({ status: 'attempted', failure: { reason: '550 no such user' } });
       consoleErrorSpy.mockRestore();
     });
 
-    it('returns sent (bounded by the deadline, not hanging forever) when the relay never responds', async () => {
+    it('returns attempted with a timeout failure (bounded by the deadline, not hanging forever) when the relay never responds', async () => {
       jest.useFakeTimers();
       const neverResolves = () => new Promise<unknown>(() => {});
       mockTransport(neverResolves);
@@ -266,10 +334,17 @@ describe('sendTemplatedMail', () => {
       await jest.advanceTimersByTimeAsync(SEND_DEADLINE_MS);
       const result = await resultPromise;
 
-      expect(result).toEqual({ status: 'sent' });
+      // The relay never even replied before the deadline gave up — this is
+      // one of the four failure modes `MailFailureDetail` exists to surface
+      // (plan §1), not silence: it reports a generic reason since no actual
+      // relay error arrived.
+      expect(result).toEqual({
+        status: 'attempted',
+        failure: { reason: `no relay response within ${SEND_DEADLINE_MS}ms` },
+      });
     });
 
-    it('does not wait past the deadline even if the relay eventually would have responded', async () => {
+    it('does not wait past the deadline even if the relay eventually would have responded, and reports the timeout as a failure', async () => {
       jest.useFakeTimers();
       const slowButFinite = () =>
         new Promise((resolve) => setTimeout(() => resolve({ messageId: '1' }), SEND_DEADLINE_MS * 10));
@@ -285,8 +360,12 @@ describe('sendTemplatedMail', () => {
 
       // Fake timers make wall-clock elapsed time meaningless here; the
       // assertion that matters is that the promise settled after advancing
-      // exactly the deadline, not the full 10x relay delay.
-      expect(result).toEqual({ status: 'sent' });
+      // exactly the deadline, not the full 10x relay delay — and that the
+      // still-pending attempt is reported as a failure, not a bare success.
+      expect(result).toEqual({
+        status: 'attempted',
+        failure: { reason: `no relay response within ${SEND_DEADLINE_MS}ms` },
+      });
       expect(Date.now() - start).toBeLessThan(SEND_DEADLINE_MS * 10);
     });
   });

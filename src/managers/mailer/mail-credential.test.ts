@@ -119,24 +119,71 @@ describe('MailCredentialStore', () => {
     expect(await store.resolveMailPassword()).toBeNull();
   });
 
-  it('DROP_SMTP_PASSWORD env wins over a stored credential', async () => {
-    await writeValidKey();
-    await store.setMailPassword('stored-password');
-    process.env.DROP_SMTP_PASSWORD = 'env-password';
+  describe('DROP_SMTP_PASSWORD env host binding', () => {
+    const originalEnvHost = process.env.DROP_SMTP_HOST;
 
-    expect(await store.resolveMailPassword()).toBe('env-password');
-  });
+    afterEach(() => {
+      if (originalEnvHost === undefined) {
+        delete process.env.DROP_SMTP_HOST;
+      } else {
+        process.env.DROP_SMTP_HOST = originalEnvHost;
+      }
+    });
 
-  it('DROP_SMTP_PASSWORD env works even with no key file at all', async () => {
-    process.env.DROP_SMTP_PASSWORD = 'env-password';
-    expect(await store.resolveMailPassword()).toBe('env-password');
-  });
+    it('DROP_SMTP_PASSWORD env wins over a stored credential when DROP_SMTP_HOST matches the configured host', async () => {
+      await writeValidKey();
+      await store.setMailPassword('stored-password');
+      process.env.DROP_SMTP_PASSWORD = 'env-password';
+      process.env.DROP_SMTP_HOST = 'smtp.example.com';
 
-  it('DROP_SMTP_PASSWORD env is never persisted to disk', async () => {
-    process.env.DROP_SMTP_PASSWORD = 'env-password';
-    await store.resolveMailPassword();
+      expect(await store.resolveMailPassword('smtp.example.com')).toBe('env-password');
+    });
 
-    await expect(fs.access(credentialFilePath)).rejects.toThrow();
+    it('matches the host case-insensitively and trimmed', async () => {
+      process.env.DROP_SMTP_PASSWORD = 'env-password';
+      process.env.DROP_SMTP_HOST = '  SMTP.Example.com  ';
+
+      expect(await store.resolveMailPassword('smtp.example.com')).toBe('env-password');
+    });
+
+    it('DROP_SMTP_PASSWORD env works even with no key file at all, given a matching host', async () => {
+      process.env.DROP_SMTP_PASSWORD = 'env-password';
+      process.env.DROP_SMTP_HOST = 'smtp.example.com';
+      expect(await store.resolveMailPassword('smtp.example.com')).toBe('env-password');
+    });
+
+    it('DROP_SMTP_PASSWORD env is never persisted to disk', async () => {
+      process.env.DROP_SMTP_PASSWORD = 'env-password';
+      process.env.DROP_SMTP_HOST = 'smtp.example.com';
+      await store.resolveMailPassword('smtp.example.com');
+
+      await expect(fs.access(credentialFilePath)).rejects.toThrow();
+    });
+
+    it('refuses (returns null) when DROP_SMTP_HOST is unset — does not fall through to the stored file', async () => {
+      await writeValidKey();
+      await store.setMailPassword('stored-password');
+      process.env.DROP_SMTP_PASSWORD = 'env-password';
+      delete process.env.DROP_SMTP_HOST;
+
+      expect(await store.resolveMailPassword('smtp.example.com')).toBeNull();
+    });
+
+    it('refuses (returns null) when DROP_SMTP_HOST does not match the configured host — does not fall through to the stored file', async () => {
+      await writeValidKey();
+      await store.setMailPassword('stored-password');
+      process.env.DROP_SMTP_PASSWORD = 'env-password';
+      process.env.DROP_SMTP_HOST = 'smtp.example.com';
+
+      expect(await store.resolveMailPassword('attacker.example')).toBeNull();
+    });
+
+    it('refuses (returns null) when no configuredHost is passed at all, even with a matching-looking DROP_SMTP_HOST', async () => {
+      process.env.DROP_SMTP_PASSWORD = 'env-password';
+      process.env.DROP_SMTP_HOST = 'smtp.example.com';
+
+      expect(await store.resolveMailPassword()).toBeNull();
+    });
   });
 
   it('clear() removes a stored credential', async () => {
@@ -160,12 +207,55 @@ describe('MailCredentialStore', () => {
     const stats = await fs.stat(credentialFilePath);
     expect(stats.mode & 0o777).toBe(0o600);
   });
+
+  describe('hasStoredCredential', () => {
+    it('returns false when nothing is configured', async () => {
+      expect(await store.hasStoredCredential()).toBe(false);
+    });
+
+    it('returns true when DROP_SMTP_PASSWORD is set, with no file or key needed', async () => {
+      process.env.DROP_SMTP_PASSWORD = 'env-password';
+      expect(await store.hasStoredCredential()).toBe(true);
+    });
+
+    it('returns true for a structurally-valid stored file, even without the key file present', async () => {
+      await writeValidKey();
+      await store.setMailPassword('super-secret-smtp-pass');
+      await fs.unlink(keyFilePath);
+
+      expect(await store.hasStoredCredential()).toBe(true);
+    });
+
+    it('returns false for a corrupt (unparseable) stored file', async () => {
+      await fs.mkdir(path.dirname(credentialFilePath), { recursive: true });
+      await fs.writeFile(credentialFilePath, 'not valid json');
+
+      expect(await store.hasStoredCredential()).toBe(false);
+    });
+
+    it('returns false for a structurally-invalid stored file', async () => {
+      await fs.mkdir(path.dirname(credentialFilePath), { recursive: true });
+      await fs.writeFile(credentialFilePath, JSON.stringify({ notPassword: 'oops' }));
+
+      expect(await store.hasStoredCredential()).toBe(false);
+    });
+
+    it('returns false after clear()', async () => {
+      await writeValidKey();
+      await store.setMailPassword('super-secret-smtp-pass');
+
+      await store.clear();
+
+      expect(await store.hasStoredCredential()).toBe(false);
+    });
+  });
 });
 
-// Exercises the actual exported wrapper `settings-manager.ts`'s
-// `setMailSettings()` calls (`clearMailCredential()`), through the singleton
-// (`getMailCredentialStore()`) rather than a directly-constructed instance —
-// the class-level tests above never touch either.
+// Exercises the exported `clearMailCredential()` wrapper (the admin
+// mail-settings route's call, per `setMailSettings()`'s doc comment) through
+// the singleton (`getMailCredentialStore()`) rather than a
+// directly-constructed instance — the class-level tests above never touch
+// either.
 describe('clearMailCredential (singleton wrapper)', () => {
   let tmpDir: string;
   let credentialFilePath: string;

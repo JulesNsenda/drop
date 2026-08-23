@@ -11,10 +11,11 @@ import * as path from 'path';
 import * as os from 'os';
 import {
   PrincipalQuota,
-  quotaKeysFor,
+  getPrincipalQuota,
   resetPrincipalQuota,
   getMailQuota,
   resetMailQuota,
+  type QuotaKey,
 } from './principal-quota';
 
 /**
@@ -160,22 +161,32 @@ describe('PrincipalQuota — mail-instance option carry-over hazards', () => {
   });
 });
 
-describe('quotaKeysFor', () => {
+describe('PrincipalQuota#keysFor — deploy defaults (formerly the free quotaKeysFor)', () => {
   const savedPrincipal = process.env.DROP_MAX_REDEPLOYS_PER_HOUR;
   const savedOwner = process.env.DROP_MAX_REDEPLOYS_PER_HOUR_PER_USER;
+
+  // The deploy singleton is unmetered-without-principal by default, so this
+  // never sees the `metered: false` branch — unwrap it so each `it` below can
+  // keep asserting on a `QuotaKey[]`, matching what the old free function
+  // returned.
+  function keysFor(actor: Parameters<PrincipalQuota['keysFor']>[0]): QuotaKey[] {
+    const result = getPrincipalQuota().keysFor(actor);
+    return result.metered ? result.keys : [];
+  }
 
   afterEach(() => {
     if (savedPrincipal === undefined) delete process.env.DROP_MAX_REDEPLOYS_PER_HOUR;
     else process.env.DROP_MAX_REDEPLOYS_PER_HOUR = savedPrincipal;
     if (savedOwner === undefined) delete process.env.DROP_MAX_REDEPLOYS_PER_HOUR_PER_USER;
     else process.env.DROP_MAX_REDEPLOYS_PER_HOUR_PER_USER = savedOwner;
+    resetPrincipalQuota();
   });
 
   it('quotas the credential AND the human behind it', () => {
     // Two windows for the same reason the breaker has two: `oauth:<sub>::<sid>`
     // embeds the session, so a fresh grant is a fresh principal with a fresh
     // allowance. The owner window spans every session that human has.
-    const keys = quotaKeysFor({ principalId: 'oauth:u1::s1', actorUserId: 'u1' });
+    const keys = keysFor({ principalId: 'oauth:u1::s1', actorUserId: 'u1' });
 
     expect(keys.map((k) => k.kind)).toEqual(['principal', 'owner']);
     expect(keys[1].key).toContain('u1');
@@ -184,7 +195,7 @@ describe('quotaKeysFor', () => {
   it('gives the owner window a LOOSER limit than the credential', () => {
     // It spans every session and app the human has, so a limit as tight as the
     // per-credential one would throttle normal multi-app work.
-    const keys = quotaKeysFor({ principalId: 'oauth:u1::s1', actorUserId: 'u1' });
+    const keys = keysFor({ principalId: 'oauth:u1::s1', actorUserId: 'u1' });
 
     expect(keys[1].limit).toBeGreaterThan(keys[0].limit);
   });
@@ -193,14 +204,14 @@ describe('quotaKeysFor', () => {
     // Every platform restart re-deploys the whole fleet through the watcher.
     // Charging that to anyone would spend a human's hourly allowance on a
     // reboot they did not ask for.
-    expect(quotaKeysFor({})).toEqual([]);
-    expect(quotaKeysFor({ automationSource: 'webhook' })).toEqual([]);
+    expect(keysFor({})).toEqual([]);
+    expect(keysFor({ automationSource: 'webhook' })).toEqual([]);
   });
 
   it('gives a credential with no known human only its own window', () => {
     // Never a shared `owner::anonymous` bucket — that would let any such caller
     // exhaust every other's allowance.
-    const keys = quotaKeysFor({ principalId: 'key:t1' });
+    const keys = keysFor({ principalId: 'key:t1' });
 
     expect(keys).toHaveLength(1);
     expect(keys[0].kind).toBe('principal');
@@ -210,7 +221,7 @@ describe('quotaKeysFor', () => {
     process.env.DROP_MAX_REDEPLOYS_PER_HOUR = '3';
     process.env.DROP_MAX_REDEPLOYS_PER_HOUR_PER_USER = '7';
 
-    const keys = quotaKeysFor({ principalId: 'key:t1', actorUserId: 'u1' });
+    const keys = keysFor({ principalId: 'key:t1', actorUserId: 'u1' });
 
     expect(keys[0].limit).toBe(3);
     expect(keys[1].limit).toBe(7);
@@ -220,10 +231,10 @@ describe('quotaKeysFor', () => {
     // parseInt('') is NaN and parseInt('0') is 0; either would silently mean
     // "no limit" if taken at face value.
     process.env.DROP_MAX_REDEPLOYS_PER_HOUR = 'not-a-number';
-    expect(quotaKeysFor({ principalId: 'key:t1' })[0].limit).toBe(20);
+    expect(keysFor({ principalId: 'key:t1' })[0].limit).toBe(20);
 
     process.env.DROP_MAX_REDEPLOYS_PER_HOUR = '0';
-    expect(quotaKeysFor({ principalId: 'key:t1' })[0].limit).toBe(20);
+    expect(keysFor({ principalId: 'key:t1' })[0].limit).toBe(20);
   });
 });
 
@@ -396,5 +407,46 @@ describe('getMailQuota', () => {
     const second = getMailQuota();
 
     expect(first).toBe(second);
+  });
+
+  it('a malformed DROP_MAX_MAILS_PER_HOUR does not silently disable the quota', async () => {
+    // parseInt('not-a-number') is NaN, and NaN is not nullish, so a bare
+    // `?? DEFAULT` would keep it — `used >= NaN` is always false, so the
+    // quota would never refuse, forever, with nothing to notice. Assert the
+    // REFUSAL itself, not just that the limit falls back to a number, or this
+    // test can pass for the wrong reason.
+    const saved = process.env.DROP_MAX_MAILS_PER_HOUR;
+    process.env.DROP_MAX_MAILS_PER_HOUR = 'not-a-number';
+    try {
+      const mail = getMailQuota(path.join(os.tmpdir(), `drop-mail-quota-nan-${Date.now()}.json`));
+      await mail.initialize();
+      const keysResult = mail.keysFor({ principalId: 'user:u1' });
+      expect(keysResult.metered).toBe(true);
+      if (!keysResult.metered) return;
+      const t = 1_000_000;
+      for (let i = 0; i < 20; i++) {
+        expect(mail.check(keysResult.keys, t + i).allowed).toBe(true);
+        mail.record(keysResult.keys, t + i);
+      }
+
+      expect(mail.check(keysResult.keys, t + 21).allowed).toBe(false);
+    } finally {
+      if (saved === undefined) delete process.env.DROP_MAX_MAILS_PER_HOUR;
+      else process.env.DROP_MAX_MAILS_PER_HOUR = saved;
+    }
+  });
+
+  it('throws on reconfiguration to a different store path instead of silently keeping whichever call landed first', () => {
+    getMailQuota(path.join(os.tmpdir(), 'drop-mail-quota-a.json'));
+
+    expect(() => getMailQuota(path.join(os.tmpdir(), 'drop-mail-quota-b.json'))).toThrow(
+      /already initialized/
+    );
+  });
+
+  it('a bare call never throws and returns the existing instance', () => {
+    const configured = getMailQuota(path.join(os.tmpdir(), 'drop-mail-quota-c.json'));
+
+    expect(getMailQuota()).toBe(configured);
   });
 });

@@ -14,7 +14,6 @@
 
 import {
   getPrincipalQuota,
-  quotaKeysFor,
   QuotaExceededError,
 } from './principal-quota';
 
@@ -345,12 +344,13 @@ export async function admitDeploy(
 
   const quota = getPrincipalQuota();
   await quota.initialize();
-  const keys = quotaKeysFor(actor);
-  const q = quota.check(keys);
+  const keysResult = quota.keysFor(actor);
+  if (!keysResult.metered) return; // automation escape hatch — nothing to meter, see keysFor's own doc
+  const q = quota.check(keysResult.keys);
   if (!q.allowed) {
     throw new QuotaExceededError(q.used ?? 0, q.limit ?? 0, q.retryAfterSeconds ?? 0);
   }
-  quota.record(keys);
+  quota.record(keysResult.keys);
 }
 
 /**

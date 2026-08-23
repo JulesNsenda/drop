@@ -166,7 +166,7 @@ DROP keeps its own state in flat files; PostgreSQL is provisioned only as a serv
 1. **App runtime state** → `AppStateManager`, JSON file at `data/drop-svc/apps.json`. Zero-config status tracking (`pending`/`building`/`running`/`stopped`/`errored`, port, pid).
 2. **Per-app config** → `AppConfigService`, files under `data/appconf/webapps/`. **Source of truth for ports** and persisted deploy metadata. On startup `platform.ts` reconciles: config files > running runtime processes/containers > apps.json.
 
-Other file-backed stores under `data/drop-svc/` (the directory is created `0700` and re-`chmod`ed every boot — it holds plaintext secrets): `secrets.json` (encrypted), `settings.json`, `mail-credential.json` (encrypted, `0600` — the SMTP relay password; DROP-154, see `docs/MAIL.md`), `webhooks.json`, `activity-log.json`, `deploys.json`, `deploy-details.json`, `principal-quotas.json`, `api-credentials.json`, `encryption.key` + `local.key` (auto-generated, `0600`).
+Other file-backed stores under `data/drop-svc/` (the directory is created `0700` and re-`chmod`ed every boot — it holds plaintext secrets): `secrets.json` (encrypted), `settings.json`, `mail-credential.json` (encrypted, `0600` — the SMTP relay password; DROP-154, see `docs/MAIL.md`), `webhooks.json`, `activity-log.json`, `deploys.json`, `deploy-details.json`, `principal-quotas.json`, `mail-quotas.json` (DROP-154's own `PrincipalQuota` instance — `getMailQuota()`, distinct env vars and store from the deploy one, see `docs/MAIL.md`), `api-credentials.json`, `encryption.key` + `local.key` (auto-generated, `0600`).
 
 Writes go through `writeJsonAtomic` (`src/utils/atomic-write.ts`) — use it for any new store rather than a bare `fs.writeFile`.
 
@@ -199,7 +199,7 @@ Root is `C:\drop\` (Windows) or `/var/drop/` (Linux), overridable via `DROP_ROOT
     ├── drop-svc/                  # Platform state (0700): apps.json, settings.json, secrets.json,
     │   │                          #   mail-credential.json, webhooks.json, activity-log.json,
     │   │                          #   deploys.json, deploy-details.json, principal-quotas.json,
-    │   │                          #   api-credentials.json, encryption.key, local.key
+    │   │                          #   mail-quotas.json, api-credentials.json, encryption.key, local.key
     │   └── pm2/                   # PM2 config
     ├── db/                        # PostgreSQL data
     ├── logs/{drop-svc,webapps,caddy,builds}/  # All logs (per-app stdout/stderr auto-captured, dated;

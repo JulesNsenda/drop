@@ -15,10 +15,16 @@
  * no reason to carry). Absent or wrong-length key -> refuse; never fall back
  * to plaintext.
  *
- * `DROP_SMTP_PASSWORD` env wins whenever set and is never persisted — it's
- * the documented production path (plan §4): the encryption here only
- * protects a `drop backup` artifact leaving the box, since the key sits in
- * the same 0700 `data/drop-svc/` directory as the ciphertext it protects.
+ * `DROP_SMTP_PASSWORD` env is never persisted — it's the documented
+ * production path (plan §4): the encryption here only protects a `drop
+ * backup` artifact leaving the box, since the key sits in the same 0700
+ * `data/drop-svc/` directory as the ciphertext it protects. It is also
+ * host-bound: it is only honoured when `DROP_SMTP_HOST` is set and matches
+ * the currently-configured host (`resolveMailPassword`'s argument). Without
+ * that check, an admin (or a hijacked admin session) could `PUT
+ * /admin/settings/mail` to an attacker-chosen host and have the operator's
+ * real relay password handed to it on the next test-send — `clear()` only
+ * ever removes the STORED file, so it can't defend the env path at all.
  *
  * Nothing decrypted here is ever cached in memory — every resolve re-reads
  * and re-decrypts from disk. Sends are infrequent, and this keeps the
@@ -109,15 +115,25 @@ export class MailCredentialStore {
 
     const file: MailCredentialFile = { password: encrypt(password, key) };
     const dir = path.dirname(this.credentialFilePath);
-    await fs.mkdir(dir, { recursive: true });
+    await fs.mkdir(dir, { recursive: true, mode: 0o700 });
     await writeJsonAtomic(this.credentialFilePath, file, { mode: 0o600 });
   }
 
   /**
-   * Resolve the password to authenticate with the relay:
-   * `DROP_SMTP_PASSWORD` env wins when set (no key required — it isn't
-   * encrypted); otherwise the stored, decrypted credential, which requires a
-   * valid key to read back. Returns `null` (never throws) on ANY failure —
+   * Resolve the password to authenticate with the relay against
+   * `configuredHost` (the caller's currently-configured `smtpHost`, e.g.
+   * `mailSettings.host` in `mailer.ts`):
+   *
+   * `DROP_SMTP_PASSWORD` env is honoured ONLY when `DROP_SMTP_HOST` is also
+   * set and strict-equals `configuredHost` (case-insensitive, trimmed) — an
+   * admin-settable host must never be able to pull the env credential toward
+   * itself (see the file header). When the env password is set but
+   * `DROP_SMTP_HOST` is unset, or the two hosts don't match, this REFUSES
+   * (returns `null`) rather than falling through to the stored file — the
+   * env credential's host binding is a hard requirement, not a preference.
+   *
+   * Otherwise falls back to the stored, decrypted credential, which requires
+   * a valid key to read back. Returns `null` (never throws) on ANY failure —
    * missing file, absent/wrong-length key, corrupt store, or a decrypt
    * failure (e.g. the key was rotated out from under a stale ciphertext) —
    * so a caller (`mailer.ts`) can turn that into `'unavailable'` rather than
@@ -125,11 +141,25 @@ export class MailCredentialStore {
    *
    * NEVER wire this into a route response — it returns plaintext, and the
    * whole point of storing it encrypted is that nothing but the outbound
-   * SMTP connection ever sees it in the clear.
+   * SMTP connection ever sees it in the clear. (`hasStoredCredential()`
+   * below is the boolean-only alternative for status routes.)
    */
-  async resolveMailPassword(): Promise<string | null> {
+  async resolveMailPassword(configuredHost?: string): Promise<string | null> {
     const envPassword = process.env.DROP_SMTP_PASSWORD;
-    if (envPassword) return envPassword;
+    if (envPassword) {
+      const envHost = process.env.DROP_SMTP_HOST;
+      if (
+        envHost &&
+        configuredHost &&
+        envHost.trim().toLowerCase() === configuredHost.trim().toLowerCase()
+      ) {
+        return envPassword;
+      }
+      // Env password set but not bound to the currently-configured host —
+      // refuse rather than silently falling through to a stored credential
+      // that may be for a different relay entirely.
+      return null;
+    }
 
     const key = await this.loadKey();
     if (!key) return null;
@@ -166,11 +196,50 @@ export class MailCredentialStore {
   }
 
   /**
-   * Clears the stored credential. Called by `settings-manager.ts`'s
-   * `setMailSettings()` when `smtpHost` changes (plan §3) — the password was
-   * saved against the OLD host, and letting it silently travel to a
-   * newly-admin-set host would exfiltrate the relay credential to any host
-   * an admin can name.
+   * Whether a usable SMTP credential is currently configured — the env var
+   * or a structurally-valid stored file — WITHOUT decrypting anything.
+   * Exists for status routes (`GET /admin/settings`) that only need a
+   * boolean and would otherwise call `resolveMailPassword()` on every
+   * dashboard poll purely to compute one, decrypting the live plaintext into
+   * the heap against this store's own stated posture of keeping the
+   * plaintext's lifetime as short as possible.
+   *
+   * Deliberately does NOT apply `resolveMailPassword()`'s env/host binding,
+   * and does not attempt a decrypt to confirm the key still matches — a
+   * `true` here means "something is configured", not "a send would succeed
+   * right now"; that stronger check stays `resolveMailPassword()`'s job, at
+   * send time.
+   */
+  async hasStoredCredential(): Promise<boolean> {
+    if (process.env.DROP_SMTP_PASSWORD) return true;
+
+    let data: string;
+    try {
+      data = await fs.readFile(this.credentialFilePath, 'utf-8');
+    } catch {
+      return false;
+    }
+
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(data);
+    } catch {
+      return false;
+    }
+
+    return isValidMailCredentialFile(parsed);
+  }
+
+  /**
+   * Clears the stored credential. The caller (the admin mail-settings route)
+   * is responsible for calling this BEFORE persisting a new `smtpHost` when
+   * the host changes (plan §3) — the password was saved against the OLD
+   * host, and letting it silently travel to a newly-admin-set host would
+   * exfiltrate the relay credential to any host an admin can name. This was
+   * previously invoked from `settings-manager.ts`'s `setMailSettings()`
+   * directly; that call was removed (DROP-154 Gate 2 §4) as a layering
+   * inversion — a platform-generic store reaching into the mailer — and the
+   * ordering requirement now belongs to, and must be enforced by, the route.
    */
   async clear(): Promise<void> {
     try {
@@ -198,7 +267,7 @@ export function resetMailCredentialStore(): void {
   instance = null;
 }
 
-/** Convenience wrapper — the name/shape `settings-manager.ts`'s `setMailSettings()` calls directly. */
+/** Convenience wrapper over the singleton's `clear()` — see `clear()`'s own doc for who calls this and why the ordering matters. */
 export async function clearMailCredential(): Promise<void> {
   await getMailCredentialStore().clear();
 }

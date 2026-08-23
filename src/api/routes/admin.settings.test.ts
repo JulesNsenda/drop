@@ -35,6 +35,7 @@ import * as activityModule from '../../managers/activity';
 import { getMailCredentialStore, resetMailCredentialStore } from '../../managers/mailer/mail-credential';
 import { sendTemplatedMail } from '../../managers/mailer/mailer';
 import { resetRateLimits } from '../middleware/rate-limit';
+import { getMailQuota, resetMailQuota } from '../../managers/guardrail/principal-quota';
 
 jest.mock('../../managers/mailer/mailer', () => ({
   __esModule: true,
@@ -63,6 +64,11 @@ interface MailPayload {
   from?: string;
   shareNotificationsEnabled: boolean;
   credentialConfigured: boolean;
+}
+
+interface MailTestPayload {
+  status: 'attempted' | 'unavailable';
+  failure?: { reason: string };
 }
 
 interface SettingsPayload {
@@ -199,6 +205,13 @@ describe('admin settings routes (PRD-041)', () => {
       credentialFilePath: path.join(tempDir, 'mail-credential.json'),
       keyFilePath: path.join(tempDir, 'encryption.key'),
     });
+    // The mail quota is a module singleton — rebind it to a temp path BEFORE
+    // any POST /mail/test call ever touches it, or `record()` writes into
+    // the repo tree at its CWD-relative fallback and counts leak across
+    // tests (and files). Mirrors apps.share.routes.test.ts's own recipe for
+    // the same singleton.
+    resetMailQuota();
+    getMailQuota(path.join(tempDir, 'mail-quotas.json'));
 
     server = new ApiServer({
       port: 3096,
@@ -218,6 +231,7 @@ describe('admin settings routes (PRD-041)', () => {
     resetStateManager();
     resetSettingsManager();
     resetMailCredentialStore();
+    resetMailQuota();
     resetAuth();
     resetPlatformOps();
     resetRateLimits();
@@ -907,6 +921,28 @@ describe('admin settings routes (PRD-041)', () => {
       expect(getSettingsManager().getMailSettings()).toEqual({});
     });
 
+    // DROP-154 Gate 2 §6 — without this, `{"from":"a@b.c,d@e.f"}` would 200
+    // and then every subsequent send would fail "unavailable" forever with
+    // nothing anywhere to explain why (mailer.ts's own single-address
+    // ADDRESS_SEPARATOR_RE check runs too late, at send time, to help an
+    // admin who just got a 200 back from the settings write).
+    it('rejects "," and ";" in user/from (address-list separators) with 400 and does not persist them', async () => {
+      for (const field of ['user', 'from']) {
+        for (const bad of ['a@b.c,d@e.f', 'a@b.c;d@e.f']) {
+          const res = await putMail({ [field]: bad });
+          expect(res.status).toBe(400);
+          const body = (await res.json()) as ApiEnvelope<never>;
+          expect(body.error?.code).toBe('VALIDATION_ERROR');
+        }
+      }
+      expect(getSettingsManager().getMailSettings()).toEqual({});
+    });
+
+    it('does NOT reject "," in host — only user/from are single-address fields', async () => {
+      const res = await putMail({ host: 'smtp.example.com,not-a-separator-rule-for-host' });
+      expect(res.status).toBe(200);
+    });
+
     it('rejects a non-boolean "shareNotificationsEnabled" with 400 without mutating the mail fields', async () => {
       await putMail({ host: 'smtp.example.com' });
       const res = await putMail({ host: 'smtp.other.com', shareNotificationsEnabled: 'yes' });
@@ -1030,13 +1066,13 @@ describe('admin settings routes (PRD-041)', () => {
   });
 
   describe('POST /admin/mail/test', () => {
-    it('reports status "sent" when the mailer sends', async () => {
-      (sendTemplatedMail as jest.Mock).mockResolvedValue({ status: 'sent' });
+    it('reports status "attempted" (no failure) when the relay conversation settles cleanly', async () => {
+      (sendTemplatedMail as jest.Mock).mockResolvedValue({ status: 'attempted' });
 
       const res = await postMailTest('someone@example.com');
       expect(res.status).toBe(200);
-      const body = (await res.json()) as ApiEnvelope<{ status: string }>;
-      expect(body.data).toEqual({ status: 'sent' });
+      const body = (await res.json()) as ApiEnvelope<MailTestPayload>;
+      expect(body.data).toEqual({ status: 'attempted' });
       expect(sendTemplatedMail).toHaveBeenCalledWith('test', 'someone@example.com', expect.any(Object));
     });
 
@@ -1045,10 +1081,26 @@ describe('admin settings routes (PRD-041)', () => {
 
       const res = await postMailTest('someone@example.com');
       expect(res.status).toBe(200);
-      const body = (await res.json()) as ApiEnvelope<{ status: string }>;
+      const body = (await res.json()) as ApiEnvelope<MailTestPayload>;
       expect(body.data).toEqual({ status: 'unavailable' });
       // The response is exactly the two-value enum — nothing relay-shaped snuck in.
       expect(Object.keys(body.data!)).toEqual(['status']);
+    });
+
+    // Unlike every other mailer caller (share-notification), this route IS
+    // allowed to surface `failure` — the operator owns the relay and
+    // supplied `to` themselves, so there's no third party to enumerate
+    // against (mailer.types.ts's MailFailureDetail doc).
+    it('surfaces the relay failure reason on "attempted" — this route is the one exception to the oracle rule', async () => {
+      (sendTemplatedMail as jest.Mock).mockResolvedValue({
+        status: 'attempted',
+        failure: { reason: '550 5.1.1 no such user' },
+      });
+
+      const res = await postMailTest('someone@example.com');
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as ApiEnvelope<MailTestPayload>;
+      expect(body.data).toEqual({ status: 'attempted', failure: { reason: '550 5.1.1 no such user' } });
     });
 
     it('rejects a missing or empty "to" with 400 without calling the mailer', async () => {
@@ -1060,13 +1112,27 @@ describe('admin settings routes (PRD-041)', () => {
     });
 
     it('records an audit entry with the resulting status', async () => {
-      (sendTemplatedMail as jest.Mock).mockResolvedValue({ status: 'sent' });
+      (sendTemplatedMail as jest.Mock).mockResolvedValue({ status: 'attempted' });
       const logSpy = jest.spyOn(activityModule, 'logActivityFor').mockResolvedValue();
 
       await postMailTest('someone@example.com');
 
       expect(logSpy).toHaveBeenCalledTimes(1);
       expect(logSpy.mock.calls[0][1]).toMatchObject({ action: 'mail-test-sent' });
+    });
+
+    it('includes the failure reason in the audit entry — a caller reading only the response would miss it', async () => {
+      (sendTemplatedMail as jest.Mock).mockResolvedValue({
+        status: 'attempted',
+        failure: { reason: 'connection refused' },
+      });
+      const logSpy = jest.spyOn(activityModule, 'logActivityFor').mockResolvedValue();
+
+      await postMailTest('someone@example.com');
+
+      expect(logSpy).toHaveBeenCalledTimes(1);
+      const detail = (logSpy.mock.calls[0][1] as { detail?: string }).detail;
+      expect(detail).toContain('failure=connection refused');
     });
 
     it('rejects a non-admin request with 403', async () => {
@@ -1083,6 +1149,93 @@ describe('admin settings routes (PRD-041)', () => {
         body: JSON.stringify({ to: 'someone@example.com' }),
       });
       expect(res.status).toBe(401);
+    });
+
+    // DROP-154 Gate 2 §3 — metered independently of the dedicated per-IP
+    // rate-limit bucket (server.mail-routes.test.ts covers that one).
+    describe('mail quota', () => {
+      it('429s once the mail quota refuses, without calling the mailer', async () => {
+        jest.spyOn(getMailQuota(), 'check').mockReturnValue({ allowed: false, retryAfterSeconds: 42 });
+
+        const res = await postMailTest('someone@example.com');
+        expect(res.status).toBe(429);
+        const body = (await res.json()) as ApiEnvelope<never>;
+        expect(body.error?.code).toBe('RATE_LIMITED');
+        expect(sendTemplatedMail).not.toHaveBeenCalled();
+        expect(res.headers.get('Retry-After')).toBe('42');
+      });
+
+      it('records against the quota only on an admitted send, not on a validation 400', async () => {
+        const recordSpy = jest.spyOn(getMailQuota(), 'record');
+
+        await postMailTest(''); // 400 — never reaches the quota
+        expect(recordSpy).not.toHaveBeenCalled();
+
+        (sendTemplatedMail as jest.Mock).mockResolvedValue({ status: 'attempted' });
+        await postMailTest('someone@example.com');
+        expect(recordSpy).toHaveBeenCalledTimes(1);
+      });
+    });
+  });
+
+  describe('mail routes — auth disabled (DROP-154 Gate 2 §5)', () => {
+    // A second, auth-disabled server: `v1.use('/admin/*', authMiddleware('admin'))`
+    // is registered only inside `if (enableAuth && isAuthEnabled())`
+    // (server.ts), so on a box with auth off these routes would otherwise
+    // be reachable anonymously — including the one that can exfiltrate the
+    // relay password. Mirrors server.mail-routes.test.ts's own auth-disabled
+    // describe block.
+    let noAuthDir: string;
+    let noAuthServer: ApiServer;
+    let noAuthHono: ReturnType<ApiServer['getApp']>;
+
+    beforeEach(async () => {
+      noAuthDir = await fs.mkdtemp(path.join(os.tmpdir(), 'drop-admin-settings-noauth-test-'));
+      // `isAuthEnabled()` reads MODULE-level state (auth.ts's `config`), not
+      // per-ApiServer state — the outer beforeEach above already called
+      // `initializeAuth()` for its own `server`, so without this reset
+      // `isAuthEnabled()` would still read that leftover `true` here, and
+      // `requireAuthForMailRoutes()` would never refuse anything below.
+      resetAuth();
+      resetMailQuota();
+      getMailQuota(path.join(noAuthDir, 'mail-quotas.json'));
+      noAuthServer = new ApiServer({ port: 3097, enableAuth: false });
+      await noAuthServer.initialize();
+      noAuthHono = noAuthServer.getApp();
+    });
+
+    afterEach(async () => {
+      await noAuthServer.stop();
+      resetMailQuota();
+      await fs.rm(noAuthDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+    });
+
+    it('refuses PUT /settings/mail with 401', async () => {
+      const res = await noAuthHono.request('/api/v1/admin/settings/mail', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ host: 'smtp.example.com' }),
+      });
+      expect(res.status).toBe(401);
+    });
+
+    it('refuses PUT /settings/mail/credential with 401', async () => {
+      const res = await noAuthHono.request('/api/v1/admin/settings/mail/credential', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ password: 'super-secret-relay-password' }),
+      });
+      expect(res.status).toBe(401);
+    });
+
+    it('refuses POST /mail/test with 401, without calling the mailer', async () => {
+      const res = await noAuthHono.request('/api/v1/admin/mail/test', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ to: 'someone@example.com' }),
+      });
+      expect(res.status).toBe(401);
+      expect(sendTemplatedMail).not.toHaveBeenCalled();
     });
   });
 });

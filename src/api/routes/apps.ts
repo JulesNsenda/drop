@@ -37,7 +37,6 @@ import { getRouterService } from '../../core/router';
 import { logActivityFor } from '../../managers/activity';
 import {
   getAppsDirectory,
-  isHttpsEnabled,
   getDomainSuffix,
   getTempDirectory,
   getUploadMaxBytes,
@@ -45,7 +44,7 @@ import {
 } from '../runtime-config';
 import { isPathWithin } from '../../utils/paths';
 import { isReservedHost } from '../../utils/reserved-hosts';
-import { isLocalhostDomain } from '../../utils/domain-validator';
+import { computeAppUrl } from '../../utils/app-url';
 import { eventBus } from '../../core/event-bus';
 import {
   getUploadDeployService,
@@ -131,44 +130,6 @@ function resolveUsername(userId?: string): string | undefined {
   } catch {
     return undefined;
   }
-}
-
-/**
- * Compute an app's externally-reachable URL.
- *
- * The served host is DERIVED, never read from `app.hostname` — that field is the
- * persisted `<name>.localhost` placeholder; the host an app actually serves on is
- * computed at route time and never stored (P0-6 hijack guard — see
- * `AppConfigService.getDomainOwners`). Priority: dashboard-set `customDomain` >
- * drop.yaml `domains` (persisted in app config) > default `<name>.<domainSuffix>`
- * (mirrors `platform.ts` `handleConfigureRoute`). Returns `undefined` for a
- * localhost host — there is no globally-reachable URL, so the dashboard falls back
- * to a direct host:port link derived from the viewer's own location.
- */
-export function computeAppUrl(app: AppState): string | undefined {
-  let configDomains: string[] | undefined;
-  let tlsDisabled = false;
-  let publicUrl: string | undefined;
-  try {
-    const cfg = getAppConfigService().getConfig(app.name);
-    configDomains = cfg?.domains;
-    tlsDisabled = cfg?.tls?.disabled === true;
-    publicUrl = cfg?.publicUrl;
-  } catch {
-    // Config service not initialised (e.g. isolated route tests) — use default host.
-  }
-  // A same-origin monorepo child is routed onto the group domain (frontend at
-  // '/', backend at '/api'), never its own `<name>` subdomain — so the
-  // name-based default below would be a dead link. handleConfigureRoute persists
-  // the real, fully-resolved URL as publicUrl. A custom domain still wins:
-  // declaring `domains` opts the child out of same-origin routing.
-  if (publicUrl && !app.customDomain && !configDomains?.length) {
-    return publicUrl;
-  }
-  const domain = app.customDomain || configDomains?.[0] || `${app.name}.${getDomainSuffix()}`;
-  if (isLocalhostDomain(domain)) return undefined;
-  const proto = isHttpsEnabled() && !tlsDisabled ? 'https' : 'http';
-  return `${proto}://${domain}`;
 }
 
 /**

@@ -40,7 +40,7 @@ import {
 import { getSettingsManager, resetSettingsManager } from '../../managers/settings/settings-manager';
 import type { AccessGateVerdict, AccessGateBlocker } from '../../managers/guardrail/access-gate';
 import { getMailQuota, resetMailQuota } from '../../managers/guardrail/principal-quota';
-import { setPublicUrl } from '../runtime-config';
+import { setPublicUrl, setApiRuntimeConfig } from '../runtime-config';
 import { MAX_USER_ID_LENGTH } from './access-limits';
 import * as atomicWrite from '../../utils/atomic-write';
 import * as mailer from '../../managers/mailer/mailer';
@@ -65,6 +65,15 @@ const featureDisabled: AccessGateVerdict = {
   reasons: ['because feature-disabled'],
   featureEnabled: false,
 };
+
+/**
+ * Lets a fire-and-forget promise chain (`void notifyShareGrant` — Gate 2
+ * fix #2) settle before an assertion that depends on its post-`await` tail
+ * (e.g. `quota.record()`, the activity log write). `setImmediate` runs after
+ * every already-queued microtask, so this is enough even though the grant
+ * response itself resolves before `notifyShareGrant` does.
+ */
+const flush = () => new Promise<void>(resolve => setImmediate(resolve));
 
 describe('/apps/:name/share (DROP-153 owner sharing)', () => {
   let t: TestApiServer;
@@ -657,22 +666,18 @@ describe('/apps/:name/share (DROP-153 owner sharing)', () => {
       resetMailQuota();
       getMailQuota(path.join(t.tempDir, 'mail-quotas.json'));
       setPublicUrl('https://dashboard.example.com');
-      // Gives `myapp` a real, non-localhost domain so `computeAppUrl` returns
-      // something rather than `undefined` — same recipe as
-      // app-access.routes.test.ts, but scoped to this app's own config
-      // rather than the whole test-server's domainSuffix (every other
-      // describe in this file relies on the default).
-      await getAppConfigService().upsertConfig('myapp', {
-        type: 'nodejs',
-        port: 4000,
-        domains: ['myapp.example.com'],
-      });
-      sendMock = jest.spyOn(mailer, 'sendTemplatedMail').mockResolvedValue({ status: 'sent' });
+      // A real, non-localhost domain SUFFIX — never a tenant `domains`/
+      // `customDomain` value (Gate 2 fix #1 dropped those from the mailed
+      // link entirely) — so the platform-derived `appUrl` resolves to
+      // something rather than `undefined`.
+      setApiRuntimeConfig({ domainSuffix: 'dropkit.sh' });
+      sendMock = jest.spyOn(mailer, 'sendTemplatedMail').mockResolvedValue({ status: 'attempted' });
     });
 
     afterEach(() => {
       resetMailQuota();
       setPublicUrl(undefined);
+      setApiRuntimeConfig({ domainSuffix: 'localhost' });
       sendMock.mockRestore();
     });
 
@@ -686,9 +691,41 @@ describe('/apps/:name/share (DROP-153 owner sharing)', () => {
       expect(sendMock).toHaveBeenCalledWith('share-notification', 'withmail-send@example.com', {
         appName: 'myapp',
         sharerName: 'owner',
-        appUrl: 'https://myapp.example.com',
+        appUrl: 'https://myapp.dropkit.sh',
         platformUrl: 'https://dashboard.example.com',
       });
+    });
+
+    it('never links a tenant-declared domain — the mailed URL is platform-derived only, even when the app declares its own (Gate 2 fix #1)', async () => {
+      // Both tenant-authored, and both what `computeAppUrl` (the dashboard's
+      // OWN display helper, which this notification deliberately does not
+      // use) would have honoured. A domain the tenant controls, inside a
+      // DKIM/SPF-aligned mail sent from the operator's own relay, is a
+      // phishing primitive — not "an app name and a username".
+      await getAppConfigService().upsertConfig('myapp', {
+        type: 'nodejs',
+        port: 4000,
+        domains: ['evil-phish.example.net'],
+      });
+      await getStateManager().updateApp('myapp', { customDomain: 'also-evil.example.net' });
+      await getSettingsManager().setShareNotificationsEnabled(true);
+      await createUser(
+        'withmail-tenant-domain',
+        'password123',
+        'user',
+        'withmail-tenant-domain@example.com'
+      );
+
+      const res = await post('myapp', bearer(ownerToken), {
+        username: 'withmail-tenant-domain',
+        gateApp: true,
+      });
+      expect(res.status).toBe(200);
+      expect(sendMock).toHaveBeenCalledTimes(1);
+      const vars = sendMock.mock.calls[0][2] as { appUrl: string };
+      expect(vars.appUrl).toBe('https://myapp.dropkit.sh');
+      expect(vars.appUrl).not.toContain('evil-phish');
+      expect(vars.appUrl).not.toContain('also-evil');
     });
 
     it('does NOT send when share notifications are disabled — the default', async () => {
@@ -721,7 +758,7 @@ describe('/apps/:name/share (DROP-153 owner sharing)', () => {
       expect(sendMock).not.toHaveBeenCalled();
     });
 
-    it('skips the send silently when the mail quota refuses — the grant still succeeds unchanged', async () => {
+    it('logs a structured refusal, never a silent kill, when the mail quota refuses — the grant still succeeds unchanged (Gate 2 fix #4)', async () => {
       await getSettingsManager().setShareNotificationsEnabled(true);
       await createUser('withmail-quota', 'password123', 'user', 'withmail-quota@example.com');
       jest.spyOn(getMailQuota(), 'check').mockReturnValue({ allowed: false });
@@ -731,9 +768,38 @@ describe('/apps/:name/share (DROP-153 owner sharing)', () => {
       expect(res.status).toBe(200);
       expect(sendMock).not.toHaveBeenCalled();
       expect(recordSpy).not.toHaveBeenCalled();
+      await flush();
+      const { entries } = getActivityLog().getEntries(10);
+      expect(entries.some(e => e.action === 'mail-send-failed' && e.appName === 'myapp')).toBe(true);
     });
 
-    it('never varies the grant response with the send outcome — byte-identical body for sent, unavailable, and a rejected send', async () => {
+    it('charges the mail quota only once the relay was actually dialed, never for an unconfigured relay (Gate 2 fix #5)', async () => {
+      await getSettingsManager().setShareNotificationsEnabled(true);
+      const recordSpy = jest.spyOn(getMailQuota(), 'record');
+
+      await createUser('withmail-unavailable', 'password123', 'user', 'withmail-unavailable@example.com');
+      sendMock.mockResolvedValueOnce({ status: 'unavailable' });
+      const res1 = await post('myapp', bearer(ownerToken), {
+        username: 'withmail-unavailable',
+        gateApp: true,
+      });
+      expect(res1.status).toBe(200);
+      await flush();
+      expect(recordSpy).not.toHaveBeenCalled();
+
+      recordSpy.mockClear();
+      await createUser('withmail-attempted', 'password123', 'user', 'withmail-attempted@example.com');
+      sendMock.mockResolvedValueOnce({ status: 'attempted' });
+      const res2 = await post('myapp', bearer(ownerToken), {
+        username: 'withmail-attempted',
+        gateApp: true,
+      });
+      expect(res2.status).toBe(200);
+      await flush();
+      expect(recordSpy).toHaveBeenCalledTimes(1);
+    });
+
+    it('never varies the grant response with the send outcome — byte-identical body for attempted, unavailable, and a rejected send', async () => {
       await getSettingsManager().setShareNotificationsEnabled(true);
       const target = await createUser(
         'withmail-outcome',
@@ -742,7 +808,7 @@ describe('/apps/:name/share (DROP-153 owner sharing)', () => {
         'withmail-outcome@example.com'
       );
 
-      sendMock.mockResolvedValueOnce({ status: 'sent' });
+      sendMock.mockResolvedValueOnce({ status: 'attempted' });
       const res1 = await post('myapp', bearer(ownerToken), { username: 'withmail-outcome', gateApp: true });
       expect(res1.status).toBe(200);
       const body1 = await res1.text();
