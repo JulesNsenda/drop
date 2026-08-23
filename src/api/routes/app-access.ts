@@ -39,6 +39,7 @@
  */
 
 import { Hono, type Context } from 'hono';
+import { success, error, ErrorCodes } from '../types';
 import { isValidAppName } from '../middleware/validate';
 import { getStateManager } from '../../managers/app/state-manager';
 import { getAppConfigServiceOrNull } from '../../managers/app/app-config';
@@ -222,7 +223,7 @@ appAccess.get('/:app/verify', async c => {
     if (method !== 'GET' && method !== 'HEAD') {
       recordAccess({ appName, decision: 'refuse', reason: 'no-session-non-get' });
       noStore(c);
-      return c.json({ error: 'session_expired' }, 401);
+      return c.json(error(ErrorCodes.UNAUTHORIZED, 'Your session has expired'), 401);
     }
 
     const platform = getPublicUrl();
@@ -268,7 +269,7 @@ appAccess.get('/authorize', c => {
 
   noStore(c);
   if (!isValidAppName(appName) || !flow) {
-    return c.json({ error: 'invalid_request' }, 400);
+    return c.json(error(ErrorCodes.VALIDATION_ERROR, 'Invalid sign-in request'), 400);
   }
 
   // Everything here is client-supplied — there is no forward_auth and so no
@@ -299,24 +300,24 @@ appAccess.post('/code', async c => {
 
   noStore(c);
   if (!isValidAppName(appName) || !flowId) {
-    return c.json({ error: 'invalid_request' }, 400);
+    return c.json(error(ErrorCodes.VALIDATION_ERROR, 'Invalid sign-in request'), 400);
   }
 
   const app = getStateManager().getApp(appName);
   const policy = gatePolicy(appName);
-  if (!app || !policy) return c.json({ error: 'not_gated' }, 404);
+  if (!app || !policy) return c.json(error(ErrorCodes.NOT_FOUND, 'This application is not gated'), 404);
 
   // The SAME predicate the verify hop uses. If these two ever disagree the
   // visitor loops between them forever, so the refusal is made HERE, where DROP
   // controls the page, rather than being discovered one hop later.
   if (!canOpen(auth, app, policy)) {
-    return c.json({ error: 'not_permitted' }, 403);
+    return c.json(error(ErrorCodes.UNAUTHORIZED, 'Not permitted to open this application'), 403);
   }
   const user = auth?.userId ? getUserById(auth.userId) : null;
-  if (!user) return c.json({ error: 'not_permitted' }, 403);
+  if (!user) return c.json(error(ErrorCodes.UNAUTHORIZED, 'Not permitted to open this application'), 403);
 
   const origin = appOrigin(appName);
-  if (!origin) return c.json({ error: 'not_routable' }, 409);
+  if (!origin) return c.json(error(ErrorCodes.CONFLICT, 'This application has no routable address'), 409);
 
   const code = mintAppAccessCode({
     userId: user.id,
@@ -328,7 +329,9 @@ appAccess.post('/code', async c => {
 
   // The SPA navigates the browser here. The origin is DROP-derived, never
   // echoed from the request.
-  return c.json({ redirectTo: `${origin}/.drop-session/exchange?code=${encodeURIComponent(code)}` });
+  return c.json(
+    success({ redirectTo: `${origin}/.drop-session/exchange?code=${encodeURIComponent(code)}` })
+  );
 });
 
 // ─────────────────────────────────────────────────────────────────────────────

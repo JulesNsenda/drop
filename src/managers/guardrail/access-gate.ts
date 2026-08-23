@@ -163,17 +163,18 @@ const BLOCKER_REASONS: Record<AccessGateBlocker, string> = {
 /**
  * Whether this build can actually ENFORCE an access gate.
  *
- * `false` until the `forward_auth` guard emitter and the verify endpoint land
- * (the next slice). Everything in this module — the rule, the three refusal
- * points, the policy store — is the enforceability half; nothing yet puts a
- * guard in front of a single request.
+ * TRUE as of Slice 1b: the `forward_auth` emitter, the verify endpoint and the
+ * code exchange all exist, so an app whose verdict is `enforceable` and whose
+ * configuration Caddy ACCEPTED really is gated.
  *
- * It exists so that no affirmative signal is a lie in the meantime: an app
- * with a policy on this build is NOT protected, whatever the verdict says
- * about the box, and the route and the state flag both say so. Flipping this
- * to `true` alongside the emitter is the one line that turns the claims on.
+ * It stays a constant rather than being deleted because it is what every
+ * affirmative signal is gated on — `enforced` on the policy route,
+ * `accessGateUnapplied` on the app's state. While it was `false` those all
+ * reported "recorded, not enforced", which was the truth for that build. If a
+ * future change ever removes the emitter, flipping this back is what keeps the
+ * API honest instead of leaving it claiming a control that is gone.
  */
-export const ACCESS_GATE_ENFORCEMENT_AVAILABLE = false;
+export const ACCESS_GATE_ENFORCEMENT_AVAILABLE = true;
 
 /**
  * The verdict. Every blocker is reported, not just the first: an operator
