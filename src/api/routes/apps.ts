@@ -56,6 +56,7 @@ import {
 import {
   describeAccessGateRefusal,
   ACCESS_GATE_ENFORCEMENT_AVAILABLE,
+  gateEnforced,
 } from '../../managers/guardrail/access-gate';
 import { DeployRefusedError } from '../../managers/guardrail/deploy-breaker';
 import { QuotaExceededError } from '../../managers/guardrail/principal-quota';
@@ -1321,15 +1322,6 @@ apps.delete('/:name/services/:id', async c => {
   }
 });
 
-/**
- * Whether a gate is actually ENFORCED for this app right now — as opposed to
- * whether the box could enforce one. A persisted policy on a build with no
- * guard emitter is a record, not a control, and every response says so.
- */
-function gateEnforced(verdict: { enforceable: boolean }, hasPolicy: boolean): boolean {
-  return hasPolicy && verdict.enforceable && ACCESS_GATE_ENFORCEMENT_AVAILABLE;
-}
-
 // GET /apps/:name/access - Admin: read the browser access gate policy.
 // Reports what is ENFORCED, not merely what is persisted: an admin must be
 // able to tell a recorded policy from a live control.
@@ -1567,7 +1559,10 @@ apps.delete('/:name/access', async c => {
     return c.json(error(ErrorCodes.CONFLICT, `Application '${name}' has an operation in progress`), 409);
   }
 
-  const updated = await getAppConfigService().setAccessPolicy(name, undefined);
+  // `() => undefined` rather than a bare `undefined`: `setAccessPolicy` takes
+  // the updater form only, so that no caller can hand it a whole policy literal
+  // and silently drop `grantedBy` on the way past.
+  const updated = await getAppConfigService().setAccessPolicy(name, () => undefined);
   if (!updated) {
     throw new NotFoundError(`Application '${name}' not found`);
   }

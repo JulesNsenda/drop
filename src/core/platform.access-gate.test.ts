@@ -135,20 +135,6 @@ describe('platform access-gate refusals (DROP-152)', () => {
   const attachErrorCapture = (p: DropPlatform): string[] => attachLogCapture(p).errors;
 
   /**
-   * Wires `platform.runtime` with a `getAllStatus()` that reports exactly the
-   * given app names as `running` — the source `sweepAccessGates` reads to
-   * decide what to REPORT for a gated app while the kill switch is off
-   * (running vs. not), mirroring `reconcileAppsOnBoot`'s own reason for
-   * reading the runtime rather than `AppState.status` (state is stale at
-   * boot).
-   */
-  const wireRuntime = (running: string[]) => {
-    (platform as unknown as Record<string, unknown>).runtime = {
-      getAllStatus: jest.fn().mockResolvedValue(running.map((name) => ({ name, status: 'running' }))),
-    };
-  };
-
-  /**
    * A REAL drop.yaml on disk. The gate's hostname/TLS resolution reads the
    * live file (the same source route emission reads), so a stubbed config
    * object cannot exercise it.
@@ -592,7 +578,6 @@ describe('platform access-gate refusals (DROP-152)', () => {
       errors = attachErrorCapture(platform);
       const gated = [configFor({ name: 'alpha', access: POLICY })];
       wire(gated[0], gated);
-      wireRuntime(['alpha']);
       const reconfigureRoute = jest.spyOn(
         platform as unknown as { reconfigureRoute: (name: string) => Promise<void> },
         'reconfigureRoute'
@@ -609,55 +594,33 @@ describe('platform access-gate refusals (DROP-152)', () => {
       expect(errors).toHaveLength(0);
     });
 
-    it('DROP-153: reports a RUNNING gated app as still carrying whatever guard Caddy has, until its next route emission', async () => {
+    it('DROP-153: reports every withdrawn app in ONE aggregate line naming it, not a per-app message', async () => {
+      // Collapsed from three near-identical branches (running, not-running,
+      // monorepo group) that all ended in the same "no action is required"
+      // fact — the distinction cost a runtime status read plus a
+      // `parseDropYaml` per gated app to choose between wording, never
+      // behaviour. A group child is still named here rather than silently
+      // dropped from reporting.
       platform = makeFlagOffPlatform();
       const captured = attachLogCapture(platform);
       errors = captured.errors;
-      const gated = [configFor({ name: 'alpha', access: POLICY })];
-      wire(gated[0], gated);
-      wireRuntime(['alpha']);
+      const gated = [
+        configFor({ name: 'alpha', access: POLICY }),
+        configFor({ name: 'child', access: POLICY, group: 'mygroup' }),
+      ];
+      wire(undefined, gated);
+      (
+        platform as unknown as { appConfigService: { getConfig: jest.Mock } }
+      ).appConfigService.getConfig = jest.fn((n: string) => gated.find((c) => c.name === n));
 
       await sweep();
 
       expect(setAccessGateUnapplied).toHaveBeenCalledWith('alpha', undefined);
-      const info = captured.infos.find(m => m.includes('alpha'));
+      expect(setAccessGateUnapplied).toHaveBeenCalledWith('child', undefined);
+      const info = captured.infos.find((m) => m.includes('alpha') && m.includes('child'));
       expect(info).toBeDefined();
       expect(info).toContain('next route emission');
       expect(info).toContain('/verify');
-    });
-
-    it('DROP-153: reports a NON-RUNNING gated app differently — nothing is being served for it either way', async () => {
-      platform = makeFlagOffPlatform();
-      const captured = attachLogCapture(platform);
-      errors = captured.errors;
-      const gated = [configFor({ name: 'alpha', access: POLICY })];
-      wire(gated[0], gated);
-      wireRuntime([]); // 'alpha' is NOT running
-
-      await sweep();
-
-      expect(setAccessGateUnapplied).toHaveBeenCalledWith('alpha', undefined);
-      const info = captured.infos.find(m => m.includes('alpha'));
-      expect(info).toBeDefined();
-      expect(info).toContain('not currently running');
-      // The "still in Caddy" framing is specific to a RUNNING app.
-      expect(info).not.toContain('next route emission');
-    });
-
-    it('DROP-153: reports a monorepo group child/container differently, without computing anything Caddy-side', async () => {
-      platform = makeFlagOffPlatform();
-      const captured = attachLogCapture(platform);
-      errors = captured.errors;
-      const gated = [configFor({ name: 'child', access: POLICY, group: 'mygroup' })];
-      wire(gated[0], gated);
-      wireRuntime(['child']);
-
-      await sweep();
-
-      expect(setAccessGateUnapplied).toHaveBeenCalledWith('child', undefined);
-      const info = captured.infos.find(m => m.includes('child'));
-      expect(info).toBeDefined();
-      expect(info).toContain('monorepo group');
     });
   });
 });

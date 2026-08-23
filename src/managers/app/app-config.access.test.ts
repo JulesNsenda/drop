@@ -30,11 +30,11 @@ import {
 const POLICY: AppAccessPolicy = { mode: 'drop-users', allow: ['user-1'] };
 
 /**
- * Arrange helper: DROP-153 Gate 2 narrowed `setAccessPolicy`'s non-updater
- * overload to `undefined` only (a clear) — a whole `AppAccessPolicy` literal
- * can no longer be written directly, precisely because that path bypassed
- * provenance merging by construction. Every test below that just wants to
- * SEED a policy (rather than exercise an updater) goes through this instead.
+ * Arrange helper: `setAccessPolicy` takes only an updater — a whole
+ * `AppAccessPolicy` literal (or a bare `undefined`) can no longer be written
+ * directly, precisely because that path bypassed provenance merging by
+ * construction. Every test below that just wants to SEED a policy (rather
+ * than exercise an updater) goes through this instead.
  */
 const setPolicy = (
   svc: AppConfigService,
@@ -95,7 +95,7 @@ describe('AppConfig.access containment', () => {
 
   it('clears the field entirely (not to null) when set to undefined', async () => {
     await setPolicy(service, 'myapp', POLICY);
-    await service.setAccessPolicy('myapp', undefined);
+    await service.setAccessPolicy('myapp', () => undefined);
     const onDisk = await readFromDisk('myapp');
     expect('access' in onDisk).toBe(false);
     expect(service.getConfig('myapp')?.access).toBeUndefined();
@@ -237,6 +237,36 @@ describe('AppConfig.access containment', () => {
       });
     });
 
+    it('returns NO_CHANGE when the whole policy is cleared between the pre-filter snapshot and the updater running', async () => {
+      // The pre-filter in pruneAllowListEntries is a cheap snapshot, not the
+      // correctness check (its own doc). Simulate an admin's whole-policy
+      // clear (DELETE /access) landing after that snapshot already matched
+      // 'myapp' but before the updater actually runs — the updater must see
+      // NO policy at all and take the `!access` branch, not resurrect one.
+      await setPolicy(service, 'myapp', { mode: 'drop-users', allow: ['u1'] });
+      const writeSpy = jest.spyOn(atomicWrite, 'writeFileAtomic');
+      writeSpy.mockClear();
+
+      const real = service.setAccessPolicy.bind(service);
+      const spy = jest
+        .spyOn(service, 'setAccessPolicy')
+        .mockImplementation(async (name: unknown, arg: unknown) => {
+          await real('myapp', () => undefined); // the racing whole-policy clear
+          return real(name as string, arg as never); // the prune's own real write
+        });
+
+      const touched = await service.pruneAllowListEntries('u1');
+
+      expect(touched).toEqual([]); // NO_CHANGE — nothing left for the prune to touch
+      expect(service.getConfig('myapp')?.access).toBeUndefined(); // stays cleared, not resurrected
+      // Exactly one write happened (the racing clear) — the prune's own
+      // updater found nothing to do and skipped saveConfig entirely.
+      expect(writeSpy).toHaveBeenCalledTimes(1);
+
+      spy.mockRestore();
+      writeSpy.mockRestore();
+    });
+
     it('a prune that races an identical prune returns NO_CHANGE the second time and skips its write', async () => {
       await setPolicy(service, 'myapp', { mode: 'drop-users', allow: ['u1'] });
       const writeSpy = jest.spyOn(atomicWrite, 'writeFileAtomic');
@@ -260,13 +290,12 @@ describe('AppConfig.access containment', () => {
   });
 
   /**
-   * DROP-153 Gate 2: `carryForwardGrantedBy` is no longer exported, and the
-   * non-updater `setAccessPolicy` overload no longer accepts a whole
-   * `AppAccessPolicy` literal — only the updater form can write a real
-   * policy, and provenance now merges INSIDE that path, structurally, rather
-   * than being an opt-in call a route remembers (or forgets) to make. These
-   * exercise that merge through the only surface left: `setAccessPolicy`
-   * itself.
+   * DROP-153 Gate 2: `carryForwardGrantedBy` is no longer exported, and
+   * `setAccessPolicy` no longer accepts a whole `AppAccessPolicy` literal —
+   * only the updater form can write a real policy, and provenance now merges
+   * INSIDE that path, structurally, rather than being an opt-in call a route
+   * remembers (or forgets) to make. These exercise that merge through the
+   * only surface left: `setAccessPolicy` itself.
    */
   describe('setAccessPolicy: automatic provenance carry-forward (DROP-153 Gate 2)', () => {
     it('a whole-policy updater that omits grantedBy cannot erase provenance', async () => {
@@ -337,6 +366,29 @@ describe('AppConfig.access containment', () => {
         allow: ['u1'],
       }));
       expect(updated?.access).toEqual({ mode: 'drop-users', allow: ['u1'] });
+    });
+
+    it('carries forward to ABSENT (not an empty object) when the write drops every owner-authored id', async () => {
+      // u1 owner-authored, u2 admin-authored (absent from grantedBy). The
+      // write's new `allow` drops u1 entirely, leaving only the
+      // already-admin-authored u2 — so there is nothing left to carry
+      // forward. `carryForwardGrantedBy`'s own doc requires this to come out
+      // as `undefined`, not `{}`, matching the "field absent, not empty"
+      // shape `grantedBy` has everywhere else.
+      await setPolicy(service, 'myapp', {
+        mode: 'drop-users',
+        allow: ['u1', 'u2'],
+        grantedBy: { u1: 'owner-a' },
+      });
+
+      await service.setAccessPolicy('myapp', (): AppAccessPolicy => ({
+        mode: 'drop-users',
+        allow: ['u2'],
+      }));
+
+      const access = service.getConfig('myapp')?.access;
+      expect(access).toEqual({ mode: 'drop-users', allow: ['u2'] });
+      expect(access && 'grantedBy' in access).toBe(false);
     });
   });
 
@@ -432,7 +484,7 @@ describe('AppConfig.access containment', () => {
       await setPolicy(service, 'myapp', { mode: 'drop-users', allow: ['u1'] });
       await Promise.all([
         grant(service, 'myapp', 'u2', 'owner-1', 200),
-        service.setAccessPolicy('myapp', undefined),
+        service.setAccessPolicy('myapp', () => undefined),
       ]);
       const finalAccess = service.getConfig('myapp')?.access;
       // Whichever write settles last wins outright — the result is always ONE

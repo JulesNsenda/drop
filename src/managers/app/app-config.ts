@@ -63,13 +63,31 @@ export interface AppAccessPolicy {
 export const NO_CHANGE = Symbol('app-config:access-no-change');
 
 /**
+ * Filter a `grantedBy` map down to entries `predicate` keeps, collapsing an
+ * empty result to `undefined` rather than `{}` — the "field absent, not
+ * empty" shape every `grantedBy` in this file relies on
+ * (`mergeAccessProvenance`'s `'grantedBy' in result` check depends on it).
+ * Shared by `carryForwardGrantedBy` (keep grantees still in the new `allow`)
+ * and `dropStaleGrants` (drop entries whose grantor was deleted) — same
+ * filter-and-collapse shape, different predicate.
+ */
+function filterGrantedBy(
+  grantedBy: Record<string, string> | undefined,
+  predicate: (granteeId: string, grantorId: string) => boolean
+): Record<string, string> | undefined {
+  if (!grantedBy) return grantedBy;
+  const next: Record<string, string> = {};
+  for (const [granteeId, grantorId] of Object.entries(grantedBy)) {
+    if (predicate(granteeId, grantorId)) next[granteeId] = grantorId;
+  }
+  return Object.keys(next).length > 0 ? next : undefined;
+}
+
+/**
  * Given an existing policy and the `allow` array a write is about to replace
  * it with, return a `grantedBy` map containing only the ids still present in
  * the new `allow` — i.e. provenance for entries the write is dropping is
  * dropped with them, and provenance for everything else carries forward.
- * Returns `undefined` (not `{}`) when nothing carries forward, so a merged
- * `{ ...policy, grantedBy: carryForwardGrantedBy(...) }` gets the same "field
- * absent, not empty" shape `grantedBy` has everywhere else.
  *
  * NOT exported. This used to be an opt-in helper a caller (the admin
  * `PUT /access` route) had to remember to call — which is exactly this
@@ -85,14 +103,8 @@ function carryForwardGrantedBy(
   existing: AppAccessPolicy | undefined,
   allow: readonly string[]
 ): Record<string, string> | undefined {
-  const grantedBy = existing?.grantedBy;
-  if (!grantedBy) return undefined;
   const allowSet = new Set(allow);
-  const next: Record<string, string> = {};
-  for (const [userId, grantorId] of Object.entries(grantedBy)) {
-    if (allowSet.has(userId)) next[userId] = grantorId;
-  }
-  return Object.keys(next).length > 0 ? next : undefined;
+  return filterGrantedBy(existing?.grantedBy, (userId) => allowSet.has(userId));
 }
 
 /**
@@ -135,12 +147,7 @@ function dropStaleGrants(
   grantedBy: Record<string, string> | undefined,
   deletedGrantorId: string
 ): Record<string, string> | undefined {
-  if (!grantedBy) return grantedBy;
-  const next: Record<string, string> = {};
-  for (const [granteeId, grantorId] of Object.entries(grantedBy)) {
-    if (grantorId !== deletedGrantorId) next[granteeId] = grantorId;
-  }
-  return Object.keys(next).length > 0 ? next : undefined;
+  return filterGrantedBy(grantedBy, (_granteeId, grantorId) => grantorId !== deletedGrantorId);
 }
 
 export interface AppConfig {
@@ -710,10 +717,11 @@ export class AppConfigService {
       const rawUpdates = typeof updates === 'function' ? updates(existing) : updates;
       // An updater-form write can signal "nothing to persist" — skip
       // saveConfig entirely rather than rewriting an unchanged config (see
-      // NO_CHANGE's own doc). `existing` is guaranteed defined here: the
-      // early `!existing && !opts.create` return above already refused
-      // before the updater ran, and `opts.create` paths always have
-      // `existing` merged in below regardless.
+      // NO_CHANGE's own doc). `existing` is NOT guaranteed defined here: the
+      // early `!existing && !opts.create` return above only refuses when
+      // `opts.create` is false — with `create: true` and no config yet on
+      // disk, `existing` is undefined and the `?? null` below is exactly for
+      // that case.
       if (rawUpdates === NO_CHANGE) return existing ?? null;
       const systemSafe = opts.system ? rawUpdates : this.stripSystemFields(appName, rawUpdates);
       // The restricted tier is applied INDEPENDENTLY of `system`, not nested
@@ -827,21 +835,22 @@ export class AppConfigService {
    * authoritative there — so an authorization write against a typo would
    * fabricate an app.
    *
-   * `undefined` clears the gate. It is written as an explicit `undefined`
-   * rather than deleted from the merged object: `yaml.stringify` omits
-   * undefined values, so the field leaves the file entirely (the same
-   * clear-by-undefined `publicUrl` already relies on). This is the ONLY
-   * non-updater form left — a caller cannot pass a whole `AppAccessPolicy`
-   * literal here (see the removed overload's history: DROP-153 Gate 2). A
+   * Takes an updater, never a plain `AppAccessPolicy` (or `undefined`)
+   * literal — a caller cannot pass a whole policy here (DROP-153 Gate 2). A
    * literal write bypasses `mergeAccessProvenance` below by construction —
    * there is no "existing" to merge against a value the caller already
    * fully decided — so it silently erases every owner-authored grant's
    * provenance on every write. The admin `PUT /access` route hit exactly
    * this, one `carryForwardGrantedBy(...)` call away from doing it by
-   * accident. Every write of a real policy now goes through the updater
-   * overload below, where the merge is structural rather than opt-in.
+   * accident. Every write of a real policy goes through the updater below,
+   * where the merge is structural rather than opt-in — including clearing
+   * the gate, which is `setAccessPolicy(name, () => undefined)` rather than
+   * a second, literal-accepting form. `undefined` is written as an explicit
+   * field rather than deleted from the merged object: `yaml.stringify` omits
+   * undefined values, so the field leaves the file entirely (the same
+   * clear-by-undefined `publicUrl` already relies on).
    *
-   * Also accepts an updater function, for the same reason `setServiceIntent`
+   * The updater form also exists for the same reason `setServiceIntent`
    * does (see its own doc above): a per-entry mutation — a grant, a revoke, a
    * prune — must read the CURRENT policy INSIDE the write chain
    * (`enqueueWrite` invokes it at execution time, not at call time), not a
@@ -867,27 +876,15 @@ export class AppConfigService {
    * not a type hole, it documents that guarantee at the one call site that
    * needs it.
    */
-  async setAccessPolicy(appName: string, access: undefined): Promise<AppConfig | null>;
   async setAccessPolicy(
     appName: string,
     updater: (existing: AppConfig) => AppAccessPolicy | undefined | typeof NO_CHANGE
-  ): Promise<AppConfig | null>;
-  async setAccessPolicy(
-    appName: string,
-    accessOrUpdater:
-      | undefined
-      | ((existing: AppConfig) => AppAccessPolicy | undefined | typeof NO_CHANGE)
   ): Promise<AppConfig | null> {
-    const updates:
-      | Partial<AppConfig>
-      | ((existing: AppConfig | undefined) => Partial<AppConfig> | typeof NO_CHANGE) =
-      typeof accessOrUpdater === 'function'
-        ? (existing: AppConfig | undefined) => {
-            const result = accessOrUpdater(existing as AppConfig);
-            if (result === NO_CHANGE) return NO_CHANGE;
-            return { access: mergeAccessProvenance(existing?.access, result) };
-          }
-        : { access: accessOrUpdater };
+    const updates = (existing: AppConfig | undefined): Partial<AppConfig> | typeof NO_CHANGE => {
+      const result = updater(existing as AppConfig);
+      if (result === NO_CHANGE) return NO_CHANGE;
+      return { access: mergeAccessProvenance(existing?.access, result) };
+    };
     return this.write(appName, updates, { create: false, system: true, restricted: 'access' });
   }
 

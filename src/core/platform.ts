@@ -142,6 +142,7 @@ import {
   describeAccessGateRefusal,
   resolveHttpsEffective,
   isGateApplied,
+  gateEnforced as computeGateEnforced,
   ACCESS_GATE_ENFORCEMENT_AVAILABLE,
   type AccessGateVerdict,
 } from '../managers/guardrail/access-gate';
@@ -4751,9 +4752,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       }
       // Whether the gate is actually going to be enforced for this app — the
       // condition `accessGuard` keys on.
-      const gateEnforced = Boolean(
-        accessPolicy && accessVerdict?.enforceable && ACCESS_GATE_ENFORCEMENT_AVAILABLE
-      );
+      const gateEnforced = computeGateEnforced(accessVerdict, Boolean(accessPolicy));
       // Narrower than the inverse of `gateEnforced`: true only when the kill
       // switch is the reason enforcement is off. Keying the hostname filter
       // and the `tls` override below on `gateEnforced` (i.e. relaxing them
@@ -4770,7 +4769,11 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       // ungated (DROP-153) — hence `!gateWithdrawn` rather than `accessPolicy`
       // alone.
       const gateWithdrawn = Boolean(accessPolicy && accessVerdict && !accessVerdict.featureEnabled);
-      if (accessPolicy && !gateWithdrawn) {
+      // Named once and reused below (hostname filter here, `tls` override in
+      // the per-domain loop) rather than repeating `accessPolicy &&
+      // !gateWithdrawn` at each site.
+      const gateStillAsserted = Boolean(accessPolicy && !gateWithdrawn);
+      if (gateStillAsserted) {
         // A gated app is not served on a plaintext or reserved hostname. The
         // inputs that would otherwise disable the gate — a `.localhost` entry
         // in `domains:`, `tls: {disabled: true}` — are TENANT-authored, so
@@ -4806,10 +4809,10 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       for (const hostname of domains) {
         const isLocalhost = isLocalhostDomain(hostname);
         // `tls.disabled` is tenant-authored; a gated app does not get to opt
-        // out of the transport its session cookie requires. Keyed on the same
-        // `accessPolicy && !gateWithdrawn` condition as the hostname filter
-        // above, not `gateEnforced` — see that condition's comment.
-        const tlsDisabled = accessPolicy && !gateWithdrawn ? false : dropYaml.config?.tls?.disabled;
+        // out of the transport its session cookie requires. Keyed on
+        // `gateStillAsserted`, not `gateEnforced` — see that condition's
+        // comment above.
+        const tlsDisabled = gateStillAsserted ? false : dropYaml.config?.tls?.disabled;
         const enableSsl = this.config.enableHttps && !isLocalhost && !tlsDisabled;
 
         await this.router.addRoute({
@@ -5141,36 +5144,21 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
    * the wrong axis to assert `true` on — see `handleConfigureRoute`'s own
    * `gateWithdrawn` handling, which this mirrors.
    *
-   * Kept from the withdrawal-writing round, repurposed for the LOG only (no
-   * behaviour they gate on any Caddy write anymore): whether the runtime
-   * reports an app `running`, and whether it is a monorepo group
-   * child/container, both change what is actually true to report, so an
-   * operator reading the log does not conclude action is required when none
-   * is.
+   * The kill-switch-off case is reported as ONE aggregate line naming every
+   * affected app, not a per-app message — mirroring the `unenforceable`
+   * summary below. An earlier version distinguished running vs. stopped
+   * (reading `runtime.getAllStatus()`) and monorepo group members (reading
+   * `assessAccessGate()`, which opens with a `parseDropYaml` parse) per app,
+   * but all three branches ended in the same "no action is required" text,
+   * so the distinction cost real boot time — a `listContainers` + N
+   * `inspect` + a per-container `stats` call under docker, plus a
+   * `parseDropYaml` per gated app — to choose between wording nobody acted
+   * on differently.
    */
   private async sweepAccessGates(): Promise<void> {
     const configs = this.appConfigService?.getAllConfigs() ?? [];
     const unenforceable: string[] = [];
-
-    // Resolved ONCE for the whole sweep, only if it will actually be read —
-    // the same runtime source `reconcileAppsOnBoot` reads rather than
-    // `AppState.status`, which is stale at boot.
-    let runningNames: Set<string> | undefined;
-    if (!this.config.enableAccessGate && this.runtime && configs.some((c) => c.access)) {
-      try {
-        const processes = await this.runtime.getAllStatus();
-        runningNames = new Set(
-          processes.filter((p) => p.status === 'running').map((p) => p.name)
-        );
-      } catch (error) {
-        this.logger.warn(
-          'Could not read runtime status while reporting access-gate policies; the ' +
-            "running/stopped distinction below will read as 'unknown'",
-          'ROUTER',
-          error
-        );
-      }
-    }
+    const withdrawn: string[] = [];
 
     for (const config of configs) {
       if (!config.access) {
@@ -5184,37 +5172,12 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       if (!this.config.enableAccessGate) {
         // There is no gate to apply while the switch is off, so "unapplied"
         // is the wrong axis to record `true` on (mirrors the route-emission
-        // fix). The log below says plainly what IS true — nobody reading it
-        // should conclude action is required.
+        // fix). Collected for the aggregate line below rather than logged
+        // per app — every app in this state ends at the same "no action is
+        // required" fact regardless of whether it is running or part of a
+        // monorepo group.
         await this.stateManager?.setAccessGateUnapplied(config.name, undefined);
-        if (runningNames && !runningNames.has(config.name)) {
-          this.logger.info(
-            `Access gate for '${config.name}' is switched off (DROP_FEATURE_ACCESS_GATE). It ` +
-              'is not currently running, so nothing is being served for it either way.',
-            'ROUTER'
-          );
-          continue;
-        }
-        const groupVerdict = await this.assessAccessGate(config.name);
-        if (
-          groupVerdict.blockers.includes('monorepo-group-child') ||
-          groupVerdict.blockers.includes('monorepo-group-container')
-        ) {
-          this.logger.info(
-            `Access gate for '${config.name}' is switched off (DROP_FEATURE_ACCESS_GATE). It is ` +
-              'part of a monorepo group; any guard already on the shared group host stays there ' +
-              "until the group's next route emission, but /verify is admitting every request in " +
-              'the meantime — no action is required.',
-            'ROUTER'
-          );
-          continue;
-        }
-        this.logger.info(
-          `Access gate for '${config.name}' is switched off (DROP_FEATURE_ACCESS_GATE). Any ` +
-            'guard already in Caddy for this app stays there until its next route emission, but ' +
-            '/verify is admitting every request in the meantime — no action is required.',
-          'ROUTER'
-        );
+        withdrawn.push(config.name);
         continue;
       }
       const verdict = await this.assessAccessGate(config.name);
@@ -5231,6 +5194,16 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           enforcementAvailable: ACCESS_GATE_ENFORCEMENT_AVAILABLE,
           reloadOutcome: 'skipped',
         })
+      );
+    }
+
+    if (withdrawn.length > 0) {
+      this.logger.info(
+        `${withdrawn.length} app(s) carry an access-gate policy that is not enforced ` +
+          `(DROP_FEATURE_ACCESS_GATE is switched off): ${withdrawn.join(', ')}. Any guard ` +
+          'already in Caddy for these apps stays there until their next route emission, but ' +
+          '/verify is admitting every request in the meantime — no action is required.',
+        'ROUTER'
       );
     }
 

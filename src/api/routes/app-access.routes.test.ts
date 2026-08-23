@@ -138,7 +138,7 @@ describe('/app-access (DROP-152 the gate)', () => {
       // right — canOpen's contract requires a policy — but it must be terminal,
       // not a redirect, or the app is bricked in a loop rather than with an
       // explanation.
-      await getAppConfigService().setAccessPolicy(APP, undefined);
+      await getAppConfigService().setAccessPolicy(APP, () => undefined);
       const res = await verify({ 'x-forwarded-uri': '/' });
       expect(res.status).toBe(403);
       expect(res.headers.get('location')).toBeNull();

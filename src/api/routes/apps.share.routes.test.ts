@@ -25,7 +25,7 @@ import { createUser, createApiKey, suspendUser, resetAuth } from '../middleware/
 import { getTestToken } from '../__testutils__/auth';
 import { getStateManager } from '../../managers/app/state-manager';
 import { getActivityLog } from '../../managers/activity';
-import { setPlatformOps, PlatformOps } from '../platform-ops';
+import { setPlatformOps, getPlatformOps, resetPlatformOps, PlatformOps } from '../platform-ops';
 import { makePlatformOpsStub } from '../__testutils__/platform-ops';
 import {
   createTestApiServer,
@@ -39,6 +39,8 @@ import {
 } from '../../managers/app/app-config';
 import { getSettingsManager, resetSettingsManager } from '../../managers/settings/settings-manager';
 import type { AccessGateVerdict, AccessGateBlocker } from '../../managers/guardrail/access-gate';
+import { MAX_USER_ID_LENGTH } from './access-limits';
+import * as atomicWrite from '../../utils/atomic-write';
 
 const ENFORCEABLE: AccessGateVerdict = {
   enforceable: true,
@@ -415,7 +417,8 @@ describe('/apps/:name/share (DROP-153 owner sharing)', () => {
       const spy = jest
         .spyOn(svc, 'setAccessPolicy')
         .mockImplementation(async (name: unknown, arg: unknown) => {
-          await real(name as string, undefined);
+          // The clear, in the updater form `setAccessPolicy` now takes.
+          await real(name as string, () => undefined);
           return real(name as string, arg as never);
         });
 
@@ -494,6 +497,151 @@ describe('/apps/:name/share (DROP-153 owner sharing)', () => {
       });
       expect(res.status).toBe(400);
     });
+
+    it('409s when a deploy is already in progress for this app', async () => {
+      wireOps({ isAppInProgress: jest.fn().mockReturnValue(true) });
+      const res = await post('myapp', bearer(ownerToken), {
+        username: targetUsername,
+        gateApp: true,
+      });
+      expect(res.status).toBe(409);
+      expect(getAppConfigService().getConfig('myapp')?.access).toBeUndefined();
+    });
+
+    it('rejects a missing username', async () => {
+      const res = await post('myapp', bearer(ownerToken), { gateApp: true });
+      expect(res.status).toBe(400);
+    });
+
+    it('rejects an empty username', async () => {
+      const res = await post('myapp', bearer(ownerToken), { username: '', gateApp: true });
+      expect(res.status).toBe(400);
+    });
+
+    it('rejects a username over the max length', async () => {
+      const res = await post('myapp', bearer(ownerToken), {
+        username: 'a'.repeat(MAX_USER_ID_LENGTH + 1),
+        gateApp: true,
+      });
+      expect(res.status).toBe(400);
+    });
+
+    it('surfaces applyError in the response when the re-emission on creation fails, without refusing the grant', async () => {
+      wireOps({ reconfigureRoute: jest.fn().mockRejectedValue(new Error('caddy validation failed')) });
+      const res = await post('myapp', bearer(ownerToken), { username: targetUsername, gateApp: true });
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as { data: { applyError?: string } };
+      expect(body.data.applyError).toBe('caddy validation failed');
+      // The grant itself still landed — a failed re-emission is reported, not rolled back.
+      expect(getAppConfigService().getConfig('myapp')?.access?.allow).toEqual([targetId]);
+    });
+
+    it('falls back to a generic applyError message when the re-emission rejects with a non-Error value', async () => {
+      wireOps({ reconfigureRoute: jest.fn().mockRejectedValue('not-an-error-instance') });
+      const res = await post('myapp', bearer(ownerToken), { username: targetUsername, gateApp: true });
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as { data: { applyError?: string } };
+      expect(body.data.applyError).toBe('Failed to re-emit the route');
+    });
+
+    it(
+      're-checks eligibility INSIDE the write closure — a target that was eligible at the ' +
+        'precheck but becomes ineligible before the write executes is still refused (SEC-7 TOCTOU)',
+      async () => {
+        // Establish an already-gated app so the second grant below does not
+        // hit the separate `needs-confirmation` branch first.
+        await post('myapp', bearer(ownerToken), { username: targetUsername, gateApp: true });
+        const bob = await createUser('toctou-bob', 'password123', 'user');
+
+        // The route's precheck (`grantIneligibleReason(getUser(username), ...)`,
+        // synchronous, before `setAccessPolicy` is even called) sees bob as
+        // eligible. This intercepts the write itself — the earliest point a
+        // concurrent suspension could land — and suspends bob right before the
+        // real updater runs, simulating exactly the race the write-closure
+        // re-check exists to close.
+        const svc = getAppConfigService();
+        const real = svc.setAccessPolicy.bind(svc);
+        const spy = jest
+          .spyOn(svc, 'setAccessPolicy')
+          .mockImplementation(async (name: unknown, arg: unknown) => {
+            await suspendUser(bob.id);
+            return real(name as string, arg as never);
+          });
+
+        const res = await post('myapp', bearer(ownerToken), { username: 'toctou-bob' });
+        expect(res.status).toBe(400);
+        const body = (await res.json()) as { error: { message: string } };
+        expect(body.error.message).toBe(`'toctou-bob' cannot be granted access to 'myapp'.`);
+        expect(getAppConfigService().getConfig('myapp')?.access?.allow).not.toContain(bob.id);
+
+        spy.mockRestore();
+      }
+    );
+
+    it('returns 503 when platform operations are unavailable', async () => {
+      resetPlatformOps();
+      expect(getPlatformOps()).toBeNull();
+      const res = await post('myapp', bearer(ownerToken), { username: targetUsername, gateApp: true });
+      expect(res.status).toBe(503);
+      wireOps(); // restore for anything that runs after this test in the same file
+    });
+
+    it(
+      'never writes to disk on ANY refusal arm across all three write routes (Gate 2 fix #6, ' +
+        'NO_CHANGE) — a spy reused across needs-confirmation, ineligible, already-granted, ' +
+        'cap-exceeded, non-owner-authored revoke and mixed-authorship clear',
+      async () => {
+        const writeSpy = jest.spyOn(atomicWrite, 'writeFileAtomic');
+        writeSpy.mockClear();
+
+        // needs-confirmation: no gateApp on an app with no policy yet.
+        await post('myapp', bearer(ownerToken), { username: targetUsername });
+        expect(writeSpy).not.toHaveBeenCalled();
+
+        // ineligible: a suspended target.
+        await suspendUser(targetId);
+        await post('myapp', bearer(ownerToken), { username: targetUsername, gateApp: true });
+        expect(writeSpy).not.toHaveBeenCalled();
+
+        // One real write to seed a policy for the remaining arms.
+        await createUser('writecheck-bob', 'password123', 'user');
+        await post('myapp', bearer(ownerToken), { username: 'writecheck-bob', gateApp: true });
+        expect(writeSpy).toHaveBeenCalledTimes(1);
+        writeSpy.mockClear();
+
+        // already-granted: idempotent re-grant.
+        await post('myapp', bearer(ownerToken), { username: 'writecheck-bob' });
+        expect(writeSpy).not.toHaveBeenCalled();
+
+        // cap-exceeded: seed a full allow-list directly (cheap — bypasses 200 real POSTs).
+        const filler = Array.from({ length: 200 }, (_, i) => `filler-${i}`);
+        await getAppConfigService().setAccessPolicy('myapp', () => ({
+          mode: 'drop-users' as const,
+          allow: filler,
+          grantedBy: Object.fromEntries(filler.map(id => [id, ownerId])),
+        }));
+        writeSpy.mockClear();
+        await createUser('writecheck-newperson', 'password123', 'user');
+        await post('myapp', bearer(ownerToken), { username: 'writecheck-newperson' });
+        expect(writeSpy).not.toHaveBeenCalled();
+
+        // non-owner-authored revoke: an admin-authored entry.
+        await getAppConfigService().setAccessPolicy('myapp', existing => ({
+          mode: 'drop-users' as const,
+          allow: [...(existing.access?.allow ?? []), 'admin-entry-id'],
+          grantedBy: existing.access?.grantedBy,
+        }));
+        writeSpy.mockClear();
+        await delOne('myapp', 'admin-entry-id', bearer(ownerToken));
+        expect(writeSpy).not.toHaveBeenCalled();
+
+        // mixed-authorship clear: the policy above still carries admin-entry-id.
+        await del('myapp', bearer(ownerToken));
+        expect(writeSpy).not.toHaveBeenCalled();
+
+        writeSpy.mockRestore();
+      }
+    );
   });
 
   describe('DELETE /:userId (revoke)', () => {
@@ -607,6 +755,32 @@ describe('/apps/:name/share (DROP-153 owner sharing)', () => {
       await delOne('myapp', targetId, bearer(ownerToken));
       expect(reconfigureRoute).toHaveBeenCalledWith('myapp');
     });
+
+    it('409s when a deploy is already in progress for this app', async () => {
+      await post('myapp', bearer(ownerToken), { username: targetUsername, gateApp: true });
+      wireOps({ isAppInProgress: jest.fn().mockReturnValue(true) });
+      const res = await delOne('myapp', targetId, bearer(ownerToken));
+      expect(res.status).toBe(409);
+      // Unrevoked — the conflict refused the write before it ran.
+      expect(getAppConfigService().getConfig('myapp')?.access?.allow).toEqual([targetId]);
+    });
+
+    it('rejects a userId over the max length', async () => {
+      const res = await delOne('myapp', 'x'.repeat(MAX_USER_ID_LENGTH + 1), bearer(ownerToken));
+      expect(res.status).toBe(400);
+    });
+
+    it('surfaces applyError when the unapplied-retry re-emission itself fails', async () => {
+      await post('myapp', bearer(ownerToken), { username: targetUsername, gateApp: true });
+      await getStateManager().setAccessGateUnapplied('myapp', true);
+      wireOps({ reconfigureRoute: jest.fn().mockRejectedValue(new Error('still refuses to load')) });
+
+      const res = await delOne('myapp', targetId, bearer(ownerToken));
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as { data: { applyError?: string; revoked: boolean } };
+      expect(body.data.revoked).toBe(true);
+      expect(body.data.applyError).toBe('still refuses to load');
+    });
   });
 
   describe('DELETE /share (clear)', () => {
@@ -685,6 +859,51 @@ describe('/apps/:name/share (DROP-153 owner sharing)', () => {
       const { entries } = getActivityLog().getEntries(10);
       const entry = entries.find(e => e.action === 'access-share-cleared' && e.appName === 'myapp');
       expect(entry?.detail).toContain('admin');
+    });
+
+    it('409s when a deploy is already in progress for this app', async () => {
+      await post('myapp', bearer(ownerToken), { username: targetUsername, gateApp: true });
+      wireOps({ isAppInProgress: jest.fn().mockReturnValue(true) });
+      const res = await del('myapp', bearer(ownerToken));
+      expect(res.status).toBe(409);
+      expect(getAppConfigService().getConfig('myapp')?.access).toBeDefined();
+    });
+
+    it('is a no-op (200), not a distinct refusal, when the app has a config but no policy at all', async () => {
+      // Distinct from the mixed-authorship 409 above: this app has never had
+      // an access policy at all, not merely one with an admin-authored entry.
+      const res = await del('myapp', bearer(ownerToken));
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as { data: { cleared: boolean; message: string } };
+      expect(body.data.cleared).toBe(false);
+      expect(body.data.message).toBe(`'myapp' has no access policy to clear`);
+    });
+
+    it('is a no-op (200) with the SAME "nothing to clear" shape as revoke, for an app with no config file at all', async () => {
+      // A config-less app (registered in state, never reached app:detected) —
+      // setAccessPolicy's create:false returns null, hitting the OTHER
+      // "nothing to do" branch (distinct from the one above, which has a
+      // config but no `access` field).
+      await getStateManager().registerApp('pending-app', path.join(t.tempDir, 'webapps', 'pending-app'));
+      await getStateManager().updateApp('pending-app', { userId: ownerId });
+      const res = await del('pending-app', bearer(ownerToken));
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as { data: { cleared: boolean; message: string } };
+      expect(body.data.cleared).toBe(false);
+      expect(body.data.message).toBe(`Nothing to clear for 'pending-app'`);
+    });
+
+    it('surfaces applyError when the clear re-emission itself fails', async () => {
+      await post('myapp', bearer(ownerToken), { username: targetUsername, gateApp: true });
+      wireOps({ reconfigureRoute: jest.fn().mockRejectedValue(new Error('caddy is down')) });
+
+      const res = await del('myapp', bearer(ownerToken));
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as { data: { cleared: boolean; applyError?: string } };
+      expect(body.data.cleared).toBe(true);
+      expect(body.data.applyError).toBe('caddy is down');
+      // The clear itself still landed — a failed re-emission is reported, not rolled back.
+      expect(getAppConfigService().getConfig('myapp')?.access).toBeUndefined();
     });
   });
 

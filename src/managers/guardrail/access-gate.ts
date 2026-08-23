@@ -284,6 +284,23 @@ export function isGateApplied(opts: {
   return opts.enforceable && opts.enforcementAvailable && opts.reloadOutcome === 'ok';
 }
 
+/**
+ * Whether a gate is actually ENFORCED for this app right now — as opposed to
+ * whether the box could enforce one. A persisted policy on a build with no
+ * guard emitter is a record, not a control, and every caller answering
+ * "gated?" reports this, not merely whether a policy exists.
+ *
+ * `verdict` is optional so a caller that has not yet resolved one (or
+ * resolved none) still gets a definite `false` rather than having to guard
+ * the call itself.
+ */
+export function gateEnforced(
+  verdict: { enforceable: boolean } | undefined,
+  hasPolicy: boolean
+): boolean {
+  return Boolean(hasPolicy && verdict?.enforceable && ACCESS_GATE_ENFORCEMENT_AVAILABLE);
+}
+
 /** The refusal message for a route or a log line, from a verdict. */
 export function describeAccessGateRefusal(appName: string, verdict: AccessGateVerdict): string {
   return (

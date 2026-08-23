@@ -19,7 +19,7 @@ import { getTestToken } from '../__testutils__/auth';
 import { getStateManager, resetStateManager } from '../../managers/app/state-manager';
 import { getSettingsManager, resetSettingsManager } from '../../managers/settings/settings-manager';
 import { resetPlatformOps } from '../platform-ops';
-import { getPublicUrl, setPublicUrl } from '../runtime-config';
+import { getPublicUrl, setPublicUrl, setApiRuntimeConfig } from '../runtime-config';
 import * as activityModule from '../../managers/activity';
 
 interface GithubWebhookPayload {
@@ -597,6 +597,65 @@ describe('admin settings routes (PRD-041)', () => {
       expect(logSpy.mock.calls[0][1]).toMatchObject({ action: 'app-sharing-set' });
     });
 
+    // The contradictory combination (plan item 1). Reported at ENABLE time, not
+    // at boot: the gate switch is a boot-time env var while this one is
+    // runtime-settable, so the contradiction is created by this very request
+    // and a start() check could never see it. Sharing is not refused for it —
+    // the two are independent controls — but without this the admin who caused
+    // it gets a plain 200 while every owner's share is refused, naming a kill
+    // switch the owner cannot see.
+    it('warns when sharing is enabled while the access gate is switched off', async () => {
+      setApiRuntimeConfig({ accessGateEnabled: false });
+      try {
+        const res = await putAppSharing(true);
+        expect(res.status).toBe(200);
+        const body = (await res.json()) as ApiEnvelope<AppSharingPayload & { warning?: string }>;
+        expect(body.data?.enabled).toBe(true);
+        expect(body.data?.warning).toMatch(/access gate is switched off/i);
+      } finally {
+        setApiRuntimeConfig({ accessGateEnabled: true });
+      }
+    });
+
+    it('does not warn when the gate is on, nor when merely disabling sharing', async () => {
+      setApiRuntimeConfig({ accessGateEnabled: true });
+      const on = (await (await putAppSharing(true)).json()) as ApiEnvelope<
+        AppSharingPayload & { warning?: string }
+      >;
+      expect(on.data?.warning).toBeUndefined();
+
+      setApiRuntimeConfig({ accessGateEnabled: false });
+      try {
+        const off = (await (await putAppSharing(false)).json()) as ApiEnvelope<
+          AppSharingPayload & { warning?: string }
+        >;
+        expect(off.data?.warning).toBeUndefined();
+      } finally {
+        setApiRuntimeConfig({ accessGateEnabled: true });
+      }
+    });
+
+    it('rejects a non-object JSON body with 400 without mutating state', async () => {
+      // A top-level number/string/array/null body would make `body.enabled`
+      // undefined and fall straight into the "not a boolean" branch UNLESS a
+      // dereference on `null`/an array first throws a TypeError and surfaces
+      // as a 500 — the same object-shape guard as PUT /settings/user-connectors.
+      await putAppSharing(true);
+      expect(getSettingsManager().getAppSharingEnabled()).toBe(true);
+
+      for (const rawBody of ['123', '"foo"', '[]', 'null']) {
+        const res = await hono.request('/api/v1/admin/settings/app-sharing', {
+          method: 'PUT',
+          headers: authHeader(adminToken),
+          body: rawBody,
+        });
+        expect(res.status).toBe(400);
+        const body = (await res.json()) as ApiEnvelope<never>;
+        expect(body.error?.code).toBe('VALIDATION_ERROR');
+      }
+      expect(getSettingsManager().getAppSharingEnabled()).toBe(true);
+    });
+
     it('rejects a non-admin request with 403', async () => {
       await createUser('regular4', 'password123', 'user');
       const userToken = await getTestToken('regular4', 'password123');
@@ -614,3 +673,4 @@ describe('admin settings routes (PRD-041)', () => {
     });
   });
 });
+

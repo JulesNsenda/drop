@@ -12,9 +12,7 @@
  * stops a malformed name reaching path/YAML construction below.
  *
  * Every route shares five refusals, applied in the same order, factored into
- * `resolveShareRequest` below (Gate 2 finding: this preamble used to be
- * copy-pasted ~35 lines per handler, in an order only a prose comment
- * enforced):
+ * `resolveShareRequest` below:
  *
  *  1. `requireAuthForAccessRoutes()` — on an auth-disabled box no role
  *     middleware is registered for these paths at all (server.ts wires it
@@ -49,9 +47,7 @@
  * entry is decided against the REQUESTER (whoever is calling, owner or
  * admin), not against the app's owner specifically — an admin who grants
  * through this route administers that grant the same way an owner would
- * administer theirs (Gate 2 finding: the clear-all route used to check
- * "does `grantedBy` have any value at all", which let it destroy an
- * admin-authored entry that the single-entry revoke correctly refuses).
+ * administer theirs.
  *
  * A grant target that cannot be granted access — nonexistent, the app's own
  * owner, an admin, or suspended — is refused with ONE generic message and
@@ -104,7 +100,7 @@ import { success, error, ErrorCodes } from '../types';
 import { NotFoundError, ValidationError } from '../middleware/error';
 import { AuthContext, getUser, getUserById, type SafeUser } from '../middleware/auth';
 import { canAccess, interactiveSessionOnly } from '../access';
-import { getPlatformOps, type PlatformOps } from '../platform-ops';
+import { getPlatformOps, AppInProgressError, type PlatformOps } from '../platform-ops';
 import { getStateManager, type AppState } from '../../managers/app/state-manager';
 import {
   getAppConfigService,
@@ -114,49 +110,29 @@ import {
 } from '../../managers/app/app-config';
 import { getSettingsManager } from '../../managers/settings/settings-manager';
 import { logActivityFor } from '../../managers/activity';
-import { ACCESS_GATE_ENFORCEMENT_AVAILABLE } from '../../managers/guardrail/access-gate';
+import { gateEnforced } from '../../managers/guardrail/access-gate';
 import { MAX_ACCESS_ALLOW_ENTRIES, MAX_USER_ID_LENGTH, requireAuthForAccessRoutes } from './access-limits';
 
 const shareRoutes = new Hono();
 
+/** The shared 409 for a write that lands while the app has an operation in progress. */
+function inProgressResponse(c: Context, name: string) {
+  return c.json(error(ErrorCodes.CONFLICT, new AppInProgressError(name).message), 409);
+}
+
 /**
- * Whether owner-initiated sharing is enabled at all right now.
- *
- * Read live on every call — see the file header on why this is a
- * `getSettingsManager()` read rather than a `runtime-config` accessor.
+ * Re-emits the route for `name`, the way every write handler below recovers
+ * from a Caddy reload failure: the policy is already persisted by the time
+ * this runs, so a thrown error here becomes `applyError` in the response
+ * rather than a failed request — the write itself already succeeded.
  */
-function sharingDisabledRefusal(): string | null {
-  if (!getSettingsManager().getAppSharingEnabled()) {
-    return 'Owner-initiated app sharing is disabled on this platform.';
+async function reEmit(ops: PlatformOps, name: string): Promise<string | undefined> {
+  try {
+    await ops.reconfigureRoute(name);
+    return undefined;
+  } catch (err) {
+    return err instanceof Error ? err.message : 'Failed to re-emit the route';
   }
-  return null;
-}
-
-/** The message used for both a genuinely nonexistent target and a stale write. */
-function stillDeployingResponse(name: string) {
-  return error(
-    ErrorCodes.CONFLICT,
-    `Application '${name}' is still being deployed — try again once it has finished.`
-  );
-}
-
-/**
- * Whether a gate is actually ENFORCED for this app right now — as opposed to
- * whether the box could enforce one. A persisted policy on a build with no
- * guard emitter is a record, not a control (Gate 2 finding: the previous
- * `gated` field answered only "is there a policy?", the exact read the kill
- * switch exists to eliminate).
- *
- * A deliberate DUPLICATE of `gateEnforced` in apps.ts, not an import from
- * it: apps.ts imports THIS file (`apps.route('/', shareRoutes)`), so
- * importing the function back out of apps.ts would close a require cycle —
- * `access-limits.ts`'s own header documents why this pair of route files
- * shares constants through a leaf module instead. Both copies read the same
- * `ACCESS_GATE_ENFORCEMENT_AVAILABLE` constant from `guardrail/access-gate`,
- * so they cannot drift on the one part of the predicate that could change.
- */
-function gateEnforced(verdict: { enforceable: boolean }, hasPolicy: boolean): boolean {
-  return hasPolicy && verdict.enforceable && ACCESS_GATE_ENFORCEMENT_AVAILABLE;
 }
 
 /** The caller's own grants (id + username) plus a COUNT of everyone else's. */
@@ -203,7 +179,6 @@ function refuseGrantTarget(name: string, username: string, reason: GrantIneligib
 }
 
 type ResolvedShareRequest = {
-  auth: AuthContext | undefined;
   requester: AuthContext;
   name: string;
   app: AppState;
@@ -230,13 +205,19 @@ async function resolveShareRequest(c: Context, action: string): Promise<Resolved
 
   const name = c.req.param('name') as string;
   const app = getStateManager().getApp(name);
-  if (!app || !canAccess(auth, app)) {
+  if (!app || !canAccess(requester, app)) {
     throw new NotFoundError(`Application '${name}' not found`);
   }
 
-  const disabledRefusal = sharingDisabledRefusal();
-  if (disabledRefusal) {
-    return c.json(error(ErrorCodes.UNAUTHORIZED, disabledRefusal, { reason: 'sharing_disabled' }), 403);
+  // Read live on every call — see the file header on why this is a
+  // `getSettingsManager()` read rather than a `runtime-config` accessor.
+  if (!getSettingsManager().getAppSharingEnabled()) {
+    return c.json(
+      error(ErrorCodes.UNAUTHORIZED, 'Owner-initiated app sharing is disabled on this platform.', {
+        reason: 'sharing_disabled',
+      }),
+      403
+    );
   }
 
   const ops = getPlatformOps();
@@ -244,7 +225,7 @@ async function resolveShareRequest(c: Context, action: string): Promise<Resolved
     return c.json(error(ErrorCodes.SERVICE_UNAVAILABLE, 'Platform operations unavailable'), 503);
   }
 
-  return { auth, requester, name, app, ops };
+  return { requester, name, app, ops };
 }
 
 // GET /apps/:name/share — the owner's own view of who has access.
@@ -298,17 +279,14 @@ shareRoutes.get('/:name/share', async c => {
 shareRoutes.post('/:name/share', async c => {
   const resolved = await resolveShareRequest(c, 'Sharing an app');
   if (resolved instanceof Response) return resolved;
-  const { auth, requester, name, app, ops } = resolved;
-  const isAdminCaller = auth?.role === 'admin';
+  const { requester, name, app, ops } = resolved;
+  const isAdminCaller = requester.role === 'admin';
 
   // Pre-check, before anything is persisted — same reason the admin PUT
   // /access route pre-checks: a deploy in flight makes the re-emission below
   // throw, and by then the policy would already be on disk.
   if (ops.isAppInProgress(name)) {
-    return c.json(
-      error(ErrorCodes.CONFLICT, `Application '${name}' has an operation in progress`),
-      409
-    );
+    return inProgressResponse(c, name);
   }
 
   // Enforceability, POST ONLY — matching the admin PUT /access route's own
@@ -411,7 +389,13 @@ shareRoutes.post('/:name/share', async c => {
   });
 
   if (!updatedConfig) {
-    return c.json(stillDeployingResponse(name), 409);
+    return c.json(
+      error(
+        ErrorCodes.CONFLICT,
+        `Application '${name}' is still being deployed — try again once it has finished.`
+      ),
+      409
+    );
   }
   if (grant.outcome === 'needs-confirmation') {
     return c.json(
@@ -447,11 +431,7 @@ shareRoutes.post('/:name/share', async c => {
   let applyError: string | undefined;
   const justCreated = !grant.hadPolicyBefore && grant.outcome === 'granted';
   if (justCreated || app.accessGateUnapplied === true) {
-    try {
-      await ops.reconfigureRoute(name);
-    } catch (err) {
-      applyError = err instanceof Error ? err.message : 'Failed to re-emit the route';
-    }
+    applyError = await reEmit(ops, name);
   }
 
   if (grant.outcome === 'granted') {
@@ -462,7 +442,7 @@ shareRoutes.post('/:name/share', async c => {
     // indistinguishable owner action (Gate 2 finding).
     const detail =
       isAdminCaller && requester.userId !== app.userId ? `${username} (admin-granted)` : username;
-    await logActivityFor(auth, { action: 'access-share-granted', appName: name, detail });
+    await logActivityFor(requester, { action: 'access-share-granted', appName: name, detail });
   }
 
   // The caller's own view only, mirroring GET — never the whole `allow`
@@ -491,14 +471,11 @@ shareRoutes.post('/:name/share', async c => {
 shareRoutes.delete('/:name/share/:userId', async c => {
   const resolved = await resolveShareRequest(c, 'Revoking an app share');
   if (resolved instanceof Response) return resolved;
-  const { auth, requester, name, app, ops } = resolved;
-  const isAdminCaller = auth?.role === 'admin';
+  const { requester, name, app, ops } = resolved;
+  const isAdminCaller = requester.role === 'admin';
 
   if (ops.isAppInProgress(name)) {
-    return c.json(
-      error(ErrorCodes.CONFLICT, `Application '${name}' has an operation in progress`),
-      409
-    );
+    return inProgressResponse(c, name);
   }
 
   const targetUserId = c.req.param('userId');
@@ -547,11 +524,7 @@ shareRoutes.delete('/:name/share/:userId', async c => {
   // that apply is stuck IS the retry.
   let applyError: string | undefined;
   if (revoke.removed && app.accessGateUnapplied === true) {
-    try {
-      await ops.reconfigureRoute(name);
-    } catch (err) {
-      applyError = err instanceof Error ? err.message : 'Failed to re-emit the route';
-    }
+    applyError = await reEmit(ops, name);
   }
 
   if (revoke.removed) {
@@ -560,7 +533,7 @@ shareRoutes.delete('/:name/share/:userId', async c => {
       isAdminCaller && revoke.grantor !== app.userId
         ? `${targetUserId} (admin-revoked)`
         : targetUserId;
-    await logActivityFor(auth, { action: 'access-share-revoked', appName: name, detail });
+    await logActivityFor(requester, { action: 'access-share-revoked', appName: name, detail });
   }
 
   return c.json(
@@ -590,14 +563,11 @@ shareRoutes.delete('/:name/share/:userId', async c => {
 shareRoutes.delete('/:name/share', async c => {
   const resolved = await resolveShareRequest(c, 'Clearing an app share policy');
   if (resolved instanceof Response) return resolved;
-  const { auth, requester, name, app, ops } = resolved;
-  const isAdminCaller = auth?.role === 'admin';
+  const { requester, name, app, ops } = resolved;
+  const isAdminCaller = requester.role === 'admin';
 
   if (ops.isAppInProgress(name)) {
-    return c.json(
-      error(ErrorCodes.CONFLICT, `Application '${name}' has an operation in progress`),
-      409
-    );
+    return inProgressResponse(c, name);
   }
 
   const clear: { cleared: boolean; refusedMixed: boolean } = { cleared: false, refusedMixed: false };
@@ -635,15 +605,11 @@ shareRoutes.delete('/:name/share', async c => {
   // like the admin DELETE /access route.
   let applyError: string | undefined;
   if (clear.cleared) {
-    try {
-      await ops.reconfigureRoute(name);
-    } catch (err) {
-      applyError = err instanceof Error ? err.message : 'Failed to re-emit the route';
-    }
+    applyError = await reEmit(ops, name);
     // Same admin-attribution reasoning as POST's grant log — see there. A
     // clear only ever succeeds when every entry was requester-authored, so
     // an admin requester means none of them were owner-authored.
-    await logActivityFor(auth, {
+    await logActivityFor(requester, {
       action: 'access-share-cleared',
       appName: name,
       ...(isAdminCaller && requester.userId !== app.userId

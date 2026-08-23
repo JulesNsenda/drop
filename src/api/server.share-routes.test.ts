@@ -23,6 +23,7 @@ import { getTestToken } from './__testutils__/auth';
 import { createTestApiServer, teardownTestApiServer, type TestApiServer } from './__testutils__/api-server';
 import { getStateManager } from '../managers/app/state-manager';
 import * as path from 'path';
+import * as jose from 'jose';
 
 describe('dedicated /apps/*/share* rate-limit bucket and role floor (DROP-153)', () => {
   let t: TestApiServer;
@@ -97,6 +98,27 @@ describe('dedicated /apps/*/share* rate-limit bucket and role floor (DROP-153)',
       );
       expect(res.status).toBe(403);
     });
+
+    it('was never double-matched by the share wildcard pair — the three-segment shape only ever matched one share-specific pattern', async () => {
+      // Not the bug this fix targets: `/apps/:name/share` (or its old
+      // wildcard equivalent `/apps/*/share`) has no fourth segment, so it
+      // never matched this three-segment path either way. 3, not 2, IS the
+      // correct baseline here — unrelated to this fix, it comes from the
+      // general mutating-method guard (server.ts, `/apps/*` DELETE/PUT/PATCH/
+      // POST branch) ALSO running authMiddleware('user') for a DELETE, on
+      // top of the share-specific pass and the general readonly pass. This
+      // just confirms the wildcard-vs-named-param change didn't add a
+      // FOURTH.
+      const verifySpy = jest.spyOn(jose, 'jwtVerify');
+      const res = await t.hono.request(
+        '/api/v1/apps/test-app/share/some-user-id',
+        { method: 'DELETE', headers: authHeader(ownerToken) },
+        fromLoopback
+      );
+      expect(res.status).not.toBe(401);
+      expect(verifySpy).toHaveBeenCalledTimes(3);
+      verifySpy.mockRestore();
+    });
   });
 
   describe('GET/POST /apps/:name/share', () => {
@@ -136,6 +158,30 @@ describe('dedicated /apps/*/share* rate-limit bucket and role floor (DROP-153)',
         fromLoopback
       );
       expect(res.status).toBe(403);
+    });
+
+    it('does not double-run the share-specific authMiddleware pass on the two-segment path', async () => {
+      // Counts real jose signature verifications, not registrations - a
+      // 200/401 pass/fail can't distinguish one extra auth pass from none.
+      // The general '/apps/*' readonly guard (server.ts, registered after
+      // every specific one) matches every /apps/* request too, so 2 real
+      // verifications is the baseline a GET on any single-path-form
+      // protected route gets (e.g. GET /apps/*/access) - not a bug. Before
+      // this fix, registering the share role floor as a wildcard PAIR
+      // (`/apps/*/share` + `/apps/*/share/*`) made the second pattern ALSO
+      // match this two-segment path, measured at 3 real verifications for
+      // one request. Named-param registration (`/apps/:name/share` +
+      // `/apps/:name/share/:userId`) matches disjoint path shapes, so this
+      // path gets back to the 2-verification baseline.
+      const verifySpy = jest.spyOn(jose, 'jwtVerify');
+      const res = await t.hono.request(
+        '/api/v1/apps/test-app/share',
+        { method: 'GET', headers: authHeader(ownerToken) },
+        fromLoopback
+      );
+      expect(res.status).not.toBe(401);
+      expect(verifySpy).toHaveBeenCalledTimes(2);
+      verifySpy.mockRestore();
     });
   });
 

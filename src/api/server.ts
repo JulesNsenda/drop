@@ -417,8 +417,14 @@ export class ApiServer {
       // the two-segment form alone would leave DELETE /apps/:name/share/:userId
       // with no explicit role floor, falling through to the general /apps/*
       // guard below instead of failing closed on its own.
-      v1.use('/apps/*/share', authMiddleware('user'));
-      v1.use('/apps/*/share/*', authMiddleware('user'));
+      //
+      // Named-param patterns, not wildcards — same reason as the rate-limit
+      // bucket above: a wildcard pair here double-counted the two-segment
+      // form, running a full extra authMiddleware pass (a real jose signature
+      // verification, with no early-out when a context is already set) on
+      // every GET/POST /apps/:name/share.
+      v1.use('/apps/:name/share', authMiddleware('user'));
+      v1.use('/apps/:name/share/:userId', authMiddleware('user'));
       // start/stop/restart mutate runtime state (and, on restart, tear down
       // and recreate the process/container) — read-only tokens must not
       // reach them. Register before the general /apps/* guard.
