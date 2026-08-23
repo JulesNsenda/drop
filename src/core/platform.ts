@@ -136,7 +136,7 @@ import {
 } from '../managers/log-retention/log-retention';
 import { hasEnoughDisk, getMinFreeDiskMb } from '../utils/disk';
 import { getAccessLog, resetAccessLog } from '../managers/access-log/access-log';
-import { sessionCookieName as appSessionCookieName } from '../api/routes/app-access';
+import { sessionCookieName as appSessionCookieName } from '../api/app-access/names';
 import {
   assessAccessGate,
   describeAccessGateRefusal,
@@ -4709,7 +4709,10 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         ? this.appConfigService.getConfig(appName)?.access
         : undefined;
       const accessKnown = Boolean(this.appConfigService);
-      const accessVerdict = accessPolicy ? await this.assessAccessGate(appName, dropYaml) : undefined;
+      // `domains` here is the post-filter list this method is about to route.
+      const accessVerdict = accessPolicy
+        ? await this.assessAccessGate(appName, dropYaml, domains)
+        : undefined;
       if (accessVerdict && !accessVerdict.enforceable) {
         this.logger.error(
           `${describeAccessGateRefusal(appName, accessVerdict)}. Refusing to emit the access ` +
@@ -4744,8 +4747,6 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         accessPolicy && accessVerdict?.enforceable && ACCESS_GATE_ENFORCEMENT_AVAILABLE
           ? {
               appName,
-              // Filled in per hostname below.
-              origin: '',
               verifyUpstream: `127.0.0.1:${this.config.apiPort}`,
               cookieName: appSessionCookieName(appName),
             }
@@ -4783,13 +4784,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           // is indistinguishable from "unchanged". Turning a guard off used to
           // leave it in the Caddyfile for the life of the process.
           mcpAuth: mcpGuard,
-          // The browser access gate. `origin` is the hostname THIS block
-          // serves, baked in at generation time — never derived at request
-          // time from `Host`/`X-Forwarded-Host`, which `forward_auth` carries
-          // from the client (SEC-2).
-          accessAuth: accessGuard
-            ? { ...accessGuard, origin: `${enableSsl ? 'https' : 'http'}://${hostname}` }
-            : undefined,
+          accessAuth: accessGuard,
         });
 
         const protocol = enableSsl ? 'https' : 'http';
@@ -4927,7 +4922,23 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
    */
   private async assessAccessGate(
     appName: string,
-    parsed?: DropYamlParseResult
+    parsed?: DropYamlParseResult,
+    /**
+     * The hostnames the caller is ACTUALLY about to route this app on.
+     *
+     * Load-bearing. Without it this method resolved its own list straight from
+     * the tenant's `drop.yaml`, while `handleConfigureRoute` routed the
+     * ownership-filtered `acceptedCustomDomains` (falling back to the default
+     * host). A tenant could make the two disagree with one line of a file they
+     * own — a second `domains:` entry trips `multi-hostname`, a reserved one
+     * empties the list and trips `no-https` — at which point the verdict
+     * refuses, no guard is emitted, and **the app is still served, ungated**.
+     *
+     * That is the same off-switch already closed for `tls: {disabled: true}`
+     * and for `.localhost` entries, reached through a third door. The verdict
+     * now describes the set that is really being emitted.
+     */
+    routedHostnames?: string[]
   ): Promise<AccessGateVerdict> {
     const dropYaml =
       parsed ?? (await parseDropYaml(path.join(this.config.appsDirectory, appName)));
@@ -4946,7 +4957,8 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     if (config?.group && dropYaml.success && dropYaml.config?.route && !hasCustomDomains) {
       hostnames = [`${config.group}.${suffix}`];
     }
-    hostnames = this.gateRoutableHostnames(hostnames, suffix);
+    // The caller's list wins when it has one — see `routedHostnames`.
+    hostnames = this.gateRoutableHostnames(routedHostnames ?? hostnames, suffix);
 
     return assessAccessGate({
       isolation: this.config.isolation === 'docker' ? 'docker' : 'none',

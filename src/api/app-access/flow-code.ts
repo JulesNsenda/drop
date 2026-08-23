@@ -66,9 +66,53 @@ function pruneExpired(): void {
   }
 }
 
+/**
+ * Live flows: minted by the verify hop, spent by the first code minted against
+ * them.
+ *
+ * Without this the flow id was **caller-supplied at mint and unlimited-use** —
+ * so anyone who merely OBSERVED a live flow id could mint a code bound to it
+ * and hand the victim a session as themselves. And a flow id is far more
+ * observable than a code: it transits two URLs on the platform host for its
+ * whole 300s life, in a query string Caddy logs, and rides a cross-origin
+ * navigation's `Referer`.
+ *
+ * That made the binding weaker than the credential it was protecting, which is
+ * the opposite of what `mintAppAccessCode`'s own header claims. A flow now has
+ * to have been STARTED by a verify hop, and it is consumed by the first mint.
+ */
+const liveFlows = new Map<string, number>();
+
+/** 300s, matching the flow cookie's own Max-Age. */
+const FLOW_TTL_MS = 300_000;
+
+function pruneFlows(): void {
+  const now = Date.now();
+  for (const [id, expiry] of liveFlows) {
+    if (expiry <= now) liveFlows.delete(id);
+  }
+}
+
 /** A random flow id, minted by the verify hop and echoed by the browser's cookie. */
 export function mintFlowId(): string {
-  return crypto.randomBytes(24).toString('base64url');
+  pruneFlows();
+  const id = crypto.randomBytes(24).toString('base64url');
+  liveFlows.set(id, Date.now() + FLOW_TTL_MS);
+  return id;
+}
+
+/**
+ * Spend a flow, or refuse.
+ *
+ * Delete-before-check, like the code store: a flow is single-mint, so two
+ * concurrent attempts cannot both succeed. An id that was never started by a
+ * verify hop — including one an attacker read out of a log — is not here.
+ */
+export function consumeFlowId(flowId: string): boolean {
+  pruneFlows();
+  const expiry = liveFlows.get(flowId);
+  liveFlows.delete(flowId);
+  return expiry !== undefined && expiry > Date.now();
 }
 
 /** Mint a single-use code for one authenticated user in one flow. */
@@ -121,7 +165,8 @@ function timingSafeEqualStrings(a: string, b: string): boolean {
   return crypto.timingSafeEqual(ab, bb);
 }
 
-/** Clear the store (tests). */
+/** Clear the stores (tests). */
 export function __resetAppAccessCodes(): void {
   codes.clear();
+  liveFlows.clear();
 }

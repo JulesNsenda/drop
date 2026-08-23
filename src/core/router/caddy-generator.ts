@@ -14,6 +14,9 @@ import {
   AccessAuthConfig,
 } from './router.types';
 import { DnsProvider } from './dns-challenge';
+// A leaf module, so the generator and the route that serves this path
+// cannot drift apart.
+import { EXCHANGE_PATH } from '../../api/app-access/names';
 
 /**
  * Check if a hostname is a localhost domain (e.g., myapp.localhost)
@@ -196,7 +199,16 @@ export function generateRouteBlock(
  * order among themselves, so "first" is meaningful here.
  */
 function generateAccessGatedTail(route: RouteConfig, access: AccessAuthConfig): CaddyDirective[] {
-  return [generateExchangeHandle(route, access), generateAccessGuardHandle(route, access)];
+  // The inner guards come from `generateGuardHandles` — the same list the
+  // ungated path uses — so a guard added there is picked up by BOTH shapes.
+  // Reaching for `route.mcpAuth` directly here would have meant the next guard
+  // was silently skipped on every gated app while the dashboard reported it as
+  // protected: the exact failure the `guards.length` derivation exists to
+  // prevent, reintroduced one layer up.
+  return [
+    generateExchangeHandle(route, access),
+    generateAccessGuardHandle(route, access, generateGuardHandles(route)),
+  ];
 }
 
 /**
@@ -235,7 +247,25 @@ function generateExchangeHandle(route: RouteConfig, access: AccessAuthConfig): C
         name: 'rewrite',
         args: ['*', `/api/v1/app-access/${access.appName}/exchange?{query}`],
       },
-      { name: 'reverse_proxy', args: [access.verifyUpstream] },
+      {
+        name: 'reverse_proxy',
+        args: [access.verifyUpstream],
+        // The same posture as the other two hops. This one proxies to DROP, so
+        // without it the visitor's whole tenant cookie jar and any
+        // client-supplied bearer reach DROP's API — a credential channel the
+        // rest of this module's comments say does not exist.
+        block: [
+          { name: 'header_up', args: ['-Authorization'] },
+          { name: 'header_up', args: ['-X-Api-Key'] },
+          {
+            name: 'header_up',
+            args: [
+              'Cookie',
+              `"${access.cookieName.replace('session', 'flow')}={http.request.cookie.${access.cookieName.replace('session', 'flow')}}"`,
+            ],
+          },
+        ],
+      },
     ],
   };
 }
@@ -255,7 +285,11 @@ function generateExchangeHandle(route: RouteConfig, access: AccessAuthConfig): C
  * identity is deleted and replaced by the bearer's on `/mcp*`, leaving the
  * tenant unable to tell the two apart.
  */
-function generateAccessGuardHandle(route: RouteConfig, access: AccessAuthConfig): CaddyDirective {
+function generateAccessGuardHandle(
+  route: RouteConfig,
+  access: AccessAuthConfig,
+  innerGuards: CaddyDirective[]
+): CaddyDirective {
   const inner: CaddyDirective[] = [
     // A client must not be able to assert who it is; copy_headers re-adds the
     // authenticated values after the sub-request.
@@ -286,11 +320,9 @@ function generateAccessGuardHandle(route: RouteConfig, access: AccessAuthConfig)
     },
   ];
 
-  // The MCP guard nests INSIDE, so a guarded MCP endpoint on a gated app needs
-  // both credentials.
-  if (route.mcpAuth) {
-    inner.push(generateMcpAuthHandle(route, route.mcpAuth));
-  }
+  // Every other guard nests INSIDE, so a guarded MCP endpoint on a gated app
+  // needs both credentials.
+  inner.push(...innerGuards);
 
   inner.push({
     name: 'handle',
@@ -319,9 +351,29 @@ function generateTenantProxy(route: RouteConfig, access: AccessAuthConfig): Cadd
     ...(proxy.block ?? []),
     { name: 'header_up', args: ['-Authorization'] },
     { name: 'header_up', args: ['-X-Api-Key'] },
+    // BOTH gate cookies. The flow cookie was left behind, so a tenant saw
+    // every live flow id on its own inbound traffic — enough, before the flow
+    // store was added, to mint a code in a visitor's flow.
+    //
+    // Unanchored, and that is fine rather than accidental: the pattern is a
+    // full `__Host-drop-…-<app>=` literal, and the only strings it could
+    // over-match are cookies deliberately named to contain it, which cost
+    // nothing to drop on the hop to the app they name.
     {
       name: 'header_up',
-      args: ['Cookie', `"${escapeRegex(access.cookieName)}=[^;]*;?\\s*"`, '""'],
+      args: [
+        'Cookie',
+        `"${escapeRegex(access.cookieName)}=[^;]*;?\\s*"`,
+        '""',
+      ],
+    },
+    {
+      name: 'header_up',
+      args: [
+        'Cookie',
+        `"${escapeRegex(access.cookieName.replace('-session-', '-flow-'))}=[^;]*;?\\s*"`,
+        '""',
+      ],
     },
   ];
   return proxy;
@@ -331,9 +383,6 @@ function generateTenantProxy(route: RouteConfig, access: AccessAuthConfig): Cadd
 function escapeRegex(literal: string): string {
   return literal.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
-
-/** The path, on the tenant's own hostname, that DROP owns for the code exchange. */
-export const EXCHANGE_PATH = '/.drop-session/exchange';
 
 /**
  * Every DROP-owned guard `handle` this route needs, in emission order.

@@ -198,6 +198,11 @@ export function canOpenSession(
   // though the signature verified — the verifier binds it too, and this is the
   // second half of that pair.
   if (session.appName !== appName) return false;
+  // The same refusal `canOpen` makes on its own path. `AppSessionIdentity.role`
+  // is typed as a real role, but it is read LIVE from the credentials file with
+  // no runtime narrowing — and this file's own argument for two entry points is
+  // that "disjoint as declared" is not something to rely on at runtime.
+  if (session.role === ('none' as string)) return false;
   return evaluateAccessPolicy(session.userId, session.role, app, policy);
 }
 

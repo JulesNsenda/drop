@@ -111,24 +111,24 @@ export interface RouteConfig {
 /**
  * The `forward_auth` browser gate for one app on one hostname.
  *
- * `appName` and `origin` are both GENERATION-TIME LITERALS. Neither may ever be
+ * `appName` is a GENERATION-TIME LITERAL and must stay one. It may never be
  * derived at request time from `Host` or `X-Forwarded-Host`: `forward_auth`
- * proxies the ORIGINAL request, so those are client-controlled, and a request-
- * time derivation would let one tenant present a valid session while claiming
- * to be another app (SEC-2).
+ * proxies the ORIGINAL request, so those are client-controlled, and a
+ * request-time derivation would let one tenant present a valid session while
+ * claiming to be another app (SEC-2). It goes in the PATH of the verify and
+ * exchange URIs, where a client cannot append a second value.
  *
- * `origin` is per-HOSTNAME rather than per-app because the session cookie is
- * `__Host-`-prefixed and therefore host-only — the audience a session is
- * verified against has to be the host it was minted on. (Today the gate is
- * refused outright for an app routed on more than one hostname, so there is
- * exactly one; carrying the origin here is what will let that refusal be
- * lifted without re-deriving anything from a header.)
+ * There is deliberately NO `origin` field. One was carried here and never
+ * read — the session's audience is resolved by the verify endpoint itself —
+ * and a field whose doc comment IS the security argument while its value is
+ * unread is worse than no field: it tells the next reader a guarantee exists
+ * where none does. The audience is deterministic because `assessAccessGate`
+ * refuses to gate an app routed on more than one hostname; see `appOrigin` in
+ * `routes/app-access.ts`, which is where that reasoning now lives.
  */
 export interface AccessAuthConfig {
   /** The app this gate belongs to — baked into the verify and exchange paths. */
   appName: string;
-  /** The origin this block serves, e.g. `https://myapp.dropkit.sh`. */
-  origin: string;
   /** DROP's own API address, e.g. `127.0.0.1:3000`. */
   verifyUpstream: string;
   /** The name of this app's session cookie, e.g. `__Host-drop-session-myapp`. */

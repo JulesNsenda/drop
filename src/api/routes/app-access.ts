@@ -53,10 +53,12 @@ import {
 } from '../app-access/session-token';
 import {
   mintFlowId,
+  consumeFlowId,
   mintAppAccessCode,
   consumeAppAccessCode,
 } from '../app-access/flow-code';
 import { validateReturnPath } from '../app-access/return-path';
+import { sessionCookieName, flowCookieName, EXCHANGE_PATH } from '../app-access/names';
 import { getAccessLog, type AccessLogEntry } from '../../managers/access-log/access-log';
 import { computeAppUrl } from './apps';
 
@@ -68,13 +70,7 @@ const FLOW_COOKIE_TTL_SECONDS = 300;
 /** The dashboard route that reads `localStorage` and POSTs for a code. */
 const CONSENT_PATH = '/dashboard/app-access';
 
-export function sessionCookieName(appName: string): string {
-  return `__Host-drop-session-${appName}`;
-}
-
-export function flowCookieName(appName: string): string {
-  return `__Host-drop-flow-${appName}`;
-}
+export { sessionCookieName, flowCookieName } from '../app-access/names';
 
 /**
  * Read one cookie from the raw header.
@@ -100,14 +96,26 @@ function readCookie(c: Context, name: string): string | undefined {
   return undefined;
 }
 
-/** The origin this app is served on — the audience its session is bound to. */
+/**
+ * The origin this app is served on — the audience its session is bound to.
+ *
+ * Deterministic precisely because `assessAccessGate` refuses to gate an app
+ * routed on more than one hostname: there is exactly one, so this and the
+ * hostname baked into the Caddy block cannot disagree.
+ *
+ * Forced to `https`. `computeAppUrl` is the dashboard's URL-DISPLAY helper and
+ * honours the tenant's own `tls: {disabled: true}` — which for a gated app
+ * would put a single-use code on the wire in cleartext, and mint an audience
+ * the visitor's browser can never reach over the transport the `Secure` cookie
+ * requires. Route emission already ignores that flag for a gated app; so does
+ * this. It is the third place the same tenant-authored field has had to be
+ * neutralised.
+ */
 function appOrigin(appName: string): string | undefined {
   const app = getStateManager().getApp(appName);
   if (!app) return undefined;
-  // Deterministic precisely because `assessAccessGate` refuses to gate an app
-  // routed on more than one hostname: there is exactly one, so this and the
-  // hostname baked into the Caddy block cannot disagree.
-  return computeAppUrl(app);
+  const url = computeAppUrl(app);
+  return url?.replace(/^http:\/\//, 'https://');
 }
 
 /** The policy, or null when this app is not gated. */
@@ -170,7 +178,11 @@ appAccess.get('/:app/verify', async c => {
     const policy = gatePolicy(appName);
     const app = getStateManager().getApp(appName);
     if (!app || !policy) {
-      recordAccess({ appName, decision: 'refuse', reason: 'gate-without-policy' });
+      // Logged ONLY for an app that exists. This endpoint is unauthenticated
+      // and reachable directly on the platform host, and the log's byte cap is
+      // per app per day — so a caller rotating invented names would get a
+      // fresh budget for each one and append without bound.
+      if (app) recordAccess({ appName, decision: 'refuse', reason: 'gate-without-policy' });
       return forbidden(
         c,
         appName,
@@ -201,8 +213,13 @@ appAccess.get('/:app/verify', async c => {
         // reason the log is: this runs once per HTTP request, and a summary
         // nobody has read yet must never delay or fail the authorization it
         // describes.
-        void getStateManager()
-          .recordAppOpened(appName, identity.userId, identity.username)
+        // Deferred, so even a throw from the SINGLETON ACCESSOR cannot reach the
+        // handler's catch and turn a summary nobody has read yet into a denial.
+        // Calling `getStateManager()` synchronously here would have been
+        // outside the promise chain — the exact shape `recordAccess` above
+        // exists to avoid.
+        void Promise.resolve()
+          .then(() => getStateManager().recordAppOpened(appName, identity.userId, identity.username))
           .catch(() => undefined);
         // The tenant learns WHO is calling without ever seeing DROP's cookie —
         // the generated block strips it on the hop to them.
@@ -284,7 +301,15 @@ appAccess.get('/authorize', c => {
   // relative path, `app` to the name grammar, and the destination below is
   // DROP's own dashboard on DROP's own host, so nothing client-controlled
   // reaches a Location as an origin.
-  const target = new URL(`${getPublicUrl() ?? ''}${CONSENT_PATH}`);
+  const platform = getPublicUrl();
+  if (!platform) {
+    // `new URL('/dashboard/...')` throws without an origin, and a 500 on a
+    // sign-in hop the visitor was just redirected to is the one thing this
+    // endpoint must not do.
+    return c.json(error(ErrorCodes.SERVICE_UNAVAILABLE, 'Sign-in is not configured'), 503);
+  }
+
+  const target = new URL(`${platform}${CONSENT_PATH}`);
   target.searchParams.set('app', appName);
   target.searchParams.set('flow', flow);
   target.searchParams.set('return', returnPath);
@@ -314,6 +339,13 @@ appAccess.post('/code', async c => {
   const policy = gatePolicy(appName);
   if (!app || !policy) return c.json(error(ErrorCodes.NOT_FOUND, 'This application is not gated'), 404);
 
+  // The flow must have been STARTED by a verify hop, and it is spent here.
+  // Otherwise an observed flow id — and it transits two logged URLs for 300s —
+  // would let anyone mint a code bound to a victim's browser.
+  if (!consumeFlowId(flowId)) {
+    return c.json(error(ErrorCodes.VALIDATION_ERROR, 'This sign-in has expired'), 400);
+  }
+
   // The SAME predicate the verify hop uses. If these two ever disagree the
   // visitor loops between them forever, so the refusal is made HERE, where DROP
   // controls the page, rather than being discovered one hop later.
@@ -336,8 +368,11 @@ appAccess.post('/code', async c => {
 
   // The SPA navigates the browser here. The origin is DROP-derived, never
   // echoed from the request.
+  // EXCHANGE_PATH, not a second copy of the literal: the Caddy matcher is
+  // built from the same constant, and a drift between them would 404 the hop
+  // that ends every sign-in.
   return c.json(
-    success({ redirectTo: `${origin}/.drop-session/exchange?code=${encodeURIComponent(code)}` })
+    success({ redirectTo: `${origin}${EXCHANGE_PATH}?code=${encodeURIComponent(code)}` })
   );
 });
 
