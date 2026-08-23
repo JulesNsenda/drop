@@ -14,8 +14,11 @@ import { getAppRuntime } from '../../managers/runtime';
 import { logActivityFor } from '../../managers/activity';
 import { getDiskFreeMb } from '../../utils/disk';
 import { getSettingsManager } from '../../managers/settings/settings-manager';
+import type { MailSettings } from '../../managers/settings/settings-manager';
 import { normalizePublicUrl } from '../../utils/url-validator';
 import { getPublicUrl, setPublicUrl, isAccessGateEnabled } from '../runtime-config';
+import { getMailCredentialStore } from '../../managers/mailer/mail-credential';
+import { sendTemplatedMail } from '../../managers/mailer/mailer';
 
 const admin = new Hono();
 
@@ -74,6 +77,50 @@ function buildUserConnectorsPayload(): { enabled: boolean } {
  */
 function buildAppSharingPayload(): { enabled: boolean } {
   return { enabled: getSettingsManager().getAppSharingEnabled() };
+}
+
+interface MailPayload {
+  host?: string;
+  port?: number;
+  secure?: boolean;
+  user?: string;
+  from?: string;
+  shareNotificationsEnabled: boolean;
+  /**
+   * Whether the mailer currently has a password to authenticate with (env
+   * `DROP_SMTP_PASSWORD`, or the stored, encrypted credential). Computed via
+   * `resolveMailPassword()` and reduced to a boolean here — the plaintext
+   * itself must never reach a route response (see that function's own
+   * warning in `mail-credential.ts`). This is honest about the DROP-154 §3
+   * host/credential coupling: changing `smtpHost` clears the stored
+   * credential (a different host means the saved password is for a relay
+   * that no longer matches), so this flips to `false` immediately after a
+   * `PUT /settings/mail` that changes `host`, even though nobody explicitly
+   * cleared the credential.
+   */
+  credentialConfigured: boolean;
+}
+
+/**
+ * Status block for the DROP-154 mail settings (SMTP relay config + the
+ * `shareNotificationsEnabled` toggle). Kept separate from the other
+ * build*Payload() helpers for the same reason those are kept separate from
+ * each other — a distinct product surface with its own shape, not a variant
+ * to fold into an existing payload. Never includes the password, in any
+ * form — see `credentialConfigured` above.
+ */
+async function buildMailPayload(): Promise<MailPayload> {
+  const mail = getSettingsManager().getMailSettings();
+  const credentialConfigured = (await getMailCredentialStore().resolveMailPassword()) !== null;
+  return {
+    host: mail.host,
+    port: mail.port,
+    secure: mail.secure,
+    user: mail.user,
+    from: mail.from,
+    shareNotificationsEnabled: getSettingsManager().getShareNotificationsEnabled(),
+    credentialConfigured,
+  };
 }
 
 const GITHUB_WEBHOOK_SECRET_MIN_LENGTH = 8;
@@ -250,6 +297,7 @@ admin.get('/settings', async (c) => {
       githubWebhook: buildGithubWebhookPayload(),
       userConnectors: buildUserConnectorsPayload(),
       appSharing: buildAppSharingPayload(),
+      mail: await buildMailPayload(),
     })
   );
 });
@@ -419,6 +467,185 @@ admin.put('/settings/app-sharing', async (c) => {
       : undefined;
 
   return c.json(success({ ...buildAppSharingPayload(), ...(warning ? { warning } : {}) }));
+});
+
+const MAIL_PORT_MIN = 1;
+const MAIL_PORT_MAX = 65535;
+
+/**
+ * Validates one of `MailSettings`' free-text fields (`host`/`user`/`from`):
+ * `null` or an empty/whitespace-only string clears the field (mirrors
+ * `PUT /settings/github-webhook-secret`'s null-clears shape); a control
+ * character (including CR/LF/NUL — `CONTROL_CHAR_PATTERN` covers `\x00-\x1f`)
+ * is refused rather than persisted, so a header-injection payload never even
+ * reaches disk — `mailer.ts` re-checks independently at send time, but this
+ * is the route's own boundary, not a substitute for that one.
+ */
+function normalizeMailStringField(value: unknown): { ok: true; value: string | undefined } | { ok: false } {
+  if (value === null) return { ok: true, value: undefined };
+  if (typeof value !== 'string') return { ok: false };
+  const trimmed = value.trim();
+  if (CONTROL_CHAR_PATTERN.test(trimmed)) return { ok: false };
+  return { ok: true, value: trimmed === '' ? undefined : trimmed };
+}
+
+// PUT /admin/settings/mail - Set (or, per field, clear) the non-secret SMTP
+// relay settings plus the shareNotificationsEnabled toggle. NEVER the
+// password — see PUT /settings/mail/credential below.
+//
+// `setMailSettings` distinguishes KEY PRESENCE from value truthiness
+// (`{ host: undefined }` deliberately wipes the host and, via the host-change
+// check inside it, clears the stored credential) — so `partial` below is
+// built field-by-field from what the body actually CONTAINS, never by
+// spreading the body in. A field omitted from the body is left untouched.
+//
+// Every field is validated BEFORE either settings-manager write below, so a
+// bad field 400s without any partial mutation — `setMailSettings` is called
+// at most once, and only after every field in the body has passed.
+admin.put('/settings/mail', async (c) => {
+  const authCtx = (c.get as Function)('auth') as AuthContext | undefined;
+  const body = (await c.req.json()) as unknown;
+
+  if (!isJsonObjectBody(body)) {
+    return c.json(error(ErrorCodes.VALIDATION_ERROR, 'Request body must be a JSON object'), 400);
+  }
+
+  const partial: MailSettings = {};
+
+  if ('host' in body) {
+    const result = normalizeMailStringField(body.host);
+    if (!result.ok) {
+      return c.json(error(ErrorCodes.VALIDATION_ERROR, 'host must be a string or null'), 400);
+    }
+    partial.host = result.value;
+  }
+
+  if ('port' in body) {
+    const value = body.port;
+    if (value === null) {
+      partial.port = undefined;
+    } else if (typeof value !== 'number' || !Number.isInteger(value) || value < MAIL_PORT_MIN || value > MAIL_PORT_MAX) {
+      return c.json(
+        error(ErrorCodes.VALIDATION_ERROR, `port must be an integer between ${MAIL_PORT_MIN} and ${MAIL_PORT_MAX}, or null`),
+        400
+      );
+    } else {
+      partial.port = value;
+    }
+  }
+
+  if ('secure' in body) {
+    const value = body.secure;
+    if (typeof value !== 'boolean') {
+      return c.json(error(ErrorCodes.VALIDATION_ERROR, 'secure must be a boolean'), 400);
+    }
+    partial.secure = value;
+  }
+
+  if ('user' in body) {
+    const result = normalizeMailStringField(body.user);
+    if (!result.ok) {
+      return c.json(error(ErrorCodes.VALIDATION_ERROR, 'user must be a string or null'), 400);
+    }
+    partial.user = result.value;
+  }
+
+  if ('from' in body) {
+    const result = normalizeMailStringField(body.from);
+    if (!result.ok) {
+      return c.json(error(ErrorCodes.VALIDATION_ERROR, 'from must be a string or null'), 400);
+    }
+    partial.from = result.value;
+  }
+
+  let shareNotificationsEnabled: boolean | undefined;
+  if ('shareNotificationsEnabled' in body) {
+    shareNotificationsEnabled = requireBooleanField(body, 'shareNotificationsEnabled');
+    if (shareNotificationsEnabled === undefined) {
+      return c.json(error(ErrorCodes.VALIDATION_ERROR, 'shareNotificationsEnabled must be a boolean'), 400);
+    }
+  }
+
+  // setMailSettings first: it's the write that can clear the stored
+  // credential (on a host change), so it goes first — if the second write
+  // below fails, the relay config + credential are still internally
+  // consistent with each other, only the notification toggle is stale.
+  await getSettingsManager().setMailSettings(partial);
+  if (shareNotificationsEnabled !== undefined) {
+    await getSettingsManager().setShareNotificationsEnabled(shareNotificationsEnabled);
+  }
+
+  await logActivityFor(authCtx, {
+    action: 'mail-settings-set',
+    detail: 'Mail settings updated',
+  });
+
+  return c.json(success(await buildMailPayload()));
+});
+
+// PUT /admin/settings/mail/credential - Write-only: sets the SMTP relay
+// password via the mailer's own encrypted credential store
+// (mail-credential.ts). Never read back — GET /settings only ever reports
+// `mail.credentialConfigured` (a boolean), never the value.
+admin.put('/settings/mail/credential', async (c) => {
+  const authCtx = (c.get as Function)('auth') as AuthContext | undefined;
+  const body = (await c.req.json()) as unknown;
+
+  if (!isJsonObjectBody(body)) {
+    return c.json(error(ErrorCodes.VALIDATION_ERROR, 'Request body must be a JSON object'), 400);
+  }
+
+  const password = body.password;
+  if (typeof password !== 'string' || password === '') {
+    return c.json(error(ErrorCodes.VALIDATION_ERROR, 'password must be a non-empty string'), 400);
+  }
+
+  try {
+    await getMailCredentialStore().setMailPassword(password);
+  } catch {
+    // Only thrown when encryption.key is absent/wrong-length — an operator
+    // environment problem, not a bad request. Mirrors the `no_key` posture
+    // POST /auth/mfa/enable already uses for the same underlying key.
+    return c.json(
+      error(ErrorCodes.INTERNAL_ERROR, 'SMTP encryption key not available. Contact the server operator.'),
+      500
+    );
+  }
+
+  await logActivityFor(authCtx, {
+    action: 'mail-settings-set',
+    detail: 'SMTP credential set',
+  });
+
+  return c.json(success(await buildMailPayload()));
+});
+
+// POST /admin/mail/test - Send the fixed `test` template to an admin-supplied
+// address to confirm the relay settings actually work. Reports only the
+// two-value `MailSendResult` status ('sent' | 'unavailable') — the relay's
+// own reply (e.g. 550/552) never reaches this response; see mailer.ts's file
+// header for why that would be a directory-enumeration oracle.
+admin.post('/mail/test', async (c) => {
+  const authCtx = (c.get as Function)('auth') as AuthContext | undefined;
+  const body = (await c.req.json()) as unknown;
+
+  if (!isJsonObjectBody(body)) {
+    return c.json(error(ErrorCodes.VALIDATION_ERROR, 'Request body must be a JSON object'), 400);
+  }
+
+  const to = body.to;
+  if (typeof to !== 'string' || to.trim() === '') {
+    return c.json(error(ErrorCodes.VALIDATION_ERROR, 'to must be a non-empty string'), 400);
+  }
+
+  const result = await sendTemplatedMail('test', to.trim(), { platformUrl: getPublicUrl() ?? '' });
+
+  await logActivityFor(authCtx, {
+    action: 'mail-test-sent',
+    detail: `to=${to.trim()} status=${result.status}`,
+  });
+
+  return c.json(success({ status: result.status }));
 });
 
 export default admin;

@@ -30,7 +30,14 @@ import nodemailer from 'nodemailer';
 import { getSettingsManager } from '../settings/settings-manager';
 import { getMailCredentialStore } from './mail-credential';
 import { renderTemplate } from './templates';
-import type { MailTemplate, MailTemplateVars, MailSendResult } from './mailer.types';
+import { tryLogActivity } from '../activity/activity-log';
+import type {
+  MailTemplate,
+  MailTemplateVars,
+  MailSendResult,
+  ShareNotificationVars,
+  InviteMailVars,
+} from './mailer.types';
 
 /**
  * Hard total deadline for a send attempt. Enforced by OUR OWN race, not by
@@ -65,6 +72,14 @@ function assertSingleAddress(field: string, value: string): void {
   if (ADDRESS_SEPARATOR_RE.test(value)) {
     throw new Error(`mailer: rejected ${field} — multiple addresses are not supported`);
   }
+}
+
+/** `share-notification` and `invite` carry an `appName`; `test` does not — narrows `vars` for the failure-log write below. */
+function isAppNamedTemplate(
+  template: MailTemplate,
+  _vars: MailTemplateVars[MailTemplate]
+): _vars is ShareNotificationVars | InviteMailVars {
+  return template === 'share-notification' || template === 'invite';
 }
 
 function resolveDeadline<T>(promise: Promise<T>, ms: number): Promise<T | undefined> {
@@ -156,11 +171,22 @@ async function doSend(
     })
     .catch((err) => {
       // Relay diagnostics go to the log, never to the return value — see the
-      // file header.
-      console.error(
-        `[mailer] send attempt failed for template=${template}:`,
-        err instanceof Error ? err.message : err
-      );
+      // file header. console.error stays (an unowned sibling test asserts on
+      // it); ActivityLog is the durable, admin-visible home for the same
+      // diagnostic — `tryLogActivity` is used directly (no `AuthContext` is
+      // available inside this function) and never throws, so a logging
+      // failure can't turn into a second, unrelated send failure. Note this
+      // write is inside the same floating `.catch()` chain that
+      // `resolveDeadline` abandons past the deadline below — a caller
+      // observing `sendTemplatedMail` resolve is NOT a guarantee this entry
+      // has been written yet.
+      const message = err instanceof Error ? err.message : String(err);
+      console.error(`[mailer] send attempt failed for template=${template}:`, message);
+      void tryLogActivity({
+        action: 'mail-send-failed',
+        appName: isAppNamedTemplate(template, vars) ? vars.appName : undefined,
+        detail: `template=${template} to=${to}: ${message}`,
+      });
     })
     .finally(() => {
       transport.close();

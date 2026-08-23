@@ -29,6 +29,7 @@ import {
   accessVerifyRateLimitMiddleware,
   servicesRateLimitMiddleware,
   shareRateLimitMiddleware,
+  mailRateLimitMiddleware,
 } from './middleware/rate-limit';
 import { securityHeadersMiddleware } from './middleware/security-headers';
 import { auditMiddleware, initializeAuditLog, closeAuditLog } from './middleware/audit';
@@ -389,6 +390,16 @@ export class ApiServer {
     // counted once.
     v1.use('/apps/:name/share', shareRateLimitMiddleware());
     v1.use('/apps/:name/share/:userId', shareRateLimitMiddleware());
+
+    // POST /admin/mail/test (DROP-154) gets its own bucket too, registered
+    // unconditionally like the other dedicated buckets — it's the one route
+    // that dials the operator's real SMTP relay, so a scripted loop here
+    // burns real send quota rather than just CPU (see MAIL_CONFIG's comment
+    // in rate-limit.ts). A single literal path, not a wildcard pair: unlike
+    // `/apps/:name/share`, mail settings GET/PUT live at a different path
+    // and only the test-send route is expensive enough to need this bucket,
+    // so there is no sibling pattern here to double-match against.
+    v1.use('/admin/mail/test', mailRateLimitMiddleware());
 
     // Apply auth middleware to protected routes when auth is enabled
     if (this.config.enableAuth && isAuthEnabled()) {

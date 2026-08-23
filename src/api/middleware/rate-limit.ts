@@ -58,6 +58,17 @@ const OAUTH_CONFIG: RateLimitConfig = {
   windowMs: 60_000, // 1 minute - dedicated bucket for the OAuth 2.1 endpoints (PRD-041)
 };
 
+const MAIL_CONFIG: RateLimitConfig = {
+  maxRequests: 10,
+  windowMs: 60_000, // 1 minute - dedicated bucket for POST /admin/mail/test (DROP-154). Same
+  // cadence as AUTH_CONFIG on purpose: this route is admin-only but it is also the ONE route
+  // that dials the operator's actual SMTP relay, so a scripted loop here burns real relay
+  // send quota (and, on some providers, trips their own abuse throttling) rather than just
+  // CPU. Its own bucket, not `services` or the general admin traffic — a burst here must not
+  // 429 an unrelated admin action mid-incident, the same reasoning `shareRateLimitMiddleware`
+  // and `servicesRateLimitMiddleware` give for staying off each other's store.
+};
+
 const DB_CONFIG: RateLimitConfig = {
   maxRequests: 20,
   windowMs: 60_000, // 1 minute - dedicated bucket for the database panel (DROP-120). The
@@ -255,6 +266,16 @@ export function servicesRateLimitMiddleware(config?: Partial<RateLimitConfig>) {
  */
 export function shareRateLimitMiddleware(config?: Partial<RateLimitConfig>) {
   return createRateLimiter('share', { ...DB_CONFIG, ...config });
+}
+
+/**
+ * Dedicated rate limiter for `POST /admin/mail/test` (DROP-154). Its own
+ * `createRateLimiter` instance, not a share of `services` or `db` — see
+ * `MAIL_CONFIG`'s comment for why a burst here has a real-world cost the
+ * general admin bucket isn't sized for.
+ */
+export function mailRateLimitMiddleware(config?: Partial<RateLimitConfig>) {
+  return createRateLimiter('mail', { ...MAIL_CONFIG, ...config });
 }
 
 /** Reset all rate limit stores (for testing) */
