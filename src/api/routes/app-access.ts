@@ -370,12 +370,23 @@ appAccess.get('/:app/exchange', async c => {
     const token = await mintAppSessionToken(record.userId, record.username, appName, origin);
 
     noStore(c);
-    c.header('Set-Cookie', [
+    // TWO headers, appended — never one folded value. RFC 6265 forbids folding
+    // and no browser splits it, so a joined pair would have delivered a
+    // `Max-Age` that parses as garbage (dropping the 8h TTL to a
+    // browser-session cookie) and would never have cleared the flow cookie at
+    // all — making this function's own replay claim false.
+    c.header(
+      'Set-Cookie',
       `${sessionCookieName(appName)}=${token}; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=${SESSION_TTL_SECONDS}`,
-      // The flow is spent. Clearing it means a replayed exchange URL has
-      // nothing to match against.
+      { append: true }
+    );
+    // The flow is spent. Clearing it means a replayed exchange URL has nothing
+    // to match against.
+    c.header(
+      'Set-Cookie',
       `${flowCookieName(appName)}=; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=0`,
-    ].join(', '));
+      { append: true }
+    );
     // From the RECORD, never from the query — a `return` riding the redirect
     // chain is attacker-mutable between hops.
     return c.redirect(record.returnPath, 302);

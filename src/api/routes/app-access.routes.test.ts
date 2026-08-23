@@ -29,7 +29,7 @@ import {
 } from '../__testutils__/api-server';
 import { getAppConfigService, resetAppConfigService } from '../../managers/app/app-config';
 import { getAccessLog, resetAccessLog } from '../../managers/access-log/access-log';
-import { mintAppSessionToken } from '../app-access/session-token';
+import { mintAppSessionToken, SESSION_TTL_SECONDS } from '../app-access/session-token';
 import { __resetAppAccessCodes } from '../app-access/flow-code';
 import { sessionCookieName, flowCookieName } from './app-access';
 
@@ -231,10 +231,22 @@ describe('/app-access (DROP-152 the gate)', () => {
       expect(ex.status).toBe(302);
       // From the RECORD, not from any query parameter.
       expect(ex.headers.get('location')).toBe('/reports');
-      const setCookie = ex.headers.get('set-cookie') as string;
-      expect(setCookie).toContain(sessionCookieName(APP));
+      // getSetCookie(), not get() + toContain. A single FOLDED header would
+      // satisfy `toContain` for both names while delivering neither correctly:
+      // RFC 6265 forbids folding, no browser splits it, and the joined value
+      // would carry a Max-Age that parses as garbage and never clear the flow
+      // cookie. The count is what discriminates.
+      const cookies = ex.headers.getSetCookie();
+      expect(cookies).toHaveLength(2);
+
+      const session = cookies.find(c => c.startsWith(sessionCookieName(APP)));
+      expect(session).toContain(`Max-Age=${SESSION_TTL_SECONDS}`);
+      expect(session).toContain('HttpOnly');
+      expect(session).toContain('Secure');
+
       // The spent flow is cleared, so a replayed exchange URL matches nothing.
-      expect(setCookie).toContain(`${flowCookieName(APP)}=;`);
+      const cleared = cookies.find(c => c.startsWith(`${flowCookieName(APP)}=;`));
+      expect(cleared).toContain('Max-Age=0');
     });
 
     it('REFUSES an exchange whose code belongs to another browser flow', async () => {

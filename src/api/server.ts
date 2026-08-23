@@ -217,13 +217,21 @@ export class ApiServer {
       return bodySizeLimit(c, next);
     });
 
-    // Rate limiting
-    // The access gate's verify hop is exempt: it is a per-request authorization
-    // sub-request rather than API traffic, and it has its own much larger
-    // bucket registered below. Stacking the two would defeat that one.
+    // Rate limiting.
+    //
+    // The limiter is built ONCE, here. `createRateLimiter` allocates a
+    // `setInterval` per call, so constructing it inside the handler leaked one
+    // timer per API request — invisible to the open-handle detector because
+    // they are `unref`'d, and unbounded in a long-lived process.
+    //
+    // The access gate's verify hop is exempt: it is a per-request
+    // authorization sub-request rather than API traffic (every asset of every
+    // gated page), and it has its own much larger bucket registered below.
+    // Stacking the two would defeat that one.
+    const generalLimiter = rateLimitMiddleware();
     this.app.use('/api/*', async (c, next) => {
       if (ACCESS_VERIFY_PATH_RE.test(new URL(c.req.url).pathname)) return next();
-      return rateLimitMiddleware()(c, next as never);
+      return generalLimiter(c, next as never);
     });
 
     // Request logging
@@ -315,11 +323,17 @@ export class ApiServer {
     // back if and when a collection route exists.
     v1.use('/apps/*/services/*', servicesRateLimitMiddleware());
 
-    // The access gate's CREDENTIAL-minting hops get the strict bucket:
-    // `/authorize` and `/code` each hand out something that becomes a session.
-    // Registered unconditionally, like every other dedicated bucket.
-    v1.use('/app-access/authorize', authRateLimitMiddleware());
+    // `/code` is the CREDENTIAL-minting hop and gets the strict bucket.
     v1.use('/app-access/code', authRateLimitMiddleware());
+
+    // `/authorize` does NOT, even though it looks like a login surface. It
+    // mints nothing — it validates and bounces to the dashboard SPA — and it
+    // is where the verify hop's per-subresource fan-out REDIRECTS TO. On the
+    // strict 10/min bucket, one gated page load with an expired session burns
+    // it, and because that bucket is keyed by NAME it is shared with
+    // `/auth/login`: the visitor would then be locked out of signing in at
+    // all, which is the one thing they were sent here to do.
+    v1.use('/app-access/authorize', accessVerifyRateLimitMiddleware());
 
     // `verify` gets its OWN, deliberately LARGE bucket, and is exempted from
     // the general `/api/*` limiter above.
