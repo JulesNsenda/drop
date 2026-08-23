@@ -59,24 +59,39 @@ export class RouterService {
   }
 
   /**
-   * Add a new route (or update if it already exists)
+   * Add a route, REPLACING any existing one for the same name.
+   *
+   * Replace, not merge, and that distinction is load-bearing. `addRoute` takes
+   * a COMPLETE `RouteConfig` — its caller has just described the whole route —
+   * so a field the caller omitted means "this route no longer has one". It
+   * used to delegate to `updateRoute`, which merges over the existing route,
+   * and `handleConfigureRoute` passes guards by conditional spread
+   * (`...(guard ? { mcpAuth: guard } : {})`), so an omitted guard was a MISSING
+   * KEY rather than an `undefined` — and the stale guard survived every
+   * subsequent re-emission for the life of the process.
+   *
+   * What that cost: turning a guard OFF never removed it from the Caddyfile.
+   * For the access gate (DROP-152) that is an app bricked for everyone
+   * including its owner — the policy is gone, so the verify endpoint refuses
+   * every request, while the API reported the gate as removed. The same shape
+   * existed for `mcpAuth` at lower impact.
+   *
+   * `updateRoute` keeps its merge semantics for genuine partial updates; this
+   * is the full-description entry point and the only one the platform uses.
    */
   async addRoute(routeConfig: RouteConfig): Promise<Route> {
     const { appName } = routeConfig;
-
-    // If route already exists, update it instead
-    if (this.routes.has(appName)) {
-      return this.updateRoute(appName, routeConfig);
-    }
+    const existing = this.routes.get(appName);
 
     // Apply defaults
     const config = this.applyDefaults(routeConfig);
 
-    // Create route
+    // Create route. `createdAt` survives a replacement — the route is the same
+    // route, re-described; only its content changed.
     const route: Route = {
       ...config,
       status: 'active',
-      createdAt: new Date(),
+      createdAt: existing?.createdAt ?? new Date(),
       updatedAt: new Date(),
     };
 
@@ -164,7 +179,11 @@ export class RouterService {
   }
 
   /**
-   * Update an existing route
+   * Update an existing route by MERGING a partial description over it.
+   *
+   * A field the caller omits is left alone. That is right for a genuine
+   * partial update and wrong for a full re-description — see `addRoute`, which
+   * replaces instead, and which is the entry point the platform uses.
    */
   async updateRoute(appName: string, updates: Partial<RouteConfig>): Promise<Route> {
     const existingRoute = this.routes.get(appName);

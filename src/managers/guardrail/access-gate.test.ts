@@ -14,6 +14,7 @@ import {
   assessAccessGate,
   describeAccessGateRefusal,
   resolveHttpsEffective,
+  isGateApplied,
   ACCESS_GATE_ENFORCEMENT_AVAILABLE,
   type AccessGateContext,
 } from './access-gate';
@@ -24,6 +25,10 @@ const ENFORCEABLE: AccessGateContext = {
   authEnabled: true,
   httpsEffective: true,
   networkIsolation: 'isolated',
+  publicUrl: 'https://dashboard.example.com',
+  hostnameCount: 1,
+  apiPortUsable: true,
+  appNameSafe: true,
 };
 
 describe('assessAccessGate', () => {
@@ -86,6 +91,48 @@ describe('assessAccessGate', () => {
     expect(verdict.blockers).not.toContain('monorepo-group-child');
   });
 
+  describe('the four ways a gate can BRICK an app rather than protect it', () => {
+    // Each of these emits a guard in front of an app that then answers nothing
+    // to anyone. That is a worse outcome than no gate, and worse than a refusal
+    // — which is why they are blockers rather than warnings.
+
+    it('refuses with no public URL — there is nowhere to send anyone to sign in', () => {
+      const verdict = assessAccessGate({ ...ENFORCEABLE, publicUrl: undefined });
+      expect(verdict.enforceable).toBe(false);
+      expect(verdict.blockers).toContain('no-public-url');
+    });
+
+    it('refuses an app routed on more than one hostname', () => {
+      // The session cookie is `__Host-` and therefore host-only, while routes
+      // are emitted per hostname — a visitor on any secondary hostname would be
+      // redirected to the primary and loop forever on the address they asked
+      // for.
+      const verdict = assessAccessGate({ ...ENFORCEABLE, hostnameCount: 2 });
+      expect(verdict.enforceable).toBe(false);
+      expect(verdict.blockers).toContain('multi-hostname');
+    });
+
+    it('refuses when the API port is unusable', () => {
+      // `forward_auth 127.0.0.1:NaN` fails to parse the WHOLE Caddyfile, so
+      // this one takes every site on the box down, not just this app.
+      const verdict = assessAccessGate({ ...ENFORCEABLE, apiPortUsable: false });
+      expect(verdict.enforceable).toBe(false);
+      expect(verdict.blockers).toContain('api-port-unusable');
+    });
+
+    it('refuses a name that cannot be written into a Caddy directive', () => {
+      const verdict = assessAccessGate({ ...ENFORCEABLE, appNameSafe: false });
+      expect(verdict.enforceable).toBe(false);
+      expect(verdict.blockers).toContain('invalid-app-name');
+    });
+
+    it('treats a single hostname and an absent count identically', () => {
+      // Callers that predate the field must not start being refused.
+      expect(assessAccessGate({ ...ENFORCEABLE, hostnameCount: undefined }).enforceable).toBe(true);
+      expect(assessAccessGate({ ...ENFORCEABLE, hostnameCount: 1 }).enforceable).toBe(true);
+    });
+  });
+
   it('reports enforcement as UNAVAILABLE in this build', () => {
     // The verdict answers "could this box enforce a gate", which is not the
     // same question as "is anything enforcing one". Until the guard emitter
@@ -101,6 +148,10 @@ describe('assessAccessGate', () => {
       httpsEffective: false,
       networkIsolation: 'shared',
       group: 'ezsign',
+      publicUrl: undefined,
+      hostnameCount: 3,
+      apiPortUsable: false,
+      appNameSafe: false,
     });
     expect(verdict.blockers).toEqual([
       'isolation-not-docker',
@@ -108,10 +159,14 @@ describe('assessAccessGate', () => {
       'no-https',
       'tenant-network-shared',
       'monorepo-group-child',
+      'no-public-url',
+      'multi-hostname',
+      'api-port-unusable',
+      'invalid-app-name',
     ]);
     // One sentence per blocker, in the same order — an operator fixing one at
     // a time must not have to rediscover the next on the next attempt.
-    expect(verdict.reasons).toHaveLength(5);
+    expect(verdict.reasons).toHaveLength(9);
     expect(verdict.reasons.every(r => r.length > 0)).toBe(true);
   });
 
@@ -121,6 +176,48 @@ describe('assessAccessGate', () => {
     expect(message).toContain("'myapp'");
     expect(message).toContain('(1)');
     expect(message).toContain('(2)');
+  });
+});
+
+describe('isGateApplied', () => {
+  // Every combination, independent of what ACCESS_GATE_ENFORCEMENT_AVAILABLE
+  // currently is. That independence is the point: driven through the platform
+  // with the constant false, all eight collapse to the same answer, and a
+  // mutation removing the reload term left the suite green.
+  const opts = (
+    enforceable: boolean,
+    enforcementAvailable: boolean,
+    reloadOutcome: 'ok' | 'failed' | 'skipped'
+  ) => ({ enforceable, enforcementAvailable, reloadOutcome });
+
+  it('is true ONLY when all three hold', () => {
+    expect(isGateApplied(opts(true, true, 'ok'))).toBe(true);
+  });
+
+  it('is false when Caddy REJECTED the config', () => {
+    // The one that matters most: a rejected /load returns false rather than
+    // throwing, so nothing else in the platform notices.
+    expect(isGateApplied(opts(true, true, 'failed'))).toBe(false);
+  });
+
+  it('is false when the reload was SKIPPED — nothing reached Caddy', () => {
+    expect(isGateApplied(opts(true, true, 'skipped'))).toBe(false);
+  });
+
+  it('is false when this build has no emitter', () => {
+    expect(isGateApplied(opts(true, false, 'ok'))).toBe(false);
+  });
+
+  it('is false when the box cannot enforce a gate', () => {
+    expect(isGateApplied(opts(false, true, 'ok'))).toBe(false);
+  });
+
+  it('matches what this build actually ships', () => {
+    // Ties the pure rule back to reality, so the suite notices when the
+    // constant flips.
+    expect(isGateApplied(opts(true, ACCESS_GATE_ENFORCEMENT_AVAILABLE, 'ok'))).toBe(
+      ACCESS_GATE_ENFORCEMENT_AVAILABLE
+    );
   });
 });
 

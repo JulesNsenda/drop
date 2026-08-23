@@ -120,6 +120,9 @@ import {
   isLocalhostDomain,
 } from '../utils/domain-validator';
 import { createApiKey, deleteApiKeysByName } from '../api/middleware/auth';
+// The STRICT name pattern (the API's), not the folder-drop parser's looser
+// check: this decides whether a name is safe to write into a Caddy literal.
+import { isValidAppName } from '../api/middleware/validate';
 import { IsolationMode, assertStartupConstraints } from './startup-constraints';
 import { createContainerExecCommand } from './builder/container-build-runner';
 import { migrateAllToDocker } from '../managers/runtime/runtime-migrator';
@@ -136,6 +139,7 @@ import {
   assessAccessGate,
   describeAccessGateRefusal,
   resolveHttpsEffective,
+  isGateApplied,
   ACCESS_GATE_ENFORCEMENT_AVAILABLE,
   type AccessGateVerdict,
 } from '../managers/guardrail/access-gate';
@@ -4729,7 +4733,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           appName: `${appName}-${hostname.replace(/\./g, '-')}`, // Unique route name per domain
           owner: appName, // Bare owning app name — lets removeRoutesForApp find every route this app owns
           hostname,
-          ...(routePathPrefix ? { pathPrefix: routePathPrefix } : {}),
+          pathPrefix: routePathPrefix,
           upstream: `localhost:${port}`,
           ssl: enableSsl,
           redirectHttps: enableSsl,
@@ -4741,7 +4745,13 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           // it — an inferred label must never put a login gate in front of
           // someone's app — and only when the API port is known, since the
           // guard is a proxy to DROP's own verify endpoint.
-          ...(mcpGuard ? { mcpAuth: mcpGuard } : {}),
+          //
+          // Passed EXPLICITLY, never `...(guard ? {…} : {})`. `addRoute`
+          // replaces rather than merges (see its own doc), and it can only
+          // remove a guard the caller has actually said is gone — a missing key
+          // is indistinguishable from "unchanged". Turning a guard off used to
+          // leave it in the Caddyfile for the life of the process.
+          mcpAuth: mcpGuard,
         });
 
         const protocol = enableSsl ? 'https' : 'http';
@@ -4777,8 +4787,16 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
 
       // Reload Caddy to apply new routes — unless the caller is batching
       // several of these into one trailing reload (opts.skipCaddyReload).
-      if (!opts?.skipCaddyReload) {
-        await this.reloadCaddyIfRunning();
+      const reloadOutcome = opts?.skipCaddyReload
+        ? ('skipped' as const)
+        : await this.reloadCaddyIfRunning();
+      if (reloadOutcome === 'failed') {
+        this.logger.error(
+          `Caddy REJECTED the configuration emitted for '${appName}'. Routing is unchanged, ` +
+            'so this app is serving whatever block it had before — and the rejected file is ' +
+            'what Caddy will read at its next start.',
+          'ROUTER'
+        );
       }
 
       // Written HERE, after the routes are actually emitted and reloaded, not
@@ -4793,10 +4811,21 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       // that exists is by definition not applied. It is not a verdict about
       // the box; it is a fact about the binary.
       if (accessKnown) {
+        // "Applied" requires THREE things, not one: the box can enforce a gate,
+        // this build has an emitter at all, and Caddy actually accepted the
+        // configuration carrying it. A rejected `/load` does not throw — it
+        // returns false — so without the reload outcome this line recorded
+        // "gate applied" for a config Caddy had refused, leaving the previous
+        // ungated block live. `skipped` is not success either: the boot path
+        // batches reloads, so nothing had reached Caddy yet at this point.
         await this.stateManager?.setAccessGateUnapplied(
           appName,
           accessVerdict
-            ? !(accessVerdict.enforceable && ACCESS_GATE_ENFORCEMENT_AVAILABLE)
+            ? !isGateApplied({
+                enforceable: accessVerdict.enforceable,
+                enforcementAvailable: ACCESS_GATE_ENFORCEMENT_AVAILABLE,
+                reloadOutcome,
+              })
             : undefined
         );
       }
@@ -4815,11 +4844,19 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     }
   }
 
-  /** Reload Caddy iff it's actually running — the guard every caller of caddyServer.reload() already repeated inline. */
-  private async reloadCaddyIfRunning(): Promise<void> {
-    if (this.caddyServer && this.caddyServer.getStatus() === 'running') {
-      await this.caddyServer.reload();
-    }
+  /**
+   * Reload Caddy iff it's actually running, and REPORT whether it took.
+   *
+   * `'skipped'` is not `'ok'`: Caddy not running (or a batching caller
+   * deferring the reload) means the emitted config has not reached it, which is
+   * a different thing from a config it accepted. The access gate's state flag
+   * distinguishes all three, because recording "gate applied" after a reload
+   * Caddy REJECTED asserts a control that was never installed — and a rejected
+   * `/load` does not throw, so the surrounding catch never sees it.
+   */
+  private async reloadCaddyIfRunning(): Promise<'ok' | 'failed' | 'skipped'> {
+    if (!this.caddyServer || this.caddyServer.getStatus() !== 'running') return 'skipped';
+    return (await this.caddyServer.reload()) ? 'ok' : 'failed';
   }
 
   /**
@@ -4881,6 +4918,15 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         isLocalhost: isLocalhostDomain,
       }),
       networkIsolation: getTenantNetworkIsolation(),
+      // The login host the gate's first hop redirects to, and the value
+      // `reservedHosts()` is derived from.
+      publicUrl: getPublicUrl(),
+      hostnameCount: hostnames.length,
+      apiPortUsable: Number.isInteger(this.config.apiPort) && this.config.apiPort > 0,
+      // The strict pattern, not the folder-drop one: this name is written into
+      // Caddy directives as a literal, and an unparseable directive rejects
+      // the whole file.
+      appNameSafe: isValidAppName(appName),
       // `group` lives in AppConfig for a CHILD and in AppState for the
       // container (expandMonorepo writes `{ group, isGroupContainer }` to state
       // only). Reading config alone left the container gateable: an admin could
@@ -4970,9 +5016,15 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         unenforceable.push(config.name);
         this.logger.error(describeAccessGateRefusal(config.name, verdict), 'ROUTER');
       }
+      // 'skipped': the sweep reads persisted state at boot and emits nothing,
+      // so it can never assert that Caddy is carrying the guard.
       await this.stateManager?.setAccessGateUnapplied(
         config.name,
-        !(verdict.enforceable && ACCESS_GATE_ENFORCEMENT_AVAILABLE)
+        !isGateApplied({
+          enforceable: verdict.enforceable,
+          enforcementAvailable: ACCESS_GATE_ENFORCEMENT_AVAILABLE,
+          reloadOutcome: 'skipped',
+        })
       );
     }
 
