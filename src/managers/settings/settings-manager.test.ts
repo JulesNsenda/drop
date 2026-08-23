@@ -502,6 +502,192 @@ describe('SettingsManager', () => {
     });
   });
 
+  describe('mail settings', () => {
+    it('defaults to an all-undefined object when nothing is set', async () => {
+      await manager.load();
+      expect(manager.getMailSettings()).toEqual({
+        host: undefined,
+        port: undefined,
+        secure: undefined,
+        user: undefined,
+        from: undefined,
+      });
+    });
+
+    it('sets and persists all fields, readable via getMailSettings', async () => {
+      await manager.setMailSettings({
+        host: 'smtp.example.com',
+        port: 587,
+        secure: false,
+        user: 'relay-user',
+        from: 'drop@example.com',
+      });
+
+      expect(manager.getMailSettings()).toEqual({
+        host: 'smtp.example.com',
+        port: 587,
+        secure: false,
+        user: 'relay-user',
+        from: 'drop@example.com',
+      });
+
+      const raw = await fs.readFile(settingsFilePath, 'utf-8');
+      expect(JSON.parse(raw)).toEqual({
+        smtpHost: 'smtp.example.com',
+        smtpPort: 587,
+        smtpSecure: false,
+        smtpUser: 'relay-user',
+        mailFrom: 'drop@example.com',
+      });
+    });
+
+    it('persists across a reload (new manager instance, same file)', async () => {
+      await manager.setMailSettings({ host: 'smtp.example.com', port: 587 });
+
+      const reloaded = new SettingsManager({ settingsFilePath });
+      await reloaded.load();
+      expect(reloaded.getMailSettings()).toEqual(
+        expect.objectContaining({ host: 'smtp.example.com', port: 587 })
+      );
+      await reloaded.close();
+    });
+
+    it('only updates the fields included in the partial, leaving the rest unchanged', async () => {
+      await manager.setMailSettings({ host: 'smtp.example.com', port: 587, from: 'drop@example.com' });
+
+      await manager.setMailSettings({ port: 465 });
+
+      expect(manager.getMailSettings()).toEqual({
+        host: 'smtp.example.com',
+        port: 465,
+        secure: undefined,
+        user: undefined,
+        from: 'drop@example.com',
+      });
+    });
+
+    it('a partial that explicitly includes `host: undefined` alongside another field still wipes host (key-presence, not value-truthiness)', async () => {
+      await manager.setMailSettings({ host: 'smtp.example.com', port: 587 });
+
+      // Mirrors a caller building the object by mapping every possible field
+      // rather than omitting ones a request didn't send.
+      await manager.setMailSettings({ host: undefined, port: 465 });
+
+      expect(manager.getMailSettings()).toEqual(
+        expect.objectContaining({ host: undefined, port: 465 })
+      );
+    });
+
+    // The credential-clearing-on-host-change tests that used to live here
+    // (asserting `clearMailCredential()` was called) moved out with the call
+    // itself (DROP-154 Gate 2 §4) — `setMailSettings()` no longer reaches
+    // into the mailer; the admin mail-settings route now owns that ordering
+    // and is where that behaviour must be covered.
+
+    it('a corrupt settings file fails closed: getMailSettings returns all-undefined', async () => {
+      await fs.mkdir(path.dirname(settingsFilePath), { recursive: true });
+      await fs.writeFile(settingsFilePath, 'not valid json');
+
+      await manager.load();
+
+      expect(manager.getMailSettings()).toEqual({
+        host: undefined,
+        port: undefined,
+        secure: undefined,
+        user: undefined,
+        from: undefined,
+      });
+    });
+  });
+
+  describe('shareNotificationsEnabled', () => {
+    it('defaults to false when the key is absent (opt-in, unverified-email tradeoff)', async () => {
+      await manager.load();
+      expect(manager.getShareNotificationsEnabled()).toBe(false);
+    });
+
+    it('sets and persists a value, readable via getShareNotificationsEnabled', async () => {
+      await manager.setShareNotificationsEnabled(true);
+      expect(manager.getShareNotificationsEnabled()).toBe(true);
+
+      const raw = await fs.readFile(settingsFilePath, 'utf-8');
+      expect(JSON.parse(raw)).toEqual({ shareNotificationsEnabled: true });
+    });
+
+    it('persists across a reload (new manager instance, same file)', async () => {
+      await manager.setShareNotificationsEnabled(true);
+
+      const reloaded = new SettingsManager({ settingsFilePath });
+      await reloaded.load();
+      expect(reloaded.getShareNotificationsEnabled()).toBe(true);
+      await reloaded.close();
+    });
+
+    it('clears the value when set to undefined (reverts to the false default)', async () => {
+      await manager.setShareNotificationsEnabled(true);
+      await manager.setShareNotificationsEnabled(undefined);
+      expect(manager.getShareNotificationsEnabled()).toBe(false);
+    });
+
+    it('a corrupt settings file fails closed', async () => {
+      await fs.mkdir(path.dirname(settingsFilePath), { recursive: true });
+      await fs.writeFile(settingsFilePath, 'not valid json');
+
+      await manager.load();
+
+      expect(manager.getShareNotificationsEnabled()).toBe(false);
+    });
+
+    it('a hand-written non-boolean value (string "true") is discarded — stays at the false default', async () => {
+      await fs.mkdir(path.dirname(settingsFilePath), { recursive: true });
+      await fs.writeFile(settingsFilePath, JSON.stringify({ shareNotificationsEnabled: 'true' }));
+
+      await manager.load();
+
+      expect(manager.getShareNotificationsEnabled()).toBe(false);
+    });
+  });
+
+  describe('parseSettings field table', () => {
+    it('ignores a key that is not in the field table — round-trips as undefined, reads as "never set"', async () => {
+      await fs.mkdir(path.dirname(settingsFilePath), { recursive: true });
+      await fs.writeFile(
+        settingsFilePath,
+        JSON.stringify({ publicUrl: 'https://drop.example.com', notARealSetting: 'sneaky' })
+      );
+
+      await manager.load();
+
+      expect(manager.getStoredPublicUrl()).toBe('https://drop.example.com');
+      const raw = await fs.readFile(settingsFilePath, 'utf-8');
+      // The unknown key must never round-trip back out through a save.
+      await manager.setPublicUrl('https://drop.example.com');
+      const rawAfterSave = await fs.readFile(settingsFilePath, 'utf-8');
+      expect(JSON.parse(rawAfterSave)).toEqual({ publicUrl: 'https://drop.example.com' });
+      expect(JSON.parse(raw).notARealSetting).toBe('sneaky');
+    });
+
+    it('drops a field whose stored type does not match the table (number where a string is expected)', async () => {
+      await fs.mkdir(path.dirname(settingsFilePath), { recursive: true });
+      await fs.writeFile(settingsFilePath, JSON.stringify({ publicUrl: 12345 }));
+
+      await manager.load();
+
+      expect(manager.getStoredPublicUrl()).toBeUndefined();
+    });
+
+    it('a corrupt (unparseable) file still fails closed via the table-driven getters', async () => {
+      await fs.mkdir(path.dirname(settingsFilePath), { recursive: true });
+      await fs.writeFile(settingsFilePath, '{not json');
+
+      await manager.load();
+
+      expect(manager.getStoredPublicUrl()).toBeUndefined();
+      expect(manager.getUserConnectorsEnabled()).toBe(false);
+      expect(manager.getAppSharingEnabled()).toBe(false);
+    });
+  });
+
   describe('file permissions', () => {
     // POSIX mode bits aren't meaningful on Windows (no chmod-style ACL model).
     const itPosix = process.platform === 'win32' ? it.skip : it;

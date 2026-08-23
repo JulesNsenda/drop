@@ -37,7 +37,7 @@ import {
 import { getStateManager } from '../../managers/app/state-manager';
 import { getAppConfigService } from '../../managers/app/app-config';
 import { mayUseConnectors, CONNECTORS_DISABLED_REASON } from '../connector-policy';
-import { computeAppUrl } from './apps';
+import { computeAppUrl } from '../../utils/app-url';
 import { canAccess } from '../access';
 import {
   isAuthEnabled,

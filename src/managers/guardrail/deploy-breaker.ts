@@ -14,7 +14,6 @@
 
 import {
   getPrincipalQuota,
-  quotaKeysFor,
   QuotaExceededError,
 } from './principal-quota';
 
@@ -345,12 +344,18 @@ export async function admitDeploy(
 
   const quota = getPrincipalQuota();
   await quota.initialize();
-  const keys = quotaKeysFor(actor);
-  const q = quota.check(keys);
+  const keysResult = quota.keysFor(actor);
+  // `admitDeploy`'s own quota is unmetered-without-principal by default, so
+  // this branch never actually refuses here — it exists only to discriminate
+  // the `MeteredKeys` union so `keysResult.keys` below type-checks. Mail's
+  // instance (`unmeteredWithoutPrincipal: false`) is the one that can reach
+  // `metered: false`, and it never calls this function — see `keysFor`'s own doc.
+  if (!keysResult.metered) return;
+  const q = quota.check(keysResult.keys);
   if (!q.allowed) {
     throw new QuotaExceededError(q.used ?? 0, q.limit ?? 0, q.retryAfterSeconds ?? 0);
   }
-  quota.record(keys);
+  quota.record(keysResult.keys);
 }
 
 /**

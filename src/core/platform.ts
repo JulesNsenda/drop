@@ -68,7 +68,12 @@ import {
   shouldHoldForPromotion,
   type PromotionMode,
 } from '../managers/guardrail/promotion';
-import { getPrincipalQuota, resetPrincipalQuota } from '../managers/guardrail/principal-quota';
+import {
+  getPrincipalQuota,
+  resetPrincipalQuota,
+  getMailQuota,
+  resetMailQuota,
+} from '../managers/guardrail/principal-quota';
 import { isExpired } from '../managers/guardrail/ephemeral';
 import { checkDetachCooldown, checkDumpByteBudget } from '../managers/guardrail/detach-limits';
 import {
@@ -854,6 +859,27 @@ export class DropPlatform {
       );
       await getPrincipalQuota(quotaStore).initialize();
 
+      // The mail quota (DROP-154) needs the same treatment, and for the same
+      // reason spelled out above: bound to `dropRoot`, not to the process CWD.
+      // Left bare it would resolve relative to wherever the service happened to
+      // be started, and — with no `initialize()` — never load the counts it
+      // wrote last time, so a restart would hand out a fresh allowance. That is
+      // the bypass `failClosedWhenFull` exists to close, arriving by the back
+      // door.
+      //
+      // Initialized here, BEFORE `initializeServices()`, so it is ready before
+      // any route that sends mail can reach it. Its limits are baked in by
+      // `getMailQuota` itself (its own env vars, distinct from the deploy ones
+      // above — see `mailPrincipalLimit`/`mailOwnerLimit` in
+      // principal-quota.ts), not passed here.
+      const mailQuotaStore = path.join(
+        this.config.dropRoot,
+        'data',
+        'drop-svc',
+        'mail-quotas.json'
+      );
+      await getMailQuota(mailQuotaStore).initialize();
+
       // Initialize services
       await this.initializeServices();
 
@@ -1089,6 +1115,17 @@ export class DropPlatform {
     this.breakerKeys.clear();
     resetDeployBreaker();
     resetPrincipalQuota();
+
+    // Flush BEFORE resetting: a quota whose counts only ever live in memory
+    // means a restart hands every principal a fresh allowance, which for an
+    // outbound mail channel is the whole cap.
+    try {
+      await getMailQuota().flush();
+    } catch {
+      // best-effort, matching the other flushes above — shutdown must not hang
+      // on a store write.
+    }
+    resetMailQuota();
 
     // Stop API server
     if (this.apiServer) {

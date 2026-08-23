@@ -16,6 +16,7 @@ import { getDetector, parseDropYaml, DetectionResult } from './detector';
 import * as diskUtils from '../utils/disk';
 import { createApiKey, deleteApiKeysByName } from '../api/middleware/auth';
 import { setPublicUrl } from '../api/runtime-config';
+import { getMailQuota, resetMailQuota } from '../managers/guardrail/principal-quota';
 
 // These are pipeline/service unit tests — they never exercise the HTTP API, so
 // disable it (createPlatform reads DROP_ENABLE_API when no enableApi is passed).
@@ -605,6 +606,29 @@ describe('DropPlatform', () => {
       expect(platform.getProcessManager()).not.toBeNull();
       expect(platform.getRouter()).not.toBeNull();
     });
+
+    // DROP-154: the mail quota needs the same DROP_ROOT-bound + initialize()
+    // treatment the deploy quota already gets (see the `start()` comment) —
+    // left bare it resolves relative to the process CWD and never loads
+    // counts from a prior run, which for `failClosedWhenFull` is a bypass
+    // arriving by the back door. Asserted directly against the singleton
+    // (not just "start() doesn't throw") because a platform boot that never
+    // calls `getMailQuota(mailQuotaStore).initialize()` at all would still
+    // pass every other test in this file.
+    it('initializes the mail quota bound to dropRoot, not the process CWD', async () => {
+      await platform.start();
+
+      const quota = getMailQuota();
+      const expectedPath = path.join(tempDir, 'data', 'drop-svc', 'mail-quotas.json');
+      // getMailQuota() with no args never throws — it just returns whatever
+      // instance exists. Reconfiguring it to a DIFFERENT path is what would
+      // throw (see getMailQuota's own doc), so that's the discriminator: if
+      // start() bound it to `tempDir` as expected, asking for the same path
+      // back is a silent no-op; asking for the CWD-relative default would
+      // throw "already initialized at ... cannot reconfigure".
+      expect(() => getMailQuota(expectedPath)).not.toThrow();
+      expect(quota).toBe(getMailQuota(expectedPath));
+    });
   });
 
   describe('stop', () => {
@@ -624,6 +648,45 @@ describe('DropPlatform', () => {
       await platform.stop();
 
       expect(platform.isActive()).toBe(false);
+    });
+
+    // DROP-154: counts live in memory only until flushed — a quota that is
+    // reset without first flushing would hand every principal a fresh
+    // allowance across a restart, which for `failClosedWhenFull` is the
+    // exact bypass the flush-before-reset ordering exists to close.
+    it('flushes the mail quota before resetting it', async () => {
+      await platform.start();
+      const quota = getMailQuota();
+      const flushSpy = jest.spyOn(quota, 'flush');
+      const expectedPath = path.join(tempDir, 'data', 'drop-svc', 'mail-quotas.json');
+
+      await platform.stop();
+
+      expect(flushSpy).toHaveBeenCalled();
+      // A fresh getMailQuota(expectedPath) call after stop() must construct a
+      // NEW instance rather than reuse the stopped platform's — resetMailQuota()
+      // ran, matching resetPrincipalQuota()'s own established behaviour. Passing
+      // the same path back (rather than a bare call) keeps this test from
+      // itself leaving a stray default-path singleton for the next test.
+      const fresh = getMailQuota(expectedPath);
+      expect(fresh).not.toBe(quota);
+      // Clean up the instance THIS assertion itself just constructed — this
+      // test's own stop() already reset the singleton once; leaving the
+      // re-probed instance in place would otherwise leak into the next test.
+      resetMailQuota();
+    });
+
+    it('does not let a failed flush stop the mail quota from being reset (best-effort, matching the other shutdown flushes)', async () => {
+      await platform.start();
+      const quota = getMailQuota();
+      jest.spyOn(quota, 'flush').mockRejectedValue(new Error('disk full'));
+      const expectedPath = path.join(tempDir, 'data', 'drop-svc', 'mail-quotas.json');
+
+      await expect(platform.stop()).resolves.toBeUndefined();
+
+      const fresh = getMailQuota(expectedPath);
+      expect(fresh).not.toBe(quota);
+      resetMailQuota();
     });
   });
 

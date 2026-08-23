@@ -126,6 +126,7 @@ docs/plans/**
 !docs/HETZNER-DEPLOY.md
 !docs/HTTPS-SETUP.md
 !docs/LOCAL-TESTING.md
+!docs/MAIL.md
 !docs/VERSION-ROADMAP.md
 # docs/specs and docs/examples publish by FILE TYPE, not wholesale. A bare
 # `!docs/specs/` would re-include the entire subtree, making it opt-OUT — so an

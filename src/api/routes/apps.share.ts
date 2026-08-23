@@ -109,9 +109,14 @@ import {
   type AppAccessPolicy,
 } from '../../managers/app/app-config';
 import { getSettingsManager } from '../../managers/settings/settings-manager';
+import { getPublicUrl, getDomainSuffix } from '../runtime-config';
 import { logActivityFor } from '../../managers/activity';
 import { gateEnforced } from '../../managers/guardrail/access-gate';
+import { getMailQuota } from '../../managers/guardrail/principal-quota';
+import { sendTemplatedMail } from '../../managers/mailer/mailer';
+import { isLocalhostDomain } from '../../utils/domain-validator';
 import { MAX_ACCESS_ALLOW_ENTRIES, MAX_USER_ID_LENGTH, requireAuthForAccessRoutes } from './access-limits';
+import { checkMailQuota } from './mail-quota';
 
 const shareRoutes = new Hono();
 
@@ -132,6 +137,110 @@ async function reEmit(ops: PlatformOps, name: string): Promise<string | undefine
     return undefined;
   } catch (err) {
     return err instanceof Error ? err.message : 'Failed to re-emit the route';
+  }
+}
+
+/**
+ * Best-effort "you now have access" notification to a freshly-granted user
+ * (DROP-154 §7/§9) — the mailer's first real consumer.
+ *
+ * Fires only after the grant is already persisted, and can NEVER change the
+ * response the caller already committed to. The call site fires this with
+ * `void`, never `await` (the `void tryLogActivity` idiom used elsewhere in
+ * this codebase) — awaiting would (a) add up to the mailer's whole send
+ * deadline to a UI action, and (b) hand a caller a TIMING ORACLE: every
+ * refusal below returns in microseconds while a real relay attempt blocks,
+ * so an owner could infer "this user has an email on file" from response
+ * latency alone even though the response BODY never varies (Gate 2
+ * finding). The outer try/catch is still defense in depth even though
+ * `sendTemplatedMail` is documented to never throw.
+ *
+ * Gated on `getShareNotificationsEnabled()` (default OFF) — read live, same
+ * as `appSharingEnabled` above, for the same restart-to-flip-a-toggle reason.
+ * DROP does not verify email addresses (`createUser`/`updateUser` enforce
+ * neither uniqueness nor validation), so this notification is an operator's
+ * explicit opt-in to a known tradeoff, not a default nobody chose.
+ *
+ * `appUrl` is PLATFORM-derived (`<name>.<domainSuffix>`) ONLY — never
+ * `computeAppUrl`, which resolves from the app's OWN drop.yaml `domains` /
+ * `customDomain`. Those fields are tenant-authored, and this message already
+ * carries an attacker-chosen app name (`isValidAppName` permits e.g.
+ * `password-reset-required`) and an attacker-chosen sharer name (the signup
+ * grammar permits `IT-Support`) inside a DKIM/SPF-aligned mail from the
+ * operator's own relay — adding a tenant-controlled DOMAIN on top of that
+ * would be a phishing primitive borrowing the operator's sender reputation,
+ * not "an app name and a username" (Gate 2 finding). `platformUrl` (the
+ * dashboard) is the link this notification actually leads with; `appUrl`
+ * exists only because `ShareNotificationVars` requires it.
+ *
+ * Every refusal is LOGGED via `logActivityFor` (`mail-send-failed`), never a
+ * bare `return` — this subsystem's own rule (`principal-quota.ts`'s header,
+ * `.claude/CLAUDE.md`): "exceeding a limit returns a structured refusal,
+ * never a silent kill". Without it, an owner sharing with enough colleagues
+ * to trip the quota would see every later grant stop notifying with no way
+ * to tell that apart from "mail was never configured" (Gate 2 finding).
+ * `logActivityFor` never throws and never touches the response this
+ * function already cannot affect.
+ */
+async function notifyShareGrant(requester: AuthContext, app: AppState, targetUserId: string): Promise<void> {
+  const refuse = (detail: string) =>
+    logActivityFor(requester, { action: 'mail-send-failed', appName: app.name, detail });
+
+  try {
+    if (!getSettingsManager().getShareNotificationsEnabled()) return;
+
+    const target = getUserById(targetUserId);
+    if (!target?.email) return; // no address on file — not a refusal, nothing to log
+
+    // Platform-derived only — see the file header above. Undefined on a
+    // localhost suffix, mirroring `computeAppUrl`'s own rule, without ever
+    // consulting the app's own domains/customDomain.
+    const domain = `${app.name}.${getDomainSuffix()}`;
+    const appUrl = isLocalhostDomain(domain) ? undefined : `https://${domain}`;
+    const platformUrl = getPublicUrl();
+    // Both variables are typed as required strings in `ShareNotificationVars`
+    // — nothing sensible to link to without them, so skip rather than send a
+    // broken mail. A dev/localhost box choosing this is not a refusal worth
+    // logging.
+    if (!appUrl || !platformUrl) return;
+
+    // checkMailQuota (mail-quota.ts) — shared with POST /admin/mail/test against
+    // this same singleton. Mail's `keysFor` has no unmetered branch (unlike
+    // deploys) — an absent principal refuses rather than sending unmetered.
+    const admission = checkMailQuota({ principalId: requester.principalId, actorUserId: requester.userId });
+    if (!admission.allowed) {
+      await refuse(`share notification refused: ${admission.reason}`);
+      return;
+    }
+
+    const result = await sendTemplatedMail('share-notification', target.email, {
+      appName: app.name,
+      // The GRANTING user, resolved server-side — never anything from the
+      // request body. `requester.userId` is exactly the id this grant just
+      // stamped into `grantedBy` for `targetUserId`.
+      sharerName: getUserById(requester.userId)?.username ?? requester.username,
+      appUrl,
+      platformUrl,
+    });
+
+    // Charge the allowance only once the relay was actually dialed — an
+    // unconfigured relay (`status: 'unavailable'`) never contacts anything,
+    // and counting it against the quota would refuse the first REAL sends
+    // once an operator finally configures mail (Gate 2 finding). POST
+    // /admin/mail/test now follows this same rule (Gate 5 — it used to
+    // record before sending).
+    if (result.status === 'unavailable') return;
+    getMailQuota().record(admission.keys);
+    if (result.failure) {
+      // ADMIN-FACING ONLY (`MailFailureDetail`'s own doc comment) — logged
+      // for whoever reads the activity log, never surfaced on this
+      // tenant-reachable response.
+      await refuse(`share notification relay attempt failed: ${result.failure.reason}`);
+    }
+  } catch (err) {
+    // Defense in depth — `sendTemplatedMail` never throws, but this boundary
+    // must hold on its own rather than trust that.
+    console.warn('[apps.share] share notification failed:', err instanceof Error ? err.message : err);
   }
 }
 
@@ -330,6 +439,8 @@ shareRoutes.post('/:name/share', async c => {
     hadPolicyBefore: boolean;
     ineligibleReason?: GrantIneligibleReason;
     adminAuthoredCount?: number;
+    /** Set only on a fresh grant — the id `notifyShareGrant` below mails. */
+    targetUserId?: string;
   } = { outcome: 'granted', hadPolicyBefore: false };
 
   const updatedConfig = await getAppConfigService().setAccessPolicy(name, existing => {
@@ -381,6 +492,7 @@ shareRoutes.post('/:name/share', async c => {
       grant.adminAuthoredCount = allow.filter(id => grantedByMap[id] !== requester.userId).length;
       return NO_CHANGE;
     }
+    grant.targetUserId = liveUser!.id;
     return {
       mode: 'drop-users',
       allow: [...allow, liveUser!.id],
@@ -443,6 +555,13 @@ shareRoutes.post('/:name/share', async c => {
     const detail =
       isAdminCaller && requester.userId !== app.userId ? `${username} (admin-granted)` : username;
     await logActivityFor(requester, { action: 'access-share-granted', appName: name, detail });
+    // Fired only for a FRESH grant, never a re-grant of an existing entry
+    // (`already-granted` is a distinct outcome) — see `notifyShareGrant`'s
+    // own doc comment for why this can never change the response above, and
+    // for why it is fired with `void` rather than `await` (Gate 2 fix #2).
+    if (grant.targetUserId) {
+      void notifyShareGrant(requester, app, grant.targetUserId);
+    }
   }
 
   // The caller's own view only, mirroring GET — never the whole `allow`

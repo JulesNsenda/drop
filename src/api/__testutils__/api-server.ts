@@ -21,6 +21,7 @@ import { getActivityLog, resetActivityLog } from '../../managers/activity';
 import { resetRateLimits } from '../middleware/rate-limit';
 import { resetPlatformOps } from '../platform-ops';
 import { getSettingsManager, resetSettingsManager } from '../../managers/settings/settings-manager';
+import { getMailCredentialStore, resetMailCredentialStore } from '../../managers/mailer/mail-credential';
 
 export interface TestApiServer {
   tempDir: string;
@@ -75,6 +76,19 @@ export async function createTestApiServer(opts: CreateTestApiServerOptions): Pro
   // tests green here, red on the runner.
   resetSettingsManager();
   getSettingsManager({ settingsFilePath: path.join(tempDir, 'settings.json') });
+  // The mail credential store self-defaults its paths from DROP_ROOT — left
+  // unbound, any suite that hits a route touching it (e.g.
+  // GET /admin/settings) reads and, via a test-send, could write this
+  // machine's real `mail-credential.json`/`encryption.key`. Bind it into
+  // tempDir like every other store above, and clear the env-password escape
+  // hatch so `resolveMailPassword` can't pick up whatever happens to be set
+  // in this shell either.
+  resetMailCredentialStore();
+  delete process.env.DROP_SMTP_PASSWORD;
+  getMailCredentialStore({
+    credentialFilePath: path.join(tempDir, 'mail-credential.json'),
+    keyFilePath: path.join(tempDir, 'encryption.key'),
+  });
 
   const server = new ApiServer({
     port: opts.port,
@@ -101,6 +115,7 @@ export async function teardownTestApiServer(
   // Mirrors the bind above — otherwise the next suite in this worker inherits a
   // manager pointing into a tempDir that is about to be removed.
   resetSettingsManager();
+  resetMailCredentialStore();
   jest.restoreAllMocks();
   await fs.rm(t.tempDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 }
