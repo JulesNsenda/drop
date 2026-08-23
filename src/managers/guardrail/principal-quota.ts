@@ -423,9 +423,19 @@ let mailInstance: PrincipalQuota | null = null;
  * deploys ("Deploy quota exceeded... Retry in Xs") — a mail caller catching
  * it should not surface that string to a user.
  */
-export function getMailQuota(storePath?: string): PrincipalQuota {
+export function getMailQuota(
+  storePath?: string,
+  opts?: Pick<PrincipalQuotaOptions, 'principalLimit' | 'ownerLimit' | 'windowMs'>
+): PrincipalQuota {
   if (!mailInstance) {
     mailInstance = new PrincipalQuota(storePath ?? 'data/drop-svc/mail-quotas.json', {
+      ...opts,
+      // Not overridable by a caller: these two are what make this instance a
+      // MAIL limiter rather than a second deploy one. An absent principal is
+      // refused (an unmetered outbound channel is not the same thing as
+      // automation with nothing to attribute volume to), and a full tracking
+      // table fails closed (otherwise anyone who can mint principals evades
+      // the per-principal cap entirely).
       unmeteredWithoutPrincipal: false,
       failClosedWhenFull: true,
     });

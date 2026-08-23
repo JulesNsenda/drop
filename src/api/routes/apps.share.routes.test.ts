@@ -39,8 +39,11 @@ import {
 } from '../../managers/app/app-config';
 import { getSettingsManager, resetSettingsManager } from '../../managers/settings/settings-manager';
 import type { AccessGateVerdict, AccessGateBlocker } from '../../managers/guardrail/access-gate';
+import { getMailQuota, resetMailQuota } from '../../managers/guardrail/principal-quota';
+import { setPublicUrl } from '../runtime-config';
 import { MAX_USER_ID_LENGTH } from './access-limits';
 import * as atomicWrite from '../../utils/atomic-write';
+import * as mailer from '../../managers/mailer/mailer';
 
 const ENFORCEABLE: AccessGateVerdict = {
   enforceable: true,
@@ -642,6 +645,125 @@ describe('/apps/:name/share (DROP-153 owner sharing)', () => {
         writeSpy.mockRestore();
       }
     );
+  });
+
+  describe('POST (grant) — share notification (DROP-154 §7/§9)', () => {
+    let sendMock: jest.SpyInstance;
+
+    beforeEach(async () => {
+      // The mail quota is a module singleton — rebind it to a temp path
+      // BEFORE the route ever touches it, or `record()` writes into the
+      // repo tree at its CWD-relative fallback and counts leak across tests.
+      resetMailQuota();
+      getMailQuota(path.join(t.tempDir, 'mail-quotas.json'));
+      setPublicUrl('https://dashboard.example.com');
+      // Gives `myapp` a real, non-localhost domain so `computeAppUrl` returns
+      // something rather than `undefined` — same recipe as
+      // app-access.routes.test.ts, but scoped to this app's own config
+      // rather than the whole test-server's domainSuffix (every other
+      // describe in this file relies on the default).
+      await getAppConfigService().upsertConfig('myapp', {
+        type: 'nodejs',
+        port: 4000,
+        domains: ['myapp.example.com'],
+      });
+      sendMock = jest.spyOn(mailer, 'sendTemplatedMail').mockResolvedValue({ status: 'sent' });
+    });
+
+    afterEach(() => {
+      resetMailQuota();
+      setPublicUrl(undefined);
+      sendMock.mockRestore();
+    });
+
+    it('sends share-notification with the correct vars when enabled and the target has an email', async () => {
+      await getSettingsManager().setShareNotificationsEnabled(true);
+      await createUser('withmail-send', 'password123', 'user', 'withmail-send@example.com');
+
+      const res = await post('myapp', bearer(ownerToken), { username: 'withmail-send', gateApp: true });
+      expect(res.status).toBe(200);
+      expect(sendMock).toHaveBeenCalledTimes(1);
+      expect(sendMock).toHaveBeenCalledWith('share-notification', 'withmail-send@example.com', {
+        appName: 'myapp',
+        sharerName: 'owner',
+        appUrl: 'https://myapp.example.com',
+        platformUrl: 'https://dashboard.example.com',
+      });
+    });
+
+    it('does NOT send when share notifications are disabled — the default', async () => {
+      // getShareNotificationsEnabled() defaults false — no explicit call.
+      await createUser('withmail-off', 'password123', 'user', 'withmail-off@example.com');
+
+      const res = await post('myapp', bearer(ownerToken), { username: 'withmail-off', gateApp: true });
+      expect(res.status).toBe(200);
+      expect(sendMock).not.toHaveBeenCalled();
+    });
+
+    it('does NOT send when the target has no email on file — skips silently, no error', async () => {
+      await getSettingsManager().setShareNotificationsEnabled(true);
+      // targetUsername ('alice') was created in the outer beforeEach with no email.
+      const res = await post('myapp', bearer(ownerToken), { username: targetUsername, gateApp: true });
+      expect(res.status).toBe(200);
+      expect(sendMock).not.toHaveBeenCalled();
+    });
+
+    it('does NOT re-notify on an idempotent re-grant of an existing entry', async () => {
+      await getSettingsManager().setShareNotificationsEnabled(true);
+      await createUser('withmail-regrant', 'password123', 'user', 'withmail-regrant@example.com');
+
+      await post('myapp', bearer(ownerToken), { username: 'withmail-regrant', gateApp: true });
+      expect(sendMock).toHaveBeenCalledTimes(1);
+      sendMock.mockClear();
+
+      const res = await post('myapp', bearer(ownerToken), { username: 'withmail-regrant' }); // already-granted
+      expect(res.status).toBe(200);
+      expect(sendMock).not.toHaveBeenCalled();
+    });
+
+    it('skips the send silently when the mail quota refuses — the grant still succeeds unchanged', async () => {
+      await getSettingsManager().setShareNotificationsEnabled(true);
+      await createUser('withmail-quota', 'password123', 'user', 'withmail-quota@example.com');
+      jest.spyOn(getMailQuota(), 'check').mockReturnValue({ allowed: false });
+      const recordSpy = jest.spyOn(getMailQuota(), 'record');
+
+      const res = await post('myapp', bearer(ownerToken), { username: 'withmail-quota', gateApp: true });
+      expect(res.status).toBe(200);
+      expect(sendMock).not.toHaveBeenCalled();
+      expect(recordSpy).not.toHaveBeenCalled();
+    });
+
+    it('never varies the grant response with the send outcome — byte-identical body for sent, unavailable, and a rejected send', async () => {
+      await getSettingsManager().setShareNotificationsEnabled(true);
+      const target = await createUser(
+        'withmail-outcome',
+        'password123',
+        'user',
+        'withmail-outcome@example.com'
+      );
+
+      sendMock.mockResolvedValueOnce({ status: 'sent' });
+      const res1 = await post('myapp', bearer(ownerToken), { username: 'withmail-outcome', gateApp: true });
+      expect(res1.status).toBe(200);
+      const body1 = await res1.text();
+
+      // Revoke so the next grant is a FRESH one again, not `already-granted`
+      // — the response wording is identical either way (Gate 2 fix #4), but
+      // this keeps the scenario matched to "a successful grant" throughout.
+      await delOne('myapp', target.id, bearer(ownerToken));
+
+      sendMock.mockResolvedValueOnce({ status: 'unavailable' });
+      const res2 = await post('myapp', bearer(ownerToken), { username: 'withmail-outcome' });
+      expect(res2.status).toBe(200);
+      expect(await res2.text()).toBe(body1);
+
+      await delOne('myapp', target.id, bearer(ownerToken));
+
+      sendMock.mockRejectedValueOnce(new Error('relay exploded'));
+      const res3 = await post('myapp', bearer(ownerToken), { username: 'withmail-outcome' });
+      expect(res3.status).toBe(200);
+      expect(await res3.text()).toBe(body1);
+    });
   });
 
   describe('DELETE /:userId (revoke)', () => {

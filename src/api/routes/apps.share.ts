@@ -109,9 +109,13 @@ import {
   type AppAccessPolicy,
 } from '../../managers/app/app-config';
 import { getSettingsManager } from '../../managers/settings/settings-manager';
+import { getPublicUrl } from '../runtime-config';
 import { logActivityFor } from '../../managers/activity';
 import { gateEnforced } from '../../managers/guardrail/access-gate';
+import { getMailQuota } from '../../managers/guardrail/principal-quota';
+import { sendTemplatedMail } from '../../managers/mailer/mailer';
 import { MAX_ACCESS_ALLOW_ENTRIES, MAX_USER_ID_LENGTH, requireAuthForAccessRoutes } from './access-limits';
+import { computeAppUrl } from './apps';
 
 const shareRoutes = new Hono();
 
@@ -132,6 +136,68 @@ async function reEmit(ops: PlatformOps, name: string): Promise<string | undefine
     return undefined;
   } catch (err) {
     return err instanceof Error ? err.message : 'Failed to re-emit the route';
+  }
+}
+
+/**
+ * Best-effort "you now have access" notification to a freshly-granted user
+ * (DROP-154 §7/§9) — the mailer's first real consumer.
+ *
+ * Fires only after the grant is already persisted, and can NEVER change the
+ * response the caller already committed to: every exit below is a silent
+ * `return`, and the one call site awaits this inside a try/catch of its own
+ * for defense in depth even though `sendTemplatedMail` is documented to
+ * never throw.
+ *
+ * Gated on `getShareNotificationsEnabled()` (default OFF) — read live, same
+ * as `appSharingEnabled` above, for the same restart-to-flip-a-toggle reason.
+ * DROP does not verify email addresses (`createUser`/`updateUser` enforce
+ * neither uniqueness nor validation), so this notification is an operator's
+ * explicit opt-in to a known tradeoff, not a default nobody chose.
+ */
+async function notifyShareGrant(requester: AuthContext, app: AppState, targetUserId: string): Promise<void> {
+  try {
+    if (!getSettingsManager().getShareNotificationsEnabled()) return;
+
+    const target = getUserById(targetUserId);
+    if (!target?.email) return; // no address on file — skip silently, no error
+
+    // Forced to https, mirroring `appOrigin` in app-access.ts: `computeAppUrl`
+    // is the dashboard's URL-DISPLAY helper and honours the tenant's own
+    // `tls: {disabled: true}`, which for a mailed link would put it on the
+    // wire in cleartext — the fourth place this same tenant-authored field
+    // has had to be neutralised.
+    const rawAppUrl = computeAppUrl(app);
+    const appUrl = rawAppUrl?.replace(/^http:\/\//, 'https://');
+    const platformUrl = getPublicUrl();
+    // Both variables are typed as required strings in `ShareNotificationVars`
+    // — nothing sensible to link to without them, so skip rather than send a
+    // broken mail.
+    if (!appUrl || !platformUrl) return;
+
+    const quota = getMailQuota();
+    const keys = quota.keysFor({ principalId: requester.principalId, actorUserId: requester.userId });
+    // Mail's `keysFor` has no unmetered branch (unlike deploys) — an absent
+    // principal refuses rather than sending unmetered.
+    if (!keys.metered) return;
+    if (!quota.check(keys.keys).allowed) return; // quota refusal skips silently, never fails the grant
+    // `record` can itself refuse (fails closed when the tracked-principal
+    // table is full) — honour that return value rather than sending anyway.
+    if (!quota.record(keys.keys)) return;
+
+    await sendTemplatedMail('share-notification', target.email, {
+      appName: app.name,
+      // The GRANTING user, resolved server-side — never anything from the
+      // request body. `requester.userId` is exactly the id this grant just
+      // stamped into `grantedBy` for `targetUserId`.
+      sharerName: getUserById(requester.userId)?.username ?? requester.username,
+      appUrl,
+      platformUrl,
+    });
+  } catch (err) {
+    // Defense in depth — `sendTemplatedMail` never throws, but this boundary
+    // must hold on its own rather than trust that.
+    console.warn('[apps.share] share notification failed:', err instanceof Error ? err.message : err);
   }
 }
 
@@ -330,6 +396,8 @@ shareRoutes.post('/:name/share', async c => {
     hadPolicyBefore: boolean;
     ineligibleReason?: GrantIneligibleReason;
     adminAuthoredCount?: number;
+    /** Set only on a fresh grant — the id `notifyShareGrant` below mails. */
+    targetUserId?: string;
   } = { outcome: 'granted', hadPolicyBefore: false };
 
   const updatedConfig = await getAppConfigService().setAccessPolicy(name, existing => {
@@ -381,6 +449,7 @@ shareRoutes.post('/:name/share', async c => {
       grant.adminAuthoredCount = allow.filter(id => grantedByMap[id] !== requester.userId).length;
       return NO_CHANGE;
     }
+    grant.targetUserId = liveUser!.id;
     return {
       mode: 'drop-users',
       allow: [...allow, liveUser!.id],
@@ -443,6 +512,12 @@ shareRoutes.post('/:name/share', async c => {
     const detail =
       isAdminCaller && requester.userId !== app.userId ? `${username} (admin-granted)` : username;
     await logActivityFor(requester, { action: 'access-share-granted', appName: name, detail });
+    // Fired only for a FRESH grant, never a re-grant of an existing entry
+    // (`already-granted` is a distinct outcome) — see `notifyShareGrant`'s
+    // own doc comment for why this can never change the response above.
+    if (grant.targetUserId) {
+      await notifyShareGrant(requester, app, grant.targetUserId);
+    }
   }
 
   // The caller's own view only, mirroring GET — never the whole `allow`
