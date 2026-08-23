@@ -21,7 +21,7 @@ import * as path from 'path';
 import { createUser } from '../middleware/auth';
 import { getTestToken } from '../__testutils__/auth';
 import { getStateManager } from '../../managers/app/state-manager';
-import { setPublicUrl } from '../runtime-config';
+import { setPublicUrl, setApiRuntimeConfig } from '../runtime-config';
 import {
   createTestApiServer,
   teardownTestApiServer,
@@ -81,12 +81,21 @@ describe('/app-access (DROP-152 the gate)', () => {
     await sm.registerApp(APP, path.join(t.tempDir, 'webapps', APP), 'nodejs');
     await sm.updateApp(APP, { userId: ownerId, port: 4000 });
 
-    await getAppConfigService().setAccessPolicy(APP, { mode: 'drop-users', allow: [allowedId] });
+    // Updater form: the whole-policy signature is now clear-only, so provenance
+    // can never be erased by a caller that forgets to carry it forward.
+    await getAppConfigService().setAccessPolicy(APP, () => ({
+      mode: 'drop-users' as const,
+      allow: [allowedId],
+    }));
     origin = `https://${APP}.example.com`;
   });
 
   afterEach(async () => {
     setPublicUrl(undefined);
+    // `setApiRuntimeConfig` has no way to clear a field back to "unset" (see
+    // its own comment), so a test that turns the kill switch off must restore
+    // it explicitly or every test declared after it inherits a disabled gate.
+    setApiRuntimeConfig({ accessGateEnabled: true });
     resetAppConfigService();
     resetAccessLog();
     await teardownTestApiServer(t);
@@ -129,7 +138,7 @@ describe('/app-access (DROP-152 the gate)', () => {
       // right — canOpen's contract requires a policy — but it must be terminal,
       // not a redirect, or the app is bricked in a loop rather than with an
       // explanation.
-      await getAppConfigService().setAccessPolicy(APP, undefined);
+      await getAppConfigService().setAccessPolicy(APP, () => undefined);
       const res = await verify({ 'x-forwarded-uri': '/' });
       expect(res.status).toBe(403);
       expect(res.headers.get('location')).toBeNull();
@@ -212,6 +221,75 @@ describe('/app-access (DROP-152 the gate)', () => {
       const location = new URL(res.headers.get('location') as string);
       expect(location.searchParams.get('return')).toBe('/');
     });
+  });
+
+  describe('verify — DROP-153 kill switch', () => {
+    // The gate lives in Caddy. A guard emitted before the operator flipped
+    // this flag off can still be loaded, so with the flag off `verify` must
+    // ADMIT rather than refuse — a stale guard must never be the thing
+    // deciding access once the platform reports the app as ungated.
+    const today = (): string => new Date().toISOString().slice(0, 10);
+
+    async function readAccessRows(): Promise<Record<string, unknown>[]> {
+      await getAccessLog().flush();
+      const file = path.join(t.tempDir, 'logs', 'access', `${today()}.access.log`);
+      const content = await fs.readFile(file, 'utf-8');
+      return content
+        .split('\n')
+        .filter(l => l.length > 0)
+        .map(l => JSON.parse(l));
+    }
+
+    it('204s a request that would otherwise 403 (valid session, not on the allow list)', async () => {
+      setApiRuntimeConfig({ accessGateEnabled: false });
+      const token = await mintAppSessionToken(outsiderId, 'outsider', APP, origin);
+      const res = await verify({ cookie: `${sessionCookieName(APP)}=${token}` });
+      expect(res.status).toBe(204);
+    });
+
+    it('204s a request with NO session at all, rather than the 302', async () => {
+      setApiRuntimeConfig({ accessGateEnabled: false });
+      const res = await verify({ 'x-forwarded-uri': '/reports' });
+      expect(res.status).toBe(204);
+      expect(res.headers.get('location')).toBeNull();
+      expect(res.headers.get('set-cookie')).toBeNull();
+    });
+
+    it('records an access-log entry with reason "gate-disabled"', async () => {
+      setApiRuntimeConfig({ accessGateEnabled: false });
+      await verify({ 'x-forwarded-uri': '/' });
+
+      const rows = await readAccessRows();
+      const row = rows.find(r => r.reason === 'gate-disabled');
+      expect(row).toBeTruthy();
+      expect(row?.decision).toBe('admit');
+      expect(row?.appName).toBe(APP);
+    });
+
+    it('still refuses an invalid app name even with the gate disabled', async () => {
+      // A single path segment (routes fine as `:app`) that fails
+      // isValidAppName's creation-time grammar (dots are not allowed) — the
+      // kill switch must not bypass this check.
+      setApiRuntimeConfig({ accessGateEnabled: false });
+      const res = await t.hono.request('/api/v1/app-access/bad.name/verify', {
+        headers: { 'x-forwarded-uri': '/' },
+      });
+      expect(res.status).toBe(403);
+    });
+
+    it('leaves every existing behaviour unchanged with the flag explicitly on', async () => {
+      setApiRuntimeConfig({ accessGateEnabled: true });
+      const token = await mintAppSessionToken(outsiderId, 'outsider', APP, origin);
+      const res = await verify({ cookie: `${sessionCookieName(APP)}=${token}` });
+      expect(res.status).toBe(403);
+    });
+
+    // No "flag unset" case here: the `afterEach` above always leaves module
+    // state at an explicit `true`, which cannot distinguish "unset" from "set
+    // to true" — a route-level default would pass this test just as easily as
+    // the real fail-closed behaviour. That property is already pinned, on a
+    // genuinely unwired module via `jest.isolateModules`, in
+    // runtime-config.test.ts.
   });
 
   describe('authorize', () => {

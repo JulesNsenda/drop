@@ -242,6 +242,21 @@ export function servicesRateLimitMiddleware(config?: Partial<RateLimitConfig>) {
   return createRateLimiter('services', { ...DB_CONFIG, ...config });
 }
 
+/**
+ * Dedicated rate limiter for owner-initiated app sharing (DROP-153).
+ * Deliberately its OWN `createRateLimiter` instance rather than a share of
+ * the `services` bucket above: that bucket's budget is already spent by
+ * attach/detach and the admin access-gate routes, and a share/revoke burst
+ * (or a client hammering a refusal) 429ing an unrelated database attach for
+ * the same client is exactly the cross-throttling the per-bucket convention
+ * exists to prevent. Same numbers as DB_CONFIG/services on purpose — first
+ * share triggers `reconfigureRoute`, the same estate-wide Caddyfile
+ * regenerate/reload those buckets are sized against.
+ */
+export function shareRateLimitMiddleware(config?: Partial<RateLimitConfig>) {
+  return createRateLimiter('share', { ...DB_CONFIG, ...config });
+}
+
 /** Reset all rate limit stores (for testing) */
 export function resetRateLimits(): void {
   stores.clear();

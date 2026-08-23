@@ -19,7 +19,7 @@ import { getTestToken } from '../__testutils__/auth';
 import { getStateManager, resetStateManager } from '../../managers/app/state-manager';
 import { getSettingsManager, resetSettingsManager } from '../../managers/settings/settings-manager';
 import { resetPlatformOps } from '../platform-ops';
-import { getPublicUrl, setPublicUrl } from '../runtime-config';
+import { getPublicUrl, setPublicUrl, setApiRuntimeConfig } from '../runtime-config';
 import * as activityModule from '../../managers/activity';
 
 interface GithubWebhookPayload {
@@ -32,12 +32,17 @@ interface UserConnectorsPayload {
   enabled: boolean;
 }
 
+interface AppSharingPayload {
+  enabled: boolean;
+}
+
 interface SettingsPayload {
   publicUrl: string | null;
   source: 'stored' | 'env' | 'unset';
   storedPublicUrl: string | null;
   githubWebhook: GithubWebhookPayload;
   userConnectors: UserConnectorsPayload;
+  appSharing: AppSharingPayload;
 }
 
 interface ApiEnvelope<T> {
@@ -81,6 +86,13 @@ describe('admin settings routes (PRD-041)', () => {
 
   const putUserConnectors = (enabled: unknown, token?: string) =>
     hono.request('/api/v1/admin/settings/user-connectors', {
+      method: 'PUT',
+      headers: authHeader(token ?? adminToken),
+      body: JSON.stringify({ enabled }),
+    });
+
+  const putAppSharing = (enabled: unknown, token?: string) =>
+    hono.request('/api/v1/admin/settings/app-sharing', {
       method: 'PUT',
       headers: authHeader(token ?? adminToken),
       body: JSON.stringify({ enabled }),
@@ -141,6 +153,7 @@ describe('admin settings routes (PRD-041)', () => {
         storedPublicUrl: null,
         githubWebhook: { configured: false, source: 'unset', payloadUrl: null },
         userConnectors: { enabled: true },
+        appSharing: { enabled: false },
       });
     });
 
@@ -158,6 +171,7 @@ describe('admin settings routes (PRD-041)', () => {
           payloadUrl: 'https://env.example.com/api/v1/git/webhook',
         },
         userConnectors: { enabled: true },
+        appSharing: { enabled: false },
       });
     });
 
@@ -178,6 +192,7 @@ describe('admin settings routes (PRD-041)', () => {
           payloadUrl: 'https://stored.example.com/api/v1/git/webhook',
         },
         userConnectors: { enabled: true },
+        appSharing: { enabled: false },
       });
     });
   });
@@ -527,4 +542,135 @@ describe('admin settings routes (PRD-041)', () => {
       expect(res.status).toBe(401);
     });
   });
+
+  describe('GET /admin/settings — appSharing block', () => {
+    it('reports enabled:false by default (key absent)', async () => {
+      const res = await getSettings();
+      const body = (await res.json()) as ApiEnvelope<SettingsPayload>;
+      expect(body.data?.appSharing).toEqual({ enabled: false });
+    });
+  });
+
+  describe('PUT /admin/settings/app-sharing', () => {
+    it('persists true and a subsequent GET reports it', async () => {
+      const res = await putAppSharing(true);
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as ApiEnvelope<AppSharingPayload>;
+      expect(body.data).toEqual({ enabled: true });
+
+      const getRes = await getSettings();
+      const getBody = (await getRes.json()) as ApiEnvelope<SettingsPayload>;
+      expect(getBody.data?.appSharing).toEqual({ enabled: true });
+
+      // Persisted to disk — a fresh manager instance reading the same file sees it.
+      resetSettingsManager();
+      getSettingsManager({ settingsFilePath: path.join(tempDir, 'settings.json') });
+      await getSettingsManager().load();
+      expect(getSettingsManager().getAppSharingEnabled()).toBe(true);
+    });
+
+    it('persists false explicitly and a subsequent GET reports it', async () => {
+      await putAppSharing(true);
+      const res = await putAppSharing(false);
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as ApiEnvelope<AppSharingPayload>;
+      expect(body.data).toEqual({ enabled: false });
+    });
+
+    it('rejects a non-boolean "enabled" value with 400 and does not mutate state', async () => {
+      for (const bad of ['true', 1, null, undefined]) {
+        const res = await putAppSharing(bad);
+        expect(res.status).toBe(400);
+        const body = (await res.json()) as ApiEnvelope<never>;
+        expect(body.success).toBe(false);
+        expect(body.error?.code).toBe('VALIDATION_ERROR');
+      }
+      expect(getSettingsManager().getAppSharingEnabled()).toBe(false);
+    });
+
+    it('records an audit entry reflecting the new value', async () => {
+      const logSpy = jest.spyOn(activityModule, 'logActivityFor').mockResolvedValue();
+
+      await putAppSharing(true);
+
+      expect(logSpy).toHaveBeenCalledTimes(1);
+      expect(logSpy.mock.calls[0][1]).toMatchObject({ action: 'app-sharing-set' });
+    });
+
+    // The contradictory combination (plan item 1). Reported at ENABLE time, not
+    // at boot: the gate switch is a boot-time env var while this one is
+    // runtime-settable, so the contradiction is created by this very request
+    // and a start() check could never see it. Sharing is not refused for it —
+    // the two are independent controls — but without this the admin who caused
+    // it gets a plain 200 while every owner's share is refused, naming a kill
+    // switch the owner cannot see.
+    it('warns when sharing is enabled while the access gate is switched off', async () => {
+      setApiRuntimeConfig({ accessGateEnabled: false });
+      try {
+        const res = await putAppSharing(true);
+        expect(res.status).toBe(200);
+        const body = (await res.json()) as ApiEnvelope<AppSharingPayload & { warning?: string }>;
+        expect(body.data?.enabled).toBe(true);
+        expect(body.data?.warning).toMatch(/access gate is switched off/i);
+      } finally {
+        setApiRuntimeConfig({ accessGateEnabled: true });
+      }
+    });
+
+    it('does not warn when the gate is on, nor when merely disabling sharing', async () => {
+      setApiRuntimeConfig({ accessGateEnabled: true });
+      const on = (await (await putAppSharing(true)).json()) as ApiEnvelope<
+        AppSharingPayload & { warning?: string }
+      >;
+      expect(on.data?.warning).toBeUndefined();
+
+      setApiRuntimeConfig({ accessGateEnabled: false });
+      try {
+        const off = (await (await putAppSharing(false)).json()) as ApiEnvelope<
+          AppSharingPayload & { warning?: string }
+        >;
+        expect(off.data?.warning).toBeUndefined();
+      } finally {
+        setApiRuntimeConfig({ accessGateEnabled: true });
+      }
+    });
+
+    it('rejects a non-object JSON body with 400 without mutating state', async () => {
+      // A top-level number/string/array/null body would make `body.enabled`
+      // undefined and fall straight into the "not a boolean" branch UNLESS a
+      // dereference on `null`/an array first throws a TypeError and surfaces
+      // as a 500 — the same object-shape guard as PUT /settings/user-connectors.
+      await putAppSharing(true);
+      expect(getSettingsManager().getAppSharingEnabled()).toBe(true);
+
+      for (const rawBody of ['123', '"foo"', '[]', 'null']) {
+        const res = await hono.request('/api/v1/admin/settings/app-sharing', {
+          method: 'PUT',
+          headers: authHeader(adminToken),
+          body: rawBody,
+        });
+        expect(res.status).toBe(400);
+        const body = (await res.json()) as ApiEnvelope<never>;
+        expect(body.error?.code).toBe('VALIDATION_ERROR');
+      }
+      expect(getSettingsManager().getAppSharingEnabled()).toBe(true);
+    });
+
+    it('rejects a non-admin request with 403', async () => {
+      await createUser('regular4', 'password123', 'user');
+      const userToken = await getTestToken('regular4', 'password123');
+      const res = await putAppSharing(true, userToken);
+      expect(res.status).toBe(403);
+    });
+
+    it('rejects an unauthenticated request with 401', async () => {
+      const res = await hono.request('/api/v1/admin/settings/app-sharing', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled: true }),
+      });
+      expect(res.status).toBe(401);
+    });
+  });
 });
+

@@ -72,21 +72,67 @@ describe('platform access-gate refusals (DROP-152)', () => {
     };
   };
 
+  /**
+   * The shape every factory in this suite shares. `enableAccessGate` is
+   * passed EXPLICITLY by every factory built on this — never left to
+   * `DEFAULT_CONFIG`'s own env read — because an operator's exported
+   * `DROP_FEATURE_ACCESS_GATE=false` would otherwise flip which world a test
+   * runs in, and some assertions here use `toContain`/`toHaveLength(0)` forms
+   * that would go green for the wrong reason if that happened silently.
+   */
+  const baseConfig = () => ({
+    dropRoot: tempDir,
+    appsDirectory: path.join(tempDir, 'apps'),
+    logLevel: 'error' as const,
+    autoBuild: false,
+    autoStart: false,
+    caddyfilePath: path.join(tempDir, 'Caddyfile'),
+    isolation: 'docker' as const,
+    enableApiAuth: true,
+    enableHttps: true,
+    domainSuffix: 'example.com',
+    apiPort: 3000,
+  });
+
   /** The gate-enforceable shape: docker isolation, auth on, real HTTPS host. */
   const makeEnforceablePlatform = () =>
-    createPlatform({
-      dropRoot: tempDir,
-      appsDirectory: path.join(tempDir, 'apps'),
-      logLevel: 'error',
-      autoBuild: false,
-      autoStart: false,
-      caddyfilePath: path.join(tempDir, 'Caddyfile'),
-      isolation: 'docker',
-      enableApiAuth: true,
-      enableHttps: true,
-      domainSuffix: 'example.com',
-      apiPort: 3000,
-    });
+    createPlatform({ ...baseConfig(), enableAccessGate: true });
+
+  /**
+   * Same enforceable shape, but with the DROP-153 operator kill switch off —
+   * the flag must WITHDRAW enforcement, not merely stop reporting it.
+   */
+  const makeFlagOffPlatform = () =>
+    createPlatform({ ...baseConfig(), enableAccessGate: false });
+
+  /**
+   * Wires a platform's logger to capture every level into its own array —
+   * `attachErrorCapture` below is the common case (only `error` matters), but
+   * the DROP-153 log-LEVEL fixes need `info`/`warn` too: the whole point of
+   * those fixes is which bucket a line lands in, not merely that some line
+   * was written.
+   */
+  const attachLogCapture = (p: DropPlatform): { errors: string[]; warns: string[]; infos: string[] } => {
+    const errors: string[] = [];
+    const warns: string[] = [];
+    const infos: string[] = [];
+    (p as unknown as { logger: { error: unknown } }).logger = {
+      error: (msg: string) => errors.push(msg),
+      warn: (msg: string) => warns.push(msg),
+      info: (msg: string) => infos.push(msg),
+      debug: () => undefined,
+      appEvent: () => undefined,
+      platformEvent: () => undefined,
+    } as never;
+    return { errors, warns, infos };
+  };
+
+  /**
+   * Wires a platform's logger to capture `error` calls into an array, the
+   * same shape `beforeEach` sets up by default — pulled out so a test that
+   * swaps `platform` for `makeFlagOffPlatform()` mid-test can re-attach it.
+   */
+  const attachErrorCapture = (p: DropPlatform): string[] => attachLogCapture(p).errors;
 
   /**
    * A REAL drop.yaml on disk. The gate's hostname/TLS resolution reads the
@@ -99,7 +145,18 @@ describe('platform access-gate refusals (DROP-152)', () => {
     await fs.writeFile(path.join(dir, 'drop.yaml'), contents);
   };
 
+  let savedAccessGateEnv: string | undefined;
+
   beforeEach(() => {
+    // DROP-153: neutralize the operator env var for the DURATION of this
+    // suite. Every factory above already passes `enableAccessGate` as an
+    // explicit constructor field (which wins over the env-derived default),
+    // but this is a second, independent line of defense — a future factory
+    // added to this suite that forgets to do so must still see a known
+    // default rather than whatever the host process happens to export.
+    savedAccessGateEnv = process.env.DROP_FEATURE_ACCESS_GATE;
+    delete process.env.DROP_FEATURE_ACCESS_GATE;
+
     jest.clearAllMocks();
     // The gate's first hop redirects here; without it every verdict is
     // `no-public-url` and the refusal tests would pass for the wrong reason.
@@ -107,18 +164,15 @@ describe('platform access-gate refusals (DROP-152)', () => {
     tempDir = path.join(os.tmpdir(), `drop-access-gate-${Date.now()}-${Math.floor(performance.now())}`);
     platform = makeEnforceablePlatform();
 
-    errors = [];
-    (platform as unknown as { logger: { error: unknown } }).logger = {
-      error: (msg: string) => errors.push(msg),
-      warn: () => undefined,
-      info: () => undefined,
-      debug: () => undefined,
-      appEvent: () => undefined,
-      platformEvent: () => undefined,
-    } as never;
+    errors = attachErrorCapture(platform);
   });
 
   afterEach(async () => {
+    if (savedAccessGateEnv === undefined) {
+      delete process.env.DROP_FEATURE_ACCESS_GATE;
+    } else {
+      process.env.DROP_FEATURE_ACCESS_GATE = savedAccessGateEnv;
+    }
     setPublicUrl(undefined);
     await fs.rm(tempDir, { recursive: true, force: true }).catch(() => undefined);
   });
@@ -348,6 +402,104 @@ describe('platform access-gate refusals (DROP-152)', () => {
       const { addRoute } = (platform as unknown as { router: { addRoute: jest.Mock } }).router;
       expect(addRoute).toHaveBeenCalledTimes(1);
     });
+
+    it('DROP-153: logs the flag-off refusal as a decision, not an error, when nothing else is wrong', async () => {
+      // An otherwise-perfectly-enforceable app: the ONLY blocker is the
+      // operator kill switch. A deliberately-off box would otherwise log
+      // ERROR for this app on every boot forever, burying a real HTTPS or
+      // isolation break under noise nobody reads anymore.
+      platform = makeFlagOffPlatform();
+      errors = attachErrorCapture(platform);
+      wire(configFor({ access: POLICY }));
+
+      await configureRoute();
+
+      const { addRoute } = (platform as unknown as { router: { addRoute: jest.Mock } }).router;
+      expect((addRoute.mock.calls[0][0] as { accessAuth?: unknown }).accessAuth).toBeUndefined();
+      expect(errors).toHaveLength(0);
+      // NOT `true`: there is no gate to apply while the kill switch is the
+      // only reason enforcement is off, so "unapplied" is the wrong axis —
+      // recording `true` here pinned it forever (nothing clears it while the
+      // switch stays off) and drove a Caddy regenerate on every share write.
+      expect(setAccessGateUnapplied).toHaveBeenCalledWith('myapp', undefined);
+    });
+
+    it('DROP-153 (fix): still drops a plaintext hostname and forces TLS for a gated app blocked by something OTHER than the kill switch', async () => {
+      // The flag stays ON (default `platform`); the box trips
+      // `isolation-not-docker`, NOT the kill switch, so `gateWithdrawn` is
+      // false and the app is still, in policy terms, gated — the overall
+      // verdict is just unenforceable for a reason that has nothing to do
+      // with hostnames. `gateEnforced` requires FULL enforceability; keying
+      // the hostname filter and the `tls` override on it (rather than on
+      // `accessPolicy && !gateWithdrawn`) relaxed BOTH for every blocker, not
+      // just the kill switch — so this app's plaintext `.localhost` hostname
+      // would have been served IN THE CLEAR.
+      (platform as unknown as { config: { isolation: string } }).config.isolation = 'none';
+      await writeDropYaml(
+        'myapp',
+        'name: myapp\ndomains:\n  - real.example.com\n  - dev.localhost\ntls:\n  disabled: true\n'
+      );
+      wire(configFor({ access: POLICY }));
+
+      await configureRoute();
+
+      const { addRoute } = (platform as unknown as { router: { addRoute: jest.Mock } }).router;
+      // Genuinely unenforceable (isolation) — no guard.
+      expect((addRoute.mock.calls[0]?.[0] as { accessAuth?: unknown })?.accessAuth).toBeUndefined();
+      // ...but the narrowing/override still ran: the plaintext hostname is
+      // dropped entirely, and the surviving HTTPS one is forced onto TLS
+      // despite the tenant's own `tls: {disabled: true}`.
+      const hostnames = addRoute.mock.calls.map((call: unknown[]) => (call[0] as { hostname: string }).hostname);
+      expect(hostnames).toEqual(['real.example.com']);
+      expect((addRoute.mock.calls[0][0] as { ssl: boolean }).ssl).toBe(true);
+    });
+
+    it('DROP-153: routes a policy-carrying app on the SAME hostnames as an identical unpoliced app, when the flag is off', async () => {
+      // The parity case for item 5: narrowing hostnames on `accessPolicy`
+      // alone (rather than on whether the gate is actually enforced) used to
+      // leave an app whose only hostname the gate-safety filter drops
+      // (localhost, in this fixture) ROUTED NOWHERE once the kill switch
+      // went off — worse than simply ungated. An identical app that never
+      // carried a policy is the honest baseline for "no narrowing happened".
+      platform = makeFlagOffPlatform();
+      errors = attachErrorCapture(platform);
+      await writeDropYaml('gated', 'name: gated\ndomains:\n  - dev.localhost\n');
+      await writeDropYaml('ungated', 'name: ungated\ndomains:\n  - dev.localhost\n');
+
+      wire(configFor({ name: 'gated', access: POLICY }));
+      await configureRoute('gated');
+      const gatedHostnames = (platform as unknown as { router: { addRoute: jest.Mock } }).router.addRoute.mock.calls.map(
+        (call: unknown[]) => (call[0] as { hostname: string }).hostname
+      );
+
+      wire(configFor({ name: 'ungated' }));
+      await configureRoute('ungated');
+      const ungatedHostnames = (platform as unknown as { router: { addRoute: jest.Mock } }).router.addRoute.mock.calls.map(
+        (call: unknown[]) => (call[0] as { hostname: string }).hostname
+      );
+
+      expect(gatedHostnames).toEqual(ungatedHostnames);
+      expect(gatedHostnames).toEqual(['dev.localhost']);
+    });
+
+    it('DROP-153 (fix): logs at INFO, not ERROR, when the kill switch is off even with a SECOND blocker present', async () => {
+      // A `none`-isolation dev box with the flag off trips BOTH
+      // `feature-disabled` and `isolation-not-docker`. Deciding the log
+      // level from blocker COUNT (`blockers.length === 1`) mis-classified
+      // this exact shape — every such box logged ERROR on every boot, the
+      // same noise this whole mechanism exists to remove. The field
+      // (`featureEnabled`) is the fix: it says nothing about what ELSE is
+      // wrong.
+      platform = makeFlagOffPlatform();
+      (platform as unknown as { config: { isolation: string } }).config.isolation = 'none';
+      const captured = attachLogCapture(platform);
+      wire(configFor({ access: POLICY }));
+
+      await configureRoute();
+
+      expect(captured.errors).toHaveLength(0);
+      expect(captured.infos.some((m) => m.includes('DROP_FEATURE_ACCESS_GATE'))).toBe(true);
+    });
   });
 
   describe('boot sweep', () => {
@@ -411,6 +563,64 @@ describe('platform access-gate refusals (DROP-152)', () => {
       wire(gated[0], gated);
 
       await expect(sweep()).resolves.toBeUndefined();
+    });
+
+    it('DROP-153: performs NO route emission for a gated app while the kill switch is off — a reporter, not a writer', async () => {
+      // The guard against reintroducing the boot-time Caddy write: an
+      // earlier round had this method call `reconfigureRoute` here, in
+      // `start()`, BEFORE boot reconciliation and the watcher have routed
+      // anything — writing a Caddyfile from a `routes` map that is still
+      // nearly empty and never seeded from disk, truncating every OTHER app
+      // on the box. `/verify` now admits (204, `gate-disabled`) whenever the
+      // switch is off, so a stale guard costs a hop, not availability — this
+      // method reports and records state ONLY.
+      platform = makeFlagOffPlatform();
+      errors = attachErrorCapture(platform);
+      const gated = [configFor({ name: 'alpha', access: POLICY })];
+      wire(gated[0], gated);
+      const reconfigureRoute = jest.spyOn(
+        platform as unknown as { reconfigureRoute: (name: string) => Promise<void> },
+        'reconfigureRoute'
+      );
+
+      await sweep();
+
+      expect(reconfigureRoute).not.toHaveBeenCalled();
+      const { addRoute } = (platform as unknown as { router: { addRoute: jest.Mock } }).router;
+      expect(addRoute).not.toHaveBeenCalled();
+      // No gate to apply while the switch is off — clear, not set.
+      expect(setAccessGateUnapplied).toHaveBeenCalledWith('alpha', undefined);
+      // Plainly stated, not an error: nothing here requires operator action.
+      expect(errors).toHaveLength(0);
+    });
+
+    it('DROP-153: reports every withdrawn app in ONE aggregate line naming it, not a per-app message', async () => {
+      // Collapsed from three near-identical branches (running, not-running,
+      // monorepo group) that all ended in the same "no action is required"
+      // fact — the distinction cost a runtime status read plus a
+      // `parseDropYaml` per gated app to choose between wording, never
+      // behaviour. A group child is still named here rather than silently
+      // dropped from reporting.
+      platform = makeFlagOffPlatform();
+      const captured = attachLogCapture(platform);
+      errors = captured.errors;
+      const gated = [
+        configFor({ name: 'alpha', access: POLICY }),
+        configFor({ name: 'child', access: POLICY, group: 'mygroup' }),
+      ];
+      wire(undefined, gated);
+      (
+        platform as unknown as { appConfigService: { getConfig: jest.Mock } }
+      ).appConfigService.getConfig = jest.fn((n: string) => gated.find((c) => c.name === n));
+
+      await sweep();
+
+      expect(setAccessGateUnapplied).toHaveBeenCalledWith('alpha', undefined);
+      expect(setAccessGateUnapplied).toHaveBeenCalledWith('child', undefined);
+      const info = captured.infos.find((m) => m.includes('alpha') && m.includes('child'));
+      expect(info).toBeDefined();
+      expect(info).toContain('next route emission');
+      expect(info).toContain('/verify');
     });
   });
 });

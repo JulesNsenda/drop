@@ -30,6 +30,16 @@
  * running.
  */
 export interface AccessGateContext {
+  /**
+   * `config.enableAccessGate` (`DROP_FEATURE_ACCESS_GATE`, default on) — the
+   * operator kill switch. REQUIRED, not optional-with-a-default: an optional
+   * field here would let a caller that forgets to pass it compile clean and
+   * read as "enabled", which is exactly the failure shape that defeated the
+   * dump guardrail in DROP-151 Phase 3 (an optional param added to keep
+   * parallel agents compiling silently disarmed the check it was supposed to
+   * gate). Every caller must state which world it is in.
+   */
+  featureEnabled: boolean;
   /** `config.isolation`. */
   isolation: 'none' | 'docker';
   /** `config.enableApiAuth` — whether DROP has a principal to gate on at all. */
@@ -107,6 +117,7 @@ export interface AccessGateContext {
 
 /** A machine-readable reason a gate cannot be enforced. */
 export type AccessGateBlocker =
+  | 'feature-disabled'
   | 'isolation-not-docker'
   | 'auth-disabled'
   | 'no-https'
@@ -123,9 +134,18 @@ export interface AccessGateVerdict {
   blockers: AccessGateBlocker[];
   /** One human-readable sentence per blocker, in the same order. */
   reasons: string[];
+  /**
+   * Mirrors `AccessGateContext.featureEnabled`, so a downstream caller can
+   * tell "an operator turned this off" apart from "this box cannot enforce
+   * it" without parsing blocker order or string-matching `reasons`.
+   */
+  featureEnabled: boolean;
 }
 
 const BLOCKER_REASONS: Record<AccessGateBlocker, string> = {
+  'feature-disabled':
+    'the access gate is switched off on this platform — an operator has disabled the ' +
+    'DROP_FEATURE_ACCESS_GATE kill switch',
   'isolation-not-docker':
     'the platform is not running in docker isolation, so each app binds its own port on the host ' +
     'and is reachable at host:port without passing through Caddy at all',
@@ -183,6 +203,10 @@ export const ACCESS_GATE_ENFORCEMENT_AVAILABLE = true;
 export function assessAccessGate(ctx: AccessGateContext): AccessGateVerdict {
   const blockers: AccessGateBlocker[] = [];
 
+  // First, so it reads first in `reasons` and in `describeAccessGateRefusal`
+  // — an operator who switched the gate off should see that as the headline
+  // reason, not buried after whatever else this box happens to fail.
+  if (!ctx.featureEnabled) blockers.push('feature-disabled');
   if (ctx.isolation !== 'docker') blockers.push('isolation-not-docker');
   if (!ctx.authEnabled) blockers.push('auth-disabled');
   if (!ctx.httpsEffective) blockers.push('no-https');
@@ -206,6 +230,7 @@ export function assessAccessGate(ctx: AccessGateContext): AccessGateVerdict {
     enforceable: blockers.length === 0,
     blockers,
     reasons: blockers.map((b) => BLOCKER_REASONS[b]),
+    featureEnabled: ctx.featureEnabled,
   };
 }
 
@@ -257,6 +282,23 @@ export function isGateApplied(opts: {
   reloadOutcome: ReloadOutcome;
 }): boolean {
   return opts.enforceable && opts.enforcementAvailable && opts.reloadOutcome === 'ok';
+}
+
+/**
+ * Whether a gate is actually ENFORCED for this app right now — as opposed to
+ * whether the box could enforce one. A persisted policy on a build with no
+ * guard emitter is a record, not a control, and every caller answering
+ * "gated?" reports this, not merely whether a policy exists.
+ *
+ * `verdict` is optional so a caller that has not yet resolved one (or
+ * resolved none) still gets a definite `false` rather than having to guard
+ * the call itself.
+ */
+export function gateEnforced(
+  verdict: { enforceable: boolean } | undefined,
+  hasPolicy: boolean
+): boolean {
+  return Boolean(hasPolicy && verdict?.enforceable && ACCESS_GATE_ENFORCEMENT_AVAILABLE);
 }
 
 /** The refusal message for a route or a log line, from a verdict. */

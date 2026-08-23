@@ -15,7 +15,7 @@ import { logActivityFor } from '../../managers/activity';
 import { getDiskFreeMb } from '../../utils/disk';
 import { getSettingsManager } from '../../managers/settings/settings-manager';
 import { normalizePublicUrl } from '../../utils/url-validator';
-import { getPublicUrl, setPublicUrl } from '../runtime-config';
+import { getPublicUrl, setPublicUrl, isAccessGateEnabled } from '../runtime-config';
 
 const admin = new Hono();
 
@@ -65,10 +65,42 @@ function buildUserConnectorsPayload(): { enabled: boolean } {
   return { enabled: getSettingsManager().getUserConnectorsEnabled() };
 }
 
+/**
+ * Status block for the DROP-153 app-sharing toggle. Kept separate from
+ * buildUserConnectorsPayload() for the same reason that one is kept separate
+ * from buildSettingsPayload() — a distinct product surface with its own
+ * default (DISABLED — see the `appSharingEnabled` field comment in
+ * SettingsManager), not a variant to fold into an existing payload shape.
+ */
+function buildAppSharingPayload(): { enabled: boolean } {
+  return { enabled: getSettingsManager().getAppSharingEnabled() };
+}
+
 const GITHUB_WEBHOOK_SECRET_MIN_LENGTH = 8;
 const GITHUB_WEBHOOK_SECRET_MAX_LENGTH = 256;
 // eslint-disable-next-line no-control-regex -- deliberately matching ASCII control chars (incl. DEL) to reject them.
 const CONTROL_CHAR_PATTERN = /[\x00-\x1f\x7f]/;
+
+/**
+ * The request body shape every settings PUT below requires: a JSON object,
+ * not null and not an array. Without it a body of `null` or `[]` dereferences
+ * a property access into a TypeError that surfaces as a 500 — a poor answer
+ * from a validator whose whole contract is "reject rather than coerce".
+ */
+function isJsonObjectBody(body: unknown): body is Record<string, unknown> {
+  return typeof body === 'object' && body !== null && !Array.isArray(body);
+}
+
+/**
+ * Strict boolean field extraction for the two-state policy toggles below
+ * (user-connectors, app-sharing): `undefined` means "reject", never "treat
+ * as false" — these are not clear-to-fall-back fields like publicUrl or the
+ * webhook secret.
+ */
+function requireBooleanField(body: Record<string, unknown>, field: string): boolean | undefined {
+  const value = body[field];
+  return typeof value === 'boolean' ? value : undefined;
+}
 
 // GET /admin/activity - Activity log (paginated)
 admin.get('/activity', async (c) => {
@@ -217,6 +249,7 @@ admin.get('/settings', async (c) => {
       ...buildSettingsPayload(),
       githubWebhook: buildGithubWebhookPayload(),
       userConnectors: buildUserConnectorsPayload(),
+      appSharing: buildAppSharingPayload(),
     })
   );
 });
@@ -276,11 +309,11 @@ admin.put('/settings/github-webhook-secret', async (c) => {
   const authCtx = (c.get as Function)('auth') as AuthContext | undefined;
   const body = (await c.req.json()) as unknown;
 
-  if (typeof body !== 'object' || body === null || Array.isArray(body)) {
+  if (!isJsonObjectBody(body)) {
     return c.json(error(ErrorCodes.VALIDATION_ERROR, 'Request body must be a JSON object'), 400);
   }
 
-  const input = (body as { secret?: unknown }).secret;
+  const input = body.secret;
 
   if (input === null || input === undefined || (typeof input === 'string' && input.trim() === '')) {
     await getSettingsManager().setGithubWebhookSecret(undefined);
@@ -331,17 +364,12 @@ admin.put('/settings/user-connectors', async (c) => {
   const authCtx = (c.get as Function)('auth') as AuthContext | undefined;
   const body = (await c.req.json()) as unknown;
 
-  // Same object guard as PUT /settings/github-webhook-secret above. Without
-  // it a body of `null` dereferences to a TypeError and surfaces as a 500,
-  // which is a poor answer from a validator whose whole contract is "strict
-  // boolean, reject rather than coerce".
-  if (typeof body !== 'object' || body === null || Array.isArray(body)) {
+  if (!isJsonObjectBody(body)) {
     return c.json(error(ErrorCodes.VALIDATION_ERROR, 'Request body must be a JSON object'), 400);
   }
 
-  const input = (body as { enabled?: unknown }).enabled;
-
-  if (typeof input !== 'boolean') {
+  const input = requireBooleanField(body, 'enabled');
+  if (input === undefined) {
     return c.json(error(ErrorCodes.VALIDATION_ERROR, 'enabled must be a boolean'), 400);
   }
 
@@ -353,6 +381,44 @@ admin.put('/settings/user-connectors', async (c) => {
   });
 
   return c.json(success(buildUserConnectorsPayload()));
+});
+
+// PUT /admin/settings/app-sharing - Gate whether an app's OWNER may share it
+// (DROP-153's `/apps/:name/share` routes). Same strict-boolean shape as PUT
+// /settings/user-connectors above: a two-state policy toggle, not a
+// "clear to fall back" field, so a non-boolean is rejected rather than
+// coerced or treated as a clear.
+admin.put('/settings/app-sharing', async (c) => {
+  const authCtx = (c.get as Function)('auth') as AuthContext | undefined;
+  const body = (await c.req.json()) as unknown;
+
+  if (!isJsonObjectBody(body)) {
+    return c.json(error(ErrorCodes.VALIDATION_ERROR, 'Request body must be a JSON object'), 400);
+  }
+
+  const input = requireBooleanField(body, 'enabled');
+  if (input === undefined) {
+    return c.json(error(ErrorCodes.VALIDATION_ERROR, 'enabled must be a boolean'), 400);
+  }
+
+  await getSettingsManager().setAppSharingEnabled(input);
+
+  await logActivityFor(authCtx, {
+    action: 'app-sharing-set',
+    detail: `App sharing ${input ? 'enabled' : 'disabled'}`,
+  });
+
+  // Reported HERE, not as a boot warning: the gate switch is a boot-time env
+  // var while this setting is runtime-settable, so the contradiction is
+  // created by this request and a boot check could never see it.
+  const warning =
+    input && !isAccessGateEnabled()
+      ? 'App sharing is enabled, but the access gate is switched off ' +
+        '(DROP_FEATURE_ACCESS_GATE=false), so sharing an app will be refused until ' +
+        'the gate is turned back on and the platform restarted.'
+      : undefined;
+
+  return c.json(success({ ...buildAppSharingPayload(), ...(warning ? { warning } : {}) }));
 });
 
 export default admin;

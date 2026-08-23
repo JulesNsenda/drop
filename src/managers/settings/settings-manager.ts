@@ -36,6 +36,15 @@ export interface PlatformSettings {
    * MCP connector. Defaults to enabled (`true`) when unset.
    */
   userConnectorsEnabled?: boolean;
+  /**
+   * Gates whether an app's OWNER may share it (DROP-153's `/apps/:name/share`
+   * routes) — the runtime toggle for the access-gate feature set. Defaults to
+   * DISABLED (`false`) when unset — deliberately the opposite of
+   * `userConnectorsEnabled` above, and not a "fix" to bring in line with it:
+   * this is a new product surface with no installed base to preserve
+   * behaviour for, so it ships opt-in rather than opt-out.
+   */
+  appSharingEnabled?: boolean;
 }
 
 export interface SettingsManagerConfig {
@@ -62,6 +71,7 @@ function parseSettings(raw: string): PlatformSettings {
   const publicUrl = (parsed as Record<string, unknown>).publicUrl;
   const githubWebhookSecret = (parsed as Record<string, unknown>).githubWebhookSecret;
   const userConnectorsEnabled = (parsed as Record<string, unknown>).userConnectorsEnabled;
+  const appSharingEnabled = (parsed as Record<string, unknown>).appSharingEnabled;
   return {
     publicUrl: typeof publicUrl === 'string' ? publicUrl : undefined,
     githubWebhookSecret:
@@ -69,6 +79,7 @@ function parseSettings(raw: string): PlatformSettings {
         ? githubWebhookSecret
         : undefined,
     userConnectorsEnabled: typeof userConnectorsEnabled === 'boolean' ? userConnectorsEnabled : undefined,
+    appSharingEnabled: typeof appSharingEnabled === 'boolean' ? appSharingEnabled : undefined,
   };
 }
 
@@ -82,6 +93,10 @@ export class SettingsManager {
   // would silently revert to ON after a parse failure, and console.error
   // reaches no log file on this platform. publicUrl and githubWebhookSecret
   // both already fail closed (undefined) when lost this way.
+  // appSharingEnabled defaults to `false`, so a corrupt read already lands on
+  // the closed value without needing this flag — it's checked anyway in
+  // getAppSharingEnabled() for the same reason `corrupt` exists at all: a
+  // future reader must not have to re-derive that from the default.
   private corrupt = false;
 
   constructor(config?: SettingsManagerConfig) {
@@ -179,6 +194,34 @@ export class SettingsManager {
   /** Set (or, with `undefined`, clear) the stored connectors-enabled override. Persists atomically. */
   async setUserConnectorsEnabled(enabled: boolean | undefined): Promise<void> {
     const next: PlatformSettings = { ...this.settings, userConnectorsEnabled: enabled };
+    // Same persist-then-commit-in-memory shape as setPublicUrl above — see
+    // that method's comment for why this isn't queued through a chained
+    // savePromise.
+    await this.doSave(next);
+    this.settings = next;
+  }
+
+  /**
+   * Whether an app's owner may share it (DROP-153). Defaults to DISABLED,
+   * unlike getUserConnectorsEnabled() above — see the field comment on
+   * `appSharingEnabled` for why that difference is deliberate. Also checks
+   * `corrupt` explicitly (see above): with a `false` default the two happen
+   * to coincide today, so this guard isn't covering a live bug yet, but it
+   * keeps the method correct on its own rather than by accident if the
+   * default is ever flipped.
+   *
+   * Uses `??`, matching getUserConnectorsEnabled()'s shape — though with a
+   * `false` default, `??` and `||` are equivalent here (both boolean-typed,
+   * so the only falsy stored value already equals the fallback).
+   */
+  getAppSharingEnabled(): boolean {
+    if (this.corrupt) return false;
+    return this.settings.appSharingEnabled ?? false;
+  }
+
+  /** Set (or, with `undefined`, clear) the stored app-sharing-enabled override. Persists atomically. */
+  async setAppSharingEnabled(enabled: boolean | undefined): Promise<void> {
+    const next: PlatformSettings = { ...this.settings, appSharingEnabled: enabled };
     // Same persist-then-commit-in-memory shape as setPublicUrl above — see
     // that method's comment for why this isn't queued through a chained
     // savePromise.

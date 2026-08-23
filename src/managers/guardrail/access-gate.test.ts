@@ -21,6 +21,7 @@ import {
 
 /** The one shape where a gate IS enforceable — every test perturbs one field. */
 const ENFORCEABLE: AccessGateContext = {
+  featureEnabled: true,
   isolation: 'docker',
   authEnabled: true,
   httpsEffective: true,
@@ -37,6 +38,56 @@ describe('assessAccessGate', () => {
     expect(verdict.enforceable).toBe(true);
     expect(verdict.blockers).toEqual([]);
     expect(verdict.reasons).toEqual([]);
+  });
+
+  describe('the operator kill switch (DROP-153)', () => {
+    // featureEnabled is REQUIRED on AccessGateContext, not optional-with-a-
+    // default — see the field's own doc comment. These assertions use the
+    // ordered `toEqual([...])` form deliberately: 9 of the 11 existing
+    // `toContain` blocker tests above would stay green even if featureEnabled
+    // were later relaxed to optional-with-a-default-of-true, because they
+    // never look at the field at all. This one would not.
+
+    it('reports ONLY feature-disabled when that is the sole blocker', () => {
+      const verdict = assessAccessGate({ ...ENFORCEABLE, featureEnabled: false });
+      expect(verdict.enforceable).toBe(false);
+      expect(verdict.blockers).toEqual(['feature-disabled']);
+      expect(verdict.featureEnabled).toBe(false);
+    });
+
+    it('puts feature-disabled FIRST when combined with a real blocker', () => {
+      // Order matters: it is what makes it the headline reason in `reasons`
+      // and in `describeAccessGateRefusal`, ahead of whatever else this box
+      // happens to fail.
+      const verdict = assessAccessGate({
+        ...ENFORCEABLE,
+        featureEnabled: false,
+        isolation: 'none',
+      });
+      expect(verdict.blockers).toEqual(['feature-disabled', 'isolation-not-docker']);
+      expect(verdict.reasons[0]).toContain('access gate is switched off');
+    });
+
+    it('leaves an otherwise-enforceable verdict unchanged when the feature is on', () => {
+      const verdict = assessAccessGate({ ...ENFORCEABLE, featureEnabled: true });
+      expect(verdict.enforceable).toBe(true);
+      expect(verdict.blockers).toEqual([]);
+      expect(verdict.featureEnabled).toBe(true);
+    });
+
+    it('does NOT read an ABSENT flag as enabled', () => {
+      // The teeth of "required, not optional-with-a-default": every case
+      // above passes featureEnabled explicitly and would survive a
+      // relaxation to `featureEnabled?: boolean` + `=== false`. This one
+      // omits it — the copy-and-delete form rather than destructuring-rest,
+      // so there is no unused binding for lint to flag — and would go green
+      // (wrongly) under that relaxed shape.
+      const withoutFlag: Partial<AccessGateContext> = { ...ENFORCEABLE };
+      delete withoutFlag.featureEnabled;
+      const verdict = assessAccessGate(withoutFlag as AccessGateContext);
+      expect(verdict.enforceable).toBe(false);
+      expect(verdict.blockers).toEqual(['feature-disabled']);
+    });
   });
 
   it('refuses outside docker isolation — the app binds the host port itself', () => {
@@ -145,6 +196,7 @@ describe('assessAccessGate', () => {
 
   it('reports EVERY blocker, not just the first', () => {
     const verdict = assessAccessGate({
+      featureEnabled: true,
       isolation: 'none',
       authEnabled: false,
       httpsEffective: false,
@@ -170,6 +222,11 @@ describe('assessAccessGate', () => {
     // a time must not have to rediscover the next on the next attempt.
     expect(verdict.reasons).toHaveLength(9);
     expect(verdict.reasons.every(r => r.length > 0)).toBe(true);
+    // Mirrors the context even when other blockers dominate — the pair a
+    // downstream log-level branch needs is this (featureEnabled: true,
+    // unenforceable: a capability failure) vs (featureEnabled: false,
+    // unenforceable: an operator decision).
+    expect(verdict.featureEnabled).toBe(true);
   });
 
   it('names the app and every reason in the refusal message', () => {
