@@ -752,6 +752,37 @@ export class AppConfigService {
   }
 
   /**
+   * Remove one user id from every app's access allow-list.
+   *
+   * Ids are validated against the credential store when a policy is written
+   * and never again, so a deleted user's id would otherwise linger in every
+   * list it was on. Nothing is granted by a stale entry —
+   * `verifyAppSessionToken` re-resolves the user live on every request, so a
+   * deleted account cannot open anything — but a governance list nobody can
+   * read as authoritative is a governance list that has stopped working.
+   *
+   * A linear pass over the configs, deliberately, rather than the reverse
+   * index this plan declined twice: the work is bounded by app count and runs
+   * once per account deletion.
+   *
+   * Writes through `setAccessPolicy`, so the RESTRICTED tier still holds — this
+   * is not a back door into `access`.
+   */
+  async pruneAllowListEntries(userId: string): Promise<string[]> {
+    const touched: string[] = [];
+    for (const config of this.getAllConfigs()) {
+      const allow = config.access?.allow;
+      if (!allow?.includes(userId)) continue;
+      await this.setAccessPolicy(config.name, {
+        ...config.access!,
+        allow: allow.filter(id => id !== userId),
+      });
+      touched.push(config.name);
+    }
+    return touched;
+  }
+
+  /**
    * Delete an app config
    */
   async deleteConfig(appName: string): Promise<boolean> {

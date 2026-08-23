@@ -239,9 +239,39 @@ appAccess.get('/:app/verify', async c => {
       return forbidden(c, appName, 'Your account is not on this application’s access list.');
     }
 
-    // No usable session. Only a top-level navigation can survive a redirect —
-    // a POST would be silently converted to a GET and its body dropped, and an
-    // XHR would fail cross-origin with no CORS headers. Measured: Caddy sets
+    // No usable session.
+    //
+    // The app's MCP endpoint answers 401, never a redirect.
+    //
+    // An MCP client presents an app-audienced bearer and holds no cookie, so a
+    // 302 to a login page is something it cannot follow and cannot interpret,
+    // where a 401 is exactly what starts its OAuth flow. The gate answers for
+    // browsers; the app's own MCP guard — which nests INSIDE this one — answers
+    // for machines, and both still run. Resolving this by hoisting `/mcp*`
+    // outside the gate is the sibling shape measured against Caddy 2.11.4 as
+    // the worst case: there a bearer-only request reaches the tenant with no
+    // browser session at all.
+    //
+    // Keyed on the forwarded PATH, not on the presence of a bearer: the guard
+    // strips `Authorization` and `X-Api-Key` before this hop precisely so a
+    // tenant-controlled credential cannot reach DROP's verify endpoint, so a
+    // header check here would be dead code that reads as a control.
+    // `X-Forwarded-Uri` is set by Caddy on this path, not by the client.
+    const mcpPath = getAppConfigServiceOrNull()?.getConfig(appName)?.mcp?.path;
+    const forwardedUri = c.req.header('x-forwarded-uri') ?? '';
+    if (mcpPath && forwardedUri.split('?')[0].startsWith(mcpPath)) {
+      recordAccess({ appName, decision: 'refuse', reason: 'no-session-mcp' });
+      noStore(c);
+      c.header('WWW-Authenticate', 'Bearer error="invalid_token"');
+      return c.json(
+        error(ErrorCodes.UNAUTHORIZED, 'This endpoint requires a token, not a browser sign-in'),
+        401
+      );
+    }
+
+    // Only a top-level navigation can survive a redirect — a POST would be
+    // silently converted to a GET and its body dropped, and an XHR would fail
+    // cross-origin with no CORS headers. Measured: Caddy sets
     // `X-Forwarded-Method`.
     const method = (c.req.header('x-forwarded-method') ?? 'GET').toUpperCase();
     if (method !== 'GET' && method !== 'HEAD') {

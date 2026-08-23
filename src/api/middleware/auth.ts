@@ -716,6 +716,19 @@ export async function deleteUser(userId: string): Promise<boolean> {
 }
 
 /**
+ * NOTE for anyone adding a second deletion path: an account's id may also be
+ * on app access allow-lists (DROP-152), and those live in `AppConfigService`,
+ * not here. `deleteUser` does not prune them because this module must not
+ * depend on the config layer — the route that owns the deletion calls
+ * `pruneAllowListEntries` instead.
+ *
+ * Nothing is granted by a stale entry (`verifyAppSessionToken` re-resolves the
+ * user live), so the cost of forgetting is a misleading governance list rather
+ * than an admission. There is exactly ONE caller of `deleteUser` today; if that
+ * stops being true, this comment is the thing that will have gone stale.
+ */
+
+/**
  * Set `user.enabled` and, whenever the TARGET state is disabled, stamp
  * `credentialsInvalidBefore` — the ONE shared primitive `suspendUser` and
  * `updateUser` (the dashboard's `PUT /auth/users/:id {enabled:false}` disable
