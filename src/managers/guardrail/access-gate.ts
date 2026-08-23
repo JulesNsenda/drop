@@ -229,6 +229,35 @@ export function resolveHttpsEffective(
   return hostnames.length > 0 && hostnames.every((h) => opts.enableHttps && !opts.isLocalhost(h));
 }
 
+/** How far an emitted configuration got toward Caddy actually running it. */
+export type ReloadOutcome = 'ok' | 'failed' | 'skipped';
+
+/**
+ * Whether an app's access gate is ACTUALLY in force right now.
+ *
+ * Three independent conditions, and it is a named function rather than an
+ * inline `&&` chain because the inline version was untestable: with
+ * `ACCESS_GATE_ENFORCEMENT_AVAILABLE` false, every combination of the other
+ * two collapses to the same answer, so a test driving the platform could not
+ * tell a correct reload check from a missing one. Mutating the reload term
+ * left the suite green. Here all combinations are reachable.
+ *
+ *  - the box CAN enforce a gate (`assessAccessGate`);
+ *  - this build HAS an emitter at all;
+ *  - and Caddy ACCEPTED the configuration carrying it. A rejected `/load`
+ *    returns false rather than throwing, so without this term the platform
+ *    recorded "applied" for a config Caddy refused, leaving the previous
+ *    ungated block live. `skipped` is not success either — the boot path
+ *    batches reloads, so nothing has reached Caddy at that point.
+ */
+export function isGateApplied(opts: {
+  enforceable: boolean;
+  enforcementAvailable: boolean;
+  reloadOutcome: ReloadOutcome;
+}): boolean {
+  return opts.enforceable && opts.enforcementAvailable && opts.reloadOutcome === 'ok';
+}
+
 /** The refusal message for a route or a log line, from a verdict. */
 export function describeAccessGateRefusal(appName: string, verdict: AccessGateVerdict): string {
   return (

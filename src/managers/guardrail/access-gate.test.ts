@@ -14,6 +14,7 @@ import {
   assessAccessGate,
   describeAccessGateRefusal,
   resolveHttpsEffective,
+  isGateApplied,
   ACCESS_GATE_ENFORCEMENT_AVAILABLE,
   type AccessGateContext,
 } from './access-gate';
@@ -175,6 +176,48 @@ describe('assessAccessGate', () => {
     expect(message).toContain("'myapp'");
     expect(message).toContain('(1)');
     expect(message).toContain('(2)');
+  });
+});
+
+describe('isGateApplied', () => {
+  // Every combination, independent of what ACCESS_GATE_ENFORCEMENT_AVAILABLE
+  // currently is. That independence is the point: driven through the platform
+  // with the constant false, all eight collapse to the same answer, and a
+  // mutation removing the reload term left the suite green.
+  const opts = (
+    enforceable: boolean,
+    enforcementAvailable: boolean,
+    reloadOutcome: 'ok' | 'failed' | 'skipped'
+  ) => ({ enforceable, enforcementAvailable, reloadOutcome });
+
+  it('is true ONLY when all three hold', () => {
+    expect(isGateApplied(opts(true, true, 'ok'))).toBe(true);
+  });
+
+  it('is false when Caddy REJECTED the config', () => {
+    // The one that matters most: a rejected /load returns false rather than
+    // throwing, so nothing else in the platform notices.
+    expect(isGateApplied(opts(true, true, 'failed'))).toBe(false);
+  });
+
+  it('is false when the reload was SKIPPED — nothing reached Caddy', () => {
+    expect(isGateApplied(opts(true, true, 'skipped'))).toBe(false);
+  });
+
+  it('is false when this build has no emitter', () => {
+    expect(isGateApplied(opts(true, false, 'ok'))).toBe(false);
+  });
+
+  it('is false when the box cannot enforce a gate', () => {
+    expect(isGateApplied(opts(false, true, 'ok'))).toBe(false);
+  });
+
+  it('matches what this build actually ships', () => {
+    // Ties the pure rule back to reality, so the suite notices when the
+    // constant flips.
+    expect(isGateApplied(opts(true, ACCESS_GATE_ENFORCEMENT_AVAILABLE, 'ok'))).toBe(
+      ACCESS_GATE_ENFORCEMENT_AVAILABLE
+    );
   });
 });
 

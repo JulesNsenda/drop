@@ -61,13 +61,17 @@ describe('guard removal reaches the Caddyfile', () => {
     expect(await emitted()).toContain('forward_auth');
   });
 
-  it('REMOVES the guard when the route is re-added without one', async () => {
+  it('REMOVES the guard when the route is re-added with the key ABSENT', async () => {
+    // The key must be genuinely absent, not an explicit `undefined`. A merge
+    // honours an explicit `undefined` too, so a test that passes one would go
+    // green against the very bug this exists to catch — which is exactly what
+    // the first version of this test did.
     await router.addRoute(routeWith({ mcpAuth }));
     expect(await emitted()).toContain('forward_auth');
 
-    // The shape handleConfigureRoute now produces: an explicit `undefined`,
-    // and a full re-description of the route.
-    await router.addRoute(routeWith({ mcpAuth: undefined }));
+    const withoutGuard = routeWith();
+    expect('mcpAuth' in withoutGuard).toBe(false);
+    await router.addRoute(withoutGuard);
 
     const config = await emitted();
     expect(config).not.toContain('forward_auth');
@@ -77,6 +81,15 @@ describe('guard removal reaches the Caddyfile', () => {
     expect(config).toContain('reverse_proxy localhost:4000');
   });
 
+  it('also removes it when the caller passes an explicit undefined', async () => {
+    // Which is the shape `handleConfigureRoute` produces. Both must work: the
+    // platform passes explicit undefineds, and any other caller describing a
+    // route without a guard simply omits the key.
+    await router.addRoute(routeWith({ mcpAuth }));
+    await router.addRoute(routeWith({ mcpAuth: undefined }));
+    expect(await emitted()).not.toContain('forward_auth');
+  });
+
   it('removes a path prefix the same way', async () => {
     // `pathPrefix` was the other conditional-spread field, and it changes the
     // SITE ADDRESS — a stale one leaves the app served at a path nobody asked
@@ -84,7 +97,9 @@ describe('guard removal reaches the Caddyfile', () => {
     await router.addRoute(routeWith({ pathPrefix: '/api*' }));
     expect(await emitted()).toContain('myapp.dropkit.sh/api*');
 
-    await router.addRoute(routeWith({ pathPrefix: undefined }));
+    const withoutPrefix = routeWith();
+    expect('pathPrefix' in withoutPrefix).toBe(false);
+    await router.addRoute(withoutPrefix);
     expect(await emitted()).not.toContain('/api*');
   });
 

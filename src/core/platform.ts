@@ -139,6 +139,7 @@ import {
   assessAccessGate,
   describeAccessGateRefusal,
   resolveHttpsEffective,
+  isGateApplied,
   ACCESS_GATE_ENFORCEMENT_AVAILABLE,
   type AccessGateVerdict,
 } from '../managers/guardrail/access-gate';
@@ -4820,11 +4821,11 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         await this.stateManager?.setAccessGateUnapplied(
           appName,
           accessVerdict
-            ? !(
-                accessVerdict.enforceable &&
-                ACCESS_GATE_ENFORCEMENT_AVAILABLE &&
-                reloadOutcome === 'ok'
-              )
+            ? !isGateApplied({
+                enforceable: accessVerdict.enforceable,
+                enforcementAvailable: ACCESS_GATE_ENFORCEMENT_AVAILABLE,
+                reloadOutcome,
+              })
             : undefined
         );
       }
@@ -5015,9 +5016,15 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         unenforceable.push(config.name);
         this.logger.error(describeAccessGateRefusal(config.name, verdict), 'ROUTER');
       }
+      // 'skipped': the sweep reads persisted state at boot and emits nothing,
+      // so it can never assert that Caddy is carrying the guard.
       await this.stateManager?.setAccessGateUnapplied(
         config.name,
-        !(verdict.enforceable && ACCESS_GATE_ENFORCEMENT_AVAILABLE)
+        !isGateApplied({
+          enforceable: verdict.enforceable,
+          enforcementAvailable: ACCESS_GATE_ENFORCEMENT_AVAILABLE,
+          reloadOutcome: 'skipped',
+        })
       );
     }
 

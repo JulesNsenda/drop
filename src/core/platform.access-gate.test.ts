@@ -243,6 +243,23 @@ describe('platform access-gate refusals (DROP-152)', () => {
       expect(setAccessGateUnapplied).toHaveBeenCalledWith('myapp', true);
     });
 
+    it('passes every guard field EXPLICITLY, so a removal can reach Caddy', async () => {
+      // `addRoute` replaces rather than merges, but it can only remove a guard
+      // the caller has actually said is gone — a missing key is
+      // indistinguishable from "unchanged". The conditional spread this
+      // replaced (`...(guard ? { mcpAuth } : {})`) omitted the key, so a guard
+      // turned off stayed in the Caddyfile for the life of the process.
+      wire(configFor());
+      await configureRoute();
+
+      const { addRoute } = (platform as unknown as { router: { addRoute: jest.Mock } }).router;
+      const emitted = addRoute.mock.calls[0][0] as Record<string, unknown>;
+      expect('mcpAuth' in emitted).toBe(true);
+      expect(emitted.mcpAuth).toBeUndefined();
+      expect('pathPrefix' in emitted).toBe(true);
+      expect(emitted.pathPrefix).toBeUndefined();
+    });
+
     it('does NOT record the gate as applied when Caddy REJECTED the config', async () => {
       // A rejected `/load` returns false rather than throwing, so the
       // surrounding catch never sees it and the previous — ungated — block
