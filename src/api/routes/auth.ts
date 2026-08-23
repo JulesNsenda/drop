@@ -35,6 +35,7 @@ import { getStateManager } from '../../managers/app/state-manager';
 import { canAccess, interactiveSessionOnly } from '../access';
 import { assertMintable } from '../agent-scopes';
 import { ValidationError } from '../middleware/error';
+import { getAppConfigServiceOrNull } from '../../managers/app/app-config';
 
 const auth = new Hono();
 
@@ -531,6 +532,15 @@ auth.delete('/account', authMiddleware(), async c => {
 
   try {
     await deleteUser(authCtx.userId);
+    // The id may be on app access allow-lists. Best-effort and after the
+    // deletion: a failure here leaves a misleading governance entry, not an
+    // admission — the session verifier re-resolves the user live — and must
+    // not turn a completed account deletion into an error the caller retries.
+    try {
+      await getAppConfigServiceOrNull()?.pruneAllowListEntries(authCtx.userId);
+    } catch {
+      // Deliberately swallowed; see above.
+    }
     await logActivityFor(authCtx, {
       action: 'delete',
       detail: 'Account deleted',

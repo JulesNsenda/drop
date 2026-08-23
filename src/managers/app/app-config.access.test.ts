@@ -130,6 +130,46 @@ describe('AppConfig.access containment', () => {
     expect(warn).toHaveBeenCalledWith(expect.stringContaining('access'));
   });
 
+  describe('pruneAllowListEntries', () => {
+    it('removes one user from every list they are on, and leaves the rest', async () => {
+      await fs.mkdir(path.join(tempDir, 'webapps', 'other'), { recursive: true });
+      await service.upsertConfig('other', { type: 'nodejs' });
+      await service.setAccessPolicy('myapp', { mode: 'drop-users', allow: ['u1', 'u2'] });
+      await service.setAccessPolicy('other', { mode: 'drop-users', allow: ['u2'] });
+
+      const touched = await service.pruneAllowListEntries('u2');
+
+      expect(touched.sort()).toEqual(['myapp', 'other']);
+      expect(service.getConfig('myapp')?.access?.allow).toEqual(['u1']);
+      expect(service.getConfig('other')?.access?.allow).toEqual([]);
+    });
+
+    it('leaves apps the user was never on untouched', async () => {
+      await service.setAccessPolicy('myapp', { mode: 'drop-users', allow: ['u1'] });
+      expect(await service.pruneAllowListEntries('nobody')).toEqual([]);
+      expect(service.getConfig('myapp')?.access?.allow).toEqual(['u1']);
+    });
+
+    it('is a no-op on an ungated app', async () => {
+      expect(await service.pruneAllowListEntries('u1')).toEqual([]);
+      expect(service.getConfig('myapp')?.access).toBeUndefined();
+    });
+
+    it('does NOT remove the policy itself — an empty list still gates', async () => {
+      // Emptying an allow-list and REMOVING a gate mean different things: the
+      // owner and admins can still open a gated app with an empty list.
+      await service.setAccessPolicy('myapp', { mode: 'drop-users', allow: ['u1'] });
+      await service.pruneAllowListEntries('u1');
+      expect(service.getConfig('myapp')?.access).toEqual({ mode: 'drop-users', allow: [] });
+    });
+
+    it('persists through the RESTRICTED writer, not around it', async () => {
+      await service.setAccessPolicy('myapp', { mode: 'drop-users', allow: ['u1'] });
+      await service.pruneAllowListEntries('u1');
+      expect((await readFromDisk('myapp')).access).toEqual({ mode: 'drop-users', allow: [] });
+    });
+  });
+
   it('survives a reload from disk', async () => {
     await service.setAccessPolicy('myapp', POLICY);
     const reloaded = new AppConfigService({

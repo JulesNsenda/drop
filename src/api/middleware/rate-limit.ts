@@ -99,8 +99,29 @@ function getClientIp(c: Context): string {
 
   if (isLocalPeer) {
     // Trust XFF only from a local reverse proxy (Caddy runs on the same host).
-    const xff = c.req.header('x-forwarded-for')?.split(',')[0]?.trim();
-    if (xff) return xff;
+    //
+    // The LAST entry, not the first, and this is the whole point of the
+    // function. Caddy's `reverse_proxy` APPENDS the address of the peer it
+    // received the request from; it does not replace the header. So for a
+    // request that arrived with no XFF, the header DROP sees is
+    // `<real-client>` — first and last agree. But a client that sends
+    // `X-Forwarded-For: 1.2.3.4` gets `1.2.3.4, <real-client>`, and the first
+    // entry is then a value the ATTACKER chose.
+    //
+    // Reading the first entry made every limiter on the platform both
+    // bypassable and weaponisable: rotate the header for unlimited attempts at
+    // `/auth/login`, or send a victim's address to exhaust their bucket and
+    // lock them out of signing in — the buckets are keyed by limiter NAME, so
+    // the login bucket is shared platform-wide.
+    //
+    // Taking the last entry is correct for exactly one trusted proxy, which is
+    // what DROP runs. Behind a second one (a CDN in front of Caddy) it would
+    // resolve to the CDN's address and bucket that traffic together — which
+    // over-throttles rather than under-throttles, and is the direction a
+    // rate limiter should fail in.
+    const forwarded = c.req.header('x-forwarded-for');
+    const appended = forwarded?.split(',').pop()?.trim().replace(/^::ffff:/i, '');
+    if (appended) return appended;
   }
 
   return peerIp;

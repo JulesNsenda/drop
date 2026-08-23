@@ -169,6 +169,38 @@ describe('/app-access (DROP-152 the gate)', () => {
       expect(res.status).toBe(302);
     });
 
+    it('401s the app MCP endpoint instead of redirecting a machine client', async () => {
+      // An MCP client holds a bearer and no cookie. A 302 to a login page is
+      // something it cannot follow; a 401 is what starts its OAuth flow. The
+      // gate answers for browsers, the app's own MCP guard (nested inside)
+      // answers for machines, and both still run — hoisting `/mcp*` outside
+      // the gate is the shape measured as the worst case.
+      await getAppConfigService().updateConfig(APP, {
+        mcp: { path: '/mcp', auth: 'drop', source: 'declared' },
+      });
+
+      const res = await verify({ 'x-forwarded-uri': '/mcp' });
+      expect(res.status).toBe(401);
+      expect(res.headers.get('location')).toBeNull();
+      expect(res.headers.get('www-authenticate')).toContain('Bearer');
+    });
+
+    it('still redirects a BROWSER path on the same app', async () => {
+      // The discriminating case: only the MCP path changes behaviour.
+      await getAppConfigService().updateConfig(APP, {
+        mcp: { path: '/mcp', auth: 'drop', source: 'declared' },
+      });
+      expect((await verify({ 'x-forwarded-uri': '/reports' })).status).toBe(302);
+    });
+
+    it('does not treat a look-alike path as the MCP endpoint', async () => {
+      await getAppConfigService().updateConfig(APP, {
+        mcp: { path: '/mcp', auth: 'drop', source: 'declared' },
+      });
+      // A prefix match on the PATH only — the query is not part of it.
+      expect((await verify({ 'x-forwarded-uri': '/reports?next=/mcp' })).status).toBe(302);
+    });
+
     it('refuses a session minted for a different app', async () => {
       const token = await mintAppSessionToken(allowedId, 'allowed', 'otherapp', origin);
       const res = await verify({ cookie: `${sessionCookieName(APP)}=${token}`, 'x-forwarded-uri': '/' });
