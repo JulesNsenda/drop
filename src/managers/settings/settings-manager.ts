@@ -59,6 +59,40 @@ function defaultSettingsFilePath(): string {
   return path.join(dropRoot, 'data', 'drop-svc', 'settings.json');
 }
 
+type SettingsFieldType = 'string' | 'number' | 'boolean';
+
+/**
+ * One entry per key in PlatformSettings. `parseSettings()` derives its
+ * whitelist + type check from this table instead of a hand-written line per
+ * field — this store started at four fields, each needing its own whitelist
+ * line, accessor pair and `corrupt` decision, and grows past that here.
+ *
+ * `sensitive` marks a field a future admin GET must redact (e.g. a secret or
+ * credential) so that becomes structural rather than a habit; nothing in
+ * this file reads it yet.
+ *
+ * `failClosedDefault` documents — for the boolean fields with a dedicated
+ * getter — the value that getter returns when the store is `corrupt`. It is
+ * NOT wired into the getters below (they keep their own explicit
+ * `if (this.corrupt) return false;`, matching the pre-existing per-field
+ * unset-default, which can legitimately differ from the corrupt fallback —
+ * see `userConnectorsEnabled` vs `appSharingEnabled` below); it exists here
+ * so a future consumer doesn't have to re-derive it per field.
+ */
+interface SettingsFieldSpec {
+  key: keyof PlatformSettings;
+  type: SettingsFieldType;
+  sensitive: boolean;
+  failClosedDefault?: boolean;
+}
+
+const SETTINGS_FIELDS: readonly SettingsFieldSpec[] = [
+  { key: 'publicUrl', type: 'string', sensitive: false },
+  { key: 'githubWebhookSecret', type: 'string', sensitive: true },
+  { key: 'userConnectorsEnabled', type: 'boolean', sensitive: false, failClosedDefault: false },
+  { key: 'appSharingEnabled', type: 'boolean', sensitive: false, failClosedDefault: false },
+];
+
 function parseSettings(raw: string): PlatformSettings {
   const parsed = JSON.parse(raw);
   // A valid-JSON-but-non-object document (`null`, `5`, `"x"`) is just as
@@ -68,19 +102,22 @@ function parseSettings(raw: string): PlatformSettings {
   if (!parsed || typeof parsed !== 'object') {
     throw new Error('Settings file does not contain a JSON object');
   }
-  const publicUrl = (parsed as Record<string, unknown>).publicUrl;
-  const githubWebhookSecret = (parsed as Record<string, unknown>).githubWebhookSecret;
-  const userConnectorsEnabled = (parsed as Record<string, unknown>).userConnectorsEnabled;
-  const appSharingEnabled = (parsed as Record<string, unknown>).appSharingEnabled;
-  return {
-    publicUrl: typeof publicUrl === 'string' ? publicUrl : undefined,
-    githubWebhookSecret:
-      typeof githubWebhookSecret === 'string' && githubWebhookSecret.length > 0
-        ? githubWebhookSecret
-        : undefined,
-    userConnectorsEnabled: typeof userConnectorsEnabled === 'boolean' ? userConnectorsEnabled : undefined,
-    appSharingEnabled: typeof appSharingEnabled === 'boolean' ? appSharingEnabled : undefined,
-  };
+  const record = parsed as Record<string, unknown>;
+  const result: Record<string, unknown> = {};
+  for (const field of SETTINGS_FIELDS) {
+    const value = record[field.key];
+    // A key missing from this table round-trips as `undefined` — never
+    // reaches `result` at all — and reads as "never set". That silent drop
+    // is the whole reason this table exists (see the `mail-credential.ts`
+    // ciphertext, which must NEVER be whitelisted here).
+    if (typeof value === field.type) {
+      result[field.key] = value;
+    }
+  }
+  // githubWebhookSecret's empty-string-means-absent behaviour is enforced by
+  // its own getter (`|| undefined`), not here — an empty string is still a
+  // valid `string` and must pass this generic type check unchanged.
+  return result as PlatformSettings;
 }
 
 export class SettingsManager {

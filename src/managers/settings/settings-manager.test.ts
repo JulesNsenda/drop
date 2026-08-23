@@ -502,6 +502,46 @@ describe('SettingsManager', () => {
     });
   });
 
+  describe('parseSettings field table', () => {
+    it('ignores a key that is not in the field table — round-trips as undefined, reads as "never set"', async () => {
+      await fs.mkdir(path.dirname(settingsFilePath), { recursive: true });
+      await fs.writeFile(
+        settingsFilePath,
+        JSON.stringify({ publicUrl: 'https://drop.example.com', notARealSetting: 'sneaky' })
+      );
+
+      await manager.load();
+
+      expect(manager.getStoredPublicUrl()).toBe('https://drop.example.com');
+      const raw = await fs.readFile(settingsFilePath, 'utf-8');
+      // The unknown key must never round-trip back out through a save.
+      await manager.setPublicUrl('https://drop.example.com');
+      const rawAfterSave = await fs.readFile(settingsFilePath, 'utf-8');
+      expect(JSON.parse(rawAfterSave)).toEqual({ publicUrl: 'https://drop.example.com' });
+      expect(JSON.parse(raw).notARealSetting).toBe('sneaky');
+    });
+
+    it('drops a field whose stored type does not match the table (number where a string is expected)', async () => {
+      await fs.mkdir(path.dirname(settingsFilePath), { recursive: true });
+      await fs.writeFile(settingsFilePath, JSON.stringify({ publicUrl: 12345 }));
+
+      await manager.load();
+
+      expect(manager.getStoredPublicUrl()).toBeUndefined();
+    });
+
+    it('a corrupt (unparseable) file still fails closed via the table-driven getters', async () => {
+      await fs.mkdir(path.dirname(settingsFilePath), { recursive: true });
+      await fs.writeFile(settingsFilePath, '{not json');
+
+      await manager.load();
+
+      expect(manager.getStoredPublicUrl()).toBeUndefined();
+      expect(manager.getUserConnectorsEnabled()).toBe(false);
+      expect(manager.getAppSharingEnabled()).toBe(false);
+    });
+  });
+
   describe('file permissions', () => {
     // POSIX mode bits aren't meaningful on Windows (no chmod-style ACL model).
     const itPosix = process.platform === 'win32' ? it.skip : it;
