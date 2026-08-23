@@ -29,7 +29,7 @@ import {
 } from '../__testutils__/api-server';
 import { getAppConfigService, resetAppConfigService } from '../../managers/app/app-config';
 import { getAccessLog, resetAccessLog } from '../../managers/access-log/access-log';
-import { mintAppSessionToken } from '../app-access/session-token';
+import { mintAppSessionToken, SESSION_TTL_SECONDS } from '../app-access/session-token';
 import { __resetAppAccessCodes } from '../app-access/flow-code';
 import { sessionCookieName, flowCookieName } from './app-access';
 
@@ -202,6 +202,18 @@ describe('/app-access (DROP-152 the gate)', () => {
   });
 
   describe('code + exchange', () => {
+    /**
+     * Start a real flow the way a browser does — a flow id is no longer a
+     * string a caller can invent. It must have been minted by a verify hop and
+     * it is spent by the first code, because an id that merely LEAKED (it
+     * transits two logged URLs for 300s) would otherwise let anyone mint a
+     * code bound to someone else's browser.
+     */
+    const startFlow = async (): Promise<string> => {
+      const res = await verify({ 'x-forwarded-uri': '/reports' });
+      return new URL(res.headers.get('location') as string).searchParams.get('flow') as string;
+    };
+
     const mintCode = async (token: string, flow: string) =>
       t.hono.request('/api/v1/app-access/code', {
         method: 'POST',
@@ -213,12 +225,12 @@ describe('/app-access (DROP-152 the gate)', () => {
       // The refusal happens HERE, on DROP's own page, rather than being
       // discovered one hop later at verify — which is the other half of the
       // loop fix.
-      const res = await mintCode(outsiderToken, 'F1');
+      const res = await mintCode(outsiderToken, await startFlow());
       expect(res.status).toBe(403);
     });
 
     it('completes the round trip for a permitted visitor', async () => {
-      const flow = 'FLOW-1';
+      const flow = await startFlow();
       const res = await mintCode(allowedToken, flow);
       expect(res.status).toBe(200);
       const body = (await res.json()) as { data: { redirectTo: string } };
@@ -231,15 +243,28 @@ describe('/app-access (DROP-152 the gate)', () => {
       expect(ex.status).toBe(302);
       // From the RECORD, not from any query parameter.
       expect(ex.headers.get('location')).toBe('/reports');
-      const setCookie = ex.headers.get('set-cookie') as string;
-      expect(setCookie).toContain(sessionCookieName(APP));
+      // getSetCookie(), not get() + toContain. A single FOLDED header would
+      // satisfy `toContain` for both names while delivering neither correctly:
+      // RFC 6265 forbids folding, no browser splits it, and the joined value
+      // would carry a Max-Age that parses as garbage and never clear the flow
+      // cookie. The count is what discriminates.
+      const cookies = ex.headers.getSetCookie();
+      expect(cookies).toHaveLength(2);
+
+      const session = cookies.find(c => c.startsWith(sessionCookieName(APP)));
+      expect(session).toContain(`Max-Age=${SESSION_TTL_SECONDS}`);
+      expect(session).toContain('HttpOnly');
+      expect(session).toContain('Secure');
+
       // The spent flow is cleared, so a replayed exchange URL matches nothing.
-      expect(setCookie).toContain(`${flowCookieName(APP)}=;`);
+      const cleared = cookies.find(c => c.startsWith(`${flowCookieName(APP)}=;`));
+      expect(cleared).toContain('Max-Age=0');
     });
 
     it('REFUSES an exchange whose code belongs to another browser flow', async () => {
       // Login-CSRF: the attacker's own valid code, the victim's browser.
-      const res = await mintCode(allowedToken, 'ATTACKER-FLOW');
+      // The attacker starts their OWN flow and mints a real code in it.
+      const res = await mintCode(allowedToken, await startFlow());
       const code = new URL(
         ((await res.json()) as { data: { redirectTo: string } }).data.redirectTo
       ).searchParams.get('code') as string;
@@ -252,7 +277,7 @@ describe('/app-access (DROP-152 the gate)', () => {
     });
 
     it('REFUSES an exchange with no flow cookie at all', async () => {
-      const res = await mintCode(allowedToken, 'F9');
+      const res = await mintCode(allowedToken, await startFlow());
       const code = new URL(
         ((await res.json()) as { data: { redirectTo: string } }).data.redirectTo
       ).searchParams.get('code') as string;
@@ -262,7 +287,7 @@ describe('/app-access (DROP-152 the gate)', () => {
     });
 
     it('is single-use', async () => {
-      const flow = 'F2';
+      const flow = await startFlow();
       const res = await mintCode(allowedToken, flow);
       const code = new URL(
         ((await res.json()) as { data: { redirectTo: string } }).data.redirectTo
@@ -273,11 +298,25 @@ describe('/app-access (DROP-152 the gate)', () => {
       expect((await t.hono.request(`/api/v1/app-access/${APP}/exchange?code=${code}`, { headers })).status).toBe(403);
     });
 
+    it('REFUSES a flow id that no verify hop ever started', async () => {
+      // The defence against an OBSERVED flow id. It transits two URLs on the
+      // platform host for 300s, in query strings Caddy logs — so "knows the
+      // id" must not be enough to mint against it.
+      const res = await mintCode(allowedToken, 'not-a-real-flow');
+      expect(res.status).toBe(400);
+    });
+
+    it('spends the flow on the first code', async () => {
+      const flow = await startFlow();
+      expect((await mintCode(allowedToken, flow)).status).toBe(200);
+      expect((await mintCode(allowedToken, flow)).status).toBe(400);
+    });
+
     it('requires a bearer for the code hop', async () => {
       const res = await t.hono.request('/api/v1/app-access/code', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ app: APP, flow: 'F1' }),
+        body: JSON.stringify({ app: APP, flow: await startFlow() }),
       });
       expect(res.status).toBe(401);
     });

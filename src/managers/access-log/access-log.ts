@@ -73,7 +73,7 @@ function principalKey(entry: AccessLogEntry): string {
 // NUL can't appear in an app name, decision literal or userId, so it is a
 // safe join separator for a composite map key.
 function aggregateKey(entry: AccessLogEntry): string {
-  return `${entry.appName}\u0000${entry.decision}\u0000${principalKey(entry)}`;
+  return `${entry.appName}\u0000${entry.decision}\u0000${entry.reason ?? ''}\u0000${principalKey(entry)}`;
 }
 
 function appDayKey(appName: string, day: string): string {

@@ -21,9 +21,16 @@
  *  - **An `app` claim** carrying the app name, so the verifier binds the token
  *    to the app it was presented to rather than re-deriving it from a
  *    spoofable request header.
- *  - **A `sid`**, so the existing `denyGrant` primitive can reach this class.
- *    Without one, a minted session could not be revoked by any means short of
- *    suspending the account.
+ *  - **A `sid`**, so a session can be addressed individually.
+ *
+ *    Stated honestly: there is **no per-session revoker yet**. `denyGrant`'s
+ *    only callers today are the OAuth refresh-token paths, and app-session
+ *    sids are not persisted anywhere, so they cannot be enumerated to revoke
+ *    one. What revokes a session TODAY is account-level — `enabled: false`, a
+ *    `credentialsInvalidBefore` stamp, or removal from the allow-list — all of
+ *    which take effect on the next request because of the live re-read below.
+ *    The claim is a `sid` exists so a revoker CAN be built without reminting;
+ *    it is not that one is wired.
  *
  * What it deliberately does NOT mirror is the 15-minute TTL. That number exists
  * because a harvested MCP token has no revocation; a browser session with a
@@ -127,8 +134,11 @@ export async function verifyAppSessionToken(
     const username = typeof p['username'] === 'string' ? p['username'] : '';
     if (!userId || !username) return null;
 
-    const sid = typeof p['sid'] === 'string' ? p['sid'] : undefined;
-    if (sid && isGrantDenied(sid)) return null;
+    // REQUIRED, not optional: a token without one would skip the denylist
+    // entirely, which is a hole the current minter cannot reach but the type
+    // allowed.
+    const sid = typeof p['sid'] === 'string' ? p['sid'] : '';
+    if (!sid || isGrantDenied(sid)) return null;
 
     // Read the user LIVE. Everything below is a fact the token cannot carry:
     // it was true when the session was minted and may not be true now.

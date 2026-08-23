@@ -1582,6 +1582,10 @@ apps.delete('/:name/access', async c => {
   if (!updated) {
     throw new NotFoundError(`Application '${name}' not found`);
   }
+  // The review date belongs to the policy. Leaving it behind means the estate
+  // view shows a governance review date against an app that is no longer
+  // governed.
+  await getAppConfigService().updateSystemConfig(name, { reviewBy: undefined });
 
   let applyError: string | undefined;
   try {

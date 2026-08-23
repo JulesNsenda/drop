@@ -180,10 +180,11 @@ describe('platform access-gate refusals (DROP-152)', () => {
         appName: 'myapp',
         cookieName: '__Host-drop-session-myapp',
       });
-      // The origin is a GENERATION-TIME literal for the hostname this block
-      // serves — never derived at request time from a header forward_auth
-      // carries from the client.
-      expect(emitted.accessAuth?.origin).toBe('https://myapp.example.com');
+      // There is deliberately no `origin` on the config: one was carried and
+      // never read, and a field whose doc comment IS the security argument
+      // while its value is unread tells the next reader a guarantee exists
+      // where none does.
+      expect(emitted.accessAuth).not.toHaveProperty('origin');
     });
 
     it('emits NO access guard when the verdict refuses', async () => {
