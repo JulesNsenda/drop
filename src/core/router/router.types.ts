@@ -96,6 +96,43 @@ export interface RouteConfig {
    * credentials from the hop to the tenant.
    */
   mcpAuth?: McpAuthConfig;
+  /**
+   * Put DROP's browser access gate in front of this whole app (DROP-152).
+   *
+   * Set only for an app carrying an admin-set `AppConfig.access` policy on a
+   * platform that can actually enforce one (`assessAccessGate`). Changes the
+   * SHAPE of the emitted block, not just its contents: the catch-all and any
+   * inner guard move inside the gate's `route`, and a DROP-owned exchange
+   * handle is emitted as a sibling ahead of it.
+   */
+  accessAuth?: AccessAuthConfig;
+}
+
+/**
+ * The `forward_auth` browser gate for one app on one hostname.
+ *
+ * `appName` and `origin` are both GENERATION-TIME LITERALS. Neither may ever be
+ * derived at request time from `Host` or `X-Forwarded-Host`: `forward_auth`
+ * proxies the ORIGINAL request, so those are client-controlled, and a request-
+ * time derivation would let one tenant present a valid session while claiming
+ * to be another app (SEC-2).
+ *
+ * `origin` is per-HOSTNAME rather than per-app because the session cookie is
+ * `__Host-`-prefixed and therefore host-only — the audience a session is
+ * verified against has to be the host it was minted on. (Today the gate is
+ * refused outright for an app routed on more than one hostname, so there is
+ * exactly one; carrying the origin here is what will let that refusal be
+ * lifted without re-deriving anything from a header.)
+ */
+export interface AccessAuthConfig {
+  /** The app this gate belongs to — baked into the verify and exchange paths. */
+  appName: string;
+  /** The origin this block serves, e.g. `https://myapp.dropkit.sh`. */
+  origin: string;
+  /** DROP's own API address, e.g. `127.0.0.1:3000`. */
+  verifyUpstream: string;
+  /** The name of this app's session cookie, e.g. `__Host-drop-session-myapp`. */
+  cookieName: string;
 }
 
 /**

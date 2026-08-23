@@ -1379,10 +1379,35 @@ function denyGrant(sid: string): void {
   }
 }
 
-function isGrantDenied(sid: string | undefined): boolean {
+/**
+ * Whether a specific grant (`sid`) has been revoked.
+ *
+ * Exported for the sibling credential class in `src/api/app-access/`, which
+ * needs the same denylist this module's own verifiers consult. A credential
+ * class that could not be reached by `denyGrant` would be revocable only by
+ * suspending the whole account.
+ */
+export function isGrantDenied(sid: string | undefined): boolean {
   if (!sid) return false;
   const until = revokedGrants.get(sid);
   return until !== undefined && until > Date.now();
+}
+
+/**
+ * The signing key for the app-audienced token classes.
+ *
+ * Exported ONLY for `src/api/app-access/session-token.ts`, which mints and
+ * verifies the browser session for a gated app. That module lives outside this
+ * file for size and cohesion — `auth.ts` is ~2k lines and imported by every
+ * route file — not because a trust boundary runs between them: three
+ * mint/verify pairs already use this key inside this module, and the fourth is
+ * the same kind of thing sitting next door.
+ *
+ * Do not widen this beyond that use. Anything that needs to SIGN with it is a
+ * new credential class and should be reviewed as one.
+ */
+export function getOAuthTokenSecret(): Uint8Array | null {
+  return oauthTokenSecret;
 }
 
 /** Hash an opaque token the same way API keys are hashed (sha256 hex digest of the raw value). */

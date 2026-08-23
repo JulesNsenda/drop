@@ -183,6 +183,24 @@ export function oauthRateLimitMiddleware(config?: Partial<RateLimitConfig>) {
 }
 
 /** Dedicated rate limiter for the database panel (DROP-120) */
+/**
+ * The access gate's verify hop.
+ *
+ * Sized for PAGE-LOAD FAN-OUT, not for a credential surface: `forward_auth`
+ * fires once per HTTP request to a gated app, so a single SPA page load is
+ * routinely 30-80 hits from one visitor. The general 100/min bucket would make
+ * an ordinary browsing session fail intermittently — and because a non-2xx
+ * from this hop is copied to the browser by Caddy, a 429 here is a broken page
+ * rather than a refusal the app can handle.
+ *
+ * It is deliberately generous. What bounds abuse here is that the endpoint is
+ * cheap (a signature check and two in-memory reads) and that a refused visitor
+ * gets a terminal 403 rather than an endless redirect loop — not this number.
+ */
+export function accessVerifyRateLimitMiddleware() {
+  return createRateLimiter('access-verify', { maxRequests: 600, windowMs: 60_000 });
+}
+
 export function dbRateLimitMiddleware(config?: Partial<RateLimitConfig>) {
   return createRateLimiter('db', { ...DB_CONFIG, ...config });
 }

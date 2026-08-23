@@ -74,6 +74,12 @@ const AUDIT_PATTERNS: Array<{ method: string; pathPattern: RegExp; action: strin
   { method: 'POST', pathPattern: /\/apps\/.*\/deploy/, action: 'app.deploy' },
   { method: 'PUT', pathPattern: /\/apps\/.*\/secrets/, action: 'secret.set' },
   { method: 'DELETE', pathPattern: /\/apps\/.*\/secrets/, action: 'secret.delete' },
+  // The access gate's credential-minting hops (DROP-152). Without these the
+  // surface that hands out app sessions produces no audit trail at all — the
+  // access log is a different store, with a different retention and a byte
+  // cap, and is not a substitute for the durable one.
+  { method: 'POST', pathPattern: /\/app-access\/code$/, action: 'app_access.mint_code' },
+  { method: 'GET', pathPattern: /\/app-access\/[^/]+\/exchange$/, action: 'app_access.exchange' },
 ];
 
 function matchAction(method: string, reqPath: string): string | null {

@@ -8,6 +8,7 @@ import { AuthContext } from './middleware/auth';
 import { AppState } from '../managers/app/state-manager';
 import { scopesAllow, AgentVerb } from './agent-scopes';
 import type { AppAccessPolicy } from '../managers/app/app-config';
+import type { AppSessionIdentity } from './app-access/session-token';
 
 /**
  * Whether the current request may access an app: owns it, is an admin, or
@@ -166,13 +167,56 @@ export function canOpen(
   // should fail in.
   if (auth.authMethod !== 'jwt' || auth.role === 'none' || auth.kind === 'agent') return false;
 
-  if (auth.role === 'admin') return true;
-  // `userId` is a required `string` on the type and NOT always one at runtime:
-  // the `DROP_API_KEY` and `cli-local` principals are ownerless, and a
-  // monorepo group child has no `AppState.userId` at all. Two `undefined`s
-  // must not compare equal into an admission. The clause above already
-  // excludes those principals; this stays because the reason it was written
-  // is a fact about the data, not about the credential class.
-  if (auth.userId !== undefined && app.userId === auth.userId) return true;
-  return auth.userId !== undefined && policy.allow.includes(auth.userId);
+  return evaluateAccessPolicy(auth.userId, auth.role, app, policy);
 }
+
+/**
+ * The same rule, for a visitor holding a GATED APP'S OWN SESSION rather than a
+ * control-plane credential.
+ *
+ * A separate exported function, deliberately not an overload of `canOpen`. An
+ * overload resolves to one implementation signature over a union and has to
+ * discriminate at runtime (`'appName' in identity`) — and the branch it would
+ * pick for a session is precisely the one that skips `canOpen`'s
+ * credential-class clause. `AppSessionIdentity` is structurally disjoint from
+ * `AuthContext` today, but excess-property checking only fires on fresh object
+ * literals, so "disjoint as declared" is not something a runtime discriminator
+ * can rely on. Two entry points, one shared evaluator, no discrimination.
+ *
+ * `appName` is checked here as well as in the token verifier. That is defence
+ * in depth of the kind `canAccessScoped` already argues for: both halves of a
+ * binding belong at the authorization boundary rather than resting on
+ * admission having been strict.
+ */
+export function canOpenSession(
+  session: AppSessionIdentity,
+  app: Pick<AppState, 'userId'>,
+  policy: AppAccessPolicy,
+  appName: string
+): boolean {
+  // A session minted for a different app is not a session for this one, even
+  // though the signature verified — the verifier binds it too, and this is the
+  // second half of that pair.
+  if (session.appName !== appName) return false;
+  return evaluateAccessPolicy(session.userId, session.role, app, policy);
+}
+
+/**
+ * The rule both entry points share: admin, or owner, or explicitly allowed.
+ *
+ * `userId` is typed as a required string on both callers and is NOT always one
+ * at runtime — the `DROP_API_KEY` and `cli-local` principals are ownerless and
+ * a monorepo group child has no `AppState.userId` — so two `undefined`s must
+ * never compare equal into an admission.
+ */
+function evaluateAccessPolicy(
+  userId: string | undefined,
+  role: 'admin' | 'user' | 'readonly' | 'none',
+  app: Pick<AppState, 'userId'>,
+  policy: AppAccessPolicy
+): boolean {
+  if (role === 'admin') return true;
+  if (userId !== undefined && app.userId === userId) return true;
+  return userId !== undefined && policy.allow.includes(userId);
+}
+
