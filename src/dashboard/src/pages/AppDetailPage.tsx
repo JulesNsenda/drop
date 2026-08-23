@@ -45,6 +45,7 @@ import Tabs, { TabDef } from '../components/Tabs';
 import MetricsTab from '../components/MetricsTab';
 import DatabaseTab from '../components/DatabaseTab';
 import AccessTab from '../components/AccessTab';
+import ShareCard from '../components/ShareCard';
 import Card from '../components/ui/Card';
 import Button from '../components/ui/Button';
 import Input from '../components/ui/Input';
@@ -676,7 +677,11 @@ function AppDetailPage() {
 
       {activeTab === 'database' && <DatabaseTab name={app.name} />}
 
-      {activeTab === 'access' && <AccessTab appName={app.name} />}
+      {/* Admins keep the full governance view; a non-admin owner gets the
+          narrower, WRITE-capable share panel instead — `AccessTab`'s allow-list
+          and provenance are exactly what `ShareCard` withholds from the party
+          it would otherwise disclose (DROP-153). */}
+      {activeTab === 'access' && (isAdmin ? <AccessTab appName={app.name} /> : <ShareCard appName={app.name} />)}
 
       {activeTab === 'environment' && (
         <Card padded={false}>
