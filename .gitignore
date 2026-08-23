@@ -118,6 +118,7 @@ docs/plans/
 docs/plans/**
 
 # Public docs — explicit allowlist.
+!docs/ACCESS-GATE.md
 !docs/AGENT-DEPLOY.md
 !docs/CLEAN-CODE-GUIDELINES.md
 !docs/GIT-BRANCHING-MODEL.md
