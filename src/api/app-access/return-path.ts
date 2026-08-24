@@ -22,6 +22,15 @@
  * throwaway decoded copy, to catch a hazard smuggled in via percent-encoding
  * before it can reach anything that *does* decode. The decoded copy is used
  * only to say no; what gets returned is always the untouched raw string.
+ *
+ * A `#` is refused (DROP-155), where it used to be accepted. Measured against
+ * Caddy 2.11.4 (`2026-08-23-guest-hop-facts.md`, Q1): a `Location` built with
+ * its OWN fragment overrides whatever fragment the client's URL carried — the
+ * server-chosen one wins, the client's is simply gone. The guest invite hop
+ * puts a secret in exactly that position, so a `returnPath` allowed to carry a
+ * `#` would silently amputate it on the next redirect with no error anywhere.
+ * Rejected in `hasStructuralHazard`, so it is refused identically raw or
+ * percent-encoded (`%23`) — the same posture as the existing backslash check.
  */
 
 /** Hard ceiling on an already-generous path; anything past it is not a normal navigation target. */
@@ -54,6 +63,10 @@ function hasStructuralHazard(value: string): boolean {
   if (value.includes('\\')) return true;
   if (SCHEME_RE.test(value)) return true;
   if (TRAVERSAL_RE.test(value)) return true;
+  // A fragment overrides the client's own on the redirect target that builds
+  // one (see the module doc comment) — refused raw or percent-encoded, same
+  // as the backslash check above.
+  if (value.includes('#')) return true;
   return false;
 }
 

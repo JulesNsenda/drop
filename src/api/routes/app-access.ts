@@ -59,6 +59,7 @@ import {
 } from '../app-access/flow-code';
 import { validateReturnPath } from '../app-access/return-path';
 import { sessionCookieName, flowCookieName, EXCHANGE_PATH } from '../app-access/names';
+import { mintAppGuestSessionToken } from '../app-access/session-token';
 import { getAccessLog, type AccessLogEntry } from '../../managers/access-log/access-log';
 import { computeAppUrl } from '../../utils/app-url';
 
@@ -415,6 +416,7 @@ appAccess.post('/code', async c => {
   if (!origin) return c.json(error(ErrorCodes.CONFLICT, 'This application has no routable address'), 409);
 
   const code = mintAppAccessCode({
+    kind: 'user',
     userId: user.id,
     username: user.username,
     appName,
@@ -458,7 +460,14 @@ appAccess.get('/:app/exchange', async c => {
 
     // Minted fresh on every exchange, so a value the tenant planted before the
     // visitor's first sign-in is replaced rather than adopted.
-    const token = await mintAppSessionToken(record.userId, record.username, appName, origin);
+    // Branch on the record's own discriminant rather than sniffing a field:
+    // a guest id must never reach `mintAppSessionToken`'s userId slot, which
+    // is the cross-class confusion the separate guest token class exists to
+    // prevent. An added third identity kind fails to compile here.
+    const token =
+      record.kind === 'guest'
+        ? await mintAppGuestSessionToken(record.guestId, record.email, appName, origin)
+        : await mintAppSessionToken(record.userId, record.username, appName, origin);
 
     noStore(c);
     // TWO headers, appended — never one folded value. RFC 6265 forbids folding

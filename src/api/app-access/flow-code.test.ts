@@ -21,8 +21,18 @@ import {
 } from './flow-code';
 
 const base = () => ({
+  kind: 'user' as const,
   userId: 'user-1',
   username: 'alice',
+  appName: 'myapp',
+  flowId: mintFlowId(),
+  returnPath: '/reports',
+});
+
+const guestBase = () => ({
+  kind: 'guest' as const,
+  guestId: 'guest:1',
+  email: 'guest@example.com',
   appName: 'myapp',
   flowId: mintFlowId(),
   returnPath: '/reports',
@@ -43,6 +53,52 @@ describe('app-access flow code', () => {
     const code = mintAppAccessCode(params);
     expect(consumeAppAccessCode(code, params.flowId)).not.toBeNull();
     expect(consumeAppAccessCode(code, params.flowId)).toBeNull();
+  });
+
+  describe('the identity union — DROP-155', () => {
+    // The naive shape was `Omit<AppAccessCodeRecord, 'expiresAt'>`, which
+    // collapses a union to the INTERSECTION of its variants' keys and would
+    // have let a guestId travel in a field named `userId`. These pin that the
+    // two variants stay genuinely distinct at the type AND the runtime level.
+
+    it('round-trips a GUEST code with guestId/email intact, kind: guest', () => {
+      const params = guestBase();
+      const code = mintAppAccessCode(params);
+      const record = consumeAppAccessCode(code, params.flowId);
+      expect(record).toMatchObject({
+        kind: 'guest',
+        guestId: 'guest:1',
+        email: 'guest@example.com',
+        appName: 'myapp',
+        returnPath: '/reports',
+      });
+    });
+
+    it('a guest record carries no userId/username at all', () => {
+      const params = guestBase();
+      const code = mintAppAccessCode(params);
+      const record = consumeAppAccessCode(code, params.flowId) as unknown as Record<string, unknown>;
+      expect(record.userId).toBeUndefined();
+      expect(record.username).toBeUndefined();
+    });
+
+    it('a user record carries no guestId/email at all', () => {
+      const params = base();
+      const code = mintAppAccessCode(params);
+      const record = consumeAppAccessCode(code, params.flowId) as unknown as Record<string, unknown>;
+      expect(record.guestId).toBeUndefined();
+      expect(record.email).toBeUndefined();
+    });
+
+    it('user and guest codes in concurrent flows stay independent', () => {
+      const user = base();
+      const guest = guestBase();
+      const userCode = mintAppAccessCode(user);
+      const guestCode = mintAppAccessCode(guest);
+
+      expect(consumeAppAccessCode(userCode, user.flowId)?.kind).toBe('user');
+      expect(consumeAppAccessCode(guestCode, guest.flowId)?.kind).toBe('guest');
+    });
   });
 
   describe('flow binding — the login-CSRF defence', () => {
