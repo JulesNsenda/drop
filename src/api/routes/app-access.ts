@@ -44,7 +44,7 @@ import { isValidAppName } from '../middleware/validate';
 import { getStateManager } from '../../managers/app/state-manager';
 import { getAppConfigServiceOrNull } from '../../managers/app/app-config';
 import { getPublicUrl, isAccessGateEnabled } from '../runtime-config';
-import { canOpen, canOpenSession } from '../access';
+import { canOpen, canOpenSession, canOpenGuestSession } from '../access';
 import { AuthContext, getUserById } from '../middleware/auth';
 import {
   mintAppSessionToken,
@@ -59,7 +59,11 @@ import {
 } from '../app-access/flow-code';
 import { validateReturnPath } from '../app-access/return-path';
 import { sessionCookieName, flowCookieName, EXCHANGE_PATH } from '../app-access/names';
-import { mintAppGuestSessionToken } from '../app-access/session-token';
+import {
+  mintAppGuestSessionToken,
+  verifyAppGuestSessionToken,
+} from '../app-access/session-token';
+import { getAppGuestById, getAppGuestManager } from '../../managers/app-guest';
 import { getAccessLog, type AccessLogEntry } from '../../managers/access-log/access-log';
 import { computeAppUrl } from '../../utils/app-url';
 
@@ -161,6 +165,69 @@ function forbidden(c: Context, appName: string, detail: string): Response {
   );
 }
 
+/**
+ * Is this guest still admissible RIGHT NOW — record live, policy live?
+ *
+ * `canOpenGuestSession` answers the POLICY half and deliberately does not read
+ * the guest record (see its own doc: bindings at the authorization boundary,
+ * record state at the verifier). So this exists only where there is NO
+ * verifier between the credential and the session — the exchange, where the
+ * credential is a single-use code rather than a guest token.
+ */
+function guestRecordLive(guestId: string, appName: string): boolean {
+  const guest = getAppGuestById(guestId);
+  if (!guest) return false;
+  if (guest.appName !== appName) return false;
+  return guest.disabled !== true;
+}
+
+/**
+ * The membership RE-CHECK the exchange makes before minting a session.
+ *
+ * A code is minted at `POST /code` (or its guest sibling) and spent one
+ * navigation later. In between the grant can be revoked — an owner removing
+ * someone, an admin clearing the policy, a guest disabled. Without this the
+ * revoked visitor still walks away with a session valid for the full TTL, so
+ * revocation would take up to eight hours to mean anything for anyone who
+ * happened to be mid-flow. The code being single-use does not help: it is a
+ * credential minted BEFORE the decision it carries was last true.
+ *
+ * Fails CLOSED on a missing app or policy, for the same reason `canOpen` takes
+ * a REQUIRED policy: this hop is reached only for an app that was gated when
+ * the code was minted, so "no policy now" is a lookup that MISSED or a gate
+ * removed mid-flow. Neither is a reason to mint.
+ */
+function codeStillAdmissible(
+  record:
+    | { kind: 'user'; userId: string; username: string }
+    | { kind: 'guest'; guestId: string; email: string },
+  appName: string
+): boolean {
+  const app = getStateManager().getApp(appName);
+  const policy = gatePolicy(appName);
+  if (!app || !policy) return false;
+
+  if (record.kind === 'guest') {
+    if (!guestRecordLive(record.guestId, appName)) return false;
+    return canOpenGuestSession(
+      { guestId: record.guestId, email: record.email, appName },
+      policy,
+      appName
+    );
+  }
+
+  // The user arm reads the role LIVE from the credentials file, exactly as
+  // `verifyAppSessionToken` does — the code carries no role and must not.
+  const user = getUserById(record.userId);
+  if (!user || user.enabled === false) return false;
+  return canOpenSession(
+    { userId: user.id, username: user.username, appName, role: user.role },
+    app,
+    policy,
+    appName
+  );
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // 1. verify — Caddy's forward_auth target, on the TENANT's hostname
 // ─────────────────────────────────────────────────────────────────────────────
@@ -223,10 +290,84 @@ appAccess.get('/:app/verify', async c => {
       return forbidden(c, appName, 'This application has no routable address.');
     }
 
+    // ONE cookie name, TWO credential classes. The exchange writes whichever
+    // class the code record named into `sessionCookieName(appName)`, so this
+    // hop cannot know which it is holding without trying both.
+    //
+    // The order is free, and that is a property worth stating rather than a
+    // coincidence to rely on: each verifier checks `token_use` FIRST (see
+    // `session-token.ts`'s module doc), so a guest token can never satisfy the
+    // user verifier and a user token can never satisfy the guest one. The user
+    // class is tried first only because it is the common case.
     const token = readCookie(c, sessionCookieName(appName));
-    const identity = token
-      ? await verifyAppSessionToken(token, origin, appName)
-      : null;
+    const identity = token ? await verifyAppSessionToken(token, origin, appName) : null;
+    const guest =
+      !identity && token ? await verifyAppGuestSessionToken(token, origin, appName) : null;
+
+    // A guest token that FAILS its verifier — expired, revoked, disabled, or
+    // minted for another app — is indistinguishable here from no cookie at
+    // all, and falls through to the redirect below. That is a deliberate
+    // choice with a real cost, so it is written down rather than left to be
+    // rediscovered.
+    //
+    // Giving those cases the terminal 403 they deserve would mean reading the
+    // token's `token_use` claim WITHOUT verifying its signature, purely to
+    // decide the message. A tenant can set cookies on its own origin, so that
+    // would hand a hostile tenant a way to force a terminal refusal for every
+    // visitor to their own gated app — including account holders, whose
+    // recovery path is the redirect this would replace. The gate is
+    // GOVERNANCE: an admin may have gated an app precisely because they do
+    // not trust the tenant, and the tenant must not be able to break the way
+    // back in.
+    //
+    // The cost is a revoked guest being sent to a sign-in page they have no
+    // account for. The owner re-sending an invite is the recovery path, which
+    // is the same answer the plan gives for a missed invite.
+
+    if (guest) {
+      if (canOpenGuestSession(guest, policy, appName)) {
+        // No `userId`/`username` on the log row: a guest id in a field named
+        // for a DROP user is the cross-class confusion the fourth credential
+        // class exists to prevent, one layer below the boundary that prevents
+        // it. `reason` carries the fact instead, until the estate view grows a
+        // guest column of its own (plan: estate rendering follows in a fixup).
+        recordAccess({ appName, decision: 'admit', reason: 'guest' });
+        // The guest store's own equivalent of `recordAppOpened`, and the
+        // reason `recordAppOpened` is NOT called here: that summary is keyed
+        // on a user id and has no guest column yet.
+        try {
+          getAppGuestManager().touchLastSeen(guest.guestId);
+        } catch {
+          // Best-effort, exactly like the log above: a summary nobody has read
+          // yet must never delay or fail the authorization it describes.
+        }
+        // A DISTINCT header name, and NO `X-Drop-Session-User-Id` /
+        // `-Username` at all.
+        //
+        // What this buys, precisely: an app whose Caddy block was emitted
+        // before DROP-155 copies neither name, so a guest arrives at that
+        // tenant with NO identity rather than one indistinguishable from a
+        // DROP user's. That is fail-closed on ABSENCE.
+        //
+        // It is NOT the same as unspoofable. `forward_auth` proxies the
+        // ORIGINAL request to the tenant, and an already-emitted block neither
+        // strips this name from the client's request nor re-adds it via
+        // `copy_headers` — so a client can set `X-Drop-Guest-Id` itself and
+        // the tenant will see the client's value, exactly as is true of
+        // `X-Drop-Session-User-Id` today. This header becomes trustworthy only
+        // once the fleet is re-emitted with a strip list AND `copy_headers`;
+        // until then it is a convenience, and the tenant must not treat it as
+        // authentication.
+        c.header('X-Drop-Guest-Id', guest.guestId);
+        noStore(c);
+        return c.body(null, 204);
+      }
+      // A valid guest session whose grant is gone. Terminal, for the same
+      // reason the user arm is — and for a harder one: a guest has no account
+      // to sign in with, so a redirect here is a loop with no exit at all.
+      recordAccess({ appName, decision: 'refuse', reason: 'guest-not-permitted' });
+      return forbidden(c, appName, 'Your invitation to this application is no longer valid.');
+    }
 
     if (identity) {
       if (canOpenSession(identity, app, policy, appName)) {
@@ -452,6 +593,24 @@ appAccess.get('/:app/exchange', async c => {
         c,
         appName,
         'This sign-in link is no longer valid. Reload the page to start again.'
+      );
+    }
+
+    // Membership, re-checked at the LAST moment before a session exists — see
+    // `codeStillAdmissible`. Deliberately AFTER `consumeAppAccessCode`, so a
+    // code whose grant was revoked mid-flow is still SPENT rather than left
+    // replayable for the rest of its (short) life.
+    if (!codeStillAdmissible(record, appName)) {
+      recordAccess({
+        appName,
+        decision: 'refuse',
+        reason: record.kind === 'guest' ? 'guest-revoked-mid-flow' : 'revoked-mid-flow',
+        ...(record.kind === 'user' ? { userId: record.userId, username: record.username } : {}),
+      });
+      return forbidden(
+        c,
+        appName,
+        'Your access to this application was removed. Ask the person who owns it.'
       );
     }
 
