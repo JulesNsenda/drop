@@ -141,6 +141,7 @@ import {
 } from '../managers/log-retention/log-retention';
 import { hasEnoughDisk, getMinFreeDiskMb } from '../utils/disk';
 import { getAccessLog, resetAccessLog } from '../managers/access-log/access-log';
+import { getAppGuestManager, resetAppGuests } from '../managers/app-guest';
 import { sessionCookieName as appSessionCookieName } from '../api/app-access/names';
 import {
   assessAccessGate,
@@ -880,6 +881,45 @@ export class DropPlatform {
       );
       await getMailQuota(mailQuotaStore).initialize();
 
+      // The guest stores (DROP-155), loaded HERE for the same reason the two
+      // quotas above are: their default paths resolve against `DROP_ROOT` via
+      // the environment rather than this platform's own `dropRoot`, and a box
+      // configured with `--root` would otherwise read and write a different
+      // directory than every other store. Bound explicitly.
+      //
+      // BEFORE `initializeServices()`, so the stores are populated before any
+      // route or verifier can reach them. `verifyAppGuestSessionToken` re-reads
+      // the guest record LIVE on every request and refuses when it finds none —
+      // which is correct as a refusal but wrong as a startup state: an unloaded
+      // store would lock every guest out of every app until something else
+      // happened to load it.
+      //
+      // `load()` never throws: an unreadable file surfaces as `isCorrupt()`,
+      // and every guest path is written to treat that as "refuse", never as
+      // "the list is empty".
+      //
+      // RESET FIRST, and that is not defensive noise. `getAppGuestById` is a
+      // bare synchronous free function, and `getAppGuestManager()` builds the
+      // singleton against its DEFAULT (env-derived) paths for whoever calls it
+      // first — so any read reaching it before this line binds the store to
+      // `DROP_ROOT`'s default rather than to THIS platform's `dropRoot`. At
+      // this point in `start()` no such binding can hold anything worth
+      // keeping (nothing has been loaded yet), and the platform is the
+      // authority on where its own state lives, so the pre-existing binding is
+      // discarded rather than argued with. Without this, a second platform in
+      // one process — which is every integration test — hits the
+      // reconfiguration guard and dies at boot.
+      resetAppGuests();
+      await getAppGuestManager({
+        guestsFilePath: path.join(this.config.dropRoot, 'data', 'drop-svc', 'app-guests.json'),
+        invitesFilePath: path.join(
+          this.config.dropRoot,
+          'data',
+          'drop-svc',
+          'app-guest-invites.json'
+        ),
+      }).load();
+
       // Initialize services
       await this.initializeServices();
 
@@ -910,6 +950,11 @@ export class DropPlatform {
       // assertStartupConstraints above runs before that and can see no app's
       // policy at all -- and deliberately non-fatal.
       await this.sweepAccessGates();
+
+      // Self-healing pass over guest grants (DROP-155). Same placement
+      // reasoning as the sweep above: it needs the app configs, which only
+      // exist after `initializeServices()`.
+      await this.pruneStaleGuestGrants();
 
       // M1 boot reconciliation (DROP_BOOT_RECONCILE): decide skip vs redeploy
       // per known app BEFORE the watcher starts, so a stable app's own
@@ -1126,6 +1171,12 @@ export class DropPlatform {
       // on a store write.
     }
     resetMailQuota();
+
+    // No flush: every guest-store write is already awaited by its caller
+    // before that caller acknowledges anything (the one fire-and-forget path,
+    // `touchLastSeen`, is explicitly best-effort). Nothing is held in memory
+    // that a restart would lose, so this is a reset, not a flush-then-reset.
+    resetAppGuests();
 
     // Stop API server
     if (this.apiServer) {
@@ -5143,6 +5194,69 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
   }
 
   /**
+   * Drop guest ids that appear in an app's `access.guests` but have no backing
+   * guest record (DROP-155).
+   *
+   * SELF-HEALING, not enforcement. Nothing is granted by a stale entry
+   * regardless — `verifyAppGuestSessionToken` re-reads the guest record live on
+   * every request and refuses when it is gone — so this is about keeping
+   * `guests` readable as the authoritative list of who currently holds access.
+   * An operator (and the dashboard's own share panel) must be able to answer
+   * "who can open this app" from the policy without cross-checking a second
+   * store, and a revoke interrupted between its two writes would otherwise
+   * leave a name on that list forever.
+   *
+   * CORRUPT STORE => SKIP ENTIRELY. This is the single most important line in
+   * the method, and it is the direction that is not obvious: with the store
+   * unreadable, "this guest has no record" cannot be distinguished from "this
+   * guest exists and we cannot see it" — so a pass that pruned what it could
+   * see would convert ONE unreadable file into permanent deletion of every
+   * guest grant on the estate, on a boot nobody was watching. `reapGuest`
+   * refuses internally for the same reason; this returns before enumerating so
+   * the log line says what actually happened.
+   *
+   * Reaping through `reapGuest` rather than calling `pruneGuestEntries`
+   * directly: an id with no record may still have live INVITES bound to it,
+   * and the reaper is what removes both. It is idempotent and safe on an id
+   * the store has never heard of, which is exactly the case here.
+   *
+   * Best-effort and never fatal — a failure here costs list hygiene, not
+   * access control, and must not stop the platform booting.
+   */
+  private async pruneStaleGuestGrants(): Promise<void> {
+    try {
+      const guestManager = getAppGuestManager();
+      if (guestManager.isCorrupt()) {
+        this.logger.warn(
+          'Guest store is unreadable — skipping the stale-guest-grant sweep entirely. ' +
+            'Guest sessions are being refused while this persists; no grant has been removed.',
+          'ACCESS'
+        );
+        return;
+      }
+
+      const configs = this.appConfigService?.getAllConfigs() ?? [];
+      const stale = new Set<string>();
+      for (const config of configs) {
+        for (const guestId of config.access?.guests ?? []) {
+          if (!guestManager.guestExists(guestId)) stale.add(guestId);
+        }
+      }
+      if (stale.size === 0) return;
+
+      for (const guestId of stale) {
+        await guestManager.reapGuest(guestId);
+      }
+      this.logger.info(
+        `Pruned ${stale.size} guest grant(s) with no backing record`,
+        'ACCESS'
+      );
+    } catch (error) {
+      this.logger.warn('Stale-guest-grant sweep failed', 'ACCESS', error);
+    }
+  }
+
+  /**
    * Report every persisted access-gate policy this box cannot enforce
    * (DROP-152), and record the resulting `accessGateUnapplied` state for
    * each app. A REPORTER — it never touches Caddy.
@@ -6836,6 +6950,53 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     } catch (error) {
       // Never block a delete that is already happening.
       this.logger.warn(`Failed to retain deploy details for ${name}`, 'CLEANUP', error);
+    }
+
+    // Guest records and their live invites (DROP-155). Deleting an app frees
+    // its NAME, and a guest record is keyed on `(email, appName)` — so a guest
+    // left behind is a credential for whatever the next registrant puts at
+    // that name. `verifyAppGuestSessionToken` would happily verify it: every
+    // check it makes (app claim, record `appName`, `disabled`, the
+    // invalidation stamp) still passes, because none of them knows the app
+    // was ever deleted. That is the same next-tenant-inherits-the-previous
+    // one's-artifacts problem the log and appdata deletes below exist for,
+    // except the artifact is an admission credential.
+    //
+    // NOT gated on `keepData`: that flag protects the user's DATA (database,
+    // Redis, appdata) so a delete-and-redeploy keeps working. A grant to a
+    // third party is not the owner's data, and re-creating the app must not
+    // silently re-admit people the owner invited to the app that used to be
+    // there.
+    //
+    // `reapGuest` also removes every invite bound to each guest, which is how
+    // the app's live invites go with it — an invite always names a guest that
+    // already exists (`mintInviteToken` requires a resolved guest id), so
+    // reaping every guest of this app reaps every invite for it.
+    try {
+      const guestManager = getAppGuestManager();
+      // Corrupt store => touch nothing. "Refuse every guest" plus "clean up
+      // what we can see" is the combination that turns one unreadable file
+      // into permanent deletion of grants across the estate; the reaper itself
+      // makes the same refusal internally, and this avoids even enumerating.
+      if (!guestManager.isCorrupt()) {
+        const appGuests = guestManager.listGuests().filter((g) => g.appName === name);
+        for (const guest of appGuests) {
+          await guestManager.reapGuest(guest.id);
+        }
+        if (appGuests.length > 0) {
+          this.logger.info(
+            `Revoked ${appGuests.length} guest grant(s) for deleted app '${name}'`,
+            'CLEANUP'
+          );
+        }
+      } else {
+        this.logger.warn(
+          `Guest store is unreadable — guest grants for deleted app '${name}' were NOT revoked`,
+          'CLEANUP'
+        );
+      }
+    } catch (error) {
+      this.logger.warn(`Failed to revoke guest grants for ${name}`, 'CLEANUP', error);
     }
 
     const targets = [

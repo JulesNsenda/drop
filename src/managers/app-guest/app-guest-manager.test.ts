@@ -453,3 +453,44 @@ describe('AppGuestManager — guest records', () => {
     });
   });
 });
+
+describe('getAppGuestManager singleton binding', () => {
+  /**
+   * `getAppGuestById` is a bare synchronous free function on the request path,
+   * and it builds this singleton with NO config if it gets there first. On a
+   * box whose root is not the default, that would bind the store to the wrong
+   * file and make `platform.ts`'s explicit configuration a no-op — and the
+   * symptom is every guest reading as "no record", which is indistinguishable
+   * from correct fail-closed behaviour. So a conflicting configure must be
+   * loud.
+   */
+  afterEach(() => resetAppGuests());
+
+  it('throws rather than silently keeping the first paths when reconfigured', () => {
+    getAppGuestManager({ guestsFilePath: '/a/app-guests.json' });
+    expect(() => getAppGuestManager({ guestsFilePath: '/b/app-guests.json' })).toThrow(
+      /already initialized at/
+    );
+  });
+
+  it('a bare call returns the existing instance and never throws', () => {
+    const first = getAppGuestManager({ guestsFilePath: '/a/app-guests.json' });
+    expect(getAppGuestManager()).toBe(first);
+  });
+
+  it('detects the conflict even when the FIRST caller passed no config at all', () => {
+    // The actual production hazard: the accidental early read builds a
+    // default-path instance, and platform.ts's root-anchored configure is the
+    // one that must fail.
+    getAppGuestManager();
+    expect(() => getAppGuestManager({ guestsFilePath: '/b/app-guests.json' })).toThrow(
+      /already initialized at/
+    );
+  });
+
+  it('resetAppGuests clears the recorded binding, so a later configure is allowed', () => {
+    getAppGuestManager({ guestsFilePath: '/a/app-guests.json' });
+    resetAppGuests();
+    expect(() => getAppGuestManager({ guestsFilePath: '/b/app-guests.json' })).not.toThrow();
+  });
+});

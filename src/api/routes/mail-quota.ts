@@ -14,18 +14,23 @@
  * silently, never failing the grant it hangs off. Folding those together would
  * mean one of them lying about what it did.
  *
- * What is NOT here, and is the deeper fix: metering inside `sendTemplatedMail`
- * itself, so a caller cannot forget to meter and cannot get the ordering wrong.
- * The DROP-154 Gate 5 review argued for it after finding the two call sites had
- * already diverged — POST /mail/test recorded BEFORE the send, so an
- * unconfigured relay burned allowance for a message that never left, which is
- * exactly what notifyShareGrant's own comment says must not happen. Both now
- * record only after the relay was actually dialed. Deferred to Slice C, where
- * the invite path arrives and the result type has to change anyway.
+ * `sendMeteredMail` below is Slice C paying off the DROP-154 Gate 5 debt: the
+ * check -> send -> record-only-if-dialed sequence in ONE place, so a caller can
+ * neither forget to meter nor get the ordering wrong. It lives here rather than
+ * inside `sendTemplatedMail` because the mailer's own header states it has no
+ * `AuthContext` — and the quota is keyed on one. Wrapping gets the
+ * can't-forget-it property without widening the mailer's type surface, which
+ * was the Gate 5 proposal's actual cost.
  */
 
 import { getMailQuota } from '../../managers/guardrail/principal-quota';
 import type { QuotaKey } from '../../managers/guardrail/principal-quota';
+import { sendTemplatedMail } from '../../managers/mailer/mailer';
+import type {
+  MailTemplate,
+  MailTemplateVars,
+  MailFailureDetail,
+} from '../../managers/mailer/mailer.types';
 
 export interface MailQuotaActor {
   principalId?: string;
@@ -61,4 +66,61 @@ export function checkMailQuota(actor: MailQuotaActor): MailQuotaAdmission {
     };
   }
   return { allowed: true, keys: keys.keys };
+}
+
+/**
+ * The quota's own arm, kept structurally distinct from the mailer's two.
+ *
+ * `refused` means NOTHING WAS SENT and no relay was dialed — a different
+ * fact from `unavailable` (local config missing, or an input the mailer
+ * refused), which callers already treat differently: `POST /admin/mail/test`
+ * answers a structured 429 for one and a 200-with-status for the other.
+ * Folding them into a single "didn't send" would erase exactly the
+ * distinction both callers branch on.
+ */
+export type MeteredMailResult =
+  | { status: 'refused'; reason: string; retryAfterSeconds?: number }
+  | { status: 'attempted'; failure?: MailFailureDetail }
+  | { status: 'unavailable' };
+
+/**
+ * Check the quota, send, and charge the allowance — in that order, once.
+ *
+ * THE ORDERING IS THE CONTROL, and it is the thing two hand-written copies
+ * of this sequence had already got wrong once (DROP-154 Gate 5):
+ *
+ *  - the quota is checked BEFORE anything is rendered or dialed, so a
+ *    refusal costs no relay conversation and leaks no timing;
+ *  - the allowance is charged only when the relay was ACTUALLY dialed
+ *    (`status !== 'unavailable'`). An unconfigured relay never opens a
+ *    socket, and counting those would refuse the first REAL sends the moment
+ *    an operator finally configures mail — the bug `POST /admin/mail/test`
+ *    shipped with.
+ *
+ * Never throws: `sendTemplatedMail` is documented not to, and the quota calls
+ * are synchronous bookkeeping. Callers still decide what a refusal MEANS —
+ * this deliberately stops at the result, because the callers genuinely
+ * diverge (a 429 for the operator's own request; a logged, silent skip for a
+ * best-effort notification that must never fail the grant it hangs off).
+ */
+export async function sendMeteredMail<T extends MailTemplate>(
+  actor: MailQuotaActor,
+  template: T,
+  to: string,
+  vars: MailTemplateVars[T]
+): Promise<MeteredMailResult> {
+  const admission = checkMailQuota(actor);
+  if (!admission.allowed) {
+    return {
+      status: 'refused',
+      reason: admission.reason,
+      retryAfterSeconds: admission.retryAfterSeconds,
+    };
+  }
+
+  const result = await sendTemplatedMail(template, to, vars);
+  if (result.status !== 'unavailable') {
+    getMailQuota().record(admission.keys);
+  }
+  return result;
 }

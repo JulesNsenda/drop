@@ -790,11 +790,41 @@ export class AppGuestManager {
 // answer from an empty map rather than throwing).
 
 let instance: AppGuestManager | null = null;
+let instanceGuestsFilePath: string | null = null;
 
+/**
+ * Passing file paths that CONFLICT with an already-constructed instance
+ * throws, rather than silently keeping whichever call landed first — the same
+ * precedent `getMailQuota()` and `getAppRuntime()` set.
+ *
+ * This is not defensive tidiness. `getAppGuestById` is a bare synchronous
+ * free function called by `verifyAppGuestSessionToken` on every request, and
+ * it constructs this singleton with NO config if it happens to be the first
+ * caller in the process. On a box started with `--root` / `DROP_ROOT` pointing
+ * somewhere other than the default, an accidental early read would bind the
+ * store to the DEFAULT path and `platform.ts`'s explicit, root-anchored
+ * configuration would then be discarded without a word — every guest on the
+ * box reads as "no record", which is a refusal, which looks exactly like
+ * correct fail-closed behaviour. That is the same shape as the mail quota
+ * resolving its store against the process CWD, and it is the reason that one
+ * grew this guard too.
+ *
+ * A bare call (no argument) never throws and returns whatever instance
+ * exists — that is the shape every reader here uses.
+ */
 export function getAppGuestManager(config?: AppGuestManagerConfig): AppGuestManager {
-  if (!instance) {
-    instance = new AppGuestManager(config);
+  if (instance) {
+    const requested = config?.guestsFilePath;
+    if (requested !== undefined && requested !== instanceGuestsFilePath) {
+      throw new Error(
+        `App guest store already initialized at '${instanceGuestsFilePath}'; ` +
+          `cannot reconfigure to '${requested}' without resetAppGuests()`
+      );
+    }
+    return instance;
   }
+  instance = new AppGuestManager(config);
+  instanceGuestsFilePath = config?.guestsFilePath ?? defaultGuestsFilePath();
   return instance;
 }
 
@@ -812,6 +842,7 @@ export function resetAppGuests(): void {
     instance.close();
     instance = null;
   }
+  instanceGuestsFilePath = null;
 }
 
 /** Synchronous live lookup — see the module doc above for why this must never become `async`. */

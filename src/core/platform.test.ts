@@ -17,6 +17,7 @@ import * as diskUtils from '../utils/disk';
 import { createApiKey, deleteApiKeysByName } from '../api/middleware/auth';
 import { setPublicUrl } from '../api/runtime-config';
 import { getMailQuota, resetMailQuota } from '../managers/guardrail/principal-quota';
+import { getAppGuestManager, resetAppGuests } from '../managers/app-guest';
 
 // These are pipeline/service unit tests — they never exercise the HTTP API, so
 // disable it (createPlatform reads DROP_ENABLE_API when no enableApi is passed).
@@ -4611,5 +4612,69 @@ describe('Step 7 — deploy guardrail at the choke points', () => {
     );
 
     expect(buildSpy).toHaveBeenCalled();
+  });
+});
+
+describe('DROP-155 — the guest store binds to THIS platform root at boot', () => {
+  /**
+   * `getAppGuestById` is a bare synchronous free function on the request path,
+   * so whoever reaches the singleton FIRST binds it — with no config, that is
+   * the env-derived default rather than this platform's `dropRoot`. `start()`
+   * therefore resets the binding before configuring it.
+   *
+   * Without that reset the reconfiguration guard fires and `start()` THROWS,
+   * and the visible damage lands two suites away: the failed start never
+   * reaches `isRunning`, so `stop()`'s own early return skips every global
+   * teardown, and the NEXT platform dies on a mail-quota conflict instead.
+   * That is a three-layer displacement between cause and symptom, which is
+   * why this is pinned by name here rather than left to the 19 tests that
+   * happen to go red.
+   */
+  let tempDir: string;
+  let platform: DropPlatform;
+
+  const guestStorePath = (root: string) =>
+    path.join(root, 'data', 'drop-svc', 'app-guests.json');
+
+  beforeEach(async () => {
+    jest.clearAllMocks();
+    tempDir = path.join(os.tmpdir(), `drop-guestbind-${Date.now()}`);
+    // The accidental early read: something builds the singleton against the
+    // DEFAULT paths before any platform has said where its root is.
+    resetAppGuests();
+    getAppGuestManager();
+
+    platform = createPlatform({
+      dropRoot: tempDir,
+      appsDirectory: path.join(tempDir, 'apps'),
+      logLevel: 'error',
+      autoBuild: false,
+      autoStart: false,
+      caddyfilePath: path.join(tempDir, 'Caddyfile'),
+    });
+  });
+
+  afterEach(async () => {
+    if (platform && platform.isActive()) {
+      await platform.stop();
+    }
+    resetAppGuests();
+  });
+
+  it('starts despite a pre-existing default binding, instead of dying on the guard', async () => {
+    await expect(platform.start()).resolves.toBeUndefined();
+  });
+
+  it('rebinds the store to this platform root', async () => {
+    await platform.start();
+
+    // Re-configuring to the SAME path is the no-op the guard permits, so this
+    // passing is the assertion that the binding moved to tempDir...
+    expect(() => getAppGuestManager({ guestsFilePath: guestStorePath(tempDir) })).not.toThrow();
+    // ...and this failing is the assertion that it is bound to exactly one
+    // place, rather than the guard having been quietly defanged.
+    expect(() =>
+      getAppGuestManager({ guestsFilePath: guestStorePath(path.join(os.tmpdir(), 'somewhere-else')) })
+    ).toThrow(/already initialized at/);
   });
 });

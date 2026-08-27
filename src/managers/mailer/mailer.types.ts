@@ -8,7 +8,7 @@
  */
 
 /** The only templates that exist. */
-export type MailTemplate = 'share-notification' | 'test';
+export type MailTemplate = 'share-notification' | 'test' | 'guest-invite';
 
 /** Sent to the recipient of an owner's `PUT /apps/:name/share` grant. */
 export interface ShareNotificationVars {
@@ -22,6 +22,37 @@ export interface ShareNotificationVars {
   platformUrl: string;
 }
 
+/**
+ * Sent to a person with NO DROP account, inviting them to one app (DROP-155).
+ *
+ * Note what is ABSENT: there is no `appUrl`. The invite link points at the
+ * PLATFORM's own origin, and the app's real hostname never appears in this
+ * message at all — `computeAppUrl` resolves from the app's own drop.yaml
+ * `domains` / `customDomain`, which are tenant-authored, and this mail is
+ * already carrying an attacker-choosable app name inside a DKIM/SPF-aligned
+ * message from the operator's relay. `renderGuestInvite` enforces the
+ * platform-origin rule on `inviteUrl` itself rather than trusting its caller
+ * to have built the URL correctly (DROP-155 plan §C).
+ */
+export interface GuestInviteVars {
+  /** `AppState.name` — constrained by `isValidAppName` upstream. */
+  appName: string;
+  /** `getUserById(createdBy).username` — constrained by the signup grammar upstream. */
+  inviterName: string;
+  /**
+   * `https://<platform>/api/v1/app-access/invite/<id>#<secret>`.
+   *
+   * Carries the invite SECRET in its fragment, which is why it must be on
+   * the platform's own origin and nowhere else — enforced at render time,
+   * not assumed.
+   */
+  inviteUrl: string;
+  /** `getPublicUrl()` — operator-set, normalized. The origin `inviteUrl` is checked against. */
+  platformUrl: string;
+  /** `INVITE_TTL_HOURS`. Passed rather than hardcoded so the copy cannot drift from the real TTL. */
+  expiresInHours: number;
+}
+
 /** Sent by `POST /admin/mail/test` to confirm relay settings actually work. */
 export interface TestMailVars {
   /** `getPublicUrl()` — operator-set, normalized. */
@@ -32,6 +63,7 @@ export interface TestMailVars {
 export interface MailTemplateVars {
   'share-notification': ShareNotificationVars;
   test: TestMailVars;
+  'guest-invite': GuestInviteVars;
 }
 
 export interface RenderedMail {

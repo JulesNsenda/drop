@@ -112,11 +112,10 @@ import { getSettingsManager } from '../../managers/settings/settings-manager';
 import { getPublicUrl, getDomainSuffix } from '../runtime-config';
 import { logActivityFor } from '../../managers/activity';
 import { gateEnforced } from '../../managers/guardrail/access-gate';
-import { getMailQuota } from '../../managers/guardrail/principal-quota';
-import { sendTemplatedMail } from '../../managers/mailer/mailer';
+
 import { isLocalhostDomain } from '../../utils/domain-validator';
 import { MAX_ACCESS_ALLOW_ENTRIES, MAX_USER_ID_LENGTH, requireAuthForAccessRoutes } from './access-limits';
-import { checkMailQuota } from './mail-quota';
+import { sendMeteredMail } from './mail-quota';
 
 const shareRoutes = new Hono();
 
@@ -204,33 +203,33 @@ async function notifyShareGrant(requester: AuthContext, app: AppState, targetUse
     // logging.
     if (!appUrl || !platformUrl) return;
 
-    // checkMailQuota (mail-quota.ts) — shared with POST /admin/mail/test against
-    // this same singleton. Mail's `keysFor` has no unmetered branch (unlike
-    // deploys) — an absent principal refuses rather than sending unmetered.
-    const admission = checkMailQuota({ principalId: requester.principalId, actorUserId: requester.userId });
-    if (!admission.allowed) {
-      await refuse(`share notification refused: ${admission.reason}`);
+    // sendMeteredMail (mail-quota.ts) — the check -> send -> charge-only-if-dialed
+    // sequence, shared with POST /admin/mail/test against the same quota
+    // singleton. Mail's `keysFor` has no unmetered branch (unlike deploys), so
+    // an absent principal comes back `refused` rather than sending unmetered.
+    const result = await sendMeteredMail(
+      { principalId: requester.principalId, actorUserId: requester.userId },
+      'share-notification',
+      target.email,
+      {
+        appName: app.name,
+        // The GRANTING user, resolved server-side — never anything from the
+        // request body. `requester.userId` is exactly the id this grant just
+        // stamped into `grantedBy` for `targetUserId`.
+        sharerName: getUserById(requester.userId)?.username ?? requester.username,
+        appUrl,
+        platformUrl,
+      }
+    );
+
+    if (result.status === 'refused') {
+      await refuse(`share notification refused: ${result.reason}`);
       return;
     }
-
-    const result = await sendTemplatedMail('share-notification', target.email, {
-      appName: app.name,
-      // The GRANTING user, resolved server-side — never anything from the
-      // request body. `requester.userId` is exactly the id this grant just
-      // stamped into `grantedBy` for `targetUserId`.
-      sharerName: getUserById(requester.userId)?.username ?? requester.username,
-      appUrl,
-      platformUrl,
-    });
-
-    // Charge the allowance only once the relay was actually dialed — an
-    // unconfigured relay (`status: 'unavailable'`) never contacts anything,
-    // and counting it against the quota would refuse the first REAL sends
-    // once an operator finally configures mail (Gate 2 finding). POST
-    // /admin/mail/test now follows this same rule (Gate 5 — it used to
-    // record before sending).
+    // `unavailable` is local config (no relay host/from/credential) or an
+    // input the mailer refused — nothing was dialed and nothing was charged.
+    // Not a refusal worth logging on a box that simply has no mail set up.
     if (result.status === 'unavailable') return;
-    getMailQuota().record(admission.keys);
     if (result.failure) {
       // ADMIN-FACING ONLY (`MailFailureDetail`'s own doc comment) — logged
       // for whoever reads the activity log, never surfaced on this

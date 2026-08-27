@@ -8,7 +8,8 @@ import { AuthContext } from './middleware/auth';
 import { AppState } from '../managers/app/state-manager';
 import { scopesAllow, AgentVerb } from './agent-scopes';
 import type { AppAccessPolicy } from '../managers/app/app-config';
-import type { AppSessionIdentity } from './app-access/session-token';
+import type { AppSessionIdentity, AppGuestIdentity } from './app-access/session-token';
+import { GUEST_ID_PREFIX } from '../managers/app-guest/types';
 
 /**
  * Whether the current request may access an app: owns it, is an admin, or
@@ -167,7 +168,7 @@ export function canOpen(
   // should fail in.
   if (auth.authMethod !== 'jwt' || auth.role === 'none' || auth.kind === 'agent') return false;
 
-  return evaluateAccessPolicy(auth.userId, auth.role, app, policy);
+  return evaluateAccessPolicy({ kind: 'account', userId: auth.userId, role: auth.role }, app, policy);
 }
 
 /**
@@ -203,25 +204,129 @@ export function canOpenSession(
   // no runtime narrowing — and this file's own argument for two entry points is
   // that "disjoint as declared" is not something to rely on at runtime.
   if (session.role === ('none' as string)) return false;
-  return evaluateAccessPolicy(session.userId, session.role, app, policy);
+  return evaluateAccessPolicy(
+    { kind: 'account', userId: session.userId, role: session.role },
+    app,
+    policy
+  );
 }
 
 /**
- * The rule both entry points share: admin, or owner, or explicitly allowed.
+ * The THIRD entry point: a visitor holding a GUEST session (DROP-155).
  *
- * `userId` is typed as a required string on both callers and is NOT always one
- * at runtime — the `DROP_API_KEY` and `cli-local` principals are ownerless and
- * a monorepo group child has no `AppState.userId` — so two `undefined`s must
- * never compare equal into an admission.
+ * A guest is not a low-privilege account, and this is not `canOpenSession`
+ * with a weaker role. `AppGuestIdentity` carries no `role` field at all, so
+ * there is no value to pass into the admin/owner clauses — the guest is
+ * admitted by `policy.guests` membership or not at all, and the evaluator
+ * below makes that structural rather than a discipline every future policy
+ * clause has to remember.
+ *
+ * WHAT THIS CHECKS AND WHAT IT DELIBERATELY DOES NOT
+ *
+ * It checks the app BINDING (the identity's own `appName` against the app
+ * being opened) and POLICY membership. It does NOT re-read the guest record
+ * to re-assert `disabled` / `credentialsInvalidBefore`, and that is a
+ * decision rather than an oversight:
+ *
+ *  - `verifyAppGuestSessionToken` already re-reads the record live on every
+ *    single request and refuses a disabled or invalidated guest there. That
+ *    is the same posture `canOpenSession` rests on for a user, whose `role`
+ *    is likewise read live by the verifier and simply trusted here.
+ *  - The line this file draws is BINDINGS here, RECORD STATE at the
+ *    verifier. `canAccessScoped`'s "both halves of a binding belong at the
+ *    authorization boundary" argument is about bindings — scope-to-app,
+ *    session-to-app — not about record liveness. Re-reading only in the
+ *    guest arm would put the two arms on different footings for no gain: a
+ *    second read at a slightly later instant is not more current, only
+ *    differently stale.
+ *
+ * So the invariant a caller must hold up is exactly the one the verifier
+ * already enforces: an `AppGuestIdentity` value must only ever come from
+ * `verifyAppGuestSessionToken`. It is not constructible from request input
+ * anywhere in this codebase, and it must not become so.
+ */
+export function canOpenGuestSession(
+  guest: AppGuestIdentity,
+  policy: AppAccessPolicy,
+  appName: string
+): boolean {
+  // The second half of the app binding, exactly as `canOpenSession` does it:
+  // the verifier binds the token's `app` claim AND the guest record's own
+  // `appName`, and this is the authorization boundary re-asserting it rather
+  // than trusting that admission was strict.
+  if (guest.appName !== appName) return false;
+  return evaluateAccessPolicy({ kind: 'guest', guestId: guest.guestId }, undefined, policy);
+}
+
+/**
+ * The principal, as the shared evaluator sees it.
+ *
+ * A DISCRIMINATED UNION, so the admin and owner clauses are unreachable for
+ * a guest BY CONSTRUCTION rather than by every clause remembering to ask.
+ * The alternative shape — one principal object with an optional `role` and
+ * an optional `guestId` — is what makes a future policy field ("also admit
+ * anyone with role >= X") silently apply to guests too, because nothing in
+ * the type stops it.
+ */
+type AccessPrincipal =
+  | { kind: 'account'; userId: string | undefined; role: 'admin' | 'user' | 'readonly' | 'none' }
+  | { kind: 'guest'; guestId: string };
+
+/**
+ * The rule all three entry points share, dispatching on the principal's own
+ * discriminant.
+ *
+ * `app` is `undefined` for a guest and that is not a convenience: there is no
+ * owner clause on the guest arm to feed it to. Typing it as optional here
+ * rather than threading a synthetic `{ userId: undefined }` through keeps
+ * "a guest has no ownership question" visible in the signature.
+ *
+ * Each arm receives only the SLICE of the policy it is allowed to read —
+ * `Pick<…,'allow'>` for an account, `Pick<…,'guests'>` for a guest. That is
+ * what makes "a guest cannot be admitted by an `allow` entry" a compile
+ * error rather than a code-review promise, in both directions.
  */
 function evaluateAccessPolicy(
-  userId: string | undefined,
-  role: 'admin' | 'user' | 'readonly' | 'none',
-  app: Pick<AppState, 'userId'>,
+  principal: AccessPrincipal,
+  app: Pick<AppState, 'userId'> | undefined,
   policy: AppAccessPolicy
 ): boolean {
+  if (principal.kind === 'guest') return guestAdmitted(principal.guestId, policy);
+  return accountAdmitted(principal.userId, principal.role, app, policy);
+}
+
+/**
+ * Admin, or owner, or explicitly allowed.
+ *
+ * `userId` is typed as a required string on both account callers and is NOT
+ * always one at runtime — the `DROP_API_KEY` and `cli-local` principals are
+ * ownerless and a monorepo group child has no `AppState.userId` — so two
+ * `undefined`s must never compare equal into an admission.
+ */
+function accountAdmitted(
+  userId: string | undefined,
+  role: 'admin' | 'user' | 'readonly' | 'none',
+  app: Pick<AppState, 'userId'> | undefined,
+  policy: Pick<AppAccessPolicy, 'allow'>
+): boolean {
   if (role === 'admin') return true;
-  if (userId !== undefined && app.userId === userId) return true;
+  if (userId !== undefined && app?.userId === userId) return true;
   return userId !== undefined && policy.allow.includes(userId);
 }
 
+/**
+ * Membership in `policy.guests`, and nothing else. No owner clause, no admin
+ * clause, no `allow` — a guest holds exactly one grant, on exactly one app.
+ *
+ * The `guest:` prefix is re-asserted HERE, not merely relied on from the
+ * store. `isValidGuestRecord` refuses to LOAD a record whose id lacks it, so
+ * a real guest id always carries it; what this closes is the other
+ * direction — a `guests` array that somehow came to hold a bare DROP user id
+ * (a hand-edited config, a future writer that forgets to namespace) must not
+ * admit anything. The namespacing guarantee in `types.ts` is only worth
+ * having if the authorization boundary depends on it rather than assuming it.
+ */
+function guestAdmitted(guestId: string, policy: Pick<AppAccessPolicy, 'guests'>): boolean {
+  if (!guestId.startsWith(GUEST_ID_PREFIX)) return false;
+  return (policy.guests ?? []).includes(guestId);
+}

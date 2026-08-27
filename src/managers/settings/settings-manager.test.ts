@@ -648,6 +648,68 @@ describe('SettingsManager', () => {
     });
   });
 
+  describe('guestInvitesEnabled', () => {
+    it('defaults to false when the key is absent (a strictly larger opt-in than share notifications)', async () => {
+      await manager.load();
+      expect(manager.getGuestInvitesEnabled()).toBe(false);
+    });
+
+    it('sets and persists a value, readable via getGuestInvitesEnabled', async () => {
+      await manager.setGuestInvitesEnabled(true);
+      expect(manager.getGuestInvitesEnabled()).toBe(true);
+
+      const raw = await fs.readFile(settingsFilePath, 'utf-8');
+      expect(JSON.parse(raw)).toEqual({ guestInvitesEnabled: true });
+    });
+
+    it('persists across a reload (new manager instance, same file)', async () => {
+      await manager.setGuestInvitesEnabled(true);
+
+      const reloaded = new SettingsManager({ settingsFilePath });
+      await reloaded.load();
+      expect(reloaded.getGuestInvitesEnabled()).toBe(true);
+      await reloaded.close();
+    });
+
+    it('clears the value when set to undefined (reverts to the false default)', async () => {
+      await manager.setGuestInvitesEnabled(true);
+      await manager.setGuestInvitesEnabled(undefined);
+      expect(manager.getGuestInvitesEnabled()).toBe(false);
+    });
+
+    it('a corrupt settings file fails closed', async () => {
+      await fs.mkdir(path.dirname(settingsFilePath), { recursive: true });
+      await fs.writeFile(settingsFilePath, 'not valid json');
+
+      await manager.load();
+
+      expect(manager.getGuestInvitesEnabled()).toBe(false);
+    });
+
+    it('a hand-written non-boolean value (string "true") is discarded — stays at the false default', async () => {
+      await fs.mkdir(path.dirname(settingsFilePath), { recursive: true });
+      await fs.writeFile(settingsFilePath, JSON.stringify({ guestInvitesEnabled: 'true' }));
+
+      await manager.load();
+
+      expect(manager.getGuestInvitesEnabled()).toBe(false);
+    });
+
+    it('is INDEPENDENT of shareNotificationsEnabled — neither implies the other', async () => {
+      // The two flags gate different things: share notifications mail an
+      // address DROP already holds, put there by an admin; a guest invite
+      // mails an arbitrary address taken from a request body. An operator may
+      // reasonably want the first on and the second off, and a "simplification"
+      // that collapses them into one toggle turns that into consent nobody gave.
+      await manager.setShareNotificationsEnabled(true);
+      expect(manager.getGuestInvitesEnabled()).toBe(false);
+
+      await manager.setGuestInvitesEnabled(true);
+      await manager.setShareNotificationsEnabled(false);
+      expect(manager.getGuestInvitesEnabled()).toBe(true);
+    });
+  });
+
   describe('parseSettings field table', () => {
     it('ignores a key that is not in the field table — round-trips as undefined, reads as "never set"', async () => {
       await fs.mkdir(path.dirname(settingsFilePath), { recursive: true });

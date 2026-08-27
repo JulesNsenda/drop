@@ -18,9 +18,7 @@ import type { MailSettings } from '../../managers/settings/settings-manager';
 import { normalizePublicUrl } from '../../utils/url-validator';
 import { getPublicUrl, setPublicUrl, isAccessGateEnabled } from '../runtime-config';
 import { getMailCredentialStore, clearMailCredential } from '../../managers/mailer/mail-credential';
-import { sendTemplatedMail } from '../../managers/mailer/mailer';
-import { getMailQuota } from '../../managers/guardrail/principal-quota';
-import { checkMailQuota } from './mail-quota';
+import { sendMeteredMail } from './mail-quota';
 
 const admin = new Hono();
 
@@ -745,34 +743,28 @@ admin.post('/mail/test', async (c) => {
     return c.json(error(ErrorCodes.VALIDATION_ERROR, 'to must be a non-empty string'), 400);
   }
 
-  // checkMailQuota (mail-quota.ts) — shared with apps.share.ts's notifyShareGrant
-  // against this same singleton — but this route ADMITS or REFUSES on it (a
-  // structured 429, mirroring admitDeploy's guardrail shape in
+  // sendMeteredMail (mail-quota.ts) — the check -> send -> charge-only-if-dialed
+  // sequence, shared with apps.share.ts's notifyShareGrant against the same
+  // quota singleton. What differs between the two callers is what a REFUSAL
+  // means, and that is decided here: this route ADMITS or REFUSES on the quota
+  // (a structured 429, mirroring admitDeploy's guardrail shape in
   // deploy-breaker.ts) rather than skipping silently, since sending is this
   // route's entire purpose rather than a best-effort side effect of one.
-  const admission = checkMailQuota({ principalId: authCtx?.principalId, actorUserId: authCtx?.userId });
-  if (!admission.allowed) {
-    if (admission.retryAfterSeconds) c.header('Retry-After', String(admission.retryAfterSeconds));
+  const result = await sendMeteredMail(
+    { principalId: authCtx?.principalId, actorUserId: authCtx?.userId },
+    'test',
+    to.trim(),
+    { platformUrl: getPublicUrl() ?? '' }
+  );
+  if (result.status === 'refused') {
+    if (result.retryAfterSeconds) c.header('Retry-After', String(result.retryAfterSeconds));
     const message =
-      admission.reason === 'no_principal'
+      result.reason === 'no_principal'
         ? 'Mail quota unavailable for this request.'
         : 'Mail quota exceeded. Try again later.';
     return c.json(error(ErrorCodes.RATE_LIMITED, message), 429);
   }
-
-  const result = await sendTemplatedMail('test', to.trim(), { platformUrl: getPublicUrl() ?? '' });
   const failure = result.status === 'attempted' ? result.failure : undefined;
-
-  // Charge the allowance only once the relay was actually dialed — the same
-  // rule notifyShareGrant follows (apps.share.ts) and for the identical
-  // reason: an unconfigured relay (`status: 'unavailable'`) never opens a
-  // socket, and counting it against the quota would refuse the first REAL
-  // sends once an operator finally configures mail. This route used to record
-  // BEFORE sending, which is exactly that bug — reconciled with the share
-  // path's rule here (DROP-154 Gate 5 finding).
-  if (result.status !== 'unavailable') {
-    getMailQuota().record(admission.keys);
-  }
 
   // This module has no ActivityLog write of its own (DROP-154 Gate 2 §4) —
   // every caller owns its own attribution, and admin's own principal is what
