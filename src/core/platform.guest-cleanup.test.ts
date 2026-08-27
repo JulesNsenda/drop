@@ -245,4 +245,61 @@ describe('platform guest cleanup (DROP-155)', () => {
       await expect(sweep()).resolves.toBeUndefined();
     });
   });
+
+  describe('sweepGuestRetention', () => {
+    const retentionSweep = () =>
+      (platform as unknown as { sweepGuestRetention(): Promise<void> }).sweepGuestRetention();
+
+    const backdate = async (id: string, lastSeenAt: string) => {
+      const file = guestsFilePath;
+      const raw = JSON.parse(await fs.readFile(file, 'utf-8'));
+      const rows = Array.isArray(raw) ? raw : raw.guests;
+      for (const row of rows) if (row.id === id) row.lastSeenAt = lastSeenAt;
+      await fs.writeFile(file, JSON.stringify(raw));
+      await guests.load();
+    };
+    const daysAgo = (n: number) => new Date(Date.now() - n * 24 * 60 * 60 * 1000).toISOString();
+
+    it('reaps an expired guest AND its grant', async () => {
+      // Reaping removes both because they are one operation. An expired guest
+      // losing access is the intent, not a side effect: a grant nobody has used
+      // inside the window has outlived its reason.
+      const stale = await guests.resolveOrCreateGuest('old@example.com', 'invoices', 'owner-1');
+      const fresh = await guests.resolveOrCreateGuest('new@example.com', 'invoices', 'owner-1');
+      await seedGuestPolicy('invoices', [stale.id, fresh.id]);
+      await backdate(stale.id, daysAgo(200));
+
+      await retentionSweep();
+
+      expect(guests.getGuestById(stale.id)).toBeUndefined();
+      expect(guests.getGuestById(fresh.id)).toBeDefined();
+      expect(configService.getConfig('invoices')?.access?.guests).toEqual([fresh.id]);
+    });
+
+    it('does nothing while the store is corrupt', async () => {
+      const guest = await guests.resolveOrCreateGuest('old@example.com', 'invoices', 'owner-1');
+      await seedGuestPolicy('invoices', [guest.id]);
+      await backdate(guest.id, daysAgo(200));
+      await fs.writeFile(guestsFilePath, 'not json');
+      await guests.load();
+
+      await retentionSweep();
+
+      expect(configService.getConfig('invoices')?.access?.guests).toEqual([guest.id]);
+    });
+
+    it('never logs the address it reaped', async () => {
+      // A retention sweep that logged what it deleted would put the personal
+      // data back into a store with a longer life than the one it removed it
+      // from.
+      const guest = await guests.resolveOrCreateGuest('old@example.com', 'invoices', 'owner-1');
+      await seedGuestPolicy('invoices', [guest.id]);
+      await backdate(guest.id, daysAgo(200));
+
+      await retentionSweep();
+
+      expect(logs.infos.join(' ')).toMatch(/Reaped 1 guest record/);
+      expect(logs.infos.join(' ')).not.toContain('old@example.com');
+    });
+  });
 });

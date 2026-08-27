@@ -95,6 +95,39 @@ export const INVITE_TTL_HOURS = 24;
 export const INVITE_TTL_MS = INVITE_TTL_HOURS * 60 * 60 * 1000;
 
 /**
+ * How long a guest record is kept after its last sign of life, in days.
+ *
+ * The plan's risk register promised "a stated retention window" for guest
+ * email — personal data DROP holds about someone who never opened an account
+ * here. Until this existed there was none: a record lived until someone
+ * explicitly revoked it or the app was deleted, so a guest invited once to a
+ * long-lived app was stored forever.
+ *
+ * Ninety days from `lastSeenAt`, or from `createdAt` for an invitation nobody
+ * ever accepted — which is the case most likely to be forgotten. Reaping is the
+ * same operation a revoke performs, so an expired guest loses access as well as
+ * storage. That is the point rather than a side effect: a grant nobody has used
+ * in three months is exactly the kind that has outlived its reason.
+ *
+ * `DROP_GUEST_RETENTION_DAYS=0` disables it, for an operator whose own policy
+ * says otherwise. Guarded like every other numeric env here: a malformed value
+ * falls back to the default rather than being taken at face value, because
+ * `NaN` compares false in every direction and would silently disable the sweep.
+ */
+export const DEFAULT_GUEST_RETENTION_DAYS = 90;
+
+export function guestRetentionMs(): number {
+  const raw = process.env.DROP_GUEST_RETENTION_DAYS;
+  if (raw !== undefined) {
+    const parsed = parseInt(raw, 10);
+    // `0` is a deliberate "never expire" and is honoured; negative and
+    // malformed are not opinions, they are mistakes.
+    if (Number.isFinite(parsed) && parsed >= 0) return parsed * 24 * 60 * 60 * 1000;
+  }
+  return DEFAULT_GUEST_RETENTION_DAYS * 24 * 60 * 60 * 1000;
+}
+
+/**
  * Cap on LIVE invite tokens, estate-wide. Generous — TTL pruning already
  * bounds the file to invites minted in the last `INVITE_TTL_HOURS` — and
  * exists only so the FILE cannot grow without limit, mirroring
@@ -106,8 +139,17 @@ export const INVITE_TTL_MS = INVITE_TTL_HOURS * 60 * 60 * 1000;
  * MAX_LIVE_INVITE_TOKENS_PER_CREATOR` below is that per-principal bound;
  * this one only stops the estate-wide file from growing without limit once
  * many principals are each within their own bound.
+ *
+ * RAISED from 500 to 5000 (DROP-155 wave 3 security review). At 500 it was not
+ * clear of its own per-creator bound: ten cooperating or compromised `user`
+ * accounts at 50 live invites each filled the table, and every OTHER tenant's
+ * mint then threw `InviteCapacityError('global')` — the cross-tenant DoS this
+ * module's own comment says a global cap must not become. The realistic ceiling
+ * is now `getInviteQuota`'s 10 per principal per hour anyway; this is a file
+ * size backstop and nothing more, so it should sit far above any population
+ * that could legitimately reach it.
  */
-export const MAX_LIVE_INVITE_TOKENS = 500;
+export const MAX_LIVE_INVITE_TOKENS = 5000;
 
 /**
  * Cap on live invite tokens ONE `createdBy` (an inviting user id) may have
@@ -313,6 +355,38 @@ export class AppGuestManager {
   getGuestByEmail(email: string, appName: string): GuestRecord | undefined {
     if (this.guestsCorrupt) return undefined;
     return this.findGuestByEmailAndApp(normalizeEmail(email), appName);
+  }
+
+  /**
+   * Records whose last sign of life is older than the retention window.
+   *
+   * `lastSeenAt ?? createdAt`, so an invitation that was never accepted ages
+   * from when it was sent — otherwise the never-used records, which are the
+   * ones most likely to be forgotten, would be the only ones kept forever.
+   *
+   * Returns `[]` when retention is disabled, and when the store is corrupt.
+   * The corrupt check is REDUNDANT today — a failed load clears `guests`, so
+   * the filter would find nothing anyway, and mutating it away leaves every
+   * test green. It stays because the property "a corrupt store destroys
+   * nothing" should not rest on a detail of how loading fails; a future load
+   * that quarantined rows instead of clearing them would silently turn this
+   * into a reaper of everything it could not verify.
+   *
+   * The caller reaps; this only decides WHICH, so the "what counts as
+   * activity" rule lives with the record rather than in `platform.ts`.
+   */
+  listExpiredGuests(now = Date.now()): GuestRecord[] {
+    if (this.guestsCorrupt) return [];
+    const windowMs = guestRetentionMs();
+    if (windowMs <= 0) return [];
+    const cutoff = now - windowMs;
+    return [...this.guests.values()].filter(g => {
+      const last = Date.parse(g.lastSeenAt ?? g.createdAt);
+      // An unparseable timestamp is a hand-edited or corrupt row. Keeping it is
+      // the safe direction: reaping on a date we could not read would delete a
+      // live grant because of a typo.
+      return Number.isFinite(last) && last < cutoff;
+    });
   }
 
   listGuests(): GuestRecord[] {

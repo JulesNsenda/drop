@@ -4665,6 +4665,46 @@ describe('DROP-155 — the guest store binds to THIS platform root at boot', () 
     await expect(platform.start()).resolves.toBeUndefined();
   });
 
+  it('a start that THROWS still tears down its process globals', async () => {
+    // The bug three waves of DROP-155 inherited. `isRunning` is set at the very
+    // END of `start()`, so a start that threw halfway left it false — and
+    // `stop()`'s early return made the catch's own `await this.stop()` a
+    // complete no-op. Every global the boot had already configured stayed
+    // configured, and the NEXT platform died on whichever reconfiguration
+    // guard it reached first, two layers away from the real cause.
+    //
+    // `initializeServices` is stubbed to throw because it runs AFTER the quota
+    // and guest-store initialisation — which is exactly the window that leaves
+    // globals stranded.
+    const failing = createPlatform({
+      dropRoot: tempDir,
+      appsDirectory: path.join(tempDir, 'apps'),
+      logLevel: 'error',
+      autoBuild: false,
+      autoStart: false,
+      caddyfilePath: path.join(tempDir, 'Caddyfile'),
+    });
+    jest
+      .spyOn(failing as unknown as { initializeServices: () => Promise<void> }, 'initializeServices')
+      .mockRejectedValue(new Error('boom'));
+    await expect(failing.start()).rejects.toThrow('boom');
+
+    // A DIFFERENT root, so anything left configured by the failed boot above
+    // collides rather than being silently reused.
+    const nextRoot = path.join(os.tmpdir(), `drop-after-failed-start-${Date.now()}`);
+    const next = createPlatform({
+      dropRoot: nextRoot,
+      appsDirectory: path.join(nextRoot, 'apps'),
+      logLevel: 'error',
+      autoBuild: false,
+      autoStart: false,
+      caddyfilePath: path.join(nextRoot, 'Caddyfile'),
+    });
+
+    await expect(next.start()).resolves.toBeUndefined();
+    await next.stop();
+  });
+
   it('rebinds the store to this platform root', async () => {
     await platform.start();
 

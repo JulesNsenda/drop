@@ -120,7 +120,7 @@ import { logActivityFor } from '../../managers/activity';
 import { gateEnforced } from '../../managers/guardrail/access-gate';
 
 import { isLocalhostDomain } from '../../utils/domain-validator';
-import { MAX_ACCESS_ALLOW_ENTRIES, MAX_USER_ID_LENGTH, requireAuthForAccessRoutes } from './access-limits';
+import { MAX_ADMITTED_PRINCIPALS, MAX_USER_ID_LENGTH, requireAuthForAccessRoutes } from './access-limits';
 import { sendMeteredMail } from './mail-quota';
 import { getInviteQuota } from '../../managers/guardrail/principal-quota';
 import {
@@ -580,11 +580,11 @@ async function inviteGuest(
       409
     );
   }
-  if (admittedCount(preAccess) >= MAX_ACCESS_ALLOW_ENTRIES) {
+  if (admittedCount(preAccess) >= MAX_ADMITTED_PRINCIPALS) {
     return c.json(
       error(
         ErrorCodes.CONFLICT,
-        `'${name}' already has ${MAX_ACCESS_ALLOW_ENTRIES} people with access — remove someone before adding another.`
+        `'${name}' already has ${MAX_ADMITTED_PRINCIPALS} people with access — remove someone before adding another.`
       ),
       409
     );
@@ -710,7 +710,7 @@ async function inviteGuest(
       invite.outcome = 'already-invited';
       return NO_CHANGE;
     }
-    if (admittedCount(current) >= MAX_ACCESS_ALLOW_ENTRIES) {
+    if (admittedCount(current) >= MAX_ADMITTED_PRINCIPALS) {
       invite.outcome = 'cap-exceeded';
       const grantedByMap = current?.grantedBy ?? {};
       const guestGrantedByMap = current?.guestGrantedBy ?? {};
@@ -760,7 +760,7 @@ async function inviteGuest(
     return c.json(
       error(
         ErrorCodes.CONFLICT,
-        `'${name}' already has ${MAX_ACCESS_ALLOW_ENTRIES} people with access — ${advice}`
+        `'${name}' already has ${MAX_ADMITTED_PRINCIPALS} people with access — ${advice}`
       ),
       409
     );
@@ -828,10 +828,18 @@ async function inviteGuest(
     applyError = await reEmit(ops, name);
   }
 
+  // THE GUEST ID, never the address.
+  //
+  // `activity-log.json` is a third store holding the same personal data, and it
+  // is touched by neither `reapGuest` nor `purgeAppArtifacts` — so revoking a
+  // guest, or deleting the whole app, left their email behind in a file that
+  // outlives both. An id resolves to an address only while the record exists,
+  // which is exactly the retention property `sweepGuestRetention` enforces; the
+  // audit trail keeps its shape and stops being a way around it.
   const detail =
     isAdminCaller && requester.userId !== app.userId
-      ? `${guest.email} (admin-invited)`
-      : guest.email;
+      ? `${guest.id} (admin-invited)`
+      : guest.id;
   await logActivityFor(requester, { action: 'guest-invited', appName: name, detail });
 
   // THE LINK COMES BACK only when the mail was never sent — `unavailable` means
@@ -979,12 +987,12 @@ shareRoutes.post('/:name/share', async c => {
 
     const allow = current?.allow ?? [];
     // Already-granted short-circuits BEFORE the cap — an idempotent re-grant
-    // at exactly MAX_ACCESS_ALLOW_ENTRIES entries must still succeed.
+    // at exactly MAX_ADMITTED_PRINCIPALS entries must still succeed.
     if (allow.includes(liveUser!.id)) {
       grant.outcome = 'already-granted';
       return NO_CHANGE;
     }
-    if (admittedCount(current) >= MAX_ACCESS_ALLOW_ENTRIES) {
+    if (admittedCount(current) >= MAX_ADMITTED_PRINCIPALS) {
       grant.outcome = 'cap-exceeded';
       // Computed HERE, not from a separate read after the fact, for the
       // same snapshot reason as the `needs-confirmation` branch above.
@@ -1043,7 +1051,7 @@ shareRoutes.post('/:name/share', async c => {
     return c.json(
       error(
         ErrorCodes.CONFLICT,
-        `'${name}' already has ${MAX_ACCESS_ALLOW_ENTRIES} people with access — ${advice}`
+        `'${name}' already has ${MAX_ADMITTED_PRINCIPALS} people with access — ${advice}`
       ),
       409
     );
@@ -1246,7 +1254,7 @@ shareRoutes.patch('/:name/share/guests/:guestId', async c => {
   await logActivityFor(requester, {
     action: 'guest-revoked',
     appName: name,
-    detail: `${record.email} (disabled by admin)`,
+    detail: `${record.id} (disabled by admin)`,
   });
 
   return c.json(success({ message: `Guest disabled for '${name}'`, disabled: true }));
@@ -1343,10 +1351,8 @@ shareRoutes.delete('/:name/share/guests/:guestId', async c => {
     applyError = await reEmit(ops, name);
   }
 
-  const detail =
-    isAdminCaller && grantor !== requester.userId
-      ? `${record?.email ?? guestId} (admin-revoked)`
-      : (record?.email ?? guestId);
+  // The id, not the address — see the note on `guest-invited` above.
+  const detail = isAdminCaller && grantor !== requester.userId ? `${guestId} (admin-revoked)` : guestId;
   await logActivityFor(requester, { action: 'guest-revoked', appName: name, detail });
 
   return c.json(

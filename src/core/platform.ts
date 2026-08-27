@@ -715,6 +715,19 @@ export class DropPlatform {
    */
   private readonly breakerKeys: Map<string, GuardrailKey[]> = new Map();
   private isRunning = false;
+  /**
+   * True for the duration of `start()`, INCLUDING while its catch tears down.
+   *
+   * `isRunning` is only set at the very END of `start()`, so a start that
+   * throws halfway leaves it false — and `stop()`'s own early return then made
+   * the catch's `await this.stop()` a complete no-op. Every process-global the
+   * boot had already configured (three quota singletons, the guest store, the
+   * access log, the settings manager) stayed configured, and the NEXT platform
+   * in the process died on a reconfiguration guard belonging to whichever one
+   * it reached first. That is two layers between cause and symptom, and three
+   * waves of DROP-155 inherited it before anyone traced it.
+   */
+  private isStarting = false;
   // Snapshot of each app's persisted status, taken in initializeServices
   // BEFORE syncStateWithConfigs/syncStateWithProcesses run — both reconcile
   // status against the live runtime and can overwrite 'errored'/'needs-config'/
@@ -810,6 +823,7 @@ export class DropPlatform {
       throw new Error('DROP platform is already running');
     }
 
+    this.isStarting = true;
     this.logger.platformEvent('starting');
     this.logger.info(`Drop root: ${this.config.dropRoot}`, 'CONFIG');
     this.logger.info(`Apps directory: ${this.config.appsDirectory}`, 'CONFIG');
@@ -971,6 +985,7 @@ export class DropPlatform {
       // reasoning as the sweep above: it needs the app configs, which only
       // exist after `initializeServices()`.
       await this.pruneStaleGuestGrants();
+      await this.sweepGuestRetention();
 
       // M1 boot reconciliation (DROP_BOOT_RECONCILE): decide skip vs redeploy
       // per known app BEFORE the watcher starts, so a stable app's own
@@ -1011,13 +1026,25 @@ export class DropPlatform {
       this.logger.platformEvent('started');
     } catch (error) {
       this.logger.platformEvent('error', error instanceof Error ? error.message : String(error));
+      // Reaches the real teardown now — see `isStarting`. Every `await` in
+      // `stop()` sits behind an `if (this.x)` guard, so running it against a
+      // half-initialized platform tears down what exists and skips what does
+      // not.
       await this.stop();
       throw error;
+    } finally {
+      // AFTER the catch, which is where the teardown above runs.
+      this.isStarting = false;
     }
   }
 
   async stop(): Promise<void> {
-    if (!this.isRunning) {
+    // `isStarting` as well as `isRunning`: a start that THREW never set
+    // `isRunning`, and returning here made its own catch's teardown a no-op —
+    // stranding every process-global the boot had configured. A platform that
+    // was never started at all still returns immediately, which is what every
+    // existing caller and test expects.
+    if (!this.isRunning && !this.isStarting) {
       return;
     }
 
@@ -5250,6 +5277,47 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
    * Best-effort and never fatal — a failure here costs list hygiene, not
    * access control, and must not stop the platform booting.
    */
+  /**
+   * Reap guest records whose retention window has elapsed (DROP-155).
+   *
+   * A DIFFERENT question from `pruneStaleGuestGrants`, which reconciles the
+   * two stores against each other. This one is about how long DROP keeps an
+   * email address belonging to someone who never opened an account — the
+   * plan's own risk register promised a window and, until this existed,
+   * there was none.
+   *
+   * Reaping removes the GRANT as well as the record, because they are the
+   * same operation: `reapGuest` revokes the app-config entry first, then its
+   * own bookkeeping. An expired guest therefore loses access, which is the
+   * intent — a grant nobody has used inside the window has outlived its
+   * reason — rather than a side effect to be worked around.
+   *
+   * `listExpiredGuests` returns nothing while the store is corrupt, so this
+   * inherits the same refuse-to-destroy-what-we-cannot-read posture as every
+   * other guest path without restating it.
+   */
+  private async sweepGuestRetention(): Promise<void> {
+    try {
+      const guests = getAppGuestManager();
+      const expired = guests.listExpiredGuests();
+      if (expired.length === 0) return;
+
+      for (const guest of expired) {
+        await guests.reapGuest(guest.id);
+      }
+      // The ID, never the address — see the note on the activity log in
+      // `apps.share.ts`. A retention sweep that logged what it deleted would
+      // put the personal data back into a store with a longer life than the
+      // one it just removed it from.
+      this.logger.info(
+        `Reaped ${expired.length} guest record(s) past the retention window`,
+        'ACCESS'
+      );
+    } catch (error) {
+      this.logger.warn('Guest retention sweep failed', 'ACCESS', error);
+    }
+  }
+
   private async pruneStaleGuestGrants(): Promise<void> {
     try {
       const guestManager = getAppGuestManager();
@@ -7614,6 +7682,12 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     }
     this.idleSweepTimer = setInterval(() => {
       void this.sweepExpiredEphemerals().then(() => this.sweepIdleApps());
+      // Guest retention rides the SAME cadence but its own chain, so a
+      // failure in either sweep cannot stop the other. Boot-only would have
+      // made "a stated retention window" true of a box that reboots and
+      // false of one that does not — and the long-lived box is the one
+      // accumulating the data.
+      void this.sweepGuestRetention();
     }, 15 * 60 * 1000);
     this.idleSweepTimer.unref?.();
   }

@@ -500,3 +500,100 @@ describe('getAppGuestManager singleton binding', () => {
     expect(() => getAppGuestManager({ guestsFilePath: '/b/app-guests.json' })).not.toThrow();
   });
 });
+
+describe('guest retention (DROP-155 wave 4)', () => {
+  /**
+   * The plan's risk register promised "a stated retention window" for guest
+   * email, and until this existed there was none — a record lived until an
+   * explicit revoke or the app's deletion, so a guest invited once to a
+   * long-lived app was stored forever.
+   */
+  let dir: string;
+  let manager: AppGuestManager;
+
+  const daysAgo = (n: number) => new Date(Date.now() - n * 24 * 60 * 60 * 1000).toISOString();
+
+  beforeEach(async () => {
+    dir = await fs.mkdtemp(path.join(os.tmpdir(), 'drop-guest-retention-'));
+    manager = new AppGuestManager({
+      guestsFilePath: path.join(dir, 'app-guests.json'),
+      invitesFilePath: path.join(dir, 'app-guest-invites.json'),
+    });
+    await manager.load();
+  });
+
+  afterEach(async () => {
+    delete process.env.DROP_GUEST_RETENTION_DAYS;
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+
+  /** Backdate a record the way time would have, since the manager stamps `now`. */
+  const backdate = async (id: string, fields: { createdAt?: string; lastSeenAt?: string }) => {
+    const raw = JSON.parse(await fs.readFile(path.join(dir, 'app-guests.json'), 'utf-8'));
+    const rows = Array.isArray(raw) ? raw : raw.guests;
+    for (const row of rows) if (row.id === id) Object.assign(row, fields);
+    await fs.writeFile(path.join(dir, 'app-guests.json'), JSON.stringify(raw));
+    await manager.load();
+  };
+
+  it('expires a record whose last sign of life is outside the window', async () => {
+    const guest = await manager.resolveOrCreateGuest('a@example.com', 'app1', 'owner-1');
+    await backdate(guest.id, { lastSeenAt: daysAgo(120) });
+
+    expect(manager.listExpiredGuests().map(g => g.id)).toEqual([guest.id]);
+  });
+
+  it('ages an unaccepted invitation from createdAt, not from nothing', async () => {
+    // The case most likely to be forgotten: nobody ever opened it, so there is
+    // no `lastSeenAt` at all. Falling back to "never expires" would keep
+    // exactly the wrong records forever.
+    const guest = await manager.resolveOrCreateGuest('a@example.com', 'app1', 'owner-1');
+    await backdate(guest.id, { createdAt: daysAgo(120) });
+
+    expect(manager.listExpiredGuests().map(g => g.id)).toEqual([guest.id]);
+  });
+
+  it('keeps a record inside the window', async () => {
+    const guest = await manager.resolveOrCreateGuest('a@example.com', 'app1', 'owner-1');
+    await backdate(guest.id, { lastSeenAt: daysAgo(10) });
+
+    expect(manager.listExpiredGuests()).toEqual([]);
+  });
+
+  it('honours DROP_GUEST_RETENTION_DAYS=0 as "never expire"', async () => {
+    const guest = await manager.resolveOrCreateGuest('a@example.com', 'app1', 'owner-1');
+    await backdate(guest.id, { lastSeenAt: daysAgo(10000) });
+    process.env.DROP_GUEST_RETENTION_DAYS = '0';
+
+    expect(manager.listExpiredGuests()).toEqual([]);
+  });
+
+  it('falls back to the default on a malformed window rather than disabling itself', async () => {
+    // `NaN` compares false in every direction, so taking it at face value would
+    // silently switch the sweep off — the failure mode `parseInt(env||'20')`
+    // already caused once in this codebase.
+    const guest = await manager.resolveOrCreateGuest('a@example.com', 'app1', 'owner-1');
+    await backdate(guest.id, { lastSeenAt: daysAgo(120) });
+    process.env.DROP_GUEST_RETENTION_DAYS = 'soon';
+
+    expect(manager.listExpiredGuests().map(g => g.id)).toEqual([guest.id]);
+  });
+
+  it('KEEPS a record whose timestamp cannot be parsed', async () => {
+    // Reaping on a date we could not read would delete a live grant because of
+    // a typo. Keeping is the safe direction.
+    const guest = await manager.resolveOrCreateGuest('a@example.com', 'app1', 'owner-1');
+    await backdate(guest.id, { lastSeenAt: 'not-a-date' });
+
+    expect(manager.listExpiredGuests()).toEqual([]);
+  });
+
+  it('returns nothing while the store is corrupt', async () => {
+    await manager.resolveOrCreateGuest('a@example.com', 'app1', 'owner-1');
+    await fs.writeFile(path.join(dir, 'app-guests.json'), 'not json');
+    await manager.load();
+
+    expect(manager.isCorrupt()).toBe(true);
+    expect(manager.listExpiredGuests()).toEqual([]);
+  });
+});

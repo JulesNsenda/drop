@@ -22,6 +22,8 @@ export {
   InviteStoreCorruptError,
   InviteCapacityError,
   INVITE_TTL_HOURS,
+  DEFAULT_GUEST_RETENTION_DAYS,
+  guestRetentionMs,
   INVITE_TTL_MS,
   MAX_LIVE_INVITE_TOKENS,
   MAX_LIVE_INVITE_TOKENS_PER_CREATOR,
