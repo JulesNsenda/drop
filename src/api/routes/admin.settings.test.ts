@@ -255,6 +255,7 @@ describe('admin settings routes (PRD-041)', () => {
         githubWebhook: { configured: false, source: 'unset', payloadUrl: null },
         userConnectors: { enabled: true },
         appSharing: { enabled: false },
+        guestInvites: { enabled: false },
         mail: DEFAULT_MAIL_PAYLOAD,
       });
     });
@@ -274,6 +275,7 @@ describe('admin settings routes (PRD-041)', () => {
         },
         userConnectors: { enabled: true },
         appSharing: { enabled: false },
+        guestInvites: { enabled: false },
         mail: DEFAULT_MAIL_PAYLOAD,
       });
     });
@@ -296,6 +298,7 @@ describe('admin settings routes (PRD-041)', () => {
         },
         userConnectors: { enabled: true },
         appSharing: { enabled: false },
+        guestInvites: { enabled: false },
         mail: DEFAULT_MAIL_PAYLOAD,
       });
     });

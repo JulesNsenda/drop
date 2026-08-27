@@ -409,6 +409,14 @@ export class ApiServer {
     // counted once.
     v1.use('/apps/:name/share', shareRateLimitMiddleware());
     v1.use('/apps/:name/share/:userId', shareRateLimitMiddleware());
+    // THREE forms, not two, since DROP-155. The note above (and the project's
+    // own CLAUDE.md) was written when this surface had handlers at two segment
+    // depths; `DELETE /apps/:name/share/guests/:guestId` is a FOUR-segment
+    // shape, and `:userId` binds exactly ONE segment — so it does not match,
+    // and without this line the route that REVOKES a guest's access would have
+    // no dedicated bucket at all. A third named-param pattern rather than a
+    // widened wildcard, for the same disjointness reason the pair above gives.
+    v1.use('/apps/:name/share/guests/:guestId', shareRateLimitMiddleware());
 
     // POST /admin/mail/test (DROP-154) gets its own bucket too, registered
     // unconditionally like the other dedicated buckets — it's the one route
@@ -455,6 +463,10 @@ export class ApiServer {
       // every GET/POST /apps/:name/share.
       v1.use('/apps/:name/share', authMiddleware('user'));
       v1.use('/apps/:name/share/:userId', authMiddleware('user'));
+      // The guest revoke's four-segment form — same reasoning as the rate-limit
+      // registration above. Without it this route falls through to the general
+      // `/apps/*` guard instead of failing closed on its own floor.
+      v1.use('/apps/:name/share/guests/:guestId', authMiddleware('user'));
       // start/stop/restart mutate runtime state (and, on restart, tear down
       // and recreate the process/container) — read-only tokens must not
       // reach them. Register before the general /apps/* guard.

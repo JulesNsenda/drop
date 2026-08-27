@@ -79,6 +79,21 @@ function buildAppSharingPayload(): { enabled: boolean } {
   return { enabled: getSettingsManager().getAppSharingEnabled() };
 }
 
+/**
+ * Status block for the DROP-155 guest-invite toggle.
+ *
+ * Reported beside `appSharing` rather than inside `mail`, and that placement
+ * is the argument for why it is a separate flag at all: this gates a SHARING
+ * capability — whether an owner may admit someone with no DROP account — and
+ * only incidentally causes mail to be sent. Folding it into the mail payload
+ * would file it as a relay setting and invite the next reader to collapse it
+ * into `shareNotificationsEnabled`, which gates a strictly smaller thing
+ * (mail to an address DROP already holds, put there by an admin).
+ */
+function buildGuestInvitesPayload(): { enabled: boolean } {
+  return { enabled: getSettingsManager().getGuestInvitesEnabled() };
+}
+
 interface MailPayload {
   host?: string;
   port?: number;
@@ -301,6 +316,7 @@ admin.get('/settings', async (c) => {
       githubWebhook: buildGithubWebhookPayload(),
       userConnectors: buildUserConnectorsPayload(),
       appSharing: buildAppSharingPayload(),
+      guestInvites: buildGuestInvitesPayload(),
       mail: await buildMailPayload(),
     })
   );
@@ -471,6 +487,63 @@ admin.put('/settings/app-sharing', async (c) => {
       : undefined;
 
   return c.json(success({ ...buildAppSharingPayload(), ...(warning ? { warning } : {}) }));
+});
+
+// PUT /admin/settings/guest-invites - Gate whether an owner may invite someone
+// with NO DROP account (DROP-155's `{ email }` branch on POST /apps/:name/share).
+//
+// Its OWN route rather than a field on PUT /settings/mail, mirroring
+// /settings/app-sharing above: this is a sharing capability, not a relay
+// setting. Same strict-boolean shape as its two siblings — a two-state policy
+// toggle, not a "clear to fall back" field, so a non-boolean is rejected
+// rather than coerced.
+admin.put('/settings/guest-invites', async (c) => {
+  const authCtx = (c.get as Function)('auth') as AuthContext | undefined;
+  const body = (await c.req.json()) as unknown;
+
+  if (!isJsonObjectBody(body)) {
+    return c.json(error(ErrorCodes.VALIDATION_ERROR, 'Request body must be a JSON object'), 400);
+  }
+
+  const input = requireBooleanField(body, 'enabled');
+  if (input === undefined) {
+    return c.json(error(ErrorCodes.VALIDATION_ERROR, 'enabled must be a boolean'), 400);
+  }
+
+  await getSettingsManager().setGuestInvitesEnabled(input);
+
+  await logActivityFor(authCtx, {
+    action: 'guest-invites-set',
+    detail: `Guest invites ${input ? 'enabled' : 'disabled'}`,
+  });
+
+  // TWO contradictions are reachable here, and both are created by this
+  // request rather than by boot, so neither could be reported by a startup
+  // check. Enabling guest invites while app sharing is off makes the branch
+  // unreachable (owners cannot reach /share at all); enabling it with no relay
+  // configured means the invite mail cannot be delivered — which is survivable,
+  // because the invite URL comes back on the response in exactly that case,
+  // but it is not what an operator flipping this switch expects.
+  const warnings: string[] = [];
+  if (input && !getSettingsManager().getAppSharingEnabled()) {
+    warnings.push(
+      'Guest invites are enabled, but owner-initiated app sharing is disabled, so no owner can ' +
+        'reach the invite route until app sharing is turned on.'
+    );
+  }
+  if (input && !getSettingsManager().getMailSettings().host) {
+    warnings.push(
+      'Guest invites are enabled, but no SMTP relay is configured, so invitation emails cannot ' +
+        'be delivered. The invite link is returned to the person who created it instead.'
+    );
+  }
+
+  return c.json(
+    success({
+      ...buildGuestInvitesPayload(),
+      ...(warnings.length > 0 ? { warning: warnings.join(' ') } : {}),
+    })
+  );
 });
 
 const MAIL_PORT_MIN = 1;
