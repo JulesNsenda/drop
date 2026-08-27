@@ -618,9 +618,31 @@ export class AppGuestManager {
 
     const prunedAny = this.pruneExpiredInvites();
 
-    // --- synchronous section: delete before any check, no await above this line ---
+    // --- synchronous section: no `await` anywhere in it ---
+    //
+    // The single-use guarantee rests on this block being uninterruptible, NOT
+    // on deleting before validating. Two concurrent redeems of the same valid
+    // invite still race here exactly as before: JS runs this straight through,
+    // so the first deletes and the second's `get` misses.
+    //
+    // What CHANGED (DROP-155 wave 3 security review, finding 7) is that a
+    // WRONG SECRET no longer burns the invitation. The id is non-secret by
+    // design and travels in a URL path, a query string, the request logger,
+    // Caddy's access log and browser history — while the secret rides a
+    // fragment that never leaves the client. Deleting on the id alone meant
+    // anyone who could READ A LOG could destroy an invitation they never held,
+    // and the invitee's failure would be indistinguishable from an expiry.
+    //
+    // It also closes a timing distinguisher: the persist below now runs only
+    // for a CORRECT secret, so an unknown id and a known-id-wrong-secret take
+    // the same path, which is what `/invite-redeem`'s "every failure returns
+    // the SAME refusal" claim actually requires.
     const record = this.invites.get(id);
-    const existed = this.invites.delete(id);
+    const valid =
+      record !== undefined &&
+      record.expiresAt > Date.now() &&
+      timingSafeEqualStrings(hashSecret(secret), record.secretHash);
+    const existed = valid && this.invites.delete(id);
     // --- end synchronous section ---
 
     if (existed || prunedAny) {
@@ -630,9 +652,7 @@ export class AppGuestManager {
       await this.persistInvites();
     }
 
-    if (!record) return null;
-    if (record.expiresAt <= Date.now()) return null;
-    if (!timingSafeEqualStrings(hashSecret(secret), record.secretHash)) return null;
+    if (!valid || !record) return null;
 
     return { guestId: record.guestId, appName: record.appName, email: record.email };
   }

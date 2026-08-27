@@ -337,6 +337,106 @@ describe('/apps/:name/share — the guest branch (DROP-155)', () => {
     });
   });
 
+  describe('a refused invitation leaves nothing behind', () => {
+    /**
+     * The critical finding of the wave-3 review, reproduced.
+     *
+     * `resolveOrCreateGuest` persists a record BEFORE the grant is written and
+     * before the token is minted. Every refusal after that point used to leave
+     * the record orphaned — unreachable by the revoke route (which
+     * short-circuits on "not on this app's list") and invisible to the boot
+     * sweep (which prunes policy entries with no record, never the reverse).
+     *
+     * That matters because `emailHeldByAnyGuest` is GLOBAL and blocks
+     * `createUser`: each orphan permanently denied an address to any DROP
+     * account, and the only exit was deleting the whole app. And because the
+     * quota was charged only on success, the loop that produced them was
+     * unmetered.
+     *
+     * `maxLiveInviteTokensPerCreator: 1` makes the mint failure deterministic,
+     * which is what made this reachable at will rather than by racing.
+     */
+    const withTinyInviteCap = async () => {
+      resetAppGuests();
+      getAppGuestManager({
+        guestsFilePath: path.join(t.tempDir, 'app-guests.json'),
+        invitesFilePath: path.join(t.tempDir, 'app-guest-invites.json'),
+        maxLiveInviteTokensPerCreator: 1,
+      });
+      await getAppGuestManager().load();
+    };
+
+    it('reaps the guest record it created, so the address is not squatted', async () => {
+      await withTinyInviteCap();
+
+      expect((await post(bearer(ownerToken), { email: 'a@example.com', gateApp: true })).status).toBe(200);
+      const refused = await post(bearer(ownerToken), { email: 'b@example.com', gateApp: true });
+
+      expect(refused.status).toBe(429);
+      // No orphan record, and no orphan grant.
+      expect(getAppGuestManager().listGuests().map(g => g.email)).toEqual(['a@example.com']);
+      expect(policy()?.guests).toHaveLength(1);
+      // And the address is still available to a real account — the squat.
+      await expect(
+        createUser('newbie', 'password123', 'user', 'b@example.com')
+      ).resolves.toBeDefined();
+    });
+
+    it('does NOT reap a guest that already existed', async () => {
+      // A failed RE-invite must not destroy a live grant. The record and its
+      // grant belong to the earlier, successful invitation.
+      await withTinyInviteCap();
+      await post(bearer(ownerToken), { email: 'a@example.com', gateApp: true });
+      const guest = getAppGuestManager().listGuests()[0];
+
+      // The creator is now at their invite cap, so a resend refuses at mint.
+      const refused = await post(bearer(ownerToken), { email: 'a@example.com', gateApp: true });
+
+      expect(refused.status).toBe(429);
+      expect(getAppGuestManager().getGuestById(guest.id)).toBeDefined();
+      expect(policy()?.guests).toEqual([guest.id]);
+    });
+
+    it('CHARGES the quota for a refused attempt, so the loop is metered', async () => {
+      process.env.DROP_MAX_INVITES_PER_HOUR = '2';
+      resetInviteQuota();
+      getInviteQuota(path.join(t.tempDir, 'invite-quotas.json'));
+      await withTinyInviteCap();
+
+      await post(bearer(ownerToken), { email: 'a@example.com', gateApp: true }); // 1/2, succeeds
+      await post(bearer(ownerToken), { email: 'b@example.com', gateApp: true }); // 2/2, refused at mint
+      const third = await post(bearer(ownerToken), { email: 'c@example.com', gateApp: true });
+
+      expect(third.status).toBe(429);
+      // The QUOTA message, not the capacity one — proof the refused attempt
+      // above was charged rather than free.
+      expect((await bodyOf(third)).error?.message).toMatch(/too many invitations recently/i);
+
+      delete process.env.DROP_MAX_INVITES_PER_HOUR;
+    });
+
+    it('bounds a concurrent BURST, not just a sequence', async () => {
+      // `check` and `record` used to be separated by three awaits, so N
+      // concurrent requests all passed the check before any of them recorded.
+      // A burst is the abuse shape that matters for a relay's sender
+      // reputation, and it was the one the quota did not stop.
+      process.env.DROP_MAX_INVITES_PER_HOUR = '3';
+      resetInviteQuota();
+      getInviteQuota(path.join(t.tempDir, 'invite-quotas.json'));
+
+      const results = await Promise.all(
+        Array.from({ length: 8 }, (_, i) =>
+          post(bearer(ownerToken), { email: `burst${i}@example.com`, gateApp: true })
+        )
+      );
+      const admitted = results.filter(r => r.status === 200).length;
+
+      expect(admitted).toBeLessThanOrEqual(3);
+
+      delete process.env.DROP_MAX_INVITES_PER_HOUR;
+    });
+  });
+
   describe('the cap counts PEOPLE, not lists', () => {
     it('refuses a guest once allow + guests reaches the cap', async () => {
       // Two independent caps would let an owner admit twice as many people by

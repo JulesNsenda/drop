@@ -583,6 +583,26 @@ async function inviteGuest(
       429
     );
   }
+  // RESERVED HERE, in the same synchronous breath as the check — not after the
+  // invite is minted, which is where this used to be.
+  //
+  // Two defects, one line. `check` and `record` were separated by three
+  // `await`s, so N concurrent requests all passed the check before any of them
+  // recorded: the 10/hour bound admitted a burst of whatever the per-IP limiter
+  // allowed. And every refusal arm below returned without recording at all, so
+  // an attacker who could reach one deterministically — the per-creator invite
+  // cap does exactly that — could loop unmetered forever.
+  //
+  // An ATTEMPT is the thing worth bounding here, not a success: the primitive
+  // is "make DROP's relay try to mail a stranger", and a refused attempt has
+  // already cost the work of getting there.
+  inviteQuota.record(inviteKeys.keys);
+
+  // Whether THIS request creates the record, so the abandonment paths below
+  // know what they are allowed to clean up. A pre-existing guest belongs to an
+  // earlier, possibly still-live grant and must never be reaped by a failed
+  // re-invite.
+  const preExisting = getAppGuestManager().getGuestByEmail(email, name) !== undefined;
 
   let guest;
   try {
@@ -596,6 +616,35 @@ async function inviteGuest(
     }
     throw err;
   }
+
+  /**
+   * Undo the record this request created, on every path that ends without a
+   * grant.
+   *
+   * Without this, a refusal AFTER `resolveOrCreateGuest` leaves a `GuestRecord`
+   * that no route can reach: the guest-revoke route short-circuits on "not on
+   * this app's list", and the boot sweep only prunes policy entries with no
+   * record, never records with no policy entry. Because `emailHeldByAnyGuest`
+   * is GLOBAL and now blocks `createUser`/`updateUser`, each orphan
+   * permanently denies that address to any DROP account — so an owner could
+   * squat addresses, including an admin's, by inviting during a deploy and
+   * reading the 409. Reachable at will; the only exit was deleting the app.
+   *
+   * Best-effort and never fails the response: the refusal the caller is about
+   * to receive is already correct, and a cleanup that throws must not turn it
+   * into a 500.
+   */
+  const abandonGuest = async (): Promise<void> => {
+    if (preExisting) return;
+    try {
+      await reapGuest(guest.id);
+    } catch (err) {
+      console.warn(
+        `[apps.share] could not reap abandoned guest for '${name}':`,
+        err instanceof Error ? err.message : err
+      );
+    }
+  };
 
   type InviteOutcome = 'invited' | 'already-invited' | 'cap-exceeded' | 'needs-confirmation';
   const invite: { outcome: InviteOutcome; hadPolicyBefore: boolean; adminAuthoredCount?: number } = {
@@ -644,6 +693,7 @@ async function inviteGuest(
   });
 
   if (!updatedConfig) {
+    await abandonGuest();
     return c.json(
       error(
         ErrorCodes.CONFLICT,
@@ -653,6 +703,7 @@ async function inviteGuest(
     );
   }
   if (invite.outcome === 'needs-confirmation') {
+    await abandonGuest();
     return c.json(
       error(
         ErrorCodes.CONFLICT,
@@ -663,6 +714,7 @@ async function inviteGuest(
     );
   }
   if (invite.outcome === 'cap-exceeded') {
+    await abandonGuest();
     const adminAuthoredCount = invite.adminAuthoredCount ?? 0;
     const advice =
       adminAuthoredCount > 0
@@ -689,6 +741,11 @@ async function inviteGuest(
       createdBy: requester.userId,
     });
   } catch (err) {
+    // The grant IS on disk by now, and it stays: an owner pressing resend is
+    // the recovery, and reaping a grant because a token could not be minted
+    // would remove access the policy already records. Only a record this
+    // request created is undone.
+    await abandonGuest();
     if (err instanceof InviteCapacityError) {
       return c.json(
         error(
@@ -708,8 +765,6 @@ async function inviteGuest(
     }
     throw err;
   }
-
-  inviteQuota.record(inviteKeys.keys);
 
   // Id in the PATH, secret in the FRAGMENT — the split C0 recommended, and the
   // reason the mail body carries only the operator's own domain. Built from

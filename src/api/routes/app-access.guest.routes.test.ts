@@ -419,6 +419,33 @@ describe('/app-access — the guest arm (DROP-155)', () => {
         expect(setCookies(second).some(v => v.startsWith(`${INVITE_COOKIE_NAME}=`))).toBe(false);
       });
 
+      it('a WRONG secret does not burn the invitation', async () => {
+        // The id is non-secret by design and travels in a URL path, a query
+        // string, the request logger, Caddy's access log and browser history —
+        // while the secret rides a fragment that never leaves the client.
+        // Deleting on the id alone let anyone who could read a log destroy an
+        // invitation they never held, and the invitee's failure was
+        // indistinguishable from an expiry.
+        const invite = await mintInvite();
+
+        const wrong = await postJson('invite-redeem', { id: invite.id, secret: 'not-it' });
+        expect(wrong.status).toBe(403);
+
+        const right = await postJson('invite-redeem', { id: invite.id, secret: invite.secret });
+        expect(right.status).toBe(200);
+      });
+
+      it('is still single-use after a wrong-secret attempt', async () => {
+        // The replay race is what delete-before-check was protecting, and it
+        // still holds: validation and deletion are one synchronous block.
+        const invite = await mintInvite();
+        await postJson('invite-redeem', { id: invite.id, secret: 'not-it' });
+        await postJson('invite-redeem', { id: invite.id, secret: invite.secret });
+
+        const replay = await postJson('invite-redeem', { id: invite.id, secret: invite.secret });
+        expect(replay.status).toBe(403);
+      });
+
       it('answers a wrong secret exactly as it answers an unknown id', async () => {
         const invite = await mintInvite();
         const wrongSecret = await postJson('invite-redeem', { id: invite.id, secret: 'nope' });
