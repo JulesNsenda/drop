@@ -279,6 +279,13 @@ function generateExchangeHandle(route: RouteConfig, access: AccessAuthConfig): C
  * sorts BEFORE `request_header`, so written as a bare list the identity strips
  * would run AFTER the auth sub-request and delete what `copy_headers` just set.
  *
+ * A GUEST is emitted under `X-Drop-Guest-Id` and gets NO `X-Drop-Session-*` at
+ * all (DROP-155 section D), so the two kinds of visitor are distinguishable by
+ * NAME rather than by a value the tenant has to interpret. Copying a name the
+ * verify hop did not emit is a no-op, so one `copy_headers` list serves both
+ * classes: a user gets the two session names and no guest name, a guest gets
+ * the guest name and no session names.
+ *
  * The header names are the gate's OWN (`X-Drop-Session-*`), deliberately not
  * the MCP guard's `X-Drop-User-*`. The MCP handle nests inside this one and
  * strips-then-re-copies its own names; sharing them would mean the browser
@@ -293,14 +300,32 @@ function generateAccessGuardHandle(
   const inner: CaddyDirective[] = [
     // A client must not be able to assert who it is; copy_headers re-adds the
     // authenticated values after the sub-request.
+    //
+    // EVERY identity name the verify hop can emit belongs in both lists. A name
+    // that is emitted but not stripped is client-assertable, and a name that is
+    // stripped but not copied is simply absent — so the two lists have to be
+    // kept in step by hand, which is why they are adjacent and why
+    // `caddy-generator.access-guard.test.ts` pins them against the set the
+    // route actually emits.
     { name: 'request_header', args: ['-X-Drop-Session-User-Id'] },
     { name: 'request_header', args: ['-X-Drop-Session-Username'] },
+    // DROP-155. Added late, and the omission is worth recording: the guest
+    // header shipped emitted-but-unstripped, on a comment claiming parity with
+    // the two names above — which was false, because those two are stripped
+    // here and re-added below. Any client past the gate could assert a guest
+    // id, and a tenant reading the three names as siblings would have had an
+    // identity-spoofing bypass in the one credential class with no account
+    // behind it to cross-check.
+    { name: 'request_header', args: ['-X-Drop-Guest-Id'] },
     {
       name: 'forward_auth',
       args: [access.verifyUpstream],
       block: [
         { name: 'uri', args: [`/api/v1/app-access/${access.appName}/verify`] },
-        { name: 'copy_headers', args: ['X-Drop-Session-User-Id', 'X-Drop-Session-Username'] },
+        {
+          name: 'copy_headers',
+          args: ['X-Drop-Session-User-Id', 'X-Drop-Session-Username', 'X-Drop-Guest-Id'],
+        },
         // forward_auth proxies the ORIGINAL request, so a tenant-controlled
         // bearer would otherwise arrive at DROP's verify endpoint. Measured:
         // without these the verify hop receives them.

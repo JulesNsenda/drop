@@ -364,22 +364,22 @@ appAccess.get('/:app/verify', async c => {
           // yet must never delay or fail the authorization it describes.
         }
         // A DISTINCT header name, and NO `X-Drop-Session-User-Id` /
-        // `-Username` at all.
+        // `-Username` at all — so a tenant tells the two kinds of visitor
+        // apart by which name arrives, not by interpreting a value.
         //
-        // What this buys, precisely: an app whose Caddy block was emitted
-        // before DROP-155 copies neither name, so a guest arrives at that
-        // tenant with NO identity rather than one indistinguishable from a
-        // DROP user's. That is fail-closed on ABSENCE.
+        // `caddy-generator.ts` strips this name from the client's request and
+        // re-adds it via `copy_headers` after the sub-request, exactly as it
+        // does for the two session names. That pairing is what makes the value
+        // trustworthy; either half alone does not.
         //
-        // It is NOT the same as unspoofable. `forward_auth` proxies the
-        // ORIGINAL request to the tenant, and an already-emitted block neither
-        // strips this name from the client's request nor re-adds it via
-        // `copy_headers` — so a client can set `X-Drop-Guest-Id` itself and
-        // the tenant will see the client's value, exactly as is true of
-        // `X-Drop-Session-User-Id` today. This header becomes trustworthy only
-        // once the fleet is re-emitted with a strip list AND `copy_headers`;
-        // until then it is a convenience, and the tenant must not treat it as
-        // authentication.
+        // ON A BLOCK EMITTED BEFORE DROP-155 it is neither stripped nor
+        // copied, so a guest reaches that tenant with NO identity at all
+        // (fail-closed on absence) — but a client past the gate CAN assert the
+        // name itself until that app is re-emitted. Re-emission happens on the
+        // app's next deploy, restart or boot-reconcile pass. An earlier version
+        // of this comment claimed the header was no worse than
+        // `X-Drop-Session-User-Id`; that was false, because those two were
+        // already stripped and copied and this one was not.
         c.header('X-Drop-Guest-Id', guest.guestId);
         noStore(c);
         return c.body(null, 204);

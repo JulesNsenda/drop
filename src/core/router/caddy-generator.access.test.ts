@@ -116,6 +116,46 @@ describe('gated route block', () => {
     expect(JSON.stringify(inner.slice(0, 2))).toContain('-X-Drop-Session-User-Id');
   });
 
+  it('STRIPS AND COPIES every identity name the verify hop can emit', () => {
+    // The invariant, asserted as an invariant rather than as a list of names
+    // someone remembered to extend.
+    //
+    // A name that is EMITTED but not STRIPPED is client-assertable: a
+    // `forward_auth` proxies the original request, so whatever the client sent
+    // reaches the tenant. A name that is STRIPPED but not COPIED is simply
+    // absent. Both halves, or the header is not an identity.
+    //
+    // `X-Drop-Guest-Id` shipped emitted-but-unstripped in DROP-155 wave 3a,
+    // behind a comment claiming parity with the two session names — which were
+    // already stripped AND copied. Nothing here could see the gap, because
+    // every assertion named one header at a time.
+    const { directives } = generateRouteBlock({ ...base, accessAuth });
+    const route = (handles(directives)[1].block?.[0] as CaddyDirective);
+    const inner = route.block as CaddyDirective[];
+    const fa = inner.find(d => d.name === 'forward_auth') as CaddyDirective;
+    const copy = fa.block?.find(d => (d as CaddyDirective).name === 'copy_headers') as CaddyDirective;
+
+    const stripped = new Set(
+      inner
+        .filter(d => d.name === 'request_header' && String(d.args?.[0] ?? '').startsWith('-'))
+        .map(d => String(d.args?.[0] ?? '').slice(1))
+    );
+    const copied = new Set((copy.args ?? []).map(String));
+
+    // The set `app-access.ts`'s verify hop can put on a 204. Kept here rather
+    // than imported so a rename has to be made deliberately in both places.
+    const EMITTED = ['X-Drop-Session-User-Id', 'X-Drop-Session-Username', 'X-Drop-Guest-Id'];
+    for (const name of EMITTED) {
+      expect(stripped.has(name)).toBe(true);
+      expect(copied.has(name)).toBe(true);
+    }
+    // And nothing is copied that is not also stripped — the direction that
+    // would re-add a value the client was allowed to supply.
+    for (const name of copied) {
+      expect(stripped.has(name)).toBe(true);
+    }
+  });
+
   it('uses its OWN header names, not the MCP guard\'s', () => {
     // The MCP handle nests inside and strips-then-re-copies X-Drop-User-*.
     // Sharing the names would delete the browser identity on /mcp*.
