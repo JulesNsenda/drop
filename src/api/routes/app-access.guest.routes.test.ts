@@ -34,6 +34,7 @@ import { mintAppSessionToken, mintAppGuestSessionToken } from '../app-access/ses
 import { mintAppAccessCode, __resetAppAccessCodes } from '../app-access/flow-code';
 import { getAppGuestManager, resetAppGuests, type GuestRecord } from '../../managers/app-guest';
 import { sessionCookieName, flowCookieName } from './app-access';
+import { INVITE_COOKIE_NAME } from '../app-access/names';
 
 const APP = 'myapp';
 
@@ -320,6 +321,352 @@ describe('/app-access — the guest arm (DROP-155)', () => {
         { headers: { cookie: `${flowCookieName(APP)}=flow-frag` } }
       );
       expectNoFragment(res);
+    });
+  });
+  describe('the invite hop (wave 3b)', () => {
+    const PLATFORM = 'https://dashboard.example.com';
+
+    const mintInvite = () =>
+      getAppGuestManager().mintInviteToken({
+        appName: APP,
+        guestId: guest.id,
+        email: guest.email,
+        createdBy: ownerId,
+      });
+
+    const postJson = (path: string, body: unknown, headers: Record<string, string> = {}) =>
+      t.hono.request(`/api/v1/app-access/${path}`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', ...headers },
+        body: JSON.stringify(body),
+      });
+
+    /** `Response.json()` is `unknown` under this tsconfig; every body here is DROP's envelope. */
+    const bodyOf = async (res: Response) =>
+      (await res.json()) as { data?: Record<string, string>; error?: { message: string } };
+
+    const setCookies = (res: Response) => res.headers.getSetCookie?.() ?? [];
+    const inviteCookieFrom = (res: Response): string => {
+      const raw = setCookies(res).find(v => v.startsWith(`${INVITE_COOKIE_NAME}=`));
+      expect(raw).toBeDefined();
+      return (raw as string).split(';')[0];
+    };
+
+    describe('GET /invite/:id — the mail link', () => {
+      it('redirects to the guest page carrying the id, with no fragment of its own', async () => {
+        const invite = await mintInvite();
+        const res = await t.hono.request(`/api/v1/app-access/invite/${invite.id}`);
+
+        expect(res.status).toBe(302);
+        const location = new URL(res.headers.get('location') as string);
+        expect(location.origin).toBe(PLATFORM);
+        expect(location.pathname).toBe('/dashboard/app-invite');
+        expect(location.searchParams.get('id')).toBe(invite.id);
+        // C0 Q1: a Location with its OWN fragment overrides the client's, which
+        // is where the secret lives. This hop must never grow one.
+        expect(location.hash).toBe('');
+      });
+
+      it('answers IDENTICALLY for an invented id — it is not an existence oracle', async () => {
+        const invite = await mintInvite();
+        const real = await t.hono.request(`/api/v1/app-access/invite/${invite.id}`);
+        const fake = await t.hono.request(
+          '/api/v1/app-access/invite/00000000-0000-0000-0000-000000000000'
+        );
+
+        expect(fake.status).toBe(real.status);
+        expect(new URL(fake.headers.get('location') as string).pathname).toBe(
+          new URL(real.headers.get('location') as string).pathname
+        );
+      });
+
+      it('refuses an id that is not shaped like one we mint', async () => {
+        const res = await t.hono.request('/api/v1/app-access/invite/..%2F..%2Fetc');
+        expect(res.status).toBe(400);
+      });
+    });
+
+    describe('POST /invite-redeem — spending it', () => {
+      it('sets the invite cookie on the PLATFORM origin and returns the app URL', async () => {
+        const invite = await mintInvite();
+        const res = await postJson('invite-redeem', { id: invite.id, secret: invite.secret });
+
+        expect(res.status).toBe(200);
+        expect((await bodyOf(res)).data?.appUrl).toBe(origin);
+
+        const cookie = setCookies(res).find(v => v.startsWith(`${INVITE_COOKIE_NAME}=`)) as string;
+        expect(cookie).toBeDefined();
+        expect(cookie).toContain('Secure');
+        expect(cookie).toContain('HttpOnly');
+        expect(cookie).toContain('Path=/');
+        // Lax, NOT Strict, and this is pinned because Strict silently breaks
+        // the chain: the next hop that must carry this cookie is a top-level
+        // GET arriving from the TENANT origin, which Strict drops.
+        expect(cookie).toContain('SameSite=Lax');
+      });
+
+      it('is SINGLE-USE', async () => {
+        const invite = await mintInvite();
+        await postJson('invite-redeem', { id: invite.id, secret: invite.secret });
+        const second = await postJson('invite-redeem', { id: invite.id, secret: invite.secret });
+
+        expect(second.status).toBe(403);
+        expect(setCookies(second).some(v => v.startsWith(`${INVITE_COOKIE_NAME}=`))).toBe(false);
+      });
+
+      it('answers a wrong secret exactly as it answers an unknown id', async () => {
+        const invite = await mintInvite();
+        const wrongSecret = await postJson('invite-redeem', { id: invite.id, secret: 'nope' });
+        const unknownId = await postJson('invite-redeem', { id: 'no-such-id', secret: 'nope' });
+
+        expect(wrongSecret.status).toBe(unknownId.status);
+        expect((await bodyOf(wrongSecret)).error?.message).toBe(
+          (await bodyOf(unknownId)).error?.message
+        );
+      });
+
+      it('refuses when the grant was revoked, and the invite stays SPENT', async () => {
+        const invite = await mintInvite();
+        await setGuests([]);
+
+        const refused = await postJson('invite-redeem', { id: invite.id, secret: invite.secret });
+        expect(refused.status).toBe(403);
+
+        // Restoring the grant must not resurrect a spent invite.
+        await setGuests([guest.id]);
+        const retry = await postJson('invite-redeem', { id: invite.id, secret: invite.secret });
+        expect(retry.status).toBe(403);
+      });
+
+      it('refuses a DISABLED guest', async () => {
+        const invite = await mintInvite();
+        await getAppGuestManager().disableGuest(guest.id, ownerId);
+
+        const res = await postJson('invite-redeem', { id: invite.id, secret: invite.secret });
+        expect(res.status).toBe(403);
+      });
+    });
+
+    describe('authorize — the page hint', () => {
+      it('sends a visitor with no invite cookie to the account-holder page', async () => {
+        const res = await t.hono.request(
+          `/api/v1/app-access/authorize?app=${APP}&flow=f1&return=%2F`
+        );
+        expect(new URL(res.headers.get('location') as string).pathname).toBe(
+          '/dashboard/app-access'
+        );
+      });
+
+      it('sends a visitor holding an invite cookie to the guest page', async () => {
+        const invite = await mintInvite();
+        const redeemed = await postJson('invite-redeem', {
+          id: invite.id,
+          secret: invite.secret,
+        });
+        const res = await t.hono.request(
+          `/api/v1/app-access/authorize?app=${APP}&flow=f1&return=%2F`,
+          { headers: { cookie: inviteCookieFrom(redeemed) } }
+        );
+
+        const location = new URL(res.headers.get('location') as string);
+        expect(location.pathname).toBe('/dashboard/app-invite');
+        expect(location.searchParams.get('flow')).toBe('f1');
+        expect(location.hash).toBe('');
+      });
+
+      it('treats the cookie as a HINT — presence alone, never a verified claim', async () => {
+        // Garbage routes to the guest page too, and that is deliberate: the
+        // page corrects a wrong hint, and `guest-code` re-verifies server-side.
+        // The alternative — verifying here — would make `/authorize` the place
+        // bearer-vs-invite precedence gets decided, and this hop cannot see a
+        // bearer at all.
+        const res = await t.hono.request(
+          `/api/v1/app-access/authorize?app=${APP}&flow=f1&return=%2F`,
+          { headers: { cookie: `${INVITE_COOKIE_NAME}=not-a-real-token` } }
+        );
+        expect(new URL(res.headers.get('location') as string).pathname).toBe(
+          '/dashboard/app-invite'
+        );
+      });
+    });
+
+    describe('POST /guest-code', () => {
+      const redeemedCookie = async () => {
+        const invite = await mintInvite();
+        return inviteCookieFrom(
+          await postJson('invite-redeem', { id: invite.id, secret: invite.secret })
+        );
+      };
+
+      const startFlow = async (): Promise<string> => {
+        const res = await verify({ 'x-forwarded-uri': '/' });
+        const cookie = (res.headers.getSetCookie?.() ?? []).find(v =>
+          v.startsWith(`${flowCookieName(APP)}=`)
+        ) as string;
+        return cookie.split('=')[1].split(';')[0];
+      };
+
+      it('mints a code pointing at the app exchange', async () => {
+        const cookie = await redeemedCookie();
+        const flow = await startFlow();
+
+        const res = await postJson('guest-code', { app: APP, flow, return: '/' }, { cookie });
+
+        expect(res.status).toBe(200);
+        const redirectTo = new URL((await bodyOf(res)).data?.redirectTo as string);
+        expect(redirectTo.origin).toBe(origin);
+        expect(redirectTo.pathname).toBe('/.drop-session/exchange');
+        expect(redirectTo.searchParams.get('code')).toBeTruthy();
+      });
+
+      it('refuses with no invite cookie at all', async () => {
+        const flow = await startFlow();
+        const res = await postJson('guest-code', { app: APP, flow, return: '/' });
+        expect(res.status).toBe(403);
+      });
+
+      it('refuses when the invite names a DIFFERENT app than the request', async () => {
+        // The app is bound INSIDE the token and compared against the body —
+        // otherwise one redeemed invite would mint codes for every gated app
+        // on the box.
+        const other = await getAppGuestManager().resolveOrCreateGuest(
+          'visitor@example.com',
+          'other-app',
+          ownerId
+        );
+        await getAppConfigService().upsertConfig('other-app', { type: 'nodejs', port: 4100 });
+        await getStateManager().registerApp(
+          'other-app',
+          path.join(t.tempDir, 'webapps', APP),
+          'nodejs'
+        );
+        await getStateManager().updateApp('other-app', { userId: ownerId, port: 4100 });
+        await getAppConfigService().setAccessPolicy('other-app', () => ({
+          mode: 'drop-users' as const,
+          allow: [],
+          guests: [other.id],
+        }));
+        const otherInvite = await getAppGuestManager().mintInviteToken({
+          appName: 'other-app',
+          guestId: other.id,
+          email: other.email,
+          createdBy: ownerId,
+        });
+        const cookie = inviteCookieFrom(
+          await postJson('invite-redeem', { id: otherInvite.id, secret: otherInvite.secret })
+        );
+        const flow = await startFlow();
+
+        const res = await postJson('guest-code', { app: APP, flow, return: '/' }, { cookie });
+
+        expect(res.status).toBe(403);
+
+        // And it refuses BEFORE spending the flow. That ordering is the only
+        // thing the app-binding check uniquely buys — the live re-check below
+        // it would refuse this too (a guest record is per-app, so a guest for
+        // another app can never be live for this one), but only after burning
+        // the visitor's flow id. Without this assertion the binding line is
+        // invisible to the suite: mutating it away leaves every test green.
+        const ownCookie = await redeemedCookie();
+        const stillUsable = await postJson(
+          'guest-code',
+          { app: APP, flow, return: '/' },
+          { cookie: ownCookie }
+        );
+        expect(stillUsable.status).toBe(200);
+      });
+
+      it('SPENDS the flow, so an observed flow id cannot be replayed', async () => {
+        const cookie = await redeemedCookie();
+        const flow = await startFlow();
+
+        await postJson('guest-code', { app: APP, flow, return: '/' }, { cookie });
+        const replay = await postJson('guest-code', { app: APP, flow, return: '/' }, { cookie });
+
+        expect(replay.status).toBe(400);
+      });
+
+      it('refuses once the grant is revoked, even holding a valid invite cookie', async () => {
+        const cookie = await redeemedCookie();
+        const flow = await startFlow();
+        await setGuests([]);
+
+        const res = await postJson('guest-code', { app: APP, flow, return: '/' }, { cookie });
+
+        expect(res.status).toBe(403);
+      });
+    });
+
+    it('walks the whole chain: mail link -> redeem -> verify -> authorize -> code -> exchange', async () => {
+      // The six hops of the plan's section C, end to end, in the order a real
+      // browser makes them. This is the closest a test gets to the runtime
+      // walk, and it is here because the chain's failure mode is that every
+      // hop works alone.
+      const invite = await mintInvite();
+
+      // 1. The mail link, on the platform origin.
+      const landing = await t.hono.request(`/api/v1/app-access/invite/${invite.id}`);
+      expect(new URL(landing.headers.get('location') as string).pathname).toBe(
+        '/dashboard/app-invite'
+      );
+
+      // 2-3. The gesture: the page POSTs id + the fragment secret.
+      const redeemed = await postJson('invite-redeem', {
+        id: invite.id,
+        secret: invite.secret,
+      });
+      expect(redeemed.status).toBe(200);
+      const inviteCookie = inviteCookieFrom(redeemed);
+      expect((await bodyOf(redeemed)).data?.appUrl).toBe(origin);
+
+      // 4. The browser walks to the app; Caddy's forward_auth hits verify,
+      //    which plants the flow cookie on the TENANT origin and bounces back.
+      const verified = await verify({ 'x-forwarded-uri': '/reports' });
+      expect(verified.status).toBe(302);
+      const flowCookie = (verified.headers.getSetCookie?.() ?? []).find(v =>
+        v.startsWith(`${flowCookieName(APP)}=`)
+      ) as string;
+      const flow = flowCookie.split('=')[1].split(';')[0];
+
+      // ...to authorize, which now sees the invite cookie and picks the guest page.
+      const authorized = await t.hono.request(
+        (verified.headers.get('location') as string).replace(PLATFORM, ''),
+        { headers: { cookie: inviteCookie } }
+      );
+      const consent = new URL(authorized.headers.get('location') as string);
+      expect(consent.pathname).toBe('/dashboard/app-invite');
+      expect(consent.searchParams.get('app')).toBe(APP);
+      expect(consent.searchParams.get('return')).toBe('/reports');
+
+      // 5. The guest page POSTs app + flow with the invite cookie.
+      const coded = await postJson(
+        'guest-code',
+        {
+          app: consent.searchParams.get('app'),
+          flow: consent.searchParams.get('flow'),
+          return: consent.searchParams.get('return'),
+        },
+        { cookie: inviteCookie }
+      );
+      expect(coded.status).toBe(200);
+      const redirectTo = new URL((await bodyOf(coded)).data?.redirectTo as string);
+
+      // 6. The exchange, on the tenant origin, behind the flow cookie.
+      const exchanged = await t.hono.request(
+        `/api/v1/app-access/${APP}/exchange${redirectTo.search}`,
+        { headers: { cookie: `${flowCookieName(APP)}=${flow}` } }
+      );
+      expect(exchanged.status).toBe(302);
+      expect(exchanged.headers.get('location')).toBe('/reports');
+      const session = (exchanged.headers.getSetCookie?.() ?? []).find(v =>
+        v.startsWith(`${sessionCookieName(APP)}=`)
+      ) as string;
+      expect(session).toBeDefined();
+
+      // And the session that came out of it opens the app.
+      const opened = await verify({ cookie: session.split(';')[0] });
+      expect(opened.status).toBe(204);
+      expect(opened.headers.get('x-drop-guest-id')).toBe(guest.id);
     });
   });
 });

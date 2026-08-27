@@ -58,12 +58,25 @@ import {
   consumeAppAccessCode,
 } from '../app-access/flow-code';
 import { validateReturnPath } from '../app-access/return-path';
-import { sessionCookieName, flowCookieName, EXCHANGE_PATH } from '../app-access/names';
+import {
+  sessionCookieName,
+  flowCookieName,
+  EXCHANGE_PATH,
+  INVITE_COOKIE_NAME,
+} from '../app-access/names';
 import {
   mintAppGuestSessionToken,
   verifyAppGuestSessionToken,
+  mintAppInviteToken,
+  verifyAppInviteToken,
+  INVITE_SESSION_TTL_SECONDS,
 } from '../app-access/session-token';
-import { getAppGuestById, getAppGuestManager } from '../../managers/app-guest';
+import {
+  getAppGuestById,
+  getAppGuestManager,
+  GuestStoreCorruptError,
+  InviteStoreCorruptError,
+} from '../../managers/app-guest';
 import { getAccessLog, type AccessLogEntry } from '../../managers/access-log/access-log';
 import { computeAppUrl } from '../../utils/app-url';
 
@@ -74,6 +87,15 @@ const FLOW_COOKIE_TTL_SECONDS = 300;
 
 /** The dashboard route that reads `localStorage` and POSTs for a code. */
 const CONSENT_PATH = '/dashboard/app-access';
+
+/**
+ * The GUEST's page — a separate route that never mounts the dashboard's auth
+ * provider, rather than a guest mode inside the consent page (whose
+ * unauthenticated branch the account-holder flow depends on: it navigates to
+ * `/login`, which is exactly right for an account holder and exactly wrong for
+ * someone with no account).
+ */
+const INVITE_CONSENT_PATH = '/dashboard/app-invite';
 
 export { sessionCookieName, flowCookieName } from '../app-access/names';
 
@@ -507,11 +529,243 @@ appAccess.get('/authorize', c => {
     return c.json(error(ErrorCodes.SERVICE_UNAVAILABLE, 'Sign-in is not configured'), 503);
   }
 
-  const target = new URL(`${platform}${CONSENT_PATH}`);
+  // WHICH page, decided by the presence of a redeemed-invite cookie — and it
+  // is a HINT, not a decision.
+  //
+  // This hop carries no credential of any kind (the dashboard session is a
+  // bearer in `localStorage`, which a top-level 302 cannot bring), so here the
+  // invite cookie is VISIBLE and an account holder's bearer is structurally
+  // INVISIBLE. Deciding precedence here would therefore always resolve in the
+  // invite's favour — and an account holder carrying a stale invite cookie for
+  // some other app would be routed to the guest page, refused for the app
+  // mismatch, and stuck, with a perfectly good bearer never consulted.
+  //
+  // So the guest page reads `localStorage` itself and hands off to
+  // CONSENT_PATH whenever a dashboard token is present, which is where the
+  // plan's "a present bearer always wins over an invite, leaving it unspent"
+  // rule is actually enforced. A spoofed or stale cookie costs nothing: the
+  // guest-code hop re-verifies it server-side and re-checks the live guest
+  // record and the live policy before minting anything.
+  //
+  // Presence only, never a signature check: a hint that lies routes the
+  // visitor to a page that corrects it.
+  const hasInvite = readCookie(c, INVITE_COOKIE_NAME) !== undefined;
+  const target = new URL(`${platform}${hasInvite ? INVITE_CONSENT_PATH : CONSENT_PATH}`);
   target.searchParams.set('app', appName);
   target.searchParams.set('flow', flow);
   target.searchParams.set('return', returnPath);
   return c.redirect(target.toString(), 302);
+});
+
+// ---------------------------------------------------------------------------
+// 2b. invite — the GUEST's entry point, on the PLATFORM host
+// ---------------------------------------------------------------------------
+
+/**
+ * The mail link: `https://<platform>/api/v1/app-access/invite/<id>#<secret>`.
+ *
+ * The id is in the PATH and the secret in the FRAGMENT, which is the split C0
+ * recommended: the fragment is the half most likely to be eaten by an
+ * enterprise mail-link rewriter (unverifiable from this box, so treated as
+ * hostile), and a server-visible id means the page can tell the reader their
+ * link is incomplete instead of failing blankly.
+ *
+ * This hop does NOT look the invite up, deliberately: answering differently
+ * for a real and an invented id would make an unauthenticated endpoint an
+ * existence oracle over the id space. It redirects, and the page behind it
+ * produces one generic refusal for every way an invite can be bad.
+ *
+ * SAME-ORIGIN redirect with NO fragment of its own — the C0 Q1 landmine. A
+ * `Location` carrying its own fragment OVERRIDES the client's, which would
+ * destroy the secret silently. `new URL(...)` + `searchParams` cannot grow
+ * one, and `app-access.guest.routes.test.ts` pins it.
+ */
+appAccess.get('/invite/:id', c => {
+  const id = c.req.param('id');
+  noStore(c);
+
+  const platform = getPublicUrl();
+  if (!platform) {
+    return c.json(error(ErrorCodes.SERVICE_UNAVAILABLE, 'Sign-in is not configured'), 503);
+  }
+  // Bounded and grammar-checked before it is echoed into a URL. Invite ids are
+  // `crypto.randomUUID()`, so anything else is not an id we minted.
+  if (!/^[A-Za-z0-9_-]{1,64}$/.test(id)) {
+    return c.json(error(ErrorCodes.VALIDATION_ERROR, 'Invalid invitation link'), 400);
+  }
+
+  const target = new URL(`${platform}${INVITE_CONSENT_PATH}`);
+  target.searchParams.set('id', id);
+  return c.redirect(target.toString(), 302);
+});
+
+/**
+ * Spend the invite. `{ id, secret }`, POSTed by the guest page after an
+ * EXPLICIT user gesture.
+ *
+ * The gesture is a control, not decoration: mail scanners and preview panes
+ * fetch links, and an auto-POST on page load would burn single-use invites
+ * before the human ever clicked. A GET could not do this at all.
+ *
+ * Every failure — unknown id, wrong secret, expired, already spent, guest
+ * disabled, grant revoked, app unroutable — returns the SAME refusal. The id
+ * is non-secret by design, so the only thing distinguishable answers would
+ * reveal is which invites exist and which are still live.
+ */
+appAccess.post('/invite-redeem', async c => {
+  noStore(c);
+  const platform = getPublicUrl();
+  if (!platform) {
+    return c.json(error(ErrorCodes.SERVICE_UNAVAILABLE, 'Sign-in is not configured'), 503);
+  }
+
+  const body = (await c.req.json().catch(() => ({}))) as { id?: unknown; secret?: unknown };
+  const id = typeof body.id === 'string' ? body.id : '';
+  const secret = typeof body.secret === 'string' ? body.secret : '';
+
+  const refuse = () =>
+    c.json(
+      error(
+        ErrorCodes.UNAUTHORIZED,
+        'This invitation is no longer valid. Ask the person who sent it to send you another.'
+      ),
+      403
+    );
+
+  if (!id || !secret) return refuse();
+
+  let redemption;
+  try {
+    redemption = await getAppGuestManager().redeemInviteToken(id, secret);
+  } catch (err) {
+    // A corrupt store refuses rather than admitting — with the same message as
+    // every other failure, so an unreadable file is not itself something a
+    // caller can detect.
+    if (err instanceof GuestStoreCorruptError || err instanceof InviteStoreCorruptError) {
+      return refuse();
+    }
+    throw err;
+  }
+  if (!redemption) return refuse();
+
+  // The invite is SPENT by this point, whatever happens below. That is the
+  // right direction: an invite whose grant has since been revoked must not
+  // stay redeemable until someone restores the grant.
+  const app = getStateManager().getApp(redemption.appName);
+  const policy = gatePolicy(redemption.appName);
+  if (!app || !policy) return refuse();
+  if (
+    !guestRecordLive(redemption.guestId, redemption.appName) ||
+    !canOpenGuestSession(
+      { guestId: redemption.guestId, email: redemption.email, appName: redemption.appName },
+      policy,
+      redemption.appName
+    )
+  ) {
+    return refuse();
+  }
+
+  const origin = appOrigin(redemption.appName);
+  if (!origin) return refuse();
+
+  const token = await mintAppInviteToken(
+    redemption.guestId,
+    redemption.email,
+    redemption.appName,
+    platform
+  );
+  // On the PLATFORM origin — the whole point of the revised chain.
+  // `SameSite=Lax` rather than `Strict`: the next hop that must send this
+  // cookie is a top-level GET navigation arriving from the TENANT origin
+  // (`/verify`'s 302 to `/authorize`), which Lax permits and Strict would
+  // drop — leaving the guest bounced to the account-holder page holding an
+  // invite nothing can see.
+  c.header(
+    'Set-Cookie',
+    `${INVITE_COOKIE_NAME}=${token}; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=${INVITE_SESSION_TTL_SECONDS}`
+  );
+  // The app's own URL, DROP-derived and forced to https by `appOrigin` — the
+  // same value the session will be audienced to, so the two cannot disagree.
+  return c.json(success({ appName: redemption.appName, appUrl: origin }));
+});
+
+/**
+ * The guest's sibling of `POST /code`: same flow binding, same single-use
+ * code, same `redirectTo`. What differs is only which credential authenticates
+ * it — a redeemed-invite cookie instead of a dashboard bearer.
+ *
+ * NOT behind `authMiddleware`, for the reason this module's header gives: it
+ * authenticates its own credential class, and a role guard would admit a
+ * dashboard session, an API key or a DROP-scoped OAuth token — none of which
+ * is a redeemed invite.
+ */
+appAccess.post('/guest-code', async c => {
+  noStore(c);
+  const platform = getPublicUrl();
+  if (!platform) {
+    return c.json(error(ErrorCodes.SERVICE_UNAVAILABLE, 'Sign-in is not configured'), 503);
+  }
+
+  const body = (await c.req.json().catch(() => ({}))) as {
+    app?: unknown;
+    flow?: unknown;
+    return?: unknown;
+  };
+  const appName = typeof body.app === 'string' ? body.app : '';
+  const flowId = typeof body.flow === 'string' ? body.flow : '';
+  const returnPath = validateReturnPath(typeof body.return === 'string' ? body.return : undefined);
+
+  if (!isValidAppName(appName) || !flowId) {
+    return c.json(error(ErrorCodes.VALIDATION_ERROR, 'Invalid sign-in request'), 400);
+  }
+
+  const cookie = readCookie(c, INVITE_COOKIE_NAME);
+  const invite = cookie ? await verifyAppInviteToken(cookie, platform) : null;
+  // The app is BOUND IN THE TOKEN and compared here, never taken from the
+  // body: otherwise a redeemed invite for one app would mint a code for any
+  // other gated app on the box.
+  if (!invite || invite.appName !== appName) {
+    return c.json(error(ErrorCodes.UNAUTHORIZED, 'Not permitted to open this application'), 403);
+  }
+
+  // Spent HERE, exactly as `POST /code` spends it — the flow must have been
+  // started by a verify hop in THIS browser, or an observed flow id would let
+  // anyone mint a code bound to a victim's browser.
+  if (!consumeFlowId(flowId)) {
+    return c.json(error(ErrorCodes.VALIDATION_ERROR, 'This sign-in has expired'), 400);
+  }
+
+  // The SAME predicate the verify hop and the exchange use. If these disagree
+  // the visitor loops between them, so the refusal is made HERE, on a page
+  // DROP controls, rather than discovered one hop later.
+  if (
+    !codeStillAdmissible({ kind: 'guest', guestId: invite.guestId, email: invite.email }, appName)
+  ) {
+    return c.json(error(ErrorCodes.UNAUTHORIZED, 'Not permitted to open this application'), 403);
+  }
+
+  const origin = appOrigin(appName);
+  if (!origin) {
+    return c.json(error(ErrorCodes.CONFLICT, 'This application has no routable address'), 409);
+  }
+
+  const code = mintAppAccessCode({
+    kind: 'guest',
+    guestId: invite.guestId,
+    email: invite.email,
+    appName,
+    flowId,
+    returnPath: returnPath ?? '/',
+  });
+
+  // The invite cookie is deliberately NOT cleared here. It expires on its own
+  // in minutes, every code it can mint is single-use and flow-bound to this
+  // same browser, and leaving it lets a guest whose exchange hop failed retry
+  // without asking for a new invitation — which, the invite SECRET being
+  // already spent, would otherwise mean a whole new email.
+  return c.json(
+    success({ redirectTo: `${origin}${EXCHANGE_PATH}?code=${encodeURIComponent(code)}` })
+  );
 });
 
 // ─────────────────────────────────────────────────────────────────────────────

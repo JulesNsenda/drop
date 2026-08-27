@@ -131,6 +131,128 @@ export interface AppGuestIdentity {
   appName: string;
 }
 
+/**
+ * How long a REDEEMED invite stays usable, in seconds.
+ *
+ * Ten minutes, and short for a reason that is not "secrets should be short".
+ * This credential covers exactly one hop chain: the guest presses a button on
+ * DROP's own page, the browser walks to the app, `/verify` bounces it back to
+ * `/authorize`, and the guest-code hop spends it. That is seconds of wall
+ * clock, and the only legitimate reason it takes longer is a person reading
+ * the page in between.
+ *
+ * It is also the ONE window in which a redeemed invite is a bearer credential
+ * with no second factor and no user gesture left to make — the invite secret
+ * itself is already spent by this point. `FLOW_COOKIE_TTL_SECONDS` (300s)
+ * bounds the sibling half of the same chain; this is deliberately of the same
+ * order rather than of the same order as a session.
+ */
+export const INVITE_SESSION_TTL_SECONDS = 10 * 60;
+
+/**
+ * What a verified, REDEEMED invite proves: this browser spent invite `<id>`
+ * for this guest on this app, on the platform origin, within the last
+ * `INVITE_SESSION_TTL_SECONDS`.
+ *
+ * A FIFTH credential class, and it earns its place rather than reusing the
+ * guest session: a guest session is minted on the TENANT origin, audienced to
+ * the app, and is the thing the gate admits on. This lives on the PLATFORM
+ * origin and admits nothing — its only power is to satisfy the guest-code hop,
+ * which then re-checks the live guest record and the live policy before
+ * minting anything. Folding the two together would put a credential that opens
+ * an app on the platform's own origin, where every hop of every other flow can
+ * see it.
+ */
+export interface AppInviteIdentity {
+  guestId: string;
+  email: string;
+  appName: string;
+}
+
+/**
+ * Mint the redeemed-invite credential. `audience` is the PLATFORM origin —
+ * never an app's — which is what stops this ever verifying at a hop that
+ * expects an app-audienced token.
+ */
+export async function mintAppInviteToken(
+  guestId: string,
+  email: string,
+  appName: string,
+  platformOrigin: string
+): Promise<string> {
+  const secret = getOAuthTokenSecret();
+  if (!secret) throw new Error('Auth not initialized');
+  return new jose.SignJWT({
+    sub: guestId,
+    email,
+    token_use: 'app_guest_invite',
+    app: appName,
+    aud: platformOrigin,
+    // Same reasoning as the two session classes: without a per-credential id
+    // there is no way to end ONE browser's redeemed invite short of disabling
+    // the guest outright.
+    sid: crypto.randomBytes(16).toString('base64url'),
+  })
+    .setProtectedHeader({ alg: 'HS256' })
+    .setIssuedAt()
+    .setExpirationTime(`${INVITE_SESSION_TTL_SECONDS}s`)
+    .sign(secret);
+}
+
+/**
+ * Verify a redeemed invite for ONE expected platform audience.
+ *
+ * Same shape and same ordering as the two session verifiers — class first,
+ * then audience, then the sid denylist, then a LIVE re-read of the guest
+ * record — because the argument for each check is the same argument about a
+ * different record. `token_use` first is what stops this class and the guest
+ * SESSION class authenticating as each other: they carry the same `sub`, the
+ * same `email` and the same `app`, and differ in exactly two claims. Without
+ * the class check an audience collision would make them interchangeable, and
+ * one of them opens an app.
+ *
+ * There is deliberately NO `expectedApp` parameter. The caller does not know
+ * which app the invite names — that is the whole point of reading it — so the
+ * app is RETURNED and the caller compares it against the app it is being asked
+ * about. `guest.appName` is re-asserted against the token's own claim here, so
+ * the value handed back is bound at both ends before the caller sees it.
+ */
+export async function verifyAppInviteToken(
+  token: string,
+  expectedAudience: string
+): Promise<AppInviteIdentity | null> {
+  const secret = getOAuthTokenSecret();
+  if (!secret) return null;
+
+  try {
+    const { payload } = await jose.jwtVerify(token, secret, { algorithms: ['HS256'] });
+    const p = payload as Record<string, unknown>;
+
+    if (p['token_use'] !== 'app_guest_invite') return null;
+    if (p['aud'] !== expectedAudience) return null;
+
+    const guestId = typeof p['sub'] === 'string' ? p['sub'] : '';
+    const email = typeof p['email'] === 'string' ? p['email'] : '';
+    const appName = typeof p['app'] === 'string' ? p['app'] : '';
+    if (!guestId || !email || !appName) return null;
+
+    const sid = typeof p['sid'] === 'string' ? p['sid'] : '';
+    if (!sid || isGrantDenied(sid)) return null;
+
+    const guest = getAppGuestById(guestId);
+    if (!guest) return null;
+    if (guest.appName !== appName) return null;
+    if (guest.disabled === true) return null;
+
+    const iat = typeof p['iat'] === 'number' ? p['iat'] : 0;
+    if (predatesInvalidationStamp(iat, guest.credentialsInvalidBefore)) return null;
+
+    return { guestId, email, appName };
+  } catch {
+    return null;
+  }
+}
+
 /** Mint a session for one user on one app. */
 export async function mintAppSessionToken(
   userId: string,

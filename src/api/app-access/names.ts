@@ -39,6 +39,23 @@ export function flowCookieName(appName: string): string {
 }
 
 /**
+ * The cookie that carries a REDEEMED invite across the guest's hop chain
+ * (DROP-155).
+ *
+ * On the PLATFORM origin, not the tenant's — the whole point of the revised
+ * chain is that the invite secret never touches a tenant-controlled host. It
+ * is set when the guest spends their invite and read one navigation later, on
+ * the same origin, by the guest-code hop.
+ *
+ * NOT per-app, unlike the two above. Those are per-app because a browser can
+ * hold sessions for many gated apps at once and they must not shadow each
+ * other. An invite is different: a visitor redeems one at a time, and the app
+ * it admits to is bound INSIDE the token rather than in the name — so a second
+ * redemption replacing the first is the correct behaviour, not a collision.
+ */
+export const INVITE_COOKIE_NAME = '__Host-drop-invite';
+
+/**
  * The path, on the tenant's own hostname, that DROP owns for the code
  * exchange. Emitted as a Caddy matcher and used to build the redirect the SPA
  * navigates to, which is why it cannot live in either of those places alone.

@@ -359,6 +359,25 @@ export class ApiServer {
     // outage, not a refusal.
     v1.use('/app-access/*/verify', accessVerifyRateLimitMiddleware());
 
+    // The guest hops (DROP-155). Two credential surfaces and one page load,
+    // and they get different buckets because they are different things:
+    //
+    //  - `/invite-redeem` GUESSES a secret and `/guest-code` MINTS a code, so
+    //    both take the strict `auth` bucket that `/app-access/code` takes;
+    //  - `/invite/:id` mints and guesses nothing — it validates an id shape
+    //    and redirects — and is the FIRST thing a guest ever loads. Putting it
+    //    on the strict bucket would mean a shared office NAT could exhaust it
+    //    and lock a real invitee out of the only entry point they have.
+    //
+    // The three patterns are disjoint by SHAPE, not by luck: two single
+    // segments and one two-segment path. That matters because these run as
+    // `use()` middleware, which is method-blind — an earlier draft put redeem
+    // at `/app-access/invite/redeem`, where `/app-access/invite/:id` matches it
+    // too and every redeem would have been counted against both buckets.
+    v1.use('/app-access/invite-redeem', authRateLimitMiddleware());
+    v1.use('/app-access/guest-code', authRateLimitMiddleware());
+    v1.use('/app-access/invite/:id', accessVerifyRateLimitMiddleware());
+
     // The access-gate policy routes (DROP-152) get the services bucket too.
     // Part 9 of the plan declined a bucket on the grounds that the route is
     // "admin-only and cheap"; the call graph says otherwise — every PUT/DELETE
