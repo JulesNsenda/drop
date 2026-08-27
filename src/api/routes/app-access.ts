@@ -1,5 +1,5 @@
 /**
- * The browser access gate's four endpoints (DROP-152).
+ * The browser access gate's endpoints (DROP-152, extended by DROP-155).
  *
  * DELIBERATELY NOT behind `authMiddleware`, for the same reason
  * `mcp-gateway.ts` is not: these authenticate their own credential classes.
@@ -8,7 +8,10 @@
  * this app. `POST /code` is the one exception and mounts its own guard in
  * `server.ts`, exactly as `/oauth/approve` does.
  *
- * ## The flow, and why it has four hops rather than two
+ * ## The ACCOUNT-HOLDER flow, and why it has four hops rather than two
+ *
+ * The GUEST flow (DROP-155) adds three endpoints and two hops on top of this
+ * one — see `2b. invite` below, and section C of that plan.
  *
  * DROP sets no cookies on its own host: the dashboard session is a bearer JWT
  * in `localStorage`. So a 302 into an `/authorize` endpoint arrives with NO
@@ -44,6 +47,7 @@ import { isValidAppName } from '../middleware/validate';
 import { getStateManager } from '../../managers/app/state-manager';
 import { getAppConfigServiceOrNull } from '../../managers/app/app-config';
 import { getPublicUrl, isAccessGateEnabled } from '../runtime-config';
+import { getSettingsManager } from '../../managers/settings/settings-manager';
 import { canOpen, canOpenSession, canOpenGuestSession } from '../access';
 import { AuthContext, getUserById } from '../middleware/auth';
 import {
@@ -147,6 +151,29 @@ function appOrigin(appName: string): string | undefined {
 /** The policy, or null when this app is not gated. */
 function gatePolicy(appName: string) {
   return getAppConfigServiceOrNull()?.getConfig(appName)?.access ?? null;
+}
+
+/**
+ * The DROP-155 operator switch, read LIVE at every hop that admits a guest or
+ * mints a guest credential.
+ *
+ * A KILL SWITCH, not a capability gate, and that is a deliberate widening of
+ * what the name suggests. Gating only the `{ email }` branch would mean an
+ * operator flipping it off during an incident stops new invitations and nothing
+ * else: unredeemed invite tokens stay redeemable for 24 hours, redeemed invite
+ * cookies for ten minutes, and every live guest session for a full eight — all
+ * while the admin API reports `guestInvites.enabled: false`. That is the "a
+ * flag that only ASSESSES is not a kill switch" shape DROP-153 already had to
+ * fix once, and the window it lands in is incident response.
+ *
+ * It does NOT delete anything: guest records, grants and invites survive, so
+ * turning it back on restores exactly what was there. The cost of the wider
+ * reading is that an operator who wanted to stop only new invitations also
+ * evicts current guests — visible, reversible, and the direction a switch
+ * should fail in. `PUT /admin/settings/guest-invites` says so in its response.
+ */
+function guestAccessEnabled(): boolean {
+  return getSettingsManager().getGuestInvitesEnabled();
 }
 
 /**
@@ -347,6 +374,15 @@ appAccess.get('/:app/verify', async c => {
     // is the same answer the plan gives for a missed invite.
 
     if (guest) {
+      // The kill switch, checked before the policy is consulted — see
+      // `guestAccessEnabled`. A guest holding a perfectly valid session is
+      // refused TERMINALLY rather than redirected: they have no account to
+      // sign in with, so a redirect is a loop with no exit, and the operator
+      // has deliberately turned this off.
+      if (!guestAccessEnabled()) {
+        recordAccess({ appName, decision: 'refuse', reason: 'guest-access-disabled' });
+        return forbidden(c, appName, 'Guest access is disabled on this platform.');
+      }
       if (canOpenGuestSession(guest, policy, appName)) {
         // No `userId`/`username` on the log row: a guest id in a field named
         // for a DROP user is the cross-class confusion the fourth credential
@@ -632,6 +668,12 @@ appAccess.post('/invite-redeem', async c => {
       403
     );
 
+  // Redemption is credential ISSUANCE, not consumption of an existing session,
+  // so the switch that gates minting gates spending too. Same generic refusal
+  // as every other failure here: an operator's configuration is not something
+  // an anonymous caller needs distinguished from a bad secret.
+  if (!guestAccessEnabled()) return refuse();
+
   if (!id || !secret) return refuse();
 
   let redemption;
@@ -675,11 +717,20 @@ appAccess.post('/invite-redeem', async c => {
     platform
   );
   // On the PLATFORM origin — the whole point of the revised chain.
-  // `SameSite=Lax` rather than `Strict`: the next hop that must send this
-  // cookie is a top-level GET navigation arriving from the TENANT origin
-  // (`/verify`'s 302 to `/authorize`), which Lax permits and Strict would
-  // drop — leaving the guest bounced to the account-holder page holding an
-  // invite nothing can see.
+  // `SameSite=Lax`, and the reasoning is MEASURED rather than assumed — because
+  // the obvious version of it is wrong. This comment used to say "Strict would
+  // drop it on the hop back from the tenant". Measured on Chrome 151 over real
+  // TLS with two genuinely cross-site hosts: it does NOT. For a top-level
+  // navigation Chrome computes same-site from the INITIATOR and the FINAL
+  // target — both the platform here — and an intermediate cross-site hop does
+  // not make the chain cross-site. Strict would have worked on this shape.
+  //
+  // Lax is still right, for reasons that survive the correction: the property
+  // the chain needs is "survives a top-level cross-site GET", which is what Lax
+  // GUARANTEES and Strict does not — the chain merely happens not to exercise
+  // it today, and a tenant app linking back into the platform would. The
+  // measurement is also Chrome-only, exactly as C0's fragment results are.
+  // Full results as Q5 in `docs/plans/2026-08-23-guest-hop-facts.md`.
   c.header(
     'Set-Cookie',
     `${INVITE_COOKIE_NAME}=${token}; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=${INVITE_SESSION_TTL_SECONDS}`
@@ -717,6 +768,10 @@ appAccess.post('/guest-code', async c => {
 
   if (!isValidAppName(appName) || !flowId) {
     return c.json(error(ErrorCodes.VALIDATION_ERROR, 'Invalid sign-in request'), 400);
+  }
+
+  if (!guestAccessEnabled()) {
+    return c.json(error(ErrorCodes.UNAUTHORIZED, 'Not permitted to open this application'), 403);
   }
 
   const cookie = readCookie(c, INVITE_COOKIE_NAME);

@@ -578,7 +578,17 @@ const VALID_USER_ROLES: ReadonlySet<string> = new Set(['admin', 'user', 'readonl
  * the truth to keep in sync for a list that is small by construction.
  */
 export function emailHeldByAnyUser(email: string): boolean {
-  if (!credentials) return false;
+  // THROWS when the store is unreadable, rather than answering "not held".
+  //
+  // Its counterpart `emailHeldByAnyGuest` already argues this polarity at
+  // length: reporting "cannot tell" as "free" PERMITS the parallel identity
+  // the rule exists to refuse. A rule the plan calls "enforced at both ends"
+  // had one end failing open and the other closed, which is worse than either
+  // choice made consistently. `inviteGuest` maps this to the same 503 it gives
+  // for an unreadable guest store.
+  if (!credentials) {
+    throw new Error('Cannot verify address availability — credentials are unavailable.');
+  }
   const target = email.trim().toLowerCase();
   if (!target) return false;
   return credentials.users.some(u => (u.email ?? '').trim().toLowerCase() === target);

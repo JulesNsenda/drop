@@ -525,6 +525,15 @@ admin.put('/settings/guest-invites', async (c) => {
   // because the invite URL comes back on the response in exactly that case,
   // but it is not what an operator flipping this switch expects.
   const warnings: string[] = [];
+  if (!input) {
+    // Said plainly, because the switch does more than its name suggests and an
+    // operator reaching for it in an incident needs to know which.
+    warnings.push(
+      'Guest access is now OFF platform-wide: no new invitations, no redemptions, and every ' +
+        'existing guest session stops opening its app immediately. Nothing is deleted — turning ' +
+        'this back on restores the guests and grants that were already there.'
+    );
+  }
   if (input && !getSettingsManager().getAppSharingEnabled()) {
     warnings.push(
       'Guest invites are enabled, but owner-initiated app sharing is disabled, so no owner can ' +

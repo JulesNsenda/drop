@@ -223,9 +223,19 @@ function GuestInvite() {
 let capturedSecret: string | null = null;
 function readAndScrubFragment(): string {
   if (capturedSecret !== null) return capturedSecret;
-  const raw = window.location.hash.startsWith('#')
-    ? decodeURIComponent(window.location.hash.slice(1))
-    : '';
+  // `decodeURIComponent` THROWS on a stray or truncated `%`, which is exactly
+  // the shape C0 Q2 says a mail-link rewriter may leave behind — and an
+  // uncaught throw in a `useState` initializer blanks the page during render.
+  // That would defeat the incomplete-link message below in the one scenario
+  // the id-in-the-path mitigation exists for.
+  let raw = '';
+  try {
+    raw = window.location.hash.startsWith('#')
+      ? decodeURIComponent(window.location.hash.slice(1))
+      : '';
+  } catch {
+    raw = '';
+  }
   capturedSecret = raw;
   if (raw) {
     try {

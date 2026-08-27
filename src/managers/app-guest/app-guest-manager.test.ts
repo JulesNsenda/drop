@@ -292,14 +292,20 @@ describe('AppGuestManager — guest records', () => {
 
       expect(() => manager.touchLastSeen(created.id)).not.toThrow();
 
-      // `doPersistGuests` awaits a real `fs.mkdir` before the (mocked)
-      // write, so the catch's console.error is an actual event-loop turn
-      // away, not just a microtask — poll with `setImmediate` (which runs
-      // after pending I/O callbacks) rather than a fixed number of
-      // `Promise.resolve()` ticks, which left this logging AFTER the test
-      // (and its temp dir) had already torn down.
-      for (let i = 0; i < 20 && errorSpy.mock.calls.length === 0; i++) {
-        await new Promise((resolve) => setImmediate(resolve));
+      // `doPersistGuests` awaits a real `fs.mkdir` before the (mocked) write,
+      // so the catch's console.error is an actual event-loop turn away, not
+      // just a microtask — a fixed number of `Promise.resolve()` ticks left
+      // this logging AFTER the test (and its temp dir) had torn down.
+      //
+      // Bounded by WALL CLOCK rather than by a turn count. Twenty
+      // `setImmediate` turns is not a duration: it is however long twenty
+      // turns take, which on a loaded box is less than one `fs.mkdir`. That
+      // made this the suite's most frequent false failure once DROP-155 added
+      // enough parallel work to slow the box down. The assertion below is
+      // unchanged — this only waits properly for it.
+      const deadline = Date.now() + 5000;
+      while (errorSpy.mock.calls.length === 0 && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 5));
       }
 
       expect(errorSpy).toHaveBeenCalledWith(

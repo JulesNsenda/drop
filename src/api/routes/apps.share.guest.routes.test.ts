@@ -586,6 +586,130 @@ describe('/apps/:name/share — the guest branch (DROP-155)', () => {
     });
   });
 
+  describe('PATCH /share/guests/:guestId — the admin disable lever', () => {
+    const patchGuest = (guestId: string, headers: Record<string, string>, body: unknown) =>
+      t.hono.request(`/api/v1/apps/${APP}/share/guests/${guestId}`, {
+        method: 'PATCH',
+        headers: { ...headers, 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+
+    const invite = async (email: string) => {
+      await post(bearer(ownerToken), { email, gateApp: true });
+      return getAppGuestManager().listGuests().find(g => g.email === email)!;
+    };
+
+    it('lets an admin disable a guest, stamping the record', async () => {
+      const guest = await invite('v@example.com');
+
+      const res = await patchGuest(guest.id, bearer(adminToken), { disabled: true });
+
+      expect(res.status).toBe(200);
+      const record = getAppGuestManager().getGuestById(guest.id)!;
+      expect(record.disabled).toBe(true);
+      // The stamp is what kills every live session immediately, rather than
+      // waiting out the 8h TTL.
+      expect(record.credentialsInvalidBefore).toBeTruthy();
+      expect(record.disabledBy).toBe(adminId);
+    });
+
+    it('refuses an OWNER', async () => {
+      const guest = await invite('v@example.com');
+
+      const res = await patchGuest(guest.id, bearer(ownerToken), { disabled: true });
+
+      expect(res.status).toBe(403);
+      expect(getAppGuestManager().getGuestById(guest.id)?.disabled).toBe(false);
+    });
+
+    it('is one-way — re-enabling is refused rather than half-supported', async () => {
+      // `credentialsInvalidBefore` is never cleared, so a re-enabled guest
+      // would read as enabled while its old sessions stayed dead: two sources
+      // of truth disagreeing about one person.
+      const guest = await invite('v@example.com');
+      await patchGuest(guest.id, bearer(adminToken), { disabled: true });
+
+      const res = await patchGuest(guest.id, bearer(adminToken), { disabled: false });
+
+      expect(res.status).toBe(400);
+      expect(getAppGuestManager().getGuestById(guest.id)?.disabled).toBe(true);
+    });
+
+    it('is a TOMBSTONE — a re-invite resolves to the same disabled record', async () => {
+      // The whole reason disable exists alongside revoke. Revoking removes the
+      // grant and the owner can re-invite a second later; disabling leaves a
+      // record the owner cannot delete, so the address resolves back to it.
+      const guest = await invite('v@example.com');
+      await patchGuest(guest.id, bearer(adminToken), { disabled: true });
+
+      await post(bearer(ownerToken), { email: 'v@example.com', gateApp: true });
+
+      const records = getAppGuestManager().listGuests().filter(g => g.email === 'v@example.com');
+      expect(records).toHaveLength(1);
+      expect(records[0].id).toBe(guest.id);
+      expect(records[0].disabled).toBe(true);
+    });
+  });
+
+  describe('the sharing toggle, and who it stops', () => {
+    /**
+     * `appSharingEnabled` gates OWNER-INITIATED sharing — that is what the
+     * setting is for and what DROP-153 pinned, including for revoke: an owner
+     * who may no longer share also may not unshare, and governance reverts to
+     * admins. That behaviour is unchanged here.
+     *
+     * What DROP-155 changes is narrower. An ADMIN is not stopped by it on the
+     * routes that TAKE ACCESS AWAY, because an operator who disables the
+     * feature during an incident must not lose every lever for removing one
+     * person. (`DELETE /apps/:name/access` still works for an admin, but it
+     * clears the WHOLE policy.)
+     */
+    it('stops an OWNER revoking, unchanged from DROP-153', async () => {
+      await post(bearer(ownerToken), { email: 'v@example.com', gateApp: true });
+      const guest = getAppGuestManager().listGuests()[0];
+      await getSettingsManager().setAppSharingEnabled(false);
+
+      const res = await delGuest(guest.id, bearer(ownerToken));
+
+      expect(res.status).toBe(403);
+      expect(policy()?.guests).toEqual([guest.id]);
+    });
+
+    it('does NOT stop an ADMIN revoking one guest', async () => {
+      await post(bearer(ownerToken), { email: 'v@example.com', gateApp: true });
+      const guest = getAppGuestManager().listGuests()[0];
+      await getSettingsManager().setAppSharingEnabled(false);
+
+      const res = await delGuest(guest.id, bearer(adminToken));
+
+      expect(res.status).toBe(200);
+      expect(policy()?.guests ?? []).toEqual([]);
+    });
+
+    it('does NOT stop an ADMIN disabling a guest', async () => {
+      await post(bearer(ownerToken), { email: 'v@example.com', gateApp: true });
+      const guest = getAppGuestManager().listGuests()[0];
+      await getSettingsManager().setAppSharingEnabled(false);
+
+      const res = await t.hono.request(`/api/v1/apps/${APP}/share/guests/${guest.id}`, {
+        method: 'PATCH',
+        headers: { ...bearer(adminToken), 'Content-Type': 'application/json' },
+        body: JSON.stringify({ disabled: true }),
+      });
+
+      expect(res.status).toBe(200);
+      expect(getAppGuestManager().getGuestById(guest.id)?.disabled).toBe(true);
+    });
+
+    it('still stops an ADMIN from GRANTING — only removal is exempt', async () => {
+      await getSettingsManager().setAppSharingEnabled(false);
+
+      const res = await post(bearer(adminToken), { email: 'v@example.com', gateApp: true });
+
+      expect(res.status).toBe(403);
+    });
+  });
+
   describe('the other end of the collision rule', () => {
     it('refuses creating a DROP user with an address a guest already holds', async () => {
       await post(bearer(ownerToken), { email: 'v@example.com', gateApp: true });

@@ -33,6 +33,10 @@ import { getAccessLog, resetAccessLog } from '../../managers/access-log/access-l
 import { mintAppSessionToken, mintAppGuestSessionToken } from '../app-access/session-token';
 import { mintAppAccessCode, __resetAppAccessCodes } from '../app-access/flow-code';
 import { getAppGuestManager, resetAppGuests, type GuestRecord } from '../../managers/app-guest';
+import {
+  getSettingsManager,
+  resetSettingsManager,
+} from '../../managers/settings/settings-manager';
 import { sessionCookieName, flowCookieName } from './app-access';
 import { INVITE_COOKIE_NAME } from '../app-access/names';
 
@@ -60,6 +64,7 @@ describe('/app-access — the guest arm (DROP-155)', () => {
     resetAppConfigService();
     resetAccessLog();
     resetAppGuests();
+    resetSettingsManager();
     __resetAppAccessCodes();
     setPublicUrl('https://dashboard.example.com');
 
@@ -84,6 +89,12 @@ describe('/app-access — the guest arm (DROP-155)', () => {
     });
     await getAppGuestManager().load();
 
+    // The DROP-155 operator switch, baked ON for this suite. It defaults OFF,
+    // and every hop below reads it live — so before this line existed the whole
+    // guest arm refused, which is the switch working rather than a harness bug.
+    getSettingsManager({ settingsFilePath: path.join(t.tempDir, 'settings.json') });
+    await getSettingsManager().setGuestInvitesEnabled(true);
+
     const owner = await createUser('owner', 'password123', 'user');
     ownerId = owner.id;
     const allowed = await createUser('allowed', 'password123', 'user');
@@ -104,6 +115,7 @@ describe('/app-access — the guest arm (DROP-155)', () => {
     resetAppConfigService();
     resetAccessLog();
     resetAppGuests();
+    resetSettingsManager();
     await teardownTestApiServer(t);
   });
 
@@ -278,6 +290,102 @@ describe('/app-access — the guest arm (DROP-155)', () => {
       const res = await exchange(code, 'flow-5');
 
       expect(res.status).toBe(403);
+    });
+  });
+
+  describe('guestInvitesEnabled is a KILL SWITCH, not a mint-only gate', () => {
+    /**
+     * Gating only the `{ email }` branch would mean an operator flipping this
+     * off during an incident stops new invitations and nothing else:
+     * unredeemed invites stay redeemable for 24h, redeemed invite cookies for
+     * 10min, and every live guest session for a full 8h — while the admin API
+     * reports `guestInvites.enabled: false`. DROP-153 already had to fix that
+     * exact shape once.
+     */
+    const disable = () => getSettingsManager().setGuestInvitesEnabled(false);
+
+    it('stops admitting a guest who already holds a valid session', async () => {
+      const cookie = await guestCookie();
+      await disable();
+
+      const res = await verify(cookie);
+
+      // TERMINAL, not a redirect: a guest has no account to sign in with, and
+      // the operator turned this off on purpose.
+      expect(res.status).toBe(403);
+      expect(res.headers.get('location')).toBeNull();
+      expect(res.headers.get('x-drop-guest-id')).toBeNull();
+    });
+
+    it('stops redemption of an invite that was already sent', async () => {
+      const invite = await getAppGuestManager().mintInviteToken({
+        appName: APP,
+        guestId: guest.id,
+        email: guest.email,
+        createdBy: ownerId,
+      });
+      await disable();
+
+      const res = await t.hono.request('/api/v1/app-access/invite-redeem', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ id: invite.id, secret: invite.secret }),
+      });
+
+      expect(res.status).toBe(403);
+      // And it did NOT burn the invitation on the way to refusing — turning the
+      // switch back on must restore exactly what was there.
+      await getSettingsManager().setGuestInvitesEnabled(true);
+      const after = await t.hono.request('/api/v1/app-access/invite-redeem', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ id: invite.id, secret: invite.secret }),
+      });
+      expect(after.status).toBe(200);
+    });
+
+    it('stops a redeemed invite cookie from minting a code', async () => {
+      const invite = await getAppGuestManager().mintInviteToken({
+        appName: APP,
+        guestId: guest.id,
+        email: guest.email,
+        createdBy: ownerId,
+      });
+      const redeemed = await t.hono.request('/api/v1/app-access/invite-redeem', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ id: invite.id, secret: invite.secret }),
+      });
+      const cookie = (redeemed.headers.getSetCookie?.() ?? [])
+        .find(v => v.startsWith(`${INVITE_COOKIE_NAME}=`))
+        ?.split(';')[0] as string;
+
+      const flowRes = await verify({ 'x-forwarded-uri': '/' });
+      const flow = ((flowRes.headers.getSetCookie?.() ?? []).find(v =>
+        v.startsWith(`${flowCookieName(APP)}=`)
+      ) as string)
+        .split('=')[1]
+        .split(';')[0];
+
+      await disable();
+
+      const res = await t.hono.request('/api/v1/app-access/guest-code', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', cookie },
+        body: JSON.stringify({ app: APP, flow, return: '/' }),
+      });
+
+      expect(res.status).toBe(403);
+    });
+
+    it('leaves the ACCOUNT-HOLDER arm alone — it gates guests, not the gate', async () => {
+      await setGuests([guest.id], [allowedId]);
+      const token = await mintAppSessionToken(allowedId, 'allowed', APP, origin);
+      await disable();
+
+      const res = await verify({ cookie: `${sessionCookieName(APP)}=${token}` });
+
+      expect(res.status).toBe(204);
     });
   });
 

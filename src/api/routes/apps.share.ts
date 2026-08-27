@@ -127,6 +127,7 @@ import {
   getAppGuestManager,
   normalizeEmail,
   reapGuest,
+  setAppGuestDisabled,
   GuestStoreCorruptError,
   InviteStoreCorruptError,
   InviteCapacityError,
@@ -363,7 +364,11 @@ type ResolvedShareRequest = {
  * carry four different statuses/messages and a flag object would just move
  * that dispatch into every caller.
  */
-async function resolveShareRequest(c: Context, action: string): Promise<ResolvedShareRequest | Response> {
+async function resolveShareRequest(
+  c: Context,
+  action: string,
+  opts: { adminMayBypassToggle?: boolean } = {}
+): Promise<ResolvedShareRequest | Response> {
   const auth = (c.get as (k: string) => AuthContext | undefined)('auth');
 
   const authRefusal = requireAuthForAccessRoutes();
@@ -379,9 +384,28 @@ async function resolveShareRequest(c: Context, action: string): Promise<Resolved
     throw new NotFoundError(`Application '${name}' not found`);
   }
 
-  // Read live on every call — see the file header on why this is a
-  // `getSettingsManager()` read rather than a `runtime-config` accessor.
-  if (!getSettingsManager().getAppSharingEnabled()) {
+  // The `appSharingEnabled` toggle, read live on every call — see the file
+  // header on why this is a `getSettingsManager()` read rather than a
+  // `runtime-config` accessor.
+  //
+  // The toggle gates OWNER-INITIATED sharing — that is what the setting's own
+  // field doc says it is for — so an OWNER sees it on every route here,
+  // including revoke, exactly as DROP-153 decided and pinned. An owner who can
+  // no longer share also cannot unshare; governance reverts to admins, which
+  // is the point of turning it off.
+  //
+  // What an ADMIN may bypass is narrower and is opted into per route: the
+  // routes that TAKE ACCESS AWAY. An operator who disables the feature during
+  // an incident must not simultaneously lose every lever for removing access,
+  // and an admin acting here is not owner-initiated sharing by any reading.
+  // Admins keep `DELETE /apps/:name/access` regardless, but that clears the
+  // WHOLE policy — it is not a way to remove one person.
+  //
+  // Gated by default, and the exemption is admin-only and removal-only: a
+  // future write route that forgets the option inherits the toggle, which is
+  // the safe direction to forget in.
+  const adminBypass = opts.adminMayBypassToggle === true && requester.role === 'admin';
+  if (!adminBypass && !getSettingsManager().getAppSharingEnabled()) {
     return c.json(
       error(ErrorCodes.UNAUTHORIZED, 'Owner-initiated app sharing is disabled on this platform.', {
         reason: 'sharing_disabled',
@@ -397,6 +421,9 @@ async function resolveShareRequest(c: Context, action: string): Promise<Resolved
 
   return { requester, name, app, ops };
 }
+
+/** The routes that TAKE access away, where an ADMIN is not stopped by the owner-sharing toggle. */
+const ADMIN_MAY_BYPASS_TOGGLE = { adminMayBypassToggle: true } as const;
 
 // GET /apps/:name/share — the owner's own view of who has access.
 //
@@ -525,7 +552,17 @@ async function inviteGuest(
   // The INVITE end of the collision rule; `createUser`/`updateUser` hold the
   // other end. Both are needed and the pair is not redundant: a one-directional
   // check is walked past by taking the address from the other side afterwards.
-  if (emailHeldByAnyUser(email)) return refuseAddress('address belongs to a DROP account');
+  try {
+    if (emailHeldByAnyUser(email)) return refuseAddress('address belongs to a DROP account');
+  } catch {
+    // `emailHeldByAnyUser` throws rather than guessing when the credentials
+    // store is unreadable — see its own doc. Same 503 the guest store gets:
+    // we cannot rule out a parallel identity, so we do not create one.
+    return c.json(
+      error(ErrorCodes.SERVICE_UNAVAILABLE, 'Guest records are unavailable right now.'),
+      503
+    );
+  }
 
   // Pre-check, before any guest record exists — the same fast-path shape the
   // username branch uses, and here it has a second job: `resolveOrCreateGuest`
@@ -825,13 +862,19 @@ async function inviteGuest(
   );
 }
 
-// POST /apps/:name/share — grant one person, by username.
+// POST /apps/:name/share — grant one person.
 //
-// `{ username }` ONLY, never `{ email }`: `createUser` enforces no email
-// uniqueness and no verification, so an email is not an identifier in this
-// codebase — resolving one to an existing account would let an attacker on
-// a signup-enabled box register with a colleague's address and receive
-// their shares. The `{ email }` branch (guest access) is a later slice.
+// TWO BRANCHES, dispatched below. `{ username }` grants an existing DROP
+// account; `{ email }` invites someone with no account at all (`inviteGuest`,
+// DROP-155 — see its own doc for why they are siblings rather than one branch
+// with a mode).
+//
+// An email still never resolves to an EXISTING account, and that rule is
+// unchanged: `createUser` enforces no email uniqueness and no verification, so
+// an email is not an identifier in this codebase — resolving one would let an
+// attacker on a signup-enabled box register with a colleague's address and
+// receive their shares. `inviteGuest` REFUSES an address any DROP account
+// holds rather than matching on it.
 shareRoutes.post('/:name/share', async c => {
   const resolved = await resolveShareRequest(c, 'Sharing an app');
   if (resolved instanceof Response) return resolved;
@@ -1053,7 +1096,7 @@ shareRoutes.post('/:name/share', async c => {
 // must always be able to remove a control, including on a box that can no
 // longer enforce it; a stale guard may still be live in Caddy.
 shareRoutes.delete('/:name/share/:userId', async c => {
-  const resolved = await resolveShareRequest(c, 'Revoking an app share');
+  const resolved = await resolveShareRequest(c, 'Revoking an app share', ADMIN_MAY_BYPASS_TOGGLE);
   if (resolved instanceof Response) return resolved;
   const { requester, name, app, ops } = resolved;
   const isAdminCaller = requester.role === 'admin';
@@ -1131,6 +1174,84 @@ shareRoutes.delete('/:name/share/:userId', async c => {
   );
 });
 
+// PATCH /apps/:name/share/guests/:guestId — an ADMIN bars one guest.
+//
+// The lever `setAppGuestDisabled` was written for in wave 1 and that nothing
+// called. Three separate controls were already defending the `disabled` state —
+// the verifiers' live re-read, `credentialsInvalidBefore`, and the
+// only-an-admin-may-delete-a-disabled-record rule on the DELETE below — while
+// no code path could put a guest into it. A governance feature whose governing
+// role is strictly LESS capable than the governed one is the inverse of the
+// posture this whole slice is built on.
+//
+// DISABLE vs REVOKE, and why an admin needs both: revoking removes the grant,
+// and the owner can re-invite the same address a second later. Disabling stamps
+// the record — `credentialsInvalidBefore`, killing every live session
+// immediately — and leaves a tombstone the owner cannot delete, so re-inviting
+// resolves to the SAME disabled record rather than a fresh enabled one.
+//
+// On the same path as the DELETE, so it inherits that path's dedicated bucket
+// and role floor rather than needing a fourth registration in `server.ts`. The
+// admin check is in the handler, matching how every other admin-vs-owner
+// distinction in this file is made. Ungated by `appSharingEnabled` for the same
+// reason the revokes are: an admin taking access away is never blocked by the
+// toggle on owner-initiated sharing.
+shareRoutes.patch('/:name/share/guests/:guestId', async c => {
+  const resolved = await resolveShareRequest(c, 'Disabling a guest', ADMIN_MAY_BYPASS_TOGGLE);
+  if (resolved instanceof Response) return resolved;
+  const { requester, name } = resolved;
+
+  if (requester.role !== 'admin') {
+    return c.json(
+      error(ErrorCodes.UNAUTHORIZED, 'Only an administrator may disable a guest.'),
+      403
+    );
+  }
+
+  const guestId = c.req.param('guestId');
+  if (!guestId || guestId.length > MAX_USER_ID_LENGTH) {
+    throw new ValidationError(`Invalid guest id (max ${MAX_USER_ID_LENGTH} chars)`);
+  }
+
+  const body = (await c.req.json().catch(() => ({}))) as { disabled?: unknown };
+  if (body.disabled !== true) {
+    // Deliberately one-way. `credentialsInvalidBefore` is never cleared (see
+    // `GuestRecord`), so a re-enable would return a guest whose old sessions
+    // stay dead and whose record reads enabled — two sources of truth
+    // disagreeing about the same person. An admin who wants the guest back
+    // deletes the record and lets the owner re-invite.
+    throw new ValidationError('disabled must be true — disabling a guest cannot be undone');
+  }
+
+  let record;
+  try {
+    record = await setAppGuestDisabled(guestId, true, requester.userId);
+  } catch (err) {
+    if (err instanceof GuestStoreCorruptError) {
+      return c.json(
+        error(ErrorCodes.SERVICE_UNAVAILABLE, 'Guest records are unavailable right now.'),
+        503
+      );
+    }
+    throw err;
+  }
+
+  // Same idempotent-no-op posture the revoke routes take, and for the same
+  // oracle reason: an admin is allowed to know, but this shares its shape with
+  // owner-reachable siblings and there is nothing gained by diverging.
+  if (!record) {
+    return c.json(success({ message: `No such guest for '${name}'`, disabled: false }));
+  }
+
+  await logActivityFor(requester, {
+    action: 'guest-revoked',
+    appName: name,
+    detail: `${record.email} (disabled by admin)`,
+  });
+
+  return c.json(success({ message: `Guest disabled for '${name}'`, disabled: true }));
+});
+
 // DELETE /apps/:name/share/guests/:guestId — revoke one guest.
 //
 // A FOUR-segment path, and that is worth stating because it is what makes this
@@ -1145,7 +1266,7 @@ shareRoutes.delete('/:name/share/:userId', async c => {
 // must always be able to remove a control, including on a box that can no
 // longer enforce it.
 shareRoutes.delete('/:name/share/guests/:guestId', async c => {
-  const resolved = await resolveShareRequest(c, 'Revoking a guest');
+  const resolved = await resolveShareRequest(c, 'Revoking a guest', ADMIN_MAY_BYPASS_TOGGLE);
   if (resolved instanceof Response) return resolved;
   const { requester, name, app, ops } = resolved;
   const isAdminCaller = requester.role === 'admin';
@@ -1251,7 +1372,7 @@ shareRoutes.delete('/:name/share/guests/:guestId', async c => {
 // themselves stays admin-only to clear, via DELETE /apps/:name/access,
 // which is the invariant server.ts actually cares about.
 shareRoutes.delete('/:name/share', async c => {
-  const resolved = await resolveShareRequest(c, 'Clearing an app share policy');
+  const resolved = await resolveShareRequest(c, 'Clearing an app share policy', ADMIN_MAY_BYPASS_TOGGLE);
   if (resolved instanceof Response) return resolved;
   const { requester, name, app, ops } = resolved;
   const isAdminCaller = requester.role === 'admin';
