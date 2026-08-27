@@ -14,19 +14,24 @@ import Card from '../components/ui/Card';
  * DEPENDS on that branch, so a guest mode inside it would have to weaken the
  * one behaviour it exists for.
  *
- * ## Why it never mounts the auth provider
+ * ## Why it never CONSULTS the auth provider
  *
- * `main.tsx` renders this page STANDALONE — outside `<App>`, outside
- * `AuthContext`, outside the router. Inside them, `useAuthProvider()` probes
- * `/auth/me` on mount and the app-wide `drop:unauthorized` listener navigates
- * to `/login` when that probe fails. For a guest the probe MUST fail, so the
- * page would be torn off the screen by design before the visitor could press
- * anything.
+ * A PUBLIC route beside `app-access` and `oauth-consent`, handling its own
+ * unauthenticated state exactly as they do — not a second React root outside
+ * the router.
  *
- * It also uses plain `fetch` rather than the shared API client, for the two
- * halves of the same reason: the client attaches a bearer this page must not
- * send, and it fires `drop:unauthorized` on a 401 — an event nothing is
- * listening for here, and which exists to log a user out.
+ * It was briefly the latter, on the belief that a failed `/auth/me` probe
+ * would bounce a guest to `/login` before they could press anything. That is
+ * false: `api/client.ts` fires `drop:unauthorized` only when a token is
+ * PRESENT, and a guest never has one, so the probe simply resolves to
+ * `authenticated: false` and nothing navigates. The standalone mount cost a
+ * page invisible to the 404 route and a hard dependency on one literal
+ * pathname matching the router basename, for a hazard that did not exist.
+ *
+ * It does use plain `fetch` rather than the shared API client, and that part
+ * stands: the client attaches a bearer this page must not send, and it fires
+ * `drop:unauthorized` on a 401 — an event that exists to log a user out, which
+ * is not a thing that can be done to a visitor with no account.
  *
  * ## The two modes
  *
