@@ -28,6 +28,8 @@ import {
   verifyAppSessionToken,
   mintAppGuestSessionToken,
   verifyAppGuestSessionToken,
+  mintAppInviteToken,
+  verifyAppInviteToken,
   SESSION_TTL_SECONDS,
   GUEST_SESSION_TTL_SECONDS,
 } from './session-token';
@@ -278,6 +280,85 @@ describe('app guest session token', () => {
     it('a GUEST session token is refused by the USER verifier', async () => {
       const guestToken = await mint();
       expect(await verifyAppSessionToken(guestToken, ORIGIN, APP)).toBeNull();
+    });
+  });
+});
+
+describe('token_use is checked FIRST, and that is the whole control', () => {
+  /**
+   * This module's header says class-first ordering is what stops the classes
+   * authenticating as each other "on an audience collision". Nothing tested it,
+   * because in normal operation the audiences already differ — a guest SESSION
+   * is audienced to the tenant origin and a redeemed INVITE to the platform
+   * origin, so `aud` separates them without `token_use` ever mattering.
+   *
+   * These two tests construct the collision the doc describes. `app_guest_session`
+   * and `app_guest_invite` carry the SAME `sub`, the SAME `email` and the SAME
+   * `app`; give them the same audience and only the class check is left between
+   * them. One of them opens an application.
+   *
+   * Worth having now that the ordering is single-sourced in
+   * `verifyTokenEnvelope`: the check is one line, and it is the line.
+   */
+  let tempDir: string;
+  let guestId: string;
+
+  beforeEach(async () => {
+    tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'drop-class-collision-'));
+    jest.spyOn(console, 'log').mockImplementation();
+    resetAuth();
+    resetAppGuests();
+    getAppGuestManager({
+      guestsFilePath: path.join(tempDir, 'app-guests.json'),
+      invitesFilePath: path.join(tempDir, 'app-guest-invites.json'),
+    });
+    await getAppGuestManager().load();
+    await initializeAuth({
+      credentialsPath: path.join(tempDir, 'credentials.json'),
+      enableJwt: true,
+      enableApiKeys: true,
+    } as never);
+    const guest = await createAppGuest(APP, 'visitor@example.com', 'owner-1');
+    guestId = guest.id;
+  });
+
+  afterEach(async () => {
+    resetAuth();
+    resetAppGuests();
+    jest.restoreAllMocks();
+    await fs.rm(tempDir, { recursive: true, force: true });
+  });
+
+  it('a redeemed INVITE cannot verify as a guest SESSION, even sharing an audience', async () => {
+    // The invite is minted with the app's own origin as its audience, which is
+    // what a session uses. Everything but `token_use` now matches.
+    const invite = await mintAppInviteToken(guestId, 'visitor@example.com', APP, ORIGIN);
+
+    expect(await verifyAppGuestSessionToken(invite, ORIGIN, APP)).toBeNull();
+  });
+
+  it('a guest SESSION cannot verify as a redeemed invite, either', async () => {
+    const session = await mintAppGuestSessionToken(guestId, 'visitor@example.com', APP, ORIGIN);
+
+    expect(await verifyAppInviteToken(session, ORIGIN)).toBeNull();
+  });
+
+  it('and each still verifies as ITSELF at that audience', async () => {
+    // The control above must refuse the wrong class, not simply refuse
+    // everything — otherwise both assertions would pass with the verifiers
+    // broken.
+    const invite = await mintAppInviteToken(guestId, 'visitor@example.com', APP, ORIGIN);
+    const session = await mintAppGuestSessionToken(guestId, 'visitor@example.com', APP, ORIGIN);
+
+    expect(await verifyAppInviteToken(invite, ORIGIN)).toEqual({
+      guestId,
+      email: 'visitor@example.com',
+      appName: APP,
+    });
+    expect(await verifyAppGuestSessionToken(session, ORIGIN, APP)).toEqual({
+      guestId,
+      email: 'visitor@example.com',
+      appName: APP,
     });
   });
 });

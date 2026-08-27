@@ -150,6 +150,85 @@ export interface AppGuestIdentity {
 export const INVITE_SESSION_TTL_SECONDS = 10 * 60;
 
 /**
+ * The part of every class verifier that is IDENTICAL, extracted once.
+ *
+ * Not a general-purpose abstraction — a deliberately small one covering
+ * exactly the checks whose ORDER is the control this module's header describes,
+ * and stopping before the record-state checks that genuinely differ per class.
+ *
+ * Why extract at all: three verifiers had written this sequence out
+ * independently, and the module doc says the sequence is what stops the classes
+ * authenticating as each other. A control that holds only while three bodies
+ * keep agreeing is one careless reorder from being untrue in one of them, and
+ * the drift would be invisible in review because each function reads correctly
+ * on its own.
+ *
+ * Why stop here rather than take callbacks for the rest: what follows is the
+ * live record lookup and its per-class state rules, and folding those into a
+ * generic would trade a readable straight line for a spec a reviewer has to
+ * hold in their head alongside the implementation. In security code that is a
+ * bad trade. Each verifier keeps its own tail, in the open.
+ *
+ * `expectedApp` is optional because the invite class does not KNOW its app —
+ * reading it is the point — so it returns the claim for the caller to bind.
+ */
+interface TokenEnvelope {
+  /** `sub`. Guaranteed non-empty. */
+  subject: string;
+  /** The `app` claim. Guaranteed non-empty, and equal to `expectedApp` when one was given. */
+  appName: string;
+  /** `iat`, or 0 — for `predatesInvalidationStamp`. */
+  issuedAt: number;
+  /** Every claim, for the per-class extras each verifier reads itself. */
+  claims: Record<string, unknown>;
+}
+
+async function verifyTokenEnvelope(
+  token: string,
+  opts: { tokenUse: string; expectedAudience: string; expectedApp?: string }
+): Promise<TokenEnvelope | null> {
+  const secret = getOAuthTokenSecret();
+  if (!secret) return null;
+
+  try {
+    const { payload } = await jose.jwtVerify(token, secret, { algorithms: ['HS256'] });
+    const p = payload as Record<string, unknown>;
+
+    // CLASS FIRST, before audience — see the module doc. This is the line that
+    // stops one class authenticating as another on an audience collision, and
+    // it is now written once instead of three times.
+    if (p['token_use'] !== opts.tokenUse) return null;
+    if (p['aud'] !== opts.expectedAudience) return null;
+
+    const appName = typeof p['app'] === 'string' ? p['app'] : '';
+    if (!appName) return null;
+    if (opts.expectedApp !== undefined && appName !== opts.expectedApp) return null;
+
+    const subject = typeof p['sub'] === 'string' ? p['sub'] : '';
+    if (!subject) return null;
+
+    // REQUIRED, not optional, for every class: a token without one would skip
+    // the denylist entirely — the only per-session revoker any of them has.
+    const sid = typeof p['sid'] === 'string' ? p['sid'] : '';
+    if (!sid || isGrantDenied(sid)) return null;
+
+    return {
+      subject,
+      appName,
+      issuedAt: typeof p['iat'] === 'number' ? p['iat'] : 0,
+      claims: p,
+    };
+  } catch {
+    return null;
+  }
+}
+
+/** Reads a claim that must be a non-empty string. */
+function stringClaim(claims: Record<string, unknown>, name: string): string {
+  return typeof claims[name] === 'string' ? (claims[name] as string) : '';
+}
+
+/**
  * What a verified, REDEEMED invite proves: this browser spent invite `<id>`
  * for this guest on this app, on the platform origin, within the last
  * `INVITE_SESSION_TTL_SECONDS`.
@@ -162,6 +241,14 @@ export const INVITE_SESSION_TTL_SECONDS = 10 * 60;
  * minting anything. Folding the two together would put a credential that opens
  * an app on the platform's own origin, where every hop of every other flow can
  * see it.
+ *
+ * STRUCTURALLY IDENTICAL to `AppGuestIdentity`, and deliberately so: both state
+ * the same fact — this guest, this app — differing only in which credential
+ * proved it. TypeScript will therefore let one be passed where the other is
+ * expected, and `/invite-redeem` relies on exactly that when it asks
+ * `canOpenGuestSession` about a freshly redeemed invite. The class separation
+ * is enforced at RUNTIME by `token_use`, checked first in every verifier; it is
+ * not, and does not claim to be, a compile-time guarantee.
  */
 export interface AppInviteIdentity {
   guestId: string;
@@ -221,36 +308,28 @@ export async function verifyAppInviteToken(
   token: string,
   expectedAudience: string
 ): Promise<AppInviteIdentity | null> {
-  const secret = getOAuthTokenSecret();
-  if (!secret) return null;
+  // No `expectedApp`: the caller does not know which app the invite names —
+  // reading it is the point — so the claim comes back and the caller binds it.
+  const env = await verifyTokenEnvelope(token, {
+    tokenUse: 'app_guest_invite',
+    expectedAudience,
+  });
+  if (!env) return null;
 
-  try {
-    const { payload } = await jose.jwtVerify(token, secret, { algorithms: ['HS256'] });
-    const p = payload as Record<string, unknown>;
+  const email = stringClaim(env.claims, 'email');
+  if (!email) return null;
 
-    if (p['token_use'] !== 'app_guest_invite') return null;
-    if (p['aud'] !== expectedAudience) return null;
+  // Everything below is a fact the token cannot carry: it was true when the
+  // invite was redeemed and may not be true now.
+  const guest = getAppGuestById(env.subject);
+  if (!guest) return null;
+  // Bound at BOTH ends before the caller sees it: the token's own `app` claim
+  // (checked in the envelope) and the live record's `appName`.
+  if (guest.appName !== env.appName) return null;
+  if (guest.disabled === true) return null;
+  if (predatesInvalidationStamp(env.issuedAt, guest.credentialsInvalidBefore)) return null;
 
-    const guestId = typeof p['sub'] === 'string' ? p['sub'] : '';
-    const email = typeof p['email'] === 'string' ? p['email'] : '';
-    const appName = typeof p['app'] === 'string' ? p['app'] : '';
-    if (!guestId || !email || !appName) return null;
-
-    const sid = typeof p['sid'] === 'string' ? p['sid'] : '';
-    if (!sid || isGrantDenied(sid)) return null;
-
-    const guest = getAppGuestById(guestId);
-    if (!guest) return null;
-    if (guest.appName !== appName) return null;
-    if (guest.disabled === true) return null;
-
-    const iat = typeof p['iat'] === 'number' ? p['iat'] : 0;
-    if (predatesInvalidationStamp(iat, guest.credentialsInvalidBefore)) return null;
-
-    return { guestId, email, appName };
-  } catch {
-    return null;
-  }
+  return { guestId: env.subject, email, appName: env.appName };
 }
 
 /** Mint a session for one user on one app. */
@@ -296,43 +375,24 @@ export async function verifyAppSessionToken(
   expectedAudience: string,
   expectedApp: string
 ): Promise<AppSessionIdentity | null> {
-  const secret = getOAuthTokenSecret();
-  if (!secret) return null;
+  const env = await verifyTokenEnvelope(token, {
+    tokenUse: 'app_session',
+    expectedAudience,
+    expectedApp,
+  });
+  if (!env) return null;
 
-  try {
-    const { payload } = await jose.jwtVerify(token, secret, { algorithms: ['HS256'] });
-    const p = payload as Record<string, unknown>;
+  const username = stringClaim(env.claims, 'username');
+  if (!username) return null;
 
-    // Class first, before audience — the same ordering verifyAppMcpAccessToken
-    // uses, so an audience collision can never let one class authenticate as
-    // another.
-    if (p['token_use'] !== 'app_session') return null;
-    if (p['aud'] !== expectedAudience) return null;
-    if (p['app'] !== expectedApp) return null;
+  // Read the user LIVE. Everything below is a fact the token cannot carry: it
+  // was true when the session was minted and may not be true now.
+  const user = getUserById(env.subject);
+  if (!user) return null;
+  if (user.enabled === false) return null;
+  if (predatesInvalidationStamp(env.issuedAt, user.credentialsInvalidBefore)) return null;
 
-    const userId = typeof p['sub'] === 'string' ? p['sub'] : '';
-    const username = typeof p['username'] === 'string' ? p['username'] : '';
-    if (!userId || !username) return null;
-
-    // REQUIRED, not optional: a token without one would skip the denylist
-    // entirely, which is a hole the current minter cannot reach but the type
-    // allowed.
-    const sid = typeof p['sid'] === 'string' ? p['sid'] : '';
-    if (!sid || isGrantDenied(sid)) return null;
-
-    // Read the user LIVE. Everything below is a fact the token cannot carry:
-    // it was true when the session was minted and may not be true now.
-    const user = getUserById(userId);
-    if (!user) return null;
-    if (user.enabled === false) return null;
-
-    const iat = typeof p['iat'] === 'number' ? p['iat'] : 0;
-    if (predatesInvalidationStamp(iat, user.credentialsInvalidBefore)) return null;
-
-    return { userId, username, appName: expectedApp, role: user.role };
-  } catch {
-    return null;
-  }
+  return { userId: env.subject, username, appName: expectedApp, role: user.role };
 }
 
 /** Mint a session for one guest on one app. */
@@ -383,44 +443,27 @@ export async function verifyAppGuestSessionToken(
   expectedAudience: string,
   expectedApp: string
 ): Promise<AppGuestIdentity | null> {
-  const secret = getOAuthTokenSecret();
-  if (!secret) return null;
+  const env = await verifyTokenEnvelope(token, {
+    tokenUse: 'app_guest_session',
+    expectedAudience,
+    expectedApp,
+  });
+  if (!env) return null;
 
-  try {
-    const { payload } = await jose.jwtVerify(token, secret, { algorithms: ['HS256'] });
-    const p = payload as Record<string, unknown>;
+  const email = stringClaim(env.claims, 'email');
+  if (!email) return null;
 
-    // Class first, before audience — see the module doc comment.
-    if (p['token_use'] !== 'app_guest_session') return null;
-    if (p['aud'] !== expectedAudience) return null;
-    if (p['app'] !== expectedApp) return null;
+  // Read the guest record LIVE. Everything below is a fact the token cannot
+  // carry: it was true when the session was minted and may not be true now.
+  const guest = getAppGuestById(env.subject);
+  if (!guest) return null;
+  // Bound explicitly rather than assumed from the lookup key: if the sibling
+  // store keys guests globally by id, a guest minted for one app must not
+  // verify against a record that has since been re-pointed at, or simply
+  // happens to also exist for, a different app.
+  if (guest.appName !== expectedApp) return null;
+  if (guest.disabled === true) return null;
+  if (predatesInvalidationStamp(env.issuedAt, guest.credentialsInvalidBefore)) return null;
 
-    const guestId = typeof p['sub'] === 'string' ? p['sub'] : '';
-    const email = typeof p['email'] === 'string' ? p['email'] : '';
-    if (!guestId || !email) return null;
-
-    // REQUIRED, not optional — the same reasoning as the user class: a token
-    // without one would skip the denylist entirely, and a guest has fewer
-    // OTHER revokers than a user, so this one cannot be allowed to go missing.
-    const sid = typeof p['sid'] === 'string' ? p['sid'] : '';
-    if (!sid || isGrantDenied(sid)) return null;
-
-    // Read the guest record LIVE. Everything below is a fact the token cannot
-    // carry: it was true when the session was minted and may not be true now.
-    const guest = getAppGuestById(guestId);
-    if (!guest) return null;
-    // Bound explicitly rather than assumed from the lookup key: if the
-    // sibling store keys guests globally by id, a guest minted for one app
-    // must not verify against a record that has since been re-pointed at, or
-    // simply happens to also exist for, a different app.
-    if (guest.appName !== expectedApp) return null;
-    if (guest.disabled === true) return null;
-
-    const iat = typeof p['iat'] === 'number' ? p['iat'] : 0;
-    if (predatesInvalidationStamp(iat, guest.credentialsInvalidBefore)) return null;
-
-    return { guestId, email, appName: expectedApp };
-  } catch {
-    return null;
-  }
+  return { guestId: env.subject, email, appName: expectedApp };
 }
