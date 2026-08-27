@@ -64,6 +64,91 @@ themselves granted, never the admin-authored governance list.
 
 ---
 
+## Inviting someone with no DROP account
+
+An owner can also admit a person who has no account here at all. They receive an
+email, click it, press a button, and are in the app — with no password, no
+signup, and access an owner or admin can take away at any time.
+
+This is a **second** admin toggle, on top of app sharing, and it ships disabled:
+
+```bash
+curl -X PUT https://<your-drop>/api/v1/admin/settings/guest-invites \
+  -H "Authorization: Bearer $ADMIN" -H 'Content-Type: application/json' \
+  -d '{"enabled":true}'
+```
+
+It is separate from `app-sharing` deliberately. That one gates mail to an
+address DROP already holds, put there by an admin at user creation. This one
+lets an owner have DROP send mail to **any address on the internet**, from your
+relay, over your SPF/DKIM alignment. Those are different things to consent to,
+and an operator may reasonably want the first without the second.
+
+Once on, an owner invites at the same route as an ordinary share:
+
+```bash
+curl -X POST https://<your-drop>/api/v1/apps/<app>/share \
+  -H "Authorization: Bearer $OWNER" -H 'Content-Type: application/json' \
+  -d '{"email":"visitor@example.com"}'
+```
+
+**If no SMTP relay is configured, the response carries the invitation link and
+the owner has to deliver it themselves.** The secret exists in plaintext exactly
+once, in that response — nothing stores it — so this is also the only way to
+invite anyone on a platform without mail. When a relay *is* configured the link
+is never returned.
+
+### What an operator should know
+
+- **An invitation is single-use and expires in 24 hours.** A guest session lasts
+  8 hours, the same as an account holder's. There is no self-service re-entry:
+  the recovery path for a lost or expired invitation is the owner pressing
+  **Resend**, which mints a fresh link.
+- **A guest belongs to exactly one app.** The same address invited to a second
+  app is a separate record with a separate grant.
+- **An address cannot be both.** DROP refuses to invite an address that belongs
+  to an account, and refuses to give an account an address a guest holds —
+  otherwise one mailbox would map to two principals with different
+  authorization paths. Both refusals are deliberately vague, because a specific
+  one would let a caller enumerate who is on the platform.
+- **Guest records expire.** Ninety days after a guest last opened the app — or
+  after the invitation was sent, if they never did — the record and its grant
+  are reaped. Set `DROP_GUEST_RETENTION_DAYS` to change the window, or `0` to
+  keep guests indefinitely. This is the only retention DROP applies to guest
+  email; the activity log records guest **ids**, not addresses, so revoking a
+  guest really does remove their address from the platform.
+- **Volume is bounded per person**, not globally: `DROP_MAX_INVITES_PER_HOUR`
+  (10) and `DROP_MAX_INVITES_PER_HOUR_PER_USER` (25). Refused attempts count,
+  so a loop cannot mint for free.
+
+### Revoking, and the difference between revoke and disable
+
+An **owner** can revoke a guest they invited — the grant and the record go, and
+any unredeemed invitation goes with them. Nothing stops them inviting the same
+address again afterwards.
+
+An **admin** can *disable* a guest instead:
+
+```bash
+curl -X PATCH https://<your-drop>/api/v1/apps/<app>/share/guests/<guestId> \
+  -H "Authorization: Bearer $ADMIN" -H 'Content-Type: application/json' \
+  -d '{"disabled":true}'
+```
+
+Disabling ends every live session for that guest immediately and leaves a record
+the owner cannot delete, so re-inviting the address resolves back to the
+disabled one rather than creating a fresh, enabled guest. That is the difference:
+a revoke is an owner changing their mind, a disable is an administrator's
+decision that the owner cannot undo. It is one-way — to reverse it, an admin
+deletes the record and the owner re-invites.
+
+Turning `guest-invites` **off** is a full stop, not just a stop on new
+invitations: unredeemed invitations stop working, and every existing guest
+session stops opening its app. Nothing is deleted, so turning it back on
+restores exactly what was there.
+
+---
+
 ## Turning the whole gate off
 
 `DROP_FEATURE_ACCESS_GATE` (env, boot-time, default **on**) is the operator
@@ -136,17 +221,37 @@ not a session for `app-b`, and it is not a DROP control-plane credential.
 
 ## What the app receives
 
-On an admitted request the app is given two headers:
+On an admitted request the app is given the identity of whoever was let in.
+
+An account holder:
 
 ```
 X-Drop-Session-User-Id: <the DROP user id>
 X-Drop-Session-Username: <their username>
 ```
 
+A guest — a **different header name**, and none of the account-holder ones:
+
+```
+X-Drop-Guest-Id: guest:<uuid>
+```
+
+The names differ so an app tells the two apart by which header arrived, rather
+than by interpreting a value. A guest id is namespaced `guest:` and is not a
+DROP user id; matching one against your own user table finds nothing.
+
 DROP's own cookies and credentials are stripped on the hop to the app, so a
-compromised app cannot harvest them from its own inbound traffic. Client-sent
-copies of those two headers are stripped before DROP sets them, so an app can
-trust them.
+compromised app cannot harvest them from its own inbound traffic. All three
+identity headers are stripped from the incoming request and re-added by DROP
+after it has authenticated, so an app can trust them.
+
+> **One caveat, on apps gated before this feature shipped.** The strip and
+> re-add are written into each app's proxy configuration when its route is
+> emitted. An app whose configuration predates guest support does not strip
+> `X-Drop-Guest-Id`, so a client could send one itself — the app would see the
+> client's value. Such an app receives no *account-holder* headers for a guest
+> either way, so it fails closed rather than confusing a guest for a user. Any
+> deploy, restart or platform reboot re-emits the configuration and closes it.
 
 ---
 
