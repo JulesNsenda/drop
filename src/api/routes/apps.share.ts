@@ -122,6 +122,7 @@ import { gateEnforced } from '../../managers/guardrail/access-gate';
 import { isLocalhostDomain } from '../../utils/domain-validator';
 import { MAX_ACCESS_ALLOW_ENTRIES, MAX_USER_ID_LENGTH, requireAuthForAccessRoutes } from './access-limits';
 import { sendMeteredMail } from './mail-quota';
+import { getInviteQuota } from '../../managers/guardrail/principal-quota';
 import {
   getAppGuestManager,
   normalizeEmail,
@@ -552,6 +553,37 @@ async function inviteGuest(
     );
   }
 
+  // The INVITE quota, stacked on top of the mail one and checked BEFORE
+  // anything is created (see `getInviteQuota`'s own doc for why the existing
+  // caps do not bound this). Charged after the invite is minted, not after the
+  // mail is accepted: when no relay is configured the link comes back on the
+  // response instead, so a counter that only moved on a send would leave the
+  // primitive unbounded on exactly the boxes least likely to notice.
+  const inviteQuota = getInviteQuota();
+  const inviteKeys = inviteQuota.keysFor({
+    principalId: requester.principalId,
+    actorUserId: requester.userId,
+  });
+  if (!inviteKeys.metered) {
+    return c.json(
+      error(ErrorCodes.RATE_LIMITED, 'Invitations are unavailable for this request.'),
+      429
+    );
+  }
+  const inviteAdmission = inviteQuota.check(inviteKeys.keys);
+  if (!inviteAdmission.allowed) {
+    if (inviteAdmission.retryAfterSeconds) {
+      c.header('Retry-After', String(inviteAdmission.retryAfterSeconds));
+    }
+    return c.json(
+      error(
+        ErrorCodes.RATE_LIMITED,
+        'You have sent too many invitations recently. Try again later.'
+      ),
+      429
+    );
+  }
+
   let guest;
   try {
     guest = await getAppGuestManager().resolveOrCreateGuest(email, name, requester.userId);
@@ -676,6 +708,8 @@ async function inviteGuest(
     }
     throw err;
   }
+
+  inviteQuota.record(inviteKeys.keys);
 
   // Id in the PATH, secret in the FRAGMENT — the split C0 recommended, and the
   // reason the mail body carries only the operator's own domain. Built from

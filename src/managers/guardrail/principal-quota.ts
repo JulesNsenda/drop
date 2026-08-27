@@ -139,6 +139,38 @@ function mailOwnerLimit(): number {
   return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_MAIL_OWNER_LIMIT;
 }
 
+/**
+ * Guest invites per principal per window (DROP-155). Tighter than mail, and
+ * that gap is the whole reason this is a third instance rather than a third
+ * caller of the mail one.
+ *
+ * `sendMeteredMail` bounds mail to an address DROP ALREADY HOLDS — put there
+ * by an admin at user creation. The `{ email }` branch takes an arbitrary
+ * address from a request body, which is a different primitive: "send mail to
+ * anyone on the internet, from the operator's SPF/DKIM-aligned relay". The two
+ * deserve different budgets, and sharing one would let ordinary sharing
+ * activity fund invitations to strangers.
+ *
+ * What this is NOT bounded by, and why the existing caps were not enough:
+ * `MAX_LIVE_INVITE_TOKENS_PER_CREATOR` (50) looks like a per-creator bound and
+ * is not one for VOLUME — revoking a guest reaps its invites, so an
+ * invite/revoke/invite loop frees a slot every time and mints without limit.
+ * Only a windowed counter bounds messages sent.
+ */
+const DEFAULT_INVITE_PRINCIPAL_LIMIT = 10;
+/** Guest invites per human per window, across every session and credential they hold. */
+const DEFAULT_INVITE_OWNER_LIMIT = 25;
+
+function invitePrincipalLimit(): number {
+  const raw = parseInt(process.env.DROP_MAX_INVITES_PER_HOUR || '', 10);
+  return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_INVITE_PRINCIPAL_LIMIT;
+}
+
+function inviteOwnerLimit(): number {
+  const raw = parseInt(process.env.DROP_MAX_INVITES_PER_HOUR_PER_USER || '', 10);
+  return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_INVITE_OWNER_LIMIT;
+}
+
 interface QuotaStore {
   /** key -> deploy timestamps (ms), all inside the window. */
   deploys: Record<string, number[]>;
@@ -445,6 +477,55 @@ export function getMailQuota(storePath?: string): PrincipalQuota {
     failClosedWhenFull: true,
   });
   return mailInstance;
+}
+
+let inviteInstance: PrincipalQuota | null = null;
+/** The store path `inviteInstance` was actually constructed with, for the reconfiguration guard. */
+let inviteInstanceStorePath: string | null = null;
+
+/**
+ * The GUEST-INVITE singleton (DROP-155), wired up by `platform.ts`'s `start()`
+ * and flushed in its `stop()` alongside the other two.
+ *
+ * STACKS with the mail quota rather than replacing it — the same shape the
+ * dedicated rate-limit buckets take with the general `/api/*` limiter. An
+ * invite is both "an invitation to a stranger" and "a message through the
+ * operator's relay", and each bound answers a different question.
+ *
+ * Recorded when the INVITE IS MINTED, not when mail is accepted. That is
+ * load-bearing since wave 3c: when no relay is configured the invite link is
+ * returned on the response instead of being mailed, so a counter that only
+ * moved on a successful send would leave the whole primitive unbounded on
+ * exactly the boxes least likely to notice.
+ *
+ * Same two option differences as the mail instance, for the same reasons: no
+ * unmetered branch (an actor with no principal is refused, not waved through),
+ * and fails closed when the tracked-principal table is full.
+ */
+export function getInviteQuota(storePath?: string): PrincipalQuota {
+  const resolvedPath = storePath ?? 'data/drop-svc/invite-quotas.json';
+  if (inviteInstance) {
+    if (storePath !== undefined && resolvedPath !== inviteInstanceStorePath) {
+      throw new Error(
+        `Invite quota already initialized at '${inviteInstanceStorePath}'; ` +
+          `cannot reconfigure to '${resolvedPath}' without resetInviteQuota()`
+      );
+    }
+    return inviteInstance;
+  }
+  inviteInstanceStorePath = resolvedPath;
+  inviteInstance = new PrincipalQuota(resolvedPath, {
+    principalLimit: invitePrincipalLimit(),
+    ownerLimit: inviteOwnerLimit(),
+    unmeteredWithoutPrincipal: false,
+    failClosedWhenFull: true,
+  });
+  return inviteInstance;
+}
+
+export function resetInviteQuota(): void {
+  inviteInstance = null;
+  inviteInstanceStorePath = null;
 }
 
 export function resetMailQuota(): void {

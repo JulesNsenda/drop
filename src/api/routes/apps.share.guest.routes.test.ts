@@ -35,7 +35,12 @@ import {
   type AppAccessPolicy,
 } from '../../managers/app/app-config';
 import { getSettingsManager, resetSettingsManager } from '../../managers/settings/settings-manager';
-import { getMailQuota, resetMailQuota } from '../../managers/guardrail/principal-quota';
+import {
+  getMailQuota,
+  resetMailQuota,
+  getInviteQuota,
+  resetInviteQuota,
+} from '../../managers/guardrail/principal-quota';
 import { setPublicUrl, setApiRuntimeConfig } from '../runtime-config';
 import { getAppGuestManager, resetAppGuests } from '../../managers/app-guest';
 import * as mailer from '../../managers/mailer/mailer';
@@ -105,6 +110,7 @@ describe('/apps/:name/share — the guest branch (DROP-155)', () => {
     resetSettingsManager();
     resetAppGuests();
     resetMailQuota();
+    resetInviteQuota();
 
     t = await createTestApiServer({
       port: 3181,
@@ -131,6 +137,7 @@ describe('/apps/:name/share — the guest branch (DROP-155)', () => {
     await getSettingsManager().setGuestInvitesEnabled(true);
 
     getMailQuota(path.join(t.tempDir, 'mail-quotas.json'));
+    getInviteQuota(path.join(t.tempDir, 'invite-quotas.json'));
     setPublicUrl('https://dashboard.example.com');
     setApiRuntimeConfig({ domainSuffix: 'dropkit.sh' });
     // The default: no relay reachable, so nothing is sent. That is the state
@@ -165,6 +172,7 @@ describe('/apps/:name/share — the guest branch (DROP-155)', () => {
     resetSettingsManager();
     resetAppGuests();
     resetMailQuota();
+    resetInviteQuota();
     resetAuth();
     await teardownTestApiServer(t);
   });
@@ -267,6 +275,65 @@ describe('/apps/:name/share — the guest branch (DROP-155)', () => {
 
       expect(policy()?.guests).toHaveLength(1);
       expect(second.data?.inviteUrl).not.toBe(first.data?.inviteUrl);
+    });
+  });
+
+  describe('the invite quota', () => {
+    it('bounds invitations per hour independently of the mail quota', async () => {
+      // Its OWN budget, tighter than mail's, because the two bound different
+      // primitives: mail to an address DROP already holds, versus mail to an
+      // arbitrary address from a request body.
+      process.env.DROP_MAX_INVITES_PER_HOUR = '2';
+      resetInviteQuota();
+      getInviteQuota(path.join(t.tempDir, 'invite-quotas.json'));
+
+      expect((await post(bearer(ownerToken), { email: 'a@example.com', gateApp: true })).status).toBe(200);
+      expect((await post(bearer(ownerToken), { email: 'b@example.com', gateApp: true })).status).toBe(200);
+      const blocked = await post(bearer(ownerToken), { email: 'c@example.com', gateApp: true });
+
+      expect(blocked.status).toBe(429);
+      // Refused BEFORE anything is created — no third guest record, no third
+      // invite, nothing to clean up.
+      expect(getAppGuestManager().listGuests()).toHaveLength(2);
+
+      delete process.env.DROP_MAX_INVITES_PER_HOUR;
+    });
+
+    it('charges an invitation even when no relay is configured', async () => {
+      // The bug this closes: since wave 3c the link comes back on the response
+      // when mail is `unavailable`, so a counter that only moved on a
+      // successful SEND would leave the whole primitive unbounded on exactly
+      // the boxes least likely to notice. `sendTemplatedMail` is stubbed
+      // `unavailable` for this whole suite, so this is that case.
+      process.env.DROP_MAX_INVITES_PER_HOUR = '1';
+      resetInviteQuota();
+      getInviteQuota(path.join(t.tempDir, 'invite-quotas.json'));
+
+      const first = await post(bearer(ownerToken), { email: 'a@example.com', gateApp: true });
+      expect((await bodyOf(first)).data?.inviteUrl).toBeTruthy();
+      expect((await post(bearer(ownerToken), { email: 'b@example.com', gateApp: true })).status).toBe(429);
+
+      delete process.env.DROP_MAX_INVITES_PER_HOUR;
+    });
+
+    it('is NOT reset by revoking — invite/revoke/invite cannot mint without limit', async () => {
+      // `MAX_LIVE_INVITE_TOKENS_PER_CREATOR` looks like a per-creator bound and
+      // is not one for VOLUME: revoking a guest reaps its invites and frees the
+      // slot. Only a windowed counter bounds messages actually sent, which is
+      // why this quota exists at all rather than leaning on that cap.
+      process.env.DROP_MAX_INVITES_PER_HOUR = '2';
+      resetInviteQuota();
+      getInviteQuota(path.join(t.tempDir, 'invite-quotas.json'));
+
+      await post(bearer(ownerToken), { email: 'a@example.com', gateApp: true });
+      const guest = getAppGuestManager().listGuests()[0];
+      await delGuest(guest.id, bearer(ownerToken));
+      await post(bearer(ownerToken), { email: 'b@example.com', gateApp: true });
+
+      const third = await post(bearer(ownerToken), { email: 'c@example.com', gateApp: true });
+      expect(third.status).toBe(429);
+
+      delete process.env.DROP_MAX_INVITES_PER_HOUR;
     });
   });
 

@@ -72,6 +72,8 @@ import {
   getPrincipalQuota,
   resetPrincipalQuota,
   getMailQuota,
+  getInviteQuota,
+  resetInviteQuota,
   resetMailQuota,
 } from '../managers/guardrail/principal-quota';
 import { isExpired } from '../managers/guardrail/ephemeral';
@@ -881,6 +883,20 @@ export class DropPlatform {
       );
       await getMailQuota(mailQuotaStore).initialize();
 
+      // The GUEST-INVITE quota (DROP-155), same treatment and same reasons as
+      // the two above: anchored under `dropRoot` rather than the process CWD,
+      // and `initialize()`d so a restart does not hand every principal a fresh
+      // allowance. Its own store and its own env vars
+      // (`DROP_MAX_INVITES_PER_HOUR(_PER_USER)`) — see `getInviteQuota` for why
+      // it is a third instance rather than a third caller of the mail one.
+      const inviteQuotaStore = path.join(
+        this.config.dropRoot,
+        'data',
+        'drop-svc',
+        'invite-quotas.json'
+      );
+      await getInviteQuota(inviteQuotaStore).initialize();
+
       // The guest stores (DROP-155), loaded HERE for the same reason the two
       // quotas above are: their default paths resolve against `DROP_ROOT` via
       // the environment rather than this platform's own `dropRoot`, and a box
@@ -1171,6 +1187,17 @@ export class DropPlatform {
       // on a store write.
     }
     resetMailQuota();
+
+    // Flushed BEFORE resetting, same as the two quotas above — an invite
+    // budget that lives only in memory means a restart hands every principal a
+    // fresh allowance, which for an invite-anyone-on-the-internet primitive is
+    // the whole cap.
+    try {
+      await getInviteQuota().flush();
+    } catch {
+      // best-effort; shutdown must not hang on a store write.
+    }
+    resetInviteQuota();
 
     // No flush: every guest-store write is already awaited by its caller
     // before that caller acknowledges anything (the one fire-and-forget path,

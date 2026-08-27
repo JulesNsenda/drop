@@ -399,9 +399,14 @@ describe('/app-access — the guest arm (DROP-155)', () => {
         expect(cookie).toContain('Secure');
         expect(cookie).toContain('HttpOnly');
         expect(cookie).toContain('Path=/');
-        // Lax, NOT Strict, and this is pinned because Strict silently breaks
-        // the chain: the next hop that must carry this cookie is a top-level
-        // GET arriving from the TENANT origin, which Strict drops.
+        // Pinned as a STRING here, which is all a route test can do — the
+        // behaviour it stands for was measured in a real browser instead (see
+        // the route's own comment and the C0 facts doc). Worth being clear
+        // about what this assertion does and does not buy: it catches someone
+        // changing the value, and it proves nothing about what a browser then
+        // does with it. The first version of that browser measurement passed
+        // under EVERY SameSite value, because `page.goto` is browser-initiated
+        // and Chrome treats those navigations as same-site.
         expect(cookie).toContain('SameSite=Lax');
       });
 
