@@ -149,6 +149,19 @@ jobs:
         working-directory: src/dashboard
         run: npm ci
 
+      # DROP-156. The root `Lint` step above is scoped to the server's `src`
+      # and the root eslint.config.js explicitly ignores `src/dashboard/**`, so
+      # without this step the dashboard has NO lint pass and its two design-token
+      # guards would be a config nobody executes.
+      #
+      # `lint` carries a `--max-warnings` ratchet pinned to the exact current
+      # count (see src/dashboard/eslint.config.js) — that ceiling is what makes
+      # the guards build-breaking, so a new violation fails here. Lower the
+      # number as pages migrate; do not raise it.
+      - name: Lint dashboard
+        working-directory: src/dashboard
+        run: npm run lint
+
       - name: Build dashboard
         working-directory: src/dashboard
         run: npm run build

@@ -177,3 +177,63 @@ html.dark .drop-ui {
     box-shadow: 0 0 32px var(--accent);
   }
 }
+
+/* ──────────────────────────────────────────────────────────────────────────
+ * Portal surfaces — DROP-156
+ *
+ * `Toast` and `ConfirmDialog` render as siblings of {children} inside their
+ * providers, and those providers wrap <Routes> in App.tsx — ABOVE AppShell and
+ * AuthLayout, the only two elements carrying `.drop-ui`. So until now these two
+ * components sat OUTSIDE the token scope entirely: every `var(--token)` there
+ * resolved to nothing. That is not a hypothesis, it is why they were the two
+ * worst files in the tree for raw `gray-*`/`drop-*` classes (27 and 19) — the
+ * design system was literally unreachable from them, so they were written
+ * against Tailwind's stock palette instead.
+ *
+ * PRD-045 §2.1 forbids hoisting `.drop-ui` above the route split, so the fix
+ * is to re-establish the scope at each portal root.
+ *
+ * `.dui-portal` is required alongside it: the bare `.drop-ui` rule in
+ * tokens.css sets `background: var(--bg)`, which on a `fixed inset-0` overlay
+ * would paint an opaque full-screen fill over the app. The two-class selector
+ * (0,2,0) outranks it. A Tailwind `bg-transparent` would NOT work here —
+ * index.css is imported before app-ui.css, so app-ui.css wins on source order.
+ */
+.drop-ui.dui-portal {
+  background: transparent;
+}
+
+/* Toast (components/Toast.tsx). Tinted against --panel rather than
+ * transparent, so a toast stays opaque over whatever it covers. */
+.drop-ui .dui-toast {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  box-shadow: var(--elev);
+}
+.drop-ui .dui-toast-success {
+  background: color-mix(in srgb, var(--ok) 12%, var(--panel));
+  border-color: color-mix(in srgb, var(--ok) 35%, var(--border));
+}
+.drop-ui .dui-toast-error {
+  background: color-mix(in srgb, var(--err) 12%, var(--panel));
+  border-color: color-mix(in srgb, var(--err) 35%, var(--border));
+}
+.drop-ui .dui-toast-info {
+  background: color-mix(in srgb, var(--accent) 12%, var(--panel));
+  border-color: color-mix(in srgb, var(--accent) 35%, var(--border));
+}
+
+/* ConfirmDialog (components/ConfirmDialog.tsx) */
+.drop-ui .dui-dialog {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  box-shadow: var(--elev);
+}
+.drop-ui .dui-dialog-icon-danger {
+  background: color-mix(in srgb, var(--err) 15%, transparent);
+  color: var(--err);
+}
+.drop-ui .dui-dialog-icon-default {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
