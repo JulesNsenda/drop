@@ -100,12 +100,23 @@ jobs:
       - name: Build server
         run: npm run build:server
 
-      - name: Test
-        run: npm test
-
+      # BEFORE `Test`, matching _verify.yml. The root jest testMatch is
+      # `**/*.test.ts`, which sweeps up the dashboard's colocated tests too --
+      # and `src/dashboard/src/lib/cn.ts` imports clsx/tailwind-merge, which
+      # live in src/dashboard/node_modules and are NOT in the root lockfile.
+      #
+      # This file deliberately does not call _verify.yml (see the header), so
+      # it carries its own copy of this sequence -- and the ordering fix made
+      # there for DROP-156 did not reach here. The v1.5.0 tag failed on exactly
+      # that: `TS2307: Cannot find module 'clsx'`, after the same fix had
+      # already landed in CI. A duplicated sequence needs the fix applied to
+      # every copy; grep for `npm test` across the workflows when changing it.
       - name: Install dashboard dependencies
         working-directory: src/dashboard
         run: npm ci
+
+      - name: Test
+        run: npm test
 
       - name: Build dashboard
         working-directory: src/dashboard
