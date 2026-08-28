@@ -7,6 +7,7 @@ import { useConfirm } from './ConfirmDialog';
 import Button from './ui/Button';
 import Input from './ui/Input';
 import Card from './ui/Card';
+import { SkeletonText } from './ui/Skeleton';
 import Badge, { BadgeTone } from './ui/Badge';
 
 /**
@@ -324,10 +325,7 @@ function GitWebhooksTab() {
          * post-mutation refresh.
          */}
         {statusLoading && !status ? (
-          <div className="animate-pulse space-y-2">
-            <div className="h-4 w-48 rounded" style={{ background: 'var(--border-2)' }} />
-            <div className="h-4 w-64 rounded" style={{ background: 'var(--border-2)' }} />
-          </div>
+          <SkeletonText label="Loading webhook status" widths={['w-48', 'w-64']} />
         ) : statusError && !status ? (
           <div className="flex items-center justify-between gap-3">
             <p className="text-sm" style={{ color: 'var(--err)' }}>

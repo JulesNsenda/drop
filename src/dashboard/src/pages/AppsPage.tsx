@@ -20,6 +20,7 @@ import StatusBadge from '../components/StatusBadge';
 import Badge, { statusToTone } from '../components/ui/Badge';
 import Button from '../components/ui/Button';
 import Card from '../components/ui/Card';
+import EmptyState from '../components/ui/EmptyState';
 import StatCard from '../components/ui/StatCard';
 
 const STATUS_OPTIONS = ['all', 'running', 'stopped', 'building', 'errored', 'pending'] as const;
@@ -328,20 +329,22 @@ function AppsPage() {
 
       {/* No results from filter */}
       {apps.length > 0 && filteredApps.length === 0 && (
-        <div className="py-12 text-center">
-          <Search className="mx-auto mb-4 h-12 w-12" style={{ color: 'var(--text-3)' }} />
-          <p style={{ color: 'var(--text-2)' }}>No apps match your search</p>
-          <button
-            onClick={() => {
-              setSearch('');
-              setStatusFilter('all');
-            }}
-            className="mt-2 text-sm font-medium"
-            style={{ color: 'var(--accent)' }}
-          >
-            Clear filters
-          </button>
-        </div>
+        <EmptyState
+          icon={Search}
+          title="No apps match your search"
+          action={
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => {
+                setSearch('');
+                setStatusFilter('all');
+              }}
+            >
+              Clear filters
+            </Button>
+          }
+        />
       )}
 
       {/* Apps list */}

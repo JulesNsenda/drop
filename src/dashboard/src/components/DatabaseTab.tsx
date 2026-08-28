@@ -5,6 +5,7 @@ import { useAuth } from '../hooks/useAuth';
 import { useToast } from './Toast';
 import { useConfirm } from './ConfirmDialog';
 import Card from './ui/Card';
+import EmptyState from './ui/EmptyState';
 import {
   Table,
   TableHead,
@@ -535,18 +536,21 @@ function DatabaseTab({ name }: { name: string }) {
 
   if (error) {
     return (
-      <Card className="py-12 text-center">
-        <AlertTriangle className="mx-auto mb-3 h-8 w-8" style={{ color: 'var(--err)' }} />
-        <h3 className="mb-1 text-base font-semibold" style={{ color: 'var(--text)' }}>
-          Couldn&apos;t load the database panel
-        </h3>
-        <p className="mb-4 text-sm" style={{ color: 'var(--text-2)' }}>
-          {error}
-        </p>
-        <Button variant="secondary" onClick={() => load(true)} disabled={refreshing}>
-          <RefreshCw className={`h-4 w-4 ${refreshing ? 'animate-spin' : ''}`} />
-          Retry
-        </Button>
+      <Card padded={false}>
+        <EmptyState
+          icon={AlertTriangle}
+          tone="error"
+          size="sm"
+          titleAs="h3"
+          title="Couldn&apos;t load the database panel"
+          description={error}
+          action={
+            <Button variant="secondary" onClick={() => load(true)} disabled={refreshing}>
+              <RefreshCw className={`h-4 w-4 ${refreshing ? 'animate-spin' : ''}`} />
+              Retry
+            </Button>
+          }
+        />
       </Card>
     );
   }

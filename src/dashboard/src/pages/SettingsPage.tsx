@@ -31,6 +31,7 @@ import UserConnectorTab from '../components/UserConnectorTab';
 import GitWebhooksTab from '../components/GitWebhooksTab';
 import Button from '../components/ui/Button';
 import Card from '../components/ui/Card';
+import { SkeletonText } from '../components/ui/Skeleton';
 import Input from '../components/ui/Input';
 import Badge from '../components/ui/Badge';
 
@@ -86,10 +87,7 @@ function SectionCard({
 
 function SkeletonLines() {
   return (
-    <div className="animate-pulse space-y-3">
-      <div className="h-4 w-48 rounded" style={{ background: 'var(--bg-2)' }} />
-      <div className="h-4 w-36 rounded" style={{ background: 'var(--bg-2)' }} />
-    </div>
+    <SkeletonText label="Loading settings" className="space-y-3" />
   );
 }
 

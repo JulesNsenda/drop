@@ -1,5 +1,6 @@
 import { CheckCircle, XCircle, Circle, GitBranch } from 'lucide-react';
 import { useDeployTimeline, DeployEpisodeDto, DeployStageName } from '../hooks/useApi';
+import { SkeletonText } from './ui/Skeleton';
 
 interface DeployTimelineProps {
   appName: string;
@@ -154,10 +155,7 @@ function DeployTimeline({ appName }: DeployTimelineProps) {
           </div>
         )}
         {loading && episodes.length === 0 ? (
-          <div className="animate-pulse space-y-2">
-            <div className="h-4 w-64 rounded" style={{ background: 'var(--border-2)' }} />
-            <div className="h-4 w-48 rounded" style={{ background: 'var(--border-2)' }} />
-          </div>
+          <SkeletonText label="Loading deploy history" widths={['w-64', 'w-48']} />
         ) : error && episodes.length === 0 ? (
           <div
             className="p-3 border rounded-lg text-sm"

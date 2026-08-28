@@ -5,6 +5,7 @@ import { useToast } from '../components/Toast';
 import Badge from '../components/ui/Badge';
 import Button from '../components/ui/Button';
 import Card from '../components/ui/Card';
+import EmptyState from '../components/ui/EmptyState';
 import { describeAvailability } from '../lib/availability-label';
 import {
   filterCatalog,
@@ -268,20 +269,22 @@ function CatalogPage() {
           this only renders once a catalog actually loaded (extensions.length
           proves that, whether or not a later refresh has since failed). */}
       {!loading && extensions.length > 0 && filtered.length === 0 && (
-        <div className="py-12 text-center">
-          <Package className="mx-auto mb-4 h-12 w-12" style={{ color: 'var(--text-3)' }} />
-          <p style={{ color: 'var(--text-2)' }}>No catalog entries match your search</p>
-          <button
-            onClick={() => {
-              setSearch('');
-              setKind('all');
-            }}
-            className="mt-2 text-sm font-medium"
-            style={{ color: 'var(--accent)' }}
-          >
-            Clear filters
-          </button>
-        </div>
+        <EmptyState
+          icon={Package}
+          title="No catalog entries match your search"
+          action={
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => {
+                setSearch('');
+                setKind('all');
+              }}
+            >
+              Clear filters
+            </Button>
+          }
+        />
       )}
 
       {/* Catalog grid */}

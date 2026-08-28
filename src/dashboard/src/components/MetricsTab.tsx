@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { Activity, Clock, Cpu, Gauge, MemoryStick } from 'lucide-react';
 import type { App } from '../hooks/useApi';
 import Card from './ui/Card';
+import EmptyState from './ui/EmptyState';
 import StatCard from './ui/StatCard';
 
 /** Short client-side rolling window (PRD-048 §1.3 — no long-term history in Phase 1). */
@@ -159,14 +160,14 @@ function MetricsTab({ app }: { app: App }) {
 
   if (!hasLiveMetrics) {
     return (
-      <Card className="py-12 text-center">
-        <Activity className="mx-auto mb-3 h-8 w-8" style={{ color: 'var(--text-3)' }} />
-        <h3 className="mb-1 text-base font-semibold" style={{ color: 'var(--text)' }}>
-          No metrics available
-        </h3>
-        <p className="text-sm" style={{ color: 'var(--text-2)' }}>
-          {unavailableReason(app.status)}
-        </p>
+      <Card padded={false}>
+        <EmptyState
+          icon={Activity}
+          size="sm"
+          titleAs="h3"
+          title="No metrics available"
+          description={unavailableReason(app.status)}
+        />
       </Card>
     );
   }
