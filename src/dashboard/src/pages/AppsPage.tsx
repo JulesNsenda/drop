@@ -8,11 +8,16 @@ import {
   Filter,
   GitBranch,
   Layers,
+  MoreHorizontal,
+  Play,
   RefreshCw,
+  RotateCw,
   Search,
+  Square,
+  Trash2,
   User,
 } from 'lucide-react';
-import { useApps } from '../hooks/useApi';
+import { useApps, appAction, deleteApp } from '../hooks/useApi';
 import type { App } from '../hooks/useApi';
 import { useAuth } from '../hooks/useAuth';
 import { appLinkInfo } from '../api/client';
@@ -22,6 +27,15 @@ import Button from '../components/ui/Button';
 import Card from '../components/ui/Card';
 import EmptyState from '../components/ui/EmptyState';
 import StatCard from '../components/ui/StatCard';
+import {
+  DropdownMenu,
+  DropdownMenuTrigger,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+} from '../components/ui/DropdownMenu';
+import { useToast } from '../components/Toast';
+import { useConfirm } from '../components/ConfirmDialog';
 
 const STATUS_OPTIONS = ['all', 'running', 'stopped', 'building', 'errored', 'pending'] as const;
 
@@ -48,7 +62,54 @@ function formatDate(dateString?: string) {
 }
 
 /** A single app row, shared by the flat (ungrouped) list and grouped sections. */
-function AppListCard({ app, isAdmin }: { app: App; isAdmin: boolean }) {
+function AppListCard({
+  app,
+  isAdmin,
+  onChanged,
+}: {
+  app: App;
+  isAdmin: boolean;
+  onChanged: () => void;
+}) {
+  const { toast } = useToast();
+  const confirmDialog = useConfirm();
+  const [busy, setBusy] = useState<string | null>(null);
+
+  const run = async (action: 'start' | 'stop' | 'restart') => {
+    setBusy(action);
+    try {
+      const okAction = await appAction(app.name, action);
+      toast(okAction ? 'success' : 'error', okAction ? `${app.name}: ${action} requested` : `Failed to ${action} ${app.name}`);
+      if (okAction) onChanged();
+    } catch {
+      toast('error', `Failed to ${action} ${app.name}`);
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const remove = async () => {
+    const confirmed = await confirmDialog({
+      title: `Delete ${app.name}?`,
+      message: 'This removes the app and its routing. Deployed files are not recoverable from here.',
+      confirmText: 'Delete',
+      variant: 'danger',
+    });
+    if (!confirmed) return;
+    setBusy('delete');
+    try {
+      const okDelete = await deleteApp(app.name);
+      toast(okDelete ? 'success' : 'error', okDelete ? `Deleted ${app.name}` : `Failed to delete ${app.name}`);
+      if (okDelete) onChanged();
+    } catch {
+      toast('error', `Failed to delete ${app.name}`);
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const isRunning = app.status === 'running';
+
   return (
     <Link to={`/apps/${app.name}`} className="block">
       <Card className="transition-colors hover:!border-[var(--accent-2)]">
@@ -61,12 +122,12 @@ function AppListCard({ app, isAdmin }: { app: App; isAdmin: boolean }) {
             />
             <div className="min-w-0">
               <div className="flex items-center gap-2">
-                <h3 className="truncate font-semibold" style={{ color: 'var(--text)' }}>
+                <h3 className="truncate font-semibold text-fg">
                   {app.name}
                 </h3>
                 <StatusBadge status={app.status} />
               </div>
-              <p className="truncate text-sm" style={{ color: 'var(--text-3)' }}>
+              <p className="truncate text-sm text-faint">
                 {app.type}
                 {app.framework && ` · ${app.framework}`}
                 {app.port ? ` · :${app.port}` : ''}
@@ -75,8 +136,7 @@ function AppListCard({ app, isAdmin }: { app: App; isAdmin: boolean }) {
           </div>
 
           <div
-            className="flex flex-wrap items-center gap-x-5 gap-y-1 text-sm sm:justify-end"
-            style={{ color: 'var(--text-2)' }}
+            className="flex flex-wrap items-center gap-x-5 gap-y-1 text-sm sm:justify-end text-muted"
           >
             {app.port && app.status === 'running' && (
               <a
@@ -84,23 +144,65 @@ function AppListCard({ app, isAdmin }: { app: App; isAdmin: boolean }) {
                 target="_blank"
                 rel="noopener noreferrer"
                 onClick={e => e.stopPropagation()}
-                className="inline-flex items-center gap-1.5 hover:underline"
-                style={{ color: 'var(--accent)' }}
+                className="inline-flex items-center gap-1.5 hover:underline text-accent"
               >
                 <ExternalLink className="h-3.5 w-3.5" />
                 <span>{appLinkInfo(app).label}</span>
               </a>
             )}
             <span className="inline-flex items-center gap-1.5">
-              <Clock className="h-3.5 w-3.5" style={{ color: 'var(--text-3)' }} />
+              <Clock className="h-3.5 w-3.5 text-faint" />
               {formatDate(app.lastDeployedAt)}
             </span>
             {isAdmin && app.ownerName && (
               <span className="inline-flex items-center gap-1.5">
-                <User className="h-3.5 w-3.5" style={{ color: 'var(--text-3)' }} />
+                <User className="h-3.5 w-3.5 text-faint" />
                 {app.ownerName}
               </span>
             )}
+
+            {/* Row actions. The whole card is a <Link>, so every handler here
+                stops propagation — otherwise opening the menu navigates. */}
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <button
+                  type="button"
+                  aria-label={`Actions for ${app.name}`}
+                  disabled={busy !== null}
+                  onClick={e => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                  }}
+                  className="dui-focus-ring rounded p-1 text-faint transition-colors hover:text-fg focus-visible:outline-none disabled:opacity-50"
+                >
+                  <MoreHorizontal className="h-4 w-4" />
+                </button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent onClick={e => e.stopPropagation()}>
+                {isRunning ? (
+                  <>
+                    <DropdownMenuItem onSelect={() => run('restart')}>
+                      <RotateCw className="h-4 w-4" aria-hidden="true" />
+                      Restart
+                    </DropdownMenuItem>
+                    <DropdownMenuItem onSelect={() => run('stop')}>
+                      <Square className="h-4 w-4" aria-hidden="true" />
+                      Stop
+                    </DropdownMenuItem>
+                  </>
+                ) : (
+                  <DropdownMenuItem onSelect={() => run('start')}>
+                    <Play className="h-4 w-4" aria-hidden="true" />
+                    Start
+                  </DropdownMenuItem>
+                )}
+                <DropdownMenuSeparator />
+                <DropdownMenuItem tone="danger" onSelect={remove}>
+                  <Trash2 className="h-4 w-4" aria-hidden="true" />
+                  Delete
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
           </div>
         </div>
 
@@ -209,10 +311,10 @@ function AppsPage() {
       {/* Header */}
       <div className="mb-6 flex items-center justify-between gap-3">
         <div>
-          <h1 className="text-2xl font-bold" style={{ color: 'var(--text)' }}>
+          <h1 className="text-2xl font-bold text-fg">
             Applications
           </h1>
-          <p style={{ color: 'var(--text-2)' }}>
+          <p className="text-muted">
             {apps.length} app{apps.length !== 1 ? 's' : ''} deployed
           </p>
         </div>
@@ -238,8 +340,7 @@ function AppsPage() {
           {/* Search */}
           <div className="relative max-w-md flex-1">
             <Search
-              className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2"
-              style={{ color: 'var(--text-3)' }}
+              className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-faint"
             />
             <input
               type="text"
@@ -252,7 +353,7 @@ function AppsPage() {
 
           {/* Status filter */}
           <div className="flex flex-wrap items-center gap-2">
-            <Filter className="h-4 w-4" style={{ color: 'var(--text-3)' }} />
+            <Filter className="h-4 w-4 text-faint" />
             <div className="flex flex-wrap gap-1">
               {STATUS_OPTIONS.map(s => (
                 <button
@@ -296,7 +397,7 @@ function AppsPage() {
       {loading && (
         <div className="flex animate-pulse flex-col gap-3" aria-hidden="true">
           {[0, 1, 2].map(i => (
-            <div key={i} className="h-20 rounded-xl" style={{ background: 'var(--bg-2)' }} />
+            <div key={i} className="h-20 rounded-xl bg-surface-2" />
           ))}
         </div>
       )}
@@ -308,15 +409,14 @@ function AppsPage() {
       {!loading && !error && apps.length === 0 && (
         <Card className="mx-auto max-w-lg p-10 text-center">
           <div
-            className="mx-auto mb-6 flex h-16 w-16 items-center justify-center rounded-2xl"
-            style={{ background: 'var(--accent-soft)' }}
+            className="mx-auto mb-6 flex h-16 w-16 items-center justify-center rounded-2xl bg-accent-soft"
           >
-            <GitBranch className="h-8 w-8" style={{ color: 'var(--accent)' }} />
+            <GitBranch className="h-8 w-8 text-accent" />
           </div>
-          <h2 className="mb-2 text-xl font-bold" style={{ color: 'var(--text)' }}>
+          <h2 className="mb-2 text-xl font-bold text-fg">
             Deploy your first app
           </h2>
-          <p className="mb-8 leading-relaxed" style={{ color: 'var(--text-2)' }}>
+          <p className="mb-8 leading-relaxed text-muted">
             Paste a GitHub repo URL and your app will be live in seconds. Supports Node.js, Python,
             Go, static sites, and Docker.
           </p>
@@ -354,10 +454,10 @@ function AppsPage() {
           {groupedSections.map(section => (
             <div key={section.group}>
               <div className="mb-2 flex flex-wrap items-center gap-2">
-                <Layers className="h-4 w-4" style={{ color: 'var(--text-3)' }} />
-                <h2 className="text-sm font-semibold" style={{ color: 'var(--text)' }}>
+                <Layers className="h-4 w-4 text-faint" />
+                <h2 className="text-sm font-semibold text-fg">
                   {section.group}
-                  <span className="font-normal" style={{ color: 'var(--text-3)' }}>
+                  <span className="font-normal text-faint">
                     {' '}
                     · {section.apps.length} service{section.apps.length !== 1 ? 's' : ''}
                   </span>
@@ -365,11 +465,10 @@ function AppsPage() {
                 <Badge tone="neutral">monorepo</Badge>
               </div>
               <div
-                className="flex flex-col gap-3 border-l-2 pl-4"
-                style={{ borderColor: 'var(--border)' }}
+                className="flex flex-col gap-3 border-l-2 pl-4 border-line"
               >
                 {section.apps.map(app => (
-                  <AppListCard key={app.name} app={app} isAdmin={isAdmin} />
+                  <AppListCard key={app.name} app={app} isAdmin={isAdmin} onChanged={refresh} />
                 ))}
               </div>
             </div>
@@ -379,7 +478,7 @@ function AppsPage() {
           {ungroupedApps.length > 0 && (
             <div className="flex flex-col gap-3">
               {ungroupedApps.map(app => (
-                <AppListCard key={app.name} app={app} isAdmin={isAdmin} />
+                <AppListCard key={app.name} app={app} isAdmin={isAdmin} onChanged={refresh} />
               ))}
             </div>
           )}
