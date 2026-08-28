@@ -4,6 +4,7 @@ import Layout from './components/Layout';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import { ToastProvider } from './components/Toast';
 import { ConfirmProvider } from './components/ConfirmDialog';
+import { PortalScopeProvider } from './components/ui/PortalScope';
 import { AuthContext, useAuthProvider } from './hooks/useAuth';
 import { UNAUTHORIZED_EVENT, MUST_CHANGE_PASSWORD_EVENT } from './api/client';
 import AppsPage from './pages/AppsPage';
@@ -46,6 +47,11 @@ function App() {
 
   return (
     <AuthContext.Provider value={auth}>
+      {/* Owns the one `.drop-ui` node that portalled UI mounts into. Must wrap
+          both consumers below: ConfirmProvider reads the container from its
+          context, and it sits ABOVE the layout shells that carry `.drop-ui`,
+          so no shell-provided context could ever reach it. */}
+      <PortalScopeProvider>
       <ToastProvider>
         <ConfirmProvider>
         <ErrorBoundary>
@@ -129,6 +135,7 @@ function App() {
         </ErrorBoundary>
         </ConfirmProvider>
       </ToastProvider>
+      </PortalScopeProvider>
     </AuthContext.Provider>
   );
 }

@@ -142,12 +142,22 @@ jobs:
       - name: Build server
         run: npm run build:server
 
-      - name: Test
-        run: npm test
-
+      # BEFORE `Test`, deliberately (DROP-156). The root jest testMatch is
+      # `**/*.test.ts`, which picks up the dashboard's colocated tests too --
+      # and `src/dashboard/src/lib/cn.ts` imports clsx/tailwind-merge, which
+      # live in src/dashboard/node_modules and are NOT in the root lockfile.
+      # With this step after `Test`, that suite failed to compile in CI while
+      # passing locally, purely because a local checkout already had the
+      # dashboard installed.
+      #
+      # Every other dashboard test is pure TS with no third-party imports, so
+      # this ordering had never mattered before.
       - name: Install dashboard dependencies
         working-directory: src/dashboard
         run: npm ci
+
+      - name: Test
+        run: npm test
 
       # DROP-156. The root `Lint` step above is scoped to the server's `src`
       # and the root eslint.config.js explicitly ignores `src/dashboard/**`, so
