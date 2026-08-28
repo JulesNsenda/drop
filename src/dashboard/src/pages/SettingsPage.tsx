@@ -360,6 +360,7 @@ function SettingsPage() {
         tabs={availableTabs}
         active={activeTab}
         onChange={id => setSearchParams({ tab: id }, { replace: true })}
+        label="Settings sections"
       />
 
       {/* System tab (admin only) */}

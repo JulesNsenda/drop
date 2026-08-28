@@ -669,7 +669,7 @@ function AppDetailPage() {
       )}
 
       {/* Deep-view tabs: Logs / Metrics / Database / Environment / Domains */}
-      <Tabs tabs={DETAIL_TABS} active={activeTab} onChange={setActiveTab} />
+      <Tabs tabs={DETAIL_TABS} active={activeTab} onChange={setActiveTab} label="App sections" />
 
       {activeTab === 'logs' && <LogViewer appName={app.name} appStatus={app.status} />}
 
