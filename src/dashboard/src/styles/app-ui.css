@@ -281,3 +281,47 @@ html.dark .drop-ui {
     animation: none;
   }
 }
+
+/*
+ * Dropdown menu (components/ui/DropdownMenu.tsx) — DROP-156 PR 3b.
+ * Radix ships unstyled; these are the token surfaces. `[data-highlighted]` is
+ * Radix's own hook for the item under keyboard OR pointer focus, so one rule
+ * covers both and the keyboard path is never a second-class citizen.
+ */
+.drop-ui .dui-menu {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  box-shadow: var(--elev);
+}
+.drop-ui .dui-menu-item {
+  color: var(--text);
+}
+.drop-ui .dui-menu-item[data-highlighted] {
+  background: var(--bg-2);
+}
+.drop-ui .dui-menu-item[data-disabled] {
+  color: var(--text-3);
+  cursor: not-allowed;
+}
+.drop-ui .dui-menu-item-danger {
+  color: var(--err);
+}
+.drop-ui .dui-menu-item-danger[data-highlighted] {
+  background: color-mix(in srgb, var(--err) 12%, transparent);
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .drop-ui .dui-menu[data-state='open'] {
+    animation: dui-menu-in 110ms ease-out;
+  }
+  @keyframes dui-menu-in {
+    from {
+      opacity: 0;
+      transform: translateY(-2px) scale(0.98);
+    }
+    to {
+      opacity: 1;
+      transform: none;
+    }
+  }
+}
