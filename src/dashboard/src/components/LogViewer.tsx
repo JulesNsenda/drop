@@ -2,6 +2,7 @@ import { useState, useEffect, useMemo, useRef, ReactNode } from 'react';
 import { Terminal, Download, Copy, Pause, Play, Hammer, ArrowDown } from 'lucide-react';
 import { getAuthHeaders } from '../hooks/useAuth';
 import { useToast } from './Toast';
+import Tooltip from './ui/Tooltip';
 
 type LogTab = 'runtime' | 'build';
 type SourceFilter = 'all' | 'out' | 'err';
@@ -244,14 +245,12 @@ function LogViewer({ appName, appStatus }: { appName: string; appStatus?: string
                 </span>
               </button>
             </div>
-            <button
-              onClick={handleDownload}
-              className={toolButton}
-              title="Download raw logs (last 1000 lines)"
-            >
-              <Download className="w-4 h-4" />
-              Download
-            </button>
+            <Tooltip content="Downloads the last 1000 lines">
+              <button onClick={handleDownload} className={toolButton}>
+                <Download className="w-4 h-4" />
+                Download
+              </button>
+            </Tooltip>
           </div>
         </div>
 
@@ -296,10 +295,12 @@ function LogViewer({ appName, appStatus }: { appName: string; appStatus?: string
               {paused ? <Play className="w-4 h-4" /> : <Pause className="w-4 h-4" />}
               {paused ? 'Resume' : 'Pause'}
             </button>
-            <button onClick={handleCopy} className={toolButton} title="Copy visible lines">
-              <Copy className="w-4 h-4" />
-              Copy
-            </button>
+            <Tooltip content="Copies only the lines currently shown">
+              <button onClick={handleCopy} className={toolButton}>
+                <Copy className="w-4 h-4" />
+                Copy
+              </button>
+            </Tooltip>
             {filtered && (
               <span className="text-xs" style={{ color: 'var(--text-3)' }}>
                 {visible.length} of {parsed.length} fetched lines

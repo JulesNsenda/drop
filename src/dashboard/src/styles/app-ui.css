@@ -325,3 +325,28 @@ html.dark .drop-ui {
     }
   }
 }
+
+/* Tooltip (components/ui/Tooltip.tsx) — DROP-156 PR 4. */
+.drop-ui .dui-tooltip {
+  background: var(--text);
+  color: var(--bg);
+  box-shadow: var(--elev);
+}
+.drop-ui .dui-tooltip-arrow {
+  fill: var(--text);
+}
+@media (prefers-reduced-motion: no-preference) {
+  .drop-ui .dui-tooltip[data-state='delayed-open'] {
+    animation: dui-tooltip-in 110ms ease-out;
+  }
+  @keyframes dui-tooltip-in {
+    from {
+      opacity: 0;
+      transform: scale(0.96);
+    }
+    to {
+      opacity: 1;
+      transform: none;
+    }
+  }
+}
