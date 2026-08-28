@@ -25,6 +25,13 @@
  * flow id exists in two places that an attacker cannot bridge — the victim's
  * own cookie jar for that origin, and the code record — and a code minted in
  * the attacker's flow simply does not match the victim's cookie.
+ *
+ * DROP-155 adds a second identity a code can carry: a guest, authenticated by
+ * an invite token rather than a dashboard bearer. `AppAccessCodeIdentity` is a
+ * discriminated union rather than a shared shape with an optional `guestId` —
+ * see its own doc comment for why `Omit` cannot express this safely. The
+ * exchange must `switch (record.kind)` rather than reach for `record.userId`
+ * unconditionally.
  */
 
 import * as crypto from 'crypto';
@@ -39,9 +46,28 @@ import * as crypto from 'crypto';
  */
 const CODE_TTL_MS = 60_000;
 
-export interface AppAccessCodeRecord {
-  userId: string;
-  username: string;
+/**
+ * WHO the code was minted for — a discriminated union, not a shared shape with
+ * optional fields.
+ *
+ * `Omit<AppAccessCodeRecord, 'expiresAt'>` was the naive shape here, and it is
+ * a trap `Omit` sets on any union: `keyof (A | B)` is the INTERSECTION of the
+ * two variants' keys, not the union of them, so an `Omit` over
+ * `{kind:'user',userId,username} | {kind:'guest',guestId,email}` silently
+ * collapses to `{appName, flowId, returnPath}` — every identity field
+ * vanishes from the mint's parameter type and a guestId-shaped object would
+ * typecheck as a user record. Naming the pieces explicitly (below) is what
+ * keeps `mintAppAccessCode`'s signature honest and keeps a `switch
+ * (record.kind)` at the exchange exhaustive, so a future third case cannot be
+ * forgotten the way a shared `userId` field would have let a guestId slip
+ * into it.
+ */
+export type AppAccessCodeIdentity =
+  | { kind: 'user'; userId: string; username: string }
+  | { kind: 'guest'; guestId: string; email: string };
+
+/** Everything the code carries besides who it was minted for. */
+export interface AppAccessCodeContext {
   appName: string;
   /** Must match the `__Host-drop-flow-<app>` cookie the visitor's browser holds. */
   flowId: string;
@@ -54,8 +80,12 @@ export interface AppAccessCodeRecord {
    * `/oauth/token` takes the same position with `redirect_uri`.
    */
   returnPath: string;
-  expiresAt: number;
 }
+
+/** What `mintAppAccessCode` takes: identity plus context, never merged into one flat shape. */
+export type AppAccessCodeInput = AppAccessCodeContext & AppAccessCodeIdentity;
+
+export type AppAccessCodeRecord = AppAccessCodeInput & { expiresAt: number };
 
 const codes = new Map<string, AppAccessCodeRecord>();
 
@@ -115,8 +145,8 @@ export function consumeFlowId(flowId: string): boolean {
   return expiry !== undefined && expiry > Date.now();
 }
 
-/** Mint a single-use code for one authenticated user in one flow. */
-export function mintAppAccessCode(params: Omit<AppAccessCodeRecord, 'expiresAt'>): string {
+/** Mint a single-use code for one authenticated user OR guest in one flow. */
+export function mintAppAccessCode(params: AppAccessCodeInput): string {
   pruneExpired();
   const code = crypto.randomBytes(32).toString('base64url');
   codes.set(code, { ...params, expiresAt: Date.now() + CODE_TTL_MS });

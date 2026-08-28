@@ -95,6 +95,7 @@ Router (Caddy config)  → Route configured
 - **UploadDeployService** (`src/core/upload-deploy/`): tar-upload deploy path (`POST /api/v1/apps/:name/source`) — extraction is hardened separately in `tar-extract.ts` (path traversal, symlinks, size).
 - **DeployTracker + DeployDetailStore** (`src/managers/deploy-tracker/`): per-deploy history and structured failure detail (`deploys.json` / `deploy-details.json`), served by `/api/v1/deploys`. Both subscribe to the EventBus and are flushed in `platform.stop()`.
 - **Guardrails** (`src/managers/guardrail/`) — the agent-deploy safety layer, see below.
+- **AppGuestManager** (`src/managers/app-guest/`, DROP-155): the GUEST credential class — a person with no DROP account, admitted to exactly one app by redeeming a single-use emailed invitation. Owns guest records *and* invite tokens in one module (same lifetime, same key space, one `platform.ts` init, one `resetAppGuests()`). Both stores fail CLOSED on a corrupt parse, and every cleanup path SKIPS ENTIRELY in that state rather than pruning what it can see — "refuse every guest" plus "prune entries with no backing record" would otherwise turn one unreadable file into permanent deletion of every guest grant on the estate. Records expire on a retention window (`DROP_GUEST_RETENTION_DAYS`, default 90) swept on the platform's 15-minute cadence.
 - **ApiServer** (`src/api/server.ts`): Hono REST API + hosted MCP + dashboard/site static serving (see below).
 - Smaller managers, each `data/`-file backed: `settings/` (runtime-settable platform settings, `settings.json` — loaded *before* `ApiServer` is constructed, which reads `getStoredPublicUrl()` synchronously), `redis/` (bundled Redis server + per-app provisioner, only started when enabled), `build-log/` (per-deploy build stdout/stderr under `data/logs/builds/`), `log-retention/` (prunes captured app logs).
 
@@ -141,7 +142,56 @@ Middleware stack (applied in `setupMiddleware`): security headers → CORS → b
 
 Credential-minting and guessing surfaces get their **own** stricter rate-limit buckets registered *unconditionally* (i.e. even when auth is disabled): `/auth/login`, `/auth/signup`, `/auth/mfa/*`, `/auth/password`, `/auth/agent-tokens`, `POST /auth/users`, `/apps/*/source` (uploads), `/mcp`, `/oauth/*`, `/db/*`, `/apps/*/share` + `/apps/*/share/*`, `POST /admin/mail/test`. These stack with the general `/api/*` limiter rather than replacing it — keep new credential/expensive routes in the same pattern.
 
-**Both path forms, for a route with handlers at two different segment depths.** `/apps/:name/share` (DROP-153) has handlers on the two-segment path (`GET`/`POST /apps/:name/share`) *and* the three-segment one (`DELETE /apps/:name/share/:userId`), so a bucket registered on only one form leaves the other with no dedicated limit — this has been re-derived from scratch twice, so: register `/apps/*/share` **and** `/apps/*/share/*` (and, for auth middleware, the same pair), not just the nested wildcard the way `/apps/*/services` gets away with. One trap the other direction: a *wildcard pair* here double-counts the two-segment form, because `/apps/*/share/*` matches it too once its sibling is registered — that's why the actual rate-limit registration in `server.ts` uses the named-param pair `/apps/:name/share` + `/apps/:name/share/:userId` instead (disjoint path shapes, each request counted once), while the *auth middleware* registration uses the wildcard pair (fine there — `authMiddleware` isn't counting).
+**Both path forms, for a route with handlers at two different segment depths.** `/apps/:name/share` (DROP-153) has handlers on the two-segment path (`GET`/`POST /apps/:name/share`) *and* the three-segment one (`DELETE /apps/:name/share/:userId`), so a bucket registered on only one form leaves the other with no dedicated limit — this has been re-derived from scratch twice, so: register `/apps/*/share` **and** `/apps/*/share/*` (and, for auth middleware, the same pair), not just the nested wildcard the way `/apps/*/services` gets away with. One trap the other direction: a *wildcard pair* here double-counts the two-segment form, because `/apps/*/share/*` matches it too once its sibling is registered — that's why the actual rate-limit registration in `server.ts` uses the named-param pair `/apps/:name/share` + `/apps/:name/share/:userId` instead (disjoint path shapes, each request counted once), and the *auth middleware* registration uses the SAME named-param pair, for a related reason — a wildcard pair ran a second full `authMiddleware` pass (a real jose verification) on every two-segment request. **Since DROP-155 there are THREE forms, not two**: `DELETE /apps/:name/share/guests/:guestId` is a four-segment shape that `:userId` does not match, so it needs its own registration in both places or the guest-revoke route has no bucket and no explicit role floor.
+
+### Credential classes on the gate (`src/api/app-access/session-token.ts`)
+
+Five classes now share one signing secret, and they are kept apart by a
+`token_use` claim **checked before anything else** — before audience, before the
+subject read. That ordering IS the control: `app_guest_session` and
+`app_guest_invite` carry the same `sub`, `email` and `app`, and differ in
+exactly two claims, so on an audience collision only the class check stands
+between them. One of them opens an application.
+
+The sequence (class → audience → app → subject → sid → denylist) lives once, in
+`verifyTokenEnvelope`; each verifier keeps its own live-record tail in the open,
+because folding those behind callbacks would trade a readable straight line for
+a spec a reviewer has to hold in their head. `session-token.test.ts` constructs
+the audience collision deliberately — in normal operation the audiences already
+differ, so nothing would otherwise exercise the check.
+
+`AppInviteIdentity` and `AppGuestIdentity` are structurally identical and
+therefore interchangeable to the compiler. That is fine and deliberate — they
+state the same fact — but it means the class separation is a RUNTIME guarantee,
+not a type-level one. Do not write a comment claiming otherwise.
+
+### The guest hop chain (DROP-155)
+
+The invitation lands on the **platform** host first, never the tenant's:
+
+```
+mail → /api/v1/app-access/invite/<id>#<secret>   (platform, id in path, secret in fragment)
+     → /dashboard/app-invite                      (reads the fragment, scrubs it, needs a GESTURE)
+     → POST /app-access/invite-redeem             (sets __Host-drop-invite on the PLATFORM origin)
+     → the app → /verify → 302 → /authorize       (routes on the invite cookie as a HINT)
+     → POST /app-access/guest-code                (mints an ordinary flow-bound code)
+     → EXCHANGE_PATH                              (the existing hop; membership re-checked)
+```
+
+Three things about it are easy to get wrong:
+
+- **The mail body must contain only the operator's own domain.** An app's
+  hostname is tenant-authored (`domains`/`customDomain`), and putting it in
+  operator-signed mail is a phishing primitive. `renderGuestInvite` enforces
+  the invite URL's origin at render time rather than trusting its caller.
+- **`/authorize`'s page choice is a HINT, not a decision.** That hop carries no
+  credential of any kind, so the invite cookie is visible there and a dashboard
+  bearer (in `localStorage`) is structurally invisible. Deciding precedence
+  there would always favour the invite and strand an account holder holding a
+  stale one. The page enforces "a present bearer wins".
+- **Every redirect in the chain must be fragment-free.** A `Location` carrying
+  its own fragment OVERRIDES the client's, silently destroying the invite
+  secret — measured, and pinned by a test.
 
 ### Agent surfaces: MCP + OAuth (`src/api/mcp/`, `src/api/oauth/`, `mcp-gateway.ts`)
 
@@ -166,7 +216,7 @@ DROP keeps its own state in flat files; PostgreSQL is provisioned only as a serv
 1. **App runtime state** → `AppStateManager`, JSON file at `data/drop-svc/apps.json`. Zero-config status tracking (`pending`/`building`/`running`/`stopped`/`errored`, port, pid).
 2. **Per-app config** → `AppConfigService`, files under `data/appconf/webapps/`. **Source of truth for ports** and persisted deploy metadata. On startup `platform.ts` reconciles: config files > running runtime processes/containers > apps.json.
 
-Other file-backed stores under `data/drop-svc/` (the directory is created `0700` and re-`chmod`ed every boot — it holds plaintext secrets): `secrets.json` (encrypted), `settings.json`, `mail-credential.json` (encrypted, `0600` — the SMTP relay password; DROP-154, see `docs/MAIL.md`), `webhooks.json`, `activity-log.json`, `deploys.json`, `deploy-details.json`, `principal-quotas.json`, `mail-quotas.json` (DROP-154's own `PrincipalQuota` instance — `getMailQuota()`, distinct env vars and store from the deploy one, see `docs/MAIL.md`), `api-credentials.json`, `encryption.key` + `local.key` (auto-generated, `0600`).
+Other file-backed stores under `data/drop-svc/` (the directory is created `0700` and re-`chmod`ed every boot — it holds plaintext secrets): `secrets.json` (encrypted), `settings.json`, `mail-credential.json` (encrypted, `0600` — the SMTP relay password; DROP-154, see `docs/MAIL.md`), `webhooks.json`, `activity-log.json`, `deploys.json`, `deploy-details.json`, `principal-quotas.json`, `mail-quotas.json` (DROP-154's own `PrincipalQuota` instance — `getMailQuota()`, distinct env vars and store from the deploy one, see `docs/MAIL.md`), `invite-quotas.json` (a THIRD `PrincipalQuota` — `getInviteQuota()`, DROP-155; tighter than mail because the `{ email }` branch mails an ARBITRARY address rather than one DROP already holds, and charged when the invite is MINTED so a refused attempt still costs), `app-guests.json` + `app-guest-invites.json` (the guest module's two stores), `api-credentials.json`, `encryption.key` + `local.key` (auto-generated, `0600`).
 
 Writes go through `writeJsonAtomic` (`src/utils/atomic-write.ts`) — use it for any new store rather than a bare `fs.writeFile`.
 

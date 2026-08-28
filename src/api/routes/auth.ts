@@ -99,7 +99,19 @@ auth.post('/signup', async c => {
     if (message.includes('already exists')) {
       return c.json(error(ErrorCodes.CONFLICT, message), 409);
     }
-    return c.json(error(ErrorCodes.INTERNAL_ERROR, message), 500);
+    // NEVER echo an unmatched message on this route. It is UNAUTHENTICATED
+    // wherever `DROP_ALLOW_SIGNUP` is on, and DROP-155 gave `createUser` a
+    // second business-rule throw — the guest email-collision refusal. Echoed,
+    // it let an anonymous caller test addresses one at a time and tell "held
+    // by a guest of some app on this platform" (500 + that exact string) from
+    // "free" (201) and from "username taken" (409): a directory oracle over
+    // guest identities, on the one surface with no credential in front of it,
+    // reopening precisely what `inviteGuest`'s uniform refusal was built to
+    // close.
+    //
+    // Logged server-side so an operator debugging a real failure still has it.
+    console.warn('[auth] signup failed:', message);
+    return c.json(error(ErrorCodes.INTERNAL_ERROR, 'Registration failed'), 500);
   }
 });
 
@@ -460,6 +472,13 @@ auth.put('/users/:id', authMiddleware('admin'), async c => {
     // write itself failing) is an infrastructure error, not bad input, and
     // must fall through to the global error handler rather than be reported
     // to the client as a VALIDATION_ERROR with the raw message attached.
+    // DROP-155 added a SECOND business-rule refusal to `updateUser` (the guest
+    // email collision). Without it here, an admin moving a user onto a guest's
+    // address got a 500 — a security refusal indistinguishable from an outage,
+    // and one they cannot act on.
+    if (err instanceof Error && err.message === 'That email address is not available.') {
+      return c.json(error(ErrorCodes.VALIDATION_ERROR, err.message), 400);
+    }
     if (err instanceof Error && err.message === 'Cannot demote the last admin account') {
       return c.json(error(ErrorCodes.VALIDATION_ERROR, err.message), 400);
     }

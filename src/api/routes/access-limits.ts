@@ -31,6 +31,25 @@ import { isAuthEnabled } from '../middleware/auth';
 export const MAX_ACCESS_ALLOW_ENTRIES = 200;
 
 /**
+ * The same number, under the name that describes what DROP-155 made it bound.
+ *
+ * `MAX_ACCESS_ALLOW_ENTRIES` still means exactly what it says at its ONE
+ * remaining `allow`-only call site: the admin `PUT /apps/:name/access` route
+ * validating the length of an `allow` array in a request body.
+ *
+ * `/apps/:name/share` bounds something else now — `allow.length +
+ * guests.length`, one cap on PEOPLE WITH ACCESS, because two independent caps
+ * would let an owner admit twice as many by alternating between the lists.
+ * Reading `MAX_ACCESS_ALLOW_ENTRIES` there invited the next person raising the
+ * user allow-list to raise the guest ceiling without noticing, and left
+ * `access-limits.ts` describing a bound it no longer only holds.
+ *
+ * An alias rather than a rename: renaming would have made the `apps.ts` use
+ * site wrong instead, which is not an improvement.
+ */
+export const MAX_ADMITTED_PRINCIPALS = MAX_ACCESS_ALLOW_ENTRIES;
+
+/**
  * Per-entry cap. Ids are UUIDs; the bound exists so an unvalidated string
  * cannot be echoed into the refusal message, the error log and a persisted
  * YAML file at body-size scale.

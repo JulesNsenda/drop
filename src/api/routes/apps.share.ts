@@ -98,7 +98,13 @@
 import { Hono, type Context } from 'hono';
 import { success, error, ErrorCodes } from '../types';
 import { NotFoundError, ValidationError } from '../middleware/error';
-import { AuthContext, getUser, getUserById, type SafeUser } from '../middleware/auth';
+import {
+  AuthContext,
+  getUser,
+  getUserById,
+  emailHeldByAnyUser,
+  type SafeUser,
+} from '../middleware/auth';
 import { canAccess, interactiveSessionOnly } from '../access';
 import { getPlatformOps, AppInProgressError, type PlatformOps } from '../platform-ops';
 import { getStateManager, type AppState } from '../../managers/app/state-manager';
@@ -112,11 +118,21 @@ import { getSettingsManager } from '../../managers/settings/settings-manager';
 import { getPublicUrl, getDomainSuffix } from '../runtime-config';
 import { logActivityFor } from '../../managers/activity';
 import { gateEnforced } from '../../managers/guardrail/access-gate';
-import { getMailQuota } from '../../managers/guardrail/principal-quota';
-import { sendTemplatedMail } from '../../managers/mailer/mailer';
+
 import { isLocalhostDomain } from '../../utils/domain-validator';
-import { MAX_ACCESS_ALLOW_ENTRIES, MAX_USER_ID_LENGTH, requireAuthForAccessRoutes } from './access-limits';
-import { checkMailQuota } from './mail-quota';
+import { MAX_ADMITTED_PRINCIPALS, MAX_USER_ID_LENGTH, requireAuthForAccessRoutes } from './access-limits';
+import { sendMeteredMail } from './mail-quota';
+import { getInviteQuota } from '../../managers/guardrail/principal-quota';
+import {
+  getAppGuestManager,
+  normalizeEmail,
+  reapGuest,
+  setAppGuestDisabled,
+  GuestStoreCorruptError,
+  InviteStoreCorruptError,
+  InviteCapacityError,
+  INVITE_TTL_HOURS,
+} from '../../managers/app-guest';
 
 const shareRoutes = new Hono();
 
@@ -204,33 +220,33 @@ async function notifyShareGrant(requester: AuthContext, app: AppState, targetUse
     // logging.
     if (!appUrl || !platformUrl) return;
 
-    // checkMailQuota (mail-quota.ts) — shared with POST /admin/mail/test against
-    // this same singleton. Mail's `keysFor` has no unmetered branch (unlike
-    // deploys) — an absent principal refuses rather than sending unmetered.
-    const admission = checkMailQuota({ principalId: requester.principalId, actorUserId: requester.userId });
-    if (!admission.allowed) {
-      await refuse(`share notification refused: ${admission.reason}`);
+    // sendMeteredMail (mail-quota.ts) — the check -> send -> charge-only-if-dialed
+    // sequence, shared with POST /admin/mail/test against the same quota
+    // singleton. Mail's `keysFor` has no unmetered branch (unlike deploys), so
+    // an absent principal comes back `refused` rather than sending unmetered.
+    const result = await sendMeteredMail(
+      { principalId: requester.principalId, actorUserId: requester.userId },
+      'share-notification',
+      target.email,
+      {
+        appName: app.name,
+        // The GRANTING user, resolved server-side — never anything from the
+        // request body. `requester.userId` is exactly the id this grant just
+        // stamped into `grantedBy` for `targetUserId`.
+        sharerName: getUserById(requester.userId)?.username ?? requester.username,
+        appUrl,
+        platformUrl,
+      }
+    );
+
+    if (result.status === 'refused') {
+      await refuse(`share notification refused: ${result.reason}`);
       return;
     }
-
-    const result = await sendTemplatedMail('share-notification', target.email, {
-      appName: app.name,
-      // The GRANTING user, resolved server-side — never anything from the
-      // request body. `requester.userId` is exactly the id this grant just
-      // stamped into `grantedBy` for `targetUserId`.
-      sharerName: getUserById(requester.userId)?.username ?? requester.username,
-      appUrl,
-      platformUrl,
-    });
-
-    // Charge the allowance only once the relay was actually dialed — an
-    // unconfigured relay (`status: 'unavailable'`) never contacts anything,
-    // and counting it against the quota would refuse the first REAL sends
-    // once an operator finally configures mail (Gate 2 finding). POST
-    // /admin/mail/test now follows this same rule (Gate 5 — it used to
-    // record before sending).
+    // `unavailable` is local config (no relay host/from/credential) or an
+    // input the mailer refused — nothing was dialed and nothing was charged.
+    // Not a refusal worth logging on a box that simply has no mail set up.
     if (result.status === 'unavailable') return;
-    getMailQuota().record(admission.keys);
     if (result.failure) {
       // ADMIN-FACING ONLY (`MailFailureDetail`'s own doc comment) — logged
       // for whoever reads the activity log, never surfaced on this
@@ -248,7 +264,11 @@ async function notifyShareGrant(requester: AuthContext, app: AppState, targetUse
 function ownView(
   access: AppAccessPolicy | undefined,
   requesterUserId: string
-): { ownGrants: { userId: string; username?: string }[]; othersGrantedCount: number } {
+): {
+  ownGrants: { userId: string; username?: string }[];
+  ownGuests: { guestId: string; email: string; disabled: boolean }[];
+  othersGrantedCount: number;
+} {
   const grantedBy = access?.grantedBy ?? {};
   const ownGrants: { userId: string; username?: string }[] = [];
   let othersGrantedCount = 0;
@@ -259,7 +279,49 @@ function ownView(
       othersGrantedCount += 1;
     }
   }
-  return { ownGrants, othersGrantedCount };
+
+  // Guests are counted by the SAME rule and into the SAME "everyone else"
+  // number (DROP-155). The alternative — a separate `othersGuestCount` — would
+  // report an app gated by an admin and populated entirely with
+  // admin-invited guests as having nobody else on it, which is exactly the
+  // disclosure asymmetry `grantedBy` exists to prevent, reintroduced on the
+  // second list.
+  //
+  // A guest's own EMAIL is returned to whoever invited them, and only to them:
+  // it is the only handle an owner has for a person with no username, so
+  // "revoke the person I invited" is otherwise unreachable. Someone else's
+  // invitee stays a count, exactly like someone else's grant.
+  const guestGrantedBy = access?.guestGrantedBy ?? {};
+  const ownGuests: { guestId: string; email: string; disabled: boolean }[] = [];
+  for (const guestId of access?.guests ?? []) {
+    if (guestGrantedBy[guestId] !== requesterUserId) {
+      othersGrantedCount += 1;
+      continue;
+    }
+    const record = getAppGuestManager().getGuestById(guestId);
+    // A grant with no backing record is stale (the boot sweep prunes these).
+    // Reported with the id alone rather than dropped, so an owner can still
+    // revoke something they can see.
+    ownGuests.push({
+      guestId,
+      email: record?.email ?? '',
+      disabled: record?.disabled === true,
+    });
+  }
+
+  return { ownGrants, ownGuests, othersGrantedCount };
+}
+
+/**
+ * How many PEOPLE this policy admits — account holders and guests together.
+ *
+ * One bound on one thing, rather than two independent caps. The cap exists to
+ * keep a policy small enough to reason about and to bound the work every
+ * `/verify` does; neither of those cares which list a principal is on, and two
+ * separate caps would let an owner admit twice as many people by alternating.
+ */
+function admittedCount(access: AppAccessPolicy | undefined): number {
+  return (access?.allow.length ?? 0) + (access?.guests?.length ?? 0);
 }
 
 type GrantIneligibleReason = 'unknown-user' | 'owner' | 'admin' | 'suspended';
@@ -302,7 +364,11 @@ type ResolvedShareRequest = {
  * carry four different statuses/messages and a flag object would just move
  * that dispatch into every caller.
  */
-async function resolveShareRequest(c: Context, action: string): Promise<ResolvedShareRequest | Response> {
+async function resolveShareRequest(
+  c: Context,
+  action: string,
+  opts: { adminMayBypassToggle?: boolean } = {}
+): Promise<ResolvedShareRequest | Response> {
   const auth = (c.get as (k: string) => AuthContext | undefined)('auth');
 
   const authRefusal = requireAuthForAccessRoutes();
@@ -318,9 +384,28 @@ async function resolveShareRequest(c: Context, action: string): Promise<Resolved
     throw new NotFoundError(`Application '${name}' not found`);
   }
 
-  // Read live on every call — see the file header on why this is a
-  // `getSettingsManager()` read rather than a `runtime-config` accessor.
-  if (!getSettingsManager().getAppSharingEnabled()) {
+  // The `appSharingEnabled` toggle, read live on every call — see the file
+  // header on why this is a `getSettingsManager()` read rather than a
+  // `runtime-config` accessor.
+  //
+  // The toggle gates OWNER-INITIATED sharing — that is what the setting's own
+  // field doc says it is for — so an OWNER sees it on every route here,
+  // including revoke, exactly as DROP-153 decided and pinned. An owner who can
+  // no longer share also cannot unshare; governance reverts to admins, which
+  // is the point of turning it off.
+  //
+  // What an ADMIN may bypass is narrower and is opted into per route: the
+  // routes that TAKE ACCESS AWAY. An operator who disables the feature during
+  // an incident must not simultaneously lose every lever for removing access,
+  // and an admin acting here is not owner-initiated sharing by any reading.
+  // Admins keep `DELETE /apps/:name/access` regardless, but that clears the
+  // WHOLE policy — it is not a way to remove one person.
+  //
+  // Gated by default, and the exemption is admin-only and removal-only: a
+  // future write route that forgets the option inherits the toggle, which is
+  // the safe direction to forget in.
+  const adminBypass = opts.adminMayBypassToggle === true && requester.role === 'admin';
+  if (!adminBypass && !getSettingsManager().getAppSharingEnabled()) {
     return c.json(
       error(ErrorCodes.UNAUTHORIZED, 'Owner-initiated app sharing is disabled on this platform.', {
         reason: 'sharing_disabled',
@@ -336,6 +421,9 @@ async function resolveShareRequest(c: Context, action: string): Promise<Resolved
 
   return { requester, name, app, ops };
 }
+
+/** The routes that TAKE access away, where an ADMIN is not stopped by the owner-sharing toggle. */
+const ADMIN_MAY_BYPASS_TOGGLE = { adminMayBypassToggle: true } as const;
 
 // GET /apps/:name/share — the owner's own view of who has access.
 //
@@ -353,7 +441,7 @@ shareRoutes.get('/:name/share', async c => {
   const { requester, name, app, ops } = resolved;
 
   const access = getAppConfigServiceOrNull()?.getConfig(name)?.access;
-  const { ownGrants, othersGrantedCount } = ownView(access, requester.userId);
+  const view = ownView(access, requester.userId);
 
   const verdict = await ops.assessAccessGate(name);
   const policyPresent = access !== undefined;
@@ -365,8 +453,11 @@ shareRoutes.get('/:name/share', async c => {
       // same distinction admin's GET /access reports, and the read the kill
       // switch exists to make truthful.
       enforced: gateEnforced(verdict, policyPresent),
-      ownGrants,
-      othersGrantedCount,
+      // SPREAD, never a hand-picked pair. `ownView` grew `ownGuests` in
+      // DROP-155 and every field it returns is part of the caller's own view
+      // by construction — re-listing them here is how one gets silently
+      // dropped from a response while the helper looks correct.
+      ...view,
       // The platform's own record of whether the last route emission
       // actually installed the guard — without it, an owner whose first
       // share failed to apply has no signal, and the app reads as shared
@@ -378,13 +469,420 @@ shareRoutes.get('/:name/share', async c => {
   );
 });
 
-// POST /apps/:name/share — grant one person, by username.
+/** RFC-5321's practical ceiling for a whole address. */
+const MAX_EMAIL_LENGTH = 254;
+
+/**
+ * Deliberately conservative, and deliberately NOT an attempt at RFC 5322.
+ *
+ * This value becomes the `To:` header of mail sent from the operator's own
+ * SPF/DKIM-aligned relay, so the question is not "could a standards-compliant
+ * mail server route this" but "is this unambiguously one plain address". Quoted
+ * local parts, comments and address lists are all legal RFC 5322 and all things
+ * this must never hand to nodemailer, which fans a list out to every address it
+ * finds. `mailer.ts` re-checks separately — that is a backstop, not a licence
+ * for this to be loose.
+ */
+const EMAIL_PATTERN = /^[^\s@,;<>"'\\]+@[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$/;
+
+/**
+ * The `{ email }` branch: invite someone with NO DROP account (DROP-155).
+ *
+ * A sibling of the `{ username }` path rather than a mode inside it. The two
+ * resolve different kinds of principal into different lists, with different
+ * provenance maps and different revoke routes — the only thing they genuinely
+ * share is the policy write, and that is shared by calling the same writer.
+ *
+ * THE REFUSALS ARE UNIFORM ON PURPOSE. Whether an address belongs to a DROP
+ * user, is already a guest elsewhere, or has never been seen, the caller gets
+ * one message. An owner who could tell those apart would have a directory
+ * oracle over every account on the platform, one address at a time — the same
+ * reason `refuseGrantTarget` collapses its four reasons into one.
+ */
+async function inviteGuest(
+  c: Context,
+  resolved: ResolvedShareRequest,
+  rawEmail: unknown,
+  gateApp: boolean
+): Promise<Response> {
+  const { requester, name, app, ops } = resolved;
+  const isAdminCaller = requester.role === 'admin';
+
+  // The operator opt-in, read LIVE — same posture as `appSharingEnabled`
+  // above, and for the same restart-to-flip-a-toggle reason.
+  if (!getSettingsManager().getGuestInvitesEnabled()) {
+    return c.json(
+      error(
+        ErrorCodes.UNAUTHORIZED,
+        'Inviting people without a DROP account is disabled on this platform.',
+        { reason: 'guest_invites_disabled' }
+      ),
+      403
+    );
+  }
+
+  if (typeof rawEmail !== 'string' || rawEmail.trim().length === 0) {
+    throw new ValidationError('email is required');
+  }
+  const email = normalizeEmail(rawEmail);
+  if (email.length > MAX_EMAIL_LENGTH || !EMAIL_PATTERN.test(email)) {
+    throw new ValidationError('email is not a valid single email address');
+  }
+
+  const platformUrl = getPublicUrl();
+  if (!platformUrl) {
+    return c.json(
+      error(
+        ErrorCodes.CONFLICT,
+        'This platform has no public URL configured, so an invitation link cannot be built.'
+      ),
+      409
+    );
+  }
+
+  /** The ONE refusal every ineligible address gets. See this function's doc. */
+  const refuseAddress = (reason: string): Response => {
+    console.warn(`[apps.share] guest invite on '${name}' refused: ${reason}`);
+    return c.json(
+      error(ErrorCodes.VALIDATION_ERROR, `'${email}' cannot be invited to '${name}'.`),
+      400
+    );
+  };
+
+  // The INVITE end of the collision rule; `createUser`/`updateUser` hold the
+  // other end. Both are needed and the pair is not redundant: a one-directional
+  // check is walked past by taking the address from the other side afterwards.
+  try {
+    if (emailHeldByAnyUser(email)) return refuseAddress('address belongs to a DROP account');
+  } catch {
+    // `emailHeldByAnyUser` throws rather than guessing when the credentials
+    // store is unreadable — see its own doc. Same 503 the guest store gets:
+    // we cannot rule out a parallel identity, so we do not create one.
+    return c.json(
+      error(ErrorCodes.SERVICE_UNAVAILABLE, 'Guest records are unavailable right now.'),
+      503
+    );
+  }
+
+  // Pre-check, before any guest record exists — the same fast-path shape the
+  // username branch uses, and here it has a second job: `resolveOrCreateGuest`
+  // below CREATES a record, and a record created for a grant that then gets
+  // refused would sit inert but still hold the address against the collision
+  // rule. The authoritative re-check still happens inside the write closure.
+  const preAccess = getAppConfigServiceOrNull()?.getConfig(name)?.access;
+  if (preAccess === undefined && !gateApp) {
+    return c.json(
+      error(
+        ErrorCodes.CONFLICT,
+        `'${name}' is not gated yet. Sharing it will make it sign-in-only for everyone else — ` +
+          `resend with { "gateApp": true } to confirm.`
+      ),
+      409
+    );
+  }
+  if (admittedCount(preAccess) >= MAX_ADMITTED_PRINCIPALS) {
+    return c.json(
+      error(
+        ErrorCodes.CONFLICT,
+        `'${name}' already has ${MAX_ADMITTED_PRINCIPALS} people with access — remove someone before adding another.`
+      ),
+      409
+    );
+  }
+
+  // The INVITE quota, stacked on top of the mail one and checked BEFORE
+  // anything is created (see `getInviteQuota`'s own doc for why the existing
+  // caps do not bound this). Charged after the invite is minted, not after the
+  // mail is accepted: when no relay is configured the link comes back on the
+  // response instead, so a counter that only moved on a send would leave the
+  // primitive unbounded on exactly the boxes least likely to notice.
+  const inviteQuota = getInviteQuota();
+  const inviteKeys = inviteQuota.keysFor({
+    principalId: requester.principalId,
+    actorUserId: requester.userId,
+  });
+  if (!inviteKeys.metered) {
+    return c.json(
+      error(ErrorCodes.RATE_LIMITED, 'Invitations are unavailable for this request.'),
+      429
+    );
+  }
+  const inviteAdmission = inviteQuota.check(inviteKeys.keys);
+  if (!inviteAdmission.allowed) {
+    if (inviteAdmission.retryAfterSeconds) {
+      c.header('Retry-After', String(inviteAdmission.retryAfterSeconds));
+    }
+    return c.json(
+      error(
+        ErrorCodes.RATE_LIMITED,
+        'You have sent too many invitations recently. Try again later.'
+      ),
+      429
+    );
+  }
+  // RESERVED HERE, in the same synchronous breath as the check — not after the
+  // invite is minted, which is where this used to be.
+  //
+  // Two defects, one line. `check` and `record` were separated by three
+  // `await`s, so N concurrent requests all passed the check before any of them
+  // recorded: the 10/hour bound admitted a burst of whatever the per-IP limiter
+  // allowed. And every refusal arm below returned without recording at all, so
+  // an attacker who could reach one deterministically — the per-creator invite
+  // cap does exactly that — could loop unmetered forever.
+  //
+  // An ATTEMPT is the thing worth bounding here, not a success: the primitive
+  // is "make DROP's relay try to mail a stranger", and a refused attempt has
+  // already cost the work of getting there.
+  inviteQuota.record(inviteKeys.keys);
+
+  // Whether THIS request creates the record, so the abandonment paths below
+  // know what they are allowed to clean up. A pre-existing guest belongs to an
+  // earlier, possibly still-live grant and must never be reaped by a failed
+  // re-invite.
+  const preExisting = getAppGuestManager().getGuestByEmail(email, name) !== undefined;
+
+  let guest;
+  try {
+    guest = await getAppGuestManager().resolveOrCreateGuest(email, name, requester.userId);
+  } catch (err) {
+    if (err instanceof GuestStoreCorruptError) {
+      return c.json(
+        error(ErrorCodes.SERVICE_UNAVAILABLE, 'Guest records are unavailable right now.'),
+        503
+      );
+    }
+    throw err;
+  }
+
+  /**
+   * Undo the record this request created, on every path that ends without a
+   * grant.
+   *
+   * Without this, a refusal AFTER `resolveOrCreateGuest` leaves a `GuestRecord`
+   * that no route can reach: the guest-revoke route short-circuits on "not on
+   * this app's list", and the boot sweep only prunes policy entries with no
+   * record, never records with no policy entry. Because `emailHeldByAnyGuest`
+   * is GLOBAL and now blocks `createUser`/`updateUser`, each orphan
+   * permanently denies that address to any DROP account — so an owner could
+   * squat addresses, including an admin's, by inviting during a deploy and
+   * reading the 409. Reachable at will; the only exit was deleting the app.
+   *
+   * Best-effort and never fails the response: the refusal the caller is about
+   * to receive is already correct, and a cleanup that throws must not turn it
+   * into a 500.
+   */
+  const abandonGuest = async (): Promise<void> => {
+    if (preExisting) return;
+    try {
+      await reapGuest(guest.id);
+    } catch (err) {
+      console.warn(
+        `[apps.share] could not reap abandoned guest for '${name}':`,
+        err instanceof Error ? err.message : err
+      );
+    }
+  };
+
+  type InviteOutcome = 'invited' | 'already-invited' | 'cap-exceeded' | 'needs-confirmation';
+  const invite: { outcome: InviteOutcome; hadPolicyBefore: boolean; adminAuthoredCount?: number } = {
+    outcome: 'invited',
+    hadPolicyBefore: false,
+  };
+
+  const updatedConfig = await getAppConfigService().setAccessPolicy(name, existing => {
+    const current = existing.access;
+    invite.hadPolicyBefore = current !== undefined;
+
+    // Read at write EXECUTION time, never from the snapshot above — an admin's
+    // DELETE /access landing between the pre-check and here must be seen, or
+    // this silently re-installs the guard they just removed.
+    if (current === undefined && !gateApp) {
+      invite.outcome = 'needs-confirmation';
+      return NO_CHANGE;
+    }
+
+    const guests = current?.guests ?? [];
+    // Idempotent re-invite short-circuits BEFORE the cap, exactly as the
+    // username branch does: re-inviting someone already on the list at exactly
+    // the cap must still work (it mints a fresh invite, which is the whole
+    // point of a resend).
+    if (guests.includes(guest.id)) {
+      invite.outcome = 'already-invited';
+      return NO_CHANGE;
+    }
+    if (admittedCount(current) >= MAX_ADMITTED_PRINCIPALS) {
+      invite.outcome = 'cap-exceeded';
+      const grantedByMap = current?.grantedBy ?? {};
+      const guestGrantedByMap = current?.guestGrantedBy ?? {};
+      invite.adminAuthoredCount =
+        (current?.allow ?? []).filter(id => grantedByMap[id] !== requester.userId).length +
+        guests.filter(id => guestGrantedByMap[id] !== requester.userId).length;
+      return NO_CHANGE;
+    }
+
+    return {
+      mode: 'drop-users',
+      allow: current?.allow ?? [],
+      grantedBy: current?.grantedBy,
+      guests: [...guests, guest.id],
+      guestGrantedBy: { ...(current?.guestGrantedBy ?? {}), [guest.id]: requester.userId },
+    };
+  });
+
+  if (!updatedConfig) {
+    await abandonGuest();
+    return c.json(
+      error(
+        ErrorCodes.CONFLICT,
+        `Application '${name}' is still being deployed — try again once it has finished.`
+      ),
+      409
+    );
+  }
+  if (invite.outcome === 'needs-confirmation') {
+    await abandonGuest();
+    return c.json(
+      error(
+        ErrorCodes.CONFLICT,
+        `'${name}' is not gated yet. Sharing it will make it sign-in-only for everyone else — ` +
+          `resend with { "gateApp": true } to confirm.`
+      ),
+      409
+    );
+  }
+  if (invite.outcome === 'cap-exceeded') {
+    await abandonGuest();
+    const adminAuthoredCount = invite.adminAuthoredCount ?? 0;
+    const advice =
+      adminAuthoredCount > 0
+        ? `${adminAuthoredCount} of them granted by an administrator — ask an admin to remove one, or revoke someone you invited yourself.`
+        : 'remove someone before adding another.';
+    return c.json(
+      error(
+        ErrorCodes.CONFLICT,
+        `'${name}' already has ${MAX_ADMITTED_PRINCIPALS} people with access — ${advice}`
+      ),
+      409
+    );
+  }
+
+  // Minted AFTER the grant is on disk. A live invite for a grant that was
+  // refused is a credential for access nobody agreed to; the reverse — a grant
+  // whose invite failed to mint — is an owner pressing resend.
+  let minted;
+  try {
+    minted = await getAppGuestManager().mintInviteToken({
+      appName: name,
+      guestId: guest.id,
+      email: guest.email,
+      createdBy: requester.userId,
+    });
+  } catch (err) {
+    // The grant IS on disk by now, and it stays: an owner pressing resend is
+    // the recovery, and reaping a grant because a token could not be minted
+    // would remove access the policy already records. Only a record this
+    // request created is undone.
+    await abandonGuest();
+    if (err instanceof InviteCapacityError) {
+      return c.json(
+        error(
+          ErrorCodes.RATE_LIMITED,
+          err.reason === 'per_creator'
+            ? 'You have too many invitations outstanding. Wait for some to expire or be used.'
+            : 'This platform has too many invitations outstanding right now.'
+        ),
+        429
+      );
+    }
+    if (err instanceof InviteStoreCorruptError) {
+      return c.json(
+        error(ErrorCodes.SERVICE_UNAVAILABLE, 'Invitations are unavailable right now.'),
+        503
+      );
+    }
+    throw err;
+  }
+
+  // Id in the PATH, secret in the FRAGMENT — the split C0 recommended, and the
+  // reason the mail body carries only the operator's own domain. Built from
+  // `getPublicUrl()`, which is also what the template re-checks the origin
+  // against: a link on any other origin fails to render rather than being sent.
+  const inviteUrl = `${platformUrl}/api/v1/app-access/invite/${minted.id}#${minted.secret}`;
+
+  const mail = await sendMeteredMail(
+    { principalId: requester.principalId, actorUserId: requester.userId },
+    'guest-invite',
+    guest.email,
+    {
+      appName: name,
+      inviterName: getUserById(requester.userId)?.username ?? requester.username,
+      inviteUrl,
+      platformUrl,
+      expiresInHours: INVITE_TTL_HOURS,
+    }
+  );
+
+  let applyError: string | undefined;
+  const justCreated = !invite.hadPolicyBefore && invite.outcome === 'invited';
+  if (justCreated || app.accessGateUnapplied === true) {
+    applyError = await reEmit(ops, name);
+  }
+
+  // THE GUEST ID, never the address.
+  //
+  // `activity-log.json` is a third store holding the same personal data, and it
+  // is touched by neither `reapGuest` nor `purgeAppArtifacts` — so revoking a
+  // guest, or deleting the whole app, left their email behind in a file that
+  // outlives both. An id resolves to an address only while the record exists,
+  // which is exactly the retention property `sweepGuestRetention` enforces; the
+  // audit trail keeps its shape and stops being a way around it.
+  const detail =
+    isAdminCaller && requester.userId !== app.userId
+      ? `${guest.id} (admin-invited)`
+      : guest.id;
+  await logActivityFor(requester, { action: 'guest-invited', appName: name, detail });
+
+  // THE LINK COMES BACK only when the mail was never sent — `unavailable` means
+  // no relay is configured, or the mailer refused the input, so nothing was
+  // dialed. Two reasons this is right rather than a leak:
+  //
+  //  - the requester AUTHORED this invitation moments ago and is the one
+  //    person entitled to the link; this is the same once-only disclosure
+  //    `POST /auth/api-keys` already makes for a freshly minted key;
+  //  - without it, a platform with no SMTP relay cannot invite anyone at all,
+  //    and the feature is unusable rather than degraded.
+  //
+  // Never on `attempted`, even with a `failure`: there the relay was dialed and
+  // the message may yet be delivered, so handing the link back as well would
+  // widen the disclosure for no gain.
+  const undelivered = mail.status !== 'attempted';
+  return c.json(
+    success({
+      message:
+        invite.outcome === 'already-invited'
+          ? `A new invitation for '${guest.email}' has been created for '${name}'.`
+          : `'${guest.email}' has been invited to '${name}'.`,
+      ...ownView(updatedConfig.access, requester.userId),
+      mailSent: mail.status === 'attempted',
+      ...(undelivered ? { inviteUrl } : {}),
+      ...(applyError ? { applyError } : {}),
+    })
+  );
+}
+
+// POST /apps/:name/share — grant one person.
 //
-// `{ username }` ONLY, never `{ email }`: `createUser` enforces no email
-// uniqueness and no verification, so an email is not an identifier in this
-// codebase — resolving one to an existing account would let an attacker on
-// a signup-enabled box register with a colleague's address and receive
-// their shares. The `{ email }` branch (guest access) is a later slice.
+// TWO BRANCHES, dispatched below. `{ username }` grants an existing DROP
+// account; `{ email }` invites someone with no account at all (`inviteGuest`,
+// DROP-155 — see its own doc for why they are siblings rather than one branch
+// with a mode).
+//
+// An email still never resolves to an EXISTING account, and that rule is
+// unchanged: `createUser` enforces no email uniqueness and no verification, so
+// an email is not an identifier in this codebase — resolving one would let an
+// attacker on a signup-enabled box register with a colleague's address and
+// receive their shares. `inviteGuest` REFUSES an address any DROP account
+// holds rather than matching on it.
 shareRoutes.post('/:name/share', async c => {
   const resolved = await resolveShareRequest(c, 'Sharing an app');
   if (resolved instanceof Response) return resolved;
@@ -415,7 +913,23 @@ shareRoutes.post('/:name/share', async c => {
     return c.json(error(ErrorCodes.CONFLICT, message, { blockers: verdict.blockers }), 409);
   }
 
-  const body = (await c.req.json().catch(() => ({}))) as { username?: unknown; gateApp?: unknown };
+  const body = (await c.req.json().catch(() => ({}))) as {
+    username?: unknown;
+    email?: unknown;
+    gateApp?: unknown;
+  };
+
+  // ONE of the two, never both. `{ username, email }` together has no sensible
+  // meaning — they name different kinds of principal — and silently preferring
+  // one would make which principal got access depend on a field-order detail
+  // nobody wrote down.
+  if (body.username !== undefined && body.email !== undefined) {
+    throw new ValidationError('Provide either username or email, not both');
+  }
+  if (body.email !== undefined) {
+    return inviteGuest(c, resolved, body.email, body.gateApp === true);
+  }
+
   const username = body.username;
   if (
     typeof username !== 'string' ||
@@ -473,12 +987,12 @@ shareRoutes.post('/:name/share', async c => {
 
     const allow = current?.allow ?? [];
     // Already-granted short-circuits BEFORE the cap — an idempotent re-grant
-    // at exactly MAX_ACCESS_ALLOW_ENTRIES entries must still succeed.
+    // at exactly MAX_ADMITTED_PRINCIPALS entries must still succeed.
     if (allow.includes(liveUser!.id)) {
       grant.outcome = 'already-granted';
       return NO_CHANGE;
     }
-    if (allow.length >= MAX_ACCESS_ALLOW_ENTRIES) {
+    if (admittedCount(current) >= MAX_ADMITTED_PRINCIPALS) {
       grant.outcome = 'cap-exceeded';
       // Computed HERE, not from a separate read after the fact, for the
       // same snapshot reason as the `needs-confirmation` branch above.
@@ -489,7 +1003,10 @@ shareRoutes.post('/:name/share', async c => {
       // cannot remove themselves (Gate 2 finding: this is the same bug fix
       // #1 closed, reappearing here).
       const grantedByMap = current?.grantedBy ?? {};
-      grant.adminAuthoredCount = allow.filter(id => grantedByMap[id] !== requester.userId).length;
+      const guestGrantedByMap = current?.guestGrantedBy ?? {};
+      grant.adminAuthoredCount =
+        allow.filter(id => grantedByMap[id] !== requester.userId).length +
+        (current?.guests ?? []).filter(id => guestGrantedByMap[id] !== requester.userId).length;
       return NO_CHANGE;
     }
     grant.targetUserId = liveUser!.id;
@@ -534,7 +1051,7 @@ shareRoutes.post('/:name/share', async c => {
     return c.json(
       error(
         ErrorCodes.CONFLICT,
-        `'${name}' already has ${MAX_ACCESS_ALLOW_ENTRIES} people with access — ${advice}`
+        `'${name}' already has ${MAX_ADMITTED_PRINCIPALS} people with access — ${advice}`
       ),
       409
     );
@@ -575,8 +1092,7 @@ shareRoutes.post('/:name/share', async c => {
       // of an existing entry — a distinct "already has access" message let
       // an owner probe allow-list membership one username at a time.
       message: `'${username}' has access to '${name}'.`,
-      ownGrants: view.ownGrants,
-      othersGrantedCount: view.othersGrantedCount,
+      ...view,
       ...(applyError ? { applyError } : {}),
     })
   );
@@ -588,7 +1104,7 @@ shareRoutes.post('/:name/share', async c => {
 // must always be able to remove a control, including on a box that can no
 // longer enforce it; a stale guard may still be live in Caddy.
 shareRoutes.delete('/:name/share/:userId', async c => {
-  const resolved = await resolveShareRequest(c, 'Revoking an app share');
+  const resolved = await resolveShareRequest(c, 'Revoking an app share', ADMIN_MAY_BYPASS_TOGGLE);
   if (resolved instanceof Response) return resolved;
   const { requester, name, app, ops } = resolved;
   const isAdminCaller = requester.role === 'admin';
@@ -666,6 +1182,188 @@ shareRoutes.delete('/:name/share/:userId', async c => {
   );
 });
 
+// PATCH /apps/:name/share/guests/:guestId — an ADMIN bars one guest.
+//
+// The lever `setAppGuestDisabled` was written for in wave 1 and that nothing
+// called. Three separate controls were already defending the `disabled` state —
+// the verifiers' live re-read, `credentialsInvalidBefore`, and the
+// only-an-admin-may-delete-a-disabled-record rule on the DELETE below — while
+// no code path could put a guest into it. A governance feature whose governing
+// role is strictly LESS capable than the governed one is the inverse of the
+// posture this whole slice is built on.
+//
+// DISABLE vs REVOKE, and why an admin needs both: revoking removes the grant,
+// and the owner can re-invite the same address a second later. Disabling stamps
+// the record — `credentialsInvalidBefore`, killing every live session
+// immediately — and leaves a tombstone the owner cannot delete, so re-inviting
+// resolves to the SAME disabled record rather than a fresh enabled one.
+//
+// On the same path as the DELETE, so it inherits that path's dedicated bucket
+// and role floor rather than needing a fourth registration in `server.ts`. The
+// admin check is in the handler, matching how every other admin-vs-owner
+// distinction in this file is made. Ungated by `appSharingEnabled` for the same
+// reason the revokes are: an admin taking access away is never blocked by the
+// toggle on owner-initiated sharing.
+shareRoutes.patch('/:name/share/guests/:guestId', async c => {
+  const resolved = await resolveShareRequest(c, 'Disabling a guest', ADMIN_MAY_BYPASS_TOGGLE);
+  if (resolved instanceof Response) return resolved;
+  const { requester, name } = resolved;
+
+  if (requester.role !== 'admin') {
+    return c.json(
+      error(ErrorCodes.UNAUTHORIZED, 'Only an administrator may disable a guest.'),
+      403
+    );
+  }
+
+  const guestId = c.req.param('guestId');
+  if (!guestId || guestId.length > MAX_USER_ID_LENGTH) {
+    throw new ValidationError(`Invalid guest id (max ${MAX_USER_ID_LENGTH} chars)`);
+  }
+
+  const body = (await c.req.json().catch(() => ({}))) as { disabled?: unknown };
+  if (body.disabled !== true) {
+    // Deliberately one-way. `credentialsInvalidBefore` is never cleared (see
+    // `GuestRecord`), so a re-enable would return a guest whose old sessions
+    // stay dead and whose record reads enabled — two sources of truth
+    // disagreeing about the same person. An admin who wants the guest back
+    // deletes the record and lets the owner re-invite.
+    throw new ValidationError('disabled must be true — disabling a guest cannot be undone');
+  }
+
+  let record;
+  try {
+    record = await setAppGuestDisabled(guestId, true, requester.userId);
+  } catch (err) {
+    if (err instanceof GuestStoreCorruptError) {
+      return c.json(
+        error(ErrorCodes.SERVICE_UNAVAILABLE, 'Guest records are unavailable right now.'),
+        503
+      );
+    }
+    throw err;
+  }
+
+  // Same idempotent-no-op posture the revoke routes take, and for the same
+  // oracle reason: an admin is allowed to know, but this shares its shape with
+  // owner-reachable siblings and there is nothing gained by diverging.
+  if (!record) {
+    return c.json(success({ message: `No such guest for '${name}'`, disabled: false }));
+  }
+
+  await logActivityFor(requester, {
+    action: 'guest-revoked',
+    appName: name,
+    detail: `${record.id} (disabled by admin)`,
+  });
+
+  return c.json(success({ message: `Guest disabled for '${name}'`, disabled: true }));
+});
+
+// DELETE /apps/:name/share/guests/:guestId — revoke one guest.
+//
+// A FOUR-segment path, and that is worth stating because it is what makes this
+// route's guards easy to miss: `/apps/:name/share/:userId` binds exactly one
+// segment, so it does NOT match this, and neither the dedicated rate-limit
+// bucket nor the explicit role floor reaches here without a third registration
+// of its own in `server.ts`. A revoke route silently falling through to the
+// general `/apps/*` guard is precisely the shape DROP-153 already had to fix
+// once for the three-segment form.
+//
+// Like the user revoke, deliberately NOT gated on enforceability: an operator
+// must always be able to remove a control, including on a box that can no
+// longer enforce it.
+shareRoutes.delete('/:name/share/guests/:guestId', async c => {
+  const resolved = await resolveShareRequest(c, 'Revoking a guest', ADMIN_MAY_BYPASS_TOGGLE);
+  if (resolved instanceof Response) return resolved;
+  const { requester, name, app, ops } = resolved;
+  const isAdminCaller = requester.role === 'admin';
+
+  if (ops.isAppInProgress(name)) {
+    return inProgressResponse(c, name);
+  }
+
+  const guestId = c.req.param('guestId');
+  if (!guestId || guestId.length > MAX_USER_ID_LENGTH) {
+    throw new ValidationError(`Invalid guest id (max ${MAX_USER_ID_LENGTH} chars)`);
+  }
+
+  const access = getAppConfigServiceOrNull()?.getConfig(name)?.access;
+  const onThisApp = (access?.guests ?? []).includes(guestId);
+  const grantor = access?.guestGrantedBy?.[guestId];
+
+  // The same no-op-not-refusal posture the user revoke takes, and for the same
+  // reason: a 403 for "someone else invited them" against a 200 for "never
+  // existed" is itself a membership oracle over the admin-authored list that
+  // `ownView` deliberately reduces to a count.
+  if (!onThisApp || (!isAdminCaller && grantor !== requester.userId)) {
+    return c.json(
+      success({ message: `Nothing to revoke for '${name}'`, revoked: false })
+    );
+  }
+
+  // ONLY AN ADMIN MAY REMOVE A DISABLED RECORD.
+  //
+  // `disabled` is an admin's decision about a person. Deleting the record frees
+  // the `(email, appName)` key, so an owner who could delete it could re-invite
+  // the same address a second later and get a fresh, ENABLED guest — a clean
+  // bypass of the disable, performed entirely through owner-level routes. The
+  // grant itself is still revocable by the owner (that is what the branch
+  // below does); what they cannot do is destroy the tombstone.
+  const record = getAppGuestManager().getGuestById(guestId);
+  if (record?.disabled === true && !isAdminCaller) {
+    return c.json(
+      error(
+        ErrorCodes.UNAUTHORIZED,
+        'This guest was disabled by an administrator. Ask an admin to remove them.'
+      ),
+      403
+    );
+  }
+
+  // `reapGuest` and not a bare policy edit: a guest id can carry LIVE INVITES,
+  // and removing the grant while leaving an invite redeemable would let the
+  // next click put the same person straight back on the list. The reaper
+  // revokes the app-config grant FIRST and clears its own bookkeeping second,
+  // so a crash between the two still leaves the guest without access.
+  //
+  // AWAITED before the response. A fire-and-forget revoke that is acknowledged
+  // and then lost to a restart resurrects a guest whose session is still
+  // valid — the plan's durability-before-acknowledgement rule, and the one
+  // place on this route where it bites.
+  try {
+    await reapGuest(guestId);
+  } catch (err) {
+    if (err instanceof GuestStoreCorruptError) {
+      return c.json(
+        error(ErrorCodes.SERVICE_UNAVAILABLE, 'Guest records are unavailable right now.'),
+        503
+      );
+    }
+    throw err;
+  }
+
+  // Same rule as the user revoke: re-emit only when the platform's own record
+  // says the last apply never landed. An ordinary revoke needs no Caddy reload,
+  // because `/verify` reads the policy live on every request.
+  let applyError: string | undefined;
+  if (app.accessGateUnapplied === true) {
+    applyError = await reEmit(ops, name);
+  }
+
+  // The id, not the address — see the note on `guest-invited` above.
+  const detail = isAdminCaller && grantor !== requester.userId ? `${guestId} (admin-revoked)` : guestId;
+  await logActivityFor(requester, { action: 'guest-revoked', appName: name, detail });
+
+  return c.json(
+    success({
+      message: `Guest access revoked for '${name}'`,
+      revoked: true,
+      ...(applyError ? { applyError } : {}),
+    })
+  );
+});
+
 // DELETE /apps/:name/share — clear an ALL-REQUESTER-AUTHORED policy.
 //
 // Symmetric with the create-requires-gateApp rule above (DROP-153 §3): an
@@ -680,7 +1378,7 @@ shareRoutes.delete('/:name/share/:userId', async c => {
 // themselves stays admin-only to clear, via DELETE /apps/:name/access,
 // which is the invariant server.ts actually cares about.
 shareRoutes.delete('/:name/share', async c => {
-  const resolved = await resolveShareRequest(c, 'Clearing an app share policy');
+  const resolved = await resolveShareRequest(c, 'Clearing an app share policy', ADMIN_MAY_BYPASS_TOGGLE);
   if (resolved instanceof Response) return resolved;
   const { requester, name, app, ops } = resolved;
   const isAdminCaller = requester.role === 'admin';
@@ -694,7 +1392,15 @@ shareRoutes.delete('/:name/share', async c => {
     const current = existing.access;
     if (!current) return NO_CHANGE; // nothing to clear
     const grantedBy = current.grantedBy ?? {};
-    const allRequesterAuthored = current.allow.every(id => grantedBy[id] === requester.userId);
+    const guestGrantedBy = current.guestGrantedBy ?? {};
+    // BOTH lists, and `guests` is the half that made the old rule unsound:
+    // `[].every()` is `true`, so an app gated by an admin whose entire
+    // population was admin-INVITED GUESTS passed the all-requester-authored
+    // test on an empty `allow` and could be cleared — un-gating it — by any
+    // owner (DROP-155 plan section B).
+    const allRequesterAuthored =
+      current.allow.every(id => grantedBy[id] === requester.userId) &&
+      (current.guests ?? []).every(id => guestGrantedBy[id] === requester.userId);
     if (!allRequesterAuthored) {
       clear.refusedMixed = true;
       return NO_CHANGE;

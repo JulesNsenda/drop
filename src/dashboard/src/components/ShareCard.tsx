@@ -47,10 +47,23 @@ interface OwnGrant {
   username?: string;
 }
 
+/**
+ * A guest the CALLER invited (DROP-155). Someone else's invitee is a number in
+ * `othersGrantedCount`, never a row here — the same rule that hides another
+ * person's account grants, applied to the second list.
+ */
+interface OwnGuest {
+  guestId: string;
+  /** Empty when the grant is stale — a policy entry whose record the boot sweep has not reaped yet. */
+  email: string;
+  disabled: boolean;
+}
+
 interface ShareView {
   policyPresent: boolean;
   enforced: boolean;
   ownGrants: OwnGrant[];
+  ownGuests: OwnGuest[];
   othersGrantedCount: number;
   gateApplied: boolean | null;
   enforceable: boolean;
@@ -129,6 +142,21 @@ function ShareCard({ appName }: { appName: string }) {
     void load();
   }, [load]);
 
+  /**
+   * The invitation link, shown ONLY when the server says the mail was never
+   * sent — which means no SMTP relay is configured on this platform.
+   *
+   * Not a convenience: without it an operator with no relay cannot invite
+   * anyone at all, because the secret exists in plaintext exactly once, in the
+   * response to the request that created it. The owner authored this
+   * invitation seconds ago and is the one person entitled to the link, which is
+   * the same once-only disclosure a freshly minted API key already gets.
+   */
+  const [inviteLink, setInviteLink] = useState<{ email: string; url: string } | null>(null);
+  const [guestEmail, setGuestEmail] = useState('');
+  /** Set when the platform refuses the `{ email }` branch, so the field stops offering it. */
+  const [guestInvitesDisabled, setGuestInvitesDisabled] = useState(false);
+
   const grant = async (targetUsername: string, gateApp: boolean) => {
     setSaving(true);
     setBanner(null);
@@ -187,6 +215,94 @@ function ShareCard({ appName }: { appName: string }) {
     setBanner(null);
     const res = await apiJsonWithStatus<{ message: string; revoked: boolean; applyError?: string }>(
       `/apps/${appName}/share/${userId}`,
+      { method: 'DELETE' }
+    );
+    setSaving(false);
+    if (!res.success && isSharingDisabled(res)) {
+      setSharingDisabled(true);
+      setView(null);
+      return;
+    }
+    setBanner(
+      !res.success
+        ? { kind: 'error', text: res.error?.message || 'Could not revoke access.' }
+        : res.data?.applyError
+          ? { kind: 'error', text: `Revoked, but the gate was not re-applied: ${res.data.applyError}` }
+          : { kind: 'ok', text: res.data?.message || 'Access revoked.' }
+    );
+    await load();
+  };
+
+  const invite = async (email: string, gateApp: boolean) => {
+    setSaving(true);
+    setBanner(null);
+    setInviteLink(null);
+    const res = await apiJsonWithStatus<{
+      message: string;
+      mailSent: boolean;
+      inviteUrl?: string;
+      applyError?: string;
+    }>(`/apps/${appName}/share`, {
+      method: 'POST',
+      ...jsonBody({ email, ...(gateApp ? { gateApp: true } : {}) }),
+    });
+    setSaving(false);
+
+    if (!res.success) {
+      if (isSharingDisabled(res)) {
+        setSharingDisabled(true);
+        setView(null);
+        return;
+      }
+      // The platform's own opt-in for the guest branch, separate from app
+      // sharing — an admin may reasonably have one on and the other off.
+      if ((res.error as { details?: { reason?: string } })?.details?.reason === 'guest_invites_disabled') {
+        setGuestInvitesDisabled(true);
+        setBanner({ kind: 'error', text: res.error?.message || 'Guest invitations are disabled.' });
+        return;
+      }
+      setBanner({ kind: 'error', text: res.error?.message || 'Could not send that invitation.' });
+      return;
+    }
+
+    setGuestEmail('');
+    if (res.data?.applyError) {
+      setBanner({ kind: 'error', text: `Invited, but the gate was not re-applied: ${res.data.applyError}` });
+    } else if (res.data?.inviteUrl) {
+      // Mail was never sent. Say so plainly rather than reporting success —
+      // the owner has to deliver this themselves or nothing happens.
+      setInviteLink({ email, url: res.data.inviteUrl });
+      setBanner(null);
+    } else {
+      setBanner({ kind: 'ok', text: res.data?.message || `Invitation sent to ${email}.` });
+    }
+    await load();
+  };
+
+  const handleInvite = () => {
+    const trimmed = guestEmail.trim();
+    if (!trimmed || !view) return;
+    // The same acknowledged-act rule the username branch follows — a first
+    // share on an ungated app is confirmed explicitly (file header).
+    if (!view.policyPresent) {
+      const confirmed = window.confirm(
+        `${appName} isn't sign-in gated yet. Inviting '${trimmed}' will make it sign-in-only ` +
+          `for everyone else — only an administrator can undo this. Continue?`
+      );
+      if (!confirmed) return;
+      void invite(trimmed, true);
+      return;
+    }
+    void invite(trimmed, false);
+  };
+
+  const revokeGuest = async (guestId: string, label: string) => {
+    if (!window.confirm(`Revoke ${label}'s access to ${appName}?`)) return;
+    setSaving(true);
+    setBanner(null);
+    setInviteLink(null);
+    const res = await apiJsonWithStatus<{ message: string; revoked: boolean; applyError?: string }>(
+      `/apps/${appName}/share/guests/${encodeURIComponent(guestId)}`,
       { method: 'DELETE' }
     );
     setSaving(false);
@@ -337,6 +453,74 @@ function ShareCard({ appName }: { appName: string }) {
           )}
         </div>
 
+        {view.ownGuests.length > 0 && (
+          <div className="mt-4 space-y-1 border-t pt-4">
+            <p className="text-xs uppercase tracking-wide opacity-50">Invited by email</p>
+            {view.ownGuests.map(g => (
+              <div key={g.guestId} className="flex items-center justify-between gap-2 py-1 text-sm">
+                <span className={g.disabled ? 'opacity-50 line-through' : undefined}>
+                  {g.email || g.guestId}
+                  {g.disabled && (
+                    <span className="ml-2 text-xs opacity-70 no-underline">
+                      disabled by an administrator
+                    </span>
+                  )}
+                </span>
+                <span className="flex items-center gap-2">
+                  {/* Resend is the SAME call as the first invite: the address
+                      resolves to the same guest record, and a fresh
+                      single-use link is minted. It is the only recovery path
+                      for a lost or expired invitation, because the secret is
+                      never stored. Not offered for a disabled guest — that
+                      record is an administrator's decision. */}
+                  {!g.disabled && (
+                    <button
+                      onClick={() => void invite(g.email, false)}
+                      className="text-xs transition-opacity hover:opacity-70"
+                      style={{ color: 'var(--text-3)' }}
+                      disabled={saving || !g.email}
+                      aria-label={`Resend invitation to ${g.email || g.guestId}`}
+                    >
+                      Resend
+                    </button>
+                  )}
+                  <button
+                    onClick={() => void revokeGuest(g.guestId, g.email || g.guestId)}
+                    className="transition-opacity hover:opacity-70"
+                    style={{ color: 'var(--text-3)' }}
+                    disabled={saving}
+                    aria-label={`Revoke access for ${g.email || g.guestId}`}
+                  >
+                    <X className="h-4 w-4" />
+                  </button>
+                </span>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {inviteLink && (
+          <div className="mt-4 rounded border px-3 py-2 text-sm" style={{ borderColor: 'var(--border)' }}>
+            <p className="font-medium">No email was sent</p>
+            <p className="mt-1 text-xs opacity-70">
+              This platform has no outgoing mail configured, so you need to send{' '}
+              {inviteLink.email} this link yourself. It can only be used once, and it will not be
+              shown again.
+            </p>
+            <div className="mt-2 flex items-center gap-2">
+              <Input type="text" readOnly value={inviteLink.url} onFocus={e => e.target.select()} />
+              <Button
+                onClick={() => {
+                  void navigator.clipboard?.writeText(inviteLink.url);
+                  setBanner({ kind: 'ok', text: 'Invitation link copied.' });
+                }}
+              >
+                Copy
+              </Button>
+            </div>
+          </div>
+        )}
+
         <div className="mt-4 flex flex-wrap items-end gap-3 border-t pt-4">
           <label className="text-sm">
             <span className="opacity-60">Username</span>
@@ -352,6 +536,31 @@ function ShareCard({ appName }: { appName: string }) {
             Share
           </Button>
         </div>
+
+        {!guestInvitesDisabled && (
+          <div className="mt-3 flex flex-wrap items-end gap-3">
+            <label className="text-sm">
+              <span className="opacity-60">Or invite by email</span>
+              <Input
+                type="email"
+                value={guestEmail}
+                onChange={e => setGuestEmail(e.target.value)}
+                placeholder="someone@example.com"
+                disabled={saving || !canGrant}
+              />
+            </label>
+            <Button onClick={handleInvite} disabled={saving || !canGrant || !guestEmail.trim()}>
+              Invite
+            </Button>
+          </div>
+        )}
+
+        {!guestInvitesDisabled && (
+          <p className="mt-2 text-xs opacity-60">
+            Someone invited by email opens this app without a DROP account. Their invitation is
+            single-use and expires.
+          </p>
+        )}
 
         {!canGrant && (
           <p className="mt-2 text-xs opacity-60">

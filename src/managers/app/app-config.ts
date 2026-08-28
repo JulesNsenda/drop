@@ -25,8 +25,18 @@ import type { RuntimeType } from '../runtime/app-runtime.types';
  * documentation and pre-commits a shape whose real constraints are unknown
  * (this repo has declined that exact seam twice — see
  * docs/plans/2026-08-13-service-provider-plugins.md).
+ *
+ * `guests` (DROP-155, below) is deliberately ORTHOGONAL to `mode`, not a
+ * value it takes: a guest is admitted by redeeming a single-use invite
+ * token, never by resolving against whichever identity source `mode` names.
+ * `mode` widening to `'drop-users' | 'oidc'` therefore doesn't make `guests`
+ * untrue, and `guests` existing doesn't make `mode` untrue either — the two
+ * fields answer different questions ("who is this principal" vs. "does this
+ * principal, once admitted some other way, get to open this app").
  */
 export interface AppAccessPolicy {
+  // Guests (below) do not widen this — see the interface doc above for why
+  // `guests` is orthogonal to `mode` rather than a value it takes.
   mode: 'drop-users';
   /**
    * User ids (NOT usernames) permitted to open the app, on top of the owner
@@ -45,6 +55,27 @@ export interface AppAccessPolicy {
    * an owner cannot revoke, or even see, a grant they did not make.
    */
   grantedBy?: Record<string, string>;
+  /**
+   * Guest ids (DROP-155) permitted to open the app — the namespaced
+   * `guest:<uuid>` space, never a `allow`-shaped user id, so a tenant
+   * matching against known user ids fails closed. A guest reaches this list
+   * by redeeming a single-use invite, not by anything in `mode`.
+   *
+   * STRUCTURAL in `mergeAccessProvenance`, exactly like `allow`/`grantedBy`:
+   * a whole-policy write (`PUT /apps/:name/access`, `POST /apps/:name/share`)
+   * that has never heard of guests must not delete them — see that
+   * function's own doc for why this field, unlike `allow`, is ITSELF carried
+   * forward when absent (an updater always has an opinion on `allow`; it
+   * usually has none on `guests` at all).
+   */
+  guests?: string[];
+  /**
+   * Provenance for `guests` — same shape and the same rules as `grantedBy`
+   * above: granted guest id → the user id whose invite created it. An id
+   * present in `guests` but ABSENT from this map is ADMIN-authored, the same
+   * conservative default `grantedBy`'s own doc gives.
+   */
+  guestGrantedBy?: Record<string, string>;
 }
 
 /**
@@ -63,13 +94,16 @@ export interface AppAccessPolicy {
 export const NO_CHANGE = Symbol('app-config:access-no-change');
 
 /**
- * Filter a `grantedBy` map down to entries `predicate` keeps, collapsing an
+ * Filter a provenance map (`grantedBy` OR `guestGrantedBy` — same shape,
+ * `granteeId -> grantorId`) down to entries `predicate` keeps, collapsing an
  * empty result to `undefined` rather than `{}` — the "field absent, not
- * empty" shape every `grantedBy` in this file relies on
- * (`mergeAccessProvenance`'s `'grantedBy' in result` check depends on it).
- * Shared by `carryForwardGrantedBy` (keep grantees still in the new `allow`)
- * and `dropStaleGrants` (drop entries whose grantor was deleted) — same
- * filter-and-collapse shape, different predicate.
+ * empty" shape both maps rely on everywhere in this file
+ * (`mergeAccessProvenance`'s `'grantedBy' in result` / `'guestGrantedBy' in
+ * result` checks depend on it). Shared by `carryForwardGrantedBy` /
+ * `carryForwardGuestGrantedBy` (keep grantees still present in the new
+ * `allow` / `guests`) and `dropStaleGrants` / `dropStaleGuestGrants` (drop
+ * entries whose grantor was deleted) — same filter-and-collapse shape,
+ * different predicate.
  */
 function filterGrantedBy(
   grantedBy: Record<string, string> | undefined,
@@ -108,26 +142,72 @@ function carryForwardGrantedBy(
 }
 
 /**
+ * Same rule as `carryForwardGrantedBy`, applied to `guestGrantedBy` against
+ * the write's (possibly itself carried-forward, see `mergeAccessProvenance`)
+ * `guests` array: provenance for a guest id the write is dropping is dropped
+ * with it, and provenance for everything else carries forward.
+ */
+function carryForwardGuestGrantedBy(
+  existing: AppAccessPolicy | undefined,
+  guests: readonly string[]
+): Record<string, string> | undefined {
+  const guestSet = new Set(guests);
+  return filterGrantedBy(existing?.guestGrantedBy, (guestId) => guestSet.has(guestId));
+}
+
+/**
  * Applied to every `setAccessPolicy` updater result before it reaches
  * `write()` (see `setAccessPolicy` below). `result === undefined` is a
- * clear — nothing to merge. `'grantedBy' in result` (checked with `in`, not
- * truthiness, so an explicit `grantedBy: undefined` counts as "handled")
- * means the updater already decided provenance for this write, including
- * deciding to drop it — e.g. `pruneAllowListEntries` stripping a deleted
- * grantor's entries — and that decision is respected untouched. Only when
- * the key is entirely ABSENT does this fall back to `carryForwardGrantedBy`,
- * carrying provenance forward for every id still present in the new `allow`
- * — the structural safety net for an updater that never touches `grantedBy`
- * at all.
+ * clear — nothing to merge.
+ *
+ * `grantedBy` (checked with `in`, not truthiness, so an explicit
+ * `grantedBy: undefined` counts as "handled") means the updater already
+ * decided provenance for this write, including deciding to drop it — e.g.
+ * `pruneAllowListEntries` stripping a deleted grantor's entries — and that
+ * decision is respected untouched. Only when the key is entirely ABSENT does
+ * this fall back to `carryForwardGrantedBy`, carrying provenance forward for
+ * every id still present in the new `allow` — the structural safety net for
+ * an updater that never touches `grantedBy` at all.
+ *
+ * `guests` gets the SAME absent-key-carries-forward treatment, but unlike
+ * `allow` the ARRAY ITSELF is what's carried, not just its provenance map:
+ * `PUT /apps/:name/access` and `POST /apps/:name/share` both return
+ * whole-policy literals (`{ mode, allow, grantedBy }`) that have never heard
+ * of guests at all, and an absent `guests` key from either of those must
+ * read as "no opinion", not "clear every guest" (DROP-155 plan §A — the
+ * `carryForwardGrantedBy` trap, reintroduced on a second field, this time
+ * destroying access people are actively using). `guestGrantedBy` is then
+ * carried forward the same way `grantedBy` is, against whichever `guests`
+ * array the write ends up with (freshly written or itself carried forward).
  */
 function mergeAccessProvenance(
   existing: AppAccessPolicy | undefined,
   result: AppAccessPolicy | undefined
 ): AppAccessPolicy | undefined {
   if (!result) return result;
-  if ('grantedBy' in result) return result;
-  const grantedBy = carryForwardGrantedBy(existing, result.allow);
-  return grantedBy ? { ...result, grantedBy } : result;
+  let merged = result;
+
+  if (!('guests' in merged)) {
+    // A fresh copy, not the existing array by reference — `saveConfig` sets
+    // the new config into the in-memory map on top of the old one, so a bare
+    // reference would leave the previous and the merged policy sharing one
+    // array instance. `filterGrantedBy` (used by every `grantedBy`/
+    // `guestGrantedBy` path) always constructs a fresh object; this keeps
+    // `guests` the same "carry-forward is always a copy" shape.
+    merged = existing?.guests ? { ...merged, guests: [...existing.guests] } : merged;
+  }
+
+  if (!('grantedBy' in merged)) {
+    const grantedBy = carryForwardGrantedBy(existing, merged.allow);
+    merged = grantedBy ? { ...merged, grantedBy } : merged;
+  }
+
+  if (!('guestGrantedBy' in merged)) {
+    const guestGrantedBy = carryForwardGuestGrantedBy(existing, merged.guests ?? []);
+    merged = guestGrantedBy ? { ...merged, guestGrantedBy } : merged;
+  }
+
+  return merged;
 }
 
 /**
@@ -148,6 +228,22 @@ function dropStaleGrants(
   deletedGrantorId: string
 ): Record<string, string> | undefined {
   return filterGrantedBy(grantedBy, (_granteeId, grantorId) => grantorId !== deletedGrantorId);
+}
+
+/**
+ * Same rule as `dropStaleGrants`, applied to `guestGrantedBy`: a deleted
+ * user's own guest invites (they were the GRANTOR, not the guest) fall back
+ * to the same "absent means ADMIN-authored" reading rather than staying
+ * attributed to an account that no longer exists.
+ */
+function dropStaleGuestGrants(
+  guestGrantedBy: Record<string, string> | undefined,
+  deletedGrantorId: string
+): Record<string, string> | undefined {
+  return filterGrantedBy(
+    guestGrantedBy,
+    (_guestId, grantorId) => grantorId !== deletedGrantorId
+  );
 }
 
 export interface AppConfig {
@@ -946,28 +1042,35 @@ export class AppConfigService {
    * stale pre-filter hit never costs a disk write.
    *
    * `userId` can be deleted as a GRANTEE (their own `allow` entry), a
-   * GRANTOR (a value in someone else's `grantedBy` entry), or both — an
-   * account that shared an app it doesn't itself have access to is only the
-   * latter, and would otherwise be missed entirely. Grantee removal also
-   * drops `userId`'s own `grantedBy` key, if any — an entry can't stay
-   * attributed to a user id that no longer appears in `allow`. Grantor
-   * removal drops every `grantedBy` entry `userId` granted, via
-   * `dropStaleGrants` — see that helper's own doc for why leaving those in
-   * place strands them (unrevokable through the owner route, forever) rather
-   * than merely orphaning them.
+   * GRANTOR (a value in someone else's `grantedBy` entry), a guest GRANTOR (a
+   * value in `guestGrantedBy` — they invited a guest but hold no `allow`
+   * entry themselves), or any combination — an account that shared an app it
+   * doesn't itself have access to is only the latter two, and would
+   * otherwise be missed entirely. Grantee removal also drops `userId`'s own
+   * `grantedBy` key, if any — an entry can't stay attributed to a user id
+   * that no longer appears in `allow`. Grantor removal drops every
+   * `grantedBy` entry `userId` granted, via `dropStaleGrants` — see that
+   * helper's own doc for why leaving those in place strands them (unrevokable
+   * through the owner route, forever) rather than merely orphaning them.
+   * `guestGrantedBy` gets the same grantor cleanup via `dropStaleGuestGrants`
+   * — a deleted user's guest invites fall back to admin-authored rather than
+   * staying attributed to an account that no longer exists. This does NOT
+   * touch `guests` itself: deleting a platform user is not deleting a guest,
+   * see `pruneGuestEntries` for that.
    */
   async pruneAllowListEntries(userId: string): Promise<string[]> {
     const touched: string[] = [];
     // A cheap pre-filter, not the correctness check — see the doc above. This
     // only narrows which apps are worth an updater round-trip; the updater
     // re-checks presence against the config it actually reads. Matches on
-    // EITHER role: a grantee entry in `allow`, or a grantor value in
-    // `grantedBy`.
+    // ANY role: a grantee entry in `allow`, a grantor value in `grantedBy`,
+    // or a grantor value in `guestGrantedBy`.
     const candidates = this.getAllConfigs().filter(config => {
       const access = config.access;
       if (!access) return false;
       if (access.allow.includes(userId)) return true;
-      return Object.values(access.grantedBy ?? {}).includes(userId);
+      if (Object.values(access.grantedBy ?? {}).includes(userId)) return true;
+      return Object.values(access.guestGrantedBy ?? {}).includes(userId);
     });
     for (const config of candidates) {
       let changed = false;
@@ -977,7 +1080,11 @@ export class AppConfigService {
         const isGrantee = access.allow.includes(userId);
         const grantedBy = access.grantedBy;
         const isGrantor = grantedBy ? Object.values(grantedBy).includes(userId) : false;
-        if (!isGrantee && !isGrantor) return NO_CHANGE; // already gone by the time we got here
+        const guestGrantedBy = access.guestGrantedBy;
+        const isGuestGrantor = guestGrantedBy
+          ? Object.values(guestGrantedBy).includes(userId)
+          : false;
+        if (!isGrantee && !isGrantor && !isGuestGrantor) return NO_CHANGE; // already gone by the time we got here
         changed = true;
         let nextGrantedBy = grantedBy ? { ...grantedBy } : undefined;
         if (nextGrantedBy) delete nextGrantedBy[userId]; // userId's own entry (they were the grantee)
@@ -986,6 +1093,57 @@ export class AppConfigService {
           ...access,
           allow: access.allow.filter(id => id !== userId),
           grantedBy: nextGrantedBy,
+          guestGrantedBy: dropStaleGuestGrants(guestGrantedBy, userId), // guest invites userId sent
+        };
+      });
+      if (changed) touched.push(config.name);
+    }
+    return touched;
+  }
+
+  /**
+   * Remove one guest id from every app's `guests` list, dropping its
+   * `guestGrantedBy` provenance entry with it — the guest-id mirror of
+   * `pruneAllowListEntries` above, for the same reason: a governance list
+   * nobody can read as authoritative between boots is a governance list that
+   * has stopped working (DROP-155 plan §2).
+   *
+   * Runs on GUEST deletion (a guest record being revoked/removed by its
+   * owning module), not only at boot, exactly as `pruneAllowListEntries`
+   * runs on user-account deletion rather than only at boot reconciliation.
+   * Nothing is granted by a stale entry regardless — the guest session
+   * evaluator re-resolves the guest record live on every request — but this
+   * keeps `guests` readable as the authoritative list of who currently holds
+   * an admit, not a history of who ever did.
+   *
+   * Deliberately does NOT touch `grantedBy`/`allow`: a guest id never
+   * appears there (different namespace, `guest:<uuid>`), and never acts as a
+   * GRANTOR of anything — a guest cannot invite another guest.
+   *
+   * Same NO_CHANGE / updater-form / concurrency-safety shape as
+   * `pruneAllowListEntries` — see that method's own doc for why a snapshot
+   * pre-filter is not the correctness check here either.
+   */
+  async pruneGuestEntries(guestId: string): Promise<string[]> {
+    const touched: string[] = [];
+    const candidates = this.getAllConfigs().filter(config =>
+      (config.access?.guests ?? []).includes(guestId)
+    );
+    for (const config of candidates) {
+      let changed = false;
+      await this.setAccessPolicy(config.name, existing => {
+        const access = existing.access;
+        if (!access) return NO_CHANGE; // already gone by the time we got here
+        const guests = access.guests ?? [];
+        if (!guests.includes(guestId)) return NO_CHANGE; // already gone by the time we got here
+        changed = true;
+        return {
+          ...access,
+          guests: guests.filter(id => id !== guestId),
+          guestGrantedBy: filterGrantedBy(
+            access.guestGrantedBy,
+            granteeGuestId => granteeGuestId !== guestId
+          ),
         };
       });
       if (changed) touched.push(config.name);

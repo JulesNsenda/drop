@@ -1,0 +1,743 @@
+/**
+ * The owner surface for GUESTS (DROP-155 wave 3c).
+ *
+ * The `{ email }` branch, the guest revoke route, and the three places the
+ * DROP-152/153 rules had to learn that a second list of people exists.
+ *
+ * Section B of the plan is what most of this is about, and it is worth
+ * restating because it is not obvious: `[].every()` is `true`. An app gated by
+ * an ADMIN whose entire population was admin-INVITED GUESTS therefore passed
+ * the "every allow entry is requester-authored" test on an empty `allow`, and
+ * could be cleared — un-gating it — by any owner. The same blind spot made the
+ * entry cap and the owner's own view count only half the people with access.
+ *
+ * The refusals are uniform on purpose. An owner who could tell "that address
+ * belongs to a DROP account" from "that address has never been seen" would
+ * have a directory oracle over every account on the platform, one address at a
+ * time.
+ */
+
+import * as fs from 'fs/promises';
+import * as path from 'path';
+import { createUser, updateUser, resetAuth } from '../middleware/auth';
+import { getTestToken } from '../__testutils__/auth';
+import { getStateManager } from '../../managers/app/state-manager';
+import { setPlatformOps, resetPlatformOps, type PlatformOps } from '../platform-ops';
+import { makePlatformOpsStub } from '../__testutils__/platform-ops';
+import {
+  createTestApiServer,
+  teardownTestApiServer,
+  type TestApiServer,
+} from '../__testutils__/api-server';
+import {
+  getAppConfigService,
+  resetAppConfigService,
+  type AppAccessPolicy,
+} from '../../managers/app/app-config';
+import { getSettingsManager, resetSettingsManager } from '../../managers/settings/settings-manager';
+import {
+  getMailQuota,
+  resetMailQuota,
+  getInviteQuota,
+  resetInviteQuota,
+} from '../../managers/guardrail/principal-quota';
+import { setPublicUrl, setApiRuntimeConfig } from '../runtime-config';
+import { getAppGuestManager, resetAppGuests } from '../../managers/app-guest';
+import * as mailer from '../../managers/mailer/mailer';
+
+const APP = 'myapp';
+
+const ENFORCEABLE = {
+  enforceable: true,
+  blockers: [],
+  reasons: [],
+  featureEnabled: true,
+};
+
+describe('/apps/:name/share — the guest branch (DROP-155)', () => {
+  let t: TestApiServer;
+  let ownerToken: string;
+  let ownerId: string;
+  let adminToken: string;
+  let adminId: string;
+  let otherOwnerId: string;
+  let sendMock: jest.SpyInstance;
+
+  const bearer = (token: string) => ({ Authorization: `Bearer ${token}` });
+
+  const post = (headers: Record<string, string>, body: unknown) =>
+    t.hono.request(`/api/v1/apps/${APP}/share`, {
+      method: 'POST',
+      headers: { ...headers, 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+
+  const get = (headers: Record<string, string>) =>
+    t.hono.request(`/api/v1/apps/${APP}/share`, { headers });
+
+  const delGuest = (guestId: string, headers: Record<string, string>) =>
+    t.hono.request(`/api/v1/apps/${APP}/share/guests/${guestId}`, { method: 'DELETE', headers });
+
+  const delAll = (headers: Record<string, string>) =>
+    t.hono.request(`/api/v1/apps/${APP}/share`, { method: 'DELETE', headers });
+
+  const bodyOf = async (res: Response) =>
+    (await res.json()) as {
+      data?: {
+        inviteUrl?: string;
+        mailSent?: boolean;
+        message?: string;
+        revoked?: boolean;
+        ownGuests?: { guestId: string; email: string; disabled: boolean }[];
+        ownGrants?: { userId: string }[];
+        othersGrantedCount?: number;
+      };
+      error?: { message: string };
+    };
+
+  const policy = (): AppAccessPolicy | undefined =>
+    getAppConfigService().getConfig(APP)?.access;
+
+  const seedPolicy = (over: Partial<AppAccessPolicy> = {}) =>
+    getAppConfigService().setAccessPolicy(APP, () => ({
+      mode: 'drop-users' as const,
+      allow: [],
+      ...over,
+    }));
+
+  beforeEach(async () => {
+    resetAppConfigService();
+    resetSettingsManager();
+    resetAppGuests();
+    resetMailQuota();
+    resetInviteQuota();
+
+    t = await createTestApiServer({
+      port: 3181,
+      tempPrefix: 'drop-share-guest-',
+      activityLog: true,
+    });
+
+    await fs.mkdir(path.join(t.tempDir, 'appconf'), { recursive: true });
+    await fs.mkdir(path.join(t.tempDir, 'webapps', APP), { recursive: true });
+    getAppConfigService({
+      configDir: path.join(t.tempDir, 'appconf'),
+      webappsDir: path.join(t.tempDir, 'webapps'),
+    });
+    await getAppConfigService().upsertConfig(APP, { type: 'nodejs', port: 4000 });
+
+    getAppGuestManager({
+      guestsFilePath: path.join(t.tempDir, 'app-guests.json'),
+      invitesFilePath: path.join(t.tempDir, 'app-guest-invites.json'),
+    });
+    await getAppGuestManager().load();
+
+    getSettingsManager({ settingsFilePath: path.join(t.tempDir, 'settings.json') });
+    await getSettingsManager().setAppSharingEnabled(true);
+    await getSettingsManager().setGuestInvitesEnabled(true);
+
+    getMailQuota(path.join(t.tempDir, 'mail-quotas.json'));
+    getInviteQuota(path.join(t.tempDir, 'invite-quotas.json'));
+    setPublicUrl('https://dashboard.example.com');
+    setApiRuntimeConfig({ domainSuffix: 'dropkit.sh' });
+    // The default: no relay reachable, so nothing is sent. That is the state
+    // this box is actually in, and the state `inviteUrl` exists for.
+    sendMock = jest.spyOn(mailer, 'sendTemplatedMail').mockResolvedValue({ status: 'unavailable' });
+
+    const admin = await createUser('gov', 'password123', 'admin');
+    adminId = admin.id;
+    adminToken = await getTestToken('gov', 'password123');
+    const owner = await createUser('owner', 'password123', 'user');
+    ownerId = owner.id;
+    ownerToken = await getTestToken('owner', 'password123');
+    const other = await createUser('other-owner', 'password123', 'user');
+    otherOwnerId = other.id;
+
+    const sm = getStateManager();
+    await sm.registerApp(APP, path.join(t.tempDir, 'webapps', APP), 'nodejs');
+    await sm.updateApp(APP, { userId: ownerId, port: 4000 });
+
+    setPlatformOps(
+      makePlatformOpsStub({
+        assessAccessGate: jest.fn().mockResolvedValue(ENFORCEABLE),
+      } as Partial<PlatformOps>)
+    );
+  });
+
+  afterEach(async () => {
+    sendMock.mockRestore();
+    setPublicUrl(undefined);
+    resetPlatformOps();
+    resetAppConfigService();
+    resetSettingsManager();
+    resetAppGuests();
+    resetMailQuota();
+    resetInviteQuota();
+    resetAuth();
+    await teardownTestApiServer(t);
+  });
+
+  describe('POST { email }', () => {
+    it('is refused while the operator opt-in is off', async () => {
+      await getSettingsManager().setGuestInvitesEnabled(false);
+
+      const res = await post(bearer(ownerToken), { email: 'v@example.com', gateApp: true });
+
+      expect(res.status).toBe(403);
+      // Nothing was created on the way to the refusal.
+      expect(getAppGuestManager().listGuests()).toHaveLength(0);
+    });
+
+    it('refuses username and email together rather than silently preferring one', async () => {
+      const res = await post(bearer(ownerToken), {
+        username: 'gov',
+        email: 'v@example.com',
+        gateApp: true,
+      });
+      expect(res.status).toBe(400);
+    });
+
+    it('invites, records provenance, and returns the link when no relay is configured', async () => {
+      const res = await post(bearer(ownerToken), { email: 'Visitor@Example.COM', gateApp: true });
+
+      expect(res.status).toBe(200);
+      const body = await bodyOf(res);
+      expect(body.data?.mailSent).toBe(false);
+
+      const guests = getAppGuestManager().listGuests();
+      expect(guests).toHaveLength(1);
+      // Normalized on the way in — one mailbox is one identity however typed.
+      expect(guests[0].email).toBe('visitor@example.com');
+
+      expect(policy()?.guests).toEqual([guests[0].id]);
+      expect(policy()?.guestGrantedBy).toEqual({ [guests[0].id]: ownerId });
+
+      // The link is on the PLATFORM origin, carries the id in the path and the
+      // secret in the fragment, and never names the app's own hostname.
+      const url = new URL(body.data?.inviteUrl as string);
+      expect(url.origin).toBe('https://dashboard.example.com');
+      expect(url.pathname).toBe(`/api/v1/app-access/invite/${url.pathname.split('/').pop()}`);
+      expect(url.hash.length).toBeGreaterThan(1);
+      expect(body.data?.inviteUrl).not.toContain('dropkit.sh');
+    });
+
+    it('does NOT return the link when the relay was actually dialed', async () => {
+      // `attempted` means the message may yet be delivered, so handing the
+      // link back as well would widen the disclosure for no gain.
+      sendMock.mockResolvedValue({ status: 'attempted' });
+
+      const body = await bodyOf(
+        await post(bearer(ownerToken), { email: 'v@example.com', gateApp: true })
+      );
+
+      expect(body.data?.mailSent).toBe(true);
+      expect(body.data?.inviteUrl).toBeUndefined();
+    });
+
+    it('refuses an address that belongs to a DROP account, with no guest created', async () => {
+      await updateUser(adminId, { email: 'gov@example.com' });
+
+      const res = await post(bearer(ownerToken), { email: 'GOV@example.com', gateApp: true });
+
+      expect(res.status).toBe(400);
+      expect(getAppGuestManager().listGuests()).toHaveLength(0);
+    });
+
+    it('refuses an unknown address the SAME way it refuses a taken one', async () => {
+      // The oracle check: the two answers must be indistinguishable in status
+      // and message, or an owner can enumerate accounts one address at a time.
+      await updateUser(adminId, { email: 'gov@example.com' });
+      await seedPolicy();
+
+      const taken = await post(bearer(ownerToken), { email: 'gov@example.com', gateApp: true });
+      const malformed = await post(bearer(ownerToken), { email: 'not-an-email', gateApp: true });
+
+      expect(malformed.status).toBe(taken.status);
+    });
+
+    it('refuses to create a policy without gateApp, leaving no guest behind', async () => {
+      const res = await post(bearer(ownerToken), { email: 'v@example.com' });
+
+      expect(res.status).toBe(409);
+      // The pre-check exists for exactly this: `resolveOrCreateGuest` would
+      // otherwise have created a record holding the address against the
+      // collision rule for a grant that was never made.
+      expect(getAppGuestManager().listGuests()).toHaveLength(0);
+    });
+
+    it('is idempotent — a re-invite mints a fresh link without a second entry', async () => {
+      const first = await bodyOf(
+        await post(bearer(ownerToken), { email: 'v@example.com', gateApp: true })
+      );
+      const second = await bodyOf(
+        await post(bearer(ownerToken), { email: 'v@example.com', gateApp: true })
+      );
+
+      expect(policy()?.guests).toHaveLength(1);
+      expect(second.data?.inviteUrl).not.toBe(first.data?.inviteUrl);
+    });
+  });
+
+  describe('the invite quota', () => {
+    it('bounds invitations per hour independently of the mail quota', async () => {
+      // Its OWN budget, tighter than mail's, because the two bound different
+      // primitives: mail to an address DROP already holds, versus mail to an
+      // arbitrary address from a request body.
+      process.env.DROP_MAX_INVITES_PER_HOUR = '2';
+      resetInviteQuota();
+      getInviteQuota(path.join(t.tempDir, 'invite-quotas.json'));
+
+      expect((await post(bearer(ownerToken), { email: 'a@example.com', gateApp: true })).status).toBe(200);
+      expect((await post(bearer(ownerToken), { email: 'b@example.com', gateApp: true })).status).toBe(200);
+      const blocked = await post(bearer(ownerToken), { email: 'c@example.com', gateApp: true });
+
+      expect(blocked.status).toBe(429);
+      // Refused BEFORE anything is created — no third guest record, no third
+      // invite, nothing to clean up.
+      expect(getAppGuestManager().listGuests()).toHaveLength(2);
+
+      delete process.env.DROP_MAX_INVITES_PER_HOUR;
+    });
+
+    it('charges an invitation even when no relay is configured', async () => {
+      // The bug this closes: since wave 3c the link comes back on the response
+      // when mail is `unavailable`, so a counter that only moved on a
+      // successful SEND would leave the whole primitive unbounded on exactly
+      // the boxes least likely to notice. `sendTemplatedMail` is stubbed
+      // `unavailable` for this whole suite, so this is that case.
+      process.env.DROP_MAX_INVITES_PER_HOUR = '1';
+      resetInviteQuota();
+      getInviteQuota(path.join(t.tempDir, 'invite-quotas.json'));
+
+      const first = await post(bearer(ownerToken), { email: 'a@example.com', gateApp: true });
+      expect((await bodyOf(first)).data?.inviteUrl).toBeTruthy();
+      expect((await post(bearer(ownerToken), { email: 'b@example.com', gateApp: true })).status).toBe(429);
+
+      delete process.env.DROP_MAX_INVITES_PER_HOUR;
+    });
+
+    it('is NOT reset by revoking — invite/revoke/invite cannot mint without limit', async () => {
+      // `MAX_LIVE_INVITE_TOKENS_PER_CREATOR` looks like a per-creator bound and
+      // is not one for VOLUME: revoking a guest reaps its invites and frees the
+      // slot. Only a windowed counter bounds messages actually sent, which is
+      // why this quota exists at all rather than leaning on that cap.
+      process.env.DROP_MAX_INVITES_PER_HOUR = '2';
+      resetInviteQuota();
+      getInviteQuota(path.join(t.tempDir, 'invite-quotas.json'));
+
+      await post(bearer(ownerToken), { email: 'a@example.com', gateApp: true });
+      const guest = getAppGuestManager().listGuests()[0];
+      await delGuest(guest.id, bearer(ownerToken));
+      await post(bearer(ownerToken), { email: 'b@example.com', gateApp: true });
+
+      const third = await post(bearer(ownerToken), { email: 'c@example.com', gateApp: true });
+      expect(third.status).toBe(429);
+
+      delete process.env.DROP_MAX_INVITES_PER_HOUR;
+    });
+  });
+
+  describe('a refused invitation leaves nothing behind', () => {
+    /**
+     * The critical finding of the wave-3 review, reproduced.
+     *
+     * `resolveOrCreateGuest` persists a record BEFORE the grant is written and
+     * before the token is minted. Every refusal after that point used to leave
+     * the record orphaned — unreachable by the revoke route (which
+     * short-circuits on "not on this app's list") and invisible to the boot
+     * sweep (which prunes policy entries with no record, never the reverse).
+     *
+     * That matters because `emailHeldByAnyGuest` is GLOBAL and blocks
+     * `createUser`: each orphan permanently denied an address to any DROP
+     * account, and the only exit was deleting the whole app. And because the
+     * quota was charged only on success, the loop that produced them was
+     * unmetered.
+     *
+     * `maxLiveInviteTokensPerCreator: 1` makes the mint failure deterministic,
+     * which is what made this reachable at will rather than by racing.
+     */
+    const withTinyInviteCap = async () => {
+      resetAppGuests();
+      getAppGuestManager({
+        guestsFilePath: path.join(t.tempDir, 'app-guests.json'),
+        invitesFilePath: path.join(t.tempDir, 'app-guest-invites.json'),
+        maxLiveInviteTokensPerCreator: 1,
+      });
+      await getAppGuestManager().load();
+    };
+
+    it('reaps the guest record it created, so the address is not squatted', async () => {
+      await withTinyInviteCap();
+
+      expect((await post(bearer(ownerToken), { email: 'a@example.com', gateApp: true })).status).toBe(200);
+      const refused = await post(bearer(ownerToken), { email: 'b@example.com', gateApp: true });
+
+      expect(refused.status).toBe(429);
+      // No orphan record, and no orphan grant.
+      expect(getAppGuestManager().listGuests().map(g => g.email)).toEqual(['a@example.com']);
+      expect(policy()?.guests).toHaveLength(1);
+      // And the address is still available to a real account — the squat.
+      await expect(
+        createUser('newbie', 'password123', 'user', 'b@example.com')
+      ).resolves.toBeDefined();
+    });
+
+    it('does NOT reap a guest that already existed', async () => {
+      // A failed RE-invite must not destroy a live grant. The record and its
+      // grant belong to the earlier, successful invitation.
+      await withTinyInviteCap();
+      await post(bearer(ownerToken), { email: 'a@example.com', gateApp: true });
+      const guest = getAppGuestManager().listGuests()[0];
+
+      // The creator is now at their invite cap, so a resend refuses at mint.
+      const refused = await post(bearer(ownerToken), { email: 'a@example.com', gateApp: true });
+
+      expect(refused.status).toBe(429);
+      expect(getAppGuestManager().getGuestById(guest.id)).toBeDefined();
+      expect(policy()?.guests).toEqual([guest.id]);
+    });
+
+    it('CHARGES the quota for a refused attempt, so the loop is metered', async () => {
+      process.env.DROP_MAX_INVITES_PER_HOUR = '2';
+      resetInviteQuota();
+      getInviteQuota(path.join(t.tempDir, 'invite-quotas.json'));
+      await withTinyInviteCap();
+
+      await post(bearer(ownerToken), { email: 'a@example.com', gateApp: true }); // 1/2, succeeds
+      await post(bearer(ownerToken), { email: 'b@example.com', gateApp: true }); // 2/2, refused at mint
+      const third = await post(bearer(ownerToken), { email: 'c@example.com', gateApp: true });
+
+      expect(third.status).toBe(429);
+      // The QUOTA message, not the capacity one — proof the refused attempt
+      // above was charged rather than free.
+      expect((await bodyOf(third)).error?.message).toMatch(/too many invitations recently/i);
+
+      delete process.env.DROP_MAX_INVITES_PER_HOUR;
+    });
+
+    it('bounds a concurrent BURST, not just a sequence', async () => {
+      // `check` and `record` used to be separated by three awaits, so N
+      // concurrent requests all passed the check before any of them recorded.
+      // A burst is the abuse shape that matters for a relay's sender
+      // reputation, and it was the one the quota did not stop.
+      process.env.DROP_MAX_INVITES_PER_HOUR = '3';
+      resetInviteQuota();
+      getInviteQuota(path.join(t.tempDir, 'invite-quotas.json'));
+
+      const results = await Promise.all(
+        Array.from({ length: 8 }, (_, i) =>
+          post(bearer(ownerToken), { email: `burst${i}@example.com`, gateApp: true })
+        )
+      );
+      const admitted = results.filter(r => r.status === 200).length;
+
+      expect(admitted).toBeLessThanOrEqual(3);
+
+      delete process.env.DROP_MAX_INVITES_PER_HOUR;
+    });
+  });
+
+  describe('the cap counts PEOPLE, not lists', () => {
+    it('refuses a guest once allow + guests reaches the cap', async () => {
+      // Two independent caps would let an owner admit twice as many people by
+      // alternating between the lists.
+      const allow = Array.from({ length: 200 }, (_, i) => `user-${i}`);
+      await seedPolicy({ allow });
+
+      const res = await post(bearer(ownerToken), { email: 'v@example.com', gateApp: true });
+
+      expect(res.status).toBe(409);
+      expect((await bodyOf(res)).error?.message).toContain('200 people with access');
+    });
+
+    it('counts existing guests against a USERNAME grant too', async () => {
+      const guests = Array.from({ length: 200 }, (_, i) => `guest:${i}`);
+      await seedPolicy({ guests });
+      await createUser('alice', 'password123', 'user');
+
+      const res = await post(bearer(ownerToken), { username: 'alice' });
+
+      expect(res.status).toBe(409);
+    });
+  });
+
+  describe('the clear-all rule sees guests (plan section B)', () => {
+    it('refuses an owner clearing a policy holding an ADMIN-invited guest', async () => {
+      // `[].every()` is true, so before DROP-155 an empty `allow` plus a full
+      // `guests` list cleared cleanly — un-gating an app an admin had gated.
+      await seedPolicy({
+        allow: [],
+        guests: ['guest:admin-invited'],
+        guestGrantedBy: { 'guest:admin-invited': adminId },
+      });
+
+      const res = await delAll(bearer(ownerToken));
+
+      expect(res.status).toBe(409);
+      expect(policy()).toBeDefined();
+    });
+
+    it('still lets an owner clear a policy that is entirely their own', async () => {
+      await seedPolicy({
+        allow: [],
+        guests: ['guest:mine'],
+        guestGrantedBy: { 'guest:mine': ownerId },
+      });
+
+      const res = await delAll(bearer(ownerToken));
+
+      expect(res.status).toBe(200);
+      expect(policy()).toBeUndefined();
+    });
+  });
+
+  describe('ownView', () => {
+    it('shows the caller their own invitees and counts everyone else as a number', async () => {
+      await seedPolicy({
+        allow: [],
+        guests: ['guest:mine', 'guest:theirs'],
+        guestGrantedBy: { 'guest:mine': ownerId, 'guest:theirs': otherOwnerId },
+      });
+
+      const body = await bodyOf(await get(bearer(ownerToken)));
+
+      expect(body.data?.ownGuests?.map(g => g.guestId)).toEqual(['guest:mine']);
+      // Someone else's invitee is a COUNT, never an address — the same rule
+      // `grantedBy` enforces for account grants.
+      expect(body.data?.othersGrantedCount).toBe(1);
+    });
+  });
+
+  describe('DELETE /share/guests/:guestId', () => {
+    const invite = async (email: string, token = ownerToken) => {
+      await post(bearer(token), { email, gateApp: true });
+      const record = getAppGuestManager().listGuests().find(g => g.email === email);
+      return record!;
+    };
+
+    it('lets the owner revoke someone they invited, and takes live invites with it', async () => {
+      const guest = await invite('v@example.com');
+      const live = await getAppGuestManager().mintInviteToken({
+        appName: APP,
+        guestId: guest.id,
+        email: guest.email,
+        createdBy: ownerId,
+      });
+
+      const res = await delGuest(guest.id, bearer(ownerToken));
+
+      expect(res.status).toBe(200);
+      expect((await bodyOf(res)).data?.revoked).toBe(true);
+      expect(policy()?.guests ?? []).toEqual([]);
+      expect(policy()?.guestGrantedBy ?? {}).toEqual({});
+      expect(getAppGuestManager().getGuestById(guest.id)).toBeUndefined();
+      // A revoke that left an invite redeemable would put the same person back
+      // on the list with one click.
+      expect(await getAppGuestManager().redeemInviteToken(live.id, live.secret)).toBeNull();
+    });
+
+    it('is a silent no-op for a guest the caller did not invite', async () => {
+      const guest = await invite('v@example.com');
+      await getAppConfigService().setAccessPolicy(APP, existing => ({
+        ...(existing.access as AppAccessPolicy),
+        guestGrantedBy: { [guest.id]: otherOwnerId },
+      }));
+
+      const res = await delGuest(guest.id, bearer(ownerToken));
+
+      // 200-not-revoked rather than 403: a distinguishable refusal is a
+      // membership oracle over the list `ownView` reduces to a count.
+      expect(res.status).toBe(200);
+      expect((await bodyOf(res)).data?.revoked).toBe(false);
+      expect(policy()?.guests).toEqual([guest.id]);
+    });
+
+    it('lets an admin revoke anyone', async () => {
+      const guest = await invite('v@example.com');
+
+      const res = await delGuest(guest.id, bearer(adminToken));
+
+      expect(res.status).toBe(200);
+      expect(policy()?.guests ?? []).toEqual([]);
+    });
+
+    it('refuses an OWNER removing a DISABLED record — delete-then-reinvite is a bypass', async () => {
+      // Deleting the record frees the (email, appName) key, so an owner who
+      // could delete it could re-invite the same address a second later and get
+      // a fresh, ENABLED guest. That is a clean bypass of an admin's disable
+      // performed entirely through owner-level routes.
+      const guest = await invite('v@example.com');
+      await getAppGuestManager().disableGuest(guest.id, adminId);
+
+      const res = await delGuest(guest.id, bearer(ownerToken));
+
+      expect(res.status).toBe(403);
+      expect(getAppGuestManager().getGuestById(guest.id)).toBeDefined();
+    });
+
+    it('lets an ADMIN remove a disabled record', async () => {
+      const guest = await invite('v@example.com');
+      await getAppGuestManager().disableGuest(guest.id, adminId);
+
+      const res = await delGuest(guest.id, bearer(adminToken));
+
+      expect(res.status).toBe(200);
+      expect(getAppGuestManager().getGuestById(guest.id)).toBeUndefined();
+    });
+  });
+
+  describe('PATCH /share/guests/:guestId — the admin disable lever', () => {
+    const patchGuest = (guestId: string, headers: Record<string, string>, body: unknown) =>
+      t.hono.request(`/api/v1/apps/${APP}/share/guests/${guestId}`, {
+        method: 'PATCH',
+        headers: { ...headers, 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+
+    const invite = async (email: string) => {
+      await post(bearer(ownerToken), { email, gateApp: true });
+      return getAppGuestManager().listGuests().find(g => g.email === email)!;
+    };
+
+    it('lets an admin disable a guest, stamping the record', async () => {
+      const guest = await invite('v@example.com');
+
+      const res = await patchGuest(guest.id, bearer(adminToken), { disabled: true });
+
+      expect(res.status).toBe(200);
+      const record = getAppGuestManager().getGuestById(guest.id)!;
+      expect(record.disabled).toBe(true);
+      // The stamp is what kills every live session immediately, rather than
+      // waiting out the 8h TTL.
+      expect(record.credentialsInvalidBefore).toBeTruthy();
+      expect(record.disabledBy).toBe(adminId);
+    });
+
+    it('refuses an OWNER', async () => {
+      const guest = await invite('v@example.com');
+
+      const res = await patchGuest(guest.id, bearer(ownerToken), { disabled: true });
+
+      expect(res.status).toBe(403);
+      expect(getAppGuestManager().getGuestById(guest.id)?.disabled).toBe(false);
+    });
+
+    it('is one-way — re-enabling is refused rather than half-supported', async () => {
+      // `credentialsInvalidBefore` is never cleared, so a re-enabled guest
+      // would read as enabled while its old sessions stayed dead: two sources
+      // of truth disagreeing about one person.
+      const guest = await invite('v@example.com');
+      await patchGuest(guest.id, bearer(adminToken), { disabled: true });
+
+      const res = await patchGuest(guest.id, bearer(adminToken), { disabled: false });
+
+      expect(res.status).toBe(400);
+      expect(getAppGuestManager().getGuestById(guest.id)?.disabled).toBe(true);
+    });
+
+    it('is a TOMBSTONE — a re-invite resolves to the same disabled record', async () => {
+      // The whole reason disable exists alongside revoke. Revoking removes the
+      // grant and the owner can re-invite a second later; disabling leaves a
+      // record the owner cannot delete, so the address resolves back to it.
+      const guest = await invite('v@example.com');
+      await patchGuest(guest.id, bearer(adminToken), { disabled: true });
+
+      await post(bearer(ownerToken), { email: 'v@example.com', gateApp: true });
+
+      const records = getAppGuestManager().listGuests().filter(g => g.email === 'v@example.com');
+      expect(records).toHaveLength(1);
+      expect(records[0].id).toBe(guest.id);
+      expect(records[0].disabled).toBe(true);
+    });
+  });
+
+  describe('the sharing toggle, and who it stops', () => {
+    /**
+     * `appSharingEnabled` gates OWNER-INITIATED sharing — that is what the
+     * setting is for and what DROP-153 pinned, including for revoke: an owner
+     * who may no longer share also may not unshare, and governance reverts to
+     * admins. That behaviour is unchanged here.
+     *
+     * What DROP-155 changes is narrower. An ADMIN is not stopped by it on the
+     * routes that TAKE ACCESS AWAY, because an operator who disables the
+     * feature during an incident must not lose every lever for removing one
+     * person. (`DELETE /apps/:name/access` still works for an admin, but it
+     * clears the WHOLE policy.)
+     */
+    it('stops an OWNER revoking, unchanged from DROP-153', async () => {
+      await post(bearer(ownerToken), { email: 'v@example.com', gateApp: true });
+      const guest = getAppGuestManager().listGuests()[0];
+      await getSettingsManager().setAppSharingEnabled(false);
+
+      const res = await delGuest(guest.id, bearer(ownerToken));
+
+      expect(res.status).toBe(403);
+      expect(policy()?.guests).toEqual([guest.id]);
+    });
+
+    it('does NOT stop an ADMIN revoking one guest', async () => {
+      await post(bearer(ownerToken), { email: 'v@example.com', gateApp: true });
+      const guest = getAppGuestManager().listGuests()[0];
+      await getSettingsManager().setAppSharingEnabled(false);
+
+      const res = await delGuest(guest.id, bearer(adminToken));
+
+      expect(res.status).toBe(200);
+      expect(policy()?.guests ?? []).toEqual([]);
+    });
+
+    it('does NOT stop an ADMIN disabling a guest', async () => {
+      await post(bearer(ownerToken), { email: 'v@example.com', gateApp: true });
+      const guest = getAppGuestManager().listGuests()[0];
+      await getSettingsManager().setAppSharingEnabled(false);
+
+      const res = await t.hono.request(`/api/v1/apps/${APP}/share/guests/${guest.id}`, {
+        method: 'PATCH',
+        headers: { ...bearer(adminToken), 'Content-Type': 'application/json' },
+        body: JSON.stringify({ disabled: true }),
+      });
+
+      expect(res.status).toBe(200);
+      expect(getAppGuestManager().getGuestById(guest.id)?.disabled).toBe(true);
+    });
+
+    it('still stops an ADMIN from GRANTING — only removal is exempt', async () => {
+      await getSettingsManager().setAppSharingEnabled(false);
+
+      const res = await post(bearer(adminToken), { email: 'v@example.com', gateApp: true });
+
+      expect(res.status).toBe(403);
+    });
+  });
+
+  describe('the other end of the collision rule', () => {
+    it('refuses creating a DROP user with an address a guest already holds', async () => {
+      await post(bearer(ownerToken), { email: 'v@example.com', gateApp: true });
+
+      await expect(
+        createUser('newbie', 'password123', 'user', 'V@Example.com')
+      ).rejects.toThrow(/not available/);
+    });
+
+    it('refuses MOVING an existing user onto a guest address', async () => {
+      // A check only on create is walked past by an update one request later.
+      await post(bearer(ownerToken), { email: 'v@example.com', gateApp: true });
+
+      await expect(updateUser(adminId, { email: 'v@example.com' })).rejects.toThrow(
+        /not available/
+      );
+    });
+
+    it('still bootstraps a user with NO email while the guest store is corrupt', async () => {
+      // `emailHeldByAnyGuest` throws on a corrupt store — the right direction
+      // for a check that cannot rule out a parallel identity. But the default
+      // admin is created through this same function with no email at all, and
+      // refusing that because an unrelated file is unreadable bricks the box.
+      await fs.writeFile(path.join(t.tempDir, 'app-guests.json'), 'not json');
+      await getAppGuestManager().load();
+      expect(getAppGuestManager().isCorrupt()).toBe(true);
+
+      await expect(createUser('bootstrap', 'password123', 'admin')).resolves.toBeDefined();
+    });
+  });
+});

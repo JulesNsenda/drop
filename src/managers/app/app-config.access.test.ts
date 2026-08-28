@@ -42,6 +42,20 @@ const setPolicy = (
   access: AppAccessPolicy
 ): Promise<AppConfig | null> => svc.setAccessPolicy(name, () => access);
 
+/**
+ * The invariant `guests`/`guestGrantedBy` carry-forward exists to protect:
+ * every `guestGrantedBy` key must name a guest actually present in `guests`
+ * — a provenance entry for a guest no longer on the list is exactly the
+ * stranding shape DROP-153 Gate 2 closed for `grantedBy`/`allow`, now
+ * checked on the guest pair after every write this file exercises.
+ */
+const expectGuestGrantedByIsSubsetOfGuests = (access: AppAccessPolicy | undefined): void => {
+  const guests = new Set(access?.guests ?? []);
+  for (const guestId of Object.keys(access?.guestGrantedBy ?? {})) {
+    expect(guests.has(guestId)).toBe(true);
+  }
+};
+
 describe('config field tiers', () => {
   it('SYSTEM and RESTRICTED stay disjoint', () => {
     // A field in both is stripped twice and warns twice for one write. The
@@ -222,6 +236,34 @@ describe('AppConfig.access containment', () => {
       });
     });
 
+    it('strips guestGrantedBy entries the deleted user GRANTED, even though they hold no allow entry themselves (DROP-155)', async () => {
+      // u-inviter invited a guest into 'myapp' but was never given `allow`
+      // access to it themselves — the same stranding shape DROP-153 Gate 2
+      // closed for grantedBy, now on the guest provenance map: without this,
+      // the pre-filter never looks at this app and the entry survives
+      // attributed to a deleted account forever.
+      await setPolicy(service, 'myapp', {
+        mode: 'drop-users',
+        allow: [],
+        guests: ['guest:g1'],
+        guestGrantedBy: { 'guest:g1': 'u-inviter' },
+      });
+
+      const touched = await service.pruneAllowListEntries('u-inviter');
+
+      expect(touched).toEqual(['myapp']);
+      // The guest keeps their access — only the stale provenance is dropped,
+      // which makes the entry read as admin-authored (absent from
+      // guestGrantedBy).
+      const access = service.getConfig('myapp')?.access;
+      expect(access).toEqual({
+        mode: 'drop-users',
+        allow: [],
+        guests: ['guest:g1'],
+      });
+      expectGuestGrantedByIsSubsetOfGuests(access);
+    });
+
     it('handles a user who is both grantee and grantor on the same app', async () => {
       await setPolicy(service, 'myapp', {
         mode: 'drop-users',
@@ -286,6 +328,115 @@ describe('AppConfig.access containment', () => {
       expect(writeSpy).toHaveBeenCalledTimes(1);
       expect(service.getConfig('myapp')?.access).toEqual({ mode: 'drop-users', allow: [] });
       writeSpy.mockRestore();
+    });
+  });
+
+  describe('pruneGuestEntries (DROP-155 §2)', () => {
+    it('removes one guest from every list they are on, and leaves the rest', async () => {
+      await fs.mkdir(path.join(tempDir, 'webapps', 'other'), { recursive: true });
+      await service.upsertConfig('other', { type: 'nodejs' });
+      await setPolicy(service, 'myapp', {
+        mode: 'drop-users',
+        allow: [],
+        guests: ['guest:g1', 'guest:g2'],
+      });
+      await setPolicy(service, 'other', { mode: 'drop-users', allow: [], guests: ['guest:g2'] });
+
+      const touched = await service.pruneGuestEntries('guest:g2');
+
+      expect(touched.sort()).toEqual(['myapp', 'other']);
+      expect(service.getConfig('myapp')?.access?.guests).toEqual(['guest:g1']);
+      expect(service.getConfig('other')?.access?.guests).toEqual([]);
+    });
+
+    it('leaves apps the guest was never on untouched', async () => {
+      await setPolicy(service, 'myapp', { mode: 'drop-users', allow: [], guests: ['guest:g1'] });
+      expect(await service.pruneGuestEntries('guest:nobody')).toEqual([]);
+      expect(service.getConfig('myapp')?.access?.guests).toEqual(['guest:g1']);
+    });
+
+    it('is a no-op on an ungated app', async () => {
+      expect(await service.pruneGuestEntries('guest:g1')).toEqual([]);
+      expect(service.getConfig('myapp')?.access).toBeUndefined();
+    });
+
+    it('does NOT remove the policy itself — an empty guest list still gates', async () => {
+      await setPolicy(service, 'myapp', { mode: 'drop-users', allow: [], guests: ['guest:g1'] });
+      await service.pruneGuestEntries('guest:g1');
+      expect(service.getConfig('myapp')?.access).toEqual({
+        mode: 'drop-users',
+        allow: [],
+        guests: [],
+      });
+    });
+
+    it('persists through the RESTRICTED writer, not around it', async () => {
+      await setPolicy(service, 'myapp', { mode: 'drop-users', allow: [], guests: ['guest:g1'] });
+      await service.pruneGuestEntries('guest:g1');
+      expect((await readFromDisk('myapp')).access).toEqual({
+        mode: 'drop-users',
+        allow: [],
+        guests: [],
+      });
+    });
+
+    it('drops the pruned guest id from guestGrantedBy too', async () => {
+      await setPolicy(service, 'myapp', {
+        mode: 'drop-users',
+        allow: [],
+        guests: ['guest:g1', 'guest:g2'],
+        guestGrantedBy: { 'guest:g1': 'owner-a', 'guest:g2': 'owner-b' },
+      });
+      await service.pruneGuestEntries('guest:g1');
+      expect(service.getConfig('myapp')?.access).toEqual({
+        mode: 'drop-users',
+        allow: [],
+        guests: ['guest:g2'],
+        guestGrantedBy: { 'guest:g2': 'owner-b' },
+      });
+    });
+
+    it('does not touch allow/grantedBy — a guest id never appears there', async () => {
+      await setPolicy(service, 'myapp', {
+        mode: 'drop-users',
+        allow: ['u1'],
+        grantedBy: { u1: 'owner-a' },
+        guests: ['guest:g1'],
+      });
+      await service.pruneGuestEntries('guest:g1');
+      expect(service.getConfig('myapp')?.access).toEqual({
+        mode: 'drop-users',
+        allow: ['u1'],
+        grantedBy: { u1: 'owner-a' },
+        guests: [],
+      });
+    });
+
+    it('a grant racing a prune under the write chain settles deterministically, never both applied and reverted', async () => {
+      await setPolicy(service, 'myapp', {
+        mode: 'drop-users',
+        allow: [],
+        guests: ['guest:g1'],
+      });
+
+      const grantGuest = (guestId: string): Promise<AppConfig | null> =>
+        service.setAccessPolicy('myapp', existing => {
+          const current = existing.access ?? { mode: 'drop-users' as const, allow: [] };
+          const guests = current.guests ?? [];
+          if (guests.includes(guestId)) return current; // idempotent re-grant
+          return { ...current, guests: [...guests, guestId] };
+        });
+
+      await Promise.all([grantGuest('guest:g2'), service.pruneGuestEntries('guest:g1')]);
+
+      // `enqueueWrite` serializes both onto the same per-app chain
+      // (`setAccessPolicy` is called synchronously by each before either op
+      // actually runs), so the grant's write always lands first and the
+      // prune's updater re-reads THAT result rather than a stale snapshot
+      // taken before it: g1 is gone (the prune removed it) and g2 survives
+      // (the grant added it and the prune never touches an unrelated id) —
+      // neither op silently reverts the other's write.
+      expect(service.getConfig('myapp')?.access?.guests?.sort()).toEqual(['guest:g2']);
     });
   });
 
@@ -389,6 +540,165 @@ describe('AppConfig.access containment', () => {
       const access = service.getConfig('myapp')?.access;
       expect(access).toEqual({ mode: 'drop-users', allow: ['u2'] });
       expect(access && 'grantedBy' in access).toBe(false);
+    });
+  });
+
+  /**
+   * DROP-155 plan §A (critical): `guests` and `guestGrantedBy` must be
+   * STRUCTURAL in `mergeAccessProvenance` exactly as `allow`/`grantedBy`
+   * are — a whole-policy literal that has never heard of guests must not
+   * delete them. `PUT /apps/:name/access` and `POST /apps/:name/share` both
+   * return whole-policy literals of this exact shape; these simulate each
+   * writer's own return shape rather than exercising the routes (which live
+   * outside this file).
+   */
+  describe('setAccessPolicy: guest carry-forward (DROP-155 §A)', () => {
+    it('an admin PUT /access-shaped literal that omits guests does not lose them', async () => {
+      await setPolicy(service, 'myapp', {
+        mode: 'drop-users',
+        allow: ['u1'],
+        guests: ['guest:g1', 'guest:g2'],
+        guestGrantedBy: { 'guest:g1': 'owner-a' },
+      });
+
+      // The admin PUT /access route's own return shape: { mode, allow,
+      // grantedBy } — no `guests` key at all.
+      await service.setAccessPolicy('myapp', (): AppAccessPolicy => ({
+        mode: 'drop-users',
+        allow: ['u1', 'u2'],
+        grantedBy: { u2: 'admin-a' },
+      }));
+
+      const access = service.getConfig('myapp')?.access;
+      expect(access).toEqual({
+        mode: 'drop-users',
+        allow: ['u1', 'u2'],
+        grantedBy: { u2: 'admin-a' },
+        guests: ['guest:g1', 'guest:g2'],
+        guestGrantedBy: { 'guest:g1': 'owner-a' },
+      });
+      expectGuestGrantedByIsSubsetOfGuests(access);
+    });
+
+    it('an owner POST /share-shaped literal that omits guests does not lose them', async () => {
+      await setPolicy(service, 'myapp', {
+        mode: 'drop-users',
+        allow: ['u1'],
+        guests: ['guest:g1'],
+        guestGrantedBy: { 'guest:g1': 'admin-a' },
+      });
+
+      // The owner share route's own return shape: another whole-policy
+      // literal that has never heard of guests either.
+      await service.setAccessPolicy('myapp', (): AppAccessPolicy => ({
+        mode: 'drop-users',
+        allow: ['u1', 'u3'],
+        grantedBy: { u3: 'u1' },
+      }));
+
+      expect(service.getConfig('myapp')?.access?.guests).toEqual(['guest:g1']);
+      expect(service.getConfig('myapp')?.access?.guestGrantedBy).toEqual({
+        'guest:g1': 'admin-a',
+      });
+    });
+
+    it('drops guest provenance for guest ids the write removes from guests', async () => {
+      await setPolicy(service, 'myapp', {
+        mode: 'drop-users',
+        allow: [],
+        guests: ['guest:g1', 'guest:g2'],
+        guestGrantedBy: { 'guest:g1': 'owner-a', 'guest:g2': 'owner-b' },
+      });
+
+      await service.setAccessPolicy('myapp', (): AppAccessPolicy => ({
+        mode: 'drop-users',
+        allow: [],
+        guests: ['guest:g2'],
+      }));
+
+      expect(service.getConfig('myapp')?.access).toEqual({
+        mode: 'drop-users',
+        allow: [],
+        guests: ['guest:g2'],
+        guestGrantedBy: { 'guest:g2': 'owner-b' },
+      });
+    });
+
+    it('an updater that explicitly manages guests/guestGrantedBy (even to nothing) is never overridden', async () => {
+      await setPolicy(service, 'myapp', {
+        mode: 'drop-users',
+        allow: [],
+        guests: ['guest:g1'],
+        guestGrantedBy: { 'guest:g1': 'owner-a' },
+      });
+
+      // Explicit `guests: undefined` — "this write clears guests", not "I
+      // forgot to mention them". Auto carry-forward must not resurrect it.
+      await service.setAccessPolicy('myapp', (): AppAccessPolicy => ({
+        mode: 'drop-users',
+        allow: [],
+        guests: undefined,
+        guestGrantedBy: undefined,
+      }));
+
+      expect(service.getConfig('myapp')?.access).toEqual({ mode: 'drop-users', allow: [] });
+      // `yaml.stringify` omits undefined values, so on disk (unlike the
+      // in-memory object, which legitimately carries the key with an
+      // `undefined` value) the fields are truly absent, not resurrected.
+      const onDisk = await readFromDisk('myapp');
+      expect('guests' in onDisk.access!).toBe(false);
+      expect('guestGrantedBy' in onDisk.access!).toBe(false);
+    });
+
+    it('has nothing to carry forward when there was no existing policy', async () => {
+      const updated = await service.setAccessPolicy('myapp', (): AppAccessPolicy => ({
+        mode: 'drop-users',
+        allow: [],
+        guests: ['guest:g1'],
+      }));
+      expect(updated?.access).toEqual({ mode: 'drop-users', allow: [], guests: ['guest:g1'] });
+    });
+
+    it('carries guestGrantedBy forward to ABSENT (not an empty object) when the write drops every owner-authored guest id', async () => {
+      await setPolicy(service, 'myapp', {
+        mode: 'drop-users',
+        allow: [],
+        guests: ['guest:g1', 'guest:g2'],
+        guestGrantedBy: { 'guest:g1': 'owner-a' }, // g1 owner-authored, g2 admin-authored
+      });
+
+      await service.setAccessPolicy('myapp', (): AppAccessPolicy => ({
+        mode: 'drop-users',
+        allow: [],
+        guests: ['guest:g2'],
+      }));
+
+      const access = service.getConfig('myapp')?.access;
+      expect(access).toEqual({ mode: 'drop-users', allow: [], guests: ['guest:g2'] });
+      expect(access && 'guestGrantedBy' in access).toBe(false);
+    });
+
+    it('survives an ordinary redeploy-shaped write untouched, same as allow/grantedBy', async () => {
+      // `access` (guests included) must not share `mcp`'s lifecycle, where
+      // the field is recomputed from tenant source on every build.
+      await setPolicy(service, 'myapp', {
+        mode: 'drop-users',
+        allow: [],
+        guests: ['guest:g1'],
+        guestGrantedBy: { 'guest:g1': 'owner-a' },
+      });
+
+      await service.updateConfig('myapp', {
+        port: 4001,
+        lastDeployedAt: new Date(0).toISOString(),
+        sourceHash: 'abc123',
+      });
+      await service.upsertSystemConfig('myapp', { agentCreated: true });
+
+      expect(service.getConfig('myapp')?.access?.guests).toEqual(['guest:g1']);
+      expect(service.getConfig('myapp')?.access?.guestGrantedBy).toEqual({
+        'guest:g1': 'owner-a',
+      });
     });
   });
 

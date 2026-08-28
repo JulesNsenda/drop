@@ -18,9 +18,7 @@ import type { MailSettings } from '../../managers/settings/settings-manager';
 import { normalizePublicUrl } from '../../utils/url-validator';
 import { getPublicUrl, setPublicUrl, isAccessGateEnabled } from '../runtime-config';
 import { getMailCredentialStore, clearMailCredential } from '../../managers/mailer/mail-credential';
-import { sendTemplatedMail } from '../../managers/mailer/mailer';
-import { getMailQuota } from '../../managers/guardrail/principal-quota';
-import { checkMailQuota } from './mail-quota';
+import { sendMeteredMail } from './mail-quota';
 
 const admin = new Hono();
 
@@ -79,6 +77,21 @@ function buildUserConnectorsPayload(): { enabled: boolean } {
  */
 function buildAppSharingPayload(): { enabled: boolean } {
   return { enabled: getSettingsManager().getAppSharingEnabled() };
+}
+
+/**
+ * Status block for the DROP-155 guest-invite toggle.
+ *
+ * Reported beside `appSharing` rather than inside `mail`, and that placement
+ * is the argument for why it is a separate flag at all: this gates a SHARING
+ * capability — whether an owner may admit someone with no DROP account — and
+ * only incidentally causes mail to be sent. Folding it into the mail payload
+ * would file it as a relay setting and invite the next reader to collapse it
+ * into `shareNotificationsEnabled`, which gates a strictly smaller thing
+ * (mail to an address DROP already holds, put there by an admin).
+ */
+function buildGuestInvitesPayload(): { enabled: boolean } {
+  return { enabled: getSettingsManager().getGuestInvitesEnabled() };
 }
 
 interface MailPayload {
@@ -303,6 +316,7 @@ admin.get('/settings', async (c) => {
       githubWebhook: buildGithubWebhookPayload(),
       userConnectors: buildUserConnectorsPayload(),
       appSharing: buildAppSharingPayload(),
+      guestInvites: buildGuestInvitesPayload(),
       mail: await buildMailPayload(),
     })
   );
@@ -473,6 +487,72 @@ admin.put('/settings/app-sharing', async (c) => {
       : undefined;
 
   return c.json(success({ ...buildAppSharingPayload(), ...(warning ? { warning } : {}) }));
+});
+
+// PUT /admin/settings/guest-invites - Gate whether an owner may invite someone
+// with NO DROP account (DROP-155's `{ email }` branch on POST /apps/:name/share).
+//
+// Its OWN route rather than a field on PUT /settings/mail, mirroring
+// /settings/app-sharing above: this is a sharing capability, not a relay
+// setting. Same strict-boolean shape as its two siblings — a two-state policy
+// toggle, not a "clear to fall back" field, so a non-boolean is rejected
+// rather than coerced.
+admin.put('/settings/guest-invites', async (c) => {
+  const authCtx = (c.get as Function)('auth') as AuthContext | undefined;
+  const body = (await c.req.json()) as unknown;
+
+  if (!isJsonObjectBody(body)) {
+    return c.json(error(ErrorCodes.VALIDATION_ERROR, 'Request body must be a JSON object'), 400);
+  }
+
+  const input = requireBooleanField(body, 'enabled');
+  if (input === undefined) {
+    return c.json(error(ErrorCodes.VALIDATION_ERROR, 'enabled must be a boolean'), 400);
+  }
+
+  await getSettingsManager().setGuestInvitesEnabled(input);
+
+  await logActivityFor(authCtx, {
+    action: 'guest-invites-set',
+    detail: `Guest invites ${input ? 'enabled' : 'disabled'}`,
+  });
+
+  // TWO contradictions are reachable here, and both are created by this
+  // request rather than by boot, so neither could be reported by a startup
+  // check. Enabling guest invites while app sharing is off makes the branch
+  // unreachable (owners cannot reach /share at all); enabling it with no relay
+  // configured means the invite mail cannot be delivered — which is survivable,
+  // because the invite URL comes back on the response in exactly that case,
+  // but it is not what an operator flipping this switch expects.
+  const warnings: string[] = [];
+  if (!input) {
+    // Said plainly, because the switch does more than its name suggests and an
+    // operator reaching for it in an incident needs to know which.
+    warnings.push(
+      'Guest access is now OFF platform-wide: no new invitations, no redemptions, and every ' +
+        'existing guest session stops opening its app immediately. Nothing is deleted — turning ' +
+        'this back on restores the guests and grants that were already there.'
+    );
+  }
+  if (input && !getSettingsManager().getAppSharingEnabled()) {
+    warnings.push(
+      'Guest invites are enabled, but owner-initiated app sharing is disabled, so no owner can ' +
+        'reach the invite route until app sharing is turned on.'
+    );
+  }
+  if (input && !getSettingsManager().getMailSettings().host) {
+    warnings.push(
+      'Guest invites are enabled, but no SMTP relay is configured, so invitation emails cannot ' +
+        'be delivered. The invite link is returned to the person who created it instead.'
+    );
+  }
+
+  return c.json(
+    success({
+      ...buildGuestInvitesPayload(),
+      ...(warnings.length > 0 ? { warning: warnings.join(' ') } : {}),
+    })
+  );
 });
 
 const MAIL_PORT_MIN = 1;
@@ -745,34 +825,28 @@ admin.post('/mail/test', async (c) => {
     return c.json(error(ErrorCodes.VALIDATION_ERROR, 'to must be a non-empty string'), 400);
   }
 
-  // checkMailQuota (mail-quota.ts) — shared with apps.share.ts's notifyShareGrant
-  // against this same singleton — but this route ADMITS or REFUSES on it (a
-  // structured 429, mirroring admitDeploy's guardrail shape in
+  // sendMeteredMail (mail-quota.ts) — the check -> send -> charge-only-if-dialed
+  // sequence, shared with apps.share.ts's notifyShareGrant against the same
+  // quota singleton. What differs between the two callers is what a REFUSAL
+  // means, and that is decided here: this route ADMITS or REFUSES on the quota
+  // (a structured 429, mirroring admitDeploy's guardrail shape in
   // deploy-breaker.ts) rather than skipping silently, since sending is this
   // route's entire purpose rather than a best-effort side effect of one.
-  const admission = checkMailQuota({ principalId: authCtx?.principalId, actorUserId: authCtx?.userId });
-  if (!admission.allowed) {
-    if (admission.retryAfterSeconds) c.header('Retry-After', String(admission.retryAfterSeconds));
+  const result = await sendMeteredMail(
+    { principalId: authCtx?.principalId, actorUserId: authCtx?.userId },
+    'test',
+    to.trim(),
+    { platformUrl: getPublicUrl() ?? '' }
+  );
+  if (result.status === 'refused') {
+    if (result.retryAfterSeconds) c.header('Retry-After', String(result.retryAfterSeconds));
     const message =
-      admission.reason === 'no_principal'
+      result.reason === 'no_principal'
         ? 'Mail quota unavailable for this request.'
         : 'Mail quota exceeded. Try again later.';
     return c.json(error(ErrorCodes.RATE_LIMITED, message), 429);
   }
-
-  const result = await sendTemplatedMail('test', to.trim(), { platformUrl: getPublicUrl() ?? '' });
   const failure = result.status === 'attempted' ? result.failure : undefined;
-
-  // Charge the allowance only once the relay was actually dialed — the same
-  // rule notifyShareGrant follows (apps.share.ts) and for the identical
-  // reason: an unconfigured relay (`status: 'unavailable'`) never opens a
-  // socket, and counting it against the quota would refuse the first REAL
-  // sends once an operator finally configures mail. This route used to record
-  // BEFORE sending, which is exactly that bug — reconciled with the share
-  // path's rule here (DROP-154 Gate 5 finding).
-  if (result.status !== 'unavailable') {
-    getMailQuota().record(admission.keys);
-  }
 
   // This module has no ActivityLog write of its own (DROP-154 Gate 2 §4) —
   // every caller owns its own attribution, and admin's own principal is what

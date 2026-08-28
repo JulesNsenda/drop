@@ -75,6 +75,22 @@ export interface PlatformSettings {
    * disclosure tradeoff rather than a default nobody chose.
    */
   shareNotificationsEnabled?: boolean;
+  /**
+   * Gates the GUEST-INVITE branch of `POST /apps/:name/share` (DROP-155):
+   * whether an owner may invite an address that has no DROP account at all.
+   * Defaults to DISABLED (`false`) when unset — a sibling of
+   * `shareNotificationsEnabled` above, but gating a strictly larger thing
+   * and therefore not merged with it.
+   *
+   * `shareNotificationsEnabled` gates mail to an address DROP ALREADY HOLDS,
+   * put there by an admin at user creation. The guest branch takes an
+   * arbitrary address from the request body, which makes it a "send mail to
+   * any address on the internet, from the operator's SPF/DKIM-aligned
+   * relay" primitive — a different thing to consent to, and one an operator
+   * may reasonably want off while ordinary share notifications stay on. Two
+   * flags, so neither decision is made on the other's behalf.
+   */
+  guestInvitesEnabled?: boolean;
 }
 
 export interface SettingsManagerConfig {
@@ -121,6 +137,7 @@ const SETTINGS_FIELDS: Record<keyof PlatformSettings, SettingsFieldType> = {
   smtpUser: 'string',
   mailFrom: 'string',
   shareNotificationsEnabled: 'boolean',
+  guestInvitesEnabled: 'boolean',
   // The SMTP password is deliberately NOT here — and cannot be, since it is
   // not a key of `PlatformSettings` at all. It lives encrypted in its own
   // store (mail-credential.ts), owned by the mailer; adding it to
@@ -386,6 +403,32 @@ export class SettingsManager {
   /** Set (or, with `undefined`, clear) the stored share-notifications-enabled override. Persists atomically. */
   async setShareNotificationsEnabled(enabled: boolean | undefined): Promise<void> {
     const next: PlatformSettings = { ...this.settings, shareNotificationsEnabled: enabled };
+    // Same persist-then-commit-in-memory shape as setPublicUrl above — see
+    // that method's comment for why this isn't queued through a chained
+    // savePromise.
+    await this.doSave(next);
+    this.settings = next;
+  }
+
+  /**
+   * Whether an owner may invite a person with NO DROP account (DROP-155).
+   * Defaults to DISABLED, same shape as getShareNotificationsEnabled() above
+   * — see the field comment on `guestInvitesEnabled` for why this is a
+   * SECOND flag rather than a widening of that one.
+   *
+   * The `corrupt` check is what makes an unreadable settings.json refuse
+   * guest invites rather than fall through to the `?? false` default by
+   * accident. Same direction as its two siblings: an operator opt-in whose
+   * safe state is off.
+   */
+  getGuestInvitesEnabled(): boolean {
+    if (this.corrupt) return false;
+    return this.settings.guestInvitesEnabled ?? false;
+  }
+
+  /** Set (or, with `undefined`, clear) the stored guest-invites-enabled override. Persists atomically. */
+  async setGuestInvitesEnabled(enabled: boolean | undefined): Promise<void> {
+    const next: PlatformSettings = { ...this.settings, guestInvitesEnabled: enabled };
     // Same persist-then-commit-in-memory shape as setPublicUrl above — see
     // that method's comment for why this isn't queued through a chained
     // savePromise.
