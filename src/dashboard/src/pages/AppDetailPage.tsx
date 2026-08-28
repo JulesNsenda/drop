@@ -691,7 +691,11 @@ function AppDetailPage() {
           narrower, WRITE-capable share panel instead — `AccessTab`'s allow-list
           and provenance are exactly what `ShareCard` withholds from the party
           it would otherwise disclose (DROP-153). */}
-      {activeTab === 'access' && <TabPanel id="access">(isAdmin ? <AccessTab appName={app.name} /> : <ShareCard appName={app.name} />)</TabPanel>}
+      {activeTab === 'access' && (
+        <TabPanel id="access">
+          {isAdmin ? <AccessTab appName={app.name} /> : <ShareCard appName={app.name} />}
+        </TabPanel>
+      )}
 
       {activeTab === 'environment' && (
         <TabPanel id="environment">
