@@ -532,7 +532,7 @@ function DeployPage() {
       </div>
 
       <div className="max-w-2xl">
-        <Tabs tabs={deployTabs} active={tab} onChange={id => setTab(id as Tab)} />
+        <Tabs tabs={deployTabs} active={tab} onChange={id => setTab(id as Tab)} label="Deployment source" />
       </div>
 
       {/* GitHub tab */}
