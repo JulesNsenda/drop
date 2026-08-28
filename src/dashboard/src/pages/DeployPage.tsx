@@ -29,6 +29,7 @@ import Tabs, { TabDef, TabPanel } from '../components/Tabs';
 import Button from '../components/ui/Button';
 import Card from '../components/ui/Card';
 import Input from '../components/ui/Input';
+import Field from '../components/ui/Field';
 import { buildArchiveFromFiles, UploadArchiveError } from '../lib/upload-archive';
 import { APP_NAME_RE, commonRootName, normalizeEntryPath } from '../../../utils/upload-paths';
 import { formatBytes } from '../components/db-format';
@@ -569,12 +570,11 @@ function DeployPage() {
             </div>
 
             {/* Token + auto-redeploy row */}
-            <div>
-              <label className="mb-1 block text-sm font-medium" style={{ color: 'var(--text-2)' }}>
-                Authentication (private repos)
-              </label>
+            <Field label="Authentication (private repos)">
+              {({ id }) => (
               <div className="flex gap-2">
                 <select
+                  id={id}
                   value={selectedToken}
                   onChange={e => setSelectedToken(e.target.value)}
                   className={inlineFieldClass}
@@ -597,7 +597,8 @@ function DeployPage() {
                   <Key className="h-4 w-4" />
                 </button>
               </div>
-            </div>
+              )}
+            </Field>
 
             {/* Token manager panel */}
             {showTokenForm && (

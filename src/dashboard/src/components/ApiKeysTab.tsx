@@ -6,6 +6,7 @@ import { useConfirm } from './ConfirmDialog';
 import Button from './ui/Button';
 import Input from './ui/Input';
 import Card from './ui/Card';
+import Field from './ui/Field';
 import { SkeletonText } from './ui/Skeleton';
 import {
   Table,
@@ -233,25 +234,20 @@ function ApiKeysTab() {
               placeholder="e.g. CI deploy key"
               autoFocus
             />
-            <div>
-              <label
-                className="mb-1 block text-sm font-medium"
-                style={{ color: 'var(--text-2)' }}
-                htmlFor="api-key-role"
-              >
-                Role
-              </label>
-              <select
-                id="api-key-role"
-                value={role}
-                onChange={e => setRole(e.target.value as ApiKeyRecord['role'])}
-                className="w-full rounded-lg px-3 py-2 text-sm outline-none dui-input"
-              >
-                <option value="readonly">Readonly</option>
-                <option value="user">User</option>
-                <option value="admin">Admin</option>
-              </select>
-            </div>
+            <Field label="Role" id="api-key-role">
+              {({ id }) => (
+                <select
+                  id={id}
+                  value={role}
+                  onChange={e => setRole(e.target.value as ApiKeyRecord['role'])}
+                  className="dui-input w-full rounded-lg px-3 py-2 text-sm outline-none"
+                >
+                  <option value="readonly">Readonly</option>
+                  <option value="user">User</option>
+                  <option value="admin">Admin</option>
+                </select>
+              )}
+            </Field>
             <Input
               id="api-key-expires"
               label="Expires in (days)"

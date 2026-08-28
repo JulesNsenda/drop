@@ -1,46 +1,45 @@
-import { InputHTMLAttributes, forwardRef, useId } from 'react';
+import { InputHTMLAttributes, forwardRef } from 'react';
+import { cn } from '../../lib/cn';
+import Field from './Field';
 
 export interface InputProps extends InputHTMLAttributes<HTMLInputElement> {
   label?: string;
+  /** Guidance shown under the control, announced with it. */
+  hint?: string;
   error?: string;
 }
 
 /**
- * Design-system input primitive (PRD-045): label + error + focus ring =
- * `--accent`. Forwards all native <input> props. Render inside a `.drop-ui`
- * scope (AppShell / AuthLayout).
+ * Text input primitive (PRD-045).
+ *
+ * The label/hint/error scaffolding now comes from `Field` (DROP-156 PR 4)
+ * rather than being a second copy of the same wiring — `Input` is just the
+ * control. Its public API is unchanged: `label` and `error` behave exactly as
+ * before, and `hint` is new.
+ *
+ * Render inside a `.drop-ui` scope.
  */
 const Input = forwardRef<HTMLInputElement, InputProps>(function Input(
-  { label, error, id, className = '', ...rest },
+  { label, hint, error, id, className, ...rest },
   ref
 ) {
-  const generatedId = useId();
-  const inputId = id || generatedId;
-  const errorId = `${inputId}-error`;
-
   return (
-    <div className="w-full">
-      {label && (
-        <label htmlFor={inputId} className="mb-1 block text-sm font-medium" style={{ color: 'var(--text-2)' }}>
-          {label}
-        </label>
+    <Field label={label} hint={hint} error={error} id={id}>
+      {({ id: inputId, describedBy, invalid }) => (
+        <input
+          ref={ref}
+          id={inputId}
+          aria-describedby={describedBy}
+          aria-invalid={invalid}
+          className={cn(
+            'dui-input w-full rounded-lg px-3 py-2 outline-none transition-colors',
+            error && 'dui-input-error',
+            className
+          )}
+          {...rest}
+        />
       )}
-      <input
-        ref={ref}
-        id={inputId}
-        className={`w-full rounded-lg px-3 py-2 outline-none transition-colors dui-input ${
-          error ? 'dui-input-error' : ''
-        } ${className}`}
-        aria-invalid={!!error || undefined}
-        aria-describedby={error ? errorId : undefined}
-        {...rest}
-      />
-      {error && (
-        <p id={errorId} role="alert" className="mt-1 text-sm" style={{ color: 'var(--err)' }}>
-          {error}
-        </p>
-      )}
-    </div>
+    </Field>
   );
 });
 
