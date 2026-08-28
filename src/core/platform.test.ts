@@ -16,6 +16,8 @@ import { getDetector, parseDropYaml, DetectionResult } from './detector';
 import * as diskUtils from '../utils/disk';
 import { createApiKey, deleteApiKeysByName } from '../api/middleware/auth';
 import { setPublicUrl } from '../api/runtime-config';
+import { getMailQuota, resetMailQuota } from '../managers/guardrail/principal-quota';
+import { getAppGuestManager, resetAppGuests } from '../managers/app-guest';
 
 // These are pipeline/service unit tests — they never exercise the HTTP API, so
 // disable it (createPlatform reads DROP_ENABLE_API when no enableApi is passed).
@@ -605,6 +607,29 @@ describe('DropPlatform', () => {
       expect(platform.getProcessManager()).not.toBeNull();
       expect(platform.getRouter()).not.toBeNull();
     });
+
+    // DROP-154: the mail quota needs the same DROP_ROOT-bound + initialize()
+    // treatment the deploy quota already gets (see the `start()` comment) —
+    // left bare it resolves relative to the process CWD and never loads
+    // counts from a prior run, which for `failClosedWhenFull` is a bypass
+    // arriving by the back door. Asserted directly against the singleton
+    // (not just "start() doesn't throw") because a platform boot that never
+    // calls `getMailQuota(mailQuotaStore).initialize()` at all would still
+    // pass every other test in this file.
+    it('initializes the mail quota bound to dropRoot, not the process CWD', async () => {
+      await platform.start();
+
+      const quota = getMailQuota();
+      const expectedPath = path.join(tempDir, 'data', 'drop-svc', 'mail-quotas.json');
+      // getMailQuota() with no args never throws — it just returns whatever
+      // instance exists. Reconfiguring it to a DIFFERENT path is what would
+      // throw (see getMailQuota's own doc), so that's the discriminator: if
+      // start() bound it to `tempDir` as expected, asking for the same path
+      // back is a silent no-op; asking for the CWD-relative default would
+      // throw "already initialized at ... cannot reconfigure".
+      expect(() => getMailQuota(expectedPath)).not.toThrow();
+      expect(quota).toBe(getMailQuota(expectedPath));
+    });
   });
 
   describe('stop', () => {
@@ -624,6 +649,45 @@ describe('DropPlatform', () => {
       await platform.stop();
 
       expect(platform.isActive()).toBe(false);
+    });
+
+    // DROP-154: counts live in memory only until flushed — a quota that is
+    // reset without first flushing would hand every principal a fresh
+    // allowance across a restart, which for `failClosedWhenFull` is the
+    // exact bypass the flush-before-reset ordering exists to close.
+    it('flushes the mail quota before resetting it', async () => {
+      await platform.start();
+      const quota = getMailQuota();
+      const flushSpy = jest.spyOn(quota, 'flush');
+      const expectedPath = path.join(tempDir, 'data', 'drop-svc', 'mail-quotas.json');
+
+      await platform.stop();
+
+      expect(flushSpy).toHaveBeenCalled();
+      // A fresh getMailQuota(expectedPath) call after stop() must construct a
+      // NEW instance rather than reuse the stopped platform's — resetMailQuota()
+      // ran, matching resetPrincipalQuota()'s own established behaviour. Passing
+      // the same path back (rather than a bare call) keeps this test from
+      // itself leaving a stray default-path singleton for the next test.
+      const fresh = getMailQuota(expectedPath);
+      expect(fresh).not.toBe(quota);
+      // Clean up the instance THIS assertion itself just constructed — this
+      // test's own stop() already reset the singleton once; leaving the
+      // re-probed instance in place would otherwise leak into the next test.
+      resetMailQuota();
+    });
+
+    it('does not let a failed flush stop the mail quota from being reset (best-effort, matching the other shutdown flushes)', async () => {
+      await platform.start();
+      const quota = getMailQuota();
+      jest.spyOn(quota, 'flush').mockRejectedValue(new Error('disk full'));
+      const expectedPath = path.join(tempDir, 'data', 'drop-svc', 'mail-quotas.json');
+
+      await expect(platform.stop()).resolves.toBeUndefined();
+
+      const fresh = getMailQuota(expectedPath);
+      expect(fresh).not.toBe(quota);
+      resetMailQuota();
     });
   });
 
@@ -4548,5 +4612,109 @@ describe('Step 7 — deploy guardrail at the choke points', () => {
     );
 
     expect(buildSpy).toHaveBeenCalled();
+  });
+});
+
+describe('DROP-155 — the guest store binds to THIS platform root at boot', () => {
+  /**
+   * `getAppGuestById` is a bare synchronous free function on the request path,
+   * so whoever reaches the singleton FIRST binds it — with no config, that is
+   * the env-derived default rather than this platform's `dropRoot`. `start()`
+   * therefore resets the binding before configuring it.
+   *
+   * Without that reset the reconfiguration guard fires and `start()` THROWS,
+   * and the visible damage lands two suites away: the failed start never
+   * reaches `isRunning`, so `stop()`'s own early return skips every global
+   * teardown, and the NEXT platform dies on a mail-quota conflict instead.
+   * That is a three-layer displacement between cause and symptom, which is
+   * why this is pinned by name here rather than left to the 19 tests that
+   * happen to go red.
+   */
+  let tempDir: string;
+  let platform: DropPlatform;
+
+  const guestStorePath = (root: string) =>
+    path.join(root, 'data', 'drop-svc', 'app-guests.json');
+
+  beforeEach(async () => {
+    jest.clearAllMocks();
+    tempDir = path.join(os.tmpdir(), `drop-guestbind-${Date.now()}`);
+    // The accidental early read: something builds the singleton against the
+    // DEFAULT paths before any platform has said where its root is.
+    resetAppGuests();
+    getAppGuestManager();
+
+    platform = createPlatform({
+      dropRoot: tempDir,
+      appsDirectory: path.join(tempDir, 'apps'),
+      logLevel: 'error',
+      autoBuild: false,
+      autoStart: false,
+      caddyfilePath: path.join(tempDir, 'Caddyfile'),
+    });
+  });
+
+  afterEach(async () => {
+    if (platform && platform.isActive()) {
+      await platform.stop();
+    }
+    resetAppGuests();
+  });
+
+  it('starts despite a pre-existing default binding, instead of dying on the guard', async () => {
+    await expect(platform.start()).resolves.toBeUndefined();
+  });
+
+  it('a start that THROWS still tears down its process globals', async () => {
+    // The bug three waves of DROP-155 inherited. `isRunning` is set at the very
+    // END of `start()`, so a start that threw halfway left it false — and
+    // `stop()`'s early return made the catch's own `await this.stop()` a
+    // complete no-op. Every global the boot had already configured stayed
+    // configured, and the NEXT platform died on whichever reconfiguration
+    // guard it reached first, two layers away from the real cause.
+    //
+    // `initializeServices` is stubbed to throw because it runs AFTER the quota
+    // and guest-store initialisation — which is exactly the window that leaves
+    // globals stranded.
+    const failing = createPlatform({
+      dropRoot: tempDir,
+      appsDirectory: path.join(tempDir, 'apps'),
+      logLevel: 'error',
+      autoBuild: false,
+      autoStart: false,
+      caddyfilePath: path.join(tempDir, 'Caddyfile'),
+    });
+    jest
+      .spyOn(failing as unknown as { initializeServices: () => Promise<void> }, 'initializeServices')
+      .mockRejectedValue(new Error('boom'));
+    await expect(failing.start()).rejects.toThrow('boom');
+
+    // A DIFFERENT root, so anything left configured by the failed boot above
+    // collides rather than being silently reused.
+    const nextRoot = path.join(os.tmpdir(), `drop-after-failed-start-${Date.now()}`);
+    const next = createPlatform({
+      dropRoot: nextRoot,
+      appsDirectory: path.join(nextRoot, 'apps'),
+      logLevel: 'error',
+      autoBuild: false,
+      autoStart: false,
+      caddyfilePath: path.join(nextRoot, 'Caddyfile'),
+    });
+
+    await expect(next.start()).resolves.toBeUndefined();
+    await next.stop();
+  });
+
+  it('rebinds the store to this platform root', async () => {
+    await platform.start();
+
+    // Re-configuring to the SAME path is the no-op the guard permits, so this
+    // passing is the assertion that the binding moved to tempDir...
+    expect(() => getAppGuestManager({ guestsFilePath: guestStorePath(tempDir) })).not.toThrow();
+    // ...and this failing is the assertion that it is bound to exactly one
+    // place, rather than the guard having been quietly defanged.
+    expect(() =>
+      getAppGuestManager({ guestsFilePath: guestStorePath(path.join(os.tmpdir(), 'somewhere-else')) })
+    ).toThrow(/already initialized at/);
   });
 });

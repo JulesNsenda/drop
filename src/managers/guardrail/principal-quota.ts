@@ -9,6 +9,18 @@
  * capacity, and nothing in Step 7 notices.
  *
  * Exceeding returns a structured refusal, never a silent kill.
+ *
+ * `PrincipalQuota` is also the engine behind the MAIL quota (DROP-154) —
+ * `getMailQuota()` below, a second instance rather than a fork, per the
+ * plan's own reasoning: this eviction/capacity policy was reasoned about
+ * once and duplicating it would duplicate the chance to get it wrong twice.
+ * Mail differs from deploys in exactly two ways, both driven by
+ * `PrincipalQuotaOptions` rather than hardcoded: it has no unmetered branch
+ * (an absent principal REFUSES rather than passing free — see `keysFor`),
+ * and it fails closed when the tracked-principal table is full (see
+ * `failClosedWhenFull` on `check`/`record`) rather than degrading by quietly
+ * leaving new principals untracked, which for an outbound channel is a
+ * straightforward cap bypass.
  */
 
 import * as fs from 'fs/promises';
@@ -64,7 +76,22 @@ export interface QuotaVerdict {
   limit?: number;
   used?: number;
   retryAfterSeconds?: number;
+  /**
+   * Set only on the `failClosedWhenFull` refusal path — the table itself is
+   * at capacity, not the key's own window. `used`/`retryAfterSeconds` do not
+   * apply: the key was never tracked, so there is nothing to report aging
+   * out.
+   */
+  reason?: 'table_full';
 }
+
+/**
+ * The result of `PrincipalQuota#keysFor`. See its doc comment for why this
+ * is a union rather than `QuotaKey[] | null`.
+ */
+export type MeteredKeys =
+  | { metered: true; keys: QuotaKey[] }
+  | { metered: false; reason: 'no_principal' };
 
 /** Refusal raised by the quota. Distinct from the breaker's DeployRefusedError. */
 export class QuotaExceededError extends Error {
@@ -88,23 +115,60 @@ function ownerLimit(): number {
   return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_OWNER_LIMIT;
 }
 
+/** Mails per principal per window. Looser than a deploy — see `getMailQuota`. */
+const DEFAULT_MAIL_PRINCIPAL_LIMIT = 20;
+/** Mails per human per window, across every session and credential they have. */
+const DEFAULT_MAIL_OWNER_LIMIT = 50;
+
 /**
- * The quota keys for a caller.
- *
- * Automation (no principal) is deliberately NOT quota'd: it has no human to
- * attribute volume to, and every platform restart re-deploys the whole fleet
- * through the watcher — which would otherwise spend every owner's allowance on
- * a reboot. Its runaway case is the breaker's automation key.
+ * Mail's own env-var-backed limits — deliberately NOT the deploy vars above.
+ * Sharing them would mean an operator tightening redeploy limits silently
+ * tightened outbound mail too, which is a surprising coupling between two
+ * unrelated controls. Guarded the same way `principalLimit`/`ownerLimit` are:
+ * a malformed value (`parseInt` -> `NaN`, or <= 0) falls back to the default
+ * rather than being taken at face value, which for `NaN` would otherwise
+ * disable the quota entirely (`used >= NaN` is always false).
  */
-export function quotaKeysFor(actor: DeployActorInfo): QuotaKey[] {
-  if (!actor.principalId) return [];
-  const keys: QuotaKey[] = [
-    { key: actor.principalId, limit: principalLimit(), kind: 'principal' },
-  ];
-  if (actor.actorUserId) {
-    keys.push({ key: `owner::${actor.actorUserId}`, limit: ownerLimit(), kind: 'owner' });
-  }
-  return keys;
+function mailPrincipalLimit(): number {
+  const raw = parseInt(process.env.DROP_MAX_MAILS_PER_HOUR || '', 10);
+  return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_MAIL_PRINCIPAL_LIMIT;
+}
+
+function mailOwnerLimit(): number {
+  const raw = parseInt(process.env.DROP_MAX_MAILS_PER_HOUR_PER_USER || '', 10);
+  return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_MAIL_OWNER_LIMIT;
+}
+
+/**
+ * Guest invites per principal per window (DROP-155). Tighter than mail, and
+ * that gap is the whole reason this is a third instance rather than a third
+ * caller of the mail one.
+ *
+ * `sendMeteredMail` bounds mail to an address DROP ALREADY HOLDS — put there
+ * by an admin at user creation. The `{ email }` branch takes an arbitrary
+ * address from a request body, which is a different primitive: "send mail to
+ * anyone on the internet, from the operator's SPF/DKIM-aligned relay". The two
+ * deserve different budgets, and sharing one would let ordinary sharing
+ * activity fund invitations to strangers.
+ *
+ * What this is NOT bounded by, and why the existing caps were not enough:
+ * `MAX_LIVE_INVITE_TOKENS_PER_CREATOR` (50) looks like a per-creator bound and
+ * is not one for VOLUME — revoking a guest reaps its invites, so an
+ * invite/revoke/invite loop frees a slot every time and mints without limit.
+ * Only a windowed counter bounds messages sent.
+ */
+const DEFAULT_INVITE_PRINCIPAL_LIMIT = 10;
+/** Guest invites per human per window, across every session and credential they hold. */
+const DEFAULT_INVITE_OWNER_LIMIT = 25;
+
+function invitePrincipalLimit(): number {
+  const raw = parseInt(process.env.DROP_MAX_INVITES_PER_HOUR || '', 10);
+  return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_INVITE_PRINCIPAL_LIMIT;
+}
+
+function inviteOwnerLimit(): number {
+  const raw = parseInt(process.env.DROP_MAX_INVITES_PER_HOUR_PER_USER || '', 10);
+  return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_INVITE_OWNER_LIMIT;
 }
 
 interface QuotaStore {
@@ -115,11 +179,48 @@ interface QuotaStore {
 export interface PrincipalQuotaOptions {
   /** Override the tracked-principal cap. Tests, and per-box tuning. */
   maxTrackedPrincipals?: number;
+  /**
+   * Override the per-principal limit used by `keysFor`. Falls back to the
+   * env-var-backed default for the calling instance (deploy's or mail's — see
+   * `principalLimit()`/`mailPrincipalLimit()`) when unset, so a caller that
+   * does not pass this explicitly gets the same number either way rather
+   * than two limit sources silently drifting apart.
+   */
+  principalLimit?: number;
+  /** Override the per-owner limit used by `keysFor`. Same fallback as above. */
+  ownerLimit?: number;
+  /**
+   * Whether an actor with no `principalId` is unmetered (deploy's automation
+   * escape hatch — see `keysFor`) or refused outright.
+   *
+   * Default `true`, preserving deploy behaviour exactly. Mail sets this
+   * `false`: an absent principal on an outbound channel is not automation
+   * with nothing to attribute volume to, it is an unmetered send path.
+   */
+  unmeteredWithoutPrincipal?: boolean;
+  /**
+   * Whether a brand-new principal, arriving while the tracked-principal
+   * table is already at `maxTrackedPrincipals`, is refused (`check`
+   * returns `{ allowed: false, reason: 'table_full' }`, `record` returns
+   * `false`) or silently left untracked as before.
+   *
+   * Default `false`, preserving deploy behaviour exactly: `record` still
+   * degrades gracefully rather than refusing, because the owner window
+   * keeps enforcing regardless (see `record`'s own comment). Mail sets this
+   * `true` — leaving a principal untracked there is not graceful
+   * degradation, it is a caller who can mint principals evading the
+   * per-principal limit entirely once the table fills.
+   */
+  failClosedWhenFull?: boolean;
 }
 
 export class PrincipalQuota {
   private readonly storePath: string;
   private readonly maxTrackedPrincipals: number;
+  private readonly principalLimitOverride?: number;
+  private readonly ownerLimitOverride?: number;
+  private readonly unmeteredWithoutPrincipal: boolean;
+  private readonly failClosedWhenFull: boolean;
   /**
    * IN-MEMORY IS AUTHORITATIVE; the file is durability across a restart.
    *
@@ -136,6 +237,44 @@ export class PrincipalQuota {
   constructor(storePath: string, opts: PrincipalQuotaOptions = {}) {
     this.storePath = storePath;
     this.maxTrackedPrincipals = opts.maxTrackedPrincipals ?? MAX_TRACKED_PRINCIPALS;
+    this.principalLimitOverride = opts.principalLimit;
+    this.ownerLimitOverride = opts.ownerLimit;
+    this.unmeteredWithoutPrincipal = opts.unmeteredWithoutPrincipal ?? true;
+    this.failClosedWhenFull = opts.failClosedWhenFull ?? false;
+  }
+
+  /**
+   * The single key-building entry point — every caller (deploy's
+   * `admitDeploy`, mail's `apps.share.ts`) goes through this, on its own
+   * `PrincipalQuota` instance, rather than a free function reading the env
+   * vars directly. That used to fork (a free `quotaKeysFor` for deploys, this
+   * method for mail); one entry point means constructing an instance with
+   * limit overrides always configures something, instead of silently doing
+   * nothing when a caller reached for the free function out of habit.
+   *
+   * Returns a discriminated union rather than `QuotaKey[] | null` on
+   * purpose: `[]` already means "no gating needed" (`check([])` allows), so
+   * a caller writing `keysFor(actor) ?? []` would silently reconstruct the
+   * unmetered branch this exists to remove. `metered: false` must be handled
+   * explicitly by the caller.
+   */
+  keysFor(actor: DeployActorInfo): MeteredKeys {
+    if (!actor.principalId) {
+      return this.unmeteredWithoutPrincipal
+        ? { metered: true, keys: [] }
+        : { metered: false, reason: 'no_principal' };
+    }
+    const keys: QuotaKey[] = [
+      { key: actor.principalId, limit: this.principalLimitOverride ?? principalLimit(), kind: 'principal' },
+    ];
+    if (actor.actorUserId) {
+      keys.push({
+        key: `owner::${actor.actorUserId}`,
+        limit: this.ownerLimitOverride ?? ownerLimit(),
+        kind: 'owner',
+      });
+    }
+    return { metered: true, keys };
   }
 
   async initialize(): Promise<void> {
@@ -151,8 +290,32 @@ export class PrincipalQuota {
     this.initialized = true;
   }
 
+  /**
+   * Whether adding `keys` would need to start tracking a NEW principal while
+   * the table is already at `maxTrackedPrincipals`.
+   *
+   * Shared by `check` and `record` so the two agree: "known" must be read
+   * BEFORE `prune` in both places (an aged-out-but-still-present key is
+   * still "known" for capacity purposes; only a genuinely new key needs a
+   * fresh slot). Owner keys never count against the cap — see `record`'s own
+   * comment on `kind === 'principal'`.
+   */
+  private wouldOverflowTable(keys: QuotaKey[]): boolean {
+    if (Object.keys(this.store.deploys).length < this.maxTrackedPrincipals) return false;
+    return keys.some(
+      ({ key, kind }) => kind === 'principal' && this.store.deploys[key] === undefined
+    );
+  }
+
   /** Whether a deploy may proceed. Counts nothing. */
   check(keys: QuotaKey[], now = Date.now()): QuotaVerdict {
+    if (this.failClosedWhenFull && this.wouldOverflowTable(keys)) {
+      // The table itself is full, not any individual key's window. Deploys
+      // never reach here (`failClosedWhenFull` defaults false); mail refuses
+      // rather than falling into `record`'s degrade-gracefully path, which
+      // for an outbound channel is a cap bypass — see the module doc.
+      return { allowed: false, reason: 'table_full' };
+    }
     for (const { key, limit } of keys) {
       const used = this.prune(key, now).length;
       if (used >= limit) {
@@ -168,8 +331,18 @@ export class PrincipalQuota {
   /**
    * Count a deploy against every key. Call only once a deploy is ADMITTED — a
    * refused attempt must never consume the allowance that refused it.
+   *
+   * Returns `false` (and records nothing at all) when `failClosedWhenFull`
+   * refuses the whole call — an action that never happened must not consume
+   * even the keys that still had room, matching the rule above. Deploys
+   * (`failClosedWhenFull` false) always get `true`; they keep the older
+   * per-key degrade-gracefully behaviour below instead, which
+   * `wouldOverflowTable` guards this branch from ever reaching for them.
    */
-  record(keys: QuotaKey[], now = Date.now()): void {
+  record(keys: QuotaKey[], now = Date.now()): boolean {
+    if (this.failClosedWhenFull && this.wouldOverflowTable(keys)) {
+      return false;
+    }
     for (const { key, kind } of keys) {
       const known = this.store.deploys[key] !== undefined;
       if (
@@ -188,6 +361,7 @@ export class PrincipalQuota {
       this.store.deploys[key] = list;
     }
     this.lastSave = this.save();
+    return true;
   }
 
   /**
@@ -254,4 +428,107 @@ export function getPrincipalQuota(storePath?: string): PrincipalQuota {
 
 export function resetPrincipalQuota(): void {
   instance = null;
+}
+
+let mailInstance: PrincipalQuota | null = null;
+/** The store path `mailInstance` was actually constructed with, for the reconfiguration guard below. */
+let mailInstanceStorePath: string | null = null;
+
+/**
+ * The mail singleton (DROP-154), wired up by `platform.ts`'s `start()`
+ * (initialized before `initializeServices()`) and flushed in its `stop()`
+ * alongside the deploy singleton. Same engine as `getPrincipalQuota` above,
+ * same RELATIVE-fallback caveat, but the two DELIBERATE option differences
+ * described on the module doc comment: no unmetered branch, and fails closed
+ * when the tracked-principal table is full. Its limits read
+ * `DROP_MAX_MAILS_PER_HOUR(_PER_USER)` — see `mailPrincipalLimit`/
+ * `mailOwnerLimit` — never the deploy env vars. A caller needing different
+ * limits or window can construct its own `PrincipalQuota` directly — this
+ * singleton exists for the common case of one shared mail quota.
+ *
+ * Passing a `storePath` that conflicts with an already-constructed instance
+ * THROWS rather than silently keeping whichever call landed first — the same
+ * precedent `getAppRuntime()` sets for a conflicting runtime type. A bare
+ * call (no argument) never throws and just returns whatever instance exists,
+ * matching `getAppRuntime()`'s and `getPrincipalQuota()`'s own shape.
+ */
+export function getMailQuota(storePath?: string): PrincipalQuota {
+  const resolvedPath = storePath ?? 'data/drop-svc/mail-quotas.json';
+  if (mailInstance) {
+    if (storePath !== undefined && resolvedPath !== mailInstanceStorePath) {
+      throw new Error(
+        `Mail quota already initialized at '${mailInstanceStorePath}'; ` +
+          `cannot reconfigure to '${resolvedPath}' without resetMailQuota()`
+      );
+    }
+    return mailInstance;
+  }
+  mailInstanceStorePath = resolvedPath;
+  mailInstance = new PrincipalQuota(resolvedPath, {
+    principalLimit: mailPrincipalLimit(),
+    ownerLimit: mailOwnerLimit(),
+    // Not overridable by a caller: these two are what make this instance a
+    // MAIL limiter rather than a second deploy one. An absent principal is
+    // refused (an unmetered outbound channel is not the same thing as
+    // automation with nothing to attribute volume to), and a full tracking
+    // table fails closed (otherwise anyone who can mint principals evades
+    // the per-principal cap entirely).
+    unmeteredWithoutPrincipal: false,
+    failClosedWhenFull: true,
+  });
+  return mailInstance;
+}
+
+let inviteInstance: PrincipalQuota | null = null;
+/** The store path `inviteInstance` was actually constructed with, for the reconfiguration guard. */
+let inviteInstanceStorePath: string | null = null;
+
+/**
+ * The GUEST-INVITE singleton (DROP-155), wired up by `platform.ts`'s `start()`
+ * and flushed in its `stop()` alongside the other two.
+ *
+ * STACKS with the mail quota rather than replacing it — the same shape the
+ * dedicated rate-limit buckets take with the general `/api/*` limiter. An
+ * invite is both "an invitation to a stranger" and "a message through the
+ * operator's relay", and each bound answers a different question.
+ *
+ * Recorded when the INVITE IS MINTED, not when mail is accepted. That is
+ * load-bearing since wave 3c: when no relay is configured the invite link is
+ * returned on the response instead of being mailed, so a counter that only
+ * moved on a successful send would leave the whole primitive unbounded on
+ * exactly the boxes least likely to notice.
+ *
+ * Same two option differences as the mail instance, for the same reasons: no
+ * unmetered branch (an actor with no principal is refused, not waved through),
+ * and fails closed when the tracked-principal table is full.
+ */
+export function getInviteQuota(storePath?: string): PrincipalQuota {
+  const resolvedPath = storePath ?? 'data/drop-svc/invite-quotas.json';
+  if (inviteInstance) {
+    if (storePath !== undefined && resolvedPath !== inviteInstanceStorePath) {
+      throw new Error(
+        `Invite quota already initialized at '${inviteInstanceStorePath}'; ` +
+          `cannot reconfigure to '${resolvedPath}' without resetInviteQuota()`
+      );
+    }
+    return inviteInstance;
+  }
+  inviteInstanceStorePath = resolvedPath;
+  inviteInstance = new PrincipalQuota(resolvedPath, {
+    principalLimit: invitePrincipalLimit(),
+    ownerLimit: inviteOwnerLimit(),
+    unmeteredWithoutPrincipal: false,
+    failClosedWhenFull: true,
+  });
+  return inviteInstance;
+}
+
+export function resetInviteQuota(): void {
+  inviteInstance = null;
+  inviteInstanceStorePath = null;
+}
+
+export function resetMailQuota(): void {
+  mailInstance = null;
+  mailInstanceStorePath = null;
 }

@@ -29,6 +29,13 @@ interface ApiRuntimeConfig {
   maxDbsPerUser?: number;
   /** Per-user managed-Redis cap, mirroring PlatformConfig.maxRedisPerUser. */
   maxRedisPerUser?: number;
+  /**
+   * The DROP-152 access gate's operator kill switch (`PlatformConfig.enableAccessGate`,
+   * `DROP_FEATURE_ACCESS_GATE` env, boot-time). Read by the access-gate route
+   * and by platform.ts's sweep/emission paths so the flag actually withdraws
+   * enforcement rather than only changing what the API reports.
+   */
+  accessGateEnabled?: boolean;
 }
 
 const runtimeConfig: ApiRuntimeConfig = {};
@@ -42,6 +49,7 @@ export function setApiRuntimeConfig(config: ApiRuntimeConfig): void {
   if (config.publicUrl !== undefined) runtimeConfig.publicUrl = config.publicUrl;
   if (config.maxDbsPerUser !== undefined) runtimeConfig.maxDbsPerUser = config.maxDbsPerUser;
   if (config.maxRedisPerUser !== undefined) runtimeConfig.maxRedisPerUser = config.maxRedisPerUser;
+  if (config.accessGateEnabled !== undefined) runtimeConfig.accessGateEnabled = config.accessGateEnabled;
 }
 
 /** Resolved webapps directory: explicit config > DROP_APPS_DIR env > platform default. */
@@ -132,3 +140,41 @@ export function getMaxRedisPerUser(): number {
   if (runtimeConfig.maxRedisPerUser !== undefined) return runtimeConfig.maxRedisPerUser;
   return parseInt(process.env.DROP_MAX_REDIS_PER_USER || '3', 10);
 }
+
+/**
+ * Whether the DROP-152 access gate is enabled at all.
+ *
+ * Returns `true` when `setApiRuntimeConfig` has never been called with this
+ * field, and that direction is the whole point. This flag has an
+ * ADMIT-ON-FALSE consumer — `app-access.ts`'s `/verify` hop answers 204 with a
+ * `gate-disabled` decision when the gate is switched off, so that a stale
+ * Caddy guard can never lock visitors out of an app the platform reports as
+ * ungated. An accessor that read "nobody wired the flag yet" as "the operator
+ * turned the gate off" would therefore admit EVERY visitor to EVERY gated app
+ * while the guards stayed installed — the exact inversion the kill switch
+ * exists to prevent, in the dangerous direction.
+ *
+ * So "fail closed" here means KEEP ENFORCING, not "return false" — the
+ * opposite direction to the sharing toggle (see the note below), deliberately:
+ * the safe state of a security control is on, and the safe state of a product
+ * feature is off. Only an explicit `false` from the platform disarms the gate.
+ */
+export function isAccessGateEnabled(): boolean {
+  return runtimeConfig.accessGateEnabled !== false;
+}
+
+/*
+ * There is deliberately NO `isAppSharingEnabled()` here.
+ *
+ * The owner-sharing toggle lives in `settings.json` precisely so an admin can
+ * change it at runtime without the platform restart that redeploys the whole
+ * fleet. Snapshotting it into this module at ApiServer construction — the way
+ * `accessGateEnabled` is, correctly, because that one is a boot-time env
+ * kill switch — would have reintroduced exactly the restart it was moved here
+ * to avoid, silently: the setting would flip in the file and the API would
+ * keep answering with the value captured at boot.
+ *
+ * Callers read `getSettingsManager().getAppSharingEnabled()` live instead. It
+ * is an in-memory field read, and it already fails closed (`false`) both when
+ * unset and when the settings file is corrupt.
+ */

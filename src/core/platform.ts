@@ -26,6 +26,7 @@ import {
   DetectorService,
   getDetector,
   parseDropYaml,
+  type DropYamlParseResult,
   DetectionResult,
   DropYamlConfig,
   AppType,
@@ -67,7 +68,14 @@ import {
   shouldHoldForPromotion,
   type PromotionMode,
 } from '../managers/guardrail/promotion';
-import { getPrincipalQuota, resetPrincipalQuota } from '../managers/guardrail/principal-quota';
+import {
+  getPrincipalQuota,
+  resetPrincipalQuota,
+  getMailQuota,
+  getInviteQuota,
+  resetInviteQuota,
+  resetMailQuota,
+} from '../managers/guardrail/principal-quota';
 import { isExpired } from '../managers/guardrail/ephemeral';
 import { checkDetachCooldown, checkDumpByteBudget } from '../managers/guardrail/detach-limits';
 import {
@@ -119,6 +127,9 @@ import {
   isLocalhostDomain,
 } from '../utils/domain-validator';
 import { createApiKey, deleteApiKeysByName } from '../api/middleware/auth';
+// The STRICT name pattern (the API's), not the folder-drop parser's looser
+// check: this decides whether a name is safe to write into a Caddy literal.
+import { isValidAppName } from '../api/middleware/validate';
 import { IsolationMode, assertStartupConstraints } from './startup-constraints';
 import { createContainerExecCommand } from './builder/container-build-runner';
 import { migrateAllToDocker } from '../managers/runtime/runtime-migrator';
@@ -131,6 +142,26 @@ import {
   resetLogRetentionService,
 } from '../managers/log-retention/log-retention';
 import { hasEnoughDisk, getMinFreeDiskMb } from '../utils/disk';
+import { getAccessLog, resetAccessLog } from '../managers/access-log/access-log';
+import { getAppGuestManager, resetAppGuests } from '../managers/app-guest';
+import { sessionCookieName as appSessionCookieName } from '../api/app-access/names';
+import {
+  assessAccessGate,
+  describeAccessGateRefusal,
+  resolveHttpsEffective,
+  isGateApplied,
+  gateEnforced as computeGateEnforced,
+  ACCESS_GATE_ENFORCEMENT_AVAILABLE,
+  type AccessGateVerdict,
+} from '../managers/guardrail/access-gate';
+// Imported from the concrete file, NOT the '../managers/runtime' barrel: five
+// platform test suites mock that barrel wholesale and would hand back
+// `undefined` for anything they did not list -- the same reason
+// DEFAULT_IGNORE_PATTERNS is imported from watcher.config.ts above.
+import {
+  getTenantNetworkIsolation,
+  probeTenantNetworkIsolation,
+} from '../managers/runtime/container-manager';
 import { probePort, probeHttp } from '../utils/http-probe';
 
 /** See PlatformConfig.bootReconcileMode. */
@@ -200,6 +231,16 @@ export interface PlatformConfig {
   apiPort: number;
   /** Enable API authentication */
   enableApiAuth: boolean;
+  /**
+   * Operator kill switch for the DROP-152 browser access gate
+   * (`DROP_FEATURE_ACCESS_GATE`). Default true — a security control's off
+   * switch defaults to keeping the control ON; defaulting it off would
+   * silently disarm a control that is live in production while policies
+   * stay on disk and simply stop being enforced. Read by
+   * `assessAccessGate`, the boot sweep, and forwarded to the API via
+   * `ApiServerConfig.accessGateEnabled`.
+   */
+  enableAccessGate: boolean;
   /** Maximum apps per user (0 = unlimited) */
   maxAppsPerUser: number;
   /**
@@ -330,6 +371,7 @@ const DEFAULT_CONFIG: PlatformConfig = {
   enableApi: true,
   apiPort: 3000,
   enableApiAuth: process.env.DROP_DISABLE_AUTH !== 'true',
+  enableAccessGate: process.env.DROP_FEATURE_ACCESS_GATE !== 'false',
   maxAppsPerUser: parseInt(process.env.DROP_MAX_APPS_PER_USER || '5', 10),
   isolation: (process.env.DROP_ISOLATION as IsolationMode) ?? 'none',
   allowSignup: process.env.DROP_ALLOW_SIGNUP === 'true',
@@ -673,6 +715,19 @@ export class DropPlatform {
    */
   private readonly breakerKeys: Map<string, GuardrailKey[]> = new Map();
   private isRunning = false;
+  /**
+   * True for the duration of `start()`, INCLUDING while its catch tears down.
+   *
+   * `isRunning` is only set at the very END of `start()`, so a start that
+   * throws halfway leaves it false — and `stop()`'s own early return then made
+   * the catch's `await this.stop()` a complete no-op. Every process-global the
+   * boot had already configured (three quota singletons, the guest store, the
+   * access log, the settings manager) stayed configured, and the NEXT platform
+   * in the process died on a reconfiguration guard belonging to whichever one
+   * it reached first. That is two layers between cause and symptom, and three
+   * waves of DROP-155 inherited it before anyone traced it.
+   */
+  private isStarting = false;
   // Snapshot of each app's persisted status, taken in initializeServices
   // BEFORE syncStateWithConfigs/syncStateWithProcesses run — both reconcile
   // status against the live runtime and can overwrite 'errored'/'needs-config'/
@@ -768,6 +823,7 @@ export class DropPlatform {
       throw new Error('DROP platform is already running');
     }
 
+    this.isStarting = true;
     this.logger.platformEvent('starting');
     this.logger.info(`Drop root: ${this.config.dropRoot}`, 'CONFIG');
     this.logger.info(`Apps directory: ${this.config.appsDirectory}`, 'CONFIG');
@@ -796,6 +852,10 @@ export class DropPlatform {
 
       // Prune old logs so a long-lived box can't fill its disk (per-app, Caddy,
       // build and platform logs all live under data/logs). Sweeps now + daily.
+      // The gate's evidence trail. Under data/logs so the EXISTING retention
+      // sweep prunes it — which is why its files end `.access.log`.
+      getAccessLog(path.join(this.config.dropRoot, 'data', 'logs'));
+
       this.logRetention = getLogRetentionService(
         path.join(this.config.dropRoot, 'data', 'logs'),
         this.config.logRetentionDays
@@ -816,6 +876,80 @@ export class DropPlatform {
       );
       await getPrincipalQuota(quotaStore).initialize();
 
+      // The mail quota (DROP-154) needs the same treatment, and for the same
+      // reason spelled out above: bound to `dropRoot`, not to the process CWD.
+      // Left bare it would resolve relative to wherever the service happened to
+      // be started, and — with no `initialize()` — never load the counts it
+      // wrote last time, so a restart would hand out a fresh allowance. That is
+      // the bypass `failClosedWhenFull` exists to close, arriving by the back
+      // door.
+      //
+      // Initialized here, BEFORE `initializeServices()`, so it is ready before
+      // any route that sends mail can reach it. Its limits are baked in by
+      // `getMailQuota` itself (its own env vars, distinct from the deploy ones
+      // above — see `mailPrincipalLimit`/`mailOwnerLimit` in
+      // principal-quota.ts), not passed here.
+      const mailQuotaStore = path.join(
+        this.config.dropRoot,
+        'data',
+        'drop-svc',
+        'mail-quotas.json'
+      );
+      await getMailQuota(mailQuotaStore).initialize();
+
+      // The GUEST-INVITE quota (DROP-155), same treatment and same reasons as
+      // the two above: anchored under `dropRoot` rather than the process CWD,
+      // and `initialize()`d so a restart does not hand every principal a fresh
+      // allowance. Its own store and its own env vars
+      // (`DROP_MAX_INVITES_PER_HOUR(_PER_USER)`) — see `getInviteQuota` for why
+      // it is a third instance rather than a third caller of the mail one.
+      const inviteQuotaStore = path.join(
+        this.config.dropRoot,
+        'data',
+        'drop-svc',
+        'invite-quotas.json'
+      );
+      await getInviteQuota(inviteQuotaStore).initialize();
+
+      // The guest stores (DROP-155), loaded HERE for the same reason the two
+      // quotas above are: their default paths resolve against `DROP_ROOT` via
+      // the environment rather than this platform's own `dropRoot`, and a box
+      // configured with `--root` would otherwise read and write a different
+      // directory than every other store. Bound explicitly.
+      //
+      // BEFORE `initializeServices()`, so the stores are populated before any
+      // route or verifier can reach them. `verifyAppGuestSessionToken` re-reads
+      // the guest record LIVE on every request and refuses when it finds none —
+      // which is correct as a refusal but wrong as a startup state: an unloaded
+      // store would lock every guest out of every app until something else
+      // happened to load it.
+      //
+      // `load()` never throws: an unreadable file surfaces as `isCorrupt()`,
+      // and every guest path is written to treat that as "refuse", never as
+      // "the list is empty".
+      //
+      // RESET FIRST, and that is not defensive noise. `getAppGuestById` is a
+      // bare synchronous free function, and `getAppGuestManager()` builds the
+      // singleton against its DEFAULT (env-derived) paths for whoever calls it
+      // first — so any read reaching it before this line binds the store to
+      // `DROP_ROOT`'s default rather than to THIS platform's `dropRoot`. At
+      // this point in `start()` no such binding can hold anything worth
+      // keeping (nothing has been loaded yet), and the platform is the
+      // authority on where its own state lives, so the pre-existing binding is
+      // discarded rather than argued with. Without this, a second platform in
+      // one process — which is every integration test — hits the
+      // reconfiguration guard and dies at boot.
+      resetAppGuests();
+      await getAppGuestManager({
+        guestsFilePath: path.join(this.config.dropRoot, 'data', 'drop-svc', 'app-guests.json'),
+        invitesFilePath: path.join(
+          this.config.dropRoot,
+          'data',
+          'drop-svc',
+          'app-guest-invites.json'
+        ),
+      }).load();
+
       // Initialize services
       await this.initializeServices();
 
@@ -827,6 +961,31 @@ export class DropPlatform {
 
       // Wire up event handlers
       this.setupEventHandlers();
+
+      // DROP-152: establish whether tenant containers are isolated from each
+      // other BEFORE anything reads the answer. `ensureNetwork` otherwise runs
+      // only on the first container start, and a docker box restarting into
+      // steady state skips every app at boot reconciliation and starts none —
+      // so the value stayed 'unknown' for the whole process lifetime and the
+      // `tenant-network-shared` blocker could never fire on precisely the box
+      // it exists to describe.
+      if (this.config.isolation === 'docker') {
+        await probeTenantNetworkIsolation().catch((error) => {
+          this.logger.warn('Could not determine tenant network isolation', 'RUNTIME', error);
+        });
+      }
+
+      // Report any persisted access-gate policy this box cannot enforce.
+      // Placed HERE, after initializeServices() has loaded the app configs --
+      // assertStartupConstraints above runs before that and can see no app's
+      // policy at all -- and deliberately non-fatal.
+      await this.sweepAccessGates();
+
+      // Self-healing pass over guest grants (DROP-155). Same placement
+      // reasoning as the sweep above: it needs the app configs, which only
+      // exist after `initializeServices()`.
+      await this.pruneStaleGuestGrants();
+      await this.sweepGuestRetention();
 
       // M1 boot reconciliation (DROP_BOOT_RECONCILE): decide skip vs redeploy
       // per known app BEFORE the watcher starts, so a stable app's own
@@ -867,13 +1026,25 @@ export class DropPlatform {
       this.logger.platformEvent('started');
     } catch (error) {
       this.logger.platformEvent('error', error instanceof Error ? error.message : String(error));
+      // Reaches the real teardown now — see `isStarting`. Every `await` in
+      // `stop()` sits behind an `if (this.x)` guard, so running it against a
+      // half-initialized platform tears down what exists and skips what does
+      // not.
       await this.stop();
       throw error;
+    } finally {
+      // AFTER the catch, which is where the teardown above runs.
+      this.isStarting = false;
     }
   }
 
   async stop(): Promise<void> {
-    if (!this.isRunning) {
+    // `isStarting` as well as `isRunning`: a start that THREW never set
+    // `isRunning`, and returning here made its own catch's teardown a no-op —
+    // stranding every process-global the boot had configured. A platform that
+    // was never started at all still returns immediately, which is what every
+    // existing caller and test expects.
+    if (!this.isRunning && !this.isStarting) {
       return;
     }
 
@@ -1007,6 +1178,16 @@ export class DropPlatform {
       this.deployDetailUnsub();
       this.deployDetailUnsub = undefined;
     }
+    // The access log aggregates in memory between flushes, and `deploy.yml`
+    // stops this process on every push to `develop` — so without this the
+    // current window is lost on every deploy.
+    try {
+      await getAccessLog().flush();
+    } catch {
+      // Never block shutdown on log hygiene.
+    }
+    resetAccessLog();
+
     try {
       await getDeployTracker().flush();
     } catch {
@@ -1022,6 +1203,34 @@ export class DropPlatform {
     this.breakerKeys.clear();
     resetDeployBreaker();
     resetPrincipalQuota();
+
+    // Flush BEFORE resetting: a quota whose counts only ever live in memory
+    // means a restart hands every principal a fresh allowance, which for an
+    // outbound mail channel is the whole cap.
+    try {
+      await getMailQuota().flush();
+    } catch {
+      // best-effort, matching the other flushes above — shutdown must not hang
+      // on a store write.
+    }
+    resetMailQuota();
+
+    // Flushed BEFORE resetting, same as the two quotas above — an invite
+    // budget that lives only in memory means a restart hands every principal a
+    // fresh allowance, which for an invite-anyone-on-the-internet primitive is
+    // the whole cap.
+    try {
+      await getInviteQuota().flush();
+    } catch {
+      // best-effort; shutdown must not hang on a store write.
+    }
+    resetInviteQuota();
+
+    // No flush: every guest-store write is already awaited by its caller
+    // before that caller acknowledges anything (the one fire-and-forget path,
+    // `touchLastSeen`, is explicitly best-effort). Nothing is held in memory
+    // that a restart would lose, so this is a reset, not a flush-then-reset.
+    resetAppGuests();
 
     // Stop API server
     if (this.apiServer) {
@@ -1656,6 +1865,15 @@ backup:
       // runtime-config so a route file never has to re-derive them.
       maxDbsPerUser: this.config.maxDbsPerUser,
       maxRedisPerUser: this.config.maxRedisPerUser,
+      // DROP-152: the access-gate route refuses to enable a gate outside
+      // docker isolation. Passed through rather than re-read from the env in
+      // the route, so the route and the platform can never disagree about
+      // which mode is actually running.
+      isolation: this.config.isolation === 'docker' ? 'docker' : 'none',
+      // DROP-153: the operator kill switch, forwarded so a route can answer
+      // "is this box even trying to enforce a gate" without re-reading the
+      // env var itself.
+      accessGateEnabled: this.config.enableAccessGate,
     });
 
     await this.apiServer.initialize();
@@ -1672,6 +1890,8 @@ backup:
       attachService: (name, serviceId) => this.attachService(name, serviceId),
       detachService: (name, serviceId) => this.detachService(name, serviceId),
       getServiceIntent: (name, serviceId) => this.getServiceIntent(name, serviceId),
+      reconfigureRoute: (name) => this.reconfigureRoute(name),
+      assessAccessGate: (name) => this.assessAccessGate(name),
     });
 
     this.logger.info(`API server running on port ${this.config.apiPort}`, 'API');
@@ -4413,7 +4633,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
   private async handleConfigureRoute(
     appName: string,
     port: number,
-    opts?: { skipCaddyReload?: boolean }
+    opts?: { skipCaddyReload?: boolean; routeOnly?: boolean }
   ): Promise<void> {
     if (!this.router || !port) return;
 
@@ -4526,10 +4746,19 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
 
         // Persist only the accepted domains as the source of truth — never the
         // raw, possibly-hijacking request.
-        await this.appConfigService.updateConfig(appName, {
-          domains: acceptedCustomDomains,
-          tls: dropYaml.config?.tls,
-        });
+        //
+        // Skipped under `routeOnly`. This method is now reachable from an
+        // authorization write (`reconfigureRoute`), and persisting whatever
+        // `domains:`/`tls:` the tenant's drop.yaml happens to contain RIGHT
+        // NOW would make an admin's access-policy change an apply path for
+        // tenant edits made since the last deploy, with no deploy and no
+        // review. A route re-emission must not mutate persisted config.
+        if (!opts?.routeOnly) {
+          await this.appConfigService.updateConfig(appName, {
+            domains: acceptedCustomDomains,
+            tls: dropYaml.config?.tls,
+          });
+        }
       }
 
       // In docker (multi-user) mode inject security headers on all tenant routes.
@@ -4621,17 +4850,118 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       }
       domains = routableDomains;
 
+      // DROP-152 browser access gate. Assessed HERE, at emission, and not only
+      // at the route that sets the policy: the two are separated in time by
+      // anything from a redeploy to a platform upgrade, and a box can stop
+      // satisfying the premise in between (HTTPS turned off, a drop.yaml
+      // `tls: {disabled: true}` landing on the next deploy, an in-place upgrade
+      // leaving drop-net with ICC enabled). An app asked to be protected and
+      // not protected must never be silent -- the dashboard would otherwise
+      // report it as gated on the strength of the persisted policy alone.
+      // The config service is the ONLY way to know an app is gated. If it is
+      // unavailable we cannot tell, and "cannot tell" must not read as "not
+      // gated" — that is the same permissive-read-of-an-absent-input defect
+      // that `canOpen`'s optional policy parameter was. Leave the flag alone
+      // and say so rather than clearing it.
+      const accessPolicy = this.appConfigService
+        ? this.appConfigService.getConfig(appName)?.access
+        : undefined;
+      const accessKnown = Boolean(this.appConfigService);
+      // `domains` here is the post-filter list this method is about to route.
+      const accessVerdict = accessPolicy
+        ? await this.assessAccessGate(appName, dropYaml, domains)
+        : undefined;
+      if (accessVerdict && !accessVerdict.enforceable) {
+        // `featureEnabled` is the field, not blocker-list shape: a flag-off
+        // box carrying a SECOND blocker (e.g. every `none`-isolation dev box
+        // also fails `isolation-not-docker`) is still an operator DECISION at
+        // its root, not a defect, and must not log ERROR on every boot
+        // forever — that would bury the real HTTPS/isolation breaks this log
+        // level exists to surface (DROP-153).
+        if (!accessVerdict.featureEnabled) {
+          this.logger.info(
+            `Access gate for '${appName}' is not enforced: an operator has switched off the ` +
+              'DROP_FEATURE_ACCESS_GATE kill switch on this platform. No guard was emitted.',
+            'ROUTER'
+          );
+        } else {
+          this.logger.error(
+            `${describeAccessGateRefusal(appName, accessVerdict)}. Refusing to emit the access ` +
+              'guard: this app is NOT protected.',
+            'ROUTER'
+          );
+        }
+      }
+      // Whether the gate is actually going to be enforced for this app — the
+      // condition `accessGuard` keys on.
+      const gateEnforced = computeGateEnforced(accessVerdict, Boolean(accessPolicy));
+      // Narrower than the inverse of `gateEnforced`: true only when the kill
+      // switch is the reason enforcement is off. Keying the hostname filter
+      // and the `tls` override below on `gateEnforced` (i.e. relaxing them
+      // for every blocker, not just this one) let a tenant trip a SECOND
+      // blocker — an extra `domains:` entry (`multi-hostname`), a dropped
+      // `publicUrl` — and have their still-gated app served over plaintext,
+      // re-opening the same "tenant switches off their own gate" defect a
+      // different door (bd86006) already closed once. Only the kill switch
+      // may relax them: every other blocker is a defect this box must keep
+      // refusing to route around. Keying the filter/override on bare
+      // `accessPolicy` (policy presence, not enforceability) has the
+      // opposite failure: with the kill switch off, an app whose only
+      // hostname is plaintext ended up routed NOWHERE, which is worse than
+      // ungated (DROP-153) — hence `!gateWithdrawn` rather than `accessPolicy`
+      // alone.
+      const gateWithdrawn = Boolean(accessPolicy && accessVerdict && !accessVerdict.featureEnabled);
+      // Named once and reused below (hostname filter here, `tls` override in
+      // the per-domain loop) rather than repeating `accessPolicy &&
+      // !gateWithdrawn` at each site.
+      const gateStillAsserted = Boolean(accessPolicy && !gateWithdrawn);
+      if (gateStillAsserted) {
+        // A gated app is not served on a plaintext or reserved hostname. The
+        // inputs that would otherwise disable the gate — a `.localhost` entry
+        // in `domains:`, `tls: {disabled: true}` — are TENANT-authored, so
+        // honouring them would hand the governed party an off switch for the
+        // control governing them. Dropping the hostname keeps the app's real
+        // HTTPS address serving and gated.
+        const gateSafe = this.gateRoutableHostnames(domains, domainSuffix);
+        if (gateSafe.length !== domains.length) {
+          this.logger.warn(
+            `App '${appName}' carries an access policy; refusing to route it on ` +
+              `${domains.length - gateSafe.length} plaintext/reserved hostname(s) that would ` +
+              'disable the gate',
+            'ROUTER'
+          );
+        }
+        domains = gateSafe;
+      }
+
+      // The browser access gate (DROP-152). Computed as ONE value, beside
+      // mcpGuard, rather than as a section inside the per-domain loop — that
+      // loop already sits 60 lines deep in a 340-line method, and the next
+      // guard should be able to follow this shape rather than deepen it.
+      const accessGuard = gateEnforced
+        ? {
+            appName,
+            verifyUpstream: `127.0.0.1:${this.config.apiPort}`,
+            cookieName: appSessionCookieName(appName),
+          }
+        : undefined;
+
       // Configure route for each domain
       let resolvedPublicUrl: string | undefined;
       for (const hostname of domains) {
         const isLocalhost = isLocalhostDomain(hostname);
-        const enableSsl = this.config.enableHttps && !isLocalhost && !dropYaml.config?.tls?.disabled;
+        // `tls.disabled` is tenant-authored; a gated app does not get to opt
+        // out of the transport its session cookie requires. Keyed on
+        // `gateStillAsserted`, not `gateEnforced` — see that condition's
+        // comment above.
+        const tlsDisabled = gateStillAsserted ? false : dropYaml.config?.tls?.disabled;
+        const enableSsl = this.config.enableHttps && !isLocalhost && !tlsDisabled;
 
         await this.router.addRoute({
           appName: `${appName}-${hostname.replace(/\./g, '-')}`, // Unique route name per domain
           owner: appName, // Bare owning app name — lets removeRoutesForApp find every route this app owns
           hostname,
-          ...(routePathPrefix ? { pathPrefix: routePathPrefix } : {}),
+          pathPrefix: routePathPrefix,
           upstream: `localhost:${port}`,
           ssl: enableSsl,
           redirectHttps: enableSsl,
@@ -4643,7 +4973,14 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           // it — an inferred label must never put a login gate in front of
           // someone's app — and only when the API port is known, since the
           // guard is a proxy to DROP's own verify endpoint.
-          ...(mcpGuard ? { mcpAuth: mcpGuard } : {}),
+          //
+          // Passed EXPLICITLY, never `...(guard ? {…} : {})`. `addRoute`
+          // replaces rather than merges (see its own doc), and it can only
+          // remove a guard the caller has actually said is gone — a missing key
+          // is indistinguishable from "unchanged". Turning a guard off used to
+          // leave it in the Caddyfile for the life of the process.
+          mcpAuth: mcpGuard,
+          accessAuth: accessGuard,
         });
 
         const protocol = enableSsl ? 'https' : 'http';
@@ -4673,16 +5010,73 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       // CLEARS a stale one, so computeAppUrl can never link to the group host
       // for an app no longer served there (which would load a sibling's app).
       // The change-guard avoids a config write per app on every start.
-      if (this.appConfigService && resolvedPublicUrl !== appConfig?.publicUrl) {
+      if (!opts?.routeOnly && this.appConfigService && resolvedPublicUrl !== appConfig?.publicUrl) {
         await this.appConfigService.updateConfig(appName, { publicUrl: resolvedPublicUrl });
       }
 
       // Reload Caddy to apply new routes — unless the caller is batching
       // several of these into one trailing reload (opts.skipCaddyReload).
-      if (!opts?.skipCaddyReload) {
-        await this.reloadCaddyIfRunning();
+      const reloadOutcome = opts?.skipCaddyReload
+        ? ('skipped' as const)
+        : await this.reloadCaddyIfRunning();
+      if (reloadOutcome === 'failed') {
+        this.logger.error(
+          `Caddy REJECTED the configuration emitted for '${appName}'. Routing is unchanged, ` +
+            'so this app is serving whatever block it had before — and the rejected file is ' +
+            'what Caddy will read at its next start.',
+          'ROUTER'
+        );
+      }
+
+      // Written HERE, after the routes are actually emitted and reloaded, not
+      // beside the verdict above. Everything in this method runs inside a
+      // catch that only logs, so a throw from addRoute or the Caddy reload
+      // leaves the PREVIOUS block live — recording "gate applied" before that
+      // point asserted a control that had not been installed. The catch arm
+      // below records the opposite.
+      //
+      // The value is `true` for every gated app while ACCESS_GATE_ENFORCEMENT
+      // is unavailable: this build emits no access guard at all, so a policy
+      // that exists is by definition not applied. It is not a verdict about
+      // the box; it is a fact about the binary.
+      if (accessKnown) {
+        // "Applied" requires THREE things, not one: the box can enforce a gate,
+        // this build has an emitter at all, and Caddy actually accepted the
+        // configuration carrying it. A rejected `/load` does not throw — it
+        // returns false — so without the reload outcome this line recorded
+        // "gate applied" for a config Caddy had refused, leaving the previous
+        // ungated block live. `skipped` is not success either: the boot path
+        // batches reloads, so nothing had reached Caddy yet at this point.
+        //
+        // `gateWithdrawn` is handled SEPARATELY from the general
+        // `!isGateApplied` case: when the kill switch is the only reason
+        // enforcement is off, there is no gate to apply at all, so "unapplied"
+        // is the wrong axis to record `true` on. Doing so pinned the flag
+        // `true` forever (nothing ever clears it while the switch stays off),
+        // and `apps.share.ts` drives a full Caddyfile regenerate + reload off
+        // that flag on every share/revoke write — an unbounded retry loop for
+        // a state that isn't actually broken. Clear it instead.
+        await this.stateManager?.setAccessGateUnapplied(
+          appName,
+          accessVerdict
+            ? gateWithdrawn
+              ? undefined
+              : !isGateApplied({
+                  enforceable: accessVerdict.enforceable,
+                  enforcementAvailable: ACCESS_GATE_ENFORCEMENT_AVAILABLE,
+                  reloadOutcome,
+                })
+            : undefined
+        );
       }
     } catch (error) {
+      // A gated app whose route configuration threw is NOT protected: Caddy
+      // kept whatever block it had, which does not carry the guard.
+      if (this.appConfigService?.getConfig(appName)?.access) {
+        await this.stateManager
+          ?.setAccessGateUnapplied(appName, true)
+          .catch(() => undefined);
+      }
       // Surface at error level: a failed reload means this (and every
       // subsequent) route change silently stops applying until an operator
       // intervenes — not a benign "route already exists".
@@ -4690,10 +5084,381 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     }
   }
 
-  /** Reload Caddy iff it's actually running — the guard every caller of caddyServer.reload() already repeated inline. */
-  private async reloadCaddyIfRunning(): Promise<void> {
-    if (this.caddyServer && this.caddyServer.getStatus() === 'running') {
-      await this.caddyServer.reload();
+  /**
+   * Reload Caddy iff it's actually running, and REPORT whether it took.
+   *
+   * `'skipped'` is not `'ok'`: Caddy not running (or a batching caller
+   * deferring the reload) means the emitted config has not reached it, which is
+   * a different thing from a config it accepted. The access gate's state flag
+   * distinguishes all three, because recording "gate applied" after a reload
+   * Caddy REJECTED asserts a control that was never installed — and a rejected
+   * `/load` does not throw, so the surrounding catch never sees it.
+   */
+  private async reloadCaddyIfRunning(): Promise<'ok' | 'failed' | 'skipped'> {
+    if (!this.caddyServer || this.caddyServer.getStatus() !== 'running') return 'skipped';
+    return (await this.caddyServer.reload()) ? 'ok' : 'failed';
+  }
+
+  /**
+   * Whether a browser access gate (DROP-152) can actually be enforced for this
+   * app, resolved from the platform's own live view.
+   *
+   * THE only resolution. The route reaches it through `PlatformOps`, route
+   * emission and the boot sweep call it directly — so there is one answer per
+   * app, not a platform answer and a route answer that have to be argued into
+   * agreement. An earlier shape had the route re-derive the same five inputs
+   * from `runtime-config` + `AppConfig`; the claim that it could only ever be
+   * optimistic was prose with nothing pinning it, and it was already
+   * falsifiable on `authEnabled`.
+   *
+   * Two resolution rules are load-bearing:
+   *
+   *  - **Tenant `tls: {disabled: true}` is IGNORED.** It is authored in the
+   *    app's own `drop.yaml`, so honouring it would let the tenant switch off
+   *    a governance control an admin set, by editing one line in a file they
+   *    own. `handleConfigureRoute` correspondingly refuses to honour it for a
+   *    gated app, so this is not an optimistic read — it is the policy.
+   *  - **Non-HTTPS hostnames are dropped, not tolerated.** A `.localhost`
+   *    entry in a tenant's `domains:` would otherwise flip `httpsEffective`
+   *    false for the app's real HTTPS hostname too. A gated app is not routed
+   *    on a plaintext host at all (again enforced at emission); if that leaves
+   *    no hostname, the verdict is `no-https`.
+   *
+   * `parsed` lets `handleConfigureRoute` hand over the `drop.yaml` it has
+   * already read, so the common path parses once.
+   */
+  private async assessAccessGate(
+    appName: string,
+    parsed?: DropYamlParseResult,
+    /**
+     * The hostnames the caller is ACTUALLY about to route this app on.
+     *
+     * Load-bearing. Without it this method resolved its own list straight from
+     * the tenant's `drop.yaml`, while `handleConfigureRoute` routed the
+     * ownership-filtered `acceptedCustomDomains` (falling back to the default
+     * host). A tenant could make the two disagree with one line of a file they
+     * own — a second `domains:` entry trips `multi-hostname`, a reserved one
+     * empties the list and trips `no-https` — at which point the verdict
+     * refuses, no guard is emitted, and **the app is still served, ungated**.
+     *
+     * That is the same off-switch already closed for `tls: {disabled: true}`
+     * and for `.localhost` entries, reached through a third door. The verdict
+     * now describes the set that is really being emitted.
+     */
+    routedHostnames?: string[]
+  ): Promise<AccessGateVerdict> {
+    const dropYaml =
+      parsed ?? (await parseDropYaml(path.join(this.config.appsDirectory, appName)));
+    const config = this.appConfigService?.getConfig(appName);
+    const state = this.stateManager?.getApp(appName);
+    const suffix = this.config.domainSuffix || 'localhost';
+
+    const declared = dropYaml.success ? dropYaml.config?.domains : undefined;
+    const hasCustomDomains = Boolean(declared && declared.length > 0);
+    let hostnames: string[] = hasCustomDomains
+      ? (declared as string[])
+      : [`${appName}.${suffix}`];
+    // A same-origin monorepo child is routed onto the shared group host —
+    // mirroring handleConfigureRoute's own branch, which is also why a gate on
+    // a single child is refused outright below.
+    if (config?.group && dropYaml.success && dropYaml.config?.route && !hasCustomDomains) {
+      hostnames = [`${config.group}.${suffix}`];
+    }
+    // The caller's list wins when it has one — see `routedHostnames`.
+    hostnames = this.gateRoutableHostnames(routedHostnames ?? hostnames, suffix);
+
+    return assessAccessGate({
+      featureEnabled: this.config.enableAccessGate,
+      isolation: this.config.isolation === 'docker' ? 'docker' : 'none',
+      authEnabled: this.config.enableApiAuth,
+      httpsEffective: resolveHttpsEffective(hostnames, {
+        enableHttps: this.config.enableHttps,
+        isLocalhost: isLocalhostDomain,
+      }),
+      networkIsolation: getTenantNetworkIsolation(),
+      // The login host the gate's first hop redirects to, and the value
+      // `reservedHosts()` is derived from.
+      publicUrl: getPublicUrl(),
+      hostnameCount: hostnames.length,
+      apiPortUsable: Number.isInteger(this.config.apiPort) && this.config.apiPort > 0,
+      // The strict pattern, not the folder-drop one: this name is written into
+      // Caddy directives as a literal, and an unparseable directive rejects
+      // the whole file.
+      appNameSafe: isValidAppName(appName),
+      // `group` lives in AppConfig for a CHILD and in AppState for the
+      // container (expandMonorepo writes `{ group, isGroupContainer }` to state
+      // only). Reading config alone left the container gateable: an admin could
+      // persist a policy on an app that serves nothing, while the children
+      // holding the data stayed open on the group host.
+      group: config?.group ?? state?.group,
+      isGroupContainer: state?.isGroupContainer === true,
+    });
+  }
+
+  /**
+   * The hostnames a GATED app may be routed on: reserved hosts and plaintext
+   * hosts removed. Shared by the verdict and by route emission so the set the
+   * verdict is about is the set that is actually served.
+   */
+  private gateRoutableHostnames(hostnames: string[], suffix: string): string[] {
+    return hostnames.filter(
+      (hostname) =>
+        !isReservedHost(hostname, getPublicUrl(), suffix) &&
+        this.config.enableHttps &&
+        !isLocalhostDomain(hostname)
+    );
+  }
+
+  /**
+   * Re-emit one app's Caddy route blocks from its CURRENT config and reload
+   * Caddy, without stopping, rebuilding or restarting it. See
+   * `PlatformOps.reconfigureRoute` for why this exists.
+   */
+  private async reconfigureRoute(appName: string): Promise<void> {
+    if (this.appsInProgress.has(appName)) {
+      // A deploy in flight will write the route itself when it starts the app;
+      // racing it here could emit a block for a port that is about to change.
+      throw new AppInProgressError(appName);
+    }
+    // CHECK-then-ACT is not enough: a deploy starting immediately after the
+    // check would race this, and because DROP reuses freed ports the losing
+    // write can point a hostname at a port a different tenant's app now owns.
+    // Hold the guard for the duration, like every other lifecycle path.
+    this.appsInProgress.add(appName);
+    try {
+      // AppConfig is the source of truth for ports (see the two-phase
+      // reconciliation in syncStateWithConfigs); AppState is the fallback for
+      // an app whose config has not been written yet.
+      const port =
+        this.appConfigService?.getConfig(appName)?.port ?? this.stateManager?.getApp(appName)?.port;
+      if (!port) {
+        // Nothing is routed for an app with no port. Not an error: a stopped or
+        // never-deployed app's gate takes effect the next time it is routed.
+        this.logger.info(
+          `No route to reconfigure for '${appName}' - it has no assigned port`,
+          'ROUTER'
+        );
+        return;
+      }
+
+      await this.handleConfigureRoute(appName, port, { routeOnly: true });
+    } finally {
+      this.appsInProgress.delete(appName);
+    }
+  }
+
+  /**
+   * Drop guest ids that appear in an app's `access.guests` but have no backing
+   * guest record (DROP-155).
+   *
+   * SELF-HEALING, not enforcement. Nothing is granted by a stale entry
+   * regardless — `verifyAppGuestSessionToken` re-reads the guest record live on
+   * every request and refuses when it is gone — so this is about keeping
+   * `guests` readable as the authoritative list of who currently holds access.
+   * An operator (and the dashboard's own share panel) must be able to answer
+   * "who can open this app" from the policy without cross-checking a second
+   * store, and a revoke interrupted between its two writes would otherwise
+   * leave a name on that list forever.
+   *
+   * CORRUPT STORE => SKIP ENTIRELY. This is the single most important line in
+   * the method, and it is the direction that is not obvious: with the store
+   * unreadable, "this guest has no record" cannot be distinguished from "this
+   * guest exists and we cannot see it" — so a pass that pruned what it could
+   * see would convert ONE unreadable file into permanent deletion of every
+   * guest grant on the estate, on a boot nobody was watching. `reapGuest`
+   * refuses internally for the same reason; this returns before enumerating so
+   * the log line says what actually happened.
+   *
+   * Reaping through `reapGuest` rather than calling `pruneGuestEntries`
+   * directly: an id with no record may still have live INVITES bound to it,
+   * and the reaper is what removes both. It is idempotent and safe on an id
+   * the store has never heard of, which is exactly the case here.
+   *
+   * Best-effort and never fatal — a failure here costs list hygiene, not
+   * access control, and must not stop the platform booting.
+   */
+  /**
+   * Reap guest records whose retention window has elapsed (DROP-155).
+   *
+   * A DIFFERENT question from `pruneStaleGuestGrants`, which reconciles the
+   * two stores against each other. This one is about how long DROP keeps an
+   * email address belonging to someone who never opened an account — the
+   * plan's own risk register promised a window and, until this existed,
+   * there was none.
+   *
+   * Reaping removes the GRANT as well as the record, because they are the
+   * same operation: `reapGuest` revokes the app-config entry first, then its
+   * own bookkeeping. An expired guest therefore loses access, which is the
+   * intent — a grant nobody has used inside the window has outlived its
+   * reason — rather than a side effect to be worked around.
+   *
+   * `listExpiredGuests` returns nothing while the store is corrupt, so this
+   * inherits the same refuse-to-destroy-what-we-cannot-read posture as every
+   * other guest path without restating it.
+   */
+  private async sweepGuestRetention(): Promise<void> {
+    try {
+      const guests = getAppGuestManager();
+      const expired = guests.listExpiredGuests();
+      if (expired.length === 0) return;
+
+      for (const guest of expired) {
+        await guests.reapGuest(guest.id);
+      }
+      // The ID, never the address — see the note on the activity log in
+      // `apps.share.ts`. A retention sweep that logged what it deleted would
+      // put the personal data back into a store with a longer life than the
+      // one it just removed it from.
+      this.logger.info(
+        `Reaped ${expired.length} guest record(s) past the retention window`,
+        'ACCESS'
+      );
+    } catch (error) {
+      this.logger.warn('Guest retention sweep failed', 'ACCESS', error);
+    }
+  }
+
+  private async pruneStaleGuestGrants(): Promise<void> {
+    try {
+      const guestManager = getAppGuestManager();
+      if (guestManager.isCorrupt()) {
+        this.logger.warn(
+          'Guest store is unreadable — skipping the stale-guest-grant sweep entirely. ' +
+            'Guest sessions are being refused while this persists; no grant has been removed.',
+          'ACCESS'
+        );
+        return;
+      }
+
+      const configs = this.appConfigService?.getAllConfigs() ?? [];
+      const stale = new Set<string>();
+      for (const config of configs) {
+        for (const guestId of config.access?.guests ?? []) {
+          if (!guestManager.guestExists(guestId)) stale.add(guestId);
+        }
+      }
+      if (stale.size === 0) return;
+
+      for (const guestId of stale) {
+        await guestManager.reapGuest(guestId);
+      }
+      this.logger.info(
+        `Pruned ${stale.size} guest grant(s) with no backing record`,
+        'ACCESS'
+      );
+    } catch (error) {
+      this.logger.warn('Stale-guest-grant sweep failed', 'ACCESS', error);
+    }
+  }
+
+  /**
+   * Report every persisted access-gate policy this box cannot enforce
+   * (DROP-152), and record the resulting `accessGateUnapplied` state for
+   * each app. A REPORTER — it never touches Caddy.
+   *
+   * A SWEEP, not a startup constraint. `assertStartupConstraints` runs before
+   * the config layer loads -- so it cannot see any app's policy -- and it
+   * throws to exit the process, which would let one tenant's gate declaration
+   * refuse to boot the entire fleet. This logs and returns.
+   *
+   * DELIBERATELY does not re-emit any app's route to strip a stale guard out
+   * of Caddy when the DROP_FEATURE_ACCESS_GATE kill switch is off, even
+   * though a guard already loaded stays there until that app's next route
+   * event. An earlier version of this method did exactly that (via
+   * `reconfigureRoute`), which sounded like the safe move but was not:
+   *
+   *  - it ran in `start()` BEFORE boot reconciliation and the watcher have
+   *    routed anything, when `RouterService.routes` is still nearly empty and
+   *    never seeded from disk — so `addRoute`'s `regenerateConfig()` wrote a
+   *    Caddyfile describing only the handful of apps this sweep had touched
+   *    so far, truncating every OTHER app on the box. That is strictly worse
+   *    than the stale guard it was meant to fix, and batching the reloads
+   *    (tried in an earlier round) does not close the window: the file write
+   *    happens inside `addRoute` regardless of `skipCaddyReload`, which only
+   *    defers the `caddy reload` admin-API call;
+   *  - it bought little even ignoring that risk. `/verify` admits (204,
+   *    `gate-disabled`) whenever `isAccessGateEnabled()` is false, so a stale
+   *    guard cannot lock anyone out any more — it costs an extra hop, not
+   *    availability. And `handleConfigureRoute` already drops the guard
+   *    through the ORDINARY emission path once its own `gateWithdrawn`
+   *    condition is true, so the guard clears itself on this app's next
+   *    deploy, restart, or boot-reconcile pass regardless of anything this
+   *    method does.
+   *
+   * `setAccessGateUnapplied` is still cleared (never set) for a gated app
+   * while the switch is off: there is no gate to apply, so "unapplied" is
+   * the wrong axis to assert `true` on — see `handleConfigureRoute`'s own
+   * `gateWithdrawn` handling, which this mirrors.
+   *
+   * The kill-switch-off case is reported as ONE aggregate line naming every
+   * affected app, not a per-app message — mirroring the `unenforceable`
+   * summary below. An earlier version distinguished running vs. stopped
+   * (reading `runtime.getAllStatus()`) and monorepo group members (reading
+   * `assessAccessGate()`, which opens with a `parseDropYaml` parse) per app,
+   * but all three branches ended in the same "no action is required" text,
+   * so the distinction cost real boot time — a `listContainers` + N
+   * `inspect` + a per-container `stats` call under docker, plus a
+   * `parseDropYaml` per gated app — to choose between wording nobody acted
+   * on differently.
+   */
+  private async sweepAccessGates(): Promise<void> {
+    const configs = this.appConfigService?.getAllConfigs() ?? [];
+    const unenforceable: string[] = [];
+    const withdrawn: string[] = [];
+
+    for (const config of configs) {
+      if (!config.access) {
+        // Not `continue`: a gate removed while the platform was down must
+        // clear the flag, or the estate view reports "gate not applied" for an
+        // app that no longer has a gate. The write is change-guarded, so this
+        // is a no-op for the overwhelming majority of apps that never had one.
+        await this.stateManager?.setAccessGateUnapplied(config.name, undefined);
+        continue;
+      }
+      if (!this.config.enableAccessGate) {
+        // There is no gate to apply while the switch is off, so "unapplied"
+        // is the wrong axis to record `true` on (mirrors the route-emission
+        // fix). Collected for the aggregate line below rather than logged
+        // per app — every app in this state ends at the same "no action is
+        // required" fact regardless of whether it is running or part of a
+        // monorepo group.
+        await this.stateManager?.setAccessGateUnapplied(config.name, undefined);
+        withdrawn.push(config.name);
+        continue;
+      }
+      const verdict = await this.assessAccessGate(config.name);
+      if (!verdict.enforceable) {
+        unenforceable.push(config.name);
+        this.logger.error(describeAccessGateRefusal(config.name, verdict), 'ROUTER');
+      }
+      // 'skipped': the sweep reads persisted state at boot and emits nothing,
+      // so it can never assert that Caddy is carrying the guard.
+      await this.stateManager?.setAccessGateUnapplied(
+        config.name,
+        !isGateApplied({
+          enforceable: verdict.enforceable,
+          enforcementAvailable: ACCESS_GATE_ENFORCEMENT_AVAILABLE,
+          reloadOutcome: 'skipped',
+        })
+      );
+    }
+
+    if (withdrawn.length > 0) {
+      this.logger.info(
+        `${withdrawn.length} app(s) carry an access-gate policy that is not enforced ` +
+          `(DROP_FEATURE_ACCESS_GATE is switched off): ${withdrawn.join(', ')}. Any guard ` +
+          'already in Caddy for these apps stays there until their next route emission, but ' +
+          '/verify is admitting every request in the meantime — no action is required.',
+        'ROUTER'
+      );
+    }
+
+    if (unenforceable.length > 0) {
+      this.logger.error(
+        `${unenforceable.length} app(s) have an access-gate policy this platform cannot enforce: ` +
+          `${unenforceable.join(', ')}. They are NOT protected.`,
+        'ROUTER'
+      );
     }
   }
 
@@ -6282,6 +7047,53 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       this.logger.warn(`Failed to retain deploy details for ${name}`, 'CLEANUP', error);
     }
 
+    // Guest records and their live invites (DROP-155). Deleting an app frees
+    // its NAME, and a guest record is keyed on `(email, appName)` — so a guest
+    // left behind is a credential for whatever the next registrant puts at
+    // that name. `verifyAppGuestSessionToken` would happily verify it: every
+    // check it makes (app claim, record `appName`, `disabled`, the
+    // invalidation stamp) still passes, because none of them knows the app
+    // was ever deleted. That is the same next-tenant-inherits-the-previous
+    // one's-artifacts problem the log and appdata deletes below exist for,
+    // except the artifact is an admission credential.
+    //
+    // NOT gated on `keepData`: that flag protects the user's DATA (database,
+    // Redis, appdata) so a delete-and-redeploy keeps working. A grant to a
+    // third party is not the owner's data, and re-creating the app must not
+    // silently re-admit people the owner invited to the app that used to be
+    // there.
+    //
+    // `reapGuest` also removes every invite bound to each guest, which is how
+    // the app's live invites go with it — an invite always names a guest that
+    // already exists (`mintInviteToken` requires a resolved guest id), so
+    // reaping every guest of this app reaps every invite for it.
+    try {
+      const guestManager = getAppGuestManager();
+      // Corrupt store => touch nothing. "Refuse every guest" plus "clean up
+      // what we can see" is the combination that turns one unreadable file
+      // into permanent deletion of grants across the estate; the reaper itself
+      // makes the same refusal internally, and this avoids even enumerating.
+      if (!guestManager.isCorrupt()) {
+        const appGuests = guestManager.listGuests().filter((g) => g.appName === name);
+        for (const guest of appGuests) {
+          await guestManager.reapGuest(guest.id);
+        }
+        if (appGuests.length > 0) {
+          this.logger.info(
+            `Revoked ${appGuests.length} guest grant(s) for deleted app '${name}'`,
+            'CLEANUP'
+          );
+        }
+      } else {
+        this.logger.warn(
+          `Guest store is unreadable — guest grants for deleted app '${name}' were NOT revoked`,
+          'CLEANUP'
+        );
+      }
+    } catch (error) {
+      this.logger.warn(`Failed to revoke guest grants for ${name}`, 'CLEANUP', error);
+    }
+
     const targets = [
       path.join(this.config.dropRoot, 'data', 'logs', 'webapps', name),
       path.join(this.config.dropRoot, 'data', 'logs', 'builds', name),
@@ -6870,6 +7682,12 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     }
     this.idleSweepTimer = setInterval(() => {
       void this.sweepExpiredEphemerals().then(() => this.sweepIdleApps());
+      // Guest retention rides the SAME cadence but its own chain, so a
+      // failure in either sweep cannot stop the other. Boot-only would have
+      // made "a stated retention window" true of a box that reboots and
+      // false of one that does not — and the long-lived box is the one
+      // accumulating the data.
+      void this.sweepGuestRetention();
     }, 15 * 60 * 1000);
     this.idleSweepTimer.unref?.();
   }

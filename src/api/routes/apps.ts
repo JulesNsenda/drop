@@ -27,14 +27,16 @@ import { getDeployTracker } from '../../managers/deploy-tracker';
 import { migrateAppRuntime } from '../../managers/runtime/runtime-migrator';
 import { hasEnoughDisk, getMinFreeDiskMb } from '../../utils/disk';
 import { getStateManager, AppState } from '../../managers/app/state-manager';
-import { getAppConfigService, getAppConfigServiceOrNull } from '../../managers/app/app-config';
+import {
+  getAppConfigService,
+  getAppConfigServiceOrNull,
+} from '../../managers/app/app-config';
 import { getDatabaseProvisioner } from '../../managers/database';
 import { getRedisProvisioner } from '../../managers/redis';
 import { getRouterService } from '../../core/router';
 import { logActivityFor } from '../../managers/activity';
 import {
   getAppsDirectory,
-  isHttpsEnabled,
   getDomainSuffix,
   getTempDirectory,
   getUploadMaxBytes,
@@ -42,7 +44,7 @@ import {
 } from '../runtime-config';
 import { isPathWithin } from '../../utils/paths';
 import { isReservedHost } from '../../utils/reserved-hosts';
-import { isLocalhostDomain } from '../../utils/domain-validator';
+import { computeAppUrl } from '../../utils/app-url';
 import { eventBus } from '../../core/event-bus';
 import {
   getUploadDeployService,
@@ -50,11 +52,22 @@ import {
   UploadValidationError,
   InsufficientDiskSpaceError,
 } from '../../core/upload-deploy';
+import {
+  describeAccessGateRefusal,
+  ACCESS_GATE_ENFORCEMENT_AVAILABLE,
+  gateEnforced,
+} from '../../managers/guardrail/access-gate';
 import { DeployRefusedError } from '../../managers/guardrail/deploy-breaker';
 import { QuotaExceededError } from '../../managers/guardrail/principal-quota';
 import { pruneOwnerDumpsToFit, predeleteMaxBytes } from '../../managers/guardrail/detach-limits';
 import { runUploadPreflight } from '../upload-preflight';
 import type { RuntimeType } from '../../managers/runtime/app-runtime.types';
+import {
+  MAX_ACCESS_ALLOW_ENTRIES,
+  MAX_USER_ID_LENGTH,
+  requireAuthForAccessRoutes,
+} from './access-limits';
+import shareRoutes from './apps.share';
 
 const apps = new Hono();
 
@@ -117,44 +130,6 @@ function resolveUsername(userId?: string): string | undefined {
   } catch {
     return undefined;
   }
-}
-
-/**
- * Compute an app's externally-reachable URL.
- *
- * The served host is DERIVED, never read from `app.hostname` — that field is the
- * persisted `<name>.localhost` placeholder; the host an app actually serves on is
- * computed at route time and never stored (P0-6 hijack guard — see
- * `AppConfigService.getDomainOwners`). Priority: dashboard-set `customDomain` >
- * drop.yaml `domains` (persisted in app config) > default `<name>.<domainSuffix>`
- * (mirrors `platform.ts` `handleConfigureRoute`). Returns `undefined` for a
- * localhost host — there is no globally-reachable URL, so the dashboard falls back
- * to a direct host:port link derived from the viewer's own location.
- */
-export function computeAppUrl(app: AppState): string | undefined {
-  let configDomains: string[] | undefined;
-  let tlsDisabled = false;
-  let publicUrl: string | undefined;
-  try {
-    const cfg = getAppConfigService().getConfig(app.name);
-    configDomains = cfg?.domains;
-    tlsDisabled = cfg?.tls?.disabled === true;
-    publicUrl = cfg?.publicUrl;
-  } catch {
-    // Config service not initialised (e.g. isolated route tests) — use default host.
-  }
-  // A same-origin monorepo child is routed onto the group domain (frontend at
-  // '/', backend at '/api'), never its own `<name>` subdomain — so the
-  // name-based default below would be a dead link. handleConfigureRoute persists
-  // the real, fully-resolved URL as publicUrl. A custom domain still wins:
-  // declaring `domains` opts the child out of same-origin routing.
-  if (publicUrl && !app.customDomain && !configDomains?.length) {
-    return publicUrl;
-  }
-  const domain = app.customDomain || configDomains?.[0] || `${app.name}.${getDomainSuffix()}`;
-  if (isLocalhostDomain(domain)) return undefined;
-  const proto = isHttpsEnabled() && !tlsDisabled ? 'https' : 'http';
-  return `${proto}://${domain}`;
 }
 
 /**
@@ -1307,6 +1282,281 @@ apps.delete('/:name/services/:id', async c => {
     return c.json(error(ErrorCodes.INTERNAL_ERROR, 'Failed to detach service'), 500);
   }
 });
+
+// GET /apps/:name/access - Admin: read the browser access gate policy.
+// Reports what is ENFORCED, not merely what is persisted: an admin must be
+// able to tell a recorded policy from a live control.
+apps.get('/:name/access', async c => {
+  const name = c.req.param('name');
+  const refusal = requireAuthForAccessRoutes();
+  if (refusal) return c.json(error(ErrorCodes.UNAUTHORIZED, refusal), 401);
+
+  const app = getStateManager().getApp(name);
+  if (!app) {
+    throw new NotFoundError(`Application '${name}' not found`);
+  }
+
+  const ops = getPlatformOps();
+  if (!ops) {
+    return c.json(error(ErrorCodes.SERVICE_UNAVAILABLE, 'Platform operations unavailable'), 503);
+  }
+
+  const policy = getAppConfigServiceOrNull()?.getConfig(name)?.access;
+  const verdict = await ops.assessAccessGate(name);
+
+  return c.json(
+    success({
+      access: policy ?? null,
+      // What is true of traffic right now.
+      enforced: gateEnforced(verdict, Boolean(policy)),
+      // What is true of the box, independent of whether a policy exists.
+      enforceable: verdict.enforceable,
+      blockers: verdict.blockers,
+      reasons: verdict.reasons,
+      // The platform's own record of whether the last route emission actually
+      // installed the guard. Distinct from `enforceable`: the box can be
+      // capable and the emission still have failed.
+      gateApplied: app.accessGateUnapplied === undefined ? null : !app.accessGateUnapplied,
+      // AC3: who has opened it, and when it was last opened at all.
+      //
+      // Deliberately on THIS route rather than on the app DTO. It is personal
+      // data about third parties — the visitor set — and `/apps/*` is reachable
+      // by every `readonly` principal and by the app's owner, while this route
+      // is admin-only. Source IP is never recorded anywhere, so there is none
+      // to leak here.
+      lastOpenedAt: app.lastOpenedAt ?? null,
+      recentOpeners: app.recentOpeners ?? [],
+      owner: app.userId ?? null,
+      reviewBy: getAppConfigServiceOrNull()?.getConfig(name)?.reviewBy ?? null,
+    })
+  );
+});
+
+// PUT /apps/:name/access - Admin: gate this app to an explicit list of users.
+//
+// Refuses (409) when the platform cannot ENFORCE the gate rather than writing
+// a policy that would do nothing — the first of the three refusal points; the
+// other two are route emission and the boot sweep, which cover the case where
+// the box stops satisfying the premise after this write succeeded.
+apps.put('/:name/access', async c => {
+  const auth = (c.get as Function)('auth') as AuthContext | undefined;
+  const name = c.req.param('name');
+  const refusal = requireAuthForAccessRoutes();
+  if (refusal) return c.json(error(ErrorCodes.UNAUTHORIZED, refusal), 401);
+
+  const app = getStateManager().getApp(name);
+  if (!app) {
+    throw new NotFoundError(`Application '${name}' not found`);
+  }
+
+  const ops = getPlatformOps();
+  if (!ops) {
+    return c.json(error(ErrorCodes.SERVICE_UNAVAILABLE, 'Platform operations unavailable'), 503);
+  }
+  // Pre-check, before anything is persisted: a deploy in flight makes the
+  // route re-emission below throw, and by then the policy would already be on
+  // disk with a 409 telling the caller it was not. The delete route uses the
+  // same synchronous pre-check for the same reason.
+  if (ops.isAppInProgress(name)) {
+    return c.json(error(ErrorCodes.CONFLICT, `Application '${name}' has an operation in progress`), 409);
+  }
+
+  // The enforceability refusal comes BEFORE allow-list validation. Reversed,
+  // an auth-disabled box answers "Unknown user id(s)" — `getUserById` returns
+  // null for everything when there are no credentials — and the operator is
+  // told their ids are wrong when the real problem is that the platform has no
+  // principals at all, with the structured refusal never firing.
+  const verdict = await ops.assessAccessGate(name);
+  if (!verdict.enforceable) {
+    return c.json(
+      {
+        success: false,
+        error: {
+          code: ErrorCodes.CONFLICT,
+          message: describeAccessGateRefusal(name, verdict),
+          details: { blockers: verdict.blockers, reasons: verdict.reasons },
+        },
+      },
+      409
+    );
+  }
+
+  const body = (await c.req.json()) as { allow?: unknown };
+  const allow = body.allow;
+
+  if (
+    !Array.isArray(allow) ||
+    !allow.every(id => typeof id === 'string' && id.length > 0 && id.length <= MAX_USER_ID_LENGTH)
+  ) {
+    throw new ValidationError(
+      `allow must be an array of non-empty user id strings (max ${MAX_USER_ID_LENGTH} chars each)`
+    );
+  }
+  if (allow.length > MAX_ACCESS_ALLOW_ENTRIES) {
+    throw new ValidationError(
+      `allow may contain at most ${MAX_ACCESS_ALLOW_ENTRIES} entries (got ${allow.length})`
+    );
+  }
+  if (new Set(allow).size !== allow.length) {
+    throw new ValidationError('allow must not contain duplicate user ids');
+  }
+
+  // Validated against the credential store at write time. An unvalidated id is
+  // not merely untidy: the list is read on every request the gate handles, and
+  // ids that never resolve accumulate silently until nobody can say who a gate
+  // actually admits. USER IDs, not usernames — a username can be reassigned.
+  const unknown = allow.filter(id => !getUserById(id));
+  if (unknown.length > 0) {
+    throw new ValidationError(`Unknown user id(s): ${unknown.slice(0, 10).join(', ')}`);
+  }
+
+  // A governance review date. Metadata, not authorization — so it goes on the
+  // SYSTEM tier with the existing narrowed writers rather than joining the
+  // RESTRICTED tier, which exists for fields that decide who may do something
+  // and costs a dedicated setter per field.
+  const reviewBy = typeof (body as { reviewBy?: unknown }).reviewBy === 'string'
+    ? (body as { reviewBy: string }).reviewBy
+    : undefined;
+  if (reviewBy !== undefined && Number.isNaN(Date.parse(reviewBy))) {
+    throw new ValidationError('reviewBy must be an ISO-8601 date');
+  }
+
+  // setAccessPolicy, not updateConfig/updateSystemConfig: `access` is a
+  // RESTRICTED field that every other writer strips at runtime. It does not
+  // create a config when none exists, so an access write against a name that
+  // has runtime state but no persisted config refuses rather than minting a
+  // skeleton config that the next boot's reconciliation would then treat as a
+  // real app.
+  //
+  // The updater form (DROP-153), not a whole-policy literal: this route replaces
+  // the WHOLE `allow` array on every write, and `setAccessPolicy` replaces
+  // `access` wholesale.
+  //
+  // Provenance (`grantedBy`) is NOT built here on purpose. An updater result
+  // that omits the key entirely means "I have no opinion", and
+  // `setAccessPolicy` then carries provenance forward itself for every id still
+  // present in `allow`, dropping it for ids this write removes. That merge used
+  // to live in this route as an exported helper every caller had to remember to
+  // call — which is the shape `.claude/CLAUDE.md` warns about, since the next
+  // writer of `access` would compile clean and one-way convert every
+  // owner-authored grant into an unrevokable admin-authored one.
+  const updated = await getAppConfigService().setAccessPolicy(name, () => ({
+    mode: 'drop-users' as const,
+    allow,
+  }));
+  if (!updated) {
+    throw new NotFoundError(`Application '${name}' not found`);
+  }
+  if (reviewBy !== undefined) {
+    await getAppConfigService().updateSystemConfig(name, { reviewBy });
+  }
+
+  let applied = true;
+  let applyError: string | undefined;
+  try {
+    // Without this the policy is written and NOTHING in the running Caddyfile
+    // changes until the app happens to be redeployed — fail-open in the enable
+    // direction, with the dashboard reporting the app as gated.
+    await ops.reconfigureRoute(name);
+  } catch (err) {
+    // The policy is already persisted, so an error STATUS here would describe
+    // the opposite of the stored state. Report success-with-`applied: false`
+    // and let the state flag (written by the emission path's own catch) carry
+    // the same news to the estate view.
+    applied = false;
+    applyError = err instanceof Error ? err.message : 'Failed to re-emit the route';
+  }
+
+  await logActivityFor(auth, { action: 'access-gate-set', appName: name });
+
+  const enforced = applied && gateEnforced(verdict, true);
+  return c.json(
+    success({
+      message: enforced
+        ? `Access gate set for '${name}'`
+        : `Access policy recorded for '${name}', but it is NOT being enforced`,
+      // The persisted value (including the carried-forward `grantedBy`), not
+      // a locally-built literal — the two can now differ.
+      access: updated.access,
+      enforced,
+      ...(ACCESS_GATE_ENFORCEMENT_AVAILABLE
+        ? {}
+        : {
+            // Slice 0 ships the policy store and the refusals; nothing emits a
+            // guard yet. Saying "gate set" here would be the platform's own
+            // API asserting a control that does not exist.
+            notEnforcedReason:
+              'this build records access policies but does not yet enforce them',
+          }),
+      ...(applyError ? { applyError } : {}),
+    })
+  );
+});
+
+// DELETE /apps/:name/access - Admin: remove the gate entirely.
+//
+// Deliberately NOT gated on enforceability: an operator must always be able to
+// REMOVE a control, including on a box that can no longer enforce it. Refusing
+// here would strand a policy that the platform itself reports as not applied.
+apps.delete('/:name/access', async c => {
+  const auth = (c.get as Function)('auth') as AuthContext | undefined;
+  const name = c.req.param('name');
+  const refusal = requireAuthForAccessRoutes();
+  if (refusal) return c.json(error(ErrorCodes.UNAUTHORIZED, refusal), 401);
+
+  const app = getStateManager().getApp(name);
+  if (!app) {
+    throw new NotFoundError(`Application '${name}' not found`);
+  }
+
+  const ops = getPlatformOps();
+  if (!ops) {
+    return c.json(error(ErrorCodes.SERVICE_UNAVAILABLE, 'Platform operations unavailable'), 503);
+  }
+  // Before the write, for the same reason PUT pre-checks: a 409 after the
+  // policy is already gone tells the operator the gate is still in place when
+  // it is not — the worst possible direction for this particular lie.
+  if (ops.isAppInProgress(name)) {
+    return c.json(error(ErrorCodes.CONFLICT, `Application '${name}' has an operation in progress`), 409);
+  }
+
+  // `() => undefined` rather than a bare `undefined`: `setAccessPolicy` takes
+  // the updater form only, so that no caller can hand it a whole policy literal
+  // and silently drop `grantedBy` on the way past.
+  const updated = await getAppConfigService().setAccessPolicy(name, () => undefined);
+  if (!updated) {
+    throw new NotFoundError(`Application '${name}' not found`);
+  }
+  // The review date belongs to the policy. Leaving it behind means the estate
+  // view shows a governance review date against an app that is no longer
+  // governed.
+  await getAppConfigService().updateSystemConfig(name, { reviewBy: undefined });
+
+  let applyError: string | undefined;
+  try {
+    await ops.reconfigureRoute(name);
+  } catch (err) {
+    // The gate is already gone from the store, so the removal SUCCEEDED. Only
+    // the re-emission failed, which for a removal leaves a stale guard in
+    // Caddy — restrictive, not permissive — so this is reported, not an error.
+    applyError = err instanceof Error ? err.message : 'Failed to re-emit the route';
+  }
+
+  await logActivityFor(auth, { action: 'access-gate-clear', appName: name });
+
+  return c.json(
+    success({
+      message: `Access gate removed for '${name}'`,
+      ...(applyError ? { applyError } : {}),
+    })
+  );
+});
+
+// GET/POST/DELETE /apps/:name/share — owner-initiated sharing (DROP-153).
+// Mounted via `apps.route(...)` rather than a second `v1.route('/apps', …)`
+// in server.ts, so `apps.use('/:name/*', validateAppName())` above covers
+// these paths too (a second top-level mount would bypass it).
+apps.route('/', shareRoutes);
 
 /**
  * Scopes an admin may grant via PUT /:name/capabilities. Deliberately a fixed

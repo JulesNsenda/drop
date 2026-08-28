@@ -4,6 +4,7 @@ import Layout from './components/Layout';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import { ToastProvider } from './components/Toast';
 import { ConfirmProvider } from './components/ConfirmDialog';
+import { PortalScopeProvider } from './components/ui/PortalScope';
 import { AuthContext, useAuthProvider } from './hooks/useAuth';
 import { UNAUTHORIZED_EVENT, MUST_CHANGE_PASSWORD_EVENT } from './api/client';
 import AppsPage from './pages/AppsPage';
@@ -17,6 +18,8 @@ import UsersPage from './pages/UsersPage';
 import NotFoundPage from './pages/NotFoundPage';
 import ChangePasswordPage from './pages/ChangePasswordPage';
 import OAuthConsent from './pages/OAuthConsent';
+import AppAccessConsent from './pages/AppAccessConsent';
+import GuestInvite from './pages/GuestInvite';
 
 function App() {
   const auth = useAuthProvider();
@@ -44,6 +47,11 @@ function App() {
 
   return (
     <AuthContext.Provider value={auth}>
+      {/* Owns the one `.drop-ui` node that portalled UI mounts into. Must wrap
+          both consumers below: ConfirmProvider reads the container from its
+          context, and it sits ABOVE the layout shells that carry `.drop-ui`,
+          so no shell-provided context could ever reach it. */}
+      <PortalScopeProvider>
       <ToastProvider>
         <ConfirmProvider>
         <ErrorBoundary>
@@ -77,6 +85,17 @@ function App() {
                 returnTo when signed out; see refinement #1 in the OAuth
                 execution plan). */}
             <Route path="oauth-consent" element={<OAuthConsent />} />
+            {/* The browser access gate's SPA hop (DROP-152): the only place that
+                can read the localStorage session a top-level 302 cannot carry. */}
+            <Route path="app-access" element={<AppAccessConsent />} />
+            {/* The GUEST's hop (DROP-155). A public route beside its two
+                siblings, not a second React root: it was mounted outside
+                <App> on the belief that a failed /auth/me probe would bounce
+                a guest to /login, and that is false — `client.ts` only fires
+                `drop:unauthorized` when a token is PRESENT, which a guest
+                never has. The page handles its own unauthenticated state, as
+                AppAccessConsent and OAuthConsent already do. */}
+            <Route path="app-invite" element={<GuestInvite />} />
 
             {/* Docs (PRD-043) and API/CLI reference (PRD-044) moved to the
                 marketing site bundle at /docs and /reference (DROP-070) —
@@ -116,6 +135,7 @@ function App() {
         </ErrorBoundary>
         </ConfirmProvider>
       </ToastProvider>
+      </PortalScopeProvider>
     </AuthContext.Provider>
   );
 }

@@ -52,10 +52,10 @@ function ChangePasswordPage() {
   return (
     <AuthLayout>
       <div className="mb-6 text-center">
-        <h1 className="text-2xl font-semibold" style={{ color: 'var(--text)' }}>
+        <h1 className="text-2xl font-semibold text-fg">
           Set your password
         </h1>
-        <p className="mt-1 text-sm" style={{ color: 'var(--text-2)' }}>
+        <p className="mt-1 text-sm text-muted">
           Choose a new password to secure your account.
         </p>
       </div>

@@ -566,6 +566,92 @@ function isLegacyPasswordHash(storedHash: string): boolean {
 const VALID_USER_ROLES: ReadonlySet<string> = new Set(['admin', 'user', 'readonly']);
 
 /**
+ * Whether any DROP user already holds this address — the lookup the INVITE end
+ * of the collision rule needs (DROP-155).
+ *
+ * Normalized on both sides, matching `assertEmailNotHeldByGuest` below: one
+ * mailbox is one identity regardless of how it was typed, and a check that
+ * disagrees is a check that can be walked past with a capital letter.
+ *
+ * A linear scan, deliberately un-indexed: `credentials.users` is the same
+ * array every other lookup here scans, and an index would be a second copy of
+ * the truth to keep in sync for a list that is small by construction.
+ */
+export function emailHeldByAnyUser(email: string): boolean {
+  // THROWS when the store is unreadable, rather than answering "not held".
+  //
+  // Its counterpart `emailHeldByAnyGuest` already argues this polarity at
+  // length: reporting "cannot tell" as "free" PERMITS the parallel identity
+  // the rule exists to refuse. A rule the plan calls "enforced at both ends"
+  // had one end failing open and the other closed, which is worse than either
+  // choice made consistently. `inviteGuest` maps this to the same 503 it gives
+  // for an unreadable guest store.
+  if (!credentials) {
+    throw new Error('Cannot verify address availability — credentials are unavailable.');
+  }
+  const target = email.trim().toLowerCase();
+  if (!target) return false;
+  return credentials.users.some(u => (u.email ?? '').trim().toLowerCase() === target);
+}
+
+/**
+ * The USER end of DROP-155's email-collision rule.
+ *
+ * A guest is identified by `(email, appName)`, and a DROP user by a username.
+ * Nothing stops the same human address existing on both sides — and if it
+ * does, one address maps to two principals with different authorization
+ * paths, which is the parallel-identity hole the rule exists to close.
+ *
+ * BOTH ENDS, because one is not enough and the direction is not symmetric in
+ * time: the invite route refuses an address a user already holds, and this
+ * refuses an address a guest already holds. A one-directional check would let
+ * a user simply take the address afterwards, which is the ordering that makes
+ * a single check useless rather than merely incomplete.
+ *
+ * NORMALIZED on both sides via the guest store's own `normalizeEmail`, never a
+ * bare `===`: `Alice@Example.com` and `alice@example.com` are one mailbox, and
+ * a check that treats them as two is a check that can be walked straight past.
+ *
+ * GATED ON `email !== undefined`, and that is load-bearing rather than tidy.
+ * `emailHeldByAnyGuest` THROWS when the guest store is corrupt — the right
+ * direction for a check whose job is refusing to create a parallel identity it
+ * cannot rule out. But `initializeAuth` bootstraps the default admin through
+ * `createUser`, and that call passes no email at all: without this guard an
+ * unreadable, entirely unrelated `app-guests.json` would refuse to create the
+ * only account that can log in and fix it. "Fail closed" means the SAFE state,
+ * and bricking the box is not it.
+ *
+ * Refuses with the same generic message the username branch uses, and for the
+ * same reason: a distinguishable refusal is an oracle over who holds which
+ * address.
+ */
+function assertEmailNotHeldByGuest(email: string | undefined): void {
+  if (email === undefined) return;
+  const { emailHeldByAnyGuest, normalizeEmail } = requireGuestModule();
+  if (emailHeldByAnyGuest(normalizeEmail(email))) {
+    throw new Error('That email address is not available.');
+  }
+}
+
+/**
+ * Loaded through `require` rather than a top-level import, and this is not
+ * style.
+ *
+ * `src/managers/app-guest` imports `session-token.ts`'s siblings and, through
+ * the manager, this very module's `predatesInvalidationStamp`/`isGrantDenied`.
+ * A static import here closes that loop into a require cycle, whose symptom is
+ * an `undefined` binding at module-init time in whichever file happens to be
+ * evaluated second — a failure that moves when unrelated import order changes.
+ */
+function requireGuestModule(): {
+  emailHeldByAnyGuest: (email: string) => boolean;
+  normalizeEmail: (email: string) => string;
+} {
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  return require('../../managers/app-guest');
+}
+
+/**
  * Create a new user
  */
 export async function createUser(
@@ -603,6 +689,11 @@ export async function createUser(
   if (credentials.users.find((u) => u.username === username)) {
     throw new Error(`User '${username}' already exists`);
   }
+
+  // DROP-155: an address already held by a guest must not also become a user.
+  // Checked HERE rather than at the two routes that create users, so a future
+  // caller inherits it — the same argument the role check above makes.
+  assertEmailNotHeldByGuest(email);
 
   const { hash: passwordHash } = hashPassword(password);
   const user: User = {
@@ -716,6 +807,19 @@ export async function deleteUser(userId: string): Promise<boolean> {
 }
 
 /**
+ * NOTE for anyone adding a second deletion path: an account's id may also be
+ * on app access allow-lists (DROP-152), and those live in `AppConfigService`,
+ * not here. `deleteUser` does not prune them because this module must not
+ * depend on the config layer — the route that owns the deletion calls
+ * `pruneAllowListEntries` instead.
+ *
+ * Nothing is granted by a stale entry (`verifyAppSessionToken` re-resolves the
+ * user live), so the cost of forgetting is a misleading governance list rather
+ * than an admission. There is exactly ONE caller of `deleteUser` today; if that
+ * stops being true, this comment is the thing that will have gone stale.
+ */
+
+/**
  * Set `user.enabled` and, whenever the TARGET state is disabled, stamp
  * `credentialsInvalidBefore` — the ONE shared primitive `suspendUser` and
  * `updateUser` (the dashboard's `PUT /auth/users/:id {enabled:false}` disable
@@ -807,6 +911,11 @@ export async function updateUser(userId: string, updates: { enabled?: boolean; r
   if (updates.role !== undefined && !VALID_USER_ROLES.has(updates.role)) {
     throw new Error(`Invalid role: ${updates.role}`);
   }
+
+  // DROP-155, the other half of the same rule. Creating a user with a guest's
+  // address and MOVING a user onto one are the same parallel identity; a check
+  // only on create would be walked past by an update one request later.
+  assertEmailNotHeldByGuest(updates.email);
 
   if (updates.enabled !== undefined) setUserEnabled(user, updates.enabled);
   if (updates.role) user.role = updates.role;
@@ -1368,9 +1477,20 @@ export const ACCESS_TOKEN_TTL_SECONDS = 15 * 60;
 const ACCESS_TOKEN_TTL_MS = ACCESS_TOKEN_TTL_SECONDS * 1000;
 const revokedGrants = new Map<string, number>();
 
-function denyGrant(sid: string): void {
+/**
+ * Revoke one grant until the credential carrying it would have expired anyway.
+ *
+ * `ttlMs` defaults to the OAuth access-token lifetime, which is what every
+ * caller wanted while `oauth_access` and `app_mcp` were the only classes using
+ * it. The browser session class (`app_access/session-token.ts`) lives for
+ * HOURS, so a denial retained for 15 minutes would silently stop denying it —
+ * the entry would be swept and the still-valid token would work again. A
+ * denylist that expires before the thing it denies is worse than no denylist,
+ * because it reads as coverage.
+ */
+export function denyGrant(sid: string, ttlMs: number = ACCESS_TOKEN_TTL_MS): void {
   if (!sid) return;
-  revokedGrants.set(sid, Date.now() + ACCESS_TOKEN_TTL_MS);
+  revokedGrants.set(sid, Date.now() + ttlMs);
   // Opportunistic sweep — no timer to leak, and the map only ever holds
   // entries from the last token-lifetime of revocation activity.
   const now = Date.now();
@@ -1379,10 +1499,35 @@ function denyGrant(sid: string): void {
   }
 }
 
-function isGrantDenied(sid: string | undefined): boolean {
+/**
+ * Whether a specific grant (`sid`) has been revoked.
+ *
+ * Exported for the sibling credential class in `src/api/app-access/`, which
+ * needs the same denylist this module's own verifiers consult. A credential
+ * class that could not be reached by `denyGrant` would be revocable only by
+ * suspending the whole account.
+ */
+export function isGrantDenied(sid: string | undefined): boolean {
   if (!sid) return false;
   const until = revokedGrants.get(sid);
   return until !== undefined && until > Date.now();
+}
+
+/**
+ * The signing key for the app-audienced token classes.
+ *
+ * Exported ONLY for `src/api/app-access/session-token.ts`, which mints and
+ * verifies the browser session for a gated app. That module lives outside this
+ * file for size and cohesion — `auth.ts` is ~2k lines and imported by every
+ * route file — not because a trust boundary runs between them: three
+ * mint/verify pairs already use this key inside this module, and the fourth is
+ * the same kind of thing sitting next door.
+ *
+ * Do not widen this beyond that use. Anything that needs to SIGN with it is a
+ * new credential class and should be reviewed as one.
+ */
+export function getOAuthTokenSecret(): Uint8Array | null {
+  return oauthTokenSecret;
 }
 
 /** Hash an opaque token the same way API keys are hashed (sha256 hex digest of the raw value). */

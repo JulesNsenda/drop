@@ -26,7 +26,10 @@ import {
   mcpRateLimitMiddleware,
   oauthRateLimitMiddleware,
   dbRateLimitMiddleware,
+  accessVerifyRateLimitMiddleware,
   servicesRateLimitMiddleware,
+  shareRateLimitMiddleware,
+  mailRateLimitMiddleware,
 } from './middleware/rate-limit';
 import { securityHeadersMiddleware } from './middleware/security-headers';
 import { auditMiddleware, initializeAuditLog, closeAuditLog } from './middleware/audit';
@@ -51,10 +54,13 @@ import adminRoutes from './routes/admin';
 import usageRoutes from './routes/usage';
 import oauthRoutes from './routes/oauth';
 import mcpGatewayRoutes from './routes/mcp-gateway';
+import appAccessRoutes from './routes/app-access';
 import { handleMcpRequest, methodNotAllowed } from './mcp/transport';
 
 /** Matches POST /api/v1/apps/:name/source — the upload-deploy endpoint (PRD-039). */
 const UPLOAD_SOURCE_PATH_RE = /^\/api\/v1\/apps\/[A-Za-z0-9_-]+\/source$/;
+/** Matches the access gate's verify hop, which is exempt from the general limiter. */
+const ACCESS_VERIFY_PATH_RE = /^\/api\/v1\/app-access\/[A-Za-z0-9_-]+\/verify$/;
 /** Matches /api/v1/mcp — the hosted MCP endpoint (PRD-040). */
 const MCP_PATH_RE = /^\/api\/v1\/mcp$/;
 /** deploy_files allows up to 1.5 MB of summed file content — comfortably over the global 1 MB body cap. */
@@ -91,6 +97,20 @@ export interface ApiServerConfig {
   maxDbsPerUser?: number;
   /** Per-user managed-Redis cap (passed through to runtime-config for GET /db/:name). */
   maxRedisPerUser?: number;
+  /**
+   * Tenant isolation mode (passed through to runtime-config). Read by the
+   * access-gate route, which refuses to enable a gate the platform cannot
+   * enforce — outside docker isolation the tenant binds the host port itself
+   * and `host:port` walks straight past Caddy.
+   */
+  isolation?: 'none' | 'docker';
+  /**
+   * The DROP-152 access gate's operator kill switch (`PlatformConfig.enableAccessGate`,
+   * `DROP_FEATURE_ACCESS_GATE` env, boot-time), passed through to runtime-config
+   * so the access-gate route and platform.ts's sweep/emission paths read the
+   * same flag the platform resolved rather than defaulting independently.
+   */
+  accessGateEnabled?: boolean;
   /**
    * Override the resolved dashboard directory (normally dist/dashboard, or
    * src/dashboard as a dev fallback — see setupRoutes). Defaults to that
@@ -131,6 +151,7 @@ export class ApiServer {
       maxUploadSizeMb: this.config.maxUploadSizeMb,
       maxDbsPerUser: this.config.maxDbsPerUser,
       maxRedisPerUser: this.config.maxRedisPerUser,
+      accessGateEnabled: this.config.accessGateEnabled,
       // Admin-stored override (PRD-041 settings UI) takes precedence over
       // DROP_PUBLIC_URL — see getPublicUrl()'s precedence. Reads whatever
       // the settings manager singleton has loaded so far: the real platform
@@ -206,8 +227,22 @@ export class ApiServer {
       return bodySizeLimit(c, next);
     });
 
-    // Rate limiting
-    this.app.use('/api/*', rateLimitMiddleware());
+    // Rate limiting.
+    //
+    // The limiter is built ONCE, here. `createRateLimiter` allocates a
+    // `setInterval` per call, so constructing it inside the handler leaked one
+    // timer per API request — invisible to the open-handle detector because
+    // they are `unref`'d, and unbounded in a long-lived process.
+    //
+    // The access gate's verify hop is exempt: it is a per-request
+    // authorization sub-request rather than API traffic (every asset of every
+    // gated page), and it has its own much larger bucket registered below.
+    // Stacking the two would defeat that one.
+    const generalLimiter = rateLimitMiddleware();
+    this.app.use('/api/*', async (c, next) => {
+      if (ACCESS_VERIFY_PATH_RE.test(new URL(c.req.url).pathname)) return next();
+      return generalLimiter(c, next as never);
+    });
 
     // Request logging
     this.app.use('*', logger());
@@ -298,6 +333,101 @@ export class ApiServer {
     // back if and when a collection route exists.
     v1.use('/apps/*/services/*', servicesRateLimitMiddleware());
 
+    // `/code` is the CREDENTIAL-minting hop and gets the strict bucket.
+    v1.use('/app-access/code', authRateLimitMiddleware());
+
+    // `/authorize` does NOT, even though it looks like a login surface. It
+    // mints nothing — it validates and bounces to the dashboard SPA — and it
+    // is where the verify hop's per-subresource fan-out REDIRECTS TO. On the
+    // strict 10/min bucket, one gated page load with an expired session burns
+    // it, and because that bucket is keyed by NAME it is shared with
+    // `/auth/login`: the visitor would then be locked out of signing in at
+    // all, which is the one thing they were sent here to do.
+    v1.use('/app-access/authorize', accessVerifyRateLimitMiddleware());
+
+    // `verify` gets its OWN, deliberately LARGE bucket, and is exempted from
+    // the general `/api/*` limiter above.
+    //
+    // It is not a credential surface — it is a per-HTTP-REQUEST authorization
+    // sub-request. `forward_auth` fires for every JS chunk, image and XHR of
+    // every gated page, so one ordinary SPA page load is 30-80 hits. On the
+    // general 100/min bucket that breaks a gated app under normal browsing
+    // AND throttles the same visitor out of the dashboard, because
+    // `getClientIp` trusts the XFF Caddy forwards from loopback — so the
+    // bucket is keyed per END USER, not per proxy. Caddy copies a non-2xx
+    // from this hop straight to the browser, so a 429 here is a visible
+    // outage, not a refusal.
+    v1.use('/app-access/*/verify', accessVerifyRateLimitMiddleware());
+
+    // The guest hops (DROP-155). Two credential surfaces and one page load,
+    // and they get different buckets because they are different things:
+    //
+    //  - `/invite-redeem` GUESSES a secret and `/guest-code` MINTS a code, so
+    //    both take the strict `auth` bucket that `/app-access/code` takes;
+    //  - `/invite/:id` mints and guesses nothing — it validates an id shape
+    //    and redirects — and is the FIRST thing a guest ever loads. Putting it
+    //    on the strict bucket would mean a shared office NAT could exhaust it
+    //    and lock a real invitee out of the only entry point they have.
+    //
+    // The three patterns are disjoint by SHAPE, not by luck: two single
+    // segments and one two-segment path. That matters because these run as
+    // `use()` middleware, which is method-blind — an earlier draft put redeem
+    // at `/app-access/invite/redeem`, where `/app-access/invite/:id` matches it
+    // too and every redeem would have been counted against both buckets.
+    v1.use('/app-access/invite-redeem', authRateLimitMiddleware());
+    v1.use('/app-access/guest-code', authRateLimitMiddleware());
+    v1.use('/app-access/invite/:id', accessVerifyRateLimitMiddleware());
+
+    // The access-gate policy routes (DROP-152) get the services bucket too.
+    // Part 9 of the plan declined a bucket on the grounds that the route is
+    // "admin-only and cheap"; the call graph says otherwise — every PUT/DELETE
+    // runs `reconfigureRoute`, which regenerates the WHOLE Caddyfile and
+    // reloads Caddy once per routed domain. A scripted loop (or a stolen admin
+    // key) is an estate-wide routing DoS, and a failed reload mid-storm takes
+    // every tenant on the box with it. Registered unconditionally, like the
+    // other dedicated buckets, so an auth-disabled box gets it too.
+    v1.use('/apps/*/access', servicesRateLimitMiddleware());
+
+    // Owner-initiated app sharing (DROP-153) gets its OWN bucket, not the
+    // `services` one above — that bucket's budget is already spent by
+    // attach/detach and the admin access-gate routes. Both path forms are
+    // required, not just the nested one: unlike `/apps/*/services`, this
+    // surface has handlers on the TWO-segment path (GET/POST /apps/:name/share)
+    // as well as the three-segment one (DELETE /apps/:name/share/:userId), so
+    // the '/apps/*/services'-vs-'/apps/x/services/postgres' asymmetry noted
+    // above cuts the other way here: registering only the two-segment pattern
+    // would leave DELETE /apps/:name/share/:userId with no dedicated bucket
+    // at all. Registered unconditionally, like the other dedicated buckets,
+    // so an auth-disabled box gets it too.
+    //
+    // Named-param patterns, not wildcards: a wildcard pair here
+    // (`/apps/*/share` + `/apps/*/share/*`) double-counts the two-segment
+    // form, because '/apps/*/share/*' matches it too once the sibling pattern
+    // is registered (see server.share-routes.test.ts for the measured
+    // before/after). `:name` and `:userId` each bind exactly one segment, so
+    // the two patterns below match disjoint path shapes and every request is
+    // counted once.
+    v1.use('/apps/:name/share', shareRateLimitMiddleware());
+    v1.use('/apps/:name/share/:userId', shareRateLimitMiddleware());
+    // THREE forms, not two, since DROP-155. The note above (and the project's
+    // own CLAUDE.md) was written when this surface had handlers at two segment
+    // depths; `DELETE /apps/:name/share/guests/:guestId` is a FOUR-segment
+    // shape, and `:userId` binds exactly ONE segment — so it does not match,
+    // and without this line the route that REVOKES a guest's access would have
+    // no dedicated bucket at all. A third named-param pattern rather than a
+    // widened wildcard, for the same disjointness reason the pair above gives.
+    v1.use('/apps/:name/share/guests/:guestId', shareRateLimitMiddleware());
+
+    // POST /admin/mail/test (DROP-154) gets its own bucket too, registered
+    // unconditionally like the other dedicated buckets — it's the one route
+    // that dials the operator's real SMTP relay, so a scripted loop here
+    // burns real send quota rather than just CPU (see MAIL_CONFIG's comment
+    // in rate-limit.ts). A single literal path, not a wildcard pair: unlike
+    // `/apps/:name/share`, mail settings GET/PUT live at a different path
+    // and only the test-send route is expensive enough to need this bucket,
+    // so there is no sibling pattern here to double-match against.
+    v1.use('/admin/mail/test', mailRateLimitMiddleware());
+
     // Apply auth middleware to protected routes when auth is enabled
     if (this.config.enableAuth && isAuthEnabled()) {
       // migrate-runtime is admin-only — register before the general /apps/* guard.
@@ -306,6 +436,37 @@ export class ApiServer {
       // scoped DROP_API_KEY) is admin-only — register before the general /apps/*
       // guard so a readonly/user token can't confer capabilities.
       v1.use('/apps/*/capabilities', authMiddleware('admin'));
+      // The SPA consent hop presents the visitor's dashboard bearer. Only this
+      // one endpoint of the gate is behind a role guard — `verify`,
+      // `authorize` and `exchange` each authenticate their own credential
+      // class (or none), exactly as `/oauth/approve` is guarded while
+      // `/oauth/authorize` is not.
+      v1.use('/app-access/code', authMiddleware('readonly'));
+      // The browser access gate (DROP-152) is a GOVERNANCE control: who may
+      // OPEN an app, set by whoever governs the estate. Admin-only, and
+      // registered before the general /apps/* guard — a `user`-role owner must
+      // not be able to widen (or clear) an allow-list an admin set on their
+      // app, which the general 'readonly'/'user' guard would permit.
+      v1.use('/apps/*/access', authMiddleware('admin'));
+      // Owner-initiated app sharing (DROP-153): the owner OR an admin may
+      // grant/revoke/clear, so the floor here is 'user' — the routes
+      // themselves refuse a non-owner, non-admin caller with a 404. Both path
+      // forms are registered, same reasoning as the rate-limit bucket above:
+      // the two-segment form alone would leave DELETE /apps/:name/share/:userId
+      // with no explicit role floor, falling through to the general /apps/*
+      // guard below instead of failing closed on its own.
+      //
+      // Named-param patterns, not wildcards — same reason as the rate-limit
+      // bucket above: a wildcard pair here double-counted the two-segment
+      // form, running a full extra authMiddleware pass (a real jose signature
+      // verification, with no early-out when a context is already set) on
+      // every GET/POST /apps/:name/share.
+      v1.use('/apps/:name/share', authMiddleware('user'));
+      v1.use('/apps/:name/share/:userId', authMiddleware('user'));
+      // The guest revoke's four-segment form — same reasoning as the rate-limit
+      // registration above. Without it this route falls through to the general
+      // `/apps/*` guard instead of failing closed on its own floor.
+      v1.use('/apps/:name/share/guests/:guestId', authMiddleware('user'));
       // start/stop/restart mutate runtime state (and, on restart, tear down
       // and recreate the process/container) — read-only tokens must not
       // reach them. Register before the general /apps/* guard.
@@ -416,6 +577,7 @@ export class ApiServer {
     // bearer itself and must reject every other credential class, which a
     // general auth gate would instead admit.
     v1.route('/mcp-gateway', mcpGatewayRoutes);
+    v1.route('/app-access', appAccessRoutes);
 
     // Hosted MCP endpoint (PRD-040): stateless Streamable HTTP, POST only.
     // GET/DELETE have no meaning in stateless mode (no sessions/streams) —

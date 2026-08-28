@@ -177,3 +177,176 @@ html.dark .drop-ui {
     box-shadow: 0 0 32px var(--accent);
   }
 }
+
+/* ──────────────────────────────────────────────────────────────────────────
+ * Portal surfaces — DROP-156
+ *
+ * `Toast` and `ConfirmDialog` render as siblings of {children} inside their
+ * providers, and those providers wrap <Routes> in App.tsx — ABOVE AppShell and
+ * AuthLayout, the only two elements carrying `.drop-ui`. So until now these two
+ * components sat OUTSIDE the token scope entirely: every `var(--token)` there
+ * resolved to nothing. That is not a hypothesis, it is why they were the two
+ * worst files in the tree for raw `gray-*`/`drop-*` classes (27 and 19) — the
+ * design system was literally unreachable from them, so they were written
+ * against Tailwind's stock palette instead.
+ *
+ * PRD-045 §2.1 forbids hoisting `.drop-ui` above the route split, so the fix
+ * is to re-establish the scope at each portal root.
+ *
+ * `.dui-portal` is required alongside it: the bare `.drop-ui` rule in
+ * tokens.css sets `background: var(--bg)`, which on a `fixed inset-0` overlay
+ * would paint an opaque full-screen fill over the app. The two-class selector
+ * (0,2,0) outranks it. A Tailwind `bg-transparent` would NOT work here —
+ * index.css is imported before app-ui.css, so app-ui.css wins on source order.
+ */
+.drop-ui.dui-portal {
+  background: transparent;
+}
+
+/* Toast (components/Toast.tsx). Tinted against --panel rather than
+ * transparent, so a toast stays opaque over whatever it covers. */
+.drop-ui .dui-toast {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  box-shadow: var(--elev);
+}
+.drop-ui .dui-toast-success {
+  background: color-mix(in srgb, var(--ok) 12%, var(--panel));
+  border-color: color-mix(in srgb, var(--ok) 35%, var(--border));
+}
+.drop-ui .dui-toast-error {
+  background: color-mix(in srgb, var(--err) 12%, var(--panel));
+  border-color: color-mix(in srgb, var(--err) 35%, var(--border));
+}
+.drop-ui .dui-toast-info {
+  background: color-mix(in srgb, var(--accent) 12%, var(--panel));
+  border-color: color-mix(in srgb, var(--accent) 35%, var(--border));
+}
+
+/* ConfirmDialog (components/ConfirmDialog.tsx) */
+.drop-ui .dui-dialog {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  box-shadow: var(--elev);
+}
+.drop-ui .dui-dialog-icon-danger {
+  background: color-mix(in srgb, var(--err) 15%, transparent);
+  color: var(--err);
+}
+.drop-ui .dui-dialog-icon-default {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+/*
+ * Focus ring (DROP-156). `focus-visible` was ZERO across the dashboard before
+ * this — keyboard users got whatever the UA drew, which on a token-coloured
+ * panel is frequently invisible. Token-driven so it works in both themes, and
+ * a single class so every primitive rings identically.
+ */
+.drop-ui .dui-focus-ring:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--panel), 0 0 0 4px var(--accent);
+}
+
+/*
+ * Radix state animations. Radix stamps `data-state="open"|"closed"` on the
+ * overlay and content, which is the only hook available for an exit animation
+ * (the node is removed after it finishes).
+ *
+ * Everything here is inside `prefers-reduced-motion: no-preference` — the
+ * dashboard had NO reduced-motion handling at all before DROP-156, including
+ * the infinitely-pulsing auth logo. Motion is opt-out by OS setting, not
+ * mandatory.
+ */
+@media (prefers-reduced-motion: no-preference) {
+  .drop-ui [data-state='open'].dui-dialog {
+    animation: dui-dialog-in 140ms ease-out;
+  }
+  @keyframes dui-dialog-in {
+    from {
+      opacity: 0;
+      transform: translate(-50%, -48%) scale(0.97);
+    }
+    to {
+      opacity: 1;
+      transform: translate(-50%, -50%) scale(1);
+    }
+  }
+}
+
+/* Respect the OS setting for the pre-existing auth-logo pulse too. */
+@media (prefers-reduced-motion: reduce) {
+  .drop-ui .dui-auth-logo {
+    animation: none;
+  }
+}
+
+/*
+ * Dropdown menu (components/ui/DropdownMenu.tsx) — DROP-156 PR 3b.
+ * Radix ships unstyled; these are the token surfaces. `[data-highlighted]` is
+ * Radix's own hook for the item under keyboard OR pointer focus, so one rule
+ * covers both and the keyboard path is never a second-class citizen.
+ */
+.drop-ui .dui-menu {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  box-shadow: var(--elev);
+}
+.drop-ui .dui-menu-item {
+  color: var(--text);
+}
+.drop-ui .dui-menu-item[data-highlighted] {
+  background: var(--bg-2);
+}
+.drop-ui .dui-menu-item[data-disabled] {
+  color: var(--text-3);
+  cursor: not-allowed;
+}
+.drop-ui .dui-menu-item-danger {
+  color: var(--err);
+}
+.drop-ui .dui-menu-item-danger[data-highlighted] {
+  background: color-mix(in srgb, var(--err) 12%, transparent);
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .drop-ui .dui-menu[data-state='open'] {
+    animation: dui-menu-in 110ms ease-out;
+  }
+  @keyframes dui-menu-in {
+    from {
+      opacity: 0;
+      transform: translateY(-2px) scale(0.98);
+    }
+    to {
+      opacity: 1;
+      transform: none;
+    }
+  }
+}
+
+/* Tooltip (components/ui/Tooltip.tsx) — DROP-156 PR 4. */
+.drop-ui .dui-tooltip {
+  background: var(--text);
+  color: var(--bg);
+  box-shadow: var(--elev);
+}
+.drop-ui .dui-tooltip-arrow {
+  fill: var(--text);
+}
+@media (prefers-reduced-motion: no-preference) {
+  .drop-ui .dui-tooltip[data-state='delayed-open'] {
+    animation: dui-tooltip-in 110ms ease-out;
+  }
+  @keyframes dui-tooltip-in {
+    from {
+      opacity: 0;
+      transform: scale(0.96);
+    }
+    to {
+      opacity: 1;
+      transform: none;
+    }
+  }
+}

@@ -7,6 +7,7 @@ import { useConfirm } from './ConfirmDialog';
 import Button from './ui/Button';
 import Input from './ui/Input';
 import Card from './ui/Card';
+import { SkeletonText } from './ui/Skeleton';
 import Badge, { BadgeTone } from './ui/Badge';
 
 /**
@@ -225,11 +226,10 @@ function GitWebhooksTab() {
   return (
     <Card padded={false} className="mb-6">
       <div
-        className="px-4 py-3 border-b flex items-center gap-2"
-        style={{ borderColor: 'var(--border)' }}
+        className="px-4 py-3 border-b flex items-center gap-2 border-line"
       >
-        <GitBranch className="w-4 h-4" style={{ color: 'var(--text-2)' }} />
-        <h2 className="font-semibold" style={{ color: 'var(--text)' }}>
+        <GitBranch className="w-4 h-4 text-muted" />
+        <h2 className="font-semibold text-fg">
           Git webhooks
         </h2>
       </div>
@@ -255,22 +255,16 @@ function GitWebhooksTab() {
         {/* Reveal-once panel (after Generate) */}
         {step === 'reveal' && revealedSecret && (
           <div
-            className="max-w-md space-y-3 rounded-lg border p-4"
-            style={{ background: 'var(--bg-2)', borderColor: 'var(--border)' }}
+            className="max-w-md space-y-3 rounded-lg border p-4 bg-surface-2 border-line"
           >
-            <div className="flex items-center gap-2" style={{ color: 'var(--warn)' }}>
+            <div className="flex items-center gap-2 text-warn">
               <AlertTriangle className="w-4 h-4 flex-shrink-0" />
               <p className="text-sm font-medium">
                 You won't see this again — paste it into GitHub now.
               </p>
             </div>
             <code
-              className="block break-all select-all rounded border px-3 py-2 font-mono text-xs"
-              style={{
-                background: 'var(--bg-3)',
-                color: 'var(--text)',
-                borderColor: 'var(--border)',
-              }}
+              className="block break-all select-all rounded border px-3 py-2 font-mono text-xs bg-surface-3 text-fg border-line"
             >
               {revealedSecret}
             </code>
@@ -291,8 +285,7 @@ function GitWebhooksTab() {
         {step === 'custom-form' && (
           <form
             onSubmit={handleSetCustom}
-            className="max-w-md space-y-3 rounded-lg border p-4"
-            style={{ background: 'var(--bg-2)', borderColor: 'var(--border)' }}
+            className="max-w-md space-y-3 rounded-lg border p-4 bg-surface-2 border-line"
           >
             <Input
               id="custom-webhook-secret"
@@ -324,13 +317,10 @@ function GitWebhooksTab() {
          * post-mutation refresh.
          */}
         {statusLoading && !status ? (
-          <div className="animate-pulse space-y-2">
-            <div className="h-4 w-48 rounded" style={{ background: 'var(--border-2)' }} />
-            <div className="h-4 w-64 rounded" style={{ background: 'var(--border-2)' }} />
-          </div>
+          <SkeletonText label="Loading webhook status" widths={['w-48', 'w-64']} />
         ) : statusError && !status ? (
           <div className="flex items-center justify-between gap-3">
-            <p className="text-sm" style={{ color: 'var(--err)' }}>
+            <p className="text-sm text-err">
               {statusError}
             </p>
             <Button variant="secondary" onClick={() => void fetchStatus()}>
@@ -341,7 +331,7 @@ function GitWebhooksTab() {
         ) : status ? (
           <>
             <div className="flex items-center gap-2">
-              <span className="text-sm font-medium" style={{ color: 'var(--text-2)' }}>
+              <span className="text-sm font-medium text-muted">
                 Status:
               </span>
               <Badge tone={STATUS_TONE[status.source]}>{STATUS_LABEL[status.source]}</Badge>
@@ -356,12 +346,10 @@ function GitWebhooksTab() {
                 Payload URL
               </div>
               <div
-                className="flex items-center gap-2 rounded-lg border px-3 py-2"
-                style={{ borderColor: 'var(--border)', background: 'var(--bg-2)' }}
+                className="flex items-center gap-2 rounded-lg border px-3 py-2 border-line bg-surface-2"
               >
                 <code
-                  className="flex-1 truncate text-sm font-mono"
-                  style={{ color: 'var(--text)' }}
+                  className="flex-1 truncate text-sm font-mono text-fg"
                 >
                   {payloadUrl}
                 </code>

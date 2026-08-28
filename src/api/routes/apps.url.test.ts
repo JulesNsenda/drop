@@ -19,7 +19,7 @@ jest.mock('../../managers/app/app-config', () => ({
 }));
 
 import { getAppConfigService } from '../../managers/app/app-config';
-import { computeAppUrl } from './apps';
+import { computeAppUrl } from '../../utils/app-url';
 import type { AppState } from '../../managers/app/state-manager';
 
 const mockConfigService = getAppConfigService as jest.Mock;

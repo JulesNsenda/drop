@@ -25,10 +25,11 @@ import {
   useHealth,
 } from '../hooks/useApi';
 import { appLinkInfo } from '../api/client';
-import Tabs, { TabDef } from '../components/Tabs';
+import Tabs, { TabDef, TabPanel } from '../components/Tabs';
 import Button from '../components/ui/Button';
 import Card from '../components/ui/Card';
 import Input from '../components/ui/Input';
+import Field from '../components/ui/Field';
 import { buildArchiveFromFiles, UploadArchiveError } from '../lib/upload-archive';
 import { APP_NAME_RE, commonRootName, normalizeEntryPath } from '../../../utils/upload-paths';
 import { formatBytes } from '../components/db-format';
@@ -449,12 +450,12 @@ function DeployPage() {
               className="mx-auto mb-5 flex h-14 w-14 items-center justify-center rounded-full"
               style={{ background: 'color-mix(in srgb, var(--ok) 15%, transparent)' }}
             >
-              <CheckCircle className="h-7 w-7" style={{ color: 'var(--ok)' }} />
+              <CheckCircle className="h-7 w-7 text-ok" />
             </div>
-            <h2 className="mb-2 text-xl font-semibold" style={{ color: 'var(--text)' }}>
+            <h2 className="mb-2 text-xl font-semibold text-fg">
               Deployment started
             </h2>
-            <p className="mb-6 text-sm leading-relaxed" style={{ color: 'var(--text-2)' }}>
+            <p className="mb-6 text-sm leading-relaxed text-muted">
               {message}
             </p>
             <div className="flex flex-col justify-center gap-3 sm:flex-row">
@@ -486,12 +487,12 @@ function DeployPage() {
               className="mx-auto mb-5 flex h-14 w-14 items-center justify-center rounded-full"
               style={{ background: 'color-mix(in srgb, var(--err) 15%, transparent)' }}
             >
-              <AlertCircle className="h-7 w-7" style={{ color: 'var(--err)' }} />
+              <AlertCircle className="h-7 w-7 text-err" />
             </div>
-            <h2 className="mb-2 text-xl font-semibold" style={{ color: 'var(--text)' }}>
+            <h2 className="mb-2 text-xl font-semibold text-fg">
               Deployment failed
             </h2>
-            <p className="mb-6 text-sm leading-relaxed" style={{ color: 'var(--text-2)' }}>
+            <p className="mb-6 text-sm leading-relaxed text-muted">
               {message}
             </p>
             {/* Clear the upload-derived display state too, not just the
@@ -523,324 +524,322 @@ function DeployPage() {
     <div className="p-6">
       {/* Header */}
       <div className="mb-6">
-        <h1 className="text-2xl font-bold" style={{ color: 'var(--text)' }}>
+        <h1 className="text-2xl font-bold text-fg">
           Deploy
         </h1>
-        <p className="mt-1 text-sm" style={{ color: 'var(--text-2)' }}>
+        <p className="mt-1 text-sm text-muted">
           Deploy a new application from GitHub or by uploading files
         </p>
       </div>
 
       <div className="max-w-2xl">
-        <Tabs tabs={deployTabs} active={tab} onChange={id => setTab(id as Tab)} />
+        <Tabs tabs={deployTabs} active={tab} onChange={id => setTab(id as Tab)} label="Deployment source" />
       </div>
 
       {/* GitHub tab */}
       {tab === 'github' && (
-        <Card className="max-w-2xl space-y-5">
-          <Input
-            label="Repository URL"
-            type="url"
-            value={repoUrl}
-            onChange={e => setRepoUrl(e.target.value)}
-            placeholder="https://github.com/user/repo"
-            disabled={status === 'deploying'}
-          />
-
-          {/* Branch + Name row */}
-          <div className="grid grid-cols-2 gap-4">
+        <TabPanel id="github">
+          <Card className="max-w-2xl space-y-5">
             <Input
-              label="Branch"
-              type="text"
-              value={branch}
-              onChange={e => setBranch(e.target.value)}
-              placeholder="main"
+              label="Repository URL"
+              type="url"
+              value={repoUrl}
+              onChange={e => setRepoUrl(e.target.value)}
+              placeholder="https://github.com/user/repo"
               disabled={status === 'deploying'}
             />
-            <Input
-              label="App name (optional)"
-              type="text"
-              value={gitAppName}
-              onChange={e => setGitAppName(e.target.value)}
-              placeholder="Derived from repo name"
-              disabled={status === 'deploying'}
-            />
-          </div>
 
-          {/* Token + auto-redeploy row */}
-          <div>
-            <label className="mb-1 block text-sm font-medium" style={{ color: 'var(--text-2)' }}>
-              Authentication (private repos)
-            </label>
-            <div className="flex gap-2">
-              <select
-                value={selectedToken}
-                onChange={e => setSelectedToken(e.target.value)}
-                className={inlineFieldClass}
+            {/* Branch + Name row */}
+            <div className="grid grid-cols-2 gap-4">
+              <Input
+                label="Branch"
+                type="text"
+                value={branch}
+                onChange={e => setBranch(e.target.value)}
+                placeholder="main"
                 disabled={status === 'deploying'}
-              >
-                <option value="">No token (public repo)</option>
-                {tokens.map(t => (
-                  <option key={t.id} value={t.id}>
-                    {t.name}
-                  </option>
-                ))}
-              </select>
-              <button
-                type="button"
-                onClick={() => setShowTokenForm(!showTokenForm)}
-                title="Manage tokens"
-                aria-label="Manage tokens"
-                className="dui-btn-secondary flex-shrink-0 rounded-lg border px-3 py-2 transition-colors"
-              >
-                <Key className="h-4 w-4" />
-              </button>
+              />
+              <Input
+                label="App name (optional)"
+                type="text"
+                value={gitAppName}
+                onChange={e => setGitAppName(e.target.value)}
+                placeholder="Derived from repo name"
+                disabled={status === 'deploying'}
+              />
             </div>
-          </div>
 
-          {/* Token manager panel */}
-          {showTokenForm && (
-            <div
-              className="space-y-3 rounded-lg border p-4"
-              style={{ background: 'var(--bg-2)', borderColor: 'var(--border)' }}
-            >
-              <h3 className="text-sm font-medium" style={{ color: 'var(--text-2)' }}>
-                Manage tokens
-              </h3>
-              {tokens.length > 0 && (
-                <div className="space-y-1.5">
-                  {tokens.map(t => (
-                    <div
-                      key={t.id}
-                      className="flex items-center justify-between rounded px-2 py-1.5"
-                      style={{ background: 'var(--bg-3)', border: '1px solid var(--border)' }}
-                    >
-                      <span className="text-sm" style={{ color: 'var(--text-2)' }}>
-                        {t.name}
-                      </span>
-                      <button
-                        type="button"
-                        onClick={() => handleDeleteToken(t.id)}
-                        title="Delete token"
-                        aria-label="Delete token"
-                        className="transition-colors hover:text-[var(--err)]"
-                        style={{ color: 'var(--text-3)' }}
-                      >
-                        <Trash2 className="h-3.5 w-3.5" />
-                      </button>
-                    </div>
-                  ))}
-                </div>
-              )}
+            {/* Token + auto-redeploy row */}
+            <Field label="Authentication (private repos)">
+              {({ id }) => (
               <div className="flex gap-2">
-                <input
-                  type="text"
-                  value={newTokenName}
-                  onChange={e => setNewTokenName(e.target.value)}
-                  placeholder="Label"
+                <select
+                  id={id}
+                  value={selectedToken}
+                  onChange={e => setSelectedToken(e.target.value)}
                   className={inlineFieldClass}
-                />
-                <input
-                  type="password"
-                  value={newTokenValue}
-                  onChange={e => setNewTokenValue(e.target.value)}
-                  placeholder="ghp_..."
-                  className={inlineFieldClass}
-                />
+                  disabled={status === 'deploying'}
+                >
+                  <option value="">No token (public repo)</option>
+                  {tokens.map(t => (
+                    <option key={t.id} value={t.id}>
+                      {t.name}
+                    </option>
+                  ))}
+                </select>
                 <button
                   type="button"
-                  onClick={handleAddToken}
-                  disabled={!newTokenName.trim() || !newTokenValue.trim()}
-                  title="Add token"
-                  aria-label="Add token"
-                  className="dui-btn-primary flex-shrink-0 rounded-lg border px-3 py-2 transition-colors disabled:cursor-not-allowed disabled:opacity-50"
+                  onClick={() => setShowTokenForm(!showTokenForm)}
+                  title="Manage tokens"
+                  aria-label="Manage tokens"
+                  className="dui-btn-secondary flex-shrink-0 rounded-lg border px-3 py-2 transition-colors"
                 >
-                  <Plus className="h-4 w-4" />
+                  <Key className="h-4 w-4" />
                 </button>
               </div>
-              <p className="text-xs" style={{ color: 'var(--text-3)' }}>
-                Use a fine-grained PAT with <code>Contents: Read</code> permission.
-              </p>
+              )}
+            </Field>
+
+            {/* Token manager panel */}
+            {showTokenForm && (
+              <div
+                className="space-y-3 rounded-lg border p-4 bg-surface-2 border-line"
+              >
+                <h3 className="text-sm font-medium text-muted">
+                  Manage tokens
+                </h3>
+                {tokens.length > 0 && (
+                  <div className="space-y-1.5">
+                    {tokens.map(t => (
+                      <div
+                        key={t.id}
+                        className="flex items-center justify-between rounded px-2 py-1.5"
+                        style={{ background: 'var(--bg-3)', border: '1px solid var(--border)' }}
+                      >
+                        <span className="text-sm text-muted">
+                          {t.name}
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => handleDeleteToken(t.id)}
+                          title="Delete token"
+                          aria-label="Delete token"
+                          className="transition-colors hover:text-[var(--err)] text-faint"
+                        >
+                          <Trash2 className="h-3.5 w-3.5" />
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+                <div className="flex gap-2">
+                  <input
+                    type="text"
+                    value={newTokenName}
+                    onChange={e => setNewTokenName(e.target.value)}
+                    placeholder="Label"
+                    className={inlineFieldClass}
+                  />
+                  <input
+                    type="password"
+                    value={newTokenValue}
+                    onChange={e => setNewTokenValue(e.target.value)}
+                    placeholder="ghp_..."
+                    className={inlineFieldClass}
+                  />
+                  <button
+                    type="button"
+                    onClick={handleAddToken}
+                    disabled={!newTokenName.trim() || !newTokenValue.trim()}
+                    title="Add token"
+                    aria-label="Add token"
+                    className="dui-btn-primary flex-shrink-0 rounded-lg border px-3 py-2 transition-colors disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    <Plus className="h-4 w-4" />
+                  </button>
+                </div>
+                <p className="text-xs text-faint">
+                  Use a fine-grained PAT with <code>Contents: Read</code> permission.
+                </p>
+              </div>
+            )}
+
+            {/* Options */}
+            <div className="flex items-center gap-3">
+              <input
+                type="checkbox"
+                id="autoRedeploy"
+                checked={autoRedeploy}
+                onChange={e => setAutoRedeploy(e.target.checked)}
+                className="h-4 w-4 rounded"
+                style={{ accentColor: 'var(--accent)' }}
+                disabled={status === 'deploying'}
+              />
+              <label htmlFor="autoRedeploy" className="text-sm text-muted">
+                Auto-redeploy when code is pushed (via GitHub webhook)
+              </label>
             </div>
-          )}
+            <p className="-mt-2 text-xs text-faint">
+              {/* The Git webhooks settings tab is admin-only — don't deep-link
+                  non-admins to a tab they can't open (SettingsPage would
+                  silently fall back to the Account tab). */}
+              {role === 'admin' ? (
+                <>
+                  Requires a webhook secret — configure one in{' '}
+                  <Link to="/settings?tab=git-webhooks" className="underline">
+                    Settings &rarr; Git webhooks
+                  </Link>
+                  .
+                </>
+              ) : (
+                <>Requires a webhook secret — ask an admin to configure one in Settings.</>
+              )}
+            </p>
 
-          {/* Options */}
-          <div className="flex items-center gap-3">
-            <input
-              type="checkbox"
-              id="autoRedeploy"
-              checked={autoRedeploy}
-              onChange={e => setAutoRedeploy(e.target.checked)}
-              className="h-4 w-4 rounded"
-              style={{ accentColor: 'var(--accent)' }}
-              disabled={status === 'deploying'}
-            />
-            <label htmlFor="autoRedeploy" className="text-sm" style={{ color: 'var(--text-2)' }}>
-              Auto-redeploy when code is pushed (via GitHub webhook)
-            </label>
-          </div>
-          <p className="-mt-2 text-xs" style={{ color: 'var(--text-3)' }}>
-            {/* The Git webhooks settings tab is admin-only — don't deep-link
-                non-admins to a tab they can't open (SettingsPage would
-                silently fall back to the Account tab). */}
-            {role === 'admin' ? (
-              <>
-                Requires a webhook secret — configure one in{' '}
-                <Link to="/settings?tab=git-webhooks" className="underline">
-                  Settings &rarr; Git webhooks
-                </Link>
-                .
-              </>
-            ) : (
-              <>Requires a webhook secret — ask an admin to configure one in Settings.</>
-            )}
-          </p>
-
-          {/* Deploy button */}
-          <Button
-            onClick={handleGitDeploy}
-            disabled={!repoUrl.trim()}
-            loading={status === 'deploying'}
-            className="w-full"
-          >
-            {status === 'deploying' ? (
-              deployStep || 'Deploying...'
-            ) : (
-              <>
-                Deploy from GitHub
-                <ExternalLink className="h-4 w-4" />
-              </>
-            )}
-          </Button>
-        </Card>
+            {/* Deploy button */}
+            <Button
+              onClick={handleGitDeploy}
+              disabled={!repoUrl.trim()}
+              loading={status === 'deploying'}
+              className="w-full"
+            >
+              {status === 'deploying' ? (
+                deployStep || 'Deploying...'
+              ) : (
+                <>
+                  Deploy from GitHub
+                  <ExternalLink className="h-4 w-4" />
+                </>
+              )}
+            </Button>
+          </Card>
+        </TabPanel>
       )}
 
       {/* Upload tab */}
       {tab === 'upload' && (
-        <Card className="max-w-2xl space-y-5">
-          {/* App name */}
-          <Input
-            label="Application name"
-            type="text"
-            value={uploadAppName}
-            onChange={e => setUploadAppName(e.target.value)}
-            placeholder="Uses the selected folder's name if left blank"
-            disabled={status === 'deploying'}
-          />
-
-          {/* Drop zone — click opens a folder picker (webkitdirectory), since
-              a whole app folder is the expected input; the loose-file
-              fallback below covers a plain multi-file selection. */}
-          <div
-            onDragOver={handleDragOver}
-            onDragLeave={handleDragLeave}
-            onDrop={handleDrop}
-            onClick={() => status !== 'deploying' && folderInputRef.current?.click()}
-            className="cursor-pointer rounded-xl border-2 border-dashed p-10 text-center transition-colors"
-            style={{
-              borderColor: dragOver ? 'var(--accent)' : 'var(--border)',
-              background: dragOver ? 'var(--accent-soft)' : 'transparent',
-            }}
-          >
-            <input
-              ref={folderInputRef}
-              type="file"
-              multiple
-              onChange={handleFolderSelect}
-              className="hidden"
-              {...({ webkitdirectory: '' } as InputHTMLAttributes<HTMLInputElement>)}
+        <TabPanel id="upload">
+          <Card className="max-w-2xl space-y-5">
+            {/* App name */}
+            <Input
+              label="Application name"
+              type="text"
+              value={uploadAppName}
+              onChange={e => setUploadAppName(e.target.value)}
+              placeholder="Uses the selected folder's name if left blank"
+              disabled={status === 'deploying'}
             />
-            {status === 'deploying' ? (
-              <>
-                <Loader2
-                  className="mx-auto mb-3 h-10 w-10 animate-spin"
-                  style={{ color: 'var(--accent)' }}
-                />
-                <p className="text-sm font-medium" style={{ color: 'var(--text)' }}>
-                  {deployStep || 'Uploading and deploying...'}
-                </p>
-                {(uploadFileCount > 0 || uploadSkipped.length > 0) && (
-                  <p className="mt-1 text-xs" style={{ color: 'var(--text-2)' }}>
-                    {uploadFileCount} file{uploadFileCount === 1 ? '' : 's'}, {formatBytes(uploadBytes)} compressed
+
+            {/* Drop zone — click opens a folder picker (webkitdirectory), since
+                a whole app folder is the expected input; the loose-file
+                fallback below covers a plain multi-file selection. */}
+            <div
+              onDragOver={handleDragOver}
+              onDragLeave={handleDragLeave}
+              onDrop={handleDrop}
+              onClick={() => status !== 'deploying' && folderInputRef.current?.click()}
+              className="cursor-pointer rounded-xl border-2 border-dashed p-10 text-center transition-colors"
+              style={{
+                borderColor: dragOver ? 'var(--accent)' : 'var(--border)',
+                background: dragOver ? 'var(--accent-soft)' : 'transparent',
+              }}
+            >
+              <input
+                ref={folderInputRef}
+                type="file"
+                multiple
+                onChange={handleFolderSelect}
+                className="hidden"
+                {...({ webkitdirectory: '' } as InputHTMLAttributes<HTMLInputElement>)}
+              />
+              {status === 'deploying' ? (
+                <>
+                  <Loader2
+                    className="mx-auto mb-3 h-10 w-10 animate-spin text-accent"
+                  />
+                  <p className="text-sm font-medium text-fg">
+                    {deployStep || 'Uploading and deploying...'}
                   </p>
-                )}
-              </>
-            ) : (
-              <>
-                <FolderUp className="mx-auto mb-3 h-10 w-10" style={{ color: 'var(--text-3)' }} />
-                <p className="mb-1 text-sm font-medium" style={{ color: 'var(--text)' }}>
-                  Click to choose your app's folder, or drag &amp; drop files here
-                </p>
-                <p className="text-xs" style={{ color: 'var(--text-2)' }}>
-                  A folder is expected — <code>.git</code> and <code>node_modules</code> are excluded
-                  automatically.
-                </p>
-              </>
-            )}
-          </div>
-
-          {/* Skipped-paths list — shown while/after building the archive so
-              the user can see what a folder drop excluded (.git is a hard
-              server-side rejection, not just hygiene, so this must be
-              visible rather than a silent difference). */}
-          {uploadSkipped.length > 0 && (
-            <div
-              className="rounded-lg border p-3 text-xs"
-              style={{ background: 'var(--bg-2)', borderColor: 'var(--border)', color: 'var(--text-3)' }}
-            >
-              <p className="mb-1 font-medium" style={{ color: 'var(--text-2)' }}>
-                Skipped {uploadSkipped.length} path{uploadSkipped.length === 1 ? '' : 's'} (.git, node_modules)
-              </p>
-              <ul className="space-y-0.5 font-mono">
-                {uploadSkipped.slice(0, 5).map(p => (
-                  <li key={p} className="truncate">
-                    {p}
-                  </li>
-                ))}
-                {uploadSkipped.length > 5 && <li>+{uploadSkipped.length - 5} more</li>}
-              </ul>
+                  {(uploadFileCount > 0 || uploadSkipped.length > 0) && (
+                    <p className="mt-1 text-xs text-muted">
+                      {uploadFileCount} file{uploadFileCount === 1 ? '' : 's'}, {formatBytes(uploadBytes)} compressed
+                    </p>
+                  )}
+                </>
+              ) : (
+                <>
+                  <FolderUp className="mx-auto mb-3 h-10 w-10 text-faint" />
+                  <p className="mb-1 text-sm font-medium text-fg">
+                    Click to choose your app's folder, or drag &amp; drop files here
+                  </p>
+                  <p className="text-xs text-muted">
+                    A folder is expected — <code>.git</code> and <code>node_modules</code> are excluded
+                    automatically.
+                  </p>
+                </>
+              )}
             </div>
-          )}
 
-          {/* Loose-file fallback */}
-          {status !== 'deploying' && (
-            <p className="-mt-3 text-center text-xs" style={{ color: 'var(--text-3)' }}>
-              Not a folder?{' '}
-              <button type="button" onClick={() => fileInputRef.current?.click()} className="underline">
-                Select individual files instead
-              </button>
-              <input ref={fileInputRef} type="file" multiple onChange={handleFileSelect} className="hidden" />
-            </p>
-          )}
-
-          {/* CLI hint */}
-          {filesystemHint && (
-            <div
-              className="rounded-lg border p-4"
-              style={{ background: 'var(--bg-2)', borderColor: 'var(--border)' }}
-            >
-              <p
-                className="mb-2 text-xs font-medium uppercase tracking-wide"
-                style={{ color: 'var(--text-3)' }}
+            {/* Skipped-paths list — shown while/after building the archive so
+                the user can see what a folder drop excluded (.git is a hard
+                server-side rejection, not just hygiene, so this must be
+                visible rather than a silent difference). */}
+            {uploadSkipped.length > 0 && (
+              <div
+                className="rounded-lg border p-3 text-xs bg-surface-2 border-line text-faint"
               >
-                Or deploy via filesystem
-              </p>
-              <div className="rounded-md px-3 py-2" style={{ background: '#0d1117' }}>
-                <code
-                  className="font-mono text-xs"
-                  style={{
-                    color: 'var(--ok)',
-                    background: 'transparent',
-                    border: 'none',
-                    padding: 0,
-                  }}
-                >
-                  {filesystemHint}
-                </code>
+                <p className="mb-1 font-medium text-muted">
+                  Skipped {uploadSkipped.length} path{uploadSkipped.length === 1 ? '' : 's'} (.git, node_modules)
+                </p>
+                <ul className="space-y-0.5 font-mono">
+                  {uploadSkipped.slice(0, 5).map(p => (
+                    <li key={p} className="truncate">
+                      {p}
+                    </li>
+                  ))}
+                  {uploadSkipped.length > 5 && <li>+{uploadSkipped.length - 5} more</li>}
+                </ul>
               </div>
-            </div>
-          )}
-        </Card>
+            )}
+
+            {/* Loose-file fallback */}
+            {status !== 'deploying' && (
+              <p className="-mt-3 text-center text-xs text-faint">
+                Not a folder?{' '}
+                <button type="button" onClick={() => fileInputRef.current?.click()} className="underline">
+                  Select individual files instead
+                </button>
+                <input ref={fileInputRef} type="file" multiple onChange={handleFileSelect} className="hidden" />
+              </p>
+            )}
+
+            {/* CLI hint */}
+            {filesystemHint && (
+              <div
+                className="rounded-lg border p-4 bg-surface-2 border-line"
+              >
+                <p
+                  className="mb-2 text-xs font-medium uppercase tracking-wide text-faint"
+                >
+                  Or deploy via filesystem
+                </p>
+                <div className="rounded-md px-3 py-2" style={{ background: '#0d1117' }}>
+                  <code
+                    className="font-mono text-xs"
+                    style={{
+                      color: 'var(--ok)',
+                      background: 'transparent',
+                      border: 'none',
+                      padding: 0,
+                    }}
+                  >
+                    {filesystemHint}
+                  </code>
+                </div>
+              </div>
+            )}
+          </Card>
+        </TabPanel>
       )}
     </div>
   );

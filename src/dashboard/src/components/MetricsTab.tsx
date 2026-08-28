@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { Activity, Clock, Cpu, Gauge, MemoryStick } from 'lucide-react';
 import type { App } from '../hooks/useApi';
 import Card from './ui/Card';
+import EmptyState from './ui/EmptyState';
 import StatCard from './ui/StatCard';
 
 /** Short client-side rolling window (PRD-048 §1.3 — no long-term history in Phase 1). */
@@ -79,8 +80,7 @@ function SparkBars({
   if (values.length === 0) {
     return (
       <div
-        className="flex h-16 items-center justify-center text-xs"
-        style={{ color: 'var(--text-3)' }}
+        className="flex h-16 items-center justify-center text-xs text-faint"
       >
         {emptyLabel}
       </div>
@@ -159,14 +159,14 @@ function MetricsTab({ app }: { app: App }) {
 
   if (!hasLiveMetrics) {
     return (
-      <Card className="py-12 text-center">
-        <Activity className="mx-auto mb-3 h-8 w-8" style={{ color: 'var(--text-3)' }} />
-        <h3 className="mb-1 text-base font-semibold" style={{ color: 'var(--text)' }}>
-          No metrics available
-        </h3>
-        <p className="text-sm" style={{ color: 'var(--text-2)' }}>
-          {unavailableReason(app.status)}
-        </p>
+      <Card padded={false}>
+        <EmptyState
+          icon={Activity}
+          size="sm"
+          titleAs="h3"
+          title="No metrics available"
+          description={unavailableReason(app.status)}
+        />
       </Card>
     );
   }
@@ -193,10 +193,10 @@ function MetricsTab({ app }: { app: App }) {
       <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
         <Card>
           <div className="mb-3 flex items-center justify-between">
-            <span className="text-sm font-medium" style={{ color: 'var(--text-2)' }}>
+            <span className="text-sm font-medium text-muted">
               CPU history
             </span>
-            <span className="text-xs" style={{ color: 'var(--text-3)' }}>
+            <span className="text-xs text-faint">
               last {MAX_SAMPLES} samples
             </span>
           </div>
@@ -209,10 +209,10 @@ function MetricsTab({ app }: { app: App }) {
         </Card>
         <Card>
           <div className="mb-3 flex items-center justify-between">
-            <span className="text-sm font-medium" style={{ color: 'var(--text-2)' }}>
+            <span className="text-sm font-medium text-muted">
               Memory history
             </span>
-            <span className="text-xs" style={{ color: 'var(--text-3)' }}>
+            <span className="text-xs text-faint">
               last {MAX_SAMPLES} samples
             </span>
           </div>
@@ -229,12 +229,12 @@ function MetricsTab({ app }: { app: App }) {
           instrumentation that doesn't exist yet — never fabricate numbers. */}
       <Card>
         <div className="flex items-start gap-3">
-          <Gauge className="mt-0.5 h-5 w-5 flex-shrink-0" style={{ color: 'var(--text-3)' }} />
+          <Gauge className="mt-0.5 h-5 w-5 flex-shrink-0 text-faint" />
           <div>
-            <h4 className="text-sm font-medium" style={{ color: 'var(--text)' }}>
+            <h4 className="text-sm font-medium text-fg">
               Requests/sec &amp; p95 latency — not available yet
             </h4>
-            <p className="mt-1 text-sm" style={{ color: 'var(--text-2)' }}>
+            <p className="mt-1 text-sm text-muted">
               Traffic metrics need request-level instrumentation DROP doesn't collect today. This
               lands in a later release (PRD-048 Phase 2) — nothing shown here is a placeholder or
               estimate.

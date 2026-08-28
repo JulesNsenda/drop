@@ -30,7 +30,7 @@ function AuthLayout({ children, hostStatus = DEFAULT_HOST_STATUS }: AuthLayoutPr
   const toggleTheme = () => setTheme(isDark ? 'light' : 'dark');
 
   return (
-    <div className="drop-ui flex min-h-screen" style={{ background: 'var(--bg)', color: 'var(--text)' }}>
+    <div className="drop-ui flex min-h-screen bg-surface text-fg">
       {/* Left — branding panel (hidden on narrow viewports) */}
       <div
         className="relative hidden flex-1 flex-col justify-between overflow-hidden p-10 md:flex"
@@ -41,22 +41,20 @@ function AuthLayout({ children, hostStatus = DEFAULT_HOST_STATUS }: AuthLayoutPr
         <div className="flex flex-col items-start gap-6">
           <span className="dui-auth-logo" aria-hidden="true" />
           <h1
-            className="text-4xl font-bold leading-tight"
-            style={{ fontFamily: 'var(--mono)', color: 'var(--text)' }}
+            className="text-4xl font-bold leading-tight font-mono text-fg"
           >
             Drop a folder.
             <br />
             Get a URL.
           </h1>
-          <p className="max-w-sm text-sm" style={{ color: 'var(--text-2)' }}>
+          <p className="max-w-sm text-sm text-muted">
             DROP watches a folder, detects your app, builds it, and routes traffic to it — zero configuration for
             most projects.
           </p>
         </div>
 
         <div
-          className="text-xs"
-          style={{ color: 'var(--text-3)', fontFamily: 'var(--mono)' }}
+          className="text-xs text-faint font-mono"
         >
           {hostStatus}
         </div>

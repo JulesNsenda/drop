@@ -5,6 +5,7 @@
  */
 
 import * as crypto from 'crypto';
+import * as fs from 'fs/promises';
 
 const ALGORITHM = 'aes-256-gcm';
 const IV_LENGTH = 16;
@@ -78,4 +79,28 @@ export function decrypt(encrypted: EncryptedData, key: Buffer): string {
   plaintext += decipher.final('utf8');
 
   return plaintext;
+}
+
+/**
+ * Loads the platform's hex-encoded encryption key from `keyFilePath` as raw
+ * key bytes (NOT scrypt-derived — this is `encryption.key` itself, not a
+ * passphrase). Returns `null` (never throws) when the file is missing or the
+ * key is the wrong length — fail-closed, so a caller never falls back to
+ * storing or reading plaintext. Shared by every caller that reads this same
+ * on-disk key (`auth.ts`'s MFA secret encryption inlines an equivalent check
+ * rather than importing this, per its own history).
+ */
+export async function loadPlatformMasterKey(keyFilePath: string): Promise<Buffer | null> {
+  let hex: string;
+  try {
+    hex = (await fs.readFile(keyFilePath, 'utf-8')).trim();
+  } catch {
+    return null;
+  }
+  const key = Buffer.from(hex, 'hex');
+  if (key.length !== KEY_LENGTH) {
+    console.warn(`[encryption] ${keyFilePath} is not a 32-byte key — refusing to use it`);
+    return null;
+  }
+  return key;
 }

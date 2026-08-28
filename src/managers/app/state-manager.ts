@@ -99,6 +99,51 @@ export interface AppState {
    */
   awaitingPromotion?: boolean;
   /**
+   * True when this app carries a browser access-gate policy (DROP-152) that
+   * the platform could NOT enforce, and false once it can.
+   *
+   * A FLAG, not an `AppStatus` member, for the same reason
+   * `readinessUnverified` above is one: it answers a different question from
+   * "what is running", and the ~20 `status === 'running'` comparisons would
+   * silently mis-answer several of theirs if it became a status.
+   *
+   * Written on every route configuration and by the boot sweep, in ALL THREE
+   * directions -- true, false, and ABSENT. Absent means the app has no gate
+   * policy at all, which is not the same as an enforced one, so removing a
+   * gate must DELETE the key rather than leave the last verdict behind:
+   * `updateApp` is a spread merge, and merely omitting the key would leave an
+   * app flagged once flagged forever, exactly as `readinessUnverified` above
+   * records. `setAccessGateUnapplied` is the writer that gets this right.
+   */
+  accessGateUnapplied?: boolean;
+  /**
+   * When someone last OPENED this app through the access gate, and who has
+   * done so recently (DROP-152 AC3).
+   *
+   * Held in AppState rather than derived from the access log, deliberately.
+   * The log is pruned by `logRetentionDays` — 14 by default and settable to 1
+   * — so an app nobody had opened in fifteen days would read identically to
+   * one nobody had EVER opened. That is precisely the distinction a stale-app
+   * review exists to make, so the estate view cannot be built on a store with
+   * an operator-tunable amnesia window. The log stays the evidence trail; this
+   * is the summary.
+   *
+   * `AppStateManager` already debounces its writes through `scheduleSave`,
+   * which is what makes a per-open update affordable here and unaffordable in
+   * `AppConfig` (rewritten in full on every write, and the source of truth for
+   * port assignments).
+   */
+  lastOpenedAt?: string;
+  /**
+   * A small, bounded set of the users who most recently opened this app.
+   *
+   * Bounded because it is rendered to a decision-maker, not queried: the
+   * question the estate view answers is "is anyone still using this, and
+   * roughly who", and an unbounded list answers it no better while growing
+   * without limit in a file read on every boot.
+   */
+  recentOpeners?: Array<{ userId: string; username: string; at: string }>;
+  /**
    * Grouping tag for apps expanded from a single monorepo deploy (e.g.
    * `ezsign-backend` / `ezsign-frontend` both tagged `group: ezsign`). Set via
    * `updateApp(name, { group })`, not `registerApp` — `AppConfig` (app-config.ts)
@@ -123,6 +168,9 @@ export interface AppState {
 export interface StateManagerConfig {
   stateFilePath: string;
 }
+
+/** How many recent openers the estate view carries per app. */
+const MAX_RECENT_OPENERS = 10;
 
 export class AppStateManager {
   private readonly config: StateManagerConfig;
@@ -304,6 +352,62 @@ export class AppStateManager {
     });
 
     return updated;
+  }
+
+  /**
+   * Record (or clear) the access-gate verdict for one app -- see
+   * `AppState.accessGateUnapplied`.
+   *
+   * `undefined` DELETES the key, which a spread-merge `updateApp` cannot
+   * express; that is the whole reason this exists rather than a bare
+   * `updateApp(name, { accessGateUnapplied })`.
+   *
+   * Change-guarded: the callers run over every app on every route
+   * configuration and over every config at boot, and an unguarded write would
+   * fire an `app:updated` event and schedule a save per app per pass, for a
+   * value that is absent on almost all of them.
+   */
+  async setAccessGateUnapplied(
+    name: string,
+    value: boolean | undefined
+  ): Promise<AppState | null> {
+    const app = this.apps.get(name);
+    if (!app) return null;
+    if (app.accessGateUnapplied === value) return app;
+
+    if (value === undefined) {
+      delete app.accessGateUnapplied;
+      return this.updateApp(name, {});
+    }
+    return this.updateApp(name, { accessGateUnapplied: value });
+  }
+
+  /**
+   * Record that someone opened this app through the access gate.
+   *
+   * Called from the verify hop, which runs once per HTTP REQUEST — every asset
+   * of every page — so this is deliberately cheap and deliberately lossy: the
+   * timestamp is rounded to the minute and a repeat within the same minute is
+   * dropped without touching state at all. Without that, one page load would
+   * queue dozens of saves for a value nobody reads at that resolution.
+   */
+  async recordAppOpened(name: string, userId: string, username: string): Promise<void> {
+    const app = this.apps.get(name);
+    if (!app) return;
+
+    // `Date.now()` rather than `new Date()`: same value, and the one a test can
+    // move — `jest.spyOn(Date, 'now')` does not affect the constructor.
+    const minute = new Date(Math.floor(Date.now() / 60_000) * 60_000).toISOString();
+    const existing = app.recentOpeners ?? [];
+    const already = existing.find(o => o.userId === userId && o.at === minute);
+    if (already) return;
+
+    const recentOpeners = [
+      { userId, username, at: minute },
+      ...existing.filter(o => o.userId !== userId),
+    ].slice(0, MAX_RECENT_OPENERS);
+
+    await this.updateApp(name, { lastOpenedAt: minute, recentOpeners });
   }
 
   async setAppStatus(name: string, status: AppStatus, details?: { port?: number; pid?: number; error?: string; missingSecrets?: string[]; readinessUnverified?: boolean; parkedReason?: string; awaitingPromotion?: boolean }): Promise<AppState | null> {

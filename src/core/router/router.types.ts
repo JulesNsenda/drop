@@ -96,6 +96,43 @@ export interface RouteConfig {
    * credentials from the hop to the tenant.
    */
   mcpAuth?: McpAuthConfig;
+  /**
+   * Put DROP's browser access gate in front of this whole app (DROP-152).
+   *
+   * Set only for an app carrying an admin-set `AppConfig.access` policy on a
+   * platform that can actually enforce one (`assessAccessGate`). Changes the
+   * SHAPE of the emitted block, not just its contents: the catch-all and any
+   * inner guard move inside the gate's `route`, and a DROP-owned exchange
+   * handle is emitted as a sibling ahead of it.
+   */
+  accessAuth?: AccessAuthConfig;
+}
+
+/**
+ * The `forward_auth` browser gate for one app on one hostname.
+ *
+ * `appName` is a GENERATION-TIME LITERAL and must stay one. It may never be
+ * derived at request time from `Host` or `X-Forwarded-Host`: `forward_auth`
+ * proxies the ORIGINAL request, so those are client-controlled, and a
+ * request-time derivation would let one tenant present a valid session while
+ * claiming to be another app (SEC-2). It goes in the PATH of the verify and
+ * exchange URIs, where a client cannot append a second value.
+ *
+ * There is deliberately NO `origin` field. One was carried here and never
+ * read — the session's audience is resolved by the verify endpoint itself —
+ * and a field whose doc comment IS the security argument while its value is
+ * unread is worse than no field: it tells the next reader a guarantee exists
+ * where none does. The audience is deterministic because `assessAccessGate`
+ * refuses to gate an app routed on more than one hostname; see `appOrigin` in
+ * `routes/app-access.ts`, which is where that reasoning now lives.
+ */
+export interface AccessAuthConfig {
+  /** The app this gate belongs to — baked into the verify and exchange paths. */
+  appName: string;
+  /** DROP's own API address, e.g. `127.0.0.1:3000`. */
+  verifyUpstream: string;
+  /** The name of this app's session cookie, e.g. `__Host-drop-session-myapp`. */
+  cookieName: string;
 }
 
 /**

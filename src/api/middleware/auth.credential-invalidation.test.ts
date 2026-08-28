@@ -43,36 +43,21 @@ import {
   authMiddleware,
   AuthContext,
 } from './auth';
+import { clockTick } from '../__testutils__/auth';
 
 const PASSWORD = 'pw-bob-123456';
 const AUD = 'https://drop.example.com/api/v1/mcp';
 
 /**
- * Block until the wall clock advances at least one millisecond.
+ * `clockTick` — block until the wall clock advances a millisecond — now lives
+ * in `src/api/__testutils__/auth.ts` and is imported above (DROP-157).
  *
- * `predatesInvalidationStamp` compares `mintedMs < stampMs` — STRICTLY less
- * than — and both sides are `new Date().toISOString()` at millisecond
- * resolution. So a credential minted in the SAME millisecond as the
- * invalidation stamp does not count as predating it.
- *
- * Every test here asserting "issued before suspension" (or "issued after
- * re-enable") is really asserting an ordering the clock has to be able to
- * express. Without this, the two operations can complete inside one
- * millisecond and the assertion inverts — which is a flaky test, not a
- * product bug, and it fails on FAST machines rather than loaded ones. It cost
- * a red CI run on `Deploy develop` at 1.0.0 while the same commit passed CI.
- *
- * Deliberately not fixed by relaxing the comparison to `<=`: that would just
- * move the tie-break, making the mirror-image "accepts a token issued AFTER
- * re-enable" tests flaky instead. The ambiguity at an exact millisecond tie is
- * real; the tests should not depend on which way it resolves.
+ * It was local to this file, which is exactly how its sibling
+ * `auth.owner-guards.test.ts` came to exercise the same stamp through the same
+ * primitive with NO clock discipline at all, and fail CI on a fast runner. The
+ * full rationale — including why relaxing the production comparison to `<=` is
+ * the wrong fix — is on the shared helper.
  */
-async function clockTick(): Promise<void> {
-  const start = Date.now();
-  while (Date.now() === start) {
-    await new Promise((resolve) => setTimeout(resolve, 1));
-  }
-}
 
 /** Read the raw credentials file as loosely-typed JSON, for corrupting a record by hand. */
 async function readRawStore(credentialsPath: string): Promise<Record<string, unknown>> {

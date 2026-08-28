@@ -22,12 +22,12 @@ function StatCard({ label, value, delta, deltaDirection = 'neutral', icon: Icon,
   return (
     <div className={`dui-stat-card dui-card rounded-xl p-5 ${className}`}>
       <div className="flex items-start justify-between gap-3">
-        <span className="text-sm font-medium" style={{ color: 'var(--text-2)' }}>
+        <span className="text-sm font-medium text-muted">
           {label}
         </span>
-        {Icon && <Icon className="h-4 w-4 flex-shrink-0" style={{ color: 'var(--text-3)' }} aria-hidden="true" />}
+        {Icon && <Icon className="h-4 w-4 flex-shrink-0 text-faint" aria-hidden="true" />}
       </div>
-      <div className="mt-2 text-2xl font-semibold" style={{ color: 'var(--text)', fontFamily: 'var(--mono)' }}>
+      <div className="mt-2 text-2xl font-semibold text-fg font-mono">
         {value}
       </div>
       {delta && (

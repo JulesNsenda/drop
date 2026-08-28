@@ -86,7 +86,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
           echo "Releasing $VERSION (prerelease=$PRERELEASE)"
 
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 20
           cache: npm
@@ -245,7 +245,7 @@ jobs:
       attestations: write
     steps:
       - name: Download built assets
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: release-assets
 
@@ -261,7 +261,7 @@ jobs:
       # you want an existing tag's assets attested.
       - name: Attest build provenance
         if: github.event.repository.private == false
-        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: |
             drop-dist.tar.gz

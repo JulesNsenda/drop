@@ -20,7 +20,6 @@ import {
 import {
   getPrincipalQuota,
   resetPrincipalQuota,
-  quotaKeysFor,
   QuotaExceededError,
 } from './principal-quota';
 
@@ -99,7 +98,7 @@ describe('admitDeploy', () => {
     // Every platform restart re-deploys the whole fleet through the watcher.
     for (let i = 0; i < 10; i++) await admitDeploy('app', true, {});
 
-    expect(quotaKeysFor({})).toEqual([]);
+    expect(getPrincipalQuota().keysFor({})).toEqual({ metered: true, keys: [] });
   });
 
   it('still enforces the breaker for automation', async () => {

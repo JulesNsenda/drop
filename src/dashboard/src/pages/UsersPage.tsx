@@ -8,6 +8,15 @@ import { App } from '../hooks/useApi';
 import Button from '../components/ui/Button';
 import Card from '../components/ui/Card';
 import Badge from '../components/ui/Badge';
+import {
+  Table,
+  TableHead,
+  TableBody,
+  TableRow,
+  TableHeaderCell,
+  TableCell,
+} from '../components/ui/Table';
+import { cn } from '../lib/cn';
 import StatCard from '../components/ui/StatCard';
 
 interface UserInfo {
@@ -108,8 +117,7 @@ function UsersPage() {
       <div className="p-6">
         <button
           onClick={() => setSelectedUser(null)}
-          className="mb-6 inline-flex items-center gap-2 text-sm transition-colors hover:text-[var(--accent)]"
-          style={{ color: 'var(--text-2)' }}
+          className="mb-6 inline-flex items-center gap-2 text-sm transition-colors hover:text-[var(--accent)] text-muted"
         >
           <ArrowLeft className="h-4 w-4" /> Back to users
         </button>
@@ -117,11 +125,11 @@ function UsersPage() {
         {/* User header */}
         <div className="mb-6 flex items-center justify-between">
           <div>
-            <h1 className="text-2xl font-bold" style={{ color: 'var(--text)' }}>
+            <h1 className="text-2xl font-bold text-fg">
               {selectedUser.username}
             </h1>
             {selectedUser.email && (
-              <p className="text-sm" style={{ color: 'var(--text-2)' }}>
+              <p className="text-sm text-muted">
                 {selectedUser.email}
               </p>
             )}
@@ -135,7 +143,7 @@ function UsersPage() {
               >
                 {selectedUser.enabled ? 'Active' : 'Disabled'}
               </span>
-              <span className="text-xs" style={{ color: 'var(--text-3)' }}>
+              <span className="text-xs text-faint">
                 Joined {formatDate(selectedUser.createdAt)}
               </span>
             </div>
@@ -162,7 +170,7 @@ function UsersPage() {
         <div className="mb-6 grid gap-4 md:grid-cols-4">
           <StatCard label="Applications" value={userApps.length} />
           <Card>
-            <p className="mb-1 text-sm font-medium" style={{ color: 'var(--text-2)' }}>
+            <p className="mb-1 text-sm font-medium text-muted">
               App Limit
             </p>
             <div className="flex items-center gap-2">
@@ -184,13 +192,12 @@ function UsersPage() {
                   });
                   toast('success', 'App limit updated');
                 }}
-                className="text-xs font-medium"
-                style={{ color: 'var(--accent)' }}
+                className="text-xs font-medium text-accent"
               >
                 Save
               </button>
             </div>
-            <p className="mt-1 text-[10px]" style={{ color: 'var(--text-3)' }}>
+            <p className="mt-1 text-[10px] text-faint">
               0 = use global default
             </p>
           </Card>
@@ -200,35 +207,34 @@ function UsersPage() {
 
         {/* User's apps */}
         <Card padded={false} className="mb-6">
-          <div className="border-b px-4 py-3" style={{ borderColor: 'var(--border)' }}>
-            <h2 className="font-semibold" style={{ color: 'var(--text)' }}>
+          <div className="border-b px-4 py-3 border-line">
+            <h2 className="font-semibold text-fg">
               Applications
             </h2>
           </div>
           {userApps.length === 0 ? (
-            <div className="p-4 text-sm" style={{ color: 'var(--text-2)' }}>
+            <div className="p-4 text-sm text-muted">
               No applications deployed
             </div>
           ) : (
-            <div className="divide-y" style={{ borderColor: 'var(--border)' }}>
+            <div className="divide-y border-line">
               {userApps.map(app => (
                 <Link
                   key={app.name}
                   to={`/apps/${app.name}`}
-                  className="flex items-center justify-between px-4 py-3 transition-colors hover:bg-[var(--bg-2)]"
-                  style={{ borderColor: 'var(--border)' }}
+                  className="flex items-center justify-between px-4 py-3 transition-colors hover:bg-[var(--bg-2)] border-line"
                 >
                   <div>
-                    <span className="text-sm font-medium" style={{ color: 'var(--text)' }}>
+                    <span className="text-sm font-medium text-fg">
                       {app.name}
                     </span>
-                    <span className="ml-2 text-xs" style={{ color: 'var(--text-3)' }}>
+                    <span className="ml-2 text-xs text-faint">
                       {app.type}
                     </span>
                   </div>
                   <div className="flex items-center gap-3">
                     {app.port && (
-                      <span className="font-mono text-xs" style={{ color: 'var(--text-3)' }}>
+                      <span className="font-mono text-xs text-faint">
                         :{app.port}
                       </span>
                     )}
@@ -243,8 +249,8 @@ function UsersPage() {
         {/* Reset password (admin action) */}
         {selectedUser.role !== 'admin' && (
           <Card padded={false} className="mb-6">
-            <div className="border-b px-4 py-3" style={{ borderColor: 'var(--border)' }}>
-              <h2 className="font-semibold" style={{ color: 'var(--text)' }}>
+            <div className="border-b px-4 py-3 border-line">
+              <h2 className="font-semibold text-fg">
                 Reset Password
               </h2>
             </div>
@@ -284,32 +290,31 @@ function UsersPage() {
 
         {/* User's activity */}
         <Card padded={false}>
-          <div className="border-b px-4 py-3" style={{ borderColor: 'var(--border)' }}>
-            <h2 className="font-semibold" style={{ color: 'var(--text)' }}>
+          <div className="border-b px-4 py-3 border-line">
+            <h2 className="font-semibold text-fg">
               Recent Activity
             </h2>
           </div>
           {userActivity.length === 0 ? (
-            <div className="p-4 text-sm" style={{ color: 'var(--text-2)' }}>
+            <div className="p-4 text-sm text-muted">
               No activity recorded
             </div>
           ) : (
-            <div className="divide-y" style={{ borderColor: 'var(--border)' }}>
+            <div className="divide-y border-line">
               {userActivity.map(a => (
                 <div
                   key={a.id}
-                  className="flex items-center justify-between px-4 py-2.5 text-sm"
-                  style={{ borderColor: 'var(--border)' }}
+                  className="flex items-center justify-between px-4 py-2.5 text-sm border-line"
                 >
                   <div>
-                    <span style={{ color: 'var(--text-2)' }}>{a.action}</span>
+                    <span className="text-muted">{a.action}</span>
                     {a.appName && (
-                      <span className="ml-1" style={{ color: 'var(--accent)' }}>
+                      <span className="ml-1 text-accent">
                         {a.appName}
                       </span>
                     )}
                   </div>
-                  <span className="text-xs" style={{ color: 'var(--text-3)' }}>
+                  <span className="text-xs text-faint">
                     {formatTime(a.timestamp)}
                   </span>
                 </div>
@@ -326,10 +331,10 @@ function UsersPage() {
     <div className="p-6">
       <div className="mb-6 flex items-center justify-between">
         <div>
-          <h1 className="text-2xl font-bold" style={{ color: 'var(--text)' }}>
+          <h1 className="text-2xl font-bold text-fg">
             Users
           </h1>
-          <p className="mt-1 text-sm" style={{ color: 'var(--text-2)' }}>
+          <p className="mt-1 text-sm text-muted">
             {users.length} registered user{users.length !== 1 ? 's' : ''}
           </p>
         </div>
@@ -340,84 +345,54 @@ function UsersPage() {
       </div>
 
       <Card padded={false} className="overflow-hidden">
-        <table className="w-full text-sm">
-          <thead>
-            <tr
-              className="border-b"
-              style={{ borderColor: 'var(--border)', background: 'var(--bg-2)' }}
-            >
-              <th className="px-4 py-3 text-left font-medium" style={{ color: 'var(--text-3)' }}>
-                User
-              </th>
-              <th
-                className="hidden px-4 py-3 text-left font-medium md:table-cell"
-                style={{ color: 'var(--text-3)' }}
-              >
-                Email
-              </th>
-              <th className="px-4 py-3 text-left font-medium" style={{ color: 'var(--text-3)' }}>
-                Role
-              </th>
-              <th className="px-4 py-3 text-left font-medium" style={{ color: 'var(--text-3)' }}>
-                Apps
-              </th>
-              <th className="px-4 py-3 text-left font-medium" style={{ color: 'var(--text-3)' }}>
-                Last Login
-              </th>
-              <th className="px-4 py-3 text-left font-medium" style={{ color: 'var(--text-3)' }}>
-                Status
-              </th>
-              <th className="px-4 py-3 text-right font-medium" style={{ color: 'var(--text-3)' }}>
-                Actions
-              </th>
-            </tr>
-          </thead>
-          <tbody className="divide-y" style={{ borderColor: 'var(--border)' }}>
+        <Table>
+          <TableHead>
+            <TableRow header>
+              <TableHeaderCell>User</TableHeaderCell>
+              <TableHeaderCell className="hidden md:table-cell">Email</TableHeaderCell>
+              <TableHeaderCell>Role</TableHeaderCell>
+              <TableHeaderCell>Apps</TableHeaderCell>
+              <TableHeaderCell>Last Login</TableHeaderCell>
+              <TableHeaderCell>Status</TableHeaderCell>
+              <TableHeaderCell align="right">Actions</TableHeaderCell>
+            </TableRow>
+          </TableHead>
+          <TableBody>
             {users.map(u => (
-              <tr
+              <TableRow
                 key={u.id}
-                className="cursor-pointer transition-colors hover:bg-[var(--bg-2)]"
-                style={{ borderColor: 'var(--border)', opacity: u.enabled ? 1 : 0.5 }}
+                className={cn(
+                  'cursor-pointer transition-colors hover:bg-surface-2',
+                  !u.enabled && 'opacity-50'
+                )}
                 onClick={() => selectUser(u)}
               >
-                <td className="px-4 py-3">
+                <TableCell>
                   <div className="flex items-center gap-2">
-                    <Users className="h-4 w-4" style={{ color: 'var(--text-3)' }} />
-                    <span className="font-medium" style={{ color: 'var(--text)' }}>
-                      {u.username}
-                    </span>
+                    <Users className="h-4 w-4 text-faint" />
+                    <span className="font-medium text-fg">{u.username}</span>
                   </div>
-                </td>
-                <td
-                  className="hidden px-4 py-3 text-xs md:table-cell"
-                  style={{ color: 'var(--text-2)' }}
-                >
+                </TableCell>
+                <TableCell className="hidden text-xs text-muted md:table-cell">
                   {u.email || '-'}
-                </td>
-                <td className="px-4 py-3">
+                </TableCell>
+                <TableCell>
                   <Badge tone={u.role === 'admin' ? 'accent' : 'neutral'}>{u.role}</Badge>
-                </td>
-                <td className="px-4 py-3" style={{ color: 'var(--text-2)' }}>
-                  {u.appCount}
-                </td>
-                <td className="px-4 py-3 text-xs" style={{ color: 'var(--text-2)' }}>
-                  {formatDate(u.lastLogin)}
-                </td>
-                <td className="px-4 py-3">
-                  <span
-                    className="text-xs"
-                    style={{ color: u.enabled ? 'var(--ok)' : 'var(--err)' }}
-                  >
+                </TableCell>
+                <TableCell className="text-muted">{u.appCount}</TableCell>
+                <TableCell className="text-xs text-muted">{formatDate(u.lastLogin)}</TableCell>
+                <TableCell>
+                  <span className={cn('text-xs', u.enabled ? 'text-ok' : 'text-err')}>
                     {u.enabled ? 'Active' : 'Disabled'}
                   </span>
-                </td>
-                <td className="px-4 py-3 text-right" onClick={e => e.stopPropagation()}>
+                </TableCell>
+                <TableCell align="right" onClick={e => e.stopPropagation()}>
                   {u.role !== 'admin' && (
                     <button
                       onClick={() => toggleUser(u.id, !u.enabled)}
-                      className="transition-colors hover:text-[var(--text)]"
-                      style={{ color: 'var(--text-3)' }}
+                      className="dui-focus-ring rounded text-faint transition-colors hover:text-fg focus-visible:outline-none"
                       title={u.enabled ? 'Disable user' : 'Enable user'}
+                      aria-label={u.enabled ? `Disable ${u.username}` : `Enable ${u.username}`}
                     >
                       {u.enabled ? (
                         <ShieldOff className="h-4 w-4" />
@@ -426,11 +401,11 @@ function UsersPage() {
                       )}
                     </button>
                   )}
-                </td>
-              </tr>
+                </TableCell>
+              </TableRow>
             ))}
-          </tbody>
-        </table>
+          </TableBody>
+        </Table>
       </Card>
     </div>
   );

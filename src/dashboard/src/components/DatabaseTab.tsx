@@ -5,6 +5,15 @@ import { useAuth } from '../hooks/useAuth';
 import { useToast } from './Toast';
 import { useConfirm } from './ConfirmDialog';
 import Card from './ui/Card';
+import EmptyState from './ui/EmptyState';
+import {
+  Table,
+  TableHead,
+  TableBody,
+  TableRow,
+  TableHeaderCell,
+  TableCell,
+} from './ui/Table';
 import StatCard from './ui/StatCard';
 import Button from './ui/Button';
 import Badge from './ui/Badge';
@@ -131,13 +140,12 @@ function ServiceRow({
 
   return (
     <div
-      className="flex flex-col gap-2 border-b py-3 last:border-b-0"
-      style={{ borderColor: 'var(--border)' }}
+      className="flex flex-col gap-2 border-b py-3 last:border-b-0 border-line"
     >
       <div className="flex items-center justify-between gap-3">
         <div className="flex items-center gap-2">
-          <Icon className="h-4 w-4" style={{ color: 'var(--text-2)' }} />
-          <span className="text-sm font-medium" style={{ color: 'var(--text)' }}>
+          <Icon className="h-4 w-4 text-muted" />
+          <span className="text-sm font-medium text-fg">
             {label}
           </span>
         </div>
@@ -176,7 +184,7 @@ function ServiceRow({
         ) : (
           <div className="flex items-center gap-3">
             {quota.constrained && (
-              <span className="text-xs" style={{ color: 'var(--text-3)' }}>
+              <span className="text-xs text-faint">
                 {formatQuotaUsage(quota)}
               </span>
             )}
@@ -202,17 +210,17 @@ function ServiceRow({
       </div>
 
       {view.detachIncomplete && view.canDetach && (
-        <p className="text-xs" style={{ color: 'var(--warn)' }}>
+        <p className="text-xs text-warn">
           A previous detach did not finish — retry to complete it.
         </p>
       )}
       {!view.attached && !view.detachIncomplete && role !== 'readonly' && view.disabledReason === 'quota-exceeded' && (
-        <p className="text-xs" style={{ color: 'var(--warn)' }}>
+        <p className="text-xs text-warn">
           {label} quota reached — free up a service before attaching another.
         </p>
       )}
       {!view.attached && !view.detachIncomplete && role !== 'readonly' && !view.disabledReason && view.previouslyDetached && (
-        <p className="text-xs" style={{ color: 'var(--text-3)' }}>
+        <p className="text-xs text-faint">
           Previously detached — attaching will re-provision it.
         </p>
       )}
@@ -228,7 +236,7 @@ function ServiceRow({
         >
           {refusal.message}
           {refusal.quota && (
-            <span className="mt-1 block" style={{ color: 'var(--text-3)' }}>
+            <span className="mt-1 block text-faint">
               {formatQuotaUsage(refusal.quota)}
             </span>
           )}
@@ -479,11 +487,10 @@ function DatabaseTab({ name }: { name: string }) {
   const servicesCard = (
     <Card padded={false}>
       <div
-        className="flex items-center border-b px-4 py-3"
-        style={{ borderColor: 'var(--border)' }}
+        className="flex items-center border-b px-4 py-3 border-line"
       >
-        <Plug className="mr-2 h-4 w-4" style={{ color: 'var(--text-2)' }} />
-        <h2 className="font-semibold" style={{ color: 'var(--text)' }}>
+        <Plug className="mr-2 h-4 w-4 text-muted" />
+        <h2 className="font-semibold text-fg">
           Backing services
         </h2>
       </div>
@@ -518,27 +525,30 @@ function DatabaseTab({ name }: { name: string }) {
   if (loading) {
     return (
       <Card className="animate-pulse space-y-3">
-        <div className="h-4 w-40 rounded" style={{ background: 'var(--bg-2)' }} />
-        <div className="h-20 rounded" style={{ background: 'var(--bg-2)' }} />
-        <div className="h-32 rounded" style={{ background: 'var(--bg-2)' }} />
+        <div className="h-4 w-40 rounded bg-surface-2" />
+        <div className="h-20 rounded bg-surface-2" />
+        <div className="h-32 rounded bg-surface-2" />
       </Card>
     );
   }
 
   if (error) {
     return (
-      <Card className="py-12 text-center">
-        <AlertTriangle className="mx-auto mb-3 h-8 w-8" style={{ color: 'var(--err)' }} />
-        <h3 className="mb-1 text-base font-semibold" style={{ color: 'var(--text)' }}>
-          Couldn&apos;t load the database panel
-        </h3>
-        <p className="mb-4 text-sm" style={{ color: 'var(--text-2)' }}>
-          {error}
-        </p>
-        <Button variant="secondary" onClick={() => load(true)} disabled={refreshing}>
-          <RefreshCw className={`h-4 w-4 ${refreshing ? 'animate-spin' : ''}`} />
-          Retry
-        </Button>
+      <Card padded={false}>
+        <EmptyState
+          icon={AlertTriangle}
+          tone="error"
+          size="sm"
+          titleAs="h3"
+          title="Couldn&apos;t load the database panel"
+          description={error}
+          action={
+            <Button variant="secondary" onClick={() => load(true)} disabled={refreshing}>
+              <RefreshCw className={`h-4 w-4 ${refreshing ? 'animate-spin' : ''}`} />
+              Retry
+            </Button>
+          }
+        />
       </Card>
     );
   }
@@ -554,11 +564,11 @@ function DatabaseTab({ name }: { name: string }) {
     return (
       <div className="space-y-4">
         <Card className="py-12 text-center">
-          <Database className="mx-auto mb-3 h-8 w-8" style={{ color: 'var(--text-3)' }} />
-          <h3 className="mb-1 text-base font-semibold" style={{ color: 'var(--text)' }}>
+          <Database className="mx-auto mb-3 h-8 w-8 text-faint" />
+          <h3 className="mb-1 text-base font-semibold text-fg">
             {missingDatabase ? 'Database missing' : 'No database provisioned for this app'}
           </h3>
-          <p className="mx-auto max-w-md text-sm" style={{ color: 'var(--text-2)' }}>
+          <p className="mx-auto max-w-md text-sm text-muted">
             {missingDatabase ? (
               <>
                 The database named in this app&apos;s stored credentials no longer exists, though
@@ -605,71 +615,44 @@ function DatabaseTab({ name }: { name: string }) {
 
       <Card padded={false}>
         <div
-          className="flex items-center border-b px-4 py-3"
-          style={{ borderColor: 'var(--border)' }}
+          className="flex items-center border-b px-4 py-3 border-line"
         >
-          <Table2 className="mr-2 h-4 w-4" style={{ color: 'var(--text-2)' }} />
-          <h2 className="font-semibold" style={{ color: 'var(--text)' }}>
+          <Table2 className="mr-2 h-4 w-4 text-muted" />
+          <h2 className="font-semibold text-fg">
             Tables
           </h2>
         </div>
         <div className="p-4">
           {tablesError ? (
-            <p className="text-sm" style={{ color: 'var(--err)' }}>
+            <p className="text-sm text-err">
               {tablesError}
             </p>
           ) : tables.length === 0 ? (
-            <p className="text-sm" style={{ color: 'var(--text-2)' }}>
+            <p className="text-sm text-muted">
               No tables yet
             </p>
           ) : (
             <div className="overflow-x-auto">
-              <table className="w-full text-sm">
-                <thead>
-                  <tr className="border-b" style={{ borderColor: 'var(--border)' }}>
-                    <th
-                      className="text-left py-2 pr-4 font-medium"
-                      style={{ color: 'var(--text-3)' }}
-                    >
-                      Name
-                    </th>
-                    <th
-                      className="text-left py-2 pr-4 font-medium"
-                      style={{ color: 'var(--text-3)' }}
-                    >
-                      Row estimate
-                    </th>
-                    <th className="text-left py-2 font-medium" style={{ color: 'var(--text-3)' }}>
-                      Size
-                    </th>
-                  </tr>
-                </thead>
-                <tbody>
+              <Table density="compact">
+                <TableHead>
+                  <TableRow>
+                    <TableHeaderCell>Name</TableHeaderCell>
+                    <TableHeaderCell>Row estimate</TableHeaderCell>
+                    <TableHeaderCell className="pr-0">Size</TableHeaderCell>
+                  </TableRow>
+                </TableHead>
+                <TableBody>
                   {tables.map(t => (
-                    <tr
-                      key={t.name}
-                      className="border-b last:border-b-0"
-                      style={{ borderColor: 'var(--border)' }}
-                    >
-                      <td
-                        className="py-2.5 pr-4 font-mono font-medium"
-                        style={{ color: 'var(--text)' }}
-                      >
-                        {t.name}
-                      </td>
-                      <td
-                        className="py-2.5 pr-4"
-                        style={{ color: isUntrustedZero(t) ? 'var(--text-3)' : 'var(--text)' }}
-                      >
+                    <TableRow key={t.name} className="last:border-b-0">
+                      <TableCell className="font-mono font-medium text-fg">{t.name}</TableCell>
+                      <TableCell className={isUntrustedZero(t) ? 'text-faint' : 'text-fg'}>
                         {formatRowEstimate(t)}
-                      </td>
-                      <td className="py-2.5" style={{ color: 'var(--text-2)' }}>
-                        {formatBytes(t.sizeBytes)}
-                      </td>
-                    </tr>
+                      </TableCell>
+                      <TableCell className="pr-0 text-muted">{formatBytes(t.sizeBytes)}</TableCell>
+                    </TableRow>
                   ))}
-                </tbody>
-              </table>
+                </TableBody>
+              </Table>
             </div>
           )}
         </div>

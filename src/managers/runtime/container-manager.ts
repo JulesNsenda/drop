@@ -150,6 +150,64 @@ function mapDockerState(state: Docker.ContainerInspectInfo['State']): AppRuntime
  * replace it with a mock — the real client is constructed when `client` is
  * omitted (production path).
  */
+export type TenantNetworkIsolation = 'unknown' | 'isolated' | 'shared';
+
+/**
+ * Whether tenant containers are isolated from each other on `drop-net`.
+ *
+ * `'shared'` is the value that means something is actually wrong: the network
+ * predates ICC-disabling and could not be recreated because containers were
+ * attached, so every tenant container can reach every other tenant's port
+ * directly, walking past Caddy. Read by the DROP-152 access gate, which cannot
+ * be enforced at the Caddy layer on a box in that state.
+ *
+ * `'unknown'` means nothing has looked yet, and it is deliberately NOT a
+ * refusal — on a PM2 box nothing ever will, and refusing there would refuse
+ * for a reason that does not apply. It is the platform's job to make sure the
+ * answer is known before anything reads it under docker isolation: see
+ * `probeTenantNetworkIsolation`, which the platform calls at boot. Left to
+ * `ensureNetwork` alone the value stayed `'unknown'` for the life of a docker
+ * box that skipped every app at boot reconciliation — i.e. the steady-state
+ * restart — so the blocker could never fire on the boxes it describes.
+ *
+ * Module-level rather than per-instance so a PM2 box, which never constructs a
+ * ContainerManager at all, can still be asked the question and answer
+ * `'unknown'` honestly. `resetContainerManager()` clears it.
+ */
+let tenantNetworkIsolation: TenantNetworkIsolation = 'unknown';
+
+/** See `tenantNetworkIsolation`. */
+export function getTenantNetworkIsolation(): TenantNetworkIsolation {
+  return tenantNetworkIsolation;
+}
+
+/**
+ * Determine `tenantNetworkIsolation` WITHOUT creating or recreating anything.
+ *
+ * `ensureNetwork` also sets it, but only as a side effect of starting a
+ * container. This is the read-only path the platform calls once at boot so the
+ * answer is established before the access-gate sweep and any route emission
+ * consults it. A network that does not exist yet reads as `'isolated'`: the
+ * only way one gets created is `ensureNetwork` below, which always sets
+ * `enable_icc=false`.
+ */
+export async function probeTenantNetworkIsolation(
+  docker?: Docker
+): Promise<TenantNetworkIsolation> {
+  const client = docker ?? new Docker();
+  try {
+    const net = (await client.getNetwork(DROP_NETWORK).inspect()) as {
+      Options?: Record<string, string>;
+    };
+    tenantNetworkIsolation =
+      net.Options?.['com.docker.network.bridge.enable_icc'] === 'false' ? 'isolated' : 'shared';
+  } catch {
+    // No such network yet — the next ensureNetwork() creates it with ICC off.
+    tenantNetworkIsolation = 'isolated';
+  }
+  return tenantNetworkIsolation;
+}
+
 export class ContainerManager implements AppRuntime {
   readonly type = 'docker' as const;
 
@@ -532,6 +590,7 @@ export class ContainerManager implements AppRuntime {
     }
 
     if (networkExists && iccDisabled) {
+      tenantNetworkIsolation = 'isolated';
       // Already correctly configured. The subnet is deliberately NOT required to
       // match DROP_NET_SUBNET: `drop-host` is mapped to the network's ACTUAL
       // gateway at container start (resolveHostGatewayIp), so an in-place upgrade
@@ -555,6 +614,11 @@ export class ContainerManager implements AppRuntime {
             'communication ENABLED and could not be recreated because containers are ' +
             'still attached. Restart DROP with no running containers to re-disable ICC.'
         );
+        // Record it, don't just warn: on this box every tenant container can
+        // reach every other tenant's port on the bridge, bypassing Caddy — so
+        // a Caddy-level access gate is not enforceable here for the same
+        // reason it is not enforceable under isolation: none (DROP-152).
+        tenantNetworkIsolation = 'shared';
         return;
       }
     }
@@ -573,6 +637,7 @@ export class ContainerManager implements AppRuntime {
         // gives new installs a stable, uncommon range.
         IPAM: { Config: [{ Subnet: DROP_NET_SUBNET, Gateway: DROP_NET_GATEWAY }] },
       });
+      tenantNetworkIsolation = 'isolated';
     }
   }
 
@@ -834,6 +899,7 @@ export function getContainerManager(docker?: Docker): ContainerManager {
 }
 
 export function resetContainerManager(): void {
+  tenantNetworkIsolation = 'unknown';
   if (containerManagerInstance) {
     containerManagerInstance.disconnect();
   }

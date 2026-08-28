@@ -27,6 +27,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.0] - 2026-08-28
+
+Apps can now require a sign-in before anyone reaches them, owners can share an
+app with a colleague, and a person with no DROP account can be invited to one
+app by email. The dashboard was rebuilt on a real design-token system and is
+usable from the keyboard throughout.
+
+**Everything in the sharing program is opt-in.** `appSharingEnabled` defaults to
+false, and an app with no policy behaves exactly as it did in 1.4.0 — upgrading
+changes nothing until an admin turns something on.
+
+### Added
+
+- **App access gate.** An app can be put behind DROP sign-in, enforced at the
+  proxy rather than by the app itself. The policy is `mode: 'drop-users'` with
+  an explicit allow-list; the `mode` field is the seam a future identity source
+  plugs into.
+- **App sharing.** An owner can grant a colleague access to one of their apps
+  without an admin round-trip, gated behind an admin-level toggle that is off by
+  default.
+- **Outbound mail.** An SMTP relay can be configured from Settings, with the
+  password encrypted at rest and write-only over the API. Share notifications
+  ride on it and ship default-off.
+- **Guest access.** Someone with no DROP account can be invited to exactly one
+  app by email and redeem a single-use invitation. Invitations expire, are rate
+  limited per principal, and the mail body only ever contains the operator's own
+  domain.
+- **Dashboard: Overview and Activity tabs** on the app page. The deploy history
+  was previously buried mid-scroll above the tab bar; it is now a destination of
+  its own, and the tab bar sits directly under the header rather than reading as
+  a footer.
+- **Dashboard: per-row actions** on the apps list. Restart, stop, start and
+  delete without opening the app first.
+- **Dashboard: command palette.** Cmd-K (Ctrl-K off macOS) jumps to any page or
+  any app.
+- **Dashboard: a design-token bridge.** Every `.drop-ui` token is a Tailwind
+  utility, with a lint guard so the hand-piped inline styles it replaces cannot
+  come back.
+
+### Changed
+
+- The dashboard is keyboard-usable in places it previously was not: the confirm
+  dialog traps focus and restores it, the tab bar is one tab stop with arrow-key
+  navigation instead of one stop per tab, table headers are associated with
+  their columns, loading states announce themselves, and hints that were
+  mouse-only `title` attributes now appear on focus.
+- Motion respects `prefers-reduced-motion`, which the dashboard previously
+  ignored entirely.
+
+### Fixed
+
+- Two high-severity advisories in transitive dependencies (`js-yaml` quadratic
+  CPU consumption, reached via pm2 and ts-jest) and one moderate
+  (`protobufjs`, via dockerode). `npm audit` reports zero.
+- A credential-invalidation test that could fail on a fast CI runner when a key
+  was minted in the same millisecond as the suspension that should revoke it.
+
 ## [1.4.0] - 2026-08-22
 
 Backing services can now be attached to and detached from a running app, from

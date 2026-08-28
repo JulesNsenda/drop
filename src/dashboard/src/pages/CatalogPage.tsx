@@ -5,6 +5,7 @@ import { useToast } from '../components/Toast';
 import Badge from '../components/ui/Badge';
 import Button from '../components/ui/Button';
 import Card from '../components/ui/Card';
+import EmptyState from '../components/ui/EmptyState';
 import { describeAvailability } from '../lib/availability-label';
 import {
   filterCatalog,
@@ -59,7 +60,7 @@ function ExtensionCard({ extension }: { extension: ExtensionDescriptor }) {
     <Card className="flex flex-col gap-3">
       <div className="flex items-start justify-between gap-3">
         <div className="min-w-0">
-          <h3 className="truncate font-semibold" style={{ color: 'var(--text)' }}>
+          <h3 className="truncate font-semibold text-fg">
             {extension.displayName}
           </h3>
           <Badge tone="neutral" className="mt-1">
@@ -69,11 +70,11 @@ function ExtensionCard({ extension }: { extension: ExtensionDescriptor }) {
         <Badge tone={availability.tone}>{availability.label}</Badge>
       </div>
 
-      <p className="text-sm" style={{ color: 'var(--text-2)' }}>
+      <p className="text-sm text-muted">
         {extension.summary}
       </p>
 
-      <p className="text-sm" style={{ color: 'var(--text-3)' }}>
+      <p className="text-sm text-faint">
         {availability.detail}
       </p>
 
@@ -82,12 +83,11 @@ function ExtensionCard({ extension }: { extension: ExtensionDescriptor }) {
           render, not this component. */}
       {availability.canAdd && extension.snippet && (
         <div>
-          <span className="mb-1 block text-xs font-medium uppercase" style={{ color: 'var(--text-3)' }}>
+          <span className="mb-1 block text-xs font-medium uppercase text-faint">
             drop.yaml
           </span>
           <pre
-            className="overflow-x-auto rounded-lg p-3 text-xs"
-            style={{ background: 'var(--bg-2)', color: 'var(--text)' }}
+            className="overflow-x-auto rounded-lg p-3 text-xs bg-surface-2 text-fg"
           >
             <code>{extension.snippet}</code>
           </pre>
@@ -109,7 +109,7 @@ function ExtensionCard({ extension }: { extension: ExtensionDescriptor }) {
           the honest answer to "how do I use this?" when the answer is
           "nothing to do". */}
       {extension.detection && (
-        <p className="text-sm" style={{ color: 'var(--text-2)' }}>
+        <p className="text-sm text-muted">
           {extension.detection}
         </p>
       )}
@@ -119,8 +119,7 @@ function ExtensionCard({ extension }: { extension: ExtensionDescriptor }) {
           href={extension.docsUrl}
           target="_blank"
           rel="noopener noreferrer"
-          className="inline-flex items-center gap-1.5 text-sm hover:underline"
-          style={{ color: 'var(--accent)' }}
+          className="inline-flex items-center gap-1.5 text-sm hover:underline text-accent"
         >
           <ExternalLink className="h-3.5 w-3.5" />
           Docs
@@ -178,10 +177,10 @@ function CatalogPage() {
       {/* Header */}
       <div className="mb-6 flex items-center justify-between gap-3">
         <div>
-          <h1 className="text-2xl font-bold" style={{ color: 'var(--text)' }}>
+          <h1 className="text-2xl font-bold text-fg">
             Catalog
           </h1>
-          <p style={{ color: 'var(--text-2)' }}>
+          <p className="text-muted">
             Backing services and app types DROP can build. Copy a snippet into your app&apos;s
             drop.yaml to use one.
           </p>
@@ -201,8 +200,7 @@ function CatalogPage() {
           {/* Search */}
           <div className="relative max-w-md flex-1">
             <Search
-              className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2"
-              style={{ color: 'var(--text-3)' }}
+              className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-faint"
             />
             <input
               type="text"
@@ -215,7 +213,7 @@ function CatalogPage() {
 
           {/* Kind filter */}
           <div className="flex flex-wrap items-center gap-2">
-            <Filter className="h-4 w-4" style={{ color: 'var(--text-3)' }} />
+            <Filter className="h-4 w-4 text-faint" />
             <div className="flex flex-wrap gap-1">
               {KIND_OPTIONS.map(opt => (
                 <button
@@ -259,7 +257,7 @@ function CatalogPage() {
           aria-hidden="true"
         >
           {[0, 1, 2, 3, 4, 5].map(i => (
-            <div key={i} className="h-44 rounded-xl" style={{ background: 'var(--bg-2)' }} />
+            <div key={i} className="h-44 rounded-xl bg-surface-2" />
           ))}
         </div>
       )}
@@ -268,20 +266,22 @@ function CatalogPage() {
           this only renders once a catalog actually loaded (extensions.length
           proves that, whether or not a later refresh has since failed). */}
       {!loading && extensions.length > 0 && filtered.length === 0 && (
-        <div className="py-12 text-center">
-          <Package className="mx-auto mb-4 h-12 w-12" style={{ color: 'var(--text-3)' }} />
-          <p style={{ color: 'var(--text-2)' }}>No catalog entries match your search</p>
-          <button
-            onClick={() => {
-              setSearch('');
-              setKind('all');
-            }}
-            className="mt-2 text-sm font-medium"
-            style={{ color: 'var(--accent)' }}
-          >
-            Clear filters
-          </button>
-        </div>
+        <EmptyState
+          icon={Package}
+          title="No catalog entries match your search"
+          action={
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => {
+                setSearch('');
+                setKind('all');
+              }}
+            >
+              Clear filters
+            </Button>
+          }
+        />
       )}
 
       {/* Catalog grid */}
