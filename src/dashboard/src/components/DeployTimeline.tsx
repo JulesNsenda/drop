@@ -41,8 +41,7 @@ function EpisodeStatusBadge({ status }: { status: string }) {
     >
       {status === 'in-progress' && (
         <span
-          className="w-2 h-2 mr-1.5 rounded-full animate-pulse"
-          style={{ background: 'var(--accent)' }}
+          className="w-2 h-2 mr-1.5 rounded-full animate-pulse bg-accent"
         />
       )}
       {status}
@@ -71,12 +70,12 @@ function relativeTime(iso: string): string {
 
 function stageIcon(stage: DeployStageName, ok?: boolean) {
   if (stage === 'build-failed' || stage === 'errored' || ok === false) {
-    return <XCircle className="w-4 h-4 shrink-0" style={{ color: 'var(--err)' }} />;
+    return <XCircle className="w-4 h-4 shrink-0 text-err" />;
   }
   if (stage === 'running' || (stage === 'build' && ok === true)) {
-    return <CheckCircle className="w-4 h-4 shrink-0" style={{ color: 'var(--ok)' }} />;
+    return <CheckCircle className="w-4 h-4 shrink-0 text-ok" />;
   }
-  return <Circle className="w-4 h-4 shrink-0" style={{ color: 'var(--text-3)' }} />;
+  return <Circle className="w-4 h-4 shrink-0 text-faint" />;
 }
 
 function LatestEpisode({ episode }: { episode: DeployEpisodeDto }) {
@@ -87,12 +86,12 @@ function LatestEpisode({ episode }: { episode: DeployEpisodeDto }) {
       <div className="flex items-center justify-between mb-3">
         <div className="flex items-center gap-2">
           <EpisodeStatusBadge status={episode.status} />
-          <span className="text-sm" style={{ color: 'var(--text-2)' }}>
+          <span className="text-sm text-muted">
             {TRIGGER_LABELS[episode.trigger]}
           </span>
         </div>
         {totalDuration && (
-          <span className="text-xs" style={{ color: 'var(--text-3)' }}>
+          <span className="text-xs text-faint">
             Total: {totalDuration}
           </span>
         )}
@@ -103,12 +102,11 @@ function LatestEpisode({ episode }: { episode: DeployEpisodeDto }) {
           <li key={`${stage.stage}-${i}`} className="flex items-start gap-3">
             {stageIcon(stage.stage, stage.ok)}
             <div className="flex-1 flex items-center justify-between">
-              <span className="text-sm" style={{ color: 'var(--text)' }}>
+              <span className="text-sm text-fg">
                 {STAGE_LABELS[stage.stage]}
               </span>
               <div
-                className="flex items-center gap-2 text-xs whitespace-nowrap ml-4"
-                style={{ color: 'var(--text-3)' }}
+                className="flex items-center gap-2 text-xs whitespace-nowrap ml-4 text-faint"
               >
                 {stage.durationMs != null && <span>{formatDuration(stage.durationMs)}</span>}
                 <span>{new Date(stage.at).toLocaleTimeString()}</span>
@@ -127,11 +125,10 @@ function DeployTimeline({ appName }: DeployTimelineProps) {
   return (
     <div className="dui-card rounded-xl mb-6">
       <div
-        className="flex items-center px-4 py-3 border-b"
-        style={{ borderColor: 'var(--border)' }}
+        className="flex items-center px-4 py-3 border-b border-line"
       >
-        <GitBranch className="w-4 h-4 mr-2" style={{ color: 'var(--text-2)' }} />
-        <h2 className="font-semibold" style={{ color: 'var(--text)' }}>
+        <GitBranch className="w-4 h-4 mr-2 text-muted" />
+        <h2 className="font-semibold text-fg">
           Deploy Timeline
         </h2>
       </div>
@@ -168,7 +165,7 @@ function DeployTimeline({ appName }: DeployTimelineProps) {
             {error}
           </div>
         ) : episodes.length === 0 ? (
-          <p className="text-sm" style={{ color: 'var(--text-2)' }}>
+          <p className="text-sm text-muted">
             No deploys recorded yet
           </p>
         ) : (
@@ -176,10 +173,9 @@ function DeployTimeline({ appName }: DeployTimelineProps) {
             <LatestEpisode episode={episodes[0]} />
 
             {episodes.length > 1 && (
-              <div className="mt-6 pt-4 border-t" style={{ borderColor: 'var(--border)' }}>
+              <div className="mt-6 pt-4 border-t border-line">
                 <h3
-                  className="text-xs font-medium uppercase tracking-wide mb-2"
-                  style={{ color: 'var(--text-3)' }}
+                  className="text-xs font-medium uppercase tracking-wide mb-2 text-faint"
                 >
                   Recent deploys
                 </h3>
@@ -190,15 +186,14 @@ function DeployTimeline({ appName }: DeployTimelineProps) {
                       className="flex items-center justify-between py-1.5 text-sm"
                     >
                       <div className="flex items-center gap-2">
-                        <span className="font-mono text-xs" style={{ color: 'var(--text-3)' }}>
+                        <span className="font-mono text-xs text-faint">
                           {ep.deployId.slice(0, 8)}
                         </span>
-                        <span style={{ color: 'var(--text-2)' }}>{TRIGGER_LABELS[ep.trigger]}</span>
+                        <span className="text-muted">{TRIGGER_LABELS[ep.trigger]}</span>
                         <EpisodeStatusBadge status={ep.status} />
                       </div>
                       <div
-                        className="flex items-center gap-3 text-xs whitespace-nowrap ml-4"
-                        style={{ color: 'var(--text-3)' }}
+                        className="flex items-center gap-3 text-xs whitespace-nowrap ml-4 text-faint"
                       >
                         {formatDuration(ep.durationMs) && (
                           <span>{formatDuration(ep.durationMs)}</span>

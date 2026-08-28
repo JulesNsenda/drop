@@ -60,22 +60,21 @@ function AppShell({ sidebarNav, breadcrumb, headerSearch, themeToggle, headerAct
   const sidebarContent = (
     <>
       {/* Logo */}
-      <div className="flex items-center justify-between border-b p-4" style={{ borderColor: 'var(--border)' }}>
-        <Link to="/apps" className="flex items-center gap-3" style={{ color: 'var(--text)' }}>
+      <div className="flex items-center justify-between border-b p-4 border-line">
+        <Link to="/apps" className="flex items-center gap-3 !text-fg">
           <LogoMark />
           <div>
             <h1 className="text-lg font-bold leading-tight" style={{ fontFamily: 'var(--mono)', letterSpacing: 1 }}>
               DROP
             </h1>
-            <p className="text-xs" style={{ color: 'var(--text-3)' }}>
+            <p className="text-xs text-faint">
               Dashboard
             </p>
           </div>
         </Link>
         <button
           onClick={closeSidebar}
-          className="md:hidden"
-          style={{ color: 'var(--text-3)' }}
+          className="md:hidden text-faint"
           aria-label="Close menu"
         >
           <X className="h-5 w-5" />
@@ -87,8 +86,7 @@ function AppShell({ sidebarNav, breadcrumb, headerSearch, themeToggle, headerAct
 
       {/* Daemon-status footer */}
       <div
-        className="flex items-center gap-2 border-t px-4 py-3 text-xs"
-        style={{ borderColor: 'var(--border)', color: 'var(--text-3)', fontFamily: 'var(--mono)' }}
+        className="flex items-center gap-2 border-t px-4 py-3 text-xs border-line text-faint font-mono"
       >
         <span
           className="inline-block h-1.5 w-1.5 rounded-full"
@@ -101,7 +99,7 @@ function AppShell({ sidebarNav, breadcrumb, headerSearch, themeToggle, headerAct
   );
 
   return (
-    <div className="drop-ui flex h-screen overflow-hidden" style={{ background: 'var(--bg)', color: 'var(--text)' }}>
+    <div className="drop-ui flex h-screen overflow-hidden bg-surface text-fg">
       {/* Cmd-K palette. Lives in the shell so it is available on every
           authenticated page and nowhere else. */}
       <CommandPalette />
@@ -117,18 +115,16 @@ function AppShell({ sidebarNav, breadcrumb, headerSearch, themeToggle, headerAct
 
       {/* Sidebar — desktop */}
       <aside
-        className="hidden h-screen w-[236px] flex-shrink-0 flex-col border-r md:flex"
-        style={{ background: 'var(--bg-2)', borderColor: 'var(--border)' }}
+        className="hidden h-screen w-[236px] flex-shrink-0 flex-col border-r md:flex bg-surface-2 border-line"
       >
         {sidebarContent}
       </aside>
 
       {/* Sidebar — mobile drawer */}
       <aside
-        className={`fixed inset-y-0 left-0 z-50 flex w-[236px] flex-col border-r transition-transform duration-200 md:hidden ${
+        className={`fixed inset-y-0 left-0 z-50 flex w-[236px] flex-col border-r border-line bg-surface-2 transition-transform duration-200 md:hidden ${
           sidebarOpen ? 'translate-x-0' : '-translate-x-full'
         }`}
-        style={{ background: 'var(--bg-2)', borderColor: 'var(--border)' }}
       >
         {sidebarContent}
       </aside>
@@ -146,8 +142,7 @@ function AppShell({ sidebarNav, breadcrumb, headerSearch, themeToggle, headerAct
         >
           <button
             onClick={() => setSidebarOpen(true)}
-            className="md:hidden"
-            style={{ color: 'var(--text-2)' }}
+            className="md:hidden text-muted"
             aria-label="Open menu"
           >
             <Menu className="h-5 w-5" />

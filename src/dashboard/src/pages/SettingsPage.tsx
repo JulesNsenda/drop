@@ -69,8 +69,7 @@ function SectionCard({
       }
     >
       <div
-        className="flex items-center gap-2 border-b px-4 py-3"
-        style={{ borderColor: 'var(--border)' }}
+        className="flex items-center gap-2 border-b px-4 py-3 border-line"
       >
         {Icon && (
           <Icon className="h-4 w-4" style={{ color: danger ? 'var(--err)' : 'var(--text-3)' }} />
@@ -346,10 +345,10 @@ function SettingsPage() {
   return (
     <div className="p-6">
       <div className="mb-6">
-        <h1 className="text-2xl font-bold" style={{ color: 'var(--text)' }}>
+        <h1 className="text-2xl font-bold text-fg">
           Settings
         </h1>
-        <p className="mt-1 text-sm" style={{ color: 'var(--text-2)' }}>
+        <p className="mt-1 text-sm text-muted">
           Platform health, configuration, and status
         </p>
       </div>
@@ -372,13 +371,12 @@ function SettingsPage() {
                 <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
                   <div className="flex items-center gap-3">
                     <div
-                      className="flex h-10 w-10 items-center justify-center rounded-lg"
-                      style={{ background: 'var(--accent-soft)' }}
+                      className="flex h-10 w-10 items-center justify-center rounded-lg bg-accent-soft"
                     >
-                      <Server className="h-5 w-5" style={{ color: 'var(--accent)' }} />
+                      <Server className="h-5 w-5 text-accent" />
                     </div>
                     <div>
-                      <p className="text-xs" style={{ color: 'var(--text-3)' }}>
+                      <p className="text-xs text-faint">
                         Platform
                       </p>
                       <p
@@ -392,16 +390,15 @@ function SettingsPage() {
 
                   <div className="flex items-center gap-3">
                     <div
-                      className="flex h-10 w-10 items-center justify-center rounded-lg"
-                      style={{ background: 'var(--accent-soft)' }}
+                      className="flex h-10 w-10 items-center justify-center rounded-lg bg-accent-soft"
                     >
-                      <HardDrive className="h-5 w-5" style={{ color: 'var(--accent)' }} />
+                      <HardDrive className="h-5 w-5 text-accent" />
                     </div>
                     <div>
-                      <p className="text-xs" style={{ color: 'var(--text-3)' }}>
+                      <p className="text-xs text-faint">
                         Uptime
                       </p>
-                      <p className="text-sm font-medium" style={{ color: 'var(--text)' }}>
+                      <p className="text-sm font-medium text-fg">
                         {formatUptime(health.uptime)}
                       </p>
                     </div>
@@ -409,13 +406,12 @@ function SettingsPage() {
 
                   <div className="flex items-center gap-3">
                     <div
-                      className="flex h-10 w-10 items-center justify-center rounded-lg"
-                      style={{ background: 'var(--accent-soft)' }}
+                      className="flex h-10 w-10 items-center justify-center rounded-lg bg-accent-soft"
                     >
-                      <Activity className="h-5 w-5" style={{ color: 'var(--accent)' }} />
+                      <Activity className="h-5 w-5 text-accent" />
                     </div>
                     <div>
-                      <p className="text-xs" style={{ color: 'var(--text-3)' }}>
+                      <p className="text-xs text-faint">
                         Process Manager
                       </p>
                       <p
@@ -431,13 +427,12 @@ function SettingsPage() {
 
                   <div className="flex items-center gap-3">
                     <div
-                      className="flex h-10 w-10 items-center justify-center rounded-lg"
-                      style={{ background: 'var(--accent-soft)' }}
+                      className="flex h-10 w-10 items-center justify-center rounded-lg bg-accent-soft"
                     >
-                      <Database className="h-5 w-5" style={{ color: 'var(--accent)' }} />
+                      <Database className="h-5 w-5 text-accent" />
                     </div>
                     <div>
-                      <p className="text-xs" style={{ color: 'var(--text-3)' }}>
+                      <p className="text-xs text-faint">
                         Database
                       </p>
                       <p
@@ -452,25 +447,23 @@ function SettingsPage() {
                   </div>
                 </div>
               ) : (
-                <p style={{ color: 'var(--text-2)' }}>Unable to fetch system status</p>
+                <p className="text-muted">Unable to fetch system status</p>
               )}
             </SectionCard>
 
             {/* Component Details */}
             {health && (
               <SectionCard title="Component Details">
-                <div className="-m-4 divide-y" style={{ borderColor: 'var(--border)' }}>
+                <div className="-m-4 divide-y border-line">
                   {Object.entries(health.components || {}).map(([name, comp]) => (
                     <div
                       key={name}
-                      className="flex items-center justify-between px-4 py-3"
-                      style={{ borderColor: 'var(--border)' }}
+                      className="flex items-center justify-between px-4 py-3 border-line"
                     >
                       <div className="flex items-center gap-3">
                         <StatusIcon status={comp?.status || 'unknown'} />
                         <span
-                          className="text-sm font-medium capitalize"
-                          style={{ color: 'var(--text-2)' }}
+                          className="text-sm font-medium capitalize text-muted"
                         >
                           {name.replace(/([A-Z])/g, ' $1').trim()}
                         </span>
@@ -483,7 +476,7 @@ function SettingsPage() {
                           {comp?.status || 'unknown'}
                         </span>
                         {comp?.message && (
-                          <p className="text-xs" style={{ color: 'var(--text-3)' }}>
+                          <p className="text-xs text-faint">
                             {comp.message}
                           </p>
                         )}
@@ -499,7 +492,7 @@ function SettingsPage() {
               {appChecksLoading ? (
                 <SkeletonLines />
               ) : appChecks.length === 0 ? (
-                <p className="text-sm" style={{ color: 'var(--text-2)' }}>
+                <p className="text-sm text-muted">
                   No running apps to check
                 </p>
               ) : (
@@ -507,16 +500,15 @@ function SettingsPage() {
                   {appChecks.map(app => (
                     <div
                       key={app.name}
-                      className="flex items-center justify-between rounded-lg px-3 py-2"
-                      style={{ background: 'var(--bg-2)' }}
+                      className="flex items-center justify-between rounded-lg px-3 py-2 bg-surface-2"
                     >
                       <div className="flex items-center gap-3">
                         <StatusIcon status={app.healthy ? 'up' : 'down'} />
-                        <span className="text-sm font-medium" style={{ color: 'var(--text-2)' }}>
+                        <span className="text-sm font-medium text-muted">
                           {app.name}
                         </span>
                         {app.port && (
-                          <span className="font-mono text-xs" style={{ color: 'var(--text-3)' }}>
+                          <span className="font-mono text-xs text-faint">
                             :{app.port}
                           </span>
                         )}
@@ -536,37 +528,36 @@ function SettingsPage() {
             {/* Configuration */}
             <SectionCard title="Configuration">
               <table className="w-full text-sm">
-                <tbody className="divide-y" style={{ borderColor: 'var(--border)' }}>
-                  <tr style={{ borderColor: 'var(--border)' }}>
-                    <td className="py-2" style={{ color: 'var(--text-2)' }}>
+                <tbody className="divide-y border-line">
+                  <tr className="border-line">
+                    <td className="py-2 text-muted">
                       Version
                     </td>
-                    <td className="py-2 font-mono" style={{ color: 'var(--text)' }}>
+                    <td className="py-2 font-mono text-fg">
                       {health?.version || '0.6.0'}
                     </td>
                   </tr>
-                  <tr style={{ borderColor: 'var(--border)' }}>
-                    <td className="py-2" style={{ color: 'var(--text-2)' }}>
+                  <tr className="border-line">
+                    <td className="py-2 text-muted">
                       Apps Directory
                     </td>
-                    <td className="py-2 font-mono text-xs" style={{ color: 'var(--text)' }}>
+                    <td className="py-2 font-mono text-xs text-fg">
                       {health?.system?.appsDirectory ?? '—'}
                     </td>
                   </tr>
-                  <tr style={{ borderColor: 'var(--border)' }}>
-                    <td className="py-2" style={{ color: 'var(--text-2)' }}>
+                  <tr className="border-line">
+                    <td className="py-2 text-muted">
                       API Endpoint
                     </td>
                     <td
-                      className="py-2 font-mono text-xs"
-                      style={{ color: 'var(--text)' }}
+                      className="py-2 font-mono text-xs text-fg"
                     >{`${window.location.origin}/api/v1`}</td>
                   </tr>
-                  <tr style={{ borderColor: 'var(--border)' }}>
-                    <td className="py-2" style={{ color: 'var(--text-2)' }}>
+                  <tr className="border-line">
+                    <td className="py-2 text-muted">
                       Node.js
                     </td>
-                    <td className="py-2 font-mono text-xs" style={{ color: 'var(--text)' }}>
+                    <td className="py-2 font-mono text-xs text-fg">
                       {typeof process !== 'undefined' ? 'Runtime' : 'N/A'}
                     </td>
                   </tr>
@@ -628,7 +619,7 @@ function SettingsPage() {
                 <div>
                   {mfaEnabled ? (
                     <div>
-                      <p className="mb-3 text-sm" style={{ color: 'var(--text-2)' }}>
+                      <p className="mb-3 text-sm text-muted">
                         Two-factor authentication is active. Your account requires a code from your
                         authenticator app on each login.
                       </p>
@@ -645,7 +636,7 @@ function SettingsPage() {
                     </div>
                   ) : (
                     <div>
-                      <p className="mb-3 text-sm" style={{ color: 'var(--text-2)' }}>
+                      <p className="mb-3 text-sm text-muted">
                         Add an extra layer of security to your account. You'll need an authenticator
                         app (Google Authenticator, Authy, 1Password, etc.).
                       </p>
@@ -661,7 +652,7 @@ function SettingsPage() {
               {mfaStep === 'setup' && (
                 <form onSubmit={handleMfaEnable} className="max-w-sm space-y-4">
                   <div>
-                    <p className="mb-2 text-sm font-medium" style={{ color: 'var(--text-2)' }}>
+                    <p className="mb-2 text-sm font-medium text-muted">
                       1. Scan this QR code with your authenticator app
                     </p>
                     {mfaQrDataUrl ? (
@@ -673,15 +664,14 @@ function SettingsPage() {
                       />
                     ) : (
                       <div
-                        className="flex h-48 w-48 items-center justify-center rounded-lg"
-                        style={{ background: 'var(--bg-2)' }}
+                        className="flex h-48 w-48 items-center justify-center rounded-lg bg-surface-2"
                       >
-                        <span className="text-xs" style={{ color: 'var(--text-3)' }}>
+                        <span className="text-xs text-faint">
                           Generating...
                         </span>
                       </div>
                     )}
-                    <p className="mt-2 text-xs" style={{ color: 'var(--text-3)' }}>
+                    <p className="mt-2 text-xs text-faint">
                       Can't scan? Enter this secret manually:
                     </p>
                     <code className="mt-1 block break-all">{mfaSetupSecret}</code>
@@ -689,8 +679,7 @@ function SettingsPage() {
 
                   <div>
                     <label
-                      className="mb-1 block text-sm font-medium"
-                      style={{ color: 'var(--text-2)' }}
+                      className="mb-1 block text-sm font-medium text-muted"
                     >
                       2. Enter the 6-digit code to confirm
                     </label>
@@ -709,8 +698,7 @@ function SettingsPage() {
 
                   <div>
                     <label
-                      className="mb-1 block text-sm font-medium"
-                      style={{ color: 'var(--text-2)' }}
+                      className="mb-1 block text-sm font-medium text-muted"
                     >
                       3. Confirm your account password
                     </label>
@@ -744,7 +732,7 @@ function SettingsPage() {
                     </Button>
                   </div>
 
-                  <p className="text-xs" style={{ color: 'var(--text-3)' }}>
+                  <p className="text-xs text-faint">
                     Lost your device? Run <code>drop mfa disable &lt;username&gt;</code> on the server
                     to recover access.
                   </p>
@@ -753,14 +741,13 @@ function SettingsPage() {
 
               {mfaStep === 'disable' && (
                 <form onSubmit={handleMfaDisable} className="max-w-sm space-y-4">
-                  <p className="text-sm" style={{ color: 'var(--text-2)' }}>
+                  <p className="text-sm text-muted">
                     Enter a current code from your authenticator app to disable two-factor
                     authentication.
                   </p>
                   <div>
                     <label
-                      className="mb-1 block text-sm font-medium"
-                      style={{ color: 'var(--text-2)' }}
+                      className="mb-1 block text-sm font-medium text-muted"
                     >
                       Authentication code
                     </label>
@@ -806,10 +793,10 @@ function SettingsPage() {
               <SectionCard title="Danger Zone" danger>
                 <div className="flex items-center justify-between">
                   <div>
-                    <p className="text-sm font-medium" style={{ color: 'var(--text)' }}>
+                    <p className="text-sm font-medium text-fg">
                       Delete account
                     </p>
-                    <p className="text-xs" style={{ color: 'var(--text-3)' }}>
+                    <p className="text-xs text-faint">
                       Permanently remove your account and all your apps
                     </p>
                   </div>
@@ -867,7 +854,7 @@ function SettingsPage() {
             {activityLoading ? (
               <SkeletonLines />
             ) : activity.length === 0 ? (
-              <p className="text-sm" style={{ color: 'var(--text-2)' }}>
+              <p className="text-sm text-muted">
                 No activity yet
               </p>
             ) : (
@@ -875,20 +862,19 @@ function SettingsPage() {
                 {activity.map(a => (
                   <div key={a.id} className="flex items-center justify-between py-1.5 text-sm">
                     <div>
-                      <span className="font-medium" style={{ color: 'var(--text-2)' }}>
+                      <span className="font-medium text-muted">
                         {a.username || 'system'}
                       </span>
-                      <span style={{ color: 'var(--text-2)' }}> {a.action}</span>
-                      {a.appName && <span style={{ color: 'var(--accent)' }}> {a.appName}</span>}
+                      <span className="text-muted"> {a.action}</span>
+                      {a.appName && <span className="text-accent"> {a.appName}</span>}
                       {a.detail && (
-                        <span className="ml-1 text-xs" style={{ color: 'var(--text-3)' }}>
+                        <span className="ml-1 text-xs text-faint">
                           ({a.detail})
                         </span>
                       )}
                     </div>
                     <span
-                      className="ml-4 whitespace-nowrap text-xs"
-                      style={{ color: 'var(--text-3)' }}
+                      className="ml-4 whitespace-nowrap text-xs text-faint"
                     >
                       {new Date(a.timestamp).toLocaleString()}
                     </span>
@@ -904,7 +890,7 @@ function SettingsPage() {
       {activeTab === 'about' && (
         <TabPanel id="about">
           <SectionCard title="About DROP">
-            <p className="mb-4 text-sm" style={{ color: 'var(--text-2)' }}>
+            <p className="mb-4 text-sm text-muted">
               DROP (Deploy, Run, Operate, Publish) is a lightweight, self-hosted PaaS for
               zero-configuration deployments. Drop a folder and get a running application.
             </p>

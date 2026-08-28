@@ -450,12 +450,12 @@ function DeployPage() {
               className="mx-auto mb-5 flex h-14 w-14 items-center justify-center rounded-full"
               style={{ background: 'color-mix(in srgb, var(--ok) 15%, transparent)' }}
             >
-              <CheckCircle className="h-7 w-7" style={{ color: 'var(--ok)' }} />
+              <CheckCircle className="h-7 w-7 text-ok" />
             </div>
-            <h2 className="mb-2 text-xl font-semibold" style={{ color: 'var(--text)' }}>
+            <h2 className="mb-2 text-xl font-semibold text-fg">
               Deployment started
             </h2>
-            <p className="mb-6 text-sm leading-relaxed" style={{ color: 'var(--text-2)' }}>
+            <p className="mb-6 text-sm leading-relaxed text-muted">
               {message}
             </p>
             <div className="flex flex-col justify-center gap-3 sm:flex-row">
@@ -487,12 +487,12 @@ function DeployPage() {
               className="mx-auto mb-5 flex h-14 w-14 items-center justify-center rounded-full"
               style={{ background: 'color-mix(in srgb, var(--err) 15%, transparent)' }}
             >
-              <AlertCircle className="h-7 w-7" style={{ color: 'var(--err)' }} />
+              <AlertCircle className="h-7 w-7 text-err" />
             </div>
-            <h2 className="mb-2 text-xl font-semibold" style={{ color: 'var(--text)' }}>
+            <h2 className="mb-2 text-xl font-semibold text-fg">
               Deployment failed
             </h2>
-            <p className="mb-6 text-sm leading-relaxed" style={{ color: 'var(--text-2)' }}>
+            <p className="mb-6 text-sm leading-relaxed text-muted">
               {message}
             </p>
             {/* Clear the upload-derived display state too, not just the
@@ -524,10 +524,10 @@ function DeployPage() {
     <div className="p-6">
       {/* Header */}
       <div className="mb-6">
-        <h1 className="text-2xl font-bold" style={{ color: 'var(--text)' }}>
+        <h1 className="text-2xl font-bold text-fg">
           Deploy
         </h1>
-        <p className="mt-1 text-sm" style={{ color: 'var(--text-2)' }}>
+        <p className="mt-1 text-sm text-muted">
           Deploy a new application from GitHub or by uploading files
         </p>
       </div>
@@ -603,10 +603,9 @@ function DeployPage() {
             {/* Token manager panel */}
             {showTokenForm && (
               <div
-                className="space-y-3 rounded-lg border p-4"
-                style={{ background: 'var(--bg-2)', borderColor: 'var(--border)' }}
+                className="space-y-3 rounded-lg border p-4 bg-surface-2 border-line"
               >
-                <h3 className="text-sm font-medium" style={{ color: 'var(--text-2)' }}>
+                <h3 className="text-sm font-medium text-muted">
                   Manage tokens
                 </h3>
                 {tokens.length > 0 && (
@@ -617,7 +616,7 @@ function DeployPage() {
                         className="flex items-center justify-between rounded px-2 py-1.5"
                         style={{ background: 'var(--bg-3)', border: '1px solid var(--border)' }}
                       >
-                        <span className="text-sm" style={{ color: 'var(--text-2)' }}>
+                        <span className="text-sm text-muted">
                           {t.name}
                         </span>
                         <button
@@ -625,8 +624,7 @@ function DeployPage() {
                           onClick={() => handleDeleteToken(t.id)}
                           title="Delete token"
                           aria-label="Delete token"
-                          className="transition-colors hover:text-[var(--err)]"
-                          style={{ color: 'var(--text-3)' }}
+                          className="transition-colors hover:text-[var(--err)] text-faint"
                         >
                           <Trash2 className="h-3.5 w-3.5" />
                         </button>
@@ -660,7 +658,7 @@ function DeployPage() {
                     <Plus className="h-4 w-4" />
                   </button>
                 </div>
-                <p className="text-xs" style={{ color: 'var(--text-3)' }}>
+                <p className="text-xs text-faint">
                   Use a fine-grained PAT with <code>Contents: Read</code> permission.
                 </p>
               </div>
@@ -677,11 +675,11 @@ function DeployPage() {
                 style={{ accentColor: 'var(--accent)' }}
                 disabled={status === 'deploying'}
               />
-              <label htmlFor="autoRedeploy" className="text-sm" style={{ color: 'var(--text-2)' }}>
+              <label htmlFor="autoRedeploy" className="text-sm text-muted">
                 Auto-redeploy when code is pushed (via GitHub webhook)
               </label>
             </div>
-            <p className="-mt-2 text-xs" style={{ color: 'var(--text-3)' }}>
+            <p className="-mt-2 text-xs text-faint">
               {/* The Git webhooks settings tab is admin-only — don't deep-link
                   non-admins to a tab they can't open (SettingsPage would
                   silently fall back to the Account tab). */}
@@ -757,25 +755,24 @@ function DeployPage() {
               {status === 'deploying' ? (
                 <>
                   <Loader2
-                    className="mx-auto mb-3 h-10 w-10 animate-spin"
-                    style={{ color: 'var(--accent)' }}
+                    className="mx-auto mb-3 h-10 w-10 animate-spin text-accent"
                   />
-                  <p className="text-sm font-medium" style={{ color: 'var(--text)' }}>
+                  <p className="text-sm font-medium text-fg">
                     {deployStep || 'Uploading and deploying...'}
                   </p>
                   {(uploadFileCount > 0 || uploadSkipped.length > 0) && (
-                    <p className="mt-1 text-xs" style={{ color: 'var(--text-2)' }}>
+                    <p className="mt-1 text-xs text-muted">
                       {uploadFileCount} file{uploadFileCount === 1 ? '' : 's'}, {formatBytes(uploadBytes)} compressed
                     </p>
                   )}
                 </>
               ) : (
                 <>
-                  <FolderUp className="mx-auto mb-3 h-10 w-10" style={{ color: 'var(--text-3)' }} />
-                  <p className="mb-1 text-sm font-medium" style={{ color: 'var(--text)' }}>
+                  <FolderUp className="mx-auto mb-3 h-10 w-10 text-faint" />
+                  <p className="mb-1 text-sm font-medium text-fg">
                     Click to choose your app's folder, or drag &amp; drop files here
                   </p>
-                  <p className="text-xs" style={{ color: 'var(--text-2)' }}>
+                  <p className="text-xs text-muted">
                     A folder is expected — <code>.git</code> and <code>node_modules</code> are excluded
                     automatically.
                   </p>
@@ -789,10 +786,9 @@ function DeployPage() {
                 visible rather than a silent difference). */}
             {uploadSkipped.length > 0 && (
               <div
-                className="rounded-lg border p-3 text-xs"
-                style={{ background: 'var(--bg-2)', borderColor: 'var(--border)', color: 'var(--text-3)' }}
+                className="rounded-lg border p-3 text-xs bg-surface-2 border-line text-faint"
               >
-                <p className="mb-1 font-medium" style={{ color: 'var(--text-2)' }}>
+                <p className="mb-1 font-medium text-muted">
                   Skipped {uploadSkipped.length} path{uploadSkipped.length === 1 ? '' : 's'} (.git, node_modules)
                 </p>
                 <ul className="space-y-0.5 font-mono">
@@ -808,7 +804,7 @@ function DeployPage() {
 
             {/* Loose-file fallback */}
             {status !== 'deploying' && (
-              <p className="-mt-3 text-center text-xs" style={{ color: 'var(--text-3)' }}>
+              <p className="-mt-3 text-center text-xs text-faint">
                 Not a folder?{' '}
                 <button type="button" onClick={() => fileInputRef.current?.click()} className="underline">
                   Select individual files instead
@@ -820,12 +816,10 @@ function DeployPage() {
             {/* CLI hint */}
             {filesystemHint && (
               <div
-                className="rounded-lg border p-4"
-                style={{ background: 'var(--bg-2)', borderColor: 'var(--border)' }}
+                className="rounded-lg border p-4 bg-surface-2 border-line"
               >
                 <p
-                  className="mb-2 text-xs font-medium uppercase tracking-wide"
-                  style={{ color: 'var(--text-3)' }}
+                  className="mb-2 text-xs font-medium uppercase tracking-wide text-faint"
                 >
                   Or deploy via filesystem
                 </p>

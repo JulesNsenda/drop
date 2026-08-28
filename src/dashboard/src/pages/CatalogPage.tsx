@@ -60,7 +60,7 @@ function ExtensionCard({ extension }: { extension: ExtensionDescriptor }) {
     <Card className="flex flex-col gap-3">
       <div className="flex items-start justify-between gap-3">
         <div className="min-w-0">
-          <h3 className="truncate font-semibold" style={{ color: 'var(--text)' }}>
+          <h3 className="truncate font-semibold text-fg">
             {extension.displayName}
           </h3>
           <Badge tone="neutral" className="mt-1">
@@ -70,11 +70,11 @@ function ExtensionCard({ extension }: { extension: ExtensionDescriptor }) {
         <Badge tone={availability.tone}>{availability.label}</Badge>
       </div>
 
-      <p className="text-sm" style={{ color: 'var(--text-2)' }}>
+      <p className="text-sm text-muted">
         {extension.summary}
       </p>
 
-      <p className="text-sm" style={{ color: 'var(--text-3)' }}>
+      <p className="text-sm text-faint">
         {availability.detail}
       </p>
 
@@ -83,12 +83,11 @@ function ExtensionCard({ extension }: { extension: ExtensionDescriptor }) {
           render, not this component. */}
       {availability.canAdd && extension.snippet && (
         <div>
-          <span className="mb-1 block text-xs font-medium uppercase" style={{ color: 'var(--text-3)' }}>
+          <span className="mb-1 block text-xs font-medium uppercase text-faint">
             drop.yaml
           </span>
           <pre
-            className="overflow-x-auto rounded-lg p-3 text-xs"
-            style={{ background: 'var(--bg-2)', color: 'var(--text)' }}
+            className="overflow-x-auto rounded-lg p-3 text-xs bg-surface-2 text-fg"
           >
             <code>{extension.snippet}</code>
           </pre>
@@ -110,7 +109,7 @@ function ExtensionCard({ extension }: { extension: ExtensionDescriptor }) {
           the honest answer to "how do I use this?" when the answer is
           "nothing to do". */}
       {extension.detection && (
-        <p className="text-sm" style={{ color: 'var(--text-2)' }}>
+        <p className="text-sm text-muted">
           {extension.detection}
         </p>
       )}
@@ -120,8 +119,7 @@ function ExtensionCard({ extension }: { extension: ExtensionDescriptor }) {
           href={extension.docsUrl}
           target="_blank"
           rel="noopener noreferrer"
-          className="inline-flex items-center gap-1.5 text-sm hover:underline"
-          style={{ color: 'var(--accent)' }}
+          className="inline-flex items-center gap-1.5 text-sm hover:underline text-accent"
         >
           <ExternalLink className="h-3.5 w-3.5" />
           Docs
@@ -179,10 +177,10 @@ function CatalogPage() {
       {/* Header */}
       <div className="mb-6 flex items-center justify-between gap-3">
         <div>
-          <h1 className="text-2xl font-bold" style={{ color: 'var(--text)' }}>
+          <h1 className="text-2xl font-bold text-fg">
             Catalog
           </h1>
-          <p style={{ color: 'var(--text-2)' }}>
+          <p className="text-muted">
             Backing services and app types DROP can build. Copy a snippet into your app&apos;s
             drop.yaml to use one.
           </p>
@@ -202,8 +200,7 @@ function CatalogPage() {
           {/* Search */}
           <div className="relative max-w-md flex-1">
             <Search
-              className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2"
-              style={{ color: 'var(--text-3)' }}
+              className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-faint"
             />
             <input
               type="text"
@@ -216,7 +213,7 @@ function CatalogPage() {
 
           {/* Kind filter */}
           <div className="flex flex-wrap items-center gap-2">
-            <Filter className="h-4 w-4" style={{ color: 'var(--text-3)' }} />
+            <Filter className="h-4 w-4 text-faint" />
             <div className="flex flex-wrap gap-1">
               {KIND_OPTIONS.map(opt => (
                 <button
@@ -260,7 +257,7 @@ function CatalogPage() {
           aria-hidden="true"
         >
           {[0, 1, 2, 3, 4, 5].map(i => (
-            <div key={i} className="h-44 rounded-xl" style={{ background: 'var(--bg-2)' }} />
+            <div key={i} className="h-44 rounded-xl bg-surface-2" />
           ))}
         </div>
       )}

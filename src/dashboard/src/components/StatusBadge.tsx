@@ -35,8 +35,7 @@ function StatusBadge({ status }: StatusBadgeProps) {
     >
       {status === 'running' && (
         <span
-          className="w-2 h-2 mr-1.5 rounded-full animate-pulse"
-          style={{ background: 'var(--ok)' }}
+          className="w-2 h-2 mr-1.5 rounded-full animate-pulse bg-ok"
         />
       )}
       {statusLabels[status] || status}

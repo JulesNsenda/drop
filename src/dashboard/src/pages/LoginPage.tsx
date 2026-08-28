@@ -122,10 +122,10 @@ function LoginPage() {
   return (
     <AuthLayout>
       <div className="mb-6 text-center">
-        <h1 className="text-2xl font-semibold" style={{ color: 'var(--text)' }}>
+        <h1 className="text-2xl font-semibold text-fg">
           {step === 'totp' ? 'Two-factor authentication' : 'Sign in'}
         </h1>
-        <p className="mt-1 text-sm" style={{ color: 'var(--text-2)' }}>
+        <p className="mt-1 text-sm text-muted">
           {step === 'totp'
             ? 'Enter the 6-digit code from your authenticator app.'
             : 'Sign in to your dashboard.'}
@@ -228,9 +228,9 @@ function LoginPage() {
 
       {step === 'credentials' && (
         <div className="mt-4 space-y-2 text-center">
-          <p className="text-sm" style={{ color: 'var(--text-2)' }}>
+          <p className="text-sm text-muted">
             Don't have an account?{' '}
-            <Link to="/signup" className="font-medium" style={{ color: 'var(--accent)' }}>
+            <Link to="/signup" className="font-medium text-accent">
               Sign up
             </Link>
           </p>
@@ -243,8 +243,7 @@ function LoginPage() {
           {siteOrigin && (
             <a
               href={siteOrigin}
-              className="inline-flex items-center gap-1.5 text-sm transition-colors"
-              style={{ color: 'var(--text-2)' }}
+              className="inline-flex items-center gap-1.5 text-sm transition-colors !text-muted"
             >
               <ArrowLeft className="h-3.5 w-3.5" />
               Back to home

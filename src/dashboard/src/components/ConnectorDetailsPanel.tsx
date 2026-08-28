@@ -42,8 +42,7 @@ function CopyField({
         style={valueBoxStyle}
       >
         <code
-          className="flex-1 truncate text-sm"
-          style={{ fontFamily: 'var(--mono)', color: 'var(--text)' }}
+          className="flex-1 truncate text-sm font-mono text-fg"
         >
           {value}
         </code>
@@ -109,7 +108,7 @@ export default function ConnectorDetailsPanel({
       </p>
 
       <div>
-        <h3 className="mb-2 text-sm font-semibold" style={{ color: 'var(--text)' }}>
+        <h3 className="mb-2 text-sm font-semibold text-fg">
           Set it up in claude.ai
         </h3>
         <ol

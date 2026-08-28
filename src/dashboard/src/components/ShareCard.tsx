@@ -343,7 +343,7 @@ function ShareCard({ appName }: { appName: string }) {
   if (loadError) {
     return (
       <Card className="p-6">
-        <p className="text-sm" style={{ color: 'var(--err)' }}>
+        <p className="text-sm text-err">
           {loadError}
         </p>
       </Card>
@@ -441,8 +441,7 @@ function ShareCard({ appName }: { appName: string }) {
                 <span>{g.username ?? g.userId}</span>
                 <button
                   onClick={() => void revoke(g.userId, g.username ?? g.userId)}
-                  className="transition-opacity hover:opacity-70"
-                  style={{ color: 'var(--text-3)' }}
+                  className="transition-opacity hover:opacity-70 text-faint"
                   disabled={saving}
                   aria-label={`Revoke access for ${g.username ?? g.userId}`}
                 >
@@ -476,8 +475,7 @@ function ShareCard({ appName }: { appName: string }) {
                   {!g.disabled && (
                     <button
                       onClick={() => void invite(g.email, false)}
-                      className="text-xs transition-opacity hover:opacity-70"
-                      style={{ color: 'var(--text-3)' }}
+                      className="text-xs transition-opacity hover:opacity-70 text-faint"
                       disabled={saving || !g.email}
                       aria-label={`Resend invitation to ${g.email || g.guestId}`}
                     >
@@ -486,8 +484,7 @@ function ShareCard({ appName }: { appName: string }) {
                   )}
                   <button
                     onClick={() => void revokeGuest(g.guestId, g.email || g.guestId)}
-                    className="transition-opacity hover:opacity-70"
-                    style={{ color: 'var(--text-3)' }}
+                    className="transition-opacity hover:opacity-70 text-faint"
                     disabled={saving}
                     aria-label={`Revoke access for ${g.email || g.guestId}`}
                   >
@@ -500,7 +497,7 @@ function ShareCard({ appName }: { appName: string }) {
         )}
 
         {inviteLink && (
-          <div className="mt-4 rounded border px-3 py-2 text-sm" style={{ borderColor: 'var(--border)' }}>
+          <div className="mt-4 rounded border px-3 py-2 text-sm border-line">
             <p className="font-medium">No email was sent</p>
             <p className="mt-1 text-xs opacity-70">
               This platform has no outgoing mail configured, so you need to send{' '}

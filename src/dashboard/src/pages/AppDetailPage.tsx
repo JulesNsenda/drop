@@ -276,8 +276,8 @@ function AppDetailPage() {
     return (
       <div className="p-6">
         <div className="animate-pulse">
-          <div className="mb-4 h-8 w-48 rounded" style={{ background: 'var(--bg-2)' }} />
-          <div className="h-4 w-96 rounded" style={{ background: 'var(--bg-2)' }} />
+          <div className="mb-4 h-8 w-48 rounded bg-surface-2" />
+          <div className="h-4 w-96 rounded bg-surface-2" />
         </div>
       </div>
     );
@@ -293,8 +293,7 @@ function AppDetailPage() {
       <div className="p-6">
         <Link
           to="/apps"
-          className="mb-6 inline-flex items-center gap-2 text-sm transition-opacity hover:opacity-70"
-          style={{ color: 'var(--text-2)' }}
+          className="mb-6 inline-flex items-center gap-2 text-sm transition-opacity hover:opacity-70 !text-muted"
         >
           <ArrowLeft className="h-4 w-4" />
           Back to apps
@@ -318,8 +317,7 @@ function AppDetailPage() {
       {/* Back link */}
       <Link
         to="/apps"
-        className="mb-6 inline-flex items-center gap-2 text-sm transition-opacity hover:opacity-70"
-        style={{ color: 'var(--text-2)' }}
+        className="mb-6 inline-flex items-center gap-2 text-sm transition-opacity hover:opacity-70 !text-muted"
       >
         <ArrowLeft className="h-4 w-4" />
         Back to apps
@@ -345,12 +343,12 @@ function AppDetailPage() {
       <div className="mb-6 flex flex-wrap items-start justify-between gap-4">
         <div>
           <div className="mb-2 flex items-center gap-3">
-            <h1 className="text-2xl font-bold" style={{ color: 'var(--text)' }}>
+            <h1 className="text-2xl font-bold text-fg">
               {app.name}
             </h1>
             <StatusBadge status={app.status} />
           </div>
-          <p className="text-sm" style={{ color: 'var(--text-2)' }}>
+          <p className="text-sm text-muted">
             {app.type} application
             {app.framework && ` (${app.framework})`}
           </p>
@@ -364,7 +362,7 @@ function AppDetailPage() {
                 variant="secondary"
                 onClick={() => handleAction('restart')}
                 disabled={actionLoading !== null}
-                style={{ color: 'var(--warn)' }}
+                className="!text-warn"
               >
                 <RotateCw
                   className={`h-4 w-4 ${actionLoading === 'restart' ? 'animate-spin' : ''}`}
@@ -429,7 +427,7 @@ function AppDetailPage() {
                 variant="secondary"
                 onClick={handleRedeploy}
                 disabled={actionLoading !== null}
-                style={{ color: 'var(--accent)' }}
+                className="!text-accent"
                 title={
                   isGroupChild
                     ? `Re-pull and rebuild the whole ${app.group} monorepo group`
@@ -460,11 +458,11 @@ function AppDetailPage() {
             background: 'color-mix(in srgb, var(--warn) 10%, transparent)',
           }}
         >
-          <div className="mb-2 flex items-center gap-2" style={{ color: 'var(--warn)' }}>
+          <div className="mb-2 flex items-center gap-2 text-warn">
             <AlertTriangle className="h-4 w-4 flex-shrink-0" />
             <p className="text-sm font-medium">Waiting on required secrets</p>
           </div>
-          <p className="mb-3 text-sm" style={{ color: 'var(--text-2)' }}>
+          <p className="mb-3 text-sm text-muted">
             This app declared required secrets in its <code>drop.yaml</code> that aren&apos;t set
             yet, so DROP parked it instead of starting it.
             {app.missingSecrets && app.missingSecrets.length > 0
@@ -474,7 +472,7 @@ function AppDetailPage() {
           {app.missingSecrets && app.missingSecrets.length > 0 && (
             <ul className="mb-3 space-y-1">
               {app.missingSecrets.map(key => (
-                <li key={key} className="font-mono text-sm" style={{ color: 'var(--text)' }}>
+                <li key={key} className="font-mono text-sm text-fg">
                   {key}
                 </li>
               ))}
@@ -493,7 +491,7 @@ function AppDetailPage() {
               variant="secondary"
               onClick={() => handleAction('restart')}
               disabled={actionLoading !== null}
-              style={{ color: 'var(--warn)' }}
+              className="!text-warn"
             >
               <RotateCw
                 className={`h-4 w-4 ${actionLoading === 'restart' ? 'animate-spin' : ''}`}
@@ -513,7 +511,7 @@ function AppDetailPage() {
           {/* Info cards */}
           <div className="mb-6 grid gap-4 md:grid-cols-3">
             <Card>
-              <div className="mb-1 flex items-center gap-2" style={{ color: 'var(--text-2)' }}>
+              <div className="mb-1 flex items-center gap-2 text-muted">
                 <ExternalLink className="h-4 w-4" />
                 <span className="text-sm">URL</span>
               </div>
@@ -527,7 +525,7 @@ function AppDetailPage() {
                   {appLinkInfo(app).label}
                 </a>
               ) : (
-                <span className="text-sm font-semibold" style={{ color: 'var(--text-3)' }}>
+                <span className="text-sm font-semibold text-faint">
                   Not assigned
                 </span>
               )}
@@ -535,11 +533,11 @@ function AppDetailPage() {
 
             {app.mcp ? (
               <Card>
-                <div className="mb-1 flex items-center gap-2" style={{ color: 'var(--text-2)' }}>
+                <div className="mb-1 flex items-center gap-2 text-muted">
                   <Plug className="h-4 w-4" />
                   <span className="text-sm">MCP endpoint</span>
                 </div>
-                <p className="break-all text-sm font-semibold" style={{ color: 'var(--text)' }}>
+                <p className="break-all text-sm font-semibold text-fg">
                   {app.mcp.url}
                 </p>
                 {/*
@@ -560,7 +558,7 @@ function AppDetailPage() {
                   is the tenant's DECLARATION, not proof of enforcement, so this
                   must not promise more than the declaration supports.
                 */}
-                <p className="mt-1 text-xs" style={{ color: 'var(--text-3)' }}>
+                <p className="mt-1 text-xs text-faint">
                   {app.mcp.auth === 'drop'
                     ? 'Guarded at the proxy — DROP verifies an audience-bound token on requests that arrive through it. Traffic reaching the app’s own port directly is not covered.'
                     : 'Public — DROP does not authenticate callers to this endpoint.'}
@@ -570,30 +568,29 @@ function AppDetailPage() {
 
             {isAdmin && app.path ? (
               <Card>
-                <div className="mb-1 flex items-center gap-2" style={{ color: 'var(--text-2)' }}>
+                <div className="mb-1 flex items-center gap-2 text-muted">
                   <Folder className="h-4 w-4" />
                   <span className="text-sm">Path</span>
                 </div>
                 <p
-                  className="truncate font-mono text-sm"
-                  style={{ color: 'var(--text)' }}
+                  className="truncate font-mono text-sm text-fg"
                   title={app.path}
                 >
                   {app.path}
                 </p>
                 {app.ownerName && (
-                  <p className="mt-1 text-xs" style={{ color: 'var(--text-2)' }}>
+                  <p className="mt-1 text-xs text-muted">
                     Owner: {app.ownerName}
                   </p>
                 )}
               </Card>
             ) : (
               <Card>
-                <div className="mb-1 flex items-center gap-2" style={{ color: 'var(--text-2)' }}>
+                <div className="mb-1 flex items-center gap-2 text-muted">
                   <Folder className="h-4 w-4" />
                   <span className="text-sm">Type</span>
                 </div>
-                <p className="text-sm capitalize" style={{ color: 'var(--text)' }}>
+                <p className="text-sm capitalize text-fg">
                   {app.type}
                   {app.framework ? ` (${app.framework})` : ''}
                 </p>
@@ -601,15 +598,15 @@ function AppDetailPage() {
             )}
 
             <Card>
-              <div className="mb-1 flex items-center gap-2" style={{ color: 'var(--text-2)' }}>
+              <div className="mb-1 flex items-center gap-2 text-muted">
                 <Clock className="h-4 w-4" />
                 <span className="text-sm">Last Deployed</span>
               </div>
-              <p className="text-sm" style={{ color: 'var(--text)' }}>
+              <p className="text-sm text-fg">
                 {formatDate(app.lastDeployedAt)}
               </p>
               {app.buildDuration && (
-                <p className="text-xs" style={{ color: 'var(--text-2)' }}>
+                <p className="text-xs text-muted">
                   Build: {app.buildDuration}ms
                 </p>
               )}
@@ -619,13 +616,13 @@ function AppDetailPage() {
           {/* Git source info */}
           {app.gitSource && (
             <Card className="mb-6">
-              <div className="mb-3 flex items-center gap-2" style={{ color: 'var(--text-2)' }}>
+              <div className="mb-3 flex items-center gap-2 text-muted">
                 <GitBranch className="h-4 w-4" />
                 <span className="text-sm font-medium">Git Source</span>
               </div>
               <div className="grid gap-3 text-sm md:grid-cols-2">
                 <div>
-                  <span style={{ color: 'var(--text-2)' }}>Repository: </span>
+                  <span className="text-muted">Repository: </span>
                   <a
                     href={app.gitSource.repoUrl}
                     target="_blank"
@@ -636,29 +633,29 @@ function AppDetailPage() {
                   </a>
                 </div>
                 <div>
-                  <span style={{ color: 'var(--text-2)' }}>Branch: </span>
-                  <span className="font-mono" style={{ color: 'var(--text)' }}>
+                  <span className="text-muted">Branch: </span>
+                  <span className="font-mono text-fg">
                     {app.gitSource.branch}
                   </span>
                 </div>
                 {app.gitSource.lastCommitSha && (
                   <div>
-                    <span style={{ color: 'var(--text-2)' }}>Commit: </span>
-                    <span className="font-mono" style={{ color: 'var(--text)' }}>
+                    <span className="text-muted">Commit: </span>
+                    <span className="font-mono text-fg">
                       {app.gitSource.lastCommitSha.slice(0, 7)}
                     </span>
                   </div>
                 )}
                 <div>
-                  <span style={{ color: 'var(--text-2)' }}>Auto-redeploy: </span>
-                  <span style={{ color: 'var(--text)' }}>
+                  <span className="text-muted">Auto-redeploy: </span>
+                  <span className="text-fg">
                     {app.gitSource.autoRedeploy ? 'Enabled' : 'Disabled'}
                   </span>
                 </div>
                 {isAdmin && (
                   <div>
-                    <span style={{ color: 'var(--text-2)' }}>Credential: </span>
-                    <span style={{ color: 'var(--text)' }}>{attachedTokenLabel}</span>
+                    <span className="text-muted">Credential: </span>
+                    <span className="text-fg">{attachedTokenLabel}</span>
                   </div>
                 )}
               </div>
@@ -700,17 +697,16 @@ function AppDetailPage() {
         <TabPanel id="environment">
           <Card padded={false}>
             <div
-              className="flex items-center border-b px-4 py-3"
-              style={{ borderColor: 'var(--border)' }}
+              className="flex items-center border-b px-4 py-3 border-line"
             >
-              <Key className="mr-2 h-4 w-4" style={{ color: 'var(--text-2)' }} />
-              <h2 className="font-semibold" style={{ color: 'var(--text)' }}>
+              <Key className="mr-2 h-4 w-4 text-muted" />
+              <h2 className="font-semibold text-fg">
                 Environment Variables
               </h2>
             </div>
             <div className="p-4">
               {envLoading ? (
-                <div className="h-8 animate-pulse rounded" style={{ background: 'var(--bg-2)' }} />
+                <div className="h-8 animate-pulse rounded bg-surface-2" />
               ) : (
                 <>
                   {envVars.length > 0 && (
@@ -718,22 +714,19 @@ function AppDetailPage() {
                       {envVars.map(key => (
                         <div key={key} className="flex items-center gap-2 text-sm">
                           <span
-                            className="min-w-[120px] font-mono font-medium"
-                            style={{ color: 'var(--text)' }}
+                            className="min-w-[120px] font-mono font-medium text-fg"
                           >
                             {key}
                           </span>
                           <span
-                            className="flex-1 truncate font-mono"
-                            style={{ color: 'var(--text-2)' }}
+                            className="flex-1 truncate font-mono text-muted"
                           >
                             ••••••••
                           </span>
                           {role !== 'readonly' && (
                             <button
                               onClick={() => handleRemoveEnvVar(key)}
-                              className="transition-opacity hover:opacity-70"
-                              style={{ color: 'var(--text-3)' }}
+                              className="transition-opacity hover:opacity-70 text-faint"
                               aria-label={`Remove ${key}`}
                             >
                               <X className="h-4 w-4" />
@@ -745,7 +738,7 @@ function AppDetailPage() {
                   )}
 
                   {envVars.length === 0 && (
-                    <p className="mb-4 text-sm" style={{ color: 'var(--text-2)' }}>
+                    <p className="mb-4 text-sm text-muted">
                       No environment variables set
                     </p>
                   )}
@@ -777,7 +770,7 @@ function AppDetailPage() {
                           Add
                         </Button>
                       </div>
-                      <p className="mt-2 text-xs" style={{ color: 'var(--text-2)' }}>
+                      <p className="mt-2 text-xs text-muted">
                         Changes take effect on next restart.
                       </p>
                     </>
@@ -838,7 +831,7 @@ function CustomDomainSection({
 
   return (
     <Card>
-      <div className="mb-3 flex items-center gap-2" style={{ color: 'var(--text-2)' }}>
+      <div className="mb-3 flex items-center gap-2 text-muted">
         <Globe className="h-4 w-4" />
         <span className="text-sm font-medium">Custom Domain</span>
       </div>
@@ -856,7 +849,7 @@ function CustomDomainSection({
         </Button>
       </div>
       {currentDomain && (
-        <p className="mt-2 text-xs" style={{ color: 'var(--text-2)' }}>
+        <p className="mt-2 text-xs text-muted">
           Point a CNAME record for <code>{currentDomain}</code> to your DROP server.
         </p>
       )}

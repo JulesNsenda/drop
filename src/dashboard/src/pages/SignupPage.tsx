@@ -51,10 +51,10 @@ function SignupPage() {
   return (
     <AuthLayout>
       <div className="mb-6 text-center">
-        <h1 className="text-2xl font-semibold" style={{ color: 'var(--text)' }}>
+        <h1 className="text-2xl font-semibold text-fg">
           Create account
         </h1>
-        <p className="mt-1 text-sm" style={{ color: 'var(--text-2)' }}>
+        <p className="mt-1 text-sm text-muted">
           Start deploying in seconds.
         </p>
       </div>
@@ -134,9 +134,9 @@ function SignupPage() {
       </Card>
 
       <div className="mt-4 space-y-2 text-center">
-        <p className="text-sm" style={{ color: 'var(--text-2)' }}>
+        <p className="text-sm text-muted">
           Already have an account?{' '}
-          <Link to="/login" className="font-medium" style={{ color: 'var(--accent)' }}>
+          <Link to="/login" className="font-medium text-accent">
             Sign in
           </Link>
         </p>
@@ -146,8 +146,7 @@ function SignupPage() {
         {siteOrigin && (
           <a
             href={siteOrigin}
-            className="inline-flex items-center gap-1.5 text-sm transition-colors"
-            style={{ color: 'var(--text-2)' }}
+            className="inline-flex items-center gap-1.5 text-sm transition-colors !text-muted"
           >
             <ArrowLeft className="h-3.5 w-3.5" />
             Back to home

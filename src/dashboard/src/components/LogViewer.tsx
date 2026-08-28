@@ -211,23 +211,22 @@ function LogViewer({ appName, appStatus }: { appName: string; appStatus?: string
 
   return (
     <div className="dui-card rounded-xl">
-      <div className="px-4 py-3 border-b" style={{ borderColor: 'var(--border)' }}>
+      <div className="px-4 py-3 border-b border-line">
         <div className="flex items-center justify-between flex-wrap gap-2">
           <div className="flex items-center gap-2">
-            <Terminal className="w-4 h-4" style={{ color: 'var(--text-2)' }} />
-            <h2 className="font-semibold" style={{ color: 'var(--text)' }}>
+            <Terminal className="w-4 h-4 text-muted" />
+            <h2 className="font-semibold text-fg">
               Logs
             </h2>
             {tab === 'runtime' && logsLoading && (
-              <span className="text-xs" style={{ color: 'var(--text-3)' }}>
+              <span className="text-xs text-faint">
                 (loading...)
               </span>
             )}
           </div>
           <div className="flex items-center gap-2">
             <div
-              className="flex rounded-lg border overflow-hidden"
-              style={{ borderColor: 'var(--border)' }}
+              className="flex rounded-lg border overflow-hidden border-line"
             >
               <button
                 onClick={() => setTab('runtime')}
@@ -257,8 +256,7 @@ function LogViewer({ appName, appStatus }: { appName: string; appStatus?: string
         {tab === 'runtime' && (
           <div className="flex items-center flex-wrap gap-2 mt-3">
             <div
-              className="flex rounded-lg border overflow-hidden"
-              style={{ borderColor: 'var(--border)' }}
+              className="flex rounded-lg border overflow-hidden border-line"
             >
               {(['all', 'out', 'err'] as const).map(s => (
                 <button
@@ -302,7 +300,7 @@ function LogViewer({ appName, appStatus }: { appName: string; appStatus?: string
               </button>
             </Tooltip>
             {filtered && (
-              <span className="text-xs" style={{ color: 'var(--text-3)' }}>
+              <span className="text-xs text-faint">
                 {visible.length} of {parsed.length} fetched lines
               </span>
             )}

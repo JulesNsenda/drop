@@ -92,22 +92,22 @@ export default function UserConnectorTab(): JSX.Element {
 
   return (
     <Card padded={false} className="mb-6">
-      <div className="flex items-center gap-2 border-b px-4 py-3" style={{ borderColor: 'var(--border)' }}>
-        <Plug className="h-4 w-4" style={{ color: 'var(--text-3)' }} />
-        <h2 className="font-semibold" style={{ color: 'var(--text)' }}>
+      <div className="flex items-center gap-2 border-b px-4 py-3 border-line">
+        <Plug className="h-4 w-4 text-faint" />
+        <h2 className="font-semibold text-fg">
           Claude (MCP) connector
         </h2>
       </div>
 
       <div className="space-y-4 p-4">
         <p className="text-sm" style={{ color: 'var(--text-2)', lineHeight: 1.7 }}>
-          Let <strong style={{ color: 'var(--text)' }}>claude.ai</strong> deploy and manage your own
+          Let <strong className="text-fg">claude.ai</strong> deploy and manage your own
           apps through the hosted MCP server. Add a custom connector in claude.ai with the values
           below &mdash; you sign in and consent, and only ever see your own apps.
         </p>
 
         {state.kind === 'loading' && (
-          <p className="text-sm" style={{ color: 'var(--text-3)' }}>
+          <p className="text-sm text-faint">
             Loading connector details&hellip;
           </p>
         )}
@@ -143,7 +143,7 @@ export default function UserConnectorTab(): JSX.Element {
 
         {state.kind === 'error' && (
           <div className="flex items-center justify-between gap-3">
-            <p className="text-sm" style={{ color: 'var(--err)' }}>
+            <p className="text-sm text-err">
               {state.message}
             </p>
             <Button variant="secondary" onClick={() => void load()}>
