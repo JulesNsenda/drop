@@ -84,5 +84,12 @@
     "ts-jest": "^29.2.0",
     "ts-node": "^10.9.0",
     "typescript": "^5.7.0"
+  },
+  "overrides": {
+    "js-yaml": "^4.3.1",
+    "@istanbuljs/load-nyc-config": {
+      "js-yaml": "^3.15.1"
+    },
+    "protobufjs": "^7.6.6"
   }
 }
