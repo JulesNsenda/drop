@@ -8,6 +8,15 @@ import { App } from '../hooks/useApi';
 import Button from '../components/ui/Button';
 import Card from '../components/ui/Card';
 import Badge from '../components/ui/Badge';
+import {
+  Table,
+  TableHead,
+  TableBody,
+  TableRow,
+  TableHeaderCell,
+  TableCell,
+} from '../components/ui/Table';
+import { cn } from '../lib/cn';
 import StatCard from '../components/ui/StatCard';
 
 interface UserInfo {
@@ -340,84 +349,54 @@ function UsersPage() {
       </div>
 
       <Card padded={false} className="overflow-hidden">
-        <table className="w-full text-sm">
-          <thead>
-            <tr
-              className="border-b"
-              style={{ borderColor: 'var(--border)', background: 'var(--bg-2)' }}
-            >
-              <th className="px-4 py-3 text-left font-medium" style={{ color: 'var(--text-3)' }}>
-                User
-              </th>
-              <th
-                className="hidden px-4 py-3 text-left font-medium md:table-cell"
-                style={{ color: 'var(--text-3)' }}
-              >
-                Email
-              </th>
-              <th className="px-4 py-3 text-left font-medium" style={{ color: 'var(--text-3)' }}>
-                Role
-              </th>
-              <th className="px-4 py-3 text-left font-medium" style={{ color: 'var(--text-3)' }}>
-                Apps
-              </th>
-              <th className="px-4 py-3 text-left font-medium" style={{ color: 'var(--text-3)' }}>
-                Last Login
-              </th>
-              <th className="px-4 py-3 text-left font-medium" style={{ color: 'var(--text-3)' }}>
-                Status
-              </th>
-              <th className="px-4 py-3 text-right font-medium" style={{ color: 'var(--text-3)' }}>
-                Actions
-              </th>
-            </tr>
-          </thead>
-          <tbody className="divide-y" style={{ borderColor: 'var(--border)' }}>
+        <Table>
+          <TableHead>
+            <TableRow header>
+              <TableHeaderCell>User</TableHeaderCell>
+              <TableHeaderCell className="hidden md:table-cell">Email</TableHeaderCell>
+              <TableHeaderCell>Role</TableHeaderCell>
+              <TableHeaderCell>Apps</TableHeaderCell>
+              <TableHeaderCell>Last Login</TableHeaderCell>
+              <TableHeaderCell>Status</TableHeaderCell>
+              <TableHeaderCell align="right">Actions</TableHeaderCell>
+            </TableRow>
+          </TableHead>
+          <TableBody>
             {users.map(u => (
-              <tr
+              <TableRow
                 key={u.id}
-                className="cursor-pointer transition-colors hover:bg-[var(--bg-2)]"
-                style={{ borderColor: 'var(--border)', opacity: u.enabled ? 1 : 0.5 }}
+                className={cn(
+                  'cursor-pointer transition-colors hover:bg-surface-2',
+                  !u.enabled && 'opacity-50'
+                )}
                 onClick={() => selectUser(u)}
               >
-                <td className="px-4 py-3">
+                <TableCell>
                   <div className="flex items-center gap-2">
-                    <Users className="h-4 w-4" style={{ color: 'var(--text-3)' }} />
-                    <span className="font-medium" style={{ color: 'var(--text)' }}>
-                      {u.username}
-                    </span>
+                    <Users className="h-4 w-4 text-faint" />
+                    <span className="font-medium text-fg">{u.username}</span>
                   </div>
-                </td>
-                <td
-                  className="hidden px-4 py-3 text-xs md:table-cell"
-                  style={{ color: 'var(--text-2)' }}
-                >
+                </TableCell>
+                <TableCell className="hidden text-xs text-muted md:table-cell">
                   {u.email || '-'}
-                </td>
-                <td className="px-4 py-3">
+                </TableCell>
+                <TableCell>
                   <Badge tone={u.role === 'admin' ? 'accent' : 'neutral'}>{u.role}</Badge>
-                </td>
-                <td className="px-4 py-3" style={{ color: 'var(--text-2)' }}>
-                  {u.appCount}
-                </td>
-                <td className="px-4 py-3 text-xs" style={{ color: 'var(--text-2)' }}>
-                  {formatDate(u.lastLogin)}
-                </td>
-                <td className="px-4 py-3">
-                  <span
-                    className="text-xs"
-                    style={{ color: u.enabled ? 'var(--ok)' : 'var(--err)' }}
-                  >
+                </TableCell>
+                <TableCell className="text-muted">{u.appCount}</TableCell>
+                <TableCell className="text-xs text-muted">{formatDate(u.lastLogin)}</TableCell>
+                <TableCell>
+                  <span className={cn('text-xs', u.enabled ? 'text-ok' : 'text-err')}>
                     {u.enabled ? 'Active' : 'Disabled'}
                   </span>
-                </td>
-                <td className="px-4 py-3 text-right" onClick={e => e.stopPropagation()}>
+                </TableCell>
+                <TableCell align="right" onClick={e => e.stopPropagation()}>
                   {u.role !== 'admin' && (
                     <button
                       onClick={() => toggleUser(u.id, !u.enabled)}
-                      className="transition-colors hover:text-[var(--text)]"
-                      style={{ color: 'var(--text-3)' }}
+                      className="dui-focus-ring rounded text-faint transition-colors hover:text-fg focus-visible:outline-none"
                       title={u.enabled ? 'Disable user' : 'Enable user'}
+                      aria-label={u.enabled ? `Disable ${u.username}` : `Enable ${u.username}`}
                     >
                       {u.enabled ? (
                         <ShieldOff className="h-4 w-4" />
@@ -426,11 +405,11 @@ function UsersPage() {
                       )}
                     </button>
                   )}
-                </td>
-              </tr>
+                </TableCell>
+              </TableRow>
             ))}
-          </tbody>
-        </table>
+          </TableBody>
+        </Table>
       </Card>
     </div>
   );
