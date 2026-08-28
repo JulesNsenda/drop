@@ -3,6 +3,7 @@ import { AlertTriangle, Lock, ShieldCheck, ShieldOff, Users } from 'lucide-react
 import { apiJsonWithStatus, jsonBody } from '../api/client';
 import { getAuthHeaders } from '../hooks/useAuth';
 import Card from './ui/Card';
+import { asArray } from '../lib/api-shape';
 import Button from './ui/Button';
 import Input from './ui/Input';
 
@@ -78,7 +79,7 @@ function AccessTab({ appName }: { appName: string }) {
       try {
         const res = await fetch('/api/v1/auth/users', { headers: getAuthHeaders() });
         const json = (await res.json()) as { success: boolean; data?: DirectoryUser[] };
-        if (json.success) setUsers(json.data ?? []);
+        if (json.success) setUsers(asArray(json.data));
       } catch {
         // A missing directory degrades the picker, not the page.
       }
