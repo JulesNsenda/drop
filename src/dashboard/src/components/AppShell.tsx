@@ -1,5 +1,6 @@
 import { ReactNode, useEffect, useState } from 'react';
 import { Link, useLocation } from 'react-router-dom';
+import CommandPalette from './CommandPalette';
 import { Menu, X } from 'lucide-react';
 
 export interface AppShellProps {
@@ -101,6 +102,9 @@ function AppShell({ sidebarNav, breadcrumb, headerSearch, themeToggle, headerAct
 
   return (
     <div className="drop-ui flex h-screen overflow-hidden" style={{ background: 'var(--bg)', color: 'var(--text)' }}>
+      {/* Cmd-K palette. Lives in the shell so it is available on every
+          authenticated page and nowhere else. */}
+      <CommandPalette />
       {/* Mobile overlay */}
       {sidebarOpen && (
         <div
