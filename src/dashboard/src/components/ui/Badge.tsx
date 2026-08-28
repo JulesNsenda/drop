@@ -1,37 +1,51 @@
 import { HTMLAttributes } from 'react';
+import { cva, type VariantProps } from 'class-variance-authority';
+import { cn } from '../../lib/cn';
 
-export type BadgeTone = 'neutral' | 'accent' | 'ok' | 'warn' | 'err';
+/**
+ * Generic status/role badge primitive (PRD-045, CVA-ised in DROP-156).
+ *
+ * Token-driven via `.drop-ui` (see styles/app-ui.css `.dui-badge-*`) — render
+ * inside a `.drop-ui` scope.
+ *
+ * This wraps the same semantic tones `StatusBadge` (components/StatusBadge.tsx)
+ * uses for app run-states — see `statusToTone` below — without rewriting that
+ * component. `StatusBadge` keeps its own existing color mapping.
+ */
+const badge = cva('inline-flex items-center gap-1.5 rounded-full font-medium', {
+  variants: {
+    tone: {
+      neutral: 'dui-badge-neutral',
+      accent: 'dui-badge-accent',
+      ok: 'dui-badge-ok',
+      warn: 'dui-badge-warn',
+      err: 'dui-badge-err',
+    },
+    size: {
+      sm: 'px-2 py-0.5 text-[11px]',
+      md: 'px-2.5 py-0.5 text-xs',
+    },
+  },
+  defaultVariants: { tone: 'neutral', size: 'md' },
+});
 
-export interface BadgeProps extends HTMLAttributes<HTMLSpanElement> {
-  tone?: BadgeTone;
+export type BadgeTone = NonNullable<VariantProps<typeof badge>['tone']>;
+
+export interface BadgeProps extends HTMLAttributes<HTMLSpanElement>, VariantProps<typeof badge> {
   /** Render a small leading dot in the badge's tone color (e.g. a live-status indicator). */
   dot?: boolean;
 }
 
-const TONE_CLASS: Record<BadgeTone, string> = {
-  neutral: 'dui-badge-neutral',
-  accent: 'dui-badge-accent',
-  ok: 'dui-badge-ok',
-  warn: 'dui-badge-warn',
-  err: 'dui-badge-err',
-};
-
-/**
- * Generic status/role badge primitive (PRD-045). Token-driven via `.drop-ui`
- * (see styles/app-ui.css `.dui-badge-*`) — render inside a `.drop-ui` scope.
- *
- * This wraps the same semantic tones `StatusBadge` (components/StatusBadge.tsx)
- * uses for app run-states — see `statusToTone` below — without rewriting that
- * component. `StatusBadge` keeps its own existing color mapping; pages may
- * adopt this primitive directly in a later PRD.
- */
-function Badge({ tone = 'neutral', dot = false, className = '', children, ...rest }: BadgeProps) {
+function Badge({ tone, size, dot = false, className, children, ...rest }: BadgeProps) {
   return (
-    <span
-      className={`inline-flex items-center gap-1.5 rounded-full px-2.5 py-0.5 text-xs font-medium ${TONE_CLASS[tone]} ${className}`}
-      {...rest}
-    >
-      {dot && <span className="h-1.5 w-1.5 rounded-full" style={{ background: 'currentColor' }} aria-hidden="true" />}
+    <span className={cn(badge({ tone, size }), className)} {...rest}>
+      {dot && (
+        <span
+          className="h-1.5 w-1.5 rounded-full"
+          style={{ background: 'currentColor' }}
+          aria-hidden="true"
+        />
+      )}
       {children}
     </span>
   );
