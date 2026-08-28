@@ -23,6 +23,7 @@ import {
   listApiKeys,
   verifyUserPassword,
 } from './auth';
+import { clockTick } from '../__testutils__/auth';
 
 const PASSWORD = 'pw-bob-123456';
 
@@ -57,6 +58,9 @@ describe('API-key ownership guards', () => {
       const bob = await createUser('bob', PASSWORD, 'user');
       const { key } = await createApiKey('bob-ci', 'user', undefined, undefined, bob.id);
 
+      // The key must provably PREDATE the stamp suspendUser writes; without
+      // this both can land in one millisecond and the assertion inverts.
+      await clockTick();
       await suspendUser(bob.id);
 
       expect(await verifyApiKey(key)).toBeNull();
@@ -66,6 +70,7 @@ describe('API-key ownership guards', () => {
       const bob = await createUser('bob', PASSWORD, 'user');
       const { key } = await createApiKey('bob-ci', 'user', undefined, undefined, bob.id);
 
+      await clockTick();
       await updateUser(bob.id, { enabled: false });
 
       expect(await verifyApiKey(key)).toBeNull();
@@ -91,6 +96,7 @@ describe('API-key ownership guards', () => {
       const bob = await createUser('bob', PASSWORD, 'user');
       const { key } = await createApiKey('bob-ci', 'user', undefined, undefined, bob.id);
 
+      await clockTick();
       await suspendUser(bob.id);
 
       expect(await verifyApiKey(key)).toBeNull();
@@ -102,6 +108,11 @@ describe('API-key ownership guards', () => {
       await updateUser(bob.id, { enabled: true });
 
       expect(await verifyApiKey(key)).toBeNull();
+
+      // ...and the fresh key must provably POSTDATE the stamp, the mirror-image
+      // ordering. Re-enabling does not re-stamp (setUserEnabled stamps only on
+      // the transition TO disabled), so this ticks past the SUSPENSION stamp.
+      await clockTick();
       const { key: freshKey } = await createApiKey('bob-ci-2', 'user', undefined, undefined, bob.id);
       expect(await verifyApiKey(freshKey)).not.toBeNull();
     });
@@ -117,6 +128,7 @@ describe('API-key ownership guards', () => {
       const bob = await createUser('bob-dashboard-disable', PASSWORD, 'user');
       const { key } = await createApiKey('bob-dashboard-ci', 'user', undefined, undefined, bob.id);
 
+      await clockTick();
       await updateUser(bob.id, { enabled: false });
       expect(await verifyApiKey(key)).toBeNull();
 
@@ -124,6 +136,8 @@ describe('API-key ownership guards', () => {
 
       // The pre-existing key must NOT come back just because the account did.
       expect(await verifyApiKey(key)).toBeNull();
+
+      await clockTick();
       const { key: freshKey } = await createApiKey(
         'bob-dashboard-ci-2',
         'user',
