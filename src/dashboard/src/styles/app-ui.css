@@ -237,3 +237,47 @@ html.dark .drop-ui {
   background: var(--accent-soft);
   color: var(--accent);
 }
+
+/*
+ * Focus ring (DROP-156). `focus-visible` was ZERO across the dashboard before
+ * this — keyboard users got whatever the UA drew, which on a token-coloured
+ * panel is frequently invisible. Token-driven so it works in both themes, and
+ * a single class so every primitive rings identically.
+ */
+.drop-ui .dui-focus-ring:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--panel), 0 0 0 4px var(--accent);
+}
+
+/*
+ * Radix state animations. Radix stamps `data-state="open"|"closed"` on the
+ * overlay and content, which is the only hook available for an exit animation
+ * (the node is removed after it finishes).
+ *
+ * Everything here is inside `prefers-reduced-motion: no-preference` — the
+ * dashboard had NO reduced-motion handling at all before DROP-156, including
+ * the infinitely-pulsing auth logo. Motion is opt-out by OS setting, not
+ * mandatory.
+ */
+@media (prefers-reduced-motion: no-preference) {
+  .drop-ui [data-state='open'].dui-dialog {
+    animation: dui-dialog-in 140ms ease-out;
+  }
+  @keyframes dui-dialog-in {
+    from {
+      opacity: 0;
+      transform: translate(-50%, -48%) scale(0.97);
+    }
+    to {
+      opacity: 1;
+      transform: translate(-50%, -50%) scale(1);
+    }
+  }
+}
+
+/* Respect the OS setting for the pre-existing auth-logo pulse too. */
+@media (prefers-reduced-motion: reduce) {
+  .drop-ui .dui-auth-logo {
+    animation: none;
+  }
+}
