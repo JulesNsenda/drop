@@ -20,6 +20,8 @@ import {
   AlertTriangle,
   Database,
   Lock,
+  LayoutDashboard,
+  History,
 } from 'lucide-react';
 import {
   useApp,
@@ -56,6 +58,12 @@ import Input from '../components/ui/Input';
 const inlineSelectClass = 'rounded-lg px-3 py-2 text-sm outline-none transition-colors dui-input';
 
 const DETAIL_TABS: TabDef[] = [
+  // Overview and Activity lead (DROP-156 PR 3a). Everything below used to be
+  // rendered ABOVE the tab bar as one long scroll, which made the bar read as
+  // a footer rather than as the page's structure — and buried the deploy
+  // history, the single most useful thing on the page, in the middle of it.
+  { id: 'overview', label: 'Overview', icon: LayoutDashboard },
+  { id: 'activity', label: 'Activity', icon: History },
   { id: 'logs', label: 'Logs', icon: Terminal },
   { id: 'metrics', label: 'Metrics', icon: Activity },
   { id: 'database', label: 'Database', icon: Database },
@@ -76,7 +84,7 @@ function AppDetailPage() {
   const { toast } = useToast();
   const confirmDialog = useConfirm();
   const [actionLoading, setActionLoading] = useState<string | null>(null);
-  const [activeTab, setActiveTab] = useState<string>('logs');
+  const [activeTab, setActiveTab] = useState<string>('overview');
 
   // Git credential to send with the next redeploy (DROP-142)
   const [gitTokens, setGitTokens] = useState<GitTokenInfo[]>([]);
@@ -496,180 +504,183 @@ function AppDetailPage() {
         </div>
       )}
 
-      {/* Info cards */}
-      <div className="mb-6 grid gap-4 md:grid-cols-3">
-        <Card>
-          <div className="mb-1 flex items-center gap-2" style={{ color: 'var(--text-2)' }}>
-            <ExternalLink className="h-4 w-4" />
-            <span className="text-sm">URL</span>
-          </div>
-          {app.port ? (
-            <a
-              href={appLinkInfo(app).href}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="break-all text-sm font-semibold hover:underline"
-            >
-              {appLinkInfo(app).label}
-            </a>
-          ) : (
-            <span className="text-sm font-semibold" style={{ color: 'var(--text-3)' }}>
-              Not assigned
-            </span>
-          )}
-        </Card>
+      {/* Overview / Activity / Logs / Metrics / Database / Environment / Domains / Access */}
+      <Tabs tabs={DETAIL_TABS} active={activeTab} onChange={setActiveTab} label="App sections" />
 
-        {app.mcp ? (
+      {activeTab === 'overview' && (
+        <>
+        {/* Info cards */}
+        <div className="mb-6 grid gap-4 md:grid-cols-3">
           <Card>
             <div className="mb-1 flex items-center gap-2" style={{ color: 'var(--text-2)' }}>
-              <Plug className="h-4 w-4" />
-              <span className="text-sm">MCP endpoint</span>
+              <ExternalLink className="h-4 w-4" />
+              <span className="text-sm">URL</span>
             </div>
-            <p className="break-all text-sm font-semibold" style={{ color: 'var(--text)' }}>
-              {app.mcp.url}
-            </p>
-            {/*
-              Shown with the URL, never separately: an operator handed only an
-              address would reasonably assume DROP guards it, and for `auth:
-              none` it does not.
-
-              This used to say "Public" unconditionally, ignoring `mcp.auth`
-              — wrong for every `auth: drop` app, where the Caddy forward_auth
-              gateway DOES verify an audience-bound token (see
-              routes/mcp-gateway.ts).
-
-              The wording is deliberately "guarded at the proxy", not
-              "protected": the guard lives ONLY in Caddy. platform.ts logs the
-              two counter-cases itself — outside docker isolation the app binds
-              a host port that is reachable directly, bypassing it, and when
-              apiPort is unusable the guard is not emitted at all. `mcp.auth`
-              is the tenant's DECLARATION, not proof of enforcement, so this
-              must not promise more than the declaration supports.
-            */}
-            <p className="mt-1 text-xs" style={{ color: 'var(--text-3)' }}>
-              {app.mcp.auth === 'drop'
-                ? 'Guarded at the proxy — DROP verifies an audience-bound token on requests that arrive through it. Traffic reaching the app’s own port directly is not covered.'
-                : 'Public — DROP does not authenticate callers to this endpoint.'}
-            </p>
+            {app.port ? (
+              <a
+                href={appLinkInfo(app).href}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="break-all text-sm font-semibold hover:underline"
+              >
+                {appLinkInfo(app).label}
+              </a>
+            ) : (
+              <span className="text-sm font-semibold" style={{ color: 'var(--text-3)' }}>
+                Not assigned
+              </span>
+            )}
           </Card>
-        ) : null}
 
-        {isAdmin && app.path ? (
+          {app.mcp ? (
+            <Card>
+              <div className="mb-1 flex items-center gap-2" style={{ color: 'var(--text-2)' }}>
+                <Plug className="h-4 w-4" />
+                <span className="text-sm">MCP endpoint</span>
+              </div>
+              <p className="break-all text-sm font-semibold" style={{ color: 'var(--text)' }}>
+                {app.mcp.url}
+              </p>
+              {/*
+                Shown with the URL, never separately: an operator handed only an
+                address would reasonably assume DROP guards it, and for `auth:
+                none` it does not.
+
+                This used to say "Public" unconditionally, ignoring `mcp.auth`
+                — wrong for every `auth: drop` app, where the Caddy forward_auth
+                gateway DOES verify an audience-bound token (see
+                routes/mcp-gateway.ts).
+
+                The wording is deliberately "guarded at the proxy", not
+                "protected": the guard lives ONLY in Caddy. platform.ts logs the
+                two counter-cases itself — outside docker isolation the app binds
+                a host port that is reachable directly, bypassing it, and when
+                apiPort is unusable the guard is not emitted at all. `mcp.auth`
+                is the tenant's DECLARATION, not proof of enforcement, so this
+                must not promise more than the declaration supports.
+              */}
+              <p className="mt-1 text-xs" style={{ color: 'var(--text-3)' }}>
+                {app.mcp.auth === 'drop'
+                  ? 'Guarded at the proxy — DROP verifies an audience-bound token on requests that arrive through it. Traffic reaching the app’s own port directly is not covered.'
+                  : 'Public — DROP does not authenticate callers to this endpoint.'}
+              </p>
+            </Card>
+          ) : null}
+
+          {isAdmin && app.path ? (
+            <Card>
+              <div className="mb-1 flex items-center gap-2" style={{ color: 'var(--text-2)' }}>
+                <Folder className="h-4 w-4" />
+                <span className="text-sm">Path</span>
+              </div>
+              <p
+                className="truncate font-mono text-sm"
+                style={{ color: 'var(--text)' }}
+                title={app.path}
+              >
+                {app.path}
+              </p>
+              {app.ownerName && (
+                <p className="mt-1 text-xs" style={{ color: 'var(--text-2)' }}>
+                  Owner: {app.ownerName}
+                </p>
+              )}
+            </Card>
+          ) : (
+            <Card>
+              <div className="mb-1 flex items-center gap-2" style={{ color: 'var(--text-2)' }}>
+                <Folder className="h-4 w-4" />
+                <span className="text-sm">Type</span>
+              </div>
+              <p className="text-sm capitalize" style={{ color: 'var(--text)' }}>
+                {app.type}
+                {app.framework ? ` (${app.framework})` : ''}
+              </p>
+            </Card>
+          )}
+
           <Card>
             <div className="mb-1 flex items-center gap-2" style={{ color: 'var(--text-2)' }}>
-              <Folder className="h-4 w-4" />
-              <span className="text-sm">Path</span>
+              <Clock className="h-4 w-4" />
+              <span className="text-sm">Last Deployed</span>
             </div>
-            <p
-              className="truncate font-mono text-sm"
-              style={{ color: 'var(--text)' }}
-              title={app.path}
-            >
-              {app.path}
+            <p className="text-sm" style={{ color: 'var(--text)' }}>
+              {formatDate(app.lastDeployedAt)}
             </p>
-            {app.ownerName && (
-              <p className="mt-1 text-xs" style={{ color: 'var(--text-2)' }}>
-                Owner: {app.ownerName}
+            {app.buildDuration && (
+              <p className="text-xs" style={{ color: 'var(--text-2)' }}>
+                Build: {app.buildDuration}ms
               </p>
             )}
           </Card>
-        ) : (
-          <Card>
-            <div className="mb-1 flex items-center gap-2" style={{ color: 'var(--text-2)' }}>
-              <Folder className="h-4 w-4" />
-              <span className="text-sm">Type</span>
+        </div>
+
+        {/* Git source info */}
+        {app.gitSource && (
+          <Card className="mb-6">
+            <div className="mb-3 flex items-center gap-2" style={{ color: 'var(--text-2)' }}>
+              <GitBranch className="h-4 w-4" />
+              <span className="text-sm font-medium">Git Source</span>
             </div>
-            <p className="text-sm capitalize" style={{ color: 'var(--text)' }}>
-              {app.type}
-              {app.framework ? ` (${app.framework})` : ''}
-            </p>
+            <div className="grid gap-3 text-sm md:grid-cols-2">
+              <div>
+                <span style={{ color: 'var(--text-2)' }}>Repository: </span>
+                <a
+                  href={app.gitSource.repoUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="hover:underline"
+                >
+                  {app.gitSource.repoUrl.replace('https://github.com/', '')}
+                </a>
+              </div>
+              <div>
+                <span style={{ color: 'var(--text-2)' }}>Branch: </span>
+                <span className="font-mono" style={{ color: 'var(--text)' }}>
+                  {app.gitSource.branch}
+                </span>
+              </div>
+              {app.gitSource.lastCommitSha && (
+                <div>
+                  <span style={{ color: 'var(--text-2)' }}>Commit: </span>
+                  <span className="font-mono" style={{ color: 'var(--text)' }}>
+                    {app.gitSource.lastCommitSha.slice(0, 7)}
+                  </span>
+                </div>
+              )}
+              <div>
+                <span style={{ color: 'var(--text-2)' }}>Auto-redeploy: </span>
+                <span style={{ color: 'var(--text)' }}>
+                  {app.gitSource.autoRedeploy ? 'Enabled' : 'Disabled'}
+                </span>
+              </div>
+              {isAdmin && (
+                <div>
+                  <span style={{ color: 'var(--text-2)' }}>Credential: </span>
+                  <span style={{ color: 'var(--text)' }}>{attachedTokenLabel}</span>
+                </div>
+              )}
+            </div>
           </Card>
         )}
 
-        <Card>
-          <div className="mb-1 flex items-center gap-2" style={{ color: 'var(--text-2)' }}>
-            <Clock className="h-4 w-4" />
-            <span className="text-sm">Last Deployed</span>
+        {/* Error message */}
+        {app.error && (
+          <div
+            className="mb-6 rounded-lg border p-4 text-sm"
+            style={{
+              borderColor: 'var(--err)',
+              background: 'color-mix(in srgb, var(--err) 10%, transparent)',
+              color: 'var(--err)',
+            }}
+          >
+            <strong>Error:</strong> {app.error}
           </div>
-          <p className="text-sm" style={{ color: 'var(--text)' }}>
-            {formatDate(app.lastDeployedAt)}
-          </p>
-          {app.buildDuration && (
-            <p className="text-xs" style={{ color: 'var(--text-2)' }}>
-              Build: {app.buildDuration}ms
-            </p>
-          )}
-        </Card>
-      </div>
-
-      {/* Deploy timeline */}
-      <DeployTimeline appName={app.name} />
-
-      {/* Git source info */}
-      {app.gitSource && (
-        <Card className="mb-6">
-          <div className="mb-3 flex items-center gap-2" style={{ color: 'var(--text-2)' }}>
-            <GitBranch className="h-4 w-4" />
-            <span className="text-sm font-medium">Git Source</span>
-          </div>
-          <div className="grid gap-3 text-sm md:grid-cols-2">
-            <div>
-              <span style={{ color: 'var(--text-2)' }}>Repository: </span>
-              <a
-                href={app.gitSource.repoUrl}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="hover:underline"
-              >
-                {app.gitSource.repoUrl.replace('https://github.com/', '')}
-              </a>
-            </div>
-            <div>
-              <span style={{ color: 'var(--text-2)' }}>Branch: </span>
-              <span className="font-mono" style={{ color: 'var(--text)' }}>
-                {app.gitSource.branch}
-              </span>
-            </div>
-            {app.gitSource.lastCommitSha && (
-              <div>
-                <span style={{ color: 'var(--text-2)' }}>Commit: </span>
-                <span className="font-mono" style={{ color: 'var(--text)' }}>
-                  {app.gitSource.lastCommitSha.slice(0, 7)}
-                </span>
-              </div>
-            )}
-            <div>
-              <span style={{ color: 'var(--text-2)' }}>Auto-redeploy: </span>
-              <span style={{ color: 'var(--text)' }}>
-                {app.gitSource.autoRedeploy ? 'Enabled' : 'Disabled'}
-              </span>
-            </div>
-            {isAdmin && (
-              <div>
-                <span style={{ color: 'var(--text-2)' }}>Credential: </span>
-                <span style={{ color: 'var(--text)' }}>{attachedTokenLabel}</span>
-              </div>
-            )}
-          </div>
-        </Card>
+        )}
+        </>
       )}
 
-      {/* Error message */}
-      {app.error && (
-        <div
-          className="mb-6 rounded-lg border p-4 text-sm"
-          style={{
-            borderColor: 'var(--err)',
-            background: 'color-mix(in srgb, var(--err) 10%, transparent)',
-            color: 'var(--err)',
-          }}
-        >
-          <strong>Error:</strong> {app.error}
-        </div>
-      )}
-
-      {/* Deep-view tabs: Logs / Metrics / Database / Environment / Domains */}
-      <Tabs tabs={DETAIL_TABS} active={activeTab} onChange={setActiveTab} label="App sections" />
+      {activeTab === 'activity' && <DeployTimeline appName={app.name} />}
 
       {activeTab === 'logs' && <LogViewer appName={app.name} appStatus={app.status} />}
 
