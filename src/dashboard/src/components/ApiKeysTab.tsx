@@ -6,6 +6,7 @@ import { useConfirm } from './ConfirmDialog';
 import Button from './ui/Button';
 import Input from './ui/Input';
 import Card from './ui/Card';
+import { SkeletonText } from './ui/Skeleton';
 import {
   Table,
   TableHead,
@@ -306,10 +307,7 @@ function ApiKeysTab() {
         )}
 
         {loading ? (
-          <div className="animate-pulse space-y-2">
-            <div className="h-4 w-48 rounded" style={{ background: 'var(--border-2)' }} />
-            <div className="h-4 w-36 rounded" style={{ background: 'var(--border-2)' }} />
-          </div>
+          <SkeletonText label="Loading API keys" />
         ) : error ? (
           <p className="text-sm" style={{ color: 'var(--err)' }}>
             {error}
