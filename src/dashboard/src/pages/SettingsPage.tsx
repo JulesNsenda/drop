@@ -838,14 +838,30 @@ function SettingsPage() {
       )}
 
       {/* API Keys tab (admin only) */}
-      {isAdmin && <TabPanel id="api-keys">activeTab === 'api-keys' && <ApiKeysTab /></TabPanel>}
+      {isAdmin && activeTab === 'api-keys' && (
+        <TabPanel id="api-keys">
+          <ApiKeysTab />
+        </TabPanel>
+      )}
 
       {/* Claude (MCP) connector tab (admin + user; readonly never sees it) */}
-      {isAdmin && <TabPanel id="mcp-connector">activeTab === 'mcp-connector' && <McpConnectorTab /></TabPanel>}
-      {!isAdmin && <TabPanel id="mcp-connector">canUseConnectors && activeTab === 'mcp-connector' && <UserConnectorTab /></TabPanel>}
+      {isAdmin && activeTab === 'mcp-connector' && (
+        <TabPanel id="mcp-connector">
+          <McpConnectorTab />
+        </TabPanel>
+      )}
+      {!isAdmin && canUseConnectors && activeTab === 'mcp-connector' && (
+        <TabPanel id="mcp-connector">
+          <UserConnectorTab />
+        </TabPanel>
+      )}
 
       {/* Git webhooks tab (admin only) */}
-      {isAdmin && <TabPanel id="git-webhooks">activeTab === 'git-webhooks' && <GitWebhooksTab /></TabPanel>}
+      {isAdmin && activeTab === 'git-webhooks' && (
+        <TabPanel id="git-webhooks">
+          <GitWebhooksTab />
+        </TabPanel>
+      )}
 
       {/* Activity tab (admin only) */}
       {isAdmin && activeTab === 'activity' && (
