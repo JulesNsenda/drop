@@ -5,6 +5,14 @@ import { useAuth } from '../hooks/useAuth';
 import { useToast } from './Toast';
 import { useConfirm } from './ConfirmDialog';
 import Card from './ui/Card';
+import {
+  Table,
+  TableHead,
+  TableBody,
+  TableRow,
+  TableHeaderCell,
+  TableCell,
+} from './ui/Table';
 import StatCard from './ui/StatCard';
 import Button from './ui/Button';
 import Badge from './ui/Badge';
@@ -624,52 +632,26 @@ function DatabaseTab({ name }: { name: string }) {
             </p>
           ) : (
             <div className="overflow-x-auto">
-              <table className="w-full text-sm">
-                <thead>
-                  <tr className="border-b" style={{ borderColor: 'var(--border)' }}>
-                    <th
-                      className="text-left py-2 pr-4 font-medium"
-                      style={{ color: 'var(--text-3)' }}
-                    >
-                      Name
-                    </th>
-                    <th
-                      className="text-left py-2 pr-4 font-medium"
-                      style={{ color: 'var(--text-3)' }}
-                    >
-                      Row estimate
-                    </th>
-                    <th className="text-left py-2 font-medium" style={{ color: 'var(--text-3)' }}>
-                      Size
-                    </th>
-                  </tr>
-                </thead>
-                <tbody>
+              <Table density="compact">
+                <TableHead>
+                  <TableRow>
+                    <TableHeaderCell>Name</TableHeaderCell>
+                    <TableHeaderCell>Row estimate</TableHeaderCell>
+                    <TableHeaderCell className="pr-0">Size</TableHeaderCell>
+                  </TableRow>
+                </TableHead>
+                <TableBody>
                   {tables.map(t => (
-                    <tr
-                      key={t.name}
-                      className="border-b last:border-b-0"
-                      style={{ borderColor: 'var(--border)' }}
-                    >
-                      <td
-                        className="py-2.5 pr-4 font-mono font-medium"
-                        style={{ color: 'var(--text)' }}
-                      >
-                        {t.name}
-                      </td>
-                      <td
-                        className="py-2.5 pr-4"
-                        style={{ color: isUntrustedZero(t) ? 'var(--text-3)' : 'var(--text)' }}
-                      >
+                    <TableRow key={t.name} className="last:border-b-0">
+                      <TableCell className="font-mono font-medium text-fg">{t.name}</TableCell>
+                      <TableCell className={isUntrustedZero(t) ? 'text-faint' : 'text-fg'}>
                         {formatRowEstimate(t)}
-                      </td>
-                      <td className="py-2.5" style={{ color: 'var(--text-2)' }}>
-                        {formatBytes(t.sizeBytes)}
-                      </td>
-                    </tr>
+                      </TableCell>
+                      <TableCell className="pr-0 text-muted">{formatBytes(t.sizeBytes)}</TableCell>
+                    </TableRow>
                   ))}
-                </tbody>
-              </table>
+                </TableBody>
+              </Table>
             </div>
           )}
         </div>

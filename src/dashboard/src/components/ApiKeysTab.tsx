@@ -6,6 +6,14 @@ import { useConfirm } from './ConfirmDialog';
 import Button from './ui/Button';
 import Input from './ui/Input';
 import Card from './ui/Card';
+import {
+  Table,
+  TableHead,
+  TableBody,
+  TableRow,
+  TableHeaderCell,
+  TableCell,
+} from './ui/Table';
 
 interface ApiKeyRecord {
   id: string;
@@ -312,92 +320,47 @@ function ApiKeysTab() {
           </p>
         ) : (
           <div className="overflow-x-auto">
-            <table className="w-full text-sm">
-              <thead>
-                <tr className="border-b" style={{ borderColor: 'var(--border)' }}>
-                  <th
-                    className="text-left py-2 pr-4 font-medium"
-                    style={{ color: 'var(--text-3)' }}
-                  >
-                    Name
-                  </th>
-                  <th
-                    className="text-left py-2 pr-4 font-medium"
-                    style={{ color: 'var(--text-3)' }}
-                  >
-                    Prefix
-                  </th>
-                  <th
-                    className="text-left py-2 pr-4 font-medium"
-                    style={{ color: 'var(--text-3)' }}
-                  >
-                    Role
-                  </th>
-                  <th
-                    className="text-left py-2 pr-4 font-medium"
-                    style={{ color: 'var(--text-3)' }}
-                  >
-                    Created
-                  </th>
-                  <th
-                    className="text-left py-2 pr-4 font-medium"
-                    style={{ color: 'var(--text-3)' }}
-                  >
-                    Last used
-                  </th>
-                  <th
-                    className="text-left py-2 pr-4 font-medium"
-                    style={{ color: 'var(--text-3)' }}
-                  >
-                    Expires
-                  </th>
-                  <th className="text-right py-2 font-medium" style={{ color: 'var(--text-3)' }}>
+            <Table density="compact">
+              <TableHead>
+                <TableRow>
+                  <TableHeaderCell>Name</TableHeaderCell>
+                  <TableHeaderCell>Prefix</TableHeaderCell>
+                  <TableHeaderCell>Role</TableHeaderCell>
+                  <TableHeaderCell>Created</TableHeaderCell>
+                  <TableHeaderCell>Last used</TableHeaderCell>
+                  <TableHeaderCell>Expires</TableHeaderCell>
+                  <TableHeaderCell align="right" className="pr-0">
                     Actions
-                  </th>
-                </tr>
-              </thead>
-              <tbody>
+                  </TableHeaderCell>
+                </TableRow>
+              </TableHead>
+              <TableBody>
                 {keys.map(k => {
                   const isCliLocal = k.name === RESERVED_NAME;
                   const isExpired = !!k.expiresAt && new Date(k.expiresAt).getTime() < Date.now();
                   return (
-                    <tr
-                      key={k.id}
-                      className="border-b last:border-b-0"
-                      style={{ borderColor: 'var(--border)' }}
-                    >
-                      <td className="py-2.5 pr-4">
+                    <TableRow key={k.id} className="last:border-b-0">
+                      <TableCell>
                         <div className="flex items-center gap-2">
-                          <span className="font-medium" style={{ color: 'var(--text)' }}>
-                            {k.name}
-                          </span>
+                          <span className="font-medium text-fg">{k.name}</span>
                           {isCliLocal && (
                             <span className="text-[10px] px-1.5 py-0.5 rounded font-medium uppercase dui-badge-neutral">
                               System (CLI)
                             </span>
                           )}
                         </div>
-                      </td>
-                      <td
-                        className="py-2.5 pr-4 font-mono text-xs"
-                        style={{ color: 'var(--text-3)' }}
-                      >
-                        {k.prefix}
-                      </td>
-                      <td className="py-2.5 pr-4">
+                      </TableCell>
+                      <TableCell className="font-mono text-xs text-faint">{k.prefix}</TableCell>
+                      <TableCell>
                         <span
                           className={`text-xs px-2 py-0.5 rounded-full font-medium ${roleBadgeTone[k.role]}`}
                         >
                           {k.role}
                         </span>
-                      </td>
-                      <td className="py-2.5 pr-4 text-xs" style={{ color: 'var(--text-3)' }}>
-                        {formatDate(k.createdAt)}
-                      </td>
-                      <td className="py-2.5 pr-4 text-xs" style={{ color: 'var(--text-3)' }}>
-                        {formatDate(k.lastUsed)}
-                      </td>
-                      <td className="py-2.5 pr-4 text-xs" style={{ color: 'var(--text-3)' }}>
+                      </TableCell>
+                      <TableCell className="text-xs text-faint">{formatDate(k.createdAt)}</TableCell>
+                      <TableCell className="text-xs text-faint">{formatDate(k.lastUsed)}</TableCell>
+                      <TableCell className="text-xs text-faint">
                         <div className="flex items-center gap-1.5">
                           {formatDate(k.expiresAt)}
                           {isExpired && (
@@ -406,23 +369,22 @@ function ApiKeysTab() {
                             </span>
                           )}
                         </div>
-                      </td>
-                      <td className="py-2.5 text-right">
+                      </TableCell>
+                      <TableCell align="right" className="pr-0">
                         <button
                           onClick={() => handleDelete(k)}
-                          className="transition-colors hover:text-red-500"
-                          style={{ color: 'var(--text-3)' }}
+                          className="dui-focus-ring rounded text-faint transition-colors hover:text-err focus-visible:outline-none"
                           title="Delete API key"
                           aria-label={`Delete API key ${k.name}`}
                         >
                           <Trash2 className="w-4 h-4" />
                         </button>
-                      </td>
-                    </tr>
+                      </TableCell>
+                    </TableRow>
                   );
                 })}
-              </tbody>
-            </table>
+              </TableBody>
+            </Table>
           </div>
         )}
       </div>
