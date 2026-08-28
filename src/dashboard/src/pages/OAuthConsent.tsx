@@ -123,17 +123,17 @@ function OAuthConsent() {
     return (
       <AuthLayout>
         <div className="mb-6 text-center">
-          <h1 className="text-2xl font-semibold" style={{ color: 'var(--text)' }}>
+          <h1 className="text-2xl font-semibold text-fg">
             Invalid authorization request
           </h1>
-          <p className="mt-1 text-sm" style={{ color: 'var(--text-2)' }}>
+          <p className="mt-1 text-sm text-muted">
             This link is missing required parameters.
           </p>
         </div>
         <Card>
           <div className="flex items-start gap-3">
-            <AlertTriangle className="h-5 w-5 flex-shrink-0" style={{ color: 'var(--err)' }} aria-hidden="true" />
-            <p className="text-sm" style={{ color: 'var(--text-2)' }}>
+            <AlertTriangle className="h-5 w-5 flex-shrink-0 text-err" aria-hidden="true" />
+            <p className="text-sm text-muted">
               We couldn't find a valid <code>client_id</code> and <code>redirect_uri</code> in this request. Please
               restart the connection from claude.ai.
             </p>
@@ -151,17 +151,17 @@ function OAuthConsent() {
     return (
       <AuthLayout>
         <div className="mb-6 text-center">
-          <h1 className="text-2xl font-semibold" style={{ color: 'var(--text)' }}>
+          <h1 className="text-2xl font-semibold text-fg">
             Connector setup disabled
           </h1>
-          <p className="mt-1 text-sm" style={{ color: 'var(--text-2)' }}>
+          <p className="mt-1 text-sm text-muted">
             {disabledMessage}
           </p>
         </div>
         <Card>
           <div className="flex items-start gap-3">
-            <AlertTriangle className="h-5 w-5 flex-shrink-0" style={{ color: 'var(--err)' }} aria-hidden="true" />
-            <p className="text-sm" style={{ color: 'var(--text-2)' }}>
+            <AlertTriangle className="h-5 w-5 flex-shrink-0 text-err" aria-hidden="true" />
+            <p className="text-sm text-muted">
               Ask an administrator to turn on non-admin connector setup in Settings, or connect using
               an agent token from Claude Code instead.
             </p>
@@ -175,8 +175,8 @@ function OAuthConsent() {
     return (
       <AuthLayout>
         <div className="flex flex-col items-center gap-3 py-10">
-          <Loader2 className="h-6 w-6 animate-spin" style={{ color: 'var(--text-2)' }} aria-hidden="true" />
-          <p className="text-sm" style={{ color: 'var(--text-2)' }}>
+          <Loader2 className="h-6 w-6 animate-spin text-muted" aria-hidden="true" />
+          <p className="text-sm text-muted">
             Loading...
           </p>
         </div>
@@ -193,10 +193,10 @@ function OAuthConsent() {
   return (
     <AuthLayout>
       <div className="mb-6 text-center">
-        <h1 className="text-2xl font-semibold" style={{ color: 'var(--text)' }}>
+        <h1 className="text-2xl font-semibold text-fg">
           Authorize claude.ai
         </h1>
-        <p className="mt-1 text-sm" style={{ color: 'var(--text-2)' }}>
+        <p className="mt-1 text-sm text-muted">
           Review the access below before continuing.
         </p>
       </div>
@@ -221,10 +221,10 @@ function OAuthConsent() {
             className="flex h-10 w-10 flex-shrink-0 items-center justify-center rounded-lg"
             style={{ background: 'var(--bg-3)', border: '1px solid var(--border)' }}
           >
-            <ShieldCheck className="h-5 w-5" style={{ color: 'var(--accent)' }} aria-hidden="true" />
+            <ShieldCheck className="h-5 w-5 text-accent" aria-hidden="true" />
           </div>
           <div>
-            <p className="text-sm" style={{ color: 'var(--text)' }}>
+            <p className="text-sm text-fg">
               <strong>claude.ai</strong> wants to connect to your DROP account
               {auth.username ? (
                 <>
@@ -242,18 +242,18 @@ function OAuthConsent() {
               is asked to agree to it.
             */}
             {appName ? (
-              <p className="mt-2 text-sm" style={{ color: 'var(--text-2)' }}>
+              <p className="mt-2 text-sm text-muted">
                 This grants access to <strong>{appName}</strong> only — one app's MCP
                 endpoint. It does <strong>not</strong> allow deploying or managing your
                 other apps.
               </p>
             ) : (
-              <p className="mt-2 text-sm" style={{ color: 'var(--text-2)' }}>
+              <p className="mt-2 text-sm text-muted">
                 This will allow claude.ai to deploy and manage your apps on your behalf.
               </p>
             )}
             {params.resource ? (
-              <p className="mt-2 break-all font-mono text-xs" style={{ color: 'var(--text-3)' }}>
+              <p className="mt-2 break-all font-mono text-xs text-faint">
                 {params.resource}
               </p>
             ) : null}

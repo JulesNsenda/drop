@@ -38,7 +38,7 @@ export interface TableProps extends TableHTMLAttributes<HTMLTableElement> {
  *
  * What this removes: every `<th>` in the tree repeated
  * `className="text-left py-2 pr-4 font-medium"` with
- * `style={{ color: 'var(--text-3)' }}` — the header colour hand-piped per cell,
+ * `className="text-faint"` — the header colour hand-piped per cell,
  * across four files, because there was no other way to reach the token before
  * the preset landed in PR 1.
  *

@@ -66,7 +66,7 @@ function PublicUrlSection({
           : undefined
       }
     >
-      <h3 className="mb-1 text-sm font-semibold" style={{ color: 'var(--text)' }}>
+      <h3 className="mb-1 text-sm font-semibold text-fg">
         Public URL
       </h3>
       <p className="mb-2 text-xs" style={{ color: 'var(--text-3)', lineHeight: 1.6 }}>
@@ -90,7 +90,7 @@ function PublicUrlSection({
       {source === 'env' && (
         <p className="mt-2 text-xs" style={{ color: 'var(--text-3)', lineHeight: 1.6 }}>
           Currently set from the{' '}
-          <code style={{ fontFamily: 'var(--mono)', color: 'var(--text)' }}>DROP_PUBLIC_URL</code>{' '}
+          <code className="font-mono text-fg">DROP_PUBLIC_URL</code>{' '}
           environment variable. Saving here overrides it.
         </p>
       )}
@@ -209,22 +209,22 @@ export default function McpConnectorTab(): JSX.Element {
 
   return (
     <Card padded={false} className="mb-6">
-      <div className="flex items-center gap-2 border-b px-4 py-3" style={{ borderColor: 'var(--border)' }}>
-        <Plug className="h-4 w-4" style={{ color: 'var(--text-3)' }} />
-        <h2 className="font-semibold" style={{ color: 'var(--text)' }}>
+      <div className="flex items-center gap-2 border-b px-4 py-3 border-line">
+        <Plug className="h-4 w-4 text-faint" />
+        <h2 className="font-semibold text-fg">
           Claude (MCP) connector
         </h2>
       </div>
 
       <div className="space-y-4 p-4">
         <p className="text-sm" style={{ color: 'var(--text-2)', lineHeight: 1.7 }}>
-          Let <strong style={{ color: 'var(--text)' }}>claude.ai</strong> deploy and manage apps
+          Let <strong className="text-fg">claude.ai</strong> deploy and manage apps
           through the hosted MCP server. Add a custom connector in claude.ai with the values below
           &mdash; each person signs in and consents, and only ever sees their own apps.
         </p>
 
         {(loading || settingsLoading) && (
-          <p className="text-sm" style={{ color: 'var(--text-3)' }}>
+          <p className="text-sm text-faint">
             Loading connector details&hellip;
           </p>
         )}
@@ -241,7 +241,7 @@ export default function McpConnectorTab(): JSX.Element {
           >
             The web connector is not configured yet. Set the Public URL below and save to enable it
             &mdash; no restart required. (You can also set the{' '}
-            <code style={{ fontFamily: 'var(--mono)', color: 'var(--text)' }}>DROP_PUBLIC_URL</code>{' '}
+            <code className="font-mono text-fg">DROP_PUBLIC_URL</code>{' '}
             environment variable and restart DROP instead.)
           </div>
         )}
@@ -260,7 +260,7 @@ export default function McpConnectorTab(): JSX.Element {
         )}
 
         {!settingsLoading && userConnectorsState !== undefined && (
-          <div className="rounded-lg border p-4" style={{ borderColor: 'var(--border)', background: 'var(--bg-2)' }}>
+          <div className="rounded-lg border p-4 border-line bg-surface-2">
             <div className="flex items-center gap-3">
               <input
                 type="checkbox"
@@ -273,8 +273,7 @@ export default function McpConnectorTab(): JSX.Element {
               />
               <label
                 htmlFor="userConnectorsEnabled"
-                className="text-sm font-semibold"
-                style={{ color: 'var(--text)' }}
+                className="text-sm font-semibold text-fg"
               >
                 Let non-admin users set up their own claude.ai connector
               </label>
@@ -282,9 +281,9 @@ export default function McpConnectorTab(): JSX.Element {
             <p className="mt-2 text-xs" style={{ color: 'var(--text-3)', lineHeight: 1.6 }}>
               Turning this off disables <strong>claude.ai connector setup</strong> for non-admin
               accounts only &mdash; it does not disable agent tokens or{' '}
-              <code style={{ fontFamily: 'var(--mono)', color: 'var(--text)' }}>POST /api/v1/mcp</code>,
+              <code className="font-mono text-fg">POST /api/v1/mcp</code>,
               which any user can still drive from Claude Code. It also stops non-admin users' own{' '}
-              <code style={{ fontFamily: 'var(--mono)', color: 'var(--text)' }}>mcp: auth: drop</code>{' '}
+              <code className="font-mono text-fg">mcp: auth: drop</code>{' '}
               tenant apps from refreshing their tokens (symptom: a 401 from the gateway).
             </p>
           </div>
@@ -292,8 +291,7 @@ export default function McpConnectorTab(): JSX.Element {
 
         {!settingsLoading && userConnectorsState === undefined && (
           <div
-            className="rounded-lg border p-4 text-sm"
-            style={{ borderColor: 'var(--border)', background: 'var(--bg-2)', color: 'var(--text-2)' }}
+            className="rounded-lg border p-4 text-sm border-line bg-surface-2 text-muted"
           >
             Non-admin connector setting: current state unknown &mdash; reload to try again.
           </div>
@@ -301,7 +299,7 @@ export default function McpConnectorTab(): JSX.Element {
 
         {!loading && !settingsLoading && error && (
           <div className="flex items-center justify-between gap-3">
-            <p className="text-sm" style={{ color: 'var(--err)' }}>
+            <p className="text-sm text-err">
               {error}
             </p>
             <Button variant="secondary" onClick={() => void load()}>

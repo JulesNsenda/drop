@@ -10,19 +10,17 @@ function NotFoundPage() {
 
   return (
     <div
-      className="drop-ui flex min-h-screen flex-col items-center justify-center px-4 text-center"
-      style={{ background: 'var(--bg)', color: 'var(--text)' }}
+      className="drop-ui flex min-h-screen flex-col items-center justify-center px-4 text-center bg-surface text-fg"
     >
       <p
-        className="text-6xl font-bold"
-        style={{ color: 'var(--text-3)', fontFamily: 'var(--mono)' }}
+        className="text-6xl font-bold text-faint font-mono"
       >
         404
       </p>
-      <h1 className="mt-4 text-xl font-semibold" style={{ color: 'var(--text)' }}>
+      <h1 className="mt-4 text-xl font-semibold text-fg">
         Page not found
       </h1>
-      <p className="mt-2" style={{ color: 'var(--text-2)' }}>
+      <p className="mt-2 text-muted">
         The page you&apos;re looking for doesn&apos;t exist or has moved.
       </p>
       <Link

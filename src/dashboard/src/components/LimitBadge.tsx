@@ -1,4 +1,5 @@
 import { useUsage } from '../hooks/useApi';
+import Tooltip from './ui/Tooltip';
 
 /**
  * App-limit indicator (PRD-027). Shows used/limit; turns amber at >=80% and
@@ -17,14 +18,15 @@ function LimitBadge() {
   const toneClass = atLimit ? 'dui-badge-err' : warning ? 'dui-badge-warn' : 'dui-badge-neutral';
 
   return (
-    <div
-      className={`px-3 py-1.5 rounded-lg text-xs font-medium ${toneClass}`}
-      title={atLimit ? 'You have reached your app limit' : `${used} of ${limit} apps used`}
+    <Tooltip
+      content={atLimit ? 'You have reached your app limit' : `${used} of ${limit} apps used`}
     >
-      Apps: {used}/{limit}
-      {warning && !atLimit && <span className="ml-1">— nearing limit</span>}
-      {atLimit && <span className="ml-1">— limit reached</span>}
-    </div>
+      <div className={`px-3 py-1.5 rounded-lg text-xs font-medium ${toneClass}`} tabIndex={0}>
+        Apps: {used}/{limit}
+        {warning && !atLimit && <span className="ml-1">— nearing limit</span>}
+        {atLimit && <span className="ml-1">— limit reached</span>}
+      </div>
+    </Tooltip>
   );
 }
 

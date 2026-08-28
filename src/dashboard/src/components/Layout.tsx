@@ -94,7 +94,7 @@ function Layout() {
         </ul>
       </nav>
 
-      <div className="mt-6 space-y-1 border-t pt-4" style={{ borderColor: 'var(--border)' }}>
+      <div className="mt-6 space-y-1 border-t pt-4 border-line">
         <NavLink to="/settings" className={secondaryLinkClass}>
           <Settings className="h-4 w-4" />
           Settings
@@ -106,7 +106,7 @@ function Layout() {
           </div>
         )}
 
-        <div className="px-3 pt-2 text-xs" style={{ color: 'var(--text-3)' }}>
+        <div className="px-3 pt-2 text-xs text-faint">
           DROP v{__DROP_VERSION__}
         </div>
       </div>
@@ -120,24 +120,24 @@ function Layout() {
   const appDetailMatch = location.pathname.match(/^\/apps\/([^/]+)/);
   if (appDetailMatch) {
     breadcrumb = (
-      <span className="flex items-center gap-1.5 text-sm" style={{ color: 'var(--text-3)' }}>
-        <Link to="/apps" style={{ color: 'var(--text-3)' }}>
+      <span className="flex items-center gap-1.5 text-sm text-faint">
+        <Link to="/apps" className="!text-faint">
           Applications
         </Link>
         <span aria-hidden="true">/</span>
-        <span style={{ color: 'var(--text)' }}>{decodeURIComponent(appDetailMatch[1])}</span>
+        <span className="text-fg">{decodeURIComponent(appDetailMatch[1])}</span>
       </span>
     );
   } else if (location.pathname.startsWith('/apps')) {
-    breadcrumb = <span style={{ color: 'var(--text)' }}>Applications</span>;
+    breadcrumb = <span className="text-fg">Applications</span>;
   } else if (location.pathname.startsWith('/deploy')) {
-    breadcrumb = <span style={{ color: 'var(--text)' }}>Deploy</span>;
+    breadcrumb = <span className="text-fg">Deploy</span>;
   } else if (location.pathname.startsWith('/catalog')) {
-    breadcrumb = <span style={{ color: 'var(--text)' }}>Catalog</span>;
+    breadcrumb = <span className="text-fg">Catalog</span>;
   } else if (location.pathname.startsWith('/settings')) {
-    breadcrumb = <span style={{ color: 'var(--text)' }}>Settings</span>;
+    breadcrumb = <span className="text-fg">Settings</span>;
   } else if (location.pathname.startsWith('/users')) {
-    breadcrumb = <span style={{ color: 'var(--text)' }}>Users</span>;
+    breadcrumb = <span className="text-fg">Users</span>;
   }
 
   const themeToggle = (
@@ -163,12 +163,10 @@ function Layout() {
   // user block; preserves the admin badge and logout (PRD-026).
   const user = authRequired ? (
     <div
-      className="ml-1 flex items-center gap-2 border-l pl-3"
-      style={{ borderColor: 'var(--border)' }}
+      className="ml-1 flex items-center gap-2 border-l pl-3 border-line"
     >
       <span
-        className="flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-full text-xs font-semibold"
-        style={{ background: 'var(--accent-soft)', color: 'var(--accent)' }}
+        className="flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-full text-xs font-semibold bg-accent-soft text-accent"
         aria-hidden="true"
       >
         {(username || 'U').charAt(0).toUpperCase()}
@@ -177,15 +175,13 @@ function Layout() {
           badge (below) stay visible at every width — the admin badge must be
           preserved on mobile too, not just desktop. */}
       <span
-        className="hidden max-w-[120px] truncate text-sm font-medium sm:inline"
-        style={{ color: 'var(--text)' }}
+        className="hidden max-w-[120px] truncate text-sm font-medium sm:inline text-fg"
       >
         {username || 'User'}
       </span>
       {role === 'admin' && (
         <span
-          className="rounded px-1.5 py-0.5 text-[10px] font-medium uppercase"
-          style={{ background: 'var(--accent-soft)', color: 'var(--accent)' }}
+          className="rounded px-1.5 py-0.5 text-[10px] font-medium uppercase bg-accent-soft text-accent"
         >
           admin
         </span>

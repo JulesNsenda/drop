@@ -1,4 +1,4 @@
-import { useRef, KeyboardEvent } from 'react';
+import { useRef, KeyboardEvent, ReactNode } from 'react';
 import { LucideIcon } from 'lucide-react';
 import { cn } from '../lib/cn';
 
@@ -6,6 +6,16 @@ export interface TabDef {
   id: string;
   label: string;
   icon?: LucideIcon;
+}
+
+/** The panel id a tab controls. Shared so the two sides cannot drift. */
+export function tabPanelId(tabId: string): string {
+  return `dui-tabpanel-${tabId}`;
+}
+
+/** The tab button id, used by a panel's `aria-labelledby`. */
+export function tabId(id: string): string {
+  return `dui-tab-${id}`;
 }
 
 export interface TabsProps {
@@ -48,8 +58,14 @@ export interface TabsProps {
  * Activation follows focus, which is the WAI-ARIA pattern for tabs whose
  * panels are already rendered and cheap to switch.
  *
- * `aria-controls` is deliberately absent until the pages wrap their panels —
- * see above. Everything else in the contract holds without it.
+ * `aria-controls` is now present, but ONLY on the selected tab. The pages
+ * render one panel at a time, so an inactive tab has no panel to point at —
+ * and a dangling ARIA reference is worse than an absent one, which is the same
+ * reasoning that kept this off Radix Tabs. `aria-controls` is optional per tab
+ * in the pattern; a reference that resolves is the part that matters.
+ *
+ * Panels get no `tabIndex`: every one of them contains focusable content, so
+ * the pattern does not call for making the panel itself a tab stop.
  */
 function Tabs({ tabs, active, onChange, label }: TabsProps) {
   const refs = useRef<Record<string, HTMLButtonElement | null>>({});
@@ -107,8 +123,9 @@ function Tabs({ tabs, active, onChange, label }: TabsProps) {
               }}
               type="button"
               role="tab"
-              id={`dui-tab-${id}`}
+              id={tabId(id)}
               aria-selected={selected}
+              aria-controls={selected ? tabPanelId(id) : undefined}
               // Roving tabindex: only the selected tab is in the tab order, so
               // the whole bar is one stop instead of one per tab.
               tabIndex={selected ? 0 : -1}
@@ -124,6 +141,31 @@ function Tabs({ tabs, active, onChange, label }: TabsProps) {
           );
         })}
       </div>
+    </div>
+  );
+}
+
+/**
+ * Wraps a tab's content so the pair is a real tab/panel relationship rather
+ * than two unrelated regions that happen to sit near each other.
+ *
+ * Pages render exactly one of these at a time (`{active === 'x' && <TabPanel
+ * id="x">…}`), which is why `Tabs` only points `aria-controls` at the selected
+ * tab.
+ */
+export function TabPanel({
+  id,
+  children,
+  className,
+}: {
+  /** The TabDef id this panel belongs to. */
+  id: string;
+  children: ReactNode;
+  className?: string;
+}) {
+  return (
+    <div role="tabpanel" id={tabPanelId(id)} aria-labelledby={tabId(id)} className={className}>
+      {children}
     </div>
   );
 }

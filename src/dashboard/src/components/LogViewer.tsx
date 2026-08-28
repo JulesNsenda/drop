@@ -2,6 +2,7 @@ import { useState, useEffect, useMemo, useRef, ReactNode } from 'react';
 import { Terminal, Download, Copy, Pause, Play, Hammer, ArrowDown } from 'lucide-react';
 import { getAuthHeaders } from '../hooks/useAuth';
 import { useToast } from './Toast';
+import Tooltip from './ui/Tooltip';
 
 type LogTab = 'runtime' | 'build';
 type SourceFilter = 'all' | 'out' | 'err';
@@ -210,23 +211,22 @@ function LogViewer({ appName, appStatus }: { appName: string; appStatus?: string
 
   return (
     <div className="dui-card rounded-xl">
-      <div className="px-4 py-3 border-b" style={{ borderColor: 'var(--border)' }}>
+      <div className="px-4 py-3 border-b border-line">
         <div className="flex items-center justify-between flex-wrap gap-2">
           <div className="flex items-center gap-2">
-            <Terminal className="w-4 h-4" style={{ color: 'var(--text-2)' }} />
-            <h2 className="font-semibold" style={{ color: 'var(--text)' }}>
+            <Terminal className="w-4 h-4 text-muted" />
+            <h2 className="font-semibold text-fg">
               Logs
             </h2>
             {tab === 'runtime' && logsLoading && (
-              <span className="text-xs" style={{ color: 'var(--text-3)' }}>
+              <span className="text-xs text-faint">
                 (loading...)
               </span>
             )}
           </div>
           <div className="flex items-center gap-2">
             <div
-              className="flex rounded-lg border overflow-hidden"
-              style={{ borderColor: 'var(--border)' }}
+              className="flex rounded-lg border overflow-hidden border-line"
             >
               <button
                 onClick={() => setTab('runtime')}
@@ -244,22 +244,19 @@ function LogViewer({ appName, appStatus }: { appName: string; appStatus?: string
                 </span>
               </button>
             </div>
-            <button
-              onClick={handleDownload}
-              className={toolButton}
-              title="Download raw logs (last 1000 lines)"
-            >
-              <Download className="w-4 h-4" />
-              Download
-            </button>
+            <Tooltip content="Downloads the last 1000 lines">
+              <button onClick={handleDownload} className={toolButton}>
+                <Download className="w-4 h-4" />
+                Download
+              </button>
+            </Tooltip>
           </div>
         </div>
 
         {tab === 'runtime' && (
           <div className="flex items-center flex-wrap gap-2 mt-3">
             <div
-              className="flex rounded-lg border overflow-hidden"
-              style={{ borderColor: 'var(--border)' }}
+              className="flex rounded-lg border overflow-hidden border-line"
             >
               {(['all', 'out', 'err'] as const).map(s => (
                 <button
@@ -296,12 +293,14 @@ function LogViewer({ appName, appStatus }: { appName: string; appStatus?: string
               {paused ? <Play className="w-4 h-4" /> : <Pause className="w-4 h-4" />}
               {paused ? 'Resume' : 'Pause'}
             </button>
-            <button onClick={handleCopy} className={toolButton} title="Copy visible lines">
-              <Copy className="w-4 h-4" />
-              Copy
-            </button>
+            <Tooltip content="Copies only the lines currently shown">
+              <button onClick={handleCopy} className={toolButton}>
+                <Copy className="w-4 h-4" />
+                Copy
+              </button>
+            </Tooltip>
             {filtered && (
-              <span className="text-xs" style={{ color: 'var(--text-3)' }}>
+              <span className="text-xs text-faint">
                 {visible.length} of {parsed.length} fetched lines
               </span>
             )}

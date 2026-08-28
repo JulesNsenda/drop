@@ -24,7 +24,7 @@ import {
   Plug,
   GitBranch,
 } from 'lucide-react';
-import Tabs, { TabDef } from '../components/Tabs';
+import Tabs, { TabDef, TabPanel } from '../components/Tabs';
 import ApiKeysTab from '../components/ApiKeysTab';
 import McpConnectorTab from '../components/McpConnectorTab';
 import UserConnectorTab from '../components/UserConnectorTab';
@@ -69,8 +69,7 @@ function SectionCard({
       }
     >
       <div
-        className="flex items-center gap-2 border-b px-4 py-3"
-        style={{ borderColor: 'var(--border)' }}
+        className="flex items-center gap-2 border-b px-4 py-3 border-line"
       >
         {Icon && (
           <Icon className="h-4 w-4" style={{ color: danger ? 'var(--err)' : 'var(--text-3)' }} />
@@ -346,10 +345,10 @@ function SettingsPage() {
   return (
     <div className="p-6">
       <div className="mb-6">
-        <h1 className="text-2xl font-bold" style={{ color: 'var(--text)' }}>
+        <h1 className="text-2xl font-bold text-fg">
           Settings
         </h1>
-        <p className="mt-1 text-sm" style={{ color: 'var(--text-2)' }}>
+        <p className="mt-1 text-sm text-muted">
           Platform health, configuration, and status
         </p>
       </div>
@@ -363,563 +362,558 @@ function SettingsPage() {
 
       {/* System tab (admin only) */}
       {isAdmin && activeTab === 'system' && (
-        <>
-          <SectionCard title="System Health" icon={Server}>
-            {loading ? (
-              <SkeletonLines />
-            ) : health ? (
-              <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
-                <div className="flex items-center gap-3">
-                  <div
-                    className="flex h-10 w-10 items-center justify-center rounded-lg"
-                    style={{ background: 'var(--accent-soft)' }}
-                  >
-                    <Server className="h-5 w-5" style={{ color: 'var(--accent)' }} />
-                  </div>
-                  <div>
-                    <p className="text-xs" style={{ color: 'var(--text-3)' }}>
-                      Platform
-                    </p>
-                    <p
-                      className="text-sm font-medium capitalize"
-                      style={{ color: statusTone(health.status) }}
+        <TabPanel id="system">
+          <>
+            <SectionCard title="System Health" icon={Server}>
+              {loading ? (
+                <SkeletonLines />
+              ) : health ? (
+                <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
+                  <div className="flex items-center gap-3">
+                    <div
+                      className="flex h-10 w-10 items-center justify-center rounded-lg bg-accent-soft"
                     >
-                      {health.status}
-                    </p>
-                  </div>
-                </div>
-
-                <div className="flex items-center gap-3">
-                  <div
-                    className="flex h-10 w-10 items-center justify-center rounded-lg"
-                    style={{ background: 'var(--accent-soft)' }}
-                  >
-                    <HardDrive className="h-5 w-5" style={{ color: 'var(--accent)' }} />
-                  </div>
-                  <div>
-                    <p className="text-xs" style={{ color: 'var(--text-3)' }}>
-                      Uptime
-                    </p>
-                    <p className="text-sm font-medium" style={{ color: 'var(--text)' }}>
-                      {formatUptime(health.uptime)}
-                    </p>
-                  </div>
-                </div>
-
-                <div className="flex items-center gap-3">
-                  <div
-                    className="flex h-10 w-10 items-center justify-center rounded-lg"
-                    style={{ background: 'var(--accent-soft)' }}
-                  >
-                    <Activity className="h-5 w-5" style={{ color: 'var(--accent)' }} />
-                  </div>
-                  <div>
-                    <p className="text-xs" style={{ color: 'var(--text-3)' }}>
-                      Process Manager
-                    </p>
-                    <p
-                      className="text-sm font-medium capitalize"
-                      style={{
-                        color: statusTone(health.components?.processManager?.status || 'unknown'),
-                      }}
-                    >
-                      {health.components?.processManager?.status || 'Unknown'}
-                    </p>
-                  </div>
-                </div>
-
-                <div className="flex items-center gap-3">
-                  <div
-                    className="flex h-10 w-10 items-center justify-center rounded-lg"
-                    style={{ background: 'var(--accent-soft)' }}
-                  >
-                    <Database className="h-5 w-5" style={{ color: 'var(--accent)' }} />
-                  </div>
-                  <div>
-                    <p className="text-xs" style={{ color: 'var(--text-3)' }}>
-                      Database
-                    </p>
-                    <p
-                      className="text-sm font-medium capitalize"
-                      style={{
-                        color: statusTone(health.components?.database?.status || 'unknown'),
-                      }}
-                    >
-                      {health.components?.database?.status || 'Unknown'}
-                    </p>
-                  </div>
-                </div>
-              </div>
-            ) : (
-              <p style={{ color: 'var(--text-2)' }}>Unable to fetch system status</p>
-            )}
-          </SectionCard>
-
-          {/* Component Details */}
-          {health && (
-            <SectionCard title="Component Details">
-              <div className="-m-4 divide-y" style={{ borderColor: 'var(--border)' }}>
-                {Object.entries(health.components || {}).map(([name, comp]) => (
-                  <div
-                    key={name}
-                    className="flex items-center justify-between px-4 py-3"
-                    style={{ borderColor: 'var(--border)' }}
-                  >
-                    <div className="flex items-center gap-3">
-                      <StatusIcon status={comp?.status || 'unknown'} />
-                      <span
+                      <Server className="h-5 w-5 text-accent" />
+                    </div>
+                    <div>
+                      <p className="text-xs text-faint">
+                        Platform
+                      </p>
+                      <p
                         className="text-sm font-medium capitalize"
-                        style={{ color: 'var(--text-2)' }}
+                        style={{ color: statusTone(health.status) }}
                       >
-                        {name.replace(/([A-Z])/g, ' $1').trim()}
-                      </span>
-                    </div>
-                    <div className="text-right">
-                      <span
-                        className="text-sm capitalize"
-                        style={{ color: statusTone(comp?.status || 'unknown') }}
-                      >
-                        {comp?.status || 'unknown'}
-                      </span>
-                      {comp?.message && (
-                        <p className="text-xs" style={{ color: 'var(--text-3)' }}>
-                          {comp.message}
-                        </p>
-                      )}
+                        {health.status}
+                      </p>
                     </div>
                   </div>
-                ))}
-              </div>
-            </SectionCard>
-          )}
 
-          {/* App Health Checks */}
-          <SectionCard title="App Health Checks" icon={Eye}>
-            {appChecksLoading ? (
-              <SkeletonLines />
-            ) : appChecks.length === 0 ? (
-              <p className="text-sm" style={{ color: 'var(--text-2)' }}>
-                No running apps to check
-              </p>
-            ) : (
-              <div className="space-y-2">
-                {appChecks.map(app => (
-                  <div
-                    key={app.name}
-                    className="flex items-center justify-between rounded-lg px-3 py-2"
-                    style={{ background: 'var(--bg-2)' }}
-                  >
-                    <div className="flex items-center gap-3">
-                      <StatusIcon status={app.healthy ? 'up' : 'down'} />
-                      <span className="text-sm font-medium" style={{ color: 'var(--text-2)' }}>
-                        {app.name}
-                      </span>
-                      {app.port && (
-                        <span className="font-mono text-xs" style={{ color: 'var(--text-3)' }}>
-                          :{app.port}
-                        </span>
-                      )}
-                    </div>
-                    <span
-                      className="text-xs font-medium"
-                      style={{ color: app.healthy ? 'var(--ok)' : 'var(--err)' }}
+                  <div className="flex items-center gap-3">
+                    <div
+                      className="flex h-10 w-10 items-center justify-center rounded-lg bg-accent-soft"
                     >
-                      {app.healthy ? 'Responding' : 'Not responding'}
-                    </span>
+                      <HardDrive className="h-5 w-5 text-accent" />
+                    </div>
+                    <div>
+                      <p className="text-xs text-faint">
+                        Uptime
+                      </p>
+                      <p className="text-sm font-medium text-fg">
+                        {formatUptime(health.uptime)}
+                      </p>
+                    </div>
                   </div>
-                ))}
-              </div>
-            )}
-          </SectionCard>
 
-          {/* Configuration */}
-          <SectionCard title="Configuration">
-            <table className="w-full text-sm">
-              <tbody className="divide-y" style={{ borderColor: 'var(--border)' }}>
-                <tr style={{ borderColor: 'var(--border)' }}>
-                  <td className="py-2" style={{ color: 'var(--text-2)' }}>
-                    Version
-                  </td>
-                  <td className="py-2 font-mono" style={{ color: 'var(--text)' }}>
-                    {health?.version || '0.6.0'}
-                  </td>
-                </tr>
-                <tr style={{ borderColor: 'var(--border)' }}>
-                  <td className="py-2" style={{ color: 'var(--text-2)' }}>
-                    Apps Directory
-                  </td>
-                  <td className="py-2 font-mono text-xs" style={{ color: 'var(--text)' }}>
-                    {health?.system?.appsDirectory ?? '—'}
-                  </td>
-                </tr>
-                <tr style={{ borderColor: 'var(--border)' }}>
-                  <td className="py-2" style={{ color: 'var(--text-2)' }}>
-                    API Endpoint
-                  </td>
-                  <td
-                    className="py-2 font-mono text-xs"
-                    style={{ color: 'var(--text)' }}
-                  >{`${window.location.origin}/api/v1`}</td>
-                </tr>
-                <tr style={{ borderColor: 'var(--border)' }}>
-                  <td className="py-2" style={{ color: 'var(--text-2)' }}>
-                    Node.js
-                  </td>
-                  <td className="py-2 font-mono text-xs" style={{ color: 'var(--text)' }}>
-                    {typeof process !== 'undefined' ? 'Runtime' : 'N/A'}
-                  </td>
-                </tr>
-              </tbody>
-            </table>
-          </SectionCard>
-        </>
+                  <div className="flex items-center gap-3">
+                    <div
+                      className="flex h-10 w-10 items-center justify-center rounded-lg bg-accent-soft"
+                    >
+                      <Activity className="h-5 w-5 text-accent" />
+                    </div>
+                    <div>
+                      <p className="text-xs text-faint">
+                        Process Manager
+                      </p>
+                      <p
+                        className="text-sm font-medium capitalize"
+                        style={{
+                          color: statusTone(health.components?.processManager?.status || 'unknown'),
+                        }}
+                      >
+                        {health.components?.processManager?.status || 'Unknown'}
+                      </p>
+                    </div>
+                  </div>
+
+                  <div className="flex items-center gap-3">
+                    <div
+                      className="flex h-10 w-10 items-center justify-center rounded-lg bg-accent-soft"
+                    >
+                      <Database className="h-5 w-5 text-accent" />
+                    </div>
+                    <div>
+                      <p className="text-xs text-faint">
+                        Database
+                      </p>
+                      <p
+                        className="text-sm font-medium capitalize"
+                        style={{
+                          color: statusTone(health.components?.database?.status || 'unknown'),
+                        }}
+                      >
+                        {health.components?.database?.status || 'Unknown'}
+                      </p>
+                    </div>
+                  </div>
+                </div>
+              ) : (
+                <p className="text-muted">Unable to fetch system status</p>
+              )}
+            </SectionCard>
+
+            {/* Component Details */}
+            {health && (
+              <SectionCard title="Component Details">
+                <div className="-m-4 divide-y border-line">
+                  {Object.entries(health.components || {}).map(([name, comp]) => (
+                    <div
+                      key={name}
+                      className="flex items-center justify-between px-4 py-3 border-line"
+                    >
+                      <div className="flex items-center gap-3">
+                        <StatusIcon status={comp?.status || 'unknown'} />
+                        <span
+                          className="text-sm font-medium capitalize text-muted"
+                        >
+                          {name.replace(/([A-Z])/g, ' $1').trim()}
+                        </span>
+                      </div>
+                      <div className="text-right">
+                        <span
+                          className="text-sm capitalize"
+                          style={{ color: statusTone(comp?.status || 'unknown') }}
+                        >
+                          {comp?.status || 'unknown'}
+                        </span>
+                        {comp?.message && (
+                          <p className="text-xs text-faint">
+                            {comp.message}
+                          </p>
+                        )}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </SectionCard>
+            )}
+
+            {/* App Health Checks */}
+            <SectionCard title="App Health Checks" icon={Eye}>
+              {appChecksLoading ? (
+                <SkeletonLines />
+              ) : appChecks.length === 0 ? (
+                <p className="text-sm text-muted">
+                  No running apps to check
+                </p>
+              ) : (
+                <div className="space-y-2">
+                  {appChecks.map(app => (
+                    <div
+                      key={app.name}
+                      className="flex items-center justify-between rounded-lg px-3 py-2 bg-surface-2"
+                    >
+                      <div className="flex items-center gap-3">
+                        <StatusIcon status={app.healthy ? 'up' : 'down'} />
+                        <span className="text-sm font-medium text-muted">
+                          {app.name}
+                        </span>
+                        {app.port && (
+                          <span className="font-mono text-xs text-faint">
+                            :{app.port}
+                          </span>
+                        )}
+                      </div>
+                      <span
+                        className="text-xs font-medium"
+                        style={{ color: app.healthy ? 'var(--ok)' : 'var(--err)' }}
+                      >
+                        {app.healthy ? 'Responding' : 'Not responding'}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </SectionCard>
+
+            {/* Configuration */}
+            <SectionCard title="Configuration">
+              <table className="w-full text-sm">
+                <tbody className="divide-y border-line">
+                  <tr className="border-line">
+                    <td className="py-2 text-muted">
+                      Version
+                    </td>
+                    <td className="py-2 font-mono text-fg">
+                      {health?.version || '0.6.0'}
+                    </td>
+                  </tr>
+                  <tr className="border-line">
+                    <td className="py-2 text-muted">
+                      Apps Directory
+                    </td>
+                    <td className="py-2 font-mono text-xs text-fg">
+                      {health?.system?.appsDirectory ?? '—'}
+                    </td>
+                  </tr>
+                  <tr className="border-line">
+                    <td className="py-2 text-muted">
+                      API Endpoint
+                    </td>
+                    <td
+                      className="py-2 font-mono text-xs text-fg"
+                    >{`${window.location.origin}/api/v1`}</td>
+                  </tr>
+                  <tr className="border-line">
+                    <td className="py-2 text-muted">
+                      Node.js
+                    </td>
+                    <td className="py-2 font-mono text-xs text-fg">
+                      {typeof process !== 'undefined' ? 'Runtime' : 'N/A'}
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+            </SectionCard>
+          </>
+        </TabPanel>
       )}
 
       {/* Account tab */}
       {activeTab === 'account' && (
-        <>
-          {/* Change Password */}
-          <SectionCard title="Change Password" icon={Lock}>
-            <form onSubmit={handleChangePassword} className="max-w-md space-y-3">
-              <Input
-                type="password"
-                value={currentPw}
-                onChange={e => setCurrentPw(e.target.value)}
-                placeholder="Current password"
-                required
-              />
-              <Input
-                type="password"
-                value={newPw}
-                onChange={e => setNewPw(e.target.value)}
-                placeholder="New password (min 8 chars)"
-                required
-                minLength={8}
-              />
-              <Input
-                type="password"
-                value={confirmPw}
-                onChange={e => setConfirmPw(e.target.value)}
-                placeholder="Confirm new password"
-                required
-              />
-              <Button type="submit" loading={pwLoading}>
-                {pwLoading ? 'Changing...' : 'Change password'}
-              </Button>
-            </form>
-          </SectionCard>
+        <TabPanel id="account">
+          <>
+            {/* Change Password */}
+            <SectionCard title="Change Password" icon={Lock}>
+              <form onSubmit={handleChangePassword} className="max-w-md space-y-3">
+                <Input
+                  type="password"
+                  value={currentPw}
+                  onChange={e => setCurrentPw(e.target.value)}
+                  placeholder="Current password"
+                  required
+                />
+                <Input
+                  type="password"
+                  value={newPw}
+                  onChange={e => setNewPw(e.target.value)}
+                  placeholder="New password (min 8 chars)"
+                  required
+                  minLength={8}
+                />
+                <Input
+                  type="password"
+                  value={confirmPw}
+                  onChange={e => setConfirmPw(e.target.value)}
+                  placeholder="Confirm new password"
+                  required
+                />
+                <Button type="submit" loading={pwLoading}>
+                  {pwLoading ? 'Changing...' : 'Change password'}
+                </Button>
+              </form>
+            </SectionCard>
 
-          {/* Two-Factor Authentication */}
-          <SectionCard
-            title="Two-Factor Authentication"
-            icon={ShieldCheck}
-            headerExtra={
-              mfaEnabled ? (
-                <Badge tone="ok" className="ml-1">
-                  Enabled
-                </Badge>
-              ) : undefined
-            }
-          >
-            {mfaStep === 'idle' && (
-              <div>
-                {mfaEnabled ? (
+            {/* Two-Factor Authentication */}
+            <SectionCard
+              title="Two-Factor Authentication"
+              icon={ShieldCheck}
+              headerExtra={
+                mfaEnabled ? (
+                  <Badge tone="ok" className="ml-1">
+                    Enabled
+                  </Badge>
+                ) : undefined
+              }
+            >
+              {mfaStep === 'idle' && (
+                <div>
+                  {mfaEnabled ? (
+                    <div>
+                      <p className="mb-3 text-sm text-muted">
+                        Two-factor authentication is active. Your account requires a code from your
+                        authenticator app on each login.
+                      </p>
+                      <Button
+                        variant="danger"
+                        onClick={() => {
+                          setMfaStep('disable');
+                          setMfaCode('');
+                        }}
+                      >
+                        <ShieldOff className="h-4 w-4" />
+                        Disable two-factor authentication
+                      </Button>
+                    </div>
+                  ) : (
+                    <div>
+                      <p className="mb-3 text-sm text-muted">
+                        Add an extra layer of security to your account. You'll need an authenticator
+                        app (Google Authenticator, Authy, 1Password, etc.).
+                      </p>
+                      <Button onClick={handleMfaSetupStart} loading={mfaLoading}>
+                        {!mfaLoading && <ShieldCheck className="h-4 w-4" />}
+                        {mfaLoading ? 'Setting up...' : 'Enable two-factor authentication'}
+                      </Button>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {mfaStep === 'setup' && (
+                <form onSubmit={handleMfaEnable} className="max-w-sm space-y-4">
                   <div>
-                    <p className="mb-3 text-sm" style={{ color: 'var(--text-2)' }}>
-                      Two-factor authentication is active. Your account requires a code from your
-                      authenticator app on each login.
+                    <p className="mb-2 text-sm font-medium text-muted">
+                      1. Scan this QR code with your authenticator app
                     </p>
+                    {mfaQrDataUrl ? (
+                      <img
+                        src={mfaQrDataUrl}
+                        alt="TOTP QR code"
+                        className="rounded-lg border"
+                        style={{ width: 200, height: 200, borderColor: 'var(--border)' }}
+                      />
+                    ) : (
+                      <div
+                        className="flex h-48 w-48 items-center justify-center rounded-lg bg-surface-2"
+                      >
+                        <span className="text-xs text-faint">
+                          Generating...
+                        </span>
+                      </div>
+                    )}
+                    <p className="mt-2 text-xs text-faint">
+                      Can't scan? Enter this secret manually:
+                    </p>
+                    <code className="mt-1 block break-all">{mfaSetupSecret}</code>
+                  </div>
+
+                  <div>
+                    <label
+                      className="mb-1 block text-sm font-medium text-muted"
+                    >
+                      2. Enter the 6-digit code to confirm
+                    </label>
+                    <Input
+                      type="text"
+                      inputMode="numeric"
+                      pattern="[0-9]{6}"
+                      maxLength={6}
+                      value={mfaCode}
+                      onChange={e => setMfaCode(e.target.value.replace(/\D/g, ''))}
+                      placeholder="000000"
+                      required
+                      className="text-center text-xl font-mono tracking-widest"
+                    />
+                  </div>
+
+                  <div>
+                    <label
+                      className="mb-1 block text-sm font-medium text-muted"
+                    >
+                      3. Confirm your account password
+                    </label>
+                    <Input
+                      type="password"
+                      value={mfaPassword}
+                      onChange={e => setMfaPassword(e.target.value)}
+                      placeholder="Current password"
+                      required
+                    />
+                  </div>
+
+                  <div className="flex gap-3">
                     <Button
-                      variant="danger"
+                      type="submit"
+                      loading={mfaLoading}
+                      disabled={mfaCode.length !== 6 || !mfaPassword}
+                    >
+                      {mfaLoading ? 'Activating...' : 'Activate'}
+                    </Button>
+                    <Button
+                      type="button"
+                      variant="secondary"
                       onClick={() => {
-                        setMfaStep('disable');
+                        setMfaStep('idle');
+                        setMfaSetupUri('');
+                        setMfaSetupSecret('');
+                      }}
+                    >
+                      Cancel
+                    </Button>
+                  </div>
+
+                  <p className="text-xs text-faint">
+                    Lost your device? Run <code>drop mfa disable &lt;username&gt;</code> on the server
+                    to recover access.
+                  </p>
+                </form>
+              )}
+
+              {mfaStep === 'disable' && (
+                <form onSubmit={handleMfaDisable} className="max-w-sm space-y-4">
+                  <p className="text-sm text-muted">
+                    Enter a current code from your authenticator app to disable two-factor
+                    authentication.
+                  </p>
+                  <div>
+                    <label
+                      className="mb-1 block text-sm font-medium text-muted"
+                    >
+                      Authentication code
+                    </label>
+                    <Input
+                      type="text"
+                      inputMode="numeric"
+                      pattern="[0-9]{6}"
+                      maxLength={6}
+                      value={mfaCode}
+                      onChange={e => setMfaCode(e.target.value.replace(/\D/g, ''))}
+                      placeholder="000000"
+                      required
+                      autoFocus
+                      className="text-center text-xl font-mono tracking-widest"
+                    />
+                  </div>
+                  <div className="flex gap-3">
+                    <Button
+                      type="submit"
+                      variant="danger"
+                      loading={mfaLoading}
+                      disabled={mfaCode.length !== 6}
+                    >
+                      {mfaLoading ? 'Disabling...' : 'Disable 2FA'}
+                    </Button>
+                    <Button
+                      type="button"
+                      variant="secondary"
+                      onClick={() => {
+                        setMfaStep('idle');
                         setMfaCode('');
                       }}
                     >
-                      <ShieldOff className="h-4 w-4" />
-                      Disable two-factor authentication
+                      Cancel
                     </Button>
                   </div>
-                ) : (
-                  <div>
-                    <p className="mb-3 text-sm" style={{ color: 'var(--text-2)' }}>
-                      Add an extra layer of security to your account. You'll need an authenticator
-                      app (Google Authenticator, Authy, 1Password, etc.).
-                    </p>
-                    <Button onClick={handleMfaSetupStart} loading={mfaLoading}>
-                      {!mfaLoading && <ShieldCheck className="h-4 w-4" />}
-                      {mfaLoading ? 'Setting up...' : 'Enable two-factor authentication'}
-                    </Button>
-                  </div>
-                )}
-              </div>
-            )}
-
-            {mfaStep === 'setup' && (
-              <form onSubmit={handleMfaEnable} className="max-w-sm space-y-4">
-                <div>
-                  <p className="mb-2 text-sm font-medium" style={{ color: 'var(--text-2)' }}>
-                    1. Scan this QR code with your authenticator app
-                  </p>
-                  {mfaQrDataUrl ? (
-                    <img
-                      src={mfaQrDataUrl}
-                      alt="TOTP QR code"
-                      className="rounded-lg border"
-                      style={{ width: 200, height: 200, borderColor: 'var(--border)' }}
-                    />
-                  ) : (
-                    <div
-                      className="flex h-48 w-48 items-center justify-center rounded-lg"
-                      style={{ background: 'var(--bg-2)' }}
-                    >
-                      <span className="text-xs" style={{ color: 'var(--text-3)' }}>
-                        Generating...
-                      </span>
-                    </div>
-                  )}
-                  <p className="mt-2 text-xs" style={{ color: 'var(--text-3)' }}>
-                    Can't scan? Enter this secret manually:
-                  </p>
-                  <code className="mt-1 block break-all">{mfaSetupSecret}</code>
-                </div>
-
-                <div>
-                  <label
-                    className="mb-1 block text-sm font-medium"
-                    style={{ color: 'var(--text-2)' }}
-                  >
-                    2. Enter the 6-digit code to confirm
-                  </label>
-                  <Input
-                    type="text"
-                    inputMode="numeric"
-                    pattern="[0-9]{6}"
-                    maxLength={6}
-                    value={mfaCode}
-                    onChange={e => setMfaCode(e.target.value.replace(/\D/g, ''))}
-                    placeholder="000000"
-                    required
-                    className="text-center text-xl font-mono tracking-widest"
-                  />
-                </div>
-
-                <div>
-                  <label
-                    className="mb-1 block text-sm font-medium"
-                    style={{ color: 'var(--text-2)' }}
-                  >
-                    3. Confirm your account password
-                  </label>
-                  <Input
-                    type="password"
-                    value={mfaPassword}
-                    onChange={e => setMfaPassword(e.target.value)}
-                    placeholder="Current password"
-                    required
-                  />
-                </div>
-
-                <div className="flex gap-3">
-                  <Button
-                    type="submit"
-                    loading={mfaLoading}
-                    disabled={mfaCode.length !== 6 || !mfaPassword}
-                  >
-                    {mfaLoading ? 'Activating...' : 'Activate'}
-                  </Button>
-                  <Button
-                    type="button"
-                    variant="secondary"
-                    onClick={() => {
-                      setMfaStep('idle');
-                      setMfaSetupUri('');
-                      setMfaSetupSecret('');
-                    }}
-                  >
-                    Cancel
-                  </Button>
-                </div>
-
-                <p className="text-xs" style={{ color: 'var(--text-3)' }}>
-                  Lost your device? Run <code>drop mfa disable &lt;username&gt;</code> on the server
-                  to recover access.
-                </p>
-              </form>
-            )}
-
-            {mfaStep === 'disable' && (
-              <form onSubmit={handleMfaDisable} className="max-w-sm space-y-4">
-                <p className="text-sm" style={{ color: 'var(--text-2)' }}>
-                  Enter a current code from your authenticator app to disable two-factor
-                  authentication.
-                </p>
-                <div>
-                  <label
-                    className="mb-1 block text-sm font-medium"
-                    style={{ color: 'var(--text-2)' }}
-                  >
-                    Authentication code
-                  </label>
-                  <Input
-                    type="text"
-                    inputMode="numeric"
-                    pattern="[0-9]{6}"
-                    maxLength={6}
-                    value={mfaCode}
-                    onChange={e => setMfaCode(e.target.value.replace(/\D/g, ''))}
-                    placeholder="000000"
-                    required
-                    autoFocus
-                    className="text-center text-xl font-mono tracking-widest"
-                  />
-                </div>
-                <div className="flex gap-3">
-                  <Button
-                    type="submit"
-                    variant="danger"
-                    loading={mfaLoading}
-                    disabled={mfaCode.length !== 6}
-                  >
-                    {mfaLoading ? 'Disabling...' : 'Disable 2FA'}
-                  </Button>
-                  <Button
-                    type="button"
-                    variant="secondary"
-                    onClick={() => {
-                      setMfaStep('idle');
-                      setMfaCode('');
-                    }}
-                  >
-                    Cancel
-                  </Button>
-                </div>
-              </form>
-            )}
-          </SectionCard>
-
-          {/* Delete Account */}
-          {!isAdmin && (
-            <SectionCard title="Danger Zone" danger>
-              <div className="flex items-center justify-between">
-                <div>
-                  <p className="text-sm font-medium" style={{ color: 'var(--text)' }}>
-                    Delete account
-                  </p>
-                  <p className="text-xs" style={{ color: 'var(--text-3)' }}>
-                    Permanently remove your account and all your apps
-                  </p>
-                </div>
-                <Button
-                  variant="danger"
-                  onClick={async () => {
-                    const confirmed = await confirmDialog({
-                      title: 'Delete account',
-                      message:
-                        'This will permanently delete your account and all your deployed applications. This cannot be undone.',
-                      confirmText: 'Delete my account',
-                      variant: 'danger',
-                    });
-                    if (!confirmed) return;
-                    try {
-                      const res = await fetch('/api/v1/auth/account', {
-                        method: 'DELETE',
-                        headers: getAuthHeaders(),
-                      });
-                      const json = await res.json();
-                      if (json.success) {
-                        localStorage.clear();
-                        window.location.href = '/dashboard';
-                      } else {
-                        toast('error', json.error?.message || 'Failed to delete account');
-                      }
-                    } catch {
-                      toast('error', 'Network error');
-                    }
-                  }}
-                >
-                  Delete account
-                </Button>
-              </div>
+                </form>
+              )}
             </SectionCard>
-          )}
-        </>
+
+            {/* Delete Account */}
+            {!isAdmin && (
+              <SectionCard title="Danger Zone" danger>
+                <div className="flex items-center justify-between">
+                  <div>
+                    <p className="text-sm font-medium text-fg">
+                      Delete account
+                    </p>
+                    <p className="text-xs text-faint">
+                      Permanently remove your account and all your apps
+                    </p>
+                  </div>
+                  <Button
+                    variant="danger"
+                    onClick={async () => {
+                      const confirmed = await confirmDialog({
+                        title: 'Delete account',
+                        message:
+                          'This will permanently delete your account and all your deployed applications. This cannot be undone.',
+                        confirmText: 'Delete my account',
+                        variant: 'danger',
+                      });
+                      if (!confirmed) return;
+                      try {
+                        const res = await fetch('/api/v1/auth/account', {
+                          method: 'DELETE',
+                          headers: getAuthHeaders(),
+                        });
+                        const json = await res.json();
+                        if (json.success) {
+                          localStorage.clear();
+                          window.location.href = '/dashboard';
+                        } else {
+                          toast('error', json.error?.message || 'Failed to delete account');
+                        }
+                      } catch {
+                        toast('error', 'Network error');
+                      }
+                    }}
+                  >
+                    Delete account
+                  </Button>
+                </div>
+              </SectionCard>
+            )}
+          </>
+        </TabPanel>
       )}
 
       {/* API Keys tab (admin only) */}
-      {isAdmin && activeTab === 'api-keys' && <ApiKeysTab />}
+      {isAdmin && <TabPanel id="api-keys">activeTab === 'api-keys' && <ApiKeysTab /></TabPanel>}
 
       {/* Claude (MCP) connector tab (admin + user; readonly never sees it) */}
-      {isAdmin && activeTab === 'mcp-connector' && <McpConnectorTab />}
-      {!isAdmin && canUseConnectors && activeTab === 'mcp-connector' && <UserConnectorTab />}
+      {isAdmin && <TabPanel id="mcp-connector">activeTab === 'mcp-connector' && <McpConnectorTab /></TabPanel>}
+      {!isAdmin && <TabPanel id="mcp-connector">canUseConnectors && activeTab === 'mcp-connector' && <UserConnectorTab /></TabPanel>}
 
       {/* Git webhooks tab (admin only) */}
-      {isAdmin && activeTab === 'git-webhooks' && <GitWebhooksTab />}
+      {isAdmin && <TabPanel id="git-webhooks">activeTab === 'git-webhooks' && <GitWebhooksTab /></TabPanel>}
 
       {/* Activity tab (admin only) */}
       {isAdmin && activeTab === 'activity' && (
-        <SectionCard title="Recent Activity" icon={Clock}>
-          {activityLoading ? (
-            <SkeletonLines />
-          ) : activity.length === 0 ? (
-            <p className="text-sm" style={{ color: 'var(--text-2)' }}>
-              No activity yet
-            </p>
-          ) : (
-            <div className="max-h-80 space-y-2 overflow-auto">
-              {activity.map(a => (
-                <div key={a.id} className="flex items-center justify-between py-1.5 text-sm">
-                  <div>
-                    <span className="font-medium" style={{ color: 'var(--text-2)' }}>
-                      {a.username || 'system'}
-                    </span>
-                    <span style={{ color: 'var(--text-2)' }}> {a.action}</span>
-                    {a.appName && <span style={{ color: 'var(--accent)' }}> {a.appName}</span>}
-                    {a.detail && (
-                      <span className="ml-1 text-xs" style={{ color: 'var(--text-3)' }}>
-                        ({a.detail})
+        <TabPanel id="activity">
+          <SectionCard title="Recent Activity" icon={Clock}>
+            {activityLoading ? (
+              <SkeletonLines />
+            ) : activity.length === 0 ? (
+              <p className="text-sm text-muted">
+                No activity yet
+              </p>
+            ) : (
+              <div className="max-h-80 space-y-2 overflow-auto">
+                {activity.map(a => (
+                  <div key={a.id} className="flex items-center justify-between py-1.5 text-sm">
+                    <div>
+                      <span className="font-medium text-muted">
+                        {a.username || 'system'}
                       </span>
-                    )}
+                      <span className="text-muted"> {a.action}</span>
+                      {a.appName && <span className="text-accent"> {a.appName}</span>}
+                      {a.detail && (
+                        <span className="ml-1 text-xs text-faint">
+                          ({a.detail})
+                        </span>
+                      )}
+                    </div>
+                    <span
+                      className="ml-4 whitespace-nowrap text-xs text-faint"
+                    >
+                      {new Date(a.timestamp).toLocaleString()}
+                    </span>
                   </div>
-                  <span
-                    className="ml-4 whitespace-nowrap text-xs"
-                    style={{ color: 'var(--text-3)' }}
-                  >
-                    {new Date(a.timestamp).toLocaleString()}
-                  </span>
-                </div>
-              ))}
-            </div>
-          )}
-        </SectionCard>
+                ))}
+              </div>
+            )}
+          </SectionCard>
+        </TabPanel>
       )}
 
       {/* About tab */}
       {activeTab === 'about' && (
-        <SectionCard title="About DROP">
-          <p className="mb-4 text-sm" style={{ color: 'var(--text-2)' }}>
-            DROP (Deploy, Run, Operate, Publish) is a lightweight, self-hosted PaaS for
-            zero-configuration deployments. Drop a folder and get a running application.
-          </p>
-          <div className="flex gap-4">
-            <a
-              href="https://github.com/JulesNsenda/drop"
-              target="_blank"
-              rel="noopener noreferrer"
-              className="text-sm"
-            >
-              GitHub
-            </a>
-            <a
-              href="https://github.com/JulesNsenda/drop/blob/main/CHANGELOG.md"
-              target="_blank"
-              rel="noopener noreferrer"
-              className="text-sm"
-            >
-              Changelog
-            </a>
-          </div>
-        </SectionCard>
+        <TabPanel id="about">
+          <SectionCard title="About DROP">
+            <p className="mb-4 text-sm text-muted">
+              DROP (Deploy, Run, Operate, Publish) is a lightweight, self-hosted PaaS for
+              zero-configuration deployments. Drop a folder and get a running application.
+            </p>
+            <div className="flex gap-4">
+              <a
+                href="https://github.com/JulesNsenda/drop"
+                target="_blank"
+                rel="noopener noreferrer"
+                className="text-sm"
+              >
+                GitHub
+              </a>
+              <a
+                href="https://github.com/JulesNsenda/drop/blob/main/CHANGELOG.md"
+                target="_blank"
+                rel="noopener noreferrer"
+                className="text-sm"
+              >
+                Changelog
+              </a>
+            </div>
+          </SectionCard>
+        </TabPanel>
       )}
     </div>
   );

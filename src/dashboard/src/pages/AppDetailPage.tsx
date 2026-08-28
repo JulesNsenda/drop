@@ -43,7 +43,7 @@ import { useConfirm } from '../components/ConfirmDialog';
 import StatusBadge from '../components/StatusBadge';
 import DeployTimeline from '../components/DeployTimeline';
 import LogViewer from '../components/LogViewer';
-import Tabs, { TabDef } from '../components/Tabs';
+import Tabs, { TabDef, TabPanel } from '../components/Tabs';
 import MetricsTab from '../components/MetricsTab';
 import DatabaseTab from '../components/DatabaseTab';
 import AccessTab from '../components/AccessTab';
@@ -276,8 +276,8 @@ function AppDetailPage() {
     return (
       <div className="p-6">
         <div className="animate-pulse">
-          <div className="mb-4 h-8 w-48 rounded" style={{ background: 'var(--bg-2)' }} />
-          <div className="h-4 w-96 rounded" style={{ background: 'var(--bg-2)' }} />
+          <div className="mb-4 h-8 w-48 rounded bg-surface-2" />
+          <div className="h-4 w-96 rounded bg-surface-2" />
         </div>
       </div>
     );
@@ -293,8 +293,7 @@ function AppDetailPage() {
       <div className="p-6">
         <Link
           to="/apps"
-          className="mb-6 inline-flex items-center gap-2 text-sm transition-opacity hover:opacity-70"
-          style={{ color: 'var(--text-2)' }}
+          className="mb-6 inline-flex items-center gap-2 text-sm transition-opacity hover:opacity-70 !text-muted"
         >
           <ArrowLeft className="h-4 w-4" />
           Back to apps
@@ -318,8 +317,7 @@ function AppDetailPage() {
       {/* Back link */}
       <Link
         to="/apps"
-        className="mb-6 inline-flex items-center gap-2 text-sm transition-opacity hover:opacity-70"
-        style={{ color: 'var(--text-2)' }}
+        className="mb-6 inline-flex items-center gap-2 text-sm transition-opacity hover:opacity-70 !text-muted"
       >
         <ArrowLeft className="h-4 w-4" />
         Back to apps
@@ -345,12 +343,12 @@ function AppDetailPage() {
       <div className="mb-6 flex flex-wrap items-start justify-between gap-4">
         <div>
           <div className="mb-2 flex items-center gap-3">
-            <h1 className="text-2xl font-bold" style={{ color: 'var(--text)' }}>
+            <h1 className="text-2xl font-bold text-fg">
               {app.name}
             </h1>
             <StatusBadge status={app.status} />
           </div>
-          <p className="text-sm" style={{ color: 'var(--text-2)' }}>
+          <p className="text-sm text-muted">
             {app.type} application
             {app.framework && ` (${app.framework})`}
           </p>
@@ -364,7 +362,7 @@ function AppDetailPage() {
                 variant="secondary"
                 onClick={() => handleAction('restart')}
                 disabled={actionLoading !== null}
-                style={{ color: 'var(--warn)' }}
+                className="!text-warn"
               >
                 <RotateCw
                   className={`h-4 w-4 ${actionLoading === 'restart' ? 'animate-spin' : ''}`}
@@ -429,7 +427,7 @@ function AppDetailPage() {
                 variant="secondary"
                 onClick={handleRedeploy}
                 disabled={actionLoading !== null}
-                style={{ color: 'var(--accent)' }}
+                className="!text-accent"
                 title={
                   isGroupChild
                     ? `Re-pull and rebuild the whole ${app.group} monorepo group`
@@ -460,11 +458,11 @@ function AppDetailPage() {
             background: 'color-mix(in srgb, var(--warn) 10%, transparent)',
           }}
         >
-          <div className="mb-2 flex items-center gap-2" style={{ color: 'var(--warn)' }}>
+          <div className="mb-2 flex items-center gap-2 text-warn">
             <AlertTriangle className="h-4 w-4 flex-shrink-0" />
             <p className="text-sm font-medium">Waiting on required secrets</p>
           </div>
-          <p className="mb-3 text-sm" style={{ color: 'var(--text-2)' }}>
+          <p className="mb-3 text-sm text-muted">
             This app declared required secrets in its <code>drop.yaml</code> that aren&apos;t set
             yet, so DROP parked it instead of starting it.
             {app.missingSecrets && app.missingSecrets.length > 0
@@ -474,7 +472,7 @@ function AppDetailPage() {
           {app.missingSecrets && app.missingSecrets.length > 0 && (
             <ul className="mb-3 space-y-1">
               {app.missingSecrets.map(key => (
-                <li key={key} className="font-mono text-sm" style={{ color: 'var(--text)' }}>
+                <li key={key} className="font-mono text-sm text-fg">
                   {key}
                 </li>
               ))}
@@ -493,7 +491,7 @@ function AppDetailPage() {
               variant="secondary"
               onClick={() => handleAction('restart')}
               disabled={actionLoading !== null}
-              style={{ color: 'var(--warn)' }}
+              className="!text-warn"
             >
               <RotateCw
                 className={`h-4 w-4 ${actionLoading === 'restart' ? 'animate-spin' : ''}`}
@@ -508,289 +506,290 @@ function AppDetailPage() {
       <Tabs tabs={DETAIL_TABS} active={activeTab} onChange={setActiveTab} label="App sections" />
 
       {activeTab === 'overview' && (
-        <>
-        {/* Info cards */}
-        <div className="mb-6 grid gap-4 md:grid-cols-3">
-          <Card>
-            <div className="mb-1 flex items-center gap-2" style={{ color: 'var(--text-2)' }}>
-              <ExternalLink className="h-4 w-4" />
-              <span className="text-sm">URL</span>
-            </div>
-            {app.port ? (
-              <a
-                href={appLinkInfo(app).href}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="break-all text-sm font-semibold hover:underline"
-              >
-                {appLinkInfo(app).label}
-              </a>
-            ) : (
-              <span className="text-sm font-semibold" style={{ color: 'var(--text-3)' }}>
-                Not assigned
-              </span>
-            )}
-          </Card>
-
-          {app.mcp ? (
+        <TabPanel id="overview">
+          <>
+          {/* Info cards */}
+          <div className="mb-6 grid gap-4 md:grid-cols-3">
             <Card>
-              <div className="mb-1 flex items-center gap-2" style={{ color: 'var(--text-2)' }}>
-                <Plug className="h-4 w-4" />
-                <span className="text-sm">MCP endpoint</span>
+              <div className="mb-1 flex items-center gap-2 text-muted">
+                <ExternalLink className="h-4 w-4" />
+                <span className="text-sm">URL</span>
               </div>
-              <p className="break-all text-sm font-semibold" style={{ color: 'var(--text)' }}>
-                {app.mcp.url}
-              </p>
-              {/*
-                Shown with the URL, never separately: an operator handed only an
-                address would reasonably assume DROP guards it, and for `auth:
-                none` it does not.
-
-                This used to say "Public" unconditionally, ignoring `mcp.auth`
-                — wrong for every `auth: drop` app, where the Caddy forward_auth
-                gateway DOES verify an audience-bound token (see
-                routes/mcp-gateway.ts).
-
-                The wording is deliberately "guarded at the proxy", not
-                "protected": the guard lives ONLY in Caddy. platform.ts logs the
-                two counter-cases itself — outside docker isolation the app binds
-                a host port that is reachable directly, bypassing it, and when
-                apiPort is unusable the guard is not emitted at all. `mcp.auth`
-                is the tenant's DECLARATION, not proof of enforcement, so this
-                must not promise more than the declaration supports.
-              */}
-              <p className="mt-1 text-xs" style={{ color: 'var(--text-3)' }}>
-                {app.mcp.auth === 'drop'
-                  ? 'Guarded at the proxy — DROP verifies an audience-bound token on requests that arrive through it. Traffic reaching the app’s own port directly is not covered.'
-                  : 'Public — DROP does not authenticate callers to this endpoint.'}
-              </p>
+              {app.port ? (
+                <a
+                  href={appLinkInfo(app).href}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="break-all text-sm font-semibold hover:underline"
+                >
+                  {appLinkInfo(app).label}
+                </a>
+              ) : (
+                <span className="text-sm font-semibold text-faint">
+                  Not assigned
+                </span>
+              )}
             </Card>
-          ) : null}
 
-          {isAdmin && app.path ? (
+            {app.mcp ? (
+              <Card>
+                <div className="mb-1 flex items-center gap-2 text-muted">
+                  <Plug className="h-4 w-4" />
+                  <span className="text-sm">MCP endpoint</span>
+                </div>
+                <p className="break-all text-sm font-semibold text-fg">
+                  {app.mcp.url}
+                </p>
+                {/*
+                  Shown with the URL, never separately: an operator handed only an
+                  address would reasonably assume DROP guards it, and for `auth:
+                  none` it does not.
+
+                  This used to say "Public" unconditionally, ignoring `mcp.auth`
+                  — wrong for every `auth: drop` app, where the Caddy forward_auth
+                  gateway DOES verify an audience-bound token (see
+                  routes/mcp-gateway.ts).
+
+                  The wording is deliberately "guarded at the proxy", not
+                  "protected": the guard lives ONLY in Caddy. platform.ts logs the
+                  two counter-cases itself — outside docker isolation the app binds
+                  a host port that is reachable directly, bypassing it, and when
+                  apiPort is unusable the guard is not emitted at all. `mcp.auth`
+                  is the tenant's DECLARATION, not proof of enforcement, so this
+                  must not promise more than the declaration supports.
+                */}
+                <p className="mt-1 text-xs text-faint">
+                  {app.mcp.auth === 'drop'
+                    ? 'Guarded at the proxy — DROP verifies an audience-bound token on requests that arrive through it. Traffic reaching the app’s own port directly is not covered.'
+                    : 'Public — DROP does not authenticate callers to this endpoint.'}
+                </p>
+              </Card>
+            ) : null}
+
+            {isAdmin && app.path ? (
+              <Card>
+                <div className="mb-1 flex items-center gap-2 text-muted">
+                  <Folder className="h-4 w-4" />
+                  <span className="text-sm">Path</span>
+                </div>
+                <p
+                  className="truncate font-mono text-sm text-fg"
+                  title={app.path}
+                >
+                  {app.path}
+                </p>
+                {app.ownerName && (
+                  <p className="mt-1 text-xs text-muted">
+                    Owner: {app.ownerName}
+                  </p>
+                )}
+              </Card>
+            ) : (
+              <Card>
+                <div className="mb-1 flex items-center gap-2 text-muted">
+                  <Folder className="h-4 w-4" />
+                  <span className="text-sm">Type</span>
+                </div>
+                <p className="text-sm capitalize text-fg">
+                  {app.type}
+                  {app.framework ? ` (${app.framework})` : ''}
+                </p>
+              </Card>
+            )}
+
             <Card>
-              <div className="mb-1 flex items-center gap-2" style={{ color: 'var(--text-2)' }}>
-                <Folder className="h-4 w-4" />
-                <span className="text-sm">Path</span>
+              <div className="mb-1 flex items-center gap-2 text-muted">
+                <Clock className="h-4 w-4" />
+                <span className="text-sm">Last Deployed</span>
               </div>
-              <p
-                className="truncate font-mono text-sm"
-                style={{ color: 'var(--text)' }}
-                title={app.path}
-              >
-                {app.path}
+              <p className="text-sm text-fg">
+                {formatDate(app.lastDeployedAt)}
               </p>
-              {app.ownerName && (
-                <p className="mt-1 text-xs" style={{ color: 'var(--text-2)' }}>
-                  Owner: {app.ownerName}
+              {app.buildDuration && (
+                <p className="text-xs text-muted">
+                  Build: {app.buildDuration}ms
                 </p>
               )}
             </Card>
-          ) : (
-            <Card>
-              <div className="mb-1 flex items-center gap-2" style={{ color: 'var(--text-2)' }}>
-                <Folder className="h-4 w-4" />
-                <span className="text-sm">Type</span>
+          </div>
+
+          {/* Git source info */}
+          {app.gitSource && (
+            <Card className="mb-6">
+              <div className="mb-3 flex items-center gap-2 text-muted">
+                <GitBranch className="h-4 w-4" />
+                <span className="text-sm font-medium">Git Source</span>
               </div>
-              <p className="text-sm capitalize" style={{ color: 'var(--text)' }}>
-                {app.type}
-                {app.framework ? ` (${app.framework})` : ''}
-              </p>
+              <div className="grid gap-3 text-sm md:grid-cols-2">
+                <div>
+                  <span className="text-muted">Repository: </span>
+                  <a
+                    href={app.gitSource.repoUrl}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="hover:underline"
+                  >
+                    {app.gitSource.repoUrl.replace('https://github.com/', '')}
+                  </a>
+                </div>
+                <div>
+                  <span className="text-muted">Branch: </span>
+                  <span className="font-mono text-fg">
+                    {app.gitSource.branch}
+                  </span>
+                </div>
+                {app.gitSource.lastCommitSha && (
+                  <div>
+                    <span className="text-muted">Commit: </span>
+                    <span className="font-mono text-fg">
+                      {app.gitSource.lastCommitSha.slice(0, 7)}
+                    </span>
+                  </div>
+                )}
+                <div>
+                  <span className="text-muted">Auto-redeploy: </span>
+                  <span className="text-fg">
+                    {app.gitSource.autoRedeploy ? 'Enabled' : 'Disabled'}
+                  </span>
+                </div>
+                {isAdmin && (
+                  <div>
+                    <span className="text-muted">Credential: </span>
+                    <span className="text-fg">{attachedTokenLabel}</span>
+                  </div>
+                )}
+              </div>
             </Card>
           )}
 
-          <Card>
-            <div className="mb-1 flex items-center gap-2" style={{ color: 'var(--text-2)' }}>
-              <Clock className="h-4 w-4" />
-              <span className="text-sm">Last Deployed</span>
+          {/* Error message */}
+          {app.error && (
+            <div
+              className="mb-6 rounded-lg border p-4 text-sm"
+              style={{
+                borderColor: 'var(--err)',
+                background: 'color-mix(in srgb, var(--err) 10%, transparent)',
+                color: 'var(--err)',
+              }}
+            >
+              <strong>Error:</strong> {app.error}
             </div>
-            <p className="text-sm" style={{ color: 'var(--text)' }}>
-              {formatDate(app.lastDeployedAt)}
-            </p>
-            {app.buildDuration && (
-              <p className="text-xs" style={{ color: 'var(--text-2)' }}>
-                Build: {app.buildDuration}ms
-              </p>
-            )}
-          </Card>
-        </div>
-
-        {/* Git source info */}
-        {app.gitSource && (
-          <Card className="mb-6">
-            <div className="mb-3 flex items-center gap-2" style={{ color: 'var(--text-2)' }}>
-              <GitBranch className="h-4 w-4" />
-              <span className="text-sm font-medium">Git Source</span>
-            </div>
-            <div className="grid gap-3 text-sm md:grid-cols-2">
-              <div>
-                <span style={{ color: 'var(--text-2)' }}>Repository: </span>
-                <a
-                  href={app.gitSource.repoUrl}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="hover:underline"
-                >
-                  {app.gitSource.repoUrl.replace('https://github.com/', '')}
-                </a>
-              </div>
-              <div>
-                <span style={{ color: 'var(--text-2)' }}>Branch: </span>
-                <span className="font-mono" style={{ color: 'var(--text)' }}>
-                  {app.gitSource.branch}
-                </span>
-              </div>
-              {app.gitSource.lastCommitSha && (
-                <div>
-                  <span style={{ color: 'var(--text-2)' }}>Commit: </span>
-                  <span className="font-mono" style={{ color: 'var(--text)' }}>
-                    {app.gitSource.lastCommitSha.slice(0, 7)}
-                  </span>
-                </div>
-              )}
-              <div>
-                <span style={{ color: 'var(--text-2)' }}>Auto-redeploy: </span>
-                <span style={{ color: 'var(--text)' }}>
-                  {app.gitSource.autoRedeploy ? 'Enabled' : 'Disabled'}
-                </span>
-              </div>
-              {isAdmin && (
-                <div>
-                  <span style={{ color: 'var(--text-2)' }}>Credential: </span>
-                  <span style={{ color: 'var(--text)' }}>{attachedTokenLabel}</span>
-                </div>
-              )}
-            </div>
-          </Card>
-        )}
-
-        {/* Error message */}
-        {app.error && (
-          <div
-            className="mb-6 rounded-lg border p-4 text-sm"
-            style={{
-              borderColor: 'var(--err)',
-              background: 'color-mix(in srgb, var(--err) 10%, transparent)',
-              color: 'var(--err)',
-            }}
-          >
-            <strong>Error:</strong> {app.error}
-          </div>
-        )}
-        </>
+          )}
+          </>
+        </TabPanel>
       )}
 
-      {activeTab === 'activity' && <DeployTimeline appName={app.name} />}
+      {activeTab === 'activity' && <TabPanel id="activity"><DeployTimeline appName={app.name} /></TabPanel>}
 
-      {activeTab === 'logs' && <LogViewer appName={app.name} appStatus={app.status} />}
+      {activeTab === 'logs' && <TabPanel id="logs"><LogViewer appName={app.name} appStatus={app.status} /></TabPanel>}
 
-      {activeTab === 'metrics' && <MetricsTab app={app} />}
+      {activeTab === 'metrics' && <TabPanel id="metrics"><MetricsTab app={app} /></TabPanel>}
 
-      {activeTab === 'database' && <DatabaseTab name={app.name} />}
+      {activeTab === 'database' && <TabPanel id="database"><DatabaseTab name={app.name} /></TabPanel>}
 
       {/* Admins keep the full governance view; a non-admin owner gets the
           narrower, WRITE-capable share panel instead — `AccessTab`'s allow-list
           and provenance are exactly what `ShareCard` withholds from the party
           it would otherwise disclose (DROP-153). */}
-      {activeTab === 'access' && (isAdmin ? <AccessTab appName={app.name} /> : <ShareCard appName={app.name} />)}
+      {activeTab === 'access' && <TabPanel id="access">(isAdmin ? <AccessTab appName={app.name} /> : <ShareCard appName={app.name} />)</TabPanel>}
 
       {activeTab === 'environment' && (
-        <Card padded={false}>
-          <div
-            className="flex items-center border-b px-4 py-3"
-            style={{ borderColor: 'var(--border)' }}
-          >
-            <Key className="mr-2 h-4 w-4" style={{ color: 'var(--text-2)' }} />
-            <h2 className="font-semibold" style={{ color: 'var(--text)' }}>
-              Environment Variables
-            </h2>
-          </div>
-          <div className="p-4">
-            {envLoading ? (
-              <div className="h-8 animate-pulse rounded" style={{ background: 'var(--bg-2)' }} />
-            ) : (
-              <>
-                {envVars.length > 0 && (
-                  <div className="mb-4 space-y-2">
-                    {envVars.map(key => (
-                      <div key={key} className="flex items-center gap-2 text-sm">
-                        <span
-                          className="min-w-[120px] font-mono font-medium"
-                          style={{ color: 'var(--text)' }}
-                        >
-                          {key}
-                        </span>
-                        <span
-                          className="flex-1 truncate font-mono"
-                          style={{ color: 'var(--text-2)' }}
-                        >
-                          ••••••••
-                        </span>
-                        {role !== 'readonly' && (
-                          <button
-                            onClick={() => handleRemoveEnvVar(key)}
-                            className="transition-opacity hover:opacity-70"
-                            style={{ color: 'var(--text-3)' }}
-                            aria-label={`Remove ${key}`}
+        <TabPanel id="environment">
+          <Card padded={false}>
+            <div
+              className="flex items-center border-b px-4 py-3 border-line"
+            >
+              <Key className="mr-2 h-4 w-4 text-muted" />
+              <h2 className="font-semibold text-fg">
+                Environment Variables
+              </h2>
+            </div>
+            <div className="p-4">
+              {envLoading ? (
+                <div className="h-8 animate-pulse rounded bg-surface-2" />
+              ) : (
+                <>
+                  {envVars.length > 0 && (
+                    <div className="mb-4 space-y-2">
+                      {envVars.map(key => (
+                        <div key={key} className="flex items-center gap-2 text-sm">
+                          <span
+                            className="min-w-[120px] font-mono font-medium text-fg"
                           >
-                            <X className="h-4 w-4" />
-                          </button>
-                        )}
-                      </div>
-                    ))}
-                  </div>
-                )}
-
-                {envVars.length === 0 && (
-                  <p className="mb-4 text-sm" style={{ color: 'var(--text-2)' }}>
-                    No environment variables set
-                  </p>
-                )}
-
-                {role !== 'readonly' && (
-                  <>
-                    {/* Add new */}
-                    <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
-                      <div className="flex-1">
-                        <Input
-                          type="text"
-                          value={newKey}
-                          onChange={e => setNewKey(e.target.value.toUpperCase())}
-                          placeholder="KEY"
-                          className="font-mono"
-                        />
-                      </div>
-                      <div className="flex-1">
-                        <Input
-                          type="text"
-                          value={newValue}
-                          onChange={e => setNewValue(e.target.value)}
-                          placeholder="value"
-                          className="font-mono"
-                        />
-                      </div>
-                      <Button variant="primary" onClick={handleAddEnvVar} disabled={!newKey.trim()}>
-                        <Plus className="h-3.5 w-3.5" />
-                        Add
-                      </Button>
+                            {key}
+                          </span>
+                          <span
+                            className="flex-1 truncate font-mono text-muted"
+                          >
+                            ••••••••
+                          </span>
+                          {role !== 'readonly' && (
+                            <button
+                              onClick={() => handleRemoveEnvVar(key)}
+                              className="transition-opacity hover:opacity-70 text-faint"
+                              aria-label={`Remove ${key}`}
+                            >
+                              <X className="h-4 w-4" />
+                            </button>
+                          )}
+                        </div>
+                      ))}
                     </div>
-                    <p className="mt-2 text-xs" style={{ color: 'var(--text-2)' }}>
-                      Changes take effect on next restart.
+                  )}
+
+                  {envVars.length === 0 && (
+                    <p className="mb-4 text-sm text-muted">
+                      No environment variables set
                     </p>
-                  </>
-                )}
-              </>
-            )}
-          </div>
-        </Card>
+                  )}
+
+                  {role !== 'readonly' && (
+                    <>
+                      {/* Add new */}
+                      <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+                        <div className="flex-1">
+                          <Input
+                            type="text"
+                            value={newKey}
+                            onChange={e => setNewKey(e.target.value.toUpperCase())}
+                            placeholder="KEY"
+                            className="font-mono"
+                          />
+                        </div>
+                        <div className="flex-1">
+                          <Input
+                            type="text"
+                            value={newValue}
+                            onChange={e => setNewValue(e.target.value)}
+                            placeholder="value"
+                            className="font-mono"
+                          />
+                        </div>
+                        <Button variant="primary" onClick={handleAddEnvVar} disabled={!newKey.trim()}>
+                          <Plus className="h-3.5 w-3.5" />
+                          Add
+                        </Button>
+                      </div>
+                      <p className="mt-2 text-xs text-muted">
+                        Changes take effect on next restart.
+                      </p>
+                    </>
+                  )}
+                </>
+              )}
+            </div>
+          </Card>
+        </TabPanel>
       )}
 
       {activeTab === 'domains' && (
-        <CustomDomainSection
-          appName={app.name}
-          currentDomain={app.customDomain}
-          onUpdate={refresh}
-        />
+        <TabPanel id="domains">
+          <CustomDomainSection
+            appName={app.name}
+            currentDomain={app.customDomain}
+            onUpdate={refresh}
+          />
+        </TabPanel>
       )}
     </div>
   );
@@ -832,7 +831,7 @@ function CustomDomainSection({
 
   return (
     <Card>
-      <div className="mb-3 flex items-center gap-2" style={{ color: 'var(--text-2)' }}>
+      <div className="mb-3 flex items-center gap-2 text-muted">
         <Globe className="h-4 w-4" />
         <span className="text-sm font-medium">Custom Domain</span>
       </div>
@@ -850,7 +849,7 @@ function CustomDomainSection({
         </Button>
       </div>
       {currentDomain && (
-        <p className="mt-2 text-xs" style={{ color: 'var(--text-2)' }}>
+        <p className="mt-2 text-xs text-muted">
           Point a CNAME record for <code>{currentDomain}</code> to your DROP server.
         </p>
       )}

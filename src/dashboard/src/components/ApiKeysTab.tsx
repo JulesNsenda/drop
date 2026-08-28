@@ -6,6 +6,7 @@ import { useConfirm } from './ConfirmDialog';
 import Button from './ui/Button';
 import Input from './ui/Input';
 import Card from './ui/Card';
+import Field from './ui/Field';
 import { SkeletonText } from './ui/Skeleton';
 import {
   Table,
@@ -186,12 +187,11 @@ function ApiKeysTab() {
   return (
     <Card padded={false} className="mb-6">
       <div
-        className="px-4 py-3 border-b flex items-center justify-between"
-        style={{ borderColor: 'var(--border)' }}
+        className="px-4 py-3 border-b flex items-center justify-between border-line"
       >
         <div className="flex items-center gap-2">
-          <KeyRound className="w-4 h-4" style={{ color: 'var(--text-2)' }} />
-          <h2 className="font-semibold" style={{ color: 'var(--text)' }}>
+          <KeyRound className="w-4 h-4 text-muted" />
+          <h2 className="font-semibold text-fg">
             API Keys
           </h2>
         </div>
@@ -207,8 +207,7 @@ function ApiKeysTab() {
         {step === 'form' && (
           <form
             onSubmit={handleCreate}
-            className="mb-6 space-y-3 max-w-md border rounded-lg p-4"
-            style={{ background: 'var(--bg-2)', borderColor: 'var(--border)' }}
+            className="mb-6 space-y-3 max-w-md border rounded-lg p-4 bg-surface-2 border-line"
           >
             {formError && (
               <div
@@ -233,25 +232,20 @@ function ApiKeysTab() {
               placeholder="e.g. CI deploy key"
               autoFocus
             />
-            <div>
-              <label
-                className="mb-1 block text-sm font-medium"
-                style={{ color: 'var(--text-2)' }}
-                htmlFor="api-key-role"
-              >
-                Role
-              </label>
-              <select
-                id="api-key-role"
-                value={role}
-                onChange={e => setRole(e.target.value as ApiKeyRecord['role'])}
-                className="w-full rounded-lg px-3 py-2 text-sm outline-none dui-input"
-              >
-                <option value="readonly">Readonly</option>
-                <option value="user">User</option>
-                <option value="admin">Admin</option>
-              </select>
-            </div>
+            <Field label="Role" id="api-key-role">
+              {({ id }) => (
+                <select
+                  id={id}
+                  value={role}
+                  onChange={e => setRole(e.target.value as ApiKeyRecord['role'])}
+                  className="dui-input w-full rounded-lg px-3 py-2 text-sm outline-none"
+                >
+                  <option value="readonly">Readonly</option>
+                  <option value="user">User</option>
+                  <option value="admin">Admin</option>
+                </select>
+              )}
+            </Field>
             <Input
               id="api-key-expires"
               label="Expires in (days)"
@@ -276,20 +270,14 @@ function ApiKeysTab() {
 
         {step === 'reveal' && createdKey && (
           <div
-            className="mb-6 max-w-md border rounded-lg p-4 space-y-3"
-            style={{ background: 'var(--bg-2)', borderColor: 'var(--border)' }}
+            className="mb-6 max-w-md border rounded-lg p-4 space-y-3 bg-surface-2 border-line"
           >
-            <div className="flex items-center gap-2" style={{ color: 'var(--warn)' }}>
+            <div className="flex items-center gap-2 text-warn">
               <AlertTriangle className="w-4 h-4 flex-shrink-0" />
               <p className="text-sm font-medium">This key won't be shown again — copy it now.</p>
             </div>
             <code
-              className="block text-xs font-mono px-3 py-2 rounded border break-all select-all"
-              style={{
-                background: 'var(--bg-3)',
-                color: 'var(--text)',
-                borderColor: 'var(--border)',
-              }}
+              className="block text-xs font-mono px-3 py-2 rounded border break-all select-all bg-surface-3 text-fg border-line"
             >
               {createdKey.key}
             </code>
@@ -309,11 +297,11 @@ function ApiKeysTab() {
         {loading ? (
           <SkeletonText label="Loading API keys" />
         ) : error ? (
-          <p className="text-sm" style={{ color: 'var(--err)' }}>
+          <p className="text-sm text-err">
             {error}
           </p>
         ) : keys.length === 0 ? (
-          <p className="text-sm" style={{ color: 'var(--text-2)' }}>
+          <p className="text-sm text-muted">
             No API keys yet
           </p>
         ) : (
