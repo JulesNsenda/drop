@@ -1,4 +1,4 @@
-import { asStringArray, asArray } from './api-shape';
+import { asStringArray, asArray, asArrayOr } from './api-shape';
 
 /**
  * DROP-237. The case that mattered is `asStringArray([], 'keys')`.
@@ -64,5 +64,55 @@ describe('asArray', () => {
     ['a string', 'no'],
   ])('returns [] for %s', (_label, input) => {
     expect(asArray(input)).toEqual([]);
+  });
+});
+
+/**
+ * What the call sites actually do with the result: `.map()`, `.filter()`,
+ * `new Set()`, and index reads. Every one of those throws on the `{}` payload
+ * that a `?? []` lets through, so the contract worth pinning is not just
+ * "returns an array" but "is safe for all of them, for every degraded shape".
+ */
+describe('asArray: the contract the call sites rely on', () => {
+  it.each([
+    ['null', null],
+    ['undefined', undefined],
+    ['an empty object', {}],
+    ['an object with keys', { keys: [] }],
+    ['a string', 'nope'],
+    ['a number', 7],
+    ['true', true],
+  ])('%s survives map, filter, Set and an index read', (_label, input) => {
+    const out = asArray<string>(input);
+    expect(out).toEqual([]);
+    expect(() => out.map(v => v)).not.toThrow();
+    expect(() => out.filter(Boolean)).not.toThrow();
+    expect(() => new Set(out)).not.toThrow();
+    expect(out[0]).toBeUndefined();
+  });
+});
+
+describe('asArrayOr', () => {
+  const FALLBACK: string[] = [];
+
+  it('passes an array through', () => {
+    const given = ['a'];
+    expect(asArrayOr(given, FALLBACK)).toBe(given);
+  });
+
+  it.each([
+    ['null', null],
+    ['undefined', undefined],
+    ['an object', {}],
+    ['a string', 'no'],
+  ])('returns the fallback for %s', (_label, input) => {
+    expect(asArrayOr(input, FALLBACK)).toEqual([]);
+  });
+
+  it('returns the fallback BY IDENTITY, so useMemo([apps]) does not re-run', () => {
+    // A fresh `[]` here would change identity on every poll and defeat the
+    // memoised filtering/grouping in AppsPage.
+    expect(asArrayOr({}, FALLBACK)).toBe(FALLBACK);
+    expect(asArrayOr(undefined, FALLBACK)).toBe(FALLBACK);
   });
 });

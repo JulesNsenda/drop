@@ -38,3 +38,13 @@ export function asStringArray(value: unknown, key: string): string[] {
 export function asArray<T>(value: unknown): T[] {
   return Array.isArray(value) ? (value as T[]) : [];
 }
+
+/**
+ * `value` if it is genuinely an array, otherwise `fallback` — returned BY
+ * IDENTITY, not copied. The polled hooks hand out one shared empty array so
+ * `useMemo([apps])` in AppsPage does not re-run on every poll; a fresh `[]`
+ * here would defeat that, which is why this exists alongside `asArray`.
+ */
+export function asArrayOr<T>(value: unknown, fallback: T[]): T[] {
+  return Array.isArray(value) ? (value as T[]) : fallback;
+}

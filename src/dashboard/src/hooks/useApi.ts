@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback, useRef } from 'react';
 import { apiJson, apiJsonWithStatus, jsonBody } from '../api/client';
 import { redeployBody } from '../lib/redeploy-credential';
 import { createPollTracker, PollTracker } from '../lib/poll-tracker';
+import { asArray, asArrayOr } from '../lib/api-shape';
 
 export interface GitSource {
   repoUrl: string;
@@ -213,7 +214,11 @@ const NO_APPS: App[] = [];
 
 export function useApps() {
   const { data, ...rest } = usePolledJson<App[]>('/apps', 5000, 'Failed to fetch apps');
-  return { apps: data ?? NO_APPS, ...rest };
+  // asArrayOr, not `?? NO_APPS`: a `{}` payload is neither null nor
+  // undefined, so a default never fires and AppsPage's `apps.filter` throws
+  // (DROP-237). The fallback is returned by identity, so the stable-array
+  // rationale above still holds.
+  return { apps: asArrayOr(data, NO_APPS), ...rest };
 }
 
 export function useApp(name: string) {
@@ -259,7 +264,9 @@ export function useDeployTimeline(appName: string) {
     5000,
     'Failed to fetch deploy timeline'
   );
-  return { episodes: data ?? NO_EPISODES, ...rest };
+  // Same shape guard as useApps: `{}` would pass `??` and then reach
+  // `episodes[0]` as undefined, crashing the timeline (DROP-237).
+  return { episodes: asArrayOr(data, NO_EPISODES), ...rest };
 }
 
 export interface UsageInfo {
@@ -372,7 +379,7 @@ export async function gitRedeploy(
 
 export async function getGitTokens(): Promise<GitTokenInfo[]> {
   const json = await apiJson<GitTokenInfo[]>('/git/tokens');
-  return json.data || [];
+  return asArray<GitTokenInfo>(json.data);
 }
 
 export async function addGitToken(

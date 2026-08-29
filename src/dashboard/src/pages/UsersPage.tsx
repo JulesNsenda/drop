@@ -2,6 +2,7 @@ import { useState, useEffect } from 'react';
 import { Link } from 'react-router-dom';
 import { Users, Shield, ShieldOff, RefreshCw, ArrowLeft } from 'lucide-react';
 import { getAuthHeaders } from '../hooks/useAuth';
+import { asArray } from '../lib/api-shape';
 import { useToast } from '../components/Toast';
 import StatusBadge from '../components/StatusBadge';
 import { App } from '../hooks/useApi';
@@ -53,7 +54,7 @@ function UsersPage() {
     try {
       const res = await fetch('/api/v1/auth/users', { headers: getAuthHeaders() });
       const json = await res.json();
-      if (json.success) setUsers(json.data || []);
+      if (json.success) setUsers(asArray<UserInfo>(json.data));
     } catch {
     } finally {
       setLoading(false);
@@ -72,7 +73,7 @@ function UsersPage() {
       const res = await fetch('/api/v1/apps', { headers: getAuthHeaders() });
       const json = await res.json();
       if (json.success) {
-        setUserApps((json.data || []).filter((a: App) => a.userId === user.id));
+        setUserApps(asArray<App>(json.data).filter(a => a.userId === user.id));
       }
     } catch {
       setUserApps([]);
@@ -84,7 +85,9 @@ function UsersPage() {
       const json = await res.json();
       if (json.success) {
         setUserActivity(
-          (json.data || []).filter((a: ActivityEntry) => a.username === user.username).slice(0, 15)
+          asArray<ActivityEntry>(json.data)
+            .filter(a => a.username === user.username)
+            .slice(0, 15)
         );
       }
     } catch {

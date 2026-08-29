@@ -3,6 +3,7 @@ import { useSearchParams } from 'react-router-dom';
 import QRCode from 'qrcode';
 import { useHealth, AppHealthCheck } from '../hooks/useApi';
 import { getAuthHeaders, useAuth } from '../hooks/useAuth';
+import { asArray } from '../lib/api-shape';
 import { useToast } from '../components/Toast';
 import { useConfirm } from '../components/ConfirmDialog';
 import {
@@ -263,7 +264,7 @@ function SettingsPage() {
       try {
         const res = await fetch('/api/v1/admin/activity?limit=20', { headers: getAuthHeaders() });
         const json = await res.json();
-        if (json.success) setActivity(json.data || []);
+        if (json.success) setActivity(asArray<ActivityEntry>(json.data));
       } catch {
       } finally {
         setActivityLoading(false);
