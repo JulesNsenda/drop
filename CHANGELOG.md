@@ -27,16 +27,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.1]
+
+A dashboard-only patch. One malformed API response could replace an entire page
+with the error boundary at mount — not the panel that made the call, the whole
+page, header and tabs and every action button with it. Nothing on the server
+changed, and upgrading needs no configuration.
+
 ### Fixed
 
 - **The app page white-screened on a degraded API response.** When the secrets
   endpoint returned an array instead of `{ keys: [...] }`, `data.keys` resolved
   to `Array.prototype.keys` — a function, so the `?? []` default never fired —
-  and React called it as a state updater, throwing out of `basicStateReducer`
-  and replacing the whole page with the error boundary at mount. Fixed at the
-  read, and the same array-versus-object assumption is now guarded across the
-  apps list, the deploy timeline, the git token list, the access tab, the API
-  keys tab, the activity log and the users page. (#237)
+  and React called it as a state updater, throwing out of `basicStateReducer`.
+  (#237)
+- **The same array-versus-object assumption crashed six more pages.** A `{}`
+  payload passes every `?? []` and `|| []` default, and a `length === 0` guard
+  does not stop it either: `{}.length` is `undefined`, so the guard falls
+  through to `.map()` on an object. The apps list, the deploy timeline, the git
+  token list, the API keys tab, the activity log and the users page each went
+  down that way; the access tab and two filtered lists are hardened alongside
+  them. Verified against the real bundle: eight pages that failed on degraded
+  shapes before the fix all render after it. (#237)
 
 ## [1.5.0] - 2026-08-28
 
