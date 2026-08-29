@@ -27,7 +27,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [1.5.1]
+## [1.5.1] - 2026-08-29
 
 A dashboard-only patch. One malformed API response could replace an entire page
 with the error boundary at mount — not the panel that made the call, the whole
