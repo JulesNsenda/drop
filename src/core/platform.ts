@@ -4100,6 +4100,8 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         ? await this.buildLogService.startBuild(appName, buildStartedAt, deployId)
         : null;
 
+      await this.writeWritablePathHint(logId, appName);
+
       // Everything between startBuild and closeBuildLog must sit in this
       // try/finally: the disk check below throws on a low-disk box, and that
       // used to skip finishBuild entirely — leaking the log's write stream and
@@ -4325,6 +4327,51 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       }
     } catch {
       // Guardrail state is best-effort; it must never fail a deploy.
+    }
+  }
+
+  /**
+   * Announce the writable-path contract at the TOP of a deploy log (issue #238).
+   *
+   * Persistent storage has always existed — `DROP_DATA_DIR` is injected into
+   * every app's environment and bind-mounted read-write — but it was
+   * discoverable only by reading that environment, and nothing about a failed
+   * write points there. An author who tried `/app/storage` got an errno naming
+   * the PATH rather than the mount, probed five more directories, and concluded
+   * the platform had no durable storage at all. It does. That report cost hours
+   * and still ended in the wrong conclusion, so this says it before anything
+   * fails rather than explaining it afterwards.
+   *
+   * The deploy log is the target because it is the one surface an app author
+   * reliably reads: `get_deploy_logs`, the CLI, and the dashboard's build output
+   * all render it. Never throws — a hint that breaks a deploy would be a far
+   * worse bug than the confusion it prevents.
+   */
+  private async writeWritablePathHint(logId: string | null, appName: string): Promise<void> {
+    if (!logId || !this.buildLogService) return;
+    try {
+      const dataDir = await this.ensureAppDataDirectory(appName);
+      this.buildLogService.writeLine(
+        logId,
+        `[drop] Writable data directory: ${dataDir} (also in the app env as DROP_DATA_DIR).`
+      );
+      this.buildLogService.writeLine(
+        logId,
+        '[drop] It survives redeploys, and already contains uploads/, logs/ and cache/.'
+      );
+      // ONLY under docker isolation. `container-manager.ts` bind-mounts the
+      // source at /app with `ReadOnly: true`; under 'none' the app is a host
+      // process in a writable directory, and claiming otherwise would send a
+      // pm2-box author hunting a restriction that is not there.
+      if (this.config.isolation === 'docker') {
+        this.buildLogService.writeLine(
+          logId,
+          '[drop] The app source directory is mounted READ-ONLY — write here instead.'
+        );
+      }
+    } catch (error) {
+      this.logger.debug(`Could not write the data-directory hint for ${appName}`, 'DATA');
+      void error;
     }
   }
 
