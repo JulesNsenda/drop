@@ -44,6 +44,7 @@ import StatusBadge from '../components/StatusBadge';
 import DeployTimeline from '../components/DeployTimeline';
 import LogViewer from '../components/LogViewer';
 import Tabs, { TabDef, TabPanel } from '../components/Tabs';
+import { asStringArray } from '../lib/api-shape';
 import MetricsTab from '../components/MetricsTab';
 import DatabaseTab from '../components/DatabaseTab';
 import AccessTab from '../components/AccessTab';
@@ -104,8 +105,15 @@ function AppDetailPage() {
         setEnvLoading(true);
         const res = await fetch(`/api/v1/secrets/${name}`, { headers: getAuthHeaders() });
         const json = await res.json();
-        if (json.success && json.data) {
-          setEnvVars(json.data.keys ?? []);
+        if (json.success) {
+          // NOT `json.data.keys ?? []`: when `data` comes back as an array,
+          // `data.keys` is `Array.prototype.keys` — a function, so `??` never
+          // fires — and React treats a function passed to a setter as an
+          // updater, calling it unbound. That threw
+          // `Cannot convert undefined or null to object` out of
+          // basicStateReducer and replaced the WHOLE page with the error
+          // boundary at mount (DROP-237).
+          setEnvVars(asStringArray(json.data, 'keys'));
         }
       } catch {
         // Secrets endpoint may not be available

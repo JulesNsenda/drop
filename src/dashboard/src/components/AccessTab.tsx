@@ -3,6 +3,7 @@ import { AlertTriangle, Lock, ShieldCheck, ShieldOff, Users } from 'lucide-react
 import { apiJsonWithStatus, jsonBody } from '../api/client';
 import { getAuthHeaders } from '../hooks/useAuth';
 import Card from './ui/Card';
+import { asArray } from '../lib/api-shape';
 import Button from './ui/Button';
 import Input from './ui/Input';
 
@@ -62,7 +63,10 @@ function AccessTab({ appName }: { appName: string }) {
       // The allow-list is the SOURCE; the checkboxes mirror it. Re-seeding on
       // every load means a failed save cannot leave the form claiming a state
       // the server never accepted.
-      setSelected(new Set(res.data.access?.allow ?? []));
+      // asArray, not `?? []`: `new Set` throws on a non-iterable, and a `{}`
+      // there is neither null nor undefined so the default never fires
+      // (DROP-237).
+      setSelected(new Set(asArray<string>(res.data.access?.allow)));
       setReviewBy(res.data.reviewBy ? res.data.reviewBy.slice(0, 10) : '');
     }
   }, [appName]);
@@ -78,7 +82,7 @@ function AccessTab({ appName }: { appName: string }) {
       try {
         const res = await fetch('/api/v1/auth/users', { headers: getAuthHeaders() });
         const json = (await res.json()) as { success: boolean; data?: DirectoryUser[] };
-        if (json.success) setUsers(json.data ?? []);
+        if (json.success) setUsers(asArray(json.data));
       } catch {
         // A missing directory degrades the picker, not the page.
       }
