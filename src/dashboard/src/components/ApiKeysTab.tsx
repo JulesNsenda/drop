@@ -1,6 +1,7 @@
 import { useState, useEffect, FormEvent } from 'react';
 import { KeyRound, Copy, Trash2, Plus, CheckCircle, AlertTriangle } from 'lucide-react';
 import { apiJson, jsonBody } from '../api/client';
+import { asArray } from '../lib/api-shape';
 import { useToast } from './Toast';
 import { useConfirm } from './ConfirmDialog';
 import Button from './ui/Button';
@@ -71,7 +72,7 @@ function ApiKeysTab() {
     setError('');
     const json = await apiJson<ApiKeyRecord[]>('/auth/api-keys');
     if (json.success) {
-      setKeys(json.data || []);
+      setKeys(asArray<ApiKeyRecord>(json.data));
     } else {
       setError(json.error?.message || 'Failed to load API keys');
     }

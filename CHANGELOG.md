@@ -27,6 +27,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **The app page white-screened on a degraded API response.** When the secrets
+  endpoint returned an array instead of `{ keys: [...] }`, `data.keys` resolved
+  to `Array.prototype.keys` — a function, so the `?? []` default never fired —
+  and React called it as a state updater, throwing out of `basicStateReducer`
+  and replacing the whole page with the error boundary at mount. Fixed at the
+  read, and the same array-versus-object assumption is now guarded across the
+  apps list, the deploy timeline, the git token list, the access tab, the API
+  keys tab, the activity log and the users page. (#237)
+
 ## [1.5.0] - 2026-08-28
 
 Apps can now require a sign-in before anyone reaches them, owners can share an

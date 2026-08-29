@@ -63,7 +63,10 @@ function AccessTab({ appName }: { appName: string }) {
       // The allow-list is the SOURCE; the checkboxes mirror it. Re-seeding on
       // every load means a failed save cannot leave the form claiming a state
       // the server never accepted.
-      setSelected(new Set(res.data.access?.allow ?? []));
+      // asArray, not `?? []`: `new Set` throws on a non-iterable, and a `{}`
+      // there is neither null nor undefined so the default never fires
+      // (DROP-237).
+      setSelected(new Set(asArray<string>(res.data.access?.allow)));
       setReviewBy(res.data.reviewBy ? res.data.reviewBy.slice(0, 10) : '');
     }
   }, [appName]);
