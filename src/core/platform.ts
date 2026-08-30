@@ -108,7 +108,9 @@ import {
 import { ApiServer, createApiServer } from '../api';
 import {
   AppInProgressError,
+  AppManifestInvalidError,
   AppNeedsConfigError,
+  needsConfigAction,
   setPlatformOps,
   resetPlatformOps,
   type AttachableServiceId,
@@ -273,6 +275,24 @@ export interface PlatformConfig {
    */
   enableSecretPreflight: boolean;
   /**
+   * Refuse to start an app whose `drop.yaml` exists but does not parse
+   * (DROP-130 Q1). The preflight above can only gate on secrets it can SEE:
+   * every `parseDropYaml` caller reads `cfg.success ? cfg.config?.x :
+   * undefined`, so a manifest with a typo yields `declaredSecrets = undefined`,
+   * `planSecretPreflight` reports nothing missing, and the app starts
+   * unconfigured — precisely what the preflight exists to prevent. Once the
+   * parse has failed we cannot know whether secrets were declared, so refusing
+   * is the only sound answer.
+   *
+   * **Default false, deliberately.** The blast radius is real and cannot be
+   * measured from a development box: an app whose manifest is already
+   * malformed deploys today and would refuse to start after. DROP-130's own
+   * recommendation was to ship the warning (item 9, done), read the resulting
+   * `drop.yaml failed to parse` lines off the live fleet, and only then flip
+   * this. Turn it on with DROP_STRICT_MANIFEST=true once that log is clean.
+   */
+  strictManifest: boolean;
+  /**
    * Boot reconciliation (M1): stops the watcher's initial scan from
    * fabricating `app:detected` — and therefore a full rebuild — for every
    * existing app dir on every platform restart.
@@ -380,6 +400,7 @@ const DEFAULT_CONFIG: PlatformConfig = {
   redisPort: parseInt(process.env.DROP_REDIS_PORT || '6380', 10),
   maxRedisPerUser: parseInt(process.env.DROP_MAX_REDIS_PER_USER || '3', 10),
   enableSecretPreflight: process.env.DROP_ENABLE_SECRET_PREFLIGHT !== 'false',
+  strictManifest: process.env.DROP_STRICT_MANIFEST === 'true',
   bootReconcileMode: parseBootReconcileMode(process.env.DROP_BOOT_RECONCILE),
   maxConcurrentBuilds: parseInt(process.env.DROP_MAX_CONCURRENT_BUILDS || '3', 10),
   maxConcurrentApps: parseInt(process.env.DROP_MAX_CONCURRENT_APPS || '0', 10),
@@ -4651,13 +4672,16 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       // `starting` transition above already cleared any stale error.
       if (error instanceof AppNeedsConfigError) {
         this.logger.warn(
-          `${appName} parked in needs-config — set required secret(s): ` +
-            `${error.missingSecrets.join(', ')}, then restart`,
+          `${appName} parked in needs-config — ${needsConfigAction(error)}, then restart`,
           'SECURITY'
         );
         if (this.stateManager) {
           await this.stateManager.setAppStatus(appName, 'needs-config', {
             missingSecrets: error.missingSecrets,
+            // Only the manifest park carries a reason the empty `missingSecrets`
+            // list cannot express. `needs-config` is not in setAppStatus's
+            // error-clearing set, so this survives until the app next starts.
+            ...(error instanceof AppManifestInvalidError ? { error: error.message } : {}),
           });
         }
         // COUNTED. buildFreshStartSpec throws this AFTER the build completed,
@@ -5967,12 +5991,12 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       // `starting` transition above already cleared any stale error.
       if (error instanceof AppNeedsConfigError) {
         this.logger.warn(
-          `${appName} parked in needs-config on hot-reload — set required secret(s): ` +
-            `${error.missingSecrets.join(', ')}, then restart`,
+          `${appName} parked in needs-config on hot-reload — ${needsConfigAction(error)}, then restart`,
           'SECURITY'
         );
         await this.stateManager.setAppStatus(appName, 'needs-config', {
           missingSecrets: error.missingSecrets,
+          ...(error instanceof AppManifestInvalidError ? { error: error.message } : {}),
         });
         // COUNTED, unlike the pre-build deferrals. AppNeedsConfigError is
         // thrown from buildFreshStartSpec, which runs AFTER builder.build() has
@@ -8009,6 +8033,25 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     // expansion writes into each child's drop.yaml) was previously ignored,
     // leaving e.g. a TypeScript backend stuck on the `node index.js` default.
     const dropYamlCfg = await parseDropYaml(appPath);
+
+    // DROP-130 Q1 — the fail-OPEN half of item 9, closed behind a flag.
+    //
+    // Every read of this result below is `dropYamlCfg.success ? … : undefined`,
+    // which is correct field by field and wrong in aggregate: on a parse
+    // failure the whole manifest is discarded silently, so `secrets:` reads as
+    // "none declared", the preflight gate finds nothing missing, and the app
+    // starts with none of the configuration its author wrote. A typo like
+    // `JWT-SECRET` is enough. Refusing is the only sound response — the one
+    // thing we cannot know after a failed parse is what was declared.
+    //
+    // Gated OFF by default: turning this on refuses to start any app already
+    // carrying a malformed manifest, and that population is unknowable from
+    // here. `warnParseFailure` (item 9) makes it knowable from the live log
+    // first. See DropPlatformConfig.strictManifest.
+    if (this.config.strictManifest && dropYamlCfg.exists && !dropYamlCfg.success) {
+      throw new AppManifestInvalidError(appName, dropYamlCfg.error ?? 'unknown parse error');
+    }
+
     const startOverride = dropYamlCfg.success ? dropYamlCfg.config?.start : undefined;
 
     // Procfile `web:` is the next rung down: a user-provided, language-agnostic

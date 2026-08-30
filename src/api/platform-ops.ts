@@ -66,6 +66,52 @@ export class AppNeedsConfigError extends Error {
   }
 }
 
+/**
+ * Thrown by the start path when an app's `drop.yaml` EXISTS but does not parse,
+ * and `strictManifest` is on (DROP-130 Q1). A subclass of the secret park
+ * rather than its own error because it is the same event from the operator's
+ * side — the app is not broken, its configuration is, and the fix is a config
+ * edit followed by a retry. Subclassing also means every `instanceof
+ * AppNeedsConfigError` site already routes it to `needs-config` instead of
+ * `errored`; only the human-facing text has to distinguish the two.
+ *
+ * `missingSecrets` is empty and that is the honest value: once the parse has
+ * failed, which secrets the manifest declared is exactly what is unknown. Use
+ * `needsConfigDetail()` rather than reading `missingSecrets` when rendering
+ * this to a caller.
+ */
+export class AppManifestInvalidError extends AppNeedsConfigError {
+  constructor(
+    appName: string,
+    readonly reason: string,
+  ) {
+    super(appName, []);
+    this.name = 'AppManifestInvalidError';
+    this.message =
+      `Application '${appName}' has a drop.yaml that does not parse, so it was not started: ${reason}`;
+  }
+}
+
+/**
+ * What the operator has to DO about a `needs-config` park, as a clause that
+ * can be embedded in a longer sentence. One function because the two
+ * subclasses park for different reasons and every site that renders one must
+ * not decide that for itself: "set required secret(s): " with nothing after
+ * the colon — which is what the manifest park's empty `missingSecrets`
+ * produces — sends the operator looking for a secret that was never the
+ * problem.
+ */
+export function needsConfigAction(err: AppNeedsConfigError): string {
+  return err instanceof AppManifestInvalidError
+    ? `fix drop.yaml (${err.reason})`
+    : `set required secret(s): ${err.missingSecrets.join(', ')}`;
+}
+
+/** The whole operator-facing sentence, for handlers that render it alone. */
+export function needsConfigDetail(err: AppNeedsConfigError, appName: string): string {
+  return `Application '${appName}' needs configuration — ${needsConfigAction(err)}, then retry`;
+}
+
 export interface PlatformOps {
   /**
    * Stop-if-running, rebuild the start spec from current state (secrets,
