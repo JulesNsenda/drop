@@ -282,8 +282,13 @@ function awaitingPromotionResult(appName: string): CallToolResult {
  * Poll the deploy tracker until the episode correlated with this deploy
  * (`startedAt >= acceptedAt`) reaches a terminal status, or the wait budget
  * (`DROP_MCP_DEPLOY_WAIT_MS`, default 120s) elapses.
+ *
+ * Exported for its own tests — the timeout branch's contract (#265) is a
+ * message the caller depends on to reach `get_deploy_logs`, and driving a whole
+ * deploy handler to assert one string would test the mocks, not the policy.
+ * `deploy-result.ts` exports its helpers for the same reason.
  */
-async function waitForDeployOutcome(
+export async function waitForDeployOutcome(
   appName: string,
   acceptedAtIso: string,
   isNew: boolean
@@ -291,6 +296,15 @@ async function waitForDeployOutcome(
   const budgetMs = getDeployWaitBudgetMs();
   const deadline = Date.now() + budgetMs;
   const acceptedAtMs = new Date(acceptedAtIso).getTime();
+
+  // The last episode correlated with THIS deploy. Held across iterations so the
+  // timeout branch below can name it: without a deployId the caller has no way
+  // to read the deploy's own output ever again — `get_deploy_logs` looks up by
+  // exactly this key and answers one indistinguishable "not found" for missing,
+  // succeeded and foreign ids, and `app_logs` reads the runtime rather than
+  // build output. A slow monorepo or a cold container build used to time out
+  // into a dead end (#265).
+  let correlated: DeployEpisode | undefined;
 
   while (Date.now() < deadline) {
     // A parked app (PRD-051) never reaches a terminal deploy status, so report
@@ -311,6 +325,7 @@ async function waitForDeployOutcome(
 
     const [episode] = getDeployTracker().getEpisodes(appName, 1);
     if (episode && new Date(episode.startedAt).getTime() >= acceptedAtMs) {
+      correlated = episode;
       if (episode.status === 'succeeded') return successResult(appName, isNew);
       if (episode.status === 'failed' || episode.status === 'interrupted')
         return failureResult(appName, episode);
@@ -319,8 +334,21 @@ async function waitForDeployOutcome(
     await sleep(POLL_INTERVAL_MS);
   }
 
+  const stillBuilding = `Deploy of '${appName}' is still building after ~${Math.round(
+    budgetMs / 1000
+  )}s.`;
+
+  // No correlated episode means the budget expired before this deploy's own
+  // episode appeared. That is genuinely id-less, and inventing one — the newest
+  // episode for the app — would hand back a PREVIOUS deploy's output labelled
+  // as this one's. Say what is true instead.
+  if (!correlated) {
+    return toolText(`${stillBuilding} Call app_status to check progress.`);
+  }
+
   return toolText(
-    `Deploy of '${appName}' is still building after ~${Math.round(budgetMs / 1000)}s. Call app_status to check progress.`
+    `${stillBuilding} Call app_status to check progress, or get_deploy_logs with ` +
+      `deploy_id '${correlated.deployId}' for its build output.`
   );
 }
 

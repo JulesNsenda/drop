@@ -19,6 +19,7 @@
 import Docker from 'dockerode';
 import * as fs from 'fs/promises';
 import * as path from 'path';
+import { tailFile } from '../../utils/tail-file';
 import { Readable } from 'stream';
 import { AppRuntime } from './app-runtime';
 import {
@@ -484,6 +485,23 @@ export class ContainerManager implements AppRuntime {
 
   // ── Logs ───────────────────────────────────────────────────────────────────
 
+  /**
+   * Logs for an app, container first and DROP-owned files second.
+   *
+   * ORDER MATTERS, and the obvious inversion is wrong. Reading the files first
+   * looks like the durable choice, but `startLogTailer` attaches with `tail: 0`
+   * AFTER the container is started, so the files can be missing the opening
+   * window of the very first run (#264, defect 1) — the run whose output tends
+   * to matter most. Docker’s own log retains that window. Preferring the files
+   * would also flatten the stdout/stderr interleaving the container’s demuxed
+   * stream preserves, since two files cannot be merged back into chronological
+   * order without timestamps.
+   *
+   * So the container stays the source of truth while it exists, and the files
+   * cover only the case where it does not: destroyed by a redeploy, or pruned.
+   * That case used to return an empty string, which is how a deploy’s output
+   * became permanently unreachable.
+   */
   async getLogs(name: string, lines = 100): Promise<string> {
     try {
       const container = this.docker.getContainer(containerName(name));
@@ -499,9 +517,44 @@ export class ContainerManager implements AppRuntime {
       const raw = logStream as unknown;
       return demuxDockerLogs(Buffer.isBuffer(raw) ? raw : Buffer.from(String(raw)));
     } catch (err: unknown) {
-      if (this.isNotFound(err)) return '';
+      if (this.isNotFound(err)) return this.readCapturedLogs(name, lines);
       throw err;
     }
+  }
+
+  /**
+   * The DROP-owned log files this app’s tailer wrote, for when the container
+   * they came from is gone.
+   *
+   * Prefixed `[out] ` / `[err] ` to match both `demuxDockerLogs` and the PM2
+   * adapter: the dashboard’s Logs tab splits streams on exactly those prefixes,
+   * and a read path that omitted them would silently re-break the "err" filter
+   * demuxDockerLogs exists to keep working.
+   *
+   * Returns an empty string when no paths are known. `logPaths` is populated by
+   * `start()`, so an app the platform has not started this boot has nothing to
+   * offer here — the same answer callers already handle.
+   */
+  private async readCapturedLogs(name: string, lines: number): Promise<string> {
+    const { out, err } = this.logPaths.get(name) ?? {};
+    const sections: string[] = [];
+
+    for (const [file, tag] of [
+      [out, 'out'],
+      [err, 'err'],
+    ] as const) {
+      if (!file) continue;
+      try {
+        const tail = (await tailFile(file, lines)).slice(-lines).filter(Boolean);
+        if (tail.length) sections.push(tail.map(l => `[${tag}] ${l}`).join('\n'));
+      } catch {
+        // A missing or unreadable file degrades this to the other stream, or to
+        // the empty answer callers already handle. It must not throw: this runs
+        // on the path where the container is ALREADY gone.
+      }
+    }
+
+    return sections.join('\n');
   }
 
   async streamLogs(
@@ -835,11 +888,32 @@ export class ContainerManager implements AppRuntime {
       ? (await import('fs')).createWriteStream(errFile, { flags: 'a' })
       : null;
 
+    // `tail: 'all'`, not 0 — this is #264's first defect.
+    //
+    // The follower attaches AFTER `container.start()` and is not awaited, so
+    // with `tail: 0` everything printed in that gap was never written to DROP's
+    // log files at all. Measured against Docker 28.3: a container printing a
+    // secret at startup, followed 700ms later, MISSED it at `tail: 0` and
+    // captured it at `tail: 'all'`. A one-time credential printed on first boot
+    // is exactly the payload that lands in that window.
+    //
+    // 'all' cannot duplicate here, and that rests on an invariant worth naming:
+    // `start()` calls `removeIfExists` before `createContainer`, so the
+    // container this attaches to is ALWAYS brand new and has no history
+    // predating this call. The log FILES are append-mode across restarts, but
+    // 'all' replays only this container's own output. Re-attaching to an
+    // already-running container would break that — if a caller ever needs to,
+    // it needs its own tail depth, not this one.
+    //
+    // The cast is dockerode's type being narrower than the API it wraps: it
+    // declares `tail?: number`, while Docker documents and accepts the string
+    // "all" (`GET /containers/{id}/logs`, `tail` — "all or <number>"). Verified
+    // through dockerode against Docker 28.3 before writing this, not assumed.
     const logStream = await container.logs({
       stdout: true,
       stderr: true,
       follow: true,
-      tail: 0,
+      tail: 'all' as unknown as number,
     }) as Readable;
 
     container.modem.demuxStream(

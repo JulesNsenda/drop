@@ -27,6 +27,70 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.2] - 2026-08-30
+
+A patch about what a deploy log tells you, and about output that was being
+thrown away. Two reports drove it, and both diagnosed the platform from a log
+that had omitted the one fact that would have corrected them: an app author
+concluded DROP had no durable storage at all (it has always injected
+`DROP_DATA_DIR`), and read a refused connection to port 5432 as a startup-order
+bug (the bundled server has never listened there). The log now opens by naming
+both. The rest is captured output that existed and could not be read back —
+first-boot lines printed before the log follower attached, and a previous
+deploy's output that vanished with its container. Nothing here changes
+configuration; upgrading needs no action.
+
+### Changed
+
+- **A deploy log now opens by saying where the app can write.** Persistent
+  per-app storage has always existed — `DROP_DATA_DIR` is injected into every
+  app and bind-mounted read-write — but it was discoverable only by reading the
+  environment, and a failed write to the read-only source directory pointed at
+  the path rather than the mount. One app author concluded the platform had no
+  durable storage at all, shipped uploads to `/tmp`, and planned to take on S3.
+  Every deploy log now names the directory, its `DROP_DATA_DIR` env var, and the
+  fact that it survives redeploys; under Docker isolation it also says the source
+  directory is read-only. (#238)
+
+- **A deploy log now also names the database variables.** The same report that
+  could not find `DROP_DATA_DIR` also read `ECONNREFUSED 127.0.0.1:5432` as
+  "DROP starts apps before Postgres is ready". Postgres was ready — DROP has
+  never listened on 5432 (the bundled server defaults to 5433 to avoid colliding
+  with a host install, and under Docker isolation apps reach it over a unix
+  socket rather than TCP at all), so an app building its own connection from
+  defaults was refused correctly and told nothing useful. The deploy log now
+  names `DATABASE_URL` and the `PG*` variables up front. (#238)
+
+### Fixed
+
+- **First-boot output is no longer lost under Docker isolation.** The follower
+  that copies container output into DROP's own log files attached with
+  `tail: 0`, and it attaches after the container has already started — so
+  anything printed in that gap was never captured at all. A one-time admin
+  password printed on first boot is exactly what lands there. Measured against
+  Docker 28.3: a container printing a secret at startup, followed 700ms later,
+  missed it at `tail: 0` and captured it at `tail: 'all'`. It now follows from
+  container start. (#264)
+
+- **A deploy that outlives the MCP wait budget now returns its `deploy_id`.**
+  After ~120s the reply said only "still building, call app_status" — and since
+  `get_deploy_logs` looks a deploy up by that id and cannot disclose which ids
+  exist, while `app_logs` never reads build output, a slow monorepo or cold
+  container build had no supported way to read its own output. The id was never
+  missing: the poll loop already read the correlated episode and discarded it at
+  the deadline. When no episode has correlated yet the message stays id-less
+  rather than naming a previous deploy's. (#265)
+- **A deploy's log output no longer dies with its container.** Under Docker
+  isolation the logs API, the CLI, the dashboard and the MCP `app_logs` tool all
+  read the running container, so once a redeploy destroyed it the previous
+  deploy's output came back as an empty string — indistinguishable from an app
+  that had simply been quiet. When the container is gone the DROP-owned log
+  files are now read instead, with the same `[out] `/`[err] ` prefixes the
+  dashboard's stream filter splits on. The container is still preferred while it
+  exists: it retains the opening window of the first run, which the file capture
+  can miss, and preserves the stdout/stderr interleaving two separate files
+  cannot. (#264)
+
 ## [1.5.1] - 2026-08-29
 
 A dashboard-only patch. One malformed API response could replace an entire page
