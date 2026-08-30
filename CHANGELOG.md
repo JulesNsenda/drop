@@ -27,26 +27,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.6.0] - 2026-08-30
+
+A hardening release, plus two things you can see.
+
+Most of this closes work that earlier releases deliberately deferred with a
+written reason rather than a TODO: container isolation's second tier, the
+control plane's reachability from tenant containers, a backup that holds the
+deploy pipeline still, and a production deploy that can put the previous release
+back when the new one fails its health check. The two visible additions are a
+read-only SQL console in the database panel and, for apps behind the access
+gate, a page that retries itself instead of a blank tab while the platform
+restarts.
+
+**Read the Upgrading section before you take this if you run
+`isolation: docker`.** Two of the container changes will stop an app that was
+relying on behaviour that was never promised. On the default `isolation: none`
+nothing breaks — you get one forced redeploy and the rest is additions.
+
 ### Upgrading
 
-- **Every containerised app is redeployed once, on the first boot after this.**
-  Four new container-policy values (pinned image digests, the read-only root
-  filesystem, the tmpfs set, and the data-dir mount point) are folded into the
-  fingerprint boot reconciliation compares. That is the only way any of them
-  reaches an app that is already running — without it the hardening would apply
-  to new apps only, which looks like success on a fresh box and like nothing at
-  all on a real fleet. Expect one more redeploy each time a base-image digest is
-  refreshed.
-- **An app that hardcoded its data directory's host path breaks.** The
-  persistent data directory now mounts inside the container at `/data` instead
-  of at its own host path, so the host's directory layout is no longer published
-  to every tenant. `DROP_DATA_DIR` is rewritten to match, so an app that reads
-  the variable — the documented contract, and what the deploy log tells every
-  author to do — is unaffected.
-- **An app that writes outside `/tmp` and its data directory breaks.** The
-  container root filesystem is read-only now. `/tmp`, `/run`, `/var/run` and
-  `/var/cache/nginx` come back as size-capped `noexec` tmpfs, which covers what
-  language runtimes and nginx actually write.
+- **Every app is redeployed once on the first boot after this**, under both
+  isolation modes. Four container-policy values (pinned image digests, the
+  read-only root filesystem, the tmpfs set, and the data-dir mount point) join
+  the fingerprint boot reconciliation compares, and that fingerprint is hashed
+  for every app rather than only containerised ones. Folding them in is the only
+  way any of them reaches an app that is already running — without it the
+  hardening would apply to new apps only, which looks like success on a fresh
+  box and like nothing at all on a real fleet. Expect one more redeploy each
+  time a base-image digest is refreshed.
+- **`isolation: docker` only — an app that hardcoded its data directory's host
+  path breaks.** The persistent data directory now mounts inside the container
+  at `/data` instead of at its own host path, so the host's directory layout is
+  no longer published to every tenant. `DROP_DATA_DIR` is rewritten to match, so
+  an app that reads the variable — the documented contract, and what the deploy
+  log tells every author to do — is unaffected.
+- **`isolation: docker` only — an app that writes outside `/tmp` and its data
+  directory breaks.** The container root filesystem is read-only now. `/tmp`,
+  `/run`, `/var/run` and `/var/cache/nginx` come back as size-capped `noexec`
+  tmpfs, which covers what language runtimes and nginx actually write.
 
 ### Added
 
