@@ -140,6 +140,22 @@ function SettingsPage() {
   const [activity, setActivity] = useState<ActivityEntry[]>([]);
   const [activityLoading, setActivityLoading] = useState(true);
 
+  // Isolation mode (admin only). The single biggest behavioural switch on the
+  // platform — it decides whether tenant code runs as a host process under PM2
+  // or in a container, and with it the DATABASE_URL shape, DROP_API_URL, how
+  // health is probed, and whether multi-user mode is allowed — and until now it
+  // was inferable only from the process environment or from an app's symptoms.
+  //
+  // Read-only, deliberately: the platform picks its AppRuntime implementation
+  // once at boot and cannot swap it while running, so a control here would
+  // report a mode the platform is not in. The server sends `changeWith` so this
+  // card can say what to actually do instead of only naming the problem.
+  const [isolation, setIsolation] = useState<{
+    mode: 'none' | 'docker';
+    changeWith: string;
+    note: string;
+  } | null>(null);
+
   // Hydrate MFA (and must-change) status from /auth/me on mount. It is not
   // carried in the login/mfa-verify response or localStorage, and refreshMe()
   // otherwise only runs right after enable/disable — so without this the MFA
@@ -273,6 +289,31 @@ function SettingsPage() {
     fetchActivity();
     const interval = setInterval(fetchActivity, 15000);
     return () => clearInterval(interval);
+  }, [isAdmin]);
+
+  // Isolation mode. Fetched once rather than polled: it cannot change while the
+  // platform is running, which is the whole point of reporting it read-only.
+  // Admin-gated because `GET /admin/settings` is; a non-admin simply sees no
+  // row rather than a permission error.
+  useEffect(() => {
+    if (!isAdmin) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetch('/api/v1/admin/settings', { headers: getAuthHeaders() });
+        const json = await res.json();
+        // Optional, not required: a rolled-back server omits `isolation`
+        // entirely, and the row should disappear rather than render "undefined".
+        if (!cancelled && json?.success && json.data?.isolation?.mode) {
+          setIsolation(json.data.isolation);
+        }
+      } catch {
+        // Non-fatal — this card is informational.
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
   }, [isAdmin]);
 
   const handleChangePassword = async (e: FormEvent) => {
@@ -538,6 +579,25 @@ function SettingsPage() {
                       {health?.version || '0.6.0'}
                     </td>
                   </tr>
+                  {isolation && (
+                    <tr className="border-line">
+                      <td className="py-2 text-muted align-top">
+                        Isolation
+                      </td>
+                      <td className="py-2 text-fg">
+                        <span className="font-mono">{isolation.mode}</span>
+                        <span className="ml-2 text-xs text-muted">
+                          {isolation.mode === 'docker'
+                            ? 'tenant apps run in containers'
+                            : 'tenant apps run as host processes under PM2'}
+                        </span>
+                        <div className="mt-1 text-xs text-muted">
+                          {isolation.note} Change with{' '}
+                          <span className="font-mono">{isolation.changeWith}</span>.
+                        </div>
+                      </td>
+                    </tr>
+                  )}
                   <tr className="border-line">
                     <td className="py-2 text-muted">
                       Apps Directory

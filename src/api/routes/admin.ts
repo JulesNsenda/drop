@@ -16,7 +16,7 @@ import { getDiskFreeMb } from '../../utils/disk';
 import { getSettingsManager } from '../../managers/settings/settings-manager';
 import type { MailSettings } from '../../managers/settings/settings-manager';
 import { normalizePublicUrl } from '../../utils/url-validator';
-import { getPublicUrl, setPublicUrl, isAccessGateEnabled } from '../runtime-config';
+import { getPublicUrl, setPublicUrl, isAccessGateEnabled, getIsolationMode } from '../runtime-config';
 import { getMailCredentialStore, clearMailCredential } from '../../managers/mailer/mail-credential';
 import { sendMeteredMail } from './mail-quota';
 import { getPlatformOps } from '../platform-ops';
@@ -310,6 +310,40 @@ admin.post('/apps/:name/suspend', async (c) => {
 // GET /admin/settings - Platform settings: the public base URL / OAuth
 // issuer override (PRD-041) plus the GitHub webhook secret status and the
 // non-admin MCP-connector toggle.
+/**
+ * The isolation mode, for the admin surface.
+ *
+ * `config.isolation` is the single biggest behavioural switch on the platform —
+ * it decides whether tenant code runs as a host process under PM2 or in a
+ * container, and with it the `DATABASE_URL` shape, `DROP_API_URL`, how health
+ * is probed, and whether multi-user mode is allowed at all. Until now it was
+ * inferable only from the process environment or from an app's symptoms.
+ *
+ * Reported READ-ONLY, with the reason attached rather than left to be
+ * rediscovered: the platform selects its `AppRuntime` implementation exactly
+ * once at boot, and `getAppRuntime()` throws if a different type is later
+ * requested. A settings-backed switch would therefore report a mode the running
+ * platform is not in — worse than offering no switch. `changeWith` names what
+ * an operator must actually do, so the surface answers the question instead of
+ * only raising it.
+ */
+function buildIsolationPayload(): {
+  mode: 'none' | 'docker';
+  configurable: false;
+  changeWith: string;
+  note: string;
+} {
+  return {
+    mode: getIsolationMode(),
+    configurable: false,
+    changeWith: 'DROP_ISOLATION=docker|none (or --isolation), then restart the platform',
+    note:
+      'Chosen once at startup — the app runtime is selected from it and cannot be swapped ' +
+      'while the platform is running. Existing apps move between runtimes with ' +
+      '`drop migrate-runtime`.',
+  };
+}
+
 admin.get('/settings', async (c) => {
   return c.json(
     success({
@@ -319,6 +353,7 @@ admin.get('/settings', async (c) => {
       appSharing: buildAppSharingPayload(),
       guestInvites: buildGuestInvitesPayload(),
       mail: await buildMailPayload(),
+      isolation: buildIsolationPayload(),
     })
   );
 });

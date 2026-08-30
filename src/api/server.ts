@@ -164,6 +164,7 @@ export class ApiServer {
       maxDbsPerUser: this.config.maxDbsPerUser,
       maxRedisPerUser: this.config.maxRedisPerUser,
       accessGateEnabled: this.config.accessGateEnabled,
+      isolation: this.config.isolation,
       // Admin-stored override (PRD-041 settings UI) takes precedence over
       // DROP_PUBLIC_URL — see getPublicUrl()'s precedence. Reads whatever
       // the settings manager singleton has loaded so far: the real platform
