@@ -96,3 +96,86 @@ describe('getLogs falls back to the DROP-owned files when the container is gone'
     expect(logs).not.toContain('[err]');
   });
 });
+
+/**
+ * #264 defect 1 — the capture side of the same issue.
+ *
+ * The follower attaches AFTER `container.start()` and is not awaited, so with
+ * `tail: 0` anything printed in that gap never reached DROP's log files at all.
+ * Measured against Docker 28.3 before the change: a container printing a secret
+ * at startup, followed 700ms later, MISSED it at `tail: 0` and captured it at
+ * `tail: 'all'`.
+ *
+ * `'all'` is safe here only because `start()` calls `removeIfExists` before
+ * `createContainer`, so the container being followed is always brand new and
+ * has no history predating this attach. That invariant is what these tests
+ * guard: if a re-attach path is ever added, it needs its own tail depth.
+ */
+describe('the log tailer captures from container start (#264 defect 1)', () => {
+  const spec = {
+    name: 'my-app',
+    script: 'server.js',
+    cwd: '/apps/my-app',
+    env: { NODE_ENV: 'production' },
+    appType: 'nodejs',
+    outFile: '/logs/my-app-out.log',
+    errorFile: '/logs/my-app-err.log',
+  };
+
+  const makeDocker = () => {
+    const container = {
+      inspect: jest.fn().mockResolvedValue({
+        Id: 'abc',
+        Name: '/drop-my-app',
+        State: { Running: true, Pid: 42, StartedAt: new Date().toISOString(), ExitCode: 0 },
+        Config: { Image: 'node:22-alpine' },
+      }),
+      start: jest.fn().mockResolvedValue(undefined),
+      remove: jest.fn().mockResolvedValue(undefined),
+      logs: jest.fn().mockResolvedValue({ on: jest.fn(), destroy: jest.fn(), pipe: jest.fn() }),
+      modem: { demuxStream: jest.fn() },
+    };
+    const docker = {
+      getContainer: jest.fn(() => container),
+      createContainer: jest.fn().mockResolvedValue(container),
+      listContainers: jest.fn().mockResolvedValue([]),
+      getNetwork: jest.fn(() => ({
+        inspect: jest
+          .fn()
+          .mockResolvedValue({ Options: { 'com.docker.network.bridge.enable_icc': 'false' } }),
+        remove: jest.fn(),
+      })),
+      createNetwork: jest.fn().mockResolvedValue({}),
+      getImage: jest.fn(() => ({ inspect: jest.fn().mockResolvedValue({}) })),
+      pull: jest.fn(),
+    };
+    return { docker, container };
+  };
+
+  it("follows with tail: 'all', so first-boot output is not lost to the attach gap", async () => {
+    const { docker, container } = makeDocker();
+    const mgr = new ContainerManager(docker as unknown as ConstructorParameters<typeof ContainerManager>[0]);
+
+    await mgr.start(spec as unknown as Parameters<typeof mgr.start>[0]);
+    // The tailer is fire-and-forget; let its microtasks run.
+    await new Promise(r => setTimeout(r, 20));
+
+    const followCall = container.logs.mock.calls.find(
+      (c: unknown[]) => (c[0] as Record<string, unknown>)?.follow === true
+    );
+    expect(followCall).toBeDefined();
+    expect((followCall![0] as Record<string, unknown>).tail).toBe('all');
+  });
+
+  it('removes any previous container before creating one, which is what makes all safe', async () => {
+    const { docker, container } = makeDocker();
+    const mgr = new ContainerManager(docker as unknown as ConstructorParameters<typeof ContainerManager>[0]);
+
+    await mgr.start(spec as unknown as Parameters<typeof mgr.start>[0]);
+
+    // Without this the replay would re-append a previous run's output.
+    expect(container.remove).toHaveBeenCalled();
+    expect(docker.createContainer).toHaveBeenCalledTimes(1);
+  });
+});
+

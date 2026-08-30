@@ -29,6 +29,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **First-boot output is no longer lost under Docker isolation.** The follower
+  that copies container output into DROP's own log files attached with
+  `tail: 0`, and it attaches after the container has already started — so
+  anything printed in that gap was never captured at all. A one-time admin
+  password printed on first boot is exactly what lands there. Measured against
+  Docker 28.3: a container printing a secret at startup, followed 700ms later,
+  missed it at `tail: 0` and captured it at `tail: 'all'`. It now follows from
+  container start. (#264)
+
 - **A deploy that outlives the MCP wait budget now returns its `deploy_id`.**
   After ~120s the reply said only "still building, call app_status" — and since
   `get_deploy_logs` looks a deploy up by that id and cannot disclose which ids

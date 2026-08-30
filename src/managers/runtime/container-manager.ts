@@ -888,11 +888,32 @@ export class ContainerManager implements AppRuntime {
       ? (await import('fs')).createWriteStream(errFile, { flags: 'a' })
       : null;
 
+    // `tail: 'all'`, not 0 — this is #264's first defect.
+    //
+    // The follower attaches AFTER `container.start()` and is not awaited, so
+    // with `tail: 0` everything printed in that gap was never written to DROP's
+    // log files at all. Measured against Docker 28.3: a container printing a
+    // secret at startup, followed 700ms later, MISSED it at `tail: 0` and
+    // captured it at `tail: 'all'`. A one-time credential printed on first boot
+    // is exactly the payload that lands in that window.
+    //
+    // 'all' cannot duplicate here, and that rests on an invariant worth naming:
+    // `start()` calls `removeIfExists` before `createContainer`, so the
+    // container this attaches to is ALWAYS brand new and has no history
+    // predating this call. The log FILES are append-mode across restarts, but
+    // 'all' replays only this container's own output. Re-attaching to an
+    // already-running container would break that — if a caller ever needs to,
+    // it needs its own tail depth, not this one.
+    //
+    // The cast is dockerode's type being narrower than the API it wraps: it
+    // declares `tail?: number`, while Docker documents and accepts the string
+    // "all" (`GET /containers/{id}/logs`, `tail` — "all or <number>"). Verified
+    // through dockerode against Docker 28.3 before writing this, not assumed.
     const logStream = await container.logs({
       stdout: true,
       stderr: true,
       follow: true,
-      tail: 0,
+      tail: 'all' as unknown as number,
     }) as Readable;
 
     container.modem.demuxStream(
