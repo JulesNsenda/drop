@@ -32,7 +32,10 @@ import { eventBus } from '../../core/event-bus';
 import {
   DROP_NETWORK,
   CONTAINER_CAP_DROP,
+  CONTAINER_DATA_DIR,
+  CONTAINER_READONLY_ROOTFS,
   CONTAINER_SECURITY_OPT,
+  CONTAINER_TMPFS,
   DEFAULT_CPUS,
   DEFAULT_MEMORY,
   DEFAULT_PIDS_LIMIT,
@@ -266,14 +269,27 @@ export class ContainerManager implements AppRuntime {
     ];
 
     // Bind-mount the data dir read-write if the caller provided DROP_DATA_DIR.
+    //
+    // Mounted at a FIXED in-container path (Tier B M-3), not at its own host
+    // path. Reproducing `/var/drop/data/appdata/<app>` inside the container
+    // published the host's directory layout and DROP's root location to every
+    // tenant, and made the in-container path depend on how the operator set
+    // `DROP_ROOT`. The env var the app actually reads is rewritten below, so
+    // the documented contract ("read DROP_DATA_DIR") is unaffected; only a
+    // hardcoded host path breaks, and that path was never promised.
     const dataDir = spec.env?.['DROP_DATA_DIR'];
     if (dataDir) {
       mounts.push({
         Type: 'bind',
         Source: dataDir,
-        Target: dataDir,
+        Target: CONTAINER_DATA_DIR,
         ReadOnly: false,
       });
+      // Rewrite in the env the container receives, not in `spec.env` — the
+      // spec is shared with the PM2 path and with the caller's own bookkeeping,
+      // where the HOST path is the correct and only meaningful value.
+      const dataDirIndex = env.findIndex(e => e.startsWith('DROP_DATA_DIR='));
+      if (dataDirIndex >= 0) env[dataDirIndex] = `DROP_DATA_DIR=${CONTAINER_DATA_DIR}`;
     }
 
     // Bind-mount the Postgres socket directory so the app can reach the bundled
@@ -331,9 +347,16 @@ export class ContainerManager implements AppRuntime {
         CpuQuota: cpuQuota,
         CpuPeriod: 100_000,
         PidsLimit: DEFAULT_PIDS_LIMIT,
-        // Security — every container runs non-root with zero capabilities.
+        // Security — every container runs non-root with zero capabilities, on a
+        // read-only root filesystem, with writable space handed back only as
+        // capped `noexec` tmpfs (Tier B). See container-config.ts for what each
+        // tmpfs path exists for; `/var/cache/nginx` in particular is what lets
+        // static/SPA apps keep the read-only rootfs instead of being exempted
+        // from it.
         CapDrop: CONTAINER_CAP_DROP,
         SecurityOpt: CONTAINER_SECURITY_OPT,
+        ReadonlyRootfs: CONTAINER_READONLY_ROOTFS,
+        Tmpfs: CONTAINER_TMPFS,
         // Networking — attach to the DROP bridge; no host networking
         NetworkMode: DROP_NETWORK,
         // Resolve the DROP control-plane API from inside the container via a

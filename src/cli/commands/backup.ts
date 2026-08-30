@@ -29,6 +29,7 @@ import * as fs from 'fs/promises';
 import * as fssync from 'fs';
 import { Pool } from 'pg';
 import * as output from '../utils/output';
+import { createApiClient } from '../api-client';
 import { runPgDump, createRoleSql } from '../../managers/database/pg-dump';
 
 const isWindows = process.platform === 'win32';
@@ -174,6 +175,11 @@ export function createBackupCommand(): Command {
     .description('Back up DROP state (file stores + internal database + every per-app database)')
     .option('-r, --root <dir>', 'DROP root directory')
     .option('-k, --keep <n>', 'Number of backups to retain', '7')
+    .option(
+      '--no-quiesce',
+      'Do not pause the deploy pipeline for the duration of the backup (faster, but the snapshot can straddle a deploy)'
+    )
+    .option('--quiesce-seconds <n>', 'How long to hold the deploy pipeline', '300')
     .action(async (options) => {
       // Must run before any dump/write in this action: children (pg_dump)
       // inherit it, so their `-f` output is born 0600. Captured and restored in
@@ -195,6 +201,47 @@ export function createBackupCommand(): Command {
 
       /** Non-fatal gaps: collected, reported, and force a non-zero exit — but the backup still completes. */
       const failures: string[] = [];
+
+      // Hold the deploy pipeline still for the duration (P2-5b).
+      //
+      // Every individual write here is atomic — `writeJsonAtomic` for the file
+      // stores, an MVCC snapshot per `pg_dump` — so nothing is ever captured
+      // half-written. What was NOT guaranteed is that the ~12 stores and every
+      // database describe the same moment: a deploy landing mid-backup leaves
+      // `apps.json` from before it and `appconf/webapps/` from after, or a
+      // database dump referencing an app the state file has not heard of.
+      // Restoring that is not obviously broken, which is the dangerous part.
+      //
+      // Best effort by design. `drop backup` runs from cron on a box where the
+      // platform may legitimately be stopped — that is exactly when the file
+      // stores matter most — so an unreachable platform is a WARNING, never a
+      // refusal. Same posture the DB-enumeration step below already takes.
+      const quiesceSeconds = parseInt(options.quiesceSeconds, 10) || 300;
+      let quiesced = false;
+      let quiesceClient: Awaited<ReturnType<typeof createApiClient>> | null = null;
+      if (options.quiesce !== false) {
+        try {
+          quiesceClient = await createApiClient();
+          const result = await quiesceClient.quiesce(quiesceSeconds);
+          quiesced = true;
+          if (!result.drained) {
+            // Reported, never hidden: a deploy outlived the drain window, so
+            // this snapshot may straddle it. Claiming a consistency we do not
+            // have is the failure the whole mechanism exists to prevent.
+            output.warn(
+              'A deploy was still running when the drain window closed — this snapshot may straddle it.'
+            );
+            failures.push('deploy pipeline did not drain before the snapshot began');
+          } else {
+            output.print('  Deploy pipeline quiesced.');
+          }
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          output.warn(
+            `Could not quiesce the deploy pipeline (is the platform running?): ${msg} — continuing unquiesced.`
+          );
+        }
+      }
 
       try {
         await fs.mkdir(partialDir, { recursive: true, mode: 0o700 });
@@ -304,6 +351,21 @@ export function createBackupCommand(): Command {
         }
         process.exitCode = 1;
       } finally {
+        // Release the hold as soon as the snapshot is committed, rather than
+        // letting the lease run out. In the `finally` because a backup that
+        // THREW is exactly the case where deploys must not stay frozen — the
+        // platform-side deadline is the backstop for a hard kill, not the
+        // normal path.
+        if (quiesced && quiesceClient) {
+          try {
+            await quiesceClient.resumeFromQuiesce();
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            output.warn(
+              `Could not release the deploy quiesce: ${msg} — it expires on its own in at most ${quiesceSeconds}s.`
+            );
+          }
+        }
         // Restore the umask so the 0o077 above never leaks past this action
         // (see the capture site). No-op on Windows.
         process.umask(prevUmask);

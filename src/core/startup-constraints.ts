@@ -66,6 +66,75 @@ export function checkDockerReachable(): Promise<void> {
 }
 
 /**
+ * Report which daemon-level Tier B hardening is actually in effect.
+ *
+ * Everything DROP applies per container — cap-drop, no-new-privileges,
+ * read-only rootfs, non-root user, pinned digests — is visible in this repo and
+ * enforced by its own tests. Two Tier B controls are NOT: `userns-remap` and
+ * the seccomp profile live on the Docker daemon, are set by the operator, and
+ * are invisible from inside the platform unless it looks.
+ *
+ * That asymmetry is the reason this exists. Without it an operator reads
+ * "Tier B shipped" and reasonably concludes container-root is mapped to an
+ * unprivileged host UID, when nothing in DROP can make that true — a runc or
+ * kernel escape from a tenant container lands as real root on the host.
+ *
+ * Reports, never refuses. This is a statement about the host's configuration,
+ * and a platform that refused to start over it would be unbootable on exactly
+ * the boxes that most need to see the warning.
+ */
+export function reportDaemonHardening(log: (level: 'info' | 'warn', msg: string) => void): Promise<void> {
+  return new Promise((resolve) => {
+    const proc = spawn('docker', ['info', '--format', '{{json .SecurityOptions}}'], {
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+
+    let stdout = '';
+    proc.stdout.on('data', (chunk: Buffer) => {
+      stdout += chunk.toString();
+    });
+
+    // Never rejects: an unreadable `docker info` is not a reason to fail a boot
+    // that `checkDockerReachable` has already passed.
+    proc.on('error', () => resolve());
+    proc.on('close', () => {
+      let options: string[] = [];
+      try {
+        const parsed: unknown = JSON.parse(stdout.trim() || '[]');
+        if (Array.isArray(parsed)) options = parsed.map(String);
+      } catch {
+        resolve();
+        return;
+      }
+
+      const joined = options.join(' ');
+      const hasUserns = joined.includes('name=userns');
+      // Docker reports `name=seccomp,profile=builtin` (or `=default` on older
+      // engines) when its default profile is active, and
+      // `profile=unconfined` when someone has turned it off.
+      const seccompOff = joined.includes('seccomp') && joined.includes('unconfined');
+
+      if (hasUserns) {
+        log('info', 'Docker userns-remap is active — container root maps to an unprivileged host UID');
+      } else {
+        log(
+          'warn',
+          'Docker userns-remap is NOT active: a container escape would land as real root on the host. ' +
+            'Required before untrusted tenants deploy — see docs/DOCKER-ISOLATION.md'
+        );
+      }
+      if (seccompOff) {
+        log(
+          'warn',
+          'Docker seccomp is unconfined on this daemon — the default syscall filter is not applied to tenant containers'
+        );
+      }
+      resolve();
+    });
+  });
+}
+
+/**
  * Probe whether `caddy` is on the PATH and responds to `caddy version`.
  *
  * In docker/multi-user mode Caddy is mandatory — hostname-based routing and

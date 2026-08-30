@@ -60,23 +60,115 @@ const BASE_IMAGES: Partial<Record<AppType, string>> = {
 /** Fallback for types not yet fully containerised. */
 const FALLBACK_IMAGE = 'node:20-slim';
 
-/** Allowlist of approved images: the values of BASE_IMAGES plus the fallback. */
-const ALLOWED_IMAGES = new Set<string>([
-  ...Object.values(BASE_IMAGES as Record<string, string>),
-  FALLBACK_IMAGE,
-]);
+/**
+ * Content digests for every tag above (Tier B, DROP-160).
+ *
+ * A tag is a mutable pointer. `node:20-slim` is rebuilt on the publisher's
+ * schedule, so two DROP boxes pulling "the same" image on different days run
+ * different code, and the allowlist that `selectBaseImage` enforces guarantees
+ * only a NAME — the bytes behind it are whoever controls that tag. Pinning the
+ * digest makes the allowlist mean what it appears to mean.
+ *
+ * These are INDEX (manifest-list) digests, not per-architecture ones, so Docker
+ * still resolves the right build on an arm64 host. Captured with
+ * `docker buildx imagetools inspect <tag>` — `docker manifest inspect -v`
+ * reports the digest of the platform manifest the LOCAL daemon resolved to,
+ * which would pin every self-hoster to the architecture of whoever ran the
+ * command.
+ *
+ * **The trade this makes, stated plainly:** a pinned digest no longer picks up
+ * the base image's security rebuilds. That is the point — an image change
+ * becomes a reviewed commit rather than a silent one — but it means this table
+ * is a maintenance obligation, not a set-and-forget. Refresh it deliberately
+ * (see docs/DOCKER-ISOLATION.md), and note that a stale pin is a known-CVE
+ * base image, which is its own risk in the other direction.
+ *
+ * Escape hatch: `DROP_DISABLE_IMAGE_PINNING=true` falls back to tags. It exists
+ * for an operator on a private mirror that does not carry these digests — a
+ * wrong pin refuses every deploy on the box, so there has to be a way out that
+ * is not "edit the source and rebuild".
+ */
+const IMAGE_DIGESTS: Record<string, string> = {
+  'node:20-slim': 'sha256:2cf067cfed83d5ea958367df9f966191a942351a2df77d6f0193e162b5febfc0',
+  'python:3.12-slim': 'sha256:09f7da3bc104798d0afb40bc08d23ab2da20a76130cec1f2ef170848f5d85217',
+  'golang:1.22-alpine': 'sha256:1699c10032ca2582ec89a24a1312d986a3f094aed3d5c1147b19880afe40e052',
+  'nginx:alpine': 'sha256:db35bfc6b2951e7f8a72db5db120288c127ffaeeb4a6d4b95a26fead017d5913',
+};
+
+/** Whether digest pinning is active. Read per call so tests can toggle it. */
+function pinningEnabled(): boolean {
+  return process.env.DROP_DISABLE_IMAGE_PINNING !== 'true';
+}
+
+/**
+ * `tag` → `tag@sha256:…`, or the tag unchanged when pinning is off or the tag
+ * has no recorded digest. A missing digest is deliberately NOT an error: the
+ * failure mode of throwing here is that adding a base image to `BASE_IMAGES`
+ * without also pinning it takes the whole runtime down, which is a much worse
+ * outcome than the image being unpinned until someone notices. `pinnedImages()`
+ * exists so a test can notice.
+ */
+function pin(tag: string): string {
+  if (!pinningEnabled()) return tag;
+  const digest = IMAGE_DIGESTS[tag];
+  return digest ? `${tag}@${digest}` : tag;
+}
+
+/** Every tag DROP will run, for the pin-coverage test and for pre-pulling. */
+export function baseImageTags(): string[] {
+  return [...new Set([...Object.values(BASE_IMAGES as Record<string, string>), FALLBACK_IMAGE,
+    ...Object.values(BUILD_IMAGE_OVERRIDES as Record<string, string>)])];
+}
+
+/** The same list, as the pinned references the runtime actually pulls. */
+export function pinnedImages(): string[] {
+  return baseImageTags().map(pin);
+}
+
+/**
+ * Allowlist of approved images. Holds BOTH spellings of each entry — the bare
+ * tag and its pinned form — because an operator's `runtimeImage` may
+ * legitimately be either: `drop.yaml` and existing app configs were written
+ * against tags, and refusing those would turn a hardening change into a
+ * breaking one.
+ *
+ * Built on first use, not at module load. `baseImageTags()` reads
+ * `BUILD_IMAGE_OVERRIDES`, which is declared further down this file, so a
+ * module-level `const` here throws `Cannot access 'BUILD_IMAGE_OVERRIDES'
+ * before initialization` the moment anything imports this module — a
+ * whole-runtime outage from a declaration-order detail that `tsc` does not
+ * flag. Deferring the read removes the ordering constraint rather than
+ * relying on nobody reintroducing it.
+ */
+let allowedImagesCache: Set<string> | null = null;
+
+function allowedImages(): Set<string> {
+  if (!allowedImagesCache) {
+    allowedImagesCache = new Set<string>(
+      baseImageTags().flatMap(tag => {
+        const digest = IMAGE_DIGESTS[tag];
+        return digest ? [tag, `${tag}@${digest}`] : [tag];
+      })
+    );
+  }
+  return allowedImagesCache;
+}
 
 export function selectBaseImage(appType: AppType, runtimeImage?: string): string {
   if (runtimeImage !== undefined) {
-    if (!ALLOWED_IMAGES.has(runtimeImage)) {
+    const allowed = allowedImages();
+    if (!allowed.has(runtimeImage)) {
       throw new Error(
         `Image '${runtimeImage}' is not in the DROP image allowlist. ` +
-          `Allowed: ${[...ALLOWED_IMAGES].join(', ')}`
+          `Allowed: ${[...allowed].join(', ')}`
       );
     }
-    return runtimeImage;
+    // Normalise to the pinned form even when the operator wrote the bare tag:
+    // an allowlist that admits a mutable pointer and then runs it has only
+    // moved the trust, not removed it.
+    return pin(runtimeImage.split('@')[0]);
   }
-  return BASE_IMAGES[appType] ?? FALLBACK_IMAGE;
+  return pin(BASE_IMAGES[appType] ?? FALLBACK_IMAGE);
 }
 
 /**
@@ -114,7 +206,8 @@ const BUILD_IMAGE_OVERRIDES: Partial<Record<AppType, string>> = {
  */
 export function selectBuildImage(appType: AppType, runtimeImage?: string): string {
   if (runtimeImage !== undefined) return selectBaseImage(appType, runtimeImage);
-  return BUILD_IMAGE_OVERRIDES[appType] ?? selectBaseImage(appType);
+  const override = BUILD_IMAGE_OVERRIDES[appType];
+  return override ? pin(override) : selectBaseImage(appType);
 }
 
 /**
@@ -157,6 +250,71 @@ export const DEFAULT_PIDS_LIMIT = 256;
  */
 export const CONTAINER_SECURITY_OPT = ['no-new-privileges:true'];
 export const CONTAINER_CAP_DROP = ['ALL'];
+
+/**
+ * Read-only container root filesystem (Tier B).
+ *
+ * `/app` is already a read-only bind, but everything OUTSIDE it was writable:
+ * a compromised process could drop a binary in `/usr/local/bin`, rewrite
+ * `/etc`, or stage tooling anywhere on the image layer. None of that survives
+ * a restart — the container is recreated on every deploy — but "it goes away
+ * eventually" is not containment while the process is live.
+ *
+ * The writable surface an app legitimately needs comes back as tmpfs, which is
+ * per-container, RAM-backed, capped, and mounted `noexec` so it cannot become
+ * the staging ground the read-only rootfs just removed.
+ */
+export const CONTAINER_READONLY_ROOTFS = true;
+
+/**
+ * Size cap for each tmpfs, in bytes. RAM-backed, so an uncapped tmpfs is a
+ * memory-exhaustion path that bypasses the container's `Memory` limit on some
+ * kernels and, worse, competes with the HOST on a 4 GB box. 64 MB is generous
+ * for what these directories actually hold (an nginx pid file, a socket, a
+ * short-lived upload) and small enough that a runaway writer hits ENOSPC
+ * rather than the OOM killer.
+ */
+const TMPFS_SIZE_BYTES = 64 * 1024 * 1024;
+
+/**
+ * The directories a read-only rootfs has to hand back, with the mount options
+ * they get. `noexec,nosuid,nodev` on every one: these exist so an app can write
+ * a pid file or a temp upload, never so it can execute what it wrote.
+ *
+ * - `/tmp` — every language runtime assumes it. Python writes bytecode and
+ *   `tempfile` here, npm/pip use it during any runtime install, and Node's
+ *   `os.tmpdir()` points at it.
+ * - `/run` and `/var/run` — pid files and unix sockets. Distinct paths on the
+ *   Debian slim images (`/var/run` is a symlink to `/run` on some, a real
+ *   directory on others), so both are covered rather than assuming which.
+ * - `/var/cache/nginx` — nginx:alpine writes its proxy/fastcgi temp paths here
+ *   at startup and fails to start without it. This is the concrete instance of
+ *   the "nginx-writes-config tension" Tier B named: it is resolved by giving
+ *   nginx a writable tmpfs for the three things it actually writes, not by
+ *   exempting static apps from the read-only rootfs.
+ */
+export const CONTAINER_TMPFS: Record<string, string> = {
+  '/tmp': `rw,noexec,nosuid,nodev,size=${TMPFS_SIZE_BYTES}`,
+  '/run': `rw,noexec,nosuid,nodev,size=${TMPFS_SIZE_BYTES}`,
+  '/var/run': `rw,noexec,nosuid,nodev,size=${TMPFS_SIZE_BYTES}`,
+  '/var/cache/nginx': `rw,noexec,nosuid,nodev,size=${TMPFS_SIZE_BYTES}`,
+};
+
+/**
+ * Where an app's persistent data dir is mounted INSIDE the container (Tier B
+ * M-3). It used to be mounted at its own host path — `/var/drop/data/appdata/
+ * <app>` inside the container as well as outside — which handed every tenant
+ * the host's directory layout and DROP's root location for free, and made the
+ * in-container path vary by how the operator configured `DROP_ROOT`.
+ *
+ * `DROP_DATA_DIR` is rewritten to this value in the container's environment, so
+ * an app that reads the variable (which is the documented contract, and what
+ * the deploy log now tells every author to do) sees the right path either way.
+ * An app that hardcoded the old host path is the breaking case — but that path
+ * was never a promise, is unwritable in `none` isolation anyway, and the data
+ * itself is the same bind mount either side of this change.
+ */
+export const CONTAINER_DATA_DIR = '/data';
 
 /**
  * Runtime-config inputs to containerPolicyFingerprint that are NOT
@@ -216,11 +374,50 @@ export interface ContainerPolicyInputs {
  * what forcing its one-time mismatch protects against.
  */
 export function containerPolicyFingerprint(inputs: ContainerPolicyInputs): string {
+  return crypto
+    .createHash('sha256')
+    .update(JSON.stringify(buildFingerprintPayload(inputs)))
+    .digest('hex');
+}
+
+/**
+ * The payload `containerPolicyFingerprint` hashes.
+ *
+ * Split out and exported so a test can assert WHAT is covered rather than
+ * hand-copying the constants and asserting a byte-identical hash — the older
+ * shape of that test could only stay true until the next policy field, and had
+ * to be rewritten the first time one arrived.
+ */
+export function fingerprintPayloadForTest(
+  inputs: ContainerPolicyInputs = {
+    apiPort: 0,
+    maxMemoryMbPerApp: 0,
+    maxCpusPerApp: 0,
+    pgSocketDir: undefined,
+  }
+): Record<string, unknown> {
+  return buildFingerprintPayload(inputs);
+}
+
+function buildFingerprintPayload(inputs: ContainerPolicyInputs): Record<string, unknown> {
   const payload = {
     capDrop: CONTAINER_CAP_DROP,
     securityOpt: CONTAINER_SECURITY_OPT,
     pidsLimit: DEFAULT_PIDS_LIMIT,
     baseImages: BASE_IMAGES,
+    // DROP-160 Tier B. Each of these is the ONLY way its hardening reaches an
+    // already-running app: recreating the container is what applies a new
+    // digest, a read-only rootfs, a tmpfs set or a different data-dir target,
+    // and boot reconciliation will otherwise SKIP every running docker app
+    // (status running, port assigned, scopes empty) and leave it on the old
+    // policy indefinitely. Same reasoning as `pgSocketDir` below. Expect one
+    // forced redeploy of every docker-mode app on the first boot after this
+    // ships — and one more each time a digest is refreshed, which is the
+    // correct behaviour for a base-image change.
+    imageDigests: IMAGE_DIGESTS,
+    readonlyRootfs: CONTAINER_READONLY_ROOTFS,
+    tmpfs: CONTAINER_TMPFS,
+    containerDataDir: CONTAINER_DATA_DIR,
     imageUsers: IMAGE_USERS,
     netSubnet: DROP_NET_SUBNET,
     netGateway: DROP_NET_GATEWAY,
@@ -229,5 +426,5 @@ export function containerPolicyFingerprint(inputs: ContainerPolicyInputs): strin
     maxCpusPerApp: inputs.maxCpusPerApp,
     pgSocketDir: inputs.pgSocketDir,
   };
-  return crypto.createHash('sha256').update(JSON.stringify(payload)).digest('hex');
+  return payload;
 }
