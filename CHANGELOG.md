@@ -50,6 +50,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A read-only SQL console in the database panel.** Run a query against an
+  app's own database from the dashboard. **Admin-only, and off until an admin
+  turns it on** — not caution about a new feature: PostgreSQL's shared catalogs
+  are world-readable and no privilege setting closes them, so anyone who can run
+  arbitrary SQL can list every database and role on the server. Writes are
+  refused by the server rather than by inspecting the query text — every
+  statement runs in a read-only transaction, which is the only thing that stops
+  a `SECURITY DEFINER` function an app created from writing as its owner — and
+  the row cap is a server-side cursor. Each query is recorded in the activity
+  log: who and which app, never the SQL itself, since a query can contain the
+  very secret an audit trail exists to investigate. Newly provisioned databases
+  also get a `temp_file_limit` so one query cannot fill the shared disk; older
+  ones keep the timeout and memory bounds until reprovisioned.
 - **Read-only container root filesystems, pinned base images, and a fixed data
   mount.** The Tier B isolation work that was deferred in June, for boxes that
   will host untrusted tenants. Base images are pinned by index digest, so two

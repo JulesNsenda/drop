@@ -60,6 +60,23 @@ const EXPECTED_ISOLATION = {
     '`drop migrate-runtime`.',
 };
 
+/**
+ * The SQL-console block GET /admin/settings reports (DROP-163).
+ *
+ * `enabled: false` is the DEFAULT, and that default is the security property,
+ * not a preference: any arbitrary query can read the shared PostgreSQL
+ * catalogs, so an operator has to turn this on knowing it. `catalogVisibility`
+ * travels with the flag so the API says that rather than leaving it to a doc.
+ */
+const EXPECTED_SQL_CONSOLE = {
+  enabled: false,
+  adminOnly: true,
+  catalogVisibility:
+    'Any arbitrary query can read the shared PostgreSQL catalogs, which list every ' +
+    'database and role on this server. No privilege setting closes that, which is why ' +
+    'the console is admin-only.',
+};
+
 interface GithubWebhookPayload {
   configured: boolean;
   source: 'stored' | 'env' | 'unset';
@@ -276,6 +293,7 @@ describe('admin settings routes (PRD-041)', () => {
         guestInvites: { enabled: false },
         mail: DEFAULT_MAIL_PAYLOAD,
         isolation: EXPECTED_ISOLATION,
+        sqlConsole: EXPECTED_SQL_CONSOLE,
       });
     });
 
@@ -297,6 +315,7 @@ describe('admin settings routes (PRD-041)', () => {
         guestInvites: { enabled: false },
         mail: DEFAULT_MAIL_PAYLOAD,
         isolation: EXPECTED_ISOLATION,
+        sqlConsole: EXPECTED_SQL_CONSOLE,
       });
     });
 
@@ -321,6 +340,7 @@ describe('admin settings routes (PRD-041)', () => {
         guestInvites: { enabled: false },
         mail: DEFAULT_MAIL_PAYLOAD,
         isolation: EXPECTED_ISOLATION,
+        sqlConsole: EXPECTED_SQL_CONSOLE,
       });
     });
   });
@@ -1409,5 +1429,103 @@ describe('GET /admin/settings — isolation block', () => {
     });
 
     expect(res.status).toBe(403);
+  });
+});
+
+/**
+ * PUT /admin/settings/sql-console (DROP-163).
+ *
+ * The toggle is the operator's conscious acceptance that any arbitrary query
+ * can read the shared PostgreSQL catalogs — an un-fixable property, not a bug
+ * awaiting a patch. So what matters here is that it defaults OFF, that it
+ * persists, and that the reason travels with it.
+ */
+describe('PUT /admin/settings/sql-console', () => {
+  let tempDir: string;
+  let server: ApiServer;
+  let hono: ReturnType<ApiServer['getApp']>;
+  let adminToken: string;
+
+  const put = (body: unknown) =>
+    hono.request('/api/v1/admin/settings/sql-console', {
+      method: 'PUT',
+      headers: { Authorization: `Bearer ${adminToken}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+
+  beforeEach(async () => {
+    tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'drop-sqlconsole-'));
+    resetAuth();
+    resetStateManager();
+    resetSettingsManager();
+    getSettingsManager({ settingsFilePath: path.join(tempDir, 'settings.json') });
+    resetRateLimits();
+
+    server = new ApiServer({
+      port: 3100,
+      enableAuth: true,
+      credentialsPath: path.join(tempDir, 'credentials.json'),
+    });
+    await server.initialize();
+    hono = server.getApp();
+    await createUser('root', 'password123', 'admin');
+    adminToken = await getTestToken('root', 'password123');
+  });
+
+  afterEach(async () => {
+    resetAuth();
+    resetStateManager();
+    resetSettingsManager();
+    resetPlatformOps();
+    await fs.rm(tempDir, { recursive: true, force: true });
+  });
+
+  it('is disabled until an admin turns it on', async () => {
+    expect(getSettingsManager().getSqlConsoleEnabled()).toBe(false);
+  });
+
+  it('enables and persists', async () => {
+    const res = await put({ enabled: true });
+
+    expect(res.status).toBe(200);
+    expect(getSettingsManager().getSqlConsoleEnabled()).toBe(true);
+  });
+
+  it('disables again', async () => {
+    await put({ enabled: true });
+
+    await put({ enabled: false });
+
+    expect(getSettingsManager().getSqlConsoleEnabled()).toBe(false);
+  });
+
+  it('reports the catalog caveat alongside the flag, not only in a doc', async () => {
+    const res = await put({ enabled: true });
+
+    const body = (await res.json()) as { data: { enabled: boolean; adminOnly: boolean; catalogVisibility: string } };
+    expect(body.data.enabled).toBe(true);
+    expect(body.data.adminOnly).toBe(true);
+    expect(body.data.catalogVisibility).toMatch(/every database and role/);
+  });
+
+  it('rejects a non-boolean', async () => {
+    const res = await put({ enabled: 'yes' });
+
+    expect(res.status).toBe(400);
+    expect(getSettingsManager().getSqlConsoleEnabled()).toBe(false);
+  });
+
+  it('is admin-only', async () => {
+    await createUser('plain', 'password123', 'user');
+    const userToken = await getTestToken('plain', 'password123');
+
+    const res = await hono.request('/api/v1/admin/settings/sql-console', {
+      method: 'PUT',
+      headers: { Authorization: `Bearer ${userToken}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ enabled: true }),
+    });
+
+    expect(res.status).toBe(403);
+    expect(getSettingsManager().getSqlConsoleEnabled()).toBe(false);
   });
 });

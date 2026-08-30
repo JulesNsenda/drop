@@ -18,10 +18,14 @@ import { getAppConfigServiceOrNull } from '../../managers/app/app-config';
 import { getDatabaseProvisioner } from '../../managers/database';
 import { getRedisProvisioner } from '../../managers/redis';
 import { getMaxDbsPerUser, getMaxRedisPerUser } from '../runtime-config';
+import { getSettingsManager } from '../../managers/settings/settings-manager';
+import { logActivityFor } from '../../managers/activity';
 import { validateAppName } from '../middleware/validate';
 import {
   getOverview,
   listTables,
+  runQuery,
+  DbQueryError,
   DbUnavailableError,
 } from '../../managers/database/app-db-inspector';
 
@@ -272,6 +276,91 @@ db.get('/:name/tables', async c => {
       // credentials orphan with a still-live database (`credentials-missing`,
       // 503 — see `DatabaseProvisioner.orphanDatabaseExists`), which must not
       // be silently swallowed into "no database" either.
+      return respondDbUnavailable(c, err);
+    }
+    throw err;
+  }
+});
+
+/**
+ * POST /db/:name/query — the read-only SQL console (DROP-163, database panel M2).
+ *
+ * The gating here is deliberately layered, and the order matters because each
+ * layer answers a different question:
+ *
+ * 1. `interactiveSessionOnly` — a JWT session, never an API key or an OAuth
+ *    token. An agent holding a scoped token must not reach arbitrary SQL; this
+ *    is the same reason the rest of the panel uses it.
+ * 2. **admin role** — not the app owner. `pg_catalog` and the shared catalogs
+ *    are world-readable and no privilege configuration can close them, so a
+ *    principal running arbitrary SQL can enumerate every database and role on
+ *    the cluster. For an admin that discloses nothing they cannot already list;
+ *    for an app owner it would be a cross-tenant inventory leak. That asymmetry
+ *    is the whole reason this is not owner-accessible, and it is not a
+ *    limitation that can be engineered away later.
+ * 3. **the `sqlConsoleEnabled` setting** — off by default, so the catalog
+ *    exposure above is something an operator turns on knowing about it.
+ * 4. `resolveApp` / `canAccess` — the app must exist and be visible, exactly as
+ *    for the panel's reads.
+ *
+ * The `/db/*` rate-limit bucket already covers this path.
+ */
+db.post('/:name/query', async c => {
+  const auth = (c.get as (k: string) => AuthContext | undefined)('auth');
+
+  const gate = interactiveSessionOnly(auth, 'Running a database query');
+  if (!gate.ok) {
+    return c.json(error(ErrorCodes.UNAUTHORIZED, gate.message), 403);
+  }
+
+  if (gate.requester.role !== 'admin') {
+    return c.json(
+      error(
+        ErrorCodes.UNAUTHORIZED,
+        'The SQL console is admin-only: any arbitrary query can read the shared ' +
+          'PostgreSQL catalogs, which list every database and role on this server.'
+      ),
+      403
+    );
+  }
+
+  if (!getSettingsManager().getSqlConsoleEnabled()) {
+    return c.json(
+      error(
+        ErrorCodes.UNAUTHORIZED,
+        'The SQL console is disabled. An admin can enable it in Settings — see the ' +
+          'note there about catalog visibility.'
+      ),
+      403
+    );
+  }
+
+  const name = resolveApp(c, auth);
+
+  const body = (await c.req.json().catch(() => ({}))) as { sql?: unknown; limit?: unknown };
+  if (typeof body.sql !== 'string') {
+    return c.json(error(ErrorCodes.VALIDATION_ERROR, 'sql must be a string'), 400);
+  }
+  const limit = typeof body.limit === 'number' ? body.limit : undefined;
+
+  // Audited, unlike the panel's reads. A read of table names is metadata; this
+  // is arbitrary SQL against a tenant's data, and "who ran what" is the first
+  // question after a leak. The SQL text itself is deliberately NOT logged —
+  // a query can carry the very values (a token, an email) whose exposure the
+  // audit trail exists to investigate, and the activity log is not encrypted.
+  await logActivityFor(auth, { action: 'db-query', appName: name });
+
+  try {
+    const result = await runQuery(name, body.sql, limit);
+    return c.json(success(result));
+  } catch (err) {
+    if (err instanceof DbQueryError) {
+      // 400, not 500: PostgreSQL understood the statement and refused it, so
+      // this is the caller's answer — a syntax error, a read-only violation, a
+      // missing table — and its message is the useful part of the response.
+      return c.json(error(ErrorCodes.VALIDATION_ERROR, err.message), 400);
+    }
+    if (err instanceof DbUnavailableError) {
       return respondDbUnavailable(c, err);
     }
     throw err;

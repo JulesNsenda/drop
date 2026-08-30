@@ -64,3 +64,23 @@ export function formatRowEstimate(row: DbTable): string {
   if (isUntrustedZero(row)) return 'not yet analysed';
   return `≈ ${(row.rowEstimate ?? 0).toLocaleString()}`;
 }
+
+/**
+ * One result from `POST /db/:name/query` (DROP-163).
+ *
+ * Every cell is a string or null, never a number or a Date. That is the
+ * server's choice, not a limitation of this type: JSON cannot round-trip what
+ * PostgreSQL returns — `bigint` loses precision past 2^53, `Date` arrives
+ * timezone-shifted, `Buffer` becomes `{type:'Buffer',data:[…]}` — so the value
+ * is rendered once, server-side, and the console displays exactly what came
+ * back. `null` stays distinct from the empty string because those are
+ * different answers.
+ */
+export interface DbQueryResponse {
+  columns: string[];
+  rows: Array<Array<string | null>>;
+  rowCount: number;
+  /** The cap was hit, so more rows existed than were returned. */
+  truncated: boolean;
+  durationMs: number;
+}
