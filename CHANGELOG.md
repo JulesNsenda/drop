@@ -27,7 +27,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.2]
+
+A patch about what a deploy log tells you, and about output that was being
+thrown away. Two reports drove it, and both diagnosed the platform from a log
+that had omitted the one fact that would have corrected them: an app author
+concluded DROP had no durable storage at all (it has always injected
+`DROP_DATA_DIR`), and read a refused connection to port 5432 as a startup-order
+bug (the bundled server has never listened there). The log now opens by naming
+both. The rest is captured output that existed and could not be read back —
+first-boot lines printed before the log follower attached, and a previous
+deploy's output that vanished with its container. Nothing here changes
+configuration; upgrading needs no action.
+
 ### Changed
+
+- **A deploy log now opens by saying where the app can write.** Persistent
+  per-app storage has always existed — `DROP_DATA_DIR` is injected into every
+  app and bind-mounted read-write — but it was discoverable only by reading the
+  environment, and a failed write to the read-only source directory pointed at
+  the path rather than the mount. One app author concluded the platform had no
+  durable storage at all, shipped uploads to `/tmp`, and planned to take on S3.
+  Every deploy log now names the directory, its `DROP_DATA_DIR` env var, and the
+  fact that it survives redeploys; under Docker isolation it also says the source
+  directory is read-only. (#238)
 
 - **A deploy log now also names the database variables.** The same report that
   could not find `DROP_DATA_DIR` also read `ECONNREFUSED 127.0.0.1:5432` as
@@ -67,18 +90,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exists: it retains the opening window of the first run, which the file capture
   can miss, and preserves the stdout/stderr interleaving two separate files
   cannot. (#264)
-
-### Changed
-
-- **A deploy log now opens by saying where the app can write.** Persistent
-  per-app storage has always existed — `DROP_DATA_DIR` is injected into every
-  app and bind-mounted read-write — but it was discoverable only by reading the
-  environment, and a failed write to the read-only source directory pointed at
-  the path rather than the mount. One app author concluded the platform had no
-  durable storage at all, shipped uploads to `/tmp`, and planned to take on S3.
-  Every deploy log now names the directory, its `DROP_DATA_DIR` env var, and the
-  fact that it survives redeploys; under Docker isolation it also says the source
-  directory is read-only. (#238)
 
 ## [1.5.1] - 2026-08-29
 
