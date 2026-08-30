@@ -328,8 +328,8 @@ db.post('/:name/query', async c => {
     return c.json(
       error(
         ErrorCodes.UNAUTHORIZED,
-        'The SQL console is disabled. An admin can enable it in Settings — see the ' +
-          'note there about catalog visibility.'
+        'The SQL console is disabled. An admin can enable it in Settings → Platform — ' +
+          'see the note there about catalog visibility.'
       ),
       403
     );
