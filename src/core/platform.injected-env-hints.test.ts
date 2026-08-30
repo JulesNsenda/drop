@@ -39,7 +39,7 @@ describe('the writable-path hint in the deploy log (#238)', () => {
   };
 
   const emit = (platform: DropPlatform, logId: string | null = 'log-1') =>
-    (platform as any).writeWritablePathHint(logId, 'my-app');
+    (platform as any).writeInjectedEnvHints(logId, 'my-app');
 
   beforeEach(() => {
     tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'drop-238-'));
@@ -76,6 +76,27 @@ describe('the writable-path hint in the deploy log (#238)', () => {
     expect(lines.join('\n')).not.toContain('READ-ONLY');
     // The rest of the hint still applies — only the mount claim is mode-specific.
     expect(lines.join('\n')).toContain('DROP_DATA_DIR');
+  });
+
+  /**
+   * The SECOND misdiagnosis in the same report. An app that built its own
+   * connection from defaults hit `ECONNREFUSED 127.0.0.1:5432`, which was read
+   * as "DROP starts apps before Postgres accepts connections". It does not:
+   * the bundled server defaults to 5433 to avoid colliding with a host install,
+   * and under docker isolation apps reach it over a unix socket rather than TCP
+   * at all. The refusal was correct and told the author nothing.
+   */
+  it('names the database variables, and that 5432 is not where DROP listens', async () => {
+    await emit(makePlatform('docker'));
+    const joined = lines.join('\n');
+    expect(joined).toContain('DATABASE_URL');
+    expect(joined).toContain('PGHOST');
+    expect(joined).toContain('127.0.0.1:5432');
+  });
+
+  it('gives the database hint under BOTH isolation modes, since neither uses 5432', async () => {
+    await emit(makePlatform('none'));
+    expect(lines.join('\n')).toContain('DATABASE_URL');
   });
 
   it('is a no-op when no build log is open rather than throwing into the deploy', async () => {
