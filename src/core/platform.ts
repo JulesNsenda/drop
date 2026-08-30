@@ -132,7 +132,11 @@ import { createApiKey, deleteApiKeysByName } from '../api/middleware/auth';
 // The STRICT name pattern (the API's), not the folder-drop parser's looser
 // check: this decides whether a name is safe to write into a Caddy literal.
 import { isValidAppName } from '../api/middleware/validate';
-import { IsolationMode, assertStartupConstraints } from './startup-constraints';
+import {
+  IsolationMode,
+  assertStartupConstraints,
+  reportDaemonHardening,
+} from './startup-constraints';
 import { createContainerExecCommand } from './builder/container-build-runner';
 import { migrateAllToDocker } from '../managers/runtime/runtime-migrator';
 import {
@@ -862,6 +866,16 @@ export class DropPlatform {
         allowSignup: this.config.allowSignup,
         enableApiAuth: this.config.enableApiAuth,
       });
+
+      // Say plainly which Tier B controls the DAEMON is providing. Everything
+      // DROP applies per container is enforced in this repo; userns-remap and
+      // the seccomp profile are the operator's, and are invisible unless the
+      // platform looks. Reports, never refuses — see reportDaemonHardening.
+      if (this.config.isolation === 'docker') {
+        await reportDaemonHardening((level, msg) =>
+          level === 'warn' ? this.logger.warn(msg, 'SECURITY') : this.logger.info(msg, 'SECURITY')
+        );
+      }
 
       // Validate domain configuration if HTTPS is enabled
       if (this.config.enableHttps && this.config.domainSuffix) {
