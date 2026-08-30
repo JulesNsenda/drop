@@ -125,6 +125,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unconfigured — which is what that preflight exists to prevent. Off by default
   (`DROP_STRICT_MANIFEST=true`), because turning it on refuses to start any app
   already carrying a malformed manifest, and the deploy log names them first.
+- **A gated app now shows a retrying page, not a blank tab, while DROP
+  restarts.** The access gate asks DROP's own API on every request, so a
+  platform deploy takes every gated app down for that window while ungated apps
+  keep serving. Measured, the visitor used to get an HTTP 502 with an empty body
+  and no content type; they now get a page saying the app is temporarily
+  unavailable, with `Retry-After`, that reloads itself and lands them back in
+  the app once DROP returns. It still fails closed — the page fires only on the
+  status codes an unreachable upstream produces, so a real refusal is untouched,
+  and it serves no tenant content. The underlying coupling is unchanged: plan
+  gated apps' maintenance windows around platform deploys.
 
 ## [1.5.2] - 2026-08-30
 

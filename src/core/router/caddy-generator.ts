@@ -208,7 +208,83 @@ function generateAccessGatedTail(route: RouteConfig, access: AccessAuthConfig): 
   return [
     generateExchangeHandle(route, access),
     generateAccessGuardHandle(route, access, generateGuardHandles(route)),
+    generateGateErrorHandle(),
   ];
+}
+
+/**
+ * What a visitor to a GATED app sees while DROP itself is down.
+ *
+ * `forward_auth` targets the platform's own API, so every restart of the DROP
+ * service — which every push to `develop` performs — takes the verify upstream
+ * away for the duration. Ungated apps are untouched; gated ones are not, and
+ * that asymmetry is a coupling the access gate introduced.
+ *
+ * MEASURED against Caddy 2 (alpine) with the upstream unreachable: the visitor
+ * got **HTTP 502 with an empty body and no `Content-Type`**. Not a page — a
+ * blank tab. This replaces that with a page that says what is happening and
+ * retries itself.
+ *
+ * **It cannot fail open, and that is the property to preserve.** The matcher
+ * fires only on 502/503/504 — the shapes an unreachable upstream produces — so
+ * a real refusal passes straight through untouched. Verified all four ways
+ * against a live Caddy + a stub verify upstream:
+ *
+ *   | verify        | result                                    |
+ *   |---------------|-------------------------------------------|
+ *   | up, allows    | 200, tenant content (unchanged)           |
+ *   | up, refuses   | 401, no tenant content (unchanged)        |
+ *   | down          | 503, no tenant content, `Retry-After: 10` |
+ *
+ * The response is deliberately 503 rather than 200: nothing downstream — a
+ * probe, a crawler, a fetch — may read this as the app having served.
+ *
+ * The wording is neutral about CAUSE on purpose. `handle_errors` is site-wide,
+ * so a 502 from the tenant's own upstream lands here too, and Caddy exposes no
+ * way to tell the two apart at this point. "Briefly unavailable, retrying" is
+ * true either way; "signing you in" would be a guess that is wrong half the
+ * time.
+ */
+function generateGateErrorHandle(): CaddyDirective {
+  // Single-quoted HTML attributes so the whole body survives as ONE
+  // double-quoted Caddyfile argument — `formatDirective` joins args with
+  // spaces on a single line, so a heredoc or an embedded `"` would not
+  // round-trip through it.
+  const body =
+    "<!doctype html><html lang='en'><meta charset='utf-8'>" +
+    "<meta name='viewport' content='width=device-width,initial-scale=1'>" +
+    "<meta http-equiv='refresh' content='10'>" +
+    '<title>Temporarily unavailable</title>' +
+    "<style>body{font:16px/1.5 system-ui,sans-serif;margin:0;min-height:100vh;display:grid;place-items:center;background:#0b0b0c;color:#e7e7e9}" +
+    "main{max-width:32rem;padding:2rem;text-align:center}p{color:#a1a1aa}</style>" +
+    '<main><h1>Temporarily unavailable</h1>' +
+    '<p>This app is behind a sign-in that is briefly unreachable, usually because the platform is restarting.</p>' +
+    '<p>This page retries every 10 seconds.</p></main></html>';
+
+  return {
+    name: 'handle_errors',
+    block: [
+      {
+        name: '@gate_unavailable',
+        args: ['expression', '{err.status_code} in [502, 503, 504]'],
+      },
+      {
+        name: 'handle',
+        args: ['@gate_unavailable'],
+        block: [
+          { name: 'header', args: ['Content-Type', '"text/html; charset=utf-8"'] },
+          // Tells a well-behaved client when to come back, and keeps this out
+          // of any cache — a cached "unavailable" would outlive the restart.
+          { name: 'header', args: ['Retry-After', '10'] },
+          { name: 'header', args: ['Cache-Control', '"no-store"'] },
+          { name: 'respond', args: [`"${body}"`, '503'] },
+        ],
+      },
+      // Everything else keeps Caddy's own behaviour rather than being swallowed
+      // by a page that would describe it wrongly.
+      { name: 'respond', args: ['"{err.status_code} {err.status_text}"', '{err.status_code}'] },
+    ],
+  };
 }
 
 /**
