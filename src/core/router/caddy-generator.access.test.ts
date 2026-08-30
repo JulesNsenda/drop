@@ -228,3 +228,109 @@ describe('gated route block', () => {
     expect(JSON.stringify(directives)).not.toContain('drop-session');
   });
 });
+
+/**
+ * What a visitor sees while DROP itself is down (DROP-164).
+ *
+ * `forward_auth` targets the platform's own API, so every restart of the DROP
+ * service — which every push to `develop` performs — takes the verify upstream
+ * away. Ungated apps are untouched; gated ones are not.
+ *
+ * MEASURED against Caddy 2 with the upstream unreachable, BEFORE this shipped:
+ * HTTP 502, empty body, no `Content-Type`. A blank tab.
+ *
+ * And measured again AFTER, by feeding this generator's own output to a real
+ * Caddy with a stub verify upstream and a stub tenant — all four cases:
+ *
+ *   | verify      | result                                    |
+ *   |-------------|-------------------------------------------|
+ *   | up, allows  | 200, tenant content (unchanged)           |
+ *   | up, refuses | 401, no tenant content (unchanged)        |
+ *   | down        | 503, no tenant content, `Retry-After: 10` |
+ *
+ * These tests pin the SHAPE that produces that, since CI has no Caddy binary.
+ */
+describe('the gated failure page', () => {
+  const errorHandle = (ds: CaddyDirective[]) => top(ds, 'handle_errors')[0];
+
+  it('is emitted for a gated route', () => {
+    const { directives } = generateRouteBlock({ ...base, accessAuth });
+
+    expect(errorHandle(directives)).toBeDefined();
+  });
+
+  it('is NOT emitted for an ungated route', () => {
+    // An ungated app has no coupling to DROP's availability in the first
+    // place, so there is nothing here to soften — and a page claiming a
+    // sign-in problem would be a lie about why it is down.
+    const { directives } = generateRouteBlock(base);
+
+    expect(errorHandle(directives)).toBeUndefined();
+  });
+
+  it('fires ONLY on the codes an unreachable upstream produces', () => {
+    // The whole safety property. A real refusal — 401, 403, the gate's 302 —
+    // must pass through untouched; if this matcher ever widened to catch them,
+    // the page would replace the gate's own answer.
+    const { directives } = generateRouteBlock({ ...base, accessAuth });
+    const matcher = errorHandle(directives).block?.find(
+      d => (d as CaddyDirective).name === '@gate_unavailable'
+    ) as CaddyDirective;
+
+    expect(matcher.args?.join(' ')).toBe('expression {err.status_code} in [502, 503, 504]');
+  });
+
+  it('answers 503, never a 2xx', () => {
+    // Nothing downstream — a probe, a crawler, a fetch — may read this as the
+    // app having served.
+    const { directives } = generateRouteBlock({ ...base, accessAuth });
+    const handled = errorHandle(directives).block?.find(
+      d => (d as CaddyDirective).name === 'handle'
+    ) as CaddyDirective;
+    const respond = handled.block?.find(
+      d => (d as CaddyDirective).name === 'respond'
+    ) as CaddyDirective;
+
+    expect(respond.args?.[1]).toBe('503');
+  });
+
+  it('serves no tenant content and proxies nothing', () => {
+    // The page is a static body. A `reverse_proxy` in here would be reaching
+    // for the tenant on a path where the gate has NOT authorised anyone.
+    const handle = errorHandle(generateRouteBlock({ ...base, accessAuth }).directives);
+
+    expect(proxies([handle])).toHaveLength(0);
+    expect(JSON.stringify(handle)).not.toContain('localhost:4000');
+  });
+
+  it('tells the client when to retry, and forbids caching the failure', () => {
+    // A cached "unavailable" would outlive the restart it describes.
+    const handle = errorHandle(generateRouteBlock({ ...base, accessAuth }).directives);
+    const text = JSON.stringify(handle);
+
+    expect(text).toContain('Retry-After');
+    expect(text).toContain('no-store');
+  });
+
+  it('does not name a cause it cannot know', () => {
+    // `handle_errors` is site-wide, so a 502 from the TENANT's own upstream
+    // lands here too — observed while wiring the live test up. Caddy exposes
+    // no way to tell the two apart at this point, so the copy stays true for
+    // both rather than guessing.
+    const handle = errorHandle(generateRouteBlock({ ...base, accessAuth }).directives);
+    const text = JSON.stringify(handle);
+
+    expect(text).toContain('Temporarily unavailable');
+    expect(text.toLowerCase()).not.toContain('signing you in');
+  });
+
+  it('leaves other error codes to Caddy', () => {
+    const handle = errorHandle(generateRouteBlock({ ...base, accessAuth }).directives);
+    const fallback = handle.block?.filter(
+      d => (d as CaddyDirective).name === 'respond'
+    ) as CaddyDirective[];
+
+    expect(fallback).toHaveLength(1);
+    expect(fallback[0].args?.[1]).toBe('{err.status_code}');
+  });
+});
