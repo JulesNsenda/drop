@@ -108,7 +108,9 @@ import {
 import { ApiServer, createApiServer } from '../api';
 import {
   AppInProgressError,
+  AppManifestInvalidError,
   AppNeedsConfigError,
+  needsConfigAction,
   setPlatformOps,
   resetPlatformOps,
   type AttachableServiceId,
@@ -130,10 +132,18 @@ import { createApiKey, deleteApiKeysByName } from '../api/middleware/auth';
 // The STRICT name pattern (the API's), not the folder-drop parser's looser
 // check: this decides whether a name is safe to write into a Caddy literal.
 import { isValidAppName } from '../api/middleware/validate';
-import { IsolationMode, assertStartupConstraints } from './startup-constraints';
+import {
+  IsolationMode,
+  assertStartupConstraints,
+  reportDaemonHardening,
+} from './startup-constraints';
 import { createContainerExecCommand } from './builder/container-build-runner';
 import { migrateAllToDocker } from '../managers/runtime/runtime-migrator';
-import { HOST_ALIAS, containerPolicyFingerprint } from '../managers/runtime/container-config';
+import {
+  CONTAINER_DATA_DIR,
+  HOST_ALIAS,
+  containerPolicyFingerprint,
+} from '../managers/runtime/container-config';
 import { buildNginxConf } from '../utils/nginx-conf';
 import { BuildLogService, getBuildLogService, resetBuildLogService } from '../managers/build-log/build-log';
 import {
@@ -273,6 +283,24 @@ export interface PlatformConfig {
    */
   enableSecretPreflight: boolean;
   /**
+   * Refuse to start an app whose `drop.yaml` exists but does not parse
+   * (DROP-130 Q1). The preflight above can only gate on secrets it can SEE:
+   * every `parseDropYaml` caller reads `cfg.success ? cfg.config?.x :
+   * undefined`, so a manifest with a typo yields `declaredSecrets = undefined`,
+   * `planSecretPreflight` reports nothing missing, and the app starts
+   * unconfigured — precisely what the preflight exists to prevent. Once the
+   * parse has failed we cannot know whether secrets were declared, so refusing
+   * is the only sound answer.
+   *
+   * **Default false, deliberately.** The blast radius is real and cannot be
+   * measured from a development box: an app whose manifest is already
+   * malformed deploys today and would refuse to start after. DROP-130's own
+   * recommendation was to ship the warning (item 9, done), read the resulting
+   * `drop.yaml failed to parse` lines off the live fleet, and only then flip
+   * this. Turn it on with DROP_STRICT_MANIFEST=true once that log is clean.
+   */
+  strictManifest: boolean;
+  /**
    * Boot reconciliation (M1): stops the watcher's initial scan from
    * fabricating `app:detected` — and therefore a full rebuild — for every
    * existing app dir on every platform restart.
@@ -380,6 +408,7 @@ const DEFAULT_CONFIG: PlatformConfig = {
   redisPort: parseInt(process.env.DROP_REDIS_PORT || '6380', 10),
   maxRedisPerUser: parseInt(process.env.DROP_MAX_REDIS_PER_USER || '3', 10),
   enableSecretPreflight: process.env.DROP_ENABLE_SECRET_PREFLIGHT !== 'false',
+  strictManifest: process.env.DROP_STRICT_MANIFEST === 'true',
   bootReconcileMode: parseBootReconcileMode(process.env.DROP_BOOT_RECONCILE),
   maxConcurrentBuilds: parseInt(process.env.DROP_MAX_CONCURRENT_BUILDS || '3', 10),
   maxConcurrentApps: parseInt(process.env.DROP_MAX_CONCURRENT_APPS || '0', 10),
@@ -838,6 +867,16 @@ export class DropPlatform {
         enableApiAuth: this.config.enableApiAuth,
       });
 
+      // Say plainly which Tier B controls the DAEMON is providing. Everything
+      // DROP applies per container is enforced in this repo; userns-remap and
+      // the seccomp profile are the operator's, and are invisible unless the
+      // platform looks. Reports, never refuses — see reportDaemonHardening.
+      if (this.config.isolation === 'docker') {
+        await reportDaemonHardening((level, msg) =>
+          level === 'warn' ? this.logger.warn(msg, 'SECURITY') : this.logger.info(msg, 'SECURITY')
+        );
+      }
+
       // Validate domain configuration if HTTPS is enabled
       if (this.config.enableHttps && this.config.domainSuffix) {
         await this.validateDomainConfig();
@@ -1259,6 +1298,89 @@ export class DropPlatform {
     this.eventBus.publish('platform:stopped', { timestamp: new Date() });
     this.logger.platformEvent('stopped');
     this.logger.close();
+  }
+
+  /**
+   * Deploy quiesce (P2-5b) — hold the pipeline still so a backup can take a
+   * self-consistent snapshot.
+   *
+   * `drop backup` copies ~12 file stores and then dumps every database. Each
+   * individual write is atomic (`writeJsonAtomic`) so nothing is ever captured
+   * half-written, and each `pg_dump` is internally consistent — but the SET is
+   * not. A deploy landing mid-backup can leave `apps.json` from before it and
+   * `appconf/webapps/` from after, or a database dump that references an app
+   * the state file has not heard of. Restoring that is not obviously broken,
+   * which is the dangerous part: it is discovered later, from an app whose port
+   * or database the platform disagrees about.
+   *
+   * **`quiescedUntil` is a DEADLINE, not a boolean, and that is the safety
+   * property.** The caller is a separate process (`drop backup`, or a cron
+   * running it) which can be killed, crash, or lose its network. A boolean
+   * would leave the platform refusing every deploy until someone noticed and
+   * cleared it by hand. An expiring lease cannot wedge the box: the worst case
+   * is deploys deferring for the remainder of the requested window.
+   */
+  private quiescedUntil = 0;
+
+  /** Upper bound on a quiesce lease. A backup that needs longer has a problem a longer lease will not fix. */
+  private readonly MAX_QUIESCE_MS = 15 * 60_000;
+
+  /** Whether the deploy pipeline is currently held. */
+  isQuiesced(): boolean {
+    return Date.now() < this.quiescedUntil;
+  }
+
+  /**
+   * Hold the deploy pipeline for `durationMs`, then wait for whatever was
+   * already in flight to finish.
+   *
+   * Returns whether the drain actually completed. `false` means a deploy was
+   * still running when the drain deadline passed — the backup is free to
+   * proceed, but the caller should say so rather than claim a clean snapshot.
+   */
+  async quiesce(durationMs: number): Promise<{ drained: boolean; until: number }> {
+    const bounded = Math.max(0, Math.min(durationMs, this.MAX_QUIESCE_MS));
+    this.quiescedUntil = Date.now() + bounded;
+    this.logger.info(`Deploy pipeline quiesced for ${Math.round(bounded / 1000)}s`, 'BACKUP');
+
+    // Reuse the shutdown drain: same question, same bounded wait. Capped at the
+    // lease so a stuck deploy cannot hold the caller past its own window.
+    await this.drainInProgress(Math.min(bounded, 60_000));
+    return { drained: this.appsInProgress.size === 0, until: this.quiescedUntil };
+  }
+
+  /**
+   * Whether the watcher should hold off on `name`.
+   *
+   * While quiesced EVERY app reads as locked, which is what holds the
+   * folder-drop path still during a backup. The watcher's contract for a locked
+   * app is to DEFER — `scheduleRebuild` re-arms once the lock clears — not to
+   * drop, so a folder dropped mid-backup still deploys, just after the lease.
+   * The other entry point is `handleAppUpdate`, where redeploys, webhooks, git
+   * and upload deploys all converge.
+   *
+   * Deliberately NOT gated: `handleStartApp`. It runs on `build:completed` for
+   * an app that is ALREADY in `appsInProgress` with its build paid for, so
+   * refusing there would abandon a deploy mid-pipeline — worse than the
+   * inconsistency quiescing exists to prevent. `quiesce()` drains those
+   * instead. First-time app CREATION via `POST /apps` is likewise not gated: it
+   * is rare, bounded by the drain, and gating it would mean threading this
+   * through nine `appsInProgress.add` sites in the deploy pipeline, which is a
+   * refactor that wants its own change.
+   *
+   * A named method rather than an inline closure in the watcher config so the
+   * rule can be tested without standing up `initializeServices()`.
+   */
+  private isDeployLocked(name: string): boolean {
+    return this.isQuiesced() || this.appsInProgress.has(name);
+  }
+
+  /** Release the hold early. Safe to call when not quiesced. */
+  resumeFromQuiesce(): void {
+    if (this.quiescedUntil !== 0) {
+      this.logger.info('Deploy pipeline resumed', 'BACKUP');
+    }
+    this.quiescedUntil = 0;
   }
 
   /** Wait (up to timeoutMs) for in-progress deploys to drain. */
@@ -1833,7 +1955,7 @@ backup:
       appsDir: this.config.appsDirectory,
       debounceMs: 1000,
       maxDepth: 2,
-      isAppLocked: (name) => this.appsInProgress.has(name),
+      isAppLocked: (name) => this.isDeployLocked(name),
     });
   }
 
@@ -1892,6 +2014,9 @@ backup:
       getServiceIntent: (name, serviceId) => this.getServiceIntent(name, serviceId),
       reconfigureRoute: (name) => this.reconfigureRoute(name),
       assessAccessGate: (name) => this.assessAccessGate(name),
+      quiesce: (ms) => this.quiesce(ms),
+      resumeFromQuiesce: () => this.resumeFromQuiesce(),
+      isQuiesced: () => this.isQuiesced(),
     });
 
     this.logger.info(`API server running on port ${this.config.apiPort}`, 'API');
@@ -4350,7 +4475,15 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
   private async writeInjectedEnvHints(logId: string | null, appName: string): Promise<void> {
     if (!logId || !this.buildLogService) return;
     try {
-      const dataDir = await this.ensureAppDataDirectory(appName);
+      const hostDataDir = await this.ensureAppDataDirectory(appName);
+      // The path the APP sees, which since Tier B M-3 is not the host path
+      // under docker isolation: the data dir bind-mounts at CONTAINER_DATA_DIR
+      // so the host's directory layout stops being published to every tenant.
+      // Printing the host path here would recreate the exact confusion this
+      // hint exists to prevent — an author reading a directory out of the
+      // deploy log, writing to it, and getting ENOENT.
+      const dataDir =
+        this.config.isolation === 'docker' ? CONTAINER_DATA_DIR : hostDataDir;
       this.buildLogService.writeLine(
         logId,
         `[drop] Writable data directory: ${dataDir} (also in the app env as DROP_DATA_DIR).`
@@ -4651,13 +4784,16 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       // `starting` transition above already cleared any stale error.
       if (error instanceof AppNeedsConfigError) {
         this.logger.warn(
-          `${appName} parked in needs-config — set required secret(s): ` +
-            `${error.missingSecrets.join(', ')}, then restart`,
+          `${appName} parked in needs-config — ${needsConfigAction(error)}, then restart`,
           'SECURITY'
         );
         if (this.stateManager) {
           await this.stateManager.setAppStatus(appName, 'needs-config', {
             missingSecrets: error.missingSecrets,
+            // Only the manifest park carries a reason the empty `missingSecrets`
+            // list cannot express. `needs-config` is not in setAppStatus's
+            // error-clearing set, so this survives until the app next starts.
+            ...(error instanceof AppManifestInvalidError ? { error: error.message } : {}),
           });
         }
         // COUNTED. buildFreshStartSpec throws this AFTER the build completed,
@@ -5587,6 +5723,18 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
   ): Promise<void> {
     if (!this.runtime || !this.stateManager || !this.detector || !this.builder) return;
 
+    // A backup is taking a snapshot (P2-5b). Deferring rather than dropping:
+    // the watcher re-arms once the lock clears, and an API/webhook caller has
+    // already been told the deploy was accepted — so this is logged at info,
+    // not debug, for the same reason the appsInProgress skip below is.
+    if (this.isQuiesced()) {
+      this.logger.info(
+        `Deferring update for ${appName} — deploys are quiesced for a backup`,
+        'BACKUP'
+      );
+      return;
+    }
+
     // Skip apps currently being cloned by git deploy
     if (this.gitDeployService?.isCloning(appName)) return;
 
@@ -5967,12 +6115,12 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       // `starting` transition above already cleared any stale error.
       if (error instanceof AppNeedsConfigError) {
         this.logger.warn(
-          `${appName} parked in needs-config on hot-reload — set required secret(s): ` +
-            `${error.missingSecrets.join(', ')}, then restart`,
+          `${appName} parked in needs-config on hot-reload — ${needsConfigAction(error)}, then restart`,
           'SECURITY'
         );
         await this.stateManager.setAppStatus(appName, 'needs-config', {
           missingSecrets: error.missingSecrets,
+          ...(error instanceof AppManifestInvalidError ? { error: error.message } : {}),
         });
         // COUNTED, unlike the pre-build deferrals. AppNeedsConfigError is
         // thrown from buildFreshStartSpec, which runs AFTER builder.build() has
@@ -8009,6 +8157,25 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     // expansion writes into each child's drop.yaml) was previously ignored,
     // leaving e.g. a TypeScript backend stuck on the `node index.js` default.
     const dropYamlCfg = await parseDropYaml(appPath);
+
+    // DROP-130 Q1 — the fail-OPEN half of item 9, closed behind a flag.
+    //
+    // Every read of this result below is `dropYamlCfg.success ? … : undefined`,
+    // which is correct field by field and wrong in aggregate: on a parse
+    // failure the whole manifest is discarded silently, so `secrets:` reads as
+    // "none declared", the preflight gate finds nothing missing, and the app
+    // starts with none of the configuration its author wrote. A typo like
+    // `JWT-SECRET` is enough. Refusing is the only sound response — the one
+    // thing we cannot know after a failed parse is what was declared.
+    //
+    // Gated OFF by default: turning this on refuses to start any app already
+    // carrying a malformed manifest, and that population is unknowable from
+    // here. `warnParseFailure` (item 9) makes it knowable from the live log
+    // first. See DropPlatformConfig.strictManifest.
+    if (this.config.strictManifest && dropYamlCfg.exists && !dropYamlCfg.success) {
+      throw new AppManifestInvalidError(appName, dropYamlCfg.error ?? 'unknown parse error');
+    }
+
     const startOverride = dropYamlCfg.success ? dropYamlCfg.config?.start : undefined;
 
     // Procfile `web:` is the next rung down: a user-provided, language-agnostic
@@ -8041,9 +8208,20 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         // Tier B: nginx runs unprivileged (uid 101, zero caps), so the full
         // config is passed via -c from the bind-mounted data dir instead of
         // being copied into root-owned /etc/nginx.
+        //
+        // The path in the COMMAND is the in-container one, which since Tier B
+        // M-3 is no longer the host path: the data dir mounts at
+        // CONTAINER_DATA_DIR, so `nginx -c <hostPath>/nginx.conf` would name a
+        // file that does not exist inside the container and every static app
+        // would fail to start. `nginxConfPath` above stays a host path because
+        // that is where DROP writes the file; only the argument nginx receives
+        // is translated.
         script = '/bin/sh';
         interpreter = 'none';
-        args = ['-c', `nginx -c ${nginxConfPath} -g 'daemon off;'`];
+        args = [
+          '-c',
+          `nginx -c ${CONTAINER_DATA_DIR}/nginx.conf -g 'daemon off;'`,
+        ];
       } else {
         const serveDir = path.join(appPath, outputSubdir || '.');
         // eslint-disable-next-line @typescript-eslint/no-require-imports

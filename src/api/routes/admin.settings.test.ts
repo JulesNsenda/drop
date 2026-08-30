@@ -42,6 +42,24 @@ jest.mock('../../managers/mailer/mailer', () => ({
   sendTemplatedMail: jest.fn(),
 }));
 
+/**
+ * The isolation block GET /admin/settings reports (DROP-160).
+ *
+ * `'none'` here is not an arbitrary fixture: these tests construct `ApiServer`
+ * directly with no platform behind it, so `getIsolationMode()` falls back to
+ * PlatformConfig's own default. Reporting `'docker'` in that state would be a
+ * lie in the dangerous direction — it is the mode that permits multi-user.
+ */
+const EXPECTED_ISOLATION = {
+  mode: 'none',
+  configurable: false,
+  changeWith: 'DROP_ISOLATION=docker|none (or --isolation), then restart the platform',
+  note:
+    'Chosen once at startup — the app runtime is selected from it and cannot be swapped ' +
+    'while the platform is running. Existing apps move between runtimes with ' +
+    '`drop migrate-runtime`.',
+};
+
 interface GithubWebhookPayload {
   configured: boolean;
   source: 'stored' | 'env' | 'unset';
@@ -257,6 +275,7 @@ describe('admin settings routes (PRD-041)', () => {
         appSharing: { enabled: false },
         guestInvites: { enabled: false },
         mail: DEFAULT_MAIL_PAYLOAD,
+        isolation: EXPECTED_ISOLATION,
       });
     });
 
@@ -277,6 +296,7 @@ describe('admin settings routes (PRD-041)', () => {
         appSharing: { enabled: false },
         guestInvites: { enabled: false },
         mail: DEFAULT_MAIL_PAYLOAD,
+        isolation: EXPECTED_ISOLATION,
       });
     });
 
@@ -300,6 +320,7 @@ describe('admin settings routes (PRD-041)', () => {
         appSharing: { enabled: false },
         guestInvites: { enabled: false },
         mail: DEFAULT_MAIL_PAYLOAD,
+        isolation: EXPECTED_ISOLATION,
       });
     });
   });
@@ -1286,3 +1307,107 @@ describe('admin settings routes (PRD-041)', () => {
   });
 });
 
+
+/**
+ * The isolation surface (DROP-160, item 7 of the plan-backlog triage).
+ *
+ * `config.isolation` is the single biggest behavioural switch on the platform:
+ * it decides whether tenant code runs as a host process under PM2 or in a
+ * container, and with it the `DATABASE_URL` shape, `DROP_API_URL`, how health
+ * is probed, and whether multi-user mode is allowed at all. Until now it was
+ * inferable only from the process environment or from an app's symptoms.
+ */
+describe('GET /admin/settings — isolation block', () => {
+  let tempDir: string;
+  let server: ApiServer;
+  let hono: ReturnType<ApiServer['getApp']>;
+  let adminToken: string;
+
+  const makeServer = async (isolation?: 'none' | 'docker') => {
+    server = new ApiServer({
+      port: 3098,
+      enableAuth: true,
+      credentialsPath: path.join(tempDir, 'credentials.json'),
+      isolation,
+    });
+    await server.initialize();
+    hono = server.getApp();
+    await createUser('root', 'password123', 'admin');
+    adminToken = await getTestToken('root', 'password123');
+  };
+
+  const read = async () => {
+    const res = await hono.request('/api/v1/admin/settings', {
+      headers: { Authorization: `Bearer ${adminToken}` },
+    });
+    const body = (await res.json()) as { data: { isolation: Record<string, unknown> } };
+    return body.data.isolation;
+  };
+
+  beforeEach(async () => {
+    tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'drop-isolation-'));
+    resetAuth();
+    resetStateManager();
+    resetSettingsManager();
+    getSettingsManager({ settingsFilePath: path.join(tempDir, 'settings.json') });
+    resetRateLimits();
+  });
+
+  afterEach(async () => {
+    resetAuth();
+    resetStateManager();
+    resetSettingsManager();
+    resetPlatformOps();
+    // The module-level runtime config is process-global; leaving 'docker' set
+    // would make an unrelated later test see a mode its platform is not in.
+    setApiRuntimeConfig({ isolation: 'none' });
+    await fs.rm(tempDir, { recursive: true, force: true });
+  });
+
+  it('reports the mode the platform is actually running', async () => {
+    await makeServer('docker');
+
+    expect(await read()).toMatchObject({ mode: 'docker' });
+  });
+
+  it('reports "none" when the platform runs host processes', async () => {
+    await makeServer('none');
+
+    expect(await read()).toMatchObject({ mode: 'none' });
+  });
+
+  it('defaults to "none" rather than guessing when no platform is wired', async () => {
+    // Failing toward 'none' matters: 'docker' is the mode that permits
+    // multi-user, so a wrong default would report a containment the box does
+    // not have.
+    await makeServer(undefined);
+
+    expect(await read()).toMatchObject({ mode: 'none' });
+  });
+
+  it('declares itself NOT configurable, and says what to do instead', async () => {
+    // The platform selects its AppRuntime implementation exactly once at boot
+    // and `getAppRuntime()` throws if a different type is later requested, so a
+    // settings-backed switch would report a mode the platform is not in —
+    // worse than offering no switch. The surface has to answer the question it
+    // raises, hence `changeWith`.
+    await makeServer('docker');
+
+    const isolation = await read();
+    expect(isolation.configurable).toBe(false);
+    expect(String(isolation.changeWith)).toContain('DROP_ISOLATION');
+    expect(String(isolation.changeWith)).toContain('restart');
+  });
+
+  it('is admin-only, like the rest of the settings surface', async () => {
+    await makeServer('docker');
+    await createUser('plain', 'password123', 'user');
+    const userToken = await getTestToken('plain', 'password123');
+
+    const res = await hono.request('/api/v1/admin/settings', {
+      headers: { Authorization: `Bearer ${userToken}` },
+    });
+
+    expect(res.status).toBe(403);
+  });
+});

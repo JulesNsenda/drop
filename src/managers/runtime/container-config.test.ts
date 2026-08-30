@@ -11,8 +11,11 @@
  *   field cannot, on its own, force a PM2 app to redeploy.
  */
 
-import * as crypto from 'crypto';
-import { containerPolicyFingerprint, ContainerPolicyInputs } from './container-config';
+import {
+  containerPolicyFingerprint,
+  fingerprintPayloadForTest,
+  ContainerPolicyInputs,
+} from './container-config';
 
 const baseInputs: ContainerPolicyInputs = {
   apiPort: 3000,
@@ -52,46 +55,51 @@ describe('containerPolicyFingerprint — pgSocketDir (DROP-072)', () => {
     expect(a).toBe(b);
   });
 
-  it('pgSocketDir: undefined never causes a mismatch for a PM2 app on its own — matches the fingerprint of the pre-DROP-072 payload shape (no pgSocketDir key at all)', () => {
-    // Reconstruct the OLD payload shape by hand (same hashing recipe, same
-    // keys minus pgSocketDir) — this is what every already-recorded PM2
-    // AppConfig.runtimeSpecFingerprint on disk was computed from before this
-    // field existed. If containerPolicyFingerprint's pgSocketDir: undefined
-    // case produced anything OTHER than this exact hash, every PM2 app in
-    // the fleet would spuriously redeploy on the first boot after this ships
-    // — JSON.stringify dropping `undefined`-valued keys is what prevents that.
-    const oldShapePayload = {
-      capDrop: ['ALL'],
-      securityOpt: ['no-new-privileges:true'],
-      pidsLimit: 256,
-      baseImages: {
-        nodejs: 'node:20-slim',
-        python: 'python:3.12-slim',
-        django: 'python:3.12-slim',
-        flask: 'python:3.12-slim',
-        fastapi: 'python:3.12-slim',
-        go: 'golang:1.22-alpine',
-        static: 'nginx:alpine',
-        spa: 'nginx:alpine',
-      },
-      imageUsers: {
-        nodejs: 'node',
-        python: '1000:1000',
-        go: '1000:1000',
-        static: '101:101',
-        spa: '101:101',
-      },
-      netSubnet: process.env.DROP_NET_SUBNET ?? '10.83.0.0/24',
-      netGateway: process.env.DROP_NET_GATEWAY ?? '10.83.0.1',
+  it('pgSocketDir: undefined never causes a mismatch for a PM2 app on its own', () => {
+    // The property, stated over two calls rather than against a hand-copied
+    // payload: an `undefined` value must hash the same as the key being absent,
+    // which is what `JSON.stringify` dropping undefined-valued keys buys.
+    // Without it, adding this field would have redeployed every PM2 app in the
+    // fleet on the first boot after DROP-072.
+    //
+    // This USED to reconstruct the whole pre-DROP-072 payload by hand and
+    // assert a byte-identical hash. That version could only ever be true until
+    // the next policy field, and DROP-160 (Tier B) is that next field: pinning
+    // digests, a read-only rootfs, the tmpfs set and the fixed data-dir target
+    // all joined the payload, which rotates the hash for EVERY app exactly
+    // once. That rotation is not a regression — recreating the container is the
+    // only way any of those reaches an already-running app, and boot
+    // reconciliation would otherwise skip every running docker app and leave it
+    // on the old policy. Asserting the property instead of the constants keeps
+    // this test alive across the next one.
+    const withUndefinedKey = containerPolicyFingerprint(baseInputs);
+
+    const withoutKey = containerPolicyFingerprint({
       apiPort: baseInputs.apiPort,
       maxMemoryMbPerApp: baseInputs.maxMemoryMbPerApp,
       maxCpusPerApp: baseInputs.maxCpusPerApp,
-    };
-    const oldShapeHash = crypto
-      .createHash('sha256')
-      .update(JSON.stringify(oldShapePayload))
-      .digest('hex');
+    } as ContainerPolicyInputs);
 
-    expect(containerPolicyFingerprint(baseInputs)).toBe(oldShapeHash);
+    expect(withUndefinedKey).toBe(withoutKey);
+  });
+
+  it('covers the Tier B container policy, so hardening reaches already-running apps', () => {
+    // Each of these is applied at `docker create` time and nowhere else, so an
+    // app that is already running only picks it up when boot reconciliation
+    // sees a fingerprint mismatch and forces a redeploy. If the payload stops
+    // covering them, the hardening silently applies to new apps only — which
+    // looks exactly like success on a fresh box and exactly like nothing on a
+    // real fleet.
+    const payloadKeys = Object.keys(
+      JSON.parse(
+        JSON.stringify({
+          ...(fingerprintPayloadForTest() as Record<string, unknown>),
+        })
+      )
+    );
+
+    expect(payloadKeys).toEqual(
+      expect.arrayContaining(['imageDigests', 'readonlyRootfs', 'tmpfs', 'containerDataDir'])
+    );
   });
 });

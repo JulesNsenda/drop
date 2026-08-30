@@ -24,6 +24,12 @@ import type { AccessGateVerdict } from '../../managers/guardrail/access-gate';
 export function makePlatformOpsStub(overrides?: Partial<PlatformOps>): PlatformOps {
   return {
     restartApp: jest.fn(),
+    // P2-5b. Stubbed rather than omitted so every route test that builds a
+    // PlatformOps keeps compiling; the quiesce behaviour itself is covered in
+    // platform.quiesce.test.ts against the real platform.
+    quiesce: jest.fn().mockResolvedValue({ drained: true, until: 0 }),
+    resumeFromQuiesce: jest.fn(),
+    isQuiesced: jest.fn().mockReturnValue(false),
     attachService: jest.fn().mockResolvedValue({
       attached: true,
       envVarNames: [],

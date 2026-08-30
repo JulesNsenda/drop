@@ -36,6 +36,20 @@ interface ApiRuntimeConfig {
    * enforcement rather than only changing what the API reports.
    */
   accessGateEnabled?: boolean;
+  /**
+   * Tenant isolation mode (`PlatformConfig.isolation`, `DROP_ISOLATION` env /
+   * `--isolation` flag). Already passed to `ApiServer`; snapshotted here so
+   * `GET /admin/settings` can REPORT it.
+   *
+   * Boot-time, like `accessGateEnabled` and for a stronger reason: the platform
+   * picks its `AppRuntime` implementation exactly once
+   * (`getAppRuntime(isolation === 'docker' ? 'docker' : 'pm2')`) and
+   * `getAppRuntime()` throws if a different type is later requested. There is
+   * no runtime setter here, and there must not be one — a settings-backed
+   * "switch" would report a mode the running platform is not in, which is worse
+   * than not offering the switch at all.
+   */
+  isolation?: 'none' | 'docker';
 }
 
 const runtimeConfig: ApiRuntimeConfig = {};
@@ -50,6 +64,7 @@ export function setApiRuntimeConfig(config: ApiRuntimeConfig): void {
   if (config.maxDbsPerUser !== undefined) runtimeConfig.maxDbsPerUser = config.maxDbsPerUser;
   if (config.maxRedisPerUser !== undefined) runtimeConfig.maxRedisPerUser = config.maxRedisPerUser;
   if (config.accessGateEnabled !== undefined) runtimeConfig.accessGateEnabled = config.accessGateEnabled;
+  if (config.isolation !== undefined) runtimeConfig.isolation = config.isolation;
 }
 
 /** Resolved webapps directory: explicit config > DROP_APPS_DIR env > platform default. */
@@ -161,6 +176,17 @@ export function getMaxRedisPerUser(): number {
  */
 export function isAccessGateEnabled(): boolean {
   return runtimeConfig.accessGateEnabled !== false;
+}
+
+/**
+ * The isolation mode the platform is ACTUALLY running, for the admin surface.
+ *
+ * Defaults to `'none'` when unset, matching `PlatformConfig`'s own default —
+ * an ApiServer constructed directly in a test has no platform behind it, and
+ * reporting `'docker'` there would be a lie in the dangerous direction.
+ */
+export function getIsolationMode(): 'none' | 'docker' {
+  return runtimeConfig.isolation ?? 'none';
 }
 
 /*

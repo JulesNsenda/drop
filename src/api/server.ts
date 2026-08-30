@@ -33,6 +33,7 @@ import {
 } from './middleware/rate-limit';
 import { securityHeadersMiddleware } from './middleware/security-headers';
 import { auditMiddleware, initializeAuditLog, closeAuditLog } from './middleware/audit';
+import { containerOriginGate } from './middleware/container-origin';
 import { validateBodySize } from './middleware/validate';
 import { setApiRuntimeConfig, getPublicUrl } from './runtime-config';
 import { getSettingsManager } from '../managers/settings/settings-manager';
@@ -127,7 +128,18 @@ export class ApiServer {
 
   constructor(config: ApiServerConfig) {
     this.config = {
-      host: '0.0.0.0',
+      // `0.0.0.0` because under docker isolation an app holding control-plane
+      // capabilities reaches the API at `drop-host:<apiPort>`, which resolves
+      // to drop-net's gateway — a host interface, not loopback. That is the
+      // SEC-3 tension: a bind is all-or-nothing per interface, so binding
+      // loopback closes the bridge for the capability app too.
+      //
+      // `DROP_API_HOST=127.0.0.1` is the stronger setting and the right one for
+      // any operator with no capability-holding apps: nothing else needs the
+      // bridge, because Caddy and the CLI are both on the host. Operators who
+      // cannot take it get `containerOriginGate()` (see container-origin.ts),
+      // which is defence in depth, not a substitute for the bind.
+      host: process.env.DROP_API_HOST || '0.0.0.0',
       // Auth is on by default (fail-safe). Disable explicitly with
       // DROP_DISABLE_AUTH=true. Callers (the platform) pass enableAuth
       // explicitly; this default only governs direct/test construction.
@@ -152,6 +164,7 @@ export class ApiServer {
       maxDbsPerUser: this.config.maxDbsPerUser,
       maxRedisPerUser: this.config.maxRedisPerUser,
       accessGateEnabled: this.config.accessGateEnabled,
+      isolation: this.config.isolation,
       // Admin-stored override (PRD-041 settings UI) takes precedence over
       // DROP_PUBLIC_URL — see getPublicUrl()'s precedence. Reads whatever
       // the settings manager singleton has loaded so far: the real platform
@@ -243,6 +256,19 @@ export class ApiServer {
       if (ACCESS_VERIFY_PATH_RE.test(new URL(c.req.url).pathname)) return next();
       return generalLimiter(c, next as never);
     });
+
+    // SEC-3 (Tier B): what a tenant container may reach on the control plane.
+    //
+    // Registered BEFORE the request logger and the audit log so a refused
+    // container request is still logged as the 404 it becomes, and before
+    // `setupRoutes` so it covers the discovery routes and the dashboard as well
+    // as `/api/*`. Docker-only: under `none` isolation there is no drop-net,
+    // and every address the check could match would be an operator's own
+    // network. See container-origin.ts for why this is a denylist and what
+    // `DROP_API_HOST=127.0.0.1` does instead.
+    if (this.config.isolation === 'docker') {
+      this.app.use('*', containerOriginGate());
+    }
 
     // Request logging
     this.app.use('*', logger());
