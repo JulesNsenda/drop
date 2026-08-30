@@ -27,6 +27,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Settings → Platform, for the toggles that had no dashboard control.** App
+  sharing, guest invitations, the SQL console and the outbound-mail relay all
+  shipped with an API endpoint and no way to reach them, so turning any of them
+  on meant `curl` with a hand-extracted token — most of the sharing program was
+  effectively unreachable that way. Each switch carries its consequence beside
+  it rather than in a doc: enabling app sharing warns if the access gate is off,
+  guest invitations say they need a mail relay, and the SQL console states the
+  catalog exposure that makes it admin-only. The mail card covers host, port,
+  TLS, username and from-address, a write-only relay password, and a test send.
+
+### Fixed
+
+- **The SQL console's refusal pointed at a Settings page that did not exist.**
+  It told an admin to "enable it in Settings" while no such control had been
+  built. It now names the tab that exists.
+
 ## [1.6.0] - 2026-08-30
 
 A hardening release, plus two things you can see.

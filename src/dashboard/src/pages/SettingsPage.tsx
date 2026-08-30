@@ -24,10 +24,12 @@ import {
   LucideIcon,
   Plug,
   GitBranch,
+  SlidersHorizontal,
 } from 'lucide-react';
 import Tabs, { TabDef, TabPanel } from '../components/Tabs';
 import ApiKeysTab from '../components/ApiKeysTab';
 import McpConnectorTab from '../components/McpConnectorTab';
+import PlatformSettingsTab from '../components/PlatformSettingsTab';
 import UserConnectorTab from '../components/UserConnectorTab';
 import GitWebhooksTab from '../components/GitWebhooksTab';
 import Button from '../components/ui/Button';
@@ -362,6 +364,7 @@ function SettingsPage() {
     const tabs: TabDef[] = [];
     if (isAdmin) tabs.push({ id: 'system', label: 'System', icon: Server });
     tabs.push({ id: 'account', label: 'Account', icon: Lock });
+    if (isAdmin) tabs.push({ id: 'platform', label: 'Platform', icon: SlidersHorizontal });
     if (isAdmin) tabs.push({ id: 'api-keys', label: 'API Keys', icon: KeyRound });
     if (canUseConnectors) tabs.push({ id: 'mcp-connector', label: 'Claude (MCP)', icon: Plug });
     if (isAdmin) tabs.push({ id: 'git-webhooks', label: 'Git webhooks', icon: GitBranch });
@@ -899,6 +902,12 @@ function SettingsPage() {
       )}
 
       {/* API Keys tab (admin only) */}
+      {isAdmin && activeTab === 'platform' && (
+        <TabPanel id="platform">
+          <PlatformSettingsTab />
+        </TabPanel>
+      )}
+
       {isAdmin && activeTab === 'api-keys' && (
         <TabPanel id="api-keys">
           <ApiKeysTab />
