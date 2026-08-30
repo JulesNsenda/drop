@@ -27,6 +27,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A deploy that outlives the MCP wait budget now returns its `deploy_id`.**
+  After ~120s the reply said only "still building, call app_status" — and since
+  `get_deploy_logs` looks a deploy up by that id and cannot disclose which ids
+  exist, while `app_logs` never reads build output, a slow monorepo or cold
+  container build had no supported way to read its own output. The id was never
+  missing: the poll loop already read the correlated episode and discarded it at
+  the deadline. When no episode has correlated yet the message stays id-less
+  rather than naming a previous deploy's. (#265)
+
 ### Changed
 
 - **A deploy log now opens by saying where the app can write.** Persistent
