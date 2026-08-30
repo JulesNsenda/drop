@@ -135,7 +135,11 @@ import { isValidAppName } from '../api/middleware/validate';
 import { IsolationMode, assertStartupConstraints } from './startup-constraints';
 import { createContainerExecCommand } from './builder/container-build-runner';
 import { migrateAllToDocker } from '../managers/runtime/runtime-migrator';
-import { HOST_ALIAS, containerPolicyFingerprint } from '../managers/runtime/container-config';
+import {
+  CONTAINER_DATA_DIR,
+  HOST_ALIAS,
+  containerPolicyFingerprint,
+} from '../managers/runtime/container-config';
 import { buildNginxConf } from '../utils/nginx-conf';
 import { BuildLogService, getBuildLogService, resetBuildLogService } from '../managers/build-log/build-log';
 import {
@@ -4371,7 +4375,15 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
   private async writeInjectedEnvHints(logId: string | null, appName: string): Promise<void> {
     if (!logId || !this.buildLogService) return;
     try {
-      const dataDir = await this.ensureAppDataDirectory(appName);
+      const hostDataDir = await this.ensureAppDataDirectory(appName);
+      // The path the APP sees, which since Tier B M-3 is not the host path
+      // under docker isolation: the data dir bind-mounts at CONTAINER_DATA_DIR
+      // so the host's directory layout stops being published to every tenant.
+      // Printing the host path here would recreate the exact confusion this
+      // hint exists to prevent — an author reading a directory out of the
+      // deploy log, writing to it, and getting ENOENT.
+      const dataDir =
+        this.config.isolation === 'docker' ? CONTAINER_DATA_DIR : hostDataDir;
       this.buildLogService.writeLine(
         logId,
         `[drop] Writable data directory: ${dataDir} (also in the app env as DROP_DATA_DIR).`
@@ -8084,9 +8096,20 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         // Tier B: nginx runs unprivileged (uid 101, zero caps), so the full
         // config is passed via -c from the bind-mounted data dir instead of
         // being copied into root-owned /etc/nginx.
+        //
+        // The path in the COMMAND is the in-container one, which since Tier B
+        // M-3 is no longer the host path: the data dir mounts at
+        // CONTAINER_DATA_DIR, so `nginx -c <hostPath>/nginx.conf` would name a
+        // file that does not exist inside the container and every static app
+        // would fail to start. `nginxConfPath` above stays a host path because
+        // that is where DROP writes the file; only the argument nginx receives
+        // is translated.
         script = '/bin/sh';
         interpreter = 'none';
-        args = ['-c', `nginx -c ${nginxConfPath} -g 'daemon off;'`];
+        args = [
+          '-c',
+          `nginx -c ${CONTAINER_DATA_DIR}/nginx.conf -g 'daemon off;'`,
+        ];
       } else {
         const serveDir = path.join(appPath, outputSubdir || '.');
         // eslint-disable-next-line @typescript-eslint/no-require-imports

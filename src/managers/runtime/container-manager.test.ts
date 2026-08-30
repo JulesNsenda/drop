@@ -20,6 +20,9 @@ import { AppStartSpec } from './app-runtime.types';
 import { eventBus } from '../../core/event-bus';
 import {
   DROP_NETWORK,
+  CONTAINER_DATA_DIR,
+  baseImageTags,
+  pinnedImages,
   selectBaseImage,
   selectBuildImage,
   selectImageUser,
@@ -30,6 +33,16 @@ import {
   DROP_NET_GATEWAY,
   HOST_ALIAS,
 } from './container-config';
+
+/**
+ * Strip the `@sha256:…` a pinned reference carries (DROP-160 Tier B).
+ *
+ * The assertions below were written to pin WHICH IMAGE each app type gets, and
+ * that is still what they check. Digest pinning is a separate property with its
+ * own block at the bottom of this file, so that refreshing a digest touches one
+ * table and one test rather than every image assertion in the suite.
+ */
+const tagOf = (ref: string) => ref.split('@')[0];
 
 // ── Docker mock helpers ──────────────────────────────────────────────────────
 
@@ -178,6 +191,128 @@ describe('ContainerManager', () => {
       expect(call.HostConfig.CapAdd).toBeUndefined();
     });
 
+    /**
+     * Read-only rootfs + tmpfs (DROP-160, Tier B).
+     *
+     * `/app` was already a read-only bind, but everything outside it was
+     * writable: a compromised process could drop a binary into
+     * `/usr/local/bin` or rewrite `/etc` and keep it for the life of the
+     * container.
+     */
+    it('runs on a read-only root filesystem', async () => {
+      const docker = makeDockerMock() as any;
+      const mgr = new ContainerManager(docker);
+
+      await mgr.start(baseSpec);
+
+      expect(docker.createContainer.mock.calls[0][0].HostConfig.ReadonlyRootfs).toBe(true);
+    });
+
+    it('hands back only capped, noexec tmpfs for the paths a runtime actually writes', async () => {
+      const docker = makeDockerMock() as any;
+      const mgr = new ContainerManager(docker);
+
+      await mgr.start(baseSpec);
+      const tmpfs = docker.createContainer.mock.calls[0][0].HostConfig.Tmpfs;
+
+      // /tmp is the one every language runtime assumes; /var/cache/nginx is
+      // what lets static apps keep the read-only rootfs rather than being
+      // exempted from it.
+      expect(Object.keys(tmpfs)).toEqual(
+        expect.arrayContaining(['/tmp', '/run', '/var/run', '/var/cache/nginx'])
+      );
+      // `noexec` is the half that matters: a writable tmpfs the app can
+      // execute from just relocates the staging ground the read-only rootfs
+      // removed. `size=` is the other — a RAM-backed mount with no cap is a
+      // memory-exhaustion path on a 4 GB box.
+      for (const opts of Object.values(tmpfs) as string[]) {
+        expect(opts).toContain('noexec');
+        expect(opts).toContain('nosuid');
+        expect(opts).toContain('nodev');
+        expect(opts).toMatch(/size=\d+/);
+      }
+    });
+
+    /**
+     * Fixed in-container data dir (DROP-160, Tier B M-3). The data dir used to
+     * be mounted at its own HOST path, publishing DROP's directory layout and
+     * root location to every tenant and making the in-container path vary with
+     * how the operator set DROP_ROOT.
+     */
+    it('mounts the data dir at a fixed path, not at the host path', async () => {
+      const docker = makeDockerMock() as any;
+      const mgr = new ContainerManager(docker);
+
+      await mgr.start({
+        ...baseSpec,
+        env: { ...baseSpec.env, DROP_DATA_DIR: '/var/drop/data/appdata/my-app' },
+      });
+      const call = docker.createContainer.mock.calls[0][0];
+      const dataMount = call.HostConfig.Mounts.find(
+        (m: { Target: string }) => m.Target === CONTAINER_DATA_DIR
+      );
+
+      expect(dataMount).toMatchObject({
+        Type: 'bind',
+        Source: '/var/drop/data/appdata/my-app',
+        ReadOnly: false,
+      });
+      expect(
+        call.HostConfig.Mounts.some((m: { Target: string }) =>
+          m.Target.includes('/var/drop/data/appdata')
+        )
+      ).toBe(false);
+    });
+
+    it('rewrites DROP_DATA_DIR so the documented contract still resolves', async () => {
+      // The whole reason M-3 is safe: the app is told to read the env var
+      // (issue #238 exists because that was not discoverable enough), so
+      // moving the mount is invisible to any app following the contract.
+      const docker = makeDockerMock() as any;
+      const mgr = new ContainerManager(docker);
+
+      await mgr.start({
+        ...baseSpec,
+        env: { ...baseSpec.env, DROP_DATA_DIR: '/var/drop/data/appdata/my-app' },
+      });
+
+      expect(docker.createContainer.mock.calls[0][0].Env).toContain(
+        `DROP_DATA_DIR=${CONTAINER_DATA_DIR}`
+      );
+    });
+
+    it('leaves the caller\'s spec holding the HOST path', async () => {
+      // `spec.env` is shared with the PM2 path and the caller's own
+      // bookkeeping, where the host path is the only meaningful value —
+      // rewriting it in place would corrupt both.
+      const docker = makeDockerMock() as any;
+      const mgr = new ContainerManager(docker);
+      const spec = {
+        ...baseSpec,
+        env: { ...baseSpec.env, DROP_DATA_DIR: '/var/drop/data/appdata/my-app' },
+      };
+
+      await mgr.start(spec);
+
+      expect(spec.env.DROP_DATA_DIR).toBe('/var/drop/data/appdata/my-app');
+    });
+
+    it('publishes ports on loopback only, never on every interface', async () => {
+      // The non-loopback-publish assertion Tier B asked for. Caddy is the only
+      // thing that should reach an app; a `0.0.0.0` binding would put every
+      // tenant app directly on the public internet, bypassing the router, its
+      // TLS, and the access gate.
+      const docker = makeDockerMock() as any;
+      const mgr = new ContainerManager(docker);
+
+      await mgr.start(baseSpec);
+      const bindings = docker.createContainer.mock.calls[0][0].HostConfig.PortBindings;
+
+      for (const list of Object.values(bindings) as Array<Array<{ HostIp: string }>>) {
+        for (const b of list) expect(b.HostIp).toBe('127.0.0.1');
+      }
+    });
+
     it('runs static apps as the unprivileged nginx user with zero capabilities', async () => {
       const docker = makeDockerMock() as any;
       const mgr = new ContainerManager(docker);
@@ -192,7 +327,7 @@ describe('ContainerManager', () => {
       });
 
       const call = docker.createContainer.mock.calls[0][0];
-      expect(call.Image).toBe('nginx:alpine');
+      expect(tagOf(call.Image)).toBe('nginx:alpine');
       expect(call.User).toBe('101:101');
       expect(call.HostConfig.CapDrop).toEqual(CONTAINER_CAP_DROP);
       expect(call.HostConfig.CapAdd).toBeUndefined();
@@ -311,7 +446,7 @@ describe('ContainerManager', () => {
       await mgr.start({ ...baseSpec, appType: 'python' });
 
       const call = docker.createContainer.mock.calls[0][0];
-      expect(call.Image).toBe('python:3.12-slim');
+      expect(tagOf(call.Image)).toBe('python:3.12-slim');
     });
 
     it('returns an AppProcessInfo with runtime: docker', async () => {
@@ -880,13 +1015,13 @@ describe('selectBuildImage (DROP-137)', () => {
   // `spa: nginx:alpine` itself was the second (nginx start command missing from
   // node) — and fixing that runtime broke the build, the symmetric half.
   it('builds static in node:20-slim while still SERVING it from nginx:alpine', () => {
-    expect(selectBuildImage('static')).toBe('node:20-slim');
-    expect(selectBaseImage('static')).toBe('nginx:alpine');
+    expect(tagOf(selectBuildImage('static'))).toBe('node:20-slim');
+    expect(tagOf(selectBaseImage('static'))).toBe('nginx:alpine');
   });
 
   it('builds spa in node:20-slim while still SERVING it from nginx:alpine', () => {
-    expect(selectBuildImage('spa')).toBe('node:20-slim');
-    expect(selectBaseImage('spa')).toBe('nginx:alpine');
+    expect(tagOf(selectBuildImage('spa'))).toBe('node:20-slim');
+    expect(tagOf(selectBaseImage('spa'))).toBe('nginx:alpine');
   });
 
   it.each(['nodejs', 'python', 'django', 'flask', 'fastapi', 'go'] as const)(
@@ -897,7 +1032,7 @@ describe('selectBuildImage (DROP-137)', () => {
   );
 
   it('honours an explicitly pinned image on the build path too', () => {
-    expect(selectBuildImage('spa', 'node:20-slim')).toBe('node:20-slim');
+    expect(tagOf(selectBuildImage('spa', 'node:20-slim'))).toBe('node:20-slim');
   });
 
   it('still enforces the image allowlist on the build path', () => {
@@ -907,11 +1042,11 @@ describe('selectBuildImage (DROP-137)', () => {
 
 describe('selectBaseImage', () => {
   it('returns node:20-slim for nodejs', () => {
-    expect(selectBaseImage('nodejs')).toBe('node:20-slim');
+    expect(tagOf(selectBaseImage('nodejs'))).toBe('node:20-slim');
   });
 
   it('returns python:3.12-slim for python', () => {
-    expect(selectBaseImage('python')).toBe('python:3.12-slim');
+    expect(tagOf(selectBaseImage('python'))).toBe('python:3.12-slim');
   });
 
   // Python web frameworks: the detector reports the specific type
@@ -920,31 +1055,31 @@ describe('selectBaseImage', () => {
   // entries they fell back to node:20-slim, where `pip` doesn't exist —
   // the build failed with "/bin/sh: 1: pip: not found".
   it('returns python:3.12-slim for django', () => {
-    expect(selectBaseImage('django')).toBe('python:3.12-slim');
+    expect(tagOf(selectBaseImage('django'))).toBe('python:3.12-slim');
   });
 
   it('returns python:3.12-slim for flask', () => {
-    expect(selectBaseImage('flask')).toBe('python:3.12-slim');
+    expect(tagOf(selectBaseImage('flask'))).toBe('python:3.12-slim');
   });
 
   it('returns python:3.12-slim for fastapi', () => {
-    expect(selectBaseImage('fastapi')).toBe('python:3.12-slim');
+    expect(tagOf(selectBaseImage('fastapi'))).toBe('python:3.12-slim');
   });
 
   it('returns golang:1.22-alpine for go', () => {
-    expect(selectBaseImage('go')).toBe('golang:1.22-alpine');
+    expect(tagOf(selectBaseImage('go'))).toBe('golang:1.22-alpine');
   });
 
   it('returns nginx:alpine for static', () => {
-    expect(selectBaseImage('static')).toBe('nginx:alpine');
+    expect(tagOf(selectBaseImage('static'))).toBe('nginx:alpine');
   });
 
   it('returns nginx:alpine for spa (served by the same nginx path as static)', () => {
-    expect(selectBaseImage('spa')).toBe('nginx:alpine');
+    expect(tagOf(selectBaseImage('spa'))).toBe('nginx:alpine');
   });
 
   it('respects runtimeImage override when image is in the allowlist', () => {
-    expect(selectBaseImage('nodejs', 'node:20-slim')).toBe('node:20-slim');
+    expect(tagOf(selectBaseImage('nodejs', 'node:20-slim'))).toBe('node:20-slim');
   });
 
   it('throws when runtimeImage is not in the allowlist', () => {
@@ -954,7 +1089,7 @@ describe('selectBaseImage', () => {
   });
 
   it('falls back to node:20-slim for unknown types', () => {
-    expect(selectBaseImage('docker' as any)).toBe('node:20-slim');
+    expect(tagOf(selectBaseImage('docker' as any))).toBe('node:20-slim');
   });
 });
 
@@ -968,5 +1103,73 @@ describe('selectImageUser', () => {
     expect(selectImageUser('nodejs')).toBe('node');
     expect(selectImageUser('python')).toBe('1000:1000');
     expect(selectImageUser('go')).toBe('1000:1000');
+  });
+});
+
+/**
+ * Digest pinning (DROP-160, Tier B).
+ *
+ * The allowlist `selectBaseImage` enforces guaranteed only a NAME. `node:20-slim`
+ * is a mutable pointer rebuilt on its publisher's schedule, so two DROP boxes
+ * pulling "the same" image on different days ran different bytes, and an
+ * allowlist that admits a moving tag has relocated the trust rather than
+ * removed it.
+ */
+describe('base image digest pinning', () => {
+  afterEach(() => {
+    delete process.env.DROP_DISABLE_IMAGE_PINNING;
+  });
+
+  it('pins every image the runtime can select', () => {
+    // The property that matters, stated over the whole set rather than image
+    // by image: adding a base image to BASE_IMAGES without adding its digest
+    // must fail HERE. `pin()` deliberately returns the bare tag for an unpinned
+    // image rather than throwing — taking the runtime down over a missing table
+    // entry would be a far worse outcome than running unpinned — so this test
+    // is the thing that notices.
+    for (const ref of pinnedImages()) {
+      expect(ref).toMatch(/^[^@]+@sha256:[0-9a-f]{64}$/);
+    }
+    expect(pinnedImages().length).toBeGreaterThan(0);
+  });
+
+  it('pins INDEX digests, so an arm64 self-hoster still resolves a runnable image', () => {
+    // Captured with `docker buildx imagetools inspect`, not
+    // `docker manifest inspect -v` — the latter reports the platform manifest
+    // the LOCAL daemon resolved to, which would pin every self-hoster to the
+    // architecture of whoever last refreshed the table. There is no way to
+    // assert "this is an index digest" offline, so this test pins the
+    // provenance in prose next to the values and checks the shape.
+    expect(pinnedImages()).toEqual(baseImageTags().map(t => expect.stringContaining(`${t}@sha256:`)));
+  });
+
+  it('normalises a bare tag from an operator override to the pinned form', () => {
+    // Existing app configs and drop.yaml files were written against tags, so
+    // the allowlist still ACCEPTS a bare tag — but running one would leave the
+    // hole open for exactly the callers most likely to have a stale config.
+    expect(selectBaseImage('nodejs', 'node:20-slim')).toMatch(/@sha256:/);
+  });
+
+  it('accepts the pinned spelling of an allowlisted image too', () => {
+    const pinned = selectBaseImage('nodejs');
+
+    expect(selectBaseImage('nodejs', pinned)).toBe(pinned);
+  });
+
+  it('still refuses an image outside the allowlist, pinned or not', () => {
+    expect(() => selectBaseImage('nodejs', 'evil:latest')).toThrow(/allowlist/i);
+    expect(() =>
+      selectBaseImage('nodejs', 'evil:latest@sha256:' + '0'.repeat(64))
+    ).toThrow(/allowlist/i);
+  });
+
+  it('falls back to bare tags when an operator disables pinning', () => {
+    // The escape hatch exists because a digest this box cannot pull refuses
+    // EVERY deploy, and "edit the source and rebuild" is not an acceptable
+    // recovery path for an operator on a private mirror.
+    process.env.DROP_DISABLE_IMAGE_PINNING = 'true';
+
+    expect(selectBaseImage('nodejs')).toBe('node:20-slim');
+    expect(selectBuildImage('spa')).toBe('node:20-slim');
   });
 });
