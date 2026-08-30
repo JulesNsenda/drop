@@ -16,9 +16,10 @@ import { getDiskFreeMb } from '../../utils/disk';
 import { getSettingsManager } from '../../managers/settings/settings-manager';
 import type { MailSettings } from '../../managers/settings/settings-manager';
 import { normalizePublicUrl } from '../../utils/url-validator';
-import { getPublicUrl, setPublicUrl, isAccessGateEnabled } from '../runtime-config';
+import { getPublicUrl, setPublicUrl, isAccessGateEnabled, getIsolationMode } from '../runtime-config';
 import { getMailCredentialStore, clearMailCredential } from '../../managers/mailer/mail-credential';
 import { sendMeteredMail } from './mail-quota';
+import { getPlatformOps } from '../platform-ops';
 
 const admin = new Hono();
 
@@ -309,6 +310,59 @@ admin.post('/apps/:name/suspend', async (c) => {
 // GET /admin/settings - Platform settings: the public base URL / OAuth
 // issuer override (PRD-041) plus the GitHub webhook secret status and the
 // non-admin MCP-connector toggle.
+/**
+ * The isolation mode, for the admin surface.
+ *
+ * `config.isolation` is the single biggest behavioural switch on the platform —
+ * it decides whether tenant code runs as a host process under PM2 or in a
+ * container, and with it the `DATABASE_URL` shape, `DROP_API_URL`, how health
+ * is probed, and whether multi-user mode is allowed at all. Until now it was
+ * inferable only from the process environment or from an app's symptoms.
+ *
+ * Reported READ-ONLY, with the reason attached rather than left to be
+ * rediscovered: the platform selects its `AppRuntime` implementation exactly
+ * once at boot, and `getAppRuntime()` throws if a different type is later
+ * requested. A settings-backed switch would therefore report a mode the running
+ * platform is not in — worse than offering no switch. `changeWith` names what
+ * an operator must actually do, so the surface answers the question instead of
+ * only raising it.
+ */
+function buildIsolationPayload(): {
+  mode: 'none' | 'docker';
+  configurable: false;
+  changeWith: string;
+  note: string;
+} {
+  return {
+    mode: getIsolationMode(),
+    configurable: false,
+    changeWith: 'DROP_ISOLATION=docker|none (or --isolation), then restart the platform',
+    note:
+      'Chosen once at startup — the app runtime is selected from it and cannot be swapped ' +
+      'while the platform is running. Existing apps move between runtimes with ' +
+      '`drop migrate-runtime`.',
+  };
+}
+
+/**
+ * The SQL console's on/off state, for GET /admin/settings.
+ *
+ * `catalogVisibility` travels WITH the flag rather than living only in a doc:
+ * it is the property an operator is accepting by turning this on, and a
+ * settings API that reports `{enabled: false}` and nothing else invites the
+ * reader to treat it as an ordinary feature toggle.
+ */
+function buildSqlConsolePayload(): { enabled: boolean; adminOnly: true; catalogVisibility: string } {
+  return {
+    enabled: getSettingsManager().getSqlConsoleEnabled(),
+    adminOnly: true,
+    catalogVisibility:
+      'Any arbitrary query can read the shared PostgreSQL catalogs, which list every ' +
+      'database and role on this server. No privilege setting closes that, which is why ' +
+      'the console is admin-only.',
+  };
+}
+
 admin.get('/settings', async (c) => {
   return c.json(
     success({
@@ -318,6 +372,8 @@ admin.get('/settings', async (c) => {
       appSharing: buildAppSharingPayload(),
       guestInvites: buildGuestInvitesPayload(),
       mail: await buildMailPayload(),
+      isolation: buildIsolationPayload(),
+      sqlConsole: buildSqlConsolePayload(),
     })
   );
 });
@@ -861,6 +917,102 @@ admin.post('/mail/test', async (c) => {
   });
 
   return c.json(success(failure ? { status: result.status, failure } : { status: result.status }));
+});
+
+
+/**
+ * Deploy quiesce (P2-5b) — `drop backup`'s way to hold the pipeline still.
+ *
+ * `drop backup` runs as its own process (usually from cron), so it cannot reach
+ * into the platform's `appsInProgress` directly. It authenticates with the
+ * `cli-local` admin key the platform writes on start and calls these two
+ * routes around the snapshot.
+ *
+ * The window is a LEASE with a ceiling enforced platform-side, not a boolean.
+ * The caller can be SIGKILLed mid-backup; a boolean would leave the box
+ * refusing every deploy until a human noticed. The worst case here is deploys
+ * deferring for the rest of the requested window — and the watcher DEFERS
+ * rather than dropping, so nothing is lost either way.
+ */
+admin.post('/quiesce', async (c) => {
+  const ops = getPlatformOps();
+  if (!ops) {
+    return c.json(error(ErrorCodes.INTERNAL_ERROR, 'Platform not available'), 503);
+  }
+
+  const body = await c.req.json().catch(() => ({}) as Record<string, unknown>);
+  const requested = Number((body as Record<string, unknown>).seconds ?? 300);
+  if (!Number.isFinite(requested) || requested <= 0) {
+    return c.json(error(ErrorCodes.VALIDATION_ERROR, 'seconds must be a positive number'), 400);
+  }
+
+  const result = await ops.quiesce(requested * 1000);
+  await logActivityFor((c.get as Function)('auth') as AuthContext | undefined, {
+    action: 'backup-quiesce',
+    detail: `${Math.round(requested)}s, drained=${result.drained}`,
+  });
+
+  // `drained: false` is reported, never hidden: it means a deploy outlived the
+  // drain window, so the caller's snapshot may straddle it. A backup that
+  // silently claims consistency it does not have is the failure this whole
+  // mechanism exists to prevent.
+  return c.json(
+    success({
+      quiesced: true,
+      drained: result.drained,
+      until: new Date(result.until).toISOString(),
+    })
+  );
+});
+
+admin.delete('/quiesce', async (c) => {
+  const ops = getPlatformOps();
+  if (!ops) {
+    return c.json(error(ErrorCodes.INTERNAL_ERROR, 'Platform not available'), 503);
+  }
+
+  ops.resumeFromQuiesce();
+  await logActivityFor((c.get as Function)('auth') as AuthContext | undefined, {
+    action: 'backup-resume',
+    detail: 'released',
+  });
+
+  return c.json(success({ quiesced: false }));
+});
+
+/**
+ * PUT /admin/settings/sql-console — the conscious acceptance the database
+ * panel's query console requires (DROP-163).
+ *
+ * Off by default, and unlike the app-sharing toggle it is not off merely
+ * because it is new. `pg_catalog` and the shared catalogs are world-readable
+ * and no privilege configuration can close them, so any principal running
+ * arbitrary SQL can enumerate every database and role on this server. The
+ * console is admin-only on top of this, which is what makes that tolerable —
+ * an admin can already list every app — but the operator still has to turn it
+ * on knowing the property exists.
+ */
+admin.put('/settings/sql-console', async (c) => {
+  const authCtx = (c.get as Function)('auth') as AuthContext | undefined;
+  const body = (await c.req.json().catch(() => undefined)) as unknown;
+
+  if (!isJsonObjectBody(body)) {
+    return c.json(error(ErrorCodes.VALIDATION_ERROR, 'Request body must be a JSON object'), 400);
+  }
+
+  const input = requireBooleanField(body, 'enabled');
+  if (input === undefined) {
+    return c.json(error(ErrorCodes.VALIDATION_ERROR, 'enabled must be a boolean'), 400);
+  }
+
+  await getSettingsManager().setSqlConsoleEnabled(input);
+
+  await logActivityFor(authCtx, {
+    action: 'sql-console-set',
+    detail: `SQL console ${input ? 'enabled' : 'disabled'}`,
+  });
+
+  return c.json(success(buildSqlConsolePayload()));
 });
 
 export default admin;

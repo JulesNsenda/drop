@@ -436,3 +436,204 @@ export async function listTables(appName: string): Promise<DbTable[]> {
     throw mapConnectError(err, appName);
   }
 }
+
+// ── M2: the read-only query runner ──────────────────────────────────────────
+
+/**
+ * Hard cap on the SQL a caller may submit. Not a security control — the
+ * controls are below — just a bound on what gets parsed and logged.
+ */
+const MAX_SQL_BYTES = 8 * 1024;
+
+/** Rows returned in one response. The caller may ask for less, never more. */
+export const MAX_QUERY_ROWS = 500;
+const DEFAULT_QUERY_ROWS = 100;
+
+/**
+ * Per-session memory ceiling, applied with `SET LOCAL` inside the read-only
+ * transaction so it cannot outlive it.
+ *
+ * `work_mem` is `USERSET`, so a caller could raise it back — except that raising
+ * it needs a second statement, and the extended protocol below refuses to carry
+ * one.
+ *
+ * **`temp_file_limit` is deliberately NOT here.** It is the control that bounds
+ * spill-to-disk, and disk is GLOBAL on this box, so it matters — but its
+ * `pg_settings.context` is `superuser`, and this module connects as the app's
+ * own unprivileged role. Setting it here does not fail quietly: PostgreSQL
+ * refuses the whole statement with `42501 permission denied to set parameter`,
+ * which took every query on this path down until a live run against a real
+ * server caught it. It belongs at the ROLE level, where a superuser can set it
+ * once — see `applyQueryResourceLimits` in database-provisioner.ts.
+ */
+const QUERY_WORK_MEM = '8MB';
+
+/** Fixed cursor name. Never interpolated from input — the SQL is the only tenant-authored part. */
+const CURSOR_NAME = 'drop_panel_cursor';
+
+export interface DbQueryResult {
+  columns: string[];
+  rows: Array<Array<string | null>>;
+  rowCount: number;
+  /** More rows existed than were returned — the cap was hit, not the end of the result. */
+  truncated: boolean;
+  durationMs: number;
+}
+
+/** Thrown when the submitted SQL is refused or fails. Distinct from a connection problem. */
+export class DbQueryError extends Error {
+  constructor(
+    readonly reason: 'too-long' | 'empty' | 'rejected',
+    message: string
+  ) {
+    super(message);
+    this.name = 'DbQueryError';
+  }
+}
+
+/**
+ * Render one value for transport.
+ *
+ * Everything becomes a string or null, deliberately. A SQL console's job is to
+ * show what is in the column, and JSON cannot round-trip half of what Postgres
+ * returns — `bigint` loses precision past 2^53, `Date` becomes a
+ * timezone-shifted string, `Buffer` becomes `{type:'Buffer',data:[…]}`, and
+ * `NaN`/`Infinity` become `null`. Stringifying once, here, means the client
+ * renders exactly what came back rather than a lossy re-encoding of it.
+ */
+function renderCell(value: unknown): string | null {
+  if (value === null || value === undefined) return null;
+  if (typeof value === 'string') return value;
+  if (Buffer.isBuffer(value)) return '\\x' + value.toString('hex');
+  if (value instanceof Date) return value.toISOString();
+  if (typeof value === 'object') return JSON.stringify(value);
+  return String(value);
+}
+
+/**
+ * Run one read-only statement against an app's own database.
+ *
+ * Four controls, each closing something the others do not. All four were
+ * verified against PostgreSQL 16 rather than reasoned about:
+ *
+ * 1. **`queryMode: 'extended'`** — the extended protocol refuses more than one
+ *    command per message (`42601: cannot insert multiple commands into a
+ *    prepared statement`). This is load-bearing, not decorative: the DEFAULT
+ *    protocol happily runs `SELECT 1; INSERT …`, measured. It is also why
+ *    there is NO regex allowlist here — a "must start with SELECT" check is
+ *    the kind of guard that looks like one and is not, and would misdescribe
+ *    where the boundary actually is.
+ *
+ * 2. **`BEGIN READ ONLY`** (from `withGatedReadOnlySession`) — the only thing
+ *    that stops a `SECURITY DEFINER` function the app itself created, which
+ *    executes as the app OWNER and is a full write primitive no `SELECT`-only
+ *    grant can reach. Measured: the definer INSERT is refused `25006`, as is
+ *    `CREATE TEMP TABLE` (temp tables are real relations on disk, granted to
+ *    `PUBLIC` by default, and not bounded by `temp_file_limit`).
+ *
+ * 3. **A server-side CURSOR** — a true row cap. `rows: n` on the driver is not
+ *    one: node-postgres re-`Execute`s on `portalSuspended`, so it caps the
+ *    BATCH, not the total. `FETCH` asks for one more row than the caller wants,
+ *    which is how `truncated` is known without counting the whole result.
+ *
+ * 4. **Resource ceilings + the existing gate** — `work_mem` per session, the
+ *    connection's `statement_timeout`, `temp_file_limit` as a role default (it
+ *    is superuser-context, so it cannot be set from here), and M1's bounded
+ *    connection gate.
+ *
+ * What NONE of this closes, and cannot: `pg_catalog` and the shared catalogs
+ * are world-readable, so any principal running arbitrary SQL can enumerate
+ * every database and role on the cluster — the box's whole app inventory. No
+ * privilege configuration closes that. It is why the route is admin-only and
+ * behind a setting an operator has to turn on: the acceptance has to be
+ * conscious, not inherited from owning one app.
+ */
+export async function runQuery(
+  appName: string,
+  sql: string,
+  limit = DEFAULT_QUERY_ROWS
+): Promise<DbQueryResult> {
+  const trimmed = sql.trim();
+  if (!trimmed) throw new DbQueryError('empty', 'No SQL was submitted.');
+  if (Buffer.byteLength(trimmed, 'utf8') > MAX_SQL_BYTES) {
+    throw new DbQueryError('too-long', `Query exceeds the ${MAX_SQL_BYTES}-byte limit.`);
+  }
+
+  // Anything not a usable positive count — 0, negative, NaN, a fraction below
+  // 1 — becomes the default rather than being clamped. Clamping produced two
+  // different answers for two spellings of the same nonsense (`0` fell through
+  // `||` to the default while `-5` floored to 1), which is the kind of
+  // inconsistency that only ever surfaces as a confusing bug report.
+  const requested = Math.floor(limit);
+  const capped = Number.isFinite(requested) && requested >= 1
+    ? Math.min(requested, MAX_QUERY_ROWS)
+    : DEFAULT_QUERY_ROWS;
+
+  const provisioner = getDatabaseProvisioner();
+  if (!provisioner) {
+    console.warn('[db-panel] unavailable', { appName, reason: 'no-service' });
+    throw new DbUnavailableError('no-service', 'Database service is not available.');
+  }
+
+  const creds = provisioner.getAppCredentials(appName);
+  if (!creds) {
+    console.warn('[db-panel] unavailable', { appName, reason: 'not-provisioned' });
+    throw new DbUnavailableError('not-provisioned', `No database is provisioned for "${appName}".`);
+  }
+
+  const started = Date.now();
+  try {
+    return await withGatedReadOnlySession(appName, creds, async (client) => {
+      // SET LOCAL, so it dies with the transaction. Sent as an ordinary
+      // statement because it is a DROP-authored constant, not input.
+      await client.query(`SET LOCAL work_mem = '${QUERY_WORK_MEM}'`);
+
+      // The tenant SQL reaches the server exactly once, here, inside a cursor
+      // declaration on the extended protocol. `NO SCROLL` because this only
+      // ever fetches forward, and a scrollable cursor can force materialisation.
+      await client.query({
+        text: `DECLARE ${CURSOR_NAME} NO SCROLL CURSOR FOR ${trimmed}`,
+        queryMode: 'extended',
+      } as unknown as string);
+
+      // One more than asked, so "there were more" is known without counting.
+      //
+      // `rowMode: 'array'` for two reasons, and the first one is a bug this
+      // had: node-postgres returns rows as OBJECTS keyed by column name by
+      // default, so indexing them positionally yields `undefined` for every
+      // cell — which rendered as a grid of nulls until a live run showed it.
+      // The second is that a console must survive `SELECT 1 AS a, 2 AS a`:
+      // object keys collide and silently drop a column, positions do not.
+      const result = await client.query({
+        text: `FETCH FORWARD ${capped + 1} FROM ${CURSOR_NAME}`,
+        rowMode: 'array',
+      });
+      const truncated = result.rows.length > capped;
+      const rows = truncated ? result.rows.slice(0, capped) : result.rows;
+      const columns = result.fields.map((f) => f.name);
+
+      return {
+        columns,
+        rows: rows.map((row) => (row as unknown[]).map(renderCell)),
+        rowCount: rows.length,
+        truncated,
+        durationMs: Date.now() - started,
+      };
+    });
+  } catch (err) {
+    if (err instanceof DbUnavailableError) throw err;
+    if (err instanceof SuperuserCredentialGuardError) throw err;
+    if (err instanceof DbQueryError) throw err;
+
+    // A SQLSTATE means PostgreSQL understood the request and refused it — a
+    // syntax error, a read-only violation, a missing table. That is the
+    // caller's answer, not a platform fault, and the message is the useful
+    // part. Connection-level failures still go through mapConnectError.
+    const code = (err as { code?: string } | undefined)?.code;
+    if (typeof code === 'string' && /^[0-9A-Z]{5}$/.test(code)) {
+      const message = err instanceof Error ? err.message : String(err);
+      throw new DbQueryError('rejected', `${message} (SQLSTATE ${code})`);
+    }
+    throw mapConnectError(err, appName);
+  }
+}

@@ -73,6 +73,10 @@ ACME_EMAIL=""
 ENABLE_HTTPS=false
 DEPLOY_PUBKEY=""
 ISOLATION=""       # "docker" to enable container isolation; empty to leave unchanged
+# Tier B userns-remap. OPT-IN and never implied by --isolation=docker: enabling
+# it restarts the daemon, invalidates image/container storage, and changes which
+# host UID a bind-mounted data dir must be owned by. See ensure_userns_remap.
+USERNS_REMAP=0
 FROM_RELEASE=false # install the prebuilt GitHub Release artifact instead of building from source
 RELEASE_TAG=""     # specific release tag to install; empty means "latest"
 # Records which release tag is installed. A release install has no .git, so this
@@ -127,9 +131,10 @@ while [[ $# -gt 0 ]]; do
     --deploy-pubkey=*) DEPLOY_PUBKEY="${1#*=}" ;;
     --port=*)          API_PORT="${1#*=}" ;;
     --isolation=*)     ISOLATION="${1#*=}" ;;
+    --userns-remap)    USERNS_REMAP=1 ;;
     --from-release)    FROM_RELEASE=true ;;
     --from-release=*)  FROM_RELEASE=true; RELEASE_TAG="${1#*=}" ;;
-    *) error "Unknown option: $1 (try --bootstrap, --upgrade, --provision, --from-release[=vX.Y.Z], --domain=, --https, --acme-email=, --deploy-pubkey=, --isolation=docker, --dir=, --root=, --branch=, --link)" ;;
+    *) error "Unknown option: $1 (try --bootstrap, --upgrade, --provision, --from-release[=vX.Y.Z], --domain=, --https, --acme-email=, --deploy-pubkey=, --isolation=docker, --userns-remap, --dir=, --root=, --branch=, --link)" ;;
   esac
   shift
 done
@@ -293,10 +298,73 @@ ensure_docker() {
   fi
 
   # Pre-pull the base images used by DROP so the first container start is fast.
+  #
+  # PINNED BY DIGEST, and they must stay byte-identical to IMAGE_DIGESTS in
+  # src/managers/runtime/container-config.ts — the runtime pulls the pinned
+  # reference, so pre-pulling the bare tag would warm an image DROP never runs
+  # and every first deploy would pull again anyway. A drift test
+  # (container-config.install-parity.test.ts) fails the build if these two
+  # lists disagree, because the failure is otherwise silent and only shows up
+  # as a slow first deploy on a box nobody is watching.
   info "Pre-pulling DROP base images (this may take a few minutes)..."
-  for img in node:20-slim python:3.12-slim nginx:alpine golang:1.22-alpine; do
+  for img in     "node:20-slim@sha256:2cf067cfed83d5ea958367df9f966191a942351a2df77d6f0193e162b5febfc0"     "python:3.12-slim@sha256:09f7da3bc104798d0afb40bc08d23ab2da20a76130cec1f2ef170848f5d85217"     "golang:1.22-alpine@sha256:1699c10032ca2582ec89a24a1312d986a3f094aed3d5c1147b19880afe40e052"     "nginx:alpine@sha256:db35bfc6b2951e7f8a72db5db120288c127ffaeeb4a6d4b95a26fead017d5913"; do
     docker pull "$img" 2>&1 | tail -1 || warn "Failed to pre-pull $img — will retry on first deploy"
   done
+
+  [[ "$USERNS_REMAP" == "1" ]] && ensure_userns_remap
+}
+
+# ── docker userns-remap (Tier B, OPT-IN) ─────────────────────────────────────
+# Maps container root to an unprivileged host UID, so a runc or kernel escape
+# from a tenant container lands as `nobody` rather than as real root. This is
+# the Tier B control DROP itself cannot apply: it is daemon-level, set here.
+#
+# OPT-IN (`--userns-remap`) and deliberately not part of `--provision`, because
+# enabling it is DISRUPTIVE on a box that is already running:
+#
+#   - the daemon restarts, stopping every container;
+#   - image and container storage moves to a remapped root, so every image must
+#     be pulled again and every container recreated — existing ones become
+#     invisible, not migrated;
+#   - a bind-mounted host directory is now accessed as the remapped UID, so any
+#     data dir that is not owned by it becomes unwritable to the app.
+#
+# That last one is the sharp edge on an existing fleet: DROP's per-app data dirs
+# are chowned for the in-container user, and remapping shifts what that user IS.
+# Plan the ownership change before turning this on. See docs/DOCKER-ISOLATION.md.
+ensure_userns_remap() {
+  local daemon_json="/etc/docker/daemon.json"
+
+  if docker info --format '{{json .SecurityOptions}}' 2>/dev/null | grep -q 'name=userns'; then
+    info "Docker userns-remap already active"
+    return 0
+  fi
+
+  warn "Enabling Docker userns-remap. The daemon will restart, every container will stop,"
+  warn "and images must be re-pulled into the remapped storage root."
+
+  mkdir -p /etc/docker
+  if [[ -f "$daemon_json" ]] && grep -q 'userns-remap' "$daemon_json"; then
+    info "daemon.json already mentions userns-remap — leaving it alone"
+  elif [[ -f "$daemon_json" ]]; then
+    # Refuse rather than guess: this file is the operator's, may carry registry
+    # mirrors, log drivers or storage settings, and a wrong rewrite takes the
+    # whole engine down. Merging JSON in bash is exactly how that happens.
+    warn "$daemon_json already exists — add '\"userns-remap\": \"default\"' to it by hand, then restart docker."
+    return 0
+  else
+    echo '{ "userns-remap": "default" }' > "$daemon_json"
+    chmod 0644 "$daemon_json"
+    info "Wrote $daemon_json with userns-remap: default"
+  fi
+
+  systemctl restart docker || warn "Could not restart docker — restart it manually to apply userns-remap"
+
+  if docker info --format '{{json .SecurityOptions}}' 2>/dev/null | grep -q 'name=userns'; then
+    info "Docker userns-remap is active"
+  else
+    warn "userns-remap did not come up — check 'docker info' and /etc/subuid for the dockremap user"
+  fi
 }
 
 # ── system user ──────────────────────────────────────────────────────────────
@@ -772,6 +840,26 @@ fetch_release() {
   # it and install_provision_script runs later. The EXIT trap clears it.
 }
 
+# ── CI deploy staging directory (Landing C) ──────────────────────────────────
+# Where deploy.yml scp's the artifact and unpacks the deploy script, replacing
+# /tmp.
+#
+# /tmp is world-writable, and its sticky bit prevents REPLACEMENT of an existing
+# file, not PRE-CREATION of one that does not exist yet -- so any local user
+# could plant a file at the path the deploy is about to write. That was already
+# unwanted for a tarball; Landing C stages an EXECUTABLE there, which is a
+# change of kind. install.sh already refuses /tmp for $PROVISION_SRC for exactly
+# this reason.
+#
+# 0700 and drop-owned: only the deploy user writes here, and nothing else on the
+# box can read the artifact before it is unpacked.
+ensure_deploy_staging() {
+  local staging="$INSTALL_DIR/staging"
+  mkdir -p "$staging"
+  chown "$DROP_USER:$DROP_USER" "$staging"
+  chmod 0700 "$staging"
+}
+
 # ── dependencies for a prebuilt install ──────────────────────────────────────
 # The artifact ships compiled dist/, so only runtime deps are needed. Runs as
 # $DROP_USER for the same reason build_drop does: as root, every dependency's
@@ -876,6 +964,7 @@ EOF
 # deploy's install.sh (DROP-071 trade-off, see install_provision_script).
 provision_system() {
   ensure_root_dir
+  ensure_deploy_staging
   ensure_caddy
   ensure_removeipc_off
   write_env_config

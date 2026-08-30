@@ -50,10 +50,24 @@ describe('the writable-path hint in the deploy log (#238)', () => {
   });
 
   it('names DROP_DATA_DIR and the absolute path, because the env var alone was not findable', async () => {
-    await emit(makePlatform('docker'));
+    await emit(makePlatform('none'));
     const joined = lines.join('\n');
     expect(joined).toContain('DROP_DATA_DIR');
     expect(joined).toContain(path.join(tempDir, 'data', 'appdata', 'my-app'));
+  });
+
+  /**
+   * DROP-160 Tier B M-3 moved the container-side mount off the host path, and
+   * this hint is the surface where getting that wrong would recreate the exact
+   * confusion #238 is about: an author reads a directory out of the deploy log,
+   * writes to it, and gets ENOENT because the container never had that path.
+   */
+  it('names the path the APP sees under docker isolation, not the host path', async () => {
+    await emit(makePlatform('docker'));
+    const joined = lines.join('\n');
+
+    expect(joined).toContain('/data');
+    expect(joined).not.toContain(path.join(tempDir, 'data', 'appdata', 'my-app'));
   });
 
   it('says the directory survives redeploys — the guarantee the reporter went looking for', async () => {

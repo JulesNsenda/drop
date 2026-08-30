@@ -20,6 +20,7 @@ import Badge from './ui/Badge';
 // Types and the row-estimate heuristic live in a plain .ts sibling so the root
 // jest can cover them — this package has no test runner of its own, and that
 // heuristic decides what number an operator actually reads. See db-format.ts.
+import type { DbQueryResponse } from './db-format';
 import {
   formatBytes,
   formatRowEstimate,
@@ -257,6 +258,147 @@ function ServiceRow({
  * made `provisioned: false` first-class content here, and a second panel
  * would give two accounts of one database.
  */
+
+/**
+ * The read-only SQL console (DROP-163, database panel M2).
+ *
+ * Rendered only for admins, and only once `GET /admin/settings` reports the
+ * console enabled — the server enforces both independently, so this is about
+ * not showing a control that would only ever 403, never about access.
+ *
+ * The reason it is admin-only is worth having on screen rather than buried in a
+ * doc: any arbitrary query can read the shared PostgreSQL catalogs, which list
+ * every database and role on the server. That is why the note below is part of
+ * the empty state instead of a tooltip.
+ */
+function SqlConsole({ name }: { name: string }) {
+  const { role } = useAuth();
+  const [enabled, setEnabled] = useState(false);
+  const [sql, setSql] = useState('');
+  const [running, setRunning] = useState(false);
+  const [result, setResult] = useState<DbQueryResponse | null>(null);
+  const [queryError, setQueryError] = useState('');
+
+  useEffect(() => {
+    if (role !== 'admin') return;
+    let cancelled = false;
+    void (async () => {
+      const json = await apiJson<{ sqlConsole?: { enabled?: boolean } }>('/admin/settings');
+      // `apiJson` never throws — a network failure comes back as
+      // `success: false` — so this reads the envelope rather than relying on a
+      // catch. A failed settings read must leave the console HIDDEN: the
+      // server refuses it either way, and defaulting to shown would offer a
+      // control that only ever 403s.
+      if (!cancelled) setEnabled(json.success && json.data?.sqlConsole?.enabled === true);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [role]);
+
+  const run = useCallback(async () => {
+    if (!sql.trim() || running) return;
+    setRunning(true);
+    setQueryError('');
+    const json = await apiJson<DbQueryResponse>(`/db/${encodeURIComponent(name)}/query`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sql }),
+    });
+    if (json.success && json.data) {
+      setResult(json.data);
+    } else {
+      // The server's message IS the useful part — a syntax error or a
+      // read-only violation names the problem far better than anything this
+      // component could synthesise from a status code.
+      setQueryError(json.error?.message || 'Query failed');
+      setResult(null);
+    }
+    setRunning(false);
+  }, [name, sql, running]);
+
+  if (role !== 'admin' || !enabled) return null;
+
+  return (
+    <Card className="mt-4">
+      <div className="mb-3 flex items-center justify-between">
+        <h3 className="font-semibold text-fg">Query</h3>
+        <span className="text-xs text-muted">Read-only · admin only</span>
+      </div>
+
+      <textarea
+        value={sql}
+        onChange={e => setSql(e.target.value)}
+        onKeyDown={e => {
+          // Ctrl/Cmd+Enter runs, because a SQL box that only submits by mouse
+          // is unusable for the iterating this is actually for.
+          if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
+            e.preventDefault();
+            void run();
+          }
+        }}
+        rows={4}
+        spellCheck={false}
+        placeholder="SELECT * FROM ..."
+        aria-label="SQL query"
+        className="w-full resize-y rounded border p-2 font-mono text-xs border-line bg-surface text-fg"
+      />
+
+      <div className="mt-2 flex items-center gap-3">
+        <Button onClick={() => void run()} disabled={running || !sql.trim()}>
+          {running ? 'Running…' : 'Run'}
+        </Button>
+        <span className="text-xs text-muted">Ctrl+Enter</span>
+        {result && (
+          <span className="text-xs text-muted">
+            {result.rowCount} row{result.rowCount === 1 ? '' : 's'} · {result.durationMs}ms
+            {result.truncated ? ' · truncated' : ''}
+          </span>
+        )}
+      </div>
+
+      {queryError && (
+        <p className="mt-3 font-mono text-xs text-err">
+          {queryError}
+        </p>
+      )}
+
+      {result && result.columns.length > 0 && (
+        // Its own horizontal scroll container: a wide result must not make the
+        // whole page scroll sideways.
+        <div className="mt-3 overflow-x-auto">
+          <Table>
+            <TableHead>
+              <TableRow>
+                {result.columns.map((col, i) => (
+                  <TableHeaderCell key={`${col}-${i}`}>{col}</TableHeaderCell>
+                ))}
+              </TableRow>
+            </TableHead>
+            <TableBody>
+              {result.rows.map((row, r) => (
+                <TableRow key={r} className="last:border-b-0">
+                  {row.map((cell, ci) => (
+                    <TableCell key={ci} className="whitespace-pre font-mono text-xs text-fg">
+                      {/* NULL and the empty string are different answers and
+                          must not render identically. */}
+                      {cell === null ? <span className="text-faint">NULL</span> : cell}
+                    </TableCell>
+                  ))}
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        </div>
+      )}
+
+      {result && result.rowCount === 0 && !queryError && (
+        <p className="mt-3 text-xs text-muted">No rows.</p>
+      )}
+    </Card>
+  );
+}
+
 function DatabaseTab({ name }: { name: string }) {
   const [overview, setOverview] = useState<DbOverviewResponse | null>(null);
   const [tables, setTables] = useState<DbTable[]>([]);
@@ -657,6 +799,8 @@ function DatabaseTab({ name }: { name: string }) {
           )}
         </div>
       </Card>
+
+      <SqlConsole name={name} />
     </div>
   );
 }

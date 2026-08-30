@@ -27,6 +27,134 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.6.0] - 2026-08-30
+
+A hardening release, plus two things you can see.
+
+Most of this closes work that earlier releases deliberately deferred with a
+written reason rather than a TODO: container isolation's second tier, the
+control plane's reachability from tenant containers, a backup that holds the
+deploy pipeline still, and a production deploy that can put the previous release
+back when the new one fails its health check. The two visible additions are a
+read-only SQL console in the database panel and, for apps behind the access
+gate, a page that retries itself instead of a blank tab while the platform
+restarts.
+
+**Read the Upgrading section before you take this if you run
+`isolation: docker`.** Two of the container changes will stop an app that was
+relying on behaviour that was never promised. On the default `isolation: none`
+nothing breaks — you get one forced redeploy and the rest is additions.
+
+### Upgrading
+
+- **Every app is redeployed once on the first boot after this**, under both
+  isolation modes. Four container-policy values (pinned image digests, the
+  read-only root filesystem, the tmpfs set, and the data-dir mount point) join
+  the fingerprint boot reconciliation compares, and that fingerprint is hashed
+  for every app rather than only containerised ones. Folding them in is the only
+  way any of them reaches an app that is already running — without it the
+  hardening would apply to new apps only, which looks like success on a fresh
+  box and like nothing at all on a real fleet. Expect one more redeploy each
+  time a base-image digest is refreshed.
+- **`isolation: docker` only — an app that hardcoded its data directory's host
+  path breaks.** The persistent data directory now mounts inside the container
+  at `/data` instead of at its own host path, so the host's directory layout is
+  no longer published to every tenant. `DROP_DATA_DIR` is rewritten to match, so
+  an app that reads the variable — the documented contract, and what the deploy
+  log tells every author to do — is unaffected.
+- **`isolation: docker` only — an app that writes outside `/tmp` and its data
+  directory breaks.** The container root filesystem is read-only now. `/tmp`,
+  `/run`, `/var/run` and `/var/cache/nginx` come back as size-capped `noexec`
+  tmpfs, which covers what language runtimes and nginx actually write.
+
+### Added
+
+- **A read-only SQL console in the database panel.** Run a query against an
+  app's own database from the dashboard. **Admin-only, and off until an admin
+  turns it on** — not caution about a new feature: PostgreSQL's shared catalogs
+  are world-readable and no privilege setting closes them, so anyone who can run
+  arbitrary SQL can list every database and role on the server. Writes are
+  refused by the server rather than by inspecting the query text — every
+  statement runs in a read-only transaction, which is the only thing that stops
+  a `SECURITY DEFINER` function an app created from writing as its owner — and
+  the row cap is a server-side cursor. Each query is recorded in the activity
+  log: who and which app, never the SQL itself, since a query can contain the
+  very secret an audit trail exists to investigate. Newly provisioned databases
+  also get a `temp_file_limit` so one query cannot fill the shared disk; older
+  ones keep the timeout and memory bounds until reprovisioned.
+- **Read-only container root filesystems, pinned base images, and a fixed data
+  mount.** The Tier B isolation work that was deferred in June, for boxes that
+  will host untrusted tenants. Base images are pinned by index digest, so two
+  DROP installs pulling "the same" image on different days now run the same
+  bytes; `DROP_DISABLE_IMAGE_PINNING=true` falls back to tags for an operator on
+  a private mirror. See `docs/DOCKER-ISOLATION.md`.
+- **The control plane is closed to tenant containers.** DROP's API is reachable
+  from the container bridge, because an app granted control-plane capabilities
+  calls it there. Every OTHER container could reach it too. `DROP_API_HOST`
+  makes the bind an operator decision (`127.0.0.1` is right for anyone with no
+  capability-holding apps), and a request arriving from the bridge is now
+  refused the credential-guessing endpoints, the credential-minting ones, the
+  browser-facing authorization flows and the dashboard.
+- **`userns-remap` is offered and reported.** `install.sh --userns-remap`
+  enables it; opt-in, because on a running box it stops every container,
+  invalidates image storage, and changes which host UID a bind-mounted data
+  directory must be owned by. DROP now says at startup whether the daemon
+  actually provides it — without that, "Tier B shipped" reads as a guarantee the
+  platform cannot make on its own.
+- **`drop backup` holds the deploy pipeline still while it runs.** Each write
+  was already atomic, but the file stores and the databases were not guaranteed
+  to describe the same moment — a deploy landing mid-backup could leave the app
+  state file from before it and the per-app config from after. `--no-quiesce`
+  opts out. The pause is a lease with a ceiling, so a backup killed mid-run
+  cannot leave the box refusing deploys.
+- **The isolation mode is visible in Settings.** The single biggest behavioural
+  switch on the platform was inferable only from the process environment or from
+  an app's symptoms. Reported read-only, with what to change and that a restart
+  is required — the app runtime is selected once at startup and cannot be
+  swapped while running.
+- **Deploys can roll themselves back.** The production deploy script is a file
+  in the repository now, shellchecked and smoke-tested in a container before it
+  ever runs for real, instead of a script embedded in a CI workflow where a
+  single apostrophe once truncated it mid-deploy and left the service stopped.
+  It snapshots the previous release first and restores it — code *and*
+  dependencies — if the new one fails its health check. `scripts/deploy/rollback.sh`
+  covers the case a health check cannot catch: a deploy that comes up fine and
+  is found bad afterwards. See `docs/DEPLOY-ROLLBACK.md`, which is explicit
+  about what a rollback does **not** undo.
+
+### Fixed
+
+- **Secret changes were never written to the audit log.** The audit rules
+  described secrets at a URL this API has never served, so in practice no
+  request had ever matched them. Webhook, certificate-renewal and
+  database-panel activity is now recorded too — the surfaces where "which
+  credential did this?" is the first question after a leak.
+- **An audit entry recorded whatever address the caller claimed.** The audit log
+  kept its own copy of the client-address logic and read the first
+  `X-Forwarded-For` entry, which is the value the client sent rather than the
+  one the reverse proxy appended. The same defect was fixed in the rate limiter
+  in 1.5.0 and missed here, so the one field a forensic record cannot afford to
+  take on trust was attacker-controlled.
+
+### Changed
+
+- **A `drop.yaml` that does not parse can now refuse the deploy.** A malformed
+  manifest was discarded whole and silently: a typo in a secret name meant the
+  app declared no secrets, the preflight found nothing missing, and it started
+  unconfigured — which is what that preflight exists to prevent. Off by default
+  (`DROP_STRICT_MANIFEST=true`), because turning it on refuses to start any app
+  already carrying a malformed manifest, and the deploy log names them first.
+- **A gated app now shows a retrying page, not a blank tab, while DROP
+  restarts.** The access gate asks DROP's own API on every request, so a
+  platform deploy takes every gated app down for that window while ungated apps
+  keep serving. Measured, the visitor used to get an HTTP 502 with an empty body
+  and no content type; they now get a page saying the app is temporarily
+  unavailable, with `Retry-After`, that reloads itself and lands them back in
+  the app once DROP returns. It still fails closed — the page fires only on the
+  status codes an unreachable upstream produces, so a real refusal is untouched,
+  and it serves no tenant content. The underlying coupling is unchanged: plan
+  gated apps' maintenance windows around platform deploys.
+
 ## [1.5.2] - 2026-08-30
 
 A patch about what a deploy log tells you, and about output that was being

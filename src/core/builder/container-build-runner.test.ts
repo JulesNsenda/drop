@@ -139,7 +139,10 @@ describe('executeCommandInContainer', () => {
     await executeCommandInContainer(docker, { ...baseOpts, appType: 'python' });
 
     const call = docker.createContainer.mock.calls[0][0];
-    expect(call.Image).toBe('python:3.12-slim');
+    // Tag only: the build image is digest-pinned (DROP-160), and which
+    // IMAGE a python app builds in is what this asserts. Pinning has its own
+    // block in container-manager.test.ts.
+    expect(String(call.Image).split('@')[0]).toBe('python:3.12-slim');
   });
 
   it('starts the container after attaching', async () => {
@@ -202,6 +205,9 @@ describe('createContainerExecCommand', () => {
     await fn('pip install -r requirements.txt', '/apps/my-app', {});
 
     const call = docker.createContainer.mock.calls[0][0];
-    expect(call.Image).toBe('python:3.12-slim');
+    // Tag only: the build image is digest-pinned (DROP-160), and which
+    // IMAGE a python app builds in is what this asserts. Pinning has its own
+    // block in container-manager.test.ts.
+    expect(String(call.Image).split('@')[0]).toBe('python:3.12-slim');
   });
 });

@@ -199,9 +199,30 @@ can fix them in one pass rather than discovering them one at a time.
 **A gated app is unavailable while DROP itself is restarting.** The gate asks
 DROP's own API on every request, so a platform deploy or restart takes every
 gated app down for that window — while ungated apps keep serving from the proxy
-as usual. This is a real coupling between control-plane and tenant availability
-and it is not currently mitigated. Plan gated apps' maintenance windows around
-platform deploys.
+as usual. This is a real coupling between control-plane and tenant availability,
+and it is a property of asking a live service on every request rather than
+something a configuration change removes.
+
+What *has* changed is what the visitor sees. Measured against Caddy 2 with the
+verify upstream unreachable, the response used to be an HTTP 502 with an empty
+body and no `Content-Type` — a blank tab. It is now a page saying the app is
+temporarily unavailable, with `Retry-After: 10`, which reloads itself and lands
+the visitor back in the app once DROP returns.
+
+**It still fails closed.** The page replaces the *presentation* of the failure,
+never the decision: it fires only on the 502/503/504 that an unreachable
+upstream produces, so a real refusal (401, 403, the gate's own redirect) passes
+through untouched, and it serves no tenant content and proxies nothing.
+Verified against a live Caddy in all four combinations — verify up and allowing
+(200, app served), up and refusing (401), and down either way (503, page).
+
+One caveat worth knowing: that page is served for *any* 502/503/504 on a gated
+app, including one from the tenant's own upstream. Caddy cannot distinguish them
+at that point, so the wording says "temporarily unavailable" rather than naming
+a cause it cannot know.
+
+Plan gated apps' maintenance windows around platform deploys regardless — a
+retrying page is better than a blank one, but it is still downtime.
 
 **A gated app's MCP endpoint answers `401`, not a redirect.** Machine clients
 present a token and hold no browser session, so they get the challenge that

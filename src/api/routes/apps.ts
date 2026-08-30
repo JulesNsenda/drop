@@ -20,6 +20,8 @@ import {
   getPlatformOps,
   AppInProgressError,
   AppNeedsConfigError,
+  needsConfigAction,
+  needsConfigDetail,
   type AttachableServiceId,
 } from '../platform-ops';
 import { getSecretManager } from '../../managers/secret';
@@ -931,7 +933,7 @@ apps.post('/:name/start', async c => {
       return c.json(
         error(
           ErrorCodes.CONFLICT,
-          `Application '${name}' needs configuration — set required secret(s): ${err.missingSecrets.join(', ')}, then retry`
+          needsConfigDetail(err, name)
         ),
         409
       );
@@ -1063,7 +1065,7 @@ apps.post('/:name/restart', async c => {
       return c.json(
         error(
           ErrorCodes.CONFLICT,
-          `Application '${name}' needs configuration — set required secret(s): ${err.missingSecrets.join(', ')}, then retry`
+          needsConfigDetail(err, name)
         ),
         409
       );
@@ -1153,7 +1155,7 @@ apps.post('/:name/services/:id', async c => {
         error(
           ErrorCodes.CONFLICT,
           `'${serviceId}' was attached to '${name}', but the app needs configuration before it ` +
-            `can start — set required secret(s): ${err.missingSecrets.join(', ')}, then restart`
+            `can start — ${needsConfigAction(err)}, then restart`
         ),
         409
       );
@@ -1626,7 +1628,7 @@ apps.put('/:name/capabilities', async c => {
       return c.json(
         error(
           ErrorCodes.CONFLICT,
-          `Application '${name}' needs configuration — set required secret(s): ${err.missingSecrets.join(', ')}, then retry`
+          needsConfigDetail(err, name)
         ),
         409
       );
