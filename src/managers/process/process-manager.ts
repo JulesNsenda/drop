@@ -5,7 +5,7 @@
  * monitoring, clustering, and graceful shutdown.
  */
 
-import * as fs from 'fs/promises';
+import { tailFile } from '../../utils/tail-file';
 import * as fsSync from 'fs';
 import { eventBus } from '../../core/event-bus';
 import {
@@ -221,7 +221,7 @@ export class ProcessManager {
     // Read stdout logs
     if (outLogPath) {
       try {
-        const outLines = (await this.tailFile(outLogPath, lines)).slice(-lines);
+        const outLines = (await tailFile(outLogPath, lines)).slice(-lines);
         logs += outLines.map(l => `[out] ${l}`).join('\n');
       } catch {
         // Log file may not exist
@@ -231,7 +231,7 @@ export class ProcessManager {
     // Read stderr logs
     if (errLogPath) {
       try {
-        const errLines = (await this.tailFile(errLogPath, lines)).slice(-lines);
+        const errLines = (await tailFile(errLogPath, lines)).slice(-lines);
         if (logs) logs += '\n';
         logs += errLines.map(l => `[err] ${l}`).join('\n');
       } catch {
@@ -242,29 +242,6 @@ export class ProcessManager {
     return logs;
   }
 
-  /**
-   * Read approximately the last `lines` lines of a file without loading the
-   * whole thing into memory. Production log files grow to GBs; a full
-   * readFile would OOM the platform process.
-   */
-  private async tailFile(filePath: string, lines: number): Promise<string[]> {
-    // Assume a generous average line length; read a bounded tail window.
-    const avgLineBytes = 512;
-    const readBytes = Math.min(lines * avgLineBytes, 2 * 1024 * 1024); // cap 2MB
-
-    const handle = await fs.open(filePath, 'r');
-    try {
-      const { size } = await handle.stat();
-      const start = Math.max(0, size - readBytes);
-      const length = size - start;
-      if (length <= 0) return [];
-      const buffer = Buffer.alloc(length);
-      await handle.read(buffer, 0, length, start);
-      return buffer.toString('utf-8').split('\n');
-    } finally {
-      await handle.close();
-    }
-  }
 
   /**
    * Stream logs for a process (follow mode)

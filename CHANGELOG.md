@@ -37,6 +37,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   missing: the poll loop already read the correlated episode and discarded it at
   the deadline. When no episode has correlated yet the message stays id-less
   rather than naming a previous deploy's. (#265)
+- **A deploy's log output no longer dies with its container.** Under Docker
+  isolation the logs API, the CLI, the dashboard and the MCP `app_logs` tool all
+  read the running container, so once a redeploy destroyed it the previous
+  deploy's output came back as an empty string — indistinguishable from an app
+  that had simply been quiet. When the container is gone the DROP-owned log
+  files are now read instead, with the same `[out] `/`[err] ` prefixes the
+  dashboard's stream filter splits on. The container is still preferred while it
+  exists: it retains the opening window of the first run, which the file capture
+  can miss, and preserves the stdout/stderr interleaving two separate files
+  cannot. (#264)
 
 ### Changed
 
