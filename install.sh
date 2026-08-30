@@ -772,6 +772,26 @@ fetch_release() {
   # it and install_provision_script runs later. The EXIT trap clears it.
 }
 
+# ── CI deploy staging directory (Landing C) ──────────────────────────────────
+# Where deploy.yml scp's the artifact and unpacks the deploy script, replacing
+# /tmp.
+#
+# /tmp is world-writable, and its sticky bit prevents REPLACEMENT of an existing
+# file, not PRE-CREATION of one that does not exist yet -- so any local user
+# could plant a file at the path the deploy is about to write. That was already
+# unwanted for a tarball; Landing C stages an EXECUTABLE there, which is a
+# change of kind. install.sh already refuses /tmp for $PROVISION_SRC for exactly
+# this reason.
+#
+# 0700 and drop-owned: only the deploy user writes here, and nothing else on the
+# box can read the artifact before it is unpacked.
+ensure_deploy_staging() {
+  local staging="$INSTALL_DIR/staging"
+  mkdir -p "$staging"
+  chown "$DROP_USER:$DROP_USER" "$staging"
+  chmod 0700 "$staging"
+}
+
 # ── dependencies for a prebuilt install ──────────────────────────────────────
 # The artifact ships compiled dist/, so only runtime deps are needed. Runs as
 # $DROP_USER for the same reason build_drop does: as root, every dependency's
@@ -876,6 +896,7 @@ EOF
 # deploy's install.sh (DROP-071 trade-off, see install_provision_script).
 provision_system() {
   ensure_root_dir
+  ensure_deploy_staging
   ensure_caddy
   ensure_removeipc_off
   write_env_config

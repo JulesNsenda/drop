@@ -104,40 +104,75 @@ jobs:
       # file is a real target's /etc/os-release, not something in this repo
       # shellcheck could follow with -x either. Warning-and-above is clean.
       - name: Shellcheck install.sh
-        run: shellcheck --severity=warning install.sh
+        run: shellcheck --severity=warning install.sh scripts/deploy/*.sh
 
-      # Moved here from deploy.yml (Landing B): this step parses
-      # .github/workflows/deploy.yml directly off the checkout, so it works
-      # unchanged from this reusable workflow -- and moving it here means it
-      # now runs on every PR via ci.yml too, not only on the deploy path,
-      # which it did not before.
+      # Moved here from deploy.yml (Landing B): these steps parse
+      # .github/workflows/deploy.yml directly off the checkout, so they work
+      # unchanged from this reusable workflow -- and running here means they
+      # run on every PR via ci.yml too, not only on the deploy path.
       #
-      # DROP-074. The remote deploy script is passed to ssh as ONE
-      # single-quoted argument, so a single apostrophe anywhere inside it —
-      # including in a comment (chown'd, install.sh's, exec'ing) — closes the
-      # string early and silently corrupts every command after it. That took
-      # production down: both provisioning arms and the fallback
-      # `systemctl restart` were mangled into unrecognisable commands, so the
-      # deploy stopped the service and never restarted it. Nothing in bash,
-      # YAML, or shellcheck catches it, because each half parses fine on its
-      # own. Fail the build instead.
-      - name: Deploy script must contain no apostrophes (DROP-074)
+      # DROP-074 was: the remote deploy script was passed to ssh as ONE
+      # single-quoted argument, so a single apostrophe anywhere inside it --
+      # including in a comment (chown'd, install.sh's, exec'ing) -- closed the
+      # string early and silently corrupted every command after it. Production
+      # went down: both provisioning arms AND the fallback `systemctl restart`
+      # were mangled, so the deploy stopped the service and never restarted it.
+      # Nothing in bash, YAML or shellcheck catches it, because each half parses
+      # fine on its own.
+      #
+      # The old guard counted apostrophes in that one step. Landing C deletes
+      # the step, and deleting a guard's INSTANCE without guarding its CLASS
+      # would leave the same outage available to the next person who inlines a
+      # script. So this checks the property instead: no ssh invocation in any
+      # workflow may carry a multi-line script as an argument. The deploy
+      # sequence is a file now (scripts/deploy/remote-deploy.sh), shellchecked
+      # and smoke-tested, which is what makes the property satisfiable.
+      - name: No workflow may pass a multi-line script to ssh
         run: |
           node -e '
             const fs = require("fs");
-            const yaml = require("yaml");
-            const wf = yaml.parse(fs.readFileSync(".github/workflows/deploy.yml", "utf8"));
-            const step = wf.jobs.deploy.steps.find(s => s.name === "Deploy on server");
-            if (!step) { console.error("Deploy on server step not found"); process.exit(1); }
-            const quotes = (step.run.match(/’|\x27/g) || []).length;
-            if (quotes !== 2) {
-              console.error("Deploy step has " + quotes + " single-quotes; expected exactly 2 (the ssh argument delimiters).");
-              console.error("An apostrophe inside the remote script closes the quoted argument early and corrupts the deploy.");
-              step.run.split("\n").forEach((l, i) => { if (l.includes("\x27")) console.error("  line " + (i + 1) + ": " + l.trim()); });
-              process.exit(1);
+            const path = require("path");
+            const dir = ".github/workflows";
+            let bad = 0;
+            for (const file of fs.readdirSync(dir).filter(f => f.endsWith(".yml"))) {
+              const lines = fs.readFileSync(path.join(dir, file), "utf8").split("\n");
+              lines.forEach((line, i) => {
+                if (!/(^|\s)ssh\s/.test(line)) return;
+                // Count the lines for which a single-quote opened by this ssh
+                // invocation stays OPEN -- not the raw span. A legitimate
+                // invocation is several backslash-continued flag lines and may
+                // carry an error handler, so a line-count threshold would break
+                // on the next flag anyone adds. An inlined script differs in
+                // KIND: it opens a quote and holds it for the whole script,
+                // which is DROP-074 exactly. Verified both ways -- this fires
+                // on the pre-Landing-C deploy.yml (116 lines held) and passes
+                // the current one (0).
+                let open = 0, held = 0;
+                for (let j = i; j < lines.length && j - i < 400; j++) {
+                  open = (open + (lines[j].match(/./g) || []).filter(c => c === String.fromCharCode(39)).length) % 2;
+                  if (open === 1) held++;
+                  else if (!/\\s*$/.test(lines[j])) break;
+                }
+                if (held > 1) {
+                  console.error(file + ":" + (i + 1) + " ssh holds a quoted argument open across " +
+                    held + " lines -- an inlined remote script. Put it in scripts/deploy/ instead.");
+                  bad++;
+                }
+              });
             }
-            console.log("Deploy script quoting OK (2 delimiters, no stray apostrophes).");
+            if (bad) process.exit(1);
+            console.log("No inlined remote scripts in any workflow.");
           '
+
+      # The deploy script is the only thing on this repo`s path to production
+      # that has no unit test and cannot be exercised by one. shellcheck proves
+      # it parses; the smoke test proves the SEQUENCE is right -- that the
+      # service is stopped before the untar, that the rollback restores what it
+      # claims, that a second run is idempotent, and that a bad argument is
+      # refused before anything is touched. Without it, those properties are
+      # first checked at 2am with the service already stopped.
+      - name: Smoke-test the deploy script
+        run: bash scripts/deploy/smoke-test.sh
 
       - name: Build server
         run: npm run build:server
@@ -189,7 +224,7 @@ jobs:
       # bytes off the runner, is worth gating.
       - name: Package artifact
         run: |
-          tar -czf drop-dist.tar.gz dist/ install.sh package.json package-lock.json
+          tar -czf drop-dist.tar.gz dist/ install.sh package.json package-lock.json scripts/deploy/
 
       # Computed here, in the job that built the tree, so the digest is
       # trustworthy evidence about what CI actually produced -- not a value
