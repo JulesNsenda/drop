@@ -4100,7 +4100,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         ? await this.buildLogService.startBuild(appName, buildStartedAt, deployId)
         : null;
 
-      await this.writeWritablePathHint(logId, appName);
+      await this.writeInjectedEnvHints(logId, appName);
 
       // Everything between startBuild and closeBuildLog must sit in this
       // try/finally: the disk check below throws on a low-disk box, and that
@@ -4331,7 +4331,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
   }
 
   /**
-   * Announce the writable-path contract at the TOP of a deploy log (issue #238).
+   * Announce what DROP injected, at the TOP of a deploy log (issue #238).
    *
    * Persistent storage has always existed — `DROP_DATA_DIR` is injected into
    * every app's environment and bind-mounted read-write — but it was
@@ -4347,7 +4347,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
    * all render it. Never throws — a hint that breaks a deploy would be a far
    * worse bug than the confusion it prevents.
    */
-  private async writeWritablePathHint(logId: string | null, appName: string): Promise<void> {
+  private async writeInjectedEnvHints(logId: string | null, appName: string): Promise<void> {
     if (!logId || !this.buildLogService) return;
     try {
       const dataDir = await this.ensureAppDataDirectory(appName);
@@ -4369,6 +4369,22 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           '[drop] The app source directory is mounted READ-ONLY — write here instead.'
         );
       }
+
+      // The SECOND misdiagnosis in the same report, for the same reason: an app
+      // that built its own connection from host/port defaults hit
+      // `ECONNREFUSED 127.0.0.1:5432` and it was read as "DROP starts apps
+      // before Postgres is ready". Postgres was ready. DROP has never listened
+      // on 5432 — the bundled server defaults to 5433 to avoid colliding with a
+      // host install, and under docker isolation apps reach it over a unix
+      // socket, not TCP at all. So the refusal was correct and said nothing
+      // useful. Naming the variables costs one line and forecloses the whole
+      // investigation.
+      this.buildLogService.writeLine(
+        logId,
+        '[drop] A provisioned database arrives as DATABASE_URL (plus PGHOST/PGPORT/' +
+          'PGDATABASE/PGUSER). DROP does not listen on 127.0.0.1:5432 — use those, ' +
+          'not defaults.'
+      );
     } catch (error) {
       this.logger.debug(`Could not write the data-directory hint for ${appName}`, 'DATA');
       void error;

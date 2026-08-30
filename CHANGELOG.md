@@ -27,6 +27,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **A deploy log now also names the database variables.** The same report that
+  could not find `DROP_DATA_DIR` also read `ECONNREFUSED 127.0.0.1:5432` as
+  "DROP starts apps before Postgres is ready". Postgres was ready — DROP has
+  never listened on 5432 (the bundled server defaults to 5433 to avoid colliding
+  with a host install, and under Docker isolation apps reach it over a unix
+  socket rather than TCP at all), so an app building its own connection from
+  defaults was refused correctly and told nothing useful. The deploy log now
+  names `DATABASE_URL` and the `PG*` variables up front. (#238)
+
 ### Fixed
 
 - **First-boot output is no longer lost under Docker isolation.** The follower
