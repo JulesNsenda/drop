@@ -57,6 +57,19 @@ export interface PlatformSettings {
    * behaviour for, so it ships opt-in rather than opt-out.
    */
   appSharingEnabled?: boolean;
+  /**
+   * Gates the database panel's read-only SQL console (`POST /db/:name/query`).
+   *
+   * Defaults to DISABLED, and unlike `appSharingEnabled` this one is not
+   * off-by-default merely because it is new. `pg_catalog` and the shared
+   * catalogs are world-readable and NO privilege configuration can close them,
+   * so any principal running arbitrary SQL can enumerate every database and
+   * role on the cluster — the box's entire app inventory. That is an accepted,
+   * un-fixable limit, and an operator has to accept it CONSCIOUSLY rather than
+   * inherit it from having installed DROP. The route is admin-only on top of
+   * this, which is what makes the catalog exposure tolerable at all.
+   */
+  sqlConsoleEnabled?: boolean;
   /** SMTP relay hostname. NOT the password — see `mail-credential.ts`. */
   smtpHost?: string;
   /** SMTP relay port. */
@@ -131,6 +144,7 @@ const SETTINGS_FIELDS: Record<keyof PlatformSettings, SettingsFieldType> = {
   githubWebhookSecret: 'string',
   userConnectorsEnabled: 'boolean',
   appSharingEnabled: 'boolean',
+  sqlConsoleEnabled: 'boolean',
   smtpHost: 'string',
   smtpPort: 'number',
   smtpSecure: 'boolean',
@@ -313,6 +327,24 @@ export class SettingsManager {
   getAppSharingEnabled(): boolean {
     if (this.corrupt) return false;
     return this.settings.appSharingEnabled ?? false;
+  }
+
+  /**
+   * Whether the read-only SQL console is enabled. Same fail-closed shape as
+   * `getAppSharingEnabled` — a corrupt settings file answers `false`, which for
+   * this setting is the difference between "the console is off" and "an
+   * unreadable file silently opened a cluster-enumeration surface".
+   */
+  getSqlConsoleEnabled(): boolean {
+    if (this.corrupt) return false;
+    return this.settings.sqlConsoleEnabled ?? false;
+  }
+
+  /** Set (or, with `undefined`, clear) the stored SQL-console override. Persists atomically. */
+  async setSqlConsoleEnabled(enabled: boolean | undefined): Promise<void> {
+    const next: PlatformSettings = { ...this.settings, sqlConsoleEnabled: enabled };
+    await this.doSave(next);
+    this.settings = next;
   }
 
   /** Set (or, with `undefined`, clear) the stored app-sharing-enabled override. Persists atomically. */

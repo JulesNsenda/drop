@@ -40,6 +40,7 @@ jest.mock('../../managers/database/app-db-inspector', () => {
     ...actual,
     getOverview: jest.fn(),
     listTables: jest.fn(),
+    runQuery: jest.fn(),
   };
 });
 
@@ -56,13 +57,17 @@ jest.mock('../../managers/redis', () => {
 import {
   getOverview,
   listTables,
+  runQuery,
   DbUnavailableError,
+  DbQueryError,
 } from '../../managers/database/app-db-inspector';
+import { getSettingsManager, resetSettingsManager } from '../../managers/settings/settings-manager';
 import { getDatabaseProvisioner } from '../../managers/database';
 import { getRedisProvisioner } from '../../managers/redis';
 
 const mockGetOverview = getOverview as jest.MockedFunction<typeof getOverview>;
 const mockListTables = listTables as jest.MockedFunction<typeof listTables>;
+const mockRunQuery = runQuery as jest.MockedFunction<typeof runQuery>;
 const mockGetDatabaseProvisioner = getDatabaseProvisioner as jest.MockedFunction<
   typeof getDatabaseProvisioner
 >;
@@ -619,5 +624,203 @@ describe('database panel routes — auth disabled (DROP-120)', () => {
     const res = await app.request('/api/v1/db/open-app/tables');
     expect(res.status).toBe(403);
     expect(mockListTables).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * POST /db/:name/query — the SQL console's gate (DROP-163, M2).
+ *
+ * The query MECHANISM is covered in app-db-inspector.query.test.ts and was
+ * verified against a real PostgreSQL 16. What is covered here is who is allowed
+ * to reach it, which is where this feature's actual risk lives: `pg_catalog` is
+ * world-readable and no privilege setting closes it, so anyone who can run
+ * arbitrary SQL can enumerate every database and role on the server. Three
+ * independent gates keep that admin-only and opt-in, and each is tested alone
+ * so that removing any one of them fails here rather than in production.
+ */
+describe('POST /db/:name/query — the SQL console gate', () => {
+  let tempDir: string;
+  let server: ApiServer;
+  let app: ReturnType<ApiServer['getApp']>;
+  let adminToken: string;
+  let aliceToken: string;
+  let adminApiKey: string;
+
+  const authHeader = (token: string) => ({ Authorization: `Bearer ${token}` });
+
+  const post = (token: string, name = 'alice-app', body: unknown = { sql: 'SELECT 1' }) =>
+    app.request(`/api/v1/db/${name}/query`, {
+      method: 'POST',
+      headers: { ...authHeader(token), 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+
+  beforeEach(async () => {
+    tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'drop-db-query-'));
+    jest.spyOn(console, 'log').mockImplementation();
+    jest.spyOn(console, 'warn').mockImplementation();
+
+    mockRunQuery.mockReset();
+    mockRunQuery.mockResolvedValue({
+      columns: ['id'],
+      rows: [['1']],
+      rowCount: 1,
+      truncated: false,
+      durationMs: 3,
+    });
+    mockGetDatabaseProvisioner.mockReset();
+    mockGetDatabaseProvisioner.mockReturnValue(null);
+    mockGetRedisProvisioner.mockReset();
+    mockGetRedisProvisioner.mockReturnValue(null);
+
+    resetStateManager();
+    resetAuth();
+    resetRateLimits();
+    resetActivityLog();
+    resetAppConfigService();
+    resetSettingsManager();
+    getSettingsManager({ settingsFilePath: path.join(tempDir, 'settings.json') });
+    getActivityLog(path.join(tempDir, 'activity-log.json'));
+    getStateManager({ stateFilePath: path.join(tempDir, 'apps.json') });
+    getAppConfigService({
+      configDir: path.join(tempDir, 'appconf', 'webapps'),
+      webappsDir: path.join(tempDir, 'webapps'),
+    });
+    await getAppConfigService().initialize();
+
+    server = new ApiServer({
+      port: 3099,
+      enableAuth: true,
+      credentialsPath: path.join(tempDir, 'credentials.json'),
+    });
+    await server.initialize();
+    app = server.getApp();
+
+    const alice = await createUser('alice', 'password123', 'user');
+    const admin = await createUser('root', 'password123', 'admin');
+    aliceToken = await getTestToken('alice', 'password123');
+    adminToken = await getTestToken('root', 'password123');
+    adminApiKey = (await createApiKey('root-key', 'admin', undefined, undefined, admin.id)).key;
+
+    const sm = getStateManager();
+    await sm.registerApp('alice-app', path.join(tempDir, 'alice-app'));
+    await sm.updateApp('alice-app', { userId: alice.id });
+
+    // On by default in this block; the "off" case has its own test.
+    await getSettingsManager().setSqlConsoleEnabled(true);
+  });
+
+  afterEach(async () => {
+    if (server) await server.stop();
+    await getStateManager().close();
+    resetStateManager();
+    resetAuth();
+    resetRateLimits();
+    resetActivityLog();
+    resetAppConfigService();
+    resetSettingsManager();
+    jest.restoreAllMocks();
+    await fs.rm(tempDir, { recursive: true, force: true });
+  });
+
+  it('runs a query for an admin on an interactive session', async () => {
+    const res = await post(adminToken);
+
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { data: { rows: string[][]; columns: string[] } };
+    expect(body.data.columns).toEqual(['id']);
+    expect(body.data.rows).toEqual([['1']]);
+  });
+
+  it('refuses a non-admin, even the app OWNER', async () => {
+    // The asymmetry that decides this feature's shape: for an admin the
+    // catalogs disclose nothing they cannot already list, but for an app owner
+    // they are a cross-tenant inventory of every database and role on the box.
+    const res = await post(aliceToken);
+
+    expect(res.status).toBe(403);
+    expect(mockRunQuery).not.toHaveBeenCalled();
+  });
+
+  it('refuses an API key, even an admin one', async () => {
+    // An agent token must never reach arbitrary SQL. Same rule the rest of the
+    // panel applies, and the reason it exists is stronger here.
+    const res = await app.request('/api/v1/db/alice-app/query', {
+      method: 'POST',
+      headers: { 'X-API-Key': adminApiKey, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sql: 'SELECT 1' }),
+    });
+
+    expect(res.status).toBe(403);
+    expect(mockRunQuery).not.toHaveBeenCalled();
+  });
+
+  it('refuses when the console setting is off', async () => {
+    // The operator's conscious acceptance of the catalog exposure. Off is the
+    // default; this proves the flag is actually consulted rather than being
+    // decoration on the settings page.
+    await getSettingsManager().setSqlConsoleEnabled(false);
+
+    const res = await post(adminToken);
+
+    expect(res.status).toBe(403);
+    expect(mockRunQuery).not.toHaveBeenCalled();
+  });
+
+  it('is off by default, with no setting written at all', async () => {
+    await getSettingsManager().setSqlConsoleEnabled(undefined);
+
+    const res = await post(adminToken);
+
+    expect(res.status).toBe(403);
+  });
+
+  it('404s for an app that does not exist, with no existence oracle', async () => {
+    const res = await post(adminToken, 'no-such-app');
+
+    expect(res.status).toBe(404);
+  });
+
+  it('rejects a non-string sql field', async () => {
+    const res = await post(adminToken, 'alice-app', { sql: { evil: true } });
+
+    expect(res.status).toBe(400);
+    expect(mockRunQuery).not.toHaveBeenCalled();
+  });
+
+  it('reports a refused query as 400, not as a platform failure', async () => {
+    // PostgreSQL understood the statement and refused it. A 500 would tell the
+    // operator the platform is broken when their SQL is.
+    mockRunQuery.mockRejectedValue(
+      new DbQueryError('rejected', 'cannot execute INSERT in a read-only transaction (SQLSTATE 25006)')
+    );
+
+    const res = await post(adminToken);
+
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: { message: string } };
+    expect(body.error.message).toMatch(/25006/);
+  });
+
+  it('still reports an unreachable database as 503', async () => {
+    mockRunQuery.mockRejectedValue(new DbUnavailableError('unreachable', 'PostgreSQL is not reachable.'));
+
+    const res = await post(adminToken);
+
+    expect(res.status).toBe(503);
+  });
+
+  it('writes an activity entry, but never the SQL itself', async () => {
+    // Unlike the panel's reads, this is audited: arbitrary SQL against tenant
+    // data makes "who ran this" the first question after a leak. The statement
+    // text is deliberately absent — a query can carry the very token or address
+    // whose exposure is being investigated, and the activity log is plaintext.
+    await post(adminToken, 'alice-app', { sql: "SELECT * FROM users WHERE token = 'super-secret'" });
+
+    const { entries } = getActivityLog().getEntries(50, 0);
+    const entry = entries.find(e => e.action === 'db-query');
+    expect(entry).toBeDefined();
+    expect(entry?.appName).toBe('alice-app');
+    expect(JSON.stringify(entries)).not.toContain('super-secret');
   });
 });

@@ -294,6 +294,30 @@ export class DatabaseProvisioner {
       // second DB user were somehow created.
       await appPool.query(`REVOKE CONNECT ON DATABASE "${dbName}" FROM PUBLIC`);
       await appPool.query(`REVOKE ALL ON SCHEMA public FROM PUBLIC`);
+
+      // Bound how much this role can spill to disk (DROP-163, the database
+      // panel's query console). Disk is GLOBAL on this box: a query that fills
+      // it takes down PostgreSQL, Caddy and every app, so this is a
+      // whole-platform availability control, not a per-tenant nicety.
+      //
+      // It has to be set HERE, as a role default by the superuser, and cannot
+      // be a `SET LOCAL` in the query path: `temp_file_limit`'s
+      // `pg_settings.context` is `superuser`, so an unprivileged role setting
+      // it gets `42501 permission denied to set parameter` — which refuses the
+      // whole statement rather than being ignored.
+      //
+      // Non-fatal: a provisioning run that fails only here has still produced a
+      // working database, and the query console is bounded by
+      // `statement_timeout` and `work_mem` regardless. Roles provisioned BEFORE
+      // this shipped do not have it until they are reprovisioned.
+      await appPool
+        .query(`ALTER ROLE "${userName}" SET temp_file_limit = '128MB'`)
+        .catch((err: unknown) => {
+          console.warn(
+            `[db-provisioner] could not set temp_file_limit for "${userName}": ` +
+              `${err instanceof Error ? err.message : String(err)}`
+          );
+        });
     } finally {
       await appPool.end();
     }

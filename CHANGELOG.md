@@ -27,6 +27,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **A read-only SQL console in the database panel.** Run a query against an
+  app's own database from the dashboard, with results capped and the statement
+  bounded by a timeout.
+
+  **Admin-only, and off until an admin turns it on** (Settings → SQL console).
+  That is not caution about a new feature: PostgreSQL's shared catalogs are
+  world-readable and no privilege setting can close them, so anyone who can run
+  arbitrary SQL can list every database and role on the server. For an admin
+  that discloses nothing they could not already see; for an app owner it would
+  be an inventory of every other tenant. The setting exists so an operator
+  accepts that knowingly rather than inheriting it.
+
+  Writes are refused by the server, not by inspecting the query text: every
+  statement runs inside a read-only transaction, which is the only thing that
+  stops a `SECURITY DEFINER` function an app created from writing as its owner.
+  Multiple statements in one submission are refused by the protocol, and the row
+  cap is a server-side cursor rather than a client-side slice. Each query is
+  recorded in the activity log — who and which app, never the SQL itself, since
+  a query can contain the very secret an audit trail exists to investigate.
+
+  Newly provisioned databases also get a `temp_file_limit`, so a query cannot
+  fill the disk the whole platform shares. Databases provisioned before this
+  release keep the timeout and memory bounds but not that one until they are
+  reprovisioned.
+
 ## [1.5.2] - 2026-08-30
 
 A patch about what a deploy log tells you, and about output that was being

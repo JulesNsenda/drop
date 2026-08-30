@@ -344,6 +344,25 @@ function buildIsolationPayload(): {
   };
 }
 
+/**
+ * The SQL console's on/off state, for GET /admin/settings.
+ *
+ * `catalogVisibility` travels WITH the flag rather than living only in a doc:
+ * it is the property an operator is accepting by turning this on, and a
+ * settings API that reports `{enabled: false}` and nothing else invites the
+ * reader to treat it as an ordinary feature toggle.
+ */
+function buildSqlConsolePayload(): { enabled: boolean; adminOnly: true; catalogVisibility: string } {
+  return {
+    enabled: getSettingsManager().getSqlConsoleEnabled(),
+    adminOnly: true,
+    catalogVisibility:
+      'Any arbitrary query can read the shared PostgreSQL catalogs, which list every ' +
+      'database and role on this server. No privilege setting closes that, which is why ' +
+      'the console is admin-only.',
+  };
+}
+
 admin.get('/settings', async (c) => {
   return c.json(
     success({
@@ -354,6 +373,7 @@ admin.get('/settings', async (c) => {
       guestInvites: buildGuestInvitesPayload(),
       mail: await buildMailPayload(),
       isolation: buildIsolationPayload(),
+      sqlConsole: buildSqlConsolePayload(),
     })
   );
 });
@@ -958,6 +978,41 @@ admin.delete('/quiesce', async (c) => {
   });
 
   return c.json(success({ quiesced: false }));
+});
+
+/**
+ * PUT /admin/settings/sql-console — the conscious acceptance the database
+ * panel's query console requires (DROP-163).
+ *
+ * Off by default, and unlike the app-sharing toggle it is not off merely
+ * because it is new. `pg_catalog` and the shared catalogs are world-readable
+ * and no privilege configuration can close them, so any principal running
+ * arbitrary SQL can enumerate every database and role on this server. The
+ * console is admin-only on top of this, which is what makes that tolerable —
+ * an admin can already list every app — but the operator still has to turn it
+ * on knowing the property exists.
+ */
+admin.put('/settings/sql-console', async (c) => {
+  const authCtx = (c.get as Function)('auth') as AuthContext | undefined;
+  const body = (await c.req.json().catch(() => undefined)) as unknown;
+
+  if (!isJsonObjectBody(body)) {
+    return c.json(error(ErrorCodes.VALIDATION_ERROR, 'Request body must be a JSON object'), 400);
+  }
+
+  const input = requireBooleanField(body, 'enabled');
+  if (input === undefined) {
+    return c.json(error(ErrorCodes.VALIDATION_ERROR, 'enabled must be a boolean'), 400);
+  }
+
+  await getSettingsManager().setSqlConsoleEnabled(input);
+
+  await logActivityFor(authCtx, {
+    action: 'sql-console-set',
+    detail: `SQL console ${input ? 'enabled' : 'disabled'}`,
+  });
+
+  return c.json(success(buildSqlConsolePayload()));
 });
 
 export default admin;
