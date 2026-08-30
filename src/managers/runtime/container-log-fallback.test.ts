@@ -112,14 +112,46 @@ describe('getLogs falls back to the DROP-owned files when the container is gone'
  * guard: if a re-attach path is ever added, it needs its own tail depth.
  */
 describe('the log tailer captures from container start (#264 defect 1)', () => {
-  const spec = {
-    name: 'my-app',
-    script: 'server.js',
-    cwd: '/apps/my-app',
-    env: { NODE_ENV: 'production' },
-    appType: 'nodejs',
-    outFile: '/logs/my-app-out.log',
-    errorFile: '/logs/my-app-err.log',
+  // A REAL writable directory. `/logs/...` passed locally only because Windows
+  // happily creates `C:\logs`; on the Linux CI runner `/logs` needs root, so
+  // startLogTailer's `fs.mkdir` threw into its own `.catch()` and
+  // `container.logs` was never reached — a deterministic CI failure wearing a
+  // flake's clothing.
+  let logDir: string;
+  let spec: Record<string, unknown>;
+
+  beforeEach(() => {
+    logDir = fs.mkdtempSync(path.join(os.tmpdir(), 'drop-264-tailer-'));
+    spec = {
+      name: 'my-app',
+      script: 'server.js',
+      cwd: '/apps/my-app',
+      env: { NODE_ENV: 'production' },
+      appType: 'nodejs',
+      outFile: path.join(logDir, 'my-app-out.log'),
+      errorFile: path.join(logDir, 'my-app-err.log'),
+    };
+  });
+
+  afterEach(() => fs.rmSync(logDir, { recursive: true, force: true }));
+
+  /**
+   * Wait for the follow attach rather than sleeping a fixed 20ms.
+   * `startLogTailer` is fire-and-forget and does real filesystem work first, so
+   * a fixed sleep is a timing dependency that fails under CI load.
+   */
+  const awaitFollowCall = async (
+    container: { logs: { mock: { calls: unknown[][] } } }
+  ): Promise<Record<string, unknown> | undefined> => {
+    const deadline = Date.now() + 5000;
+    for (;;) {
+      const call = container.logs.mock.calls.find(
+        c => (c[0] as Record<string, unknown>)?.follow === true
+      );
+      if (call) return call[0] as Record<string, unknown>;
+      if (Date.now() > deadline) return undefined;
+      await new Promise(r => setTimeout(r, 10));
+    }
   };
 
   const makeDocker = () => {
@@ -157,14 +189,10 @@ describe('the log tailer captures from container start (#264 defect 1)', () => {
     const mgr = new ContainerManager(docker as unknown as ConstructorParameters<typeof ContainerManager>[0]);
 
     await mgr.start(spec as unknown as Parameters<typeof mgr.start>[0]);
-    // The tailer is fire-and-forget; let its microtasks run.
-    await new Promise(r => setTimeout(r, 20));
 
-    const followCall = container.logs.mock.calls.find(
-      (c: unknown[]) => (c[0] as Record<string, unknown>)?.follow === true
-    );
+    const followCall = await awaitFollowCall(container);
     expect(followCall).toBeDefined();
-    expect((followCall![0] as Record<string, unknown>).tail).toBe('all');
+    expect(followCall!.tail).toBe('all');
   });
 
   it('removes any previous container before creating one, which is what makes all safe', async () => {
