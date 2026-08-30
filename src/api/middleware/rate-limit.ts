@@ -88,8 +88,17 @@ const stores = new Map<string, Map<string, RateLimitEntry>>();
  * XFF is only trusted when the socket peer is loopback (i.e. the request
  * came from the local Caddy reverse proxy), preventing clients from spoofing
  * their own rate-limit bucket by forging the X-Forwarded-For header.
+ *
+ * Exported for `audit.ts`, which carried its own copy taking the FIRST XFF
+ * entry with no peer check — the exact defect DROP-152 follow-up 2 fixed here
+ * and missed there, leaving every audit row's `ip` client-controlled. It is
+ * exported rather than moved to a shared module deliberately: this function is
+ * load-bearing for the login bucket, `rate-limit.client-ip.test.ts` covers it
+ * where it lives, and relocating it to give a second caller a tidier import
+ * would put that coverage and this reasoning one indirection away from the
+ * limiter they exist for.
  */
-function getClientIp(c: Context): string {
+export function getClientIp(c: Context): string {
   // @hono/node-server exposes the raw IncomingMessage on c.env.incoming
   const incoming = (c.env as unknown as Record<string, unknown>)?.incoming as
     | { socket?: { remoteAddress?: string } }
