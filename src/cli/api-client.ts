@@ -100,6 +100,22 @@ export class DropApiClient {
     return this.request<AppDto>('GET', `/apps/${encodeURIComponent(name)}`);
   }
 
+  /**
+   * Hold the deploy pipeline still for `seconds` and wait for in-flight
+   * deploys to drain (P2-5b) — what `drop backup` calls around its snapshot.
+   *
+   * `drained: false` means a deploy outlived the drain window, so the snapshot
+   * may straddle it. The caller must report that rather than swallow it.
+   */
+  async quiesce(seconds: number): Promise<{ quiesced: boolean; drained: boolean; until: string }> {
+    return this.request('POST', '/admin/quiesce', { seconds });
+  }
+
+  /** Release the hold early. Always safe; the lease expires on its own anyway. */
+  async resumeFromQuiesce(): Promise<void> {
+    await this.request('DELETE', '/admin/quiesce');
+  }
+
   async startApp(name: string): Promise<void> {
     await this.request('POST', `/apps/${encodeURIComponent(name)}/start`);
   }

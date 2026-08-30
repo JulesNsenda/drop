@@ -19,6 +19,7 @@ import { normalizePublicUrl } from '../../utils/url-validator';
 import { getPublicUrl, setPublicUrl, isAccessGateEnabled } from '../runtime-config';
 import { getMailCredentialStore, clearMailCredential } from '../../managers/mailer/mail-credential';
 import { sendMeteredMail } from './mail-quota';
+import { getPlatformOps } from '../platform-ops';
 
 const admin = new Hono();
 
@@ -861,6 +862,67 @@ admin.post('/mail/test', async (c) => {
   });
 
   return c.json(success(failure ? { status: result.status, failure } : { status: result.status }));
+});
+
+
+/**
+ * Deploy quiesce (P2-5b) — `drop backup`'s way to hold the pipeline still.
+ *
+ * `drop backup` runs as its own process (usually from cron), so it cannot reach
+ * into the platform's `appsInProgress` directly. It authenticates with the
+ * `cli-local` admin key the platform writes on start and calls these two
+ * routes around the snapshot.
+ *
+ * The window is a LEASE with a ceiling enforced platform-side, not a boolean.
+ * The caller can be SIGKILLed mid-backup; a boolean would leave the box
+ * refusing every deploy until a human noticed. The worst case here is deploys
+ * deferring for the rest of the requested window — and the watcher DEFERS
+ * rather than dropping, so nothing is lost either way.
+ */
+admin.post('/quiesce', async (c) => {
+  const ops = getPlatformOps();
+  if (!ops) {
+    return c.json(error(ErrorCodes.INTERNAL_ERROR, 'Platform not available'), 503);
+  }
+
+  const body = await c.req.json().catch(() => ({}) as Record<string, unknown>);
+  const requested = Number((body as Record<string, unknown>).seconds ?? 300);
+  if (!Number.isFinite(requested) || requested <= 0) {
+    return c.json(error(ErrorCodes.VALIDATION_ERROR, 'seconds must be a positive number'), 400);
+  }
+
+  const result = await ops.quiesce(requested * 1000);
+  await logActivityFor((c.get as Function)('auth') as AuthContext | undefined, {
+    action: 'backup-quiesce',
+    detail: `${Math.round(requested)}s, drained=${result.drained}`,
+  });
+
+  // `drained: false` is reported, never hidden: it means a deploy outlived the
+  // drain window, so the caller's snapshot may straddle it. A backup that
+  // silently claims consistency it does not have is the failure this whole
+  // mechanism exists to prevent.
+  return c.json(
+    success({
+      quiesced: true,
+      drained: result.drained,
+      until: new Date(result.until).toISOString(),
+    })
+  );
+});
+
+admin.delete('/quiesce', async (c) => {
+  const ops = getPlatformOps();
+  if (!ops) {
+    return c.json(error(ErrorCodes.INTERNAL_ERROR, 'Platform not available'), 503);
+  }
+
+  ops.resumeFromQuiesce();
+  await logActivityFor((c.get as Function)('auth') as AuthContext | undefined, {
+    action: 'backup-resume',
+    detail: 'released',
+  });
+
+  return c.json(success({ quiesced: false }));
 });
 
 export default admin;

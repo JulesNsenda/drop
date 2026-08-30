@@ -1286,6 +1286,89 @@ export class DropPlatform {
     this.logger.close();
   }
 
+  /**
+   * Deploy quiesce (P2-5b) — hold the pipeline still so a backup can take a
+   * self-consistent snapshot.
+   *
+   * `drop backup` copies ~12 file stores and then dumps every database. Each
+   * individual write is atomic (`writeJsonAtomic`) so nothing is ever captured
+   * half-written, and each `pg_dump` is internally consistent — but the SET is
+   * not. A deploy landing mid-backup can leave `apps.json` from before it and
+   * `appconf/webapps/` from after, or a database dump that references an app
+   * the state file has not heard of. Restoring that is not obviously broken,
+   * which is the dangerous part: it is discovered later, from an app whose port
+   * or database the platform disagrees about.
+   *
+   * **`quiescedUntil` is a DEADLINE, not a boolean, and that is the safety
+   * property.** The caller is a separate process (`drop backup`, or a cron
+   * running it) which can be killed, crash, or lose its network. A boolean
+   * would leave the platform refusing every deploy until someone noticed and
+   * cleared it by hand. An expiring lease cannot wedge the box: the worst case
+   * is deploys deferring for the remainder of the requested window.
+   */
+  private quiescedUntil = 0;
+
+  /** Upper bound on a quiesce lease. A backup that needs longer has a problem a longer lease will not fix. */
+  private readonly MAX_QUIESCE_MS = 15 * 60_000;
+
+  /** Whether the deploy pipeline is currently held. */
+  isQuiesced(): boolean {
+    return Date.now() < this.quiescedUntil;
+  }
+
+  /**
+   * Hold the deploy pipeline for `durationMs`, then wait for whatever was
+   * already in flight to finish.
+   *
+   * Returns whether the drain actually completed. `false` means a deploy was
+   * still running when the drain deadline passed — the backup is free to
+   * proceed, but the caller should say so rather than claim a clean snapshot.
+   */
+  async quiesce(durationMs: number): Promise<{ drained: boolean; until: number }> {
+    const bounded = Math.max(0, Math.min(durationMs, this.MAX_QUIESCE_MS));
+    this.quiescedUntil = Date.now() + bounded;
+    this.logger.info(`Deploy pipeline quiesced for ${Math.round(bounded / 1000)}s`, 'BACKUP');
+
+    // Reuse the shutdown drain: same question, same bounded wait. Capped at the
+    // lease so a stuck deploy cannot hold the caller past its own window.
+    await this.drainInProgress(Math.min(bounded, 60_000));
+    return { drained: this.appsInProgress.size === 0, until: this.quiescedUntil };
+  }
+
+  /**
+   * Whether the watcher should hold off on `name`.
+   *
+   * While quiesced EVERY app reads as locked, which is what holds the
+   * folder-drop path still during a backup. The watcher's contract for a locked
+   * app is to DEFER — `scheduleRebuild` re-arms once the lock clears — not to
+   * drop, so a folder dropped mid-backup still deploys, just after the lease.
+   * The other entry point is `handleAppUpdate`, where redeploys, webhooks, git
+   * and upload deploys all converge.
+   *
+   * Deliberately NOT gated: `handleStartApp`. It runs on `build:completed` for
+   * an app that is ALREADY in `appsInProgress` with its build paid for, so
+   * refusing there would abandon a deploy mid-pipeline — worse than the
+   * inconsistency quiescing exists to prevent. `quiesce()` drains those
+   * instead. First-time app CREATION via `POST /apps` is likewise not gated: it
+   * is rare, bounded by the drain, and gating it would mean threading this
+   * through nine `appsInProgress.add` sites in the deploy pipeline, which is a
+   * refactor that wants its own change.
+   *
+   * A named method rather than an inline closure in the watcher config so the
+   * rule can be tested without standing up `initializeServices()`.
+   */
+  private isDeployLocked(name: string): boolean {
+    return this.isQuiesced() || this.appsInProgress.has(name);
+  }
+
+  /** Release the hold early. Safe to call when not quiesced. */
+  resumeFromQuiesce(): void {
+    if (this.quiescedUntil !== 0) {
+      this.logger.info('Deploy pipeline resumed', 'BACKUP');
+    }
+    this.quiescedUntil = 0;
+  }
+
   /** Wait (up to timeoutMs) for in-progress deploys to drain. */
   private async drainInProgress(timeoutMs: number): Promise<void> {
     const deadline = Date.now() + timeoutMs;
@@ -1858,7 +1941,7 @@ backup:
       appsDir: this.config.appsDirectory,
       debounceMs: 1000,
       maxDepth: 2,
-      isAppLocked: (name) => this.appsInProgress.has(name),
+      isAppLocked: (name) => this.isDeployLocked(name),
     });
   }
 
@@ -1917,6 +2000,9 @@ backup:
       getServiceIntent: (name, serviceId) => this.getServiceIntent(name, serviceId),
       reconfigureRoute: (name) => this.reconfigureRoute(name),
       assessAccessGate: (name) => this.assessAccessGate(name),
+      quiesce: (ms) => this.quiesce(ms),
+      resumeFromQuiesce: () => this.resumeFromQuiesce(),
+      isQuiesced: () => this.isQuiesced(),
     });
 
     this.logger.info(`API server running on port ${this.config.apiPort}`, 'API');
@@ -5622,6 +5708,18 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     actor?: DeployActorInfo
   ): Promise<void> {
     if (!this.runtime || !this.stateManager || !this.detector || !this.builder) return;
+
+    // A backup is taking a snapshot (P2-5b). Deferring rather than dropping:
+    // the watcher re-arms once the lock clears, and an API/webhook caller has
+    // already been told the deploy was accepted — so this is logged at info,
+    // not debug, for the same reason the appsInProgress skip below is.
+    if (this.isQuiesced()) {
+      this.logger.info(
+        `Deferring update for ${appName} — deploys are quiesced for a backup`,
+        'BACKUP'
+      );
+      return;
+    }
 
     // Skip apps currently being cloned by git deploy
     if (this.gitDeployService?.isCloning(appName)) return;

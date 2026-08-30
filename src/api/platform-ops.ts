@@ -247,6 +247,24 @@ export interface PlatformOps {
    * was a comment with nothing enforcing it.
    */
   assessAccessGate(appName: string): Promise<AccessGateVerdict>;
+
+  /**
+   * Hold the deploy pipeline still for `durationMs` so `drop backup` can take a
+   * self-consistent snapshot, then wait for in-flight deploys to drain
+   * (P2-5b). Resolves with whether the drain actually completed — `false` means
+   * a deploy outlived the drain window and the snapshot may straddle it.
+   *
+   * The duration is a LEASE with a hard ceiling, because the caller is a
+   * separate process that can be killed: nothing here can wedge the platform
+   * into refusing deploys indefinitely.
+   */
+  quiesce(durationMs: number): Promise<{ drained: boolean; until: number }>;
+
+  /** Release the hold early — what `drop backup` calls in its `finally`. */
+  resumeFromQuiesce(): void;
+
+  /** Whether the pipeline is currently held. */
+  isQuiesced(): boolean;
 }
 
 let platformOps: PlatformOps | null = null;
