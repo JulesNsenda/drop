@@ -27,7 +27,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [1.5.2]
+## [1.5.2] - 2026-08-30
 
 A patch about what a deploy log tells you, and about output that was being
 thrown away. Two reports drove it, and both diagnosed the platform from a log
