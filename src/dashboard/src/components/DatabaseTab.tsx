@@ -358,7 +358,7 @@ function SqlConsole({ name }: { name: string }) {
       </div>
 
       {queryError && (
-        <p className="mt-3 font-mono text-xs" style={{ color: 'var(--err)' }}>
+        <p className="mt-3 font-mono text-xs text-err">
           {queryError}
         </p>
       )}
