@@ -157,6 +157,19 @@ function ShareCard({ appName }: { appName: string }) {
   /** Set when the platform refuses the `{ email }` branch, so the field stops offering it. */
   const [guestInvitesDisabled, setGuestInvitesDisabled] = useState(false);
 
+  // None of this survives a change of app. `AppDetailPage` does not remount on
+  // a name change, so a live single-use invitation minted for app A would
+  // otherwise stay rendered under app B's heading, next to copy telling the
+  // owner to send it to someone — a working guest credential, mis-delivered to
+  // the wrong application. A refusal learned from one app's toggle read is
+  // likewise not a fact about the next one.
+  useEffect(() => {
+    setInviteLink(null);
+    setGuestEmail('');
+    setGuestInvitesDisabled(false);
+    setBanner(null);
+  }, [appName]);
+
   const grant = async (targetUsername: string, gateApp: boolean) => {
     setSaving(true);
     setBanner(null);
@@ -266,12 +279,23 @@ function ShareCard({ appName }: { appName: string }) {
     }
 
     setGuestEmail('');
+
+    // Mail was never sent, so the owner has to deliver this themselves or
+    // nothing happens. `mailSent === false` rather than "a url came back":
+    // the server makes the two equivalent, and asserting it here means a
+    // response that ever carried both would withhold the secret instead of
+    // publishing a link to an invitation that WAS delivered.
+    const url = res.data?.mailSent === false ? res.data?.inviteUrl : undefined;
+
+    // ADDITIVE, never an either/or. `applyError` fires on the write that
+    // creates the policy and `inviteUrl` comes back when no mail was dialed —
+    // so both arrive together on the single most likely case, a first invite
+    // on a relay-less box. Branching dropped the secret (nothing stores it,
+    // so it is unrecoverable) while telling the owner the person was invited.
+    if (url) setInviteLink({ email, url });
     if (res.data?.applyError) {
       setBanner({ kind: 'error', text: `Invited, but the gate was not re-applied: ${res.data.applyError}` });
-    } else if (res.data?.inviteUrl) {
-      // Mail was never sent. Say so plainly rather than reporting success —
-      // the owner has to deliver this themselves or nothing happens.
-      setInviteLink({ email, url: res.data.inviteUrl });
+    } else if (url) {
       setBanner(null);
     } else {
       setBanner({ kind: 'ok', text: res.data?.message || `Invitation sent to ${email}.` });
@@ -508,8 +532,28 @@ function ShareCard({ appName }: { appName: string }) {
               <Input type="text" readOnly value={inviteLink.url} onFocus={e => e.target.select()} />
               <Button
                 onClick={() => {
-                  void navigator.clipboard?.writeText(inviteLink.url);
-                  setBanner({ kind: 'ok', text: 'Invitation link copied.' });
+                  // Never claim "copied" without checking. A dashboard on
+                  // plain HTTP — the same relay-less box that is the only
+                  // kind to ever see this link — has no
+                  // `navigator.clipboard` at all, and the owner would go and
+                  // paste whatever was there before. The secret is not
+                  // recoverable.
+                  const copying = navigator.clipboard?.writeText(inviteLink.url);
+                  if (!copying) {
+                    setBanner({
+                      kind: 'error',
+                      text: 'This browser will not let the page copy for you — select the link and press Ctrl-C.',
+                    });
+                    return;
+                  }
+                  void copying.then(
+                    () => setBanner({ kind: 'ok', text: 'Invitation link copied.' }),
+                    () =>
+                      setBanner({
+                        kind: 'error',
+                        text: 'Could not copy — select the link and press Ctrl-C.',
+                      })
+                  );
                 }}
               >
                 Copy
