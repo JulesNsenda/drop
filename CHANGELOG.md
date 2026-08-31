@@ -39,11 +39,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   catalog exposure that makes it admin-only. The mail card covers host, port,
   TLS, username and from-address, a write-only relay password, and a test send.
 
+- **Guest invitations, and revoking them, on the admin Access tab.** An admin
+  viewing an app gets the governance tab, never the owner's share panel, and the
+  invite-by-email control lived only on the latter — so switching guest invites
+  on left the operator who did it unable to invite anyone except with `curl`.
+  The tab now invites, lists the guests you invited with Resend and Revoke, and
+  counts the ones it cannot list (someone else's invitees, or all of them while
+  the share read is refused) so an unreadable answer is never rendered as
+  "nobody". The list and its Revoke controls stay reachable when app sharing is
+  switched off, matching the API's own rule that disabling a feature must not
+  remove the lever for taking access away.
+
 ### Fixed
 
 - **The SQL console's refusal pointed at a Settings page that did not exist.**
   It told an admin to "enable it in Settings" while no such control had been
   built. It now names the tab that exists.
+
+- **A first guest invitation on a platform with no mail relay destroyed its own
+  link.** The invitation secret exists in plaintext exactly once, in the
+  response to the request that mints it, and is returned only when no mail was
+  sent. The share panel checked the gate-application error before that field, so
+  a response carrying both — the ordinary shape of a first invite on a
+  relay-less box — reported "invited" and dropped the only credential that would
+  have admitted the person. Nothing stores it, so it could not be recovered.
+
+- **The share panel claimed it had copied an invitation link when it had not.**
+  A dashboard served over plain HTTP has no clipboard API, which is exactly the
+  kind of box that sees these links; the copy silently did nothing and said it
+  had worked. It now reports the failure and tells you to copy by hand.
+
+- **An invitation link stayed on screen after switching to another app.** The
+  app detail page does not remount on a name change, so a live single-use
+  credential minted for one app was rendered under another app's heading.
 
 ## [1.6.0] - 2026-08-30
 
