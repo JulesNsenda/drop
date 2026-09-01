@@ -1,11 +1,20 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { AlertTriangle, Lock, ShieldCheck, ShieldOff, UserPlus, Users, X } from 'lucide-react';
+import { AlertTriangle, Lock, ShieldCheck, ShieldOff, UserPlus, Users } from 'lucide-react';
 import { apiJsonWithStatus, jsonBody } from '../api/client';
 import { getAuthHeaders } from '../hooks/useAuth';
 import Card from './ui/Card';
 import { asArray } from '../lib/api-shape';
 import Button from './ui/Button';
 import Input from './ui/Input';
+import InviteLinkPanel from './InviteLinkPanel';
+import { AccountGrantRow, GuestGrantRow } from './ShareGrantRows';
+import {
+  gateNotReappliedText,
+  inviteSecretUrl,
+  shareRefusal,
+  type OwnGrant,
+  type OwnGuest,
+} from '../lib/app-share';
 
 /**
  * Access governance for one app (DROP-152).
@@ -26,32 +35,45 @@ import Input from './ui/Input';
  * only way to gate an app was curl with an admin token — a governance control
  * the people it is for could not use.
  *
- * The guest-invite section at the bottom exists for the same reason. An admin
- * viewing an app gets THIS component, never `ShareCard` (AppDetailPage), and
- * `ShareCard` held the only invite-by-email control — so an operator with
- * `guest-invites` switched on could not invite anyone from the UI they
- * actually see, only with curl.
+ * The "Share this app" card at the bottom exists for the same reason. An
+ * admin viewing an app gets THIS component, never `ShareCard`
+ * (AppDetailPage), and `ShareCard` held the ONLY controls for both halves of
+ * `/apps/:name/share` — so an operator with the feature switched on could not
+ * share or invite anyone from the UI they actually see, only with curl.
  *
- * It DUPLICATES ~40 lines of `ShareCard`'s guest branch rather than sharing
- * them, deliberately. Extracting would mean surgery on the shipped owner path
- * (its confirm dialog, its sharing-disabled first-run panel, its once-only
- * link box) for a change that does not otherwise touch it, and the two differ
- * where it counts: the copy here is admin-actionable (a refusal names the
- * toggle to flip) where `ShareCard`'s says "ask an administrator". Extract if
- * a third caller ever appears.
+ * It reaches the same two routes as `ShareCard`, and the pieces where the two
+ * are genuinely identical now live in one place: the wire contract in
+ * `lib/app-share.ts` (root jest reaches it there; nothing executes a
+ * component), and the row and once-only-link markup in `ShareGrantRows` /
+ * `InviteLinkPanel`. What stays local is what genuinely differs — the copy
+ * here is admin-actionable (a refusal names the toggle to flip) where
+ * `ShareCard`'s says "ask an administrator", the confirm text drops the
+ * "only an administrator can undo this" clause that is meaningless to one,
+ * and the reads below are three-state where `ShareCard`'s are not.
  *
- * The guest list is scoped and SAYS SO. `GET /apps/:name/share` reports guests
- * through `ownView`, which returns only the ones the CALLER invited; everyone
- * else's are a number. On this component — the full-disclosure surface for
- * accounts (allow-list, provenance, openers) — an unlabelled partial list
- * would read as complete and would not be. It is labelled "Guests you
- * invited" for that reason, and it is exactly the set this card can act on:
- * `DELETE /apps/:name/share/guests/:guestId` admits an admin against any
- * guest, but nothing in the UI would let one pick a guest they cannot see.
+ * Sharing sits BESIDE the allow-list rather than replacing it, and they are
+ * not the same control. The allow-list is the complete, admin-authored
+ * governance set; a share carries the grantor's name (`grantedBy`) and is
+ * revocable one entry at a time. Both write `access.allow`, which is why
+ * every write here re-reads the gate — and why a grant seeds its id into the
+ * checkbox form, so the admin's next "Update gate" cannot silently revoke the
+ * person they just shared with.
+ *
+ * The two lists are scoped and SAY SO. `GET /apps/:name/share` reports both
+ * through `ownView`, which returns only the grants and guests the CALLER
+ * made; everyone else's are a number. On this component — the
+ * full-disclosure surface for accounts (allow-list, provenance, openers) — an
+ * unlabelled partial list would read as complete and would not be. They are
+ * labelled "Shared by you" and "Guests you invited" for that reason, and they
+ * are exactly the sets this card can act on: the DELETEs admit an admin
+ * against any entry, but nothing in the UI would let one pick an entry they
+ * cannot see. `othersGrantedCount` is deliberately NOT rendered — unlike an
+ * owner, an admin already has the complete allow-list one card up, so a count
+ * of "others" would restate it worse.
  *
  * A create-only control was the first shape of this, and it was wrong: an
- * admin could mint guest access here and then had no dashboard path to undo
- * it, in a component whose entire subject is who may open the app.
+ * admin could mint access here and then had no dashboard path to undo it, in
+ * a component whose entire subject is who may open the app.
  */
 
 interface AccessView {
@@ -77,13 +99,6 @@ interface DirectoryUser {
   role: string;
 }
 
-/** One guest THIS caller invited — see the header on why the list is scoped. */
-interface OwnGuest {
-  guestId: string;
-  email: string;
-  disabled: boolean;
-}
-
 function AccessTab({ appName }: { appName: string }) {
   const [view, setView] = useState<AccessView | null>(null);
   const [status, setStatus] = useState<number>(0);
@@ -93,12 +108,16 @@ function AccessTab({ appName }: { appName: string }) {
   const [saving, setSaving] = useState(false);
   const [banner, setBanner] = useState<{ kind: 'error' | 'ok'; text: string } | null>(null);
   const [guestEmail, setGuestEmail] = useState('');
+  const [username, setUsername] = useState('');
   /**
-   * The invite section keeps its OWN banner rather than sharing the allow-list
-   * one above: they sit in different cards, and a "policy saved" message
-   * appearing next to the invite box (or the reverse) reports the wrong write.
+   * The share card keeps its OWN banner rather than sharing the allow-list one
+   * above: they sit in different cards, and a "policy saved" message appearing
+   * next to the invite box (or the reverse) reports the wrong write. Both
+   * halves of the card share this one — they are the same feature, the same
+   * route and the same toggle, and a share confirmation appearing under the
+   * email field is not a misattribution the way the allow-list's is.
    */
-  const [inviteBanner, setInviteBanner] = useState<{ kind: 'error' | 'ok'; text: string } | null>(
+  const [shareBanner, setShareBanner] = useState<{ kind: 'error' | 'ok'; text: string } | null>(
     null
   );
   /**
@@ -119,14 +138,21 @@ function AccessTab({ appName }: { appName: string }) {
    */
   const [inviteBlockedBy, setInviteBlockedBy] = useState<'sharing' | 'guests' | null>(null);
   /**
-   * THREE states, not an array. An unreadable guest list rendered as an empty
-   * one is an affirmative "nobody has guest access" on the one screen whose
-   * subject is who may open the app — and the read fails for ordinary reasons
-   * (an expired session, the rate limiter, the app-sharing toggle) while the
-   * grants it could not read stay live.
+   * THREE states, not two arrays. An unreadable list rendered as an empty one
+   * is an affirmative "nobody has access" on the one screen whose subject is
+   * who may open the app — and the read fails for ordinary reasons (an expired
+   * session, the rate limiter, the app-sharing toggle) while the grants it
+   * could not read stay live.
+   *
+   * Accounts and guests come from ONE response and live in ONE state for that
+   * reason: two states fed by a single read can go independently stale, and
+   * the failure mode is a list that says "nobody" while the other says
+   * otherwise.
    */
-  const [guestList, setGuestList] = useState<
-    { kind: 'loading' } | { kind: 'ok'; items: OwnGuest[] } | { kind: 'error'; message: string }
+  const [shareList, setShareList] = useState<
+    | { kind: 'loading' }
+    | { kind: 'ok'; grants: OwnGrant[]; guests: OwnGuest[] }
+    | { kind: 'error'; message: string }
   >({ kind: 'loading' });
 
   /**
@@ -174,42 +200,52 @@ function AccessTab({ appName }: { appName: string }) {
   }, [load]);
 
   /**
-   * The guest slice comes from the SHARE view — `GET /access` reports the
-   * allow-list and knows nothing about guests. Only `ownGuests` is read from
-   * it; see the header on why that scoping is the honest one here.
+   * Both lists come from the SHARE view — `GET /access` reports the allow-list
+   * and knows nothing about guests, and nothing about which account grants
+   * this caller authored. Only the caller's own slices are read from it; see
+   * the header on why that scoping is the honest one here.
    *
-   * This GET is also the one guest-related route an admin does NOT bypass the
+   * This GET is also the one `/share` route an admin does NOT bypass the
    * app-sharing toggle on (the revokes do, so removal is always possible), so
    * its refusal is how the panel learns the toggle is off before anyone types
-   * an address. It refuses the READ only — the count below it, taken from
-   * `GET /access`, still reports that guests exist.
+   * a username or an address. It refuses the READ only — the count below it,
+   * taken from `GET /access`, still reports that guests exist, and the
+   * allow-list card above still shows every account grant.
    */
-  const loadGuests = useCallback(async () => {
+  const loadShareView = useCallback(async () => {
     const forApp = appName;
-    const res = await apiJsonWithStatus<{ ownGuests?: OwnGuest[] }>(`/apps/${appName}/share`);
+    const res = await apiJsonWithStatus<{ ownGrants?: OwnGrant[]; ownGuests?: OwnGuest[] }>(
+      `/apps/${appName}/share`
+    );
     if (currentApp.current !== forApp) return;
     if (res.success && res.data) {
-      setGuestList({ kind: 'ok', items: asArray<OwnGuest>(res.data.ownGuests) });
+      setShareList({
+        kind: 'ok',
+        grants: asArray<OwnGrant>(res.data.ownGrants),
+        guests: asArray<OwnGuest>(res.data.ownGuests),
+      });
       // Clear a stale sharing block, never a `guests` one — this route says
       // nothing about the guest-invites toggle.
       setInviteBlockedBy(prev => (prev === 'sharing' ? null : prev));
       return;
     }
-    const reason = (res.error as { details?: { reason?: string } } | undefined)?.details?.reason;
-    if (res.status === 403 && reason === 'sharing_disabled') {
+    if (shareRefusal(res) === 'sharing') {
       setInviteBlockedBy('sharing');
-      setGuestList({
+      setShareList({
         kind: 'error',
-        message: 'Guests cannot be listed while owner sharing is switched off.',
+        message: 'Shares and guests cannot be listed while owner sharing is switched off.',
       });
       return;
     }
-    setGuestList({ kind: 'error', message: res.error?.message || 'Could not read the guest list.' });
+    setShareList({
+      kind: 'error',
+      message: res.error?.message || 'Could not read who this app has been shared with.',
+    });
   }, [appName]);
 
   useEffect(() => {
-    void loadGuests();
-  }, [loadGuests]);
+    void loadShareView();
+  }, [loadShareView]);
 
   // Invite state is per-APP, and none of it survives a change of app: a live
   // invitation secret rendered under another app's Access tab invites a
@@ -218,12 +254,13 @@ function AccessTab({ appName }: { appName: string }) {
   // the toggle back on).
   useEffect(() => {
     setInviteLink(null);
-    setInviteBanner(null);
+    setShareBanner(null);
     setInviteBlockedBy(null);
     setGuestEmail('');
+    setUsername('');
     // The list carries app A's invitees' EMAIL ADDRESSES; leaving it up under
     // app B's heading is the same misattribution, one field further in.
-    setGuestList({ kind: 'loading' });
+    setShareList({ kind: 'loading' });
   }, [appName]);
 
   useEffect(() => {
@@ -246,8 +283,12 @@ function AccessTab({ appName }: { appName: string }) {
     // Any write to the policy can invalidate a still-displayed invitation
     // link, and the box next to it says "send this to <person>". Drop it
     // rather than leave a credential on screen that may no longer admit
-    // anyone (`removeGate` does the same, harder).
+    // anyone (`removeGate` does the same, harder). The share banner goes with
+    // it for the same reason one step further out: "Shared with alice." is a
+    // claim about who can open this app, and this write may have just ended
+    // that.
     setInviteLink(null);
+    setShareBanner(null);
     const res = await apiJsonWithStatus<{ enforced: boolean; applyError?: string }>(
       `/apps/${appName}/access`,
       {
@@ -296,9 +337,11 @@ function AccessTab({ appName }: { appName: string }) {
     }
     setSaving(true);
     setBanner(null);
-    // Removing the policy takes the guest grants with it, so any link shown
-    // above would admit nobody.
+    // Removing the policy takes every grant with it, so any link shown above
+    // would admit nobody — and any "Shared with …" confirmation beside it is
+    // about to be false.
     setInviteLink(null);
+    setShareBanner(null);
     const res = await apiJsonWithStatus(`/apps/${appName}/access`, { method: 'DELETE' });
     setSaving(false);
     setBanner(
@@ -307,15 +350,137 @@ function AccessTab({ appName }: { appName: string }) {
         : { kind: 'error', text: res.error?.message || 'Could not remove the gate.' }
     );
     await load();
-    // Clearing the policy takes the guest grants with it. Without this the
-    // list keeps naming people who can no longer open the app, and pressing
-    // Revoke on one answers "there was nothing to revoke".
-    await loadGuests();
+    // Clearing the policy takes every grant with it. Without this the lists
+    // keep naming people who can no longer open the app, and pressing Revoke
+    // on one answers "there was nothing to revoke".
+    await loadShareView();
+  };
+
+  /**
+   * Share with a DROP account.
+   *
+   * `POST /share` writes the target into `access.allow` server-side, which the
+   * checkbox form above mirrors — so the ids that came back are seeded into
+   * `selected` here. Without that, the admin's next "Update gate" sends an
+   * allow-list that omits the person they just shared with and silently
+   * revokes them.
+   *
+   * Seeding ALL of `ownGrants`, not just the new id, is deliberate: the
+   * response does not name the target, and re-ticking a grant of the admin's
+   * own that they had un-ticked-but-not-saved errs toward keeping access,
+   * which is the safe direction. Silent removal is the one that is not.
+   */
+  const grant = async (targetUsername: string, gateApp: boolean) => {
+    setSaving(true);
+    setShareBanner(null);
+    // Any write to the policy can invalidate a still-displayed invitation
+    // link, and the box next to it says "send this to <person>".
+    setInviteLink(null);
+    const res = await apiJsonWithStatus<{
+      message: string;
+      ownGrants: OwnGrant[];
+      applyError?: string;
+    }>(`/apps/${appName}/share`, {
+      method: 'POST',
+      ...jsonBody({ username: targetUsername, ...(gateApp ? { gateApp: true } : {}) }),
+    });
+    setSaving(false);
+
+    if (!res.success) {
+      if (shareRefusal(res) === 'sharing') {
+        setInviteBlockedBy('sharing');
+        return;
+      }
+      setShareBanner({ kind: 'error', text: res.error?.message || 'Could not share this app.' });
+      return;
+    }
+
+    setUsername('');
+    const granted = asArray<OwnGrant>(res.data?.ownGrants);
+    if (granted.length > 0) {
+      setSelected(prev => {
+        const next = new Set(prev);
+        for (const g of granted) next.add(g.userId);
+        return next;
+      });
+    }
+    setShareBanner(
+      res.data?.applyError
+        ? { kind: 'error', text: gateNotReappliedText('Shared', res.data.applyError) }
+        : { kind: 'ok', text: res.data?.message || `Shared with ${targetUsername}.` }
+    );
+    // `reseedForm: false` — this write DID change `allow`, but re-seeding the
+    // checkboxes from the server would discard an un-tick the admin has in
+    // progress and not yet saved, silently abandoning an access REMOVAL. The
+    // ids this write added are seeded above instead.
+    await load({ reseedForm: false });
+    await loadShareView();
+  };
+
+  const handleGrant = () => {
+    const trimmed = username.trim();
+    if (!trimmed || !view) return;
+    // The acknowledged-act rule `ShareCard` follows: a first admission on an
+    // ungated app is confirmed explicitly, and only then sent with
+    // `gateApp: true`.
+    if (view.access === null) {
+      const confirmed = window.confirm(
+        `${appName} isn't sign-in gated yet. Sharing it with '${trimmed}' will make it ` +
+          `sign-in-only for everyone else. Continue?`
+      );
+      if (!confirmed) return;
+      void grant(trimmed, true);
+      return;
+    }
+    void grant(trimmed, false);
+  };
+
+  /**
+   * Unlike the guest revoke, this one DOES remove an id from `access.allow` —
+   * so the checkbox form has to drop it too, or the next save re-grants the
+   * access just taken away.
+   */
+  const revokeGrant = async (userId: string, label: string) => {
+    if (!window.confirm(`Revoke ${label}'s access to ${appName}?`)) return;
+    setSaving(true);
+    setShareBanner(null);
+    setInviteLink(null);
+    const res = await apiJsonWithStatus<{ message: string; revoked: boolean; applyError?: string }>(
+      `/apps/${appName}/share/${encodeURIComponent(userId)}`,
+      { method: 'DELETE' }
+    );
+    setSaving(false);
+
+    if (!res.success) {
+      setShareBanner({ kind: 'error', text: res.error?.message || 'Could not revoke access.' });
+    } else {
+      // Either way the id is NOT in `allow` server-side now, so the checkbox
+      // drops it in both branches — the message is what differs.
+      setSelected(prev => {
+        const next = new Set(prev);
+        next.delete(userId);
+        return next;
+      });
+      if (res.data?.revoked === false) {
+        // A 200 that revoked NOTHING — the same shape the guest revoke
+        // answers with, and reporting it as a revoke would be a claim the
+        // list is about to contradict.
+        setShareBanner({ kind: 'error', text: res.data.message || 'There was nothing to revoke.' });
+      } else {
+        setShareBanner(
+          res.data?.applyError
+            ? { kind: 'error', text: gateNotReappliedText('Revoked', res.data.applyError) }
+            : { kind: 'ok', text: `${label} can no longer open ${appName}.` }
+        );
+      }
+    }
+    await load({ reseedForm: false });
+    await loadShareView();
   };
 
   const invite = async (email: string, gateApp: boolean) => {
     setSaving(true);
-    setInviteBanner(null);
+    setShareBanner(null);
     setInviteLink(null);
     const res = await apiJsonWithStatus<{
       message: string;
@@ -329,12 +494,12 @@ function AccessTab({ appName }: { appName: string }) {
     setSaving(false);
 
     if (!res.success) {
-      const reason = (res.error as { details?: { reason?: string } } | undefined)?.details?.reason;
-      if (res.status === 403 && (reason === 'sharing_disabled' || reason === 'guest_invites_disabled')) {
-        setInviteBlockedBy(reason === 'sharing_disabled' ? 'sharing' : 'guests');
+      const refusal = shareRefusal(res);
+      if (refusal) {
+        setInviteBlockedBy(refusal);
         return;
       }
-      setInviteBanner({
+      setShareBanner({
         kind: 'error',
         text: res.error?.message || 'Could not send that invitation.',
       });
@@ -343,11 +508,8 @@ function AccessTab({ appName }: { appName: string }) {
 
     setGuestEmail('');
 
-    // `mailSent === false`, not merely "a url came back": the server makes the
-    // two equivalent today, and asserting the invariant here means a response
-    // that ever carried both would withhold the secret rather than display a
-    // link to an invitation that WAS delivered.
-    const url = res.data?.mailSent === false ? res.data?.inviteUrl : undefined;
+    // Not merely "a url came back" — see `inviteSecretUrl` for the invariant.
+    const url = inviteSecretUrl(res.data);
 
     // ADDITIVE, never an either/or. `applyError` fires on `justCreated` and
     // `inviteUrl` comes back when no mail was dialed — so both arrive together
@@ -356,24 +518,24 @@ function AccessTab({ appName }: { appName: string }) {
     // telling the admin the person was invited.
     if (url) setInviteLink({ email, url });
     if (res.data?.applyError) {
-      setInviteBanner({
+      setShareBanner({
         kind: 'error',
-        text: `Invited, but the gate was not re-applied: ${res.data.applyError}`,
+        text: gateNotReappliedText('Invited', res.data.applyError),
       });
     } else if (!url) {
-      setInviteBanner({ kind: 'ok', text: res.data?.message || `Invitation sent to ${email}.` });
+      setShareBanner({ kind: 'ok', text: res.data?.message || `Invitation sent to ${email}.` });
     }
     // An invite carrying `gateApp` creates the policy server-side, so the gate
     // display above is stale until this runs. The FORM is deliberately left
     // alone (see `load`) — this write never touches `allow`.
     await load({ reseedForm: false });
-    await loadGuests();
+    await loadShareView();
   };
 
   const revokeGuest = async (guestId: string, label: string) => {
     if (!window.confirm(`Revoke ${label}'s access to ${appName}?`)) return;
     setSaving(true);
-    setInviteBanner(null);
+    setShareBanner(null);
     // Whatever link is on screen may be this guest's — same reason `save` and
     // `removeGate` drop it.
     setInviteLink(null);
@@ -384,7 +546,7 @@ function AccessTab({ appName }: { appName: string }) {
     setSaving(false);
 
     if (!res.success) {
-      setInviteBanner({
+      setShareBanner({
         kind: 'error',
         text: res.error?.message || 'Could not revoke that guest.',
       });
@@ -392,15 +554,15 @@ function AccessTab({ appName }: { appName: string }) {
       // A 200 that revoked NOTHING. The route answers this way rather than
       // disclosing whether the id exists, so reporting it as a revoke would
       // be a claim the list is about to contradict.
-      setInviteBanner({ kind: 'error', text: res.data.message || 'There was nothing to revoke.' });
+      setShareBanner({ kind: 'error', text: res.data.message || 'There was nothing to revoke.' });
     } else {
-      setInviteBanner(
+      setShareBanner(
         res.data?.applyError
-          ? { kind: 'error', text: `Revoked, but the gate was not re-applied: ${res.data.applyError}` }
+          ? { kind: 'error', text: gateNotReappliedText('Revoked', res.data.applyError) }
           : { kind: 'ok', text: `${label} can no longer open ${appName}.` }
       );
     }
-    await loadGuests();
+    await loadShareView();
   };
 
   const handleInvite = () => {
@@ -456,7 +618,7 @@ function AccessTab({ appName }: { appName: string }) {
    */
   const unlistedGuests = Math.max(
     0,
-    (view.access?.guests?.length ?? 0) - (guestList.kind === 'ok' ? guestList.items.length : 0)
+    (view.access?.guests?.length ?? 0) - (shareList.kind === 'ok' ? shareList.guests.length : 0)
   );
 
   return (
@@ -530,8 +692,9 @@ function AccessTab({ appName }: { appName: string }) {
         </h3>
         <p className="mt-1 text-sm opacity-70">
           The owner and administrators can always open this app. Everyone else must be listed here
-          — or invited by email below, which admits someone with no account, so they never appear
-          in this list.
+          — this is the complete list, including shares made below, which appear here under the
+          name of whoever granted them. A guest invited by email has no account at all, so they
+          never appear in it.
         </p>
 
         {banner && (
@@ -588,27 +751,29 @@ function AccessTab({ appName }: { appName: string }) {
 
       <Card className="p-6">
         <h3 className="flex items-center gap-2 font-semibold">
-          <UserPlus className="h-4 w-4" /> Invite someone without an account
+          <UserPlus className="h-4 w-4" /> Share this app
         </h3>
         <p className="mt-1 text-sm opacity-70">
-          They get a single-use emailed invitation and open this app with no DROP account, no
-          password, and no signup. Invitations are single-use and expire on their own; revoking one
-          takes effect immediately.
+          A share admits someone the same way the list above does, and appears there too — the
+          difference is that it carries your name as the grantor, so you can take it back one
+          entry at a time. Someone with no DROP account can be invited by email instead: they
+          open this app with no account, no password and no signup, on a single-use invitation
+          that expires on its own.
         </p>
 
-        {inviteBanner && (
+        {shareBanner && (
           <div
             className={`mt-3 rounded px-3 py-2 text-sm ${
-              inviteBanner.kind === 'error'
+              shareBanner.kind === 'error'
                 ? 'bg-red-500/10 text-red-600 dark:text-red-400'
                 : 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-400'
             }`}
           >
-            {inviteBanner.text}
+            {shareBanner.text}
           </div>
         )}
 
-        {/* The list, its Revoke buttons and the banner sit OUTSIDE the
+        {/* The lists, their Revoke buttons and the banner sit OUTSIDE the
             blocked branch below, on purpose. `app-sharing` off refuses the
             share READ but never a revoke (`ADMIN_MAY_BYPASS_TOGGLE`), which
             is the API's own rule: an operator who switches the feature off
@@ -617,68 +782,58 @@ function AccessTab({ appName }: { appName: string }) {
             reintroduce exactly that, and would swallow the confirmation of a
             revoke that had just succeeded. */}
         <div className="mt-4 space-y-1">
-          {guestList.kind === 'loading' && <p className="text-sm opacity-60">Loading guests…</p>}
-
-          {guestList.kind === 'error' && (
-            // NOT "nobody has been invited" — the read failed, and the grants
-            // it could not read are still live.
-            <p className="text-sm text-amber-600 dark:text-amber-400">{guestList.message}</p>
+          {shareList.kind === 'loading' && (
+            <p className="text-sm opacity-60">Loading shares and guests…</p>
           )}
 
-          {guestList.kind === 'ok' &&
-            (guestList.items.length === 0 ? (
-              <p className="text-sm opacity-60">
-                You haven&rsquo;t invited anyone by email to this app yet.
-              </p>
-            ) : (
-              <>
-                {/* Scoped, and says so — the header explains why an
-                    unlabelled list would be the wrong shape here. */}
-                <p className="text-xs uppercase tracking-wide opacity-50">Guests you invited</p>
-                {guestList.items.map(g => (
-                  <div
-                    key={g.guestId}
-                    className="flex items-center justify-between gap-2 py-1 text-sm"
-                  >
-                    <span className={g.disabled ? 'opacity-50 line-through' : undefined}>
-                      {g.email || g.guestId}
-                      {g.disabled && (
-                        <span className="ml-2 text-xs opacity-70 no-underline">
-                          disabled by an administrator
-                        </span>
-                      )}
-                    </span>
-                    <span className="flex items-center gap-2">
-                      {/* Resend is the SAME call as the first invite: the
-                          address resolves to the same guest record and a
-                          fresh single-use link is minted. It is the only
-                          recovery path for a lost or expired invitation,
-                          because the secret is never stored. Not offered
-                          for a disabled guest — that record is an
-                          administrator's decision. */}
-                      {!g.disabled && (
-                        <button
-                          onClick={() => void invite(g.email, false)}
-                          className="text-xs transition-opacity hover:opacity-70 text-faint"
-                          disabled={saving || !g.email}
-                          aria-label={`Resend invitation to ${g.email || g.guestId}`}
-                        >
-                          Resend
-                        </button>
-                      )}
-                      <button
-                        onClick={() => void revokeGuest(g.guestId, g.email || g.guestId)}
-                        className="transition-opacity hover:opacity-70 text-faint"
-                        disabled={saving}
-                        aria-label={`Revoke access for ${g.email || g.guestId}`}
-                      >
-                        <X className="h-4 w-4" />
-                      </button>
-                    </span>
-                  </div>
-                ))}
-              </>
-            ))}
+          {shareList.kind === 'error' && (
+            // NOT "nobody has been shared with" — the read failed, and the
+            // grants it could not read are still live.
+            <p className="text-sm text-amber-600 dark:text-amber-400">{shareList.message}</p>
+          )}
+
+          {shareList.kind === 'ok' && (
+            <>
+              {/* Scoped, and says so — the header explains why an unlabelled
+                  list would be the wrong shape on this screen. */}
+              {shareList.grants.length === 0 ? (
+                <p className="text-sm opacity-60">
+                  You haven&rsquo;t shared this app with an account yourself.
+                </p>
+              ) : (
+                <>
+                  <p className="text-xs uppercase tracking-wide opacity-50">Shared by you</p>
+                  {shareList.grants.map(g => (
+                    <AccountGrantRow
+                      key={g.userId}
+                      grant={g}
+                      disabled={saving}
+                      onRevoke={(userId, label) => void revokeGrant(userId, label)}
+                    />
+                  ))}
+                </>
+              )}
+
+              {shareList.guests.length === 0 ? (
+                <p className="pt-2 text-sm opacity-60">
+                  You haven&rsquo;t invited anyone by email to this app yet.
+                </p>
+              ) : (
+                <div className="space-y-1 pt-3">
+                  <p className="text-xs uppercase tracking-wide opacity-50">Guests you invited</p>
+                  {shareList.guests.map(g => (
+                    <GuestGrantRow
+                      key={g.guestId}
+                      guest={g}
+                      disabled={saving}
+                      onResend={email => void invite(email, false)}
+                      onRevoke={(guestId, label) => void revokeGuest(guestId, label)}
+                    />
+                  ))}
+                </div>
+              )}
+            </>
+          )}
 
           {/* Ids from `GET /access`, which returns the WHOLE guest list —
               so an admin is told that guests they cannot list can open this
@@ -695,91 +850,88 @@ function AccessTab({ appName }: { appName: string }) {
         </div>
 
         {inviteLink && (
-          <div className="mt-3 rounded border px-3 py-2 text-sm border-line">
-            <p className="font-medium">No email was sent</p>
-            <p className="mt-1 text-xs opacity-70">
-              This platform has no outgoing mail configured, so you need to send{' '}
-              {inviteLink.email} this link yourself. It can only be used once, and it will not
-              be shown again.
-            </p>
-            <div className="mt-2 flex items-center gap-2">
-              <Input
-                type="text"
-                readOnly
-                value={inviteLink.url}
-                onFocus={e => e.target.select()}
-              />
-              <Button
-                onClick={() => {
-                  // Never claim "copied" without checking. A dashboard on
-                  // plain HTTP — the same dev/LAN box that, having no
-                  // relay, is the only kind that ever sees this link —
-                  // has no `navigator.clipboard` at all, and the admin
-                  // would go and paste whatever was there before. The
-                  // secret is not recoverable.
-                  const copying = navigator.clipboard?.writeText(inviteLink.url);
-                  if (!copying) {
-                    setInviteBanner({
-                      kind: 'error',
-                      text: 'This browser will not let the page copy for you — select the link and press Ctrl-C.',
-                    });
-                    return;
-                  }
-                  void copying.then(
-                    () => setInviteBanner({ kind: 'ok', text: 'Invitation link copied.' }),
-                    () =>
-                      setInviteBanner({
-                        kind: 'error',
-                        text: 'Could not copy — select the link and press Ctrl-C.',
-                      })
-                  );
-                }}
-              >
-                Copy
-              </Button>
-              <Button variant="ghost" onClick={() => setInviteLink(null)}>
-                Dismiss
-              </Button>
-            </div>
-          </div>
+          <InviteLinkPanel
+            email={inviteLink.email}
+            url={inviteLink.url}
+            onResult={setShareBanner}
+            onDismiss={() => setInviteLink(null)}
+          />
         )}
 
-        {/* Only the FORM is replaced when a platform toggle refuses. */}
-        {inviteBlockedBy ? (
+        {/* Only the FORMS are replaced when a platform toggle refuses — and
+            `app-sharing` takes BOTH of them, because every `/share` route is
+            behind it. `guest-invites` takes only the email one. */}
+        {inviteBlockedBy === 'sharing' ? (
           <p className="mt-4 border-t pt-4 text-sm opacity-70">
-            {inviteBlockedBy === 'guests'
-              ? 'Guest invitations are switched off for this platform. Turn on “Let owners invite guests by email” under Settings → Platform.'
-              : 'Owner-initiated sharing is switched off for this platform, and invitations go through the same route. Turning on “Let owners share their apps” under Settings → Platform re-enables it — that also lets every app owner share their own apps.'}
+            Owner-initiated sharing is switched off for this platform, and both sharing and
+            invitations go through the same route. Turning on “Let owners share their apps” under
+            Settings → Platform re-enables them — that also lets every app owner share their own
+            apps. Access can still be granted from the allow-list above.
           </p>
         ) : (
           <>
             <div className="mt-4 flex flex-wrap items-end gap-3 border-t pt-4">
               <label className="text-sm">
-                <span className="opacity-60">Email address</span>
+                <span className="opacity-60">Username</span>
                 <Input
-                  type="email"
-                  value={guestEmail}
-                  onChange={e => setGuestEmail(e.target.value)}
-                  placeholder="someone@example.com"
+                  type="text"
+                  value={username}
+                  onChange={e => setUsername(e.target.value)}
+                  placeholder="teammate"
                   disabled={saving || !view.enforceable}
                 />
               </label>
               <Button
-                onClick={handleInvite}
-                disabled={saving || !view.enforceable || !guestEmail.trim()}
+                onClick={handleGrant}
+                disabled={saving || !view.enforceable || !username.trim()}
               >
-                Invite
+                Share
               </Button>
             </div>
 
             <p className="mt-2 text-xs opacity-60">
-              Re-entering an address that has already been invited sends a fresh invitation — that
-              is the only way to replace a lost or expired one, because the link is never stored.
+              Sharing also ticks that person in the list above. Administrators and this app&rsquo;s
+              owner cannot be shared with — they can open it already.
             </p>
+
+            {inviteBlockedBy === 'guests' ? (
+              <p className="mt-4 border-t pt-4 text-sm opacity-70">
+                Guest invitations are switched off for this platform. Turn on “Let owners invite
+                guests by email” under Settings → Platform.
+              </p>
+            ) : (
+              <>
+                <div className="mt-3 flex flex-wrap items-end gap-3">
+                  <label className="text-sm">
+                    <span className="opacity-60">Or invite by email</span>
+                    <Input
+                      type="email"
+                      value={guestEmail}
+                      onChange={e => setGuestEmail(e.target.value)}
+                      placeholder="someone@example.com"
+                      disabled={saving || !view.enforceable}
+                    />
+                  </label>
+                  <Button
+                    onClick={handleInvite}
+                    disabled={saving || !view.enforceable || !guestEmail.trim()}
+                  >
+                    Invite
+                  </Button>
+                </div>
+
+                <p className="mt-2 text-xs opacity-60">
+                  Re-entering an address that has already been invited sends a fresh invitation —
+                  that is the only way to replace a lost or expired one, because the link is never
+                  stored.
+                </p>
+              </>
+            )}
 
             {!view.enforceable && (
               <p className="mt-2 text-xs opacity-60">
-                Invitations are unavailable while this platform cannot enforce a gate here.
+                Sharing and invitations are unavailable while this platform cannot enforce a gate
+                here.
               </p>
             )}
           </>

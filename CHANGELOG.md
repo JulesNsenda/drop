@@ -50,6 +50,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   switched off, matching the API's own rule that disabling a feature must not
   remove the lever for taking access away.
 
+- **Sharing an app with a DROP account, on the admin Access tab.** The same gap
+  as the invitations above, one control over: an admin could already grant
+  access from the allow-list, but the share control — the one that records who
+  granted it and can be taken back one entry at a time — lived only on the
+  owner's panel, which an admin never sees. The tab now shares by username
+  beside the invite field, lists the shares you made with Revoke, and reads both
+  lists from a request it was already making. A share also ticks that person in
+  the allow-list above, so the next “Update gate” cannot silently revoke the
+  person you just shared with. The pieces both panels genuinely had in common —
+  the platform-toggle refusal codes, the once-only invitation link and the grant
+  rows — now live in one place instead of two copies that were already one
+  refusal code apart.
+
 ### Fixed
 
 - **The SQL console's refusal pointed at a Settings page that did not exist.**
