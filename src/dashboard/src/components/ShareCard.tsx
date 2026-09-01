@@ -1,9 +1,18 @@
 import { useCallback, useEffect, useState } from 'react';
-import { AlertTriangle, Lock, ShieldCheck, ShieldOff, X } from 'lucide-react';
+import { AlertTriangle, Lock, ShieldCheck, ShieldOff } from 'lucide-react';
 import { apiJsonWithStatus, jsonBody } from '../api/client';
 import Card from './ui/Card';
 import Button from './ui/Button';
 import Input from './ui/Input';
+import InviteLinkPanel from './InviteLinkPanel';
+import { AccountGrantRow, GuestGrantRow } from './ShareGrantRows';
+import {
+  gateNotReappliedText,
+  inviteSecretUrl,
+  shareRefusal,
+  type OwnGrant,
+  type ShareView,
+} from '../lib/app-share';
 
 /**
  * Owner-facing app sharing (DROP-153).
@@ -42,34 +51,6 @@ import Input from './ui/Input';
  * only once they try to submit.
  */
 
-interface OwnGrant {
-  userId: string;
-  username?: string;
-}
-
-/**
- * A guest the CALLER invited (DROP-155). Someone else's invitee is a number in
- * `othersGrantedCount`, never a row here — the same rule that hides another
- * person's account grants, applied to the second list.
- */
-interface OwnGuest {
-  guestId: string;
-  /** Empty when the grant is stale — a policy entry whose record the boot sweep has not reaped yet. */
-  email: string;
-  disabled: boolean;
-}
-
-interface ShareView {
-  policyPresent: boolean;
-  enforced: boolean;
-  ownGrants: OwnGrant[];
-  ownGuests: OwnGuest[];
-  othersGrantedCount: number;
-  gateApplied: boolean | null;
-  enforceable: boolean;
-  blockers: string[];
-}
-
 /**
  * Owner-safe wording for each `AccessGateBlocker` code (see
  * `src/managers/guardrail/access-gate.ts`). Deliberately shorter and less
@@ -104,9 +85,8 @@ function blockerCopy(code: string): string {
  * first-run panel `load` shows rather than a red banner the owner keeps
  * retrying against.
  */
-function isSharingDisabled(res: { status: number; error?: { details?: unknown } }): boolean {
-  const reason = (res.error as { details?: { reason?: string } } | undefined)?.details?.reason;
-  return res.status === 403 && reason === 'sharing_disabled';
+function isSharingDisabled(res: { status: number; error?: unknown }): boolean {
+  return shareRefusal(res) === 'sharing';
 }
 
 function ShareCard({ appName }: { appName: string }) {
@@ -142,16 +122,7 @@ function ShareCard({ appName }: { appName: string }) {
     void load();
   }, [load]);
 
-  /**
-   * The invitation link, shown ONLY when the server says the mail was never
-   * sent — which means no SMTP relay is configured on this platform.
-   *
-   * Not a convenience: without it an operator with no relay cannot invite
-   * anyone at all, because the secret exists in plaintext exactly once, in the
-   * response to the request that created it. The owner authored this
-   * invitation seconds ago and is the one person entitled to the link, which is
-   * the same once-only disclosure a freshly minted API key already gets.
-   */
+  /** The once-only invitation link — see `InviteLinkPanel` for why it is shown at all. */
   const [inviteLink, setInviteLink] = useState<{ email: string; url: string } | null>(null);
   const [guestEmail, setGuestEmail] = useState('');
   /** Set when the platform refuses the `{ email }` branch, so the field stops offering it. */
@@ -199,7 +170,7 @@ function ShareCard({ appName }: { appName: string }) {
     // the lie the `gateApplied` signal exists to prevent.
     setBanner(
       res.data?.applyError
-        ? { kind: 'error', text: `Shared, but the gate was not re-applied: ${res.data.applyError}` }
+        ? { kind: 'error', text: gateNotReappliedText('Shared', res.data.applyError) }
         : { kind: 'ok', text: res.data?.message || `Shared with ${targetUsername}.` }
     );
     await load();
@@ -240,7 +211,7 @@ function ShareCard({ appName }: { appName: string }) {
       !res.success
         ? { kind: 'error', text: res.error?.message || 'Could not revoke access.' }
         : res.data?.applyError
-          ? { kind: 'error', text: `Revoked, but the gate was not re-applied: ${res.data.applyError}` }
+          ? { kind: 'error', text: gateNotReappliedText('Revoked', res.data.applyError) }
           : { kind: 'ok', text: res.data?.message || 'Access revoked.' }
     );
     await load();
@@ -281,11 +252,9 @@ function ShareCard({ appName }: { appName: string }) {
     setGuestEmail('');
 
     // Mail was never sent, so the owner has to deliver this themselves or
-    // nothing happens. `mailSent === false` rather than "a url came back":
-    // the server makes the two equivalent, and asserting it here means a
-    // response that ever carried both would withhold the secret instead of
-    // publishing a link to an invitation that WAS delivered.
-    const url = res.data?.mailSent === false ? res.data?.inviteUrl : undefined;
+    // nothing happens (see `inviteSecretUrl` for why this is not simply "a url
+    // came back").
+    const url = inviteSecretUrl(res.data);
 
     // ADDITIVE, never an either/or. `applyError` fires on the write that
     // creates the policy and `inviteUrl` comes back when no mail was dialed —
@@ -294,7 +263,7 @@ function ShareCard({ appName }: { appName: string }) {
     // so it is unrecoverable) while telling the owner the person was invited.
     if (url) setInviteLink({ email, url });
     if (res.data?.applyError) {
-      setBanner({ kind: 'error', text: `Invited, but the gate was not re-applied: ${res.data.applyError}` });
+      setBanner({ kind: 'error', text: gateNotReappliedText('Invited', res.data.applyError) });
     } else if (url) {
       setBanner(null);
     } else {
@@ -339,7 +308,7 @@ function ShareCard({ appName }: { appName: string }) {
       !res.success
         ? { kind: 'error', text: res.error?.message || 'Could not revoke access.' }
         : res.data?.applyError
-          ? { kind: 'error', text: `Revoked, but the gate was not re-applied: ${res.data.applyError}` }
+          ? { kind: 'error', text: gateNotReappliedText('Revoked', res.data.applyError) }
           : { kind: 'ok', text: res.data?.message || 'Access revoked.' }
     );
     await load();
@@ -461,17 +430,12 @@ function ShareCard({ appName }: { appName: string }) {
             <p className="text-sm opacity-60">You haven&rsquo;t shared this app with anyone yet.</p>
           ) : (
             view.ownGrants.map(g => (
-              <div key={g.userId} className="flex items-center justify-between gap-2 py-1 text-sm">
-                <span>{g.username ?? g.userId}</span>
-                <button
-                  onClick={() => void revoke(g.userId, g.username ?? g.userId)}
-                  className="transition-opacity hover:opacity-70 text-faint"
-                  disabled={saving}
-                  aria-label={`Revoke access for ${g.username ?? g.userId}`}
-                >
-                  <X className="h-4 w-4" />
-                </button>
-              </div>
+              <AccountGrantRow
+                key={g.userId}
+                grant={g}
+                disabled={saving}
+                onRevoke={(userId, label) => void revoke(userId, label)}
+              />
             ))
           )}
         </div>
@@ -480,86 +444,19 @@ function ShareCard({ appName }: { appName: string }) {
           <div className="mt-4 space-y-1 border-t pt-4">
             <p className="text-xs uppercase tracking-wide opacity-50">Invited by email</p>
             {view.ownGuests.map(g => (
-              <div key={g.guestId} className="flex items-center justify-between gap-2 py-1 text-sm">
-                <span className={g.disabled ? 'opacity-50 line-through' : undefined}>
-                  {g.email || g.guestId}
-                  {g.disabled && (
-                    <span className="ml-2 text-xs opacity-70 no-underline">
-                      disabled by an administrator
-                    </span>
-                  )}
-                </span>
-                <span className="flex items-center gap-2">
-                  {/* Resend is the SAME call as the first invite: the address
-                      resolves to the same guest record, and a fresh
-                      single-use link is minted. It is the only recovery path
-                      for a lost or expired invitation, because the secret is
-                      never stored. Not offered for a disabled guest — that
-                      record is an administrator's decision. */}
-                  {!g.disabled && (
-                    <button
-                      onClick={() => void invite(g.email, false)}
-                      className="text-xs transition-opacity hover:opacity-70 text-faint"
-                      disabled={saving || !g.email}
-                      aria-label={`Resend invitation to ${g.email || g.guestId}`}
-                    >
-                      Resend
-                    </button>
-                  )}
-                  <button
-                    onClick={() => void revokeGuest(g.guestId, g.email || g.guestId)}
-                    className="transition-opacity hover:opacity-70 text-faint"
-                    disabled={saving}
-                    aria-label={`Revoke access for ${g.email || g.guestId}`}
-                  >
-                    <X className="h-4 w-4" />
-                  </button>
-                </span>
-              </div>
+              <GuestGrantRow
+                key={g.guestId}
+                guest={g}
+                disabled={saving}
+                onResend={email => void invite(email, false)}
+                onRevoke={(guestId, label) => void revokeGuest(guestId, label)}
+              />
             ))}
           </div>
         )}
 
         {inviteLink && (
-          <div className="mt-4 rounded border px-3 py-2 text-sm border-line">
-            <p className="font-medium">No email was sent</p>
-            <p className="mt-1 text-xs opacity-70">
-              This platform has no outgoing mail configured, so you need to send{' '}
-              {inviteLink.email} this link yourself. It can only be used once, and it will not be
-              shown again.
-            </p>
-            <div className="mt-2 flex items-center gap-2">
-              <Input type="text" readOnly value={inviteLink.url} onFocus={e => e.target.select()} />
-              <Button
-                onClick={() => {
-                  // Never claim "copied" without checking. A dashboard on
-                  // plain HTTP — the same relay-less box that is the only
-                  // kind to ever see this link — has no
-                  // `navigator.clipboard` at all, and the owner would go and
-                  // paste whatever was there before. The secret is not
-                  // recoverable.
-                  const copying = navigator.clipboard?.writeText(inviteLink.url);
-                  if (!copying) {
-                    setBanner({
-                      kind: 'error',
-                      text: 'This browser will not let the page copy for you — select the link and press Ctrl-C.',
-                    });
-                    return;
-                  }
-                  void copying.then(
-                    () => setBanner({ kind: 'ok', text: 'Invitation link copied.' }),
-                    () =>
-                      setBanner({
-                        kind: 'error',
-                        text: 'Could not copy — select the link and press Ctrl-C.',
-                      })
-                  );
-                }}
-              >
-                Copy
-              </Button>
-            </div>
-          </div>
+          <InviteLinkPanel email={inviteLink.email} url={inviteLink.url} onResult={setBanner} />
         )}
 
         <div className="mt-4 flex flex-wrap items-end gap-3 border-t pt-4">
