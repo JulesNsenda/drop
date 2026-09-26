@@ -27,6 +27,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Zero-downtime is the default for apps that declare a `healthCheck` (#298).**
+  An app whose `drop.yaml` sets `healthCheck` and no `deploy.strategy` is now
+  built into release directories and redeployed, rolled back and promoted
+  through the zero-downtime cutover — its declared path is what the cutover's
+  readiness gate probes. Every other app is unchanged. Opt a single app out
+  with `deploy: { strategy: in-place }`, or turn the default off for the whole
+  platform with `DROP_ZERO_DOWNTIME_DEFAULT=false` (explicit opt-ins still
+  apply). Monorepo children stay in place: their generated `drop.yaml` now
+  says so explicitly. An existing app moves over on its next deploy; its first
+  zero-downtime redeploy still has to prove the new version answers
+  `healthCheck` below HTTP 500, or the deploy fails as `READINESS_FAILED` and
+  the old version keeps serving.
+
 ### Added
 
 - **Rollback and promotion without downtime (#298, opt-in).** For an app on

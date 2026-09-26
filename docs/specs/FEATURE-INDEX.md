@@ -71,7 +71,7 @@ something is listed here it exists in the shipped code. Planned work lives in
 | Roles | `readonly` / `user` / `admin`, with per-route enforcement |
 | Multi-user | Per-user app ownership and limits; invitation-based signup |
 | Scoped agent tokens | Least-privilege keys scoped to named capabilities, never full admin |
-| Zero-downtime redeploys (opt-in) | `drop.yaml` `deploy: { strategy: zero-downtime }`: each deploy builds into `data/releases/<app>/<id>/`, starts beside the old instance on a second port, must answer HTTP < 500, then Caddy switches and the old instance is drained and removed; a failed new version leaves the old one serving (`READINESS_FAILED`) |
+| Zero-downtime redeploys | On by default for an app that declares a `healthCheck` (opt out: `deploy: { strategy: in-place }`, or `DROP_ZERO_DOWNTIME_DEFAULT=false` platform-wide); opt in explicitly with `deploy: { strategy: zero-downtime }`. Each deploy builds into `data/releases/<app>/<id>/`, starts beside the old instance on a second port, must answer HTTP < 500, then Caddy switches and the old instance is drained and removed; a failed new version leaves the old one serving (`READINESS_FAILED`) |
 | Per-app rollback | `POST /api/v1/apps/:name/rollback` goes back to what served before the last deploy, without rebuilding: a zero-downtime app cuts over to its previous release; any other app gets the last-good tree captured before an upload/git redeploy and restarts; code only, never the database |
 | Deploy guardrails | Circuit breaker on failing deploy loops, per-principal quotas, ephemeral TTL'd apps, idle reaping, disk ceilings; the caller's own headroom is readable up front via `GET /api/v1/limits` |
 | Rate limiting | Stricter buckets on credential-minting and expensive endpoints |

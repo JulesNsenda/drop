@@ -13,8 +13,13 @@
  * build output underneath the process that is serving. With a release per
  * deploy, the previous release is not touched until the new one is running.
  *
- * Opt-in (maintainer decision): apps without `deploy.strategy: zero-downtime`
- * keep the in-place behaviour exactly.
+ * WHO (#298 step 7). An explicit `deploy.strategy` always wins. Without one,
+ * an app that declares a `healthCheck` is on `zero-downtime` — the declared
+ * path is what the cutover's readiness gate probes, so those apps are the ones
+ * it can gate reliably — and every other app stays `in-place`, exactly as
+ * before. `DROP_ZERO_DOWNTIME_DEFAULT=false` turns the default off platform-wide
+ * (explicit opt-ins still apply). Monorepo children are written an explicit
+ * `in-place` by the platform, so the default never reaches them.
  *
  * CONTAINMENT. A release path becomes the runtime's working directory, so every
  * path this module hands back — and every path read back from config before
@@ -26,6 +31,7 @@ import * as fs from 'fs/promises';
 import * as path from 'path';
 import { isValidAppName } from '../../api/middleware/validate';
 import { parseDropYaml } from '../../core/detector/drop-yaml-parser';
+import type { DeployStrategy, DropYamlConfig } from '../../core/detector/drop-yaml-parser';
 
 /**
  * Not copied from the source into a release: VCS metadata, and dependency
@@ -116,11 +122,31 @@ export class ReleaseStore {
   }
 }
 
-/** Whether the app's drop.yaml opts it into release directories. Never throws. */
+/**
+ * Whether the platform applies the zero-downtime default to apps that declare a
+ * `healthCheck` and no strategy. On unless `DROP_ZERO_DOWNTIME_DEFAULT` is
+ * `false`/`0`/`off`/`no` — an operator's escape hatch, not a per-app setting.
+ */
+export function zeroDowntimeByDefault(env: NodeJS.ProcessEnv = process.env): boolean {
+  const raw = env.DROP_ZERO_DOWNTIME_DEFAULT?.trim().toLowerCase();
+  return !(raw === 'false' || raw === '0' || raw === 'off' || raw === 'no');
+}
+
+/** The strategy a deploy of this manifest uses. See the file header, "WHO". */
+export function effectiveDeployStrategy(
+  config: DropYamlConfig | null | undefined,
+  env: NodeJS.ProcessEnv = process.env
+): DeployStrategy {
+  const declared = config?.deploy?.strategy;
+  if (declared) return declared;
+  return config?.healthCheck && zeroDowntimeByDefault(env) ? 'zero-downtime' : 'in-place';
+}
+
+/** Whether a deploy of the app at `sourcePath` builds into a release directory. Never throws. */
 export async function wantsReleases(sourcePath: string): Promise<boolean> {
   try {
     const parsed = await parseDropYaml(sourcePath);
-    return parsed.success && parsed.config?.deploy?.strategy === 'zero-downtime';
+    return parsed.success && effectiveDeployStrategy(parsed.config) === 'zero-downtime';
   } catch {
     return false;
   }

@@ -1,1 +1,1 @@
-export { ReleaseStore, wantsReleases } from './release-store';
+export { ReleaseStore, wantsReleases, effectiveDeployStrategy, zeroDowntimeByDefault } from './release-store';
