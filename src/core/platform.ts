@@ -1915,6 +1915,14 @@ backup:
     // Initialize the app runtime — docker when isolation=docker, PM2 otherwise.
     this.runtime = getAppRuntime(this.config.isolation === 'docker' ? 'docker' : 'pm2');
 
+    // The live runtime slot of each app (#298 step 4). Adapters default every
+    // app to slot `a`; only an app whose current release records slot `b` —
+    // after a zero-downtime cutover — needs telling, and must be told before
+    // anything below asks the runtime about it by name.
+    for (const cfg of this.appConfigService.getAllConfigs()) {
+      if (cfg.currentRelease?.instance === 'b') this.runtime.setLiveInstance(cfg.name, 'b');
+    }
+
     // Load used ports from existing PM2 processes
     await this.loadUsedPorts();
 

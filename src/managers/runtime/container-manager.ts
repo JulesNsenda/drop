@@ -28,6 +28,7 @@ import {
   AppRuntimeState,
   AppStartSpec,
 } from './app-runtime.types';
+import { LiveInstances, InstanceSlot, appNameOfInstance } from './instance';
 import { eventBus } from '../../core/event-bus';
 import {
   DROP_NETWORK,
@@ -220,6 +221,20 @@ export class ContainerManager implements AppRuntime {
   private readonly logTailers: Map<string, () => void> = new Map();
   /** Per-app log file paths, populated in start() and returned by getLogPaths(). */
   private readonly logPaths: Map<string, AppLogPaths> = new Map();
+  /**
+   * App name → live slot (#298). Containers are `drop-<instance>`, and
+   * `logPaths`/`logTailers` are keyed by INSTANCE, so two instances of one app
+   * never overwrite each other's bookkeeping.
+   */
+  private readonly live = new LiveInstances();
+
+  setLiveInstance(appName: string, slot: InstanceSlot): void {
+    this.live.set(appName, slot);
+  }
+
+  getLiveInstance(appName: string): InstanceSlot {
+    return this.live.slotOf(appName);
+  }
 
   constructor(docker?: Docker) {
     this.docker = docker ?? new Docker();
@@ -242,7 +257,8 @@ export class ContainerManager implements AppRuntime {
     // pinned subnet — an in-place upgrade keeps its legacy subnet and still works.
     const hostGatewayIp = await this.resolveHostGatewayIp();
 
-    const name = containerName(spec.name);
+    const instance = spec.instance ?? spec.name;
+    const name = containerName(instance);
     const appName = spec.name;
 
     // Remove a previous container with the same name (stopped or errored).
@@ -334,6 +350,7 @@ export class ContainerManager implements AppRuntime {
       Labels: {
         [MANAGED_LABEL]: 'true',
         'drop.app': appName,
+        'drop.instance': instance,
       },
       ...(healthcheck ? { Healthcheck: healthcheck } : {}),
       HostConfig: {
@@ -382,17 +399,17 @@ export class ContainerManager implements AppRuntime {
 
     // Remember the log paths so getLogPaths() can return them without guessing.
     if (spec.outFile || spec.errorFile) {
-      this.logPaths.set(appName, { out: spec.outFile, err: spec.errorFile });
+      this.logPaths.set(instance, { out: spec.outFile, err: spec.errorFile });
     }
 
     // Wire container stdout/stderr → DROP log files (best-effort).
     if (spec.outFile || spec.errorFile) {
-      this.startLogTailer(appName, container, spec.outFile, spec.errorFile).catch(() => {
+      this.startLogTailer(instance, container, spec.outFile, spec.errorFile).catch(() => {
         // Log tailer failure is non-fatal; the app is already running.
       });
     }
 
-    const info = this.inspectToInfo(appName, await container.inspect());
+    const info = { ...this.inspectToInfo(appName, await container.inspect()), instance };
 
     // Publish the lifecycle event the router (handleConfigureRoute) and webhooks
     // subscribe to. The PM2 runtime emits this from ProcessManager; the container
@@ -410,8 +427,9 @@ export class ContainerManager implements AppRuntime {
   }
 
   async stop(name: string): Promise<void> {
-    this.stopLogTailer(name);
-    const container = this.docker.getContainer(containerName(name));
+    const instance = this.live.resolve(name);
+    this.stopLogTailer(instance);
+    const container = this.docker.getContainer(containerName(instance));
     try {
       await container.stop({ t: 10 });
     } catch (err: unknown) {
@@ -420,15 +438,20 @@ export class ContainerManager implements AppRuntime {
   }
 
   async restart(name: string): Promise<AppProcessInfo> {
-    this.stopLogTailer(name);
-    const container = this.docker.getContainer(containerName(name));
+    const instance = this.live.resolve(name);
+    this.stopLogTailer(instance);
+    const container = this.docker.getContainer(containerName(instance));
     await container.restart({ t: 10 });
-    return this.inspectToInfo(name, await container.inspect());
+    return {
+      ...this.inspectToInfo(appNameOfInstance(instance), await container.inspect()),
+      instance,
+    };
   }
 
   async delete(name: string): Promise<void> {
-    this.stopLogTailer(name);
-    const container = this.docker.getContainer(containerName(name));
+    const instance = this.live.resolve(name);
+    this.stopLogTailer(instance);
+    const container = this.docker.getContainer(containerName(instance));
     try {
       await container.stop({ t: 5 });
     } catch {
@@ -445,9 +468,10 @@ export class ContainerManager implements AppRuntime {
 
   async getStatus(name: string): Promise<AppProcessInfo | null> {
     try {
-      const container = this.docker.getContainer(containerName(name));
+      const instance = this.live.resolve(name);
+      const container = this.docker.getContainer(containerName(instance));
       const info = await container.inspect();
-      const base = this.inspectToInfo(name, info);
+      const base = { ...this.inspectToInfo(appNameOfInstance(instance), info), instance };
       if (base.status === 'running') {
         const stats = await this.fetchContainerStats(container);
         return { ...base, ...stats };
@@ -491,10 +515,15 @@ export class ContainerManager implements AppRuntime {
     // disappearing between list and inspect can't drop the rest.
     const results = await Promise.all(
       containers.map(async (c) => {
-        const appName = c.Labels?.['drop.app'] ?? appNameFromContainer(c.Names?.[0] ?? '');
+        const instance =
+          c.Labels?.['drop.instance'] ?? appNameFromContainer(c.Names?.[0] ?? '');
+        const appName = c.Labels?.['drop.app'] ?? appNameOfInstance(instance);
         try {
           const container = this.docker.getContainer(c.Id);
-          const base = this.inspectToInfo(appName, await container.inspect());
+          const base: AppProcessInfo = {
+            ...this.inspectToInfo(appName, await container.inspect()),
+            instance,
+          };
           if (base.status !== 'running') return base;
           return { ...base, ...(await this.fetchContainerStats(container)) };
         } catch {
@@ -526,8 +555,9 @@ export class ContainerManager implements AppRuntime {
    * became permanently unreachable.
    */
   async getLogs(name: string, lines = 100): Promise<string> {
+    const instance = this.live.resolve(name);
     try {
-      const container = this.docker.getContainer(containerName(name));
+      const container = this.docker.getContainer(containerName(instance));
       const logStream = await container.logs({
         stdout: true,
         stderr: true,
@@ -540,7 +570,7 @@ export class ContainerManager implements AppRuntime {
       const raw = logStream as unknown;
       return demuxDockerLogs(Buffer.isBuffer(raw) ? raw : Buffer.from(String(raw)));
     } catch (err: unknown) {
-      if (this.isNotFound(err)) return this.readCapturedLogs(name, lines);
+      if (this.isNotFound(err)) return this.readCapturedLogs(instance, lines);
       throw err;
     }
   }
@@ -585,7 +615,7 @@ export class ContainerManager implements AppRuntime {
     onLine: (line: string, type: 'out' | 'err') => void,
     onError?: (error: Error) => void
   ): Promise<() => void> {
-    const container = this.docker.getContainer(containerName(name));
+    const container = this.docker.getContainer(containerName(this.live.resolve(name)));
     const stream = await container.logs({
       stdout: true,
       stderr: true,
@@ -624,7 +654,7 @@ export class ContainerManager implements AppRuntime {
     // Return paths stored when start() was called.  Callers (e.g. the logs API)
     // may read these before any log data arrives; returns an empty object on the
     // first call before start() has run for this app (e.g. after a crash/restart).
-    return this.logPaths.get(name) ?? {};
+    return this.logPaths.get(this.live.resolve(name)) ?? {};
   }
 
   disconnect(): void {

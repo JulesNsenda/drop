@@ -494,6 +494,12 @@ export interface AppRelease {
   id: string;
   path: string;
   createdAt: string;
+  /**
+   * Which runtime slot runs this release (#298 step 4). Absent means slot `a`,
+   * the bare app name. Re-applied to the runtime at boot, so the live slot
+   * survives a platform restart.
+   */
+  instance?: 'a' | 'b';
 }
 
 /**
