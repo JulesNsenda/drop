@@ -34,6 +34,7 @@
 
 import type { DeployErrorCode } from '../../managers/deploy-tracker';
 import type { BuildStage } from '../../core/builder/builder.types';
+import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 
 export type DeployResultStatus =
   | 'succeeded'
@@ -48,6 +49,7 @@ export type DeployNextAction =
   | 'get_deploy_logs'
   | 'app_logs'
   | 'app_status'
+  | 'verify_deployment'
   | 'restart_app'
   | 'list_apps';
 
@@ -77,6 +79,12 @@ export interface DeployResult {
   output_tail?: string;
   url?: string;
   next_actions?: DeployNextAction[];
+  /**
+   * Seconds until a refused deploy may be retried. Set only on a pre-admission
+   * refusal (`refusalResult`), where it is the whole point: the right next move
+   * is machine-decidable, so it must not have to be parsed out of prose.
+   */
+  retry_after_seconds?: number;
 }
 
 /** Failing stage -> command kind. Total, so a new stage is a compile error. */
@@ -138,6 +146,40 @@ export function hintFor(code: DeployErrorCode): string {
   return HINTS[code] ?? HINTS.UNKNOWN;
 }
 
+/** The refusal codes: a deploy DROP declined before admitting it. Nothing was built. */
+export type DeployRefusalCode = Extract<DeployErrorCode, 'QUOTA_EXCEEDED' | 'GUARDRAIL_TRIPPED'>;
+
+/**
+ * Structured result for a deploy refused BEFORE admission — the quota or the
+ * failure breaker said no, so there is no deploy id, stage or log to report.
+ *
+ * `text` is the refusal's own message and is kept verbatim as the text content:
+ * some clients render only the text, and it already names the wait. Every
+ * structured field is DROP-generated — the code is chosen by the caller from
+ * the error CLASS, the hint is the static table, and the wait is a number the
+ * guardrail computed.
+ */
+export function refusalResult(
+  appName: string,
+  code: DeployRefusalCode,
+  retryAfterSeconds: number,
+  text: string
+): CallToolResult {
+  const structured: DeployResult = {
+    ok: false,
+    app: appName,
+    status: 'failed',
+    error_code: code,
+    hint: hintFor(code),
+    retry_after_seconds: Math.max(0, Math.ceil(retryAfterSeconds)),
+  };
+  return {
+    content: [{ type: 'text', text }],
+    structuredContent: { ...structured },
+    isError: true,
+  };
+}
+
 /**
  * What a caller should do next. Derived from the phase, never from output.
  *
@@ -147,7 +189,9 @@ export function hintFor(code: DeployErrorCode): string {
  */
 export function nextActionsFor(status: DeployResultStatus, phase?: 'build' | 'boot'): DeployNextAction[] {
   if (status === 'succeeded') return [];
-  if (status === 'succeeded_unverified') return ['app_status', 'app_logs'];
+  // verify_deployment first: it answers the exact question the status leaves
+  // open ("does it serve now?"); app_logs is for when the answer is no.
+  if (status === 'succeeded_unverified') return ['verify_deployment', 'app_logs'];
   // get_deploy_logs FIRST for any failure: it returns the output of THIS
   // deploy, where app_logs returns whatever the app is doing now — which for a
   // failed deploy is usually nothing, and for a build failure is structurally

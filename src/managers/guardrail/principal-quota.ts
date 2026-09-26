@@ -384,6 +384,20 @@ export class PrincipalQuota {
     return this.prune(key, now).length;
   }
 
+  /**
+   * Usage against a key and when its window next frees a slot, without
+   * pruning anything. For read-only reporting (GET /limits).
+   *
+   * `resetsAt` is when the OLDEST counted deploy ages out — the same instant
+   * `check` computes `retryAfterSeconds` from. Absent when nothing is counted.
+   */
+  peek(key: string, now = Date.now()): { used: number; resetsAt?: number } {
+    const cutoff = now - WINDOW_MS;
+    const kept = (this.store.deploys[key] ?? []).filter((at) => at > cutoff);
+    if (kept.length === 0) return { used: 0 };
+    return { used: kept.length, resetsAt: Math.min(...kept) + WINDOW_MS };
+  }
+
   /** Timestamps still inside the window, pruned in place. */
   private prune(key: string, now: number): number[] {
     const cutoff = now - WINDOW_MS;

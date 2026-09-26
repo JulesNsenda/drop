@@ -31,6 +31,19 @@ const ALLOWED_MCP_KEYS = new Set(['path', 'auth']);
  */
 const MCP_PATH_REGEX = /^\/[A-Za-z0-9._~/-]{0,100}$/;
 
+/**
+ * Whether `p` is a safe endpoint path on an app's own hostname: the
+ * MCP_PATH_REGEX allowlist, plus explicit rejection of traversal and empty
+ * segments (the allowlist permits '.' and '/', so "/a/../b" and "/a//b" match
+ * it on their own). No query string, no fragment, no scheme or host.
+ *
+ * Shared by drop.yaml's `mcp.path` and the MCP `verify_deployment` probe path,
+ * so a path DROP composes into a URL is held to one rule wherever it enters.
+ */
+export function isSafeEndpointPath(p: string): boolean {
+  return MCP_PATH_REGEX.test(p) && !p.includes('..') && !p.includes('//');
+}
+
 /** Keys accepted under a drop.yaml#services.<name> entry */
 const ALLOWED_SERVICE_KEYS = new Set([
   'path', 'type', 'build', 'start', 'env', 'build_env', 'secrets', 'database', 'redis',
@@ -518,13 +531,7 @@ export function validateDropYamlConfig(
       if (typeof mcp.path !== 'string') {
         return { valid: false, error: 'mcp.path must be a string' };
       }
-      // Traversal and empty segments are rejected explicitly: the allowlist
-      // permits '.' and '/', so "/a/../b" and "/a//b" match it on their own.
-      if (
-        !MCP_PATH_REGEX.test(mcp.path) ||
-        mcp.path.includes('..') ||
-        mcp.path.includes('//')
-      ) {
+      if (!isSafeEndpointPath(mcp.path)) {
         return {
           valid: false,
           error: `Invalid mcp.path '${mcp.path}': must start with '/' and contain only letters, digits, '.', '_', '~', '-' or '/'`,

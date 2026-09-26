@@ -4,9 +4,9 @@
  * `buildMcpServer(auth)` builds one McpServer instance per HTTP request
  * (stateless mode — see `transport.ts`), with the caller's `AuthContext`
  * captured by closure so every tool handler runs with the caller's identity
- * flowing through the existing `canAccess` ownership model. Seven tools:
- * `deploy_files`, `deploy_from_git`, `list_apps`, `app_status`, `app_logs`,
- * `get_deploy_logs`, `restart_app`. No `set_secrets`/`remove_app` —
+ * flowing through the existing `canAccess` ownership model. Eight tools:
+ * `deploy_files`, `deploy_from_git`, `list_apps`, `app_status`,
+ * `verify_deployment`, `app_logs`, `get_deploy_logs`, `restart_app`. No `set_secrets`/`remove_app` —
  * destructive/blast-radius tools stay off the MCP surface (PRD-040 non-goals).
  *
  * Tool errors are returned as `{ content: [...], isError: true }` results,
@@ -39,7 +39,7 @@ import {
   InsufficientDiskSpaceError,
 } from '../../core/upload-deploy';
 import { isVcsMetadataComponent } from '../../utils/upload-paths';
-import { getGitDeployService } from '../../core/git-deploy';
+import { getGitDeployService, extractRepoName } from '../../core/git-deploy';
 import { getDeployTracker } from '../../managers/deploy-tracker';
 import type { DeployEpisode } from '../../managers/deploy-tracker';
 import { getBuildLogService } from '../../managers/build-log/build-log';
@@ -52,10 +52,13 @@ import {
   commandKindForStage,
   hintFor,
   nextActionsFor,
+  refusalResult,
 } from './deploy-result';
 import { getDeployDetailStore } from '../../managers/deploy-tracker';
 import { classifyBuildFailure } from '../../core/builder/classify';
 import { computeAppUrl } from '../../utils/app-url';
+import { probeHttp } from '../../utils/http-probe';
+import { parseDropYaml, isSafeEndpointPath } from '../../core/detector/drop-yaml-parser';
 import { getPlatformVersion } from '../../utils/version';
 import { tryLogActivity } from '../../managers/activity';
 import { DeployRefusedError } from '../../managers/guardrail/deploy-breaker';
@@ -77,6 +80,8 @@ const MAX_LOG_LINES = 500;
  * memory-exhaustion lever, not just a slow response.
  */
 const MAX_RUNTIME_LOG_BYTES = 1024 * 1024;
+/** One request, bounded — verify_deployment must not become a slow-loris lever. */
+const VERIFY_TIMEOUT_MS = 3000;
 
 function toolText(text: string): CallToolResult {
   return { content: [{ type: 'text', text }] };
@@ -114,6 +119,27 @@ function getAppLimit(userId?: string): number {
     // User lookup failed — fall back to the global limit
   }
   return globalMax;
+}
+
+/**
+ * A pre-admission refusal (quota or failure breaker) as a structured result,
+ * or undefined for any other error. The same `error_code` vocabulary an
+ * admitted-then-failed deploy uses, plus `retry_after_seconds`, so an agent
+ * can wait and retry without string-matching the message. The text content is
+ * the refusal message unchanged — DROP-generated, it names the wait already.
+ */
+function deployRefusal(
+  appName: string | (() => string),
+  err: unknown
+): CallToolResult | undefined {
+  const name = (): string => (typeof appName === 'function' ? appName() : appName);
+  if (err instanceof QuotaExceededError) {
+    return refusalResult(name(), 'QUOTA_EXCEEDED', err.retryAfterSeconds, err.message);
+  }
+  if (err instanceof DeployRefusedError) {
+    return refusalResult(name(), 'GUARDRAIL_TRIPPED', err.retryAfterSeconds, err.message);
+  }
+  return undefined;
 }
 
 // ============ Deploy-episode wait + result shaping (shared by both deploy tools) ============
@@ -521,13 +547,11 @@ export async function handleDeployFiles(
     if (err instanceof UploadValidationError || err instanceof InsufficientDiskSpaceError) {
       return toolError(err.message);
     }
-    if (
-      err instanceof DeployRefusedError ||
-      err instanceof QuotaExceededError ||
-      err instanceof EphemeralQuotaError
-    ) {
-      // The message already names the wait or the limit, so an agent has
-      // something to act on rather than a bare failure it will retry at once.
+    const refusal = deployRefusal(name, err);
+    if (refusal) return refusal;
+    if (err instanceof EphemeralQuotaError) {
+      // The message already names the limit. No retry_after: the ephemeral cap
+      // frees up when an app is removed or expires, not on a clock.
       return toolError(err.message);
     }
     return toolError(
@@ -633,9 +657,15 @@ export async function handleDeployFromGit(
 
     return await waitForDeployOutcome(result.appName, acceptedAt, true);
   } catch (err) {
-    if (err instanceof DeployRefusedError || err instanceof QuotaExceededError) {
-      return toolError(err.message);
-    }
+    // `app` rides unfenced in structuredContent, so it must never be the raw
+    // `url`. A refusal is only thrown after git-deploy has validated the URL
+    // and derived the name the same way, but re-check it here rather than
+    // lean on that ordering.
+    const refusal = deployRefusal(() => {
+      const derived = args.name ?? extractRepoName(args.url);
+      return /^[\w.-]{1,128}$/.test(derived) ? derived : '';
+    }, err);
+    if (refusal) return refusal;
     const message = err instanceof Error ? err.message : 'Deploy failed';
     // message is git-derived (git-deploy.ts / git-client.ts stderr, token-sanitized
     // but never fenced) — fence once here so none of the three sibling returns below
@@ -688,10 +718,43 @@ export function handleListApps(auth: AuthContext | undefined): CallToolResult {
   return toolText(lines.join('\n'));
 }
 
-export function handleAppStatus(
+/**
+ * Live resource figures for ONE app, as `app_status` lines, or [] when there is
+ * nothing trustworthy to report.
+ *
+ * One `getStatus` call, never `getAllStatus`: under docker isolation a stats
+ * sample costs about a second per container (see `countManaged` in
+ * app-runtime.ts), which is acceptable for one app on an explicit request and
+ * not for a fleet.
+ *
+ * ABSENT, never zero, when the runtime cannot answer. The docker adapter
+ * degrades to {cpu: 0, memory: 0} on a throwing stats call, and an agent told
+ * "cpu_percent: 0" would reasonably conclude the app is idle. Memory is the
+ * discriminator, as in GET /apps: a live process is never legitimately at 0
+ * bytes. That also hides a PM2 process whose monitor has not sampled yet —
+ * for an agent, "not measured yet" and "absent" mean the same thing, which is
+ * not true of the dashboard's Metrics tab (see the note in GET /apps/:name).
+ */
+async function resourceLines(appName: string): Promise<string[]> {
+  let info;
+  try {
+    info = await getAppRuntime().getStatus(appName);
+  } catch {
+    return [];
+  }
+  if (!info || !(info.memory > 0)) return [];
+  return [
+    `memory_mb: ${(info.memory / (1024 * 1024)).toFixed(1)}`,
+    `cpu_percent: ${Number.isFinite(info.cpu) ? info.cpu.toFixed(1) : 'n/a'}`,
+    `uptime_seconds: ${Math.max(0, Math.floor(info.uptime / 1000))}`,
+    `restarts: ${info.restarts}`,
+  ];
+}
+
+export async function handleAppStatus(
   auth: AuthContext | undefined,
   args: { name: string }
-): CallToolResult {
+): Promise<CallToolResult> {
   const app = getStateManager().getApp(args.name);
   if (!app || !canAccessScoped(auth, app, args.name, 'read')) {
     return toolError(`Application '${args.name}' not found`);
@@ -706,6 +769,15 @@ export function handleAppStatus(
     url ? `url: ${url}` : 'url: (no externally-reachable domain configured)',
   ];
   if (app.lastDeployedAt) lines.push(`lastDeployedAt: ${app.lastDeployedAt}`);
+
+  // Resource figures are the OWNER's, mirroring GET /apps/:name's isOwner
+  // gate: a read grant on someone else's app shows its status, not its load.
+  // Only for a running app — a stopped one has nothing to measure, and asking
+  // the runtime anyway costs a stats round-trip for a guaranteed empty answer.
+  const isOwner = !auth || auth.role === 'admin' || auth.userId === app.userId;
+  if (isOwner && app.status === 'running') {
+    lines.push(...(await resourceLines(args.name)));
+  }
 
   // MCP endpoint (Step 11). The URL is COMPOSED by DROP from the app's own
   // hostname and a path the drop.yaml parser allowlisted — a tenant string is
@@ -725,6 +797,93 @@ export function handleAppStatus(
     );
   }
   return toolText(lines.join('\n'));
+}
+
+/**
+ * verify_deployment — probe an app NOW and report what happened (#295).
+ *
+ * The follow-up to `succeeded_unverified`: the deploy-path readiness gate is
+ * lenient by design, so this is how an agent turns "DROP could not confirm it"
+ * into a decision.
+ *
+ * Three constraints, each load-bearing:
+ *  - NEVER an arbitrary URL. The target is 127.0.0.1 plus the app's OWN
+ *    assigned port — the same target the platform's readiness gate probes in
+ *    both isolation modes (docker publishes the port to the host). Only the
+ *    path is caller-influenced, and it must pass `isSafeEndpointPath`, the
+ *    rule drop.yaml's `mcp.path` is held to. A tool that fetched a
+ *    caller-supplied URL from inside the platform would be an SSRF primitive.
+ *  - NEVER the response body. That is tenant output; status code and latency
+ *    are DROP's own observations and are safe unfenced.
+ *  - BOUNDED. One GET, `VERIFY_TIMEOUT_MS`, no redirect following (probeHttp
+ *    uses bare http.get, which never follows one).
+ *
+ * Read-only: it does not clear `readinessUnverified`. That flag records what
+ * the deploy-path gate saw, and a later probe answers a different question.
+ */
+export async function handleVerifyDeployment(
+  auth: AuthContext | undefined,
+  args: { name: string; path?: string }
+): Promise<CallToolResult> {
+  const app = getStateManager().getApp(args.name);
+  if (!app || !canAccessScoped(auth, app, args.name, 'read')) {
+    return toolError(`Application '${args.name}' not found`);
+  }
+
+  if (args.path !== undefined && !isSafeEndpointPath(args.path)) {
+    return toolError(
+      "Invalid path: must start with '/' and contain only letters, digits, '.', '_', '~', '-' or '/' " +
+        '(no query string, no "..", no "//"), at most 101 characters.'
+    );
+  }
+
+  if (app.status !== 'running' || !app.port) {
+    const structured = { ok: false, app: app.name, app_status: app.status };
+    return {
+      content: [
+        {
+          type: 'text',
+          text: `'${app.name}' is not running (status: ${app.status}), so there is nothing to probe. Use app_status or restart_app.`,
+        },
+      ],
+      structuredContent: structured,
+    };
+  }
+
+  // The declared healthCheck is the natural default — but it is tenant text,
+  // and the parser only checks it is a string, so it must pass the same rule
+  // as a caller's path or be ignored.
+  let path = args.path;
+  if (path === undefined) {
+    try {
+      const declared = await parseDropYaml(app.path);
+      const hc = declared.success ? declared.config?.healthCheck : undefined;
+      if (hc && isSafeEndpointPath(hc)) path = hc;
+    } catch {
+      // No readable drop.yaml — fall through to '/'.
+    }
+  }
+  path = path ?? '/';
+
+  const probedUrl = `http://127.0.0.1:${app.port}${path}`;
+  const started = Date.now();
+  const r = await probeHttp('127.0.0.1', app.port, path, VERIFY_TIMEOUT_MS);
+  const latencyMs = Date.now() - started;
+
+  // Any HTTP answer below 500 means the app is serving: a JSON API that
+  // answers 404 or 401 at '/' is healthy (see http-probe.ts). A 5xx is the app
+  // saying it is broken, and no answer at all means it is not serving.
+  const ok = r.responded && typeof r.statusCode === 'number' && r.statusCode < 500;
+  const structured: Record<string, unknown> = {
+    ok,
+    app: app.name,
+    probed_url: probedUrl,
+    ...(r.responded ? { status_code: r.statusCode, latency_ms: latencyMs } : {}),
+  };
+  const text = r.responded
+    ? `Probed ${probedUrl}: HTTP ${r.statusCode} in ${latencyMs} ms — ${ok ? 'the app is serving.' : 'the app answered with a server error.'}`
+    : `Probed ${probedUrl}: no HTTP response within ${VERIFY_TIMEOUT_MS} ms — the app is not serving on its assigned port. Check app_logs.`;
+  return { content: [{ type: 'text', text }], structuredContent: structured };
 }
 
 export async function handleAppLogs(
@@ -1004,13 +1163,38 @@ export function buildMcpServer(auth: AuthContext | undefined): McpServer {
     {
       title: 'App status',
       description:
-        "Get an app's current status, type, port, and URL. Returns a not-found error for apps you don't own or that don't exist " +
+        "Get an app's current status, type, port, and URL — plus live memory, CPU, uptime and restart count for a running app you own " +
+        "(omitted, never reported as zero, when the runtime cannot measure them). Returns a not-found error for apps you don't own or that don't exist " +
         '(no existence oracle — foreign and unknown apps look identical).',
       inputSchema: {
         name: z.string().describe('App name.'),
       },
     },
-    args => Promise.resolve(handleAppStatus(auth, args))
+    args => handleAppStatus(auth, args)
+  );
+
+  server.registerTool(
+    'verify_deployment',
+    {
+      title: 'Verify deployment',
+      description:
+        'Probe one of your running apps NOW with a single HTTP GET and report the status code and latency. ' +
+        "Use it after a deploy returns 'succeeded_unverified' to find out whether the app actually serves. " +
+        "DROP composes the target from the app's own assigned port — you choose only the path, which defaults to the " +
+        "app's drop.yaml healthCheck, else '/'. ok is true for any response below 500 (a 404 at '/' from an API is healthy). " +
+        'The response body is never returned, and redirects are not followed.',
+      inputSchema: {
+        name: z.string().describe('App name.'),
+        path: z
+          .string()
+          .max(101)
+          .optional()
+          .describe(
+            "Path to probe, e.g. '/health'. Must start with '/'; letters, digits, '.', '_', '~', '-' and '/' only, no query string."
+          ),
+      },
+    },
+    args => handleVerifyDeployment(auth, args)
   );
 
   server.registerTool(

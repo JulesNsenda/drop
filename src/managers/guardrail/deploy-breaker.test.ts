@@ -146,3 +146,35 @@ describe('automationKey', () => {
     expect(automationKey('webhook', 'myapp')).not.toBe(automationKey('watcher', 'myapp'));
   });
 });
+
+describe('DeployBreaker#peek (#293)', () => {
+  const t = 1_000_000;
+
+  it('agrees with check while the breaker is open', () => {
+    const breaker = new DeployBreaker(OPTS);
+    for (let i = 0; i < OPTS.threshold; i++) breaker.recordFailure('k', t + i);
+
+    const peeked = breaker.peek('k', t + 10_000);
+    expect(peeked).toEqual(breaker.check('k', t + 10_000));
+    expect(peeked.allowed).toBe(false);
+  });
+
+  it('does NOT delete a key whose cooldown has lapsed, where check does', () => {
+    const breaker = new DeployBreaker(OPTS);
+    for (let i = 0; i < OPTS.threshold; i++) breaker.recordFailure('k', t + i);
+    const lapsed = t + OPTS.cooldownMs + 10;
+
+    expect(breaker.peek('k', lapsed)).toEqual({ allowed: true, failures: 0 });
+    // Still present: reading it again BEFORE the lapse still sees it open.
+    expect(breaker.peek('k', t + 10).allowed).toBe(false);
+  });
+
+  it('does not prune the failure window it reports', () => {
+    const breaker = new DeployBreaker(OPTS);
+    breaker.recordFailure('k', t);
+
+    expect(breaker.peek('k', t + OPTS.windowMs + 1).failures).toBe(0);
+    // The aged-out failure was not pruned by the read.
+    expect(breaker.peek('k', t + 1).failures).toBe(1);
+  });
+});

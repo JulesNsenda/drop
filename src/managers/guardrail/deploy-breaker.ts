@@ -166,6 +166,31 @@ export class DeployBreaker {
   }
 
   /**
+   * What `check` would answer, WITHOUT its side effect.
+   *
+   * `check` deletes a key whose cooldown has lapsed and prunes its window in
+   * place. A read-only reporter (GET /limits) must not do either: observing a
+   * key must never be what changes it, and `checkGuardrailKeys` deliberately
+   * short-circuits to avoid exactly that kind of incidental expiry.
+   */
+  peek(key: string, now = Date.now()): BreakerVerdict {
+    const entry = this.state.get(key);
+    if (!entry) return { allowed: true, failures: 0 };
+    if (entry.openUntil !== undefined) {
+      if (entry.openUntil > now) {
+        return {
+          allowed: false,
+          retryAfterSeconds: Math.ceil((entry.openUntil - now) / 1000),
+          failures: entry.failures.length,
+        };
+      }
+      return { allowed: true, failures: 0 };
+    }
+    const cutoff = now - this.windowMs;
+    return { allowed: true, failures: entry.failures.filter((at) => at > cutoff).length };
+  }
+
+  /**
    * Record a failed deploy. Returns the verdict for the NEXT attempt, so a
    * caller can report "this was your last one" in the same breath.
    */

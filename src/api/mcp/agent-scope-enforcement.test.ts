@@ -102,8 +102,8 @@ describe('agent scope enforcement', () => {
       expect(res.isError).toBe(true);
     });
 
-    it('allows app_status to a read grant', () => {
-      const res = handleAppStatus(agent(['app:mine:read']), { name: 'mine' });
+    it('allows app_status to a read grant', async () => {
+      const res = await handleAppStatus(agent(['app:mine:read']), { name: 'mine' });
 
       expect(res.isError).toBeUndefined();
     });
@@ -113,13 +113,13 @@ describe('agent scope enforcement', () => {
     it('refuses an app the token was not granted, even when the owner owns it', async () => {
       apps.set('sibling', { name: 'sibling', userId: 'owner-1' });
 
-      const res = handleAppStatus(agent(['app:mine:read']), { name: 'sibling' });
+      const res = await handleAppStatus(agent(['app:mine:read']), { name: 'sibling' });
 
       expect(res.isError).toBe(true);
     });
 
-    it("refuses another tenant's app outright", () => {
-      const res = handleAppStatus(agent(['app:other:read']), { name: 'other' });
+    it("refuses another tenant's app outright", async () => {
+      const res = await handleAppStatus(agent(['app:other:read']), { name: 'other' });
 
       // Scope alone is not enough — canAccess still applies, so a scope that
       // outlived an ownership transfer grants nothing.

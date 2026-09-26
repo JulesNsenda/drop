@@ -29,6 +29,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **MCP: a refused deploy is now machine-readable (#292).** `deploy_files` and
+  `deploy_from_git` refused by the deploy quota or the failure breaker used to
+  return only a sentence. They now also return `structuredContent` with
+  `error_code` (`QUOTA_EXCEEDED` / `GUARDRAIL_TRIPPED`), the static `hint`, and
+  `retry_after_seconds`, so an agent can wait and retry without parsing prose.
+  The text content is unchanged for clients that render only text.
+
+- **`GET /api/v1/limits` — read your headroom before spending it (#293).** One
+  `readonly` call returns every guardrail that can refuse the caller's next
+  deploy, with current usage: the hourly deploy quota (per principal and per
+  owning user, with when each window frees a slot), the failure breaker (the
+  new-app window, the owner backstop, and any of the caller's own apps with
+  failures on the board), live ephemerals against their cap, the app count, and
+  the per-app disk ceiling. Strictly per-caller — an admin sees their own
+  figures, never the fleet's — and it reports no host facts. It reads through
+  new side-effect-free `peek` methods, so observing a limit never prunes or
+  expires it.
+
+- **MCP `verify_deployment` tool (#295).** Probes one of the caller's running
+  apps with a single bounded HTTP GET and returns `ok`, `status_code`,
+  `latency_ms` and `probed_url` — the follow-up a `succeeded_unverified` deploy
+  was missing, and now its first `next_actions` entry. The target is always
+  127.0.0.1 plus the app's own assigned port (both isolation modes); only the
+  path is caller-chosen, held to the same allowlist as drop.yaml's `mcp.path`,
+  defaulting to the app's `healthCheck`. The body is never returned and
+  redirects are not followed. Foreign and missing apps get the same not-found.
+
+- **MCP `app_status` reports live memory, CPU, uptime and restarts (#294)** for
+  a running app the caller owns, from one runtime stats call (never the
+  fleet-wide one). When the runtime cannot measure them — including the docker
+  adapter's `{cpu: 0, memory: 0}` fallback — the fields are omitted rather than
+  reported as zero, so an agent is never told a crashed stats call means "idle".
+
 - **Settings → Platform, for the toggles that had no dashboard control.** App
   sharing, guest invitations, the SQL console and the outbound-mail relay all
   shipped with an API endpoint and no way to reach them, so turning any of them
