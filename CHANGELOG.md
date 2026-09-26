@@ -29,6 +29,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **MCP `rollback_app` tool.** The agent-side of per-app rollback: undoes the
+  last `deploy_files` or git redeploy of an app the caller may deploy to (a
+  read-only grant cannot), with no rebuild. Both the text and the structured
+  result state what was not restored — the database above all — and point at
+  `verify_deployment` next.
+
 - **Per-app rollback (#296).** Before an upload or git redeploy overwrites a
   running app, DROP keeps a copy of the tree that was serving — build output
   and dependencies included — under `data/rollback/<app>/`.

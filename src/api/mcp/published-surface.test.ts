@@ -33,6 +33,7 @@ const PUBLISHED_MCP_TOOLS = [
   'app_logs',
   'get_deploy_logs',
   'restart_app',
+  'rollback_app',
 ];
 
 /** REST `error.code` values, as listed in llms.txt's errors section. */

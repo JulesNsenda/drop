@@ -4,9 +4,10 @@
  * `buildMcpServer(auth)` builds one McpServer instance per HTTP request
  * (stateless mode — see `transport.ts`), with the caller's `AuthContext`
  * captured by closure so every tool handler runs with the caller's identity
- * flowing through the existing `canAccess` ownership model. Eight tools:
+ * flowing through the existing `canAccess` ownership model. Nine tools:
  * `deploy_files`, `deploy_from_git`, `list_apps`, `app_status`,
- * `verify_deployment`, `app_logs`, `get_deploy_logs`, `restart_app`. No `set_secrets`/`remove_app` —
+ * `verify_deployment`, `app_logs`, `get_deploy_logs`, `restart_app`,
+ * `rollback_app`. No `set_secrets`/`remove_app` —
  * destructive/blast-radius tools stay off the MCP surface (PRD-040 non-goals).
  *
  * Tool errors are returned as `{ content: [...], isError: true }` results,
@@ -64,6 +65,7 @@ import { tryLogActivity } from '../../managers/activity';
 import { DeployRefusedError } from '../../managers/guardrail/deploy-breaker';
 import { QuotaExceededError } from '../../managers/guardrail/principal-quota';
 import { ephemeralAppName, EphemeralQuotaError } from '../../managers/guardrail/ephemeral';
+import { NoRollbackSnapshotError, NOT_RESTORED } from '../../managers/rollback';
 
 /** ≤48 files per deploy_files call. */
 export const DEPLOY_FILES_MAX_FILES = 48;
@@ -587,7 +589,7 @@ interface DeployFromGitArgs {
  */
 async function auditToolAction(
   auth: AuthContext | undefined,
-  action: 'agent-deploy' | 'restart',
+  action: 'agent-deploy' | 'restart' | 'rollback',
   appName: string,
   detail?: string
 ): Promise<void> {
@@ -1023,6 +1025,63 @@ export async function handleGetDeployLogs(
   return toolText(wrapUntrusted(`RUNTIME LOG: ${detail.appName}`, tail(combined)));
 }
 
+/**
+ * rollback_app (#296) — put back the tree that was serving before the last
+ * upload or git redeploy, and restart without rebuilding.
+ *
+ * 'deploy', not 'read', for the same reason as restart_app: it replaces what
+ * is serving. The result says what was NOT restored, in the text as well as
+ * the structured content, because the trap a rollback sets is an agent
+ * assuming the database went back too.
+ */
+export async function handleRollbackApp(
+  auth: AuthContext | undefined,
+  args: { name: string }
+): Promise<CallToolResult> {
+  const app = getStateManager().getApp(args.name);
+  if (!app || !canAccessScoped(auth, app, args.name, 'deploy')) {
+    return toolError(`Application '${args.name}' not found`);
+  }
+
+  const ops = getPlatformOps();
+  if (!ops) {
+    return toolError('Platform operations are unavailable on this server.');
+  }
+
+  try {
+    const { meta } = await ops.rollbackApp(args.name);
+    await auditToolAction(auth, 'rollback', args.name, 'rollback_app');
+    const notRestored = [...NOT_RESTORED];
+    const text =
+      `Application '${args.name}' rolled back to the tree captured ${meta.takenAt} and restarted.\n` +
+      `Restored: code, build output and dependencies. NOT restored: ${notRestored.join(', ')} — ` +
+      'a database migration run by the bad deploy is still applied.\n' +
+      'Call verify_deployment to confirm it serves.';
+    return {
+      content: [{ type: 'text', text }],
+      structuredContent: {
+        ok: true,
+        app: args.name,
+        snapshot_taken_at: meta.takenAt,
+        not_restored: notRestored,
+        next_actions: ['verify_deployment'],
+      },
+    };
+  } catch (err) {
+    if (err instanceof NoRollbackSnapshotError) {
+      return toolError(
+        `${err.message} A snapshot is taken only when deploy_files or a git redeploy replaces a running app.`
+      );
+    }
+    if (err instanceof AppInProgressError) {
+      return toolError(err.message);
+    }
+    return toolError(
+      `Failed to roll back '${args.name}': ${err instanceof Error ? err.message : 'unknown error'}`
+    );
+  }
+}
+
 export async function handleRestartApp(
   auth: AuthContext | undefined,
   args: { name: string }
@@ -1266,6 +1325,23 @@ export function buildMcpServer(auth: AuthContext | undefined): McpServer {
       },
     },
     args => handleRestartApp(auth, args)
+  );
+
+  server.registerTool(
+    'rollback_app',
+    {
+      title: 'Roll back app',
+      description:
+        'Undo the last deploy_files or git redeploy of one of your apps: put back the code, build output and dependencies ' +
+        'that were serving before it, and restart on the same port without rebuilding. Restores CODE ONLY — the database, ' +
+        'Redis, app data, secrets and environment are not rolled back, so a migration the bad deploy ran stays applied. ' +
+        'Fails with a clear error when no snapshot exists (one is kept only when a redeploy replaces a RUNNING app). ' +
+        'Follow with verify_deployment.',
+      inputSchema: {
+        name: z.string().describe('App name.'),
+      },
+    },
+    args => handleRollbackApp(auth, args)
   );
 
   return server;
