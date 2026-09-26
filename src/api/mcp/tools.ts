@@ -39,7 +39,7 @@ import {
   InsufficientDiskSpaceError,
 } from '../../core/upload-deploy';
 import { isVcsMetadataComponent } from '../../utils/upload-paths';
-import { getGitDeployService } from '../../core/git-deploy';
+import { getGitDeployService, extractRepoName } from '../../core/git-deploy';
 import { getDeployTracker } from '../../managers/deploy-tracker';
 import type { DeployEpisode } from '../../managers/deploy-tracker';
 import { getBuildLogService } from '../../managers/build-log/build-log';
@@ -52,6 +52,7 @@ import {
   commandKindForStage,
   hintFor,
   nextActionsFor,
+  refusalResult,
 } from './deploy-result';
 import { getDeployDetailStore } from '../../managers/deploy-tracker';
 import { classifyBuildFailure } from '../../core/builder/classify';
@@ -114,6 +115,27 @@ function getAppLimit(userId?: string): number {
     // User lookup failed — fall back to the global limit
   }
   return globalMax;
+}
+
+/**
+ * A pre-admission refusal (quota or failure breaker) as a structured result,
+ * or undefined for any other error. The same `error_code` vocabulary an
+ * admitted-then-failed deploy uses, plus `retry_after_seconds`, so an agent
+ * can wait and retry without string-matching the message. The text content is
+ * the refusal message unchanged — DROP-generated, it names the wait already.
+ */
+function deployRefusal(
+  appName: string | (() => string),
+  err: unknown
+): CallToolResult | undefined {
+  const name = (): string => (typeof appName === 'function' ? appName() : appName);
+  if (err instanceof QuotaExceededError) {
+    return refusalResult(name(), 'QUOTA_EXCEEDED', err.retryAfterSeconds, err.message);
+  }
+  if (err instanceof DeployRefusedError) {
+    return refusalResult(name(), 'GUARDRAIL_TRIPPED', err.retryAfterSeconds, err.message);
+  }
+  return undefined;
 }
 
 // ============ Deploy-episode wait + result shaping (shared by both deploy tools) ============
@@ -521,13 +543,11 @@ export async function handleDeployFiles(
     if (err instanceof UploadValidationError || err instanceof InsufficientDiskSpaceError) {
       return toolError(err.message);
     }
-    if (
-      err instanceof DeployRefusedError ||
-      err instanceof QuotaExceededError ||
-      err instanceof EphemeralQuotaError
-    ) {
-      // The message already names the wait or the limit, so an agent has
-      // something to act on rather than a bare failure it will retry at once.
+    const refusal = deployRefusal(name, err);
+    if (refusal) return refusal;
+    if (err instanceof EphemeralQuotaError) {
+      // The message already names the limit. No retry_after: the ephemeral cap
+      // frees up when an app is removed or expires, not on a clock.
       return toolError(err.message);
     }
     return toolError(
@@ -633,9 +653,15 @@ export async function handleDeployFromGit(
 
     return await waitForDeployOutcome(result.appName, acceptedAt, true);
   } catch (err) {
-    if (err instanceof DeployRefusedError || err instanceof QuotaExceededError) {
-      return toolError(err.message);
-    }
+    // `app` rides unfenced in structuredContent, so it must never be the raw
+    // `url`. A refusal is only thrown after git-deploy has validated the URL
+    // and derived the name the same way, but re-check it here rather than
+    // lean on that ordering.
+    const refusal = deployRefusal(() => {
+      const derived = args.name ?? extractRepoName(args.url);
+      return /^[\w.-]{1,128}$/.test(derived) ? derived : '';
+    }, err);
+    if (refusal) return refusal;
     const message = err instanceof Error ? err.message : 'Deploy failed';
     // message is git-derived (git-deploy.ts / git-client.ts stderr, token-sanitized
     // but never fenced) — fence once here so none of the three sibling returns below
@@ -688,10 +714,43 @@ export function handleListApps(auth: AuthContext | undefined): CallToolResult {
   return toolText(lines.join('\n'));
 }
 
-export function handleAppStatus(
+/**
+ * Live resource figures for ONE app, as `app_status` lines, or [] when there is
+ * nothing trustworthy to report.
+ *
+ * One `getStatus` call, never `getAllStatus`: under docker isolation a stats
+ * sample costs about a second per container (see `countManaged` in
+ * app-runtime.ts), which is acceptable for one app on an explicit request and
+ * not for a fleet.
+ *
+ * ABSENT, never zero, when the runtime cannot answer. The docker adapter
+ * degrades to {cpu: 0, memory: 0} on a throwing stats call, and an agent told
+ * "cpu_percent: 0" would reasonably conclude the app is idle. Memory is the
+ * discriminator, as in GET /apps: a live process is never legitimately at 0
+ * bytes. That also hides a PM2 process whose monitor has not sampled yet —
+ * for an agent, "not measured yet" and "absent" mean the same thing, which is
+ * not true of the dashboard's Metrics tab (see the note in GET /apps/:name).
+ */
+async function resourceLines(appName: string): Promise<string[]> {
+  let info;
+  try {
+    info = await getAppRuntime().getStatus(appName);
+  } catch {
+    return [];
+  }
+  if (!info || !(info.memory > 0)) return [];
+  return [
+    `memory_mb: ${(info.memory / (1024 * 1024)).toFixed(1)}`,
+    `cpu_percent: ${Number.isFinite(info.cpu) ? info.cpu.toFixed(1) : 'n/a'}`,
+    `uptime_seconds: ${Math.max(0, Math.floor(info.uptime / 1000))}`,
+    `restarts: ${info.restarts}`,
+  ];
+}
+
+export async function handleAppStatus(
   auth: AuthContext | undefined,
   args: { name: string }
-): CallToolResult {
+): Promise<CallToolResult> {
   const app = getStateManager().getApp(args.name);
   if (!app || !canAccessScoped(auth, app, args.name, 'read')) {
     return toolError(`Application '${args.name}' not found`);
@@ -706,6 +765,15 @@ export function handleAppStatus(
     url ? `url: ${url}` : 'url: (no externally-reachable domain configured)',
   ];
   if (app.lastDeployedAt) lines.push(`lastDeployedAt: ${app.lastDeployedAt}`);
+
+  // Resource figures are the OWNER's, mirroring GET /apps/:name's isOwner
+  // gate: a read grant on someone else's app shows its status, not its load.
+  // Only for a running app — a stopped one has nothing to measure, and asking
+  // the runtime anyway costs a stats round-trip for a guaranteed empty answer.
+  const isOwner = !auth || auth.role === 'admin' || auth.userId === app.userId;
+  if (isOwner && app.status === 'running') {
+    lines.push(...(await resourceLines(args.name)));
+  }
 
   // MCP endpoint (Step 11). The URL is COMPOSED by DROP from the app's own
   // hostname and a path the drop.yaml parser allowlisted — a tenant string is
@@ -1004,13 +1072,14 @@ export function buildMcpServer(auth: AuthContext | undefined): McpServer {
     {
       title: 'App status',
       description:
-        "Get an app's current status, type, port, and URL. Returns a not-found error for apps you don't own or that don't exist " +
+        "Get an app's current status, type, port, and URL — plus live memory, CPU, uptime and restart count for a running app you own " +
+        "(omitted, never reported as zero, when the runtime cannot measure them). Returns a not-found error for apps you don't own or that don't exist " +
         '(no existence oracle — foreign and unknown apps look identical).',
       inputSchema: {
         name: z.string().describe('App name.'),
       },
     },
-    args => Promise.resolve(handleAppStatus(auth, args))
+    args => handleAppStatus(auth, args)
   );
 
   server.registerTool(

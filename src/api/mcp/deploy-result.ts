@@ -34,6 +34,7 @@
 
 import type { DeployErrorCode } from '../../managers/deploy-tracker';
 import type { BuildStage } from '../../core/builder/builder.types';
+import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 
 export type DeployResultStatus =
   | 'succeeded'
@@ -77,6 +78,12 @@ export interface DeployResult {
   output_tail?: string;
   url?: string;
   next_actions?: DeployNextAction[];
+  /**
+   * Seconds until a refused deploy may be retried. Set only on a pre-admission
+   * refusal (`refusalResult`), where it is the whole point: the right next move
+   * is machine-decidable, so it must not have to be parsed out of prose.
+   */
+  retry_after_seconds?: number;
 }
 
 /** Failing stage -> command kind. Total, so a new stage is a compile error. */
@@ -136,6 +143,40 @@ const HINTS: Record<DeployErrorCode, string> = {
 
 export function hintFor(code: DeployErrorCode): string {
   return HINTS[code] ?? HINTS.UNKNOWN;
+}
+
+/** The refusal codes: a deploy DROP declined before admitting it. Nothing was built. */
+export type DeployRefusalCode = Extract<DeployErrorCode, 'QUOTA_EXCEEDED' | 'GUARDRAIL_TRIPPED'>;
+
+/**
+ * Structured result for a deploy refused BEFORE admission — the quota or the
+ * failure breaker said no, so there is no deploy id, stage or log to report.
+ *
+ * `text` is the refusal's own message and is kept verbatim as the text content:
+ * some clients render only the text, and it already names the wait. Every
+ * structured field is DROP-generated — the code is chosen by the caller from
+ * the error CLASS, the hint is the static table, and the wait is a number the
+ * guardrail computed.
+ */
+export function refusalResult(
+  appName: string,
+  code: DeployRefusalCode,
+  retryAfterSeconds: number,
+  text: string
+): CallToolResult {
+  const structured: DeployResult = {
+    ok: false,
+    app: appName,
+    status: 'failed',
+    error_code: code,
+    hint: hintFor(code),
+    retry_after_seconds: Math.max(0, Math.ceil(retryAfterSeconds)),
+  };
+  return {
+    content: [{ type: 'text', text }],
+    structuredContent: { ...structured },
+    isError: true,
+  };
 }
 
 /**

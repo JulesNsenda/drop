@@ -29,6 +29,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **MCP: a refused deploy is now machine-readable (#292).** `deploy_files` and
+  `deploy_from_git` refused by the deploy quota or the failure breaker used to
+  return only a sentence. They now also return `structuredContent` with
+  `error_code` (`QUOTA_EXCEEDED` / `GUARDRAIL_TRIPPED`), the static `hint`, and
+  `retry_after_seconds`, so an agent can wait and retry without parsing prose.
+  The text content is unchanged for clients that render only text.
+
+- **MCP `app_status` reports live memory, CPU, uptime and restarts (#294)** for
+  a running app the caller owns, from one runtime stats call (never the
+  fleet-wide one). When the runtime cannot measure them — including the docker
+  adapter's `{cpu: 0, memory: 0}` fallback — the fields are omitted rather than
+  reported as zero, so an agent is never told a crashed stats call means "idle".
+
 - **Settings → Platform, for the toggles that had no dashboard control.** App
   sharing, guest invitations, the SQL console and the outbound-mail relay all
   shipped with an API endpoint and no way to reach them, so turning any of them
