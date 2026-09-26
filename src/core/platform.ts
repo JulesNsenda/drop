@@ -92,6 +92,13 @@ import {
   DISK_SWEEP_INTERVAL_MS,
 } from '../managers/guardrail/disk-ceiling';
 import {
+  initRollbackStore,
+  resetRollbackStore,
+  getRollbackStore,
+  NoRollbackSnapshotError,
+} from '../managers/rollback';
+import type { RollbackSnapshotMeta } from '../managers/rollback';
+import {
   getDeployBreaker,
   guardrailKeysFor,
   checkGuardrailKeys,
@@ -928,6 +935,11 @@ export class DropPlatform {
       // `getMailQuota` itself (its own env vars, distinct from the deploy ones
       // above — see `mailPrincipalLimit`/`mailOwnerLimit` in
       // principal-quota.ts), not passed here.
+      // Rollback snapshots (#296), anchored under THIS platform's dropRoot for
+      // the same reason as the quotas: the upload and git deploy services
+      // capture through the singleton and have no root of their own.
+      initRollbackStore(this.config.dropRoot);
+
       const mailQuotaStore = path.join(
         this.config.dropRoot,
         'data',
@@ -1242,6 +1254,7 @@ export class DropPlatform {
     this.breakerKeys.clear();
     resetDeployBreaker();
     resetPrincipalQuota();
+    resetRollbackStore();
 
     // Flush BEFORE resetting: a quota whose counts only ever live in memory
     // means a restart hands every principal a fresh allowance, which for an
@@ -2007,6 +2020,7 @@ backup:
       restartApp: (name) => this.restartApp(name),
       isAppInProgress: (name) => this.appsInProgress.has(name),
       promoteApp: (name) => this.promoteApp(name),
+      rollbackApp: (name) => this.rollbackApp(name),
       removeGroup: (name) => this.removeGroup(name),
       purgeAppArtifacts: (name, opts) => this.purgeAppArtifacts(name, opts),
       attachService: (name, serviceId) => this.attachService(name, serviceId),
@@ -6246,6 +6260,54 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
   }
 
   /**
+   * Put back the app's last-good tree and restart it on its existing port
+   * (#296). No rebuild: the snapshot holds build output and dependencies as
+   * they were when that tree was serving.
+   *
+   * Holds the `appsInProgress` guard across the restore AND the restart, so a
+   * deploy cannot land files between the two, and watcher events raised by
+   * the restore itself are dropped rather than read back as a user edit (the
+   * in-progress skip in handleAppUpdate), then covered by the cooldown
+   * doRestart records.
+   *
+   * The recorded `outputDirectory` is restored with the tree: a static app
+   * serves from it, and the deploy being undone may have changed it.
+   *
+   * Code only. Database, Redis, appdata, secrets and environment are not
+   * touched — see NOT_RESTORED.
+   */
+  async rollbackApp(appName: string): Promise<{ meta: RollbackSnapshotMeta; info: AppProcessInfo }> {
+    if (this.appsInProgress.has(appName)) {
+      throw new AppInProgressError(appName);
+    }
+    this.appsInProgress.add(appName);
+    try {
+      const store = getRollbackStore();
+      if (!store || !this.appConfigService || !this.stateManager) {
+        throw new NoRollbackSnapshotError(appName);
+      }
+      const config = this.appConfigService.getConfig(appName);
+      const state = this.stateManager.getApp(appName);
+      if (!config && !state) {
+        throw new Error(`Application not found: ${appName}`);
+      }
+      const appPath = config?.path || state?.path || path.join(this.config.appsDirectory, appName);
+
+      const meta = await store.restoreInto(appName, appPath);
+      this.appDeployTimes.set(appName, Date.now());
+      if (meta.outputDirectory !== undefined) {
+        await this.appConfigService.upsertConfig(appName, { outputDirectory: meta.outputDirectory });
+      }
+      this.logger.info(`Rolled back ${appName} to the tree captured ${meta.takenAt}`, 'ROLLBACK');
+
+      const info = await this.doRestart(appName);
+      return { meta, info };
+    } finally {
+      this.appsInProgress.delete(appName);
+    }
+  }
+
+  /**
    * The body of restartApp, extracted so `attachService` (DROP-151 Phase 2)
    * can hold the `appsInProgress` guard across provisioning AND the restart
    * that follows it, instead of releasing and re-acquiring the guard between
@@ -7309,6 +7371,10 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       path.join(this.config.dropRoot, 'data', 'logs', 'webapps', name),
       path.join(this.config.dropRoot, 'data', 'logs', 'builds', name),
       ...(opts.keepData ? [] : [path.join(this.config.dropRoot, 'data', 'appdata', name)]),
+      // The rollback snapshot is CODE, not the owner's data, so keepData does
+      // not keep it: a snapshot left behind would restore the deleted app's
+      // tree into whatever the next registrant of this name deploys.
+      path.join(this.config.dropRoot, 'data', 'rollback', name),
     ];
     for (const dir of targets) {
       try {
@@ -7757,6 +7823,8 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         paths: [
           app.path,
           path.join(this.config.dropRoot, 'data', 'appdata', app.name),
+          // The rollback snapshot (#296) is charged to the app it belongs to.
+          path.join(this.config.dropRoot, 'data', 'rollback', app.name),
         ],
         maxDiskMb: this.appConfigService?.getConfig(app.name)?.maxDiskMb,
       }));
@@ -7767,6 +7835,19 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         // Only a LIVE app is worth stopping. Parking something already stopped
         // would rewrite its reason on every sweep and bury the real one.
         if (!app || (app.status !== 'running' && app.status !== 'crash-looping')) continue;
+
+        // A snapshot is DROP's own convenience copy: when it is part of what
+        // pushes an app over, it goes first, and the app keeps running. The
+        // next sweep re-measures without it and parks only if still over.
+        const rollback = getRollbackStore();
+        if (rollback && (await rollback.get(verdict.name))) {
+          await rollback.remove(verdict.name);
+          this.logger.warn(
+            `Dropped the rollback snapshot of ${verdict.name} to keep it under its disk ceiling`,
+            'DISK'
+          );
+          continue;
+        }
 
         const reason =
           `Over its disk ceiling: ${toMb(verdict.bytes)} MB used of ` +

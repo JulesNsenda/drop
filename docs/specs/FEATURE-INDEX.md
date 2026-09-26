@@ -71,6 +71,7 @@ something is listed here it exists in the shipped code. Planned work lives in
 | Roles | `readonly` / `user` / `admin`, with per-route enforcement |
 | Multi-user | Per-user app ownership and limits; invitation-based signup |
 | Scoped agent tokens | Least-privilege keys scoped to named capabilities, never full admin |
+| Per-app rollback | `POST /api/v1/apps/:name/rollback` restores the last-good tree captured before an upload/git redeploy, and restarts without rebuilding; code only, never the database |
 | Deploy guardrails | Circuit breaker on failing deploy loops, per-principal quotas, ephemeral TTL'd apps, idle reaping, disk ceilings; the caller's own headroom is readable up front via `GET /api/v1/limits` |
 | Rate limiting | Stricter buckets on credential-minting and expensive endpoints |
 | Activity log | Audit trail of platform actions |

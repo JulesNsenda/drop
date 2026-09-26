@@ -92,6 +92,7 @@ Router (Caddy config)  → Route configured
 - **SecretManager** (`src/managers/secret/`): Encrypted per-app secrets, injected as env vars at start. Singleton `getSecretManager()`.
 - **WebhookManager** (`src/core/webhooks/`) + **GitDeployService** (`src/core/git-deploy/`): Webhook-driven and git-clone-based deploys. Singletons `getWebhookManager()` / `getGitDeployService()`.
 - **ActivityLog** (`src/managers/activity/`): Audit/activity trail. Singleton `getActivityLog()`.
+- **RollbackStore** (`src/managers/rollback/`, #296): the last-good tree of an app, captured by `captureBeforeRedeploy` right before an upload or git redeploy overwrites a RUNNING app, restored by `platform.rollbackApp` (`POST /apps/:name/rollback`) followed by the ordinary `doRestart` — no rebuild. Runtime-agnostic by construction: both isolation modes run an app straight from its directory. Code only: database, Redis, appdata, secrets and env are never restored, and the API says so. Copies use `fs.cp` with `verbatimSymlinks` (NOT `syncTree`, which drops `node_modules/.bin`), and a restore empties the app dir before moving the copy in, so it never writes through a link in the tree it replaces.
 - **UploadDeployService** (`src/core/upload-deploy/`): tar-upload deploy path (`POST /api/v1/apps/:name/source`) — extraction is hardened separately in `tar-extract.ts` (path traversal, symlinks, size).
 - **DeployTracker + DeployDetailStore** (`src/managers/deploy-tracker/`): per-deploy history and structured failure detail (`deploys.json` / `deploy-details.json`), served by `/api/v1/deploys`. Both subscribe to the EventBus and are flushed in `platform.stop()`.
 - **Guardrails** (`src/managers/guardrail/`) — the agent-deploy safety layer, see below.
@@ -255,6 +256,9 @@ Root is `C:\drop\` (Windows) or `/var/drop/` (Linux), overridable via `DROP_ROOT
     ├── logs/{drop-svc,webapps,caddy,builds}/  # All logs (per-app stdout/stderr auto-captured, dated;
     │                              #   builds/ = per-deploy build output, BuildLogService)
     ├── backup/                    # Automated backups (drop backup/restore)
+    ├── rollback/<app>/            # Last-good tree per app (#296): tree/ + meta.json. NOT under
+    │                              #   appdata/ (mounted rw into the app); charged to the app's disk
+    │                              #   ceiling, and dropped by the sweep before the app would be parked
     ├── temp/                      # Build work dirs (data/temp/<app>) + upload staging
     └── appconf/                   # Caddyfile, drop.yaml, caddy/{webapps,hosts}/, webapps/ (per-app config)
 ```

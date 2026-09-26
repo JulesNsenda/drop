@@ -29,6 +29,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Per-app rollback (#296).** Before an upload or git redeploy overwrites a
+  running app, DROP keeps a copy of the tree that was serving — build output
+  and dependencies included — under `data/rollback/<app>/`.
+  `POST /api/v1/apps/:name/rollback` puts it back and restarts the app on its
+  port without rebuilding; `GET` on the same path says whether one exists. It
+  behaves identically under PM2 and Docker, because both run an app straight
+  from its directory. It restores **code only**: the response lists what it
+  does not restore (database, Redis, app data, secrets, environment) rather
+  than implying a time machine. One snapshot per app (the last good), taken
+  only when it fits under the per-app disk ceiling with room for the app's
+  data; the ceiling sweep charges it to the app and drops it before it would
+  park one. Manual only — there is no automatic rollback on a failed health
+  check. Folders dropped straight into `webapps/` are not captured.
+
 - **`GET /api/v1/openapi.json` — a generated OpenAPI 3.1 description (#297).**
   Built from the mounted route table rather than written beside it, so it
   cannot list a route that is not served or miss one that is. Each operation

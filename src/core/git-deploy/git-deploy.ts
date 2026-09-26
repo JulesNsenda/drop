@@ -31,6 +31,7 @@ import { getSecretManager } from '../../managers/secret';
 import { getLogger } from '../../utils/logger';
 import { hasEnoughDisk, getMinFreeDiskMb } from '../../utils/disk';
 import { eventBus } from '../event-bus';
+import { captureBeforeRedeploy } from '../../managers/rollback';
 import { admitDeploy } from '../../managers/guardrail/deploy-breaker';
 import {
   checkEphemeralQuota,
@@ -352,6 +353,17 @@ export class GitDeployService {
     }
 
     logger.info(`Redeploying ${appName} from ${repoUrl} (branch: ${branch})`, 'GIT-DEPLOY');
+
+    // Rollback snapshot of the tree that is SERVING, before it is replaced
+    // (#296). Best-effort by contract: it never throws, and a skipped or
+    // failed snapshot never fails the deploy — it only means this redeploy
+    // cannot be rolled back, which the rollback route reports as such.
+    // The snapshot includes .git, so a restore also puts HEAD back and the
+    // next git redeploy fast-forwards from the restored commit.
+    const snapshot = await captureBeforeRedeploy(appName);
+    if (!snapshot.captured) {
+      logger.info(`No rollback snapshot for ${appName}: ${snapshot.reason}`, 'GIT-DEPLOY');
+    }
 
     // Mark as cloning for the duration of the pull only - mirrors deploy()'s
     // guard against the watcher building a half-pulled tree. Cleared before

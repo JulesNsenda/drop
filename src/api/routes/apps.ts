@@ -37,6 +37,8 @@ import { getDatabaseProvisioner } from '../../managers/database';
 import { getRedisProvisioner } from '../../managers/redis';
 import { getRouterService } from '../../core/router';
 import { logActivityFor } from '../../managers/activity';
+import { getRollbackStore, NoRollbackSnapshotError, NOT_RESTORED } from '../../managers/rollback';
+import type { RollbackSnapshotMeta } from '../../managers/rollback';
 import {
   getAppsDirectory,
   getDomainSuffix,
@@ -1071,6 +1073,82 @@ apps.post('/:name/restart', async c => {
       );
     }
     const message = err instanceof Error ? err.message : 'Failed to restart';
+    return c.json(error(ErrorCodes.INTERNAL_ERROR, message), 500);
+  }
+});
+
+// ============ Rollback (#296) ============
+
+/** The honest shape of a rollback: what it put back, and what it did not. */
+function rollbackReport(meta: RollbackSnapshotMeta) {
+  return {
+    snapshotTakenAt: meta.takenAt,
+    snapshotBytes: meta.bytes,
+    restores: ['code', 'build output', 'dependencies', ...(meta.outputDirectory !== undefined ? ['output directory'] : [])],
+    doesNotRestore: [...NOT_RESTORED],
+  };
+}
+
+// GET /apps/:name/rollback - is there a last-good tree to go back to?
+apps.get('/:name/rollback', async c => {
+  const auth = (c.get as Function)('auth') as AuthContext | undefined;
+  const name = c.req.param('name');
+  const app = getStateManager().getApp(name);
+  if (!app || !canAccess(auth, app)) {
+    throw new NotFoundError(`Application '${name}' not found`);
+  }
+
+  const meta = (await getRollbackStore()?.get(name)) ?? null;
+  return c.json(
+    success(meta ? { app: name, available: true, ...rollbackReport(meta) } : { app: name, available: false })
+  );
+});
+
+// POST /apps/:name/rollback - restore the last-good tree and restart, no rebuild
+apps.post('/:name/rollback', async c => {
+  const auth = (c.get as Function)('auth') as AuthContext | undefined;
+  const name = c.req.param('name');
+  const app = getStateManager().getApp(name);
+  if (!app || !canAccess(auth, app)) {
+    throw new NotFoundError(`Application '${name}' not found`);
+  }
+
+  const ops = getPlatformOps();
+  if (!ops) {
+    return c.json(error(ErrorCodes.SERVICE_UNAVAILABLE, 'Platform operations unavailable'), 503);
+  }
+
+  try {
+    const { meta, info } = await ops.rollbackApp(name);
+    await logActivityFor(auth, {
+      action: 'rollback',
+      appName: name,
+      detail: `to tree captured ${meta.takenAt}`,
+    });
+    return c.json(
+      success({
+        message: `Application '${name}' rolled back and restarted`,
+        status: info,
+        ...rollbackReport(meta),
+      })
+    );
+  } catch (err) {
+    if (err instanceof NoRollbackSnapshotError) {
+      return c.json(
+        error(
+          ErrorCodes.CONFLICT,
+          `${err.message} A snapshot is taken only when an upload or git redeploy replaces a running app.`
+        ),
+        409
+      );
+    }
+    if (err instanceof AppInProgressError) {
+      return c.json(error(ErrorCodes.CONFLICT, err.message), 409);
+    }
+    if (err instanceof AppNeedsConfigError) {
+      return c.json(error(ErrorCodes.CONFLICT, needsConfigDetail(err, name)), 409);
+    }
+    const message = err instanceof Error ? err.message : 'Failed to roll back';
     return c.json(error(ErrorCodes.INTERNAL_ERROR, message), 500);
   }
 });
