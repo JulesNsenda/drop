@@ -29,6 +29,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Release directories for zero-downtime deploys (#298, opt-in).** An app
+  whose `drop.yaml` sets `deploy: { strategy: zero-downtime }` is now built into
+  its own directory per deploy, `data/releases/<app>/<deployId>/`, and run from
+  there — so a build no longer rewrites `node_modules` and the build output
+  underneath the process that is serving. The source folder keeps its role
+  (uploads, `git pull`, the watcher and `drop.yaml` all stay in
+  `webapps/<app>`). The previous release is kept and older ones pruned; a
+  failed build or start discards the new release and leaves the serving one
+  alone; restarts and rollbacks work on the current release; removing the
+  opt-in goes back to in-place and deletes the releases. Apps that do not opt
+  in are unchanged. A redeploy still stops before it starts — the traffic
+  cutover that removes that gap is the next step.
+
 - **MCP `rollback_app` tool.** The agent-side of per-app rollback: undoes the
   last `deploy_files` or git redeploy of an app the caller may deploy to (a
   read-only grant cannot), with no rebuild. Both the text and the structured

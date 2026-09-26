@@ -14,8 +14,12 @@ import { getLogger } from '../../utils/logger';
 const ALLOWED_TOP_KEYS = new Set([
   'name', 'domains', 'tls', 'env', 'build_env', 'secrets', 'depends_on', 'port',
   'build', 'start', 'healthCheck', 'maxBodySize', 'timeout',
-  'group', 'services', 'type', 'database', 'redis', 'route', 'mcp',
+  'group', 'services', 'type', 'database', 'redis', 'route', 'mcp', 'deploy',
 ]);
+
+/** drop.yaml#deploy.strategy values (#298). */
+export const DEPLOY_STRATEGIES = ['in-place', 'zero-downtime'] as const;
+export type DeployStrategy = (typeof DEPLOY_STRATEGIES)[number];
 
 /** Keys accepted under drop.yaml#tls */
 const ALLOWED_TLS_KEYS = new Set(['certFile', 'keyFile', 'disabled']);
@@ -256,6 +260,13 @@ export interface DropYamlConfig {
    * be surfaced, and reserves the shape PR 2's per-app OAuth will extend.
    */
   mcp?: AppMcpConfig;
+  /**
+   * How a deploy of this app is carried out (#298). `in-place` (the default)
+   * builds and runs in the app's own folder. `zero-downtime` builds each deploy
+   * into its own release directory and serves from there, so a build never
+   * rewrites the tree a live process is running from.
+   */
+  deploy?: { strategy?: DeployStrategy };
 }
 
 /**
@@ -511,6 +522,28 @@ export function validateDropYamlConfig(
       if (!isValidDomain(domain)) {
         return { valid: false, error: `Invalid domain: ${domain}` };
       }
+    }
+  }
+
+  // Validate deploy (#298)
+  if (cfg.deploy !== undefined) {
+    if (typeof cfg.deploy !== 'object' || cfg.deploy === null || Array.isArray(cfg.deploy)) {
+      return { valid: false, error: 'deploy must be an object' };
+    }
+    const deploy = cfg.deploy as Record<string, unknown>;
+    for (const key of Object.keys(deploy)) {
+      if (key !== 'strategy') {
+        return { valid: false, error: `Unknown field 'deploy.${key}' in drop.yaml` };
+      }
+    }
+    if (
+      deploy.strategy !== undefined &&
+      !(DEPLOY_STRATEGIES as readonly unknown[]).includes(deploy.strategy)
+    ) {
+      return {
+        valid: false,
+        error: `deploy.strategy must be one of: ${DEPLOY_STRATEGIES.join(', ')}`,
+      };
     }
   }
 

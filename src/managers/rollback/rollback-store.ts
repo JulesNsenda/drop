@@ -274,7 +274,9 @@ export async function captureBeforeRedeploy(appName: string): Promise<CaptureRes
     } catch {
       config = undefined;
     }
-    const appPath = config?.path || app.path;
+    // The tree that is SERVING: the current release for an app on the
+    // zero-downtime strategy (#298), its source folder otherwise.
+    const appPath = config?.currentRelease?.path || config?.path || app.path;
     return await store.capture(appName, appPath, {
       outputDirectory: config?.outputDirectory,
       maxDiskMb: config?.maxDiskMb,
