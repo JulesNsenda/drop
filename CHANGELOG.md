@@ -154,6 +154,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   when its turn comes. It also gains `setUpstream`, which repoints an app's
   routes and reloads Caddy immediately, reporting whether Caddy accepted it —
   the first step of zero-downtime redeploys (#298).
+  The Caddyfile is now also written atomically, so Caddy's reload path or a
+  Caddy restart can never read a half-written (or truncated-to-empty) file.
 
 - **The SQL console's refusal pointed at a Settings page that did not exist.**
   It told an admin to "enable it in Settings" while no such control had been

@@ -14,6 +14,7 @@ import {
   CaddyConfig,
 } from './router.types';
 import { generateFullCaddyfile } from './caddy-generator';
+import { writeFileAtomic } from '../../utils/atomic-write';
 
 const DEFAULT_CADDY_CONFIG: CaddyConfig = {
   caddyfilePath: '/etc/caddy/Caddyfile',
@@ -343,8 +344,11 @@ export class RouterService {
     const dir = path.dirname(this.config.caddy.caddyfilePath);
     await fs.mkdir(dir, { recursive: true });
 
-    // Write Caddyfile
-    await fs.writeFile(this.config.caddy.caddyfilePath, content, 'utf-8');
+    // Atomically (temp file + rename): Caddy's own reload path and a Caddy
+    // restart (`--config <caddyfilePath>`) READ this file, and a plain
+    // writeFile truncates first — a reader landing mid-write would load a
+    // partial config, or an empty one.
+    await writeFileAtomic(this.config.caddy.caddyfilePath, content);
 
     // Schedule Caddy reload if auto-reload enabled
     if (this.config.caddy.autoReload) {
