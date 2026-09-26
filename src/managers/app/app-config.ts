@@ -486,7 +486,10 @@ export interface AppConfig {
    * tier: it becomes the runtime's working directory.
    */
   currentRelease?: AppRelease;
-  /** The release served before `currentRelease`; kept for rollback (#298 step 6). */
+  /**
+   * The release served before `currentRelease` — or, for an app that has just
+   * opted out, its last release — kept as the rollback target (#298 step 6).
+   */
   previousRelease?: AppRelease;
   /**
    * Which runtime slot is live (#298): `a` = the bare app name, `b` =
@@ -508,6 +511,12 @@ export interface AppRelease {
    * survives a platform restart.
    */
   instance?: 'a' | 'b';
+  /**
+   * The app's `outputDirectory` when this release started serving — what a
+   * rollback to it must serve from (a deploy can change it). Absent on
+   * releases recorded before #298 step 6.
+   */
+  outputDirectory?: string;
 }
 
 /**

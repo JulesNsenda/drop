@@ -1027,7 +1027,9 @@ export async function handleGetDeployLogs(
 
 /**
  * rollback_app (#296) — put back the tree that was serving before the last
- * upload or git redeploy, and restart without rebuilding.
+ * upload or git redeploy, without rebuilding: a cutover to the previous
+ * release for an app that has one (#298 step 6), a snapshot restore and
+ * restart otherwise.
  *
  * 'deploy', not 'read', for the same reason as restart_app: it replaces what
  * is serving. The result says what was NOT restored, in the text as well as
@@ -1052,8 +1054,12 @@ export async function handleRollbackApp(
     const { meta } = await ops.rollbackApp(args.name);
     await auditToolAction(auth, 'rollback', args.name, 'rollback_app');
     const notRestored = [...NOT_RESTORED];
+    const target =
+      meta.kind === 'release'
+        ? `the previous release, deployed ${meta.takenAt}`
+        : `the tree captured ${meta.takenAt}`;
     const text =
-      `Application '${args.name}' rolled back to the tree captured ${meta.takenAt} and restarted.\n` +
+      `Application '${args.name}' rolled back to ${target}.\n` +
       `Restored: code, build output and dependencies. NOT restored: ${notRestored.join(', ')} — ` +
       'a database migration run by the bad deploy is still applied.\n' +
       'Call verify_deployment to confirm it serves.';
@@ -1062,6 +1068,7 @@ export async function handleRollbackApp(
       structuredContent: {
         ok: true,
         app: args.name,
+        rollback_source: meta.kind ?? 'snapshot',
         snapshot_taken_at: meta.takenAt,
         not_restored: notRestored,
         next_actions: ['verify_deployment'],
@@ -1333,7 +1340,8 @@ export function buildMcpServer(auth: AuthContext | undefined): McpServer {
       title: 'Roll back app',
       description:
         'Undo the last deploy_files or git redeploy of one of your apps: put back the code, build output and dependencies ' +
-        'that were serving before it, and restart on the same port without rebuilding. Restores CODE ONLY — the database, ' +
+        'that were serving before it, without rebuilding — an app on the zero-downtime deploy strategy switches to its previous ' +
+        'release without a gap, any other app restarts on the same port. Restores CODE ONLY — the database, ' +
         'Redis, app data, secrets and environment are not rolled back, so a migration the bad deploy ran stays applied. ' +
         'Fails with a clear error when no snapshot exists (one is kept only when a redeploy replaces a RUNNING app). ' +
         'Follow with verify_deployment.',

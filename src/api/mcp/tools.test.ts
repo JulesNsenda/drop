@@ -966,10 +966,24 @@ describe('MCP tool handlers', () => {
       expect(result.structuredContent).toEqual({
         ok: true,
         app: 'alice-app',
+        rollback_source: 'snapshot',
         snapshot_taken_at: '2026-09-01T00:00:00.000Z',
         not_restored: ['database', 'redis', 'appdata', 'secrets', 'environment'],
         next_actions: ['verify_deployment'],
       });
+    });
+
+    it('names the previous release when that is what it went back to (#298 step 6)', async () => {
+      const ops = makeOps({
+        rollbackApp: jest.fn().mockResolvedValue({ ...rolledBack, meta: { ...rolledBack.meta, kind: 'release' } }),
+      });
+      setPlatformOps(ops);
+
+      const result = await handleRollbackApp(alice, { name: 'alice-app' });
+
+      expect(firstText(result)).toContain('rolled back to the previous release, deployed 2026-09-01');
+      expect(firstText(result)).toContain('NOT restored: database');
+      expect(result.structuredContent).toEqual(expect.objectContaining({ rollback_source: 'release' }));
     });
 
     it('explains when there is no snapshot to go back to', async () => {

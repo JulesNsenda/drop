@@ -185,13 +185,20 @@ export interface PlatformOps {
   promoteApp(appName: string): Promise<void>;
 
   /**
-   * Restore the app's last-good tree (captured before the redeploy that
-   * replaced it) and restart it on its existing port, without rebuilding
-   * (#296). Rejects with NoRollbackSnapshotError when nothing was captured,
+   * Go back to what served before the last deploy, without rebuilding: cut
+   * over to the app's previous release when it has one (#298 step 6), else
+   * restore its last-good tree (captured before the redeploy that replaced
+   * it) and restart it on its existing port (#296). Rejects with NoRollbackSnapshotError when nothing was captured,
    * AppInProgressError when the app is busy. Restores CODE only — see
    * `NOT_RESTORED` in managers/rollback.
    */
   rollbackApp(appName: string): Promise<{ meta: RollbackSnapshotMeta; info: AppProcessInfo }>;
+
+  /**
+   * What `rollbackApp` would go back to — the previous release (#298 step 6)
+   * or the snapshot — without doing it; null when there is nothing.
+   */
+  describeRollback(appName: string): Promise<RollbackSnapshotMeta | null>;
 
   /**
    * Tear down every app belonging to a monorepo group (M4): stop+delete each

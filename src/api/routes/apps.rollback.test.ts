@@ -22,6 +22,7 @@ import { getStateManager } from '../../managers/app/state-manager';
 import {
   initRollbackStore,
   resetRollbackStore,
+  getRollbackStore,
   NoRollbackSnapshotError,
   NOT_RESTORED,
   captureBeforeRedeploy,
@@ -35,6 +36,7 @@ describe('/api/v1/apps/:name/rollback (#296)', () => {
   let bob: string;
   let reader: string;
   let rollbackApp: jest.Mock;
+  let describeRollback: jest.Mock;
 
   const call = (method: 'GET' | 'POST', token: string, name = 'web') =>
     t.hono.request(`/api/v1/apps/${name}/rollback`, {
@@ -64,7 +66,13 @@ describe('/api/v1/apps/:name/rollback (#296)', () => {
       meta: { appName: 'web', takenAt: '2026-09-01T00:00:00.000Z', bytes: 2, outputDirectory: 'dist' },
       info: { name: 'web', status: 'running' },
     });
-    setPlatformOps(makePlatformOpsStub({ rollbackApp }));
+    // What the platform reports for an app without a previous release: the
+    // snapshot store's answer.
+    describeRollback = jest.fn(async (name: string) => {
+      const meta = await getRollbackStore()?.get(name);
+      return meta ? { ...meta, kind: 'snapshot' } : null;
+    });
+    setPlatformOps(makePlatformOpsStub({ rollbackApp, describeRollback }));
   });
 
   afterEach(async () => {
@@ -90,7 +98,27 @@ describe('/api/v1/apps/:name/rollback (#296)', () => {
 
     const after = (await (await call('GET', alice)).json()) as { data: Record<string, unknown> };
     expect(after.data).toEqual(
-      expect.objectContaining({ available: true, doesNotRestore: [...NOT_RESTORED] })
+      expect.objectContaining({ available: true, source: 'snapshot', doesNotRestore: [...NOT_RESTORED] })
+    );
+  });
+
+  it('reports a previous release as the rollback source (#298 step 6)', async () => {
+    describeRollback.mockResolvedValue({
+      appName: 'web',
+      takenAt: '2026-09-02T00:00:00.000Z',
+      bytes: 10,
+      kind: 'release',
+    });
+
+    const res = (await (await call('GET', alice)).json()) as { data: Record<string, unknown> };
+
+    expect(res.data).toEqual(
+      expect.objectContaining({
+        available: true,
+        source: 'release',
+        snapshotTakenAt: '2026-09-02T00:00:00.000Z',
+        doesNotRestore: [...NOT_RESTORED],
+      })
     );
   });
 

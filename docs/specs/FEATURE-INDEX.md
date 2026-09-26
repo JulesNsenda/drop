@@ -72,7 +72,7 @@ something is listed here it exists in the shipped code. Planned work lives in
 | Multi-user | Per-user app ownership and limits; invitation-based signup |
 | Scoped agent tokens | Least-privilege keys scoped to named capabilities, never full admin |
 | Zero-downtime redeploys (opt-in) | `drop.yaml` `deploy: { strategy: zero-downtime }`: each deploy builds into `data/releases/<app>/<id>/`, starts beside the old instance on a second port, must answer HTTP < 500, then Caddy switches and the old instance is drained and removed; a failed new version leaves the old one serving (`READINESS_FAILED`) |
-| Per-app rollback | `POST /api/v1/apps/:name/rollback` restores the last-good tree captured before an upload/git redeploy, and restarts without rebuilding; code only, never the database |
+| Per-app rollback | `POST /api/v1/apps/:name/rollback` goes back to what served before the last deploy, without rebuilding: a zero-downtime app cuts over to its previous release; any other app gets the last-good tree captured before an upload/git redeploy and restarts; code only, never the database |
 | Deploy guardrails | Circuit breaker on failing deploy loops, per-principal quotas, ephemeral TTL'd apps, idle reaping, disk ceilings; the caller's own headroom is readable up front via `GET /api/v1/limits` |
 | Rate limiting | Stricter buckets on credential-minting and expensive endpoints |
 | Activity log | Audit trail of platform actions |
@@ -90,5 +90,6 @@ Named here because other documents have claimed otherwise at various points:
 - **No metrics export, alerting or historical retention.** The dashboard shows
   current CPU/memory/uptime; there is no Prometheus endpoint or time series.
 - **No plugin system.**
-- **No deploy rollback.** Deploy history is recorded, but there is no command
-  or endpoint that restores a previous deploy; redeploy from source instead.
+- **Rollback goes back one deploy only.** `POST /apps/:name/rollback` restores
+  the previous deploy's code (never its database); anything older means
+  redeploying from source.

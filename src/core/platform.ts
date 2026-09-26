@@ -47,6 +47,7 @@ import {
 import { AppStateManager, AppStatus, getStateManager, resetStateManager } from '../managers/app/state-manager';
 import { SettingsManager, getSettingsManager, resetSettingsManager } from '../managers/settings/settings-manager';
 import { AppConfig, AppConfigService, getAppConfigService, resetAppConfigService } from '../managers/app/app-config';
+import type { AppRelease } from '../managers/app/app-config';
 import {
   PostgresServer,
   getPostgresServer,
@@ -94,6 +95,7 @@ import {
 } from '../managers/guardrail/idle-reaper';
 import {
   findOverCeiling,
+  measureTree,
   toMb,
   configuredCeilingBytes,
   DISK_SWEEP_INTERVAL_MS,
@@ -2067,6 +2069,7 @@ backup:
       isAppInProgress: (name) => this.appsInProgress.has(name),
       promoteApp: (name) => this.promoteApp(name),
       rollbackApp: (name) => this.rollbackApp(name),
+      describeRollback: (name) => this.describeRollback(name),
       removeGroup: (name) => this.removeGroup(name),
       purgeAppArtifacts: (name, opts) => this.purgeAppArtifacts(name, opts),
       attachService: (name, serviceId) => this.attachService(name, serviceId),
@@ -6351,31 +6354,10 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
   /**
    * Zero-downtime cutover (#298 step 5) for a redeploy that has just built a
    * new release. Returns FALSE, having touched nothing, when the deploy is not
-   * eligible — the caller then stops and starts as before. Returns TRUE when it
-   * handled the deploy, successfully or not; it then owns the app's status,
-   * the guardrail outcome and releasing `appsInProgress`.
-   *
-   *   1. start the release in the IDLE slot, on a second port — the route is
-   *      not touched (see `cutovers`);
-   *   2. strict readiness: it must answer HTTP below 500, and stay alive;
-   *   3. persist the new slot and port, then point the app's routes at it and
-   *      WAIT for Caddy to accept;
-   *   4. drain, then delete the old instance and release its port.
-   *
-   * A failure before step 3 deletes the new instance and nothing else: the old
-   * one never stopped serving. Persisting before the route moves is what makes
-   * a crash recoverable: at boot the live slot comes from config, the other
-   * slot is removed as an orphan, and routes are rebuilt from the config port.
-   *
-   * Not eligible, by design: an app not on the zero-downtime strategy, one
-   * that was not running, one with a declared `port:` (two instances cannot
-   * share it), one that does not listen on its port (a worker — nothing to cut
-   * traffic over), and, on a localhost-suffix box, one that other apps depend
-   * on (they are handed its port directly, not its hostname).
-   *
-   * Caveat: every start re-mints an app's scoped DROP_API_KEY, so for an app
-   * with granted capabilities the OLD instance's key stops working for the
-   * length of the drain.
+   * eligible (see `cutoverEligibility`) — the caller then stops and starts as
+   * before. Returns TRUE when it handled the deploy, successfully or not; it
+   * then owns the app's status, the guardrail outcome and releasing
+   * `appsInProgress`.
    */
   private async tryCutover(
     appName: string,
@@ -6384,22 +6366,89 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     outputPath: string | undefined,
     wasRunning: boolean
   ): Promise<boolean> {
+    if (!wasRunning) return false;
+    const oldPort = await this.cutoverEligibility(appName, buildPath);
+    if (oldPort === null) return false;
+
+    const result = await this.cutoverTo(appName, buildPath, detection, outputPath, oldPort);
+    if (!result.ok) {
+      await this.discardDeployTarget(appName);
+      await this.failCutover(appName, oldPort, result.error, result.healthCheckPath);
+      return true;
+    }
+    this.recordDeployOutcome(appName, true);
+    this.appsInProgress.delete(appName);
+    return true;
+  }
+
+  /**
+   * The app's current port when `targetPath` can be cut over to without a
+   * gap, or null when it must be stopped and started instead.
+   *
+   * Not eligible, by design: a target that is not one of the app's releases
+   * (an in-place app), an app that is not running, one with a declared `port:`
+   * (two instances cannot share it), one that does not listen on its port (a
+   * worker — nothing to cut traffic over), and, on a localhost-suffix box, one
+   * that other apps depend on (they are handed its port directly, not its
+   * hostname).
+   */
+  private async cutoverEligibility(appName: string, targetPath: string): Promise<number | null> {
     const runtime = this.runtime;
     const state = this.stateManager;
-    if (!runtime || !state || !this.releaseStore) return false;
-    if (!this.releaseStore.isReleasePathOf(appName, buildPath) || !wasRunning) return false;
+    if (!runtime || !state || !this.releaseStore) return null;
+    if (!this.releaseStore.isReleasePathOf(appName, targetPath)) return null;
     const oldPort = state.getApp(appName)?.port;
-    if (!oldPort) return false;
-    if ((await parseDropYaml(buildPath))?.config?.port) return false;
-    if ((await runtime.getStatus(appName))?.status !== 'running') return false;
-    if (!(await probePort('127.0.0.1', oldPort, 1000))) return false;
+    if (!oldPort) return null;
+    if ((await parseDropYaml(targetPath))?.config?.port) return null;
+    if ((await runtime.getStatus(appName))?.status !== 'running') return null;
+    if (!(await probePort('127.0.0.1', oldPort, 1000))) return null;
     if (
       isLocalhostDomain(this.config.domainSuffix || 'localhost') &&
       (await this.hasDependents(appName))
     ) {
-      return false;
+      return null;
     }
+    return oldPort;
+  }
 
+  /**
+   * Put the release at `targetPath` in front of traffic without a gap — the
+   * one implementation behind a zero-downtime redeploy, a rollback to the
+   * previous release, and a promotion of a held one (#298 step 6):
+   *
+   *   1. start the release in the IDLE slot, on a second port — the route is
+   *      not touched (see `cutovers`);
+   *   2. strict readiness: it must answer HTTP below 500, and stay alive;
+   *   3. persist the new slot and port, then point the app's routes at it and
+   *      WAIT for Caddy to accept;
+   *   4. drain, then delete the old instance and release its port;
+   *   5. record the release as current, mark the app running on the new port
+   *      and re-arm its supervision.
+   *
+   * A failure before step 3 deletes the new instance and nothing else: the old
+   * one never stopped serving, and the result says why. Persisting before the
+   * route moves is what makes a crash recoverable: at boot the live slot comes
+   * from config, the other slot is removed as an orphan, and routes are
+   * rebuilt from the config port.
+   *
+   * The caller holds `appsInProgress` and has checked `cutoverEligibility`;
+   * what a failure MEANS (a failed deploy, a refused rollback) is the caller's.
+   *
+   * Caveat: every start re-mints an app's scoped DROP_API_KEY, so for an app
+   * with granted capabilities the OLD instance's key stops working for the
+   * length of the drain.
+   */
+  private async cutoverTo(
+    appName: string,
+    targetPath: string,
+    detection: DetectionResult,
+    outputPath: string | undefined,
+    oldPort: number
+  ): Promise<
+    | { ok: true; port: number }
+    | { ok: false; error: unknown; healthCheckPath: string | undefined }
+  > {
+    const runtime = this.runtime!;
     const oldSlot = runtime.getLiveInstance(appName);
     const newSlot: InstanceSlot = oldSlot === 'a' ? 'b' : 'a';
     // Runtime names, for the spec and the log; explicit REFS for every call
@@ -6412,15 +6461,16 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     const newPort = this.allocateAdditionalPort(appName);
     this.cutovers.add(appName);
     this.logger.info(
-      `Zero-downtime deploy of ${appName}: starting ${newInstance} on port ${newPort} beside ${oldInstance}`,
+      `Zero-downtime cutover of ${appName}: starting ${newInstance} on port ${newPort} beside ${oldInstance}`,
       'CUTOVER'
     );
 
     let spec: AppStartSpec | undefined;
     let started = false;
     let persisted = false;
+    const previousOutput = this.appConfigService?.getConfig(appName)?.outputDirectory;
     try {
-      spec = (await this.buildFreshStartSpec(appName, buildPath, detection, outputPath, newPort)).spec;
+      spec = (await this.buildFreshStartSpec(appName, targetPath, detection, outputPath, newPort)).spec;
       spec.instance = newInstance;
       // A leftover of the idle slot (an earlier cutover that died) must go.
       if (await runtime.getStatus(newRef).catch(() => null)) {
@@ -6451,13 +6501,13 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       this.cutovers.delete(appName);
       if (persisted) {
         await this.appConfigService?.updateSystemConfig(appName, { runtimeSlot: oldSlot }).catch(() => undefined);
-        await this.appConfigService?.updateConfig(appName, { port: oldPort }).catch(() => undefined);
+        await this.appConfigService
+          ?.updateConfig(appName, { port: oldPort, outputDirectory: previousOutput })
+          .catch(() => undefined);
       }
       if (started) await runtime.delete(newRef).catch(() => undefined);
       if (this.usedPorts.get(newPort) === appName) this.usedPorts.delete(newPort);
-      await this.discardDeployTarget(appName);
-      await this.failCutover(appName, oldPort, error, spec?.healthCheckPath);
-      return true;
+      return { ok: false, error, healthCheckPath: spec?.healthCheckPath };
     }
 
     // Traffic is on the new instance. Let in-flight requests to the old one
@@ -6474,16 +6524,14 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     // instance that was still serving.
     runtime.setLiveInstance(appName, newSlot);
 
-    await this.commitServedPath(appName, buildPath, newSlot);
+    await this.commitServedPath(appName, targetPath, newSlot);
     void this.recordDeploySignature(appName, this.sourcePathOf(appName));
     const info = await runtime.getStatus(appName);
-    await state.setAppStatus(appName, 'running', { port: newPort, pid: info?.pid ?? undefined });
+    await this.stateManager?.setAppStatus(appName, 'running', { port: newPort, pid: info?.pid ?? undefined });
     this.appDeployTimes.set(appName, Date.now());
     this.armPostDeployWatches(appName, newPort, spec.healthCheckPath);
-    this.recordDeployOutcome(appName, true);
-    this.appsInProgress.delete(appName);
-    this.logger.info(`Zero-downtime deploy of ${appName} complete: now serving from ${newInstance}`, 'CUTOVER');
-    return true;
+    this.logger.info(`Zero-downtime cutover of ${appName} complete: now serving from ${newInstance}`, 'CUTOVER');
+    return { ok: true, port: newPort };
   }
 
   /**
@@ -6685,9 +6733,11 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
   /**
    * The app is now RUNNING from `servedPath`: record it. A release becomes
    * `currentRelease` (the one it replaces becomes `previousRelease`) and any
-   * older release is pruned. An in-place start clears any release record left
-   * from before the app opted out, and deletes its releases. Best-effort: the
-   * app is already serving, so a bookkeeping failure is logged, not thrown.
+   * older release is pruned — so a rollback to `previousRelease` swaps the
+   * two, keeping the original record. An in-place start after the app opted
+   * out keeps its last release as `previousRelease`, so that deploy can still
+   * be rolled back, and deletes the rest. Best-effort: the app is already
+   * serving, so a bookkeeping failure is logged, not thrown.
    */
   private async commitServedPath(appName: string, servedPath: string, slot?: InstanceSlot): Promise<void> {
     if (this.deployTargets.get(appName) === servedPath) this.deployTargets.delete(appName);
@@ -6698,21 +6748,26 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       const cfg = configs.getConfig(appName);
       if (store.isReleasePathOf(appName, servedPath)) {
         if (cfg?.currentRelease?.path === servedPath) return;
+        // A rollback serves the previous release again: keep its record (when
+        // it was deployed, what it served), not a fresh one.
+        const reused = cfg?.previousRelease?.path === servedPath ? cfg.previousRelease : undefined;
         const current = {
-          id: path.basename(servedPath),
-          path: servedPath,
-          createdAt: new Date().toISOString(),
+          ...(reused
+            ? { ...reused, instance: undefined }
+            : { id: path.basename(servedPath), path: servedPath, createdAt: new Date().toISOString() }),
+          // What a later rollback to this release must serve from.
+          ...(reused ? {} : cfg?.outputDirectory !== undefined ? { outputDirectory: cfg.outputDirectory } : {}),
           ...(slot ? { instance: slot } : {}),
         };
         const previous = cfg?.currentRelease ?? cfg?.previousRelease;
         await configs.updateSystemConfig(appName, { currentRelease: current, previousRelease: previous });
         await store.prune(appName, [current.path, previous?.path, cfg?.pendingPromotion?.releasePath]);
-      } else if (cfg?.currentRelease || cfg?.previousRelease) {
+      } else if (cfg?.currentRelease) {
         await configs.updateSystemConfig(appName, {
           currentRelease: undefined,
-          previousRelease: undefined,
+          previousRelease: cfg.currentRelease,
         });
-        await store.prune(appName, [cfg?.pendingPromotion?.releasePath]);
+        await store.prune(appName, [cfg.currentRelease.path, cfg.pendingPromotion?.releasePath]);
       }
     } catch (error) {
       this.logger.warn(`Failed to record the release ${appName} is serving from`, 'RELEASE', error);
@@ -6720,9 +6775,19 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
   }
 
   /**
-   * Put back the app's last-good tree and restart it on its existing port
-   * (#296). No rebuild: the snapshot holds build output and dependencies as
-   * they were when that tree was serving.
+   * Go back to what served before the last deploy. No rebuild either way.
+   *
+   * An app with a `previousRelease` (#298 step 6 — the zero-downtime
+   * strategy, or an app that has just opted out of it) is CUT OVER to that
+   * release when it is running and listening, exactly as a redeploy is: the
+   * current version serves until the previous one has proved ready, and if it
+   * never does, nothing changes and the rollback is refused. Otherwise the
+   * release is recorded as current and the app restarts from it. The source
+   * folder is not touched: the next deploy builds from it again.
+   *
+   * Any other app gets its last-good tree back from the snapshot store and
+   * restarts on its existing port (#296): the snapshot holds build output and
+   * dependencies as they were when that tree was serving.
    *
    * Holds the `appsInProgress` guard across the restore AND the restart, so a
    * deploy cannot land files between the two, and watcher events raised by
@@ -6751,8 +6816,11 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       if (!config && !state) {
         throw new Error(`Application not found: ${appName}`);
       }
-      const appPath = this.servingPathOf(appName, config, state);
 
+      const release = await this.rollbackRelease(appName);
+      if (release) return await this.rollbackToRelease(appName, release);
+
+      const appPath = this.servingPathOf(appName, config, state);
       const meta = await store.restoreInto(appName, appPath);
       this.appDeployTimes.set(appName, Date.now());
       if (meta.outputDirectory !== undefined) {
@@ -6765,6 +6833,80 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     } finally {
       this.appsInProgress.delete(appName);
     }
+  }
+
+  /**
+   * What a rollback would go back to, without doing it: the previous release
+   * when there is one, the snapshot otherwise, or null. Backs
+   * `GET /apps/:name/rollback`.
+   */
+  async describeRollback(appName: string): Promise<RollbackSnapshotMeta | null> {
+    const release = await this.rollbackRelease(appName);
+    if (release) return this.releaseRollbackMeta(appName, release);
+    const snapshot = await getRollbackStore()?.get(appName);
+    return snapshot ? { ...snapshot, kind: 'snapshot' } : null;
+  }
+
+  /** The app's previous release, when it is contained and still on disk. */
+  private async rollbackRelease(appName: string): Promise<AppRelease | null> {
+    const release = this.appConfigService?.getConfig(appName)?.previousRelease;
+    // Contained, or ignored: a rollback makes this the runtime's cwd.
+    if (!release || !this.releaseStore?.isReleasePathOf(appName, release.path)) return null;
+    try {
+      await fs.access(release.path);
+      return release;
+    } catch {
+      return null;
+    }
+  }
+
+  private async releaseRollbackMeta(appName: string, release: AppRelease): Promise<RollbackSnapshotMeta> {
+    const measured = await measureTree(release.path).catch(() => ({ bytes: 0 }));
+    return {
+      appName,
+      takenAt: release.createdAt,
+      bytes: measured.bytes,
+      ...(release.outputDirectory !== undefined ? { outputDirectory: release.outputDirectory } : {}),
+      kind: 'release',
+    };
+  }
+
+  /** rollbackApp for an app with a previous release. The caller holds the guard. */
+  private async rollbackToRelease(
+    appName: string,
+    release: AppRelease
+  ): Promise<{ meta: RollbackSnapshotMeta; info: AppProcessInfo }> {
+    if (!this.runtime || !this.detector || !this.appConfigService) {
+      throw new Error('Platform is not fully initialized');
+    }
+    const meta = await this.releaseRollbackMeta(appName, release);
+
+    const oldPort = await this.cutoverEligibility(appName, release.path);
+    if (oldPort !== null) {
+      const detection = await this.detector.detect(release.path, { silent: true });
+      const result = await this.cutoverTo(appName, release.path, detection, release.outputDirectory, oldPort);
+      if (!result.ok) {
+        const reason = result.error instanceof Error ? result.error.message : String(result.error);
+        throw new Error(
+          `Rollback of '${appName}' was not applied: ${reason}. The current version is still serving.`
+        );
+      }
+      this.logger.info(`Rolled back ${appName} to the release deployed ${release.createdAt}`, 'ROLLBACK');
+      const info = await this.runtime.getStatus(appName);
+      if (!info) throw new Error(`Rolled back ${appName}, but the runtime does not report it`);
+      return { meta, info };
+    }
+
+    // Not running, or not something traffic can be cut over for: serve the
+    // previous release from the next start, as a snapshot rollback would.
+    if (release.outputDirectory !== undefined) {
+      await this.appConfigService.upsertConfig(appName, { outputDirectory: release.outputDirectory });
+    }
+    await this.commitServedPath(appName, release.path);
+    this.appDeployTimes.set(appName, Date.now());
+    this.logger.info(`Rolled back ${appName} to the release deployed ${release.createdAt}`, 'ROLLBACK');
+    const info = await this.doRestart(appName);
+    return { meta, info };
   }
 
   /**
@@ -8328,6 +8470,15 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           );
           continue;
         }
+        // The same for the previous release (#298 step 6), the rollback target
+        // of an app on the zero-downtime strategy.
+        if (await this.dropPreviousRelease(verdict.name)) {
+          this.logger.warn(
+            `Dropped the previous release of ${verdict.name} to keep it under its disk ceiling`,
+            'DISK'
+          );
+          continue;
+        }
 
         const reason =
           `Over its disk ceiling: ${toMb(verdict.bytes)} MB used of ` +
@@ -8358,6 +8509,20 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         'DISK'
       );
     }
+  }
+
+  /**
+   * Forget an app's previous release and delete it. True when there was one.
+   * The current release and a held build are kept.
+   */
+  private async dropPreviousRelease(appName: string): Promise<boolean> {
+    const cfg = this.appConfigService?.getConfig(appName);
+    if (!cfg?.previousRelease || !this.releaseStore) return false;
+    await this.appConfigService?.updateSystemConfig(appName, { previousRelease: undefined });
+    await this.releaseStore
+      .prune(appName, [cfg.currentRelease?.path, cfg.pendingPromotion?.releasePath])
+      .catch(() => undefined);
+    return true;
   }
 
   /**
@@ -8435,13 +8600,32 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       detail: `Promoted build from ${pending.builtAt}`,
     });
 
-    // The swap itself is the ordinary start path, so promotion has no second
-    // implementation of starting an app to drift from the first.
+    // The swap itself is an ordinary start path, so promotion has no second
+    // implementation of starting an app to drift from the first: a held
+    // release of a running app is cut over to (#298 step 6), anything else
+    // goes through the deploy path's start.
     this.appsInProgress.add(appName);
     try {
       // Re-validated: pendingPromotion is not a system-tier field.
       if (this.releaseStore?.isReleasePathOf(appName, pending.releasePath)) {
         this.deployTargets.set(appName, pending.releasePath);
+        const oldPort = await this.cutoverEligibility(appName, pending.releasePath);
+        if (oldPort !== null && this.detector) {
+          const detection = await this.detector.detect(pending.releasePath, { silent: true });
+          const result = await this.cutoverTo(
+            appName,
+            pending.releasePath,
+            detection,
+            pending.outputDirectory,
+            oldPort
+          );
+          if (result.ok) return;
+          await this.discardDeployTarget(appName);
+          const reason = result.error instanceof Error ? result.error.message : String(result.error);
+          throw new Error(
+            `The held build of '${appName}' was not promoted: ${reason}. The previous version is still serving.`
+          );
+        }
       }
       await this.handleStartApp(appName, pending.outputDirectory);
     } finally {

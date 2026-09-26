@@ -10,6 +10,10 @@
  * included. One copy of it is runtime-agnostic by construction: a restore
  * followed by the ordinary restart path behaves identically in both modes.
  *
+ * WHO. Apps that serve from their source folder. An app on the zero-downtime
+ * strategy (#298) keeps its previous release instead, and a rollback cuts over
+ * to that — so this store takes no copy of it, and drops any older one.
+ *
  * WHEN. Captured immediately BEFORE an upload or git redeploy overwrites a
  * RUNNING app — i.e. the tree that was serving. That is one retained copy (the
  * last-good), not two: capturing after success would need both the current
@@ -48,6 +52,7 @@ import { isValidAppName } from '../../api/middleware/validate';
 import { measureTree, configuredCeilingBytes, MB } from '../guardrail/disk-ceiling';
 import { getStateManager } from '../app/state-manager';
 import { getAppConfigService } from '../app/app-config';
+import { ReleaseStore } from '../release/release-store';
 
 export interface RollbackSnapshotMeta {
   appName: string;
@@ -56,6 +61,12 @@ export interface RollbackSnapshotMeta {
   bytes: number;
   /** AppConfig.outputDirectory at capture, restored with the tree (static apps serve from it). */
   outputDirectory?: string;
+  /**
+   * What a rollback goes back to: this store's copy of the tree, or the app's
+   * previous release (#298 step 6), which needs no copy. For a release,
+   * `takenAt` is when that release was deployed.
+   */
+  kind?: 'snapshot' | 'release';
 }
 
 export type CaptureResult =
@@ -77,6 +88,10 @@ export class RollbackStore {
   private readonly locks = new Map<string, Promise<unknown>>();
 
   constructor(private readonly dropRoot: string) {}
+
+  get dropRootDir(): string {
+    return this.dropRoot;
+  }
 
   get root(): string {
     return path.join(this.dropRoot, 'data', 'rollback');
@@ -274,13 +289,27 @@ export async function captureBeforeRedeploy(appName: string): Promise<CaptureRes
     } catch {
       config = undefined;
     }
-    // The tree that is SERVING: the current release for an app on the
-    // zero-downtime strategy (#298), its source folder otherwise.
-    const appPath = config?.currentRelease?.path || config?.path || app.path;
-    return await store.capture(appName, appPath, {
+    // An app serving from a release keeps the release it replaces; a rollback
+    // cuts over to that (#298 step 6). A snapshot from before it opted in
+    // would be older than that release, so it goes.
+    if (config?.currentRelease?.path) {
+      await store.remove(appName);
+      return { captured: false, reason: 'the app keeps its previous release for rollback instead' };
+    }
+    const result = await store.capture(appName, config?.path || app.path, {
       outputDirectory: config?.outputDirectory,
       maxDiskMb: config?.maxDiskMb,
     });
+    // An app that has just opted out of releases still holds its last one as
+    // the rollback target. The snapshot is newer; it takes over, and the
+    // release goes (a held build, if any, is kept).
+    if (result.captured && config?.previousRelease) {
+      await getAppConfigService().updateSystemConfig(appName, { previousRelease: undefined });
+      await new ReleaseStore(store.dropRootDir)
+        .prune(appName, [config.pendingPromotion?.releasePath])
+        .catch(() => undefined);
+    }
+    return result;
   } catch (err) {
     return { captured: false, reason: err instanceof Error ? err.message : String(err) };
   }
