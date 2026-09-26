@@ -3,7 +3,7 @@
  * name can contain, or an app could be mistaken for another app's slot b.
  */
 
-import { instanceName, appNameOfInstance, isInstanceName, LiveInstances } from './instance';
+import { instanceName, instanceRef, appNameOfInstance, isInstanceName, LiveInstances } from './instance';
 import { isValidAppName } from '../../api/middleware/validate';
 
 describe('runtime instances', () => {
@@ -34,5 +34,15 @@ describe('runtime instances', () => {
 
     live.set('web', 'a');
     expect(live.resolve('web')).toBe('web');
+  });
+
+  it('an explicit reference hits exactly one slot, whichever is live', () => {
+    const live = new LiveInstances();
+    live.set('web', 'b');
+    // The trap: slot a's runtime name IS the bare app name, which now means b.
+    expect(live.resolve(instanceName('web', 'a'))).toBe('web.b');
+    expect(live.resolve(instanceRef('web', 'a'))).toBe('web');
+    expect(live.resolve(instanceRef('web', 'b'))).toBe('web.b');
+    expect(appNameOfInstance(instanceRef('web', 'a'))).toBe('web');
   });
 });

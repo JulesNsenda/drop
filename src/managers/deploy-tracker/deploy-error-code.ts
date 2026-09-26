@@ -45,6 +45,9 @@ export type DeployErrorCode =
   | 'PROCESS_EXITED'
   | 'CRASH_LOOPED'
   | 'OOM_KILLED'
+  // A zero-downtime cutover's new instance never proved it serves (#298). The
+  // previous release is still the one serving.
+  | 'READINESS_FAILED'
   // Guardrail phase — refused before anything ran. Neither is a failure of the
   // app: the deploy was never attempted, so telling a caller to read a build
   // log would send them looking for output that does not exist.
@@ -86,6 +89,8 @@ function codeForReason(reason: DeployFailureReason): DeployErrorCode {
       return 'CRASH_LOOPED';
     case 'oom-killed':
       return 'OOM_KILLED';
+    case 'readiness-failed':
+      return 'READINESS_FAILED';
   }
 }
 

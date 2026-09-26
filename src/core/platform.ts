@@ -37,6 +37,13 @@ import { getProcfileWebCommand } from './detector/procfile';
 import { BuilderService, getBuilder } from './builder';
 import { RouterService, getRouterService, resetRouterService } from './router';
 import { AppRuntime, AppProcessInfo, AppStartSpec, getAppRuntime, resetAppRuntime } from '../managers/runtime';
+import {
+  instanceName,
+  instanceRef,
+  appNameOfInstance,
+  isInstanceName,
+  type InstanceSlot,
+} from '../managers/runtime/instance';
 import { AppStateManager, AppStatus, getStateManager, resetStateManager } from '../managers/app/state-manager';
 import { SettingsManager, getSettingsManager, resetSettingsManager } from '../managers/settings/settings-manager';
 import { AppConfig, AppConfigService, getAppConfigService, resetAppConfigService } from '../managers/app/app-config';
@@ -695,6 +702,15 @@ export function decideBootReconciliation(input: BootReconcileInput): BootReconci
   return decideBootReconciliationCheap(input) ?? decideBootReconciliationSignature(input);
 }
 
+
+/** A cutover that did not happen; `exited` = the new instance died, vs never proved ready. */
+class CutoverError extends Error {
+  constructor(message: string, readonly exited: boolean) {
+    super(message);
+    this.name = 'CutoverError';
+  }
+}
+
 export class DropPlatform {
   private readonly config: PlatformConfig;
   private readonly eventBus: EventBus;
@@ -797,6 +813,13 @@ export class DropPlatform {
    * the stale one.
    */
   private deployTargets: Map<string, string> = new Map();
+  /**
+   * Apps mid-cutover (#298 step 5). While present, a runtime `app:started` for
+   * the app must NOT rewrite its route: that event fires when the new
+   * instance's process starts, before it has proved anything, and the cutover
+   * switches the route itself once it has.
+   */
+  private cutovers: Set<string> = new Set();
   // Apps whose rebuild+restart is being managed as a single transaction by
   // handleAppUpdate. Their builder.build still emits build:completed, but
   // buildSub must NOT also start them (that would double-start). Held only for
@@ -1920,8 +1943,10 @@ backup:
     // after a zero-downtime cutover — needs telling, and must be told before
     // anything below asks the runtime about it by name.
     for (const cfg of this.appConfigService.getAllConfigs()) {
-      if (cfg.currentRelease?.instance === 'b') this.runtime.setLiveInstance(cfg.name, 'b');
+      const slot = cfg.runtimeSlot ?? cfg.currentRelease?.instance;
+      if (slot === 'b') this.runtime.setLiveInstance(cfg.name, 'b');
     }
+    await this.removeOrphanInstances();
 
     // Load used ports from existing PM2 processes
     await this.loadUsedPorts();
@@ -2798,7 +2823,13 @@ backup:
 
     // When app starts, configure routing
     const startedSub = this.eventBus.subscribe('app:started', async (payload) => {
-      await this.handleConfigureRoute(payload.name, payload.port);
+      // PM2 publishes the PROCESS name, which for a slot-b instance is
+      // `<app>.b` (#298) — routes are per APP.
+      const appName = appNameOfInstance(payload.name);
+      // A cutover switches the route itself, after the new instance proves it
+      // serves; routing it here would send traffic to it before that.
+      if (this.cutovers.has(appName)) return;
+      await this.handleConfigureRoute(appName, payload.port);
     });
     this.subscriptions.push(startedSub);
 
@@ -6097,6 +6128,21 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         return;
       }
 
+      // Zero-downtime cutover (#298) for an eligible app: the old instance
+      // keeps serving until the new one has proved itself and traffic moved.
+      // Returns false, having touched nothing, for anything it cannot cut over.
+      if (
+        await this.tryCutover(
+          appName,
+          buildPath,
+          detection,
+          buildResult.outputPath ?? undefined,
+          wasRunning
+        )
+      ) {
+        return;
+      }
+
       // Build succeeded — now stop the old version and swap in the new one.
       // The port reservation is held throughout — no release here — because
       // buildFreshStartSpec's allocatePort() call below re-claims the same
@@ -6225,12 +6271,14 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     appName: string,
     appPath: string,
     detection: DetectionResult,
-    buildOutputDir?: string
+    buildOutputDir?: string,
+    /** A cutover's second port (#298), already claimed in usedPorts. */
+    portOverride?: number
   ): Promise<{ spec: AppStartSpec; port: number }> {
     // Restart path: honour a declared `port:` here too, or a restart would
     // quietly hand back the previously auto-allocated port and undo it.
     const declaredPort = (await parseDropYaml(appPath))?.config?.port;
-    const port = this.allocatePort(appName, declaredPort);
+    const port = portOverride ?? this.allocatePort(appName, declaredPort);
 
     // Ensure data directory exists (preserved across upgrades)
     const dataDir = await this.ensureAppDataDirectory(appName);
@@ -6297,6 +6345,268 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       return await this.doRestart(appName);
     } finally {
       this.appsInProgress.delete(appName);
+    }
+  }
+
+  /**
+   * Zero-downtime cutover (#298 step 5) for a redeploy that has just built a
+   * new release. Returns FALSE, having touched nothing, when the deploy is not
+   * eligible — the caller then stops and starts as before. Returns TRUE when it
+   * handled the deploy, successfully or not; it then owns the app's status,
+   * the guardrail outcome and releasing `appsInProgress`.
+   *
+   *   1. start the release in the IDLE slot, on a second port — the route is
+   *      not touched (see `cutovers`);
+   *   2. strict readiness: it must answer HTTP below 500, and stay alive;
+   *   3. persist the new slot and port, then point the app's routes at it and
+   *      WAIT for Caddy to accept;
+   *   4. drain, then delete the old instance and release its port.
+   *
+   * A failure before step 3 deletes the new instance and nothing else: the old
+   * one never stopped serving. Persisting before the route moves is what makes
+   * a crash recoverable: at boot the live slot comes from config, the other
+   * slot is removed as an orphan, and routes are rebuilt from the config port.
+   *
+   * Not eligible, by design: an app not on the zero-downtime strategy, one
+   * that was not running, one with a declared `port:` (two instances cannot
+   * share it), one that does not listen on its port (a worker — nothing to cut
+   * traffic over), and, on a localhost-suffix box, one that other apps depend
+   * on (they are handed its port directly, not its hostname).
+   *
+   * Caveat: every start re-mints an app's scoped DROP_API_KEY, so for an app
+   * with granted capabilities the OLD instance's key stops working for the
+   * length of the drain.
+   */
+  private async tryCutover(
+    appName: string,
+    buildPath: string,
+    detection: DetectionResult,
+    outputPath: string | undefined,
+    wasRunning: boolean
+  ): Promise<boolean> {
+    const runtime = this.runtime;
+    const state = this.stateManager;
+    if (!runtime || !state || !this.releaseStore) return false;
+    if (!this.releaseStore.isReleasePathOf(appName, buildPath) || !wasRunning) return false;
+    const oldPort = state.getApp(appName)?.port;
+    if (!oldPort) return false;
+    if ((await parseDropYaml(buildPath))?.config?.port) return false;
+    if ((await runtime.getStatus(appName))?.status !== 'running') return false;
+    if (!(await probePort('127.0.0.1', oldPort, 1000))) return false;
+    if (
+      isLocalhostDomain(this.config.domainSuffix || 'localhost') &&
+      (await this.hasDependents(appName))
+    ) {
+      return false;
+    }
+
+    const oldSlot = runtime.getLiveInstance(appName);
+    const newSlot: InstanceSlot = oldSlot === 'a' ? 'b' : 'a';
+    // Runtime names, for the spec and the log; explicit REFS for every call
+    // that must hit exactly one slot — a bare slot-a name would resolve to
+    // whichever slot is live (see instance.ts, "Addressing one slot").
+    const oldInstance = instanceName(appName, oldSlot);
+    const newInstance = instanceName(appName, newSlot);
+    const oldRef = instanceRef(appName, oldSlot);
+    const newRef = instanceRef(appName, newSlot);
+    const newPort = this.allocateAdditionalPort(appName);
+    this.cutovers.add(appName);
+    this.logger.info(
+      `Zero-downtime deploy of ${appName}: starting ${newInstance} on port ${newPort} beside ${oldInstance}`,
+      'CUTOVER'
+    );
+
+    let spec: AppStartSpec | undefined;
+    let started = false;
+    let persisted = false;
+    try {
+      spec = (await this.buildFreshStartSpec(appName, buildPath, detection, outputPath, newPort)).spec;
+      spec.instance = newInstance;
+      // A leftover of the idle slot (an earlier cutover that died) must go.
+      if (await runtime.getStatus(newRef).catch(() => null)) {
+        await runtime.delete(newRef).catch(() => undefined);
+      }
+      await this.noteRuntimeLogStart(appName);
+      await runtime.start(spec);
+      started = true;
+
+      const ready = await this.awaitStrictReadiness(newRef, newPort, spec.healthCheckPath);
+      if (!ready.ok) throw new CutoverError(ready.reason, ready.exited);
+
+      // Point of no return for bookkeeping: see the method doc on ordering.
+      await this.appConfigService?.updateSystemConfig(appName, { runtimeSlot: newSlot });
+      await this.appConfigService?.updateConfig(appName, {
+        port: newPort,
+        ...(outputPath ? { outputDirectory: outputPath } : {}),
+      });
+      persisted = true;
+
+      const switched = await this.router?.setUpstream(appName, `localhost:${newPort}`);
+      if (switched?.outcome === 'rejected') {
+        throw new CutoverError('Caddy rejected the config that switched traffic to the new version', false);
+      }
+      // 'unavailable' / 'disabled' / no routes: nothing routes through Caddy
+      // here (a dev box), so there is no traffic switch to wait for.
+    } catch (error) {
+      this.cutovers.delete(appName);
+      if (persisted) {
+        await this.appConfigService?.updateSystemConfig(appName, { runtimeSlot: oldSlot }).catch(() => undefined);
+        await this.appConfigService?.updateConfig(appName, { port: oldPort }).catch(() => undefined);
+      }
+      if (started) await runtime.delete(newRef).catch(() => undefined);
+      if (this.usedPorts.get(newPort) === appName) this.usedPorts.delete(newPort);
+      await this.discardDeployTarget(appName);
+      await this.failCutover(appName, oldPort, error, spec?.healthCheckPath);
+      return true;
+    }
+
+    // Traffic is on the new instance. Let in-flight requests to the old one
+    // finish, then remove it.
+    this.cutovers.delete(appName);
+    await new Promise((resolve) => setTimeout(resolve, this.cutoverDrainMs()));
+    this.stopHealthProber(appName);
+    await runtime.delete(oldRef).catch((err) =>
+      this.logger.warn(`Could not remove ${oldInstance} after cutover`, 'CUTOVER', err)
+    );
+    if (this.usedPorts.get(oldPort) === appName) this.usedPorts.delete(oldPort);
+    // Only now does a bare app name mean the new instance. Until the old one
+    // was gone, anything asking the runtime about the app by name got the
+    // instance that was still serving.
+    runtime.setLiveInstance(appName, newSlot);
+
+    await this.commitServedPath(appName, buildPath, newSlot);
+    void this.recordDeploySignature(appName, this.sourcePathOf(appName));
+    const info = await runtime.getStatus(appName);
+    await state.setAppStatus(appName, 'running', { port: newPort, pid: info?.pid ?? undefined });
+    this.appDeployTimes.set(appName, Date.now());
+    this.armPostDeployWatches(appName, newPort, spec.healthCheckPath);
+    this.recordDeployOutcome(appName, true);
+    this.appsInProgress.delete(appName);
+    this.logger.info(`Zero-downtime deploy of ${appName} complete: now serving from ${newInstance}`, 'CUTOVER');
+    return true;
+  }
+
+  /**
+   * Report a cutover that did not happen. The old instance is still serving,
+   * so the app ends `running` — but the deploy FAILED, and the tracker closes
+   * an episode as failed only on `errored`. So: publish the boot failure, mark
+   * `errored` (closing the episode and its detail), then put the true status
+   * back and re-arm the old instance's supervision, which the `errored`
+   * transition tore down.
+   */
+  private async failCutover(
+    appName: string,
+    oldPort: number,
+    error: unknown,
+    healthCheckPath: string | undefined
+  ): Promise<void> {
+    const reason = error instanceof Error ? error.message : String(error);
+    const exited = error instanceof CutoverError && error.exited;
+    this.logger.warn(`Zero-downtime deploy of ${appName} failed; previous version still serving: ${reason}`, 'CUTOVER');
+    this.recordDeployOutcome(appName, false);
+    await this.noteRuntimeLogEnd(appName);
+    eventBus.publish('deploy:failed', {
+      appId: appName,
+      phase: 'boot',
+      reason: exited ? 'process-exited' : 'readiness-failed',
+    });
+    const message = `New version was not deployed (${reason}); the previous version is still serving.`;
+    await this.stateManager?.setAppStatus(appName, 'errored', { port: oldPort, error: message });
+    await this.stateManager?.setAppStatus(appName, 'running', { port: oldPort, error: message });
+    this.armPostDeployWatches(appName, oldPort, healthCheckPath);
+    this.appsInProgress.delete(appName);
+  }
+
+  /**
+   * Readiness for CUTTING TRAFFIC OVER, which is stricter than the deploy-path
+   * gate on purpose: that one accepts a bare port bind (PM2) or a slow start
+   * with a warning, because a first deploy has nothing to protect. Here the old
+   * version is serving, so the new one must answer HTTP below 500 — on its
+   * `healthCheck` path when it declares one — and still be alive.
+   */
+  private async awaitStrictReadiness(
+    instance: string,
+    port: number,
+    healthCheckPath: string | undefined
+  ): Promise<{ ok: true } | { ok: false; reason: string; exited: boolean }> {
+    const deadline = Date.now() + this.readinessTimeoutMs;
+    let lastStatus: number | undefined;
+    while (Date.now() < deadline) {
+      const info = await this.runtime?.getStatus(instance).catch(() => null);
+      if (!info || info.status === 'stopped' || info.status === 'errored') {
+        return { ok: false, reason: 'the new instance exited before it was ready', exited: true };
+      }
+      const probe = await probeHttp('127.0.0.1', port, healthCheckPath || '/', 2000);
+      if (probe.responded && typeof probe.statusCode === 'number') {
+        if (probe.statusCode < 500) return { ok: true };
+        lastStatus = probe.statusCode;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+    return {
+      ok: false,
+      reason: lastStatus
+        ? `the new instance answered HTTP ${lastStatus} until the readiness window closed`
+        : 'the new instance never answered HTTP within the readiness window',
+      exited: false,
+    };
+  }
+
+  /** Drain window between switching traffic and removing the old instance. */
+  private cutoverDrainMs(): number {
+    const parsed = parseInt(process.env.DROP_CUTOVER_DRAIN_MS ?? '', 10);
+    return Number.isFinite(parsed) && parsed >= 0 ? parsed : 10_000;
+  }
+
+  /**
+   * A port for a cutover's new instance: never the app's current one. Claimed
+   * synchronously, like allocatePort's range scan, so nothing can race onto it.
+   */
+  private allocateAdditionalPort(appName: string): number {
+    for (let p = this.config.portRangeStart; p <= this.config.portRangeEnd; p++) {
+      if (!this.usedPorts.has(p)) {
+        this.usedPorts.set(p, appName);
+        return p;
+      }
+    }
+    throw new Error('No available ports in configured range');
+  }
+
+  /** Whether any other app's drop.yaml lists `appName` under depends_on. */
+  private async hasDependents(appName: string): Promise<boolean> {
+    for (const other of this.stateManager?.getAllApps() ?? []) {
+      if (other.name === appName || other.isGroupContainer) continue;
+      try {
+        const parsed = await parseDropYaml(this.sourcePathOf(other.name));
+        if (parsed.config?.depends_on?.some((d) => d.name === appName)) return true;
+      } catch {
+        // An unreadable manifest declares nothing.
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Remove runtime instances that are not their app's live one (#298): the
+   * leftover of a cutover the platform died in the middle of. Which slot is
+   * live comes from config, written only once a new instance proved ready, so
+   * the survivor is always one that served. Best-effort.
+   */
+  private async removeOrphanInstances(): Promise<void> {
+    if (!this.runtime) return;
+    let all: AppProcessInfo[];
+    try {
+      all = await this.runtime.getAllStatus();
+    } catch {
+      return;
+    }
+    for (const proc of all) {
+      if (!proc.instance) continue;
+      const live = instanceName(proc.name, this.runtime.getLiveInstance(proc.name));
+      if (proc.instance === live) continue;
+      this.logger.warn(`Removing orphaned instance ${proc.instance} (live: ${live})`, 'CUTOVER');
+      const orphanSlot: InstanceSlot = isInstanceName(proc.instance) ? 'b' : 'a';
+      await this.runtime.delete(instanceRef(proc.name, orphanSlot)).catch(() => undefined);
     }
   }
 
@@ -6379,7 +6689,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
    * from before the app opted out, and deletes its releases. Best-effort: the
    * app is already serving, so a bookkeeping failure is logged, not thrown.
    */
-  private async commitServedPath(appName: string, servedPath: string): Promise<void> {
+  private async commitServedPath(appName: string, servedPath: string, slot?: InstanceSlot): Promise<void> {
     if (this.deployTargets.get(appName) === servedPath) this.deployTargets.delete(appName);
     const store = this.releaseStore;
     const configs = this.appConfigService;
@@ -6392,6 +6702,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           id: path.basename(servedPath),
           path: servedPath,
           createdAt: new Date().toISOString(),
+          ...(slot ? { instance: slot } : {}),
         };
         const previous = cfg?.currentRelease ?? cfg?.previousRelease;
         await configs.updateSystemConfig(appName, { currentRelease: current, previousRelease: previous });
@@ -7455,6 +7766,22 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
    * essentially every real deletion. Best-effort; never throws.
    */
   async purgeAppArtifacts(name: string, opts: { keepData?: boolean } = {}): Promise<void> {
+    // The OTHER runtime slot (#298). Both delete paths remove the app's LIVE
+    // instance by name before reaching here; the idle slot can exist too (a
+    // crash mid-cutover), and must not outlive the app whose name it carries.
+    // Best-effort, like everything else in this method.
+    try {
+      if (this.runtime) {
+        const live = this.runtime.getLiveInstance(name);
+        await this.runtime
+          .delete(instanceRef(name, live === 'a' ? 'b' : 'a'))
+          .catch(() => undefined);
+        this.runtime.setLiveInstance(name, 'a');
+      }
+    } catch (error) {
+      this.logger.warn(`Failed to remove the idle runtime slot of ${name}`, 'CLEANUP', error);
+    }
+
     // BEFORE the deletes below, not after. Deploy details hold byte offsets
     // into the very log files this is about to remove, and those paths are
     // keyed on the app NAME — which this teardown frees for anyone to
@@ -8750,6 +9077,10 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
 
     return {
       name: appName,
+      // The app's LIVE instance (#298): slot a is the bare name, i.e. today's
+      // behaviour; after a cutover to slot b, a restart must restart slot b.
+      // A cutover overrides this with the idle slot.
+      instance: this.runtime ? instanceName(appName, this.runtime.getLiveInstance(appName)) : undefined,
       script,
       interpreter,
       args,

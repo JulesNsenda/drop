@@ -16,8 +16,14 @@
  * WHO RESOLVES. Every name-keyed AppRuntime method accepts an APP name and the
  * adapter maps it to that app's LIVE instance (`LiveInstances.resolve`), so
  * the ~20 platform call sites that stop/restart/inspect/log an app by name need
- * no change. Only the cutover addresses a specific instance, by passing its
- * full instance name — which `resolve` passes through untouched.
+ * no change.
+ *
+ * ADDRESSING ONE SLOT. Slot a's runtime name IS the bare app name, so a bare
+ * name cannot mean "slot a" — once slot b is live it means slot b. Code that
+ * must act on one specific slot (the cutover removing the old instance, boot
+ * removing an orphan, teardown) passes `instanceRef(app, slot)`: `<app>.a` or
+ * `<app>.b`, which `resolve` maps to exactly that slot's runtime name. Passing
+ * `instanceName(app, 'a')` there instead would silently hit the live instance.
  */
 
 export type InstanceSlot = 'a' | 'b';
@@ -27,6 +33,14 @@ export const INSTANCE_SLOT_SEPARATOR = '.';
 /** The runtime name of `appName`'s instance in `slot`. */
 export function instanceName(appName: string, slot: InstanceSlot): string {
   return slot === 'a' ? appName : `${appName}${INSTANCE_SLOT_SEPARATOR}${slot}`;
+}
+
+/**
+ * An explicit reference to ONE slot, for the name-keyed runtime methods:
+ * `<app>.a` or `<app>.b`, never resolved through the live map.
+ */
+export function instanceRef(appName: string, slot: InstanceSlot): string {
+  return `${appName}${INSTANCE_SLOT_SEPARATOR}${slot}`;
 }
 
 /** The app an instance name belongs to (a bare app name is its own slot `a`). */
@@ -53,8 +67,14 @@ export class LiveInstances {
     return this.live.get(appName) ?? 'a';
   }
 
-  /** An app name → its live instance; an explicit instance name → itself. */
+  /**
+   * To a runtime name: an app name → its LIVE instance; an explicit reference
+   * (`instanceRef`) → exactly that slot; a slot-b runtime name → itself.
+   */
   resolve(name: string): string {
-    return isInstanceName(name) ? name : instanceName(name, this.slotOf(name));
+    if (!isInstanceName(name)) return instanceName(name, this.slotOf(name));
+    const app = appNameOfInstance(name);
+    const slot = name.slice(app.length + INSTANCE_SLOT_SEPARATOR.length);
+    return slot === 'a' ? app : name;
   }
 }

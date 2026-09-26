@@ -66,6 +66,11 @@ export class FakeRuntime implements AppRuntime {
     return this.live.slotOf(appName);
   }
 
+  /** Test helper: the runtime name a call with `name` acts on (live resolution). */
+  runtimeNameOf(name: string): string {
+    return this.live.resolve(name);
+  }
+
   private buildInfo(instance: string, port: number | null): AppProcessInfo {
     return {
       name: appNameOfInstance(instance),

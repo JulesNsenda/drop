@@ -29,6 +29,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Zero-downtime redeploys (#298, opt-in).** A running app on
+  `deploy: { strategy: zero-downtime }` is now redeployed without dropping
+  requests: the new release starts beside the old one on a second port, must
+  answer HTTP below 500 (on its `healthCheck` path when it declares one), and
+  only then does Caddy switch to it; the old instance is removed after a drain
+  window (`DROP_CUTOVER_DRAIN_MS`, default 10 s). A new version that never
+  becomes ready is discarded while the old one keeps serving, untouched, and the
+  deploy fails with the new `READINESS_FAILED` error code. Apps that do not
+  listen on a port, declare a fixed `port:`, or (on a `localhost` domain) are
+  depended on by other apps fall back to stop/start. Caveat: an app with granted
+  control-plane capabilities gets a fresh `DROP_API_KEY` per start, so the old
+  instance's key stops working during the drain.
+
 - **Release directories for zero-downtime deploys (#298, opt-in).** An app
   whose `drop.yaml` sets `deploy: { strategy: zero-downtime }` is now built into
   its own directory per deploy, `data/releases/<app>/<deployId>/`, and run from
