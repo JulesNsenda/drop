@@ -142,6 +142,13 @@ const HINTS: Record<DeployErrorCode, string> = {
     'DROP could not classify this failure. The phase, stage and log tail are still accurate.',
 };
 
+/**
+ * Every DeployErrorCode, at runtime. Taken from HINTS' keys because HINTS is a
+ * total Record over the union — a new code that is not in this list is a
+ * compile error there, so this cannot silently fall behind the type.
+ */
+export const DEPLOY_ERROR_CODES = Object.keys(HINTS) as DeployErrorCode[];
+
 export function hintFor(code: DeployErrorCode): string {
   return HINTS[code] ?? HINTS.UNKNOWN;
 }

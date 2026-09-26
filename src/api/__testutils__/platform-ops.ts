@@ -42,6 +42,7 @@ export function makePlatformOpsStub(overrides?: Partial<PlatformOps>): PlatformO
     getServiceIntent: jest.fn().mockReturnValue(undefined),
     isAppInProgress: jest.fn().mockReturnValue(false),
     promoteApp: jest.fn().mockResolvedValue(undefined),
+    rollbackApp: jest.fn(),
     removeGroup: jest.fn().mockResolvedValue({ removed: [] }),
     purgeAppArtifacts: jest.fn().mockResolvedValue(undefined),
     reconfigureRoute: jest.fn().mockResolvedValue(undefined),

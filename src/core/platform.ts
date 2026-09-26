@@ -92,6 +92,13 @@ import {
   DISK_SWEEP_INTERVAL_MS,
 } from '../managers/guardrail/disk-ceiling';
 import {
+  initRollbackStore,
+  resetRollbackStore,
+  getRollbackStore,
+  NoRollbackSnapshotError,
+} from '../managers/rollback';
+import type { RollbackSnapshotMeta } from '../managers/rollback';
+import {
   getDeployBreaker,
   guardrailKeysFor,
   checkGuardrailKeys,
@@ -928,6 +935,11 @@ export class DropPlatform {
       // `getMailQuota` itself (its own env vars, distinct from the deploy ones
       // above — see `mailPrincipalLimit`/`mailOwnerLimit` in
       // principal-quota.ts), not passed here.
+      // Rollback snapshots (#296), anchored under THIS platform's dropRoot for
+      // the same reason as the quotas: the upload and git deploy services
+      // capture through the singleton and have no root of their own.
+      initRollbackStore(this.config.dropRoot);
+
       const mailQuotaStore = path.join(
         this.config.dropRoot,
         'data',
@@ -1242,6 +1254,7 @@ export class DropPlatform {
     this.breakerKeys.clear();
     resetDeployBreaker();
     resetPrincipalQuota();
+    resetRollbackStore();
 
     // Flush BEFORE resetting: a quota whose counts only ever live in memory
     // means a restart hands every principal a fresh allowance, which for an
@@ -2007,6 +2020,7 @@ backup:
       restartApp: (name) => this.restartApp(name),
       isAppInProgress: (name) => this.appsInProgress.has(name),
       promoteApp: (name) => this.promoteApp(name),
+      rollbackApp: (name) => this.rollbackApp(name),
       removeGroup: (name) => this.removeGroup(name),
       purgeAppArtifacts: (name, opts) => this.purgeAppArtifacts(name, opts),
       attachService: (name, serviceId) => this.attachService(name, serviceId),
@@ -2376,11 +2390,11 @@ backup:
     // ACT half (markAppKnown, handleConfigureRoute, armPostDeployWatches,
     // eventBus.publish) stays SERIAL, in original config order, run only
     // after every decision is in: RouterService.addRoute's regenerateConfig
-    // reads the full routes map and writes the WHOLE Caddyfile per call —
-    // two concurrent writes for different apps race on which one lands
-    // last, and the loser's route silently disappears from disk. Splitting
-    // decide/act avoids that without touching RouterService's own locking
-    // (out of scope here).
+    // reads the full routes map and writes the WHOLE Caddyfile per call.
+    // Overlapping writes used to race on which one landed last, dropping the
+    // loser's route from disk; RouterService now serializes its own writes
+    // (`writeChain`), so the serial act phase here is no longer what prevents
+    // that — it stays serial for its original ordering and batching reasons.
     //
     // Deliberately NO global deadline for the whole pass: an app "not yet
     // reached" under a deadline would get no markAppKnown and no
@@ -6246,6 +6260,91 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
   }
 
   /**
+   * Where an app's SOURCE lives: what uploads land in, what `git pull` updates,
+   * where `drop.yaml` and the secrets preflight are read. Persisted config path
+   * first (a monorepo child's copied folder), then state (an admin-deployed
+   * out-of-tree app has state but no appconf), then the webapps default.
+   *
+   * Callers that already hold the config/state records pass them, so this
+   * never re-reads what the caller just read.
+   */
+  private sourcePathOf(
+    appName: string,
+    config?: { path?: string } | null,
+    state?: { path?: string } | null
+  ): string {
+    const cfg = config === undefined ? this.appConfigService?.getConfig(appName) : config;
+    const st = state === undefined ? this.stateManager?.getApp(appName) : state;
+    return cfg?.path || st?.path || path.join(this.config.appsDirectory, appName);
+  }
+
+  /**
+   * Where an app RUNS FROM: the start spec's `cwd`, the tree a rollback
+   * restores, the tree the disk ceiling measures as code.
+   *
+   * Identical to `sourcePathOf` today — every app builds in place and runs from
+   * its source folder. It exists as its own name because zero-downtime
+   * redeploys (#298, docs/plans/2026-09-26-zero-downtime-releases.md) move it
+   * to a per-release directory; every caller that means "the running tree"
+   * must already be saying so when that lands.
+   */
+  private servingPathOf(
+    appName: string,
+    config?: { path?: string } | null,
+    state?: { path?: string } | null
+  ): string {
+    return this.sourcePathOf(appName, config, state);
+  }
+
+  /**
+   * Put back the app's last-good tree and restart it on its existing port
+   * (#296). No rebuild: the snapshot holds build output and dependencies as
+   * they were when that tree was serving.
+   *
+   * Holds the `appsInProgress` guard across the restore AND the restart, so a
+   * deploy cannot land files between the two, and watcher events raised by
+   * the restore itself are dropped rather than read back as a user edit (the
+   * in-progress skip in handleAppUpdate), then covered by the cooldown
+   * doRestart records.
+   *
+   * The recorded `outputDirectory` is restored with the tree: a static app
+   * serves from it, and the deploy being undone may have changed it.
+   *
+   * Code only. Database, Redis, appdata, secrets and environment are not
+   * touched — see NOT_RESTORED.
+   */
+  async rollbackApp(appName: string): Promise<{ meta: RollbackSnapshotMeta; info: AppProcessInfo }> {
+    if (this.appsInProgress.has(appName)) {
+      throw new AppInProgressError(appName);
+    }
+    this.appsInProgress.add(appName);
+    try {
+      const store = getRollbackStore();
+      if (!store || !this.appConfigService || !this.stateManager) {
+        throw new NoRollbackSnapshotError(appName);
+      }
+      const config = this.appConfigService.getConfig(appName);
+      const state = this.stateManager.getApp(appName);
+      if (!config && !state) {
+        throw new Error(`Application not found: ${appName}`);
+      }
+      const appPath = this.servingPathOf(appName, config, state);
+
+      const meta = await store.restoreInto(appName, appPath);
+      this.appDeployTimes.set(appName, Date.now());
+      if (meta.outputDirectory !== undefined) {
+        await this.appConfigService.upsertConfig(appName, { outputDirectory: meta.outputDirectory });
+      }
+      this.logger.info(`Rolled back ${appName} to the tree captured ${meta.takenAt}`, 'ROLLBACK');
+
+      const info = await this.doRestart(appName);
+      return { meta, info };
+    } finally {
+      this.appsInProgress.delete(appName);
+    }
+  }
+
+  /**
    * The body of restartApp, extracted so `attachService` (DROP-151 Phase 2)
    * can hold the `appsInProgress` guard across provisioning AND the restart
    * that follows it, instead of releasing and re-acquiring the guard between
@@ -6267,7 +6366,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     if (!config && !state) {
       throw new Error(`Application not found: ${appName}`);
     }
-    const appPath = config?.path || state?.path || path.join(this.config.appsDirectory, appName);
+    const appPath = this.servingPathOf(appName, config, state);
 
     const runtimeStatus = await this.runtime.getStatus(appName);
     const isRunning = runtimeStatus?.status === 'running';
@@ -6488,7 +6587,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       // join would read the wrong (or no) drop.yaml for an out-of-tree or
       // monorepo-child app and let the own-DATABASE_URL guard below pass
       // when it should refuse.
-      const appPath = config?.path || state?.path || path.join(this.config.appsDirectory, appName);
+      const appPath = this.sourcePathOf(appName, config, state);
 
       if (config?.ephemeral) {
         return this.refuse('attach', appName, serviceId, {
@@ -6810,7 +6909,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       }
 
       // Same resolution attachService/doRestart use.
-      const appPath = config?.path || state?.path || path.join(this.config.appsDirectory, appName);
+      const appPath = this.sourcePathOf(appName, config, state);
       // Not a refusal (guard 7) — its position can't be observed since it
       // never blocks anything. Lazy and memoised: a parse+validate of
       // drop.yaml on every call would be paid even by refusals below that
@@ -7309,6 +7408,10 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       path.join(this.config.dropRoot, 'data', 'logs', 'webapps', name),
       path.join(this.config.dropRoot, 'data', 'logs', 'builds', name),
       ...(opts.keepData ? [] : [path.join(this.config.dropRoot, 'data', 'appdata', name)]),
+      // The rollback snapshot is CODE, not the owner's data, so keepData does
+      // not keep it: a snapshot left behind would restore the deleted app's
+      // tree into whatever the next registrant of this name deploys.
+      path.join(this.config.dropRoot, 'data', 'rollback', name),
     ];
     for (const dir of targets) {
       try {
@@ -7757,6 +7860,8 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         paths: [
           app.path,
           path.join(this.config.dropRoot, 'data', 'appdata', app.name),
+          // The rollback snapshot (#296) is charged to the app it belongs to.
+          path.join(this.config.dropRoot, 'data', 'rollback', app.name),
         ],
         maxDiskMb: this.appConfigService?.getConfig(app.name)?.maxDiskMb,
       }));
@@ -7767,6 +7872,19 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         // Only a LIVE app is worth stopping. Parking something already stopped
         // would rewrite its reason on every sweep and bury the real one.
         if (!app || (app.status !== 'running' && app.status !== 'crash-looping')) continue;
+
+        // A snapshot is DROP's own convenience copy: when it is part of what
+        // pushes an app over, it goes first, and the app keeps running. The
+        // next sweep re-measures without it and parks only if still over.
+        const rollback = getRollbackStore();
+        if (rollback && (await rollback.get(verdict.name))) {
+          await rollback.remove(verdict.name);
+          this.logger.warn(
+            `Dropped the rollback snapshot of ${verdict.name} to keep it under its disk ceiling`,
+            'DISK'
+          );
+          continue;
+        }
 
         const reason =
           `Over its disk ceiling: ${toMb(verdict.bytes)} MB used of ` +

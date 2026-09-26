@@ -27,7 +27,7 @@ jest.mock('../../core/git-deploy', () => ({
   }),
 }));
 
-import { handleDeployFromGit, handleRestartApp, handleAppStatus } from './tools';
+import { handleDeployFromGit, handleRestartApp, handleAppStatus, handleRollbackApp } from './tools';
 
 const agent = (scopes: string[]): AuthContext => ({
   userId: 'owner-1',
@@ -100,6 +100,14 @@ describe('agent scope enforcement', () => {
       const res = await handleRestartApp(agent(['app:mine:read']), { name: 'mine' });
 
       expect(res.isError).toBe(true);
+    });
+
+    it('refuses rollback_app to a READ-only grant', async () => {
+      // A rollback replaces what is serving, exactly like a restart.
+      const res = await handleRollbackApp(agent(['app:mine:read']), { name: 'mine' });
+
+      expect(res.isError).toBe(true);
+      expect(textOf(res)).toContain('not found');
     });
 
     it('allows app_status to a read grant', async () => {

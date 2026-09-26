@@ -16,6 +16,7 @@ import {
   initializeAuth,
   authMiddleware,
   mcpAuthMiddleware,
+  authMiddlewareForMethods,
   isAuthEnabled,
   setSignupEnabled,
 } from './middleware/auth';
@@ -36,6 +37,8 @@ import { auditMiddleware, initializeAuditLog, closeAuditLog } from './middleware
 import { containerOriginGate } from './middleware/container-origin';
 import { validateBodySize } from './middleware/validate';
 import { setApiRuntimeConfig, getPublicUrl } from './runtime-config';
+import { buildOpenApiDocument } from './openapi';
+import { getPlatformVersion } from '../utils/version';
 import { getSettingsManager } from '../managers/settings/settings-manager';
 import { isPathWithin } from '../utils/paths';
 import { buildProtectedResourceMetadata, buildAuthServerMetadata } from './oauth/metadata';
@@ -288,6 +291,25 @@ export class ApiServer {
     // Public routes (no auth required)
     v1.route('/health', healthRoutes);
 
+    // Machine-readable API description (#297), GENERATED from this.app.routes
+    // on first request — every route is mounted by then — and cached for the
+    // life of the process, since the route table never changes after boot.
+    // Public on purpose: it is how an agent finds the API without being told,
+    // and it describes routes, never data. One explicit route, never a
+    // catch-all: a bare `/*` would swallow the OAuth discovery paths.
+    let openApiDocument: Promise<Record<string, unknown>> | null = null;
+    v1.get('/openapi.json', async (c) => {
+      openApiDocument ??= buildOpenApiDocument(this.app.routes, {
+        version: getPlatformVersion(),
+        serverUrl: getPublicUrl() ?? undefined,
+        authEnabled: isAuthEnabled(),
+      }).catch((err) => {
+        openApiDocument = null; // do not cache a failure
+        throw err;
+      });
+      return c.json(await openApiDocument);
+    });
+
     // Auth routes with stricter rate limiting (brute-force / signup-flood)
     v1.use('/auth/login', authRateLimitMiddleware());
     v1.use('/auth/signup', authRateLimitMiddleware());
@@ -539,13 +561,7 @@ export class ApiServer {
       // that accident no longer contains it, so the tier is stated explicitly.
       // Method-scoped: GET /apps/:name (and GET /apps) must stay readable at
       // `readonly`.
-      v1.use('/apps/*', async (c, next) => {
-        const method = c.req.method;
-        if (method === 'DELETE' || method === 'PUT' || method === 'PATCH' || method === 'POST') {
-          return authMiddleware('user')(c, next);
-        }
-        return next();
-      });
+      v1.use('/apps/*', authMiddlewareForMethods(['DELETE', 'PUT', 'PATCH', 'POST'], 'user'));
       v1.use('/apps/*', authMiddleware('readonly'));
       v1.use('/apps', authMiddleware('readonly'));
       v1.use('/usage', authMiddleware('readonly'));

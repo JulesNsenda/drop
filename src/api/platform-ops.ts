@@ -14,6 +14,7 @@
  */
 
 import { AppProcessInfo } from '../managers/runtime';
+import type { RollbackSnapshotMeta } from '../managers/rollback';
 // Only the three the PlatformOps interface below actually references —
 // DetachServiceOutcome/DetachServiceRestartOutcome are re-exported (below)
 // but not used in this file's own signatures.
@@ -182,6 +183,15 @@ export interface PlatformOps {
    * nobody approved. Rejects when nothing is held.
    */
   promoteApp(appName: string): Promise<void>;
+
+  /**
+   * Restore the app's last-good tree (captured before the redeploy that
+   * replaced it) and restart it on its existing port, without rebuilding
+   * (#296). Rejects with NoRollbackSnapshotError when nothing was captured,
+   * AppInProgressError when the app is busy. Restores CODE only — see
+   * `NOT_RESTORED` in managers/rollback.
+   */
+  rollbackApp(appName: string): Promise<{ meta: RollbackSnapshotMeta; info: AppProcessInfo }>;
 
   /**
    * Tear down every app belonging to a monorepo group (M4): stop+delete each

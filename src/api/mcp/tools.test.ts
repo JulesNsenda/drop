@@ -22,6 +22,7 @@ import {
   handleAppLogs,
   handleRestartApp,
   handleVerifyDeployment,
+  handleRollbackApp,
   DEPLOY_FILES_MAX_FILES,
   DEPLOY_FILES_MAX_TOTAL_BYTES,
 } from './tools';
@@ -41,6 +42,7 @@ import * as buildLogModule from '../../managers/build-log/build-log';
 import * as runtimeModule from '../../managers/runtime';
 import { QuotaExceededError } from '../../managers/guardrail/principal-quota';
 import { DeployRefusedError } from '../../managers/guardrail/deploy-breaker';
+import { NoRollbackSnapshotError } from '../../managers/rollback';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 
 /** Every tool result in this test file uses a single text content block. */
@@ -931,6 +933,66 @@ describe('MCP tool handlers', () => {
         app: 'alice-app',
         app_status: 'stopped',
       });
+    });
+  });
+
+  describe('rollback_app (#296)', () => {
+    const rolledBack = {
+      meta: { appName: 'alice-app', takenAt: '2026-09-01T00:00:00.000Z', bytes: 1 },
+      info: { name: 'alice-app', status: 'running' },
+    };
+
+    it('answers a foreign app with not-found, without touching the platform', async () => {
+      const ops = makeOps({ rollbackApp: jest.fn() });
+      setPlatformOps(ops);
+
+      const result = await handleRollbackApp(bob, { name: 'alice-app' });
+
+      expect(result.isError).toBe(true);
+      expect(firstText(result)).toBe("Application 'alice-app' not found");
+      expect(ops.rollbackApp).not.toHaveBeenCalled();
+    });
+
+    it('rolls back and says, in the TEXT too, what was not restored', async () => {
+      const ops = makeOps({ rollbackApp: jest.fn().mockResolvedValue(rolledBack) });
+      setPlatformOps(ops);
+
+      const result = await handleRollbackApp(alice, { name: 'alice-app' });
+
+      expect(result.isError).toBeFalsy();
+      expect(ops.rollbackApp).toHaveBeenCalledWith('alice-app');
+      // A text-only client must still learn the database did not go back.
+      expect(firstText(result)).toContain('NOT restored: database');
+      expect(result.structuredContent).toEqual({
+        ok: true,
+        app: 'alice-app',
+        snapshot_taken_at: '2026-09-01T00:00:00.000Z',
+        not_restored: ['database', 'redis', 'appdata', 'secrets', 'environment'],
+        next_actions: ['verify_deployment'],
+      });
+    });
+
+    it('explains when there is no snapshot to go back to', async () => {
+      setPlatformOps(
+        makeOps({ rollbackApp: jest.fn().mockRejectedValue(new NoRollbackSnapshotError('alice-app')) })
+      );
+
+      const result = await handleRollbackApp(alice, { name: 'alice-app' });
+
+      expect(result.isError).toBe(true);
+      expect(firstText(result)).toContain('No rollback snapshot');
+      expect(firstText(result)).toContain('replaces a running app');
+    });
+
+    it('maps AppInProgressError to a tool error', async () => {
+      setPlatformOps(
+        makeOps({ rollbackApp: jest.fn().mockRejectedValue(new AppInProgressError('alice-app')) })
+      );
+
+      const result = await handleRollbackApp(alice, { name: 'alice-app' });
+
+      expect(result.isError).toBe(true);
+      expect(firstText(result)).toContain('operation in progress');
     });
   });
 

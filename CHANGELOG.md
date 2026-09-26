@@ -29,6 +29,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **MCP `rollback_app` tool.** The agent-side of per-app rollback: undoes the
+  last `deploy_files` or git redeploy of an app the caller may deploy to (a
+  read-only grant cannot), with no rebuild. Both the text and the structured
+  result state what was not restored — the database above all — and point at
+  `verify_deployment` next.
+
+- **Per-app rollback (#296).** Before an upload or git redeploy overwrites a
+  running app, DROP keeps a copy of the tree that was serving — build output
+  and dependencies included — under `data/rollback/<app>/`.
+  `POST /api/v1/apps/:name/rollback` puts it back and restarts the app on its
+  port without rebuilding; `GET` on the same path says whether one exists. It
+  behaves identically under PM2 and Docker, because both run an app straight
+  from its directory. It restores **code only**: the response lists what it
+  does not restore (database, Redis, app data, secrets, environment) rather
+  than implying a time machine. One snapshot per app (the last good), taken
+  only when it fits under the per-app disk ceiling with room for the app's
+  data; the ceiling sweep charges it to the app and drops it before it would
+  park one. Manual only — there is no automatic rollback on a failed health
+  check. Folders dropped straight into `webapps/` are not captured.
+
+- **`GET /api/v1/openapi.json` — a generated OpenAPI 3.1 description (#297).**
+  Built from the mounted route table rather than written beside it, so it
+  cannot list a route that is not served or miss one that is. Each operation
+  carries its security requirements and an `x-drop-min-role`, read off a tag
+  every auth middleware now carries and matched to routes by Hono itself, so
+  method-scoped and route-level floors are included. Operations with no
+  middleware floor are marked `x-drop-auth: handler` rather than declared
+  public. Request and response bodies are not described yet. A new test fails
+  when a route is mounted with no role floor and is not on a reviewed list —
+  `setupRoutes` has no default-deny, and nothing noticed that before.
+
+- **A test fails when the published agent surface drifts from the code (#303).**
+  `src/api/mcp/published-surface.test.ts` holds the MCP tool list, the REST
+  `ErrorCodes` and the deploy `error_code` values that drop-site's `llms.txt`
+  publishes, and checks each against the code in both directions — the
+  registered tools are captured from `buildMcpServer` itself. A failure names
+  what drifted and the drop-site file to update alongside this one.
+
+- **Deploy status streams over SSE (#299).** `GET /api/v1/deploys/:deployId/stream`
+  emits an `episode` event each time a deploy's stages or status change and one
+  `end` event at a terminal status (or a park/hold, which never reaches one),
+  then closes itself and releases its subscription. Because a `202` from
+  `POST /apps/:name/source` carries `acceptedAt` but no deploy id,
+  `GET /api/v1/deploys/stream?app=<name>&since=<acceptedAt>` follows the same
+  deploy from acceptance, with the correlation the MCP deploy tools use. Same
+  owner-snapshot ownership rule as `GET /deploys`; a foreign and a missing
+  deploy are indistinguishable on both routes.
+
 - **MCP: a refused deploy is now machine-readable (#292).** `deploy_files` and
   `deploy_from_git` refused by the deploy quota or the failure breaker used to
   return only a sentence. They now also return `structuredContent` with
@@ -97,6 +145,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   refusal code apart.
 
 ### Fixed
+
+- **Concurrent route changes can no longer drop a route from the Caddyfile.**
+  Every route change rewrites the whole file from a snapshot of the routes, and
+  two overlapping rewrites could land in the wrong order, the older snapshot
+  winning and the newer route vanishing from disk until the next change. The
+  router now serializes its writes, each computed from the routes as they are
+  when its turn comes. It also gains `setUpstream`, which repoints an app's
+  routes and reloads Caddy immediately, reporting whether Caddy accepted it —
+  the first step of zero-downtime redeploys (#298).
+  The Caddyfile is now also written atomically, so Caddy's reload path or a
+  Caddy restart can never read a half-written (or truncated-to-empty) file.
 
 - **The SQL console's refusal pointed at a Settings page that did not exist.**
   It told an admin to "enable it in Settings" while no such control had been
