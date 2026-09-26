@@ -49,6 +49,7 @@ export type DeployNextAction =
   | 'get_deploy_logs'
   | 'app_logs'
   | 'app_status'
+  | 'verify_deployment'
   | 'restart_app'
   | 'list_apps';
 
@@ -188,7 +189,9 @@ export function refusalResult(
  */
 export function nextActionsFor(status: DeployResultStatus, phase?: 'build' | 'boot'): DeployNextAction[] {
   if (status === 'succeeded') return [];
-  if (status === 'succeeded_unverified') return ['app_status', 'app_logs'];
+  // verify_deployment first: it answers the exact question the status leaves
+  // open ("does it serve now?"); app_logs is for when the answer is no.
+  if (status === 'succeeded_unverified') return ['verify_deployment', 'app_logs'];
   // get_deploy_logs FIRST for any failure: it returns the output of THIS
   // deploy, where app_logs returns whatever the app is doing now — which for a
   // failed deploy is usually nothing, and for a build failure is structurally

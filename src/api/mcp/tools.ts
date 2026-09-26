@@ -4,9 +4,9 @@
  * `buildMcpServer(auth)` builds one McpServer instance per HTTP request
  * (stateless mode — see `transport.ts`), with the caller's `AuthContext`
  * captured by closure so every tool handler runs with the caller's identity
- * flowing through the existing `canAccess` ownership model. Seven tools:
- * `deploy_files`, `deploy_from_git`, `list_apps`, `app_status`, `app_logs`,
- * `get_deploy_logs`, `restart_app`. No `set_secrets`/`remove_app` —
+ * flowing through the existing `canAccess` ownership model. Eight tools:
+ * `deploy_files`, `deploy_from_git`, `list_apps`, `app_status`,
+ * `verify_deployment`, `app_logs`, `get_deploy_logs`, `restart_app`. No `set_secrets`/`remove_app` —
  * destructive/blast-radius tools stay off the MCP surface (PRD-040 non-goals).
  *
  * Tool errors are returned as `{ content: [...], isError: true }` results,
@@ -57,6 +57,8 @@ import {
 import { getDeployDetailStore } from '../../managers/deploy-tracker';
 import { classifyBuildFailure } from '../../core/builder/classify';
 import { computeAppUrl } from '../../utils/app-url';
+import { probeHttp } from '../../utils/http-probe';
+import { parseDropYaml, isSafeEndpointPath } from '../../core/detector/drop-yaml-parser';
 import { getPlatformVersion } from '../../utils/version';
 import { tryLogActivity } from '../../managers/activity';
 import { DeployRefusedError } from '../../managers/guardrail/deploy-breaker';
@@ -78,6 +80,8 @@ const MAX_LOG_LINES = 500;
  * memory-exhaustion lever, not just a slow response.
  */
 const MAX_RUNTIME_LOG_BYTES = 1024 * 1024;
+/** One request, bounded — verify_deployment must not become a slow-loris lever. */
+const VERIFY_TIMEOUT_MS = 3000;
 
 function toolText(text: string): CallToolResult {
   return { content: [{ type: 'text', text }] };
@@ -795,6 +799,93 @@ export async function handleAppStatus(
   return toolText(lines.join('\n'));
 }
 
+/**
+ * verify_deployment — probe an app NOW and report what happened (#295).
+ *
+ * The follow-up to `succeeded_unverified`: the deploy-path readiness gate is
+ * lenient by design, so this is how an agent turns "DROP could not confirm it"
+ * into a decision.
+ *
+ * Three constraints, each load-bearing:
+ *  - NEVER an arbitrary URL. The target is 127.0.0.1 plus the app's OWN
+ *    assigned port — the same target the platform's readiness gate probes in
+ *    both isolation modes (docker publishes the port to the host). Only the
+ *    path is caller-influenced, and it must pass `isSafeEndpointPath`, the
+ *    rule drop.yaml's `mcp.path` is held to. A tool that fetched a
+ *    caller-supplied URL from inside the platform would be an SSRF primitive.
+ *  - NEVER the response body. That is tenant output; status code and latency
+ *    are DROP's own observations and are safe unfenced.
+ *  - BOUNDED. One GET, `VERIFY_TIMEOUT_MS`, no redirect following (probeHttp
+ *    uses bare http.get, which never follows one).
+ *
+ * Read-only: it does not clear `readinessUnverified`. That flag records what
+ * the deploy-path gate saw, and a later probe answers a different question.
+ */
+export async function handleVerifyDeployment(
+  auth: AuthContext | undefined,
+  args: { name: string; path?: string }
+): Promise<CallToolResult> {
+  const app = getStateManager().getApp(args.name);
+  if (!app || !canAccessScoped(auth, app, args.name, 'read')) {
+    return toolError(`Application '${args.name}' not found`);
+  }
+
+  if (args.path !== undefined && !isSafeEndpointPath(args.path)) {
+    return toolError(
+      "Invalid path: must start with '/' and contain only letters, digits, '.', '_', '~', '-' or '/' " +
+        '(no query string, no "..", no "//"), at most 101 characters.'
+    );
+  }
+
+  if (app.status !== 'running' || !app.port) {
+    const structured = { ok: false, app: app.name, app_status: app.status };
+    return {
+      content: [
+        {
+          type: 'text',
+          text: `'${app.name}' is not running (status: ${app.status}), so there is nothing to probe. Use app_status or restart_app.`,
+        },
+      ],
+      structuredContent: structured,
+    };
+  }
+
+  // The declared healthCheck is the natural default — but it is tenant text,
+  // and the parser only checks it is a string, so it must pass the same rule
+  // as a caller's path or be ignored.
+  let path = args.path;
+  if (path === undefined) {
+    try {
+      const declared = await parseDropYaml(app.path);
+      const hc = declared.success ? declared.config?.healthCheck : undefined;
+      if (hc && isSafeEndpointPath(hc)) path = hc;
+    } catch {
+      // No readable drop.yaml — fall through to '/'.
+    }
+  }
+  path = path ?? '/';
+
+  const probedUrl = `http://127.0.0.1:${app.port}${path}`;
+  const started = Date.now();
+  const r = await probeHttp('127.0.0.1', app.port, path, VERIFY_TIMEOUT_MS);
+  const latencyMs = Date.now() - started;
+
+  // Any HTTP answer below 500 means the app is serving: a JSON API that
+  // answers 404 or 401 at '/' is healthy (see http-probe.ts). A 5xx is the app
+  // saying it is broken, and no answer at all means it is not serving.
+  const ok = r.responded && typeof r.statusCode === 'number' && r.statusCode < 500;
+  const structured: Record<string, unknown> = {
+    ok,
+    app: app.name,
+    probed_url: probedUrl,
+    ...(r.responded ? { status_code: r.statusCode, latency_ms: latencyMs } : {}),
+  };
+  const text = r.responded
+    ? `Probed ${probedUrl}: HTTP ${r.statusCode} in ${latencyMs} ms — ${ok ? 'the app is serving.' : 'the app answered with a server error.'}`
+    : `Probed ${probedUrl}: no HTTP response within ${VERIFY_TIMEOUT_MS} ms — the app is not serving on its assigned port. Check app_logs.`;
+  return { content: [{ type: 'text', text }], structuredContent: structured };
+}
+
 export async function handleAppLogs(
   auth: AuthContext | undefined,
   args: { name: string; lines?: number }
@@ -1080,6 +1171,30 @@ export function buildMcpServer(auth: AuthContext | undefined): McpServer {
       },
     },
     args => handleAppStatus(auth, args)
+  );
+
+  server.registerTool(
+    'verify_deployment',
+    {
+      title: 'Verify deployment',
+      description:
+        'Probe one of your running apps NOW with a single HTTP GET and report the status code and latency. ' +
+        "Use it after a deploy returns 'succeeded_unverified' to find out whether the app actually serves. " +
+        "DROP composes the target from the app's own assigned port — you choose only the path, which defaults to the " +
+        "app's drop.yaml healthCheck, else '/'. ok is true for any response below 500 (a 404 at '/' from an API is healthy). " +
+        'The response body is never returned, and redirects are not followed.',
+      inputSchema: {
+        name: z.string().describe('App name.'),
+        path: z
+          .string()
+          .max(101)
+          .optional()
+          .describe(
+            "Path to probe, e.g. '/health'. Must start with '/'; letters, digits, '.', '_', '~', '-' and '/' only, no query string."
+          ),
+      },
+    },
+    args => handleVerifyDeployment(auth, args)
   );
 
   server.registerTool(

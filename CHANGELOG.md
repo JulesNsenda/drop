@@ -36,6 +36,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `retry_after_seconds`, so an agent can wait and retry without parsing prose.
   The text content is unchanged for clients that render only text.
 
+- **MCP `verify_deployment` tool (#295).** Probes one of the caller's running
+  apps with a single bounded HTTP GET and returns `ok`, `status_code`,
+  `latency_ms` and `probed_url` — the follow-up a `succeeded_unverified` deploy
+  was missing, and now its first `next_actions` entry. The target is always
+  127.0.0.1 plus the app's own assigned port (both isolation modes); only the
+  path is caller-chosen, held to the same allowlist as drop.yaml's `mcp.path`,
+  defaulting to the app's `healthCheck`. The body is never returned and
+  redirects are not followed. Foreign and missing apps get the same not-found.
+
 - **MCP `app_status` reports live memory, CPU, uptime and restarts (#294)** for
   a running app the caller owns, from one runtime stats call (never the
   fleet-wide one). When the runtime cannot measure them — including the docker
