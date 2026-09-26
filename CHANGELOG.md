@@ -29,6 +29,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A test fails when the published agent surface drifts from the code (#303).**
+  `src/api/mcp/published-surface.test.ts` holds the MCP tool list, the REST
+  `ErrorCodes` and the deploy `error_code` values that drop-site's `llms.txt`
+  publishes, and checks each against the code in both directions — the
+  registered tools are captured from `buildMcpServer` itself. A failure names
+  what drifted and the drop-site file to update alongside this one.
+
 - **Deploy status streams over SSE (#299).** `GET /api/v1/deploys/:deployId/stream`
   emits an `episode` event each time a deploy's stages or status change and one
   `end` event at a terminal status (or a park/hold, which never reaches one),
