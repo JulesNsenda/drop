@@ -13,7 +13,7 @@ import { getStateManager } from '../../managers/app/state-manager';
 const usage = new Hono();
 
 /** Effective limit for a user: per-user override > global default. 0 = unlimited. */
-function getAppLimit(userId?: string): number {
+export function getAppLimit(userId?: string): number {
   const globalMax = parseInt(process.env.DROP_MAX_APPS_PER_USER || '5', 10);
   if (!userId) return globalMax;
   try {

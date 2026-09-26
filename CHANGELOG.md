@@ -36,6 +36,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `retry_after_seconds`, so an agent can wait and retry without parsing prose.
   The text content is unchanged for clients that render only text.
 
+- **`GET /api/v1/limits` — read your headroom before spending it (#293).** One
+  `readonly` call returns every guardrail that can refuse the caller's next
+  deploy, with current usage: the hourly deploy quota (per principal and per
+  owning user, with when each window frees a slot), the failure breaker (the
+  new-app window, the owner backstop, and any of the caller's own apps with
+  failures on the board), live ephemerals against their cap, the app count, and
+  the per-app disk ceiling. Strictly per-caller — an admin sees their own
+  figures, never the fleet's — and it reports no host facts. It reads through
+  new side-effect-free `peek` methods, so observing a limit never prunes or
+  expires it.
+
 - **MCP `verify_deployment` tool (#295).** Probes one of the caller's running
   apps with a single bounded HTTP GET and returns `ok`, `status_code`,
   `latency_ms` and `probed_url` — the follow-up a `succeeded_unverified` deploy

@@ -53,6 +53,7 @@ import webhooksRoutes from './routes/webhooks';
 import gitDeployRoutes from './routes/git-deploy';
 import adminRoutes from './routes/admin';
 import usageRoutes from './routes/usage';
+import limitsRoutes from './routes/limits';
 import oauthRoutes from './routes/oauth';
 import mcpGatewayRoutes from './routes/mcp-gateway';
 import appAccessRoutes from './routes/app-access';
@@ -548,6 +549,7 @@ export class ApiServer {
       v1.use('/apps/*', authMiddleware('readonly'));
       v1.use('/apps', authMiddleware('readonly'));
       v1.use('/usage', authMiddleware('readonly'));
+      v1.use('/limits', authMiddleware('readonly'));
       v1.use('/logs/*', authMiddleware('readonly'));
       v1.use('/deploys/*', authMiddleware('readonly'));
       v1.use('/deploys', authMiddleware('readonly'));
@@ -588,6 +590,7 @@ export class ApiServer {
     // Mount all routes (auth middleware applied above when enabled)
     v1.route('/apps', appsRoutes);
     v1.route('/usage', usageRoutes);
+    v1.route('/limits', limitsRoutes);
     v1.route('/logs', logsRoutes);
     v1.route('/certs', certsRoutes);
     v1.route('/deploys', deploysRoutes);

@@ -59,7 +59,7 @@ something is listed here it exists in the shipped code. Planned work lives in
 | CLI | `drop serve`, `list`, `status`, `logs`, `deploy`, `start/stop/restart/remove`, `backup`, `restore`, `mfa`, `migrate-runtime` |
 | Web dashboard | Apps, logs, deploys, metrics, secrets, database browser, settings |
 | Public site | Marketing, docs and API reference, served from a separate bundle |
-| Hosted MCP server | `POST /api/v1/mcp` — deploy, logs and status tools for coding agents |
+| Hosted MCP server | `POST /api/v1/mcp` — deploy, logs, status and `verify_deployment` tools for coding agents; refused deploys carry a structured `error_code` + `retry_after_seconds` |
 | OAuth 2.1 + PKCE | The authorization path web-based MCP connectors require |
 
 ## Access control and safety
@@ -70,7 +70,7 @@ something is listed here it exists in the shipped code. Planned work lives in
 | Roles | `readonly` / `user` / `admin`, with per-route enforcement |
 | Multi-user | Per-user app ownership and limits; invitation-based signup |
 | Scoped agent tokens | Least-privilege keys scoped to named capabilities, never full admin |
-| Deploy guardrails | Circuit breaker on failing deploy loops, per-principal quotas, ephemeral TTL'd apps, idle reaping, disk ceilings |
+| Deploy guardrails | Circuit breaker on failing deploy loops, per-principal quotas, ephemeral TTL'd apps, idle reaping, disk ceilings; the caller's own headroom is readable up front via `GET /api/v1/limits` |
 | Rate limiting | Stricter buckets on credential-minting and expensive endpoints |
 | Activity log | Audit trail of platform actions |
 
