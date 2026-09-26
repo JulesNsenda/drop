@@ -128,6 +128,8 @@ const HINTS: Record<DeployErrorCode, string> = {
     'The app restarted repeatedly at startup. A missing environment variable or an unreachable dependency is the usual cause.',
   OOM_KILLED:
     'The kernel killed this app for exceeding its memory limit. Reduce what the app holds in memory, or ask an admin to raise the limit — restarting unchanged will hit the same ceiling. DROP reports this only when the container runtime confirmed it, so it is a fact rather than an inference.',
+  READINESS_FAILED:
+    'The new version started but never answered HTTP with a status below 500 before the readiness window closed, so traffic was never switched to it. The previous version is still serving, untouched. Check the runtime log for why it did not come up, and its healthCheck path if it declares one.',
   GUARDRAIL_TRIPPED:
     'DROP refused this deploy because too many recent deploys of this app failed. Nothing was built. Fix the cause of the previous failures before retrying — the refusal message says how long the wait is, and retrying sooner will be refused again.',
   QUOTA_EXCEEDED:

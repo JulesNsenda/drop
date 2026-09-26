@@ -488,6 +488,14 @@ export interface AppConfig {
   currentRelease?: AppRelease;
   /** The release served before `currentRelease`; kept for rollback (#298 step 6). */
   previousRelease?: AppRelease;
+  /**
+   * Which runtime slot is live (#298): `a` = the bare app name, `b` =
+   * `<app>.b`. Absent means `a`. Written by a zero-downtime cutover AFTER the
+   * new instance proved ready and BEFORE traffic moves, and re-applied to the
+   * runtime at boot. Separate from `currentRelease` so it survives an app
+   * opting back out of releases while its slot-b instance is still running.
+   */
+  runtimeSlot?: 'a' | 'b';
 }
 
 export interface AppRelease {
@@ -519,6 +527,7 @@ const SYSTEM_CONFIG_FIELDS = [
   'lastDetachAt',
   'currentRelease',
   'previousRelease',
+  'runtimeSlot',
 ] as const satisfies readonly (keyof AppConfig)[];
 
 type SystemConfigField = (typeof SYSTEM_CONFIG_FIELDS)[number];
