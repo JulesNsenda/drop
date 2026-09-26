@@ -37,7 +37,7 @@ import { getDatabaseProvisioner } from '../../managers/database';
 import { getRedisProvisioner } from '../../managers/redis';
 import { getRouterService } from '../../core/router';
 import { logActivityFor } from '../../managers/activity';
-import { getRollbackStore, NoRollbackSnapshotError, NOT_RESTORED } from '../../managers/rollback';
+import { NoRollbackSnapshotError, NOT_RESTORED } from '../../managers/rollback';
 import type { RollbackSnapshotMeta } from '../../managers/rollback';
 import {
   getAppsDirectory,
@@ -1082,6 +1082,8 @@ apps.post('/:name/restart', async c => {
 /** The honest shape of a rollback: what it put back, and what it did not. */
 function rollbackReport(meta: RollbackSnapshotMeta) {
   return {
+    // 'release': the previous release, deployed at snapshotTakenAt (#298).
+    source: meta.kind ?? 'snapshot',
     snapshotTakenAt: meta.takenAt,
     snapshotBytes: meta.bytes,
     restores: ['code', 'build output', 'dependencies', ...(meta.outputDirectory !== undefined ? ['output directory'] : [])],
@@ -1098,7 +1100,7 @@ apps.get('/:name/rollback', async c => {
     throw new NotFoundError(`Application '${name}' not found`);
   }
 
-  const meta = (await getRollbackStore()?.get(name)) ?? null;
+  const meta = (await getPlatformOps()?.describeRollback(name)) ?? null;
   return c.json(
     success(meta ? { app: name, available: true, ...rollbackReport(meta) } : { app: name, available: false })
   );

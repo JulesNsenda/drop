@@ -29,6 +29,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Rollback and promotion without downtime (#298, opt-in).** For an app on
+  `deploy: { strategy: zero-downtime }`, `POST /apps/:name/rollback` (and the
+  `rollback_app` MCP tool) now goes back to the app's previous release, and
+  promoting a held build goes to that build's release — both through the same
+  cutover as a redeploy, so the current version serves until the other one
+  answers, and stays if it never does. A rollback copies nothing (the previous
+  release is already on disk), leaves the source folder as it is, and swaps the
+  two releases, so a second rollback goes forward again. Such apps no longer get
+  a rollback snapshot; apps that serve from their source folder keep the
+  snapshot store unchanged. An app that opts out keeps its last release as its
+  rollback target until its next snapshot replaces it. The rollback responses
+  say which one they used (`source` / `rollback_source`: `release` or
+  `snapshot`), and the disk-ceiling sweep drops a previous release, as it does
+  a snapshot, before it would park the app.
+
 - **Zero-downtime redeploys (#298, opt-in).** A running app on
   `deploy: { strategy: zero-downtime }` is now redeployed without dropping
   requests: the new release starts beside the old one on a second port, must

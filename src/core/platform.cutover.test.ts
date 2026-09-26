@@ -457,4 +457,101 @@ describe('zero-downtime cutover (#298 step 5)', () => {
     expect(log).toContain('delete site');
     expect(fakeRuntime.getLiveInstance('site')).toBe('a');
   }, 30000);
+
+  describe('rollback and promotion are cutovers too (#298 step 6)', () => {
+    it('a rollback cuts over to the previous release, with no gap and no rebuild', async () => {
+      platform = makePlatform();
+      await platform.start();
+      const appPath = await deployV1('site');
+      const first = cfg('site')!.currentRelease!;
+      await redeploy('site', appPath, 'v2');
+      const second = cfg('site')!.currentRelease!;
+      const v2Port = getStateManager().getApp('site')!.port!;
+      const builds = jest.fn();
+      const unsubscribe = eventBus.subscribe('build:started', builds);
+      log.length = 0;
+
+      const { meta } = await platform!.rollbackApp('site');
+      unsubscribe();
+
+      const port = getStateManager().getApp('site')!.port!;
+      expect(log).toEqual([`start site:${port}`, 'delete site.b']);
+      expect(builds).not.toHaveBeenCalled();
+      expect(meta).toEqual(expect.objectContaining({ kind: 'release', takenAt: first.createdAt }));
+      expect((await get(port)).body).toBe('v1');
+      await expect(get(v2Port)).rejects.toThrow();
+      expect(routeUpstreams('site')).toEqual([`localhost:${port}`]);
+      expect(cfg('site')?.currentRelease).toEqual(expect.objectContaining({ id: first.id, instance: 'a' }));
+      expect(cfg('site')?.previousRelease?.path).toBe(second.path);
+      expect(getStateManager().getApp('site')?.status).toBe('running');
+    }, 30000);
+
+    it('a previous release that never becomes ready is refused, and the current one keeps serving', async () => {
+      platform = makePlatform();
+      await platform.start();
+      const appPath = await deployV1('site');
+      await redeploy('site', appPath, 'v2');
+      const serving = cfg('site')!.currentRelease!;
+      const kept = cfg('site')!.previousRelease!;
+      const port = getStateManager().getApp('site')!.port!;
+      nextBehaviour = 'silent';
+      log.length = 0;
+
+      await expect(platform!.rollbackApp('site')).rejects.toThrow(/not applied.*still serving/);
+
+      // Slot a's runtime name is the bare app name; slot b (live) is untouched.
+      expect(log).toEqual([expect.stringMatching(/^start site:/), 'delete site']);
+      expect((await get(port)).body).toBe('v2');
+      expect(routeUpstreams('site')).toEqual([`localhost:${port}`]);
+      expect(fakeRuntime.getLiveInstance('site')).toBe('b');
+      expect(cfg('site')?.currentRelease?.path).toBe(serving.path);
+      expect(cfg('site')?.previousRelease?.path).toBe(kept.path);
+      // The rollback target is not thrown away with the failed attempt.
+      await expect(fs.access(kept.path)).resolves.toBeUndefined();
+      expect(settled('site')).toBe(true);
+    }, 30000);
+
+    it('promoting a held release cuts over to it', async () => {
+      platform = makePlatform();
+      await platform.start();
+      const appPath = await deployV1('site');
+      const oldPort = getStateManager().getApp('site')!.port!;
+      await getAppConfigService().updateConfig('site', { promotion: 'manual' });
+      await redeploy('site', appPath, 'v2');
+      const held = cfg('site')!.pendingPromotion!.releasePath!;
+      expect((await get(oldPort)).body).toBe('v1');
+      log.length = 0;
+
+      await platform!.promoteApp('site');
+
+      const port = getStateManager().getApp('site')!.port!;
+      expect(log).toEqual([`start site.b:${port}`, 'delete site']);
+      expect((await get(port)).body).toBe('v2');
+      await expect(get(oldPort)).rejects.toThrow();
+      expect(cfg('site')?.currentRelease?.path).toBe(held);
+      expect(cfg('site')?.pendingPromotion).toBeUndefined();
+      expect(settled('site')).toBe(true);
+    }, 30000);
+
+    it('a held release that never becomes ready is not promoted, and the old one keeps serving', async () => {
+      platform = makePlatform();
+      await platform.start();
+      const appPath = await deployV1('site');
+      const oldPort = getStateManager().getApp('site')!.port!;
+      const serving = cfg('site')!.currentRelease!.path;
+      await getAppConfigService().updateConfig('site', { promotion: 'manual' });
+      await redeploy('site', appPath, 'v2-broken');
+      const held = cfg('site')!.pendingPromotion!.releasePath!;
+      nextBehaviour = 'silent';
+      log.length = 0;
+
+      await expect(platform!.promoteApp('site')).rejects.toThrow(/not promoted.*still serving/);
+
+      expect(log).toEqual([expect.stringMatching(/^start site\.b:/), 'delete site.b']);
+      expect((await get(oldPort)).body).toBe('v1');
+      expect(cfg('site')?.currentRelease?.path).toBe(serving);
+      await expect(fs.access(held)).rejects.toThrow();
+      expect(settled('site')).toBe(true);
+    }, 30000);
+  });
 });

@@ -258,25 +258,32 @@ describe('release directories (#298 step 3)', () => {
     }, 20000);
   });
 
-  it('a rollback restores into the current release and restarts from it', async () => {
+  it('a rollback serves the previous release again, without a snapshot (#298 step 6)', async () => {
     platform = makePlatform();
     await platform.start();
     const appPath = await createApp('site', OPT_IN);
     await deploy('site', appPath);
-    const firstRelease = current('site')!.path;
-    // What upload-deploy does before replacing a running app.
-    const { captureBeforeRedeploy } = jest.requireActual('../managers/rollback') as typeof import('../managers/rollback');
-    expect((await captureBeforeRedeploy('site')).captured).toBe(true);
+    const firstRelease = current('site')!;
+    // What upload-deploy does before replacing a running app: nothing to copy
+    // for an app that keeps its previous release.
+    const { captureBeforeRedeploy, getRollbackStore } = jest.requireActual(
+      '../managers/rollback'
+    ) as typeof import('../managers/rollback');
+    expect((await captureBeforeRedeploy('site')).captured).toBe(false);
     await redeploy('site', appPath, '<h1>site v2</h1>');
-    const secondRelease = current('site')!.path;
+    const secondRelease = current('site')!;
     const startSpy = jest.spyOn(fakeRuntime, 'start');
 
-    await platform.rollbackApp('site');
+    const { meta } = await platform.rollbackApp('site');
 
-    expect(lastStartCwd(startSpy)).toBe(secondRelease);
-    // The snapshot was of the SERVING tree (the first release), not the source.
-    expect(await fs.readFile(path.join(secondRelease, 'index.html'), 'utf-8')).toContain('v1');
-    expect(firstRelease).not.toBe(secondRelease);
+    expect(meta).toEqual(expect.objectContaining({ kind: 'release', takenAt: firstRelease.createdAt }));
+    expect(lastStartCwd(startSpy)).toBe(firstRelease.path);
+    // A swap, keeping each release's own record; both stay on disk.
+    expect(current('site')).toEqual(expect.objectContaining({ id: firstRelease.id, createdAt: firstRelease.createdAt }));
+    expect(previous('site')?.path).toBe(secondRelease.path);
+    expect(await fs.readFile(path.join(firstRelease.path, 'index.html'), 'utf-8')).toContain('v1');
+    expect(await fs.readFile(path.join(secondRelease.path, 'index.html'), 'utf-8')).toContain('v2');
+    expect(await getRollbackStore()!.get('site')).toBeNull();
   }, 30000);
 
   it('a failed start discards the new release and leaves the serving one recorded', async () => {
@@ -298,21 +305,77 @@ describe('release directories (#298 step 3)', () => {
     expect(await fs.readdir(releasesOf('site'))).toEqual([path.basename(serving)]);
   }, 20000);
 
-  it('opting out goes back to in-place and removes the releases', async () => {
+  it('opting out goes back to in-place, keeping only the last release as the rollback target', async () => {
     platform = makePlatform();
     await platform.start();
     const appPath = await createApp('site', OPT_IN);
     await deploy('site', appPath);
+    await redeploy('site', appPath, '<h1>site v2</h1>');
+    const last = current('site')!;
     const startSpy = jest.spyOn(fakeRuntime, 'start');
 
     await fs.writeFile(path.join(appPath, 'drop.yaml'), 'type: static\n');
-    await redeploy('site', appPath, '<h1>site v2</h1>');
+    await redeploy('site', appPath, '<h1>site v3</h1>');
 
     expect(lastStartCwd(startSpy)).toBe(appPath);
     expect(current('site')).toBeUndefined();
+    expect(previous('site')?.path).toBe(last.path);
+    expect(await fs.readdir(releasesOf('site'))).toEqual([last.id]);
+
+    // The deploy that opted out can still be undone.
+    await platform.rollbackApp('site');
+    expect(lastStartCwd(startSpy)).toBe(last.path);
+    expect(current('site')?.path).toBe(last.path);
+  }, 30000);
+
+  it('drops the previous release instead of parking the app when it is what tips the ceiling', async () => {
+    platform = makePlatform();
+    await platform.start();
+    const appPath = await createApp('site', OPT_IN);
+    await fs.writeFile(path.join(appPath, 'bundle.js'), Buffer.alloc(400 * 1024));
+    await deploy('site', appPath);
+    await redeploy('site', appPath, '<h1>site v2</h1>');
+    const serving = current('site')!;
+    const dropped = previous('site')!;
+
+    // Source + two releases, ~1.2 MB, over 1 MB; without the previous one, under.
+    process.env.DROP_MAX_APP_DISK_MB = '1';
+    try {
+      const sweep = () =>
+        (platform as unknown as { sweepDiskCeiling(): Promise<void> }).sweepDiskCeiling();
+      await sweep();
+      await sweep();
+    } finally {
+      delete process.env.DROP_MAX_APP_DISK_MB;
+    }
+
     expect(previous('site')).toBeUndefined();
-    expect(await fs.readdir(releasesOf('site')).catch(() => [])).toEqual([]);
-  }, 20000);
+    expect(await exists(dropped.path)).toBe(false);
+    expect(current('site')?.path).toBe(serving.path);
+    expect(await exists(serving.path)).toBe(true);
+    expect(getStateManager().getApp('site')!.status).toBe('running');
+  }, 30000);
+
+  it('an in-place snapshot supersedes the release an opted-out app kept', async () => {
+    platform = makePlatform();
+    await platform.start();
+    const appPath = await createApp('site', OPT_IN);
+    await deploy('site', appPath);
+    await fs.writeFile(path.join(appPath, 'drop.yaml'), 'type: static\n');
+    await redeploy('site', appPath, '<h1>site v2</h1>');
+    expect(previous('site')).toBeDefined();
+    const { captureBeforeRedeploy } = jest.requireActual('../managers/rollback') as typeof import('../managers/rollback');
+
+    // The next upload of the now in-place app snapshots what serves (v2).
+    expect((await captureBeforeRedeploy('site')).captured).toBe(true);
+    expect(previous('site')).toBeUndefined();
+    await redeploy('site', appPath, '<h1>site v3</h1>');
+    expect(await fs.readdir(releasesOf('site'))).toEqual([]);
+
+    const { meta } = await platform.rollbackApp('site');
+    expect(meta.kind).toBeUndefined();
+    expect(await fs.readFile(path.join(appPath, 'index.html'), 'utf-8')).toContain('v2');
+  }, 30000);
 
   it('leaves an app that never opted in exactly as before', async () => {
     platform = makePlatform();
