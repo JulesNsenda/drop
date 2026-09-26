@@ -59,6 +59,7 @@ something is listed here it exists in the shipped code. Planned work lives in
 | CLI | `drop serve`, `list`, `status`, `logs`, `deploy`, `start/stop/restart/remove`, `backup`, `restore`, `mfa`, `migrate-runtime` |
 | Web dashboard | Apps, logs, deploys, metrics, secrets, database browser, settings |
 | Public site | Marketing, docs and API reference, served from a separate bundle |
+| OpenAPI description | `GET /api/v1/openapi.json` — OpenAPI 3.1, generated from the mounted route table with per-operation role floors |
 | Hosted MCP server | `POST /api/v1/mcp` — deploy, logs, status and `verify_deployment` tools for coding agents; refused deploys carry a structured `error_code` + `retry_after_seconds` |
 | OAuth 2.1 + PKCE | The authorization path web-based MCP connectors require |
 

@@ -29,6 +29,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`GET /api/v1/openapi.json` — a generated OpenAPI 3.1 description (#297).**
+  Built from the mounted route table rather than written beside it, so it
+  cannot list a route that is not served or miss one that is. Each operation
+  carries its security requirements and an `x-drop-min-role`, read off a tag
+  every auth middleware now carries and matched to routes by Hono itself, so
+  method-scoped and route-level floors are included. Operations with no
+  middleware floor are marked `x-drop-auth: handler` rather than declared
+  public. Request and response bodies are not described yet. A new test fails
+  when a route is mounted with no role floor and is not on a reviewed list —
+  `setupRoutes` has no default-deny, and nothing noticed that before.
+
 - **A test fails when the published agent surface drifts from the code (#303).**
   `src/api/mcp/published-surface.test.ts` holds the MCP tool list, the REST
   `ErrorCodes` and the deploy `error_code` values that drop-site's `llms.txt`
