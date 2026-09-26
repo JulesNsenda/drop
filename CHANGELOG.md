@@ -29,6 +29,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Deploy status streams over SSE (#299).** `GET /api/v1/deploys/:deployId/stream`
+  emits an `episode` event each time a deploy's stages or status change and one
+  `end` event at a terminal status (or a park/hold, which never reaches one),
+  then closes itself and releases its subscription. Because a `202` from
+  `POST /apps/:name/source` carries `acceptedAt` but no deploy id,
+  `GET /api/v1/deploys/stream?app=<name>&since=<acceptedAt>` follows the same
+  deploy from acceptance, with the correlation the MCP deploy tools use. Same
+  owner-snapshot ownership rule as `GET /deploys`; a foreign and a missing
+  deploy are indistinguishable on both routes.
+
 - **MCP: a refused deploy is now machine-readable (#292).** `deploy_files` and
   `deploy_from_git` refused by the deploy quota or the failure breaker used to
   return only a sentence. They now also return `structuredContent` with
