@@ -348,6 +348,12 @@ export interface AppConfig {
     deployId?: string;
     builtAt: string;
     outputDirectory?: string;
+    /**
+     * The release directory the held build lives in, for an app on the
+     * zero-downtime strategy (#298). Promotion starts from it. Re-validated to
+     * sit under this app's releases root before use — see release-store.
+     */
+    releasePath?: string;
   };
   sourceHash?: string;
   /**
@@ -473,6 +479,21 @@ export interface AppConfig {
    * who may do something and costs a dedicated setter per field.
    */
   reviewBy?: string;
+  /**
+   * The release the app is serving from, for an app on the zero-downtime
+   * strategy (#298): a per-deploy directory under `data/releases/<app>/`.
+   * Absent for in-place apps, which serve from their source folder. SYSTEM
+   * tier: it becomes the runtime's working directory.
+   */
+  currentRelease?: AppRelease;
+  /** The release served before `currentRelease`; kept for rollback (#298 step 6). */
+  previousRelease?: AppRelease;
+}
+
+export interface AppRelease {
+  id: string;
+  path: string;
+  createdAt: string;
 }
 
 /**
@@ -490,6 +511,8 @@ const SYSTEM_CONFIG_FIELDS = [
   'ephemeralPrincipalId',
   'expiresAt',
   'lastDetachAt',
+  'currentRelease',
+  'previousRelease',
 ] as const satisfies readonly (keyof AppConfig)[];
 
 type SystemConfigField = (typeof SYSTEM_CONFIG_FIELDS)[number];

@@ -98,6 +98,7 @@ import {
   NoRollbackSnapshotError,
 } from '../managers/rollback';
 import type { RollbackSnapshotMeta } from '../managers/rollback';
+import { ReleaseStore, wantsReleases } from '../managers/release';
 import {
   getDeployBreaker,
   guardrailKeysFor,
@@ -785,6 +786,17 @@ export class DropPlatform {
     new Map();
   private buildDrainTimer: ReturnType<typeof setTimeout> | null = null;
   private appDeployTimes: Map<string, number> = new Map(); // Track when apps were last deployed
+  /** Release directories for apps on the zero-downtime strategy (#298). */
+  private releaseStore: ReleaseStore | null = null;
+  /**
+   * Where the deploy IN FLIGHT for an app was built: a fresh release
+   * directory (zero-downtime strategy) or the source folder (in-place). Set
+   * before the build, read by the start that follows it, cleared when that
+   * start commits or fails. The start MUST use this rather than the persisted
+   * current release, or an app that just opted out of releases would restart
+   * the stale one.
+   */
+  private deployTargets: Map<string, string> = new Map();
   // Apps whose rebuild+restart is being managed as a single transaction by
   // handleAppUpdate. Their builder.build still emits build:completed, but
   // buildSub must NOT also start them (that would double-start). Held only for
@@ -939,6 +951,7 @@ export class DropPlatform {
       // the same reason as the quotas: the upload and git deploy services
       // capture through the singleton and have no root of their own.
       initRollbackStore(this.config.dropRoot);
+      this.releaseStore = new ReleaseStore(this.config.dropRoot);
 
       const mailQuotaStore = path.join(
         this.config.dropRoot,
@@ -2769,6 +2782,7 @@ backup:
         if (app?.status === 'stopped') {
           this.logger.info(`Skipping auto-start for ${payload.appId} - app was stopped by user`, 'APP');
         }
+        await this.discardDeployTarget(payload.appId);
         this.appsInProgress.delete(payload.appId);
       }
     });
@@ -4260,10 +4274,12 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         const buildEnv = await this.resolveBuildEnv(appPath, appName);
         const buildOverride = (await parseDropYaml(appPath)).config?.build;
 
+        const buildPath = await this.prepareDeployTarget(appName, appPath, deployId);
+
         builderEntered = true;
         result = await this.builder.build({
           appName,
-          appPath,
+          appPath: buildPath,
           deployId,
           appType: detection.type,
           framework: detection.framework || null,
@@ -4311,6 +4327,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         // the retry re-enters this method and re-gates itself.
         this.releaseGuardrailKeys(appName);
         this.appsInProgress.delete(appName);
+        await this.discardDeployTarget(appName);
         this.pendingBuilds.set(appName, { appPath, appType: _appType, actor });
         this.scheduleBuildDrain();
       } else {
@@ -4325,11 +4342,13 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         // fire here (the builder published its own episode), so without this
         // the breaker counted only pre-build and readiness failures and would
         // never trip on a repeatedly-failing build.
+        await this.discardDeployTarget(appName);
         this.recordDeployOutcome(appName, false);
         this.appsInProgress.delete(appName);
       }
     } catch (error) {
       const err = error instanceof Error ? error : new Error('Build failed');
+      await this.discardDeployTarget(appName);
       this.logger.appEvent('error', appName, err.message);
       if (this.stateManager) {
         await this.stateManager.setAppStatus(appName, 'errored', { error: err.message });
@@ -4603,9 +4622,16 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     // monorepo child — the copied per-service folder, not appsDirectory/name)
     // over the hardcoded join, falling back to the join only when no config
     // (or no path on it) exists yet.
+    //
+    // A deploy in flight starts from where it was BUILT (a release directory,
+    // or the source folder). Otherwise — boot, promotion of an in-place build —
+    // the app's current release when it has one.
+    const cfgAtStart = this.appConfigService?.getConfig(appName);
     const appPath =
-      this.appConfigService?.getConfig(appName)?.path ||
-      path.join(this.config.appsDirectory, appName);
+      this.deployTargets.get(appName) ??
+      (this.releaseStore?.isReleasePathOf(appName, cfgAtStart?.currentRelease?.path)
+        ? cfgAtStart!.currentRelease!.path
+        : cfgAtStart?.path || path.join(this.config.appsDirectory, appName));
 
     try {
       // Update state to starting. Kept inside the try: if this write throws it
@@ -4756,7 +4782,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       // awaited: it must never delay the 'running' status write or the
       // eventual appsInProgress release, which several callers/tests treat
       // as available the instant runtime.start()/readiness settles.
-      void this.recordDeploySignature(appName, appPath);
+      void this.recordDeploySignature(appName, this.sourcePathOf(appName));
 
       // Update state to running with port and pid.
       //
@@ -4781,6 +4807,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       // leniency: five legitimately-slow-but-healthy deploys would trip the
       // breaker on a perfectly good app. The agent still gets the unverified
       // status and a hint — that is the signal to act on, not a throttle.
+      await this.commitServedPath(appName, appPath);
       this.recordDeployOutcome(appName, true);
 
       // App is fully deployed now - record deploy time for cooldown
@@ -4832,6 +4859,8 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       // Terminal handler: always release the in-progress guard on every settled
       // path (success, error, or a throw from the initial 'starting' write), so
       // a transient failure can never wedge the app out of future rebuilds.
+      // A release this start did not commit is discarded (no-op after success).
+      await this.discardDeployTarget(appName);
       this.appsInProgress.delete(appName);
     }
   }
@@ -5990,6 +6019,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       // marker and abstains from starting the app (handleAppUpdate starts it
       // below). finally guarantees the marker is cleared even on build failure —
       // a stuck marker would silently suppress the app's NEXT legit deploy.
+      const buildPath = await this.prepareDeployTarget(appName, appPath, updateDeployId);
       this.selfManagedUpdates.add(appName);
       let buildResult;
       try {
@@ -5997,7 +6027,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         const buildOverride = (await parseDropYaml(appPath)).config?.build;
         buildResult = await this.builder.build({
           appName,
-          appPath,
+          appPath: buildPath,
           deployId: updateDeployId,
           appType: detection.type,
           framework: detection.framework || null,
@@ -6039,6 +6069,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         } else {
           await this.stateManager.setAppStatus(appName, 'errored', { error: buildError });
         }
+        await this.discardDeployTarget(appName);
         this.recordDeployOutcome(appName, false);
         this.appsInProgress.delete(appName);
         return;
@@ -6089,7 +6120,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
 
       const { spec, port } = await this.buildFreshStartSpec(
         appName,
-        appPath,
+        buildPath,
         detection,
         buildResult.outputPath ?? undefined
       );
@@ -6104,7 +6135,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       // container in docker mode, so the runtime-spec revision recorded here
       // is accurate too. Fire-and-forget (`void`), not awaited: must never
       // delay the 'running' status write or appsInProgress's release.
-      void this.recordDeploySignature(appName, appPath);
+      void this.recordDeploySignature(appName, this.sourcePathOf(appName));
 
       await this.stateManager.setAppStatus(appName, 'running', {
         port,
@@ -6120,9 +6151,11 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       // process rather than continuing to watch the old one's count.
       this.armPostDeployWatches(appName, port, spec.healthCheckPath);
 
+      await this.commitServedPath(appName, buildPath);
       this.recordDeployOutcome(appName, true);
       this.appsInProgress.delete(appName);
     } catch (error) {
+      await this.discardDeployTarget(appName);
       // Secret preflight park (PRD-051) on a hot-reload — e.g. the edited
       // drop.yaml added a required `secrets:` entry. Park in `needs-config`
       // (not `errored`) so the operator gets the actionable missing list. The
@@ -6290,10 +6323,81 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
    */
   private servingPathOf(
     appName: string,
-    config?: { path?: string } | null,
+    config?: { path?: string; currentRelease?: { path: string } } | null,
     state?: { path?: string } | null
   ): string {
-    return this.sourcePathOf(appName, config, state);
+    const cfg = config === undefined ? this.appConfigService?.getConfig(appName) : config;
+    const release = cfg?.currentRelease?.path;
+    // Contained, or ignored: this becomes the runtime's working directory.
+    if (this.releaseStore?.isReleasePathOf(appName, release)) return release;
+    return this.sourcePathOf(appName, cfg, state);
+  }
+
+  /**
+   * Decide where THIS deploy builds, and remember it for the start that
+   * follows. A zero-downtime app gets a fresh copy of its source under
+   * `data/releases/<app>/<deployId>/`; any other app builds in its source
+   * folder, exactly as before. Throws only if staging the copy fails, which
+   * the caller treats as a failed deploy.
+   */
+  private async prepareDeployTarget(
+    appName: string,
+    sourcePath: string,
+    deployId: string
+  ): Promise<string> {
+    await this.discardDeployTarget(appName);
+    let target = sourcePath;
+    if (this.releaseStore && (await wantsReleases(sourcePath))) {
+      target = await this.releaseStore.stage(appName, sourcePath, deployId);
+      this.logger.info(`Building ${appName} into release ${path.basename(target)}`, 'RELEASE');
+    }
+    this.deployTargets.set(appName, target);
+    return target;
+  }
+
+  /** Forget the in-flight deploy target, deleting it if it is a release. Never throws. */
+  private async discardDeployTarget(appName: string): Promise<void> {
+    const target = this.deployTargets.get(appName);
+    this.deployTargets.delete(appName);
+    if (target && this.releaseStore?.isReleasePathOf(appName, target)) {
+      await this.releaseStore.discard(appName, target).catch(() => undefined);
+    }
+  }
+
+  /**
+   * The app is now RUNNING from `servedPath`: record it. A release becomes
+   * `currentRelease` (the one it replaces becomes `previousRelease`) and any
+   * older release is pruned. An in-place start clears any release record left
+   * from before the app opted out, and deletes its releases. Best-effort: the
+   * app is already serving, so a bookkeeping failure is logged, not thrown.
+   */
+  private async commitServedPath(appName: string, servedPath: string): Promise<void> {
+    if (this.deployTargets.get(appName) === servedPath) this.deployTargets.delete(appName);
+    const store = this.releaseStore;
+    const configs = this.appConfigService;
+    if (!store || !configs) return;
+    try {
+      const cfg = configs.getConfig(appName);
+      if (store.isReleasePathOf(appName, servedPath)) {
+        if (cfg?.currentRelease?.path === servedPath) return;
+        const current = {
+          id: path.basename(servedPath),
+          path: servedPath,
+          createdAt: new Date().toISOString(),
+        };
+        const previous = cfg?.currentRelease ?? cfg?.previousRelease;
+        await configs.updateSystemConfig(appName, { currentRelease: current, previousRelease: previous });
+        await store.prune(appName, [current.path, previous?.path, cfg?.pendingPromotion?.releasePath]);
+      } else if (cfg?.currentRelease || cfg?.previousRelease) {
+        await configs.updateSystemConfig(appName, {
+          currentRelease: undefined,
+          previousRelease: undefined,
+        });
+        await store.prune(appName, [cfg?.pendingPromotion?.releasePath]);
+      }
+    } catch (error) {
+      this.logger.warn(`Failed to record the release ${appName} is serving from`, 'RELEASE', error);
+    }
   }
 
   /**
@@ -6409,7 +6513,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       // container in docker mode, so the runtime-spec revision recorded
       // here is accurate too. Fire-and-forget (`void`), not awaited: must
       // never delay the 'running' status write or appsInProgress's release.
-      void this.recordDeploySignature(appName, appPath);
+      void this.recordDeploySignature(appName, this.sourcePathOf(appName));
 
       await this.stateManager.setAppStatus(appName, 'running', {
         port,
@@ -7412,6 +7516,8 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       // not keep it: a snapshot left behind would restore the deleted app's
       // tree into whatever the next registrant of this name deploys.
       path.join(this.config.dropRoot, 'data', 'rollback', name),
+      // Release directories (#298) are code too, and keyed on the freed name.
+      path.join(this.config.dropRoot, 'data', 'releases', name),
     ];
     for (const dir of targets) {
       try {
@@ -7862,6 +7968,8 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           path.join(this.config.dropRoot, 'data', 'appdata', app.name),
           // The rollback snapshot (#296) is charged to the app it belongs to.
           path.join(this.config.dropRoot, 'data', 'rollback', app.name),
+          // Release directories (#298): current, previous and a held build.
+          path.join(this.config.dropRoot, 'data', 'releases', app.name),
         ],
         maxDiskMb: this.appConfigService?.getConfig(app.name)?.maxDiskMb,
       }));
@@ -7934,10 +8042,16 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     );
     if (!shouldHoldForPromotion(mode)) return false;
 
+    // The held build keeps the release it was built into; promotion starts
+    // from it. Taken OUT of deployTargets so no failure path discards it.
+    const target = this.deployTargets.get(appName);
+    this.deployTargets.delete(appName);
+    const releasePath = this.releaseStore?.isReleasePathOf(appName, target) ? target : undefined;
     const pending = {
       deployId,
       builtAt: new Date().toISOString(),
       outputDirectory: outputPath,
+      ...(releasePath ? { releasePath } : {}),
     };
     await this.appConfigService?.updateConfig(appName, { pendingPromotion: pending });
 
@@ -7990,6 +8104,10 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     // implementation of starting an app to drift from the first.
     this.appsInProgress.add(appName);
     try {
+      // Re-validated: pendingPromotion is not a system-tier field.
+      if (this.releaseStore?.isReleasePathOf(appName, pending.releasePath)) {
+        this.deployTargets.set(appName, pending.releasePath);
+      }
       await this.handleStartApp(appName, pending.outputDirectory);
     } finally {
       this.appsInProgress.delete(appName);
