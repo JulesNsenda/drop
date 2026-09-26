@@ -146,6 +146,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Concurrent route changes can no longer drop a route from the Caddyfile.**
+  Every route change rewrites the whole file from a snapshot of the routes, and
+  two overlapping rewrites could land in the wrong order, the older snapshot
+  winning and the newer route vanishing from disk until the next change. The
+  router now serializes its writes, each computed from the routes as they are
+  when its turn comes. It also gains `setUpstream`, which repoints an app's
+  routes and reloads Caddy immediately, reporting whether Caddy accepted it —
+  the first step of zero-downtime redeploys (#298).
+
 - **The SQL console's refusal pointed at a Settings page that did not exist.**
   It told an admin to "enable it in Settings" while no such control had been
   built. It now names the tab that exists.

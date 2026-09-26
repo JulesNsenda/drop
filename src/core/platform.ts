@@ -2390,11 +2390,11 @@ backup:
     // ACT half (markAppKnown, handleConfigureRoute, armPostDeployWatches,
     // eventBus.publish) stays SERIAL, in original config order, run only
     // after every decision is in: RouterService.addRoute's regenerateConfig
-    // reads the full routes map and writes the WHOLE Caddyfile per call —
-    // two concurrent writes for different apps race on which one lands
-    // last, and the loser's route silently disappears from disk. Splitting
-    // decide/act avoids that without touching RouterService's own locking
-    // (out of scope here).
+    // reads the full routes map and writes the WHOLE Caddyfile per call.
+    // Overlapping writes used to race on which one landed last, dropping the
+    // loser's route from disk; RouterService now serializes its own writes
+    // (`writeChain`), so the serial act phase here is no longer what prevents
+    // that — it stays serial for its original ordering and batching reasons.
     //
     // Deliberately NO global deadline for the whole pass: an app "not yet
     // reached" under a deadline would get no markAppKnown and no

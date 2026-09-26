@@ -38,6 +38,9 @@ const DEFAULT_ROUTER_CONFIG: RouterConfig = {
  * ordinary Caddy diagnostics (directive names, paths, ports) are far shorter
  * than the threshold and survive intact.
  */
+/** What a Caddy reload came to. `unavailable` = Caddy not running / admin API unreachable. */
+export type CaddyReloadOutcome = 'ok' | 'unavailable' | 'rejected' | 'disabled';
+
 function redactSecretLikeTokens(text: string): string {
   return text.replace(/[A-Za-z0-9_-]{24,}/g, '[redacted]');
 }
@@ -46,6 +49,14 @@ export class RouterService {
   private readonly config: RouterConfig;
   private readonly routes: Map<string, Route> = new Map();
   private reloadTimeout: ReturnType<typeof setTimeout> | null = null;
+  /**
+   * Serializes Caddyfile writes. Each regeneration snapshots the routes map
+   * into a WHOLE file and then awaits I/O; without this, two overlapping
+   * regenerations could finish out of order and the older snapshot would land
+   * last, silently dropping the newer route from disk (the race the boot path
+   * used to work around by keeping its act phase serial).
+   */
+  private writeChain: Promise<void> = Promise.resolve();
 
   constructor(config: Partial<RouterConfig> = {}) {
     this.config = {
@@ -227,6 +238,54 @@ export class RouterService {
   }
 
   /**
+   * Point every route owned by `owner` at a new upstream, write the Caddyfile,
+   * and reload Caddy NOW — awaited, not debounced — returning what the reload
+   * came to.
+   *
+   * For a traffic cutover (#298): the caller must know the switch has taken
+   * effect before it stops the instance traffic used to go to, and a 500 ms
+   * debounce that swallows its outcome cannot tell it that. Only the upstream
+   * changes; every other field of each route is kept as it was.
+   *
+   * Resolves `{ routes: 0 }` with outcome `disabled` when the owner has no
+   * routes (nothing to switch).
+   */
+  async setUpstream(
+    owner: string,
+    upstream: string
+  ): Promise<{ routes: number; outcome: CaddyReloadOutcome }> {
+    let count = 0;
+    for (const [key, route] of this.routes.entries()) {
+      if (route.owner !== owner) continue;
+      this.routes.set(key, { ...route, upstream, updatedAt: new Date() });
+      count++;
+    }
+    if (count === 0) return { routes: 0, outcome: 'disabled' };
+
+    await this.regenerateConfig();
+    const outcome = await this.reloadNow();
+    eventBus.publish('route:updated' as never, {
+      appName: owner,
+      action: 'update',
+    } as never);
+    return { routes: count, outcome };
+  }
+
+  /**
+   * Reload Caddy immediately — after any in-flight write — instead of waiting
+   * for the debounce, and report the outcome. Cancels a pending debounced
+   * reload, which this one supersedes.
+   */
+  async reloadNow(): Promise<CaddyReloadOutcome> {
+    if (this.reloadTimeout) {
+      clearTimeout(this.reloadTimeout);
+      this.reloadTimeout = null;
+    }
+    await this.writeChain;
+    return this.reloadCaddy();
+  }
+
+  /**
    * Get a route by app name
    */
   getRoute(appName: string): Route | undefined {
@@ -264,9 +323,19 @@ export class RouterService {
   }
 
   /**
-   * Generate and write Caddyfile
+   * Generate and write the Caddyfile, serialized behind any write already in
+   * flight (see `writeChain`). The content is computed when THIS write's turn
+   * comes, from the routes map as it is then, so the last write to land always
+   * reflects every mutation made before it. A failure rejects only its own
+   * caller; the chain carries on.
    */
-  private async regenerateConfig(): Promise<void> {
+  private regenerateConfig(): Promise<void> {
+    const run = this.writeChain.then(() => this.writeCaddyfile());
+    this.writeChain = run.catch(() => undefined);
+    return run;
+  }
+
+  private async writeCaddyfile(): Promise<void> {
     const routes = this.getRoutes().filter(r => r.status === 'active');
     const content = generateFullCaddyfile(routes, this.config.caddy);
 
@@ -300,10 +369,10 @@ export class RouterService {
   /**
    * Reload Caddy server
    */
-  private async reloadCaddy(): Promise<void> {
+  private async reloadCaddy(): Promise<CaddyReloadOutcome> {
     // (see redactSecretLikeTokens below for why the error body is scrubbed)
     if (!this.config.caddy.enableAdminApi || !this.config.caddy.adminApi) {
-      return;
+      return 'disabled';
     }
 
     let response: Response;
@@ -323,11 +392,11 @@ export class RouterService {
       // Transport-level failure — Caddy isn't running, or the admin endpoint
       // is unreachable. Benign and expected (dev boxes, pre-start ordering);
       // apps remain reachable directly on their ports. Stay quiet.
-      return;
+      return 'unavailable';
     }
 
     if (response.ok) {
-      return;
+      return 'ok';
     }
 
     // Caddy is RUNNING and REJECTED the config. This is categorically
@@ -353,6 +422,7 @@ export class RouterService {
       error: new Error(message),
       context: 'caddy-reload',
     });
+    return 'rejected';
   }
 
   /**
