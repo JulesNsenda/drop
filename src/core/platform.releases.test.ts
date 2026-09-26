@@ -344,6 +344,24 @@ describe('release directories (#298 step 3)', () => {
     expect(lastStartCwd(startSpy)).toBe(appPath);
   }, 20000);
 
+  it('re-applies the live runtime slot at boot (#298 step 4)', async () => {
+    platform = makePlatform();
+    await platform.start();
+    const appPath = await createApp('site', OPT_IN);
+    await deploy('site', appPath);
+    // As a cutover would record it: the current release runs in slot b.
+    await getAppConfigService().updateSystemConfig('site', {
+      currentRelease: { ...current('site')!, instance: 'b' },
+    });
+    await platform.stop();
+    expect(fakeRuntime.getLiveInstance('site')).toBe('a');
+
+    platform = makePlatform();
+    await platform.start();
+
+    expect(fakeRuntime.getLiveInstance('site')).toBe('b');
+  }, 20000);
+
   it('removes the releases when the app is deleted', async () => {
     platform = makePlatform();
     await platform.start();

@@ -14,6 +14,11 @@
  * the app "running". Call fakeRuntime.reset() between test cases.
  */
 import type { AppRuntime } from '../../managers/runtime/app-runtime';
+import {
+  LiveInstances,
+  type InstanceSlot,
+  appNameOfInstance,
+} from '../../managers/runtime/instance';
 import type {
   AppStartSpec,
   AppProcessInfo,
@@ -23,7 +28,9 @@ import type {
 
 export class FakeRuntime implements AppRuntime {
   readonly type: RuntimeType = 'pm2';
+  /** Keyed by INSTANCE name, like the real adapters (#298 step 4). */
   private readonly apps = new Map<string, AppProcessInfo>();
+  private live = new LiveInstances();
   private pidSeq = 1000;
   /** Total start() calls — lets a test assert a reload ran exactly once. */
   startCount = 0;
@@ -31,6 +38,7 @@ export class FakeRuntime implements AppRuntime {
   /** Clear all tracked apps — call between test cases, NOT between platform instances within a case. */
   reset(): void {
     this.apps.clear();
+    this.live = new LiveInstances();
     this.pidSeq = 1000;
     this.startCount = 0;
   }
@@ -42,7 +50,7 @@ export class FakeRuntime implements AppRuntime {
 
   /** Test helper: current pid of an app (changes on each start/restart), or null. */
   pidOf(name: string): number | null {
-    return this.apps.get(name)?.pid ?? null;
+    return this.apps.get(this.live.resolve(name))?.pid ?? null;
   }
 
   /** Test helper: seed a "surviving" process (e.g. to model PM2 state before a platform restart). */
@@ -50,9 +58,18 @@ export class FakeRuntime implements AppRuntime {
     this.apps.set(name, this.buildInfo(name, port));
   }
 
-  private buildInfo(name: string, port: number | null): AppProcessInfo {
+  setLiveInstance(appName: string, slot: InstanceSlot): void {
+    this.live.set(appName, slot);
+  }
+
+  getLiveInstance(appName: string): InstanceSlot {
+    return this.live.slotOf(appName);
+  }
+
+  private buildInfo(instance: string, port: number | null): AppProcessInfo {
     return {
-      name,
+      name: appNameOfInstance(instance),
+      instance,
       status: 'running',
       runtime: this.type,
       pid: this.pidSeq++,
@@ -68,13 +85,14 @@ export class FakeRuntime implements AppRuntime {
 
   async start(spec: AppStartSpec): Promise<AppProcessInfo> {
     this.startCount += 1;
-    const info = this.buildInfo(spec.name, spec.port ?? null);
-    this.apps.set(spec.name, info);
+    const instance = spec.instance ?? spec.name;
+    const info = this.buildInfo(instance, spec.port ?? null);
+    this.apps.set(instance, info);
     return { ...info };
   }
 
   async stop(name: string): Promise<void> {
-    const a = this.apps.get(name);
+    const a = this.apps.get(this.live.resolve(name));
     if (a) {
       a.status = 'stopped';
       a.pid = null;
@@ -82,7 +100,7 @@ export class FakeRuntime implements AppRuntime {
   }
 
   async restart(name: string): Promise<AppProcessInfo> {
-    const a = this.apps.get(name);
+    const a = this.apps.get(this.live.resolve(name));
     if (!a) {
       throw new Error(`FakeRuntime: cannot restart unknown app '${name}'`);
     }
@@ -94,11 +112,11 @@ export class FakeRuntime implements AppRuntime {
   }
 
   async delete(name: string): Promise<void> {
-    this.apps.delete(name);
+    this.apps.delete(this.live.resolve(name));
   }
 
   async getStatus(name: string): Promise<AppProcessInfo | null> {
-    const a = this.apps.get(name);
+    const a = this.apps.get(this.live.resolve(name));
     return a ? { ...a } : null;
   }
 

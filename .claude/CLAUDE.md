@@ -121,6 +121,8 @@ Implementor contract (from the interface's own header — honour it when touchin
 
 `container-config.ts` builds the container spec, `runtime-migrator.ts` backs `drop migrate-runtime` (moving existing apps between runtimes).
 
+**Two instances per app (#298 step 4, `instance.ts`).** Each app has runtime slots `a` (the bare app name — every process/container that exists today) and `b` (`<app>.b`; `.` is rejected by `APP_NAME_RE`, so no real app can collide). Adapters keep a `LiveInstances` map set by `setLiveInstance(app, slot)`: every name-keyed method given an APP name acts on that app's live instance, and an explicit `<app>.b` passes through — so callers keep calling by app name and only a cutover addresses a specific instance. `AppStartSpec.instance` picks the instance to start; `AppProcessInfo.name` stays the APP name, with the instance in `instance`, so `getAllStatus()` consumers still map to apps. Docker keys `logPaths`/`logTailers` by instance and labels `drop.instance`. The platform re-applies `currentRelease.instance` at boot. Still open for the cutover step: runtime-published events (`app:started` etc.) carry the PM2 process name, i.e. the INSTANCE, and teardown deletes only the live slot.
+
 ### Guardrails (`src/managers/guardrail/`)
 
 The layer that makes agent/API-driven deploys safe to expose. Independent limiters — do not collapse them, the distinctions are deliberate:

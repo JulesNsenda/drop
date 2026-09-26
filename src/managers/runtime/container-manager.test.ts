@@ -1173,3 +1173,49 @@ describe('base image digest pinning', () => {
     expect(selectBuildImage('spa')).toBe('node:20-slim');
   });
 });
+
+describe('ContainerManager live instances (#298 step 4)', () => {
+  const spec: AppStartSpec = {
+    name: 'my-app',
+    script: 'dist/index.js',
+    cwd: '/apps/my-app',
+    interpreter: 'node',
+    port: 4000,
+    env: {},
+    appType: 'nodejs',
+  };
+
+  it('names the container after the instance and labels both app and instance', async () => {
+    const docker = makeDockerMock() as any;
+    const mgr = new ContainerManager(docker);
+
+    await mgr.start({ ...spec, instance: 'my-app.b' });
+
+    const call = docker.createContainer.mock.calls[0][0];
+    expect(call.name).toBe('drop-my-app.b');
+    expect(call.Labels['drop.app']).toBe('my-app');
+    expect(call.Labels['drop.instance']).toBe('my-app.b');
+  });
+
+  it('slot a is exactly today\'s container name', async () => {
+    const docker = makeDockerMock() as any;
+    const mgr = new ContainerManager(docker);
+
+    await mgr.start(spec);
+
+    expect(docker.createContainer.mock.calls[0][0].name).toBe('drop-my-app');
+  });
+
+  it('routes app-named calls to the live instance', async () => {
+    const docker = makeDockerMock() as any;
+    const mgr = new ContainerManager(docker);
+    mgr.setLiveInstance('my-app', 'b');
+
+    await mgr.stop('my-app');
+    await mgr.getStatus('my-app');
+
+    const names = docker.getContainer.mock.calls.map((c: unknown[]) => c[0]);
+    expect(names).toEqual(['drop-my-app.b', 'drop-my-app.b']);
+  });
+});
+

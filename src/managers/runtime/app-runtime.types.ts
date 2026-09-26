@@ -89,6 +89,12 @@ export interface AppStartSpec {
    * app can reach the bundled Postgres without TCP.
    */
   pgSocketDir?: string;
+  /**
+   * Runtime instance name to start under (#298): `instanceName(name, slot)`.
+   * Absent means slot `a`, i.e. the bare app name — today's behaviour.
+   * `name` stays the APP name throughout, for events, logs and state.
+   */
+  instance?: string;
 }
 
 /**
@@ -103,7 +109,10 @@ export interface AppStartSpec {
  *   init PID as seen from the host, or null if unavailable.
  */
 export interface AppProcessInfo {
+  /** The APP name, even for a slot-b instance (see `instance`). */
   name: string;
+  /** The runtime instance name (`<app>` for slot a, `<app>.b` for slot b). */
+  instance?: string;
   status: AppRuntimeState;
   runtime: RuntimeType;
   pid: number | null;
