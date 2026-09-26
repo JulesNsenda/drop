@@ -6260,6 +6260,43 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
   }
 
   /**
+   * Where an app's SOURCE lives: what uploads land in, what `git pull` updates,
+   * where `drop.yaml` and the secrets preflight are read. Persisted config path
+   * first (a monorepo child's copied folder), then state (an admin-deployed
+   * out-of-tree app has state but no appconf), then the webapps default.
+   *
+   * Callers that already hold the config/state records pass them, so this
+   * never re-reads what the caller just read.
+   */
+  private sourcePathOf(
+    appName: string,
+    config?: { path?: string } | null,
+    state?: { path?: string } | null
+  ): string {
+    const cfg = config === undefined ? this.appConfigService?.getConfig(appName) : config;
+    const st = state === undefined ? this.stateManager?.getApp(appName) : state;
+    return cfg?.path || st?.path || path.join(this.config.appsDirectory, appName);
+  }
+
+  /**
+   * Where an app RUNS FROM: the start spec's `cwd`, the tree a rollback
+   * restores, the tree the disk ceiling measures as code.
+   *
+   * Identical to `sourcePathOf` today — every app builds in place and runs from
+   * its source folder. It exists as its own name because zero-downtime
+   * redeploys (#298, docs/plans/2026-09-26-zero-downtime-releases.md) move it
+   * to a per-release directory; every caller that means "the running tree"
+   * must already be saying so when that lands.
+   */
+  private servingPathOf(
+    appName: string,
+    config?: { path?: string } | null,
+    state?: { path?: string } | null
+  ): string {
+    return this.sourcePathOf(appName, config, state);
+  }
+
+  /**
    * Put back the app's last-good tree and restart it on its existing port
    * (#296). No rebuild: the snapshot holds build output and dependencies as
    * they were when that tree was serving.
@@ -6291,7 +6328,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       if (!config && !state) {
         throw new Error(`Application not found: ${appName}`);
       }
-      const appPath = config?.path || state?.path || path.join(this.config.appsDirectory, appName);
+      const appPath = this.servingPathOf(appName, config, state);
 
       const meta = await store.restoreInto(appName, appPath);
       this.appDeployTimes.set(appName, Date.now());
@@ -6329,7 +6366,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     if (!config && !state) {
       throw new Error(`Application not found: ${appName}`);
     }
-    const appPath = config?.path || state?.path || path.join(this.config.appsDirectory, appName);
+    const appPath = this.servingPathOf(appName, config, state);
 
     const runtimeStatus = await this.runtime.getStatus(appName);
     const isRunning = runtimeStatus?.status === 'running';
@@ -6550,7 +6587,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       // join would read the wrong (or no) drop.yaml for an out-of-tree or
       // monorepo-child app and let the own-DATABASE_URL guard below pass
       // when it should refuse.
-      const appPath = config?.path || state?.path || path.join(this.config.appsDirectory, appName);
+      const appPath = this.sourcePathOf(appName, config, state);
 
       if (config?.ephemeral) {
         return this.refuse('attach', appName, serviceId, {
@@ -6872,7 +6909,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       }
 
       // Same resolution attachService/doRestart use.
-      const appPath = config?.path || state?.path || path.join(this.config.appsDirectory, appName);
+      const appPath = this.sourcePathOf(appName, config, state);
       // Not a refusal (guard 7) — its position can't be observed since it
       // never blocks anything. Lazy and memoised: a parse+validate of
       // drop.yaml on every call would be paid even by refusals below that
