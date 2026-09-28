@@ -405,6 +405,20 @@ describe('zero-downtime cutover (#298 step 5)', () => {
     expect(fakeRuntime.getLiveInstance('worker')).toBe('a');
   }, 30000);
 
+  it('cuts over an app that only declares a healthCheck (the default, #298 step 7)', async () => {
+    platform = makePlatform();
+    await platform.start();
+    const appPath = await deployV1('site', 'type: static\nhealthCheck: /\n');
+    expect(cfg('site')?.currentRelease).toBeDefined();
+    log.length = 0;
+
+    await redeploy('site', appPath, 'v2');
+
+    const port = getStateManager().getApp('site')!.port!;
+    expect(log).toEqual([`start site.b:${port}`, 'delete site']);
+    expect((await get(port)).body).toBe('v2');
+  }, 30000);
+
   it('an in-place app is never cut over', async () => {
     platform = makePlatform();
     await platform.start();

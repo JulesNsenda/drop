@@ -3891,6 +3891,10 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           ...(svc.start ? { start: svc.start } : {}),
           ...(svc.route ? { route: svc.route } : {}),
           ...(dependsOn && dependsOn.length > 0 ? { depends_on: dependsOn } : {}),
+          // Explicit, so a service's `healthCheck` does not put the child on
+          // the zero-downtime default (#298 step 7): children are
+          // re-materialized from the group and keep stop/start for now.
+          deploy: { strategy: 'in-place' },
         };
         await fs.writeFile(path.join(childPath, 'drop.yaml'), yaml.stringify(childConfig));
 

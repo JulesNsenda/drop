@@ -10,7 +10,7 @@
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import * as os from 'os';
-import { ReleaseStore, wantsReleases } from './release-store';
+import { ReleaseStore, wantsReleases, effectiveDeployStrategy, zeroDowntimeByDefault } from './release-store';
 
 describe('ReleaseStore', () => {
   let root: string;
@@ -132,5 +132,61 @@ describe('wantsReleases', () => {
   it('is false (never throws) for an invalid manifest', async () => {
     await fs.writeFile(path.join(dir, 'drop.yaml'), 'deploy:\n  strategy: yolo\n');
     expect(await wantsReleases(dir)).toBe(false);
+  });
+
+  describe('the healthCheck default (#298 step 7)', () => {
+    const saved = process.env.DROP_ZERO_DOWNTIME_DEFAULT;
+    afterEach(() => {
+      if (saved === undefined) delete process.env.DROP_ZERO_DOWNTIME_DEFAULT;
+      else process.env.DROP_ZERO_DOWNTIME_DEFAULT = saved;
+    });
+
+    it('puts an app that declares a healthCheck and no strategy on zero-downtime', async () => {
+      delete process.env.DROP_ZERO_DOWNTIME_DEFAULT;
+      await fs.writeFile(path.join(dir, 'drop.yaml'), 'healthCheck: /health\n');
+      expect(await wantsReleases(dir)).toBe(true);
+    });
+
+    it('lets an explicit in-place win over the default', async () => {
+      delete process.env.DROP_ZERO_DOWNTIME_DEFAULT;
+      await fs.writeFile(
+        path.join(dir, 'drop.yaml'),
+        'healthCheck: /health\ndeploy:\n  strategy: in-place\n'
+      );
+      expect(await wantsReleases(dir)).toBe(false);
+    });
+
+    it('can be turned off platform-wide, leaving explicit opt-ins alone', async () => {
+      process.env.DROP_ZERO_DOWNTIME_DEFAULT = 'false';
+      await fs.writeFile(path.join(dir, 'drop.yaml'), 'healthCheck: /health\n');
+      expect(await wantsReleases(dir)).toBe(false);
+
+      await fs.writeFile(
+        path.join(dir, 'drop.yaml'),
+        'healthCheck: /health\ndeploy:\n  strategy: zero-downtime\n'
+      );
+      expect(await wantsReleases(dir)).toBe(true);
+    });
+  });
+});
+
+describe('effectiveDeployStrategy', () => {
+  it('resolves declared > healthCheck default > in-place', () => {
+    const on = {} as NodeJS.ProcessEnv;
+    expect(effectiveDeployStrategy(null, on)).toBe('in-place');
+    expect(effectiveDeployStrategy({}, on)).toBe('in-place');
+    expect(effectiveDeployStrategy({ healthCheck: '/h' }, on)).toBe('zero-downtime');
+    expect(effectiveDeployStrategy({ healthCheck: '/h', deploy: { strategy: 'in-place' } }, on)).toBe('in-place');
+    expect(effectiveDeployStrategy({ deploy: { strategy: 'zero-downtime' } }, on)).toBe('zero-downtime');
+  });
+
+  it.each(['false', '0', 'off', 'no', ' FALSE '])('treats DROP_ZERO_DOWNTIME_DEFAULT=%j as off', (raw) => {
+    expect(effectiveDeployStrategy({ healthCheck: '/h' }, { DROP_ZERO_DOWNTIME_DEFAULT: raw })).toBe('in-place');
+  });
+
+  it('treats any other value, or none, as on', () => {
+    expect(zeroDowntimeByDefault({})).toBe(true);
+    expect(zeroDowntimeByDefault({ DROP_ZERO_DOWNTIME_DEFAULT: 'true' })).toBe(true);
+    expect(zeroDowntimeByDefault({ DROP_ZERO_DOWNTIME_DEFAULT: 'yes' })).toBe(true);
   });
 });

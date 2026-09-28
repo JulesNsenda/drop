@@ -261,10 +261,11 @@ export interface DropYamlConfig {
    */
   mcp?: AppMcpConfig;
   /**
-   * How a deploy of this app is carried out (#298). `in-place` (the default)
-   * builds and runs in the app's own folder. `zero-downtime` builds each deploy
-   * into its own release directory and serves from there, so a build never
-   * rewrites the tree a live process is running from.
+   * How a deploy of this app is carried out (#298). `in-place` builds and runs
+   * in the app's own folder. `zero-downtime` builds each deploy into its own
+   * release directory, serves from there, and cuts traffic over to a new
+   * version only once it answers. Unset: `zero-downtime` when the app declares
+   * a `healthCheck`, `in-place` otherwise — see `effectiveDeployStrategy`.
    */
   deploy?: { strategy?: DeployStrategy };
 }
