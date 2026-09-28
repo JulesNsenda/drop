@@ -25,6 +25,7 @@ something is listed here it exists in the shipped code. Planned work lives in
 | Git deploys | Clone-and-deploy from a repository, including private repos |
 | Webhook deploys | Push-triggered redeploys with signature verification |
 | Tarball upload deploys | `POST /api/v1/apps/:name/source`, with hardened extraction |
+| Source download | `GET /api/v1/apps/:name/source` (dashboard: **Source** button) returns the app's source as a `.tar.gz` in the shape the upload takes, minus `node_modules`, `.venv` and `.git`; symlinks are archived as links, never followed. Owner or admin, session or API key; not agent credentials, not with auth disabled |
 | Hot reload | A file change rebuilds and restarts on the same port |
 | Deploy history | Per-deploy records and structured failure detail, via `/api/v1/deploys` and the dashboard |
 

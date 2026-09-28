@@ -55,6 +55,8 @@ import {
   ArchiveRejectedError,
   UploadValidationError,
   InsufficientDiskSpaceError,
+  createSourceArchive,
+  EmptySourceError,
 } from '../../core/upload-deploy';
 import {
   describeAccessGateRefusal,
@@ -489,6 +491,74 @@ apps.post('/', async c => {
     appName,
   });
   return c.json(success(toAppDto({ ...app, userId: auth?.userId }, auth?.role === 'admin')), 201);
+});
+
+// GET /apps/:name/source - Download the app's SOURCE as a gzipped tarball
+// (#315), in the shape POST /apps/:name/source accepts back. What is left out,
+// and why links are never followed, is in core/upload-deploy/source-archive.ts.
+//
+// auth('user') and the upload rate-limit bucket both come from the
+// `/apps/*/source` registrations in server.ts, which cover every method. Three
+// refusals on top of ownership:
+//  - no auth context: on an auth-disabled box canAccess() admits everyone, and
+//    a source tree can hold credentials (.env), so this fails closed the way
+//    the database panel's reads do;
+//  - an agent credential: its scopes grant deploy and read verbs over an app,
+//    not exporting the whole tree; a person does this;
+//  - a non-admin whose app's recorded path is outside the webapps directory
+//    (only an admin can register one), or IS that directory.
+apps.get('/:name/source', async c => {
+  const auth = (c.get as Function)('auth') as AuthContext | undefined;
+  const name = c.req.param('name');
+  const app = getStateManager().getApp(name);
+  if (!app || !canAccess(auth, app)) {
+    throw new NotFoundError(`Application '${name}' not found`);
+  }
+  if (!auth) {
+    return c.json(
+      error(ErrorCodes.UNAUTHORIZED, 'Downloading source is unavailable when authentication is disabled.'),
+      403
+    );
+  }
+  if (auth.kind === 'agent') {
+    return c.json(
+      error(ErrorCodes.UNAUTHORIZED, 'Downloading source requires a user session or API key. Agent credentials cannot download source.'),
+      403
+    );
+  }
+
+  const sourcePath = getAppConfigServiceOrNull()?.getConfig(name)?.path || app.path;
+  if (auth.role !== 'admin') {
+    const appsDir = getAppsDirectory();
+    const inside =
+      (await isPathWithin(appsDir, sourcePath)) &&
+      (await fs.realpath(sourcePath).catch(() => sourcePath)) !==
+        (await fs.realpath(appsDir).catch(() => appsDir));
+    if (!inside) {
+      throw new NotFoundError(`Application '${name}' has no downloadable source`);
+    }
+  }
+
+  let archive: Readable;
+  try {
+    archive = await createSourceArchive(name, sourcePath);
+  } catch (err) {
+    if (err instanceof EmptySourceError || (err as NodeJS.ErrnoException).code === 'ENOENT') {
+      throw new NotFoundError(`Application '${name}' has no downloadable source`);
+    }
+    throw err;
+  }
+
+  await logActivityFor(auth, { action: 'source-download', appName: name });
+  return new Response(Readable.toWeb(archive) as unknown as ReadableStream, {
+    status: 200,
+    headers: {
+      'Content-Type': 'application/gzip',
+      // `name` passed validateAppName: [A-Za-z0-9_-] only, safe in a header.
+      'Content-Disposition': `attachment; filename="${name}-source.tar.gz"`,
+      'Cache-Control': 'no-store',
+    },
+  });
 });
 
 // POST /apps/:name/source - Deploy (or redeploy) from an uploaded gzipped
