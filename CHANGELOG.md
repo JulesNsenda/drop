@@ -27,6 +27,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Download an app's source (#315).** `GET /api/v1/apps/:name/source`, and a
+  **Source** button on the app page, return the app's source folder as a
+  `.tar.gz` — so an app that only ever existed on DROP (deployed by an agent
+  with `deploy_files`, or uploaded from a machine that is gone) can be saved to
+  a git repository or anywhere else. Files sit at the archive root, the shape
+  `POST /apps/:name/source` accepts, so a download can be edited and uploaded
+  back. `node_modules`, `.venv` and `.git` are left out (a git-deployed app's
+  `.git/config` can hold the clone credential). Symlinks are archived as links
+  and never followed, so a link in a git-deployed tree cannot turn a download
+  into a read of the host; an archive containing one will not upload back
+  as-is, since uploads refuse symlinks. For the app's owner or an admin, with a
+  session or API key; refused for agent credentials, for readonly tokens, when
+  authentication is disabled, and — for a non-admin — when the app's recorded
+  path is outside the webapps directory. Shares the upload rate-limit bucket.
+
 ### Changed
 
 - **Zero-downtime is the default for apps that declare a `healthCheck` (#298).**

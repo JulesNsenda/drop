@@ -22,6 +22,7 @@ import {
   Lock,
   LayoutDashboard,
   History,
+  Download,
 } from 'lucide-react';
 import {
   useApp,
@@ -212,6 +213,35 @@ function AppDetailPage() {
     }
     await refresh();
     setActionLoading(null);
+  };
+
+  // Source download (#315). A fetch rather than a plain link: the API needs
+  // the bearer header, which an <a href> cannot send.
+  const handleDownloadSource = async () => {
+    if (!name) return;
+    setActionLoading('download');
+    try {
+      const res = await fetch(`/api/v1/apps/${encodeURIComponent(name)}/source`, {
+        headers: getAuthHeaders(),
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => null);
+        toast('error', body?.error?.message || `Failed to download ${name}`);
+        return;
+      }
+      const url = URL.createObjectURL(await res.blob());
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `${name}-source.tar.gz`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    } catch {
+      toast('error', `Failed to download ${name}`);
+    } finally {
+      setActionLoading(null);
+    }
   };
 
   const handleDelete = async () => {
@@ -448,6 +478,17 @@ function AppDetailPage() {
                 {isGroupChild ? 'Redeploy group' : 'Redeploy'}
               </Button>
             </>
+          )}
+          {role !== 'readonly' && (
+            <Button
+              variant="secondary"
+              onClick={handleDownloadSource}
+              disabled={actionLoading !== null}
+              title="Download this app's source as a .tar.gz (without node_modules, .venv and .git)"
+            >
+              <Download className="h-4 w-4" />
+              Source
+            </Button>
           )}
           <Button variant="danger" onClick={handleDelete} disabled={actionLoading !== null}>
             <Trash2 className="h-4 w-4" />
