@@ -499,6 +499,13 @@ export interface AppConfig {
    * opting back out of releases while its slot-b instance is still running.
    */
   runtimeSlot?: 'a' | 'b';
+  /**
+   * The dashboard/API custom domain (`AppState.customDomain`) DROP has seen
+   * resolve to this box (#302). Routed only while it still equals the app's
+   * `customDomain`, so changing the domain unroutes the old one without a
+   * second write. SYSTEM tier: it decides what Caddy serves.
+   */
+  customDomainVerified?: { domain: string; verifiedAt: string };
 }
 
 export interface AppRelease {
@@ -537,6 +544,7 @@ const SYSTEM_CONFIG_FIELDS = [
   'currentRelease',
   'previousRelease',
   'runtimeSlot',
+  'customDomainVerified',
 ] as const satisfies readonly (keyof AppConfig)[];
 
 type SystemConfigField = (typeof SYSTEM_CONFIG_FIELDS)[number];
@@ -1271,6 +1279,10 @@ export class AppConfigService {
       if (config.hostname) owners.set(config.hostname.toLowerCase(), appName);
       for (const d of config.domains ?? []) {
         owners.set(d.toLowerCase(), appName);
+      }
+      // A verified dashboard custom domain (#302) is routed, so it is claimed.
+      if (config.customDomainVerified) {
+        owners.set(config.customDomainVerified.domain.toLowerCase(), appName);
       }
     }
     // Pass 2: each app's computed default hostname is authoritative for that app.

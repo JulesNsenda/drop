@@ -47,6 +47,8 @@ import { getBuildLogService } from '../../managers/build-log/build-log';
 import { getTempDirectory, getAppsDirectory } from '../runtime-config';
 import { runUploadPreflight } from '../upload-preflight';
 import { wrapUntrusted } from './untrusted';
+import { setCustomDomain, customDomainStatus } from '../custom-domain';
+import { ValidationError } from '../middleware/error';
 import {
   DeployResult,
   DeployResultStatus,
@@ -589,7 +591,7 @@ interface DeployFromGitArgs {
  */
 async function auditToolAction(
   auth: AuthContext | undefined,
-  action: 'agent-deploy' | 'restart' | 'rollback',
+  action: 'agent-deploy' | 'restart' | 'rollback' | 'custom-domain-set' | 'domain-verified',
   appName: string,
   detail?: string
 ): Promise<void> {
@@ -1119,6 +1121,57 @@ export async function handleRestartApp(
   }
 }
 
+/**
+ * custom_domain (#302) — set, clear or check an app's custom domain and verify
+ * it, so an agent can finish putting an app on its user's own domain.
+ *
+ * 'deploy', not 'read': verification changes what the platform routes. Every
+ * fact in the result is DROP-generated — the records to create, and DNS
+ * reduced to booleans against DROP's own addresses; resolver output is never
+ * echoed. The domain itself has passed the shared hostname rule
+ * (`[A-Za-z0-9.-]`), so it carries no text a model could read as instructions.
+ */
+export async function handleCustomDomain(
+  auth: AuthContext | undefined,
+  args: { name: string; domain?: string; clear?: boolean }
+): Promise<CallToolResult> {
+  const app = getStateManager().getApp(args.name);
+  if (!app || !canAccessScoped(auth, app, args.name, 'deploy')) {
+    return toolError(`Application '${args.name}' not found`);
+  }
+  if (args.domain !== undefined && args.clear) {
+    return toolError('Pass either `domain` or `clear`, not both.');
+  }
+
+  try {
+    if (args.domain !== undefined || args.clear) {
+      const domain = args.clear ? undefined : args.domain;
+      await setCustomDomain(args.name, domain);
+      await auditToolAction(auth, 'custom-domain-set', args.name, domain ?? '(cleared)');
+    }
+    const status = await customDomainStatus(args.name, { verify: true });
+    if (status.state === 'verified') {
+      await auditToolAction(auth, 'domain-verified', args.name, status.domain ?? undefined);
+    }
+
+    const lines = [status.message];
+    if (status.state === 'pending' || status.state === 'unverifiable') {
+      lines.push('Create ONE of these DNS records at the domain\'s DNS provider:');
+      for (const r of status.records) lines.push(`  ${r.type} ${r.name} -> ${r.value}  (${r.use})`);
+      lines.push('Then call custom_domain again with just the app name to verify. DNS can take minutes to propagate.');
+    }
+    return {
+      content: [{ type: 'text', text: lines.join('\n') }],
+      structuredContent: { ok: true, ...status },
+    };
+  } catch (err) {
+    if (err instanceof ValidationError) return toolError(err.message);
+    return toolError(
+      `Failed to update the domain of '${args.name}': ${err instanceof Error ? err.message : 'unknown error'}`
+    );
+  }
+}
+
 // ============ Server factory ============
 
 /**
@@ -1350,6 +1403,25 @@ export function buildMcpServer(auth: AuthContext | undefined): McpServer {
       },
     },
     args => handleRollbackApp(auth, args)
+  );
+
+  server.registerTool(
+    'custom_domain',
+    {
+      title: 'Custom domain',
+      description:
+        'Put one of your apps on a domain you control. With `domain`, sets it; with `clear: true`, removes it; with ' +
+        'neither, checks the current one. Every call also verifies: once the domain\'s DNS points at this platform, the ' +
+        'domain is routed and a TLS certificate is obtained automatically. The result lists the exact DNS record to ' +
+        'create while it is pending — call again (app name only) to check. Names under the platform\'s own domain are ' +
+        'refused: every app already has one.',
+      inputSchema: {
+        name: z.string().describe('App name.'),
+        domain: z.string().optional().describe('Domain to set, e.g. app.example.com.'),
+        clear: z.boolean().optional().describe('Remove the custom domain.'),
+      },
+    },
+    args => handleCustomDomain(auth, args)
   );
 
   return server;

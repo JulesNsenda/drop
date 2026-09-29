@@ -47,6 +47,7 @@ import {
   getPublicUrl,
 } from '../runtime-config';
 import { isPathWithin } from '../../utils/paths';
+import { setCustomDomain, customDomainStatus, assertCustomDomainAllowed } from '../custom-domain';
 import { isReservedHost } from '../../utils/reserved-hosts';
 import { computeAppUrl } from '../../utils/app-url';
 import { eventBus } from '../../core/event-bus';
@@ -93,33 +94,20 @@ apps.use('/:name/*', validateAppName());
  */
 const UPDATABLE_APP_FIELDS = ['framework', 'customDomain'] as const;
 
-/**
- * Same check `PUT /:name/domain` applies. This route accepted `customDomain`
- * unvalidated, and the value is interpolated into a URL by `computeAppUrl` —
- * a value WHATWG URL rejects (a space, a '[') therefore threw inside anything
- * building an app URL. One tenant could poison a shared derivation that way.
- */
-const CUSTOM_DOMAIN_RE = /^[a-zA-Z0-9][a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/;
-
 function pickUpdatableFields(body: Record<string, unknown>): Partial<AppState> {
   const updates: Partial<AppState> = {};
   for (const field of UPDATABLE_APP_FIELDS) {
     if (body[field] !== undefined) {
       if (field === 'customDomain') {
+        // Same rules as `PUT /:name/domain` and the MCP tool (#302): one rule
+        // set behind every door. Unvalidated, the value once reached
+        // `computeAppUrl`, where a string WHATWG URL rejects threw inside
+        // anything building an app URL. '' clears the domain.
         const value = body[field];
-        // '' clears the domain, matching the dedicated route.
-        if (value !== '' && (typeof value !== 'string' || !CUSTOM_DOMAIN_RE.test(value))) {
+        if (value !== '' && typeof value !== 'string') {
           throw new ValidationError('Invalid domain format');
         }
-        // Same reservation as the dedicated route — this is the other writer,
-        // and a guard on only one of two doors is not a guard.
-        if (
-          typeof value === 'string' &&
-          value !== '' &&
-          isReservedHost(value, getPublicUrl(), getDomainSuffix())
-        ) {
-          throw new ValidationError('That domain is reserved by the platform');
-        }
+        if (value !== '') assertCustomDomainAllowed(value as string);
       }
       (updates as Record<string, unknown>)[field] = body[field];
     }
@@ -682,8 +670,10 @@ apps.put('/:name', async c => {
   // Only allow a strict set of user-editable fields; ignore everything else
   // (userId, path, port, status, pid, ...) to prevent ownership takeover
   // and escape of platform-managed invariants.
-  const updates = pickUpdatableFields(body);
+  const { customDomain, ...updates } = pickUpdatableFields(body);
 
+  // Through the shared path, which also unroutes a verified domain it replaces.
+  if (customDomain !== undefined) await setCustomDomain(name, customDomain);
   const updated = await stateManager.updateApp(name, updates);
   if (!updated) {
     throw new NotFoundError(`Application '${name}' not found`);
@@ -1803,36 +1793,63 @@ apps.put('/:name/capabilities', async c => {
   );
 });
 
-// PUT /apps/:name/domain - Set custom domain
+// PUT /apps/:name/domain - Set (or clear) the custom domain. Records it only:
+// it is routed once verified (POST /apps/:name/domain/verify, #302). The
+// response carries the status, which lists the DNS record to create.
+//
+// The shared rules (customDomainProblem) include the platform's own host: it
+// is not an app, so the cross-tenant owner map does not cover it, and claiming
+// it would put a tenant in front of DROP's own OAuth and MCP endpoints.
 apps.put('/:name/domain', async c => {
   const auth = (c.get as Function)('auth') as AuthContext | undefined;
   const name = c.req.param('name');
   const body = await c.req.json<{ domain?: string }>();
-  const stateManager = getStateManager();
-  const app = stateManager.getApp(name);
+  const app = getStateManager().getApp(name);
 
   if (!app || !canAccess(auth, app)) {
     throw new NotFoundError(`Application '${name}' not found`);
   }
 
   const domain = body.domain?.trim() || undefined;
-
-  // Basic domain validation
-  if (domain && !/^[a-zA-Z0-9][a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/.test(domain)) {
-    throw new ValidationError('Invalid domain format');
-  }
-  // The platform's own host is not an app, so the cross-tenant owner map does
-  // not cover it — claiming it here would put a tenant in front of DROP's own
-  // OAuth and MCP endpoints.
-  if (domain && isReservedHost(domain, getPublicUrl(), getDomainSuffix())) {
-    throw new ValidationError('That domain is reserved by the platform');
-  }
-
-  await stateManager.updateApp(name, { customDomain: domain || ('' as unknown as undefined) });
+  await setCustomDomain(name, domain);
 
   return c.json(
-    success({ message: domain ? `Domain set to ${domain}` : 'Domain removed', domain })
+    success({
+      message: domain
+        ? `Domain set to ${domain}. Create a DNS record below, then verify it.`
+        : 'Domain removed',
+      domain,
+      status: await customDomainStatus(name),
+    })
   );
+});
+
+// GET /apps/:name/domain - The custom domain, the DNS record to create, whether
+// DNS points here yet, and the certificate once routed (#302). Read-only.
+apps.get('/:name/domain', async c => {
+  const auth = (c.get as Function)('auth') as AuthContext | undefined;
+  const name = c.req.param('name');
+  const app = getStateManager().getApp(name);
+  if (!app || !canAccess(auth, app)) {
+    throw new NotFoundError(`Application '${name}' not found`);
+  }
+  return c.json(success(await customDomainStatus(name)));
+});
+
+// POST /apps/:name/domain/verify - Check DNS and, once it points here, route
+// the domain so Caddy obtains its certificate (#302). Idempotent: poll it.
+apps.post('/:name/domain/verify', async c => {
+  const auth = (c.get as Function)('auth') as AuthContext | undefined;
+  const name = c.req.param('name');
+  const app = getStateManager().getApp(name);
+  if (!app || !canAccess(auth, app)) {
+    throw new NotFoundError(`Application '${name}' not found`);
+  }
+  const status = await customDomainStatus(name, { verify: true });
+  if (status.state === 'verified') {
+    await logActivityFor(auth, { action: 'domain-verified', appName: name, detail: status.domain ?? undefined });
+  }
+  return c.json(success(status));
 });
 
 // POST /:name/migrate-runtime — Admin: move an app between PM2 and Docker.

@@ -5049,6 +5049,32 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         }
       }
 
+      // Dashboard/API custom domain (#302): routed only once DROP has seen its
+      // DNS point here, and only while it is still the app's domain. A
+      // verification left over from a domain the app no longer has is dropped
+      // here with its route, so a changed or cleared domain stops being served
+      // by the next route write rather than lingering in the Caddyfile.
+      const verifiedCustom = appConfig?.customDomainVerified;
+      if (verifiedCustom) {
+        const verified = verifiedCustom.domain.toLowerCase();
+        const current = this.stateManager?.getApp(appName)?.customDomain?.trim().toLowerCase();
+        if (current !== verified) {
+          await this.dropCustomDomainRoute(appName, verifiedCustom.domain);
+        } else if (routePathPrefix === undefined && !domains.some((d) => d.toLowerCase() === verified)) {
+          // Same ownership rule as drop.yaml domains. Verification already
+          // refused a claimed domain; this catches a claim made since.
+          const owner = this.appConfigService?.getDomainOwners(domainSuffix).get(verified);
+          if (owner && owner !== appName) {
+            this.logger.warn(
+              `Refusing custom domain '${verifiedCustom.domain}' for ${appName}: already claimed by '${owner}'`,
+              'ROUTER'
+            );
+          } else {
+            domains = [...domains, verifiedCustom.domain];
+          }
+        }
+      }
+
       // In docker (multi-user) mode inject security headers on all tenant routes.
       // Shared-domain isolation honest note: subdomains of one registrable domain
       // are same-site — these headers mitigate clickjacking and MIME sniffing but
@@ -6636,6 +6662,23 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       }
     }
     return false;
+  }
+
+  /**
+   * Forget a verified custom domain (#302) and remove the route it had, if
+   * any. Used when the app's domain no longer matches what was verified.
+   * Best-effort: a route that is already gone is not an error.
+   */
+  private async dropCustomDomainRoute(appName: string, domain: string): Promise<void> {
+    const routeKey = `${appName}-${domain.replace(/\./g, '-')}`;
+    if (this.router?.hasRoute(routeKey)) {
+      await this.router.removeRoute(routeKey).catch((err) =>
+        this.logger.warn(`Could not remove the route for '${domain}'`, 'ROUTER', err)
+      );
+    }
+    await this.appConfigService
+      ?.updateSystemConfig(appName, { customDomainVerified: undefined })
+      .catch(() => undefined);
   }
 
   /**
