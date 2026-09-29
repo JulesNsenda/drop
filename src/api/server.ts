@@ -31,6 +31,7 @@ import {
   servicesRateLimitMiddleware,
   shareRateLimitMiddleware,
   mailRateLimitMiddleware,
+  objectStorageTestRateLimitMiddleware,
 } from './middleware/rate-limit';
 import { securityHeadersMiddleware } from './middleware/security-headers';
 import { auditMiddleware, initializeAuditLog, closeAuditLog } from './middleware/audit';
@@ -476,6 +477,8 @@ export class ApiServer {
     // and only the test-send route is expensive enough to need this bucket,
     // so there is no sibling pattern here to double-match against.
     v1.use('/admin/mail/test', mailRateLimitMiddleware());
+    // POST /admin/object-storage/test (#301) dials AWS with the operator's key.
+    v1.use('/admin/object-storage/test', objectStorageTestRateLimitMiddleware());
 
     // Apply auth middleware to protected routes when auth is enabled
     if (this.config.enableAuth && isAuthEnabled()) {

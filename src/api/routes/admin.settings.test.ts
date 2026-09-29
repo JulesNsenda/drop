@@ -36,6 +36,13 @@ import { getMailCredentialStore, resetMailCredentialStore } from '../../managers
 import { sendTemplatedMail } from '../../managers/mailer/mailer';
 import { resetRateLimits } from '../middleware/rate-limit';
 import { getMailQuota, resetMailQuota } from '../../managers/guardrail/principal-quota';
+import {
+  AllocationStore,
+  getObjectStorageProvisioner,
+  resetObjectStorageProvisioner,
+  getStorageCredentialStore,
+  resetStorageCredentialStore,
+} from '../../managers/object-storage';
 
 jest.mock('../../managers/mailer/mailer', () => ({
   __esModule: true,
@@ -58,6 +65,18 @@ const EXPECTED_ISOLATION = {
     'Chosen once at startup — the app runtime is selected from it and cannot be swapped ' +
     'while the platform is running. Existing apps move between runtimes with ' +
     '`drop migrate-runtime`.',
+};
+
+/** The object-storage block GET /admin/settings reports on a fresh box (#301): off, and says so. */
+const DEFAULT_OBJECT_STORAGE_PAYLOAD = {
+  provider: 'aws',
+  enabled: false,
+  region: null,
+  bucketPrefix: null,
+  credentialConfigured: false,
+  available: false,
+  unavailableReason: 'disabled',
+  appsWithStorage: 0,
 };
 
 /**
@@ -247,6 +266,24 @@ describe('admin settings routes (PRD-041)', () => {
     // the same singleton.
     resetMailQuota();
     getMailQuota(path.join(tempDir, 'mail-quotas.json'));
+    // Object storage (#301): same reason as the mail credential — never the
+    // real machine's data/drop-svc/.
+    delete process.env.DROP_S3_ADMIN_ACCESS_KEY_ID;
+    delete process.env.DROP_S3_ADMIN_SECRET_ACCESS_KEY;
+    resetStorageCredentialStore();
+    resetObjectStorageProvisioner();
+    getObjectStorageProvisioner({
+      allocations: new AllocationStore(path.join(tempDir, 'object-storage.json'), path.join(tempDir, 'encryption.key')),
+      credentials: getStorageCredentialStore({
+        credentialFilePath: path.join(tempDir, 'object-storage-credential.json'),
+        keyFilePath: path.join(tempDir, 'encryption.key'),
+      }),
+      providerFactory: () => ({
+        provision: jest.fn(),
+        deprovision: jest.fn(),
+        whoAmI: jest.fn().mockResolvedValue({ account: '123456789012' }),
+      }),
+    });
 
     server = new ApiServer({
       port: 3096,
@@ -294,6 +331,7 @@ describe('admin settings routes (PRD-041)', () => {
         mail: DEFAULT_MAIL_PAYLOAD,
         isolation: EXPECTED_ISOLATION,
         sqlConsole: EXPECTED_SQL_CONSOLE,
+        objectStorage: DEFAULT_OBJECT_STORAGE_PAYLOAD,
       });
     });
 
@@ -316,6 +354,7 @@ describe('admin settings routes (PRD-041)', () => {
         mail: DEFAULT_MAIL_PAYLOAD,
         isolation: EXPECTED_ISOLATION,
         sqlConsole: EXPECTED_SQL_CONSOLE,
+        objectStorage: DEFAULT_OBJECT_STORAGE_PAYLOAD,
       });
     });
 
@@ -341,6 +380,7 @@ describe('admin settings routes (PRD-041)', () => {
         mail: DEFAULT_MAIL_PAYLOAD,
         isolation: EXPECTED_ISOLATION,
         sqlConsole: EXPECTED_SQL_CONSOLE,
+        objectStorage: DEFAULT_OBJECT_STORAGE_PAYLOAD,
       });
     });
   });
@@ -1265,6 +1305,106 @@ describe('admin settings routes (PRD-041)', () => {
     });
   });
 
+  describe('object storage routes (#301)', () => {
+    const putStorage = (body: unknown, token?: string) =>
+      hono.request('/api/v1/admin/settings/object-storage', {
+        method: 'PUT',
+        headers: authHeader(token ?? adminToken),
+        body: JSON.stringify(body),
+      });
+    const putStorageCredential = (body: unknown, token?: string) =>
+      hono.request('/api/v1/admin/settings/object-storage/credential', {
+        method: 'PUT',
+        headers: authHeader(token ?? adminToken),
+        body: JSON.stringify(body),
+      });
+    const storageBlock = async () =>
+      ((await (await getSettings()).json()) as { data: { objectStorage: Record<string, unknown> } }).data.objectStorage;
+    const goodKey = { accessKeyId: 'AKIAIOSFODNN7EXAMPLE', secretAccessKey: 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY' };
+
+    it('becomes available once enabled, configured and given a credential', async () => {
+      await writeValidEncryptionKey();
+      expect((await putStorage({ enabled: true, region: 'eu-central-1', bucketPrefix: 'dropkit' })).status).toBe(200);
+      expect(await storageBlock()).toEqual(expect.objectContaining({ available: false, unavailableReason: 'no-credential' }));
+
+      expect((await putStorageCredential(goodKey)).status).toBe(200);
+
+      expect(await storageBlock()).toEqual({
+        provider: 'aws',
+        enabled: true,
+        region: 'eu-central-1',
+        bucketPrefix: 'dropkit',
+        credentialConfigured: true,
+        available: true,
+        appsWithStorage: 0,
+      });
+    });
+
+    it('never returns the credential, from any route', async () => {
+      await writeValidEncryptionKey();
+      const put = await putStorageCredential(goodKey);
+      const get = await getSettings();
+
+      for (const res of [put, get]) {
+        const text = await res.text();
+        expect(text).not.toContain(goodKey.secretAccessKey);
+        expect(text).not.toContain(goodKey.accessKeyId);
+      }
+      const raw = await fs.readFile(path.join(tempDir, 'object-storage-credential.json'), 'utf-8');
+      expect(raw).not.toContain(goodKey.secretAccessKey);
+    });
+
+    it.each([
+      [{ region: 'Frankfurt' }, 'region'],
+      [{ region: 'https://evil.example.com' }, 'region'],
+      [{ bucketPrefix: 'UPPER' }, 'bucketPrefix'],
+      [{ bucketPrefix: 'has.dot' }, 'bucketPrefix'],
+      [{ enabled: 'yes' }, 'enabled'],
+    ])('rejects %j', async (body, field) => {
+      const res = await putStorage(body);
+      expect(res.status).toBe(400);
+      expect(await res.text()).toContain(field);
+      expect(getSettingsManager().getObjectStorageSettings()).toEqual({ enabled: false, region: undefined, bucketPrefix: undefined });
+    });
+
+    it('has no endpoint field to point the admin key elsewhere', async () => {
+      await putStorage({ enabled: true, endpoint: 'https://evil.example.com' });
+      expect(JSON.stringify(await storageBlock())).not.toContain('evil.example.com');
+    });
+
+    it('rejects a malformed credential and refuses without a platform key', async () => {
+      expect((await putStorageCredential({ accessKeyId: 'nope', secretAccessKey: 'x' })).status).toBe(400);
+      const res = await putStorageCredential(goodKey);
+      expect(res.status).toBe(500);
+      expect(await getStorageCredentialStore().isConfigured()).toBe(false);
+    });
+
+    it('clears the credential', async () => {
+      await writeValidEncryptionKey();
+      await putStorageCredential(goodKey);
+      const res = await hono.request('/api/v1/admin/settings/object-storage/credential', {
+        method: 'DELETE',
+        headers: authHeader(adminToken),
+      });
+      expect(res.status).toBe(200);
+      expect(await getStorageCredentialStore().isConfigured()).toBe(false);
+    });
+
+    it('tests the connection and reports the account', async () => {
+      await writeValidEncryptionKey();
+      await putStorageCredential(goodKey);
+      const res = await hono.request('/api/v1/admin/object-storage/test', { method: 'POST', headers: authHeader(adminToken) });
+      expect(((await res.json()) as { data: unknown }).data).toEqual({ ok: true, account: '123456789012' });
+    });
+
+    it('is admin-only', async () => {
+      await createUser('plain', 'password123', 'user');
+      const token = await getTestToken('plain', 'password123');
+      expect((await putStorage({ enabled: true }, token)).status).toBe(403);
+      expect((await putStorageCredential(goodKey, token)).status).toBe(403);
+    });
+  });
+
   describe('mail routes — auth disabled (DROP-154 Gate 2 §5)', () => {
     // A second, auth-disabled server: `v1.use('/admin/*', authMiddleware('admin'))`
     // is registered only inside `if (enableAuth && isAuthEnabled())`
@@ -1295,6 +1435,20 @@ describe('admin settings routes (PRD-041)', () => {
       await noAuthServer.stop();
       resetMailQuota();
       await fs.rm(noAuthDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+    });
+
+    it.each([
+      ['PUT', '/api/v1/admin/settings/object-storage', { enabled: true }],
+      ['PUT', '/api/v1/admin/settings/object-storage/credential', { accessKeyId: 'AKIAIOSFODNN7EXAMPLE', secretAccessKey: 'x'.repeat(40) }],
+      ['DELETE', '/api/v1/admin/settings/object-storage/credential', undefined],
+      ['POST', '/api/v1/admin/object-storage/test', undefined],
+    ])('refuses %s %s with 401 (object storage, #301)', async (method, url, body) => {
+      const res = await noAuthHono.request(url, {
+        method,
+        headers: { 'Content-Type': 'application/json' },
+        ...(body ? { body: JSON.stringify(body) } : {}),
+      });
+      expect(res.status).toBe(401);
     });
 
     it('refuses PUT /settings/mail with 401', async () => {

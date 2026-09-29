@@ -20,6 +20,13 @@ import { getPublicUrl, setPublicUrl, isAccessGateEnabled, getIsolationMode } fro
 import { getMailCredentialStore, clearMailCredential } from '../../managers/mailer/mail-credential';
 import { sendMeteredMail } from './mail-quota';
 import { getPlatformOps } from '../platform-ops';
+import {
+  getObjectStorageProvisioner,
+  getStorageCredentialStore,
+  AWS_REGION_RE,
+  BUCKET_PREFIX_RE,
+} from '../../managers/object-storage';
+import type { ObjectStorageSettings } from '../../managers/settings/settings-manager';
 
 const admin = new Hono();
 
@@ -374,6 +381,7 @@ admin.get('/settings', async (c) => {
       mail: await buildMailPayload(),
       isolation: buildIsolationPayload(),
       sqlConsole: buildSqlConsolePayload(),
+      objectStorage: await buildObjectStoragePayload(),
     })
   );
 });
@@ -1013,6 +1021,141 @@ admin.put('/settings/sql-console', async (c) => {
   });
 
   return c.json(success(buildSqlConsolePayload()));
+});
+
+// ============ Object storage (#301) ============
+
+/**
+ * The object-storage status an admin sees. The credential is reported as a
+ * boolean only; it is never returned, from here or anywhere.
+ */
+async function buildObjectStoragePayload() {
+  const settings = getSettingsManager().getObjectStorageSettings();
+  const provisioner = getObjectStorageProvisioner();
+  const availability = await provisioner.availability();
+  let appsWithStorage: number | null = null;
+  try {
+    appsWithStorage = (await provisioner.listAllocations()).length;
+  } catch {
+    appsWithStorage = null; // allocation store unreadable — reported, not thrown
+  }
+  return {
+    provider: 'aws' as const,
+    enabled: settings.enabled ?? false,
+    region: settings.region ?? null,
+    bucketPrefix: settings.bucketPrefix ?? null,
+    credentialConfigured: await getStorageCredentialStore().isConfigured(),
+    available: availability.available,
+    ...(availability.available ? {} : { unavailableReason: availability.reason }),
+    appsWithStorage,
+  };
+}
+
+/**
+ * The storage routes can create resources that bill to the operator's AWS
+ * account and hold its admin key, so — like the mail routes — they refuse
+ * outright on an auth-disabled box, where no /admin/* role floor is
+ * registered at all.
+ */
+function requireAuthForStorageRoutes(): string | null {
+  return isAuthEnabled() ? null : 'Object storage settings are unavailable when authentication is disabled.';
+}
+
+// PUT /admin/settings/object-storage - enabled / region / bucketPrefix. A key
+// absent from the body is left alone; `null` clears region or prefix. No
+// endpoint field, on purpose: see object-storage/aws-provider.ts.
+admin.put('/settings/object-storage', async (c) => {
+  const authRefusal = requireAuthForStorageRoutes();
+  if (authRefusal) return c.json(error(ErrorCodes.UNAUTHORIZED, authRefusal), 401);
+  const authCtx = (c.get as Function)('auth') as AuthContext | undefined;
+  const body = (await c.req.json()) as unknown;
+  if (!isJsonObjectBody(body)) {
+    return c.json(error(ErrorCodes.VALIDATION_ERROR, 'Request body must be a JSON object'), 400);
+  }
+
+  const partial: ObjectStorageSettings = {};
+  if ('enabled' in body) {
+    const enabled = requireBooleanField(body, 'enabled');
+    if (enabled === undefined) {
+      return c.json(error(ErrorCodes.VALIDATION_ERROR, 'enabled must be a boolean'), 400);
+    }
+    partial.enabled = enabled;
+  }
+  if ('region' in body) {
+    const region = body.region;
+    if (region !== null && (typeof region !== 'string' || !AWS_REGION_RE.test(region))) {
+      return c.json(error(ErrorCodes.VALIDATION_ERROR, 'region must be an AWS region code such as eu-central-1, or null'), 400);
+    }
+    partial.region = region ?? undefined;
+  }
+  if ('bucketPrefix' in body) {
+    const prefix = body.bucketPrefix;
+    if (prefix !== null && (typeof prefix !== 'string' || !BUCKET_PREFIX_RE.test(prefix))) {
+      return c.json(
+        error(
+          ErrorCodes.VALIDATION_ERROR,
+          'bucketPrefix must be 1-20 lowercase letters, digits or hyphens, starting and ending with a letter or digit, or null'
+        ),
+        400
+      );
+    }
+    partial.bucketPrefix = prefix ?? undefined;
+  }
+
+  await getSettingsManager().setObjectStorageSettings(partial);
+  await logActivityFor(authCtx, { action: 'object-storage-settings-set', detail: 'Object storage settings updated' });
+  return c.json(success(await buildObjectStoragePayload()));
+});
+
+// PUT /admin/settings/object-storage/credential - write-only AWS admin key
+// pair, stored encrypted (object-storage/credential-store.ts). Never read back.
+admin.put('/settings/object-storage/credential', async (c) => {
+  const authRefusal = requireAuthForStorageRoutes();
+  if (authRefusal) return c.json(error(ErrorCodes.UNAUTHORIZED, authRefusal), 401);
+  const authCtx = (c.get as Function)('auth') as AuthContext | undefined;
+  const body = (await c.req.json()) as unknown;
+  if (!isJsonObjectBody(body)) {
+    return c.json(error(ErrorCodes.VALIDATION_ERROR, 'Request body must be a JSON object'), 400);
+  }
+  const { accessKeyId, secretAccessKey } = body;
+  if (typeof accessKeyId !== 'string' || !/^[A-Z0-9]{16,128}$/.test(accessKeyId)) {
+    return c.json(error(ErrorCodes.VALIDATION_ERROR, 'accessKeyId must be an AWS access key id'), 400);
+  }
+  if (typeof secretAccessKey !== 'string' || secretAccessKey.length < 16) {
+    return c.json(error(ErrorCodes.VALIDATION_ERROR, 'secretAccessKey must be a non-empty AWS secret access key'), 400);
+  }
+
+  try {
+    await getStorageCredentialStore().set({ accessKeyId, secretAccessKey });
+  } catch {
+    return c.json(
+      error(ErrorCodes.INTERNAL_ERROR, 'Storage encryption key not available. Contact the server operator.'),
+      500
+    );
+  }
+  await logActivityFor(authCtx, { action: 'object-storage-settings-set', detail: 'Object storage credential set' });
+  return c.json(success(await buildObjectStoragePayload()));
+});
+
+// DELETE /admin/settings/object-storage/credential - forget the stored key.
+// Existing buckets are untouched; new ones cannot be created until one is set.
+admin.delete('/settings/object-storage/credential', async (c) => {
+  const authRefusal = requireAuthForStorageRoutes();
+  if (authRefusal) return c.json(error(ErrorCodes.UNAUTHORIZED, authRefusal), 401);
+  const authCtx = (c.get as Function)('auth') as AuthContext | undefined;
+  await getStorageCredentialStore().clear();
+  await logActivityFor(authCtx, { action: 'object-storage-settings-set', detail: 'Object storage credential cleared' });
+  return c.json(success(await buildObjectStoragePayload()));
+});
+
+// POST /admin/object-storage/test - confirm the credential works (STS
+// GetCallerIdentity: reads nothing, creates nothing). Reports the AWS account
+// on success and only the AWS error NAME on failure. Its own rate-limit bucket
+// (server.ts): it dials AWS with the operator's key.
+admin.post('/object-storage/test', async (c) => {
+  const authRefusal = requireAuthForStorageRoutes();
+  if (authRefusal) return c.json(error(ErrorCodes.UNAUTHORIZED, authRefusal), 401);
+  return c.json(success(await getObjectStorageProvisioner().testConnection()));
 });
 
 export default admin;
