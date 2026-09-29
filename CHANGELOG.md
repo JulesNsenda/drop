@@ -29,6 +29,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Custom domains you can verify, from the dashboard, API or an agent (#302).**
+  Setting a custom domain (`PUT /api/v1/apps/:name/domain`, the dashboard's
+  Domains tab, or the new `custom_domain` MCP tool) now returns the exact DNS
+  record to create — a CNAME to the app's own hostname, or A/AAAA records to
+  the platform's addresses for an apex. `GET /api/v1/apps/:name/domain` reports
+  the domain, those records, whether DNS points here yet and the certificate;
+  `POST /api/v1/apps/:name/domain/verify` (poll it — it is idempotent) checks
+  DNS and, once the domain resolves to this platform, routes it so Caddy
+  obtains its certificate. The platform finds its own addresses by resolving
+  its public host; set `DROP_PUBLIC_IPS` (comma-separated) on a box behind NAT.
+  DNS results are reduced to booleans against the platform's own addresses and
+  never echoed. Names under the platform's domain suffix are refused by every
+  writer: the wildcard record makes them resolve here regardless, so DNS would
+  prove nothing, and claiming one would squat a future app's hostname.
+
+### Fixed
+
+- **The dashboard/API custom domain was never routed (#302).** `customDomain`
+  was stored and shown as the app's URL, but only `drop.yaml` `domains` ever
+  reached Caddy, so that link served nothing and no certificate was issued. It
+  is now routed once verified (above), under the same cross-tenant ownership
+  and reserved-host guards as `drop.yaml` domains. Changing or clearing a
+  verified domain removes its route. Values already stored stay unrouted until
+  they are verified, so nothing starts requesting certificates for domains
+  whose DNS never pointed here.
+
 - **Download an app's source (#315).** `GET /api/v1/apps/:name/source`, and a
   **Source** button on the app page, return the app's source folder as a
   `.tar.gz` — so an app that only ever existed on DROP (deployed by an agent

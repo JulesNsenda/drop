@@ -84,6 +84,7 @@ describe('Hosted MCP endpoint (integration)', () => {
         [
           'app_logs',
           'app_status',
+          'custom_domain',
           'deploy_files',
           'deploy_from_git',
           'get_deploy_logs',
