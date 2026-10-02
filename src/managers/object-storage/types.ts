@@ -14,6 +14,13 @@ export interface AppStorageAllocation {
   userName: string;
   accessKeyId: string;
   createdAt: string;
+  /**
+   * Set when the app this belonged to was deleted and its resources were NOT
+   * destroyed — the record is moved off the app's name so a new app of the
+   * same name can never inherit the bucket. `teardown-failed` is retried by
+   * the sweep; `kept` (a `keepData` delete) is left for the operator.
+   */
+  retired?: { at: string; reason: 'teardown-failed' | 'kept' };
 }
 
 /** The allocation plus its secret, as injected into the app's environment. */

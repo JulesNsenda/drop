@@ -30,7 +30,7 @@ import { getStateManager, resetStateManager } from '../../managers/app/state-man
 import { getAppConfigService, resetAppConfigService } from '../../managers/app/app-config';
 import { resetRateLimits } from '../middleware/rate-limit';
 import { getActivityLog, resetActivityLog } from '../../managers/activity';
-import { getMaxDbsPerUser, getMaxRedisPerUser } from '../runtime-config';
+import { getMaxDbsPerUser, getMaxRedisPerUser, getMaxObjectStoragePerUser } from '../runtime-config';
 import type { DbOverview, DbTable } from '../../managers/database/app-db-inspector';
 import { serviceQuotaState } from './db';
 
@@ -54,6 +54,11 @@ jest.mock('../../managers/redis', () => {
   return { ...actual, getRedisProvisioner: jest.fn() };
 });
 
+jest.mock('../../managers/object-storage', () => {
+  const actual = jest.requireActual('../../managers/object-storage');
+  return { ...actual, getObjectStorageProvisioner: jest.fn() };
+});
+
 import {
   getOverview,
   listTables,
@@ -64,6 +69,7 @@ import {
 import { getSettingsManager, resetSettingsManager } from '../../managers/settings/settings-manager';
 import { getDatabaseProvisioner } from '../../managers/database';
 import { getRedisProvisioner } from '../../managers/redis';
+import { getObjectStorageProvisioner } from '../../managers/object-storage';
 
 const mockGetOverview = getOverview as jest.MockedFunction<typeof getOverview>;
 const mockListTables = listTables as jest.MockedFunction<typeof listTables>;
@@ -72,6 +78,21 @@ const mockGetDatabaseProvisioner = getDatabaseProvisioner as jest.MockedFunction
   typeof getDatabaseProvisioner
 >;
 const mockGetRedisProvisioner = getRedisProvisioner as jest.MockedFunction<typeof getRedisProvisioner>;
+const mockGetObjectStorageProvisioner = getObjectStorageProvisioner as jest.MockedFunction<
+  typeof getObjectStorageProvisioner
+>;
+const objectStorageStub = (opts: {
+  available: boolean;
+  allocations?: Array<{ appName: string; bucket: string; region: string }>;
+}) =>
+  ({
+    availability: jest.fn().mockResolvedValue(
+      opts.available
+        ? { available: true, region: 'eu-central-1', bucketPrefix: 'dropkit' }
+        : { available: false, reason: 'disabled', detail: 'x' }
+    ),
+    listAllocations: jest.fn().mockResolvedValue(opts.allocations ?? []),
+  }) as unknown as ReturnType<typeof getObjectStorageProvisioner>;
 
 describe('database panel routes (DROP-120)', () => {
   let tempDir: string;
@@ -99,6 +120,9 @@ describe('database panel routes (DROP-120)', () => {
     mockGetDatabaseProvisioner.mockReturnValue(null);
     mockGetRedisProvisioner.mockReset();
     mockGetRedisProvisioner.mockReturnValue(null);
+    // Object storage defaults to "not set up", the ordinary state (#301).
+    mockGetObjectStorageProvisioner.mockReset();
+    mockGetObjectStorageProvisioner.mockReturnValue(objectStorageStub({ available: false }));
 
     resetStateManager();
     resetAuth();
@@ -418,6 +442,60 @@ describe('database panel routes (DROP-120)', () => {
   // app; serviceQuotaState's own unit tests below lock in that divergence
   // directly).
   describe('extended payload (DROP-151 Phase 2): redis flag, services intent, quota state', () => {
+    it('reports object storage as not set up, and unconstrained, on a platform without it (#301)', async () => {
+      mockGetOverview.mockResolvedValue({ provisioned: false });
+
+      const res = await app.request('/api/v1/db/alice-app', { headers: authHeader(aliceToken) });
+      const json = (await res.json()) as { data: { objectStorage: unknown } };
+
+      expect(json.data.objectStorage).toEqual({ provisioned: false, available: false });
+    });
+
+    it("reports the app's bucket and region — never its key — and counts the owner's buckets (#301)", async () => {
+      mockGetOverview.mockResolvedValue({ provisioned: false });
+      mockGetObjectStorageProvisioner.mockReturnValue(
+        objectStorageStub({
+          available: true,
+          allocations: [
+            { appName: 'alice-app', bucket: 'dropkit-alice-app-a1b2c3d4', region: 'eu-central-1' },
+            { appName: 'bob-app', bucket: 'dropkit-bob-app-e5f6a7b8', region: 'eu-central-1' },
+          ],
+        })
+      );
+
+      const res = await app.request('/api/v1/db/alice-app', { headers: authHeader(aliceToken) });
+      const json = (await res.json()) as {
+        data: { objectStorage: unknown; quota: Record<string, unknown> };
+      };
+
+      expect(json.data.objectStorage).toEqual({
+        provisioned: true,
+        available: true,
+        bucket: 'dropkit-alice-app-a1b2c3d4',
+        region: 'eu-central-1',
+      });
+      expect(JSON.stringify(json.data)).not.toMatch(/secret|AKIA/i);
+      // bob-app belongs to someone else, so only alice's own bucket counts.
+      expect(json.data.quota['object-storage']).toEqual({
+        used: 1,
+        limit: getMaxObjectStoragePerUser(),
+        constrained: true,
+      });
+    });
+
+    it('keeps the panel up when the allocation store is unreadable (#301)', async () => {
+      mockGetOverview.mockResolvedValue({ provisioned: false });
+      mockGetObjectStorageProvisioner.mockReturnValue({
+        availability: jest.fn().mockResolvedValue({ available: true }),
+        listAllocations: jest.fn().mockRejectedValue(new Error('object-storage.json is unreadable')),
+      } as unknown as ReturnType<typeof getObjectStorageProvisioner>);
+
+      const res = await app.request('/api/v1/db/alice-app', { headers: authHeader(aliceToken) });
+      expect(res.status).toBe(200);
+      const json = (await res.json()) as { data: { objectStorage: unknown } };
+      expect(json.data.objectStorage).toEqual({ provisioned: false, available: false, unreadable: true });
+    });
+
     it('defaults redis.provisioned=false, services={}, and both quotas unconstrained when neither provisioner is wired', async () => {
       mockGetOverview.mockResolvedValue({ provisioned: false });
 
@@ -438,6 +516,7 @@ describe('database panel routes (DROP-120)', () => {
       expect(json.data.quota).toEqual({
         postgres: { used: 0, limit: getMaxDbsPerUser(), constrained: false },
         redis: { used: 0, limit: getMaxRedisPerUser(), constrained: false },
+        'object-storage': { used: 0, limit: getMaxObjectStoragePerUser(), constrained: false },
       });
     });
 
@@ -672,6 +751,9 @@ describe('POST /db/:name/query — the SQL console gate', () => {
     mockGetDatabaseProvisioner.mockReturnValue(null);
     mockGetRedisProvisioner.mockReset();
     mockGetRedisProvisioner.mockReturnValue(null);
+    // Object storage defaults to "not set up", the ordinary state (#301).
+    mockGetObjectStorageProvisioner.mockReset();
+    mockGetObjectStorageProvisioner.mockReturnValue(objectStorageStub({ available: false }));
 
     resetStateManager();
     resetAuth();

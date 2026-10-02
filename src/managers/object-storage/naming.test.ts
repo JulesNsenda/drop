@@ -1,5 +1,5 @@
 /** Bucket/user naming and the per-bucket policy (#301). */
-import { bucketNameFor, iamUserNameFor, bucketOnlyPolicy, BUCKET_PREFIX_RE } from './naming';
+import { bucketNameFor, iamUserNameFor, bucketOnlyPolicy, BUCKET_PREFIX_RE, newResourceSuffix } from './naming';
 
 const S3_BUCKET_RE = /^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$/;
 
@@ -21,11 +21,16 @@ describe('bucketNameFor', () => {
 });
 
 describe('iamUserNameFor', () => {
-  it('is deterministic, IAM-valid and within 64 characters', () => {
-    const name = iamUserNameFor('dropkit', 'My_App');
-    expect(name).toBe('drop-dropkit-My_App');
-    expect(iamUserNameFor('p', 'x'.repeat(64)).length).toBeLessThanOrEqual(64);
-    expect(iamUserNameFor('p', 'a.b@c')).toMatch(/^[A-Za-z0-9+=,.@_-]+$/);
+  it('carries the suffix, is IAM-valid and stays within 64 characters', () => {
+    expect(iamUserNameFor('dropkit', 'My_App', 'a1b2c3d4')).toBe('drop-dropkit-My_App-a1b2c3d4');
+    const long = iamUserNameFor('p'.repeat(20), 'x'.repeat(64), 'a1b2c3d4');
+    expect(long.length).toBeLessThanOrEqual(64);
+    expect(long.endsWith('-a1b2c3d4')).toBe(true);
+    expect(iamUserNameFor('p', 'a.b@c', 'a1b2c3d4')).toMatch(/^[A-Za-z0-9+=,.@_-]+$/);
+  });
+
+  it('differs for a recreated app, so a retired user can never block a new attach', () => {
+    expect(iamUserNameFor('p', 'site', newResourceSuffix())).not.toBe(iamUserNameFor('p', 'site', newResourceSuffix()));
   });
 });
 

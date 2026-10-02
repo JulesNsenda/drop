@@ -45,9 +45,18 @@ export class AllocationStore {
     return allocation;
   }
 
-  /** Every allocation, without secrets. */
+  /** Every LIVE allocation (one per app), without secrets. */
   async list(): Promise<AppStorageAllocation[]> {
-    return Object.values(await this.load()).map(({ secretAccessKey: _secret, ...a }) => a);
+    return Object.values(await this.load())
+      .filter((stored) => !stored.retired)
+      .map(({ secretAccessKey: _secret, ...a }) => a);
+  }
+
+  /** Allocations whose app was deleted with the resources left behind, keyed for `removeRetired`. */
+  async listRetired(): Promise<Array<{ key: string; allocation: AppStorageAllocation }>> {
+    return Object.entries(await this.load())
+      .filter(([, stored]) => stored.retired)
+      .map(([key, { secretAccessKey: _secret, ...allocation }]) => ({ key, allocation }));
   }
 
   /** The app's allocation WITH its decrypted secret — for env injection only. */
@@ -70,6 +79,32 @@ export class AllocationStore {
   async remove(appName: string): Promise<void> {
     await this.write(async (file) => {
       delete file[appName];
+    });
+  }
+
+  /**
+   * Move the app's record off its name. Deleting an app frees the name, and
+   * this store is keyed by it: a record left in place would hand the previous
+   * tenant's bucket — and its key — to whoever registers that name next,
+   * because provisioning is idempotent on exactly this lookup. `#` cannot
+   * appear in an app name, so the new key can never be asked for by one.
+   */
+  async retire(appName: string, reason: 'teardown-failed' | 'kept'): Promise<void> {
+    await this.write(async (file) => {
+      const stored = file[appName];
+      if (!stored) return;
+      const at = new Date().toISOString();
+      let key = `${appName}#retired-${Date.now()}`;
+      for (let n = 1; file[key]; n += 1) key = `${appName}#retired-${Date.now()}-${n}`;
+      file[key] = { ...stored, retired: { at, reason } };
+      delete file[appName];
+    });
+  }
+
+  /** Forget a retired record, once its resources are gone. */
+  async removeRetired(key: string): Promise<void> {
+    await this.write(async (file) => {
+      if (file[key]?.retired) delete file[key];
     });
   }
 

@@ -11,10 +11,14 @@
 
 import * as path from 'path';
 import { getSettingsManager } from '../settings/settings-manager';
-import { StorageCredentialStore, getStorageCredentialStore } from './credential-store';
+import {
+  StorageCredentialStore,
+  getStorageCredentialStore,
+  resetStorageCredentialStore,
+} from './credential-store';
 import { AllocationStore } from './allocation-store';
 import { AwsObjectStorageProvider, createAwsClients, type AwsProviderConfig } from './aws-provider';
-import { BUCKET_PREFIX_RE, bucketNameFor, iamUserNameFor } from './naming';
+import { BUCKET_PREFIX_RE, bucketNameFor, iamUserNameFor, newResourceSuffix } from './naming';
 import type {
   AppStorageAllocation,
   ObjectStorageProvider,
@@ -109,8 +113,9 @@ export class ObjectStorageProvisioner {
       throw new ObjectStorageUnavailableError(availability.reason, availability.detail);
     }
     const provider = await this.providerFor(availability.region);
-    const bucket = bucketNameFor(availability.bucketPrefix, appName);
-    const userName = iamUserNameFor(availability.bucketPrefix, appName);
+    const suffix = newResourceSuffix();
+    const bucket = bucketNameFor(availability.bucketPrefix, appName, suffix);
+    const userName = iamUserNameFor(availability.bucketPrefix, appName, suffix);
     const key = await provider.provision({ appName, bucket, userName });
 
     const allocation: AppStorageAllocation = {
@@ -162,6 +167,78 @@ export class ObjectStorageProvisioner {
     return result;
   }
 
+  /**
+   * Whether teardown can run: only the admin credential is needed. Settings
+   * are deliberately NOT consulted — an operator who disables object storage
+   * must still be able to have DROP destroy what it already created.
+   */
+  canDeprovision(): Promise<boolean> {
+    return this.credentials.isConfigured();
+  }
+
+  /**
+   * The deleted-app path. Destroys the app's storage, or — when the caller
+   * keeps data, or the teardown fails — RETIRES the record instead: moved off
+   * the app's name, so the name is genuinely free, and the resources stay
+   * tracked for the operator (`kept`) or the retry sweep (`teardown-failed`).
+   * Never throws for an AWS failure; does throw `AllocationStoreCorruptError`,
+   * because "unreadable" must never be read as "nothing to clean up".
+   */
+  async teardownForDeletedApp(
+    appName: string,
+    opts: { keepData?: boolean } = {}
+  ): Promise<
+    | { outcome: 'none' }
+    | { outcome: 'destroyed'; result: StorageDeprovisionResult }
+    | { outcome: 'retired'; reason: 'teardown-failed' | 'kept'; error?: unknown }
+  > {
+    const allocation = await this.allocations.get(appName);
+    if (!allocation) return { outcome: 'none' };
+    if (opts.keepData) {
+      await this.allocations.retire(appName, 'kept');
+      return { outcome: 'retired', reason: 'kept' };
+    }
+    try {
+      return { outcome: 'destroyed', result: (await this.deprovisionAppStorage(appName))! };
+    } catch (error) {
+      await this.allocations.retire(appName, 'teardown-failed');
+      return { outcome: 'retired', reason: 'teardown-failed', error };
+    }
+  }
+
+  /**
+   * Retry the teardown of every allocation retired by a failed delete. Each
+   * record is forgotten only once its provider reports the resources gone;
+   * `kept` records are the operator's and are never touched. A missing
+   * credential skips the whole pass rather than failing every record.
+   */
+  async sweepRetired(): Promise<{ destroyed: number; failed: number }> {
+    const pending = (await this.allocations.listRetired()).filter(
+      ({ allocation }) => allocation.retired?.reason === 'teardown-failed'
+    );
+    if (pending.length === 0 || !(await this.credentials.isConfigured())) {
+      return { destroyed: 0, failed: 0 };
+    }
+    let destroyed = 0;
+    let failed = 0;
+    for (const { key, allocation } of pending) {
+      try {
+        const provider = await this.providerFor(allocation.region);
+        await provider.deprovision({ bucket: allocation.bucket, userName: allocation.userName });
+        await this.allocations.removeRetired(key);
+        destroyed += 1;
+      } catch {
+        failed += 1;
+      }
+    }
+    return { destroyed, failed };
+  }
+
+  /** Retired allocations, for the operator's view. */
+  async listRetired(): Promise<AppStorageAllocation[]> {
+    return (await this.allocations.listRetired()).map(({ allocation }) => allocation);
+  }
+
   /** Check the admin credential against AWS. Never throws; the message is AWS's error name only. */
   async testConnection(): Promise<{ ok: true; account: string } | { ok: false; error: string }> {
     const settings = getSettingsManager().getObjectStorageSettings();
@@ -195,4 +272,27 @@ export function getObjectStorageProvisioner(options?: ObjectStorageProvisionerOp
 
 export function resetObjectStorageProvisioner(): void {
   instance = null;
+}
+
+/**
+ * Bind both object-storage singletons to THIS platform's root. Without it
+ * they resolve their files from `DROP_ROOT` in the environment, which is not
+ * the root a platform started with `--root` (or constructed in a test) uses —
+ * the admin routes and the platform would then read two different stores.
+ * Resets first, for the same reason the guest stores do: whatever bound the
+ * singletons before boot held nothing worth keeping.
+ */
+export function configureObjectStorage(dropRoot: string): ObjectStorageProvisioner {
+  const dir = path.join(dropRoot, 'data', 'drop-svc');
+  const keyFilePath = path.join(dir, 'encryption.key');
+  resetStorageCredentialStore();
+  resetObjectStorageProvisioner();
+  const credentials = getStorageCredentialStore({
+    credentialFilePath: path.join(dir, 'object-storage-credential.json'),
+    keyFilePath,
+  });
+  return getObjectStorageProvisioner({
+    credentials,
+    allocations: new AllocationStore(path.join(dir, 'object-storage.json'), keyFilePath),
+  });
 }

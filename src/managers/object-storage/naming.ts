@@ -35,10 +35,21 @@ export function bucketNameFor(prefix: string, appName: string, suffix = randomBy
   return `${prefix}-${slug(appName, budget)}-${suffix}`;
 }
 
-/** `drop-<prefix>-<app>`, unique per install and app. */
-export function iamUserNameFor(prefix: string, appName: string): string {
-  const budget = 64 - prefix.length - 'drop--'.length;
-  return `drop-${prefix}-${appName.replace(/[^A-Za-z0-9_-]/g, '-').slice(0, budget)}`;
+/**
+ * `drop-<prefix>-<app>-<suffix>` — the same random suffix as the bucket.
+ * Without it, deleting an app whose teardown failed (its user retired, not
+ * yet removed) would make a recreated app of the same name collide with the
+ * old user on `CreateUser` and fail to attach until the retry sweep caught up.
+ */
+export function iamUserNameFor(prefix: string, appName: string, suffix: string): string {
+  const budget = 64 - prefix.length - suffix.length - 'drop---'.length;
+  const app = appName.replace(/[^A-Za-z0-9_-]/g, '-').slice(0, budget);
+  return `drop-${prefix}-${app}-${suffix}`;
+}
+
+/** A fresh random suffix, shared by an allocation's bucket and IAM user. */
+export function newResourceSuffix(): string {
+  return randomBytes(4).toString('hex');
 }
 
 /** A policy granting object read/write/list on one bucket, and nothing else. */

@@ -94,16 +94,17 @@ describe('extension catalog routes (DROP-151 Phase 1)', () => {
   });
 
   describe('catalog shape', () => {
-    it('returns all 8 descriptors with the correct service/apptype split', async () => {
+    it('returns all 9 descriptors with the correct service/apptype split', async () => {
       const res = await app.request('/api/v1/extensions', { headers: authHeader(aliceToken) });
       expect(res.status).toBe(200);
       const json = (await res.json()) as { data: { extensions: ExtensionDescriptor[] } };
       const { extensions } = json.data;
 
-      expect(extensions).toHaveLength(8);
+      expect(extensions).toHaveLength(9);
       expect(extensions.map((e) => e.id)).toEqual([
         'postgres',
         'redis',
+        'object-storage',
         'external-database-url',
         'nodejs',
         'python',
@@ -111,12 +112,23 @@ describe('extension catalog routes (DROP-151 Phase 1)', () => {
         'static',
         'docker',
       ]);
-      expect(extensions.filter((e) => e.kind === 'service')).toHaveLength(3);
+      expect(extensions.filter((e) => e.kind === 'service')).toHaveLength(4);
       expect(extensions.filter((e) => e.kind === 'apptype')).toHaveLength(5);
     });
   });
 
   describe('availability tracks the live provisioner singletons', () => {
+    it('reports object storage as not configured until an operator sets it up, with no snippet (#301)', async () => {
+      const res = await app.request('/api/v1/extensions', { headers: authHeader(aliceToken) });
+      const json = (await res.json()) as { data: { extensions: ExtensionDescriptor[] } };
+      const storage = json.data.extensions.find((e) => e.id === 'object-storage');
+
+      expect(storage?.availability).toBe('unavailable');
+      expect(storage?.unavailableReason).toBe('object-storage-not-configured');
+      // Attach-only: a bucket bills the operator, so no manifest key creates one.
+      expect(storage?.snippet).toBeUndefined();
+    });
+
     it('reports postgres unavailable with the closed reason when the provisioner is null', async () => {
       resetDatabaseProvisioner();
 

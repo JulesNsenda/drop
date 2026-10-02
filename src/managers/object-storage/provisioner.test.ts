@@ -13,7 +13,14 @@ import * as os from 'os';
 import { randomBytes } from 'crypto';
 import { StorageCredentialStore } from './credential-store';
 import { AllocationStore, AllocationStoreCorruptError } from './allocation-store';
-import { ObjectStorageProvisioner, ObjectStorageUnavailableError } from './provisioner';
+import {
+  ObjectStorageProvisioner,
+  ObjectStorageUnavailableError,
+  configureObjectStorage,
+  getObjectStorageProvisioner,
+  resetObjectStorageProvisioner,
+} from './provisioner';
+import { getStorageCredentialStore, resetStorageCredentialStore } from './credential-store';
 import type { ObjectStorageProvider } from './types';
 import { getSettingsManager, resetSettingsManager } from '../settings/settings-manager';
 
@@ -61,6 +68,31 @@ describe('object storage stores and provisioner', () => {
     process.env = { ...savedEnv };
     resetSettingsManager();
     await fs.rm(dir, { recursive: true, force: true });
+  });
+
+  describe('configureObjectStorage', () => {
+    afterEach(() => {
+      resetObjectStorageProvisioner();
+      resetStorageCredentialStore();
+    });
+
+    it("binds both singletons to the platform's root, not to DROP_ROOT", async () => {
+      const root = path.join(dir, 'platform-root');
+      await fs.mkdir(path.join(root, 'data', 'drop-svc'), { recursive: true });
+      await fs.writeFile(path.join(root, 'data', 'drop-svc', 'encryption.key'), randomBytes(32).toString('hex'));
+      process.env.DROP_ROOT = path.join(dir, 'somewhere-else');
+
+      // A singleton already bound elsewhere (any earlier caller) is replaced.
+      getObjectStorageProvisioner();
+      const configured = configureObjectStorage(root);
+
+      expect(getObjectStorageProvisioner()).toBe(configured);
+      await getStorageCredentialStore().set({ accessKeyId: 'AKIA', secretAccessKey: 's' });
+      await expect(
+        fs.access(path.join(root, 'data', 'drop-svc', 'object-storage-credential.json'))
+      ).resolves.toBeUndefined();
+      await expect(fs.access(path.join(dir, 'somewhere-else'))).rejects.toThrow();
+    });
   });
 
   describe('StorageCredentialStore', () => {
@@ -142,8 +174,11 @@ describe('object storage stores and provisioner', () => {
       expect(provider.provision).toHaveBeenCalledWith({
         appName: 'site',
         bucket: expect.stringMatching(/^dropkit-site-[0-9a-f]{8}$/),
-        userName: 'drop-dropkit-site',
+        userName: expect.stringMatching(/^drop-dropkit-site-[0-9a-f]{8}$/),
       });
+      // One suffix for both, so an operator can pair a user with its bucket.
+      const { bucket, userName } = provider.provision.mock.calls[0][0];
+      expect(userName.slice(-8)).toBe(bucket.slice(-8));
       expect(allocation).toEqual(expect.objectContaining({ appName: 'site', region: 'eu-central-1', accessKeyId: 'AKIAAPP' }));
       expect(await p.getEnvVars('site')).toEqual({
         AWS_REGION: 'eu-central-1',
@@ -169,7 +204,7 @@ describe('object storage stores and provisioner', () => {
 
       await expect(makeProvisioner().provisionAppStorage('site')).rejects.toThrow('disk full');
       expect(provider.deprovision).toHaveBeenCalledWith(
-        expect.objectContaining({ userName: 'drop-dropkit-site' })
+        expect.objectContaining({ userName: expect.stringMatching(/^drop-dropkit-site-/) })
       );
     });
 
@@ -194,6 +229,99 @@ describe('object storage stores and provisioner', () => {
 
       await expect(p.deprovisionAppStorage('site')).rejects.toThrow('AccessDenied');
       expect(await p.getAllocation('site')).not.toBeNull();
+    });
+
+    describe('when the app is deleted', () => {
+      it('destroys the storage and forgets it', async () => {
+        await configure();
+        const p = makeProvisioner();
+        await p.provisionAppStorage('site');
+
+        expect(await p.teardownForDeletedApp('site')).toEqual({
+          outcome: 'destroyed',
+          result: { objectsDeleted: 3, bucketDeleted: true, userDeleted: true },
+        });
+        expect(await p.getAllocation('site')).toBeNull();
+        expect(await p.listRetired()).toEqual([]);
+      });
+
+      it('is a no-op for an app that never had storage', async () => {
+        expect(await makeProvisioner().teardownForDeletedApp('site')).toEqual({ outcome: 'none' });
+      });
+
+      it('retires a failed teardown off the name, so a new app of that name gets a NEW bucket', async () => {
+        await configure();
+        const p = makeProvisioner();
+        const old = await p.provisionAppStorage('site');
+        provider.deprovision.mockRejectedValueOnce(new Error('AccessDenied'));
+
+        const torn = await p.teardownForDeletedApp('site');
+        expect(torn).toEqual(expect.objectContaining({ outcome: 'retired', reason: 'teardown-failed' }));
+        expect(await p.getAllocation('site')).toBeNull();
+        expect(await p.getEnvVars('site')).toBeNull();
+        expect(await p.listRetired()).toEqual([expect.objectContaining({ bucket: old.bucket })]);
+
+        const fresh = await p.provisionAppStorage('site');
+        expect(fresh.bucket).not.toBe(old.bucket);
+        expect(provider.provision).toHaveBeenCalledTimes(2);
+      });
+
+      it('keeps the resources for a keepData delete, but still frees the name', async () => {
+        await configure();
+        const p = makeProvisioner();
+        await p.provisionAppStorage('site');
+
+        expect(await p.teardownForDeletedApp('site', { keepData: true })).toEqual({ outcome: 'retired', reason: 'kept' });
+        expect(provider.deprovision).not.toHaveBeenCalled();
+        expect(await p.getAllocation('site')).toBeNull();
+        expect(await p.listRetired()).toEqual([expect.objectContaining({ retired: expect.objectContaining({ reason: 'kept' }) })]);
+      });
+
+      it('refuses to act on a corrupt allocation store rather than treat it as empty', async () => {
+        await fs.writeFile(path.join(dir, 'object-storage.json'), '{not json');
+        await expect(makeProvisioner().teardownForDeletedApp('site')).rejects.toBeInstanceOf(AllocationStoreCorruptError);
+      });
+    });
+
+    describe('sweepRetired', () => {
+      it('retries failed teardowns, forgets them once gone, and never touches kept ones', async () => {
+        await configure();
+        const p = makeProvisioner();
+        await p.provisionAppStorage('failed');
+        await p.provisionAppStorage('kept');
+        provider.deprovision.mockRejectedValueOnce(new Error('AccessDenied'));
+        await p.teardownForDeletedApp('failed');
+        await p.teardownForDeletedApp('kept', { keepData: true });
+        provider.deprovision.mockClear();
+
+        expect(await p.sweepRetired()).toEqual({ destroyed: 1, failed: 0 });
+        expect(provider.deprovision).toHaveBeenCalledTimes(1);
+        expect(await p.listRetired()).toEqual([expect.objectContaining({ appName: 'kept' })]);
+      });
+
+      it('keeps a record whose retry fails, and skips the pass entirely without a credential', async () => {
+        await configure();
+        const p = makeProvisioner();
+        await p.provisionAppStorage('site');
+        provider.deprovision.mockRejectedValue(new Error('AccessDenied'));
+        await p.teardownForDeletedApp('site');
+
+        expect(await p.sweepRetired()).toEqual({ destroyed: 0, failed: 1 });
+        expect(await p.listRetired()).toHaveLength(1);
+
+        await credentials.clear();
+        provider.deprovision.mockClear();
+        expect(await p.sweepRetired()).toEqual({ destroyed: 0, failed: 0 });
+        expect(provider.deprovision).not.toHaveBeenCalled();
+      });
+    });
+
+    it('can deprovision with a credential even when the feature is disabled', async () => {
+      await configure();
+      await getSettingsManager().setObjectStorageSettings({ enabled: false });
+      expect(await makeProvisioner().canDeprovision()).toBe(true);
+      await credentials.clear();
+      expect(await makeProvisioner().canDeprovision()).toBe(false);
     });
 
     it('reports only the AWS error name from a failed connection test', async () => {
