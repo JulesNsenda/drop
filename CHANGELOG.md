@@ -29,6 +29,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Attach object storage to an app (#301).** Once an operator has set object
+  storage up, an app owner can attach a private S3 bucket from the app's
+  Database tab or `POST /api/v1/apps/:name/services/object-storage`. The app
+  is restarted with `AWS_REGION`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`
+  and `S3_BUCKET`, which every AWS SDK reads with no code; its key reaches
+  that one bucket and nothing else. Attach-only: there is no `drop.yaml` key,
+  because the bucket bills the operator. It is refused for ephemeral apps,
+  monorepo group apps, apps that already set any of those variables, and past
+  `DROP_MAX_OBJECT_STORAGE_PER_USER` (default 3). **Detaching
+  (`DELETE .../services/object-storage`) or deleting the app deletes the
+  bucket and every object in it, with no backup**, and the dashboard's
+  confirm dialog says so. A delete with `keepData=true` keeps the bucket but
+  unties it from the app's name. A teardown AWS refuses is retried every 15
+  minutes. In both cases a new app with the same name gets a new bucket,
+  never the old one. Apps with object storage attached are exempt from idle
+  reaping. The extension catalog lists object storage, marked unavailable
+  until an operator sets it up.
+
+### Fixed
+
+- **Object storage now uses the platform's own root (#301).** Its credential
+  and allocation stores were located from the `DROP_ROOT` environment
+  variable, so a platform started with `--root` (and every test platform)
+  read and wrote a different store from the one the admin routes used. They
+  are now bound to the platform's root at boot. The IAM user DROP creates per
+  app now carries the same random suffix as its bucket
+  (`drop-<prefix>-<app>-<suffix>`), so a recreated app can never collide with
+  a user still waiting to be removed.
+
+### Added
+
 - **Object storage, operator side (#301).** An admin can now configure S3
   object storage in their own AWS account: `PUT
   /api/v1/admin/settings/object-storage` (enabled, region, bucket prefix),

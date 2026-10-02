@@ -103,6 +103,8 @@ export interface ApiServerConfig {
   maxDbsPerUser?: number;
   /** Per-user managed-Redis cap (passed through to runtime-config for GET /db/:name). */
   maxRedisPerUser?: number;
+  /** Per-user object-storage cap (#301; passed through to runtime-config for GET /db/:name). */
+  maxObjectStoragePerUser?: number;
   /**
    * Tenant isolation mode (passed through to runtime-config). Read by the
    * access-gate route, which refuses to enable a gate the platform cannot
@@ -168,6 +170,7 @@ export class ApiServer {
       maxUploadSizeMb: this.config.maxUploadSizeMb,
       maxDbsPerUser: this.config.maxDbsPerUser,
       maxRedisPerUser: this.config.maxRedisPerUser,
+      maxObjectStoragePerUser: this.config.maxObjectStoragePerUser,
       accessGateEnabled: this.config.accessGateEnabled,
       isolation: this.config.isolation,
       // Admin-stored override (PRD-041 settings UI) takes precedence over

@@ -5,9 +5,9 @@ bucket and nothing else**. The buckets live in the operator's own AWS account;
 DROP creates and destroys them with one admin credential the operator supplies,
 and never hands that credential to an app.
 
-> Status: this is the **operator half** — settings, the encrypted credential,
-> and the provisioner. Attaching storage to an app (and the `AWS_*` / `S3_BUCKET`
-> variables it injects) is the next change.
+Object storage is **attach-only**. There is no `drop.yaml` key and DROP never
+infers it, because every bucket bills the operator's account. An app gets one
+only because its owner asked for it.
 
 ## What an app gets
 
@@ -16,16 +16,54 @@ For each app, DROP creates:
 | Resource | Name | Notes |
 |---|---|---|
 | S3 bucket | `<prefix>-<app>-<8 hex>` | Public access blocked, ACLs disabled (bucket-owner-enforced). The random suffix keeps names unique across AWS's global bucket namespace. |
-| IAM user | `drop-<prefix>-<app>`, path `/drop/` | One inline policy, `drop-bucket-access`: list the bucket, get/put/delete its objects, manage its multipart uploads. Nothing else — no ACLs, no bucket policy, no other bucket. |
+| IAM user | `drop-<prefix>-<app>-<8 hex>`, path `/drop/` (same suffix as its bucket) | One inline policy, `drop-bucket-access`: list the bucket, get/put/delete its objects, manage its multipart uploads. Nothing else — no ACLs, no bucket policy, no other bucket. |
 | Access key | — | Stored encrypted in `data/drop-svc/object-storage.json` (0600). |
 
-The app will receive the standard `AWS_REGION`, `AWS_ACCESS_KEY_ID` and
-`AWS_SECRET_ACCESS_KEY` — which every AWS SDK picks up with no code — plus
+The app receives the standard `AWS_REGION`, `AWS_ACCESS_KEY_ID` and
+`AWS_SECRET_ACCESS_KEY`, which every AWS SDK picks up with no code, plus
 `S3_BUCKET`.
 
-**Tearing an app's storage down destroys its data**: DROP revokes the key,
-deletes the user, deletes every object and object version, aborts pending
-uploads, and deletes the bucket. There is no backup.
+## Attaching and detaching
+
+An app owner attaches object storage from the app's **Database** tab, or with
+`POST /api/v1/apps/<app>/services/object-storage`. DROP creates the bucket,
+user and key, then restarts the app with the four variables. The row is
+disabled ("not set up on this platform") until the operator has finished the
+setup below.
+
+Attach is refused when:
+
+- the app is ephemeral (it is torn down on a timer);
+- the app is part of a monorepo group (group apps cannot detach a service);
+- the app already sets `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` or
+  `S3_BUCKET` itself, as a secret or in `drop.yaml` `env:`. The injected
+  values would replace them and point the app at an empty bucket;
+- the owner already has `DROP_MAX_OBJECT_STORAGE_PER_USER` buckets (default
+  3; `0` means unlimited). Apps deployed by the operator (with no owning user)
+  are not counted.
+
+**Detaching destroys the data.** `DELETE
+/api/v1/apps/<app>/services/object-storage` revokes the key, deletes the
+user, deletes every object and object version, aborts pending uploads, and
+deletes the bucket. There is no backup. The app stops receiving the variables
+as soon as the detach is recorded, even if AWS then refuses the teardown. A
+detach that did not finish shows as "Detach incomplete" with a retry button.
+
+## When an app is deleted
+
+Deleting an app deletes its bucket the same way, with no backup. Two cases keep
+it instead:
+
+- **`keepData=true`**: the bucket and its key are kept, for the operator to
+  deal with.
+- **AWS refuses the teardown**: DROP retries it every 15 minutes until it
+  succeeds.
+
+In both cases the record is moved off the app's name. A new app with the same
+name always gets a new bucket, never the old one.
+
+Apps with object storage attached are never removed by the idle reaper, since
+that would delete the bucket.
 
 ## Setting it up
 

@@ -64,6 +64,13 @@ import {
   getRedisProvisioner,
   resetRedisProvisioner,
 } from '../managers/redis';
+import {
+  ObjectStorageProvisioner,
+  ObjectStorageUnavailableError,
+  configureObjectStorage,
+  resetObjectStorageProvisioner,
+  resetStorageCredentialStore,
+} from '../managers/object-storage';
 import { CaddyServer, getCaddyServer, resetCaddyServer } from '../managers/router';
 import { SecretManager, getSecretManager, resetSecretManager } from '../managers/secret';
 import { WebhookManager, getWebhookManager, resetWebhookManager } from './webhooks';
@@ -293,6 +300,11 @@ export interface PlatformConfig {
   /** Max managed-Redis logical DBs a single user may provision (0 = unlimited). */
   maxRedisPerUser: number;
   /**
+   * Max object-storage buckets a single user may attach (0 = unlimited) —
+   * #301. Each one is a bucket in the OPERATOR's AWS account, billed to them.
+   */
+  maxObjectStoragePerUser: number;
+  /**
    * Run the secret preflight (PRD-051): before starting an app, auto-generate
    * declared generatable secrets and PARK the app in `needs-config` if a
    * declared-required secret is missing, instead of letting it crash-loop.
@@ -424,6 +436,7 @@ const DEFAULT_CONFIG: PlatformConfig = {
   enableRedis: process.env.DROP_ENABLE_REDIS !== 'false',
   redisPort: parseInt(process.env.DROP_REDIS_PORT || '6380', 10),
   maxRedisPerUser: parseInt(process.env.DROP_MAX_REDIS_PER_USER || '3', 10),
+  maxObjectStoragePerUser: parseInt(process.env.DROP_MAX_OBJECT_STORAGE_PER_USER || '3', 10),
   enableSecretPreflight: process.env.DROP_ENABLE_SECRET_PREFLIGHT !== 'false',
   strictManifest: process.env.DROP_STRICT_MANIFEST === 'true',
   bootReconcileMode: parseBootReconcileMode(process.env.DROP_BOOT_RECONCILE),
@@ -730,6 +743,8 @@ export class DropPlatform {
   private dbProvisioner: DatabaseProvisioner | null = null;
   private redisServer: RedisServer | null = null;
   private redisProvisioner: RedisProvisioner | null = null;
+  /** #301. Always constructed (it holds no connection); `availability()` says whether it can provision. */
+  private objectStorage: ObjectStorageProvisioner | null = null;
   private caddyServer: CaddyServer | null = null;
   private secretManager: SecretManager | null = null;
   private webhookManager: WebhookManager | null = null;
@@ -1039,6 +1054,13 @@ export class DropPlatform {
         ),
       }).load();
 
+      // Object storage (#301): bind its stores to THIS platform's root before
+      // anything can reach them — same reasoning as the guest stores above.
+      // Left to their defaults they resolve DROP_ROOT from the environment,
+      // which a `--root` boot (or a test platform) does not set, and the
+      // admin routes would then read a different store from the platform's.
+      this.objectStorage = configureObjectStorage(this.config.dropRoot);
+
       // Initialize services
       await this.initializeServices();
 
@@ -1075,6 +1097,8 @@ export class DropPlatform {
       // exist after `initializeServices()`.
       await this.pruneStaleGuestGrants();
       await this.sweepGuestRetention();
+      // Not awaited: it talks to AWS, and boot must not wait on a network.
+      void this.sweepRetiredObjectStorage();
 
       // M1 boot reconciliation (DROP_BOOT_RECONCILE): decide skip vs redeploy
       // per known app BEFORE the watcher starts, so a stable app's own
@@ -1231,6 +1255,9 @@ export class DropPlatform {
       resetRedisProvisioner();
       this.redisProvisioner = null;
     }
+    resetObjectStorageProvisioner();
+    resetStorageCredentialStore();
+    this.objectStorage = null;
 
     // Stop Caddy server
     if (this.caddyServer) {
@@ -2048,6 +2075,7 @@ backup:
       // runtime-config so a route file never has to re-derive them.
       maxDbsPerUser: this.config.maxDbsPerUser,
       maxRedisPerUser: this.config.maxRedisPerUser,
+      maxObjectStoragePerUser: this.config.maxObjectStoragePerUser,
       // DROP-152: the access-gate route refuses to enable a gate outside
       // docker isolation. Passed through rather than re-read from the env in
       // the route, so the route and the platform can never disagree about
@@ -2928,7 +2956,7 @@ backup:
    */
   private appServiceIntent(
     appName: string,
-    serviceId: 'postgres' | 'redis'
+    serviceId: AttachableServiceId
   ): 'attached' | 'detached' | undefined {
     return this.appConfigService?.getConfig(appName)?.services?.[serviceId];
   }
@@ -3361,6 +3389,107 @@ backup:
       return { allowed: false, used, limit: this.config.maxRedisPerUser };
     }
     return { allowed: true };
+  }
+
+  /**
+   * Object-storage per-user quota (#301). Truthy-gated like checkDbQuota, NOT
+   * `!== undefined` like Redis: an ownerless app was deployed by the operator
+   * (a `DROP_API_KEY`/`cli-local` deploy), and the operator is who pays for
+   * the bucket — capping them against their own account would protect no one.
+   * Async because allocations live on disk, not in a provisioner's memory;
+   * a corrupt store THROWS (fails closed) rather than reading as zero used.
+   */
+  private async checkObjectStorageQuota(
+    ownerUserId: string | undefined
+  ): Promise<{ allowed: true } | { allowed: false; used: number; limit: number }> {
+    if (!ownerUserId || this.config.maxObjectStoragePerUser <= 0 || !this.objectStorage) {
+      return { allowed: true };
+    }
+    const allocated = new Set((await this.objectStorage.listAllocations()).map((a) => a.appName));
+    const used = (this.stateManager?.getAllApps() ?? []).filter(
+      (a) => a.userId === ownerUserId && allocated.has(a.name)
+    ).length;
+    if (used >= this.config.maxObjectStoragePerUser) {
+      return { allowed: false, used, limit: this.config.maxObjectStoragePerUser };
+    }
+    return { allowed: true };
+  }
+
+  /**
+   * The object-storage mirror of `appDatabaseUrlSource`/`appRedisUrlSource`:
+   * which of the injected names the app already sets for itself. Any one is
+   * enough to refuse — an app with its own `AWS_ACCESS_KEY_ID` is talking to
+   * SOME bucket already, and handing it ours would silently move it.
+   */
+  private async appAwsCredentialSource(
+    appName: string,
+    appPath: string
+  ): Promise<{ name: string; source: 'secret' | 'drop.yaml env' } | null> {
+    const names = ['AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY', 'S3_BUCKET'];
+    try {
+      for (const name of names) {
+        if (this.secretManager?.get(appName, name)) return { name, source: 'secret' };
+      }
+    } catch {
+      // Secret store unavailable — fall through to the drop.yaml check.
+    }
+    try {
+      const dropYaml = await parseDropYaml(appPath);
+      const env = dropYaml.success ? dropYaml.config?.env : undefined;
+      for (const name of names) {
+        const declared = env?.[name];
+        if (typeof declared === 'string' && declared.trim().length > 0) {
+          return { name, source: 'drop.yaml env' };
+        }
+      }
+    } catch {
+      // Unreadable/invalid drop.yaml — nothing declared.
+    }
+    return null;
+  }
+
+  /**
+   * The app's object-storage env vars — only while the owner's intent is
+   * `attached`. Allocation alone is not enough: a detach writes `detached`
+   * BEFORE tearing anything down, and a failed teardown must not keep
+   * handing the app a key to a bucket its owner asked to be rid of.
+   *
+   * Fail-soft, like Redis: an unreadable store or key logs loudly and starts
+   * the app without the variables, rather than blocking the start.
+   */
+  private async objectStorageEnvVars(appName: string): Promise<Record<string, string>> {
+    if (!this.objectStorage || this.appServiceIntent(appName, 'object-storage') !== 'attached') {
+      return {};
+    }
+    try {
+      return (await this.objectStorage.getEnvVars(appName)) ?? {};
+    } catch (err) {
+      this.logger.error(
+        `Object storage is attached to ${appName} but its credentials could not be read — starting without them`,
+        'STORAGE',
+        err
+      );
+      return {};
+    }
+  }
+
+  /**
+   * Retry the teardown of buckets whose app was deleted while AWS refused
+   * (#301). Best-effort and quiet unless it did something.
+   */
+  private async sweepRetiredObjectStorage(): Promise<void> {
+    if (!this.objectStorage) return;
+    try {
+      const { destroyed, failed } = await this.objectStorage.sweepRetired();
+      if (destroyed > 0) {
+        this.logger.info(`Removed ${destroyed} object-storage allocation(s) left behind by deleted apps`, 'STORAGE');
+      }
+      if (failed > 0) {
+        this.logger.warn(`${failed} deleted app(s) still have object storage AWS refused to remove — will retry`, 'STORAGE');
+      }
+    } catch (error) {
+      this.logger.warn('Object-storage retry sweep failed', 'STORAGE', error);
+    }
   }
 
   /**
@@ -7210,6 +7339,19 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         });
       }
 
+      // Object storage only. detachService refuses every group app (guard
+      // 3), so a bucket attached to one could only ever be removed by
+      // deleting the app — and unlike a database, it bills the operator for
+      // every day it sits there. Postgres/Redis keep their existing
+      // asymmetry; this is not the place to change it.
+      if (serviceId === 'object-storage' && (state?.isGroupContainer || state?.group)) {
+        return this.refuse('attach', appName, serviceId, {
+          attached: false,
+          reason: 'group-app',
+          detail: `'${appName}' is part of a monorepo group, and a group app's services cannot be detached — attach object storage to a standalone app instead.`,
+        });
+      }
+
       // Both services need this guard, not just Postgres. dbEnvVars AND
       // redisEnvVars are each spread after secretEnvVars in the start env, so
       // either one provisioned over an owner-supplied URL silently repoints
@@ -7226,7 +7368,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
             detail: `This app already supplies its own DATABASE_URL (via ${ownSource}) — attaching would silently repoint it at a freshly-created, empty database.`,
           });
         }
-      } else {
+      } else if (serviceId === 'redis') {
         const ownSource = await this.appRedisUrlSource(appName, appPath);
         if (ownSource) {
           return this.refuse('attach', appName, serviceId, {
@@ -7235,17 +7377,31 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
             detail: `This app already supplies its own REDIS_URL (via ${ownSource}) — attaching would silently repoint it at a freshly-created, empty Redis instance.`,
           });
         }
+      } else {
+        const own = await this.appAwsCredentialSource(appName, appPath);
+        if (own) {
+          return this.refuse('attach', appName, serviceId, {
+            attached: false,
+            reason: 'has-own-aws-credentials',
+            detail: `This app already sets ${own.name} (via ${own.source}) — attaching would silently repoint its AWS SDK at a freshly-created, empty bucket.`,
+          });
+        }
       }
 
       const ownerUserId = state?.userId;
-      const quota = serviceId === 'postgres'
-        ? this.checkDbQuota(ownerUserId)
-        : this.checkRedisQuota(ownerUserId);
+      const quota =
+        serviceId === 'postgres'
+          ? this.checkDbQuota(ownerUserId)
+          : serviceId === 'redis'
+            ? this.checkRedisQuota(ownerUserId)
+            : await this.checkObjectStorageQuota(ownerUserId);
       if (!quota.allowed) {
+        const quotaLabel =
+          serviceId === 'postgres' ? 'Database' : serviceId === 'redis' ? 'Redis' : 'Object storage';
         return this.refuse('attach', appName, serviceId, {
           attached: false,
           reason: 'quota-exceeded',
-          detail: `${serviceId === 'postgres' ? 'Database' : 'Redis'} quota reached (${quota.used}/${quota.limit}).`,
+          detail: `${quotaLabel} quota reached (${quota.used}/${quota.limit}).`,
           quota: { used: quota.used, limit: quota.limit },
         });
       }
@@ -7285,7 +7441,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         const envVars =
           this.dbProvisioner.getEnvVars(appName, pgSocketDir ? { pgSocketDir } : undefined) || {};
         envVarNames = Object.keys(envVars);
-      } else {
+      } else if (serviceId === 'redis') {
         if (!this.redisProvisioner) {
           // See the Postgres branch above — a refusal, not a throw. This is
           // the ordinary state of any box with managed Redis disabled or
@@ -7302,6 +7458,37 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         const redisHost = this.config.isolation === 'docker' ? HOST_ALIAS : '127.0.0.1';
         const envVars = this.redisProvisioner.getEnvVars(appName, { host: redisHost }) || {};
         envVarNames = Object.keys(envVars);
+      } else {
+        // Unavailable here is the ORDINARY state of a box whose operator has
+        // not set object storage up — a refusal naming what is missing, never
+        // a throw that would read as a crash.
+        const availability = this.objectStorage ? await this.objectStorage.availability() : null;
+        if (!this.objectStorage || !availability?.available) {
+          return this.refuse('attach', appName, serviceId, {
+            attached: false,
+            reason: 'service-unavailable',
+            detail:
+              availability && !availability.available
+                ? availability.detail
+                : 'Object storage is not available on this instance.',
+          });
+        }
+        try {
+          // Idempotent: a retried attach gets the same bucket back.
+          await this.objectStorage.provisionAppStorage(appName);
+        } catch (err) {
+          // The settings or credential changed between the check above and
+          // here — still the "not configured" refusal, not a failure.
+          if (err instanceof ObjectStorageUnavailableError) {
+            return this.refuse('attach', appName, serviceId, {
+              attached: false,
+              reason: 'service-unavailable',
+              detail: err.message,
+            });
+          }
+          throw err;
+        }
+        envVarNames = Object.keys((await this.objectStorage.getEnvVars(appName)) ?? {});
       }
 
       // setServiceIntent, not upsertSystemConfig's snapshot-spread — it
@@ -7504,6 +7691,12 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           reason: 'group-app',
           detail: `'${appName}' is part of a monorepo group. Group children never consult the container's own config, so a group-level detach could report a service removed that was never actually attached to this app — detach the individual app's own database/Redis outside the group tooling, or contact an operator.`,
         });
+      }
+
+      // Object storage has no manifest key, no dump and no in-memory
+      // registry — its own method, same guard order from here on.
+      if (serviceId === 'object-storage') {
+        return await this.detachObjectStorage(appName, config, noAppConfigDetail);
       }
 
       // 4. service-unavailable — per-service, never a generic null check.
@@ -7778,6 +7971,124 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
   }
 
   /**
+   * detachService for object storage (#301), steps 4-11 — same ordering and
+   * the same persist-first invariant, minus what does not apply: there is no
+   * manifest key (so no manifest conflict), no orphan probe, and NO BACKUP.
+   * Detaching destroys every object in the bucket; the dashboard's confirm
+   * dialog says so, and this is the only place that does it.
+   *
+   * Runs inside detachService's busy guard; refusals go through `refuse`.
+   */
+  private async detachObjectStorage(
+    appName: string,
+    config: ReturnType<AppConfigService['getConfig']>,
+    noAppConfigDetail: string
+  ): Promise<DetachServiceResult> {
+    const serviceId = 'object-storage' as const;
+    const storage = this.objectStorage;
+
+    // 4. Teardown needs only the admin credential — an operator who has
+    // since DISABLED object storage can still have DROP remove a bucket.
+    if (!storage || !(await storage.canDeprovision())) {
+      return this.refuse('detach', appName, serviceId, {
+        detached: false,
+        reason: 'service-unavailable',
+        detail: 'Object storage has no AWS credential configured on this instance, so nothing can be removed.',
+      });
+    }
+
+    // 5. Not provisioned: record the intent, nothing to stop or destroy.
+    if (!(await storage.getAllocation(appName))) {
+      const persisted = await this.appConfigService!.setServiceIntent(appName, serviceId, 'detached');
+      if (!persisted) {
+        return this.refuse('detach', appName, serviceId, {
+          detached: false,
+          reason: 'no-app-config',
+          detail: noAppConfigDetail,
+        });
+      }
+      return { detached: true, deprovisioned: false, restart: 'not-needed' };
+    }
+
+    // 6. Cooldown, skipped for a retry of a detach that did not finish.
+    if (this.appServiceIntent(appName, serviceId) !== 'detached') {
+      const cooldown = checkDetachCooldown({ lastDetachAt: config?.lastDetachAt?.[serviceId] });
+      if (!cooldown.allowed) {
+        return this.refuse(
+          'detach',
+          appName,
+          serviceId,
+          {
+            detached: false,
+            reason: 'detach-limit',
+            limit: 'cooldown',
+            retryAfterSeconds: cooldown.retryAfterSeconds,
+            detail: `'${appName}' had its ${serviceId} service detached too recently — retry in ${cooldown.retryAfterSeconds}s.`,
+          },
+          'detach-limit (cooldown)'
+        );
+      }
+    }
+
+    // 8. Persist BEFORE destroying anything. From here on the app no longer
+    // gets the variables on any start (objectStorageEnvVars reads intent).
+    const persisted = await this.appConfigService!.setServiceIntent(appName, serviceId, 'detached', {
+      lastDetachAt: Date.now(),
+    });
+    if (!persisted) {
+      return this.refuse('detach', appName, serviceId, {
+        detached: false,
+        reason: 'no-app-config',
+        detail: noAppConfigDetail,
+      });
+    }
+
+    // 9-10. Stop (so nothing writes while the bucket drains), then destroy —
+    // one try, so a throw from either still reaches the single restart.
+    const wasRunning = this.stateManager!.getApp(appName)?.status === 'running';
+    let wasLive = false;
+    let deprovisionStarted = false;
+    let outcome: DetachServiceOutcome;
+    try {
+      wasLive = (await this.runtime!.getStatus(appName))?.status === 'running';
+      if (wasLive) {
+        this.stopHealthProber(appName);
+        this.stopCrashLoopWatch(appName);
+        await this.stateManager!.setAppStatus(appName, 'stopped');
+        await this.runtime!.stop(appName);
+      }
+      deprovisionStarted = true;
+      const result = await storage.deprovisionAppStorage(appName);
+      outcome = result
+        ? {
+            detached: true,
+            deprovisioned: true,
+            objectsDeleted: result.objectsDeleted,
+            bucketDeleted: result.bucketDeleted,
+          }
+        : // The allocation vanished since step 5 — nothing left to remove.
+          { detached: true, deprovisioned: false };
+    } catch (err) {
+      this.logger.error(
+        `detach: ${deprovisionStarted ? 'object storage teardown threw' : 'failed to stop the app'} for '${appName}'`,
+        'SERVICES',
+        err
+      );
+      outcome = {
+        detached: false,
+        reason: 'deprovision-failed',
+        detail: deprovisionStarted
+          ? 'The bucket could not be removed. The detach intent has been recorded and the app no longer receives its credentials — retry once AWS is reachable.'
+          : `'${appName}' could not be safely stopped, so its bucket was left untouched. The detach intent has been recorded — retry once the app can be stopped.`,
+      };
+    }
+
+    // 11.
+    const restartOutcome = await this.restartAfterDetach(appName, wasLive || wasRunning);
+    return { ...outcome, ...restartOutcome };
+  }
+
+  /**
    * True when drop.yaml still declares this service (`database:` for
    * postgres, `redis:` for redis) — informational only (guard 7): owner
    * intent always wins, this just lets the UI say so without a second round
@@ -8030,6 +8341,34 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       }
     } catch (error) {
       this.logger.warn(`Failed to revoke guest grants for ${name}`, 'CLEANUP', error);
+    }
+
+    // Object storage (#301). Here, not in either delete path, for the reason
+    // the guest block above gives: this is the one funnel both go through.
+    // The allocation is keyed on the NAME being freed, and provisioning is
+    // idempotent on that key — so whatever happens it must not stay there,
+    // or the next registrant inherits the bucket and its key. Destroyed, or
+    // retired off the name: `keepData` keeps the bucket (it is the owner's
+    // data) but never the name; a failed teardown is retried by the sweep.
+    try {
+      const torn = await this.objectStorage?.teardownForDeletedApp(name, { keepData: opts.keepData });
+      if (torn?.outcome === 'destroyed') {
+        this.logger.info(
+          `Removed the object storage of deleted app '${name}' (${torn.result.objectsDeleted} object(s))`,
+          'STORAGE'
+        );
+      } else if (torn?.outcome === 'retired') {
+        this.logger.warn(
+          torn.reason === 'kept'
+            ? `Kept the bucket of deleted app '${name}' (keepData) — it is no longer tied to the name`
+            : `Could not remove the object storage of deleted app '${name}' — retired for retry`,
+          'STORAGE',
+          torn.error
+        );
+      }
+    } catch (error) {
+      // A corrupt allocation store: touch nothing, say so loudly.
+      this.logger.error(`Object storage of deleted app '${name}' was NOT cleaned up`, 'STORAGE', error);
     }
 
     const targets = [
@@ -8701,6 +9040,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       // false of one that does not — and the long-lived box is the one
       // accumulating the data.
       void this.sweepGuestRetention();
+      void this.sweepRetiredObjectStorage();
     }, 15 * 60 * 1000);
     this.idleSweepTimer.unref?.();
   }
@@ -8724,7 +9064,11 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         candidates.push({
           name: app.name,
           agentCreated: config?.agentCreated,
-          noReap: config?.noReap,
+          // An app with object storage attached is never reaped (#301): the
+          // teardown deletes the bucket, and unlike a database there is no
+          // dump to fall back on — an idle app is not an app whose files
+          // nobody wants.
+          noReap: config?.noReap || config?.services?.['object-storage'] === 'attached',
           createdAt: app.createdAt,
           cpuTotalNs: info?.cpuTotalNs,
           status: app.status,
@@ -9214,6 +9558,10 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       }
     }
 
+    // Object storage (#301): attach-only, so this is read back here rather
+    // than threaded through both start paths like the database/Redis vars.
+    const storageEnvVars = await this.objectStorageEnvVars(appName);
+
     // Everything that is NOT tenant-authored free text: the app's own secrets
     // plus every value DROP derives for it. Assembled as one object so the
     // `depends_on` filter below has something concrete to compare against.
@@ -9226,6 +9574,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       ...(dropApiKey ? { DROP_API_KEY: dropApiKey } : {}),
       ...dbEnvVars,
       ...redisEnvVars,
+      ...storageEnvVars,
     };
 
     // DROP-150 / B1: resolved `depends_on` URLs used to be spread LAST, so

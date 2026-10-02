@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react';
-import { Database, RefreshCw, Table2, AlertTriangle, Server, Plug, Unplug } from 'lucide-react';
+import { Database, RefreshCw, Table2, AlertTriangle, Server, Plug, Unplug, HardDrive } from 'lucide-react';
 import { apiJson, apiJsonWithStatus } from '../api/client';
 import { useAuth } from '../hooks/useAuth';
 import { useToast } from './Toast';
@@ -58,8 +58,17 @@ import {
  */
 interface DbOverviewResponse extends DbOverview {
   redis: { provisioned: boolean };
+  /** #301. `available` is false until an operator sets object storage up;
+   * `unreadable` when the platform could not read its allocation store. */
+  objectStorage?: {
+    provisioned: boolean;
+    available: boolean;
+    bucket?: string;
+    region?: string;
+    unreadable?: true;
+  };
   services: Partial<Record<ServiceId, ServiceIntent>>;
-  quota: { postgres: QuotaState; redis: QuotaState };
+  quota: { postgres: QuotaState; redis: QuotaState; 'object-storage'?: QuotaState };
   /** Whether this app is ephemeral — the Detach confirm
    * dialog needs this so it never promises a Postgres backup an ephemeral
    * app's detach doesn't actually write. */
@@ -77,11 +86,13 @@ const NO_QUOTA: QuotaState = { used: 0, limit: 0, constrained: false };
 const SERVICE_LABEL: Record<ServiceId, string> = {
   postgres: 'PostgreSQL',
   redis: 'Redis',
+  'object-storage': 'Object storage',
 };
 
 const SERVICE_ICON: Record<ServiceId, typeof Database> = {
   postgres: Database,
   redis: Server,
+  'object-storage': HardDrive,
 };
 
 interface ServiceRowProps {
@@ -90,6 +101,10 @@ interface ServiceRowProps {
   /** Postgres only — `overview.broken`. Absent for redis, which has
    * no equivalent stale-registry-entry state on the wire. */
   broken?: 'database-missing';
+  /** Object storage only — see `AttachCardInput.available`. */
+  available?: boolean;
+  /** Object storage only: `bucket (region)`, shown under an attached row. */
+  detail?: string;
   intent: ServiceIntent | undefined;
   quota: QuotaState;
   role: 'admin' | 'user' | 'readonly' | undefined;
@@ -116,6 +131,8 @@ function ServiceRow({
   id,
   provisioned,
   broken,
+  available,
+  detail,
   intent,
   quota,
   role,
@@ -124,7 +141,7 @@ function ServiceRow({
   onAttach,
   onDetach,
 }: ServiceRowProps) {
-  const view = describeAttachCard({ provisioned, broken, intent, quota, role });
+  const view = describeAttachCard({ provisioned, broken, available, intent, quota, role });
   const Icon = SERVICE_ICON[id];
   const label = SERVICE_LABEL[id];
   const attaching = pending?.service === id && pending.kind === 'attach';
@@ -210,6 +227,14 @@ function ServiceRow({
         )}
       </div>
 
+      {detail && (view.attached || view.detachIncomplete) && (
+        <p className="font-mono text-xs text-faint">{detail}</p>
+      )}
+      {!view.attached && !view.detachIncomplete && role !== 'readonly' && view.disabledReason === 'unavailable' && (
+        <p className="text-xs text-faint">
+          Not set up on this platform — an operator enables it in the platform settings.
+        </p>
+      )}
       {view.detachIncomplete && view.canDetach && (
         <p className="text-xs text-warn">
           A previous detach did not finish — retry to complete it.
@@ -657,6 +682,23 @@ function DatabaseTab({ name }: { name: string }) {
           role={role}
           pending={pendingAction}
           refusal={serviceRefusals.redis}
+          onAttach={handleAttach}
+          onDetach={handleDetach}
+        />
+        <ServiceRow
+          id="object-storage"
+          provisioned={overview?.objectStorage?.provisioned ?? false}
+          available={overview?.objectStorage?.available ?? false}
+          detail={
+            overview?.objectStorage?.bucket
+              ? `${overview.objectStorage.bucket} (${overview.objectStorage.region})`
+              : undefined
+          }
+          intent={overview?.services?.['object-storage']}
+          quota={overview?.quota?.['object-storage'] ?? NO_QUOTA}
+          role={role}
+          pending={pendingAction}
+          refusal={serviceRefusals['object-storage']}
           onAttach={handleAttach}
           onDetach={handleDetach}
         />

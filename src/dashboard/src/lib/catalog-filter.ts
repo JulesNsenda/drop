@@ -20,7 +20,10 @@
 
 export type ExtensionKind = 'service' | 'apptype';
 
-export type ExtensionUnavailableReason = 'postgres-not-ready' | 'redis-not-ready';
+export type ExtensionUnavailableReason =
+  | 'postgres-not-ready'
+  | 'redis-not-ready'
+  | 'object-storage-not-configured';
 
 export interface ExtensionDescriptor {
   id: string;
