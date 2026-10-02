@@ -50,7 +50,7 @@ something is listed here it exists in the shipped code. Planned work lives in
 | Encrypted secrets | Per-app secrets encrypted at rest, injected as env vars at start |
 | Required-secret preflight | A deploy missing a declared secret stops in `needs-config` instead of crash-looping |
 | Reverse proxy + HTTPS | Caddy-managed routing, automatic certificates, wildcard and custom domains |
-| Object storage (operator side) | Admin-configured S3 in the operator's AWS account (`/api/v1/admin/settings/object-storage`, encrypted write-only credential, connection test). Per-app private bucket + bucket-scoped IAM user, created and destroyed by the provisioner; attaching it to apps is not wired yet. See `docs/OBJECT-STORAGE.md` |
+| Object storage | Admin-configured S3 in the operator's AWS account (`/api/v1/admin/settings/object-storage`, encrypted write-only credential, connection test). App owners attach a private bucket + bucket-scoped IAM user via `POST/DELETE /api/v1/apps/:name/services/object-storage` or the Database tab; injects `AWS_REGION`/`AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`/`S3_BUCKET`. Detach or app delete destroys the bucket (no backup); a failed teardown is retired off the name and retried. Per-user cap `DROP_MAX_OBJECT_STORAGE_PER_USER`. See `docs/OBJECT-STORAGE.md` |
 | Custom-domain verification | `PUT`/`GET /api/v1/apps/:name/domain`, `POST /apps/:name/domain/verify`, the `custom_domain` MCP tool and the dashboard Domains tab: the DNS record to create, a DNS check against the platform's own addresses (`DROP_PUBLIC_IPS` behind NAT), and routing + certificate once verified. `drop.yaml` `domains` are routed without verification, as before |
 | Backup / restore | `drop backup` and `drop restore` cover the platform's own state |
 

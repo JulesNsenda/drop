@@ -58,6 +58,10 @@ const UNAVAILABLE_COPY: Record<ExtensionUnavailableReason, Pick<AvailabilityLabe
     detail:
       "Managed Redis isn't available on this platform right now — it may be turned off in this platform's configuration, or it may have failed to start; this card can't tell which. Ask an operator to check the platform's Redis setting and its logs.",
   },
+  'object-storage-not-configured': {
+    detail:
+      "Object storage hasn't been set up on this platform. An operator turns it on in the platform settings, with an AWS account for the buckets to live in.",
+  },
 };
 
 /** Fallback for an `unavailable` descriptor whose reason this build cannot

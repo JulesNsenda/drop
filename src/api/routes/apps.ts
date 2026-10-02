@@ -1222,7 +1222,7 @@ apps.post('/:name/rollback', async c => {
  * module) so an unrecognized id is rejected with a clear message before ever
  * reaching the platform op.
  */
-const ATTACHABLE_SERVICE_IDS = ['postgres', 'redis'] as const;
+const ATTACHABLE_SERVICE_IDS = ['postgres', 'redis', 'object-storage'] as const;
 
 // POST /apps/:name/services/:id - Attach a backing service (DROP-151 Phase 2).
 // Quota check -> provision -> persist intent -> restart; see

@@ -279,6 +279,41 @@ describe('POST /apps/:name/services/:id (DROP-151 Phase 2 attach)', () => {
       expect(body.error.message).toContain('DATABASE_URL');
     });
 
+    it.each(['has-own-aws-credentials', 'group-app'] as const)(
+      'maps object storage\'s "%s" to 409 with reason preserved (#301)',
+      async (reason) => {
+        const ops = makeOps({
+          attachService: jest.fn().mockResolvedValue({
+            attached: false,
+            reason,
+            detail: 'refused',
+          } satisfies AttachServiceResult),
+        });
+        setPlatformOps(ops);
+
+        const res = await attach('test-app', 'object-storage', ownerToken);
+        expect(res.status).toBe(409);
+        const body = (await res.json()) as { error: { details: { reason: string } } };
+        expect(body.error.details.reason).toBe(reason);
+        expect(ops.attachService).toHaveBeenCalledWith('test-app', 'object-storage');
+      }
+    );
+
+    it('maps object storage not being set up to 503, not a conflict to retry (#301)', async () => {
+      setPlatformOps(
+        makeOps({
+          attachService: jest.fn().mockResolvedValue({
+            attached: false,
+            reason: 'service-unavailable',
+            detail: 'Object storage is not enabled on this platform.',
+          } satisfies AttachServiceResult),
+        })
+      );
+
+      const res = await attach('test-app', 'object-storage', ownerToken);
+      expect(res.status).toBe(503);
+    });
+
     it('maps "quota-exceeded" to 409 with reason AND quota {used,limit} preserved', async () => {
       const ops = makeOps({
         attachService: jest.fn().mockResolvedValue({

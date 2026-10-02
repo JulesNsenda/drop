@@ -70,7 +70,7 @@ describe('describeAvailability', () => {
   });
 
   it('never emits a host path, a binary path, or a raw error string', () => {
-    const reasons = ['postgres-not-ready', 'redis-not-ready'] as const;
+    const reasons = ['postgres-not-ready', 'redis-not-ready', 'object-storage-not-configured'] as const;
     for (const reason of reasons) {
       const { detail } = describeAvailability({ availability: 'unavailable', unavailableReason: reason });
       expect(detail).not.toMatch(/[\\/](usr|var|home|bin|opt|Users|drop-svc)[\\/]/i);

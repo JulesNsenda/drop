@@ -26,9 +26,15 @@
  * real types so a hand-mirror drift still fails the suite.
  */
 
-import type { AttachServiceResult, DetachServiceResult } from '../../../api/services-wire.types';
+import type {
+  AttachableServiceId,
+  AttachServiceResult,
+  DetachServiceResult,
+} from '../../../api/services-wire.types';
 
-export type ServiceId = 'postgres' | 'redis';
+/** Derived from the server's own union, like the refusal reasons below, so a
+ * new service cannot reach the wire without this package knowing its id. */
+export type ServiceId = AttachableServiceId;
 
 /** Mirrors `AppConfig['services'][id]` (platform.ts) — the owner's persisted
  * attach/detach intent for one service. A missing key (not the same as an
@@ -63,6 +69,14 @@ export interface AttachCardInput {
   quota: QuotaState;
   role?: 'admin' | 'user' | 'readonly';
   /**
+   * Whether this platform can provision the service at all. Only object
+   * storage reports it (`objectStorage.available`): it is off until an
+   * operator sets it up, which is the ordinary state of most installs, so an
+   * always-enabled Attach that always refused would be the common case.
+   * Absent means "assume available", the existing behaviour for the others.
+   */
+  available?: boolean;
+  /**
    * Set when `GET /db/:name` reports a stale registry entry for this service
    * — currently only postgres's `database-missing` (the `broken` marker):
    * the database itself is gone, but its
@@ -76,7 +90,7 @@ export interface AttachCardInput {
   broken?: 'database-missing';
 }
 
-export type AttachDisabledReason = 'readonly' | 'quota-exceeded';
+export type AttachDisabledReason = 'readonly' | 'unavailable' | 'quota-exceeded';
 
 export interface AttachCardView {
   /** True once the service is actually provisioned AND nothing is pending —
@@ -143,6 +157,7 @@ export interface AttachCardView {
 export function describeAttachCard(input: AttachCardInput): AttachCardView {
   const previouslyDetached = input.intent === 'detached';
   const isReadonly = input.role === 'readonly';
+  const unavailable = input.available === false;
   const quotaFull = input.quota.constrained && input.quota.used >= input.quota.limit;
 
   // A stale registry entry (`broken`) has no live database, but its
@@ -168,20 +183,24 @@ export function describeAttachCard(input: AttachCardInput): AttachCardView {
   // Always undefined when `provisioned` is true — a cleanly attached or
   // detach-incomplete service never offers Attach in the first place, so
   // there is no "disabled" reason to give for it.
+  // Unavailable ranks above quota: "this platform has none" is the truer
+  // answer than "you have used your share of it".
   const disabledReason: AttachDisabledReason | undefined = input.provisioned
     ? undefined
     : isReadonly
       ? 'readonly'
-      : quotaFull
-        ? 'quota-exceeded'
-        : undefined;
+      : unavailable
+        ? 'unavailable'
+        : quotaFull
+          ? 'quota-exceeded'
+          : undefined;
 
   return {
     // False for a service mid-detach (`detachIncomplete`) even though it is
     // still physically provisioned — never render a plain "Attached" badge
     // that hides the repair affordance.
     attached: input.provisioned && !detachIncomplete,
-    canAttach: !input.provisioned && !isReadonly && !quotaFull,
+    canAttach: !input.provisioned && !isReadonly && !unavailable && !quotaFull,
     ...(disabledReason ? { disabledReason } : {}),
     previouslyDetached,
     // 'Re-attach' only for a genuinely unprovisioned, previously-detached
@@ -280,6 +299,8 @@ const REFUSAL_FALLBACK: Record<AttachRefusalReason, string> = {
   ephemeral: 'This app is ephemeral and cannot have a service attached.',
   'has-own-database-url': 'This app already has its own database connection configured.',
   'has-own-redis-url': 'This app already has its own Redis connection configured.',
+  'has-own-aws-credentials': 'This app already sets its own AWS credentials or bucket.',
+  'group-app': 'Object storage cannot be attached to an app in a monorepo group.',
   'quota-exceeded': 'The quota for this service has been reached.',
   'no-app-config': 'This app has no saved platform configuration yet.',
   'service-unavailable': 'This service is not available on this platform.',
@@ -332,6 +353,14 @@ export function describeAttachRefusal(
  * decidable client-side at all.
  */
 export function describeDetachConfirm(serviceId: ServiceId, ephemeral: boolean): string {
+  if (serviceId === 'object-storage') {
+    // The loudest of the three, because it is the only one that destroys
+    // data the owner may have no other copy of, with no backup at all.
+    return (
+      'The bucket and EVERY object in it are deleted immediately. There is NO backup, and ' +
+      'the files cannot be recovered — download anything you need first.'
+    );
+  }
   if (serviceId === 'redis') {
     return 'Redis data for this app is flushed immediately. There is NO backup.';
   }
@@ -371,6 +400,10 @@ export interface DetachServiceSuccess {
    * path over the wire. Optional: absent when the backup was skipped
    * (ephemeral app) or nothing was found to dump. */
   backup?: { written: boolean; file?: string };
+  /** object-storage only. */
+  objectsDeleted?: number;
+  /** object-storage only. */
+  bucketDeleted?: boolean;
   manifestConflict?: boolean;
   /** `'not-needed'` is the `deprovisioned: false` arm's own restart outcome —
    * nothing was ever provisioned, so there is nothing a restart would accomplish, distinct
@@ -467,6 +500,11 @@ export function describeDetachOutcome(label: string, result: DetachServiceSucces
     lines.push(`${label} detach recorded — nothing was provisioned to remove.`);
   } else if (result.backup?.file) {
     lines.push(`${label} detached. Backup written: ${result.backup.file}.`);
+  } else if (typeof result.objectsDeleted === 'number') {
+    lines.push(
+      `${label} detached. The bucket and its ${result.objectsDeleted} ` +
+        `object${result.objectsDeleted === 1 ? '' : 's'} were deleted.`
+    );
   } else {
     lines.push(`${label} detached from the app.`);
   }

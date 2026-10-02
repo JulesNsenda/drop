@@ -17,7 +17,8 @@ import { getStateManager } from '../../managers/app/state-manager';
 import { getAppConfigServiceOrNull } from '../../managers/app/app-config';
 import { getDatabaseProvisioner } from '../../managers/database';
 import { getRedisProvisioner } from '../../managers/redis';
-import { getMaxDbsPerUser, getMaxRedisPerUser } from '../runtime-config';
+import { getMaxDbsPerUser, getMaxRedisPerUser, getMaxObjectStoragePerUser } from '../runtime-config';
+import { getObjectStorageProvisioner } from '../../managers/object-storage';
 import { getSettingsManager } from '../../managers/settings/settings-manager';
 import { logActivityFor } from '../../managers/activity';
 import { validateAppName } from '../middleware/validate';
@@ -140,6 +141,45 @@ export function serviceQuotaState(
   return { used, limit, constrained: true };
 }
 
+/**
+ * The object-storage block of `GET /db/:name` (#301), plus the set of apps
+ * holding an allocation for the quota display. Never throws: a corrupt
+ * allocation store reports `unreadable` (and no quota data) rather than
+ * taking the whole panel down — the attach itself fails closed regardless.
+ */
+async function objectStorageFields(name: string): Promise<{
+  view: {
+    provisioned: boolean;
+    available: boolean;
+    bucket?: string;
+    region?: string;
+    unreadable?: true;
+  };
+  allocated?: Set<string>;
+}> {
+  const provisioner = getObjectStorageProvisioner();
+  try {
+    const [availability, allocations] = await Promise.all([
+      provisioner.availability(),
+      provisioner.listAllocations(),
+    ]);
+    const mine = allocations.find((a) => a.appName === name);
+    return {
+      view: {
+        provisioned: Boolean(mine),
+        available: availability.available,
+        ...(mine ? { bucket: mine.bucket, region: mine.region } : {}),
+      },
+      // No quota to show on a platform that cannot provision at all — the
+      // same reason Postgres/Redis report unconstrained without a provisioner.
+      allocated: availability.available ? new Set(allocations.map((a) => a.appName)) : undefined,
+    };
+  } catch (err) {
+    console.warn(`[db] object storage state unreadable for '${name}':`, err);
+    return { view: { provisioned: false, available: false, unreadable: true } };
+  }
+}
+
 // GET /db/:name - database overview (provisioned?, size, table count), plus
 // the DROP-151 Phase 2 additions the (future) Attach UI needs: whether Redis
 // is provisioned, the persisted attach/detach intent, and per-app quota state.
@@ -185,8 +225,11 @@ db.get('/:name', async c => {
 
   const redisProvisioner = getRedisProvisioner();
   const dbProvisioner = getDatabaseProvisioner();
+  const objectStorage = await objectStorageFields(name);
   const serviceFields = {
     redis: { provisioned: redisProvisioner?.isProvisioned(name) ?? false },
+    // #301. Bucket and region only — never the key, which is the app's.
+    objectStorage: objectStorage.view,
     // The owner's persisted attach/detach intent, if any (platform.ts's
     // appServiceIntent reads the same field). Absent keys mean "no
     // explicit intent" — precedence falls through to the manifest/
@@ -209,6 +252,13 @@ db.get('/:name', async c => {
         getMaxRedisPerUser(),
         ownerUserId !== undefined,
         redisProvisioner ? (n) => redisProvisioner.isProvisioned(n) : undefined
+      ),
+      // Truthy-gated like Postgres — see checkObjectStorageQuota (platform.ts).
+      'object-storage': serviceQuotaState(
+        ownerUserId,
+        getMaxObjectStoragePerUser(),
+        Boolean(ownerUserId),
+        objectStorage.allocated ? (n) => objectStorage.allocated!.has(n) : undefined
       ),
     },
   };

@@ -29,6 +29,8 @@ interface ApiRuntimeConfig {
   maxDbsPerUser?: number;
   /** Per-user managed-Redis cap, mirroring PlatformConfig.maxRedisPerUser. */
   maxRedisPerUser?: number;
+  /** Per-user object-storage cap, mirroring PlatformConfig.maxObjectStoragePerUser (#301). */
+  maxObjectStoragePerUser?: number;
   /**
    * The DROP-152 access gate's operator kill switch (`PlatformConfig.enableAccessGate`,
    * `DROP_FEATURE_ACCESS_GATE` env, boot-time). Read by the access-gate route
@@ -63,6 +65,9 @@ export function setApiRuntimeConfig(config: ApiRuntimeConfig): void {
   if (config.publicUrl !== undefined) runtimeConfig.publicUrl = config.publicUrl;
   if (config.maxDbsPerUser !== undefined) runtimeConfig.maxDbsPerUser = config.maxDbsPerUser;
   if (config.maxRedisPerUser !== undefined) runtimeConfig.maxRedisPerUser = config.maxRedisPerUser;
+  if (config.maxObjectStoragePerUser !== undefined) {
+    runtimeConfig.maxObjectStoragePerUser = config.maxObjectStoragePerUser;
+  }
   if (config.accessGateEnabled !== undefined) runtimeConfig.accessGateEnabled = config.accessGateEnabled;
   if (config.isolation !== undefined) runtimeConfig.isolation = config.isolation;
 }
@@ -154,6 +159,12 @@ export function getMaxDbsPerUser(): number {
 export function getMaxRedisPerUser(): number {
   if (runtimeConfig.maxRedisPerUser !== undefined) return runtimeConfig.maxRedisPerUser;
   return parseInt(process.env.DROP_MAX_REDIS_PER_USER || '3', 10);
+}
+
+/** Per-user object-storage cap (#301) — mirrors getMaxDbsPerUser() above. */
+export function getMaxObjectStoragePerUser(): number {
+  if (runtimeConfig.maxObjectStoragePerUser !== undefined) return runtimeConfig.maxObjectStoragePerUser;
+  return parseInt(process.env.DROP_MAX_OBJECT_STORAGE_PER_USER || '3', 10);
 }
 
 /**

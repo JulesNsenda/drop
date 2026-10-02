@@ -13,8 +13,14 @@
  * (route handlers, tests) are unaffected by the split.
  */
 
-/** Backing services attachable through POST /apps/:name/services/:id (DROP-151 Phase 2). */
-export type AttachableServiceId = 'postgres' | 'redis';
+/**
+ * Backing services attachable through POST /apps/:name/services/:id (DROP-151
+ * Phase 2). `object-storage` (#301) differs from the other two in one way that
+ * matters: it is attach-only. There is no drop.yaml key and no inference — a
+ * bucket in the operator's own AWS account bills the operator, so it exists
+ * only because an owner explicitly asked for it.
+ */
+export type AttachableServiceId = 'postgres' | 'redis' | 'object-storage';
 
 /**
  * Result of `PlatformOps.attachService`. A refusal is a returned value, not a
@@ -40,6 +46,19 @@ export type AttachServiceResult =
          * an empty store — for Redis, that means destroying live session state.
          */
         | 'has-own-redis-url'
+        /**
+         * The object-storage counterpart: the app already sets its own
+         * `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`/`S3_BUCKET`. The injected
+         * set would override them, silently pointing the app's SDK at an
+         * empty bucket and away from wherever its data really lives.
+         */
+        | 'has-own-aws-credentials'
+        /**
+         * object-storage only: the app is a monorepo container or child.
+         * Detach refuses every group app, so a bucket attached to one could
+         * only be removed by deleting the app — while billing the operator.
+         */
+        | 'group-app'
         | 'quota-exceeded'
         /**
          * The app has runtime state but no AppConfig (an out-of-tree or
@@ -114,6 +133,10 @@ export type DetachServiceOutcome =
       flushed?: boolean;
       /** postgres only — absent when skipped (ephemeral app) or the cleanup arm found no database to dump. */
       backup?: { written: boolean; file?: string };
+      /** object-storage only: objects (and versions) deleted. There is no backup. */
+      objectsDeleted?: number;
+      /** object-storage only. */
+      bucketDeleted?: boolean;
       manifestConflict?: boolean;
     }
   | { detached: false; reason: 'backup-failed' | 'deprovision-failed'; detail: string };
