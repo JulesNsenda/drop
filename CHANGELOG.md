@@ -29,6 +29,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Object storage, operator side (#301).** An admin can now configure S3
+  object storage in their own AWS account: `PUT
+  /api/v1/admin/settings/object-storage` (enabled, region, bucket prefix),
+  `PUT`/`DELETE /api/v1/admin/settings/object-storage/credential` (the AWS admin
+  key pair, write-only and encrypted at rest; `DROP_S3_ADMIN_ACCESS_KEY_ID` /
+  `DROP_S3_ADMIN_SECRET_ACCESS_KEY` override it and are never persisted),
+  `POST /api/v1/admin/object-storage/test`, and an `objectStorage` block in `GET
+  /api/v1/admin/settings`. Behind it, a provisioner creates one private bucket
+  per app plus an IAM user whose only permissions are that bucket, and tears
+  both down (every object included). Off by default: turning it on lets DROP
+  create resources that bill to the operator's account. AWS only, with no
+  endpoint setting, so the admin key cannot be redirected to another host.
+  Attaching storage to an app is the next change. See `docs/OBJECT-STORAGE.md`
+  for the admin credential's IAM policy.
+
 - **Custom domains you can verify, from the dashboard, API or an agent (#302).**
   Setting a custom domain (`PUT /api/v1/apps/:name/domain`, the dashboard's
   Domains tab, or the new `custom_domain` MCP tool) now returns the exact DNS
