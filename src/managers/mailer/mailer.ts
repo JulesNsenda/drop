@@ -213,10 +213,10 @@ async function doSend(
     // username defaults to the From address when the operator hasn't set one
     // explicitly, since most relays require SOME username.
     auth: { user: mailSettings.user || mailSettings.from, pass: password },
-    // No `pool` key here — `SMTPTransport.Options` (nodemailer's own type)
-    // doesn't declare one; pooling is a DIFFERENT class (`SMTPPool`) that
-    // nodemailer's own `createTransport` only switches to when `options.pool`
-    // is truthy (see `nodemailer.js`'s `if (options.pool) { ... } else {
+    // No `pool` key here, and never add one — nodemailer's own types accept
+    // `pool`, so nothing at the type level stops it. Pooling is a DIFFERENT
+    // class (`SMTPPool`) that nodemailer's own `createTransport` only
+    // switches to when `options.pool` is truthy (see `nodemailer.js`'s `if (options.pool) { ... } else {
     // transporter = new SMTPTransport(options); }`). Omitting it is what
     // gives the one-shot, non-pooled transport this module is built around.
     //
