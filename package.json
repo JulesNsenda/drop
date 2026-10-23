@@ -76,7 +76,6 @@
     "@types/dockerode": "^4.0.1",
     "@types/jest": "^29.5.0",
     "@types/node": "^22.0.0",
-    "@types/nodemailer": "8.0.1",
     "@types/pg": "^8.11.0",
     "@typescript-eslint/eslint-plugin": "^8.0.0",
     "@typescript-eslint/parser": "^8.0.0",
