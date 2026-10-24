@@ -6,11 +6,34 @@
  */
 
 import * as path from 'path';
-import * as crypto from 'crypto';
-import * as fsp from 'fs/promises';
 import { BuildContext } from '../builder.types';
 import { AppType } from '../../detector/detector.types';
 import { BaseBuildStrategy } from './base';
+import {
+  NODE_MODULES_DIR,
+  hashTenantFile,
+  readTenantFile,
+  removeTenantPath,
+  writeTenantFile,
+} from '../../../utils/tenant-file';
+
+// The install-skip marker sits inside node_modules on purpose: its validity is
+// exactly node_modules' lifetime. Never create node_modules for it — that would
+// fabricate the evidence the marker stands for.
+const MARKER_NAME = '.drop-lockfile-hash';
+const MARKER_REL = path.join(NODE_MODULES_DIR, MARKER_NAME);
+
+// Absent lockfile: `npm install`. Unhashable (symlink, FIFO, oversize, any
+// other refusal): `npm ci`, never a skip, and no marker is written. Hash: the
+// skip-if-unchanged path.
+type LockfileHash = { kind: 'absent' } | { kind: 'unhashable' } | { kind: 'hash'; value: string };
+
+// A sha256 hex digest is 64 bytes; anything much bigger is not our marker.
+const MAX_MARKER_BYTES = 256;
+
+// Generous: real lockfiles run to a few MB, a huge monorepo's to tens. The cap
+// only exists so a tenant cannot make the platform buffer a gigabyte to hash.
+const MAX_LOCKFILE_BYTES = 50 * 1024 * 1024;
 
 // Framework-specific output directories
 const OUTPUT_DIRECTORIES: Record<string, string> = {
@@ -93,15 +116,23 @@ export class NodejsBuildStrategy extends BaseBuildStrategy {
       // Prefer `npm ci` (or equivalent) when a lockfile exists — it's faster
       // and deterministic. Skip install only when the lockfile hash matches
       // the marker from the last successful install. The marker lives INSIDE
-      // node_modules (see markerPath), so anything that destroys node_modules
+      // node_modules (see MARKER_NAME), so anything that destroys node_modules
       // — the monorepo re-copy, `npm ci`'s pre-clean — destroys the marker
       // with it, and a stale marker can never vouch for deps that are gone.
       const lockfileHash = await this.hashLockfile(context.appPath, packageManager);
-      const storedHash = await this.readStoredHash(context);
+      const storedHash =
+        lockfileHash.kind === 'hash' ? await this.readStoredHash(context) : null;
 
-      if (lockfileHash && lockfileHash === storedHash) {
+      if (lockfileHash.kind === 'hash' && lockfileHash.value === storedHash) {
         context.config.skipInstall = true;
       } else {
+        // The install is about to run, so any marker from an EARLIER install
+        // is stale the moment it starts: a failed yarn/pnpm install does not
+        // pre-clean node_modules, and an absent or unhashable lockfile means
+        // no hash will be written afterwards. With the marker gone, a
+        // successful postInstall is the only way one exists, so an old marker
+        // can never match a later lockfile and skip into this install's deps.
+        await this.invalidateMarker(context);
         switch (packageManager) {
           case 'pnpm':
             context.config.installCommand = 'pnpm install --frozen-lockfile';
@@ -110,8 +141,10 @@ export class NodejsBuildStrategy extends BaseBuildStrategy {
             context.config.installCommand = 'yarn install --frozen-lockfile';
             break;
           default:
-            // Use `npm ci` when a lockfile is present, `npm install` otherwise
-            context.config.installCommand = lockfileHash ? 'npm ci' : 'npm install';
+            // Use `npm ci` when a lockfile is present (even one we cannot
+            // hash), `npm install` only when there is none.
+            context.config.installCommand =
+              lockfileHash.kind === 'absent' ? 'npm install' : 'npm ci';
         }
         // The hash is persisted in postInstall, after the install succeeds.
       }
@@ -140,54 +173,55 @@ export class NodejsBuildStrategy extends BaseBuildStrategy {
   async postInstall(context: BuildContext): Promise<void> {
     const packageManager = await this.detectPackageManager(context.appPath);
     const hash = await this.hashLockfile(context.appPath, packageManager);
-    if (hash) {
-      await this.writeStoredHash(context, hash);
+    // Only a hashable lockfile can be vouched for; preBuild already cleared
+    // any older marker, so anything else leaves none behind.
+    if (hash.kind === 'hash') {
+      await this.writeStoredHash(context, hash.value);
     }
   }
 
-  /**
-   * The install-skip marker sits inside node_modules on purpose: its validity
-   * is exactly node_modules' lifetime. Never create node_modules for it —
-   * that would fabricate the evidence the marker stands for.
-   */
-  private markerPath(context: BuildContext): string {
-    return path.join(context.appPath, 'node_modules', '.drop-lockfile-hash');
+  private async invalidateMarker(context: BuildContext): Promise<void> {
+    try {
+      await removeTenantPath(context.appPath, MARKER_REL);
+    } catch {
+      // Best-effort. A failure (e.g. EACCES on a node_modules the tenant made
+      // read-only) can leave a stale marker behind, so a later build may skip
+      // its install. Only the tenant's own build is affected, and the tenant
+      // can write the marker anyway: it is a cache hint, not an integrity check.
+    }
   }
 
   private async hashLockfile(
     appPath: string,
     pm: 'npm' | 'yarn' | 'pnpm'
-  ): Promise<string | null> {
+  ): Promise<LockfileHash> {
     const lockfiles: Record<string, string> = {
       npm: 'package-lock.json',
       yarn: 'yarn.lock',
       pnpm: 'pnpm-lock.yaml',
     };
-    const lockfilePath = path.join(appPath, lockfiles[pm]);
-    try {
-      const content = await fsp.readFile(lockfilePath);
-      return crypto.createHash('sha256').update(content).digest('hex');
-    } catch {
-      return null;
-    }
+    // The lockfile is tenant-authored and, under docker isolation, was last
+    // touched by tenant code on a shared bind mount. Nothing there is "no
+    // lockfile" (install runs unpinned); anything there we refuse to read is
+    // a lockfile we cannot vouch for, which must never read as a skip.
+    const hashed = await hashTenantFile(appPath, lockfiles[pm], MAX_LOCKFILE_BYTES);
+    if (hashed.kind === 'absent') return { kind: 'absent' };
+    if (hashed.kind === 'refused') return { kind: 'unhashable' };
+    return { kind: 'hash', value: hashed.sha256 };
   }
 
   private async readStoredHash(context: BuildContext): Promise<string | null> {
-    try {
-      return (await fsp.readFile(this.markerPath(context), 'utf-8')).trim();
-    } catch {
-      return null;
-    }
+    const read = await readTenantFile(
+      context.appPath,
+      MARKER_REL,
+      MAX_MARKER_BYTES
+    );
+    return read.kind === 'ok' ? read.content.toString('utf-8').trim() : null;
   }
 
   private async writeStoredHash(context: BuildContext, hash: string): Promise<void> {
-    try {
-      // No mkdir: if install didn't produce node_modules there is nothing to
-      // vouch for, and the write fails closed (next build installs again).
-      await fsp.writeFile(this.markerPath(context), hash, 'utf-8');
-    } catch {
-      // Best-effort; a missing hash just means next build won't skip
-    }
+    // Best-effort; a refused write just means next build installs again.
+    await writeTenantFile(context.appPath, MARKER_REL, hash);
   }
 
   async validate(context: BuildContext, outputPath: string): Promise<boolean> {

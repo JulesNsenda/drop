@@ -25,9 +25,9 @@
  */
 
 import * as fs from 'fs/promises';
-import { constants as fsConstants } from 'fs';
 import * as path from 'path';
 import { writeJsonAtomic } from '../../utils/atomic-write';
+import { openRegularFileNoFollow } from '../../utils/safe-open';
 import { getStateManager } from '../app/state-manager';
 import type {
   EventBus,
@@ -89,22 +89,23 @@ interface DeployDetailStoreFile {
  * can read - api-credentials.json, the encryption key, another tenant's
  * appdata. Following it here would make the platform copy that out on the
  * app's behalf, into a file the app's own deploy record points at. lstat
- * before open, and O_NOFOLLOW so the check cannot be raced.
+ * before open, and O_NOFOLLOW (plus O_NONBLOCK) so the check cannot be raced;
+ * see openRegularFileNoFollow.
  */
 async function readDeploySlice(offsets: RuntimeLogOffsets): Promise<string> {
   const one = async (file: string, start: number, end?: number): Promise<string> => {
     try {
-      const stat = await fs.lstat(file);
-      if (stat.isSymbolicLink() || !stat.isFile()) return '';
+      const opened = await openRegularFileNoFollow(file);
+      if (opened.kind !== 'ok') return '';
+      const { handle, stat } = opened;
 
-      // A file SHORTER than the recorded start means this deploy's bytes are
-      // gone; reading from 0 would return someone else's output.
-      const upper = Math.min(end ?? stat.size, stat.size);
-      if (upper <= start) return '';
-      const want = Math.min(upper - start, MAX_RETAINED_BYTES);
-
-      const handle = await fs.open(file, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
       try {
+        // A file SHORTER than the recorded start means this deploy's bytes are
+        // gone; reading from 0 would return someone else's output.
+        const upper = Math.min(end ?? stat.size, stat.size);
+        if (upper <= start) return '';
+        const want = Math.min(upper - start, MAX_RETAINED_BYTES);
+
         const buf = Buffer.alloc(want);
         const { bytesRead } = await handle.read(buf, 0, want, start);
         return buf.subarray(0, bytesRead).toString('utf-8');
