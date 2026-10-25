@@ -11,6 +11,7 @@ import * as path from 'path';
 import * as os from 'os';
 import { EventBus } from '../../core/event-bus';
 import { DeployDetailStore } from './deploy-detail';
+import { itPosix } from '../../utils/__testutils__/fs-links';
 
 describe('DeployDetailStore', () => {
   let tmpDir: string;
@@ -437,6 +438,45 @@ describe('DeployDetailStore', () => {
       await store.retainForApp('sym', { keepData: true });
 
       expect(store.getDetail('c-3')?.retainedLogFile).toBeUndefined();
+    });
+
+    it('REFUSES a hard-linked log: a second name for a platform file passes lstat and O_NOFOLLOW', async () => {
+      logDir = path.join(tmpDir, 'hardlink-logs');
+      await fs.mkdir(logDir, { recursive: true });
+      const secret = path.join(tmpDir, 'api-credentials-hl.json');
+      await fs.writeFile(secret, 'SUPER SECRET KEY', 'utf-8');
+      const link = path.join(logDir, 'app-out.log');
+      await fs.link(secret, link);
+
+      await failWith('hl', 'c-3h', {
+        outFile: link,
+        errFile: path.join(logDir, 'app-err.log'),
+        outStartOffset: 0,
+        errStartOffset: 0,
+      });
+
+      await store.retainForApp('hl', { keepData: true });
+
+      expect(store.getDetail('c-3h')?.retainedLogFile).toBeUndefined();
+    });
+
+    itPosix('REFUSES a FIFO log without hanging', async () => {
+      logDir = path.join(tmpDir, 'fifo-logs');
+      await fs.mkdir(logDir, { recursive: true });
+      const fifo = path.join(logDir, 'app-out.log');
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      require('child_process').execFileSync('mkfifo', [fifo]);
+
+      await failWith('ff', 'c-3f', {
+        outFile: fifo,
+        errFile: path.join(logDir, 'app-err.log'),
+        outStartOffset: 0,
+        errStartOffset: 0,
+      });
+
+      await store.retainForApp('ff', { keepData: true });
+
+      expect(store.getDetail('c-3f')?.retainedLogFile).toBeUndefined();
     });
 
     it('produces no copy when the log path is not a regular file', async () => {

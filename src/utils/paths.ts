@@ -41,3 +41,24 @@ export async function isPathWithin(parent: string, child: string): Promise<boole
   const rel = path.relative(resolvedParent, resolvedChild);
   return rel.length > 0 && !rel.startsWith('..') && !path.isAbsolute(rel);
 }
+
+/**
+ * True only if `child` is a STRICT descendant of `parent` (never `parent`
+ * itself), judged on the realpaths of both.
+ *
+ * Unlike isPathWithin this fails closed: any realpath error (missing path,
+ * permissions) is false rather than a lexical fallback, because callers use it
+ * to decide whether the host may touch `child`. The realpaths are compared
+ * exactly, case-sensitively: realpath returns canonical casing, so a casing
+ * mismatch can only refuse.
+ */
+export async function isPathStrictlyWithin(parent: string, child: string): Promise<boolean> {
+  try {
+    const realParent = await fs.realpath(parent);
+    const realChild = await fs.realpath(child);
+    const prefix = realParent.endsWith(path.sep) ? realParent : realParent + path.sep;
+    return realChild.length > prefix.length && realChild.startsWith(prefix);
+  } catch {
+    return false;
+  }
+}
