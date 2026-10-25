@@ -155,6 +155,13 @@ import {
   reportDaemonHardening,
 } from './startup-constraints';
 import { createContainerExecCommand } from './builder/container-build-runner';
+import {
+  NODE_MODULES_ASIDE_DIR,
+  removeAsideDir,
+  resetToolchainProbeCache,
+  restoreParkedTree,
+  toolchainIdFor,
+} from './builder/toolchain';
 import { migrateAllToDocker } from '../managers/runtime/runtime-migrator';
 import {
   CONTAINER_DATA_DIR,
@@ -1253,6 +1260,7 @@ export class DropPlatform {
     resetUploadDeployService();
     resetActivityLog();
     resetBuildLogService();
+    resetToolchainProbeCache();
     resetPlatformOps();
 
     // Tear down the deploy tracker's subscription only now — after the drain
@@ -1923,6 +1931,10 @@ backup:
         this.stateManager.getAllApps().map((a) => [a.name, a.status])
       );
     }
+
+    // Put back any node_modules a build parked and never settled, before the
+    // first build, start or reconcile can run.
+    await this.restoreParkedNodeModules();
 
     // Sync state manager with app configs (configs are source of truth for ports)
     await this.syncStateWithConfigs();
@@ -4292,7 +4304,10 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       }
       const workDir = await this.getBuildWorkDir(appName);
 
-      const execCommand = this.buildExecCommandFor(detection.type, appName);
+      const { execCommand, toolchainId, nodeModulesAsideDir } = await this.buildToolchainFor(
+        detection.type,
+        appName
+      );
 
       const buildStartedAt = new Date();
       const logId = this.buildLogService
@@ -4336,6 +4351,8 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           env: buildEnv,
           workDir,
           execCommand,
+          toolchainId,
+          nodeModulesAsideDir,
           onBuildLog: logId && this.buildLogService
             ? (line) => this.buildLogService!.writeLine(logId, line)
             : undefined,
@@ -5793,15 +5810,42 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
    * `handleAppUpdate` — the path every upload and git REDEPLOY of an existing
    * app takes — passed no `execCommand` at all. Keep both call sites on this
    * method; a third build path must call it too.
+   *
+   * It also returns the toolchain id the build installs dependencies with, so
+   * the two can never come from different sources: `toolchainIdFor` is the one
+   * producer (docker: the image the build container runs; host isolation: the
+   * `node` tenants would get, probed in a platform-owned dir). `null` is
+   * "unknown" (no move, no stamp).
+   *
+   * Third, the app's aside ROOT (`nodeModulesAsideDir`): the platform-owned
+   * directory under which a build parks a stale node_modules in its own slot
+   * (`<root>/<hash of the build's path>/parked`) while its replacement installs.
+   * It is outside the app tree and the watcher, and not under `data/temp/<app>`
+   * (upload and MCP staging use bare app names there; a leading dot can never be
+   * an app name). Only the shared parent is created here, 0700; the slot is made
+   * by the build. It is per APP, and a build sweeps every slot but its own, so
+   * the one-build-per-app rule (appsInProgress, backed by BuilderService.build())
+   * is what makes that safe. Restored at boot by restoreParkedNodeModules, and
+   * swept by purgeAppArtifacts when the app is removed.
    */
-  private buildExecCommandFor(
+  private async buildToolchainFor(
     appType: AppType,
     appName: string
-  ): ReturnType<typeof createContainerExecCommand> | undefined {
+  ): Promise<{
+    execCommand: ReturnType<typeof createContainerExecCommand> | undefined;
+    toolchainId: string | null;
+    nodeModulesAsideDir: string;
+  }> {
+    const nodeModulesAsideDir = await this.nodeModulesAsideDirFor(appName);
+
     // Host isolation: there is no build container, and running the command on
     // the host is the intended behaviour, not a fallback.
     if (this.config.isolation !== 'docker') {
-      return undefined;
+      return {
+        execCommand: undefined,
+        toolchainId: await this.toolchainIdForBuild(appType),
+        nodeModulesAsideDir,
+      };
     }
 
     // FAIL CLOSED. Configured for docker isolation but without a container
@@ -5818,11 +5862,78 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       );
     }
 
-    return createContainerExecCommand(
-      (this.runtime as import('../managers/runtime').ContainerManager).docker,
-      appType,
-      appName
-    );
+    return {
+      execCommand: createContainerExecCommand(
+        (this.runtime as import('../managers/runtime').ContainerManager).docker,
+        appType,
+        appName
+      ),
+      toolchainId: await this.toolchainIdForBuild(appType),
+      nodeModulesAsideDir,
+    };
+  }
+
+  /** `<dropRoot>/data/temp/.node-modules-aside/<app>`; creates only the parent, 0700. */
+  private async nodeModulesAsideDirFor(appName: string): Promise<string> {
+    const asideRoot = this.nodeModulesAsideRootOf(appName);
+    await fs.mkdir(path.dirname(asideRoot), { recursive: true, mode: 0o700 });
+    return asideRoot;
+  }
+
+  /** The aside root of one app, creating nothing. The ONE place the path is built. */
+  private nodeModulesAsideRootOf(appName: string): string {
+    return path.join(this.config.dropRoot, 'data', 'temp', NODE_MODULES_ASIDE_DIR, appName);
+  }
+
+  /**
+   * Boot: put back any node_modules a build parked and never settled (a crash
+   * between the park and the settle, or a restore that failed), BEFORE anything
+   * is started or reconciled. Per known app (config or state), the slot of its
+   * source path and, when the persisted `currentRelease` path passes
+   * `isReleasePathOf` (never trusted raw: it becomes a rename target), of that
+   * release too. The slot is a pure function of the path, so nothing is read
+   * back off disk. Never throws and never blocks boot: a failure is a generic
+   * warning and the parked tree stays for the next build or boot.
+   *
+   * PRECONDITION: nothing has started a build yet (called from
+   * initializeServices, before the watcher). Under isolation=none, PM2
+   * processes outlive a platform restart and may be running now; restoring only
+   * puts the previous tree back where a build removed it.
+   */
+  private async restoreParkedNodeModules(): Promise<void> {
+    const names = new Set<string>([
+      ...(this.appConfigService?.getAllConfigs() ?? []).map((cfg) => cfg.name),
+      ...(this.stateManager?.getAllApps() ?? []).map((app) => app.name),
+    ]);
+    for (const name of names) {
+      try {
+        const asideRoot = this.nodeModulesAsideRootOf(name);
+        const paths = [this.sourcePathOf(name)];
+        const release = this.appConfigService?.getConfig(name)?.currentRelease?.path;
+        if (release && this.releaseStore?.isReleasePathOf(name, release)) paths.push(release);
+        for (const appPath of paths) {
+          const outcome = await restoreParkedTree(appPath, asideRoot);
+          if (outcome === 'restored') {
+            this.logger.info(`Restored an unsettled node_modules for ${name}`, 'BUILD');
+          }
+        }
+      } catch {
+        this.logger.warn(`Could not check for an unsettled node_modules of ${name}`, 'BUILD');
+      }
+    }
+  }
+
+  /**
+   * The build's toolchain id from the one producer. The host probe runs in its
+   * own empty directory, data/drop-svc/toolchain-probe (0700): platform-owned,
+   * never a tenant path or the shared temp dir, and not data/drop-svc itself,
+   * which holds the platform's state files.
+   */
+  private async toolchainIdForBuild(appType: AppType): Promise<string | null> {
+    const isolation = this.config.isolation === 'docker' ? 'docker' : 'none';
+    const probeCwd = path.join(this.config.dropRoot, 'data', 'drop-svc', 'toolchain-probe');
+    if (isolation === 'none') await fs.mkdir(probeCwd, { recursive: true, mode: 0o700 });
+    return toolchainIdFor(isolation, appType, probeCwd);
   }
 
   /**
@@ -6097,6 +6208,15 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       try {
         const buildEnv = await this.resolveBuildEnv(appPath, appName);
         const buildOverride = (await parseDropYaml(appPath)).config?.build;
+        // Parity with handleBuildApp — see buildToolchainFor. Without this
+        // every redeploy of an EXISTING app ran its tenant-authored install
+        // and build commands on the host instead of inside the build
+        // container, and this is the path upload-deploy and git redeploy both
+        // take, i.e. the common one.
+        const { execCommand, toolchainId, nodeModulesAsideDir } = await this.buildToolchainFor(
+          detection.type,
+          appName
+        );
         buildResult = await this.builder.build({
           appName,
           appPath: buildPath,
@@ -6109,12 +6229,9 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           },
           env: buildEnv,
           workDir,
-          // Parity with handleBuildApp — see buildExecCommandFor. Without this
-          // every redeploy of an EXISTING app ran its tenant-authored install
-          // and build commands on the host instead of inside the build
-          // container, and this is the path upload-deploy and git redeploy both
-          // take, i.e. the common one.
-          execCommand: this.buildExecCommandFor(detection.type, appName),
+          execCommand,
+          toolchainId,
+          nodeModulesAsideDir,
           onBuildLog: updateLogId && this.buildLogService
             ? (line) => this.buildLogService!.writeLine(updateLogId, line)
             : undefined,
@@ -6759,6 +6876,11 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     deployId: string
   ): Promise<string> {
     await this.discardDeployTarget(appName);
+    // A node_modules parked by an earlier failed build of the SOURCE folder goes
+    // back first, so a release is staged from it and a release build (another
+    // slot) never leaves it parked. A failure keeps it parked for the boot
+    // restore or the next in-place build; never fatal here.
+    await restoreParkedTree(sourcePath, this.nodeModulesAsideRootOf(appName));
     let target = sourcePath;
     if (this.releaseStore && (await wantsReleases(sourcePath))) {
       target = await this.releaseStore.stage(appName, sourcePath, deployId);
@@ -8050,6 +8172,12 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         this.logger.warn(`Failed to remove ${dir}`, 'CLEANUP', error);
       }
     }
+
+    // A node_modules a crashed build left in the aside dir is the previous
+    // tenant's code too, and may hold tenant-made read-only directories, so it
+    // goes through the chmod walk rather than a bare rm. It logs its own
+    // failure; the name is still freed either way.
+    await removeAsideDir(this.nodeModulesAsideRootOf(name));
   }
 
   /**
