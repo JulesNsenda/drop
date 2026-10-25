@@ -6,8 +6,8 @@
  * standalone bash installer. Nothing else makes them agree.
  *
  * Drift is SILENT, which is why this test exists rather than a comment. If the
- * installer pre-pulls `node:20-slim` while the runtime pulls
- * `node:20-slim@sha256:…`, both succeed: the warm image is simply the wrong
+ * installer pre-pulls `node:22-slim` while the runtime pulls
+ * `node:22-slim@sha256:…`, both succeed: the warm image is simply the wrong
  * one, and every first deploy on a fresh box pulls again over the network. That
  * shows up as "the first deploy is slow", on a box nobody is watching, weeks
  * after the digest was refreshed.
