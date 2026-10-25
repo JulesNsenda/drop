@@ -216,22 +216,35 @@ elif [[ -f "$RELEASE_MARKER" ]]; then
 fi
 
 # ── Node.js ──────────────────────────────────────────────────────────────────
+# The major the platform runs on. Node 20 is end-of-life (2026-04-30) and got no
+# fix in the October 2026 security release, so a box below this is upgraded.
+NODE_MAJOR=22
 ensure_node() {
   if command -v node &>/dev/null; then
     local ver
     ver=$(node -e "console.log(parseInt(process.version.slice(1)))" 2>/dev/null || echo 0)
-    if [[ $ver -ge 20 ]]; then
+    if [[ $ver -ge $NODE_MAJOR ]]; then
       info "Node.js $(node --version) already installed"
       return 0
     fi
-    warn "Node.js $ver found — need 20+, upgrading via NodeSource..."
+    # Under isolation none, tenant apps run on THIS node: their node_modules were
+    # built for its ABI, and a major upgrade breaks native addons until each app
+    # is rebuilt. Only a docker box (tenants run in their own images) is upgraded
+    # in place; anywhere else the operator upgrades deliberately.
+    local isolation="$ISOLATION"
+    [[ -z "$isolation" ]] && isolation=$(sed -n "s/^DROP_ISOLATION=//p" /etc/drop/drop.env 2>/dev/null | tail -1)
+    if [[ "$isolation" != "docker" ]]; then
+      warn "Node.js $ver is end-of-life; DROP wants ${NODE_MAJOR}+. Not upgrading in place: under isolation none tenant apps run on the host Node, and their native modules must be rebuilt for a new major. Upgrade Node yourself, then redeploy the apps."
+      return 0
+    fi
+    warn "Node.js $ver found — need ${NODE_MAJOR}+, upgrading via NodeSource..."
   else
     info "Node.js not found — installing via NodeSource..."
   fi
   if ! command -v curl &>/dev/null; then
     aptget update -qq && aptget install -y curl
   fi
-  curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+  curl -fsSL "https://deb.nodesource.com/setup_${NODE_MAJOR}.x" | bash -
   aptget install -y nodejs
   info "Node.js $(node --version) installed"
 }
