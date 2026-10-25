@@ -51,7 +51,7 @@ setup_box() {
   mkdir -p /opt/drop/dist /opt/drop/node_modules
   echo "OLD BUILD" > /opt/drop/dist/marker
   echo '{"lockfileVersion":3,"name":"old"}' > /opt/drop/package-lock.json
-  sha256sum /opt/drop/package-lock.json | cut -d' ' -f1 > /opt/drop/node_modules/.deploy-lock-hash
+  echo "$(sha256sum /opt/drop/package-lock.json | cut -d" " -f1)-abi$(node -p process.versions.modules 2>/dev/null || echo unknown)"     > /opt/drop/node_modules/.deploy-lock-hash
   echo "old install" > /opt/drop/install.sh
 }
 

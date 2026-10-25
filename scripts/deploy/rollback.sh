@@ -50,9 +50,17 @@ sudo systemctl stop drop-platform || true
 rm -rf "${DROP_DIR:?}/dist"
 tar -xzf "$SNAPSHOT" -C "${DROP_DIR:?}" || die "Could not restore the snapshot. Box state is unknown."
 
+# The dependency witness: the lockfile hash AND the Node ABI the tree was
+# installed under. A Node upgrade changes the ABI, so the native addons (ssh2's
+# optional sshcrypto, cpu-features) are rebuilt even when the lockfile did not
+# change; this format change makes every box run `npm ci` once.
+deps_witness() {
+  echo "$(sha256sum "$1" | cut -d" " -f1)-abi$(node -p process.versions.modules 2>/dev/null || echo unknown)"
+}
+
 # Dependencies roll back too — restoring code without them is what makes a
 # rollback as likely to fail as the deploy it is undoing.
-lock_hash=$(sha256sum "${DROP_DIR}/package-lock.json" | cut -d' ' -f1)
+lock_hash=$(deps_witness "${DROP_DIR}/package-lock.json")
 prev_hash=$(cat "${DROP_DIR}/node_modules/.deploy-lock-hash" 2>/dev/null || echo none)
 if [[ "$lock_hash" != "$prev_hash" ]]; then
   log "Reinstalling dependencies from the restored lockfile"

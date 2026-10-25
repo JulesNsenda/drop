@@ -51,7 +51,7 @@ ssh root@<server-ip>
 
 **3a. Install DROP**
 
-Run the install script. It creates a `drop` system user, installs Node.js 20 + PostgreSQL + Caddy, clones the repo to `/opt/drop`, builds it, and sets up a systemd service that starts on boot:
+Run the install script. It creates a `drop` system user, installs Node.js 22 + PostgreSQL + Caddy, clones the repo to `/opt/drop`, builds it, and sets up a systemd service that starts on boot:
 
 ```bash
 apt-get update -qq && apt-get install -y curl git build-essential
@@ -78,8 +78,8 @@ sudo bash install.sh --root=/var/drop --domain=example.com --https --acme-email=
 <summary>Manual install (if the curl above fails)</summary>
 
 ```bash
-# Install Node.js 20
-curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+# Install Node.js 22
+curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
 apt-get install -y nodejs
 
 # Create drop user and clone the repo
