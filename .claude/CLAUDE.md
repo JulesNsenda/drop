@@ -268,7 +268,9 @@ Root is `C:\drop\` (Windows) or `/var/drop/` (Linux), overridable via `DROP_ROOT
     ├── rollback/<app>/            # Last-good tree per app (#296): tree/ + meta.json. NOT under
     │                              #   appdata/ (mounted rw into the app); charged to the app's disk
     │                              #   ceiling, and dropped by the sweep before the app would be parked
-    ├── temp/                      # Build work dirs (data/temp/<app>) + upload staging
+    ├── temp/                      # Build work dirs (data/temp/<app>) + upload staging;
+    │                              #   .node-modules-aside/<app>/<slot>/{parked,trash-*,retired}:
+    │                              #   node_modules parked by a build for a Node toolchain change
     └── appconf/                   # Caddyfile, drop.yaml, caddy/{webapps,hosts}/, webapps/ (per-app config)
 ```
 

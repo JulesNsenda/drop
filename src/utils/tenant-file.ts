@@ -15,7 +15,12 @@
  *  - writes refuse a target whose parent directory is a symlink or escapes the
  *    tree, never create the directory, and never truncate until the opened
  *    handle has been vetted;
- *  - removals never follow a symlink out of the tree.
+ *  - removals never follow a symlink out of the tree;
+ *  - moves (moveTenantDirOut / moveTenantDirIn) rename without following the
+ *    final component. moveTenantDirOut carries only a real directory; for
+ *    moveTenantDirIn, whatever sits at the target (a partial tree, or a link a
+ *    tenant planted) is renamed AS ITSELF out to a platform-chosen trash path,
+ *    never followed and never deleted by the move.
  *
  * PRECONDITION (the directory-resolving helpers in this module only): no
  * tenant process with write access to the tree is running during a call. Node
@@ -27,7 +32,7 @@
  * primitive that IS safe against a live tenant is openRegularFileNoFollow in
  * safe-open.ts: it vets one component with O_NOFOLLOW and fstats the handle.
  *
- * readTenantFile, hashTenantFile and writeTenantFile never throw for a hostile tree: a refusal
+ * readTenantFile, hashTenantFile, writeTenantFile and the two moves never throw for a hostile tree: a refusal
  * is a normal outcome the caller turns into "treat as unknown / do nothing".
  * removeTenantPath is the one exception and THROWS on refusal or failure, on
  * purpose: a wipe that did not happen must fail the build rather than let it
@@ -37,14 +42,17 @@
  * platform-chosen, never tenant-chosen.
  */
 
-import { constants as fsConstants } from 'fs';
 import type { Stats } from 'fs';
 import * as crypto from 'crypto';
 import * as fs from 'fs/promises';
 import type { FileHandle } from 'fs/promises';
 import * as path from 'path';
 import { isPathStrictlyWithin } from './paths';
-import { NOFOLLOW, NONBLOCK, isPlainSingleLinkFile, openRegularFileNoFollow } from './safe-open';
+import {
+  chmodDirNoFollow,
+  openRegularFileForWriteNoFollow,
+  openRegularFileNoFollow,
+} from './safe-open';
 
 /**
  * The dependency directory the Node strategy installs into. Named once because
@@ -178,6 +186,22 @@ export async function readTenantFile(
 }
 
 /**
+ * Read `<treeRoot>/<relPath>` as trimmed UTF-8 text, for small markers. Same
+ * outcomes as readTenantFile (`absent` keeps its `at`); `ok` carries the text.
+ * Never throws. The text is tenant-controlled: do not log or echo it.
+ */
+export async function readTenantText(
+  treeRoot: string,
+  relPath: string,
+  maxBytes: number
+): Promise<
+  { kind: 'absent'; at: 'parent' | 'file' } | { kind: 'refused' } | { kind: 'ok'; text: string }
+> {
+  const read = await readTenantFile(treeRoot, relPath, maxBytes);
+  return read.kind === 'ok' ? { kind: 'ok', text: read.content.toString('utf-8').trim() } : read;
+}
+
+/**
  * SHA-256 of `<treeRoot>/<relPath>`, streamed from the vetted handle so a file
  * up to `maxBytes` is never buffered whole. Same containment and outcomes as
  * readTenantFile (the size cap is checked on the handle's fstat first).
@@ -229,26 +253,112 @@ export async function writeTenantFile(
     if (resolved.kind !== 'ok') return false;
     const { target } = resolved;
 
+    const opened = await openRegularFileForWriteNoFollow(target);
+    if (opened.kind !== 'ok') return false;
+    const { handle } = opened;
     try {
-      const existing = await fs.lstat(target);
-      if (!existing.isFile()) return false;
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') return false;
-    }
-
-    const handle = await fs.open(
-      target,
-      fsConstants.O_WRONLY | fsConstants.O_CREAT | NOFOLLOW | NONBLOCK,
-      0o644
-    );
-    try {
-      const opened = await handle.stat();
-      if (!isPlainSingleLinkFile(opened)) return false;
       await handle.truncate(0);
       await handle.writeFile(content);
     } finally {
       await handle.close();
     }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Move the real directory `<treeRoot>/<relPath>` OUT of the tree to `destPath`,
+ * a platform-chosen path outside it (nothing may already be there). The in-tree
+ * side is resolved like every other helper here; the entry is lstat'd and only a
+ * real directory moves (a symlink or anything else is `refused`, so a link is
+ * never carried out of the tree), and `fs.rename` never follows the final
+ * component. The directory's top level is first made u+rwx (rename needs write
+ * on the directory itself), so even a `failed` move can leave that one mode bit
+ * changed; no content is touched. `absent`: nothing to move. `failed`: the
+ * rename itself did not work; `code` is its errno class (`EXDEV` across filesystems, `EPERM`,
+ * `ENOTEMPTY` for a leftover destination, ...), never a path, so the caller can
+ * tell "cannot rename across devices" from every other failure and decide the
+ * fallback. Never throws, never exposes a path in a message.
+ */
+export async function moveTenantDirOut(
+  treeRoot: string,
+  relPath: string,
+  destPath: string
+): Promise<
+  | { kind: 'moved' }
+  | { kind: 'absent' }
+  | { kind: 'refused' }
+  | { kind: 'failed'; code: string | undefined }
+> {
+  let source: string;
+  try {
+    const resolved = await resolveContainedParent(treeRoot, relPath);
+    if (resolved.kind === 'absent') return { kind: 'absent' };
+    if (resolved.kind === 'refused') return { kind: 'refused' };
+    source = resolved.target;
+
+    const stat = await fs.lstat(source).catch((err: NodeJS.ErrnoException) => {
+      if (err.code === 'ENOENT') return null;
+      throw err;
+    });
+    if (!stat) return { kind: 'absent' };
+    if (stat.isSymbolicLink() || !stat.isDirectory()) return { kind: 'refused' };
+    // Moving a directory to another parent needs write permission on the
+    // directory itself (its `..` entry changes); a tenant-made read-only
+    // top directory would otherwise wedge the rename with EACCES. Only this
+    // real directory is chmod'd, through a no-follow handle: a link swapped in
+    // after the lstat fails the open instead of steering the chmod.
+    await chmodDirNoFollow(source).catch(() => undefined);
+  } catch {
+    return { kind: 'refused' };
+  }
+  try {
+    await fs.rename(source, destPath);
+    return { kind: 'moved' };
+  } catch (err) {
+    return { kind: 'failed', code: (err as NodeJS.ErrnoException).code };
+  }
+}
+
+/**
+ * Move the platform-owned directory `srcPath` back IN to `<treeRoot>/<relPath>`
+ * (the reverse of moveTenantDirOut) WITHOUT ever deleting anything first.
+ * Whatever is at the target now (a partial install) is renamed OUT to
+ * `trashPath` (platform-chosen, outside the tree, not existing yet; its real
+ * top directory is first made u+rwx, as in moveTenantDirOut), and only then is
+ * `srcPath` renamed in. If either rename fails, `srcPath` is still where it was,
+ * so the caller can retry from it. An in-tree parent that is no longer
+ * contained is refused. Returns true when restored; never throws.
+ *
+ * Removing `trashPath` is the caller's job (this module cannot reach the
+ * aside-dir remover, and a failure there must not undo a restore): after a
+ * `true`, the partial tree sits at `trashPath` if there was one.
+ */
+export async function moveTenantDirIn(
+  treeRoot: string,
+  relPath: string,
+  srcPath: string,
+  trashPath: string
+): Promise<boolean> {
+  try {
+    const resolved = await resolveContainedParent(treeRoot, relPath);
+    if (resolved.kind !== 'ok') return false;
+    const { target } = resolved;
+
+    const stat = await fs.lstat(target).catch((err: NodeJS.ErrnoException) => {
+      if (err.code === 'ENOENT') return null;
+      throw err;
+    });
+    if (stat) {
+      if (stat.isDirectory() && !stat.isSymbolicLink()) {
+        await chmodDirNoFollow(target).catch(() => undefined);
+      }
+      // A link or a file is renamed as itself: rename never follows it.
+      await fs.rename(target, trashPath);
+    }
+    await fs.rename(srcPath, target);
     return true;
   } catch {
     return false;

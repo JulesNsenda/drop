@@ -88,6 +88,36 @@ export interface BuildContext {
    */
   execCommand: ExecCommandFn | undefined;
   /**
+   * Id of the Node toolchain this build installs dependencies with
+   * (`node-abi-<modules>-<platform>-<arch>-<libc>`, see core/builder/toolchain.ts).
+   * The strategies use it to wipe a `node_modules` built for a different Node
+   * before installing, and to stamp the tree after a successful JS install.
+   *
+   * REQUIRED, though it may be `null`, for the same reason as `execCommand`: a
+   * build site that forgets it must be a compile error, not a build that
+   * silently reuses a stale-ABI tree. `null` means UNKNOWN (the host probe
+   * failed, or the build image has no ABI entry): no wipe and no stamp, i.e.
+   * today's behaviour. The platform returns it together with `execCommand` from
+   * one helper.
+   */
+  toolchainId: string | null;
+  /**
+   * The app's aside ROOT: a platform-owned directory OUTSIDE the app tree and the
+   * watcher (`<dropRoot>/data/temp/.node-modules-aside/<app>`; the leading dot
+   * cannot be an app name). A build parks a stale node_modules in ITS OWN slot
+   * under it (`<root>/<hash of appPath>/parked`, see core/builder/toolchain.ts),
+   * and everything else under the root is swept at the start of a build, so the
+   * caller must guarantee one build per app at a time. The root need not exist.
+   * `undefined` means there is nowhere to park a tree, so one that has to go is
+   * removed in place and a failed build cannot put it back.
+   *
+   * REQUIRED, though it may be `undefined`, like `execCommand` and `toolchainId`:
+   * a build site that forgets it must be a compile error, not a build that
+   * silently loses the ability to restore. The platform sets it at every build
+   * site, from the same helper that returns them.
+   */
+  nodeModulesAsideDir: string | undefined;
+  /**
    * Optional callback for build log lines (install/build output).
    * Called by BuilderService.emitLog() when set. Used by the platform to
    * persist build output to per-deploy log files.
@@ -189,6 +219,26 @@ export interface BuildLogEvent {
 }
 
 /**
+ * What a strategy's dependency step left to settle. The state (a tree parked,
+ * whether this build may stamp) is held by the handle object itself (a class
+ * private to toolchain.ts), never on the strategy singleton or a module. BuilderService.build() drives it:
+ *  - `beforeInstall`: called right before the install command actually runs
+ *    (never when the install is skipped), after every drop.yaml hook, so the step
+ *    can re-check what the hooks left behind. Never throws.
+ *  - `commit`: the whole build succeeded (and was not cancelled); retire what the
+ *    step parked. A successful build whose install was SKIPPED also commits.
+ *  - `rollback`: anything else (a failed stage, a throw, an abort); put back what
+ *    the step parked. A no-op when nothing was parked.
+ * `commit` and `rollback` are called at most once, in one `finally`; a throw is
+ * logged and never replaces the build's own result.
+ */
+export interface DependencySettle {
+  beforeInstall(): Promise<void>;
+  commit(): Promise<void>;
+  rollback(): Promise<void>;
+}
+
+/**
  * Build strategy interface
  */
 export interface BuildStrategy {
@@ -216,6 +266,15 @@ export interface BuildStrategy {
   getOutputDirectory(context: BuildContext): string | null;
 
   /**
+   * The dependency step: runs BEFORE the drop.yaml `preBuild` hooks and before
+   * `preBuild`, so a hook never sees a dependency tree that is about to be
+   * replaced. A throw fails the build (and nothing it did survives: it must not
+   * throw after moving something aside). The handle it returns is owned by
+   * BuilderService.build(), which settles it exactly once when the build ends.
+   */
+  prepareDependencies?(context: BuildContext): Promise<DependencySettle | void>;
+
+  /**
    * Execute pre-build setup (e.g., environment setup)
    */
   preBuild?(context: BuildContext): Promise<void>;
@@ -224,10 +283,11 @@ export interface BuildStrategy {
    * Runs only after a successful (non-skipped) install stage — the place to
    * persist install-skip markers such as the lockfile hash. Never called for
    * failed installs, so a marker can't outlive the install it describes.
+   * `deps` is the handle `prepareDependencies` returned for this build, if any.
    * Best-effort: the builder logs and swallows a throw from this hook — it
    * must not be able to fail a build whose install already succeeded.
    */
-  postInstall?(context: BuildContext): Promise<void>;
+  postInstall?(context: BuildContext, deps?: DependencySettle): Promise<void>;
 
   /**
    * Execute post-build tasks (e.g., optimization)

@@ -12,8 +12,9 @@ import * as path from 'path';
 import * as os from 'os';
 import * as crypto from 'crypto';
 import { NodejsBuildStrategy } from './nodejs';
-import { BuildContext } from '../builder.types';
+import { BuildContext, DependencySettle } from '../builder.types';
 import { AppType } from '../../detector/detector.types';
+import { parkedTreePaths } from '../toolchain';
 import { itPosix, dirLink } from '../../../utils/__testutils__/fs-links';
 
 describe('NodejsBuildStrategy', () => {
@@ -422,6 +423,409 @@ describe('NodejsBuildStrategy', () => {
       } finally {
         await fs.rm(elsewhere, { recursive: true, force: true });
       }
+    });
+  });
+
+  describe('toolchain freshness', () => {
+    const ID = 'node-abi-127-linux-x64-glibc';
+    const OLD = 'node-abi-115-linux-x64-glibc';
+    const MARKER = path.join('node_modules', '.drop-toolchain');
+    const HASH_MARKER = path.join('node_modules', '.drop-lockfile-hash');
+    let tmpDir: string;
+    let asideRoot: string;
+    let aside: string;
+
+    beforeEach(async () => {
+      tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'drop-nodejs-toolchain-'));
+      asideRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'drop-nodejs-aside-'));
+      aside = path.join(asideRoot, 'app');
+    });
+
+    afterEach(async () => {
+      await fs.rm(tmpDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+      await fs.rm(asideRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+    });
+
+    const exists = (rel: string): Promise<boolean> =>
+      fs.access(path.join(tmpDir, rel)).then(
+        () => true,
+        () => false
+      );
+    // `aside` is the aside ROOT: the parked tree sits in the slot of tmpDir under it.
+    const asideExists = async (rel = ''): Promise<boolean> =>
+      fs.access(path.join(parkedTreePaths(tmpDir, aside).parked, rel)).then(
+        () => true,
+        () => false
+      );
+    // What the builder asks right before the install, then what postInstall sees.
+    const mayStamp = async (step: DependencySettle): Promise<boolean> => {
+      await step.beforeInstall();
+      return (step as unknown as { mayStamp: boolean }).mayStamp;
+    };
+    const lockHash = (content: string): string =>
+      crypto.createHash('sha256').update(content).digest('hex');
+
+    // A node_modules with one package file and, optionally, a toolchain marker.
+    const seedModules = async (marker?: string): Promise<void> => {
+      await fs.mkdir(path.join(tmpDir, 'node_modules'));
+      await fs.writeFile(path.join(tmpDir, 'node_modules', 'pkg.txt'), 'x');
+      if (marker !== undefined) await fs.writeFile(path.join(tmpDir, MARKER), marker);
+    };
+
+    const tctx = (
+      config: BuildContext['config'],
+      overrides: Partial<BuildContext> = {}
+    ): BuildContext =>
+      ctx({
+        appType: 'nodejs',
+        appPath: tmpDir,
+        nodeModulesAsideDir: aside,
+        toolchainId: ID,
+        config,
+        ...overrides,
+      });
+
+    // What the builder does before the install stage: the dependency step, then preBuild.
+    const prepare = async (c: BuildContext): Promise<DependencySettle> => {
+      const step = (await strategy.prepareDependencies(c)) as DependencySettle;
+      await strategy.preBuild(c);
+      return step;
+    };
+
+    // The detector supplies 'npm install' (the production path); a drop.yaml
+    // app without `install:` arrives with it unset.
+    const INSTALLS: Array<[string, string | undefined]> = [
+      ['detector-supplied npm install', 'npm install'],
+      ['unset installCommand', undefined],
+    ];
+
+    describe.each(INSTALLS)('with %s', (_label, installCommand) => {
+      const config = (): BuildContext['config'] =>
+        installCommand === undefined ? {} : { installCommand };
+
+      it('moves a stale tree aside before the install, even when the lockfile-hash marker matches', async () => {
+        const lockContent = '{"lockfileVersion":3}';
+        await fs.writeFile(path.join(tmpDir, 'package-lock.json'), lockContent);
+        await seedModules(OLD);
+        await fs.writeFile(path.join(tmpDir, HASH_MARKER), lockHash(lockContent));
+
+        const c = tctx(config());
+        await prepare(c);
+
+        expect(await exists('node_modules')).toBe(false);
+        expect(await asideExists('pkg.txt')).toBe(true);
+        expect(c.config.skipInstall).toBeFalsy();
+        expect(strategy.getInstallCommand(c)).toBe(installCommand ?? 'npm ci');
+      });
+
+      it('keeps a tree stamped for this toolchain', async () => {
+        await seedModules(ID);
+        await prepare(tctx(config()));
+        expect(await exists(path.join('node_modules', 'pkg.txt'))).toBe(true);
+        expect(await exists(MARKER)).toBe(true);
+      });
+
+      it('moves an UNMARKED tree aside too: the install starts clean, then stamps', async () => {
+        await seedModules();
+        const c = tctx(config());
+        const step = await prepare(c);
+        expect(await exists('node_modules')).toBe(false);
+        expect(await asideExists('pkg.txt')).toBe(true);
+
+        await step.beforeInstall(); // the builder, right before the install runs
+        await fs.mkdir(path.join(tmpDir, 'node_modules'));
+        await strategy.postInstall(c, step);
+        expect((await fs.readFile(path.join(tmpDir, MARKER), 'utf-8')).trim()).toBe(ID);
+        await step.commit();
+        expect(await asideExists()).toBe(false);
+        expect(await exists(path.join('node_modules', 'pkg.txt'))).toBe(false);
+      });
+
+      it('does nothing when there is no node_modules', async () => {
+        const step = await prepare(tctx(config()));
+        expect(await exists('node_modules')).toBe(false);
+        expect(await asideExists()).toBe(false);
+        expect(await mayStamp(step)).toBe(true);
+      });
+
+      it('with an unknown toolchain (null) wipes nothing and drops only the toolchain marker', async () => {
+        await seedModules(OLD);
+        await prepare(tctx(config(), { toolchainId: null }));
+        expect(await exists(path.join('node_modules', 'pkg.txt'))).toBe(true);
+        expect(await exists(MARKER)).toBe(false);
+        expect(await asideExists()).toBe(false);
+      });
+
+      it('never moves or unlinks a symlinked node_modules (refused): target untouched, nothing stamped through it', async () => {
+        const elsewhere = await fs.mkdtemp(path.join(os.tmpdir(), 'drop-nodejs-elsewhere-'));
+        try {
+          await fs.writeFile(path.join(elsewhere, 'keep.txt'), 'keep');
+          await fs.writeFile(path.join(elsewhere, '.drop-toolchain'), OLD);
+          await dirLink(elsewhere, path.join(tmpDir, 'node_modules'));
+
+          const c = tctx(config());
+          const step = await prepare(c);
+          await strategy.postInstall(c, step);
+
+          expect((await fs.lstat(path.join(tmpDir, 'node_modules'))).isSymbolicLink()).toBe(true);
+          expect(await asideExists()).toBe(false);
+          expect(await fs.readFile(path.join(elsewhere, 'keep.txt'), 'utf-8')).toBe('keep');
+          expect(await fs.readFile(path.join(elsewhere, '.drop-toolchain'), 'utf-8')).toBe(OLD);
+        } finally {
+          await fs.rm(elsewhere, { recursive: true, force: true });
+        }
+      });
+
+      it('rollback brings the original stale tree back intact, marker still stale', async () => {
+        await seedModules(OLD);
+        const c = tctx(config());
+        const step = await prepare(c);
+        // A failed install left a partial tree.
+        await fs.mkdir(path.join(tmpDir, 'node_modules'));
+        await fs.writeFile(path.join(tmpDir, 'node_modules', 'partial.txt'), 'p');
+
+        await step.rollback();
+
+        expect(await exists(path.join('node_modules', 'partial.txt'))).toBe(false);
+        expect(await fs.readFile(path.join(tmpDir, 'node_modules', 'pkg.txt'), 'utf-8')).toBe('x');
+        expect((await fs.readFile(path.join(tmpDir, MARKER), 'utf-8')).trim()).toBe(OLD);
+        expect(await asideExists()).toBe(false);
+      });
+
+      it('commit discards the aside tree and keeps the new, stamped one', async () => {
+        await seedModules(OLD);
+        const c = tctx(config());
+        const step = await prepare(c);
+        await step.beforeInstall(); // the builder, right before the install runs
+        await fs.mkdir(path.join(tmpDir, 'node_modules'));
+        await fs.writeFile(path.join(tmpDir, 'node_modules', 'fresh.txt'), 'f');
+
+        await strategy.postInstall(c, step);
+        await step.commit();
+
+        expect(await asideExists()).toBe(false);
+        expect(await exists(path.join('node_modules', 'fresh.txt'))).toBe(true);
+        expect((await fs.readFile(path.join(tmpDir, MARKER), 'utf-8')).trim()).toBe(ID);
+      });
+    });
+
+    describe('the lockfile-hash skip', () => {
+      const LOCK = '{"lockfileVersion":3}';
+      const seedHashed = async (marker?: string): Promise<void> => {
+        await fs.writeFile(path.join(tmpDir, 'package-lock.json'), LOCK);
+        await seedModules(marker);
+        await fs.writeFile(path.join(tmpDir, HASH_MARKER), lockHash(LOCK));
+      };
+
+      it('is kept for a tree stamped for this toolchain', async () => {
+        await seedHashed(ID);
+        const c = tctx({});
+        await prepare(c);
+        expect(c.config.skipInstall).toBe(true);
+        expect(await exists(path.join('node_modules', 'pkg.txt'))).toBe(true);
+      });
+
+      it('is kept for an unknown toolchain, as before', async () => {
+        await seedHashed(OLD);
+        const c = tctx({}, { toolchainId: null });
+        await strategy.preBuild(c);
+        expect(c.config.skipInstall).toBe(true);
+      });
+
+      it.each([
+        ['stale', OLD],
+        ['unmarked', undefined],
+      ])('is NOT taken for a %s tree, even when the hash matches (checked in preBuild itself)', async (_s, marker) => {
+        await seedHashed(marker);
+        const c = tctx({});
+        // preBuild alone, i.e. after whatever the hooks left behind.
+        await strategy.preBuild(c);
+        expect(c.config.skipInstall).toBeFalsy();
+        expect(c.config.installCommand).toBe('npm ci');
+      });
+
+      it('is NOT taken for a refused tree (linked toolchain marker), though the hash matches', async () => {
+        await seedHashed();
+        const target = path.join(asideRoot, 'target');
+        await fs.writeFile(target, ID);
+        try {
+          await fs.symlink(target, path.join(tmpDir, MARKER));
+        } catch {
+          return; // no symlink privilege on this host; covered where it exists
+        }
+        const c = tctx({});
+        await strategy.preBuild(c);
+        expect(c.config.skipInstall).toBeFalsy();
+        expect(c.config.installCommand).toBe('npm ci');
+      });
+    });
+
+    it('removes a leftover under the aside root from a crashed build at the start of the next one', async () => {
+      await fs.mkdir(aside);
+      await fs.writeFile(path.join(aside, 'old.txt'), 'x');
+      await prepare(tctx({ installCommand: 'npm install' }));
+      await expect(fs.access(path.join(aside, 'old.txt'))).rejects.toThrow();
+      expect(await asideExists()).toBe(false);
+    });
+
+    it('removes the stale tree in place when there is no aside dir', async () => {
+      await seedModules(OLD);
+      const step = await prepare(
+        tctx({ installCommand: 'npm install' }, { nodeModulesAsideDir: undefined })
+      );
+      expect(await exists('node_modules')).toBe(false);
+      expect(await mayStamp(step)).toBe(true);
+    });
+
+    it.each([
+      ['make deps', { installCommand: 'make deps' }],
+      ['cd server && npm ci', { installCommand: 'cd server && npm ci' }],
+      ['a preset skipInstall', { installCommand: 'npm install', skipInstall: true }],
+    ])('with %s a stale tree keeps its files and loses ONLY the toolchain marker', async (_n, cfg) => {
+      await seedModules(OLD);
+      await prepare(tctx(cfg));
+      expect(await exists(path.join('node_modules', 'pkg.txt'))).toBe(true);
+      expect(await exists(MARKER)).toBe(false);
+      expect(await asideExists()).toBe(false);
+    });
+
+    it('fails the dependency step, tree untouched, when the move cannot be made', async () => {
+      await seedModules(OLD);
+      // The rename fails with EACCES, which is not EXDEV.
+      const rename = jest
+        .spyOn(jest.requireActual('fs/promises'), 'rename')
+        .mockRejectedValueOnce(Object.assign(new Error('EACCES: denied'), { code: 'EACCES' }));
+      const error = await strategy
+        .prepareDependencies(tctx({ installCommand: 'npm install' }))
+        .then(() => null, (err: Error) => err)
+        .finally(() => rename.mockRestore());
+      expect(error).toBeInstanceOf(Error);
+      expect(error!.message).toBe('could not move node_modules built for a different Node runtime');
+      expect(await fs.readFile(path.join(tmpDir, 'node_modules', 'pkg.txt'), 'utf-8')).toBe('x');
+      expect((await fs.readFile(path.join(tmpDir, MARKER), 'utf-8')).trim()).toBe(OLD);
+    });
+
+    it('runs the dependency step on its own: preBuild alone never touches a stale tree', async () => {
+      await seedModules(OLD);
+      await strategy.preBuild(tctx({ installCommand: 'npm install' }));
+      expect(await exists(path.join('node_modules', 'pkg.txt'))).toBe(true);
+    });
+
+    it('logs generic lines with no id, version or path for a stale move', async () => {
+      await seedModules(OLD);
+      const lines: string[] = [];
+      await prepare(tctx({ installCommand: 'npm install' }, { onBuildLog: (l) => lines.push(l) }));
+      expect(lines.length).toBeGreaterThanOrEqual(1);
+      const all = lines.join('\n');
+      for (const secret of [ID, OLD, '115', '127', tmpDir, asideRoot, 'node-abi']) {
+        expect(all).not.toContain(secret);
+      }
+      // No lockfile in this tree: the drift warning follows.
+      expect(all).toMatch(/lockfile/i);
+    });
+
+    describe('postInstall stamping', () => {
+      // A real handle, as the builder holds it: made over a tree with no
+      // node_modules and asked right before the install. Call it BEFORE
+      // seedModules(), which stands in for the install.
+      const owned = async (
+        config: BuildContext['config'] = { installCommand: 'npm install' }
+      ): Promise<DependencySettle> => {
+        const step = await strategy.prepareDependencies(tctx(config));
+        await step.beforeInstall();
+        return step;
+      };
+
+      it.each(['npm install', 'npm ci', undefined])(
+        'stamps node_modules with the id after a JS install the build owned (%s)',
+        async (installCommand) => {
+          const config = installCommand ? { installCommand } : {};
+          const step = await owned(config);
+          await seedModules();
+          await strategy.postInstall(tctx(config), step);
+          expect((await fs.readFile(path.join(tmpDir, MARKER), 'utf-8')).trim()).toBe(ID);
+        }
+      );
+
+      it('never stamps without a handle, or with one that said the tree was not the build\'s own', async () => {
+        const step = await strategy.prepareDependencies(tctx({ installCommand: 'npm install' }));
+        // A hook put an unmarked node_modules there before the install.
+        await seedModules();
+        await step.beforeInstall();
+        await strategy.postInstall(tctx({ installCommand: 'npm install' }));
+        await strategy.postInstall(tctx({ installCommand: 'npm install' }), step);
+        expect(await exists(MARKER)).toBe(false);
+      });
+
+      it('never stamps for a custom install', async () => {
+        const step = await owned();
+        await seedModules();
+        await strategy.postInstall(tctx({ installCommand: 'make deps' }), step);
+        expect(await exists(MARKER)).toBe(false);
+      });
+
+      it('never stamps when the toolchain is unknown', async () => {
+        const step = await owned();
+        await seedModules();
+        await strategy.postInstall(
+          tctx({ installCommand: 'npm install' }, { toolchainId: null }),
+          step
+        );
+        expect(await exists(MARKER)).toBe(false);
+      });
+
+      it('does not create node_modules for a zero-dependency app', async () => {
+        const step = await owned();
+        await strategy.postInstall(tctx({ installCommand: 'npm install' }), step);
+        expect(await exists('node_modules')).toBe(false);
+      });
+
+      it('a stamped tree is a match for the next dependency step', async () => {
+        const step = await owned();
+        await seedModules();
+        await strategy.postInstall(tctx({ installCommand: 'npm install' }), step);
+        await prepare(tctx({ installCommand: 'npm install' }));
+        expect(await exists(path.join('node_modules', 'pkg.txt'))).toBe(true);
+        expect(await asideExists()).toBe(false);
+      });
+
+      describe('ordering', () => {
+        const tenantFile = jest.requireActual('../../../utils/tenant-file');
+        afterEach(() => jest.restoreAllMocks());
+
+        const writesDuring = async (
+          rejectFirst: boolean
+        ): Promise<{ order: string[]; error: unknown }> => {
+          await fs.writeFile(path.join(tmpDir, 'package-lock.json'), '{"lockfileVersion":3}');
+          const step = await owned({ installCommand: 'npm ci' });
+          await seedModules();
+          const order: string[] = [];
+          const real = tenantFile.writeTenantFile as (...a: unknown[]) => Promise<boolean>;
+          jest
+            .spyOn(tenantFile, 'writeTenantFile')
+            .mockImplementation(async (...args: unknown[]) => {
+              order.push(path.basename(args[1] as string));
+              if (rejectFirst && order.length === 1) throw new Error('boom');
+              return real(...args);
+            });
+          const error = await strategy
+            .postInstall(tctx({ installCommand: 'npm ci' }), step)
+            .then(() => null, (err: unknown) => err);
+          return { order, error };
+        };
+
+        it('stamps the toolchain FIRST, then writes the lockfile hash', async () => {
+          const { order } = await writesDuring(false);
+          expect(order).toEqual(['.drop-toolchain', '.drop-lockfile-hash']);
+        });
+
+        it('a failing stamp does not skip the lockfile hash write, and vice versa', async () => {
+          const { order, error } = await writesDuring(true);
+          expect(error).toBeNull();
+          expect(order).toEqual(['.drop-toolchain', '.drop-lockfile-hash']);
+          expect(await exists(HASH_MARKER)).toBe(true);
+        });
+      });
     });
   });
 
