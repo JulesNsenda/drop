@@ -87,6 +87,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Node apps now run on Node 22 under `isolation: docker`.** The tenant image
+  moves from `node:20-slim` (end of life) to `node:22-slim`, digest-pinned;
+  static and SPA apps build in it too. On the first boot of this release every
+  running app under docker isolation is recreated once, and Node apps
+  reinstall their dependencies on Node 22: `node_modules` now record the Node
+  they were built for, and a tree built for Node 20 is reinstalled rather than
+  reused, so native addons are recompiled. Starting a stopped Node app whose
+  dependencies were built for Node 20 is refused with a 409 until it is
+  redeployed (a redeploy of a stopped app now rebuilds it), and rolling back
+  to a snapshot or release from before the upgrade is refused the same way
+  until the app's next deploy creates a new one. `node:22-slim` has no
+  compiler toolchain, so a native addon without a Node 22 prebuild fails to
+  install.
+
+  **Upgrading:** check each Node app installs and starts on
+  `node:22-slim` first, e.g.
+  `docker run --rm -v "$PWD":/app -w /app node:22-slim sh -c 'npm ci && npm start'`
+  on a copy of the app. Under `isolation: none` nothing changes until the host
+  Node is upgraded.
+
 - **Zero-downtime is the default for apps that declare a `healthCheck` (#298).**
   An app whose `drop.yaml` sets `healthCheck` and no `deploy.strategy` is now
   built into release directories and redeployed, rolled back and promoted

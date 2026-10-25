@@ -5966,12 +5966,14 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
    * from empty, and the start guard could never tell an old tree from a current
    * one.
    *
-   * Under docker, only trees built with PRE_MARKER_DOCKER_TOOLCHAIN (the tenant
-   * image every unmarked tree was built in) are stamped. A box that first boots
-   * this code on a later image skips the stamp: its unmarked trees are reinstalled
-   * by their next build, which is right, since they were built for the old image.
-   * Under none the probed host Node is trusted to be the one that built them;
-   * a host Node upgrade in the same restart is the recorded residual.
+   * Under docker, every unmarked tree is stamped PRE_MARKER_DOCKER_TOOLCHAIN,
+   * the tenant image every pre-marker tree was built in, whatever the image is
+   * now. On a box that first boots this code on a later image (an upgrade that
+   * skips the release that introduced the marker), those trees then read
+   * `stale`: the boot reconcile redeploys the running ones and the start guard
+   * refuses the rest, instead of an unmarked Node 20 tree starting on the new
+   * image. Under none the probed host Node is trusted to be the one that built
+   * them; a host Node upgrade in the same restart is the recorded residual.
    *
    * Done when data/drop-svc/toolchain-backfill.json exists. The flag is written
    * only after a pass in which every node app's id resolved and nothing threw.
@@ -6016,6 +6018,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     const ids = new Map<AppType, string | null>();
     let complete = true;
     let stamped = 0;
+    const stampIds = new Set<string>();
     for (const name of names) {
       const config = this.appConfigService?.getConfig(name);
       const type = (this.stateManager?.getApp(name)?.type ?? config?.type ?? 'unknown') as AppType;
@@ -6027,7 +6030,9 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           complete = false;
           break; // the probe failed: asking again per app only multiplies its timeout
         }
-        if (this.config.isolation === 'docker' && id !== PRE_MARKER_DOCKER_TOOLCHAIN) continue;
+        const stampId =
+          this.config.isolation === 'docker' && PRE_MARKER_DOCKER_TOOLCHAIN ? PRE_MARKER_DOCKER_TOOLCHAIN : id;
+        stampIds.add(stampId);
         const trees = [this.sourcePathOf(name, config)];
         const releases = [
           config?.currentRelease?.path,
@@ -6038,9 +6043,9 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           if (release && this.releaseStore?.isReleasePathOf(name, release)) trees.push(release);
         }
         for (const tree of trees) {
-          if (await backfillToolchainMarker(tree, id)) stamped++;
+          if (await backfillToolchainMarker(tree, stampId)) stamped++;
         }
-        if (await getRollbackStore()?.backfillToolchain(name, id)) stamped++;
+        if (await getRollbackStore()?.backfillToolchain(name, stampId)) stamped++;
       } catch {
         complete = false;
         this.logger.warn(`Could not stamp the existing node_modules of ${name}`, 'BUILD');
@@ -6052,9 +6057,9 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       return;
     }
     this.toolchainBackfilled = true;
-    this.logger.info(`Stamped ${stamped} existing node_modules with the current Node toolchain`, 'BUILD');
+    this.logger.info(`Stamped ${stamped} existing node_modules with the Node toolchain that built them`, 'BUILD');
     try {
-      const record = { completedAt: new Date().toISOString(), toolchains: [...new Set(ids.values())] };
+      const record = { completedAt: new Date().toISOString(), toolchains: [...stampIds] };
       await writeJsonAtomic(flagPath, record, { mode: 0o600 });
     } catch {
       this.logger.warn('Could not record the node_modules backfill; it runs again next boot', 'BUILD');
@@ -9822,7 +9827,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     }
 
     // In docker isolation mode the container runs as a non-root user (e.g. UID
-    // 1000 'node' in node:20-slim).  Make the data dir world-writable so the
+    // 1000 'node' in node:22-slim).  Make the data dir world-writable so the
     // container user can write to it without a chown step.  This is acceptable
     // because the dir is only bind-mounted into this app's own container; Tier B
     // will tighten this with explicit UID alignment.

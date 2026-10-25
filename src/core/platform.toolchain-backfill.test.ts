@@ -264,7 +264,7 @@ describe('boot backfill of the toolchain marker', () => {
     await expect(fs.access(flagPath())).resolves.toBeUndefined();
   }, 30000);
 
-  it('docker: stamps only on the image every unmarked tree was built in', async () => {
+  it('docker: stamps the image every unmarked tree was built in, whatever the image is now', async () => {
     const appPath = await deployAndStop('site');
     await withModules(appPath);
     platform2 = makePlatform();
@@ -278,9 +278,15 @@ describe('boot backfill of the toolchain marker', () => {
       await (platform2 as any).runToolchainBackfill();
     };
 
-    await backfillAs(OTHER_ID); // a later image: these trees were not built with it
-    expect(await markerOf(appPath)).toBeNull();
-    await expect(fs.access(flagPath())).resolves.toBeUndefined(); // done; the builds reinstall
+    // A later image (an upgrade that skipped the marker's release): the tree was
+    // still built on the old one, so it is stamped that, and so reads stale.
+    await backfillAs(OTHER_ID);
+    expect(await markerOf(appPath)).toBe(PRE_MARKER_DOCKER_TOOLCHAIN);
+    expect(JSON.parse(await fs.readFile(flagPath(), 'utf-8')).toolchains).toEqual([
+      PRE_MARKER_DOCKER_TOOLCHAIN,
+    ]);
+    await getStateManager().registerApp('api', appPath, 'nodejs');
+    expect(await (platform2 as any).servingTreeIsStale({ name: 'api', path: appPath })).toBe(true);
 
     await backfillAs(PRE_MARKER_DOCKER_TOOLCHAIN);
     expect(await markerOf(appPath)).toBe(PRE_MARKER_DOCKER_TOOLCHAIN);

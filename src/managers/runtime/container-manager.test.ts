@@ -1014,13 +1014,13 @@ describe('selectBuildImage (DROP-137)', () => {
   // run an app. django/flask/fastapi were the first (pip missing from node),
   // `spa: nginx:alpine` itself was the second (nginx start command missing from
   // node) — and fixing that runtime broke the build, the symmetric half.
-  it('builds static in node:20-slim while still SERVING it from nginx:alpine', () => {
-    expect(tagOf(selectBuildImage('static'))).toBe('node:20-slim');
+  it('builds static in node:22-slim while still SERVING it from nginx:alpine', () => {
+    expect(tagOf(selectBuildImage('static'))).toBe('node:22-slim');
     expect(tagOf(selectBaseImage('static'))).toBe('nginx:alpine');
   });
 
-  it('builds spa in node:20-slim while still SERVING it from nginx:alpine', () => {
-    expect(tagOf(selectBuildImage('spa'))).toBe('node:20-slim');
+  it('builds spa in node:22-slim while still SERVING it from nginx:alpine', () => {
+    expect(tagOf(selectBuildImage('spa'))).toBe('node:22-slim');
     expect(tagOf(selectBaseImage('spa'))).toBe('nginx:alpine');
   });
 
@@ -1032,7 +1032,7 @@ describe('selectBuildImage (DROP-137)', () => {
   );
 
   it('honours an explicitly pinned image on the build path too', () => {
-    expect(tagOf(selectBuildImage('spa', 'node:20-slim'))).toBe('node:20-slim');
+    expect(tagOf(selectBuildImage('spa', 'node:22-slim'))).toBe('node:22-slim');
   });
 
   it('still enforces the image allowlist on the build path', () => {
@@ -1041,8 +1041,8 @@ describe('selectBuildImage (DROP-137)', () => {
 });
 
 describe('selectBaseImage', () => {
-  it('returns node:20-slim for nodejs', () => {
-    expect(tagOf(selectBaseImage('nodejs'))).toBe('node:20-slim');
+  it('returns node:22-slim for nodejs', () => {
+    expect(tagOf(selectBaseImage('nodejs'))).toBe('node:22-slim');
   });
 
   it('returns python:3.12-slim for python', () => {
@@ -1052,7 +1052,7 @@ describe('selectBaseImage', () => {
   // Python web frameworks: the detector reports the specific type
   // (django/flask/fastapi) and the BUILD image is selected from that wide
   // type (platform.ts passes `detection.type`). Without these BASE_IMAGES
-  // entries they fell back to node:20-slim, where `pip` doesn't exist —
+  // entries they fell back to node:22-slim, where `pip` doesn't exist —
   // the build failed with "/bin/sh: 1: pip: not found".
   it('returns python:3.12-slim for django', () => {
     expect(tagOf(selectBaseImage('django'))).toBe('python:3.12-slim');
@@ -1079,7 +1079,7 @@ describe('selectBaseImage', () => {
   });
 
   it('respects runtimeImage override when image is in the allowlist', () => {
-    expect(tagOf(selectBaseImage('nodejs', 'node:20-slim'))).toBe('node:20-slim');
+    expect(tagOf(selectBaseImage('nodejs', 'node:22-slim'))).toBe('node:22-slim');
   });
 
   it('throws when runtimeImage is not in the allowlist', () => {
@@ -1088,8 +1088,8 @@ describe('selectBaseImage', () => {
     );
   });
 
-  it('falls back to node:20-slim for unknown types', () => {
-    expect(tagOf(selectBaseImage('docker' as any))).toBe('node:20-slim');
+  it('falls back to node:22-slim for unknown types', () => {
+    expect(tagOf(selectBaseImage('docker' as any))).toBe('node:22-slim');
   });
 });
 
@@ -1109,7 +1109,7 @@ describe('selectImageUser', () => {
 /**
  * Digest pinning (DROP-160, Tier B).
  *
- * The allowlist `selectBaseImage` enforces guaranteed only a NAME. `node:20-slim`
+ * The allowlist `selectBaseImage` enforces guaranteed only a NAME. `node:22-slim`
  * is a mutable pointer rebuilt on its publisher's schedule, so two DROP boxes
  * pulling "the same" image on different days ran different bytes, and an
  * allowlist that admits a moving tag has relocated the trust rather than
@@ -1147,7 +1147,7 @@ describe('base image digest pinning', () => {
     // Existing app configs and drop.yaml files were written against tags, so
     // the allowlist still ACCEPTS a bare tag — but running one would leave the
     // hole open for exactly the callers most likely to have a stale config.
-    expect(selectBaseImage('nodejs', 'node:20-slim')).toMatch(/@sha256:/);
+    expect(selectBaseImage('nodejs', 'node:22-slim')).toMatch(/@sha256:/);
   });
 
   it('accepts the pinned spelling of an allowlisted image too', () => {
@@ -1169,8 +1169,8 @@ describe('base image digest pinning', () => {
     // recovery path for an operator on a private mirror.
     process.env.DROP_DISABLE_IMAGE_PINNING = 'true';
 
-    expect(selectBaseImage('nodejs')).toBe('node:20-slim');
-    expect(selectBuildImage('spa')).toBe('node:20-slim');
+    expect(selectBaseImage('nodejs')).toBe('node:22-slim');
+    expect(selectBuildImage('spa')).toBe('node:22-slim');
   });
 });
 
