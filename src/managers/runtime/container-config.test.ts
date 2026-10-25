@@ -18,6 +18,7 @@ import {
   baseImageTags,
   selectBaseImage,
   selectBuildImage,
+  healthCheckTest,
 } from './container-config';
 import { toolchainIdFromImage } from '../../core/builder/toolchain';
 import { NODE_RUNTIME_TYPES } from '../../core/builder/node-types';
@@ -150,5 +151,27 @@ describe('node images and the toolchain ABI table', () => {
       if (!isNodeImage(selectBaseImage(type))) continue;
       expect(stripDigest(selectBuildImage(type))).toBe(stripDigest(selectBaseImage(type)));
     }
+  });
+});
+
+describe('healthCheckTest', () => {
+  it('runs an exec-form sh with the URL as $1, never spliced into the script', () => {
+    const test = healthCheckTest(3004, '/health');
+    expect(test.slice(0, 3)).toEqual(['CMD', 'sh', '-c']);
+    expect(test[4]).toBe('healthcheck');
+    expect(test[5]).toBe('http://localhost:3004/health');
+    expect(test[3]).not.toContain('/health');
+  });
+
+  it('keeps a hostile path out of the shell text', () => {
+    const test = healthCheckTest(3004, '/x"; rm -rf / #');
+    expect(test[3]).not.toContain('rm -rf');
+    expect(test[5]).toBe('http://localhost:3004/x"; rm -rf / #');
+  });
+
+  it('falls back from curl to wget to node, so images without curl still probe', () => {
+    const script = healthCheckTest(80, '/').at(3)!;
+    expect(script.indexOf('curl')).toBeLessThan(script.indexOf('wget'));
+    expect(script.indexOf('wget')).toBeLessThan(script.indexOf('node -e'));
   });
 });

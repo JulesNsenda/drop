@@ -368,6 +368,8 @@ describe('zero-downtime cutover (#298 step 5)', () => {
     expect(app.port).toBe(oldPort);
     expect(app.error).toContain(why);
     expect(app.error).toContain('previous version is still serving');
+    // The fix for an app that allows one running copy is named, not left to guess.
+    expect(app.error).toContain('deploy: strategy: in-place');
 
     const [episode] = getDeployTracker().getEpisodes('site');
     expect(episode.status).toBe('failed');

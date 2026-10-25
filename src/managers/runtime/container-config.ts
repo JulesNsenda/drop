@@ -428,3 +428,24 @@ function buildFingerprintPayload(inputs: ContainerPolicyInputs): Record<string, 
   };
   return payload;
 }
+
+/**
+ * The probe the Docker HEALTHCHECK runs inside the app's own container. Base
+ * images differ in what they ship: node:*-slim has neither curl nor wget, and
+ * nginx:alpine has wget but not node. So it tries curl, then wget, then node's
+ * built-in fetch, and fails only when none of them can reach the app. Healthy
+ * means a status below 400 (what `curl -f` and `wget` accept without following
+ * a redirect). The URL is passed as `$1`, never spliced into the shell text,
+ * because the path comes from the tenant's drop.yaml.
+ */
+const HEALTH_PROBE_SCRIPT =
+  'curl -fsS -o /dev/null "$1" 2>/dev/null' +
+  ' || wget -q -O /dev/null "$1" 2>/dev/null' +
+  ' || node -e "fetch(process.argv[1],{redirect:\'manual\'}).then(r=>process.exit(r.status<400?0:1),()=>process.exit(1))" "$1"' +
+  // Docker reads only 0 (healthy) and 1 (unhealthy); 127 from a missing tool is not 1.
+  ' || exit 1';
+
+/** The HEALTHCHECK `Test` for an app listening on `port` with `healthCheckPath`. */
+export function healthCheckTest(port: number, healthCheckPath: string): string[] {
+  return ['CMD', 'sh', '-c', HEALTH_PROBE_SCRIPT, 'healthcheck', `http://localhost:${port}${healthCheckPath}`];
+}

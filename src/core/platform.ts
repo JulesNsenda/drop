@@ -6705,7 +6705,14 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       phase: 'boot',
       reason: exited ? 'process-exited' : 'readiness-failed',
     });
-    const message = `New version was not deployed (${reason}); the previous version is still serving.`;
+    // Zero-downtime runs the new version BESIDE the old one, which an app that
+    // allows a single running copy (an exclusive database lock, a single-writer
+    // store) can never pass. Say so: the readiness reason alone reads like a
+    // bug in the new version.
+    const message =
+      `New version was not deployed (${reason}); the previous version is still serving. ` +
+      `A zero-downtime deploy starts the new version beside the old one; if this app allows ` +
+      `only one running copy, set \`deploy: strategy: in-place\` in drop.yaml.`;
     await this.stateManager?.setAppStatus(appName, 'errored', { port: oldPort, error: message });
     await this.stateManager?.setAppStatus(appName, 'running', { port: oldPort, error: message });
     this.armPostDeployWatches(appName, oldPort, healthCheckPath);
