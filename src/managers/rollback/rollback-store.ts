@@ -53,6 +53,7 @@ import { measureTree, configuredCeilingBytes, MB } from '../guardrail/disk-ceili
 import { getStateManager } from '../app/state-manager';
 import { getAppConfigService } from '../app/app-config';
 import { ReleaseStore } from '../release/release-store';
+import { backfillToolchainMarker } from '../../core/builder/toolchain';
 
 export interface RollbackSnapshotMeta {
   appName: string;
@@ -131,6 +132,18 @@ export class RollbackStore {
     } catch {
       return null;
     }
+  }
+
+  /**
+   * Boot backfill for the snapshot's node_modules (see backfillToolchainMarker).
+   * Under the app's lock, so it never interleaves with a capture or restore; the
+   * snapshot is platform-owned, and its path never leaves this class.
+   */
+  backfillToolchain(appName: string, id: string): Promise<boolean> {
+    return this.withLock(appName, async () => {
+      if (!(await this.get(appName))) return false;
+      return backfillToolchainMarker(this.treeDir(appName), id);
+    });
   }
 
   /**

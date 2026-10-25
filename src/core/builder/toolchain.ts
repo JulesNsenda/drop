@@ -114,6 +114,13 @@ export function toolchainIdFromImage(image: string): string | null {
   return formatToolchainId({ modules, platform: 'linux', arch: process.arch, libc });
 }
 
+/**
+ * Under docker, the toolchain of every tree built before the marker existed:
+ * the tenant image then was node:20-slim. The boot backfill stamps only trees
+ * it can vouch for, so it stamps nothing when the current image differs.
+ */
+export const PRE_MARKER_DOCKER_TOOLCHAIN = toolchainIdFromImage('node:20-slim');
+
 // Single quotes only and no `$`/backtick/backslash: the same string has to
 // survive both /bin/sh and cmd.exe double-quoting.
 const PROBE_SCRIPT =
@@ -758,4 +765,20 @@ export async function stampToolchain(
   }
   if (installCommand === null || !isJsInstallCommand(installCommand)) return;
   await writeTenantFile(context.appPath, path.join(NODE_MODULES_DIR, TOOLCHAIN_MARKER), id);
+}
+
+/**
+ * Boot backfill: stamp an existing `node_modules` that has no marker with `id`,
+ * the toolchain running it now. Valid only on the first boot of the release that
+ * introduced the marker, when every tree on disk was built by the toolchain that
+ * is current: nothing has changed it since. Touches only `unmarked` trees, so it
+ * never overwrites a stamp and never vouches for a `stale` or `refused` one.
+ *
+ * PRECONDITION: no tenant process can write the tree during the call (docker:
+ * runtime containers mount the tree read-only and no build has started; none: the
+ * tenant runs as the platform uid, so there is no boundary to defend).
+ */
+export async function backfillToolchainMarker(treeRoot: string, id: string): Promise<boolean> {
+  if ((await checkTree(treeRoot, id)) !== 'unmarked') return false;
+  return writeTenantFile(treeRoot, path.join(NODE_MODULES_DIR, TOOLCHAIN_MARKER), id);
 }

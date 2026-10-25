@@ -237,6 +237,8 @@ describe('build exec parity between the two build paths', () => {
       appType: string
     ): Promise<{ call: any; produced: jest.SpyInstance }> => {
       const platform = makePlatform(isolation);
+      // A booted platform: the one-shot toolchain backfill has run.
+      (platform as any).toolchainBackfilled = true;
       const appName = 'my-app';
       const appPath = path.join(tempDir, 'apps', appName);
       fs.mkdirSync(appPath, { recursive: true });
@@ -301,6 +303,7 @@ describe('build exec parity between the two build paths', () => {
         // No stub: toolchainIdFor and selectBuildImage run for real, so this
         // fails if either build path stops going through the one helper.
         const platform = makePlatform('docker');
+        (platform as any).toolchainBackfilled = true;
         // Its own app name: the deploy circuit breaker is process-wide and keyed by
         // app, and the stubbed builds above have already tripped 'my-app'.
         const appName = `real-producer-${path_}`.toLowerCase();
