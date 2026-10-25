@@ -157,11 +157,16 @@ import {
 import { createContainerExecCommand } from './builder/container-build-runner';
 import {
   NODE_MODULES_ASIDE_DIR,
+  PRE_MARKER_DOCKER_TOOLCHAIN,
+  backfillToolchainMarker,
+  checkTree,
   removeAsideDir,
   resetToolchainProbeCache,
   restoreParkedTree,
   toolchainIdFor,
 } from './builder/toolchain';
+import { NODE_MODULES_BUILD_TYPES, NODE_RUNTIME_TYPES } from './builder/node-types';
+import { writeJsonAtomic } from '../utils/atomic-write';
 import { migrateAllToDocker } from '../managers/runtime/runtime-migrator';
 import {
   CONTAINER_DATA_DIR,
@@ -559,6 +564,13 @@ export interface CheapBootReconcileInput {
    * cause a mismatch there on their own.
    */
   runtimeSpecCurrent: boolean;
+  /**
+   * Whether the serving tree's node_modules carries a toolchain marker for a
+   * different Node runtime than the one that would run it now. Only `stale`
+   * counts: an unmarked tree was stamped by the boot backfill or never had a
+   * JS install, and is not evidence of a toolchain change.
+   */
+  dependenciesStale: boolean;
 }
 
 /**
@@ -594,8 +606,16 @@ export type BootReconcileInput = CheapBootReconcileInput & SignatureBootReconcil
 export function decideBootReconciliationCheap(
   input: CheapBootReconcileInput
 ): BootReconcileDecision | null {
-  const { status, isRuntimeRunning, hasPort, portDrifted, group, grantedApiScopesCount, runtimeSpecCurrent } =
-    input;
+  const {
+    status,
+    isRuntimeRunning,
+    hasPort,
+    portDrifted,
+    group,
+    grantedApiScopesCount,
+    runtimeSpecCurrent,
+    dependenciesStale,
+  } = input;
 
   // A user-stopped app is deliberately not running — leave it alone exactly
   // like the normal app:detected path does today (handleAppDetected gates on
@@ -641,6 +661,10 @@ export function decideBootReconciliationCheap(
 
   if (!runtimeSpecCurrent) {
     return { action: 'redeploy', reason: 'runtime spec revision is stale' };
+  }
+
+  if (dependenciesStale) {
+    return { action: 'redeploy', reason: 'node_modules were built for a different Node runtime' };
   }
 
   return null; // undecided — proceed to the signature phase
@@ -799,6 +823,11 @@ export class DropPlatform {
   // reachable for the exact case it exists for. Cleared after boot
   // reconciliation runs so it can't leak into a later start() on this instance.
   private bootStatusSnapshot: Map<string, AppStatus> | null = null;
+  // Set once the one-shot toolchain backfill has run (now or on an earlier
+  // boot). Until then a build has no toolchain id, so it neither parks nor
+  // stamps: an unmarked tree must not be read as "built by another Node".
+  private toolchainBackfilled = false;
+  private toolchainBackfill: Promise<void> | null = null;
   private usedPorts: Map<number, string> = new Map(); // port -> appName ownership
   private appsInProgress: Set<string> = new Set(); // Track apps being built/started
   // Builds deferred because the concurrent-build cap was full (appName -> its
@@ -1935,6 +1964,7 @@ backup:
     // Put back any node_modules a build parked and never settled, before the
     // first build, start or reconcile can run.
     await this.restoreParkedNodeModules();
+    await this.backfillToolchainMarkers();
 
     // Sync state manager with app configs (configs are source of truth for ports)
     await this.syncStateWithConfigs();
@@ -2717,6 +2747,8 @@ backup:
         group: config.group,
         grantedApiScopesCount: config.grantedApiScopes?.length ?? 0,
         runtimeSpecCurrent,
+        // Only read for an app the cheap phase could still redeploy.
+        dependenciesStale: status !== 'stopped' && (await this.servingTreeIsStale(config)),
       });
       let scanned = false;
 
@@ -5843,7 +5875,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     if (this.config.isolation !== 'docker') {
       return {
         execCommand: undefined,
-        toolchainId: await this.toolchainIdForBuild(appType),
+        toolchainId: await this.buildToolchainIdFor(appType),
         nodeModulesAsideDir,
       };
     }
@@ -5868,7 +5900,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         appType,
         appName
       ),
-      toolchainId: await this.toolchainIdForBuild(appType),
+      toolchainId: await this.buildToolchainIdFor(appType),
       nodeModulesAsideDir,
     };
   }
@@ -5921,6 +5953,137 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         this.logger.warn(`Could not check for an unsettled node_modules of ${name}`, 'BUILD');
       }
     }
+  }
+
+  /**
+   * One-shot, on the first boot of the release that introduced the toolchain
+   * marker: stamp every existing node_modules that has no marker with the
+   * toolchain that runs it now — each known app's source folder, its current and
+   * previous release, and its rollback snapshot. Valid because nothing has
+   * changed the toolchain since those trees were built. Without it, the first
+   * build of every app would read its unmarked tree as foreign and reinstall it
+   * from empty, and the start guard could never tell an old tree from a current
+   * one.
+   *
+   * Under docker, only trees built with PRE_MARKER_DOCKER_TOOLCHAIN (the tenant
+   * image every unmarked tree was built in) are stamped. A box that first boots
+   * this code on a later image skips the stamp: its unmarked trees are reinstalled
+   * by their next build, which is right, since they were built for the old image.
+   * Under none the probed host Node is trusted to be the one that built them;
+   * a host Node upgrade in the same restart is the recorded residual.
+   *
+   * Done when data/drop-svc/toolchain-backfill.json exists. The flag is written
+   * only after a pass in which every node app's id resolved and nothing threw.
+   * Until then builds get no id, and the first build asks for the backfill
+   * again (see buildToolchainIdFor), so a host probe that failed at boot never
+   * leaves a gated build stripping markers for the rest of the process. Never
+   * throws.
+   *
+   * PRECONDITION (the tenant-file writer's): no tenant can write these trees now.
+   * Docker: runtime containers mount the app read-only, and the pass that matters
+   * runs at boot, before any build (a build container orphaned by a crash is the
+   * known residual); releases and snapshots are platform-owned. None: tenants run
+   * as the platform uid, so there is no boundary to defend, also when the pass is
+   * retried after boot.
+   */
+  private backfillToolchainMarkers(): Promise<void> {
+    if (this.toolchainBackfilled) return Promise.resolve();
+    this.toolchainBackfill ??= this.runToolchainBackfill()
+      .catch(() => {
+        this.logger.warn('Could not stamp the existing node_modules; trying again later', 'BUILD');
+      })
+      .finally(() => {
+        this.toolchainBackfill = null;
+      });
+    return this.toolchainBackfill;
+  }
+
+  private async runToolchainBackfill(): Promise<void> {
+    const flagPath = path.join(this.config.dropRoot, 'data', 'drop-svc', 'toolchain-backfill.json');
+    try {
+      await fs.access(flagPath);
+      this.toolchainBackfilled = true;
+      return;
+    } catch {
+      // Not done yet.
+    }
+
+    const names = new Set<string>([
+      ...(this.appConfigService?.getAllConfigs() ?? []).map((cfg) => cfg.name),
+      ...(this.stateManager?.getAllApps() ?? []).map((app) => app.name),
+    ]);
+    const ids = new Map<AppType, string | null>();
+    let complete = true;
+    let stamped = 0;
+    for (const name of names) {
+      const config = this.appConfigService?.getConfig(name);
+      const type = (this.stateManager?.getApp(name)?.type ?? config?.type ?? 'unknown') as AppType;
+      if (!NODE_MODULES_BUILD_TYPES.includes(type)) continue;
+      try {
+        if (!ids.has(type)) ids.set(type, await this.toolchainIdForBuild(type));
+        const id = ids.get(type);
+        if (!id) {
+          complete = false;
+          break; // the probe failed: asking again per app only multiplies its timeout
+        }
+        if (this.config.isolation === 'docker' && id !== PRE_MARKER_DOCKER_TOOLCHAIN) continue;
+        const trees = [this.sourcePathOf(name, config)];
+        const releases = [
+          config?.currentRelease?.path,
+          config?.previousRelease?.path,
+          config?.pendingPromotion?.releasePath,
+        ];
+        for (const release of releases) {
+          if (release && this.releaseStore?.isReleasePathOf(name, release)) trees.push(release);
+        }
+        for (const tree of trees) {
+          if (await backfillToolchainMarker(tree, id)) stamped++;
+        }
+        if (await getRollbackStore()?.backfillToolchain(name, id)) stamped++;
+      } catch {
+        complete = false;
+        this.logger.warn(`Could not stamp the existing node_modules of ${name}`, 'BUILD');
+      }
+    }
+
+    if (!complete) {
+      this.logger.warn('Existing node_modules are not all stamped yet; trying again later', 'BUILD');
+      return;
+    }
+    this.toolchainBackfilled = true;
+    this.logger.info(`Stamped ${stamped} existing node_modules with the current Node toolchain`, 'BUILD');
+    try {
+      const record = { completedAt: new Date().toISOString(), toolchains: [...new Set(ids.values())] };
+      await writeJsonAtomic(flagPath, record, { mode: 0o600 });
+    } catch {
+      this.logger.warn('Could not record the node_modules backfill; it runs again next boot', 'BUILD');
+    }
+  }
+
+  /**
+   * Whether the tree this node-runtime app runs from was built for another Node runtime.
+   * False when the toolchain is unknown (non-node type, failed host probe), and
+   * before the backfill has run: the redeploy it asks for would build with no
+   * id, which strips the marker and keeps the old tree. checkTree only reads,
+   * through the no-follow reader, so a live tenant cannot redirect it.
+   */
+  private async servingTreeIsStale(config: AppConfig): Promise<boolean> {
+    if (!this.toolchainBackfilled) return false;
+    const type = (this.stateManager?.getApp(config.name)?.type ?? config.type ?? 'unknown') as AppType;
+    if (!NODE_RUNTIME_TYPES.includes(type)) return false;
+    const id = await this.toolchainIdForBuild(type);
+    if (!id) return false;
+    return (await checkTree(this.servingPathOf(config.name, config), id)) === 'stale';
+  }
+
+  /**
+   * A build's toolchain id: none until the backfill has run, so a build never
+   * parks or strips the marker of a tree the backfill has yet to vouch for.
+   * Asks for the backfill first, so a pass that failed at boot is retried.
+   */
+  private async buildToolchainIdFor(appType: AppType): Promise<string | null> {
+    await this.backfillToolchainMarkers();
+    return this.toolchainBackfilled ? this.toolchainIdForBuild(appType) : null;
   }
 
   /**

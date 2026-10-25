@@ -128,6 +128,7 @@ describe('decideBootReconciliation', () => {
     group: undefined as string | undefined,
     grantedApiScopesCount: 0,
     runtimeSpecCurrent: true,
+    dependenciesStale: false,
     recordedHash: 'hash-a',
     currentSignature: { hash: 'hash-a', newestPath: 'index.html' },
     secretFingerprintChanged: false,
@@ -269,6 +270,7 @@ describe('decideBootReconciliationCheap', () => {
         group: undefined,
         grantedApiScopesCount: 0,
         runtimeSpecCurrent: true,
+        dependenciesStale: false,
       })
     ).toBeNull();
   });
