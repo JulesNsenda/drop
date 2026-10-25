@@ -428,3 +428,28 @@ function buildFingerprintPayload(inputs: ContainerPolicyInputs): Record<string, 
   };
   return payload;
 }
+
+/**
+ * The probe the Docker HEALTHCHECK runs inside the app's own container. Base
+ * images differ in what they ship: node:*-slim has neither curl nor wget,
+ * nginx:alpine has wget but not node, and python:*-slim has only python3. So it
+ * tries curl, then wget, then node's built-in fetch, then python's urllib, and
+ * fails only when none of them can reach the app. Healthy means a status below
+ * 400 (what `curl -f` and `wget` accept). The URL is passed as `$1`, never
+ * spliced into the shell text, because the path comes from the tenant's
+ * drop.yaml. The node probe runs inside the app's own memory limit every 30s,
+ * so its heap is capped: a probe must never be what pushes an app into an OOM
+ * kill that DROP would then blame on the app.
+ */
+const HEALTH_PROBE_SCRIPT =
+  'curl -fsS -o /dev/null "$1" 2>/dev/null' +
+  ' || wget -q -O /dev/null "$1" 2>/dev/null' +
+  ' || node --max-old-space-size=16 -e "fetch(process.argv[1],{redirect:\'manual\'}).then(r=>process.exit(r.status<400?0:1),()=>process.exit(1))" "$1" 2>/dev/null' +
+  ' || python3 -c "import sys,urllib.request as u;sys.exit(0 if u.urlopen(sys.argv[1],timeout=5).status<400 else 1)" "$1" 2>/dev/null' +
+  // Docker reads only 0 (healthy) and 1 (unhealthy); 127 from a missing tool is not 1.
+  ' || exit 1';
+
+/** The HEALTHCHECK `Test` for an app listening on `port` with `healthCheckPath`. */
+export function healthCheckTest(port: number, healthCheckPath: string): string[] {
+  return ['CMD', 'sh', '-c', HEALTH_PROBE_SCRIPT, 'healthcheck', `http://localhost:${port}${healthCheckPath}`];
+}

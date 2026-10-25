@@ -43,6 +43,7 @@ import {
   DROP_NET_SUBNET,
   DROP_NET_GATEWAY,
   HOST_ALIAS,
+  healthCheckTest,
   selectBaseImage,
   selectImageUser,
 } from './container-config';
@@ -326,10 +327,7 @@ export class ContainerManager implements AppRuntime {
     // Docker HEALTHCHECK — only injected when the app declares a health path.
     const healthcheck = spec.healthCheckPath
       ? {
-          Test: [
-            'CMD-SHELL',
-            `curl -sf http://localhost:${hostPort}${spec.healthCheckPath} || exit 1`,
-          ],
+          Test: healthCheckTest(hostPort, spec.healthCheckPath),
           Interval: 30_000_000_000, // 30s in nanoseconds
           Timeout:  10_000_000_000, // 10s
           Retries:  3,
