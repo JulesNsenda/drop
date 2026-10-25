@@ -169,9 +169,11 @@ describe('healthCheckTest', () => {
     expect(test[5]).toBe('http://localhost:3004/x"; rm -rf / #');
   });
 
-  it('falls back from curl to wget to node, so images without curl still probe', () => {
+  it('falls back from curl to wget to node to python, so images without curl still probe', () => {
     const script = healthCheckTest(80, '/').at(3)!;
     expect(script.indexOf('curl')).toBeLessThan(script.indexOf('wget'));
-    expect(script.indexOf('wget')).toBeLessThan(script.indexOf('node -e'));
+    expect(script.indexOf('wget')).toBeLessThan(script.indexOf('node --max-old-space-size'));
+    expect(script.indexOf('node --max-old-space-size')).toBeLessThan(script.indexOf('python3'));
+    expect(script.trimEnd().endsWith('|| exit 1')).toBe(true);
   });
 });
