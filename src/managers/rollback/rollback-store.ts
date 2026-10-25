@@ -53,7 +53,7 @@ import { measureTree, configuredCeilingBytes, MB } from '../guardrail/disk-ceili
 import { getStateManager } from '../app/state-manager';
 import { getAppConfigService } from '../app/app-config';
 import { ReleaseStore } from '../release/release-store';
-import { backfillToolchainMarker } from '../../core/builder/toolchain';
+import { backfillToolchainMarker, checkTree } from '../../core/builder/toolchain';
 
 export interface RollbackSnapshotMeta {
   appName: string;
@@ -143,6 +143,14 @@ export class RollbackStore {
     return this.withLock(appName, async () => {
       if (!(await this.get(appName))) return false;
       return backfillToolchainMarker(this.treeDir(appName), id);
+    });
+  }
+
+  /** Whether the snapshot's node_modules were built for another toolchain (the start guard's check). */
+  snapshotIsStale(appName: string, id: string): Promise<boolean> {
+    return this.withLock(appName, async () => {
+      if (!(await this.get(appName))) return false;
+      return (await checkTree(this.treeDir(appName), id)) === 'stale';
     });
   }
 

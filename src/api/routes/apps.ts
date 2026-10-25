@@ -22,6 +22,7 @@ import {
   AppNeedsConfigError,
   needsConfigAction,
   needsConfigDetail,
+  StaleDependenciesError,
   type AttachableServiceId,
 } from '../platform-ops';
 import { getSecretManager } from '../../managers/secret';
@@ -988,7 +989,7 @@ apps.post('/:name/start', async c => {
     });
     return c.json(success({ message: `Application '${name}' started`, status }));
   } catch (err) {
-    if (err instanceof AppInProgressError) {
+    if (err instanceof AppInProgressError || err instanceof StaleDependenciesError) {
       return c.json(error(ErrorCodes.CONFLICT, err.message), 409);
     }
     if (err instanceof AppNeedsConfigError) {
@@ -1089,6 +1090,9 @@ apps.post('/:name/promote', async c => {
     });
     return c.json(success({ app: name, promoted: true }));
   } catch (err) {
+    if (err instanceof StaleDependenciesError) {
+      return c.json(error(ErrorCodes.CONFLICT, err.message), 409);
+    }
     const message = err instanceof Error ? err.message : 'Promote failed';
     if (message.includes('awaiting promotion')) {
       return c.json(error(ErrorCodes.BAD_REQUEST, message), 400);
@@ -1120,7 +1124,7 @@ apps.post('/:name/restart', async c => {
     });
     return c.json(success({ message: `Application '${name}' restarted`, status }));
   } catch (err) {
-    if (err instanceof AppInProgressError) {
+    if (err instanceof AppInProgressError || err instanceof StaleDependenciesError) {
       return c.json(error(ErrorCodes.CONFLICT, err.message), 409);
     }
     if (err instanceof AppNeedsConfigError) {
@@ -1204,7 +1208,7 @@ apps.post('/:name/rollback', async c => {
         409
       );
     }
-    if (err instanceof AppInProgressError) {
+    if (err instanceof AppInProgressError || err instanceof StaleDependenciesError) {
       return c.json(error(ErrorCodes.CONFLICT, err.message), 409);
     }
     if (err instanceof AppNeedsConfigError) {
@@ -1278,7 +1282,7 @@ apps.post('/:name/services/:id', async c => {
       success({ message: `${serviceId} attached to '${name}'`, envVarNames: result.envVarNames })
     );
   } catch (err) {
-    if (err instanceof AppInProgressError) {
+    if (err instanceof AppInProgressError || err instanceof StaleDependenciesError) {
       return c.json(error(ErrorCodes.CONFLICT, err.message), 409);
     }
     // The restart at the end of an attach runs the secret preflight, so this
@@ -1761,7 +1765,7 @@ apps.put('/:name/capabilities', async c => {
   try {
     await ops.restartApp(name);
   } catch (err) {
-    if (err instanceof AppInProgressError) {
+    if (err instanceof AppInProgressError || err instanceof StaleDependenciesError) {
       return c.json(error(ErrorCodes.CONFLICT, err.message), 409);
     }
     if (err instanceof AppNeedsConfigError) {

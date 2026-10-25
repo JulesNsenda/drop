@@ -48,6 +48,27 @@ export class AppInProgressError extends Error {
 }
 
 /**
+ * Thrown before a start, restart, rollback, promotion or attach that would run
+ * a node_modules tree built for a different Node runtime. Those entry points
+ * throw it before touching anything; the start-spec backstop beneath them can
+ * throw it after its caller's own side effects (see assertDependenciesCurrent).
+ * An explicit redeploy rebuilds the tree, a stopped app included. The message
+ * names no path, marker or Node version: it reaches tenants through the API
+ * and MCP.
+ */
+export class StaleDependenciesError extends Error {
+  readonly code = 'STALE_DEPENDENCIES';
+
+  constructor(appName: string) {
+    super(
+      `Application '${appName}' was not started: this version's dependencies were built for a ` +
+        'different Node runtime. Redeploy the app to rebuild them.'
+    );
+    this.name = 'StaleDependenciesError';
+  }
+}
+
+/**
  * Thrown by the start path (PRD-051) when an app declares required secrets in
  * its drop.yaml that are neither already set nor auto-generatable. The platform
  * catches it and parks the app in the `needs-config` state instead of starting

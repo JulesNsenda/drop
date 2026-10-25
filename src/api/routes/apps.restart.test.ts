@@ -16,7 +16,7 @@ import { ApiServer } from '../server';
 import { createUser, resetAuth } from '../middleware/auth';
 import { getTestToken } from '../__testutils__/auth';
 import { getStateManager, resetStateManager } from '../../managers/app/state-manager';
-import { setPlatformOps, resetPlatformOps, AppInProgressError, AppNeedsConfigError, PlatformOps } from '../platform-ops';
+import { setPlatformOps, resetPlatformOps, AppInProgressError, AppNeedsConfigError, StaleDependenciesError, PlatformOps } from '../platform-ops';
 import { makePlatformOpsStub } from '../__testutils__/platform-ops';
 import * as activity from '../../managers/activity';
 import type { AppProcessInfo } from '../../managers/runtime';
@@ -138,6 +138,28 @@ describe('POST /apps/:name/start and /apps/:name/restart (platform ops)', () => 
       expect(res.status).toBe(409);
       const body = (await res.json()) as { error: { code: string } };
       expect(body.error.code).toBe(ErrorCodes.CONFLICT);
+    });
+  });
+
+  describe('stale dependencies (StaleDependenciesError)', () => {
+    const stale = (): jest.Mock => jest.fn().mockRejectedValue(new StaleDependenciesError('test-app'));
+
+    it.each([
+      ['start', { restartApp: stale() }],
+      ['restart', { restartApp: stale() }],
+      ['rollback', { rollbackApp: stale() }],
+      ['promote', { promoteApp: stale() }],
+    ] as const)('409s on %s with the guard message', async (route, overrides) => {
+      setPlatformOps(makeOps(overrides as Partial<PlatformOps>));
+
+      const res = await hono.request(`/api/v1/apps/test-app/${route}`, {
+        method: 'POST',
+        headers: authHeader(ownerToken),
+      });
+      expect(res.status).toBe(409);
+      const body = (await res.json()) as { error: { code: string; message: string } };
+      expect(body.error.code).toBe(ErrorCodes.CONFLICT);
+      expect(body.error.message).toBe(new StaleDependenciesError('test-app').message);
     });
   });
 

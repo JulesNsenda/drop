@@ -32,7 +32,7 @@ import { isValidAppName } from '../middleware/validate';
 import { getStateManager } from '../../managers/app/state-manager';
 import { getAppConfigService } from '../../managers/app/app-config';
 import { getAppRuntime } from '../../managers/runtime';
-import { getPlatformOps, AppInProgressError } from '../platform-ops';
+import { getPlatformOps, AppInProgressError, StaleDependenciesError } from '../platform-ops';
 import {
   getUploadDeployService,
   ArchiveRejectedError,
@@ -1082,7 +1082,7 @@ export async function handleRollbackApp(
         `${err.message} A snapshot is taken only when deploy_files or a git redeploy replaces a running app.`
       );
     }
-    if (err instanceof AppInProgressError) {
+    if (err instanceof AppInProgressError || err instanceof StaleDependenciesError) {
       return toolError(err.message);
     }
     return toolError(
@@ -1112,7 +1112,7 @@ export async function handleRestartApp(
     await auditToolAction(auth, 'restart', args.name, 'restart_app');
     return toolText(`Application '${args.name}' restarted.`);
   } catch (err) {
-    if (err instanceof AppInProgressError) {
+    if (err instanceof AppInProgressError || err instanceof StaleDependenciesError) {
       return toolError(err.message);
     }
     return toolError(

@@ -128,6 +128,7 @@ import {
   AppManifestInvalidError,
   AppNeedsConfigError,
   needsConfigAction,
+  StaleDependenciesError,
   setPlatformOps,
   resetPlatformOps,
   type AttachableServiceId,
@@ -6068,12 +6069,50 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
    * through the no-follow reader, so a live tenant cannot redirect it.
    */
   private async servingTreeIsStale(config: AppConfig): Promise<boolean> {
+    return this.treeIsStale(this.servingPathOf(config.name, config), this.appTypeOf(config.name, config));
+  }
+
+  /** servingTreeIsStale for any tree the app could run from. */
+  private async treeIsStale(treePath: string, type: AppType): Promise<boolean> {
+    const id = await this.staleCheckToolchainId(type);
+    return id !== null && (await checkTree(treePath, id)) === 'stale';
+  }
+
+  /** The id a tree is checked against, or null when nothing can be stale (see servingTreeIsStale). */
+  private async staleCheckToolchainId(type: AppType): Promise<string | null> {
+    if (!this.toolchainBackfilled || !NODE_RUNTIME_TYPES.includes(type)) return null;
+    return this.toolchainIdForBuild(type);
+  }
+
+  private appTypeOf(appName: string, config?: AppConfig | null): AppType {
+    return (this.stateManager?.getApp(appName)?.type ?? config?.type ?? 'unknown') as AppType;
+  }
+
+  /**
+   * The start guard: refuse to run a tree built for another Node runtime. The
+   * pre-checks run before their path's first side effect, so their refusal
+   * leaves the app as it was. buildStartSpec runs it too, as the backstop for
+   * start paths with no pre-check; that one runs after its caller's side
+   * effects. Only `stale` is refused: a tree a build never stamps (a custom
+   * install) reads `unmarked` and starts.
+   *
+   * The type defaults to the one the start will detect in `treePath`, the
+   * backstop's own input, so a tree whose type differs from the recorded one
+   * (an older release or snapshot) is judged the same way by both.
+   */
+  private async assertDependenciesCurrent(appName: string, treePath: string, type?: AppType): Promise<void> {
+    if (await this.dependenciesAreStale(appName, treePath, type)) throw new StaleDependenciesError(appName);
+  }
+
+  private async dependenciesAreStale(appName: string, treePath: string, type?: AppType): Promise<boolean> {
     if (!this.toolchainBackfilled) return false;
-    const type = (this.stateManager?.getApp(config.name)?.type ?? config.type ?? 'unknown') as AppType;
-    if (!NODE_RUNTIME_TYPES.includes(type)) return false;
-    const id = await this.toolchainIdForBuild(type);
-    if (!id) return false;
-    return (await checkTree(this.servingPathOf(config.name, config), id)) === 'stale';
+    return this.treeIsStale(treePath, type ?? (await this.startTypeOf(appName, treePath)));
+  }
+
+  /** The type a start of `treePath` will detect; the recorded type when detection fails. */
+  private async startTypeOf(appName: string, treePath: string): Promise<AppType> {
+    const detection = await this.detector?.detect(treePath, { silent: true }).catch(() => null);
+    return (detection?.type ?? this.appTypeOf(appName)) as AppType;
   }
 
   /**
@@ -6253,7 +6292,18 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     // (detectedSub, buildSub); without it, any edit or touch to a stopped
     // app's files (git pull, editor autosave) silently rebuilds and restarts
     // it against the user's explicit `drop stop`.
-    if (appState.status === 'stopped') {
+    //
+    // Except an explicit redeploy of a tree built for another Node runtime:
+    // the start guard refuses to start it and tells the user to redeploy, and
+    // this is the only path that rebuilds it.
+    const rebuildsStaleTree =
+      appState.status === 'stopped' &&
+      bypassCooldown === true &&
+      (await this.dependenciesAreStale(appName, this.servingPathOf(appName, undefined, appState)));
+    if (rebuildsStaleTree) {
+      this.logger.info(`Redeploying stopped ${appName} to rebuild dependencies for the current Node runtime`, 'UPDATE');
+    }
+    if (appState.status === 'stopped' && !rebuildsStaleTree) {
       if (bypassCooldown) {
         this.logger.info(`Dropped redeploy for ${appName} - app was stopped by user`, 'UPDATE');
       } else {
@@ -7159,6 +7209,12 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       const release = await this.rollbackRelease(appName);
       if (release) return await this.rollbackToRelease(appName, release);
 
+      // Before restoreInto, which empties the app directory.
+      const toolchainId = await this.staleCheckToolchainId(this.appTypeOf(appName, config));
+      if (toolchainId && (await store.snapshotIsStale(appName, toolchainId))) {
+        throw new StaleDependenciesError(appName);
+      }
+
       const appPath = this.servingPathOf(appName, config, state);
       const meta = await store.restoreInto(appName, appPath);
       this.appDeployTimes.set(appName, Date.now());
@@ -7218,6 +7274,8 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     if (!this.runtime || !this.detector || !this.appConfigService) {
       throw new Error('Platform is not fully initialized');
     }
+    // Before either branch: the one that cannot cut over rotates the releases first.
+    await this.assertDependenciesCurrent(appName, release.path);
     const meta = await this.releaseRollbackMeta(appName, release);
 
     const oldPort = await this.cutoverEligibility(appName, release.path);
@@ -7288,6 +7346,9 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         );
       }
     }
+
+    // Before the delete below: a refused restart leaves a running app running.
+    await this.assertDependenciesCurrent(appName, appPath);
 
     try {
       this.stopHealthProber(appName);
@@ -7499,6 +7560,16 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           reason: 'ephemeral',
           detail:
             'This app is ephemeral and will be torn down on its TTL without a database backup — attach is refused to avoid unrecoverable data loss.',
+        });
+      }
+
+      // Before provisioning: the attach ends in a restart, which would refuse
+      // only after a database was created against the owner's quota.
+      if (await this.dependenciesAreStale(appName, this.servingPathOf(appName, config, state))) {
+        return this.refuse('attach', appName, serviceId, {
+          attached: false,
+          reason: 'stale-dependencies',
+          detail: new StaleDependenciesError(appName).message,
         });
       }
 
@@ -8097,7 +8168,10 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
    * DATABASE_URL/REDIS_URL would keep being injected under isolation:none).
    * `doRestart` itself already parks the app in 'needs-config' or 'errored'
    * on failure — this only translates that outcome into the detach result
-   * shape, it does not duplicate the state write.
+   * shape, it does not duplicate the state write. The one exception is the
+   * start guard (StaleDependenciesError), which refuses before doRestart
+   * touches anything: the app stays 'stopped', as step 9 left it, and an
+   * explicit redeploy rebuilds and starts it.
    */
   private async restartAfterDetach(
     appName: string,
@@ -8934,6 +9008,12 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       throw new Error(`No build is awaiting promotion for '${appName}'`);
     }
 
+    // Before the held build is cleared below: a refusal keeps it held.
+    const heldPath = this.releaseStore?.isReleasePathOf(appName, pending.releasePath)
+      ? pending.releasePath
+      : this.servingPathOf(appName, config, this.stateManager?.getApp(appName));
+    await this.assertDependenciesCurrent(appName, heldPath);
+
     await this.appConfigService?.updateConfig(appName, { pendingPromotion: undefined });
     await this.stateManager?.updateApp(appName, { awaitingPromotion: false });
 
@@ -9275,6 +9355,8 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     if (this.config.strictManifest && dropYamlCfg.exists && !dropYamlCfg.success) {
       throw new AppManifestInvalidError(appName, dropYamlCfg.error ?? 'unknown parse error');
     }
+
+    await this.assertDependenciesCurrent(appName, appPath, detection.type);
 
     const startOverride = dropYamlCfg.success ? dropYamlCfg.config?.start : undefined;
 
