@@ -3068,8 +3068,15 @@ backup:
       }
 
       if (payload.success === false) {
-        // Failed build — handleBuildApp already marked it errored and cleaned up.
-        this.appsInProgress.delete(payload.appId);
+        // Failed build. Deliberately does NOT release appsInProgress: this runs
+        // synchronously inside builder.build()'s publish, BEFORE handleBuildApp
+        // has marked the app errored, discarded its target and recorded the
+        // outcome. Releasing here let a watcher or explicit update be admitted
+        // mid-cleanup and have its keys, marker, target and status clobbered by
+        // that tail. handleBuildApp releases the guard itself on every failure
+        // path (failed result, MAX_BUILDS re-queue, throw), and handleAppUpdate's
+        // builds never get here (selfManagedUpdates above). Those are the only
+        // two callers of builder.build().
         return;
       }
 
@@ -6798,14 +6805,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     // An explicit redeploy that's dropped here is logged at info - the API/
     // webhook caller has already reported success, so a silent debug-level
     // drop would hide the fact that nothing actually happened.
-    if (this.appsInProgress.has(appName)) {
-      if (bypassCooldown) {
-        this.logger.info(`Dropped redeploy for ${appName} - already in progress`, 'UPDATE');
-      } else {
-        this.logger.debug(`Skipping update for ${appName} - already in progress`, 'UPDATE');
-      }
-      return false;
-    }
+    if (this.inProgressSkip(appName, bypassCooldown)) return false;
 
     // A monorepo container (root drop.yaml has `services:`) is a group descriptor, never a buildable
     // app — the app:detected interception (see the detectedSub handler above) expands it into child
@@ -6829,6 +6829,28 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         // build per service. Whether an app takes this branch is decided by the
         // caller's own drop.yaml (`services:`), so leaving it ungated let any
         // caller opt into an unmetered build loop.
+        //
+        // Re-checked HERE, synchronously, because parseDropYaml above awaited:
+        // two explicit updates can both pass the early in-progress skip and then
+        // both reach this add. Nothing may await between this check and the add.
+        // The other two early skips are stale for the same reason: a backup
+        // quiesce, a git pull or an upload can begin during that await, and
+        // nothing has been reserved yet.
+        if (this.inProgressSkip(appName, bypassCooldown)) return false;
+        if (this.isQuiesced()) {
+          this.logger.info(
+            `Deferring update for ${appName} — deploys are quiesced for a backup`,
+            'BACKUP'
+          );
+          return false;
+        }
+        if (this.gitDeployService?.isCloning(appName) || this.uploadDeployService?.isUploading(appName)) {
+          this.logger.info(
+            `Dropped redeploy for ${appName} - a git pull/upload began while reading its drop.yaml`,
+            'UPDATE'
+          );
+          return false;
+        }
         const containerKeys = this.guardrailKeys(appName, false, actor ?? {});
         const containerVerdict = this.checkGuardrails(containerKeys);
         if (!containerVerdict.allowed) {
@@ -6954,6 +6976,13 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     // `reason`/`wasRunning` reads: each of those returns without deploying, and
     // an update that never deploys must neither be refused nor leave a key in
     // breakerKeys for some later episode's outcome to be recorded against.
+    //
+    // The in-progress skip at the top of this method is stale by now: the
+    // drop.yaml read and the stale-tree check awaited. Re-checked here, in the
+    // same synchronous turn as the add below, so two concurrent updates of one
+    // app cannot both be admitted. It sits above the guardrail check so a
+    // skipped update neither consults nor reserves a key.
+    if (this.inProgressSkip(appName, bypassCooldown)) return false;
     const guardKeys = this.guardrailKeys(appName, false, actor ?? {});
     const verdict = this.checkGuardrails(guardKeys);
     if (!verdict.allowed) {
@@ -7047,6 +7076,14 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       return false;
     }
 
+    // Same mint-and-thread as handleBuildApp. This path must NOT be skipped:
+    // upload-deploy routes every EXISTING app here, so it is the dominant
+    // path for an agent redeploying, and threading only the fresh-deploy path
+    // would leave exactly those builds unaddressable.
+    // Minted ahead of the try so the catch can close an episode under it.
+    const updateDeployId = crypto.randomUUID();
+    // Whether builder.build() was entered; see the catch (mirrors handleBuildApp).
+    let builderEntered = false;
     try {
       // M5.1 deploy transaction: keep old version serving while the new build
       // runs. Only stop the old process after a successful build — on failure,
@@ -7073,11 +7110,6 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       }
 
       const workDir = await this.getBuildWorkDir(appName);
-      // Same mint-and-thread as handleBuildApp. This path must NOT be skipped:
-      // upload-deploy routes every EXISTING app here, so it is the dominant
-      // path for an agent redeploying, and threading only the fresh-deploy path
-      // would leave exactly those builds unaddressable.
-      const updateDeployId = crypto.randomUUID();
       const updateLogId = this.buildLogService
         ? await this.buildLogService.startBuild(appName, new Date(), updateDeployId)
         : null;
@@ -7101,6 +7133,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           detection.type,
           appName
         );
+        builderEntered = true;
         buildResult = await this.builder.build({
           appName,
           appPath: buildPath,
@@ -7278,10 +7311,37 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       await this.stateManager.setAppStatus(appName, 'errored', {
         error: error instanceof Error ? error.message : 'Hot-reload failed',
       });
+      // A throw BEFORE builder.build() (detect, prepareDeployTarget,
+      // resolveBuildEnv, buildToolchainFor, a malformed drop.yaml) never opened
+      // a deploy episode, so the setAppStatus above had nothing to close.
+      // Mirrors handleBuildApp. Also records the breaker failure.
+      if (!builderEntered) {
+        this.failDeployEpisode(
+          appName,
+          error instanceof Error ? error : new Error('Hot-reload failed'),
+          updateDeployId
+        );
+      }
       this.recordDeployOutcome(appName, false);
       this.appsInProgress.delete(appName);
       return false;
     }
+  }
+
+  /**
+   * The ONE in-progress admission predicate for handleAppUpdate: true when the
+   * app already has an update or deploy in flight, having logged the skip.
+   * Synchronous on purpose — callers rely on nothing being awaited between this
+   * check and their own appsInProgress.add.
+   */
+  private inProgressSkip(appName: string, bypassCooldown?: boolean): boolean {
+    if (!this.appsInProgress.has(appName)) return false;
+    if (bypassCooldown) {
+      this.logger.info(`Dropped redeploy for ${appName} - already in progress`, 'UPDATE');
+    } else {
+      this.logger.debug(`Skipping update for ${appName} - already in progress`, 'UPDATE');
+    }
+    return true;
   }
 
   /**
