@@ -41,6 +41,8 @@ Full documentation lives at **[dropkit.sh/docs](https://dropkit.sh/docs)**, and 
 
 Also in this repo: [HTTPS setup](docs/HTTPS-SETUP.md), [git redeploy and custom domains](docs/GIT-REDEPLOY-AND-CUSTOM-DOMAINS.md), [agent deploys](docs/AGENT-DEPLOY.md).
 
+Agents can deploy to DROP unaided with the [deploy-to-drop skill](skills/deploy-to-drop/SKILL.md) (Claude Code, Cursor and any SKILL.md-compatible agent).
+
 ## Requirements
 
 **Release install (recommended, Linux):** a fresh Debian/Ubuntu box with root access. `install.sh` provisions Node.js, PostgreSQL, Caddy, and (if you choose `--isolation=docker`) Docker Engine for you — no toolchain to install yourself.
