@@ -27,6 +27,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- Hostnames under the platform's own public host can no longer be claimed as an app's custom domain.
+
 ## [1.7.1] - 2026-10-26
 
 A security release. Ownership of apps and monorepo groups is enforced more strictly; read the Upgrading notes before taking it if other accounts deploy to your server.

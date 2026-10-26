@@ -8,7 +8,12 @@
  * victims following an ordinary flow.
  */
 
-import { isReservedHost, reservedHosts } from './reserved-hosts';
+import {
+  isReservedHost,
+  platformHostProblem,
+  platformHostWarning,
+  reservedHosts,
+} from './reserved-hosts';
 
 const PUBLIC = 'https://dropkit.sh';
 const SUFFIX = 'dropkit.sh';
@@ -63,5 +68,79 @@ describe('isReservedHost', () => {
   it('ignores an unparseable candidate rather than throwing', () => {
     expect(isReservedHost('a b', PUBLIC, SUFFIX)).toBe(false);
     expect(isReservedHost('', PUBLIC, SUFFIX)).toBe(false);
+  });
+});
+
+describe('platformHostProblem', () => {
+  const split = { publicUrl: 'https://dashboard.dropkit.sh', domainSuffix: 'dropkit.sh' };
+  const UNDER = "under the platform's own host";
+
+  it('refuses the exact reserved hosts', () => {
+    expect(platformHostProblem('dashboard.dropkit.sh', split)).toBe('reserved by the platform');
+    expect(platformHostProblem('dropkit.sh', split)).toBe('reserved by the platform');
+  });
+
+  it('refuses anything under the public host', () => {
+    expect(platformHostProblem('x.dashboard.dropkit.sh', split)).toBe(UNDER);
+    expect(platformHostProblem('a.b.dashboard.dropkit.sh', split)).toBe(UNDER);
+  });
+
+  it('normalises case and a trailing dot, in candidate and configuration alike', () => {
+    expect(platformHostProblem('X.Dashboard.DropKit.sh', split)).toBe(UNDER);
+    expect(platformHostProblem('x.dashboard.dropkit.sh.', split)).toBe(UNDER);
+    expect(platformHostProblem('x.dashboard.dropkit.sh', { publicUrl: 'https://Dashboard.DropKit.sh.' })).toBe(UNDER);
+    expect(platformHostProblem('dashboard.dropkit.sh.', split)).toBe('reserved by the platform');
+    expect(isReservedHost('dropkit.sh.', 'https://dropkit.sh', undefined)).toBe(true);
+  });
+
+  it('leaves app hostnames, siblings and lookalikes alone', () => {
+    expect(platformHostProblem('myapp.dropkit.sh', split)).toBeUndefined();
+    expect(platformHostProblem('xdashboard.dropkit.sh', split)).toBeUndefined();
+    expect(platformHostProblem('dashboard.dropkit.sh.evil.com', split)).toBeUndefined();
+    expect(platformHostProblem('example.com', split)).toBeUndefined();
+  });
+
+  it('is a no-op for the subtree rule when the public URL is unset or localhost', () => {
+    expect(platformHostProblem('x.dashboard.dropkit.sh', { domainSuffix: 'dropkit.sh' })).toBeUndefined();
+    expect(platformHostProblem('x.localhost', { publicUrl: 'http://localhost:3000' })).toBeUndefined();
+  });
+
+  it('fails closed on an unparseable name when a platform host is configured', () => {
+    expect(platformHostProblem('a b', split)).toBe('not a valid hostname');
+    expect(platformHostProblem('', split)).toBe('not a valid hostname');
+    expect(platformHostProblem('a b', {})).toBeUndefined();
+  });
+
+  it('handles wildcards: under, equal, and covering the public host', () => {
+    expect(platformHostProblem('*.dashboard.dropkit.sh', split)).toBe('reserved by the platform');
+    expect(platformHostProblem('*.x.dashboard.dropkit.sh', split)).toBe(UNDER);
+    expect(platformHostProblem('*.example.com', split)).toBeUndefined();
+    // Covers the public host: `*.<parent>` where the public host is `<label>.<parent>`.
+    const outside = { publicUrl: 'https://dashboard.platform.example', domainSuffix: 'dropkit.sh' };
+    expect(platformHostProblem('*.platform.example', outside)).toBe(UNDER);
+    expect(platformHostProblem('*.other.example', outside)).toBeUndefined();
+    // A wildcard over the suffix would cover every app and the platform.
+    expect(platformHostProblem('*.dropkit.sh', split)).toBe('reserved by the platform');
+  });
+
+  describe('when the suffix equals the public host or is under it', () => {
+    it('switches the subtree rule off but keeps the exact rule', () => {
+      const same = { publicUrl: 'https://drop.example.com', domainSuffix: 'drop.example.com' };
+      expect(platformHostProblem('extra.drop.example.com', same)).toBeUndefined();
+      expect(platformHostProblem('myapp.drop.example.com', same)).toBeUndefined();
+      expect(platformHostProblem('drop.example.com', same)).toBe('reserved by the platform');
+      const below = { publicUrl: 'https://drop.example.com', domainSuffix: 'apps.drop.example.com' };
+      expect(platformHostProblem('x.drop.example.com', below)).toBeUndefined();
+    });
+  });
+});
+
+describe('platformHostWarning', () => {
+  it('warns only when the subtree rule is off', () => {
+    expect(platformHostWarning('https://drop.example.com', 'drop.example.com')).toMatch(/same-site/);
+    expect(platformHostWarning('https://drop.example.com', 'apps.drop.example.com')).toMatch(/same-site/);
+    expect(platformHostWarning('https://dashboard.dropkit.sh', 'dropkit.sh')).toBeUndefined();
+    expect(platformHostWarning(undefined, 'dropkit.sh')).toBeUndefined();
+    expect(platformHostWarning('https://drop.example.com', 'localhost')).toBeUndefined();
   });
 });

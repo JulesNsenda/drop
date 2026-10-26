@@ -20,6 +20,7 @@ import { getPublicUrl, setPublicUrl, isAccessGateEnabled, getIsolationMode } fro
 import { getMailCredentialStore, clearMailCredential } from '../../managers/mailer/mail-credential';
 import { sendMeteredMail } from './mail-quota';
 import { getPlatformOps } from '../platform-ops';
+import { getAppConfigServiceOrNull } from '../../managers/app/app-config';
 import {
   getObjectStorageProvisioner,
   getStorageCredentialStore,
@@ -386,6 +387,27 @@ admin.get('/settings', async (c) => {
   );
 });
 
+/**
+ * A new public URL changes which tenant hostnames are refused (names under the
+ * platform's own host), and routes are otherwise only written on deploy. Re-emit
+ * every app that carries drop.yaml `domains` or a verified custom domain so
+ * newly covered names stop being served now. Best-effort per app: a deploy in
+ * flight writes its own route.
+ */
+async function reemitHostRoutes(): Promise<void> {
+  const ops = getPlatformOps();
+  const configs = getAppConfigServiceOrNull();
+  if (!ops || !configs) return;
+  for (const config of configs.getAllConfigs()) {
+    if (!config.domains?.length && !config.customDomainVerified) continue;
+    try {
+      await ops.reconfigureRoute(config.name);
+    } catch {
+      // In flight (AppInProgressError) or unroutable; the next deploy re-checks.
+    }
+  }
+}
+
 // PUT /admin/settings/public-url - Set or clear the admin override for
 // DROP_PUBLIC_URL (the OAuth issuer/resource base). Security-adjacent:
 // validated HTTPS-only (except localhost) via normalizePublicUrl, and a
@@ -413,6 +435,7 @@ admin.put('/settings/public-url', async (c) => {
 
   await getSettingsManager().setPublicUrl(result.value);
   setPublicUrl(result.value);
+  await reemitHostRoutes();
 
   return c.json(success({ publicUrl: result.value, source: 'stored' as const, storedPublicUrl: result.value }));
 });

@@ -23,8 +23,9 @@
 
 import { getAppConfigService } from '../managers/app/app-config';
 import type { AppState } from '../managers/app/state-manager';
-import { isHttpsEnabled, getDomainSuffix } from '../api/runtime-config';
+import { isHttpsEnabled, getDomainSuffix, getPublicUrl } from '../api/runtime-config';
 import { isLocalhostDomain } from './domain-validator';
+import { platformHostProblem } from './reserved-hosts';
 
 export interface ComputeAppUrlOptions {
   /**
@@ -68,8 +69,14 @@ export function computeAppUrl(app: AppState, options?: ComputeAppUrlOptions): st
   if (publicUrl && !app.customDomain && !configDomains?.length) {
     return forceHttps ? publicUrl.replace(/^http:\/\//, 'https://') : publicUrl;
   }
-  const domain = app.customDomain || configDomains?.[0] || `${app.name}.${getDomainSuffix()}`;
-  if (isLocalhostDomain(domain)) return undefined;
+  // A candidate the router would refuse (the platform's own host, or a name
+  // under it) is not where the app is served; skip it rather than link to it.
+  const suffix = getDomainSuffix();
+  const hostPublicUrl = getPublicUrl();
+  const domain = [app.customDomain, ...(configDomains ?? []), `${app.name}.${suffix}`].find(
+    (d): d is string => !!d && !platformHostProblem(d, { publicUrl: hostPublicUrl, domainSuffix: suffix })
+  );
+  if (!domain || isLocalhostDomain(domain)) return undefined;
   const proto = forceHttps || (isHttpsEnabled() && !tlsDisabled) ? 'https' : 'http';
   return `${proto}://${domain}`;
 }

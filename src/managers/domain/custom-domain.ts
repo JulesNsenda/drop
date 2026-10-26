@@ -23,7 +23,7 @@
 
 import { Resolver } from 'dns/promises';
 import * as dns from 'dns/promises';
-import { isReservedHost } from '../../utils/reserved-hosts';
+import { isReservedHost, platformHostProblem } from '../../utils/reserved-hosts';
 
 /** Same format rule both existing writers applied. */
 export const CUSTOM_DOMAIN_RE = /^[a-zA-Z0-9][a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/;
@@ -47,7 +47,8 @@ export function customDomainProblem(
     return `Names under ${suffix} belong to the platform; every app already has its own ` +
       `<app>.${suffix} hostname. Use a domain you control.`;
   }
-  return undefined;
+  const problem = platformHostProblem(domain, opts);
+  return problem ? `That domain is ${problem}` : undefined;
 }
 
 /** A DNS record the domain's owner should create. */
