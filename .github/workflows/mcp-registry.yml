@@ -1,0 +1,124 @@
+name: MCP Registry
+
+# Points the MCP Registry listing (io.github.JulesNsenda/drop, from
+# server.json) at each new full release, so the listing always names the
+# latest one.
+#
+# A separate workflow on purpose, not a job in release.yml: this runs a
+# third-party binary with `id-token: write`, and a Fulcio certificate minted
+# here would otherwise carry the same signer identity
+# (release.yml@refs/tags/vX) as the build provenance `publish` signs. In its
+# own file it cannot be mistaken for that.
+#
+# Triggered by the Release workflow finishing, not by `release: published`:
+# a release created with GITHUB_TOKEN does not fire that event. workflow_run
+# only runs from the default branch's copy of this file.
+#
+# Recovery: if the publish step fails (e.g. a registry outage), re-run THIS
+# workflow. Never "Re-run all jobs" on Release: that rebuilds and clobbers
+# the published tarball, whose .sha256 then stops matching what users have.
+on:
+  workflow_run:
+    workflows: [Release]
+    types: [completed]
+  # By hand, for a release published before this workflow existed or after a
+  # failed run: Actions > MCP Registry > Run workflow, with the tag.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to list (vX.Y.Z)
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    # Only a successful tag-push release of this repository. A fork with
+    # Actions enabled cannot publish under this namespace anyway (its OIDC
+    # identity maps to its own owner), but it should not even try.
+    if: >-
+      github.repository == 'JulesNsenda/drop' &&
+      (github.event_name == 'workflow_dispatch' ||
+       (github.event.workflow_run.conclusion == 'success' &&
+        github.event.workflow_run.event == 'push'))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # The registry trusts GitHub's OIDC identity for io.github.<owner>,
+      # so no secret is stored.
+      id-token: write
+    steps:
+      # The version comes from the tag, never from the committed file, and
+      # only a plain vX.Y.Z (a full release) is published: a prerelease or
+      # any other suffix leaves the listing alone.
+      - name: Resolve the release version
+        id: version
+        env:
+          TAG: ${{ github.event.workflow_run.head_branch || inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [[ "$TAG" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+            echo "version=${BASH_REMATCH[1]}" >> "$GITHUB_OUTPUT"
+          else
+            echo "'$TAG' is not a full release tag; the listing is left alone."
+            echo "version=" >> "$GITHUB_OUTPUT"
+          fi
+
+      # The registry refuses a version it already holds, so a re-run would
+      # otherwise end red. A tag on an older line (a patch to 1.6 after 1.7)
+      # must not move the listing backwards either.
+      - name: Decide whether the listing needs this version
+        id: decide
+        if: steps.version.outputs.version != ''
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          listed=$(curl -fsSL 'https://registry.modelcontextprotocol.io/v0/servers?search=io.github.JulesNsenda/drop' \
+            | jq -r '.servers[] | (.server // .) | select(.name == "io.github.JulesNsenda/drop") | .version')
+          if printf '%s\n' "$listed" | grep -qxF "$VERSION"; then
+            echo "$VERSION is already listed; nothing to do."
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          newest=$(printf '%s\n' "$listed" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)
+          if [ -n "$newest" ] && [ "$(printf '%s\n%s\n' "$newest" "$VERSION" | sort -V | tail -1)" != "$VERSION" ]; then
+            echo "$VERSION is older than the listed $newest; the listing stays on $newest."
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "publish=true" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: steps.decide.outputs.publish == 'true'
+        with:
+          # The released commit: the run's SHA, or the tag when dispatched.
+          ref: ${{ github.event.workflow_run.head_sha || inputs.tag }}
+          persist-credentials: false
+
+      # Pinned by version AND checksum. The checksum matches upstream's
+      # registry_1.8.1_checksums.txt; bump both together.
+      - name: Install mcp-publisher
+        if: steps.decide.outputs.publish == 'true'
+        env:
+          PUBLISHER_VERSION: 1.8.1
+          PUBLISHER_SHA256: a06c9096dcb9727c13555b6be26c7effa707b01f06a4c561ba7a3635443cf2cc
+        run: |
+          set -euo pipefail
+          curl -fsSL -o mcp-publisher.tar.gz \
+            "https://github.com/modelcontextprotocol/registry/releases/download/v${PUBLISHER_VERSION}/mcp-publisher_linux_amd64.tar.gz"
+          echo "${PUBLISHER_SHA256}  mcp-publisher.tar.gz" | sha256sum -c -
+          tar -xzf mcp-publisher.tar.gz mcp-publisher
+
+      - name: Publish to the MCP Registry
+        if: steps.decide.outputs.publish == 'true'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          jq --arg v "$VERSION" '.version = $v' server.json > server.json.new
+          mv server.json.new server.json
+          jq -r '"Publishing " + .name + " " + .version' server.json
+          ./mcp-publisher login github-oidc
+          ./mcp-publisher publish
