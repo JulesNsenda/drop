@@ -7,6 +7,9 @@ Cursor) can follow directly from a shell. DROP also exposes the same
 capabilities as a hosted MCP server (see "Hosted MCP" below, PRD-040) for
 clients that would rather make typed tool calls than shell out to `curl`.
 
+A ready-made agent skill that walks through this whole flow lives at
+[`skills/deploy-to-drop/SKILL.md`](../skills/deploy-to-drop/SKILL.md).
+
 ## Prerequisites
 
 - A DROP box with the API reachable (default port 3000, `https://<host>/api/v1`
