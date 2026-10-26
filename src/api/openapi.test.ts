@@ -142,7 +142,7 @@ describe('GET /api/v1/openapi.json (#297)', () => {
       // Method-scoped: the same /apps/* line gives GET readonly and DELETE user.
       ['GET', '/api/v1/apps/{name}', 'readonly'],
       ['DELETE', '/api/v1/apps/{name}', 'user'],
-      ['POST', '/api/v1/apps', 'user'],
+      ['POST', '/api/v1/apps', 'admin'],
       ['POST', '/api/v1/apps/{name}/source', 'user'],
       ['DELETE', '/api/v1/apps/{name}/share/guests/{guestId}', 'user'],
       ['GET', '/api/v1/certs/{domain}', 'readonly'],

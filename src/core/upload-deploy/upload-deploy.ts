@@ -19,9 +19,13 @@ import {
   UploadDeployRequest,
   UploadDeployResult,
   UploadValidationError,
+  UploadNotFoundError,
+  UploadConflictError,
   InsufficientDiskSpaceError,
 } from './upload-deploy.types';
 import { isValidAppName } from '../../api/middleware/validate';
+import { pathTaken } from '../../utils/paths';
+import { getGitDeployService } from '../git-deploy';
 import { getStateManager } from '../../managers/app/state-manager';
 import { getAppConfigService } from '../../managers/app/app-config';
 import { getLogger } from '../../utils/logger';
@@ -51,6 +55,15 @@ export interface UploadDeployServiceConfig {
   extractTimeoutMs: number;
 }
 
+/** Whether a git deploy is cloning into `appName` right now (no service yet: no). */
+function isGitCloning(appName: string): boolean {
+  try {
+    return getGitDeployService().isCloning(appName);
+  } catch {
+    return false;
+  }
+}
+
 export class UploadDeployService {
   private readonly config: UploadDeployServiceConfig;
   private activeUploads: Set<string> = new Set();
@@ -66,8 +79,16 @@ export class UploadDeployService {
 
   /** Deploy (or redeploy) an app from an already-staged tarball. */
   async deploy(request: UploadDeployRequest): Promise<UploadDeployResult> {
-    const { appName, archivePath, userId, principalId, agentCaller, ephemeral, ttlMinutes } =
-      request;
+    const {
+      appName,
+      archivePath,
+      userId,
+      callerIsAdmin,
+      principalId,
+      agentCaller,
+      ephemeral,
+      ttlMinutes,
+    } = request;
 
     if (!isValidAppName(appName)) {
       throw new UploadValidationError(`Invalid app name: ${appName}`);
@@ -92,9 +113,46 @@ export class UploadDeployService {
     // upload, and this method used to set it synchronously; awaiting first
     // would open a window where the deploy has begun and nothing says so.
     // Released again if admission refuses, since nothing was started.
+    //
+    // A second upload to a name already in flight is refused BEFORE it is marked:
+    // both would stage and land into the same folder, and the first to finish
+    // would clear the guard under the other. The check and the add have no await
+    // between them.
+    //
+    // A git deploy cloning into the same name holds the same reservation, from
+    // the other side (it checks `isUploading` symmetrically).
+    //
+    // Both refusals are answered as a foreign app when the caller is a non-admin
+    // who does not own it: a 409 would tell them someone else is deploying there.
+    const existingApp = getStateManager().getApp(appName);
+    const conflict = (message: string): Error =>
+      userId && !callerIsAdmin && existingApp?.userId !== userId
+        ? new UploadNotFoundError(appName)
+        : new UploadConflictError(message);
+    if (this.activeUploads.has(appName)) {
+      throw conflict(`An upload to '${appName}' is already in progress`);
+    }
+    if (isGitCloning(appName)) {
+      throw conflict(`A git deploy to '${appName}' is already in progress`);
+    }
     this.activeUploads.add(appName);
     try {
-      const existingApp = getStateManager().getApp(appName);
+      // Ownership and "name is free", ahead of admitDeploy and extraction so a
+      // refusal spends no quota and no work. The route preflight enforces the
+      // same; this is the backstop for a caller that bypasses it or races it.
+      // The role comes from the caller's credential (`callerIsAdmin`), not from
+      // `userId`, which for an ownerless admin key is the key id and resolves to
+      // no user. No userId means auth is off: there is no boundary to enforce.
+      if (userId && !callerIsAdmin) {
+        if (existingApp) {
+          // Same rule as canAccess. Answered as an unknown app is.
+          if (existingApp.userId !== userId) throw new UploadNotFoundError(appName);
+        } else if (await pathTaken(path.join(this.config.appsDirectory, appName))) {
+          // "Not in state" is not "free": a folder-dropped app never is in state,
+          // and registering over its folder would sync this caller's tree into it.
+          throw new UploadNotFoundError(appName);
+        }
+      }
       await admitDeploy(appName, !existingApp, { principalId, actorUserId: userId });
 
       // Ephemeral quota, checked here for the same reason the guardrail is:
@@ -148,8 +206,23 @@ export class UploadDeployService {
       }
 
       const stateManager = getStateManager();
-      const isNew = !stateManager.hasApp(appName);
       const destPath = path.join(this.config.appsDirectory, appName);
+
+      // Extraction takes time, and everything decided before it was decided on
+      // state that can have moved: someone registered this name meanwhile, or the
+      // app changed hands. Deciding `isNew` afresh would turn a refused create into
+      // an adoption, so a change of either is a conflict, not a new fact.
+      const current = stateManager.getApp(appName);
+      if (!!current !== !!existingApp || current?.userId !== existingApp?.userId) {
+        throw conflict(`'${appName}' changed while the upload was being processed`);
+      }
+      const isNew = !current;
+      // A non-admin create must not land over a folder that appeared meanwhile.
+      // Admins keep adopting a folder they dropped themselves.
+      const refuseExisting = isNew && !!userId && !callerIsAdmin;
+      if (refuseExisting && (await pathTaken(destPath))) {
+        throw new UploadNotFoundError(appName);
+      }
 
       // Register (+ userId) atomically before files land - same ordering as
       // git-deploy, so a crash between register and landing still leaves the
@@ -206,7 +279,7 @@ export class UploadDeployService {
         }
       }
 
-      await this.landFiles(stagingDir, destPath);
+      await this.landFiles(stagingDir, destPath, refuseExisting);
 
       const acceptedAt = new Date().toISOString();
 
@@ -270,8 +343,15 @@ export class UploadDeployService {
    * note on `DEFAULT_PRESERVE` for why that is required rather than an
    * oversight.
    */
-  private async landFiles(stagingDir: string, destPath: string): Promise<void> {
+  private async landFiles(
+    stagingDir: string,
+    destPath: string,
+    refuseExisting: boolean
+  ): Promise<void> {
     const destExists = fssync.existsSync(destPath);
+    // Last line of the "name is free" check: syncTree would merge into, and prune,
+    // whatever is there.
+    if (refuseExisting && destExists) throw new UploadNotFoundError(path.basename(destPath));
 
     if (!destExists) {
       try {

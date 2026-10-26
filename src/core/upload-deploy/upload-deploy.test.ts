@@ -9,7 +9,14 @@ import * as os from 'os';
 import { gzipSync } from 'zlib';
 import * as tar from 'tar';
 import { UploadDeployService, resetUploadDeployService } from './upload-deploy';
-import { UploadValidationError, InsufficientDiskSpaceError } from './upload-deploy.types';
+import {
+  UploadValidationError,
+  UploadNotFoundError,
+  UploadConflictError,
+  InsufficientDiskSpaceError,
+} from './upload-deploy.types';
+import * as gitDeployModule from '../git-deploy';
+import * as breakerModule from '../../managers/guardrail/deploy-breaker';
 import { ArchiveRejectedError } from './tar-extract';
 import { resetStateManager, getStateManager } from '../../managers/app/state-manager';
 import {
@@ -133,6 +140,174 @@ describe('UploadDeployService', () => {
       } finally {
         unsubscribe();
       }
+    });
+
+    describe('over a folder that already exists on disk (preflight bypassed or raced)', () => {
+      beforeEach(async () => {
+        await fs.mkdir(path.join(appsDir, 'dropped'), { recursive: true });
+        await fs.writeFile(path.join(appsDir, 'dropped', 'index.js'), 'operator');
+      });
+
+      it('refuses a non-admin, registers nothing, and leaves the folder unchanged', async () => {
+        const archivePath = await buildArchive('dropped', { 'index.js': 'tenant' });
+
+        await expect(
+          service.deploy({ appName: 'dropped', archivePath, userId: 'user-1' })
+        ).rejects.toBeInstanceOf(UploadNotFoundError);
+
+        expect(getStateManager().hasApp('dropped')).toBe(false);
+        expect(fssync.readFileSync(path.join(appsDir, 'dropped', 'index.js'), 'utf8')).toBe('operator');
+        expect(service.isUploading('dropped')).toBe(false);
+      });
+
+      it('treats a caller that does not say it is an admin as non-admin (fails closed)', async () => {
+        const archivePath = await buildArchive('dropped', { 'index.js': 'tenant' });
+
+        await expect(
+          service.deploy({ appName: 'dropped', archivePath, userId: 'ghost' })
+        ).rejects.toBeInstanceOf(UploadNotFoundError);
+        expect(fssync.readFileSync(path.join(appsDir, 'dropped', 'index.js'), 'utf8')).toBe('operator');
+      });
+
+      it('spends no deploy quota on the refusal', async () => {
+        const archivePath = await buildArchive('dropped', { 'index.js': 'tenant' });
+        const admit = jest.spyOn(breakerModule, 'admitDeploy');
+
+        await expect(
+          service.deploy({ appName: 'dropped', archivePath, userId: 'user-1' })
+        ).rejects.toBeInstanceOf(UploadNotFoundError);
+        expect(admit).not.toHaveBeenCalled();
+      });
+
+      it('lets an admin create over it', async () => {
+        const archivePath = await buildArchive('dropped', { 'index.js': 'admin' });
+
+        const result = await service.deploy({
+          appName: 'dropped',
+          archivePath,
+          userId: 'cli-key-id',
+          callerIsAdmin: true,
+        });
+
+        expect(result.isNew).toBe(true);
+        expect(fssync.readFileSync(path.join(appsDir, 'dropped', 'index.js'), 'utf8')).toBe('admin');
+      });
+
+      it('still lets a non-admin create a genuinely new name', async () => {
+        const archivePath = await buildArchive('fresh', { 'index.js': 'tenant' });
+
+        const result = await service.deploy({ appName: 'fresh', archivePath, userId: 'user-1' });
+
+        expect(result.isNew).toBe(true);
+        expect(getStateManager().getApp('fresh')?.userId).toBe('user-1');
+      });
+    });
+
+    describe('concurrent uploads and redeploy ownership', () => {
+      it('refuses a second upload to a name already in flight, and keeps the first marked', async () => {
+        const archivePath = await buildArchive('busy', { 'index.js': 'x' });
+        let release!: () => void;
+        const gate = new Promise<void>((r) => (release = r));
+        // Hold the first upload inside admission, after it has been marked.
+        jest.spyOn(breakerModule, 'admitDeploy').mockImplementationOnce(async () => {
+          await gate;
+        });
+
+        const first = service.deploy({ appName: 'busy', archivePath });
+        await expect(service.deploy({ appName: 'busy', archivePath })).rejects.toBeInstanceOf(
+          UploadConflictError
+        );
+        expect(service.isUploading('busy')).toBe(true);
+
+        release();
+        await first;
+        expect(service.isUploading('busy')).toBe(false);
+      });
+
+      it('answers an in-flight upload as not found to a non-owner, and as a conflict to the owner', async () => {
+        const sm = getStateManager();
+        await sm.registerApp('shared', path.join(appsDir, 'shared'));
+        await sm.updateApp('shared', { userId: 'alice' } as Record<string, unknown>);
+        const archivePath = await buildArchive('shared', { 'index.js': 'x' });
+        let release!: () => void;
+        const gate = new Promise<void>((r) => (release = r));
+        jest.spyOn(breakerModule, 'admitDeploy').mockImplementationOnce(async () => {
+          await gate;
+        });
+
+        const first = service.deploy({ appName: 'shared', archivePath, userId: 'alice' });
+        await expect(
+          service.deploy({ appName: 'shared', archivePath, userId: 'mallory' })
+        ).rejects.toBeInstanceOf(UploadNotFoundError);
+        await expect(
+          service.deploy({ appName: 'shared', archivePath, userId: 'alice' })
+        ).rejects.toBeInstanceOf(UploadConflictError);
+
+        release();
+        await first;
+      });
+
+      it('refuses while a git deploy is cloning into the name', async () => {
+        jest
+          .spyOn(gitDeployModule, 'getGitDeployService')
+          .mockReturnValue({ isCloning: () => true } as never);
+        const archivePath = await buildArchive('cloning', { 'index.js': 'x' });
+
+        await expect(
+          service.deploy({ appName: 'cloning', archivePath, callerIsAdmin: true, userId: 'root' })
+        ).rejects.toBeInstanceOf(UploadConflictError);
+        expect(service.isUploading('cloning')).toBe(false);
+      });
+
+      it('refuses a create when the name is registered while the archive is processed', async () => {
+        const archivePath = await buildArchive('raced', { 'index.js': 'x' });
+        jest.spyOn(breakerModule, 'admitDeploy').mockImplementationOnce(async () => {
+          await getStateManager().registerApp('raced', path.join(appsDir, 'raced'));
+        });
+
+        await expect(
+          service.deploy({ appName: 'raced', archivePath, userId: 'root', callerIsAdmin: true })
+        ).rejects.toBeInstanceOf(UploadConflictError);
+        expect(fssync.existsSync(path.join(appsDir, 'raced'))).toBe(false);
+      });
+
+      it('refuses a non-admin create when the folder appears while the archive is processed', async () => {
+        const archivePath = await buildArchive('late', { 'index.js': 'tenant' });
+        jest.spyOn(breakerModule, 'admitDeploy').mockImplementationOnce(async () => {
+          await fs.mkdir(path.join(appsDir, 'late'));
+          await fs.writeFile(path.join(appsDir, 'late', 'index.js'), 'operator');
+        });
+
+        await expect(
+          service.deploy({ appName: 'late', archivePath, userId: 'user-1' })
+        ).rejects.toBeInstanceOf(UploadNotFoundError);
+        expect(getStateManager().hasApp('late')).toBe(false);
+        expect(fssync.readFileSync(path.join(appsDir, 'late', 'index.js'), 'utf8')).toBe('operator');
+      });
+
+      it("refuses a non-admin redeploy of someone else's app, and lets the owner and an admin through", async () => {
+        const sm = getStateManager();
+        await sm.registerApp('owned', path.join(appsDir, 'owned'));
+        await sm.updateApp('owned', { userId: 'alice' } as Record<string, unknown>);
+        await fs.mkdir(path.join(appsDir, 'owned'), { recursive: true });
+        await fs.writeFile(path.join(appsDir, 'owned', 'index.js'), 'alice');
+        const archivePath = await buildArchive('owned', { 'index.js': 'new' });
+
+        await expect(
+          service.deploy({ appName: 'owned', archivePath, userId: 'mallory' })
+        ).rejects.toBeInstanceOf(UploadNotFoundError);
+        expect(fssync.readFileSync(path.join(appsDir, 'owned', 'index.js'), 'utf8')).toBe('alice');
+
+        await service.deploy({ appName: 'owned', archivePath, userId: 'alice' });
+        const archive2 = await buildArchive('owned2', { 'index.js': 'admin' });
+        await service.deploy({
+          appName: 'owned',
+          archivePath: archive2,
+          userId: 'cli-key-id',
+          callerIsAdmin: true,
+        });
+        expect(fssync.readFileSync(path.join(appsDir, 'owned', 'index.js'), 'utf8')).toBe('admin');
+      });
     });
 
     it('clears isUploading before publishing app:detected (platform guard must not drop the event)', async () => {
@@ -309,7 +484,7 @@ describe('UploadDeployService', () => {
       // The branch that mattered most and is easiest to miss: fix, re-upload,
       // fail, repeat all lands here, never on app:detected.
       const first = await buildArchive('actor-redeploy-v1', { 'index.js': 'v1' });
-      await service.deploy({ appName: 'actor-redeploy', archivePath: first });
+      await service.deploy({ appName: 'actor-redeploy', archivePath: first, userId: 'human-1' });
 
       const second = await buildArchive('actor-redeploy-v2', { 'index.js': 'v2' });
       const received: AppUpdatePayload[] = [];
@@ -462,7 +637,12 @@ describe('UploadDeployService', () => {
       await service.deploy({ appName: 'owned-app', archivePath: archive1, userId: 'owner-1' });
 
       const archive2 = await buildArchive('owned-app-v2', { 'index.js': 'v2' });
-      await service.deploy({ appName: 'owned-app', archivePath: archive2, userId: 'someone-else' });
+      await service.deploy({
+        appName: 'owned-app',
+        archivePath: archive2,
+        userId: 'someone-else',
+        callerIsAdmin: true,
+      });
 
       // userId is set at creation time only; a redeploy request's userId is
       // not applied to an already-owned app by this service.

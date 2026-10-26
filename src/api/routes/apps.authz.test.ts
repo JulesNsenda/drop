@@ -153,7 +153,7 @@ describe('app route authorization', () => {
     expect(res.status).toBe(507);
   });
 
-  it('gates POST /apps at the user role (E)', async () => {
+  it('gates POST /apps at the admin role (E)', async () => {
     // readonly must not reach the collection route at all.
     await createUser('viewer', 'password123', 'readonly');
     const viewerToken = await getTestToken('viewer', 'password123');
@@ -167,15 +167,14 @@ describe('app route authorization', () => {
     });
     expect(blocked.status).toBe(403);
 
-    // user clears the role gate (the route's own path-containment check may
-    // still reject the request — bob's dir isn't under the webapps root — but
-    // that must not be a 403, or the two failure modes are indistinguishable).
+    // user is refused too: the route registers a folder already on the server,
+    // which is an operator action (see the floor in server.ts).
     const allowed = await app.request('/api/v1/apps', {
       method: 'POST',
       headers: { ...authHeader(bobToken), 'Content-Type': 'application/json' },
       body: JSON.stringify({ path: dir, name: 'role-gate-app' }),
     });
-    expect(allowed.status).not.toBe(403);
+    expect(allowed.status).toBe(403);
   });
 
   it('leaves GET /apps (the collection/list route) readable at readonly (E, negative half)', async () => {

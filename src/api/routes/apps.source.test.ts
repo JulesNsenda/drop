@@ -137,6 +137,7 @@ describe('POST /apps/:name/source (upload deploy)', () => {
       appName: 'alice-app',
       archivePath: expect.any(String),
       userId: aliceId,
+      callerIsAdmin: false,
       // Threaded for the deploy guardrail, so a looping agent is keyed on its
       // own credential rather than on the human it acts for.
       principalId: `jwt:${aliceId}`,
@@ -158,6 +159,61 @@ describe('POST /apps/:name/source (upload deploy)', () => {
     });
     expect(res.status).toBe(202);
     expect(deployMock).toHaveBeenCalledWith(expect.objectContaining({ appName: 'alice-app' }));
+  });
+
+  describe('a new name whose folder already exists on disk (folder-dropped app)', () => {
+    let webapps: string;
+
+    beforeEach(async () => {
+      webapps = path.join(tempDir, 'webapps');
+      await fs.mkdir(path.join(webapps, 'dropped'), { recursive: true });
+      await fs.writeFile(path.join(webapps, 'dropped', 'index.js'), 'operator');
+      jest.spyOn(runtimeConfigModule, 'getAppsDirectory').mockReturnValue(webapps);
+    });
+
+    it('404s a non-admin upload to it, never calls the deploy service, and leaves the folder alone', async () => {
+      const res = await hono.request('/api/v1/apps/dropped/source', {
+        method: 'POST',
+        headers: authHeader(aliceToken),
+        body: Buffer.from('fake-archive-bytes'),
+      });
+      // Same answer as a foreign-owned or unknown app: no oracle for the folder.
+      expect(res.status).toBe(404);
+      expect(deployMock).not.toHaveBeenCalled();
+      expect(getStateManager().hasApp('dropped')).toBe(false);
+      expect(await fs.readFile(path.join(webapps, 'dropped', 'index.js'), 'utf8')).toBe('operator');
+    });
+
+    it('404s when the name is a plain file rather than a directory', async () => {
+      await fs.writeFile(path.join(webapps, 'a-file'), 'x');
+      const res = await hono.request('/api/v1/apps/a-file/source', {
+        method: 'POST',
+        headers: authHeader(aliceToken),
+        body: Buffer.from('fake-archive-bytes'),
+      });
+      expect(res.status).toBe(404);
+      expect(deployMock).not.toHaveBeenCalled();
+    });
+
+    it('lets an admin create over it — 202', async () => {
+      const res = await hono.request('/api/v1/apps/dropped/source', {
+        method: 'POST',
+        headers: authHeader(adminToken),
+        body: Buffer.from('fake-archive-bytes'),
+      });
+      expect(res.status).toBe(202);
+      expect(deployMock).toHaveBeenCalledWith(expect.objectContaining({ appName: 'dropped' }));
+    });
+
+    it('still lets a non-admin create a genuinely new name — 202', async () => {
+      const res = await hono.request('/api/v1/apps/fresh-app/source', {
+        method: 'POST',
+        headers: authHeader(aliceToken),
+        body: Buffer.from('fake-archive-bytes'),
+      });
+      expect(res.status).toBe(202);
+      expect(deployMock).toHaveBeenCalledWith(expect.objectContaining({ appName: 'fresh-app' }));
+    });
   });
 
   it('rejects a new app upload at the per-user app limit — same shape as POST /apps', async () => {
@@ -352,6 +408,7 @@ describe('POST /apps/:name/source (upload deploy)', () => {
         appName: 'alice-app',
         archivePath: expect.any(String),
         userId: undefined,
+        callerIsAdmin: false,
         principalId: undefined,
         // With auth disabled there is no credential at all, so nothing can be
         // an agent — and an app created here is never auto-reapable.

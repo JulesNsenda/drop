@@ -12,6 +12,14 @@ export interface UploadDeployRequest {
   archivePath: string;
   userId?: string;
   /**
+   * Whether the caller's credential is an admin, from `auth.role === 'admin'` at
+   * the route or tool boundary. Absent means NOT admin. The service cannot
+   * recover this from `userId`: an ownerless admin key's userId is its key id,
+   * which no user record resolves. Only consulted when `userId` is set (with auth
+   * off there is no boundary to enforce).
+   */
+  callerIsAdmin?: boolean;
+  /**
    * The credential that asked for this deploy, for guardrail keying — NOT for
    * authorization, which happened at the route or tool boundary. Absent when
    * DROP triggered the deploy itself.
@@ -46,6 +54,26 @@ export class UploadValidationError extends Error {
   constructor(message: string) {
     super(message);
     this.name = 'UploadValidationError';
+  }
+}
+
+/**
+ * Thrown when the caller may not touch `appName`: a name whose folder already
+ * exists, or an app someone else owns. Mapped to the same 404 the route
+ * preflight gives a foreign or unknown app, so neither reveals the other.
+ */
+export class UploadNotFoundError extends Error {
+  constructor(appName: string) {
+    super(`Application '${appName}' not found`);
+    this.name = 'UploadNotFoundError';
+  }
+}
+
+/** Thrown when an upload to this app is already in flight. */
+export class UploadConflictError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'UploadConflictError';
   }
 }
 
