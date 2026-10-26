@@ -4,10 +4,10 @@
  * `buildMcpServer(auth)` builds one McpServer instance per HTTP request
  * (stateless mode — see `transport.ts`), with the caller's `AuthContext`
  * captured by closure so every tool handler runs with the caller's identity
- * flowing through the existing `canAccess` ownership model. Nine tools:
+ * flowing through the existing `canAccess` ownership model. Tools:
  * `deploy_files`, `deploy_from_git`, `list_apps`, `app_status`,
  * `verify_deployment`, `app_logs`, `get_deploy_logs`, `restart_app`,
- * `rollback_app`. No `set_secrets`/`remove_app` —
+ * `rollback_app`, `custom_domain`. No `set_secrets`/`remove_app` —
  * destructive/blast-radius tools stay off the MCP surface (PRD-040 non-goals).
  *
  * Tool errors are returned as `{ content: [...], isError: true }` results,
