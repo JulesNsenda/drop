@@ -92,9 +92,11 @@ jobs:
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: steps.decide.outputs.publish == 'true'
+        # server.json describes the LISTING (name, remote URL template), not a
+        # release, so it comes from this workflow's own branch; only the
+        # version comes from the tag. That also lets a tag that predates the
+        # file be listed.
         with:
-          # The released commit: the run's SHA, or the tag when dispatched.
-          ref: ${{ github.event.workflow_run.head_sha || inputs.tag }}
           persist-credentials: false
 
       # Pinned by version AND checksum. The checksum matches upstream's
