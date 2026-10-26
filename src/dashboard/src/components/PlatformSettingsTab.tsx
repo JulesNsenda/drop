@@ -293,15 +293,19 @@ function PlatformSettingsTab() {
             id="sqlConsoleEnabled"
             icon={Terminal}
             label="Enable the read-only SQL console"
-            summary="Adds a read-only query box to each app's Database tab. Admin-only."
-            consequence={
+            summary={
               <>
-                Writes are refused by the server and results are capped.{' '}
+                Adds a read-only query box to each app&apos;s Database tab.{' '}
                 <strong>
                   {settings?.sqlConsole?.catalogVisibility ??
                     'Any arbitrary query can read the shared PostgreSQL catalogs, which list every database and role on this server.'}
-                </strong>{' '}
-                The console is admin-only for that reason.
+                </strong>
+              </>
+            }
+            consequence={
+              <>
+                Writes are refused by the server and results are capped. The console is
+                admin-only because any query can read those shared catalogs.
               </>
             }
             checked={settings?.sqlConsole?.enabled ?? false}
