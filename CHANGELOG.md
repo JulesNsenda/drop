@@ -27,6 +27,351 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.7.0] - 2026-10-26
+
+The agent-surface release, plus Node 22 and steadier deploys.
+
+Agents get a machine-readable OpenAPI description, a limits endpoint, deploy
+status over SSE, and MCP tools to verify a deployment, roll back, and read live
+resource use. Rollback and zero-downtime redeploys arrive for apps that declare
+a `healthCheck`. Under `isolation: docker`, Node apps move to Node 22. And a
+DROP restart no longer takes monorepo apps down: unchanged children stay
+running, and a redeploy that finds every build slot busy now waits its turn
+instead of failing.
+
+**Read the Upgrading section if you run `isolation: docker`, or have an app
+that declares a `healthCheck`.**
+
+### Upgrading
+
+- **`isolation: docker` only: Node apps move to Node 22.** Every running app
+  under docker isolation is recreated once on the first boot, and Node apps
+  reinstall their dependencies for Node 22. A stopped Node app whose
+  dependencies were built for Node 20 is refused a start (409) until it is
+  redeployed. Check that each Node app installs on `node:22-slim` first; the
+  Changed entry below shows how.
+- **Apps that declare a `healthCheck` switch to zero-downtime deploys** on
+  their next deploy, which runs the old and new versions side by side for a
+  moment. An app that holds a single-writer lock (a SQLite file, a job runner
+  that must not run twice) should opt out with
+  `deploy: { strategy: in-place }`.
+- **`DROP_MAX_CONCURRENT_BUILDS` now takes effect.** The builder used to ignore
+  it and always allow 3. If you set it, your value now applies, and `0` means
+  no limit.
+- **Monorepos: the first restart after upgrading still rebuilds each child
+  once** (with boot reconcile `on`), to record what it was built from. Later
+  restarts leave unchanged children running.
+
+### Added
+
+- **Object storage, operator side (#301).** An admin can now configure S3
+  object storage in their own AWS account: `PUT
+  /api/v1/admin/settings/object-storage` (enabled, region, bucket prefix),
+  `PUT`/`DELETE /api/v1/admin/settings/object-storage/credential` (the AWS admin
+  key pair, write-only and encrypted at rest; `DROP_S3_ADMIN_ACCESS_KEY_ID` /
+  `DROP_S3_ADMIN_SECRET_ACCESS_KEY` override it and are never persisted),
+  `POST /api/v1/admin/object-storage/test`, and an `objectStorage` block in `GET
+  /api/v1/admin/settings`. Behind it, a provisioner creates one private bucket
+  per app plus an IAM user whose only permissions are that bucket, and tears
+  both down (every object included). Off by default: turning it on lets DROP
+  create resources that bill to the operator's account. AWS only, with no
+  endpoint setting, so the admin key cannot be redirected to another host.
+  Attaching storage to an app is the next change. See `docs/OBJECT-STORAGE.md`
+  for the admin credential's IAM policy.
+
+- **Custom domains you can verify, from the dashboard, API or an agent (#302).**
+  Setting a custom domain (`PUT /api/v1/apps/:name/domain`, the dashboard's
+  Domains tab, or the new `custom_domain` MCP tool) now returns the exact DNS
+  record to create — a CNAME to the app's own hostname, or A/AAAA records to
+  the platform's addresses for an apex. `GET /api/v1/apps/:name/domain` reports
+  the domain, those records, whether DNS points here yet and the certificate;
+  `POST /api/v1/apps/:name/domain/verify` (poll it — it is idempotent) checks
+  DNS and, once the domain resolves to this platform, routes it so Caddy
+  obtains its certificate. The platform finds its own addresses by resolving
+  its public host; set `DROP_PUBLIC_IPS` (comma-separated) on a box behind NAT.
+  DNS results are reduced to booleans against the platform's own addresses and
+  never echoed. Names under the platform's domain suffix are refused by every
+  writer: the wildcard record makes them resolve here regardless, so DNS would
+  prove nothing, and claiming one would squat a future app's hostname.
+
+- **Rollback and promotion without downtime (#298, opt-in).** For an app on
+  `deploy: { strategy: zero-downtime }`, `POST /apps/:name/rollback` (and the
+  `rollback_app` MCP tool) now goes back to the app's previous release, and
+  promoting a held build goes to that build's release — both through the same
+  cutover as a redeploy, so the current version serves until the other one
+  answers, and stays if it never does. A rollback copies nothing (the previous
+  release is already on disk), leaves the source folder as it is, and swaps the
+  two releases, so a second rollback goes forward again. Such apps no longer get
+  a rollback snapshot; apps that serve from their source folder keep the
+  snapshot store unchanged. An app that opts out keeps its last release as its
+  rollback target until its next snapshot replaces it. The rollback responses
+  say which one they used (`source` / `rollback_source`: `release` or
+  `snapshot`), and the disk-ceiling sweep drops a previous release, as it does
+  a snapshot, before it would park the app.
+
+- **Zero-downtime redeploys (#298, opt-in).** A running app on
+  `deploy: { strategy: zero-downtime }` is now redeployed without dropping
+  requests: the new release starts beside the old one on a second port, must
+  answer HTTP below 500 (on its `healthCheck` path when it declares one), and
+  only then does Caddy switch to it; the old instance is removed after a drain
+  window (`DROP_CUTOVER_DRAIN_MS`, default 10 s). A new version that never
+  becomes ready is discarded while the old one keeps serving, untouched, and the
+  deploy fails with the new `READINESS_FAILED` error code. Apps that do not
+  listen on a port, declare a fixed `port:`, or (on a `localhost` domain) are
+  depended on by other apps fall back to stop/start. Caveat: an app with granted
+  control-plane capabilities gets a fresh `DROP_API_KEY` per start, so the old
+  instance's key stops working during the drain.
+
+- **Release directories for zero-downtime deploys (#298, opt-in).** An app
+  whose `drop.yaml` sets `deploy: { strategy: zero-downtime }` is now built into
+  its own directory per deploy, `data/releases/<app>/<deployId>/`, and run from
+  there — so a build no longer rewrites `node_modules` and the build output
+  underneath the process that is serving. The source folder keeps its role
+  (uploads, `git pull`, the watcher and `drop.yaml` all stay in
+  `webapps/<app>`). The previous release is kept and older ones pruned; a
+  failed build or start discards the new release and leaves the serving one
+  alone; restarts and rollbacks work on the current release; removing the
+  opt-in goes back to in-place and deletes the releases. Apps that do not opt
+  in are unchanged. A redeploy still stops before it starts — the traffic
+  cutover that removes that gap is the next step.
+
+- **MCP `rollback_app` tool.** The agent-side of per-app rollback: undoes the
+  last `deploy_files` or git redeploy of an app the caller may deploy to (a
+  read-only grant cannot), with no rebuild. Both the text and the structured
+  result state what was not restored — the database above all — and point at
+  `verify_deployment` next.
+
+- **Per-app rollback (#296).** Before an upload or git redeploy overwrites a
+  running app, DROP keeps a copy of the tree that was serving — build output
+  and dependencies included — under `data/rollback/<app>/`.
+  `POST /api/v1/apps/:name/rollback` puts it back and restarts the app on its
+  port without rebuilding; `GET` on the same path says whether one exists. It
+  behaves identically under PM2 and Docker, because both run an app straight
+  from its directory. It restores **code only**: the response lists what it
+  does not restore (database, Redis, app data, secrets, environment) rather
+  than implying a time machine. One snapshot per app (the last good), taken
+  only when it fits under the per-app disk ceiling with room for the app's
+  data; the ceiling sweep charges it to the app and drops it before it would
+  park one. Manual only — there is no automatic rollback on a failed health
+  check. Folders dropped straight into `webapps/` are not captured.
+
+- **`GET /api/v1/openapi.json` — a generated OpenAPI 3.1 description (#297).**
+  Built from the mounted route table rather than written beside it, so it
+  cannot list a route that is not served or miss one that is. Each operation
+  carries its security requirements and an `x-drop-min-role`, read off a tag
+  every auth middleware now carries and matched to routes by Hono itself, so
+  method-scoped and route-level floors are included. Operations with no
+  middleware floor are marked `x-drop-auth: handler` rather than declared
+  public. Request and response bodies are not described yet. A new test fails
+  when a route is mounted with no role floor and is not on a reviewed list —
+  `setupRoutes` has no default-deny, and nothing noticed that before.
+
+- **A test fails when the published agent surface drifts from the code (#303).**
+  `src/api/mcp/published-surface.test.ts` holds the MCP tool list, the REST
+  `ErrorCodes` and the deploy `error_code` values that drop-site's `llms.txt`
+  publishes, and checks each against the code in both directions — the
+  registered tools are captured from `buildMcpServer` itself. A failure names
+  what drifted and the drop-site file to update alongside this one.
+
+- **Deploy status streams over SSE (#299).** `GET /api/v1/deploys/:deployId/stream`
+  emits an `episode` event each time a deploy's stages or status change and one
+  `end` event at a terminal status (or a park/hold, which never reaches one),
+  then closes itself and releases its subscription. Because a `202` from
+  `POST /apps/:name/source` carries `acceptedAt` but no deploy id,
+  `GET /api/v1/deploys/stream?app=<name>&since=<acceptedAt>` follows the same
+  deploy from acceptance, with the correlation the MCP deploy tools use. Same
+  owner-snapshot ownership rule as `GET /deploys`; a foreign and a missing
+  deploy are indistinguishable on both routes.
+
+- **MCP: a refused deploy is now machine-readable (#292).** `deploy_files` and
+  `deploy_from_git` refused by the deploy quota or the failure breaker used to
+  return only a sentence. They now also return `structuredContent` with
+  `error_code` (`QUOTA_EXCEEDED` / `GUARDRAIL_TRIPPED`), the static `hint`, and
+  `retry_after_seconds`, so an agent can wait and retry without parsing prose.
+  The text content is unchanged for clients that render only text.
+
+- **`GET /api/v1/limits` — read your headroom before spending it (#293).** One
+  `readonly` call returns every guardrail that can refuse the caller's next
+  deploy, with current usage: the hourly deploy quota (per principal and per
+  owning user, with when each window frees a slot), the failure breaker (the
+  new-app window, the owner backstop, and any of the caller's own apps with
+  failures on the board), live ephemerals against their cap, the app count, and
+  the per-app disk ceiling. Strictly per-caller — an admin sees their own
+  figures, never the fleet's — and it reports no host facts. It reads through
+  new side-effect-free `peek` methods, so observing a limit never prunes or
+  expires it.
+
+- **MCP `verify_deployment` tool (#295).** Probes one of the caller's running
+  apps with a single bounded HTTP GET and returns `ok`, `status_code`,
+  `latency_ms` and `probed_url` — the follow-up a `succeeded_unverified` deploy
+  was missing, and now its first `next_actions` entry. The target is always
+  127.0.0.1 plus the app's own assigned port (both isolation modes); only the
+  path is caller-chosen, held to the same allowlist as drop.yaml's `mcp.path`,
+  defaulting to the app's `healthCheck`. The body is never returned and
+  redirects are not followed. Foreign and missing apps get the same not-found.
+
+- **MCP `app_status` reports live memory, CPU, uptime and restarts (#294)** for
+  a running app the caller owns, from one runtime stats call (never the
+  fleet-wide one). When the runtime cannot measure them — including the docker
+  adapter's `{cpu: 0, memory: 0}` fallback — the fields are omitted rather than
+  reported as zero, so an agent is never told a crashed stats call means "idle".
+
+- **Settings → Platform, for the toggles that had no dashboard control.** App
+  sharing, guest invitations, the SQL console and the outbound-mail relay all
+  shipped with an API endpoint and no way to reach them, so turning any of them
+  on meant `curl` with a hand-extracted token — most of the sharing program was
+  effectively unreachable that way. Each switch carries its consequence beside
+  it rather than in a doc: enabling app sharing warns if the access gate is off,
+  guest invitations say they need a mail relay, and the SQL console states the
+  catalog exposure that makes it admin-only. The mail card covers host, port,
+  TLS, username and from-address, a write-only relay password, and a test send.
+
+- **Guest invitations, and revoking them, on the admin Access tab.** An admin
+  viewing an app gets the governance tab, never the owner's share panel, and the
+  invite-by-email control lived only on the latter — so switching guest invites
+  on left the operator who did it unable to invite anyone except with `curl`.
+  The tab now invites, lists the guests you invited with Resend and Revoke, and
+  counts the ones it cannot list (someone else's invitees, or all of them while
+  the share read is refused) so an unreadable answer is never rendered as
+  "nobody". The list and its Revoke controls stay reachable when app sharing is
+  switched off, matching the API's own rule that disabling a feature must not
+  remove the lever for taking access away.
+
+- **Sharing an app with a DROP account, on the admin Access tab.** The same gap
+  as the invitations above, one control over: an admin could already grant
+  access from the allow-list, but the share control — the one that records who
+  granted it and can be taken back one entry at a time — lived only on the
+  owner's panel, which an admin never sees. The tab now shares by username
+  beside the invite field, lists the shares you made with Revoke, and reads both
+  lists from a request it was already making. A share also ticks that person in
+  the allow-list above, so the next “Update gate” cannot silently revoke the
+  person you just shared with. The pieces both panels genuinely had in common —
+  the platform-toggle refusal codes, the once-only invitation link and the grant
+  rows — now live in one place instead of two copies that were already one
+  refusal code apart.
+
+### Fixed
+
+- **A DROP restart no longer rebuilds unchanged monorepo children.** On every
+  restart the watcher's first scan re-expanded each monorepo container, which
+  re-copied every child (deleting a static child's build output) and rebuilt
+  it. A static frontend served errors for as long as its build took, on every
+  DROP deploy. With boot reconcile `on`, a child is now decided like any other
+  app. If it is running and current (its runtime spec, dependencies, secrets
+  and scopes are unchanged), and its service source and generated `drop.yaml`
+  match what it was last built from, the restart leaves it alone: its route
+  and health checks are restored, and nothing is copied or rebuilt. Any change
+  still rebuilds it, as does an explicit redeploy. The first restart after
+  upgrading rebuilds each child once and records its fingerprint; `off` and
+  `observe` modes behave as before.
+- **The monorepo symlink guard could be bypassed by the service's path.** The
+  check that refuses a service source containing symlinks matched its exclude
+  list against the absolute path, so a service (or `DROP_ROOT`) under a folder
+  named `build` or `dist` skipped the scan entirely. It now matches relative
+  paths, like the copy does. A child folder that is itself a link is also
+  refused.
+- **A redeploy refused by the build limit was never retried.** When more apps
+  rebuilt at once than `DROP_MAX_CONCURRENT_BUILDS` allows (for example the
+  boot reconcile after an image change), a redeploy that found no free build
+  slot was recorded as a failed build and nothing tried it again. A monorepo
+  child whose source had just been re-synced was left without its build output
+  and served errors until someone redeployed it by hand. A redeploy now waits
+  for a free slot, in arrival order, without changing anything first: the old
+  version keeps serving and the status is untouched until the build starts. It
+  is dropped only if, while it waited, the app was stopped or removed, a
+  backup began, or a git pull or upload started. The builder also now honours
+  `DROP_MAX_CONCURRENT_BUILDS`; it always used 3 before.
+- **The dashboard/API custom domain was never routed (#302).** `customDomain`
+  was stored and shown as the app's URL, but only `drop.yaml` `domains` ever
+  reached Caddy, so that link served nothing and no certificate was issued. It
+  is now routed once verified (above), under the same cross-tenant ownership
+  and reserved-host guards as `drop.yaml` domains. Changing or clearing a
+  verified domain removes its route. Values already stored stay unrouted until
+  they are verified, so nothing starts requesting certificates for domains
+  whose DNS never pointed here.
+
+- **Download an app's source (#315).** `GET /api/v1/apps/:name/source`, and a
+  **Source** button on the app page, return the app's source folder as a
+  `.tar.gz` — so an app that only ever existed on DROP (deployed by an agent
+  with `deploy_files`, or uploaded from a machine that is gone) can be saved to
+  a git repository or anywhere else. Files sit at the archive root, the shape
+  `POST /apps/:name/source` accepts, so a download can be edited and uploaded
+  back. `node_modules`, `.venv` and `.git` are left out (a git-deployed app's
+  `.git/config` can hold the clone credential). Symlinks are archived as links
+  and never followed, so a link in a git-deployed tree cannot turn a download
+  into a read of the host; an archive containing one will not upload back
+  as-is, since uploads refuse symlinks. For the app's owner or an admin, with a
+  session or API key; refused for agent credentials, for readonly tokens, when
+  authentication is disabled, and — for a non-admin — when the app's recorded
+  path is outside the webapps directory. Shares the upload rate-limit bucket.
+
+- **Concurrent route changes can no longer drop a route from the Caddyfile.**
+  Every route change rewrites the whole file from a snapshot of the routes, and
+  two overlapping rewrites could land in the wrong order, the older snapshot
+  winning and the newer route vanishing from disk until the next change. The
+  router now serializes its writes, each computed from the routes as they are
+  when its turn comes. It also gains `setUpstream`, which repoints an app's
+  routes and reloads Caddy immediately, reporting whether Caddy accepted it —
+  the first step of zero-downtime redeploys (#298).
+  The Caddyfile is now also written atomically, so Caddy's reload path or a
+  Caddy restart can never read a half-written (or truncated-to-empty) file.
+
+- **The SQL console's refusal pointed at a Settings page that did not exist.**
+  It told an admin to "enable it in Settings" while no such control had been
+  built. It now names the tab that exists.
+
+- **A first guest invitation on a platform with no mail relay destroyed its own
+  link.** The invitation secret exists in plaintext exactly once, in the
+  response to the request that mints it, and is returned only when no mail was
+  sent. The share panel checked the gate-application error before that field, so
+  a response carrying both — the ordinary shape of a first invite on a
+  relay-less box — reported "invited" and dropped the only credential that would
+  have admitted the person. Nothing stores it, so it could not be recovered.
+
+- **The share panel claimed it had copied an invitation link when it had not.**
+  A dashboard served over plain HTTP has no clipboard API, which is exactly the
+  kind of box that sees these links; the copy silently did nothing and said it
+  had worked. It now reports the failure and tells you to copy by hand.
+
+- **An invitation link stayed on screen after switching to another app.** The
+  app detail page does not remount on a name change, so a live single-use
+  credential minted for one app was rendered under another app's heading.
+
+### Changed
+
+- **Node apps now run on Node 22 under `isolation: docker`.** The tenant image
+  moves from `node:20-slim` (end of life) to `node:22-slim`, digest-pinned;
+  static and SPA apps build in it too. On the first boot of this release every
+  running app under docker isolation is recreated once, and Node apps
+  reinstall their dependencies on Node 22: `node_modules` now record the Node
+  they were built for, and a tree built for Node 20 is reinstalled rather than
+  reused, so native addons are recompiled. Starting a stopped Node app whose
+  dependencies were built for Node 20 is refused with a 409 until it is
+  redeployed (a redeploy of a stopped app now rebuilds it), and rolling back
+  to a snapshot or release from before the upgrade is refused the same way
+  until the app's next deploy creates a new one. `node:22-slim` has no
+  compiler toolchain, so a native addon without a Node 22 prebuild fails to
+  install.
+
+  **Upgrading:** check each Node app installs and starts on
+  `node:22-slim` first, e.g.
+  `docker run --rm -v "$PWD":/app -w /app node:22-slim sh -c 'npm ci && npm start'`
+  on a copy of the app. Under `isolation: none` nothing changes until the host
+  Node is upgraded.
+
+- **Zero-downtime is the default for apps that declare a `healthCheck` (#298).**
+  An app whose `drop.yaml` sets `healthCheck` and no `deploy.strategy` is now
+  built into release directories and redeployed, rolled back and promoted
+  through the zero-downtime cutover — its declared path is what the cutover's
+  readiness gate probes. Every other app is unchanged. Opt a single app out
+  with `deploy: { strategy: in-place }`, or turn the default off for the whole
+  platform with `DROP_ZERO_DOWNTIME_DEFAULT=false` (explicit opt-ins still
+  apply). Monorepo children stay in place: their generated `drop.yaml` now
+  says so explicitly. An existing app moves over on its next deploy; its first
+  zero-downtime redeploy still has to prove the new version answers
+  `healthCheck` below HTTP 500, or the deploy fails as `READINESS_FAILED` and
+  the old version keeps serving.
+
 ## [1.6.0] - 2026-08-30
 
 A hardening release, plus two things you can see.

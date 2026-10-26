@@ -80,7 +80,14 @@ describe('command kind', () => {
 });
 
 describe('next actions', () => {
-  const ALLOWED = ['get_deploy_logs', 'app_logs', 'app_status', 'restart_app', 'list_apps'];
+  const ALLOWED = [
+    'get_deploy_logs',
+    'app_logs',
+    'app_status',
+    'verify_deployment',
+    'restart_app',
+    'list_apps',
+  ];
 
   it('only ever returns tool-name literals', () => {
     const all = [
@@ -115,6 +122,6 @@ describe('next actions', () => {
   it('suggests verifying an unverified success', () => {
     // The app is up but nothing confirmed it serves — the one case where a
     // "successful" deploy still warrants a look.
-    expect(nextActionsFor('succeeded_unverified')).toContain('app_status');
+    expect(nextActionsFor('succeeded_unverified')[0]).toBe('verify_deployment');
   });
 });

@@ -42,6 +42,12 @@ export type AttachServiceResult =
         | 'has-own-redis-url'
         | 'quota-exceeded'
         /**
+         * The app's node_modules were built for a different Node runtime, so
+         * the restart that ends an attach would be refused — after a database
+         * was already provisioned against the owner's quota. Refused first.
+         */
+        | 'stale-dependencies'
+        /**
          * The app has runtime state but no AppConfig (an out-of-tree or
          * admin-registered app). Refused rather than attached because
          * `upsertConfig` would mint a skeleton config with `type: 'unknown'`

@@ -10,6 +10,7 @@ export {
   getRouterService,
   resetRouterService,
 } from './router';
+export type { CaddyReloadOutcome } from './router';
 
 export {
   generateCaddyfile,

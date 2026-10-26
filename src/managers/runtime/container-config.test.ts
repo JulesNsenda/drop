@@ -15,7 +15,14 @@ import {
   containerPolicyFingerprint,
   fingerprintPayloadForTest,
   ContainerPolicyInputs,
+  baseImageTags,
+  selectBaseImage,
+  selectBuildImage,
+  healthCheckTest,
 } from './container-config';
+import { toolchainIdFromImage } from '../../core/builder/toolchain';
+import { NODE_RUNTIME_TYPES } from '../../core/builder/node-types';
+import type { AppType } from '../../core/detector/detector.types';
 
 const baseInputs: ContainerPolicyInputs = {
   apiPort: 3000,
@@ -101,5 +108,72 @@ describe('containerPolicyFingerprint — pgSocketDir (DROP-072)', () => {
     expect(payloadKeys).toEqual(
       expect.arrayContaining(['imageDigests', 'readonlyRootfs', 'tmpfs', 'containerDataDir'])
     );
+  });
+});
+
+describe('node images and the toolchain ABI table', () => {
+  const stripDigest = (image: string): string => image.split('@')[0];
+  const isNodeImage = (image: string): boolean => stripDigest(image).startsWith('node:');
+
+  // Exhaustive over AppType on purpose: a new type is a compile error here
+  // until someone decides which image it runs in.
+  const ALL_TYPES: Record<AppType, true> = {
+    nodejs: true, nextjs: true, nuxt: true, sveltekit: true, remix: true, astro: true,
+    express: true, fastify: true, hono: true, nest: true, static: true, spa: true,
+    python: true, django: true, flask: true, fastapi: true, go: true, rust: true,
+    php: true, docker: true, proxy: true, unknown: true,
+  };
+
+  it('every node image tag DROP runs has an ABI entry', () => {
+    const nodeTags = baseImageTags().filter(isNodeImage);
+    expect(nodeTags.length).toBeGreaterThan(0);
+    for (const tag of nodeTags) {
+      expect({ tag, known: toolchainIdFromImage(tag) !== null }).toEqual({ tag, known: true });
+    }
+  });
+
+  it('build image and runtime image are the same tag for every node-runtime type', () => {
+    for (const type of NODE_RUNTIME_TYPES) {
+      expect(isNodeImage(selectBaseImage(type))).toBe(true);
+      expect(stripDigest(selectBuildImage(type))).toBe(stripDigest(selectBaseImage(type)));
+    }
+  });
+
+  it('static/spa are served by nginx, not node, but are built in a node image', () => {
+    for (const type of ['static', 'spa'] as const) {
+      expect(isNodeImage(selectBaseImage(type))).toBe(false);
+      expect(toolchainIdFromImage(selectBuildImage(type))).not.toBeNull();
+    }
+  });
+
+  it('every type that runs in a node image builds in the same tag', () => {
+    for (const type of Object.keys(ALL_TYPES) as AppType[]) {
+      if (!isNodeImage(selectBaseImage(type))) continue;
+      expect(stripDigest(selectBuildImage(type))).toBe(stripDigest(selectBaseImage(type)));
+    }
+  });
+});
+
+describe('healthCheckTest', () => {
+  it('runs an exec-form sh with the URL as $1, never spliced into the script', () => {
+    const test = healthCheckTest(3004, '/health');
+    expect(test.slice(0, 3)).toEqual(['CMD', 'sh', '-c']);
+    expect(test[4]).toBe('healthcheck');
+    expect(test[5]).toBe('http://localhost:3004/health');
+    expect(test[3]).not.toContain('/health');
+  });
+
+  it('keeps a hostile path out of the shell text', () => {
+    const test = healthCheckTest(3004, '/x"; rm -rf / #');
+    expect(test[3]).not.toContain('rm -rf');
+    expect(test[5]).toBe('http://localhost:3004/x"; rm -rf / #');
+  });
+
+  it('falls back from curl to wget to node to python, so images without curl still probe', () => {
+    const script = healthCheckTest(80, '/').at(3)!;
+    expect(script.indexOf('curl')).toBeLessThan(script.indexOf('wget'));
+    expect(script.indexOf('wget')).toBeLessThan(script.indexOf('node --max-old-space-size'));
+    expect(script.indexOf('node --max-old-space-size')).toBeLessThan(script.indexOf('python3'));
+    expect(script.trimEnd().endsWith('|| exit 1')).toBe(true);
   });
 });

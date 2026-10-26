@@ -16,6 +16,7 @@ import {
   BuildStageResult,
   BuildError,
   ActiveBuild,
+  DependencySettle,
 } from './builder.types';
 import { executeCommand } from './strategies/base';
 import { nodejsBuildStrategy } from './strategies/nodejs';
@@ -41,6 +42,15 @@ const MAX_FAILED_COMMAND_CHARS = 512;
 const truncateCommand = (cmd?: string): string | undefined =>
   cmd === undefined ? undefined : cmd.slice(0, MAX_FAILED_COMMAND_CHARS);
 
+/**
+ * Where the pre-build stage leaves the handle its strategy's dependency step
+ * returned. A stage that throws is turned into a failed result by executeStage,
+ * so the handle has to be captured outside the stage's return value.
+ */
+interface DependencyStepRef {
+  settle?: DependencySettle;
+}
+
 const BUILD_STAGES: BuildStage[] = [
   'pre-build',
   'environment',
@@ -55,6 +65,11 @@ export class BuilderService {
   private readonly config: BuilderConfig;
   private readonly strategies: BuildStrategy[] = [];
   private readonly activeBuilds: Map<string, ActiveBuild> = new Map();
+  // Slots granted and not yet released (running builds plus a slot in flight to
+  // a woken waiter), the FIFO of builds waiting for one, and their app names.
+  private slotsHeld = 0;
+  private readonly slotWaiters: Array<() => void> = [];
+  private readonly waitingApps: Set<string> = new Set();
 
   constructor(config: Partial<BuilderConfig> = {}) {
     this.config = { ...DEFAULT_CONFIG, ...config };
@@ -72,7 +87,7 @@ export class BuilderService {
    * Build an application
    */
   async build(context: BuildContext): Promise<BuildResult> {
-    const startedAt = new Date();
+    let startedAt = new Date();
     const stages: BuildStageResult[] = [];
     const errors: BuildError[] = [];
     const warnings: string[] = [];
@@ -82,16 +97,18 @@ export class BuilderService {
     // report a failure, and it must match the one used for the rest of the run.
     const buildId = `build-${context.appName}-${Date.now()}`;
 
-    // Check concurrent build limit.
-    // Deliberately emits NO events: this is a DEFERRAL, not a failure — the
-    // platform re-queues the app (see handleBuildApp's MAX_BUILDS branch) and
-    // the retry opens its own episode. Publishing build:started here would
-    // leave an episode that only ever derives as 'superseded', and publishing
-    // build:failed would report a queue wait as a failed deploy.
-    if (this.activeBuilds.size >= this.config.maxConcurrentBuilds) {
+    // One build per app. The dependency step parks a tree in a slot that the next
+    // build's sweep deletes as a leftover, and its aside root is per APP, so two
+    // overlapping builds of one app would delete each other's only copy of the
+    // old dependencies (the platform's appsInProgress is the first line of
+    // defense; this is the backstop). A refusal emits NO events and runs before
+    // any dependency step: it is not THIS build's failure. An app WAITING for a
+    // slot counts as running, or a second build of it would queue behind the
+    // first and then run twice.
+    if (this.activeBuilds.has(context.appName) || this.waitingApps.has(context.appName)) {
       return this.createFailedResult(
         startedAt,
-        [{ stage: 'pre-build', message: 'Maximum concurrent builds reached', code: 'MAX_BUILDS' }],
+        [{ stage: 'pre-build', message: 'A build of this app is already running', code: 'BUILD_IN_PROGRESS' }],
         []
       );
     }
@@ -130,6 +147,27 @@ export class BuilderService {
       return this.createFailedResult(startedAt, [noStrategy], []);
     }
 
+    // Concurrent build limit. A full cap makes this build WAIT (FIFO) rather
+    // than fail: a refusal here used to lose a redeploy of a running app (a
+    // boot-reconcile burst exceeds the cap) that nothing retried. Waiting emits
+    // NO events — build:started below fires only once the slot is held — and it
+    // comes after the NO_STRATEGY return, which needs no slot. A caller that
+    // reserved its own slot (reserveSlot) owns it: it is neither taken nor
+    // released here.
+    // Only awaited when it must wait, so the uncontended path stays synchronous
+    // up to activeBuilds.set (no window for a same-app build to slip through);
+    // a woken waiter leaves waitingApps in the same run as that set.
+    const ownsSlot = !context.slotReserved;
+    if (ownsSlot) {
+      const slotWait = this.acquireSlot(context.appName);
+      if (slotWait) {
+        await slotWait;
+        this.waitingApps.delete(context.appName);
+        // Duration (and the platform's cooldown derived from it) excludes queue time.
+        startedAt = new Date();
+      }
+    }
+
     // Setup abort controller for cancellation
     const abortController = new AbortController();
 
@@ -144,49 +182,85 @@ export class BuilderService {
     };
     this.activeBuilds.set(context.appName, activeBuild);
 
-    // Emit build started event
-    eventBus.publish('build:started', {
-      appId: context.appName,
-      buildId,
-      deployId: context.deployId,
-    });
-
+    // Nothing between the acquire above and this try can throw, so the finally
+    // always releases an owned slot (build:started is published inside it).
     try {
-      // Execute build stages
-      for (let i = 0; i < BUILD_STAGES.length; i++) {
-        const stage = BUILD_STAGES[i];
-        activeBuild.currentStage = stage;
-        activeBuild.progress = Math.round((i / BUILD_STAGES.length) * 100);
+      // Emit build started event
+      eventBus.publish('build:started', {
+        appId: context.appName,
+        buildId,
+        deployId: context.deployId,
+      });
 
-        // Emit progress
-        eventBus.publish('build:progress', {
-          appId: context.appName,
-          buildId,
-          step: stage,
-          progress: activeBuild.progress,
-          message: `Running ${stage}...`,
-        });
+      // The strategy's dependency step hands back a handle (stage pre-build);
+      // this method is its one owner and settles it in the finally below.
+      const dependencyStep: DependencyStepRef = {};
+      let stagesRan = false;
+      try {
+        // Execute build stages
+        for (let i = 0; i < BUILD_STAGES.length; i++) {
+          const stage = BUILD_STAGES[i];
+          activeBuild.currentStage = stage;
+          activeBuild.progress = Math.round((i / BUILD_STAGES.length) * 100);
 
-        const stageResult = await this.executeStage(
-          stage,
-          context,
-          strategy,
-          abortController.signal
-        );
-
-        stages.push(stageResult);
-
-        if (stageResult.status === 'failed') {
-          errors.push({
-            stage,
-            message: stageResult.error || 'Stage failed',
-            exitCode: stageResult.exitCode,
-            command: stageResult.command,
+          // Emit progress
+          eventBus.publish('build:progress', {
+            appId: context.appName,
+            buildId,
+            step: stage,
+            progress: activeBuild.progress,
+            message: `Running ${stage}...`,
           });
 
-          // Stop on failure
-          break;
+          const stageResult = await this.executeStage(
+            stage,
+            context,
+            strategy,
+            abortController.signal,
+            dependencyStep
+          );
+
+          stages.push(stageResult);
+
+          if (stageResult.status === 'failed') {
+            errors.push({
+              stage,
+              message: stageResult.error || 'Stage failed',
+              exitCode: stageResult.exitCode,
+              command: stageResult.command,
+            });
+
+            // Stop on failure
+            break;
+          }
         }
+        stagesRan = true;
+      } finally {
+        // Settled BEFORE the completion/failure events below: a subscriber that
+        // starts the app on build:completed must see the finished tree, and a
+        // failed deploy must see the restored one. Commit when every stage
+        // passed and the build was not cancelled; a failed, thrown or cancelled
+        // build rolls back, which is a no-op when nothing was parked. A
+        // cancelled build is a FAILED one (not a success on the old tree): some
+        // stages (the drop.yaml hooks, validate) ignore the signal and would
+        // otherwise run to a "success" whose tree was just rolled back. A
+        // successful build whose install was SKIPPED after a move still commits:
+        // nodejs only skips over a tree that reads `match` after the hooks (one a
+        // hook restored), and a static site that turned out pre-built never loads
+        // node_modules, so putting the stale tree back would undo a correct build.
+        const cancelled = abortController.signal.aborted;
+        if (stagesRan && errors.length === 0 && cancelled) {
+          errors.push({
+            stage: activeBuild.currentStage ?? 'pre-build',
+            message: 'Build cancelled',
+            code: 'CANCELLED',
+          });
+        }
+        await this.settleDependencyStep(
+          context,
+          dependencyStep.settle,
+          stagesRan && errors.length === 0 && !cancelled
+        );
       }
 
       // Determine output path
@@ -257,7 +331,64 @@ export class BuilderService {
       return this.createFailedResult(startedAt, errors, stages);
     } finally {
       this.activeBuilds.delete(context.appName);
+      if (ownsSlot) this.releaseSlot();
     }
+  }
+
+  /**
+   * Take a build slot ahead of build(), waiting FIFO while the cap is full, so
+   * a caller can wait BEFORE its own pre-build side effects (status writes,
+   * build logs, deploy targets). Resolves to an idempotent release; pass
+   * `slotReserved: true` to build() so it neither takes nor frees a slot. The
+   * app counts as running (BUILD_IN_PROGRESS for a concurrent build()) while it
+   * waits.
+   */
+  async reserveSlot(appName: string): Promise<() => void> {
+    const wait = this.acquireSlot(appName);
+    if (wait) {
+      await wait;
+      this.waitingApps.delete(appName);
+    }
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      this.releaseSlot();
+    };
+  }
+
+  /** maxConcurrentBuilds <= 0 or non-finite (NaN, Infinity) means no cap. */
+  private isUncapped(): boolean {
+    const max = this.config.maxConcurrentBuilds;
+    return !(max > 0) || !Number.isFinite(max);
+  }
+
+  /**
+   * Take a build slot, waiting FIFO while the cap is full.
+   *
+   * `slotsHeld` counts slots from grant to release, so it covers the gap
+   * between a waiter being woken and its activeBuilds.set. A slot is granted
+   * only synchronously (the counter is incremented in the same turn as the
+   * check) or by releaseSlot handing its own slot straight to the next waiter
+   * without decrementing; nothing can see a free slot in between, so
+   * slotsHeld never exceeds the cap. Returns null when granted at once.
+   */
+  private acquireSlot(appName: string): Promise<void> | null {
+    if (this.isUncapped() || this.slotsHeld < this.config.maxConcurrentBuilds) {
+      this.slotsHeld++;
+      return null;
+    }
+    this.waitingApps.add(appName);
+    return new Promise<void>((resolve) => {
+      this.slotWaiters.push(resolve);
+    });
+  }
+
+  /** Free a slot: hand it to the longest waiter, else give it back. */
+  private releaseSlot(): void {
+    const next = this.slotWaiters.shift();
+    if (next) next();
+    else this.slotsHeld--;
   }
 
   /**
@@ -335,20 +466,21 @@ export class BuilderService {
     stage: BuildStage,
     context: BuildContext,
     strategy: BuildStrategy,
-    signal: AbortSignal
+    signal: AbortSignal,
+    dependencyStep: DependencyStepRef
   ): Promise<BuildStageResult> {
     const startTime = Date.now();
 
     try {
       switch (stage) {
         case 'pre-build':
-          return await this.executePreBuild(context, strategy, startTime);
+          return await this.executePreBuild(context, strategy, startTime, dependencyStep);
 
         case 'environment':
           return await this.executeEnvironment(context, startTime);
 
         case 'install':
-          return await this.executeInstall(context, strategy, signal, startTime);
+          return await this.executeInstall(context, strategy, signal, startTime, dependencyStep);
 
         case 'build':
           return await this.executeBuild(context, strategy, signal, startTime);
@@ -378,8 +510,15 @@ export class BuilderService {
   private async executePreBuild(
     context: BuildContext,
     strategy: BuildStrategy,
-    startTime: number
+    startTime: number,
+    dependencyStep: DependencyStepRef
   ): Promise<BuildStageResult> {
+    // The dependency step comes first: a drop.yaml hook must not run against a
+    // tree the strategy is about to replace. Its handle is settled by build().
+    if (strategy.prepareDependencies) {
+      dependencyStep.settle = (await strategy.prepareDependencies(context)) ?? undefined;
+    }
+
     // Execute custom pre-build hooks
     if (context.config.preBuild?.length) {
       const exec = context.execCommand ?? executeCommand;
@@ -449,7 +588,8 @@ export class BuilderService {
     context: BuildContext,
     strategy: BuildStrategy,
     signal: AbortSignal,
-    startTime: number
+    startTime: number,
+    dependencyStep: DependencyStepRef
   ): Promise<BuildStageResult> {
     const installCommand = strategy.getInstallCommand(context);
 
@@ -465,6 +605,11 @@ export class BuilderService {
     // only; the build/compile stage keeps context.env (NODE_ENV=production) so output stays a production
     // bundle. sanitizeBuildEnv (base.ts) preserves npm_config_*; npm>=7 include=dev overrides the omit.
     const installEnv = { ...context.env, npm_config_include: 'dev' };
+
+    // The install really runs from here (not for a skipped one): the dependency
+    // step re-checks what the drop.yaml hooks left behind, and so decides
+    // whether this install may be stamped.
+    await dependencyStep.settle?.beforeInstall();
 
     const exec = context.execCommand ?? executeCommand;
     const result = await exec(
@@ -496,7 +641,7 @@ export class BuilderService {
     // failure here must never fail the (already successful) install — worst
     // case the next build re-installs.
     try {
-      await strategy.postInstall?.(context);
+      await strategy.postInstall?.(context, dependencyStep.settle);
     } catch (err) {
       this.emitLog(
         context.appName,
@@ -513,6 +658,32 @@ export class BuilderService {
       duration: result.duration,
       output: result.stdout,
     };
+  }
+
+  /**
+   * Settle the handle the strategy's dependency step returned: commit when the
+   * build as a whole succeeded, roll back otherwise. A failure is logged as a
+   * generic warning and never replaces the build's own result or error.
+   */
+  private async settleDependencyStep(
+    context: BuildContext,
+    settle: DependencySettle | undefined,
+    commit: boolean
+  ): Promise<void> {
+    if (!settle) return;
+    try {
+      await (commit ? settle.commit() : settle.rollback());
+    } catch {
+      this.emitLog(
+        context.appName,
+        'install',
+        'warn',
+        commit
+          ? 'Could not clean up the previous dependencies.'
+          : 'Could not restore the previous dependencies.',
+        context
+      );
+    }
   }
 
   private async executeBuild(

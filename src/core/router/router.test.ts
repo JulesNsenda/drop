@@ -20,6 +20,14 @@ import {
 
 // Mock fs/promises
 jest.mock('fs/promises');
+
+// The router writes the Caddyfile through writeFileAtomic (open + rename),
+// which the fs/promises mock above cannot serve. Route it to the mocked
+// writeFile so assertions about what was written still hold.
+jest.mock('../../utils/atomic-write', () => ({
+  writeFileAtomic: (p: string, data: string) =>
+    (jest.requireMock('fs/promises') as typeof import('fs/promises')).writeFile(p, data, 'utf-8'),
+}));
 const mockFs = fs as jest.Mocked<typeof fs>;
 
 // Mock event bus

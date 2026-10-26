@@ -16,6 +16,7 @@ import {
   initializeAuth,
   authMiddleware,
   mcpAuthMiddleware,
+  authMiddlewareForMethods,
   isAuthEnabled,
   setSignupEnabled,
 } from './middleware/auth';
@@ -30,12 +31,15 @@ import {
   servicesRateLimitMiddleware,
   shareRateLimitMiddleware,
   mailRateLimitMiddleware,
+  objectStorageTestRateLimitMiddleware,
 } from './middleware/rate-limit';
 import { securityHeadersMiddleware } from './middleware/security-headers';
 import { auditMiddleware, initializeAuditLog, closeAuditLog } from './middleware/audit';
 import { containerOriginGate } from './middleware/container-origin';
 import { validateBodySize } from './middleware/validate';
 import { setApiRuntimeConfig, getPublicUrl } from './runtime-config';
+import { buildOpenApiDocument } from './openapi';
+import { getPlatformVersion } from '../utils/version';
 import { getSettingsManager } from '../managers/settings/settings-manager';
 import { isPathWithin } from '../utils/paths';
 import { buildProtectedResourceMetadata, buildAuthServerMetadata } from './oauth/metadata';
@@ -53,6 +57,7 @@ import webhooksRoutes from './routes/webhooks';
 import gitDeployRoutes from './routes/git-deploy';
 import adminRoutes from './routes/admin';
 import usageRoutes from './routes/usage';
+import limitsRoutes from './routes/limits';
 import oauthRoutes from './routes/oauth';
 import mcpGatewayRoutes from './routes/mcp-gateway';
 import appAccessRoutes from './routes/app-access';
@@ -287,6 +292,25 @@ export class ApiServer {
     // Public routes (no auth required)
     v1.route('/health', healthRoutes);
 
+    // Machine-readable API description (#297), GENERATED from this.app.routes
+    // on first request — every route is mounted by then — and cached for the
+    // life of the process, since the route table never changes after boot.
+    // Public on purpose: it is how an agent finds the API without being told,
+    // and it describes routes, never data. One explicit route, never a
+    // catch-all: a bare `/*` would swallow the OAuth discovery paths.
+    let openApiDocument: Promise<Record<string, unknown>> | null = null;
+    v1.get('/openapi.json', async (c) => {
+      openApiDocument ??= buildOpenApiDocument(this.app.routes, {
+        version: getPlatformVersion(),
+        serverUrl: getPublicUrl() ?? undefined,
+        authEnabled: isAuthEnabled(),
+      }).catch((err) => {
+        openApiDocument = null; // do not cache a failure
+        throw err;
+      });
+      return c.json(await openApiDocument);
+    });
+
     // Auth routes with stricter rate limiting (brute-force / signup-flood)
     v1.use('/auth/login', authRateLimitMiddleware());
     v1.use('/auth/signup', authRateLimitMiddleware());
@@ -453,6 +477,8 @@ export class ApiServer {
     // and only the test-send route is expensive enough to need this bucket,
     // so there is no sibling pattern here to double-match against.
     v1.use('/admin/mail/test', mailRateLimitMiddleware());
+    // POST /admin/object-storage/test (#301) dials AWS with the operator's key.
+    v1.use('/admin/object-storage/test', objectStorageTestRateLimitMiddleware());
 
     // Apply auth middleware to protected routes when auth is enabled
     if (this.config.enableAuth && isAuthEnabled()) {
@@ -538,16 +564,11 @@ export class ApiServer {
       // that accident no longer contains it, so the tier is stated explicitly.
       // Method-scoped: GET /apps/:name (and GET /apps) must stay readable at
       // `readonly`.
-      v1.use('/apps/*', async (c, next) => {
-        const method = c.req.method;
-        if (method === 'DELETE' || method === 'PUT' || method === 'PATCH' || method === 'POST') {
-          return authMiddleware('user')(c, next);
-        }
-        return next();
-      });
+      v1.use('/apps/*', authMiddlewareForMethods(['DELETE', 'PUT', 'PATCH', 'POST'], 'user'));
       v1.use('/apps/*', authMiddleware('readonly'));
       v1.use('/apps', authMiddleware('readonly'));
       v1.use('/usage', authMiddleware('readonly'));
+      v1.use('/limits', authMiddleware('readonly'));
       v1.use('/logs/*', authMiddleware('readonly'));
       v1.use('/deploys/*', authMiddleware('readonly'));
       v1.use('/deploys', authMiddleware('readonly'));
@@ -588,6 +609,7 @@ export class ApiServer {
     // Mount all routes (auth middleware applied above when enabled)
     v1.route('/apps', appsRoutes);
     v1.route('/usage', usageRoutes);
+    v1.route('/limits', limitsRoutes);
     v1.route('/logs', logsRoutes);
     v1.route('/certs', certsRoutes);
     v1.route('/deploys', deploysRoutes);

@@ -216,22 +216,35 @@ elif [[ -f "$RELEASE_MARKER" ]]; then
 fi
 
 # ── Node.js ──────────────────────────────────────────────────────────────────
+# The major the platform runs on. Node 20 is end-of-life (2026-04-30) and got no
+# fix in the October 2026 security release, so a box below this is upgraded.
+NODE_MAJOR=22
 ensure_node() {
   if command -v node &>/dev/null; then
     local ver
     ver=$(node -e "console.log(parseInt(process.version.slice(1)))" 2>/dev/null || echo 0)
-    if [[ $ver -ge 20 ]]; then
+    if [[ $ver -ge $NODE_MAJOR ]]; then
       info "Node.js $(node --version) already installed"
       return 0
     fi
-    warn "Node.js $ver found — need 20+, upgrading via NodeSource..."
+    # Under isolation none, tenant apps run on THIS node: their node_modules were
+    # built for its ABI, and a major upgrade breaks native addons until each app
+    # is rebuilt. Only a docker box (tenants run in their own images) is upgraded
+    # in place; anywhere else the operator upgrades deliberately.
+    local isolation="$ISOLATION"
+    [[ -z "$isolation" ]] && isolation=$(sed -n "s/^DROP_ISOLATION=//p" /etc/drop/drop.env 2>/dev/null | tail -1)
+    if [[ "$isolation" != "docker" ]]; then
+      warn "Node.js $ver is end-of-life; DROP wants ${NODE_MAJOR}+. Not upgrading in place: under isolation none tenant apps run on the host Node, and their native modules must be rebuilt for a new major. Upgrade Node yourself, then redeploy the apps."
+      return 0
+    fi
+    warn "Node.js $ver found — need ${NODE_MAJOR}+, upgrading via NodeSource..."
   else
     info "Node.js not found — installing via NodeSource..."
   fi
   if ! command -v curl &>/dev/null; then
     aptget update -qq && aptget install -y curl
   fi
-  curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+  curl -fsSL "https://deb.nodesource.com/setup_${NODE_MAJOR}.x" | bash -
   aptget install -y nodejs
   info "Node.js $(node --version) installed"
 }
@@ -307,7 +320,7 @@ ensure_docker() {
   # lists disagree, because the failure is otherwise silent and only shows up
   # as a slow first deploy on a box nobody is watching.
   info "Pre-pulling DROP base images (this may take a few minutes)..."
-  for img in     "node:20-slim@sha256:2cf067cfed83d5ea958367df9f966191a942351a2df77d6f0193e162b5febfc0"     "python:3.12-slim@sha256:09f7da3bc104798d0afb40bc08d23ab2da20a76130cec1f2ef170848f5d85217"     "golang:1.22-alpine@sha256:1699c10032ca2582ec89a24a1312d986a3f094aed3d5c1147b19880afe40e052"     "nginx:alpine@sha256:db35bfc6b2951e7f8a72db5db120288c127ffaeeb4a6d4b95a26fead017d5913"; do
+  for img in     "node:22-slim@sha256:de170b39439eb0e5a3444ad7d60b015614a381e10fecae2e30ec9e735122f38d"     "python:3.12-slim@sha256:09f7da3bc104798d0afb40bc08d23ab2da20a76130cec1f2ef170848f5d85217"     "golang:1.22-alpine@sha256:1699c10032ca2582ec89a24a1312d986a3f094aed3d5c1147b19880afe40e052"     "nginx:alpine@sha256:db35bfc6b2951e7f8a72db5db120288c127ffaeeb4a6d4b95a26fead017d5913"; do
     docker pull "$img" 2>&1 | tail -1 || warn "Failed to pre-pull $img — will retry on first deploy"
   done
 

@@ -102,6 +102,8 @@ describe('Pm2Runtime', () => {
       const info = await runtime.getStatus('test-app');
       expect(info).toEqual({
         name: 'test-app',
+        // Slot a: the instance IS the bare app name (#298 step 4).
+        instance: 'test-app',
         status: 'running',
         runtime: 'pm2',
         pid: 1234,
@@ -241,3 +243,42 @@ describe('OOM reporting', () => {
     expect('oomKilled' in info).toBe(false);
   });
 });
+
+describe('Pm2Runtime live instances (#298 step 4)', () => {
+  let pm: jest.Mocked<ProcessManager>;
+  let runtime: Pm2Runtime;
+
+  beforeEach(() => {
+    pm = mockProcessManager();
+    runtime = new Pm2Runtime(pm);
+  });
+
+  it('starts under spec.instance, keeping name as the app', async () => {
+    pm.start.mockResolvedValue(pm2Status({ name: 'test-app.b' }));
+
+    const info = await runtime.start({ name: 'test-app', instance: 'test-app.b', script: 'x', cwd: '/x' });
+
+    expect(pm.start).toHaveBeenCalledWith(expect.objectContaining({ name: 'test-app.b' }));
+    expect(info).toEqual(expect.objectContaining({ name: 'test-app', instance: 'test-app.b' }));
+  });
+
+  it('routes app-named calls to the live instance, and explicit instance names as given', async () => {
+    runtime.setLiveInstance('test-app', 'b');
+
+    await runtime.stop('test-app');
+    await runtime.getStatus('test-app');
+    await runtime.delete('test-app');
+    expect(pm.stop).toHaveBeenCalledWith('test-app.b');
+    expect(pm.getStatus).toHaveBeenCalledWith('test-app.b');
+    expect(pm.delete).toHaveBeenCalledWith('test-app.b');
+
+    // The old instance is still addressable by its own name.
+    await runtime.stop('test-app');
+    await runtime.delete('test-app.b');
+    runtime.setLiveInstance('test-app', 'a');
+    await runtime.stop('test-app');
+    expect(pm.stop).toHaveBeenLastCalledWith('test-app');
+    expect(runtime.getLiveInstance('test-app')).toBe('a');
+  });
+});
+

@@ -14,6 +14,7 @@
  */
 
 import { AppProcessInfo } from '../managers/runtime';
+import type { RollbackSnapshotMeta } from '../managers/rollback';
 // Only the three the PlatformOps interface below actually references —
 // DetachServiceOutcome/DetachServiceRestartOutcome are re-exported (below)
 // but not used in this file's own signatures.
@@ -43,6 +44,27 @@ export class AppInProgressError extends Error {
   constructor(appName: string) {
     super(`Application '${appName}' has an operation in progress`);
     this.name = 'AppInProgressError';
+  }
+}
+
+/**
+ * Thrown before a start, restart, rollback, promotion or attach that would run
+ * a node_modules tree built for a different Node runtime. Those entry points
+ * throw it before touching anything; the start-spec backstop beneath them can
+ * throw it after its caller's own side effects (see assertDependenciesCurrent).
+ * An explicit redeploy rebuilds the tree, a stopped app included. The message
+ * names no path, marker or Node version: it reaches tenants through the API
+ * and MCP.
+ */
+export class StaleDependenciesError extends Error {
+  readonly code = 'STALE_DEPENDENCIES';
+
+  constructor(appName: string) {
+    super(
+      `Application '${appName}' was not started: this version's dependencies were built for a ` +
+        'different Node runtime. Redeploy the app to rebuild them.'
+    );
+    this.name = 'StaleDependenciesError';
   }
 }
 
@@ -182,6 +204,22 @@ export interface PlatformOps {
    * nobody approved. Rejects when nothing is held.
    */
   promoteApp(appName: string): Promise<void>;
+
+  /**
+   * Go back to what served before the last deploy, without rebuilding: cut
+   * over to the app's previous release when it has one (#298 step 6), else
+   * restore its last-good tree (captured before the redeploy that replaced
+   * it) and restart it on its existing port (#296). Rejects with NoRollbackSnapshotError when nothing was captured,
+   * AppInProgressError when the app is busy. Restores CODE only — see
+   * `NOT_RESTORED` in managers/rollback.
+   */
+  rollbackApp(appName: string): Promise<{ meta: RollbackSnapshotMeta; info: AppProcessInfo }>;
+
+  /**
+   * What `rollbackApp` would go back to — the previous release (#298 step 6)
+   * or the snapshot — without doing it; null when there is nothing.
+   */
+  describeRollback(appName: string): Promise<RollbackSnapshotMeta | null>;
 
   /**
    * Tear down every app belonging to a monorepo group (M4): stop+delete each

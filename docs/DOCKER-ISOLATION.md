@@ -44,7 +44,7 @@ Applied to every container, and not overridable from `drop.yaml` or the API:
 | non-root `User` per image | the process starting life as uid 0 |
 | **read-only root filesystem** | writing a binary to `/usr/local/bin` or rewriting `/etc` |
 | **tmpfs for `/tmp`, `/run`, `/var/run`, `/var/cache/nginx`** | those writes still working, without giving back an executable surface — each is `noexec,nosuid,nodev` and size-capped |
-| **digest-pinned base images** | the image behind `node:20-slim` changing under you between two boxes or two days |
+| **digest-pinned base images** | the image behind `node:22-slim` changing under you between two boxes or two days |
 | **fixed `/data` mount** | the host's directory layout and DROP's root location being visible inside the container |
 | loopback-only port publish | an app reaching the internet without passing Caddy |
 | `drop-net` with ICC disabled | one tenant container talking to another |
@@ -118,7 +118,7 @@ direction.
 To refresh:
 
 ```bash
-docker buildx imagetools inspect node:20-slim   # → Digest: sha256:…
+docker buildx imagetools inspect node:22-slim   # → Digest: sha256:…
 ```
 
 Use `buildx imagetools`, **not** `docker manifest inspect -v`. The latter

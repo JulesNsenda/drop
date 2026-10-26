@@ -15,10 +15,12 @@
  */
 
 import * as path from 'path';
-import * as fsp from 'fs/promises';
-import { BuildContext } from '../builder.types';
+import { BuildContext, DependencySettle } from '../builder.types';
 import { AppType, PackageJson } from '../../detector/detector.types';
 import { BaseBuildStrategy } from './base';
+import { NODE_MODULES_BUILD_TYPES, NODE_RUNTIME_TYPES } from '../node-types';
+import { ensureFreshNodeModules, stampToolchain } from '../toolchain';
+import { readTenantText } from '../../../utils/tenant-file';
 
 const STATIC_OUTPUT_DIRS = ['dist', 'build', 'public', 'out', '_site', 'www'];
 
@@ -29,9 +31,15 @@ const STATIC_OUTPUT_DIRS = ['dist', 'build', 'public', 'out', '_site', 'www'];
  */
 const DEFAULT_BUILD_OUTPUT_DIR = 'dist';
 
+/** package.json is tenant-authored; far bigger than any real one. */
+const MAX_PACKAGE_JSON_BYTES = 1024 * 1024;
+
 export class StaticBuildStrategy extends BaseBuildStrategy {
   name = 'static';
-  supportedTypes: AppType[] = ['static', 'spa'];
+  // The node-modules build types that are not node runtimes: static and spa.
+  supportedTypes: AppType[] = NODE_MODULES_BUILD_TYPES.filter(
+    (type) => !NODE_RUNTIME_TYPES.includes(type)
+  );
 
   getInstallCommand(context: BuildContext): string | null {
     // Set by preBuild only for the source-SPA path; stays null (no install
@@ -56,7 +64,25 @@ export class StaticBuildStrategy extends BaseBuildStrategy {
     return '.';
   }
 
+  /**
+   * Runs before the drop.yaml preBuild hooks. Asks the same question preBuild
+   * acts on (willChooseJsInstall). Only a preset JS install command (which
+   * getInstallCommand still returns) runs an install in the other cases. The
+   * returned handle is settled by the builder.
+   */
+  async prepareDependencies(context: BuildContext): Promise<DependencySettle> {
+    return ensureFreshNodeModules(context, await this.willChooseJsInstall(context, true));
+  }
+
   async preBuild(context: BuildContext): Promise<void> {
+    // Source SPA: package.json declares a `build` script but no build output
+    // exists yet. Install + build; the produced output dir is resolved in
+    // postBuild, after the build has actually run.
+    if (await this.willChooseJsInstall(context)) {
+      await this.configureSourceSpaBuild(context);
+      return;
+    }
+
     if (context.config.outputDirectory) {
       // Explicit override - nothing to detect.
       return;
@@ -71,18 +97,19 @@ export class StaticBuildStrategy extends BaseBuildStrategy {
       return;
     }
 
-    // Source SPA: package.json declares a `build` script but no build output
-    // exists yet. Install + build; the produced output dir is resolved in
-    // postBuild, after the build has actually run.
-    if (await this.isSourceSpa(context.appPath)) {
-      await this.configureSourceSpaBuild(context);
-      return;
-    }
-
     // Plain static site served straight from the repo root.
     const rootIndex = path.join(context.appPath, 'index.html');
     if (await this.fileExists(rootIndex)) {
       context.config.outputDirectory = '.';
+    }
+  }
+
+  /** Stamp node_modules after a successful JS install (source SPA or preset command). */
+  async postInstall(context: BuildContext, deps?: DependencySettle): Promise<void> {
+    try {
+      await stampToolchain(context, this.getInstallCommand(context), deps);
+    } catch {
+      // Best-effort: an unstamped tree is left for the next install to reconcile.
     }
   }
 
@@ -105,6 +132,22 @@ export class StaticBuildStrategy extends BaseBuildStrategy {
   }
 
   /**
+   * True when this strategy will pick a JS install for itself: no explicit
+   * outputDirectory, no existing output dir with an index (already-built), and a
+   * package.json with a `build` script (a source SPA). The ONE answer
+   * prepareDependencies and preBuild both act on. `announce` is true for the
+   * first asker only (prepareDependencies), so a refused package.json is logged
+   * once per build, not once per asker.
+   */
+  private async willChooseJsInstall(context: BuildContext, announce = false): Promise<boolean> {
+    return (
+      !context.config.outputDirectory &&
+      !(await this.findOutputDirWithIndex(context.appPath)) &&
+      (await this.isSourceSpa(context.appPath, announce ? context.onBuildLog : undefined))
+    );
+  }
+
+  /**
    * First entry of STATIC_OUTPUT_DIRS (in priority order) that contains an
    * index.html, or null if none do.
    */
@@ -122,12 +165,21 @@ export class StaticBuildStrategy extends BaseBuildStrategy {
    * True when appPath has a package.json declaring a `build` script - i.e.
    * it's a buildable source SPA rather than a plain static site.
    */
-  private async isSourceSpa(appPath: string): Promise<boolean> {
+  private async isSourceSpa(appPath: string, onLog?: (line: string) => void): Promise<boolean> {
+    // Hardened read: package.json can be a symlink or FIFO a tenant left
+    // behind. Absent or refused is "not a source SPA", as a read error was; a
+    // refusal is logged (generic, no path), since the app is then served
+    // unbuilt rather than installed and built.
+    const read = await readTenantText(appPath, 'package.json', MAX_PACKAGE_JSON_BYTES);
+    if (read.kind === 'refused') {
+      onLog?.('package.json is not a plain file; treating the app as already built.');
+    }
+    if (read.kind !== 'ok') return false;
     try {
-      const raw = await fsp.readFile(path.join(appPath, 'package.json'), 'utf-8');
-      const pkg = JSON.parse(raw) as PackageJson;
+      const pkg = JSON.parse(read.text) as PackageJson;
       return Boolean(pkg.scripts?.build);
     } catch {
+      // Not valid JSON: not a buildable source SPA.
       return false;
     }
   }

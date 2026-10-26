@@ -37,12 +37,12 @@ export const DROP_NET_GATEWAY = process.env.DROP_NET_GATEWAY ?? '10.83.0.1';
  * deliberately avoided so image changes are a conscious upgrade decision.
  */
 const BASE_IMAGES: Partial<Record<AppType, string>> = {
-  nodejs: 'node:20-slim',
+  nodejs: 'node:22-slim',
   python: 'python:3.12-slim',
   // Python web frameworks: the detector reports the specific type (django/
   // flask/fastapi), and the BUILD image is selected from that wide type
   // (platform.ts passes `detection.type`). Without these entries they fell
-  // back to node:20-slim, where `pip` doesn't exist — the build failed with
+  // back to node:22-slim, where `pip` doesn't exist — the build failed with
   // "/bin/sh: 1: pip: not found". (The runtime container uses the narrowed
   // 'python' type and was already correct.)
   django: 'python:3.12-slim',
@@ -52,18 +52,18 @@ const BASE_IMAGES: Partial<Record<AppType, string>> = {
   static: 'nginx:alpine',
   // SPAs are served by the same nginx path as plain static apps
   // (buildStartSpec treats 'static' and 'spa' identically); without this
-  // entry they fell back to node:20-slim, where the nginx start command
+  // entry they fell back to node:22-slim, where the nginx start command
   // cannot exist.
   spa: 'nginx:alpine',
 };
 
 /** Fallback for types not yet fully containerised. */
-const FALLBACK_IMAGE = 'node:20-slim';
+const FALLBACK_IMAGE = 'node:22-slim';
 
 /**
  * Content digests for every tag above (Tier B, DROP-160).
  *
- * A tag is a mutable pointer. `node:20-slim` is rebuilt on the publisher's
+ * A tag is a mutable pointer. `node:22-slim` is rebuilt on the publisher's
  * schedule, so two DROP boxes pulling "the same" image on different days run
  * different code, and the allowlist that `selectBaseImage` enforces guarantees
  * only a NAME — the bytes behind it are whoever controls that tag. Pinning the
@@ -89,7 +89,7 @@ const FALLBACK_IMAGE = 'node:20-slim';
  * is not "edit the source and rebuild".
  */
 const IMAGE_DIGESTS: Record<string, string> = {
-  'node:20-slim': 'sha256:2cf067cfed83d5ea958367df9f966191a942351a2df77d6f0193e162b5febfc0',
+  'node:22-slim': 'sha256:de170b39439eb0e5a3444ad7d60b015614a381e10fecae2e30ec9e735122f38d',
   'python:3.12-slim': 'sha256:09f7da3bc104798d0afb40bc08d23ab2da20a76130cec1f2ef170848f5d85217',
   'golang:1.22-alpine': 'sha256:1699c10032ca2582ec89a24a1312d986a3f094aed3d5c1147b19880afe40e052',
   'nginx:alpine': 'sha256:db35bfc6b2951e7f8a72db5db120288c127ffaeeb4a6d4b95a26fead017d5913',
@@ -193,8 +193,8 @@ export function selectBaseImage(appType: AppType, runtimeImage?: string): string
  * for every other type today.
  */
 const BUILD_IMAGE_OVERRIDES: Partial<Record<AppType, string>> = {
-  static: 'node:20-slim',
-  spa: 'node:20-slim',
+  static: 'node:22-slim',
+  spa: 'node:22-slim',
 };
 
 /**
@@ -214,7 +214,7 @@ export function selectBuildImage(appType: AppType, runtimeImage?: string): strin
  * Non-root user per base image.  Used in Docker `User` field so deployed apps
  * do not run as root inside the container.
  *
- * - node:20-slim ships a `node` user (UID 1000, GID 1000).
+ * - node:22-slim ships a `node` user (UID 1000, GID 1000).
  * - python/go slim images have no named non-root user; `1000:1000` is used as
  *   a numeric UID which Docker accepts even without /etc/passwd entry.
  * - static/spa run nginx:alpine as its `nginx` user (uid/gid 101) — Tier B:
@@ -427,4 +427,29 @@ function buildFingerprintPayload(inputs: ContainerPolicyInputs): Record<string, 
     pgSocketDir: inputs.pgSocketDir,
   };
   return payload;
+}
+
+/**
+ * The probe the Docker HEALTHCHECK runs inside the app's own container. Base
+ * images differ in what they ship: node:*-slim has neither curl nor wget,
+ * nginx:alpine has wget but not node, and python:*-slim has only python3. So it
+ * tries curl, then wget, then node's built-in fetch, then python's urllib, and
+ * fails only when none of them can reach the app. Healthy means a status below
+ * 400 (what `curl -f` and `wget` accept). The URL is passed as `$1`, never
+ * spliced into the shell text, because the path comes from the tenant's
+ * drop.yaml. The node probe runs inside the app's own memory limit every 30s,
+ * so its heap is capped: a probe must never be what pushes an app into an OOM
+ * kill that DROP would then blame on the app.
+ */
+const HEALTH_PROBE_SCRIPT =
+  'curl -fsS -o /dev/null "$1" 2>/dev/null' +
+  ' || wget -q -O /dev/null "$1" 2>/dev/null' +
+  ' || node --max-old-space-size=16 -e "fetch(process.argv[1],{redirect:\'manual\'}).then(r=>process.exit(r.status<400?0:1),()=>process.exit(1))" "$1" 2>/dev/null' +
+  ' || python3 -c "import sys,urllib.request as u;sys.exit(0 if u.urlopen(sys.argv[1],timeout=5).status<400 else 1)" "$1" 2>/dev/null' +
+  // Docker reads only 0 (healthy) and 1 (unhealthy); 127 from a missing tool is not 1.
+  ' || exit 1';
+
+/** The HEALTHCHECK `Test` for an app listening on `port` with `healthCheckPath`. */
+export function healthCheckTest(port: number, healthCheckPath: string): string[] {
+  return ['CMD', 'sh', '-c', HEALTH_PROBE_SCRIPT, 'healthcheck', `http://localhost:${port}${healthCheckPath}`];
 }

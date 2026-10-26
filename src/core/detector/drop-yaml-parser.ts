@@ -14,8 +14,12 @@ import { getLogger } from '../../utils/logger';
 const ALLOWED_TOP_KEYS = new Set([
   'name', 'domains', 'tls', 'env', 'build_env', 'secrets', 'depends_on', 'port',
   'build', 'start', 'healthCheck', 'maxBodySize', 'timeout',
-  'group', 'services', 'type', 'database', 'redis', 'route', 'mcp',
+  'group', 'services', 'type', 'database', 'redis', 'route', 'mcp', 'deploy',
 ]);
+
+/** drop.yaml#deploy.strategy values (#298). */
+export const DEPLOY_STRATEGIES = ['in-place', 'zero-downtime'] as const;
+export type DeployStrategy = (typeof DEPLOY_STRATEGIES)[number];
 
 /** Keys accepted under drop.yaml#tls */
 const ALLOWED_TLS_KEYS = new Set(['certFile', 'keyFile', 'disabled']);
@@ -30,6 +34,19 @@ const ALLOWED_MCP_KEYS = new Set(['path', 'auth']);
  * traversal or empty segments.
  */
 const MCP_PATH_REGEX = /^\/[A-Za-z0-9._~/-]{0,100}$/;
+
+/**
+ * Whether `p` is a safe endpoint path on an app's own hostname: the
+ * MCP_PATH_REGEX allowlist, plus explicit rejection of traversal and empty
+ * segments (the allowlist permits '.' and '/', so "/a/../b" and "/a//b" match
+ * it on their own). No query string, no fragment, no scheme or host.
+ *
+ * Shared by drop.yaml's `mcp.path` and the MCP `verify_deployment` probe path,
+ * so a path DROP composes into a URL is held to one rule wherever it enters.
+ */
+export function isSafeEndpointPath(p: string): boolean {
+  return MCP_PATH_REGEX.test(p) && !p.includes('..') && !p.includes('//');
+}
 
 /** Keys accepted under a drop.yaml#services.<name> entry */
 const ALLOWED_SERVICE_KEYS = new Set([
@@ -243,6 +260,14 @@ export interface DropYamlConfig {
    * be surfaced, and reserves the shape PR 2's per-app OAuth will extend.
    */
   mcp?: AppMcpConfig;
+  /**
+   * How a deploy of this app is carried out (#298). `in-place` builds and runs
+   * in the app's own folder. `zero-downtime` builds each deploy into its own
+   * release directory, serves from there, and cuts traffic over to a new
+   * version only once it answers. Unset: `zero-downtime` when the app declares
+   * a `healthCheck`, `in-place` otherwise — see `effectiveDeployStrategy`.
+   */
+  deploy?: { strategy?: DeployStrategy };
 }
 
 /**
@@ -406,6 +431,25 @@ export async function findDropYaml(appPath: string): Promise<string | null> {
 }
 
 /**
+ * Parse and validate drop.yaml TEXT the caller has already read — for a caller
+ * that must read the file itself (a size-capped, symlink-refusing read of a
+ * tenant-writable tree). Throws on a YAML syntax error, like the file form.
+ */
+export function parseDropYamlContent(
+  content: string,
+  appPath: string
+): { config: DropYamlConfig } | { error: string } {
+  const parsed = yaml.parse(content) as DropYamlConfig;
+
+  // Validate the parsed config (pass appPath for TLS path containment)
+  const validationResult = validateDropYamlConfig(parsed, appPath);
+  if (!validationResult.valid) {
+    return { error: validationResult.error ?? 'invalid drop.yaml' };
+  }
+  return { config: parsed };
+}
+
+/**
  * Parse a drop.yaml file
  */
 export async function parseDropYaml(appPath: string): Promise<DropYamlParseResult> {
@@ -422,24 +466,20 @@ export async function parseDropYaml(appPath: string): Promise<DropYamlParseResul
 
   try {
     const content = await fs.readFile(yamlPath, 'utf-8');
-    const parsed = yaml.parse(content) as DropYamlConfig;
-
-    // Validate the parsed config (pass appPath for TLS path containment)
-    const validationResult = validateDropYamlConfig(parsed, appPath);
-    if (!validationResult.valid) {
-      const error = validationResult.error ?? 'invalid drop.yaml';
-      await warnParseFailure(appPath, yamlPath, error);
+    const result = parseDropYamlContent(content, appPath);
+    if ('error' in result) {
+      await warnParseFailure(appPath, yamlPath, result.error);
       return {
         config: null,
         success: false,
-        error,
+        error: result.error,
         path: yamlPath,
         exists: true,
       };
     }
 
     return {
-      config: parsed,
+      config: result.config,
       success: true,
       path: yamlPath,
       exists: true,
@@ -501,6 +541,28 @@ export function validateDropYamlConfig(
     }
   }
 
+  // Validate deploy (#298)
+  if (cfg.deploy !== undefined) {
+    if (typeof cfg.deploy !== 'object' || cfg.deploy === null || Array.isArray(cfg.deploy)) {
+      return { valid: false, error: 'deploy must be an object' };
+    }
+    const deploy = cfg.deploy as Record<string, unknown>;
+    for (const key of Object.keys(deploy)) {
+      if (key !== 'strategy') {
+        return { valid: false, error: `Unknown field 'deploy.${key}' in drop.yaml` };
+      }
+    }
+    if (
+      deploy.strategy !== undefined &&
+      !(DEPLOY_STRATEGIES as readonly unknown[]).includes(deploy.strategy)
+    ) {
+      return {
+        valid: false,
+        error: `deploy.strategy must be one of: ${DEPLOY_STRATEGIES.join(', ')}`,
+      };
+    }
+  }
+
   // Validate mcp (Step 11)
   if (cfg.mcp !== undefined) {
     if (typeof cfg.mcp !== 'object' || cfg.mcp === null || Array.isArray(cfg.mcp)) {
@@ -518,13 +580,7 @@ export function validateDropYamlConfig(
       if (typeof mcp.path !== 'string') {
         return { valid: false, error: 'mcp.path must be a string' };
       }
-      // Traversal and empty segments are rejected explicitly: the allowlist
-      // permits '.' and '/', so "/a/../b" and "/a//b" match it on their own.
-      if (
-        !MCP_PATH_REGEX.test(mcp.path) ||
-        mcp.path.includes('..') ||
-        mcp.path.includes('//')
-      ) {
+      if (!isSafeEndpointPath(mcp.path)) {
         return {
           valid: false,
           error: `Invalid mcp.path '${mcp.path}': must start with '/' and contain only letters, digits, '.', '_', '~', '-' or '/'`,

@@ -450,3 +450,35 @@ describe('getMailQuota', () => {
     expect(getMailQuota()).toBe(configured);
   });
 });
+
+describe('PrincipalQuota#peek (#293)', () => {
+  const HOUR = 60 * 60 * 1000;
+  let dir: string;
+
+  beforeEach(async () => {
+    dir = await fs.mkdtemp(path.join(os.tmpdir(), 'drop-quota-peek-'));
+  });
+
+  afterEach(async () => {
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+
+  it('reports usage and when the oldest counted deploy ages out', () => {
+    const quota = new PrincipalQuota(path.join(dir, 'q.json'));
+    const key = { key: 'p1', limit: 5, kind: 'principal' as const };
+    quota.record([key], 1_000);
+    quota.record([key], 2_000);
+
+    expect(quota.peek('p1', 3_000)).toEqual({ used: 2, resetsAt: 1_000 + HOUR });
+    expect(quota.peek('nobody', 3_000)).toEqual({ used: 0 });
+  });
+
+  it('does not prune what it reads', () => {
+    const quota = new PrincipalQuota(path.join(dir, 'q.json'));
+    const key = { key: 'p1', limit: 5, kind: 'principal' as const };
+    quota.record([key], 1_000);
+
+    expect(quota.peek('p1', 1_000 + HOUR + 1)).toEqual({ used: 0 });
+    expect(quota.peek('p1', 2_000).used).toBe(1);
+  });
+});

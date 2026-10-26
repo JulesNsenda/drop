@@ -348,8 +348,24 @@ export interface AppConfig {
     deployId?: string;
     builtAt: string;
     outputDirectory?: string;
+    /**
+     * The release directory the held build lives in, for an app on the
+     * zero-downtime strategy (#298). Promotion starts from it. Re-validated to
+     * sit under this app's releases root before use — see release-store.
+     */
+    releasePath?: string;
   };
   sourceHash?: string;
+  /**
+   * Fingerprint of the monorepo source a group child was last copied from
+   * (container name, service path, the child drop.yaml as rendered, and the
+   * service subtree as the copy sees it). Recorded by expandMonorepo only
+   * once the rebuilt child is running, and compared at boot to leave a
+   * current child alone. Only meaningful on
+   * a group child; deliberately NOT sourceHash, which covers the child's own
+   * built tree.
+   */
+  groupSourceHash?: string;
   /**
    * SHA-256 fingerprint of the app's secret key/value set (sorted, hashed —
    * never the plaintext values) as of the last successful deploy. `PUT`/
@@ -473,6 +489,51 @@ export interface AppConfig {
    * who may do something and costs a dedicated setter per field.
    */
   reviewBy?: string;
+  /**
+   * The release the app is serving from, for an app on the zero-downtime
+   * strategy (#298): a per-deploy directory under `data/releases/<app>/`.
+   * Absent for in-place apps, which serve from their source folder. SYSTEM
+   * tier: it becomes the runtime's working directory.
+   */
+  currentRelease?: AppRelease;
+  /**
+   * The release served before `currentRelease` — or, for an app that has just
+   * opted out, its last release — kept as the rollback target (#298 step 6).
+   */
+  previousRelease?: AppRelease;
+  /**
+   * Which runtime slot is live (#298): `a` = the bare app name, `b` =
+   * `<app>.b`. Absent means `a`. Written by a zero-downtime cutover AFTER the
+   * new instance proved ready and BEFORE traffic moves, and re-applied to the
+   * runtime at boot. Separate from `currentRelease` so it survives an app
+   * opting back out of releases while its slot-b instance is still running.
+   */
+  runtimeSlot?: 'a' | 'b';
+  /**
+   * The dashboard/API custom domain (`AppState.customDomain`) DROP has seen
+   * resolve to this box (#302). Routed only while it still equals the app's
+   * `customDomain`, so changing the domain unroutes the old one without a
+   * second write. SYSTEM tier: it decides what Caddy serves.
+   */
+  customDomainVerified?: { domain: string; verifiedAt: string };
+}
+
+export interface AppRelease {
+  id: string;
+  path: string;
+  createdAt: string;
+  /**
+   * Which runtime slot runs this release (#298 step 4). Absent means slot `a`,
+   * the bare app name. Re-applied to the runtime at boot, so the live slot
+   * survives a platform restart.
+   */
+  instance?: 'a' | 'b';
+  /**
+   * The app's `outputDirectory` when this release started serving — what a
+   * rollback to it must serve from (a deploy can change it). Absent on
+   * releases recorded before #298 step 6.
+   */
+  outputDirectory?: string;
 }
 
 /**
@@ -490,6 +551,13 @@ const SYSTEM_CONFIG_FIELDS = [
   'ephemeralPrincipalId',
   'expiresAt',
   'lastDetachAt',
+  'currentRelease',
+  'previousRelease',
+  'runtimeSlot',
+  'customDomainVerified',
+  // Decides whether boot leaves a monorepo child unbuilt — a tenant-writable
+  // value here would let a request body force or forge that skip.
+  'groupSourceHash',
 ] as const satisfies readonly (keyof AppConfig)[];
 
 type SystemConfigField = (typeof SYSTEM_CONFIG_FIELDS)[number];
@@ -1224,6 +1292,10 @@ export class AppConfigService {
       if (config.hostname) owners.set(config.hostname.toLowerCase(), appName);
       for (const d of config.domains ?? []) {
         owners.set(d.toLowerCase(), appName);
+      }
+      // A verified dashboard custom domain (#302) is routed, so it is claimed.
+      if (config.customDomainVerified) {
+        owners.set(config.customDomainVerified.domain.toLowerCase(), appName);
       }
     }
     // Pass 2: each app's computed default hostname is authoritative for that app.

@@ -38,6 +38,15 @@ export interface MailSettings {
   from?: string;
 }
 
+/** Object storage (#301): the non-secret half. The AWS admin key lives in object-storage/credential-store.ts. */
+export interface ObjectStorageSettings {
+  enabled?: boolean;
+  /** AWS region new buckets are created in, e.g. `eu-central-1`. */
+  region?: string;
+  /** Prefix for every bucket and IAM user DROP creates — unique per DROP install. */
+  bucketPrefix?: string;
+}
+
 export interface PlatformSettings {
   /** Admin-set public base URL override (falls back to DROP_PUBLIC_URL env when unset). */
   publicUrl?: string;
@@ -104,6 +113,13 @@ export interface PlatformSettings {
    * flags, so neither decision is made on the other's behalf.
    */
   guestInvitesEnabled?: boolean;
+  /**
+   * Object storage (#301). Defaults to DISABLED: turning it on lets app
+   * owners create AWS resources that bill to the operator's account.
+   */
+  objectStorageEnabled?: boolean;
+  objectStorageRegion?: string;
+  objectStorageBucketPrefix?: string;
 }
 
 export interface SettingsManagerConfig {
@@ -152,6 +168,9 @@ const SETTINGS_FIELDS: Record<keyof PlatformSettings, SettingsFieldType> = {
   mailFrom: 'string',
   shareNotificationsEnabled: 'boolean',
   guestInvitesEnabled: 'boolean',
+  objectStorageEnabled: 'boolean',
+  objectStorageRegion: 'string',
+  objectStorageBucketPrefix: 'string',
   // The SMTP password is deliberately NOT here — and cannot be, since it is
   // not a key of `PlatformSettings` at all. It lives encrypted in its own
   // store (mail-credential.ts), owned by the mailer; adding it to
@@ -418,6 +437,26 @@ export class SettingsManager {
     // Same persist-then-commit-in-memory shape as setPublicUrl above — see
     // that method's comment for why this isn't queued through a chained
     // savePromise.
+    await this.doSave(next);
+    this.settings = next;
+  }
+
+  /** Object storage settings (#301). Disabled and empty when the store is corrupt. */
+  getObjectStorageSettings(): ObjectStorageSettings {
+    if (this.corrupt) return { enabled: false };
+    return {
+      enabled: this.settings.objectStorageEnabled ?? false,
+      region: this.settings.objectStorageRegion,
+      bucketPrefix: this.settings.objectStorageBucketPrefix,
+    };
+  }
+
+  /** Key-presence semantics, like setMailSettings: an absent key is untouched, `undefined` clears. */
+  async setObjectStorageSettings(partial: ObjectStorageSettings): Promise<void> {
+    const next: PlatformSettings = { ...this.settings };
+    if ('enabled' in partial) next.objectStorageEnabled = partial.enabled;
+    if ('region' in partial) next.objectStorageRegion = partial.region;
+    if ('bucketPrefix' in partial) next.objectStorageBucketPrefix = partial.bucketPrefix;
     await this.doSave(next);
     this.settings = next;
   }

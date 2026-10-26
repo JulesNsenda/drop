@@ -22,6 +22,7 @@ import {
   AppNeedsConfigError,
   needsConfigAction,
   needsConfigDetail,
+  StaleDependenciesError,
   type AttachableServiceId,
 } from '../platform-ops';
 import { getSecretManager } from '../../managers/secret';
@@ -37,6 +38,8 @@ import { getDatabaseProvisioner } from '../../managers/database';
 import { getRedisProvisioner } from '../../managers/redis';
 import { getRouterService } from '../../core/router';
 import { logActivityFor } from '../../managers/activity';
+import { NoRollbackSnapshotError, NOT_RESTORED } from '../../managers/rollback';
+import type { RollbackSnapshotMeta } from '../../managers/rollback';
 import {
   getAppsDirectory,
   getDomainSuffix,
@@ -45,6 +48,7 @@ import {
   getPublicUrl,
 } from '../runtime-config';
 import { isPathWithin } from '../../utils/paths';
+import { setCustomDomain, customDomainStatus, assertCustomDomainAllowed } from '../custom-domain';
 import { isReservedHost } from '../../utils/reserved-hosts';
 import { computeAppUrl } from '../../utils/app-url';
 import { eventBus } from '../../core/event-bus';
@@ -53,6 +57,8 @@ import {
   ArchiveRejectedError,
   UploadValidationError,
   InsufficientDiskSpaceError,
+  createSourceArchive,
+  EmptySourceError,
 } from '../../core/upload-deploy';
 import {
   describeAccessGateRefusal,
@@ -89,33 +95,20 @@ apps.use('/:name/*', validateAppName());
  */
 const UPDATABLE_APP_FIELDS = ['framework', 'customDomain'] as const;
 
-/**
- * Same check `PUT /:name/domain` applies. This route accepted `customDomain`
- * unvalidated, and the value is interpolated into a URL by `computeAppUrl` —
- * a value WHATWG URL rejects (a space, a '[') therefore threw inside anything
- * building an app URL. One tenant could poison a shared derivation that way.
- */
-const CUSTOM_DOMAIN_RE = /^[a-zA-Z0-9][a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/;
-
 function pickUpdatableFields(body: Record<string, unknown>): Partial<AppState> {
   const updates: Partial<AppState> = {};
   for (const field of UPDATABLE_APP_FIELDS) {
     if (body[field] !== undefined) {
       if (field === 'customDomain') {
+        // Same rules as `PUT /:name/domain` and the MCP tool (#302): one rule
+        // set behind every door. Unvalidated, the value once reached
+        // `computeAppUrl`, where a string WHATWG URL rejects threw inside
+        // anything building an app URL. '' clears the domain.
         const value = body[field];
-        // '' clears the domain, matching the dedicated route.
-        if (value !== '' && (typeof value !== 'string' || !CUSTOM_DOMAIN_RE.test(value))) {
+        if (value !== '' && typeof value !== 'string') {
           throw new ValidationError('Invalid domain format');
         }
-        // Same reservation as the dedicated route — this is the other writer,
-        // and a guard on only one of two doors is not a guard.
-        if (
-          typeof value === 'string' &&
-          value !== '' &&
-          isReservedHost(value, getPublicUrl(), getDomainSuffix())
-        ) {
-          throw new ValidationError('That domain is reserved by the platform');
-        }
+        if (value !== '') assertCustomDomainAllowed(value as string);
       }
       (updates as Record<string, unknown>)[field] = body[field];
     }
@@ -489,6 +482,74 @@ apps.post('/', async c => {
   return c.json(success(toAppDto({ ...app, userId: auth?.userId }, auth?.role === 'admin')), 201);
 });
 
+// GET /apps/:name/source - Download the app's SOURCE as a gzipped tarball
+// (#315), in the shape POST /apps/:name/source accepts back. What is left out,
+// and why links are never followed, is in core/upload-deploy/source-archive.ts.
+//
+// auth('user') and the upload rate-limit bucket both come from the
+// `/apps/*/source` registrations in server.ts, which cover every method. Three
+// refusals on top of ownership:
+//  - no auth context: on an auth-disabled box canAccess() admits everyone, and
+//    a source tree can hold credentials (.env), so this fails closed the way
+//    the database panel's reads do;
+//  - an agent credential: its scopes grant deploy and read verbs over an app,
+//    not exporting the whole tree; a person does this;
+//  - a non-admin whose app's recorded path is outside the webapps directory
+//    (only an admin can register one), or IS that directory.
+apps.get('/:name/source', async c => {
+  const auth = (c.get as Function)('auth') as AuthContext | undefined;
+  const name = c.req.param('name');
+  const app = getStateManager().getApp(name);
+  if (!app || !canAccess(auth, app)) {
+    throw new NotFoundError(`Application '${name}' not found`);
+  }
+  if (!auth) {
+    return c.json(
+      error(ErrorCodes.UNAUTHORIZED, 'Downloading source is unavailable when authentication is disabled.'),
+      403
+    );
+  }
+  if (auth.kind === 'agent') {
+    return c.json(
+      error(ErrorCodes.UNAUTHORIZED, 'Downloading source requires a user session or API key. Agent credentials cannot download source.'),
+      403
+    );
+  }
+
+  const sourcePath = getAppConfigServiceOrNull()?.getConfig(name)?.path || app.path;
+  if (auth.role !== 'admin') {
+    const appsDir = getAppsDirectory();
+    const inside =
+      (await isPathWithin(appsDir, sourcePath)) &&
+      (await fs.realpath(sourcePath).catch(() => sourcePath)) !==
+        (await fs.realpath(appsDir).catch(() => appsDir));
+    if (!inside) {
+      throw new NotFoundError(`Application '${name}' has no downloadable source`);
+    }
+  }
+
+  let archive: Readable;
+  try {
+    archive = await createSourceArchive(name, sourcePath);
+  } catch (err) {
+    if (err instanceof EmptySourceError || (err as NodeJS.ErrnoException).code === 'ENOENT') {
+      throw new NotFoundError(`Application '${name}' has no downloadable source`);
+    }
+    throw err;
+  }
+
+  await logActivityFor(auth, { action: 'source-download', appName: name });
+  return new Response(Readable.toWeb(archive) as unknown as ReadableStream, {
+    status: 200,
+    headers: {
+      'Content-Type': 'application/gzip',
+      // `name` passed validateAppName: [A-Za-z0-9_-] only, safe in a header.
+      'Content-Disposition': `attachment; filename="${name}-source.tar.gz"`,
+      'Cache-Control': 'no-store',
+    },
+  });
+});
+
 // POST /apps/:name/source - Deploy (or redeploy) from an uploaded gzipped
 // tarball (PRD-039). Never anonymous — auth('user') is wired in server.ts
 // even when the general /apps/* guard would allow readonly.
@@ -610,8 +671,10 @@ apps.put('/:name', async c => {
   // Only allow a strict set of user-editable fields; ignore everything else
   // (userId, path, port, status, pid, ...) to prevent ownership takeover
   // and escape of platform-managed invariants.
-  const updates = pickUpdatableFields(body);
+  const { customDomain, ...updates } = pickUpdatableFields(body);
 
+  // Through the shared path, which also unroutes a verified domain it replaces.
+  if (customDomain !== undefined) await setCustomDomain(name, customDomain);
   const updated = await stateManager.updateApp(name, updates);
   if (!updated) {
     throw new NotFoundError(`Application '${name}' not found`);
@@ -926,7 +989,7 @@ apps.post('/:name/start', async c => {
     });
     return c.json(success({ message: `Application '${name}' started`, status }));
   } catch (err) {
-    if (err instanceof AppInProgressError) {
+    if (err instanceof AppInProgressError || err instanceof StaleDependenciesError) {
       return c.json(error(ErrorCodes.CONFLICT, err.message), 409);
     }
     if (err instanceof AppNeedsConfigError) {
@@ -1027,6 +1090,9 @@ apps.post('/:name/promote', async c => {
     });
     return c.json(success({ app: name, promoted: true }));
   } catch (err) {
+    if (err instanceof StaleDependenciesError) {
+      return c.json(error(ErrorCodes.CONFLICT, err.message), 409);
+    }
     const message = err instanceof Error ? err.message : 'Promote failed';
     if (message.includes('awaiting promotion')) {
       return c.json(error(ErrorCodes.BAD_REQUEST, message), 400);
@@ -1058,7 +1124,7 @@ apps.post('/:name/restart', async c => {
     });
     return c.json(success({ message: `Application '${name}' restarted`, status }));
   } catch (err) {
-    if (err instanceof AppInProgressError) {
+    if (err instanceof AppInProgressError || err instanceof StaleDependenciesError) {
       return c.json(error(ErrorCodes.CONFLICT, err.message), 409);
     }
     if (err instanceof AppNeedsConfigError) {
@@ -1071,6 +1137,84 @@ apps.post('/:name/restart', async c => {
       );
     }
     const message = err instanceof Error ? err.message : 'Failed to restart';
+    return c.json(error(ErrorCodes.INTERNAL_ERROR, message), 500);
+  }
+});
+
+// ============ Rollback (#296) ============
+
+/** The honest shape of a rollback: what it put back, and what it did not. */
+function rollbackReport(meta: RollbackSnapshotMeta) {
+  return {
+    // 'release': the previous release, deployed at snapshotTakenAt (#298).
+    source: meta.kind ?? 'snapshot',
+    snapshotTakenAt: meta.takenAt,
+    snapshotBytes: meta.bytes,
+    restores: ['code', 'build output', 'dependencies', ...(meta.outputDirectory !== undefined ? ['output directory'] : [])],
+    doesNotRestore: [...NOT_RESTORED],
+  };
+}
+
+// GET /apps/:name/rollback - is there a last-good tree to go back to?
+apps.get('/:name/rollback', async c => {
+  const auth = (c.get as Function)('auth') as AuthContext | undefined;
+  const name = c.req.param('name');
+  const app = getStateManager().getApp(name);
+  if (!app || !canAccess(auth, app)) {
+    throw new NotFoundError(`Application '${name}' not found`);
+  }
+
+  const meta = (await getPlatformOps()?.describeRollback(name)) ?? null;
+  return c.json(
+    success(meta ? { app: name, available: true, ...rollbackReport(meta) } : { app: name, available: false })
+  );
+});
+
+// POST /apps/:name/rollback - restore the last-good tree and restart, no rebuild
+apps.post('/:name/rollback', async c => {
+  const auth = (c.get as Function)('auth') as AuthContext | undefined;
+  const name = c.req.param('name');
+  const app = getStateManager().getApp(name);
+  if (!app || !canAccess(auth, app)) {
+    throw new NotFoundError(`Application '${name}' not found`);
+  }
+
+  const ops = getPlatformOps();
+  if (!ops) {
+    return c.json(error(ErrorCodes.SERVICE_UNAVAILABLE, 'Platform operations unavailable'), 503);
+  }
+
+  try {
+    const { meta, info } = await ops.rollbackApp(name);
+    await logActivityFor(auth, {
+      action: 'rollback',
+      appName: name,
+      detail: `to tree captured ${meta.takenAt}`,
+    });
+    return c.json(
+      success({
+        message: `Application '${name}' rolled back and restarted`,
+        status: info,
+        ...rollbackReport(meta),
+      })
+    );
+  } catch (err) {
+    if (err instanceof NoRollbackSnapshotError) {
+      return c.json(
+        error(
+          ErrorCodes.CONFLICT,
+          `${err.message} A snapshot is taken only when an upload or git redeploy replaces a running app.`
+        ),
+        409
+      );
+    }
+    if (err instanceof AppInProgressError || err instanceof StaleDependenciesError) {
+      return c.json(error(ErrorCodes.CONFLICT, err.message), 409);
+    }
+    if (err instanceof AppNeedsConfigError) {
+      return c.json(error(ErrorCodes.CONFLICT, needsConfigDetail(err, name)), 409);
+    }
+    const message = err instanceof Error ? err.message : 'Failed to roll back';
     return c.json(error(ErrorCodes.INTERNAL_ERROR, message), 500);
   }
 });
@@ -1138,7 +1282,7 @@ apps.post('/:name/services/:id', async c => {
       success({ message: `${serviceId} attached to '${name}'`, envVarNames: result.envVarNames })
     );
   } catch (err) {
-    if (err instanceof AppInProgressError) {
+    if (err instanceof AppInProgressError || err instanceof StaleDependenciesError) {
       return c.json(error(ErrorCodes.CONFLICT, err.message), 409);
     }
     // The restart at the end of an attach runs the secret preflight, so this
@@ -1621,7 +1765,7 @@ apps.put('/:name/capabilities', async c => {
   try {
     await ops.restartApp(name);
   } catch (err) {
-    if (err instanceof AppInProgressError) {
+    if (err instanceof AppInProgressError || err instanceof StaleDependenciesError) {
       return c.json(error(ErrorCodes.CONFLICT, err.message), 409);
     }
     if (err instanceof AppNeedsConfigError) {
@@ -1653,36 +1797,63 @@ apps.put('/:name/capabilities', async c => {
   );
 });
 
-// PUT /apps/:name/domain - Set custom domain
+// PUT /apps/:name/domain - Set (or clear) the custom domain. Records it only:
+// it is routed once verified (POST /apps/:name/domain/verify, #302). The
+// response carries the status, which lists the DNS record to create.
+//
+// The shared rules (customDomainProblem) include the platform's own host: it
+// is not an app, so the cross-tenant owner map does not cover it, and claiming
+// it would put a tenant in front of DROP's own OAuth and MCP endpoints.
 apps.put('/:name/domain', async c => {
   const auth = (c.get as Function)('auth') as AuthContext | undefined;
   const name = c.req.param('name');
   const body = await c.req.json<{ domain?: string }>();
-  const stateManager = getStateManager();
-  const app = stateManager.getApp(name);
+  const app = getStateManager().getApp(name);
 
   if (!app || !canAccess(auth, app)) {
     throw new NotFoundError(`Application '${name}' not found`);
   }
 
   const domain = body.domain?.trim() || undefined;
-
-  // Basic domain validation
-  if (domain && !/^[a-zA-Z0-9][a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/.test(domain)) {
-    throw new ValidationError('Invalid domain format');
-  }
-  // The platform's own host is not an app, so the cross-tenant owner map does
-  // not cover it — claiming it here would put a tenant in front of DROP's own
-  // OAuth and MCP endpoints.
-  if (domain && isReservedHost(domain, getPublicUrl(), getDomainSuffix())) {
-    throw new ValidationError('That domain is reserved by the platform');
-  }
-
-  await stateManager.updateApp(name, { customDomain: domain || ('' as unknown as undefined) });
+  await setCustomDomain(name, domain);
 
   return c.json(
-    success({ message: domain ? `Domain set to ${domain}` : 'Domain removed', domain })
+    success({
+      message: domain
+        ? `Domain set to ${domain}. Create a DNS record below, then verify it.`
+        : 'Domain removed',
+      domain,
+      status: await customDomainStatus(name),
+    })
   );
+});
+
+// GET /apps/:name/domain - The custom domain, the DNS record to create, whether
+// DNS points here yet, and the certificate once routed (#302). Read-only.
+apps.get('/:name/domain', async c => {
+  const auth = (c.get as Function)('auth') as AuthContext | undefined;
+  const name = c.req.param('name');
+  const app = getStateManager().getApp(name);
+  if (!app || !canAccess(auth, app)) {
+    throw new NotFoundError(`Application '${name}' not found`);
+  }
+  return c.json(success(await customDomainStatus(name)));
+});
+
+// POST /apps/:name/domain/verify - Check DNS and, once it points here, route
+// the domain so Caddy obtains its certificate (#302). Idempotent: poll it.
+apps.post('/:name/domain/verify', async c => {
+  const auth = (c.get as Function)('auth') as AuthContext | undefined;
+  const name = c.req.param('name');
+  const app = getStateManager().getApp(name);
+  if (!app || !canAccess(auth, app)) {
+    throw new NotFoundError(`Application '${name}' not found`);
+  }
+  const status = await customDomainStatus(name, { verify: true });
+  if (status.state === 'verified') {
+    await logActivityFor(auth, { action: 'domain-verified', appName: name, detail: status.domain ?? undefined });
+  }
+  return c.json(success(status));
 });
 
 // POST /:name/migrate-runtime — Admin: move an app between PM2 and Docker.

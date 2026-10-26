@@ -28,6 +28,7 @@ import { getLogger } from '../../utils/logger';
 import { hasEnoughDisk, getMinFreeDiskMb } from '../../utils/disk';
 import { syncTree, DEFAULT_PRESERVE } from '../../utils/tree-sync';
 import { eventBus } from '../event-bus';
+import { captureBeforeRedeploy } from '../../managers/rollback';
 import { admitDeploy } from '../../managers/guardrail/deploy-breaker';
 import {
   checkEphemeralQuota,
@@ -191,6 +192,17 @@ export class UploadDeployService {
             // is reapable on idleness too — not only on its deadline.
             agentCreated: true,
           });
+        }
+      }
+
+      if (!isNew) {
+      // Rollback snapshot of the tree that is SERVING, before it is replaced
+      // (#296). Best-effort by contract: it never throws, and a skipped or
+      // failed snapshot never fails the deploy — it only means this redeploy
+      // cannot be rolled back, which the rollback route reports as such.
+        const snapshot = await captureBeforeRedeploy(appName);
+        if (!snapshot.captured) {
+          logger.info(`No rollback snapshot for ${appName}: ${snapshot.reason}`, 'UPLOAD-DEPLOY');
         }
       }
 

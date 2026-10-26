@@ -34,12 +34,20 @@ import {
   readMcpInputs,
 } from './detector';
 import { getProcfileWebCommand } from './detector/procfile';
-import { BuilderService, getBuilder } from './builder';
+import { BuilderService, getBuilder, resetBuilder } from './builder';
 import { RouterService, getRouterService, resetRouterService } from './router';
 import { AppRuntime, AppProcessInfo, AppStartSpec, getAppRuntime, resetAppRuntime } from '../managers/runtime';
+import {
+  instanceName,
+  instanceRef,
+  appNameOfInstance,
+  isInstanceName,
+  type InstanceSlot,
+} from '../managers/runtime/instance';
 import { AppStateManager, AppStatus, getStateManager, resetStateManager } from '../managers/app/state-manager';
 import { SettingsManager, getSettingsManager, resetSettingsManager } from '../managers/settings/settings-manager';
 import { AppConfig, AppConfigService, getAppConfigService, resetAppConfigService } from '../managers/app/app-config';
+import type { AppRelease } from '../managers/app/app-config';
 import {
   PostgresServer,
   getPostgresServer,
@@ -87,10 +95,19 @@ import {
 } from '../managers/guardrail/idle-reaper';
 import {
   findOverCeiling,
+  measureTree,
   toMb,
   configuredCeilingBytes,
   DISK_SWEEP_INTERVAL_MS,
 } from '../managers/guardrail/disk-ceiling';
+import {
+  initRollbackStore,
+  resetRollbackStore,
+  getRollbackStore,
+  NoRollbackSnapshotError,
+} from '../managers/rollback';
+import type { RollbackSnapshotMeta } from '../managers/rollback';
+import { ReleaseStore, wantsReleases } from '../managers/release';
 import {
   getDeployBreaker,
   guardrailKeysFor,
@@ -111,6 +128,7 @@ import {
   AppManifestInvalidError,
   AppNeedsConfigError,
   needsConfigAction,
+  StaleDependenciesError,
   setPlatformOps,
   resetPlatformOps,
   type AttachableServiceId,
@@ -123,6 +141,8 @@ import { planSecretPreflight, generateSecretValue } from '../managers/secret/sec
 import { Logger, createLogger } from '../utils/logger';
 import { isPathWithin } from '../utils/paths';
 import { syncTree, DEFAULT_PRESERVE } from '../utils/tree-sync';
+import { readTenantFile } from '../utils/tenant-file';
+import { parseDropYamlContent } from './detector/drop-yaml-parser';
 import {
   validateDomain,
   validateDomainFormat,
@@ -138,6 +158,18 @@ import {
   reportDaemonHardening,
 } from './startup-constraints';
 import { createContainerExecCommand } from './builder/container-build-runner';
+import {
+  NODE_MODULES_ASIDE_DIR,
+  PRE_MARKER_DOCKER_TOOLCHAIN,
+  backfillToolchainMarker,
+  checkTree,
+  removeAsideDir,
+  resetToolchainProbeCache,
+  restoreParkedTree,
+  toolchainIdFor,
+} from './builder/toolchain';
+import { NODE_MODULES_BUILD_TYPES, NODE_RUNTIME_TYPES } from './builder/node-types';
+import { writeJsonAtomic } from '../utils/atomic-write';
 import { migrateAllToDocker } from '../managers/runtime/runtime-migrator';
 import {
   CONTAINER_DATA_DIR,
@@ -455,6 +487,26 @@ const BOOT_RECONCILE_SCAN_TIMEOUT_MS = 5_000;
  */
 const BOOT_RECONCILE_CONCURRENCY = 4;
 
+/** Cap on reading a materialized monorepo child's own drop.yaml (see readChildDropYaml). */
+const MAX_CHILD_DROP_YAML_BYTES = 256 * 1024;
+
+/**
+ * Fingerprint of what a group child was materialized from: the container, the
+ * service path, the child drop.yaml exactly as rendered, and the service
+ * subtree as the copy sees it (`treeHash`).
+ */
+function groupSourceFingerprint(
+  repoName: string,
+  servicePath: string,
+  renderedChildYaml: string,
+  treeHash: string
+): string {
+  return crypto
+    .createHash('sha256')
+    .update(JSON.stringify([repoName, servicePath, renderedChildYaml, treeHash]))
+    .digest('hex');
+}
+
 /**
  * A source-tree scan result (M1 review item 2, round-2 diff pass): a SHA-256
  * hash over the sorted (relativePath, mtimeMs, size) tuple of every file/dir
@@ -506,11 +558,10 @@ export interface CheapBootReconcileInput {
   portDrifted: boolean;
   /**
    * Monorepo group tag (AppConfig.group), or undefined for a standalone app.
-   * A grouped app's container is never seeded (it has no AppConfig of its
-   * own — see the plan's monorepo limitation) and so still fires its own
-   * app:detected on boot, which unconditionally re-copies and rebuilds every
-   * child via expandMonorepo — a routing-only skip here would be clobbered
-   * moments later. Never skip a grouped app.
+   * A grouped app is never skipped on this gate: the container's own
+   * app:detected re-copies and rebuilds its children via expandMonorepo.
+   * The one exception passes `undefined` on purpose; see
+   * decideOneAppOnBoot's `ignoreGroup`.
    */
   group: string | undefined;
   /**
@@ -535,6 +586,13 @@ export interface CheapBootReconcileInput {
    * cause a mismatch there on their own.
    */
   runtimeSpecCurrent: boolean;
+  /**
+   * Whether the serving tree's node_modules carries a toolchain marker for a
+   * different Node runtime than the one that would run it now. Only `stale`
+   * counts: an unmarked tree was stamped by the boot backfill or never had a
+   * JS install, and is not evidence of a toolchain change.
+   */
+  dependenciesStale: boolean;
 }
 
 /**
@@ -570,8 +628,16 @@ export type BootReconcileInput = CheapBootReconcileInput & SignatureBootReconcil
 export function decideBootReconciliationCheap(
   input: CheapBootReconcileInput
 ): BootReconcileDecision | null {
-  const { status, isRuntimeRunning, hasPort, portDrifted, group, grantedApiScopesCount, runtimeSpecCurrent } =
-    input;
+  const {
+    status,
+    isRuntimeRunning,
+    hasPort,
+    portDrifted,
+    group,
+    grantedApiScopesCount,
+    runtimeSpecCurrent,
+    dependenciesStale,
+  } = input;
 
   // A user-stopped app is deliberately not running — leave it alone exactly
   // like the normal app:detected path does today (handleAppDetected gates on
@@ -617,6 +683,10 @@ export function decideBootReconciliationCheap(
 
   if (!runtimeSpecCurrent) {
     return { action: 'redeploy', reason: 'runtime spec revision is stale' };
+  }
+
+  if (dependenciesStale) {
+    return { action: 'redeploy', reason: 'node_modules were built for a different Node runtime' };
   }
 
   return null; // undecided — proceed to the signature phase
@@ -679,12 +749,22 @@ export function decideBootReconciliationSignature(
  * app serving old code with no error and nothing to notice, which is worse
  * than today's rebuild-everything behaviour. Every ambiguous case therefore
  * redeploys; 'skip' is returned only for the single narrow case of a known,
- * non-grouped, unscoped app under a current runtime spec that the runtime
+ * unscoped app (not grouped, unless the caller bypasses the group gate —
+ * see CheapBootReconcileInput.group) under a current runtime spec that the runtime
  * reports running right now, with a port to reconcile, an unchanged source
  * signature, and an unchanged secret set.
  */
 export function decideBootReconciliation(input: BootReconcileInput): BootReconcileDecision {
   return decideBootReconciliationCheap(input) ?? decideBootReconciliationSignature(input);
+}
+
+
+/** A cutover that did not happen; `exited` = the new instance died, vs never proved ready. */
+class CutoverError extends Error {
+  constructor(message: string, readonly exited: boolean) {
+    super(message);
+    this.name = 'CutoverError';
+  }
 }
 
 export class DropPlatform {
@@ -766,6 +846,23 @@ export class DropPlatform {
   // reachable for the exact case it exists for. Cleared after boot
   // reconciliation runs so it can't leak into a later start() on this instance.
   private bootStatusSnapshot: Map<string, AppStatus> | null = null;
+  // THE BOOT-SKIP RULE (monorepo children). A group child that boot reconcile
+  // found running, current and routed may be left unbuilt by its container's
+  // expansion, and only when ALL of these hold: reconcile ran in mode 'on' and
+  // put the child here; the expansion is the watcher's ready scan of the
+  // container (origin 'watcher' AND initialScan); the child's recorded
+  // groupSourceHash matches what this source and generator would produce now;
+  // and its on-disk drop.yaml is byte-identical to the rendered one. Anything
+  // else takes the full copy-and-rebuild path. Reconcile never builds a child
+  // itself. Filled by reconcileAppsOnBoot, cleared at the start of the next
+  // reconcile and in stop(), and consumed by expandMonorepo the moment a child
+  // passes its collision/ownership guards — a verdict is read at most once.
+  private readonly bootCurrentChildren = new Set<string>();
+  // Set once the one-shot toolchain backfill has run (now or on an earlier
+  // boot). Until then a build has no toolchain id, so it neither parks nor
+  // stamps: an unmarked tree must not be read as "built by another Node".
+  private toolchainBackfilled = false;
+  private toolchainBackfill: Promise<void> | null = null;
   private usedPorts: Map<number, string> = new Map(); // port -> appName ownership
   private appsInProgress: Set<string> = new Set(); // Track apps being built/started
   // Builds deferred because the concurrent-build cap was full (appName -> its
@@ -778,6 +875,24 @@ export class DropPlatform {
     new Map();
   private buildDrainTimer: ReturnType<typeof setTimeout> | null = null;
   private appDeployTimes: Map<string, number> = new Map(); // Track when apps were last deployed
+  /** Release directories for apps on the zero-downtime strategy (#298). */
+  private releaseStore: ReleaseStore | null = null;
+  /**
+   * Where the deploy IN FLIGHT for an app was built: a fresh release
+   * directory (zero-downtime strategy) or the source folder (in-place). Set
+   * before the build, read by the start that follows it, cleared when that
+   * start commits or fails. The start MUST use this rather than the persisted
+   * current release, or an app that just opted out of releases would restart
+   * the stale one.
+   */
+  private deployTargets: Map<string, string> = new Map();
+  /**
+   * Apps mid-cutover (#298 step 5). While present, a runtime `app:started` for
+   * the app must NOT rewrite its route: that event fires when the new
+   * instance's process starts, before it has proved anything, and the cutover
+   * switches the route itself once it has.
+   */
+  private cutovers: Set<string> = new Set();
   // Apps whose rebuild+restart is being managed as a single transaction by
   // handleAppUpdate. Their builder.build still emits build:completed, but
   // buildSub must NOT also start them (that would double-start). Held only for
@@ -928,6 +1043,12 @@ export class DropPlatform {
       // `getMailQuota` itself (its own env vars, distinct from the deploy ones
       // above — see `mailPrincipalLimit`/`mailOwnerLimit` in
       // principal-quota.ts), not passed here.
+      // Rollback snapshots (#296), anchored under THIS platform's dropRoot for
+      // the same reason as the quotas: the upload and git deploy services
+      // capture through the singleton and have no root of their own.
+      initRollbackStore(this.config.dropRoot);
+      this.releaseStore = new ReleaseStore(this.config.dropRoot);
+
       const mailQuotaStore = path.join(
         this.config.dropRoot,
         'data',
@@ -1102,6 +1223,8 @@ export class DropPlatform {
       this.buildDrainTimer = null;
     }
     this.pendingBuilds.clear();
+    // A boot verdict belongs to the boot that made it.
+    this.bootCurrentChildren.clear();
 
     if (this.diskSweepTimer) {
       clearInterval(this.diskSweepTimer);
@@ -1203,6 +1326,9 @@ export class DropPlatform {
     resetUploadDeployService();
     resetActivityLog();
     resetBuildLogService();
+    // So the next platform's getBuilder applies ITS maxConcurrentBuilds.
+    resetBuilder();
+    resetToolchainProbeCache();
     resetPlatformOps();
 
     // Tear down the deploy tracker's subscription only now — after the drain
@@ -1242,6 +1368,7 @@ export class DropPlatform {
     this.breakerKeys.clear();
     resetDeployBreaker();
     resetPrincipalQuota();
+    resetRollbackStore();
 
     // Flush BEFORE resetting: a quota whose counts only ever live in memory
     // means a restart hands every principal a fresh allowance, which for an
@@ -1873,6 +2000,11 @@ backup:
       );
     }
 
+    // Put back any node_modules a build parked and never settled, before the
+    // first build, start or reconcile can run.
+    await this.restoreParkedNodeModules();
+    await this.backfillToolchainMarkers();
+
     // Sync state manager with app configs (configs are source of truth for ports)
     await this.syncStateWithConfigs();
 
@@ -1880,7 +2012,7 @@ backup:
     this.detector = getDetector();
 
     // Initialize builder
-    this.builder = getBuilder();
+    this.builder = getBuilder({ maxConcurrentBuilds: this.config.maxConcurrentBuilds });
 
     // Initialize build log service (persists per-deploy stdout/stderr to files)
     const buildLogsDir = path.join(this.config.dropRoot, 'data', 'logs', 'builds');
@@ -1888,6 +2020,16 @@ backup:
 
     // Initialize the app runtime — docker when isolation=docker, PM2 otherwise.
     this.runtime = getAppRuntime(this.config.isolation === 'docker' ? 'docker' : 'pm2');
+
+    // The live runtime slot of each app (#298 step 4). Adapters default every
+    // app to slot `a`; only an app whose current release records slot `b` —
+    // after a zero-downtime cutover — needs telling, and must be told before
+    // anything below asks the runtime about it by name.
+    for (const cfg of this.appConfigService.getAllConfigs()) {
+      const slot = cfg.runtimeSlot ?? cfg.currentRelease?.instance;
+      if (slot === 'b') this.runtime.setLiveInstance(cfg.name, 'b');
+    }
+    await this.removeOrphanInstances();
 
     // Load used ports from existing PM2 processes
     await this.loadUsedPorts();
@@ -2007,6 +2149,8 @@ backup:
       restartApp: (name) => this.restartApp(name),
       isAppInProgress: (name) => this.appsInProgress.has(name),
       promoteApp: (name) => this.promoteApp(name),
+      rollbackApp: (name) => this.rollbackApp(name),
+      describeRollback: (name) => this.describeRollback(name),
       removeGroup: (name) => this.removeGroup(name),
       purgeAppArtifacts: (name, opts) => this.purgeAppArtifacts(name, opts),
       attachService: (name, serviceId) => this.attachService(name, serviceId),
@@ -2158,7 +2302,15 @@ backup:
    * apart from "tree too big to scan" — both still redeploy either way, but
    * only one of them is actionable by an operator reading the boot log.
    */
-  private async computeSourceMtimeMs(appPath: string): Promise<SourceSignature> {
+  private async computeSourceMtimeMs(
+    appPath: string,
+    // Which entries the walk leaves out, given the entry's name and its path
+    // relative to appPath. Defaults to the boot-reconcile list; the monorepo
+    // group hash passes the COPY's own exclusion instead, so it covers exactly
+    // what the copy lands.
+    ignore: (name: string, relative: string) => boolean = (name) =>
+      BOOT_RECONCILE_IGNORE_DIRS.has(name)
+  ): Promise<SourceSignature> {
     const deadline = Date.now() + BOOT_RECONCILE_SCAN_TIMEOUT_MS;
     let entriesVisited = 0;
 
@@ -2184,16 +2336,16 @@ backup:
 
       const dirEntries = await fs.readdir(dir, { withFileTypes: true });
       for (const entry of dirEntries) {
-        if (BOOT_RECONCILE_IGNORE_DIRS.has(entry.name)) continue;
+        const full = path.join(dir, entry.name);
+        const relative = path.relative(appPath, full);
+        if (ignore(entry.name, relative)) continue;
 
         entriesVisited++;
         if (entriesVisited > BOOT_RECONCILE_SCAN_MAX_ENTRIES) {
           throw new Error(`boot-reconcile scan exceeded entry cap (${BOOT_RECONCILE_SCAN_MAX_ENTRIES})`);
         }
 
-        const full = path.join(dir, entry.name);
         const stat = await fs.lstat(full);
-        const relative = path.relative(appPath, full);
         entries.push([relative, stat.mtimeMs, stat.size]);
         if (stat.mtimeMs > newestMtimeMs) {
           newestMtimeMs = stat.mtimeMs;
@@ -2337,6 +2489,7 @@ backup:
    */
   private async reconcileAppsOnBoot(): Promise<void> {
     const mode = this.config.bootReconcileMode;
+    this.bootCurrentChildren.clear();
     if (mode === 'off') {
       this.bootStatusSnapshot = null;
       return;
@@ -2346,7 +2499,17 @@ backup:
       return;
     }
 
-    const configs = this.appConfigService.getAllConfigs();
+    // A group CONTAINER is never a reconcile candidate, even when it has an
+    // AppConfig of its own (git and upload deploys of agent/ephemeral apps
+    // write one before detection knows it is a container). It has no process
+    // to skip, so it would only ever decide 'redeploy' and be published
+    // without an origin — which makes its expansion a deliberate redeploy
+    // rather than the watcher's ready scan. Left alone, the watcher detects it
+    // exactly as it does a folder-dropped container.
+    const stateManager = this.stateManager;
+    const configs = this.appConfigService
+      .getAllConfigs()
+      .filter((c) => !stateManager.getApp(c.name)?.isGroupContainer);
     if (configs.length === 0) {
       this.bootStatusSnapshot = null;
       return;
@@ -2376,11 +2539,11 @@ backup:
     // ACT half (markAppKnown, handleConfigureRoute, armPostDeployWatches,
     // eventBus.publish) stays SERIAL, in original config order, run only
     // after every decision is in: RouterService.addRoute's regenerateConfig
-    // reads the full routes map and writes the WHOLE Caddyfile per call —
-    // two concurrent writes for different apps race on which one lands
-    // last, and the loser's route silently disappears from disk. Splitting
-    // decide/act avoids that without touching RouterService's own locking
-    // (out of scope here).
+    // reads the full routes map and writes the WHOLE Caddyfile per call.
+    // Overlapping writes used to race on which one landed last, dropping the
+    // loser's route from disk; RouterService now serializes its own writes
+    // (`writeChain`), so the serial act phase here is no longer what prevents
+    // that — it stays serial for its original ordering and batching reasons.
     //
     // Deliberately NO global deadline for the whole pass: an app "not yet
     // reached" under a deadline would get no markAppKnown and no
@@ -2392,7 +2555,8 @@ backup:
     const decisions = await this.mapWithConcurrency(
       configs,
       BOOT_RECONCILE_CONCURRENCY,
-      (config) => this.decideOneAppOnBoot(config, this.bootStatusSnapshot, runningByName)
+      (config) =>
+        this.decideOneAppOnBoot(config, this.bootStatusSnapshot, runningByName, mode === 'on')
     );
 
     // Batches the Caddy reload (M1 review item G): a skip's route is added
@@ -2405,7 +2569,11 @@ backup:
     for (const result of decisions) {
       const { config, appPath } = result;
 
-      if (result.kind === 'group') {
+      // See ignoreGroup and bootCurrentChildren: only a child's `skip` verdict
+      // is acted on; every other outcome for a child is routing-only.
+      const isSkip = result.kind === 'decided' && result.decision.action === 'skip';
+      const childRoutingOnly = result.kind === 'group' || (config.group && !isSkip);
+      if (childRoutingOnly) {
         // A group child's BUILD belongs to its container. Its ROUTING does not.
         //
         // Deferring both left a running child with no Caddy route whenever the
@@ -2433,7 +2601,8 @@ backup:
           anySkipped = true;
           this.logger.info(
             `Boot reconcile: group child '${config.name}' routing reconciled — ` +
-              `build left to its container`,
+              `build left to its container` +
+              (result.kind === 'decided' ? ` (${result.decision.action}: ${result.decision.reason})` : ''),
             'BOOT'
           );
         } else {
@@ -2494,6 +2663,8 @@ backup:
           // part of the item 1 readiness probe) — reused here instead of
           // re-parsing drop.yaml.
           this.armPostDeployWatches(config.name, port, healthCheckPath);
+          // Only now, once the child is routed and watched (see bootCurrentChildren).
+          if (config.group) this.bootCurrentChildren.add(config.name);
         } else {
           this.logger.info(`Boot reconcile: redeploying '${config.name}' — ${decision.reason}`, 'BOOT');
           // Publish, don't call handleBuildApp directly: this is the exact
@@ -2508,10 +2679,19 @@ backup:
         // Any unexpected failure anywhere above must not strand this app OR
         // abort reconciliation for the rest of the fleet — fail toward
         // redeploying it, the same doctrine as every other ambiguous case.
-        this.logger.warn(`Boot reconcile: '${config.name}' errored acting on decision, redeploying`, 'BOOT', error);
         this.watcher.markAppKnown(config.name);
-        if (!published) {
-          this.eventBus.publish('app:detected', { name: config.name, path: appPath, type: undefined });
+        if (config.group) {
+          // A child is never redeployed from here: its container builds it.
+          this.logger.warn(
+            `Boot reconcile: group child '${config.name}' errored acting on decision — left to its container`,
+            'BOOT',
+            error
+          );
+        } else {
+          this.logger.warn(`Boot reconcile: '${config.name}' errored acting on decision, redeploying`, 'BOOT', error);
+          if (!published) {
+            this.eventBus.publish('app:detected', { name: config.name, path: appPath, type: undefined });
+          }
         }
       }
     }
@@ -2562,7 +2742,15 @@ backup:
   private async decideOneAppOnBoot(
     config: AppConfig,
     bootStatusSnapshot: Map<string, AppStatus> | null,
-    runningByName: Map<string, AppProcessInfo>
+    runningByName: Map<string, AppProcessInfo>,
+    // 'on' mode only. A grouped child's BUILD is entirely its container's, so
+    // reconcile NEVER publishes a child in any mode. Without this flag
+    // (modes 'off' and 'observe') a child is not decided at all: no
+    // markAppKnown, no decision, no publish. With it the child IS decided like
+    // any app, but the act phase only uses a `skip` verdict (to route and
+    // watch it and let the container leave it unbuilt, see
+    // bootCurrentChildren); every other verdict is routing-only.
+    ignoreGroup = false
   ): Promise<
     | { kind: 'group'; config: AppConfig; appPath: string }
     | { kind: 'error'; config: AppConfig; appPath: string; reason: string; error: unknown }
@@ -2578,20 +2766,12 @@ backup:
     const appPath = config.path || path.join(this.config.appsDirectory, config.name);
 
     try {
-      // M1 review item 3 (round-2 diff pass): a grouped child's fate is
-      // entirely the monorepo CONTAINER's — expandMonorepo re-copies +
-      // rebuilds EVERY child as one atomic fs.rm+fs.cp+build whenever the
-      // container's own (unrelated, never-seeded) app:detected fires.
-      // Treating the child itself as a reconcile candidate — even to
-      // "redeploy" it — publishes the CHILD's own app:detected seconds-to-
-      // minutes before the container's detection ever fires, so a build is
-      // already in flight when expandMonorepo's fs.rm/fs.cp lands under it.
-      // NEVER touch a grouped app here: no markAppKnown, no decision, no
-      // publish, in EITHER mode — checked before anything else (including
-      // the 'stopped' status below) so a user-stopped grouped child gets
-      // the identical true no-op, not the leave+markAppKnown branch a
-      // stopped standalone app takes.
-      if (config.group) {
+      // M1 review item 3 (round-2 diff pass): see `ignoreGroup`. Checked before
+      // anything else (including the 'stopped' status below) so a user-stopped
+      // grouped child gets the identical true no-op. Publishing the CHILD's own
+      // app:detected would start a build before the container's detection, with
+      // one already in flight when expandMonorepo's sync lands under it.
+      if (config.group && !ignoreGroup) {
         return { kind: 'group', config, appPath };
       }
 
@@ -2639,9 +2819,12 @@ backup:
         isRuntimeRunning,
         hasPort: Boolean(config.port),
         portDrifted,
-        group: config.group,
+        // Bypassed together with the early return above (see ignoreGroup).
+        group: ignoreGroup ? undefined : config.group,
         grantedApiScopesCount: config.grantedApiScopes?.length ?? 0,
         runtimeSpecCurrent,
+        // Only read for an app the cheap phase could still redeploy.
+        dependenciesStale: status !== 'stopped' && (await this.servingTreeIsStale(config)),
       });
       let scanned = false;
 
@@ -2682,10 +2865,33 @@ backup:
       // subset of it that never checked.
       let healthCheckPath: string | undefined;
       if (decision.action === 'skip') {
-        const dropYaml = await parseDropYaml(appPath);
-        healthCheckPath = dropYaml.success ? dropYaml.config?.healthCheck : undefined;
-        const answers = await this.probeSkipReadiness(config.port as number, healthCheckPath);
-        if (!answers) {
+        let childYamlProblem: string | undefined;
+        if (config.group) {
+          // A child's folder is tenant-writable, so parseDropYaml (follows
+          // links, no size cap, blocks on a FIFO) is not used on it; any
+          // problem reading it means the child is not a skip candidate.
+          const read = await this.readChildDropYaml(appPath);
+          if (!read.ok) {
+            childYamlProblem = read.problem;
+          } else {
+            try {
+              const parsed = parseDropYamlContent(read.text, appPath);
+              if ('error' in parsed) childYamlProblem = 'invalid';
+              else healthCheckPath = parsed.config.healthCheck;
+            } catch {
+              childYamlProblem = 'unparseable';
+            }
+          }
+        } else {
+          const dropYaml = await parseDropYaml(appPath);
+          healthCheckPath = dropYaml.success ? dropYaml.config?.healthCheck : undefined;
+        }
+        if (childYamlProblem !== undefined) {
+          decision = {
+            action: 'redeploy',
+            reason: `group child drop.yaml unreadable (${childYamlProblem})`,
+          };
+        } else if (!(await this.probeSkipReadiness(config.port as number, healthCheckPath))) {
           decision = {
             action: 'redeploy',
             reason: 'skip candidate did not answer a readiness probe',
@@ -2755,6 +2961,7 @@ backup:
         if (app?.status === 'stopped') {
           this.logger.info(`Skipping auto-start for ${payload.appId} - app was stopped by user`, 'APP');
         }
+        await this.discardDeployTarget(payload.appId);
         this.appsInProgress.delete(payload.appId);
       }
     });
@@ -2762,7 +2969,13 @@ backup:
 
     // When app starts, configure routing
     const startedSub = this.eventBus.subscribe('app:started', async (payload) => {
-      await this.handleConfigureRoute(payload.name, payload.port);
+      // PM2 publishes the PROCESS name, which for a slot-b instance is
+      // `<app>.b` (#298) — routes are per APP.
+      const appName = appNameOfInstance(payload.name);
+      // A cutover switches the route itself, after the new instance proves it
+      // serves; routing it here would send traffic to it before that.
+      if (this.cutovers.has(appName)) return;
+      await this.handleConfigureRoute(appName, payload.port);
     });
     this.subscriptions.push(startedSub);
 
@@ -3509,7 +3722,10 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       const entries = await fs.readdir(dir, { withFileTypes: true });
       for (const entry of entries) {
         const full = path.join(dir, entry.name);
-        if (DropPlatform.MONOREPO_COPY_EXCLUDE_RE.test(full)) continue;
+        // Relative to the service root, as the copy tests it: an absolute path
+        // would match a `build`/`dist` segment in the repo's own location and
+        // make this scan skip everything.
+        if (DropPlatform.MONOREPO_COPY_EXCLUDE_RE.test(path.relative(srcDir, full))) continue;
         // readdir(withFileTypes) reports the entry's own type (lstat
         // semantics), so this sees the link itself, not its target — and
         // never follows it, so a link cycle can't spin this walk.
@@ -3555,6 +3771,83 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
   }
 
   /**
+   * The drop.yaml expandMonorepo writes into a materialized child. One
+   * renderer for both the write and the boot-time "is this copy current"
+   * comparison, so the two can never describe different files.
+   */
+  private renderChildConfig(
+    childName: string,
+    childType: DropYamlConfig['type'],
+    svc: NonNullable<DropYamlConfig['services']>[string],
+    group: string,
+    serviceNames: Set<string>
+  ): DropYamlConfig {
+    // Rewrite depends_on so a dependency naming a sibling service resolves
+    // to that sibling's real, group-qualified child app name. Dependencies
+    // on apps outside this group are left unchanged.
+    const dependsOn = svc.depends_on?.map(dep =>
+      serviceNames.has(dep.name) ? { ...dep, name: `${group}-${dep.name}` } : dep
+    );
+
+    // M3: `route` (services.<svc>.route) is now a top-level allowed key,
+    // so it is written into the child drop.yaml and applied by
+    // handleConfigureRoute as a same-origin Caddy path prefix (frontend at
+    // `/`, backend at `/api`).
+    return {
+      name: childName,
+      type: childType,
+      // `!== undefined`, not a truthy check: `database: false` is now an
+      // explicit opt-out (see appNeedsDatabase), and a truthy test drops
+      // it here — the child would silently fall back to inference and get
+      // a database its manifest declined. Same silent-drop class as the
+      // historically missing `userId`. The `redis` line below has always
+      // used `typeof … === 'boolean'` for exactly this reason.
+      ...(svc.database !== undefined ? { database: svc.database } : {}),
+      ...(typeof svc.redis === 'boolean' ? { redis: svc.redis } : {}),
+      ...(svc.domains && svc.domains.length > 0 ? { domains: svc.domains } : {}),
+      ...(svc.env ? { env: svc.env } : {}),
+      ...(svc.build_env ? { build_env: svc.build_env } : {}),
+      ...(svc.secrets ? { secrets: svc.secrets } : {}),
+      ...(svc.healthCheck ? { healthCheck: svc.healthCheck } : {}),
+      ...(svc.build ? { build: svc.build } : {}),
+      ...(svc.start ? { start: svc.start } : {}),
+      ...(svc.route ? { route: svc.route } : {}),
+      ...(dependsOn && dependsOn.length > 0 ? { depends_on: dependsOn } : {}),
+      // Explicit, so a service's `healthCheck` does not put the child on
+      // the zero-downtime default (#298 step 7): children are
+      // re-materialized from the group and keep stop/start for now.
+      deploy: { strategy: 'in-place' },
+    };
+  }
+
+  /** Whether `p` exists as a real directory — not a link, not a file. */
+  private async isPlainDirectory(p: string): Promise<boolean> {
+    return fs.lstat(p).then(
+      (st) => st.isDirectory(),
+      () => false
+    );
+  }
+
+  /**
+   * Read a materialized child's own drop.yaml, for the two places that
+   * compare against it (boot decide, expansion). The folder is tenant-writable
+   * under isolation 'none', so: the folder itself must be a plain directory,
+   * and the file goes through the tenant-file reader (no links, no FIFOs, size
+   * capped). `problem` names why it was refused.
+   */
+  private async readChildDropYaml(
+    dir: string
+  ): Promise<{ ok: true; text: string } | { ok: false; problem: string }> {
+    if (!(await this.isPlainDirectory(dir))) {
+      return { ok: false, problem: 'folder is not a plain directory' };
+    }
+    const read = await readTenantFile(dir, 'drop.yaml', MAX_CHILD_DROP_YAML_BYTES);
+    if (read.kind === 'absent') return { ok: false, problem: 'absent' };
+    if (read.kind !== 'ok') return { ok: false, problem: 'refused' };
+    return { ok: true, text: read.content.toString('utf-8') };
+  }
+
+  /**
    * Expand a monorepo container (a repo whose root drop.yaml declares a
    * `services:` map) into N ordinary top-level DROP apps — one per service.
    *
@@ -3575,7 +3868,9 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     repoName: string,
     config: DropYamlConfig,
     /** The caller whose redeploy triggered this, for guardrail keying. */
-    actor?: DeployActorInfo
+    actor?: DeployActorInfo,
+    /** True only for the watcher's ready scan at boot; see bootCurrentChildren. */
+    incidentalFirstSight = false
   ): Promise<void> {
     const group = (config.group || config.name || repoName).trim();
     const services = config.services ?? {};
@@ -3705,6 +4000,9 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           );
           continue;
         }
+        // Past the collision/ownership guards: consume this child's boot
+        // verdict now, so it is read at most once (see bootCurrentChildren).
+        const bootCurrent = this.bootCurrentChildren.delete(childName);
 
         const srcDir = path.join(repoPath, svc.path);
         try {
@@ -3737,6 +4035,20 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           continue;
         }
 
+        // The child folder must be a real directory when it exists. The sync,
+        // the drop.yaml write and every read below go THROUGH childPath, so a
+        // link there (a tenant can create one under isolation 'none') would
+        // redirect them to wherever it points. Nothing there yet is fine: a
+        // first-ever child is created below.
+        if ((await this.entryExists(childPath)) && !(await this.isPlainDirectory(childPath))) {
+          this.logger.warn(
+            `Skipping service '${svcName}': '${childPath}' is not a plain directory (a link or ` +
+              `a file); refusing to write through it`,
+            'MONOREPO'
+          );
+          continue;
+        }
+
         // A user-stopped child is skipped BEFORE anything is written. Both
         // downstream paths refuse to build one (`handleAppUpdate:4439`,
         // `buildSub`), but they refuse AFTER the copy would have landed —
@@ -3756,6 +4068,90 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         // above does for the container.
         this.watcher?.markAppKnown(childName);
 
+        // Tree half of the child's fingerprint, taken BEFORE the sync (a
+        // source edited mid-copy must read as changed next time, not as
+        // recorded). Placed after every guard above, so a refused child is
+        // never fingerprinted or skipped. The walk uses the copy's own
+        // exclusion (not boot reconcile's ignore list): `vendor/`, `.next/`
+        // and the like are copied, so they count. Any failure to compute it
+        // means "differs" — never a false "current". Only taken when its
+        // result can be used: to record after a rebuild (autoBuild), or to
+        // compare for a boot skip.
+        let treeHash: string | undefined;
+        if (
+          childState !== undefined &&
+          (this.config.autoBuild ||
+            (incidentalFirstSight && bootCurrent && existing?.groupSourceHash !== undefined))
+        ) {
+          try {
+            treeHash = (
+              await this.computeSourceMtimeMs(srcDir, (_name, relative) =>
+                DropPlatform.MONOREPO_COPY_EXCLUDE_RE.test(relative)
+              )
+            ).hash;
+          } catch (scanError) {
+            this.logger.warn(
+              `Cannot fingerprint '${childName}' (${
+                scanError instanceof Error ? scanError.message : String(scanError)
+              }); it will be re-copied and rebuilt every time until the service tree is smaller`,
+              'MONOREPO'
+            );
+          }
+        }
+
+        // The boot skip itself (rule: see bootCurrentChildren). The fingerprint
+        // covers the rendered child drop.yaml, so a generator change after an
+        // upgrade or an edited root drop.yaml reads as changed.
+        let childCurrent = false;
+        if (
+          incidentalFirstSight &&
+          bootCurrent &&
+          childState !== undefined &&
+          treeHash !== undefined &&
+          existing?.groupSourceHash !== undefined
+        ) {
+          const rendered = yaml.stringify(
+            this.renderChildConfig(
+              childName,
+              (svc.type ?? existing.type ?? 'static') as DropYamlConfig['type'],
+              svc,
+              group,
+              serviceNames
+            )
+          );
+          const onDisk = await this.readChildDropYaml(childPath);
+          childCurrent =
+            onDisk.ok &&
+            onDisk.text === rendered &&
+            groupSourceFingerprint(repoName, svc.path, rendered, treeHash) ===
+              existing.groupSourceHash;
+        }
+        if (childCurrent) {
+          this.logger.info(`Boot: '${childName}' is current — not re-expanded`, 'MONOREPO');
+        } else if (existing?.groupSourceHash !== undefined && this.appConfigService) {
+          // About to rewrite the child: whatever was recorded describes a copy
+          // that is no longer there, and must not survive a sync or build that
+          // fails. Re-recorded below only once the rebuilt child is running.
+          // If the clear itself fails the child is left entirely alone this
+          // round: rewriting it while its old fingerprint stands would let a
+          // failed rebuild be called current by the next boot.
+          try {
+            await this.appConfigService.upsertSystemConfig(childName, {
+              groupSourceHash: undefined,
+            });
+          } catch (clearError) {
+            this.logger.warn(
+              `Could not clear the source fingerprint for '${childName}'; leaving it untouched` +
+                (incidentalFirstSight
+                  ? ''
+                  : ` — this redeploy did NOT update or rebuild '${childName}'`),
+              'MONOREPO',
+              clearError
+            );
+            continue;
+          }
+        }
+
         // Materialize IN PLACE (idempotent). This used to be
         // `fs.rm(childPath)` + `fs.cp`, which deleted a RUNNING child's whole
         // tree — build output and installed dependencies included — and left
@@ -3773,10 +4169,12 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         // rebuild — `StaticBuildStrategy.preBuild` treats a surviving
         // `dist/index.html` as "already built" and skips the build entirely,
         // which is the trap that got v2 of this change rejected.
-        await syncTree(srcDir, childPath, {
-          exclude: DropPlatform.MONOREPO_COPY_EXCLUDE_RE,
-          preserve: DEFAULT_PRESERVE,
-        });
+        if (!childCurrent) {
+          await syncTree(srcDir, childPath, {
+            exclude: DropPlatform.MONOREPO_COPY_EXCLUDE_RE,
+            preserve: DEFAULT_PRESERVE,
+          });
+        }
 
         // Resolve type: honor an explicit override, else detect from the
         // freshly copied subtree (the real source — the generated child
@@ -3784,45 +4182,33 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         // the source subtree itself carries its own drop.yaml, it was copied
         // above and gets overwritten by the generated one next.
         let childType = svc.type;
+        // A current child was not copied, so there is no fresh subtree to
+        // detect from; keep the type it was last deployed with.
+        if (!childType && childCurrent) childType = existing?.type;
         if (!childType && this.detector) {
           const det = await this.detector.detect(childPath, { silent: true });
           childType = det.type;
         }
         childType = childType || 'static';
 
-        // Rewrite depends_on so a dependency naming a sibling service resolves
-        // to that sibling's real, group-qualified child app name. Dependencies
-        // on apps outside this group are left unchanged.
-        const dependsOn = svc.depends_on?.map(dep =>
-          serviceNames.has(dep.name) ? { ...dep, name: `${group}-${dep.name}` } : dep
+        const childYaml = yaml.stringify(
+          this.renderChildConfig(
+            childName,
+            childType as DropYamlConfig['type'],
+            svc,
+            group,
+            serviceNames
+          )
         );
-
-        // M3: `route` (services.<svc>.route) is now a top-level allowed key,
-        // so it is written into the child drop.yaml and applied by
-        // handleConfigureRoute as a same-origin Caddy path prefix (frontend at
-        // `/`, backend at `/api`).
-        const childConfig: DropYamlConfig = {
-          name: childName,
-          type: childType,
-          // `!== undefined`, not a truthy check: `database: false` is now an
-          // explicit opt-out (see appNeedsDatabase), and a truthy test drops
-          // it here — the child would silently fall back to inference and get
-          // a database its manifest declined. Same silent-drop class as the
-          // historically missing `userId`. The `redis` line below has always
-          // used `typeof … === 'boolean'` for exactly this reason.
-          ...(svc.database !== undefined ? { database: svc.database } : {}),
-          ...(typeof svc.redis === 'boolean' ? { redis: svc.redis } : {}),
-          ...(svc.domains && svc.domains.length > 0 ? { domains: svc.domains } : {}),
-          ...(svc.env ? { env: svc.env } : {}),
-          ...(svc.build_env ? { build_env: svc.build_env } : {}),
-          ...(svc.secrets ? { secrets: svc.secrets } : {}),
-          ...(svc.healthCheck ? { healthCheck: svc.healthCheck } : {}),
-          ...(svc.build ? { build: svc.build } : {}),
-          ...(svc.start ? { start: svc.start } : {}),
-          ...(svc.route ? { route: svc.route } : {}),
-          ...(dependsOn && dependsOn.length > 0 ? { depends_on: dependsOn } : {}),
-        };
-        await fs.writeFile(path.join(childPath, 'drop.yaml'), yaml.stringify(childConfig));
+        // What a boot may later compare against: recorded only after this
+        // child has been rebuilt and is running again (see below).
+        const groupSourceHash =
+          treeHash !== undefined
+            ? groupSourceFingerprint(repoName, svc.path, childYaml, treeHash)
+            : undefined;
+        if (!childCurrent) {
+          await fs.writeFile(path.join(childPath, 'drop.yaml'), childYaml);
+        }
 
         // Same narrowing cast the normal onboarding path (detectedSub) and
         // handleBuildApp already use: the detector's AppType is wider than
@@ -3877,9 +4263,11 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         // further file change to retrigger queued services (a single drop
         // produces none). If a service is deferred by the "Build queue full"
         // guard in handleBuildApp, it is not silently lost — the warning above
-        // flags oversized groups — but it also won't auto-retrigger; that's
-        // acceptable for the common small-N case and left for a future pass.
-        if (this.config.autoBuild) {
+        // flags oversized groups — but a NEW child deferred there is re-queued
+        // by drainPendingBuilds. An EXISTING child goes through handleAppUpdate,
+        // whose build waits for a builder slot instead of being refused.
+        // A current child (boot skip above) is already running its build.
+        if (this.config.autoBuild && !childCurrent) {
           // Children inherit the container's actor. Left undefined they would
           // each key as automation on their OWN name, so a loop that varies
           // service names would accumulate nowhere.
@@ -3916,13 +4304,34 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
               'MONOREPO'
             );
           } else if (childState) {
-            await this.handleAppUpdate(
+            const rebuilt = await this.handleAppUpdate(
               childName,
               childPath,
               'monorepo re-expansion',
               true,
               actor
             );
+            // Record only for a child whose new build is serving (handleAppUpdate's
+            // return; the status check is a second opinion). A first-ever child
+            // is recorded by the next boot's rebuild. A failure to record just
+            // costs one more rebuild.
+            const after = this.stateManager?.getApp(childName);
+            if (
+              groupSourceHash !== undefined &&
+              rebuilt &&
+              after?.status === 'running' &&
+              !after.error
+            ) {
+              try {
+                await this.appConfigService?.upsertSystemConfig(childName, { groupSourceHash });
+              } catch (recordError) {
+                this.logger.warn(
+                  `Could not record the source fingerprint for '${childName}'`,
+                  'MONOREPO',
+                  recordError
+                );
+              }
+            }
           } else {
             await this.handleBuildApp(childPath, childName, childType, actor);
           }
@@ -3988,7 +4397,14 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       // finally-guaranteed release — a stuck entry would wedge the app.
       this.appsInProgress.add(payload.name);
       try {
-        await this.expandMonorepo(payload.path, payload.name, rootYaml.config, payload);
+        // Incidental first sight only: see bootCurrentChildren.
+        await this.expandMonorepo(
+          payload.path,
+          payload.name,
+          rootYaml.config,
+          payload,
+          payload.origin === 'watcher' && payload.initialScan === true
+        );
       } finally {
         this.appsInProgress.delete(payload.name);
       }
@@ -4218,7 +4634,10 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       }
       const workDir = await this.getBuildWorkDir(appName);
 
-      const execCommand = this.buildExecCommandFor(detection.type, appName);
+      const { execCommand, toolchainId, nodeModulesAsideDir } = await this.buildToolchainFor(
+        detection.type,
+        appName
+      );
 
       const buildStartedAt = new Date();
       const logId = this.buildLogService
@@ -4246,10 +4665,12 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         const buildEnv = await this.resolveBuildEnv(appPath, appName);
         const buildOverride = (await parseDropYaml(appPath)).config?.build;
 
+        const buildPath = await this.prepareDeployTarget(appName, appPath, deployId);
+
         builderEntered = true;
         result = await this.builder.build({
           appName,
-          appPath,
+          appPath: buildPath,
           deployId,
           appType: detection.type,
           framework: detection.framework || null,
@@ -4260,6 +4681,8 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           env: buildEnv,
           workDir,
           execCommand,
+          toolchainId,
+          nodeModulesAsideDir,
           onBuildLog: logId && this.buildLogService
             ? (line) => this.buildLogService!.writeLine(logId, line)
             : undefined,
@@ -4286,10 +4709,9 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           await this.stateManager.updateApp(appName, { buildDuration: result.duration });
         }
       } else if (result.errors?.[0]?.code === 'MAX_BUILDS') {
-        // The builder's own concurrent-build cap fired (a redundant safety net
-        // under the platform cap above). Don't error the app — re-queue it so
-        // it retries when a slot frees, instead of leaving it permanently
-        // failed after a transient burst.
+        // Unreachable backstop: the builder now WAITS for a slot rather than
+        // refusing. Kept so a refusal would still re-queue the app instead of
+        // leaving it permanently failed after a transient burst.
         this.logger.warn(`Builder busy for ${appName}; re-queuing`, 'BUILD');
         // Deliberately NOT a guardrail failure: the deploy is being retried,
         // not rejected. Counting a queue wait as a failure would let a busy
@@ -4297,6 +4719,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         // the retry re-enters this method and re-gates itself.
         this.releaseGuardrailKeys(appName);
         this.appsInProgress.delete(appName);
+        await this.discardDeployTarget(appName);
         this.pendingBuilds.set(appName, { appPath, appType: _appType, actor });
         this.scheduleBuildDrain();
       } else {
@@ -4311,11 +4734,13 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         // fire here (the builder published its own episode), so without this
         // the breaker counted only pre-build and readiness failures and would
         // never trip on a repeatedly-failing build.
+        await this.discardDeployTarget(appName);
         this.recordDeployOutcome(appName, false);
         this.appsInProgress.delete(appName);
       }
     } catch (error) {
       const err = error instanceof Error ? error : new Error('Build failed');
+      await this.discardDeployTarget(appName);
       this.logger.appEvent('error', appName, err.message);
       if (this.stateManager) {
         await this.stateManager.setAppStatus(appName, 'errored', { error: err.message });
@@ -4589,9 +5014,16 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     // monorepo child — the copied per-service folder, not appsDirectory/name)
     // over the hardcoded join, falling back to the join only when no config
     // (or no path on it) exists yet.
+    //
+    // A deploy in flight starts from where it was BUILT (a release directory,
+    // or the source folder). Otherwise — boot, promotion of an in-place build —
+    // the app's current release when it has one.
+    const cfgAtStart = this.appConfigService?.getConfig(appName);
     const appPath =
-      this.appConfigService?.getConfig(appName)?.path ||
-      path.join(this.config.appsDirectory, appName);
+      this.deployTargets.get(appName) ??
+      (this.releaseStore?.isReleasePathOf(appName, cfgAtStart?.currentRelease?.path)
+        ? cfgAtStart!.currentRelease!.path
+        : cfgAtStart?.path || path.join(this.config.appsDirectory, appName));
 
     try {
       // Update state to starting. Kept inside the try: if this write throws it
@@ -4742,7 +5174,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       // awaited: it must never delay the 'running' status write or the
       // eventual appsInProgress release, which several callers/tests treat
       // as available the instant runtime.start()/readiness settles.
-      void this.recordDeploySignature(appName, appPath);
+      void this.recordDeploySignature(appName, this.sourcePathOf(appName));
 
       // Update state to running with port and pid.
       //
@@ -4767,6 +5199,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       // leniency: five legitimately-slow-but-healthy deploys would trip the
       // breaker on a perfectly good app. The agent still gets the unverified
       // status and a hint — that is the signal to act on, not a throttle.
+      await this.commitServedPath(appName, appPath);
       this.recordDeployOutcome(appName, true);
 
       // App is fully deployed now - record deploy time for cooldown
@@ -4818,6 +5251,8 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       // Terminal handler: always release the in-progress guard on every settled
       // path (success, error, or a throw from the initial 'starting' write), so
       // a transient failure can never wedge the app out of future rebuilds.
+      // A release this start did not commit is discarded (no-op after success).
+      await this.discardDeployTarget(appName);
       this.appsInProgress.delete(appName);
     }
   }
@@ -4957,6 +5392,32 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
             domains: acceptedCustomDomains,
             tls: dropYaml.config?.tls,
           });
+        }
+      }
+
+      // Dashboard/API custom domain (#302): routed only once DROP has seen its
+      // DNS point here, and only while it is still the app's domain. A
+      // verification left over from a domain the app no longer has is dropped
+      // here with its route, so a changed or cleared domain stops being served
+      // by the next route write rather than lingering in the Caddyfile.
+      const verifiedCustom = appConfig?.customDomainVerified;
+      if (verifiedCustom) {
+        const verified = verifiedCustom.domain.toLowerCase();
+        const current = this.stateManager?.getApp(appName)?.customDomain?.trim().toLowerCase();
+        if (current !== verified) {
+          await this.dropCustomDomainRoute(appName, verifiedCustom.domain);
+        } else if (routePathPrefix === undefined && !domains.some((d) => d.toLowerCase() === verified)) {
+          // Same ownership rule as drop.yaml domains. Verification already
+          // refused a claimed domain; this catches a claim made since.
+          const owner = this.appConfigService?.getDomainOwners(domainSuffix).get(verified);
+          if (owner && owner !== appName) {
+            this.logger.warn(
+              `Refusing custom domain '${verifiedCustom.domain}' for ${appName}: already claimed by '${owner}'`,
+              'ROUTER'
+            );
+          } else {
+            domains = [...domains, verifiedCustom.domain];
+          }
         }
       }
 
@@ -5678,15 +6139,42 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
    * `handleAppUpdate` — the path every upload and git REDEPLOY of an existing
    * app takes — passed no `execCommand` at all. Keep both call sites on this
    * method; a third build path must call it too.
+   *
+   * It also returns the toolchain id the build installs dependencies with, so
+   * the two can never come from different sources: `toolchainIdFor` is the one
+   * producer (docker: the image the build container runs; host isolation: the
+   * `node` tenants would get, probed in a platform-owned dir). `null` is
+   * "unknown" (no move, no stamp).
+   *
+   * Third, the app's aside ROOT (`nodeModulesAsideDir`): the platform-owned
+   * directory under which a build parks a stale node_modules in its own slot
+   * (`<root>/<hash of the build's path>/parked`) while its replacement installs.
+   * It is outside the app tree and the watcher, and not under `data/temp/<app>`
+   * (upload and MCP staging use bare app names there; a leading dot can never be
+   * an app name). Only the shared parent is created here, 0700; the slot is made
+   * by the build. It is per APP, and a build sweeps every slot but its own, so
+   * the one-build-per-app rule (appsInProgress, backed by BuilderService.build())
+   * is what makes that safe. Restored at boot by restoreParkedNodeModules, and
+   * swept by purgeAppArtifacts when the app is removed.
    */
-  private buildExecCommandFor(
+  private async buildToolchainFor(
     appType: AppType,
     appName: string
-  ): ReturnType<typeof createContainerExecCommand> | undefined {
+  ): Promise<{
+    execCommand: ReturnType<typeof createContainerExecCommand> | undefined;
+    toolchainId: string | null;
+    nodeModulesAsideDir: string;
+  }> {
+    const nodeModulesAsideDir = await this.nodeModulesAsideDirFor(appName);
+
     // Host isolation: there is no build container, and running the command on
     // the host is the intended behaviour, not a fallback.
     if (this.config.isolation !== 'docker') {
-      return undefined;
+      return {
+        execCommand: undefined,
+        toolchainId: await this.buildToolchainIdFor(appType),
+        nodeModulesAsideDir,
+      };
     }
 
     // FAIL CLOSED. Configured for docker isolation but without a container
@@ -5703,16 +6191,263 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       );
     }
 
-    return createContainerExecCommand(
-      (this.runtime as import('../managers/runtime').ContainerManager).docker,
-      appType,
-      appName
-    );
+    return {
+      execCommand: createContainerExecCommand(
+        (this.runtime as import('../managers/runtime').ContainerManager).docker,
+        appType,
+        appName
+      ),
+      toolchainId: await this.buildToolchainIdFor(appType),
+      nodeModulesAsideDir,
+    };
+  }
+
+  /** `<dropRoot>/data/temp/.node-modules-aside/<app>`; creates only the parent, 0700. */
+  private async nodeModulesAsideDirFor(appName: string): Promise<string> {
+    const asideRoot = this.nodeModulesAsideRootOf(appName);
+    await fs.mkdir(path.dirname(asideRoot), { recursive: true, mode: 0o700 });
+    return asideRoot;
+  }
+
+  /** The aside root of one app, creating nothing. The ONE place the path is built. */
+  private nodeModulesAsideRootOf(appName: string): string {
+    return path.join(this.config.dropRoot, 'data', 'temp', NODE_MODULES_ASIDE_DIR, appName);
+  }
+
+  /**
+   * Boot: put back any node_modules a build parked and never settled (a crash
+   * between the park and the settle, or a restore that failed), BEFORE anything
+   * is started or reconciled. Per known app (config or state), the slot of its
+   * source path and, when the persisted `currentRelease` path passes
+   * `isReleasePathOf` (never trusted raw: it becomes a rename target), of that
+   * release too. The slot is a pure function of the path, so nothing is read
+   * back off disk. Never throws and never blocks boot: a failure is a generic
+   * warning and the parked tree stays for the next build or boot.
+   *
+   * PRECONDITION: nothing has started a build yet (called from
+   * initializeServices, before the watcher). Under isolation=none, PM2
+   * processes outlive a platform restart and may be running now; restoring only
+   * puts the previous tree back where a build removed it.
+   */
+  private async restoreParkedNodeModules(): Promise<void> {
+    const names = new Set<string>([
+      ...(this.appConfigService?.getAllConfigs() ?? []).map((cfg) => cfg.name),
+      ...(this.stateManager?.getAllApps() ?? []).map((app) => app.name),
+    ]);
+    for (const name of names) {
+      try {
+        const asideRoot = this.nodeModulesAsideRootOf(name);
+        const paths = [this.sourcePathOf(name)];
+        const release = this.appConfigService?.getConfig(name)?.currentRelease?.path;
+        if (release && this.releaseStore?.isReleasePathOf(name, release)) paths.push(release);
+        for (const appPath of paths) {
+          const outcome = await restoreParkedTree(appPath, asideRoot);
+          if (outcome === 'restored') {
+            this.logger.info(`Restored an unsettled node_modules for ${name}`, 'BUILD');
+          }
+        }
+      } catch {
+        this.logger.warn(`Could not check for an unsettled node_modules of ${name}`, 'BUILD');
+      }
+    }
+  }
+
+  /**
+   * One-shot, on the first boot of the release that introduced the toolchain
+   * marker: stamp every existing node_modules that has no marker with the
+   * toolchain that runs it now — each known app's source folder, its current and
+   * previous release, and its rollback snapshot. Valid because nothing has
+   * changed the toolchain since those trees were built. Without it, the first
+   * build of every app would read its unmarked tree as foreign and reinstall it
+   * from empty, and the start guard could never tell an old tree from a current
+   * one.
+   *
+   * Under docker, every unmarked tree is stamped PRE_MARKER_DOCKER_TOOLCHAIN,
+   * the tenant image every pre-marker tree was built in, whatever the image is
+   * now. On a box that first boots this code on a later image (an upgrade that
+   * skips the release that introduced the marker), those trees then read
+   * `stale`: the boot reconcile redeploys the running ones and the start guard
+   * refuses the rest, instead of an unmarked Node 20 tree starting on the new
+   * image. Under none the probed host Node is trusted to be the one that built
+   * them; a host Node upgrade in the same restart is the recorded residual.
+   *
+   * Done when data/drop-svc/toolchain-backfill.json exists. The flag is written
+   * only after a pass in which every node app's id resolved and nothing threw.
+   * Until then builds get no id, and the first build asks for the backfill
+   * again (see buildToolchainIdFor), so a host probe that failed at boot never
+   * leaves a gated build stripping markers for the rest of the process. Never
+   * throws.
+   *
+   * PRECONDITION (the tenant-file writer's): no tenant can write these trees now.
+   * Docker: runtime containers mount the app read-only, and the pass that matters
+   * runs at boot, before any build (a build container orphaned by a crash is the
+   * known residual); releases and snapshots are platform-owned. None: tenants run
+   * as the platform uid, so there is no boundary to defend, also when the pass is
+   * retried after boot.
+   */
+  private backfillToolchainMarkers(): Promise<void> {
+    if (this.toolchainBackfilled) return Promise.resolve();
+    this.toolchainBackfill ??= this.runToolchainBackfill()
+      .catch(() => {
+        this.logger.warn('Could not stamp the existing node_modules; trying again later', 'BUILD');
+      })
+      .finally(() => {
+        this.toolchainBackfill = null;
+      });
+    return this.toolchainBackfill;
+  }
+
+  private async runToolchainBackfill(): Promise<void> {
+    const flagPath = path.join(this.config.dropRoot, 'data', 'drop-svc', 'toolchain-backfill.json');
+    try {
+      await fs.access(flagPath);
+      this.toolchainBackfilled = true;
+      return;
+    } catch {
+      // Not done yet.
+    }
+
+    const names = new Set<string>([
+      ...(this.appConfigService?.getAllConfigs() ?? []).map((cfg) => cfg.name),
+      ...(this.stateManager?.getAllApps() ?? []).map((app) => app.name),
+    ]);
+    const ids = new Map<AppType, string | null>();
+    let complete = true;
+    let stamped = 0;
+    const stampIds = new Set<string>();
+    for (const name of names) {
+      const config = this.appConfigService?.getConfig(name);
+      const type = (this.stateManager?.getApp(name)?.type ?? config?.type ?? 'unknown') as AppType;
+      if (!NODE_MODULES_BUILD_TYPES.includes(type)) continue;
+      try {
+        if (!ids.has(type)) ids.set(type, await this.toolchainIdForBuild(type));
+        const id = ids.get(type);
+        if (!id) {
+          complete = false;
+          break; // the probe failed: asking again per app only multiplies its timeout
+        }
+        const stampId =
+          this.config.isolation === 'docker' && PRE_MARKER_DOCKER_TOOLCHAIN ? PRE_MARKER_DOCKER_TOOLCHAIN : id;
+        stampIds.add(stampId);
+        const trees = [this.sourcePathOf(name, config)];
+        const releases = [
+          config?.currentRelease?.path,
+          config?.previousRelease?.path,
+          config?.pendingPromotion?.releasePath,
+        ];
+        for (const release of releases) {
+          if (release && this.releaseStore?.isReleasePathOf(name, release)) trees.push(release);
+        }
+        for (const tree of trees) {
+          if (await backfillToolchainMarker(tree, stampId)) stamped++;
+        }
+        if (await getRollbackStore()?.backfillToolchain(name, stampId)) stamped++;
+      } catch {
+        complete = false;
+        this.logger.warn(`Could not stamp the existing node_modules of ${name}`, 'BUILD');
+      }
+    }
+
+    if (!complete) {
+      this.logger.warn('Existing node_modules are not all stamped yet; trying again later', 'BUILD');
+      return;
+    }
+    this.toolchainBackfilled = true;
+    this.logger.info(`Stamped ${stamped} existing node_modules with the Node toolchain that built them`, 'BUILD');
+    try {
+      const record = { completedAt: new Date().toISOString(), toolchains: [...stampIds] };
+      await writeJsonAtomic(flagPath, record, { mode: 0o600 });
+    } catch {
+      this.logger.warn('Could not record the node_modules backfill; it runs again next boot', 'BUILD');
+    }
+  }
+
+  /**
+   * Whether the tree this node-runtime app runs from was built for another Node runtime.
+   * False when the toolchain is unknown (non-node type, failed host probe), and
+   * before the backfill has run: the redeploy it asks for would build with no
+   * id, which strips the marker and keeps the old tree. checkTree only reads,
+   * through the no-follow reader, so a live tenant cannot redirect it.
+   */
+  private async servingTreeIsStale(config: AppConfig): Promise<boolean> {
+    return this.treeIsStale(this.servingPathOf(config.name, config), this.appTypeOf(config.name, config));
+  }
+
+  /** servingTreeIsStale for any tree the app could run from. */
+  private async treeIsStale(treePath: string, type: AppType): Promise<boolean> {
+    const id = await this.staleCheckToolchainId(type);
+    return id !== null && (await checkTree(treePath, id)) === 'stale';
+  }
+
+  /** The id a tree is checked against, or null when nothing can be stale (see servingTreeIsStale). */
+  private async staleCheckToolchainId(type: AppType): Promise<string | null> {
+    if (!this.toolchainBackfilled || !NODE_RUNTIME_TYPES.includes(type)) return null;
+    return this.toolchainIdForBuild(type);
+  }
+
+  private appTypeOf(appName: string, config?: AppConfig | null): AppType {
+    return (this.stateManager?.getApp(appName)?.type ?? config?.type ?? 'unknown') as AppType;
+  }
+
+  /**
+   * The start guard: refuse to run a tree built for another Node runtime. The
+   * pre-checks run before their path's first side effect, so their refusal
+   * leaves the app as it was. buildStartSpec runs it too, as the backstop for
+   * start paths with no pre-check; that one runs after its caller's side
+   * effects. Only `stale` is refused: a tree a build never stamps (a custom
+   * install) reads `unmarked` and starts.
+   *
+   * The type defaults to the one the start will detect in `treePath`, the
+   * backstop's own input, so a tree whose type differs from the recorded one
+   * (an older release or snapshot) is judged the same way by both.
+   */
+  private async assertDependenciesCurrent(appName: string, treePath: string, type?: AppType): Promise<void> {
+    if (await this.dependenciesAreStale(appName, treePath, type)) throw new StaleDependenciesError(appName);
+  }
+
+  private async dependenciesAreStale(appName: string, treePath: string, type?: AppType): Promise<boolean> {
+    if (!this.toolchainBackfilled) return false;
+    return this.treeIsStale(treePath, type ?? (await this.startTypeOf(appName, treePath)));
+  }
+
+  /** The type a start of `treePath` will detect; the recorded type when detection fails. */
+  private async startTypeOf(appName: string, treePath: string): Promise<AppType> {
+    const detection = await this.detector?.detect(treePath, { silent: true }).catch(() => null);
+    return (detection?.type ?? this.appTypeOf(appName)) as AppType;
+  }
+
+  /**
+   * A build's toolchain id: none until the backfill has run, so a build never
+   * parks or strips the marker of a tree the backfill has yet to vouch for.
+   * Asks for the backfill first, so a pass that failed at boot is retried.
+   */
+  private async buildToolchainIdFor(appType: AppType): Promise<string | null> {
+    await this.backfillToolchainMarkers();
+    return this.toolchainBackfilled ? this.toolchainIdForBuild(appType) : null;
+  }
+
+  /**
+   * The build's toolchain id from the one producer. The host probe runs in its
+   * own empty directory, data/drop-svc/toolchain-probe (0700): platform-owned,
+   * never a tenant path or the shared temp dir, and not data/drop-svc itself,
+   * which holds the platform's state files.
+   */
+  private async toolchainIdForBuild(appType: AppType): Promise<string | null> {
+    const isolation = this.config.isolation === 'docker' ? 'docker' : 'none';
+    const probeCwd = path.join(this.config.dropRoot, 'data', 'drop-svc', 'toolchain-probe');
+    if (isolation === 'none') await fs.mkdir(probeCwd, { recursive: true, mode: 0o700 });
+    return toolchainIdFor(isolation, appType, probeCwd);
   }
 
   /**
    * Handle app update events (file changes in existing apps)
    * Stops the running process, rebuilds, and restarts on the same port
+   *
+   * @returns true only when the new build is serving (a hot-reload or a
+   * successful cutover); false for every refusal, early return, held build and
+   * failure — a failed rebuild also restores 'running' with an error, and the
+   * early returns leave the app 'running' with none, so status alone cannot
+   * tell them apart.
    */
   private async handleAppUpdate(
     appName: string,
@@ -5720,8 +6455,8 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     reason: string,
     bypassCooldown?: boolean,
     actor?: DeployActorInfo
-  ): Promise<void> {
-    if (!this.runtime || !this.stateManager || !this.detector || !this.builder) return;
+  ): Promise<boolean> {
+    if (!this.runtime || !this.stateManager || !this.detector || !this.builder) return false;
 
     // A backup is taking a snapshot (P2-5b). Deferring rather than dropping:
     // the watcher re-arms once the lock clears, and an API/webhook caller has
@@ -5732,14 +6467,14 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         `Deferring update for ${appName} — deploys are quiesced for a backup`,
         'BACKUP'
       );
-      return;
+      return false;
     }
 
     // Skip apps currently being cloned by git deploy
-    if (this.gitDeployService?.isCloning(appName)) return;
+    if (this.gitDeployService?.isCloning(appName)) return false;
 
     // Skip apps currently being uploaded (PRD-039)
-    if (this.uploadDeployService?.isUploading(appName)) return;
+    if (this.uploadDeployService?.isUploading(appName)) return false;
 
     // Skip if already processing this app (e.g., during initial deployment).
     // An explicit redeploy that's dropped here is logged at info - the API/
@@ -5751,7 +6486,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       } else {
         this.logger.debug(`Skipping update for ${appName} - already in progress`, 'UPDATE');
       }
-      return;
+      return false;
     }
 
     // A monorepo container (root drop.yaml has `services:`) is a group descriptor, never a buildable
@@ -5785,7 +6520,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           this.logger.warn(`Re-expansion of '${appName}' refused by guardrail: ${refusal}`, 'MONOREPO');
           this.releaseGuardrailKeys(appName);
           this.failDeployEpisode(appName, new Error(refusal), crypto.randomUUID(), 'GUARDRAIL_TRIPPED');
-          return;
+          return false;
         }
         this.breakerKeys.set(appName, containerKeys);
 
@@ -5809,7 +6544,8 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           'UPDATE'
         );
       }
-      return;
+      // A container is never itself built, so there is no build to report.
+      return false;
     }
 
     // The mirror of the container guard above, and deliberately AFTER it so the
@@ -5833,7 +6569,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         `Skipping incidental update for grouped child '${appName}' — its monorepo container owns rebuilds`,
         'MONOREPO'
       );
-      return;
+      return false;
     }
 
     // Skip if app was just deployed (adaptive cooldown to prevent loops), UNLESS
@@ -5847,7 +6583,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       const lastDeployTime = this.appDeployTimes.get(appName);
       if (lastDeployTime && Date.now() - lastDeployTime < this.getEffectiveCooldownMs(appName)) {
         this.logger.debug(`Skipping update for ${appName} - within cooldown period`, 'UPDATE');
-        return;
+        return false;
       }
     }
 
@@ -5856,7 +6592,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       // App not yet registered - this can happen during initial deployment
       // when file changes are detected before app:detected is fully processed
       this.logger.debug(`Skipping update for ${appName} - not yet registered`, 'UPDATE');
-      return;
+      return false;
     }
 
     // A user-stopped app must not be resurrected by a file-change hot-reload
@@ -5864,18 +6600,30 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     // (detectedSub, buildSub); without it, any edit or touch to a stopped
     // app's files (git pull, editor autosave) silently rebuilds and restarts
     // it against the user's explicit `drop stop`.
-    if (appState.status === 'stopped') {
+    //
+    // Except an explicit redeploy of a tree built for another Node runtime:
+    // the start guard refuses to start it and tells the user to redeploy, and
+    // this is the only path that rebuilds it.
+    const rebuildsStaleTree =
+      appState.status === 'stopped' &&
+      bypassCooldown === true &&
+      (await this.dependenciesAreStale(appName, this.servingPathOf(appName, undefined, appState)));
+    if (rebuildsStaleTree) {
+      this.logger.info(`Redeploying stopped ${appName} to rebuild dependencies for the current Node runtime`, 'UPDATE');
+    }
+    if (appState.status === 'stopped' && !rebuildsStaleTree) {
       if (bypassCooldown) {
         this.logger.info(`Dropped redeploy for ${appName} - app was stopped by user`, 'UPDATE');
       } else {
         this.logger.debug(`Skipping update for ${appName} - app was stopped by user`, 'UPDATE');
       }
-      return;
+      return false;
     }
 
     // Remember the current port and whether the app was running
     const originalPort = appState.port;
     const wasRunning = appState.status === 'running';
+    const statusAtEntry = appState.status;
 
     // GUARDRAIL. A SECOND choke point, not a duplicate: handleAppUpdate does
     // not route through handleBuildApp — it has its own build — so the Step 7
@@ -5910,12 +6658,55 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       // Reported as a normal deploy failure so a caller polling for an outcome
       // gets an answer instead of waiting out its budget.
       this.failDeployEpisode(appName, new Error(refusal), crypto.randomUUID(), 'GUARDRAIL_TRIPPED');
-      return;
+      return false;
     }
     this.breakerKeys.set(appName, guardKeys);
 
     this.logger.info(`Hot-reload triggered for ${appName}: ${reason}`, 'UPDATE');
     this.appsInProgress.add(appName);
+
+    // Wait for a builder slot BEFORE any side effect, so a redeploy queued
+    // behind a full cap (a boot-reconcile burst) leaves status, build log and
+    // deploy target alone and the old version untouched. The checks below
+    // re-run what can change while waiting, and the disk check then sees the
+    // disk as it is now.
+    const releaseSlot = await this.reserveBuildSlot(appName);
+    if (this.isQuiesced()) {
+      this.logger.info(
+        `Deferring update for ${appName} — deploys are quiesced for a backup`,
+        'BACKUP'
+      );
+      releaseSlot();
+      this.releaseGuardrailKeys(appName);
+      this.appsInProgress.delete(appName);
+      return false;
+    }
+    // A git pull or upload that began while waiting publishes its own
+    // app:update when it lands, and with appsInProgress cleared that runs.
+    if (this.gitDeployService?.isCloning(appName) || this.uploadDeployService?.isUploading(appName)) {
+      this.logger.info(
+        `Dropped redeploy for ${appName} - a git pull/upload began while waiting for a build slot`,
+        'UPDATE'
+      );
+      releaseSlot();
+      this.releaseGuardrailKeys(appName);
+      this.appsInProgress.delete(appName);
+      return false;
+    }
+    // Removed, or stopped by the user since entry, while waiting. An explicit
+    // redeploy of an app that was ALREADY stopped at entry (rebuildsStaleTree)
+    // deliberately proceeds.
+    const current = this.stateManager.getApp(appName);
+    if (!current || (current.status === 'stopped' && statusAtEntry !== 'stopped')) {
+      this.logger.info(
+        `Dropped redeploy for ${appName} - app was ${current ? 'stopped by user' : 'removed'} while waiting for a build slot`,
+        'UPDATE'
+      );
+      releaseSlot();
+      this.releaseGuardrailKeys(appName);
+      this.appsInProgress.delete(appName);
+      return false;
+    }
 
     // Hot-reload — the app is currently RUNNING and serving traffic. Abort
     // with a `return`, never a `throw`: the catch below unconditionally marks
@@ -5934,7 +6725,8 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       // episode's slot to whatever outcome is recorded next.
       this.releaseGuardrailKeys(appName);
       this.appsInProgress.delete(appName);
-      return;
+      releaseSlot();
+      return false;
     }
 
     try {
@@ -5976,14 +6768,24 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       // marker and abstains from starting the app (handleAppUpdate starts it
       // below). finally guarantees the marker is cleared even on build failure —
       // a stuck marker would silently suppress the app's NEXT legit deploy.
+      const buildPath = await this.prepareDeployTarget(appName, appPath, updateDeployId);
       this.selfManagedUpdates.add(appName);
       let buildResult;
       try {
         const buildEnv = await this.resolveBuildEnv(appPath, appName);
         const buildOverride = (await parseDropYaml(appPath)).config?.build;
+        // Parity with handleBuildApp — see buildToolchainFor. Without this
+        // every redeploy of an EXISTING app ran its tenant-authored install
+        // and build commands on the host instead of inside the build
+        // container, and this is the path upload-deploy and git redeploy both
+        // take, i.e. the common one.
+        const { execCommand, toolchainId, nodeModulesAsideDir } = await this.buildToolchainFor(
+          detection.type,
+          appName
+        );
         buildResult = await this.builder.build({
           appName,
-          appPath,
+          appPath: buildPath,
           deployId: updateDeployId,
           appType: detection.type,
           framework: detection.framework || null,
@@ -5993,17 +6795,18 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           },
           env: buildEnv,
           workDir,
-          // Parity with handleBuildApp — see buildExecCommandFor. Without this
-          // every redeploy of an EXISTING app ran its tenant-authored install
-          // and build commands on the host instead of inside the build
-          // container, and this is the path upload-deploy and git redeploy both
-          // take, i.e. the common one.
-          execCommand: this.buildExecCommandFor(detection.type, appName),
+          execCommand,
+          toolchainId,
+          nodeModulesAsideDir,
+          slotReserved: true,
           onBuildLog: updateLogId && this.buildLogService
             ? (line) => this.buildLogService!.writeLine(updateLogId, line)
             : undefined,
         });
       } finally {
+        // The slot is for building only; free it as soon as build() returns
+        // (idempotent, so the catch below may repeat it).
+        releaseSlot();
         this.selfManagedUpdates.delete(appName);
         // Also in the finally: resolveBuildEnv/parseDropYaml above can throw,
         // and the close used to sit after this block — so a throw leaked the
@@ -6025,9 +6828,10 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         } else {
           await this.stateManager.setAppStatus(appName, 'errored', { error: buildError });
         }
+        await this.discardDeployTarget(appName);
         this.recordDeployOutcome(appName, false);
         this.appsInProgress.delete(appName);
-        return;
+        return false;
       }
 
       // Manual promotion holds HERE, before the stop. This is the branch SEC-9
@@ -6041,7 +6845,21 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         this.releaseGuardrailKeys(appName);
         await this.stateManager.setAppStatus(appName, appState.status);
         this.appsInProgress.delete(appName);
-        return;
+        return false;
+      }
+
+      // Zero-downtime cutover (#298) for an eligible app: the old instance
+      // keeps serving until the new one has proved itself and traffic moved.
+      // Returns false, having touched nothing, for anything it cannot cut over.
+      const cutover = await this.tryCutover(
+        appName,
+        buildPath,
+        detection,
+        buildResult.outputPath ?? undefined,
+        wasRunning
+      );
+      if (cutover) {
+        return cutover === 'ok';
       }
 
       // Build succeeded — now stop the old version and swap in the new one.
@@ -6075,7 +6893,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
 
       const { spec, port } = await this.buildFreshStartSpec(
         appName,
-        appPath,
+        buildPath,
         detection,
         buildResult.outputPath ?? undefined
       );
@@ -6090,7 +6908,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       // container in docker mode, so the runtime-spec revision recorded here
       // is accurate too. Fire-and-forget (`void`), not awaited: must never
       // delay the 'running' status write or appsInProgress's release.
-      void this.recordDeploySignature(appName, appPath);
+      void this.recordDeploySignature(appName, this.sourcePathOf(appName));
 
       await this.stateManager.setAppStatus(appName, 'running', {
         port,
@@ -6106,9 +6924,13 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       // process rather than continuing to watch the old one's count.
       this.armPostDeployWatches(appName, port, spec.healthCheckPath);
 
+      await this.commitServedPath(appName, buildPath);
       this.recordDeployOutcome(appName, true);
       this.appsInProgress.delete(appName);
+      return true;
     } catch (error) {
+      releaseSlot();
+      await this.discardDeployTarget(appName);
       // Secret preflight park (PRD-051) on a hot-reload — e.g. the edited
       // drop.yaml added a required `secrets:` entry. Park in `needs-config`
       // (not `errored`) so the operator gets the actionable missing list. The
@@ -6132,7 +6954,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         // that was wrong — MAX_BUILDS aborts BEFORE the build.)
         this.recordDeployOutcome(appName, false);
         this.appsInProgress.delete(appName);
-        return;
+        return false;
       }
       this.logger.appEvent('error', appName, error instanceof Error ? error.message : 'Hot-reload failed');
       await this.stateManager.setAppStatus(appName, 'errored', {
@@ -6140,6 +6962,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       });
       this.recordDeployOutcome(appName, false);
       this.appsInProgress.delete(appName);
+      return false;
     }
   }
 
@@ -6170,12 +6993,14 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     appName: string,
     appPath: string,
     detection: DetectionResult,
-    buildOutputDir?: string
+    buildOutputDir?: string,
+    /** A cutover's second port (#298), already claimed in usedPorts. */
+    portOverride?: number
   ): Promise<{ spec: AppStartSpec; port: number }> {
     // Restart path: honour a declared `port:` here too, or a restart would
     // quietly hand back the previously auto-allocated port and undo it.
     const declaredPort = (await parseDropYaml(appPath))?.config?.port;
-    const port = this.allocatePort(appName, declaredPort);
+    const port = portOverride ?? this.allocatePort(appName, declaredPort);
 
     // Ensure data directory exists (preserved across upgrades)
     const dataDir = await this.ensureAppDataDirectory(appName);
@@ -6246,6 +7071,607 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
   }
 
   /**
+   * Zero-downtime cutover (#298 step 5) for a redeploy that has just built a
+   * new release. Returns FALSE, having touched nothing, when the deploy is not
+   * eligible (see `cutoverEligibility`) — the caller then stops and starts as
+   * before. Otherwise it handled the deploy — 'ok' when traffic moved to the
+   * new release, 'failed' when it did not; it then owns the app's status, the
+   * guardrail outcome and releasing `appsInProgress`.
+   */
+  private async tryCutover(
+    appName: string,
+    buildPath: string,
+    detection: DetectionResult,
+    outputPath: string | undefined,
+    wasRunning: boolean
+  ): Promise<false | 'ok' | 'failed'> {
+    if (!wasRunning) return false;
+    const oldPort = await this.cutoverEligibility(appName, buildPath);
+    if (oldPort === null) return false;
+
+    const result = await this.cutoverTo(appName, buildPath, detection, outputPath, oldPort);
+    if (!result.ok) {
+      await this.discardDeployTarget(appName);
+      await this.failCutover(appName, oldPort, result.error, result.healthCheckPath);
+      return 'failed';
+    }
+    this.recordDeployOutcome(appName, true);
+    this.appsInProgress.delete(appName);
+    return 'ok';
+  }
+
+  /**
+   * The app's current port when `targetPath` can be cut over to without a
+   * gap, or null when it must be stopped and started instead.
+   *
+   * Not eligible, by design: a target that is not one of the app's releases
+   * (an in-place app), an app that is not running, one with a declared `port:`
+   * (two instances cannot share it), one that does not listen on its port (a
+   * worker — nothing to cut traffic over), and, on a localhost-suffix box, one
+   * that other apps depend on (they are handed its port directly, not its
+   * hostname).
+   */
+  private async cutoverEligibility(appName: string, targetPath: string): Promise<number | null> {
+    const runtime = this.runtime;
+    const state = this.stateManager;
+    if (!runtime || !state || !this.releaseStore) return null;
+    if (!this.releaseStore.isReleasePathOf(appName, targetPath)) return null;
+    const oldPort = state.getApp(appName)?.port;
+    if (!oldPort) return null;
+    if ((await parseDropYaml(targetPath))?.config?.port) return null;
+    if ((await runtime.getStatus(appName))?.status !== 'running') return null;
+    if (!(await probePort('127.0.0.1', oldPort, 1000))) return null;
+    if (
+      isLocalhostDomain(this.config.domainSuffix || 'localhost') &&
+      (await this.hasDependents(appName))
+    ) {
+      return null;
+    }
+    return oldPort;
+  }
+
+  /**
+   * Put the release at `targetPath` in front of traffic without a gap — the
+   * one implementation behind a zero-downtime redeploy, a rollback to the
+   * previous release, and a promotion of a held one (#298 step 6):
+   *
+   *   1. start the release in the IDLE slot, on a second port — the route is
+   *      not touched (see `cutovers`);
+   *   2. strict readiness: it must answer HTTP below 500, and stay alive;
+   *   3. persist the new slot and port, then point the app's routes at it and
+   *      WAIT for Caddy to accept;
+   *   4. drain, then delete the old instance and release its port;
+   *   5. record the release as current, mark the app running on the new port
+   *      and re-arm its supervision.
+   *
+   * A failure before step 3 deletes the new instance and nothing else: the old
+   * one never stopped serving, and the result says why. Persisting before the
+   * route moves is what makes a crash recoverable: at boot the live slot comes
+   * from config, the other slot is removed as an orphan, and routes are
+   * rebuilt from the config port.
+   *
+   * The caller holds `appsInProgress` and has checked `cutoverEligibility`;
+   * what a failure MEANS (a failed deploy, a refused rollback) is the caller's.
+   *
+   * Caveat: every start re-mints an app's scoped DROP_API_KEY, so for an app
+   * with granted capabilities the OLD instance's key stops working for the
+   * length of the drain.
+   */
+  private async cutoverTo(
+    appName: string,
+    targetPath: string,
+    detection: DetectionResult,
+    outputPath: string | undefined,
+    oldPort: number
+  ): Promise<
+    | { ok: true; port: number }
+    | { ok: false; error: unknown; healthCheckPath: string | undefined }
+  > {
+    const runtime = this.runtime!;
+    const oldSlot = runtime.getLiveInstance(appName);
+    const newSlot: InstanceSlot = oldSlot === 'a' ? 'b' : 'a';
+    // Runtime names, for the spec and the log; explicit REFS for every call
+    // that must hit exactly one slot — a bare slot-a name would resolve to
+    // whichever slot is live (see instance.ts, "Addressing one slot").
+    const oldInstance = instanceName(appName, oldSlot);
+    const newInstance = instanceName(appName, newSlot);
+    const oldRef = instanceRef(appName, oldSlot);
+    const newRef = instanceRef(appName, newSlot);
+    const newPort = this.allocateAdditionalPort(appName);
+    this.cutovers.add(appName);
+    this.logger.info(
+      `Zero-downtime cutover of ${appName}: starting ${newInstance} on port ${newPort} beside ${oldInstance}`,
+      'CUTOVER'
+    );
+
+    let spec: AppStartSpec | undefined;
+    let started = false;
+    let persisted = false;
+    const previousOutput = this.appConfigService?.getConfig(appName)?.outputDirectory;
+    try {
+      spec = (await this.buildFreshStartSpec(appName, targetPath, detection, outputPath, newPort)).spec;
+      spec.instance = newInstance;
+      // A leftover of the idle slot (an earlier cutover that died) must go.
+      if (await runtime.getStatus(newRef).catch(() => null)) {
+        await runtime.delete(newRef).catch(() => undefined);
+      }
+      await this.noteRuntimeLogStart(appName);
+      await runtime.start(spec);
+      started = true;
+
+      const ready = await this.awaitStrictReadiness(newRef, newPort, spec.healthCheckPath);
+      if (!ready.ok) throw new CutoverError(ready.reason, ready.exited);
+
+      // Point of no return for bookkeeping: see the method doc on ordering.
+      await this.appConfigService?.updateSystemConfig(appName, { runtimeSlot: newSlot });
+      await this.appConfigService?.updateConfig(appName, {
+        port: newPort,
+        ...(outputPath ? { outputDirectory: outputPath } : {}),
+      });
+      persisted = true;
+
+      const switched = await this.router?.setUpstream(appName, `localhost:${newPort}`);
+      if (switched?.outcome === 'rejected') {
+        throw new CutoverError('Caddy rejected the config that switched traffic to the new version', false);
+      }
+      // 'unavailable' / 'disabled' / no routes: nothing routes through Caddy
+      // here (a dev box), so there is no traffic switch to wait for.
+    } catch (error) {
+      this.cutovers.delete(appName);
+      if (persisted) {
+        await this.appConfigService?.updateSystemConfig(appName, { runtimeSlot: oldSlot }).catch(() => undefined);
+        await this.appConfigService
+          ?.updateConfig(appName, { port: oldPort, outputDirectory: previousOutput })
+          .catch(() => undefined);
+      }
+      if (started) await runtime.delete(newRef).catch(() => undefined);
+      if (this.usedPorts.get(newPort) === appName) this.usedPorts.delete(newPort);
+      return { ok: false, error, healthCheckPath: spec?.healthCheckPath };
+    }
+
+    // Traffic is on the new instance. Let in-flight requests to the old one
+    // finish, then remove it.
+    this.cutovers.delete(appName);
+    await new Promise((resolve) => setTimeout(resolve, this.cutoverDrainMs()));
+    this.stopHealthProber(appName);
+    await runtime.delete(oldRef).catch((err) =>
+      this.logger.warn(`Could not remove ${oldInstance} after cutover`, 'CUTOVER', err)
+    );
+    if (this.usedPorts.get(oldPort) === appName) this.usedPorts.delete(oldPort);
+    // Only now does a bare app name mean the new instance. Until the old one
+    // was gone, anything asking the runtime about the app by name got the
+    // instance that was still serving.
+    runtime.setLiveInstance(appName, newSlot);
+
+    await this.commitServedPath(appName, targetPath, newSlot);
+    void this.recordDeploySignature(appName, this.sourcePathOf(appName));
+    const info = await runtime.getStatus(appName);
+    await this.stateManager?.setAppStatus(appName, 'running', { port: newPort, pid: info?.pid ?? undefined });
+    this.appDeployTimes.set(appName, Date.now());
+    this.armPostDeployWatches(appName, newPort, spec.healthCheckPath);
+    this.logger.info(`Zero-downtime cutover of ${appName} complete: now serving from ${newInstance}`, 'CUTOVER');
+    return { ok: true, port: newPort };
+  }
+
+  /**
+   * Report a cutover that did not happen. The old instance is still serving,
+   * so the app ends `running` — but the deploy FAILED, and the tracker closes
+   * an episode as failed only on `errored`. So: publish the boot failure, mark
+   * `errored` (closing the episode and its detail), then put the true status
+   * back and re-arm the old instance's supervision, which the `errored`
+   * transition tore down.
+   */
+  private async failCutover(
+    appName: string,
+    oldPort: number,
+    error: unknown,
+    healthCheckPath: string | undefined
+  ): Promise<void> {
+    const reason = error instanceof Error ? error.message : String(error);
+    const exited = error instanceof CutoverError && error.exited;
+    this.logger.warn(`Zero-downtime deploy of ${appName} failed; previous version still serving: ${reason}`, 'CUTOVER');
+    this.recordDeployOutcome(appName, false);
+    await this.noteRuntimeLogEnd(appName);
+    eventBus.publish('deploy:failed', {
+      appId: appName,
+      phase: 'boot',
+      reason: exited ? 'process-exited' : 'readiness-failed',
+    });
+    // Zero-downtime runs the new version BESIDE the old one, which an app that
+    // allows a single running copy (an exclusive database lock, a single-writer
+    // store) can never pass. Say so: the readiness reason alone reads like a
+    // bug in the new version.
+    const message =
+      `New version was not deployed (${reason}); the previous version is still serving. ` +
+      `A zero-downtime deploy starts the new version beside the old one; if this app allows ` +
+      `only one running copy, set \`deploy: strategy: in-place\` in drop.yaml.`;
+    await this.stateManager?.setAppStatus(appName, 'errored', { port: oldPort, error: message });
+    await this.stateManager?.setAppStatus(appName, 'running', { port: oldPort, error: message });
+    this.armPostDeployWatches(appName, oldPort, healthCheckPath);
+    this.appsInProgress.delete(appName);
+  }
+
+  /**
+   * Readiness for CUTTING TRAFFIC OVER, which is stricter than the deploy-path
+   * gate on purpose: that one accepts a bare port bind (PM2) or a slow start
+   * with a warning, because a first deploy has nothing to protect. Here the old
+   * version is serving, so the new one must answer HTTP below 500 — on its
+   * `healthCheck` path when it declares one — and still be alive.
+   */
+  private async awaitStrictReadiness(
+    instance: string,
+    port: number,
+    healthCheckPath: string | undefined
+  ): Promise<{ ok: true } | { ok: false; reason: string; exited: boolean }> {
+    const deadline = Date.now() + this.readinessTimeoutMs;
+    let lastStatus: number | undefined;
+    while (Date.now() < deadline) {
+      const info = await this.runtime?.getStatus(instance).catch(() => null);
+      if (!info || info.status === 'stopped' || info.status === 'errored') {
+        return { ok: false, reason: 'the new instance exited before it was ready', exited: true };
+      }
+      const probe = await probeHttp('127.0.0.1', port, healthCheckPath || '/', 2000);
+      if (probe.responded && typeof probe.statusCode === 'number') {
+        if (probe.statusCode < 500) return { ok: true };
+        lastStatus = probe.statusCode;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+    return {
+      ok: false,
+      reason: lastStatus
+        ? `the new instance answered HTTP ${lastStatus} until the readiness window closed`
+        : 'the new instance never answered HTTP within the readiness window',
+      exited: false,
+    };
+  }
+
+  /** Drain window between switching traffic and removing the old instance. */
+  private cutoverDrainMs(): number {
+    const parsed = parseInt(process.env.DROP_CUTOVER_DRAIN_MS ?? '', 10);
+    return Number.isFinite(parsed) && parsed >= 0 ? parsed : 10_000;
+  }
+
+  /**
+   * A port for a cutover's new instance: never the app's current one. Claimed
+   * synchronously, like allocatePort's range scan, so nothing can race onto it.
+   */
+  private allocateAdditionalPort(appName: string): number {
+    for (let p = this.config.portRangeStart; p <= this.config.portRangeEnd; p++) {
+      if (!this.usedPorts.has(p)) {
+        this.usedPorts.set(p, appName);
+        return p;
+      }
+    }
+    throw new Error('No available ports in configured range');
+  }
+
+  /** Whether any other app's drop.yaml lists `appName` under depends_on. */
+  private async hasDependents(appName: string): Promise<boolean> {
+    for (const other of this.stateManager?.getAllApps() ?? []) {
+      if (other.name === appName || other.isGroupContainer) continue;
+      try {
+        const parsed = await parseDropYaml(this.sourcePathOf(other.name));
+        if (parsed.config?.depends_on?.some((d) => d.name === appName)) return true;
+      } catch {
+        // An unreadable manifest declares nothing.
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Forget a verified custom domain (#302) and remove the route it had, if
+   * any. Used when the app's domain no longer matches what was verified.
+   * Best-effort: a route that is already gone is not an error.
+   */
+  private async dropCustomDomainRoute(appName: string, domain: string): Promise<void> {
+    const routeKey = `${appName}-${domain.replace(/\./g, '-')}`;
+    if (this.router?.hasRoute(routeKey)) {
+      await this.router.removeRoute(routeKey).catch((err) =>
+        this.logger.warn(`Could not remove the route for '${domain}'`, 'ROUTER', err)
+      );
+    }
+    await this.appConfigService
+      ?.updateSystemConfig(appName, { customDomainVerified: undefined })
+      .catch(() => undefined);
+  }
+
+  /**
+   * Remove runtime instances that are not their app's live one (#298): the
+   * leftover of a cutover the platform died in the middle of. Which slot is
+   * live comes from config, written only once a new instance proved ready, so
+   * the survivor is always one that served. Best-effort.
+   */
+  private async removeOrphanInstances(): Promise<void> {
+    if (!this.runtime) return;
+    let all: AppProcessInfo[];
+    try {
+      all = await this.runtime.getAllStatus();
+    } catch {
+      return;
+    }
+    for (const proc of all) {
+      if (!proc.instance) continue;
+      const live = instanceName(proc.name, this.runtime.getLiveInstance(proc.name));
+      if (proc.instance === live) continue;
+      this.logger.warn(`Removing orphaned instance ${proc.instance} (live: ${live})`, 'CUTOVER');
+      const orphanSlot: InstanceSlot = isInstanceName(proc.instance) ? 'b' : 'a';
+      await this.runtime.delete(instanceRef(proc.name, orphanSlot)).catch(() => undefined);
+    }
+  }
+
+  /**
+   * Where an app's SOURCE lives: what uploads land in, what `git pull` updates,
+   * where `drop.yaml` and the secrets preflight are read. Persisted config path
+   * first (a monorepo child's copied folder), then state (an admin-deployed
+   * out-of-tree app has state but no appconf), then the webapps default.
+   *
+   * Callers that already hold the config/state records pass them, so this
+   * never re-reads what the caller just read.
+   */
+  private sourcePathOf(
+    appName: string,
+    config?: { path?: string } | null,
+    state?: { path?: string } | null
+  ): string {
+    const cfg = config === undefined ? this.appConfigService?.getConfig(appName) : config;
+    const st = state === undefined ? this.stateManager?.getApp(appName) : state;
+    return cfg?.path || st?.path || path.join(this.config.appsDirectory, appName);
+  }
+
+  /**
+   * Where an app RUNS FROM: the start spec's `cwd`, the tree a rollback
+   * restores, the tree the disk ceiling measures as code.
+   *
+   * Identical to `sourcePathOf` today — every app builds in place and runs from
+   * its source folder. It exists as its own name because zero-downtime
+   * redeploys (#298, docs/plans/2026-09-26-zero-downtime-releases.md) move it
+   * to a per-release directory; every caller that means "the running tree"
+   * must already be saying so when that lands.
+   */
+  private servingPathOf(
+    appName: string,
+    config?: { path?: string; currentRelease?: { path: string } } | null,
+    state?: { path?: string } | null
+  ): string {
+    const cfg = config === undefined ? this.appConfigService?.getConfig(appName) : config;
+    const release = cfg?.currentRelease?.path;
+    // Contained, or ignored: this becomes the runtime's working directory.
+    if (this.releaseStore?.isReleasePathOf(appName, release)) return release;
+    return this.sourcePathOf(appName, cfg, state);
+  }
+
+  /**
+   * Decide where THIS deploy builds, and remember it for the start that
+   * follows. A zero-downtime app gets a fresh copy of its source under
+   * `data/releases/<app>/<deployId>/`; any other app builds in its source
+   * folder, exactly as before. Throws only if staging the copy fails, which
+   * the caller treats as a failed deploy.
+   */
+  private async prepareDeployTarget(
+    appName: string,
+    sourcePath: string,
+    deployId: string
+  ): Promise<string> {
+    await this.discardDeployTarget(appName);
+    // A node_modules parked by an earlier failed build of the SOURCE folder goes
+    // back first, so a release is staged from it and a release build (another
+    // slot) never leaves it parked. A failure keeps it parked for the boot
+    // restore or the next in-place build; never fatal here.
+    await restoreParkedTree(sourcePath, this.nodeModulesAsideRootOf(appName));
+    let target = sourcePath;
+    if (this.releaseStore && (await wantsReleases(sourcePath))) {
+      target = await this.releaseStore.stage(appName, sourcePath, deployId);
+      this.logger.info(`Building ${appName} into release ${path.basename(target)}`, 'RELEASE');
+    }
+    this.deployTargets.set(appName, target);
+    return target;
+  }
+
+  /** Wait for a builder slot; the returned release is idempotent. */
+  private async reserveBuildSlot(appName: string): Promise<() => void> {
+    // Builders mocked as `{ build }` in tests have no reserveSlot.
+    return (await this.builder?.reserveSlot?.(appName)) ?? (() => undefined);
+  }
+
+  /** Forget the in-flight deploy target, deleting it if it is a release. Never throws. */
+  private async discardDeployTarget(appName: string): Promise<void> {
+    const target = this.deployTargets.get(appName);
+    this.deployTargets.delete(appName);
+    if (target && this.releaseStore?.isReleasePathOf(appName, target)) {
+      await this.releaseStore.discard(appName, target).catch(() => undefined);
+    }
+  }
+
+  /**
+   * The app is now RUNNING from `servedPath`: record it. A release becomes
+   * `currentRelease` (the one it replaces becomes `previousRelease`) and any
+   * older release is pruned — so a rollback to `previousRelease` swaps the
+   * two, keeping the original record. An in-place start after the app opted
+   * out keeps its last release as `previousRelease`, so that deploy can still
+   * be rolled back, and deletes the rest. Best-effort: the app is already
+   * serving, so a bookkeeping failure is logged, not thrown.
+   */
+  private async commitServedPath(appName: string, servedPath: string, slot?: InstanceSlot): Promise<void> {
+    if (this.deployTargets.get(appName) === servedPath) this.deployTargets.delete(appName);
+    const store = this.releaseStore;
+    const configs = this.appConfigService;
+    if (!store || !configs) return;
+    try {
+      const cfg = configs.getConfig(appName);
+      if (store.isReleasePathOf(appName, servedPath)) {
+        if (cfg?.currentRelease?.path === servedPath) return;
+        // A rollback serves the previous release again: keep its record (when
+        // it was deployed, what it served), not a fresh one.
+        const reused = cfg?.previousRelease?.path === servedPath ? cfg.previousRelease : undefined;
+        const current = {
+          ...(reused
+            ? { ...reused, instance: undefined }
+            : { id: path.basename(servedPath), path: servedPath, createdAt: new Date().toISOString() }),
+          // What a later rollback to this release must serve from.
+          ...(reused ? {} : cfg?.outputDirectory !== undefined ? { outputDirectory: cfg.outputDirectory } : {}),
+          ...(slot ? { instance: slot } : {}),
+        };
+        const previous = cfg?.currentRelease ?? cfg?.previousRelease;
+        await configs.updateSystemConfig(appName, { currentRelease: current, previousRelease: previous });
+        await store.prune(appName, [current.path, previous?.path, cfg?.pendingPromotion?.releasePath]);
+      } else if (cfg?.currentRelease) {
+        await configs.updateSystemConfig(appName, {
+          currentRelease: undefined,
+          previousRelease: cfg.currentRelease,
+        });
+        await store.prune(appName, [cfg.currentRelease.path, cfg.pendingPromotion?.releasePath]);
+      }
+    } catch (error) {
+      this.logger.warn(`Failed to record the release ${appName} is serving from`, 'RELEASE', error);
+    }
+  }
+
+  /**
+   * Go back to what served before the last deploy. No rebuild either way.
+   *
+   * An app with a `previousRelease` (#298 step 6 — the zero-downtime
+   * strategy, or an app that has just opted out of it) is CUT OVER to that
+   * release when it is running and listening, exactly as a redeploy is: the
+   * current version serves until the previous one has proved ready, and if it
+   * never does, nothing changes and the rollback is refused. Otherwise the
+   * release is recorded as current and the app restarts from it. The source
+   * folder is not touched: the next deploy builds from it again.
+   *
+   * Any other app gets its last-good tree back from the snapshot store and
+   * restarts on its existing port (#296): the snapshot holds build output and
+   * dependencies as they were when that tree was serving.
+   *
+   * Holds the `appsInProgress` guard across the restore AND the restart, so a
+   * deploy cannot land files between the two, and watcher events raised by
+   * the restore itself are dropped rather than read back as a user edit (the
+   * in-progress skip in handleAppUpdate), then covered by the cooldown
+   * doRestart records.
+   *
+   * The recorded `outputDirectory` is restored with the tree: a static app
+   * serves from it, and the deploy being undone may have changed it.
+   *
+   * Code only. Database, Redis, appdata, secrets and environment are not
+   * touched — see NOT_RESTORED.
+   */
+  async rollbackApp(appName: string): Promise<{ meta: RollbackSnapshotMeta; info: AppProcessInfo }> {
+    if (this.appsInProgress.has(appName)) {
+      throw new AppInProgressError(appName);
+    }
+    this.appsInProgress.add(appName);
+    try {
+      const store = getRollbackStore();
+      if (!store || !this.appConfigService || !this.stateManager) {
+        throw new NoRollbackSnapshotError(appName);
+      }
+      const config = this.appConfigService.getConfig(appName);
+      const state = this.stateManager.getApp(appName);
+      if (!config && !state) {
+        throw new Error(`Application not found: ${appName}`);
+      }
+
+      const release = await this.rollbackRelease(appName);
+      if (release) return await this.rollbackToRelease(appName, release);
+
+      // Before restoreInto, which empties the app directory.
+      const toolchainId = await this.staleCheckToolchainId(this.appTypeOf(appName, config));
+      if (toolchainId && (await store.snapshotIsStale(appName, toolchainId))) {
+        throw new StaleDependenciesError(appName);
+      }
+
+      const appPath = this.servingPathOf(appName, config, state);
+      const meta = await store.restoreInto(appName, appPath);
+      this.appDeployTimes.set(appName, Date.now());
+      if (meta.outputDirectory !== undefined) {
+        await this.appConfigService.upsertConfig(appName, { outputDirectory: meta.outputDirectory });
+      }
+      this.logger.info(`Rolled back ${appName} to the tree captured ${meta.takenAt}`, 'ROLLBACK');
+
+      const info = await this.doRestart(appName);
+      return { meta, info };
+    } finally {
+      this.appsInProgress.delete(appName);
+    }
+  }
+
+  /**
+   * What a rollback would go back to, without doing it: the previous release
+   * when there is one, the snapshot otherwise, or null. Backs
+   * `GET /apps/:name/rollback`.
+   */
+  async describeRollback(appName: string): Promise<RollbackSnapshotMeta | null> {
+    const release = await this.rollbackRelease(appName);
+    if (release) return this.releaseRollbackMeta(appName, release);
+    const snapshot = await getRollbackStore()?.get(appName);
+    return snapshot ? { ...snapshot, kind: 'snapshot' } : null;
+  }
+
+  /** The app's previous release, when it is contained and still on disk. */
+  private async rollbackRelease(appName: string): Promise<AppRelease | null> {
+    const release = this.appConfigService?.getConfig(appName)?.previousRelease;
+    // Contained, or ignored: a rollback makes this the runtime's cwd.
+    if (!release || !this.releaseStore?.isReleasePathOf(appName, release.path)) return null;
+    try {
+      await fs.access(release.path);
+      return release;
+    } catch {
+      return null;
+    }
+  }
+
+  private async releaseRollbackMeta(appName: string, release: AppRelease): Promise<RollbackSnapshotMeta> {
+    const measured = await measureTree(release.path).catch(() => ({ bytes: 0 }));
+    return {
+      appName,
+      takenAt: release.createdAt,
+      bytes: measured.bytes,
+      ...(release.outputDirectory !== undefined ? { outputDirectory: release.outputDirectory } : {}),
+      kind: 'release',
+    };
+  }
+
+  /** rollbackApp for an app with a previous release. The caller holds the guard. */
+  private async rollbackToRelease(
+    appName: string,
+    release: AppRelease
+  ): Promise<{ meta: RollbackSnapshotMeta; info: AppProcessInfo }> {
+    if (!this.runtime || !this.detector || !this.appConfigService) {
+      throw new Error('Platform is not fully initialized');
+    }
+    // Before either branch: the one that cannot cut over rotates the releases first.
+    await this.assertDependenciesCurrent(appName, release.path);
+    const meta = await this.releaseRollbackMeta(appName, release);
+
+    const oldPort = await this.cutoverEligibility(appName, release.path);
+    if (oldPort !== null) {
+      const detection = await this.detector.detect(release.path, { silent: true });
+      const result = await this.cutoverTo(appName, release.path, detection, release.outputDirectory, oldPort);
+      if (!result.ok) {
+        const reason = result.error instanceof Error ? result.error.message : String(result.error);
+        throw new Error(
+          `Rollback of '${appName}' was not applied: ${reason}. The current version is still serving.`
+        );
+      }
+      this.logger.info(`Rolled back ${appName} to the release deployed ${release.createdAt}`, 'ROLLBACK');
+      const info = await this.runtime.getStatus(appName);
+      if (!info) throw new Error(`Rolled back ${appName}, but the runtime does not report it`);
+      return { meta, info };
+    }
+
+    // Not running, or not something traffic can be cut over for: serve the
+    // previous release from the next start, as a snapshot rollback would.
+    if (release.outputDirectory !== undefined) {
+      await this.appConfigService.upsertConfig(appName, { outputDirectory: release.outputDirectory });
+    }
+    await this.commitServedPath(appName, release.path);
+    this.appDeployTimes.set(appName, Date.now());
+    this.logger.info(`Rolled back ${appName} to the release deployed ${release.createdAt}`, 'ROLLBACK');
+    const info = await this.doRestart(appName);
+    return { meta, info };
+  }
+
+  /**
    * The body of restartApp, extracted so `attachService` (DROP-151 Phase 2)
    * can hold the `appsInProgress` guard across provisioning AND the restart
    * that follows it, instead of releasing and re-acquiring the guard between
@@ -6267,7 +7693,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     if (!config && !state) {
       throw new Error(`Application not found: ${appName}`);
     }
-    const appPath = config?.path || state?.path || path.join(this.config.appsDirectory, appName);
+    const appPath = this.servingPathOf(appName, config, state);
 
     const runtimeStatus = await this.runtime.getStatus(appName);
     const isRunning = runtimeStatus?.status === 'running';
@@ -6285,6 +7711,9 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         );
       }
     }
+
+    // Before the delete below: a refused restart leaves a running app running.
+    await this.assertDependenciesCurrent(appName, appPath);
 
     try {
       this.stopHealthProber(appName);
@@ -6310,7 +7739,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       // container in docker mode, so the runtime-spec revision recorded
       // here is accurate too. Fire-and-forget (`void`), not awaited: must
       // never delay the 'running' status write or appsInProgress's release.
-      void this.recordDeploySignature(appName, appPath);
+      void this.recordDeploySignature(appName, this.sourcePathOf(appName));
 
       await this.stateManager.setAppStatus(appName, 'running', {
         port,
@@ -6488,7 +7917,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       // join would read the wrong (or no) drop.yaml for an out-of-tree or
       // monorepo-child app and let the own-DATABASE_URL guard below pass
       // when it should refuse.
-      const appPath = config?.path || state?.path || path.join(this.config.appsDirectory, appName);
+      const appPath = this.sourcePathOf(appName, config, state);
 
       if (config?.ephemeral) {
         return this.refuse('attach', appName, serviceId, {
@@ -6496,6 +7925,16 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           reason: 'ephemeral',
           detail:
             'This app is ephemeral and will be torn down on its TTL without a database backup — attach is refused to avoid unrecoverable data loss.',
+        });
+      }
+
+      // Before provisioning: the attach ends in a restart, which would refuse
+      // only after a database was created against the owner's quota.
+      if (await this.dependenciesAreStale(appName, this.servingPathOf(appName, config, state))) {
+        return this.refuse('attach', appName, serviceId, {
+          attached: false,
+          reason: 'stale-dependencies',
+          detail: new StaleDependenciesError(appName).message,
         });
       }
 
@@ -6810,7 +8249,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       }
 
       // Same resolution attachService/doRestart use.
-      const appPath = config?.path || state?.path || path.join(this.config.appsDirectory, appName);
+      const appPath = this.sourcePathOf(appName, config, state);
       // Not a refusal (guard 7) — its position can't be observed since it
       // never blocks anything. Lazy and memoised: a parse+validate of
       // drop.yaml on every call would be paid even by refusals below that
@@ -7094,7 +8533,10 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
    * DATABASE_URL/REDIS_URL would keep being injected under isolation:none).
    * `doRestart` itself already parks the app in 'needs-config' or 'errored'
    * on failure — this only translates that outcome into the detach result
-   * shape, it does not duplicate the state write.
+   * shape, it does not duplicate the state write. The one exception is the
+   * start guard (StaleDependenciesError), which refuses before doRestart
+   * touches anything: the app stays 'stopped', as step 9 left it, and an
+   * explicit redeploy rebuilds and starts it.
    */
   private async restartAfterDetach(
     appName: string,
@@ -7244,6 +8686,22 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
    * essentially every real deletion. Best-effort; never throws.
    */
   async purgeAppArtifacts(name: string, opts: { keepData?: boolean } = {}): Promise<void> {
+    // The OTHER runtime slot (#298). Both delete paths remove the app's LIVE
+    // instance by name before reaching here; the idle slot can exist too (a
+    // crash mid-cutover), and must not outlive the app whose name it carries.
+    // Best-effort, like everything else in this method.
+    try {
+      if (this.runtime) {
+        const live = this.runtime.getLiveInstance(name);
+        await this.runtime
+          .delete(instanceRef(name, live === 'a' ? 'b' : 'a'))
+          .catch(() => undefined);
+        this.runtime.setLiveInstance(name, 'a');
+      }
+    } catch (error) {
+      this.logger.warn(`Failed to remove the idle runtime slot of ${name}`, 'CLEANUP', error);
+    }
+
     // BEFORE the deletes below, not after. Deploy details hold byte offsets
     // into the very log files this is about to remove, and those paths are
     // keyed on the app NAME — which this teardown frees for anyone to
@@ -7309,6 +8767,12 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       path.join(this.config.dropRoot, 'data', 'logs', 'webapps', name),
       path.join(this.config.dropRoot, 'data', 'logs', 'builds', name),
       ...(opts.keepData ? [] : [path.join(this.config.dropRoot, 'data', 'appdata', name)]),
+      // The rollback snapshot is CODE, not the owner's data, so keepData does
+      // not keep it: a snapshot left behind would restore the deleted app's
+      // tree into whatever the next registrant of this name deploys.
+      path.join(this.config.dropRoot, 'data', 'rollback', name),
+      // Release directories (#298) are code too, and keyed on the freed name.
+      path.join(this.config.dropRoot, 'data', 'releases', name),
     ];
     for (const dir of targets) {
       try {
@@ -7317,6 +8781,12 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         this.logger.warn(`Failed to remove ${dir}`, 'CLEANUP', error);
       }
     }
+
+    // A node_modules a crashed build left in the aside dir is the previous
+    // tenant's code too, and may hold tenant-made read-only directories, so it
+    // goes through the chmod walk rather than a bare rm. It logs its own
+    // failure; the name is still freed either way.
+    await removeAsideDir(this.nodeModulesAsideRootOf(name));
   }
 
   /**
@@ -7757,6 +9227,10 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         paths: [
           app.path,
           path.join(this.config.dropRoot, 'data', 'appdata', app.name),
+          // The rollback snapshot (#296) is charged to the app it belongs to.
+          path.join(this.config.dropRoot, 'data', 'rollback', app.name),
+          // Release directories (#298): current, previous and a held build.
+          path.join(this.config.dropRoot, 'data', 'releases', app.name),
         ],
         maxDiskMb: this.appConfigService?.getConfig(app.name)?.maxDiskMb,
       }));
@@ -7767,6 +9241,28 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         // Only a LIVE app is worth stopping. Parking something already stopped
         // would rewrite its reason on every sweep and bury the real one.
         if (!app || (app.status !== 'running' && app.status !== 'crash-looping')) continue;
+
+        // A snapshot is DROP's own convenience copy: when it is part of what
+        // pushes an app over, it goes first, and the app keeps running. The
+        // next sweep re-measures without it and parks only if still over.
+        const rollback = getRollbackStore();
+        if (rollback && (await rollback.get(verdict.name))) {
+          await rollback.remove(verdict.name);
+          this.logger.warn(
+            `Dropped the rollback snapshot of ${verdict.name} to keep it under its disk ceiling`,
+            'DISK'
+          );
+          continue;
+        }
+        // The same for the previous release (#298 step 6), the rollback target
+        // of an app on the zero-downtime strategy.
+        if (await this.dropPreviousRelease(verdict.name)) {
+          this.logger.warn(
+            `Dropped the previous release of ${verdict.name} to keep it under its disk ceiling`,
+            'DISK'
+          );
+          continue;
+        }
 
         const reason =
           `Over its disk ceiling: ${toMb(verdict.bytes)} MB used of ` +
@@ -7800,6 +9296,20 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
   }
 
   /**
+   * Forget an app's previous release and delete it. True when there was one.
+   * The current release and a held build are kept.
+   */
+  private async dropPreviousRelease(appName: string): Promise<boolean> {
+    const cfg = this.appConfigService?.getConfig(appName);
+    if (!cfg?.previousRelease || !this.releaseStore) return false;
+    await this.appConfigService?.updateSystemConfig(appName, { previousRelease: undefined });
+    await this.releaseStore
+      .prune(appName, [cfg.currentRelease?.path, cfg.pendingPromotion?.releasePath])
+      .catch(() => undefined);
+    return true;
+  }
+
+  /**
    * Hold a finished build when the app is set to manual promotion.
    *
    * Returns true when the caller must NOT start or swap. The running version is
@@ -7816,10 +9326,16 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     );
     if (!shouldHoldForPromotion(mode)) return false;
 
+    // The held build keeps the release it was built into; promotion starts
+    // from it. Taken OUT of deployTargets so no failure path discards it.
+    const target = this.deployTargets.get(appName);
+    this.deployTargets.delete(appName);
+    const releasePath = this.releaseStore?.isReleasePathOf(appName, target) ? target : undefined;
     const pending = {
       deployId,
       builtAt: new Date().toISOString(),
       outputDirectory: outputPath,
+      ...(releasePath ? { releasePath } : {}),
     };
     await this.appConfigService?.updateConfig(appName, { pendingPromotion: pending });
 
@@ -7857,6 +9373,12 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       throw new Error(`No build is awaiting promotion for '${appName}'`);
     }
 
+    // Before the held build is cleared below: a refusal keeps it held.
+    const heldPath = this.releaseStore?.isReleasePathOf(appName, pending.releasePath)
+      ? pending.releasePath
+      : this.servingPathOf(appName, config, this.stateManager?.getApp(appName));
+    await this.assertDependenciesCurrent(appName, heldPath);
+
     await this.appConfigService?.updateConfig(appName, { pendingPromotion: undefined });
     await this.stateManager?.updateApp(appName, { awaitingPromotion: false });
 
@@ -7868,10 +9390,33 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       detail: `Promoted build from ${pending.builtAt}`,
     });
 
-    // The swap itself is the ordinary start path, so promotion has no second
-    // implementation of starting an app to drift from the first.
+    // The swap itself is an ordinary start path, so promotion has no second
+    // implementation of starting an app to drift from the first: a held
+    // release of a running app is cut over to (#298 step 6), anything else
+    // goes through the deploy path's start.
     this.appsInProgress.add(appName);
     try {
+      // Re-validated: pendingPromotion is not a system-tier field.
+      if (this.releaseStore?.isReleasePathOf(appName, pending.releasePath)) {
+        this.deployTargets.set(appName, pending.releasePath);
+        const oldPort = await this.cutoverEligibility(appName, pending.releasePath);
+        if (oldPort !== null && this.detector) {
+          const detection = await this.detector.detect(pending.releasePath, { silent: true });
+          const result = await this.cutoverTo(
+            appName,
+            pending.releasePath,
+            detection,
+            pending.outputDirectory,
+            oldPort
+          );
+          if (result.ok) return;
+          await this.discardDeployTarget(appName);
+          const reason = result.error instanceof Error ? result.error.message : String(result.error);
+          throw new Error(
+            `The held build of '${appName}' was not promoted: ${reason}. The previous version is still serving.`
+          );
+        }
+      }
       await this.handleStartApp(appName, pending.outputDirectory);
     } finally {
       this.appsInProgress.delete(appName);
@@ -8175,6 +9720,8 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     if (this.config.strictManifest && dropYamlCfg.exists && !dropYamlCfg.success) {
       throw new AppManifestInvalidError(appName, dropYamlCfg.error ?? 'unknown parse error');
     }
+
+    await this.assertDependenciesCurrent(appName, appPath, detection.type);
 
     const startOverride = dropYamlCfg.success ? dropYamlCfg.config?.start : undefined;
 
@@ -8506,6 +10053,10 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
 
     return {
       name: appName,
+      // The app's LIVE instance (#298): slot a is the bare name, i.e. today's
+      // behaviour; after a cutover to slot b, a restart must restart slot b.
+      // A cutover overrides this with the idle slot.
+      instance: this.runtime ? instanceName(appName, this.runtime.getLiveInstance(appName)) : undefined,
       script,
       interpreter,
       args,
@@ -8636,7 +10187,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     }
 
     // In docker isolation mode the container runs as a non-root user (e.g. UID
-    // 1000 'node' in node:20-slim).  Make the data dir world-writable so the
+    // 1000 'node' in node:22-slim).  Make the data dir world-writable so the
     // container user can write to it without a chown step.  This is acceptable
     // because the dir is only bind-mounted into this app's own container; Tier B
     // will tighten this with explicit UID alignment.

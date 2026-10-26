@@ -14,6 +14,7 @@ import {
   ProcessStatusValue,
 } from '../process/process-manager.types';
 import { AppRuntime } from './app-runtime';
+import { LiveInstances, InstanceSlot, appNameOfInstance } from './instance';
 import {
   AppLogPaths,
   AppProcessInfo,
@@ -34,9 +35,19 @@ export class Pm2Runtime implements AppRuntime {
   readonly type = 'pm2' as const;
 
   private readonly processManager: ProcessManager;
+  /** App name → live slot. The PM2 process name IS the instance name. */
+  private readonly live = new LiveInstances();
 
   constructor(processManager?: ProcessManager) {
     this.processManager = processManager ?? getProcessManager();
+  }
+
+  setLiveInstance(appName: string, slot: InstanceSlot): void {
+    this.live.set(appName, slot);
+  }
+
+  getLiveInstance(appName: string): InstanceSlot {
+    return this.live.slotOf(appName);
   }
 
   async start(spec: AppStartSpec): Promise<AppProcessInfo> {
@@ -45,20 +56,20 @@ export class Pm2Runtime implements AppRuntime {
   }
 
   async stop(name: string): Promise<void> {
-    await this.processManager.stop(name);
+    await this.processManager.stop(this.live.resolve(name));
   }
 
   async restart(name: string): Promise<AppProcessInfo> {
-    const status = await this.processManager.restart(name);
+    const status = await this.processManager.restart(this.live.resolve(name));
     return this.toProcessInfo(status);
   }
 
   async delete(name: string): Promise<void> {
-    await this.processManager.delete(name);
+    await this.processManager.delete(this.live.resolve(name));
   }
 
   async getStatus(name: string): Promise<AppProcessInfo | null> {
-    const status = await this.processManager.getStatus(name);
+    const status = await this.processManager.getStatus(this.live.resolve(name));
     return status ? this.toProcessInfo(status) : null;
   }
 
@@ -77,7 +88,7 @@ export class Pm2Runtime implements AppRuntime {
   }
 
   getLogs(name: string, lines?: number): Promise<string> {
-    return this.processManager.getLogs(name, lines);
+    return this.processManager.getLogs(this.live.resolve(name), lines);
   }
 
   streamLogs(
@@ -85,11 +96,11 @@ export class Pm2Runtime implements AppRuntime {
     onLine: (line: string, type: 'out' | 'err') => void,
     onError?: (error: Error) => void
   ): Promise<() => void> {
-    return this.processManager.streamLogs(name, onLine, onError);
+    return this.processManager.streamLogs(this.live.resolve(name), onLine, onError);
   }
 
   getLogPaths(name: string): Promise<AppLogPaths> {
-    return this.processManager.getLogPaths(name);
+    return this.processManager.getLogPaths(this.live.resolve(name));
   }
 
   disconnect(): void {
@@ -98,7 +109,7 @@ export class Pm2Runtime implements AppRuntime {
 
   private toProcessConfig(spec: AppStartSpec): ProcessConfig {
     return {
-      name: spec.name,
+      name: spec.instance ?? spec.name,
       script: spec.script,
       cwd: spec.cwd,
       interpreter: spec.interpreter,
@@ -117,7 +128,8 @@ export class Pm2Runtime implements AppRuntime {
 
   private toProcessInfo(status: ProcessStatus): AppProcessInfo {
     return {
-      name: status.name,
+      name: appNameOfInstance(status.name),
+      instance: status.name,
       status: PM2_STATE_MAP[status.status] ?? 'unknown',
       runtime: this.type,
       pid: status.pid,

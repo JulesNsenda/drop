@@ -281,6 +281,8 @@ const REFUSAL_FALLBACK: Record<AttachRefusalReason, string> = {
   'has-own-database-url': 'This app already has its own database connection configured.',
   'has-own-redis-url': 'This app already has its own Redis connection configured.',
   'quota-exceeded': 'The quota for this service has been reached.',
+  'stale-dependencies':
+    "This app's dependencies were built for a different Node runtime. Redeploy it, then attach.",
   'no-app-config': 'This app has no saved platform configuration yet.',
   'service-unavailable': 'This service is not available on this platform.',
 };

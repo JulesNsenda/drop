@@ -106,10 +106,18 @@ snapshot_previous() {
 # An interrupted or failed install therefore leaves no witness and the next
 # deploy installs — where a witness kept beside package.json would have survived
 # and been trusted.
+# The dependency witness: the lockfile hash AND the Node ABI the tree was
+# installed under. A Node upgrade changes the ABI, so the native addons (ssh2's
+# optional sshcrypto, cpu-features) are rebuilt even when the lockfile did not
+# change; this format change makes every box run `npm ci` once.
+deps_witness() {
+  echo "$(sha256sum "$1" | cut -d" " -f1)-abi$(node -p process.versions.modules 2>/dev/null || echo unknown)"
+}
+
 install_dependencies() {
   [[ -f package-lock.json ]] || die "package-lock.json missing from artifact"
   local lock_hash prev_hash
-  lock_hash=$(sha256sum package-lock.json | cut -d' ' -f1)
+  lock_hash=$(deps_witness package-lock.json)
   prev_hash=$(cat node_modules/.deploy-lock-hash 2>/dev/null || echo none)
 
   if [[ "$lock_hash" == "$prev_hash" ]]; then
@@ -238,7 +246,7 @@ rollback() {
   # differs from what is installed, the installed tree belongs to the release
   # being undone.
   local lock_hash prev_hash
-  lock_hash=$(sha256sum "${DROP_DIR}/package-lock.json" | cut -d' ' -f1)
+  lock_hash=$(deps_witness "${DROP_DIR}/package-lock.json")
   prev_hash=$(cat "${DROP_DIR}/node_modules/.deploy-lock-hash" 2>/dev/null || echo none)
   if [[ "$lock_hash" != "$prev_hash" ]]; then
     log "Reinstalling dependencies from the restored lockfile"

@@ -287,6 +287,15 @@ export function mailRateLimitMiddleware(config?: Partial<RateLimitConfig>) {
   return createRateLimiter('mail', { ...MAIL_CONFIG, ...config });
 }
 
+/**
+ * Dedicated rate limiter for `POST /admin/object-storage/test` (#301): it
+ * dials AWS with the operator's admin key. Same cadence as the mail test,
+ * its own store so neither burst throttles the other.
+ */
+export function objectStorageTestRateLimitMiddleware(config?: Partial<RateLimitConfig>) {
+  return createRateLimiter('object-storage-test', { ...MAIL_CONFIG, ...config });
+}
+
 /** Reset all rate limit stores (for testing) */
 export function resetRateLimits(): void {
   stores.clear();

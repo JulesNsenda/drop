@@ -22,6 +22,7 @@ import {
   Lock,
   LayoutDashboard,
   History,
+  Download,
 } from 'lucide-react';
 import {
   useApp,
@@ -212,6 +213,35 @@ function AppDetailPage() {
     }
     await refresh();
     setActionLoading(null);
+  };
+
+  // Source download (#315). A fetch rather than a plain link: the API needs
+  // the bearer header, which an <a href> cannot send.
+  const handleDownloadSource = async () => {
+    if (!name) return;
+    setActionLoading('download');
+    try {
+      const res = await fetch(`/api/v1/apps/${encodeURIComponent(name)}/source`, {
+        headers: getAuthHeaders(),
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => null);
+        toast('error', body?.error?.message || `Failed to download ${name}`);
+        return;
+      }
+      const url = URL.createObjectURL(await res.blob());
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `${name}-source.tar.gz`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    } catch {
+      toast('error', `Failed to download ${name}`);
+    } finally {
+      setActionLoading(null);
+    }
   };
 
   const handleDelete = async () => {
@@ -448,6 +478,17 @@ function AppDetailPage() {
                 {isGroupChild ? 'Redeploy group' : 'Redeploy'}
               </Button>
             </>
+          )}
+          {role !== 'readonly' && (
+            <Button
+              variant="secondary"
+              onClick={handleDownloadSource}
+              disabled={actionLoading !== null}
+              title="Download this app's source as a .tar.gz (without node_modules, .venv and .git)"
+            >
+              <Download className="h-4 w-4" />
+              Source
+            </Button>
           )}
           <Button variant="danger" onClick={handleDelete} disabled={actionLoading !== null}>
             <Trash2 className="h-4 w-4" />
@@ -807,6 +848,25 @@ function AppDetailPage() {
   );
 }
 
+/** GET/POST /apps/:name/domain[/verify] (#302). Mirrors src/api/custom-domain.ts. */
+interface CustomDomainStatus {
+  domain: string | null;
+  state: 'none' | 'pending' | 'verified' | 'unverifiable' | 'blocked';
+  routed: boolean;
+  records: { type: string; name: string; value: string; use: string }[];
+  dns: { resolves: boolean; pointsHere: boolean } | null;
+  certificate: { status: string; notAfter: string | null; issuer: string } | null;
+  message: string;
+}
+
+const DOMAIN_STATE_LABEL: Record<CustomDomainStatus['state'], string> = {
+  none: 'Not set',
+  pending: 'Waiting for DNS',
+  verified: 'Verified and routed',
+  unverifiable: 'Cannot check DNS',
+  blocked: 'Cannot be used',
+};
+
 function CustomDomainSection({
   appName,
   currentDomain,
@@ -818,7 +878,24 @@ function CustomDomainSection({
 }) {
   const [domain, setDomain] = useState(currentDomain || '');
   const [saving, setSaving] = useState(false);
+  const [verifying, setVerifying] = useState(false);
+  const [status, setStatus] = useState<CustomDomainStatus | null>(null);
   const { toast } = useToast();
+
+  const request = async (method: 'GET' | 'POST', suffix = '') => {
+    const res = await fetch(`/api/v1/apps/${appName}/domain${suffix}`, {
+      method,
+      headers: getAuthHeaders(),
+    });
+    const json = await res.json();
+    if (json.success) setStatus(json.data as CustomDomainStatus);
+    return json;
+  };
+
+  useEffect(() => {
+    request('GET').catch(() => undefined);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [appName]);
 
   const handleSave = async () => {
     setSaving(true);
@@ -831,6 +908,7 @@ function CustomDomainSection({
       const json = await res.json();
       if (json.success) {
         toast('success', domain.trim() ? `Domain set to ${domain.trim()}` : 'Domain removed');
+        if (json.data?.status) setStatus(json.data.status as CustomDomainStatus);
         onUpdate();
       } else {
         toast('error', json.error?.message || 'Failed');
@@ -840,6 +918,21 @@ function CustomDomainSection({
     }
     setSaving(false);
   };
+
+  const handleVerify = async () => {
+    setVerifying(true);
+    try {
+      const json = await request('POST', '/verify');
+      if (!json.success) toast('error', json.error?.message || 'Verification failed');
+      else if (json.data?.state === 'verified') toast('success', `${json.data.domain} is verified`);
+      else toast('info', json.data?.message || 'Not verified yet');
+    } catch {
+      toast('error', 'Network error');
+    }
+    setVerifying(false);
+  };
+
+  const showRecords = status && (status.state === 'pending' || status.state === 'unverifiable');
 
   return (
     <Card>
@@ -860,10 +953,47 @@ function CustomDomainSection({
           Save
         </Button>
       </div>
-      {currentDomain && (
-        <p className="mt-2 text-xs text-muted">
-          Point a CNAME record for <code>{currentDomain}</code> to your DROP server.
-        </p>
+
+      {status && status.state !== 'none' && (
+        <div className="mt-4 space-y-3 text-sm">
+          <div className="flex flex-wrap items-center gap-3">
+            <span className="font-medium">{DOMAIN_STATE_LABEL[status.state]}</span>
+            {status.state !== 'verified' && status.state !== 'blocked' && (
+              <Button variant="secondary" onClick={handleVerify} loading={verifying}>
+                Verify DNS
+              </Button>
+            )}
+          </div>
+          <p className="text-muted">{status.message}</p>
+
+          {showRecords && status.records.length > 0 && (
+            <div className="overflow-x-auto">
+              <p className="mb-1 text-xs text-muted">
+                Create ONE of these records at your DNS provider, then verify:
+              </p>
+              <table className="text-xs">
+                <tbody>
+                  {status.records.map(r => (
+                    <tr key={`${r.type}-${r.value}`}>
+                      <td className="pr-3 font-mono">{r.type}</td>
+                      <td className="pr-3 font-mono">{r.name}</td>
+                      <td className="pr-3 font-mono">{r.value}</td>
+                      <td className="text-muted">{r.use}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+
+          {status.certificate && (
+            <p className="text-xs text-muted">
+              Certificate: {status.certificate.status}
+              {status.certificate.notAfter &&
+                ` · expires ${new Date(status.certificate.notAfter).toLocaleDateString()}`}
+            </p>
+          )}
+        </div>
       )}
     </Card>
   );

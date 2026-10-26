@@ -17,6 +17,7 @@
  *   implementation detail.
  */
 
+import type { InstanceSlot } from './instance';
 import {
   AppLogPaths,
   AppProcessInfo,
@@ -27,6 +28,16 @@ import {
 export interface AppRuntime {
   /** Which runtime this is */
   readonly type: RuntimeType;
+
+  /**
+   * Which slot is live for `appName` (#298 step 4). Every name-keyed method
+   * below that is given an APP name acts on that app's live instance; given an
+   * explicit instance name (`<app>.b`) it acts on exactly that instance.
+   * Defaults to slot `a` (the bare app name), which is every app until a
+   * zero-downtime cutover moves one.
+   */
+  setLiveInstance(appName: string, slot: InstanceSlot): void;
+  getLiveInstance(appName: string): InstanceSlot;
 
   /** Start an app; resolves when it is running */
   start(spec: AppStartSpec): Promise<AppProcessInfo>;

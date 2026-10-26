@@ -110,6 +110,13 @@ export interface AppDetectedPayload extends BaseEvent {
    */
   origin?: 'upload' | 'watcher';
   /**
+   * Set by the watcher's ready scan only: the folder was already on disk when
+   * DROP started. Lets boot-time work that is only valid for that first sight
+   * (leaving a current monorepo child unbuilt) tell it from a folder that
+   * appeared later.
+   */
+  initialScan?: boolean;
+  /**
    * Who asked for this deploy, for guardrail keying — NOT for authorization,
    * which happened at the route or tool boundary before this was published.
    *
@@ -297,7 +304,12 @@ export type DeployFailurePhase = 'boot';
  * leniency for slow starters). Adding a member no publisher can produce would
  * be the same unreachable-value defect as a constant field.
  */
-export type DeployFailureReason = 'process-exited' | 'crash-looped' | 'oom-killed';
+/**
+ * `readiness-failed` (#298): a zero-downtime cutover's NEW instance started but
+ * never answered HTTP below 500 within the window. The previous release kept
+ * serving throughout; only the new one was discarded.
+ */
+export type DeployFailureReason = 'process-exited' | 'crash-looped' | 'oom-killed' | 'readiness-failed';
 
 /**
  * A deploy that got past the build and then failed. Widens the boot-failure

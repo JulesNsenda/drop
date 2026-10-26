@@ -2158,11 +2158,62 @@ export function resetAuth(): void {
 }
 
 /**
+ * The role floor an auth middleware enforces, attached to the function itself
+ * so the OpenAPI generator (`src/api/openapi.ts`) can read the floors off the
+ * route table instead of a hand-kept copy of `server.ts#setupRoutes`.
+ *
+ * Descriptive only: nothing at request time reads it. `authenticated` is
+ * `authMiddleware()` with no role — any valid credential.
+ */
+export type AuthFloorRole = 'authenticated' | 'readonly' | 'user' | 'admin';
+export interface AuthFloor {
+  role: AuthFloorRole;
+  /** Set when the floor applies only to these methods; absent means every method. */
+  methods?: string[];
+  /** `mcp` also accepts an audience-bound OAuth access token (mcpAuthMiddleware). */
+  credentials: 'standard' | 'mcp';
+}
+
+const AUTH_FLOOR = Symbol.for('drop.authFloor');
+
+function tagAuthFloor<F extends (...args: never[]) => unknown>(fn: F, floor: AuthFloor): F {
+  Object.defineProperty(fn, AUTH_FLOOR, { value: floor, enumerable: false });
+  return fn;
+}
+
+/** The floor a middleware was tagged with, or undefined for any other handler. */
+export function authFloorOf(fn: unknown): AuthFloor | undefined {
+  if (typeof fn !== 'function') return undefined;
+  return (fn as unknown as Record<symbol, AuthFloor | undefined>)[AUTH_FLOOR];
+}
+
+/**
+ * `authMiddleware(role)` for the listed methods only; every other method passes
+ * straight through to the next middleware. Tagged with those methods, so a
+ * method-scoped floor is as visible to the generator as an unscoped one.
+ */
+export function authMiddlewareForMethods(
+  methods: string[],
+  requiredRole: 'admin' | 'user' | 'readonly'
+) {
+  const gate = authMiddleware(requiredRole);
+  return tagAuthFloor(
+    async (c: Context, next: Next): Promise<Response | void> => {
+      if (methods.includes(c.req.method)) {
+        return gate(c, next);
+      }
+      return next();
+    },
+    { role: requiredRole, methods, credentials: 'standard' }
+  );
+}
+
+/**
  * Authentication middleware
  * Checks for JWT token in Authorization header or API key in X-API-Key header
  */
 export function authMiddleware(requiredRole?: 'admin' | 'user' | 'readonly') {
-  return async (c: Context, next: Next): Promise<Response | void> => {
+  return tagAuthFloor(async (c: Context, next: Next): Promise<Response | void> => {
     // Skip auth if not enabled
     if (!isAuthEnabled()) {
       return next();
@@ -2329,7 +2380,7 @@ export function authMiddleware(requiredRole?: 'admin' | 'user' | 'readonly') {
     c.set('auth', authContext);
 
     return next();
-  };
+  }, { role: requiredRole ?? 'authenticated', credentials: 'standard' });
 }
 
 /**
@@ -2341,7 +2392,7 @@ export function authMiddleware(requiredRole?: 'admin' | 'user' | 'readonly') {
  * the MCP Inspector rely on to find the protected-resource metadata.
  */
 export function mcpAuthMiddleware() {
-  return async (c: Context, next: Next): Promise<Response | void> => {
+  return tagAuthFloor(async (c: Context, next: Next): Promise<Response | void> => {
     // Skip auth if not enabled (mirrors authMiddleware's own defensive check;
     // this is only ever mounted inside the enableAuth guard in server.ts).
     if (!isAuthEnabled()) {
@@ -2424,7 +2475,7 @@ export function mcpAuthMiddleware() {
       }
     }
     return res;
-  };
+  }, { role: 'user', credentials: 'mcp' });
 }
 
 /**

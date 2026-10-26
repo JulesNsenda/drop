@@ -309,6 +309,21 @@ describe('expandMonorepo re-materializing a live child', () => {
       }
     );
 
+    it('keeps a child in place even when its service declares a healthCheck (#298 step 7)', async () => {
+      await (platform as any).expandMonorepo(repoPath, repoName, {
+        services: { frontend: { path: 'frontend', type: 'static', healthCheck: '/health' } },
+      });
+
+      const { parseDropYaml } = await import('./detector/drop-yaml-parser');
+      const { wantsReleases } = await import('../managers/release');
+      const parsed = await parseDropYaml(childPath());
+
+      expect(parsed.success).toBe(true);
+      expect(parsed.config?.healthCheck).toBe('/health');
+      expect(parsed.config?.deploy).toEqual({ strategy: 'in-place' });
+      expect(await wantsReleases(childPath())).toBe(false);
+    });
+
     it('omits database entirely when the service does not declare one', async () => {
       await (platform as any).expandMonorepo(repoPath, repoName, {
         services: { frontend: { path: 'frontend', type: 'static' } },
