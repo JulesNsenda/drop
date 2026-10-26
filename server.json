@@ -1,0 +1,24 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.JulesNsenda/drop",
+  "title": "DROP",
+  "description": "Self-hosted PaaS: deploy apps from files or git, read logs, check status, roll back.",
+  "version": "1.7.1",
+  "websiteUrl": "https://dropkit.sh",
+  "repository": {
+    "url": "https://github.com/JulesNsenda/drop",
+    "source": "github"
+  },
+  "remotes": [
+    {
+      "type": "streamable-http",
+      "url": "https://{drop_host}/api/v1/mcp",
+      "variables": {
+        "drop_host": {
+          "description": "Public hostname of your DROP instance (e.g. drop.example.com). Sign-in uses OAuth.",
+          "isRequired": true
+        }
+      }
+    }
+  ]
+}
