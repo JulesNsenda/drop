@@ -26,9 +26,13 @@ import {
   isGitAvailable,
 } from './git-client';
 import { getStateManager } from '../../managers/app/state-manager';
-import { getAppConfigService } from '../../managers/app/app-config';
+import { getAppConfigService, getAppConfigServiceOrNull } from '../../managers/app/app-config';
 import { getSecretManager } from '../../managers/secret';
 import { getLogger } from '../../utils/logger';
+import { pathTaken } from '../../utils/paths';
+import { isValidAppName } from '../../api/middleware/validate';
+import { isNameTaken, isNewNameRefused } from '../app-names';
+import { tryReserve, release, reservationPrincipal } from '../deploy-reservations';
 import { hasEnoughDisk, getMinFreeDiskMb } from '../../utils/disk';
 import { eventBus } from '../event-bus';
 import { captureBeforeRedeploy } from '../../managers/rollback';
@@ -74,12 +78,51 @@ export class GitDeployService {
     return this.activeClones.has(appName);
   }
 
-  /** Deploy an app from a GitHub repository */
+  /**
+   * Deploy an app from a GitHub repository.
+   *
+   * Once the cheap refusals and guardrail admission are behind it, the name is
+   * re-checked and reserved (see deploy-reservations) with no await between the
+   * two: the later checks (disk, token, clone) span many, and two concurrent
+   * creates of one name, from git or upload, would otherwise both pass and race
+   * to land into one folder. A refusal reads as an existing app. Only this
+   * call's own reservation is released.
+   */
   async deploy(request: GitDeployRequest): Promise<GitDeployResult> {
     if (!this.gitAvailable) {
       throw new Error('git CLI is not available on this system');
     }
 
+    const principal = reservationPrincipal(request.userId, request.principalId);
+    let reservedName: string | undefined;
+    try {
+      return await this.deployReserved(request, (name) => {
+        if (!tryReserve(name, principal)) return false;
+        reservedName = name;
+        return true;
+      });
+    } finally {
+      if (reservedName) release(reservedName, principal);
+    }
+  }
+
+  /** The new-app name rules, for a non-admin caller only (admins name things freely). */
+  private nameIsTakenForCaller(
+    request: GitDeployRequest,
+    appName: string,
+    stateManager: ReturnType<typeof getStateManager>
+  ): boolean {
+    if (!request.userId || request.callerIsAdmin) return false;
+    return isNameTaken(appName, {
+      stateManager,
+      appConfigService: getAppConfigServiceOrNull() ?? undefined,
+    });
+  }
+
+  private async deployReserved(
+    request: GitDeployRequest,
+    reserve: (name: string) => boolean
+  ): Promise<GitDeployResult> {
     const repoUrl = normalizeRepoUrl(request.repoUrl);
     const branch = request.branch || 'main';
     const appName = request.name || extractRepoName(repoUrl);
@@ -89,8 +132,12 @@ export class GitDeployService {
       throw new Error(`Invalid GitHub URL: ${repoUrl}`);
     }
 
-    if (!appName || !/^[\w.-]+$/.test(appName)) {
-      throw new Error(`Invalid app name: ${appName}`);
+    // The FINAL name, whether given or derived from the URL: the shared rule,
+    // which also refuses dots (`<app>.b` is a runtime slot-b instance name).
+    if (!appName || !isValidAppName(appName)) {
+      throw new Error(
+        `Invalid app name: ${appName} (pass \`name\` to choose a different app name)`
+      );
     }
 
     // Check for conflicts
@@ -109,6 +156,31 @@ export class GitDeployService {
       principalId: request.principalId,
       actorUserId: request.userId,
     });
+
+    // A name that is a group, a container's, or differs only in case from an
+    // existing app. Answered as an existing app is. Admins, and callers with no
+    // account, name things freely. AFTER admission, as upload does, so probing
+    // for names costs quota.
+    if (
+      await isNewNameRefused(appName, {
+        callerIsAdmin: !request.userId || !!request.callerIsAdmin,
+        appsDirectory: this.config.appsDirectory,
+        stateManager,
+        appConfigService: getAppConfigServiceOrNull() ?? undefined,
+      })
+    ) {
+      throw new Error(`Application '${appName}' already exists`);
+    }
+
+    // Re-checked and claimed back to back, with NO await between them: nothing
+    // can take the name in the gap, and a concurrent create is turned away here.
+    if (
+      stateManager.hasApp(appName) ||
+      this.nameIsTakenForCaller(request, appName, stateManager) ||
+      !reserve(appName)
+    ) {
+      throw new Error(`Application '${appName}' already exists`);
+    }
 
     // Ephemeral quota, before the clone. Same reasoning as the guardrail: a
     // refusal after the clone would not undo the network, disk and time.
@@ -131,14 +203,10 @@ export class GitDeployService {
 
     const destPath = path.join(this.config.appsDirectory, appName);
 
-    // Check if directory already exists
-    try {
-      await fs.access(destPath);
-      throw new Error(`Directory already exists: ${destPath}`);
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
-        throw err;
-      }
+    // A folder (or a dangling link) already holding the name is taken. Same
+    // answer as an existing app, and no absolute path in it.
+    if (await pathTaken(destPath)) {
+      throw new Error(`Application '${appName}' already exists`);
     }
 
     // Preflight: ensure enough free disk space before cloning
@@ -158,7 +226,9 @@ export class GitDeployService {
       }
     }
 
-    // Mark as cloning to prevent watcher from detecting mid-clone
+    // Mark as cloning to prevent watcher from detecting mid-clone. Added only
+    // now, after every await above, so the watcher is not held off the name
+    // through quota and auth checks; held until the app is registered (below).
     this.activeClones.add(appName);
 
     // Clone
@@ -182,9 +252,6 @@ export class GitDeployService {
       throw err;
     }
 
-    // Clone complete - allow watcher to detect
-    this.activeClones.delete(appName);
-
     // Read commit SHA
     let commitSha: string | undefined;
     try {
@@ -195,9 +262,6 @@ export class GitDeployService {
 
     const clonedAt = new Date().toISOString();
 
-    // Register app with git source metadata and userId atomically
-    await stateManager.registerApp(appName, destPath);
-
     const gitSource: GitSource = {
       repoUrl,
       branch,
@@ -207,10 +271,39 @@ export class GitDeployService {
       tokenId: request.tokenId,
     };
 
-    await stateManager.updateApp(appName, {
-      gitSource,
-      ...(request.userId ? { userId: request.userId } : {}),
-    } as Record<string, unknown>);
+    // Register app with git source metadata and userId BEFORE the name leaves
+    // activeClones (upload-deploy's order): once it does, the watcher may
+    // detect a monorepo container and expand it, and a container expanded
+    // without its owner would adopt unowned group children as unowned.
+    let registered = false;
+    try {
+      // The clone took time: the name may have been taken meanwhile (an app
+      // registered, a group claimed). Re-decided now, and the clone is removed
+      // below as for any failed registration.
+      if (stateManager.hasApp(appName) || this.nameIsTakenForCaller(request, appName, stateManager)) {
+        throw new Error(`Application '${appName}' already exists`);
+      }
+      await stateManager.registerApp(appName, destPath);
+      registered = true;
+      await stateManager.updateApp(appName, {
+        gitSource,
+        ...(request.userId ? { userId: request.userId } : {}),
+      } as Record<string, unknown>);
+    } catch (err) {
+      // Same cleanup as a failed clone: an app that never got its owner must
+      // not be left registered, nor its tree left for the watcher to detect.
+      // Only what THIS call did: the registration only if its own registerApp
+      // resolved, and the tree because the clone above just created it (the
+      // folder-exists refusal means nothing was there before).
+      if (registered) {
+        await stateManager.removeApp(appName).catch(() => undefined);
+      }
+      await fs.rm(destPath, { recursive: true, force: true }).catch(() => undefined);
+      throw err;
+    } finally {
+      // Clone complete - allow watcher to detect
+      this.activeClones.delete(appName);
+    }
 
     logger.info(`Cloned ${repoUrl} → ${appName} (${commitSha?.slice(0, 7) || 'unknown'})`, 'GIT-DEPLOY');
 
@@ -262,7 +355,12 @@ export class GitDeployService {
     };
   }
 
-  /** Redeploy a git-deployed app (git pull + trigger rebuild) */
+  /**
+   * Redeploy a git-deployed app (git pull + trigger rebuild). Not reserved:
+   * two redeploys of one app (a webhook burst, a dashboard click) are the
+   * platform's own `appsInProgress` dedup to sort out, as they always were, and
+   * refusing them here would drop a push.
+   */
   async redeploy(appName: string, actor: DeployActor = {}): Promise<GitDeployResult> {
     if (!this.gitAvailable) {
       throw new Error('git CLI is not available on this system');

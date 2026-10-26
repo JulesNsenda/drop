@@ -12,7 +12,8 @@
  *   1. app name syntax
  *   2. existing app → ownership (no existence oracle: foreign and unknown
  *      both look like "not found"), then reject a stopped app;
- *      new app → per-user app limit
+ *      new app → refuse a name whose folder already exists (non-admin),
+ *      then per-user app limit
  *   3. platform-ops `isAppInProgress` (a build/restart already running)
  *   4. per-account upload concurrency — a SYNCHRONOUS check-and-insert (no
  *      `await` between the check and the insert), so two concurrent
@@ -35,10 +36,13 @@ import {
 import { canAccessScoped } from './access';
 import { scopesAllowCreate } from './agent-scopes';
 import { isValidAppName } from './middleware/validate';
-import { getStateManager, AppState } from '../managers/app/state-manager';
+import { getStateManager } from '../managers/app/state-manager';
 import { getPlatformOps } from './platform-ops';
 import { hasEnoughDisk, getMinFreeDiskMb } from '../utils/disk';
 import { getAppsDirectory } from './runtime-config';
+import { isNewNameRefused } from '../core/app-names';
+import { resolveGitBackedName } from '../core/git-backed';
+import { getAppConfigServiceOrNull } from '../managers/app/app-config';
 
 /**
  * Apps with an upload currently streaming/extracting, keyed per account (or
@@ -51,26 +55,6 @@ const uploadsInFlight = new Set<string>();
 export type UploadPreflightOutcome =
   | { ok: true; release: () => void }
   | { ok: false; error: HttpError };
-
-/**
- * The name of the git-deployed app an upload to `app` would damage, or
- * `undefined` if it is not git-backed.
- *
- * Returns the app's own name when it carries a `gitSource` directly. For a
- * monorepo child it returns the CONTAINER's name: `expandMonorepo` gives
- * children no `gitSource` of their own — the hidden container holds it — so a
- * check on `gitSource` alone would leave the whole group clobberable by
- * targeting any one child, whose materialized copy the next expansion would
- * overwrite anyway. Mirrors the container resolution in
- * `routes/git-deploy.ts`, which is what "redeploy this child" already means.
- */
-function resolveGitBackedName(app: AppState): string | undefined {
-  if (app.gitSource) return app.name;
-  if (!app.group) return undefined;
-  return getStateManager()
-    .getAllApps()
-    .find(a => a.isGroupContainer && a.group === app.group && a.gitSource)?.name;
-}
 
 /** Effective per-user app limit: per-user override > global default. Mirrors apps.ts/git-deploy.ts. */
 function getAppLimit(userId?: string): number {
@@ -137,7 +121,7 @@ export async function runUploadPreflight(
     // tarball carrying `.git` cannot repair it either: that is now refused
     // outright (tar-extract's vcs_metadata guard). Refuse the upload instead
     // of silently severing the link — one deploy source per app.
-    const gitBackedName = resolveGitBackedName(existingApp);
+    const gitBackedName = resolveGitBackedName(existingApp, stateManager);
     if (gitBackedName) {
       return {
         ok: false,
@@ -172,6 +156,25 @@ export async function runUploadPreflight(
           ),
         };
       }
+    }
+    // "Not in state" is not "free": a folder-dropped app is never in app state,
+    // so its name looks new here while its folder is the operator's. Creating
+    // over it would register it to this caller and sync their tree into it.
+    // lstat, so a dangling link or a plain file counts too. Answered exactly as
+    // a foreign-owned app is, so the refusal doesn't reveal that a folder exists.
+    // Admins are trusted to adopt a folder they dropped themselves. After the
+    // app-limit check, so a user at the limit can't probe for folders for free.
+    // Likewise a name that is another app's group or container, or differs from
+    // an existing app only in case (hostnames are case-insensitive).
+    if (
+      await isNewNameRefused(appName, {
+        callerIsAdmin: false,
+        appsDirectory: getAppsDirectory(),
+        stateManager,
+        appConfigService: getAppConfigServiceOrNull() ?? undefined,
+      })
+    ) {
+      return { ok: false, error: new NotFoundError(`Application '${appName}' not found`) };
     }
   }
 

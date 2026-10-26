@@ -15,6 +15,8 @@ import {
   resetAppConfigService,
 } from '../../managers/app/app-config';
 import * as diskUtils from '../../utils/disk';
+import * as breakerModule from '../../managers/guardrail/deploy-breaker';
+import { tryReserve, ownerOf, isReserved, resetDeployReservations } from '../deploy-reservations';
 import { eventBus } from '../event-bus';
 // AppUpdatePayload isn't re-exported by ../event-bus (index.ts) - see the same
 // note in managers/deploy-tracker/deploy-tracker.ts.
@@ -109,6 +111,13 @@ describe('GitDeployService', () => {
       stateFilePath: path.join(tempDir, 'apps.json'),
     });
     await stateManager.initialize();
+    // The new-app name rules read recorded groups and containers, and fail
+    // closed without a config service.
+    resetAppConfigService();
+    await getAppConfigService({
+      configDir: path.join(tempDir, 'appconf'),
+      webappsDir: path.join(tempDir, 'webapps'),
+    }).initialize();
 
     // Initialize secret manager
     resetSecretManager();
@@ -136,6 +145,8 @@ describe('GitDeployService', () => {
 
   afterEach(async () => {
     jest.restoreAllMocks();
+    resetDeployReservations();
+    resetAppConfigService();
     resetGitDeployService();
     resetStateManager();
     resetSecretManager();
@@ -172,6 +183,97 @@ describe('GitDeployService', () => {
       await expect(
         service.deploy({ repoUrl: 'https://github.com/user/my-repo' })
       ).rejects.toThrow('already exists');
+    });
+
+    it('refuses a name whose folder already exists, without leaking the path', async () => {
+      const folder = path.join(tempDir, 'webapps', 'taken-folder');
+      await fs.mkdir(folder, { recursive: true });
+      await fs.writeFile(path.join(folder, 'keep.txt'), 'operator data');
+
+      const attempt = service.deploy({ repoUrl: 'https://github.com/user/taken-folder' });
+
+      await expect(attempt).rejects.toThrow("Application 'taken-folder' already exists");
+      await expect(attempt).rejects.not.toThrow(tempDir);
+      expect(await fs.readFile(path.join(folder, 'keep.txt'), 'utf-8')).toBe('operator data');
+      expect(service.isCloning('taken-folder')).toBe(false);
+    });
+
+    it('reads a dangling link as a taken name', async () => {
+      const link = path.join(tempDir, 'webapps', 'dangling');
+      try {
+        await fs.symlink(path.join(tempDir, 'nowhere'), link);
+      } catch {
+        return; // no symlink privilege on this machine
+      }
+
+      await expect(
+        service.deploy({ repoUrl: 'https://github.com/user/dangling' })
+      ).rejects.toThrow("Application 'dangling' already exists");
+    });
+
+    it('a concurrent deploy of one name: exactly one wins, the other is refused', async () => {
+      // The claim is taken after admission, so either call may get there
+      // first — the guarantee is that exactly one of them creates the app.
+      const results = await Promise.allSettled([
+        service.deploy({ repoUrl: 'https://github.com/user/racing' }),
+        service.deploy({ repoUrl: 'https://github.com/user/racing' }),
+      ]);
+
+      const won = results.filter((r) => r.status === 'fulfilled');
+      const refused = results.filter((r) => r.status === 'rejected');
+      expect(won).toHaveLength(1);
+      expect((won[0] as PromiseFulfilledResult<{ appName: string }>).value).toMatchObject({ appName: 'racing' });
+      expect(refused).toHaveLength(1);
+      expect(String((refused[0] as PromiseRejectedResult).reason)).toMatch('already exists');
+    });
+
+    it('refuses a name another deploy path holds, and does not release its claim', async () => {
+      expect(tryReserve('uploading', 'someone-else')).toBe(true);
+
+      const attempt = service.deploy({ repoUrl: 'https://github.com/user/uploading', userId: 'alice' });
+
+      await expect(attempt).rejects.toThrow("Application 'uploading' already exists");
+      // Plain wording: no hint that a deploy is in flight.
+      await expect(attempt).rejects.not.toThrow(/progress/);
+      expect(ownerOf('uploading')).toBe('someone-else');
+      expect(service.isCloning('uploading')).toBe(false);
+    });
+
+    it('releases only its own reservation when it fails, and frees the name', async () => {
+      await expect(
+        service.deploy({ repoUrl: 'https://github.com/user/whatever', name: 'bad name!', userId: 'alice' })
+      ).rejects.toThrow('Invalid app name');
+      expect(isReserved('bad name!')).toBe(false);
+
+      jest.spyOn(getStateManager(), 'registerApp').mockRejectedValueOnce(new Error('register failed'));
+      await expect(
+        service.deploy({ repoUrl: 'https://github.com/user/frees', userId: 'alice' })
+      ).rejects.toThrow('register failed');
+      expect(isReserved('frees')).toBe(false);
+    });
+
+    it('does not hold the watcher off the name through its pre-clone awaits', async () => {
+      let cloningDuringAdmission: boolean | undefined;
+      jest.spyOn(breakerModule, 'admitDeploy').mockImplementationOnce(async () => {
+        cloningDuringAdmission = service.isCloning('late-clone');
+      });
+
+      await service.deploy({ repoUrl: 'https://github.com/user/late-clone' });
+
+      expect(cloningDuringAdmission).toBe(false);
+    });
+
+    it('does not remove an app it never registered when registration fails', async () => {
+      const stateManager = getStateManager();
+      jest.spyOn(stateManager, 'registerApp').mockRejectedValue(new Error('register failed'));
+      const removeApp = jest.spyOn(stateManager, 'removeApp');
+
+      await expect(
+        service.deploy({ repoUrl: 'https://github.com/user/never-registered' })
+      ).rejects.toThrow('register failed');
+
+      expect(removeApp).not.toHaveBeenCalled();
+      expect(service.isCloning('never-registered')).toBe(false);
     });
 
     it('should deploy successfully from a valid URL', async () => {
@@ -224,6 +326,48 @@ describe('GitDeployService', () => {
       expect(app?.gitSource?.repoUrl).toBe('https://github.com/user/state-test');
       expect(app?.gitSource?.branch).toBe('develop');
       expect(app?.gitSource?.autoRedeploy).toBe(false);
+    });
+
+    it('registers the app and its owner BEFORE the name leaves activeClones', async () => {
+      // Once the name is released the watcher may detect a monorepo container
+      // and expand it; without an owner on record it would adopt unowned group
+      // children as unowned.
+      const appName = 'owner-order';
+      const stateManager = getStateManager();
+      const seen: Array<{ cloning: boolean; userId?: string }> = [];
+      const realUpdate = stateManager.updateApp.bind(stateManager);
+      jest.spyOn(stateManager, 'updateApp').mockImplementation(async (name, updates) => {
+        await realUpdate(name, updates);
+        seen.push({ cloning: service.isCloning(appName), userId: stateManager.getApp(name)?.userId });
+        return stateManager.getApp(name) as never;
+      });
+
+      await service.deploy({
+        repoUrl: `https://github.com/user/${appName}`,
+        branch: 'main',
+        userId: 'owner',
+      });
+
+      expect(seen).toEqual([{ cloning: true, userId: 'owner' }]);
+      expect(service.isCloning(appName)).toBe(false);
+    });
+
+    it('removes the registration and the clone, and releases the name, when registering fails', async () => {
+      const appName = 'register-fails';
+      const stateManager = getStateManager();
+      jest.spyOn(stateManager, 'updateApp').mockRejectedValue(new Error('state write failed'));
+
+      await expect(
+        service.deploy({
+          repoUrl: `https://github.com/user/${appName}`,
+          branch: 'main',
+          userId: 'owner',
+        })
+      ).rejects.toThrow('state write failed');
+
+      expect(stateManager.hasApp(appName)).toBe(false);
+      expect(service.isCloning(appName)).toBe(false);
+      await expect(fs.stat(path.join(tempDir, 'webapps', appName))).rejects.toThrow();
     });
 
     it('publishes app:detected after a successful clone', async () => {
@@ -281,6 +425,89 @@ describe('GitDeployService', () => {
 
       expect(result.repoUrl).toBe('https://github.com/user/dotgit-test');
       expect(result.appName).toBe('dotgit-test');
+    });
+  });
+
+  describe('deploy - new app name rules', () => {
+    const deployAs = (repo: string, extra: Record<string, unknown> = {}) =>
+      service.deploy({ repoUrl: `https://github.com/user/${repo}`, userId: 'alice', ...extra });
+
+    it('refuses a dotted name, given or derived from the URL (a slot-b instance name)', async () => {
+      await expect(deployAs('shop', { name: 'shop.b' })).rejects.toThrow('Invalid app name');
+      await expect(deployAs('shop.b')).rejects.toThrow('Invalid app name');
+      // Admins are held to the syntax rule too.
+      await expect(deployAs('shop', { name: 'shop.b', callerIsAdmin: true })).rejects.toThrow(
+        'Invalid app name'
+      );
+    });
+
+    it('refuses a name differing from an existing app only in case', async () => {
+      await getStateManager().registerApp('Blog', '/x/Blog');
+
+      await expect(deployAs('blog')).rejects.toThrow("Application 'blog' already exists");
+    });
+
+    it('refuses a name equal to a group in state', async () => {
+      await getStateManager().registerApp('ezs-web', '/x/ezs-web');
+      await getStateManager().updateApp('ezs-web', { group: 'ezs' });
+
+      await expect(deployAs('ezs')).rejects.toThrow("Application 'ezs' already exists");
+      await expect(deployAs('EZS')).rejects.toThrow('already exists');
+    });
+
+    it("refuses a deleted container's name while its stamped children live on", async () => {
+      const acs = getAppConfigService({
+        configDir: path.join(tempDir, 'appconf'),
+        webappsDir: path.join(tempDir, 'webapps'),
+      });
+      await acs.initialize();
+      await acs.upsertSystemConfig('legacy-web', {
+        type: 'static',
+        group: 'legacy',
+        groupContainer: 'legacy-repo',
+      });
+
+      await expect(deployAs('legacy-repo')).rejects.toThrow("Application 'legacy-repo' already exists");
+      await expect(deployAs('Legacy')).rejects.toThrow('already exists');
+    });
+
+    it('counts the name rules against quota: a probe is admitted before it is refused', async () => {
+      await getStateManager().registerApp('ezs-web', '/x/ezs-web');
+      await getStateManager().updateApp('ezs-web', { group: 'ezs' });
+      const admit = jest.spyOn(breakerModule, 'admitDeploy');
+
+      await expect(deployAs('ezs')).rejects.toThrow('already exists');
+
+      expect(admit).toHaveBeenCalledTimes(1);
+    });
+
+    it('re-decides the name just before registering, and removes the clone if it was taken meanwhile', async () => {
+      const stateManager = getStateManager();
+      const register = jest.spyOn(stateManager, 'registerApp');
+      // A group claims the name while the deploy is between its checks and the clone.
+      jest.spyOn(diskUtils, 'hasEnoughDisk').mockImplementationOnce(async () => {
+        await stateManager.registerApp('claimer-web', '/x/claimer-web');
+        await stateManager.updateApp('claimer-web', { group: 'racy' });
+        return { ok: true, freeMb: 10000 };
+      });
+
+      await expect(deployAs('racy')).rejects.toThrow("Application 'racy' already exists");
+
+      expect(register).not.toHaveBeenCalledWith('racy', expect.anything());
+      expect(isReserved('racy')).toBe(false);
+      await expect(fs.stat(path.join(tempDir, 'webapps', 'racy'))).rejects.toThrow();
+    });
+
+    it('says how to pick another name when the derived one is invalid', async () => {
+      await expect(deployAs('my.repo')).rejects.toThrow('pass `name` to choose a different app name');
+    });
+
+    it('lets an admin take such a name, and a plain new name through', async () => {
+      await getStateManager().registerApp('ezs-web', '/x/ezs-web');
+      await getStateManager().updateApp('ezs-web', { group: 'ezs' });
+
+      await expect(deployAs('ezs', { callerIsAdmin: true })).resolves.toMatchObject({ appName: 'ezs' });
+      await expect(deployAs('fresh')).resolves.toMatchObject({ appName: 'fresh' });
     });
   });
 

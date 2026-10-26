@@ -18,6 +18,7 @@ import { createApiKey, deleteApiKeysByName } from '../api/middleware/auth';
 import { setPublicUrl } from '../api/runtime-config';
 import { getMailQuota, resetMailQuota } from '../managers/guardrail/principal-quota';
 import { getAppGuestManager, resetAppGuests } from '../managers/app-guest';
+import { AppConfigService } from '../managers/app/app-config';
 
 // These are pipeline/service unit tests — they never exercise the HTTP API, so
 // disable it (createPlatform reads DROP_ENABLE_API when no enableApi is passed).
@@ -2285,6 +2286,7 @@ describe('resolveBuildEnv / resolveDependencies (M1: build-time env + browser-re
 
 describe('expandMonorepo (M2: monorepo -> per-service app expansion)', () => {
   let platform: DropPlatform;
+  let acs: AppConfigService;
   let tempDir: string;
   let appsDir: string;
 
@@ -2338,6 +2340,11 @@ describe('expandMonorepo (M2: monorepo -> per-service app expansion)', () => {
     );
     appsDir = path.join(tempDir, 'apps');
     await fsPromises.mkdir(appsDir, { recursive: true });
+    // The real service. The atomic-write path (`open`/`rename`) stays mocked
+    // file-wide, so its writes are no-ops and it keeps its state in memory,
+    // which is all this suite needs.
+    acs = new AppConfigService({ configDir: path.join(tempDir, 'appconf'), webappsDir: appsDir });
+    await acs.initialize();
 
     platform = createPlatform({
       dropRoot: tempDir,
@@ -2394,15 +2401,7 @@ describe('expandMonorepo (M2: monorepo -> per-service app expansion)', () => {
     const repoPath = path.join(appsDir, repoName);
     await writeFixtureRepo(repoPath);
 
-    const configStore = new Map<string, any>();
-    (platform as any).appConfigService = {
-      getConfig: jest.fn((name: string) => configStore.get(name)),
-      upsertConfig: jest.fn(async (name: string, updates: any) => {
-        const merged = { ...(configStore.get(name) || {}), ...updates, name };
-        configStore.set(name, merged);
-        return merged;
-      }),
-    };
+    (platform as any).appConfigService = acs;
     (platform as any).stateManager = {
       registerApp: jest.fn().mockResolvedValue(undefined),
       updateApp: jest.fn().mockResolvedValue(undefined),
@@ -2457,8 +2456,8 @@ describe('expandMonorepo (M2: monorepo -> per-service app expansion)', () => {
     expect(frontendYaml.database).toBeUndefined();
 
     // (e) configs + state registered with the group tag
-    expect(configStore.get(`${repoName}-backend`)?.group).toBe(repoName);
-    expect(configStore.get(`${repoName}-frontend`)?.group).toBe(repoName);
+    expect(acs.getConfig(`${repoName}-backend`)?.group).toBe(repoName);
+    expect(acs.getConfig(`${repoName}-frontend`)?.group).toBe(repoName);
     expect((platform as any).stateManager.registerApp).toHaveBeenCalledWith(
       `${repoName}-backend`,
       backendChildPath,
@@ -2498,18 +2497,10 @@ describe('expandMonorepo (M2: monorepo -> per-service app expansion)', () => {
     const repoPath = path.join(appsDir, repoName);
     await writeFixtureRepo(repoPath);
 
-    const configStore = new Map<string, any>();
     // A standalone, non-grouped app already owns 'ezsign-backend'.
-    configStore.set(`${repoName}-backend`, { name: `${repoName}-backend`, type: 'nodejs' });
+    await acs.upsertSystemConfig(`${repoName}-backend`, { type: 'nodejs' });
 
-    (platform as any).appConfigService = {
-      getConfig: jest.fn((name: string) => configStore.get(name)),
-      upsertConfig: jest.fn(async (name: string, updates: any) => {
-        const merged = { ...(configStore.get(name) || {}), ...updates, name };
-        configStore.set(name, merged);
-        return merged;
-      }),
-    };
+    (platform as any).appConfigService = acs;
     (platform as any).stateManager = {
       registerApp: jest.fn().mockResolvedValue(undefined),
       updateApp: jest.fn().mockResolvedValue(undefined),
@@ -2537,9 +2528,9 @@ describe('expandMonorepo (M2: monorepo -> per-service app expansion)', () => {
     );
     // The colliding service was skipped — its config is untouched (still the
     // pre-existing standalone owner, no group tag added).
-    expect(configStore.get(`${repoName}-backend`)?.group).toBeUndefined();
+    expect(acs.getConfig(`${repoName}-backend`)?.group).toBeUndefined();
     // The other service in the same group still proceeds normally.
-    expect(configStore.get(`${repoName}-frontend`)?.group).toBe(repoName);
+    expect(acs.getConfig(`${repoName}-frontend`)?.group).toBe(repoName);
   });
 
   it('(g) writes route into the generated child drop.yaml when a service declares one (M3)', async () => {
@@ -2547,15 +2538,7 @@ describe('expandMonorepo (M2: monorepo -> per-service app expansion)', () => {
     const repoPath = path.join(appsDir, repoName);
     await writeFixtureRepo(repoPath);
 
-    const configStore = new Map<string, any>();
-    (platform as any).appConfigService = {
-      getConfig: jest.fn((name: string) => configStore.get(name)),
-      upsertConfig: jest.fn(async (name: string, updates: any) => {
-        const merged = { ...(configStore.get(name) || {}), ...updates, name };
-        configStore.set(name, merged);
-        return merged;
-      }),
-    };
+    (platform as any).appConfigService = acs;
     (platform as any).stateManager = {
       registerApp: jest.fn().mockResolvedValue(undefined),
       updateApp: jest.fn().mockResolvedValue(undefined),
@@ -2600,15 +2583,7 @@ describe('expandMonorepo (M2: monorepo -> per-service app expansion)', () => {
     const repoPath = path.join(appsDir, repoName);
     await writeFixtureRepo(repoPath);
 
-    const configStore = new Map<string, any>();
-    (platform as any).appConfigService = {
-      getConfig: jest.fn((name: string) => configStore.get(name)),
-      upsertConfig: jest.fn(async (name: string, updates: any) => {
-        const merged = { ...(configStore.get(name) || {}), ...updates, name };
-        configStore.set(name, merged);
-        return merged;
-      }),
-    };
+    (platform as any).appConfigService = acs;
     const updateApp = jest.fn().mockResolvedValue(undefined);
     (platform as any).stateManager = {
       registerApp: jest.fn().mockResolvedValue(undefined),
@@ -2643,15 +2618,7 @@ describe('expandMonorepo (M2: monorepo -> per-service app expansion)', () => {
     const repoPath = path.join(appsDir, repoName);
     await writeFixtureRepo(repoPath);
 
-    const configStore = new Map<string, any>();
-    (platform as any).appConfigService = {
-      getConfig: jest.fn((name: string) => configStore.get(name)),
-      upsertConfig: jest.fn(async (name: string, updates: any) => {
-        const merged = { ...(configStore.get(name) || {}), ...updates, name };
-        configStore.set(name, merged);
-        return merged;
-      }),
-    };
+    (platform as any).appConfigService = acs;
     const updateApp = jest.fn().mockResolvedValue(undefined);
     const registerApp = jest.fn().mockResolvedValue(undefined);
     (platform as any).stateManager = {
@@ -2682,10 +2649,7 @@ describe('expandMonorepo (M2: monorepo -> per-service app expansion)', () => {
     await fsPromises.mkdir(path.join(repoPath, 'backend'), { recursive: true });
 
     const updateApp = jest.fn().mockResolvedValue(undefined);
-    (platform as any).appConfigService = {
-      getConfig: jest.fn().mockReturnValue(undefined),
-      upsertConfig: jest.fn().mockResolvedValue({}),
-    };
+    (platform as any).appConfigService = acs;
     (platform as any).stateManager = {
       registerApp: jest.fn().mockResolvedValue(undefined),
       updateApp,
@@ -2723,10 +2687,7 @@ describe('expandMonorepo (M2: monorepo -> per-service app expansion)', () => {
     await fsPromises.mkdir(path.join(repoPath, 'backend'), { recursive: true });
 
     const updateApp = jest.fn().mockResolvedValue(undefined);
-    (platform as any).appConfigService = {
-      getConfig: jest.fn().mockReturnValue(undefined),
-      upsertConfig: jest.fn().mockResolvedValue({}),
-    };
+    (platform as any).appConfigService = acs;
     (platform as any).stateManager = {
       registerApp: jest.fn().mockResolvedValue(undefined),
       updateApp,
@@ -2767,10 +2728,7 @@ describe('expandMonorepo (M2: monorepo -> per-service app expansion)', () => {
     await fsPromises.mkdir(path.join(repoPath, 'backend'), { recursive: true });
 
     const updateApp = jest.fn().mockResolvedValue(undefined);
-    (platform as any).appConfigService = {
-      getConfig: jest.fn().mockReturnValue(undefined),
-      upsertConfig: jest.fn().mockResolvedValue({}),
-    };
+    (platform as any).appConfigService = acs;
     (platform as any).stateManager = {
       registerApp: jest.fn().mockResolvedValue(undefined),
       updateApp,
@@ -2807,10 +2765,7 @@ describe('expandMonorepo (M2: monorepo -> per-service app expansion)', () => {
     const repoPath = path.join(appsDir, repoName);
     await fsPromises.mkdir(path.join(repoPath, 'backend'), { recursive: true });
 
-    (platform as any).appConfigService = {
-      getConfig: jest.fn().mockReturnValue(undefined),
-      upsertConfig: jest.fn().mockResolvedValue({}),
-    };
+    (platform as any).appConfigService = acs;
     (platform as any).stateManager = {
       registerApp: jest.fn().mockResolvedValue(undefined),
       updateApp: jest.fn().mockResolvedValue(undefined),
@@ -2839,10 +2794,7 @@ describe('expandMonorepo (M2: monorepo -> per-service app expansion)', () => {
     const repoPath = path.join(appsDir, repoName);
     await fsPromises.mkdir(path.join(repoPath, 'backend'), { recursive: true });
 
-    (platform as any).appConfigService = {
-      getConfig: jest.fn().mockReturnValue(undefined),
-      upsertConfig: jest.fn().mockResolvedValue({}),
-    };
+    (platform as any).appConfigService = acs;
     (platform as any).stateManager = {
       registerApp: jest.fn().mockResolvedValue(undefined),
       updateApp: jest.fn().mockResolvedValue(undefined),

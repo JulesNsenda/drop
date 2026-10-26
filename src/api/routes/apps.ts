@@ -56,6 +56,8 @@ import {
   getUploadDeployService,
   ArchiveRejectedError,
   UploadValidationError,
+  UploadNotFoundError,
+  UploadConflictError,
   InsufficientDiskSpaceError,
   createSourceArchive,
   EmptySourceError,
@@ -379,6 +381,12 @@ apps.get('/:name', async c => {
 });
 
 // POST /apps - Deploy a new application
+//
+// Registers a folder ALREADY ON THE SERVER, so it is admin-only (floor set in
+// server.ts). At `user` a caller could register any other tenant's app folder
+// under a new name and read it back through GET /apps/:name/source, or take over
+// a folder-dropped app's name. Tenants deploy by upload or git instead. The
+// non-admin branches below are only reachable with auth disabled.
 apps.post('/', async c => {
   const auth = (c.get as Function)('auth') as AuthContext | undefined;
   const body = await c.req.json<CreateAppDto>();
@@ -604,6 +612,7 @@ apps.post('/:name/source', async c => {
       appName: name,
       archivePath,
       userId: auth?.userId,
+      callerIsAdmin: auth?.role === 'admin',
       principalId: auth?.principalId,
       agentCaller: auth?.kind === 'agent',
     });
@@ -629,6 +638,12 @@ apps.post('/:name/source', async c => {
     }
     if (err instanceof UploadValidationError) {
       return c.json(error(ErrorCodes.VALIDATION_ERROR, err.message), 400);
+    }
+    if (err instanceof UploadNotFoundError) {
+      return c.json(error(ErrorCodes.NOT_FOUND, err.message), 404);
+    }
+    if (err instanceof UploadConflictError) {
+      return c.json(error(ErrorCodes.CONFLICT, err.message), 409);
     }
     if (err instanceof InsufficientDiskSpaceError) {
       return c.json(error(ErrorCodes.INTERNAL_ERROR, err.message), 507 as any);

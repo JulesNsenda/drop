@@ -90,6 +90,9 @@ describe('MCP tool handlers', () => {
     resetPlatformOps();
     resetUploadPreflightState();
     getStateManager({ stateFilePath: path.join(tempDir, 'apps.json') });
+    // The new-app name rules fail closed without a config service.
+    resetAppConfigService();
+    await getAppConfigService({ configDir: path.join(tempDir, 'appconf'), webappsDir: tempDir }).initialize();
     setPlatformOps(makeOps());
 
     jest.spyOn(runtimeConfigModule, 'getTempDirectory').mockReturnValue(path.join(tempDir, 'temp'));

@@ -566,7 +566,10 @@ export class ApiServer {
       // `readonly`.
       v1.use('/apps/*', authMiddlewareForMethods(['DELETE', 'PUT', 'PATCH', 'POST'], 'user'));
       v1.use('/apps/*', authMiddleware('readonly'));
-      v1.use('/apps', authMiddleware('readonly'));
+      // `/apps/*` above also matches `/apps`, so GET keeps its readonly floor.
+      // Registering a server-side folder is an operator action: at `user` it
+      // reads other tenants' source and takes over folder-dropped app names.
+      v1.use('/apps', authMiddlewareForMethods(['POST'], 'admin'));
       v1.use('/usage', authMiddleware('readonly'));
       v1.use('/limits', authMiddleware('readonly'));
       v1.use('/logs/*', authMiddleware('readonly'));
