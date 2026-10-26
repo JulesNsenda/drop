@@ -31,21 +31,24 @@ on:
           regardless of upload-artifact -- packaging and hashing are
           unconditional, not gated on the flag, so this is never empty
           because of upload-artifact being false. It IS still empty if the
-          job fails before the Hash artifact step (e.g. Test), which is why
+          build job fails before the Hash artifact step, which is why
           deploy.yml's digest-check step still guards against an empty
           EXPECTED_SHA256 rather than trusting this to always be set --
           belt-and-braces, not the only thing standing between a skipped
           step and a production ship. When upload-artifact is false there is
           no artifact to download, only this digest of a tarball that was
-          built and hashed but not uploaded.
-        value: ${{ jobs.verify.outputs.tarball-sha256 }}
+          built and hashed but not uploaded. The build job does NOT wait for
+          the tests, so a populated digest (or an uploaded artifact) says the
+          tarball is intact, not that verify passed: the gate is the caller's
+          `needs:` on this workflow, which fails if any job here fails.
+        value: ${{ jobs.build.outputs.tarball-sha256 }}
 
 # No `secrets:` block: this workflow needs none, and a called workflow can
 # only further RESTRICT the permissions its job token ends up with relative
 # to the caller -- so pinning `contents: read` here holds no matter what the
 # caller's own token looks like. Callers must never pass `secrets: inherit`;
 # there is nothing here for a secret to do, and passing one would hand it to
-# every future step added to this file, including two `npm ci` runs' worth of
+# every future step added to this file, including several `npm ci` runs' worth of
 # transitive postinstall scripts.
 #
 # That isolation currently rests on CALLER DISCIPLINE, not on scope, and it
@@ -69,18 +72,24 @@ permissions:
   contents: read
 
 jobs:
-  verify:
+  # Four independent jobs, run in parallel. The one sequential job this
+  # replaces took ~5.5 min, almost all of it the deploy-script smoke test
+  # (~2 min) and the jest suite (~2.7 min) waiting on each other for no
+  # reason. Every job must pass for the calling `verify` job (ci.yml,
+  # deploy.yml) to pass, so "good" still means all of it. Each job repeats
+  # checkout + setup-node on purpose: a job is a fresh runner, and sharing a
+  # checkout between jobs would mean an artifact hop for no gain.
+
+  # Fast static gates: seconds after `npm ci`.
+  checks:
     runs-on: ubuntu-latest
-    outputs:
-      tarball-sha256: ${{ steps.hash.outputs.sha256 }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          # Do not leave a credential in .git/config for every later step:
-          # two `npm ci` runs below execute arbitrary transitive postinstall
-          # scripts, and checkout persists GITHUB_TOKEN there by default.
-          # Same reason release.yml sets it. Nothing here runs git after
-          # checkout.
+          # Do not leave a credential in .git/config for later steps:
+          # `npm ci` executes arbitrary transitive postinstall scripts, and
+          # checkout persists GITHUB_TOKEN there by default. Same reason
+          # release.yml sets it. Nothing here runs git after checkout.
           persist-credentials: false
 
       - name: Set up Node.js
@@ -91,6 +100,9 @@ jobs:
           # release (22.23.4); always resolve the newest patch.
           check-latest: true
           cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            src/dashboard/package-lock.json
 
       - name: Install server dependencies
         run: npm ci
@@ -167,6 +179,24 @@ jobs:
             console.log("No inlined remote scripts in any workflow.");
           '
 
+  # Needs no node_modules: the script runs with node and npm stubbed.
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # No install in this job, but the same default as every other job:
+          # nothing here runs git after checkout, so no credential is kept.
+          persist-credentials: false
+
+      # No `npm ci`, but the smoke test and remote-deploy.sh call the real
+      # `node` for the ABI witness, so pin it like every other job.
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          check-latest: true
+
       # The deploy script is the only thing on this repo`s path to production
       # that has no unit test and cannot be exercised by one. shellcheck proves
       # it parses; the smoke test proves the SEQUENCE is right -- that the
@@ -177,8 +207,39 @@ jobs:
       - name: Smoke-test the deploy script
         run: bash scripts/deploy/smoke-test.sh
 
-      - name: Build server
-        run: npm run build:server
+  # The suite split three ways by file (`jest --shard`), so the longest leg is
+  # about a third of the old Test step.
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      # One failing shard must not cancel the others: a red run should show
+      # every failure, not just the first shard's.
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Do not leave a credential in .git/config for later steps:
+          # `npm ci` executes arbitrary transitive postinstall scripts, and
+          # checkout persists GITHUB_TOKEN there by default. Same reason
+          # release.yml sets it. Nothing here runs git after checkout.
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          # The toolcache may hold an older 22.x than the Oct 2026 security
+          # release (22.23.4); always resolve the newest patch.
+          check-latest: true
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            src/dashboard/package-lock.json
+
+      - name: Install server dependencies
+        run: npm ci
 
       # BEFORE `Test`, deliberately (DROP-156). The root jest testMatch is
       # `**/*.test.ts`, which picks up the dashboard's colocated tests too --
@@ -195,9 +256,47 @@ jobs:
         run: npm ci
 
       - name: Test
-        run: npm test
+        run: npm test -- --shard=${{ matrix.shard }}/3
 
-      # DROP-156. The root `Lint` step above is scoped to the server's `src`
+  # The tree the deploy ships, and its digest, are produced here.
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      tarball-sha256: ${{ steps.hash.outputs.sha256 }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Do not leave a credential in .git/config for later steps:
+          # `npm ci` executes arbitrary transitive postinstall scripts, and
+          # checkout persists GITHUB_TOKEN there by default. Same reason
+          # release.yml sets it. Nothing here runs git after checkout.
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          # The toolcache may hold an older 22.x than the Oct 2026 security
+          # release (22.23.4); always resolve the newest patch.
+          check-latest: true
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            src/dashboard/package-lock.json
+
+      - name: Install server dependencies
+        run: npm ci
+
+      - name: Build server
+        run: npm run build:server
+
+      # For the dashboard lint and build below. (The test job installs it too,
+      # for a different reason -- see the comment there.)
+      - name: Install dashboard dependencies
+        working-directory: src/dashboard
+        run: npm ci
+
+      # DROP-156. The root `Lint` step (checks job) is scoped to the server's `src`
       # and the root eslint.config.js explicitly ignores `src/dashboard/**`, so
       # without this step the dashboard has NO lint pass and its two design-token
       # guards would be a config nobody executes.
@@ -245,3 +344,22 @@ jobs:
           name: drop-dist
           path: drop-dist.tar.gz
           retention-days: 1
+
+  # The branch ruleset requires a check named `verify / verify` (ci.yml's
+  # job id / this job id). The split above reports `verify / checks`,
+  # `verify / test (1)` and so on, so without this job no required check would
+  # ever report and every PR would wait forever. It is the one gate:
+  # `if: always()` plus the explicit result test are both load-bearing -- with
+  # a plain `needs:`, a failed job would SKIP this one, and a required check
+  # that is skipped counts as passing.
+  verify:
+    needs: [checks, smoke, test, build]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Every verify job passed
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "checks smoke test build: $RESULTS"
+          for r in $RESULTS; do [ "$r" = success ] || exit 1; done
