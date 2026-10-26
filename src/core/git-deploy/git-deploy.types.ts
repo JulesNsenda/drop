@@ -85,7 +85,11 @@ export interface GitCloneOptions {
   dest: string;
   branch: string;
   token?: string;
-  shallow?: boolean;
+  /**
+   * TEST ONLY: also allow the `file` transport. Production is https-only; the
+   * suite has no network and clones from a `file://` remote.
+   */
+  allowFileProtocol?: boolean;
 }
 
 /** Git deploy result */

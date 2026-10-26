@@ -7,9 +7,7 @@
 export { GitDeployService, getGitDeployService, resetGitDeployService } from './git-deploy';
 export {
   gitClone,
-  gitPull,
-  getCommitSha,
-  getCurrentBranch,
+  configureCloneBase,
   normalizeRepoUrl,
   extractRepoName,
   isValidGitHubUrl,

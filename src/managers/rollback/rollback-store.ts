@@ -47,6 +47,7 @@ import * as fs from 'fs/promises';
 import * as path from 'path';
 import { randomUUID } from 'crypto';
 import { writeJsonAtomic } from '../../utils/atomic-write';
+import { isVcsMetadataComponent } from '../../utils/upload-paths';
 import { hasEnoughDisk } from '../../utils/disk';
 import { isValidAppName } from '../../api/middleware/validate';
 import { measureTree, configuredCeilingBytes, MB } from '../guardrail/disk-ceiling';
@@ -196,6 +197,13 @@ export class RollbackStore {
           verbatimSymlinks: true,
           errorOnExist: false,
           force: true,
+          // Never carry repository metadata into a snapshot: a restore would
+          // put a tenant-writable .git back into the app folder.
+          filter: (src) =>
+            !path
+              .relative(appPath, src)
+              .split(path.sep)
+              .some((segment) => isVcsMetadataComponent(segment)),
         });
         await fs.rm(this.treeDir(appName), { recursive: true, force: true });
         await fs.rename(staging, this.treeDir(appName));

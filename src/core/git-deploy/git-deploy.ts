@@ -18,13 +18,15 @@ import {
 } from './git-deploy.types';
 import {
   gitClone,
-  gitPull,
-  getCommitSha,
+  configureCloneBase,
+  stripUrlCredentials,
   normalizeRepoUrl,
   extractRepoName,
   isValidGitHubUrl,
   isGitAvailable,
 } from './git-client';
+import { landTracked, readManifest, writeManifest } from './land';
+import { getPlatformOps, AppInProgressError } from '../../api/platform-ops';
 import { getStateManager } from '../../managers/app/state-manager';
 import { getAppConfigService, getAppConfigServiceOrNull } from '../../managers/app/app-config';
 import { getSecretManager } from '../../managers/secret';
@@ -49,18 +51,85 @@ const GIT_TOKEN_APP_NAME = '__drop_git_tokens';
 
 export interface GitDeployServiceConfig {
   appsDirectory: string;
+  /**
+   * Platform temp root (`data/temp`). Clones live in `.git-clones` under it —
+   * dot-prefixed so no app name can collide, and outside every watched, served
+   * or container-mounted folder. Defaults to a `temp` folder beside the apps.
+   */
+  tempDirectory?: string;
+  /** Where the per-app landed-file lists live (`data/drop-svc/git-manifests`). */
+  manifestDirectory?: string;
+  /** Cap on the summed size of a repository's tracked files (the upload cap). */
+  maxUnpackedBytes?: number;
+  /** Cap on files plus directories (the upload cap). */
+  maxEntries?: number;
 }
+
+const DEFAULT_MAX_UNPACKED_BYTES = 1024 * 1024 * 1024;
+const DEFAULT_MAX_ENTRIES = 20_000;
 
 export class GitDeployService {
   private readonly config: GitDeployServiceConfig;
   private gitAvailable = false;
-  private activeClones: Set<string> = new Set();
+  /** Per-app count of clones/lands in flight; the watcher guard is "any". */
+  private activeClones: Map<string, number> = new Map();
+  /** Tail of each app's land chain: two lands for one app never overlap. */
+  private landChains: Map<string, Promise<unknown>> = new Map();
+  private readonly cloneBase: string;
+  private readonly manifestDir: string;
 
   constructor(config: GitDeployServiceConfig) {
     this.config = config;
+    const dataDir = path.dirname(config.appsDirectory);
+    this.cloneBase = path.join(config.tempDirectory ?? path.join(dataDir, 'temp'), '.git-clones');
+    this.manifestDir = config.manifestDirectory ?? path.join(dataDir, 'drop-svc', 'git-manifests');
+    configureCloneBase(this.cloneBase);
+  }
+
+  private beginClone(appName: string): void {
+    this.activeClones.set(appName, (this.activeClones.get(appName) ?? 0) + 1);
+  }
+
+  private endClone(appName: string): void {
+    const n = (this.activeClones.get(appName) ?? 0) - 1;
+    if (n > 0) this.activeClones.set(appName, n);
+    else this.activeClones.delete(appName);
+  }
+
+  /** Run `fn` after every earlier land for this app has finished. */
+  private serialised<T>(appName: string, fn: () => Promise<T>): Promise<T> {
+    const prev = this.landChains.get(appName) ?? Promise.resolve();
+    const run = prev.catch(() => undefined).then(fn);
+    const tail = run.catch(() => undefined);
+    this.landChains.set(appName, tail);
+    void tail.then(() => {
+      if (this.landChains.get(appName) === tail) this.landChains.delete(appName);
+    });
+    return run;
+  }
+
+  /**
+   * The clone base, verified to be a real directory (not a link) owned by this
+   * user. Anything left in it by a crash is swept at boot (`initialize`).
+   */
+  private async ensureCloneBase(): Promise<string> {
+    await fs.mkdir(path.dirname(this.cloneBase), { recursive: true, mode: 0o700 });
+    await fs.mkdir(this.cloneBase, { mode: 0o700 }).catch((err: NodeJS.ErrnoException) => {
+      if (err.code !== 'EEXIST') throw err;
+    });
+    const st = await fs.lstat(this.cloneBase);
+    if (!st.isDirectory() || st.isSymbolicLink()) {
+      throw new Error('Clone directory is not a plain directory');
+    }
+    if (typeof process.getuid === 'function' && st.uid !== process.getuid()) {
+      throw new Error('Clone directory is not owned by the platform user');
+    }
+    return this.cloneBase;
   }
 
   async initialize(): Promise<void> {
+    // Boot sweep: nothing is in flight yet, so anything here is a crash's leftover.
+    await fs.rm(this.cloneBase, { recursive: true, force: true }).catch(() => undefined);
     this.gitAvailable = await isGitAvailable();
     if (!this.gitAvailable) {
       logger.warn('git CLI not found - git deploy features will be unavailable', 'GIT-DEPLOY');
@@ -75,7 +144,7 @@ export class GitDeployService {
 
   /** Check if an app is currently being cloned */
   isCloning(appName: string): boolean {
-    return this.activeClones.has(appName);
+    return (this.activeClones.get(appName) ?? 0) > 0;
   }
 
   /**
@@ -229,20 +298,15 @@ export class GitDeployService {
     // Mark as cloning to prevent watcher from detecting mid-clone. Added only
     // now, after every await above, so the watcher is not held off the name
     // through quota and auth checks; held until the app is registered (below).
-    this.activeClones.add(appName);
+    this.beginClone(appName);
 
-    // Clone
+    // Clone into a platform-owned temp dir, then land the tracked files without .git.
     logger.info(`Cloning ${repoUrl} (branch: ${branch}) into ${appName}`, 'GIT-DEPLOY');
+    let commitSha: string | undefined;
     try {
-      await gitClone({
-        url: repoUrl,
-        dest: destPath,
-        branch,
-        token,
-        shallow: true,
-      });
+      commitSha = await this.cloneAndLand(appName, repoUrl, branch, token, destPath, true);
     } catch (err) {
-      this.activeClones.delete(appName);
+      this.endClone(appName);
       // Clean up partial clone
       try {
         await fs.rm(destPath, { recursive: true, force: true });
@@ -250,14 +314,6 @@ export class GitDeployService {
         // ignore cleanup errors
       }
       throw err;
-    }
-
-    // Read commit SHA
-    let commitSha: string | undefined;
-    try {
-      commitSha = await getCommitSha(destPath);
-    } catch {
-      // non-fatal
     }
 
     const clonedAt = new Date().toISOString();
@@ -302,7 +358,7 @@ export class GitDeployService {
       throw err;
     } finally {
       // Clone complete - allow watcher to detect
-      this.activeClones.delete(appName);
+      this.endClone(appName);
     }
 
     logger.info(`Cloned ${repoUrl} → ${appName} (${commitSha?.slice(0, 7) || 'unknown'})`, 'GIT-DEPLOY');
@@ -356,10 +412,65 @@ export class GitDeployService {
   }
 
   /**
-   * Redeploy a git-deployed app (git pull + trigger rebuild). Not reserved:
-   * two redeploys of one app (a webhook burst, a dashboard click) are the
-   * platform's own `appsInProgress` dedup to sort out, as they always were, and
-   * refusing them here would drop a push.
+   * Fresh shallow clone into a temp dir the platform owns, then copy the
+   * repository's TRACKED files (no `.git`) into `destPath`; the clone is
+   * always removed. Serialised per app, so two redeploys never write one folder
+   * at once.
+   *
+   * What gets deleted is decided by the app's saved file list (see `land.ts`):
+   * only files the repository once tracked and no longer does. Untracked files
+   * are never touched, and with no saved list nothing is deleted. Returns the
+   * cloned commit SHA, best-effort.
+   */
+  private cloneAndLand(
+    appName: string,
+    url: string,
+    branch: string,
+    token: string | undefined,
+    destPath: string,
+    firstDeploy = false
+  ): Promise<string | undefined> {
+    return this.serialised(appName, async () => {
+      const base = await this.ensureCloneBase();
+      const cloneDir = await fs.mkdtemp(path.join(base, `${appName}-`));
+      try {
+        const info = await gitClone({ url, dest: cloneDir, branch, token });
+        if (info.symlinks.length > 0) {
+          const shown = info.symlinks.slice(0, 5).join(', ');
+          logger.warn(
+            `${appName}: ${info.symlinks.length} symbolic link(s) tracked in the repository are not recreated (${shown}${info.symlinks.length > 5 ? ', ...' : ''})`,
+            'GIT-DEPLOY'
+          );
+        }
+        // Last look before writing: another create may have taken the folder
+        // while the clone ran.
+        if (firstDeploy && (await pathTaken(destPath))) {
+          throw new Error(`Application '${appName}' already exists`);
+        }
+        const previous = firstDeploy ? null : await readManifest(this.manifestDir, appName);
+        const landed = await landTracked({
+          cloneDir,
+          appDir: destPath,
+          files: info.files,
+          previous,
+          limits: {
+            maxBytes: this.config.maxUnpackedBytes ?? DEFAULT_MAX_UNPACKED_BYTES,
+            maxEntries: this.config.maxEntries ?? DEFAULT_MAX_ENTRIES,
+          },
+        });
+        await writeManifest(this.manifestDir, appName, landed);
+        return info.commitSha;
+      } finally {
+        await fs.rm(cloneDir, { recursive: true, force: true }).catch(() => undefined);
+      }
+    });
+  }
+
+  /**
+   * Redeploy a git-deployed app (fresh clone + land tracked files + trigger
+   * rebuild). Refused while the platform is building or deploying the app (the
+   * land would write under a running build); redeploys of one app that do
+   * overlap are serialised in `cloneAndLand`.
    */
   async redeploy(appName: string, actor: DeployActor = {}): Promise<GitDeployResult> {
     if (!this.gitAvailable) {
@@ -377,26 +488,30 @@ export class GitDeployService {
       throw new Error(`Application '${appName}' was not deployed from git`);
     }
 
-    // Fail fast if the source tree no longer has a git repository. An upload
-    // deploy (syncTree's prune) or a monorepo re-materialization can remove
-    // the real .git while state still carries a gitSource; without this check
-    // `git pull` walks UP the ancestor chain looking for a repository instead
-    // of failing with a clear message.
-    try {
-      await fs.access(path.join(app.path, '.git'));
-    } catch {
-      throw new Error(`Application '${appName}' has no git repository on disk (.git is missing)`);
+    // A build, restart or deploy in flight reads this folder; landing files
+    // under it would hand that operation a half-written tree.
+    if (getPlatformOps()?.isAppInProgress(appName)) {
+      throw new AppInProgressError(appName);
     }
 
-    // GUARDRAIL + QUOTA, before the pull. A redeploy is the request an agent
-    // repeats, and git pull + rebuild is not free.
+    // The recorded URL, credential-stripped and re-validated (an older install
+    // may have stored one with userinfo). It is what is logged, cloned,
+    // persisted and returned.
+    const { branch } = app.gitSource;
+    const cloneUrl = normalizeRepoUrl(stripUrlCredentials(app.gitSource.repoUrl) ?? app.gitSource.repoUrl);
+    if (!isValidGitHubUrl(cloneUrl)) {
+      throw new Error(`Invalid recorded repository URL for ${appName}`);
+    }
+
+    // GUARDRAIL + QUOTA, before the clone. A redeploy is the request an agent
+    // repeats, and a clone + rebuild is not free.
     await admitDeploy(appName, false, {
       principalId: actor.principalId,
       actorUserId: actor.userId,
       automationSource: actor.automation,
     });
 
-    // Preflight: ensure enough free disk space before pulling
+    // Preflight: ensure enough free disk space before cloning
     const disk = await hasEnoughDisk(app.path);
     if (!disk.ok) {
       throw new Error(
@@ -404,11 +519,9 @@ export class GitDeployService {
       );
     }
 
-    const { repoUrl, branch } = app.gitSource;
-
     // undefined (the default, via omission) leaves the stored token
     // unchanged; null clears it; a string attaches/replaces it. Resolved once
-    // and used for BOTH the pull and the final gitSource below — `app` is a
+    // and used for BOTH the clone and the final gitSource below — `app` is a
     // snapshot captured above, and updateApp REPLACES the map entry rather
     // than mutating it, so a second read of app.gitSource after this point
     // would still see the pre-redeploy value.
@@ -450,14 +563,14 @@ export class GitDeployService {
       }
     }
 
-    logger.info(`Redeploying ${appName} from ${repoUrl} (branch: ${branch})`, 'GIT-DEPLOY');
+    logger.info(`Redeploying ${appName} from ${cloneUrl} (branch: ${branch})`, 'GIT-DEPLOY');
 
     // Rollback snapshot of the tree that is SERVING, before it is replaced
     // (#296). Best-effort by contract: it never throws, and a skipped or
     // failed snapshot never fails the deploy — it only means this redeploy
     // cannot be rolled back, which the rollback route reports as such.
-    // The snapshot includes .git, so a restore also puts HEAD back and the
-    // next git redeploy fast-forwards from the restored commit.
+    // The tree carries no .git (every git deploy clones fresh), so a restore
+    // puts the files back and the next redeploy simply clones again.
     const snapshot = await captureBeforeRedeploy(appName);
     if (!snapshot.captured) {
       logger.info(`No rollback snapshot for ${appName}: ${snapshot.reason}`, 'GIT-DEPLOY');
@@ -467,18 +580,14 @@ export class GitDeployService {
     // guard against the watcher building a half-pulled tree. Cleared before
     // the deterministic publish below, or the platform's isCloning guards
     // (platform.ts) would eat that event too.
-    this.activeClones.add(appName);
-    try {
-      await gitPull(app.path, branch, token);
-    } finally {
-      this.activeClones.delete(appName);
-    }
-
+    this.beginClone(appName);
     let commitSha: string | undefined;
     try {
-      commitSha = await getCommitSha(app.path);
-    } catch {
-      // non-fatal
+      // Clone the recorded URL into a platform-owned temp dir; git never runs
+      // inside the app folder.
+      commitSha = await this.cloneAndLand(appName, cloneUrl, branch, token, app.path);
+    } finally {
+      this.endClone(appName);
     }
 
     const clonedAt = new Date().toISOString();
@@ -488,6 +597,7 @@ export class GitDeployService {
     // on this success path (the defect two independent reviewers found).
     const gitSource: GitSource = {
       ...app.gitSource,
+      repoUrl: cloneUrl,
       tokenId: effectiveTokenId === null ? undefined : effectiveTokenId,
       lastCommitSha: commitSha,
       lastClonedAt: clonedAt,
@@ -513,7 +623,7 @@ export class GitDeployService {
 
     return {
       appName,
-      repoUrl,
+      repoUrl: cloneUrl,
       branch,
       commitSha,
       clonedAt,

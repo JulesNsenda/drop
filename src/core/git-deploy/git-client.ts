@@ -1,12 +1,18 @@
 /**
  * Git Client
  *
- * Thin wrapper around the git CLI for clone, pull, and metadata operations.
+ * Thin wrapper around the git CLI. It clones into a platform-owned temporary
+ * directory and reads the commit SHA and the tracked-file list from that clone;
+ * it NEVER runs git inside an app's own folder, because under docker isolation
+ * that folder is bind-mounted into tenant containers and everything in it
+ * (`.git/config`, hooks) is tenant-writable. `runGit` refuses any working
+ * directory outside the configured clone base. The deploy service then copies
+ * the tracked files into the app folder without any `.git` (see `land.ts`).
  *
- * BOTH `gitClone` and `gitPull` read a PAT from a credential helper's
- * environment — never argv, never the remote URL, never `.git/config`. See
- * `CREDENTIAL_HELPER_ARGS` for the mechanism and `stripRemoteUrlCredentials`
- * for the cleanup of repositories cloned before that was true.
+ * `gitClone` reads a PAT from a credential helper's environment — never argv,
+ * never the remote URL, never `.git/config`. See `CREDENTIAL_HELPER_ARGS`.
+ *
+ * Every git child goes through `runGit`, the module's only process spawn.
  *
  * The header used to claim PATs were "never written to disk" while the clone
  * path was in fact recording them permanently in the tenant's own
@@ -26,16 +32,15 @@ const execFileAsync = promisify(execFile);
  *
  * STILL LOAD-BEARING, for two cases — do not delete it as dead code:
  *
- * 1. Every app cloned before the URL-injection removal still has
- *    `remote.origin.url = https://TOKEN@github.com/...` on disk until its
- *    first redeploy self-heals it (`stripRemoteUrlCredentials`). A failed
- *    `git pull` against one of those prints the remote URL, PAT included, and
- *    that message reaches an HTTP 500 body and the deploy-details store.
+ * 1. A recorded `gitSource.repoUrl` from an older install can still carry
+ *    userinfo (`https://TOKEN@github.com/...`), and a failed clone prints the
+ *    URL it was given, PAT included. That text would otherwise reach an HTTP
+ *    500 body and the deploy-details store. (The redeploy path also strips the
+ *    userinfo before cloning; this is the net under it.)
  * 2. A repoUrl a tenant supplies can itself carry userinfo.
  *
- * What it is NOT any more is the mechanism protecting DROP's own credential
- * handling: neither clone nor pull builds a token-bearing URL. It is a net
- * under the installed base, not the design.
+ * What it is NOT is the mechanism protecting DROP's own credential handling:
+ * the clone never builds a token-bearing URL. It is a net, not the design.
  */
 function sanitizeOutput(output: string): string {
   // Strip tokens from https://TOKEN@github.com URLs
@@ -96,15 +101,15 @@ export function isValidBranchName(branch: string): boolean {
  * no escaping — this array is passed to execFile with no shell on our side.
  *
  * **Scoped to `https://github.com`, deliberately.** A bare `credential.helper`
- * answers for EVERY host git asks about, and `gitPull` runs against whatever
- * `remote.origin.url` says on disk — a value a tenant who can write their own
- * `.git/config` controls. Unscoped, pointing that at an attacker-controlled
- * host and triggering a redeploy POSTs the PAT to them in cleartext; the same
- * applies to an HTTP redirect, where git re-resolves credentials for the new
- * host. The URL-injection this replaced was host-pinned by construction (it
- * only rewrote a literal `https://github.com/` prefix), so an unscoped helper
- * would have been a real regression. `isValidGitHubUrl` admits only
+ * answers for EVERY host git asks about, including the new host after an HTTP
+ * redirect, where git re-resolves credentials. Unscoped, a redirecting remote
+ * would be handed the PAT in cleartext. `isValidGitHubUrl` admits only
  * github.com repos, so the scope costs nothing.
+ *
+ * **Order matters.** The empty reset comes FIRST and the scoped helper after
+ * it; a `credential.helper=` placed after the scoped helper would wipe it and
+ * break every private-repo clone, so `buildCloneArgs` appends these LAST among
+ * the `-c` options.
  *
  * Verified against Git for Windows 2.50.0 as well as POSIX git: Git for
  * Windows bundles its own `sh`, so the `!`-style helper is portable. Measured
@@ -122,18 +127,10 @@ export const CREDENTIAL_HELPER_ARGS: readonly string[] = [
   'credential.https://github.com.helper=!f(){ echo username=x-access-token; echo "password=$GIT_ASKPASS_TOKEN"; };f',
 ];
 
-/** Env for a git child that must authenticate, without mutating `process.env`. */
-export function credentialEnv(token: string): NodeJS.ProcessEnv {
-  return { ...process.env, GIT_ASKPASS_TOKEN: token };
-}
-
 /**
- * A remote URL with the userinfo removed, or `null` if there was none to
- * remove (or it isn't a URL at all).
- *
- * Split out and exported so the rewrite decision is testable without a real
- * repository — the `null` case is what stops a pointless `set-url` on every
- * single pull.
+ * A recorded repository URL with the userinfo removed, or `null` if there was
+ * none to remove (or it isn't a URL at all). Older installs may have stored a
+ * credentialed URL; the redeploy path strips it before validating.
  */
 export function stripUrlCredentials(remoteUrl: string): string | null {
   try {
@@ -148,47 +145,127 @@ export function stripUrlCredentials(remoteUrl: string): string | null {
 }
 
 /**
- * Remove a PAT that an EARLIER version of this code baked into a repository's
- * `remote.origin.url`, before pulling from it.
+ * Hardening every git child carries. The directory git runs in is a fresh
+ * clone DROP made itself, so there is no tenant config to defend against; this
+ * is belt and braces for the repository's own content.
  *
- * Closing the leak in `gitClone`/`gitPull` does nothing for the installed
- * base: `git clone https://TOKEN@github.com/...` recorded that URL verbatim,
- * so every app cloned before this shipped still holds its PAT in cleartext
- * inside its own directory — which is the bind-mounted container root under
- * docker isolation, and the served document root for a plain static app. Worse
- * for the fix itself: git PREFERS credentials embedded in the remote URL, so
- * on exactly those apps the new credential helper would never fire and the
- * change would be a silent no-op where it matters most.
+ * `protocol.allow=never` + `protocol.https.allow=always`: the only transport
+ * is https. A test-only option opts a single extra protocol in
+ * (`allowFileProtocol`), so the production default is never weakened to suit
+ * the suite.
  *
- * Self-healing on the next redeploy rather than a migration script: the
- * offending value is per-repository and only reachable when we are already
- * running git in that directory. Best-effort — a repo we cannot rewrite must
- * still be pullable, so a failure here is not fatal.
+ * The `filter.lfs.*` overrides (with `GIT_LFS_SKIP_SMUDGE` in the env) keep
+ * a Git LFS filter installed on the host from downloading during checkout.
  */
-export async function stripRemoteUrlCredentials(repoPath: string): Promise<boolean> {
-  try {
-    const { stdout } = await execFileAsync(
-      'git',
-      [...repoArgs(repoPath), 'remote', 'get-url', 'origin'],
-      { cwd: repoPath, timeout: 15_000 }
-    );
-    const cleaned = stripUrlCredentials(stdout);
-    if (!cleaned) return false;
-    await execFileAsync(
-      'git',
-      [...repoArgs(repoPath), 'remote', 'set-url', 'origin', '--', cleaned],
-      { cwd: repoPath, timeout: 15_000 }
-    );
-    return true;
-  } catch {
-    return false;
+function hardeningArgs(allowFileProtocol: boolean): string[] {
+  return [
+    '-c',
+    'core.hooksPath=/dev/null',
+    '-c',
+    'protocol.allow=never',
+    '-c',
+    'protocol.https.allow=always',
+    ...(allowFileProtocol ? ['-c', 'protocol.file.allow=always'] : []),
+    '-c',
+    'filter.lfs.process=',
+    '-c',
+    'filter.lfs.smudge=',
+    '-c',
+    'filter.lfs.required=false',
+  ];
+}
+
+/**
+ * Variables that redirect git to other files or make it run a program. Only
+ * these are dropped from the inherited environment: `GIT_SSL_*`,
+ * `GIT_HTTP_*`, `GIT_CURL_VERBOSE` and `GIT_TRACE*` are how an operator
+ * configures TLS, proxies and diagnostics, and stay.
+ */
+const REDIRECTING_GIT_ENV = new Set([
+  'GIT_DIR',
+  'GIT_WORK_TREE',
+  'GIT_INDEX_FILE',
+  'GIT_OBJECT_DIRECTORY',
+  'GIT_ALTERNATE_OBJECT_DIRECTORIES',
+  'GIT_EXEC_PATH',
+  'GIT_ASKPASS',
+  'GIT_CEILING_DIRECTORIES',
+  'GIT_TEMPLATE_DIR',
+  'GIT_ALLOW_PROTOCOL',
+  'GIT_PROXY_COMMAND',
+]);
+
+function isRedirectingGitEnv(key: string): boolean {
+  const k = key.toUpperCase();
+  return REDIRECTING_GIT_ENV.has(k) || k.startsWith('GIT_CONFIG') || k.startsWith('GIT_SSH');
+}
+
+/**
+ * The environment for a git child: this process's, minus the redirecting or
+ * program-running `GIT_*` keys, plus what DROP sets itself.
+ */
+function gitChildEnv(token?: string): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {};
+  for (const [k, v] of Object.entries(process.env)) {
+    if (!isRedirectingGitEnv(k)) env[k] = v;
   }
+  env.GIT_TERMINAL_PROMPT = '0';
+  env.GIT_LFS_SKIP_SMUDGE = '1';
+  if (token) env.GIT_ASKPASS_TOKEN = token;
+  return env;
+}
+
+/**
+ * The one directory git may run in or write to: the platform-owned clone base
+ * (`data/temp/.git-clones`). Set once by the deploy service.
+ */
+let cloneBase: string | null = null;
+
+export function configureCloneBase(base: string): void {
+  cloneBase = path.resolve(base);
+}
+
+/** True when `p` is strictly inside the configured clone base. */
+function insideCloneBase(p: string): boolean {
+  if (!cloneBase) return false;
+  const rel = path.relative(cloneBase, path.resolve(p));
+  return rel !== '' && !rel.startsWith('..') && !path.isAbsolute(rel);
+}
+
+interface RunGitOptions {
+  args: string[];
+  cwd?: string;
+  token?: string;
+  timeoutMs?: number;
+}
+
+/**
+ * The ONLY place this module spawns git. A source-scan test pins that, so a
+ * future call cannot bypass the environment scrubbing above. It also refuses
+ * to run in, or point `--git-dir` at, anything outside the clone base: git is
+ * never to touch an app folder.
+ */
+async function runGit(options: RunGitOptions): Promise<{ stdout: string; stderr: string }> {
+  const { args, cwd, token, timeoutMs = 120_000 } = options;
+  if (cwd !== undefined && !insideCloneBase(cwd)) {
+    throw new Error('Refusing to run git outside the clone directory');
+  }
+  const gitDirAt = args.indexOf('--git-dir');
+  if (gitDirAt >= 0 && !insideCloneBase(args[gitDirAt + 1] ?? '')) {
+    throw new Error('Refusing to run git outside the clone directory');
+  }
+  return execFileAsync('git', args, {
+    ...(cwd ? { cwd } : {}),
+    timeout: timeoutMs,
+    env: gitChildEnv(token),
+    maxBuffer: 256 * 1024 * 1024,
+  });
 }
 
 /** Check if git CLI is available */
 export async function isGitAvailable(): Promise<boolean> {
   try {
-    await execFileAsync('git', ['--version']);
+    await runGit({ args: ['--version'], timeoutMs: 15_000 });
     return true;
   } catch {
     return false;
@@ -198,123 +275,117 @@ export async function isGitAvailable(): Promise<boolean> {
 /**
  * The argv `gitClone` hands to git.
  *
- * Separated out and exported so the security property can be asserted
- * DIRECTLY rather than inferred from a clone against a local remote — which
- * needs no credentials, so it exercises none of this and would pass either
- * way. The property: the token never appears in argv or in the URL.
- *
- * It used to. `git clone https://TOKEN@host/...` records that URL verbatim as
- * `remote.origin.url` in the new repo's `.git/config`, so every private-repo
- * app carried its PAT in cleartext inside its own directory — the served
- * document root for a static app, bind-mounted into the tenant's container
- * under docker isolation — PERMANENTLY. The pull path had the same leak only
- * for the duration of the pull; this one outlived the deploy.
+ * Separated out and exported so the security properties can be asserted
+ * DIRECTLY: the token never appears in argv or in the URL, and the credential
+ * helper args come AFTER every reset (a later `credential.helper=` would wipe
+ * the helper again and break every private-repo clone).
  */
 export function buildCloneArgs(options: GitCloneOptions): string[] {
-  const { url, dest, branch, token, shallow = true } = options;
-  const args = [...(token ? CREDENTIAL_HELPER_ARGS : []), 'clone'];
-
-  if (shallow) {
-    args.push('--depth', '1');
-  }
-
+  const { url, dest, branch, token, allowFileProtocol = false } = options;
   // `--` separates options from positional args so a crafted branch/url
   // can't be reinterpreted as a git flag.
-  args.push('--branch', branch, '--', url, dest);
-  return args;
+  return [
+    ...hardeningArgs(allowFileProtocol),
+    ...(token ? CREDENTIAL_HELPER_ARGS : []),
+    'clone',
+    '--depth',
+    '1',
+    '--branch',
+    branch,
+    '--single-branch',
+    '--no-recurse-submodules',
+    '--',
+    url,
+    dest,
+  ];
 }
 
-/** Clone a repository */
-export async function gitClone(options: GitCloneOptions): Promise<void> {
-  const { url, dest, branch, token, shallow = true } = options;
-
-  if (!isValidBranchName(branch)) {
-    throw new Error(`Invalid branch name: ${branch}`);
-  }
-
-  const args = buildCloneArgs({ url, dest, branch, token, shallow });
-
-  try {
-    await execFileAsync('git', args, {
-      timeout: 120_000,
-      ...(token ? { env: credentialEnv(token) } : {}),
-    });
-  } catch (err) {
-    const message = err instanceof Error ? sanitizeOutput(err.message) : 'Clone failed';
-    throw new Error(message);
-  }
+/** What a finished clone reports. Paths are repository-relative, `/`-separated. */
+export interface CloneInfo {
+  commitSha?: string;
+  /** Tracked regular files (mode 100644/100755). */
+  files: string[];
+  /** Tracked symbolic links (mode 120000): not recreated in the app folder. */
+  symlinks: string[];
 }
 
 /**
- * Pin git to EXACTLY this app's repository.
- *
- * With only `cwd`, git discovers a repository by walking UP the ancestor
- * chain, so an app directory whose `.git` has gone missing — an upload deploy
- * or a monorepo re-materialization racing a redeploy — resolves to whatever
- * repository exists above it. Measured: `rev-parse HEAD` in a non-repo
- * subdirectory returned the ANCESTOR's SHA and exited 0, which would then be
- * persisted as the app's `lastCommitSha`. With `--git-dir` git refuses:
- * `fatal: not a git repository`.
- *
- * A caller-side `fs.access('.git')` check cannot give this — it is a
- * precondition one call site remembers, not an invariant every call inherits
- * (CLAUDE.md: "security helpers have callers"). `--work-tree` is included for
- * the commands that touch files; measured that `pull` fast-forwards the
- * working tree correctly through it.
+ * A clone failure without the clone's own text: exit code plus sanitised stderr
+ * only. `err.message` would carry the whole argv (URL, absolute temp path).
  */
-function repoArgs(repoPath: string, withWorkTree = false): string[] {
-  const args = ['--git-dir', path.join(repoPath, '.git')];
-  if (withWorkTree) args.push('--work-tree', repoPath);
-  return args;
+function cloneFailure(err: unknown, dest: string): Error {
+  const e = err as { stderr?: unknown; code?: unknown; killed?: boolean };
+  const raw = typeof e.stderr === 'string' ? e.stderr : Buffer.isBuffer(e.stderr) ? e.stderr.toString() : '';
+  let text = sanitizeOutput(raw).split(dest).join('<clone>');
+  if (cloneBase) text = text.split(cloneBase).join('<temp>');
+  text = text.replace(/\s+/g, ' ').trim().slice(0, 400);
+  const code = typeof e.code === 'number' ? ` (exit ${e.code})` : '';
+  return new Error(`git clone failed${code}${e.killed ? ' (timed out)' : ''}${text ? `: ${text}` : ''}`);
 }
 
-/** Pull latest changes in a repository */
-export async function gitPull(repoPath: string, branch: string, token?: string): Promise<void> {
+/**
+ * Shallow-clone one branch into `dest` — an empty directory inside the clone
+ * base — and report the commit and what the repository tracks.
+ */
+export async function gitClone(options: GitCloneOptions): Promise<CloneInfo> {
+  const { url, dest, branch, token, allowFileProtocol } = options;
+
   if (!isValidBranchName(branch)) {
     throw new Error(`Invalid branch name: ${branch}`);
   }
-  // Before anything else, evict a PAT an older DROP baked into this repo's
-  // remote URL. Unconditional — a repo can carry the leftover credential even
-  // when this pull supplies no token — and it must run BEFORE the pull, since
-  // git prefers a URL-embedded credential over any helper.
-  await stripRemoteUrlCredentials(repoPath);
-  const pullArgs = [...repoArgs(repoPath, true), 'pull', 'origin', branch];
-  try {
-    if (token) {
-      // Never touch the remote URL with the token — see CREDENTIAL_HELPER_ARGS
-      // for the mechanism. The old `git remote set-url origin https://TOKEN@…`
-      // wrote the PAT in cleartext into <repoPath>/.git/config: the tenant's
-      // document root for a static app, bind-mounted into their container
-      // under docker isolation, and left there permanently if the process died
-      // before the `finally` restored the clean URL.
-      await execFileAsync('git', [...CREDENTIAL_HELPER_ARGS, ...pullArgs], {
-        cwd: repoPath,
-        timeout: 120_000,
-        env: credentialEnv(token),
-      });
-    } else {
-      await execFileAsync('git', pullArgs, { cwd: repoPath, timeout: 120_000 });
-    }
-  } catch (err) {
-    const message = err instanceof Error ? sanitizeOutput(err.message) : 'Pull failed';
-    throw new Error(message);
+  if (!insideCloneBase(dest)) {
+    throw new Error('Refusing to clone outside the clone directory');
   }
+
+  try {
+    await runGit({ args: buildCloneArgs({ url, dest, branch, token, allowFileProtocol }), token });
+  } catch (err) {
+    throw cloneFailure(err, dest);
+  }
+
+  let commitSha: string | undefined;
+  try {
+    commitSha = await readHead(dest);
+  } catch {
+    // non-fatal
+  }
+  const { files, symlinks } = await listTracked(dest);
+  return { commitSha, files, symlinks };
 }
 
-/** Get the HEAD commit SHA */
-export async function getCommitSha(repoPath: string): Promise<string> {
-  const { stdout } = await execFileAsync('git', [...repoArgs(repoPath), 'rev-parse', 'HEAD'], {
-    cwd: repoPath,
+/**
+ * HEAD of a clone DROP made itself. Pinned with `--git-dir` so a missing
+ * `.git` fails instead of walking up to an ancestor repository.
+ */
+async function readHead(clonePath: string): Promise<string> {
+  const { stdout } = await runGit({
+    args: ['--git-dir', path.join(clonePath, '.git'), ...hardeningArgs(false), 'rev-parse', 'HEAD'],
+    cwd: clonePath,
+    timeoutMs: 15_000,
   });
   return stdout.trim();
 }
 
-/** Get the current branch name */
-export async function getCurrentBranch(repoPath: string): Promise<string> {
-  const { stdout } = await execFileAsync(
-    'git',
-    [...repoArgs(repoPath), 'rev-parse', '--abbrev-ref', 'HEAD'],
-    { cwd: repoPath }
-  );
-  return stdout.trim();
+/**
+ * What the clone's index tracks, split into regular files and symlinks.
+ * `ls-files -s -z` entries look like `<mode> <sha> <stage>\t<path>`; gitlinks
+ * (submodules, mode 160000) are neither and are dropped.
+ */
+async function listTracked(clonePath: string): Promise<{ files: string[]; symlinks: string[] }> {
+  const { stdout } = await runGit({
+    args: ['--git-dir', path.join(clonePath, '.git'), ...hardeningArgs(false), 'ls-files', '-s', '-z'],
+    cwd: clonePath,
+    timeoutMs: 60_000,
+  });
+  const files: string[] = [];
+  const symlinks: string[] = [];
+  for (const entry of String(stdout).split('\0')) {
+    const tab = entry.indexOf('\t');
+    if (tab < 0) continue;
+    const mode = entry.slice(0, entry.indexOf(' '));
+    const rel = entry.slice(tab + 1);
+    if (mode === '120000') symlinks.push(rel);
+    else if (mode === '100644' || mode === '100755') files.push(rel);
+  }
+  return { files, symlinks };
 }

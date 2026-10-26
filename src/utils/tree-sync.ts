@@ -7,11 +7,18 @@
  * tricky parts (entry-kind flips, symlink-safe deletion, a preserve list)
  * rather than each getting them subtly wrong.
  *
- * Callers must guarantee `srcDir` contains no symlinks — both do, by
- * construction: `tar-extract` rejects an archive carrying any non-regular
- * entry, and `expandMonorepo` refuses a service whose subtree contains a link.
- * Links in the source are therefore skipped rather than reproduced, because
- * copying one would recreate the aliasing hole closed in PR #158.
+ * Two callers use it, and both guarantee `srcDir` contains no symlinks by
+ * construction: `tar-extract` rejects an archive carrying any non-regular entry
+ * (upload deploy), and `expandMonorepo` refuses a service whose subtree
+ * contains a link. Links in the source are therefore skipped rather than
+ * reproduced, because copying one would recreate the aliasing hole closed in
+ * PR #158. If a link ever does appear, it is also not allowed to vouch for a
+ * same-named destination entry in the prune: it counts as absent.
+ *
+ * Git deploys do NOT use this function. A repository may track symlinks, and a
+ * mirror-style prune would delete files the repository never tracked; they land
+ * through `core/git-deploy/land.ts`, which copies tracked files only and prunes
+ * from a saved file list.
  *
  * Callers must also guarantee `srcDir` carries no `.git` metadata from
  * untrusted input — enforced today by `extractTarball`'s `.git`-component
@@ -143,8 +150,14 @@ async function prune(srcDir: string, destDir: string, ctx: SyncContext): Promise
   // them as absent and the prune removes them. Skipping this would let a
   // source `dist/` — never copied — still vouch for a stale `dist/` in the
   // destination, and a static app would go on serving the old bundle.
+  // A source entry that is neither a file nor a directory (a symlink, which
+  // copyInto skipped) did not land, so it cannot vouch for what is there.
   const srcByName = new Map(
-    srcEntries.filter((e) => !isExcluded(path.join(srcDir, e.name), ctx)).map((e) => [e.name, e])
+    srcEntries
+      .filter(
+        (e) => !isExcluded(path.join(srcDir, e.name), ctx) && (e.isFile() || e.isDirectory())
+      )
+      .map((e) => [e.name, e])
   );
 
   for (const destEntry of destEntries) {

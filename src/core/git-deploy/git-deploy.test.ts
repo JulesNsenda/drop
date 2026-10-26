@@ -18,9 +18,19 @@ import * as diskUtils from '../../utils/disk';
 import * as breakerModule from '../../managers/guardrail/deploy-breaker';
 import { tryReserve, ownerOf, isReserved, resetDeployReservations } from '../deploy-reservations';
 import { eventBus } from '../event-bus';
+import { setPlatformOps, resetPlatformOps, AppInProgressError } from '../../api/platform-ops';
+import type { PlatformOps } from '../../api/platform-ops';
 // AppUpdatePayload isn't re-exported by ../event-bus (index.ts) - see the same
 // note in managers/deploy-tracker/deploy-tracker.ts.
 import type { AppDetectedPayload, AppUpdatePayload } from '../event-bus/event-bus.types';
+
+// What the mocked `git clone` puts in its destination: these files (and a
+// `.git/`, as a real clone has), and the same list from `ls-files`. A gate
+// lets a test hold a clone open to observe overlap.
+let mockCloneFiles: Record<string, string> = { 'index.html': '<h1>v1</h1>' };
+let mockCloneGate: Promise<void> | null = null;
+let mockCloneActive = 0;
+let mockCloneMaxActive = 0;
 
 // Mock execFile to avoid actual git operations
 jest.mock('child_process', () => ({
@@ -51,7 +61,29 @@ jest.mock('child_process', () => ({
     }
 
     if (sub[0] === 'clone') {
-      callback(null, { stdout: '', stderr: '' });
+      const dest = args[args.length - 1];
+      mockCloneActive++;
+      mockCloneMaxActive = Math.max(mockCloneMaxActive, mockCloneActive);
+      Promise.resolve(mockCloneGate).then(() => {
+        const nodeFs = require('fs');
+        const nodePath = require('path');
+        nodeFs.mkdirSync(nodePath.join(dest, '.git'), { recursive: true });
+        nodeFs.writeFileSync(nodePath.join(dest, '.git', 'config'), '[core]');
+        for (const [rel, content] of Object.entries(mockCloneFiles)) {
+          nodeFs.mkdirSync(nodePath.dirname(nodePath.join(dest, rel)), { recursive: true });
+          nodeFs.writeFileSync(nodePath.join(dest, rel), content);
+        }
+        mockCloneActive--;
+        callback(null, { stdout: '', stderr: '' });
+      });
+      return {} as any;
+    }
+
+    if (sub[0] === 'ls-files') {
+      const out = Object.keys(mockCloneFiles)
+        .map((rel) => '100644 abc123 0\t' + rel + '\0')
+        .join('');
+      callback(null, { stdout: out, stderr: '' });
       return {} as any;
     }
 
@@ -572,7 +604,7 @@ describe('GitDeployService', () => {
     }
 
     /**
-     * Make the next `git pull` fail, whatever else redeploy() runs around it.
+     * Make the next `git clone` fail, whatever else redeploy() runs around it.
      *
      * These tests used to call `mockImplementationOnce` on the premise that
      * "the pull is the first execFile call redeploy() makes". It is not, and
@@ -588,7 +620,7 @@ describe('GitDeployService', () => {
       const original = mock.getMockImplementation() as (...a: unknown[]) => unknown;
       let fired = false;
       mock.mockImplementation((cmd: string, args: string[], opts: unknown, cb?: Function) => {
-        if (!fired && Array.isArray(args) && args.includes('pull')) {
+        if (!fired && Array.isArray(args) && args.includes('clone')) {
           fired = true;
           mock.mockImplementation(original);
           const callback = cb || (typeof opts === 'function' ? opts : undefined);
@@ -661,23 +693,179 @@ describe('GitDeployService', () => {
       }
     });
 
-    it('rejects fast when .git is missing on disk, without attempting a pull (Fix 4)', async () => {
-      const appName = 'redeploy-no-git-app';
-      await service.deploy({ repoUrl: `https://github.com/user/${appName}`, branch: 'main' });
-      // Deliberately do NOT create .git — simulates an upload-deploy prune or
-      // a monorepo re-materialization that removed the real repository while
-      // gitSource stayed behind in state.
+    describe('landing tracked files (fresh clone per redeploy)', () => {
+      const appDir = (name: string): string => path.join(tempDir, 'webapps', name);
+      const exists = (p: string): Promise<boolean> =>
+        fs.lstat(p).then(
+          () => true,
+          () => false
+        );
 
-      const pullCallsBefore = (execFile as unknown as jest.Mock).mock.calls.filter(
-        (call) => call[1]?.[0] === 'pull' || call[1]?.includes('pull')
-      ).length;
+      beforeEach(() => {
+        mockCloneFiles = { 'index.html': '<h1>v1</h1>', 'src/app.js': 'v1' };
+        mockCloneGate = null;
+        mockCloneActive = 0;
+        mockCloneMaxActive = 0;
+      });
 
-      await expect(service.redeploy(appName)).rejects.toThrow(/has no git repository on disk/);
+      afterEach(() => {
+        resetPlatformOps();
+      });
 
-      const pullCallsAfter = (execFile as unknown as jest.Mock).mock.calls.filter(
-        (call) => call[1]?.[0] === 'pull' || call[1]?.includes('pull')
-      ).length;
-      expect(pullCallsAfter).toBe(pullCallsBefore);
+      it('clones the recorded URL into the clone base, runs nothing in the app folder, and removes the clone', async () => {
+        const appName = 'redeploy-fresh-clone';
+        await service.deploy({ repoUrl: `https://github.com/user/${appName}`, branch: 'main' });
+        (execFile as unknown as jest.Mock).mockClear();
+
+        await service.redeploy(appName);
+
+        const calls = (execFile as unknown as jest.Mock).mock.calls;
+        const clone = calls.find((c) => (c[1] as string[]).includes('clone'));
+        expect(clone).toBeDefined();
+        const args = clone![1] as string[];
+        expect(args.slice(-2)[0]).toBe(`https://github.com/user/${appName}`);
+        const dest = args[args.length - 1];
+        expect(dest.startsWith(path.join(tempDir, 'webapps'))).toBe(false);
+        expect(dest).toContain(path.join(tempDir, 'temp', '.git-clones'));
+        await expect(fs.access(dest)).rejects.toThrow();
+        for (const c of calls) {
+          const opts = c[2] as { cwd?: string } | undefined;
+          expect(opts?.cwd ?? '').not.toContain(path.join(tempDir, 'webapps'));
+          expect((c[1] as string[]).includes('pull')).toBe(false);
+        }
+        const env = (clone![2] as { env: NodeJS.ProcessEnv }).env;
+        expect(env.GIT_TERMINAL_PROMPT).toBe('0');
+      });
+
+      it('lands the tracked files but not the clone\'s .git', async () => {
+        const appName = 'land-files';
+        await service.deploy({ repoUrl: `https://github.com/user/${appName}`, branch: 'main' });
+
+        expect(await fs.readFile(path.join(appDir(appName), 'src', 'app.js'), 'utf-8')).toBe('v1');
+        expect(await exists(path.join(appDir(appName), '.git'))).toBe(false);
+      });
+
+      it('removes a leftover .git from the app folder on redeploy', async () => {
+        const appName = 'redeploy-removes-dotgit';
+        await service.deploy({ repoUrl: `https://github.com/user/${appName}`, branch: 'main' });
+        await makeGitDir(appName);
+
+        await service.redeploy(appName);
+
+        expect(await exists(path.join(appDir(appName), '.git'))).toBe(false);
+      });
+
+      it('leaves untracked files alone, and deletes upstream-removed files only because the saved list names them', async () => {
+        const appName = 'land-prune';
+        await service.deploy({ repoUrl: `https://github.com/user/${appName}`, branch: 'main' });
+        await fs.writeFile(path.join(appDir(appName), 'app-data.db'), 'state');
+
+        // Upstream drops src/app.js and adds a file.
+        mockCloneFiles = { 'index.html': '<h1>v2</h1>', 'new.txt': 'n' };
+        await service.redeploy(appName);
+
+        expect(await fs.readFile(path.join(appDir(appName), 'index.html'), 'utf-8')).toBe('<h1>v2</h1>');
+        expect(await exists(path.join(appDir(appName), 'src', 'app.js'))).toBe(false);
+        expect(await fs.readFile(path.join(appDir(appName), 'app-data.db'), 'utf-8')).toBe('state');
+      });
+
+      it('prunes nothing on the first redeploy of an app that has no saved list', async () => {
+        const appName = 'land-no-manifest';
+        await service.deploy({ repoUrl: `https://github.com/user/${appName}`, branch: 'main' });
+        await fs.rm(path.join(tempDir, 'drop-svc', 'git-manifests'), { recursive: true, force: true });
+
+        mockCloneFiles = { 'index.html': '<h1>v2</h1>' };
+        await service.redeploy(appName);
+
+        expect(await exists(path.join(appDir(appName), 'src', 'app.js'))).toBe(true);
+      });
+
+      it('refuses a repository over the entry cap, and leaves the app as it was', async () => {
+        const appName = 'land-capped';
+        await service.deploy({ repoUrl: `https://github.com/user/${appName}`, branch: 'main' });
+        const capped = new GitDeployService({
+          appsDirectory: path.join(tempDir, 'webapps'),
+          maxEntries: 1,
+        });
+        await capped.initialize();
+        mockCloneFiles = { 'a.txt': 'a', 'b.txt': 'b' };
+
+        await expect(capped.redeploy(appName)).rejects.toThrow(/maximum of 1 entries/);
+
+        expect(await fs.readFile(path.join(appDir(appName), 'index.html'), 'utf-8')).toBe('<h1>v1</h1>');
+      });
+
+      it('refuses a redeploy while the platform is building or deploying the app', async () => {
+        const appName = 'land-in-progress';
+        await service.deploy({ repoUrl: `https://github.com/user/${appName}`, branch: 'main' });
+        setPlatformOps({ isAppInProgress: () => true } as unknown as PlatformOps);
+        (execFile as unknown as jest.Mock).mockClear();
+
+        await expect(service.redeploy(appName)).rejects.toBeInstanceOf(AppInProgressError);
+
+        const cloned = (execFile as unknown as jest.Mock).mock.calls.some((c) =>
+          (c[1] as string[]).includes('clone')
+        );
+        expect(cloned).toBe(false);
+      });
+
+      it('serialises two redeploys of one app: their clone-and-land never overlap, and isCloning holds until the last ends', async () => {
+        const appName = 'land-serial';
+        await service.deploy({ repoUrl: `https://github.com/user/${appName}`, branch: 'main' });
+        mockCloneMaxActive = 0;
+        let release!: () => void;
+        mockCloneGate = new Promise<void>((r) => {
+          release = r;
+        });
+
+        const first = service.redeploy(appName);
+        const second = service.redeploy(appName);
+        // Both are admitted and waiting; the gate keeps the first clone open.
+        await new Promise((r) => setTimeout(r, 50));
+        expect(service.isCloning(appName)).toBe(true);
+        release();
+        mockCloneGate = null;
+        await Promise.all([first, second]);
+
+        expect(mockCloneMaxActive).toBe(1);
+        expect(service.isCloning(appName)).toBe(false);
+      });
+
+      it('sweeps leftovers from the clone base at initialize()', async () => {
+        const leftover = path.join(tempDir, 'temp', '.git-clones', 'crashed-abc');
+        await fs.mkdir(leftover, { recursive: true });
+
+        await service.initialize();
+
+        expect(await exists(leftover)).toBe(false);
+      });
+
+      it('a clone error carries no argv or absolute temp path', async () => {
+        const appName = 'land-error-text';
+        await service.deploy({ repoUrl: `https://github.com/user/${appName}`, branch: 'main' });
+        const mock = execFile as unknown as jest.Mock;
+        const original = mock.getMockImplementation() as (...a: unknown[]) => unknown;
+        mock.mockImplementation((cmd: string, args: string[], opts: unknown, cb?: Function) => {
+          if (Array.isArray(args) && args.includes('clone')) {
+            mock.mockImplementation(original);
+            const callback = (cb || opts) as (e: Error) => void;
+            callback(
+              Object.assign(new Error('Command failed: git clone ' + args.join(' ')), {
+                code: 128,
+                stderr: 'fatal: could not read from remote repository',
+              })
+            );
+            return {} as unknown;
+          }
+          return original(cmd, args, opts, cb);
+        });
+
+        const err = await service.redeploy(appName).catch((e: Error) => e);
+
+        expect((err as Error).message).toContain('exit 128');
+        expect((err as Error).message).not.toContain('--depth');
+        expect((err as Error).message).not.toContain(tempDir);
+      });
     });
 
     describe('token attach (DROP-142)', () => {

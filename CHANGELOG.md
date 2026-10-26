@@ -27,6 +27,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- Hardened how git-deployed apps are updated: a redeploy now downloads a fresh shallow copy into a private platform folder and copies the repository's files into the app, instead of running git inside the app's own folder. The copy is size- and entry-limited like an upload, refuses to write through links, and records which files it wrote so it only ever deletes those.
+
+### Upgrading
+
+- Git-deployed apps no longer have a `.git` folder in their app directory (an existing one is removed on the first redeploy). Builds that read git metadata, such as `git describe`, can use the `DROP_GIT_COMMIT` environment variable, which holds the deployed commit.
+- A redeploy removes files that were deleted upstream, but only ones DROP itself copied from the repository. Files an app wrote into its own folder are left alone; use `DROP_DATA_DIR` for state. The first redeploy after upgrading removes nothing.
+- Every redeploy re-downloads a shallow clone of the branch.
+- Symbolic links tracked in a repository are not recreated in the app folder (a warning names them).
+- A git redeploy is refused (409) while the app is building or deploying.
+
 ## [1.7.1] - 2026-10-26
 
 A security release. Ownership of apps and monorepo groups is enforced more strictly; read the Upgrading notes before taking it if other accounts deploy to your server.

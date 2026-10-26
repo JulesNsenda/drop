@@ -1973,6 +1973,11 @@ backup:
     // Initialize git deploy service
     this.gitDeployService = getGitDeployService({
       appsDirectory: this.config.appsDirectory,
+      tempDirectory: path.join(this.config.dropRoot, 'data', 'temp'),
+      manifestDirectory: path.join(this.config.dropRoot, 'data', 'drop-svc', 'git-manifests'),
+      // The same caps an upload is held to.
+      maxUnpackedBytes: this.config.maxUploadUnpackedMb * 1024 * 1024,
+      maxEntries: 20_000,
     });
     await this.gitDeployService.initialize();
 
@@ -3761,9 +3766,14 @@ backup:
 
     const depEnvVars = await this.resolveDependencies(appPath, appName);
 
+    // The commit the clone was made at: the app folder holds no .git any more,
+    // so a build that stamps a version needs it from here.
+    const gitCommit = this.stateManager?.getApp(appName)?.gitSource?.lastCommitSha;
+
     return {
       ...this.coerceEnvRecord(config?.env),
       ...this.coerceEnvRecord(config?.build_env),
+      ...(gitCommit ? { DROP_GIT_COMMIT: gitCommit } : {}),
       ...depEnvVars,
     };
   }
@@ -9091,6 +9101,9 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       path.join(this.config.dropRoot, 'data', 'rollback', name),
       // Release directories (#298) are code too, and keyed on the freed name.
       path.join(this.config.dropRoot, 'data', 'releases', name),
+      // The saved list of files a git redeploy last landed: platform state
+      // keyed on the freed name, and it decides what the next one deletes.
+      path.join(this.config.dropRoot, 'data', 'drop-svc', 'git-manifests', `${name}.json`),
     ];
     for (const dir of targets) {
       try {
