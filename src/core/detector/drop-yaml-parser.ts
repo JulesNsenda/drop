@@ -431,6 +431,25 @@ export async function findDropYaml(appPath: string): Promise<string | null> {
 }
 
 /**
+ * Parse and validate drop.yaml TEXT the caller has already read — for a caller
+ * that must read the file itself (a size-capped, symlink-refusing read of a
+ * tenant-writable tree). Throws on a YAML syntax error, like the file form.
+ */
+export function parseDropYamlContent(
+  content: string,
+  appPath: string
+): { config: DropYamlConfig } | { error: string } {
+  const parsed = yaml.parse(content) as DropYamlConfig;
+
+  // Validate the parsed config (pass appPath for TLS path containment)
+  const validationResult = validateDropYamlConfig(parsed, appPath);
+  if (!validationResult.valid) {
+    return { error: validationResult.error ?? 'invalid drop.yaml' };
+  }
+  return { config: parsed };
+}
+
+/**
  * Parse a drop.yaml file
  */
 export async function parseDropYaml(appPath: string): Promise<DropYamlParseResult> {
@@ -447,24 +466,20 @@ export async function parseDropYaml(appPath: string): Promise<DropYamlParseResul
 
   try {
     const content = await fs.readFile(yamlPath, 'utf-8');
-    const parsed = yaml.parse(content) as DropYamlConfig;
-
-    // Validate the parsed config (pass appPath for TLS path containment)
-    const validationResult = validateDropYamlConfig(parsed, appPath);
-    if (!validationResult.valid) {
-      const error = validationResult.error ?? 'invalid drop.yaml';
-      await warnParseFailure(appPath, yamlPath, error);
+    const result = parseDropYamlContent(content, appPath);
+    if ('error' in result) {
+      await warnParseFailure(appPath, yamlPath, result.error);
       return {
         config: null,
         success: false,
-        error,
+        error: result.error,
         path: yamlPath,
         exists: true,
       };
     }
 
     return {
-      config: parsed,
+      config: result.config,
       success: true,
       path: yamlPath,
       exists: true,

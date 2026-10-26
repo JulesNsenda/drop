@@ -250,7 +250,8 @@ export class WatcherService {
     appName: string,
     appPath: string,
     _hostname: string | null,
-    _port: number | null
+    _port: number | null,
+    initialScan = false
   ): void {
     if (this.knownApps.has(appName)) {
       return;
@@ -272,6 +273,9 @@ export class WatcherService {
       // monorepo child, and that refusal keys off this — an API-originated
       // detection for the same app must still be honoured.
       origin: 'watcher',
+      // Only the ready scan sets this: the folders already on disk when DROP
+      // started, as opposed to one that appeared while it ran.
+      ...(initialScan ? { initialScan: true } : {}),
     });
   }
 
@@ -411,7 +415,7 @@ export class WatcherService {
         }
         if (!this.knownApps.has(appName)) {
           const parsed = parsePath(dir, this.config.appsDir);
-          this.handleAppDetected(appName, dir, parsed.hostname, parsed.port);
+          this.handleAppDetected(appName, dir, parsed.hostname, parsed.port, true);
         }
       }
     }

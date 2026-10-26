@@ -357,6 +357,16 @@ export interface AppConfig {
   };
   sourceHash?: string;
   /**
+   * Fingerprint of the monorepo source a group child was last copied from
+   * (container name, service path, the child drop.yaml as rendered, and the
+   * service subtree as the copy sees it). Recorded by expandMonorepo only
+   * once the rebuilt child is running, and compared at boot to leave a
+   * current child alone. Only meaningful on
+   * a group child; deliberately NOT sourceHash, which covers the child's own
+   * built tree.
+   */
+  groupSourceHash?: string;
+  /**
    * SHA-256 fingerprint of the app's secret key/value set (sorted, hashed —
    * never the plaintext values) as of the last successful deploy. `PUT`/
    * `DELETE /api/v1/secrets/:name` has no restart hook, so the next start is
@@ -545,6 +555,9 @@ const SYSTEM_CONFIG_FIELDS = [
   'previousRelease',
   'runtimeSlot',
   'customDomainVerified',
+  // Decides whether boot leaves a monorepo child unbuilt — a tenant-writable
+  // value here would let a request body force or forge that skip.
+  'groupSourceHash',
 ] as const satisfies readonly (keyof AppConfig)[];
 
 type SystemConfigField = (typeof SYSTEM_CONFIG_FIELDS)[number];

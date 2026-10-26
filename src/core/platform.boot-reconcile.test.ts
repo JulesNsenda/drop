@@ -498,6 +498,84 @@ describe('DropPlatform boot reconciliation (M1) integration', () => {
     ).toBe(false);
   }, 30000);
 
+  async function monorepoContainerRestart(touchSource: boolean): Promise<void> {
+    // The ezsign outage: every restart re-copied and rebuilt every child, and a
+    // static child serves nothing while it rebuilds. Container and child are
+    // deployed for real here; the watcher is a no-op mock in this file, so the
+    // ready scan's detection is published by hand with the flags the real
+    // watcher's handleReady sets.
+    const repo = path.join(webappsDir, 'ezsign');
+    await fs.mkdir(path.join(repo, 'frontend'), { recursive: true });
+    await fs.writeFile(
+      path.join(repo, 'drop.yaml'),
+      'name: ezsign\nservices:\n  frontend:\n    path: frontend\n    type: static\n'
+    );
+    await fs.writeFile(path.join(repo, 'frontend', 'index.html'), '<h1>ezsign</h1>');
+
+    platform = makePlatform();
+    await platform.start();
+    // First expansion creates the child; a second one (an ordinary redeploy of
+    // a running child) is what records its copy fingerprint.
+    eventBus.publish('app:detected', { name: 'ezsign', path: repo, type: undefined });
+    await waitFor(() => getStateManager().getApp('ezsign-frontend')?.status === 'running');
+    await new Promise((r) => setTimeout(r, 300));
+    eventBus.publish('app:detected', { name: 'ezsign', path: repo, type: undefined });
+    await waitFor(() => getAppConfigService().getConfig('ezsign-frontend')?.groupSourceHash !== undefined);
+    await waitFor(() => getStateManager().getApp('ezsign-frontend')?.status === 'running');
+    await new Promise((r) => setTimeout(r, 500)); // let recordDeploySignature land
+    const startsBefore = fakeRuntime.startCount;
+    await crossPlatformRestart();
+    // The paired control: the same restart with the service source touched.
+    if (touchSource) {
+      await fs.writeFile(path.join(repo, 'frontend', 'index.html'), '<h1>ezsign v2 — edited</h1>');
+    }
+
+    const buildStarted: string[] = [];
+    const unsub = eventBus.subscribe('build:started', (p) => {
+      buildStarted.push(p.appId);
+    });
+
+    platform2 = makePlatform({ bootReconcileMode: 'on' });
+    const infoSpy = jest.spyOn(
+      (platform2 as unknown as { logger: { info: (...a: unknown[]) => void } }).logger,
+      'info'
+    );
+    await platform2.start();
+    eventBus.publish('app:detected', {
+      name: 'ezsign',
+      path: repo,
+      type: undefined,
+      origin: 'watcher',
+      initialScan: true,
+    });
+    const sawCurrent = () =>
+      infoSpy.mock.calls.some(
+        (c) => typeof c[0] === 'string' && c[0].includes("'ezsign-frontend' is current — not re-expanded")
+      );
+    if (touchSource) {
+      await waitFor(() => buildStarted.includes('ezsign-frontend'));
+      await waitFor(() => getStateManager().getApp('ezsign-frontend')?.status === 'running');
+      expect(sawCurrent()).toBe(false);
+    } else {
+      // A POSITIVE marker first: the expansion reached the child and left it
+      // alone. Only then are the negatives meaningful.
+      await waitFor(sawCurrent);
+      await new Promise((r) => setTimeout(r, 500));
+      expect(buildStarted).not.toContain('ezsign-frontend');
+      expect(fakeRuntime.startCount).toBe(startsBefore);
+      expect(getStateManager().getApp('ezsign-frontend')?.status).toBe('running');
+    }
+    unsub();
+  }
+
+  it('mode on, monorepo container restart: its current child gets no rebuild at all', async () => {
+    await monorepoContainerRestart(false);
+  }, 60000);
+
+  it('mode on, monorepo container restart with the service source touched: the child IS rebuilt (control)', async () => {
+    await monorepoContainerRestart(true);
+  }, 60000);
+
   it('mode on, unchanged signature: reconciles routing only — no build:started, no runtime.start, markAppKnown called', async () => {
     platform = makePlatform();
     await platform.start();

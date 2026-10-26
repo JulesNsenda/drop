@@ -110,6 +110,13 @@ export interface AppDetectedPayload extends BaseEvent {
    */
   origin?: 'upload' | 'watcher';
   /**
+   * Set by the watcher's ready scan only: the folder was already on disk when
+   * DROP started. Lets boot-time work that is only valid for that first sight
+   * (leaving a current monorepo child unbuilt) tell it from a folder that
+   * appeared later.
+   */
+  initialScan?: boolean;
+  /**
    * Who asked for this deploy, for guardrail keying — NOT for authorization,
    * which happened at the route or tool boundary before this was published.
    *

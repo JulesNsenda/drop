@@ -141,6 +141,8 @@ import { planSecretPreflight, generateSecretValue } from '../managers/secret/sec
 import { Logger, createLogger } from '../utils/logger';
 import { isPathWithin } from '../utils/paths';
 import { syncTree, DEFAULT_PRESERVE } from '../utils/tree-sync';
+import { readTenantFile } from '../utils/tenant-file';
+import { parseDropYamlContent } from './detector/drop-yaml-parser';
 import {
   validateDomain,
   validateDomainFormat,
@@ -485,6 +487,26 @@ const BOOT_RECONCILE_SCAN_TIMEOUT_MS = 5_000;
  */
 const BOOT_RECONCILE_CONCURRENCY = 4;
 
+/** Cap on reading a materialized monorepo child's own drop.yaml (see readChildDropYaml). */
+const MAX_CHILD_DROP_YAML_BYTES = 256 * 1024;
+
+/**
+ * Fingerprint of what a group child was materialized from: the container, the
+ * service path, the child drop.yaml exactly as rendered, and the service
+ * subtree as the copy sees it (`treeHash`).
+ */
+function groupSourceFingerprint(
+  repoName: string,
+  servicePath: string,
+  renderedChildYaml: string,
+  treeHash: string
+): string {
+  return crypto
+    .createHash('sha256')
+    .update(JSON.stringify([repoName, servicePath, renderedChildYaml, treeHash]))
+    .digest('hex');
+}
+
 /**
  * A source-tree scan result (M1 review item 2, round-2 diff pass): a SHA-256
  * hash over the sorted (relativePath, mtimeMs, size) tuple of every file/dir
@@ -536,11 +558,10 @@ export interface CheapBootReconcileInput {
   portDrifted: boolean;
   /**
    * Monorepo group tag (AppConfig.group), or undefined for a standalone app.
-   * A grouped app's container is never seeded (it has no AppConfig of its
-   * own — see the plan's monorepo limitation) and so still fires its own
-   * app:detected on boot, which unconditionally re-copies and rebuilds every
-   * child via expandMonorepo — a routing-only skip here would be clobbered
-   * moments later. Never skip a grouped app.
+   * A grouped app is never skipped on this gate: the container's own
+   * app:detected re-copies and rebuilds its children via expandMonorepo.
+   * The one exception passes `undefined` on purpose; see
+   * decideOneAppOnBoot's `ignoreGroup`.
    */
   group: string | undefined;
   /**
@@ -728,7 +749,8 @@ export function decideBootReconciliationSignature(
  * app serving old code with no error and nothing to notice, which is worse
  * than today's rebuild-everything behaviour. Every ambiguous case therefore
  * redeploys; 'skip' is returned only for the single narrow case of a known,
- * non-grouped, unscoped app under a current runtime spec that the runtime
+ * unscoped app (not grouped, unless the caller bypasses the group gate —
+ * see CheapBootReconcileInput.group) under a current runtime spec that the runtime
  * reports running right now, with a port to reconcile, an unchanged source
  * signature, and an unchanged secret set.
  */
@@ -824,6 +846,18 @@ export class DropPlatform {
   // reachable for the exact case it exists for. Cleared after boot
   // reconciliation runs so it can't leak into a later start() on this instance.
   private bootStatusSnapshot: Map<string, AppStatus> | null = null;
+  // THE BOOT-SKIP RULE (monorepo children). A group child that boot reconcile
+  // found running, current and routed may be left unbuilt by its container's
+  // expansion, and only when ALL of these hold: reconcile ran in mode 'on' and
+  // put the child here; the expansion is the watcher's ready scan of the
+  // container (origin 'watcher' AND initialScan); the child's recorded
+  // groupSourceHash matches what this source and generator would produce now;
+  // and its on-disk drop.yaml is byte-identical to the rendered one. Anything
+  // else takes the full copy-and-rebuild path. Reconcile never builds a child
+  // itself. Filled by reconcileAppsOnBoot, cleared at the start of the next
+  // reconcile and in stop(), and consumed by expandMonorepo the moment a child
+  // passes its collision/ownership guards — a verdict is read at most once.
+  private readonly bootCurrentChildren = new Set<string>();
   // Set once the one-shot toolchain backfill has run (now or on an earlier
   // boot). Until then a build has no toolchain id, so it neither parks nor
   // stamps: an unmarked tree must not be read as "built by another Node".
@@ -1189,6 +1223,8 @@ export class DropPlatform {
       this.buildDrainTimer = null;
     }
     this.pendingBuilds.clear();
+    // A boot verdict belongs to the boot that made it.
+    this.bootCurrentChildren.clear();
 
     if (this.diskSweepTimer) {
       clearInterval(this.diskSweepTimer);
@@ -2266,7 +2302,15 @@ backup:
    * apart from "tree too big to scan" — both still redeploy either way, but
    * only one of them is actionable by an operator reading the boot log.
    */
-  private async computeSourceMtimeMs(appPath: string): Promise<SourceSignature> {
+  private async computeSourceMtimeMs(
+    appPath: string,
+    // Which entries the walk leaves out, given the entry's name and its path
+    // relative to appPath. Defaults to the boot-reconcile list; the monorepo
+    // group hash passes the COPY's own exclusion instead, so it covers exactly
+    // what the copy lands.
+    ignore: (name: string, relative: string) => boolean = (name) =>
+      BOOT_RECONCILE_IGNORE_DIRS.has(name)
+  ): Promise<SourceSignature> {
     const deadline = Date.now() + BOOT_RECONCILE_SCAN_TIMEOUT_MS;
     let entriesVisited = 0;
 
@@ -2292,16 +2336,16 @@ backup:
 
       const dirEntries = await fs.readdir(dir, { withFileTypes: true });
       for (const entry of dirEntries) {
-        if (BOOT_RECONCILE_IGNORE_DIRS.has(entry.name)) continue;
+        const full = path.join(dir, entry.name);
+        const relative = path.relative(appPath, full);
+        if (ignore(entry.name, relative)) continue;
 
         entriesVisited++;
         if (entriesVisited > BOOT_RECONCILE_SCAN_MAX_ENTRIES) {
           throw new Error(`boot-reconcile scan exceeded entry cap (${BOOT_RECONCILE_SCAN_MAX_ENTRIES})`);
         }
 
-        const full = path.join(dir, entry.name);
         const stat = await fs.lstat(full);
-        const relative = path.relative(appPath, full);
         entries.push([relative, stat.mtimeMs, stat.size]);
         if (stat.mtimeMs > newestMtimeMs) {
           newestMtimeMs = stat.mtimeMs;
@@ -2445,6 +2489,7 @@ backup:
    */
   private async reconcileAppsOnBoot(): Promise<void> {
     const mode = this.config.bootReconcileMode;
+    this.bootCurrentChildren.clear();
     if (mode === 'off') {
       this.bootStatusSnapshot = null;
       return;
@@ -2454,7 +2499,17 @@ backup:
       return;
     }
 
-    const configs = this.appConfigService.getAllConfigs();
+    // A group CONTAINER is never a reconcile candidate, even when it has an
+    // AppConfig of its own (git and upload deploys of agent/ephemeral apps
+    // write one before detection knows it is a container). It has no process
+    // to skip, so it would only ever decide 'redeploy' and be published
+    // without an origin — which makes its expansion a deliberate redeploy
+    // rather than the watcher's ready scan. Left alone, the watcher detects it
+    // exactly as it does a folder-dropped container.
+    const stateManager = this.stateManager;
+    const configs = this.appConfigService
+      .getAllConfigs()
+      .filter((c) => !stateManager.getApp(c.name)?.isGroupContainer);
     if (configs.length === 0) {
       this.bootStatusSnapshot = null;
       return;
@@ -2500,7 +2555,8 @@ backup:
     const decisions = await this.mapWithConcurrency(
       configs,
       BOOT_RECONCILE_CONCURRENCY,
-      (config) => this.decideOneAppOnBoot(config, this.bootStatusSnapshot, runningByName)
+      (config) =>
+        this.decideOneAppOnBoot(config, this.bootStatusSnapshot, runningByName, mode === 'on')
     );
 
     // Batches the Caddy reload (M1 review item G): a skip's route is added
@@ -2513,7 +2569,11 @@ backup:
     for (const result of decisions) {
       const { config, appPath } = result;
 
-      if (result.kind === 'group') {
+      // See ignoreGroup and bootCurrentChildren: only a child's `skip` verdict
+      // is acted on; every other outcome for a child is routing-only.
+      const isSkip = result.kind === 'decided' && result.decision.action === 'skip';
+      const childRoutingOnly = result.kind === 'group' || (config.group && !isSkip);
+      if (childRoutingOnly) {
         // A group child's BUILD belongs to its container. Its ROUTING does not.
         //
         // Deferring both left a running child with no Caddy route whenever the
@@ -2541,7 +2601,8 @@ backup:
           anySkipped = true;
           this.logger.info(
             `Boot reconcile: group child '${config.name}' routing reconciled — ` +
-              `build left to its container`,
+              `build left to its container` +
+              (result.kind === 'decided' ? ` (${result.decision.action}: ${result.decision.reason})` : ''),
             'BOOT'
           );
         } else {
@@ -2602,6 +2663,8 @@ backup:
           // part of the item 1 readiness probe) — reused here instead of
           // re-parsing drop.yaml.
           this.armPostDeployWatches(config.name, port, healthCheckPath);
+          // Only now, once the child is routed and watched (see bootCurrentChildren).
+          if (config.group) this.bootCurrentChildren.add(config.name);
         } else {
           this.logger.info(`Boot reconcile: redeploying '${config.name}' — ${decision.reason}`, 'BOOT');
           // Publish, don't call handleBuildApp directly: this is the exact
@@ -2616,10 +2679,19 @@ backup:
         // Any unexpected failure anywhere above must not strand this app OR
         // abort reconciliation for the rest of the fleet — fail toward
         // redeploying it, the same doctrine as every other ambiguous case.
-        this.logger.warn(`Boot reconcile: '${config.name}' errored acting on decision, redeploying`, 'BOOT', error);
         this.watcher.markAppKnown(config.name);
-        if (!published) {
-          this.eventBus.publish('app:detected', { name: config.name, path: appPath, type: undefined });
+        if (config.group) {
+          // A child is never redeployed from here: its container builds it.
+          this.logger.warn(
+            `Boot reconcile: group child '${config.name}' errored acting on decision — left to its container`,
+            'BOOT',
+            error
+          );
+        } else {
+          this.logger.warn(`Boot reconcile: '${config.name}' errored acting on decision, redeploying`, 'BOOT', error);
+          if (!published) {
+            this.eventBus.publish('app:detected', { name: config.name, path: appPath, type: undefined });
+          }
         }
       }
     }
@@ -2670,7 +2742,15 @@ backup:
   private async decideOneAppOnBoot(
     config: AppConfig,
     bootStatusSnapshot: Map<string, AppStatus> | null,
-    runningByName: Map<string, AppProcessInfo>
+    runningByName: Map<string, AppProcessInfo>,
+    // 'on' mode only. A grouped child's BUILD is entirely its container's, so
+    // reconcile NEVER publishes a child in any mode. Without this flag
+    // (modes 'off' and 'observe') a child is not decided at all: no
+    // markAppKnown, no decision, no publish. With it the child IS decided like
+    // any app, but the act phase only uses a `skip` verdict (to route and
+    // watch it and let the container leave it unbuilt, see
+    // bootCurrentChildren); every other verdict is routing-only.
+    ignoreGroup = false
   ): Promise<
     | { kind: 'group'; config: AppConfig; appPath: string }
     | { kind: 'error'; config: AppConfig; appPath: string; reason: string; error: unknown }
@@ -2686,20 +2766,12 @@ backup:
     const appPath = config.path || path.join(this.config.appsDirectory, config.name);
 
     try {
-      // M1 review item 3 (round-2 diff pass): a grouped child's fate is
-      // entirely the monorepo CONTAINER's — expandMonorepo re-copies +
-      // rebuilds EVERY child as one atomic fs.rm+fs.cp+build whenever the
-      // container's own (unrelated, never-seeded) app:detected fires.
-      // Treating the child itself as a reconcile candidate — even to
-      // "redeploy" it — publishes the CHILD's own app:detected seconds-to-
-      // minutes before the container's detection ever fires, so a build is
-      // already in flight when expandMonorepo's fs.rm/fs.cp lands under it.
-      // NEVER touch a grouped app here: no markAppKnown, no decision, no
-      // publish, in EITHER mode — checked before anything else (including
-      // the 'stopped' status below) so a user-stopped grouped child gets
-      // the identical true no-op, not the leave+markAppKnown branch a
-      // stopped standalone app takes.
-      if (config.group) {
+      // M1 review item 3 (round-2 diff pass): see `ignoreGroup`. Checked before
+      // anything else (including the 'stopped' status below) so a user-stopped
+      // grouped child gets the identical true no-op. Publishing the CHILD's own
+      // app:detected would start a build before the container's detection, with
+      // one already in flight when expandMonorepo's sync lands under it.
+      if (config.group && !ignoreGroup) {
         return { kind: 'group', config, appPath };
       }
 
@@ -2747,7 +2819,8 @@ backup:
         isRuntimeRunning,
         hasPort: Boolean(config.port),
         portDrifted,
-        group: config.group,
+        // Bypassed together with the early return above (see ignoreGroup).
+        group: ignoreGroup ? undefined : config.group,
         grantedApiScopesCount: config.grantedApiScopes?.length ?? 0,
         runtimeSpecCurrent,
         // Only read for an app the cheap phase could still redeploy.
@@ -2792,10 +2865,33 @@ backup:
       // subset of it that never checked.
       let healthCheckPath: string | undefined;
       if (decision.action === 'skip') {
-        const dropYaml = await parseDropYaml(appPath);
-        healthCheckPath = dropYaml.success ? dropYaml.config?.healthCheck : undefined;
-        const answers = await this.probeSkipReadiness(config.port as number, healthCheckPath);
-        if (!answers) {
+        let childYamlProblem: string | undefined;
+        if (config.group) {
+          // A child's folder is tenant-writable, so parseDropYaml (follows
+          // links, no size cap, blocks on a FIFO) is not used on it; any
+          // problem reading it means the child is not a skip candidate.
+          const read = await this.readChildDropYaml(appPath);
+          if (!read.ok) {
+            childYamlProblem = read.problem;
+          } else {
+            try {
+              const parsed = parseDropYamlContent(read.text, appPath);
+              if ('error' in parsed) childYamlProblem = 'invalid';
+              else healthCheckPath = parsed.config.healthCheck;
+            } catch {
+              childYamlProblem = 'unparseable';
+            }
+          }
+        } else {
+          const dropYaml = await parseDropYaml(appPath);
+          healthCheckPath = dropYaml.success ? dropYaml.config?.healthCheck : undefined;
+        }
+        if (childYamlProblem !== undefined) {
+          decision = {
+            action: 'redeploy',
+            reason: `group child drop.yaml unreadable (${childYamlProblem})`,
+          };
+        } else if (!(await this.probeSkipReadiness(config.port as number, healthCheckPath))) {
           decision = {
             action: 'redeploy',
             reason: 'skip candidate did not answer a readiness probe',
@@ -3626,7 +3722,10 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       const entries = await fs.readdir(dir, { withFileTypes: true });
       for (const entry of entries) {
         const full = path.join(dir, entry.name);
-        if (DropPlatform.MONOREPO_COPY_EXCLUDE_RE.test(full)) continue;
+        // Relative to the service root, as the copy tests it: an absolute path
+        // would match a `build`/`dist` segment in the repo's own location and
+        // make this scan skip everything.
+        if (DropPlatform.MONOREPO_COPY_EXCLUDE_RE.test(path.relative(srcDir, full))) continue;
         // readdir(withFileTypes) reports the entry's own type (lstat
         // semantics), so this sees the link itself, not its target — and
         // never follows it, so a link cycle can't spin this walk.
@@ -3672,6 +3771,83 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
   }
 
   /**
+   * The drop.yaml expandMonorepo writes into a materialized child. One
+   * renderer for both the write and the boot-time "is this copy current"
+   * comparison, so the two can never describe different files.
+   */
+  private renderChildConfig(
+    childName: string,
+    childType: DropYamlConfig['type'],
+    svc: NonNullable<DropYamlConfig['services']>[string],
+    group: string,
+    serviceNames: Set<string>
+  ): DropYamlConfig {
+    // Rewrite depends_on so a dependency naming a sibling service resolves
+    // to that sibling's real, group-qualified child app name. Dependencies
+    // on apps outside this group are left unchanged.
+    const dependsOn = svc.depends_on?.map(dep =>
+      serviceNames.has(dep.name) ? { ...dep, name: `${group}-${dep.name}` } : dep
+    );
+
+    // M3: `route` (services.<svc>.route) is now a top-level allowed key,
+    // so it is written into the child drop.yaml and applied by
+    // handleConfigureRoute as a same-origin Caddy path prefix (frontend at
+    // `/`, backend at `/api`).
+    return {
+      name: childName,
+      type: childType,
+      // `!== undefined`, not a truthy check: `database: false` is now an
+      // explicit opt-out (see appNeedsDatabase), and a truthy test drops
+      // it here — the child would silently fall back to inference and get
+      // a database its manifest declined. Same silent-drop class as the
+      // historically missing `userId`. The `redis` line below has always
+      // used `typeof … === 'boolean'` for exactly this reason.
+      ...(svc.database !== undefined ? { database: svc.database } : {}),
+      ...(typeof svc.redis === 'boolean' ? { redis: svc.redis } : {}),
+      ...(svc.domains && svc.domains.length > 0 ? { domains: svc.domains } : {}),
+      ...(svc.env ? { env: svc.env } : {}),
+      ...(svc.build_env ? { build_env: svc.build_env } : {}),
+      ...(svc.secrets ? { secrets: svc.secrets } : {}),
+      ...(svc.healthCheck ? { healthCheck: svc.healthCheck } : {}),
+      ...(svc.build ? { build: svc.build } : {}),
+      ...(svc.start ? { start: svc.start } : {}),
+      ...(svc.route ? { route: svc.route } : {}),
+      ...(dependsOn && dependsOn.length > 0 ? { depends_on: dependsOn } : {}),
+      // Explicit, so a service's `healthCheck` does not put the child on
+      // the zero-downtime default (#298 step 7): children are
+      // re-materialized from the group and keep stop/start for now.
+      deploy: { strategy: 'in-place' },
+    };
+  }
+
+  /** Whether `p` exists as a real directory — not a link, not a file. */
+  private async isPlainDirectory(p: string): Promise<boolean> {
+    return fs.lstat(p).then(
+      (st) => st.isDirectory(),
+      () => false
+    );
+  }
+
+  /**
+   * Read a materialized child's own drop.yaml, for the two places that
+   * compare against it (boot decide, expansion). The folder is tenant-writable
+   * under isolation 'none', so: the folder itself must be a plain directory,
+   * and the file goes through the tenant-file reader (no links, no FIFOs, size
+   * capped). `problem` names why it was refused.
+   */
+  private async readChildDropYaml(
+    dir: string
+  ): Promise<{ ok: true; text: string } | { ok: false; problem: string }> {
+    if (!(await this.isPlainDirectory(dir))) {
+      return { ok: false, problem: 'folder is not a plain directory' };
+    }
+    const read = await readTenantFile(dir, 'drop.yaml', MAX_CHILD_DROP_YAML_BYTES);
+    if (read.kind === 'absent') return { ok: false, problem: 'absent' };
+    if (read.kind !== 'ok') return { ok: false, problem: 'refused' };
+    return { ok: true, text: read.content.toString('utf-8') };
+  }
+
+  /**
    * Expand a monorepo container (a repo whose root drop.yaml declares a
    * `services:` map) into N ordinary top-level DROP apps — one per service.
    *
@@ -3692,7 +3868,9 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     repoName: string,
     config: DropYamlConfig,
     /** The caller whose redeploy triggered this, for guardrail keying. */
-    actor?: DeployActorInfo
+    actor?: DeployActorInfo,
+    /** True only for the watcher's ready scan at boot; see bootCurrentChildren. */
+    incidentalFirstSight = false
   ): Promise<void> {
     const group = (config.group || config.name || repoName).trim();
     const services = config.services ?? {};
@@ -3822,6 +4000,9 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           );
           continue;
         }
+        // Past the collision/ownership guards: consume this child's boot
+        // verdict now, so it is read at most once (see bootCurrentChildren).
+        const bootCurrent = this.bootCurrentChildren.delete(childName);
 
         const srcDir = path.join(repoPath, svc.path);
         try {
@@ -3854,6 +4035,20 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           continue;
         }
 
+        // The child folder must be a real directory when it exists. The sync,
+        // the drop.yaml write and every read below go THROUGH childPath, so a
+        // link there (a tenant can create one under isolation 'none') would
+        // redirect them to wherever it points. Nothing there yet is fine: a
+        // first-ever child is created below.
+        if ((await this.entryExists(childPath)) && !(await this.isPlainDirectory(childPath))) {
+          this.logger.warn(
+            `Skipping service '${svcName}': '${childPath}' is not a plain directory (a link or ` +
+              `a file); refusing to write through it`,
+            'MONOREPO'
+          );
+          continue;
+        }
+
         // A user-stopped child is skipped BEFORE anything is written. Both
         // downstream paths refuse to build one (`handleAppUpdate:4439`,
         // `buildSub`), but they refuse AFTER the copy would have landed —
@@ -3873,6 +4068,90 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         // above does for the container.
         this.watcher?.markAppKnown(childName);
 
+        // Tree half of the child's fingerprint, taken BEFORE the sync (a
+        // source edited mid-copy must read as changed next time, not as
+        // recorded). Placed after every guard above, so a refused child is
+        // never fingerprinted or skipped. The walk uses the copy's own
+        // exclusion (not boot reconcile's ignore list): `vendor/`, `.next/`
+        // and the like are copied, so they count. Any failure to compute it
+        // means "differs" — never a false "current". Only taken when its
+        // result can be used: to record after a rebuild (autoBuild), or to
+        // compare for a boot skip.
+        let treeHash: string | undefined;
+        if (
+          childState !== undefined &&
+          (this.config.autoBuild ||
+            (incidentalFirstSight && bootCurrent && existing?.groupSourceHash !== undefined))
+        ) {
+          try {
+            treeHash = (
+              await this.computeSourceMtimeMs(srcDir, (_name, relative) =>
+                DropPlatform.MONOREPO_COPY_EXCLUDE_RE.test(relative)
+              )
+            ).hash;
+          } catch (scanError) {
+            this.logger.warn(
+              `Cannot fingerprint '${childName}' (${
+                scanError instanceof Error ? scanError.message : String(scanError)
+              }); it will be re-copied and rebuilt every time until the service tree is smaller`,
+              'MONOREPO'
+            );
+          }
+        }
+
+        // The boot skip itself (rule: see bootCurrentChildren). The fingerprint
+        // covers the rendered child drop.yaml, so a generator change after an
+        // upgrade or an edited root drop.yaml reads as changed.
+        let childCurrent = false;
+        if (
+          incidentalFirstSight &&
+          bootCurrent &&
+          childState !== undefined &&
+          treeHash !== undefined &&
+          existing?.groupSourceHash !== undefined
+        ) {
+          const rendered = yaml.stringify(
+            this.renderChildConfig(
+              childName,
+              (svc.type ?? existing.type ?? 'static') as DropYamlConfig['type'],
+              svc,
+              group,
+              serviceNames
+            )
+          );
+          const onDisk = await this.readChildDropYaml(childPath);
+          childCurrent =
+            onDisk.ok &&
+            onDisk.text === rendered &&
+            groupSourceFingerprint(repoName, svc.path, rendered, treeHash) ===
+              existing.groupSourceHash;
+        }
+        if (childCurrent) {
+          this.logger.info(`Boot: '${childName}' is current — not re-expanded`, 'MONOREPO');
+        } else if (existing?.groupSourceHash !== undefined && this.appConfigService) {
+          // About to rewrite the child: whatever was recorded describes a copy
+          // that is no longer there, and must not survive a sync or build that
+          // fails. Re-recorded below only once the rebuilt child is running.
+          // If the clear itself fails the child is left entirely alone this
+          // round: rewriting it while its old fingerprint stands would let a
+          // failed rebuild be called current by the next boot.
+          try {
+            await this.appConfigService.upsertSystemConfig(childName, {
+              groupSourceHash: undefined,
+            });
+          } catch (clearError) {
+            this.logger.warn(
+              `Could not clear the source fingerprint for '${childName}'; leaving it untouched` +
+                (incidentalFirstSight
+                  ? ''
+                  : ` — this redeploy did NOT update or rebuild '${childName}'`),
+              'MONOREPO',
+              clearError
+            );
+            continue;
+          }
+        }
+
         // Materialize IN PLACE (idempotent). This used to be
         // `fs.rm(childPath)` + `fs.cp`, which deleted a RUNNING child's whole
         // tree — build output and installed dependencies included — and left
@@ -3890,10 +4169,12 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         // rebuild — `StaticBuildStrategy.preBuild` treats a surviving
         // `dist/index.html` as "already built" and skips the build entirely,
         // which is the trap that got v2 of this change rejected.
-        await syncTree(srcDir, childPath, {
-          exclude: DropPlatform.MONOREPO_COPY_EXCLUDE_RE,
-          preserve: DEFAULT_PRESERVE,
-        });
+        if (!childCurrent) {
+          await syncTree(srcDir, childPath, {
+            exclude: DropPlatform.MONOREPO_COPY_EXCLUDE_RE,
+            preserve: DEFAULT_PRESERVE,
+          });
+        }
 
         // Resolve type: honor an explicit override, else detect from the
         // freshly copied subtree (the real source — the generated child
@@ -3901,49 +4182,33 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         // the source subtree itself carries its own drop.yaml, it was copied
         // above and gets overwritten by the generated one next.
         let childType = svc.type;
+        // A current child was not copied, so there is no fresh subtree to
+        // detect from; keep the type it was last deployed with.
+        if (!childType && childCurrent) childType = existing?.type;
         if (!childType && this.detector) {
           const det = await this.detector.detect(childPath, { silent: true });
           childType = det.type;
         }
         childType = childType || 'static';
 
-        // Rewrite depends_on so a dependency naming a sibling service resolves
-        // to that sibling's real, group-qualified child app name. Dependencies
-        // on apps outside this group are left unchanged.
-        const dependsOn = svc.depends_on?.map(dep =>
-          serviceNames.has(dep.name) ? { ...dep, name: `${group}-${dep.name}` } : dep
+        const childYaml = yaml.stringify(
+          this.renderChildConfig(
+            childName,
+            childType as DropYamlConfig['type'],
+            svc,
+            group,
+            serviceNames
+          )
         );
-
-        // M3: `route` (services.<svc>.route) is now a top-level allowed key,
-        // so it is written into the child drop.yaml and applied by
-        // handleConfigureRoute as a same-origin Caddy path prefix (frontend at
-        // `/`, backend at `/api`).
-        const childConfig: DropYamlConfig = {
-          name: childName,
-          type: childType,
-          // `!== undefined`, not a truthy check: `database: false` is now an
-          // explicit opt-out (see appNeedsDatabase), and a truthy test drops
-          // it here — the child would silently fall back to inference and get
-          // a database its manifest declined. Same silent-drop class as the
-          // historically missing `userId`. The `redis` line below has always
-          // used `typeof … === 'boolean'` for exactly this reason.
-          ...(svc.database !== undefined ? { database: svc.database } : {}),
-          ...(typeof svc.redis === 'boolean' ? { redis: svc.redis } : {}),
-          ...(svc.domains && svc.domains.length > 0 ? { domains: svc.domains } : {}),
-          ...(svc.env ? { env: svc.env } : {}),
-          ...(svc.build_env ? { build_env: svc.build_env } : {}),
-          ...(svc.secrets ? { secrets: svc.secrets } : {}),
-          ...(svc.healthCheck ? { healthCheck: svc.healthCheck } : {}),
-          ...(svc.build ? { build: svc.build } : {}),
-          ...(svc.start ? { start: svc.start } : {}),
-          ...(svc.route ? { route: svc.route } : {}),
-          ...(dependsOn && dependsOn.length > 0 ? { depends_on: dependsOn } : {}),
-          // Explicit, so a service's `healthCheck` does not put the child on
-          // the zero-downtime default (#298 step 7): children are
-          // re-materialized from the group and keep stop/start for now.
-          deploy: { strategy: 'in-place' },
-        };
-        await fs.writeFile(path.join(childPath, 'drop.yaml'), yaml.stringify(childConfig));
+        // What a boot may later compare against: recorded only after this
+        // child has been rebuilt and is running again (see below).
+        const groupSourceHash =
+          treeHash !== undefined
+            ? groupSourceFingerprint(repoName, svc.path, childYaml, treeHash)
+            : undefined;
+        if (!childCurrent) {
+          await fs.writeFile(path.join(childPath, 'drop.yaml'), childYaml);
+        }
 
         // Same narrowing cast the normal onboarding path (detectedSub) and
         // handleBuildApp already use: the detector's AppType is wider than
@@ -4001,7 +4266,8 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         // flags oversized groups — but a NEW child deferred there is re-queued
         // by drainPendingBuilds. An EXISTING child goes through handleAppUpdate,
         // whose build waits for a builder slot instead of being refused.
-        if (this.config.autoBuild) {
+        // A current child (boot skip above) is already running its build.
+        if (this.config.autoBuild && !childCurrent) {
           // Children inherit the container's actor. Left undefined they would
           // each key as automation on their OWN name, so a loop that varies
           // service names would accumulate nowhere.
@@ -4038,13 +4304,34 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
               'MONOREPO'
             );
           } else if (childState) {
-            await this.handleAppUpdate(
+            const rebuilt = await this.handleAppUpdate(
               childName,
               childPath,
               'monorepo re-expansion',
               true,
               actor
             );
+            // Record only for a child whose new build is serving (handleAppUpdate's
+            // return; the status check is a second opinion). A first-ever child
+            // is recorded by the next boot's rebuild. A failure to record just
+            // costs one more rebuild.
+            const after = this.stateManager?.getApp(childName);
+            if (
+              groupSourceHash !== undefined &&
+              rebuilt &&
+              after?.status === 'running' &&
+              !after.error
+            ) {
+              try {
+                await this.appConfigService?.upsertSystemConfig(childName, { groupSourceHash });
+              } catch (recordError) {
+                this.logger.warn(
+                  `Could not record the source fingerprint for '${childName}'`,
+                  'MONOREPO',
+                  recordError
+                );
+              }
+            }
           } else {
             await this.handleBuildApp(childPath, childName, childType, actor);
           }
@@ -4110,7 +4397,14 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       // finally-guaranteed release — a stuck entry would wedge the app.
       this.appsInProgress.add(payload.name);
       try {
-        await this.expandMonorepo(payload.path, payload.name, rootYaml.config, payload);
+        // Incidental first sight only: see bootCurrentChildren.
+        await this.expandMonorepo(
+          payload.path,
+          payload.name,
+          rootYaml.config,
+          payload,
+          payload.origin === 'watcher' && payload.initialScan === true
+        );
       } finally {
         this.appsInProgress.delete(payload.name);
       }
@@ -6148,6 +6442,12 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
   /**
    * Handle app update events (file changes in existing apps)
    * Stops the running process, rebuilds, and restarts on the same port
+   *
+   * @returns true only when the new build is serving (a hot-reload or a
+   * successful cutover); false for every refusal, early return, held build and
+   * failure — a failed rebuild also restores 'running' with an error, and the
+   * early returns leave the app 'running' with none, so status alone cannot
+   * tell them apart.
    */
   private async handleAppUpdate(
     appName: string,
@@ -6155,8 +6455,8 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     reason: string,
     bypassCooldown?: boolean,
     actor?: DeployActorInfo
-  ): Promise<void> {
-    if (!this.runtime || !this.stateManager || !this.detector || !this.builder) return;
+  ): Promise<boolean> {
+    if (!this.runtime || !this.stateManager || !this.detector || !this.builder) return false;
 
     // A backup is taking a snapshot (P2-5b). Deferring rather than dropping:
     // the watcher re-arms once the lock clears, and an API/webhook caller has
@@ -6167,14 +6467,14 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         `Deferring update for ${appName} — deploys are quiesced for a backup`,
         'BACKUP'
       );
-      return;
+      return false;
     }
 
     // Skip apps currently being cloned by git deploy
-    if (this.gitDeployService?.isCloning(appName)) return;
+    if (this.gitDeployService?.isCloning(appName)) return false;
 
     // Skip apps currently being uploaded (PRD-039)
-    if (this.uploadDeployService?.isUploading(appName)) return;
+    if (this.uploadDeployService?.isUploading(appName)) return false;
 
     // Skip if already processing this app (e.g., during initial deployment).
     // An explicit redeploy that's dropped here is logged at info - the API/
@@ -6186,7 +6486,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       } else {
         this.logger.debug(`Skipping update for ${appName} - already in progress`, 'UPDATE');
       }
-      return;
+      return false;
     }
 
     // A monorepo container (root drop.yaml has `services:`) is a group descriptor, never a buildable
@@ -6220,7 +6520,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           this.logger.warn(`Re-expansion of '${appName}' refused by guardrail: ${refusal}`, 'MONOREPO');
           this.releaseGuardrailKeys(appName);
           this.failDeployEpisode(appName, new Error(refusal), crypto.randomUUID(), 'GUARDRAIL_TRIPPED');
-          return;
+          return false;
         }
         this.breakerKeys.set(appName, containerKeys);
 
@@ -6244,7 +6544,8 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           'UPDATE'
         );
       }
-      return;
+      // A container is never itself built, so there is no build to report.
+      return false;
     }
 
     // The mirror of the container guard above, and deliberately AFTER it so the
@@ -6268,7 +6569,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         `Skipping incidental update for grouped child '${appName}' — its monorepo container owns rebuilds`,
         'MONOREPO'
       );
-      return;
+      return false;
     }
 
     // Skip if app was just deployed (adaptive cooldown to prevent loops), UNLESS
@@ -6282,7 +6583,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       const lastDeployTime = this.appDeployTimes.get(appName);
       if (lastDeployTime && Date.now() - lastDeployTime < this.getEffectiveCooldownMs(appName)) {
         this.logger.debug(`Skipping update for ${appName} - within cooldown period`, 'UPDATE');
-        return;
+        return false;
       }
     }
 
@@ -6291,7 +6592,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       // App not yet registered - this can happen during initial deployment
       // when file changes are detected before app:detected is fully processed
       this.logger.debug(`Skipping update for ${appName} - not yet registered`, 'UPDATE');
-      return;
+      return false;
     }
 
     // A user-stopped app must not be resurrected by a file-change hot-reload
@@ -6316,7 +6617,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       } else {
         this.logger.debug(`Skipping update for ${appName} - app was stopped by user`, 'UPDATE');
       }
-      return;
+      return false;
     }
 
     // Remember the current port and whether the app was running
@@ -6357,7 +6658,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       // Reported as a normal deploy failure so a caller polling for an outcome
       // gets an answer instead of waiting out its budget.
       this.failDeployEpisode(appName, new Error(refusal), crypto.randomUUID(), 'GUARDRAIL_TRIPPED');
-      return;
+      return false;
     }
     this.breakerKeys.set(appName, guardKeys);
 
@@ -6378,7 +6679,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       releaseSlot();
       this.releaseGuardrailKeys(appName);
       this.appsInProgress.delete(appName);
-      return;
+      return false;
     }
     // A git pull or upload that began while waiting publishes its own
     // app:update when it lands, and with appsInProgress cleared that runs.
@@ -6390,7 +6691,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       releaseSlot();
       this.releaseGuardrailKeys(appName);
       this.appsInProgress.delete(appName);
-      return;
+      return false;
     }
     // Removed, or stopped by the user since entry, while waiting. An explicit
     // redeploy of an app that was ALREADY stopped at entry (rebuildsStaleTree)
@@ -6404,7 +6705,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       releaseSlot();
       this.releaseGuardrailKeys(appName);
       this.appsInProgress.delete(appName);
-      return;
+      return false;
     }
 
     // Hot-reload — the app is currently RUNNING and serving traffic. Abort
@@ -6425,7 +6726,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       this.releaseGuardrailKeys(appName);
       this.appsInProgress.delete(appName);
       releaseSlot();
-      return;
+      return false;
     }
 
     try {
@@ -6530,7 +6831,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         await this.discardDeployTarget(appName);
         this.recordDeployOutcome(appName, false);
         this.appsInProgress.delete(appName);
-        return;
+        return false;
       }
 
       // Manual promotion holds HERE, before the stop. This is the branch SEC-9
@@ -6544,22 +6845,21 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         this.releaseGuardrailKeys(appName);
         await this.stateManager.setAppStatus(appName, appState.status);
         this.appsInProgress.delete(appName);
-        return;
+        return false;
       }
 
       // Zero-downtime cutover (#298) for an eligible app: the old instance
       // keeps serving until the new one has proved itself and traffic moved.
       // Returns false, having touched nothing, for anything it cannot cut over.
-      if (
-        await this.tryCutover(
-          appName,
-          buildPath,
-          detection,
-          buildResult.outputPath ?? undefined,
-          wasRunning
-        )
-      ) {
-        return;
+      const cutover = await this.tryCutover(
+        appName,
+        buildPath,
+        detection,
+        buildResult.outputPath ?? undefined,
+        wasRunning
+      );
+      if (cutover) {
+        return cutover === 'ok';
       }
 
       // Build succeeded — now stop the old version and swap in the new one.
@@ -6627,6 +6927,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       await this.commitServedPath(appName, buildPath);
       this.recordDeployOutcome(appName, true);
       this.appsInProgress.delete(appName);
+      return true;
     } catch (error) {
       releaseSlot();
       await this.discardDeployTarget(appName);
@@ -6653,7 +6954,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         // that was wrong — MAX_BUILDS aborts BEFORE the build.)
         this.recordDeployOutcome(appName, false);
         this.appsInProgress.delete(appName);
-        return;
+        return false;
       }
       this.logger.appEvent('error', appName, error instanceof Error ? error.message : 'Hot-reload failed');
       await this.stateManager.setAppStatus(appName, 'errored', {
@@ -6661,6 +6962,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       });
       this.recordDeployOutcome(appName, false);
       this.appsInProgress.delete(appName);
+      return false;
     }
   }
 
@@ -6772,9 +7074,9 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
    * Zero-downtime cutover (#298 step 5) for a redeploy that has just built a
    * new release. Returns FALSE, having touched nothing, when the deploy is not
    * eligible (see `cutoverEligibility`) — the caller then stops and starts as
-   * before. Returns TRUE when it handled the deploy, successfully or not; it
-   * then owns the app's status, the guardrail outcome and releasing
-   * `appsInProgress`.
+   * before. Otherwise it handled the deploy — 'ok' when traffic moved to the
+   * new release, 'failed' when it did not; it then owns the app's status, the
+   * guardrail outcome and releasing `appsInProgress`.
    */
   private async tryCutover(
     appName: string,
@@ -6782,7 +7084,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     detection: DetectionResult,
     outputPath: string | undefined,
     wasRunning: boolean
-  ): Promise<boolean> {
+  ): Promise<false | 'ok' | 'failed'> {
     if (!wasRunning) return false;
     const oldPort = await this.cutoverEligibility(appName, buildPath);
     if (oldPort === null) return false;
@@ -6791,11 +7093,11 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     if (!result.ok) {
       await this.discardDeployTarget(appName);
       await this.failCutover(appName, oldPort, result.error, result.healthCheckPath);
-      return true;
+      return 'failed';
     }
     this.recordDeployOutcome(appName, true);
     this.appsInProgress.delete(appName);
-    return true;
+    return 'ok';
   }
 
   /**
