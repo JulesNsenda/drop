@@ -47,7 +47,7 @@ export function createDeployCommand(): Command {
               repoUrl: options.git,
               branch: options.branch || 'main',
               name: options.name,
-            });
+            }, { admin: true, interactive: true }); // the local operator; the CLI cannot name a stored token
 
             spin.succeed(`Cloned ${result.repoUrl} (${result.branch})`);
             output.success(`${result.appName} deployed from GitHub!`);

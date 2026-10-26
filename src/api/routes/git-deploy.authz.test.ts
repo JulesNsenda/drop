@@ -101,7 +101,7 @@ describe('git redeploy route authorization', () => {
       headers: bearer(aliceToken),
     });
     expect(res.status).toBe(200);
-    expect(redeploy).toHaveBeenCalledWith('alice-app', expect.anything());
+    expect(redeploy).toHaveBeenCalledWith('alice-app', expect.anything(), expect.anything());
   });
 
   it("admin can redeploy any user's app", async () => {
@@ -110,7 +110,7 @@ describe('git redeploy route authorization', () => {
       headers: bearer(adminToken),
     });
     expect(res.status).toBe(200);
-    expect(redeploy).toHaveBeenCalledWith('alice-app', expect.anything());
+    expect(redeploy).toHaveBeenCalledWith('alice-app', expect.anything(), expect.anything());
   });
 
   it('nonexistent app returns 404, service not called', async () => {
@@ -137,7 +137,7 @@ describe('git redeploy route authorization', () => {
       headers: bearer(adminToken),
     });
     expect(res.status).toBe(200);
-    expect(redeploy).toHaveBeenCalledWith('legacy-app', expect.anything());
+    expect(redeploy).toHaveBeenCalledWith('legacy-app', expect.anything(), expect.anything());
   });
 
   describe('monorepo group child resolution', () => {
@@ -169,7 +169,7 @@ describe('git redeploy route authorization', () => {
       });
       expect(res.status).toBe(200);
       // Resolved to the container, not the child (child has no gitSource).
-      expect(redeploy).toHaveBeenCalledWith('grp-repo', expect.anything());
+      expect(redeploy).toHaveBeenCalledWith('grp-repo', expect.anything(), expect.anything());
     });
 
     it('admin redeploying a group child resolves to the container', async () => {
@@ -178,7 +178,7 @@ describe('git redeploy route authorization', () => {
         headers: bearer(adminToken),
       });
       expect(res.status).toBe(200);
-      expect(redeploy).toHaveBeenCalledWith('grp-repo', expect.anything());
+      expect(redeploy).toHaveBeenCalledWith('grp-repo', expect.anything(), expect.anything());
     });
 
     it("crafted group collision cannot redeploy another tenant's container (IDOR)", async () => {
@@ -210,7 +210,7 @@ describe('git redeploy route authorization', () => {
         headers: bearer(aliceToken),
       });
       expect(res.status).toBe(200);
-      expect(redeploy).toHaveBeenCalledWith('alice-app', expect.objectContaining({ tokenId: undefined }));
+      expect(redeploy).toHaveBeenCalledWith('alice-app', expect.objectContaining({ tokenId: undefined }), expect.anything());
     });
 
     it('a tokenId in the body is forwarded to the resolved app', async () => {
@@ -220,7 +220,7 @@ describe('git redeploy route authorization', () => {
         body: JSON.stringify({ tokenId: 'git_abc123' }),
       });
       expect(res.status).toBe(200);
-      expect(redeploy).toHaveBeenCalledWith('alice-app', expect.objectContaining({ tokenId: 'git_abc123' }));
+      expect(redeploy).toHaveBeenCalledWith('alice-app', expect.objectContaining({ tokenId: 'git_abc123' }), expect.anything());
     });
 
     it('tokenId: null is forwarded as-is to clear the stored token', async () => {
@@ -230,7 +230,7 @@ describe('git redeploy route authorization', () => {
         body: JSON.stringify({ tokenId: null }),
       });
       expect(res.status).toBe(200);
-      expect(redeploy).toHaveBeenCalledWith('alice-app', expect.objectContaining({ tokenId: null }));
+      expect(redeploy).toHaveBeenCalledWith('alice-app', expect.objectContaining({ tokenId: null }), expect.anything());
     });
 
     it('a malformed tokenId 400s and never reaches the service', async () => {
@@ -291,7 +291,8 @@ describe('git redeploy route authorization', () => {
       expect(res.status).toBe(200);
       expect(redeploy).toHaveBeenCalledWith(
         'alice-app',
-        expect.objectContaining({ tokenId: 'git_abc123', userId: aliceId })
+        expect.objectContaining({ tokenId: 'git_abc123', userId: aliceId }),
+        expect.anything()
       );
     });
 
@@ -322,7 +323,8 @@ describe('git redeploy route authorization', () => {
         expect(res.status).toBe(200);
         expect(redeploy).toHaveBeenCalledWith(
           'tok-grp-repo',
-          expect.objectContaining({ tokenId: 'git_abc123' })
+          expect.objectContaining({ tokenId: 'git_abc123' }),
+          expect.anything()
         );
       });
     });

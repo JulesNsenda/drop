@@ -26,7 +26,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 
 import { AuthContext, getUserById } from '../middleware/auth';
-import { canAccessScoped } from '../access';
+import { canAccessScoped, tokenCallerOf } from '../access';
 import { scopesAllowCreate } from '../agent-scopes';
 import { isValidAppName } from '../middleware/validate';
 import { getStateManager } from '../../managers/app/state-manager';
@@ -655,17 +655,25 @@ export async function handleDeployFromGit(
     }
   }
 
+  // The tool names no stored token, but the service takes a caller for any
+  // deploy; an absent identity with auth enabled is refused, not made admin.
+  const tokenCaller = tokenCallerOf(auth);
+  if (!tokenCaller) return toolError('Authentication required.');
+
   const acceptedAt = new Date().toISOString();
   try {
-    const result = await service.deploy({
-      repoUrl: args.url,
-      name: args.name,
-      branch: args.branch,
-      userId: auth?.userId,
-      principalId: auth?.principalId,
-      agentCaller: auth?.kind === 'agent',
-      callerIsAdmin: auth?.role === 'admin',
-    });
+    const result = await service.deploy(
+      {
+        repoUrl: args.url,
+        name: args.name,
+        branch: args.branch,
+        userId: auth?.userId,
+        principalId: auth?.principalId,
+        agentCaller: auth?.kind === 'agent',
+        callerIsAdmin: auth?.role === 'admin',
+      },
+      tokenCaller
+    );
     await auditToolAction(auth, 'agent-deploy', result.appName, 'deploy_from_git');
 
     return await waitForDeployOutcome(result.appName, acceptedAt, true);

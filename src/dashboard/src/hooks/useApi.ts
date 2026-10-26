@@ -339,6 +339,15 @@ export interface GitTokenInfo {
   id: string;
   name: string;
   createdAt: string;
+  /** Owning user id; only an admin's list carries it. Absent on a legacy token. */
+  ownerUserId?: string;
+  /** The owner's username (admin view); absent if the account no longer resolves. */
+  ownerName?: string;
+}
+
+/** How an admin sees a token in a picker or list: its owner, or "legacy" when it has none. */
+export function gitTokenOwnerLabel(t: GitTokenInfo): string {
+  return t.ownerUserId ? `owner ${t.ownerName ?? 'unknown user'}` : 'legacy';
 }
 
 export async function gitDeploy(request: {

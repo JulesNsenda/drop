@@ -15,6 +15,7 @@ import {
   GitDeployResult,
   GitSource,
   GitTokenInfo,
+  TokenCaller,
 } from './git-deploy.types';
 import {
   gitClone,
@@ -31,6 +32,8 @@ import { logActivityFor } from '../../managers/activity';
 import { getDeployTracker } from '../../managers/deploy-tracker';
 import { getPlatformOps, AppInProgressError } from '../../api/platform-ops';
 import { getStateManager } from '../../managers/app/state-manager';
+import type { AppState } from '../../managers/app/state-manager';
+import { isAdminPrincipalId, getUserById } from '../../api/middleware/auth';
 import { getAppConfigService, getAppConfigServiceOrNull } from '../../managers/app/app-config';
 import { getSecretManager } from '../../managers/secret';
 import { getLogger } from '../../utils/logger';
@@ -51,6 +54,35 @@ import {
 const logger = getLogger();
 
 const GIT_TOKEN_APP_NAME = '__drop_git_tokens';
+// token id -> owning user id, as ONE JSON map in the same encrypted secret
+// store as the tokens themselves (one file, one atomic write path, and a store
+// quarantined as corrupt loses tokens and owners together, so an owner can
+// never go missing while its token survives). One entry means one decrypt per
+// list call, however many tokens there are. A token with NO entry is a legacy
+// token that predates ownership: only an admin may list, delete or newly
+// attach it, until an admin assigns an owner. We do not guess owners from
+// apps. An app already attached to a legacy token keeps using it.
+const GIT_TOKEN_OWNER_APP_NAME = '__drop_git_token_owners';
+const GIT_TOKEN_OWNER_KEY = 'owners';
+
+/**
+ * Where a token is being resolved from. The two are different questions:
+ * CHOSEN is a caller selecting a token now (must own it, or be an admin);
+ * ATTACHED is an app using what it already has (no caller, but a credential
+ * does not follow an app across an ownership change).
+ */
+type TokenSource =
+  | { kind: 'chosen'; id: string; caller: TokenCaller | null; appOwnerId?: string }
+  | { kind: 'attached'; app: Pick<AppState, 'userId' | 'gitSource'> };
+
+interface ResolvedToken {
+  value: string;
+  /** Admin user id, when an admin chose a token owned by someone other than the app's owner. */
+  grantedBy?: string;
+  /** The app owner that grant is for. */
+  grantedFor?: string;
+}
+
 
 export interface GitDeployServiceConfig {
   appsDirectory: string;
@@ -78,6 +110,11 @@ export interface GitDeployServiceConfig {
    * queue. Platform only, for the same reason as `sweepCloneBase`.
    */
   resumeQueue?: boolean;
+  /**
+   * Where the credential store lives, for the admin lookup on an app's owner.
+   * One path for every lookup, so the attach rule and the boot audit agree.
+   */
+  credentialsPath?: string;
 }
 
 const DEFAULT_MAX_GIT_ENTRIES = 200_000;
@@ -128,6 +165,7 @@ function envDefaultCaps(): ReturnType<typeof gitCheckoutCaps> {
 export class GitDeployService {
   private readonly config: GitDeployServiceConfig;
   private gitAvailable = false;
+  private corruptOwnersLogged = false;
   /** Per-app count of clones/lands in flight; the watcher guard is "any". */
   private activeClones: Map<string, number> = new Map();
   /** Tail of each app's land chain: two lands for one app never overlap. */
@@ -302,7 +340,10 @@ export class GitDeployService {
       this.pending.delete(appName);
       await this.persistPending();
       try {
-        await this.redeploy(appName, actor);
+        // Queued redeploys are unattended: no caller, so only the app's
+        // already-attached token can be used (a token named in a persisted
+        // actor is refused like any chosen token without a caller).
+        await this.redeploy(appName, actor, null);
         logger.info(`Ran the queued redeploy of ${appName}`, 'GIT-DEPLOY');
       } catch (err) {
         if (err instanceof AppInProgressError) {
@@ -370,7 +411,7 @@ export class GitDeployService {
    * to land into one folder. A refusal reads as an existing app. Only this
    * call's own reservation is released.
    */
-  async deploy(request: GitDeployRequest): Promise<GitDeployResult> {
+  async deploy(request: GitDeployRequest, caller: TokenCaller): Promise<GitDeployResult> {
     if (!this.gitAvailable) {
       throw new Error('git CLI is not available on this system');
     }
@@ -378,7 +419,7 @@ export class GitDeployService {
     const principal = reservationPrincipal(request.userId, request.principalId);
     let reservedName: string | undefined;
     try {
-      return await this.deployReserved(request, (name) => {
+      return await this.deployReserved(request, caller, (name) => {
         if (!tryReserve(name, principal)) return false;
         reservedName = name;
         return true;
@@ -403,6 +444,7 @@ export class GitDeployService {
 
   private async deployReserved(
     request: GitDeployRequest,
+    caller: TokenCaller,
     reserve: (name: string) => boolean
   ): Promise<GitDeployResult> {
     const repoUrl = normalizeRepoUrl(request.repoUrl);
@@ -501,11 +543,22 @@ export class GitDeployService {
 
     // Resolve token if provided
     let token: string | undefined;
+    let tokenGrantedBy: string | undefined;
+    let tokenGrantedFor: string | undefined;
     if (request.tokenId) {
-      token = await this.getTokenValue(request.tokenId);
-      if (!token) {
+      // Same message for an unknown id and one the caller may not use.
+      const resolved = await this.resolveToken({
+        kind: 'chosen',
+        id: request.tokenId,
+        caller,
+        appOwnerId: request.userId,
+      });
+      if (!resolved) {
         throw new Error(`GitHub token '${request.tokenId}' not found`);
       }
+      token = resolved.value;
+      tokenGrantedBy = resolved.grantedBy;
+      tokenGrantedFor = resolved.grantedFor;
     }
 
     // Mark as cloning to prevent watcher from detecting mid-clone. Added only
@@ -545,6 +598,7 @@ export class GitDeployService {
       lastClonedAt: clonedAt,
       autoRedeploy: request.autoRedeploy !== false,
       tokenId: request.tokenId,
+      ...(tokenGrantedBy ? { tokenGrantedBy, tokenGrantedFor } : {}),
     };
 
     // Register app with git source metadata and userId BEFORE the name leaves
@@ -733,7 +787,7 @@ export class GitDeployService {
    * land would write under a running build); redeploys of one app that do
    * overlap are serialised per app (`serialised`).
    */
-  async redeploy(appName: string, actor: DeployActor = {}): Promise<GitDeployResult> {
+  async redeploy(appName: string, actor: DeployActor, caller: TokenCaller | null): Promise<GitDeployResult> {
     if (!this.gitAvailable) {
       throw new Error('git CLI is not available on this system');
     }
@@ -822,15 +876,41 @@ export class GitDeployService {
         // resurrect once the field is gone, and `effectiveTokenId` (null) drives
         // the post-pull write too, so the two agree.
         if (actor.tokenId === null && baseSource.tokenId) {
-          const cleared: GitSource = { ...baseSource, tokenId: undefined };
+          const cleared: GitSource = {
+            ...baseSource,
+            tokenId: undefined,
+            tokenGrantedBy: undefined,
+            tokenGrantedFor: undefined,
+          };
           await stateManager.updateApp(appName, { gitSource: cleared } as Record<string, unknown>);
           logger.info(`Cleared the stored git credential for ${appName}`, 'GIT-DEPLOY');
         }
 
         // Resolve token if needed
         let token: string | undefined;
+        // A grant survives only while the token stays; clearing drops it, a new
+        // choice replaces it, and a plain redeploy leaves it alone.
+        let tokenGrantedBy = baseSource.tokenGrantedBy;
+        let tokenGrantedFor = baseSource.tokenGrantedFor;
+        if (effectiveTokenId === null) {
+          tokenGrantedBy = undefined;
+          tokenGrantedFor = undefined;
+        }
         if (effectiveTokenId) {
-          token = await this.getTokenValue(effectiveTokenId);
+          // An id chosen on THIS request is owner-checked; an inherited one is
+          // the app's existing attachment. Naming the id the app already has is
+          // not a choice, so it resolves as attached: same answer either way.
+          const chosen = typeof actor.tokenId === 'string' && actor.tokenId !== baseSource.tokenId;
+          const resolved = await this.resolveToken(
+            chosen
+              ? { kind: 'chosen', id: effectiveTokenId, caller, appOwnerId: app.userId }
+              : { kind: 'attached', app }
+          );
+          token = resolved?.value;
+          if (chosen) {
+            tokenGrantedBy = resolved?.grantedBy;
+            tokenGrantedFor = resolved?.grantedFor;
+          }
           if (!token) {
             // Branch on PROVENANCE. An id the caller supplied on THIS request that
             // resolves to nothing is a caller error — deploy() throws for exactly
@@ -878,13 +958,26 @@ export class GitDeployService {
         // Built from effectiveTokenId, NOT app.gitSource.tokenId — see the note
         // above. Spreading the stale field here would silently revert an attach
         // on this success path (the defect two independent reviewers found).
-        const gitSource: GitSource = {
-          ...baseSource,
-          repoUrl: cloneUrl,
-          tokenId: effectiveTokenId === null ? undefined : effectiveTokenId,
-          lastCommitSha: commitSha,
-          lastClonedAt: clonedAt,
-        };
+        // Re-read the app: the clone took time, and the credential may have
+        // been cleared or replaced meanwhile (a revocation). If the id on
+        // record is no longer the one this redeploy started from, that newer
+        // decision stands and only the commit and time are written. (A clear
+        // THIS call made was persisted before the clone, so it is the expected
+        // state, not a race.)
+        const latest = stateManager.getApp(appName)?.gitSource;
+        const expectedTokenId = actor.tokenId === null ? undefined : baseSource.tokenId;
+        const gitSource: GitSource =
+          latest && latest.tokenId !== expectedTokenId
+            ? { ...latest, repoUrl: cloneUrl, lastCommitSha: commitSha, lastClonedAt: clonedAt }
+            : {
+                ...baseSource,
+                repoUrl: cloneUrl,
+                tokenId: effectiveTokenId === null ? undefined : effectiveTokenId,
+                tokenGrantedBy,
+                tokenGrantedFor,
+                lastCommitSha: commitSha,
+                lastClonedAt: clonedAt,
+              };
 
         await stateManager.updateApp(appName, { gitSource } as Record<string, unknown>);
 
@@ -921,8 +1014,8 @@ export class GitDeployService {
     });
   }
 
-  /** Store a GitHub Personal Access Token */
-  async setToken(name: string, tokenValue: string): Promise<GitTokenInfo> {
+  /** Store a GitHub Personal Access Token, owned by `ownerUserId` (unset only when auth is disabled) */
+  async setToken(name: string, tokenValue: string, ownerUserId?: string): Promise<GitTokenInfo> {
     // The credential helper emits the token as a LINE in git's credential
     // protocol (`password=<token>`), so a value carrying a newline would
     // append further `key=value` attributes of the caller's choosing —
@@ -943,6 +1036,10 @@ export class GitDeployService {
     const id = `git_${crypto.randomBytes(8).toString('hex')}`;
     const key = `${id}:${name}`;
 
+    // Owner first: if the second write fails the token is simply absent, and
+    // an orphan owner record resolves to nothing. The reverse order would
+    // leave a token that reads as legacy.
+    if (ownerUserId) await this.updateOwners((o) => void (o[id] = ownerUserId));
     await sm.set(GIT_TOKEN_APP_NAME, key, tokenValue);
 
     return {
@@ -952,37 +1049,199 @@ export class GitDeployService {
     };
   }
 
-  /** Remove a stored GitHub token */
-  async removeToken(id: string): Promise<boolean> {
-    const sm = getSecretManager();
-    const keys = sm.list(GIT_TOKEN_APP_NAME);
-    const key = keys.find((k) => k.startsWith(`${id}:`));
-    if (!key) return false;
-    return sm.delete(GIT_TOKEN_APP_NAME, key);
+  /**
+   * The owner map, or null when it exists but cannot be parsed. Readers treat
+   * null as empty (every token then reads as legacy: admin-only, the closed
+   * direction); writers refuse to run over it rather than overwrite it.
+   */
+  private readOwners(): Record<string, string> | null {
+    const raw = getSecretManager().get(GIT_TOKEN_OWNER_APP_NAME, GIT_TOKEN_OWNER_KEY);
+    if (raw === null) return {};
+    try {
+      const parsed: unknown = JSON.parse(raw);
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+      const out: Record<string, string> = {};
+      for (const [id, owner] of Object.entries(parsed)) {
+        if (typeof owner === 'string') out[id] = owner;
+      }
+      return out;
+    } catch {
+      return null;
+    }
   }
 
-  /** List stored tokens (without values) */
-  listTokens(): GitTokenInfo[] {
-    const sm = getSecretManager();
-    const keys = sm.list(GIT_TOKEN_APP_NAME);
-
-    return keys.map((key) => {
-      const [id, ...nameParts] = key.split(':');
-      return {
-        id,
-        name: nameParts.join(':'),
-        createdAt: '', // We don't track creation time in the key
-      };
-    });
+  /**
+   * Read-modify-write of the owner map. There is no await between the read and
+   * the store's in-memory update, so concurrent callers cannot lose an update.
+   */
+  private async updateOwners(mutate: (owners: Record<string, string>) => void): Promise<void> {
+    const owners = this.readOwners();
+    if (!owners) throw new Error('Git token owner records are unreadable; refusing to overwrite them');
+    mutate(owners);
+    await getSecretManager().set(GIT_TOKEN_OWNER_APP_NAME, GIT_TOKEN_OWNER_KEY, JSON.stringify(owners));
   }
 
-  /** Get a token value by ID (internal use only) */
-  private async getTokenValue(id: string): Promise<string | undefined> {
+  /** Whether an app owner id is an admin, against the one configured credential store. */
+  private isAdminOwner(userId: string): Promise<boolean> {
+    return isAdminPrincipalId(userId, this.config.credentialsPath);
+  }
+
+  /** The one exact-id lookup: the stored key whose id segment IS `id`. */
+  private findTokenKey(id: string): string | undefined {
+    return getSecretManager()
+      .list(GIT_TOKEN_APP_NAME)
+      .find((k) => k.split(':')[0] === id);
+  }
+
+  /**
+   * Resolve a token to its value under the rule for where it came from; see
+   * TokenSource. Unknown and not-permitted are the same answer (undefined), so
+   * no caller can tell the two apart.
+   */
+  private async resolveToken(source: TokenSource): Promise<ResolvedToken | undefined> {
     const sm = getSecretManager();
-    const keys = sm.list(GIT_TOKEN_APP_NAME);
-    const key = keys.find((k) => k.startsWith(`${id}:`));
+    const id = source.kind === 'chosen' ? source.id : source.app.gitSource?.tokenId;
+    if (!id) return undefined;
+    const key = this.findTokenKey(id);
     if (!key) return undefined;
-    return sm.get(GIT_TOKEN_APP_NAME, key) ?? undefined;
+    const ownerMap = this.readOwners();
+    const owner = (ownerMap ?? {})[id];
+
+    if (source.kind === 'attached') {
+      const app = source.app;
+      // A grant counts only for the owner it was made for.
+      const granted = !!app.gitSource?.tokenGrantedBy && app.gitSource.tokenGrantedFor === app.userId;
+      // A credential follows its owner, not the app: if the app has since
+      // changed hands, a token owned by someone else stops being used unless
+      // an admin attached it on purpose. A legacy token (no owner record) is
+      // grandfathered; so is one on an admin-owned app. When the owner map
+      // cannot be read nothing can be called "legacy", so the grandfathering
+      // is withdrawn too: only a grant or an admin-owned app still pulls.
+      const mismatch = ownerMap === null || (owner !== undefined && owner !== app.userId);
+      if (mismatch && !granted && !(app.userId && (await this.isAdminOwner(app.userId)))) {
+        if (ownerMap === null && !this.corruptOwnersLogged) {
+          this.corruptOwnersLogged = true;
+          logger.error('Git token owner records are unreadable: attached tokens are refused until they are restored', 'GIT-DEPLOY');
+        }
+        return undefined;
+      }
+      const value = sm.get(GIT_TOKEN_APP_NAME, key);
+      return value === null ? undefined : { value };
+    }
+
+    const caller = source.caller;
+    if (!caller) return undefined;
+    // Someone else's token (or a legacy one) takes an admin in a signed-in
+    // session; an admin key or agent token may use only its own.
+    if (owner !== caller.userId && !(caller.admin && caller.interactive)) return undefined;
+    const value = sm.get(GIT_TOKEN_APP_NAME, key);
+    if (value === null) return undefined;
+    // An admin using a token that is someone else's on this app is recorded.
+    const granting = caller.admin && owner !== undefined && owner !== source.appOwnerId;
+    return {
+      value,
+      grantedBy: granting ? (caller.userId ?? 'admin') : undefined,
+      grantedFor: granting ? source.appOwnerId : undefined,
+    };
+  }
+
+  /** Remove a stored GitHub token. A token the caller may not manage answers exactly like an unknown id. */
+  async removeToken(id: string, caller: TokenCaller): Promise<boolean> {
+    const sm = getSecretManager();
+    const key = this.findTokenKey(id);
+    if (!key) return false;
+    if (!caller.admin && (this.readOwners() ?? {})[id] !== caller.userId) return false;
+    // The token delete decides the outcome. The owner record is tidying: a
+    // failure there leaves an orphan entry that resolves to nothing.
+    const deleted = await sm.delete(GIT_TOKEN_APP_NAME, key);
+    if (deleted) await this.updateOwners((o) => void delete o[id]).catch(() => undefined);
+    return deleted;
+  }
+
+  /** List the stored tokens (without values) the caller may use; an admin sees all, with owners */
+  listTokens(caller: TokenCaller): GitTokenInfo[] {
+    const keys = getSecretManager().list(GIT_TOKEN_APP_NAME);
+    const owners = this.readOwners() ?? {};
+
+    return keys
+      .filter((key) => caller.admin || owners[key.split(':')[0]] === caller.userId)
+      .map((key) => {
+        const [id, ...nameParts] = key.split(':');
+        const info: GitTokenInfo = {
+          id,
+          name: nameParts.join(':'),
+          createdAt: '', // We don't track creation time in the key
+        };
+        if (caller.admin && owners[id] !== undefined) {
+          info.ownerUserId = owners[id];
+          info.ownerName = getUserById(owners[id])?.username;
+        }
+        return info;
+      });
+  }
+
+  /** Assign (or reassign) the owner of an existing token, e.g. a legacy one. False for an unknown id. */
+  async setTokenOwner(id: string, userId: string, grantedBy: string): Promise<boolean> {
+    if (!this.findTokenKey(id)) return false;
+    await this.updateOwners((o) => {
+      o[id] = userId;
+    });
+    // Apps working off this token under another owner (grandfathered, or the
+    // previous owner's) would silently stop pulling now that it has an owner.
+    // The admin doing this is choosing to keep them going: record it.
+    const stateManager = getStateManager();
+    for (const app of stateManager.getAllApps()) {
+      if (app.gitSource?.tokenId !== id || app.userId === userId) continue;
+      await stateManager.updateApp(app.name, {
+        gitSource: { ...app.gitSource, tokenGrantedBy: grantedBy, tokenGrantedFor: app.userId },
+      } as Record<string, unknown>);
+      logger.warn(`Token '${id}' now belongs to ${userId}; kept attached to '${app.name}' by grant of ${grantedBy}`, 'GIT-DEPLOY');
+    }
+    return true;
+  }
+
+  /** Delete every token a user owns, and their owner records. Returns how many tokens were removed. */
+  async removeTokensOwnedBy(userId: string): Promise<number> {
+    const owners = this.readOwners();
+    if (!owners) throw new Error('Git token owner records are unreadable; their tokens were not removed');
+    const sm = getSecretManager();
+    let removed = 0;
+    for (const [id, owner] of Object.entries(owners)) {
+      if (owner !== userId) continue;
+      const key = this.findTokenKey(id);
+      if (key && (await sm.delete(GIT_TOKEN_APP_NAME, key))) removed++;
+    }
+    if (Object.values(owners).includes(userId)) {
+      await this.updateOwners((o) => {
+        for (const id of Object.keys(o)) if (o[id] === userId) delete o[id];
+      });
+    }
+    return removed;
+  }
+
+  /**
+   * Boot audit: one WARN per app whose attached token has no owner record and
+   * whose owner is not an admin, so an operator can see which grandfathered
+   * credentials are in use. Names the app and the token id, never the value.
+   */
+  async auditLegacyAttachments(): Promise<number> {
+    const owners = this.readOwners() ?? {};
+    const adminCache = new Map<string, boolean>();
+    let flagged = 0;
+    for (const app of getStateManager().getAllApps()) {
+      const id = app.gitSource?.tokenId;
+      if (!id || owners[id] !== undefined || !this.findTokenKey(id)) continue;
+      if (!app.userId) continue;
+      let isAdmin = adminCache.get(app.userId);
+      if (isAdmin === undefined) {
+        isAdmin = await this.isAdminOwner(app.userId);
+        adminCache.set(app.userId, isAdmin);
+      }
+      if (isAdmin) continue;
+      flagged++;
+      logger.warn(`App '${app.name}' uses legacy git token '${id}' that has no owner (assign one with PUT /git/tokens/${id}/owner)`, 'GIT-DEPLOY');
+    }
+    return flagged;
   }
 
   /** Find apps that match a repo URL and branch for webhook auto-redeploy */
@@ -1013,6 +1272,11 @@ export function getGitDeployService(config?: GitDeployServiceConfig): GitDeployS
     }
     instance = new GitDeployService(config);
   }
+  return instance;
+}
+
+/** The service if it has been created, else null (for callers that must not create it). */
+export function getGitDeployServiceOrNull(): GitDeployService | null {
   return instance;
 }
 

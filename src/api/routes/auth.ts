@@ -36,6 +36,7 @@ import {
 import { tryLogActivity, logActivityFor } from '../../managers/activity';
 import { getStateManager } from '../../managers/app/state-manager';
 import { canAccess, interactiveSessionOnly } from '../access';
+import { getGitDeployServiceOrNull } from '../../core/git-deploy';
 import { assertMintable } from '../agent-scopes';
 import { ValidationError } from '../middleware/error';
 import { getAppConfigServiceOrNull } from '../../managers/app/app-config';
@@ -591,6 +592,17 @@ auth.delete('/account', authMiddleware(), async c => {
       await getAppConfigServiceOrNull()?.pruneAllowListEntries(authCtx.userId);
     } catch {
       // Deliberately swallowed; see above.
+    }
+    // The git tokens this account added go with it. Apps that had one attached
+    // fail their next pull with the ordinary token-not-found error. Same
+    // best-effort posture as the allow-list prune above.
+    try {
+      const removed = await getGitDeployServiceOrNull()?.removeTokensOwnedBy(authCtx.userId);
+      if (removed) console.warn(`[auth] removed ${removed} stored git token(s) owned by the deleted account`);
+    } catch (err) {
+      // The account is already gone, so this does not fail the request; but the
+      // tokens are still stored, so it must be seen.
+      console.error('[auth] could not remove the deleted account\'s stored git tokens:', err instanceof Error ? err.message : err);
     }
     await logActivityFor(authCtx, {
       action: 'delete',

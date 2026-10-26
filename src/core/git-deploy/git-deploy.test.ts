@@ -9,6 +9,8 @@ import { execFile } from 'child_process';
 import { GitDeployService, resetGitDeployService } from './git-deploy';
 import { resetStateManager, getStateManager, AppStateManager } from '../../managers/app/state-manager';
 import { resetSecretManager, getSecretManager } from '../../managers/secret';
+import * as gitClient from './git-client';
+import type { TokenCaller, GitDeployRequest, DeployActor } from './git-deploy.types';
 import {
   AppConfigService,
   getAppConfigService,
@@ -151,8 +153,27 @@ function installOps(over: Partial<PlatformOps> = {}): void {
   );
 }
 
+/** The token caller for tests that are about something other than ownership. */
+const ADMIN: TokenCaller = { admin: true, interactive: true };
+const ALICE: TokenCaller = { userId: 'alice', admin: false };
+const BOB: TokenCaller = { userId: 'bob', admin: false };
+
+/**
+ * The service with an admin caller filled in where a test is about something
+ * other than ownership. The real signatures take the caller as a REQUIRED
+ * argument; the ownership tests pass theirs explicitly.
+ */
+class AdminService extends GitDeployService {
+  deploy(request: GitDeployRequest, caller: TokenCaller = ADMIN) {
+    return super.deploy(request, caller);
+  }
+  redeploy(appName: string, actor: DeployActor = {}, caller: TokenCaller | null = ADMIN) {
+    return super.redeploy(appName, actor, caller);
+  }
+}
+
 describe('GitDeployService', () => {
-  let service: GitDeployService;
+  let service: AdminService;
   let tempDir: string;
 
   beforeEach(async () => {
@@ -192,7 +213,7 @@ describe('GitDeployService', () => {
 
     // Create service
     resetGitDeployService();
-    service = new GitDeployService({ appsDirectory: appsDir });
+    service = new AdminService({ appsDirectory: appsDir });
     await service.initialize();
     reservedNow.clear();
     installOps();
@@ -820,7 +841,7 @@ describe('GitDeployService', () => {
         await capped.initialize();
         mockCloneFiles = { 'a.txt': 'a', 'b.txt': 'b' };
 
-        await expect(capped.redeploy(appName)).rejects.toThrow(/maximum of 1 entries/);
+        await expect(capped.redeploy(appName, {}, ADMIN)).rejects.toThrow(/maximum of 1 entries/);
 
         expect(await fs.readFile(path.join(appDir(appName), 'index.html'), 'utf-8')).toBe('<h1>v1</h1>');
       });
@@ -1262,7 +1283,7 @@ describe('GitDeployService', () => {
         await makeGitDir(appName);
         const stored = await service.setToken('recovery-token', 'ghp_recoveryvalue');
 
-        const result = await service.redeploy(appName, { tokenId: stored.id });
+        const result = await service.redeploy(appName, { tokenId: stored.id }, ADMIN);
 
         expect(result.appName).toBe(appName);
         const app = getStateManager().getApp(appName);
@@ -1282,7 +1303,7 @@ describe('GitDeployService', () => {
 
         failNextPull();
 
-        await expect(service.redeploy(appName, { tokenId: stored.id })).rejects.toThrow();
+        await expect(service.redeploy(appName, { tokenId: stored.id }, ADMIN)).rejects.toThrow();
         const app = getStateManager().getApp(appName);
         expect(app?.gitSource?.tokenId).toBeUndefined();
       });
@@ -1295,7 +1316,7 @@ describe('GitDeployService', () => {
         await service.deploy({ repoUrl: `https://github.com/user/${appName}`, branch: 'main' });
         await makeGitDir(appName);
         const stored = await service.setToken('kept-token', 'ghp_keptvalue');
-        await service.redeploy(appName, { tokenId: stored.id });
+        await service.redeploy(appName, { tokenId: stored.id }, ADMIN);
         expect(getStateManager().getApp(appName)?.gitSource?.tokenId).toBe(stored.id);
 
         failNextPull();
@@ -1309,7 +1330,7 @@ describe('GitDeployService', () => {
         await service.deploy({ repoUrl: `https://github.com/user/${appName}`, branch: 'main' });
         await makeGitDir(appName);
         const stored = await service.setToken('to-clear', 'ghp_toclear');
-        await service.redeploy(appName, { tokenId: stored.id });
+        await service.redeploy(appName, { tokenId: stored.id }, ADMIN);
         expect(getStateManager().getApp(appName)?.gitSource?.tokenId).toBe(stored.id);
 
         await service.redeploy(appName, { tokenId: null });
@@ -1331,7 +1352,7 @@ describe('GitDeployService', () => {
         await service.deploy({ repoUrl: `https://github.com/user/${appName}`, branch: 'main' });
         await makeGitDir(appName);
         const stored = await service.setToken('leaked-token', 'ghp_leaked');
-        await service.redeploy(appName, { tokenId: stored.id });
+        await service.redeploy(appName, { tokenId: stored.id }, ADMIN);
         expect(getStateManager().getApp(appName)?.gitSource?.tokenId).toBe(stored.id);
 
         failNextPull();
@@ -1349,7 +1370,7 @@ describe('GitDeployService', () => {
         await makeGitDir(appName);
 
         await expect(
-          service.redeploy(appName, { tokenId: 'git_doesnotexist' })
+          service.redeploy(appName, { tokenId: 'git_doesnotexist' }, ADMIN)
         ).rejects.toThrow(/GitHub token 'git_doesnotexist' not found/);
         expect(getStateManager().getApp(appName)?.gitSource?.tokenId).toBeUndefined();
       });
@@ -1363,8 +1384,8 @@ describe('GitDeployService', () => {
         await service.deploy({ repoUrl: `https://github.com/user/${appName}`, branch: 'main' });
         await makeGitDir(appName);
         const stored = await service.setToken('vanishing', 'ghp_vanishing');
-        await service.redeploy(appName, { tokenId: stored.id });
-        await service.removeToken(stored.id);
+        await service.redeploy(appName, { tokenId: stored.id }, ADMIN);
+        await service.removeToken(stored.id, ADMIN);
 
         await expect(service.redeploy(appName)).resolves.toBeDefined();
       });
@@ -1374,7 +1395,7 @@ describe('GitDeployService', () => {
         await service.deploy({ repoUrl: `https://github.com/user/${appName}`, branch: 'main' });
         await makeGitDir(appName);
         const stored = await service.setToken('unchanged', 'ghp_unchanged');
-        await service.redeploy(appName, { tokenId: stored.id });
+        await service.redeploy(appName, { tokenId: stored.id }, ADMIN);
 
         await service.redeploy(appName);
 
@@ -1402,7 +1423,7 @@ describe('GitDeployService', () => {
         const secretValue = 'ghp_totallysecretvalue';
         const stored = await service.setToken('argv-check', secretValue);
 
-        await service.redeploy(appName, { tokenId: stored.id });
+        await service.redeploy(appName, { tokenId: stored.id }, ADMIN);
 
         for (const call of (execFile as unknown as jest.Mock).mock.calls) {
           const args = (call[1] ?? []) as string[];
@@ -1431,7 +1452,7 @@ describe('GitDeployService', () => {
         await fs.mkdir(path.join(tempDir, 'webapps', 'grp-container', '.git'), { recursive: true });
         const stored = await service.setToken('group-token', 'ghp_groupvalue');
 
-        await service.redeploy('grp-container', { tokenId: stored.id });
+        await service.redeploy('grp-container', { tokenId: stored.id }, ADMIN);
 
         expect(sm.getApp('grp-container')?.gitSource?.tokenId).toBe(stored.id);
         expect(sm.getApp('grp-child')?.gitSource).toBeUndefined();
@@ -1449,7 +1470,7 @@ describe('GitDeployService', () => {
       await service.deploy({ repoUrl: `https://github.com/user/${appName}`, branch: 'main' });
       await fs.mkdir(path.join(tempDir, 'webapps', appName, '.git'), { recursive: true });
       const stored = await service.setToken('restart-token', 'ghp_restartvalue');
-      await service.redeploy(appName, { tokenId: stored.id });
+      await service.redeploy(appName, { tokenId: stored.id }, ADMIN);
 
       // Flush the debounced save and tear down the live instance, mirroring
       // an actual shutdown.
@@ -1477,23 +1498,348 @@ describe('GitDeployService', () => {
       expect(token.id).toBeDefined();
       expect(token.name).toBe('my-token');
 
-      const tokens = service.listTokens();
+      const tokens = service.listTokens(ADMIN);
       expect(tokens.length).toBe(1);
       expect(tokens[0].name).toBe('my-token');
     });
 
     it('should remove tokens', async () => {
       const token = await service.setToken('to-delete', 'ghp_xyz');
-      expect(service.listTokens().length).toBe(1);
+      expect(service.listTokens(ADMIN).length).toBe(1);
 
-      const deleted = await service.removeToken(token.id);
+      const deleted = await service.removeToken(token.id, ADMIN);
       expect(deleted).toBe(true);
-      expect(service.listTokens().length).toBe(0);
+      expect(service.listTokens(ADMIN).length).toBe(0);
     });
 
     it('should return false when removing non-existent token', async () => {
-      const deleted = await service.removeToken('non-existent');
+      const deleted = await service.removeToken('non-existent', ADMIN);
       expect(deleted).toBe(false);
+    });
+  });
+
+  describe('token ownership', () => {
+    async function makeGitDir(appName: string): Promise<void> {
+      await fs.mkdir(path.join(tempDir, 'webapps', appName, '.git'), { recursive: true });
+    }
+
+    it('lists only the caller\'s own tokens; an admin sees all, with owners', async () => {
+      const a = await service.setToken('alice-pat', 'ghp_alice', 'alice');
+      const b = await service.setToken('bob-pat', 'ghp_bob', 'bob');
+      const legacy = await service.setToken('legacy-pat', 'ghp_legacy');
+
+      expect(service.listTokens(ALICE).map((t) => t.id)).toEqual([a.id]);
+      expect(service.listTokens(BOB).map((t) => t.id)).toEqual([b.id]);
+      const all = service.listTokens(ADMIN);
+      expect(all.map((t) => t.id).sort()).toEqual([a.id, b.id, legacy.id].sort());
+      expect(all.find((t) => t.id === a.id)?.ownerUserId).toBe('alice');
+      expect(all.find((t) => t.id === legacy.id)?.ownerUserId).toBeUndefined();
+      // The owner field is an admin-view detail only.
+      expect(service.listTokens(ALICE)[0].ownerUserId).toBeUndefined();
+    });
+
+    it('a legacy ownerless token is invisible and undeletable to a non-admin, manageable by an admin', async () => {
+      const legacy = await service.setToken('legacy-pat', 'ghp_legacy');
+
+      expect(service.listTokens(ALICE)).toEqual([]);
+      expect(await service.removeToken(legacy.id, ALICE)).toBe(false);
+      expect(service.listTokens(ADMIN)).toHaveLength(1);
+      expect(await service.removeToken(legacy.id, ADMIN)).toBe(true);
+    });
+
+    it('a foreign token deletes exactly like an unknown id, and survives', async () => {
+      const b = await service.setToken('bob-pat', 'ghp_bob', 'bob');
+
+      expect(await service.removeToken(b.id, ALICE)).toBe(false);
+      expect(await service.removeToken('git_doesnotexist', ALICE)).toBe(false);
+      expect(service.listTokens(BOB)).toHaveLength(1);
+      expect(await service.removeToken(b.id, BOB)).toBe(true);
+      // The owner record goes with the token.
+      expect(JSON.parse(getSecretManager().get('__drop_git_token_owners', 'owners') ?? '{}')).toEqual({});
+    });
+
+    it('deploy refuses a foreign token with the same error as an unknown one', async () => {
+      const b = await service.setToken('bob-pat', 'ghp_bob', 'bob');
+      const legacy = await service.setToken('legacy-pat', 'ghp_legacy');
+
+      await expect(
+        service.deploy({ repoUrl: 'https://github.com/acme/foreign', branch: 'main', tokenId: b.id }, ALICE)
+      ).rejects.toThrow(`GitHub token '${b.id}' not found`);
+      await expect(
+        service.deploy({ repoUrl: 'https://github.com/acme/legacy', branch: 'main', tokenId: legacy.id }, ALICE)
+      ).rejects.toThrow(/GitHub token .* not found/);
+      await expect(
+        service.deploy({ repoUrl: 'https://github.com/acme/unk', branch: 'main', tokenId: 'git_nope' }, ALICE)
+      ).rejects.toThrow("GitHub token 'git_nope' not found");
+    });
+
+    it('deploy accepts the owner\'s token and an admin\'s choice of any token', async () => {
+      const a = await service.setToken('alice-pat', 'ghp_alice', 'alice');
+
+      await expect(
+        service.deploy({ repoUrl: 'https://github.com/acme/mine', branch: 'main', tokenId: a.id }, ALICE)
+      ).resolves.toBeDefined();
+      await expect(
+        service.deploy({ repoUrl: 'https://github.com/acme/admins', branch: 'main', tokenId: a.id }, ADMIN)
+      ).resolves.toBeDefined();
+    });
+
+    it('redeploy refuses to ATTACH a foreign or legacy token and persists nothing', async () => {
+      const appName = 'attach-foreign';
+      await service.deploy({ repoUrl: `https://github.com/user/${appName}`, branch: 'main' });
+      await makeGitDir(appName);
+      const b = await service.setToken('bob-pat', 'ghp_bob', 'bob');
+      const legacy = await service.setToken('legacy-pat', 'ghp_legacy');
+
+      await expect(service.redeploy(appName, { tokenId: b.id }, ALICE)).rejects.toThrow(/GitHub token .* not found/);
+      await expect(service.redeploy(appName, { tokenId: legacy.id }, ALICE)).rejects.toThrow(
+        /GitHub token .* not found/
+      );
+      expect(getStateManager().getApp(appName)?.gitSource?.tokenId).toBeUndefined();
+
+      await expect(service.redeploy(appName, { tokenId: legacy.id }, ADMIN)).resolves.toBeDefined();
+      expect(getStateManager().getApp(appName)?.gitSource?.tokenId).toBe(legacy.id);
+    });
+
+    it('an already-attached legacy token keeps being used by owner, API and webhook redeploys without a re-check', async () => {
+      const appName = 'attached-legacy';
+      await service.deploy({ repoUrl: `https://github.com/user/${appName}`, branch: 'main' });
+      await makeGitDir(appName);
+      const legacy = await service.setToken('legacy-pat', 'ghp_legacyvalue');
+      await service.redeploy(appName, { tokenId: legacy.id }, ADMIN);
+
+      const pull = jest.spyOn(gitClient, 'gitClone');
+      await service.redeploy(appName, { userId: 'alice' }, ALICE);
+      await service.redeploy(appName, { automation: 'webhook' }, null);
+      await service.redeploy(appName, {}, null);
+
+      expect(pull).toHaveBeenCalledTimes(3);
+      for (const call of pull.mock.calls) expect(call[0].token).toBe('ghp_legacyvalue');
+      pull.mockRestore();
+    });
+  });
+
+  describe('token ownership: attached tokens, grants, transfer', () => {
+    async function makeGitDir(appName: string): Promise<void> {
+      await fs.mkdir(path.join(tempDir, 'webapps', appName, '.git'), { recursive: true });
+    }
+    const pullTokens = (pull: jest.SpyInstance) => pull.mock.calls.map((c) => (c[0] as { token?: string }).token);
+
+    async function attachedApp(appName: string, owner: string, tokenOwner: string | undefined, tokenValue: string) {
+      await service.deploy({ repoUrl: `https://github.com/user/${appName}`, branch: 'main', userId: owner });
+      await makeGitDir(appName);
+      const t = await service.setToken(`${appName}-pat`, tokenValue, tokenOwner);
+      await service.redeploy(appName, { tokenId: t.id }, ADMIN);
+      return t;
+    }
+
+    it('an ownership transfer drops a credential owned by the previous owner', async () => {
+      const t = await attachedApp('transferred', 'alice', 'alice', 'ghp_alices');
+      await getStateManager().updateApp('transferred', { userId: 'carol' } as Record<string, unknown>);
+
+      const pull = jest.spyOn(gitClient, 'gitClone');
+      await service.redeploy('transferred', {}, { userId: 'carol', admin: false });
+      await service.redeploy('transferred', {}, null);
+
+      expect(pullTokens(pull)).toEqual([undefined, undefined]);
+      pull.mockRestore();
+      expect(t.id).toBeDefined();
+    });
+
+    it('naming the attached id again resolves as attached, so a transferred credential is refused with the usual error', async () => {
+      const t = await attachedApp('named-again', 'alice', 'alice', 'ghp_alices');
+      await getStateManager().updateApp('named-again', { userId: 'carol' } as Record<string, unknown>);
+
+      await expect(
+        service.redeploy('named-again', { tokenId: t.id }, { userId: 'carol', admin: false })
+      ).rejects.toThrow(`GitHub token '${t.id}' not found`);
+    });
+
+    it('naming the attached id again works for a legacy token a non-admin could not newly choose', async () => {
+      const t = await attachedApp('legacy-again', 'alice', undefined, 'ghp_legacyvalue');
+
+      await expect(
+        service.redeploy('legacy-again', { tokenId: t.id }, { userId: 'alice', admin: false })
+      ).resolves.toBeDefined();
+      // ...while a different legacy token is still refused.
+      const other = await service.setToken('other-legacy', 'ghp_other');
+      await expect(
+        service.redeploy('legacy-again', { tokenId: other.id }, { userId: 'alice', admin: false })
+      ).rejects.toThrow(/GitHub token .* not found/);
+    });
+
+    it('an admin attaching another user\'s token records the grant, and the grant is honoured and cleared with the token', async () => {
+      await service.deploy({ repoUrl: 'https://github.com/user/granted', branch: 'main', userId: 'alice' });
+      await makeGitDir('granted');
+      const b = await service.setToken('bob-pat', 'ghp_bobs', 'bob');
+      const admin: TokenCaller = { admin: true, userId: 'root-admin', interactive: true };
+
+      await service.redeploy('granted', { tokenId: b.id }, admin);
+      expect(getStateManager().getApp('granted')?.gitSource?.tokenGrantedBy).toBe('root-admin');
+
+      const pull = jest.spyOn(gitClient, 'gitClone');
+      await service.redeploy('granted', {}, { userId: 'alice', admin: false });
+      await service.redeploy('granted', {}, null);
+      expect(pullTokens(pull)).toEqual(['ghp_bobs', 'ghp_bobs']);
+      pull.mockRestore();
+
+      await service.redeploy('granted', { tokenId: null }, admin);
+      const src = getStateManager().getApp('granted')?.gitSource;
+      expect(src?.tokenId).toBeUndefined();
+      expect(src?.tokenGrantedBy).toBeUndefined();
+    });
+
+    it('an admin using the app owner\'s own token records no grant', async () => {
+      await service.deploy({ repoUrl: 'https://github.com/user/plain', branch: 'main', userId: 'alice' });
+      await makeGitDir('plain');
+      const a = await service.setToken('alice-pat', 'ghp_alices', 'alice');
+
+      await service.redeploy('plain', { tokenId: a.id }, { admin: true, userId: 'root-admin', interactive: true });
+      expect(getStateManager().getApp('plain')?.gitSource?.tokenGrantedBy).toBeUndefined();
+    });
+
+    it('setTokenOwner makes a legacy token usable by its new owner and reports an unknown id', async () => {
+      const legacy = await service.setToken('legacy-pat', 'ghp_legacy');
+      expect(service.listTokens(ALICE)).toEqual([]);
+
+      expect(await service.setTokenOwner(legacy.id, 'alice', 'root-admin')).toBe(true);
+      expect(service.listTokens(ALICE).map((t) => t.id)).toEqual([legacy.id]);
+      expect(await service.setTokenOwner('git_nope', 'alice', 'root-admin')).toBe(false);
+    });
+
+    it('removeTokensOwnedBy deletes only that user\'s tokens and owner records', async () => {
+      const a1 = await service.setToken('a1', 'ghp_a1', 'alice');
+      await service.setToken('a2', 'ghp_a2', 'alice');
+      const b = await service.setToken('b1', 'ghp_b1', 'bob');
+      const legacy = await service.setToken('legacy', 'ghp_l');
+
+      expect(await service.removeTokensOwnedBy('alice')).toBe(2);
+      expect(service.listTokens(ADMIN).map((t) => t.id).sort()).toEqual([b.id, legacy.id].sort());
+      expect(service.listTokens(ALICE)).toEqual([]);
+      expect(a1.id).toBeDefined();
+    });
+
+    it('a queued redeploy runs with the attached token only; a token named in the queue is refused', async () => {
+      await attachedApp('queued-tok', 'alice', 'alice', 'ghp_alices');
+      const bobs = await service.setToken('bob-pat', 'ghp_bobs', 'bob');
+      const flush = (): Promise<void> =>
+        (service as unknown as { flushPending(): Promise<void> }).flushPending();
+      const clone = jest.spyOn(gitClient, 'gitClone');
+
+      service.queueRedeploy('queued-tok', { automation: 'webhook' });
+      await flush();
+      expect(pullTokens(clone)).toEqual(['ghp_alices']);
+
+      // A persisted actor naming someone else's token has no caller to vouch for it.
+      service.queueRedeploy('queued-tok', { automation: 'webhook', tokenId: bobs.id });
+      await flush();
+      expect(pullTokens(clone)).toEqual(['ghp_alices']);
+      expect(getStateManager().getApp('queued-tok')?.gitSource?.tokenId).not.toBe(bobs.id);
+      clone.mockRestore();
+      service.dispose();
+    });
+
+    it('the boot audit flags only ownerless tokens attached to non-admin apps', async () => {
+      await attachedApp('audit-legacy', 'alice', undefined, 'ghp_l');
+      await attachedApp('audit-owned', 'alice', 'alice', 'ghp_o');
+
+      expect(await service.auditLegacyAttachments()).toBe(1);
+    });
+
+    it('assigning an owner keeps every attached app of a different owner pulling, by recorded grant', async () => {
+      const t = await attachedApp('kept-going', 'carol', undefined, 'ghp_legacyvalue');
+      await attachedApp('own-app', 'alice', undefined, 'ghp_other');
+
+      expect(await service.setTokenOwner(t.id, 'alice', 'root-admin')).toBe(true);
+
+      const src = getStateManager().getApp('kept-going')?.gitSource;
+      expect(src?.tokenGrantedBy).toBe('root-admin');
+      expect(src?.tokenGrantedFor).toBe('carol');
+      const pull = jest.spyOn(gitClient, 'gitClone');
+      await service.redeploy('kept-going', {}, null);
+      expect(pullTokens(pull)).toEqual(['ghp_legacyvalue']);
+      pull.mockRestore();
+      // An app already owned by the new owner needs no grant.
+      expect(getStateManager().getApp('own-app')?.gitSource?.tokenGrantedBy).toBeUndefined();
+    });
+
+    it('a grant is honoured only while the app still has the owner it was made for', async () => {
+      await service.deploy({ repoUrl: 'https://github.com/user/bound', branch: 'main', userId: 'alice' });
+      await makeGitDir('bound');
+      const b = await service.setToken('bob-pat', 'ghp_bobs', 'bob');
+      await service.redeploy('bound', { tokenId: b.id }, { admin: true, userId: 'root-admin', interactive: true });
+      expect(getStateManager().getApp('bound')?.gitSource?.tokenGrantedFor).toBe('alice');
+
+      await getStateManager().updateApp('bound', { userId: 'carol' } as Record<string, unknown>);
+      const pull = jest.spyOn(gitClient, 'gitClone');
+      await service.redeploy('bound', {}, null);
+      expect(pullTokens(pull)).toEqual([undefined]);
+      pull.mockRestore();
+    });
+
+    it('an admin who is not in an interactive session may use only their own tokens', async () => {
+      await service.deploy({ repoUrl: 'https://github.com/user/keyed', branch: 'main', userId: 'alice' });
+      await makeGitDir('keyed');
+      const b = await service.setToken('bob-pat', 'ghp_bobs', 'bob');
+      const mine = await service.setToken('admin-pat', 'ghp_mine', 'root-admin');
+      const keyAdmin: TokenCaller = { admin: true, userId: 'root-admin', interactive: false };
+
+      await expect(service.redeploy('keyed', { tokenId: b.id }, keyAdmin)).rejects.toThrow(/GitHub token .* not found/);
+      await expect(service.redeploy('keyed', { tokenId: mine.id }, keyAdmin)).resolves.toBeDefined();
+    });
+
+    it('a redeploy whose credential was cleared while it pulled does not write the old one back', async () => {
+      const t = await attachedApp('raced', 'alice', 'alice', 'ghp_alices');
+      const original = gitClient.gitClone;
+      const pull = jest.spyOn(gitClient, 'gitClone').mockImplementation(async (...args) => {
+        // The revocation lands mid-pull.
+        const sm = getStateManager();
+        const cur = sm.getApp('raced')!.gitSource!;
+        await sm.updateApp('raced', { gitSource: { ...cur, tokenId: undefined } } as Record<string, unknown>);
+        return original(...(args as Parameters<typeof original>));
+      });
+
+      await service.redeploy('raced', {}, ALICE);
+      pull.mockRestore();
+
+      const src = getStateManager().getApp('raced')?.gitSource;
+      expect(src?.tokenId).toBeUndefined();
+      expect(src?.lastCommitSha).toBeDefined();
+      expect(t.id).toBeDefined();
+    });
+
+    it('with an unreadable owner map an attached token is refused (no legacy grandfathering) unless granted', async () => {
+      await attachedApp('closed', 'alice', undefined, 'ghp_legacyvalue');
+      await getSecretManager().set('__drop_git_token_owners', 'owners', '{not json');
+      const pull = jest.spyOn(gitClient, 'gitClone');
+      const errorSpy = jest.spyOn(console, 'error').mockImplementation();
+
+      await service.redeploy('closed', {}, null);
+      expect(pullTokens(pull)).toEqual([undefined]);
+      pull.mockRestore();
+      errorSpy.mockRestore();
+    });
+
+    it('removeTokensOwnedBy throws on an unreadable owner map instead of reporting zero', async () => {
+      await service.setToken('a1', 'ghp_a1', 'alice');
+      await getSecretManager().set('__drop_git_token_owners', 'owners', '{not json');
+      await expect(service.removeTokensOwnedBy('alice')).rejects.toThrow(/unreadable/);
+    });
+
+    it('the admin list leaves ownerName off when the account does not resolve', async () => {
+      await service.setToken('a1', 'ghp_a1', 'no-such-account');
+      expect(service.listTokens(ADMIN)[0].ownerName).toBeUndefined();
+      expect(service.listTokens(ADMIN)[0].ownerUserId).toBe('no-such-account');
+    });
+
+    it('a corrupt owner map reads as no owners (admin-only) and is never overwritten', async () => {
+      const a = await service.setToken('alice-pat', 'ghp_alices', 'alice');
+      await getSecretManager().set('__drop_git_token_owners', 'owners', '{not json');
+
+      expect(service.listTokens(ALICE)).toEqual([]);
+      expect(service.listTokens(ADMIN).map((t) => t.id)).toEqual([a.id]);
+      await expect(service.setTokenOwner(a.id, 'alice', 'root-admin')).rejects.toThrow(/unreadable/);
+      expect(getSecretManager().get('__drop_git_token_owners', 'owners')).toBe('{not json');
     });
   });
 
