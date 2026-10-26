@@ -1010,7 +1010,7 @@ async function issueMfaChallenge(userId: string): Promise<string> {
 }
 
 export type VerifyChallengeResult =
-  | { status: 'ok'; userId: string; jti: string }
+  | { status: 'ok'; userId: string; jti: string; iat?: number }
   | { status: 'invalid' }
   | { status: 'expired' }
   | { status: 'attempt_limit' };
@@ -1030,7 +1030,8 @@ export async function verifyMfaChallenge(challengeToken: string): Promise<Verify
     const entry = challengeAttempts.get(jti);
     if (entry && entry.count >= MFA_MAX_ATTEMPTS) return { status: 'attempt_limit' };
 
-    return { status: 'ok', userId, jti };
+    const iat = typeof payload.iat === 'number' ? payload.iat : undefined;
+    return { status: 'ok', userId, jti, iat };
   } catch {
     return { status: 'expired' };
   }
@@ -1086,6 +1087,18 @@ export async function completeMfaLogin(
 
   const user = credentials.users.find((u) => u.id === challenge.userId);
   if (!user || !user.mfaEnabled || !user.mfaSecret) {
+    return { status: 'invalid' };
+  }
+
+  // The challenge was issued by a gate that has since been shut: a user who was
+  // disabled, or scope-created, or contained (suspend / forced reset) after the
+  // challenge was minted must not be able to finish the login with it.
+  // (`iat` is whole seconds: a challenge minted in the same second as a stamp
+  // reads as predating it — the fail-closed rule of `predatesInvalidationStamp`.)
+  if (user.enabled === false || user.createdByScope === true) {
+    return { status: 'invalid' };
+  }
+  if (predatesInvalidationStamp(challenge.iat, user.credentialsInvalidBefore)) {
     return { status: 'invalid' };
   }
 
