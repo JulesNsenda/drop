@@ -695,9 +695,18 @@ export function validateDropYamlConfig(
     if (!result.valid) return result;
   }
 
+  // Validate name: it becomes the group when `group:` is absent, so a blank one
+  // would derive an empty group. Only a NON-EMPTY string that is blank after
+  // trimming is rejected: `name: ""` and non-strings behave as they always did.
+  if (typeof cfg.name === 'string' && cfg.name !== '') {
+    if (!cfg.name.trim()) {
+      return { valid: false, error: 'name must be a non-empty string' };
+    }
+  }
+
   // Validate group
   if (cfg.group !== undefined) {
-    if (typeof cfg.group !== 'string' || !cfg.group) {
+    if (typeof cfg.group !== 'string' || !cfg.group.trim()) {
       return { valid: false, error: 'group must be a non-empty string' };
     }
   }

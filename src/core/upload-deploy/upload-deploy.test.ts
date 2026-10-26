@@ -15,7 +15,7 @@ import {
   UploadConflictError,
   InsufficientDiskSpaceError,
 } from './upload-deploy.types';
-import * as gitDeployModule from '../git-deploy';
+import { tryReserve, ownerOf, isReserved, resetDeployReservations } from '../deploy-reservations';
 import * as breakerModule from '../../managers/guardrail/deploy-breaker';
 import { ArchiveRejectedError } from './tar-extract';
 import { resetStateManager, getStateManager } from '../../managers/app/state-manager';
@@ -57,6 +57,10 @@ describe('UploadDeployService', () => {
     resetStateManager();
     const stateManager = getStateManager({ stateFilePath: path.join(tempDir, 'apps.json') });
     await stateManager.initialize();
+    // The new-app name rules read recorded groups and containers, and fail
+    // closed without a config service.
+    resetAppConfigService();
+    await getAppConfigService({ configDir: path.join(tempDir, 'appconf'), webappsDir: appsDir }).initialize();
 
     // The deploy quota is a singleton whose DEFAULT store path is a real file
     // under the repo. Left alone, these tests would write to it and accumulate
@@ -81,6 +85,8 @@ describe('UploadDeployService', () => {
 
   afterEach(async () => {
     jest.restoreAllMocks();
+    resetDeployReservations();
+    resetAppConfigService();
     resetUploadDeployService();
     resetStateManager();
     await fs.rm(tempDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }).catch(() => undefined);
@@ -247,16 +253,170 @@ describe('UploadDeployService', () => {
         await first;
       });
 
-      it('refuses while a git deploy is cloning into the name', async () => {
-        jest
-          .spyOn(gitDeployModule, 'getGitDeployService')
-          .mockReturnValue({ isCloning: () => true } as never);
+      it('answers a held name as a conflict to its holder, the owner and an admin, and as not found to a stranger', async () => {
+        const sm = getStateManager();
+        await sm.registerApp('cloning', path.join(appsDir, 'cloning'));
+        await sm.updateApp('cloning', { userId: 'user-1' } as Record<string, unknown>);
         const archivePath = await buildArchive('cloning', { 'index.js': 'x' });
+        tryReserve('cloning', 'some-git-deploy');
 
+        await expect(
+          service.deploy({ appName: 'cloning', archivePath, userId: 'user-1' })
+        ).rejects.toBeInstanceOf(UploadConflictError);
         await expect(
           service.deploy({ appName: 'cloning', archivePath, callerIsAdmin: true, userId: 'root' })
         ).rejects.toBeInstanceOf(UploadConflictError);
+        await expect(
+          service.deploy({ appName: 'cloning', archivePath, userId: 'mallory' })
+        ).rejects.toBeInstanceOf(UploadNotFoundError);
+
+        // None of the refusals took the holder's claim.
+        expect(ownerOf('cloning')).toBe('some-git-deploy');
         expect(service.isUploading('cloning')).toBe(false);
+      });
+
+      it('releases its reservation when it finishes, however it ends', async () => {
+        const archivePath = await buildArchive('releases', { 'index.js': 'x' });
+        await service.deploy({ appName: 'releases', archivePath, callerIsAdmin: true, userId: 'root' });
+        expect(isReserved('releases')).toBe(false);
+
+        const bad = path.join(tempDir, 'bad.tgz');
+        await fs.writeFile(bad, 'not a tarball');
+        await expect(
+          service.deploy({ appName: 'releases2', archivePath: bad, callerIsAdmin: true, userId: 'root' })
+        ).rejects.toThrow();
+        expect(isReserved('releases2')).toBe(false);
+      });
+
+      it('refuses a non-admin create whose name is a group or a case variant', async () => {
+        const sm = getStateManager();
+        await sm.registerApp('Taken', path.join(appsDir, 'Taken'));
+        await sm.registerApp('grp-web', path.join(appsDir, 'grp-web'));
+        await sm.updateApp('grp-web', { group: 'grp' });
+        const archivePath = await buildArchive('names', { 'index.js': 'x' });
+
+        for (const name of ['taken', 'grp', 'GRP']) {
+          await expect(
+            service.deploy({ appName: name, archivePath, userId: 'user-1' })
+          ).rejects.toBeInstanceOf(UploadNotFoundError);
+        }
+        expect(sm.hasApp('grp')).toBe(false);
+        // An admin names things freely.
+        await expect(
+          service.deploy({ appName: 'grp', archivePath, userId: 'root', callerIsAdmin: true })
+        ).resolves.toMatchObject({ isNew: true });
+      });
+
+      it('refuses a name that is a recorded container, after its own app is gone', async () => {
+        const acs = getAppConfigService({ configDir: path.join(tempDir, 'appconf'), webappsDir: appsDir });
+        await acs.initialize();
+        await acs.upsertSystemConfig('old-web', { type: 'static', group: 'old', groupContainer: 'old-repo' });
+        const archivePath = await buildArchive('old-repo', { 'index.js': 'x' });
+
+        await expect(
+          service.deploy({ appName: 'old-repo', archivePath, userId: 'user-1' })
+        ).rejects.toBeInstanceOf(UploadNotFoundError);
+      });
+
+      it('removes the folder it began creating for a non-admin create when landing fails part-way', async () => {
+        const archivePath = await buildArchive('partial', { 'index.js': 'tenant' });
+        jest.spyOn(service as never, 'landFiles').mockImplementationOnce((async (
+          _staging: string,
+          dest: string,
+          _refuse: boolean,
+          landing: { created: boolean }
+        ) => {
+          await fs.mkdir(dest, { recursive: true });
+          await fs.writeFile(path.join(dest, 'half.js'), 'partial');
+          landing.created = true;
+          throw new Error('copy failed');
+        }) as never);
+
+        await expect(
+          service.deploy({ appName: 'partial', archivePath, userId: 'user-1' })
+        ).rejects.toThrow('copy failed');
+
+        expect(getStateManager().hasApp('partial')).toBe(false);
+        expect(fssync.existsSync(path.join(appsDir, 'partial'))).toBe(false);
+      });
+
+      it('leaves a folder that was already there when an admin adopts it and landing fails', async () => {
+        await fs.mkdir(path.join(appsDir, 'adopted'), { recursive: true });
+        await fs.writeFile(path.join(appsDir, 'adopted', 'index.js'), 'operator');
+        const archivePath = await buildArchive('adopted', { 'index.js': 'new' });
+        // The real landFiles: the folder exists, so it syncs into it and never
+        // sets `created`. Make that sync fail.
+        const treeSync = jest.requireActual('../../utils/tree-sync') as typeof import('../../utils/tree-sync');
+        const sync = jest.spyOn(treeSync, 'syncTree').mockRejectedValueOnce(new Error('sync failed'));
+
+        await expect(
+          service.deploy({ appName: 'adopted', archivePath, userId: 'root', callerIsAdmin: true })
+        ).rejects.toThrow('sync failed');
+
+        expect(sync).toHaveBeenCalled();
+        expect(fssync.readFileSync(path.join(appsDir, 'adopted', 'index.js'), 'utf8')).toBe('operator');
+        expect(getStateManager().hasApp('adopted')).toBe(false);
+      });
+
+      it('keeps a config that existed before the call when it takes back its own entry', async () => {
+        const acs = getAppConfigService({ configDir: path.join(tempDir, 'appconf'), webappsDir: appsDir });
+        await acs.initialize();
+        await acs.upsertSystemConfig('precfg', { type: 'static', path: path.join(appsDir, 'precfg') });
+        const archivePath = await buildArchive('precfg', { 'index.js': 'x' });
+        jest.spyOn(service as never, 'landFiles').mockRejectedValueOnce(new Error('land failed') as never);
+
+        await expect(
+          service.deploy({ appName: 'precfg', archivePath, userId: 'root', callerIsAdmin: true, agentCaller: true })
+        ).rejects.toThrow('land failed');
+
+        expect(acs.hasConfig('precfg')).toBe(true);
+      });
+
+      it('refuses, as the route does, an upload onto a git-backed app or a child of a git group', async () => {
+        const sm = getStateManager();
+        await sm.registerApp('gitapp', path.join(appsDir, 'gitapp'));
+        await sm.updateApp('gitapp', {
+          userId: 'user-1',
+          gitSource: { repoUrl: 'https://github.com/a/b', branch: 'main', autoRedeploy: true },
+        } as Record<string, unknown>);
+        await sm.registerApp('gitgrp', path.join(appsDir, 'gitgrp'));
+        await sm.updateApp('gitgrp', {
+          userId: 'user-1',
+          group: 'gg',
+          isGroupContainer: true,
+          gitSource: { repoUrl: 'https://github.com/a/c', branch: 'main', autoRedeploy: true },
+        } as Record<string, unknown>);
+        await sm.registerApp('gg-web', path.join(appsDir, 'gg-web'));
+        await sm.updateApp('gg-web', { userId: 'user-1', group: 'gg' } as Record<string, unknown>);
+        const archivePath = await buildArchive('gitbacked', { 'index.js': 'x' });
+
+        for (const name of ['gitapp', 'gg-web']) {
+          await expect(
+            service.deploy({ appName: name, archivePath, userId: 'user-1' })
+          ).rejects.toBeInstanceOf(UploadConflictError);
+        }
+        expect(isReserved('gitapp')).toBe(false);
+      });
+
+      it('takes back the state entry and config it wrote, and leaves the folder, when landing fails', async () => {
+        const archivePath = await buildArchive('cleanup', { 'index.js': 'tenant' });
+        const acs = getAppConfigService({ configDir: path.join(tempDir, 'appconf'), webappsDir: appsDir });
+        await acs.initialize();
+        // A folder appears between the post-extraction re-check and landFiles.
+        jest.spyOn(service as never, 'landFiles').mockImplementationOnce((async () => {
+          await fs.mkdir(path.join(appsDir, 'cleanup'), { recursive: true });
+          await fs.writeFile(path.join(appsDir, 'cleanup', 'index.js'), 'operator');
+          throw new UploadNotFoundError('cleanup');
+        }) as never);
+
+        await expect(
+          service.deploy({ appName: 'cleanup', archivePath, userId: 'user-1', agentCaller: true })
+        ).rejects.toBeInstanceOf(UploadNotFoundError);
+
+        expect(getStateManager().hasApp('cleanup')).toBe(false);
+        expect(acs.hasConfig('cleanup')).toBe(false);
+        expect(fssync.readFileSync(path.join(appsDir, 'cleanup', 'index.js'), 'utf8')).toBe('operator');
+        expect(isReserved('cleanup')).toBe(false);
       });
 
       it('refuses a create when the name is registered while the archive is processed', async () => {

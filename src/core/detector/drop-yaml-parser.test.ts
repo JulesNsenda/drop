@@ -581,6 +581,12 @@ describe('Drop YAML Parser', () => {
       expect(result.valid).toBe(false);
       expect(result.error).toContain('group');
     });
+
+    it('should reject a group that is empty after trimming', () => {
+      const result = validateDropYamlConfig({ group: '   ' });
+      expect(result.valid).toBe(false);
+      expect(result.error).toContain('group');
+    });
   });
 
   describe('validateDropYamlConfig - services', () => {

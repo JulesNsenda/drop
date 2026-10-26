@@ -24,10 +24,11 @@ import {
   InsufficientDiskSpaceError,
 } from './upload-deploy.types';
 import { isValidAppName } from '../../api/middleware/validate';
-import { pathTaken } from '../../utils/paths';
-import { getGitDeployService } from '../git-deploy';
+import { tryReserve, release, ownerOf, reservationPrincipal } from '../deploy-reservations';
+import { isNewNameRefused } from '../app-names';
+import { resolveGitBackedName } from '../git-backed';
 import { getStateManager } from '../../managers/app/state-manager';
-import { getAppConfigService } from '../../managers/app/app-config';
+import { getAppConfigService, getAppConfigServiceOrNull } from '../../managers/app/app-config';
 import { getLogger } from '../../utils/logger';
 import { hasEnoughDisk, getMinFreeDiskMb } from '../../utils/disk';
 import { syncTree, DEFAULT_PRESERVE } from '../../utils/tree-sync';
@@ -53,15 +54,6 @@ export interface UploadDeployServiceConfig {
   maxEntries: number;
   /** Wall-clock budget for extracting a single archive, in milliseconds. */
   extractTimeoutMs: number;
-}
-
-/** Whether a git deploy is cloning into `appName` right now (no service yet: no). */
-function isGitCloning(appName: string): boolean {
-  try {
-    return getGitDeployService().isCloning(appName);
-  } catch {
-    return false;
-  }
 }
 
 export class UploadDeployService {
@@ -114,26 +106,28 @@ export class UploadDeployService {
     // would open a window where the deploy has begun and nothing says so.
     // Released again if admission refuses, since nothing was started.
     //
-    // A second upload to a name already in flight is refused BEFORE it is marked:
-    // both would stage and land into the same folder, and the first to finish
-    // would clear the guard under the other. The check and the add have no await
-    // between them.
-    //
-    // A git deploy cloning into the same name holds the same reservation, from
-    // the other side (it checks `isUploading` symmetrically).
-    //
-    // Both refusals are answered as a foreign app when the caller is a non-admin
-    // who does not own it: a 409 would tell them someone else is deploying there.
+    // The name is first RESERVED (deploy-reservations, shared with git deploy's
+    // create) by a check-and-insert with no await between them, so a second
+    // create or upload of it, inside this server process, is refused BEFORE it
+    // stages anything: both would land into the same folder, and the first to
+    // finish would clear the guard under the other. The holder's own double
+    // submit, the app's owner and an admin are told it is busy (409); anyone
+    // else is answered as a foreign app, since a 409 would tell them someone
+    // else is deploying there. Only this call's own reservation is released.
     const existingApp = getStateManager().getApp(appName);
     const conflict = (message: string): Error =>
       userId && !callerIsAdmin && existingApp?.userId !== userId
         ? new UploadNotFoundError(appName)
         : new UploadConflictError(message);
-    if (this.activeUploads.has(appName)) {
-      throw conflict(`An upload to '${appName}' is already in progress`);
-    }
-    if (isGitCloning(appName)) {
-      throw conflict(`A git deploy to '${appName}' is already in progress`);
+    const principal = reservationPrincipal(userId, principalId);
+    if (!tryReserve(appName, principal)) {
+      // The holder (a double submit), the app's owner and an admin may be told
+      // it is busy; anyone else is answered as a foreign app.
+      const mayKnow =
+        !userId || callerIsAdmin || ownerOf(appName) === principal || existingApp?.userId === userId;
+      throw mayKnow
+        ? new UploadConflictError(`A deploy of '${appName}' is already in progress`)
+        : new UploadNotFoundError(appName);
     }
     this.activeUploads.add(appName);
     try {
@@ -147,11 +141,34 @@ export class UploadDeployService {
         if (existingApp) {
           // Same rule as canAccess. Answered as an unknown app is.
           if (existingApp.userId !== userId) throw new UploadNotFoundError(appName);
-        } else if (await pathTaken(path.join(this.config.appsDirectory, appName))) {
+        } else if (
+          await isNewNameRefused(appName, {
+            callerIsAdmin: false,
+            appsDirectory: this.config.appsDirectory,
+            stateManager: getStateManager(),
+            appConfigService: getAppConfigServiceOrNull() ?? undefined,
+          })
+        ) {
           // "Not in state" is not "free": a folder-dropped app never is in state,
           // and registering over its folder would sync this caller's tree into it.
+          // Nor is a name that is another app's group or container, or differs
+          // from an existing name only in case.
           throw new UploadNotFoundError(appName);
         }
+      }
+      // An upload onto a git-backed app (or a child of a git-deployed group)
+      // would prune its `.git` and sever it from its source; the route
+      // preflight refuses it, and this is the backstop for a caller that
+      // bypasses or races the route. Same wording, one deploy source per app.
+      const gitBackedName = existingApp
+        ? resolveGitBackedName(existingApp, getStateManager())
+        : undefined;
+      if (gitBackedName) {
+        throw new UploadConflictError(
+          `Application '${appName}' is deployed from git${
+            gitBackedName === appName ? '' : ` (group '${gitBackedName}')`
+          }; redeploy it from git instead of uploading`
+        );
       }
       await admitDeploy(appName, !existingApp, { principalId, actorUserId: userId });
 
@@ -177,10 +194,18 @@ export class UploadDeployService {
       }
     } catch (err) {
       this.activeUploads.delete(appName);
+      release(appName, principal);
       throw err;
     }
 
     let stagingDir: string | undefined;
+    // What THIS call wrote for a new app, so a failure can take back exactly
+    // that (and never the folder, which may be someone else's).
+    let registeredHere = false;
+    let configWrittenHere = false;
+    // Set by landFiles once THIS call is the one creating the folder.
+    const landing = { created: false };
+    let hadConfig = false;
 
     try {
       stagingDir = path.join(this.config.tempDirectory, `upload-${appName}-${Date.now()}`);
@@ -220,7 +245,15 @@ export class UploadDeployService {
       // A non-admin create must not land over a folder that appeared meanwhile.
       // Admins keep adopting a folder they dropped themselves.
       const refuseExisting = isNew && !!userId && !callerIsAdmin;
-      if (refuseExisting && (await pathTaken(destPath))) {
+      if (
+        refuseExisting &&
+        (await isNewNameRefused(appName, {
+          callerIsAdmin: false,
+          appsDirectory: this.config.appsDirectory,
+          stateManager,
+          appConfigService: getAppConfigServiceOrNull() ?? undefined,
+        }))
+      ) {
         throw new UploadNotFoundError(appName);
       }
 
@@ -229,6 +262,7 @@ export class UploadDeployService {
       // app owned/attributed rather than landing anonymous, unregistered files.
       if (isNew) {
         await stateManager.registerApp(appName, destPath);
+        registeredHere = true;
         if (userId) {
           await stateManager.updateApp(appName, { userId } as Record<string, unknown>);
         }
@@ -248,13 +282,16 @@ export class UploadDeployService {
         // dies before detection; app:detected upserts the same value.
         // upsertSystemConfig (not upsertConfig) because agentCreated/
         // ephemeral/expiresAt/ephemeralPrincipalId are SYSTEM_CONFIG_FIELDS.
+        hadConfig = getAppConfigServiceOrNull()?.hasConfig(appName) ?? false;
         if (agentCaller) {
+          configWrittenHere = true;
           await getAppConfigService().upsertSystemConfig(appName, {
             agentCreated: true,
             path: destPath,
           });
         }
         if (ephemeral) {
+          configWrittenHere = true;
           const ttl = resolveTtlMinutes(ttlMinutes);
           await getAppConfigService().upsertSystemConfig(appName, {
             ephemeral: true,
@@ -279,7 +316,7 @@ export class UploadDeployService {
         }
       }
 
-      await this.landFiles(stagingDir, destPath, refuseExisting);
+      await this.landFiles(stagingDir, destPath, refuseExisting, landing);
 
       const acceptedAt = new Date().toISOString();
 
@@ -318,7 +355,26 @@ export class UploadDeployService {
       logger.info(`Uploaded ${appName} (${isNew ? 'new' : 'redeploy'})`, 'UPLOAD-DEPLOY');
 
       return { app: appName, acceptedAt, isNew };
+    } catch (err) {
+      // A new app this call registered must not outlive its failure: an entry
+      // with no files owns the name for the caller, and the next upload would
+      // read it as an existing app of theirs. A folder this call itself began
+      // creating is removed too, as git deploy does: landFiles flags that only
+      // when it is the one making the folder, so a folder that was already there
+      // (one that appeared meanwhile, or one an admin dropped and is adopting) is
+      // left alone. A config that existed before this call is left too.
+      if (registeredHere) {
+        if (landing.created) {
+          await fs.rm(path.join(this.config.appsDirectory, appName), { recursive: true, force: true }).catch(() => undefined);
+        }
+        await getStateManager().removeApp(appName).catch(() => undefined);
+        if (configWrittenHere && !hadConfig) {
+          await getAppConfigService().deleteConfig(appName).catch(() => undefined);
+        }
+      }
+      throw err;
     } finally {
+      release(appName, principal);
       // Idempotent: already cleared above on the success path. Still needed
       // here for the failure path (extraction/disk-check/landFiles threw
       // before reaching the clear above).
@@ -346,7 +402,8 @@ export class UploadDeployService {
   private async landFiles(
     stagingDir: string,
     destPath: string,
-    refuseExisting: boolean
+    refuseExisting: boolean,
+    landing?: { created: boolean }
   ): Promise<void> {
     const destExists = fssync.existsSync(destPath);
     // Last line of the "name is free" check: syncTree would merge into, and prune,
@@ -356,9 +413,13 @@ export class UploadDeployService {
     if (!destExists) {
       try {
         await fs.rename(stagingDir, destPath);
+        if (landing) landing.created = true;
         return;
       } catch (err) {
         if ((err as NodeJS.ErrnoException).code !== 'EXDEV') throw err;
+        // The copy below creates the folder, so a failure part-way leaves a
+        // partial one that is ours to remove.
+        if (landing) landing.created = true;
         // syncTree prunes as well as copies, where the old copy-only helper
         // did not. Harmless here: the prune only removes what the copy didn't
         // just land, and on a destination that didn't exist there is nothing

@@ -152,7 +152,9 @@ import {
   validateDomainFormat,
   isLocalhostDomain,
 } from '../utils/domain-validator';
-import { createApiKey, deleteApiKeysByName, getUserById } from '../api/middleware/auth';
+import { createApiKey, deleteApiKeysByName, isAdminPrincipalId } from '../api/middleware/auth';
+import { isNameTaken } from './app-names';
+import { resetDeployReservations } from './deploy-reservations';
 // The STRICT name pattern (the API's), not the folder-drop parser's looser
 // check: this decides whether a name is safe to write into a Caddy literal.
 import { isValidAppName } from '../api/middleware/validate';
@@ -493,6 +495,15 @@ const BOOT_RECONCILE_CONCURRENCY = 4;
 
 /** Cap on reading a materialized monorepo child's own drop.yaml (see readChildDropYaml). */
 const MAX_CHILD_DROP_YAML_BYTES = 256 * 1024;
+
+/**
+ * App, group and container names are compared ignoring case wherever they are
+ * claims on a name: hostnames are case-insensitive, so `EZS` and `ezs` collide
+ * even though the state maps key them apart.
+ */
+function sameNameIgnoringCase(a: string | undefined, b: string | undefined): boolean {
+  return a !== undefined && b !== undefined && a.toLowerCase() === b.toLowerCase();
+}
 
 /**
  * Fingerprint of what a group child was materialized from: the container, the
@@ -1288,6 +1299,9 @@ export class DropPlatform {
       resetAppConfigService();
     }
 
+    // A stopped platform cannot leave a name held by a deploy that will never finish.
+    resetDeployReservations();
+
     // Stop PostgreSQL server
     if (this.postgresServer) {
       this.logger.info('Stopping PostgreSQL...', 'DATABASE');
@@ -1959,8 +1973,6 @@ backup:
     // Initialize git deploy service
     this.gitDeployService = getGitDeployService({
       appsDirectory: this.config.appsDirectory,
-      // Resolved lazily: the upload service is created just below.
-      isNameBusy: (name) => this.uploadDeployService?.isUploading(name) === true,
     });
     await this.gitDeployService.initialize();
 
@@ -2112,11 +2124,16 @@ backup:
     });
   }
 
+  /** Where the API's credential store lives (read, never written, by the role lookups here). */
+  private credentialsStorePath(): string {
+    return path.join(this.config.dropRoot, 'data', 'drop-svc', 'api-credentials.json');
+  }
+
   /**
    * Start the REST API server
    */
   private async startApiServer(): Promise<void> {
-    const credentialsPath = path.join(this.config.dropRoot, 'data', 'drop-svc', 'api-credentials.json');
+    const credentialsPath = this.credentialsStorePath();
 
     const logDir = path.join(this.config.dropRoot, 'data', 'logs');
 
@@ -3990,6 +4007,21 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     const services = config.services ?? {};
     const serviceNames = new Set(Object.keys(services));
 
+    // Whether this container is trusted: the operator's (folder-dropped, so no
+    // owner) or owned by an enabled admin. Decided ONCE per expansion, and used
+    // by the adoption guard, the case-only checks and the new-child name rule
+    // below. Everything else is held to the strict reading of each.
+    const ownerId = this.stateManager?.getApp(repoName)?.userId;
+    const containerTrusted =
+      !ownerId || (await isAdminPrincipalId(ownerId, this.credentialsStorePath()));
+    if (!containerTrusted) {
+      this.logger.info(
+        `Monorepo container '${repoName}' is owned by '${ownerId}', who is not an enabled admin: ` +
+          'holding it to the strict name and adoption rules',
+        'MONOREPO'
+      );
+    }
+
     // PROVENANCE GUARD, ahead of the group tag and every child: a child
     // records the container that materialized it (`groupContainer`), and a
     // group holding a child stamped by ANOTHER container is not this one's to
@@ -4002,12 +4034,19 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     // the stamping container out (only OTHER containers' stamps refuse).
     const stampedByRival = this.appConfigService
       ?.getAllConfigs()
-      .find((c) => c.group === group && c.groupContainer && c.groupContainer !== repoName);
+      .find(
+        (c) =>
+          sameNameIgnoringCase(c.group, group) &&
+          c.groupContainer &&
+          // The GROUP is compared ignoring case; the CONTAINER exactly: an app
+          // `Ops-Mono` is not the `ops-mono` that stamped these children.
+          c.groupContainer !== repoName
+      );
     if (stampedByRival) {
       this.logger.error(
         `Refusing monorepo group '${group}' for '${repoName}': its child '${stampedByRival.name}' ` +
           `was materialized by container '${stampedByRival.groupContainer}'. Remove that ` +
-          'container, or its children, first.',
+          "group's children first, or deploy under a different group.",
         'MONOREPO'
       );
       this.warnIfOperatorRefused(
@@ -4016,7 +4055,29 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         stampedByRival.groupContainer as string
       );
       throw new Error(
-        `Monorepo group '${group}' belongs to another container; remove it or its children first.`
+        `Monorepo group '${group}' belongs to another container; remove that group's children first, or deploy under a different group.`
+      );
+    }
+
+    // A group that is another container's recorded NAME is not an untrusted
+    // container's to use, whatever case it is written in: the group is an
+    // identity, and that name is the container's.
+    const groupIsContainerName =
+      !containerTrusted &&
+      this.appConfigService
+        ?.getAllConfigs()
+        .find(
+          (c) =>
+            sameNameIgnoringCase(c.groupContainer, group) && !sameNameIgnoringCase(c.group, group)
+        );
+    if (groupIsContainerName) {
+      this.logger.error(
+        `Refusing monorepo group '${group}' for '${repoName}': it is the name of container ` +
+          `'${groupIsContainerName.groupContainer}', which materialized '${groupIsContainerName.name}'.`,
+        'MONOREPO'
+      );
+      throw new Error(
+        `Monorepo group '${group}' is the name of another container; deploy under a different group.`
       );
     }
 
@@ -4030,12 +4091,15 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     // its own, locking the operator out. An admin-owned or unowned container is
     // trusted and adopts as before; an admin clears this by re-owning it.
     const adopterState = this.stateManager?.getApp(repoName);
-    if (adopterState?.userId && getUserById(adopterState.userId)?.role !== 'admin') {
+    if (adopterState?.userId && !containerTrusted) {
+      // A missing or unparseable timestamp is NaN, and NaN compares false: that
+      // fails OPEN (no refusal), deliberately, so an entry without dates cannot
+      // wedge a group.
       const adopted = this.appConfigService
         ?.getAllConfigs()
         .find(
           (c) =>
-            c.group === group &&
+            sameNameIgnoringCase(c.group, group) &&
             !c.groupContainer &&
             c.name !== repoName &&
             !this.stateManager?.getApp(c.name)?.isGroupContainer &&
@@ -4087,12 +4151,17 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     // the `ezsign` group un-redeployable for three days, and the guard's own
     // regression test hid it by seeding a child with a userId that production
     // never writes.
-    const containerOwner = this.stateManager?.getApp(repoName)?.userId;
+    const containerOwner = ownerId;
+    // A trusted container compares exactly, so legacy mixed-case setups keep
+    // working; an untrusted one is refused on a case-only match as well.
+    const sameName = containerTrusted
+      ? (x: string | undefined, y: string | undefined): boolean => x !== undefined && x === y
+      : sameNameIgnoringCase;
     const groupClaimant = this.stateManager?.getAllApps().find((a) => {
       if (a.name === repoName) return false;
       // An app literally NAMED the group — the attack this guard exists for.
-      if (a.name === group) return true;
-      if (a.group !== group) return false;
+      if (sameName(a.name, group)) return true;
+      if (!sameName(a.group, group)) return false;
       // Another CONTAINER for the same group: two tenants racing one name.
       if (a.isGroupContainer) return true;
       // Otherwise a MEMBER — a child of this group. Only a claimant when it is
@@ -4148,8 +4217,26 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         // Collision guard: refuse to clobber a standalone app (or an app from
         // a different group) that already owns this name. Allow refresh when
         // the existing config already belongs to this same group (redeploy).
-        const existing = this.appConfigService?.getConfig(childName);
-        if (existing && existing.group !== group) {
+        //
+        // Looked up ignoring case, so `EZS-web` meets `ezs-web`: the two are one
+        // hostname. A match that differs from `childName` in case is somebody
+        // else's app, never a refresh.
+        // A trusted container skips the case-only reading (see `sameName` above).
+        const existing =
+          this.appConfigService?.getConfig(childName) ??
+          (containerTrusted
+            ? undefined
+            : this.appConfigService?.getAllConfigs().find((c) => sameNameIgnoringCase(c.name, childName)));
+        const caseVariantInState =
+          !containerTrusted &&
+          this.stateManager
+            ?.getAllApps()
+            .some((a) => a.name !== childName && sameNameIgnoringCase(a.name, childName));
+        if (
+          caseVariantInState ||
+          (existing &&
+            ((existing.name !== undefined && existing.name !== childName) || !sameName(existing.group, group)))
+        ) {
           this.logger.warn(
             `Skipping service '${svcName}': app '${childName}' already exists and does not ` +
               `belong to monorepo group '${group}'`,
@@ -4177,6 +4264,33 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           this.logger.warn(
             `Skipping service '${svcName}': '${childPath}' already exists on disk with no app ` +
               `config to vouch for it; refusing to delete it. Remove it manually if it is stale.`,
+            'MONOREPO'
+          );
+          continue;
+        }
+        // A NEW child is subject to the same name rules as any new app: it may
+        // not take a name another app, another group, or a RECORDED CONTAINER
+        // already holds. Otherwise a container could mint, as a child, the name
+        // of a deleted container whose surviving children are still stamped, and
+        // then expand as that container. Applies to EVERY container, trusted or
+        // not: the trust relaxation above is only for refreshing an EXISTING
+        // child by its exact name, and a name that matches another ignoring case
+        // is the same hostname to Caddy, where duplicate site blocks can wedge
+        // the reload box-wide (a case-sensitive filesystem would not stop it).
+        // "Existing" means an exact config or state entry. With no config
+        // service the recorded names cannot be read, and isNameTaken fails closed.
+        if (
+          !existing &&
+          !this.stateManager?.getApp(childName) &&
+          isNameTaken(childName, {
+            stateManager: this.stateManager as AppStateManager,
+            appConfigService: this.appConfigService ?? undefined,
+            ownGroup: group,
+          })
+        ) {
+          this.logger.warn(
+            `Skipping service '${svcName}': the name '${childName}' is already held by another ` +
+              'app, group or container',
             'MONOREPO'
           );
           continue;

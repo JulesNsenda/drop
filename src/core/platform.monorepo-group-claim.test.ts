@@ -105,9 +105,7 @@ describe('monorepo group provenance (groupContainer)', () => {
     await acs.initialize();
     // Owners are looked up by id for the adoption guard: 'boss' is an admin,
     // everyone else an ordinary user.
-    jest.spyOn(auth, 'getUserById').mockImplementation(
-      (id: string) => ({ id, username: id, role: id === 'boss' ? 'admin' : 'user' }) as any
-    );
+    jest.spyOn(auth, 'isAdminPrincipalId').mockImplementation(async (id: string) => id === 'boss');
     handleBuildApp = jest.fn().mockResolvedValue(undefined);
     handleAppUpdate = jest.fn().mockResolvedValue(true);
 
@@ -298,6 +296,271 @@ describe('monorepo group provenance (groupContainer)', () => {
       await expect(expand('ezs', ['web'])).rejects.toThrow(PROV_ERR);
 
       expect(warn.mock.calls.some((c) => String(c[0]).includes("held by 'evil'"))).toBe(true);
+    });
+  });
+
+  describe('names compared ignoring case', () => {
+    it('refuses a tenant container whose group differs from a stamped one only in case', async () => {
+      await seedChild('ezs-web', 'ezs', { groupContainer: 'ezs' });
+      await registerTenantContainer();
+
+      await expect(expand('evil', ['web'], 'EZS')).rejects.toThrow(PROV_ERR);
+
+      expect(await fs.readFile(path.join(childPathOf('ezs-web'), 'index.html'), 'utf-8')).toBe(
+        '<h1>OPERATOR</h1>'
+      );
+      expect(acs.hasConfig('EZS-web')).toBe(false);
+      expect(handleAppUpdate).not.toHaveBeenCalled();
+    });
+
+    it('refuses a group that differs from another owner\'s container group only in case', async () => {
+      await stateManager.registerApp('ezs-repo', repoPathOf('ezs'), 'unknown');
+      await stateManager.updateApp('ezs-repo', { userId: 'owner', group: 'ezs', isGroupContainer: true });
+      await registerTenantContainer();
+
+      await expect(expand('evil', ['web'], 'EZS')).rejects.toThrow(OWNER_ERR);
+    });
+
+    it('does not treat `EZS-web` as a refresh of an existing `ezs-web`', async () => {
+      // An admin-owned container skips the adoption guard, so only the child
+      // guard stands between it and the operator's child.
+      await seedChild('ezs-web', 'ezs');
+      await stateManager.registerApp('evil', repoPathOf('evil'), 'unknown');
+      await stateManager.updateApp('evil', { userId: 'boss' });
+
+      await expand('evil', ['web'], 'EZS');
+
+      expect(await fs.readFile(path.join(childPathOf('ezs-web'), 'index.html'), 'utf-8')).toBe(
+        '<h1>OPERATOR</h1>'
+      );
+      expect(acs.hasConfig('EZS-web')).toBe(false);
+      expect(acs.getConfig('ezs-web')?.groupContainer).toBeUndefined();
+      expect(handleAppUpdate).not.toHaveBeenCalled();
+      expect(handleBuildApp).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('container identity is exact, group names are not', () => {
+    it('refuses a tenant app `Ops-Mono` naming the group of the stamped `ops-mono`, children untouched', async () => {
+      await writeTree(repoPathOf('ops-mono'), { 'web/index.html': '<h1>OPS v2</h1>' });
+      await expand('ops-mono', ['web'], 'ops');
+      expect(acs.getConfig('ops-web')?.groupContainer).toBe('ops-mono');
+      const before = await fs.readFile(path.join(childPathOf('ops-web'), 'index.html'), 'utf-8');
+      handleAppUpdate.mockClear();
+      handleBuildApp.mockClear();
+
+      await writeTree(repoPathOf('Ops-Mono'), { 'web/index.html': '<h1>TENANT</h1>' });
+      await stateManager.registerApp('Ops-Mono', repoPathOf('Ops-Mono'), 'unknown');
+      await stateManager.updateApp('Ops-Mono', { userId: 'attacker' });
+
+      await expect(expand('Ops-Mono', ['web'], 'ops')).rejects.toThrow(PROV_ERR);
+
+      expect(await fs.readFile(path.join(childPathOf('ops-web'), 'index.html'), 'utf-8')).toBe(before);
+      expect(acs.getConfig('ops-web')?.groupContainer).toBe('ops-mono');
+      expect(handleAppUpdate).not.toHaveBeenCalled();
+      expect(handleBuildApp).not.toHaveBeenCalled();
+    });
+
+    it("refuses an untrusted container whose group is another container's recorded name", async () => {
+      await seedChild('victim-web', 'victim', { groupContainer: 'acme-mono' });
+      await registerTenantContainer();
+
+      await expect(expand('evil', ['web'], 'Acme-Mono')).rejects.toThrow(/name of another container/);
+      // A trusted (admin-owned) container is not held to it.
+      await stateManager.updateApp('evil', { userId: 'boss' });
+      await expect(expand('evil', ['web'], 'Acme-Mono')).resolves.toBeUndefined();
+    });
+
+    it('lets a trusted container keep a legacy mixed-case group working', async () => {
+      // Case-only matches are the strict reading; a folder-dropped container
+      // (trusted) compares exactly.
+      await seedChild('Legacy-web', 'Legacy');
+      await writeTree(repoPathOf('legacy-repo'), { 'web/index.html': '<h1>v2</h1>' });
+
+      await expect(
+        priv().expandMonorepo(repoPathOf('legacy-repo'), 'legacy-repo', {
+          group: 'Legacy',
+          services: { web: { path: 'web', type: 'static' } },
+        })
+      ).resolves.toBeUndefined();
+
+      expect(acs.getConfig('Legacy-web')?.groupContainer).toBe('legacy-repo');
+    });
+
+    it('logs the verdict once when an owned container is judged untrusted', async () => {
+      const info = jest.spyOn(priv().logger, 'info');
+      await registerTenantContainer();
+
+      await expand('evil', ['web'], 'solo');
+
+      const verdicts = info.mock.calls.filter((c) => String(c[0]).includes('not an enabled admin'));
+      expect(verdicts).toHaveLength(1);
+    });
+  });
+
+  describe('trust from a real credentials file, with auth not initialised', () => {
+    async function writeCredentials(users: Array<{ id: string; role: string }>): Promise<void> {
+      const file = path.join(tempDir, 'data', 'drop-svc', 'api-credentials.json');
+      await fs.mkdir(path.dirname(file), { recursive: true });
+      await fs.writeFile(
+        file,
+        JSON.stringify({
+          users: users.map((u) => ({ ...u, username: u.id, passwordHash: 'x', createdAt: 'now' })),
+          apiKeys: [],
+          jwtSecret: 'secret',
+        })
+      );
+    }
+
+    async function hijackedBy(owner: string): Promise<void> {
+      await seedChild('ezs-web', 'ezs', { userId: owner, createdAt: '2026-01-01T00:00:00.000Z' });
+      await stateManager.registerApp('evil', repoPathOf('evil'), 'unknown');
+      await stateManager.updateApp('evil', {
+        userId: owner,
+        group: 'ezs',
+        isGroupContainer: true,
+        createdAt: '2026-06-01T00:00:00.000Z',
+      } as any);
+    }
+
+    beforeEach(() => {
+      jest.spyOn(auth, 'isAdminPrincipalId').mockRestore();
+      auth.resetAuth();
+    });
+
+    it('trusts a container whose owner is an admin user in the file', async () => {
+      await writeCredentials([{ id: 'u-admin', role: 'admin' }]);
+      await hijackedBy('u-admin');
+
+      await expect(expand('evil', ['web'], 'ezs')).resolves.toBeUndefined();
+      expect(acs.getConfig('ezs-web')?.groupContainer).toBe('evil');
+    });
+
+    it('does not trust a container whose owner is an ordinary user in the file', async () => {
+      await writeCredentials([{ id: 'u-user', role: 'user' }]);
+      await hijackedBy('u-user');
+
+      await expect(expand('evil', ['web'], 'ezs')).rejects.toThrow(ADOPT_ERR);
+    });
+  });
+
+  describe('a NEW child is held to the new-app name rules', () => {
+    // A deleted container 'acme-platform' left stamped children behind. A new
+    // container naming group 'acme' with a service 'platform' would mint a child
+    // of exactly that name, and could then expand as the deleted container.
+    async function seedDeletedContainersChildren(): Promise<void> {
+      await seedChild('victim-web', 'victim', { groupContainer: 'acme-platform' });
+      await writeTree(repoPathOf('evil'), { 'platform/index.html': '<h1>TENANT</h1>' });
+    }
+
+    it("skips a child named after a deleted container's recorded name, for a non-admin container", async () => {
+      await seedDeletedContainersChildren();
+      await registerTenantContainer();
+
+      await expand('evil', ['platform'], 'acme');
+
+      expect(acs.hasConfig('acme-platform')).toBe(false);
+      expect(stateManager.hasApp('acme-platform')).toBe(false);
+      expect(await exists(childPathOf('acme-platform'))).toBe(false);
+      expect(handleBuildApp).not.toHaveBeenCalled();
+    });
+
+    it('skips a child named after an existing app or another group, ignoring case', async () => {
+      await stateManager.registerApp('Exists-App', childPathOf('Exists-App'), 'static');
+      await seedChild('x-web', 'G-web');
+      await writeTree(repoPathOf('evil'), { 'app/index.html': 'x', 'web/index.html': 'x' });
+      await registerTenantContainer();
+
+      await expand('evil', ['app'], 'exists');
+      await expand('evil', ['web'], 'g');
+
+      expect(acs.hasConfig('exists-app')).toBe(false);
+      expect(acs.hasConfig('g-web')).toBe(false);
+      expect(handleBuildApp).not.toHaveBeenCalled();
+    });
+
+    it('skips it for a folder-dropped (unowned, trusted) container too', async () => {
+      await seedDeletedContainersChildren();
+      await writeTree(repoPathOf('ezs'), { 'platform/index.html': '<h1>OPERATOR</h1>' });
+
+      await expand('ezs', ['platform'], 'acme');
+
+      expect(acs.hasConfig('acme-platform')).toBe(false);
+      expect(handleBuildApp).not.toHaveBeenCalled();
+    });
+
+    it('skips it for an admin-owned container too', async () => {
+      await seedDeletedContainersChildren();
+      await stateManager.registerApp('evil', repoPathOf('evil'), 'unknown');
+      await stateManager.updateApp('evil', { userId: 'boss' });
+
+      await expand('evil', ['platform'], 'acme');
+
+      expect(acs.hasConfig('acme-platform')).toBe(false);
+    });
+
+    // The Linux path. Config and state are case-sensitive maps on every OS, but
+    // on Windows/macOS the folder-exists guard fires first for a case-variant
+    // child whose folder is there, hiding a missing name rule. With no folder on
+    // disk for the variant, only the name rule can stop it, on any OS.
+    it('skips a case-variant NEW child for a trusted container even with no folder to collide with', async () => {
+      // A legacy, unstamped child: nothing at group level stops the container.
+      await acs.upsertSystemConfig('ezs-web', { type: 'static', group: 'ezs' });
+      await stateManager.registerApp('ezs-web', childPathOf('ezs-web'), 'static');
+      await stateManager.registerApp('evil', repoPathOf('evil'), 'unknown');
+      await stateManager.updateApp('evil', { userId: 'boss' });
+
+      await expand('evil', ['web'], 'EZS');
+
+      expect(acs.hasConfig('EZS-web')).toBe(false);
+      expect(stateManager.hasApp('EZS-web')).toBe(false);
+      expect(await exists(childPathOf('EZS-web'))).toBe(false);
+      expect(handleBuildApp).not.toHaveBeenCalled();
+    });
+
+    it('still lets a trusted container refresh its OWN exact legacy child while a case-variant sibling exists', async () => {
+      await seedChild('ezs-web', 'ezs');
+      // A case-variant record with no folder of its own (legacy mixed-case setup).
+      await acs.upsertSystemConfig('EZS-Web', { type: 'static', group: 'other' });
+      await writeTree(repoPathOf('ezs'), { 'web/index.html': '<h1>OPERATOR v2</h1>' });
+
+      await expand('ezs', ['web']);
+
+      expect(handleAppUpdate).toHaveBeenCalledTimes(1);
+      expect(handleAppUpdate.mock.calls[0][0]).toBe('ezs-web');
+      expect(acs.getConfig('ezs-web')?.groupContainer).toBe('ezs');
+      expect(await fs.readFile(path.join(childPathOf('ezs-web'), 'index.html'), 'utf-8')).toBe(
+        '<h1>OPERATOR v2</h1>'
+      );
+    });
+
+    it('still creates an ordinary new child for a non-admin container', async () => {
+      await registerTenantContainer();
+
+      await expand('evil', ['web'], 'fresh');
+
+      expect(acs.getConfig('fresh-web')?.groupContainer).toBe('evil');
+      expect(handleBuildApp).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('provenance across a restart', () => {
+    it('survives a new AppConfigService on the same dir, and the rival is still refused', async () => {
+      await expand('ezs', ['web']);
+      expect(acs.getConfig('ezs-web')?.groupContainer).toBe('ezs');
+
+      // A fresh service over the same files, as after a platform restart.
+      const reloaded = new AppConfigService({
+        configDir: path.join(tempDir, 'appconf'),
+        webappsDir: appsDir,
+      });
+      await reloaded.initialize();
+      expect(reloaded.getConfig('ezs-web')?.groupContainer).toBe('ezs');
+      priv().appConfigService = reloaded;
+      await registerTenantContainer();
+
+      await expect(expand('evil', ['web'], 'ezs')).rejects.toThrow(PROV_ERR);
+      expect(reloaded.getConfig('ezs-web')?.groupContainer).toBe('ezs');
     });
   });
 

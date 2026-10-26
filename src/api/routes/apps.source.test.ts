@@ -10,6 +10,7 @@
  * (covered by upload-deploy.test.ts / tar-extract.test.ts).
  */
 
+import { getAppConfigService, resetAppConfigService } from '../../managers/app/app-config';
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import * as os from 'os';
@@ -76,6 +77,9 @@ describe('POST /apps/:name/source (upload deploy)', () => {
     activitySpy = jest.spyOn(activity, 'logActivityFor').mockResolvedValue();
 
     getStateManager({ stateFilePath: path.join(tempDir, 'apps.json') });
+    // The new-app name rules fail closed without a config service.
+    resetAppConfigService();
+    await getAppConfigService({ configDir: path.join(tempDir, 'appconf'), webappsDir: tempDir }).initialize();
 
     server = new ApiServer({
       port: 3098,
@@ -104,6 +108,7 @@ describe('POST /apps/:name/source (upload deploy)', () => {
     await getStateManager().close();
     resetStateManager();
     resetAuth();
+    resetAppConfigService();
     jest.restoreAllMocks();
     await fs.rm(tempDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   });
@@ -203,6 +208,22 @@ describe('POST /apps/:name/source (upload deploy)', () => {
       });
       expect(res.status).toBe(202);
       expect(deployMock).toHaveBeenCalledWith(expect.objectContaining({ appName: 'dropped' }));
+    });
+
+    it('404s a non-admin upload to a name that is a group, or an existing app in another case', async () => {
+      await getStateManager().registerApp('Existing', path.join(webapps, 'Existing'));
+      await getStateManager().registerApp('grp-web', path.join(webapps, 'grp-web'));
+      await getStateManager().updateApp('grp-web', { group: 'grp' });
+
+      for (const name of ['grp', 'GRP', 'existing']) {
+        const res = await hono.request(`/api/v1/apps/${name}/source`, {
+          method: 'POST',
+          headers: authHeader(aliceToken),
+          body: Buffer.from('fake-archive-bytes'),
+        });
+        expect(res.status).toBe(404);
+      }
+      expect(deployMock).not.toHaveBeenCalled();
     });
 
     it('still lets a non-admin create a genuinely new name — 202', async () => {

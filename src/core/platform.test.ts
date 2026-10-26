@@ -2340,8 +2340,9 @@ describe('expandMonorepo (M2: monorepo -> per-service app expansion)', () => {
     );
     appsDir = path.join(tempDir, 'apps');
     await fsPromises.mkdir(appsDir, { recursive: true });
-    // The real service: file-system writes are mocked file-wide, so it keeps
-    // its state in memory here, which is all this suite needs.
+    // The real service. The atomic-write path (`open`/`rename`) stays mocked
+    // file-wide, so its writes are no-ops and it keeps its state in memory,
+    // which is all this suite needs.
     acs = new AppConfigService({ configDir: path.join(tempDir, 'appconf'), webappsDir: appsDir });
     await acs.initialize();
 

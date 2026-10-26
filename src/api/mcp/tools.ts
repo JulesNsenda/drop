@@ -664,6 +664,7 @@ export async function handleDeployFromGit(
       userId: auth?.userId,
       principalId: auth?.principalId,
       agentCaller: auth?.kind === 'agent',
+      callerIsAdmin: auth?.role === 'admin',
     });
     await auditToolAction(auth, 'agent-deploy', result.appName, 'deploy_from_git');
 
