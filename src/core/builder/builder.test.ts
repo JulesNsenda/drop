@@ -748,18 +748,45 @@ describe('BuilderService Integration', () => {
     expect(failed![1].command.length).toBe(512);
   });
 
-  it('emits no events when deferred by the concurrent-build cap', async () => {
-    // MAX_BUILDS is a deferral, not a failure: the platform re-queues the app
-    // and the retry opens its own episode. Publishing here would either strand
-    // a 'superseded' episode or report a queue wait as a failed deploy.
+  describe('concurrent-build cap', () => {
+    // A cap-full build WAITS for a slot (FIFO) instead of failing: a refusal
+    // used to lose redeploys of running apps that nothing retried. 'rust' has no
+    // built-in strategy, so the gated custom strategy below is the only match.
     const { eventBus } = jest.requireMock('../event-bus');
-    const service = new BuilderService({ maxConcurrentBuilds: 0 });
-    (eventBus.publish as jest.Mock).mockClear();
+    let started: string[];
+    let live: number;
+    let peak: number;
+    let gates: Map<string, () => void>;
+    let throwFor: Set<string>;
 
-    const result = await service.build({
-      appName: 'deferred-app',
+    const makeService = (maxConcurrentBuilds: number): BuilderService => {
+      const service = new BuilderService({ maxConcurrentBuilds });
+      service.registerStrategy({
+        name: 'gated',
+        supportedTypes: ['rust'],
+        canBuild: () => true,
+        getInstallCommand: () => null,
+        getBuildCommand: () => null,
+        getOutputDirectory: () => null,
+        preBuild: async (context: BuildContext) => {
+          started.push(context.appName);
+          live++;
+          peak = Math.max(peak, live);
+          try {
+            if (throwFor.has(context.appName)) throw new Error('strategy blew up');
+            await new Promise<void>((resolve) => gates.set(context.appName, resolve));
+          } finally {
+            live--;
+          }
+        },
+      } as BuildStrategy);
+      return service;
+    };
+
+    const ctx = (appName: string): BuildContext => ({
+      appName,
       appPath: tempDir,
-      appType: 'nodejs',
+      appType: 'rust',
       framework: null,
       config: {},
       env: {},
@@ -768,8 +795,231 @@ describe('BuilderService Integration', () => {
       nodeModulesAsideDir: undefined,
     });
 
-    expect(result.errors.some(e => e.code === 'MAX_BUILDS')).toBe(true);
-    expect(eventBus.publish).not.toHaveBeenCalled();
+    const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
+    const finish = async (appName: string) => {
+      gates.get(appName)!();
+      gates.delete(appName);
+      await tick();
+    };
+    const startedEvents = () =>
+      (eventBus.publish as jest.Mock).mock.calls
+        .filter(([name]: [string]) => name === 'build:started')
+        .map(([, payload]: [string, { appId: string }]) => payload.appId);
+
+    beforeEach(() => {
+      started = [];
+      live = 0;
+      peak = 0;
+      gates = new Map();
+      throwFor = new Set();
+      (eventBus.publish as jest.Mock).mockClear();
+    });
+
+    it('a second build waits and starts only after the first finishes', async () => {
+      const service = makeService(1);
+      const first = service.build(ctx('a'));
+      const second = service.build(ctx('b'));
+      await tick();
+
+      expect(started).toEqual(['a']);
+      expect(startedEvents()).toEqual(['a']);
+
+      await finish('a');
+      expect((await first).errors.some((e) => e.code === 'MAX_BUILDS')).toBe(false);
+      expect(started).toEqual(['a', 'b']);
+
+      await finish('b');
+      expect((await second).success).toBe(true);
+    });
+
+    it('starts three builds at cap 1 in FIFO order', async () => {
+      const service = makeService(1);
+      const results = [service.build(ctx('a')), service.build(ctx('b')), service.build(ctx('c'))];
+      await tick();
+      expect(started).toEqual(['a']);
+
+      await finish('a');
+      expect(started).toEqual(['a', 'b']);
+      await finish('b');
+      expect(started).toEqual(['a', 'b', 'c']);
+      await finish('c');
+
+      expect((await Promise.all(results)).every((r) => r.success)).toBe(true);
+    });
+
+    it('a throwing strategy frees its slot so the waiter proceeds', async () => {
+      const service = makeService(1);
+      throwFor.add('a');
+      const first = service.build(ctx('a'));
+      const second = service.build(ctx('b'));
+      await tick();
+
+      expect((await first).success).toBe(false);
+      expect(started).toEqual(['a', 'b']);
+      await finish('b');
+      expect((await second).success).toBe(true);
+    });
+
+    it('cap 0 means unlimited: nothing waits', async () => {
+      const service = makeService(0);
+      const names = ['a', 'b', 'c', 'd', 'e'];
+      const all = names.map((n) => service.build(ctx(n)));
+      await tick();
+
+      expect(started).toEqual(names);
+      for (const n of names) await finish(n);
+      expect((await Promise.all(all)).every((r) => r.success)).toBe(true);
+    });
+
+    it('a NaN cap is unlimited too', async () => {
+      const service = makeService(NaN);
+      const all = [service.build(ctx('a')), service.build(ctx('b'))];
+      await tick();
+
+      expect(started).toEqual(['a', 'b']);
+      await finish('a');
+      await finish('b');
+      await Promise.all(all);
+    });
+
+    it('a waiter publishes no build:started until it holds the slot', async () => {
+      const service = makeService(1);
+      const first = service.build(ctx('a'));
+      const second = service.build(ctx('b'));
+      await tick();
+      expect(startedEvents()).toEqual(['a']);
+      expect(
+        (eventBus.publish as jest.Mock).mock.calls.some(
+          ([, payload]: [string, { appId: string }]) => payload.appId === 'b'
+        )
+      ).toBe(false);
+
+      await finish('a');
+      expect(startedEvents()).toEqual(['a', 'b']);
+      await finish('b');
+      await Promise.all([first, second]);
+    });
+
+    it('refuses a second build of an app that is running or waiting with BUILD_IN_PROGRESS', async () => {
+      const service = makeService(1);
+      const running = service.build(ctx('a'));
+      const waiting = service.build(ctx('b'));
+      await tick();
+
+      const dupRunning = await service.build(ctx('a'));
+      const dupWaiting = await service.build(ctx('b'));
+      expect(dupRunning.errors[0].code).toBe('BUILD_IN_PROGRESS');
+      expect(dupWaiting.errors[0].code).toBe('BUILD_IN_PROGRESS');
+
+      await finish('a');
+      // 'b' now holds the slot (no longer waiting) and is still refused.
+      expect((await service.build(ctx('b'))).errors[0].code).toBe('BUILD_IN_PROGRESS');
+      await finish('b');
+      await Promise.all([running, waiting]);
+      // Gone from both sets once done: a fresh build is accepted.
+      const again = service.build(ctx('b'));
+      await tick();
+      expect(started).toEqual(['a', 'b', 'b']);
+      await finish('b');
+      expect((await again).success).toBe(true);
+    });
+
+    it('reserveSlot grants FIFO under the cap and its release is idempotent', async () => {
+      const service = makeService(1);
+      const order: string[] = [];
+      const releaseA = await service.reserveSlot('a');
+      const pb = service.reserveSlot('b').then((r) => (order.push('b'), r));
+      const pc = service.reserveSlot('c').then((r) => (order.push('c'), r));
+      await tick();
+      expect(order).toEqual([]);
+
+      releaseA();
+      releaseA(); // a double release must not hand out a second slot
+      await tick();
+      expect(order).toEqual(['b']);
+
+      (await pb)();
+      await tick();
+      expect(order).toEqual(['b', 'c']);
+      (await pc)();
+    });
+
+    it('build with slotReserved neither waits nor releases the caller slot', async () => {
+      const service = makeService(1);
+      const release = await service.reserveSlot('a');
+      let secondGranted = false;
+      const second = service.reserveSlot('b').then((r) => ((secondGranted = true), r));
+
+      // Cap is full, yet the build of the reserving app starts at once.
+      const built = service.build({ ...ctx('a'), slotReserved: true });
+      await tick();
+      expect(started).toEqual(['a']);
+
+      await finish('a');
+      expect((await built).success).toBe(true);
+      await tick();
+      expect(secondGranted).toBe(false); // build() did not free the caller's slot
+
+      release();
+      (await second)();
+      expect(secondGranted).toBe(true);
+    });
+
+    it('duration excludes the time spent waiting for a slot', async () => {
+      const service = makeService(1);
+      const first = service.build(ctx('a'));
+      const second = service.build(ctx('b'));
+      const queuedAt = Date.now();
+      await tick();
+      await new Promise((resolve) => setTimeout(resolve, 200));
+
+      await finish('a');
+      await first;
+      const waited = Date.now() - queuedAt;
+      await finish('b');
+      const result = await second;
+      expect(result.success).toBe(true);
+      // Measured against the actual wait, not an absolute bound.
+      expect(result.duration).toBeLessThan(waited);
+    });
+
+    it('a NO_STRATEGY build returns at once under a full cap', async () => {
+      const service = new BuilderService({ maxConcurrentBuilds: 1 });
+      const release = await service.reserveSlot('holder');
+
+      const result = await service.build(ctx('nostrat'));
+
+      expect(result.errors[0].code).toBe('NO_STRATEGY');
+      release();
+    });
+
+    it('a build() of an app that is waiting in reserveSlot gets BUILD_IN_PROGRESS', async () => {
+      const service = makeService(1);
+      const release = await service.reserveSlot('holder');
+      const waiting = service.reserveSlot('b');
+      await tick();
+
+      const result = await service.build(ctx('b'));
+      expect(result.errors[0].code).toBe('BUILD_IN_PROGRESS');
+
+      release();
+      (await waiting)();
+    });
+
+    it('never exceeds the cap under concurrent calls', async () => {
+      const service = makeService(2);
+      const names = ['a', 'b', 'c', 'd', 'e', 'f'];
+      const all = names.map((n) => service.build(ctx(n)));
+      await tick();
+
+      for (const n of names) {
+        await tick();
+        await finish(n);
+        expect(peak).toBeLessThanOrEqual(2);
+      }
+      expect((await Promise.all(all)).every((r) => r.success)).toBe(true);
+      expect(peak).toBe(2);
+    });
   });
 
   it('should build static site successfully', async () => {
@@ -821,7 +1071,7 @@ describe('BuilderService Integration', () => {
       nodeModulesAsideDir: undefined,
     });
 
-    // Try to start second build immediately
+    // Start the second build immediately: it waits for the first's slot
     const build2Promise = service.build({
       appName: 'app2',
       appPath: appDir2,
@@ -836,9 +1086,9 @@ describe('BuilderService Integration', () => {
 
     const [result1, result2] = await Promise.all([build1Promise, build2Promise]);
 
-    // At least one should succeed, the other might fail due to concurrency limit
-    // Since static builds are fast, both might succeed
-    expect(result1.success || result2.success).toBe(true);
+    // The second waits for the slot instead of failing on the cap, so both succeed.
+    expect(result1.success).toBe(true);
+    expect(result2.success).toBe(true);
   });
 
   it('should track build status', async () => {

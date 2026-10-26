@@ -65,6 +65,11 @@ export class BuilderService {
   private readonly config: BuilderConfig;
   private readonly strategies: BuildStrategy[] = [];
   private readonly activeBuilds: Map<string, ActiveBuild> = new Map();
+  // Slots granted and not yet released (running builds plus a slot in flight to
+  // a woken waiter), the FIFO of builds waiting for one, and their app names.
+  private slotsHeld = 0;
+  private readonly slotWaiters: Array<() => void> = [];
+  private readonly waitingApps: Set<string> = new Set();
 
   constructor(config: Partial<BuilderConfig> = {}) {
     this.config = { ...DEFAULT_CONFIG, ...config };
@@ -82,7 +87,7 @@ export class BuilderService {
    * Build an application
    */
   async build(context: BuildContext): Promise<BuildResult> {
-    const startedAt = new Date();
+    let startedAt = new Date();
     const stages: BuildStageResult[] = [];
     const errors: BuildError[] = [];
     const warnings: string[] = [];
@@ -96,26 +101,14 @@ export class BuilderService {
     // build's sweep deletes as a leftover, and its aside root is per APP, so two
     // overlapping builds of one app would delete each other's only copy of the
     // old dependencies (the platform's appsInProgress is the first line of
-    // defense; this is the backstop). Like the cap below, a refusal emits NO
-    // events and runs before any dependency step: it is not THIS build's failure.
-    if (this.activeBuilds.has(context.appName)) {
+    // defense; this is the backstop). A refusal emits NO events and runs before
+    // any dependency step: it is not THIS build's failure. An app WAITING for a
+    // slot counts as running, or a second build of it would queue behind the
+    // first and then run twice.
+    if (this.activeBuilds.has(context.appName) || this.waitingApps.has(context.appName)) {
       return this.createFailedResult(
         startedAt,
         [{ stage: 'pre-build', message: 'A build of this app is already running', code: 'BUILD_IN_PROGRESS' }],
-        []
-      );
-    }
-
-    // Check concurrent build limit.
-    // Deliberately emits NO events: this is a DEFERRAL, not a failure — the
-    // platform re-queues the app (see handleBuildApp's MAX_BUILDS branch) and
-    // the retry opens its own episode. Publishing build:started here would
-    // leave an episode that only ever derives as 'superseded', and publishing
-    // build:failed would report a queue wait as a failed deploy.
-    if (this.activeBuilds.size >= this.config.maxConcurrentBuilds) {
-      return this.createFailedResult(
-        startedAt,
-        [{ stage: 'pre-build', message: 'Maximum concurrent builds reached', code: 'MAX_BUILDS' }],
         []
       );
     }
@@ -154,6 +147,27 @@ export class BuilderService {
       return this.createFailedResult(startedAt, [noStrategy], []);
     }
 
+    // Concurrent build limit. A full cap makes this build WAIT (FIFO) rather
+    // than fail: a refusal here used to lose a redeploy of a running app (a
+    // boot-reconcile burst exceeds the cap) that nothing retried. Waiting emits
+    // NO events — build:started below fires only once the slot is held — and it
+    // comes after the NO_STRATEGY return, which needs no slot. A caller that
+    // reserved its own slot (reserveSlot) owns it: it is neither taken nor
+    // released here.
+    // Only awaited when it must wait, so the uncontended path stays synchronous
+    // up to activeBuilds.set (no window for a same-app build to slip through);
+    // a woken waiter leaves waitingApps in the same run as that set.
+    const ownsSlot = !context.slotReserved;
+    if (ownsSlot) {
+      const slotWait = this.acquireSlot(context.appName);
+      if (slotWait) {
+        await slotWait;
+        this.waitingApps.delete(context.appName);
+        // Duration (and the platform's cooldown derived from it) excludes queue time.
+        startedAt = new Date();
+      }
+    }
+
     // Setup abort controller for cancellation
     const abortController = new AbortController();
 
@@ -168,14 +182,16 @@ export class BuilderService {
     };
     this.activeBuilds.set(context.appName, activeBuild);
 
-    // Emit build started event
-    eventBus.publish('build:started', {
-      appId: context.appName,
-      buildId,
-      deployId: context.deployId,
-    });
-
+    // Nothing between the acquire above and this try can throw, so the finally
+    // always releases an owned slot (build:started is published inside it).
     try {
+      // Emit build started event
+      eventBus.publish('build:started', {
+        appId: context.appName,
+        buildId,
+        deployId: context.deployId,
+      });
+
       // The strategy's dependency step hands back a handle (stage pre-build);
       // this method is its one owner and settles it in the finally below.
       const dependencyStep: DependencyStepRef = {};
@@ -315,7 +331,64 @@ export class BuilderService {
       return this.createFailedResult(startedAt, errors, stages);
     } finally {
       this.activeBuilds.delete(context.appName);
+      if (ownsSlot) this.releaseSlot();
     }
+  }
+
+  /**
+   * Take a build slot ahead of build(), waiting FIFO while the cap is full, so
+   * a caller can wait BEFORE its own pre-build side effects (status writes,
+   * build logs, deploy targets). Resolves to an idempotent release; pass
+   * `slotReserved: true` to build() so it neither takes nor frees a slot. The
+   * app counts as running (BUILD_IN_PROGRESS for a concurrent build()) while it
+   * waits.
+   */
+  async reserveSlot(appName: string): Promise<() => void> {
+    const wait = this.acquireSlot(appName);
+    if (wait) {
+      await wait;
+      this.waitingApps.delete(appName);
+    }
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      this.releaseSlot();
+    };
+  }
+
+  /** maxConcurrentBuilds <= 0 or non-finite (NaN, Infinity) means no cap. */
+  private isUncapped(): boolean {
+    const max = this.config.maxConcurrentBuilds;
+    return !(max > 0) || !Number.isFinite(max);
+  }
+
+  /**
+   * Take a build slot, waiting FIFO while the cap is full.
+   *
+   * `slotsHeld` counts slots from grant to release, so it covers the gap
+   * between a waiter being woken and its activeBuilds.set. A slot is granted
+   * only synchronously (the counter is incremented in the same turn as the
+   * check) or by releaseSlot handing its own slot straight to the next waiter
+   * without decrementing; nothing can see a free slot in between, so
+   * slotsHeld never exceeds the cap. Returns null when granted at once.
+   */
+  private acquireSlot(appName: string): Promise<void> | null {
+    if (this.isUncapped() || this.slotsHeld < this.config.maxConcurrentBuilds) {
+      this.slotsHeld++;
+      return null;
+    }
+    this.waitingApps.add(appName);
+    return new Promise<void>((resolve) => {
+      this.slotWaiters.push(resolve);
+    });
+  }
+
+  /** Free a slot: hand it to the longest waiter, else give it back. */
+  private releaseSlot(): void {
+    const next = this.slotWaiters.shift();
+    if (next) next();
+    else this.slotsHeld--;
   }
 
   /**

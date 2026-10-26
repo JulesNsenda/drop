@@ -61,6 +61,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A redeploy refused by the build limit was never retried.** When more apps
+  rebuilt at once than `DROP_MAX_CONCURRENT_BUILDS` allows (for example the
+  boot reconcile after an image change), a redeploy that found no free build
+  slot was recorded as a failed build and nothing tried it again. A monorepo
+  child whose source had just been re-synced was left without its build output
+  and served errors until someone redeployed it by hand. A redeploy now waits
+  for a free slot, in arrival order, without changing anything first: the old
+  version keeps serving and the status is untouched until the build starts. It
+  is dropped only if, while it waited, the app was stopped or removed, a
+  backup began, or a git pull or upload started. The builder also now honours
+  `DROP_MAX_CONCURRENT_BUILDS`; it always used 3 before.
 - **The dashboard/API custom domain was never routed (#302).** `customDomain`
   was stored and shown as the app's URL, but only `drop.yaml` `domains` ever
   reached Caddy, so that link served nothing and no certificate was issued. It

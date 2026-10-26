@@ -598,6 +598,31 @@ describe('DropPlatform', () => {
       await expect(platform.start()).rejects.toThrow('DROP platform is already running');
     });
 
+    it('builds with the configured maxConcurrentBuilds, and a restart re-applies it', async () => {
+      // getBuilder is a singleton that applies config on first creation only;
+      // stop() resets it so the next platform's cap is not the previous one's.
+      const make = (maxConcurrentBuilds: number) =>
+        createPlatform({
+          dropRoot: tempDir,
+          appsDirectory: path.join(tempDir, 'apps'),
+          logLevel: 'error',
+          autoBuild: false,
+          autoStart: false,
+          caddyfilePath: path.join(tempDir, 'Caddyfile'),
+          maxConcurrentBuilds,
+        });
+
+      const first = make(2);
+      await first.start();
+      expect(first.getBuilder()!.getConfig().maxConcurrentBuilds).toBe(2);
+      await first.stop();
+
+      const second = make(5);
+      await second.start();
+      expect(second.getBuilder()!.getConfig().maxConcurrentBuilds).toBe(5);
+      await second.stop();
+    });
+
     it('should initialize all services', async () => {
       await platform.start();
 

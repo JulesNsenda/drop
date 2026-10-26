@@ -34,7 +34,7 @@ import {
   readMcpInputs,
 } from './detector';
 import { getProcfileWebCommand } from './detector/procfile';
-import { BuilderService, getBuilder } from './builder';
+import { BuilderService, getBuilder, resetBuilder } from './builder';
 import { RouterService, getRouterService, resetRouterService } from './router';
 import { AppRuntime, AppProcessInfo, AppStartSpec, getAppRuntime, resetAppRuntime } from '../managers/runtime';
 import {
@@ -1290,6 +1290,8 @@ export class DropPlatform {
     resetUploadDeployService();
     resetActivityLog();
     resetBuildLogService();
+    // So the next platform's getBuilder applies ITS maxConcurrentBuilds.
+    resetBuilder();
     resetToolchainProbeCache();
     resetPlatformOps();
 
@@ -1974,7 +1976,7 @@ backup:
     this.detector = getDetector();
 
     // Initialize builder
-    this.builder = getBuilder();
+    this.builder = getBuilder({ maxConcurrentBuilds: this.config.maxConcurrentBuilds });
 
     // Initialize build log service (persists per-deploy stdout/stderr to files)
     const buildLogsDir = path.join(this.config.dropRoot, 'data', 'logs', 'builds');
@@ -3996,8 +3998,9 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         // further file change to retrigger queued services (a single drop
         // produces none). If a service is deferred by the "Build queue full"
         // guard in handleBuildApp, it is not silently lost — the warning above
-        // flags oversized groups — but it also won't auto-retrigger; that's
-        // acceptable for the common small-N case and left for a future pass.
+        // flags oversized groups — but a NEW child deferred there is re-queued
+        // by drainPendingBuilds. An EXISTING child goes through handleAppUpdate,
+        // whose build waits for a builder slot instead of being refused.
         if (this.config.autoBuild) {
           // Children inherit the container's actor. Left undefined they would
           // each key as automation on their OWN name, so a loop that varies
@@ -4412,10 +4415,9 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           await this.stateManager.updateApp(appName, { buildDuration: result.duration });
         }
       } else if (result.errors?.[0]?.code === 'MAX_BUILDS') {
-        // The builder's own concurrent-build cap fired (a redundant safety net
-        // under the platform cap above). Don't error the app — re-queue it so
-        // it retries when a slot frees, instead of leaving it permanently
-        // failed after a transient burst.
+        // Unreachable backstop: the builder now WAITS for a slot rather than
+        // refusing. Kept so a refusal would still re-queue the app instead of
+        // leaving it permanently failed after a transient burst.
         this.logger.warn(`Builder busy for ${appName}; re-queuing`, 'BUILD');
         // Deliberately NOT a guardrail failure: the deploy is being retried,
         // not rejected. Counting a queue wait as a failure would let a busy
@@ -6320,6 +6322,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     // Remember the current port and whether the app was running
     const originalPort = appState.port;
     const wasRunning = appState.status === 'running';
+    const statusAtEntry = appState.status;
 
     // GUARDRAIL. A SECOND choke point, not a duplicate: handleAppUpdate does
     // not route through handleBuildApp — it has its own build — so the Step 7
@@ -6361,6 +6364,49 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     this.logger.info(`Hot-reload triggered for ${appName}: ${reason}`, 'UPDATE');
     this.appsInProgress.add(appName);
 
+    // Wait for a builder slot BEFORE any side effect, so a redeploy queued
+    // behind a full cap (a boot-reconcile burst) leaves status, build log and
+    // deploy target alone and the old version untouched. The checks below
+    // re-run what can change while waiting, and the disk check then sees the
+    // disk as it is now.
+    const releaseSlot = await this.reserveBuildSlot(appName);
+    if (this.isQuiesced()) {
+      this.logger.info(
+        `Deferring update for ${appName} — deploys are quiesced for a backup`,
+        'BACKUP'
+      );
+      releaseSlot();
+      this.releaseGuardrailKeys(appName);
+      this.appsInProgress.delete(appName);
+      return;
+    }
+    // A git pull or upload that began while waiting publishes its own
+    // app:update when it lands, and with appsInProgress cleared that runs.
+    if (this.gitDeployService?.isCloning(appName) || this.uploadDeployService?.isUploading(appName)) {
+      this.logger.info(
+        `Dropped redeploy for ${appName} - a git pull/upload began while waiting for a build slot`,
+        'UPDATE'
+      );
+      releaseSlot();
+      this.releaseGuardrailKeys(appName);
+      this.appsInProgress.delete(appName);
+      return;
+    }
+    // Removed, or stopped by the user since entry, while waiting. An explicit
+    // redeploy of an app that was ALREADY stopped at entry (rebuildsStaleTree)
+    // deliberately proceeds.
+    const current = this.stateManager.getApp(appName);
+    if (!current || (current.status === 'stopped' && statusAtEntry !== 'stopped')) {
+      this.logger.info(
+        `Dropped redeploy for ${appName} - app was ${current ? 'stopped by user' : 'removed'} while waiting for a build slot`,
+        'UPDATE'
+      );
+      releaseSlot();
+      this.releaseGuardrailKeys(appName);
+      this.appsInProgress.delete(appName);
+      return;
+    }
+
     // Hot-reload — the app is currently RUNNING and serving traffic. Abort
     // with a `return`, never a `throw`: the catch below unconditionally marks
     // the app 'errored' and tears down its health prober, which is wrong for
@@ -6378,6 +6424,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       // episode's slot to whatever outcome is recorded next.
       this.releaseGuardrailKeys(appName);
       this.appsInProgress.delete(appName);
+      releaseSlot();
       return;
     }
 
@@ -6450,11 +6497,15 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           execCommand,
           toolchainId,
           nodeModulesAsideDir,
+          slotReserved: true,
           onBuildLog: updateLogId && this.buildLogService
             ? (line) => this.buildLogService!.writeLine(updateLogId, line)
             : undefined,
         });
       } finally {
+        // The slot is for building only; free it as soon as build() returns
+        // (idempotent, so the catch below may repeat it).
+        releaseSlot();
         this.selfManagedUpdates.delete(appName);
         // Also in the finally: resolveBuildEnv/parseDropYaml above can throw,
         // and the close used to sit after this block — so a throw leaked the
@@ -6577,6 +6628,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       this.recordDeployOutcome(appName, true);
       this.appsInProgress.delete(appName);
     } catch (error) {
+      releaseSlot();
       await this.discardDeployTarget(appName);
       // Secret preflight park (PRD-051) on a hot-reload — e.g. the edited
       // drop.yaml added a required `secrets:` entry. Park in `needs-config`
@@ -7113,6 +7165,12 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     }
     this.deployTargets.set(appName, target);
     return target;
+  }
+
+  /** Wait for a builder slot; the returned release is idempotent. */
+  private async reserveBuildSlot(appName: string): Promise<() => void> {
+    // Builders mocked as `{ build }` in tests have no reserveSlot.
+    return (await this.builder?.reserveSlot?.(appName)) ?? (() => undefined);
   }
 
   /** Forget the in-flight deploy target, deleting it if it is a release. Never throws. */

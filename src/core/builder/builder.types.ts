@@ -48,6 +48,11 @@ export interface BuildContext {
   config: BuildConfig;
   env: Record<string, string>;
   /**
+   * The caller already holds a build slot (BuilderService.reserveSlot) and
+   * frees it itself: build() then neither waits for nor releases one.
+   */
+  slotReserved?: boolean;
+  /**
    * Platform-minted deploy id for the deploy this build belongs to. Carried
    * through onto the build:started/completed/failed payloads so DeployTracker
    * correlates the episode to the same id the caller already knows — rather
