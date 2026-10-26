@@ -6,6 +6,7 @@ import Card from './ui/Card';
 import { asArray } from '../lib/api-shape';
 import Button from './ui/Button';
 import Input from './ui/Input';
+import InfoTip from './ui/InfoTip';
 import InviteLinkPanel from './InviteLinkPanel';
 import { AccountGrantRow, GuestGrantRow } from './ShareGrantRows';
 import {
@@ -687,14 +688,18 @@ function AccessTab({ appName }: { appName: string }) {
       </Card>
 
       <Card className="p-6">
-        <h3 className="flex items-center gap-2 font-semibold">
-          <Lock className="h-4 w-4" /> Who may open it
-        </h3>
+        <div className="flex flex-wrap items-center gap-2">
+          <h3 className="flex items-center gap-2 font-semibold">
+            <Lock className="h-4 w-4" /> Who may open it
+          </h3>
+          <InfoTip topic="who may open this app">
+            Everyone else must be listed here — this is the complete list, including shares made
+            below, which appear here under the name of whoever granted them. A guest invited by
+            email has no account at all, so they never appear in it.
+          </InfoTip>
+        </div>
         <p className="mt-1 text-sm opacity-70">
-          The owner and administrators can always open this app. Everyone else must be listed here
-          — this is the complete list, including shares made below, which appear here under the
-          name of whoever granted them. A guest invited by email has no account at all, so they
-          never appear in it.
+          The owner and administrators can always open this app.
         </p>
 
         {banner && (
@@ -750,15 +755,30 @@ function AccessTab({ appName }: { appName: string }) {
       </Card>
 
       <Card className="p-6">
-        <h3 className="flex items-center gap-2 font-semibold">
-          <UserPlus className="h-4 w-4" /> Share this app
-        </h3>
+        <div className="flex flex-wrap items-center gap-2">
+          <h3 className="flex items-center gap-2 font-semibold">
+            <UserPlus className="h-4 w-4" /> Share this app
+          </h3>
+          <InfoTip topic="sharing and invitations">
+            <p>
+              The difference from the list above is that a share carries your name as the
+              grantor, so you can take it back one entry at a time. Someone with no DROP account
+              can be invited by email instead: they open this app with no account, no password and
+              no signup, on a single-use invitation that expires on its own.
+            </p>
+            <p className="mt-2">
+              Sharing also ticks that person in the list above. Administrators and this
+              app&rsquo;s owner cannot be shared with — they can open it already.
+            </p>
+            <p className="mt-2">
+              Re-entering an address that has already been invited sends a fresh invitation —
+              that is the only way to replace a lost or expired one, because the link is never
+              stored.
+            </p>
+          </InfoTip>
+        </div>
         <p className="mt-1 text-sm opacity-70">
-          A share admits someone the same way the list above does, and appears there too — the
-          difference is that it carries your name as the grantor, so you can take it back one
-          entry at a time. Someone with no DROP account can be invited by email instead: they
-          open this app with no account, no password and no signup, on a single-use invitation
-          that expires on its own.
+          A share admits someone the same way the list above does, and appears there too.
         </p>
 
         {shareBanner && (
@@ -889,11 +909,6 @@ function AccessTab({ appName }: { appName: string }) {
               </Button>
             </div>
 
-            <p className="mt-2 text-xs opacity-60">
-              Sharing also ticks that person in the list above. Administrators and this app&rsquo;s
-              owner cannot be shared with — they can open it already.
-            </p>
-
             {inviteBlockedBy === 'guests' ? (
               <p className="mt-4 border-t pt-4 text-sm opacity-70">
                 Guest invitations are switched off for this platform. Turn on “Let owners invite
@@ -919,12 +934,6 @@ function AccessTab({ appName }: { appName: string }) {
                     Invite
                   </Button>
                 </div>
-
-                <p className="mt-2 text-xs opacity-60">
-                  Re-entering an address that has already been invited sends a fresh invitation —
-                  that is the only way to replace a lost or expired one, because the link is never
-                  stored.
-                </p>
               </>
             )}
 
