@@ -12,8 +12,9 @@
  * Each switch carries its consequence next to it rather than in a doc. These
  * are not preferences: three of the four widen who can reach something, and one
  * of those (the SQL console) exposes a property no privilege setting can close.
- * A settings page that renders them as bare switches invites them to be flipped
- * without that being read.
+ * Every switch shows a one-line summary with the rest behind an (i) control
+ * (#360); a consequence that must be read before flipping — the SQL console's
+ * catalog exposure — is a `caveat`, which is never collapsed.
  */
 
 import { useCallback, useEffect, useState } from 'react';
@@ -58,7 +59,8 @@ interface AdminSettings {
  * One switch, its label, and the thing an operator should know before flipping
  * it. `consequence` is required rather than optional on purpose — every setting
  * on this page changes who can reach something. `summary` is the one line under
- * the label; `consequence` is the rest, behind the (i) button (#360).
+ * the label; `consequence` is the rest, behind the (i) button (#360); `caveat`
+ * is must-read text that always stays on the page.
  */
 function SettingToggle({
   id,
@@ -66,6 +68,7 @@ function SettingToggle({
   label,
   summary,
   consequence,
+  caveat,
   checked,
   busy,
   warning,
@@ -76,6 +79,7 @@ function SettingToggle({
   label: string;
   summary: React.ReactNode;
   consequence: React.ReactNode;
+  caveat?: React.ReactNode;
   checked: boolean;
   busy: boolean;
   warning?: string;
@@ -100,6 +104,9 @@ function SettingToggle({
         {tip.button}
       </div>
       <p className="mt-2 text-xs leading-relaxed text-muted">{summary}</p>
+      {caveat && (
+        <p className="mt-2 text-xs font-semibold leading-relaxed text-fg">{caveat}</p>
+      )}
       {tip.panel}
       {warning && (
         <p className="mt-2 flex items-start gap-2 text-xs leading-relaxed text-err">
@@ -293,21 +300,12 @@ function PlatformSettingsTab() {
             id="sqlConsoleEnabled"
             icon={Terminal}
             label="Enable the read-only SQL console"
-            summary={
-              <>
-                Adds a read-only query box to each app&apos;s Database tab.{' '}
-                <strong>
-                  {settings?.sqlConsole?.catalogVisibility ??
-                    'Any arbitrary query can read the shared PostgreSQL catalogs, which list every database and role on this server.'}
-                </strong>
-              </>
+            summary="Adds a read-only query box to each app's Database tab. Admin-only."
+            caveat={
+              settings?.sqlConsole?.catalogVisibility ??
+              'Any arbitrary query can read the shared PostgreSQL catalogs, which list every database and role on this server. No privilege setting closes that, which is why the console is admin-only.'
             }
-            consequence={
-              <>
-                Writes are refused by the server and results are capped. The console is
-                admin-only because any query can read those shared catalogs.
-              </>
-            }
+            consequence="The SQL console refuses writes on the server side, and caps the size of every result."
             checked={settings?.sqlConsole?.enabled ?? false}
             busy={busy === 'sqlConsole'}
             onChange={next => void setFlag('sqlConsole', 'sql-console', next, 'SQL console')}
