@@ -290,6 +290,31 @@ describe('WatcherService', () => {
     );
   });
 
+  it('flags only the REAL ready scan detection as initialScan', async () => {
+    const { eventBus } = require('../event-bus');
+    const mockWatcher = chokidar.watch();
+    mockWatcher.getWatched.mockReturnValueOnce({
+      '/test/apps': ['boot-app'],
+      '/test/apps/boot-app': ['index.html'],
+    });
+    const service = new WatcherService({ appsDir: '/test/apps', debounceMs: 1000 });
+    await service.start();
+
+    const ready = mockWatcher.on.mock.calls.filter((c: unknown[]) => c[0] === 'ready').pop()[1];
+    ready();
+    service.handleAppDetected('later-app', '/test/apps/later-app', null, null);
+
+    const detections = eventBus.publish.mock.calls
+      .filter((c: unknown[]) => c[0] === 'app:detected')
+      .map((c: unknown[]) => c[1]);
+    expect(detections.find((d: { name: string }) => d.name === 'boot-app')).toEqual(
+      expect.objectContaining({ origin: 'watcher', initialScan: true })
+    );
+    expect(detections.find((d: { name: string }) => d.name === 'later-app')).toEqual(
+      expect.not.objectContaining({ initialScan: true })
+    );
+  });
+
   it('should start watching', async () => {
     const service = new WatcherService({
       appsDir: '/test/apps',

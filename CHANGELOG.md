@@ -61,6 +61,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A DROP restart no longer rebuilds unchanged monorepo children.** On every
+  restart the watcher's first scan re-expanded each monorepo container, which
+  re-copied every child (deleting a static child's build output) and rebuilt
+  it. A static frontend served errors for as long as its build took, on every
+  DROP deploy. With boot reconcile `on`, a child is now decided like any other
+  app. If it is running and current (its runtime spec, dependencies, secrets
+  and scopes are unchanged), and its service source and generated `drop.yaml`
+  match what it was last built from, the restart leaves it alone: its route
+  and health checks are restored, and nothing is copied or rebuilt. Any change
+  still rebuilds it, as does an explicit redeploy. The first restart after
+  upgrading rebuilds each child once and records its fingerprint; `off` and
+  `observe` modes behave as before.
+- **The monorepo symlink guard could be bypassed by the service's path.** The
+  check that refuses a service source containing symlinks matched its exclude
+  list against the absolute path, so a service (or `DROP_ROOT`) under a folder
+  named `build` or `dist` skipped the scan entirely. It now matches relative
+  paths, like the copy does. A child folder that is itself a link is also
+  refused.
 - **A redeploy refused by the build limit was never retried.** When more apps
   rebuilt at once than `DROP_MAX_CONCURRENT_BUILDS` allows (for example the
   boot reconcile after an image change), a redeploy that found no free build
