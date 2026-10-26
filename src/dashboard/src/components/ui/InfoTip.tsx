@@ -2,14 +2,6 @@ import { ReactNode, useId, useRef, useState, KeyboardEvent } from 'react';
 import { Info } from 'lucide-react';
 import { cn } from '../../lib/cn';
 
-export interface InfoTipProps {
-  /** What the tip is about; becomes the button's name ("More about <topic>"). */
-  topic: string;
-  /** The explanation. May be several sentences — that is the point. */
-  children: ReactNode;
-  className?: string;
-}
-
 /**
  * Longer explanation behind an (i) button (#360).
  *
@@ -21,59 +13,67 @@ export interface InfoTipProps {
  * get it as a transient description rather than content they can read at their
  * own pace.
  *
- * So the panel is plain content that opens in the flow, below the line the
- * button sits on, and stays until it is closed. No positioning, no portal, no
- * dependency: the button carries `aria-expanded` and `aria-controls` and the
- * browser's own button semantics supply Enter/Space.
+ * So the panel is plain content that opens in the flow and stays until it is
+ * closed. No positioning, no portal, no dependency: the button carries
+ * `aria-expanded` and `aria-controls` and the browser's own button semantics
+ * supply Enter/Space.
  *
- * Place it inside a `flex flex-wrap` row next to the heading. It renders two
- * siblings — the button, then a full-width panel that wraps onto its own line —
- * so the caller owns the row.
+ * It is a hook rather than a component because the two halves live in
+ * different places: render `button` beside the heading (NOT inside the `<h3>`,
+ * or the panel becomes heading content) and `panel` AFTER the one-line summary,
+ * so an open tip reads in order. Both share one open state. The panel is always
+ * rendered and toggled with `hidden`, so `aria-controls` never points at
+ * nothing — a dangling ARIA reference is worse than an absent one (Tabs.tsx).
+ * Each tip must read correctly on its own, since it is read apart from the
+ * summary it follows.
  *
- * Escape closes it from the button or from inside the panel, and returns focus
- * to the button so a keyboard user is not dropped at the top of the page.
+ * Escape closes it from the button, or from a focusable element inside the
+ * panel, and returns focus to the button. NOT yet verified inside a Radix
+ * Dialog: a document-level Escape listener there may close the dialog too.
  */
-export function InfoTip({ topic, children, className }: InfoTipProps) {
+export function useInfoTip(
+  topic: string,
+  content: ReactNode
+): { button: ReactNode; panel: ReactNode } {
   const [open, setOpen] = useState(false);
   const panelId = useId();
-  const button = useRef<HTMLButtonElement>(null);
+  const buttonRef = useRef<HTMLButtonElement>(null);
 
   const onKeyDown = (e: KeyboardEvent) => {
     if (e.key !== 'Escape' || !open) return;
     e.stopPropagation();
     setOpen(false);
-    button.current?.focus();
+    buttonRef.current?.focus();
   };
 
-  return (
-    <>
-      <button
-        ref={button}
-        type="button"
-        aria-label={`More about ${topic}`}
-        aria-expanded={open}
-        aria-controls={panelId}
-        onClick={() => setOpen(o => !o)}
-        onKeyDown={onKeyDown}
-        className={cn(
-          'inline-flex h-5 w-5 items-center justify-center rounded-full text-muted hover:text-fg',
-          open && 'text-accent',
-          className
-        )}
-      >
-        <Info className="h-4 w-4" aria-hidden="true" />
-      </button>
-      {open && (
-        <div
-          id={panelId}
-          onKeyDown={onKeyDown}
-          className="w-full rounded-md border border-line bg-surface-2 px-3 py-2 text-sm font-normal text-muted"
-        >
-          {children}
-        </div>
+  const button = (
+    <button
+      ref={buttonRef}
+      type="button"
+      aria-label={`More about ${topic}`}
+      aria-expanded={open}
+      aria-controls={panelId}
+      onClick={() => setOpen(o => !o)}
+      onKeyDown={onKeyDown}
+      className={cn(
+        'dui-focus-ring inline-flex h-6 w-6 items-center justify-center rounded-full text-muted hover:text-fg focus-visible:outline-none',
+        open && 'text-accent'
       )}
-    </>
+    >
+      <Info className="h-4 w-4" aria-hidden="true" />
+    </button>
   );
-}
 
-export default InfoTip;
+  const panel = (
+    <div
+      id={panelId}
+      hidden={!open}
+      onKeyDown={onKeyDown}
+      className="mt-2 rounded-md border border-line bg-surface-2 px-3 py-2 text-sm font-normal text-muted"
+    >
+      {content}
+    </div>
+  );
+
+  return { button, panel };
+}
