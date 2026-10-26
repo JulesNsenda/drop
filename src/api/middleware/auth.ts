@@ -401,7 +401,12 @@ export async function initializeAuth(authConfig: AuthConfig): Promise<void> {
   // Create default admin user if no users exist
   if (credentials.users.length === 0) {
     const defaultPassword = crypto.randomBytes(16).toString('hex');
-    await createUser('admin', defaultPassword, 'admin', undefined, true);
+    await createUser({
+      username: 'admin',
+      role: 'admin',
+      credential: { password: defaultPassword },
+      mustChangePassword: true,
+    });
     console.log('='.repeat(60));
     console.log('DROP API - Default Admin Credentials');
     console.log('='.repeat(60));
@@ -651,15 +656,13 @@ function requireGuestModule(): {
   return require('../../managers/app-guest');
 }
 
-/**
- * Create a new user
- */
-export async function createUser(
-  username: string,
-  password: string,
-  role: 'admin' | 'user' | 'readonly' = 'user',
-  email?: string,
-  mustChangePassword?: boolean,
+/** What a new account is made from. */
+export interface NewUserInput {
+  username: string;
+  role: 'admin' | 'user' | 'readonly';
+  email?: string;
+  credential: { password: string };
+  mustChangePassword?: boolean;
   /**
    * DROP-130 Item 6: stamp `createdByScope` on the record. Only
    * `POST /auth/users` sets this, and only when the caller driving the
@@ -669,8 +672,14 @@ export async function createUser(
    * `undefined`, which is what keeps admin-created and self-service
    * accounts able to log in immediately.
    */
-  createdByScope?: boolean,
-): Promise<User> {
+  createdByScope?: boolean;
+}
+
+/**
+ * Create a new user
+ */
+export async function createUser(input: NewUserInput): Promise<User> {
+  const { username, role, email, credential, mustChangePassword, createdByScope } = input;
   if (!credentials || !config) {
     throw new Error('Auth not initialized');
   }
@@ -695,7 +704,7 @@ export async function createUser(
   // caller inherits it — the same argument the role check above makes.
   assertEmailNotHeldByGuest(email);
 
-  const { hash: passwordHash } = hashPassword(password);
+  const { hash: passwordHash } = hashPassword(credential.password);
   const user: User = {
     id: crypto.randomUUID(),
     username,
@@ -747,7 +756,7 @@ export async function changePassword(userId: string, currentPassword: string, ne
 /**
  * Admin reset a user's password — CONTAINMENT, not onboarding. This is an
  * admin forcing a reset on a possibly-compromised account (reachable from the
- * dashboard's "Reset password" button), distinct from `createUser(..., true)`
+ * dashboard's "Reset password" button), distinct from `createUser({ mustChangePassword: true })`
  * / self-service signup's `mustChangePassword`, which is onboarding ("set
  * your own password") and does NOT touch `credentialsInvalidBefore`.
  *

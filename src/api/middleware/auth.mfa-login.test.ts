@@ -55,7 +55,7 @@ describe('MFA login returns the user role (regression)', () => {
   });
 
   it('completeMfaLogin returns the admin user (role) after a valid code', async () => {
-    const admin = await createUser('mfaadmin', 'password123', 'admin');
+    const admin = await createUser({ username: 'mfaadmin', role: 'admin', credential: { password: 'password123' } });
 
     // Enable MFA at the current step.
     const setup = setupMfa(admin.id);

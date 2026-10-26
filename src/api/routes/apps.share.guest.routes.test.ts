@@ -144,13 +144,13 @@ describe('/apps/:name/share — the guest branch (DROP-155)', () => {
     // this box is actually in, and the state `inviteUrl` exists for.
     sendMock = jest.spyOn(mailer, 'sendTemplatedMail').mockResolvedValue({ status: 'unavailable' });
 
-    const admin = await createUser('gov', 'password123', 'admin');
+    const admin = await createUser({ username: 'gov', role: 'admin', credential: { password: 'password123' } });
     adminId = admin.id;
     adminToken = await getTestToken('gov', 'password123');
-    const owner = await createUser('owner', 'password123', 'user');
+    const owner = await createUser({ username: 'owner', role: 'user', credential: { password: 'password123' } });
     ownerId = owner.id;
     ownerToken = await getTestToken('owner', 'password123');
-    const other = await createUser('other-owner', 'password123', 'user');
+    const other = await createUser({ username: 'other-owner', role: 'user', credential: { password: 'password123' } });
     otherOwnerId = other.id;
 
     const sm = getStateManager();
@@ -378,7 +378,7 @@ describe('/apps/:name/share — the guest branch (DROP-155)', () => {
       expect(policy()?.guests).toHaveLength(1);
       // And the address is still available to a real account — the squat.
       await expect(
-        createUser('newbie', 'password123', 'user', 'b@example.com')
+        createUser({ username: 'newbie', role: 'user', email: 'b@example.com', credential: { password: 'password123' } })
       ).resolves.toBeDefined();
     });
 
@@ -453,7 +453,7 @@ describe('/apps/:name/share — the guest branch (DROP-155)', () => {
     it('counts existing guests against a USERNAME grant too', async () => {
       const guests = Array.from({ length: 200 }, (_, i) => `guest:${i}`);
       await seedPolicy({ guests });
-      await createUser('alice', 'password123', 'user');
+      await createUser({ username: 'alice', role: 'user', credential: { password: 'password123' } });
 
       const res = await post(bearer(ownerToken), { username: 'alice' });
 
@@ -715,7 +715,7 @@ describe('/apps/:name/share — the guest branch (DROP-155)', () => {
       await post(bearer(ownerToken), { email: 'v@example.com', gateApp: true });
 
       await expect(
-        createUser('newbie', 'password123', 'user', 'V@Example.com')
+        createUser({ username: 'newbie', role: 'user', email: 'V@Example.com', credential: { password: 'password123' } })
       ).rejects.toThrow(/not available/);
     });
 
@@ -737,7 +737,7 @@ describe('/apps/:name/share — the guest branch (DROP-155)', () => {
       await getAppGuestManager().load();
       expect(getAppGuestManager().isCorrupt()).toBe(true);
 
-      await expect(createUser('bootstrap', 'password123', 'admin')).resolves.toBeDefined();
+      await expect(createUser({ username: 'bootstrap', role: 'admin', credential: { password: 'password123' } })).resolves.toBeDefined();
     });
   });
 });

@@ -49,9 +49,9 @@ describe('custom domains (#302)', () => {
     await getAppConfigService().upsertConfig('site', { type: 'static', port: 4000 });
     await getAppConfigService().upsertConfig('other', { type: 'static', port: 4001 });
 
-    ownerId = (await createUser('owner', 'password123', 'user')).id;
+    ownerId = (await createUser({ username: 'owner', role: 'user', credential: { password: 'password123' } })).id;
     ownerToken = await getTestToken('owner', 'password123');
-    await createUser('outsider', 'password123', 'user');
+    await createUser({ username: 'outsider', role: 'user', credential: { password: 'password123' } });
     outsiderToken = await getTestToken('outsider', 'password123');
     const sm = getStateManager();
     await sm.registerApp('site', path.join(t.tempDir, 'webapps', 'site'), 'static');

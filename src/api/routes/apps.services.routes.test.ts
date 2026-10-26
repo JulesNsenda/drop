@@ -84,7 +84,7 @@ describe('POST /apps/:name/services/:id (DROP-151 Phase 2 attach)', () => {
     await server.initialize();
     hono = server.getApp();
 
-    const owner = await createUser('owner', 'password123', 'user');
+    const owner = await createUser({ username: 'owner', role: 'user', credential: { password: 'password123' } });
     ownerId = owner.id;
     ownerToken = await getTestToken('owner', 'password123');
 
@@ -376,7 +376,7 @@ describe('POST /apps/:name/services/:id (DROP-151 Phase 2 attach)', () => {
   // --- 7. Authorization -------------------------------------------------------
   describe('authorization', () => {
     it('blocks a readonly-role token with 403 (POST is gated at >= user)', async () => {
-      await createUser('viewer', 'password123', 'readonly');
+      await createUser({ username: 'viewer', role: 'readonly', credential: { password: 'password123' } });
       const viewerToken = await getTestToken('viewer', 'password123');
       const ops = makeOps();
       setPlatformOps(ops);
@@ -394,7 +394,7 @@ describe('POST /apps/:name/services/:id (DROP-151 Phase 2 attach)', () => {
     });
 
     it("404s (not 403) when a non-owning user-role caller attaches to another user's app -- no existence oracle", async () => {
-      await createUser('intruder', 'password123', 'user');
+      await createUser({ username: 'intruder', role: 'user', credential: { password: 'password123' } });
       const intruderToken = await getTestToken('intruder', 'password123');
       const ops = makeOps();
       setPlatformOps(ops);
@@ -414,7 +414,7 @@ describe('POST /apps/:name/services/:id (DROP-151 Phase 2 attach)', () => {
     });
 
     it("lets an admin attach to another user's app", async () => {
-      await createUser('root', 'password123', 'admin');
+      await createUser({ username: 'root', role: 'admin', credential: { password: 'password123' } });
       const adminToken = await getTestToken('root', 'password123');
       const ops = makeOps();
       setPlatformOps(ops);

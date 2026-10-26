@@ -86,7 +86,7 @@ describe('DELETE /api/v1/apps/:name — database teardown', () => {
     await server.initialize();
     hono = server.getApp();
 
-    const owner = await createUser('db-owner', 'password123', 'user');
+    const owner = await createUser({ username: 'db-owner', role: 'user', credential: { password: 'password123' } });
     ownerId = owner.id;
     ownerToken = await getTestToken('db-owner', 'password123');
 
@@ -281,7 +281,7 @@ describe('DELETE /api/v1/apps/:name — group-aware (M4)', () => {
     await server.initialize();
     hono = server.getApp();
 
-    const owner = await createUser('group-owner', 'password123', 'user');
+    const owner = await createUser({ username: 'group-owner', role: 'user', credential: { password: 'password123' } });
     ownerId = owner.id;
     ownerToken = await getTestToken('group-owner', 'password123');
 
@@ -386,7 +386,7 @@ describe('DELETE /api/v1/apps/:name — group-aware (M4)', () => {
     setPlatformOps(makeOps({ removeGroup }));
 
     // A second child of the SAME group, owned by someone else.
-    const otherOwner = await createUser('other-owner', 'password123', 'user');
+    const otherOwner = await createUser({ username: 'other-owner', role: 'user', credential: { password: 'password123' } });
     const sm = getStateManager();
     await sm.registerApp('grp-extra', path.join(tempDir, 'webapps', 'grp-extra'));
     await sm.updateApp('grp-extra', { userId: otherOwner.id, group: 'grp' });
@@ -470,7 +470,7 @@ describe('DELETE /api/v1/apps/:name — group-aware (M4)', () => {
 
     it("404s a container DELETE when the requester can't access the container", async () => {
       setPlatformOps(makeOps({ removeGroup }));
-      const stranger = await createUser('stranger', 'password123', 'user');
+      const stranger = await createUser({ username: 'stranger', role: 'user', credential: { password: 'password123' } });
       void stranger;
       const strangerToken = await getTestToken('stranger', 'password123');
 
@@ -520,7 +520,7 @@ describe('DELETE /api/v1/apps/:name — group-aware (M4)', () => {
     // another user's container entry/folder.
     it("404s a group-name DELETE when a colliding container belongs to someone else", async () => {
       setPlatformOps(makeOps({ removeGroup }));
-      const victim = await createUser('victim-owner', 'password123', 'user');
+      const victim = await createUser({ username: 'victim-owner', role: 'user', credential: { password: 'password123' } });
       const sm = getStateManager();
       await sm.updateApp('grp-repo', { userId: victim.id });
 
@@ -535,7 +535,7 @@ describe('DELETE /api/v1/apps/:name — group-aware (M4)', () => {
 
     it("last-child delete does NOT cascade into another user's colliding container", async () => {
       setPlatformOps(makeOps({ removeGroup }));
-      const victim = await createUser('victim-owner2', 'password123', 'user');
+      const victim = await createUser({ username: 'victim-owner2', role: 'user', credential: { password: 'password123' } });
       const sm = getStateManager();
       await sm.updateApp('grp-repo', { userId: victim.id });
 
@@ -599,7 +599,7 @@ describe('DELETE /api/v1/apps/:name — in-progress guard (M4)', () => {
     await server.initialize();
     hono = server.getApp();
 
-    const owner = await createUser('busy-owner', 'password123', 'user');
+    const owner = await createUser({ username: 'busy-owner', role: 'user', credential: { password: 'password123' } });
     ownerId = owner.id;
     ownerToken = await getTestToken('busy-owner', 'password123');
 
@@ -697,7 +697,7 @@ describe('POST /api/v1/apps/:name/stop — route cleanup (M4: route-leak fix)', 
     await server.initialize();
     hono = server.getApp();
 
-    const owner = await createUser('stop-owner', 'password123', 'user');
+    const owner = await createUser({ username: 'stop-owner', role: 'user', credential: { password: 'password123' } });
     ownerId = owner.id;
     ownerToken = await getTestToken('stop-owner', 'password123');
 

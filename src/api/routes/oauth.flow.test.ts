@@ -183,8 +183,8 @@ describe('OAuth 2.1 flow (PRD-041 integration)', () => {
     // Seed an admin (mints/reads the static client_id) and a regular user
     // (consents + exchanges tokens) via the real auth module — mirrors how
     // an operator + an already-logged-in browser session would exist.
-    await createUser('oauth-admin', 'adminpass123', 'admin');
-    oauthUserId = (await createUser('oauth-user', 'userpass123', 'user')).id;
+    await createUser({ username: 'oauth-admin', role: 'admin', credential: { password: 'adminpass123' } });
+    oauthUserId = (await createUser({ username: 'oauth-user', role: 'user', credential: { password: 'userpass123' } })).id;
 
     adminToken = await login('oauth-admin', 'adminpass123');
     userToken = await login('oauth-user', 'userpass123');

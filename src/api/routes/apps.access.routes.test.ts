@@ -111,12 +111,12 @@ describe('/apps/:name/access (DROP-152 access gate)', () => {
     });
     await getAppConfigService().upsertConfig('myapp', { type: 'nodejs', port: 4000 });
 
-    await createUser('gov', 'password123', 'admin');
+    await createUser({ username: 'gov', role: 'admin', credential: { password: 'password123' } });
     adminToken = await getTestToken('gov', 'password123');
-    const owner = await createUser('owner', 'password123', 'user');
+    const owner = await createUser({ username: 'owner', role: 'user', credential: { password: 'password123' } });
     ownerId = owner.id;
     ownerToken = await getTestToken('owner', 'password123');
-    const outsider = await createUser('reviewer', 'password123', 'user');
+    const outsider = await createUser({ username: 'reviewer', role: 'user', credential: { password: 'password123' } });
     outsiderId = outsider.id;
 
     const sm = getStateManager();

@@ -80,7 +80,12 @@ auth.post('/signup', async c => {
   }
 
   try {
-    const user = await createUser(body.username, body.password, 'user', body.email);
+    const user = await createUser({
+      username: body.username,
+      role: 'user',
+      email: body.email,
+      credential: { password: body.password },
+    });
     // Stays on tryLogActivity, not logActivityFor: identity here is the
     // account this request just created, not an ambient AuthContext — there
     // is no request auth to derive it from (signup precedes it).
@@ -402,14 +407,13 @@ auth.post('/users', authMiddleware(), requireCapability('users:create'), async c
   const createdByScope = authCtx !== undefined && authCtx.role !== 'admin';
 
   try {
-    const user = await createUser(
-      body.username,
-      body.password,
-      body.role || 'user',
-      undefined,
-      true,
-      createdByScope
-    );
+    const user = await createUser({
+      username: body.username,
+      role: body.role || 'user',
+      credential: { password: body.password },
+      mustChangePassword: true,
+      createdByScope,
+    });
     return c.json(
       success({
         id: user.id,
