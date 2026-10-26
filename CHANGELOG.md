@@ -27,6 +27,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.7.0] - 2026-10-26
+
+The agent-surface release, plus Node 22 and steadier deploys.
+
+Agents get a machine-readable OpenAPI description, a limits endpoint, deploy
+status over SSE, and MCP tools to verify a deployment, roll back, and read live
+resource use. Rollback and zero-downtime redeploys arrive for apps that declare
+a `healthCheck`. Under `isolation: docker`, Node apps move to Node 22. And a
+DROP restart no longer takes monorepo apps down: unchanged children stay
+running, and a redeploy that finds every build slot busy now waits its turn
+instead of failing.
+
+**Read the Upgrading section if you run `isolation: docker`, or have an app
+that declares a `healthCheck`.**
+
+### Upgrading
+
+- **`isolation: docker` only: Node apps move to Node 22.** Every running app
+  under docker isolation is recreated once on the first boot, and Node apps
+  reinstall their dependencies for Node 22. A stopped Node app whose
+  dependencies were built for Node 20 is refused a start (409) until it is
+  redeployed. Check that each Node app installs on `node:22-slim` first; the
+  Changed entry below shows how.
+- **Apps that declare a `healthCheck` switch to zero-downtime deploys** on
+  their next deploy, which runs the old and new versions side by side for a
+  moment. An app that holds a single-writer lock (a SQLite file, a job runner
+  that must not run twice) should opt out with
+  `deploy: { strategy: in-place }`.
+- **`DROP_MAX_CONCURRENT_BUILDS` now takes effect.** The builder used to ignore
+  it and always allow 3. If you set it, your value now applies, and `0` means
+  no limit.
+- **Monorepos: the first restart after upgrading still rebuilds each child
+  once** (with boot reconcile `on`), to record what it was built from. Later
+  restarts leave unchanged children running.
+
 ### Added
 
 - **Object storage, operator side (#301).** An admin can now configure S3
@@ -58,98 +93,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   never echoed. Names under the platform's domain suffix are refused by every
   writer: the wildcard record makes them resolve here regardless, so DNS would
   prove nothing, and claiming one would squat a future app's hostname.
-
-### Fixed
-
-- **A DROP restart no longer rebuilds unchanged monorepo children.** On every
-  restart the watcher's first scan re-expanded each monorepo container, which
-  re-copied every child (deleting a static child's build output) and rebuilt
-  it. A static frontend served errors for as long as its build took, on every
-  DROP deploy. With boot reconcile `on`, a child is now decided like any other
-  app. If it is running and current (its runtime spec, dependencies, secrets
-  and scopes are unchanged), and its service source and generated `drop.yaml`
-  match what it was last built from, the restart leaves it alone: its route
-  and health checks are restored, and nothing is copied or rebuilt. Any change
-  still rebuilds it, as does an explicit redeploy. The first restart after
-  upgrading rebuilds each child once and records its fingerprint; `off` and
-  `observe` modes behave as before.
-- **The monorepo symlink guard could be bypassed by the service's path.** The
-  check that refuses a service source containing symlinks matched its exclude
-  list against the absolute path, so a service (or `DROP_ROOT`) under a folder
-  named `build` or `dist` skipped the scan entirely. It now matches relative
-  paths, like the copy does. A child folder that is itself a link is also
-  refused.
-- **A redeploy refused by the build limit was never retried.** When more apps
-  rebuilt at once than `DROP_MAX_CONCURRENT_BUILDS` allows (for example the
-  boot reconcile after an image change), a redeploy that found no free build
-  slot was recorded as a failed build and nothing tried it again. A monorepo
-  child whose source had just been re-synced was left without its build output
-  and served errors until someone redeployed it by hand. A redeploy now waits
-  for a free slot, in arrival order, without changing anything first: the old
-  version keeps serving and the status is untouched until the build starts. It
-  is dropped only if, while it waited, the app was stopped or removed, a
-  backup began, or a git pull or upload started. The builder also now honours
-  `DROP_MAX_CONCURRENT_BUILDS`; it always used 3 before.
-- **The dashboard/API custom domain was never routed (#302).** `customDomain`
-  was stored and shown as the app's URL, but only `drop.yaml` `domains` ever
-  reached Caddy, so that link served nothing and no certificate was issued. It
-  is now routed once verified (above), under the same cross-tenant ownership
-  and reserved-host guards as `drop.yaml` domains. Changing or clearing a
-  verified domain removes its route. Values already stored stay unrouted until
-  they are verified, so nothing starts requesting certificates for domains
-  whose DNS never pointed here.
-
-- **Download an app's source (#315).** `GET /api/v1/apps/:name/source`, and a
-  **Source** button on the app page, return the app's source folder as a
-  `.tar.gz` — so an app that only ever existed on DROP (deployed by an agent
-  with `deploy_files`, or uploaded from a machine that is gone) can be saved to
-  a git repository or anywhere else. Files sit at the archive root, the shape
-  `POST /apps/:name/source` accepts, so a download can be edited and uploaded
-  back. `node_modules`, `.venv` and `.git` are left out (a git-deployed app's
-  `.git/config` can hold the clone credential). Symlinks are archived as links
-  and never followed, so a link in a git-deployed tree cannot turn a download
-  into a read of the host; an archive containing one will not upload back
-  as-is, since uploads refuse symlinks. For the app's owner or an admin, with a
-  session or API key; refused for agent credentials, for readonly tokens, when
-  authentication is disabled, and — for a non-admin — when the app's recorded
-  path is outside the webapps directory. Shares the upload rate-limit bucket.
-
-### Changed
-
-- **Node apps now run on Node 22 under `isolation: docker`.** The tenant image
-  moves from `node:20-slim` (end of life) to `node:22-slim`, digest-pinned;
-  static and SPA apps build in it too. On the first boot of this release every
-  running app under docker isolation is recreated once, and Node apps
-  reinstall their dependencies on Node 22: `node_modules` now record the Node
-  they were built for, and a tree built for Node 20 is reinstalled rather than
-  reused, so native addons are recompiled. Starting a stopped Node app whose
-  dependencies were built for Node 20 is refused with a 409 until it is
-  redeployed (a redeploy of a stopped app now rebuilds it), and rolling back
-  to a snapshot or release from before the upgrade is refused the same way
-  until the app's next deploy creates a new one. `node:22-slim` has no
-  compiler toolchain, so a native addon without a Node 22 prebuild fails to
-  install.
-
-  **Upgrading:** check each Node app installs and starts on
-  `node:22-slim` first, e.g.
-  `docker run --rm -v "$PWD":/app -w /app node:22-slim sh -c 'npm ci && npm start'`
-  on a copy of the app. Under `isolation: none` nothing changes until the host
-  Node is upgraded.
-
-- **Zero-downtime is the default for apps that declare a `healthCheck` (#298).**
-  An app whose `drop.yaml` sets `healthCheck` and no `deploy.strategy` is now
-  built into release directories and redeployed, rolled back and promoted
-  through the zero-downtime cutover — its declared path is what the cutover's
-  readiness gate probes. Every other app is unchanged. Opt a single app out
-  with `deploy: { strategy: in-place }`, or turn the default off for the whole
-  platform with `DROP_ZERO_DOWNTIME_DEFAULT=false` (explicit opt-ins still
-  apply). Monorepo children stay in place: their generated `drop.yaml` now
-  says so explicitly. An existing app moves over on its next deploy; its first
-  zero-downtime redeploy still has to prove the new version answers
-  `healthCheck` below HTTP 500, or the deploy fails as `READINESS_FAILED` and
-  the old version keeps serving.
-
-### Added
 
 - **Rollback and promotion without downtime (#298, opt-in).** For an app on
   `deploy: { strategy: zero-downtime }`, `POST /apps/:name/rollback` (and the
@@ -309,6 +252,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A DROP restart no longer rebuilds unchanged monorepo children.** On every
+  restart the watcher's first scan re-expanded each monorepo container, which
+  re-copied every child (deleting a static child's build output) and rebuilt
+  it. A static frontend served errors for as long as its build took, on every
+  DROP deploy. With boot reconcile `on`, a child is now decided like any other
+  app. If it is running and current (its runtime spec, dependencies, secrets
+  and scopes are unchanged), and its service source and generated `drop.yaml`
+  match what it was last built from, the restart leaves it alone: its route
+  and health checks are restored, and nothing is copied or rebuilt. Any change
+  still rebuilds it, as does an explicit redeploy. The first restart after
+  upgrading rebuilds each child once and records its fingerprint; `off` and
+  `observe` modes behave as before.
+- **The monorepo symlink guard could be bypassed by the service's path.** The
+  check that refuses a service source containing symlinks matched its exclude
+  list against the absolute path, so a service (or `DROP_ROOT`) under a folder
+  named `build` or `dist` skipped the scan entirely. It now matches relative
+  paths, like the copy does. A child folder that is itself a link is also
+  refused.
+- **A redeploy refused by the build limit was never retried.** When more apps
+  rebuilt at once than `DROP_MAX_CONCURRENT_BUILDS` allows (for example the
+  boot reconcile after an image change), a redeploy that found no free build
+  slot was recorded as a failed build and nothing tried it again. A monorepo
+  child whose source had just been re-synced was left without its build output
+  and served errors until someone redeployed it by hand. A redeploy now waits
+  for a free slot, in arrival order, without changing anything first: the old
+  version keeps serving and the status is untouched until the build starts. It
+  is dropped only if, while it waited, the app was stopped or removed, a
+  backup began, or a git pull or upload started. The builder also now honours
+  `DROP_MAX_CONCURRENT_BUILDS`; it always used 3 before.
+- **The dashboard/API custom domain was never routed (#302).** `customDomain`
+  was stored and shown as the app's URL, but only `drop.yaml` `domains` ever
+  reached Caddy, so that link served nothing and no certificate was issued. It
+  is now routed once verified (above), under the same cross-tenant ownership
+  and reserved-host guards as `drop.yaml` domains. Changing or clearing a
+  verified domain removes its route. Values already stored stay unrouted until
+  they are verified, so nothing starts requesting certificates for domains
+  whose DNS never pointed here.
+
+- **Download an app's source (#315).** `GET /api/v1/apps/:name/source`, and a
+  **Source** button on the app page, return the app's source folder as a
+  `.tar.gz` — so an app that only ever existed on DROP (deployed by an agent
+  with `deploy_files`, or uploaded from a machine that is gone) can be saved to
+  a git repository or anywhere else. Files sit at the archive root, the shape
+  `POST /apps/:name/source` accepts, so a download can be edited and uploaded
+  back. `node_modules`, `.venv` and `.git` are left out (a git-deployed app's
+  `.git/config` can hold the clone credential). Symlinks are archived as links
+  and never followed, so a link in a git-deployed tree cannot turn a download
+  into a read of the host; an archive containing one will not upload back
+  as-is, since uploads refuse symlinks. For the app's owner or an admin, with a
+  session or API key; refused for agent credentials, for readonly tokens, when
+  authentication is disabled, and — for a non-admin — when the app's recorded
+  path is outside the webapps directory. Shares the upload rate-limit bucket.
+
 - **Concurrent route changes can no longer drop a route from the Caddyfile.**
   Every route change rewrites the whole file from a snapshot of the routes, and
   two overlapping rewrites could land in the wrong order, the older snapshot
@@ -340,6 +336,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **An invitation link stayed on screen after switching to another app.** The
   app detail page does not remount on a name change, so a live single-use
   credential minted for one app was rendered under another app's heading.
+
+### Changed
+
+- **Node apps now run on Node 22 under `isolation: docker`.** The tenant image
+  moves from `node:20-slim` (end of life) to `node:22-slim`, digest-pinned;
+  static and SPA apps build in it too. On the first boot of this release every
+  running app under docker isolation is recreated once, and Node apps
+  reinstall their dependencies on Node 22: `node_modules` now record the Node
+  they were built for, and a tree built for Node 20 is reinstalled rather than
+  reused, so native addons are recompiled. Starting a stopped Node app whose
+  dependencies were built for Node 20 is refused with a 409 until it is
+  redeployed (a redeploy of a stopped app now rebuilds it), and rolling back
+  to a snapshot or release from before the upgrade is refused the same way
+  until the app's next deploy creates a new one. `node:22-slim` has no
+  compiler toolchain, so a native addon without a Node 22 prebuild fails to
+  install.
+
+  **Upgrading:** check each Node app installs and starts on
+  `node:22-slim` first, e.g.
+  `docker run --rm -v "$PWD":/app -w /app node:22-slim sh -c 'npm ci && npm start'`
+  on a copy of the app. Under `isolation: none` nothing changes until the host
+  Node is upgraded.
+
+- **Zero-downtime is the default for apps that declare a `healthCheck` (#298).**
+  An app whose `drop.yaml` sets `healthCheck` and no `deploy.strategy` is now
+  built into release directories and redeployed, rolled back and promoted
+  through the zero-downtime cutover — its declared path is what the cutover's
+  readiness gate probes. Every other app is unchanged. Opt a single app out
+  with `deploy: { strategy: in-place }`, or turn the default off for the whole
+  platform with `DROP_ZERO_DOWNTIME_DEFAULT=false` (explicit opt-ins still
+  apply). Monorepo children stay in place: their generated `drop.yaml` now
+  says so explicitly. An existing app moves over on its next deploy; its first
+  zero-downtime redeploy still has to prove the new version answers
+  `healthCheck` below HTTP 500, or the deploy fails as `READINESS_FAILED` and
+  the old version keeps serving.
 
 ## [1.6.0] - 2026-08-30
 
