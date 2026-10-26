@@ -458,7 +458,7 @@ describe('credentialsInvalidBefore (DROP-130 Items 4 & 5)', () => {
       // Bob completes the forced change — this must not resurrect the key
       // that was live before the reset.
       const changed = await changePassword(bob.id, 'temp-password-123456', 'final-password-123456');
-      expect(changed).toBe(true);
+      expect(changed).toBe('changed');
 
       expect(await verifyApiKey(key)).toBeNull();
 

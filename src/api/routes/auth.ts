@@ -16,7 +16,9 @@ import {
   getUser,
   getUserById,
   changePassword,
-  verifyUserPassword,
+  confirmAccountPassword,
+  hasNoWorkingLoginMethod,
+  NO_LOGIN_METHOD_WARNING,
   updateUser,
   resetUserPassword,
   deleteUser,
@@ -28,6 +30,7 @@ import {
   enableMfa,
   disableMfa,
   completeMfaLogin,
+  PASSWORDLESS_ADMIN_REFUSAL,
   AuthContext,
 } from '../middleware/auth';
 import { tryLogActivity, logActivityFor } from '../../managers/activity';
@@ -38,6 +41,15 @@ import { ValidationError } from '../middleware/error';
 import { getAppConfigServiceOrNull } from '../../managers/app/app-config';
 
 const auth = new Hono();
+
+/**
+ * A passwordless account (SSO-only) has no password to present, so the
+ * password-gated self-service flows answer with this instead of the misleading
+ * "Current password is incorrect". Recovery is an admin password reset. The refusal
+ * itself comes from the auth primitives (`changePassword`, `confirmAccountPassword`,
+ * `setupMfa`, `enableMfa`); this only maps it.
+ */
+const PASSWORDLESS_MESSAGE = 'This account signs in with an external identity and has no password';
 
 /** Default life of an agent token: long enough for a deploy, short enough to forget about. */
 const DEFAULT_AGENT_TOKEN_MINUTES = 60;
@@ -304,6 +316,7 @@ auth.get('/me', authMiddleware(), async c => {
       authMethod: authContext.authMethod,
       mustChangePassword: meUser?.mustChangePassword === true,
       mfaEnabled: meUser?.mfaEnabled === true,
+      passwordless: meUser?.passwordless === true,
     })
   );
 });
@@ -335,7 +348,10 @@ auth.put('/password', authMiddleware(), async c => {
   }
 
   const changed = await changePassword(authCtx.userId, body.currentPassword, body.newPassword);
-  if (!changed) {
+  if (changed === 'passwordless') {
+    return c.json(error(ErrorCodes.BAD_REQUEST, PASSWORDLESS_MESSAGE), 400);
+  }
+  if (changed === 'invalid') {
     return c.json(error(ErrorCodes.UNAUTHORIZED, 'Current password is incorrect'), 401);
   }
 
@@ -483,13 +499,19 @@ auth.put('/users/:id', authMiddleware('admin'), async c => {
     if (err instanceof Error && err.message === 'That email address is not available.') {
       return c.json(error(ErrorCodes.VALIDATION_ERROR, err.message), 400);
     }
+    if (err instanceof Error && err.message === PASSWORDLESS_ADMIN_REFUSAL) {
+      return c.json(error(ErrorCodes.VALIDATION_ERROR, err.message), 400);
+    }
     if (err instanceof Error && err.message === 'Cannot demote the last admin account') {
       return c.json(error(ErrorCodes.VALIDATION_ERROR, err.message), 400);
     }
     throw err;
   }
 
-  return c.json(success({ message: 'User updated' }));
+  // Re-enabling a passwordless account whose identities were stamped stale by the
+  // suspension leaves it with no way in; tell the admin rather than let it look fixed.
+  const warning = body.enabled === true && hasNoWorkingLoginMethod(id) ? NO_LOGIN_METHOD_WARNING : undefined;
+  return c.json(success({ message: 'User updated', ...(warning ? { warning } : {}) }));
 });
 
 // POST /auth/users/:id/reset-password - Admin reset user password
@@ -546,10 +568,16 @@ auth.delete('/account', authMiddleware(), async c => {
   const confirmBody = await c.req
     .json<{ password?: string }>()
     .catch(() => ({ password: undefined }));
+  // Asked before the missing-password check, so a passwordless account (which
+  // has no password to send) is told why instead of being asked for one.
+  const verdict = confirmAccountPassword(authCtx.userId, confirmBody.password ?? '');
+  if (verdict === 'passwordless') {
+    return c.json(error(ErrorCodes.BAD_REQUEST, PASSWORDLESS_MESSAGE), 400);
+  }
   if (!confirmBody.password) {
     throw new ValidationError('Current password is required to delete your account');
   }
-  if (!verifyUserPassword(authCtx.userId, confirmBody.password)) {
+  if (verdict !== 'ok') {
     return c.json(error(ErrorCodes.UNAUTHORIZED, 'Current password is incorrect'), 401);
   }
 
@@ -636,6 +664,9 @@ auth.post('/mfa/setup', authMiddleware(), async c => {
   }
   const authCtx = gate.requester;
   const setup = setupMfa(authCtx.userId);
+  if (setup === 'passwordless') {
+    return c.json(error(ErrorCodes.BAD_REQUEST, PASSWORDLESS_MESSAGE), 400);
+  }
   if (!setup) {
     return c.json(error(ErrorCodes.NOT_FOUND, 'User not found'), 404);
   }
@@ -663,6 +694,9 @@ auth.post('/mfa/enable', authMiddleware(), async c => {
 
   const result = await enableMfa(authCtx.userId, body.password, body.secret, body.code);
 
+  if (result.status === 'passwordless') {
+    return c.json(error(ErrorCodes.BAD_REQUEST, PASSWORDLESS_MESSAGE), 400);
+  }
   if (result.status === 'invalid_password') {
     return c.json(error(ErrorCodes.UNAUTHORIZED, 'Current password is incorrect'), 401);
   }

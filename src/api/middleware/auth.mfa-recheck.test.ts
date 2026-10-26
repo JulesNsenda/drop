@@ -56,7 +56,7 @@ describe('MFA completion re-checks the account', () => {
 
     const u = await createUser({ username: 'mfa', role: 'user', credential: { password: PW } });
     userId = u.id;
-    secret = setupMfa(userId)!.secret;
+    secret = (setupMfa(userId) as { secret: string }).secret;
     await enableMfa(userId, PW, secret, generateTotp(secret, nowSec));
     nowSec += 60;
     const res = await authenticateUser('mfa', PW);

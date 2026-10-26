@@ -58,7 +58,7 @@ describe('MFA login returns the user role (regression)', () => {
     const admin = await createUser({ username: 'mfaadmin', role: 'admin', credential: { password: 'password123' } });
 
     // Enable MFA at the current step.
-    const setup = setupMfa(admin.id);
+    const setup = setupMfa(admin.id) as { uri: string; secret: string } | null;
     expect(setup).not.toBeNull();
     const enableRes = await enableMfa(admin.id, 'password123', setup!.secret, generateTotp(setup!.secret, nowSec));
     expect(enableRes.status).toBe('ok');
