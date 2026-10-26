@@ -47,7 +47,11 @@ import {
 import { AppStateManager, AppStatus, getStateManager, resetStateManager } from '../managers/app/state-manager';
 import { SettingsManager, getSettingsManager, resetSettingsManager } from '../managers/settings/settings-manager';
 import { AppConfig, AppConfigService, getAppConfigService, resetAppConfigService } from '../managers/app/app-config';
-import type { AppRelease } from '../managers/app/app-config';
+import type {
+  AppRelease,
+  RestrictedConfigField,
+  SystemConfigField,
+} from '../managers/app/app-config';
 import {
   PostgresServer,
   getPostgresServer,
@@ -148,7 +152,7 @@ import {
   validateDomainFormat,
   isLocalhostDomain,
 } from '../utils/domain-validator';
-import { createApiKey, deleteApiKeysByName } from '../api/middleware/auth';
+import { createApiKey, deleteApiKeysByName, getUserById } from '../api/middleware/auth';
 // The STRICT name pattern (the API's), not the folder-drop parser's looser
 // check: this decides whether a name is safe to write into a Caddy literal.
 import { isValidAppName } from '../api/middleware/validate';
@@ -1159,6 +1163,11 @@ export class DropPlatform {
         await this.reconcileAppsOnBoot();
       }
 
+      // Warn-only look for group children owned by someone other than their
+      // container, i.e. an install that was taken over before the provenance
+      // check existed. Synchronous and in-memory: nothing here can delay boot.
+      this.auditGroupOwnership();
+
       // Start watching for apps
       if (this.watcher) {
         await this.watcher.start();
@@ -1950,6 +1959,8 @@ backup:
     // Initialize git deploy service
     this.gitDeployService = getGitDeployService({
       appsDirectory: this.config.appsDirectory,
+      // Resolved lazily: the upload service is created just below.
+      isNameBusy: (name) => this.uploadDeployService?.isUploading(name) === true,
     });
     await this.gitDeployService.initialize();
 
@@ -2442,6 +2453,109 @@ backup:
       });
     } catch (error) {
       this.logger.warn(`Failed to record deploy signature for ${appName}`, 'BOOT', error);
+    }
+  }
+
+  /**
+   * Boot-time audit of group ownership: warns for every group child whose
+   * owner differs from its container's. That is what an install taken over
+   * before the `groupContainer` provenance check looks like (a tenant
+   * container syncs into an operator's children and re-owns them). Warn only —
+   * nothing is reassigned, because from here the two owners are
+   * indistinguishable from a legitimate hand-over.
+   *
+   * The container is the child's stamped `groupContainer`; an UNSTAMPED child
+   * is checked against EVERY app whose state carries `isGroupContainer` for
+   * its group, because the first one found may be the innocent party. A
+   * folder-dropped container has no state entry, so its owner is undefined.
+   * An unstamped child older than a candidate container is flagged too: a
+   * container that was registered after the child did not create it, and in a
+   * hijack made before stamping existed the owners already match.
+   */
+  private auditGroupOwnership(): void {
+    try {
+      const stateManager = this.stateManager;
+      if (!stateManager) return;
+      const apps = stateManager.getAllApps();
+      for (const child of apps) {
+        if (!child.group || child.isGroupContainer) continue;
+        const stamped = this.appConfigService?.getConfig(child.name)?.groupContainer;
+        const candidates = stamped
+          ? [stamped]
+          : apps.filter((a) => a.isGroupContainer && a.group === child.group).map((a) => a.name);
+        // No container in state is a folder-dropped one: its owner is none, so
+        // an owned child of it is the mismatch.
+        if (candidates.length === 0 && child.userId) {
+          this.logger.warn(
+            `Group child '${child.name}' (owner: ${child.userId}) has no registered container ` +
+              `for group '${child.group}' (owner: none). ` +
+              'If this is not intended, an admin should reassign or remove it.',
+            'MONOREPO'
+          );
+        }
+        for (const containerName of candidates) {
+          if (containerName === child.name) continue;
+          const container = stateManager.getApp(containerName);
+          if (child.userId !== container?.userId) {
+            this.logger.warn(
+              `Group child '${child.name}' (owner: ${child.userId ?? 'none'}) does not belong to the same ` +
+                `owner as its container '${containerName}' (owner: ${container?.userId ?? 'none'}). ` +
+                'If this is not intended, an admin should reassign or remove it.',
+              'MONOREPO'
+            );
+          } else if (!stamped && Date.parse(container?.createdAt ?? '') > Date.parse(child.createdAt)) {
+            this.logger.warn(
+              `Group child '${child.name}' is older than its container '${containerName}', which ` +
+                'did not create it: possible takeover. If this is not intended, an admin should ' +
+                'reassign or remove it.',
+              'MONOREPO'
+            );
+          }
+        }
+      }
+    } catch (error) {
+      this.logger.warn('Group ownership audit failed', 'MONOREPO', error);
+    }
+  }
+
+  /**
+   * A container with no state entry is folder-dropped, i.e. the operator's.
+   * When one is refused its own group, someone else holds it: say who, since
+   * the operator otherwise sees only a refusal and has no way to tell a
+   * takeover from a name clash.
+   */
+  private warnIfOperatorRefused(repoName: string, group: string, holder: string): void {
+    if (this.stateManager?.hasApp(repoName)) return;
+    // The refusing app may be a member rather than the rival container, and
+    // it is the container the operator needs to be pointed at.
+    const rival = this.stateManager
+      ?.getAllApps()
+      .find((a) => a.isGroupContainer && a.group === group && a.name !== repoName);
+    if (rival) holder = rival.name;
+    const owner = this.stateManager?.getApp(holder)?.userId;
+    this.logger.warn(
+      `Group '${group}' is held by '${holder}' (owner: ${owner ?? 'none'}); if you did not ` +
+        `deploy that, it may have taken over this group and '${repoName}' cannot expand into it.`,
+      'MONOREPO'
+    );
+  }
+
+  /**
+   * Record `container` as the one that materialized group child `childName`.
+   * Best-effort, but the stamp is protective: without it the child stays open
+   * to another container's claim, so a failure is logged as exactly that.
+   */
+  private async stampGroupChild(childName: string, container: string): Promise<void> {
+    try {
+      await this.appConfigService?.upsertSystemConfig(childName, { groupContainer: container });
+    } catch (stampError) {
+      this.logger.warn(
+        `Could not record that '${childName}' belongs to container '${container}'; the child ` +
+          'is NOT protected against another container claiming this group until a later ' +
+          'expansion records it',
+        'MONOREPO',
+        stampError
+      );
     }
   }
 
@@ -3876,6 +3990,72 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     const services = config.services ?? {};
     const serviceNames = new Set(Object.keys(services));
 
+    // PROVENANCE GUARD, ahead of the group tag and every child: a child
+    // records the container that materialized it (`groupContainer`), and a
+    // group holding a child stamped by ANOTHER container is not this one's to
+    // expand. The state-based claimant check below cannot see this case — a
+    // folder-dropped container has no state entry and its children are
+    // unowned, so a tenant container naming that group read as "free" and its
+    // code was synced into the operator's running children. Read from the
+    // configs, not the disk, so a deleted container's surviving children still
+    // hold the group, and a refused tenant container left on disk cannot lock
+    // the stamping container out (only OTHER containers' stamps refuse).
+    const stampedByRival = this.appConfigService
+      ?.getAllConfigs()
+      .find((c) => c.group === group && c.groupContainer && c.groupContainer !== repoName);
+    if (stampedByRival) {
+      this.logger.error(
+        `Refusing monorepo group '${group}' for '${repoName}': its child '${stampedByRival.name}' ` +
+          `was materialized by container '${stampedByRival.groupContainer}'. Remove that ` +
+          'container, or its children, first.',
+        'MONOREPO'
+      );
+      this.warnIfOperatorRefused(
+        repoName,
+        group,
+        stampedByRival.groupContainer as string
+      );
+      throw new Error(
+        `Monorepo group '${group}' belongs to another container; remove it or its children first.`
+      );
+    }
+
+    // ADOPTION GUARD, for groups that predate the stamp. A container REGISTERED
+    // after an unstamped member of its group is adopting something it did not
+    // create (a folder-dropped container has no entry, so it is never refused
+    // here). That is what a tenant container taking over an unstamped group
+    // looks like, and the stamp cannot tell it from the real owner, so one
+    // decision for the whole expansion — not per child: a refused child would
+    // still be synced into, and a new service it declares would be stamped as
+    // its own, locking the operator out. An admin-owned or unowned container is
+    // trusted and adopts as before; an admin clears this by re-owning it.
+    const adopterState = this.stateManager?.getApp(repoName);
+    if (adopterState?.userId && getUserById(adopterState.userId)?.role !== 'admin') {
+      const adopted = this.appConfigService
+        ?.getAllConfigs()
+        .find(
+          (c) =>
+            c.group === group &&
+            !c.groupContainer &&
+            c.name !== repoName &&
+            !this.stateManager?.getApp(c.name)?.isGroupContainer &&
+            Date.parse(this.stateManager?.getApp(c.name)?.createdAt ?? c.createdAt ?? '') <
+              Date.parse(adopterState.createdAt)
+        );
+      if (adopted) {
+        this.logger.error(
+          `Refusing monorepo group '${group}' for '${repoName}': it was registered after ` +
+            `'${adopted.name}', which it did not create, so this is a possible takeover. ` +
+            'An admin can re-own the container to clear this.',
+          'MONOREPO'
+        );
+        throw new Error(
+          `Monorepo group '${group}' already has apps this container did not create; ` +
+            'an admin must review it.'
+        );
+      }
+    }
+
     // The deploy-from-git path registers the cloned repo itself as an app
     // before detection can know it's a container. That entry must survive —
     // its gitSource is what webhook auto-redeploys match on — but it is not
@@ -3931,6 +4111,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           `'${groupClaimant.name}', which belongs to a different owner.`,
         'MONOREPO'
       );
+      this.warnIfOperatorRefused(repoName, group, groupClaimant.name);
       throw new Error(
         `Monorepo group '${group}' is already in use by another account. ` +
           'Choose a different `group:` in drop.yaml.'
@@ -3999,6 +4180,17 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
             'MONOREPO'
           );
           continue;
+        }
+        // Record the claim on an EXISTING child now, past the guards but ahead
+        // of every skip below (stopped, missing or unsafe source, fingerprint
+        // clear): the stamp is the claim, not the build, and a child that is
+        // skipped this round must not stay claimable. A child with another
+        // container's stamp cannot reach here — it makes the group-level check
+        // throw. A NEW child is stamped by its single config write further down.
+        // Also runs for a boot-current child, so legacy children are stamped on
+        // the first boot after upgrading without a rebuild.
+        if (this.appConfigService && existing && existing.groupContainer !== repoName) {
+          await this.stampGroupChild(childName, repoName);
         }
         // Past the collision/ownership guards: consume this child's boot
         // verdict now, so it is read at most once (see bootCurrentChildren).
@@ -4216,12 +4408,24 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         const narrowedType = childType as 'nodejs' | 'python' | 'go' | 'static' | 'docker' | 'unknown';
 
         if (this.appConfigService) {
-          await this.appConfigService.upsertConfig(childName, {
+          // Typed so a system- or restricted-tier field cannot be added here: this
+          // object goes to upsertConfig for an existing child.
+          const childConfig: Partial<Omit<AppConfig, SystemConfigField | RestrictedConfigField>> = {
             type: narrowedType,
             path: childPath,
             hostname: `${childName}.localhost`,
             group,
-          });
+          };
+          if (existing) {
+            await this.appConfigService.upsertConfig(childName, childConfig);
+          } else {
+            // A NEW child: the claim and the config land in ONE write, so there
+            // is no window in which the config exists unclaimed.
+            await this.appConfigService.upsertSystemConfig(childName, {
+              ...childConfig,
+              groupContainer: repoName,
+            });
+          }
         }
         // An EXISTING child is UPDATED, never re-registered.
         //

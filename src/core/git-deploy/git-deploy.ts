@@ -29,6 +29,7 @@ import { getStateManager } from '../../managers/app/state-manager';
 import { getAppConfigService } from '../../managers/app/app-config';
 import { getSecretManager } from '../../managers/secret';
 import { getLogger } from '../../utils/logger';
+import { pathTaken } from '../../utils/paths';
 import { hasEnoughDisk, getMinFreeDiskMb } from '../../utils/disk';
 import { eventBus } from '../event-bus';
 import { captureBeforeRedeploy } from '../../managers/rollback';
@@ -45,6 +46,8 @@ const GIT_TOKEN_APP_NAME = '__drop_git_tokens';
 
 export interface GitDeployServiceConfig {
   appsDirectory: string;
+  /** True while another deploy path (an upload) is landing this app name. */
+  isNameBusy?: (appName: string) => boolean;
 }
 
 export class GitDeployService {
@@ -74,12 +77,34 @@ export class GitDeployService {
     return this.activeClones.has(appName);
   }
 
-  /** Deploy an app from a GitHub repository */
+  /**
+   * Deploy an app from a GitHub repository.
+   *
+   * The name is reserved synchronously, before the first await: the checks
+   * below span several (guardrail, disk, token) and two concurrent deploys of
+   * one name would otherwise both pass them and race to clone into one folder.
+   */
   async deploy(request: GitDeployRequest): Promise<GitDeployResult> {
     if (!this.gitAvailable) {
       throw new Error('git CLI is not available on this system');
     }
 
+    const reservedName = request.name || extractRepoName(normalizeRepoUrl(request.repoUrl));
+    if (reservedName) {
+      if (this.activeClones.has(reservedName) || this.config.isNameBusy?.(reservedName)) {
+        throw new Error(`Application '${reservedName}' already exists (a deploy of it is in progress)`);
+      }
+      this.activeClones.add(reservedName);
+    }
+    try {
+      return await this.deployReserved(request);
+    } catch (err) {
+      this.activeClones.delete(reservedName);
+      throw err;
+    }
+  }
+
+  private async deployReserved(request: GitDeployRequest): Promise<GitDeployResult> {
     const repoUrl = normalizeRepoUrl(request.repoUrl);
     const branch = request.branch || 'main';
     const appName = request.name || extractRepoName(repoUrl);
@@ -131,14 +156,10 @@ export class GitDeployService {
 
     const destPath = path.join(this.config.appsDirectory, appName);
 
-    // Check if directory already exists
-    try {
-      await fs.access(destPath);
-      throw new Error(`Directory already exists: ${destPath}`);
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
-        throw err;
-      }
+    // A folder (or a dangling link) already holding the name is taken. Same
+    // answer as an existing app, and no absolute path in it.
+    if (await pathTaken(destPath)) {
+      throw new Error(`Application '${appName}' already exists`);
     }
 
     // Preflight: ensure enough free disk space before cloning
@@ -182,9 +203,6 @@ export class GitDeployService {
       throw err;
     }
 
-    // Clone complete - allow watcher to detect
-    this.activeClones.delete(appName);
-
     // Read commit SHA
     let commitSha: string | undefined;
     try {
@@ -195,9 +213,6 @@ export class GitDeployService {
 
     const clonedAt = new Date().toISOString();
 
-    // Register app with git source metadata and userId atomically
-    await stateManager.registerApp(appName, destPath);
-
     const gitSource: GitSource = {
       repoUrl,
       branch,
@@ -207,10 +222,33 @@ export class GitDeployService {
       tokenId: request.tokenId,
     };
 
-    await stateManager.updateApp(appName, {
-      gitSource,
-      ...(request.userId ? { userId: request.userId } : {}),
-    } as Record<string, unknown>);
+    // Register app with git source metadata and userId BEFORE the name leaves
+    // activeClones (upload-deploy's order): once it does, the watcher may
+    // detect a monorepo container and expand it, and a container expanded
+    // without its owner would adopt unowned group children as unowned.
+    let registered = false;
+    try {
+      await stateManager.registerApp(appName, destPath);
+      registered = true;
+      await stateManager.updateApp(appName, {
+        gitSource,
+        ...(request.userId ? { userId: request.userId } : {}),
+      } as Record<string, unknown>);
+    } catch (err) {
+      // Same cleanup as a failed clone: an app that never got its owner must
+      // not be left registered, nor its tree left for the watcher to detect.
+      // Only what THIS call did: the registration only if its own registerApp
+      // resolved, and the tree because the clone above just created it (the
+      // folder-exists refusal means nothing was there before).
+      if (registered) {
+        await stateManager.removeApp(appName).catch(() => undefined);
+      }
+      await fs.rm(destPath, { recursive: true, force: true }).catch(() => undefined);
+      throw err;
+    } finally {
+      // Clone complete - allow watcher to detect
+      this.activeClones.delete(appName);
+    }
 
     logger.info(`Cloned ${repoUrl} → ${appName} (${commitSha?.slice(0, 7) || 'unknown'})`, 'GIT-DEPLOY');
 
