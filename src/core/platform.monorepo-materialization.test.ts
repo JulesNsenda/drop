@@ -30,6 +30,7 @@ import * as os from 'os';
 import * as fs from 'fs/promises';
 import { DropPlatform, createPlatform } from './platform';
 import { getStateManager, resetStateManager, AppStateManager } from '../managers/app/state-manager';
+import { AppConfigService } from '../managers/app/app-config';
 
 describe('expandMonorepo re-materializing a live child', () => {
   let platform: DropPlatform;
@@ -37,7 +38,7 @@ describe('expandMonorepo re-materializing a live child', () => {
   let appsDir: string;
   let repoPath: string;
   let stateManager: AppStateManager;
-  let configs: Map<string, { name: string; path: string; group?: string }>;
+  let acs: AppConfigService;
   let handleBuildApp: jest.Mock;
   let handleAppUpdate: jest.Mock;
   /** Child status as seen at the moment the build path was invoked. */
@@ -69,7 +70,8 @@ describe('expandMonorepo re-materializing a live child', () => {
     stateManager = getStateManager({ stateFilePath: path.join(tempDir, 'apps.json') });
     await stateManager.initialize();
 
-    configs = new Map();
+    acs = new AppConfigService({ configDir: path.join(tempDir, 'appconf'), webappsDir: appsDir });
+    await acs.initialize();
     statusAtBuild = [];
     handleBuildApp = jest.fn(async () => {
       statusAtBuild.push(stateManager.getApp(childName)?.status);
@@ -89,15 +91,7 @@ describe('expandMonorepo re-materializing a live child', () => {
     (platform as any).handleBuildApp = handleBuildApp;
     (platform as any).handleAppUpdate = handleAppUpdate;
     (platform as any).watcher = { markAppKnown: jest.fn() };
-    (platform as any).appConfigService = {
-      getConfig: (n: string) => configs.get(n),
-      upsertConfig: jest.fn(async (n: string, updates: any) => {
-        const merged = { ...(configs.get(n) || {}), ...updates, name: n };
-        configs.set(n, merged);
-        return merged;
-      }),
-      updateConfig: jest.fn().mockResolvedValue(undefined),
-    };
+    (platform as any).appConfigService = acs;
   });
 
   afterEach(async () => {
@@ -131,7 +125,7 @@ describe('expandMonorepo re-materializing a live child', () => {
 
     await stateManager.registerApp(childName, childPath(), 'static');
     await stateManager.updateApp(childName, { group: repoName, status: 'running', port: 4001 });
-    configs.set(childName, { name: childName, path: childPath(), group: repoName });
+    await acs.upsertSystemConfig(childName, { type: 'static', path: childPath(), group: repoName });
   }
 
   describe('an existing, running child', () => {

@@ -10,4 +10,9 @@ export { extractTarball, ArchiveRejectedError } from './tar-extract';
 export { createSourceArchive, EmptySourceError, SOURCE_ARCHIVE_EXCLUDED } from './source-archive';
 export type { TarExtractLimits, TarExtractResult, ArchiveRejectReason } from './tar-extract';
 export type { UploadDeployRequest, UploadDeployResult } from './upload-deploy.types';
-export { UploadValidationError, InsufficientDiskSpaceError } from './upload-deploy.types';
+export {
+  UploadValidationError,
+  UploadNotFoundError,
+  UploadConflictError,
+  InsufficientDiskSpaceError,
+} from './upload-deploy.types';

@@ -27,6 +27,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **A container could adopt another account's monorepo apps.** Each monorepo
+  child now records the container that created it, and a different container
+  naming the same `group:` is refused. Group and child names are compared
+  ignoring case for a container owned by a non-admin, so `EZS` no longer slips
+  past `ezs`. Children from before this change are recorded on the first
+  expansion after upgrading; a non-admin container registered after the apps it
+  names is refused rather than recorded.
+- **Creating an app could land over an existing folder.** For non-admin
+  creates, an upload or git deploy to a name whose folder already exists is now
+  refused. A new app name can no longer equal an existing group or a recorded
+  container name, or differ from an existing app only in case, and the children
+  a non-admin's monorepo container creates are held to the same rule.
+- Inside the running server, a git deploy and an upload to the same new name
+  can no longer run at once, an upload to a git-deployed app is refused
+  even when it skips the route, and a failed upload no longer leaves a
+  registered app behind.
+
+### Changed
+
+- **`POST /api/v1/apps` (registering a server folder) now requires an admin.**
+- **Git deploy refuses repo-derived names that are not valid app names**, such
+  as one containing a dot. Pass `name` to choose a different app name.
+- A `group:` or `name:` in `drop.yaml` that is blank (spaces only) is now
+  rejected.
+
+### Upgrading
+
+- **Watch the first boot log for `possible takeover` and group-ownership
+  warnings** (the `MONOREPO` source). Each names a group child, its container
+  and both owners. If the owners differ and that is not intended, an admin
+  should review the named container, then reassign or remove it. Nothing is
+  changed automatically.
+- A container is trusted only while it has no owner (folder-dropped) or its
+  owner is an enabled admin user or a live admin API key. A container refused
+  with "already has apps this container did not create" needs an admin to
+  re-own it, or its group to be redeployed under an admin.
+
 ## [1.7.0] - 2026-10-26
 
 The agent-surface release, plus Node 22 and steadier deploys.

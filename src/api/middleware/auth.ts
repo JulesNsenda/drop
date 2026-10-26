@@ -2124,6 +2124,40 @@ export function getUserById(userId: string): SafeUser | null {
 }
 
 /**
+ * Whether `principalId` — as stored on an app's `userId` — is an admin. Covers
+ * both kinds of id that land there: a user's id, and the id of an ownerless
+ * API key (which `apiKeyAuthContext` uses as the userId). Unknown ids, and a
+ * disabled user or an expired key, are not admins.
+ *
+ * The platform's boot-time expansions run before the API server has called
+ * `initializeAuth`, so with the store not loaded yet and a `credentialsPath`
+ * given, this reads the file once, read-only. It never creates or rewrites it:
+ * that is `initializeAuth`'s job, and a missing or unreadable file just reads
+ * as "no admin".
+ */
+export async function isAdminPrincipalId(
+  principalId: string,
+  credentialsPath?: string
+): Promise<boolean> {
+  let store: CredentialsStore | null = credentials;
+  if (!store && credentialsPath) {
+    try {
+      const parsed: unknown = JSON.parse(await fs.readFile(credentialsPath, 'utf-8'));
+      if (isValidCredentialsStore(parsed)) store = parsed;
+    } catch {
+      // Unreadable: nothing vouches for the id.
+    }
+  }
+  if (!store) return false;
+  const user = store.users.find((u) => u.id === principalId);
+  if (user) return user.role === 'admin' && user.enabled !== false;
+  const key = store.apiKeys.find((k) => k.id === principalId && !k.ownerUserId);
+  if (!key) return false;
+  const expired = key.expiresAt !== undefined && Date.parse(key.expiresAt) <= Date.now();
+  return key.role === 'admin' && !expired;
+}
+
+/**
  * Check if auth is enabled
  */
 export function isAuthEnabled(): boolean {

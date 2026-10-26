@@ -59,6 +59,8 @@ export interface GitDeployRequest {
   principalId?: string;
   /** See UploadDeployRequest.agentCaller — server-derived, first creation only. */
   agentCaller?: boolean;
+  /** See UploadDeployRequest.callerIsAdmin — server-derived from the credential, never the body. */
+  callerIsAdmin?: boolean;
   /** See UploadDeployRequest.ephemeral. */
   ephemeral?: boolean;
   ttlMinutes?: number;

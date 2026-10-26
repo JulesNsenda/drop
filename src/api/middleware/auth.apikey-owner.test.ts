@@ -17,6 +17,7 @@ import {
   resetAuth,
   createUser,
   createApiKey,
+  isAdminPrincipalId,
   verifyApiKey,
   authMiddleware,
   AuthContext,
@@ -41,6 +42,58 @@ async function authenticateWithKey(key: string): Promise<AuthContext | undefined
   await authMiddleware()(c as never, async () => undefined);
   return captured;
 }
+
+describe('isAdminPrincipalId', () => {
+  let tmpDir: string;
+  let credentialsPath: string;
+
+  beforeEach(async () => {
+    tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'drop-admin-principal-'));
+    credentialsPath = path.join(tmpDir, 'api-credentials.json');
+    await initializeAuth({ credentialsPath });
+  });
+
+  afterEach(async () => {
+    resetAuth();
+    await fs.rm(tmpDir, { recursive: true, force: true });
+  });
+
+  it('counts an admin user, not an ordinary one, and not an unknown id', async () => {
+    const admin = await createUser('boss', 'pw-boss-123456', 'admin');
+    const user = await createUser('carol', 'pw-carol-123456', 'user');
+
+    expect(await isAdminPrincipalId(admin.id)).toBe(true);
+    expect(await isAdminPrincipalId(user.id)).toBe(false);
+    expect(await isAdminPrincipalId('no-such-id')).toBe(false);
+  });
+
+  it('counts an ownerless admin API key id as admin, and an ownerless user-role key as not', async () => {
+    const { apiKey: adminKey } = await createApiKey('ops', 'admin');
+    const { apiKey: userKey } = await createApiKey('ci', 'user');
+
+    expect(await isAdminPrincipalId(adminKey.id)).toBe(true);
+    expect(await isAdminPrincipalId(userKey.id)).toBe(false);
+  });
+
+  it('does not count an owned key id: its principal is the owner', async () => {
+    const bob = await createUser('bob2', 'pw-bob2-123456', 'admin');
+    const { apiKey } = await createApiKey('bob-key', 'admin', undefined, undefined, bob.id);
+
+    expect(await isAdminPrincipalId(apiKey.id)).toBe(false);
+  });
+
+  it('reads the credential file itself when the store is not loaded yet, without writing it', async () => {
+    const admin = await createUser('early', 'pw-early-123456', 'admin');
+    resetAuth();
+
+    expect(await isAdminPrincipalId(admin.id)).toBe(false);
+    expect(await isAdminPrincipalId(admin.id, credentialsPath)).toBe(true);
+    // A path with nothing behind it is "no admin", and creates nothing.
+    const missing = path.join(tmpDir, 'missing.json');
+    expect(await isAdminPrincipalId(admin.id, missing)).toBe(false);
+    await expect(fs.stat(missing)).rejects.toThrow();
+  });
+});
 
 describe('API key ownership attribution', () => {
   let tmpDir: string;

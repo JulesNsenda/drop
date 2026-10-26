@@ -86,6 +86,7 @@ gitDeploy.post('/deploy', async (c) => {
     body.userId = auth?.userId;
     body.principalId = auth?.principalId;
     body.agentCaller = auth?.kind === 'agent';
+    body.callerIsAdmin = auth?.role === 'admin';
 
     const result = await service.deploy(body);
     await logActivityFor(auth, { action: 'git-deploy', appName: result.appName, detail: result.repoUrl });

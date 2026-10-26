@@ -62,3 +62,18 @@ export async function isPathStrictlyWithin(parent: string, child: string): Promi
     return false;
   }
 }
+
+/**
+ * Whether anything at all (dir, file, link — dangling or not) sits at `p`.
+ *
+ * lstat, so a link is judged by itself rather than its target. Fails CLOSED:
+ * only a clean ENOENT means free, so an unreadable entry counts as taken.
+ */
+export async function pathTaken(p: string): Promise<boolean> {
+  try {
+    await fs.lstat(p);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code !== 'ENOENT';
+  }
+}

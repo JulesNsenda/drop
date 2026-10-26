@@ -37,6 +37,8 @@ import {
   getUploadDeployService,
   ArchiveRejectedError,
   UploadValidationError,
+  UploadNotFoundError,
+  UploadConflictError,
   InsufficientDiskSpaceError,
 } from '../../core/upload-deploy';
 import { isVcsMetadataComponent } from '../../utils/upload-paths';
@@ -525,6 +527,7 @@ export async function handleDeployFiles(
       appName: name,
       archivePath,
       userId: auth?.userId,
+      callerIsAdmin: auth?.role === 'admin',
       principalId: auth?.principalId,
       // Derived from the credential, never from tool input.
       agentCaller: auth?.kind === 'agent',
@@ -548,7 +551,12 @@ export async function handleDeployFiles(
       const fenced = wrapUntrusted(`ARCHIVE: ${name}`, err.message);
       return toolError(`Archive rejected (reason: ${err.reason}): ${fenced}`);
     }
-    if (err instanceof UploadValidationError || err instanceof InsufficientDiskSpaceError) {
+    if (
+      err instanceof UploadValidationError ||
+      err instanceof UploadNotFoundError ||
+      err instanceof UploadConflictError ||
+      err instanceof InsufficientDiskSpaceError
+    ) {
       return toolError(err.message);
     }
     const refusal = deployRefusal(name, err);
@@ -656,6 +664,7 @@ export async function handleDeployFromGit(
       userId: auth?.userId,
       principalId: auth?.principalId,
       agentCaller: auth?.kind === 'agent',
+      callerIsAdmin: auth?.role === 'admin',
     });
     await auditToolAction(auth, 'agent-deploy', result.appName, 'deploy_from_git');
 

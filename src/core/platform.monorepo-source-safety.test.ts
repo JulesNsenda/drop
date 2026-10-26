@@ -29,6 +29,7 @@ import * as os from 'os';
 import * as fs from 'fs/promises';
 import * as fssync from 'fs';
 import { DropPlatform, createPlatform } from './platform';
+import { AppConfigService } from '../managers/app/app-config';
 
 /**
  * Create a directory symlink. Uses a junction on Windows, which needs no
@@ -46,7 +47,7 @@ describe('expandMonorepo refuses unsafe service sources', () => {
   let appsDir: string;
   let repoPath: string;
   let victimDir: string;
-  let configs: Map<string, { name: string; path: string; group?: string }>;
+  let acs: AppConfigService;
   let handleBuildApp: jest.Mock;
   let markAppKnown: jest.Mock;
 
@@ -70,7 +71,8 @@ describe('expandMonorepo refuses unsafe service sources', () => {
     await fs.mkdir(path.join(repoPath, 'frontend'), { recursive: true });
     await fs.writeFile(path.join(repoPath, 'frontend', 'index.html'), '<h1>frontend</h1>');
 
-    configs = new Map();
+    acs = new AppConfigService({ configDir: path.join(tempDir, 'appconf'), webappsDir: appsDir });
+    await acs.initialize();
     handleBuildApp = jest.fn().mockResolvedValue(undefined);
     markAppKnown = jest.fn();
 
@@ -83,15 +85,7 @@ describe('expandMonorepo refuses unsafe service sources', () => {
 
     (platform as any).handleBuildApp = handleBuildApp;
     (platform as any).watcher = { markAppKnown };
-    (platform as any).appConfigService = {
-      getConfig: (n: string) => configs.get(n),
-      upsertConfig: jest.fn(async (n: string, updates: any) => {
-        const merged = { ...(configs.get(n) || {}), ...updates, name: n };
-        configs.set(n, merged);
-        return merged;
-      }),
-      updateConfig: jest.fn().mockResolvedValue(undefined),
-    };
+    (platform as any).appConfigService = acs;
     (platform as any).stateManager = {
       getApp: jest.fn().mockReturnValue(undefined),
       getAllApps: jest.fn().mockReturnValue([]),
@@ -220,8 +214,8 @@ describe('expandMonorepo refuses unsafe service sources', () => {
     const childPath = childPathOf('frontend');
     await fs.mkdir(childPath, { recursive: true });
     await fs.writeFile(path.join(childPath, 'stale.txt'), 'from the previous deploy');
-    configs.set(`${repoName}-frontend`, {
-      name: `${repoName}-frontend`,
+    await acs.upsertSystemConfig(`${repoName}-frontend`, {
+      type: 'static',
       path: childPath,
       group: repoName,
     });

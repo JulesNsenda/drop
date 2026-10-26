@@ -367,6 +367,15 @@ export interface AppConfig {
    */
   groupSourceHash?: string;
   /**
+   * The container app that materialized this group child, recorded by
+   * expandMonorepo (first holder wins). Any other container claiming the
+   * child's group is refused, so a tenant container naming an operator's
+   * group cannot sync its code into the operator's children. Never rendered
+   * into the child drop.yaml: that file is tenant-writable and feeds
+   * groupSourceFingerprint.
+   */
+  groupContainer?: string;
+  /**
    * SHA-256 fingerprint of the app's secret key/value set (sorted, hashed —
    * never the plaintext values) as of the last successful deploy. `PUT`/
    * `DELETE /api/v1/secrets/:name` has no restart hook, so the next start is
@@ -542,7 +551,7 @@ export interface AppRelease {
  * runtime regardless of what their caller passes; `upsertSystemConfig` and
  * `setServiceIntent` are the only writers allowed to touch them.
  */
-const SYSTEM_CONFIG_FIELDS = [
+export const SYSTEM_CONFIG_FIELDS = [
   'reviewBy',
   'services',
   'grantedApiScopes',
@@ -558,9 +567,12 @@ const SYSTEM_CONFIG_FIELDS = [
   // Decides whether boot leaves a monorepo child unbuilt — a tenant-writable
   // value here would let a request body force or forge that skip.
   'groupSourceHash',
+  // Which container owns a group child; a tenant-writable value would let a
+  // request body re-point a child at its own container.
+  'groupContainer',
 ] as const satisfies readonly (keyof AppConfig)[];
 
-type SystemConfigField = (typeof SYSTEM_CONFIG_FIELDS)[number];
+export type SystemConfigField = (typeof SYSTEM_CONFIG_FIELDS)[number];
 
 /**
  * A strictly stronger tier than SYSTEM_CONFIG_FIELDS: fields that even the
@@ -586,7 +598,7 @@ type SystemConfigField = (typeof SYSTEM_CONFIG_FIELDS)[number];
  */
 const RESTRICTED_CONFIG_FIELDS = ['access'] as const satisfies readonly (keyof AppConfig)[];
 
-type RestrictedConfigField = (typeof RESTRICTED_CONFIG_FIELDS)[number];
+export type RestrictedConfigField = (typeof RESTRICTED_CONFIG_FIELDS)[number];
 
 /**
  * The two tiers must stay disjoint — a field in both would be stripped twice
