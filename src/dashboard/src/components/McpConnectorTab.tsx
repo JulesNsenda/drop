@@ -6,6 +6,7 @@ import Card from './ui/Card';
 import Button from './ui/Button';
 import Input from './ui/Input';
 import ConnectorDetailsPanel, { ConnectorDetails } from './ConnectorDetailsPanel';
+import { useInfoTip } from './ui/InfoTip';
 
 /**
  * Admin-only Settings panel that surfaces the claude.ai (web) MCP connector
@@ -121,6 +122,26 @@ export default function McpConnectorTab(): JSX.Element {
   // can silently drop one field even though both requests return 200.
   const busy = saving || savingConnectors;
 
+  // Each tip is read apart from its summary line, hence the self-contained wording.
+  const connectorTip = useInfoTip(
+    'the claude.ai connector',
+    <>
+      Add a custom connector in claude.ai with the values below &mdash; each person signs in and
+      consents, and only ever sees their own apps.
+    </>
+  );
+  const userConnectorsTip = useInfoTip(
+    'non-admin connector setup',
+    <>
+      Turning this off disables <strong>claude.ai connector setup</strong> for non-admin accounts
+      only &mdash; it does not disable agent tokens or{' '}
+      <code className="font-mono text-fg">POST /api/v1/mcp</code>, which any user can still drive
+      from Claude Code. It also stops non-admin users' own{' '}
+      <code className="font-mono text-fg">mcp: auth: drop</code> tenant apps from refreshing their
+      tokens (symptom: a 401 from the gateway).
+    </>
+  );
+
   // `undefined` (not just a falsy `enabled`) means we don't actually know the
   // state yet — GET /admin/settings failed, or a rolled-back server omitted
   // the field. Render the checkbox ONLY once this is defined; otherwise it
@@ -214,14 +235,17 @@ export default function McpConnectorTab(): JSX.Element {
         <h2 className="font-semibold text-fg">
           Claude (MCP) connector
         </h2>
+        {connectorTip.button}
       </div>
 
       <div className="space-y-4 p-4">
-        <p className="text-sm" style={{ color: 'var(--text-2)', lineHeight: 1.7 }}>
-          Let <strong className="text-fg">claude.ai</strong> deploy and manage apps
-          through the hosted MCP server. Add a custom connector in claude.ai with the values below
-          &mdash; each person signs in and consents, and only ever sees their own apps.
-        </p>
+        <div>
+          <p className="text-sm" style={{ color: 'var(--text-2)', lineHeight: 1.7 }}>
+            Let <strong className="text-fg">claude.ai</strong> deploy and manage apps
+            through the hosted MCP server.
+          </p>
+          {connectorTip.panel}
+        </div>
 
         {(loading || settingsLoading) && (
           <p className="text-sm text-faint">
@@ -277,15 +301,13 @@ export default function McpConnectorTab(): JSX.Element {
               >
                 Let non-admin users set up their own claude.ai connector
               </label>
+              {userConnectorsTip.button}
             </div>
             <p className="mt-2 text-xs" style={{ color: 'var(--text-3)', lineHeight: 1.6 }}>
               Turning this off disables <strong>claude.ai connector setup</strong> for non-admin
-              accounts only &mdash; it does not disable agent tokens or{' '}
-              <code className="font-mono text-fg">POST /api/v1/mcp</code>,
-              which any user can still drive from Claude Code. It also stops non-admin users' own{' '}
-              <code className="font-mono text-fg">mcp: auth: drop</code>{' '}
-              tenant apps from refreshing their tokens (symptom: a 401 from the gateway).
+              accounts only.
             </p>
+            {userConnectorsTip.panel}
           </div>
         )}
 

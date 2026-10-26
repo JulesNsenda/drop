@@ -24,6 +24,7 @@ import Card from './ui/Card';
 import Button from './ui/Button';
 import Input from './ui/Input';
 import { SkeletonText } from './ui/Skeleton';
+import { useInfoTip } from './ui/InfoTip';
 
 interface BoolSetting {
   enabled: boolean;
@@ -56,12 +57,14 @@ interface AdminSettings {
 /**
  * One switch, its label, and the thing an operator should know before flipping
  * it. `consequence` is required rather than optional on purpose — every setting
- * on this page changes who can reach something.
+ * on this page changes who can reach something. `summary` is the one line under
+ * the label; `consequence` is the rest, behind the (i) button (#360).
  */
 function SettingToggle({
   id,
   icon: Icon,
   label,
+  summary,
   consequence,
   checked,
   busy,
@@ -71,12 +74,14 @@ function SettingToggle({
   id: string;
   icon: typeof Share2;
   label: string;
+  summary: React.ReactNode;
   consequence: React.ReactNode;
   checked: boolean;
   busy: boolean;
   warning?: string;
   onChange: (next: boolean) => void;
 }) {
+  const tip = useInfoTip(label, consequence);
   return (
     <div className="rounded-lg border p-4 border-line bg-surface-2">
       <div className="flex items-center gap-3">
@@ -92,8 +97,10 @@ function SettingToggle({
         <label htmlFor={id} className="text-sm font-semibold text-fg">
           {label}
         </label>
+        {tip.button}
       </div>
-      <p className="mt-2 text-xs leading-relaxed text-muted">{consequence}</p>
+      <p className="mt-2 text-xs leading-relaxed text-muted">{summary}</p>
+      {tip.panel}
       {warning && (
         <p className="mt-2 flex items-start gap-2 text-xs leading-relaxed text-err">
           <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" aria-hidden="true" />
@@ -117,6 +124,16 @@ function PlatformSettingsTab() {
   const [mailDraft, setMailDraft] = useState({ host: '', port: '', user: '', from: '', secure: false });
   const [password, setPassword] = useState('');
   const [testTo, setTestTo] = useState('');
+
+  // A hook, so it sits above the loading early return below.
+  const mailTip = useInfoTip(
+    'outbound mail',
+    <>
+      Guest invitations and share notifications ride on this relay. Leave a field empty to clear
+      it. Sending a test message dials the real relay, so it is rate-limited separately from the
+      rest of the API.
+    </>
+  );
 
   const load = useCallback(async () => {
     const json = await apiJson<AdminSettings>('/admin/settings');
@@ -239,9 +256,9 @@ function PlatformSettingsTab() {
             id="appSharingEnabled"
             icon={Share2}
             label="Let owners share their apps"
+            summary="An app's owner can grant a colleague access without an admin round-trip."
             consequence={
               <>
-                An app&apos;s owner can grant a colleague access without an admin round-trip.
                 Sharing only takes effect on apps that are behind the access gate; it does not
                 let the person deploy, restart, or read secrets.
               </>
@@ -256,11 +273,15 @@ function PlatformSettingsTab() {
             id="guestInvitesEnabled"
             icon={UserPlus}
             label="Let owners invite guests by email"
+            summary={
+              <>
+                Someone with <strong>no DROP account</strong> can be invited to exactly one app.
+              </>
+            }
             consequence={
               <>
-                Someone with <strong>no DROP account</strong> can be invited to exactly one app
-                and redeem a single-use emailed invitation. Needs outbound mail configured below
-                — without a relay the invitation cannot be delivered.
+                A guest redeems a single-use emailed invitation. Needs outbound mail configured
+                below — without a relay the invitation cannot be delivered.
               </>
             }
             checked={settings?.guestInvites?.enabled ?? false}
@@ -272,15 +293,15 @@ function PlatformSettingsTab() {
             id="sqlConsoleEnabled"
             icon={Terminal}
             label="Enable the read-only SQL console"
+            summary="Adds a read-only query box to each app's Database tab. Admin-only."
             consequence={
               <>
-                Adds a query box to each app&apos;s Database tab. Writes are refused by the
-                server and results are capped.{' '}
+                Writes are refused by the server and results are capped.{' '}
                 <strong>
                   {settings?.sqlConsole?.catalogVisibility ??
                     'Any arbitrary query can read the shared PostgreSQL catalogs, which list every database and role on this server.'}
                 </strong>{' '}
-                Admin-only for that reason.
+                The console is admin-only for that reason.
               </>
             }
             checked={settings?.sqlConsole?.enabled ?? false}
@@ -294,15 +315,16 @@ function PlatformSettingsTab() {
         <div className="flex items-center gap-2 border-b px-4 py-3 border-line">
           <Mail className="h-4 w-4 text-faint" aria-hidden="true" />
           <h2 className="font-semibold text-fg">Outbound mail</h2>
+          {mailTip.button}
           <span className="ml-auto text-xs text-muted">
             {mail?.credentialConfigured ? 'Password set' : 'No password set'}
           </span>
         </div>
         <div className="space-y-4 p-4">
-          <p className="text-xs leading-relaxed text-muted">
-            The SMTP relay DROP sends from. Guest invitations and share notifications ride on it.
-            Leave a field empty to clear it.
-          </p>
+          <div>
+            <p className="text-xs leading-relaxed text-muted">The SMTP relay DROP sends from.</p>
+            {mailTip.panel}
+          </div>
 
           <div className="grid gap-3 sm:grid-cols-2">
             <label className="text-xs font-semibold text-muted">
@@ -415,9 +437,6 @@ function PlatformSettingsTab() {
               </Button>
             </div>
           </div>
-          <p className="text-xs text-muted">
-            This dials the real relay, so it is rate-limited separately from the rest of the API.
-          </p>
         </div>
       </Card>
     </>
