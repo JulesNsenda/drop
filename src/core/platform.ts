@@ -2238,6 +2238,7 @@ backup:
       restartApp: (name) => this.restartApp(name),
       isAppInProgress: (name) => this.appsInProgress.has(name),
       reserveApp: (name) => this.reserveApp(name),
+      objectStorageDeleteRisk: (name) => this.objectStorageDeleteRisk(name),
       retireObjectStorage: (name, opts) => this.retireObjectStorageOfDeletedApp(name, opts?.keepData),
       promoteApp: (name) => this.promoteApp(name),
       rollbackApp: (name) => this.rollbackApp(name),
@@ -3804,6 +3805,20 @@ backup:
       }
     } catch (error) {
       this.logger.warn('Could not check object-storage allocations at boot', 'STORAGE', error);
+    }
+  }
+
+  /**
+   * Whether deleting the app would destroy a bucket (#301). An allocation
+   * store that cannot be read is 'unknown', not 'none': the delete route must
+   * never treat "I could not look" as "there is nothing to lose".
+   */
+  private async objectStorageDeleteRisk(appName: string): Promise<'none' | 'bucket' | 'unknown'> {
+    if (!this.objectStorage) return 'none';
+    try {
+      return (await this.objectStorage.getAllocation(appName)) ? 'bucket' : 'none';
+    } catch {
+      return 'unknown';
     }
   }
 

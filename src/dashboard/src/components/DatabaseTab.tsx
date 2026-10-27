@@ -610,8 +610,12 @@ function DatabaseTab({ name }: { name: string }) {
 
       setServiceRefusals(prev => recordServiceRefusal(prev, serviceId, undefined));
 
+      // Detaching object storage deletes the bucket, and the server refuses
+      // unless the request names the app: the dialog above is what makes
+      // sending that an informed act.
+      const confirmQuery = serviceId === 'object-storage' ? `?confirm=${encodeURIComponent(name)}` : '';
       const result = await apiJsonWithStatus<DetachServiceSuccess>(
-        `/apps/${encodeURIComponent(name)}/services/${serviceId}`,
+        `/apps/${encodeURIComponent(name)}/services/${serviceId}${confirmQuery}`,
         { method: 'DELETE' }
       );
 

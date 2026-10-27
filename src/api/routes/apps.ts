@@ -4,7 +4,7 @@
  * CRUD and management endpoints for applications.
  */
 
-import { Hono } from 'hono';
+import { Hono, type Context } from 'hono';
 import * as path from 'path';
 import * as fs from 'fs/promises';
 import * as fsSync from 'fs';
@@ -13,7 +13,7 @@ import { pipeline } from 'stream/promises';
 import { success, error, ErrorCodes, AppDto, CreateAppDto } from '../types';
 import { NotFoundError, ValidationError } from '../middleware/error';
 import { AuthContext, listUsers, getUserById } from '../middleware/auth';
-import { canAccess } from '../access';
+import { canAccess, interactiveSessionOnly } from '../access';
 import { isValidAppName, validateAppName } from '../middleware/validate';
 import { getAppRuntime } from '../../managers/runtime';
 import {
@@ -698,6 +698,42 @@ apps.put('/:name', async c => {
   return c.json(success(toAppDto(updated, auth?.role === 'admin')));
 });
 
+/**
+ * The gate for the one action here that destroys data with no backup: an
+ * object-storage bucket and every object in it (#301). Two requirements, both
+ * enforced on the server because the dashboard's dialog is only a courtesy:
+ *
+ *  - an INTERACTIVE session (`interactiveSessionOnly`): an API key, an OAuth
+ *    token or an agent token never reaches this, however privileged its role;
+ *  - an explicit `?confirm=<target>` naming what is being destroyed, so a
+ *    script or a stray DELETE cannot trigger it by accident.
+ *
+ * Returns the refusal to send, or null to proceed.
+ */
+function bucketDestructionRefusal(
+  c: Context,
+  auth: AuthContext | undefined,
+  target: string,
+  action: string
+): Response | null {
+  const gate = interactiveSessionOnly(auth, action);
+  if (!gate.ok) {
+    return c.json(error(ErrorCodes.UNAUTHORIZED, gate.message), 403);
+  }
+  if (c.req.query('confirm') !== target) {
+    return c.json(
+      error(
+        ErrorCodes.VALIDATION_ERROR,
+        `${action} permanently deletes the object-storage bucket and every object in it, with no backup. ` +
+          `Repeat the request with ?confirm=${target} to proceed.`,
+        { reason: 'confirmation-required', confirm: target }
+      ),
+      400
+    );
+  }
+  return null;
+}
+
 // DELETE /apps/:name - Remove application (group-aware, M4)
 apps.delete('/:name', async c => {
   const auth = (c.get as Function)('auth') as AuthContext | undefined;
@@ -762,6 +798,16 @@ apps.delete('/:name', async c => {
       );
     }
 
+    // A group delete destroys every child's bucket too (keepData is not
+    // offered here), so it needs the same confirmation as a single app.
+    for (const child of groupChildren) {
+      if ((await ops.objectStorageDeleteRisk(child.name)) !== 'none') {
+        const refusal = bucketDestructionRefusal(c, auth, name, `Deleting group '${groupName}'`);
+        if (refusal) return refusal;
+        break;
+      }
+    }
+
     const { removed } = await ops.removeGroup(groupName);
 
     await logActivityFor(auth, {
@@ -774,6 +820,19 @@ apps.delete('/:name', async c => {
 
   if (!canAccess(auth, app)) {
     throw new NotFoundError(`Application '${name}' not found`);
+  }
+
+  // An app whose bucket this delete would destroy needs an interactive session
+  // and an explicit confirmation — checked before anything is stopped or
+  // reserved. `keepData` keeps the bucket, so it is not destruction. An
+  // unreadable allocation store counts as "may destroy": it cannot be proven
+  // otherwise.
+  if (c.req.query('keepData') !== 'true') {
+    const risk = (await getPlatformOps()?.objectStorageDeleteRisk(name)) ?? 'none';
+    if (risk !== 'none') {
+      const refusal = bucketDestructionRefusal(c, auth, name, `Deleting '${name}'`);
+      if (refusal) return refusal;
+    }
   }
 
   // Hold the app against deploy/restart/attach/detach for the whole teardown.
@@ -1385,6 +1444,13 @@ apps.delete('/:name/services/:id', async c => {
   const ops = getPlatformOps();
   if (!ops) {
     return c.json(error(ErrorCodes.SERVICE_UNAVAILABLE, 'Platform operations unavailable'), 503);
+  }
+
+  // Detaching object storage deletes the bucket and its objects, with no
+  // backup (postgres dumps first; redis is a cache). See bucketDestructionRefusal.
+  if (serviceId === 'object-storage') {
+    const refusal = bucketDestructionRefusal(c, auth, name, 'Detaching object storage');
+    if (refusal) return refusal;
   }
 
   try {

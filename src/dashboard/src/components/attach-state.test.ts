@@ -2,6 +2,7 @@ import {
   describeAttachCard,
   describeAttachRefusal,
   describeDetachConfirm,
+  describeDeleteBucketWarning,
   describeDetachOutcome,
   describeDetachRefusal,
   formatQuotaUsage,
@@ -477,6 +478,23 @@ describe('describeDetachRefusal', () => {
   // (now-removed) fallback entry.
   it('falls back to the generic message for the now-removed flush-failed reason', () => {
     expect(describeDetachRefusal('flush-failed', undefined)).toBe('Could not detach this service.');
+  });
+});
+
+describe('describeDeleteBucketWarning', () => {
+  it('says plainly that the bucket and every file go too, with no backup', () => {
+    expect(describeDeleteBucketWarning('bucket')).toMatch(/bucket and EVERY file/);
+    expect(describeDeleteBucketWarning('bucket')).toContain('NO backup');
+  });
+
+  it('words a failed lookup as a possibility, and never as nothing-to-lose', () => {
+    const text = describeDeleteBucketWarning('unknown');
+    expect(text).toMatch(/^ If it has object storage/);
+    expect(text).toContain('NO backup');
+  });
+
+  it('adds nothing for an app without a bucket', () => {
+    expect(describeDeleteBucketWarning('none')).toBe('');
   });
 });
 

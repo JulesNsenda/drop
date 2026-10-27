@@ -207,6 +207,15 @@ export interface PlatformOps {
   reserveApp(appName: string): (() => void) | null;
 
   /**
+   * Whether deleting the app (without keepData) would destroy an
+   * object-storage bucket: `bucket` when it has one, `unknown` when the
+   * allocation store cannot be read (it cannot be proven otherwise, so callers
+   * treat it as `bucket`), `none` otherwise. Lets the delete route demand an
+   * explicit confirmation before it stops anything.
+   */
+  objectStorageDeleteRisk(appName: string): Promise<'none' | 'bucket' | 'unknown'>;
+
+  /**
    * Retire the app's object-storage allocation off its name and revoke its
    * IAM key (#301). Called by the delete route BEFORE any other teardown step,
    * so the name is free of the previous tenant's bucket the moment the app

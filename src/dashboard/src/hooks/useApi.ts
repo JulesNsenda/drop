@@ -3,6 +3,7 @@ import { apiJson, apiJsonWithStatus, jsonBody } from '../api/client';
 import { redeployBody } from '../lib/redeploy-credential';
 import { createPollTracker, PollTracker } from '../lib/poll-tracker';
 import { asArray, asArrayOr } from '../lib/api-shape';
+import type { BucketDeleteRisk } from '../components/attach-state';
 
 export interface GitSource {
   repoUrl: string;
@@ -320,8 +321,29 @@ export async function appAction(
   return json.success;
 }
 
-export async function deleteApp(name: string): Promise<boolean> {
-  const json = await apiJson(`/apps/${name}`, { method: 'DELETE' });
+/**
+ * Whether deleting the app would destroy an object-storage bucket (#301), read
+ * from the same panel endpoint the Database tab uses. A failed or unreadable
+ * lookup is `unknown`, never `none`: the dialog must not claim there is
+ * nothing to lose because it could not look.
+ */
+export async function appBucketRisk(name: string): Promise<BucketDeleteRisk> {
+  const json = await apiJson<{ objectStorage?: { provisioned?: boolean; unreadable?: boolean } }>(
+    `/db/${encodeURIComponent(name)}`
+  );
+  const state = json.success ? json.data?.objectStorage : undefined;
+  if (!state) return 'unknown';
+  return state.provisioned || state.unreadable ? 'bucket' : 'none';
+}
+
+/**
+ * `confirmBucket` sends the explicit `?confirm=<app>` the server demands before
+ * it will delete an app that may hold a bucket. Pass it only after the dialog
+ * has told the person (see `describeDeleteBucketWarning`).
+ */
+export async function deleteApp(name: string, opts?: { confirmBucket?: boolean }): Promise<boolean> {
+  const qs = opts?.confirmBucket ? `?confirm=${encodeURIComponent(name)}` : '';
+  const json = await apiJson(`/apps/${name}${qs}`, { method: 'DELETE' });
   return json.success;
 }
 

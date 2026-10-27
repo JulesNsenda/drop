@@ -340,6 +340,26 @@ export function describeAttachRefusal(
   return resolveRefusalCopy(reason, message, REFUSAL_FALLBACK, 'Could not attach this service.');
 }
 
+/** What deleting an app does to its object-storage bucket, as the delete dialog knows it. */
+export type BucketDeleteRisk = 'bucket' | 'none' | 'unknown';
+
+/**
+ * The sentence the delete dialogs append, so a person who confirms an app
+ * delete has been told about the one thing in it that cannot be undone. The
+ * server refuses the delete without an explicit `?confirm=<app>`; this is what
+ * makes sending that confirmation an informed act and not a reflex.
+ * `unknown` (the lookup failed) is worded as a possibility, never as "none".
+ */
+export function describeDeleteBucketWarning(risk: BucketDeleteRisk): string {
+  if (risk === 'bucket') {
+    return ' Its object-storage bucket and EVERY file in it are deleted too — there is NO backup.';
+  }
+  if (risk === 'unknown') {
+    return ' If it has object storage, that bucket and EVERY file in it are deleted too — there is NO backup.';
+  }
+  return '';
+}
+
 /**
  * Detach confirm-dialog detail sentence for one service (DROP-151 Phase 3
  * dashboard). Per-service copy: postgres names WHERE the backup goes and that
@@ -359,8 +379,9 @@ export function describeDetachConfirm(serviceId: ServiceId, ephemeral: boolean):
     // The loudest of the three, because it is the only one that destroys
     // data the owner may have no other copy of, with no backup at all.
     return (
-      'The bucket and EVERY object in it are deleted immediately. There is NO backup, and ' +
-      'the files cannot be recovered — download anything you need first.'
+      'The app loses access to the bucket straight away, and the bucket and EVERY object in it ' +
+      'are then deleted in the background. There is NO backup, and the files cannot be ' +
+      'recovered — download anything you need first.'
     );
   }
   if (serviceId === 'redis') {
