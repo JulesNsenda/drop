@@ -37,13 +37,25 @@ export interface LandLimits {
   maxEntries: number;
 }
 
-/** One tracked regular file: repository-relative `/` path and its git blob id. */
+/** One tracked regular file: repository-relative `/` path, its git blob id and mode. */
 export interface TrackedFile {
   path: string;
   sha: string;
+  /** `100644`, or `100755` when the executable bit is set. */
+  mode: string;
 }
 
-/** What a land wrote: path to blob id. An empty id means "written, id unknown". */
+/**
+ * What identifies a file's landed state: blob id AND mode, so a commit that only
+ * flips the executable bit is a change. A manifest value without a mode (older
+ * lists, or version-1 entries) never equals this, so such a file is rewritten
+ * once and recorded with its mode.
+ */
+export function fileStamp(file: { sha: string; mode: string }): string {
+  return file.sha === '' ? '' : `${file.sha}:${file.mode}`;
+}
+
+/** What a land wrote: path to its stamp (see fileStamp). An empty value means "written, state unknown". */
 export type LandedFiles = Map<string, string>;
 
 export interface LandRequest {
@@ -178,13 +190,14 @@ export async function landTracked(req: LandRequest): Promise<LandedFiles> {
 
   // Validate and measure BEFORE writing anything, so a refusal leaves the app
   // exactly as it was.
-  const planned: Array<{ rel: string; segs: string[]; sha: string; size: number }> = [];
+  const planned: Array<{ rel: string; segs: string[]; stamp: string; mode: string; size: number }> = [];
   const dirs = new Set<string>();
   let bytes = 0;
   if (files.length > limits.maxEntries) {
     throw new Error(`Repository exceeds the maximum of ${limits.maxEntries} entries`);
   }
-  for (const { path: rel, sha } of files) {
+  for (const file of files) {
+    const rel = file.path;
     const segs = segmentsOf(rel);
     if (path.join(appDir, ...segs).length > MAX_PATH_LENGTH) {
       throw new Error(`Refusing to land an over-long path: ${rel.slice(0, 80)}`);
@@ -202,7 +215,7 @@ export async function landTracked(req: LandRequest): Promise<LandedFiles> {
       throw new Error(`Repository exceeds the maximum checkout size of ${Math.floor(limits.maxBytes / (1024 * 1024))} MB`);
     }
     for (let i = 1; i < segs.length; i++) dirs.add(segs.slice(0, i).join('/'));
-    planned.push({ rel, segs, sha, size: st.size });
+    planned.push({ rel, segs, stamp: fileStamp(file), mode: file.mode, size: st.size });
   }
   if (planned.length + dirs.size > limits.maxEntries) {
     throw new Error(`Repository exceeds the maximum of ${limits.maxEntries} entries`);
@@ -231,7 +244,7 @@ export async function landTracked(req: LandRequest): Promise<LandedFiles> {
   // writing the folder: each directory is verified once per land.
   const checkedDirs = new Set<string>();
   const landed: LandedFiles = new Map();
-  for (const { rel, segs, sha, size } of planned) {
+  for (const { rel, segs, stamp, mode, size } of planned) {
     let cur = appDir;
     for (let i = 0; i < segs.length - 1; i++) {
       cur = path.join(cur, segs[i]);
@@ -242,14 +255,14 @@ export async function landTracked(req: LandRequest): Promise<LandedFiles> {
       }
     }
     const dest = path.join(cur, segs[segs.length - 1]);
-    landed.set(rel, sha);
+    landed.set(rel, stamp);
 
     // Unchanged since the last land and still a plain file of the right size:
     // leave it (no rewrite, no new mtime for the watcher or a signature).
     const before = await lstatOrNull(dest);
     if (
-      sha !== '' &&
-      previous?.get(rel) === sha &&
+      stamp !== '' &&
+      previous?.get(rel) === stamp &&
       before?.isFile() &&
       !before.isSymbolicLink() &&
       before.size === size
@@ -264,6 +277,9 @@ export async function landTracked(req: LandRequest): Promise<LandedFiles> {
     const tmp = path.join(cur, `.drop-land-${randomBytes(6).toString('hex')}`);
     try {
       await fs.copyFile(path.join(cloneDir, ...segs), tmp, fsConstants.COPYFILE_EXCL);
+      // The executable bit is part of what the repository tracks: set it (or
+      // clear it) explicitly rather than trusting what the checkout produced.
+      if (process.platform !== 'win32') await fs.chmod(tmp, mode === '100755' ? 0o755 : 0o644);
       await fs.rename(tmp, dest);
     } catch (err) {
       await fs.rm(tmp, { force: true }).catch(() => undefined);

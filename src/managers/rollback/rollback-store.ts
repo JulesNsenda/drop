@@ -57,6 +57,22 @@ import { getAppConfigService } from '../app/app-config';
 import { ReleaseStore } from '../release/release-store';
 import { backfillToolchainMarker, checkTree } from '../../core/builder/toolchain';
 
+/**
+ * Copy beside the target, then rename over it: a reader (or a crash) sees the
+ * old file or the new one, never a partial one. The destination is left alone
+ * when the source cannot be copied.
+ */
+async function copyFileAtomic(src: string, dest: string): Promise<void> {
+  const tmp = `${dest}.tmp-${randomUUID()}`;
+  try {
+    await fs.copyFile(src, tmp);
+    await fs.rename(tmp, dest);
+  } catch (err) {
+    await fs.rm(tmp, { force: true }).catch(() => undefined);
+    throw err;
+  }
+}
+
 export interface RollbackSnapshotMeta {
   appName: string;
   /** When the tree was captured — i.e. when the deploy that replaced it began. */
@@ -212,8 +228,9 @@ export class RollbackStore {
         await fs.rename(staging, this.treeDir(appName));
         // The saved list of files a git redeploy last wrote describes THIS tree,
         // so it is snapshotted with it. Absent for an app that is not git-deployed.
-        await fs.rm(this.snapshotManifestPath(appName), { force: true });
-        await fs.copyFile(this.liveManifestPath(appName), this.snapshotManifestPath(appName)).catch(() => undefined);
+        await copyFileAtomic(this.liveManifestPath(appName), this.snapshotManifestPath(appName)).catch(() =>
+          fs.rm(this.snapshotManifestPath(appName), { force: true }).catch(() => undefined)
+        );
 
         const meta: RollbackSnapshotMeta = {
           appName,
@@ -281,8 +298,9 @@ export class RollbackStore {
         // making the next git redeploy prune nothing).
         const live = this.liveManifestPath(appName);
         await fs.mkdir(path.dirname(live), { recursive: true, mode: 0o700 }).catch(() => undefined);
-        await fs.rm(live, { force: true }).catch(() => undefined);
-        await fs.copyFile(this.snapshotManifestPath(appName), live).catch(() => undefined);
+        await copyFileAtomic(this.snapshotManifestPath(appName), live).catch(() =>
+          fs.rm(live, { force: true }).catch(() => undefined)
+        );
         return meta;
       } finally {
         await fs.rm(staging, { recursive: true, force: true }).catch(() => undefined);

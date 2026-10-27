@@ -20,6 +20,7 @@ import {
   stripUrlCredentials,
 } from './git-client';
 import { landTracked } from './land';
+import { gitChildEnv } from './git-client';
 import type { TrackedFile } from './land';
 
 const run = promisify(execFile);
@@ -421,6 +422,72 @@ describe('Git Client', () => {
 
     it('returns null for a value that is not a URL at all (an SSH remote)', () => {
       expect(stripUrlCredentials('git@github.com:acme/app.git')).toBeNull();
+    });
+  });
+
+  describe('inherited GIT_* environment is an allowlist', () => {
+    const names = [
+      'GIT_COMMON_DIR',
+      'GIT_SHALLOW_FILE',
+      'GIT_ATTR_SOURCE',
+      'GIT_DIR',
+      'GIT_CONFIG_COUNT',
+      'GIT_SSH_COMMAND',
+      'GIT_EXEC_PATH',
+      'GIT_ASKPASS',
+      'GIT_ASKPASS_TOKEN',
+      'GIT_SOMETHING_FUTURE',
+      'GIT_SSL_CAINFO',
+      'GIT_HTTP_PROXY_AUTHMETHOD',
+      'GIT_TRACE',
+      'GIT_TRACE_PACKET',
+      'GIT_CURL_VERBOSE',
+    ];
+    const saved: Record<string, string | undefined> = {};
+
+    beforeEach(() => {
+      for (const n of names) {
+        saved[n] = process.env[n];
+        process.env[n] = 'inherited';
+      }
+    });
+    afterEach(() => {
+      for (const n of names) {
+        if (saved[n] === undefined) delete process.env[n];
+        else process.env[n] = saved[n];
+      }
+    });
+
+    it('drops every inherited GIT_* variable that is not on the list', () => {
+      const env = gitChildEnv();
+      for (const n of [
+        'GIT_COMMON_DIR',
+        'GIT_SHALLOW_FILE',
+        'GIT_ATTR_SOURCE',
+        'GIT_DIR',
+        'GIT_CONFIG_COUNT',
+        'GIT_SSH_COMMAND',
+        'GIT_EXEC_PATH',
+        'GIT_ASKPASS',
+        'GIT_ASKPASS_TOKEN',
+        'GIT_SOMETHING_FUTURE',
+      ]) {
+        expect(env[n]).toBeUndefined();
+      }
+    });
+
+    it('keeps the TLS, proxy and diagnostic settings an operator relies on', () => {
+      const env = gitChildEnv();
+      for (const n of ['GIT_SSL_CAINFO', 'GIT_HTTP_PROXY_AUTHMETHOD', 'GIT_TRACE', 'GIT_TRACE_PACKET', 'GIT_CURL_VERBOSE']) {
+        expect(env[n]).toBe('inherited');
+      }
+    });
+
+    it('sets what DROP sets itself, and the token only when one is given', () => {
+      expect(gitChildEnv().GIT_TERMINAL_PROMPT).toBe('0');
+      expect(gitChildEnv().GIT_LFS_SKIP_SMUDGE).toBe('1');
+      expect(gitChildEnv().GIT_ASKPASS_TOKEN).toBeUndefined();
+      expect(gitChildEnv('tok').GIT_ASKPASS_TOKEN).toBe('tok');
     });
   });
 

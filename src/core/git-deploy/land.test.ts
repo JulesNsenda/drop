@@ -9,10 +9,11 @@ import * as path from 'path';
 import { landTracked, readManifest, writeManifest, gitManifestDir, gitManifestPath } from './land';
 
 /** Tracked files with a content-derived id, as a clone would report them. */
-const f = (...paths: string[]): Array<{ path: string; sha: string }> =>
-  paths.map((p) => ({ path: p, sha: `sha-${p}` }));
+const f = (...paths: string[]): Array<{ path: string; sha: string; mode: string }> =>
+  paths.map((p) => ({ path: p, sha: `sha-${p}`, mode: '100644' }));
 /** A previous landing of the same files. */
-const prev = (...paths: string[]): Map<string, string> => new Map(paths.map((p) => [p, `sha-${p}`]));
+const prev = (...paths: string[]): Map<string, string> =>
+  new Map(paths.map((p) => [p, `sha-${p}:100644`]));
 
 const LIMITS = { maxBytes: 10 * 1024 * 1024, maxEntries: 1000 };
 
@@ -80,7 +81,7 @@ describe('landTracked', () => {
     await landTracked({
       cloneDir: clone,
       appDir: app,
-      files: [{ path: 'kept.txt', sha: 'new-content' }],
+      files: [{ path: 'kept.txt', sha: 'new-content', mode: '100644' }],
       previous: prev('kept.txt', 'removed-upstream.txt', 'sub/also-removed.txt', 'node_modules/dep/index.js'),
       limits: LIMITS,
     });
@@ -243,18 +244,62 @@ describe('landTracked', () => {
       cloneDir: clone,
       appDir: app,
       files: [
-        { path: 'a.txt', sha: 'same' },
-        { path: 'b.txt', sha: 'changed-now' },
+        { path: 'a.txt', sha: 'same', mode: '100644' },
+        { path: 'b.txt', sha: 'changed-now', mode: '100644' },
       ],
       previous: new Map([
-        ['a.txt', 'same'],
-        ['b.txt', 'changed-before'],
+        ['a.txt', 'same:100644'],
+        ['b.txt', 'changed-before:100644'],
       ]),
       limits: LIMITS,
     });
 
     expect(await fs.readFile(path.join(app, 'a.txt'), 'utf-8')).toBe('Z'); // skipped
     expect(await fs.readFile(path.join(app, 'b.txt'), 'utf-8')).toBe('B'); // rewritten
+  });
+
+  it('lands a commit that only flips the executable bit (same blob id), and applies the bit', async () => {
+    await write(clone, 'run.sh', 'echo');
+    await write(app, 'run.sh', 'ZZZZ'); // same size as the source, so only the stamp can tell
+    const exec = [{ path: 'run.sh', sha: 'same-blob', mode: '100755' }];
+
+    await landTracked({
+      cloneDir: clone,
+      appDir: app,
+      files: exec,
+      previous: new Map([['run.sh', 'same-blob:100644']]),
+      limits: LIMITS,
+    });
+
+    expect(await fs.readFile(path.join(app, 'run.sh'), 'utf-8')).toBe('echo'); // rewritten
+    if (process.platform !== 'win32') {
+      expect((await fs.stat(path.join(app, 'run.sh'))).mode & 0o111).not.toBe(0);
+      // And the bit is cleared again when the repository drops it.
+      await landTracked({
+        cloneDir: clone,
+        appDir: app,
+        files: [{ path: 'run.sh', sha: 'same-blob', mode: '100644' }],
+        previous: new Map([['run.sh', 'same-blob:100755']]),
+        limits: LIMITS,
+      });
+      expect((await fs.stat(path.join(app, 'run.sh'))).mode & 0o111).toBe(0);
+    }
+  });
+
+  it('counts a manifest entry that has no mode (an older list) as changed, once', async () => {
+    await write(clone, 'a.txt', 'A');
+    await write(app, 'a.txt', 'Z');
+
+    const landed = await landTracked({
+      cloneDir: clone,
+      appDir: app,
+      files: f('a.txt'),
+      previous: new Map([['a.txt', 'sha-a.txt']]), // id only, no ":mode"
+      limits: LIMITS,
+    });
+
+    expect(await fs.readFile(path.join(app, 'a.txt'), 'utf-8')).toBe('A');
+    expect(landed.get('a.txt')).toBe('sha-a.txt:100644');
   });
 
   it('writes beside the target and renames over it, leaving no temporary file behind', async () => {

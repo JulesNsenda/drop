@@ -177,38 +177,33 @@ function hardeningArgs(allowFileProtocol: boolean): string[] {
 }
 
 /**
- * Variables that redirect git to other files or make it run a program. Only
- * these are dropped from the inherited environment: `GIT_SSL_*`,
- * `GIT_HTTP_*`, `GIT_CURL_VERBOSE` and `GIT_TRACE*` are how an operator
- * configures TLS, proxies and diagnostics, and stay.
+ * Inherited `GIT_*` variables that are kept. Everything else with that prefix
+ * is dropped, because git reads far more of them than any list of the
+ * dangerous ones can keep up with (GIT_DIR, GIT_COMMON_DIR, GIT_SHALLOW_FILE,
+ * GIT_ATTR_SOURCE, GIT_CONFIG_*, GIT_SSH*, GIT_EXEC_PATH, ...). What stays is
+ * how an operator configures TLS, proxies and diagnostics:
+ * `GIT_SSL_*`, `GIT_HTTP_*`, `GIT_CURL_VERBOSE`, `GIT_TRACE*`, and
+ * `GIT_TERMINAL_PROMPT` (which is forced to 0 below anyway). Whatever DROP sets
+ * itself is added after the filter. `GIT_ASKPASS` is NOT kept: the token
+ * travels through the credential helper, never an askpass program.
  */
-const REDIRECTING_GIT_ENV = new Set([
-  'GIT_DIR',
-  'GIT_WORK_TREE',
-  'GIT_INDEX_FILE',
-  'GIT_OBJECT_DIRECTORY',
-  'GIT_ALTERNATE_OBJECT_DIRECTORIES',
-  'GIT_EXEC_PATH',
-  'GIT_ASKPASS',
-  'GIT_CEILING_DIRECTORIES',
-  'GIT_TEMPLATE_DIR',
-  'GIT_ALLOW_PROTOCOL',
-  'GIT_PROXY_COMMAND',
-]);
+const INHERITED_GIT_ENV_PREFIXES = ['GIT_SSL_', 'GIT_HTTP_', 'GIT_TRACE'];
+const INHERITED_GIT_ENV_NAMES: ReadonlySet<string> = new Set(['GIT_TERMINAL_PROMPT', 'GIT_CURL_VERBOSE']);
 
-function isRedirectingGitEnv(key: string): boolean {
+function isInheritedGitEnvAllowed(key: string): boolean {
   const k = key.toUpperCase();
-  return REDIRECTING_GIT_ENV.has(k) || k.startsWith('GIT_CONFIG') || k.startsWith('GIT_SSH');
+  if (!k.startsWith('GIT_')) return true;
+  return INHERITED_GIT_ENV_NAMES.has(k) || INHERITED_GIT_ENV_PREFIXES.some((p) => k.startsWith(p));
 }
 
 /**
- * The environment for a git child: this process's, minus the redirecting or
- * program-running `GIT_*` keys, plus what DROP sets itself.
+ * The environment for a git child: this process's, minus every `GIT_*` variable
+ * not on the allowlist above, plus what DROP sets itself.
  */
-function gitChildEnv(token?: string): NodeJS.ProcessEnv {
+export function gitChildEnv(token?: string): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {};
   for (const [k, v] of Object.entries(process.env)) {
-    if (!isRedirectingGitEnv(k)) env[k] = v;
+    if (isInheritedGitEnvAllowed(k)) env[k] = v;
   }
   env.GIT_TERMINAL_PROMPT = '0';
   env.GIT_LFS_SKIP_SMUDGE = '1';
@@ -446,7 +441,7 @@ async function listTracked(clonePath: string): Promise<{ files: TrackedFile[]; s
     const [mode, sha] = entry.slice(0, tab).split(' ');
     const rel = entry.slice(tab + 1);
     if (mode === '120000') symlinks.push(rel);
-    else if (mode === '100644' || mode === '100755') files.push({ path: rel, sha });
+    else if (mode === '100644' || mode === '100755') files.push({ path: rel, sha, mode });
   }
   return { files, symlinks };
 }

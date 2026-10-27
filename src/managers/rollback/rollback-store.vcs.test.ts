@@ -61,6 +61,34 @@ describe('RollbackStore snapshots exclude .git', () => {
     expect(JSON.parse(await fs.readFile(manifest, 'utf-8')).files).toEqual({ 'index.js': 'aaa' });
   });
 
+  it('never writes the live saved list in place: it is copied beside and renamed over', async () => {
+    const appPath = path.join(root, 'data', 'webapps', 'web');
+    await fs.mkdir(appPath, { recursive: true });
+    await fs.writeFile(path.join(appPath, 'index.js'), 'v1');
+    const manifest = gitManifestPath(gitManifestDir(path.join(root, 'data')), 'web');
+    await fs.mkdir(path.dirname(manifest), { recursive: true });
+    await fs.writeFile(manifest, '{"version":2,"files":{"index.js":"aaa:100644"}}');
+    const store = new RollbackStore(root);
+    await store.capture('web', appPath);
+    await fs.writeFile(manifest, '{"version":2,"files":{"other.js":"bbb:100644"}}');
+
+    const realFs = require('fs/promises');
+    const copy = jest.spyOn(realFs, 'copyFile');
+    try {
+      await store.restoreInto('web', appPath);
+      const intoLive = copy.mock.calls.filter((c) => String(c[1]).startsWith(manifest));
+      expect(intoLive.length).toBeGreaterThan(0);
+      // Never straight onto the live path: always a temporary name beside it.
+      for (const c of intoLive) expect(String(c[1])).not.toBe(manifest);
+    } finally {
+      copy.mockRestore();
+    }
+
+    expect(JSON.parse(await fs.readFile(manifest, 'utf-8')).files).toEqual({ 'index.js': 'aaa:100644' });
+    const left = (await fs.readdir(path.dirname(manifest))).filter((n) => n.includes('.tmp-'));
+    expect(left).toEqual([]);
+  });
+
   it('a restore of a snapshot taken with no saved list drops the live list', async () => {
     const appPath = path.join(root, 'data', 'webapps', 'web');
     await fs.mkdir(appPath, { recursive: true });
