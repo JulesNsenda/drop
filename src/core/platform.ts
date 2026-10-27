@@ -3848,12 +3848,7 @@ backup:
 
     // The commit the clone was made at: the app folder holds no .git any more,
     // so a build that stamps a version needs it from here.
-    // A monorepo child carries no gitSource: its commit is the group container's
-    // (the container stamped on it as `groupContainer`).
-    const container = this.appConfigService?.getConfig?.(appName)?.groupContainer;
-    const gitCommit =
-      this.stateManager?.getApp(appName)?.gitSource?.lastCommitSha ??
-      (container ? this.stateManager?.getApp(container)?.gitSource?.lastCommitSha : undefined);
+    const gitCommit = this.servedGitCommit(appName);
 
     return {
       ...this.coerceEnvRecord(config?.env),
@@ -8042,6 +8037,33 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
   }
 
   /**
+   * The git commit the app's current files came from: its own `gitSource`, or
+   * for a monorepo child (which carries none) its group container's, the
+   * container stamped on it as `groupContainer`.
+   */
+  private servedGitCommit(appName: string): string | undefined {
+    const container = this.appConfigService?.getConfig?.(appName)?.groupContainer;
+    return (
+      this.stateManager?.getApp(appName)?.gitSource?.lastCommitSha ??
+      (container ? this.stateManager?.getApp(container)?.gitSource?.lastCommitSha : undefined)
+    );
+  }
+
+  /**
+   * Put the commit an app displays back to the one its restored files came
+   * from. Only an app with its own `gitSource`: a monorepo child's commit is its
+   * container's, which a child rollback does not touch.
+   */
+  private async restoreGitCommit(appName: string, commit: string | undefined): Promise<void> {
+    if (commit === undefined || !this.stateManager) return;
+    const gitSource = this.stateManager.getApp(appName)?.gitSource;
+    if (!gitSource) return;
+    await this.stateManager.updateApp(appName, {
+      gitSource: { ...gitSource, lastCommitSha: commit },
+    } as Record<string, unknown>);
+  }
+
+  /**
    * The app is now RUNNING from `servedPath`: record it. A release becomes
    * `currentRelease` (the one it replaces becomes `previousRelease`) and any
    * older release is pruned — so a rollback to `previousRelease` swaps the
@@ -8068,6 +8090,10 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
             : { id: path.basename(servedPath), path: servedPath, createdAt: new Date().toISOString() }),
           // What a later rollback to this release must serve from.
           ...(reused ? {} : cfg?.outputDirectory !== undefined ? { outputDirectory: cfg.outputDirectory } : {}),
+          // The commit it was built from, for a rollback to put back.
+          ...(reused || this.servedGitCommit(appName) === undefined
+            ? {}
+            : { gitCommit: this.servedGitCommit(appName) }),
           ...(slot ? { instance: slot } : {}),
         };
         const previous = cfg?.currentRelease ?? cfg?.previousRelease;
@@ -8140,11 +8166,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       const appPath = this.servingPathOf(appName, config, state);
       const meta = await store.restoreInto(appName, appPath);
       // The folder is the older tree again, so the commit the app claims is too.
-      if (meta.gitCommit !== undefined && state?.gitSource) {
-        await this.stateManager.updateApp(appName, {
-          gitSource: { ...state.gitSource, lastCommitSha: meta.gitCommit },
-        } as Record<string, unknown>);
-      }
+      await this.restoreGitCommit(appName, meta.gitCommit);
       this.appDeployTimes.set(appName, Date.now());
       if (meta.outputDirectory !== undefined) {
         await this.appConfigService.upsertConfig(appName, { outputDirectory: meta.outputDirectory });
@@ -8190,6 +8212,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       takenAt: release.createdAt,
       bytes: measured.bytes,
       ...(release.outputDirectory !== undefined ? { outputDirectory: release.outputDirectory } : {}),
+      ...(release.gitCommit !== undefined ? { gitCommit: release.gitCommit } : {}),
       kind: 'release',
     };
   }
@@ -8217,6 +8240,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         );
       }
       this.logger.info(`Rolled back ${appName} to the release deployed ${release.createdAt}`, 'ROLLBACK');
+      await this.restoreGitCommit(appName, release.gitCommit);
       const info = await this.runtime.getStatus(appName);
       if (!info) throw new Error(`Rolled back ${appName}, but the runtime does not report it`);
       return { meta, info };
@@ -8230,6 +8254,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     await this.commitServedPath(appName, release.path);
     this.appDeployTimes.set(appName, Date.now());
     this.logger.info(`Rolled back ${appName} to the release deployed ${release.createdAt}`, 'ROLLBACK');
+    await this.restoreGitCommit(appName, release.gitCommit);
     const info = await this.doRestart(appName);
     return { meta, info };
   }

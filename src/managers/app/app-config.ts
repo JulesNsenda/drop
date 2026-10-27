@@ -543,6 +543,12 @@ export interface AppRelease {
    * releases recorded before #298 step 6.
    */
   outputDirectory?: string;
+  /**
+   * The git commit this release was built from (the app's `gitSource`, or its
+   * group container's), so a rollback to it can put the displayed commit back.
+   * Absent for apps that are not git-deployed and for older records.
+   */
+  gitCommit?: string;
 }
 
 /**
