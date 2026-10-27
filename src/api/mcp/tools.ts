@@ -28,6 +28,8 @@ import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import { AuthContext, getUserById } from '../middleware/auth';
 import { canAccessScoped, tokenCallerOf } from '../access';
 import { scopesAllowCreate } from '../agent-scopes';
+import { deployActorOf } from '../deploy-actor';
+import { redeployFor } from '../redeploy-for';
 import { isValidAppName } from '../middleware/validate';
 import { getStateManager } from '../../managers/app/state-manager';
 import { getAppConfigService } from '../../managers/app/app-config';
@@ -530,7 +532,7 @@ export async function handleDeployFiles(
       callerIsAdmin: auth?.role === 'admin',
       principalId: auth?.principalId,
       // Derived from the credential, never from tool input.
-      agentCaller: auth?.kind === 'agent',
+      agentCaller: deployActorOf(auth).agent,
       ephemeral: args.ephemeral === true,
       ttlMinutes: args.ttl_minutes,
     });
@@ -599,7 +601,7 @@ interface DeployFromGitArgs {
  */
 async function auditToolAction(
   auth: AuthContext | undefined,
-  action: 'agent-deploy' | 'restart' | 'rollback' | 'custom-domain-set' | 'domain-verified',
+  action: 'agent-deploy' | 'restart' | 'rollback' | 'redeploy' | 'custom-domain-set' | 'domain-verified',
   appName: string,
   detail?: string
 ): Promise<void> {
@@ -669,7 +671,7 @@ export async function handleDeployFromGit(
         branch: args.branch,
         userId: auth?.userId,
         principalId: auth?.principalId,
-        agentCaller: auth?.kind === 'agent',
+        agentCaller: deployActorOf(auth).agent,
         callerIsAdmin: auth?.role === 'admin',
       },
       tokenCaller
@@ -1111,6 +1113,80 @@ export async function handleRollbackApp(
   }
 }
 
+/**
+ * Rebuild an existing app the way POST /apps/:name/redeploy does (#359): the
+ * shared `redeployFor` owns authorization (the 'deploy' scope, a not-found that
+ * names only the app asked for), the git-group child -> container resolution
+ * and the actor, so this tool cannot drift from the route.
+ *
+ * A started or accepted redeploy waits for its outcome like deploy_files,
+ * correlated by app + acceptedAt. A monorepo container is re-expanded in the
+ * background, not built, so there is no outcome to wait for: the answer names
+ * the container and says its services deploy under their own names.
+ */
+export async function handleRedeployApp(
+  auth: AuthContext | undefined,
+  args: { name: string }
+): Promise<CallToolResult> {
+  if (!isValidAppName(args.name)) {
+    return toolError(`Invalid app name: '${args.name}'`);
+  }
+
+  try {
+    const outcome = await redeployFor(auth, getPlatformOps(), args.name);
+    if (outcome.kind === 'not-found') return toolError(`Application '${args.name}' not found`);
+    if (outcome.kind === 'unavailable') return toolError('Platform operations are unavailable on this server.');
+
+    const { target, acceptedAt, result } = outcome;
+    if ('refused' in result) {
+      const { code, message, retryAfterSeconds } = result.refused;
+      // The recorded git URL is tenant-controlled and rides in this one message.
+      const text = code === 'INVALID_GIT_SOURCE' ? wrapUntrusted(`GIT SOURCE: ${target}`, message) : message;
+      return {
+        content: [{ type: 'text', text }],
+        isError: true,
+        structuredContent: {
+          ok: false,
+          app: target,
+          status: 'refused',
+          refusal_code: code,
+          ...(retryAfterSeconds !== undefined ? { retry_after_seconds: retryAfterSeconds } : {}),
+        },
+      };
+    }
+
+    await auditToolAction(auth, 'redeploy', target, `redeploy_app (${outcome.detail})`);
+
+    if ('group' in result) {
+      const container = result.group.container;
+      return {
+        content: [
+          {
+            type: 'text',
+            text:
+              `Application '${container}' is a monorepo container: it is being re-expanded in the background, not built. ` +
+              'Its services deploy under their own names — call app_status on each service to follow it.',
+          },
+        ],
+        structuredContent: {
+          ok: true,
+          app: container,
+          status: 'group_reexpanding',
+          container,
+          next_actions: ['app_status'],
+        },
+      };
+    }
+
+    return await waitForDeployOutcome(target, acceptedAt, false);
+  } catch (err) {
+    if (err instanceof AppInProgressError || err instanceof StaleDependenciesError) {
+      return toolError(err.message);
+    }
+    return toolError(`Failed to redeploy '${args.name}': ${err instanceof Error ? err.message : 'unknown error'}`);
+  }
+}
+
 export async function handleRestartApp(
   auth: AuthContext | undefined,
   args: { name: string }
@@ -1423,6 +1499,23 @@ export function buildMcpServer(auth: AuthContext | undefined): McpServer {
       },
     },
     args => handleRollbackApp(auth, args)
+  );
+
+  server.registerTool(
+    'redeploy_app',
+    {
+      title: 'Redeploy app',
+      description:
+        "Rebuild an existing app and swap it in, without uploading anything: a git-backed app first pulls its repository's newest commit, " +
+        "any other app is rebuilt from the source already on disk. Use deploy_files to change an app's files. " +
+        'Waits for the build to finish and returns the app URL on success, or the failing build stage and an untrusted build-log tail on failure. ' +
+        'A monorepo container is re-expanded in the background and the answer names it — its services deploy under their own names. ' +
+        'A stopped app is not rebuilt by an agent; use restart_app. A refusal (busy, rate-limited, low disk) is returned with a code and, when relevant, retry_after_seconds.',
+      inputSchema: {
+        name: z.string().describe('App name.'),
+      },
+    },
+    args => handleRedeployApp(auth, args)
   );
 
   server.registerTool(

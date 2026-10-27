@@ -45,6 +45,7 @@ Cursor and other clients: same URL and `Authorization` header in `mcp.json`.
 | Small app you just wrote, text files only (max 48 files, max 1.5 MB total) | `deploy_files` |
 | Bigger project, binary assets, or already on GitHub (**new** app only) | `deploy_from_git` |
 | Shell-capable agent with a large or binary project | REST tarball upload (below) |
+| Rebuild an existing app without changing its files (a git app pulls its newest commit first) | `redeploy_app` |
 | Redeploying an app that was deployed from git | `POST /api/v1/git/redeploy/<app>` (uploads onto a git-deployed app are refused with 409) |
 | Scratch test you don't want to keep | `deploy_files` with `ephemeral: true` (self-deletes, default 60 min; `ttl_minutes` sets the lifetime, clamped to the platform maximum) |
 

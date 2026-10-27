@@ -13,7 +13,7 @@ import { pipeline } from 'stream/promises';
 import { success, error, ErrorCodes, AppDto, CreateAppDto } from '../types';
 import { NotFoundError, ValidationError } from '../middleware/error';
 import { AuthContext, listUsers, getUserById } from '../middleware/auth';
-import { canAccess, canAccessScoped, interactiveSessionOnly, tokenCallerOf } from '../access';
+import { canAccess, interactiveSessionOnly } from '../access';
 import { isValidAppName, validateAppName } from '../middleware/validate';
 import { getAppRuntime } from '../../managers/runtime';
 import {
@@ -68,12 +68,11 @@ import {
   gateEnforced,
 } from '../../managers/guardrail/access-gate';
 import { DeployRefusedError } from '../../managers/guardrail/deploy-breaker';
-import { deployActorOf } from '../deploy-actor';
+import { redeployFor } from '../redeploy-for';
 import { QuotaExceededError } from '../../managers/guardrail/principal-quota';
 import { pruneOwnerDumpsToFit, predeleteMaxBytes } from '../../managers/guardrail/detach-limits';
 import { runUploadPreflight } from '../upload-preflight';
 import type { RedeployRefusal, RedeployRefusalCode } from '../platform-ops';
-import { resolveGitBackedName } from '../../core/git-backed';
 import type { RuntimeType } from '../../managers/runtime/app-runtime.types';
 import {
   MAX_ACCESS_ALLOW_ENTRIES,
@@ -1336,47 +1335,16 @@ apps.post('/:name/redeploy', async c => {
   const auth = (c.get as Function)('auth') as AuthContext | undefined;
   const name = c.req.param('name');
 
-  // Authorization first, and a 404 that names only the app the caller asked
-  // for. Scoped: an agent token needs app:<name>:deploy for THIS app.
-  const app = getStateManager().getApp(name);
-  if (!app || !canAccessScoped(auth, app, name, 'deploy')) {
-    throw new NotFoundError(`Application '${name}' not found`);
-  }
-
-  // A service of a git-deployed group holds no repository: its container does,
-  // and a rebuild of the child would only redo a copy the container's next
-  // expansion overwrites. The group tag is tenant-influenced, so access is
-  // re-checked on the RESOLVED container, and a refusal names only the app asked for.
-  const stateManager = getStateManager();
-  let target = name;
-  const owner = resolveGitBackedName(app, stateManager);
-  if (owner && owner !== name) {
-    const container = stateManager.getApp(owner);
-    if (!container || !canAccessScoped(auth, container, owner, 'deploy')) {
-      throw new NotFoundError(`Application '${name}' not found`);
-    }
-    target = owner;
-  }
-
-  const ops = getPlatformOps();
-  if (!ops) {
+  // Authorization, git-group resolution and the actor live in redeployFor, shared with the MCP tool.
+  const outcome = await redeployFor(auth, getPlatformOps(), name);
+  if (outcome.kind === 'not-found') throw new NotFoundError(`Application '${name}' not found`);
+  if (outcome.kind === 'unavailable') {
     return c.json(error(ErrorCodes.SERVICE_UNAVAILABLE, 'Platform operations unavailable'), 503);
   }
-
-  // Taken BEFORE the start, so the since-stream cannot miss an episode that
-  // opens while the platform is still deciding.
-  const acceptedAt = new Date().toISOString();
-
-  // One operation: the platform reserves, admits (with the one actor, for the
-  // guardrail keys and the stopped rule alike) and starts.
-  const result = await ops.redeployApp(target, deployActorOf(auth), { caller: tokenCallerOf(auth) ?? null });
+  const { target, acceptedAt, result, detail } = outcome;
   if ('refused' in result) return redeployRefusalResponse(c, result.refused);
 
-  await logActivityFor(auth, {
-    action: 'redeploy',
-    appName: target,
-    detail: target !== name || app.gitSource ? 'git' : 'group' in result ? 'group' : 'files',
-  });
+  await logActivityFor(auth, { action: 'redeploy', appName: target, detail });
   // A scope-only caller (role 'none') cannot read /deploys at all (its floor is
   // 'readonly'), so a URL into it would only 403: it gets the facts and no link.
   const follow =

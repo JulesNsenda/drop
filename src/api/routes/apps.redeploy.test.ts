@@ -20,6 +20,7 @@ import { makePlatformOpsStub } from '../__testutils__/platform-ops';
 import { getStateManager } from '../../managers/app/state-manager';
 import { setPlatformOps, resetPlatformOps, type PlatformOps, type RedeployRefusal } from '../platform-ops';
 import * as activity from '../../managers/activity';
+import * as redeployForModule from '../redeploy-for';
 
 describe('POST /apps/:name/redeploy', () => {
   let t: TestApiServer;
@@ -61,6 +62,15 @@ describe('POST /apps/:name/redeploy', () => {
   afterEach(async () => {
     resetPlatformOps();
     await teardownTestApiServer(t);
+  });
+
+  it('decides through the shared redeployFor, the same core the MCP tool calls', async () => {
+    const core = jest.spyOn(redeployForModule, 'redeployFor');
+    const res = await redeploy('site', bearer(ownerToken));
+    expect(res.status).toBe(202);
+    expect(core).toHaveBeenCalledTimes(1);
+    expect(core).toHaveBeenCalledWith(expect.objectContaining({ userId: ownerId }), ops, 'site');
+    core.mockRestore();
   });
 
   describe('authorization comes first', () => {
