@@ -7110,9 +7110,14 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     // breakerKeys for some later episode's outcome to be recorded against.
     //
     // The in-progress skip at the top of this method is stale by now: the
-    // drop.yaml read and the stale-tree check awaited. The ONE re-check is below,
-    // after the guardrail keys are reserved and in the same synchronous turn as
-    // the claim, so two concurrent updates of one app cannot both be admitted.
+    // drop.yaml read and the stale-tree check awaited, leaving a gap in which
+    // another deploy can take the slot (the chained redeploy: A's update arrives
+    // after A released, B reserves, then A would claim a slot B holds, build
+    // beside B's land, and release B's reservation when it finished). So it is
+    // re-checked HERE, before the guardrail: a busy app's update is dropped, not
+    // refused, and never touches a key. inProgressSkip covers BOTH sets
+    // (in-progress and git-reserved). Nothing below awaits before the claim.
+    if (this.inProgressSkip(appName, bypassCooldown)) return false;
     const guardKeys = this.guardrailKeys(appName, false, actor ?? {});
     const verdict = this.checkGuardrails(guardKeys);
     if (!verdict.allowed) {
@@ -7138,16 +7143,6 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       return false;
     }
     this.breakerKeys.set(appName, guardKeys);
-
-    // The awaits above leave a gap in which another deploy can take the slot
-    // (the chained redeploy: A's update arrives after A released, B reserves,
-    // then A would claim a slot B holds, build beside B's land, and release B's
-    // reservation when it finished). inProgressSkip covers BOTH sets (in-progress
-    // and git-reserved); the guardrail keys reserved above are given back.
-    if (this.inProgressSkip(appName, bypassCooldown)) {
-      this.releaseGuardrailKeys(appName);
-      return false;
-    }
     this.logger.info(`Hot-reload triggered for ${appName}: ${reason}`, 'UPDATE');
     this.appsInProgress.add(appName);
 
