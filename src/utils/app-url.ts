@@ -69,14 +69,15 @@ export function computeAppUrl(app: AppState, options?: ComputeAppUrlOptions): st
   if (publicUrl && !app.customDomain && !configDomains?.length) {
     return forceHttps ? publicUrl.replace(/^http:\/\//, 'https://') : publicUrl;
   }
-  // A candidate the router would refuse (the platform's own host, or a name
-  // under it) is not where the app is served; skip it rather than link to it.
   const suffix = getDomainSuffix();
-  const hostPublicUrl = getPublicUrl();
-  const domain = [app.customDomain, ...(configDomains ?? []), `${app.name}.${suffix}`].find(
-    (d): d is string => !!d && !platformHostProblem(d, { publicUrl: hostPublicUrl, domainSuffix: suffix })
-  );
-  if (!domain || isLocalhostDomain(domain)) return undefined;
+  const domain = app.customDomain || configDomains?.[0] || `${app.name}.${suffix}`;
+  // The chosen host is one the router would refuse (the platform's own host, a
+  // name under it, or one that cannot be parsed): there is no URL to hand out.
+  // Fail closed rather than fall through to a lower-priority candidate — the
+  // MCP gateway and the session audience treat this URL as the app's canonical
+  // origin, and a fallback would be one the app's owner never chose.
+  if (platformHostProblem(domain, { publicUrl: getPublicUrl(), domainSuffix: suffix })) return undefined;
+  if (isLocalhostDomain(domain)) return undefined;
   const proto = forceHttps || (isHttpsEnabled() && !tlsDisabled) ? 'https' : 'http';
   return `${proto}://${domain}`;
 }

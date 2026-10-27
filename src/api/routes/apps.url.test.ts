@@ -108,12 +108,11 @@ describe('computeAppUrl', () => {
     expect(computeAppUrl(makeApp())).toBe('https://waitlist.dropkit.sh');
   });
 
-  it('skips a candidate under the platform public host and uses the next one', () => {
+  it('returns undefined, not a lower-priority host, when the chosen host is under the platform public host', () => {
     setApiRuntimeConfig({ publicUrl: 'https://dashboard.platform.example' });
-    withConfig({ domains: ['x.dashboard.platform.example', 'declared.example.com'] });
-    expect(computeAppUrl(makeApp({ customDomain: 'y.dashboard.platform.example' }))).toBe(
-      'https://declared.example.com'
-    );
+    withConfig({ domains: ['declared.example.com'] });
+    expect(computeAppUrl(makeApp({ customDomain: 'y.dashboard.platform.example' }))).toBeUndefined();
+    expect(computeAppUrl(makeApp({ customDomain: 'a b.example.com' }))).toBeUndefined();
     setApiRuntimeConfig({ publicUrl: undefined });
   });
 });
