@@ -900,6 +900,7 @@ export class GitDeployService {
         let tokenGrantedFor = baseSource.tokenGrantedFor;
         // True only when THIS call established the grant (the admin-chosen path).
         let grantedHere = false;
+        let ownerAtResolve: string | undefined;
         if (effectiveTokenId === null) {
           tokenGrantedBy = undefined;
           tokenGrantedFor = undefined;
@@ -919,6 +920,8 @@ export class GitDeployService {
             tokenGrantedBy = resolved?.grantedBy;
             tokenGrantedFor = resolved?.grantedFor;
             grantedHere = true;
+            // Who owned the token when the grant was minted; re-checked at write time.
+            ownerAtResolve = this.readOwners()?.[effectiveTokenId];
           }
           if (!token) {
             // Branch on PROVENANCE. An id the caller supplied on THIS request that
@@ -980,6 +983,18 @@ export class GitDeployService {
         // is written from the pre-clone snapshot only when THIS call just made it
         // (an admin-chosen token); otherwise it is taken from the latest state.
         const latest = stateManager.getApp(appName)?.gitSource;
+        // A grant minted by this call is void if the token changed hands during
+        // the clone (setTokenOwner could not see this app: it was not attached
+        // yet). The token is still attached, without the grant, so it fails
+        // closed on the next resolve. Checked here, synchronously before the write.
+        if (grantedHere && tokenGrantedBy && this.readOwners()?.[effectiveTokenId as string] !== ownerAtResolve) {
+          logger.warn(
+            `Token '${effectiveTokenId}' changed owner while ${appName} was cloning; the grant made for this redeploy was not recorded`,
+            'GIT-DEPLOY'
+          );
+          tokenGrantedBy = undefined;
+          tokenGrantedFor = undefined;
+        }
         const expectedTokenId = actor.tokenId === null ? undefined : baseSource.tokenId;
         const expectedGrantedBy = actor.tokenId === null ? undefined : baseSource.tokenGrantedBy;
         const expectedGrantedFor = actor.tokenId === null ? undefined : baseSource.tokenGrantedFor;
@@ -1235,16 +1250,24 @@ export class GitDeployService {
         // Clear any grant it already held (an admin-chosen token, an earlier
         // keepAttached): resolveToken honours a grant whoever owned the token
         // when it was made, so leaving it would keep this app pulling.
-        if (app.gitSource?.tokenGrantedBy || app.gitSource?.tokenGrantedFor) {
+        //
+        // `crossOwner` is a snapshot taken before the awaits above, so the app is
+        // re-read here, with no await before the write: an app that detached the
+        // token meanwhile is skipped rather than handed its old gitSource back.
+        const cur = stateManager.getApp(app.name)?.gitSource;
+        if (cur?.tokenId !== id) continue;
+        if (cur.tokenGrantedBy || cur.tokenGrantedFor) {
           await stateManager.updateApp(app.name, {
-            gitSource: { ...app.gitSource, tokenGrantedBy: undefined, tokenGrantedFor: undefined },
+            gitSource: { ...cur, tokenGrantedBy: undefined, tokenGrantedFor: undefined },
           } as Record<string, unknown>);
         }
         failing.push(app.name);
         continue;
       }
+      const cur = stateManager.getApp(app.name)?.gitSource;
+      if (cur?.tokenId !== id) continue;
       await stateManager.updateApp(app.name, {
-        gitSource: { ...app.gitSource, tokenGrantedBy: grantedBy, tokenGrantedFor: app.userId },
+        gitSource: { ...cur, tokenGrantedBy: grantedBy, tokenGrantedFor: app.userId },
       } as Record<string, unknown>);
       granted.push(app.name);
       logger.warn(`Token '${id}' now belongs to ${userId}; kept attached to '${app.name}' by grant of ${grantedBy}`, 'GIT-DEPLOY');
