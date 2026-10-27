@@ -176,11 +176,11 @@ export interface AuthContext {
    */
   principalId?: string;
   /**
-   * True only for the platform's own CLI key (`cli-local`): ownerless, admin,
-   * minted by the platform at boot into a file only a local operator can read.
-   * It is what lets `drop remove --destroy-bucket` confirm a destructive
-   * action without a browser session. Derived here from the key itself, never
-   * from a name a caller could choose for an owned key.
+   * True only for THE key the platform minted at this boot for the CLI
+   * (`registerLocalCliKey`), matched by its id. Not by name, role or
+   * ownerlessness: another admin can create a key with all of those. It is a
+   * property of the credential only; the destructive-action gate additionally
+   * requires the request itself to be a direct loopback connection.
    */
   localCli?: true;
   /**
@@ -190,8 +190,17 @@ export interface AuthContext {
   kind?: 'agent';
 }
 
-/** The name the platform gives the CLI's own admin key at boot (platform.ts). */
-export const CLI_LOCAL_KEY_NAME = 'cli-local';
+/** The id of the CLI key the platform minted at this boot (see `registerLocalCliKey`). */
+let localCliKeyId: string | null = null;
+
+/**
+ * Record which API key is the platform's own CLI key. Called once per boot,
+ * with the id of the key just minted into `local.key`; only that id is ever
+ * treated as the local CLI.
+ */
+export function registerLocalCliKey(id: string): void {
+  localCliKeyId = id;
+}
 
 /**
  * Canonical role ranking. The single source every ordinal role comparison
@@ -2024,7 +2033,7 @@ function apiKeyAuthContext(key: ApiKey, owner: SafeUser | null): AuthContext {
       // more than one. Ownership still flows through userId above.
       principalId: `key:${key.id}`,
       ...(key.kind ? { kind: key.kind } : {}),
-      ...(key.name === CLI_LOCAL_KEY_NAME && key.role === 'admin' && !key.kind ? { localCli: true as const } : {}),
+      ...(localCliKeyId !== null && key.id === localCliKeyId ? { localCli: true as const } : {}),
     };
   }
 
@@ -2201,6 +2210,7 @@ export function resetAuth(): void {
   lastUsedFlushAt = 0;
   challengeAttempts.clear();
   revokedGrants.clear();
+  localCliKeyId = null;
 }
 
 /**

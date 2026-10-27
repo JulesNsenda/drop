@@ -88,11 +88,17 @@ detach converges without a manual retry.
 
 Deleting an app deletes its bucket the same way, with no backup, and needs the
 same `?confirm=<app>` when the app holds a bucket (a monorepo group delete is
-confirmed with the group name), from an interactive session **or the
-platform's own CLI key**. The dashboard's delete dialog says so and sends the
+confirmed with the group name), from an interactive session **or the CLI run
+on the server itself**. The dashboard's delete dialog says so and sends the
 confirmation. `drop remove <app>` is refused with advice; `drop remove <app>
 --keep-data` keeps the bucket, and `drop remove <app> --destroy-bucket`
-destroys it. Any other API key, an OAuth token or an agent token is refused.
+destroys it — but only from an interactive terminal, where you type the app
+name to confirm; with stdin not a terminal it refuses and tells you a person
+must confirm it. The server accepts the CLI's confirmation only from the one
+key it minted at boot (matched by id, not by name), over a direct loopback
+connection with no proxy headers (`X-Forwarded-*`, `Forwarded`, `Via`,
+`X-Real-IP`). Any other API key, an OAuth token, an agent token or a proxied
+request is refused.
 If the allocation store is unreadable, DROP cannot tell whether the app holds a
 bucket: the delete answers 503 and says so (`keepData` still works) instead of
 asking for a confirmation that would mean nothing.

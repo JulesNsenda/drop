@@ -72,9 +72,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **Destroying a bucket needs a person and a confirmation.** Detaching, or
     deleting an app (or group) that holds a bucket, requires an interactive
     session and `?confirm=<name>`, checked server-side before anything is
-    stopped. Other API keys, OAuth and agent tokens are refused; the CLI's own
-    local key is accepted, so `drop remove <app> --destroy-bucket` (or
-    `--keep-data` to keep the bucket) works. An unreadable allocation store
+    stopped. Other API keys, OAuth and agent tokens are refused. The CLI's own
+    boot key is also accepted, but only from a direct loopback connection
+    (nothing proxied) and only behind `drop remove <app> --destroy-bucket`,
+    which makes you type the app name at a terminal and refuses off a TTY;
+    `--keep-data` keeps the bucket. An unreadable allocation store
     answers 503 rather than asking. The dashboard dialogs say so and send it.
   - **A delete retires the record before touching AWS.** The allocation is
     moved off the app's name first, the IAM key is revoked, and the bucket is

@@ -8,6 +8,7 @@ import { Command } from 'commander';
 import { RemoveOptions } from '../cli.types';
 import * as output from '../utils/output';
 import { createApiClient, DropApiError } from '../api-client';
+import { ask, isInteractiveTerminal } from '../utils/prompt';
 
 export function createRemoveCommand(): Command {
   const cmd = new Command('remove')
@@ -36,6 +37,26 @@ export function createRemoveCommand(): Command {
         if (app.status === 'running' && !options.force) {
           output.warn(`${appName} is currently running. Use --force to remove anyway.`);
           process.exit(1);
+        }
+
+        // Destroying a bucket is a person's decision: it is typed at a terminal,
+        // never passed from a script (a pipe, cron, an agent). The server
+        // accepts this CLI's key for it, so this prompt is the check that a
+        // human is there.
+        if (options.destroyBucket) {
+          if (!isInteractiveTerminal()) {
+            output.error(
+              '--destroy-bucket permanently deletes data and has to be confirmed by a person: run it from an interactive terminal, or delete the app from the dashboard. It cannot be confirmed from a script.'
+            );
+            process.exit(1);
+          }
+          const typed = await ask(
+            `This permanently deletes ${appName}'s object-storage bucket and every object in it, with no backup.\nType the app name to confirm: `
+          );
+          if (typed !== appName) {
+            output.error('The name did not match, so nothing was deleted.');
+            process.exit(1);
+          }
         }
 
         const spin = output.spinner(`Removing ${appName}...`);
@@ -76,8 +97,11 @@ export function createRemoveCommand(): Command {
           // say which two ways forward there are.
           if (err.details?.reason === 'confirmation-required') {
             output.info(
-              `${appName} holds an object-storage bucket. To delete the app and KEEP the bucket, re-run with --keep-data. ` +
-                'To delete the app AND permanently destroy the bucket and every object in it (no backup), re-run with --destroy-bucket.'
+              isInteractiveTerminal()
+                ? `${appName} holds an object-storage bucket. To delete the app and KEEP the bucket, re-run with --keep-data. ` +
+                    'To delete the app AND permanently destroy the bucket and every object in it (no backup), re-run with --destroy-bucket and type the app name when asked.'
+                : `${appName} holds an object-storage bucket. To delete the app and keep the bucket, re-run with --keep-data. ` +
+                    'Destroying the bucket has to be confirmed by a person, interactively, in the dashboard or at a terminal.'
             );
           }
         } else {

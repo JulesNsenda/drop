@@ -14,6 +14,7 @@ import { success, error, ErrorCodes, AppDto, CreateAppDto } from '../types';
 import { NotFoundError, ValidationError } from '../middleware/error';
 import { AuthContext, listUsers, getUserById } from '../middleware/auth';
 import { canAccess, interactiveSessionOrLocalCli } from '../access';
+import { isDirectLoopbackRequest } from '../loopback';
 import { isValidAppName, validateAppName } from '../middleware/validate';
 import { getAppRuntime } from '../../managers/runtime';
 import {
@@ -717,7 +718,7 @@ function bucketDestructionRefusal(
   target: string,
   action: string
 ): Response | null {
-  const gate = interactiveSessionOrLocalCli(auth, action);
+  const gate = interactiveSessionOrLocalCli(auth, action, isDirectLoopbackRequest(c));
   if (!gate.ok) {
     return c.json(error(ErrorCodes.UNAUTHORIZED, gate.message), 403);
   }

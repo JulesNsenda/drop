@@ -9,7 +9,7 @@ import * as fs from 'fs/promises';
 import * as path from 'path';
 import * as os from 'os';
 import { ApiServer } from '../server';
-import { createUser, createApiKey, resetAuth } from '../middleware/auth';
+import { createUser, createApiKey, registerLocalCliKey, resetAuth } from '../middleware/auth';
 import { getTestToken } from '../__testutils__/auth';
 import { getStateManager, resetStateManager } from '../../managers/app/state-manager';
 import { resetAppConfigService } from '../../managers/app/app-config';
@@ -47,8 +47,15 @@ describe('destroying a bucket needs an interactive session and a confirmation (#
 
   const bearer = (token: string) => ({ Authorization: `Bearer ${token}` });
   const ops = (overrides?: Partial<PlatformOps>) => setPlatformOps(makePlatformOpsStub(overrides));
-  const del = (url: string, headers: Record<string, string> = bearer(ownerToken)) =>
-    hono.request(url, { method: 'DELETE', headers });
+  const del = (url: string, headers: Record<string, string> = bearer(ownerToken), env?: unknown) =>
+    hono.request(url, { method: 'DELETE', headers }, env as never);
+  /** What @hono/node-server hands the app for a request that arrived on this socket. */
+  const fromSocket = (remoteAddress: string) => ({ incoming: { socket: { remoteAddress } } });
+  const mintLocalCliKey = async () => {
+    const created = await createApiKey('cli-local', 'admin');
+    registerLocalCliKey(created.apiKey.id);
+    return { 'X-API-Key': created.key };
+  };
 
   beforeEach(async () => {
     tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'drop-bucket-destruction-test-'));
@@ -178,15 +185,68 @@ describe('destroying a bucket needs an interactive session and a confirmation (#
       expect((await del('/api/v1/apps/site?keepData=true')).status).toBe(200);
     });
 
-    it("accepts the platform's own CLI key (admin, ownerless) with the confirmation, but not without it", async () => {
+    it("accepts the platform's own CLI key over a direct loopback connection, with the confirmation, but not without it", async () => {
       withRisk('bucket');
-      const cli = { 'X-API-Key': (await createApiKey('cli-local', 'admin')).key };
+      const cli = await mintLocalCliKey();
+      const loopback = fromSocket('127.0.0.1');
 
-      expect((await del('/api/v1/apps/site', cli)).status).toBe(400);
+      expect((await del('/api/v1/apps/site', cli, loopback)).status).toBe(400);
       expect(getStateManager().getApp('site')).toBeDefined();
 
-      expect((await del('/api/v1/apps/site?confirm=site', cli)).status).toBe(200);
+      expect((await del('/api/v1/apps/site?confirm=site', cli, loopback)).status).toBe(200);
       expect(getStateManager().getApp('site')).toBeUndefined();
+    });
+
+    it('also accepts it from ::1 and the IPv4-mapped loopback form', async () => {
+      withRisk('bucket');
+      const cli = await mintLocalCliKey();
+      expect((await del('/api/v1/apps/site?confirm=site', cli, fromSocket('::ffff:127.0.0.1'))).status).toBe(200);
+    });
+
+    it.each([
+      ['X-Forwarded-For', '203.0.113.9'],
+      ['X-Forwarded-Host', 'drop.example.com'],
+      ['X-Forwarded-Proto', 'https'],
+      ['X-Real-IP', '203.0.113.9'],
+      ['Forwarded', 'for=203.0.113.9'],
+      ['Via', '1.1 caddy'],
+    ])('refuses the local CLI key on a proxied request (%s present), even from a loopback peer', async (header, value) => {
+      withRisk('bucket');
+      const cli = await mintLocalCliKey();
+
+      const res = await del('/api/v1/apps/site?confirm=site', { ...cli, [header]: value }, fromSocket('127.0.0.1'));
+
+      expect(res.status).toBe(403);
+      expect(getStateManager().getApp('site')).toBeDefined();
+    });
+
+    it.each([['a remote peer', fromSocket('203.0.113.9')], ['an unreadable peer', undefined]])(
+      'refuses the local CLI key from %s',
+      async (_label, env) => {
+        withRisk('bucket');
+        const cli = await mintLocalCliKey();
+
+        expect((await del('/api/v1/apps/site?confirm=site', cli, env)).status).toBe(403);
+        expect(getStateManager().getApp('site')).toBeDefined();
+      }
+    );
+
+    it('pins the local CLI to the key minted at boot: a key with the same name, role and ownerlessness is refused', async () => {
+      withRisk('bucket');
+      await mintLocalCliKey();
+      const lookalike = { 'X-API-Key': (await createApiKey('cli-local', 'admin')).key };
+
+      const res = await del('/api/v1/apps/site?confirm=site', lookalike, fromSocket('127.0.0.1'));
+
+      expect(res.status).toBe(403);
+      expect(getStateManager().getApp('site')).toBeDefined();
+    });
+
+    it('treats no registered boot key as no local CLI at all', async () => {
+      withRisk('bucket');
+      const key = { 'X-API-Key': (await createApiKey('cli-local', 'admin')).key };
+
+      expect((await del('/api/v1/apps/site?confirm=site', key, fromSocket('127.0.0.1'))).status).toBe(403);
     });
 
     it('still refuses every other credential with the confirmation: other admin keys, owned admin keys, agent tokens', async () => {

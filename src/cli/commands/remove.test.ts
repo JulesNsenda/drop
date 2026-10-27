@@ -9,6 +9,13 @@ import * as output from '../utils/output';
 
 const removeApp = jest.fn();
 const getApp = jest.fn();
+const ask = jest.fn();
+const isInteractiveTerminal = jest.fn();
+
+jest.mock('../utils/prompt', () => ({
+  ask: (q: string) => ask(q),
+  isInteractiveTerminal: () => isInteractiveTerminal(),
+}));
 
 jest.mock('../api-client', () => {
   const actual = jest.requireActual('../api-client');
@@ -26,6 +33,8 @@ describe('drop remove --destroy-bucket', () => {
 
   beforeEach(() => {
     removeApp.mockReset();
+    ask.mockReset();
+    isInteractiveTerminal.mockReset().mockReturnValue(true);
     getApp.mockReset().mockResolvedValue({ name: 'site', status: 'stopped' });
     errors = [];
     infos = [];
@@ -43,20 +52,51 @@ describe('drop remove --destroy-bucket', () => {
     expect(createRemoveCommand().options.map((o) => o.long)).toContain('--destroy-bucket');
   });
 
-  it('passes it to the client, and not by default', async () => {
+  it('prompts for the app name, and sends the confirmation only once it is typed', async () => {
     removeApp.mockResolvedValue({ database: 'none' });
+    ask.mockResolvedValue('site');
 
     await run(['site', '--destroy-bucket']);
+
+    expect(ask).toHaveBeenCalledTimes(1);
+    expect(ask.mock.calls[0][0]).toMatch(/permanently deletes site's object-storage bucket/);
     expect(removeApp).toHaveBeenLastCalledWith('site', { keepData: undefined, destroyBucket: true });
+  });
+
+  it('does not prompt, or destroy anything, without the flag', async () => {
+    removeApp.mockResolvedValue({ database: 'none' });
 
     await run(['site']);
+
+    expect(ask).not.toHaveBeenCalled();
     expect(removeApp).toHaveBeenLastCalledWith('site', { keepData: undefined, destroyBucket: undefined });
   });
 
-  it('turns a confirmation-required refusal into advice naming both flags', async () => {
-    removeApp.mockRejectedValue(
-      new DropApiError(400, 'VALIDATION_ERROR', 'Deleting site needs ?confirm=site', { reason: 'confirmation-required' })
-    );
+  it('deletes nothing when the typed name does not match', async () => {
+    ask.mockResolvedValue('sit');
+
+    await expect(run(['site', '--destroy-bucket'])).rejects.toThrow('exit');
+
+    expect(removeApp).not.toHaveBeenCalled();
+    expect(errors.join(' ')).toMatch(/did not match/);
+  });
+
+  it('refuses outright when stdin is not a terminal: a script cannot confirm a destroy', async () => {
+    isInteractiveTerminal.mockReturnValue(false);
+
+    await expect(run(['site', '--destroy-bucket'])).rejects.toThrow('exit');
+
+    expect(ask).not.toHaveBeenCalled();
+    expect(removeApp).not.toHaveBeenCalled();
+    expect(errors.join(' ')).toMatch(/confirmed by a person/);
+    expect(errors.join(' ')).toMatch(/dashboard/);
+  });
+
+  const refusal = () =>
+    new DropApiError(400, 'VALIDATION_ERROR', 'Deleting site needs ?confirm=site', { reason: 'confirmation-required' });
+
+  it('at a terminal, a confirmation-required refusal names both ways forward', async () => {
+    removeApp.mockRejectedValue(refusal());
 
     await expect(run(['site'])).rejects.toThrow('exit');
 
@@ -64,6 +104,18 @@ describe('drop remove --destroy-bucket', () => {
     expect(infos.join(' ')).toMatch(/--keep-data/);
     expect(infos.join(' ')).toMatch(/--destroy-bucket/);
     expect(exit).toHaveBeenCalledWith(1);
+  });
+
+  it('off a terminal, the refusal does NOT coach the caller towards --destroy-bucket', async () => {
+    isInteractiveTerminal.mockReturnValue(false);
+    removeApp.mockRejectedValue(refusal());
+
+    await expect(run(['site'])).rejects.toThrow('exit');
+
+    const advice = infos.join(' ');
+    expect(advice).toMatch(/--keep-data/);
+    expect(advice).not.toMatch(/--destroy-bucket/);
+    expect(advice).toMatch(/confirmed by a person, interactively, in the dashboard or at a terminal/);
   });
 
   it('adds no advice to an unrelated refusal', async () => {
