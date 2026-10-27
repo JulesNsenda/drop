@@ -35,7 +35,7 @@ import {
 } from './detector';
 import { getProcfileWebCommand } from './detector/procfile';
 import { BuilderService, getBuilder, resetBuilder } from './builder';
-import { RouterService, getRouterService, resetRouterService } from './router';
+import { RouterService, RouteConflictError, getRouterService, resetRouterService } from './router';
 import { AppRuntime, AppProcessInfo, AppStartSpec, getAppRuntime, resetAppRuntime } from '../managers/runtime';
 import {
   instanceName,
@@ -6369,8 +6369,11 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         const tlsDisabled = gateStillAsserted ? false : dropYaml.config?.tls?.disabled;
         const enableSsl = this.config.enableHttps && !isLocalhost && !tlsDisabled;
 
-        await this.router.addRoute({
-          appName: `${appName}.${hostname}`, // Unique route key per domain: app names cannot contain '.', so the first dot ends the app name
+        // Route key: '/' can appear in neither a folder name nor a hostname, so
+        // distinct (app, host) pairs can never share a key. Lowercased, so case
+        // variants of one host are one route rather than two Caddy site blocks.
+        const conflict = await this.router.addRoute({
+          appName: `${appName}/${hostname.toLowerCase()}`,
           owner: appName, // Bare owning app name — lets removeRoutesForApp find every route this app owns
           hostname,
           pathPrefix: routePathPrefix,
@@ -6393,7 +6396,21 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           // leave it in the Caddyfile for the life of the process.
           mcpAuth: mcpGuard,
           accessAuth: accessGuard,
-        });
+        }).then(
+          () => undefined,
+          (err: unknown) => {
+            if (err instanceof RouteConflictError) return err;
+            throw err;
+          }
+        );
+
+        if (conflict) {
+          this.logger.error(
+            `Route for '${hostname}' NOT configured for ${appName}: already routed for app '${conflict.existingOwner ?? 'unknown'}' (${conflict.existingHostname})`,
+            'ROUTER'
+          );
+          continue;
+        }
 
         const protocol = enableSsl ? 'https' : 'http';
         const caddyAvailable = this.caddyServer?.getStatus() === 'running';
@@ -8185,13 +8202,13 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
   /**
    * Remove the live route for a hostname the app is no longer allowed to serve.
    *
-   * The route key is `${app}.${host}`; app names cannot contain '.', so keys
-   * of different apps cannot collide. The old scheme (`${app}-${host with dots
-   * as dashes}`) was ambiguous, so the owner and hostname are still checked:
-   * only a route this app owns, on exactly this hostname, is removed.
+   * The route key is `${app}/${host lowercased}`; '/' appears in neither a
+   * folder name nor a hostname, so keys of different apps cannot collide. The
+   * owner and hostname are still checked as defence in depth: only a route this
+   * app owns, on exactly this hostname, is removed.
    */
   private async pruneRoute(appName: string, hostname: string): Promise<void> {
-    const routeKey = `${appName}.${hostname}`;
+    const routeKey = `${appName}/${hostname.toLowerCase()}`;
     const route = this.router?.getRoute(routeKey);
     if (!route || route.owner !== appName) return;
     if (route.hostname?.toLowerCase() !== hostname.toLowerCase()) return;

@@ -13,6 +13,7 @@ import {
 } from './caddy-generator';
 import {
   RouterService,
+  RouteConflictError,
   createRouterService,
   getRouterService,
   resetRouterService,
@@ -479,9 +480,10 @@ describe('RouterService', () => {
         await router.addRoute(route('behalf', 'behalf.dropkit.sh', 'localhost:3000'));
         mockFs.writeFile.mockClear();
 
-        const result = await router.addRoute(route('other', 'behalf.dropkit.sh', 'localhost:4000'));
+        await expect(
+          router.addRoute(route('other', 'behalf.dropkit.sh', 'localhost:4000'))
+        ).rejects.toBeInstanceOf(RouteConflictError);
 
-        expect(result.owner).toBe('behalf');
         expect(router.getRoute('shared-key')?.upstream).toBe('localhost:3000');
         expect(console.warn).toHaveBeenCalledWith(expect.stringContaining('Refusing to replace'));
         expect(mockFs.writeFile).not.toHaveBeenCalled();
@@ -491,7 +493,9 @@ describe('RouterService', () => {
         const router = new RouterService({ caddy: { caddyfilePath: testCaddyfilePath } });
         await router.addRoute(route('behalf', 'behalf.dropkit.sh', 'localhost:3000'));
 
-        await router.addRoute(route('behalf', 'elsewhere.dropkit.sh', 'localhost:4000'));
+        await expect(
+          router.addRoute(route('behalf', 'elsewhere.dropkit.sh', 'localhost:4000'))
+        ).rejects.toBeInstanceOf(RouteConflictError);
         expect(router.getRoute('shared-key')?.hostname).toBe('behalf.dropkit.sh');
 
         await router.addRoute(route('behalf', 'BEHALF.dropkit.sh', 'localhost:5000'));
