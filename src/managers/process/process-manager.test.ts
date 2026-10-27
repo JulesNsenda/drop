@@ -476,4 +476,16 @@ describe('ProcessConfig conversion', () => {
       })
     );
   });
+
+  it('passes filterEnv to PM2 as filter_env', async () => {
+    const manager = new ProcessManager();
+    await manager.start({ name: 'a', script: 'index.js', cwd: '/app', filterEnv: ['DROP_', 'AWS_'] });
+    expect(mockStart).toHaveBeenLastCalledWith(expect.objectContaining({ filter_env: ['DROP_', 'AWS_'] }));
+  });
+
+  it('omits filter_env when there is no filterEnv', async () => {
+    const manager = new ProcessManager();
+    await manager.start({ name: 'b', script: 'index.js', cwd: '/app' });
+    expect(mockStart.mock.calls[mockStart.mock.calls.length - 1][0]).not.toHaveProperty('filter_env');
+  });
 });

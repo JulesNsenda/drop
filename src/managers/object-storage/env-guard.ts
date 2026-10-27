@@ -1,15 +1,10 @@
 /**
- * Environment hygiene for object storage (#301).
+ * Names an app may already set for itself (#301).
  *
- * DROP holds ONE AWS admin credential for the operator's account. It reaches
- * the platform through `DROP_S3_ADMIN_*` (or the ambient `AWS_*` chain), i.e.
- * through the platform's own process environment — and a PM2 app inherits
- * that environment unless told otherwise. Under Docker an app gets only what
- * the spec lists; under PM2 (`isolation: none`) it gets everything.
+ * (Keeping the platform's own `DROP_S3_ADMIN_*` / `AWS_*` out of a PM2 app is
+ * not done here: it is the general reserved-prefix filter in
+ * `utils/reserved-env.ts`, applied at the PM2 runtime seam.)
  */
-
-/** Prefixes of platform-process variables an app must never inherit. */
-const ADMIN_ENV_PREFIXES = ['DROP_S3_', 'AWS_'];
 
 /**
  * The names DROP injects for an attached bucket, plus every other name an AWS
@@ -27,24 +22,3 @@ export const APP_OWNED_AWS_NAMES = [
   'AWS_ENDPOINT_URL_S3',
   'S3_BUCKET',
 ] as const;
-
-/**
- * `env` plus an explicit empty value for every platform-process variable an
- * app must not inherit (and which `env` does not itself set). PM2 merges its
- * own environment under the app's, so the only way to take an inherited
- * variable away from the app is to override it. An empty value reads as unset
- * to every AWS SDK. Anything the app was deliberately given — its own
- * secrets, the injected bucket variables — is untouched.
- */
-export function blankInheritedAdminEnv(
-  inherited: NodeJS.ProcessEnv,
-  env: Record<string, string>
-): Record<string, string> {
-  const out: Record<string, string> = { ...env };
-  for (const name of Object.keys(inherited)) {
-    if (ADMIN_ENV_PREFIXES.some((prefix) => name.startsWith(prefix)) && !Object.hasOwn(out, name)) {
-      out[name] = '';
-    }
-  }
-  return out;
-}

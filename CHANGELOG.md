@@ -29,13 +29,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Upgrading
 
-- **`isolation: none` only: apps no longer inherit the platform's `AWS_*` and
-  `DROP_S3_*` environment.** A PM2 app used to receive every variable the
-  platform process was started with; any of those two prefixes that the app does
-  not set itself (as a secret, in `drop.yaml` `env:`, or by attaching object
-  storage) is now passed as empty. An app that relied on picking up AWS
-  credentials from the host's environment must set them as secrets. Container
-  isolation was never affected.
+- **`isolation: none` only: apps no longer inherit the platform's `DROP_`,
+  `AWS_` and `CF_` environment.** A PM2 app used to receive every variable the
+  platform process was started with, which put the platform's secrets (the
+  operator's AWS keys, Cloudflare tokens, `DROP_*` settings) in reach of tenant
+  code. Variables with those three prefixes are now removed, the same list the
+  build step already used, unless the app is given them explicitly (as a
+  secret, in `drop.yaml` `env:`, by DROP itself such as `DROP_DATA_DIR`, or by
+  attaching object storage). That includes `AWS_REGION` and `AWS_PROFILE`: an
+  app that relied on picking AWS settings up from the host's environment must
+  set them as secrets. Container isolation was never affected.
 
 ## [1.7.1] - 2026-10-26
 
@@ -141,8 +144,8 @@ that declares a `healthCheck`.**
   - **Only under container isolation, and only with API auth on.** Object
     storage holds the AWS admin key, so it reports unavailable (`isolation` /
     `auth-disabled`) under `isolation: none`, where a PM2 app inherits the
-    platform's environment. A PM2 app's start environment also blanks every
-    inherited `DROP_S3_*` / `AWS_*` variable it was not deliberately given.
+    platform's environment. A PM2 app also no longer inherits the platform's
+    `DROP_`/`AWS_`/`CF_` environment at all (see Upgrading).
   - **Destroying a bucket needs a person and a confirmation.** Detaching, or
     deleting an app (or group) that holds a bucket, requires an interactive
     session and `?confirm=<name>`, checked server-side before anything is

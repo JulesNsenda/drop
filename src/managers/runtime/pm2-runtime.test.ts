@@ -149,6 +149,8 @@ describe('Pm2Runtime', () => {
         args: ['--flag'],
         port: 3001,
         env: { FOO: 'bar' },
+        // The platform's own secrets are filtered out of what PM2 lets the app inherit.
+        filterEnv: ['DROP_', 'AWS_', 'CF_'],
         autorestart: true,
         killTimeout: 5000,
         outFile: '/logs/out.log',

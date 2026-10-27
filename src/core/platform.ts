@@ -74,7 +74,6 @@ import {
   ObjectStorageIncarnationError,
   ObjectStorageUnavailableError,
   APP_OWNED_AWS_NAMES,
-  blankInheritedAdminEnv,
   configureObjectStorage,
   resetObjectStorageProvisioner,
   resetStorageCredentialStore,
@@ -10892,15 +10891,6 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       ...platformEnv,
       ...safeDepEnvVars,
     };
-
-    // Defence in depth for object storage (#301): a PM2 app inherits the
-    // platform's own environment, which is where the AWS admin key
-    // (DROP_S3_ADMIN_* / AWS_*) lives. Override whatever it would inherit with
-    // an empty value; a container gets only what is listed here, so it needs
-    // nothing. Everything the app was deliberately given is left alone.
-    if (this.config.isolation !== 'docker') {
-      Object.assign(env, blankInheritedAdminEnv(process.env, env));
-    }
 
     // Secret preflight — gate (PRD-051). A declared-required secret that is
     // neither auto-generated above nor present (non-empty) in the assembled

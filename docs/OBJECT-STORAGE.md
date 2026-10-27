@@ -21,9 +21,9 @@ Object storage holds your AWS admin key, so it is available **only** when:
 
 Either condition missing makes it unavailable (`isolation` / `auth-disabled` in
 the admin settings) however well it is configured. Removing what already
-exists still works. As defence in depth, a PM2 app's start environment blanks
-every inherited `DROP_S3_*` and `AWS_*` variable that the app was not
-deliberately given.
+exists still works. As defence in depth, a PM2 app no longer inherits the
+platform's `DROP_`, `AWS_` or `CF_` environment (the admin key can live there),
+unless it is given a variable explicitly.
 
 ## What an app gets
 

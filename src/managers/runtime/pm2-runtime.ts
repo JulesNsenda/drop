@@ -7,6 +7,7 @@
  * types and PM2's.
  */
 
+import { RESERVED_ENV_PREFIXES } from '../../utils/reserved-env';
 import { ProcessManager, getProcessManager } from '../process';
 import {
   ProcessConfig,
@@ -116,6 +117,12 @@ export class Pm2Runtime implements AppRuntime {
       args: spec.args,
       port: spec.port,
       env: spec.env,
+      // PM2 starts the app with the platform's OWN environment underneath
+      // spec.env. Take the platform's secrets (DROP_*, AWS_*, CF_*) back out;
+      // whatever the app was explicitly given in spec.env is layered on top
+      // again by PM2, so DROP_DATA_DIR, the app's secrets and an attached
+      // bucket's AWS_* variables survive.
+      filterEnv: RESERVED_ENV_PREFIXES,
       autorestart: spec.autorestart,
       killTimeout: spec.killTimeout,
       outFile: spec.outFile,

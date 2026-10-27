@@ -466,6 +466,10 @@ export class ProcessManager {
       options.watch = config.watch;
     }
 
+    if (config.filterEnv && config.filterEnv.length > 0) {
+      options.filter_env = [...config.filterEnv];
+    }
+
     if (config.ignoreWatch) {
       options.ignore_watch = config.ignoreWatch;
     }

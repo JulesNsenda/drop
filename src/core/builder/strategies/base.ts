@@ -15,7 +15,7 @@ import { AppType } from '../../detector/detector.types';
  * env is preserved — PATH, SystemRoot/APPDATA/COMSPEC (Windows needs these to
  * run node/npm at all), proxy vars, NODE_EXTRA_CA_CERTS, npm_config_*, etc.
  */
-const SECRET_ENV_PREFIXES = ['DROP_', 'AWS_', 'CF_'];
+import { isReservedEnvName } from '../../../utils/reserved-env';
 
 /**
  * Build a child-process env from the parent env minus platform secrets, plus
@@ -35,8 +35,7 @@ const SECRET_ENV_PREFIXES = ['DROP_', 'AWS_', 'CF_'];
  * gets a diagnosable failure instead of a mystery.
  */
 export function sanitizeBuildEnv(overrides: Record<string, string> = {}): NodeJS.ProcessEnv {
-  const isSecretKey = (key: string): boolean =>
-    SECRET_ENV_PREFIXES.some((prefix) => key.startsWith(prefix));
+  const isSecretKey = isReservedEnvName;
 
   const out: NodeJS.ProcessEnv = {};
   for (const [key, value] of Object.entries(process.env)) {

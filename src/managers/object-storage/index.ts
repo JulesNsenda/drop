@@ -15,7 +15,7 @@ export type {
   StorageEnvironment,
   StorageUnavailableReason,
 } from './provisioner';
-export { APP_OWNED_AWS_NAMES, blankInheritedAdminEnv } from './env-guard';
+export { APP_OWNED_AWS_NAMES } from './env-guard';
 export {
   StorageCredentialStore,
   getStorageCredentialStore,
