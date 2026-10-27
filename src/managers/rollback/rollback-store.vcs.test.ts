@@ -41,4 +41,25 @@ describe('RollbackStore snapshots exclude .git', () => {
     await expect(fs.lstat(path.join(tree, '.git'))).rejects.toThrow();
     await expect(fs.lstat(path.join(tree, 'sub', '.git'))).rejects.toThrow();
   });
+
+  it('a restore filters a .git from an older snapshot and voids the saved git file list', async () => {
+    const appPath = path.join(root, 'data', 'webapps', 'web');
+    await fs.mkdir(appPath, { recursive: true });
+    await fs.writeFile(path.join(appPath, 'index.js'), 'v1');
+    const store = new RollbackStore(root);
+    await store.capture('web', appPath);
+    // A snapshot from before snapshots excluded .git.
+    const tree = path.join(root, 'data', 'rollback', 'web', 'tree');
+    await fs.mkdir(path.join(tree, '.git'), { recursive: true });
+    await fs.writeFile(path.join(tree, '.git', 'config'), '[core]');
+    const manifest = path.join(root, 'data', 'drop-svc', 'git-manifests', 'web.json');
+    await fs.mkdir(path.dirname(manifest), { recursive: true });
+    await fs.writeFile(manifest, '{"version":1,"files":["index.js"]}');
+
+    await store.restoreInto('web', appPath);
+
+    expect(await fs.readFile(path.join(appPath, 'index.js'), 'utf-8')).toBe('v1');
+    await expect(fs.lstat(path.join(appPath, '.git'))).rejects.toThrow();
+    await expect(fs.lstat(manifest)).rejects.toThrow();
+  });
 });

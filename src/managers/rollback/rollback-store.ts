@@ -240,11 +240,18 @@ export class RollbackStore {
       // current tree has not been touched yet.
       const staging = path.join(this.dirFor(appName), `restore.tmp-${randomUUID()}`);
       try {
-        await fs.cp(this.treeDir(appName), staging, {
+        const treeRoot = this.treeDir(appName);
+        await fs.cp(treeRoot, staging, {
           recursive: true,
           verbatimSymlinks: true,
           errorOnExist: false,
           force: true,
+          // A snapshot taken before snapshots excluded .git may still hold one.
+          filter: (src) =>
+            !path
+              .relative(treeRoot, src)
+              .split(path.sep)
+              .some((segment) => isVcsMetadataComponent(segment)),
         });
 
         await fs.mkdir(appPath, { recursive: true });
@@ -261,6 +268,13 @@ export class RollbackStore {
             await fs.cp(from, to, { recursive: true, verbatimSymlinks: true });
           }
         }
+        // The folder is no longer what the last git redeploy wrote, so the list
+        // of files that redeploy may delete is void: the next one prunes nothing.
+        await fs
+          .rm(path.join(this.dropRoot, 'data', 'drop-svc', 'git-manifests', `${appName}.json`), {
+            force: true,
+          })
+          .catch(() => undefined);
         return meta;
       } finally {
         await fs.rm(staging, { recursive: true, force: true }).catch(() => undefined);

@@ -197,6 +197,22 @@ export interface PlatformOps {
   isAppInProgress(appName: string): boolean;
 
   /**
+   * Atomically claim the app's slot in the platform's in-progress set, so no
+   * build, restart or deploy can start while the caller writes its folder.
+   * Returns the release function, or `null` when the app is already busy (or
+   * the platform is quiesced). A build that arrives meanwhile is deferred, not
+   * dropped. The holder MUST call the release.
+   */
+  tryReserveApp(appName: string): (() => void) | null;
+
+  /**
+   * Whether a build container for the app exists right now (running, or left
+   * behind by a crash). Only meaningful under docker isolation; resolves false
+   * elsewhere.
+   */
+  hasLiveBuildContainer(appName: string): Promise<boolean>;
+
+  /**
    * Put a held (built-but-unpromoted) build in front of traffic.
    *
    * Starts exactly what was built rather than rebuilding — a rebuild could pick

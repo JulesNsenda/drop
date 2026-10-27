@@ -59,14 +59,40 @@ export interface GitDeployServiceConfig {
   tempDirectory?: string;
   /** Where the per-app landed-file lists live (`data/drop-svc/git-manifests`). */
   manifestDirectory?: string;
-  /** Cap on the summed size of a repository's tracked files (the upload cap). */
+  /** Cap on the summed size of a repository's tracked files (see `gitCheckoutCaps`). */
   maxUnpackedBytes?: number;
-  /** Cap on files plus directories (the upload cap). */
+  /** Cap on files plus directories (see `gitCheckoutCaps`). */
   maxEntries?: number;
+  /**
+   * Remove everything under the clone base at `initialize()`. ONLY the
+   * platform sets this: it is the one process that knows nothing is in flight.
+   * A CLI process sharing the directory must never sweep another process's
+   * clone out from under it.
+   */
+  sweepCloneBase?: boolean;
 }
 
-const DEFAULT_MAX_UNPACKED_BYTES = 1024 * 1024 * 1024;
-const DEFAULT_MAX_ENTRIES = 20_000;
+const DEFAULT_MAX_GIT_ENTRIES = 200_000;
+
+/**
+ * The caps a git checkout is held to. A repository is not an upload: its
+ * history-free tree is routinely larger than a tarball a person built, so the
+ * size cap is its own setting (`DROP_MAX_GIT_CHECKOUT_MB`), defaulting to twice
+ * the upload unpacked cap, with a larger entry cap.
+ */
+export function gitCheckoutCaps(uploadUnpackedMb: number): {
+  maxUnpackedBytes: number;
+  maxEntries: number;
+} {
+  const configured = parseInt(process.env.DROP_MAX_GIT_CHECKOUT_MB || '', 10);
+  const mb = Number.isFinite(configured) && configured > 0 ? configured : uploadUnpackedMb * 2;
+  return { maxUnpackedBytes: mb * 1024 * 1024, maxEntries: DEFAULT_MAX_GIT_ENTRIES };
+}
+
+/** The same caps from the environment alone (a process without the platform's config). */
+function envDefaultCaps(): ReturnType<typeof gitCheckoutCaps> {
+  return gitCheckoutCaps(parseInt(process.env.DROP_MAX_UPLOAD_UNPACKED_MB || '1024', 10));
+}
 
 export class GitDeployService {
   private readonly config: GitDeployServiceConfig;
@@ -77,6 +103,9 @@ export class GitDeployService {
   private landChains: Map<string, Promise<unknown>> = new Map();
   private readonly cloneBase: string;
   private readonly manifestDir: string;
+  /** Redeploys that were refused as busy; one per app, latest actor wins. */
+  private pending: Map<string, DeployActor> = new Map();
+  private pendingTimer: NodeJS.Timeout | null = null;
 
   constructor(config: GitDeployServiceConfig) {
     this.config = config;
@@ -128,8 +157,11 @@ export class GitDeployService {
   }
 
   async initialize(): Promise<void> {
-    // Boot sweep: nothing is in flight yet, so anything here is a crash's leftover.
-    await fs.rm(this.cloneBase, { recursive: true, force: true }).catch(() => undefined);
+    // Boot sweep, platform only: nothing is in flight yet, so anything here is a
+    // crash's leftover. A CLI process never sweeps (it shares the directory).
+    if (this.config.sweepCloneBase) {
+      await fs.rm(this.cloneBase, { recursive: true, force: true }).catch(() => undefined);
+    }
     this.gitAvailable = await isGitAvailable();
     if (!this.gitAvailable) {
       logger.warn('git CLI not found - git deploy features will be unavailable', 'GIT-DEPLOY');
@@ -140,6 +172,91 @@ export class GitDeployService {
 
   isAvailable(): boolean {
     return this.gitAvailable;
+  }
+
+  /** Stop the pending-redeploy timer. */
+  dispose(): void {
+    if (this.pendingTimer) clearTimeout(this.pendingTimer);
+    this.pendingTimer = null;
+    this.pending.clear();
+  }
+
+  /**
+   * Remember a redeploy that was refused because the app was busy, and run it
+   * once the app frees up. One per app: a later request replaces an earlier
+   * one (the latest push is the one that matters), keeping what it set.
+   */
+  queueRedeploy(appName: string, actor: DeployActor = {}): void {
+    this.pending.set(appName, { ...this.pending.get(appName), ...actor });
+    this.schedulePending();
+  }
+
+  private schedulePending(): void {
+    if (this.pendingTimer || this.pending.size === 0) return;
+    this.pendingTimer = setTimeout(() => {
+      this.pendingTimer = null;
+      void this.flushPending();
+    }, 2000);
+    this.pendingTimer.unref?.();
+  }
+
+  private async flushPending(): Promise<void> {
+    for (const [appName, actor] of [...this.pending]) {
+      this.pending.delete(appName);
+      try {
+        await this.redeploy(appName, actor);
+        logger.info(`Ran the queued redeploy of ${appName}`, 'GIT-DEPLOY');
+      } catch (err) {
+        if (err instanceof AppInProgressError) {
+          // Still busy: keep it, unless a newer request arrived meanwhile.
+          this.pending.set(appName, { ...actor, ...this.pending.get(appName) });
+        } else {
+          logger.warn(
+            `Queued redeploy of ${appName} failed: ${err instanceof Error ? err.message : 'unknown error'}`,
+            'GIT-DEPLOY'
+          );
+        }
+      }
+    }
+    this.schedulePending();
+  }
+
+  /**
+   * Take the exclusive right to write an app's folder, or throw
+   * `AppInProgressError`. Nothing may build, restart or deploy the app while a
+   * land is under way, so the platform claims its in-progress slot and we
+   * confirm no build container is alive. A monorepo container is also refused
+   * while any of its children is busy.
+   *
+   * Without platform operations (a CLI process, or startup) nothing can be
+   * guaranteed, so a REDEPLOY fails closed. A first deploy of a name that does
+   * not exist yet has nothing to collide with and may proceed.
+   */
+  private async reserveFolder(
+    appName: string,
+    app: { isGroupContainer?: boolean; group?: string } | undefined,
+    requireOps: boolean
+  ): Promise<() => void> {
+    const ops = getPlatformOps();
+    if (!ops) {
+      if (requireOps) throw new Error('Platform operations are unavailable; not writing the app folder');
+      return () => undefined;
+    }
+    if (app?.isGroupContainer && app.group) {
+      const busyChild = getStateManager()
+        .getAllApps()
+        .some((a) => a.group === app.group && !a.isGroupContainer && ops.isAppInProgress(a.name));
+      if (busyChild) throw new AppInProgressError(appName);
+    }
+    const release = ops.tryReserveApp(appName);
+    if (!release) throw new AppInProgressError(appName);
+    try {
+      if (await ops.hasLiveBuildContainer(appName)) throw new AppInProgressError(appName);
+    } catch (err) {
+      release();
+      throw err;
+    }
+    return release;
   }
 
   /** Check if an app is currently being cloned */
@@ -303,15 +420,22 @@ export class GitDeployService {
     // Clone into a platform-owned temp dir, then land the tracked files without .git.
     logger.info(`Cloning ${repoUrl} (branch: ${branch}) into ${appName}`, 'GIT-DEPLOY');
     let commitSha: string | undefined;
+    // Whether THIS deploy created the folder: only then is it ours to remove.
+    const landState = { created: false };
     try {
-      commitSha = await this.cloneAndLand(appName, repoUrl, branch, token, destPath, true);
+      commitSha = await this.serialised(appName, async () => {
+        const release = await this.reserveFolder(appName, undefined, false);
+        try {
+          return await this.cloneAndLand(appName, repoUrl, branch, token, destPath, true, landState);
+        } finally {
+          release();
+        }
+      });
     } catch (err) {
       this.endClone(appName);
-      // Clean up partial clone
-      try {
-        await fs.rm(destPath, { recursive: true, force: true });
-      } catch {
-        // ignore cleanup errors
+      // Clean up a partial land, but only a folder this call made.
+      if (landState.created) {
+        await fs.rm(destPath, { recursive: true, force: true }).catch(() => undefined);
       }
       throw err;
     }
@@ -354,7 +478,9 @@ export class GitDeployService {
       if (registered) {
         await stateManager.removeApp(appName).catch(() => undefined);
       }
-      await fs.rm(destPath, { recursive: true, force: true }).catch(() => undefined);
+      if (landState.created) {
+        await fs.rm(destPath, { recursive: true, force: true }).catch(() => undefined);
+      }
       throw err;
     } finally {
       // Clone complete - allow watcher to detect
@@ -414,24 +540,32 @@ export class GitDeployService {
   /**
    * Fresh shallow clone into a temp dir the platform owns, then copy the
    * repository's TRACKED files (no `.git`) into `destPath`; the clone is
-   * always removed. Serialised per app, so two redeploys never write one folder
-   * at once.
+   * always removed. The CALLER holds the per-app chain (`serialised`) and the
+   * folder reservation (`reserveFolder`) around this.
    *
    * What gets deleted is decided by the app's saved file list (see `land.ts`):
    * only files the repository once tracked and no longer does. Untracked files
    * are never touched, and with no saved list nothing is deleted. Returns the
    * cloned commit SHA, best-effort.
    */
-  private cloneAndLand(
+  private async cloneAndLand(
     appName: string,
     url: string,
     branch: string,
     token: string | undefined,
     destPath: string,
-    firstDeploy = false
+    firstDeploy = false,
+    state?: { created: boolean }
   ): Promise<string | undefined> {
-    return this.serialised(appName, async () => {
+    {
       const base = await this.ensureCloneBase();
+      // The clones live on the temp volume, which may not be the apps volume.
+      const tempDisk = await hasEnoughDisk(base);
+      if (!tempDisk.ok) {
+        throw new Error(
+          `Insufficient disk space to clone: ${Math.round(tempDisk.freeMb)} MB free, need ${getMinFreeDiskMb()} MB`
+        );
+      }
       const cloneDir = await fs.mkdtemp(path.join(base, `${appName}-`));
       try {
         const info = await gitClone({ url, dest: cloneDir, branch, token });
@@ -454,8 +588,11 @@ export class GitDeployService {
           files: info.files,
           previous,
           limits: {
-            maxBytes: this.config.maxUnpackedBytes ?? DEFAULT_MAX_UNPACKED_BYTES,
-            maxEntries: this.config.maxEntries ?? DEFAULT_MAX_ENTRIES,
+            maxBytes: this.config.maxUnpackedBytes ?? envDefaultCaps().maxUnpackedBytes,
+            maxEntries: this.config.maxEntries ?? envDefaultCaps().maxEntries,
+          },
+          onCreatedAppDir: () => {
+            if (state) state.created = true;
           },
         });
         await writeManifest(this.manifestDir, appName, landed);
@@ -463,7 +600,7 @@ export class GitDeployService {
       } finally {
         await fs.rm(cloneDir, { recursive: true, force: true }).catch(() => undefined);
       }
-    });
+    }
   }
 
   /**
@@ -490,7 +627,12 @@ export class GitDeployService {
 
     // A build, restart or deploy in flight reads this folder; landing files
     // under it would hand that operation a half-written tree.
-    if (getPlatformOps()?.isAppInProgress(appName)) {
+    // Cheap early refusal; the reservation below is the real guard.
+    const ops = getPlatformOps();
+    if (!ops) {
+      throw new Error('Platform operations are unavailable; not writing the app folder');
+    }
+    if (ops.isAppInProgress(appName)) {
       throw new AppInProgressError(appName);
     }
 
@@ -502,6 +644,7 @@ export class GitDeployService {
     if (!isValidGitHubUrl(cloneUrl)) {
       throw new Error(`Invalid recorded repository URL for ${appName}`);
     }
+    const baseSource: GitSource = app.gitSource;
 
     // GUARDRAIL + QUOTA, before the clone. A redeploy is the request an agent
     // repeats, and a clone + rebuild is not free.
@@ -571,32 +714,46 @@ export class GitDeployService {
     // cannot be rolled back, which the rollback route reports as such.
     // The tree carries no .git (every git deploy clones fresh), so a restore
     // puts the files back and the next redeploy simply clones again.
-    const snapshot = await captureBeforeRedeploy(appName);
-    if (!snapshot.captured) {
-      logger.info(`No rollback snapshot for ${appName}: ${snapshot.reason}`, 'GIT-DEPLOY');
-    }
+    return this.serialised(appName, async () => {
+      // From here until just before the publish below, the platform's own
+      // in-progress slot for this app is ours: no build, restart or deploy can
+      // start, and one that arrives is deferred rather than dropped.
+      const releaseReservation = await this.reserveFolder(appName, app, true);
+      let released = false;
+      const release = (): void => {
+        if (released) return;
+        released = true;
+        releaseReservation();
+      };
+      // This run supersedes any queued one for the app.
+      this.pending.delete(appName);
+      try {
+        const snapshot = await captureBeforeRedeploy(appName);
+        if (!snapshot.captured) {
+          logger.info(`No rollback snapshot for ${appName}: ${snapshot.reason}`, 'GIT-DEPLOY');
+        }
 
-    // Mark as cloning for the duration of the pull only - mirrors deploy()'s
-    // guard against the watcher building a half-pulled tree. Cleared before
-    // the deterministic publish below, or the platform's isCloning guards
-    // (platform.ts) would eat that event too.
-    this.beginClone(appName);
-    let commitSha: string | undefined;
-    try {
-      // Clone the recorded URL into a platform-owned temp dir; git never runs
-      // inside the app folder.
-      commitSha = await this.cloneAndLand(appName, cloneUrl, branch, token, app.path);
-    } finally {
-      this.endClone(appName);
-    }
+        // Mark as cloning for the duration of the land only - mirrors deploy()'s
+        // guard against the watcher building a half-written tree. Cleared before
+        // the deterministic publish below, or the platform's isCloning guards
+        // (platform.ts) would eat that event too.
+        this.beginClone(appName);
+        let commitSha: string | undefined;
+        try {
+          // Clone the recorded URL into a platform-owned temp dir; git never
+          // runs inside the app folder.
+          commitSha = await this.cloneAndLand(appName, cloneUrl, branch, token, app.path);
+        } finally {
+          this.endClone(appName);
+        }
 
-    const clonedAt = new Date().toISOString();
+        const clonedAt = new Date().toISOString();
 
     // Built from effectiveTokenId, NOT app.gitSource.tokenId — see the note
     // above. Spreading the stale field here would silently revert an attach
     // on this success path (the defect two independent reviewers found).
     const gitSource: GitSource = {
-      ...app.gitSource,
+      ...baseSource,
       repoUrl: cloneUrl,
       tokenId: effectiveTokenId === null ? undefined : effectiveTokenId,
       lastCommitSha: commitSha,
@@ -606,6 +763,10 @@ export class GitDeployService {
     await stateManager.updateApp(appName, { gitSource } as Record<string, unknown>);
 
     logger.info(`Redeployed ${appName} (${commitSha?.slice(0, 7) || 'unknown'})`, 'GIT-DEPLOY');
+
+    // The land is finished: free the app for the rebuild this publish triggers
+    // (handleAppUpdate drops an update for an app that is still in progress).
+    release();
 
     // Publish the rebuild trigger directly instead of waiting on the watcher
     // to notice file changes: a no-change pull touches nothing on disk (the
@@ -628,6 +789,10 @@ export class GitDeployService {
       commitSha,
       clonedAt,
     };
+      } finally {
+        release();
+      }
+    });
   }
 
   /** Store a GitHub Personal Access Token */
@@ -726,5 +891,6 @@ export function getGitDeployService(config?: GitDeployServiceConfig): GitDeployS
 }
 
 export function resetGitDeployService(): void {
+  instance?.dispose();
   instance = null;
 }

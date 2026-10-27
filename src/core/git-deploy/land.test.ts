@@ -160,6 +160,73 @@ describe('landTracked', () => {
     expect(await fs.readFile(path.join(target, 'b.txt'), 'utf-8')).toBe('victim');
   });
 
+  it('aborts when a listed file is missing from the clone, writing nothing', async () => {
+    await write(clone, 'a.txt', 'A');
+
+    await expect(
+      landTracked({ cloneDir: clone, appDir: app, files: ['a.txt', 'gone.txt'], previous: null, limits: LIMITS })
+    ).rejects.toThrow(/missing from the clone/);
+    expect(await exists(path.join(app, 'a.txt'))).toBe(false);
+  });
+
+  it('refuses a clone path that runs through a symlinked directory', async () => {
+    const elsewhere = path.join(root, 'elsewhere');
+    await fs.mkdir(elsewhere);
+    await fs.writeFile(path.join(elsewhere, 'b.txt'), 'outside the clone');
+    await link(elsewhere, path.join(clone, 'sub'));
+
+    await expect(
+      landTracked({ cloneDir: clone, appDir: app, files: ['sub/b.txt'], previous: null, limits: LIMITS })
+    ).rejects.toThrow(/plain directories/);
+    expect(await exists(path.join(app, 'sub'))).toBe(false);
+  });
+
+  it('refuses over-long names before writing anything', async () => {
+    await write(clone, 'a.txt', 'A');
+    const long = `${'x'.repeat(256)}.txt`;
+
+    await expect(
+      landTracked({ cloneDir: clone, appDir: app, files: ['a.txt', long], previous: null, limits: LIMITS })
+    ).rejects.toThrow(/over-long/);
+    expect(await exists(path.join(app, 'a.txt'))).toBe(false);
+  });
+
+  it('does not delete a file whose name differs only by case from one it just wrote (on a case-insensitive volume)', async () => {
+    await write(app, 'probe-lower', 'x');
+    const insensitive = await exists(path.join(app, 'PROBE-LOWER'));
+    await fs.rm(path.join(app, 'probe-lower'));
+    await write(app, 'README.md', 'old');
+    await write(clone, 'readme.md', 'new');
+
+    await landTracked({
+      cloneDir: clone,
+      appDir: app,
+      files: ['readme.md'],
+      previous: ['README.md'],
+      limits: LIMITS,
+    });
+
+    const names = await fs.readdir(app);
+    if (insensitive) {
+      // One entry, holding the new content: the prune must not have removed it.
+      expect(names.map((n) => n.toLowerCase())).toEqual(['readme.md']);
+      expect(await fs.readFile(path.join(app, 'readme.md'), 'utf-8')).toBe('new');
+    } else {
+      expect(names).toEqual(['readme.md']);
+    }
+  });
+
+  it('calls onCreatedAppDir only when this land created the folder', async () => {
+    await write(clone, 'a.txt', 'A');
+    const made = jest.fn();
+    await landTracked({ cloneDir: clone, appDir: app, files: ['a.txt'], previous: null, limits: LIMITS, onCreatedAppDir: made });
+    expect(made).not.toHaveBeenCalled();
+
+    const fresh = path.join(root, 'fresh');
+    await landTracked({ cloneDir: clone, appDir: fresh, files: ['a.txt'], previous: null, limits: LIMITS, onCreatedAppDir: made });
+    expect(made).toHaveBeenCalledTimes(1);
+  });
+
   it('refuses a repository over the entry or size caps before writing anything', async () => {
     await write(clone, 'a.txt', 'A');
     await write(clone, 'b.txt', 'B');
@@ -181,7 +248,7 @@ describe('landTracked', () => {
         previous: null,
         limits: { maxBytes: 1, maxEntries: 100 },
       })
-    ).rejects.toThrow(/unpacked size/);
+    ).rejects.toThrow(/checkout size/);
 
     expect(await exists(path.join(app, 'a.txt'))).toBe(false);
   });

@@ -20,6 +20,7 @@ import { tryReserve, ownerOf, isReserved, resetDeployReservations } from '../dep
 import { eventBus } from '../event-bus';
 import { setPlatformOps, resetPlatformOps, AppInProgressError } from '../../api/platform-ops';
 import type { PlatformOps } from '../../api/platform-ops';
+import { makePlatformOpsStub } from '../../api/__testutils__/platform-ops';
 // AppUpdatePayload isn't re-exported by ../event-bus (index.ts) - see the same
 // note in managers/deploy-tracker/deploy-tracker.ts.
 import type { AppDetectedPayload, AppUpdatePayload } from '../event-bus/event-bus.types';
@@ -123,6 +124,23 @@ import {
   resetPrincipalQuota,
 } from '../../managers/guardrail/principal-quota';
 
+// The platform ops a redeploy requires: a reservation that is exclusive per app.
+const reservedNow = new Set<string>();
+function installOps(over: Partial<PlatformOps> = {}): void {
+  setPlatformOps(
+    makePlatformOpsStub({
+      tryReserveApp: (name: string) => {
+        if (reservedNow.has(name)) return null;
+        reservedNow.add(name);
+        return () => {
+          reservedNow.delete(name);
+        };
+      },
+      ...over,
+    })
+  );
+}
+
 describe('GitDeployService', () => {
   let service: GitDeployService;
   let tempDir: string;
@@ -166,6 +184,8 @@ describe('GitDeployService', () => {
     resetGitDeployService();
     service = new GitDeployService({ appsDirectory: appsDir });
     await service.initialize();
+    reservedNow.clear();
+    installOps();
 
     // The child_process mock above intercepts the PowerShell/df calls that
     // hasEnoughDisk relies on, which would otherwise make every disk check
@@ -831,13 +851,128 @@ describe('GitDeployService', () => {
         expect(service.isCloning(appName)).toBe(false);
       });
 
-      it('sweeps leftovers from the clone base at initialize()', async () => {
+      it('the platform sweeps leftovers from the clone base at initialize(); a CLI process never does', async () => {
         const leftover = path.join(tempDir, 'temp', '.git-clones', 'crashed-abc');
         await fs.mkdir(leftover, { recursive: true });
 
-        await service.initialize();
+        await service.initialize(); // no sweepCloneBase: the CLI shape
+        expect(await exists(leftover)).toBe(true);
 
+        const platformShaped = new GitDeployService({
+          appsDirectory: path.join(tempDir, 'webapps'),
+          sweepCloneBase: true,
+        });
+        await platformShaped.initialize();
         expect(await exists(leftover)).toBe(false);
+      });
+
+      it('holds the platform reservation across clone and land, and releases it before app:update', async () => {
+        const appName = 'land-reserved';
+        await service.deploy({ repoUrl: `https://github.com/user/${appName}`, branch: 'main' });
+        let open!: () => void;
+        mockCloneGate = new Promise<void>((r) => {
+          open = r;
+        });
+        const heldAtPublish: boolean[] = [];
+        const unsub = eventBus.subscribe('app:update', (p) => {
+          if (p.name === appName) heldAtPublish.push(reservedNow.has(appName));
+        });
+        try {
+          const run = service.redeploy(appName);
+          await new Promise((r) => setTimeout(r, 50));
+          // The clone is open: the slot is ours, so a build could not start.
+          expect(reservedNow.has(appName)).toBe(true);
+          open();
+          mockCloneGate = null;
+          await run;
+        } finally {
+          unsub();
+        }
+
+        expect(heldAtPublish).toEqual([false]);
+        expect(reservedNow.has(appName)).toBe(false);
+      });
+
+      it('refuses to land while the reservation is taken, a build container is alive, or a monorepo child is busy', async () => {
+        const appName = 'land-refused';
+        await service.deploy({ repoUrl: `https://github.com/user/${appName}`, branch: 'main' });
+        (execFile as unknown as jest.Mock).mockClear();
+
+        reservedNow.add(appName);
+        await expect(service.redeploy(appName)).rejects.toBeInstanceOf(AppInProgressError);
+        reservedNow.clear();
+
+        installOps({ hasLiveBuildContainer: jest.fn().mockResolvedValue(true) });
+        await expect(service.redeploy(appName)).rejects.toBeInstanceOf(AppInProgressError);
+        // The failed attempt released what it took.
+        expect(reservedNow.has(appName)).toBe(false);
+
+        const cloned = (execFile as unknown as jest.Mock).mock.calls.some((c) =>
+          (c[1] as string[]).includes('clone')
+        );
+        expect(cloned).toBe(false);
+
+        const group = 'grp';
+        await getStateManager().registerApp('grp-container', path.join(tempDir, 'webapps', 'grp-container'));
+        await getStateManager().updateApp('grp-container', {
+          group,
+          isGroupContainer: true,
+          gitSource: { repoUrl: 'https://github.com/user/grp', branch: 'main' },
+        } as Record<string, unknown>);
+        await getStateManager().registerApp('grp-child', path.join(tempDir, 'webapps', 'grp-child'));
+        await getStateManager().updateApp('grp-child', { group } as Record<string, unknown>);
+        installOps({ isAppInProgress: (n: string) => n === 'grp-child' });
+        await expect(service.redeploy('grp-container')).rejects.toBeInstanceOf(AppInProgressError);
+      });
+
+      it('fails closed when platform operations are unavailable', async () => {
+        const appName = 'land-no-ops';
+        await service.deploy({ repoUrl: `https://github.com/user/${appName}`, branch: 'main' });
+        resetPlatformOps();
+
+        await expect(service.redeploy(appName)).rejects.toThrow(/unavailable/);
+      });
+
+      it('a push refused as busy is queued (latest wins) and runs once the app is free', async () => {
+        const appName = 'land-queued';
+        await service.deploy({ repoUrl: `https://github.com/user/${appName}`, branch: 'main' });
+        installOps({ isAppInProgress: () => true });
+        await expect(service.redeploy(appName, { automation: 'webhook' })).rejects.toBeInstanceOf(
+          AppInProgressError
+        );
+        service.queueRedeploy(appName, { automation: 'webhook' });
+        service.queueRedeploy(appName, { automation: 'webhook' });
+        mockCloneFiles = { 'index.html': '<h1>queued</h1>' };
+        const flush = (): Promise<void> =>
+          (service as unknown as { flushPending(): Promise<void> }).flushPending();
+
+        await flush(); // still busy: stays queued
+        expect(await exists(path.join(appDir(appName), 'queued.txt'))).toBe(false);
+        expect(await fs.readFile(path.join(appDir(appName), 'index.html'), 'utf-8')).toBe('<h1>v1</h1>');
+
+        installOps();
+        await flush();
+        expect(await fs.readFile(path.join(appDir(appName), 'index.html'), 'utf-8')).toBe('<h1>queued</h1>');
+        service.dispose();
+      });
+
+      it('a first deploy that loses the folder race leaves the other creator\'s folder alone', async () => {
+        const appName = 'land-race';
+        let open!: () => void;
+        mockCloneGate = new Promise<void>((r) => {
+          open = r;
+        });
+
+        const run = service.deploy({ repoUrl: `https://github.com/user/${appName}`, branch: 'main' });
+        await new Promise((r) => setTimeout(r, 50));
+        // Someone else takes the folder while the clone is in flight.
+        await fs.mkdir(appDir(appName), { recursive: true });
+        await fs.writeFile(path.join(appDir(appName), 'theirs.txt'), 'not ours');
+        open();
+        mockCloneGate = null;
+
+        await expect(run).rejects.toThrow(/already exists/);
+        expect(await fs.readFile(path.join(appDir(appName), 'theirs.txt'), 'utf-8')).toBe('not ours');
       });
 
       it('a clone error carries no argv or absolute temp path', async () => {

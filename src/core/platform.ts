@@ -71,7 +71,12 @@ import {
 import { CaddyServer, getCaddyServer, resetCaddyServer } from '../managers/router';
 import { SecretManager, getSecretManager, resetSecretManager } from '../managers/secret';
 import { WebhookManager, getWebhookManager, resetWebhookManager } from './webhooks';
-import { GitDeployService, getGitDeployService, resetGitDeployService } from './git-deploy';
+import {
+  GitDeployService,
+  getGitDeployService,
+  resetGitDeployService,
+  gitCheckoutCaps,
+} from './git-deploy';
 import { UploadDeployService, getUploadDeployService, resetUploadDeployService } from './upload-deploy';
 import { getActivityLog, resetActivityLog } from '../managers/activity';
 import { tryLogActivity } from '../managers/activity';
@@ -163,7 +168,11 @@ import {
   assertStartupConstraints,
   reportDaemonHardening,
 } from './startup-constraints';
-import { createContainerExecCommand } from './builder/container-build-runner';
+import {
+  createContainerExecCommand,
+  hasBuildContainer,
+  reapBuildContainers,
+} from './builder/container-build-runner';
 import {
   NODE_MODULES_ASIDE_DIR,
   PRE_MARKER_DOCKER_TOOLCHAIN,
@@ -880,6 +889,8 @@ export class DropPlatform {
   private toolchainBackfill: Promise<void> | null = null;
   private usedPorts: Map<number, string> = new Map(); // port -> appName ownership
   private appsInProgress: Set<string> = new Set(); // Track apps being built/started
+  /** Apps whose folder a git deploy is writing (a subset of appsInProgress). */
+  private gitReserved: Set<string> = new Set();
   // Builds deferred because the concurrent-build cap was full (appName -> its
   // path + type hint). A first-boot or single-drop burst can briefly saturate
   // the cap — in docker mode especially, where a first-time base-image pull
@@ -1525,6 +1536,40 @@ export class DropPlatform {
     return this.isQuiesced() || this.appsInProgress.has(name);
   }
 
+  /**
+   * Claim an app's in-progress slot for a git deploy that is about to write its
+   * folder. Null when the app is busy or the platform is quiesced. While held,
+   * `handleBuildApp` defers the app's builds (see `gitReserved`).
+   */
+  private tryReserveApp(name: string): (() => void) | null {
+    if (this.isQuiesced() || this.appsInProgress.has(name)) return null;
+    this.appsInProgress.add(name);
+    this.gitReserved.add(name);
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      this.gitReserved.delete(name);
+      this.appsInProgress.delete(name);
+    };
+  }
+
+  /** Whether a build container for the app exists (docker isolation only). */
+  private async hasLiveBuildContainer(name: string): Promise<boolean> {
+    if (this.config.isolation !== 'docker') return false;
+    // FAIL CLOSED: under docker isolation an unavailable runtime means we
+    // cannot rule a build container out.
+    if (this.runtime?.type !== 'docker') return true;
+    try {
+      return await hasBuildContainer(
+        (this.runtime as import('../managers/runtime').ContainerManager).docker,
+        name
+      );
+    } catch {
+      return true;
+    }
+  }
+
   /** Release the hold early. Safe to call when not quiesced. */
   resumeFromQuiesce(): void {
     if (this.quiescedUntil !== 0) {
@@ -1975,9 +2020,8 @@ backup:
       appsDirectory: this.config.appsDirectory,
       tempDirectory: path.join(this.config.dropRoot, 'data', 'temp'),
       manifestDirectory: path.join(this.config.dropRoot, 'data', 'drop-svc', 'git-manifests'),
-      // The same caps an upload is held to.
-      maxUnpackedBytes: this.config.maxUploadUnpackedMb * 1024 * 1024,
-      maxEntries: 20_000,
+      ...gitCheckoutCaps(this.config.maxUploadUnpackedMb),
+      sweepCloneBase: true,
     });
     await this.gitDeployService.initialize();
 
@@ -2058,6 +2102,16 @@ backup:
       if (slot === 'b') this.runtime.setLiveInstance(cfg.name, 'b');
     }
     await this.removeOrphanInstances();
+    if (this.config.isolation === 'docker' && this.runtime.type === 'docker') {
+      try {
+        const reaped = await reapBuildContainers(
+          (this.runtime as import('../managers/runtime').ContainerManager).docker
+        );
+        if (reaped > 0) this.logger.warn(`Removed ${reaped} orphan build container(s)`, 'BUILD');
+      } catch (error) {
+        this.logger.warn('Could not reap orphan build containers', 'BUILD', error);
+      }
+    }
 
     // Load used ports from existing PM2 processes
     await this.loadUsedPorts();
@@ -2181,6 +2235,8 @@ backup:
     setPlatformOps({
       restartApp: (name) => this.restartApp(name),
       isAppInProgress: (name) => this.appsInProgress.has(name),
+      tryReserveApp: (name) => this.tryReserveApp(name),
+      hasLiveBuildContainer: (name) => this.hasLiveBuildContainer(name),
       promoteApp: (name) => this.promoteApp(name),
       rollbackApp: (name) => this.rollbackApp(name),
       describeRollback: (name) => this.describeRollback(name),
@@ -3768,7 +3824,12 @@ backup:
 
     // The commit the clone was made at: the app folder holds no .git any more,
     // so a build that stamps a version needs it from here.
-    const gitCommit = this.stateManager?.getApp(appName)?.gitSource?.lastCommitSha;
+    // A monorepo child carries no gitSource: its commit is the group container's
+    // (the container stamped on it as `groupContainer`).
+    const container = this.appConfigService?.getConfig?.(appName)?.groupContainer;
+    const gitCommit =
+      this.stateManager?.getApp(appName)?.gitSource?.lastCommitSha ??
+      (container ? this.stateManager?.getApp(container)?.gitSource?.lastCommitSha : undefined);
 
     return {
       ...this.coerceEnvRecord(config?.env),
@@ -4831,6 +4892,16 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
   ): Promise<void> {
     if (!this.builder || !this.detector) return;
 
+    // A git deploy is writing this folder. Building now would read a half-
+    // written tree (and let a build container write beside the land), so the
+    // build is deferred and retried, never dropped.
+    if (this.gitReserved.has(appName) || this.gitDeployService?.isCloning(appName)) {
+      this.logger.debug(`Deferring ${appName} - a git deploy is landing its files`, 'BUILD');
+      this.pendingBuilds.set(appName, { appPath, appType: _appType, actor });
+      this.scheduleBuildDrain();
+      return;
+    }
+
     // Skip if already processing this app
     if (this.appsInProgress.has(appName)) {
       this.logger.debug(`Skipping ${appName} - already in progress`, 'BUILD');
@@ -5317,6 +5388,8 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           this.appsInProgress.size >= this.config.maxConcurrentBuilds) {
         break;
       }
+      // A git deploy is still landing its files: keep it queued.
+      if (this.gitReserved.has(appName) || this.gitDeployService?.isCloning(appName)) continue;
       // Started some other way (or already running) since it was queued — drop it.
       if (this.appsInProgress.has(appName) ||
           this.stateManager?.getApp(appName)?.status === 'running') {

@@ -305,6 +305,14 @@ gitDeploy.post('/webhook', async (c) => {
       await logActivityFor(undefined, { action: 'redeploy', appName, detail: `webhook: ${branch}` });
       results.push({ app: appName, status: 'redeploying' });
     } catch (err) {
+      // Busy (building, deploying, or another land under way): not a lost push.
+      // It is remembered, one per app with the latest winning, and runs as soon
+      // as the app frees up.
+      if (err instanceof AppInProgressError) {
+        service.queueRedeploy(appName, { automation: 'webhook' });
+        results.push({ app: appName, status: 'queued' });
+        continue;
+      }
       results.push({
         app: appName,
         status: 'failed',

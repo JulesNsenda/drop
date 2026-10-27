@@ -35,7 +35,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Git-deployed apps no longer have a `.git` folder in their app directory (an existing one is removed on the first redeploy). Builds that read git metadata, such as `git describe`, can use the `DROP_GIT_COMMIT` environment variable, which holds the deployed commit.
 - A redeploy removes files that were deleted upstream, but only ones DROP itself copied from the repository. Files an app wrote into its own folder are left alone; use `DROP_DATA_DIR` for state. The first redeploy after upgrading removes nothing.
-- Every redeploy re-downloads a shallow clone of the branch.
+- Every redeploy re-downloads a shallow clone of the branch. A repository checkout is limited to 200,000 entries and `DROP_MAX_GIT_CHECKOUT_MB` megabytes (default: twice `DROP_MAX_UPLOAD_UNPACKED_MB`); larger repositories are refused.
+- A Dockerfile build receives the deployed commit as the `DROP_GIT_COMMIT` build argument (declare `ARG DROP_GIT_COMMIT`); monorepo services get the group's commit.
+- A redeploy that arrives while the app is building or deploying (a push webhook, for instance) is queued and run when the app is free, instead of being dropped.
 - Symbolic links tracked in a repository are not recreated in the app folder (a warning names them).
 - A git redeploy is refused (409) while the app is building or deploying.
 

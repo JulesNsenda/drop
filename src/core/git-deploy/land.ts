@@ -26,6 +26,7 @@ import * as fs from 'fs/promises';
 import { constants as fsConstants } from 'fs';
 import type { Stats } from 'fs';
 import * as path from 'path';
+import { randomBytes } from 'crypto';
 import { writeJsonAtomic } from '../../utils/atomic-write';
 import { isVcsMetadataComponent } from '../../utils/upload-paths';
 
@@ -44,7 +45,13 @@ export interface LandRequest {
   /** The previously landed file list, or `null` when there is none. */
   previous: string[] | null;
   limits: LandLimits;
+  /** Called right after THIS land created the app folder (and not before). */
+  onCreatedAppDir?: () => void;
 }
+
+/** Longest single path component and longest whole destination path we will write. */
+const MAX_SEGMENT_BYTES = 255;
+const MAX_PATH_LENGTH = 4000;
 
 /** Split and validate one repository-relative path. */
 function segmentsOf(rel: string): string[] {
@@ -52,6 +59,9 @@ function segmentsOf(rel: string): string[] {
   for (const s of segs) {
     if (s === '' || s === '.' || s === '..' || s.includes('\0') || s.includes('\\') || isVcsMetadataComponent(s)) {
       throw new Error(`Refusing to land unsafe path: ${rel}`);
+    }
+    if (Buffer.byteLength(s, 'utf8') > MAX_SEGMENT_BYTES) {
+      throw new Error(`Refusing to land a path with an over-long name: ${rel.slice(0, 80)}`);
     }
   }
   return segs;
@@ -119,8 +129,39 @@ async function parentIsPlainDirs(appDir: string, segs: string[]): Promise<boolea
   return true;
 }
 
+/**
+ * Whether the app folder's volume ignores case. Probed once per land with a
+ * throwaway file, because the answer decides whether `Readme.md` and
+ * `README.md` are the same entry.
+ */
+async function probeCaseInsensitive(appDir: string): Promise<boolean> {
+  const stem = `.drop-case-probe-${randomBytes(6).toString('hex')}`;
+  const lower = path.join(appDir, stem);
+  try {
+    await fs.writeFile(lower, '', { flag: 'wx' });
+    const upper = await lstatOrNull(path.join(appDir, stem.toUpperCase()));
+    return upper !== null;
+  } catch {
+    return false;
+  } finally {
+    await fs.rm(lower, { force: true }).catch(() => undefined);
+  }
+}
+
+/** Confirm every directory from `base` down to `rel`'s parent is a real directory. */
+async function assertPlainParents(base: string, segs: string[], what: string): Promise<void> {
+  let cur = base;
+  for (const s of segs.slice(0, -1)) {
+    cur = path.join(cur, s);
+    const st = await lstatOrNull(cur);
+    if (!st || !st.isDirectory() || st.isSymbolicLink()) {
+      throw new Error(`${what} is not under plain directories: ${segs.join('/')}`);
+    }
+  }
+}
+
 export async function landTracked(req: LandRequest): Promise<string[]> {
-  const { cloneDir, appDir, files, previous, limits } = req;
+  const { cloneDir, appDir, files, previous, limits, onCreatedAppDir } = req;
 
   // Validate and measure BEFORE writing anything, so a refusal leaves the app
   // exactly as it was.
@@ -132,11 +173,20 @@ export async function landTracked(req: LandRequest): Promise<string[]> {
   }
   for (const rel of files) {
     const segs = segmentsOf(rel);
+    if (path.join(appDir, ...segs).length > MAX_PATH_LENGTH) {
+      throw new Error(`Refusing to land an over-long path: ${rel.slice(0, 80)}`);
+    }
+    // Every file the index lists must be there: a clone that lost one is not a
+    // clone to deploy from. (Tracked symlinks are listed separately and are
+    // the only thing skipped on purpose.)
+    await assertPlainParents(cloneDir, segs, 'Clone entry');
     const st = await lstatOrNull(path.join(cloneDir, ...segs));
-    if (!st || !st.isFile()) continue;
+    if (!st || !st.isFile()) {
+      throw new Error(`Tracked file missing from the clone: ${rel.slice(0, 120)}`);
+    }
     bytes += st.size;
     if (bytes > limits.maxBytes) {
-      throw new Error(`Repository exceeds the maximum unpacked size of ${Math.floor(limits.maxBytes / (1024 * 1024))} MB`);
+      throw new Error(`Repository exceeds the maximum checkout size of ${Math.floor(limits.maxBytes / (1024 * 1024))} MB`);
     }
     for (let i = 1; i < segs.length; i++) dirs.add(segs.slice(0, i).join('/'));
     rels.push(rel);
@@ -148,21 +198,30 @@ export async function landTracked(req: LandRequest): Promise<string[]> {
   // The app folder itself: created if this is a first deploy, never a link.
   const root = await lstatOrNull(appDir);
   if (root?.isSymbolicLink()) throw refuseLink('');
-  if (!root) await fs.mkdir(appDir);
-  else if (!root.isDirectory()) throw new Error('App folder is not a directory');
+  if (!root) {
+    await fs.mkdir(appDir);
+    onCreatedAppDir?.();
+  } else if (!root.isDirectory()) throw new Error('App folder is not a directory');
 
-  // Copy.
-  const verified = new Set<string>();
+  const insensitive = await probeCaseInsensitive(appDir);
+  const fold = (t: string): string => (insensitive ? t.toLowerCase() : t);
+  if (insensitive) {
+    const seen = new Set<string>();
+    for (const rel of rels) {
+      const k = fold(rel);
+      if (seen.has(k)) throw new Error('Repository has paths that differ only by case; this host cannot hold both');
+      seen.add(k);
+    }
+  }
+
+  // Copy. Every parent is re-checked with lstat for every file: nothing is
+  // remembered between writes, because a container may be changing the folder.
   for (const rel of rels) {
     const segs = segmentsOf(rel);
     let cur = appDir;
     for (let i = 0; i < segs.length - 1; i++) {
       cur = path.join(cur, segs[i]);
-      const key = segs.slice(0, i + 1).join('/');
-      if (!verified.has(key)) {
-        await ensureRealDir(cur, key);
-        verified.add(key);
-      }
+      await ensureRealDir(cur, segs.slice(0, i + 1).join('/'));
     }
     const dest = path.join(cur, segs[segs.length - 1]);
     await clearEntry(dest);
@@ -171,16 +230,16 @@ export async function landTracked(req: LandRequest): Promise<string[]> {
 
   // Prune: only what the previous land wrote and this one no longer has.
   if (previous) {
-    const now = new Set(rels);
+    const now = new Set(rels.map(fold));
     for (const rel of previous) {
-      if (now.has(rel)) continue;
+      if (now.has(fold(rel))) continue;
       let segs: string[];
       try {
         segs = segmentsOf(rel);
       } catch {
         continue;
       }
-      if (segs.includes('node_modules')) continue;
+      if (segs.some((s) => fold(s) === 'node_modules')) continue;
       if (!(await parentIsPlainDirs(appDir, segs))) continue;
       const abs = path.join(appDir, ...segs);
       const st = await lstatOrNull(abs);

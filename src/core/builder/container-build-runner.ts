@@ -218,6 +218,52 @@ export async function executeCommandInContainer(
 
 // ── Factory ───────────────────────────────────────────────────────────────────
 
+// -- Build-container bookkeeping -----------------------------------------------
+
+/** Name prefix of every build container (`drop-build-<app>-<timestamp>`). */
+const BUILD_CONTAINER_PREFIX = 'drop-build-';
+
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * Whether a build container for `appName` exists (running or not). The name
+ * filter docker applies is a substring match, so each name is re-checked
+ * exactly: app `web` must not be held up by `web-2`'s build.
+ */
+export async function hasBuildContainer(docker: Docker, appName: string): Promise<boolean> {
+  const exact = new RegExp(`^/?${escapeRegExp(BUILD_CONTAINER_PREFIX + appName)}-\\d+$`);
+  const list = await docker.listContainers({
+    all: true,
+    filters: { name: [BUILD_CONTAINER_PREFIX + appName + '-'] },
+  });
+  return list.some((c) => (c.Names ?? []).some((n) => exact.test(n)));
+}
+
+/**
+ * Remove every build container. Run once at platform boot: a build belongs to
+ * the process that started it, so any left over is an orphan, and one that is
+ * still running would be writing an app folder nobody is tracking.
+ */
+export async function reapBuildContainers(docker: Docker): Promise<number> {
+  const list = await docker.listContainers({
+    all: true,
+    filters: { name: [BUILD_CONTAINER_PREFIX] },
+  });
+  let reaped = 0;
+  for (const c of list) {
+    if (!(c.Names ?? []).some((n) => n.replace(/^\//, '').startsWith(BUILD_CONTAINER_PREFIX))) continue;
+    try {
+      await docker.getContainer(c.Id).remove({ force: true });
+      reaped++;
+    } catch {
+      // best-effort
+    }
+  }
+  return reaped;
+}
+
 /**
  * Create a command executor closure suitable for BuildContext.execCommand.
  * Captures the docker client, app type, and app name at factory time so that
