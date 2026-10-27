@@ -56,9 +56,9 @@ describe('the guest email-collision refusal, as the routes surface it', () => {
     await getAppGuestManager().load();
     await getAppGuestManager().resolveOrCreateGuest('taken@example.com', 'someapp', 'owner-1');
 
-    await createUser('gov', 'password123', 'admin');
+    await createUser({ username: 'gov', role: 'admin', credential: { password: 'password123' } });
     adminToken = await getTestToken('gov', 'password123');
-    const victim = await createUser('victim', 'password123', 'user');
+    const victim = await createUser({ username: 'victim', role: 'user', credential: { password: 'password123' } });
     victimId = victim.id;
   });
 
@@ -149,7 +149,7 @@ describe('the guest email-collision refusal, as the routes surface it', () => {
       await getAppGuestManager().load();
 
       await expect(
-        createUser('another', 'password123', 'user', 'anything@example.com')
+        createUser({ username: 'another', role: 'user', email: 'anything@example.com', credential: { password: 'password123' } })
       ).rejects.toThrow();
     });
   });

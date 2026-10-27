@@ -154,10 +154,10 @@ describe('database panel routes (DROP-120)', () => {
     await server.initialize();
     app = server.getApp();
 
-    const alice = await createUser('alice', 'password123', 'user');
-    const bob = await createUser('bob', 'password123', 'user');
-    const admin = await createUser('root', 'password123', 'admin');
-    await createUser('ro', 'password123', 'readonly');
+    const alice = await createUser({ username: 'alice', role: 'user', credential: { password: 'password123' } });
+    const bob = await createUser({ username: 'bob', role: 'user', credential: { password: 'password123' } });
+    const admin = await createUser({ username: 'root', role: 'admin', credential: { password: 'password123' } });
+    await createUser({ username: 'ro', role: 'readonly', credential: { password: 'password123' } });
     aliceId = alice.id;
 
     aliceToken = await getTestToken('alice', 'password123');
@@ -798,8 +798,8 @@ describe('POST /db/:name/query — the SQL console gate', () => {
     await server.initialize();
     app = server.getApp();
 
-    const alice = await createUser('alice', 'password123', 'user');
-    const admin = await createUser('root', 'password123', 'admin');
+    const alice = await createUser({ username: 'alice', role: 'user', credential: { password: 'password123' } });
+    const admin = await createUser({ username: 'root', role: 'admin', credential: { password: 'password123' } });
     aliceToken = await getTestToken('alice', 'password123');
     adminToken = await getTestToken('root', 'password123');
     adminApiKey = (await createApiKey('root-key', 'admin', undefined, undefined, admin.id)).key;

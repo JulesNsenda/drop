@@ -120,8 +120,8 @@ describe('deploy status streaming (#299)', () => {
     await server.initialize();
     app = server.getApp();
 
-    aliceId = (await createUser('alice', 'password123', 'user')).id;
-    await createUser('bob', 'password123', 'user');
+    aliceId = (await createUser({ username: 'alice', role: 'user', credential: { password: 'password123' } })).id;
+    await createUser({ username: 'bob', role: 'user', credential: { password: 'password123' } });
     aliceToken = await getTestToken('alice', 'password123');
     bobToken = await getTestToken('bob', 'password123');
     baseline = globalHandlerCount();

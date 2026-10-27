@@ -68,8 +68,8 @@ describe('GET /api/v1/limits', () => {
     // inside the route would reload from disk over records made in the test.
     await getPrincipalQuota(path.join(t.tempDir, 'principal-quotas.json')).initialize();
 
-    aliceId = (await createUser('alice', 'password123', 'user')).id;
-    bobId = (await createUser('bob', 'password123', 'user')).id;
+    aliceId = (await createUser({ username: 'alice', role: 'user', credential: { password: 'password123' } })).id;
+    bobId = (await createUser({ username: 'bob', role: 'user', credential: { password: 'password123' } })).id;
     aliceToken = await getTestToken('alice', 'password123');
     bobToken = await getTestToken('bob', 'password123');
 
@@ -155,7 +155,7 @@ describe('GET /api/v1/limits', () => {
   });
 
   it("gives an admin their OWN figures, not the fleet's", async () => {
-    await createUser('root', 'password123', 'admin');
+    await createUser({ username: 'root', role: 'admin', credential: { password: 'password123' } });
     const adminToken = await getTestToken('root', 'password123');
 
     const data = await body(adminToken);

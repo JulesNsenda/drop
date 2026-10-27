@@ -78,7 +78,7 @@ describe('PUT /apps/:name/capabilities', () => {
     await server.initialize();
     hono = server.getApp();
 
-    await createUser('root', 'password123', 'admin');
+    await createUser({ username: 'root', role: 'admin', credential: { password: 'password123' } });
     adminToken = await getTestToken('root', 'password123');
 
     const sm = getStateManager();

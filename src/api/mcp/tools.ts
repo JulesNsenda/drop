@@ -679,6 +679,9 @@ export async function handleDeployFromGit(
       return /^[\w.-]{1,128}$/.test(derived) ? derived : '';
     }, err);
     if (refusal) return refusal;
+    if (err instanceof AppInProgressError) {
+      return toolError(`Conflict: ${err.message}`);
+    }
     const message = err instanceof Error ? err.message : 'Deploy failed';
     // message is git-derived (git-deploy.ts / git-client.ts stderr, token-sanitized
     // but never fenced) — fence once here so none of the three sibling returns below

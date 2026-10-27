@@ -82,7 +82,7 @@ describe('destroying a bucket needs an interactive session and a confirmation (#
     await server.initialize();
     hono = server.getApp();
 
-    const owner = await createUser('bucket-owner', 'password123', 'user');
+    const owner = await createUser({ username: 'bucket-owner', role: 'user', credential: { password: 'password123' } });
     ownerToken = await getTestToken('bucket-owner', 'password123');
     ownerApiKey = (await createApiKey('owner-key', 'user', undefined, undefined, owner.id)).key;
 
@@ -251,7 +251,7 @@ describe('destroying a bucket needs an interactive session and a confirmation (#
 
     it('still refuses every other credential with the confirmation: other admin keys, owned admin keys, agent tokens', async () => {
       withRisk('bucket');
-      const admin = await createUser('boss', 'password123', 'admin');
+      const admin = await createUser({ username: 'boss', role: 'admin', credential: { password: 'password123' } });
       const keys: Record<string, string> = {
         'ownerless admin key under another name': (await createApiKey('deploy-bot', 'admin')).key,
         'owned admin key even if named cli-local': (await createApiKey('cli-local', 'admin', undefined, undefined, admin.id)).key,

@@ -47,6 +47,8 @@ import * as fs from 'fs/promises';
 import * as path from 'path';
 import { randomUUID } from 'crypto';
 import { writeJsonAtomic } from '../../utils/atomic-write';
+import { isVcsMetadataComponent } from '../../utils/upload-paths';
+import { gitManifestDir, gitManifestPath } from '../../core/git-deploy/land';
 import { hasEnoughDisk } from '../../utils/disk';
 import { isValidAppName } from '../../api/middleware/validate';
 import { measureTree, configuredCeilingBytes, MB } from '../guardrail/disk-ceiling';
@@ -55,6 +57,22 @@ import { getAppConfigService } from '../app/app-config';
 import { ReleaseStore } from '../release/release-store';
 import { backfillToolchainMarker, checkTree } from '../../core/builder/toolchain';
 
+/**
+ * Copy beside the target, then rename over it: a reader (or a crash) sees the
+ * old file or the new one, never a partial one. The destination is left alone
+ * when the source cannot be copied.
+ */
+async function copyFileAtomic(src: string, dest: string): Promise<void> {
+  const tmp = `${dest}.tmp-${randomUUID()}`;
+  try {
+    await fs.copyFile(src, tmp);
+    await fs.rename(tmp, dest);
+  } catch (err) {
+    await fs.rm(tmp, { force: true }).catch(() => undefined);
+    throw err;
+  }
+}
+
 export interface RollbackSnapshotMeta {
   appName: string;
   /** When the tree was captured — i.e. when the deploy that replaced it began. */
@@ -62,6 +80,8 @@ export interface RollbackSnapshotMeta {
   bytes: number;
   /** AppConfig.outputDirectory at capture, restored with the tree (static apps serve from it). */
   outputDirectory?: string;
+  /** The git commit the captured tree was deployed from, restored on rollback. */
+  gitCommit?: string;
   /**
    * What a rollback goes back to: this store's copy of the tree, or the app's
    * previous release (#298 step 6), which needs no copy. For a release,
@@ -162,7 +182,7 @@ export class RollbackStore {
   capture(
     appName: string,
     appPath: string,
-    opts: { outputDirectory?: string; maxDiskMb?: number } = {}
+    opts: { outputDirectory?: string; maxDiskMb?: number; gitCommit?: string } = {}
   ): Promise<CaptureResult> {
     return this.withLock(appName, async (): Promise<CaptureResult> => {
       const dir = this.dirFor(appName);
@@ -196,15 +216,28 @@ export class RollbackStore {
           verbatimSymlinks: true,
           errorOnExist: false,
           force: true,
+          // Never carry repository metadata into a snapshot: a restore would
+          // put a tenant-writable .git back into the app folder.
+          filter: (src) =>
+            !path
+              .relative(appPath, src)
+              .split(path.sep)
+              .some((segment) => isVcsMetadataComponent(segment)),
         });
         await fs.rm(this.treeDir(appName), { recursive: true, force: true });
         await fs.rename(staging, this.treeDir(appName));
+        // The saved list of files a git redeploy last wrote describes THIS tree,
+        // so it is snapshotted with it. Absent for an app that is not git-deployed.
+        await copyFileAtomic(this.liveManifestPath(appName), this.snapshotManifestPath(appName)).catch(() =>
+          fs.rm(this.snapshotManifestPath(appName), { force: true }).catch(() => undefined)
+        );
 
         const meta: RollbackSnapshotMeta = {
           appName,
           takenAt: new Date().toISOString(),
           bytes: tree.bytes,
           ...(opts.outputDirectory !== undefined ? { outputDirectory: opts.outputDirectory } : {}),
+          ...(opts.gitCommit !== undefined ? { gitCommit: opts.gitCommit } : {}),
         };
         await writeJsonAtomic(this.metaPath(appName), meta);
         return { captured: true, meta };
@@ -232,11 +265,18 @@ export class RollbackStore {
       // current tree has not been touched yet.
       const staging = path.join(this.dirFor(appName), `restore.tmp-${randomUUID()}`);
       try {
-        await fs.cp(this.treeDir(appName), staging, {
+        const treeRoot = this.treeDir(appName);
+        await fs.cp(treeRoot, staging, {
           recursive: true,
           verbatimSymlinks: true,
           errorOnExist: false,
           force: true,
+          // A snapshot taken before snapshots excluded .git may still hold one.
+          filter: (src) =>
+            !path
+              .relative(treeRoot, src)
+              .split(path.sep)
+              .some((segment) => isVcsMetadataComponent(segment)),
         });
 
         await fs.mkdir(appPath, { recursive: true });
@@ -253,11 +293,29 @@ export class RollbackStore {
             await fs.cp(from, to, { recursive: true, verbatimSymlinks: true });
           }
         }
+        // The folder is the older tree again, so the saved file list goes back to
+        // the one that described it (or is dropped when the snapshot had none,
+        // making the next git redeploy prune nothing).
+        const live = this.liveManifestPath(appName);
+        await fs.mkdir(path.dirname(live), { recursive: true, mode: 0o700 }).catch(() => undefined);
+        await copyFileAtomic(this.snapshotManifestPath(appName), live).catch(() =>
+          fs.rm(live, { force: true }).catch(() => undefined)
+        );
         return meta;
       } finally {
         await fs.rm(staging, { recursive: true, force: true }).catch(() => undefined);
       }
     });
+  }
+
+  /** The git file list as it was when the snapshot was taken. */
+  private snapshotManifestPath(appName: string): string {
+    return path.join(this.dirFor(appName), 'git-manifest.json');
+  }
+
+  /** The app's live saved git file list (see core/git-deploy/land.ts). */
+  private liveManifestPath(appName: string): string {
+    return gitManifestPath(gitManifestDir(path.join(this.dropRoot, 'data')), appName);
   }
 
   /** Forget an app's snapshot. Best-effort; used at teardown and by the ceiling sweep. */
@@ -320,6 +378,7 @@ export async function captureBeforeRedeploy(appName: string): Promise<CaptureRes
     const result = await store.capture(appName, config?.path || app.path, {
       outputDirectory: config?.outputDirectory,
       maxDiskMb: config?.maxDiskMb,
+      gitCommit: app.gitSource?.lastCommitSha,
     });
     // An app that has just opted out of releases still holds its last one as
     // the rollback target. The snapshot is newer; it takes over, and the

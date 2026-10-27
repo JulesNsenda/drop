@@ -135,15 +135,15 @@ describe('/apps/:name/share (DROP-153 owner sharing)', () => {
     getSettingsManager({ settingsFilePath: path.join(t.tempDir, 'settings.json') });
     await getSettingsManager().setAppSharingEnabled(true);
 
-    const admin = await createUser('gov', 'password123', 'admin');
+    const admin = await createUser({ username: 'gov', role: 'admin', credential: { password: 'password123' } });
     adminId = admin.id;
     adminToken = await getTestToken('gov', 'password123');
-    const owner = await createUser('owner', 'password123', 'user');
+    const owner = await createUser({ username: 'owner', role: 'user', credential: { password: 'password123' } });
     ownerId = owner.id;
     ownerToken = await getTestToken('owner', 'password123');
-    await createUser('outsider', 'password123', 'user');
+    await createUser({ username: 'outsider', role: 'user', credential: { password: 'password123' } });
     outsiderToken = await getTestToken('outsider', 'password123');
-    const target = await createUser('alice', 'password123', 'user');
+    const target = await createUser({ username: 'alice', role: 'user', credential: { password: 'password123' } });
     targetId = target.id;
     targetUsername = 'alice';
 
@@ -252,7 +252,7 @@ describe('/apps/:name/share (DROP-153 owner sharing)', () => {
 
     it('does not require gateApp on a SECOND grant to an already-gated app', async () => {
       await post('myapp', bearer(ownerToken), { username: targetUsername, gateApp: true });
-      const bob = await createUser('bob', 'password123', 'user');
+      const bob = await createUser({ username: 'bob', role: 'user', credential: { password: 'password123' } });
       const res = await post('myapp', bearer(ownerToken), { username: 'bob' });
       expect(res.status).toBe(200);
       expect(getAppConfigService().getConfig('myapp')?.access?.allow).toEqual(
@@ -294,7 +294,7 @@ describe('/apps/:name/share (DROP-153 owner sharing)', () => {
       // alone at ~19s and then blew even a 30s timeout under a full-suite run.
       // The filler was never the behaviour under test, so making it real only
       // bought flakiness.
-      const existing = await createUser('capholder', 'password123', 'user');
+      const existing = await createUser({ username: 'capholder', role: 'user', credential: { password: 'password123' } });
       const filler = Array.from({ length: 199 }, (_, i) => `synthetic-${i}`);
       const allow = [existing.id, ...filler];
       await getAppConfigService().setAccessPolicy('myapp', () => ({
@@ -340,13 +340,13 @@ describe('/apps/:name/share (DROP-153 owner sharing)', () => {
 
     it("never echoes an admin-authored entry back in the success response (Gate 2 fix #4)", async () => {
       await post('myapp', bearer(ownerToken), { username: targetUsername, gateApp: true });
-      const govTarget = await createUser('gov-target', 'password123', 'user');
+      const govTarget = await createUser({ username: 'gov-target', role: 'user', credential: { password: 'password123' } });
       await getAppConfigService().setAccessPolicy('myapp', existing => ({
         mode: 'drop-users' as const,
         allow: [...(existing.access?.allow ?? []), govTarget.id],
         grantedBy: existing.access?.grantedBy, // govTarget.id absent — admin-authored
       }));
-      await createUser('carol2', 'password123', 'user');
+      await createUser({ username: 'carol2', role: 'user', credential: { password: 'password123' } });
       const res = await post('myapp', bearer(ownerToken), { username: 'carol2' });
       const body = await res.json();
       expect(JSON.stringify(body)).not.toContain(govTarget.id);
@@ -434,7 +434,7 @@ describe('/apps/:name/share (DROP-153 owner sharing)', () => {
           return real(name as string, arg as never);
         });
 
-      await createUser('bob3', 'password123', 'user');
+      await createUser({ username: 'bob3', role: 'user', credential: { password: 'password123' } });
       const res = await post('myapp', bearer(ownerToken), { username: 'bob3' });
       expect(res.status).toBe(409);
       const body = (await res.json()) as { error: { message: string } };
@@ -486,7 +486,7 @@ describe('/apps/:name/share (DROP-153 owner sharing)', () => {
       const reconfigureRoute = jest.fn().mockResolvedValue(undefined);
       wireOps({ reconfigureRoute });
 
-      await createUser('carol', 'password123', 'user');
+      await createUser({ username: 'carol', role: 'user', credential: { password: 'password123' } });
       await post('myapp', bearer(ownerToken), { username: 'carol' });
       expect(reconfigureRoute).not.toHaveBeenCalled();
     });
@@ -497,7 +497,7 @@ describe('/apps/:name/share (DROP-153 owner sharing)', () => {
       const reconfigureRoute = jest.fn().mockResolvedValue(undefined);
       wireOps({ reconfigureRoute });
 
-      await createUser('dave', 'password123', 'user');
+      await createUser({ username: 'dave', role: 'user', credential: { password: 'password123' } });
       await post('myapp', bearer(ownerToken), { username: 'dave' });
       expect(reconfigureRoute).toHaveBeenCalledWith('myapp');
     });
@@ -563,7 +563,7 @@ describe('/apps/:name/share (DROP-153 owner sharing)', () => {
         // Establish an already-gated app so the second grant below does not
         // hit the separate `needs-confirmation` branch first.
         await post('myapp', bearer(ownerToken), { username: targetUsername, gateApp: true });
-        const bob = await createUser('toctou-bob', 'password123', 'user');
+        const bob = await createUser({ username: 'toctou-bob', role: 'user', credential: { password: 'password123' } });
 
         // The route's precheck (`grantIneligibleReason(getUser(username), ...)`,
         // synchronous, before `setAccessPolicy` is even called) sees bob as
@@ -616,7 +616,7 @@ describe('/apps/:name/share (DROP-153 owner sharing)', () => {
         expect(writeSpy).not.toHaveBeenCalled();
 
         // One real write to seed a policy for the remaining arms.
-        await createUser('writecheck-bob', 'password123', 'user');
+        await createUser({ username: 'writecheck-bob', role: 'user', credential: { password: 'password123' } });
         await post('myapp', bearer(ownerToken), { username: 'writecheck-bob', gateApp: true });
         expect(writeSpy).toHaveBeenCalledTimes(1);
         writeSpy.mockClear();
@@ -633,7 +633,7 @@ describe('/apps/:name/share (DROP-153 owner sharing)', () => {
           grantedBy: Object.fromEntries(filler.map(id => [id, ownerId])),
         }));
         writeSpy.mockClear();
-        await createUser('writecheck-newperson', 'password123', 'user');
+        await createUser({ username: 'writecheck-newperson', role: 'user', credential: { password: 'password123' } });
         await post('myapp', bearer(ownerToken), { username: 'writecheck-newperson' });
         expect(writeSpy).not.toHaveBeenCalled();
 
@@ -683,7 +683,7 @@ describe('/apps/:name/share (DROP-153 owner sharing)', () => {
 
     it('sends share-notification with the correct vars when enabled and the target has an email', async () => {
       await getSettingsManager().setShareNotificationsEnabled(true);
-      await createUser('withmail-send', 'password123', 'user', 'withmail-send@example.com');
+      await createUser({ username: 'withmail-send', role: 'user', email: 'withmail-send@example.com', credential: { password: 'password123' } });
 
       const res = await post('myapp', bearer(ownerToken), { username: 'withmail-send', gateApp: true });
       expect(res.status).toBe(200);
@@ -709,11 +709,7 @@ describe('/apps/:name/share (DROP-153 owner sharing)', () => {
       });
       await getStateManager().updateApp('myapp', { customDomain: 'also-evil.example.net' });
       await getSettingsManager().setShareNotificationsEnabled(true);
-      await createUser(
-        'withmail-tenant-domain',
-        'password123',
-        'user',
-        'withmail-tenant-domain@example.com'
+      await createUser({ username: 'withmail-tenant-domain', role: 'user', email: 'withmail-tenant-domain@example.com', credential: { password: 'password123' } }
       );
 
       const res = await post('myapp', bearer(ownerToken), {
@@ -730,7 +726,7 @@ describe('/apps/:name/share (DROP-153 owner sharing)', () => {
 
     it('does NOT send when share notifications are disabled — the default', async () => {
       // getShareNotificationsEnabled() defaults false — no explicit call.
-      await createUser('withmail-off', 'password123', 'user', 'withmail-off@example.com');
+      await createUser({ username: 'withmail-off', role: 'user', email: 'withmail-off@example.com', credential: { password: 'password123' } });
 
       const res = await post('myapp', bearer(ownerToken), { username: 'withmail-off', gateApp: true });
       expect(res.status).toBe(200);
@@ -747,7 +743,7 @@ describe('/apps/:name/share (DROP-153 owner sharing)', () => {
 
     it('does NOT re-notify on an idempotent re-grant of an existing entry', async () => {
       await getSettingsManager().setShareNotificationsEnabled(true);
-      await createUser('withmail-regrant', 'password123', 'user', 'withmail-regrant@example.com');
+      await createUser({ username: 'withmail-regrant', role: 'user', email: 'withmail-regrant@example.com', credential: { password: 'password123' } });
 
       await post('myapp', bearer(ownerToken), { username: 'withmail-regrant', gateApp: true });
       expect(sendMock).toHaveBeenCalledTimes(1);
@@ -760,7 +756,7 @@ describe('/apps/:name/share (DROP-153 owner sharing)', () => {
 
     it('logs a structured refusal, never a silent kill, when the mail quota refuses — the grant still succeeds unchanged (Gate 2 fix #4)', async () => {
       await getSettingsManager().setShareNotificationsEnabled(true);
-      await createUser('withmail-quota', 'password123', 'user', 'withmail-quota@example.com');
+      await createUser({ username: 'withmail-quota', role: 'user', email: 'withmail-quota@example.com', credential: { password: 'password123' } });
       jest.spyOn(getMailQuota(), 'check').mockReturnValue({ allowed: false });
       const recordSpy = jest.spyOn(getMailQuota(), 'record');
 
@@ -777,7 +773,7 @@ describe('/apps/:name/share (DROP-153 owner sharing)', () => {
       await getSettingsManager().setShareNotificationsEnabled(true);
       const recordSpy = jest.spyOn(getMailQuota(), 'record');
 
-      await createUser('withmail-unavailable', 'password123', 'user', 'withmail-unavailable@example.com');
+      await createUser({ username: 'withmail-unavailable', role: 'user', email: 'withmail-unavailable@example.com', credential: { password: 'password123' } });
       sendMock.mockResolvedValueOnce({ status: 'unavailable' });
       const res1 = await post('myapp', bearer(ownerToken), {
         username: 'withmail-unavailable',
@@ -788,7 +784,7 @@ describe('/apps/:name/share (DROP-153 owner sharing)', () => {
       expect(recordSpy).not.toHaveBeenCalled();
 
       recordSpy.mockClear();
-      await createUser('withmail-attempted', 'password123', 'user', 'withmail-attempted@example.com');
+      await createUser({ username: 'withmail-attempted', role: 'user', email: 'withmail-attempted@example.com', credential: { password: 'password123' } });
       sendMock.mockResolvedValueOnce({ status: 'attempted' });
       const res2 = await post('myapp', bearer(ownerToken), {
         username: 'withmail-attempted',
@@ -801,11 +797,7 @@ describe('/apps/:name/share (DROP-153 owner sharing)', () => {
 
     it('never varies the grant response with the send outcome — byte-identical body for attempted, unavailable, and a rejected send', async () => {
       await getSettingsManager().setShareNotificationsEnabled(true);
-      const target = await createUser(
-        'withmail-outcome',
-        'password123',
-        'user',
-        'withmail-outcome@example.com'
+      const target = await createUser({ username: 'withmail-outcome', role: 'user', email: 'withmail-outcome@example.com', credential: { password: 'password123' } }
       );
 
       sendMock.mockResolvedValueOnce({ status: 'attempted' });
@@ -1099,7 +1091,7 @@ describe('/apps/:name/share (DROP-153 owner sharing)', () => {
     it("shows the caller's own grants but only a COUNT of admin-authored ones", async () => {
       await post('myapp', bearer(ownerToken), { username: targetUsername, gateApp: true });
       // An admin-authored entry the owner must not see the identity of.
-      const gov = await createUser('bob2', 'password123', 'user');
+      const gov = await createUser({ username: 'bob2', role: 'user', credential: { password: 'password123' } });
       await getAppConfigService().setAccessPolicy('myapp', existing => ({
         mode: 'drop-users' as const,
         allow: [...(existing.access?.allow ?? []), gov.id],

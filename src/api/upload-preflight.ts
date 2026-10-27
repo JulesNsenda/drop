@@ -111,16 +111,14 @@ export async function runUploadPreflight(
         ),
       };
     }
-    // An upload onto a git-backed app is destructive and irreversible in a way
-    // the caller cannot see coming: landFiles syncs the staged tree over the
-    // app directory and then PRUNES whatever the tarball didn't carry, and
-    // DEFAULT_PRESERVE covers only `node_modules` — so the app's real `.git`
-    // is deleted. Its gitSource survives in apps.json, so the app still looks
-    // git-backed, but the next `POST /git/redeploy/<app>` fails in
-    // `git remote get-url origin` with no repository present. Re-uploading a
-    // tarball carrying `.git` cannot repair it either: that is now refused
-    // outright (tar-extract's vcs_metadata guard). Refuse the upload instead
-    // of silently severing the link — one deploy source per app.
+    // An upload onto a git-backed app is destructive in a way the caller cannot
+    // see coming: landFiles syncs the staged tree over the app directory and
+    // then PRUNES whatever the tarball didn't carry, so the files the next
+    // `POST /git/redeploy/<app>` would have kept in step with the repository
+    // are replaced by whatever was uploaded, and the saved list of files that
+    // redeploy uses to decide what to delete no longer matches the folder.
+    // Refuse the upload instead of mixing two sources — one deploy source per
+    // app.
     const gitBackedName = resolveGitBackedName(existingApp, stateManager);
     if (gitBackedName) {
       return {

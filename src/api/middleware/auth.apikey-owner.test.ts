@@ -59,8 +59,8 @@ describe('isAdminPrincipalId', () => {
   });
 
   it('counts an admin user, not an ordinary one, and not an unknown id', async () => {
-    const admin = await createUser('boss', 'pw-boss-123456', 'admin');
-    const user = await createUser('carol', 'pw-carol-123456', 'user');
+    const admin = await createUser({ username: 'boss', role: 'admin', credential: { password: 'pw-boss-123456' } });
+    const user = await createUser({ username: 'carol', role: 'user', credential: { password: 'pw-carol-123456' } });
 
     expect(await isAdminPrincipalId(admin.id)).toBe(true);
     expect(await isAdminPrincipalId(user.id)).toBe(false);
@@ -76,14 +76,14 @@ describe('isAdminPrincipalId', () => {
   });
 
   it('does not count an owned key id: its principal is the owner', async () => {
-    const bob = await createUser('bob2', 'pw-bob2-123456', 'admin');
+    const bob = await createUser({ username: 'bob2', role: 'admin', credential: { password: 'pw-bob2-123456' } });
     const { apiKey } = await createApiKey('bob-key', 'admin', undefined, undefined, bob.id);
 
     expect(await isAdminPrincipalId(apiKey.id)).toBe(false);
   });
 
   it('reads the credential file itself when the store is not loaded yet, without writing it', async () => {
-    const admin = await createUser('early', 'pw-early-123456', 'admin');
+    const admin = await createUser({ username: 'early', role: 'admin', credential: { password: 'pw-early-123456' } });
     resetAuth();
 
     expect(await isAdminPrincipalId(admin.id)).toBe(false);
@@ -109,7 +109,7 @@ describe('API key ownership attribution', () => {
   });
 
   it('resolves userId to the owning human, not the key id', async () => {
-    const bob = await createUser('bob', 'pw-bob-123456', 'user');
+    const bob = await createUser({ username: 'bob', role: 'user', credential: { password: 'pw-bob-123456' } });
     const { key, apiKey } = await createApiKey('bob-ci', 'user', undefined, undefined, bob.id);
 
     const auth = await authenticateWithKey(key);
@@ -122,7 +122,7 @@ describe('API key ownership attribution', () => {
   });
 
   it('two keys for the same human share one identity — no per-key quota reset', async () => {
-    const bob = await createUser('bob', 'pw-bob-123456', 'user');
+    const bob = await createUser({ username: 'bob', role: 'user', credential: { password: 'pw-bob-123456' } });
     const first = await createApiKey('bob-ci-1', 'user', undefined, undefined, bob.id);
     const second = await createApiKey('bob-ci-2', 'user', undefined, undefined, bob.id);
 
@@ -137,7 +137,7 @@ describe('API key ownership attribution', () => {
   });
 
   it('keeps the owning user resolvable, so per-user maxApps overrides apply', async () => {
-    const bob = await createUser('bob', 'pw-bob-123456', 'user');
+    const bob = await createUser({ username: 'bob', role: 'user', credential: { password: 'pw-bob-123456' } });
     const { key } = await createApiKey('bob-ci', 'user', undefined, undefined, bob.id);
 
     const auth = await authenticateWithKey(key);
@@ -150,8 +150,8 @@ describe('API key ownership attribution', () => {
   });
 
   it('distinct owners stay distinct principals', async () => {
-    const bob = await createUser('bob', 'pw-bob-123456', 'user');
-    const carol = await createUser('carol', 'pw-carol-12345', 'user');
+    const bob = await createUser({ username: 'bob', role: 'user', credential: { password: 'pw-bob-123456' } });
+    const carol = await createUser({ username: 'carol', role: 'user', credential: { password: 'pw-carol-12345' } });
     const bobKey = await createApiKey('bob-ci', 'user', undefined, undefined, bob.id);
     const carolKey = await createApiKey('carol-ci', 'user', undefined, undefined, carol.id);
 
@@ -177,7 +177,7 @@ describe('API key ownership attribution', () => {
   });
 
   it('persists ownerUserId across a reload of the credentials store', async () => {
-    const bob = await createUser('bob', 'pw-bob-123456', 'user');
+    const bob = await createUser({ username: 'bob', role: 'user', credential: { password: 'pw-bob-123456' } });
     const { key } = await createApiKey('bob-ci', 'user', undefined, undefined, bob.id);
 
     resetAuth();
@@ -200,7 +200,7 @@ describe('API key ownership attribution', () => {
     // end. An agent-grammar scope is explicitly exempt from that
     // suppression, so it is what proves ownership resolution alone still
     // leaves a legitimate scope alone.
-    const bob = await createUser('bob', 'pw-bob-123456', 'user');
+    const bob = await createUser({ username: 'bob', role: 'user', credential: { password: 'pw-bob-123456' } });
     const { key } = await createApiKey(
       'scoped',
       'none',

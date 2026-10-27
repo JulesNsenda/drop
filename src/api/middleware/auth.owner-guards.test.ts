@@ -42,7 +42,7 @@ describe('API-key ownership guards', () => {
 
   describe('a key stops working when its owner does', () => {
     it('rejects a key whose owner has been deleted', async () => {
-      const bob = await createUser('bob', PASSWORD, 'user');
+      const bob = await createUser({ username: 'bob', role: 'user', credential: { password: PASSWORD } });
       const { key } = await createApiKey('bob-ci', 'user', undefined, undefined, bob.id);
 
       expect(await verifyApiKey(key)).not.toBeNull();
@@ -55,7 +55,7 @@ describe('API-key ownership guards', () => {
     });
 
     it('rejects a key whose owner has been suspended', async () => {
-      const bob = await createUser('bob', PASSWORD, 'user');
+      const bob = await createUser({ username: 'bob', role: 'user', credential: { password: PASSWORD } });
       const { key } = await createApiKey('bob-ci', 'user', undefined, undefined, bob.id);
 
       // The key must provably PREDATE the stamp suspendUser writes; without
@@ -67,7 +67,7 @@ describe('API-key ownership guards', () => {
     });
 
     it('rejects a key whose owner was disabled via updateUser', async () => {
-      const bob = await createUser('bob', PASSWORD, 'user');
+      const bob = await createUser({ username: 'bob', role: 'user', credential: { password: PASSWORD } });
       const { key } = await createApiKey('bob-ci', 'user', undefined, undefined, bob.id);
 
       await clockTick();
@@ -77,8 +77,8 @@ describe('API-key ownership guards', () => {
     });
 
     it('deleting a user also revokes their keys from the store', async () => {
-      const bob = await createUser('bob', PASSWORD, 'user');
-      const carol = await createUser('carol', 'pw-carol-12345', 'user');
+      const bob = await createUser({ username: 'bob', role: 'user', credential: { password: PASSWORD } });
+      const carol = await createUser({ username: 'carol', role: 'user', credential: { password: 'pw-carol-12345' } });
       await createApiKey('bob-ci', 'user', undefined, undefined, bob.id);
       await createApiKey('carol-ci', 'user', undefined, undefined, carol.id);
 
@@ -93,7 +93,7 @@ describe('API-key ownership guards', () => {
       // The MECHANISM changed (DROP-130 Item 4): the key is no longer purged
       // from the store — it is stamped out of standing instead — but the
       // promise the docstring makes (the key stops working) still holds.
-      const bob = await createUser('bob', PASSWORD, 'user');
+      const bob = await createUser({ username: 'bob', role: 'user', credential: { password: PASSWORD } });
       const { key } = await createApiKey('bob-ci', 'user', undefined, undefined, bob.id);
 
       await clockTick();
@@ -125,7 +125,7 @@ describe('API-key ownership guards', () => {
       // the ACTUAL dashboard path therefore resurrected every key verbatim,
       // even though the test above (which goes through suspendUser) looked
       // green the whole time.
-      const bob = await createUser('bob-dashboard-disable', PASSWORD, 'user');
+      const bob = await createUser({ username: 'bob-dashboard-disable', role: 'user', credential: { password: PASSWORD } });
       const { key } = await createApiKey('bob-dashboard-ci', 'user', undefined, undefined, bob.id);
 
       await clockTick();
@@ -149,7 +149,7 @@ describe('API-key ownership guards', () => {
     });
 
     it('leaves legacy ownerless keys alone when an unrelated user is deleted', async () => {
-      const bob = await createUser('bob', PASSWORD, 'user');
+      const bob = await createUser({ username: 'bob', role: 'user', credential: { password: PASSWORD } });
       const { key } = await createApiKey('legacy', 'user');
 
       await deleteUser(bob.id);
@@ -161,12 +161,12 @@ describe('API-key ownership guards', () => {
   describe('verifyUserPassword', () => {
     // Backs the password confirmation now required to delete an account.
     it('accepts the correct password for a user id', async () => {
-      const bob = await createUser('bob', PASSWORD, 'user');
+      const bob = await createUser({ username: 'bob', role: 'user', credential: { password: PASSWORD } });
       expect(verifyUserPassword(bob.id, PASSWORD)).toBe(true);
     });
 
     it('rejects a wrong password', async () => {
-      const bob = await createUser('bob', PASSWORD, 'user');
+      const bob = await createUser({ username: 'bob', role: 'user', credential: { password: PASSWORD } });
       expect(verifyUserPassword(bob.id, 'not-the-password')).toBe(false);
     });
 
@@ -175,7 +175,7 @@ describe('API-key ownership guards', () => {
     });
 
     it('rejects an API key id (keys are not user-backed principals)', async () => {
-      const bob = await createUser('bob', PASSWORD, 'user');
+      const bob = await createUser({ username: 'bob', role: 'user', credential: { password: PASSWORD } });
       const { apiKey } = await createApiKey('bob-ci', 'user', undefined, undefined, bob.id);
 
       expect(verifyUserPassword(apiKey.id, PASSWORD)).toBe(false);

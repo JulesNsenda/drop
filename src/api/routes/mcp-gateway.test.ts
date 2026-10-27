@@ -58,8 +58,8 @@ describe('GET /mcp-gateway/verify', () => {
       enableJwt: true,
       enableApiKeys: true,
     });
-    owner = await createUser('owner', 'correct-horse-battery-staple', 'user');
-    stranger = await createUser('stranger', 'correct-horse-battery-staple', 'user');
+    owner = await createUser({ username: 'owner', role: 'user', credential: { password: 'correct-horse-battery-staple' } });
+    stranger = await createUser({ username: 'stranger', role: 'user', credential: { password: 'correct-horse-battery-staple' } });
 
     getStateManager({ stateFilePath: path.join(tempDir, 'apps.json') });
     await getStateManager().initialize();
@@ -215,7 +215,7 @@ describe('GET /mcp-gateway/verify', () => {
     let admin: User;
 
     beforeEach(async () => {
-      admin = await createUser('admin-owner', 'correct-horse-battery-staple', 'admin');
+      admin = await createUser({ username: 'admin-owner', role: 'admin', credential: { password: 'correct-horse-battery-staple' } });
 
       await getStateManager().registerApp(ADMIN_APP, path.join(tempDir, ADMIN_APP));
       await getStateManager().updateApp(ADMIN_APP, { userId: admin.id } as Record<string, unknown>);

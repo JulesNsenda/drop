@@ -73,8 +73,8 @@ describe('certs authorization (P0-8)', () => {
     await server.initialize();
     app = server.getApp();
 
-    const alice = await createUser('alice', 'password123', 'user');
-    await createUser('root', 'password123', 'admin');
+    const alice = await createUser({ username: 'alice', role: 'user', credential: { password: 'password123' } });
+    await createUser({ username: 'root', role: 'admin', credential: { password: 'password123' } });
     aliceToken = await getTestToken('alice', 'password123');
     adminToken = await getTestToken('root', 'password123');
 

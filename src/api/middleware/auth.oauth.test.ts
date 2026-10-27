@@ -51,7 +51,7 @@ describe('OAuth access tokens (PRD-041)', () => {
 
   describe('verifyOAuthAccessToken', () => {
     it('accepts a token minted with the matching audience', async () => {
-      const user = await createUser('mcpuser', 'password123', 'user');
+      const user = await createUser({ username: 'mcpuser', role: 'user', credential: { password: 'password123' } });
       const token = await mintOAuthAccessToken(user, AUDIENCE);
 
       const ctx = await verifyOAuthAccessToken(token, AUDIENCE);
@@ -64,7 +64,7 @@ describe('OAuth access tokens (PRD-041)', () => {
     });
 
     it('returns null for a wrong audience', async () => {
-      const user = await createUser('mcpuser2', 'password123', 'user');
+      const user = await createUser({ username: 'mcpuser2', role: 'user', credential: { password: 'password123' } });
       const token = await mintOAuthAccessToken(user, AUDIENCE);
 
       const ctx = await verifyOAuthAccessToken(token, 'https://drop.example.com/api/v1/mcp-other');
@@ -73,7 +73,7 @@ describe('OAuth access tokens (PRD-041)', () => {
     });
 
     it('returns null when token_use is absent (e.g. a session-JWT-shaped token)', async () => {
-      const user = await createUser('mcpuser3', 'password123', 'user');
+      const user = await createUser({ username: 'mcpuser3', role: 'user', credential: { password: 'password123' } });
       // Same audience claim, but no token_use — must still be rejected.
       const bogus = await new jose.SignJWT({
         sub: user.id,
@@ -92,7 +92,7 @@ describe('OAuth access tokens (PRD-041)', () => {
     });
 
     it('returns null when token_use carries some other value', async () => {
-      const user = await createUser('mcpuser4', 'password123', 'user');
+      const user = await createUser({ username: 'mcpuser4', role: 'user', credential: { password: 'password123' } });
       const bogus = await new jose.SignJWT({
         sub: user.id,
         username: user.username,
@@ -122,7 +122,7 @@ describe('OAuth access tokens (PRD-041)', () => {
 
     it('401s an oauth_access token presented as a general-API Bearer token', async () => {
       const app = buildApp();
-      const user = await createUser('mcpuser5', 'password123', 'user');
+      const user = await createUser({ username: 'mcpuser5', role: 'user', credential: { password: 'password123' } });
       const token = await mintOAuthAccessToken(user, AUDIENCE);
 
       const res = await app.request('/apps', { headers: { Authorization: `Bearer ${token}` } });
@@ -152,7 +152,7 @@ describe('OAuth refresh tokens (PRD-041)', () => {
   });
 
   it('issue -> rotate returns a new token and invalidates the old one', async () => {
-    const user = await createUser('refreshuser', 'password123', 'user');
+    const user = await createUser({ username: 'refreshuser', role: 'user', credential: { password: 'password123' } });
     const original = await issueRefreshToken(user.id, 'drop-mcp-client');
 
     const rotated = await rotateRefreshToken(original);
@@ -171,7 +171,7 @@ describe('OAuth refresh tokens (PRD-041)', () => {
   });
 
   it('revokeRefreshToken invalidates a token', async () => {
-    const user = await createUser('revokeuser', 'password123', 'user');
+    const user = await createUser({ username: 'revokeuser', role: 'user', credential: { password: 'password123' } });
     const token = await issueRefreshToken(user.id, 'drop-mcp-client');
 
     const revoked = await revokeRefreshToken(token);
@@ -200,7 +200,7 @@ describe('OAuth refresh tokens (PRD-041)', () => {
     }
 
     it('keeps exactly the cap for one user and drops the OLDEST records first', async () => {
-      const user = await createUser('capuser', 'password123', 'user');
+      const user = await createUser({ username: 'capuser', role: 'user', credential: { password: 'password123' } });
       const overflow = 5;
 
       for (let i = 0; i < MAX_REFRESH_TOKENS_PER_USER + overflow; i++) {
@@ -223,8 +223,8 @@ describe('OAuth refresh tokens (PRD-041)', () => {
     });
 
     it("never evicts another user's records when one user hits the cap", async () => {
-      const userA = await createUser('capuserA', 'password123', 'user');
-      const userB = await createUser('capuserB', 'password123', 'user');
+      const userA = await createUser({ username: 'capuserA', role: 'user', credential: { password: 'password123' } });
+      const userB = await createUser({ username: 'capuserB', role: 'user', credential: { password: 'password123' } });
       const tokenB = await issueRefreshToken(userB.id, 'client-b');
 
       for (let i = 0; i < MAX_REFRESH_TOKENS_PER_USER + 3; i++) {
@@ -241,7 +241,7 @@ describe('OAuth refresh tokens (PRD-041)', () => {
     });
 
     it('lets a user AT the cap rotate repeatedly without ever losing their grant', async () => {
-      const user = await createUser('capuserC', 'password123', 'user');
+      const user = await createUser({ username: 'capuserC', role: 'user', credential: { password: 'password123' } });
       // The token under test is the FIRST (oldest) one issued — the exact
       // record eviction would reach for if it ran on the un-spliced array,
       // since the rest of the loop below issues nine newer siblings that
@@ -268,7 +268,7 @@ describe('OAuth refresh tokens (PRD-041)', () => {
     });
 
     it('tolerates a missing createdAt on a stored record and evicts it first', async () => {
-      const user = await createUser('capuserD', 'password123', 'user');
+      const user = await createUser({ username: 'capuserD', role: 'user', credential: { password: 'password123' } });
 
       // Simulate a legacy/hand-edited/restored record — no schema validates
       // `api-credentials.json`, and `createdAt` is exactly the field
@@ -306,7 +306,7 @@ describe('OAuth refresh tokens (PRD-041)', () => {
     });
 
     it("kills an evicted grant's outstanding access token immediately (denyGrant)", async () => {
-      const user = await createUser('capuserE', 'password123', 'user');
+      const user = await createUser({ username: 'capuserE', role: 'user', credential: { password: 'password123' } });
       const sid = 'sid-evicted-grant';
 
       // The oldest record for this user — carries the sid whose access
@@ -343,7 +343,7 @@ describe('OAuth refresh tokens (PRD-041)', () => {
     // a brand-new record's real timestamp, so an eviction that didn't
     // exclude the new record by hash would pick the new record itself.
     it('protects the just-issued record even when existing records carry bogus future timestamps', async () => {
-      const user = await createUser('capuserF', 'password123', 'user');
+      const user = await createUser({ username: 'capuserF', role: 'user', credential: { password: 'password123' } });
 
       const raw = JSON.parse(await fs.readFile(credentialsPath, 'utf-8')) as {
         refreshTokens?: Array<Record<string, unknown>>;

@@ -53,9 +53,9 @@ describe('POST /apps/:name/promote', () => {
     await server.initialize();
     app = server.getApp();
 
-    const alice = await createUser('alice', 'password123', 'user');
-    await createUser('bob', 'password123', 'user');
-    await createUser('sysadmin', 'password123', 'admin');
+    const alice = await createUser({ username: 'alice', role: 'user', credential: { password: 'password123' } });
+    await createUser({ username: 'bob', role: 'user', credential: { password: 'password123' } });
+    await createUser({ username: 'sysadmin', role: 'admin', credential: { password: 'password123' } });
     aliceId = alice.id;
     aliceToken = await getTestToken('alice', 'password123');
     bobToken = await getTestToken('bob', 'password123');
@@ -80,6 +80,17 @@ describe('POST /apps/:name/promote', () => {
     const res = await promote('alice-app', bearer(aliceToken));
 
     expect(res.status).toBe(200);
+    expect(promoteApp).toHaveBeenCalledWith('alice-app');
+  });
+
+  it('answers 409 (not 500) when the app is claimed by a build between the request and the promotion', async () => {
+    // promoteApp claims the app itself and throws if it is busy; the route no
+    // longer pre-checks, so this is the only place the race can show.
+    promoteApp.mockRejectedValueOnce(new platformOps.AppInProgressError('alice-app'));
+
+    const res = await promote('alice-app', bearer(aliceToken));
+
+    expect(res.status).toBe(409);
     expect(promoteApp).toHaveBeenCalledWith('alice-app');
   });
 

@@ -13,7 +13,7 @@
  *
  * This module's stated contract is "DOM-free and node-free so the dashboard
  * can bundle it", but `isVcsMetadataComponent` below is the guard that blocks
- * host command execution via `gitPull` (see `tar-extract.ts`'s entry handler
+ * host command execution through a planted `.git` (see `tar-extract.ts`'s entry handler
  * and `validateStagedRelativePath` in `api/mcp/tools.ts`). Do not weaken it
  * for browser-bundling reasons. End-to-end `vcs_metadata` coverage through
  * `extractTarball` is what would catch a removed call site.

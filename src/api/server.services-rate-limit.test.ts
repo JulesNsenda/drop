@@ -39,7 +39,7 @@ describe('dedicated /apps/*/services/* rate-limit bucket (DROP-151 Phase 3)', ()
   beforeEach(async () => {
     t = await createTestApiServer({ port: 3101, tempPrefix: 'drop-services-ratelimit-' });
 
-    const owner = await createUser('services-owner', 'password123', 'user');
+    const owner = await createUser({ username: 'services-owner', role: 'user', credential: { password: 'password123' } });
     ownerId = owner.id;
     ownerToken = await getTestToken('services-owner', 'password123');
 

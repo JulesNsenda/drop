@@ -114,6 +114,9 @@ export async function executeCommandInContainer(
   try {
     container = await docker.createContainer({
       name: containerName,
+      // Found by this label, never by name: an app called `build-victim-1` must
+      // not look like a build container of `victim`.
+      Labels: { [BUILD_LABEL]: appName },
       Image: image,
       Cmd: ['/bin/sh', '-c', command],
       WorkingDir: '/app',
@@ -217,6 +220,78 @@ export async function executeCommandInContainer(
 }
 
 // ── Factory ───────────────────────────────────────────────────────────────────
+
+// -- Build-container bookkeeping -----------------------------------------------
+
+/** Label every build container carries; its value is the app name. */
+const BUILD_LABEL = 'drop.build';
+
+/**
+ * Whether a build container for `appName` exists (running or not). Matched by
+ * label, and the label VALUE is re-checked on what docker returns rather than
+ * trusting the daemon's filter alone.
+ */
+export async function hasBuildContainer(docker: Docker, appName: string): Promise<boolean> {
+  const list = await docker.listContainers({
+    all: true,
+    filters: { label: [`${BUILD_LABEL}=${appName}`] },
+  });
+  if (list.some((c) => c.Labels?.[BUILD_LABEL] === appName)) return true;
+  // Fail closed: a build started by a binary from before the label existed is
+  // still writing SOME app folder, and its name cannot say which app reliably.
+  // Any such container blocks every app until the boot reap removes it.
+  return (await listLegacyBuildContainers(docker)).length > 0;
+}
+
+/** Runtime containers carry this label; a build container never does. */
+const MANAGED_LABEL = 'drop.managed';
+
+/** `drop-build-<app>-<13-digit ms timestamp>`, the name every build container has had. */
+const LEGACY_BUILD_NAME = /^\/?drop-build-.+-\d{13}$/;
+
+/**
+ * Build containers made before containers were labelled: the build name, and
+ * neither the build label nor the managed label. The managed-label exclusion
+ * is what keeps an app whose own name looks like a build container (its
+ * runtime container is named after the app) from ever being counted or reaped.
+ */
+async function listLegacyBuildContainers(docker: Docker): Promise<Docker.ContainerInfo[]> {
+  const list = await docker.listContainers({ all: true, filters: { name: ['drop-build-'] } });
+  return list.filter(
+    (c) =>
+      c.Labels?.[BUILD_LABEL] === undefined &&
+      c.Labels?.[MANAGED_LABEL] === undefined &&
+      (c.Names ?? []).some((n) => LEGACY_BUILD_NAME.test(n))
+  );
+}
+
+/**
+ * Remove every build container. Run once at platform boot: a build belongs to
+ * the process that started it, so any left over is an orphan, and one that is
+ * still running would be writing an app folder nobody is tracking.
+ */
+export async function reapBuildContainers(docker: Docker): Promise<number> {
+  const list = await docker.listContainers({
+    all: true,
+    filters: { label: [BUILD_LABEL] },
+  });
+  let reaped = 0;
+  // Labelled builds, plus legacy ones left by the pre-upgrade binary: a build
+  // in flight at the upgrade restart survives it (stop() never kills builds).
+  const targets = [
+    ...list.filter((c) => c.Labels?.[BUILD_LABEL] !== undefined),
+    ...(await listLegacyBuildContainers(docker)),
+  ];
+  for (const c of targets) {
+    try {
+      await docker.getContainer(c.Id).remove({ force: true });
+      reaped++;
+    } catch {
+      // best-effort
+    }
+  }
+  return reaped;
+}
 
 /**
  * Create a command executor closure suitable for BuildContext.execCommand.

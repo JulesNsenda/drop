@@ -39,7 +39,7 @@ describe('DELETE /apps/:name/services/:id authorization (DROP-151 Phase 3 detach
   beforeEach(async () => {
     t = await createTestApiServer({ port: 3102, tempPrefix: 'drop-detach-service-authz-', activityLog: true });
 
-    const owner = await createUser('owner', 'password123', 'user');
+    const owner = await createUser({ username: 'owner', role: 'user', credential: { password: 'password123' } });
     ownerId = owner.id;
     ownerToken = await getTestToken('owner', 'password123');
 
@@ -68,7 +68,7 @@ describe('DELETE /apps/:name/services/:id authorization (DROP-151 Phase 3 detach
   });
 
   it('blocks a readonly-role token with 403 (DELETE is gated at >= user) and never calls detachService', async () => {
-    await createUser('viewer', 'password123', 'readonly');
+    await createUser({ username: 'viewer', role: 'readonly', credential: { password: 'password123' } });
     const viewerToken = await getTestToken('viewer', 'password123');
     const ops = makePlatformOpsStub();
     setPlatformOps(ops);
@@ -79,7 +79,7 @@ describe('DELETE /apps/:name/services/:id authorization (DROP-151 Phase 3 detach
   });
 
   it("404s (not 403) when a non-owning user-role caller detaches another user's app -- no existence oracle", async () => {
-    await createUser('intruder', 'password123', 'user');
+    await createUser({ username: 'intruder', role: 'user', credential: { password: 'password123' } });
     const intruderToken = await getTestToken('intruder', 'password123');
     const ops = makePlatformOpsStub();
     setPlatformOps(ops);
@@ -99,7 +99,7 @@ describe('DELETE /apps/:name/services/:id authorization (DROP-151 Phase 3 detach
   });
 
   it("lets an admin detach another user's app", async () => {
-    await createUser('root', 'password123', 'admin');
+    await createUser({ username: 'root', role: 'admin', credential: { password: 'password123' } });
     const adminToken = await getTestToken('root', 'password123');
     const ops = makePlatformOpsStub();
     setPlatformOps(ops);
@@ -125,7 +125,7 @@ describe('DELETE /apps/:name/services/:id — refusal detail and audit-log shape
   beforeEach(async () => {
     t = await createTestApiServer({ port: 3103, tempPrefix: 'drop-detach-service-fixes-', activityLog: true });
 
-    const owner = await createUser('owner2', 'password123', 'user');
+    const owner = await createUser({ username: 'owner2', role: 'user', credential: { password: 'password123' } });
     ownerId = owner.id;
     ownerToken = await getTestToken('owner2', 'password123');
 

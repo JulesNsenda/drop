@@ -10,6 +10,7 @@ import { success, error, ErrorCodes } from '../types';
 import { ValidationError } from '../middleware/error';
 import { AuthContext } from '../middleware/auth';
 import { getGitDeployService } from '../../core/git-deploy';
+import { AppInProgressError } from '../platform-ops';
 import { getStateManager } from '../../managers/app/state-manager';
 import { getSettingsManager } from '../../managers/settings/settings-manager';
 import { getUserById } from '../middleware/auth';
@@ -96,6 +97,9 @@ gitDeploy.post('/deploy', async (c) => {
       c.header('Retry-After', String(err.retryAfterSeconds));
       return c.json(error(ErrorCodes.RATE_LIMITED, err.message), 429);
     }
+    if (err instanceof AppInProgressError) {
+      return c.json(error(ErrorCodes.CONFLICT, err.message), 409);
+    }
     const message = err instanceof Error ? err.message : 'Deploy failed';
     if (message.includes('already exists')) {
       return c.json(error(ErrorCodes.CONFLICT, message), 409);
@@ -124,8 +128,8 @@ gitDeploy.post('/redeploy/:name', async (c) => {
   }
 
   // Monorepo children carry no gitSource of their own — the group's hidden
-  // container holds it (and is what a git pull + re-expansion runs against).
-  // So "Redeploy" on any child resolves to its container: one pull re-pulls
+  // container holds it (and is what a fresh clone + re-expansion runs against).
+  // So "Redeploy" on any child resolves to its container: one clone refreshes
   // and re-materializes the whole group. The `group` tag is tenant-influenced
   // (drop.yaml group:/name:), so a crafted collision could name a victim's
   // group — re-check access on the RESOLVED container, mirroring the
@@ -199,6 +203,12 @@ gitDeploy.post('/redeploy/:name', async (c) => {
       c.header('Retry-After', String(err.retryAfterSeconds));
       return c.json(error(ErrorCodes.RATE_LIMITED, err.message), 429);
     }
+    if (err instanceof AppInProgressError) {
+      return c.json(
+        error(ErrorCodes.CONFLICT, `Application '${name}' is building or deploying — retry once it settles`),
+        409
+      );
+    }
     const message = err instanceof Error ? err.message : 'Redeploy failed';
     // A token id the caller supplied that resolves to nothing is their input
     // error, not a missing app — must not fall into the 404 below.
@@ -208,7 +218,7 @@ gitDeploy.post('/redeploy/:name', async (c) => {
     if (message.includes('not found')) {
       return c.json(error(ErrorCodes.NOT_FOUND, message), 404);
     }
-    if (message.includes('not deployed from git') || message.includes('has no git repository on disk')) {
+    if (message.includes('not deployed from git')) {
       return c.json(error(ErrorCodes.BAD_REQUEST, message), 400);
     }
     return c.json(error(ErrorCodes.INTERNAL_ERROR, message), 500);
@@ -298,6 +308,19 @@ gitDeploy.post('/webhook', async (c) => {
       await logActivityFor(undefined, { action: 'redeploy', appName, detail: `webhook: ${branch}` });
       results.push({ app: appName, status: 'redeploying' });
     } catch (err) {
+      // Busy (building, deploying, or another land under way): not a lost push.
+      // It is remembered, one per app with the latest winning, and runs as soon
+      // as the app frees up.
+      if (err instanceof AppInProgressError) {
+        service.queueRedeploy(appName, { automation: 'webhook' });
+        await logActivityFor(undefined, {
+          action: 'redeploy',
+          appName,
+          detail: `webhook (queued, app busy): ${branch}`,
+        });
+        results.push({ app: appName, status: 'queued' });
+        continue;
+      }
       results.push({
         app: appName,
         status: 'failed',

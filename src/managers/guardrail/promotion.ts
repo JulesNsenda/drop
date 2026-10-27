@@ -9,8 +9,10 @@
  * The plan specifies: the unapproved deploy starts on a NEW port while the
  * route keeps pointing at the previously-approved port, and `promote` flips the
  * upstream. That shape requires the OLD process to still be running, i.e. two
- * live processes for one app — and DROP cannot do that today. Both runtimes
- * derive process identity purely from the app name: `containerName(spec.name)`
+ * live processes for one app — and DROP could not do that when this gate was
+ * written (since #298 each app has instances a/b, used for zero-downtime
+ * cutover, but this gate still builds and holds). Both runtimes then
+ * derived process identity purely from the app name: `containerName(spec.name)`
  * in container-manager, `name: spec.name` in pm2-runtime. Worse, the container
  * path calls `removeIfExists(name)` on start, so bringing the new version up
  * DESTROYS the approved one. Making it work needs a second app identity for the

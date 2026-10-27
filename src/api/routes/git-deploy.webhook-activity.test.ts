@@ -13,6 +13,7 @@ import * as crypto from 'crypto';
 import { ApiServer } from './../server';
 import * as activity from '../../managers/activity';
 import * as gitDeployModule from '../../core/git-deploy';
+import { AppInProgressError } from '../platform-ops';
 
 describe('git webhook activity logging (P2-4)', () => {
   let tempDir: string;
@@ -30,6 +31,7 @@ describe('git webhook activity logging (P2-4)', () => {
     'sha256=' + crypto.createHmac('sha256', secret).update(body).digest('hex');
 
   let redeploy: jest.Mock;
+  let queueRedeploy: jest.Mock;
   let logSpy: jest.SpyInstance;
 
   beforeEach(async () => {
@@ -38,9 +40,11 @@ describe('git webhook activity logging (P2-4)', () => {
     jest.spyOn(console, 'warn').mockImplementation();
 
     redeploy = jest.fn().mockResolvedValue(undefined);
+    queueRedeploy = jest.fn();
     jest.spyOn(gitDeployModule, 'getGitDeployService').mockReturnValue({
       findAppsForWebhook: () => ['myapp'],
       redeploy,
+      queueRedeploy,
     } as unknown as ReturnType<typeof gitDeployModule.getGitDeployService>);
     logSpy = jest.spyOn(activity, 'logActivityFor').mockResolvedValue();
 
@@ -84,6 +88,42 @@ describe('git webhook activity logging (P2-4)', () => {
     // asserting on the pre-merge `entry` here would be vacuous (it can never
     // carry those fields, by the helper's own type).
     expect(auth).toBeUndefined();
+  });
+
+  it('queues a push that arrives while the app is busy, reports it as queued, and audits it', async () => {
+    redeploy.mockRejectedValueOnce(new AppInProgressError('myapp'));
+
+    const res = await app.request('/api/v1/git/webhook', {
+      method: 'POST',
+      headers: {
+        'X-GitHub-Event': 'push',
+        'X-Hub-Signature-256': sign(pushBody),
+        'Content-Type': 'application/json',
+      },
+      body: pushBody,
+    });
+
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { data: { results: Array<{ app: string; status: string }> } };
+    expect(body.data.results).toEqual([{ app: 'myapp', status: 'queued' }]);
+    expect(queueRedeploy).toHaveBeenCalledWith('myapp', { automation: 'webhook' });
+    expect(logSpy).toHaveBeenCalledTimes(1);
+    expect(logSpy.mock.calls[0][1].detail).toContain('queued');
+  });
+
+  it('maps a first deploy refused as busy (quiesced, stale build container) to 409, not 500', async () => {
+    jest.spyOn(gitDeployModule, 'getGitDeployService').mockReturnValue({
+      isAvailable: () => true,
+      deploy: jest.fn().mockRejectedValue(new AppInProgressError('newapp')),
+    } as unknown as ReturnType<typeof gitDeployModule.getGitDeployService>);
+
+    const res = await app.request('/api/v1/git/deploy', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ repoUrl: 'https://github.com/acme/newapp' }),
+    });
+
+    expect(res.status).toBe(409);
   });
 
   it('does not log when the redeploy itself fails', async () => {

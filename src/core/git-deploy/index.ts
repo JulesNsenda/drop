@@ -4,12 +4,16 @@
  * Public exports for git-based deployment functionality.
  */
 
-export { GitDeployService, getGitDeployService, resetGitDeployService } from './git-deploy';
+export {
+  GitDeployService,
+  getGitDeployService,
+  resetGitDeployService,
+  gitCheckoutCaps,
+  PlatformNotReadyError,
+} from './git-deploy';
 export {
   gitClone,
-  gitPull,
-  getCommitSha,
-  getCurrentBranch,
+  configureCloneBase,
   normalizeRepoUrl,
   extractRepoName,
   isValidGitHubUrl,
