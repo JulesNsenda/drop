@@ -21,7 +21,6 @@ import type { RollbackSnapshotMeta } from '../managers/rollback';
 import type { AttachableServiceId, AttachServiceResult, DetachServiceResult } from './services-wire.types';
 import type { AccessGateVerdict } from '../managers/guardrail/access-gate';
 import type { DeployActorInfo } from '../managers/guardrail/deploy-breaker';
-import type { TokenCaller } from '../core/git-deploy/git-deploy.types';
 
 /**
  * The attach/detach wire contract itself lives in `services-wire.types.ts` —
@@ -136,25 +135,10 @@ export function needsConfigDetail(err: AppNeedsConfigError, appName: string): st
   return `Application '${appName}' needs configuration — ${needsConfigAction(err)}, then retry`;
 }
 
-/**
- * What the caller brings to a redeploy beyond the app and who is asking. The
- * platform interprets it: `caller` is who may use which stored git token, for
- * the git path (which lands the repository under the reservation before it
- * builds). The files path ignores it.
- */
-export interface RedeployOptions {
-  caller?: TokenCaller;
-  /**
-   * How long to wait for the build to be minted - i.e. for a builder slot -
-   * before answering `accepted` and carrying on in the background. Defaults to
-   * 10 seconds; a test lowers it.
-   */
-  waitMs?: number;
-}
-
 /** Why an explicit redeploy was refused. The route maps each code to its status. */
 export type RedeployRefusalCode =
   | 'NOT_FOUND'
+  | 'APP_SOURCE_MISSING'
   | 'APP_BUSY'
   | 'SERVICE_UNAVAILABLE'
   | 'REDEPLOY_NOT_SUPPORTED_YET'
@@ -306,7 +290,7 @@ export interface PlatformOps {
    * starts. An admitted request counts against the caller's deploy quota
    * whatever becomes of it - the quota counts volume, not outcome.
    *
-   * Waits at most `options.waitMs` (10 seconds) for a builder slot. In time:
+   * Waits for a builder slot, at most DROP_REDEPLOY_START_WAIT_MS (10 seconds). In time:
    * `started`, with the id the build runs under (its episode follows within
    * moments). Not in time: `accepted` - the redeploy carries on in the
    * background, a refusal after the wait is recorded as a failed deploy
@@ -314,7 +298,7 @@ export interface PlatformOps {
    * returned, never thrown; the slot and the breaker keys are given back on
    * every path. Authorization is the caller's.
    */
-  redeployApp(appName: string, actor: DeployActorInfo, options?: RedeployOptions): Promise<RedeployStart>;
+  redeployApp(appName: string, actor: DeployActorInfo): Promise<RedeployStart>;
 
   /**
    * Whether any app in the same monorepo group as `appName` is busy in a way

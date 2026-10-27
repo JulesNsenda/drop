@@ -73,6 +73,7 @@ describe('explicit redeploy: reservation, group rule, redeployApp', () => {
     resetDeployTracker();
     resetDeployDetailStore();
     process.env.DROP_MIN_FREE_DISK_MB = '500';
+    process.env.DROP_REDEPLOY_START_WAIT_MS = '50'; // "held past the wait" without a ten-second test
     (hasEnoughDisk as jest.Mock).mockResolvedValue({ ok: true, freeMb: 999999 });
     tempDir = path.join(os.tmpdir(), `drop-explicit-redeploy-${Date.now()}-${Math.random()}`);
     appPath = path.join(tempDir, 'apps', appName);
@@ -165,6 +166,7 @@ describe('explicit redeploy: reservation, group rule, redeployApp', () => {
 
   afterEach(async () => {
     delete process.env.DROP_MIN_FREE_DISK_MB;
+    delete process.env.DROP_REDEPLOY_START_WAIT_MS;
     resetPrincipalQuota();
     unsubs.forEach((u) => u());
     // The tracker persists in the background: let it finish before the folder goes.
@@ -183,13 +185,10 @@ describe('explicit redeploy: reservation, group rule, redeployApp', () => {
       expect(p().gitReserved.has(appName)).toBe(false);
     });
 
-    it('beginLand and endLand mark and clear the land, while the hold is held', () => {
+    it('beginLand marks the land while the hold is held, and release clears it', () => {
       const hold = p().reserve(appName);
       hold.beginLand();
       expect(p().gitReserved.has(appName)).toBe(true);
-      hold.endLand();
-      expect(p().gitReserved.has(appName)).toBe(false);
-      hold.beginLand();
       hold.release();
       expect(p().gitReserved.has(appName)).toBe(false);
       expect(p().appsInProgress.has(appName)).toBe(false);
@@ -471,7 +470,7 @@ describe('explicit redeploy: reservation, group rule, redeployApp', () => {
     it('with no slot inside the wait answers accepted, holding the claim and the keys, and carries on', async () => {
       let freeSlot!: () => void;
       slotGate = new Promise<void>((resolve) => (freeSlot = resolve));
-      const out = await p().redeployApp(appName, actor, { waitMs: 30 });
+      const out = await p().redeployApp(appName, actor);
       expect(out).toEqual({ accepted: true });
       expect(buildCtxs).toHaveLength(0);
       expect(p().appsInProgress.has(appName)).toBe(true);
@@ -490,7 +489,7 @@ describe('explicit redeploy: reservation, group rule, redeployApp', () => {
     it('sets the breaker keys once the hold is consumed, and a refusal before that sets none', async () => {
       let slotHeld!: () => void;
       slotGate = new Promise<void>((resolve) => (slotHeld = resolve));
-      const out = await p().redeployApp(appName, actor, { waitMs: 30 });
+      const out = await p().redeployApp(appName, actor);
       expect(out).toEqual({ accepted: true });
       expect(p().breakerKeys.get(appName)).toEqual(p().guardrailKeys(appName, false, actor));
       slotHeld();
@@ -543,7 +542,7 @@ describe('explicit redeploy: reservation, group rule, redeployApp', () => {
         throw new Error('slot wait blew up');
       });
       const logged = jest.spyOn(p().logger, 'error').mockImplementation(() => undefined);
-      const out = await p().redeployApp(appName, actor, { waitMs: 30 });
+      const out = await p().redeployApp(appName, actor);
       expect(out).toEqual({ accepted: true });
       boom();
       await settle();
@@ -596,7 +595,7 @@ describe('explicit redeploy: reservation, group rule, redeployApp', () => {
         let freeSlot!: () => void;
         slotGate = new Promise<void>((resolve) => (freeSlot = resolve));
         setup();
-        const out = await p().redeployApp(appName, actor, { waitMs: 30 });
+        const out = await p().redeployApp(appName, actor);
         expect(out).toEqual({ accepted: true });
         expect(getDeployTracker().getEpisodes(appName)).toEqual([]);
 
@@ -660,7 +659,7 @@ describe('explicit redeploy: reservation, group rule, redeployApp', () => {
       const expand = jest.spyOn(p(), 'expandMonorepo').mockResolvedValue(undefined);
       let freeSlot!: () => void;
       slotGate = new Promise<void>((resolve) => (freeSlot = resolve));
-      const out = await p().redeployApp(appName, actor, { waitMs: 30 });
+      const out = await p().redeployApp(appName, actor);
       expect(out).toEqual({ accepted: true });
 
       const during = await p().handleAppUpdate(containerName, containerPath, 'upload deploy', true);
@@ -671,6 +670,161 @@ describe('explicit redeploy: reservation, group rule, redeployApp', () => {
       await settle();
       await p().handleAppUpdate(containerName, containerPath, 'upload deploy', true);
       expect(expand).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('redeployApp: the source folder', () => {
+    it('a missing source folder is APP_SOURCE_MISSING (409), checked before the disk probe', async () => {
+      fs.rmSync(appPath, { recursive: true, force: true });
+      (hasEnoughDisk as jest.Mock).mockClear();
+      const out = await p().redeployApp(appName, actor);
+      expect(out.refused.code).toBe('APP_SOURCE_MISSING');
+      expect(hasEnoughDisk).not.toHaveBeenCalled();
+      expectNothingHeld();
+    });
+
+    it('a source that is a file, not a folder, is the same refusal', async () => {
+      fs.rmSync(appPath, { recursive: true, force: true });
+      fs.writeFileSync(appPath, 'not a folder');
+      const out = await p().redeployApp(appName, actor);
+      expect(out.refused.code).toBe('APP_SOURCE_MISSING');
+      expectNothingHeld();
+    });
+  });
+
+  describe('redeployApp: stopping and the quota store', () => {
+    afterEach(() => {
+      p().stopping = false;
+    });
+
+    it('a platform that began stopping during the slot wait refuses, releasing only the slot it took', async () => {
+      const slotReleased = jest.fn();
+      p().builder.reserveSlot.mockImplementation(async () => {
+        p().stopping = true;
+        return slotReleased;
+      });
+      p().holdOwners.set(appName, {});
+      expect(await p().acquireSlotAndRecheck(appName, { appPath, statusAtEntry: 'running' })).toEqual({
+        refused: 'stopping',
+      });
+      expect(slotReleased).toHaveBeenCalledTimes(1);
+      expect(p().holdOwners.has(appName)).toBe(true); // not the stage's to clear
+      p().holdOwners.clear();
+    });
+
+    it('through redeployApp, in time: SERVICE_UNAVAILABLE and nothing held', async () => {
+      reserveEffect = () => (p().stopping = true);
+      const out = await p().redeployApp(appName, actor);
+      expect(out.refused.code).toBe('SERVICE_UNAVAILABLE');
+      expect(p().builder.build).not.toHaveBeenCalled();
+      expectNothingHeld();
+    });
+
+    it("loads the quota's store BEFORE checking the hold, so a hold lost meanwhile charges nothing", async () => {
+      const admit = jest.spyOn(breakerModule, 'admitDeploy');
+      const quota = getPrincipalQuota();
+      jest.spyOn(quota, 'initialize').mockImplementation(async () => {
+        p().holdOwners.clear(); // the reservation is lost while the store loads
+      });
+      const out = await p().redeployApp(appName, actor);
+      expect(out.refused.code).toBe('APP_BUSY');
+      expect(admit).not.toHaveBeenCalled();
+      expect(p().builder.reserveSlot).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('a refusal or failure after acceptance gets its OWN episode', () => {
+    /** A deploy left open the way a held or parked app's is: started, never closed. */
+    const leaveOpen = () => eventBus.publish('build:started', { appId: appName, buildId: 'held-b', deployId: 'held-1' });
+    const statuses = () =>
+      Object.fromEntries(getDeployTracker().getEpisodes(appName).map((e) => [e.deployId, e.status]));
+
+    it('a detached DEPLOY_REFUSED does not close the held episode in its place', async () => {
+      leaveOpen();
+      let freeSlot!: () => void;
+      slotGate = new Promise<void>((resolve) => (freeSlot = resolve));
+      reserveEffect = () => (appState = undefined);
+      expect(await p().redeployApp(appName, actor)).toEqual({ accepted: true });
+      freeSlot();
+      await settle();
+
+      const byId = statuses();
+      expect(byId['held-1']).toBe('superseded');
+      const own = getDeployTracker().getEpisodes(appName).find((e) => e.deployId !== 'held-1')!;
+      expect(own.status).toBe('failed');
+      expect(getDeployDetailStore().getDetail(own.deployId)?.errorCode).toBe('DEPLOY_REFUSED');
+      expect(getDeployDetailStore().getDetail('held-1')).toBeUndefined();
+    });
+
+    it('the post-wait guardrail refusal gets its own episode too', async () => {
+      leaveOpen();
+      jest.spyOn(p(), 'checkGuardrails').mockReturnValue({ allowed: false, failures: 3, retryAfterSeconds: 9 });
+      const out = await p().redeployApp(appName, actor);
+      expect(out.refused.code).toBe('RATE_LIMITED');
+      const byId = statuses();
+      expect(byId['held-1']).toBe('superseded');
+      expect(Object.values(byId).filter((st) => st === 'failed')).toHaveLength(1);
+    });
+
+    it('a slot wait that throws gets its own episode', async () => {
+      leaveOpen();
+      p().builder.reserveSlot.mockRejectedValue(new Error('slot wait blew up'));
+      await expect(p().redeployApp(appName, actor)).rejects.toThrow('slot wait blew up');
+      const byId = statuses();
+      expect(byId['held-1']).toBe('superseded');
+      expect(Object.values(byId).filter((st) => st === 'failed')).toHaveLength(1);
+    });
+
+    it('without newEpisode an open episode still takes the failure (the anonymous path is unchanged)', () => {
+      leaveOpen();
+      p().failDeployEpisode(appName, new Error('boom'), 'anon-1');
+      expect(statuses()['held-1']).toBe('failed');
+    });
+  });
+
+  describe('the monorepo group guards', () => {
+    const containerName = 'g-container';
+    let containerPath: string;
+
+    beforeEach(() => {
+      containerPath = path.join(tempDir, 'apps', containerName);
+      fs.mkdirSync(containerPath, { recursive: true });
+      fs.writeFileSync(path.join(containerPath, 'drop.yaml'), 'services:\n  web:\n    path: web\n    type: static\n');
+      const container = { name: containerName, group: 'g', isGroupContainer: true, status: 'running', path: containerPath };
+      appState = { ...appState, group: 'g' };
+      allApps = [container, appState];
+      p().stateManager.getApp.mockImplementation((n: string) => allApps!.find((a: any) => a.name === n));
+    });
+
+    it('an explicit update to a service is dropped while its container is busy, but the expansion\'s own call passes', async () => {
+      p().appsInProgress.add(containerName);
+      expect(await p().handleAppUpdate(appName, appPath, 'upload deploy', true)).toBe(false);
+      expect(p().builder.reserveSlot).not.toHaveBeenCalled();
+
+      // expandMonorepo holds the container's claim and updates each child with this reason.
+      expect(await p().handleAppUpdate(appName, appPath, 'monorepo re-expansion', true)).toBe(true);
+      expect(p().builder.build).toHaveBeenCalledTimes(1);
+    });
+
+    it('the watcher\'s interception does not expand a container while a service is busy', async () => {
+      const expand = jest.spyOn(p(), 'expandMonorepo').mockResolvedValue(undefined);
+      const payload = { name: containerName, path: containerPath, timestamp: new Date() };
+      p().appsInProgress.add(appName); // a service is being redeployed
+      await p().handleAppDetected(payload);
+      expect(expand).not.toHaveBeenCalled();
+
+      p().appsInProgress.delete(appName);
+      await p().handleAppDetected(payload);
+      expect(expand).toHaveBeenCalledTimes(1);
+    });
+
+    it('an explicit re-expansion dropped by the guard is recorded as a failed deploy', async () => {
+      jest.spyOn(p(), 'expandMonorepo').mockResolvedValue(undefined);
+      p().appsInProgress.add(appName);
+      expect(await p().handleAppUpdate(containerName, containerPath, 'upload deploy', true)).toBe(false);
+      const [episode] = getDeployTracker().getEpisodes(containerName);
+      expect(episode.status).toBe('failed');
+      expect(getDeployDetailStore().getDetail(episode.deployId)?.errorCode).toBe('DEPLOY_REFUSED');
     });
   });
 });

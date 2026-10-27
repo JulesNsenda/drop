@@ -346,10 +346,10 @@ export class ApiServer {
 
     // An explicit redeploy waits for a builder slot and runs a full install
     // and build, so it gets its own bucket too, registered unconditionally. One
-    // handler depth today (POST /apps/:name/redeploy); the follow handle's
-    // GET /apps/:name/redeploy/:handle adds a second path form and must be
-    // registered here when it lands. Named param, like the share routes, so a
-    // request is counted once.
+    // handler depth (POST /apps/:name/redeploy; what it hands back to follow is
+    // the existing GET /deploys/stream, under its own routes). A named param,
+    // like the share routes, so a request is counted once. A second path form
+    // under /redeploy would need registering here as well.
     v1.use('/apps/:name/redeploy', redeployRateLimitMiddleware());
 
     // The hosted MCP endpoint gets its own bucket (PRD-040), also registered

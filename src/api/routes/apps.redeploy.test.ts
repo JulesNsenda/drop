@@ -10,6 +10,8 @@
  */
 
 import * as path from 'path';
+import { Hono } from 'hono';
+import appsRoutes from './apps';
 import { createUser, createApiKey } from '../middleware/auth';
 import { getTestToken } from '../__testutils__/auth';
 import { createTestApiServer, teardownTestApiServer, type TestApiServer } from '../__testutils__/api-server';
@@ -129,14 +131,40 @@ describe('POST /apps/:name/redeploy', () => {
       expect(new Date(json.data.acceptedAt).getTime()).toBeLessThanOrEqual(atStart);
     });
 
-    it("makes ONE call, with the one actor and the caller's token standing as options", async () => {
+    it('makes ONE call, with the one actor', async () => {
       await redeploy('site', bearer(ownerToken));
       expect(ops.redeployApp).toHaveBeenCalledTimes(1);
-      const [name, actor, options] = (ops.redeployApp as jest.Mock).mock.calls[0];
+      const [name, actor, ...rest] = (ops.redeployApp as jest.Mock).mock.calls[0];
       expect(name).toBe('site');
       expect(actor).toMatchObject({ actorUserId: ownerId, agent: false });
       expect(actor.principalId).toBeDefined();
-      expect(options).toEqual({ caller: { admin: false, userId: ownerId } });
+      expect(rest).toEqual([]);
+    });
+
+    it('gives a scope-only caller (role none) the facts and no follow link: it cannot read /deploys', async () => {
+      // Never reaches the handler through the real role floor, so the route is
+      // mounted bare under an injected auth context.
+      const bare = new Hono();
+      bare.use('*', async (c, next) => {
+        (c.set as Function)('auth', {
+          userId: ownerId,
+          username: 'agent',
+          role: 'none',
+          kind: 'agent',
+          scopes: ['app:site:deploy'],
+          authMethod: 'apikey',
+          principalId: 'p-1',
+        });
+        await next();
+      });
+      bare.route('/apps', appsRoutes);
+
+      const res = await bare.request('/apps/site/redeploy', { method: 'POST' });
+      expect(res.status).toBe(202);
+      const json = await body(res);
+      expect(json.data.deployId).toBe('11111111-2222-4333-8444-555555555555');
+      expect(json.data.acceptedAt).toBeDefined();
+      expect(json.data.follow).toBeUndefined();
     });
 
     it('marks an agent token as an agent', async () => {
@@ -165,6 +193,7 @@ describe('POST /apps/:name/redeploy', () => {
   describe('refusals', () => {
     const cases: Array<[RedeployRefusal['code'], number, string]> = [
       ['NOT_FOUND', 404, 'NOT_FOUND'],
+      ['APP_SOURCE_MISSING', 409, 'APP_SOURCE_MISSING'],
       ['APP_BUSY', 409, 'APP_BUSY'],
       ['REDEPLOY_NOT_SUPPORTED_YET', 409, 'REDEPLOY_NOT_SUPPORTED_YET'],
       ['APP_STOPPED', 409, 'APP_STOPPED'],

@@ -85,6 +85,8 @@ describe('POST /apps/:name/redeploy, followed', () => {
 
   beforeEach(async () => {
     process.env.DROP_MIN_FREE_DISK_MB = '500';
+    // A short wait, so "held past the wait" does not take ten seconds.
+    process.env.DROP_REDEPLOY_START_WAIT_MS = '80';
     t = await createTestApiServer({ port: 3113, tempPrefix: 'drop-redeploy-integration-', activityLog: true });
     resetDeployTracker();
     resetDeployBreaker();
@@ -151,8 +153,7 @@ describe('POST /apps/:name/redeploy, followed', () => {
 
     setPlatformOps(
       makePlatformOpsStub({
-        // A short wait, so "held past the wait" does not take ten seconds.
-        redeployApp: (name, actor, options) => p().redeployApp(name, actor, { ...options, waitMs: 80 }),
+        redeployApp: (name, actor) => p().redeployApp(name, actor),
         isGroupBusy: (name: string) => p().isGroupBusy(name),
       })
     );
@@ -160,6 +161,7 @@ describe('POST /apps/:name/redeploy, followed', () => {
 
   afterEach(async () => {
     delete process.env.DROP_MIN_FREE_DISK_MB;
+    delete process.env.DROP_REDEPLOY_START_WAIT_MS;
     resetPlatformOps();
     resetPrincipalQuota();
     unsub();
@@ -197,6 +199,31 @@ describe('POST /apps/:name/redeploy, followed', () => {
     const end = events[events.length - 1];
     expect(end).toMatchObject({ event: 'end', data: { status: 'succeeded' } });
     expect(p().builder.build).toHaveBeenCalledTimes(1);
+  });
+
+  it('an app held for promotion (its episode left open): the refusal gets its OWN failed episode on the follow', async () => {
+    // The held deploy: started, built, never closed (nothing is serving it yet).
+    eventBus.publish('build:started', { appId: appName, buildId: 'held-b', deployId: 'held-1' });
+    await getStateManager().updateApp(appName, { awaitingPromotion: true });
+
+    let freeSlot!: () => void;
+    slotGate = new Promise<void>((resolve) => (freeSlot = resolve));
+    afterSlot = () => jest.spyOn(p(), 'isQuiesced').mockReturnValue(true);
+
+    const res = await post();
+    const json = (await res.json()) as any;
+    expect(json.data.accepted).toBe(true);
+
+    const following = readAll(await follow(json.data.follow));
+    setTimeout(freeSlot, 100);
+    const events = await following;
+
+    const end = events[events.length - 1];
+    expect(end).toMatchObject({ event: 'end', data: { status: 'failed' } });
+    expect(end.data.deployId).not.toBe('held-1');
+    // The held episode was superseded, not marked failed in the refusal's place.
+    const held = getDeployTracker().getEpisodes(appName).find((e) => e.deployId === 'held-1')!;
+    expect(held.status).toBe('superseded');
   });
 
   it('a refusal after the wait shows up as a failed deploy on the follow', async () => {

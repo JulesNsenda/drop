@@ -13,7 +13,7 @@ import { pipeline } from 'stream/promises';
 import { success, error, ErrorCodes, AppDto, CreateAppDto } from '../types';
 import { NotFoundError, ValidationError } from '../middleware/error';
 import { AuthContext, listUsers, getUserById } from '../middleware/auth';
-import { canAccess, canAccessScoped, interactiveSessionOnly, tokenCallerOf } from '../access';
+import { canAccess, canAccessScoped, interactiveSessionOnly } from '../access';
 import { isValidAppName, validateAppName } from '../middleware/validate';
 import { getAppRuntime } from '../../managers/runtime';
 import {
@@ -1288,6 +1288,8 @@ apps.post('/:name/restart', async c => {
 /** Status and API code for each way an explicit redeploy can be refused. */
 const REDEPLOY_REFUSALS: Record<RedeployRefusalCode, { status: 404 | 409 | 429 | 503 | 507; code: string }> = {
   NOT_FOUND: { status: 404, code: ErrorCodes.NOT_FOUND },
+  // The app exists but its folder does not: a conflict with the app's state, not an unknown app (404).
+  APP_SOURCE_MISSING: { status: 409, code: 'APP_SOURCE_MISSING' },
   APP_BUSY: { status: 409, code: 'APP_BUSY' },
   REDEPLOY_NOT_SUPPORTED_YET: { status: 409, code: 'REDEPLOY_NOT_SUPPORTED_YET' },
   APP_STOPPED: { status: 409, code: 'APP_STOPPED' },
@@ -1339,15 +1341,20 @@ apps.post('/:name/redeploy', async c => {
 
   // One operation: the platform reserves, admits (with the one actor, for the
   // guardrail keys and the stopped rule alike) and starts.
-  const result = await ops.redeployApp(name, deployActorOf(auth), { caller: tokenCallerOf(auth) });
+  const result = await ops.redeployApp(name, deployActorOf(auth));
   if ('refused' in result) return redeployRefusalResponse(c, result.refused);
 
   await logActivityFor(auth, { action: 'redeploy', appName: name, detail: 'files' });
-  const follow = `/api/v1/deploys/stream?app=${encodeURIComponent(name)}&since=${encodeURIComponent(acceptedAt)}`;
+  // A scope-only caller (role 'none') cannot read /deploys at all (its floor is
+  // 'readonly'), so a URL into it would only 403: it gets the facts and no link.
+  const follow =
+    auth?.role === 'none'
+      ? undefined
+      : `/api/v1/deploys/stream?app=${encodeURIComponent(name)}&since=${encodeURIComponent(acceptedAt)}`;
   if ('accepted' in result) {
-    return c.json(success({ accepted: true, acceptedAt, follow }), 202);
+    return c.json(success({ accepted: true, acceptedAt, ...(follow ? { follow } : {}) }), 202);
   }
-  return c.json(success({ deployId: result.started, acceptedAt, follow }), 202);
+  return c.json(success({ deployId: result.started, acceptedAt, ...(follow ? { follow } : {}) }), 202);
 });
 
 // ============ Rollback (#296) ============
