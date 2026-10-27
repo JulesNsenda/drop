@@ -20,6 +20,7 @@ describe('handleConfigureRoute: dashboard custom domain (#302)', () => {
   let addRoute: jest.Mock;
   let removeRoute: jest.Mock;
   let hasRoute: jest.Mock;
+  let getRoute: jest.Mock;
   let updateSystemConfig: jest.Mock;
   let owners: Map<string, string>;
 
@@ -55,9 +56,13 @@ describe('handleConfigureRoute: dashboard custom domain (#302)', () => {
     addRoute = jest.fn().mockResolvedValue(undefined);
     removeRoute = jest.fn().mockResolvedValue(undefined);
     hasRoute = jest.fn().mockReturnValue(true);
+    // pruneRoute removes only a route this app owns, for the hostname it names.
+    getRoute = jest.fn((key: string) =>
+      key === 'site-old-example-com' ? { owner: 'site', hostname: 'old.example.com' } : undefined
+    );
     updateSystemConfig = jest.fn().mockResolvedValue(undefined);
     owners = new Map([['site.dropkit.sh', 'site']]);
-    internals().router = { addRoute, removeRoute, hasRoute };
+    internals().router = { addRoute, removeRoute, hasRoute, getRoute };
     internals().caddyServer = undefined;
   });
 

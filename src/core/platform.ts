@@ -10,7 +10,7 @@ import * as fs from 'fs/promises';
 import * as yaml from 'yaml';
 import * as crypto from 'crypto';
 import { EventBus, eventBus, Unsubscribe, AppDeletedPayload, AppDetectedPayload } from './event-bus';
-import { isReservedHost } from '../utils/reserved-hosts';
+import { platformHostProblem, platformHostWarning } from '../utils/reserved-hosts';
 import { isValidEnvVarName } from '../utils/env-var-names';
 import { getPublicUrl } from '../api/runtime-config';
 import type { DeployFailureReason } from './event-bus/event-bus.types';
@@ -1127,6 +1127,8 @@ export class DropPlatform {
 
       // Initialize services
       await this.initializeServices();
+
+      this.warnPlatformHostConfig();
 
       // In docker mode, stop any PM2-managed apps before the watcher starts so
       // containers can bind to the same ports without conflict.
@@ -5676,6 +5678,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       // hostname (never filtered), so it stays reachable even if every custom
       // domain is refused.
       let acceptedCustomDomains: string[] = [];
+      const refusedHostnames: string[] = [];
       if (hasCustomDomains && this.appConfigService) {
         const owners = this.appConfigService.getDomainOwners(domainSuffix);
         acceptedCustomDomains = domains.filter((d) => {
@@ -5684,11 +5687,18 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           // claiming it gets a Caddy block for DROP's hostname pointing at
           // their app, which serves DROP's OAuth and MCP endpoints: a victim's
           // control-plane token delivered straight to a tenant.
-          if (isReservedHost(d, getPublicUrl(), domainSuffix)) {
-            this.logger.warn(
-              `Refusing domain '${d}' for ${appName}: reserved by the platform`,
-              'ROUTER'
-            );
+          //
+          // The same rule also covers a name UNDER the public host: it is
+          // same-site with the platform, so a code or token minted for the
+          // platform's host can be delivered to it.
+          //
+          // Known gap, left for the maintainer: a tenant may still declare a
+          // name under the DOMAIN SUFFIX (another app's future default
+          // hostname). That is a product decision, not refused here.
+          const problem = platformHostProblem(d, { publicUrl: getPublicUrl(), domainSuffix });
+          if (problem) {
+            this.logger.warn(`Refusing domain '${d}' for ${appName}: ${problem}`, 'ROUTER');
+            refusedHostnames.push(d);
             return false;
           }
           const owner = owners.get(d.toLowerCase());
@@ -5702,6 +5712,8 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           return true;
         });
         domains = acceptedCustomDomains.length > 0 ? acceptedCustomDomains : [defaultHostname];
+        // A refused name that was routed before this rule must stop being served.
+        for (const hostname of refusedHostnames) await this.pruneRoute(appName, hostname);
 
         // Persist only the accepted domains as the source of truth — never the
         // raw, possibly-hijacking request.
@@ -5735,7 +5747,19 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           // Same ownership rule as drop.yaml domains. Verification already
           // refused a claimed domain; this catches a claim made since.
           const owner = this.appConfigService?.getDomainOwners(domainSuffix).get(verified);
-          if (owner && owner !== appName) {
+          const problem = platformHostProblem(verifiedCustom.domain, {
+            publicUrl: getPublicUrl(),
+            domainSuffix,
+          });
+          if (problem) {
+            // Verified before this rule existed. Withdraw its route and
+            // verification (AppState.customDomain itself is left as set).
+            this.logger.warn(
+              `Refusing custom domain '${verifiedCustom.domain}' for ${appName}: ${problem}`,
+              'ROUTER'
+            );
+            await this.dropCustomDomainRoute(appName, verifiedCustom.domain);
+          } else if (owner && owner !== appName) {
             this.logger.warn(
               `Refusing custom domain '${verifiedCustom.domain}' for ${appName}: already claimed by '${owner}'`,
               'ROUTER'
@@ -5816,16 +5840,20 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       // used as-is. Both paths land here: an app named e.g. `dashboard`
       // would otherwise get a Caddy block for the platform's own host
       // unconditionally, with no drop.yaml `domains:` required to trigger it.
+      const finalRefused: string[] = [];
       const routableDomains = domains.filter((hostname) => {
-        if (isReservedHost(hostname, getPublicUrl(), domainSuffix)) {
+        const problem = platformHostProblem(hostname, { publicUrl: getPublicUrl(), domainSuffix });
+        if (problem) {
           this.logger.warn(
-            `Refusing route for ${appName}: hostname '${hostname}' is reserved by the platform`,
+            `Refusing route for ${appName}: hostname '${hostname}' is ${problem}`,
             'ROUTER'
           );
+          finalRefused.push(hostname);
           return false;
         }
         return true;
       });
+      for (const hostname of finalRefused) await this.pruneRoute(appName, hostname);
       if (routableDomains.length === 0) {
         this.logger.warn(
           `App '${appName}' has no routable hostname (every candidate is reserved by the ` +
@@ -6188,7 +6216,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
   private gateRoutableHostnames(hostnames: string[], suffix: string): string[] {
     return hostnames.filter(
       (hostname) =>
-        !isReservedHost(hostname, getPublicUrl(), suffix) &&
+        !platformHostProblem(hostname, { publicUrl: getPublicUrl(), domainSuffix: suffix }) &&
         this.config.enableHttps &&
         !isLocalhostDomain(hostname)
     );
@@ -7738,18 +7766,37 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     return false;
   }
 
+  /** One boot-time warning when the public host cannot be protected from tenant names. */
+  private warnPlatformHostConfig(): void {
+    const warning = platformHostWarning(getPublicUrl(), this.config.domainSuffix);
+    if (warning) this.logger.warn(warning, 'SECURITY');
+  }
+
+  /**
+   * Remove the live route for a hostname the app is no longer allowed to serve.
+   *
+   * The route key is `${app}-${host with dots as dashes}` and app names may
+   * contain '-', so two apps can share a key (`behalf-behalf` on `dropkit.sh`
+   * and `behalf` on `behalf.dropkit.sh`). The key alone therefore proves
+   * nothing: only a route this app owns, on exactly this hostname, is removed.
+   */
+  private async pruneRoute(appName: string, hostname: string): Promise<void> {
+    const routeKey = `${appName}-${hostname.replace(/\./g, '-')}`;
+    const route = this.router?.getRoute(routeKey);
+    if (!route || route.owner !== appName) return;
+    if (route.hostname?.toLowerCase() !== hostname.toLowerCase()) return;
+    await this.router?.removeRoute(routeKey).catch((err) =>
+      this.logger.warn(`Could not remove the route for '${hostname}'`, 'ROUTER', err)
+    );
+  }
+
   /**
    * Forget a verified custom domain (#302) and remove the route it had, if
    * any. Used when the app's domain no longer matches what was verified.
    * Best-effort: a route that is already gone is not an error.
    */
   private async dropCustomDomainRoute(appName: string, domain: string): Promise<void> {
-    const routeKey = `${appName}-${domain.replace(/\./g, '-')}`;
-    if (this.router?.hasRoute(routeKey)) {
-      await this.router.removeRoute(routeKey).catch((err) =>
-        this.logger.warn(`Could not remove the route for '${domain}'`, 'ROUTER', err)
-      );
-    }
+    await this.pruneRoute(appName, domain);
     await this.appConfigService
       ?.updateSystemConfig(appName, { customDomainVerified: undefined })
       .catch(() => undefined);
