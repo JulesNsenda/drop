@@ -357,7 +357,7 @@ describe('principalId', () => {
       // Stamps are second-granular: a token minted in the same second would
       // also predate the stamp.
       await new Promise((r) => setTimeout(r, 1100));
-      const fresh = await mintOAuthAccessToken(getUserById(user.id)!, AUD, 'sid-demote-2');
+      const fresh = await mintOAuthAccessToken(user, AUD, 'sid-demote-2');
       expect((await verifyOAuthAccessToken(fresh, AUD))?.role).toBe('readonly');
     });
 
