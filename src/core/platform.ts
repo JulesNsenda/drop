@@ -36,7 +36,6 @@ import {
 import { getProcfileWebCommand } from './detector/procfile';
 import { BuilderService, getBuilder, resetBuilder } from './builder';
 import { RouterService, RouteConflictError, getRouterService, resetRouterService } from './router';
-import { resolveGitBackedName } from './git-backed';
 import { AppRuntime, AppProcessInfo, AppStartSpec, getAppRuntime, resetAppRuntime } from '../managers/runtime';
 import {
   instanceName,
@@ -84,11 +83,15 @@ import { CaddyServer, getCaddyServer, resetCaddyServer } from '../managers/route
 import { SecretManager, getSecretManager, resetSecretManager } from '../managers/secret';
 import { WebhookManager, getWebhookManager, resetWebhookManager } from './webhooks';
 import { gitManifestDir, gitManifestPath } from './git-deploy/land';
+import type { TokenCaller } from './git-deploy/git-deploy.types';
+import { resolveGitBackedName } from './git-backed';
 import {
   GitDeployService,
   getGitDeployService,
   resetGitDeployService,
   gitCheckoutCaps,
+  deployActorOfInfo,
+  publishRedeployUpdate,
 } from './git-deploy';
 import { UploadDeployService, getUploadDeployService, resetUploadDeployService } from './upload-deploy';
 import { getActivityLog, resetActivityLog } from '../managers/activity';
@@ -839,8 +842,9 @@ interface AdmittedUpdate {
  * hands the claim to the build and returns the callback that gives it back,
  * after which `release` is a no-op (null when it was already consumed,
  * released or replaced). `beginLand` marks the span in which a git deploy is
- * writing the folder (`gitReserved`; `release` clears it); a files redeploy
- * never does.
+ * writing the folder (`gitReserved`; `release` clears it) and `endLand` ends
+ * it while the hold goes on - a redeploy that lands then builds under the same
+ * hold, and its own marker would refuse that build; a files redeploy never marks.
  */
 interface PlatformHold {
   readonly app: string;
@@ -849,6 +853,7 @@ interface PlatformHold {
   release(): void;
   consume(): (() => void) | null;
   beginLand(): void;
+  endLand(): void;
 }
 
 /** What acquireSlotAndRecheck hands to buildAndSwap: the build slot, which the caller then owns. */
@@ -1808,6 +1813,9 @@ export class DropPlatform {
       beginLand: () => {
         if (!consumed && owns()) this.gitReserved.add(name);
       },
+      endLand: () => {
+        if (!consumed && owns()) this.gitReserved.delete(name);
+      },
     };
   }
 
@@ -2532,7 +2540,7 @@ backup:
       restartApp: (name) => this.restartApp(name),
       isAppInProgress: (name) => this.isBusy(name),
       tryReserveApp: (name) => this.tryReserveApp(name),
-      redeployApp: (name, actor) => this.redeployApp(name, actor),
+      redeployApp: (name, actor, options) => this.redeployApp(name, actor, options),
       isGroupBusy: (name) => this.isGroupBusy(name),
       hasLiveBuildContainer: (name) => this.hasLiveBuildContainer(name),
       objectStorageDeleteRisk: (name) => this.objectStorageDeleteRisk(name),
@@ -7488,86 +7496,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     const containerYaml = await parseDropYaml(appPath);
     if (isMonorepoContainer(containerYaml)) {
       if (bypassCooldown) {
-        // GUARDRAIL. This branch RETURNS below, above the gate on the ordinary
-        // rebuild path, and expandMonorepo is one of the most expensive things
-        // on the box: a git pull plus an fs.rm/fs.cp of every child tree plus a
-        // build per service. Whether an app takes this branch is decided by the
-        // caller's own drop.yaml (`services:`), so leaving it ungated let any
-        // caller opt into an unmetered build loop.
-        //
-        // Re-checked HERE, synchronously, because parseDropYaml above awaited:
-        // two explicit updates can both pass the early in-progress skip and then
-        // both reach this add. Nothing may await between this check and the add.
-        // The other two early skips are stale for the same reason: a backup
-        // quiesce, a git pull or an upload can begin during that await, and
-        // nothing has been reserved yet.
-        if (this.inProgressSkip(appName, bypassCooldown)) return false;
-        if (this.isQuiesced()) {
-          this.logger.info(
-            `Deferring update for ${appName} — deploys are quiesced for a backup`,
-            'BACKUP'
-          );
-          return false;
-        }
-        if (this.gitDeployService?.isCloning(appName) || this.uploadDeployService?.isUploading(appName)) {
-          this.logger.info(
-            `Dropped redeploy for ${appName} - a git pull/upload began while reading its drop.yaml`,
-            'UPDATE'
-          );
-          return false;
-        }
-        // Re-expansion fs.rm/fs.cp's every child's folder. A child that is
-        // being rebuilt or redeployed (or a group being torn down) must not have
-        // its tree rewritten under it; the update is dropped, and the next
-        // explicit redeploy of the group re-expands.
-        if (this.isGroupBusy(appName)) {
-          this.logger.info(
-            `Dropped redeploy for ${appName} - a service of its monorepo group is busy`,
-            'MONOREPO'
-          );
-          // An explicit re-expansion that is dropped is a deploy the caller is
-          // following: it gets a failed one, not silence.
-          this.failDeployEpisode(
-            appName,
-            new Error(`a service of the monorepo group '${appName}' is busy; retry once it settles`),
-            crypto.randomUUID(),
-            'DEPLOY_REFUSED',
-            undefined,
-            { newEpisode: true }
-          );
-          return false;
-        }
-        const containerKeys = this.guardrailKeys(appName, false, actor ?? {});
-        const containerVerdict = this.checkGuardrails(containerKeys);
-        if (!containerVerdict.allowed) {
-          const refusal =
-            `Too many failed deploys (${containerVerdict.failures}). ` +
-            `Retry in ${containerVerdict.retryAfterSeconds}s.`;
-          this.logger.warn(`Re-expansion of '${appName}' refused by guardrail: ${refusal}`, 'MONOREPO');
-          this.releaseGuardrailKeys(appName);
-          this.failDeployEpisode(appName, new Error(refusal), crypto.randomUUID(), 'GUARDRAIL_TRIPPED');
-          return false;
-        }
-        this.breakerKeys.set(appName, containerKeys);
-
-        this.logger.info(`Re-expanding monorepo container '${appName}' (explicit redeploy)`, 'MONOREPO');
-        // Same in-progress bracket as the app:detected interception: blocks a
-        // concurrent DELETE (409) and re-entrant updates while child folders
-        // are re-materialized out from under running apps.
-        if (this.isBusy(appName)) {
-          this.releaseGuardrailKeys(appName);
-          return false;
-        }
-        this.appsInProgress.add(appName);
-        try {
-          await this.expandMonorepo(appPath, appName, containerYaml.config, actor);
-          this.recordDeployOutcome(appName, true);
-        } catch (err) {
-          this.recordDeployOutcome(appName, false);
-          throw err;
-        } finally {
-          this.appsInProgress.delete(appName);
-        }
+        await this.reExpandContainer(appName, appPath, containerYaml.config, actor);
       } else {
         this.logger.debug(
           `Skipping update for monorepo container '${appName}' - not a buildable app`,
@@ -7735,29 +7664,40 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
   }
 
   /**
-   * Redeploy an app explicitly (POST /apps/:name/redeploy): rebuild the files
-   * it already has. ONE operation, and the reservation never leaves it:
+   * Redeploy an app explicitly (POST /apps/:name/redeploy): ONE operation, and
+   * the reservation never leaves it:
    *
    *  1. take the app's slot (a hold), synchronously;
-   *  2. under it, check the app is a files app and may be rebuilt (see
-   *     checkRedeployable). Git-backed apps and monorepo groups are refused
-   *     here for now: the git path will land the repository under this same
-   *     hold, by class;
-   *  3. the last admission step: ONE admitDeploy, charged to the caller's quota
-   *     whatever becomes of the request (the quota counts volume, not outcome),
-   *     with nothing awaited between it and the hold being consumed - so a hold
-   *     that was lost is found out BEFORE the charge, not after;
-   *  4. consume the hold, set the breaker keys (their lifetime is the hold's)
-   *     and start, waiting up to DROP_REDEPLOY_START_WAIT_MS for a builder slot;
-   *  5. in time: `started`; otherwise `accepted`, and the start carries on in
-   *     the background - a refusal after the wait then closes a failed episode
-   *     (DEPLOY_REFUSED), because nobody is left to be told.
+   *  2. under it, check the app may be rebuilt (see checkRedeployable) and
+   *     classify it: git-backed (its own gitSource), a monorepo container, or a
+   *     plain app. Every refusal so far is returned directly, uncharged;
+   *  3. ONE admitDeploy, charged to the caller's quota whatever becomes of the
+   *     request (the quota counts volume, not outcome). For a plain app it is
+   *     the last step, with nothing awaited between it and the hold being
+   *     consumed - so a hold that was lost is found out BEFORE the charge. A
+   *     git-backed app is charged BEFORE its clone, as git's own redeploy is:
+   *     charged after, a caller over quota would get a free clone every time;
+   *  4. a plain app: consume the hold, set the breaker keys (their lifetime is
+   *     the hold's) and start, waiting up to DROP_REDEPLOY_START_WAIT_MS for a
+   *     builder slot. In time: `started`; otherwise `accepted`, and the start
+   *     carries on in the background - a refusal after the wait then closes a
+   *     failed episode (DEPLOY_REFUSED), because nobody is left to be told;
+   *  5. a git-backed app or a container does NOT run inside the request: the
+   *     answer is `accepted` (`group` for a container) as soon as admission
+   *     passes, and continueRedeploy carries on under the same hold - land,
+   *     re-classify (the landed drop.yaml may now declare `services:`), then
+   *     either re-expand the group or build. Whatever goes wrong there is
+   *     recorded as a failed deploy the caller can follow.
    *
-   * The hold is released in the finally until step 4 consumes it, so every
-   * earlier exit gives the slot back exactly once and leaves no key behind.
-   * Authorization is the caller's.
+   * The hold is released in the finally until step 4 consumes it or step 5
+   * takes it over, so every earlier exit gives the slot back exactly once and
+   * leaves no key behind. Authorization is the caller's.
    */
-  private async redeployApp(appName: string, actor: DeployActorInfo): Promise<RedeployStart> {
+  private async redeployApp(
+    appName: string,
+    actor: DeployActorInfo,
+    options: { caller?: TokenCaller | null } = {}
+  ): Promise<RedeployStart> {
     if (!this.runtime || !this.stateManager || !this.detector || !this.builder) {
       return redeployRefusal('SERVICE_UNAVAILABLE', 'The platform is not ready to deploy');
     }
@@ -7767,10 +7707,11 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         ? redeployRefusal('SERVICE_UNAVAILABLE', 'Deploys are paused for a backup; retry shortly')
         : redeployRefusal('APP_BUSY', `Application '${appName}' is building or deploying - retry once it settles`);
     }
+    let handedOn = false;
     try {
       const checked = await this.checkRedeployable(appName, actor);
       if ('refused' in checked) return checked;
-      const appState = checked.appState;
+      const { appState, kind, isContainer } = checked;
 
       const lost = (): { refused: RedeployRefusal } =>
         redeployRefusal('APP_BUSY', `The reservation for '${appName}' is no longer held - retry the redeploy`);
@@ -7780,7 +7721,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       await getPrincipalQuota().initialize();
       if (!hold.held()) return lost();
       // ONE admission, with the one actor: the breaker and the quota, charged
-      // here, last, and followed at once by the consume.
+      // here, followed at once by the consume (a plain app) or the hand-over.
       try {
         await admitDeploy(appName, false, actor);
       } catch (error) {
@@ -7789,62 +7730,282 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         }
         throw error;
       }
+
+      if (kind !== 'files') {
+        handedOn = true;
+        void this.continueRedeploy(appName, appState, kind, actor, options.caller ?? null, hold).catch((error) =>
+          this.logger.error(`Redeploy of ${appName} failed`, 'UPDATE', error)
+        );
+        this.logger.info(`Explicit redeploy of ${appName} accepted (${kind}), carrying on in the background`, 'UPDATE');
+        return isContainer ? { group: { container: appName } } : { accepted: true };
+      }
+
       const releaseClaim = hold.consume();
       if (!releaseClaim) return lost();
+      return await this.startClaimedRedeploy(appName, actor, appState, releaseClaim, false);
+    } finally {
+      if (!handedOn) hold.release();
+    }
+  }
 
-      // Past this point the claim is the build's: nothing below may throw
-      // without giving it back, and the finally no longer can.
-      try {
-        this.breakerKeys.set(appName, this.guardrailKeys(appName, false, actor));
-        const admitted: AdmittedUpdate = {
-          appPath: this.sourcePathOf(appName),
-          statusAtEntry: appState.status,
-          appState,
-          wasRunning: appState.status === 'running',
-          originalPort: appState.port,
-          trigger: 'deploy',
-          groupGuard: true,
-          explicit: true,
-        };
-        const detached = { value: false };
-        const pending = this.runClaimedUpdate(appName, admitted, releaseClaim, (refused) => {
-          // The caller was answered `accepted` and is following the app: give
-          // it the refusal as a failed deploy (the guardrail refusal already
-          // closed its own). Keys first, so the failure is not charged.
-          if (!detached.value || refused.refused === 'guardrail') return;
-          this.releaseGuardrailKeys(appName);
-          this.failDeployEpisode(
-            appName,
-            new Error(redeployRefusalOf(appName, refused).refused.message),
-            crypto.randomUUID(),
-            'DEPLOY_REFUSED',
-            admitted.trigger,
-            { newEpisode: true }
-          );
-        });
-        const first = await this.within(pending, redeployStartWaitMs());
-        if (first === TIMED_OUT) {
-          detached.value = true;
-          pending.then(
-            (late) => {
-              if ('started' in late) this.logRedeployFailure(appName, late.done);
-            },
-            (error) => this.logger.error(`Redeploy of ${appName} failed before its build`, 'UPDATE', error)
-          );
-          this.logger.info(`Explicit redeploy of ${appName} accepted, waiting for a builder slot`, 'UPDATE');
-          return { accepted: true };
-        }
-        if ('refused' in first) return redeployRefusalOf(appName, first);
-        this.logger.info(`Explicit redeploy of ${appName} started (${first.started})`, 'UPDATE');
-        this.logRedeployFailure(appName, first.done);
-        return { started: first.started };
-      } catch (error) {
-        releaseClaim();
+  /**
+   * The start of an explicit redeploy, once its claim has been consumed: the
+   * claim is the build's from here, and nothing below may throw without giving
+   * it back. `background`: the caller has already been answered, so the start
+   * is not raced against the wait and every refusal is recorded as a failed
+   * deploy.
+   */
+  private async startClaimedRedeploy(
+    appName: string,
+    actor: DeployActorInfo,
+    appState: NonNullable<ReturnType<AppStateManager['getApp']>>,
+    releaseClaim: () => void,
+    background: boolean
+  ): Promise<RedeployStart> {
+    try {
+      this.breakerKeys.set(appName, this.guardrailKeys(appName, false, actor));
+      const admitted: AdmittedUpdate = {
+        appPath: this.sourcePathOf(appName),
+        statusAtEntry: appState.status,
+        appState,
+        wasRunning: appState.status === 'running',
+        originalPort: appState.port,
+        trigger: 'deploy',
+        groupGuard: true,
+        explicit: true,
+      };
+      const detached = { value: background };
+      const pending = this.runClaimedUpdate(appName, admitted, releaseClaim, (refused) => {
+        // The caller was answered `accepted` and is following the app: give
+        // it the refusal as a failed deploy (the guardrail refusal already
+        // closed its own). Keys first, so the failure is not charged.
+        if (!detached.value || refused.refused === 'guardrail') return;
         this.releaseGuardrailKeys(appName);
-        throw error;
+        this.failDeployEpisode(
+          appName,
+          new Error(redeployRefusalOf(appName, refused).refused.message),
+          crypto.randomUUID(),
+          'DEPLOY_REFUSED',
+          admitted.trigger,
+          { newEpisode: true }
+        );
+      });
+      const first = background ? await pending : await this.within(pending, redeployStartWaitMs());
+      if (first === TIMED_OUT) {
+        detached.value = true;
+        pending.then(
+          (late) => {
+            if ('started' in late) this.logRedeployFailure(appName, late.done);
+          },
+          (error) => this.logger.error(`Redeploy of ${appName} failed before its build`, 'UPDATE', error)
+        );
+        this.logger.info(`Explicit redeploy of ${appName} accepted, waiting for a builder slot`, 'UPDATE');
+        return { accepted: true };
       }
+      if ('refused' in first) return redeployRefusalOf(appName, first);
+      this.logger.info(`Explicit redeploy of ${appName} started (${first.started})`, 'UPDATE');
+      this.logRedeployFailure(appName, first.done);
+      return { started: first.started };
+    } catch (error) {
+      releaseClaim();
+      this.releaseGuardrailKeys(appName);
+      throw error;
+    }
+  }
+
+  /**
+   * The rest of a git-backed app's or a container's redeploy, run in the
+   * background under the hold redeployApp handed over (this releases it, unless
+   * a consume gave it to the build or the re-expansion). A git-backed app lands
+   * first, then both are classified again; a failure anywhere is a failed
+   * deploy under the app's name, and a throw is the terminal catch's to log.
+   *
+   * A hold that was lost (the platform stopped, say): after a land, the landed
+   * commit still has to build, so the update git's own redeploy always
+   * publishes is published; before one, the request is simply recorded as
+   * refused.
+   */
+  private async continueRedeploy(
+    appName: string,
+    appState: NonNullable<ReturnType<AppStateManager['getApp']>>,
+    kind: 'git' | 'container',
+    actor: DeployActorInfo,
+    caller: TokenCaller | null,
+    hold: PlatformHold
+  ): Promise<void> {
+    const refuse = (message: string): void =>
+      this.failDeployEpisode(appName, new Error(message), crypto.randomUUID(), 'DEPLOY_REFUSED', 'deploy', {
+        newEpisode: true,
+      });
+    try {
+      if (kind === 'git') await this.landForRedeploy(appName, appState, actor, caller, hold);
+      const appPath = this.sourcePathOf(appName);
+      const group = await this.groupClassOf(this.stateManager!.getApp(appName) ?? appState, appPath);
+      const parsed = group === 'container' ? await parseDropYaml(appPath) : undefined;
+
+      const releaseClaim = hold.consume();
+      if (!releaseClaim) {
+        if (kind === 'git') {
+          this.logger.warn(
+            `The reservation for '${appName}' was lost during its redeploy; publishing the update so the landed commit builds`,
+            'UPDATE'
+          );
+          publishRedeployUpdate(appName, appPath, deployActorOfInfo(actor));
+        } else {
+          refuse(`The reservation for '${appName}' was lost - retry the redeploy`);
+        }
+        return;
+      }
+      if (parsed) {
+        if (!isMonorepoContainer(parsed)) {
+          releaseClaim();
+          refuse(`'${appName}' is a monorepo container but its drop.yaml declares no services`);
+          return;
+        }
+        await this.reExpandContainer(appName, appPath, parsed.config, actor, releaseClaim);
+        return;
+      }
+      await this.startClaimedRedeploy(appName, actor, appState, releaseClaim, true);
     } finally {
       hold.release();
+    }
+  }
+
+  /**
+   * Re-expand a monorepo container's group (an EXPLICIT update to a container:
+   * a git pull refreshed it, the children are copies that must be
+   * re-materialized). Shared by handleAppUpdate's container branch, which takes
+   * its own claim, and by the explicit redeploy, which passes the claim it
+   * already holds as `held` (the callback that gives it back). Under `held`
+   * every refusal and failure is recorded as a failed deploy under the
+   * container's name, because the caller was answered and is following; the
+   * claim is given back exactly once, whichever way this ends.
+   */
+  private async reExpandContainer(
+    appName: string,
+    appPath: string,
+    config: DropYamlConfig,
+    actor: DeployActorInfo | undefined,
+    held?: () => void
+  ): Promise<void> {
+    let released = false;
+    const giveBack = (): void => {
+      if (held && !released) {
+        released = true;
+        held();
+      }
+    };
+    const refusedWhileHeld = (message: string, code: 'DEPLOY_REFUSED' | 'GUARDRAIL_TRIPPED' = 'DEPLOY_REFUSED'): void => {
+      if (!held) return;
+      this.releaseGuardrailKeys(appName);
+      this.failDeployEpisode(appName, new Error(message), crypto.randomUUID(), code, undefined, { newEpisode: true });
+    };
+    try {
+      // GUARDRAIL. This branch RETURNS below, above the gate on the ordinary
+      // rebuild path, and expandMonorepo is one of the most expensive things
+      // on the box: a git pull plus an fs.rm/fs.cp of every child tree plus a
+      // build per service. Whether an app takes this branch is decided by the
+      // caller's own drop.yaml (`services:`), so leaving it ungated let any
+      // caller opt into an unmetered build loop.
+      //
+      // Re-checked HERE, synchronously, because the caller's parseDropYaml
+      // awaited: two explicit updates can both pass the early in-progress skip
+      // and then both reach this add. Nothing may await between this check and
+      // the add. The other two early skips are stale for the same reason: a
+      // backup quiesce, a git pull or an upload can begin during that await, and
+      // nothing has been reserved yet. (Under `held` the claim is ours.)
+      if (!held && this.inProgressSkip(appName, true)) return;
+      if (this.isQuiesced()) {
+        this.logger.info(
+          `Deferring update for ${appName}  deploys are quiesced for a backup`,
+          'BACKUP'
+        );
+        refusedWhileHeld(`deploys are paused for a backup; retry the redeploy of '${appName}' shortly`);
+        return;
+      }
+      if (this.gitDeployService?.isCloning(appName) || this.uploadDeployService?.isUploading(appName)) {
+        this.logger.info(
+          `Dropped redeploy for ${appName} - a git pull/upload began while reading its drop.yaml`,
+          'UPDATE'
+        );
+        refusedWhileHeld(`a git pull or upload of '${appName}' began; retry once it settles`);
+        return;
+      }
+      // Re-expansion fs.rm/fs.cp's every child's folder. A child that is
+      // being rebuilt or redeployed (or a group being torn down) must not have
+      // its tree rewritten under it; the update is dropped, and the next
+      // explicit redeploy of the group re-expands.
+      if (this.isGroupBusy(appName)) {
+        this.logger.info(
+          `Dropped redeploy for ${appName} - a service of its monorepo group is busy`,
+          'MONOREPO'
+        );
+        // An explicit re-expansion that is dropped is a deploy the caller is
+        // following: it gets a failed one, not silence.
+        this.failDeployEpisode(
+          appName,
+          new Error(`a service of the monorepo group '${appName}' is busy; retry once it settles`),
+          crypto.randomUUID(),
+          'DEPLOY_REFUSED',
+          undefined,
+          { newEpisode: true }
+        );
+        return;
+      }
+      const containerKeys = this.guardrailKeys(appName, false, actor ?? {});
+      const containerVerdict = this.checkGuardrails(containerKeys);
+      if (!containerVerdict.allowed) {
+        const refusal =
+          `Too many failed deploys (${containerVerdict.failures}). ` +
+          `Retry in ${containerVerdict.retryAfterSeconds}s.`;
+        this.logger.warn(`Re-expansion of '${appName}' refused by guardrail: ${refusal}`, 'MONOREPO');
+        this.releaseGuardrailKeys(appName);
+        this.failDeployEpisode(
+          appName,
+          new Error(refusal),
+          crypto.randomUUID(),
+          'GUARDRAIL_TRIPPED',
+          undefined,
+          held ? { newEpisode: true } : undefined
+        );
+        return;
+      }
+      this.breakerKeys.set(appName, containerKeys);
+
+      this.logger.info(`Re-expanding monorepo container '${appName}' (explicit redeploy)`, 'MONOREPO');
+      // Same in-progress bracket as the app:detected interception: blocks a
+      // concurrent DELETE (409) and re-entrant updates while child folders
+      // are re-materialized out from under running apps.
+      if (!held) {
+        if (this.isBusy(appName)) {
+          this.releaseGuardrailKeys(appName);
+          return;
+        }
+        this.appsInProgress.add(appName);
+      }
+      try {
+        await this.expandMonorepo(appPath, appName, config, actor);
+        this.recordDeployOutcome(appName, true);
+      } catch (err) {
+        if (held) {
+          // Records the failure with the breaker as well (it owns the keys).
+          this.failDeployEpisode(
+            appName,
+            err instanceof Error ? err : new Error(String(err)),
+            crypto.randomUUID(),
+            undefined,
+            undefined,
+            { newEpisode: true }
+          );
+        } else {
+          this.recordDeployOutcome(appName, false);
+        }
+        throw err;
+      } finally {
+        if (!held) this.appsInProgress.delete(appName);
+      }
+    } finally {
+      giveBack();
     }
   }
 
@@ -7871,46 +8032,101 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     }
   }
 
-  /** What a folder is, for a redeploy: git-backed, a monorepo group, or plain files. */
-  private async redeployClassOf(
+  /**
+   * Land a git-backed app's repository for an explicit redeploy, under the
+   * caller's hold: the land is marked (so a watcher build is deferred, not
+   * dropped) and unmarked again before the hold goes on to build. A failure is
+   * a deploy the caller is following - a failed episode, counted by the breaker
+   * like any other failed deploy - and is rethrown; the hold is the caller's to
+   * release. The actor carries no token choice: the app's stored token is used.
+   */
+  private async landForRedeploy(
+    appName: string,
+    appState: NonNullable<ReturnType<AppStateManager['getApp']>>,
+    actor: DeployActorInfo,
+    caller: TokenCaller | null,
+    hold: PlatformHold
+  ): Promise<void> {
+    // This run supersedes a queued (webhook) redeploy of the app, as git's own does.
+    this.gitDeployService!.supersedeQueued(appName);
+    hold.beginLand();
+    try {
+      await this.gitDeployService!.landUnderHold(appState, deployActorOfInfo(actor), caller);
+    } catch (error) {
+      this.breakerKeys.set(appName, this.guardrailKeys(appName, false, actor));
+      this.failDeployEpisode(
+        appName,
+        error instanceof Error ? error : new Error(String(error)),
+        crypto.randomUUID(),
+        undefined,
+        'deploy',
+        { newEpisode: true }
+      );
+      throw error;
+    } finally {
+      hold.endLand();
+    }
+  }
+
+  /** Whether a folder is a monorepo container (by state, or by the drop.yaml it holds now) or plain files. */
+  private async groupClassOf(
     appState: NonNullable<ReturnType<AppStateManager['getApp']>>,
     appPath: string
-  ): Promise<'git' | 'container' | 'files'> {
-    if (resolveGitBackedName(appState, this.stateManager!)) return 'git';
+  ): Promise<'container' | 'files'> {
     if (appState.isGroupContainer || isMonorepoContainer(await parseDropYaml(appPath))) return 'container';
     return 'files';
   }
 
   /**
-   * redeployApp's checks, run under the hold: the app exists and is a files app
-   * (git-backed apps and monorepo groups are refused for now), nothing around it
-   * is busy, the stopped rule, and disk. The deploy admission (breaker and
-   * quota) is NOT here: it is the caller's last step, so a request refused for
-   * any of these is not counted. An ADMITTED request counts against the quota
-   * whatever becomes of it - the quota counts volume, not outcome (principal-quota).
+   * redeployApp's checks, run under the hold: the app exists and is not a
+   * service of a git-deployed group (its container is what holds the
+   * repository), a git-backed app has a git service and a valid recorded
+   * repository URL (checked HERE, before any charge), nothing around it is busy,
+   * the stopped rule (not for a monorepo container, which is never started), a
+   * files app still has its folder (a git app lands it again), and disk. Answers
+   * the class too. The deploy admission (breaker and quota) is NOT here: it is
+   * the caller's next step, so a request refused for any of these is not
+   * counted. An ADMITTED request counts against the quota whatever becomes of
+   * it - the quota counts volume, not outcome (principal-quota).
    */
   private async checkRedeployable(
     appName: string,
     actor: DeployActorInfo
   ): Promise<
-    { refused: RedeployRefusal } | { appState: NonNullable<ReturnType<AppStateManager['getApp']>> }
+    | { refused: RedeployRefusal }
+    | {
+        appState: NonNullable<ReturnType<AppStateManager['getApp']>>;
+        kind: 'git' | 'container' | 'files';
+        isContainer: boolean;
+      }
   > {
     const appState = this.stateManager!.getApp(appName);
     if (!appState) return redeployRefusal('NOT_FOUND', `Application '${appName}' not found`);
     const appPath = this.sourcePathOf(appName);
 
-    const kind = await this.redeployClassOf(appState, appPath);
-    if (kind === 'git') {
+    // A child of a git-deployed group holds no repository of its own, and its
+    // copy is rewritten by the container's next expansion: the route resolves a
+    // child to its container (and re-checks access on it). A direct caller is
+    // told, without naming the container (the group tag is tenant-influenced).
+    const owner = resolveGitBackedName(appState, this.stateManager!);
+    if (owner && owner !== appName) {
       return redeployRefusal(
-        'REDEPLOY_NOT_SUPPORTED_YET',
-        `Application '${appName}' is deployed from git; use POST /api/v1/git/redeploy/${appName}`
+        'REDEPLOY_VIA_CONTAINER',
+        `Application '${appName}' is a service of a git-deployed group; redeploy the group's container`
       );
     }
-    if (kind === 'container') {
-      return redeployRefusal(
-        'REDEPLOY_NOT_SUPPORTED_YET',
-        `Application '${appName}' is a monorepo group; redeploying a group is not supported here yet`
-      );
+
+    const isContainer = (await this.groupClassOf(appState, appPath)) === 'container';
+    const kind = appState.gitSource ? 'git' : isContainer ? 'container' : 'files';
+    if (kind === 'git') {
+      if (!this.gitDeployService?.isAvailable()) {
+        return redeployRefusal('SERVICE_UNAVAILABLE', 'git is not available on this system');
+      }
+      try {
+        this.gitDeployService.recordedCloneUrl(appState);
+      } catch (error) {
+        return redeployRefusal('INVALID_GIT_SOURCE', error instanceof Error ? error.message : String(error));
+      }
     }
     // A group being rewritten (a container's expansion) or a child being rebuilt
     // under a container that is. Checked again after the slot wait.
@@ -7926,25 +8142,26 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     // The stopped rule, decided once: a stopped app is rebuilt only to refresh a
     // tree built for another Node runtime, and an agent never rebuilds one.
     const rebuildsStale = !actor.agent && (await this.rebuildsStaleTree(appName, appState, true));
-    if (appState.status === 'stopped' && !rebuildsStale) {
+    if (appState.status === 'stopped' && !rebuildsStale && !isContainer) {
       return redeployRefusal('APP_STOPPED', `Application '${appName}' is stopped; start it before redeploying`);
     }
 
-    // An app whose folder is gone (deleted from under it, a wiped volume) has
-    // nothing to rebuild; without this the disk probe of a missing path reads
-    // as "no space" (507). Checked first, so the refusal says what is wrong.
+    // A files app whose folder is gone (deleted from under it, a wiped volume)
+    // has nothing to rebuild; without this the disk probe of a missing path reads
+    // as "no space" (507). A git app does not need its folder: the land creates
+    // it again, and the disk is probed where it will be.
     const hasSource = await fs.stat(appPath).then(
       (stat) => stat.isDirectory(),
       () => false
     );
-    if (!hasSource) {
+    if (!hasSource && kind !== 'git') {
       return redeployRefusal(
         'APP_SOURCE_MISSING',
         `Application '${appName}' has no source folder on disk to rebuild; upload it again`
       );
     }
 
-    const disk = await hasEnoughDisk(appPath);
+    const disk = await hasEnoughDisk(hasSource ? appPath : path.dirname(appPath));
     if (!disk.ok) {
       return redeployRefusal(
         'INSUFFICIENT_DISK',
@@ -7952,7 +8169,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       );
     }
 
-    return { appState };
+    return { appState, kind, isContainer };
   }
 
   /**

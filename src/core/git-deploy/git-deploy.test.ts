@@ -6,7 +6,7 @@ import * as fs from 'fs/promises';
 import * as path from 'path';
 import * as os from 'os';
 import { execFile } from 'child_process';
-import { GitDeployService, resetGitDeployService } from './git-deploy';
+import { GitDeployService, resetGitDeployService, deployActorOfInfo, publishRedeployUpdate } from './git-deploy';
 import { resetStateManager, getStateManager, AppStateManager } from '../../managers/app/state-manager';
 import { resetSecretManager, getSecretManager } from '../../managers/secret';
 import * as gitClient from './git-client';
@@ -681,6 +681,26 @@ describe('GitDeployService', () => {
         return original(cmd, args, opts, cb);
       });
     }
+
+    it('deployActorOfInfo and publishRedeployUpdate are the one conversion and the one post-land publish', () => {
+      expect(
+        deployActorOfInfo({ principalId: 'p-1', actorUserId: 'u-1', automationSource: 'webhook', agent: true })
+      ).toEqual({ principalId: 'p-1', userId: 'u-1', automation: 'webhook' });
+
+      const seen: AppUpdatePayload[] = [];
+      const unsubscribe = eventBus.subscribe('app:update', (payload) => void seen.push(payload));
+      publishRedeployUpdate('some-app', '/apps/some-app', { principalId: 'p-1', userId: 'u-1' });
+      unsubscribe();
+      expect(seen).toHaveLength(1);
+      expect(seen[0]).toMatchObject({
+        name: 'some-app',
+        path: '/apps/some-app',
+        reason: 'git redeploy',
+        bypassCooldown: true,
+        principalId: 'p-1',
+        actorUserId: 'u-1',
+      });
+    });
 
     it('publishes app:update with bypassCooldown after a successful pull', async () => {
       const appName = 'redeploy-app';
@@ -1654,6 +1674,32 @@ describe('GitDeployService', () => {
       await expect(
         service.redeploy('named-again', { tokenId: t.id }, { userId: 'carol', admin: false })
       ).rejects.toThrow(`GitHub token '${t.id}' not found`);
+    });
+
+    it('landUnderHold (the platform redeploy) uses the attached token only: the owner\'s or a granted one, never a stranger\'s', async () => {
+      // No tokenId in the actor: this surface cannot choose a token.
+      const land = (name: string): Promise<unknown> =>
+        service.landUnderHold(getStateManager().getApp(name)!, { principalId: 'p-1' }, null);
+
+      // The owner's own token, attached. After a transfer it is a stranger's.
+      await attachedApp('land-owned', 'alice', 'alice', 'ghp_alices');
+      // Another user's token, attached by an admin: the grant makes it usable,
+      // and it is void once the app has another owner.
+      await service.deploy({ repoUrl: 'https://github.com/user/land-granted', branch: 'main', userId: 'alice' });
+      await makeGitDir('land-granted');
+      const b = await service.setToken('bob-pat', 'ghp_bobs', 'bob');
+      await service.redeploy('land-granted', { tokenId: b.id }, { admin: true, userId: 'root-admin', interactive: true });
+
+      const pull = jest.spyOn(gitClient, 'gitClone');
+      await land('land-owned');
+      await getStateManager().updateApp('land-owned', { userId: 'carol' } as Record<string, unknown>);
+      await land('land-owned');
+      await land('land-granted');
+      await getStateManager().updateApp('land-granted', { userId: 'carol' } as Record<string, unknown>);
+      await land('land-granted');
+
+      expect(pullTokens(pull)).toEqual(['ghp_alices', undefined, 'ghp_bobs', undefined]);
+      pull.mockRestore();
     });
 
     it('naming the attached id again works for a legacy token a non-admin could not newly choose', async () => {

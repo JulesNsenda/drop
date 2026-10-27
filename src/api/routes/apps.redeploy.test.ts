@@ -1,6 +1,7 @@
 /**
- * POST /apps/:name/redeploy (#359 Item 2) - rebuild a FILES app from the source
- * already on disk.
+ * POST /apps/:name/redeploy (#359) - rebuild an app: a git-backed app lands its
+ * newest commit first, a monorepo container is re-expanded, any other app is
+ * rebuilt from the source already on disk.
  *
  * The platform's admission and start are stubbed at the PlatformOps seam (they
  * are covered against the real platform in platform.explicit-redeploy.test.ts);
@@ -131,14 +132,105 @@ describe('POST /apps/:name/redeploy', () => {
       expect(new Date(json.data.acceptedAt).getTime()).toBeLessThanOrEqual(atStart);
     });
 
-    it('makes ONE call, with the one actor', async () => {
+    it('makes ONE call, with the one actor and the caller for the git token rules (no tokenId exists here)', async () => {
       await redeploy('site', bearer(ownerToken));
       expect(ops.redeployApp).toHaveBeenCalledTimes(1);
-      const [name, actor, ...rest] = (ops.redeployApp as jest.Mock).mock.calls[0];
+      const [name, actor, options, ...rest] = (ops.redeployApp as jest.Mock).mock.calls[0];
       expect(name).toBe('site');
       expect(actor).toMatchObject({ actorUserId: ownerId, agent: false });
       expect(actor.principalId).toBeDefined();
+      expect(options).toEqual({ caller: { admin: false, userId: ownerId } });
       expect(rest).toEqual([]);
+    });
+
+    it('a git-backed app: 202 like any other, logged as git', async () => {
+      await getStateManager().updateApp('site', {
+        gitSource: { repoUrl: 'https://github.com/user/site', branch: 'main' },
+      } as Record<string, unknown>);
+      const res = await redeploy('site', bearer(ownerToken));
+      expect(res.status).toBe(202);
+      expect((await body(res)).data.deployId).toBe('11111111-2222-4333-8444-555555555555');
+      expect(logSpy).toHaveBeenCalledWith(expect.anything(), { action: 'redeploy', appName: 'site', detail: 'git' });
+    });
+
+    it('a monorepo container: 202 group with the container, the follow, and no deploy id', async () => {
+      (ops.redeployApp as jest.Mock).mockResolvedValue({ group: { container: 'site' } });
+      const res = await redeploy('site', bearer(ownerToken));
+      expect(res.status).toBe(202);
+      const json = await body(res);
+      expect(json.data.group).toBe(true);
+      expect(json.data.container).toBe('site');
+      expect(json.data.deployId).toBeUndefined();
+      expect(json.data.follow).toBe(
+        `/api/v1/deploys/stream?app=site&since=${encodeURIComponent(json.data.acceptedAt)}`
+      );
+      expect(logSpy).toHaveBeenCalledWith(expect.anything(), { action: 'redeploy', appName: 'site', detail: 'group' });
+    });
+
+    describe('a service of a git-deployed group', () => {
+      const registerGroup = async (containerOwner: string) => {
+        const sm = getStateManager();
+        await sm.registerApp('svc', path.join(t.tempDir, 'svc'));
+        await sm.updateApp('svc', { userId: ownerId, group: 'g' } as Record<string, unknown>);
+        await sm.registerApp('box', path.join(t.tempDir, 'box'));
+        await sm.updateApp('box', {
+          userId: containerOwner,
+          group: 'g',
+          isGroupContainer: true,
+          gitSource: { repoUrl: 'https://github.com/user/box', branch: 'main' },
+        } as Record<string, unknown>);
+      };
+
+      it('is redeployed through its container: the container is what the platform is asked for, and what is answered', async () => {
+        await registerGroup(ownerId);
+        (ops.redeployApp as jest.Mock).mockResolvedValue({ group: { container: 'box' } });
+        const res = await redeploy('svc', bearer(ownerToken));
+        expect(res.status).toBe(202);
+        const json = await body(res);
+        expect((ops.redeployApp as jest.Mock).mock.calls[0][0]).toBe('box');
+        expect(json.data).toMatchObject({ group: true, container: 'box' });
+        expect(json.data.follow).toContain('app=box');
+        expect(logSpy).toHaveBeenCalledWith(expect.anything(), { action: 'redeploy', appName: 'box', detail: 'git' });
+      });
+
+      it("404s, naming only the requested app, when the caller has no access to the container", async () => {
+        const other = await createUser({ username: 'other', role: 'user', credential: { password: 'password123' } });
+        await registerGroup(other.id);
+        const res = await redeploy('svc', bearer(ownerToken));
+        expect(res.status).toBe(404);
+        expect((await body(res)).error.message).toBe("Application 'svc' not found");
+        expect(ops.redeployApp).not.toHaveBeenCalled();
+      });
+    });
+
+    it('maps a refused recorded repository URL to a 400 and a stale group child to a 409', async () => {
+      refuse({ code: 'INVALID_GIT_SOURCE', message: 'Invalid recorded repository URL for site' });
+      expect((await redeploy('site', bearer(ownerToken))).status).toBe(400);
+      refuse({ code: 'REDEPLOY_VIA_CONTAINER', message: 'redeploy the group container' });
+      expect((await redeploy('site', bearer(ownerToken))).status).toBe(409);
+    });
+
+    it('a container answered to a role-none caller carries no follow link', async () => {
+      (ops.redeployApp as jest.Mock).mockResolvedValue({ group: { container: 'site' } });
+      const bare = new Hono();
+      bare.use('*', async (c, next) => {
+        (c.set as Function)('auth', {
+          userId: ownerId,
+          username: 'agent',
+          role: 'none',
+          kind: 'agent',
+          scopes: ['app:site:deploy'],
+          authMethod: 'apikey',
+          principalId: 'p-1',
+        });
+        await next();
+      });
+      bare.route('/apps', appsRoutes);
+      const res = await bare.request('/apps/site/redeploy', { method: 'POST' });
+      expect(res.status).toBe(202);
+      const json = await body(res);
+      expect(json.data).toMatchObject({ group: true, container: 'site' });
+      expect(json.data.follow).toBeUndefined();
     });
 
     it('gives a scope-only caller (role none) the facts and no follow link: it cannot read /deploys', async () => {
@@ -195,7 +287,6 @@ describe('POST /apps/:name/redeploy', () => {
       ['NOT_FOUND', 404, 'NOT_FOUND'],
       ['APP_SOURCE_MISSING', 409, 'APP_SOURCE_MISSING'],
       ['APP_BUSY', 409, 'APP_BUSY'],
-      ['REDEPLOY_NOT_SUPPORTED_YET', 409, 'REDEPLOY_NOT_SUPPORTED_YET'],
       ['APP_STOPPED', 409, 'APP_STOPPED'],
       ['SERVICE_UNAVAILABLE', 503, 'SERVICE_UNAVAILABLE'],
       ['RATE_LIMITED', 429, 'RATE_LIMITED'],
@@ -217,15 +308,6 @@ describe('POST /apps/:name/redeploy', () => {
       expect(res.status).toBe(429);
       expect(res.headers.get('Retry-After')).toBe('37');
       expect((await body(res)).error.details).toEqual({ retryAfterSeconds: 37 });
-    });
-
-    it('tells a git-backed app where to go', async () => {
-      refuse({
-        code: 'REDEPLOY_NOT_SUPPORTED_YET',
-        message: "Application 'site' is deployed from git; use POST /api/v1/git/redeploy/site",
-      });
-      const res = await redeploy('site', bearer(ownerToken));
-      expect((await body(res)).error.message).toContain('/git/redeploy/site');
     });
 
     it('500s when the platform operation itself throws', async () => {
