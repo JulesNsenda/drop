@@ -62,6 +62,8 @@ describe('handleAppUpdate exit trace', () => {
   let startThrows: Error | undefined;
   let detectThrows: Error | undefined;
   let quiesced: boolean;
+  let runtimeLive: boolean;
+  let buildEffect: (() => void) | undefined;
   let unsubs: Array<() => void>;
   const appName = `trace-app-${Date.now()}`;
 
@@ -84,6 +86,8 @@ describe('handleAppUpdate exit trace', () => {
     startThrows = undefined;
     detectThrows = undefined;
     quiesced = false;
+    runtimeLive = true;
+    buildEffect = undefined;
     buildResult = { success: true, duration: 12, outputPath: null };
 
     platform = createPlatform({
@@ -105,12 +109,14 @@ describe('handleAppUpdate exit trace', () => {
       }),
       build: jest.fn(async (ctx: { deployId?: string }) => {
         log(`builder.build:${ctx.deployId}`);
+        buildEffect?.();
         if (buildThrows) throw buildThrows;
         return buildResult;
       }),
     };
     p().runtime = {
       type: 'pm2',
+      getStatus: jest.fn(async () => (runtimeLive ? { status: 'running' } : null)),
       stop: jest.fn(async () => log('runtime.stop')),
       start: jest.fn(async () => {
         log('runtime.start');
@@ -579,6 +585,7 @@ describe('handleAppUpdate exit trace', () => {
 
     it('success on an app stopped at entry that needs its tree rebuilt does not stop or re-stop it', async () => {
       appState = { ...appState, status: 'stopped' };
+      runtimeLive = false;
       jest.spyOn(p(), 'dependenciesAreStale').mockResolvedValue(true);
       const r = await update();
       expect(r.result).toBe(true);
@@ -700,12 +707,105 @@ describe('handleAppUpdate exit trace', () => {
       expectReleased();
     });
 
-    it('decides from the state re-read after the wait: an app that was running only at entry is not stopped for a swap', async () => {
-      reserveEffect = () => (appState = { ...appState, status: 'pending' });
+    it('stops a live process before the swap whatever its stored status (a crash-looping app)', async () => {
+      reserveEffect = () => (appState = { ...appState, status: 'errored' });
+      runtimeLive = true;
+      const r = await update();
+      expect(r.result).toBe(true);
+      expect(p().runtime.stop).toHaveBeenCalledTimes(1);
+      expect(p().runtime.start).toHaveBeenCalledTimes(1);
+      expectReleased();
+    });
+
+    it('does not stop anything when no process is live, whatever its stored status', async () => {
+      runtimeLive = false; // stored 'running', nothing alive
       const r = await update();
       expect(r.result).toBe(true);
       expect(p().runtime.stop).not.toHaveBeenCalled();
       expect(p().runtime.start).toHaveBeenCalledTimes(1);
+      expectReleased();
+    });
+
+    it('refuses, closing the outcome unpaid, when the breaker tripped while the update waited for its slot', async () => {
+      jest
+        .spyOn(p(), 'checkGuardrails')
+        .mockReturnValueOnce({ allowed: true, failures: 0 })
+        .mockReturnValue({ allowed: false, failures: 3, retryAfterSeconds: 9 });
+      const r = await update();
+      expect(r.result).toBe(false);
+      expect(r.trace).toEqual([
+        `inprogress.add:${appName}`,
+        'slot.release',
+        'keys.release',
+        'episode.fail:Too many failed deploys (3). Retry in 9s:ID1:GUARDRAIL_TRIPPED',
+        'outcome:false(none)',
+        `inprogress.delete:${appName}`,
+      ]);
+      expect(r.logs).toEqual([
+        'info:UPDATE:Hot-reload triggered for <app>: file change',
+        'warn:UPDATE:Redeploy of <app> refused by guardrail: Too many failed deploys (3). Retry in 9s.',
+        'bus:build:started:ID1',
+        'bus:build:failed:pre-build:GUARDRAIL_TRIPPED:ID1',
+      ]);
+      expect(p().appDeployTimes.has(appName)).toBe(true);
+      expect(p().builder.build).not.toHaveBeenCalled();
+      expectReleased();
+    });
+
+    it('drops the deploy, discarding its target and closing the episode unpaid, when the app is stopped during the build', async () => {
+      buildEffect = () => (appState = { ...appState, status: 'stopped' });
+      const r = await update();
+      expect(r.result).toBe(false);
+      expect(r.trace).toEqual([
+        `inprogress.add:${appName}`,
+        'status:building',
+        'buildlog.start:ID1',
+        'discard',
+        'builder.build:ID1',
+        'slot.release',
+        'discard',
+        'keys.release',
+        'episode.fail:the app was stopped during the deploy:ID1:-',
+        'outcome:false(none)',
+        `inprogress.delete:${appName}`,
+      ]);
+      expect(r.logs).toContain('info:UPDATE:Dropped redeploy for <app> - app was stopped by user during the build');
+      expect(p().runtime.stop).not.toHaveBeenCalled();
+      expect(p().runtime.start).not.toHaveBeenCalled();
+      expect(appState.status).toBe('stopped');
+      const watcherKey = p().guardrailKeys(appName, false, {})[0].key as string;
+      expect(getDeployBreaker().peek(watcherKey).failures).toBe(0);
+      expectReleased();
+    });
+
+    it('drops the deploy when the app is removed during the build', async () => {
+      buildEffect = () => (appState = undefined);
+      const r = await update();
+      expect(r.result).toBe(false);
+      expect(r.trace).toContain('episode.fail:the app was removed during the deploy:ID1:-');
+      expect(p().runtime.stop).not.toHaveBeenCalled();
+      expect(p().runtime.start).not.toHaveBeenCalled();
+      expectReleased();
+    });
+
+    it('a stopped-at-entry stale-tree rebuild is not dropped for being stopped', async () => {
+      appState = { ...appState, status: 'stopped' };
+      runtimeLive = false;
+      jest.spyOn(p(), 'dependenciesAreStale').mockResolvedValue(true);
+      const r = await update();
+      expect(r.result).toBe(true);
+      expectReleased();
+    });
+
+    it('a failure handler that throws with the builder\'s episode still open closes it under the minted id', async () => {
+      buildEffect = () =>
+        eventBus.publish('build:started', { appId: appName, buildId: 'b-1', deployId: 'D1' } as never);
+      buildThrows = new Error('strategy threw');
+      (p().stateManager.setAppStatus as jest.Mock).mockImplementation(async (_n: string, status: string) => {
+        if (status === 'errored') throw new Error('state store down');
+      });
+      await expect(p().handleAppUpdate(appName, appPath, 'file change', true)).rejects.toThrow('state store down');
+      expect(trace.filter((e) => e.startsWith('episode.fail'))).toHaveLength(1);
       expectReleased();
     });
   });
@@ -714,15 +814,33 @@ describe('handleAppUpdate exit trace', () => {
     const admitted = () => ({ appPath, statusAtEntry: 'running' });
     const claim = () => p().breakerKeys.set(appName, p().guardrailKeys(appName, false, {}));
 
-    it('acquireSlotAndRecheck: a refusal releases only the slot it took', async () => {
+    const refusals: Array<[string, () => void]> = [
+      ['quiesced', () => (reserveEffect = () => (quiesced = true))],
+      ['busy', () => (reserveEffect = () => p().gitReserved.add(appName))],
+      ['gone', () => (reserveEffect = () => (appState = undefined))],
+      ['stopped', () => (reserveEffect = () => (appState = { ...appState, status: 'stopped' }))],
+      ['disk', () => (hasEnoughDisk as jest.Mock).mockResolvedValue({ ok: false, freeMb: 1 })],
+      ['guardrail', () => jest.spyOn(p(), 'checkGuardrails').mockReturnValue({ allowed: false, failures: 3, retryAfterSeconds: 9 })],
+    ];
+    it.each(refusals)('acquireSlotAndRecheck: refuses %s, releasing only the slot it took', async (reason, setup) => {
       claim();
       p().appsInProgress.add(appName);
       trace.length = 0;
-      reserveEffect = () => (quiesced = true);
-      expect(await p().acquireSlotAndRecheck(appName, admitted())).toBeNull();
-      expect(trace).toEqual(['slot.release']);
+      setup();
+      expect(await p().acquireSlotAndRecheck(appName, admitted())).toEqual({ refused: reason });
+      const guardrail = reason === 'guardrail';
+      // The guardrail refusal also closes its outcome, as the entry gate does.
+      expect(trace.filter((e) => !guardrail || e === 'slot.release')).toEqual(['slot.release']);
       expect(p().appsInProgress.has(appName)).toBe(true);
-      expect(p().breakerKeys.has(appName)).toBe(true);
+      expect(p().breakerKeys.has(appName)).toBe(guardrail ? false : true);
+    });
+
+    it('acquireSlotAndRecheck: reads the app AFTER the disk probe', async () => {
+      (hasEnoughDisk as jest.Mock).mockImplementation(async () => {
+        appState = undefined; // removed while the probe ran
+        return { ok: true, freeMb: 999999 };
+      });
+      expect(await p().acquireSlotAndRecheck(appName, admitted())).toEqual({ refused: 'gone' });
     });
 
     it('acquireSlotAndRecheck: success hands back the live slot and the state it re-read', async () => {
@@ -744,7 +862,7 @@ describe('handleAppUpdate exit trace', () => {
       claim();
       reserveEffect = () => (quiesced = true);
       const releaseClaim = jest.fn();
-      expect(await p().runClaimedUpdate(appName, admitted(), releaseClaim)).toBe(false);
+      expect(await p().runClaimedUpdate(appName, admitted(), releaseClaim)).toEqual({ refused: 'quiesced' });
       expect(releaseClaim).toHaveBeenCalledTimes(1);
       expect(p().breakerKeys.has(appName)).toBe(false);
       expect(trace).toEqual(['slot.release', 'keys.release']);
@@ -753,14 +871,52 @@ describe('handleAppUpdate exit trace', () => {
     it('neither stage touches appsInProgress', async () => {
       claim();
       const releaseClaim = jest.fn();
-      expect(await p().runClaimedUpdate(appName, admitted(), releaseClaim)).toBe(true);
+      const r = await p().runClaimedUpdate(appName, admitted(), releaseClaim);
+      expect(await r.done).toBe(true);
       expect(trace.filter((e) => e.startsWith('inprogress'))).toEqual([]);
       expect(releaseClaim).toHaveBeenCalledTimes(1);
     });
 
-    const exits: Array<[string, () => void, boolean | 'throws']> = [
+    it('runClaimedUpdate: resolves started at the mint, with the build still running and the claim still held', async () => {
+      claim();
+      let finishBuild!: () => void;
+      p().builder.build.mockImplementation(
+        (ctx: { deployId?: string }) =>
+          new Promise((resolve) => {
+            log(`builder.build:${ctx.deployId}`);
+            finishBuild = () => resolve(buildResult);
+          })
+      );
+      const releaseClaim = jest.fn();
+      const r = await p().runClaimedUpdate(appName, admitted(), releaseClaim);
+      expect(r.started).toMatch(UUID);
+      expect(releaseClaim).not.toHaveBeenCalled();
+      expect(p().breakerKeys.has(appName)).toBe(true);
+      for (let i = 0; i < 500 && !finishBuild; i++) await new Promise((resolve) => setTimeout(resolve, 10));
+      expect(trace).toContain(`builder.build:${r.started}`);
+      finishBuild();
+      expect(await r.done).toBe(true);
+      expect(releaseClaim).toHaveBeenCalledTimes(1);
+      expect(p().breakerKeys.has(appName)).toBe(false);
+    });
+
+    it('runClaimedUpdate: a failure handler that throws rejects done, which is logged so nothing goes unhandled', async () => {
+      claim();
+      detectThrows = new Error('detect blew up');
+      (p().stateManager.setAppStatus as jest.Mock).mockImplementation(async (_n: string, status: string) => {
+        if (status === 'errored') throw new Error('state store down');
+      });
+      const logged = jest.spyOn(p().logger, 'error').mockImplementation(() => undefined);
+      const releaseClaim = jest.fn();
+      const r = await p().runClaimedUpdate(appName, admitted(), releaseClaim);
+      await expect(r.done).rejects.toThrow('state store down');
+      expect(logged).toHaveBeenCalledTimes(1);
+      expect(releaseClaim).toHaveBeenCalledTimes(1);
+    });
+
+    const exits: Array<[string, () => void, boolean | object | 'throws']> = [
       ['success', () => undefined, true],
-      ['a refusal', () => (reserveEffect = () => (quiesced = true)), false],
+      ['a refusal', () => (reserveEffect = () => (quiesced = true)), { refused: 'quiesced' }],
       ['a failed build', () => (buildResult = { success: false, duration: 1, errors: [{ message: 'x' }] }), false],
       ['a failed start', () => (startThrows = new Error('port in use')), false],
       ['a pre-build throw', () => (detectThrows = new Error('detect blew up')), false],
@@ -781,9 +937,12 @@ describe('handleAppUpdate exit trace', () => {
       claim();
       setup();
       const releaseClaim = jest.fn();
-      const run = p().runClaimedUpdate(appName, admitted(), releaseClaim);
+      const run = (async () => {
+        const r = await p().runClaimedUpdate(appName, admitted(), releaseClaim);
+        return 'started' in r ? r.done : r;
+      })();
       if (expected === 'throws') await expect(run).rejects.toThrow();
-      else expect(await run).toBe(expected);
+      else expect(await run).toEqual(expected);
       expect(releaseClaim).toHaveBeenCalledTimes(1);
       expect(p().breakerKeys.has(appName)).toBe(false);
     });

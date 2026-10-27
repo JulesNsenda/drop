@@ -817,6 +817,16 @@ interface AcquiredSlot {
   current: NonNullable<ReturnType<AppStateManager['getApp']>>;
 }
 
+/** Why acquireSlotAndRecheck declined to go on; the claim's holder gives the claim back. */
+type UpdateRefusal = 'quiesced' | 'busy' | 'gone' | 'stopped' | 'disk' | 'guardrail';
+
+/**
+ * runClaimedUpdate's answer: refused (claim already given back), or started
+ * with the id the deploy was minted under; `done` settles when the build and
+ * swap have, with the claim and the keys given back by then.
+ */
+type ClaimedUpdate = { refused: UpdateRefusal } | { started: string; done: Promise<boolean> };
+
 /** What buildAndSwap has done that runClaimedUpdate needs if its failure handler throws. */
 interface UpdateProgress {
   builderEntered: boolean;
@@ -5129,7 +5139,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     // declared service as its own top-level sibling app and skip the
     // normal single-app onboarding below for the container folder itself.
     const rootYaml = await parseDropYaml(payload.path);
-    if (rootYaml.success && rootYaml.config?.services && Object.keys(rootYaml.config.services).length > 0) {
+    if (isMonorepoContainer(rootYaml)) {
       this.watcher?.markAppKnown(payload.name);
       // Hold the container name in appsInProgress for the duration of the
       // expansion: the DELETE route's in-progress guard keys off it (a
@@ -7475,79 +7485,115 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     this.appsInProgress.add(appName);
 
     const admitted: AdmittedUpdate = { appPath, statusAtEntry };
-    return this.runClaimedUpdate(appName, admitted, () => this.appsInProgress.delete(appName));
+    const update = await this.runClaimedUpdate(appName, admitted, () => this.appsInProgress.delete(appName));
+    return 'started' in update ? update.done : false;
   }
 
   /**
-   * The claim's one owner, from the moment it is taken: runs the two stages and
-   * gives the claim and the breaker keys back in the one finally below, on every
-   * exit - a refusal, a throw out of either stage, success or failure. Neither
-   * stage touches `appsInProgress`. `releaseClaim` is how the caller's claim is
-   * given back; it runs exactly once.
+   * The claim's one owner, from the moment it is taken. Two-phase: it resolves
+   * `{refused}` (claim and keys already given back) or `{started}` right after
+   * the mint, with `done` the build and swap running behind it. Whichever way
+   * it ends the claim and the breaker keys are given back exactly once, in one
+   * place (giveBack); neither stage touches `appsInProgress`. `releaseClaim` is
+   * how the caller's claim is given back.
    *
-   * @returns true only when the new build is serving (see handleAppUpdate).
+   * `done` resolves true only when the new build is serving (see
+   * handleAppUpdate). It rejects when the failure handler itself threw, after
+   * the outcome has been closed; a caller that does not await it is covered by
+   * the log below, so nothing goes unhandled.
    */
   private async runClaimedUpdate(
     appName: string,
     admitted: AdmittedUpdate,
     releaseClaim: () => void
-  ): Promise<boolean> {
-    try {
-      let acquired: AcquiredSlot | null;
-      try {
-        acquired = await this.acquireSlotAndRecheck(appName, admitted);
-      } catch (error) {
-        // The slot wait or the disk probe threw: a refusal nobody reported.
-        // Reported the way the guardrail refusal is, keys released first so the
-        // failure is not charged to the window (the build never ran), and the
-        // caller gets an outcome rather than a silent drop.
-        const failure = error instanceof Error ? error : new Error(String(error));
-        this.logger.warn(`Redeploy of ${appName} failed before its build: ${failure.message}`, 'UPDATE');
-        this.releaseGuardrailKeys(appName);
-        this.failDeployEpisode(appName, failure, crypto.randomUUID());
-        throw error;
-      }
-      // A refusal: nothing was built, and neither a refusal nor the box being
-      // full is evidence the caller is looping. The keys are released, not
-      // recorded, in the finally.
-      if (!acquired) return false;
-
-      const deployId = crypto.randomUUID();
-      const progress: UpdateProgress = { builderEntered: false, episodeClosed: false };
-      try {
-        return await this.buildAndSwap(appName, admitted, deployId, acquired, progress);
-      } catch (error) {
-        // buildAndSwap reports every failure itself and never rethrows, so this
-        // is its failure handler throwing (a state write rejecting). Close what
-        // it left open: an episode it never got to, or a build that was paid
-        // for and must be charged.
-        if (!progress.builderEntered && !progress.episodeClosed) {
-          this.failDeployEpisode(
-            appName,
-            error instanceof Error ? error : new Error('Hot-reload failed'),
-            deployId
-          );
-        } else {
-          this.recordDeployOutcome(appName, false);
-        }
-        throw error;
-      }
-    } finally {
+  ): Promise<ClaimedUpdate> {
+    const giveBack = (): void => {
       this.releaseGuardrailKeys(appName);
       releaseClaim();
+    };
+    let acquired: AcquiredSlot | { refused: UpdateRefusal };
+    try {
+      acquired = await this.acquireSlotAndRecheck(appName, admitted);
+    } catch (error) {
+      // The slot wait or the disk probe threw: a refusal nobody reported.
+      // Reported the way the guardrail refusal is, and the keys released BEFORE
+      // failDeployEpisode so the failure is not charged (the build never ran).
+      const failure = error instanceof Error ? error : new Error(String(error));
+      this.logger.warn(`Redeploy of ${appName} failed before its build: ${failure.message}`, 'UPDATE');
+      this.releaseGuardrailKeys(appName);
+      this.failDeployEpisode(appName, failure, crypto.randomUUID());
+      giveBack();
+      throw error;
+    }
+    // A refusal: nothing was built, and neither a refusal nor the box being
+    // full is evidence the caller is looping, so the keys are released, not
+    // recorded.
+    if ('refused' in acquired) {
+      giveBack();
+      return acquired;
+    }
+
+    const deployId = crypto.randomUUID();
+    const done = this.swapAndClose(appName, admitted, deployId, acquired, giveBack);
+    done.catch((error) =>
+      this.logger.error(`Redeploy of ${appName} failed while reporting its outcome`, 'UPDATE', error)
+    );
+    return { started: deployId, done };
+  }
+
+  /** runClaimedUpdate's second phase: buildAndSwap, then whatever it left open closed, then the claim given back. */
+  private async swapAndClose(
+    appName: string,
+    admitted: AdmittedUpdate,
+    deployId: string,
+    acquired: AcquiredSlot,
+    giveBack: () => void
+  ): Promise<boolean> {
+    const progress: UpdateProgress = { builderEntered: false, episodeClosed: false };
+    try {
+      return await this.buildAndSwap(appName, admitted, deployId, acquired, progress);
+    } catch (error) {
+      // buildAndSwap reports every failure itself and never rethrows, so this
+      // is its failure handler throwing (a state write rejecting). Close what
+      // it left open: the minted episode if nothing closed it, and a build
+      // that was paid for is charged either way. failDeployEpisode is NOT
+      // idempotent (on a closed episode it opens and fails a second one), so
+      // closure is tracked, and read from the tracker once the builder has
+      // been entered, since the builder opens its own episode.
+      if (!progress.episodeClosed && (!progress.builderEntered || this.deployEpisodeOpen(appName))) {
+        this.failDeployEpisode(
+          appName,
+          error instanceof Error ? error : new Error('Hot-reload failed'),
+          deployId
+        );
+      } else if (progress.builderEntered) {
+        this.recordDeployOutcome(appName, false);
+      }
+      throw error;
+    } finally {
+      giveBack();
+    }
+  }
+
+  /** Whether the deploy tracker has an episode open for the app (false when it is not initialised). */
+  private deployEpisodeOpen(appName: string): boolean {
+    try {
+      return getDeployTracker().hasOpenEpisode(appName);
+    } catch {
+      return false;
     }
   }
 
   /**
    * handleAppUpdate's second stage: wait for a builder slot, then re-check what
-   * the wait could have changed. Returns null for a refusal, having released the
-   * slot it took and nothing else. On success the caller owns the returned slot
-   * release, and the state it re-read. Never touches `appsInProgress`.
+   * the wait could have changed. A refusal names its reason and has released
+   * the slot it took, and nothing else. On success the caller owns the returned
+   * slot release, and the state it re-read. Never touches `appsInProgress`.
    */
   private async acquireSlotAndRecheck(
     appName: string,
     admitted: AdmittedUpdate
-  ): Promise<AcquiredSlot | null> {
+  ): Promise<AcquiredSlot | { refused: UpdateRefusal }> {
     // Wait for a builder slot BEFORE any side effect, so a redeploy queued
     // behind a full cap (a boot-reconcile burst) leaves status, build log and
     // deploy target alone and the old version untouched. The checks below
@@ -7560,7 +7606,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         'BACKUP'
       );
       releaseSlot();
-      return null;
+      return { refused: 'quiesced' };
     }
     // A git pull or upload that began while waiting publishes its own
     // app:update when it lands, and with appsInProgress cleared that runs.
@@ -7574,19 +7620,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         'UPDATE'
       );
       releaseSlot();
-      return null;
-    }
-    // Removed, or stopped by the user since entry, while waiting. An explicit
-    // redeploy of an app that was ALREADY stopped at entry (rebuildsStaleTree)
-    // deliberately proceeds.
-    const current = this.stateManager!.getApp(appName);
-    if (!current || (current.status === 'stopped' && admitted.statusAtEntry !== 'stopped')) {
-      this.logger.info(
-        `Dropped redeploy for ${appName} - app was ${current ? 'stopped by user' : 'removed'} while waiting for a build slot`,
-        'UPDATE'
-      );
-      releaseSlot();
-      return null;
+      return { refused: 'busy' };
     }
 
     // Hot-reload - the app is currently RUNNING and serving traffic. Abort
@@ -7602,13 +7636,45 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       releaseSlot();
       throw error;
     }
+
+    // Read AFTER the awaited probe, so what the build decides from is as late
+    // as it can be. Removed, or stopped by the user since entry, while waiting:
+    // an explicit redeploy of an app that was ALREADY stopped at entry
+    // (rebuildsStaleTree) deliberately proceeds.
+    const current = this.stateManager!.getApp(appName);
+    if (!current || (current.status === 'stopped' && admitted.statusAtEntry !== 'stopped')) {
+      this.logger.info(
+        `Dropped redeploy for ${appName} - app was ${current ? 'stopped by user' : 'removed'} while waiting for a build slot`,
+        'UPDATE'
+      );
+      releaseSlot();
+      return { refused: current ? 'stopped' : 'gone' };
+    }
     if (!disk.ok) {
       this.logger.warn(
         `Skipping hot-reload of ${appName}: insufficient disk (${Math.round(disk.freeMb)} MB free, need ${getMinFreeDiskMb()} MB)`,
         'UPDATE'
       );
       releaseSlot();
-      return null;
+      return { refused: 'disk' };
+    }
+
+    // The entry gate's verdict is stale after a long wait: the breaker may have
+    // tripped meanwhile (a looping caller queued behind a full cap). Re-checked
+    // against the keys this deploy was admitted under; spends no quota.
+    const keys = this.breakerKeys.get(appName);
+    const verdict = keys ? this.checkGuardrails(keys) : undefined;
+    if (verdict && !verdict.allowed) {
+      const refusal =
+        `Too many failed deploys (${verdict.failures}). Retry in ${verdict.retryAfterSeconds}s.`;
+      this.logger.warn(`Redeploy of ${appName} refused by guardrail: ${refusal}`, 'UPDATE');
+      releaseSlot();
+      // Released BEFORE reporting, as at the entry gate: failDeployEpisode
+      // records a failure, which must not land in the window that refused it.
+      this.releaseGuardrailKeys(appName);
+      this.appDeployTimes.set(appName, Date.now());
+      this.failDeployEpisode(appName, new Error(refusal), crypto.randomUUID(), 'GUARDRAIL_TRIPPED');
+      return { refused: 'guardrail' };
     }
     return { releaseSlot, current };
   }
@@ -7737,6 +7803,28 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         return false;
       }
 
+      // The user can stop or delete the app during a long build, and everything
+      // below would undo that (a swap restarts it). Re-read synchronously, as
+      // late as it can be: a gone or newly stopped app gets its deploy target
+      // discarded and its episode closed, and the window is not charged.
+      const after = this.stateManager!.getApp(appName);
+      if (!after || (after.status === 'stopped' && admitted.statusAtEntry !== 'stopped')) {
+        this.logger.info(
+          `Dropped redeploy for ${appName} - app was ${after ? 'stopped by user' : 'removed'} during the build`,
+          'UPDATE'
+        );
+        await this.discardDeployTarget(appName);
+        // Released BEFORE reporting: failDeployEpisode records a failure.
+        this.releaseGuardrailKeys(appName);
+        this.failDeployEpisode(
+          appName,
+          new Error(`the app was ${after ? 'stopped' : 'removed'} during the deploy`),
+          deployId
+        );
+        progress.episodeClosed = true;
+        return false;
+      }
+
       // Manual promotion holds HERE, before the stop. This is the branch SEC-9
       // found broken in the withhold-the-route design: on a redeploy the route
       // already exists, so gating it did nothing and unapproved code went live
@@ -7744,7 +7832,9 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       // approved version running and serving, untouched.
       if (await this.holdForPromotion(appName, buildResult.outputPath ?? undefined, deployId)) {
         // A held build is not a failed one — the guardrail window must not be
-        // charged for a deploy the operator asked to be held.
+        // charged for a deploy the operator asked to be held. Released here, not
+        // left to the finally: the status write below can throw, and a throw is
+        // charged to whatever keys are still set.
         this.releaseGuardrailKeys(appName);
         await this.stateManager!.setAppStatus(appName, statusBefore);
         return false;
@@ -7769,12 +7859,17 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       // buildFreshStartSpec's allocatePort() call below re-claims the same
       // config-sourced port; releasing it in between would open a window for
       // a concurrent deploy to steal it.
-      // Also stop when the app is 'errored': the hot-reload catch block below
-      // can mark an app errored while its PM2 process is still alive (the
-      // failure happened after start), and skipping stop() here would hit
-      // ProcessManager.start's online-early-return - a silent no-op that
-      // leaves the old (broken) code running.
-      if (wasRunning || statusBefore === 'errored') {
+      // Stop on RUNTIME liveness, not the stored status: an 'errored' or
+      // crash-looping app can still hold a live process (the hot-reload catch
+      // block below marks an app errored while its PM2 process is alive), and
+      // skipping stop() here would hit ProcessManager.start's online-early-return
+      // - a silent no-op that leaves the old (broken) code running. The same
+      // read detachService uses for wasLive; a failed read stops anyway.
+      const live = await this.runtime!.getStatus(appName).then(
+        (info) => info?.status === 'running',
+        () => true
+      );
+      if (live) {
         this.logger.info(`Stopping ${appName} to swap in new build...`, 'UPDATE');
         this.stopHealthProber(appName);
         await this.runtime!.stop(appName);
