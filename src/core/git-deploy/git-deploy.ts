@@ -898,6 +898,8 @@ export class GitDeployService {
         // choice replaces it, and a plain redeploy leaves it alone.
         let tokenGrantedBy = baseSource.tokenGrantedBy;
         let tokenGrantedFor = baseSource.tokenGrantedFor;
+        // True only when THIS call established the grant (the admin-chosen path).
+        let grantedHere = false;
         if (effectiveTokenId === null) {
           tokenGrantedBy = undefined;
           tokenGrantedFor = undefined;
@@ -916,6 +918,7 @@ export class GitDeployService {
           if (chosen) {
             tokenGrantedBy = resolved?.grantedBy;
             tokenGrantedFor = resolved?.grantedFor;
+            grantedHere = true;
           }
           if (!token) {
             // Branch on PROVENANCE. An id the caller supplied on THIS request that
@@ -970,17 +973,28 @@ export class GitDeployService {
         // decision stands and only the commit and time are written. (A clear
         // THIS call made was persisted before the clone, so it is the expected
         // state, not a race.)
+        //
+        // The grant is checked the same way. setTokenOwner revokes a grant while
+        // KEEPING tokenId, so comparing the id alone would let a revocation that
+        // landed during the clone be overwritten by the pre-clone grant. A grant
+        // is written from the pre-clone snapshot only when THIS call just made it
+        // (an admin-chosen token); otherwise it is taken from the latest state.
         const latest = stateManager.getApp(appName)?.gitSource;
         const expectedTokenId = actor.tokenId === null ? undefined : baseSource.tokenId;
+        const expectedGrantedBy = actor.tokenId === null ? undefined : baseSource.tokenGrantedBy;
+        const expectedGrantedFor = actor.tokenId === null ? undefined : baseSource.tokenGrantedFor;
         const gitSource: GitSource =
-          latest && latest.tokenId !== expectedTokenId
+          latest &&
+          (latest.tokenId !== expectedTokenId ||
+            latest.tokenGrantedBy !== expectedGrantedBy ||
+            latest.tokenGrantedFor !== expectedGrantedFor)
             ? { ...latest, repoUrl: cloneUrl, lastCommitSha: commitSha, lastClonedAt: clonedAt }
             : {
-                ...baseSource,
+                ...(latest ?? baseSource),
                 repoUrl: cloneUrl,
                 tokenId: effectiveTokenId === null ? undefined : effectiveTokenId,
-                tokenGrantedBy,
-                tokenGrantedFor,
+                tokenGrantedBy: grantedHere ? tokenGrantedBy : latest?.tokenGrantedBy,
+                tokenGrantedFor: grantedHere ? tokenGrantedFor : latest?.tokenGrantedFor,
                 lastCommitSha: commitSha,
                 lastClonedAt: clonedAt,
               };
