@@ -57,6 +57,13 @@ export const DROP_SVC_FILES = [
   'activity-log.json',
   'api-credentials.json',
   'db-credentials.json',
+  // #301: which bucket and IAM user each app has, and the app's key (encrypted
+  // under encryption.key, which is in this list). Without them a restore
+  // forgets every bucket — still billing the operator, reachable by no one —
+  // and would provision a second one for each app that attaches again.
+  'object-storage.json',
+  // The AWS admin key DROP uses to create and remove those buckets (encrypted).
+  'object-storage-credential.json',
   'encryption.key',
   '.pg-superuser',
 ];

@@ -283,6 +283,18 @@ describe('drop restore', () => {
     }
   });
 
+  it('restores the object-storage allocation store and admin credential (#301)', async () => {
+    await seedBackupFileStores(backupDir);
+    await fs.writeFile(path.join(backupDir, 'object-storage.json'), '{"site":{}}');
+    await fs.writeFile(path.join(backupDir, 'object-storage-credential.json'), '{"enc":1}');
+
+    await runRestore(dropRoot, backupDir, ['--confirm']);
+
+    const restoredFiles = await readDirSafe(svcDirOf(dropRoot));
+    expect(restoredFiles).toContain('object-storage.json');
+    expect(restoredFiles).toContain('object-storage-credential.json');
+  });
+
   it('copies backupDir/webapps to data/appconf/webapps recursively', async () => {
     await seedBackupFileStores(backupDir);
     const webappsSrc = path.join(backupDir, 'webapps', 'myapp');

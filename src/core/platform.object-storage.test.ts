@@ -455,6 +455,35 @@ describe('DropPlatform object storage (#301)', () => {
     });
   });
 
+  describe('boot reconcile', () => {
+    it('warns for an app whose intent is attached but which has no allocation, and for nobody else', async () => {
+      stubStorage({ allocated: ['has-bucket'] });
+      (platform as any).appConfigService = {
+        getAllConfigs: jest.fn().mockReturnValue([
+          baseConfigFixture('has-bucket', { services: { 'object-storage': 'attached' } }),
+          baseConfigFixture('lost-bucket', { services: { 'object-storage': 'attached' } }),
+          baseConfigFixture('detached', { services: { 'object-storage': 'detached' } }),
+          baseConfigFixture('plain'),
+        ]),
+      };
+      const warn = jest.spyOn((platform as any).logger, 'warn').mockImplementation(() => undefined);
+
+      await (platform as any).warnOnMissingObjectStorage();
+
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(warn.mock.calls[0][0]).toContain("'lost-bucket'");
+    });
+
+    it('never fails boot when the allocation store is unreadable', async () => {
+      const storage = stubStorage();
+      storage.listAllocations.mockRejectedValueOnce(new Error('corrupt'));
+      (platform as any).appConfigService = { getAllConfigs: jest.fn().mockReturnValue([]) };
+      jest.spyOn((platform as any).logger, 'warn').mockImplementation(() => undefined);
+
+      await expect((platform as any).warnOnMissingObjectStorage()).resolves.toBeUndefined();
+    });
+  });
+
   describe('the sweep', () => {
     const deferred = () => {
       let resolve!: () => void;

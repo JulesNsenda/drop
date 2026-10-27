@@ -1189,6 +1189,7 @@ export class DropPlatform {
       // exist after `initializeServices()`.
       await this.pruneStaleGuestGrants();
       await this.sweepGuestRetention();
+      await this.warnOnMissingObjectStorage();
       // Not awaited: it talks to AWS, and boot must not wait on a network.
       void this.sweepRetiredObjectStorage();
 
@@ -3770,6 +3771,31 @@ backup:
         err
       );
       return {};
+    }
+  }
+
+  /**
+   * Boot-time check that every app whose owner attached object storage still
+   * has an allocation record. The usual cause of a gap is a restore from a
+   * backup taken before the allocation store was part of it: the buckets still
+   * exist (and bill) in AWS, but nothing points at them, and the app would
+   * quietly start without its variables. Local file read only; fail-soft.
+   */
+  private async warnOnMissingObjectStorage(): Promise<void> {
+    if (!this.objectStorage || !this.appConfigService) return;
+    try {
+      const allocated = new Set((await this.objectStorage.listAllocations()).map((a) => a.appName));
+      for (const config of this.appConfigService.getAllConfigs()) {
+        if (config.services?.['object-storage'] === 'attached' && !allocated.has(config.name)) {
+          this.logger.warn(
+            `'${config.name}' has object storage attached but no allocation on record - it will start without its bucket variables. ` +
+              `If this followed a restore from an older backup, its bucket still exists in AWS (look for the DROP-generated 'drop-' IAM users); detach and re-attach to get a new one.`,
+            'STORAGE'
+          );
+        }
+      }
+    } catch (error) {
+      this.logger.warn('Could not check object-storage allocations at boot', 'STORAGE', error);
     }
   }
 

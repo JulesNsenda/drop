@@ -323,6 +323,22 @@ describe('drop backup — per-app database backup', () => {
     expect(consoleLogText()).toContain('drop_../evil');
   });
 
+  // (h) ------------------------------------------------------------------
+  it('backs up the object-storage allocation store and admin credential (#301)', async () => {
+    await seedDropRoot(dropRoot);
+    const svcDir = path.join(dropRoot, 'data', 'drop-svc');
+    await fs.writeFile(path.join(svcDir, 'object-storage.json'), '{"site":{}}');
+    await fs.writeFile(path.join(svcDir, 'object-storage-credential.json'), '{"enc":1}');
+    mockQueryFn.mockResolvedValue({ rows: [] });
+
+    await runBackup(dropRoot);
+
+    const finalDir = await findFinalBackupDir(dropRoot);
+    const files = await fs.readdir(path.join(backupRootOf(dropRoot), finalDir!));
+    expect(files).toContain('object-storage.json');
+    expect(files).toContain('object-storage-credential.json');
+  });
+
   // (g) ------------------------------------------------------------------
   it('missing pg_dump binary is a loud non-zero failure, not a silent skip', async () => {
     await seedDropRoot(dropRoot, { withPgDump: false });
