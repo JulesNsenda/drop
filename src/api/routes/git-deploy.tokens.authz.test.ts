@@ -329,7 +329,7 @@ describe('git token routes authorization', () => {
       expect(asOwner.data.gitSource.tokenGrantedFor).toBeUndefined();
     });
 
-    it('assigning a legacy token\'s owner keeps apps of other owners pulling, by grant', async () => {
+    it('assigning an owner with cross-owner apps is a 409 naming them, and writes nothing', async () => {
       const legacy = await getGitDeployService().setToken('legacy-pat', 'ghp_legacyvalue');
       await gitApp('bobs-app', bobId, legacy.id);
 
@@ -338,10 +338,42 @@ describe('git token routes authorization', () => {
         headers: json(adminToken),
         body: JSON.stringify({ userId: aliceId }),
       });
+      expect(res.status).toBe(409);
+      expect(((await res.json()) as any).apps).toEqual(['bobs-app']);
+      expect(getStateManager().getApp('bobs-app')?.gitSource?.tokenGrantedBy).toBeUndefined();
+      expect(await listIds(aliceToken)).toEqual([]);
+    });
+
+    it('keepAttached grants the named app only; the response lists who was kept and who will fail', async () => {
+      const legacy = await getGitDeployService().setToken('legacy-pat', 'ghp_legacyvalue');
+      await gitApp('bobs-app', bobId, legacy.id);
+      await gitApp('carols-app', aliceId, legacy.id);
+      await gitApp('dropped-app', bobId, legacy.id);
+
+      const res = await app.request(`/api/v1/git/tokens/${legacy.id}/owner`, {
+        method: 'PUT',
+        headers: json(adminToken),
+        body: JSON.stringify({ userId: aliceId, keepAttached: ['bobs-app'] }),
+      });
       expect(res.status).toBe(200);
+      const data = ((await res.json()) as any).data;
+      expect(data.keptAttached).toEqual(['bobs-app']);
+      expect(data.willFail).toEqual(['dropped-app']);
       expect(getStateManager().getApp('bobs-app')?.gitSource?.tokenGrantedBy).toBe(adminId);
+
       expect((await redeploy(bobToken, 'bobs-app')).status).toBe(200);
-      expect(pulledWith()).toEqual(['ghp_legacyvalue']);
+      expect((await redeploy(bobToken, 'dropped-app')).status).toBe(200);
+      expect(pulledWith()).toEqual(['ghp_legacyvalue', undefined]);
+    });
+
+    it('keepAttached must be an array of names', async () => {
+      const legacy = await getGitDeployService().setToken('legacy-pat', 'ghp_legacyvalue');
+      const res = await app.request(`/api/v1/git/tokens/${legacy.id}/owner`, {
+        method: 'PUT',
+        headers: json(adminToken),
+        body: JSON.stringify({ userId: aliceId, keepAttached: 'bobs-app' }),
+      });
+      expect(res.status).toBe(400);
     });
 
     it('a webhook redeploy of an app with an attached token still uses it', async () => {

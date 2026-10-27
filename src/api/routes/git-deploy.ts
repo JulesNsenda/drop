@@ -423,25 +423,54 @@ gitDeploy.put('/tokens/:id/owner', async (c) => {
   const auth = (c.get as Function)('auth') as AuthContext | undefined;
   const refusal = humanOnly(auth, 'Assigning a git token owner');
   if (refusal) return c.json(error(ErrorCodes.UNAUTHORIZED, refusal), 403);
-  // The route floor is admin; checked again here so the rule survives a
-  // change to the registration.
+  // The route floor (authMiddleware('admin'), registered in server.ts) already
+  // refuses a non-admin; checked again here so the rule does not depend on
+  // that registration alone.
   if (auth && auth.role !== 'admin') {
     return c.json(error(ErrorCodes.UNAUTHORIZED, 'Admin access required'), 403);
   }
 
-  const body = await c.req.json<{ userId?: unknown }>().catch(() => ({}) as { userId?: unknown });
+  const body = await c.req
+    .json<{ userId?: unknown; keepAttached?: unknown }>()
+    .catch(() => ({}) as { userId?: unknown; keepAttached?: unknown });
   if (typeof body.userId !== 'string' || !body.userId) {
     throw new ValidationError('userId is required');
+  }
+  if (
+    body.keepAttached !== undefined &&
+    (!Array.isArray(body.keepAttached) || !body.keepAttached.every((n) => typeof n === 'string'))
+  ) {
+    throw new ValidationError('keepAttached must be an array of app names');
   }
   if (!getUserById(body.userId)) {
     return c.json(error(ErrorCodes.NOT_FOUND, 'User not found'), 404);
   }
 
-  const updated = await getGitDeployService().setTokenOwner(id, body.userId, auth?.userId ?? 'admin');
-  if (!updated) {
+  const result = await getGitDeployService().setTokenOwner(
+    id,
+    body.userId,
+    auth?.userId ?? 'admin',
+    body.keepAttached as string[] | undefined
+  );
+  if (result.status === 'unknown-token') {
     return c.json(error(ErrorCodes.NOT_FOUND, `Token '${id}' not found`), 404);
   }
-  return c.json(success({ message: 'Token owner updated' }));
+  if (result.status === 'needs-decision') {
+    // Nothing was changed. Name the apps so the admin can list the ones to keep.
+    return c.json(
+      {
+        ...error(
+          ErrorCodes.CONFLICT,
+          'Apps are attached to this token under another owner. Resend with keepAttached listing the apps that should keep pulling with it; any app not listed will stop.'
+        ),
+        apps: result.apps,
+      },
+      409
+    );
+  }
+  return c.json(
+    success({ message: 'Token owner updated', keptAttached: result.granted, willFail: result.failing })
+  );
 });
 
 export default gitDeploy;

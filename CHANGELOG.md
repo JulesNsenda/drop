@@ -40,10 +40,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before this change have no recorded owner, so they are administrator-only to
   list, delete, or newly attach until an administrator assigns one with
   `PUT /api/v1/git/tokens/:id/owner`; apps already attached to one keep using
-  it for redeploys, including webhook redeploys. Assigning an owner keeps
-  every app currently attached to that token pulling: each one whose owner
-  differs is marked as granted by the administrator who assigned it (and the
-  boot log and server log say so). A token an app already has follows its
+  it for redeploys, including webhook redeploys. Assigning an owner grants
+  nothing by itself: if apps with a different owner are attached to the token,
+  the request is refused (409) with their names, and `keepAttached` lists the
+  ones that should keep pulling with it. Those are marked as granted by the
+  administrator who assigned the owner; the others stop, and the response and
+  server log say which. A token an app already has follows its
   owner: if the app changes hands, a token owned by someone else stops being
   used for it, unless an administrator attached it on purpose; that grant is
   recorded on the app and counts only for the owner it was made for. Choosing

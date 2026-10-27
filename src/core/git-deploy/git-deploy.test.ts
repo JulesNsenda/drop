@@ -1702,9 +1702,9 @@ describe('GitDeployService', () => {
       const legacy = await service.setToken('legacy-pat', 'ghp_legacy');
       expect(service.listTokens(ALICE)).toEqual([]);
 
-      expect(await service.setTokenOwner(legacy.id, 'alice', 'root-admin')).toBe(true);
+      expect(await service.setTokenOwner(legacy.id, 'alice', 'root-admin')).toMatchObject({ status: 'ok' });
       expect(service.listTokens(ALICE).map((t) => t.id)).toEqual([legacy.id]);
-      expect(await service.setTokenOwner('git_nope', 'alice', 'root-admin')).toBe(false);
+      expect(await service.setTokenOwner('git_nope', 'alice', 'root-admin')).toEqual({ status: 'unknown-token' });
     });
 
     it('removeTokensOwnedBy deletes only that user\'s tokens and owner records', async () => {
@@ -1746,21 +1746,49 @@ describe('GitDeployService', () => {
       expect(await service.auditLegacyAttachments()).toBe(1);
     });
 
-    it('assigning an owner keeps every attached app of a different owner pulling, by recorded grant', async () => {
+    it('assigning an owner grants nothing by itself: cross-owner apps are reported and nothing is written', async () => {
       const t = await attachedApp('kept-going', 'carol', undefined, 'ghp_legacyvalue');
+
+      const res = await service.setTokenOwner(t.id, 'alice', 'root-admin');
+
+      expect(res).toEqual({ status: 'needs-decision', apps: ['kept-going'] });
+      expect(getStateManager().getApp('kept-going')?.gitSource?.tokenGrantedBy).toBeUndefined();
+      // The owner was not assigned either: the token is still legacy.
+      expect(service.listTokens(ALICE)).toEqual([]);
+    });
+
+    it('keepAttached grants only the named app; an unlisted one then fails closed', async () => {
+      const t = await attachedApp('kept-going', 'carol', undefined, 'ghp_legacyvalue');
+      await service.deploy({ repoUrl: 'https://github.com/user/dropped', branch: 'main', userId: 'dave' });
+      await service.redeploy('dropped', { tokenId: t.id }, ADMIN);
       await attachedApp('own-app', 'alice', undefined, 'ghp_other');
 
-      expect(await service.setTokenOwner(t.id, 'alice', 'root-admin')).toBe(true);
+      const res = await service.setTokenOwner(t.id, 'alice', 'root-admin', ['kept-going']);
 
-      const src = getStateManager().getApp('kept-going')?.gitSource;
-      expect(src?.tokenGrantedBy).toBe('root-admin');
-      expect(src?.tokenGrantedFor).toBe('carol');
-      const pull = jest.spyOn(gitClient, 'gitClone');
-      await service.redeploy('kept-going', {}, null);
-      expect(pullTokens(pull)).toEqual(['ghp_legacyvalue']);
-      pull.mockRestore();
+      expect(res).toEqual({ status: 'ok', granted: ['kept-going'], failing: ['dropped'] });
+      const kept = getStateManager().getApp('kept-going')?.gitSource;
+      expect(kept?.tokenGrantedBy).toBe('root-admin');
+      expect(kept?.tokenGrantedFor).toBe('carol');
+      expect(getStateManager().getApp('dropped')?.gitSource?.tokenGrantedBy).toBeUndefined();
       // An app already owned by the new owner needs no grant.
       expect(getStateManager().getApp('own-app')?.gitSource?.tokenGrantedBy).toBeUndefined();
+
+      const pull = jest.spyOn(gitClient, 'gitClone');
+      await service.redeploy('kept-going', {}, null);
+      await service.redeploy('dropped', {}, null);
+      expect(pullTokens(pull)).toEqual(['ghp_legacyvalue', undefined]);
+      pull.mockRestore();
+    });
+
+    it('an explicit empty keepAttached proceeds and grants nothing', async () => {
+      const t = await attachedApp('kept-going', 'carol', undefined, 'ghp_legacyvalue');
+
+      expect(await service.setTokenOwner(t.id, 'alice', 'root-admin', [])).toEqual({
+        status: 'ok',
+        granted: [],
+        failing: ['kept-going'],
+      });
+      expect(service.listTokens(ALICE).map((x) => x.id)).toEqual([t.id]);
     });
 
     it('a grant is honoured only while the app still has the owner it was made for', async () => {

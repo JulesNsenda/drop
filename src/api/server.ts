@@ -605,6 +605,10 @@ export class ApiServer {
       v1.use('/git/deploy', authMiddleware('user'));
       v1.use('/git/redeploy/*', authMiddleware('user'));
       v1.use('/git/tokens', authMiddleware('user'));
+      // Before the /git/tokens/* line, so a non-admin is refused here first.
+      // Both match the owner route and the floor reported is the strictest;
+      // the cost is one extra token verification on that one admin route.
+      v1.use('/git/tokens/:id/owner', authMiddleware('admin'));
       v1.use('/git/tokens/*', authMiddleware('user'));
       v1.use('/admin/*', authMiddleware('admin'));
     }

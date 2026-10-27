@@ -153,6 +153,9 @@ describe('GET /api/v1/openapi.json (#297)', () => {
       ['GET', '/api/v1/auth/users', 'admin'],
       ['GET', '/api/v1/auth/me', 'authenticated'],
       ['GET', '/api/v1/health/stats', 'readonly'],
+      // Strictest wins: the owner route is admin although /git/tokens/* is user.
+      ['PUT', '/api/v1/git/tokens/{id}/owner', 'admin'],
+      ['DELETE', '/api/v1/git/tokens/{id}', 'user'],
     ])('%s %s has floor %s', (method, p, role) => {
       const operation = op(method, p);
       expect(operation['x-drop-min-role']).toBe(role);

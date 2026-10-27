@@ -75,6 +75,12 @@ type TokenSource =
   | { kind: 'chosen'; id: string; caller: TokenCaller | null; appOwnerId?: string }
   | { kind: 'attached'; app: Pick<AppState, 'userId' | 'gitSource'> };
 
+/** What `setTokenOwner` did, or why it did not. */
+export type TokenOwnerResult =
+  | { status: 'unknown-token' }
+  | { status: 'needs-decision'; apps: string[] }
+  | { status: 'ok'; granted: string[]; failing: string[] };
+
 interface ResolvedToken {
   value: string;
   /** Admin user id, when an admin chose a token owned by someone other than the app's owner. */
@@ -1180,24 +1186,51 @@ export class GitDeployService {
       });
   }
 
-  /** Assign (or reassign) the owner of an existing token, e.g. a legacy one. False for an unknown id. */
-  async setTokenOwner(id: string, userId: string, grantedBy: string): Promise<boolean> {
-    if (!this.findTokenKey(id)) return false;
+  /**
+   * Assign (or reassign) the owner of an existing token, e.g. a legacy one.
+   * Grants nothing on its own: apps attached under a different owner are
+   * reported back (`needs-decision`) until `keepAttached` names them, and
+   * only the named ones get a grant.
+   */
+  async setTokenOwner(
+    id: string,
+    userId: string,
+    grantedBy: string,
+    keepAttached?: string[]
+  ): Promise<TokenOwnerResult> {
+    if (!this.findTokenKey(id)) return { status: 'unknown-token' };
+    // Apps using this token under a different owner than the new one. They stop
+    // pulling once the token has an owner, unless an admin names them.
+    const stateManager = getStateManager();
+    const crossOwner = stateManager
+      .getAllApps()
+      .filter((app) => app.gitSource?.tokenId === id && app.userId !== userId);
+    // Assigning an owner grants nothing by itself: the admin must say which of
+    // these apps to keep going, even if the answer is none (an empty list).
+    if (crossOwner.length > 0 && keepAttached === undefined) {
+      return { status: 'needs-decision', apps: crossOwner.map((a) => a.name) };
+    }
+
     await this.updateOwners((o) => {
       o[id] = userId;
     });
-    // Apps working off this token under another owner (grandfathered, or the
-    // previous owner's) would silently stop pulling now that it has an owner.
-    // The admin doing this is choosing to keep them going: record it.
-    const stateManager = getStateManager();
-    for (const app of stateManager.getAllApps()) {
-      if (app.gitSource?.tokenId !== id || app.userId === userId) continue;
+    const granted: string[] = [];
+    const failing: string[] = [];
+    for (const app of crossOwner) {
+      if (!keepAttached?.includes(app.name)) {
+        failing.push(app.name);
+        continue;
+      }
       await stateManager.updateApp(app.name, {
         gitSource: { ...app.gitSource, tokenGrantedBy: grantedBy, tokenGrantedFor: app.userId },
       } as Record<string, unknown>);
+      granted.push(app.name);
       logger.warn(`Token '${id}' now belongs to ${userId}; kept attached to '${app.name}' by grant of ${grantedBy}`, 'GIT-DEPLOY');
     }
-    return true;
+    for (const name of failing) {
+      logger.warn(`Token '${id}' now belongs to ${userId}; '${name}' no longer pulls with it (not listed in keepAttached)`, 'GIT-DEPLOY');
+    }
+    return { status: 'ok', granted, failing };
   }
 
   /** Delete every token a user owns, and their owner records. Returns how many tokens were removed. */
@@ -1239,7 +1272,7 @@ export class GitDeployService {
       }
       if (isAdmin) continue;
       flagged++;
-      logger.warn(`App '${app.name}' uses legacy git token '${id}' that has no owner (assign one with PUT /git/tokens/${id}/owner)`, 'GIT-DEPLOY');
+      logger.warn(`App '${app.name}' uses legacy git token '${id}' that has no owner (assigning an owner will stop it pulling unless the app is named in keepAttached: PUT /git/tokens/${id}/owner)`, 'GIT-DEPLOY');
     }
     return flagged;
   }
