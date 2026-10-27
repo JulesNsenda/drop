@@ -252,6 +252,13 @@ export interface DeployActorInfo {
   principalId?: string;
   actorUserId?: string;
   automationSource?: 'webhook';
+  /**
+   * The caller is an agent token (`AuthContext.kind === 'agent'`). Carried so an
+   * admission rule that must treat agents differently (an agent never rebuilds
+   * a stopped app) reads it from the same record the guardrail keys come from.
+   * Not part of any key.
+   */
+  agent?: boolean;
 }
 
 /**

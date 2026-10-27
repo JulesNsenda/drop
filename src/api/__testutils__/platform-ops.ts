@@ -18,7 +18,13 @@
  * `makeOps` that bakes one in) rather than the other way round.
  */
 
-import type { PlatformOps, AttachServiceResult, DetachServiceResult } from '../platform-ops';
+import type {
+  PlatformOps,
+  AttachServiceResult,
+  DetachServiceResult,
+  RedeployAdmission,
+  RedeployStart,
+} from '../platform-ops';
 import type { AccessGateVerdict } from '../../managers/guardrail/access-gate';
 
 export function makePlatformOpsStub(overrides?: Partial<PlatformOps>): PlatformOps {
@@ -48,6 +54,11 @@ export function makePlatformOpsStub(overrides?: Partial<PlatformOps>): PlatformO
     promoteApp: jest.fn().mockResolvedValue(undefined),
     rollbackApp: jest.fn(),
     describeRollback: jest.fn().mockResolvedValue(null),
+    admitExplicitUpdate: jest.fn().mockResolvedValue({
+      hold: { app: 'stub', release: jest.fn(), consume: jest.fn().mockReturnValue(() => undefined) },
+      admitted: {},
+    } satisfies RedeployAdmission),
+    startExplicitUpdate: jest.fn().mockResolvedValue({ started: 'stub-deploy-id' } satisfies RedeployStart),
     removeGroup: jest.fn().mockResolvedValue({ removed: [] }),
     purgeAppArtifacts: jest.fn().mockResolvedValue(undefined),
     reconfigureRoute: jest.fn().mockResolvedValue(undefined),

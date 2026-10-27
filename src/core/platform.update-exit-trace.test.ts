@@ -737,7 +737,10 @@ describe('handleAppUpdate exit trace', () => {
       p().appsInProgress.add(appName);
       trace.length = 0;
       setup();
-      expect(await p().acquireSlotAndRecheck(appName, admitted())).toEqual({ refused: reason });
+      // The guardrail refusal also says how long to wait.
+      expect(await p().acquireSlotAndRecheck(appName, admitted())).toEqual(
+        reason === 'guardrail' ? { refused: reason, retryAfterSeconds: 9 } : { refused: reason }
+      );
       const guardrail = reason === 'guardrail';
       // The guardrail refusal also closes its outcome, as the entry gate does.
       expect(trace.filter((e) => !guardrail || e === 'slot.release')).toEqual(['slot.release']);

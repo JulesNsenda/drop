@@ -5,6 +5,7 @@
  */
 
 import { AppType } from '../detector/detector.types';
+import type { DeployTriggerTag } from '../event-bus/event-bus.types';
 
 /**
  * Build stage names
@@ -62,6 +63,8 @@ export interface BuildContext {
    * the tracker falls back to minting.
    */
   deployId?: string;
+  /** What started the deploy; carried onto build:started (see BuildStartedPayload.trigger). */
+  trigger?: DeployTriggerTag;
   previousBuild?: BuildResult;
   /**
    * Scratch directory for ephemeral build artifacts (tarballs, generated

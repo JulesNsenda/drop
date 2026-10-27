@@ -99,6 +99,38 @@ describe('DeployTracker', () => {
     });
   });
 
+  describe('trigger', () => {
+    // An explicit redeploy publishes no app:detected / app:update, so the
+    // tracker has no inferred tag for it; the publisher says what it was.
+    it("prefers the publisher's trigger over the tag inferred from app:update", async () => {
+      bus.publish('app:update', {
+        name: 'trig',
+        path: '/x',
+        reason: 'file change',
+        bypassCooldown: true,
+      } as never);
+      bus.publish('build:started', { appId: 'trig', buildId: 'b1', deployId: 'd1', trigger: 'deploy' });
+      bus.publish('app:updated', { appId: 'trig', changes: { status: 'running' } });
+      await tracker.flush();
+
+      expect(tracker.getEpisodes('trig', 1)[0].trigger).toBe('deploy');
+    });
+
+    it('falls back to the inferred tag when the publisher says nothing', async () => {
+      bus.publish('app:update', {
+        name: 'trig2',
+        path: '/x',
+        reason: 'file change',
+        bypassCooldown: true,
+      } as never);
+      bus.publish('build:started', { appId: 'trig2', buildId: 'b1', deployId: 'd2' });
+      bus.publish('app:updated', { appId: 'trig2', changes: { status: 'running' } });
+      await tracker.flush();
+
+      expect(tracker.getEpisodes('trig2', 1)[0].trigger).toBe('hot-reload');
+    });
+  });
+
   describe('failure category is derived, not hardcoded', () => {
     // Gap A: builder.ts always knew which stage failed but published only
     // {appId, buildId, error}, so this handler hardcoded 'build-failed' while

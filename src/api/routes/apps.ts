@@ -13,7 +13,7 @@ import { pipeline } from 'stream/promises';
 import { success, error, ErrorCodes, AppDto, CreateAppDto } from '../types';
 import { NotFoundError, ValidationError } from '../middleware/error';
 import { AuthContext, listUsers, getUserById } from '../middleware/auth';
-import { canAccess, interactiveSessionOnly } from '../access';
+import { canAccess, canAccessScoped, interactiveSessionOnly } from '../access';
 import { isValidAppName, validateAppName } from '../middleware/validate';
 import { getAppRuntime } from '../../managers/runtime';
 import {
@@ -67,10 +67,11 @@ import {
   ACCESS_GATE_ENFORCEMENT_AVAILABLE,
   gateEnforced,
 } from '../../managers/guardrail/access-gate';
-import { DeployRefusedError } from '../../managers/guardrail/deploy-breaker';
+import { DeployRefusedError, type DeployActorInfo } from '../../managers/guardrail/deploy-breaker';
 import { QuotaExceededError } from '../../managers/guardrail/principal-quota';
 import { pruneOwnerDumpsToFit, predeleteMaxBytes } from '../../managers/guardrail/detach-limits';
 import { runUploadPreflight } from '../upload-preflight';
+import type { RedeployRefusal, RedeployRefusalCode } from '../platform-ops';
 import type { RuntimeType } from '../../managers/runtime/app-runtime.types';
 import {
   MAX_ACCESS_ALLOW_ENTRIES,
@@ -1279,6 +1280,80 @@ apps.post('/:name/restart', async c => {
     const message = err instanceof Error ? err.message : 'Failed to restart';
     return c.json(error(ErrorCodes.INTERNAL_ERROR, message), 500);
   }
+});
+
+// ============ Explicit redeploy (#359) ============
+
+/** Status and API code for each way an explicit redeploy can be refused. */
+const REDEPLOY_REFUSALS: Record<RedeployRefusalCode, { status: 404 | 409 | 429 | 503 | 507; code: string }> = {
+  NOT_FOUND: { status: 404, code: ErrorCodes.NOT_FOUND },
+  APP_BUSY: { status: 409, code: 'APP_BUSY' },
+  REDEPLOY_NOT_SUPPORTED_YET: { status: 409, code: 'REDEPLOY_NOT_SUPPORTED_YET' },
+  APP_STOPPED: { status: 409, code: 'APP_STOPPED' },
+  SERVICE_UNAVAILABLE: { status: 503, code: ErrorCodes.SERVICE_UNAVAILABLE },
+  RATE_LIMITED: { status: 429, code: ErrorCodes.RATE_LIMITED },
+  INSUFFICIENT_DISK: { status: 507, code: 'INSUFFICIENT_DISK' },
+};
+
+function redeployRefusalResponse(c: Context, refusal: RedeployRefusal) {
+  const { status, code } = REDEPLOY_REFUSALS[refusal.code];
+  if (refusal.retryAfterSeconds !== undefined) c.header('Retry-After', String(refusal.retryAfterSeconds));
+  return c.json(
+    error(
+      code,
+      refusal.message,
+      refusal.retryAfterSeconds !== undefined ? { retryAfterSeconds: refusal.retryAfterSeconds } : undefined
+    ),
+    status as 404
+  );
+}
+
+// POST /apps/:name/redeploy - rebuild a FILES app from the source already on
+// disk and swap it in. Resolves 202 once the build is minted (after the wait
+// for a builder slot); the build runs on behind it and is followed at
+// /deploys/<id>/stream. Git-backed apps and monorepo groups are refused for now.
+apps.post('/:name/redeploy', async c => {
+  const auth = (c.get as Function)('auth') as AuthContext | undefined;
+  const name = c.req.param('name');
+
+  // Authorization first, and a 404 that names only the app the caller asked
+  // for. Scoped: an agent token needs app:<name>:deploy for THIS app.
+  const app = getStateManager().getApp(name);
+  if (!app || !canAccessScoped(auth, app, name, 'deploy')) {
+    throw new NotFoundError(`Application '${name}' not found`);
+  }
+
+  const ops = getPlatformOps();
+  if (!ops) {
+    return c.json(error(ErrorCodes.SERVICE_UNAVAILABLE, 'Platform operations unavailable'), 503);
+  }
+
+  // One actor, for the admission, the guardrail keys and the stopped rule.
+  const actor: DeployActorInfo = {
+    principalId: auth?.principalId,
+    actorUserId: auth?.userId,
+    agent: auth?.kind === 'agent',
+  };
+
+  const admission = await ops.admitExplicitUpdate(name, actor);
+  if ('refused' in admission) return redeployRefusalResponse(c, admission.refused);
+
+  let started;
+  try {
+    started = await ops.startExplicitUpdate(admission.hold, admission.admitted);
+  } catch (err) {
+    // The hold is the only thing standing between the app and a wedged slot;
+    // a consumed hold ignores this.
+    admission.hold.release();
+    throw err;
+  }
+  if ('refused' in started) return redeployRefusalResponse(c, started.refused);
+
+  await logActivityFor(auth, { action: 'redeploy', appName: name, detail: 'files' });
+  return c.json(
+    success({ deployId: started.started, follow: `/api/v1/deploys/${started.started}/stream` }),
+    202
+  );
 });
 
 // ============ Rollback (#296) ============

@@ -127,6 +127,7 @@ export class BuilderService {
         appId: context.appName,
         buildId,
         deployId: context.deployId,
+        trigger: context.trigger,
       });
 
       const noStrategy: BuildError = {
@@ -190,6 +191,7 @@ export class BuilderService {
         appId: context.appName,
         buildId,
         deployId: context.deployId,
+        trigger: context.trigger,
       });
 
       // The strategy's dependency step hands back a handle (stage pre-build);

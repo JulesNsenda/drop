@@ -201,7 +201,7 @@ export class DeployTracker {
       userId,
       stage: 'triggered',
       at: pending?.at ?? at,
-      detail: pending?.trigger,
+      detail: payload.trigger ?? pending?.trigger,
     });
     this.rows.unshift({
       deployId,

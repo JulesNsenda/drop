@@ -20,6 +20,7 @@ import type { RollbackSnapshotMeta } from '../managers/rollback';
 // but not used in this file's own signatures.
 import type { AttachableServiceId, AttachServiceResult, DetachServiceResult } from './services-wire.types';
 import type { AccessGateVerdict } from '../managers/guardrail/access-gate';
+import type { DeployActorInfo } from '../managers/guardrail/deploy-breaker';
 
 /**
  * The attach/detach wire contract itself lives in `services-wire.types.ts` —
@@ -133,6 +134,46 @@ export function needsConfigAction(err: AppNeedsConfigError): string {
 export function needsConfigDetail(err: AppNeedsConfigError, appName: string): string {
   return `Application '${appName}' needs configuration — ${needsConfigAction(err)}, then retry`;
 }
+
+/**
+ * A reservation of one app's in-progress slot for an explicit redeploy
+ * (`reserveForUpdate`). `release` and `consume` act only while the platform's
+ * owner map still names THIS hold, so a stale hold can never free a later
+ * owner's claim. `consume` is one-shot: it hands the claim to the build and
+ * returns the callback that gives it back, after which `release` is a no-op;
+ * it returns null when the hold is already consumed, released or replaced.
+ */
+export interface UpdateHold {
+  readonly app: string;
+  release(): void;
+  consume(): (() => void) | null;
+}
+
+/** Why an explicit redeploy was refused. The route maps each code to its status. */
+export type RedeployRefusalCode =
+  | 'NOT_FOUND'
+  | 'APP_BUSY'
+  | 'SERVICE_UNAVAILABLE'
+  | 'REDEPLOY_NOT_SUPPORTED_YET'
+  | 'APP_STOPPED'
+  | 'RATE_LIMITED'
+  | 'INSUFFICIENT_DISK';
+
+export interface RedeployRefusal {
+  code: RedeployRefusalCode;
+  message: string;
+  retryAfterSeconds?: number;
+}
+
+/**
+ * What admission settled on, opaque to callers: handed back to
+ * `startExplicitUpdate` untouched.
+ */
+export type AdmittedRedeploy = object;
+
+export type RedeployAdmission = { refused: RedeployRefusal } | { hold: UpdateHold; admitted: AdmittedRedeploy };
+
+export type RedeployStart = { started: string } | { refused: RedeployRefusal };
 
 export interface PlatformOps {
   /**
@@ -254,6 +295,25 @@ export interface PlatformOps {
    * or the snapshot — without doing it; null when there is nothing.
    */
   describeRollback(appName: string): Promise<RollbackSnapshotMeta | null>;
+
+  /**
+   * Admit an explicit redeploy of a FILES app (source already on disk, rebuilt
+   * as it stands): take the app's slot, then decide under it that the app
+   * exists, is not git-backed or a monorepo container, passes the stopped
+   * rule, is admitted by the deploy guardrails (once, charging the caller's
+   * quota) and has disk. A refusal has released the slot already; otherwise the
+   * caller owns the returned hold and MUST pass it to `startExplicitUpdate`
+   * straight away. Authorization is the caller's, done first.
+   */
+  admitExplicitUpdate(appName: string, actor: DeployActorInfo): Promise<RedeployAdmission>;
+
+  /**
+   * Start an admitted redeploy: consumes the hold, waits for a builder slot,
+   * and resolves with the deploy id as soon as the build is minted - the build
+   * and swap run on behind it and close their own outcome. Never throws for a
+   * refusal; the hold's claim is given back on every path.
+   */
+  startExplicitUpdate(hold: UpdateHold, admitted: AdmittedRedeploy): Promise<RedeployStart>;
 
   /**
    * Tear down every app belonging to a monorepo group (M4): stop+delete each

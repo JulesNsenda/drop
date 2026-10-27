@@ -219,10 +219,19 @@ export interface BuildQueuedPayload extends BaseEvent {
  * and any future publisher — so the fallback stays live code rather than
  * becoming unreachable. The tracker logs when it takes that path.
  */
+/** What started a deploy, as the deploy tracker reports it (the existing wire values). */
+export type DeployTriggerTag = 'deploy' | 'hot-reload' | 'upload';
+
 export interface BuildStartedPayload extends BaseEvent {
   appId: string;
   buildId: string;
   deployId?: string;
+  /**
+   * What started this deploy, when the publisher knows. The tracker prefers it
+   * over the transient tag it inferred from the preceding app:detected /
+   * app:update, which an explicit redeploy (it publishes neither) never sets.
+   */
+  trigger?: DeployTriggerTag;
 }
 
 export interface BuildProgressPayload extends BaseEvent {
