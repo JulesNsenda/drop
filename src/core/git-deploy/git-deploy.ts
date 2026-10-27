@@ -817,15 +817,8 @@ export class GitDeployService {
       throw new AppInProgressError(appName);
     }
 
-    // The recorded URL, credential-stripped and re-validated (an older install
-    // may have stored one with userinfo). It is what is logged, cloned,
-    // persisted and returned.
-    const { branch } = app.gitSource;
-    const cloneUrl = normalizeRepoUrl(stripUrlCredentials(app.gitSource.repoUrl) ?? app.gitSource.repoUrl);
-    if (!isValidGitHubUrl(cloneUrl)) {
-      throw new Error(`Invalid recorded repository URL for ${appName}`);
-    }
-    const baseSource: GitSource = app.gitSource;
+    // Refused up front, before the reservation and the quota charge.
+    this.recordedCloneUrl(app);
 
     return this.serialised(appName, async () => {
       // The reservation comes BEFORE the quota is charged: an attempt that is
@@ -859,161 +852,7 @@ export class GitDeployService {
           );
         }
 
-        // undefined (the default, via omission) leaves the stored token
-        // unchanged; null clears it; a string attaches/replaces it. Resolved once
-        // and used for BOTH the clone and the final gitSource below — `app` is a
-        // snapshot captured above, and updateApp REPLACES the map entry rather
-        // than mutating it, so a second read of app.gitSource after this point
-        // would still see the pre-redeploy value.
-        const effectiveTokenId = actor.tokenId !== undefined ? actor.tokenId : baseSource.tokenId;
-
-        // A CLEAR is a revocation, not a deploy outcome, so it is persisted BEFORE
-        // the pull — the one deliberate asymmetry with the attach direction.
-        //
-        // Both directions cannot use the post-pull write: clearing a credential
-        // makes the very next pull unauthenticated, so on a private repo it throws
-        // and the write below never runs. The clear would be silently discarded
-        // every time, which leaves NO route to detach a compromised PAT short of
-        // hand-editing apps.json. The stale-snapshot trap that forced the attach
-        // AFTER the pull does not apply here: there is nothing a later spread can
-        // resurrect once the field is gone, and `effectiveTokenId` (null) drives
-        // the post-pull write too, so the two agree.
-        if (actor.tokenId === null && baseSource.tokenId) {
-          const cleared: GitSource = {
-            ...baseSource,
-            tokenId: undefined,
-            tokenGrantedBy: undefined,
-            tokenGrantedFor: undefined,
-          };
-          await stateManager.updateApp(appName, { gitSource: cleared } as Record<string, unknown>);
-          logger.info(`Cleared the stored git credential for ${appName}`, 'GIT-DEPLOY');
-        }
-
-        // Resolve token if needed
-        let token: string | undefined;
-        // A grant survives only while the token stays; clearing drops it, a new
-        // choice replaces it, and a plain redeploy leaves it alone.
-        let tokenGrantedBy = baseSource.tokenGrantedBy;
-        let tokenGrantedFor = baseSource.tokenGrantedFor;
-        // True only when THIS call established the grant (the admin-chosen path).
-        let grantedHere = false;
-        let ownerAtResolve: string | undefined;
-        if (effectiveTokenId === null) {
-          tokenGrantedBy = undefined;
-          tokenGrantedFor = undefined;
-        }
-        if (effectiveTokenId) {
-          // An id chosen on THIS request is owner-checked; an inherited one is
-          // the app's existing attachment. Naming the id the app already has is
-          // not a choice, so it resolves as attached: same answer either way.
-          const chosen = typeof actor.tokenId === 'string' && actor.tokenId !== baseSource.tokenId;
-          const resolved = await this.resolveToken(
-            chosen
-              ? { kind: 'chosen', id: effectiveTokenId, caller, appOwnerId: app.userId }
-              : { kind: 'attached', app }
-          );
-          token = resolved?.value;
-          if (chosen) {
-            tokenGrantedBy = resolved?.grantedBy;
-            tokenGrantedFor = resolved?.grantedFor;
-            grantedHere = true;
-            // Who owned the token when the grant was minted; re-checked at write time.
-            ownerAtResolve = this.readOwners()?.[effectiveTokenId];
-          }
-          if (!token) {
-            // Branch on PROVENANCE. An id the caller supplied on THIS request that
-            // resolves to nothing is a caller error — deploy() throws for exactly
-            // this condition — and warning past it returns 200 while persisting a
-            // dangling reference that silently degrades every later unattended
-            // webhook redeploy to unauthenticated. An INHERITED id is different:
-            // the token may have been deleted since, and refusing to redeploy an
-            // existing app over that is worse than trying.
-            if (actor.tokenId) {
-              throw new Error(`GitHub token '${actor.tokenId}' not found`);
-            }
-            logger.warn(`Token '${effectiveTokenId}' not found for ${appName} - trying without auth`, 'GIT-DEPLOY');
-          }
-        }
-
-        logger.info(`Redeploying ${appName} from ${cloneUrl} (branch: ${branch})`, 'GIT-DEPLOY');
-
-        // Rollback snapshot of the tree that is SERVING, before it is replaced
-        // (#296). Best-effort by contract: it never throws, and a skipped or
-        // failed snapshot never fails the deploy — it only means this redeploy
-        // cannot be rolled back, which the rollback route reports as such.
-        // The tree carries no .git (every git deploy clones fresh), so a restore
-        // puts the files back and the next redeploy simply clones again.
-        const snapshot = await captureBeforeRedeploy(appName);
-        if (!snapshot.captured) {
-          logger.info(`No rollback snapshot for ${appName}: ${snapshot.reason}`, 'GIT-DEPLOY');
-        }
-
-        // Mark as cloning for the duration of the land only - mirrors deploy()'s
-        // guard against the watcher building a half-written tree. Cleared before
-        // the deterministic publish below, or the platform's isCloning guards
-        // (platform.ts) would eat that event too.
-        this.beginClone(appName);
-        let commitSha: string | undefined;
-        try {
-          // Clone the recorded URL into a platform-owned temp dir; git never
-          // runs inside the app folder.
-          commitSha = await this.cloneAndLand(appName, cloneUrl, branch, token, app.path);
-        } finally {
-          this.endClone(appName);
-        }
-
-        const clonedAt = new Date().toISOString();
-
-        // Built from effectiveTokenId, NOT app.gitSource.tokenId — see the note
-        // above. Spreading the stale field here would silently revert an attach
-        // on this success path (the defect two independent reviewers found).
-        // Re-read the app: the clone took time, and the credential may have
-        // been cleared or replaced meanwhile (a revocation). If the id on
-        // record is no longer the one this redeploy started from, that newer
-        // decision stands and only the commit and time are written. (A clear
-        // THIS call made was persisted before the clone, so it is the expected
-        // state, not a race.)
-        //
-        // The grant is checked the same way. setTokenOwner revokes a grant while
-        // KEEPING tokenId, so comparing the id alone would let a revocation that
-        // landed during the clone be overwritten by the pre-clone grant. A grant
-        // is written from the pre-clone snapshot only when THIS call just made it
-        // (an admin-chosen token); otherwise it is taken from the latest state.
-        const latest = stateManager.getApp(appName)?.gitSource;
-        // A grant minted by this call is void if the token changed hands during
-        // the clone (setTokenOwner could not see this app: it was not attached
-        // yet). The token is still attached, without the grant, so it fails
-        // closed on the next resolve. Checked here, synchronously before the write.
-        if (grantedHere && tokenGrantedBy && this.readOwners()?.[effectiveTokenId as string] !== ownerAtResolve) {
-          logger.warn(
-            `Token '${effectiveTokenId}' changed owner while ${appName} was cloning; the grant made for this redeploy was not recorded`,
-            'GIT-DEPLOY'
-          );
-          tokenGrantedBy = undefined;
-          tokenGrantedFor = undefined;
-        }
-        const expectedTokenId = actor.tokenId === null ? undefined : baseSource.tokenId;
-        const expectedGrantedBy = actor.tokenId === null ? undefined : baseSource.tokenGrantedBy;
-        const expectedGrantedFor = actor.tokenId === null ? undefined : baseSource.tokenGrantedFor;
-        const gitSource: GitSource =
-          latest &&
-          (latest.tokenId !== expectedTokenId ||
-            latest.tokenGrantedBy !== expectedGrantedBy ||
-            latest.tokenGrantedFor !== expectedGrantedFor)
-            ? { ...latest, repoUrl: cloneUrl, lastCommitSha: commitSha, lastClonedAt: clonedAt }
-            : {
-                ...(latest ?? baseSource),
-                repoUrl: cloneUrl,
-                tokenId: effectiveTokenId === null ? undefined : effectiveTokenId,
-                tokenGrantedBy: grantedHere ? tokenGrantedBy : latest?.tokenGrantedBy,
-                tokenGrantedFor: grantedHere ? tokenGrantedFor : latest?.tokenGrantedFor,
-                lastCommitSha: commitSha,
-                lastClonedAt: clonedAt,
-              };
-
-        await stateManager.updateApp(appName, { gitSource } as Record<string, unknown>);
-
-        logger.info(`Redeployed ${appName} (${commitSha?.slice(0, 7) || 'unknown'})`, 'GIT-DEPLOY');
+        const landed = await this.landUnderHold(app, actor, caller);
 
         // The land is finished: free the app for the rebuild this publish triggers
         // (handleAppUpdate drops an update for an app that is still in progress).
@@ -1033,17 +872,206 @@ export class GitDeployService {
           automationSource: actor.automation,
         });
 
-        return {
-          appName,
-          repoUrl: cloneUrl,
-          branch,
-          commitSha,
-          clonedAt,
-        };
+        return landed;
       } finally {
         release();
       }
     });
+  }
+
+  /** The recorded clone URL of a git-deployed app: credential-stripped and re-validated (an older install may have stored one with userinfo). It is what is logged, cloned, persisted and returned. */
+  private recordedCloneUrl(app: AppState): string {
+    const recorded = app.gitSource!.repoUrl;
+    const cloneUrl = normalizeRepoUrl(stripUrlCredentials(recorded) ?? recorded);
+    if (!isValidGitHubUrl(cloneUrl)) {
+      throw new Error(`Invalid recorded repository URL for ${app.name}`);
+    }
+    return cloneUrl;
+  }
+
+  /**
+   * The land of a git redeploy, run by a caller that already holds the app's
+   * slot (the per-app chain, the folder reservation and the deploy admission
+   * are all the CALLER's): resolve the stored token, snapshot the serving tree,
+   * clone fresh, land the tracked files, and record the commit on the app.
+   * Never publishes the rebuild and never releases the slot: what follows a
+   * land is the caller's to decide. `app` is the caller's snapshot of the
+   * app, which must carry a gitSource.
+   *
+   * `actor.tokenId` is how a request chooses, clears or keeps the stored
+   * token; a caller with no choice to make (the platform's own redeploy) leaves
+   * it unset, and the token then resolves as ATTACHED to the app only.
+   */
+  async landUnderHold(app: AppState, actor: DeployActor, caller: TokenCaller | null): Promise<GitDeployResult> {
+    const appName = app.name;
+    const stateManager = getStateManager();
+    const { branch } = app.gitSource!;
+    const cloneUrl = this.recordedCloneUrl(app);
+    const baseSource: GitSource = app.gitSource!;
+
+    // undefined (the default, via omission) leaves the stored token
+    // unchanged; null clears it; a string attaches/replaces it. Resolved once
+    // and used for BOTH the clone and the final gitSource below — `app` is a
+    // snapshot captured above, and updateApp REPLACES the map entry rather
+    // than mutating it, so a second read of app.gitSource after this point
+    // would still see the pre-redeploy value.
+    const effectiveTokenId = actor.tokenId !== undefined ? actor.tokenId : baseSource.tokenId;
+
+    // A CLEAR is a revocation, not a deploy outcome, so it is persisted BEFORE
+    // the pull — the one deliberate asymmetry with the attach direction.
+    //
+    // Both directions cannot use the post-pull write: clearing a credential
+    // makes the very next pull unauthenticated, so on a private repo it throws
+    // and the write below never runs. The clear would be silently discarded
+    // every time, which leaves NO route to detach a compromised PAT short of
+    // hand-editing apps.json. The stale-snapshot trap that forced the attach
+    // AFTER the pull does not apply here: there is nothing a later spread can
+    // resurrect once the field is gone, and `effectiveTokenId` (null) drives
+    // the post-pull write too, so the two agree.
+    if (actor.tokenId === null && baseSource.tokenId) {
+      const cleared: GitSource = {
+        ...baseSource,
+        tokenId: undefined,
+        tokenGrantedBy: undefined,
+        tokenGrantedFor: undefined,
+      };
+      await stateManager.updateApp(appName, { gitSource: cleared } as Record<string, unknown>);
+      logger.info(`Cleared the stored git credential for ${appName}`, 'GIT-DEPLOY');
+    }
+
+    // Resolve token if needed
+    let token: string | undefined;
+    // A grant survives only while the token stays; clearing drops it, a new
+    // choice replaces it, and a plain redeploy leaves it alone.
+    let tokenGrantedBy = baseSource.tokenGrantedBy;
+    let tokenGrantedFor = baseSource.tokenGrantedFor;
+    // True only when THIS call established the grant (the admin-chosen path).
+    let grantedHere = false;
+    let ownerAtResolve: string | undefined;
+    if (effectiveTokenId === null) {
+      tokenGrantedBy = undefined;
+      tokenGrantedFor = undefined;
+    }
+    if (effectiveTokenId) {
+      // An id chosen on THIS request is owner-checked; an inherited one is
+      // the app's existing attachment. Naming the id the app already has is
+      // not a choice, so it resolves as attached: same answer either way.
+      const chosen = typeof actor.tokenId === 'string' && actor.tokenId !== baseSource.tokenId;
+      const resolved = await this.resolveToken(
+        chosen
+          ? { kind: 'chosen', id: effectiveTokenId, caller, appOwnerId: app.userId }
+          : { kind: 'attached', app }
+      );
+      token = resolved?.value;
+      if (chosen) {
+        tokenGrantedBy = resolved?.grantedBy;
+        tokenGrantedFor = resolved?.grantedFor;
+        grantedHere = true;
+        // Who owned the token when the grant was minted; re-checked at write time.
+        ownerAtResolve = this.readOwners()?.[effectiveTokenId];
+      }
+      if (!token) {
+        // Branch on PROVENANCE. An id the caller supplied on THIS request that
+        // resolves to nothing is a caller error — deploy() throws for exactly
+        // this condition — and warning past it returns 200 while persisting a
+        // dangling reference that silently degrades every later unattended
+        // webhook redeploy to unauthenticated. An INHERITED id is different:
+        // the token may have been deleted since, and refusing to redeploy an
+        // existing app over that is worse than trying.
+        if (actor.tokenId) {
+          throw new Error(`GitHub token '${actor.tokenId}' not found`);
+        }
+        logger.warn(`Token '${effectiveTokenId}' not found for ${appName} - trying without auth`, 'GIT-DEPLOY');
+      }
+    }
+
+    logger.info(`Redeploying ${appName} from ${cloneUrl} (branch: ${branch})`, 'GIT-DEPLOY');
+
+    // Rollback snapshot of the tree that is SERVING, before it is replaced
+    // (#296). Best-effort by contract: it never throws, and a skipped or
+    // failed snapshot never fails the deploy — it only means this redeploy
+    // cannot be rolled back, which the rollback route reports as such.
+    // The tree carries no .git (every git deploy clones fresh), so a restore
+    // puts the files back and the next redeploy simply clones again.
+    const snapshot = await captureBeforeRedeploy(appName);
+    if (!snapshot.captured) {
+      logger.info(`No rollback snapshot for ${appName}: ${snapshot.reason}`, 'GIT-DEPLOY');
+    }
+
+    // Mark as cloning for the duration of the land only - mirrors deploy()'s
+    // guard against the watcher building a half-written tree. Cleared before
+    // the caller's deterministic publish, or the platform's isCloning guards
+    // (platform.ts) would eat that event too.
+    this.beginClone(appName);
+    let commitSha: string | undefined;
+    try {
+      // Clone the recorded URL into a platform-owned temp dir; git never
+      // runs inside the app folder.
+      commitSha = await this.cloneAndLand(appName, cloneUrl, branch, token, app.path);
+    } finally {
+      this.endClone(appName);
+    }
+
+    const clonedAt = new Date().toISOString();
+
+    // Built from effectiveTokenId, NOT app.gitSource.tokenId — see the note
+    // above. Spreading the stale field here would silently revert an attach
+    // on this success path (the defect two independent reviewers found).
+    // Re-read the app: the clone took time, and the credential may have
+    // been cleared or replaced meanwhile (a revocation). If the id on
+    // record is no longer the one this redeploy started from, that newer
+    // decision stands and only the commit and time are written. (A clear
+    // THIS call made was persisted before the clone, so it is the expected
+    // state, not a race.)
+    //
+    // The grant is checked the same way. setTokenOwner revokes a grant while
+    // KEEPING tokenId, so comparing the id alone would let a revocation that
+    // landed during the clone be overwritten by the pre-clone grant. A grant
+    // is written from the pre-clone snapshot only when THIS call just made it
+    // (an admin-chosen token); otherwise it is taken from the latest state.
+    const latest = stateManager.getApp(appName)?.gitSource;
+    // A grant minted by this call is void if the token changed hands during
+    // the clone (setTokenOwner could not see this app: it was not attached
+    // yet). The token is still attached, without the grant, so it fails
+    // closed on the next resolve. Checked here, synchronously before the write.
+    if (grantedHere && tokenGrantedBy && this.readOwners()?.[effectiveTokenId as string] !== ownerAtResolve) {
+      logger.warn(
+        `Token '${effectiveTokenId}' changed owner while ${appName} was cloning; the grant made for this redeploy was not recorded`,
+        'GIT-DEPLOY'
+      );
+      tokenGrantedBy = undefined;
+      tokenGrantedFor = undefined;
+    }
+    const expectedTokenId = actor.tokenId === null ? undefined : baseSource.tokenId;
+    const expectedGrantedBy = actor.tokenId === null ? undefined : baseSource.tokenGrantedBy;
+    const expectedGrantedFor = actor.tokenId === null ? undefined : baseSource.tokenGrantedFor;
+    const gitSource: GitSource =
+      latest &&
+      (latest.tokenId !== expectedTokenId ||
+        latest.tokenGrantedBy !== expectedGrantedBy ||
+        latest.tokenGrantedFor !== expectedGrantedFor)
+        ? { ...latest, repoUrl: cloneUrl, lastCommitSha: commitSha, lastClonedAt: clonedAt }
+        : {
+            ...(latest ?? baseSource),
+            repoUrl: cloneUrl,
+            tokenId: effectiveTokenId === null ? undefined : effectiveTokenId,
+            tokenGrantedBy: grantedHere ? tokenGrantedBy : latest?.tokenGrantedBy,
+            tokenGrantedFor: grantedHere ? tokenGrantedFor : latest?.tokenGrantedFor,
+            lastCommitSha: commitSha,
+            lastClonedAt: clonedAt,
+          };
+
+    await stateManager.updateApp(appName, { gitSource } as Record<string, unknown>);
+
+    logger.info(`Redeployed ${appName} (${commitSha?.slice(0, 7) || 'unknown'})`, 'GIT-DEPLOY');
+
+    return {
+      appName,
+      repoUrl: cloneUrl,
+      branch,
+      commitSha,
+      clonedAt,
+    };
   }
 
   /** Store a GitHub Personal Access Token, owned by `ownerUserId` (unset only when auth is disabled) */
