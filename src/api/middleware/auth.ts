@@ -62,6 +62,16 @@ export interface User {
    */
   credentialsInvalidBefore?: string;
   /**
+   * Stamped when the user's role is LOWERED. Honoured ONLY by the interactive
+   * credential classes (session JWT, OAuth/app-MCP access tokens, refresh
+   * tokens, authorization codes) via `predatesSessionInvalidation`, so a demoted
+   * user must sign in / re-authorize connectors at the new rank. Deliberately NOT
+   * `credentialsInvalidBefore`: API keys and agent tokens keep working, clamped
+   * to the owner's lower role as before. Optional, so records written before it
+   * existed load unchanged.
+   */
+  sessionsInvalidBefore?: string;
+  /**
    * DROP-130 Item 6: set only when this account was minted through the
    * SCOPED (non-admin, capability-only) path — a rank-0 `users:create`
    * caller acting on `POST /auth/users`, never an admin. `authenticateUser`
@@ -1261,6 +1271,22 @@ export function listExternalIdentities(
  */
 
 /**
+ * `predatesInvalidationStamp` against BOTH of the user's stamps: the
+ * user-wide `credentialsInvalidBefore` and `sessionsInvalidBefore` (role
+ * demotion). Called by the session/connector verifiers only; the API-key paths
+ * keep checking `credentialsInvalidBefore` alone.
+ */
+export function predatesSessionInvalidation(
+  mintedAt: string | number | undefined,
+  user: Pick<User, 'credentialsInvalidBefore' | 'sessionsInvalidBefore'>
+): boolean {
+  return (
+    predatesInvalidationStamp(mintedAt, user.credentialsInvalidBefore) ||
+    predatesInvalidationStamp(mintedAt, user.sessionsInvalidBefore)
+  );
+}
+
+/**
  * Set `user.enabled` and, whenever the TARGET state is disabled, stamp
  * `credentialsInvalidBefore` — the ONE shared primitive `suspendUser` and
  * `updateUser` (the dashboard's `PUT /auth/users/:id {enabled:false}` disable
@@ -1368,12 +1394,12 @@ export async function updateUser(userId: string, updates: { enabled?: boolean; r
 
   if (updates.enabled !== undefined) setUserEnabled(user, updates.enabled);
   if (updates.role) {
-    // A LOWERING of rank invalidates every credential issued under the old,
-    // higher role (sessions, API keys, refresh tokens, OAuth connector grants)
-    // the same way a suspension does, so the user must re-authorize at the new
-    // rank. A raise or an unchanged role leaves them alone.
+    // A LOWERING of rank invalidates sessions and connector grants issued
+    // under the old, higher role, so the user must re-authorize at the new
+    // rank. API keys are untouched (the owner-role clamp caps them). A raise
+    // or an unchanged role leaves everything alone.
     if (rankOf(updates.role) < rankOf(user.role)) {
-      user.credentialsInvalidBefore = new Date().toISOString();
+      user.sessionsInvalidBefore = new Date().toISOString();
     }
     user.role = updates.role;
   }
@@ -1842,7 +1868,7 @@ export async function verifyAppMcpAccessToken(
     // the rest of its 15-minute lifetime just because the account was later
     // re-enabled or the password changed.
     const iat = typeof p['iat'] === 'number' ? (p['iat'] as number) : undefined;
-    if (predatesInvalidationStamp(iat, user.credentialsInvalidBefore)) return null;
+    if (predatesSessionInvalidation(iat, user)) return null;
 
     const sid = p['sid'];
     if (typeof sid === 'string' && sid && isGrantDenied(sid)) return null;
@@ -1918,7 +1944,7 @@ export async function verifyOAuthAccessToken(
     // authenticating for the rest of its 15-minute lifetime just because the
     // account was later re-enabled or the password changed.
     const iat = typeof p['iat'] === 'number' ? (p['iat'] as number) : undefined;
-    if (predatesInvalidationStamp(iat, record.credentialsInvalidBefore)) return null;
+    if (predatesSessionInvalidation(iat, record)) return null;
 
     // Single-grant revocation, within this process lifetime. Not durable — see
     // the note above the denylist.
@@ -2195,7 +2221,7 @@ export async function rotateRefreshToken(presented: string): Promise<{
   // access tokens after a later re-enable or password change. Checked here,
   // before the record is consumed, for the same reason as the `enabled`
   // check above.
-  if (predatesInvalidationStamp(createdAt, owner.credentialsInvalidBefore)) return null;
+  if (predatesSessionInvalidation(createdAt, owner)) return null;
 
   // Global connector-policy gate — site 3 of 5, see `mayUseConnectors`'
   // header (connector-policy.ts). THIS PLACEMENT IS THE WHOLE POINT: checked
@@ -2876,7 +2902,7 @@ export function authMiddleware(requiredRole?: 'admin' | 'user' | 'readonly') {
       // `payload.iat`, set by `issueSessionJwt`'s `.setIssuedAt()` — Unix
       // SECONDS, which `predatesInvalidationStamp` already accepts (see the
       // two OAuth call sites).
-      if (predatesInvalidationStamp(jwtIssuedAt, jwtUserRecord.credentialsInvalidBefore)) {
+      if (predatesSessionInvalidation(jwtIssuedAt, jwtUserRecord)) {
         return c.json(error(ErrorCodes.UNAUTHORIZED, 'Account is no longer active'), 401);
       }
       // Role from the RECORD, not the claim — a demotion must bite now.

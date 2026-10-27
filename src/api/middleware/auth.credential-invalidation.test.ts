@@ -672,6 +672,21 @@ describe('credentialsInvalidBefore (DROP-130 Items 4 & 5)', () => {
       expect(await verifyOAuthAccessToken(oauth, AUD)).toBeNull();
     });
 
+    it('demotion kills the refresh token (session/connector class) but not the API key, which is clamped', async () => {
+      const bob = await createUser({ username: 'bob-demote-key', role: 'user', credential: { password: PASSWORD } });
+      const { key } = await createApiKey('bob-demote-key-ci', 'user', undefined, undefined, bob.id);
+      const refresh = await issueRefreshToken(bob.id, 'client-demote', 'sid-demote-key');
+      await clockTick();
+      expect((await probeWithKey(key)).auth?.role).toBe('user');
+
+      await updateUser(bob.id, { role: 'readonly' });
+
+      const after = await probeWithKey(key);
+      expect(after.status).toBe(200);
+      expect(after.auth?.role).toBe('readonly');
+      expect(await rotateRefreshToken(refresh)).toBeNull();
+    });
+
     it('promotion (readonly -> user) does NOT log the user out', async () => {
       const bob = await createUser({ username: 'bob-promote', role: 'readonly', credential: { password: PASSWORD } });
       const oauth = await mintOAuthAccessToken(bob, AUD, 'sid-promote');

@@ -50,7 +50,7 @@ import {
   rotateRefreshToken,
   revokeRefreshToken,
   getUserById,
-  predatesInvalidationStamp,
+  predatesSessionInvalidation,
   type AuthContext,
   type User,
 } from '../middleware/auth';
@@ -420,7 +420,7 @@ oauth.post('/token', async (c) => {
     }
     // Same reasoning, for the stamp itself: a code minted BEFORE containment
     // must not be exchangeable after, even within its own 60s TTL.
-    if (predatesInvalidationStamp(record.createdAt, user.credentialsInvalidBefore)) {
+    if (predatesSessionInvalidation(record.createdAt, user)) {
       return tokenError('invalid_grant', 'Authorization code predates a credential invalidation');
     }
 

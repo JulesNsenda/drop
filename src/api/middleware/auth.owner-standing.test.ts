@@ -148,10 +148,10 @@ describe('owner-derived API-key standing', () => {
 
       await updateUser(owner.id, { role: 'readonly' });
 
-      // A demotion also stamps credentialsInvalidBefore, so a token minted
-      // BEFORE it stops authenticating (401) instead of reaching the clamp.
+      // Falls through to authMiddleware('user') once resolveAgentToken
+      // refuses it — a role:'none' principal 403s a user-gated route.
       const after = await probeWith(mcpGate, key);
-      expect(after.status).toBe(401);
+      expect(after.status).toBe(403);
     });
 
     it('an admin-owned agent token is unaffected — the owner still ranks at least user', async () => {
@@ -181,10 +181,8 @@ describe('owner-derived API-key standing', () => {
 
     await updateUser(owner.id, { role: 'readonly' });
 
-    // A demotion also stamps credentialsInvalidBefore, so a key minted BEFORE it
-    // stops authenticating (401) instead of reaching the clamp.
     const after = await probeWith(adminGate, key);
-    expect(after.status).toBe(401);
+    expect(after.status).toBe(403);
   });
 
   it("attributes an owned key's request to the OWNER's username, not the key's own name", async () => {
@@ -234,10 +232,8 @@ describe('owner-derived API-key standing', () => {
 
     await updateUser(owner.id, { role: 'readonly' });
 
-    // A demotion also stamps credentialsInvalidBefore, so a key minted BEFORE it
-    // stops authenticating (401) instead of reaching the clamp.
     const after = await probeWith(capabilityGate, key);
-    expect(after.status).toBe(401);
+    expect(after.status).toBe(403);
   });
 
   it("suppresses a control-plane scope on a role:'none' key even with a perfectly healthy (not demoted) owner", async () => {
