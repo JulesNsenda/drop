@@ -3828,6 +3828,17 @@ backup:
   }
 
   /**
+   * Which app an object-storage record must belong to for this app to act on
+   * it: owner plus creation stamp, from the app's live state. Undefined when
+   * the state is already gone (the delete safety net), in which case the
+   * provisioner cannot verify and does not try.
+   */
+  private incarnationOf(appName: string): { ownerUserId?: string; appCreatedAt?: string } | undefined {
+    const state = this.stateManager?.getApp(appName);
+    return state ? { ownerUserId: state.userId, appCreatedAt: state.createdAt } : undefined;
+  }
+
+  /**
    * Reserve an app against every other lifecycle operation (deploy, restart,
    * attach, detach) for as long as the caller holds it. Null when it is busy.
    * The delete route holds this across its whole teardown, because attach and
@@ -3854,7 +3865,7 @@ backup:
    */
   private async retireObjectStorageOfDeletedApp(name: string, keepData?: boolean): Promise<void> {
     try {
-      const torn = await this.objectStorage?.teardownForDeletedApp(name, { keepData });
+      const torn = await this.objectStorage?.teardownForDeletedApp(name, { keepData }, this.incarnationOf(name));
       if (torn?.outcome !== 'retired') return;
       if (torn.reason === 'kept') {
         this.logger.warn(
@@ -3905,9 +3916,14 @@ backup:
         // detach or delete is holding the app: a re-attach reuses the key
         // before it writes 'attached', and the sweep must not revoke it in
         // that window.
+        // It answers with the app's incarnation, so a record that belongs to
+        // an EARLIER app of the same name is skipped, never drained for this one.
+        // No state at all answers with an empty incarnation, which matches no record.
         shouldDrain: (appName) =>
           !this.appsInProgress.has(appName) &&
-          this.appServiceIntent(appName, 'object-storage') === 'detached',
+          this.appServiceIntent(appName, 'object-storage') === 'detached'
+            ? (this.incarnationOf(appName) ?? {})
+            : false,
       });
       if (destroyed > 0) {
         this.logger.info(`Removed ${destroyed} object-storage bucket(s) left behind by deleted or detached apps`, 'STORAGE');
@@ -9302,7 +9318,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     let outcome: DetachServiceOutcome;
     try {
       wasLive = (await this.runtime!.getStatus(appName))?.status === 'running';
-      const revoked = await storage.revokeAppAccess(appName);
+      const revoked = await storage.revokeAppAccess(appName, this.incarnationOf(appName));
       outcome = revoked
         ? { detached: true, deprovisioned: true, drainPending: true }
         : // The allocation vanished since step 5 — nothing left to remove.

@@ -1180,6 +1180,7 @@ admin.get('/object-storage/retired', async (c) => {
           retiredAt: allocation.retired?.at ?? null,
           reason: allocation.retired?.reason ?? null,
           accessRevoked: allocation.accessRevoked === true,
+          quarantined: allocation.quarantined === true,
         })),
       })
     );

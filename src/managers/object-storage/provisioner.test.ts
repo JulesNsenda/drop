@@ -339,6 +339,90 @@ describe('object storage stores and provisioner', () => {
       expect(await p.getAllocation('site')).not.toBeNull();
     });
 
+    describe('a record that belongs to an earlier app of the same name', () => {
+      const U1 = { ownerUserId: 'u1', appCreatedAt: 'T1' };
+      const U2 = { ownerUserId: 'u2', appCreatedAt: 'T2' };
+
+      /** u1's record survives under the name (a crash, a restore), and u2 registers it. */
+      async function strandedFor(p: ObjectStorageProvisioner) {
+        return p.provisionAppStorage('site', U1);
+      }
+
+      it("u2's detach neither revokes nor drains u1's bucket: it is retired as kept instead", async () => {
+        await configure();
+        const p = makeProvisioner();
+        const theirs = await strandedFor(p);
+
+        expect(await p.revokeAppAccess('site', U2)).toBeNull();
+
+        expect(provider.revokeAccess).not.toHaveBeenCalled();
+        expect(provider.deprovision).not.toHaveBeenCalled();
+        expect(await p.getAllocation('site')).toBeNull();
+        expect(await p.listRetired()).toEqual([
+          expect.objectContaining({ bucket: theirs.bucket, ownerUserId: 'u1', retired: expect.objectContaining({ reason: 'kept' }) }),
+        ]);
+        // ...and the sweep leaves a kept record alone.
+        expect(await p.sweepRetired({ shouldDrain: () => U2 })).toEqual({ destroyed: 0, failed: 0 });
+        expect(provider.revokeAccess).not.toHaveBeenCalled();
+        expect(provider.deprovision).not.toHaveBeenCalled();
+        expect((await p.listRetired())[0].quarantined).toBe(true);
+      });
+
+      it("u2's delete neither revokes nor drains u1's bucket", async () => {
+        await configure();
+        const p = makeProvisioner();
+        const theirs = await strandedFor(p);
+
+        expect(await p.teardownForDeletedApp('site', {}, U2)).toEqual({ outcome: 'none' });
+        expect(await p.teardownForDeletedApp('site', { keepData: true }, U2)).toEqual({ outcome: 'none' });
+
+        expect(provider.revokeAccess).not.toHaveBeenCalled();
+        expect(provider.deprovision).not.toHaveBeenCalled();
+        expect(await p.getAllocation('site')).toBeNull();
+        expect((await p.listRetired())[0]).toEqual(
+          expect.objectContaining({ bucket: theirs.bucket, retired: expect.objectContaining({ reason: 'kept' }) })
+        );
+        expect(await p.sweepRetired()).toEqual({ destroyed: 0, failed: 0 });
+        expect(provider.deprovision).not.toHaveBeenCalled();
+      });
+
+      it("a direct deprovision as u2 does not destroy u1's bucket either", async () => {
+        await configure();
+        const p = makeProvisioner();
+        await strandedFor(p);
+
+        expect(await p.deprovisionAppStorage('site', U2)).toBeNull();
+        expect(provider.deprovision).not.toHaveBeenCalled();
+        expect(await p.listRetired()).toHaveLength(1);
+      });
+
+      it("the sweep's detached loop skips a record that is not the current app's", async () => {
+        await configure();
+        const p = makeProvisioner();
+        const theirs = await strandedFor(p);
+
+        // u2 is the app on the name now, and its intent is detached.
+        expect(await p.sweepRetired({ shouldDrain: () => U2 })).toEqual({ destroyed: 0, failed: 0 });
+        expect(provider.revokeAccess).not.toHaveBeenCalled();
+        expect(provider.deprovision).not.toHaveBeenCalled();
+        expect((await p.getAllocation('site'))?.bucket).toBe(theirs.bucket);
+
+        // The rightful incarnation is drained.
+        expect(await p.sweepRetired({ shouldDrain: () => U1 })).toEqual({ destroyed: 1, failed: 0 });
+      });
+
+      it('acts normally for the rightful incarnation, and when the caller cannot say', async () => {
+        await configure();
+        const p = makeProvisioner();
+        await strandedFor(p);
+        expect((await p.revokeAppAccess('site', U1))?.accessRevoked).toBe(true);
+
+        await p.teardownForDeletedApp('site');
+        expect(await p.getAllocation('site')).toBeNull();
+        expect((await p.listRetired())[0].retired?.reason).toBe('deleting');
+      });
+    });
+
     describe('awaitKeyPropagation', () => {
       const instantSleep = () => {
         const waits: number[] = [];
@@ -452,11 +536,11 @@ describe('object storage stores and provisioner', () => {
         expect(await p.sweepRetired()).toEqual({ destroyed: 0, failed: 0 });
 
         // Intent changes between the listing and the drain: still not drained.
-        const answers = [true, false];
+        const answers = [{}, false];
         expect(await p.sweepRetired({ shouldDrain: () => answers.shift() ?? false })).toEqual({ destroyed: 0, failed: 0 });
         expect(provider.deprovision).not.toHaveBeenCalled();
 
-        expect(await p.sweepRetired({ shouldDrain: () => true })).toEqual({ destroyed: 1, failed: 0 });
+        expect(await p.sweepRetired({ shouldDrain: () => ({}) })).toEqual({ destroyed: 1, failed: 0 });
         expect(provider.deprovision).toHaveBeenCalledWith({ bucket: live.bucket, userName: live.userName });
         expect(await p.getAllocation('site')).toBeNull();
       });
@@ -470,7 +554,7 @@ describe('object storage stores and provisioner', () => {
         await expect(p.revokeAppAccess('site')).rejects.toThrow('Throttling');
         expect((await p.getAllocation('site'))?.accessRevoked).toBeUndefined();
 
-        expect(await p.sweepRetired({ shouldDrain: () => true })).toEqual({ destroyed: 1, failed: 0 });
+        expect(await p.sweepRetired({ shouldDrain: () => ({}) })).toEqual({ destroyed: 1, failed: 0 });
 
         expect(provider.revokeAccess).toHaveBeenLastCalledWith({ userName: live.userName });
         const revokeOrders = provider.revokeAccess.mock.invocationCallOrder;
@@ -495,7 +579,7 @@ describe('object storage stores and provisioner', () => {
         await configure();
         const p = makeProvisioner();
         await p.provisionAppStorage('site');
-        const answers = [true, true, false]; // list, before revoke, after revoke
+        const answers = [{}, {}, false]; // list, before revoke, after revoke
         expect(await p.sweepRetired({ shouldDrain: () => answers.shift() ?? false })).toEqual({ destroyed: 0, failed: 0 });
         expect(provider.revokeAccess).toHaveBeenCalledTimes(1);
         expect(provider.deprovision).not.toHaveBeenCalled();
@@ -510,12 +594,12 @@ describe('object storage stores and provisioner', () => {
         await p.revokeAppAccess('site');
         provider.deprovision.mockRejectedValueOnce(Object.assign(new Error('x'), { name: 'InternalError' }));
 
-        expect(await p.sweepRetired({ shouldDrain: () => true })).toEqual({ destroyed: 0, failed: 1 });
+        expect(await p.sweepRetired({ shouldDrain: () => ({}) })).toEqual({ destroyed: 0, failed: 1 });
         // Still tracked, still revoked, still refused for attach.
         expect(await p.getAllocation('site')).toEqual(expect.objectContaining({ accessRevoked: true }));
         await expect(p.provisionAppStorage('site')).rejects.toBeInstanceOf(ObjectStorageDetachIncompleteError);
 
-        expect(await p.sweepRetired({ shouldDrain: () => true })).toEqual({ destroyed: 1, failed: 0 });
+        expect(await p.sweepRetired({ shouldDrain: () => ({}) })).toEqual({ destroyed: 1, failed: 0 });
         expect(await p.getAllocation('site')).toBeNull();
         // Now the name is genuinely free for a fresh attach.
         expect((await p.provisionAppStorage('site')).appName).toBe('site');

@@ -35,6 +35,12 @@ export interface AppStorageAllocation {
    */
   accessRevoked?: boolean;
   /**
+   * Retired because it was found on a name whose current app is NOT the one it
+   * was made for. Nothing — not even the sweep's key revocation — touches it
+   * until an admin resolves it (`DELETE /admin/object-storage/retired/:id`).
+   */
+  quarantined?: boolean;
+  /**
    * Set when the app this belonged to was deleted and its resources were NOT
    * (all) destroyed — the record is moved off the app's name so a new app of
    * the same name can never inherit the bucket. `teardown-failed` is retried by

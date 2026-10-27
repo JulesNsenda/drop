@@ -135,7 +135,7 @@ export class AllocationStore {
    */
   async amend(
     key: string,
-    fields: Partial<Pick<AppStorageAllocation, 'accessRevoked'>> & {
+    fields: Partial<Pick<AppStorageAllocation, 'accessRevoked' | 'quarantined'>> & {
       retiredReason?: RetiredReason;
       /** Forget the stored app secret — its key is revoked, so nothing may read it back. */
       dropSecret?: boolean;

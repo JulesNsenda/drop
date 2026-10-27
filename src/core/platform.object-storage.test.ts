@@ -393,6 +393,22 @@ describe('DropPlatform object storage (#301)', () => {
       expect(storage.deprovisionAppStorage).not.toHaveBeenCalled();
     });
 
+    it('acts on the bucket only as THIS app: the detach passes its incarnation to the provisioner', async () => {
+      stubAppConfigService(baseConfig({ services: { 'object-storage': 'attached' } }));
+      const state = baseState({ status: 'stopped' });
+      stubStateManager(state);
+      stubRuntime(false);
+      const storage = stubStorage({ allocated: [appName] });
+      jest.spyOn(platform as any, 'doRestart').mockResolvedValue(undefined);
+
+      await platform.detachService(appName, 'object-storage');
+
+      expect(storage.revokeAppAccess).toHaveBeenCalledWith(appName, {
+        ownerUserId: 'user-1',
+        appCreatedAt: state.createdAt,
+      });
+    });
+
     it('records the intent and restarts nothing when there is no bucket', async () => {
       const setServiceIntent = stubAppConfigService(baseConfig());
       stubStateManager(baseState());
@@ -582,9 +598,17 @@ describe('DropPlatform object storage (#301)', () => {
       const storage = stubStorage();
       stubAppConfigService(baseConfig({ services: { 'object-storage': 'detached' } }));
       await (platform as any).runObjectStorageSweep();
-      const { shouldDrain } = storage.sweepRetired.mock.calls[0][0] as { shouldDrain: (n: string) => boolean };
+      const state = baseState();
+      stubStateManager(state);
+      const { shouldDrain } = storage.sweepRetired.mock.calls[0][0] as {
+        shouldDrain: (n: string) => false | { ownerUserId?: string; appCreatedAt?: string };
+      };
 
-      expect(shouldDrain(appName)).toBe(true);
+      // Answers with the CURRENT app's incarnation, so an earlier app's record is skipped.
+      expect(shouldDrain(appName)).toEqual({ ownerUserId: 'user-1', appCreatedAt: state.createdAt });
+      // No state at all: an empty incarnation, which matches no marked record.
+      stubStateManager(undefined);
+      expect(shouldDrain(appName)).toEqual({});
       // An attach/detach/delete holding the app: the sweep keeps its hands off.
       (platform as any).appsInProgress.add(appName);
       expect(shouldDrain(appName)).toBe(false);
@@ -624,10 +648,10 @@ describe('DropPlatform object storage (#301)', () => {
       const storage = stubStorage({ allocated: [appName] });
 
       await platform.purgeAppArtifacts(appName, { keepData: true });
-      expect(storage.teardownForDeletedApp).toHaveBeenLastCalledWith(appName, { keepData: true });
+      expect(storage.teardownForDeletedApp).toHaveBeenLastCalledWith(appName, { keepData: true }, undefined);
 
       await platform.purgeAppArtifacts(appName);
-      expect(storage.teardownForDeletedApp).toHaveBeenLastCalledWith(appName, { keepData: undefined });
+      expect(storage.teardownForDeletedApp).toHaveBeenLastCalledWith(appName, { keepData: undefined }, undefined);
     });
 
     it('never offers an app with object storage attached to the idle reaper, which would delete the bucket', async () => {
@@ -660,8 +684,31 @@ describe('DropPlatform object storage (#301)', () => {
 
       await (platform as any).retireObjectStorageOfDeletedApp(appName, false);
 
-      expect(storage.teardownForDeletedApp).toHaveBeenCalledWith(appName, { keepData: false });
+      expect(storage.teardownForDeletedApp).toHaveBeenCalledWith(appName, { keepData: false }, undefined);
       expect(sweep).toHaveBeenCalledTimes(1);
+    });
+
+    it('passes the deleted app\'s incarnation, while its state still exists', async () => {
+      const storage = stubStorage({ allocated: [appName] });
+      const state = baseState();
+      stubStateManager(state);
+
+      await (platform as any).retireObjectStorageOfDeletedApp(appName, false);
+
+      expect(storage.teardownForDeletedApp).toHaveBeenCalledWith(
+        appName,
+        { keepData: false },
+        { ownerUserId: 'user-1', appCreatedAt: state.createdAt }
+      );
+    });
+
+    it('cannot verify once the state is gone (the purge safety net) and says so by passing nothing', async () => {
+      const storage = stubStorage({ allocated: [appName] });
+      stubStateManager(undefined);
+
+      await (platform as any).retireObjectStorageOfDeletedApp(appName, false);
+
+      expect(storage.teardownForDeletedApp).toHaveBeenCalledWith(appName, { keepData: false }, undefined);
     });
 
     it('does not sweep a kept bucket, which only an admin destroys', async () => {

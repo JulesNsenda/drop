@@ -335,11 +335,13 @@ export class ObjectStorageProvisioner {
    * and RECORD that on the allocation (dropping the stored secret with it).
    * The bucket stays, to be drained by the sweep once the owner's intent is
    * confirmed `detached`. Idempotent, so a retried detach just picks up where
-   * the last one stopped. Null when the app has no storage.
+   * the last one stopped. Null when the app has no storage — or when the
+   * record on the name belongs to a different app (see `ownedBy`).
    */
-  async revokeAppAccess(appName: string): Promise<AppStorageAllocation | null> {
+  async revokeAppAccess(appName: string, incarnation?: AppIncarnation): Promise<AppStorageAllocation | null> {
     const allocation = await this.allocations.get(appName);
     if (!allocation) return null;
+    if (!(await this.ownedBy(appName, allocation, incarnation))) return null;
     if (allocation.accessRevoked) return allocation;
     assertGeneratedResourcePair(allocation.bucket, allocation.userName);
     const provider = await this.providerFor(allocation.region);
@@ -353,14 +355,43 @@ export class ObjectStorageProvisioner {
    * allocation record is removed only once the provider reports it done, so
    * a failed teardown can be retried. Null when the app had none.
    */
-  async deprovisionAppStorage(appName: string): Promise<StorageDeprovisionResult | null> {
+  async deprovisionAppStorage(
+    appName: string,
+    incarnation?: AppIncarnation
+  ): Promise<StorageDeprovisionResult | null> {
     const allocation = await this.allocations.get(appName);
     if (!allocation) return null;
+    if (!(await this.ownedBy(appName, allocation, incarnation))) return null;
     assertGeneratedResourcePair(allocation.bucket, allocation.userName);
     const provider = await this.providerFor(allocation.region);
     const result = await provider.deprovision({ bucket: allocation.bucket, userName: allocation.userName });
     await this.allocations.remove(appName);
     return result;
+  }
+
+  /**
+   * Whether the record on `appName` belongs to the app the caller is acting
+   * for. Every destructive path asks BEFORE it calls AWS: app names are
+   * reusable, and a record that outlived its app (a crash, a store restored
+   * from a backup) must never be revoked or drained on behalf of whoever holds
+   * the name now. On a mismatch nothing is touched: the record is retired as
+   * `kept` (off the name, bucket and all, for an admin to resolve) and the
+   * mismatch is logged. `incarnation` undefined means the caller cannot say
+   * (the app's state is already gone) and the check is skipped.
+   */
+  private async ownedBy(
+    appName: string,
+    allocation: AppStorageAllocation,
+    incarnation: AppIncarnation | undefined
+  ): Promise<boolean> {
+    if (!incarnation || sameIncarnation(allocation, incarnation)) return true;
+    getLogger().error(
+      `Object storage on '${appName}' belongs to a different app than the one acting on it - refusing to revoke or delete it; retired as kept for an admin to resolve`,
+      'STORAGE'
+    );
+    const key = await this.allocations.retire(appName, 'kept');
+    if (key) await this.allocations.amend(key, { quarantined: true });
+    return false;
   }
 
   /**
@@ -386,10 +417,13 @@ export class ObjectStorageProvisioner {
    */
   async teardownForDeletedApp(
     appName: string,
-    opts: { keepData?: boolean } = {}
+    opts: { keepData?: boolean } = {},
+    incarnation?: AppIncarnation
   ): Promise<{ outcome: 'none' } | { outcome: 'retired'; reason: RetiredReason; key: string }> {
     const allocation = await this.allocations.get(appName);
     if (!allocation) return { outcome: 'none' };
+    // A record that is not this app's is retired as kept and left alone.
+    if (!(await this.ownedBy(appName, allocation, incarnation))) return { outcome: 'none' };
     const reason: RetiredReason = opts.keepData ? 'kept' : 'deleting';
     const key = await this.allocations.retire(appName, reason);
     if (!key) return { outcome: 'none' };
@@ -418,16 +452,27 @@ export class ObjectStorageProvisioner {
    *
    * A missing credential skips the whole pass rather than failing every record.
    */
-  async sweepRetired(opts: { shouldDrain?: (appName: string) => boolean } = {}): Promise<{ destroyed: number; failed: number }> {
+  async sweepRetired(
+    opts: {
+      /** The incarnation of the app that wants its storage detached, or false for "leave it". */
+      shouldDrain?: (appName: string) => AppIncarnation | false;
+    } = {}
+  ): Promise<{ destroyed: number; failed: number }> {
+    // Asked again after each step. A record whose marker is not the CURRENT
+    // app's is someone else's bucket under a reused name: skipped, not acted on.
+    const wants = (a: AppStorageAllocation): AppIncarnation | false => {
+      const inc = opts.shouldDrain?.(a.appName);
+      return inc && sameIncarnation(a, inc) ? inc : false;
+    };
     const retired = (await this.allocations.listRetired()).filter(
       ({ allocation }) =>
         allocation.retired?.reason === 'teardown-failed' ||
         allocation.retired?.reason === 'deleting' ||
         // A kept bucket whose key could not be revoked at delete time: finish
         // that half. Its bucket is still never touched.
-        (allocation.retired?.reason === 'kept' && !allocation.accessRevoked)
+        (allocation.retired?.reason === 'kept' && !allocation.accessRevoked && !allocation.quarantined)
     );
-    const detached = (await this.allocations.list()).filter((allocation) => opts.shouldDrain?.(allocation.appName));
+    const detached = (await this.allocations.list()).filter((allocation) => wants(allocation));
     if ((retired.length === 0 && detached.length === 0) || !(await this.credentials.isConfigured())) {
       return { destroyed: 0, failed: 0 };
     }
@@ -456,16 +501,17 @@ export class ObjectStorageProvisioner {
     for (const allocation of detached) {
       try {
         assertGeneratedResourcePair(allocation.bucket, allocation.userName);
-        if (!opts.shouldDrain?.(allocation.appName)) continue;
+        const inc = wants(allocation);
+        if (!inc) continue;
         if (!allocation.accessRevoked) {
           // The detach recorded its intent but could not revoke the key.
-          await this.revokeAppAccess(allocation.appName);
-          if (!opts.shouldDrain?.(allocation.appName)) continue;
+          await this.revokeAppAccess(allocation.appName, inc);
+          if (!wants(allocation)) continue;
         }
         const provider = await this.providerFor(allocation.region);
         // The last look before data is deleted: the owner may have changed
         // their mind (or the app may have gone) since the list above.
-        if (!opts.shouldDrain?.(allocation.appName)) continue;
+        if (!wants(allocation)) continue;
         await provider.deprovision({ bucket: allocation.bucket, userName: allocation.userName });
         // Forget it only if the name still holds THIS record.
         if ((await this.allocations.get(allocation.appName))?.bucket === allocation.bucket) {
