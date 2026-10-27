@@ -1836,6 +1836,102 @@ describe('GitDeployService', () => {
       expect(t.id).toBeDefined();
     });
 
+    it('a redeploy never restores a grant that setTokenOwner revoked during its clone', async () => {
+      await service.deploy({ repoUrl: 'https://github.com/user/revoked', branch: 'main', userId: 'alice' });
+      await makeGitDir('revoked');
+      const b = await service.setToken('bob-pat', 'ghp_bobs', 'bob');
+      const admin: TokenCaller = { admin: true, userId: 'root-admin', interactive: true };
+      await service.redeploy('revoked', { tokenId: b.id }, admin);
+      expect(getStateManager().getApp('revoked')?.gitSource?.tokenGrantedBy).toBe('root-admin');
+
+      const original = gitClient.gitClone;
+      let revoked = false;
+      const pull = jest.spyOn(gitClient, 'gitClone').mockImplementation(async (...args) => {
+        if (!revoked) {
+          revoked = true;
+          // The admin hands the token to someone else, keeping nothing attached.
+          await service.setTokenOwner(b.id, 'carol', 'root-admin', []);
+        }
+        return original(...(args as Parameters<typeof original>));
+      });
+
+      await service.redeploy('revoked', {}, null);
+
+      const src = getStateManager().getApp('revoked')?.gitSource;
+      expect(src?.tokenId).toBe(b.id);
+      expect(src?.tokenGrantedBy).toBeUndefined();
+      expect(src?.tokenGrantedFor).toBeUndefined();
+      expect(src?.lastCommitSha).toBeDefined();
+
+      pull.mockClear();
+      await service.redeploy('revoked', {}, null);
+      expect(pullTokens(pull)).toEqual([undefined]);
+      pull.mockRestore();
+    });
+
+    it('setTokenOwner skips an app that detached the token while it awaited the owner write', async () => {
+      const t = await attachedApp('detaching', 'carol', undefined, 'ghp_legacyvalue');
+      const realUpdate = (service as unknown as { updateOwners(m: (o: Record<string, string>) => void): Promise<void> })
+        .updateOwners;
+      const spy = jest
+        .spyOn(service as unknown as { updateOwners(m: (o: Record<string, string>) => void): Promise<void> }, 'updateOwners')
+        .mockImplementation(async function (this: unknown, mutate) {
+          await realUpdate.call(service, mutate);
+          const sm = getStateManager();
+          const cur = sm.getApp('detaching')!.gitSource!;
+          await sm.updateApp('detaching', { gitSource: { ...cur, tokenId: undefined } } as Record<string, unknown>);
+        });
+
+      const res = await service.setTokenOwner(t.id, 'alice', 'root-admin', ['detaching']);
+      spy.mockRestore();
+
+      expect(res).toEqual({ status: 'ok', granted: [], failing: [] });
+      const src = getStateManager().getApp('detaching')?.gitSource;
+      expect(src?.tokenId).toBeUndefined();
+      expect(src?.tokenGrantedBy).toBeUndefined();
+    });
+
+    it('a grant minted by a redeploy is dropped when the token changes owner during its clone', async () => {
+      await service.deploy({ repoUrl: 'https://github.com/user/void-grant', branch: 'main', userId: 'alice' });
+      await makeGitDir('void-grant');
+      const b = await service.setToken('bob-pat', 'ghp_bobs', 'bob');
+      const admin: TokenCaller = { admin: true, userId: 'root-admin', interactive: true };
+
+      const original = gitClient.gitClone;
+      let moved = false;
+      const pull = jest.spyOn(gitClient, 'gitClone').mockImplementation(async (...args) => {
+        if (!moved) {
+          moved = true;
+          await service.setTokenOwner(b.id, 'carol', 'root-admin', []);
+        }
+        return original(...(args as Parameters<typeof original>));
+      });
+
+      await service.redeploy('void-grant', { tokenId: b.id }, admin);
+
+      const src = getStateManager().getApp('void-grant')?.gitSource;
+      expect(src?.tokenId).toBe(b.id);
+      expect(src?.tokenGrantedBy).toBeUndefined();
+      expect(src?.tokenGrantedFor).toBeUndefined();
+
+      pull.mockClear();
+      await service.redeploy('void-grant', {}, null);
+      expect(pullTokens(pull)).toEqual([undefined]);
+      pull.mockRestore();
+    });
+
+    it('an admin-chosen token redeploy still records its grant when nothing races it', async () => {
+      await service.deploy({ repoUrl: 'https://github.com/user/chosen-grant', branch: 'main', userId: 'alice' });
+      await makeGitDir('chosen-grant');
+      const b = await service.setToken('bob-pat', 'ghp_bobs', 'bob');
+
+      await service.redeploy('chosen-grant', { tokenId: b.id }, { admin: true, userId: 'root-admin', interactive: true });
+
+      const src = getStateManager().getApp('chosen-grant')?.gitSource;
+      expect(src?.tokenGrantedBy).toBe('root-admin');
+      expect(src?.tokenGrantedFor).toBe('alice');
+    });
+
     it('with an unreadable owner map an attached token is refused (no legacy grandfathering) unless granted', async () => {
       await attachedApp('closed', 'alice', undefined, 'ghp_legacyvalue');
       await getSecretManager().set('__drop_git_token_owners', 'owners', '{not json');
