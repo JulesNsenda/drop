@@ -1,18 +1,20 @@
 /**
- * handleAppUpdate's EXIT TRACE, pinned so the admission / slot / build split
- * (#359) can be proved behaviour-preserving.
+ * handleAppUpdate's EXIT TRACE: every way out of the method is driven once and
+ * the full ordered trace is asserted - the return value, every appsInProgress
+ * add/delete, the breaker-key release/record calls, the episode-closing calls,
+ * the status transitions, the build slot release, and (inline per test) what
+ * was logged and published. Each exit releases the app's claim EXACTLY once,
+ * and the tests say so by listing the single `inprogress.delete` in the trace.
  *
- * Every way out of the method is driven once and the full ordered trace is
- * asserted: the return value, every appsInProgress add/delete, the breaker-key
- * release/record calls, the episode-closing calls, the status transitions, the
- * build slot release and the bus events. Each exit must release the app's
- * in-progress claim EXACTLY once, and the tests say so by listing the single
- * `inprogress.delete` in the trace.
+ * The tests NOT tagged DEVIATION pin behaviour the split of #359 preserved; they
+ * pass unchanged against the pre-split platform.ts. The DEVIATION tests pin what
+ * the split deliberately fixed (a throw leaking the claim; a decision taken from
+ * the entry snapshot) and the direct contracts of the three stages.
  *
  * The builder is a fake so the slot release is countable; the post-build swap
  * is stubbed at the platform's own private seams (same shape as
  * platform.update-admission.test.ts), except tryCutover/failCutover, which are
- * real because they release the claim themselves today.
+ * real so the cutover exits are traced through them.
  */
 
 import * as path from 'path';
@@ -31,115 +33,6 @@ import { getDeployTracker, resetDeployTracker } from '../managers/deploy-tracker
 import { hasEnoughDisk } from '../utils/disk';
 
 const UUID = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/g;
-
-/** What each exit SAYS (logger calls and bus events), by test name. `<app>` is the app under test. */
-const SAID: Record<string, string[]> = {
-  "refused before the claim (unchanged by the split) quiesced at entry": [
-    "info:BACKUP:Deferring update for <app> — deploys are quiesced for a backup",
-  ],
-  "refused before the claim (unchanged by the split) guardrail refusal: keys released before the episode is failed, app never claimed": [
-    "warn:UPDATE:Redeploy of <app> refused by guardrail: Too many failed deploys (3). Retry in 9s.",
-    "bus:build:started:ID1",
-    "bus:build:failed:pre-build:GUARDRAIL_TRIPPED:ID1",
-  ],
-  "refused after the slot wait quiesced during the wait": [
-    "info:UPDATE:Hot-reload triggered for <app>: file change",
-    "info:BACKUP:Deferring update for <app> — deploys are quiesced for a backup",
-  ],
-  "refused after the slot wait a git reservation began during the wait": [
-    "info:UPDATE:Hot-reload triggered for <app>: file change",
-    "info:UPDATE:Dropped redeploy for <app> - a git pull/upload began while waiting for a build slot",
-  ],
-  "refused after the slot wait a git clone began during the wait": [
-    "info:UPDATE:Hot-reload triggered for <app>: file change",
-    "info:UPDATE:Dropped redeploy for <app> - a git pull/upload began while waiting for a build slot",
-  ],
-  "refused after the slot wait an upload began during the wait": [
-    "info:UPDATE:Hot-reload triggered for <app>: file change",
-    "info:UPDATE:Dropped redeploy for <app> - a git pull/upload began while waiting for a build slot",
-  ],
-  "refused after the slot wait the app was removed during the wait": [
-    "info:UPDATE:Hot-reload triggered for <app>: file change",
-    "info:UPDATE:Dropped redeploy for <app> - app was removed while waiting for a build slot",
-  ],
-  "refused after the slot wait the user stopped the app during the wait": [
-    "info:UPDATE:Hot-reload triggered for <app>: file change",
-    "info:UPDATE:Dropped redeploy for <app> - app was stopped by user while waiting for a build slot",
-  ],
-  "refused after the slot wait insufficient disk": [
-    "info:UPDATE:Hot-reload triggered for <app>: file change",
-    "warn:UPDATE:Skipping hot-reload of <app>: insufficient disk (1 MB free, need 500 MB)",
-  ],
-  "past the mint a pre-build throw closes the episode under the minted deployId": [
-    "info:UPDATE:Hot-reload triggered for <app>: file change",
-    "app:error:detect blew up",
-    "bus:build:started:ID1",
-    "bus:build:failed:pre-build:-:ID1",
-  ],
-  "past the mint build failure on a running app restores running with the error": [
-    "info:UPDATE:Hot-reload triggered for <app>: file change",
-    "app:error:tsc exploded",
-  ],
-  "past the mint build failure on a not-running app leaves it errored": [
-    "info:UPDATE:Hot-reload triggered for <app>: file change",
-    "app:error:tsc exploded",
-  ],
-  "past the mint a throw from builder.build does not open a second episode": [
-    "info:UPDATE:Hot-reload triggered for <app>: file change",
-    "app:error:strategy threw",
-  ],
-  "past the mint start failure": [
-    "info:UPDATE:Hot-reload triggered for <app>: file change",
-    "info:UPDATE:Stopping <app> to swap in new build...",
-    "app:built:rebuilt in 12ms",
-    "app:error:port in use",
-  ],
-  "past the mint a start that needs config parks the app and counts the failure": [
-    "info:UPDATE:Hot-reload triggered for <app>: file change",
-    "info:UPDATE:Stopping <app> to swap in new build...",
-    "app:built:rebuilt in 12ms",
-    "warn:SECURITY:<app> parked in needs-config on hot-reload — set required secret(s): API_KEY, then restart",
-  ],
-  "past the mint success": [
-    "info:UPDATE:Hot-reload triggered for <app>: file change",
-    "info:UPDATE:Stopping <app> to swap in new build...",
-    "app:built:rebuilt in 12ms",
-    "app:started:PID 4242, port 3005 (hot-reloaded)",
-  ],
-  "past the mint success on an app stopped at entry that needs its tree rebuilt does not stop or re-stop it": [
-    "info:UPDATE:Redeploying stopped <app> to rebuild dependencies for the current Node runtime",
-    "info:UPDATE:Hot-reload triggered for <app>: file change",
-    "app:built:rebuilt in 12ms",
-    "app:started:PID 4242, port 3005 (hot-reloaded)",
-  ],
-  "past the mint a build held for promotion releases the keys without charging the window": [
-    "info:UPDATE:Hot-reload triggered for <app>: file change",
-  ],
-  "zero-downtime cutover a cutover that lands returns true and releases once": [
-    "info:UPDATE:Hot-reload triggered for <app>: file change",
-  ],
-  "zero-downtime cutover a cutover that fails returns false, fails the deploy and releases once": [
-    "info:UPDATE:Hot-reload triggered for <app>: file change",
-    "warn:CUTOVER:Zero-downtime deploy of <app> failed; previous version still serving: never ready",
-  ],
-  "the monorepo container branch (explicit redeploy re-expansion) re-expands, records success and releases once": [
-    "info:MONOREPO:Re-expanding monorepo container '<app>' (explicit redeploy)",
-  ],
-  "the expandMonorepo child call builds the child while the CONTAINER holds appsInProgress, and releases only the child": [
-    "info:UPDATE:Hot-reload triggered for <app>: monorepo re-expansion",
-    "info:UPDATE:Stopping <app> to swap in new build...",
-    "app:built:rebuilt in 12ms",
-    "app:started:PID 4242, port 3005 (hot-reloaded)",
-  ],
-  "the expandMonorepo child call charges a failed child build to the ACTOR key it was admitted under, not the watcher bucket": [
-    "info:UPDATE:Hot-reload triggered for <app>: monorepo re-expansion",
-    "app:error:child build failed",
-  ],
-  "the expandMonorepo child call a child that fails to build reports false to its container, which keeps its claim": [
-    "info:UPDATE:Hot-reload triggered for <app>: monorepo re-expansion",
-    "app:error:child build failed",
-  ],
-};
 
 class TracingSet extends Set<string> {
   constructor(private readonly log: (e: string) => void) {
@@ -178,6 +71,7 @@ describe('handleAppUpdate exit trace', () => {
   beforeEach(async () => {
     resetDeployBreaker();
     resetDeployTracker();
+    process.env.DROP_MIN_FREE_DISK_MB = '500';
     (hasEnoughDisk as jest.Mock).mockResolvedValue({ ok: true, freeMb: 999999 });
     tempDir = path.join(os.tmpdir(), `drop-update-exit-trace-${Date.now()}-${Math.random()}`);
     appPath = path.join(tempDir, 'apps', appName);
@@ -263,7 +157,7 @@ describe('handleAppUpdate exit trace', () => {
     const realRelease = p().releaseGuardrailKeys.bind(platform);
     jest.spyOn(p(), 'releaseGuardrailKeys').mockImplementation((...a: any[]) => {
       const n = a[0] as string;
-      log(`keys.release${p().breakerKeys.has(n) ? '' : '(none)'}`);
+      if (p().breakerKeys.has(n)) log('keys.release');
       realRelease(n);
     });
     const realOutcome = p().recordDeployOutcome.bind(platform);
@@ -302,13 +196,14 @@ describe('handleAppUpdate exit trace', () => {
   });
 
   afterEach(async () => {
+    delete process.env.DROP_MIN_FREE_DISK_MB;
     unsubs.forEach((u) => u());
     jest.restoreAllMocks();
     if (platform.isActive()) await platform.stop();
     fs.rmSync(tempDir, { recursive: true, force: true });
   });
 
-  /** Run one update; ids become ID1, ID2... by first appearance so equality shows. */
+  /** Run one update through handleAppUpdate. */
   async function update(opts: { bypass?: boolean; actor?: object; reason?: string } = {}): Promise<{
     result: boolean;
     trace: string[];
@@ -323,18 +218,21 @@ describe('handleAppUpdate exit trace', () => {
     );
     // Let fire-and-forget bus handlers settle before the trace is read.
     await new Promise((resolve) => setImmediate(resolve));
+    return { result, ...snapshot() };
+  }
+
+  /** The trace and the logs so far; ids become ID1, ID2... by first appearance, the app `<app>` in logs. */
+  function snapshot(): { trace: string[]; logs: string[] } {
     const ids = new Map<string, string>();
     const sub = (e: string) =>
       e.replace(UUID, (m) => {
         if (!ids.has(m)) ids.set(m, `ID${ids.size + 1}`);
         return ids.get(m)!;
       });
-    const norm = trace.map(sub);
-    const normLogs = logs.map(sub);
-    const said = SAID[(expect.getState().currentTestName ?? '').slice('handleAppUpdate exit trace '.length)];
-    expect(said).toBeDefined();
-    expect(normLogs.map((l) => l.split(appName).join('<app>'))).toEqual(said);
-    return { result, trace: norm, logs: normLogs };
+    return {
+      trace: trace.map(sub),
+      logs: logs.map((l) => sub(l).split(appName).join('<app>')),
+    };
   }
 
   /** Post-condition shared by every exit: nothing held, no key left, slot freed. */
@@ -349,6 +247,9 @@ describe('handleAppUpdate exit trace', () => {
       quiesced = true;
       const r = await update();
       expect(r.result).toBe(false);
+      expect(r.logs).toEqual([
+        'info:BACKUP:Deferring update for <app> — deploys are quiesced for a backup',
+      ]);
       expect(r.trace).toEqual([]);
       expect(p().breakerKeys.has(appName)).toBe(false);
     });
@@ -357,8 +258,12 @@ describe('handleAppUpdate exit trace', () => {
       jest.spyOn(p(), 'checkGuardrails').mockReturnValue({ allowed: false, failures: 3, retryAfterSeconds: 9 });
       const r = await update();
       expect(r.result).toBe(false);
+      expect(r.logs).toEqual([
+        'warn:UPDATE:Redeploy of <app> refused by guardrail: Too many failed deploys (3). Retry in 9s.',
+        'bus:build:started:ID1',
+        'bus:build:failed:pre-build:GUARDRAIL_TRIPPED:ID1',
+      ]);
       expect(r.trace).toEqual([
-        'keys.release(none)',
         'episode.fail:Too many failed deploys (3). Retry in 9s:ID1:GUARDRAIL_TRIPPED',
         'outcome:false(none)',
       ]);
@@ -372,12 +277,16 @@ describe('handleAppUpdate exit trace', () => {
       reserveEffect = () => (quiesced = true);
       const r = await update();
       expect(r.result).toBe(false);
-      expect(r.trace.filter((e) => !e.startsWith('slot') && !e.startsWith('keys') && !e.startsWith('inprogress.delete'))).toEqual([
-        `inprogress.add:${appName}`,
+      expect(r.logs).toEqual([
+        'info:UPDATE:Hot-reload triggered for <app>: file change',
+        'info:BACKUP:Deferring update for <app> — deploys are quiesced for a backup',
       ]);
-      expect([...r.trace].sort()).toEqual(
-        [`inprogress.add:${appName}`, `inprogress.delete:${appName}`, 'keys.release', 'slot.release'].sort()
-      );
+      expect(r.trace).toEqual([
+        `inprogress.add:${appName}`,
+        'slot.release',
+        'keys.release',
+        `inprogress.delete:${appName}`,
+      ]);
       expectReleased();
       expect(slotReleased).toBe(true);
       expect(appState.status).toBe('running');
@@ -387,9 +296,16 @@ describe('handleAppUpdate exit trace', () => {
       reserveEffect = () => p().gitReserved.add(appName);
       const r = await update();
       expect(r.result).toBe(false);
-      expect([...r.trace].sort()).toEqual(
-        [`inprogress.add:${appName}`, `inprogress.delete:${appName}`, 'keys.release', 'slot.release'].sort()
-      );
+      expect(r.logs).toEqual([
+        'info:UPDATE:Hot-reload triggered for <app>: file change',
+        'info:UPDATE:Dropped redeploy for <app> - a git pull/upload began while waiting for a build slot',
+      ]);
+      expect(r.trace).toEqual([
+        `inprogress.add:${appName}`,
+        'slot.release',
+        'keys.release',
+        `inprogress.delete:${appName}`,
+      ]);
       expectReleased();
       expect(p().gitReserved.has(appName)).toBe(true); // not ours to clear
     });
@@ -398,9 +314,16 @@ describe('handleAppUpdate exit trace', () => {
       p().gitDeployService = { isCloning: jest.fn().mockReturnValueOnce(false).mockReturnValue(true) };
       const r = await update();
       expect(r.result).toBe(false);
-      expect([...r.trace].sort()).toEqual(
-        [`inprogress.add:${appName}`, `inprogress.delete:${appName}`, 'keys.release', 'slot.release'].sort()
-      );
+      expect(r.logs).toEqual([
+        'info:UPDATE:Hot-reload triggered for <app>: file change',
+        'info:UPDATE:Dropped redeploy for <app> - a git pull/upload began while waiting for a build slot',
+      ]);
+      expect(r.trace).toEqual([
+        `inprogress.add:${appName}`,
+        'slot.release',
+        'keys.release',
+        `inprogress.delete:${appName}`,
+      ]);
       expectReleased();
     });
 
@@ -408,9 +331,16 @@ describe('handleAppUpdate exit trace', () => {
       p().uploadDeployService = { isUploading: jest.fn().mockReturnValueOnce(false).mockReturnValue(true) };
       const r = await update();
       expect(r.result).toBe(false);
-      expect([...r.trace].sort()).toEqual(
-        [`inprogress.add:${appName}`, `inprogress.delete:${appName}`, 'keys.release', 'slot.release'].sort()
-      );
+      expect(r.logs).toEqual([
+        'info:UPDATE:Hot-reload triggered for <app>: file change',
+        'info:UPDATE:Dropped redeploy for <app> - a git pull/upload began while waiting for a build slot',
+      ]);
+      expect(r.trace).toEqual([
+        `inprogress.add:${appName}`,
+        'slot.release',
+        'keys.release',
+        `inprogress.delete:${appName}`,
+      ]);
       expectReleased();
     });
 
@@ -418,9 +348,16 @@ describe('handleAppUpdate exit trace', () => {
       reserveEffect = () => (appState = undefined);
       const r = await update();
       expect(r.result).toBe(false);
-      expect([...r.trace].sort()).toEqual(
-        [`inprogress.add:${appName}`, `inprogress.delete:${appName}`, 'keys.release', 'slot.release'].sort()
-      );
+      expect(r.logs).toEqual([
+        'info:UPDATE:Hot-reload triggered for <app>: file change',
+        'info:UPDATE:Dropped redeploy for <app> - app was removed while waiting for a build slot',
+      ]);
+      expect(r.trace).toEqual([
+        `inprogress.add:${appName}`,
+        'slot.release',
+        'keys.release',
+        `inprogress.delete:${appName}`,
+      ]);
       expectReleased();
     });
 
@@ -428,9 +365,16 @@ describe('handleAppUpdate exit trace', () => {
       reserveEffect = () => (appState = { ...appState, status: 'stopped' });
       const r = await update();
       expect(r.result).toBe(false);
-      expect([...r.trace].sort()).toEqual(
-        [`inprogress.add:${appName}`, `inprogress.delete:${appName}`, 'keys.release', 'slot.release'].sort()
-      );
+      expect(r.logs).toEqual([
+        'info:UPDATE:Hot-reload triggered for <app>: file change',
+        'info:UPDATE:Dropped redeploy for <app> - app was stopped by user while waiting for a build slot',
+      ]);
+      expect(r.trace).toEqual([
+        `inprogress.add:${appName}`,
+        'slot.release',
+        'keys.release',
+        `inprogress.delete:${appName}`,
+      ]);
       expectReleased();
       expect(appState.status).toBe('stopped');
     });
@@ -439,8 +383,15 @@ describe('handleAppUpdate exit trace', () => {
       (hasEnoughDisk as jest.Mock).mockResolvedValue({ ok: false, freeMb: 1 });
       const r = await update();
       expect(r.result).toBe(false);
-      expect([...r.trace].sort()).toEqual(
-        [`inprogress.add:${appName}`, `inprogress.delete:${appName}`, 'keys.release', 'slot.release'].sort()
+      expect(r.logs).toEqual([
+        'info:UPDATE:Hot-reload triggered for <app>: file change',
+        'warn:UPDATE:Skipping hot-reload of <app>: insufficient disk (1 MB free, need 500 MB)',
+      ]);
+      // The only exit whose cleanup order changed (slot, keys, claim here; keys,
+      // claim, slot before the split): three synchronous calls, so unobservable.
+      expect(r.trace[0]).toBe(`inprogress.add:${appName}`);
+      expect([...r.trace.slice(1)].sort()).toEqual(
+        [`inprogress.delete:${appName}`, 'keys.release', 'slot.release'].sort()
       );
       expectReleased();
       expect(appState.status).toBe('running');
@@ -449,31 +400,16 @@ describe('handleAppUpdate exit trace', () => {
   });
 
   describe('past the mint', () => {
-    // Deliberate deviation from "behaviour-preserving" (#359): these two throws
-    // used to leak the claim (and the slot, for the disk probe) until restart.
-    it('a throw from the slot wait releases the claim and the key, and surfaces', async () => {
-      p().builder.reserveSlot.mockRejectedValue(new Error('slot wait blew up'));
-      await expect(p().handleAppUpdate(appName, appPath, 'file change', true)).rejects.toThrow('slot wait blew up');
-      expect(p().appsInProgress.has(appName)).toBe(false);
-      expect(p().breakerKeys.has(appName)).toBe(false);
-      expect(trace.filter((e) => e === `inprogress.delete:${appName}`)).toHaveLength(1);
-      expect(p().builder.build).not.toHaveBeenCalled();
-    });
-
-    it('a throw from the disk probe releases the slot, the claim and the key, and surfaces', async () => {
-      (hasEnoughDisk as jest.Mock).mockRejectedValue(new Error('disk probe blew up'));
-      await expect(p().handleAppUpdate(appName, appPath, 'file change', true)).rejects.toThrow('disk probe blew up');
-      expect(slotReleased).toBe(true);
-      expect(p().appsInProgress.has(appName)).toBe(false);
-      expect(p().breakerKeys.has(appName)).toBe(false);
-      expect(trace.filter((e) => e === `inprogress.delete:${appName}`)).toHaveLength(1);
-      expect(p().builder.build).not.toHaveBeenCalled();
-    });
-
     it('a pre-build throw closes the episode under the minted deployId', async () => {
       detectThrows = new Error('detect blew up');
       const r = await update();
       expect(r.result).toBe(false);
+      expect(r.logs).toEqual([
+        'info:UPDATE:Hot-reload triggered for <app>: file change',
+        'app:error:detect blew up',
+        'bus:build:started:ID1',
+        'bus:build:failed:pre-build:-:ID1',
+      ]);
       expect(r.trace).toEqual([
         `inprogress.add:${appName}`,
         'status:building',
@@ -488,25 +424,14 @@ describe('handleAppUpdate exit trace', () => {
       expectReleased();
     });
 
-    // The one DELIBERATE delta of the split (#359): a throw out of the catch itself
-    // used to leave the claim and the breaker key set until the next restart; the
-    // single finally in buildAndSwap releases them. Not a trace-equal exit.
-    it('a throw out of the failure handler still releases the claim and the key', async () => {
-      detectThrows = new Error('detect blew up');
-      const set = p().stateManager.setAppStatus as jest.Mock;
-      set.mockImplementation(async (_n: string, status: string) => {
-        if (status === 'errored') throw new Error('state store down');
-      });
-      await expect(p().handleAppUpdate(appName, appPath, 'file change', true)).rejects.toThrow('state store down');
-      expect(p().appsInProgress.has(appName)).toBe(false);
-      expect(p().breakerKeys.has(appName)).toBe(false);
-      expect(trace.filter((e) => e === `inprogress.delete:${appName}`)).toHaveLength(1);
-    });
-
     it('build failure on a running app restores running with the error', async () => {
       buildResult = { success: false, duration: 1, errors: [{ message: 'tsc exploded' }] };
       const r = await update();
       expect(r.result).toBe(false);
+      expect(r.logs).toEqual([
+        'info:UPDATE:Hot-reload triggered for <app>: file change',
+        'app:error:tsc exploded',
+      ]);
       expect(r.trace).toEqual([
         `inprogress.add:${appName}`,
         'status:building',
@@ -527,6 +452,10 @@ describe('handleAppUpdate exit trace', () => {
       buildResult = { success: false, duration: 1, errors: [{ message: 'tsc exploded' }] };
       const r = await update();
       expect(r.result).toBe(false);
+      expect(r.logs).toEqual([
+        'info:UPDATE:Hot-reload triggered for <app>: file change',
+        'app:error:tsc exploded',
+      ]);
       expect(r.trace).toEqual([
         `inprogress.add:${appName}`,
         'status:building',
@@ -546,6 +475,10 @@ describe('handleAppUpdate exit trace', () => {
       buildThrows = new Error('strategy threw');
       const r = await update();
       expect(r.result).toBe(false);
+      expect(r.logs).toEqual([
+        'info:UPDATE:Hot-reload triggered for <app>: file change',
+        'app:error:strategy threw',
+      ]);
       expect(r.trace).toEqual([
         `inprogress.add:${appName}`,
         'status:building',
@@ -565,6 +498,12 @@ describe('handleAppUpdate exit trace', () => {
       startThrows = new Error('port in use');
       const r = await update();
       expect(r.result).toBe(false);
+      expect(r.logs).toEqual([
+        'info:UPDATE:Hot-reload triggered for <app>: file change',
+        'info:UPDATE:Stopping <app> to swap in new build...',
+        'app:built:rebuilt in 12ms',
+        'app:error:port in use',
+      ]);
       expect(r.trace).toEqual([
         `inprogress.add:${appName}`,
         'status:building',
@@ -587,6 +526,12 @@ describe('handleAppUpdate exit trace', () => {
       p().buildFreshStartSpec.mockRejectedValue(new AppNeedsConfigError(appName, ['API_KEY']));
       const r = await update();
       expect(r.result).toBe(false);
+      expect(r.logs).toEqual([
+        'info:UPDATE:Hot-reload triggered for <app>: file change',
+        'info:UPDATE:Stopping <app> to swap in new build...',
+        'app:built:rebuilt in 12ms',
+        'warn:SECURITY:<app> parked in needs-config on hot-reload — set required secret(s): API_KEY, then restart',
+      ]);
       expect(r.trace).toEqual([
         `inprogress.add:${appName}`,
         'status:building',
@@ -607,6 +552,12 @@ describe('handleAppUpdate exit trace', () => {
     it('success', async () => {
       const r = await update({ actor: { automationSource: 'webhook' } });
       expect(r.result).toBe(true);
+      expect(r.logs).toEqual([
+        'info:UPDATE:Hot-reload triggered for <app>: file change',
+        'info:UPDATE:Stopping <app> to swap in new build...',
+        'app:built:rebuilt in 12ms',
+        'app:started:PID 4242, port 3005 (hot-reloaded)',
+      ]);
       expect(r.trace).toEqual([
         `inprogress.add:${appName}`,
         'status:building',
@@ -631,6 +582,12 @@ describe('handleAppUpdate exit trace', () => {
       jest.spyOn(p(), 'dependenciesAreStale').mockResolvedValue(true);
       const r = await update();
       expect(r.result).toBe(true);
+      expect(r.logs).toEqual([
+        'info:UPDATE:Redeploying stopped <app> to rebuild dependencies for the current Node runtime',
+        'info:UPDATE:Hot-reload triggered for <app>: file change',
+        'app:built:rebuilt in 12ms',
+        'app:started:PID 4242, port 3005 (hot-reloaded)',
+      ]);
       expect(p().runtime.stop).not.toHaveBeenCalled();
       expect(p().runtime.start).toHaveBeenCalledTimes(1);
       expect(r.trace[r.trace.length - 1]).toBe(`inprogress.delete:${appName}`);
@@ -641,6 +598,9 @@ describe('handleAppUpdate exit trace', () => {
       p().holdForPromotion.mockResolvedValue(true);
       const r = await update();
       expect(r.result).toBe(false);
+      expect(r.logs).toEqual([
+        'info:UPDATE:Hot-reload triggered for <app>: file change',
+      ]);
       expect(r.trace).toEqual([
         `inprogress.add:${appName}`,
         'status:building',
@@ -657,6 +617,178 @@ describe('handleAppUpdate exit trace', () => {
     });
   });
 
+  describe('DEVIATION: a throw no longer leaks the claim, and every exit closes an outcome', () => {
+    it('a throw from the slot wait closes the episode under a fresh id and surfaces', async () => {
+      p().builder.reserveSlot.mockRejectedValue(new Error('slot wait blew up'));
+      await expect(p().handleAppUpdate(appName, appPath, 'file change', true)).rejects.toThrow('slot wait blew up');
+      const r = snapshot();
+      expect(r.trace).toEqual([
+        `inprogress.add:${appName}`,
+        'keys.release',
+        'episode.fail:slot wait blew up:ID1:-',
+        'outcome:false(none)',
+        `inprogress.delete:${appName}`,
+      ]);
+      expect(r.logs).toEqual([
+        'info:UPDATE:Hot-reload triggered for <app>: file change',
+        'warn:UPDATE:Redeploy of <app> failed before its build: slot wait blew up',
+        'bus:build:started:ID1',
+        'bus:build:failed:pre-build:-:ID1',
+      ]);
+      expectReleased();
+      expect(p().builder.build).not.toHaveBeenCalled();
+    });
+
+    it('a throw from the disk probe frees the slot, closes the episode and surfaces', async () => {
+      (hasEnoughDisk as jest.Mock).mockRejectedValue(new Error('disk probe blew up'));
+      await expect(p().handleAppUpdate(appName, appPath, 'file change', true)).rejects.toThrow('disk probe blew up');
+      const r = snapshot();
+      expect(r.trace).toEqual([
+        `inprogress.add:${appName}`,
+        'slot.release',
+        'keys.release',
+        'episode.fail:disk probe blew up:ID1:-',
+        'outcome:false(none)',
+        `inprogress.delete:${appName}`,
+      ]);
+      expect(slotReleased).toBe(true);
+      expectReleased();
+      expect(p().builder.build).not.toHaveBeenCalled();
+    });
+
+    it('a failure handler that throws before the build still closes the episode under the minted id', async () => {
+      detectThrows = new Error('detect blew up');
+      (p().stateManager.setAppStatus as jest.Mock).mockImplementation(async (_n: string, status: string) => {
+        if (status === 'errored') throw new Error('state store down');
+      });
+      await expect(p().handleAppUpdate(appName, appPath, 'file change', true)).rejects.toThrow('state store down');
+      const r = snapshot();
+      expect(r.trace).toEqual([
+        `inprogress.add:${appName}`,
+        'slot.release',
+        'discard',
+        'episode.fail:state store down:ID1:-',
+        'outcome:false',
+        `inprogress.delete:${appName}`,
+      ]);
+      expectReleased();
+    });
+
+    it('a failure handler that throws after the build was paid for charges the window', async () => {
+      buildThrows = new Error('strategy threw');
+      (p().stateManager.setAppStatus as jest.Mock).mockImplementation(async (_n: string, status: string) => {
+        if (status === 'errored') throw new Error('state store down');
+      });
+      await expect(p().handleAppUpdate(appName, appPath, 'file change', true)).rejects.toThrow('state store down');
+      // The build opened its own episode, so none is synthesised here; the paid-for
+      // build is charged to the key it was admitted under.
+      expect(trace.filter((e) => e.startsWith('episode.fail'))).toEqual([]);
+      expect(trace).toContain('outcome:false');
+      expectReleased();
+      const watcherKey = p().guardrailKeys(appName, false, {})[0].key as string;
+      expect(getDeployBreaker().peek(watcherKey).failures).toBe(1);
+    });
+
+    it('decides from the state re-read after the wait: an app that errored while queued is not restored to running', async () => {
+      reserveEffect = () => (appState = { ...appState, status: 'errored', port: undefined });
+      buildResult = { success: false, duration: 1, errors: [{ message: 'tsc exploded' }] };
+      const r = await update();
+      expect(r.result).toBe(false);
+      expect(r.trace).toContain('status:errored:tsc exploded');
+      expect(r.trace.filter((e) => e.startsWith('status:running'))).toEqual([]);
+      expect(appState.status).toBe('errored');
+      expectReleased();
+    });
+
+    it('decides from the state re-read after the wait: an app that was running only at entry is not stopped for a swap', async () => {
+      reserveEffect = () => (appState = { ...appState, status: 'pending' });
+      const r = await update();
+      expect(r.result).toBe(true);
+      expect(p().runtime.stop).not.toHaveBeenCalled();
+      expect(p().runtime.start).toHaveBeenCalledTimes(1);
+      expectReleased();
+    });
+  });
+
+  describe('DEVIATION: the stage contracts', () => {
+    const admitted = () => ({ appPath, statusAtEntry: 'running' });
+    const claim = () => p().breakerKeys.set(appName, p().guardrailKeys(appName, false, {}));
+
+    it('acquireSlotAndRecheck: a refusal releases only the slot it took', async () => {
+      claim();
+      p().appsInProgress.add(appName);
+      trace.length = 0;
+      reserveEffect = () => (quiesced = true);
+      expect(await p().acquireSlotAndRecheck(appName, admitted())).toBeNull();
+      expect(trace).toEqual(['slot.release']);
+      expect(p().appsInProgress.has(appName)).toBe(true);
+      expect(p().breakerKeys.has(appName)).toBe(true);
+    });
+
+    it('acquireSlotAndRecheck: success hands back the live slot and the state it re-read', async () => {
+      const got = await p().acquireSlotAndRecheck(appName, admitted());
+      expect(got.current).toBe(appState);
+      expect(slotReleased).toBe(false);
+      got.releaseSlot();
+      expect(slotReleased).toBe(true);
+      expect(trace).toEqual(['slot.release']);
+    });
+
+    it('acquireSlotAndRecheck: a disk probe that throws frees the slot and rethrows', async () => {
+      (hasEnoughDisk as jest.Mock).mockRejectedValue(new Error('disk probe blew up'));
+      await expect(p().acquireSlotAndRecheck(appName, admitted())).rejects.toThrow('disk probe blew up');
+      expect(trace).toEqual(['slot.release']);
+    });
+
+    it('runClaimedUpdate: a refusal gives back the keys and calls releaseClaim once', async () => {
+      claim();
+      reserveEffect = () => (quiesced = true);
+      const releaseClaim = jest.fn();
+      expect(await p().runClaimedUpdate(appName, admitted(), releaseClaim)).toBe(false);
+      expect(releaseClaim).toHaveBeenCalledTimes(1);
+      expect(p().breakerKeys.has(appName)).toBe(false);
+      expect(trace).toEqual(['slot.release', 'keys.release']);
+    });
+
+    it('neither stage touches appsInProgress', async () => {
+      claim();
+      const releaseClaim = jest.fn();
+      expect(await p().runClaimedUpdate(appName, admitted(), releaseClaim)).toBe(true);
+      expect(trace.filter((e) => e.startsWith('inprogress'))).toEqual([]);
+      expect(releaseClaim).toHaveBeenCalledTimes(1);
+    });
+
+    const exits: Array<[string, () => void, boolean | 'throws']> = [
+      ['success', () => undefined, true],
+      ['a refusal', () => (reserveEffect = () => (quiesced = true)), false],
+      ['a failed build', () => (buildResult = { success: false, duration: 1, errors: [{ message: 'x' }] }), false],
+      ['a failed start', () => (startThrows = new Error('port in use')), false],
+      ['a pre-build throw', () => (detectThrows = new Error('detect blew up')), false],
+      ['a throwing slot wait', () => p().builder.reserveSlot.mockRejectedValue(new Error('slot')), 'throws'],
+      ['a throwing disk probe', () => (hasEnoughDisk as jest.Mock).mockRejectedValue(new Error('disk')), 'throws'],
+      [
+        'a throwing failure handler',
+        () => {
+          detectThrows = new Error('detect blew up');
+          (p().stateManager.setAppStatus as jest.Mock).mockImplementation(async (_n: string, status: string) => {
+            if (status === 'errored') throw new Error('state store down');
+          });
+        },
+        'throws',
+      ],
+    ];
+    it.each(exits)('runClaimedUpdate: releaseClaim runs exactly once on %s, with the keys gone', async (_n, setup, expected) => {
+      claim();
+      setup();
+      const releaseClaim = jest.fn();
+      const run = p().runClaimedUpdate(appName, admitted(), releaseClaim);
+      if (expected === 'throws') await expect(run).rejects.toThrow();
+      else expect(await run).toBe(expected);
+      expect(releaseClaim).toHaveBeenCalledTimes(1);
+      expect(p().breakerKeys.has(appName)).toBe(false);
+    });
+  });
+
   describe('zero-downtime cutover', () => {
     beforeEach(() => {
       p().tryCutover.mockRestore();
@@ -667,6 +799,9 @@ describe('handleAppUpdate exit trace', () => {
       jest.spyOn(p(), 'cutoverTo').mockResolvedValue({ ok: true, port: 3006 });
       const r = await update();
       expect(r.result).toBe(true);
+      expect(r.logs).toEqual([
+        'info:UPDATE:Hot-reload triggered for <app>: file change',
+      ]);
       expect(r.trace).toEqual([
         `inprogress.add:${appName}`,
         'status:building',
@@ -691,6 +826,10 @@ describe('handleAppUpdate exit trace', () => {
       const r = await update();
       off();
       expect(r.result).toBe(false);
+      expect(r.logs).toEqual([
+        'info:UPDATE:Hot-reload triggered for <app>: file change',
+        'warn:CUTOVER:Zero-downtime deploy of <app> failed; previous version still serving: never ready',
+      ]);
       expect(r.trace).toEqual([
         `inprogress.add:${appName}`,
         'status:building',
@@ -722,6 +861,9 @@ describe('handleAppUpdate exit trace', () => {
       const expand = jest.spyOn(p(), 'expandMonorepo').mockResolvedValue(undefined);
       const r = await update({ reason: 'git redeploy' });
       expect(r.result).toBe(false);
+      expect(r.logs).toEqual([
+        "info:MONOREPO:Re-expanding monorepo container '<app>' (explicit redeploy)",
+      ]);
       expect(expand).toHaveBeenCalledTimes(1);
       expect(r.trace).toEqual([`inprogress.add:${appName}`, 'outcome:true', `inprogress.delete:${appName}`]);
       expect(p().breakerKeys.has(appName)).toBe(false);
@@ -747,6 +889,12 @@ describe('handleAppUpdate exit trace', () => {
       const actor = { automationSource: 'webhook' };
       const r = await update({ reason: 'monorepo re-expansion', actor });
       expect(r.result).toBe(true);
+      expect(r.logs).toEqual([
+        'info:UPDATE:Hot-reload triggered for <app>: monorepo re-expansion',
+        'info:UPDATE:Stopping <app> to swap in new build...',
+        'app:built:rebuilt in 12ms',
+        'app:started:PID 4242, port 3005 (hot-reloaded)',
+      ]);
       expect(r.trace[0]).toBe(`inprogress.add:${appName}`);
       expect(r.trace[r.trace.length - 1]).toBe(`inprogress.delete:${appName}`);
       expect(p().appsInProgress.has(container)).toBe(true);
@@ -763,6 +911,10 @@ describe('handleAppUpdate exit trace', () => {
       buildResult = { success: false, duration: 1, errors: [{ message: 'child build failed' }] };
       const r = await update({ reason: 'monorepo re-expansion', actor: { automationSource: 'webhook' } });
       expect(r.result).toBe(false);
+      expect(r.logs).toEqual([
+        'info:UPDATE:Hot-reload triggered for <app>: monorepo re-expansion',
+        'app:error:child build failed',
+      ]);
       expect(getDeployBreaker().peek(webhookKey).failures).toBe(1);
       expect(getDeployBreaker().peek(watcherKey).failures).toBe(0);
     });
@@ -772,6 +924,10 @@ describe('handleAppUpdate exit trace', () => {
       buildResult = { success: false, duration: 1, errors: [{ message: 'child build failed' }] };
       const r = await update({ reason: 'monorepo re-expansion' });
       expect(r.result).toBe(false);
+      expect(r.logs).toEqual([
+        'info:UPDATE:Hot-reload triggered for <app>: monorepo re-expansion',
+        'app:error:child build failed',
+      ]);
       expect(p().appsInProgress.has(container)).toBe(true);
       expect(p().appsInProgress.has(appName)).toBe(false);
     });

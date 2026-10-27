@@ -802,25 +802,38 @@ export function decideBootReconciliation(input: BootReconcileInput): BootReconci
 
 
 /**
- * What handleAppUpdate admitted, computed once and read by the two stages after
- * the claim (acquireSlotAndRecheck, buildAndSwap).
+ * What handleAppUpdate admitted, read by the stages after the claim. Only what
+ * they read: the app's live state is re-read after the slot wait, not carried.
  */
 interface AdmittedUpdate {
   appPath: string;
-  reason: string;
-  /** The guardrail keys the update was admitted under (also held in `breakerKeys`). */
-  keys: GuardrailKey[];
-  actor: DeployActorInfo | undefined;
-  appState: NonNullable<ReturnType<AppStateManager['getApp']>>;
+  /** The status at entry; an app already stopped then is an explicit stale-tree rebuild. */
   statusAtEntry: AppStatus;
-  wasRunning: boolean;
-  originalPort: number | undefined;
-  /** A stopped app an explicit redeploy rebuilds for a Node toolchain change. */
-  rebuildsStaleTree: boolean;
 }
 
-/** Why acquireSlotAndRecheck declined to go on (the claim's holder cleans up). */
-type UpdateRefusal = 'quiesced' | 'git-or-upload' | 'removed' | 'stopped' | 'disk';
+/** What acquireSlotAndRecheck hands to buildAndSwap: the build slot and the state re-read after the wait. */
+interface AcquiredSlot {
+  releaseSlot: () => void;
+  current: NonNullable<ReturnType<AppStateManager['getApp']>>;
+}
+
+/** What buildAndSwap has done that runClaimedUpdate needs if its failure handler throws. */
+interface UpdateProgress {
+  builderEntered: boolean;
+  /** failDeployEpisode has already closed this deploy's episode. */
+  episodeClosed: boolean;
+}
+
+/**
+ * Whether a parsed drop.yaml makes its folder a monorepo CONTAINER: a group
+ * descriptor with at least one `services:` entry, never itself a buildable app.
+ * The one rule, so every caller that must tell a container from an app agrees.
+ */
+function isMonorepoContainer(
+  parsed: DropYamlParseResult
+): parsed is DropYamlParseResult & { config: DropYamlConfig } {
+  return parsed.success && !!parsed.config?.services && Object.keys(parsed.config.services).length > 0;
+}
 
 /** A cutover that did not happen; `exited` = the new instance died, vs never proved ready. */
 class CutoverError extends Error {
@@ -7265,11 +7278,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     // interception already expanded the children this deploy, and re-expanding would fs.rm/fs.cp their
     // folders out from under an in-flight build.
     const containerYaml = await parseDropYaml(appPath);
-    if (
-      containerYaml.success &&
-      containerYaml.config?.services &&
-      Object.keys(containerYaml.config.services).length > 0
-    ) {
+    if (isMonorepoContainer(containerYaml)) {
       if (bypassCooldown) {
         // GUARDRAIL. This branch RETURNS below, above the gate on the ordinary
         // rebuild path, and expandMonorepo is one of the most expensive things
@@ -7412,9 +7421,8 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       return false;
     }
 
-    // Remember the current port and whether the app was running
-    const originalPort = appState.port;
-    const wasRunning = appState.status === 'running';
+    // The status at entry. The stages after the claim decide from the state they
+    // re-read once the slot wait is over, not from this.
     const statusAtEntry = appState.status;
 
     // GUARDRAIL. A SECOND choke point, not a duplicate: handleAppUpdate does
@@ -7425,7 +7433,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     //
     // Deliberately here, below every skip guard above (in-progress, monorepo
     // container, cooldown, unregistered, user-stopped) and below the
-    // `reason`/`wasRunning` reads: each of those returns without deploying, and
+    // `statusAtEntry` read: each of those returns without deploying, and
     // an update that never deploys must neither be refused nor leave a key in
     // breakerKeys for some later episode's outcome to be recorded against.
     //
@@ -7466,49 +7474,80 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     this.logger.info(`Hot-reload triggered for ${appName}: ${reason}`, 'UPDATE');
     this.appsInProgress.add(appName);
 
-    const admitted: AdmittedUpdate = {
-      appPath,
-      reason,
-      keys: guardKeys,
-      actor,
-      appState,
-      statusAtEntry,
-      wasRunning,
-      originalPort,
-      rebuildsStaleTree,
-    };
-    let acquired: Awaited<ReturnType<DropPlatform['acquireSlotAndRecheck']>>;
+    const admitted: AdmittedUpdate = { appPath, statusAtEntry };
+    return this.runClaimedUpdate(appName, admitted, () => this.appsInProgress.delete(appName));
+  }
+
+  /**
+   * The claim's one owner, from the moment it is taken: runs the two stages and
+   * gives the claim and the breaker keys back in the one finally below, on every
+   * exit - a refusal, a throw out of either stage, success or failure. Neither
+   * stage touches `appsInProgress`. `releaseClaim` is how the caller's claim is
+   * given back; it runs exactly once.
+   *
+   * @returns true only when the new build is serving (see handleAppUpdate).
+   */
+  private async runClaimedUpdate(
+    appName: string,
+    admitted: AdmittedUpdate,
+    releaseClaim: () => void
+  ): Promise<boolean> {
     try {
-      acquired = await this.acquireSlotAndRecheck(appName, admitted);
-    } catch (error) {
-      // A throw from the slot wait or the disk probe is a refusal nobody
-      // reported: release the keys and the claim exactly as a refusal does,
-      // then let it surface.
+      let acquired: AcquiredSlot | null;
+      try {
+        acquired = await this.acquireSlotAndRecheck(appName, admitted);
+      } catch (error) {
+        // The slot wait or the disk probe threw: a refusal nobody reported.
+        // Reported the way the guardrail refusal is, keys released first so the
+        // failure is not charged to the window (the build never ran), and the
+        // caller gets an outcome rather than a silent drop.
+        const failure = error instanceof Error ? error : new Error(String(error));
+        this.logger.warn(`Redeploy of ${appName} failed before its build: ${failure.message}`, 'UPDATE');
+        this.releaseGuardrailKeys(appName);
+        this.failDeployEpisode(appName, failure, crypto.randomUUID());
+        throw error;
+      }
+      // A refusal: nothing was built, and neither a refusal nor the box being
+      // full is evidence the caller is looping. The keys are released, not
+      // recorded, in the finally.
+      if (!acquired) return false;
+
+      const deployId = crypto.randomUUID();
+      const progress: UpdateProgress = { builderEntered: false, episodeClosed: false };
+      try {
+        return await this.buildAndSwap(appName, admitted, deployId, acquired, progress);
+      } catch (error) {
+        // buildAndSwap reports every failure itself and never rethrows, so this
+        // is its failure handler throwing (a state write rejecting). Close what
+        // it left open: an episode it never got to, or a build that was paid
+        // for and must be charged.
+        if (!progress.builderEntered && !progress.episodeClosed) {
+          this.failDeployEpisode(
+            appName,
+            error instanceof Error ? error : new Error('Hot-reload failed'),
+            deployId
+          );
+        } else {
+          this.recordDeployOutcome(appName, false);
+        }
+        throw error;
+      }
+    } finally {
       this.releaseGuardrailKeys(appName);
-      this.appsInProgress.delete(appName);
-      throw error;
+      releaseClaim();
     }
-    if ('refused' in acquired) {
-      // Released, not counted: the build never ran, and neither a refusal nor
-      // the box being full is evidence the caller is looping. Leaving the key
-      // set would hand this episode's slot to whatever outcome is recorded next.
-      this.releaseGuardrailKeys(appName);
-      this.appsInProgress.delete(appName);
-      return false;
-    }
-    return this.buildAndSwap(appName, admitted, crypto.randomUUID(), acquired.releaseSlot);
   }
 
   /**
    * handleAppUpdate's second stage: wait for a builder slot, then re-check what
-   * the wait could have changed. Releases only the slot it took, and only on a
-   * refusal; the caller still holds `appsInProgress` and the breaker keys, and
-   * releases them. On success the caller owns the returned slot release.
+   * the wait could have changed. Returns null for a refusal, having released the
+   * slot it took and nothing else. On success the caller owns the returned slot
+   * release, and the state it re-read. Never touches `appsInProgress`.
    */
   private async acquireSlotAndRecheck(
     appName: string,
     admitted: AdmittedUpdate
-  ): Promise<{ releaseSlot: () => void } | { refused: UpdateRefusal }> {
+  ): Promise<AcquiredSlot | null> {
     // Wait for a builder slot BEFORE any side effect, so a redeploy queued
     // behind a full cap (a boot-reconcile burst) leaves status, build log and
     // deploy target alone and the old version untouched. The checks below
@@ -7521,7 +7560,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         'BACKUP'
       );
       releaseSlot();
-      return { refused: 'quiesced' };
+      return null;
     }
     // A git pull or upload that began while waiting publishes its own
     // app:update when it lands, and with appsInProgress cleared that runs.
@@ -7535,7 +7574,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         'UPDATE'
       );
       releaseSlot();
-      return { refused: 'git-or-upload' };
+      return null;
     }
     // Removed, or stopped by the user since entry, while waiting. An explicit
     // redeploy of an app that was ALREADY stopped at entry (rebuildsStaleTree)
@@ -7547,14 +7586,14 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         'UPDATE'
       );
       releaseSlot();
-      return { refused: current ? 'stopped' : 'removed' };
+      return null;
     }
 
-    // Hot-reload — the app is currently RUNNING and serving traffic. Abort
-    // with a `return`, never a `throw`: the catch below unconditionally marks
-    // the app 'errored' and tears down its health prober, which is wrong for
-    // a healthy running app that simply can't be rebuilt right now. Must run
-    // after appsInProgress.add (before it would open a TOCTOU double-build
+    // Hot-reload - the app is currently RUNNING and serving traffic. Abort
+    // with a `return`, never a `throw`: buildAndSwap's catch unconditionally
+    // marks the app 'errored' and tears down its health prober, which is wrong
+    // for a healthy running app that simply can't be rebuilt right now. Must run
+    // after the claim is taken (before it would open a TOCTOU double-build
     // window) and before setAppStatus('building') (so status stays 'running').
     let disk;
     try {
@@ -7569,16 +7608,17 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         'UPDATE'
       );
       releaseSlot();
-      return { refused: 'disk' };
+      return null;
     }
-    return { releaseSlot };
-
+    return { releaseSlot, current };
   }
 
   /**
-   * handleAppUpdate's third stage: build, then swap the new release in. Owns
-   * the claim: `appsInProgress` and the breaker keys are released here, in the
-   * one finally, on every exit. The slot comes from acquireSlotAndRecheck.
+   * handleAppUpdate's third stage: build, then swap the new release in. Reports
+   * every failure itself (the catch below) and does not touch the claim -
+   * runClaimedUpdate releases it. What it decides from (was the app running,
+   * which port) is the state acquireSlotAndRecheck re-read after the slot wait,
+   * not the snapshot taken at entry.
    *
    * @returns true only when the new build is serving (see handleAppUpdate).
    */
@@ -7586,29 +7626,27 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     appName: string,
     admitted: AdmittedUpdate,
     deployId: string,
-    releaseSlot: () => void
+    acquired: AcquiredSlot,
+    progress: UpdateProgress
   ): Promise<boolean> {
-    // Same mint-and-thread as handleBuildApp. This path must NOT be skipped:
-    // upload-deploy routes every EXISTING app here, so it is the dominant
-    // path for an agent redeploying, and threading only the fresh-deploy path
-    // would leave exactly those builds unaddressable.
     // The id is minted by the caller, ahead of the try, so the catch can close
-    // an episode under it.
-    const { appPath, appState, wasRunning, originalPort } = admitted;
-    const stateManager = this.stateManager!;
-    const detector = this.detector!;
-    const builder = this.builder!;
-    const runtime = this.runtime!;
-    // Whether builder.build() was entered; see the catch (mirrors handleBuildApp).
-    let builderEntered = false;
+    // an episode under it. This path must NOT skip the mint: upload-deploy
+    // routes every EXISTING app here, so threading only the fresh-deploy path
+    // would leave exactly those builds unaddressable.
+    const { appPath } = admitted;
+    const { releaseSlot } = acquired;
+    // Read once, before any await: a state manager may hand out its live record,
+    // which the 'building' write below would then change under us.
+    const { status: statusBefore, port: originalPort } = acquired.current;
+    const wasRunning = statusBefore === 'running';
     try {
       // M5.1 deploy transaction: keep old version serving while the new build
       // runs. Only stop the old process after a successful build — on failure,
       // restore the `running` status so the old version stays live.
-      await stateManager.setAppStatus(appName, 'building');
+      await this.stateManager!.setAppStatus(appName, 'building');
 
       // Re-detect and rebuild the app
-      const detection = await detector.detect(appPath, { silent: true });
+      const detection = await this.detector!.detect(appPath, { silent: true });
 
       // Persist the (possibly changed) type on hot-reload too — detect() is
       // silent, so this is the only place a static→node type change is recorded.
@@ -7622,9 +7660,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       if (this.appConfigService) {
         await this.appConfigService.updateConfig(appName, { type: detectedType });
       }
-      if (this.stateManager) {
-        await stateManager.updateApp(appName, { type: detectedType });
-      }
+      await this.stateManager!.updateApp(appName, { type: detectedType });
 
       const workDir = await this.getBuildWorkDir(appName);
       const updateLogId = this.buildLogService
@@ -7650,8 +7686,8 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           detection.type,
           appName
         );
-        builderEntered = true;
-        buildResult = await builder.build({
+        progress.builderEntered = true;
+        buildResult = await this.builder!.build({
           appName,
           appPath: buildPath,
           deployId,
@@ -7689,12 +7725,12 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         // Old process is still running — restore status and surface the error
         // so the dashboard shows it without taking down the live service.
         if (wasRunning) {
-          await stateManager.setAppStatus(appName, 'running', {
+          await this.stateManager!.setAppStatus(appName, 'running', {
             port: originalPort,
             error: `Build failed: ${buildError}`,
           });
         } else {
-          await stateManager.setAppStatus(appName, 'errored', { error: buildError });
+          await this.stateManager!.setAppStatus(appName, 'errored', { error: buildError });
         }
         await this.discardDeployTarget(appName);
         this.recordDeployOutcome(appName, false);
@@ -7710,7 +7746,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         // A held build is not a failed one — the guardrail window must not be
         // charged for a deploy the operator asked to be held.
         this.releaseGuardrailKeys(appName);
-        await stateManager.setAppStatus(appName, appState.status);
+        await this.stateManager!.setAppStatus(appName, statusBefore);
         return false;
       }
 
@@ -7738,10 +7774,10 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       // failure happened after start), and skipping stop() here would hit
       // ProcessManager.start's online-early-return - a silent no-op that
       // leaves the old (broken) code running.
-      if (wasRunning || appState.status === 'errored') {
+      if (wasRunning || statusBefore === 'errored') {
         this.logger.info(`Stopping ${appName} to swap in new build...`, 'UPDATE');
         this.stopHealthProber(appName);
-        await runtime.stop(appName);
+        await this.runtime!.stop(appName);
       }
 
       this.appBuildDurations.set(appName, buildResult.duration);
@@ -7755,7 +7791,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         });
       }
 
-      await stateManager.setAppStatus(appName, 'starting');
+      await this.stateManager!.setAppStatus(appName, 'starting');
 
       const { spec, port } = await this.buildFreshStartSpec(
         appName,
@@ -7764,7 +7800,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         buildResult.outputPath ?? undefined
       );
       await this.noteRuntimeLogStart(appName);
-      const status = await runtime.start(spec);
+      const status = await this.runtime!.start(spec);
 
       this.logger.appEvent('started', appName, `PID ${status.pid}, port ${port} (hot-reloaded)`);
 
@@ -7776,7 +7812,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       // delay the 'running' status write or appsInProgress's release.
       void this.recordDeploySignature(appName, this.sourcePathOf(appName));
 
-      await stateManager.setAppStatus(appName, 'running', {
+      await this.stateManager!.setAppStatus(appName, 'running', {
         port,
         pid: status.pid ?? undefined,
       });
@@ -7805,7 +7841,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           `${appName} parked in needs-config on hot-reload — ${needsConfigAction(error)}, then restart`,
           'SECURITY'
         );
-        await stateManager.setAppStatus(appName, 'needs-config', {
+        await this.stateManager!.setAppStatus(appName, 'needs-config', {
           missingSecrets: error.missingSecrets,
           ...(error instanceof AppManifestInvalidError ? { error: error.message } : {}),
         });
@@ -7821,31 +7857,23 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         return false;
       }
       this.logger.appEvent('error', appName, error instanceof Error ? error.message : 'Hot-reload failed');
-      await stateManager.setAppStatus(appName, 'errored', {
+      await this.stateManager!.setAppStatus(appName, 'errored', {
         error: error instanceof Error ? error.message : 'Hot-reload failed',
       });
       // A throw BEFORE builder.build() (detect, prepareDeployTarget,
       // resolveBuildEnv, buildToolchainFor, a malformed drop.yaml) never opened
       // a deploy episode, so the setAppStatus above had nothing to close.
       // Mirrors handleBuildApp. Also records the breaker failure.
-      if (!builderEntered) {
+      if (!progress.builderEntered) {
         this.failDeployEpisode(
           appName,
           error instanceof Error ? error : new Error('Hot-reload failed'),
           deployId
         );
+        progress.episodeClosed = true;
       }
       this.recordDeployOutcome(appName, false);
       return false;
-    } finally {
-      // The ONE release of the claim, for every exit past the mint: success,
-      // build failure, a held build, a cutover (landed or failed), needs-config
-      // and any throw. Keys first, both synchronous, nothing awaited between.
-      // Every path above has already recorded or released its keys, so the
-      // release is a no-op there; it only catches an exit that threw before it
-      // could.
-      if (this.breakerKeys.has(appName)) this.releaseGuardrailKeys(appName);
-      this.appsInProgress.delete(appName);
     }
   }
 
