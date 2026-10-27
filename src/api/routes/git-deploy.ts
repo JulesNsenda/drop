@@ -18,8 +18,11 @@ import { canAccess, interactiveSessionOnly, tokenCallerOf } from '../access';
 import { logActivityFor } from '../../managers/activity';
 import { DeployRefusedError } from '../../managers/guardrail/deploy-breaker';
 import { QuotaExceededError } from '../../managers/guardrail/principal-quota';
+import { getLogger } from '../../utils/logger';
 import type { GitDeployRequest, GitTokenCreateRequest } from '../../core/git-deploy';
 import { GIT_TOKEN_ID_RE } from '../../core/git-deploy/git-deploy.types';
+
+const logger = getLogger();
 
 const gitDeploy = new Hono();
 
@@ -264,6 +267,46 @@ gitDeploy.post('/redeploy/:name', async (c) => {
   }
 });
 
+/**
+ * One webhook-triggered redeploy, run after the response has gone out. Never
+ * rejects: it is started with `void`, so an escaping error would be an
+ * unhandled rejection rather than a log line.
+ */
+async function runWebhookRedeploy(
+  service: ReturnType<typeof getGitDeployService>,
+  appName: string,
+  branch: string
+): Promise<void> {
+  try {
+    // No caller: the webhook is unattended. Marked as automation rather than
+    // left principal-less so a looping webhook gets its own guardrail bucket
+    // instead of consuming the app owner's.
+    await service.redeploy(appName, { automation: 'webhook' }, null);
+    // Webhook auto-redeploys are unattended and had no audit trail — record
+    // them (system action, no user). The API /git/redeploy route logs its
+    // own; this webhook path is distinct, so there is no double-count.
+    await logActivityFor(undefined, { action: 'redeploy', appName, detail: `webhook: ${branch}` });
+  } catch (err) {
+    // Busy (building, deploying, or another land under way): not a lost push.
+    // It is remembered, one per app with the latest winning, and runs as soon
+    // as the app frees up.
+    if (err instanceof AppInProgressError) {
+      service.queueRedeploy(appName, { automation: 'webhook' });
+      await logActivityFor(undefined, {
+        action: 'redeploy',
+        appName,
+        detail: `webhook (queued, app busy): ${branch}`,
+      }).catch(() => undefined);
+      return;
+    }
+    logger.error(
+      `Webhook redeploy of ${appName} failed: ${err instanceof Error ? err.message : 'Unknown error'}`,
+      'GIT-DEPLOY',
+      err
+    );
+  }
+}
+
 // POST /git/webhook - GitHub webhook receiver
 gitDeploy.post('/webhook', async (c) => {
   const event = c.req.header('X-GitHub-Event');
@@ -333,39 +376,16 @@ gitDeploy.post('/webhook', async (c) => {
     return c.json(success({ message: 'No matching apps found', repoUrl, branch }));
   }
 
-  // Trigger redeploy for all matching apps
+  // Start the redeploy for every matching app, but do not wait for it. A
+  // redeploy is a fresh clone, which outlasts GitHub's 10s delivery timeout —
+  // GitHub then records the delivery as failed ("context deadline exceeded")
+  // although the redeploy completes. Everything that can be decided up front
+  // (event, signature, payload, matching) has been; the outcome of each
+  // redeploy goes to the log and the activity trail instead of the response.
   const results: Array<{ app: string; status: string; error?: string }> = [];
   for (const appName of matchingApps) {
-    try {
-      // No caller: the webhook is unattended. Marked as automation rather than
-      // left principal-less so a looping webhook gets its own guardrail bucket
-      // instead of consuming the app owner's.
-      await service.redeploy(appName, { automation: 'webhook' }, null);
-      // Webhook auto-redeploys are unattended and had no audit trail — record
-      // them (system action, no user). The API /git/redeploy route logs its
-      // own; this webhook path is distinct, so there is no double-count.
-      await logActivityFor(undefined, { action: 'redeploy', appName, detail: `webhook: ${branch}` });
-      results.push({ app: appName, status: 'redeploying' });
-    } catch (err) {
-      // Busy (building, deploying, or another land under way): not a lost push.
-      // It is remembered, one per app with the latest winning, and runs as soon
-      // as the app frees up.
-      if (err instanceof AppInProgressError) {
-        service.queueRedeploy(appName, { automation: 'webhook' });
-        await logActivityFor(undefined, {
-          action: 'redeploy',
-          appName,
-          detail: `webhook (queued, app busy): ${branch}`,
-        });
-        results.push({ app: appName, status: 'queued' });
-        continue;
-      }
-      results.push({
-        app: appName,
-        status: 'failed',
-        error: err instanceof Error ? err.message : 'Unknown error',
-      });
-    }
+    void runWebhookRedeploy(service, appName, branch);
+    results.push({ app: appName, status: 'redeploying' });
   }
 
   return c.json(success({ message: `Triggered redeploy for ${matchingApps.length} app(s)`, results }));
