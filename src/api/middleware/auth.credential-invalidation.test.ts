@@ -633,4 +633,80 @@ describe('credentialsInvalidBefore (DROP-130 Items 4 & 5)', () => {
       expect((await probeJwt(after, { method: 'PUT', path: '/auth/password' })).status).toBe(200);
     }, 10_000);
   });
+
+  describe('updateUser - role change invalidation', () => {
+    const probeJwt = async (token: string): Promise<number> => {
+      const app = new Hono<TestEnv>();
+      app.get('/probe', authMiddleware(), (c) => c.json({ ok: true }));
+      const res = await app.request('/probe', { headers: { Authorization: `Bearer ${token}` } });
+      return res.status;
+    };
+
+    const loginToken = async (username: string): Promise<string> => {
+      const result = await authenticateUser(username, PASSWORD);
+      if (result.status !== 'ok') throw new Error(`login failed: ${JSON.stringify(result)}`);
+      return result.token;
+    };
+
+    it('demotion (user -> readonly) kills the existing OAuth grant and session JWT', async () => {
+      const bob = await createUser({ username: 'bob-demote', role: 'user', credential: { password: PASSWORD } });
+      const oauth = await mintOAuthAccessToken(bob, AUD, 'sid-demote');
+      const jwt = await loginToken('bob-demote');
+      await clockTick();
+      expect(await verifyOAuthAccessToken(oauth, AUD)).not.toBeNull();
+
+      await updateUser(bob.id, { role: 'readonly' });
+
+      expect(await verifyOAuthAccessToken(oauth, AUD)).toBeNull();
+      expect(await probeJwt(jwt)).toBe(401);
+    });
+
+    it('demotion (admin -> user) stamps the invalidation too', async () => {
+      const root = await createUser({ username: 'root-demote', role: 'admin', credential: { password: PASSWORD } });
+      await createUser({ username: 'root-demote-2', role: 'admin', credential: { password: PASSWORD } });
+      const oauth = await mintOAuthAccessToken(root, AUD, 'sid-demote-admin');
+      await clockTick();
+
+      await updateUser(root.id, { role: 'user' });
+
+      expect(await verifyOAuthAccessToken(oauth, AUD)).toBeNull();
+    });
+
+    it('demotion kills the refresh token (session/connector class) but not the API key, which is clamped', async () => {
+      const bob = await createUser({ username: 'bob-demote-key', role: 'user', credential: { password: PASSWORD } });
+      const { key } = await createApiKey('bob-demote-key-ci', 'user', undefined, undefined, bob.id);
+      const refresh = await issueRefreshToken(bob.id, 'client-demote', 'sid-demote-key');
+      await clockTick();
+      expect((await probeWithKey(key)).auth?.role).toBe('user');
+
+      await updateUser(bob.id, { role: 'readonly' });
+
+      const after = await probeWithKey(key);
+      expect(after.status).toBe(200);
+      expect(after.auth?.role).toBe('readonly');
+      expect(await rotateRefreshToken(refresh)).toBeNull();
+    });
+
+    it('promotion (readonly -> user) does NOT log the user out', async () => {
+      const bob = await createUser({ username: 'bob-promote', role: 'readonly', credential: { password: PASSWORD } });
+      const oauth = await mintOAuthAccessToken(bob, AUD, 'sid-promote');
+      const jwt = await loginToken('bob-promote');
+      await clockTick();
+
+      await updateUser(bob.id, { role: 'user' });
+
+      expect(await verifyOAuthAccessToken(oauth, AUD)).not.toBeNull();
+      expect(await probeJwt(jwt)).toBe(200);
+    });
+
+    it('re-sending the same role does NOT log the user out', async () => {
+      const bob = await createUser({ username: 'bob-same', role: 'user', credential: { password: PASSWORD } });
+      const oauth = await mintOAuthAccessToken(bob, AUD, 'sid-same');
+      await clockTick();
+
+      await updateUser(bob.id, { role: 'user', maxApps: 5 });
+
+      expect(await verifyOAuthAccessToken(oauth, AUD)).not.toBeNull();
+    });
+  });
 });

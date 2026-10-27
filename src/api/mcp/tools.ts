@@ -21,11 +21,11 @@ import * as fs from 'fs/promises';
 import * as fsp from 'fs/promises';
 import * as path from 'path';
 import * as tar from 'tar';
-import { z } from 'zod';
-import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { z, type ZodRawShape } from 'zod';
+import { McpServer, ToolCallback } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 
-import { AuthContext, getUserById } from '../middleware/auth';
+import { AuthContext, getUserById, roleHierarchy } from '../middleware/auth';
 import { canAccessScoped, tokenCallerOf } from '../access';
 import { scopesAllowCreate } from '../agent-scopes';
 import { redeployFor } from '../redeploy-for';
@@ -1315,6 +1315,50 @@ export async function handleCustomDomain(
   }
 }
 
+// ============ Role floor ============
+
+/**
+ * Whether `auth` may run a MUTATING tool. REST floors every mutating route at
+ * `user`; the OAuth branch of `mcpAuthMiddleware` admits a connector grant on
+ * its own checks and never ranks the role, so a user demoted to `readonly`
+ * after granting a connector would otherwise keep restart/rollback/deploy.
+ *
+ * Only rank-bearing roles are floored. A role-`none` principal is a scoped
+ * agent token: it is governed by its scopes (checked in each handler), not by
+ * rank, so it passes through to those checks unchanged. No auth at all is the
+ * auth-disabled deployment. An unrecognised role string is NOT `none`, ranks 0
+ * and is refused.
+ */
+export function meetsMutatingFloor(auth: AuthContext | undefined): boolean {
+  if (!auth || auth.role === 'none') return true;
+  const rank = Object.prototype.hasOwnProperty.call(roleHierarchy, auth.role)
+    ? roleHierarchy[auth.role]
+    : 0;
+  return rank >= roleHierarchy.user;
+}
+
+/**
+ * The ONE place a tool is registered. `mutating` is a required argument, so a
+ * new tool cannot be added without deciding whether the `user` floor applies.
+ * The refusal does not depend on the app name, so it is no existence oracle.
+ */
+function registerTool<In extends ZodRawShape>(
+  server: McpServer,
+  auth: AuthContext | undefined,
+  mutating: boolean,
+  name: string,
+  config: { title: string; description: string; inputSchema: In },
+  handler: ToolCallback<In>
+): void {
+  const guarded = ((...cbArgs: unknown[]) => {
+    if (mutating && !meetsMutatingFloor(auth)) {
+      return toolError(`'${name}' requires at least the user role; your role is ${auth?.role}.`);
+    }
+    return (handler as (...a: unknown[]) => CallToolResult | Promise<CallToolResult>)(...cbArgs);
+  }) as ToolCallback<In>;
+  server.registerTool(name, config, guarded);
+}
+
 // ============ Server factory ============
 
 /**
@@ -1325,7 +1369,10 @@ export async function handleCustomDomain(
 export function buildMcpServer(auth: AuthContext | undefined): McpServer {
   const server = new McpServer({ name: 'dropkit', version: getPlatformVersion() });
 
-  server.registerTool(
+  registerTool(
+    server,
+    auth,
+    true,
     'deploy_files',
     {
       title: 'Deploy files',
@@ -1373,7 +1420,10 @@ export function buildMcpServer(auth: AuthContext | undefined): McpServer {
     args => handleDeployFiles(auth, args)
   );
 
-  server.registerTool(
+  registerTool(
+    server,
+    auth,
+    true,
     'deploy_from_git',
     {
       title: 'Deploy from git',
@@ -1409,7 +1459,10 @@ export function buildMcpServer(auth: AuthContext | undefined): McpServer {
     args => handleDeployFromGit(auth, args)
   );
 
-  server.registerTool(
+  registerTool(
+    server,
+    auth,
+    false,
     'list_apps',
     {
       title: 'List apps',
@@ -1420,7 +1473,10 @@ export function buildMcpServer(auth: AuthContext | undefined): McpServer {
     () => handleListApps(auth)
   );
 
-  server.registerTool(
+  registerTool(
+    server,
+    auth,
+    false,
     'app_status',
     {
       title: 'App status',
@@ -1435,7 +1491,10 @@ export function buildMcpServer(auth: AuthContext | undefined): McpServer {
     args => handleAppStatus(auth, args)
   );
 
-  server.registerTool(
+  registerTool(
+    server,
+    auth,
+    false,
     'verify_deployment',
     {
       title: 'Verify deployment',
@@ -1459,7 +1518,10 @@ export function buildMcpServer(auth: AuthContext | undefined): McpServer {
     args => handleVerifyDeployment(auth, args)
   );
 
-  server.registerTool(
+  registerTool(
+    server,
+    auth,
+    false,
     'app_logs',
     {
       title: 'App logs',
@@ -1482,7 +1544,10 @@ export function buildMcpServer(auth: AuthContext | undefined): McpServer {
     args => handleAppLogs(auth, args)
   );
 
-  server.registerTool(
+  registerTool(
+    server,
+    auth,
+    false,
     'get_deploy_logs',
     {
       title: 'Deploy logs',
@@ -1516,7 +1581,10 @@ export function buildMcpServer(auth: AuthContext | undefined): McpServer {
     args => handleGetDeployLogs(auth, args)
   );
 
-  server.registerTool(
+  registerTool(
+    server,
+    auth,
+    true,
     'restart_app',
     {
       title: 'Restart app',
@@ -1530,7 +1598,10 @@ export function buildMcpServer(auth: AuthContext | undefined): McpServer {
     args => handleRestartApp(auth, args)
   );
 
-  server.registerTool(
+  registerTool(
+    server,
+    auth,
+    true,
     'rollback_app',
     {
       title: 'Roll back app',
@@ -1548,7 +1619,10 @@ export function buildMcpServer(auth: AuthContext | undefined): McpServer {
     args => handleRollbackApp(auth, args)
   );
 
-  server.registerTool(
+  registerTool(
+    server,
+    auth,
+    true,
     'redeploy_app',
     {
       title: 'Redeploy app',
@@ -1566,7 +1640,10 @@ export function buildMcpServer(auth: AuthContext | undefined): McpServer {
     args => handleRedeployApp(auth, args)
   );
 
-  server.registerTool(
+  registerTool(
+    server,
+    auth,
+    true,
     'custom_domain',
     {
       title: 'Custom domain',
