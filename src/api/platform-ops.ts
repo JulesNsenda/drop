@@ -213,6 +213,24 @@ export interface PlatformOps {
   hasLiveBuildContainer(appName: string): Promise<boolean>;
 
   /**
+   * Whether deleting the app (without keepData) would destroy an
+   * object-storage bucket: `bucket` when it has one, `unknown` when the
+   * allocation store cannot be read (it cannot be proven otherwise, so callers
+   * treat it as `bucket`), `none` otherwise. Lets the delete route demand an
+   * explicit confirmation before it stops anything.
+   */
+  objectStorageDeleteRisk(appName: string): Promise<'none' | 'bucket' | 'unknown'>;
+
+  /**
+   * Retire the app's object-storage allocation off its name and revoke its
+   * IAM key (#301). Called by the delete route BEFORE any other teardown step,
+   * so the name is free of the previous tenant's bucket the moment the app
+   * stops. The bucket drains in the background unless `keepData`. Idempotent;
+   * never throws for an AWS failure.
+   */
+  retireObjectStorage(appName: string, opts?: { keepData?: boolean }): Promise<void>;
+
+  /**
    * Put a held (built-but-unpromoted) build in front of traffic.
    *
    * Starts exactly what was built rather than rebuilding — a rebuild could pick

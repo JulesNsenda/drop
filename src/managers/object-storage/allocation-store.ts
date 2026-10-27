@@ -13,13 +13,23 @@ import * as fs from 'fs/promises';
 import * as path from 'path';
 import { writeJsonAtomic } from '../../utils/atomic-write';
 import { encrypt, decrypt, loadPlatformMasterKey, EncryptedData } from '../secret/encryption';
-import type { AppStorageAllocation, AppStorageCredentials } from './types';
+import type { AppStorageAllocation, AppStorageCredentials, RetiredReason } from './types';
 
 interface StoredAllocation extends AppStorageAllocation {
-  secretAccessKey: EncryptedData;
+  /** Absent on a retired record: nothing reads a key back once its app is gone. */
+  secretAccessKey?: EncryptedData;
 }
 
+/**
+ * Keyed by app name, which is tenant-chosen: a plain `{}` would resolve
+ * `constructor`, `toString` or `__proto__` to an inherited member and read it
+ * as an allocation. Always built on a null prototype and read via `own()`.
+ */
 type StoreFile = Record<string, StoredAllocation>;
+
+function own(file: StoreFile, key: string): StoredAllocation | undefined {
+  return Object.hasOwn(file, key) ? file[key] : undefined;
+}
 
 export class AllocationStoreCorruptError extends Error {
   constructor(filePath: string) {
@@ -39,21 +49,39 @@ export class AllocationStore {
 
   /** The app's allocation without its secret, or null. */
   async get(appName: string): Promise<AppStorageAllocation | null> {
-    const stored = (await this.load())[appName];
+    const stored = own(await this.load(), appName);
     if (!stored) return null;
     const { secretAccessKey: _secret, ...allocation } = stored;
     return allocation;
   }
 
-  /** Every allocation, without secrets. */
+  /** A retired record by its key (see `listRetired`), or null. */
+  async getRetired(key: string): Promise<AppStorageAllocation | null> {
+    const stored = own(await this.load(), key);
+    if (!stored?.retired) return null;
+    const { secretAccessKey: _secret, ...allocation } = stored;
+    return allocation;
+  }
+
+  /** Every LIVE allocation (one per app), without secrets. */
   async list(): Promise<AppStorageAllocation[]> {
-    return Object.values(await this.load()).map(({ secretAccessKey: _secret, ...a }) => a);
+    return Object.values(await this.load())
+      .filter((stored) => !stored.retired)
+      .map(({ secretAccessKey: _secret, ...a }) => a);
+  }
+
+  /** Allocations whose app was deleted with the resources left behind, keyed for `removeRetired`. */
+  async listRetired(): Promise<Array<{ key: string; allocation: AppStorageAllocation }>> {
+    return Object.entries(await this.load())
+      .filter(([, stored]) => stored.retired)
+      .map(([key, { secretAccessKey: _secret, ...allocation }]) => ({ key, allocation }));
   }
 
   /** The app's allocation WITH its decrypted secret — for env injection only. */
   async getCredentials(appName: string): Promise<AppStorageCredentials | null> {
-    const stored = (await this.load())[appName];
+    const stored = own(await this.load(), appName);
     if (!stored) return null;
+    if (stored.retired || !stored.secretAccessKey) return null;
     const key = await loadPlatformMasterKey(this.keyFilePath);
     if (!key) throw new Error('encryption.key is absent or not 32 bytes — cannot read storage credentials');
     return { ...stored, secretAccessKey: decrypt(stored.secretAccessKey, key) };
@@ -69,7 +97,70 @@ export class AllocationStore {
 
   async remove(appName: string): Promise<void> {
     await this.write(async (file) => {
+      if (Object.hasOwn(file, appName)) delete file[appName];
+    });
+  }
+
+  /**
+   * Move the app's record off its name. Deleting an app frees the name, and
+   * this store is keyed by it: a record left in place would hand the previous
+   * tenant's bucket — and its key — to whoever registers that name next,
+   * because provisioning is idempotent on exactly this lookup. `#` cannot
+   * appear in an app name, so the new key can never be asked for by one.
+   *
+   * The app's key secret is dropped here: a retired record is only ever torn
+   * down by the names of its resources, never run.
+   *
+   * Returns the retired record's key, or null when the app had none.
+   */
+  async retire(appName: string, reason: RetiredReason): Promise<string | null> {
+    let retiredKey: string | null = null;
+    await this.write(async (file) => {
+      const stored = own(file, appName);
+      if (!stored) return;
+      const at = new Date().toISOString();
+      let key = `${appName}#retired-${Date.now()}`;
+      for (let n = 1; Object.hasOwn(file, key); n += 1) key = `${appName}#retired-${Date.now()}-${n}`;
+      const { secretAccessKey: _secret, ...rest } = stored;
+      file[key] = { ...rest, retired: { at, reason } };
       delete file[appName];
+      retiredKey = key;
+    });
+    return retiredKey;
+  }
+
+  /**
+   * Merge fields into an existing record — live (keyed by app name) or
+   * retired (keyed as `listRetired` reports). False when there is none.
+   */
+  async amend(
+    key: string,
+    fields: Partial<Pick<AppStorageAllocation, 'accessRevoked' | 'quarantined'>> & {
+      retiredReason?: RetiredReason;
+      /** Forget the stored app secret — its key is revoked, so nothing may read it back. */
+      dropSecret?: boolean;
+    }
+  ): Promise<boolean> {
+    let found = false;
+    await this.write(async (file) => {
+      const stored = own(file, key);
+      if (!stored) return;
+      found = true;
+      const { retiredReason, dropSecret, ...rest } = fields;
+      const { secretAccessKey, ...withoutSecret } = stored;
+      file[key] = {
+        ...(dropSecret ? withoutSecret : { ...withoutSecret, secretAccessKey }),
+        ...rest,
+        ...(retiredReason && stored.retired ? { retired: { ...stored.retired, reason: retiredReason } } : {}),
+      };
+    });
+    return found;
+  }
+
+  /** Forget a retired record, once its resources are gone. */
+  async removeRetired(key: string): Promise<void> {
+    await this.write(async (file) => {
+      if (own(file, key)?.retired) delete file[key];
     });
   }
 
@@ -89,12 +180,14 @@ export class AllocationStore {
     try {
       raw = await fs.readFile(this.filePath, 'utf-8');
     } catch (err) {
-      if ((err as NodeJS.ErrnoException).code === 'ENOENT') return {};
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') return Object.create(null) as StoreFile;
       throw new AllocationStoreCorruptError(this.filePath);
     }
     try {
       const parsed = JSON.parse(raw);
-      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed as StoreFile;
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        return Object.assign(Object.create(null), parsed) as StoreFile;
+      }
     } catch {
       // fall through
     }

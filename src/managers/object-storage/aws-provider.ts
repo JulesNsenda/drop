@@ -24,6 +24,7 @@ import {
   ListMultipartUploadsCommand,
   AbortMultipartUploadCommand,
   DeleteBucketCommand,
+  HeadBucketCommand,
   type BucketLocationConstraint,
 } from '@aws-sdk/client-s3';
 import {
@@ -37,7 +38,7 @@ import {
   DeleteUserCommand,
 } from '@aws-sdk/client-iam';
 import { STSClient, GetCallerIdentityCommand } from '@aws-sdk/client-sts';
-import { IAM_USER_PATH, bucketOnlyPolicy } from './naming';
+import { IAM_USER_PATH, assertGeneratedResourcePair, assertGeneratedUserName, bucketOnlyPolicy } from './naming';
 import type { ObjectStorageProvider, StorageDeprovisionResult } from './types';
 
 /** The one method DROP uses on each SDK client — injectable for tests. */
@@ -84,10 +85,20 @@ async function ignoreGone<T>(op: Promise<T>): Promise<T | undefined> {
   }
 }
 
+/** An S3 client that signs with the APP's key — the only way to ask whether that key works. */
+export type S3ForKey = (key: { accessKeyId: string; secretAccessKey: string }) => Sender;
+
 export class AwsObjectStorageProvider implements ObjectStorageProvider {
   constructor(
     private readonly region: string,
-    private readonly clients: AwsClients
+    private readonly clients: AwsClients,
+    private readonly s3ForKey: S3ForKey = (key) =>
+      new S3Client({
+        region: region,
+        credentials: { accessKeyId: key.accessKeyId, secretAccessKey: key.secretAccessKey },
+        // One quick try per probe; the caller does the waiting.
+        maxAttempts: 1,
+      })
   ) {}
 
   async provision(input: { appName: string; bucket: string; userName: string }): Promise<{
@@ -153,9 +164,25 @@ export class AwsObjectStorageProvider implements ObjectStorageProvider {
   }
 
   async deprovision(input: { bucket: string; userName: string }): Promise<StorageDeprovisionResult> {
+    // Backstop for every caller: see isGeneratedResourcePair.
+    assertGeneratedResourcePair(input.bucket, input.userName);
     const userDeleted = await this.removeUser(input.userName);
     const { objectsDeleted, bucketDeleted } = await this.removeBucket(input.bucket);
     return { objectsDeleted, bucketDeleted, userDeleted };
+  }
+
+  async revokeAccess(input: { userName: string }): Promise<boolean> {
+    assertGeneratedUserName(input.userName);
+    return this.removeUser(input.userName);
+  }
+
+  async probeAccess(input: { bucket: string; accessKeyId: string; secretAccessKey: string }): Promise<boolean> {
+    try {
+      await this.s3ForKey(input).send(new HeadBucketCommand({ Bucket: input.bucket }));
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   async whoAmI(): Promise<{ account: string }> {
@@ -196,10 +223,13 @@ export class AwsObjectStorageProvider implements ObjectStorageProvider {
       );
       for (let i = 0; i < targets.length; i += 1000) {
         const batch = targets.slice(i, i + 1000);
-        await this.clients.s3.send(
+        const deleted = await this.clients.s3.send(
           new DeleteObjectsCommand({ Bucket: bucket, Delete: { Objects: batch, Quiet: true } })
         );
-        objectsDeleted += batch.length;
+        // DeleteObjects answers 200 with a per-object `Errors` list: those
+        // were NOT deleted, and the count must not claim them. (A non-empty
+        // bucket then fails DeleteBucket, so the teardown is retried.)
+        objectsDeleted += batch.length - (deleted?.Errors?.length ?? 0);
       }
       if (!page.IsTruncated) break;
       keyMarker = page.NextKeyMarker;

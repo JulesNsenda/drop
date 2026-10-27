@@ -25,7 +25,8 @@ import * as path from 'path';
 import * as os from 'os';
 import * as crypto from 'crypto';
 import { ApiServer } from '../server';
-import { createUser, resetAuth } from '../middleware/auth';
+import { createUser, createApiKey, resetAuth } from '../middleware/auth';
+import * as activity from '../../managers/activity';
 import { getTestToken } from '../__testutils__/auth';
 import { getStateManager, resetStateManager } from '../../managers/app/state-manager';
 import { getSettingsManager, resetSettingsManager } from '../../managers/settings/settings-manager';
@@ -274,6 +275,7 @@ describe('admin settings routes (PRD-041)', () => {
     resetStorageCredentialStore();
     resetObjectStorageProvisioner();
     getObjectStorageProvisioner({
+      environment: () => ({ isolation: 'docker', authEnabled: true }),
       allocations: new AllocationStore(path.join(tempDir, 'object-storage.json'), path.join(tempDir, 'encryption.key')),
       credentials: getStorageCredentialStore({
         credentialFilePath: path.join(tempDir, 'object-storage-credential.json'),
@@ -281,7 +283,9 @@ describe('admin settings routes (PRD-041)', () => {
       }),
       providerFactory: () => ({
         provision: jest.fn(),
-        deprovision: jest.fn(),
+        revokeAccess: jest.fn().mockResolvedValue(true),
+        probeAccess: jest.fn().mockResolvedValue(true),
+        deprovision: jest.fn().mockResolvedValue({ objectsDeleted: 2, bucketDeleted: true, userDeleted: true }),
         whoAmI: jest.fn().mockResolvedValue({ account: '123456789012' }),
       }),
     });
@@ -1354,6 +1358,15 @@ describe('admin settings routes (PRD-041)', () => {
       });
     const storageBlock = async () =>
       ((await (await getSettings()).json()) as { data: { objectStorage: Record<string, unknown> } }).data.objectStorage;
+    const listRetired = (token?: string) =>
+      hono.request('/api/v1/admin/object-storage/retired', { headers: authHeader(token ?? adminToken) });
+    const destroyRetired = (id: string, token?: string, confirm: string | null = id) =>
+      hono.request(
+        `/api/v1/admin/object-storage/retired/${encodeURIComponent(id)}${
+          confirm === null ? '' : `?confirm=${encodeURIComponent(confirm)}`
+        }`,
+        { method: 'DELETE', headers: authHeader(token ?? adminToken) }
+      );
     const goodKey = { accessKeyId: 'AKIAIOSFODNN7EXAMPLE', secretAccessKey: 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY' };
 
     it('becomes available once enabled, configured and given a credential', async () => {
@@ -1436,6 +1449,89 @@ describe('admin settings routes (PRD-041)', () => {
       const token = await getTestToken('plain', 'password123');
       expect((await putStorage({ enabled: true }, token)).status).toBe(403);
       expect((await putStorageCredential(goodKey, token)).status).toBe(403);
+      expect((await listRetired(token)).status).toBe(403);
+      expect((await destroyRetired('x', token)).status).toBe(403);
+    });
+
+    describe('retired (kept) buckets', () => {
+      const seedKept = async (): Promise<string> => {
+        await writeValidEncryptionKey();
+        const store = new AllocationStore(path.join(tempDir, 'object-storage.json'), path.join(tempDir, 'encryption.key'));
+        await store.put({
+          appName: 'site', provider: 'aws', region: 'eu-central-1', bucket: 'dropkit-site-a1b2c3d4',
+          userName: 'drop-dropkit-site-a1b2c3d4', accessKeyId: 'AKIAAPP', createdAt: 'now',
+          ownerUserId: 'u1', secretAccessKey: 'app-secret-value',
+        });
+        return (await store.retire('site', 'kept'))!;
+      };
+
+      it('lists kept buckets as metadata only, with no secret of any kind', async () => {
+        const id = await seedKept();
+        const res = await listRetired();
+        expect(res.status).toBe(200);
+        const body = (await res.json()) as { data: { retired: Array<Record<string, unknown>> } };
+        expect(body.data.retired).toEqual([
+          expect.objectContaining({ id, appName: 'site', bucket: 'dropkit-site-a1b2c3d4', ownerUserId: 'u1', reason: 'kept' }),
+        ]);
+        expect(JSON.stringify(body)).not.toMatch(/secret|AKIA/i);
+      });
+
+      it('refuses to destroy without ?confirm=<id>, or with a different one, touching nothing', async () => {
+        const id = await seedKept();
+        await putStorageCredential(goodKey);
+
+        for (const confirm of [null, '', 'other']) {
+          const res = await destroyRetired(id, undefined, confirm);
+          expect(res.status).toBe(400);
+          expect(((await res.json()) as { error: { details?: { reason: string } } }).error.details?.reason).toBe(
+            'confirmation-required'
+          );
+        }
+        const list = (await (await listRetired()).json()) as { data: { retired: unknown[] } };
+        expect(list.data.retired).toHaveLength(1);
+      });
+
+      it('refuses an admin API key even with the right confirmation: it needs a person', async () => {
+        const id = await seedKept();
+        await putStorageCredential(goodKey);
+        const admin2 = await createUser({ username: 'root2', role: 'admin', credential: { password: 'password123' } });
+        const apiKey = (await createApiKey('root2-key', 'admin', undefined, undefined, admin2.id)).key;
+
+        const res = await hono.request(
+          `/api/v1/admin/object-storage/retired/${encodeURIComponent(id)}?confirm=${encodeURIComponent(id)}`,
+          { method: 'DELETE', headers: { 'X-API-Key': apiKey } }
+        );
+
+        expect(res.status).toBe(403);
+        const list = (await (await listRetired()).json()) as { data: { retired: unknown[] } };
+        expect(list.data.retired).toHaveLength(1);
+      });
+
+      it('records a distinct activity entry when a bucket is destroyed', async () => {
+        const id = await seedKept();
+        await putStorageCredential(goodKey);
+        const log = jest.spyOn(activity, 'logActivityFor').mockResolvedValue(undefined as never);
+
+        expect((await destroyRetired(id)).status).toBe(200);
+
+        expect(log).toHaveBeenCalledWith(
+          expect.anything(),
+          expect.objectContaining({ action: 'object-storage-bucket-destroyed' })
+        );
+        log.mockRestore();
+      });
+
+      it('destroys a kept bucket on request, and 404s once it is gone', async () => {
+        const id = await seedKept();
+        await putStorageCredential(goodKey);
+
+        const res = await destroyRetired(id);
+        expect(res.status).toBe(200);
+        expect(((await res.json()) as { data: unknown }).data).toEqual({ destroyed: true, objectsDeleted: 2, bucketDeleted: true });
+        expect((await destroyRetired(id)).status).toBe(404);
+        const list = (await (await listRetired()).json()) as { data: { retired: unknown[] } };
+        expect(list.data.retired).toEqual([]);
+      });
     });
   });
 
@@ -1476,6 +1572,8 @@ describe('admin settings routes (PRD-041)', () => {
       ['PUT', '/api/v1/admin/settings/object-storage/credential', { accessKeyId: 'AKIAIOSFODNN7EXAMPLE', secretAccessKey: 'x'.repeat(40) }],
       ['DELETE', '/api/v1/admin/settings/object-storage/credential', undefined],
       ['POST', '/api/v1/admin/object-storage/test', undefined],
+      ['GET', '/api/v1/admin/object-storage/retired', undefined],
+      ['DELETE', '/api/v1/admin/object-storage/retired/x', undefined],
     ])('refuses %s %s with 401 (object storage, #301)', async (method, url, body) => {
       const res = await noAuthHono.request(url, {
         method,
