@@ -87,6 +87,12 @@ export interface ObjectStorageProvider {
   revokeAccess(input: { userName: string }): Promise<boolean>;
   /** Delete the key(s), the user, every object and the bucket. Idempotent. */
   deprovision(input: { bucket: string; userName: string }): Promise<StorageDeprovisionResult>;
+  /**
+   * Whether the APP's own key can reach its bucket yet (an S3 HeadBucket made
+   * with that key, not the admin's). A brand-new IAM key takes a moment to be
+   * honoured everywhere; false means "not yet", never an error.
+   */
+  probeAccess(input: { bucket: string; accessKeyId: string; secretAccessKey: string }): Promise<boolean>;
   /** Confirm the admin credential works; returns the account it belongs to. */
   whoAmI(): Promise<{ account: string }>;
 }

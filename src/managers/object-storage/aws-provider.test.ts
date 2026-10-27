@@ -192,6 +192,35 @@ describe('AwsObjectStorageProvider.revokeAccess', () => {
   });
 });
 
+describe('AwsObjectStorageProvider.probeAccess', () => {
+  const key = { bucket: BUCKET, accessKeyId: 'AKIAAPP', secretAccessKey: 'secret' };
+
+  it("makes a HeadBucket with the APP's key, not the admin's", async () => {
+    const { calls: adminCalls, clients } = fakeClients({});
+    const { calls: appCalls, clients: appClients } = fakeClients({ HeadBucketCommand: () => ({}) });
+    const used: unknown[] = [];
+    const provider = new AwsObjectStorageProvider('eu-central-1', clients, (k) => {
+      used.push(k);
+      return appClients.s3;
+    });
+
+    await expect(provider.probeAccess(key)).resolves.toBe(true);
+
+    expect(used).toEqual([expect.objectContaining({ accessKeyId: 'AKIAAPP', secretAccessKey: 'secret' })]);
+    expect(appCalls.map((c) => c.command)).toEqual(['HeadBucketCommand']);
+    expect(appCalls[0].input.Bucket).toBe(BUCKET);
+    expect(adminCalls).toEqual([]);
+  });
+
+  it('reads any failure as "not yet", never an error', async () => {
+    const { clients: appClients } = fakeClients({ HeadBucketCommand: gone('InvalidAccessKeyId') });
+    const { clients } = fakeClients({});
+    const provider = new AwsObjectStorageProvider('eu-central-1', clients, () => appClients.s3);
+
+    await expect(provider.probeAccess(key)).resolves.toBe(false);
+  });
+});
+
 describe('AwsObjectStorageProvider.whoAmI', () => {
   it('reports the account of the admin credential', async () => {
     const { clients } = fakeClients({ GetCallerIdentityCommand: () => ({ Account: '123456789012' }) });

@@ -24,6 +24,7 @@ import {
   ListMultipartUploadsCommand,
   AbortMultipartUploadCommand,
   DeleteBucketCommand,
+  HeadBucketCommand,
   type BucketLocationConstraint,
 } from '@aws-sdk/client-s3';
 import {
@@ -84,10 +85,20 @@ async function ignoreGone<T>(op: Promise<T>): Promise<T | undefined> {
   }
 }
 
+/** An S3 client that signs with the APP's key — the only way to ask whether that key works. */
+export type S3ForKey = (key: { accessKeyId: string; secretAccessKey: string }) => Sender;
+
 export class AwsObjectStorageProvider implements ObjectStorageProvider {
   constructor(
     private readonly region: string,
-    private readonly clients: AwsClients
+    private readonly clients: AwsClients,
+    private readonly s3ForKey: S3ForKey = (key) =>
+      new S3Client({
+        region: region,
+        credentials: { accessKeyId: key.accessKeyId, secretAccessKey: key.secretAccessKey },
+        // One quick try per probe; the caller does the waiting.
+        maxAttempts: 1,
+      })
   ) {}
 
   async provision(input: { appName: string; bucket: string; userName: string }): Promise<{
@@ -163,6 +174,15 @@ export class AwsObjectStorageProvider implements ObjectStorageProvider {
   async revokeAccess(input: { userName: string }): Promise<boolean> {
     assertGeneratedUserName(input.userName);
     return this.removeUser(input.userName);
+  }
+
+  async probeAccess(input: { bucket: string; accessKeyId: string; secretAccessKey: string }): Promise<boolean> {
+    try {
+      await this.s3ForKey(input).send(new HeadBucketCommand({ Bucket: input.bucket }));
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   async whoAmI(): Promise<{ account: string }> {

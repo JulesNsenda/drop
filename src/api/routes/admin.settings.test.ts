@@ -282,6 +282,7 @@ describe('admin settings routes (PRD-041)', () => {
       providerFactory: () => ({
         provision: jest.fn(),
         revokeAccess: jest.fn().mockResolvedValue(true),
+        probeAccess: jest.fn().mockResolvedValue(true),
         deprovision: jest.fn().mockResolvedValue({ objectsDeleted: 2, bucketDeleted: true, userDeleted: true }),
         whoAmI: jest.fn().mockResolvedValue({ account: '123456789012' }),
       }),

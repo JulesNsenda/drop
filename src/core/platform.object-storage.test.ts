@@ -72,6 +72,7 @@ describe('DropPlatform object storage (#301)', () => {
     teardownForDeletedApp: jest.Mock;
     undoProvision: jest.Mock;
     revokeAppAccess: jest.Mock;
+    awaitKeyPropagation: jest.Mock;
     sweepRetired: jest.Mock;
   };
 
@@ -108,6 +109,7 @@ describe('DropPlatform object storage (#301)', () => {
       }),
       teardownForDeletedApp: jest.fn().mockResolvedValue({ outcome: 'none' }),
       undoProvision: jest.fn().mockResolvedValue(undefined),
+      awaitKeyPropagation: jest.fn().mockResolvedValue(true),
       revokeAppAccess: jest.fn(async (name: string) => (allocated.has(name) ? { appName: name, accessRevoked: true } : null)),
       sweepRetired: jest.fn().mockResolvedValue({ destroyed: 0, failed: 0 }),
     };
@@ -149,6 +151,41 @@ describe('DropPlatform object storage (#301)', () => {
         setServiceIntent.mock.invocationCallOrder[0]
       );
       expect(setServiceIntent.mock.invocationCallOrder[0]).toBeLessThan(doRestart.mock.invocationCallOrder[0]);
+    });
+
+    it("waits for the new key to be honoured BEFORE the restart, and restarts anyway if it never is", async () => {
+      stubAppConfigService(baseConfig());
+      stubStateManager(baseState());
+      stubSecrets();
+      const storage = stubStorage();
+      const doRestart = jest.spyOn(platform as any, 'doRestart').mockResolvedValue(undefined);
+
+      await platform.attachService(appName, 'object-storage');
+      expect(storage.awaitKeyPropagation).toHaveBeenCalledWith(appName);
+      expect(storage.awaitKeyPropagation.mock.invocationCallOrder[0]).toBeLessThan(
+        doRestart.mock.invocationCallOrder[0]
+      );
+
+      doRestart.mockClear();
+      storage.awaitKeyPropagation.mockResolvedValueOnce(false);
+      jest.spyOn((platform as any).logger, 'warn').mockImplementation(() => undefined);
+      // Detached in between, so this is a fresh bucket again.
+      (storage.getAllocation as jest.Mock).mockResolvedValueOnce(null);
+      expect(await platform.attachService(appName, 'object-storage')).toEqual(
+        expect.objectContaining({ attached: true })
+      );
+      expect(doRestart).toHaveBeenCalledTimes(1);
+    });
+
+    it('does not wait for a bucket that already existed (its key propagated long ago)', async () => {
+      stubAppConfigService(baseConfig());
+      stubStateManager(baseState());
+      stubSecrets();
+      const storage = stubStorage({ allocated: [appName] });
+      jest.spyOn(platform as any, 'doRestart').mockResolvedValue(undefined);
+
+      await platform.attachService(appName, 'object-storage');
+      expect(storage.awaitKeyPropagation).not.toHaveBeenCalled();
     });
 
     it('takes back a bucket it just created when the app lost its config before the intent could be saved', async () => {

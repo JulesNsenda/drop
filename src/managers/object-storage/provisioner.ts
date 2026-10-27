@@ -267,6 +267,36 @@ export class ObjectStorageProvisioner {
   }
 
   /**
+   * Wait until the app's NEW key is actually honoured: a freshly created IAM
+   * key is eventually consistent, and an app restarted straight after attach
+   * can boot into `InvalidAccessKeyId` and crash-loop on first use. Polls an
+   * S3 HeadBucket made with the app's own key, backing off (250ms doubling to
+   * 4s) for at most `timeoutMs` (default 30s). True once it works; false on
+   * timeout — the caller proceeds anyway, since the key usually lands while
+   * the app boots, and an app that retries recovers.
+   */
+  async awaitKeyPropagation(
+    appName: string,
+    opts: { timeoutMs?: number; sleep?: (ms: number) => Promise<void> } = {}
+  ): Promise<boolean> {
+    const creds = await this.allocations.getCredentials(appName);
+    if (!creds) return false;
+    const provider = await this.providerFor(creds.region);
+    const sleep = opts.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+    const timeoutMs = opts.timeoutMs ?? 30_000;
+    let waited = 0;
+    let delay = 250;
+    for (;;) {
+      if (await provider.probeAccess(creds)) return true;
+      if (waited >= timeoutMs) return false;
+      const step = Math.min(delay, timeoutMs - waited);
+      await sleep(step);
+      waited += step;
+      delay = Math.min(delay * 2, 4000);
+    }
+  }
+
+  /**
    * The env vars for the app, or null when it has no storage. Standard AWS
    * names, so any AWS SDK in the app finds them unaided.
    */

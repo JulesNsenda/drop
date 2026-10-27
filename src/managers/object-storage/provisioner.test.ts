@@ -66,6 +66,7 @@ describe('object storage stores and provisioner', () => {
     provider = {
       provision: jest.fn().mockResolvedValue({ accessKeyId: 'AKIAAPP', secretAccessKey: 'app-secret-value' }),
       revokeAccess: jest.fn().mockResolvedValue(true),
+      probeAccess: jest.fn().mockResolvedValue(true),
       deprovision: jest.fn().mockResolvedValue({ objectsDeleted: 3, bucketDeleted: true, userDeleted: true }),
       whoAmI: jest.fn().mockResolvedValue({ account: '123456789012' }),
     };
@@ -319,6 +320,60 @@ describe('object storage stores and provisioner', () => {
 
       await expect(p.deprovisionAppStorage('site')).rejects.toThrow('AccessDenied');
       expect(await p.getAllocation('site')).not.toBeNull();
+    });
+
+    describe('awaitKeyPropagation', () => {
+      const instantSleep = () => {
+        const waits: number[] = [];
+        return { waits, sleep: async (ms: number) => void waits.push(ms) };
+      };
+
+      it("probes with the APP's own key and returns at once when it already works", async () => {
+        await configure();
+        const p = makeProvisioner();
+        const live = await p.provisionAppStorage('site');
+        const { waits, sleep } = instantSleep();
+
+        expect(await p.awaitKeyPropagation('site', { sleep })).toBe(true);
+        expect(provider.probeAccess).toHaveBeenCalledTimes(1);
+        expect(provider.probeAccess).toHaveBeenCalledWith(
+          expect.objectContaining({ bucket: live.bucket, accessKeyId: 'AKIAAPP', secretAccessKey: 'app-secret-value' })
+        );
+        expect(waits).toEqual([]);
+      });
+
+      it('backs off (250ms doubling to 4s) until the key is honoured', async () => {
+        await configure();
+        const p = makeProvisioner();
+        await p.provisionAppStorage('site');
+        provider.probeAccess
+          .mockResolvedValueOnce(false)
+          .mockResolvedValueOnce(false)
+          .mockResolvedValueOnce(false)
+          .mockResolvedValueOnce(true);
+        const { waits, sleep } = instantSleep();
+
+        expect(await p.awaitKeyPropagation('site', { sleep })).toBe(true);
+        expect(waits).toEqual([250, 500, 1000]);
+      });
+
+      it('gives up after the bound, never waiting longer than it', async () => {
+        await configure();
+        const p = makeProvisioner();
+        await p.provisionAppStorage('site');
+        provider.probeAccess.mockResolvedValue(false);
+        const { waits, sleep } = instantSleep();
+
+        expect(await p.awaitKeyPropagation('site', { sleep, timeoutMs: 30_000 })).toBe(false);
+        expect(waits.reduce((a, b) => a + b, 0)).toBe(30_000);
+        expect(Math.max(...waits)).toBeLessThanOrEqual(4000);
+      });
+
+      it('has nothing to wait for without an allocation', async () => {
+        await configure();
+        expect(await makeProvisioner().awaitKeyPropagation('nobody')).toBe(false);
+        expect(provider.probeAccess).not.toHaveBeenCalled();
+      });
     });
 
     describe('detaching (the app stays; its storage goes)', () => {

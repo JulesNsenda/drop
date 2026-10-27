@@ -8725,6 +8725,20 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         });
       }
 
+      // A brand-new IAM key is eventually consistent: restarting the app the
+      // instant it exists can boot it into InvalidAccessKeyId. Wait (bounded)
+      // until the app's own key reaches its bucket. Not a refusal on timeout —
+      // the key normally lands while the app boots.
+      if (serviceId === 'object-storage' && createdStorage && this.objectStorage) {
+        const ready = await this.objectStorage.awaitKeyPropagation(appName).catch(() => false);
+        if (!ready) {
+          this.logger.warn(
+            `The new object-storage key for '${appName}' was not yet honoured after the wait - restarting the app anyway`,
+            'STORAGE'
+          );
+        }
+      }
+
       // Only report success once the restart (and its env re-injection)
       // actually resolves — a provisioned-but-not-yet-running database is
       // not what "Attach" promised.
