@@ -69,7 +69,7 @@ describe('POST /apps/:name/redeploy', () => {
     const res = await redeploy('site', bearer(ownerToken));
     expect(res.status).toBe(202);
     expect(core).toHaveBeenCalledTimes(1);
-    expect(core).toHaveBeenCalledWith(expect.objectContaining({ userId: ownerId }), ops, 'site');
+    expect(core).toHaveBeenCalledWith(expect.objectContaining({ userId: ownerId }), 'site');
     core.mockRestore();
   });
 

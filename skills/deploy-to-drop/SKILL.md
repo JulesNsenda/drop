@@ -46,7 +46,7 @@ Cursor and other clients: same URL and `Authorization` header in `mcp.json`.
 | Bigger project, binary assets, or already on GitHub (**new** app only) | `deploy_from_git` |
 | Shell-capable agent with a large or binary project | REST tarball upload (below) |
 | Rebuild an existing app without changing its files (a git app pulls its newest commit first) | `redeploy_app` |
-| Redeploying an app that was deployed from git | `POST /api/v1/git/redeploy/<app>` (uploads onto a git-deployed app are refused with 409) |
+| Redeploying an app that was deployed from git | `redeploy_app` (REST alternative: `POST /api/v1/git/redeploy/<app>`; uploads onto a git-deployed app are refused with 409) |
 | Scratch test you don't want to keep | `deploy_files` with `ephemeral: true` (self-deletes, default 60 min; `ttl_minutes` sets the lifetime, clamped to the platform maximum) |
 
 Calling `deploy_files` again with the same `name` redeploys that app. Files you
@@ -149,15 +149,17 @@ curl -sS "$DROP_URL/api/v1/logs/my-app/build" -H "Authorization: Bearer $DROP_AP
 curl -sS "$DROP_URL/api/v1/apps/my-app" -H "Authorization: Bearer $DROP_API_KEY"
 ```
 
-Redeploying an app that was deployed from git: `POST /api/v1/git/redeploy/my-app`
-(same auth header, no body needed). A stopped app must be started first with
+Redeploying an app that was deployed from git: the MCP `redeploy_app` tool, or
+over REST `POST /api/v1/git/redeploy/my-app` (same auth header, no body needed).
+`POST /api/v1/apps/my-app/redeploy` is the REST twin of `redeploy_app` and
+covers files, git and monorepo apps. A stopped app must be started first with
 `POST /api/v1/apps/my-app/start`.
 
 | Status | Meaning | Action |
 |---|---|---|
 | 400 | Bad archive or invalid app name | Repack; read the `reason` |
 | 404 | Name belongs to someone else (or does not exist) | Pick another name |
-| 409 | Mid-build, app was stopped, or app is git-deployed | Wait; start a stopped app; use git redeploy for git apps |
+| 409 | Mid-build, app was stopped, or app is git-deployed | Wait; start a stopped app; use `redeploy_app` or git redeploy for git apps |
 | 413 | Archive over the cap (default 100 MB) | Trim; check excludes |
 | 429 | Upload already in flight, app limit reached, or rate-limited | Wait for the current deploy; honour `Retry-After` |
 

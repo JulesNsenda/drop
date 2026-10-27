@@ -1336,7 +1336,7 @@ apps.post('/:name/redeploy', async c => {
   const name = c.req.param('name');
 
   // Authorization, git-group resolution and the actor live in redeployFor, shared with the MCP tool.
-  const outcome = await redeployFor(auth, getPlatformOps(), name);
+  const outcome = await redeployFor(auth, name);
   if (outcome.kind === 'not-found') throw new NotFoundError(`Application '${name}' not found`);
   if (outcome.kind === 'unavailable') {
     return c.json(error(ErrorCodes.SERVICE_UNAVAILABLE, 'Platform operations unavailable'), 503);

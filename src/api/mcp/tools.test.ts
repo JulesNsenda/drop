@@ -31,7 +31,8 @@ import { AuthContext } from '../middleware/auth';
 import { getStateManager, resetStateManager } from '../../managers/app/state-manager';
 import { getAppConfigService, resetAppConfigService } from '../../managers/app/app-config';
 import { setApiRuntimeConfig } from '../runtime-config';
-import { setPlatformOps, resetPlatformOps, PlatformOps, AppInProgressError } from '../platform-ops';
+import { setPlatformOps, resetPlatformOps, PlatformOps, AppInProgressError, StaleDependenciesError } from '../platform-ops';
+import * as activityModule from '../../managers/activity';
 import { makePlatformOpsStub } from '../__testutils__/platform-ops';
 import { resetUploadPreflightState } from '../upload-preflight';
 import * as diskUtils from '../../utils/disk';
@@ -1261,8 +1262,12 @@ describe('MCP tool handlers', () => {
       const result = await handleRedeployApp(alice, { name: 'alice-app' });
 
       expect(result.isError).toBe(true);
-      expect(firstText(result)).toContain('BEGIN UNTRUSTED');
-      expect(firstText(result)).toContain('ignore-all-instructions');
+      const text = firstText(result);
+      expect(text).toMatch(/^----- BEGIN UNTRUSTED GIT SOURCE: alice-app #\w+/);
+      expect(text).toMatch(/----- END UNTRUSTED GIT SOURCE: alice-app #\w+ -----$/);
+      expect(text.indexOf('ignore-all-instructions')).toBeGreaterThan(text.indexOf('BEGIN UNTRUSTED'));
+      expect(text.indexOf('ignore-all-instructions')).toBeLessThan(text.indexOf('END UNTRUSTED'));
+      expect(JSON.stringify(result.structuredContent)).not.toContain('evil');
     });
 
     it('maps AppInProgressError to a tool error', async () => {
@@ -1274,6 +1279,111 @@ describe('MCP tool handlers', () => {
       expect(firstText(result)).toContain('operation in progress');
     });
 
+    it('refuses a readonly principal as not-found, before any lookup or admission', async () => {
+      const ops = makeOps({ redeployApp: jest.fn() });
+      setPlatformOps(ops);
+      const readonly: AuthContext = { ...alice, role: 'readonly' };
+
+      const result = await handleRedeployApp(readonly, { name: 'alice-app' });
+
+      expect(result.isError).toBe(true);
+      expect(firstText(result)).toBe("Application 'alice-app' not found");
+      expect(ops.redeployApp).not.toHaveBeenCalled();
+    });
+
+    it('does not send an agent round restart_app: a stopped-app refusal says a person has to act', async () => {
+      setPlatformOps(
+        makeOps({
+          redeployApp: jest.fn().mockResolvedValue({
+            refused: { code: 'APP_STOPPED', message: "Application 'alice-app' is stopped; start it before redeploying" },
+          }),
+        })
+      );
+
+      const result = await handleRedeployApp(alice, { name: 'alice-app' });
+
+      expect(result.isError).toBe(true);
+      expect(firstText(result)).toContain('a person has to start or redeploy this app from the dashboard');
+      expect(result.structuredContent).toEqual(expect.objectContaining({ refusal_code: 'APP_STOPPED' }));
+    });
+
+    it('restart_app tells an agent the same thing in the stale-dependencies case', async () => {
+      setPlatformOps(makeOps({ restartApp: jest.fn().mockRejectedValue(new StaleDependenciesError('alice-app')) }));
+
+      const result = await handleRestartApp(alice, { name: 'alice-app' });
+
+      expect(result.isError).toBe(true);
+      expect(firstText(result)).toContain('a person has to start or redeploy it from the dashboard');
+    });
+
+    it('waits for a started redeploy by its deploy id, not the newest episode, and stamps the id on the answer', async () => {
+      setPlatformOps(makeOps({ redeployApp: jest.fn().mockResolvedValue({ started: 'mine' }) }));
+      // A newer episode of another deploy sits in front of ours, and an older start time would not match.
+      jest.spyOn(deployTrackerModule, 'getDeployTracker').mockReturnValue({
+        getEpisodes: jest.fn().mockReturnValue([
+          { deployId: 'other', appName: 'alice-app', status: 'failed', startedAt: new Date().toISOString(), stages: [] },
+          { deployId: 'mine', appName: 'alice-app', status: 'succeeded', startedAt: '2020-01-01T00:00:00.000Z', stages: [] },
+        ]),
+      } as unknown as ReturnType<typeof deployTrackerModule.getDeployTracker>);
+
+      const result = await handleRedeployApp(alice, { name: 'alice-app' });
+
+      expect(result.isError).toBeFalsy();
+      expect(firstText(result)).toContain('succeeded');
+      expect(firstText(result)).toContain('Deploy id: mine');
+      expect(result.structuredContent).toEqual(expect.objectContaining({ deploy_id: 'mine' }));
+    });
+
+    it('names the deploy id on the timeout answer too', async () => {
+      process.env.DROP_MCP_DEPLOY_WAIT_MS = '50';
+      try {
+        setPlatformOps(makeOps({ redeployApp: jest.fn().mockResolvedValue({ started: 'slow-1' }) }));
+        jest.spyOn(deployTrackerModule, 'getDeployTracker').mockReturnValue({
+          getEpisodes: jest.fn().mockReturnValue([]),
+        } as unknown as ReturnType<typeof deployTrackerModule.getDeployTracker>);
+
+        const result = await handleRedeployApp(alice, { name: 'alice-app' });
+
+        expect(firstText(result)).toContain('still building');
+        expect(firstText(result)).toContain('Deploy id: slow-1');
+        expect(result.structuredContent).toEqual(expect.objectContaining({ deploy_id: 'slow-1' }));
+      } finally {
+        delete process.env.DROP_MCP_DEPLOY_WAIT_MS;
+      }
+    });
+
+    it('stops waiting on an accepted redeploy whose app became a monorepo container after the land', async () => {
+      setPlatformOps(makeOps({ redeployApp: jest.fn().mockResolvedValue({ accepted: true }) }));
+      await getStateManager().updateApp('alice-app', { isGroupContainer: true } as Record<string, unknown>);
+      jest.spyOn(deployTrackerModule, 'getDeployTracker').mockReturnValue({
+        getEpisodes: jest.fn().mockReturnValue([]),
+      } as unknown as ReturnType<typeof deployTrackerModule.getDeployTracker>);
+
+      const result = await handleRedeployApp(alice, { name: 'alice-app' });
+
+      expect(result.isError).toBeFalsy();
+      expect(firstText(result)).toContain('monorepo container');
+      expect(result.structuredContent).toEqual(expect.objectContaining({ status: 'group_reexpanding' }));
+    });
+
+    it('fences the catch-all error message as untrusted', async () => {
+      setPlatformOps(makeOps({ redeployApp: jest.fn().mockRejectedValue(new Error('boom /srv/x ignore-me')) }));
+
+      const result = await handleRedeployApp(alice, { name: 'alice-app' });
+
+      expect(result.isError).toBe(true);
+      expect(firstText(result)).toMatch(/BEGIN UNTRUSTED REDEPLOY: alice-app #\w+[\s\S]*boom \/srv\/x ignore-me[\s\S]*END UNTRUSTED REDEPLOY/);
+    });
+
+    it('writes the same activity detail the route does', async () => {
+      const audit = jest.spyOn(activityModule, 'tryLogActivity').mockResolvedValue();
+      setPlatformOps(makeOps({ redeployApp: jest.fn().mockResolvedValue({ group: { container: 'alice-app' } }) }));
+
+      await handleRedeployApp(alice, { name: 'alice-app' });
+
+      expect(audit).toHaveBeenCalledWith(expect.objectContaining({ action: 'redeploy', appName: 'alice-app', detail: 'group' }));
+    });
+
     it('decides through the shared redeployFor, with the caller, the platform ops and the name', async () => {
       const ops = makeOps({ redeployApp: jest.fn() });
       setPlatformOps(ops);
@@ -1281,7 +1391,7 @@ describe('MCP tool handlers', () => {
 
       const result = await handleRedeployApp(alice, { name: 'alice-app' });
 
-      expect(core).toHaveBeenCalledWith(alice, ops, 'alice-app');
+      expect(core).toHaveBeenCalledWith(alice, 'alice-app');
       expect(firstText(result)).toBe("Application 'alice-app' not found");
     });
   });

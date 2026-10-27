@@ -12,7 +12,7 @@ import { canAccessScoped, tokenCallerOf } from './access';
 import { deployActorOf } from './deploy-actor';
 import { getStateManager } from '../managers/app/state-manager';
 import { resolveGitBackedName } from '../core/git-backed';
-import type { PlatformOps, RedeployStart } from './platform-ops';
+import { getPlatformOps, type RedeployStart } from './platform-ops';
 
 export type RedeployForResult =
   /** Unknown, foreign or out-of-scope: one answer for all three, naming only the app asked for. */
@@ -29,11 +29,11 @@ export type RedeployForResult =
       detail: 'git' | 'group' | 'files';
     };
 
-export async function redeployFor(
-  auth: AuthContext | undefined,
-  ops: PlatformOps | null | undefined,
-  name: string
-): Promise<RedeployForResult> {
+export async function redeployFor(auth: AuthContext | undefined, name: string): Promise<RedeployForResult> {
+  // A readonly principal never redeploys. REST floors the route at 'user'; the MCP
+  // OAuth path has no role floor of its own, so a demoted user is refused here, as not-found.
+  if (auth?.role === 'readonly') return { kind: 'not-found' };
+
   // Authorization first, and a 404 that names only the app the caller asked
   // for. Scoped: an agent token needs app:<name>:deploy for THIS app.
   const stateManager = getStateManager();
@@ -52,6 +52,7 @@ export async function redeployFor(
     target = owner;
   }
 
+  const ops = getPlatformOps();
   if (!ops) return { kind: 'unavailable' };
 
   // Taken BEFORE the start, so the since-stream cannot miss an episode that
