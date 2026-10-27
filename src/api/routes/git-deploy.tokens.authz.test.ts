@@ -366,6 +366,29 @@ describe('git token routes authorization', () => {
       expect(pulledWith()).toEqual(['ghp_legacyvalue', undefined]);
     });
 
+    it('an app left out of keepAttached loses a grant it already held', async () => {
+      const legacy = await getGitDeployService().setToken('legacy-pat', 'ghp_legacyvalue');
+      await gitApp('bobs-app', bobId, legacy.id);
+      const assign = (keepAttached: string[]) =>
+        app.request(`/api/v1/git/tokens/${legacy.id}/owner`, {
+          method: 'PUT',
+          headers: json(adminToken),
+          body: JSON.stringify({ userId: aliceId, keepAttached }),
+        });
+
+      expect((await assign(['bobs-app'])).status).toBe(200);
+      expect(getStateManager().getApp('bobs-app')?.gitSource?.tokenGrantedBy).toBe(adminId);
+
+      const res = await assign([]);
+      expect(res.status).toBe(200);
+      expect(((await res.json()) as any).data.willFail).toEqual(['bobs-app']);
+      expect(getStateManager().getApp('bobs-app')?.gitSource?.tokenGrantedBy).toBeUndefined();
+      expect(getStateManager().getApp('bobs-app')?.gitSource?.tokenGrantedFor).toBeUndefined();
+
+      expect((await redeploy(bobToken, 'bobs-app')).status).toBe(200);
+      expect(pulledWith()).toEqual([undefined]);
+    });
+
     it('keepAttached must be an array of names', async () => {
       const legacy = await getGitDeployService().setToken('legacy-pat', 'ghp_legacyvalue');
       const res = await app.request(`/api/v1/git/tokens/${legacy.id}/owner`, {

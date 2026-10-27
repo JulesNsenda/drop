@@ -1218,6 +1218,14 @@ export class GitDeployService {
     const failing: string[] = [];
     for (const app of crossOwner) {
       if (!keepAttached?.includes(app.name)) {
+        // Clear any grant it already held (an admin-chosen token, an earlier
+        // keepAttached): resolveToken honours a grant whoever owned the token
+        // when it was made, so leaving it would keep this app pulling.
+        if (app.gitSource?.tokenGrantedBy || app.gitSource?.tokenGrantedFor) {
+          await stateManager.updateApp(app.name, {
+            gitSource: { ...app.gitSource, tokenGrantedBy: undefined, tokenGrantedFor: undefined },
+          } as Record<string, unknown>);
+        }
         failing.push(app.name);
         continue;
       }
