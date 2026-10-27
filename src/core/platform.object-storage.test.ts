@@ -619,6 +619,50 @@ describe('DropPlatform object storage (#301)', () => {
       expect(shouldDrain(appName)).toBe(false);
     });
 
+    it('stops draining the moment stop() begins: shouldDrain refuses and the loop is told to stop', async () => {
+      const storage = stubStorage();
+      stubAppConfigService(baseConfig({ services: { 'object-storage': 'detached' } }));
+      stubStateManager(baseState());
+      (platform as any).stateManager.close = jest.fn().mockResolvedValue(undefined);
+      await (platform as any).runObjectStorageSweep();
+      const opts = storage.sweepRetired.mock.calls[0][0] as {
+        shouldDrain: (n: string) => unknown;
+        stopping: () => boolean;
+      };
+      expect(opts.stopping()).toBe(false);
+      expect(opts.shouldDrain(appName)).toBeTruthy();
+
+      (platform as any).isRunning = true;
+      await platform.stop();
+
+      expect(opts.stopping()).toBe(true);
+      expect(opts.shouldDrain(appName)).toBe(false);
+    });
+
+    it('is awaited by stop() BEFORE appsInProgress is cleared', async () => {
+      const storage = stubStorage();
+      const gate = deferred();
+      let heldDuringSweep: boolean | undefined;
+      storage.sweepRetired.mockImplementationOnce(async () => {
+        await gate.promise;
+        heldDuringSweep = (platform as any).appsInProgress.has('other-app');
+        return { destroyed: 0, failed: 0 };
+      });
+      void (platform as any).sweepRetiredObjectStorage();
+      (platform as any).isRunning = true;
+      // An app that is mid-operation when shutdown begins and never finishes.
+      (platform as any).appsInProgress.add('other-app');
+      jest.spyOn(platform as any, 'drainInProgress').mockResolvedValue(undefined);
+
+      const stopping = platform.stop();
+      await new Promise((r) => setTimeout(r, 20));
+      gate.resolve();
+      await stopping;
+
+      expect(heldDuringSweep).toBe(true);
+      expect((platform as any).appsInProgress.size).toBe(0);
+    });
+
     it('is awaited by stop() before the provisioner is torn down', async () => {
       const storage = stubStorage();
       const gate = deferred();

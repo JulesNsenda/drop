@@ -833,6 +833,40 @@ describe('object storage stores and provisioner', () => {
       });
     });
 
+    describe('sweepRetired when the platform is stopping', () => {
+      it('finishes the record in hand and starts no other', async () => {
+        await configure();
+        const p = makeProvisioner();
+        await p.provisionAppStorage('one');
+        await p.provisionAppStorage('two');
+        await p.teardownForDeletedApp('one');
+        await p.teardownForDeletedApp('two');
+        provider.deprovision.mockClear();
+        let stop = false;
+        provider.deprovision.mockImplementation(async () => {
+          stop = true; // shutdown begins while the first bucket drains
+          return { objectsDeleted: 1, bucketDeleted: true, userDeleted: true };
+        });
+
+        expect(await p.sweepRetired({ stopping: () => stop })).toEqual({ destroyed: 1, failed: 0 });
+        expect(provider.deprovision).toHaveBeenCalledTimes(1);
+        expect(await p.listRetired()).toHaveLength(1);
+      });
+
+      it('does not start the detached loop at all once stopping', async () => {
+        await configure();
+        const p = makeProvisioner();
+        await p.provisionAppStorage('site');
+        await p.revokeAppAccess('site');
+
+        expect(await p.sweepRetired({ shouldDrain: () => ({}), stopping: () => true })).toEqual({
+          destroyed: 0,
+          failed: 0,
+        });
+        expect(provider.deprovision).not.toHaveBeenCalled();
+      });
+    });
+
     describe('sweepRetired', () => {
       it('drains deleted apps, forgets them once gone, and never destroys kept ones', async () => {
         await configure();

@@ -456,6 +456,8 @@ export class ObjectStorageProvisioner {
     opts: {
       /** The incarnation of the app that wants its storage detached, or false for "leave it". */
       shouldDrain?: (appName: string) => AppIncarnation | false;
+      /** True once the platform is shutting down: finish the record in hand, start no other. */
+      stopping?: () => boolean;
     } = {}
   ): Promise<{ destroyed: number; failed: number }> {
     // Asked again after each step. A record whose marker is not the CURRENT
@@ -479,6 +481,7 @@ export class ObjectStorageProvisioner {
     let destroyed = 0;
     let failed = 0;
     for (const { key, allocation } of retired) {
+      if (opts.stopping?.()) break;
       try {
         assertGeneratedResourcePair(allocation.bucket, allocation.userName);
         if (allocation.retired?.reason === 'kept') {
@@ -499,6 +502,7 @@ export class ObjectStorageProvisioner {
       }
     }
     for (const allocation of detached) {
+      if (opts.stopping?.()) break;
       try {
         assertGeneratedResourcePair(allocation.bucket, allocation.userName);
         const inc = wants(allocation);

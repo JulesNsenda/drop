@@ -822,6 +822,8 @@ export class DropPlatform {
   private storageSweep: Promise<void> | null = null;
   /** A sweep was requested while one was running: go round once more, it may have missed the new work. */
   private storageSweepAgain = false;
+  /** Set when `stop()` begins: the object-storage sweep starts nothing new and winds down. */
+  private stopping = false;
   private caddyServer: CaddyServer | null = null;
   private secretManager: SecretManager | null = null;
   private webhookManager: WebhookManager | null = null;
@@ -1006,6 +1008,7 @@ export class DropPlatform {
     }
 
     this.isStarting = true;
+    this.stopping = false;
     this.logger.platformEvent('starting');
     this.logger.info(`Drop root: ${this.config.dropRoot}`, 'CONFIG');
     this.logger.info(`Apps directory: ${this.config.appsDirectory}`, 'CONFIG');
@@ -1270,6 +1273,9 @@ export class DropPlatform {
 
     this.logger.platformEvent('stopping');
     this.eventBus.publish('platform:stopping', { timestamp: new Date() });
+    // From here the object-storage sweep drains nothing new: it finishes the
+    // record it is on and returns, instead of racing the teardown below.
+    this.stopping = true;
 
     // Stop certificate monitoring
     if (this.certExpiryTimer) {
@@ -1316,6 +1322,27 @@ export class DropPlatform {
     // Let any in-flight build/start finish (best-effort, bounded) before we
     // tear down the builder/state so apps aren't left half-deployed.
     await this.drainInProgress(10_000);
+
+    // A sweep still draining a bucket must be over before appsInProgress is
+    // cleared (its shouldDrain reads that set, and a cleared set would read as
+    // "nothing is holding any app") and before the provisioner, the stores and
+    // the state it holds are reset below. Bounded: a huge bucket must not hold
+    // shutdown hostage — the unfinished record is simply still there for the
+    // next boot's sweep.
+    if (this.storageSweep) {
+      let timer: NodeJS.Timeout | undefined;
+      const outcome = await Promise.race([
+        this.storageSweep.then(() => 'done' as const),
+        new Promise<'timeout'>((resolve) => {
+          timer = setTimeout(() => resolve('timeout'), 30_000);
+          timer.unref?.();
+        }),
+      ]);
+      if (timer) clearTimeout(timer);
+      if (outcome === 'timeout') {
+        this.logger.warn('Shutdown proceeding with an object-storage sweep still draining', 'STORAGE');
+      }
+    }
     this.appsInProgress.clear();
 
     if (this.router) {
@@ -1366,24 +1393,6 @@ export class DropPlatform {
     if (this.redisProvisioner) {
       resetRedisProvisioner();
       this.redisProvisioner = null;
-    }
-    // A sweep still draining a bucket would otherwise outlive the provisioner
-    // it holds (and the stores a restart is about to rebind). Bounded: a huge
-    // bucket must not hold shutdown hostage — the unfinished record is simply
-    // still there for the next boot's sweep.
-    if (this.storageSweep) {
-      let timer: NodeJS.Timeout | undefined;
-      const outcome = await Promise.race([
-        this.storageSweep.then(() => 'done' as const),
-        new Promise<'timeout'>((resolve) => {
-          timer = setTimeout(() => resolve('timeout'), 30_000);
-          timer.unref?.();
-        }),
-      ]);
-      if (timer) clearTimeout(timer);
-      if (outcome === 'timeout') {
-        this.logger.warn('Shutdown proceeding with an object-storage sweep still draining', 'STORAGE');
-      }
     }
     resetObjectStorageProvisioner();
     resetStorageCredentialStore();
@@ -3897,7 +3906,7 @@ backup:
       do {
         this.storageSweepAgain = false;
         await this.runObjectStorageSweep();
-      } while (this.storageSweepAgain && this.objectStorage);
+      } while (this.storageSweepAgain && this.objectStorage && !this.stopping);
     })().finally(() => {
       this.storageSweep = null;
     });
@@ -3918,7 +3927,9 @@ backup:
         // It answers with the app's incarnation, so a record that belongs to
         // an EARLIER app of the same name is skipped, never drained for this one.
         // No state at all answers with an empty incarnation, which matches no record.
+        stopping: () => this.stopping,
         shouldDrain: (appName) =>
+          !this.stopping &&
           !this.appsInProgress.has(appName) &&
           this.appServiceIntent(appName, 'object-storage') === 'detached'
             ? (this.incarnationOf(appName) ?? {})
