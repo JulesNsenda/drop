@@ -36,6 +36,7 @@ const PUBLISHED_MCP_TOOLS = [
   'get_deploy_logs',
   'restart_app',
   'rollback_app',
+  'redeploy_app',
   'custom_domain',
 ];
 

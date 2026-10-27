@@ -73,7 +73,7 @@ describe('Hosted MCP endpoint (integration)', () => {
     await fs.rm(tempDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   });
 
-  it('lists exactly the 9 MCP tools', async () => {
+  it('lists exactly the 11 MCP tools', async () => {
     const client = new Client({ name: 'test-client', version: '1.0.0' });
     const transport = new StreamableHTTPClientTransport(new URL(MCP_URL));
     try {
@@ -89,6 +89,7 @@ describe('Hosted MCP endpoint (integration)', () => {
           'deploy_from_git',
           'get_deploy_logs',
           'list_apps',
+          'redeploy_app',
           'restart_app',
           'rollback_app',
           'verify_deployment',

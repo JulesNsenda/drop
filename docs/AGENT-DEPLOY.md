@@ -179,6 +179,7 @@ role, so it can never outrank the human it was minted for.
 | `get_deploy_logs` | Read the build or runtime output of one deploy by `deploy_id` (optional `phase`, `lines`); defaults to the phase that failed. Returned as untrusted data. |
 | `restart_app` | Stop and restart an app on its existing port. |
 | `rollback_app` | Undo the last `deploy_files` or git redeploy without rebuilding. Code only — database, Redis, app data, secrets and env are not rolled back. Needs a snapshot (kept only when a redeploy replaces a running app). |
+| `redeploy_app` | Rebuild an existing app without uploading anything: a git-backed app pulls its newest commit first, any other app is rebuilt from the source on disk. Waits for the build like `deploy_files`. A monorepo container is re-expanded in the background (its services deploy under their own names). Refused with a code (and `retry_after_seconds` when relevant) if the app is busy, stopped, rate-limited or short of disk. |
 | `custom_domain` | Set (`domain`), clear (`clear: true`) or check a custom domain for an app; reports the DNS record to create while pending, and routes it with a TLS certificate once DNS points here. |
 
 There is no `set_secrets` or `remove_app` tool — those stay REST-only (the

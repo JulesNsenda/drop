@@ -7,7 +7,7 @@
  * flowing through the existing `canAccess` ownership model. Tools:
  * `deploy_files`, `deploy_from_git`, `list_apps`, `app_status`,
  * `verify_deployment`, `app_logs`, `get_deploy_logs`, `restart_app`,
- * `rollback_app`, `custom_domain`. No `set_secrets`/`remove_app` —
+ * `rollback_app`, `redeploy_app`, `custom_domain`. No `set_secrets`/`remove_app` —
  * destructive/blast-radius tools stay off the MCP surface (PRD-040 non-goals).
  *
  * Tool errors are returned as `{ content: [...], isError: true }` results,
@@ -28,6 +28,7 @@ import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import { AuthContext, getUserById } from '../middleware/auth';
 import { canAccessScoped, tokenCallerOf } from '../access';
 import { scopesAllowCreate } from '../agent-scopes';
+import { redeployFor } from '../redeploy-for';
 import { isValidAppName } from '../middleware/validate';
 import { getStateManager } from '../../managers/app/state-manager';
 import { getAppConfigService } from '../../managers/app/app-config';
@@ -310,6 +311,39 @@ function awaitingPromotionResult(appName: string): CallToolResult {
   };
 }
 
+/** What an agent can do about a stale-dependency start: nothing it may do itself, so say so rather than loop. */
+const STALE_FOR_AGENTS =
+  'An agent cannot rebuild this app: a person has to start or redeploy it from the dashboard.';
+
+/** Stamp a known deploy id on a result: in the text and as `deploy_id`, so every answer can reach get_deploy_logs. */
+function withDeployId(result: CallToolResult, deployId: string): CallToolResult {
+  const [first, ...rest] = result.content;
+  const content: CallToolResult['content'] =
+    first?.type === 'text' ? [{ ...first, text: `${first.text}\nDeploy id: ${deployId}` }, ...rest] : result.content;
+  return { ...result, content, structuredContent: { ...result.structuredContent, deploy_id: deployId } };
+}
+
+/** The answer for a monorepo container: re-expanded in the background, not built. */
+function groupContainerResult(container: string): CallToolResult {
+  return {
+    content: [
+      {
+        type: 'text',
+        text:
+          `Application '${container}' is a monorepo container: it is being re-expanded in the background, not built. ` +
+          'Its services deploy under their own names — call app_status on each service to follow it.',
+      },
+    ],
+    structuredContent: {
+      ok: true,
+      app: container,
+      status: 'group_reexpanding',
+      container,
+      next_actions: ['app_status'],
+    },
+  };
+}
+
 /**
  * Poll the deploy tracker until the episode correlated with this deploy
  * (`startedAt >= acceptedAt`) reaches a terminal status, or the wait budget
@@ -319,12 +353,21 @@ function awaitingPromotionResult(appName: string): CallToolResult {
  * message the caller depends on to reach `get_deploy_logs`, and driving a whole
  * deploy handler to assert one string would test the mocks, not the policy.
  * `deploy-result.ts` exports its helpers for the same reason.
+ *
+ * `opts.deployId` (a redeploy that started with an id) correlates THAT episode
+ * instead of the newest one since `acceptedAt`, and stamps the id on every
+ * answer, the timeout one included. `opts.watchGroup` (a redeploy that was only
+ * accepted) stops waiting if the app turns out to be a monorepo container once
+ * its repository has landed: that is re-expanded, not built.
  */
 export async function waitForDeployOutcome(
   appName: string,
   acceptedAtIso: string,
-  isNew: boolean
+  isNew: boolean,
+  opts: { deployId?: string; watchGroup?: boolean } = {}
 ): Promise<CallToolResult> {
+  const { deployId, watchGroup } = opts;
+  const tag = (r: CallToolResult): CallToolResult => (deployId ? withDeployId(r, deployId) : r);
   const budgetMs = getDeployWaitBudgetMs();
   const deadline = Date.now() + budgetMs;
   const acceptedAtMs = new Date(acceptedAtIso).getTime();
@@ -344,7 +387,7 @@ export async function waitForDeployOutcome(
     // so a stale park from an earlier deploy can't cause a premature return.
     const app = getStateManager().getApp(appName);
     if (app?.status === 'needs-config' && new Date(app.updatedAt).getTime() >= acceptedAtMs) {
-      return needsConfigResult(appName);
+      return tag(needsConfigResult(appName));
     }
 
     // A held build never reaches a terminal deploy status either — the episode
@@ -352,15 +395,21 @@ export async function waitForDeployOutcome(
     // as the park above, so a hold left over from an earlier deploy cannot
     // return early for this one.
     if (app?.awaitingPromotion === true && new Date(app.updatedAt).getTime() >= acceptedAtMs) {
-      return awaitingPromotionResult(appName);
+      return tag(awaitingPromotionResult(appName));
     }
 
-    const [episode] = getDeployTracker().getEpisodes(appName, 1);
-    if (episode && new Date(episode.startedAt).getTime() >= acceptedAtMs) {
+    if (watchGroup && app?.isGroupContainer === true) return groupContainerResult(appName);
+
+    const episode = deployId
+      ? getDeployTracker()
+          .getEpisodes(appName)
+          .find(e => e.deployId === deployId)
+      : getDeployTracker().getEpisodes(appName, 1)[0];
+    if (episode && (deployId || new Date(episode.startedAt).getTime() >= acceptedAtMs)) {
       correlated = episode;
-      if (episode.status === 'succeeded') return successResult(appName, isNew);
+      if (episode.status === 'succeeded') return tag(successResult(appName, isNew));
       if (episode.status === 'failed' || episode.status === 'interrupted')
-        return failureResult(appName, episode);
+        return tag(await failureResult(appName, episode));
       // 'in-progress' / 'superseded' — keep waiting
     }
     await sleep(POLL_INTERVAL_MS);
@@ -375,12 +424,14 @@ export async function waitForDeployOutcome(
   // episode for the app — would hand back a PREVIOUS deploy's output labelled
   // as this one's. Say what is true instead.
   if (!correlated) {
-    return toolText(`${stillBuilding} Call app_status to check progress.`);
+    return tag(toolText(`${stillBuilding} Call app_status to check progress.`));
   }
 
-  return toolText(
-    `${stillBuilding} Call app_status to check progress, or get_deploy_logs with ` +
-      `deploy_id '${correlated.deployId}' for its build output.`
+  return tag(
+    toolText(
+      `${stillBuilding} Call app_status to check progress, or get_deploy_logs with ` +
+        `deploy_id '${correlated.deployId}' for its build output.`
+    )
   );
 }
 
@@ -530,6 +581,7 @@ export async function handleDeployFiles(
       callerIsAdmin: auth?.role === 'admin',
       principalId: auth?.principalId,
       // Derived from the credential, never from tool input.
+      // Deliberately not deployActorOf: that counts an OAuth session as an agent, which would mark apps a connector session creates as agentCreated.
       agentCaller: auth?.kind === 'agent',
       ephemeral: args.ephemeral === true,
       ttlMinutes: args.ttl_minutes,
@@ -599,7 +651,7 @@ interface DeployFromGitArgs {
  */
 async function auditToolAction(
   auth: AuthContext | undefined,
-  action: 'agent-deploy' | 'restart' | 'rollback' | 'custom-domain-set' | 'domain-verified',
+  action: 'agent-deploy' | 'restart' | 'rollback' | 'redeploy' | 'custom-domain-set' | 'domain-verified',
   appName: string,
   detail?: string
 ): Promise<void> {
@@ -669,6 +721,7 @@ export async function handleDeployFromGit(
         branch: args.branch,
         userId: auth?.userId,
         principalId: auth?.principalId,
+        // Deliberately not deployActorOf: that counts an OAuth session as an agent, which would mark apps a connector session creates as agentCreated.
         agentCaller: auth?.kind === 'agent',
         callerIsAdmin: auth?.role === 'admin',
       },
@@ -1111,6 +1164,77 @@ export async function handleRollbackApp(
   }
 }
 
+/**
+ * Rebuild an existing app the way POST /apps/:name/redeploy does (#359): the
+ * shared `redeployFor` owns authorization (the 'deploy' scope, a not-found that
+ * names only the app asked for), the git-group child -> container resolution
+ * and the actor, so this tool cannot drift from the route.
+ *
+ * A started or accepted redeploy waits for its outcome like deploy_files,
+ * correlated by app + acceptedAt. A monorepo container is re-expanded in the
+ * background, not built, so there is no outcome to wait for: the answer names
+ * the container and says its services deploy under their own names.
+ */
+export async function handleRedeployApp(
+  auth: AuthContext | undefined,
+  args: { name: string }
+): Promise<CallToolResult> {
+  if (!isValidAppName(args.name)) {
+    return toolError(`Invalid app name: '${args.name}'`);
+  }
+
+  try {
+    const outcome = await redeployFor(auth, args.name);
+    if (outcome.kind === 'not-found') return toolError(`Application '${args.name}' not found`);
+    if (outcome.kind === 'unavailable') return toolError('Platform operations are unavailable on this server.');
+
+    const { target, acceptedAt, result } = outcome;
+    if ('refused' in result) {
+      const { code, message, retryAfterSeconds } = result.refused;
+      // The recorded git URL is tenant-controlled and rides in this one message.
+      let text = code === 'INVALID_GIT_SOURCE' ? wrapUntrusted(`GIT SOURCE: ${target}`, message) : message;
+      if (code === 'APP_STOPPED') {
+        // An agent never rebuilds a stopped app, so do not send it round restart_app and back:
+        // restart_app starts one whose dependencies are intact, and says so when they are not.
+        text =
+          `Application '${target}' is stopped, and an agent does not rebuild a stopped app. ` +
+          'restart_app starts it; if that reports its dependencies were built for a different Node runtime, ' +
+          'a person has to start or redeploy this app from the dashboard.';
+      }
+      return {
+        content: [{ type: 'text', text }],
+        isError: true,
+        structuredContent: {
+          ok: false,
+          app: target,
+          status: 'refused',
+          refusal_code: code,
+          ...(retryAfterSeconds !== undefined ? { retry_after_seconds: retryAfterSeconds } : {}),
+        },
+      };
+    }
+
+    await auditToolAction(auth, 'redeploy', target, outcome.detail);
+
+    if ('group' in result) return groupContainerResult(result.group.container);
+
+    // Started: wait for THAT deploy by id. Accepted: no id yet, so correlate by app + acceptedAt,
+    // and stop if the landed repository turns out to be a monorepo container.
+    return await waitForDeployOutcome(
+      target,
+      acceptedAt,
+      false,
+      'started' in result ? { deployId: result.started } : { watchGroup: true }
+    );
+  } catch (err) {
+    if (err instanceof AppInProgressError) return toolError(err.message);
+    if (err instanceof StaleDependenciesError) return toolError(`${err.message} ${STALE_FOR_AGENTS}`);
+    // The error text can carry tenant-influenced content (paths, repo URLs): fence it.
+    const message = err instanceof Error ? err.message : 'unknown error';
+    return toolError(`Failed to redeploy '${args.name}': ${wrapUntrusted(`REDEPLOY: ${args.name}`, message)}`);
+  }
+}
+
 export async function handleRestartApp(
   auth: AuthContext | undefined,
   args: { name: string }
@@ -1132,9 +1256,8 @@ export async function handleRestartApp(
     await auditToolAction(auth, 'restart', args.name, 'restart_app');
     return toolText(`Application '${args.name}' restarted.`);
   } catch (err) {
-    if (err instanceof AppInProgressError || err instanceof StaleDependenciesError) {
-      return toolError(err.message);
-    }
+    if (err instanceof AppInProgressError) return toolError(err.message);
+    if (err instanceof StaleDependenciesError) return toolError(`${err.message} ${STALE_FOR_AGENTS}`);
     return toolError(
       `Failed to restart '${args.name}': ${err instanceof Error ? err.message : 'unknown error'}`
     );
@@ -1423,6 +1546,24 @@ export function buildMcpServer(auth: AuthContext | undefined): McpServer {
       },
     },
     args => handleRollbackApp(auth, args)
+  );
+
+  server.registerTool(
+    'redeploy_app',
+    {
+      title: 'Redeploy app',
+      description:
+        "Rebuild an existing app and swap it in, without uploading anything: a git-backed app first pulls its repository's newest commit, " +
+        "any other app is rebuilt from the source already on disk. Use deploy_files to change an app's files. " +
+        'Waits for the build to finish and returns the app URL on success, or the failing build stage and an untrusted build-log tail on failure. ' +
+        'A monorepo container is re-expanded in the background and the answer names it — its services deploy under their own names. ' +
+        'An agent never rebuilds a stopped app: restart_app starts one, and if its dependencies need rebuilding a person has to start or redeploy it from the dashboard. ' +
+        'A refusal (busy, rate-limited, low disk) is returned with a code and, when relevant, retry_after_seconds.',
+      inputSchema: {
+        name: z.string().describe('App name.'),
+      },
+    },
+    args => handleRedeployApp(auth, args)
   );
 
   server.registerTool(
