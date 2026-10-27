@@ -174,14 +174,23 @@ async function probeCaseInsensitive(appDir: string): Promise<boolean> {
 }
 
 /** Confirm every directory from `base` down to `rel`'s parent is a real directory. */
-async function assertPlainParents(base: string, segs: string[], what: string): Promise<void> {
+async function assertPlainParents(
+  base: string,
+  segs: string[],
+  what: string,
+  verified: Set<string>
+): Promise<void> {
   let cur = base;
-  for (const s of segs.slice(0, -1)) {
-    cur = path.join(cur, s);
+  for (let i = 0; i < segs.length - 1; i++) {
+    cur = path.join(cur, segs[i]);
+    // Each directory is looked at once per land; the clone is ours alone.
+    const key = segs.slice(0, i + 1).join('/');
+    if (verified.has(key)) continue;
     const st = await lstatOrNull(cur);
     if (!st || !st.isDirectory() || st.isSymbolicLink()) {
       throw new Error(`${what} is not under plain directories: ${segs.join('/')}`);
     }
+    verified.add(key);
   }
 }
 
@@ -196,6 +205,7 @@ export async function landTracked(req: LandRequest): Promise<LandedFiles> {
   if (files.length > limits.maxEntries) {
     throw new Error(`Repository exceeds the maximum of ${limits.maxEntries} entries`);
   }
+  const verifiedCloneDirs = new Set<string>();
   for (const file of files) {
     const rel = file.path;
     const segs = segmentsOf(rel);
@@ -205,7 +215,7 @@ export async function landTracked(req: LandRequest): Promise<LandedFiles> {
     // Every file the index lists must be there: a clone that lost one is not a
     // clone to deploy from. (Tracked symlinks are listed separately and are
     // the only thing skipped on purpose.)
-    await assertPlainParents(cloneDir, segs, 'Clone entry');
+    await assertPlainParents(cloneDir, segs, 'Clone entry', verifiedCloneDirs);
     const st = await lstatOrNull(path.join(cloneDir, ...segs));
     if (!st || !st.isFile()) {
       throw new Error(`Tracked file missing from the clone: ${rel.slice(0, 120)}`);

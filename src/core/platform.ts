@@ -4987,15 +4987,6 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
 
     // Proceeding — drop any queued entry for this app so the drain doesn't
     // start a duplicate build.
-    // Synchronous re-check directly before the claim (see isBusy).
-    if (this.isBusy(appName)) {
-      this.releaseGuardrailKeys(appName);
-      if (this.gitReserved.has(appName)) {
-        this.pendingBuilds.set(appName, { appPath, appType: _appType, actor });
-        this.scheduleBuildDrain();
-      }
-      return;
-    }
     this.pendingBuilds.delete(appName);
     this.appsInProgress.add(appName);
 
@@ -7119,11 +7110,9 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     // breakerKeys for some later episode's outcome to be recorded against.
     //
     // The in-progress skip at the top of this method is stale by now: the
-    // drop.yaml read and the stale-tree check awaited. Re-checked here, in the
-    // same synchronous turn as the add below, so two concurrent updates of one
-    // app cannot both be admitted. It sits above the guardrail check so a
-    // skipped update neither consults nor reserves a key.
-    if (this.inProgressSkip(appName, bypassCooldown)) return false;
+    // drop.yaml read and the stale-tree check awaited. The ONE re-check is below,
+    // after the guardrail keys are reserved and in the same synchronous turn as
+    // the claim, so two concurrent updates of one app cannot both be admitted.
     const guardKeys = this.guardrailKeys(appName, false, actor ?? {});
     const verdict = this.checkGuardrails(guardKeys);
     if (!verdict.allowed) {
@@ -7150,13 +7139,13 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     }
     this.breakerKeys.set(appName, guardKeys);
 
-    // Re-checked on the line before the claim: the awaits above leave a gap in
-    // which a git deploy can take the slot (the chained redeploy: A's update
-    // arrives after A released, B reserves, then A would claim a slot B holds,
-    // build beside B's land, and release B's reservation when it finished).
-    if (this.isBusy(appName)) {
+    // The awaits above leave a gap in which another deploy can take the slot
+    // (the chained redeploy: A's update arrives after A released, B reserves,
+    // then A would claim a slot B holds, build beside B's land, and release B's
+    // reservation when it finished). inProgressSkip covers BOTH sets (in-progress
+    // and git-reserved); the guardrail keys reserved above are given back.
+    if (this.inProgressSkip(appName, bypassCooldown)) {
       this.releaseGuardrailKeys(appName);
-      this.logger.info(`Dropped update for ${appName} - a deploy took the app meanwhile`, 'UPDATE');
       return false;
     }
     this.logger.info(`Hot-reload triggered for ${appName}: ${reason}`, 'UPDATE');
@@ -7489,7 +7478,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
    * check and their own appsInProgress.add.
    */
   private inProgressSkip(appName: string, bypassCooldown?: boolean): boolean {
-    if (!this.appsInProgress.has(appName)) return false;
+    if (!this.isBusy(appName)) return false;
     if (bypassCooldown) {
       this.logger.info(`Dropped redeploy for ${appName} - already in progress`, 'UPDATE');
     } else {

@@ -653,79 +653,77 @@ export class GitDeployService {
     firstDeploy = false,
     state?: { created: boolean }
   ): Promise<string | undefined> {
-    {
-      const base = await this.ensureCloneBase();
-      // The clones live on the temp volume, which may not be the apps volume.
-      const tempDisk = await hasEnoughDisk(base);
-      if (!tempDisk.ok) {
-        throw new Error(
-          `Insufficient disk space to clone: ${Math.round(tempDisk.freeMb)} MB free, need ${getMinFreeDiskMb()} MB`
+    const base = await this.ensureCloneBase();
+    // The clones live on the temp volume, which may not be the apps volume.
+    const tempDisk = await hasEnoughDisk(base);
+    if (!tempDisk.ok) {
+      throw new Error(
+        `Insufficient disk space to clone: ${Math.round(tempDisk.freeMb)} MB free, need ${getMinFreeDiskMb()} MB`
+      );
+    }
+    const cloneDir = await fs.mkdtemp(path.join(base, `${appName}-`));
+    try {
+      const caps = {
+        maxBytes: this.config.maxUnpackedBytes ?? envDefaultCaps().maxUnpackedBytes,
+        maxEntries: this.config.maxEntries ?? envDefaultCaps().maxEntries,
+      };
+      const info = await gitClone({ url, dest: cloneDir, branch, token, ...caps });
+      if (info.symlinks.length > 0) {
+        const shown = info.symlinks.slice(0, 5).join(', ');
+        logger.warn(
+          `${appName}: ${info.symlinks.length} symbolic link(s) tracked in the repository are not recreated (${shown}${info.symlinks.length > 5 ? ', ...' : ''})`,
+          'GIT-DEPLOY'
         );
       }
-      const cloneDir = await fs.mkdtemp(path.join(base, `${appName}-`));
-      try {
-        const caps = {
-          maxBytes: this.config.maxUnpackedBytes ?? envDefaultCaps().maxUnpackedBytes,
-          maxEntries: this.config.maxEntries ?? envDefaultCaps().maxEntries,
-        };
-        const info = await gitClone({ url, dest: cloneDir, branch, token, ...caps });
-        if (info.symlinks.length > 0) {
-          const shown = info.symlinks.slice(0, 5).join(', ');
-          logger.warn(
-            `${appName}: ${info.symlinks.length} symbolic link(s) tracked in the repository are not recreated (${shown}${info.symlinks.length > 5 ? ', ...' : ''})`,
-            'GIT-DEPLOY'
-          );
-        }
-        // Last look before writing: another create may have taken the folder
-        // while the clone ran.
-        if (firstDeploy && (await pathTaken(destPath))) {
-          throw new Error(`Application '${appName}' already exists`);
-        }
-        const limits = { maxBytes: caps.maxBytes, maxEntries: caps.maxEntries };
-        if (firstDeploy) {
-          // A new app is built in a hidden directory INSIDE the apps folder (the
-          // same volume as its destination, which the watcher ignores) and renamed
-          // into place in one step, so the watcher, the CLI and every other reader
-          // see either nothing or the whole tree, never half of it.
-          const stage = await fs.mkdtemp(path.join(path.dirname(destPath), `${STAGE_PREFIX}${appName}-`));
-          try {
-            const landed = await landTracked({
-              cloneDir,
-              appDir: stage,
-              files: info.files,
-              previous: null,
-              limits,
-            });
-            await fs.chmod(stage, 0o755);
-            try {
-              await fs.rename(stage, destPath);
-            } catch (err) {
-              const code = (err as NodeJS.ErrnoException).code;
-              if (code === 'EEXIST' || code === 'ENOTEMPTY') {
-                throw new Error(`Application '${appName}' already exists`);
-              }
-              throw err;
-            }
-            if (state) state.created = true;
-            await writeManifest(this.manifestDir, appName, landed);
-          } finally {
-            await fs.rm(stage, { recursive: true, force: true }).catch(() => undefined);
-          }
-          return info.commitSha;
-        }
-        const previous = await readManifest(this.manifestDir, appName);
-        const landed = await landTracked({
-          cloneDir,
-          appDir: destPath,
-          files: info.files,
-          previous,
-          limits,
-        });
-        await writeManifest(this.manifestDir, appName, landed);
-        return info.commitSha;
-      } finally {
-        await fs.rm(cloneDir, { recursive: true, force: true }).catch(() => undefined);
+      // Last look before writing: another create may have taken the folder
+      // while the clone ran.
+      if (firstDeploy && (await pathTaken(destPath))) {
+        throw new Error(`Application '${appName}' already exists`);
       }
+      const limits = { maxBytes: caps.maxBytes, maxEntries: caps.maxEntries };
+      if (firstDeploy) {
+        // A new app is built in a hidden directory INSIDE the apps folder (the
+        // same volume as its destination, which the watcher ignores) and renamed
+        // into place in one step, so the watcher, the CLI and every other reader
+        // see either nothing or the whole tree, never half of it.
+        const stage = await fs.mkdtemp(path.join(path.dirname(destPath), `${STAGE_PREFIX}${appName}-`));
+        try {
+          const landed = await landTracked({
+            cloneDir,
+            appDir: stage,
+            files: info.files,
+            previous: null,
+            limits,
+          });
+          await fs.chmod(stage, 0o755);
+          try {
+            await fs.rename(stage, destPath);
+          } catch (err) {
+            const code = (err as NodeJS.ErrnoException).code;
+            if (code === 'EEXIST' || code === 'ENOTEMPTY') {
+              throw new Error(`Application '${appName}' already exists`);
+            }
+            throw err;
+          }
+          if (state) state.created = true;
+          await writeManifest(this.manifestDir, appName, landed);
+        } finally {
+          await fs.rm(stage, { recursive: true, force: true }).catch(() => undefined);
+        }
+        return info.commitSha;
+      }
+      const previous = await readManifest(this.manifestDir, appName);
+      const landed = await landTracked({
+        cloneDir,
+        appDir: destPath,
+        files: info.files,
+        previous,
+        limits,
+      });
+      await writeManifest(this.manifestDir, appName, landed);
+      return info.commitSha;
+    } finally {
+      await fs.rm(cloneDir, { recursive: true, force: true }).catch(() => undefined);
     }
   }
 
@@ -733,7 +731,7 @@ export class GitDeployService {
    * Redeploy a git-deployed app (fresh clone + land tracked files + trigger
    * rebuild). Refused while the platform is building or deploying the app (the
    * land would write under a running build); redeploys of one app that do
-   * overlap are serialised in `cloneAndLand`.
+   * overlap are serialised per app (`serialised`).
    */
   async redeploy(appName: string, actor: DeployActor = {}): Promise<GitDeployResult> {
     if (!this.gitAvailable) {
@@ -788,74 +786,74 @@ export class GitDeployService {
       // This run supersedes any queued one for the app.
       if (this.pending.delete(appName)) void this.persistPending();
       try {
-    // GUARDRAIL + QUOTA, before the clone. A redeploy is the request an agent
-    // repeats, and a clone + rebuild is not free.
-    await admitDeploy(appName, false, {
-      principalId: actor.principalId,
-      actorUserId: actor.userId,
-      automationSource: actor.automation,
-    });
+        // GUARDRAIL + QUOTA, before the clone. A redeploy is the request an agent
+        // repeats, and a clone + rebuild is not free.
+        await admitDeploy(appName, false, {
+          principalId: actor.principalId,
+          actorUserId: actor.userId,
+          automationSource: actor.automation,
+        });
 
-    // Preflight: ensure enough free disk space before cloning
-    const disk = await hasEnoughDisk(app.path);
-    if (!disk.ok) {
-      throw new Error(
-        `Insufficient disk space to redeploy: ${Math.round(disk.freeMb)} MB free, need ${getMinFreeDiskMb()} MB`
-      );
-    }
-
-    // undefined (the default, via omission) leaves the stored token
-    // unchanged; null clears it; a string attaches/replaces it. Resolved once
-    // and used for BOTH the clone and the final gitSource below — `app` is a
-    // snapshot captured above, and updateApp REPLACES the map entry rather
-    // than mutating it, so a second read of app.gitSource after this point
-    // would still see the pre-redeploy value.
-    const effectiveTokenId = actor.tokenId !== undefined ? actor.tokenId : baseSource.tokenId;
-
-    // A CLEAR is a revocation, not a deploy outcome, so it is persisted BEFORE
-    // the pull — the one deliberate asymmetry with the attach direction.
-    //
-    // Both directions cannot use the post-pull write: clearing a credential
-    // makes the very next pull unauthenticated, so on a private repo it throws
-    // and the write below never runs. The clear would be silently discarded
-    // every time, which leaves NO route to detach a compromised PAT short of
-    // hand-editing apps.json. The stale-snapshot trap that forced the attach
-    // AFTER the pull does not apply here: there is nothing a later spread can
-    // resurrect once the field is gone, and `effectiveTokenId` (null) drives
-    // the post-pull write too, so the two agree.
-    if (actor.tokenId === null && baseSource.tokenId) {
-      const cleared: GitSource = { ...baseSource, tokenId: undefined };
-      await stateManager.updateApp(appName, { gitSource: cleared } as Record<string, unknown>);
-      logger.info(`Cleared the stored git credential for ${appName}`, 'GIT-DEPLOY');
-    }
-
-    // Resolve token if needed
-    let token: string | undefined;
-    if (effectiveTokenId) {
-      token = await this.getTokenValue(effectiveTokenId);
-      if (!token) {
-        // Branch on PROVENANCE. An id the caller supplied on THIS request that
-        // resolves to nothing is a caller error — deploy() throws for exactly
-        // this condition — and warning past it returns 200 while persisting a
-        // dangling reference that silently degrades every later unattended
-        // webhook redeploy to unauthenticated. An INHERITED id is different:
-        // the token may have been deleted since, and refusing to redeploy an
-        // existing app over that is worse than trying.
-        if (actor.tokenId) {
-          throw new Error(`GitHub token '${actor.tokenId}' not found`);
+        // Preflight: ensure enough free disk space before cloning
+        const disk = await hasEnoughDisk(app.path);
+        if (!disk.ok) {
+          throw new Error(
+            `Insufficient disk space to redeploy: ${Math.round(disk.freeMb)} MB free, need ${getMinFreeDiskMb()} MB`
+          );
         }
-        logger.warn(`Token '${effectiveTokenId}' not found for ${appName} - trying without auth`, 'GIT-DEPLOY');
-      }
-    }
 
-    logger.info(`Redeploying ${appName} from ${cloneUrl} (branch: ${branch})`, 'GIT-DEPLOY');
+        // undefined (the default, via omission) leaves the stored token
+        // unchanged; null clears it; a string attaches/replaces it. Resolved once
+        // and used for BOTH the clone and the final gitSource below — `app` is a
+        // snapshot captured above, and updateApp REPLACES the map entry rather
+        // than mutating it, so a second read of app.gitSource after this point
+        // would still see the pre-redeploy value.
+        const effectiveTokenId = actor.tokenId !== undefined ? actor.tokenId : baseSource.tokenId;
 
-    // Rollback snapshot of the tree that is SERVING, before it is replaced
-    // (#296). Best-effort by contract: it never throws, and a skipped or
-    // failed snapshot never fails the deploy — it only means this redeploy
-    // cannot be rolled back, which the rollback route reports as such.
-    // The tree carries no .git (every git deploy clones fresh), so a restore
-    // puts the files back and the next redeploy simply clones again.
+        // A CLEAR is a revocation, not a deploy outcome, so it is persisted BEFORE
+        // the pull — the one deliberate asymmetry with the attach direction.
+        //
+        // Both directions cannot use the post-pull write: clearing a credential
+        // makes the very next pull unauthenticated, so on a private repo it throws
+        // and the write below never runs. The clear would be silently discarded
+        // every time, which leaves NO route to detach a compromised PAT short of
+        // hand-editing apps.json. The stale-snapshot trap that forced the attach
+        // AFTER the pull does not apply here: there is nothing a later spread can
+        // resurrect once the field is gone, and `effectiveTokenId` (null) drives
+        // the post-pull write too, so the two agree.
+        if (actor.tokenId === null && baseSource.tokenId) {
+          const cleared: GitSource = { ...baseSource, tokenId: undefined };
+          await stateManager.updateApp(appName, { gitSource: cleared } as Record<string, unknown>);
+          logger.info(`Cleared the stored git credential for ${appName}`, 'GIT-DEPLOY');
+        }
+
+        // Resolve token if needed
+        let token: string | undefined;
+        if (effectiveTokenId) {
+          token = await this.getTokenValue(effectiveTokenId);
+          if (!token) {
+            // Branch on PROVENANCE. An id the caller supplied on THIS request that
+            // resolves to nothing is a caller error — deploy() throws for exactly
+            // this condition — and warning past it returns 200 while persisting a
+            // dangling reference that silently degrades every later unattended
+            // webhook redeploy to unauthenticated. An INHERITED id is different:
+            // the token may have been deleted since, and refusing to redeploy an
+            // existing app over that is worse than trying.
+            if (actor.tokenId) {
+              throw new Error(`GitHub token '${actor.tokenId}' not found`);
+            }
+            logger.warn(`Token '${effectiveTokenId}' not found for ${appName} - trying without auth`, 'GIT-DEPLOY');
+          }
+        }
+
+        logger.info(`Redeploying ${appName} from ${cloneUrl} (branch: ${branch})`, 'GIT-DEPLOY');
+
+        // Rollback snapshot of the tree that is SERVING, before it is replaced
+        // (#296). Best-effort by contract: it never throws, and a skipped or
+        // failed snapshot never fails the deploy — it only means this redeploy
+        // cannot be rolled back, which the rollback route reports as such.
+        // The tree carries no .git (every git deploy clones fresh), so a restore
+        // puts the files back and the next redeploy simply clones again.
         const snapshot = await captureBeforeRedeploy(appName);
         if (!snapshot.captured) {
           logger.info(`No rollback snapshot for ${appName}: ${snapshot.reason}`, 'GIT-DEPLOY');
@@ -877,46 +875,46 @@ export class GitDeployService {
 
         const clonedAt = new Date().toISOString();
 
-    // Built from effectiveTokenId, NOT app.gitSource.tokenId — see the note
-    // above. Spreading the stale field here would silently revert an attach
-    // on this success path (the defect two independent reviewers found).
-    const gitSource: GitSource = {
-      ...baseSource,
-      repoUrl: cloneUrl,
-      tokenId: effectiveTokenId === null ? undefined : effectiveTokenId,
-      lastCommitSha: commitSha,
-      lastClonedAt: clonedAt,
-    };
+        // Built from effectiveTokenId, NOT app.gitSource.tokenId — see the note
+        // above. Spreading the stale field here would silently revert an attach
+        // on this success path (the defect two independent reviewers found).
+        const gitSource: GitSource = {
+          ...baseSource,
+          repoUrl: cloneUrl,
+          tokenId: effectiveTokenId === null ? undefined : effectiveTokenId,
+          lastCommitSha: commitSha,
+          lastClonedAt: clonedAt,
+        };
 
-    await stateManager.updateApp(appName, { gitSource } as Record<string, unknown>);
+        await stateManager.updateApp(appName, { gitSource } as Record<string, unknown>);
 
-    logger.info(`Redeployed ${appName} (${commitSha?.slice(0, 7) || 'unknown'})`, 'GIT-DEPLOY');
+        logger.info(`Redeployed ${appName} (${commitSha?.slice(0, 7) || 'unknown'})`, 'GIT-DEPLOY');
 
-    // The land is finished: free the app for the rebuild this publish triggers
-    // (handleAppUpdate drops an update for an app that is still in progress).
-    release();
+        // The land is finished: free the app for the rebuild this publish triggers
+        // (handleAppUpdate drops an update for an app that is still in progress).
+        release();
 
-    // Publish the rebuild trigger directly instead of waiting on the watcher
-    // to notice file changes: a no-change pull touches nothing on disk (the
-    // watcher would never fire), and on a slow pull the watcher's mid-pull
-    // flush could otherwise race this with a half-pulled tree.
-    eventBus.publish('app:update', {
-      name: appName,
-      path: app.path,
-      reason: 'git redeploy',
-      bypassCooldown: true,
-      principalId: actor.principalId,
-      actorUserId: actor.userId,
-      automationSource: actor.automation,
-    });
+        // Publish the rebuild trigger directly instead of waiting on the watcher
+        // to notice file changes: a no-change pull touches nothing on disk (the
+        // watcher would never fire), and on a slow pull the watcher's mid-pull
+        // flush could otherwise race this with a half-pulled tree.
+        eventBus.publish('app:update', {
+          name: appName,
+          path: app.path,
+          reason: 'git redeploy',
+          bypassCooldown: true,
+          principalId: actor.principalId,
+          actorUserId: actor.userId,
+          automationSource: actor.automation,
+        });
 
-    return {
-      appName,
-      repoUrl: cloneUrl,
-      branch,
-      commitSha,
-      clonedAt,
-    };
+        return {
+          appName,
+          repoUrl: cloneUrl,
+          branch,
+          commitSha,
+          clonedAt,
+        };
       } finally {
         release();
       }

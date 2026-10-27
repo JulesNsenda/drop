@@ -164,12 +164,9 @@ describe('git deploy folder reservation', () => {
 
       expect(ran).toBe(false);
       // B reserved during the drop.yaml read, so only a re-check AFTER that
-      // await can see it. Two run back to back with nothing awaited between
-      // them (the in-progress skip, then the busy check before the claim);
-      // either one dropping the update is correct.
-      expect(logged).toContainEqual(
-        expect.stringMatching(/already in progress|a deploy took the app meanwhile/)
-      );
+      // await can see it: the single inProgressSkip before the claim, which
+      // covers the git reservation as well as the in-progress set.
+      expect(logged).toContainEqual(expect.stringMatching(/Dropped redeploy for web - already in progress/));
       expect(releaseB).not.toBeNull();
       expect(build).not.toHaveBeenCalled();
       // B's reservation is intact: still busy, still reserved.
