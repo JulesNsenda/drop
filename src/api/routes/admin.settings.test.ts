@@ -29,7 +29,8 @@ import { createUser, resetAuth } from '../middleware/auth';
 import { getTestToken } from '../__testutils__/auth';
 import { getStateManager, resetStateManager } from '../../managers/app/state-manager';
 import { getSettingsManager, resetSettingsManager } from '../../managers/settings/settings-manager';
-import { resetPlatformOps } from '../platform-ops';
+import { resetPlatformOps, setPlatformOps, type PlatformOps } from '../platform-ops';
+import * as appConfigModule from '../../managers/app/app-config';
 import { getPublicUrl, setPublicUrl, setApiRuntimeConfig } from '../runtime-config';
 import * as activityModule from '../../managers/activity';
 import { getMailCredentialStore, resetMailCredentialStore } from '../../managers/mailer/mail-credential';
@@ -293,7 +294,7 @@ describe('admin settings routes (PRD-041)', () => {
     await server.initialize();
     hono = server.getApp();
 
-    await createUser('root', 'password123', 'admin');
+    await createUser({ username: 'root', role: 'admin', credential: { password: 'password123' } });
     adminToken = await getTestToken('root', 'password123');
   });
 
@@ -406,6 +407,39 @@ describe('admin settings routes (PRD-041)', () => {
       getSettingsManager({ settingsFilePath: path.join(tempDir, 'settings.json') });
       await getSettingsManager().load();
       expect(getSettingsManager().getStoredPublicUrl()).toBe('https://drop.example.com');
+    });
+
+    describe('route re-emission', () => {
+      const reconfigureRoute = jest.fn().mockResolvedValue(undefined);
+
+      beforeEach(() => {
+        reconfigureRoute.mockClear();
+        setPlatformOps({ reconfigureRoute } as unknown as PlatformOps);
+        jest.spyOn(appConfigModule, 'getAppConfigServiceOrNull').mockReturnValue({
+          getAllConfigs: () => [
+            { name: 'with-domains', port: 4001, domains: ['a.example.com'] },
+            { name: 'default-host', port: 4002 },
+            { name: 'not-deployed' },
+          ],
+        } as never);
+      });
+
+      afterEach(() => {
+        jest.restoreAllMocks();
+        resetPlatformOps();
+      });
+
+      it('re-emits every app that has a port when the public URL is set', async () => {
+        const res = await putPublicUrl('https://drop.example.com');
+        expect(res.status).toBe(200);
+        expect(reconfigureRoute.mock.calls.map((c) => c[0])).toEqual(['with-domains', 'default-host']);
+      });
+
+      it('re-emits when the override is cleared', async () => {
+        const res = await putPublicUrl(null);
+        expect(res.status).toBe(200);
+        expect(reconfigureRoute.mock.calls.map((c) => c[0])).toEqual(['with-domains', 'default-host']);
+      });
     });
 
     it('normalizes a trailing slash before storing', async () => {
@@ -524,7 +558,7 @@ describe('admin settings routes (PRD-041)', () => {
     });
 
     it('rejects a non-admin request with 403', async () => {
-      await createUser('regular', 'password123', 'user');
+      await createUser({ username: 'regular', role: 'user', credential: { password: 'password123' } });
       const userToken = await getTestToken('regular', 'password123');
       const res = await generateGithubWebhookSecret(userToken);
       expect(res.status).toBe(403);
@@ -644,7 +678,7 @@ describe('admin settings routes (PRD-041)', () => {
     });
 
     it('rejects a non-admin request with 403', async () => {
-      await createUser('regular2', 'password123', 'user');
+      await createUser({ username: 'regular2', role: 'user', credential: { password: 'password123' } });
       const userToken = await getTestToken('regular2', 'password123');
       const res = await putGithubWebhookSecret('some-valid-secret-value', userToken);
       expect(res.status).toBe(403);
@@ -715,7 +749,7 @@ describe('admin settings routes (PRD-041)', () => {
     });
 
     it('rejects a non-admin request with 403', async () => {
-      await createUser('regular3', 'password123', 'user');
+      await createUser({ username: 'regular3', role: 'user', credential: { password: 'password123' } });
       const userToken = await getTestToken('regular3', 'password123');
       const res = await putUserConnectors(false, userToken);
       expect(res.status).toBe(403);
@@ -845,7 +879,7 @@ describe('admin settings routes (PRD-041)', () => {
     });
 
     it('rejects a non-admin request with 403', async () => {
-      await createUser('regular4', 'password123', 'user');
+      await createUser({ username: 'regular4', role: 'user', credential: { password: 'password123' } });
       const userToken = await getTestToken('regular4', 'password123');
       const res = await putAppSharing(true, userToken);
       expect(res.status).toBe(403);
@@ -1110,7 +1144,7 @@ describe('admin settings routes (PRD-041)', () => {
     });
 
     it('rejects a non-admin request with 403', async () => {
-      await createUser('regular5', 'password123', 'user');
+      await createUser({ username: 'regular5', role: 'user', credential: { password: 'password123' } });
       const userToken = await getTestToken('regular5', 'password123');
       const res = await putMail({ host: 'smtp.example.com' }, userToken);
       expect(res.status).toBe(403);
@@ -1176,7 +1210,7 @@ describe('admin settings routes (PRD-041)', () => {
 
     it('rejects a non-admin request with 403', async () => {
       await writeValidEncryptionKey();
-      await createUser('regular6', 'password123', 'user');
+      await createUser({ username: 'regular6', role: 'user', credential: { password: 'password123' } });
       const userToken = await getTestToken('regular6', 'password123');
       const res = await putMailCredential('super-secret-relay-password', userToken);
       expect(res.status).toBe(403);
@@ -1263,7 +1297,7 @@ describe('admin settings routes (PRD-041)', () => {
     });
 
     it('rejects a non-admin request with 403', async () => {
-      await createUser('regular7', 'password123', 'user');
+      await createUser({ username: 'regular7', role: 'user', credential: { password: 'password123' } });
       const userToken = await getTestToken('regular7', 'password123');
       const res = await postMailTest('someone@example.com', userToken);
       expect(res.status).toBe(403);
@@ -1398,7 +1432,7 @@ describe('admin settings routes (PRD-041)', () => {
     });
 
     it('is admin-only', async () => {
-      await createUser('plain', 'password123', 'user');
+      await createUser({ username: 'plain', role: 'user', credential: { password: 'password123' } });
       const token = await getTestToken('plain', 'password123');
       expect((await putStorage({ enabled: true }, token)).status).toBe(403);
       expect((await putStorageCredential(goodKey, token)).status).toBe(403);
@@ -1506,7 +1540,7 @@ describe('GET /admin/settings — isolation block', () => {
     });
     await server.initialize();
     hono = server.getApp();
-    await createUser('root', 'password123', 'admin');
+    await createUser({ username: 'root', role: 'admin', credential: { password: 'password123' } });
     adminToken = await getTestToken('root', 'password123');
   };
 
@@ -1575,7 +1609,7 @@ describe('GET /admin/settings — isolation block', () => {
 
   it('is admin-only, like the rest of the settings surface', async () => {
     await makeServer('docker');
-    await createUser('plain', 'password123', 'user');
+    await createUser({ username: 'plain', role: 'user', credential: { password: 'password123' } });
     const userToken = await getTestToken('plain', 'password123');
 
     const res = await hono.request('/api/v1/admin/settings', {
@@ -1622,7 +1656,7 @@ describe('PUT /admin/settings/sql-console', () => {
     });
     await server.initialize();
     hono = server.getApp();
-    await createUser('root', 'password123', 'admin');
+    await createUser({ username: 'root', role: 'admin', credential: { password: 'password123' } });
     adminToken = await getTestToken('root', 'password123');
   });
 
@@ -1670,7 +1704,7 @@ describe('PUT /admin/settings/sql-console', () => {
   });
 
   it('is admin-only', async () => {
-    await createUser('plain', 'password123', 'user');
+    await createUser({ username: 'plain', role: 'user', credential: { password: 'password123' } });
     const userToken = await getTestToken('plain', 'password123');
 
     const res = await hono.request('/api/v1/admin/settings/sql-console', {

@@ -40,10 +40,10 @@ describe('dedicated POST /admin/mail/test rate-limit bucket (DROP-154)', () => {
   beforeEach(async () => {
     t = await createTestApiServer({ port: 3104, tempPrefix: 'drop-mail-ratelimit-' });
 
-    await createUser('mail-admin', 'password123', 'admin');
+    await createUser({ username: 'mail-admin', role: 'admin', credential: { password: 'password123' } });
     adminToken = await getTestToken('mail-admin', 'password123');
 
-    await createUser('mail-user', 'password123', 'user');
+    await createUser({ username: 'mail-user', role: 'user', credential: { password: 'password123' } });
     userToken = await getTestToken('mail-user', 'password123');
   });
 

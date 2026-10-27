@@ -168,7 +168,7 @@ describe('capability model', () => {
 
     it('still admits a JWT session for a plain user on authMiddleware("readonly")', async () => {
       const app = buildApp();
-      await createUser('alice', 'password123', 'user');
+      await createUser({ username: 'alice', role: 'user', credential: { password: 'password123' } });
       const { getTestToken } = await import('../__testutils__/auth');
       const token = await getTestToken('alice', 'password123');
 

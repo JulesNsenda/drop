@@ -30,6 +30,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Security
 
 - Hardened how git-deployed apps are updated: a redeploy now downloads a fresh shallow copy into a private platform folder and copies the repository's files into the app, instead of running git inside the app's own folder. The copy is size- and entry-limited like an upload, refuses to write through links, and records which files it wrote so it only ever deletes those.
+- Hostnames under the platform's own public host can no longer be claimed as an app's custom domain.
 
 ### Upgrading
 

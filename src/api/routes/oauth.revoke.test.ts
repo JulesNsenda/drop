@@ -142,8 +142,8 @@ describe('POST /oauth/revoke (RFC 7009, DROP-131)', () => {
     });
     await server.start();
 
-    await createUser('revoke-admin', 'adminpass123', 'admin');
-    await createUser('revoke-user', 'userpass123', 'user');
+    await createUser({ username: 'revoke-admin', role: 'admin', credential: { password: 'adminpass123' } });
+    await createUser({ username: 'revoke-user', role: 'user', credential: { password: 'userpass123' } });
     adminToken = await login('revoke-admin', 'adminpass123');
     userToken = await login('revoke-user', 'userpass123');
 

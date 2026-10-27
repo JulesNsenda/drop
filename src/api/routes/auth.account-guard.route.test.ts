@@ -38,7 +38,7 @@ describe('DELETE /auth/account guards', () => {
     await server.initialize();
     app = server.getApp();
 
-    const bob = await createUser('bob', 'password123', 'user');
+    const bob = await createUser({ username: 'bob', role: 'user', credential: { password: 'password123' } });
     bobId = bob.id;
     bobToken = await getTestToken('bob', 'password123');
   });

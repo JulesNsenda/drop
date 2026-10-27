@@ -33,6 +33,16 @@ describe('customDomainProblem', () => {
     expect(customDomainProblem('A.B.DropKit.sh', ctx)).toMatch(/belong to the platform/);
   });
 
+  it("rejects names under the platform's public host even when it is outside the suffix", () => {
+    const apart = { publicUrl: 'https://dashboard.platform.example', domainSuffix: 'dropkit.sh' };
+    expect(customDomainProblem('x.dashboard.platform.example', apart)).toBe(
+      "That domain is under the platform's own host"
+    );
+    expect(customDomainProblem('X.Dashboard.Platform.Example', apart)).toMatch(/under the platform/);
+    expect(customDomainProblem('platform.example', apart)).toBeUndefined();
+    expect(customDomainProblem('x.dashboard.platform.example', { domainSuffix: 'dropkit.sh' })).toBeUndefined();
+  });
+
   it('does not treat a lookalike suffix as the platform suffix', () => {
     expect(customDomainProblem('notdropkit.sh', ctx)).toBeUndefined();
   });

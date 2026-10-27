@@ -61,9 +61,9 @@ describe('git redeploy route authorization', () => {
     await server.initialize();
     app = server.getApp();
 
-    const alice = await createUser('alice', 'password123', 'user');
-    await createUser('bob', 'password123', 'user');
-    await createUser('sysadmin', 'password123', 'admin');
+    const alice = await createUser({ username: 'alice', role: 'user', credential: { password: 'password123' } });
+    await createUser({ username: 'bob', role: 'user', credential: { password: 'password123' } });
+    await createUser({ username: 'sysadmin', role: 'admin', credential: { password: 'password123' } });
     aliceId = alice.id;
     aliceToken = await getTestToken('alice', 'password123');
     bobToken = await getTestToken('bob', 'password123');
@@ -186,7 +186,7 @@ describe('git redeploy route authorization', () => {
       // He can reach his own child, but the resolved container is Alice's — the
       // recheck on the resolved container must block it. Same 404 as any miss.
       const sm = getStateManager();
-      const bobId = (await createUser('mallory', 'password123', 'user')).id;
+      const bobId = (await createUser({ username: 'mallory', role: 'user', credential: { password: 'password123' } })).id;
       const malloryToken = await getTestToken('mallory', 'password123');
       await sm.registerApp('evil-backend', path.join(tempDir, 'evil-backend'));
       await sm.updateApp('evil-backend', { userId: bobId, group: 'grp' });

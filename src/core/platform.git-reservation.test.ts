@@ -163,9 +163,13 @@ describe('git deploy folder reservation', () => {
       const ran = await internals.handleAppUpdate('web', '/apps/web', 'git redeploy', true);
 
       expect(ran).toBe(false);
-      // It was dropped by the re-check on the line before the claim, not by
-      // some earlier guard.
-      expect(logged).toContainEqual(expect.stringContaining('a deploy took the app meanwhile'));
+      // B reserved during the drop.yaml read, so only a re-check AFTER that
+      // await can see it. Two run back to back with nothing awaited between
+      // them (the in-progress skip, then the busy check before the claim);
+      // either one dropping the update is correct.
+      expect(logged).toContainEqual(
+        expect.stringMatching(/already in progress|a deploy took the app meanwhile/)
+      );
       expect(releaseB).not.toBeNull();
       expect(build).not.toHaveBeenCalled();
       // B's reservation is intact: still busy, still reserved.

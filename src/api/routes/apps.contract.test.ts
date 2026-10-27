@@ -78,8 +78,8 @@ describe('GET /api/v1/apps/:name DTO contract', () => {
     await server.initialize();
     hono = server.getApp();
 
-    await createUser('admin-user', 'password123', 'admin');
-    const user = await createUser('regular-user', 'password123', 'user');
+    await createUser({ username: 'admin-user', role: 'admin', credential: { password: 'password123' } });
+    const user = await createUser({ username: 'regular-user', role: 'user', credential: { password: 'password123' } });
     userId = user.id;
     adminToken = await getTestToken('admin-user', 'password123');
     userToken = await getTestToken('regular-user', 'password123');
@@ -287,8 +287,8 @@ describe('GET /api/v1/apps list DTO contract', () => {
     await server.initialize();
     hono = server.getApp();
 
-    const user = await createUser('user-list', 'password123', 'user');
-    await createUser('admin-list', 'password123', 'admin');
+    const user = await createUser({ username: 'user-list', role: 'user', credential: { password: 'password123' } });
+    await createUser({ username: 'admin-list', role: 'admin', credential: { password: 'password123' } });
     userId = user.id;
     userToken = await getTestToken('user-list', 'password123');
     adminToken = await getTestToken('admin-list', 'password123');

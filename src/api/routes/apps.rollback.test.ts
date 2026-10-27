@@ -49,9 +49,9 @@ describe('/api/v1/apps/:name/rollback (#296)', () => {
     jest.spyOn(diskUtils, 'hasEnoughDisk').mockResolvedValue({ ok: true, freeMb: 999999 });
     initRollbackStore(t.tempDir);
 
-    aliceId = (await createUser('alice', 'password123', 'user')).id;
-    await createUser('bob', 'password123', 'user');
-    await createUser('reader', 'password123', 'readonly');
+    aliceId = (await createUser({ username: 'alice', role: 'user', credential: { password: 'password123' } })).id;
+    await createUser({ username: 'bob', role: 'user', credential: { password: 'password123' } });
+    await createUser({ username: 'reader', role: 'readonly', credential: { password: 'password123' } });
     alice = await getTestToken('alice', 'password123');
     bob = await getTestToken('bob', 'password123');
     reader = await getTestToken('reader', 'password123');
