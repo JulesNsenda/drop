@@ -30,6 +30,7 @@ import {
   accessVerifyRateLimitMiddleware,
   servicesRateLimitMiddleware,
   shareRateLimitMiddleware,
+  redeployRateLimitMiddleware,
   mailRateLimitMiddleware,
   objectStorageTestRateLimitMiddleware,
 } from './middleware/rate-limit';
@@ -343,6 +344,14 @@ export class ApiServer {
     // auth-disabled (single-operator) box still gets flood protection.
     v1.use('/apps/*/source', uploadRateLimitMiddleware());
 
+    // An explicit redeploy waits for a builder slot and runs a full install
+    // and build, so it gets its own bucket too, registered unconditionally. One
+    // handler depth (POST /apps/:name/redeploy; what it hands back to follow is
+    // the existing GET /deploys/stream, under its own routes). A named param,
+    // like the share routes, so a request is counted once. A second path form
+    // under /redeploy would need registering here as well.
+    v1.use('/apps/:name/redeploy', redeployRateLimitMiddleware());
+
     // The hosted MCP endpoint gets its own bucket (PRD-040), also registered
     // unconditionally.
     v1.use('/mcp', mcpRateLimitMiddleware());
@@ -528,6 +537,8 @@ export class ApiServer {
       v1.use('/apps/*/start', authMiddleware('user'));
       v1.use('/apps/*/stop', authMiddleware('user'));
       v1.use('/apps/*/restart', authMiddleware('user'));
+      // Rebuilding an app from its files on disk mutates it like an upload does.
+      v1.use('/apps/*/redeploy', authMiddleware('user'));
       // Promotion is a human decision (Step 6d). The role floor is enforced
       // here; the route ALSO rejects an agent credential outright, because a
       // role alone does not distinguish an agent token from a session.

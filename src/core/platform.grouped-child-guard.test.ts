@@ -69,6 +69,8 @@ describe('grouped monorepo children are the container’s to build', () => {
     };
     (platform as any).stateManager = {
       getApp: (n: string) => states.get(n),
+      // isGroupBusy (the explicit-update guard) reads the whole set.
+      getAllApps: () => [...states.values()],
       registerApp: jest.fn().mockResolvedValue(undefined),
       updateApp: jest.fn().mockResolvedValue(undefined),
       hasApp: jest.fn().mockReturnValue(true),

@@ -107,6 +107,12 @@ describe('refusal codes', () => {
     ).toBe('GUARDRAIL_TRIPPED');
   });
 
+  it('names a refused-after-acceptance redeploy with its own code, not PREBUILD_FAILED', () => {
+    expect(
+      deriveErrorCode({ phase: 'build', stage: 'pre-build', builderCode: 'DEPLOY_REFUSED' })
+    ).toBe('DEPLOY_REFUSED');
+  });
+
   it('names a quota refusal the same way', () => {
     expect(
       deriveErrorCode({ phase: 'build', stage: 'pre-build', builderCode: 'QUOTA_EXCEEDED' })

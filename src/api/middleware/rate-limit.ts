@@ -34,6 +34,13 @@ const UPLOAD_CONFIG: RateLimitConfig = {
   windowMs: 60_000, // 1 minute - stricter for the upload-deploy endpoint (PRD-039)
 };
 
+const REDEPLOY_CONFIG: RateLimitConfig = {
+  maxRequests: 10,
+  windowMs: 60_000, // 1 minute - dedicated bucket for POST /apps/:name/redeploy (#359). Each accepted
+  // request waits for a builder slot and then runs a full install and build, so it is as expensive as an
+  // upload deploy; its own store, so a redeploy burst cannot 429 uploads from the same client, or the reverse.
+};
+
 const MCP_CONFIG: RateLimitConfig = {
   maxRequests: 60,
   windowMs: 60_000, // 1 minute - dedicated bucket for the hosted MCP endpoint (PRD-040)
@@ -211,6 +218,11 @@ export function authRateLimitMiddleware(config?: Partial<RateLimitConfig>) {
 /** Strict rate limiter for the upload-deploy endpoint (large-body abuse, PRD-039) */
 export function uploadRateLimitMiddleware(config?: Partial<RateLimitConfig>) {
   return createRateLimiter('upload', { ...UPLOAD_CONFIG, ...config });
+}
+
+/** Dedicated rate limiter for the explicit-redeploy endpoint (#359) */
+export function redeployRateLimitMiddleware(config?: Partial<RateLimitConfig>) {
+  return createRateLimiter('redeploy', { ...REDEPLOY_CONFIG, ...config });
 }
 
 /** Dedicated rate limiter for the hosted MCP endpoint (PRD-040) */

@@ -1091,7 +1091,8 @@ describe('GitDeployService', () => {
         } as Record<string, unknown>);
         await getStateManager().registerApp('grp-child', path.join(tempDir, 'webapps', 'grp-child'));
         await getStateManager().updateApp('grp-child', { group } as Record<string, unknown>);
-        installOps({ isAppInProgress: (n: string) => n === 'grp-child' });
+        // The group rule is the platform's (isGroupBusy; its own test pins the scan).
+        installOps({ isGroupBusy: (n: string) => n === 'grp-container' });
         await expect(service.redeploy('grp-container')).rejects.toBeInstanceOf(AppInProgressError);
       });
 

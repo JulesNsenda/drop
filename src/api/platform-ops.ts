@@ -20,6 +20,7 @@ import type { RollbackSnapshotMeta } from '../managers/rollback';
 // but not used in this file's own signatures.
 import type { AttachableServiceId, AttachServiceResult, DetachServiceResult } from './services-wire.types';
 import type { AccessGateVerdict } from '../managers/guardrail/access-gate';
+import type { DeployActorInfo } from '../managers/guardrail/deploy-breaker';
 
 /**
  * The attach/detach wire contract itself lives in `services-wire.types.ts` —
@@ -133,6 +134,31 @@ export function needsConfigAction(err: AppNeedsConfigError): string {
 export function needsConfigDetail(err: AppNeedsConfigError, appName: string): string {
   return `Application '${appName}' needs configuration — ${needsConfigAction(err)}, then retry`;
 }
+
+/** Why an explicit redeploy was refused. The route maps each code to its status. */
+export type RedeployRefusalCode =
+  | 'NOT_FOUND'
+  | 'APP_SOURCE_MISSING'
+  | 'APP_BUSY'
+  | 'SERVICE_UNAVAILABLE'
+  | 'REDEPLOY_NOT_SUPPORTED_YET'
+  | 'APP_STOPPED'
+  | 'RATE_LIMITED'
+  | 'INSUFFICIENT_DISK';
+
+export interface RedeployRefusal {
+  code: RedeployRefusalCode;
+  message: string;
+  retryAfterSeconds?: number;
+}
+
+/**
+ * What an explicit redeploy came to: started (it has a builder slot and the
+ * deploy id it builds under), accepted (no slot within the wait: it carries on
+ * in the background, and has no id yet), or refused. A monorepo group is refused for now; a
+ * group that appears after a git land is a later item's.
+ */
+export type RedeployStart = { started: string } | { accepted: true } | { refused: RedeployRefusal };
 
 export interface PlatformOps {
   /**
@@ -254,6 +280,32 @@ export interface PlatformOps {
    * or the snapshot — without doing it; null when there is nothing.
    */
   describeRollback(appName: string): Promise<RollbackSnapshotMeta | null>;
+
+  /**
+   * Redeploy an app explicitly (source already on disk, rebuilt as it stands).
+   * ONE operation, and the reservation never leaves the platform: it takes the
+   * app's slot, decides under it that the app exists, is a files app (git-backed
+   * apps and monorepo groups are refused for now), is not busy, passes the
+   * stopped rule, has disk and is admitted by the deploy guardrails (once), and
+   * starts. An admitted request counts against the caller's deploy quota
+   * whatever becomes of it - the quota counts volume, not outcome.
+   *
+   * Waits for a builder slot, at most DROP_REDEPLOY_START_WAIT_MS (10 seconds). In time:
+   * `started`, with the id the build runs under (its episode follows within
+   * moments). Not in time: `accepted` - the redeploy carries on in the
+   * background, a refusal after the wait is recorded as a failed deploy
+   * (DEPLOY_REFUSED) the caller can follow, and a throw is logged. Refusals are
+   * returned, never thrown; the slot and the breaker keys are given back on
+   * every path. Authorization is the caller's.
+   */
+  redeployApp(appName: string, actor: DeployActorInfo): Promise<RedeployStart>;
+
+  /**
+   * Whether any app in the same monorepo group as `appName` is busy in a way
+   * that forbids touching it: for a container, any of its children; for a
+   * child, its container. False for an app outside any group.
+   */
+  isGroupBusy(appName: string): boolean;
 
   /**
    * Tear down every app belonging to a monorepo group (M4): stop+delete each

@@ -252,6 +252,14 @@ export interface DeployActorInfo {
   principalId?: string;
   actorUserId?: string;
   automationSource?: 'webhook';
+  /**
+   * The caller is autonomous: an agent token (`AuthContext.kind === 'agent'`) or
+   * an OAuth session (see `deployActorOf`). Carried so an admission rule that
+   * must treat autonomous callers differently (they never rebuild an app a human
+   * stopped) reads it from the same record the guardrail keys come from. Not
+   * part of any key.
+   */
+  agent?: boolean;
 }
 
 /**

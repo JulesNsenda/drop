@@ -385,11 +385,8 @@ export class GitDeployService {
       if (requireOps) throw new PlatformNotReadyError(appName);
       return () => undefined;
     }
-    if (app?.isGroupContainer && app.group) {
-      const busyChild = getStateManager()
-        .getAllApps()
-        .some((a) => a.group === app.group && !a.isGroupContainer && ops.isAppInProgress(a.name));
-      if (busyChild) throw new AppInProgressError(appName);
+    if (app?.isGroupContainer && app.group && ops.isGroupBusy(appName)) {
+      throw new AppInProgressError(appName);
     }
     const release = ops.tryReserveApp(appName);
     if (!release) throw new AppInProgressError(appName);

@@ -13,7 +13,7 @@ import { pipeline } from 'stream/promises';
 import { success, error, ErrorCodes, AppDto, CreateAppDto } from '../types';
 import { NotFoundError, ValidationError } from '../middleware/error';
 import { AuthContext, listUsers, getUserById } from '../middleware/auth';
-import { canAccess, interactiveSessionOnly } from '../access';
+import { canAccess, canAccessScoped, interactiveSessionOnly } from '../access';
 import { isValidAppName, validateAppName } from '../middleware/validate';
 import { getAppRuntime } from '../../managers/runtime';
 import {
@@ -68,9 +68,11 @@ import {
   gateEnforced,
 } from '../../managers/guardrail/access-gate';
 import { DeployRefusedError } from '../../managers/guardrail/deploy-breaker';
+import { deployActorOf } from '../deploy-actor';
 import { QuotaExceededError } from '../../managers/guardrail/principal-quota';
 import { pruneOwnerDumpsToFit, predeleteMaxBytes } from '../../managers/guardrail/detach-limits';
 import { runUploadPreflight } from '../upload-preflight';
+import type { RedeployRefusal, RedeployRefusalCode } from '../platform-ops';
 import type { RuntimeType } from '../../managers/runtime/app-runtime.types';
 import {
   MAX_ACCESS_ALLOW_ENTRIES,
@@ -1279,6 +1281,81 @@ apps.post('/:name/restart', async c => {
     const message = err instanceof Error ? err.message : 'Failed to restart';
     return c.json(error(ErrorCodes.INTERNAL_ERROR, message), 500);
   }
+});
+
+// ============ Explicit redeploy (#359) ============
+
+/** Status and API code for each way an explicit redeploy can be refused. */
+const REDEPLOY_REFUSALS: Record<RedeployRefusalCode, { status: 404 | 409 | 429 | 503 | 507; code: string }> = {
+  NOT_FOUND: { status: 404, code: ErrorCodes.NOT_FOUND },
+  // The app exists but its folder does not: a conflict with the app's state, not an unknown app (404).
+  APP_SOURCE_MISSING: { status: 409, code: 'APP_SOURCE_MISSING' },
+  APP_BUSY: { status: 409, code: 'APP_BUSY' },
+  REDEPLOY_NOT_SUPPORTED_YET: { status: 409, code: 'REDEPLOY_NOT_SUPPORTED_YET' },
+  APP_STOPPED: { status: 409, code: 'APP_STOPPED' },
+  SERVICE_UNAVAILABLE: { status: 503, code: ErrorCodes.SERVICE_UNAVAILABLE },
+  RATE_LIMITED: { status: 429, code: ErrorCodes.RATE_LIMITED },
+  INSUFFICIENT_DISK: { status: 507, code: 'INSUFFICIENT_DISK' },
+};
+
+function redeployRefusalResponse(c: Context, refusal: RedeployRefusal) {
+  const { status, code } = REDEPLOY_REFUSALS[refusal.code];
+  if (refusal.retryAfterSeconds !== undefined) c.header('Retry-After', String(refusal.retryAfterSeconds));
+  return c.json(
+    error(
+      code,
+      refusal.message,
+      refusal.retryAfterSeconds !== undefined ? { retryAfterSeconds: refusal.retryAfterSeconds } : undefined
+    ),
+    status as 404
+  );
+}
+
+// POST /apps/:name/redeploy - rebuild a FILES app from the source already on
+// disk and swap it in. The platform waits up to 10s for a builder slot: in time
+// the 202 carries the deploy id; otherwise it says `accepted` and the redeploy
+// carries on in the background. Either way `follow` (omitted for a role-none
+// caller, which cannot read /deploys) is the app + since stream
+// (GET /deploys/stream), NOT the by-id stream: between the mint and the build's
+// first event the deploy has no episode, and the by-id stream 404s there, while
+// the since-stream waits for it (and shows a refusal after the wait). Git-backed
+// apps and monorepo groups are refused for now.
+apps.post('/:name/redeploy', async c => {
+  const auth = (c.get as Function)('auth') as AuthContext | undefined;
+  const name = c.req.param('name');
+
+  // Authorization first, and a 404 that names only the app the caller asked
+  // for. Scoped: an agent token needs app:<name>:deploy for THIS app.
+  const app = getStateManager().getApp(name);
+  if (!app || !canAccessScoped(auth, app, name, 'deploy')) {
+    throw new NotFoundError(`Application '${name}' not found`);
+  }
+
+  const ops = getPlatformOps();
+  if (!ops) {
+    return c.json(error(ErrorCodes.SERVICE_UNAVAILABLE, 'Platform operations unavailable'), 503);
+  }
+
+  // Taken BEFORE the start, so the since-stream cannot miss an episode that
+  // opens while the platform is still deciding.
+  const acceptedAt = new Date().toISOString();
+
+  // One operation: the platform reserves, admits (with the one actor, for the
+  // guardrail keys and the stopped rule alike) and starts.
+  const result = await ops.redeployApp(name, deployActorOf(auth));
+  if ('refused' in result) return redeployRefusalResponse(c, result.refused);
+
+  await logActivityFor(auth, { action: 'redeploy', appName: name, detail: 'files' });
+  // A scope-only caller (role 'none') cannot read /deploys at all (its floor is
+  // 'readonly'), so a URL into it would only 403: it gets the facts and no link.
+  const follow =
+    auth?.role === 'none'
+      ? undefined
+      : `/api/v1/deploys/stream?app=${encodeURIComponent(name)}&since=${encodeURIComponent(acceptedAt)}`;
+  if ('accepted' in result) {
+    return c.json(success({ accepted: true, acceptedAt, ...(follow ? { follow } : {}) }), 202);
+  }
+  return c.json(success({ deployId: result.started, acceptedAt, ...(follow ? { follow } : {}) }), 202);
 });
 
 // ============ Rollback (#296) ============
