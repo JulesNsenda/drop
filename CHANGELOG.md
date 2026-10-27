@@ -33,8 +33,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `AWS_` and `CF_` environment.** A PM2 app used to receive every variable the
   platform process was started with, which put the platform's secrets (the
   operator's AWS keys, Cloudflare tokens, `DROP_*` settings) in reach of tenant
-  code. Variables with those three prefixes are now removed, the same list the
-  build step already used, unless the app is given them explicitly (as a
+  code. Variables with those three prefixes are now removed (and passed as
+  empty on a hot reload, where PM2 re-seeds from the platform), the same list
+  the build step already used, unless the app is given them explicitly (as a
   secret, in `drop.yaml` `env:`, by DROP itself such as `DROP_DATA_DIR`, or by
   attaching object storage). That includes `AWS_REGION` and `AWS_PROFILE`: an
   app that relied on picking AWS settings up from the host's environment must

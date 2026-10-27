@@ -42,6 +42,15 @@ export class ProcessManager {
       return existingStatus;
     }
 
+    // A stopped / errored entry under this name: remove it first, as a restart
+    // does. `pm2.start` over a live entry takes PM2's restart path, which
+    // seeds the app's environment from the PLATFORM's own and skips the
+    // env filtering a fresh start gets. Deleting here, in the adapter, covers
+    // every caller (a hot reload stops then starts with no delete between).
+    if (existingStatus) {
+      await this.delete(name);
+    }
+
     // Convert config to PM2 options
     const pm2Options = this.configToPM2Options(config);
 

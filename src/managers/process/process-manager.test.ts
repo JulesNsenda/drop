@@ -186,6 +186,25 @@ describe('ProcessManager', () => {
       );
     });
 
+    it('deletes a stopped entry before starting over it, so PM2 takes its fresh-start path', async () => {
+      mockGetProcessStatus
+        .mockResolvedValueOnce(createStatus({ status: 'stopped' }))
+        .mockResolvedValue(createStatus());
+
+      await new ProcessManager().start({ name: 'test-app', script: 'index.js', cwd: '/app' });
+
+      expect(mockDeleteProcess).toHaveBeenCalledWith('test-app');
+      expect(mockDeleteProcess.mock.invocationCallOrder[0]).toBeLessThan(mockStart.mock.invocationCallOrder[0]);
+    });
+
+    it('deletes nothing when there is no entry to start over', async () => {
+      mockGetProcessStatus.mockResolvedValueOnce(null).mockResolvedValue(createStatus());
+
+      await new ProcessManager().start({ name: 'test-app', script: 'index.js', cwd: '/app' });
+
+      expect(mockDeleteProcess).not.toHaveBeenCalled();
+    });
+
     it('should return existing status if already online', async () => {
       mockGetProcessStatus.mockResolvedValue(createStatus());
 

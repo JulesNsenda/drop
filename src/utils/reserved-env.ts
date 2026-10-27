@@ -10,6 +10,27 @@
  */
 export const RESERVED_ENV_PREFIXES = ['DROP_', 'AWS_', 'CF_'] as const;
 
+/**
+ * `env` plus an explicit EMPTY value for every reserved-prefix variable in
+ * `inherited` that `env` does not itself set.
+ *
+ * PM2's `filter_env` strips these on a fresh start, but PM2 restarts a stopped
+ * entry through a different path (`_startJson` with `updateEnv`) that seeds the
+ * app from the platform's own `process.env` and does not apply it. An explicit
+ * empty value wins on EVERY path, and reads as unset to every SDK. Anything
+ * the app was deliberately given is left alone.
+ */
+export function withReservedEnvBlanked(
+  inherited: NodeJS.ProcessEnv,
+  env: Record<string, string>
+): Record<string, string> {
+  const out: Record<string, string> = { ...env };
+  for (const name of Object.keys(inherited)) {
+    if (isReservedEnvName(name) && !Object.hasOwn(out, name)) out[name] = '';
+  }
+  return out;
+}
+
 /** Whether a variable name starts with a reserved platform prefix. */
 export function isReservedEnvName(name: string): boolean {
   return RESERVED_ENV_PREFIXES.some((prefix) => name.startsWith(prefix));

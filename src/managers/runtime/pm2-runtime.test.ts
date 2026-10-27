@@ -125,6 +125,10 @@ describe('Pm2Runtime', () => {
 
   describe('start spec conversion', () => {
     it('maps the runtime-agnostic spec onto ProcessConfig', async () => {
+      // The platform's own reserved variables are overridden with empty ones.
+      for (const name of Object.keys(process.env)) {
+        if (/^(DROP_|AWS_|CF_)/.test(name)) delete process.env[name];
+      }
       pm.start.mockResolvedValue(pm2Status());
       await runtime.start({
         name: 'test-app',
