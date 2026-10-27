@@ -7712,14 +7712,22 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     if (warning) this.logger.warn(warning, 'SECURITY');
   }
 
-  /** Remove the live route for a hostname the app is no longer allowed to serve. */
+  /**
+   * Remove the live route for a hostname the app is no longer allowed to serve.
+   *
+   * The route key is `${app}-${host with dots as dashes}` and app names may
+   * contain '-', so two apps can share a key (`behalf-behalf` on `dropkit.sh`
+   * and `behalf` on `behalf.dropkit.sh`). The key alone therefore proves
+   * nothing: only a route this app owns, on exactly this hostname, is removed.
+   */
   private async pruneRoute(appName: string, hostname: string): Promise<void> {
     const routeKey = `${appName}-${hostname.replace(/\./g, '-')}`;
-    if (this.router?.hasRoute(routeKey)) {
-      await this.router.removeRoute(routeKey).catch((err) =>
-        this.logger.warn(`Could not remove the route for '${hostname}'`, 'ROUTER', err)
-      );
-    }
+    const route = this.router?.getRoute(routeKey);
+    if (!route || route.owner !== appName) return;
+    if (route.hostname?.toLowerCase() !== hostname.toLowerCase()) return;
+    await this.router?.removeRoute(routeKey).catch((err) =>
+      this.logger.warn(`Could not remove the route for '${hostname}'`, 'ROUTER', err)
+    );
   }
 
   /**
@@ -7728,12 +7736,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
    * Best-effort: a route that is already gone is not an error.
    */
   private async dropCustomDomainRoute(appName: string, domain: string): Promise<void> {
-    const routeKey = `${appName}-${domain.replace(/\./g, '-')}`;
-    if (this.router?.hasRoute(routeKey)) {
-      await this.router.removeRoute(routeKey).catch((err) =>
-        this.logger.warn(`Could not remove the route for '${domain}'`, 'ROUTER', err)
-      );
-    }
+    await this.pruneRoute(appName, domain);
     await this.appConfigService
       ?.updateSystemConfig(appName, { customDomainVerified: undefined })
       .catch(() => undefined);

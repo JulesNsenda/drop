@@ -409,24 +409,37 @@ describe('admin settings routes (PRD-041)', () => {
       expect(getSettingsManager().getStoredPublicUrl()).toBe('https://drop.example.com');
     });
 
-    it('re-emits the route of every app with domains or a verified custom domain', async () => {
+    describe('route re-emission', () => {
       const reconfigureRoute = jest.fn().mockResolvedValue(undefined);
-      setPlatformOps({ reconfigureRoute } as unknown as PlatformOps);
-      jest.spyOn(appConfigModule, 'getAppConfigServiceOrNull').mockReturnValue({
-        getAllConfigs: () => [
-          { name: 'with-domains', domains: ['a.example.com'] },
-          { name: 'with-verified', customDomainVerified: { domain: 'b.example.com', verifiedAt: 'x' } },
-          { name: 'plain' },
-        ],
-      } as never);
-      try {
-        const res = await putPublicUrl('https://drop.example.com');
-        expect(res.status).toBe(200);
-        expect(reconfigureRoute.mock.calls.map((c) => c[0])).toEqual(['with-domains', 'with-verified']);
-      } finally {
+
+      beforeEach(() => {
+        reconfigureRoute.mockClear();
+        setPlatformOps({ reconfigureRoute } as unknown as PlatformOps);
+        jest.spyOn(appConfigModule, 'getAppConfigServiceOrNull').mockReturnValue({
+          getAllConfigs: () => [
+            { name: 'with-domains', port: 4001, domains: ['a.example.com'] },
+            { name: 'default-host', port: 4002 },
+            { name: 'not-deployed' },
+          ],
+        } as never);
+      });
+
+      afterEach(() => {
         jest.restoreAllMocks();
         resetPlatformOps();
-      }
+      });
+
+      it('re-emits every app that has a port when the public URL is set', async () => {
+        const res = await putPublicUrl('https://drop.example.com');
+        expect(res.status).toBe(200);
+        expect(reconfigureRoute.mock.calls.map((c) => c[0])).toEqual(['with-domains', 'default-host']);
+      });
+
+      it('re-emits when the override is cleared', async () => {
+        const res = await putPublicUrl(null);
+        expect(res.status).toBe(200);
+        expect(reconfigureRoute.mock.calls.map((c) => c[0])).toEqual(['with-domains', 'default-host']);
+      });
     });
 
     it('normalizes a trailing slash before storing', async () => {

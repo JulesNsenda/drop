@@ -3051,7 +3051,7 @@ describe('expandMonorepo (M2: monorepo -> per-service app expansion)', () => {
           (platform as any).config.domainSuffix = 'dropkit.sh';
           const router = {
             addRoute: jest.fn().mockResolvedValue(undefined),
-            hasRoute: jest.fn().mockReturnValue(false),
+            getRoute: jest.fn().mockReturnValue(undefined),
             removeRoute: jest.fn().mockResolvedValue(undefined),
             ...extra,
           };
@@ -3071,6 +3071,9 @@ describe('expandMonorepo (M2: monorepo -> per-service app expansion)', () => {
           const errorSpy = jest.spyOn((platform as any).logger, 'error').mockImplementation(() => undefined);
           return { router, warnSpy, errorSpy };
         };
+
+        const ownedRoute = (owner: string, key: string, hostname: string) =>
+          jest.fn().mockImplementation((k: string) => (k === key ? { owner, hostname } : undefined));
 
         const route = async (
           publicUrl: string | undefined,
@@ -3134,7 +3137,7 @@ describe('expandMonorepo (M2: monorepo -> per-service app expansion)', () => {
             'https://dashboard.dropkit.sh',
             'tenant',
             ['x.dashboard.dropkit.sh', 'www.example.com'],
-            { hasRoute: jest.fn().mockImplementation((k: string) => k === 'tenant-x-dashboard-dropkit-sh') }
+            { getRoute: ownedRoute('tenant', 'tenant-x-dashboard-dropkit-sh', 'x.dashboard.dropkit.sh') }
           );
           expect(router.removeRoute).toHaveBeenCalledTimes(1);
           expect(router.removeRoute).toHaveBeenCalledWith('tenant-x-dashboard-dropkit-sh');
@@ -3146,7 +3149,7 @@ describe('expandMonorepo (M2: monorepo -> per-service app expansion)', () => {
             jest.fn().mockReturnValue({
               customDomainVerified: { domain: 'x.dashboard.dropkit.sh', verifiedAt: '2026-01-01T00:00:00Z' },
             }),
-            { hasRoute: jest.fn().mockImplementation((k: string) => k === 'tenant-x-dashboard-dropkit-sh') }
+            { getRoute: ownedRoute('tenant', 'tenant-x-dashboard-dropkit-sh', 'x.dashboard.dropkit.sh') }
           );
 
           await (platform as any).handleConfigureRoute('tenant', 4012);
@@ -3161,6 +3164,30 @@ describe('expandMonorepo (M2: monorepo -> per-service app expansion)', () => {
             customDomainVerified: undefined,
           });
           expect(errorSpy).not.toHaveBeenCalled();
+        });
+
+        it("never removes another app's route that shares the key (behalf-behalf vs behalf)", async () => {
+          // 'behalf-behalf' on dropkit.sh and 'behalf' on behalf.dropkit.sh both
+          // map to the key 'behalf-behalf-dropkit-sh'.
+          const key = 'behalf-behalf-dropkit-sh';
+          const victim = { getRoute: ownedRoute('behalf', key, 'behalf.dropkit.sh') };
+          const { router } = stubPlatform(jest.fn().mockReturnValue(undefined), victim);
+          await (platform as any).pruneRoute('behalf-behalf', 'dropkit.sh');
+          expect(router.removeRoute).not.toHaveBeenCalled();
+
+          // Same owner, different hostname behind the same key: also kept.
+          const other = stubPlatform(jest.fn().mockReturnValue(undefined), {
+            getRoute: ownedRoute('behalf-behalf', key, 'behalf.dropkit.sh'),
+          });
+          await (platform as any).pruneRoute('behalf-behalf', 'dropkit.sh');
+          expect(other.router.removeRoute).not.toHaveBeenCalled();
+
+          // Its own route is removed (hostname compared case-insensitively).
+          const own = stubPlatform(jest.fn().mockReturnValue(undefined), {
+            getRoute: ownedRoute('behalf-behalf', key, 'DropKit.sh'),
+          });
+          await (platform as any).pruneRoute('behalf-behalf', 'dropkit.sh');
+          expect(own.router.removeRoute).toHaveBeenCalledWith(key);
         });
 
         it('warns once at boot when the suffix is, or is under, the public host', () => {
