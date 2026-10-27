@@ -230,7 +230,6 @@ export function useApp(name: string) {
 // Deploy Timeline API (P2-4 deploy observability)
 
 export type DeployStageName =
-  | 'queued'
   | 'triggered'
   | 'build-started'
   | 'build'
@@ -250,7 +249,7 @@ export interface DeployEpisodeDto {
   deployId: string;
   appName: string;
   trigger: 'deploy' | 'hot-reload' | 'upload' | 'unknown';
-  status: 'queued' | 'in-progress' | 'succeeded' | 'failed' | 'superseded' | 'interrupted';
+  status: 'in-progress' | 'succeeded' | 'failed' | 'superseded' | 'interrupted';
   startedAt: string;
   endedAt?: string;
   durationMs?: number;

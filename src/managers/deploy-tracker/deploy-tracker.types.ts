@@ -23,7 +23,6 @@ export type DeployFailureCategory =
   | 'postbuild-failed';
 
 export type DeployStageName =
-  | 'queued'
   | 'triggered'
   | 'build-started'
   | 'build'
@@ -50,12 +49,7 @@ export interface DeployRow {
   command?: string;
 }
 
-/**
- * `queued`: accepted and waiting for a builder slot - nothing is building yet.
- * It is open like `in-progress`, but a different fact, and the readers that
- * correlate "the deploy I just started" skip it until it builds.
- */
-export type DeployStatus = 'queued' | 'in-progress' | 'succeeded' | 'failed' | 'superseded' | 'interrupted';
+export type DeployStatus = 'in-progress' | 'succeeded' | 'failed' | 'superseded' | 'interrupted';
 
 export interface DeployStage {
   stage: DeployStageName;

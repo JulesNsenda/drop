@@ -838,6 +838,8 @@ interface AdmittedUpdate {
  */
 interface PlatformHold {
   readonly app: string;
+  /** Still held: not consumed, not released, not replaced. */
+  held(): boolean;
   release(): void;
   consume(): (() => void) | null;
   beginLand(): void;
@@ -861,6 +863,10 @@ type UpdateRefused = { refused: UpdateRefusal; retryAfterSeconds?: number };
  * swap have, with the claim and the keys given back by then.
  */
 type ClaimedUpdate = UpdateRefused | { started: string; done: Promise<boolean> };
+
+/** How long a redeploy waits for a builder slot before answering `accepted`. */
+const REDEPLOY_START_WAIT_MS = 10_000;
+const TIMED_OUT = Symbol('timed-out');
 
 function redeployRefusal(
   code: RedeployRefusal['code'],
@@ -1752,11 +1758,14 @@ export class DropPlatform {
   }
 
   /**
-   * The ONE place an app's in-progress slot is reserved, and so the one place
-   * its gates live: not while quiesced, not while busy, not while an upload is
-   * writing the folder. The reservation is a hold (see PlatformHold) backed by
-   * a per-name owner map; `tryReserveApp` and an explicit redeploy both build
-   * on it, so they exclude each other.
+   * The reservation factory for a claim that is HELD across awaits and handed
+   * around: not while quiesced, not while busy, not while an upload is writing
+   * the folder. The hold (see PlatformHold) is backed by a per-name owner map.
+   * Its claim sites are `tryReserveApp` (git deploy, the DELETE route) and the
+   * explicit redeploy, so those exclude each other. It is NOT the only way the
+   * slot is claimed: handleAppUpdate, handleBuildApp, restartApp, attach/detach
+   * and a monorepo expansion add to `appsInProgress` inline, each re-checking
+   * `isBusy` on the line before the add; their claims have no owner entry.
    */
   private reserve(name: string): PlatformHold | null {
     if (this.isQuiesced() || this.isBusy(name)) return null;
@@ -1775,6 +1784,7 @@ export class DropPlatform {
     };
     return {
       app: name,
+      held: () => !consumed && owns(),
       release: () => {
         if (!consumed) giveBack();
       },
@@ -7479,6 +7489,17 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           );
           return false;
         }
+        // Re-expansion fs.rm/fs.cp's every child's folder. A child that is
+        // being rebuilt or redeployed (or a group being torn down) must not have
+        // its tree rewritten under it; the update is dropped, and the next
+        // explicit redeploy of the group re-expands.
+        if (this.isGroupBusy(appName)) {
+          this.logger.info(
+            `Dropped redeploy for ${appName} - a service of its monorepo group is busy`,
+            'MONOREPO'
+          );
+          return false;
+        }
         const containerKeys = this.guardrailKeys(appName, false, actor ?? {});
         const containerVerdict = this.checkGuardrails(containerKeys);
         if (!containerVerdict.allowed) {
@@ -7676,49 +7697,59 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
    *     checkRedeployable). Git-backed apps and monorepo groups are refused
    *     here for now: the git path will land the repository under this same
    *     hold, by class, using `options.caller`;
-   *  3. consume the hold, set the breaker keys (their lifetime is the hold's),
-   *     mint the deploy id, announce it (`build:queued`: the deploy tracker
-   *     opens the episode under it) and start the build WITHOUT waiting for a
-   *     builder slot - the caller gets the id at once;
-   *  4. the build runs on and closes its own outcome; a refusal after the wait
-   *     closes the same episode.
+   *  3. the last admission step: ONE admitDeploy, charged to the caller's quota
+   *     whatever becomes of the request (the quota counts volume, not outcome),
+   *     with nothing awaited between it and the hold being consumed - so a hold
+   *     that was lost is found out BEFORE the charge, not after;
+   *  4. consume the hold, set the breaker keys (their lifetime is the hold's)
+   *     and start, waiting up to `options.waitMs` for a builder slot;
+   *  5. in time: `started`; otherwise `accepted`, and the start carries on in
+   *     the background - a refusal after the wait then closes a failed episode
+   *     (DEPLOY_REFUSED), because nobody is left to be told.
    *
-   * The hold is released in the finally until step 3 consumes it, so every
-   * earlier exit - a refusal, any error - gives the slot back exactly once and
-   * leaves no key behind. Authorization is the caller's.
+   * The hold is released in the finally until step 4 consumes it, so every
+   * earlier exit gives the slot back exactly once and leaves no key behind.
+   * Authorization is the caller's.
    */
   private async redeployApp(
     appName: string,
     actor: DeployActorInfo,
-    _options: RedeployOptions = {}
+    options: RedeployOptions = {}
   ): Promise<RedeployStart> {
     if (!this.runtime || !this.stateManager || !this.detector || !this.builder) {
       return redeployRefusal('SERVICE_UNAVAILABLE', 'The platform is not ready to deploy');
     }
-    if (this.isQuiesced()) {
-      return redeployRefusal('SERVICE_UNAVAILABLE', 'Deploys are paused for a backup; retry shortly');
-    }
     const hold = this.reserve(appName);
     if (!hold) {
-      return redeployRefusal(
-        'APP_BUSY',
-        `Application '${appName}' is building or deploying - retry once it settles`
-      );
+      return this.isQuiesced()
+        ? redeployRefusal('SERVICE_UNAVAILABLE', 'Deploys are paused for a backup; retry shortly')
+        : redeployRefusal('APP_BUSY', `Application '${appName}' is building or deploying - retry once it settles`);
     }
     try {
       const checked = await this.checkRedeployable(appName, actor);
       if ('refused' in checked) return checked;
       const appState = checked.appState;
 
-      const releaseClaim = hold.consume();
-      if (!releaseClaim) {
-        return redeployRefusal('APP_BUSY', `The reservation for '${appName}' is no longer held - retry the redeploy`);
+      const lost = (): { refused: RedeployRefusal } =>
+        redeployRefusal('APP_BUSY', `The reservation for '${appName}' is no longer held - retry the redeploy`);
+      if (!hold.held()) return lost();
+      // ONE admission, with the one actor: the breaker and the quota, charged
+      // here, last, and followed at once by the consume.
+      try {
+        await admitDeploy(appName, false, actor);
+      } catch (error) {
+        if (error instanceof DeployRefusedError || error instanceof QuotaExceededError) {
+          return redeployRefusal('RATE_LIMITED', error.message, error.retryAfterSeconds);
+        }
+        throw error;
       }
+      const releaseClaim = hold.consume();
+      if (!releaseClaim) return lost();
+
       // Past this point the claim is the build's: nothing below may throw
       // without giving it back, and the finally no longer can.
       try {
         this.breakerKeys.set(appName, this.guardrailKeys(appName, false, actor));
-        const deployId = crypto.randomUUID();
         const admitted: AdmittedUpdate = {
           appPath: this.sourcePathOf(appName),
           statusAtEntry: appState.status,
@@ -7728,27 +7759,37 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           trigger: 'deploy',
           groupGuard: true,
         };
-        // Accepted: the tracker opens the episode under this id now, so it can
-        // be followed from here and a refusal after the wait closes it.
-        eventBus.publish('build:queued', {
-          appId: appName,
-          buildId: `deploy-${appName}-${Date.now()}`,
-          deployId,
-          trigger: 'deploy',
+        const detached = { value: false };
+        const pending = this.runClaimedUpdate(appName, admitted, releaseClaim, (refused) => {
+          // The caller was answered `accepted` and is following the app: give
+          // it the refusal as a failed deploy (the guardrail refusal already
+          // closed its own). Keys first, so the failure is not charged.
+          if (!detached.value || refused.refused === 'guardrail') return;
+          this.releaseGuardrailKeys(appName);
+          this.failDeployEpisode(
+            appName,
+            new Error(redeployRefusalOf(appName, refused).refused.message),
+            crypto.randomUUID(),
+            'DEPLOY_REFUSED',
+            admitted.trigger
+          );
         });
-        const update = await this.runClaimedUpdate(appName, admitted, releaseClaim, deployId);
-        if (!('started' in update)) {
-          // The early form always starts; this keeps the type honest.
-          return redeployRefusalOf(appName, update);
+        const first = await this.within(pending, options.waitMs ?? REDEPLOY_START_WAIT_MS);
+        if (first === TIMED_OUT) {
+          detached.value = true;
+          pending.then(
+            (late) => {
+              if ('started' in late) this.logRedeployFailure(appName, late.done);
+            },
+            (error) => this.logger.error(`Redeploy of ${appName} failed before its build`, 'UPDATE', error)
+          );
+          this.logger.info(`Explicit redeploy of ${appName} accepted, waiting for a builder slot`, 'UPDATE');
+          return { accepted: true };
         }
-        this.logger.info(`Explicit redeploy of ${appName} accepted (${deployId})`, 'UPDATE');
-        // Nobody awaits `done`: its rejection (the failure handler itself
-        // throwing) is logged here, after the outcome was closed, so it is never
-        // unhandled.
-        update.done.catch((error) =>
-          this.logger.error(`Redeploy of ${appName} failed while reporting its outcome`, 'UPDATE', error)
-        );
-        return { started: deployId };
+        if ('refused' in first) return redeployRefusalOf(appName, first);
+        this.logger.info(`Explicit redeploy of ${appName} started (${first.started})`, 'UPDATE');
+        this.logRedeployFailure(appName, first.done);
+        return { started: first.started };
       } catch (error) {
         releaseClaim();
         this.releaseGuardrailKeys(appName);
@@ -7756,6 +7797,29 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       }
     } finally {
       hold.release();
+    }
+  }
+
+  /** Nobody awaits a redeploy's `done`: its rejection (the failure handler itself throwing) is logged, never unhandled. */
+  private logRedeployFailure(appName: string, done: Promise<boolean>): void {
+    done.catch((error) =>
+      this.logger.error(`Redeploy of ${appName} failed while reporting its outcome`, 'UPDATE', error)
+    );
+  }
+
+  /** `promise`, or TIMED_OUT if it has not settled within `ms` (it keeps running either way). */
+  private async within<T>(promise: Promise<T>, ms: number): Promise<T | typeof TIMED_OUT> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        promise,
+        new Promise<typeof TIMED_OUT>((resolve) => {
+          timer = setTimeout(() => resolve(TIMED_OUT), ms);
+          timer.unref?.();
+        }),
+      ]);
+    } finally {
+      clearTimeout(timer);
     }
   }
 
@@ -7772,10 +7836,10 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
   /**
    * redeployApp's checks, run under the hold: the app exists and is a files app
    * (git-backed apps and monorepo groups are refused for now), nothing around it
-   * is busy, the stopped rule, disk, and ONE admission with the one actor.
-   * Disk comes before the admission, so a request refused for want of disk is
-   * not counted. An ADMITTED request counts against the caller's quota whatever
-   * becomes of it - the quota counts volume, not outcome (principal-quota).
+   * is busy, the stopped rule, and disk. The deploy admission (breaker and
+   * quota) is NOT here: it is the caller's last step, so a request refused for
+   * any of these is not counted. An ADMITTED request counts against the quota
+   * whatever becomes of it - the quota counts volume, not outcome (principal-quota).
    */
   private async checkRedeployable(
     appName: string,
@@ -7826,15 +7890,6 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       );
     }
 
-    // ONE admission, with the one actor: the breaker and the quota, charged here.
-    try {
-      await admitDeploy(appName, false, actor);
-    } catch (error) {
-      if (error instanceof DeployRefusedError || error instanceof QuotaExceededError) {
-        return redeployRefusal('RATE_LIMITED', error.message, error.retryAfterSeconds);
-      }
-      throw error;
-    }
     return { appState };
   }
 
@@ -7856,18 +7911,13 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     appName: string,
     admitted: AdmittedUpdate,
     releaseClaim: () => void,
-    earlyDeployId?: string
+    /** Called with a refusal while the claim is still held (before it is given back). */
+    onRefused?: (refused: UpdateRefused) => void
   ): Promise<ClaimedUpdate> {
     const giveBack = (): void => {
       this.releaseGuardrailKeys(appName);
       releaseClaim();
     };
-    // The early form: the caller has already handed the id out (and registered
-    // it as queued), so it starts at once and the wait for the slot, and any
-    // refusal after it, happen behind it, closing the episode under that id.
-    if (earlyDeployId) {
-      return { started: earlyDeployId, done: this.acquireAndSwap(appName, admitted, earlyDeployId, giveBack) };
-    }
     let acquired: AcquiredSlot | UpdateRefused;
     try {
       acquired = await this.acquireSlotAndRecheck(appName, admitted);
@@ -7880,6 +7930,9 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     // full is evidence the caller is looping, so the keys are released, not
     // recorded.
     if ('refused' in acquired) {
+      // Reported while the claim is still ours, so a close lands on THIS
+      // deploy's episode and not on a successor's.
+      onRefused?.(acquired);
       giveBack();
       return acquired;
     }
@@ -7899,40 +7952,6 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     this.logger.warn(`Redeploy of ${appName} failed before its build: ${failure.message}`, 'UPDATE');
     this.releaseGuardrailKeys(appName);
     this.failDeployEpisode(appName, failure, deployId, undefined, trigger);
-  }
-
-  /** runClaimedUpdate's early form: the id is already out, so a refusal after the wait closes the episode under it. */
-  private async acquireAndSwap(
-    appName: string,
-    admitted: AdmittedUpdate,
-    deployId: string,
-    giveBack: () => void
-  ): Promise<boolean> {
-    let acquired: AcquiredSlot | UpdateRefused;
-    try {
-      acquired = await this.acquireSlotAndRecheck(appName, admitted, deployId);
-    } catch (error) {
-      this.reportPreBuildThrow(appName, error, deployId, admitted.trigger);
-      giveBack();
-      throw error;
-    }
-    if ('refused' in acquired) {
-      // The guardrail refusal closed its own episode (under this id); the rest
-      // do it here, keys released first so the failure is not charged.
-      if (acquired.refused !== 'guardrail') {
-        this.releaseGuardrailKeys(appName);
-        this.failDeployEpisode(
-          appName,
-          new Error(redeployRefusalOf(appName, acquired).refused.message),
-          deployId,
-          'DEPLOY_REFUSED',
-          admitted.trigger
-        );
-      }
-      giveBack();
-      return false;
-    }
-    return this.swapAndClose(appName, admitted, deployId, acquired, giveBack);
   }
 
   /** runClaimedUpdate's second phase: buildAndSwap, then whatever it left open closed, then the claim given back. */
@@ -7988,9 +8007,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
    */
   private async acquireSlotAndRecheck(
     appName: string,
-    admitted: AdmittedUpdate,
-    /** The id the deploy was already handed out under, when it was minted before the wait. */
-    deployId?: string
+    admitted: AdmittedUpdate
   ): Promise<AcquiredSlot | UpdateRefused> {
     // Wait for a builder slot BEFORE any side effect, so a redeploy queued
     // behind a full cap (a boot-reconcile burst) leaves status, build log and
@@ -8074,7 +8091,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       this.failDeployEpisode(
         appName,
         new Error(refusal),
-        deployId ?? crypto.randomUUID(),
+        crypto.randomUUID(),
         'GUARDRAIL_TRIPPED',
         admitted.trigger
       );

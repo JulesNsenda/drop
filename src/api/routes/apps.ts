@@ -1310,10 +1310,13 @@ function redeployRefusalResponse(c: Context, refusal: RedeployRefusal) {
 }
 
 // POST /apps/:name/redeploy - rebuild a FILES app from the source already on
-// disk and swap it in. 202 comes BEFORE the wait for a builder slot: the deploy
-// id is minted and its episode opened (`queued`) at acceptance, and the build
-// runs on behind it, followed at /deploys/<id>/stream. Git-backed apps and
-// monorepo groups are refused for now.
+// disk and swap it in. The platform waits up to 10s for a builder slot: in time
+// the 202 carries the deploy id; otherwise it says `accepted` and the redeploy
+// carries on in the background. Either way `follow` is the app + since stream
+// (GET /deploys/stream), NOT the by-id stream: between the mint and the build's
+// first event the deploy has no episode, and the by-id stream 404s there, while
+// the since-stream waits for it (and shows a refusal after the wait). Git-backed
+// apps and monorepo groups are refused for now.
 apps.post('/:name/redeploy', async c => {
   const auth = (c.get as Function)('auth') as AuthContext | undefined;
   const name = c.req.param('name');
@@ -1330,17 +1333,21 @@ apps.post('/:name/redeploy', async c => {
     return c.json(error(ErrorCodes.SERVICE_UNAVAILABLE, 'Platform operations unavailable'), 503);
   }
 
+  // Taken BEFORE the start, so the since-stream cannot miss an episode that
+  // opens while the platform is still deciding.
+  const acceptedAt = new Date().toISOString();
+
   // One operation: the platform reserves, admits (with the one actor, for the
-  // guardrail keys and the stopped rule alike) and starts. It answers as soon as
-  // the deploy id is minted, before any wait for a builder slot.
+  // guardrail keys and the stopped rule alike) and starts.
   const result = await ops.redeployApp(name, deployActorOf(auth), { caller: tokenCallerOf(auth) });
   if ('refused' in result) return redeployRefusalResponse(c, result.refused);
 
   await logActivityFor(auth, { action: 'redeploy', appName: name, detail: 'files' });
-  return c.json(
-    success({ deployId: result.started, follow: `/api/v1/deploys/${result.started}/stream` }),
-    202
-  );
+  const follow = `/api/v1/deploys/stream?app=${encodeURIComponent(name)}&since=${encodeURIComponent(acceptedAt)}`;
+  if ('accepted' in result) {
+    return c.json(success({ accepted: true, acceptedAt, follow }), 202);
+  }
+  return c.json(success({ deployId: result.started, acceptedAt, follow }), 202);
 });
 
 // ============ Rollback (#296) ============

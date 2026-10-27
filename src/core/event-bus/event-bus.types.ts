@@ -208,19 +208,9 @@ export type DeployTriggerTag = 'deploy' | 'hot-reload' | 'upload';
 
 // Build event payloads
 
-/**
- * A deploy accepted but not yet building (it is waiting for a builder slot).
- * The deploy tracker opens the episode under `deployId` here, in a `queued`
- * stage, and `build:started` carrying the same id continues it - so a caller
- * handed the id at acceptance can follow it from the start, and a refusal after
- * the wait closes THAT episode.
- */
 export interface BuildQueuedPayload extends BaseEvent {
   appId: string;
   buildId: string;
-  /** The id the deploy was accepted under. Without one there is nothing to open an episode for. */
-  deployId?: string;
-  trigger?: DeployTriggerTag;
 }
 
 export interface BuildStartedPayload extends BaseEvent {

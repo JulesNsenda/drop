@@ -309,12 +309,7 @@ deploys.get('/stream', async (c) => {
       getDeployTracker()
         .getEpisodes(appName)
         .find(
-          (e) =>
-            // A queued deploy has not built anything yet: the upload this follows is
-            // a different deploy, and would otherwise be mistaken for it.
-            e.status !== 'queued' &&
-            new Date(e.startedAt).getTime() >= sinceMs &&
-            canAccess(auth, { userId: e.userId })
+          (e) => new Date(e.startedAt).getTime() >= sinceMs && canAccess(auth, { userId: e.userId })
         ),
     envMs('DROP_DEPLOY_STREAM_APPEAR_MS', DEFAULT_STREAM_APPEAR_TIMEOUT_MS)
   );

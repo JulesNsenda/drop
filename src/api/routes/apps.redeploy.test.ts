@@ -90,15 +90,43 @@ describe('POST /apps/:name/redeploy', () => {
   });
 
   describe('accepted', () => {
-    it('answers 202 with the deploy id and where to follow it', async () => {
+    it('with a slot in time: 202 with the deploy id, and the app + since stream to follow it', async () => {
+      const before = Date.now();
       const res = await redeploy('site', bearer(ownerToken));
       expect(res.status).toBe(202);
       const json = await body(res);
       expect(json.success).toBe(true);
-      expect(json.data).toEqual({
-        deployId: '11111111-2222-4333-8444-555555555555',
-        follow: '/api/v1/deploys/11111111-2222-4333-8444-555555555555/stream',
+      expect(json.data.deployId).toBe('11111111-2222-4333-8444-555555555555');
+      // The by-id stream 404s between the mint and the build's first event, so
+      // both answers follow by app + since, with since taken BEFORE the start.
+      expect(json.data.follow).toBe(
+        `/api/v1/deploys/stream?app=site&since=${encodeURIComponent(json.data.acceptedAt)}`
+      );
+      expect(new Date(json.data.acceptedAt).getTime()).toBeGreaterThanOrEqual(before - 1);
+      expect(new Date(json.data.acceptedAt).getTime()).toBeLessThanOrEqual(Date.now());
+    });
+
+    it('with no slot in time: 202 accepted, with no id yet and the same follow', async () => {
+      (ops.redeployApp as jest.Mock).mockResolvedValue({ accepted: true });
+      const res = await redeploy('site', bearer(ownerToken));
+      expect(res.status).toBe(202);
+      const json = await body(res);
+      expect(json.data.accepted).toBe(true);
+      expect(json.data.deployId).toBeUndefined();
+      expect(json.data.follow).toBe(
+        `/api/v1/deploys/stream?app=site&since=${encodeURIComponent(json.data.acceptedAt)}`
+      );
+      expect(logSpy).toHaveBeenCalledWith(expect.anything(), { action: 'redeploy', appName: 'site', detail: 'files' });
+    });
+
+    it('takes acceptedAt before it starts the redeploy', async () => {
+      let atStart = 0;
+      (ops.redeployApp as jest.Mock).mockImplementation(async () => {
+        atStart = Date.now();
+        return { started: '11111111-2222-4333-8444-555555555555' };
       });
+      const json = await body(await redeploy('site', bearer(ownerToken)));
+      expect(new Date(json.data.acceptedAt).getTime()).toBeLessThanOrEqual(atStart);
     });
 
     it("makes ONE call, with the one actor and the caller's token standing as options", async () => {

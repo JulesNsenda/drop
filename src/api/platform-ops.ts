@@ -144,6 +144,12 @@ export function needsConfigDetail(err: AppNeedsConfigError, appName: string): st
  */
 export interface RedeployOptions {
   caller?: TokenCaller;
+  /**
+   * How long to wait for the build to be minted - i.e. for a builder slot -
+   * before answering `accepted` and carrying on in the background. Defaults to
+   * 10 seconds; a test lowers it.
+   */
+  waitMs?: number;
 }
 
 /** Why an explicit redeploy was refused. The route maps each code to its status. */
@@ -163,12 +169,12 @@ export interface RedeployRefusal {
 }
 
 /**
- * What an explicit redeploy came to: started (the deploy id is minted and
- * accepted, possibly still waiting for a builder slot - follow it at
- * /deploys/<id>/stream), or refused. A monorepo group is refused for now; a
+ * What an explicit redeploy came to: started (it has a builder slot and the
+ * deploy id it builds under), accepted (no slot within the wait: it carries on
+ * in the background, and has no id yet), or refused. A monorepo group is refused for now; a
  * group that appears after a git land is a later item's.
  */
-export type RedeployStart = { started: string } | { refused: RedeployRefusal };
+export type RedeployStart = { started: string } | { accepted: true } | { refused: RedeployRefusal };
 
 export interface PlatformOps {
   /**
@@ -300,12 +306,13 @@ export interface PlatformOps {
    * starts. An admitted request counts against the caller's deploy quota
    * whatever becomes of it - the quota counts volume, not outcome.
    *
-   * Resolves as soon as the deploy id is minted and accepted - BEFORE the wait
-   * for a builder slot, so a caller never waits on one. The deploy tracker
-   * opens the episode under that id (`queued`) at that moment; the build runs
-   * on, and whatever stops it, a refusal after the wait included, closes that
-   * same episode. Refusals are returned, never thrown; the slot and the breaker
-   * keys are given back on every path. Authorization is the caller's.
+   * Waits at most `options.waitMs` (10 seconds) for a builder slot. In time:
+   * `started`, with the id the build runs under (its episode follows within
+   * moments). Not in time: `accepted` - the redeploy carries on in the
+   * background, a refusal after the wait is recorded as a failed deploy
+   * (DEPLOY_REFUSED) the caller can follow, and a throw is logged. Refusals are
+   * returned, never thrown; the slot and the breaker keys are given back on
+   * every path. Authorization is the caller's.
    */
   redeployApp(appName: string, actor: DeployActorInfo, options?: RedeployOptions): Promise<RedeployStart>;
 

@@ -7,7 +7,6 @@ interface DeployTimelineProps {
 }
 
 const STAGE_LABELS: Record<DeployStageName, string> = {
-  queued: 'Queued',
   triggered: 'Detected',
   'build-started': 'Build started',
   build: 'Build',
@@ -29,8 +28,6 @@ const TRIGGER_LABELS: Record<DeployEpisodeDto['trigger'], string> = {
 const EPISODE_STATUS_TONES: Record<string, string> = {
   succeeded: 'dui-badge-ok',
   failed: 'dui-badge-err',
-  // Accepted, waiting for a builder slot: open like in-progress, but nothing is building.
-  queued: 'dui-badge-neutral',
   'in-progress': 'dui-badge-accent',
   superseded: 'dui-badge-neutral',
   interrupted: 'dui-badge-warn',
