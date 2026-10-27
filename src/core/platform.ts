@@ -6370,7 +6370,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         const enableSsl = this.config.enableHttps && !isLocalhost && !tlsDisabled;
 
         await this.router.addRoute({
-          appName: `${appName}-${hostname.replace(/\./g, '-')}`, // Unique route name per domain
+          appName: `${appName}.${hostname}`, // Unique route key per domain: app names cannot contain '.', so the first dot ends the app name
           owner: appName, // Bare owning app name — lets removeRoutesForApp find every route this app owns
           hostname,
           pathPrefix: routePathPrefix,
@@ -8185,13 +8185,13 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
   /**
    * Remove the live route for a hostname the app is no longer allowed to serve.
    *
-   * The route key is `${app}-${host with dots as dashes}` and app names may
-   * contain '-', so two apps can share a key (`behalf-behalf` on `dropkit.sh`
-   * and `behalf` on `behalf.dropkit.sh`). The key alone therefore proves
-   * nothing: only a route this app owns, on exactly this hostname, is removed.
+   * The route key is `${app}.${host}`; app names cannot contain '.', so keys
+   * of different apps cannot collide. The old scheme (`${app}-${host with dots
+   * as dashes}`) was ambiguous, so the owner and hostname are still checked:
+   * only a route this app owns, on exactly this hostname, is removed.
    */
   private async pruneRoute(appName: string, hostname: string): Promise<void> {
-    const routeKey = `${appName}-${hostname.replace(/\./g, '-')}`;
+    const routeKey = `${appName}.${hostname}`;
     const route = this.router?.getRoute(routeKey);
     if (!route || route.owner !== appName) return;
     if (route.hostname?.toLowerCase() !== hostname.toLowerCase()) return;

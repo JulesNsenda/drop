@@ -13,6 +13,7 @@ import * as path from 'path';
 import * as os from 'os';
 import * as fs from 'fs/promises';
 import { DropPlatform, createPlatform } from './platform';
+import { RouterService } from './router';
 
 describe('handleConfigureRoute: dashboard custom domain (#302)', () => {
   let platform: DropPlatform;
@@ -58,7 +59,7 @@ describe('handleConfigureRoute: dashboard custom domain (#302)', () => {
     hasRoute = jest.fn().mockReturnValue(true);
     // pruneRoute removes only a route this app owns, for the hostname it names.
     getRoute = jest.fn((key: string) =>
-      key === 'site-old-example-com' ? { owner: 'site', hostname: 'old.example.com' } : undefined
+      key === 'site.old.example.com' ? { owner: 'site', hostname: 'old.example.com' } : undefined
     );
     updateSystemConfig = jest.fn().mockResolvedValue(undefined);
     owners = new Map([['site.dropkit.sh', 'site']]);
@@ -105,7 +106,7 @@ describe('handleConfigureRoute: dashboard custom domain (#302)', () => {
     await (platform as any).handleConfigureRoute('site', 4100);
 
     expect(routedHosts()).toEqual(['site.dropkit.sh']);
-    expect(removeRoute).toHaveBeenCalledWith('site-old-example-com');
+    expect(removeRoute).toHaveBeenCalledWith('site.old.example.com');
     expect(updateSystemConfig).toHaveBeenCalledWith('site', { customDomainVerified: undefined });
   });
 
@@ -114,7 +115,7 @@ describe('handleConfigureRoute: dashboard custom domain (#302)', () => {
 
     await (platform as any).handleConfigureRoute('site', 4100);
 
-    expect(removeRoute).toHaveBeenCalledWith('site-old-example-com');
+    expect(removeRoute).toHaveBeenCalledWith('site.old.example.com');
     expect(updateSystemConfig).toHaveBeenCalledWith('site', { customDomainVerified: undefined });
   });
 
@@ -125,5 +126,79 @@ describe('handleConfigureRoute: dashboard custom domain (#302)', () => {
     await (platform as any).handleConfigureRoute('site', 4100);
 
     expect(routedHosts()).toEqual(['site.dropkit.sh']);
+  });
+});
+
+describe('handleConfigureRoute: route keys are unambiguous across apps', () => {
+  let platform: DropPlatform;
+  let appsDir: string;
+  let router: RouterService;
+
+  const internals = () => platform as unknown as Record<string, unknown>;
+
+  async function declareDomains(app: string, domains: string[]): Promise<void> {
+    await fs.mkdir(path.join(appsDir, app), { recursive: true });
+    await fs.writeFile(
+      path.join(appsDir, app, 'drop.yaml'),
+      `domains:\n${domains.map((d) => `  - ${d}\n`).join('')}`
+    );
+  }
+
+  const hostsOf = (owner: string) =>
+    router
+      .getRoutes()
+      .filter((r) => r.owner === owner)
+      .map((r) => r.hostname);
+
+  beforeEach(async () => {
+    appsDir = await fs.mkdtemp(path.join(os.tmpdir(), 'drop-route-keys-'));
+    platform = createPlatform({
+      dropRoot: appsDir,
+      appsDirectory: appsDir,
+      logLevel: 'error',
+      domainSuffix: 'dropkit.sh',
+      enableHttps: true,
+    });
+    router = new RouterService({ caddy: { caddyfilePath: path.join(appsDir, 'Caddyfile') } });
+    internals().router = router;
+    internals().caddyServer = undefined;
+    internals().stateManager = {
+      getApp: jest.fn((name: string) => ({ name })),
+      setAccessGateUnapplied: jest.fn().mockResolvedValue(undefined),
+    };
+    internals().appConfigService = {
+      getConfig: jest.fn(() => ({})),
+      updateConfig: jest.fn().mockResolvedValue(undefined),
+      updateSystemConfig: jest.fn().mockResolvedValue(undefined),
+      getDomainOwners: jest.fn(() => new Map()),
+    };
+  });
+
+  afterEach(async () => {
+    await fs.rm(appsDir, { recursive: true, force: true });
+  });
+
+  it('keeps both routes when a dashed app name and a dotted host would have shared a key', async () => {
+    // Both used to key as 'behalf-behalf-dropkit-sh'.
+    await declareDomains('behalf-behalf', ['dropkit-sh']);
+
+    await (platform as any).handleConfigureRoute('behalf', 4100);
+    await (platform as any).handleConfigureRoute('behalf-behalf', 4200);
+
+    expect(hostsOf('behalf')).toEqual(['behalf.dropkit.sh']);
+    expect(hostsOf('behalf-behalf')).toEqual(['dropkit-sh']);
+    expect(router.getRoute('behalf.behalf.dropkit.sh')?.upstream).toBe('localhost:4100');
+  });
+
+  it('keeps both routes when the split between app name and host is the only difference', async () => {
+    // 'shop' + 'www.example.com' and 'shop-www' + 'example.com' used to collide.
+    await declareDomains('shop', ['www.example.com']);
+    await declareDomains('shop-www', ['example.com']);
+
+    await (platform as any).handleConfigureRoute('shop', 4100);
+    await (platform as any).handleConfigureRoute('shop-www', 4200);
+
+    expect(hostsOf('shop')).toEqual(['www.example.com']);
+    expect(hostsOf('shop-www')).toEqual(['example.com']);
   });
 });

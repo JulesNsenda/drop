@@ -95,6 +95,22 @@ export class RouterService {
     const { appName } = routeConfig;
     const existing = this.routes.get(appName);
 
+    // A key is only ever re-described by the route's own owner, for the same
+    // hostname. Anything else is a different route that happens to share the
+    // key, and replacing it would silently take the first one offline.
+    if (
+      existing &&
+      (existing.owner !== routeConfig.owner ||
+        existing.hostname.toLowerCase() !== routeConfig.hostname.toLowerCase())
+    ) {
+      console.warn(
+        `[router] Refusing to replace route '${appName}' (owner ${existing.owner ?? 'none'}, ` +
+          `host ${existing.hostname}) with one for owner ${routeConfig.owner ?? 'none'}, ` +
+          `host ${routeConfig.hostname}`
+      );
+      return existing;
+    }
+
     // Apply defaults
     const config = this.applyDefaults(routeConfig);
 

@@ -54,7 +54,7 @@ export interface RouteConfig {
   appName: string;
   /**
    * The bare owning app name (e.g. "myapp"), as distinct from `appName`
-   * above, which is a per-domain route key (`${owner}-${hostname}`) — one app
+   * above, which is a per-domain route key (`${owner}.${hostname}`) — one app
    * can own several routes (one per custom domain). Used by
    * `RouterService.removeRoutesForApp` to remove every route an app owns
    * without needing to know its per-domain keys. Optional for backward

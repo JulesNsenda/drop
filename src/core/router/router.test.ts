@@ -450,14 +450,53 @@ describe('RouterService', () => {
       // Adding same app again should update, not throw
       const updatedRoute = await router.addRoute({
         appName: 'test-app',
-        hostname: 'test2.example.com',
+        hostname: 'TEST.example.com',
         upstream: 'localhost:3001',
         ssl: false,
         redirectHttps: false,
       });
 
-      expect(updatedRoute.hostname).toBe('test2.example.com');
+      expect(updatedRoute.hostname).toBe('TEST.example.com');
       expect(updatedRoute.upstream).toBe('localhost:3001');
+    });
+
+    describe('shared route key', () => {
+      const route = (owner: string | undefined, hostname: string, upstream: string) => ({
+        appName: 'shared-key',
+        owner,
+        hostname,
+        upstream,
+        ssl: false,
+        redirectHttps: false,
+      });
+
+      beforeEach(() => {
+        jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+      });
+
+      it('refuses to replace a route owned by another app', async () => {
+        const router = new RouterService({ caddy: { caddyfilePath: testCaddyfilePath } });
+        await router.addRoute(route('behalf', 'behalf.dropkit.sh', 'localhost:3000'));
+        mockFs.writeFile.mockClear();
+
+        const result = await router.addRoute(route('other', 'behalf.dropkit.sh', 'localhost:4000'));
+
+        expect(result.owner).toBe('behalf');
+        expect(router.getRoute('shared-key')?.upstream).toBe('localhost:3000');
+        expect(console.warn).toHaveBeenCalledWith(expect.stringContaining('Refusing to replace'));
+        expect(mockFs.writeFile).not.toHaveBeenCalled();
+      });
+
+      it('refuses to replace a route for a different hostname, case-insensitively', async () => {
+        const router = new RouterService({ caddy: { caddyfilePath: testCaddyfilePath } });
+        await router.addRoute(route('behalf', 'behalf.dropkit.sh', 'localhost:3000'));
+
+        await router.addRoute(route('behalf', 'elsewhere.dropkit.sh', 'localhost:4000'));
+        expect(router.getRoute('shared-key')?.hostname).toBe('behalf.dropkit.sh');
+
+        await router.addRoute(route('behalf', 'BEHALF.dropkit.sh', 'localhost:5000'));
+        expect(router.getRoute('shared-key')?.upstream).toBe('localhost:5000');
+      });
     });
 
     it('should write Caddyfile after adding route', async () => {
