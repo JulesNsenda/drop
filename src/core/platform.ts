@@ -161,11 +161,9 @@ import {
   type DetachServiceOutcome,
   type DetachServiceResult,
   type DetachServiceRestartOutcome,
-  RedeployRefusedError,
   type RedeployRefusal,
   type RedeployStart,
-  type RedeployPrepare,
-  type QueuedDeploy,
+  type RedeployOptions,
 } from '../api/platform-ops';
 import { planSecretPreflight, generateSecretValue } from '../managers/secret/secret-preflight';
 import { Logger, createLogger } from '../utils/logger';
@@ -852,7 +850,7 @@ interface AcquiredSlot {
 }
 
 /** Why acquireSlotAndRecheck declined to go on; the claim's holder gives the claim back. */
-type UpdateRefusal = 'quiesced' | 'busy' | 'gone' | 'stopped' | 'disk' | 'guardrail';
+type UpdateRefusal = 'quiesced' | 'busy' | 'group-busy' | 'gone' | 'stopped' | 'disk' | 'guardrail';
 
 /** A refusal from acquireSlotAndRecheck: the reason, and how long to wait when it is a tripped breaker. */
 type UpdateRefused = { refused: UpdateRefusal; retryAfterSeconds?: number };
@@ -881,6 +879,11 @@ function redeployRefusalOf(appName: string, refused: UpdateRefused): { refused: 
       return redeployRefusal(
         'APP_BUSY',
         `Application '${appName}' is being updated by a git pull or an upload - retry once it settles`
+      );
+    case 'group-busy':
+      return redeployRefusal(
+        'APP_BUSY',
+        `Application '${appName}' belongs to a monorepo group that became busy - retry once it settles`
       );
     case 'gone':
       return redeployRefusal('NOT_FOUND', `Application '${appName}' not found`);
@@ -1041,14 +1044,6 @@ export class DropPlatform {
    * claim.
    */
   private readonly holdOwners: Map<string, object> = new Map();
-  /**
-   * Explicit redeploys accepted (their id handed out) but not yet built: the
-   * id is minted before the wait for a builder slot, so the deploys routes
-   * need to know it is real while the tracker has no episode for it yet. An
-   * entry goes when its deploy settles; the episode (a refusal closes one under
-   * the same id) is by then recorded.
-   */
-  private readonly queuedDeploys: Map<string, QueuedDeploy> = new Map();
   // Builds deferred because the concurrent-build cap was full (appName -> its
   // path + type hint). A first-boot or single-drop burst can briefly saturate
   // the cap — in docker mode especially, where a first-time base-image pull
@@ -1490,6 +1485,10 @@ export class DropPlatform {
       }
     }
     this.appsInProgress.clear();
+    // The reservations go with the claims they back: a stale owner entry would
+    // refuse to free the next owner's.
+    this.holdOwners.clear();
+    this.gitReserved.clear();
 
     if (this.router) {
       this.router.stop();
@@ -2514,8 +2513,7 @@ backup:
       restartApp: (name) => this.restartApp(name),
       isAppInProgress: (name) => this.isBusy(name),
       tryReserveApp: (name) => this.tryReserveApp(name),
-      redeployApp: (name, actor, prepare) => this.redeployApp(name, actor, prepare),
-      getQueuedDeploy: (id) => this.queuedDeploys.get(id),
+      redeployApp: (name, actor, options) => this.redeployApp(name, actor, options),
       isGroupBusy: (name) => this.isGroupBusy(name),
       hasLiveBuildContainer: (name) => this.hasLiveBuildContainer(name),
       objectStorageDeleteRisk: (name) => this.objectStorageDeleteRisk(name),
@@ -5703,7 +5701,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
      * environment, or drop.yaml") sends the caller to look at something that is
      * not wrong.
      */
-    code?: 'GUARDRAIL_TRIPPED' | 'QUOTA_EXCEEDED',
+    code?: 'GUARDRAIL_TRIPPED' | 'QUOTA_EXCEEDED' | 'DEPLOY_REFUSED',
     /** What started the deploy, so a pre-build failure's episode carries it like a built one does. */
     trigger?: DeployTriggerTag
   ): void {
@@ -7675,22 +7673,24 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
    *
    *  1. take the app's slot (a hold), synchronously;
    *  2. under it, check the app is a files app and may be rebuilt (see
-   *     checkRedeployable), then run `prepare` if there is one and look at what
-   *     the folder is NOW (a git land can turn it into a monorepo group);
+   *     checkRedeployable). Git-backed apps and monorepo groups are refused
+   *     here for now: the git path will land the repository under this same
+   *     hold, by class, using `options.caller`;
    *  3. consume the hold, set the breaker keys (their lifetime is the hold's),
-   *     mint the deploy id, register it as queued and start the build WITHOUT
-   *     waiting for a builder slot - the caller gets the id at once;
+   *     mint the deploy id, announce it (`build:queued`: the deploy tracker
+   *     opens the episode under it) and start the build WITHOUT waiting for a
+   *     builder slot - the caller gets the id at once;
    *  4. the build runs on and closes its own outcome; a refusal after the wait
-   *     closes the episode under the same id.
+   *     closes the same episode.
    *
    * The hold is released in the finally until step 3 consumes it, so every
-   * earlier exit - a refusal, a throwing `prepare`, any error - gives the slot
-   * back exactly once and leaves no key behind. Authorization is the caller's.
+   * earlier exit - a refusal, any error - gives the slot back exactly once and
+   * leaves no key behind. Authorization is the caller's.
    */
   private async redeployApp(
     appName: string,
     actor: DeployActorInfo,
-    prepare?: RedeployPrepare
+    _options: RedeployOptions = {}
   ): Promise<RedeployStart> {
     if (!this.runtime || !this.stateManager || !this.detector || !this.builder) {
       return redeployRefusal('SERVICE_UNAVAILABLE', 'The platform is not ready to deploy');
@@ -7708,24 +7708,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     try {
       const checked = await this.checkRedeployable(appName, actor);
       if ('refused' in checked) return checked;
-      let appState = checked.appState;
-
-      if (prepare) {
-        try {
-          await prepare({ app: appName, beginLand: hold.beginLand, endLand: hold.endLand });
-        } catch (error) {
-          if (error instanceof RedeployRefusedError) return { refused: error.refusal };
-          throw error;
-        }
-        // The land is over, and it may have changed what this folder is.
-        hold.endLand();
-        const after = this.stateManager.getApp(appName);
-        if (!after) return redeployRefusal('NOT_FOUND', `Application '${appName}' not found`);
-        if ((await this.redeployClassOf(after, this.sourcePathOf(appName))) === 'container') {
-          return { group: { container: appName } };
-        }
-        appState = after;
-      }
+      const appState = checked.appState;
 
       const releaseClaim = hold.consume();
       if (!releaseClaim) {
@@ -7736,7 +7719,6 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       try {
         this.breakerKeys.set(appName, this.guardrailKeys(appName, false, actor));
         const deployId = crypto.randomUUID();
-        this.queuedDeploys.set(deployId, { appName, userId: appState.userId });
         const admitted: AdmittedUpdate = {
           appPath: this.sourcePathOf(appName),
           statusAtEntry: appState.status,
@@ -7746,21 +7728,26 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           trigger: 'deploy',
           groupGuard: true,
         };
+        // Accepted: the tracker opens the episode under this id now, so it can
+        // be followed from here and a refusal after the wait closes it.
+        eventBus.publish('build:queued', {
+          appId: appName,
+          buildId: `deploy-${appName}-${Date.now()}`,
+          deployId,
+          trigger: 'deploy',
+        });
         const update = await this.runClaimedUpdate(appName, admitted, releaseClaim, deployId);
         if (!('started' in update)) {
           // The early form always starts; this keeps the type honest.
-          this.queuedDeploys.delete(deployId);
           return redeployRefusalOf(appName, update);
         }
         this.logger.info(`Explicit redeploy of ${appName} accepted (${deployId})`, 'UPDATE');
         // Nobody awaits `done`: its rejection (the failure handler itself
         // throwing) is logged here, after the outcome was closed, so it is never
-        // unhandled; the queued entry goes when the deploy settles.
-        update.done
-          .catch((error) =>
-            this.logger.error(`Redeploy of ${appName} failed while reporting its outcome`, 'UPDATE', error)
-          )
-          .finally(() => this.queuedDeploys.delete(deployId));
+        // unhandled.
+        update.done.catch((error) =>
+          this.logger.error(`Redeploy of ${appName} failed while reporting its outcome`, 'UPDATE', error)
+        );
         return { started: deployId };
       } catch (error) {
         releaseClaim();
@@ -7785,8 +7772,10 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
   /**
    * redeployApp's checks, run under the hold: the app exists and is a files app
    * (git-backed apps and monorepo groups are refused for now), nothing around it
-   * is busy, the stopped rule, disk, and ONE admission with the one actor. Disk
-   * comes before the admission so a refused request never burns quota.
+   * is busy, the stopped rule, disk, and ONE admission with the one actor.
+   * Disk comes before the admission, so a request refused for want of disk is
+   * not counted. An ADMITTED request counts against the caller's quota whatever
+   * becomes of it - the quota counts volume, not outcome (principal-quota).
    */
   private async checkRedeployable(
     appName: string,
@@ -7936,7 +7925,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           appName,
           new Error(redeployRefusalOf(appName, acquired).refused.message),
           deployId,
-          undefined,
+          'DEPLOY_REFUSED',
           admitted.trigger
         );
       }
@@ -8037,7 +8026,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         'UPDATE'
       );
       releaseSlot();
-      return { refused: 'busy' };
+      return { refused: 'group-busy' };
     }
     // Removed, or stopped by the user since entry, while waiting. An explicit
     // redeploy of an app that was ALREADY stopped at entry (rebuildsStaleTree)

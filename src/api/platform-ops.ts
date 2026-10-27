@@ -21,6 +21,7 @@ import type { RollbackSnapshotMeta } from '../managers/rollback';
 import type { AttachableServiceId, AttachServiceResult, DetachServiceResult } from './services-wire.types';
 import type { AccessGateVerdict } from '../managers/guardrail/access-gate';
 import type { DeployActorInfo } from '../managers/guardrail/deploy-breaker';
+import type { TokenCaller } from '../core/git-deploy/git-deploy.types';
 
 /**
  * The attach/detach wire contract itself lives in `services-wire.types.ts` —
@@ -136,19 +137,14 @@ export function needsConfigDetail(err: AppNeedsConfigError, appName: string): st
 }
 
 /**
- * What a `prepare` step may do with the reservation it runs under: mark the
- * span in which it is writing the app's folder (so a build is deferred, not
- * started, while it lands). It cannot release or hand the reservation on; the
- * platform owns both.
+ * What the caller brings to a redeploy beyond the app and who is asking. The
+ * platform interprets it: `caller` is who may use which stored git token, for
+ * the git path (which lands the repository under the reservation before it
+ * builds). The files path ignores it.
  */
-export interface RedeployHold {
-  readonly app: string;
-  beginLand(): void;
-  endLand(): void;
+export interface RedeployOptions {
+  caller?: TokenCaller;
 }
-
-/** Runs under the reservation, after admission and before the build is minted (a git land, later). */
-export type RedeployPrepare = (hold: RedeployHold) => Promise<void>;
 
 /** Why an explicit redeploy was refused. The route maps each code to its status. */
 export type RedeployRefusalCode =
@@ -166,31 +162,13 @@ export interface RedeployRefusal {
   retryAfterSeconds?: number;
 }
 
-/** Thrown by a `prepare` step to refuse the redeploy; the platform returns the refusal and releases everything. */
-export class RedeployRefusedError extends Error {
-  constructor(readonly refusal: RedeployRefusal) {
-    super(refusal.message);
-    this.name = 'RedeployRefusedError';
-  }
-}
-
 /**
  * What an explicit redeploy came to: started (the deploy id is minted and
  * accepted, possibly still waiting for a builder slot - follow it at
- * /deploys/<id>), a monorepo group (the container to follow per child), or
- * refused.
+ * /deploys/<id>/stream), or refused. A monorepo group is refused for now; a
+ * group that appears after a git land is a later item's.
  */
-export type RedeployStart =
-  | { started: string }
-  | { group: { container: string } }
-  | { refused: RedeployRefusal };
-
-/** A deploy accepted but not yet built, as the deploys routes need it: whose it is. */
-export interface QueuedDeploy {
-  appName: string;
-  /** The app's owner when it was accepted, for the same snapshot-based tenant filter episodes use. */
-  userId?: string;
-}
+export type RedeployStart = { started: string } | { refused: RedeployRefusal };
 
 export interface PlatformOps {
   /**
@@ -318,23 +296,18 @@ export interface PlatformOps {
    * ONE operation, and the reservation never leaves the platform: it takes the
    * app's slot, decides under it that the app exists, is a files app (git-backed
    * apps and monorepo groups are refused for now), is not busy, passes the
-   * stopped rule, has disk and is admitted by the deploy guardrails (once,
-   * charging the caller's quota), runs `prepare` if there is one, and starts.
+   * stopped rule, has disk and is admitted by the deploy guardrails (once), and
+   * starts. An admitted request counts against the caller's deploy quota
+   * whatever becomes of it - the quota counts volume, not outcome.
    *
    * Resolves as soon as the deploy id is minted and accepted - BEFORE the wait
-   * for a builder slot, so a caller never waits on one. The build runs on, and
-   * whatever stops it (a refusal after the wait included) closes the episode
-   * under that same id. Refusals are returned, never thrown; the slot and the
-   * breaker keys are given back on every path. Authorization is the caller's.
+   * for a builder slot, so a caller never waits on one. The deploy tracker
+   * opens the episode under that id (`queued`) at that moment; the build runs
+   * on, and whatever stops it, a refusal after the wait included, closes that
+   * same episode. Refusals are returned, never thrown; the slot and the breaker
+   * keys are given back on every path. Authorization is the caller's.
    */
-  redeployApp(appName: string, actor: DeployActorInfo, prepare?: RedeployPrepare): Promise<RedeployStart>;
-
-  /**
-   * An accepted deploy that has no episode yet (still waiting for its builder
-   * slot), or undefined. Read-only: lets the deploys routes answer `queued`
-   * instead of 404 for an id the caller was just handed.
-   */
-  getQueuedDeploy(deployId: string): QueuedDeploy | undefined;
+  redeployApp(appName: string, actor: DeployActorInfo, options?: RedeployOptions): Promise<RedeployStart>;
 
   /**
    * Whether any app in the same monorepo group as `appName` is busy in a way

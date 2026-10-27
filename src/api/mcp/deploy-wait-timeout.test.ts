@@ -72,6 +72,32 @@ describe('waitForDeployOutcome when the budget expires (#265)', () => {
     expect(text).toContain('still building');
   });
 
+  it('does NOT correlate with an episode still queued for a builder slot (an explicit redeploy\'s)', async () => {
+    // Newest, and started after this deploy was accepted - but it has built
+    // nothing, and is a different deploy from the upload being waited on.
+    episodes.push({
+      deployId: 'dep-queued',
+      appName: 'my-app',
+      trigger: 'deploy',
+      status: 'queued',
+      startedAt: '2026-08-30T10:00:02.000Z',
+      stages: [],
+    });
+    episodes.push({
+      deployId: 'dep-mine',
+      appName: 'my-app',
+      trigger: 'upload',
+      status: 'in-progress',
+      startedAt: STARTED_AT,
+      stages: [],
+    });
+
+    const text = textOf(await waitForDeployOutcome('my-app', ACCEPTED_AT, true));
+
+    expect(text).toContain('dep-mine');
+    expect(text).not.toContain('dep-queued');
+  });
+
   it('does NOT invent an id when no episode correlates with this deploy', async () => {
     // Present, but started BEFORE this deploy was accepted — a previous run.
     // Reporting its id would hand back another deploy's output labelled as

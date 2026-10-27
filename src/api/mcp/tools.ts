@@ -355,7 +355,11 @@ export async function waitForDeployOutcome(
       return awaitingPromotionResult(appName);
     }
 
-    const [episode] = getDeployTracker().getEpisodes(appName, 1);
+    // The newest episode that has STARTED: one still queued for a builder slot
+    // (an explicit redeploy's) is a different deploy from the one just accepted.
+    const episode = getDeployTracker()
+      .getEpisodes(appName)
+      .find((e) => e.status !== 'queued');
     if (episode && new Date(episode.startedAt).getTime() >= acceptedAtMs) {
       correlated = episode;
       if (episode.status === 'succeeded') return successResult(appName, isNew);

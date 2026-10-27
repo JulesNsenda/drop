@@ -101,22 +101,14 @@ describe('POST /apps/:name/redeploy', () => {
       });
     });
 
-    it('makes ONE call, with the one actor and no prepare step', async () => {
+    it("makes ONE call, with the one actor and the caller's token standing as options", async () => {
       await redeploy('site', bearer(ownerToken));
       expect(ops.redeployApp).toHaveBeenCalledTimes(1);
-      const [name, actor, prepare] = (ops.redeployApp as jest.Mock).mock.calls[0];
+      const [name, actor, options] = (ops.redeployApp as jest.Mock).mock.calls[0];
       expect(name).toBe('site');
       expect(actor).toMatchObject({ actorUserId: ownerId, agent: false });
       expect(actor.principalId).toBeDefined();
-      expect(prepare).toBeUndefined();
-    });
-
-    it('answers 202 with the group when the platform says the folder is a monorepo group', async () => {
-      (ops.redeployApp as jest.Mock).mockResolvedValue({ group: { container: 'site' } });
-      const res = await redeploy('site', bearer(ownerToken));
-      expect(res.status).toBe(202);
-      expect((await body(res)).data).toEqual({ group: true, container: 'site' });
-      expect(logSpy).toHaveBeenCalledWith(expect.anything(), { action: 'redeploy', appName: 'site', detail: 'group' });
+      expect(options).toEqual({ caller: { admin: false, userId: ownerId } });
     });
 
     it('marks an agent token as an agent', async () => {

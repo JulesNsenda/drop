@@ -13,7 +13,7 @@ import { pipeline } from 'stream/promises';
 import { success, error, ErrorCodes, AppDto, CreateAppDto } from '../types';
 import { NotFoundError, ValidationError } from '../middleware/error';
 import { AuthContext, listUsers, getUserById } from '../middleware/auth';
-import { canAccess, canAccessScoped, interactiveSessionOnly } from '../access';
+import { canAccess, canAccessScoped, interactiveSessionOnly, tokenCallerOf } from '../access';
 import { isValidAppName, validateAppName } from '../middleware/validate';
 import { getAppRuntime } from '../../managers/runtime';
 import {
@@ -1310,9 +1310,10 @@ function redeployRefusalResponse(c: Context, refusal: RedeployRefusal) {
 }
 
 // POST /apps/:name/redeploy - rebuild a FILES app from the source already on
-// disk and swap it in. Resolves 202 once the build is minted (after the wait
-// for a builder slot); the build runs on behind it and is followed at
-// /deploys/<id>/stream. Git-backed apps and monorepo groups are refused for now.
+// disk and swap it in. 202 comes BEFORE the wait for a builder slot: the deploy
+// id is minted and its episode opened (`queued`) at acceptance, and the build
+// runs on behind it, followed at /deploys/<id>/stream. Git-backed apps and
+// monorepo groups are refused for now.
 apps.post('/:name/redeploy', async c => {
   const auth = (c.get as Function)('auth') as AuthContext | undefined;
   const name = c.req.param('name');
@@ -1332,13 +1333,8 @@ apps.post('/:name/redeploy', async c => {
   // One operation: the platform reserves, admits (with the one actor, for the
   // guardrail keys and the stopped rule alike) and starts. It answers as soon as
   // the deploy id is minted, before any wait for a builder slot.
-  const result = await ops.redeployApp(name, deployActorOf(auth));
+  const result = await ops.redeployApp(name, deployActorOf(auth), { caller: tokenCallerOf(auth) });
   if ('refused' in result) return redeployRefusalResponse(c, result.refused);
-
-  if ('group' in result) {
-    await logActivityFor(auth, { action: 'redeploy', appName: name, detail: 'group' });
-    return c.json(success({ group: true, container: result.group.container }), 202);
-  }
 
   await logActivityFor(auth, { action: 'redeploy', appName: name, detail: 'files' });
   return c.json(

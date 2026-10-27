@@ -22,9 +22,13 @@ import { eventBus } from './event-bus';
 import * as breakerModule from '../managers/guardrail/deploy-breaker';
 import { getDeployBreaker, resetDeployBreaker } from '../managers/guardrail/deploy-breaker';
 import { getPrincipalQuota, resetPrincipalQuota } from '../managers/guardrail/principal-quota';
-import { getDeployTracker, resetDeployTracker } from '../managers/deploy-tracker';
+import {
+  getDeployTracker,
+  resetDeployTracker,
+  getDeployDetailStore,
+  resetDeployDetailStore,
+} from '../managers/deploy-tracker';
 import { hasEnoughDisk } from '../utils/disk';
-import { RedeployRefusedError } from '../api/platform-ops';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
@@ -45,11 +49,11 @@ describe('explicit redeploy: reservation, group rule, redeployApp', () => {
 
   const p = () => platform as any;
   const tick = (ms = 10) => new Promise((resolve) => setTimeout(resolve, ms));
-  /** Until the deploy has settled: nothing held, nothing queued. */
+  /** Until the deploy has settled: nothing held. */
   const settle = async (): Promise<void> => {
     for (
       let i = 0;
-      i < 300 && (p().appsInProgress.has(appName) || p().holdOwners.has(appName) || p().queuedDeploys.size > 0);
+      i < 300 && (p().appsInProgress.has(appName) || p().holdOwners.has(appName));
       i++
     ) {
       await tick();
@@ -67,6 +71,7 @@ describe('explicit redeploy: reservation, group rule, redeployApp', () => {
   beforeEach(async () => {
     resetDeployBreaker();
     resetDeployTracker();
+    resetDeployDetailStore();
     process.env.DROP_MIN_FREE_DISK_MB = '500';
     (hasEnoughDisk as jest.Mock).mockResolvedValue({ ok: true, freeMb: 999999 });
     tempDir = path.join(os.tmpdir(), `drop-explicit-redeploy-${Date.now()}-${Math.random()}`);
@@ -96,8 +101,15 @@ describe('explicit redeploy: reservation, group rule, redeployApp', () => {
         reserveEffect?.();
         return () => undefined;
       }),
-      build: jest.fn(async (ctx: unknown) => {
+      build: jest.fn(async (ctx: { deployId?: string; trigger?: string }) => {
         buildCtxs.push(ctx);
+        // What the real BuilderService publishes once it holds the slot.
+        eventBus.publish('build:started', {
+          appId: appName,
+          buildId: 'b-1',
+          deployId: ctx.deployId,
+          trigger: ctx.trigger as 'deploy',
+        });
         await buildGate;
         return { success: true, duration: 12, outputPath: null };
       }),
@@ -144,7 +156,9 @@ describe('explicit redeploy: reservation, group rule, redeployApp', () => {
 
     const tracker = getDeployTracker(path.join(tempDir, 'deploys.json'));
     await tracker.initialize();
-    unsubs = [tracker.subscribe(eventBus)];
+    const details = getDeployDetailStore(path.join(tempDir, 'deploy-details.json'));
+    await details.initialize();
+    unsubs = [tracker.subscribe(eventBus), details.subscribe(eventBus)];
   });
 
   afterEach(async () => {
@@ -434,12 +448,16 @@ describe('explicit redeploy: reservation, group rule, redeployApp', () => {
       const out = await p().redeployApp(appName, actor);
       expect(out.started).toMatch(UUID);
 
-      // Accepted, queued, claimed and keyed - and nothing has started building.
-      expect(p().queuedDeploys.get(out.started)).toEqual({ appName, userId: 'owner-1' });
+      // Accepted, claimed and keyed - and nothing has started building. The
+      // tracker already has the episode, under the id just handed out.
       expect(p().appsInProgress.has(appName)).toBe(true);
       expect(p().breakerKeys.has(appName)).toBe(true);
-      expect(episodeOf(out.started)).toBeUndefined();
       expect(buildCtxs).toHaveLength(0);
+      const queued = episodeOf(out.started)!;
+      expect(queued.status).toBe('queued');
+      expect(queued.trigger).toBe('deploy');
+      expect(queued.stages.map((s) => s.stage)).toEqual(['queued']);
+      expect(getDeployTracker().hasOpenEpisode(appName)).toBe(true);
 
       freeSlot();
       for (let i = 0; i < 300 && buildCtxs.length === 0; i++) await tick();
@@ -448,8 +466,26 @@ describe('explicit redeploy: reservation, group rule, redeployApp', () => {
       expect(buildCtxs[0].trigger).toBe('deploy');
       await settle();
       expectNothingHeld();
-      expect(p().queuedDeploys.size).toBe(0);
       expect(p().runtime.start).toHaveBeenCalledTimes(1);
+    });
+
+    it('build:started continues the SAME episode: building, not queued, one episode', async () => {
+      let open!: () => void;
+      buildGate = new Promise<void>((resolve) => (open = resolve));
+      slotGate = new Promise<void>((resolve) => setTimeout(resolve, 20));
+      const out = await p().redeployApp(appName, actor);
+      expect(episodeOf(out.started)!.status).toBe('queued');
+
+      for (let i = 0; i < 300 && buildCtxs.length === 0; i++) await tick();
+      const building = episodeOf(out.started)!;
+      expect(building.status).toBe('in-progress');
+      expect(building.stages.map((s) => s.stage)).toEqual(['queued', 'build-started']);
+      expect(getDeployTracker().getEpisodes(appName)).toHaveLength(1);
+      // The episode began when it was accepted, not when the slot freed.
+      expect(new Date(building.startedAt).getTime()).toBeLessThan(new Date(building.stages[1].at).getTime() + 1);
+
+      open();
+      await settle();
     });
 
     it('holds the claim while the build runs, and gives it back when it settles', async () => {
@@ -458,30 +494,31 @@ describe('explicit redeploy: reservation, group rule, redeployApp', () => {
       const out = await p().redeployApp(appName, actor);
       for (let i = 0; i < 300 && buildCtxs.length === 0; i++) await tick();
       expect(p().appsInProgress.has(appName)).toBe(true);
-      expect(p().queuedDeploys.has(out.started)).toBe(true);
+      expect(episodeOf(out.started)!.status).toBe('in-progress');
       open();
       await settle();
       expectNothingHeld();
     });
 
-    it('sets the breaker keys only after the hold is consumed', async () => {
-      let during: boolean | undefined;
+    it('sets the breaker keys once the hold is consumed, and a refusal before that sets none', async () => {
       let slotHeld!: () => void;
       slotGate = new Promise<void>((resolve) => (slotHeld = resolve));
-      const out = await p().redeployApp(appName, actor, async () => {
-        during = p().breakerKeys.has(appName);
-      });
-      expect(during).toBe(false);
+      const out = await p().redeployApp(appName, actor);
       expect(p().breakerKeys.get(appName)).toEqual(p().guardrailKeys(appName, false, actor));
       slotHeld();
       await settle();
       expect(out.started).toMatch(UUID);
+
+      (hasEnoughDisk as jest.Mock).mockResolvedValue({ ok: false, freeMb: 1 });
+      const refused = await p().redeployApp(appName, actor);
+      expect(refused.refused.code).toBe('INSUFFICIENT_DISK');
+      expect(p().breakerKeys.has(appName)).toBe(false);
     });
 
     it.each([
       ['quiesced', () => (reserveEffect = () => jest.spyOn(p(), 'isQuiesced').mockReturnValue(true))],
       ['busy', () => (reserveEffect = () => p().gitReserved.add(appName))],
-      ['group busy', () => (reserveEffect = () => jest.spyOn(p(), 'isGroupBusy').mockReturnValue(true))],
+      ['group-busy', () => (reserveEffect = () => jest.spyOn(p(), 'isGroupBusy').mockReturnValue(true))],
       ['gone', () => (reserveEffect = () => (appState = undefined))],
       ['stopped', () => (reserveEffect = () => (appState = { ...appState, status: 'stopped' }))],
       [
@@ -495,7 +532,7 @@ describe('explicit redeploy: reservation, group rule, redeployApp', () => {
         'guardrail',
         () => jest.spyOn(p(), 'checkGuardrails').mockReturnValue({ allowed: false, failures: 3, retryAfterSeconds: 9 }),
       ],
-    ])('a %s refusal after the wait closes the episode under the SAME id', async (_reason, setup) => {
+    ])('a %s refusal after the wait closes the episode under the SAME id', async (_reason: string, setup: () => unknown) => {
       setup();
       const out = await p().redeployApp(appName, actor);
       expect(out.started).toMatch(UUID);
@@ -505,14 +542,35 @@ describe('explicit redeploy: reservation, group rule, redeployApp', () => {
       expect(episode).toBeDefined();
       expect(episode!.status).toBe('failed');
       expect(episode!.trigger).toBe('deploy');
+      expect(episode!.stages.map((s) => s.stage)).toEqual(['queued', 'build-failed']);
+      expect(getDeployTracker().getEpisodes(appName)).toHaveLength(1);
+      // A refusal has its own code - not PREBUILD_FAILED, whose hint sends the caller to drop.yaml.
+      expect(getDeployDetailStore().getDetail(out.started)?.errorCode).toBe(
+        _reason === 'guardrail' ? 'GUARDRAIL_TRIPPED' : 'DEPLOY_REFUSED'
+      );
       expect(p().builder.build).not.toHaveBeenCalled();
-      expect(p().queuedDeploys.size).toBe(0);
       expect(p().holdOwners.has(appName)).toBe(false);
       expect(p().appsInProgress.has(appName)).toBe(false);
       expect(p().breakerKeys.has(appName)).toBe(false);
       // Not charged: a refusal is not a failed build.
       const [{ key }] = p().guardrailKeys(appName, false, actor);
       expect(getDeployBreaker().peek(key).failures).toBe(0);
+    });
+
+    it('an old open episode (a parked app\'s) does not swallow the new id\'s failure', async () => {
+      // A previous deploy that never closed: build:started with no terminal event.
+      eventBus.publish('build:started', { appId: appName, buildId: 'old-b', deployId: 'old-deploy' });
+      expect(episodeOf('old-deploy')!.status).toBe('in-progress');
+      reserveEffect = () => (appState = undefined); // refused after the wait: gone
+
+      const out = await p().redeployApp(appName, actor);
+      await settle();
+
+      expect(episodeOf(out.started)!.status).toBe('failed');
+      expect(getDeployDetailStore().getDetail(out.started)?.errorCode).toBe('DEPLOY_REFUSED');
+      // The old one was superseded, not closed by this failure.
+      expect(episodeOf('old-deploy')!.status).toBe('superseded');
+      expect(getDeployDetailStore().getDetail('old-deploy')).toBeUndefined();
     });
 
     it('a pre-build failure carries the trigger on its episode', async () => {
@@ -547,63 +605,6 @@ describe('explicit redeploy: reservation, group rule, redeployApp', () => {
       await settle();
       expect(episodeOf(out.started)!.status).toBe('failed');
       expect(logged).toHaveBeenCalledTimes(1);
-      expectNothingHeld();
-    });
-  });
-
-  describe('redeployApp: prepare', () => {
-    it('maps a refusal thrown by prepare, releasing the hold and never setting the keys', async () => {
-      let keysDuring: boolean | undefined;
-      const out = await p().redeployApp(appName, actor, async () => {
-        keysDuring = p().breakerKeys.has(appName);
-        throw new RedeployRefusedError({ code: 'APP_BUSY', message: 'the clone is still running' });
-      });
-      expect(out.refused).toEqual({ code: 'APP_BUSY', message: 'the clone is still running' });
-      expect(keysDuring).toBe(false);
-      expectNothingHeld();
-      expect(p().queuedDeploys.size).toBe(0);
-      expect(p().builder.build).not.toHaveBeenCalled();
-    });
-
-    it('releases the hold and rethrows when prepare fails some other way', async () => {
-      await expect(
-        p().redeployApp(appName, actor, async () => {
-          throw new Error('disk fell over');
-        })
-      ).rejects.toThrow('disk fell over');
-      expectNothingHeld();
-    });
-
-    it('lets prepare mark its land, and the build is not refused as busy for it', async () => {
-      const out = await p().redeployApp(appName, actor, async (hold: any) => {
-        expect(hold.app).toBe(appName);
-        hold.beginLand();
-        expect(p().gitReserved.has(appName)).toBe(true);
-        // It cannot release or consume the reservation.
-        expect(hold.release).toBeUndefined();
-        expect(hold.consume).toBeUndefined();
-      });
-      expect(out.started).toMatch(UUID);
-      await settle();
-      expect(buildCtxs).toHaveLength(1);
-      expectNothingHeld();
-    });
-
-    it('re-checks what the folder is after prepare: a group answers {group}, releasing everything', async () => {
-      const out = await p().redeployApp(appName, actor, async () => {
-        fs.writeFileSync(path.join(appPath, 'drop.yaml'), 'services:\n  web:\n    path: web\n    type: static\n');
-      });
-      expect(out).toEqual({ group: { container: appName } });
-      expectNothingHeld();
-      expect(p().queuedDeploys.size).toBe(0);
-      expect(p().builder.build).not.toHaveBeenCalled();
-    });
-
-    it('answers NOT_FOUND when prepare left no app behind', async () => {
-      const out = await p().redeployApp(appName, actor, async () => {
-        appState = undefined;
-      });
-      expect(out.refused.code).toBe('NOT_FOUND');
       expectNothingHeld();
     });
   });

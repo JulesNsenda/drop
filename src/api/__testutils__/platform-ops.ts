@@ -54,7 +54,6 @@ export function makePlatformOpsStub(overrides?: Partial<PlatformOps>): PlatformO
     rollbackApp: jest.fn(),
     describeRollback: jest.fn().mockResolvedValue(null),
     redeployApp: jest.fn().mockResolvedValue({ started: 'stub-deploy-id' } satisfies RedeployStart),
-    getQueuedDeploy: jest.fn().mockReturnValue(undefined),
     isGroupBusy: jest.fn().mockReturnValue(false),
     removeGroup: jest.fn().mockResolvedValue({ removed: [] }),
     purgeAppArtifacts: jest.fn().mockResolvedValue(undefined),

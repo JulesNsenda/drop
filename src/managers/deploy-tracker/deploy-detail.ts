@@ -32,6 +32,7 @@ import { getStateManager } from '../app/state-manager';
 import type {
   EventBus,
   Unsubscribe,
+  BuildQueuedPayload,
   BuildStartedPayload,
   BuildFailedPayload,
   AppUpdatedPayload,
@@ -179,6 +180,7 @@ export class DeployDetailStore {
 
   subscribe(bus: EventBus): Unsubscribe {
     const unsubs: Unsubscribe[] = [
+      bus.subscribe('build:queued', (payload) => this.handleBuildQueued(payload)),
       bus.subscribe('build:started', (payload) => this.handleBuildStarted(payload)),
       bus.subscribe('build:failed', (payload) => this.handleBuildFailed(payload)),
       bus.subscribe('deploy:failed', (payload) => this.handleDeployFailed(payload)),
@@ -191,6 +193,16 @@ export class DeployDetailStore {
   }
 
   // ============ Event handlers ============
+
+  /**
+   * A deploy accepted before it builds adopts its id here, so a refusal after
+   * the wait (build:failed) is recorded under the id the caller holds - and the
+   * id it replaces is no longer the open one.
+   */
+  private handleBuildQueued(payload: BuildQueuedPayload): void {
+    if (!payload.deployId || !SAFE_DEPLOY_ID.test(payload.deployId)) return;
+    this.active.set(payload.appId, payload.deployId);
+  }
 
   private handleBuildStarted(payload: BuildStartedPayload): void {
     const appName = payload.appId;

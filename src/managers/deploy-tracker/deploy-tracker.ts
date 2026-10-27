@@ -33,6 +33,7 @@ import type {
   Unsubscribe,
   AppDetectedPayload,
   AppUpdatedPayload,
+  BuildQueuedPayload,
   BuildStartedPayload,
   BuildCompletedPayload,
   BuildFailedPayload,
@@ -101,6 +102,11 @@ export class DeployTracker {
 
   // Correlation cache: appName -> deployId of the currently-open episode.
   private readonly active: Map<string, string> = new Map();
+  // Deploys opened at build:queued whose build:started has not arrived: the
+  // episode is continued, not re-opened, when it does. In memory on purpose - a
+  // restart drops the wait, and a persisted queued-only episode derives as
+  // 'interrupted' (see deriveStatus).
+  private readonly queuedOpen: Set<string> = new Set();
   // Transient trigger tag, set by app:detected/app:update, consumed by build:started.
   private readonly pendingTrigger: Map<string, PendingTrigger> = new Map();
 
@@ -137,6 +143,7 @@ export class DeployTracker {
     const unsubs: Unsubscribe[] = [
       bus.subscribe('app:detected', (payload) => this.handleAppDetected(payload)),
       bus.subscribe('app:update', (payload) => this.handleAppUpdate(payload)),
+      bus.subscribe('build:queued', (payload) => this.handleBuildQueued(payload)),
       bus.subscribe('build:started', (payload) => this.handleBuildStarted(payload)),
       bus.subscribe('build:completed', (payload) => this.handleBuildCompleted(payload)),
       bus.subscribe('build:failed', (payload) => this.handleBuildFailed(payload)),
@@ -163,6 +170,32 @@ export class DeployTracker {
     const trigger: DeployTrigger = payload.reason === 'upload deploy' ? 'upload' : 'hot-reload';
     this.pendingTrigger.set(appName, { trigger, at: payload.timestamp.toISOString() });
     // Transient only — do NOT open an episode.
+  }
+
+  /**
+   * An accepted deploy that is waiting for a builder slot. Opens the episode
+   * under the id the caller was handed (open from now, so a refusal after the
+   * wait closes THIS id - and an older episode left open, a parked app's, is
+   * superseded by it instead of swallowing its close). A publisher without an
+   * id opens nothing: there is no id for an episode to be addressed by.
+   */
+  private handleBuildQueued(payload: BuildQueuedPayload): void {
+    const deployId = payload.deployId;
+    if (!deployId) return;
+    const appName = this.resolveAppName(payload);
+
+    this.active.set(appName, deployId);
+    this.queuedOpen.add(deployId);
+    this.rows.unshift({
+      deployId,
+      appName,
+      userId: this.snapshotUserId(appName),
+      stage: 'queued',
+      at: payload.timestamp.toISOString(),
+      detail: payload.trigger,
+    });
+
+    void this.persist();
   }
 
   private handleBuildStarted(payload: BuildStartedPayload): void {
@@ -195,16 +228,22 @@ export class DeployTracker {
     this.pendingTrigger.delete(appName);
     const userId = this.snapshotUserId(appName);
 
-    this.rows.unshift({
-      deployId,
-      appName,
-      userId,
-      stage: 'triggered',
-      // An explicit trigger is its own account of the start: the pending tag's
-      // timestamp (an earlier app:update, say) is not this deploy's.
-      at: payload.trigger ? at : (pending?.at ?? at),
-      detail: payload.trigger ?? pending?.trigger,
-    });
+    // An episode opened at build:queued under this id CONTINUES: its first row
+    // already says what triggered it and when it was accepted. Otherwise this
+    // is where the episode begins.
+    const continuing = this.queuedOpen.delete(deployId);
+    if (!continuing) {
+      this.rows.unshift({
+        deployId,
+        appName,
+        userId,
+        stage: 'triggered',
+        // An explicit trigger is its own account of the start: the pending tag's
+        // timestamp (an earlier app:update, say) is not this deploy's.
+        at: payload.trigger ? at : (pending?.at ?? at),
+        detail: payload.trigger ?? pending?.trigger,
+      });
+    }
     this.rows.unshift({
       deployId,
       appName,
@@ -375,7 +414,7 @@ export class DeployTracker {
     // getApp lookup — that would leak across app-name reuse).
     const userId = rows.find((row) => row.userId !== undefined)?.userId;
 
-    const triggeredRow = rows.find((row) => row.stage === 'triggered');
+    const triggeredRow = rows.find((row) => row.stage === 'triggered' || row.stage === 'queued');
     const trigger = this.deriveTrigger(triggeredRow?.detail);
 
     const stages: DeployStage[] = [];
@@ -400,7 +439,8 @@ export class DeployTracker {
     const failedRow = rows.find((row) => row.stage === 'build-failed' || row.stage === 'errored');
     const terminalRow = runningRow ?? failedRow;
 
-    const status = this.deriveStatus(appName, deployId, runningRow, failedRow, newestDeployIdByApp);
+    const everStarted = rows.some((row) => row.stage === 'build-started');
+    const status = this.deriveStatus(appName, deployId, runningRow, failedRow, everStarted, newestDeployIdByApp);
 
     const startedAt = rows[0].at;
     const endedAt = terminalRow?.at;
@@ -426,12 +466,21 @@ export class DeployTracker {
     deployId: string,
     runningRow: DeployRow | undefined,
     failedRow: DeployRow | undefined,
+    everStarted: boolean,
     newestDeployIdByApp: Map<string, string>
   ): DeployStatus {
     if (runningRow) return 'succeeded';
     if (failedRow) return 'failed';
 
     const isNewestForApp = newestDeployIdByApp.get(appName) === deployId;
+    // Accepted, never built. Waiting while it is the open one; otherwise it did
+    // not survive - and NEVER 'succeeded' because the app happens to be
+    // running, which is the cross-check below for a deploy that did start: the
+    // app running here is the OLD version.
+    if (!everStarted) {
+      if (isNewestForApp && this.active.get(appName) === deployId) return 'queued';
+      return isNewestForApp ? 'interrupted' : 'superseded';
+    }
     if (isNewestForApp && this.active.get(appName) === deployId) return 'in-progress';
     if (!isNewestForApp) return 'superseded';
 

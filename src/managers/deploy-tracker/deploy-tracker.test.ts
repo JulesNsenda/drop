@@ -177,6 +177,76 @@ describe('DeployTracker', () => {
     });
   });
 
+  describe('queued (an accepted deploy waiting for its builder slot)', () => {
+    const queue = (app: string, id: string, extra: Record<string, unknown> = {}) =>
+      bus.publish('build:queued', { appId: app, buildId: 'b', deployId: id, trigger: 'deploy', ...extra });
+
+    it('opens the episode at build:queued under the id it carries', async () => {
+      queue('q-app', 'q-1');
+      await tracker.flush();
+
+      const [episode] = tracker.getEpisodes('q-app', 1);
+      expect(episode).toMatchObject({ deployId: 'q-1', status: 'queued', trigger: 'deploy' });
+      expect(episode.stages.map((s) => s.stage)).toEqual(['queued']);
+      expect(tracker.hasOpenEpisode('q-app')).toBe(true);
+    });
+
+    it('opens nothing without an id: there is nothing to address the episode by', async () => {
+      bus.publish('build:queued', { appId: 'q-none', buildId: 'b' });
+      expect(tracker.getEpisodes('q-none')).toEqual([]);
+      expect(tracker.hasOpenEpisode('q-none')).toBe(false);
+    });
+
+    it('build:started with the same id CONTINUES the episode: in-progress, one episode, no second trigger row', async () => {
+      queue('q-app', 'q-1');
+      bus.publish('build:started', { appId: 'q-app', buildId: 'b', deployId: 'q-1', trigger: 'deploy' });
+      await tracker.flush();
+
+      const episodes = tracker.getEpisodes('q-app');
+      expect(episodes).toHaveLength(1);
+      expect(episodes[0].status).toBe('in-progress');
+      expect(episodes[0].stages.map((s) => s.stage)).toEqual(['queued', 'build-started']);
+      expect(episodes[0].trigger).toBe('deploy');
+    });
+
+    it('closes THIS id on build:failed, and an older open episode does not swallow it', async () => {
+      bus.publish('build:started', { appId: 'q-app', buildId: 'old', deployId: 'old-1' });
+      queue('q-app', 'q-1');
+      bus.publish('build:failed', {
+        appId: 'q-app',
+        buildId: 'b',
+        error: new Error('declined'),
+        deployId: 'q-1',
+        stage: 'pre-build',
+      });
+      await tracker.flush();
+
+      const byId = Object.fromEntries(tracker.getEpisodes('q-app').map((e) => [e.deployId, e.status]));
+      expect(byId).toEqual({ 'q-1': 'failed', 'old-1': 'superseded' });
+      expect(tracker.hasOpenEpisode('q-app')).toBe(false);
+    });
+
+    it('a queued-only episode that did not survive a restart is interrupted - never succeeded because the old version runs', async () => {
+      queue('q-app', 'q-1');
+      await tracker.flush();
+
+      const restarted = new DeployTracker(storePath);
+      await restarted.initialize();
+      const [episode] = restarted.getEpisodes('q-app', 1);
+      expect(episode.status).toBe('interrupted');
+      expect(restarted.hasOpenEpisode('q-app')).toBe(false);
+    });
+
+    it('is superseded, not interrupted, once a newer deploy of the app exists', async () => {
+      queue('q-app', 'q-1');
+      bus.publish('build:started', { appId: 'q-app', buildId: 'b', deployId: 'newer' });
+      await tracker.flush();
+
+      const byId = Object.fromEntries(tracker.getEpisodes('q-app').map((e) => [e.deployId, e.status]));
+      expect(byId).toEqual({ 'q-1': 'superseded', newer: 'in-progress' });
+    });
+  });
+
   describe('failure category is derived, not hardcoded', () => {
     // Gap A: builder.ts always knew which stage failed but published only
     // {appId, buildId, error}, so this handler hardcoded 'build-failed' while

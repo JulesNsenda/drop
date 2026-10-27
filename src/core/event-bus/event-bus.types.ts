@@ -203,28 +203,39 @@ export interface AppErrorPayload extends BaseEvent {
   context?: string;
 }
 
+/** What started a deploy, as the deploy tracker reports it (the existing wire values). */
+export type DeployTriggerTag = 'deploy' | 'hot-reload' | 'upload';
+
 // Build event payloads
+
+/**
+ * A deploy accepted but not yet building (it is waiting for a builder slot).
+ * The deploy tracker opens the episode under `deployId` here, in a `queued`
+ * stage, and `build:started` carrying the same id continues it - so a caller
+ * handed the id at acceptance can follow it from the start, and a refusal after
+ * the wait closes THAT episode.
+ */
 export interface BuildQueuedPayload extends BaseEvent {
   appId: string;
   buildId: string;
+  /** The id the deploy was accepted under. Without one there is nothing to open an episode for. */
+  deployId?: string;
+  trigger?: DeployTriggerTag;
 }
-
-/**
- * The platform-minted deploy id, threaded from the call site that began this
- * deploy through the build to DeployTracker, so one deploy is addressable end
- * to end (build log file, episode, structured result).
- *
- * OPTIONAL on purpose. DeployTracker keeps its mint-a-fresh-one fallback for
- * any publisher that doesn't supply it — tests constructing payloads by hand,
- * and any future publisher — so the fallback stays live code rather than
- * becoming unreachable. The tracker logs when it takes that path.
- */
-/** What started a deploy, as the deploy tracker reports it (the existing wire values). */
-export type DeployTriggerTag = 'deploy' | 'hot-reload' | 'upload';
 
 export interface BuildStartedPayload extends BaseEvent {
   appId: string;
   buildId: string;
+  /**
+   * The platform-minted deploy id, threaded from the call site that began this
+   * deploy through the build to DeployTracker, so one deploy is addressable end
+   * to end (build log file, episode, structured result).
+   *
+   * OPTIONAL on purpose. DeployTracker keeps its mint-a-fresh-one fallback for
+   * any publisher that doesn't supply it — tests constructing payloads by hand,
+   * and any future publisher — so the fallback stays live code rather than
+   * becoming unreachable. The tracker logs when it takes that path.
+   */
   deployId?: string;
   /**
    * What started this deploy, when the publisher knows. The tracker prefers it

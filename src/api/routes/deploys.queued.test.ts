@@ -1,12 +1,14 @@
 /**
- * A deploy that was accepted but has not started building (#359): POST
- * /apps/:name/redeploy answers with its id BEFORE the wait for a builder slot,
- * so for a while the id is real and the tracker has no episode for it.
+ * A deploy accepted but not yet building (#359), through the routes, against
+ * the REAL deploy tracker.
  *
- * GET /deploys/:id answers `queued` instead of 404, and the by-id stream
- * announces `queued` and then keeps waiting until the episode appears - with
- * the same owner-snapshot tenant filter episodes use, so a foreign or unknown
- * id is still one indistinguishable 404.
+ * POST /apps/:name/redeploy answers with its id BEFORE the wait for a builder
+ * slot. The tracker opens the episode under that id at `build:queued`
+ * (`queued`), `build:started` continues it (`in-progress`), and a refusal
+ * after the wait closes it. The routes add nothing of their own: the list, the
+ * by-id stream and the `?since=` stream just follow the tracker, with the same
+ * owner-snapshot tenant filter as ever - except that `?since=` follows the
+ * deploy that STARTED, never one still waiting for its slot.
  */
 
 import * as fs from 'fs/promises';
@@ -15,41 +17,13 @@ import * as os from 'os';
 import { ApiServer } from '../server';
 import { createUser, resetAuth } from '../middleware/auth';
 import { getTestToken } from '../__testutils__/auth';
-import { makePlatformOpsStub } from '../__testutils__/platform-ops';
-import { setPlatformOps, resetPlatformOps, type QueuedDeploy } from '../platform-ops';
 import { eventBus } from '../../core/event-bus';
-import type { DeployEpisode } from '../../managers/deploy-tracker';
-
-let episodes: DeployEpisode[] = [];
-jest.mock('../../managers/deploy-tracker', () => ({
-  getDeployTracker: () => ({
-    getEpisodes: (appName?: string) => episodes.filter((e) => !appName || e.appName === appName),
-  }),
-}));
-jest.mock('../../managers/app/state-manager', () => ({
-  getStateManager: () => ({ getApp: () => undefined }),
-}));
-
-function mkEpisode(deployId: string, userId: string | undefined, status: DeployEpisode['status']): DeployEpisode {
-  const startedAt = '2026-09-01T00:00:10.000Z';
-  return {
-    deployId,
-    appName: 'web',
-    userId,
-    trigger: 'deploy',
-    status,
-    startedAt,
-    stages: [{ stage: 'build-started', at: startedAt }],
-  };
-}
-
-function nudge(): void {
-  eventBus.publish('app:started', { appName: 'web' } as never);
-}
+import { getStateManager, resetStateManager } from '../../managers/app/state-manager';
+import { getDeployTracker, resetDeployTracker } from '../../managers/deploy-tracker';
 
 interface SseEvent {
   event: string;
-  data: Record<string, unknown>;
+  data: Record<string, any>;
 }
 
 async function readAll(res: Response, onEvent: (e: SseEvent) => void, limitMs = 5000): Promise<SseEvent[]> {
@@ -82,26 +56,33 @@ async function readAll(res: Response, onEvent: (e: SseEvent) => void, limitMs = 
   }
 }
 
-describe('queued deploys on the deploys routes (#359)', () => {
+describe('a queued deploy on the deploys routes (#359)', () => {
   let tempDir: string;
   let server: ApiServer;
   let app: ReturnType<ApiServer['getApp']>;
   let aliceId: string;
   let aliceToken: string;
   let bobToken: string;
-  let queued: Map<string, QueuedDeploy>;
+  let unsub: () => void;
 
   const get = (url: string, token: string) => app.request(url, { headers: { Authorization: `Bearer ${token}` } });
+  const queue = (id: string, appId = 'web') =>
+    eventBus.publish('build:queued', { appId, buildId: 'b', deployId: id, trigger: 'deploy' });
+  const start = (id: string, appId = 'web') =>
+    eventBus.publish('build:started', { appId, buildId: 'b', deployId: id, trigger: 'deploy' });
 
   beforeEach(async () => {
     tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'drop-deploys-queued-'));
     jest.spyOn(console, 'log').mockImplementation();
     jest.spyOn(console, 'warn').mockImplementation();
     resetAuth();
-    resetPlatformOps();
-    episodes = [];
-    queued = new Map();
-    setPlatformOps(makePlatformOpsStub({ getQueuedDeploy: (id: string) => queued.get(id) }));
+    resetStateManager();
+    resetDeployTracker();
+    getStateManager({ stateFilePath: path.join(tempDir, 'apps.json') });
+
+    const tracker = getDeployTracker(path.join(tempDir, 'deploys.json'));
+    await tracker.initialize();
+    unsub = tracker.subscribe(eventBus);
 
     server = new ApiServer({
       port: 3197,
@@ -115,88 +96,119 @@ describe('queued deploys on the deploys routes (#359)', () => {
     await createUser({ username: 'bob', role: 'user', credential: { password: 'password123' } });
     aliceToken = await getTestToken('alice', 'password123');
     bobToken = await getTestToken('bob', 'password123');
+
+    const sm = getStateManager();
+    await sm.registerApp('web', path.join(tempDir, 'web'));
+    await sm.updateApp('web', { userId: aliceId });
   });
 
   afterEach(async () => {
-    resetPlatformOps();
+    delete process.env.DROP_DEPLOY_STREAM_APPEAR_MS;
+    delete process.env.DROP_DEPLOY_STREAM_RECHECK_MS;
+    unsub();
+    await getDeployTracker().flush();
     await server.stop();
+    await getStateManager().close();
+    resetStateManager();
     jest.restoreAllMocks();
-    await fs.rm(tempDir, { recursive: true, force: true });
+    await fs.rm(tempDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   });
 
-  describe('GET /deploys/:deployId', () => {
-    it('answers queued, not 404, for an id that was accepted and has not started building', async () => {
-      queued.set('q1', { appName: 'web', userId: aliceId });
-      const res = await get('/api/v1/deploys/q1', aliceToken);
-      expect(res.status).toBe(200);
-      expect((await res.json()) as unknown).toEqual({
-        success: true,
-        data: { deployId: 'q1', appName: 'web', status: 'queued' },
-      });
+  describe('GET /deploys?app=', () => {
+    it('lists the accepted deploy as queued, then building (not queued) once its build starts', async () => {
+      queue('d1');
+      let rows = ((await (await get('/api/v1/deploys?app=web', aliceToken)).json()) as any).data;
+      expect(rows).toHaveLength(1);
+      expect(rows[0]).toMatchObject({ deployId: 'd1', status: 'queued', trigger: 'deploy' });
+      expect(rows[0].stages.map((s: any) => s.stage)).toEqual(['queued']);
+
+      start('d1');
+      rows = ((await (await get('/api/v1/deploys?app=web', aliceToken)).json()) as any).data;
+      expect(rows).toHaveLength(1);
+      expect(rows[0]).toMatchObject({ deployId: 'd1', status: 'in-progress' });
+      expect(rows[0].stages.map((s: any) => s.stage)).toEqual(['queued', 'build-started']);
     });
 
-    it('answers someone else\'s queued id exactly like an unknown one', async () => {
-      queued.set('q1', { appName: 'web', userId: aliceId });
-      const foreign = await get('/api/v1/deploys/q1', bobToken);
-      const unknown = await get('/api/v1/deploys/never-issued', bobToken);
-      expect(foreign.status).toBe(404);
-      expect(unknown.status).toBe(404);
-      expect(((await foreign.json()) as any).error.code).toBe(((await unknown.json()) as any).error.code);
-    });
-
-    it('is a 404 once the id is no longer queued', async () => {
-      const res = await get('/api/v1/deploys/q1', aliceToken);
+    it('does not show a queued deploy to another tenant', async () => {
+      queue('d1');
+      const res = await get('/api/v1/deploys?app=web', bobToken);
       expect(res.status).toBe(404);
-    });
-
-    it('is a 404 when the platform operations are not wired', async () => {
-      queued.set('q1', { appName: 'web', userId: aliceId });
-      resetPlatformOps();
-      expect((await get('/api/v1/deploys/q1', aliceToken)).status).toBe(404);
     });
   });
 
   describe('GET /deploys/:deployId/stream', () => {
-    it('refuses a foreign or unknown id with the same 404', async () => {
-      queued.set('q1', { appName: 'web', userId: aliceId });
-      expect((await get('/api/v1/deploys/q1/stream', bobToken)).status).toBe(404);
-      expect((await get('/api/v1/deploys/never-issued/stream', aliceToken)).status).toBe(404);
-    });
-
-    it('announces queued, keeps waiting, then follows the real episode to its end', async () => {
-      queued.set('q1', { appName: 'web', userId: aliceId });
-      const res = await get('/api/v1/deploys/q1/stream', aliceToken);
+    it('follows an accepted id from queued, through building, to its end', async () => {
+      queue('d1');
+      const res = await get('/api/v1/deploys/d1/stream', aliceToken);
       expect(res.status).toBe(200);
 
       const events = await readAll(res, (e) => {
-        if (e.event === 'queued') {
-          // The builder slot frees: the episode appears under the same id.
-          episodes = [mkEpisode('q1', aliceId, 'in-progress')];
-          queued.delete('q1');
-          nudge();
+        if (e.event === 'episode' && e.data.status === 'queued') {
+          start('d1');
         } else if (e.event === 'episode' && e.data.status === 'in-progress') {
-          episodes = [mkEpisode('q1', aliceId, 'succeeded')];
-          nudge();
+          eventBus.publish('app:updated', { appId: 'web', changes: { status: 'running' } } as never);
         }
       });
 
-      expect(events.map((e) => e.event)).toEqual(['queued', 'episode', 'episode', 'end']);
-      expect(events[0].data).toEqual({ deployId: 'q1' });
-      expect(events[3].data).toMatchObject({ status: 'succeeded', deployId: 'q1' });
+      expect(events.filter((e) => e.event === 'episode').map((e) => e.data.status)).toEqual([
+        'queued',
+        'in-progress',
+        'succeeded',
+      ]);
+      expect(events[events.length - 1]).toMatchObject({ event: 'end', data: { status: 'succeeded', deployId: 'd1' } });
     });
 
-    it('a refusal after the wait ends the stream as failed under the same id', async () => {
-      queued.set('q1', { appName: 'web', userId: aliceId });
-      const res = await get('/api/v1/deploys/q1/stream', aliceToken);
+    it('ends as failed when a refusal after the wait closes the SAME id', async () => {
+      queue('d1');
+      const res = await get('/api/v1/deploys/d1/stream', aliceToken);
       const events = await readAll(res, (e) => {
-        if (e.event === 'queued') {
-          episodes = [mkEpisode('q1', aliceId, 'failed')];
-          queued.delete('q1');
-          nudge();
+        if (e.event === 'episode' && e.data.status === 'queued') {
+          eventBus.publish('build:failed', {
+            appId: 'web',
+            buildId: 'b',
+            error: new Error('declined'),
+            deployId: 'd1',
+            stage: 'pre-build',
+            code: 'DEPLOY_REFUSED',
+          });
         }
       });
-      expect(events.map((e) => e.event)).toEqual(['queued', 'episode', 'end']);
-      expect(events[2].data).toMatchObject({ status: 'failed', deployId: 'q1' });
+      expect(events[events.length - 1]).toMatchObject({ event: 'end', data: { status: 'failed', deployId: 'd1' } });
+    });
+
+    it('answers someone else\'s queued id exactly like an unknown one', async () => {
+      queue('d1');
+      const foreign = await get('/api/v1/deploys/d1/stream', bobToken);
+      const unknown = await get('/api/v1/deploys/never-issued/stream', bobToken);
+      expect(foreign.status).toBe(404);
+      expect(unknown.status).toBe(404);
+    });
+  });
+
+  describe('GET /deploys/stream?app=&since= follows the deploy that STARTED', () => {
+    it('does not pick up a queued-only episode', async () => {
+      process.env.DROP_DEPLOY_STREAM_APPEAR_MS = '150';
+      process.env.DROP_DEPLOY_STREAM_RECHECK_MS = '50';
+      const since = new Date(Date.now() - 1000).toISOString();
+      queue('d-queued');
+
+      const res = await get(`/api/v1/deploys/stream?app=web&since=${encodeURIComponent(since)}`, aliceToken);
+      const events = await readAll(res, () => undefined);
+
+      expect(events.map((e) => e.event)).toEqual(['end']);
+      expect(events[0].data).toEqual({ status: 'not-found' });
+    });
+
+    it('picks it up once it has built', async () => {
+      process.env.DROP_DEPLOY_STREAM_APPEAR_MS = '2000';
+      const since = new Date(Date.now() - 1000).toISOString();
+      queue('d-queued');
+      start('d-queued');
+      eventBus.publish('app:updated', { appId: 'web', changes: { status: 'running' } } as never);
+
+      const res = await get(`/api/v1/deploys/stream?app=web&since=${encodeURIComponent(since)}`, aliceToken);
+      const events = await readAll(res, () => undefined);
+      expect(events[events.length - 1]).toMatchObject({ event: 'end', data: { status: 'succeeded', deployId: 'd-queued' } });
     });
   });
 });
