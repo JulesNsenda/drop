@@ -287,6 +287,18 @@ describe('DropPlatform object storage (#301)', () => {
       }
     );
 
+    it('throws on an attachable service nobody wrote a branch for, instead of treating it as the last one', async () => {
+      stubAppConfigService(baseConfig());
+      stubStateManager(baseState());
+      stubSecrets();
+      const storage = stubStorage();
+
+      await expect(platform.attachService(appName, 'memcached' as never)).rejects.toThrow(
+        'Unhandled attachable service: memcached'
+      );
+      expect(storage.provisionAppStorage).not.toHaveBeenCalled();
+    });
+
     it('refuses ephemeral apps', async () => {
       stubAppConfigService(baseConfig({ ephemeral: true }));
       stubStateManager(baseState());

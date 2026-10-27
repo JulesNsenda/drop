@@ -2,6 +2,7 @@ export {
   ObjectStorageProvisioner,
   ObjectStorageUnavailableError,
   ObjectStorageIncarnationError,
+  ObjectStorageNotConfiguredError,
   ObjectStorageDetachIncompleteError,
   getObjectStorageProvisioner,
   resetObjectStorageProvisioner,

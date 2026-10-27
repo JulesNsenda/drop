@@ -33,9 +33,6 @@ import type {
   StorageDeprovisionResult,
 } from './types';
 
-const isWindows = process.platform === 'win32';
-const DEFAULT_DROP_ROOT = isWindows ? 'C:\\drop' : '/var/drop';
-
 /** AWS region codes: `us-east-1`, `eu-central-1`, `ap-southeast-2`, `us-gov-west-1`… */
 export const AWS_REGION_RE = /^[a-z]{2}(?:-gov)?-[a-z]+-\d$/;
 
@@ -57,6 +54,21 @@ export interface StorageEnvironment {
 export type StorageAvailability =
   | { available: true; region: string; bucketPrefix: string }
   | { available: false; reason: StorageUnavailableReason; detail: string };
+
+/**
+ * The provisioner was built without an allocation store. Production code gets
+ * one from `configureObjectStorage(dropRoot, ...)`, which binds it to THIS
+ * platform's root. A provisioner that quietly fell back to `DROP_ROOT` from
+ * the environment would read and write a different store from the platform's
+ * (a `--root` boot does not set it), which is how the admin routes and the
+ * platform once disagreed about where the buckets were.
+ */
+export class ObjectStorageNotConfiguredError extends Error {
+  constructor() {
+    super('Object storage has no allocation store: it was not bound to a platform root (configureObjectStorage)');
+    this.name = 'ObjectStorageNotConfiguredError';
+  }
+}
 
 export class ObjectStorageUnavailableError extends Error {
   constructor(readonly reason: StorageUnavailableReason, detail: string) {
@@ -124,21 +136,28 @@ export interface ObjectStorageProvisionerOptions {
 }
 
 export class ObjectStorageProvisioner {
-  private readonly allocations: AllocationStore;
+  private readonly allocationStore: AllocationStore | null;
   private readonly credentials: StorageCredentialStore;
   private readonly providerFactory: (config: AwsProviderConfig) => ObjectStorageProvider;
   private readonly environment: () => StorageEnvironment;
 
   constructor(options: ObjectStorageProvisionerOptions = {}) {
-    const dir = path.join(process.env.DROP_ROOT || DEFAULT_DROP_ROOT, 'data', 'drop-svc');
-    this.allocations =
-      options.allocations ??
-      new AllocationStore(path.join(dir, 'object-storage.json'), path.join(dir, 'encryption.key'));
+    this.allocationStore = options.allocations ?? null;
     this.environment = options.environment ?? (() => ({ isolation: 'none', authEnabled: false }));
     this.credentials = options.credentials ?? getStorageCredentialStore();
     this.providerFactory =
       options.providerFactory ??
       ((config) => new AwsObjectStorageProvider(config.region, createAwsClients(config)));
+  }
+
+  /**
+   * The allocation store, or ObjectStorageNotConfiguredError. Thrown at the
+   * first use rather than at construction, so a standalone ApiServer (tests)
+   * that merely asks `availability()` still gets its answer.
+   */
+  private get allocations(): AllocationStore {
+    if (!this.allocationStore) throw new ObjectStorageNotConfiguredError();
+    return this.allocationStore;
   }
 
   /** Whether an app could be given storage right now, and if not, why. */
@@ -183,11 +202,11 @@ export class ObjectStorageProvisioner {
   }
 
   /** The app's allocation, without its secret. */
-  getAllocation(appName: string): Promise<AppStorageAllocation | null> {
+  async getAllocation(appName: string): Promise<AppStorageAllocation | null> {
     return this.allocations.get(appName);
   }
 
-  listAllocations(): Promise<AppStorageAllocation[]> {
+  async listAllocations(): Promise<AppStorageAllocation[]> {
     return this.allocations.list();
   }
 

@@ -9,6 +9,22 @@ Object storage is **attach-only**. There is no `drop.yaml` key and DROP never
 infers it, because every bucket bills the operator's account. An app gets one
 only because its owner asked for it.
 
+## Requirements
+
+Object storage holds your AWS admin key, so it is available **only** when:
+
+- the platform runs with **container isolation** (`DROP_ISOLATION=docker`).
+  Under `isolation: none`, tenant apps run on the same host as that key, and a
+  PM2 app inherits the platform's environment; and
+- **API authentication is on**. With it off, every route that can create
+  buckets on your bill is open.
+
+Either condition missing makes it unavailable (`isolation` / `auth-disabled` in
+the admin settings) however well it is configured. Removing what already
+exists still works. As defence in depth, a PM2 app's start environment blanks
+every inherited `DROP_S3_*` and `AWS_*` variable that the app was not
+deliberately given.
+
 ## What an app gets
 
 For each app, DROP creates:
@@ -17,7 +33,7 @@ For each app, DROP creates:
 |---|---|---|
 | S3 bucket | `<prefix>-<app>-<8 hex>` | Public access blocked, ACLs disabled (bucket-owner-enforced). The random suffix keeps names unique across AWS's global bucket namespace. |
 | IAM user | `drop-<prefix>-<app>-<8 hex>`, path `/drop/` (same suffix as its bucket) | One inline policy, `drop-bucket-access`: list the bucket, get/put/delete its objects, manage its multipart uploads. Nothing else — no ACLs, no bucket policy, no other bucket. |
-| Access key | — | Stored encrypted in `data/drop-svc/object-storage.json` (0600). |
+| Access key | — | Stored encrypted in `data/drop-svc/object-storage.json` (0600). The record also notes the owner and the app's creation time: a record belongs to one app, not to whoever holds the name later. |
 
 The app receives the standard `AWS_REGION`, `AWS_ACCESS_KEY_ID` and
 `AWS_SECRET_ACCESS_KEY`, which every AWS SDK picks up with no code, plus
@@ -27,42 +43,70 @@ The app receives the standard `AWS_REGION`, `AWS_ACCESS_KEY_ID` and
 
 An app owner attaches object storage from the app's **Database** tab, or with
 `POST /api/v1/apps/<app>/services/object-storage`. DROP creates the bucket,
-user and key, then restarts the app with the four variables. The row is
-disabled ("not set up on this platform") until the operator has finished the
+user and key, waits (up to 30 seconds, backing off) until the app's new key
+is actually accepted by S3 — a new IAM key takes a moment to propagate — then
+restarts the app with the four variables. The row is disabled ("not set up on this platform") until the operator has finished the
 setup below.
 
 Attach is refused when:
 
 - the app is ephemeral (it is torn down on a timer);
 - the app is part of a monorepo group (group apps cannot detach a service);
+- a previous detach has not finished (see below), or the name holds storage
+  that belongs to a previous app of the same name, which an admin must resolve;
 - the app already sets any variable an AWS SDK takes credentials, a region or
   an endpoint from — `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
   `AWS_SESSION_TOKEN`, `AWS_PROFILE`, `AWS_REGION`, `AWS_ENDPOINT_URL`,
   `AWS_ENDPOINT_URL_S3` or `S3_BUCKET` — as a secret or in `drop.yaml` `env:`.
   The injected values would replace them and point the app at an empty bucket;
-- the owner already has `DROP_MAX_OBJECT_STORAGE_PER_USER` buckets (default
-  3; `0` means unlimited). Apps deployed by the operator (with no owning user)
-  are not counted.
+- the owner already holds `DROP_MAX_OBJECT_STORAGE_PER_USER` buckets (default
+  3; `0` means unlimited). Live buckets, buckets still being deleted and
+  buckets kept by a `keepData` delete all count, since all of them bill you.
+  Apps deployed by the operator (with no owning user) are not counted.
 
 **Detaching destroys the data.** `DELETE
-/api/v1/apps/<app>/services/object-storage` revokes the key, deletes the
-user, deletes every object and object version, aborts pending uploads, and
-deletes the bucket. There is no backup. The app stops receiving the variables
-as soon as the detach is recorded, even if AWS then refuses the teardown. A
-detach that did not finish shows as "Detach incomplete" with a retry button.
+/api/v1/apps/<app>/services/object-storage?confirm=<app>` records the intent,
+revokes the app's key and deletes its IAM user, restarts the app without the
+variables, and then deletes every object and object version, aborts pending
+uploads, and deletes the bucket **in the background** (the request does not wait
+for a large bucket). There is no backup.
+
+The request is refused unless it comes from an **interactive session** (the
+dashboard — never an API key, OAuth token or agent token) **and** names the app
+in `?confirm=`. The dashboard's confirm dialog sends it.
+
+A detach that did not finish shows as "Detach incomplete" with a retry button,
+and **attaching is refused until it is finished** (retry the detach; it is
+idempotent): attaching in between would hand the app a bucket that is about to
+be emptied. The background step only deletes a bucket while the owner's intent
+is still `detached`, re-checked immediately before it deletes anything.
 
 ## When an app is deleted
 
-Deleting an app deletes its bucket the same way, with no backup. Two cases keep
-it instead:
+Deleting an app deletes its bucket the same way, with no backup, and needs the
+same interactive session and `?confirm=<app>` when the app holds a bucket (a
+monorepo group delete is confirmed with the group name). An unreadable
+allocation store counts as "may hold a bucket". The dashboard's delete dialog
+says so and sends the confirmation. A script using an API key (`drop remove`)
+is refused for such an app unless it passes `keepData`.
 
-- **`keepData=true`**: the bucket and its key are kept, for the operator to
-  deal with.
+The record is **moved off the app's name first**, before any AWS call, and the
+bucket is torn down from that retired record; a large bucket is drained by a
+background sweep, not while the request waits. A new app with the same name
+always gets a new bucket, never the old one — and a record that somehow still
+sits on a name is refused for any app whose owner and creation time do not
+match it.
+
+Two cases do not finish the job in one step:
+
+- **`keepData=true`**: the bucket is kept, as the owner's data — but its IAM
+  key is revoked and its user deleted, so nothing can keep writing to it. An
+  admin lists these with `GET /api/v1/admin/object-storage/retired` and
+  destroys one with `DELETE /api/v1/admin/object-storage/retired/<id>`. They
+  keep counting against their owner's `DROP_MAX_OBJECT_STORAGE_PER_USER`.
 - **AWS refuses the teardown**: DROP retries it every 15 minutes until it
-  succeeds.
-
-In both cases the record is moved off the app's name. A new app with the same
-name always gets a new bucket, never the old one.
+  succeeds. The sweep never runs twice at once, and shutting the platform down
+  waits for one in progress (up to 30 seconds).
 
 Apps with object storage attached are never removed by the idle reaper, since
 that would delete the bucket.
@@ -82,9 +126,20 @@ that would delete the bucket.
    belongs to, or the AWS error name.
 
 `GET /api/v1/admin/settings` reports an `objectStorage` block: whether it is
-enabled and available, why not when it is not (`disabled`, `not-configured`,
-`no-credential`), whether a credential is configured (never the credential
+enabled and available, why not when it is not (`isolation`, `auth-disabled`,
+`disabled`, `not-configured`, `no-credential`), whether a credential is configured (never the credential
 itself), and how many apps have storage.
+
+## Backup and restore
+
+`drop backup` includes `object-storage.json` (which bucket and IAM user each app
+has, and each app's encrypted key) and `object-storage-credential.json` (the
+encrypted admin key); `drop restore` puts them back. Both are encrypted under
+`encryption.key`, which is in the same backup. At boot, DROP logs a warning for
+every app whose owner attached object storage but which has no allocation on
+record — what a restore from a backup that predates these files looks like. The
+bucket still exists in AWS in that case; look for the `drop-` IAM users under
+the `/drop/` path.
 
 There is deliberately **no endpoint setting**. A settable endpoint would let an
 admin — or anyone holding an admin session — point DROP at a host they control

@@ -16,6 +16,7 @@ import { AllocationStore, AllocationStoreCorruptError } from './allocation-store
 import {
   ObjectStorageDetachIncompleteError,
   ObjectStorageIncarnationError,
+  ObjectStorageNotConfiguredError,
   ObjectStorageProvisioner,
   ObjectStorageUnavailableError,
   configureObjectStorage,
@@ -185,6 +186,22 @@ describe('object storage stores and provisioner', () => {
 
       await credentials.set({ accessKeyId: 'AKIAADMIN0000000', secretAccessKey: 'admin-secret-value' });
       expect(await p.availability()).toEqual({ available: true, region: 'eu-central-1', bucketPrefix: 'dropkit' });
+    });
+
+    describe('without an allocation store', () => {
+      it('never falls back to DROP_ROOT from the environment: it throws on first use', async () => {
+        process.env.DROP_ROOT = dir;
+        const p = new ObjectStorageProvisioner({ credentials, providerFactory: factory, environment: () => environment });
+
+        await expect(p.getAllocation('site')).rejects.toBeInstanceOf(ObjectStorageNotConfiguredError);
+        await expect(p.provisionAppStorage('site')).rejects.toBeInstanceOf(ObjectStorageNotConfiguredError);
+        await expect(fs.access(path.join(dir, 'data', 'drop-svc', 'object-storage.json'))).rejects.toThrow();
+      });
+
+      it('still answers availability(), which touches no store', async () => {
+        const p = new ObjectStorageProvisioner({ credentials, providerFactory: factory });
+        expect(await p.availability()).toEqual(expect.objectContaining({ available: false }));
+      });
     });
 
     describe('platform environment', () => {

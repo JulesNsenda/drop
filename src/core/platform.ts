@@ -79,6 +79,7 @@ import {
   resetObjectStorageProvisioner,
   resetStorageCredentialStore,
 } from '../managers/object-storage';
+import { assertNever } from '../utils/assert-never';
 import { CaddyServer, getCaddyServer, resetCaddyServer } from '../managers/router';
 import { SecretManager, getSecretManager, resetSecretManager } from '../managers/secret';
 import { WebhookManager, getWebhookManager, resetWebhookManager } from './webhooks';
@@ -8571,7 +8572,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
             detail: `This app already supplies its own REDIS_URL (via ${ownSource}) — attaching would silently repoint it at a freshly-created, empty Redis instance.`,
           });
         }
-      } else {
+      } else if (serviceId === 'object-storage') {
         const own = await this.appAwsCredentialSource(appName, appPath);
         if (own) {
           return this.refuse('attach', appName, serviceId, {
@@ -8580,18 +8581,28 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
             detail: `This app already sets ${own.name} (via ${own.source}) — attaching would silently repoint its AWS SDK at a freshly-created, empty bucket.`,
           });
         }
+      } else {
+        return assertNever(serviceId, 'attachable service');
       }
 
       const ownerUserId = state?.userId;
-      const quota =
-        serviceId === 'postgres'
-          ? this.checkDbQuota(ownerUserId)
-          : serviceId === 'redis'
-            ? this.checkRedisQuota(ownerUserId)
-            : await this.checkObjectStorageQuota(ownerUserId);
+      let quota: { allowed: true } | { allowed: false; used: number; limit: number };
+      if (serviceId === 'postgres') {
+        quota = this.checkDbQuota(ownerUserId);
+      } else if (serviceId === 'redis') {
+        quota = this.checkRedisQuota(ownerUserId);
+      } else if (serviceId === 'object-storage') {
+        quota = await this.checkObjectStorageQuota(ownerUserId);
+      } else {
+        return assertNever(serviceId, 'attachable service');
+      }
       if (!quota.allowed) {
-        const quotaLabel =
-          serviceId === 'postgres' ? 'Database' : serviceId === 'redis' ? 'Redis' : 'Object storage';
+        const QUOTA_LABEL: Record<AttachableServiceId, string> = {
+          postgres: 'Database',
+          redis: 'Redis',
+          'object-storage': 'Object storage',
+        };
+        const quotaLabel = QUOTA_LABEL[serviceId];
         return this.refuse('attach', appName, serviceId, {
           attached: false,
           reason: 'quota-exceeded',
@@ -8655,7 +8666,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         const redisHost = this.config.isolation === 'docker' ? HOST_ALIAS : '127.0.0.1';
         const envVars = this.redisProvisioner.getEnvVars(appName, { host: redisHost }) || {};
         envVarNames = Object.keys(envVars);
-      } else {
+      } else if (serviceId === 'object-storage') {
         // Unavailable here is the ORDINARY state of a box whose operator has
         // not set object storage up — a refusal naming what is missing, never
         // a throw that would read as a crash.
@@ -8699,6 +8710,8 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           throw err;
         }
         envVarNames = Object.keys((await this.objectStorage.getEnvVars(appName)) ?? {});
+      } else {
+        return assertNever(serviceId, 'attachable service');
       }
 
       // setServiceIntent, not upsertSystemConfig's snapshot-spread — it

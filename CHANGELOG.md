@@ -127,6 +127,41 @@ that declares a `healthCheck`.**
   reaping. The extension catalog lists object storage, marked unavailable
   until an operator sets it up.
 
+  Hardening that ships with it (the review of the first draft):
+  - **Only under container isolation, and only with API auth on.** Object
+    storage holds the AWS admin key, so it reports unavailable (`isolation` /
+    `auth-disabled`) under `isolation: none`, where a PM2 app inherits the
+    platform's environment. A PM2 app's start environment also blanks every
+    inherited `DROP_S3_*` / `AWS_*` variable it was not deliberately given.
+  - **Destroying a bucket needs a person and a confirmation.** Detaching, or
+    deleting an app (or group) that holds a bucket, requires an interactive
+    session and `?confirm=<name>`, checked server-side before anything is
+    stopped. API keys, OAuth and agent tokens are refused, so `drop remove` of
+    such an app needs `--keep-data`. The dashboard dialogs say so and send it.
+  - **A delete retires the record before touching AWS.** The allocation is
+    moved off the app's name first, the IAM key is revoked, and the bucket is
+    drained in the background rather than while the DELETE waits. Records carry
+    the owner and the app's creation time, and are never reused by another app
+    of the same name. The delete route holds the app against concurrent
+    attach/detach.
+  - **`keepData` keeps only the bucket.** Its IAM key and user are deleted, and
+    kept buckets still count against the owner's cap. Admins can list and
+    destroy them: `GET /admin/object-storage/retired`, `DELETE
+    /admin/object-storage/retired/:id`.
+  - **A half-finished detach is recorded and finished.** The key is revoked and
+    that is persisted; attach is refused until the detach completes; a
+    single-flight background sweep drains the bucket only while the owner's
+    intent is still `detached`; shutdown waits for it.
+  - **Backup and restore include the allocation store and admin credential**
+    (`object-storage.json`, `object-storage-credential.json`); a boot warning
+    flags apps that are attached with no allocation.
+  - The allocation store is safe against app names like `constructor`; teardown
+    refuses any bucket or IAM user whose name DROP did not generate (an empty
+    user name would make IAM act on the caller's own keys); attach waits for the
+    new IAM key to be accepted before restarting the app; the AWS-credentials
+    guard also covers `AWS_REGION`, `AWS_SESSION_TOKEN`, `AWS_PROFILE`,
+    `AWS_ENDPOINT_URL` and `AWS_ENDPOINT_URL_S3`.
+
 ### Fixed
 
 - **Object storage now uses the platform's own root (#301).** Its credential
