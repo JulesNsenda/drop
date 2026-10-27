@@ -498,6 +498,12 @@ describe('describeDetachOutcome', () => {
     );
   });
 
+  it('says the bucket is still being deleted when the drain was handed to the background', () => {
+    expect(describeDetachOutcome('Object storage', { ...base, drainPending: true })).toBe(
+      'Object storage detached. The app can no longer reach the bucket, and the bucket and its objects are being deleted in the background.'
+    );
+  });
+
   it('reports the backup file when present', () => {
     expect(
       describeDetachOutcome('PostgreSQL', {

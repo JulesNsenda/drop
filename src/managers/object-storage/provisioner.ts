@@ -73,6 +73,22 @@ export class ObjectStorageIncarnationError extends Error {
   }
 }
 
+/**
+ * The app's storage was half-detached: its key is revoked but the bucket has
+ * not been drained yet. Attaching now would either hand it a bucket the sweep
+ * is about to empty, or mint a new key whose writes the sweep would delete —
+ * so the owner must finish the detach first (retrying it is idempotent).
+ */
+export class ObjectStorageDetachIncompleteError extends Error {
+  constructor(appName: string) {
+    super(
+      `A previous detach of object storage on '${appName}' did not finish — retry the detach, ` +
+        'then attach again once it completes.'
+    );
+    this.name = 'ObjectStorageDetachIncompleteError';
+  }
+}
+
 function sameIncarnation(record: AppStorageAllocation, incarnation: AppIncarnation): boolean {
   return (
     (record.ownerUserId ?? null) === (incarnation.ownerUserId ?? null) &&
@@ -145,6 +161,7 @@ export class ObjectStorageProvisioner {
   async provisionAppStorage(appName: string, incarnation: AppIncarnation = {}): Promise<AppStorageAllocation> {
     const existing = await this.allocations.get(appName);
     if (existing) {
+      if (existing.accessRevoked) throw new ObjectStorageDetachIncompleteError(appName);
       if (!sameIncarnation(existing, incarnation)) throw new ObjectStorageIncarnationError(appName);
       return existing;
     }
@@ -225,6 +242,24 @@ export class ObjectStorageProvisioner {
   }
 
   /**
+   * The first half of a detach: revoke the app's IAM key and delete its user,
+   * and RECORD that on the allocation (dropping the stored secret with it).
+   * The bucket stays, to be drained by the sweep once the owner's intent is
+   * confirmed `detached`. Idempotent, so a retried detach just picks up where
+   * the last one stopped. Null when the app has no storage.
+   */
+  async revokeAppAccess(appName: string): Promise<AppStorageAllocation | null> {
+    const allocation = await this.allocations.get(appName);
+    if (!allocation) return null;
+    if (allocation.accessRevoked) return allocation;
+    assertGeneratedResourcePair(allocation.bucket, allocation.userName);
+    const provider = await this.providerFor(allocation.region);
+    await provider.revokeAccess({ userName: allocation.userName });
+    await this.allocations.amend(appName, { accessRevoked: true, dropSecret: true });
+    return { ...allocation, accessRevoked: true };
+  }
+
+  /**
    * DESTROY the app's storage: key, user, every object and the bucket. The
    * allocation record is removed only once the provider reports it done, so
    * a failed teardown can be retried. Null when the app had none.
@@ -278,13 +313,22 @@ export class ObjectStorageProvisioner {
   }
 
   /**
-   * Retry the teardown of every allocation retired by a failed delete. Each
-   * record is forgotten only once its provider reports the resources gone;
-   * `kept` records are the operator's and are never touched. A missing
-   * credential skips the whole pass rather than failing every record.
+   * Finish what earlier operations left behind. Each record is forgotten only
+   * once its provider reports the resources gone.
+   *
+   *  - Retired records (`deleting`, `teardown-failed`): drained and removed.
+   *  - Retired `kept` records: only their IAM access is finished off; the
+   *    bucket is the owner's, and only an admin destroys it.
+   *  - LIVE allocations whose key was revoked by a detach: drained, but only
+   *    while `shouldDrain` still says the owner's intent is detached —
+   *    checked again immediately before the drain, because the sweep is the
+   *    one actor that deletes data without a person present. The provisioner
+   *    does not know intents; the platform does.
+   *
+   * A missing credential skips the whole pass rather than failing every record.
    */
-  async sweepRetired(): Promise<{ destroyed: number; failed: number }> {
-    const pending = (await this.allocations.listRetired()).filter(
+  async sweepRetired(opts: { shouldDrain?: (appName: string) => boolean } = {}): Promise<{ destroyed: number; failed: number }> {
+    const retired = (await this.allocations.listRetired()).filter(
       ({ allocation }) =>
         allocation.retired?.reason === 'teardown-failed' ||
         allocation.retired?.reason === 'deleting' ||
@@ -292,12 +336,15 @@ export class ObjectStorageProvisioner {
         // that half. Its bucket is still never touched.
         (allocation.retired?.reason === 'kept' && !allocation.accessRevoked)
     );
-    if (pending.length === 0 || !(await this.credentials.isConfigured())) {
+    const detached = (await this.allocations.list()).filter(
+      (allocation) => allocation.accessRevoked && opts.shouldDrain?.(allocation.appName)
+    );
+    if ((retired.length === 0 && detached.length === 0) || !(await this.credentials.isConfigured())) {
       return { destroyed: 0, failed: 0 };
     }
     let destroyed = 0;
     let failed = 0;
-    for (const { key, allocation } of pending) {
+    for (const { key, allocation } of retired) {
       try {
         assertGeneratedResourcePair(allocation.bucket, allocation.userName);
         if (allocation.retired?.reason === 'kept') {
@@ -314,6 +361,23 @@ export class ObjectStorageProvisioner {
         if (allocation.retired?.reason === 'deleting') {
           await this.allocations.amend(key, { retiredReason: 'teardown-failed' }).catch(() => undefined);
         }
+        failed += 1;
+      }
+    }
+    for (const allocation of detached) {
+      try {
+        assertGeneratedResourcePair(allocation.bucket, allocation.userName);
+        const provider = await this.providerFor(allocation.region);
+        // The last look before data is deleted: the owner may have changed
+        // their mind (or the app may have gone) since the list above.
+        if (!opts.shouldDrain?.(allocation.appName)) continue;
+        await provider.deprovision({ bucket: allocation.bucket, userName: allocation.userName });
+        // Forget it only if the name still holds THIS record.
+        if ((await this.allocations.get(allocation.appName))?.bucket === allocation.bucket) {
+          await this.allocations.remove(allocation.appName);
+        }
+        destroyed += 1;
+      } catch {
         failed += 1;
       }
     }

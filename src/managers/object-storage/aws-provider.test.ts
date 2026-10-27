@@ -138,6 +138,20 @@ describe('AwsObjectStorageProvider.deprovision', () => {
     expect(names[names.length - 1]).toBe('DeleteBucketCommand');
   });
 
+  it('does not count objects AWS reported it could not delete', async () => {
+    const { clients } = fakeClients({
+      ListAccessKeysCommand: () => ({ AccessKeyMetadata: [] }),
+      ListObjectVersionsCommand: () => ({
+        Versions: [{ Key: 'a', VersionId: '1' }, { Key: 'b', VersionId: '2' }, { Key: 'c', VersionId: '3' }],
+        IsTruncated: false,
+      }),
+      DeleteObjectsCommand: () => ({ Errors: [{ Key: 'b', Code: 'AccessDenied' }] }),
+    });
+
+    const result = await new AwsObjectStorageProvider('eu-central-1', clients).deprovision({ bucket: BUCKET, userName: USER });
+    expect(result.objectsDeleted).toBe(2);
+  });
+
   it('treats resources that are already gone as done, so a retry finishes', async () => {
     const { clients } = fakeClients({
       ListAccessKeysCommand: gone('NoSuchEntity'),

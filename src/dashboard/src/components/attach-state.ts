@@ -406,6 +406,8 @@ export interface DetachServiceSuccess {
   objectsDeleted?: number;
   /** object-storage only. */
   bucketDeleted?: boolean;
+  /** object-storage only: the key is revoked; the bucket is still being deleted in the background. */
+  drainPending?: boolean;
   manifestConflict?: boolean;
   /** `'not-needed'` is the `deprovisioned: false` arm's own restart outcome —
    * nothing was ever provisioned, so there is nothing a restart would accomplish, distinct
@@ -502,6 +504,11 @@ export function describeDetachOutcome(label: string, result: DetachServiceSucces
     lines.push(`${label} detach recorded — nothing was provisioned to remove.`);
   } else if (result.backup?.file) {
     lines.push(`${label} detached. Backup written: ${result.backup.file}.`);
+  } else if (result.drainPending) {
+    lines.push(
+      `${label} detached. The app can no longer reach the bucket, and the bucket and its objects are ` +
+        'being deleted in the background.'
+    );
   } else if (typeof result.objectsDeleted === 'number') {
     lines.push(
       `${label} detached. The bucket and its ${result.objectsDeleted} ` +

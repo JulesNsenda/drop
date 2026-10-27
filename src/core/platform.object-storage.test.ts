@@ -71,6 +71,7 @@ describe('DropPlatform object storage (#301)', () => {
     deprovisionAppStorage: jest.Mock;
     teardownForDeletedApp: jest.Mock;
     undoProvision: jest.Mock;
+    revokeAppAccess: jest.Mock;
     sweepRetired: jest.Mock;
   };
 
@@ -107,6 +108,7 @@ describe('DropPlatform object storage (#301)', () => {
       }),
       teardownForDeletedApp: jest.fn().mockResolvedValue({ outcome: 'none' }),
       undoProvision: jest.fn().mockResolvedValue(undefined),
+      revokeAppAccess: jest.fn(async (name: string) => (allocated.has(name) ? { appName: name, accessRevoked: true } : null)),
       sweepRetired: jest.fn().mockResolvedValue({ destroyed: 0, failed: 0 }),
     };
     (platform as any).objectStorage = stub;
@@ -298,29 +300,32 @@ describe('DropPlatform object storage (#301)', () => {
   });
 
   describe('detach', () => {
-    it('persists the intent BEFORE destroying the bucket, stops then restarts the app, and reports what was deleted', async () => {
+    it('persists the intent, revokes the key, restarts the app, and only then hands the drain to the sweep', async () => {
       const setServiceIntent = stubAppConfigService(baseConfig({ services: { 'object-storage': 'attached' } }));
       stubStateManager(baseState({ status: 'running' }));
-      const { stop } = stubRuntime(true);
+      stubRuntime(true);
       const storage = stubStorage({ allocated: [appName] });
       const doRestart = jest.spyOn(platform as any, 'doRestart').mockResolvedValue(undefined);
+      const sweep = jest.spyOn(platform as any, 'sweepRetiredObjectStorage').mockResolvedValue(undefined);
 
       const result = await platform.detachService(appName, 'object-storage');
 
       expect(result).toEqual({
         detached: true,
         deprovisioned: true,
-        objectsDeleted: 7,
-        bucketDeleted: true,
+        drainPending: true,
         restart: 'restarted',
       });
       expect(setServiceIntent).toHaveBeenCalledWith(appName, 'object-storage', 'detached', {
         lastDetachAt: expect.any(Number),
       });
-      const persisted = setServiceIntent.mock.invocationCallOrder[0];
-      expect(persisted).toBeLessThan(stop.mock.invocationCallOrder[0]);
-      expect(stop.mock.invocationCallOrder[0]).toBeLessThan(storage.deprovisionAppStorage.mock.invocationCallOrder[0]);
+      const order = (m: { mock: { invocationCallOrder: number[] } }) => m.mock.invocationCallOrder[0];
+      expect(order(setServiceIntent)).toBeLessThan(order(storage.revokeAppAccess));
+      expect(order(storage.revokeAppAccess)).toBeLessThan(order(doRestart));
+      expect(order(doRestart)).toBeLessThan(order(sweep));
       expect(doRestart).toHaveBeenCalledWith(appName);
+      // The bucket is never drained inline.
+      expect(storage.deprovisionAppStorage).not.toHaveBeenCalled();
     });
 
     it('records the intent and restarts nothing when there is no bucket', async () => {
@@ -336,7 +341,7 @@ describe('DropPlatform object storage (#301)', () => {
         restart: 'not-needed',
       });
       expect(setServiceIntent).toHaveBeenCalledWith(appName, 'object-storage', 'detached');
-      expect(storage.deprovisionAppStorage).not.toHaveBeenCalled();
+      expect(storage.revokeAppAccess).not.toHaveBeenCalled();
       expect(doRestart).not.toHaveBeenCalled();
     });
 
@@ -349,7 +354,7 @@ describe('DropPlatform object storage (#301)', () => {
       expect(await platform.detachService(appName, 'object-storage')).toEqual(
         expect.objectContaining({ detached: false, reason: 'service-unavailable' })
       );
-      expect(storage.deprovisionAppStorage).not.toHaveBeenCalled();
+      expect(storage.revokeAppAccess).not.toHaveBeenCalled();
     });
 
     it('keeps the intent and still restarts the app when AWS refuses the teardown', async () => {
@@ -357,8 +362,9 @@ describe('DropPlatform object storage (#301)', () => {
       stubStateManager(baseState({ status: 'running' }));
       stubRuntime(true);
       const storage = stubStorage({ allocated: [appName] });
-      storage.deprovisionAppStorage.mockRejectedValueOnce(new Error('AccessDenied: arn:aws:iam::123'));
+      storage.revokeAppAccess.mockRejectedValueOnce(new Error('AccessDenied: arn:aws:iam::123'));
       const doRestart = jest.spyOn(platform as any, 'doRestart').mockResolvedValue(undefined);
+      const sweep = jest.spyOn(platform as any, 'sweepRetiredObjectStorage').mockResolvedValue(undefined);
 
       const result = await platform.detachService(appName, 'object-storage');
 
@@ -369,6 +375,8 @@ describe('DropPlatform object storage (#301)', () => {
       expect(JSON.stringify(result)).not.toContain('arn:aws');
       expect(setServiceIntent).toHaveBeenCalled();
       expect(doRestart).toHaveBeenCalled();
+      // Nothing was revoked, so there is nothing for the sweep to drain yet.
+      expect(sweep).not.toHaveBeenCalled();
     });
 
     it('applies the per-service cooldown, but not to a retry of an unfinished detach', async () => {
@@ -390,6 +398,20 @@ describe('DropPlatform object storage (#301)', () => {
       expect(await platform.detachService(appName, 'object-storage')).toEqual(
         expect.objectContaining({ detached: true, deprovisioned: true })
       );
+    });
+
+    it('treats a retried detach whose key is already revoked as a success that re-kicks the drain', async () => {
+      stubAppConfigService(baseConfig({ services: { 'object-storage': 'detached' } }));
+      stubStateManager(baseState({ status: 'stopped' }));
+      stubRuntime(false);
+      stubStorage({ allocated: [appName] });
+      jest.spyOn(platform as any, 'doRestart').mockResolvedValue(undefined);
+      const sweep = jest.spyOn(platform as any, 'sweepRetiredObjectStorage').mockResolvedValue(undefined);
+
+      expect(await platform.detachService(appName, 'object-storage')).toEqual(
+        expect.objectContaining({ detached: true, deprovisioned: true, drainPending: true })
+      );
+      expect(sweep).toHaveBeenCalledTimes(1);
     });
 
     it('refuses a group app, like every other service', async () => {
@@ -430,6 +452,69 @@ describe('DropPlatform object storage (#301)', () => {
       stubAppConfigService(baseConfig({ services: { 'object-storage': 'attached' } }));
 
       expect(await envFor()).toEqual({});
+    });
+  });
+
+  describe('the sweep', () => {
+    const deferred = () => {
+      let resolve!: () => void;
+      const promise = new Promise<void>((r) => (resolve = r));
+      return { promise, resolve };
+    };
+
+    it('is single-flight: concurrent requests share one run, plus exactly one follow-up pass', async () => {
+      const storage = stubStorage();
+      const gate = deferred();
+      storage.sweepRetired.mockImplementationOnce(async () => {
+        await gate.promise;
+        return { destroyed: 0, failed: 0 };
+      });
+
+      const first = (platform as any).sweepRetiredObjectStorage() as Promise<void>;
+      const second = (platform as any).sweepRetiredObjectStorage() as Promise<void>;
+      const third = (platform as any).sweepRetiredObjectStorage() as Promise<void>;
+      expect(storage.sweepRetired).toHaveBeenCalledTimes(1);
+
+      gate.resolve();
+      await Promise.all([first, second, third]);
+      // The request that arrived mid-run is not lost, but several are not several runs.
+      expect(storage.sweepRetired).toHaveBeenCalledTimes(2);
+    });
+
+    it('drains a detached bucket only for an app whose owner intent is still detached', async () => {
+      const storage = stubStorage();
+      stubAppConfigService(baseConfig({ services: { 'object-storage': 'detached' } }));
+      await (platform as any).runObjectStorageSweep();
+      const { shouldDrain } = storage.sweepRetired.mock.calls[0][0] as { shouldDrain: (n: string) => boolean };
+
+      expect(shouldDrain(appName)).toBe(true);
+      stubAppConfigService(baseConfig({ services: { 'object-storage': 'attached' } }));
+      expect(shouldDrain(appName)).toBe(false);
+      stubAppConfigService(baseConfig());
+      expect(shouldDrain(appName)).toBe(false);
+    });
+
+    it('is awaited by stop() before the provisioner is torn down', async () => {
+      const storage = stubStorage();
+      const gate = deferred();
+      const events: string[] = [];
+      storage.sweepRetired.mockImplementationOnce(async () => {
+        await gate.promise;
+        events.push('sweep-done');
+        return { destroyed: 0, failed: 0 };
+      });
+      void (platform as any).sweepRetiredObjectStorage();
+      (platform as any).isRunning = true;
+
+      const stopping = platform.stop().then(() => events.push('stopped'));
+      await new Promise((r) => setTimeout(r, 20));
+      expect(events).toEqual([]);
+      expect((platform as any).objectStorage).not.toBeNull();
+
+      gate.resolve();
+      await stopping;
+      expect(events).toEqual(['sweep-done', 'stopped']);
+      expect((platform as any).objectStorage).toBeNull();
     });
   });
 

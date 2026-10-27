@@ -133,17 +133,23 @@ export class AllocationStore {
    * Merge fields into an existing record — live (keyed by app name) or
    * retired (keyed as `listRetired` reports). False when there is none.
    */
-  async amend(key: string, fields: Partial<Pick<AppStorageAllocation, 'accessRevoked'>> & {
-    retiredReason?: RetiredReason;
-  }): Promise<boolean> {
+  async amend(
+    key: string,
+    fields: Partial<Pick<AppStorageAllocation, 'accessRevoked'>> & {
+      retiredReason?: RetiredReason;
+      /** Forget the stored app secret — its key is revoked, so nothing may read it back. */
+      dropSecret?: boolean;
+    }
+  ): Promise<boolean> {
     let found = false;
     await this.write(async (file) => {
       const stored = own(file, key);
       if (!stored) return;
       found = true;
-      const { retiredReason, ...rest } = fields;
+      const { retiredReason, dropSecret, ...rest } = fields;
+      const { secretAccessKey, ...withoutSecret } = stored;
       file[key] = {
-        ...stored,
+        ...(dropSecret ? withoutSecret : { ...withoutSecret, secretAccessKey }),
         ...rest,
         ...(retiredReason && stored.retired ? { retired: { ...stored.retired, reason: retiredReason } } : {}),
       };

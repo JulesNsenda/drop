@@ -143,6 +143,12 @@ export type DetachServiceOutcome =
       objectsDeleted?: number;
       /** object-storage only. */
       bucketDeleted?: boolean;
+      /**
+       * object-storage only: the app's key is revoked and it is off the
+       * bucket, but the bucket (and its objects) is still being deleted in the
+       * background — `objectsDeleted`/`bucketDeleted` do not exist yet.
+       */
+      drainPending?: boolean;
       manifestConflict?: boolean;
     }
   | { detached: false; reason: 'backup-failed' | 'deprovision-failed'; detail: string };

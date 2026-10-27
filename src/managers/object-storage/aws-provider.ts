@@ -203,10 +203,13 @@ export class AwsObjectStorageProvider implements ObjectStorageProvider {
       );
       for (let i = 0; i < targets.length; i += 1000) {
         const batch = targets.slice(i, i + 1000);
-        await this.clients.s3.send(
+        const deleted = await this.clients.s3.send(
           new DeleteObjectsCommand({ Bucket: bucket, Delete: { Objects: batch, Quiet: true } })
         );
-        objectsDeleted += batch.length;
+        // DeleteObjects answers 200 with a per-object `Errors` list: those
+        // were NOT deleted, and the count must not claim them. (A non-empty
+        // bucket then fails DeleteBucket, so the teardown is retried.)
+        objectsDeleted += batch.length - (deleted?.Errors?.length ?? 0);
       }
       if (!page.IsTruncated) break;
       keyMarker = page.NextKeyMarker;

@@ -70,6 +70,7 @@ import {
 } from '../managers/redis';
 import {
   ObjectStorageProvisioner,
+  ObjectStorageDetachIncompleteError,
   ObjectStorageIncarnationError,
   ObjectStorageUnavailableError,
   configureObjectStorage,
@@ -815,6 +816,10 @@ export class DropPlatform {
   private redisProvisioner: RedisProvisioner | null = null;
   /** #301. Always constructed (it holds no connection); `availability()` says whether it can provision. */
   private objectStorage: ObjectStorageProvisioner | null = null;
+  /** The object-storage sweep in flight (single-flight), so `stop()` can wait for it. */
+  private storageSweep: Promise<void> | null = null;
+  /** A sweep was requested while one was running: go round once more, it may have missed the new work. */
+  private storageSweepAgain = false;
   private caddyServer: CaddyServer | null = null;
   private secretManager: SecretManager | null = null;
   private webhookManager: WebhookManager | null = null;
@@ -1351,6 +1356,24 @@ export class DropPlatform {
     if (this.redisProvisioner) {
       resetRedisProvisioner();
       this.redisProvisioner = null;
+    }
+    // A sweep still draining a bucket would otherwise outlive the provisioner
+    // it holds (and the stores a restart is about to rebind). Bounded: a huge
+    // bucket must not hold shutdown hostage — the unfinished record is simply
+    // still there for the next boot's sweep.
+    if (this.storageSweep) {
+      let timer: NodeJS.Timeout | undefined;
+      const outcome = await Promise.race([
+        this.storageSweep.then(() => 'done' as const),
+        new Promise<'timeout'>((resolve) => {
+          timer = setTimeout(() => resolve('timeout'), 30_000);
+          timer.unref?.();
+        }),
+      ]);
+      if (timer) clearTimeout(timer);
+      if (outcome === 'timeout') {
+        this.logger.warn('Shutdown proceeding with an object-storage sweep still draining', 'STORAGE');
+      }
     }
     resetObjectStorageProvisioner();
     resetStorageCredentialStore();
@@ -3797,15 +3820,41 @@ backup:
    * Retry the teardown of buckets whose app was deleted while AWS refused
    * (#301). Best-effort and quiet unless it did something.
    */
-  private async sweepRetiredObjectStorage(): Promise<void> {
+  private sweepRetiredObjectStorage(): Promise<void> {
+    // Single-flight: the timer, a delete and a detach can all ask at once, and
+    // two sweeps would drain the same bucket twice. A request that arrives
+    // mid-sweep earns exactly one more pass, so work added after the running
+    // sweep listed its records is not left for fifteen minutes.
+    if (this.storageSweep) {
+      this.storageSweepAgain = true;
+      return this.storageSweep;
+    }
+    const run = (async () => {
+      do {
+        this.storageSweepAgain = false;
+        await this.runObjectStorageSweep();
+      } while (this.storageSweepAgain && this.objectStorage);
+    })().finally(() => {
+      this.storageSweep = null;
+    });
+    this.storageSweep = run;
+    return run;
+  }
+
+  private async runObjectStorageSweep(): Promise<void> {
     if (!this.objectStorage) return;
     try {
-      const { destroyed, failed } = await this.objectStorage.sweepRetired();
+      const { destroyed, failed } = await this.objectStorage.sweepRetired({
+        // A live bucket is drained only for an app whose owner's intent is
+        // (still) 'detached' — the sweep is the one actor that deletes data
+        // with nobody watching.
+        shouldDrain: (appName) => this.appServiceIntent(appName, 'object-storage') === 'detached',
+      });
       if (destroyed > 0) {
-        this.logger.info(`Removed ${destroyed} object-storage allocation(s) left behind by deleted apps`, 'STORAGE');
+        this.logger.info(`Removed ${destroyed} object-storage bucket(s) left behind by deleted or detached apps`, 'STORAGE');
       }
       if (failed > 0) {
-        this.logger.warn(`${failed} deleted app(s) still have object storage AWS refused to remove — will retry`, 'STORAGE');
+        this.logger.warn(`${failed} object-storage bucket(s) AWS refused to remove — will retry`, 'STORAGE');
       }
     } catch (error) {
       this.logger.warn('Object-storage retry sweep failed', 'STORAGE', error);
@@ -8578,7 +8627,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
             appCreatedAt: state?.createdAt,
           });
         } catch (err) {
-          if (err instanceof ObjectStorageIncarnationError) {
+          if (err instanceof ObjectStorageIncarnationError || err instanceof ObjectStorageDetachIncompleteError) {
             return this.refuse('attach', appName, serviceId, {
               attached: false,
               reason: 'service-unavailable',
@@ -9155,48 +9204,41 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       });
     }
 
-    // 9-10. Stop (so nothing writes while the bucket drains), then destroy —
-    // one try, so a throw from either still reaches the single restart.
+    // 9. Revoke the app's key and delete its IAM user — the half of the
+    // teardown that is fast, and the half that matters: from here the app
+    // cannot touch the bucket whatever it still holds in memory. Progress is
+    // RECORDED on the allocation (accessRevoked), so a retry resumes and an
+    // attach in between is refused rather than handed a bucket the sweep is
+    // about to empty. The bucket itself is NOT drained here: a large one would
+    // hold this request open for minutes, and the app should restart without
+    // waiting for it.
     const wasRunning = this.stateManager!.getApp(appName)?.status === 'running';
     let wasLive = false;
-    let deprovisionStarted = false;
     let outcome: DetachServiceOutcome;
     try {
       wasLive = (await this.runtime!.getStatus(appName))?.status === 'running';
-      if (wasLive) {
-        this.stopHealthProber(appName);
-        this.stopCrashLoopWatch(appName);
-        await this.stateManager!.setAppStatus(appName, 'stopped');
-        await this.runtime!.stop(appName);
-      }
-      deprovisionStarted = true;
-      const result = await storage.deprovisionAppStorage(appName);
-      outcome = result
-        ? {
-            detached: true,
-            deprovisioned: true,
-            objectsDeleted: result.objectsDeleted,
-            bucketDeleted: result.bucketDeleted,
-          }
+      const revoked = await storage.revokeAppAccess(appName);
+      outcome = revoked
+        ? { detached: true, deprovisioned: true, drainPending: true }
         : // The allocation vanished since step 5 — nothing left to remove.
           { detached: true, deprovisioned: false };
     } catch (err) {
-      this.logger.error(
-        `detach: ${deprovisionStarted ? 'object storage teardown threw' : 'failed to stop the app'} for '${appName}'`,
-        'SERVICES',
-        err
-      );
+      this.logger.error(`detach: revoking the object storage key threw for '${appName}'`, 'SERVICES', err);
       outcome = {
         detached: false,
         reason: 'deprovision-failed',
-        detail: deprovisionStarted
-          ? 'The bucket could not be removed. The detach intent has been recorded and the app no longer receives its credentials — retry once AWS is reachable.'
-          : `'${appName}' could not be safely stopped, so its bucket was left untouched. The detach intent has been recorded — retry once the app can be stopped.`,
+        detail:
+          'The bucket key could not be revoked. The detach intent has been recorded and the app no longer receives its credentials — retry once AWS is reachable.',
       };
     }
 
-    // 11.
+    // 10. Restart, so the app comes back without the variables.
     const restartOutcome = await this.restartAfterDetach(appName, wasLive || wasRunning);
+
+    // 11. Drain through the sweep (not awaited), after the app is off the
+    // bucket. A failed revoke is retried here too: the sweep drains only
+    // revoked buckets, and a retried detach is what revokes this one.
+    if (outcome.detached && outcome.deprovisioned) void this.sweepRetiredObjectStorage();
     return { ...outcome, ...restartOutcome };
   }
 

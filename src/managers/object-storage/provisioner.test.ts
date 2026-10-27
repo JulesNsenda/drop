@@ -14,6 +14,7 @@ import { randomBytes } from 'crypto';
 import { StorageCredentialStore } from './credential-store';
 import { AllocationStore, AllocationStoreCorruptError } from './allocation-store';
 import {
+  ObjectStorageDetachIncompleteError,
   ObjectStorageIncarnationError,
   ObjectStorageProvisioner,
   ObjectStorageUnavailableError,
@@ -279,6 +280,93 @@ describe('object storage stores and provisioner', () => {
 
       await expect(p.deprovisionAppStorage('site')).rejects.toThrow('AccessDenied');
       expect(await p.getAllocation('site')).not.toBeNull();
+    });
+
+    describe('detaching (the app stays; its storage goes)', () => {
+      it('revokes the key, records it, and drops the secret — leaving the bucket for the sweep', async () => {
+        await configure();
+        const p = makeProvisioner();
+        const live = await p.provisionAppStorage('site', { ownerUserId: 'u1', appCreatedAt: 'T1' });
+
+        expect(await p.revokeAppAccess('site')).toEqual(expect.objectContaining({ bucket: live.bucket, accessRevoked: true }));
+
+        expect(provider.revokeAccess).toHaveBeenCalledWith({ userName: live.userName });
+        expect(provider.deprovision).not.toHaveBeenCalled();
+        expect(await p.getAllocation('site')).toEqual(expect.objectContaining({ accessRevoked: true }));
+        // Nothing can hand the dead key back to the app.
+        expect(await p.getEnvVars('site')).toBeNull();
+        expect(await fs.readFile(path.join(dir, 'object-storage.json'), 'utf-8')).not.toMatch(/secretAccessKey/);
+        // A retry does not call AWS again.
+        await p.revokeAppAccess('site');
+        expect(provider.revokeAccess).toHaveBeenCalledTimes(1);
+        expect(await p.revokeAppAccess('nobody')).toBeNull();
+      });
+
+      it('records nothing when AWS refuses the revoke, so the retry does the whole job', async () => {
+        await configure();
+        const p = makeProvisioner();
+        await p.provisionAppStorage('site');
+        provider.revokeAccess.mockRejectedValueOnce(new Error('Throttling'));
+
+        await expect(p.revokeAppAccess('site')).rejects.toThrow('Throttling');
+        expect((await p.getAllocation('site'))?.accessRevoked).toBeUndefined();
+
+        await p.revokeAppAccess('site');
+        expect((await p.getAllocation('site'))?.accessRevoked).toBe(true);
+      });
+
+      it('refuses an attach that finds a half-detached record, rather than mint a key the sweep would delete', async () => {
+        await configure();
+        const p = makeProvisioner();
+        await p.provisionAppStorage('site', { ownerUserId: 'u1', appCreatedAt: 'T1' });
+        await p.revokeAppAccess('site');
+        provider.provision.mockClear();
+
+        await expect(p.provisionAppStorage('site', { ownerUserId: 'u1', appCreatedAt: 'T1' })).rejects.toBeInstanceOf(
+          ObjectStorageDetachIncompleteError
+        );
+        expect(provider.provision).not.toHaveBeenCalled();
+      });
+
+      it('drains a revoked bucket only while the owner still wants it detached, re-checking right before deleting', async () => {
+        await configure();
+        const p = makeProvisioner();
+        const live = await p.provisionAppStorage('site');
+        await p.revokeAppAccess('site');
+
+        // Intent flipped back: not drained.
+        expect(await p.sweepRetired({ shouldDrain: () => false })).toEqual({ destroyed: 0, failed: 0 });
+        expect(provider.deprovision).not.toHaveBeenCalled();
+        // No callback at all (nothing knows the intent): not drained either.
+        expect(await p.sweepRetired()).toEqual({ destroyed: 0, failed: 0 });
+
+        // Intent changes between the listing and the drain: still not drained.
+        const answers = [true, false];
+        expect(await p.sweepRetired({ shouldDrain: () => answers.shift() ?? false })).toEqual({ destroyed: 0, failed: 0 });
+        expect(provider.deprovision).not.toHaveBeenCalled();
+
+        expect(await p.sweepRetired({ shouldDrain: () => true })).toEqual({ destroyed: 1, failed: 0 });
+        expect(provider.deprovision).toHaveBeenCalledWith({ bucket: live.bucket, userName: live.userName });
+        expect(await p.getAllocation('site')).toBeNull();
+      });
+
+      it('survives AWS failing between removing the user and removing the bucket, and finishes on retry', async () => {
+        await configure();
+        const p = makeProvisioner();
+        await p.provisionAppStorage('site');
+        await p.revokeAppAccess('site');
+        provider.deprovision.mockRejectedValueOnce(Object.assign(new Error('x'), { name: 'InternalError' }));
+
+        expect(await p.sweepRetired({ shouldDrain: () => true })).toEqual({ destroyed: 0, failed: 1 });
+        // Still tracked, still revoked, still refused for attach.
+        expect(await p.getAllocation('site')).toEqual(expect.objectContaining({ accessRevoked: true }));
+        await expect(p.provisionAppStorage('site')).rejects.toBeInstanceOf(ObjectStorageDetachIncompleteError);
+
+        expect(await p.sweepRetired({ shouldDrain: () => true })).toEqual({ destroyed: 1, failed: 0 });
+        expect(await p.getAllocation('site')).toBeNull();
+        // Now the name is genuinely free for a fresh attach.
+        expect((await p.provisionAppStorage('site')).appName).toBe('site');
+      });
     });
 
     describe('when the app is deleted', () => {
