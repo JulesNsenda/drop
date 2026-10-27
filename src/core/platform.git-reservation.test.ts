@@ -13,6 +13,7 @@ import * as path from 'path';
 import { createPlatform, DropPlatform } from './platform';
 import { reapBuildContainers } from './builder/container-build-runner';
 import * as dropYaml from './detector/drop-yaml-parser';
+import { sanitizeBuildEnv } from './builder/strategies/base';
 
 type Internals = {
   appsInProgress: Set<string>;
@@ -192,6 +193,38 @@ describe('git deploy folder reservation', () => {
 
       internals.gitReserved.delete('web');
       release();
+    });
+  });
+
+  describe('the build env of a git-deployed app', () => {
+    it('carries DROP_GIT_COMMIT (its own commit, or its group container's) and survives the build-env sanitiser', async () => {
+      const internals = platform as unknown as {
+        stateManager: unknown;
+        appConfigService: unknown;
+        resolveDependencies: jest.Mock;
+        resolveBuildEnv(p: string, n: string): Promise<Record<string, string>>;
+      };
+      internals.resolveDependencies = jest.fn().mockResolvedValue({});
+      internals.appConfigService = {
+        getConfig: (n: string) => (n === 'child' ? { groupContainer: 'box' } : undefined),
+      };
+      const apps: Record<string, unknown> = {
+        web: { name: 'web', gitSource: { repoUrl: 'x', branch: 'main', lastCommitSha: 'a'.repeat(40) } },
+        box: { name: 'box', gitSource: { repoUrl: 'x', branch: 'main', lastCommitSha: 'b'.repeat(40) } },
+        child: { name: 'child' },
+        plain: { name: 'plain' },
+      };
+      internals.stateManager = { getApp: (n: string) => apps[n] };
+
+      const web = await internals.resolveBuildEnv(path.join(tempDir, 'web'), 'web');
+      const child = await internals.resolveBuildEnv(path.join(tempDir, 'child'), 'child');
+      const plain = await internals.resolveBuildEnv(path.join(tempDir, 'plain'), 'plain');
+
+      expect(web.DROP_GIT_COMMIT).toBe('a'.repeat(40));
+      expect(child.DROP_GIT_COMMIT).toBe('b'.repeat(40));
+      expect(plain.DROP_GIT_COMMIT).toBeUndefined();
+      // And it reaches the build command: the sanitiser keeps it.
+      expect(sanitizeBuildEnv(web).DROP_GIT_COMMIT).toBe('a'.repeat(40));
     });
   });
 
