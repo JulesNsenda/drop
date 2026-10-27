@@ -42,6 +42,23 @@ const DEFAULT_ROUTER_CONFIG: RouterConfig = {
 /** What a Caddy reload came to. `unavailable` = Caddy not running / admin API unreachable. */
 export type CaddyReloadOutcome = 'ok' | 'unavailable' | 'rejected' | 'disabled';
 
+/**
+ * `addRoute` refused to replace a route that belongs to another owner or
+ * another hostname. The existing route is untouched.
+ */
+export class RouteConflictError extends Error {
+  constructor(
+    readonly key: string,
+    readonly existingOwner: string | undefined,
+    readonly existingHostname: string
+  ) {
+    super(
+      `Route '${key}' is already held by ${existingOwner ?? 'no owner'} for ${existingHostname}`
+    );
+    this.name = 'RouteConflictError';
+  }
+}
+
 function redactSecretLikeTokens(text: string): string {
   return text.replace(/[A-Za-z0-9_-]{24,}/g, '[redacted]');
 }
@@ -71,7 +88,9 @@ export class RouterService {
   }
 
   /**
-   * Add a route, REPLACING any existing one for the same name.
+   * Add a route, REPLACING any existing one for the same name. Throws
+   * `RouteConflictError` (changing nothing) when that route belongs to another
+   * owner or another hostname.
    *
    * Replace, not merge, and that distinction is load-bearing. `addRoute` takes
    * a COMPLETE `RouteConfig` — its caller has just described the whole route —
@@ -94,6 +113,22 @@ export class RouterService {
   async addRoute(routeConfig: RouteConfig): Promise<Route> {
     const { appName } = routeConfig;
     const existing = this.routes.get(appName);
+
+    // A key is only ever re-described by the route's own owner, for the same
+    // hostname. Anything else is a different route that happens to share the
+    // key, and replacing it would silently take the first one offline.
+    if (
+      existing &&
+      (existing.owner !== routeConfig.owner ||
+        existing.hostname.toLowerCase() !== routeConfig.hostname.toLowerCase())
+    ) {
+      console.warn(
+        `[router] Refusing to replace route '${appName}' (owner ${existing.owner ?? 'none'}, ` +
+          `host ${existing.hostname}) with one for owner ${routeConfig.owner ?? 'none'}, ` +
+          `host ${routeConfig.hostname}`
+      );
+      throw new RouteConflictError(appName, existing.owner, existing.hostname);
+    }
 
     // Apply defaults
     const config = this.applyDefaults(routeConfig);
