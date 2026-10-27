@@ -133,7 +133,7 @@ The layer that makes agent/API-driven deploys safe to expose. Independent limite
 - **`deploy-breaker.ts`** — circuit breaker on a *failing* loop; resets on the first success.
 - **`principal-quota.ts`** — deploys per principal per window, regardless of outcome. Explicitly distinct from the breaker: a caller alternating success and failure is never throttled by the breaker, but still burns build capacity. Per principal *and* per owning user, never global (a global cap is a DoS any tenant can trigger).
 - **`ephemeral.ts`** — throwaway TTL'd apps (default 60min, max 1440min, ≤3 live per principal) plus name/hostname constraints.
-- **`idle-reaper.ts`**, **`disk-ceiling.ts`**, **`promotion.ts`** — idle cleanup, disk headroom, and ephemeral→permanent promotion.
+- **`idle-reaper.ts`**, **`disk-ceiling.ts`**, **`promotion.ts`** — idle cleanup, disk headroom, and the manual build-and-hold promotion gate (`POST /apps/:name/promote`; a held build never serves until a human promotes it). There is no ephemeral→permanent promotion.
 
 Exceeding a limit returns a **structured refusal**, never a silent kill.
 
