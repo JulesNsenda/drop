@@ -9,7 +9,7 @@ import * as fs from 'fs/promises';
 import * as path from 'path';
 import * as os from 'os';
 import { ApiServer } from '../server';
-import { createUser, createApiKey, registerLocalCliKey, resetAuth } from '../middleware/auth';
+import { createUser, createApiKey, resetAuth } from '../middleware/auth';
 import { getTestToken } from '../__testutils__/auth';
 import { getStateManager, resetStateManager } from '../../managers/app/state-manager';
 import { resetAppConfigService } from '../../managers/app/app-config';
@@ -49,13 +49,10 @@ describe('destroying a bucket needs an interactive session and a confirmation (#
   const ops = (overrides?: Partial<PlatformOps>) => setPlatformOps(makePlatformOpsStub(overrides));
   const del = (url: string, headers: Record<string, string> = bearer(ownerToken), env?: unknown) =>
     hono.request(url, { method: 'DELETE', headers }, env as never);
+  /** The CLI's own key, exactly as the platform mints it at boot. */
+  const mintLocalCliKey = async () => ({ 'X-API-Key': (await createApiKey('cli-local', 'admin')).key });
   /** What @hono/node-server hands the app for a request that arrived on this socket. */
-  const fromSocket = (remoteAddress: string) => ({ incoming: { socket: { remoteAddress } } });
-  const mintLocalCliKey = async () => {
-    const created = await createApiKey('cli-local', 'admin');
-    registerLocalCliKey(created.apiKey.id);
-    return { 'X-API-Key': created.key };
-  };
+  const fromLoopback = { incoming: { socket: { remoteAddress: '127.0.0.1' } } };
 
   beforeEach(async () => {
     tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'drop-bucket-destruction-test-'));
@@ -131,6 +128,18 @@ describe('destroying a bucket needs an interactive session and a confirmation (#
       expect(detachService).not.toHaveBeenCalled();
     });
 
+    it('refuses the CLI\'s own key for a detach: dashboard-only', async () => {
+      const detachService = jest.fn().mockResolvedValue(detachResult);
+      ops({ detachService });
+      const cli = await mintLocalCliKey();
+
+      const res = await del('/api/v1/apps/site/services/object-storage?confirm=site', cli, fromLoopback);
+
+      expect(res.status).toBe(403);
+      expect(((await res.json()) as { error: { details?: { reason: string } } }).error.details?.reason).toBe('dashboard-only');
+      expect(detachService).not.toHaveBeenCalled();
+    });
+
     it('proceeds for an interactive session with the confirmation', async () => {
       const detachService = jest.fn().mockResolvedValue(detachResult);
       ops({ detachService });
@@ -185,71 +194,32 @@ describe('destroying a bucket needs an interactive session and a confirmation (#
       expect((await del('/api/v1/apps/site?keepData=true')).status).toBe(200);
     });
 
-    it("accepts the platform's own CLI key over a direct loopback connection, with the confirmation, but not without it", async () => {
+    it('refuses the CLI\'s own key for a bucket-destroying delete: destroying a bucket is dashboard-only', async () => {
       withRisk('bucket');
       const cli = await mintLocalCliKey();
-      const loopback = fromSocket('127.0.0.1');
 
-      expect((await del('/api/v1/apps/site', cli, loopback)).status).toBe(400);
+      // With and without the confirmation, from a direct loopback connection.
+      for (const url of ['/api/v1/apps/site', '/api/v1/apps/site?confirm=site']) {
+        const res = await del(url, cli, fromLoopback);
+        expect(res.status).toBe(403);
+        const body = (await res.json()) as { error: { message: string; details?: { reason: string } } };
+        expect(body.error.details?.reason).toBe('dashboard-only');
+        expect(body.error.message).toMatch(/dashboard/);
+        expect(body.error.message).toMatch(/keepData=true/);
+      }
+      expect(runtime.stop).not.toHaveBeenCalled();
       expect(getStateManager().getApp('site')).toBeDefined();
+    });
 
-      expect((await del('/api/v1/apps/site?confirm=site', cli, loopback)).status).toBe(200);
+    it('lets the CLI delete the app and KEEP the bucket (keepData), which destroys nothing', async () => {
+      withRisk('bucket');
+      const cli = await mintLocalCliKey();
+
+      expect((await del('/api/v1/apps/site?keepData=true', cli, fromLoopback)).status).toBe(200);
       expect(getStateManager().getApp('site')).toBeUndefined();
     });
 
-    it('also accepts it from ::1 and the IPv4-mapped loopback form', async () => {
-      withRisk('bucket');
-      const cli = await mintLocalCliKey();
-      expect((await del('/api/v1/apps/site?confirm=site', cli, fromSocket('::ffff:127.0.0.1'))).status).toBe(200);
-    });
-
-    it.each([
-      ['X-Forwarded-For', '203.0.113.9'],
-      ['X-Forwarded-Host', 'drop.example.com'],
-      ['X-Forwarded-Proto', 'https'],
-      ['X-Real-IP', '203.0.113.9'],
-      ['Forwarded', 'for=203.0.113.9'],
-      ['Via', '1.1 caddy'],
-    ])('refuses the local CLI key on a proxied request (%s present), even from a loopback peer', async (header, value) => {
-      withRisk('bucket');
-      const cli = await mintLocalCliKey();
-
-      const res = await del('/api/v1/apps/site?confirm=site', { ...cli, [header]: value }, fromSocket('127.0.0.1'));
-
-      expect(res.status).toBe(403);
-      expect(getStateManager().getApp('site')).toBeDefined();
-    });
-
-    it.each([['a remote peer', fromSocket('203.0.113.9')], ['an unreadable peer', undefined]])(
-      'refuses the local CLI key from %s',
-      async (_label, env) => {
-        withRisk('bucket');
-        const cli = await mintLocalCliKey();
-
-        expect((await del('/api/v1/apps/site?confirm=site', cli, env)).status).toBe(403);
-        expect(getStateManager().getApp('site')).toBeDefined();
-      }
-    );
-
-    it('pins the local CLI to the key minted at boot: a key with the same name, role and ownerlessness is refused', async () => {
-      withRisk('bucket');
-      await mintLocalCliKey();
-      const lookalike = { 'X-API-Key': (await createApiKey('cli-local', 'admin')).key };
-
-      const res = await del('/api/v1/apps/site?confirm=site', lookalike, fromSocket('127.0.0.1'));
-
-      expect(res.status).toBe(403);
-      expect(getStateManager().getApp('site')).toBeDefined();
-    });
-
-    it('treats no registered boot key as no local CLI at all', async () => {
-      withRisk('bucket');
-      const key = { 'X-API-Key': (await createApiKey('cli-local', 'admin')).key };
-
-      expect((await del('/api/v1/apps/site?confirm=site', key, fromSocket('127.0.0.1'))).status).toBe(403);
-    });
-
-    it('still refuses every other credential with the confirmation: other admin keys, owned admin keys, agent tokens', async () => {
+    it('refuses every other credential with the confirmation too: other admin keys, owned admin keys, agent tokens', async () => {
       withRisk('bucket');
       const admin = await createUser({ username: 'boss', role: 'admin', credential: { password: 'password123' } });
       const keys: Record<string, string> = {
@@ -312,6 +282,22 @@ describe('destroying a bucket needs an interactive session and a confirmation (#
 
       expect((await del('/api/v1/apps/mono?confirm=mono')).status).toBe(200);
       expect(removeGroup).toHaveBeenCalledWith('mono');
+    });
+
+    it('refuses the CLI\'s own key for a bucket-destroying group delete too', async () => {
+      const sm = getStateManager();
+      const owner = (await sm.getApp('site'))!.userId;
+      await sm.registerApp('mono-web', path.join(tempDir, 'mono-web'));
+      await sm.updateApp('mono-web', { userId: owner, group: 'mono' });
+      const removeGroup = jest.fn().mockResolvedValue({ removed: ['mono-web'] });
+      ops({
+        removeGroup,
+        objectStorageDeleteRisk: jest.fn(async (n: string) => (n === 'mono-web' ? 'bucket' : 'none')),
+      });
+      const cli = await mintLocalCliKey();
+
+      expect((await del('/api/v1/apps/mono?confirm=mono', cli, fromLoopback)).status).toBe(403);
+      expect(removeGroup).not.toHaveBeenCalled();
     });
 
     it('answers 503 for a group delete when a child allocation store is unreadable', async () => {

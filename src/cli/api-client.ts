@@ -136,14 +136,10 @@ export class DropApiClient {
 
   async removeApp(
     name: string,
-    opts?: { keepData?: boolean; destroyBucket?: boolean }
+    opts?: { keepData?: boolean }
   ): Promise<{ message?: string; database?: 'dropped' | 'retained' | 'preserved' | 'none' }> {
-    const params = new URLSearchParams();
-    if (opts?.keepData) params.set('keepData', 'true');
-    // The explicit confirmation the server demands before it deletes a bucket.
-    if (opts?.destroyBucket) params.set('confirm', name);
-    const qs = params.toString();
-    return this.request('DELETE', `/apps/${encodeURIComponent(name)}${qs ? '?' + qs : ''}`);
+    const qs = opts?.keepData ? '?keepData=true' : '';
+    return this.request('DELETE', `/apps/${encodeURIComponent(name)}${qs}`);
   }
 
   async getLogs(name: string, lines = 100): Promise<string[]> {

@@ -200,30 +200,10 @@ export interface AuthContext {
    */
   principalId?: string;
   /**
-   * True only for THE key the platform minted at this boot for the CLI
-   * (`registerLocalCliKey`), matched by its id. Not by name, role or
-   * ownerlessness: another admin can create a key with all of those. It is a
-   * property of the credential only; the destructive-action gate additionally
-   * requires the request itself to be a direct loopback connection.
-   */
-  localCli?: true;
-  /**
    * Set only for a token minted through POST /auth/agent-tokens. Load-bearing
    * at the MCP gate — see mcpAuthMiddleware.
    */
   kind?: 'agent';
-}
-
-/** The id of the CLI key the platform minted at this boot (see `registerLocalCliKey`). */
-let localCliKeyId: string | null = null;
-
-/**
- * Record which API key is the platform's own CLI key. Called once per boot,
- * with the id of the key just minted into `local.key`; only that id is ever
- * treated as the local CLI.
- */
-export function registerLocalCliKey(id: string): void {
-  localCliKeyId = id;
 }
 
 /**
@@ -2535,7 +2515,6 @@ function apiKeyAuthContext(key: ApiKey, owner: SafeUser | null): AuthContext {
       // more than one. Ownership still flows through userId above.
       principalId: `key:${key.id}`,
       ...(key.kind ? { kind: key.kind } : {}),
-      ...(localCliKeyId !== null && key.id === localCliKeyId ? { localCli: true as const } : {}),
     };
   }
 
@@ -2712,7 +2691,6 @@ export function resetAuth(): void {
   lastUsedFlushAt = 0;
   challengeAttempts.clear();
   revokedGrants.clear();
-  localCliKeyId = null;
   identitiesCorruptReported = false;
 }
 

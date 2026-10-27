@@ -53,7 +53,6 @@ export interface ProcessOptions extends GlobalOptions {
 export interface RemoveOptions extends GlobalOptions {
   force?: boolean;
   keepData?: boolean;
-  destroyBucket?: boolean;
 }
 
 /**

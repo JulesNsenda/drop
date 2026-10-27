@@ -111,35 +111,6 @@ export function interactiveSessionOnly(
 }
 
 /**
- * The bar for a destructive action that a PERSON must stand behind (deleting
- * a bucket): an interactive session, or the platform's own CLI key, which only
- * a local operator at the machine can read, presented over a direct loopback
- * connection (not through a proxy). Never an agent token, an OAuth token, or
- * any other API key, however privileged its role — those are what a leaked
- * secret or a looping agent looks like.
- */
-export function interactiveSessionOrLocalCli(
-  requester: AuthContext | undefined,
-  action: string,
-  /** Whether this very request is a direct loopback connection (see `isDirectLoopbackRequest`). */
-  directLoopback: boolean
-): { ok: true; requester: AuthContext } | { ok: false; message: string } {
-  if (!requester) {
-    return { ok: false, message: `${action} is unavailable when authentication is disabled.` };
-  }
-  if (requester.kind === 'agent') {
-    return { ok: false, message: `${action} cannot be done with an agent token.` };
-  }
-  if (requester.authMethod === 'jwt') return { ok: true, requester };
-  // The key alone is not enough: a proxied request can carry it too.
-  if (requester.localCli === true && requester.role === 'admin' && directLoopback) return { ok: true, requester };
-  return {
-    ok: false,
-    message: `${action} requires an interactive session, or the CLI run on the server itself. Other API keys, OAuth tokens and proxied requests cannot be used.`,
-  };
-}
-
-/**
  * Whether the current request may OPEN an app in a browser — the ACCESS
  * question, as distinct from the management question `canAccess` answers
  * (DROP-152).

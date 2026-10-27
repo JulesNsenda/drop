@@ -13,8 +13,7 @@ import { pipeline } from 'stream/promises';
 import { success, error, ErrorCodes, AppDto, CreateAppDto } from '../types';
 import { NotFoundError, ValidationError } from '../middleware/error';
 import { AuthContext, listUsers, getUserById } from '../middleware/auth';
-import { canAccess, interactiveSessionOrLocalCli } from '../access';
-import { isDirectLoopbackRequest } from '../loopback';
+import { canAccess, interactiveSessionOnly } from '../access';
 import { isValidAppName, validateAppName } from '../middleware/validate';
 import { getAppRuntime } from '../../managers/runtime';
 import {
@@ -704,9 +703,10 @@ apps.put('/:name', async c => {
  * object-storage bucket and every object in it (#301). Two requirements, both
  * enforced on the server because the dashboard's dialog is only a courtesy:
  *
- *  - an INTERACTIVE session, or the platform's own CLI key (`drop remove
- *    --destroy-bucket`): any other API key, an OAuth token or an agent token
- *    never reaches this, however privileged its role;
+ *  - an INTERACTIVE session (`interactiveSessionOnly`, i.e. the dashboard):
+ *    no API key — the CLI's own included — OAuth token or agent token ever
+ *    reaches this, however privileged its role. Destroying a bucket is
+ *    dashboard-only; the CLI can delete the app with `--keep-data` instead;
  *  - an explicit `?confirm=<target>` naming what is being destroyed, so a
  *    script or a stray DELETE cannot trigger it by accident.
  *
@@ -718,9 +718,17 @@ function bucketDestructionRefusal(
   target: string,
   action: string
 ): Response | null {
-  const gate = interactiveSessionOrLocalCli(auth, action, isDirectLoopbackRequest(c));
+  const gate = interactiveSessionOnly(auth, action);
   if (!gate.ok) {
-    return c.json(error(ErrorCodes.UNAUTHORIZED, gate.message), 403);
+    return c.json(
+      error(
+        ErrorCodes.UNAUTHORIZED,
+        `${gate.message} Destroying an object-storage bucket can only be done from the dashboard` +
+          (action.startsWith('Detaching') ? '.' : ', or pass keepData=true to delete the app and keep the bucket.'),
+        { reason: 'dashboard-only' }
+      ),
+      403
+    );
   }
   if (c.req.query('confirm') !== target) {
     return c.json(

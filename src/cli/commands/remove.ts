@@ -8,7 +8,6 @@ import { Command } from 'commander';
 import { RemoveOptions } from '../cli.types';
 import * as output from '../utils/output';
 import { createApiClient, DropApiError } from '../api-client';
-import { ask, isInteractiveTerminal } from '../utils/prompt';
 
 export function createRemoveCommand(): Command {
   const cmd = new Command('remove')
@@ -17,10 +16,6 @@ export function createRemoveCommand(): Command {
     .argument('<app>', 'Application name')
     .option('-f, --force', 'Force removal without confirmation')
     .option('--keep-data', 'Keep application data and logs')
-    .option(
-      '--destroy-bucket',
-      "Also permanently delete the app's object-storage bucket and every object in it (no backup)"
-    )
     .action(async (appName: string, options: RemoveOptions) => {
       try {
         const client = await createApiClient();
@@ -39,33 +34,10 @@ export function createRemoveCommand(): Command {
           process.exit(1);
         }
 
-        // Destroying a bucket is a person's decision: it is typed at a terminal,
-        // never passed from a script (a pipe, cron, an agent). The server
-        // accepts this CLI's key for it, so this prompt is the check that a
-        // human is there.
-        if (options.destroyBucket) {
-          if (!isInteractiveTerminal()) {
-            output.error(
-              '--destroy-bucket permanently deletes data and has to be confirmed by a person: run it from an interactive terminal, or delete the app from the dashboard. It cannot be confirmed from a script.'
-            );
-            process.exit(1);
-          }
-          const typed = await ask(
-            `This permanently deletes ${appName}'s object-storage bucket and every object in it, with no backup.\nType the app name to confirm: `
-          );
-          if (typed !== appName) {
-            output.error('The name did not match, so nothing was deleted.');
-            process.exit(1);
-          }
-        }
-
         const spin = output.spinner(`Removing ${appName}...`);
         spin.start();
 
-        const result = await client.removeApp(appName, {
-          keepData: options.keepData,
-          destroyBucket: options.destroyBucket,
-        });
+        const result = await client.removeApp(appName, { keepData: options.keepData });
 
         spin.succeed(`Removed ${appName}`);
 
@@ -93,15 +65,13 @@ export function createRemoveCommand(): Command {
       } catch (err) {
         if (err instanceof DropApiError) {
           output.error(err.message);
-          // The server refuses to delete a bucket without an explicit say-so;
-          // say which two ways forward there are.
-          if (err.details?.reason === 'confirmation-required') {
+          // The server refuses to destroy a bucket from anything but the
+          // dashboard (a 403, or a 400 asking for the confirmation the
+          // dashboard sends). Say what the app holds and the two ways forward.
+          if (err.details?.reason === 'dashboard-only' || err.details?.reason === 'confirmation-required') {
             output.info(
-              isInteractiveTerminal()
-                ? `${appName} holds an object-storage bucket. To delete the app and KEEP the bucket, re-run with --keep-data. ` +
-                    'To delete the app AND permanently destroy the bucket and every object in it (no backup), re-run with --destroy-bucket and type the app name when asked.'
-                : `${appName} holds an object-storage bucket. To delete the app and keep the bucket, re-run with --keep-data. ` +
-                    'Destroying the bucket has to be confirmed by a person, interactively, in the dashboard or at a terminal.'
+              `${appName} holds an object-storage bucket. Use --keep-data to delete the app and keep the bucket, ` +
+                'or delete it from the dashboard to destroy the bucket.'
             );
           }
         } else {

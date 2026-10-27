@@ -1,7 +1,7 @@
 /**
- * `drop remove` and bucket destruction (#301): `--destroy-bucket` sends the
- * explicit confirmation the server demands, and a refusal for want of it says
- * which two flags are the way forward.
+ * `drop remove` and object-storage buckets (#301): destroying a bucket is
+ * dashboard-only, so the CLI has no flag for it. It can delete the app and keep
+ * the bucket (`--keep-data`), and when the server refuses it says so.
  */
 import { createRemoveCommand } from './remove';
 import { DropApiClient, DropApiError } from '../api-client';
@@ -9,13 +9,6 @@ import * as output from '../utils/output';
 
 const removeApp = jest.fn();
 const getApp = jest.fn();
-const ask = jest.fn();
-const isInteractiveTerminal = jest.fn();
-
-jest.mock('../utils/prompt', () => ({
-  ask: (q: string) => ask(q),
-  isInteractiveTerminal: () => isInteractiveTerminal(),
-}));
 
 jest.mock('../api-client', () => {
   const actual = jest.requireActual('../api-client');
@@ -26,19 +19,16 @@ async function run(args: string[]): Promise<void> {
   await createRemoveCommand().parseAsync(args, { from: 'user' });
 }
 
-describe('drop remove --destroy-bucket', () => {
-  let exit: jest.SpyInstance;
+describe('drop remove and buckets', () => {
   let errors: string[];
   let infos: string[];
 
   beforeEach(() => {
     removeApp.mockReset();
-    ask.mockReset();
-    isInteractiveTerminal.mockReset().mockReturnValue(true);
     getApp.mockReset().mockResolvedValue({ name: 'site', status: 'stopped' });
     errors = [];
     infos = [];
-    exit = jest.spyOn(process, 'exit').mockImplementation((() => {
+    jest.spyOn(process, 'exit').mockImplementation((() => {
       throw new Error('exit');
     }) as never);
     jest.spyOn(output, 'error').mockImplementation(((m: string) => void errors.push(m)) as never);
@@ -48,74 +38,35 @@ describe('drop remove --destroy-bucket', () => {
   });
   afterEach(() => jest.restoreAllMocks());
 
-  it('offers the flag', () => {
-    expect(createRemoveCommand().options.map((o) => o.long)).toContain('--destroy-bucket');
+  it('has no flag for destroying a bucket', () => {
+    const flags = createRemoveCommand().options.map((o) => o.long);
+    expect(flags).toContain('--keep-data');
+    expect(flags).not.toContain('--destroy-bucket');
   });
 
-  it('prompts for the app name, and sends the confirmation only once it is typed', async () => {
-    removeApp.mockResolvedValue({ database: 'none' });
-    ask.mockResolvedValue('site');
+  it('deletes the app and keeps its bucket with --keep-data', async () => {
+    removeApp.mockResolvedValue({ database: 'preserved' });
 
-    await run(['site', '--destroy-bucket']);
+    await run(['site', '--keep-data']);
 
-    expect(ask).toHaveBeenCalledTimes(1);
-    expect(ask.mock.calls[0][0]).toMatch(/permanently deletes site's object-storage bucket/);
-    expect(removeApp).toHaveBeenLastCalledWith('site', { keepData: undefined, destroyBucket: true });
+    expect(removeApp).toHaveBeenCalledWith('site', { keepData: true });
+    expect(errors).toEqual([]);
   });
 
-  it('does not prompt, or destroy anything, without the flag', async () => {
-    removeApp.mockResolvedValue({ database: 'none' });
-
-    await run(['site']);
-
-    expect(ask).not.toHaveBeenCalled();
-    expect(removeApp).toHaveBeenLastCalledWith('site', { keepData: undefined, destroyBucket: undefined });
-  });
-
-  it('deletes nothing when the typed name does not match', async () => {
-    ask.mockResolvedValue('sit');
-
-    await expect(run(['site', '--destroy-bucket'])).rejects.toThrow('exit');
-
-    expect(removeApp).not.toHaveBeenCalled();
-    expect(errors.join(' ')).toMatch(/did not match/);
-  });
-
-  it('refuses outright when stdin is not a terminal: a script cannot confirm a destroy', async () => {
-    isInteractiveTerminal.mockReturnValue(false);
-
-    await expect(run(['site', '--destroy-bucket'])).rejects.toThrow('exit');
-
-    expect(ask).not.toHaveBeenCalled();
-    expect(removeApp).not.toHaveBeenCalled();
-    expect(errors.join(' ')).toMatch(/confirmed by a person/);
-    expect(errors.join(' ')).toMatch(/dashboard/);
-  });
-
-  const refusal = () =>
-    new DropApiError(400, 'VALIDATION_ERROR', 'Deleting site needs ?confirm=site', { reason: 'confirmation-required' });
-
-  it('at a terminal, a confirmation-required refusal names both ways forward', async () => {
-    removeApp.mockRejectedValue(refusal());
+  it.each([
+    ['403', new DropApiError(403, 'UNAUTHORIZED', "Deleting 'site' requires an interactive session.", { reason: 'dashboard-only' })],
+    ['400', new DropApiError(400, 'VALIDATION_ERROR', 'Deleting site needs ?confirm=site', { reason: 'confirmation-required' })],
+  ])('on a %s refusal, says the app holds a bucket and the two ways forward', async (_label, refusal) => {
+    removeApp.mockRejectedValue(refusal);
 
     await expect(run(['site'])).rejects.toThrow('exit');
 
-    expect(errors[0]).toMatch(/needs \?confirm=site/);
-    expect(infos.join(' ')).toMatch(/--keep-data/);
-    expect(infos.join(' ')).toMatch(/--destroy-bucket/);
-    expect(exit).toHaveBeenCalledWith(1);
-  });
-
-  it('off a terminal, the refusal does NOT coach the caller towards --destroy-bucket', async () => {
-    isInteractiveTerminal.mockReturnValue(false);
-    removeApp.mockRejectedValue(refusal());
-
-    await expect(run(['site'])).rejects.toThrow('exit');
-
+    expect(errors[0]).toBe(refusal.message);
     const advice = infos.join(' ');
-    expect(advice).toMatch(/--keep-data/);
+    expect(advice).toMatch(/site holds an object-storage bucket/);
+    expect(advice).toMatch(/--keep-data to delete the app and keep the bucket/);
+    expect(advice).toMatch(/delete it from the dashboard to destroy the bucket/);
     expect(advice).not.toMatch(/--destroy-bucket/);
-    expect(advice).toMatch(/confirmed by a person, interactively, in the dashboard or at a terminal/);
   });
 
   it('adds no advice to an unrelated refusal', async () => {
@@ -139,32 +90,30 @@ describe('DropApiClient.removeApp', () => {
     }) as never;
   });
 
-  it('builds the query: keepData, and confirm=<name> for destroyBucket', async () => {
+  it('builds the query: keepData only', async () => {
     const client = new DropApiClient('http://localhost:3000', 'k');
     await client.removeApp('site');
     await client.removeApp('site', { keepData: true });
-    await client.removeApp('site', { destroyBucket: true });
 
     expect(calls.map((u) => u.replace('http://localhost:3000/api/v1', ''))).toEqual([
       '/apps/site',
       '/apps/site?keepData=true',
-      '/apps/site?confirm=site',
     ]);
   });
 
   it('carries the server error details on the thrown error', async () => {
     global.fetch = jest.fn(async () => ({
       ok: false,
-      status: 400,
+      status: 403,
       json: async () => ({
         success: false,
-        error: { code: 'VALIDATION_ERROR', message: 'm', details: { reason: 'confirmation-required' } },
+        error: { code: 'UNAUTHORIZED', message: 'm', details: { reason: 'dashboard-only' } },
       }),
     })) as never;
 
     await expect(new DropApiClient('http://x', 'k').removeApp('site')).rejects.toMatchObject({
-      statusCode: 400,
-      details: { reason: 'confirmation-required' },
+      statusCode: 403,
+      details: { reason: 'dashboard-only' },
     });
   });
 });

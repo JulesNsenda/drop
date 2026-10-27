@@ -85,15 +85,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `auth-disabled`) under `isolation: none`, where a PM2 app inherits the
     platform's environment. A PM2 app also no longer inherits the platform's
     `DROP_`/`AWS_`/`CF_` environment at all (see Upgrading).
-  - **Destroying a bucket needs a person and a confirmation.** Detaching, or
-    deleting an app (or group) that holds a bucket, requires an interactive
-    session and `?confirm=<name>`, checked server-side before anything is
-    stopped. Other API keys, OAuth and agent tokens are refused. The CLI's own
-    boot key is also accepted, but only from a direct loopback connection
-    (nothing proxied) and only behind `drop remove <app> --destroy-bucket`,
-    which makes you type the app name at a terminal and refuses off a TTY;
-    `--keep-data` keeps the bucket. An unreadable allocation store
-    answers 503 rather than asking. The dashboard dialogs say so and send it.
+  - **Destroying a bucket is dashboard-only.** Detaching, or deleting an app
+    (or group) that holds a bucket, requires an interactive dashboard session
+    and `?confirm=<name>`, checked server-side before anything is stopped. Every
+    API key (the CLI's included), OAuth token and agent token is refused, so
+    `drop remove <app>` on such an app prints that it holds a bucket: use
+    `--keep-data` to delete the app and keep the bucket, or delete it from the
+    dashboard to destroy the bucket. An unreadable allocation store answers 503
+    rather than asking. The dashboard dialogs say so and send the confirmation.
   - **A delete retires the record before touching AWS.** The allocation is
     moved off the app's name first, the IAM key is revoked, and the bucket is
     drained in the background rather than while the DELETE waits. Records carry

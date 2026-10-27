@@ -169,12 +169,7 @@ import {
   validateDomainFormat,
   isLocalhostDomain,
 } from '../utils/domain-validator';
-import {
-  createApiKey,
-  deleteApiKeysByName,
-  isAdminPrincipalId,
-  registerLocalCliKey,
-} from '../api/middleware/auth';
+import { createApiKey, deleteApiKeysByName, isAdminPrincipalId } from '../api/middleware/auth';
 import { isNameTaken } from './app-names';
 import { resetDeployReservations } from './deploy-reservations';
 // The STRICT name pattern (the API's), not the folder-drop parser's looser
@@ -11666,10 +11661,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     try {
       const keyPath = path.join(this.config.dropRoot, 'data', 'drop-svc', 'local.key');
       await deleteApiKeysByName('cli-local');
-      const { key, apiKey } = await createApiKey('cli-local', 'admin');
-      // Only THIS key (by id) counts as the local CLI for destructive-action
-      // confirmation; a key another admin names 'cli-local' does not.
-      registerLocalCliKey(apiKey.id);
+      const { key } = await createApiKey('cli-local', 'admin');
       await fs.writeFile(keyPath, key, { encoding: 'utf-8', mode: 0o600 });
       this.logger.info('Local CLI auth key written', 'API');
     } catch (err) {
