@@ -6,6 +6,7 @@
 
 export {
   RouterService,
+  RouteConflictError,
   createRouterService,
   getRouterService,
   resetRouterService,
