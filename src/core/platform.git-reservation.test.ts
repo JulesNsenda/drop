@@ -197,7 +197,7 @@ describe('git deploy folder reservation', () => {
   });
 
   describe('the build env of a git-deployed app', () => {
-    it('carries DROP_GIT_COMMIT (its own commit, or its group container's) and survives the build-env sanitiser', async () => {
+    it('carries DROP_GIT_COMMIT (its own commit, or that of its group container) and survives the build-env sanitiser', async () => {
       const internals = platform as unknown as {
         stateManager: unknown;
         appConfigService: unknown;
