@@ -7477,7 +7477,17 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       originalPort,
       rebuildsStaleTree,
     };
-    const acquired = await this.acquireSlotAndRecheck(appName, admitted);
+    let acquired: Awaited<ReturnType<DropPlatform['acquireSlotAndRecheck']>>;
+    try {
+      acquired = await this.acquireSlotAndRecheck(appName, admitted);
+    } catch (error) {
+      // A throw from the slot wait or the disk probe is a refusal nobody
+      // reported: release the keys and the claim exactly as a refusal does,
+      // then let it surface.
+      this.releaseGuardrailKeys(appName);
+      this.appsInProgress.delete(appName);
+      throw error;
+    }
     if ('refused' in acquired) {
       // Released, not counted: the build never ran, and neither a refusal nor
       // the box being full is evidence the caller is looping. Leaving the key
@@ -7546,7 +7556,13 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     // a healthy running app that simply can't be rebuilt right now. Must run
     // after appsInProgress.add (before it would open a TOCTOU double-build
     // window) and before setAppStatus('building') (so status stays 'running').
-    const disk = await hasEnoughDisk(admitted.appPath);
+    let disk;
+    try {
+      disk = await hasEnoughDisk(admitted.appPath);
+    } catch (error) {
+      releaseSlot();
+      throw error;
+    }
     if (!disk.ok) {
       this.logger.warn(
         `Skipping hot-reload of ${appName}: insufficient disk (${Math.round(disk.freeMb)} MB free, need ${getMinFreeDiskMb()} MB)`,

@@ -449,6 +449,27 @@ describe('handleAppUpdate exit trace', () => {
   });
 
   describe('past the mint', () => {
+    // Deliberate deviation from "behaviour-preserving" (#359): these two throws
+    // used to leak the claim (and the slot, for the disk probe) until restart.
+    it('a throw from the slot wait releases the claim and the key, and surfaces', async () => {
+      p().builder.reserveSlot.mockRejectedValue(new Error('slot wait blew up'));
+      await expect(p().handleAppUpdate(appName, appPath, 'file change', true)).rejects.toThrow('slot wait blew up');
+      expect(p().appsInProgress.has(appName)).toBe(false);
+      expect(p().breakerKeys.has(appName)).toBe(false);
+      expect(trace.filter((e) => e === `inprogress.delete:${appName}`)).toHaveLength(1);
+      expect(p().builder.build).not.toHaveBeenCalled();
+    });
+
+    it('a throw from the disk probe releases the slot, the claim and the key, and surfaces', async () => {
+      (hasEnoughDisk as jest.Mock).mockRejectedValue(new Error('disk probe blew up'));
+      await expect(p().handleAppUpdate(appName, appPath, 'file change', true)).rejects.toThrow('disk probe blew up');
+      expect(slotReleased).toBe(true);
+      expect(p().appsInProgress.has(appName)).toBe(false);
+      expect(p().breakerKeys.has(appName)).toBe(false);
+      expect(trace.filter((e) => e === `inprogress.delete:${appName}`)).toHaveLength(1);
+      expect(p().builder.build).not.toHaveBeenCalled();
+    });
+
     it('a pre-build throw closes the episode under the minted deployId', async () => {
       detectThrows = new Error('detect blew up');
       const r = await update();
