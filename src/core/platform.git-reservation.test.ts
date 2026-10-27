@@ -210,12 +210,13 @@ describe('git deploy folder reservation', () => {
       const removed: string[] = [];
       return {
         removed,
-        listContainers: jest.fn(async (opts: { filters?: { label?: string[] } }) =>
-          all.filter((c) =>
-            (opts.filters?.label ?? []).every((l) => {
-              const [k, v] = l.split('=');
-              return v === undefined ? k in c.Labels : c.Labels[k] === v;
-            })
+        listContainers: jest.fn(async (opts: { filters?: { label?: string[]; name?: string[] } }) =>
+          all.filter(
+            (c) =>
+              (opts.filters?.label ?? []).every((l) => {
+                const [k, v] = l.split('=');
+                return v === undefined ? k in c.Labels : c.Labels[k] === v;
+              }) && (opts.filters?.name ?? []).every((n) => c.Names.some((cn) => cn.includes(n)))
           )
         ),
         getContainer: jest.fn((id: string) => ({
@@ -265,6 +266,53 @@ describe('git deploy folder reservation', () => {
       pl.runtime = { type: 'docker', docker: fakeDocker([lookalike, build('build-victim-1', 'b1')]) };
       expect(await pl.hasLiveBuildContainer('victim')).toBe(false);
       expect(await pl.hasLiveBuildContainer('build-victim-1')).toBe(true);
+    });
+
+    // A build started by the binary from before containers were labelled.
+    const legacy: FakeContainer = { Id: 'old', Names: ['/drop-build-web-1730000000000'], Labels: {} };
+    // A RUNTIME container (managed) for an app whose own name looks like a build container.
+    const managedLookalike: FakeContainer = {
+      Id: 'managed',
+      Names: ['/drop-build-foo-1730000000000'],
+      Labels: { 'drop.managed': 'true' },
+    };
+
+    it('reaps a legacy (unlabelled) build container left by the previous binary', async () => {
+      const docker = fakeDocker([legacy, build('api', 'a1')]);
+      expect(await reapBuildContainers(docker as never)).toBe(2);
+      expect(docker.removed.sort()).toEqual(['a1', 'old']);
+    });
+
+    it('a legacy build container blocks EVERY app (fail closed) until it is reaped', async () => {
+      const pl = createPlatform({
+        dropRoot: tempDir,
+        appsDirectory: path.join(tempDir, 'apps'),
+        logLevel: 'error',
+        isolation: 'docker',
+      }) as unknown as Internals;
+      const docker = fakeDocker([legacy]);
+      pl.runtime = { type: 'docker', docker };
+      expect(await pl.hasLiveBuildContainer('unrelated')).toBe(true);
+
+      await reapBuildContainers(docker as never);
+      const after = fakeDocker([]);
+      pl.runtime = { type: 'docker', docker: after };
+      expect(await pl.hasLiveBuildContainer('unrelated')).toBe(false);
+    });
+
+    it('a drop.managed runtime container with a build-like name is neither counted nor reaped', async () => {
+      const pl = createPlatform({
+        dropRoot: tempDir,
+        appsDirectory: path.join(tempDir, 'apps'),
+        logLevel: 'error',
+        isolation: 'docker',
+      }) as unknown as Internals;
+      const docker = fakeDocker([managedLookalike]);
+      pl.runtime = { type: 'docker', docker };
+      expect(await pl.hasLiveBuildContainer('foo')).toBe(false);
+      expect(await pl.hasLiveBuildContainer('other')).toBe(false);
+      expect(await reapBuildContainers(docker as never)).toBe(0);
+      expect(docker.removed).toEqual([]);
     });
 
     it('reaping removes labelled build containers only, never a look-alike', async () => {
