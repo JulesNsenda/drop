@@ -813,7 +813,9 @@ export async function createUser(input: NewUserInput): Promise<User> {
   }
 
   const passwordHash = hashPassword(
-    'password' in credential ? credential.password : crypto.randomBytes(32).toString('hex')
+    // Decided by the same check as the passwordless flag, so an object that
+    // somehow carries both fields never stores a usable password.
+    externalIdentity ? crypto.randomBytes(32).toString('hex') : (credential as { password: string }).password
   ).hash;
   const user: User = {
     id: crypto.randomUUID(),
