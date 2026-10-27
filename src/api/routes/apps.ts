@@ -1314,7 +1314,8 @@ function redeployRefusalResponse(c: Context, refusal: RedeployRefusal) {
 // POST /apps/:name/redeploy - rebuild a FILES app from the source already on
 // disk and swap it in. The platform waits up to 10s for a builder slot: in time
 // the 202 carries the deploy id; otherwise it says `accepted` and the redeploy
-// carries on in the background. Either way `follow` is the app + since stream
+// carries on in the background. Either way `follow` (omitted for a role-none
+// caller, which cannot read /deploys) is the app + since stream
 // (GET /deploys/stream), NOT the by-id stream: between the mint and the build's
 // first event the deploy has no episode, and the by-id stream 404s there, while
 // the since-stream waits for it (and shows a refusal after the wait). Git-backed
