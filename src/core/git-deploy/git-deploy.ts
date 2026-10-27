@@ -83,6 +83,29 @@ export interface GitDeployServiceConfig {
 const DEFAULT_MAX_GIT_ENTRIES = 200_000;
 
 /**
+ * Prefix of a first deploy's staging directory, created in the apps folder
+ * itself so the final rename never crosses a volume. Dot-prefixed: the watcher
+ * (path-parser isValidAppName) and the initial scan both skip hidden names, so
+ * a stage is never mistaken for an app.
+ */
+const STAGE_PREFIX = '.drop-stage-';
+
+/**
+ * The platform has not (or no longer) published its operations: during boot,
+ * before they are set, and during shutdown, after they are reset. It is a kind
+ * of "busy" - nothing is lost, the redeploy just cannot run YET - so it is an
+ * AppInProgressError: callers map it to 409, the webhook queues it, and the
+ * queue keeps the entry instead of recording a failure.
+ */
+export class PlatformNotReadyError extends AppInProgressError {
+  constructor(appName: string) {
+    super(appName);
+    this.name = 'PlatformNotReadyError';
+    this.message = 'Platform operations are unavailable; not writing the app folder';
+  }
+}
+
+/**
  * The caps a git checkout is held to. A repository is not an upload: its
  * history-free tree is routinely larger than a tarball a person built, so the
  * size cap is its own setting (`DROP_MAX_GIT_CHECKOUT_MB`), defaulting to twice
@@ -171,6 +194,15 @@ export class GitDeployService {
     // crash's leftover. A CLI process never sweeps (it shares the directory).
     if (this.config.sweepCloneBase) {
       await fs.rm(this.cloneBase, { recursive: true, force: true }).catch(() => undefined);
+      // A first deploy that died between staging and the rename leaves its stage
+      // beside the apps (dot-prefixed, so never an app).
+      for (const entry of await fs.readdir(this.config.appsDirectory).catch(() => [] as string[])) {
+        if (entry.startsWith(STAGE_PREFIX)) {
+          await fs
+            .rm(path.join(this.config.appsDirectory, entry), { recursive: true, force: true })
+            .catch(() => undefined);
+        }
+      }
     }
     if (this.config.resumeQueue) await this.loadPending();
     this.gitAvailable = await isGitAvailable();
@@ -259,6 +291,13 @@ export class GitDeployService {
   }
 
   private async flushPending(): Promise<void> {
+    // Never flush before the platform has published its operations (the timer
+    // fires about two seconds after boot, ahead of setPlatformOps), nor after
+    // it has withdrawn them (shutdown): keep every entry and look again later.
+    if (!getPlatformOps()) {
+      this.schedulePending();
+      return;
+    }
     for (const [appName, actor] of [...this.pending]) {
       this.pending.delete(appName);
       await this.persistPending();
@@ -296,7 +335,7 @@ export class GitDeployService {
   ): Promise<() => void> {
     const ops = getPlatformOps();
     if (!ops) {
-      if (requireOps) throw new Error('Platform operations are unavailable; not writing the app folder');
+      if (requireOps) throw new PlatformNotReadyError(appName);
       return () => undefined;
     }
     if (app?.isGroupContainer && app.group) {
@@ -644,10 +683,11 @@ export class GitDeployService {
         }
         const limits = { maxBytes: caps.maxBytes, maxEntries: caps.maxEntries };
         if (firstDeploy) {
-          // A new app is built beside the apps folder (same volume, never watched)
-          // and renamed into place in one step, so the watcher, the CLI and every
-          // other reader see either nothing or the whole tree, never half of it.
-          const stage = await fs.mkdtemp(path.join(base, `${appName}-stage-`));
+          // A new app is built in a hidden directory INSIDE the apps folder (the
+          // same volume as its destination, which the watcher ignores) and renamed
+          // into place in one step, so the watcher, the CLI and every other reader
+          // see either nothing or the whole tree, never half of it.
+          const stage = await fs.mkdtemp(path.join(path.dirname(destPath), `${STAGE_PREFIX}${appName}-`));
           try {
             const landed = await landTracked({
               cloneDir,
@@ -661,7 +701,7 @@ export class GitDeployService {
               await fs.rename(stage, destPath);
             } catch (err) {
               const code = (err as NodeJS.ErrnoException).code;
-              if (code === 'EEXIST' || code === 'ENOTEMPTY' || code === 'EPERM') {
+              if (code === 'EEXIST' || code === 'ENOTEMPTY') {
                 throw new Error(`Application '${appName}' already exists`);
               }
               throw err;
@@ -716,7 +756,7 @@ export class GitDeployService {
     // Cheap early refusal; the reservation below is the real guard.
     const ops = getPlatformOps();
     if (!ops) {
-      throw new Error('Platform operations are unavailable; not writing the app folder');
+      throw new PlatformNotReadyError(appName);
     }
     if (ops.isAppInProgress(appName)) {
       throw new AppInProgressError(appName);

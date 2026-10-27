@@ -19,6 +19,7 @@ import * as breakerModule from '../../managers/guardrail/deploy-breaker';
 import { tryReserve, ownerOf, isReserved, resetDeployReservations } from '../deploy-reservations';
 import { eventBus } from '../event-bus';
 import { setPlatformOps, resetPlatformOps, AppInProgressError } from '../../api/platform-ops';
+import { PlatformNotReadyError } from './git-deploy';
 import type { PlatformOps } from '../../api/platform-ops';
 import { makePlatformOpsStub } from '../../api/__testutils__/platform-ops';
 import * as activity from '../../managers/activity';
@@ -1073,12 +1074,111 @@ describe('GitDeployService', () => {
         await expect(service.redeploy('grp-container')).rejects.toBeInstanceOf(AppInProgressError);
       });
 
-      it('fails closed when platform operations are unavailable', async () => {
+      it('fails closed when platform operations are unavailable, as a busy-kind error', async () => {
         const appName = 'land-no-ops';
         await service.deploy({ repoUrl: `https://github.com/user/${appName}`, branch: 'main' });
         resetPlatformOps();
 
-        await expect(service.redeploy(appName)).rejects.toThrow(/unavailable/);
+        const err = await service.redeploy(appName).catch((e: Error) => e);
+        expect(err).toBeInstanceOf(PlatformNotReadyError);
+        expect(err).toBeInstanceOf(AppInProgressError);
+        expect((err as Error).message).toMatch(/unavailable/);
+      });
+
+      it('the queue keeps its entries while the platform has not published its operations (boot) or has withdrawn them (shutdown)', async () => {
+        const appName = 'land-queue-boot';
+        await service.deploy({ repoUrl: `https://github.com/user/${appName}`, branch: 'main' });
+        const pending = (): Map<string, unknown> =>
+          (service as unknown as { pending: Map<string, unknown> }).pending;
+        const flush = (): Promise<void> =>
+          (service as unknown as { flushPending(): Promise<void> }).flushPending();
+        const redeploy = jest.spyOn(service, 'redeploy');
+        const failures: string[] = [];
+        const unsub = eventBus.subscribe('build:failed', (p) => {
+          failures.push(p.appId);
+        });
+        try {
+          // Boot: the timer fires before setPlatformOps.
+          resetPlatformOps();
+          service.queueRedeploy(appName, { automation: 'webhook' });
+          await flush();
+          expect(redeploy).not.toHaveBeenCalled();
+          expect(pending().has(appName)).toBe(true);
+          expect(failures).toEqual([]);
+
+          // Shutdown race: the operations vanish after the flush started.
+          installOps();
+          redeploy.mockRejectedValueOnce(new PlatformNotReadyError(appName));
+          await flush();
+          expect(pending().has(appName)).toBe(true);
+          expect(failures).toEqual([]);
+
+          // Once ready, it runs and leaves the queue.
+          redeploy.mockRestore();
+          await flush();
+          expect(pending().has(appName)).toBe(false);
+        } finally {
+          unsub();
+          service.dispose();
+        }
+      });
+
+      it('a first deploy is staged inside the apps folder (one volume) under a hidden name, and renamed into place', async () => {
+        const appName = 'land-stage-parent';
+        const rename = jest.spyOn(require('fs/promises'), 'rename');
+        try {
+          await service.deploy({ repoUrl: `https://github.com/user/${appName}`, branch: 'main' });
+          const call = rename.mock.calls.find((c) => String(c[1]) === appDir(appName));
+          expect(call).toBeDefined();
+          expect(path.dirname(String(call![0]))).toBe(path.join(tempDir, 'webapps'));
+          expect(path.basename(String(call![0])).startsWith('.drop-stage-')).toBe(true);
+        } finally {
+          rename.mockRestore();
+        }
+      });
+
+      it('only EEXIST/ENOTEMPTY mean "already exists"; any other rename error surfaces as it is', async () => {
+        const realFs = require('fs/promises');
+        const original = realFs.rename.bind(realFs);
+        const rename = jest.spyOn(realFs, 'rename');
+        // Fail only the rename INTO the app folder (the platform's own atomic
+        // state writes also rename, and must keep working).
+        const failInto = (name: string, code: string): void => {
+          rename.mockImplementation(async (from: unknown, to: unknown) => {
+            if (String(to) === appDir(name)) {
+              throw Object.assign(new Error(`${code}: simulated`), { code });
+            }
+            return original(from, to);
+          });
+        };
+        try {
+          failInto('land-rename-a', 'EEXIST');
+          await expect(
+            service.deploy({ repoUrl: 'https://github.com/user/land-rename-a', branch: 'main' })
+          ).rejects.toThrow(/already exists/);
+
+          failInto('land-rename-b', 'EPERM');
+          const err = await service
+            .deploy({ repoUrl: 'https://github.com/user/land-rename-b', branch: 'main' })
+            .catch((e: Error) => e);
+          expect((err as Error).message).toContain('EPERM');
+          expect((err as Error).message).not.toMatch(/already exists/);
+        } finally {
+          rename.mockRestore();
+        }
+      });
+
+      it('the platform removes a stage left by a crashed first deploy at boot', async () => {
+        const leftover = path.join(tempDir, 'webapps', '.drop-stage-crashed-abc123');
+        await fs.mkdir(leftover, { recursive: true });
+
+        const platformShaped = new GitDeployService({
+          appsDirectory: path.join(tempDir, 'webapps'),
+          sweepCloneBase: true,
+        });
+        await platformShaped.initialize();
+
+        expect(await exists(leftover)).toBe(false);
       });
 
       it('a push refused as busy is queued (latest wins) and runs once the app is free', async () => {

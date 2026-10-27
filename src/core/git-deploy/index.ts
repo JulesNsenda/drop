@@ -9,6 +9,7 @@ export {
   getGitDeployService,
   resetGitDeployService,
   gitCheckoutCaps,
+  PlatformNotReadyError,
 } from './git-deploy';
 export {
   gitClone,

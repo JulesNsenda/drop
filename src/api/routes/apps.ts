@@ -1097,13 +1097,6 @@ apps.post('/:name/promote', async c => {
     return c.json(error(ErrorCodes.SERVICE_UNAVAILABLE, 'Platform operations unavailable'), 503);
   }
 
-  if (ops.isAppInProgress(name)) {
-    return c.json(
-      error(ErrorCodes.CONFLICT, `Application '${name}' is building or deploying - retry once it settles`),
-      409
-    );
-  }
-
   try {
     await ops.promoteApp(name);
     await logActivityFor(auth, {
@@ -1114,6 +1107,14 @@ apps.post('/:name/promote', async c => {
   } catch (err) {
     if (err instanceof StaleDependenciesError) {
       return c.json(error(ErrorCodes.CONFLICT, err.message), 409);
+    }
+    // promoteApp claims the app before it touches anything, so a build that
+    // started in the meantime surfaces here (not as a 500).
+    if (err instanceof AppInProgressError) {
+      return c.json(
+        error(ErrorCodes.CONFLICT, `Application '${name}' is building or deploying - retry once it settles`),
+        409
+      );
     }
     const message = err instanceof Error ? err.message : 'Promote failed';
     if (message.includes('awaiting promotion')) {
