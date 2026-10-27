@@ -8,8 +8,8 @@
  *
  * The tests NOT tagged DEVIATION pin behaviour the split of #359 preserved; they
  * pass unchanged against the pre-split platform.ts. The DEVIATION tests pin what
- * the split deliberately fixed (a throw leaking the claim; a decision taken from
- * the entry snapshot) and the direct contracts of the three stages.
+ * the split deliberately fixed (a throw leaking the claim; a breaker that tripped
+ * while the update queued) and the direct contracts of the stages.
  *
  * The builder is a fake so the slot release is countable; the post-build swap
  * is stubbed at the platform's own private seams (same shape as
@@ -62,7 +62,6 @@ describe('handleAppUpdate exit trace', () => {
   let startThrows: Error | undefined;
   let detectThrows: Error | undefined;
   let quiesced: boolean;
-  let runtimeLive: boolean;
   let buildEffect: (() => void) | undefined;
   let unsubs: Array<() => void>;
   const appName = `trace-app-${Date.now()}`;
@@ -86,7 +85,6 @@ describe('handleAppUpdate exit trace', () => {
     startThrows = undefined;
     detectThrows = undefined;
     quiesced = false;
-    runtimeLive = true;
     buildEffect = undefined;
     buildResult = { success: true, duration: 12, outputPath: null };
 
@@ -116,7 +114,6 @@ describe('handleAppUpdate exit trace', () => {
     };
     p().runtime = {
       type: 'pm2',
-      getStatus: jest.fn(async () => (runtimeLive ? { status: 'running' } : null)),
       stop: jest.fn(async () => log('runtime.stop')),
       start: jest.fn(async () => {
         log('runtime.start');
@@ -585,7 +582,6 @@ describe('handleAppUpdate exit trace', () => {
 
     it('success on an app stopped at entry that needs its tree rebuilt does not stop or re-stop it', async () => {
       appState = { ...appState, status: 'stopped' };
-      runtimeLive = false;
       jest.spyOn(p(), 'dependenciesAreStale').mockResolvedValue(true);
       const r = await update();
       expect(r.result).toBe(true);
@@ -646,23 +642,6 @@ describe('handleAppUpdate exit trace', () => {
       expect(p().builder.build).not.toHaveBeenCalled();
     });
 
-    it('a throw from the disk probe frees the slot, closes the episode and surfaces', async () => {
-      (hasEnoughDisk as jest.Mock).mockRejectedValue(new Error('disk probe blew up'));
-      await expect(p().handleAppUpdate(appName, appPath, 'file change', true)).rejects.toThrow('disk probe blew up');
-      const r = snapshot();
-      expect(r.trace).toEqual([
-        `inprogress.add:${appName}`,
-        'slot.release',
-        'keys.release',
-        'episode.fail:disk probe blew up:ID1:-',
-        'outcome:false(none)',
-        `inprogress.delete:${appName}`,
-      ]);
-      expect(slotReleased).toBe(true);
-      expectReleased();
-      expect(p().builder.build).not.toHaveBeenCalled();
-    });
-
     it('a failure handler that throws before the build still closes the episode under the minted id', async () => {
       detectThrows = new Error('detect blew up');
       (p().stateManager.setAppStatus as jest.Mock).mockImplementation(async (_n: string, status: string) => {
@@ -696,36 +675,6 @@ describe('handleAppUpdate exit trace', () => {
       expect(getDeployBreaker().peek(watcherKey).failures).toBe(1);
     });
 
-    it('decides from the state re-read after the wait: an app that errored while queued is not restored to running', async () => {
-      reserveEffect = () => (appState = { ...appState, status: 'errored', port: undefined });
-      buildResult = { success: false, duration: 1, errors: [{ message: 'tsc exploded' }] };
-      const r = await update();
-      expect(r.result).toBe(false);
-      expect(r.trace).toContain('status:errored:tsc exploded');
-      expect(r.trace.filter((e) => e.startsWith('status:running'))).toEqual([]);
-      expect(appState.status).toBe('errored');
-      expectReleased();
-    });
-
-    it('stops a live process before the swap whatever its stored status (a crash-looping app)', async () => {
-      reserveEffect = () => (appState = { ...appState, status: 'errored' });
-      runtimeLive = true;
-      const r = await update();
-      expect(r.result).toBe(true);
-      expect(p().runtime.stop).toHaveBeenCalledTimes(1);
-      expect(p().runtime.start).toHaveBeenCalledTimes(1);
-      expectReleased();
-    });
-
-    it('does not stop anything when no process is live, whatever its stored status', async () => {
-      runtimeLive = false; // stored 'running', nothing alive
-      const r = await update();
-      expect(r.result).toBe(true);
-      expect(p().runtime.stop).not.toHaveBeenCalled();
-      expect(p().runtime.start).toHaveBeenCalledTimes(1);
-      expectReleased();
-    });
-
     it('refuses, closing the outcome unpaid, when the breaker tripped while the update waited for its slot', async () => {
       jest
         .spyOn(p(), 'checkGuardrails')
@@ -752,51 +701,6 @@ describe('handleAppUpdate exit trace', () => {
       expectReleased();
     });
 
-    it('drops the deploy, discarding its target and closing the episode unpaid, when the app is stopped during the build', async () => {
-      buildEffect = () => (appState = { ...appState, status: 'stopped' });
-      const r = await update();
-      expect(r.result).toBe(false);
-      expect(r.trace).toEqual([
-        `inprogress.add:${appName}`,
-        'status:building',
-        'buildlog.start:ID1',
-        'discard',
-        'builder.build:ID1',
-        'slot.release',
-        'discard',
-        'keys.release',
-        'episode.fail:the app was stopped during the deploy:ID1:-',
-        'outcome:false(none)',
-        `inprogress.delete:${appName}`,
-      ]);
-      expect(r.logs).toContain('info:UPDATE:Dropped redeploy for <app> - app was stopped by user during the build');
-      expect(p().runtime.stop).not.toHaveBeenCalled();
-      expect(p().runtime.start).not.toHaveBeenCalled();
-      expect(appState.status).toBe('stopped');
-      const watcherKey = p().guardrailKeys(appName, false, {})[0].key as string;
-      expect(getDeployBreaker().peek(watcherKey).failures).toBe(0);
-      expectReleased();
-    });
-
-    it('drops the deploy when the app is removed during the build', async () => {
-      buildEffect = () => (appState = undefined);
-      const r = await update();
-      expect(r.result).toBe(false);
-      expect(r.trace).toContain('episode.fail:the app was removed during the deploy:ID1:-');
-      expect(p().runtime.stop).not.toHaveBeenCalled();
-      expect(p().runtime.start).not.toHaveBeenCalled();
-      expectReleased();
-    });
-
-    it('a stopped-at-entry stale-tree rebuild is not dropped for being stopped', async () => {
-      appState = { ...appState, status: 'stopped' };
-      runtimeLive = false;
-      jest.spyOn(p(), 'dependenciesAreStale').mockResolvedValue(true);
-      const r = await update();
-      expect(r.result).toBe(true);
-      expectReleased();
-    });
-
     it('a failure handler that throws with the builder\'s episode still open closes it under the minted id', async () => {
       buildEffect = () =>
         eventBus.publish('build:started', { appId: appName, buildId: 'b-1', deployId: 'D1' } as never);
@@ -811,7 +715,13 @@ describe('handleAppUpdate exit trace', () => {
   });
 
   describe('DEVIATION: the stage contracts', () => {
-    const admitted = () => ({ appPath, statusAtEntry: 'running' });
+    const admitted = () => ({
+      appPath,
+      statusAtEntry: 'running',
+      appState,
+      wasRunning: true,
+      originalPort: 3005,
+    });
     const claim = () => p().breakerKeys.set(appName, p().guardrailKeys(appName, false, {}));
 
     const refusals: Array<[string, () => void]> = [
@@ -835,26 +745,11 @@ describe('handleAppUpdate exit trace', () => {
       expect(p().breakerKeys.has(appName)).toBe(guardrail ? false : true);
     });
 
-    it('acquireSlotAndRecheck: reads the app AFTER the disk probe', async () => {
-      (hasEnoughDisk as jest.Mock).mockImplementation(async () => {
-        appState = undefined; // removed while the probe ran
-        return { ok: true, freeMb: 999999 };
-      });
-      expect(await p().acquireSlotAndRecheck(appName, admitted())).toEqual({ refused: 'gone' });
-    });
-
-    it('acquireSlotAndRecheck: success hands back the live slot and the state it re-read', async () => {
+    it('acquireSlotAndRecheck: success hands back the live slot', async () => {
       const got = await p().acquireSlotAndRecheck(appName, admitted());
-      expect(got.current).toBe(appState);
       expect(slotReleased).toBe(false);
       got.releaseSlot();
       expect(slotReleased).toBe(true);
-      expect(trace).toEqual(['slot.release']);
-    });
-
-    it('acquireSlotAndRecheck: a disk probe that throws frees the slot and rethrows', async () => {
-      (hasEnoughDisk as jest.Mock).mockRejectedValue(new Error('disk probe blew up'));
-      await expect(p().acquireSlotAndRecheck(appName, admitted())).rejects.toThrow('disk probe blew up');
       expect(trace).toEqual(['slot.release']);
     });
 
@@ -900,7 +795,7 @@ describe('handleAppUpdate exit trace', () => {
       expect(p().breakerKeys.has(appName)).toBe(false);
     });
 
-    it('runClaimedUpdate: a failure handler that throws rejects done, which is logged so nothing goes unhandled', async () => {
+    it('runClaimedUpdate: a failure handler that throws rejects done and logs nothing itself', async () => {
       claim();
       detectThrows = new Error('detect blew up');
       (p().stateManager.setAppStatus as jest.Mock).mockImplementation(async (_n: string, status: string) => {
@@ -910,7 +805,7 @@ describe('handleAppUpdate exit trace', () => {
       const releaseClaim = jest.fn();
       const r = await p().runClaimedUpdate(appName, admitted(), releaseClaim);
       await expect(r.done).rejects.toThrow('state store down');
-      expect(logged).toHaveBeenCalledTimes(1);
+      expect(logged).not.toHaveBeenCalled();
       expect(releaseClaim).toHaveBeenCalledTimes(1);
     });
 
@@ -921,7 +816,6 @@ describe('handleAppUpdate exit trace', () => {
       ['a failed start', () => (startThrows = new Error('port in use')), false],
       ['a pre-build throw', () => (detectThrows = new Error('detect blew up')), false],
       ['a throwing slot wait', () => p().builder.reserveSlot.mockRejectedValue(new Error('slot')), 'throws'],
-      ['a throwing disk probe', () => (hasEnoughDisk as jest.Mock).mockRejectedValue(new Error('disk')), 'throws'],
       [
         'a throwing failure handler',
         () => {

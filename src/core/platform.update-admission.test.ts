@@ -106,7 +106,6 @@ describe('handleAppUpdate admission and failure bookkeeping', () => {
       });
     p().runtime = {
       type: 'pm2',
-      getStatus: jest.fn().mockResolvedValue({ status: 'running' }),
       stop: jest.fn().mockResolvedValue(undefined),
       start: jest.fn().mockResolvedValue({ pid: 4242 }),
     };
