@@ -223,7 +223,17 @@ describe('DropPlatform object storage (#301)', () => {
       expect(setServiceIntent).not.toHaveBeenCalled();
     });
 
-    it.each(['AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY', 'S3_BUCKET'])(
+    it.each([
+      'AWS_ACCESS_KEY_ID',
+      'AWS_SECRET_ACCESS_KEY',
+      'AWS_REGION',
+      'S3_BUCKET',
+      // Not injected by DROP, but each one points an AWS SDK somewhere of the app's own choosing.
+      'AWS_SESSION_TOKEN',
+      'AWS_PROFILE',
+      'AWS_ENDPOINT_URL',
+      'AWS_ENDPOINT_URL_S3',
+    ])(
       'refuses when the app already sets its own %s, before provisioning anything',
       async (name) => {
         const setServiceIntent = stubAppConfigService(baseConfig());

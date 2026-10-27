@@ -35,9 +35,11 @@ Attach is refused when:
 
 - the app is ephemeral (it is torn down on a timer);
 - the app is part of a monorepo group (group apps cannot detach a service);
-- the app already sets `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` or
-  `S3_BUCKET` itself, as a secret or in `drop.yaml` `env:`. The injected
-  values would replace them and point the app at an empty bucket;
+- the app already sets any variable an AWS SDK takes credentials, a region or
+  an endpoint from — `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
+  `AWS_SESSION_TOKEN`, `AWS_PROFILE`, `AWS_REGION`, `AWS_ENDPOINT_URL`,
+  `AWS_ENDPOINT_URL_S3` or `S3_BUCKET` — as a secret or in `drop.yaml` `env:`.
+  The injected values would replace them and point the app at an empty bucket;
 - the owner already has `DROP_MAX_OBJECT_STORAGE_PER_USER` buckets (default
   3; `0` means unlimited). Apps deployed by the operator (with no owning user)
   are not counted.

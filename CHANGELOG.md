@@ -114,7 +114,9 @@ that declares a `healthCheck`.**
   and `S3_BUCKET`, which every AWS SDK reads with no code; its key reaches
   that one bucket and nothing else. Attach-only: there is no `drop.yaml` key,
   because the bucket bills the operator. It is refused for ephemeral apps,
-  monorepo group apps, apps that already set any of those variables, and past
+  monorepo group apps, apps that already set any of those variables or any
+  other AWS credential, region or endpoint variable (`AWS_SESSION_TOKEN`,
+  `AWS_PROFILE`, `AWS_ENDPOINT_URL`, `AWS_ENDPOINT_URL_S3`), and past
   `DROP_MAX_OBJECT_STORAGE_PER_USER` (default 3). **Detaching
   (`DELETE .../services/object-storage`) or deleting the app deletes the
   bucket and every object in it, with no backup**, and the dashboard's

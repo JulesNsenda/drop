@@ -73,6 +73,7 @@ import {
   ObjectStorageDetachIncompleteError,
   ObjectStorageIncarnationError,
   ObjectStorageUnavailableError,
+  APP_OWNED_AWS_NAMES,
   blankInheritedAdminEnv,
   configureObjectStorage,
   resetObjectStorageProvisioner,
@@ -3735,7 +3736,10 @@ backup:
     appName: string,
     appPath: string
   ): Promise<{ name: string; source: 'secret' | 'drop.yaml env' } | null> {
-    const names = ['AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY', 'S3_BUCKET'];
+    // Every name an AWS SDK reads credentials, a region or an endpoint from —
+    // not just the four DROP injects. An app that sets AWS_PROFILE, a session
+    // token or its own endpoint is already talking to some AWS of its own.
+    const names = APP_OWNED_AWS_NAMES;
     try {
       for (const name of names) {
         if (this.secretManager?.get(appName, name)) return { name, source: 'secret' };
