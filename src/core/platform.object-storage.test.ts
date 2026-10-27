@@ -12,7 +12,7 @@
 import * as path from 'path';
 import * as os from 'os';
 import { DropPlatform, createPlatform } from './platform';
-import { ObjectStorageUnavailableError } from '../managers/object-storage';
+import { ObjectStorageIncarnationError, ObjectStorageUnavailableError } from '../managers/object-storage';
 import * as idleReaper from '../managers/guardrail/idle-reaper';
 import type { AppState } from '../managers/app/state-manager';
 import type { AppConfig } from '../managers/app/app-config';
@@ -70,6 +70,7 @@ describe('DropPlatform object storage (#301)', () => {
     canDeprovision: jest.Mock;
     deprovisionAppStorage: jest.Mock;
     teardownForDeletedApp: jest.Mock;
+    undoProvision: jest.Mock;
     sweepRetired: jest.Mock;
   };
 
@@ -105,6 +106,7 @@ describe('DropPlatform object storage (#301)', () => {
         return { objectsDeleted: 7, bucketDeleted: true, userDeleted: true };
       }),
       teardownForDeletedApp: jest.fn().mockResolvedValue({ outcome: 'none' }),
+      undoProvision: jest.fn().mockResolvedValue(undefined),
       sweepRetired: jest.fn().mockResolvedValue({ destroyed: 0, failed: 0 }),
     };
     (platform as any).objectStorage = stub;
@@ -126,7 +128,8 @@ describe('DropPlatform object storage (#301)', () => {
   describe('attach', () => {
     it('provisions, persists the intent, then restarts — and reports variable NAMES only', async () => {
       const setServiceIntent = stubAppConfigService(baseConfig());
-      stubStateManager(baseState());
+      const state = baseState();
+      stubStateManager(state);
       stubSecrets();
       const storage = stubStorage();
       const doRestart = jest.spyOn(platform as any, 'doRestart').mockResolvedValue(undefined);
@@ -135,12 +138,55 @@ describe('DropPlatform object storage (#301)', () => {
 
       expect(result).toEqual({ attached: true, envVarNames: Object.keys(ENV) });
       expect(JSON.stringify(result)).not.toContain(ENV.AWS_SECRET_ACCESS_KEY);
-      expect(storage.provisionAppStorage).toHaveBeenCalledWith(appName, { ownerUserId: baseState().userId });
+      expect(storage.provisionAppStorage).toHaveBeenCalledWith(appName, {
+        ownerUserId: 'user-1',
+        appCreatedAt: state.createdAt,
+      });
       expect(setServiceIntent).toHaveBeenCalledWith(appName, 'object-storage', 'attached');
       expect(storage.provisionAppStorage.mock.invocationCallOrder[0]).toBeLessThan(
         setServiceIntent.mock.invocationCallOrder[0]
       );
       expect(setServiceIntent.mock.invocationCallOrder[0]).toBeLessThan(doRestart.mock.invocationCallOrder[0]);
+    });
+
+    it('takes back a bucket it just created when the app lost its config before the intent could be saved', async () => {
+      const setServiceIntent = stubAppConfigService(baseConfig());
+      setServiceIntent.mockResolvedValueOnce(null);
+      stubStateManager(baseState());
+      stubSecrets();
+      const storage = stubStorage();
+      const doRestart = jest.spyOn(platform as any, 'doRestart').mockResolvedValue(undefined);
+
+      expect(await platform.attachService(appName, 'object-storage')).toEqual(
+        expect.objectContaining({ attached: false, reason: 'no-app-config' })
+      );
+      expect(storage.undoProvision).toHaveBeenCalledWith(appName);
+      expect(doRestart).not.toHaveBeenCalled();
+    });
+
+    it('does NOT undo a bucket that already existed before this attach', async () => {
+      const setServiceIntent = stubAppConfigService(baseConfig());
+      setServiceIntent.mockResolvedValueOnce(null);
+      stubStateManager(baseState());
+      stubSecrets();
+      const storage = stubStorage({ allocated: [appName] });
+
+      await platform.attachService(appName, 'object-storage');
+      expect(storage.undoProvision).not.toHaveBeenCalled();
+    });
+
+    it('refuses, rather than reuse it, a record that belongs to a previous app of the same name', async () => {
+      stubAppConfigService(baseConfig());
+      stubStateManager(baseState());
+      stubSecrets();
+      const storage = stubStorage();
+      storage.provisionAppStorage.mockRejectedValueOnce(new ObjectStorageIncarnationError(appName));
+      const doRestart = jest.spyOn(platform as any, 'doRestart').mockResolvedValue(undefined);
+
+      expect(await platform.attachService(appName, 'object-storage')).toEqual(
+        expect.objectContaining({ attached: false, reason: 'service-unavailable' })
+      );
+      expect(doRestart).not.toHaveBeenCalled();
     });
 
     it('refuses as service-unavailable, naming what is missing, when the operator has not set it up', async () => {
@@ -419,6 +465,26 @@ describe('DropPlatform object storage (#301)', () => {
       const candidates = plan.mock.calls[0][0] as Array<{ name: string; noReap?: boolean }>;
       expect(candidates.find((c) => c.name === appName)?.noReap).toBe(true);
       expect(candidates.find((c) => c.name === 'plain')?.noReap).toBeFalsy();
+    });
+
+    it('retires off the name before the state and config go, and drains in the background', async () => {
+      const storage = stubStorage({ allocated: [appName] });
+      storage.teardownForDeletedApp.mockResolvedValue({ outcome: 'retired', reason: 'deleting', key: 'k' });
+      const sweep = jest.spyOn(platform as any, 'sweepRetiredObjectStorage').mockResolvedValue(undefined);
+
+      await (platform as any).retireObjectStorageOfDeletedApp(appName, false);
+
+      expect(storage.teardownForDeletedApp).toHaveBeenCalledWith(appName, { keepData: false });
+      expect(sweep).toHaveBeenCalledTimes(1);
+    });
+
+    it('does not sweep a kept bucket, which only an admin destroys', async () => {
+      const storage = stubStorage({ allocated: [appName] });
+      storage.teardownForDeletedApp.mockResolvedValue({ outcome: 'retired', reason: 'kept', key: 'k' });
+      const sweep = jest.spyOn(platform as any, 'sweepRetiredObjectStorage').mockResolvedValue(undefined);
+
+      await (platform as any).retireObjectStorageOfDeletedApp(appName, true);
+      expect(sweep).not.toHaveBeenCalled();
     });
 
     it('never lets an unreadable allocation store fail the delete', async () => {

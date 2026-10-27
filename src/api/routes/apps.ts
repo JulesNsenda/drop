@@ -776,205 +776,233 @@ apps.delete('/:name', async c => {
     throw new NotFoundError(`Application '${name}' not found`);
   }
 
-  // Stop the process if running
-  const pm = getAppRuntime();
-  try {
-    await pm.stop(name);
-    await pm.delete(name);
-  } catch {
-    // Process might not exist in PM2
+  // Hold the app against deploy/restart/attach/detach for the whole teardown.
+  // Attach and detach both read the object-storage allocation this moves, and
+  // the isAppInProgress check at the top is only a read, not a reservation.
+  // An unwired platform (standalone ApiServer in tests) has nothing to reserve.
+  const deleteOps = getPlatformOps();
+  const releaseApp = deleteOps?.reserveApp(name) ?? null;
+  if (deleteOps && !releaseApp) {
+    return c.json(
+      error(ErrorCodes.CONFLICT, `Application '${name}' is building or deploying — retry once it settles`),
+      409
+    );
   }
+  try {
+    const keepData = c.req.query('keepData') === 'true';
 
-  // Dump-then-drop the app's provisioned database (if any) BEFORE removing
-  // app state. This must run before stateManager.removeApp so a same-named
-  // recreate can't race in and inherit a still-live/retained database.
-  // `?keepData=true` skips the drop entirely — the DB is left intact.
-  // Non-fatal: a failure here still lets the rest of the delete proceed; the
-  // database is simply retained (the safe outcome — see
-  // docs/plans/2026-07-07-dump-then-drop-on-delete.md).
-  const keepData = c.req.query('keepData') === 'true';
-  let dbStatus: 'dropped' | 'retained' | 'preserved' | 'none' = 'none';
-  if (keepData) {
-    dbStatus = 'preserved';
-  } else {
+    // Stop the process if running
+    const pm = getAppRuntime();
     try {
-      const provisioner = getDatabaseProvisioner();
-      if (!provisioner) {
-        // In a running server the provisioner is never null. A null here means
-        // the database layer didn't initialise and we're SILENTLY skipping the
-        // drop — the exact orphan-leak this feature exists to prevent, and
-        // indistinguishable in the response from the legitimate "no database"
-        // case. Make it loud instead of collapsing it into 'none'.
-        console.warn(
-          `[apps.delete] database provisioner unavailable — DB teardown SKIPPED for ${name} (database NOT dropped)`
-        );
-        dbStatus = 'none';
-      } else {
-        // Meter, don't refuse: an unmetered create->attach->delete loop
-        // reproduces the exact per-owner dump-byte amplification DROP-151
-        // Phase 3's detach-limit budget exists to bound — a delete must never
-        // be BLOCKED by the budget, so this prunes THIS APP'S OWN oldest
-        // dumps first rather than checking the budget. Scoped to
-        // `dbNamePrefix` (this app only), never the
-        // owner's whole directory — pruning to make room for a delete must
-        // not evict a SIBLING app's only surviving dump (the cross-app-
-        // eviction finding the per-owner directory layout closes; see
-        // detach-limits.ts's module doc). Skipped for an ephemeral app: its
-        // dump is skipped below too via `skipBackup` (nothing new is being
-        // written that needs room made for it).
-        // Read defensively via the null-returning accessor — an
-        // uninitialised AppConfigService (tests / early failures) must NOT
-        // abort the real drop below; default to "not ephemeral" (pruning
-        // still proceeds, which is always safe).
-        const isEphemeral = getAppConfigServiceOrNull()?.getConfig(name)?.ephemeral === true;
-        if (!isEphemeral) {
-          try {
-            const ownerDir = provisioner.ownerDumpDir(app.userId);
-            const dbNamePrefix = provisioner.dbNameForApp(name);
-            await pruneOwnerDumpsToFit(ownerDir, predeleteMaxBytes(), 0, dbNamePrefix);
-          } catch (err) {
-            // pruneOwnerDumpsToFit is already best-effort per file; this only
-            // guards a directory-level throw from blocking the delete itself.
-            console.warn(`[apps.delete] dump-budget prune threw for ${name}:`, err);
-          }
-        }
+      await pm.stop(name);
+      await pm.delete(name);
+    } catch {
+      // Process might not exist in PM2
+    }
 
-        const outcome = await provisioner.backupAndDeleteAppDatabase(name, {
-          skipBackup: isEphemeral,
-          ownerUserId: app.userId ?? null,
-        });
-        // Re-keyed on databaseDropped, not the combined `dropped` (DROP-151):
-        // `dropped` is true only when BOTH the database and its role were
-        // dropped, so a database-dropped-but-role-drop-failed outcome used to
-        // report 'retained' for a database that was actually gone and no
-        // longer tracked anywhere.
-        if (outcome.databaseDropped) {
-          dbStatus = 'dropped';
-        } else if (outcome.reason === 'no database provisioned') {
+    // Object storage (#301): move the bucket's record off the app's name
+    // BEFORE the database drop, the state removal or anything else that can
+    // fail — the name is freed by this delete, and a record still sitting on it
+    // is what a later registrant would inherit. Revokes the IAM key; the bucket
+    // itself drains in the background (or, with keepData, stays for an admin).
+    try {
+      await deleteOps?.retireObjectStorage(name, { keepData });
+    } catch (err) {
+      console.warn(`[apps.delete] object storage retirement threw for ${name}:`, err);
+    }
+
+    // Dump-then-drop the app's provisioned database (if any) BEFORE removing
+    // app state. This must run before stateManager.removeApp so a same-named
+    // recreate can't race in and inherit a still-live/retained database.
+    // `?keepData=true` skips the drop entirely — the DB is left intact.
+    // Non-fatal: a failure here still lets the rest of the delete proceed; the
+    // database is simply retained (the safe outcome — see
+    // docs/plans/2026-07-07-dump-then-drop-on-delete.md).
+    let dbStatus: 'dropped' | 'retained' | 'preserved' | 'none' = 'none';
+    if (keepData) {
+      dbStatus = 'preserved';
+    } else {
+      try {
+        const provisioner = getDatabaseProvisioner();
+        if (!provisioner) {
+          // In a running server the provisioner is never null. A null here means
+          // the database layer didn't initialise and we're SILENTLY skipping the
+          // drop — the exact orphan-leak this feature exists to prevent, and
+          // indistinguishable in the response from the legitimate "no database"
+          // case. Make it loud instead of collapsing it into 'none'.
+          console.warn(
+            `[apps.delete] database provisioner unavailable — DB teardown SKIPPED for ${name} (database NOT dropped)`
+          );
           dbStatus = 'none';
         } else {
-          dbStatus = 'retained';
-        }
-        // A database that was dropped but whose role survived is a tracked
-        // orphan, not a silent no-op — logged distinctly from the "nothing
-        // happened" warning below so it isn't lost in an identical message.
-        if (outcome.databaseDropped && !outcome.roleDropped) {
-          console.warn(
-            `[apps.delete] database dropped for ${name} but its role survived (orphaned): ${outcome.reason ?? 'unknown'}`
-          );
-        }
-        // The full reason (which may embed raw pg_dump stderr, i.e. a path leak)
-        // is logged server-side only — never returned to the client.
-        if (!outcome.databaseDropped && outcome.reason !== 'no database provisioned') {
-          console.warn(`[apps.delete] database retained for ${name}: ${outcome.reason}`);
-        }
-      }
-    } catch (err) {
-      dbStatus = 'retained';
-      console.warn(`[apps.delete] database teardown threw for ${name}:`, err);
-    }
-
-    // Free the app's managed-Redis logical DB (FLUSHDB + release the number).
-    // Idempotent + fail-soft; a no-op when the app had no Redis. `?keepData=true`
-    // skips it (handled by the enclosing `else`).
-    try {
-      await getRedisProvisioner()?.deprovisionAppRedis(name);
-    } catch (err) {
-      console.warn(`[apps.delete] redis teardown threw for ${name}:`, err);
-    }
-  }
-
-  // Remove from state
-  await stateManager.removeApp(name);
-
-  // Clean up secrets so a future same-named app doesn't inherit them
-  try {
-    await getSecretManager().deleteAll(name);
-  } catch {
-    // Secret manager may not be initialised (tests / early failures)
-  }
-
-  // Purge deploy history so a future same-named app doesn't inherit the
-  // deleted app's deploy timeline (and, more importantly, its owner-scoped
-  // episodes leaking to whoever registers the name next).
-  try {
-    getDeployTracker().purgeApp(name);
-  } catch {
-    // Deploy tracker may not be initialised (tests / early failures)
-  }
-
-  // Remove app config (e.g. appconf/webapps/ezsign.yaml)
-  try {
-    const configService = getAppConfigService();
-    await configService.deleteConfig(name);
-  } catch {
-    // Config may not exist
-  }
-
-  // Delete the app folder from the filesystem so the watcher doesn't re-detect it
-  if (app.path) {
-    try {
-      await fs.rm(app.path, { recursive: true, force: true });
-    } catch {
-      // Folder may already be gone
-    }
-  }
-
-  // Remove the name-keyed artifacts that live outside the app folder (logs,
-  // and DROP_DATA_DIR unless keepData). This route does its own inline
-  // teardown rather than calling platform.teardownApp, so without this the
-  // previous tenant's logs and persistent data survive under a name that is
-  // now free for anyone to re-register. Best-effort — never fails the delete.
-  try {
-    await getPlatformOps()?.purgeAppArtifacts(name, { keepData });
-  } catch {
-    // Platform not wired (direct ApiServer construction in tests) or cleanup
-    // failed; the delete itself has already succeeded.
-  }
-
-  // If this app was a monorepo group child and is now the LAST remaining
-  // child of its group, also remove the group's CONTAINER folder
-  // (webapps/<group>/, holding the root drop.yaml with `services:`) — left
-  // behind, it would regenerate the just-deleted child on the watcher's next
-  // scan. The container's own state entry carries the group tag too and must
-  // not count as a sibling; with no real children left it goes as well, or it
-  // would linger as an invisible orphan.
-  if (app.group) {
-    const groupApps = stateManager.getAllApps().filter(a => a.group === app.group);
-    const remainingSiblings = groupApps.filter(a => !a.isGroupContainer);
-    if (remainingSiblings.length === 0) {
-      // Only containers the requester may access: group tags are
-      // tenant-influenced, so a child delete must not cascade into another
-      // user's colliding container entry/folder.
-      for (const container of groupApps.filter(a => a.isGroupContainer && canAccess(auth, a))) {
-        try {
-          await stateManager.removeApp(container.name);
-          if (container.path) {
-            await fs.rm(container.path, { recursive: true, force: true });
+          // Meter, don't refuse: an unmetered create->attach->delete loop
+          // reproduces the exact per-owner dump-byte amplification DROP-151
+          // Phase 3's detach-limit budget exists to bound — a delete must never
+          // be BLOCKED by the budget, so this prunes THIS APP'S OWN oldest
+          // dumps first rather than checking the budget. Scoped to
+          // `dbNamePrefix` (this app only), never the
+          // owner's whole directory — pruning to make room for a delete must
+          // not evict a SIBLING app's only surviving dump (the cross-app-
+          // eviction finding the per-owner directory layout closes; see
+          // detach-limits.ts's module doc). Skipped for an ephemeral app: its
+          // dump is skipped below too via `skipBackup` (nothing new is being
+          // written that needs room made for it).
+          // Read defensively via the null-returning accessor — an
+          // uninitialised AppConfigService (tests / early failures) must NOT
+          // abort the real drop below; default to "not ephemeral" (pruning
+          // still proceeds, which is always safe).
+          const isEphemeral = getAppConfigServiceOrNull()?.getConfig(name)?.ephemeral === true;
+          if (!isEphemeral) {
+            try {
+              const ownerDir = provisioner.ownerDumpDir(app.userId);
+              const dbNamePrefix = provisioner.dbNameForApp(name);
+              await pruneOwnerDumpsToFit(ownerDir, predeleteMaxBytes(), 0, dbNamePrefix);
+            } catch (err) {
+              // pruneOwnerDumpsToFit is already best-effort per file; this only
+              // guards a directory-level throw from blocking the delete itself.
+              console.warn(`[apps.delete] dump-budget prune threw for ${name}:`, err);
+            }
           }
-          // The container is detected and built before expansion, so it can
-          // have deploy details of its own — and its log directory. This
-          // cascade never went through purgeAppArtifacts, so those details
-          // kept live name-keyed log offsets with no retention stamp, which
-          // also put them outside the serve-time guard.
-          await getPlatformOps()?.purgeAppArtifacts(container.name, { keepData });
-        } catch {
-          // Container entry/folder may already be gone
+
+          const outcome = await provisioner.backupAndDeleteAppDatabase(name, {
+            skipBackup: isEphemeral,
+            ownerUserId: app.userId ?? null,
+          });
+          // Re-keyed on databaseDropped, not the combined `dropped` (DROP-151):
+          // `dropped` is true only when BOTH the database and its role were
+          // dropped, so a database-dropped-but-role-drop-failed outcome used to
+          // report 'retained' for a database that was actually gone and no
+          // longer tracked anywhere.
+          if (outcome.databaseDropped) {
+            dbStatus = 'dropped';
+          } else if (outcome.reason === 'no database provisioned') {
+            dbStatus = 'none';
+          } else {
+            dbStatus = 'retained';
+          }
+          // A database that was dropped but whose role survived is a tracked
+          // orphan, not a silent no-op — logged distinctly from the "nothing
+          // happened" warning below so it isn't lost in an identical message.
+          if (outcome.databaseDropped && !outcome.roleDropped) {
+            console.warn(
+              `[apps.delete] database dropped for ${name} but its role survived (orphaned): ${outcome.reason ?? 'unknown'}`
+            );
+          }
+          // The full reason (which may embed raw pg_dump stderr, i.e. a path leak)
+          // is logged server-side only — never returned to the client.
+          if (!outcome.databaseDropped && outcome.reason !== 'no database provisioned') {
+            console.warn(`[apps.delete] database retained for ${name}: ${outcome.reason}`);
+          }
         }
+      } catch (err) {
+        dbStatus = 'retained';
+        console.warn(`[apps.delete] database teardown threw for ${name}:`, err);
       }
+
+      // Free the app's managed-Redis logical DB (FLUSHDB + release the number).
+      // Idempotent + fail-soft; a no-op when the app had no Redis. `?keepData=true`
+      // skips it (handled by the enclosing `else`).
       try {
-        await fs.rm(path.join(getAppsDirectory(), app.group), { recursive: true, force: true });
-      } catch {
-        // Container folder may already be gone
+        await getRedisProvisioner()?.deprovisionAppRedis(name);
+      } catch (err) {
+        console.warn(`[apps.delete] redis teardown threw for ${name}:`, err);
       }
     }
-  }
 
-  await logActivityFor(auth, {
-    action: 'delete',
-    appName: name,
-  });
-  return c.json(success({ message: `Application '${name}' removed`, database: dbStatus }));
+    // Remove from state
+    await stateManager.removeApp(name);
+
+    // Clean up secrets so a future same-named app doesn't inherit them
+    try {
+      await getSecretManager().deleteAll(name);
+    } catch {
+      // Secret manager may not be initialised (tests / early failures)
+    }
+
+    // Purge deploy history so a future same-named app doesn't inherit the
+    // deleted app's deploy timeline (and, more importantly, its owner-scoped
+    // episodes leaking to whoever registers the name next).
+    try {
+      getDeployTracker().purgeApp(name);
+    } catch {
+      // Deploy tracker may not be initialised (tests / early failures)
+    }
+
+    // Remove app config (e.g. appconf/webapps/ezsign.yaml)
+    try {
+      const configService = getAppConfigService();
+      await configService.deleteConfig(name);
+    } catch {
+      // Config may not exist
+    }
+
+    // Delete the app folder from the filesystem so the watcher doesn't re-detect it
+    if (app.path) {
+      try {
+        await fs.rm(app.path, { recursive: true, force: true });
+      } catch {
+        // Folder may already be gone
+      }
+    }
+
+    // Remove the name-keyed artifacts that live outside the app folder (logs,
+    // and DROP_DATA_DIR unless keepData). This route does its own inline
+    // teardown rather than calling platform.teardownApp, so without this the
+    // previous tenant's logs and persistent data survive under a name that is
+    // now free for anyone to re-register. Best-effort — never fails the delete.
+    try {
+      await getPlatformOps()?.purgeAppArtifacts(name, { keepData });
+    } catch {
+      // Platform not wired (direct ApiServer construction in tests) or cleanup
+      // failed; the delete itself has already succeeded.
+    }
+
+    // If this app was a monorepo group child and is now the LAST remaining
+    // child of its group, also remove the group's CONTAINER folder
+    // (webapps/<group>/, holding the root drop.yaml with `services:`) — left
+    // behind, it would regenerate the just-deleted child on the watcher's next
+    // scan. The container's own state entry carries the group tag too and must
+    // not count as a sibling; with no real children left it goes as well, or it
+    // would linger as an invisible orphan.
+    if (app.group) {
+      const groupApps = stateManager.getAllApps().filter(a => a.group === app.group);
+      const remainingSiblings = groupApps.filter(a => !a.isGroupContainer);
+      if (remainingSiblings.length === 0) {
+        // Only containers the requester may access: group tags are
+        // tenant-influenced, so a child delete must not cascade into another
+        // user's colliding container entry/folder.
+        for (const container of groupApps.filter(a => a.isGroupContainer && canAccess(auth, a))) {
+          try {
+            await stateManager.removeApp(container.name);
+            if (container.path) {
+              await fs.rm(container.path, { recursive: true, force: true });
+            }
+            // The container is detected and built before expansion, so it can
+            // have deploy details of its own — and its log directory. This
+            // cascade never went through purgeAppArtifacts, so those details
+            // kept live name-keyed log offsets with no retention stamp, which
+            // also put them outside the serve-time guard.
+            await getPlatformOps()?.purgeAppArtifacts(container.name, { keepData });
+          } catch {
+            // Container entry/folder may already be gone
+          }
+        }
+        try {
+          await fs.rm(path.join(getAppsDirectory(), app.group), { recursive: true, force: true });
+        } catch {
+          // Container folder may already be gone
+        }
+      }
+    }
+
+    await logActivityFor(auth, {
+      action: 'delete',
+      appName: name,
+    });
+    return c.json(success({ message: `Application '${name}' removed`, database: dbStatus }));
+  } finally {
+    releaseApp?.();
+  }
 });
 
 // POST /apps/:name/start - Start application

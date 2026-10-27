@@ -70,6 +70,7 @@ import {
 } from '../managers/redis';
 import {
   ObjectStorageProvisioner,
+  ObjectStorageIncarnationError,
   ObjectStorageUnavailableError,
   configureObjectStorage,
   resetObjectStorageProvisioner,
@@ -2204,6 +2205,8 @@ backup:
     setPlatformOps({
       restartApp: (name) => this.restartApp(name),
       isAppInProgress: (name) => this.appsInProgress.has(name),
+      reserveApp: (name) => this.reserveApp(name),
+      retireObjectStorage: (name, opts) => this.retireObjectStorageOfDeletedApp(name, opts?.keepData),
       promoteApp: (name) => this.promoteApp(name),
       rollbackApp: (name) => this.rollbackApp(name),
       describeRollback: (name) => this.describeRollback(name),
@@ -3744,6 +3747,49 @@ backup:
         err
       );
       return {};
+    }
+  }
+
+  /**
+   * Reserve an app against every other lifecycle operation (deploy, restart,
+   * attach, detach) for as long as the caller holds it. Null when it is busy.
+   * The delete route holds this across its whole teardown, because attach and
+   * detach read the allocation this teardown moves.
+   */
+  private reserveApp(appName: string): (() => void) | null {
+    if (this.appsInProgress.has(appName)) return null;
+    this.appsInProgress.add(appName);
+    return () => {
+      this.appsInProgress.delete(appName);
+    };
+  }
+
+  /**
+   * The deleted-app half of object storage (#301). Retires the allocation off
+   * the app's name FIRST (a synchronous store write, no AWS), then revokes the
+   * IAM key; the bucket is drained by the sweep, kicked here and not awaited,
+   * so a large bucket never holds the DELETE response open. `keepData` keeps
+   * the bucket (the owner's data) but never the name or a live key.
+   *
+   * Idempotent, and fail-soft: a corrupt allocation store is logged loudly and
+   * touches nothing — the incarnation marker still stops the next registrant
+   * of the name from inheriting the record.
+   */
+  private async retireObjectStorageOfDeletedApp(name: string, keepData?: boolean): Promise<void> {
+    try {
+      const torn = await this.objectStorage?.teardownForDeletedApp(name, { keepData });
+      if (torn?.outcome !== 'retired') return;
+      if (torn.reason === 'kept') {
+        this.logger.warn(
+          `Kept the bucket of deleted app '${name}' (keepData) — its key is revoked and it is no longer tied to the name`,
+          'STORAGE'
+        );
+      } else {
+        this.logger.info(`Draining the object storage of deleted app '${name}' in the background`, 'STORAGE');
+        void this.sweepRetiredObjectStorage();
+      }
+    } catch (error) {
+      this.logger.error(`Object storage of deleted app '${name}' was NOT cleaned up`, 'STORAGE', error);
     }
   }
 
@@ -8468,6 +8514,9 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       // retried attach recovers cleanly; nothing currently detects the gap
       // proactively.
       let envVarNames: string[];
+      // Object storage only: whether THIS attach created the bucket, so a
+      // refusal further down knows it owns the undo.
+      let createdStorage = false;
       if (serviceId === 'postgres') {
         if (!this.dbProvisioner) {
           // A refusal, not a throw: an instance with no database layer is a
@@ -8520,9 +8569,22 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           });
         }
         try {
-          // Idempotent: a retried attach gets the same bucket back.
-          await this.objectStorage.provisionAppStorage(appName, { ownerUserId });
+          // Idempotent: a retried attach gets the same bucket back — but only
+          // the same APP gets it (owner + creation stamp), never a later
+          // registrant of the name.
+          createdStorage = !(await this.objectStorage.getAllocation(appName));
+          await this.objectStorage.provisionAppStorage(appName, {
+            ownerUserId,
+            appCreatedAt: state?.createdAt,
+          });
         } catch (err) {
+          if (err instanceof ObjectStorageIncarnationError) {
+            return this.refuse('attach', appName, serviceId, {
+              attached: false,
+              reason: 'service-unavailable',
+              detail: err.message,
+            });
+          }
           // The settings or credential changed between the check above and
           // here — still the "not configured" refusal, not a failure.
           if (err instanceof ObjectStorageUnavailableError) {
@@ -8550,6 +8612,10 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       // recorded.
       const persisted = await this.appConfigService.setServiceIntent(appName, serviceId, 'attached');
       if (!persisted) {
+        // A bucket this attach just created, with no intent to ever use it,
+        // would bill the operator forever: take it back (a failed undo is
+        // logged and retired for the sweep inside undoProvision).
+        if (createdStorage) await this.objectStorage?.undoProvision(appName);
         return this.refuse('attach', appName, serviceId, {
           attached: false,
           reason: 'no-app-config',
@@ -9222,6 +9288,10 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       // Process might not exist in the runtime
     }
 
+    // Object storage is retired off the name before the state and config that
+    // describe the app are removed, and before anything else can fail.
+    await this.retireObjectStorageOfDeletedApp(name, opts.keepData);
+
     // Explicit + deterministic: `stateManager.removeApp` below also triggers
     // this via `app:deleted` -> `handleAppDeleted`, but that's fire-and-forget
     // from this method's perspective. Calling it here directly means a caller
@@ -9392,33 +9462,11 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       this.logger.warn(`Failed to revoke guest grants for ${name}`, 'CLEANUP', error);
     }
 
-    // Object storage (#301). Here, not in either delete path, for the reason
-    // the guest block above gives: this is the one funnel both go through.
-    // The allocation is keyed on the NAME being freed, and provisioning is
-    // idempotent on that key — so whatever happens it must not stay there,
-    // or the next registrant inherits the bucket and its key. Destroyed, or
-    // retired off the name: `keepData` keeps the bucket (it is the owner's
-    // data) but never the name; a failed teardown is retried by the sweep.
-    try {
-      const torn = await this.objectStorage?.teardownForDeletedApp(name, { keepData: opts.keepData });
-      if (torn?.outcome === 'destroyed') {
-        this.logger.info(
-          `Removed the object storage of deleted app '${name}' (${torn.result.objectsDeleted} object(s))`,
-          'STORAGE'
-        );
-      } else if (torn?.outcome === 'retired') {
-        this.logger.warn(
-          torn.reason === 'kept'
-            ? `Kept the bucket of deleted app '${name}' (keepData) — it is no longer tied to the name`
-            : `Could not remove the object storage of deleted app '${name}' — retired for retry`,
-          'STORAGE',
-          torn.error
-        );
-      }
-    } catch (error) {
-      // A corrupt allocation store: touch nothing, say so loudly.
-      this.logger.error(`Object storage of deleted app '${name}' was NOT cleaned up`, 'STORAGE', error);
-    }
+    // Object storage (#301): normally already retired by the delete path
+    // before anything else ran (see retireObjectStorageOfDeletedApp), so this
+    // is the safety net for a path that reaches here without having done so.
+    // A no-op when the name holds no allocation.
+    await this.retireObjectStorageOfDeletedApp(name, opts.keepData);
 
     const targets = [
       path.join(this.config.dropRoot, 'data', 'logs', 'webapps', name),

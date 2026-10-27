@@ -13,7 +13,7 @@ import * as fs from 'fs/promises';
 import * as path from 'path';
 import { writeJsonAtomic } from '../../utils/atomic-write';
 import { encrypt, decrypt, loadPlatformMasterKey, EncryptedData } from '../secret/encryption';
-import type { AppStorageAllocation, AppStorageCredentials } from './types';
+import type { AppStorageAllocation, AppStorageCredentials, RetiredReason } from './types';
 
 interface StoredAllocation extends AppStorageAllocation {
   /** Absent on a retired record: nothing reads a key back once its app is gone. */
@@ -113,7 +113,7 @@ export class AllocationStore {
    *
    * Returns the retired record's key, or null when the app had none.
    */
-  async retire(appName: string, reason: 'teardown-failed' | 'kept'): Promise<string | null> {
+  async retire(appName: string, reason: RetiredReason): Promise<string | null> {
     let retiredKey: string | null = null;
     await this.write(async (file) => {
       const stored = own(file, appName);
@@ -134,7 +134,7 @@ export class AllocationStore {
    * retired (keyed as `listRetired` reports). False when there is none.
    */
   async amend(key: string, fields: Partial<Pick<AppStorageAllocation, 'accessRevoked'>> & {
-    retiredReason?: 'teardown-failed' | 'kept';
+    retiredReason?: RetiredReason;
   }): Promise<boolean> {
     let found = false;
     await this.write(async (file) => {

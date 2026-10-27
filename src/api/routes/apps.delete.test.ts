@@ -649,6 +649,74 @@ describe('DELETE /api/v1/apps/:name — in-progress guard (M4)', () => {
     expect(getStateManager().getApp('busy-app')).toBeUndefined();
   });
 
+  it('holds the app reserved for the whole teardown and releases it afterwards', async () => {
+    const release = jest.fn();
+    const reserveApp = jest.fn().mockReturnValue(release);
+    const retireObjectStorage = jest.fn().mockResolvedValue(undefined);
+    setPlatformOps(makeOps({ reserveApp, retireObjectStorage }));
+
+    const res = await hono.request('/api/v1/apps/busy-app', {
+      method: 'DELETE',
+      headers: authHeader(ownerToken),
+    });
+
+    expect(res.status).toBe(200);
+    expect(reserveApp).toHaveBeenCalledWith('busy-app');
+    // Released only once the delete is finished, not before the state is gone.
+    expect(release).toHaveBeenCalledTimes(1);
+    expect(getStateManager().getApp('busy-app')).toBeUndefined();
+  });
+
+  it('409s and tears down nothing when the reservation is lost to a concurrent attach/detach', async () => {
+    setPlatformOps(makeOps({ reserveApp: jest.fn().mockReturnValue(null) }));
+
+    const res = await hono.request('/api/v1/apps/busy-app', {
+      method: 'DELETE',
+      headers: authHeader(ownerToken),
+    });
+
+    expect(res.status).toBe(409);
+    expect(runtime.stop).not.toHaveBeenCalled();
+    expect(getStateManager().getApp('busy-app')).toBeDefined();
+  });
+
+  it('retires the object storage off the name BEFORE the database drop and the state removal', async () => {
+    const order: string[] = [];
+    const backupAndDeleteAppDatabase = jest.fn(async () => {
+      order.push('database');
+      return { dropped: true };
+    });
+    jest.spyOn(databaseModule, 'getDatabaseProvisioner').mockReturnValue({
+      backupAndDeleteAppDatabase,
+    } as unknown as DatabaseProvisioner);
+    const retireObjectStorage = jest.fn(async () => {
+      order.push('retire');
+      expect(getStateManager().getApp('busy-app')).toBeDefined();
+    });
+    setPlatformOps(makeOps({ retireObjectStorage }));
+
+    const res = await hono.request('/api/v1/apps/busy-app?keepData=false', {
+      method: 'DELETE',
+      headers: authHeader(ownerToken),
+    });
+
+    expect(res.status).toBe(200);
+    expect(retireObjectStorage).toHaveBeenCalledWith('busy-app', { keepData: false });
+    expect(order).toEqual(['retire', 'database']);
+  });
+
+  it('still deletes when retiring the object storage throws', async () => {
+    setPlatformOps(makeOps({ retireObjectStorage: jest.fn().mockRejectedValue(new Error('boom')) }));
+
+    const res = await hono.request('/api/v1/apps/busy-app', {
+      method: 'DELETE',
+      headers: authHeader(ownerToken),
+    });
+
+    expect(res.status).toBe(200);
+    expect(getStateManager().getApp('busy-app')).toBeUndefined();
+  });
+
   it('proceeds with the delete when platform ops is unwired (defense-in-depth only, matches upload-deploy route posture)', async () => {
     // Deliberately not calling setPlatformOps — mirrors a standalone
     // ApiServer. isAppInProgress is treated as "not in progress" rather than

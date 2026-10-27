@@ -25,9 +25,11 @@ import {
   iamUserNameFor,
   newResourceSuffix,
 } from './naming';
+import { getLogger } from '../../utils/logger';
 import type {
   AppStorageAllocation,
   ObjectStorageProvider,
+  RetiredReason,
   StorageDeprovisionResult,
 } from './types';
 
@@ -48,6 +50,34 @@ export class ObjectStorageUnavailableError extends Error {
     super(detail);
     this.name = 'ObjectStorageUnavailableError';
   }
+}
+
+/** Which app a record belongs to: the owner and the app's own creation stamp. */
+export interface AppIncarnation {
+  ownerUserId?: string;
+  appCreatedAt?: string;
+}
+
+/**
+ * The name holds a record that belongs to a DIFFERENT app — one that had the
+ * name before and whose storage was never settled. Handing it over would give
+ * the new registrant the previous tenant's bucket and key.
+ */
+export class ObjectStorageIncarnationError extends Error {
+  constructor(appName: string) {
+    super(
+      `'${appName}' has object storage on record that belongs to a previous app of the same name, ` +
+        'so it was not reused. An admin must resolve it before storage can be attached.'
+    );
+    this.name = 'ObjectStorageIncarnationError';
+  }
+}
+
+function sameIncarnation(record: AppStorageAllocation, incarnation: AppIncarnation): boolean {
+  return (
+    (record.ownerUserId ?? null) === (incarnation.ownerUserId ?? null) &&
+    (record.appCreatedAt ?? null) === (incarnation.appCreatedAt ?? null)
+  );
 }
 
 export interface ObjectStorageProvisionerOptions {
@@ -108,14 +138,16 @@ export class ObjectStorageProvisioner {
   /**
    * Create the app's bucket and scoped key — or return the existing ones:
    * idempotent, so a retried attach recovers instead of creating a second
-   * bucket. Throws ObjectStorageUnavailableError when not configured.
+   * bucket. Throws ObjectStorageUnavailableError when not configured, and
+   * ObjectStorageIncarnationError when the name holds a record that belongs to
+   * a different app than `incarnation` describes.
    */
-  async provisionAppStorage(
-    appName: string,
-    owner: { ownerUserId?: string } = {}
-  ): Promise<AppStorageAllocation> {
+  async provisionAppStorage(appName: string, incarnation: AppIncarnation = {}): Promise<AppStorageAllocation> {
     const existing = await this.allocations.get(appName);
-    if (existing) return existing;
+    if (existing) {
+      if (!sameIncarnation(existing, incarnation)) throw new ObjectStorageIncarnationError(appName);
+      return existing;
+    }
 
     const availability = await this.availability();
     if (!availability.available) {
@@ -135,17 +167,46 @@ export class ObjectStorageProvisioner {
       userName,
       accessKeyId: key.accessKeyId,
       createdAt: new Date().toISOString(),
-      ...(owner.ownerUserId ? { ownerUserId: owner.ownerUserId } : {}),
+      ...(incarnation.ownerUserId ? { ownerUserId: incarnation.ownerUserId } : {}),
+      ...(incarnation.appCreatedAt ? { appCreatedAt: incarnation.appCreatedAt } : {}),
     };
     try {
       await this.allocations.put({ ...allocation, secretAccessKey: key.secretAccessKey });
     } catch (err) {
       // Unrecorded resources would be invisible to every later teardown:
       // remove them rather than leave a bucket nothing points at.
-      await provider.deprovision({ bucket, userName }).catch(() => undefined);
+      await provider.deprovision({ bucket, userName }).catch((undoErr) => {
+        // The record could not be written either, so there is nothing for the
+        // sweep to retry: the names are the only trail an operator gets.
+        getLogger().error(
+          `Object storage for '${appName}' could not be recorded AND the undo failed — bucket '${bucket}' and IAM user '${userName}' are orphaned in AWS and must be removed by hand`,
+          'STORAGE',
+          undoErr
+        );
+      });
       throw err;
     }
     return allocation;
+  }
+
+  /**
+   * Undo a provision whose attach could not be completed (the app lost its
+   * config in between). Never throws for AWS: a failed undo is logged and
+   * recorded as a `teardown-failed` retired record, so the sweep keeps trying
+   * instead of the bucket silently billing the operator with nothing pointing
+   * at it. Only call this for an allocation the caller itself just created.
+   */
+  async undoProvision(appName: string): Promise<void> {
+    try {
+      await this.deprovisionAppStorage(appName);
+    } catch (err) {
+      getLogger().error(
+        `Undoing the object storage just provisioned for '${appName}' failed — retired for the sweep to retry`,
+        'STORAGE',
+        err
+      );
+      await this.allocations.retire(appName, 'teardown-failed');
+    }
   }
 
   /**
@@ -188,37 +249,32 @@ export class ObjectStorageProvisioner {
   }
 
   /**
-   * The deleted-app path. Destroys the app's storage, or — when the caller
-   * keeps data, or the teardown fails — RETIRES the record instead: moved off
-   * the app's name, so the name is genuinely free, and the resources stay
-   * tracked for the operator (`kept`) or the retry sweep (`teardown-failed`).
+   * The deleted-app path. RETIRES the record first — a synchronous write that
+   * moves it off the app's name before any AWS call, so the name is genuinely
+   * free (and a crash anywhere after this leaves a tracked record, not an
+   * orphan) — then revokes the IAM key and user by the retired record. The
+   * bucket is NOT drained here: a large bucket would hold the DELETE response
+   * open for minutes. A `kept` record (keepData) keeps its bucket for an admin
+   * to destroy; any other is `deleting`, and the sweep drains it.
+   *
    * Never throws for an AWS failure; does throw `AllocationStoreCorruptError`,
    * because "unreadable" must never be read as "nothing to clean up".
    */
   async teardownForDeletedApp(
     appName: string,
     opts: { keepData?: boolean } = {}
-  ): Promise<
-    | { outcome: 'none' }
-    | { outcome: 'destroyed'; result: StorageDeprovisionResult }
-    | { outcome: 'retired'; reason: 'teardown-failed' | 'kept'; error?: unknown }
-  > {
+  ): Promise<{ outcome: 'none' } | { outcome: 'retired'; reason: RetiredReason; key: string }> {
     const allocation = await this.allocations.get(appName);
     if (!allocation) return { outcome: 'none' };
-    if (opts.keepData) {
-      // The bucket is the owner's data; the credential is not. Retire the
-      // record, then revoke the key and delete the IAM user so nothing keeps
-      // write access to a bucket with no app. Only the bucket is kept.
-      const key = await this.allocations.retire(appName, 'kept');
-      if (key) await this.revokeRetiredAccess(key, allocation).catch(() => undefined);
-      return { outcome: 'retired', reason: 'kept' };
-    }
-    try {
-      return { outcome: 'destroyed', result: (await this.deprovisionAppStorage(appName))! };
-    } catch (error) {
-      await this.allocations.retire(appName, 'teardown-failed');
-      return { outcome: 'retired', reason: 'teardown-failed', error };
-    }
+    const reason: RetiredReason = opts.keepData ? 'kept' : 'deleting';
+    const key = await this.allocations.retire(appName, reason);
+    if (!key) return { outcome: 'none' };
+    // A failure here is not final: the sweep revokes (and, unless kept,
+    // drains) every retired record it finds.
+    await this.revokeRetiredAccess(key, allocation).catch((err) => {
+      getLogger().warn(`Could not revoke the IAM key of deleted app '${appName}' yet — the sweep will retry`, 'STORAGE', err);
+    });
+    return { outcome: 'retired', reason, key };
   }
 
   /**
@@ -231,6 +287,7 @@ export class ObjectStorageProvisioner {
     const pending = (await this.allocations.listRetired()).filter(
       ({ allocation }) =>
         allocation.retired?.reason === 'teardown-failed' ||
+        allocation.retired?.reason === 'deleting' ||
         // A kept bucket whose key could not be revoked at delete time: finish
         // that half. Its bucket is still never touched.
         (allocation.retired?.reason === 'kept' && !allocation.accessRevoked)
@@ -252,6 +309,11 @@ export class ObjectStorageProvisioner {
         await this.allocations.removeRetired(key);
         destroyed += 1;
       } catch {
+        // A failed destroy is a teardown failure, whatever the record was
+        // called before the attempt.
+        if (allocation.retired?.reason === 'deleting') {
+          await this.allocations.amend(key, { retiredReason: 'teardown-failed' }).catch(() => undefined);
+        }
         failed += 1;
       }
     }

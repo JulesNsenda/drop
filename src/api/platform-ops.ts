@@ -197,6 +197,25 @@ export interface PlatformOps {
   isAppInProgress(appName: string): boolean;
 
   /**
+   * Hold the app against every other lifecycle operation (deploy, restart,
+   * attach, detach) until the returned release is called; null when it is
+   * already busy. `isAppInProgress` only READS the set — a caller that is about
+   * to tear the app down needs the reservation, or an attach can interleave
+   * with the teardown. Callers that find platform-ops unwired treat it as
+   * nothing to reserve, like `isAppInProgress`.
+   */
+  reserveApp(appName: string): (() => void) | null;
+
+  /**
+   * Retire the app's object-storage allocation off its name and revoke its
+   * IAM key (#301). Called by the delete route BEFORE any other teardown step,
+   * so the name is free of the previous tenant's bucket the moment the app
+   * stops. The bucket drains in the background unless `keepData`. Idempotent;
+   * never throws for an AWS failure.
+   */
+  retireObjectStorage(appName: string, opts?: { keepData?: boolean }): Promise<void>;
+
+  /**
    * Put a held (built-but-unpromoted) build in front of traffic.
    *
    * Starts exactly what was built rather than rebuilding — a rebuild could pick

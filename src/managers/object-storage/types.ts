@@ -22,6 +22,13 @@ export interface AppStorageAllocation {
    */
   ownerUserId?: string;
   /**
+   * `AppState.createdAt` of the app this was provisioned for. With
+   * `ownerUserId` it is the incarnation marker: app names are reusable, so a
+   * record is the property of ONE app, not of whoever holds the name now.
+   * `provisionAppStorage` refuses to hand a record to a different incarnation.
+   */
+  appCreatedAt?: string;
+  /**
    * The IAM key is revoked and its user deleted; only the bucket survives. Set
    * by a `keepData` delete (the bucket is the owner's data, the credential is
    * not) and by the first half of a detach.
@@ -34,8 +41,16 @@ export interface AppStorageAllocation {
    * the sweep; `kept` (a `keepData` delete) is left for an admin, who can list
    * and destroy it.
    */
-  retired?: { at: string; reason: 'teardown-failed' | 'kept' };
+  retired?: { at: string; reason: RetiredReason };
 }
+
+/**
+ * Why a record was moved off its app's name. `deleting`: the app was deleted
+ * and the sweep has yet to drain the bucket. `teardown-failed`: a destroy was
+ * attempted and AWS refused (retried by the sweep). `kept`: a keepData delete —
+ * only an admin destroys it.
+ */
+export type RetiredReason = 'deleting' | 'teardown-failed' | 'kept';
 
 /** The allocation plus its secret, as injected into the app's environment. */
 export interface AppStorageCredentials extends AppStorageAllocation {

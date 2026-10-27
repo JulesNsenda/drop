@@ -1,12 +1,13 @@
 export {
   ObjectStorageProvisioner,
   ObjectStorageUnavailableError,
+  ObjectStorageIncarnationError,
   getObjectStorageProvisioner,
   resetObjectStorageProvisioner,
   configureObjectStorage,
   AWS_REGION_RE,
 } from './provisioner';
-export type { StorageAvailability, StorageUnavailableReason } from './provisioner';
+export type { AppIncarnation, StorageAvailability, StorageUnavailableReason } from './provisioner';
 export {
   StorageCredentialStore,
   getStorageCredentialStore,
@@ -20,5 +21,6 @@ export type {
   AppStorageAllocation,
   AppStorageCredentials,
   ObjectStorageProvider,
+  RetiredReason,
   StorageDeprovisionResult,
 } from './types';
