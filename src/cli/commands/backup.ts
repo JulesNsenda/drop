@@ -62,8 +62,10 @@ export const DROP_SVC_FILES = [
   // forgets every bucket — still billing the operator, reachable by no one —
   // and would provision a second one for each app that attaches again.
   'object-storage.json',
-  // The AWS admin key DROP uses to create and remove those buckets (encrypted).
-  'object-storage-credential.json',
+  // object-storage-credential.json (the AWS admin key) is deliberately NOT
+  // here. It is encrypted under encryption.key, which IS in a backup, so
+  // including it would put the operator's AWS key and the key that opens it in
+  // the same archive. After a restore the operator re-enters it.
   'encryption.key',
   '.pg-superuser',
 ];

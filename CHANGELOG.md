@@ -162,9 +162,10 @@ that declares a `healthCheck`.**
     that is persisted; attach is refused until the detach completes; a
     single-flight background sweep drains the bucket only while the owner's
     intent is still `detached`; shutdown waits for it.
-  - **Backup and restore include the allocation store and admin credential**
-    (`object-storage.json`, `object-storage-credential.json`); a boot warning
-    flags apps that are attached with no allocation.
+  - **Backup and restore include the allocation store** (`object-storage.json`).
+    The AWS admin credential is deliberately left out, since it would sit in
+    the archive next to `encryption.key`; `drop restore` tells you to re-enter
+    it. A boot warning flags apps that are attached with no allocation.
   - The allocation store is safe against app names like `constructor`; teardown
     refuses any bucket or IAM user whose name DROP did not generate (an empty
     user name would make IAM act on the caller's own keys); attach waits for the

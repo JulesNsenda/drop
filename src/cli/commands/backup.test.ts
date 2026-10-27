@@ -324,7 +324,7 @@ describe('drop backup — per-app database backup', () => {
   });
 
   // (h) ------------------------------------------------------------------
-  it('backs up the object-storage allocation store and admin credential (#301)', async () => {
+  it('backs up the object-storage allocation store, but NOT the AWS admin credential (#301)', async () => {
     await seedDropRoot(dropRoot);
     const svcDir = path.join(dropRoot, 'data', 'drop-svc');
     await fs.writeFile(path.join(svcDir, 'object-storage.json'), '{"site":{}}');
@@ -336,7 +336,7 @@ describe('drop backup — per-app database backup', () => {
     const finalDir = await findFinalBackupDir(dropRoot);
     const files = await fs.readdir(path.join(backupRootOf(dropRoot), finalDir!));
     expect(files).toContain('object-storage.json');
-    expect(files).toContain('object-storage-credential.json');
+    expect(files).not.toContain('object-storage-credential.json');
   });
 
   // (g) ------------------------------------------------------------------

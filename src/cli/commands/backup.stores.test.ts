@@ -35,6 +35,16 @@ const NOT_BACKED_UP_YET = [
   'toolchain-backfill.json',
 ];
 
+/**
+ * Stores that are deliberately NOT backed up, each with the reason. Distinct
+ * from the list above: these are decisions, not omissions.
+ */
+const DELIBERATELY_NOT_BACKED_UP = [
+  // The AWS admin key. Encrypted under encryption.key, which a backup contains:
+  // together they would hand an archive-holder the operator's AWS account.
+  'object-storage-credential.json',
+];
+
 /** `.json` literals in the scanned files that are not drop-svc stores. */
 const NOT_STORES = [
   'package.json',
@@ -81,9 +91,10 @@ function discoverStoreNames(): Set<string> {
 describe('data/drop-svc file stores vs the backup list', () => {
   const discovered = discoverStoreNames();
 
-  it('backs up and restores the object-storage stores (#301)', () => {
+  it('backs up and restores the object-storage allocations, but never the AWS admin credential (#301)', () => {
     expect(DROP_SVC_FILES).toContain('object-storage.json');
-    expect(DROP_SVC_FILES).toContain('object-storage-credential.json');
+    expect(DROP_SVC_FILES).not.toContain('object-storage-credential.json');
+    expect(DROP_SVC_FILES).toContain('encryption.key');
   });
 
   it('finds the stores it is meant to guard (the scan itself is not broken)', () => {
@@ -96,6 +107,7 @@ describe('data/drop-svc file stores vs the backup list', () => {
     const unaccounted = [...discovered]
       .filter((name) => !DROP_SVC_FILES.includes(name))
       .filter((name) => !NOT_BACKED_UP_YET.includes(name))
+      .filter((name) => !DELIBERATELY_NOT_BACKED_UP.includes(name))
       .filter((name) => !NOT_STORES.includes(name))
       .sort();
     expect(unaccounted).toEqual([]);
@@ -104,5 +116,7 @@ describe('data/drop-svc file stores vs the backup list', () => {
   it('keeps the exemption list honest: nothing exempted is already backed up or no longer exists', () => {
     expect(NOT_BACKED_UP_YET.filter((name) => DROP_SVC_FILES.includes(name))).toEqual([]);
     expect(NOT_BACKED_UP_YET.filter((name) => !discovered.has(name))).toEqual([]);
+    expect(DELIBERATELY_NOT_BACKED_UP.filter((name) => DROP_SVC_FILES.includes(name))).toEqual([]);
+    expect(DELIBERATELY_NOT_BACKED_UP.filter((name) => !discovered.has(name))).toEqual([]);
   });
 });

@@ -140,9 +140,13 @@ itself), and how many apps have storage.
 ## Backup and restore
 
 `drop backup` includes `object-storage.json` (which bucket and IAM user each app
-has, and each app's encrypted key) and `object-storage-credential.json` (the
-encrypted admin key); `drop restore` puts them back. Both are encrypted under
-`encryption.key`, which is in the same backup. At boot, DROP logs a warning for
+has, and each app's encrypted key), encrypted under `encryption.key`, which is in
+the same backup; `drop restore` puts it back. It does **not** include
+`object-storage-credential.json`, your AWS admin key: encrypted under that same
+`encryption.key`, it would put the key to your AWS account and the key that
+opens it in one archive. After a restore, re-enter the credential (step 3
+above, or `DROP_S3_ADMIN_*` in the service environment); `drop restore` says so.
+At boot, DROP logs a warning for
 every app whose owner attached object storage but which has no allocation on
 record — what a restore from a backup that predates these files looks like. The
 bucket still exists in AWS in that case; look for the `drop-` IAM users under

@@ -332,6 +332,11 @@ export function createRestoreCommand(): Command {
         output.print(
           `  Per-app config:           ${hasWebapps ? 'data/appconf/webapps (recursive copy)' : 'not present in backup'}`
         );
+        if (filesToRestore.includes('object-storage.json')) {
+          output.print(
+            '  Object storage:          the AWS admin credential is NOT part of a backup — re-enter it afterwards (PUT /api/v1/admin/settings/object-storage/credential, or DROP_S3_ADMIN_* in the service environment).'
+          );
+        }
         if (hasDatabases) {
           output.print(
             `  Database restore:        ${hasRolesSql ? 'restore-roles.sql, then ' : '(no restore-roles.sql — roles NOT recreated) '}${dumpFiles.length} dump(s): ${dumpFiles.join(', ') || '(none)'}`
