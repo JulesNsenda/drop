@@ -105,7 +105,11 @@ Two cases do not finish the job in one step:
 - **`keepData=true`**: the bucket is kept, as the owner's data — but its IAM
   key is revoked and its user deleted, so nothing can keep writing to it. An
   admin lists these with `GET /api/v1/admin/object-storage/retired` and
-  destroys one with `DELETE /api/v1/admin/object-storage/retired/<id>`. They
+  destroys one with `DELETE /api/v1/admin/object-storage/retired/<id>?confirm=<id>`,
+  which, like detaching, needs an interactive session (not an API key) and is
+  logged as `object-storage-bucket-destroyed`. A record quarantined because it
+  was found on a name whose current app is not the one it was made for shows
+  `quarantined: true`. They
   keep counting against their owner's `DROP_MAX_OBJECT_STORAGE_PER_USER`.
 - **AWS refuses the teardown**: DROP retries it every 15 minutes until it
   succeeds. The sweep never runs twice at once, and shutting the platform down

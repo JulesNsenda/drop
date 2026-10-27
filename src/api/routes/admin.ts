@@ -9,6 +9,7 @@ import * as crypto from 'crypto';
 import { success, error, ErrorCodes } from '../types';
 import { getActivityLog } from '../../managers/activity';
 import { suspendUser, updateUser, listUsers, isAuthEnabled, AuthContext } from '../middleware/auth';
+import { interactiveSessionOnly } from '../access';
 import { getStateManager } from '../../managers/app/state-manager';
 import { getAppRuntime } from '../../managers/runtime';
 import { logActivityFor } from '../../managers/activity';
@@ -1199,6 +1200,22 @@ admin.delete('/object-storage/retired/:id', async (c) => {
   if (authRefusal) return c.json(error(ErrorCodes.UNAUTHORIZED, authRefusal), 401);
   const authCtx = (c.get as Function)('auth') as AuthContext | undefined;
   const id = c.req.param('id');
+  // The most destructive call in the platform: every object, then the bucket,
+  // with no backup. Same bar as detaching or deleting an app that holds one —
+  // a person at an interactive session who names what is being destroyed — so
+  // neither a stolen API key nor a script's slip can do it.
+  const gate = interactiveSessionOnly(authCtx, 'Destroying a kept bucket');
+  if (!gate.ok) return c.json(error(ErrorCodes.UNAUTHORIZED, gate.message), 403);
+  if (c.req.query('confirm') !== id) {
+    return c.json(
+      error(
+        ErrorCodes.VALIDATION_ERROR,
+        `Destroying a kept bucket permanently deletes it and every object in it, with no backup. Repeat the request with ?confirm=${id} to proceed.`,
+        { reason: 'confirmation-required', confirm: id }
+      ),
+      400
+    );
+  }
   let result;
   try {
     result = await getObjectStorageProvisioner().destroyRetired(id);
@@ -1213,7 +1230,7 @@ admin.delete('/object-storage/retired/:id', async (c) => {
     );
   }
   if (!result) return c.json(error(ErrorCodes.NOT_FOUND, 'No such retired bucket'), 404);
-  await logActivityFor(authCtx, { action: 'object-storage-settings-set', detail: `Destroyed retired bucket ${id}` });
+  await logActivityFor(authCtx, { action: 'object-storage-bucket-destroyed', detail: `Destroyed retired bucket ${id}` });
   return c.json(success({ destroyed: true, objectsDeleted: result.objectsDeleted, bucketDeleted: result.bucketDeleted }));
 });
 

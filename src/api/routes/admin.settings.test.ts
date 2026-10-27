@@ -25,7 +25,8 @@ import * as path from 'path';
 import * as os from 'os';
 import * as crypto from 'crypto';
 import { ApiServer } from '../server';
-import { createUser, resetAuth } from '../middleware/auth';
+import { createUser, createApiKey, resetAuth } from '../middleware/auth';
+import * as activity from '../../managers/activity';
 import { getTestToken } from '../__testutils__/auth';
 import { getStateManager, resetStateManager } from '../../managers/app/state-manager';
 import { getSettingsManager, resetSettingsManager } from '../../managers/settings/settings-manager';
@@ -1325,11 +1326,13 @@ describe('admin settings routes (PRD-041)', () => {
       ((await (await getSettings()).json()) as { data: { objectStorage: Record<string, unknown> } }).data.objectStorage;
     const listRetired = (token?: string) =>
       hono.request('/api/v1/admin/object-storage/retired', { headers: authHeader(token ?? adminToken) });
-    const destroyRetired = (id: string, token?: string) =>
-      hono.request(`/api/v1/admin/object-storage/retired/${encodeURIComponent(id)}`, {
-        method: 'DELETE',
-        headers: authHeader(token ?? adminToken),
-      });
+    const destroyRetired = (id: string, token?: string, confirm: string | null = id) =>
+      hono.request(
+        `/api/v1/admin/object-storage/retired/${encodeURIComponent(id)}${
+          confirm === null ? '' : `?confirm=${encodeURIComponent(confirm)}`
+        }`,
+        { method: 'DELETE', headers: authHeader(token ?? adminToken) }
+      );
     const goodKey = { accessKeyId: 'AKIAIOSFODNN7EXAMPLE', secretAccessKey: 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY' };
 
     it('becomes available once enabled, configured and given a credential', async () => {
@@ -1437,6 +1440,51 @@ describe('admin settings routes (PRD-041)', () => {
           expect.objectContaining({ id, appName: 'site', bucket: 'dropkit-site-a1b2c3d4', ownerUserId: 'u1', reason: 'kept' }),
         ]);
         expect(JSON.stringify(body)).not.toMatch(/secret|AKIA/i);
+      });
+
+      it('refuses to destroy without ?confirm=<id>, or with a different one, touching nothing', async () => {
+        const id = await seedKept();
+        await putStorageCredential(goodKey);
+
+        for (const confirm of [null, '', 'other']) {
+          const res = await destroyRetired(id, undefined, confirm);
+          expect(res.status).toBe(400);
+          expect(((await res.json()) as { error: { details?: { reason: string } } }).error.details?.reason).toBe(
+            'confirmation-required'
+          );
+        }
+        const list = (await (await listRetired()).json()) as { data: { retired: unknown[] } };
+        expect(list.data.retired).toHaveLength(1);
+      });
+
+      it('refuses an admin API key even with the right confirmation: it needs a person', async () => {
+        const id = await seedKept();
+        await putStorageCredential(goodKey);
+        const admin2 = await createUser('root2', 'password123', 'admin');
+        const apiKey = (await createApiKey('root2-key', 'admin', undefined, undefined, admin2.id)).key;
+
+        const res = await hono.request(
+          `/api/v1/admin/object-storage/retired/${encodeURIComponent(id)}?confirm=${encodeURIComponent(id)}`,
+          { method: 'DELETE', headers: { 'X-API-Key': apiKey } }
+        );
+
+        expect(res.status).toBe(403);
+        const list = (await (await listRetired()).json()) as { data: { retired: unknown[] } };
+        expect(list.data.retired).toHaveLength(1);
+      });
+
+      it('records a distinct activity entry when a bucket is destroyed', async () => {
+        const id = await seedKept();
+        await putStorageCredential(goodKey);
+        const log = jest.spyOn(activity, 'logActivityFor').mockResolvedValue(undefined as never);
+
+        expect((await destroyRetired(id)).status).toBe(200);
+
+        expect(log).toHaveBeenCalledWith(
+          expect.anything(),
+          expect.objectContaining({ action: 'object-storage-bucket-destroyed' })
+        );
+        log.mockRestore();
       });
 
       it('destroys a kept bucket on request, and 404s once it is gone', async () => {
