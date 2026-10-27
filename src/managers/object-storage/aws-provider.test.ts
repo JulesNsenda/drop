@@ -92,7 +92,23 @@ describe('AwsObjectStorageProvider.provision', () => {
   });
 });
 
+const BUCKET = 'dropkit-site-a1b2c3d4';
+const USER = 'drop-dropkit-site-a1b2c3d4';
+
 describe('AwsObjectStorageProvider.deprovision', () => {
+  it.each([
+    ['an empty user (IAM would list the CALLER keys)', { bucket: BUCKET, userName: '' }],
+    ['an empty bucket', { bucket: '', userName: USER }],
+    ['a name DROP did not generate', { bucket: 'someone-elses-bucket', userName: USER }],
+    ['a bucket and user with different suffixes', { bucket: BUCKET, userName: 'drop-dropkit-site-ffffffff' }],
+  ])('refuses %s, touching nothing', async (_label, input) => {
+    const { calls, clients } = fakeClients({});
+    await expect(new AwsObjectStorageProvider('eu-central-1', clients).deprovision(input)).rejects.toMatchObject({
+      name: 'UnsafeResourceNameError',
+    });
+    expect(calls).toEqual([]);
+  });
+
   it('revokes first, then empties every version and upload, then deletes the bucket', async () => {
     let page = 0;
     const { calls, clients } = fakeClients({
@@ -109,7 +125,7 @@ describe('AwsObjectStorageProvider.deprovision', () => {
       ListMultipartUploadsCommand: () => ({ Uploads: [{ Key: 'big', UploadId: 'u1' }] }),
     });
 
-    const result = await new AwsObjectStorageProvider('eu-central-1', clients).deprovision({ bucket: 'b', userName: 'u' });
+    const result = await new AwsObjectStorageProvider('eu-central-1', clients).deprovision({ bucket: BUCKET, userName: USER });
 
     expect(result).toEqual({ objectsDeleted: 1201, bucketDeleted: true, userDeleted: true });
     const names = calls.map((c) => c.command);
@@ -122,6 +138,20 @@ describe('AwsObjectStorageProvider.deprovision', () => {
     expect(names[names.length - 1]).toBe('DeleteBucketCommand');
   });
 
+  it('does not count objects AWS reported it could not delete', async () => {
+    const { clients } = fakeClients({
+      ListAccessKeysCommand: () => ({ AccessKeyMetadata: [] }),
+      ListObjectVersionsCommand: () => ({
+        Versions: [{ Key: 'a', VersionId: '1' }, { Key: 'b', VersionId: '2' }, { Key: 'c', VersionId: '3' }],
+        IsTruncated: false,
+      }),
+      DeleteObjectsCommand: () => ({ Errors: [{ Key: 'b', Code: 'AccessDenied' }] }),
+    });
+
+    const result = await new AwsObjectStorageProvider('eu-central-1', clients).deprovision({ bucket: BUCKET, userName: USER });
+    expect(result.objectsDeleted).toBe(2);
+  });
+
   it('treats resources that are already gone as done, so a retry finishes', async () => {
     const { clients } = fakeClients({
       ListAccessKeysCommand: gone('NoSuchEntity'),
@@ -129,15 +159,65 @@ describe('AwsObjectStorageProvider.deprovision', () => {
     });
 
     await expect(
-      new AwsObjectStorageProvider('eu-central-1', clients).deprovision({ bucket: 'b', userName: 'u' })
+      new AwsObjectStorageProvider('eu-central-1', clients).deprovision({ bucket: BUCKET, userName: USER })
     ).resolves.toEqual({ objectsDeleted: 0, bucketDeleted: false, userDeleted: false });
   });
 
   it('surfaces any other failure', async () => {
     const { clients } = fakeClients({ ListAccessKeysCommand: gone('AccessDenied') });
     await expect(
-      new AwsObjectStorageProvider('eu-central-1', clients).deprovision({ bucket: 'b', userName: 'u' })
+      new AwsObjectStorageProvider('eu-central-1', clients).deprovision({ bucket: BUCKET, userName: USER })
     ).rejects.toMatchObject({ name: 'AccessDenied' });
+  });
+});
+
+describe('AwsObjectStorageProvider.revokeAccess', () => {
+  it('removes the keys, policy and user, and never touches the bucket', async () => {
+    const { calls, clients } = fakeClients({
+      ListAccessKeysCommand: () => ({ AccessKeyMetadata: [{ AccessKeyId: 'K1' }] }),
+    });
+
+    await expect(new AwsObjectStorageProvider('eu-central-1', clients).revokeAccess({ userName: USER })).resolves.toBe(true);
+
+    const names = calls.map((c) => c.command);
+    expect(names).toEqual(['ListAccessKeysCommand', 'DeleteAccessKeyCommand', 'DeleteUserPolicyCommand', 'DeleteUserCommand']);
+  });
+
+  it('refuses an empty user name (IAM would read it as the caller)', async () => {
+    const { calls, clients } = fakeClients({});
+    await expect(new AwsObjectStorageProvider('eu-central-1', clients).revokeAccess({ userName: '' })).rejects.toMatchObject({
+      name: 'UnsafeResourceNameError',
+    });
+    expect(calls).toEqual([]);
+  });
+});
+
+describe('AwsObjectStorageProvider.probeAccess', () => {
+  const key = { bucket: BUCKET, accessKeyId: 'AKIAAPP', secretAccessKey: 'secret' };
+
+  it("makes a HeadBucket with the APP's key, not the admin's", async () => {
+    const { calls: adminCalls, clients } = fakeClients({});
+    const { calls: appCalls, clients: appClients } = fakeClients({ HeadBucketCommand: () => ({}) });
+    const used: unknown[] = [];
+    const provider = new AwsObjectStorageProvider('eu-central-1', clients, (k) => {
+      used.push(k);
+      return appClients.s3;
+    });
+
+    await expect(provider.probeAccess(key)).resolves.toBe(true);
+
+    expect(used).toEqual([expect.objectContaining({ accessKeyId: 'AKIAAPP', secretAccessKey: 'secret' })]);
+    expect(appCalls.map((c) => c.command)).toEqual(['HeadBucketCommand']);
+    expect(appCalls[0].input.Bucket).toBe(BUCKET);
+    expect(adminCalls).toEqual([]);
+  });
+
+  it('reads any failure as "not yet", never an error', async () => {
+    const { clients: appClients } = fakeClients({ HeadBucketCommand: gone('InvalidAccessKeyId') });
+    const { clients } = fakeClients({});
+    const provider = new AwsObjectStorageProvider('eu-central-1', clients, () => appClients.s3);
+
+    await expect(provider.probeAccess(key)).resolves.toBe(false);
   });
 });
 

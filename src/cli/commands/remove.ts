@@ -65,6 +65,15 @@ export function createRemoveCommand(): Command {
       } catch (err) {
         if (err instanceof DropApiError) {
           output.error(err.message);
+          // The server refuses to destroy a bucket from anything but the
+          // dashboard (a 403, or a 400 asking for the confirmation the
+          // dashboard sends). Say what the app holds and the two ways forward.
+          if (err.details?.reason === 'dashboard-only' || err.details?.reason === 'confirmation-required') {
+            output.info(
+              `${appName} holds an object-storage bucket. Use --keep-data to delete the app and keep the bucket, ` +
+                'or delete it from the dashboard to destroy the bucket.'
+            );
+          }
         } else {
           output.error('Failed to remove application', err instanceof Error ? err : undefined);
         }

@@ -41,6 +41,8 @@ export function makePlatformOpsStub(overrides?: Partial<PlatformOps>): PlatformO
     } satisfies DetachServiceResult),
     getServiceIntent: jest.fn().mockReturnValue(undefined),
     isAppInProgress: jest.fn().mockReturnValue(false),
+    objectStorageDeleteRisk: jest.fn().mockResolvedValue('none'),
+    retireObjectStorage: jest.fn().mockResolvedValue(undefined),
     tryReserveApp: jest.fn().mockReturnValue(() => undefined),
     hasLiveBuildContainer: jest.fn().mockResolvedValue(false),
     promoteApp: jest.fn().mockResolvedValue(undefined),

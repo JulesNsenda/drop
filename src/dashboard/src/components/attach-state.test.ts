@@ -2,6 +2,7 @@ import {
   describeAttachCard,
   describeAttachRefusal,
   describeDetachConfirm,
+  describeDeleteBucketWarning,
   describeDetachOutcome,
   describeDetachRefusal,
   formatQuotaUsage,
@@ -24,6 +25,25 @@ const input = (over: Partial<AttachCardInput> = {}): AttachCardInput => ({
 });
 
 describe('describeAttachCard', () => {
+  it('disables attach for a service this platform has not set up, and says so ahead of quota', () => {
+    const view = describeAttachCard(
+      input({ available: false, quota: { used: 3, limit: 3, constrained: true } })
+    );
+    expect(view.canAttach).toBe(false);
+    expect(view.disabledReason).toBe('unavailable');
+  });
+
+  it('keeps readonly ahead of unavailable, and treats an absent flag as available', () => {
+    expect(describeAttachCard(input({ available: false, role: 'readonly' })).disabledReason).toBe('readonly');
+    expect(describeAttachCard(input()).canAttach).toBe(true);
+  });
+
+  it('still offers detach for a provisioned service the platform can no longer provision', () => {
+    const view = describeAttachCard(input({ provisioned: true, available: false }));
+    expect(view.attached).toBe(true);
+    expect(view.canDetach).toBe(true);
+  });
+
   it('marks a provisioned service attached, with no attach control offered', () => {
     const view = describeAttachCard(input({ provisioned: true }));
     expect(view.attached).toBe(true);
@@ -324,6 +344,15 @@ describe('describeDetachConfirm', () => {
     expect(text.toLowerCase()).toContain('no backup');
   });
 
+  it('warns loudest for object storage: every object is deleted, with no backup, ephemeral or not', () => {
+    for (const ephemeral of [false, true]) {
+      const text = describeDetachConfirm('object-storage', ephemeral);
+      expect(text).toMatch(/EVERY object/);
+      expect(text).toContain('NO backup');
+      expect(text.toLowerCase()).toContain('cannot be recovered');
+    }
+  });
+
   it('keeps the existing "no backup at all" redis copy regardless of the ephemeral flag', () => {
     const nonEphemeral = describeDetachConfirm('redis', false);
     const ephemeral = describeDetachConfirm('redis', true);
@@ -362,6 +391,8 @@ describe('describeAttachRefusal', () => {
       'ephemeral',
       'has-own-database-url',
       'has-own-redis-url',
+      'has-own-aws-credentials',
+      'group-app',
       'quota-exceeded',
       'no-app-config',
       'service-unavailable',
@@ -450,12 +481,44 @@ describe('describeDetachRefusal', () => {
   });
 });
 
+describe('describeDeleteBucketWarning', () => {
+  it('says plainly that the bucket and every file go too, with no backup', () => {
+    expect(describeDeleteBucketWarning('bucket')).toMatch(/bucket and EVERY file/);
+    expect(describeDeleteBucketWarning('bucket')).toContain('NO backup');
+  });
+
+  it('words a failed lookup as a possibility, and never as nothing-to-lose', () => {
+    const text = describeDeleteBucketWarning('unknown');
+    expect(text).toMatch(/^ If it has object storage/);
+    expect(text).toContain('NO backup');
+  });
+
+  it('adds nothing for an app without a bucket', () => {
+    expect(describeDeleteBucketWarning('none')).toBe('');
+  });
+});
+
 describe('describeDetachOutcome', () => {
   const base: DetachServiceSuccess = { detached: true, deprovisioned: true, restart: 'restarted' };
 
   it('reports a clean detach with no backup file', () => {
     expect(describeDetachOutcome('Redis', { ...base, flushed: true })).toBe(
       'Redis detached from the app.'
+    );
+  });
+
+  it('says how many objects went with the bucket on an object-storage detach', () => {
+    expect(describeDetachOutcome('Object storage', { ...base, objectsDeleted: 12, bucketDeleted: true })).toBe(
+      'Object storage detached. The bucket and its 12 objects were deleted.'
+    );
+    expect(describeDetachOutcome('Object storage', { ...base, objectsDeleted: 1, bucketDeleted: true })).toBe(
+      'Object storage detached. The bucket and its 1 object were deleted.'
+    );
+  });
+
+  it('says the bucket is still being deleted when the drain was handed to the background', () => {
+    expect(describeDetachOutcome('Object storage', { ...base, drainPending: true })).toBe(
+      'Object storage detached. The app can no longer reach the bucket, and the bucket and its objects are being deleted in the background.'
     );
   });
 

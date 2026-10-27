@@ -28,10 +28,12 @@ import {
   useApp,
   appAction,
   deleteApp,
+  appBucketRisk,
   gitRedeploy,
   getGitTokens,
   GitTokenInfo,
 } from '../hooks/useApi';
+import { describeDeleteBucketWarning } from '../components/attach-state';
 import { getAuthHeaders, useAuth } from '../hooks/useAuth';
 import { appLinkInfo } from '../api/client';
 import {
@@ -246,16 +248,19 @@ function AppDetailPage() {
 
   const handleDelete = async () => {
     if (!name) return;
+    const bucketRisk = await appBucketRisk(name);
     const confirmed = await confirmDialog({
       title: 'Delete application',
-      message: `Are you sure you want to delete "${name}"? This will remove the app and all its files permanently.`,
+      message:
+        `Are you sure you want to delete "${name}"? This will remove the app and all its files permanently.` +
+        describeDeleteBucketWarning(bucketRisk),
       confirmText: 'Delete',
       variant: 'danger',
     });
     if (!confirmed) return;
 
     setActionLoading('delete');
-    const success = await deleteApp(name);
+    const success = await deleteApp(name, { confirmBucket: bucketRisk !== 'none' });
     if (success) {
       toast('success', `Deleted ${name}`);
       navigate('/');

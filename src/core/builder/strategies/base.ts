@@ -8,14 +8,13 @@ import { spawn, ChildProcess } from 'child_process';
 import * as path from 'path';
 import { BuildContext, BuildStrategy, CommandResult } from '../builder.types';
 import { AppType } from '../../detector/detector.types';
+import { isReservedEnvName } from '../../../utils/reserved-env';
 
-/**
- * Env var prefixes that carry platform secrets and must never be exposed to a
- * deployed app's (untrusted) build scripts. Everything else from the parent
- * env is preserved — PATH, SystemRoot/APPDATA/COMSPEC (Windows needs these to
- * run node/npm at all), proxy vars, NODE_EXTRA_CA_CERTS, npm_config_*, etc.
- */
-const SECRET_ENV_PREFIXES = ['DROP_', 'AWS_', 'CF_'];
+// Reserved env prefixes (DROP_, AWS_, CF_) carry platform secrets and must never
+// be exposed to a deployed app's (untrusted) build scripts; the list lives in
+// utils/reserved-env.ts, shared with the PM2 start path. Everything else from
+// the parent env is preserved — PATH, SystemRoot/APPDATA/COMSPEC (Windows needs
+// these to run node/npm at all), proxy vars, NODE_EXTRA_CA_CERTS, npm_config_*.
 
 /**
  * Reserved-prefix names the platform itself sets for a build and allows through
@@ -43,8 +42,7 @@ const PLATFORM_SET_BUILD_VARS: ReadonlySet<string> = new Set(['DROP_GIT_COMMIT']
  * gets a diagnosable failure instead of a mystery.
  */
 export function sanitizeBuildEnv(overrides: Record<string, string> = {}): NodeJS.ProcessEnv {
-  const isSecretKey = (key: string): boolean =>
-    SECRET_ENV_PREFIXES.some((prefix) => key.startsWith(prefix));
+  const isSecretKey = isReservedEnvName;
 
   const out: NodeJS.ProcessEnv = {};
   for (const [key, value] of Object.entries(process.env)) {
