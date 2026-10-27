@@ -153,7 +153,7 @@ describe('POST /apps/:name/redeploy, followed', () => {
 
     setPlatformOps(
       makePlatformOpsStub({
-        redeployApp: (name, actor) => p().redeployApp(name, actor),
+        redeployApp: (name, actor, options) => p().redeployApp(name, actor, options),
         isGroupBusy: (name: string) => p().isGroupBusy(name),
       })
     );

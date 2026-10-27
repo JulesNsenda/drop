@@ -321,38 +321,6 @@ describe('explicit redeploy: reservation, group rule, redeployApp', () => {
       expectNothingHeld();
     });
 
-    it('refuses a git-backed app, pointing at /git/redeploy', async () => {
-      appState = { ...appState, gitSource: { repoUrl: 'https://example.com/r.git', branch: 'main' } };
-      const out = await p().redeployApp(appName, actor);
-      expect(out.refused.code).toBe('REDEPLOY_NOT_SUPPORTED_YET');
-      expect(out.refused.message).toContain(`/git/redeploy/${appName}`);
-      expectNothingHeld();
-    });
-
-    it('refuses a child of a git-deployed group', async () => {
-      appState = { ...appState, group: 'g' };
-      allApps = [
-        appState,
-        { name: 'g-container', isGroupContainer: true, group: 'g', gitSource: { repoUrl: 'x', branch: 'main' } },
-      ];
-      const out = await p().redeployApp(appName, actor);
-      expect(out.refused.code).toBe('REDEPLOY_NOT_SUPPORTED_YET');
-      expectNothingHeld();
-    });
-
-    it('refuses a monorepo container, by flag and by its drop.yaml', async () => {
-      appState = { ...appState, isGroupContainer: true };
-      let out = await p().redeployApp(appName, actor);
-      expect(out.refused.code).toBe('REDEPLOY_NOT_SUPPORTED_YET');
-      expectNothingHeld();
-
-      appState = { name: appName, status: 'running', port: 3005, path: appPath };
-      fs.writeFileSync(path.join(appPath, 'drop.yaml'), 'services:\n  web:\n    path: web\n    type: static\n');
-      out = await p().redeployApp(appName, actor);
-      expect(out.refused.code).toBe('REDEPLOY_NOT_SUPPORTED_YET');
-      expectNothingHeld();
-    });
-
     it('refuses a stopped app', async () => {
       appState = { ...appState, status: 'stopped' };
       jest.spyOn(p(), 'dependenciesAreStale').mockResolvedValue(false);
@@ -428,6 +396,181 @@ describe('explicit redeploy: reservation, group rule, redeployApp', () => {
       jest.spyOn(breakerModule, 'admitDeploy').mockRejectedValue(new Error('quota store down'));
       await expect(p().redeployApp(appName, actor)).rejects.toThrow('quota store down');
       expectNothingHeld();
+    });
+  });
+
+  describe('redeployApp: git-backed apps and monorepo containers', () => {
+    const gitSource = { repoUrl: 'https://github.com/user/repo', branch: 'main' };
+    const servicesYaml = 'services:\n  web:\n    path: web\n    type: static\n';
+    const caller = { admin: false as const, userId: 'owner-1' };
+    let land: jest.Mock;
+
+    beforeEach(() => {
+      appState = { ...appState, gitSource };
+      land = jest.fn().mockResolvedValue({ appName, repoUrl: gitSource.repoUrl, branch: 'main' });
+      p().gitDeployService = { isAvailable: () => true, isCloning: () => false, landUnderHold: land };
+    });
+
+    /** What the subscriber of 'app:update' in start() does, which this harness does not run. */
+    const dispatchUpdates = (): void => {
+      unsubs.push(
+        eventBus.subscribe('app:update', async (payload) => {
+          await p().handleAppUpdate(payload.name, payload.path, payload.reason, payload.bypassCooldown, payload);
+        })
+      );
+    };
+
+    it("a git app's redeploy lands its new commit under the hold, then builds it", async () => {
+      const order: string[] = [];
+      const admit = jest.spyOn(breakerModule, 'admitDeploy').mockImplementation(async () => {
+        order.push('admit');
+      });
+      let duringLand: { claimed: boolean; landMarked: boolean } | undefined;
+      land.mockImplementation(async () => {
+        order.push('land');
+        duringLand = { claimed: p().appsInProgress.has(appName), landMarked: p().gitReserved.has(appName) };
+        return { appName };
+      });
+
+      const out = await p().redeployApp(appName, actor, { caller });
+      expect(out.started).toMatch(UUID);
+      await settle();
+
+      // Charged once, BEFORE the clone; the land runs claimed and marked, and the
+      // marker is gone by the time the hold builds (or the build would be refused).
+      expect(order).toEqual(['admit', 'land']);
+      expect(admit).toHaveBeenCalledTimes(1);
+      expect(duringLand).toEqual({ claimed: true, landMarked: true });
+      expect(land).toHaveBeenCalledTimes(1);
+      const [landedApp, landActor, landCaller] = land.mock.calls[0];
+      expect(landedApp).toMatchObject({ name: appName, gitSource });
+      // No token choice on this surface: the stored token only.
+      expect(landActor).toEqual({ principalId: 'p-1', userId: 'u-1', automation: undefined });
+      expect('tokenId' in landActor).toBe(false);
+      expect(landCaller).toBe(caller);
+      expect(buildCtxs).toHaveLength(1);
+      expect(buildCtxs[0].deployId).toBe(out.started);
+      expect(episodeOf(out.started)!.status).toBe('succeeded');
+      expectNothingHeld();
+    });
+
+    it('passes no caller through as null (the token then resolves as attached only)', async () => {
+      await p().redeployApp(appName, actor);
+      await settle();
+      expect(land.mock.calls[0][2]).toBeNull();
+    });
+
+    it('a failed land releases the hold, records the failed deploy and rethrows', async () => {
+      land.mockRejectedValue(new Error('clone failed: repository not found'));
+      await expect(p().redeployApp(appName, actor, { caller })).rejects.toThrow('clone failed');
+      expectNothingHeld();
+      const episodes = getDeployTracker().getEpisodes(appName);
+      expect(episodes).toHaveLength(1);
+      expect(episodes[0].status).toBe('failed');
+      expect(buildCtxs).toHaveLength(0);
+      expect(p().runtime.start).not.toHaveBeenCalled();
+      // A failed deploy counts toward the breaker, as any other.
+      const [{ key }] = p().guardrailKeys(appName, false, actor);
+      expect(getDeployBreaker().peek(key).failures).toBe(1);
+    });
+
+    it('a caller over quota or over the breaker gets no clone', async () => {
+      const [{ key, threshold }] = p().guardrailKeys(appName, false, actor);
+      for (let i = 0; i < threshold; i++) getDeployBreaker().recordFailure(key, Date.now(), threshold);
+      const out = await p().redeployApp(appName, actor, { caller });
+      expect(out.refused.code).toBe('RATE_LIMITED');
+      expect(land).not.toHaveBeenCalled();
+      expectNothingHeld();
+    });
+
+    it('refuses a git app when the git service is missing, before any admission', async () => {
+      const admit = jest.spyOn(breakerModule, 'admitDeploy');
+      p().gitDeployService = null;
+      const out = await p().redeployApp(appName, actor);
+      expect(out.refused.code).toBe('SERVICE_UNAVAILABLE');
+      expect(admit).not.toHaveBeenCalled();
+      expectNothingHeld();
+    });
+
+    it('rebuilds a child of a git-deployed group as it stands: the container holds the repository, not the child', async () => {
+      appState = { name: appName, status: 'running', port: 3005, path: appPath, userId: 'owner-1', group: 'g' };
+      allApps = [
+        appState,
+        { name: 'g-container', isGroupContainer: true, group: 'g', gitSource: { repoUrl: 'x', branch: 'main' } },
+      ];
+      const out = await p().redeployApp(appName, actor, { caller });
+      expect(out.started).toMatch(UUID);
+      await settle();
+      expect(land).not.toHaveBeenCalled();
+      expect(buildCtxs).toHaveLength(1);
+    });
+
+    it('a container answers group and re-expands, charging the quota once', async () => {
+      appState = { name: appName, status: 'running', port: 3005, path: appPath, userId: 'owner-1' };
+      fs.writeFileSync(path.join(appPath, 'drop.yaml'), servicesYaml);
+      dispatchUpdates();
+      const admit = jest.spyOn(breakerModule, 'admitDeploy');
+      const expand = jest.spyOn(p(), 'expandMonorepo').mockResolvedValue(undefined);
+      const published: any[] = [];
+      unsubs.push(eventBus.subscribe('app:update', (payload) => void published.push(payload)));
+
+      const out = await p().redeployApp(appName, actor, { caller });
+      expect(out).toEqual({ group: { container: appName } });
+      for (let i = 0; i < 300 && expand.mock.calls.length === 0; i++) await tick();
+
+      expect(published).toHaveLength(1);
+      expect(published[0]).toMatchObject({
+        name: appName,
+        bypassCooldown: true,
+        principalId: 'p-1',
+        actorUserId: 'u-1',
+      });
+      // The update path re-expanded it with the same actor, and nothing built.
+      expect(expand).toHaveBeenCalledTimes(1);
+      expect(expand.mock.calls[0][3]).toMatchObject({ principalId: 'p-1', actorUserId: 'u-1' });
+      expect(buildCtxs).toHaveLength(0);
+      // ONE admission: the anonymous path takes none of its own.
+      expect(admit).toHaveBeenCalledTimes(1);
+      expect(land).not.toHaveBeenCalled();
+      await settle();
+      expectNothingHeld();
+    });
+
+    it('a container flagged in state is a group even before its drop.yaml says so, and is never refused as stopped', async () => {
+      appState = { name: appName, status: 'stopped', path: appPath, userId: 'owner-1', isGroupContainer: true };
+      jest.spyOn(p(), 'dependenciesAreStale').mockResolvedValue(false);
+      const out = await p().redeployApp(appName, actor);
+      expect(out).toEqual({ group: { container: appName } });
+      expectNothingHeld();
+    });
+
+    it('a git repo that gained services: is dispatched as a group, not built', async () => {
+      land.mockImplementation(async () => {
+        fs.writeFileSync(path.join(appPath, 'drop.yaml'), servicesYaml);
+        return { appName };
+      });
+      dispatchUpdates();
+      const expand = jest.spyOn(p(), 'expandMonorepo').mockResolvedValue(undefined);
+
+      const out = await p().redeployApp(appName, actor, { caller });
+      expect(out).toEqual({ group: { container: appName } });
+      for (let i = 0; i < 300 && expand.mock.calls.length === 0; i++) await tick();
+
+      expect(land).toHaveBeenCalledTimes(1);
+      expect(expand).toHaveBeenCalledTimes(1);
+      expect(buildCtxs).toHaveLength(0);
+      expect(p().runtime.start).not.toHaveBeenCalled();
+      await settle();
+      expectNothingHeld();
+    });
+
+    it('a container is refused while a service of its group is busy', async () => {
+      appState = { name: appName, status: 'running', path: appPath, userId: 'owner-1', isGroupContainer: true, group: 'g' };
+      allApps = [appState, { name: 'g-web', group: 'g', status: 'running' }];
+      p().appsInProgress.add('g-web');
+      const out = await p().redeployApp(appName, actor);
+      expect(out.refused.code).toBe('APP_BUSY');
+      expect(p().holdOwners.has(appName)).toBe(false);
     });
   });
 

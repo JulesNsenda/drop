@@ -21,6 +21,7 @@ import type { RollbackSnapshotMeta } from '../managers/rollback';
 import type { AttachableServiceId, AttachServiceResult, DetachServiceResult } from './services-wire.types';
 import type { AccessGateVerdict } from '../managers/guardrail/access-gate';
 import type { DeployActorInfo } from '../managers/guardrail/deploy-breaker';
+import type { TokenCaller } from '../core/git-deploy/git-deploy.types';
 
 /**
  * The attach/detach wire contract itself lives in `services-wire.types.ts` —
@@ -141,7 +142,6 @@ export type RedeployRefusalCode =
   | 'APP_SOURCE_MISSING'
   | 'APP_BUSY'
   | 'SERVICE_UNAVAILABLE'
-  | 'REDEPLOY_NOT_SUPPORTED_YET'
   | 'APP_STOPPED'
   | 'RATE_LIMITED'
   | 'INSUFFICIENT_DISK';
@@ -155,10 +155,15 @@ export interface RedeployRefusal {
 /**
  * What an explicit redeploy came to: started (it has a builder slot and the
  * deploy id it builds under), accepted (no slot within the wait: it carries on
- * in the background, and has no id yet), or refused. A monorepo group is refused for now; a
- * group that appears after a git land is a later item's.
+ * in the background, and has no id yet), a group (the app is a monorepo
+ * container, which is re-expanded rather than built: its services deploy under
+ * their own names), or refused.
  */
-export type RedeployStart = { started: string } | { accepted: true } | { refused: RedeployRefusal };
+export type RedeployStart =
+  | { started: string }
+  | { accepted: true }
+  | { group: { container: string } }
+  | { refused: RedeployRefusal };
 
 export interface PlatformOps {
   /**
@@ -282,13 +287,15 @@ export interface PlatformOps {
   describeRollback(appName: string): Promise<RollbackSnapshotMeta | null>;
 
   /**
-   * Redeploy an app explicitly (source already on disk, rebuilt as it stands).
-   * ONE operation, and the reservation never leaves the platform: it takes the
-   * app's slot, decides under it that the app exists, is a files app (git-backed
-   * apps and monorepo groups are refused for now), is not busy, passes the
-   * stopped rule, has disk and is admitted by the deploy guardrails (once), and
-   * starts. An admitted request counts against the caller's deploy quota
-   * whatever becomes of it - the quota counts volume, not outcome.
+   * Redeploy an app explicitly (rebuilt as it stands; a git-backed app first
+   * lands its repository's newest commit). ONE operation, and the reservation
+   * never leaves the platform: it takes the app's slot, decides under it that
+   * the app exists, is not busy, passes the stopped rule, has disk and is
+   * admitted by the deploy guardrails (once), lands a git-backed app, and
+   * starts. A monorepo container is re-expanded instead of built. An admitted
+   * request counts against the caller's deploy quota whatever becomes of it -
+   * the quota counts volume, not outcome. `options.caller` is who is asking,
+   * for the git token rules; the app's stored token is the only one used.
    *
    * Waits for a builder slot, at most DROP_REDEPLOY_START_WAIT_MS (10 seconds). In time:
    * `started`, with the id the build runs under (its episode follows within
@@ -298,7 +305,11 @@ export interface PlatformOps {
    * returned, never thrown; the slot and the breaker keys are given back on
    * every path. Authorization is the caller's.
    */
-  redeployApp(appName: string, actor: DeployActorInfo): Promise<RedeployStart>;
+  redeployApp(
+    appName: string,
+    actor: DeployActorInfo,
+    options?: { caller?: TokenCaller | null }
+  ): Promise<RedeployStart>;
 
   /**
    * Whether any app in the same monorepo group as `appName` is busy in a way

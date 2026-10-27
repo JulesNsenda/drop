@@ -1656,6 +1656,32 @@ describe('GitDeployService', () => {
       ).rejects.toThrow(`GitHub token '${t.id}' not found`);
     });
 
+    it('landUnderHold (the platform redeploy) uses the attached token only: the owner\'s or a granted one, never a stranger\'s', async () => {
+      // No tokenId in the actor: this surface cannot choose a token.
+      const land = (name: string): Promise<unknown> =>
+        service.landUnderHold(getStateManager().getApp(name)!, { principalId: 'p-1' }, null);
+
+      // The owner's own token, attached. After a transfer it is a stranger's.
+      await attachedApp('land-owned', 'alice', 'alice', 'ghp_alices');
+      // Another user's token, attached by an admin: the grant makes it usable,
+      // and it is void once the app has another owner.
+      await service.deploy({ repoUrl: 'https://github.com/user/land-granted', branch: 'main', userId: 'alice' });
+      await makeGitDir('land-granted');
+      const b = await service.setToken('bob-pat', 'ghp_bobs', 'bob');
+      await service.redeploy('land-granted', { tokenId: b.id }, { admin: true, userId: 'root-admin', interactive: true });
+
+      const pull = jest.spyOn(gitClient, 'gitClone');
+      await land('land-owned');
+      await getStateManager().updateApp('land-owned', { userId: 'carol' } as Record<string, unknown>);
+      await land('land-owned');
+      await land('land-granted');
+      await getStateManager().updateApp('land-granted', { userId: 'carol' } as Record<string, unknown>);
+      await land('land-granted');
+
+      expect(pullTokens(pull)).toEqual(['ghp_alices', undefined, 'ghp_bobs', undefined]);
+      pull.mockRestore();
+    });
+
     it('naming the attached id again works for a legacy token a non-admin could not newly choose', async () => {
       const t = await attachedApp('legacy-again', 'alice', undefined, 'ghp_legacyvalue');
 

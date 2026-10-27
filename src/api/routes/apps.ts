@@ -13,7 +13,7 @@ import { pipeline } from 'stream/promises';
 import { success, error, ErrorCodes, AppDto, CreateAppDto } from '../types';
 import { NotFoundError, ValidationError } from '../middleware/error';
 import { AuthContext, listUsers, getUserById } from '../middleware/auth';
-import { canAccess, canAccessScoped, interactiveSessionOnly } from '../access';
+import { canAccess, canAccessScoped, interactiveSessionOnly, tokenCallerOf } from '../access';
 import { isValidAppName, validateAppName } from '../middleware/validate';
 import { getAppRuntime } from '../../managers/runtime';
 import {
@@ -1291,7 +1291,6 @@ const REDEPLOY_REFUSALS: Record<RedeployRefusalCode, { status: 404 | 409 | 429 |
   // The app exists but its folder does not: a conflict with the app's state, not an unknown app (404).
   APP_SOURCE_MISSING: { status: 409, code: 'APP_SOURCE_MISSING' },
   APP_BUSY: { status: 409, code: 'APP_BUSY' },
-  REDEPLOY_NOT_SUPPORTED_YET: { status: 409, code: 'REDEPLOY_NOT_SUPPORTED_YET' },
   APP_STOPPED: { status: 409, code: 'APP_STOPPED' },
   SERVICE_UNAVAILABLE: { status: 503, code: ErrorCodes.SERVICE_UNAVAILABLE },
   RATE_LIMITED: { status: 429, code: ErrorCodes.RATE_LIMITED },
@@ -1311,15 +1310,19 @@ function redeployRefusalResponse(c: Context, refusal: RedeployRefusal) {
   );
 }
 
-// POST /apps/:name/redeploy - rebuild a FILES app from the source already on
-// disk and swap it in. The platform waits up to 10s for a builder slot: in time
-// the 202 carries the deploy id; otherwise it says `accepted` and the redeploy
-// carries on in the background. Either way `follow` (omitted for a role-none
-// caller, which cannot read /deploys) is the app + since stream
+// POST /apps/:name/redeploy - rebuild an app and swap it in. A git-backed app
+// first lands its repository's newest commit (its stored token only: this
+// surface has no tokenId to choose one); any other app is rebuilt from the
+// source already on disk. The platform waits up to 10s for a builder slot: in
+// time the 202 carries the deploy id; otherwise it says `accepted` and the
+// redeploy carries on in the background. Either way `follow` (omitted for a
+// role-none caller, which cannot read /deploys) is the app + since stream
 // (GET /deploys/stream), NOT the by-id stream: between the mint and the build's
 // first event the deploy has no episode, and the by-id stream 404s there, while
-// the since-stream waits for it (and shows a refusal after the wait). Git-backed
-// apps and monorepo groups are refused for now.
+// the since-stream waits for it (and shows a refusal after the wait). A
+// monorepo container is not built: it is re-expanded, and the 202 says
+// `group` with the container's name. Its services deploy under their own names,
+// so follow them per service; the container's own stream shows only a refusal.
 apps.post('/:name/redeploy', async c => {
   const auth = (c.get as Function)('auth') as AuthContext | undefined;
   const name = c.req.param('name');
@@ -1342,16 +1345,26 @@ apps.post('/:name/redeploy', async c => {
 
   // One operation: the platform reserves, admits (with the one actor, for the
   // guardrail keys and the stopped rule alike) and starts.
-  const result = await ops.redeployApp(name, deployActorOf(auth));
+  const result = await ops.redeployApp(name, deployActorOf(auth), { caller: tokenCallerOf(auth) ?? null });
   if ('refused' in result) return redeployRefusalResponse(c, result.refused);
 
-  await logActivityFor(auth, { action: 'redeploy', appName: name, detail: 'files' });
+  await logActivityFor(auth, {
+    action: 'redeploy',
+    appName: name,
+    detail: app.gitSource ? 'git' : 'group' in result ? 'group' : 'files',
+  });
   // A scope-only caller (role 'none') cannot read /deploys at all (its floor is
   // 'readonly'), so a URL into it would only 403: it gets the facts and no link.
   const follow =
     auth?.role === 'none'
       ? undefined
       : `/api/v1/deploys/stream?app=${encodeURIComponent(name)}&since=${encodeURIComponent(acceptedAt)}`;
+  if ('group' in result) {
+    return c.json(
+      success({ group: true, container: result.group.container, acceptedAt, ...(follow ? { follow } : {}) }),
+      202
+    );
+  }
   if ('accepted' in result) {
     return c.json(success({ accepted: true, acceptedAt, ...(follow ? { follow } : {}) }), 202);
   }
