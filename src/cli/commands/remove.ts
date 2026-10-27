@@ -16,6 +16,10 @@ export function createRemoveCommand(): Command {
     .argument('<app>', 'Application name')
     .option('-f, --force', 'Force removal without confirmation')
     .option('--keep-data', 'Keep application data and logs')
+    .option(
+      '--destroy-bucket',
+      "Also permanently delete the app's object-storage bucket and every object in it (no backup)"
+    )
     .action(async (appName: string, options: RemoveOptions) => {
       try {
         const client = await createApiClient();
@@ -37,7 +41,10 @@ export function createRemoveCommand(): Command {
         const spin = output.spinner(`Removing ${appName}...`);
         spin.start();
 
-        const result = await client.removeApp(appName, { keepData: options.keepData });
+        const result = await client.removeApp(appName, {
+          keepData: options.keepData,
+          destroyBucket: options.destroyBucket,
+        });
 
         spin.succeed(`Removed ${appName}`);
 
@@ -65,6 +72,14 @@ export function createRemoveCommand(): Command {
       } catch (err) {
         if (err instanceof DropApiError) {
           output.error(err.message);
+          // The server refuses to delete a bucket without an explicit say-so;
+          // say which two ways forward there are.
+          if (err.details?.reason === 'confirmation-required') {
+            output.info(
+              `${appName} holds an object-storage bucket. To delete the app and KEEP the bucket, re-run with --keep-data. ` +
+                'To delete the app AND permanently destroy the bucket and every object in it (no backup), re-run with --destroy-bucket.'
+            );
+          }
         } else {
           output.error('Failed to remove application', err instanceof Error ? err : undefined);
         }

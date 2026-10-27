@@ -147,8 +147,8 @@ describe('destroying a bucket needs an interactive session and a confirmation (#
     const withRisk = (risk: 'none' | 'bucket' | 'unknown') =>
       ops({ objectStorageDeleteRisk: jest.fn().mockResolvedValue(risk) });
 
-    it.each(['bucket', 'unknown'] as const)('refuses without ?confirm=<app> when the store says %s, stopping nothing', async (risk) => {
-      withRisk(risk);
+    it('refuses without ?confirm=<app> when the app holds a bucket, stopping nothing', async () => {
+      withRisk('bucket');
 
       const res = await del('/api/v1/apps/site');
 
@@ -157,6 +157,53 @@ describe('destroying a bucket needs an interactive session and a confirmation (#
         'confirmation-required'
       );
       expect(runtime.stop).not.toHaveBeenCalled();
+      expect(getStateManager().getApp('site')).toBeDefined();
+    });
+
+    it('answers 503, saying why, when the allocation store is unreadable — not a confirmation prompt', async () => {
+      withRisk('unknown');
+
+      for (const url of ['/api/v1/apps/site', '/api/v1/apps/site?confirm=site']) {
+        const res = await del(url);
+        expect(res.status).toBe(503);
+        const body = (await res.json()) as { error: { code: string; message: string; details?: { reason: string } } };
+        expect(body.error.code).toBe(ErrorCodes.SERVICE_UNAVAILABLE);
+        expect(body.error.details?.reason).toBe('object-storage-unreadable');
+        expect(body.error.message).toMatch(/unreadable/);
+      }
+      expect(runtime.stop).not.toHaveBeenCalled();
+      expect(getStateManager().getApp('site')).toBeDefined();
+
+      // keepData keeps any bucket, so it is the way out.
+      expect((await del('/api/v1/apps/site?keepData=true')).status).toBe(200);
+    });
+
+    it("accepts the platform's own CLI key (admin, ownerless) with the confirmation, but not without it", async () => {
+      withRisk('bucket');
+      const cli = { 'X-API-Key': (await createApiKey('cli-local', 'admin')).key };
+
+      expect((await del('/api/v1/apps/site', cli)).status).toBe(400);
+      expect(getStateManager().getApp('site')).toBeDefined();
+
+      expect((await del('/api/v1/apps/site?confirm=site', cli)).status).toBe(200);
+      expect(getStateManager().getApp('site')).toBeUndefined();
+    });
+
+    it('still refuses every other credential with the confirmation: other admin keys, owned admin keys, agent tokens', async () => {
+      withRisk('bucket');
+      const admin = await createUser('boss', 'password123', 'admin');
+      const keys: Record<string, string> = {
+        'ownerless admin key under another name': (await createApiKey('deploy-bot', 'admin')).key,
+        'owned admin key even if named cli-local': (await createApiKey('cli-local', 'admin', undefined, undefined, admin.id)).key,
+        'agent token': (
+          await createApiKey('agent', 'admin', undefined, undefined, admin.id, { expiresInMinutes: 30, kind: 'agent' })
+        ).key,
+      };
+
+      for (const [label, key] of Object.entries(keys)) {
+        const res = await del('/api/v1/apps/site?confirm=site', { 'X-API-Key': key });
+        expect({ label, status: res.status }).toEqual({ label, status: 403 });
+      }
       expect(getStateManager().getApp('site')).toBeDefined();
     });
 
@@ -205,6 +252,18 @@ describe('destroying a bucket needs an interactive session and a confirmation (#
 
       expect((await del('/api/v1/apps/mono?confirm=mono')).status).toBe(200);
       expect(removeGroup).toHaveBeenCalledWith('mono');
+    });
+
+    it('answers 503 for a group delete when a child allocation store is unreadable', async () => {
+      const sm = getStateManager();
+      const owner = (await sm.getApp('site'))!.userId;
+      await sm.registerApp('mono-web', path.join(tempDir, 'mono-web'));
+      await sm.updateApp('mono-web', { userId: owner, group: 'mono' });
+      const removeGroup = jest.fn().mockResolvedValue({ removed: ['mono-web'] });
+      ops({ removeGroup, objectStorageDeleteRisk: jest.fn().mockResolvedValue('unknown') });
+
+      expect((await del('/api/v1/apps/mono?confirm=mono')).status).toBe(503);
+      expect(removeGroup).not.toHaveBeenCalled();
     });
 
     it('needs nothing extra for an app without a bucket (an API key still deletes)', async () => {

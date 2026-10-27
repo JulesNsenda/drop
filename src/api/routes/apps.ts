@@ -13,7 +13,7 @@ import { pipeline } from 'stream/promises';
 import { success, error, ErrorCodes, AppDto, CreateAppDto } from '../types';
 import { NotFoundError, ValidationError } from '../middleware/error';
 import { AuthContext, listUsers, getUserById } from '../middleware/auth';
-import { canAccess, interactiveSessionOnly } from '../access';
+import { canAccess, interactiveSessionOrLocalCli } from '../access';
 import { isValidAppName, validateAppName } from '../middleware/validate';
 import { getAppRuntime } from '../../managers/runtime';
 import {
@@ -703,8 +703,9 @@ apps.put('/:name', async c => {
  * object-storage bucket and every object in it (#301). Two requirements, both
  * enforced on the server because the dashboard's dialog is only a courtesy:
  *
- *  - an INTERACTIVE session (`interactiveSessionOnly`): an API key, an OAuth
- *    token or an agent token never reaches this, however privileged its role;
+ *  - an INTERACTIVE session, or the platform's own CLI key (`drop remove
+ *    --destroy-bucket`): any other API key, an OAuth token or an agent token
+ *    never reaches this, however privileged its role;
  *  - an explicit `?confirm=<target>` naming what is being destroyed, so a
  *    script or a stray DELETE cannot trigger it by accident.
  *
@@ -716,7 +717,7 @@ function bucketDestructionRefusal(
   target: string,
   action: string
 ): Response | null {
-  const gate = interactiveSessionOnly(auth, action);
+  const gate = interactiveSessionOrLocalCli(auth, action);
   if (!gate.ok) {
     return c.json(error(ErrorCodes.UNAUTHORIZED, gate.message), 403);
   }
@@ -725,13 +726,27 @@ function bucketDestructionRefusal(
       error(
         ErrorCodes.VALIDATION_ERROR,
         `${action} permanently deletes the object-storage bucket and every object in it, with no backup. ` +
-          `Repeat the request with ?confirm=${target} to proceed.`,
+          `Repeat the request with ?confirm=${target} to proceed` +
+          (action.startsWith('Detaching') ? '.' : ', or pass keepData=true to keep the bucket.'),
         { reason: 'confirmation-required', confirm: target }
       ),
       400
     );
   }
   return null;
+}
+
+/** The delete cannot be proven safe: the object-storage allocation store is unreadable. */
+function objectStorageUnreadable(c: Context): Response {
+  return c.json(
+    error(
+      ErrorCodes.SERVICE_UNAVAILABLE,
+      "The object-storage allocation store is unreadable, so DROP cannot tell whether this app holds a bucket and will not delete it. " +
+        'An operator needs to repair the store (data/drop-svc/object-storage.json); to delete the app anyway and keep any bucket it may hold, pass keepData=true.',
+      { reason: 'object-storage-unreadable' }
+    ),
+    503
+  );
 }
 
 // DELETE /apps/:name - Remove application (group-aware, M4)
@@ -801,7 +816,9 @@ apps.delete('/:name', async c => {
     // A group delete destroys every child's bucket too (keepData is not
     // offered here), so it needs the same confirmation as a single app.
     for (const child of groupChildren) {
-      if ((await ops.objectStorageDeleteRisk(child.name)) !== 'none') {
+      const risk = await ops.objectStorageDeleteRisk(child.name);
+      if (risk === 'unknown') return objectStorageUnreadable(c);
+      if (risk === 'bucket') {
         const refusal = bucketDestructionRefusal(c, auth, name, `Deleting group '${groupName}'`);
         if (refusal) return refusal;
         break;
@@ -825,11 +842,13 @@ apps.delete('/:name', async c => {
   // An app whose bucket this delete would destroy needs an interactive session
   // and an explicit confirmation — checked before anything is stopped or
   // reserved. `keepData` keeps the bucket, so it is not destruction. An
-  // unreadable allocation store counts as "may destroy": it cannot be proven
-  // otherwise.
+  // unreadable allocation store cannot be proven safe, but a confirmation
+  // would not make it so either (the person has nothing to confirm): the
+  // delete is refused with a 503 that says why, and keepData is the way out.
   if (c.req.query('keepData') !== 'true') {
     const risk = (await getPlatformOps()?.objectStorageDeleteRisk(name)) ?? 'none';
-    if (risk !== 'none') {
+    if (risk === 'unknown') return objectStorageUnreadable(c);
+    if (risk === 'bucket') {
       const refusal = bucketDestructionRefusal(c, auth, name, `Deleting '${name}'`);
       if (refusal) return refusal;
     }

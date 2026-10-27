@@ -87,11 +87,15 @@ detach converges without a manual retry.
 ## When an app is deleted
 
 Deleting an app deletes its bucket the same way, with no backup, and needs the
-same interactive session and `?confirm=<app>` when the app holds a bucket (a
-monorepo group delete is confirmed with the group name). An unreadable
-allocation store counts as "may hold a bucket". The dashboard's delete dialog
-says so and sends the confirmation. A script using an API key (`drop remove`)
-is refused for such an app unless it passes `keepData`.
+same `?confirm=<app>` when the app holds a bucket (a monorepo group delete is
+confirmed with the group name), from an interactive session **or the
+platform's own CLI key**. The dashboard's delete dialog says so and sends the
+confirmation. `drop remove <app>` is refused with advice; `drop remove <app>
+--keep-data` keeps the bucket, and `drop remove <app> --destroy-bucket`
+destroys it. Any other API key, an OAuth token or an agent token is refused.
+If the allocation store is unreadable, DROP cannot tell whether the app holds a
+bucket: the delete answers 503 and says so (`keepData` still works) instead of
+asking for a confirmation that would mean nothing.
 
 The record is **moved off the app's name first**, before any AWS call, and the
 bucket is torn down from that retired record; a large bucket is drained by a

@@ -149,8 +149,10 @@ that declares a `healthCheck`.**
   - **Destroying a bucket needs a person and a confirmation.** Detaching, or
     deleting an app (or group) that holds a bucket, requires an interactive
     session and `?confirm=<name>`, checked server-side before anything is
-    stopped. API keys, OAuth and agent tokens are refused, so `drop remove` of
-    such an app needs `--keep-data`. The dashboard dialogs say so and send it.
+    stopped. Other API keys, OAuth and agent tokens are refused; the CLI's own
+    local key is accepted, so `drop remove <app> --destroy-bucket` (or
+    `--keep-data` to keep the bucket) works. An unreadable allocation store
+    answers 503 rather than asking. The dashboard dialogs say so and send it.
   - **A delete retires the record before touching AWS.** The allocation is
     moved off the app's name first, the IAM key is revoked, and the bucket is
     drained in the background rather than while the DELETE waits. Records carry

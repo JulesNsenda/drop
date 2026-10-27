@@ -34,7 +34,9 @@ export class DropApiError extends Error {
   constructor(
     public readonly statusCode: number,
     public readonly code: string,
-    message: string
+    message: string,
+    /** The server's structured `error.details`, when it sent any (e.g. `{ reason: 'confirmation-required' }`). */
+    public readonly details?: Record<string, unknown>
   ) {
     super(message);
     this.name = 'DropApiError';
@@ -74,7 +76,11 @@ export class DropApiClient {
       );
     }
 
-    let json: { success: boolean; data?: T; error?: { code: string; message: string } };
+    let json: {
+      success: boolean;
+      data?: T;
+      error?: { code: string; message: string; details?: Record<string, unknown> };
+    };
     try {
       json = (await response.json()) as typeof json;
     } catch {
@@ -84,7 +90,7 @@ export class DropApiClient {
     if (!json.success || !response.ok) {
       const code = json.error?.code ?? 'UNKNOWN';
       const message = json.error?.message ?? `HTTP ${response.status}`;
-      throw new DropApiError(response.status, code, message);
+      throw new DropApiError(response.status, code, message, json.error?.details);
     }
     return json.data as T;
   }
@@ -130,10 +136,14 @@ export class DropApiClient {
 
   async removeApp(
     name: string,
-    opts?: { keepData?: boolean }
+    opts?: { keepData?: boolean; destroyBucket?: boolean }
   ): Promise<{ message?: string; database?: 'dropped' | 'retained' | 'preserved' | 'none' }> {
-    const qs = opts?.keepData ? '?keepData=true' : '';
-    return this.request('DELETE', `/apps/${encodeURIComponent(name)}${qs}`);
+    const params = new URLSearchParams();
+    if (opts?.keepData) params.set('keepData', 'true');
+    // The explicit confirmation the server demands before it deletes a bucket.
+    if (opts?.destroyBucket) params.set('confirm', name);
+    const qs = params.toString();
+    return this.request('DELETE', `/apps/${encodeURIComponent(name)}${qs ? '?' + qs : ''}`);
   }
 
   async getLogs(name: string, lines = 100): Promise<string[]> {

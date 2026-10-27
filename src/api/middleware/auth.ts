@@ -176,11 +176,22 @@ export interface AuthContext {
    */
   principalId?: string;
   /**
+   * True only for the platform's own CLI key (`cli-local`): ownerless, admin,
+   * minted by the platform at boot into a file only a local operator can read.
+   * It is what lets `drop remove --destroy-bucket` confirm a destructive
+   * action without a browser session. Derived here from the key itself, never
+   * from a name a caller could choose for an owned key.
+   */
+  localCli?: true;
+  /**
    * Set only for a token minted through POST /auth/agent-tokens. Load-bearing
    * at the MCP gate — see mcpAuthMiddleware.
    */
   kind?: 'agent';
 }
+
+/** The name the platform gives the CLI's own admin key at boot (platform.ts). */
+export const CLI_LOCAL_KEY_NAME = 'cli-local';
 
 /**
  * Canonical role ranking. The single source every ordinal role comparison
@@ -2013,6 +2024,7 @@ function apiKeyAuthContext(key: ApiKey, owner: SafeUser | null): AuthContext {
       // more than one. Ownership still flows through userId above.
       principalId: `key:${key.id}`,
       ...(key.kind ? { kind: key.kind } : {}),
+      ...(key.name === CLI_LOCAL_KEY_NAME && key.role === 'admin' && !key.kind ? { localCli: true as const } : {}),
     };
   }
 
