@@ -41,6 +41,22 @@ describe('DockerBuildStrategy', () => {
       expect(strategy.getBuildCommand(c)).toBe(`docker build --build-arg DROP_GIT_COMMIT=${sha} -t app:latest .`);
     });
 
+    it("adds the build arg to the platform's own suggested command, but not to the owner's", () => {
+      const strategy = new DockerBuildStrategy();
+      const suggested = ctx({
+        appName: 'app',
+        env: { DROP_GIT_COMMIT: sha },
+        config: { buildCommand: 'docker build -t app .' },
+      });
+      expect(strategy.getBuildCommand(suggested)).toBe(`docker build --build-arg DROP_GIT_COMMIT=${sha} -t app .`);
+      const owners = ctx({
+        appName: 'app',
+        env: { DROP_GIT_COMMIT: sha },
+        config: { buildCommand: 'docker build -t mine --target prod .' },
+      });
+      expect(strategy.getBuildCommand(owners)).toBe('docker build -t mine --target prod .');
+    });
+
     it('never interpolates anything else into the shell command', () => {
       const strategy = new DockerBuildStrategy();
       const c = ctx({ appName: 'app', env: { DROP_GIT_COMMIT: 'x; rm -rf /' } });

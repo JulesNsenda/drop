@@ -90,6 +90,14 @@ export interface GitCloneOptions {
    * suite has no network and clones from a `file://` remote.
    */
   allowFileProtocol?: boolean;
+  /**
+   * Refuse, BEFORE any file is written, a repository whose tree is larger than
+   * this many bytes or has more than `maxEntries` files. The clone is made
+   * without a checkout and sized from the tree object (`ls-tree -r -l`), so a
+   * huge repository costs a download, not the disk.
+   */
+  maxBytes?: number;
+  maxEntries?: number;
 }
 
 /** Git deploy result */

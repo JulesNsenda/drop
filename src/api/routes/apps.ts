@@ -1097,6 +1097,13 @@ apps.post('/:name/promote', async c => {
     return c.json(error(ErrorCodes.SERVICE_UNAVAILABLE, 'Platform operations unavailable'), 503);
   }
 
+  if (ops.isAppInProgress(name)) {
+    return c.json(
+      error(ErrorCodes.CONFLICT, `Application '${name}' is building or deploying - retry once it settles`),
+      409
+    );
+  }
+
   try {
     await ops.promoteApp(name);
     await logActivityFor(auth, {

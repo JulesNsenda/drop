@@ -37,13 +37,26 @@ export interface LandLimits {
   maxEntries: number;
 }
 
+/** One tracked regular file: repository-relative `/` path and its git blob id. */
+export interface TrackedFile {
+  path: string;
+  sha: string;
+}
+
+/** What a land wrote: path to blob id. An empty id means "written, id unknown". */
+export type LandedFiles = Map<string, string>;
+
 export interface LandRequest {
   cloneDir: string;
   appDir: string;
-  /** Tracked regular files, repository-relative with `/` separators. */
-  files: string[];
-  /** The previously landed file list, or `null` when there is none. */
-  previous: string[] | null;
+  /** Tracked regular files of the clone. */
+  files: TrackedFile[];
+  /**
+   * The previously landed files, or `null` when there is none. A file whose id
+   * is unchanged (and whose copy is still a regular file) is not rewritten; a
+   * path absent from the new list is the only kind that is ever deleted.
+   */
+  previous: LandedFiles | null;
   limits: LandLimits;
   /** Called right after THIS land created the app folder (and not before). */
   onCreatedAppDir?: () => void;
@@ -160,18 +173,18 @@ async function assertPlainParents(base: string, segs: string[], what: string): P
   }
 }
 
-export async function landTracked(req: LandRequest): Promise<string[]> {
+export async function landTracked(req: LandRequest): Promise<LandedFiles> {
   const { cloneDir, appDir, files, previous, limits, onCreatedAppDir } = req;
 
   // Validate and measure BEFORE writing anything, so a refusal leaves the app
   // exactly as it was.
-  const rels: string[] = [];
+  const planned: Array<{ rel: string; segs: string[]; sha: string; size: number }> = [];
   const dirs = new Set<string>();
   let bytes = 0;
   if (files.length > limits.maxEntries) {
     throw new Error(`Repository exceeds the maximum of ${limits.maxEntries} entries`);
   }
-  for (const rel of files) {
+  for (const { path: rel, sha } of files) {
     const segs = segmentsOf(rel);
     if (path.join(appDir, ...segs).length > MAX_PATH_LENGTH) {
       throw new Error(`Refusing to land an over-long path: ${rel.slice(0, 80)}`);
@@ -189,9 +202,9 @@ export async function landTracked(req: LandRequest): Promise<string[]> {
       throw new Error(`Repository exceeds the maximum checkout size of ${Math.floor(limits.maxBytes / (1024 * 1024))} MB`);
     }
     for (let i = 1; i < segs.length; i++) dirs.add(segs.slice(0, i).join('/'));
-    rels.push(rel);
+    planned.push({ rel, segs, sha, size: st.size });
   }
-  if (rels.length + dirs.size > limits.maxEntries) {
+  if (planned.length + dirs.size > limits.maxEntries) {
     throw new Error(`Repository exceeds the maximum of ${limits.maxEntries} entries`);
   }
 
@@ -207,31 +220,61 @@ export async function landTracked(req: LandRequest): Promise<string[]> {
   const fold = (t: string): string => (insensitive ? t.toLowerCase() : t);
   if (insensitive) {
     const seen = new Set<string>();
-    for (const rel of rels) {
+    for (const { rel } of planned) {
       const k = fold(rel);
       if (seen.has(k)) throw new Error('Repository has paths that differ only by case; this host cannot hold both');
       seen.add(k);
     }
   }
 
-  // Copy. Every parent is re-checked with lstat for every file: nothing is
-  // remembered between writes, because a container may be changing the folder.
-  for (const rel of rels) {
-    const segs = segmentsOf(rel);
+  // Copy. The caller holds the app's exclusive reservation, so nothing else is
+  // writing the folder: each directory is verified once per land.
+  const checkedDirs = new Set<string>();
+  const landed: LandedFiles = new Map();
+  for (const { rel, segs, sha, size } of planned) {
     let cur = appDir;
     for (let i = 0; i < segs.length - 1; i++) {
       cur = path.join(cur, segs[i]);
-      await ensureRealDir(cur, segs.slice(0, i + 1).join('/'));
+      const key = segs.slice(0, i + 1).join('/');
+      if (!checkedDirs.has(key)) {
+        await ensureRealDir(cur, key);
+        checkedDirs.add(key);
+      }
     }
     const dest = path.join(cur, segs[segs.length - 1]);
-    await clearEntry(dest);
-    await fs.copyFile(path.join(cloneDir, ...segs), dest, fsConstants.COPYFILE_EXCL);
+    landed.set(rel, sha);
+
+    // Unchanged since the last land and still a plain file of the right size:
+    // leave it (no rewrite, no new mtime for the watcher or a signature).
+    const before = await lstatOrNull(dest);
+    if (
+      sha !== '' &&
+      previous?.get(rel) === sha &&
+      before?.isFile() &&
+      !before.isSymbolicLink() &&
+      before.size === size
+    ) {
+      continue;
+    }
+    // A directory in the way must go first; anything else is replaced by the
+    // rename below (a link is replaced, never followed).
+    if (before?.isDirectory() && !before.isSymbolicLink()) await clearEntry(dest);
+    // Write beside the target, then rename over it: there is no moment when
+    // the path is missing or half-written.
+    const tmp = path.join(cur, `.drop-land-${randomBytes(6).toString('hex')}`);
+    try {
+      await fs.copyFile(path.join(cloneDir, ...segs), tmp, fsConstants.COPYFILE_EXCL);
+      await fs.rename(tmp, dest);
+    } catch (err) {
+      await fs.rm(tmp, { force: true }).catch(() => undefined);
+      throw err;
+    }
   }
 
   // Prune: only what the previous land wrote and this one no longer has.
   if (previous) {
-    const now = new Set(rels.map(fold));
-    for (const rel of previous) {
+    const now = new Set([...landed.keys()].map(fold));
+    for (const rel of previous.keys()) {
       if (now.has(fold(rel))) continue;
       let segs: string[];
       try {
@@ -239,7 +282,7 @@ export async function landTracked(req: LandRequest): Promise<string[]> {
       } catch {
         continue;
       }
-      if (segs.some((s) => fold(s) === 'node_modules')) continue;
+      if (segs.some((seg) => fold(seg) === 'node_modules')) continue;
       if (!(await parentIsPlainDirs(appDir, segs))) continue;
       const abs = path.join(appDir, ...segs);
       const st = await lstatOrNull(abs);
@@ -258,36 +301,62 @@ export async function landTracked(req: LandRequest): Promise<string[]> {
   }
 
   await removeDotGit(appDir);
-  return rels;
+  return landed;
 }
 
 // ── Manifest store ───────────────────────────────────────────────────────────
 
 interface ManifestFile {
-  version: 1;
-  files: string[];
+  version: 2;
+  files: Record<string, string>;
 }
 
-function manifestPath(dir: string, appName: string): string {
-  if (path.basename(appName) !== appName || appName.includes('..')) {
+/**
+ * Where the saved file lists live, given the platform's `data` directory. The
+ * ONE place the location is built: the platform, app teardown and rollback all
+ * go through it.
+ */
+export function gitManifestDir(dataDir: string): string {
+  return path.join(dataDir, 'drop-svc', 'git-manifests');
+}
+
+/** One app's saved file list. Throws on a name that could escape the directory. */
+export function gitManifestPath(manifestDir: string, appName: string): string {
+  if (!appName || path.basename(appName) !== appName || appName.includes('..')) {
     throw new Error('Invalid app name for manifest');
   }
-  return path.join(dir, `${appName}.json`);
+  return path.join(manifestDir, `${appName}.json`);
 }
 
-/** The previously landed file list, or `null` (missing or unreadable: prune nothing). */
-export async function readManifest(dir: string, appName: string): Promise<string[] | null> {
+/**
+ * The previously landed files, or `null` (missing or unreadable: prune nothing).
+ * A version-1 file (paths only) reads with unknown ids, so every file is
+ * rewritten once and the ids are recorded.
+ */
+export async function readManifest(dir: string, appName: string): Promise<LandedFiles | null> {
   try {
-    const parsed = JSON.parse(await fs.readFile(manifestPath(dir, appName), 'utf-8')) as ManifestFile;
-    if (parsed?.version !== 1 || !Array.isArray(parsed.files)) return null;
-    return parsed.files.filter((f): f is string => typeof f === 'string');
+    const parsed = JSON.parse(await fs.readFile(gitManifestPath(dir, appName), 'utf-8')) as {
+      version?: number;
+      files?: unknown;
+    };
+    if (parsed?.version === 2 && parsed.files && typeof parsed.files === 'object') {
+      const out: LandedFiles = new Map();
+      for (const [k, v] of Object.entries(parsed.files as Record<string, unknown>)) {
+        out.set(k, typeof v === 'string' ? v : '');
+      }
+      return out;
+    }
+    if (parsed?.version === 1 && Array.isArray(parsed.files)) {
+      return new Map(parsed.files.filter((f): f is string => typeof f === 'string').map((f) => [f, '']));
+    }
+    return null;
   } catch {
     return null;
   }
 }
 
-export async function writeManifest(dir: string, appName: string, files: string[]): Promise<void> {
+export async function writeManifest(dir: string, appName: string, files: LandedFiles): Promise<void> {
   await fs.mkdir(dir, { recursive: true, mode: 0o700 });
-  const value: ManifestFile = { version: 1, files };
-  await writeJsonAtomic(manifestPath(dir, appName), value, { mode: 0o600 });
+  const value: ManifestFile = { version: 2, files: Object.fromEntries(files) };
+  await writeJsonAtomic(gitManifestPath(dir, appName), value, { mode: 0o600 });
 }

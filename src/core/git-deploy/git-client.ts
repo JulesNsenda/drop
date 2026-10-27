@@ -24,6 +24,7 @@ import { execFile } from 'child_process';
 import * as path from 'path';
 import { promisify } from 'util';
 import { GitCloneOptions } from './git-deploy.types';
+import type { TrackedFile } from './land';
 
 const execFileAsync = promisify(execFile);
 
@@ -288,6 +289,7 @@ export function buildCloneArgs(options: GitCloneOptions): string[] {
     ...hardeningArgs(allowFileProtocol),
     ...(token ? CREDENTIAL_HELPER_ARGS : []),
     'clone',
+    '--no-checkout',
     '--depth',
     '1',
     '--branch',
@@ -303,8 +305,8 @@ export function buildCloneArgs(options: GitCloneOptions): string[] {
 /** What a finished clone reports. Paths are repository-relative, `/`-separated. */
 export interface CloneInfo {
   commitSha?: string;
-  /** Tracked regular files (mode 100644/100755). */
-  files: string[];
+  /** Tracked regular files (mode 100644/100755) with their blob ids. */
+  files: TrackedFile[];
   /** Tracked symbolic links (mode 120000): not recreated in the app folder. */
   symlinks: string[];
 }
@@ -328,7 +330,7 @@ function cloneFailure(err: unknown, dest: string): Error {
  * base — and report the commit and what the repository tracks.
  */
 export async function gitClone(options: GitCloneOptions): Promise<CloneInfo> {
-  const { url, dest, branch, token, allowFileProtocol } = options;
+  const { url, dest, branch, token, allowFileProtocol, maxBytes, maxEntries } = options;
 
   if (!isValidBranchName(branch)) {
     throw new Error(`Invalid branch name: ${branch}`);
@@ -338,8 +340,27 @@ export async function gitClone(options: GitCloneOptions): Promise<CloneInfo> {
   }
 
   try {
+    // No checkout yet: the tree is sized first (below), so an oversized
+    // repository is refused before it is written out.
     await runGit({ args: buildCloneArgs({ url, dest, branch, token, allowFileProtocol }), token });
+    if (maxBytes !== undefined || maxEntries !== undefined) {
+      await assertTreeWithinCaps(dest, maxBytes, maxEntries);
+    }
+    await runGit({
+      args: [
+        '--git-dir',
+        path.join(dest, '.git'),
+        '--work-tree',
+        dest,
+        ...hardeningArgs(!!allowFileProtocol),
+        'checkout',
+        '--force',
+        'HEAD',
+      ],
+      cwd: dest,
+    });
   } catch (err) {
+    if (err instanceof TreeTooLargeError) throw err;
     throw cloneFailure(err, dest);
   }
 
@@ -349,8 +370,48 @@ export async function gitClone(options: GitCloneOptions): Promise<CloneInfo> {
   } catch {
     // non-fatal
   }
-  const { files, symlinks } = await listTracked(dest);
-  return { commitSha, files, symlinks };
+  try {
+    const { files, symlinks } = await listTracked(dest);
+    return { commitSha, files, symlinks };
+  } catch (err) {
+    throw cloneFailure(err, dest);
+  }
+}
+
+class TreeTooLargeError extends Error {}
+
+/**
+ * Size the cloned tree from its objects, before any file is written: the sum of
+ * the blobs' declared sizes (`ls-tree -r -l`) and their count.
+ */
+async function assertTreeWithinCaps(
+  clonePath: string,
+  maxBytes: number | undefined,
+  maxEntries: number | undefined
+): Promise<void> {
+  const { stdout } = await runGit({
+    args: ['--git-dir', path.join(clonePath, '.git'), ...hardeningArgs(false), 'ls-tree', '-r', '-l', '-z', 'HEAD'],
+    cwd: clonePath,
+    timeoutMs: 60_000,
+  });
+  let bytes = 0;
+  let entries = 0;
+  for (const entry of String(stdout).split('\0')) {
+    const tab = entry.indexOf('\t');
+    if (tab < 0) continue;
+    const [mode, type, , size] = entry.slice(0, tab).trim().split(/\s+/);
+    if (type !== 'blob' || mode === '120000') continue;
+    entries++;
+    bytes += Number(size) || 0;
+    if (maxEntries !== undefined && entries > maxEntries) {
+      throw new TreeTooLargeError(`Repository exceeds the maximum of ${maxEntries} entries`);
+    }
+    if (maxBytes !== undefined && bytes > maxBytes) {
+      throw new TreeTooLargeError(
+        `Repository exceeds the maximum checkout size of ${Math.floor(maxBytes / (1024 * 1024))} MB`
+      );
+    }
+  }
 }
 
 /**
@@ -371,21 +432,21 @@ async function readHead(clonePath: string): Promise<string> {
  * `ls-files -s -z` entries look like `<mode> <sha> <stage>\t<path>`; gitlinks
  * (submodules, mode 160000) are neither and are dropped.
  */
-async function listTracked(clonePath: string): Promise<{ files: string[]; symlinks: string[] }> {
+async function listTracked(clonePath: string): Promise<{ files: TrackedFile[]; symlinks: string[] }> {
   const { stdout } = await runGit({
     args: ['--git-dir', path.join(clonePath, '.git'), ...hardeningArgs(false), 'ls-files', '-s', '-z'],
     cwd: clonePath,
     timeoutMs: 60_000,
   });
-  const files: string[] = [];
+  const files: TrackedFile[] = [];
   const symlinks: string[] = [];
   for (const entry of String(stdout).split('\0')) {
     const tab = entry.indexOf('\t');
     if (tab < 0) continue;
-    const mode = entry.slice(0, entry.indexOf(' '));
+    const [mode, sha] = entry.slice(0, tab).split(' ');
     const rel = entry.slice(tab + 1);
     if (mode === '120000') symlinks.push(rel);
-    else if (mode === '100644' || mode === '100755') files.push(rel);
+    else if (mode === '100644' || mode === '100755') files.push({ path: rel, sha });
   }
   return { files, symlinks };
 }

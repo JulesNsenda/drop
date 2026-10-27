@@ -97,6 +97,9 @@ gitDeploy.post('/deploy', async (c) => {
       c.header('Retry-After', String(err.retryAfterSeconds));
       return c.json(error(ErrorCodes.RATE_LIMITED, err.message), 429);
     }
+    if (err instanceof AppInProgressError) {
+      return c.json(error(ErrorCodes.CONFLICT, err.message), 409);
+    }
     const message = err instanceof Error ? err.message : 'Deploy failed';
     if (message.includes('already exists')) {
       return c.json(error(ErrorCodes.CONFLICT, message), 409);
@@ -310,6 +313,11 @@ gitDeploy.post('/webhook', async (c) => {
       // as the app frees up.
       if (err instanceof AppInProgressError) {
         service.queueRedeploy(appName, { automation: 'webhook' });
+        await logActivityFor(undefined, {
+          action: 'redeploy',
+          appName,
+          detail: `webhook (queued, app busy): ${branch}`,
+        });
         results.push({ app: appName, status: 'queued' });
         continue;
       }

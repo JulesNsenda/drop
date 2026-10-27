@@ -6,7 +6,13 @@
 import * as fs from 'fs/promises';
 import * as os from 'os';
 import * as path from 'path';
-import { landTracked, readManifest, writeManifest } from './land';
+import { landTracked, readManifest, writeManifest, gitManifestDir, gitManifestPath } from './land';
+
+/** Tracked files with a content-derived id, as a clone would report them. */
+const f = (...paths: string[]): Array<{ path: string; sha: string }> =>
+  paths.map((p) => ({ path: p, sha: `sha-${p}` }));
+/** A previous landing of the same files. */
+const prev = (...paths: string[]): Map<string, string> => new Map(paths.map((p) => [p, `sha-${p}`]));
 
 const LIMITS = { maxBytes: 10 * 1024 * 1024, maxEntries: 1000 };
 
@@ -52,12 +58,12 @@ describe('landTracked', () => {
     const landed = await landTracked({
       cloneDir: clone,
       appDir: app,
-      files: ['a.txt', 'sub/b.txt'],
+      files: f('a.txt', 'sub/b.txt'),
       previous: null,
       limits: LIMITS,
     });
 
-    expect(landed).toEqual(['a.txt', 'sub/b.txt']);
+    expect([...landed.keys()]).toEqual(['a.txt', 'sub/b.txt']);
     expect(await fs.readFile(path.join(app, 'sub', 'b.txt'), 'utf-8')).toBe('B');
     expect(await exists(path.join(app, '.git'))).toBe(false);
   });
@@ -74,8 +80,8 @@ describe('landTracked', () => {
     await landTracked({
       cloneDir: clone,
       appDir: app,
-      files: ['kept.txt'],
-      previous: ['kept.txt', 'removed-upstream.txt', 'sub/also-removed.txt', 'node_modules/dep/index.js'],
+      files: [{ path: 'kept.txt', sha: 'new-content' }],
+      previous: prev('kept.txt', 'removed-upstream.txt', 'sub/also-removed.txt', 'node_modules/dep/index.js'),
       limits: LIMITS,
     });
 
@@ -92,7 +98,7 @@ describe('landTracked', () => {
     await write(app, 'stale.txt', 'old');
     await write(clone, 'a.txt', 'A');
 
-    await landTracked({ cloneDir: clone, appDir: app, files: ['a.txt'], previous: null, limits: LIMITS });
+    await landTracked({ cloneDir: clone, appDir: app, files: f('a.txt'), previous: null, limits: LIMITS });
 
     expect(await exists(path.join(app, 'stale.txt'))).toBe(true);
   });
@@ -100,14 +106,14 @@ describe('landTracked', () => {
   it('removes a leftover .git directory, and a symlinked .git as a link only', async () => {
     await write(clone, 'a.txt', 'A');
     await write(app, '.git/config', 'tenant-written');
-    await landTracked({ cloneDir: clone, appDir: app, files: ['a.txt'], previous: null, limits: LIMITS });
+    await landTracked({ cloneDir: clone, appDir: app, files: f('a.txt'), previous: null, limits: LIMITS });
     expect(await exists(path.join(app, '.git'))).toBe(false);
 
     const target = path.join(root, 'target');
     await fs.mkdir(target);
     await fs.writeFile(path.join(target, 'sentinel'), 'safe');
     await link(target, path.join(app, '.git'));
-    await landTracked({ cloneDir: clone, appDir: app, files: ['a.txt'], previous: null, limits: LIMITS });
+    await landTracked({ cloneDir: clone, appDir: app, files: f('a.txt'), previous: null, limits: LIMITS });
     expect(await exists(path.join(app, '.git'))).toBe(false);
     expect(await fs.readFile(path.join(target, 'sentinel'), 'utf-8')).toBe('safe');
   });
@@ -119,7 +125,7 @@ describe('landTracked', () => {
     await write(clone, 'sub/b.txt', 'B');
 
     await expect(
-      landTracked({ cloneDir: clone, appDir: app, files: ['sub/b.txt'], previous: null, limits: LIMITS })
+      landTracked({ cloneDir: clone, appDir: app, files: f('sub/b.txt'), previous: null, limits: LIMITS })
     ).rejects.toThrow(/symbolic link/);
 
     expect(await exists(path.join(target, 'b.txt'))).toBe(false);
@@ -135,7 +141,7 @@ describe('landTracked', () => {
     }
     await write(clone, 'a.txt', 'A');
 
-    await landTracked({ cloneDir: clone, appDir: app, files: ['a.txt'], previous: null, limits: LIMITS });
+    await landTracked({ cloneDir: clone, appDir: app, files: f('a.txt'), previous: null, limits: LIMITS });
 
     expect(await fs.readFile(outside, 'utf-8')).toBe('host file');
     expect((await fs.lstat(path.join(app, 'a.txt'))).isSymbolicLink()).toBe(false);
@@ -152,8 +158,8 @@ describe('landTracked', () => {
     await landTracked({
       cloneDir: clone,
       appDir: app,
-      files: ['a.txt'],
-      previous: ['a.txt', 'sub/b.txt'],
+      files: f('a.txt'),
+      previous: prev('a.txt', 'sub/b.txt'),
       limits: LIMITS,
     });
 
@@ -164,7 +170,7 @@ describe('landTracked', () => {
     await write(clone, 'a.txt', 'A');
 
     await expect(
-      landTracked({ cloneDir: clone, appDir: app, files: ['a.txt', 'gone.txt'], previous: null, limits: LIMITS })
+      landTracked({ cloneDir: clone, appDir: app, files: f('a.txt', 'gone.txt'), previous: null, limits: LIMITS })
     ).rejects.toThrow(/missing from the clone/);
     expect(await exists(path.join(app, 'a.txt'))).toBe(false);
   });
@@ -176,7 +182,7 @@ describe('landTracked', () => {
     await link(elsewhere, path.join(clone, 'sub'));
 
     await expect(
-      landTracked({ cloneDir: clone, appDir: app, files: ['sub/b.txt'], previous: null, limits: LIMITS })
+      landTracked({ cloneDir: clone, appDir: app, files: f('sub/b.txt'), previous: null, limits: LIMITS })
     ).rejects.toThrow(/plain directories/);
     expect(await exists(path.join(app, 'sub'))).toBe(false);
   });
@@ -186,7 +192,7 @@ describe('landTracked', () => {
     const long = `${'x'.repeat(256)}.txt`;
 
     await expect(
-      landTracked({ cloneDir: clone, appDir: app, files: ['a.txt', long], previous: null, limits: LIMITS })
+      landTracked({ cloneDir: clone, appDir: app, files: f('a.txt', long), previous: null, limits: LIMITS })
     ).rejects.toThrow(/over-long/);
     expect(await exists(path.join(app, 'a.txt'))).toBe(false);
   });
@@ -201,8 +207,8 @@ describe('landTracked', () => {
     await landTracked({
       cloneDir: clone,
       appDir: app,
-      files: ['readme.md'],
-      previous: ['README.md'],
+      files: f('readme.md'),
+      previous: prev('README.md'),
       limits: LIMITS,
     });
 
@@ -219,12 +225,55 @@ describe('landTracked', () => {
   it('calls onCreatedAppDir only when this land created the folder', async () => {
     await write(clone, 'a.txt', 'A');
     const made = jest.fn();
-    await landTracked({ cloneDir: clone, appDir: app, files: ['a.txt'], previous: null, limits: LIMITS, onCreatedAppDir: made });
+    await landTracked({ cloneDir: clone, appDir: app, files: f('a.txt'), previous: null, limits: LIMITS, onCreatedAppDir: made });
     expect(made).not.toHaveBeenCalled();
 
     const fresh = path.join(root, 'fresh');
-    await landTracked({ cloneDir: clone, appDir: fresh, files: ['a.txt'], previous: null, limits: LIMITS, onCreatedAppDir: made });
+    await landTracked({ cloneDir: clone, appDir: fresh, files: f('a.txt'), previous: null, limits: LIMITS, onCreatedAppDir: made });
     expect(made).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not rewrite a file whose id is unchanged and which is still a plain file of the same size', async () => {
+    await write(clone, 'a.txt', 'A');
+    await write(clone, 'b.txt', 'B');
+    await write(app, 'a.txt', 'Z'); // same size, locally changed
+    await write(app, 'b.txt', 'Z');
+
+    await landTracked({
+      cloneDir: clone,
+      appDir: app,
+      files: [
+        { path: 'a.txt', sha: 'same' },
+        { path: 'b.txt', sha: 'changed-now' },
+      ],
+      previous: new Map([
+        ['a.txt', 'same'],
+        ['b.txt', 'changed-before'],
+      ]),
+      limits: LIMITS,
+    });
+
+    expect(await fs.readFile(path.join(app, 'a.txt'), 'utf-8')).toBe('Z'); // skipped
+    expect(await fs.readFile(path.join(app, 'b.txt'), 'utf-8')).toBe('B'); // rewritten
+  });
+
+  it('writes beside the target and renames over it, leaving no temporary file behind', async () => {
+    await write(clone, 'a.txt', 'new');
+    await write(app, 'a.txt', 'old');
+
+    await landTracked({ cloneDir: clone, appDir: app, files: f('a.txt'), previous: null, limits: LIMITS });
+
+    expect(await fs.readFile(path.join(app, 'a.txt'), 'utf-8')).toBe('new');
+    expect((await fs.readdir(app)).filter((n) => n.startsWith('.drop-land-'))).toEqual([]);
+  });
+
+  it('replaces a directory standing where a file is tracked', async () => {
+    await write(clone, 'a.txt', 'A');
+    await write(app, 'a.txt/inner', 'x');
+
+    await landTracked({ cloneDir: clone, appDir: app, files: f('a.txt'), previous: null, limits: LIMITS });
+
+    expect(await fs.readFile(path.join(app, 'a.txt'), 'utf-8')).toBe('A');
   });
 
   it('refuses a repository over the entry or size caps before writing anything', async () => {
@@ -235,7 +284,7 @@ describe('landTracked', () => {
       landTracked({
         cloneDir: clone,
         appDir: app,
-        files: ['a.txt', 'b.txt'],
+        files: f('a.txt', 'b.txt'),
         previous: null,
         limits: { maxBytes: 1024, maxEntries: 1 },
       })
@@ -244,7 +293,7 @@ describe('landTracked', () => {
       landTracked({
         cloneDir: clone,
         appDir: app,
-        files: ['a.txt', 'b.txt'],
+        files: f('a.txt', 'b.txt'),
         previous: null,
         limits: { maxBytes: 1, maxEntries: 100 },
       })
@@ -256,7 +305,7 @@ describe('landTracked', () => {
   it('refuses unsafe tracked paths', async () => {
     for (const bad of ['../x', '.git/config', 'a/../b', 'sub/.GIT/x']) {
       await expect(
-        landTracked({ cloneDir: clone, appDir: app, files: [bad], previous: null, limits: LIMITS })
+        landTracked({ cloneDir: clone, appDir: app, files: f(bad), previous: null, limits: LIMITS })
       ).rejects.toThrow(/unsafe path/);
     }
   });
@@ -269,9 +318,19 @@ describe('landTracked', () => {
     await write(clone, 'a.txt', 'A');
 
     await expect(
-      landTracked({ cloneDir: clone, appDir: linked, files: ['a.txt'], previous: null, limits: LIMITS })
+      landTracked({ cloneDir: clone, appDir: linked, files: f('a.txt'), previous: null, limits: LIMITS })
     ).rejects.toThrow(/symbolic link/);
     expect(await exists(path.join(real, 'a.txt'))).toBe(false);
+  });
+});
+
+describe('manifest location', () => {
+  it('is one helper, and refuses a name that escapes the directory', () => {
+    const dir = gitManifestDir('/srv/drop/data');
+    expect(dir.replace(/\\/g, '/')).toBe('/srv/drop/data/drop-svc/git-manifests');
+    expect(gitManifestPath(dir, 'web').replace(/\\/g, '/')).toBe('/srv/drop/data/drop-svc/git-manifests/web.json');
+    expect(() => gitManifestPath(dir, '../x')).toThrow();
+    expect(() => gitManifestPath(dir, 'a/b')).toThrow();
   });
 });
 
@@ -280,8 +339,11 @@ describe('manifest store', () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'drop-manifest-'));
     try {
       expect(await readManifest(dir, 'app')).toBeNull();
-      await writeManifest(dir, 'app', ['a.txt', 'sub/b.txt']);
-      expect(await readManifest(dir, 'app')).toEqual(['a.txt', 'sub/b.txt']);
+      await writeManifest(dir, 'app', new Map([['a.txt', 'aaa'], ['sub/b.txt', 'bbb']]));
+      expect(await readManifest(dir, 'app')).toEqual(new Map([['a.txt', 'aaa'], ['sub/b.txt', 'bbb']]));
+      // A version-1 file (paths only) still reads, with unknown ids.
+      await fs.writeFile(gitManifestPath(dir, 'old'), '{"version":1,"files":["x.txt"]}');
+      expect(await readManifest(dir, 'old')).toEqual(new Map([['x.txt', '']]));
       await fs.writeFile(path.join(dir, 'app.json'), '{not json');
       expect(await readManifest(dir, 'app')).toBeNull();
     } finally {

@@ -9,6 +9,9 @@ import { BuildContext } from '../builder.types';
 import { AppType } from '../../detector/detector.types';
 import { BaseBuildStrategy } from './base';
 
+/** The `buildCommand` the Docker detector (detectors/docker.ts) suggests. */
+const DETECTOR_SUGGESTED_BUILD_COMMAND = 'docker build -t app .';
+
 export class DockerBuildStrategy extends BaseBuildStrategy {
   name = 'docker';
   supportedTypes: AppType[] = ['docker'];
@@ -36,6 +39,12 @@ export class DockerBuildStrategy extends BaseBuildStrategy {
   getBuildCommand(context: BuildContext): string | null {
     // Use custom build command if provided
     if (context.config.buildCommand) {
+      // The command the Docker detector suggests is the platform's own, so it
+      // gets the commit argument like the one built below; a command the owner
+      // wrote in drop.yaml is theirs and is left exactly as written.
+      if (context.config.buildCommand === DETECTOR_SUGGESTED_BUILD_COMMAND) {
+        return `docker build${this.gitCommitArg(context)} -t app .`;
+      }
       return context.config.buildCommand;
     }
 

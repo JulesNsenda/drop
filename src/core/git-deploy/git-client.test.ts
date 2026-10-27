@@ -20,6 +20,7 @@ import {
   stripUrlCredentials,
 } from './git-client';
 import { landTracked } from './land';
+import type { TrackedFile } from './land';
 
 const run = promisify(execFile);
 
@@ -165,7 +166,7 @@ describe('Git Client', () => {
       await run('git', ['-C', remote, 'commit', '-am', content]);
     }
 
-    async function freshClone(): Promise<{ dest: string; files: string[]; symlinks: string[]; commitSha?: string }> {
+    async function freshClone(): Promise<{ dest: string; files: TrackedFile[]; symlinks: string[]; commitSha?: string }> {
       const dest = path.join(clones, `clone-${n++}`);
       await fs.mkdir(dest);
       const info = await gitClone({ url: remoteUrl, dest, branch: br, allowFileProtocol: true });
@@ -199,10 +200,27 @@ describe('Git Client', () => {
       const info = await freshClone();
       const head = (await run('git', ['-C', remote, 'rev-parse', 'HEAD'])).stdout.trim();
       expect(info.commitSha).toBe(head);
-      expect(info.files.sort()).toEqual(['file.txt', 'sub/a.txt']);
+      expect(info.files.map((x) => x.path).sort()).toEqual(['file.txt', 'sub/a.txt']);
+      // Each file carries its git blob id, which the saved list keeps.
+      for (const file of info.files) expect(file.sha).toMatch(/^[0-9a-f]{40}$/);
       expect(info.symlinks).toEqual([]);
       const depth = (await run('git', ['-C', info.dest, 'rev-list', '--count', 'HEAD'])).stdout.trim();
       expect(depth).toBe('1');
+    }, 30000);
+
+    it('refuses an oversized tree BEFORE any file is checked out', async () => {
+      const dest = path.join(clones, 'too-big');
+      await fs.mkdir(dest);
+      await expect(
+        gitClone({ url: remoteUrl, dest, branch: br, allowFileProtocol: true, maxBytes: 1 })
+      ).rejects.toThrow(/maximum checkout size/);
+      await expect(fs.access(path.join(dest, 'file.txt'))).rejects.toThrow();
+
+      const dest2 = path.join(clones, 'too-many');
+      await fs.mkdir(dest2);
+      await expect(
+        gitClone({ url: remoteUrl, dest: dest2, branch: br, allowFileProtocol: true, maxEntries: 1 })
+      ).rejects.toThrow(/maximum of 1 entries/);
     }, 30000);
 
     it('is https-only by default: the file transport needs the explicit test option', async () => {

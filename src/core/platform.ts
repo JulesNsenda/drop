@@ -71,6 +71,7 @@ import {
 import { CaddyServer, getCaddyServer, resetCaddyServer } from '../managers/router';
 import { SecretManager, getSecretManager, resetSecretManager } from '../managers/secret';
 import { WebhookManager, getWebhookManager, resetWebhookManager } from './webhooks';
+import { gitManifestDir, gitManifestPath } from './git-deploy/land';
 import {
   GitDeployService,
   getGitDeployService,
@@ -1537,12 +1538,25 @@ export class DropPlatform {
   }
 
   /**
+   * The ONE busy predicate. An app is busy while it is in the in-progress set OR
+   * held by a git deploy land. Every claim of the slot re-checks it on the line
+   * directly before the `add` (a Set add is idempotent, so a claim that finds
+   * the app already held would otherwise "succeed", build beside the holder, and
+   * delete the holder's entry when it finished).
+   */
+  private isBusy(name: string): boolean {
+    return this.appsInProgress.has(name) || this.gitReserved.has(name);
+  }
+
+  /**
    * Claim an app's in-progress slot for a git deploy that is about to write its
    * folder. Null when the app is busy or the platform is quiesced. While held,
    * `handleBuildApp` defers the app's builds (see `gitReserved`).
    */
   private tryReserveApp(name: string): (() => void) | null {
-    if (this.isQuiesced() || this.appsInProgress.has(name)) return null;
+    if (this.isQuiesced() || this.isBusy(name)) return null;
+    // An upload in flight is writing the same folder.
+    if (this.uploadDeployService?.isUploading(name)) return null;
     this.appsInProgress.add(name);
     this.gitReserved.add(name);
     let released = false;
@@ -2019,9 +2033,10 @@ backup:
     this.gitDeployService = getGitDeployService({
       appsDirectory: this.config.appsDirectory,
       tempDirectory: path.join(this.config.dropRoot, 'data', 'temp'),
-      manifestDirectory: path.join(this.config.dropRoot, 'data', 'drop-svc', 'git-manifests'),
+      manifestDirectory: gitManifestDir(path.join(this.config.dropRoot, 'data')),
       ...gitCheckoutCaps(this.config.maxUploadUnpackedMb),
       sweepCloneBase: true,
+      resumeQueue: true,
     });
     await this.gitDeployService.initialize();
 
@@ -2234,7 +2249,7 @@ backup:
     // platform-ops seam — a direct import would be circular (platform → api → routes).
     setPlatformOps({
       restartApp: (name) => this.restartApp(name),
-      isAppInProgress: (name) => this.appsInProgress.has(name),
+      isAppInProgress: (name) => this.isBusy(name),
       tryReserveApp: (name) => this.tryReserveApp(name),
       hasLiveBuildContainer: (name) => this.hasLiveBuildContainer(name),
       promoteApp: (name) => this.promoteApp(name),
@@ -4784,6 +4799,13 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       // teardown must not interleave with the fs.rm/fs.cp of child folders)
       // and a concurrent app:update for the container drops re-entrantly.
       // finally-guaranteed release — a stuck entry would wedge the app.
+      if (this.isBusy(payload.name)) {
+        this.logger.info(
+          `Not expanding container '${payload.name}': a deploy is already in progress for it`,
+          'MONOREPO'
+        );
+        return;
+      }
       this.appsInProgress.add(payload.name);
       try {
         // Incidental first sight only: see bootCurrentChildren.
@@ -4961,6 +4983,15 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
 
     // Proceeding — drop any queued entry for this app so the drain doesn't
     // start a duplicate build.
+    // Synchronous re-check directly before the claim (see isBusy).
+    if (this.isBusy(appName)) {
+      this.releaseGuardrailKeys(appName);
+      if (this.gitReserved.has(appName)) {
+        this.pendingBuilds.set(appName, { appPath, appType: _appType, actor });
+        this.scheduleBuildDrain();
+      }
+      return;
+    }
     this.pendingBuilds.delete(appName);
     this.appsInProgress.add(appName);
 
@@ -6276,7 +6307,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
    * `PlatformOps.reconfigureRoute` for why this exists.
    */
   private async reconfigureRoute(appName: string): Promise<void> {
-    if (this.appsInProgress.has(appName)) {
+    if (this.isBusy(appName)) {
       // A deploy in flight will write the route itself when it starts the app;
       // racing it here could emit a block for a port that is about to change.
       throw new AppInProgressError(appName);
@@ -6929,6 +6960,10 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         // Same in-progress bracket as the app:detected interception: blocks a
         // concurrent DELETE (409) and re-entrant updates while child folders
         // are re-materialized out from under running apps.
+        if (this.isBusy(appName)) {
+          this.releaseGuardrailKeys(appName);
+          return false;
+        }
         this.appsInProgress.add(appName);
         try {
           await this.expandMonorepo(appPath, appName, containerYaml.config, actor);
@@ -7063,6 +7098,15 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     }
     this.breakerKeys.set(appName, guardKeys);
 
+    // Re-checked on the line before the claim: the awaits above leave a gap in
+    // which a git deploy can take the slot (the chained redeploy: A's update
+    // arrives after A released, B reserves, then A would claim a slot B holds,
+    // build beside B's land, and release B's reservation when it finished).
+    if (this.isBusy(appName)) {
+      this.releaseGuardrailKeys(appName);
+      this.logger.info(`Dropped update for ${appName} - a deploy took the app meanwhile`, 'UPDATE');
+      return false;
+    }
     this.logger.info(`Hot-reload triggered for ${appName}: ${reason}`, 'UPDATE');
     this.appsInProgress.add(appName);
 
@@ -7084,7 +7128,11 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     }
     // A git pull or upload that began while waiting publishes its own
     // app:update when it lands, and with appsInProgress cleared that runs.
-    if (this.gitDeployService?.isCloning(appName) || this.uploadDeployService?.isUploading(appName)) {
+    if (
+      this.gitDeployService?.isCloning(appName) ||
+      this.gitReserved.has(appName) ||
+      this.uploadDeployService?.isUploading(appName)
+    ) {
       this.logger.info(
         `Dropped redeploy for ${appName} - a git pull/upload began while waiting for a build slot`,
         'UPDATE'
@@ -7457,10 +7505,11 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
    * api/platform-ops.ts): on a stopped app it degenerates to a fresh start.
    */
   async restartApp(appName: string): Promise<AppProcessInfo> {
-    // Synchronous check-and-insert — no await between the check and the add,
-    // mirroring handleAppUpdate — so two concurrent restarts of the same app
-    // can't both pass the guard.
-    if (this.appsInProgress.has(appName)) {
+    // Synchronous check-and-insert, no await between the check and the add,
+    // so two concurrent restarts of the same app can't both pass the guard.
+    // (handleAppUpdate awaits before its claim, so it re-checks again on the
+    // line before ITS add; see isBusy.)
+    if (this.isBusy(appName)) {
       throw new AppInProgressError(appName);
     }
     this.appsInProgress.add(appName);
@@ -7957,7 +8006,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
    * touched — see NOT_RESTORED.
    */
   async rollbackApp(appName: string): Promise<{ meta: RollbackSnapshotMeta; info: AppProcessInfo }> {
-    if (this.appsInProgress.has(appName)) {
+    if (this.isBusy(appName)) {
       throw new AppInProgressError(appName);
     }
     this.appsInProgress.add(appName);
@@ -7983,6 +8032,12 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
 
       const appPath = this.servingPathOf(appName, config, state);
       const meta = await store.restoreInto(appName, appPath);
+      // The folder is the older tree again, so the commit the app claims is too.
+      if (meta.gitCommit !== undefined && state?.gitSource) {
+        await this.stateManager.updateApp(appName, {
+          gitSource: { ...state.gitSource, lastCommitSha: meta.gitCommit },
+        } as Record<string, unknown>);
+      }
       this.appDeployTimes.set(appName, Date.now());
       if (meta.outputDirectory !== undefined) {
         await this.appConfigService.upsertConfig(appName, { outputDirectory: meta.outputDirectory });
@@ -8266,7 +8321,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     appName: string,
     serviceId: AttachableServiceId
   ): Promise<AttachServiceResult> {
-    if (this.appsInProgress.has(appName)) {
+    if (this.isBusy(appName)) {
       throw new AppInProgressError(appName);
     }
     this.appsInProgress.add(appName);
@@ -8598,7 +8653,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     appName: string,
     serviceId: AttachableServiceId
   ): Promise<DetachServiceResult> {
-    if (this.appsInProgress.has(appName)) {
+    if (this.isBusy(appName)) {
       throw new AppInProgressError(appName);
     }
     this.appsInProgress.add(appName);
@@ -9176,7 +9231,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       path.join(this.config.dropRoot, 'data', 'releases', name),
       // The saved list of files a git redeploy last landed: platform state
       // keyed on the freed name, and it decides what the next one deletes.
-      path.join(this.config.dropRoot, 'data', 'drop-svc', 'git-manifests', `${name}.json`),
+      gitManifestPath(gitManifestDir(path.join(this.config.dropRoot, 'data')), name),
     ];
     for (const dir of targets) {
       try {
@@ -9783,22 +9838,32 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       : this.servingPathOf(appName, config, this.stateManager?.getApp(appName));
     await this.assertDependenciesCurrent(appName, heldPath);
 
-    await this.appConfigService?.updateConfig(appName, { pendingPromotion: undefined });
-    await this.stateManager?.updateApp(appName, { awaitingPromotion: false });
+    // Claimed BEFORE the held state is cleared, so a refusal keeps the build
+    // held and nothing else can be writing this app while it swaps.
+    if (this.isBusy(appName)) {
+      throw new AppInProgressError(appName);
+    }
+    this.appsInProgress.add(appName);
+    try {
+      await this.appConfigService?.updateConfig(appName, { pendingPromotion: undefined });
+      await this.stateManager?.updateApp(appName, { awaitingPromotion: false });
 
-    const app = this.stateManager?.getApp(appName);
-    await tryLogActivity({
-      action: 'promote',
-      appName,
-      userId: app?.userId,
-      detail: `Promoted build from ${pending.builtAt}`,
-    });
+      const app = this.stateManager?.getApp(appName);
+      await tryLogActivity({
+        action: 'promote',
+        appName,
+        userId: app?.userId,
+        detail: `Promoted build from ${pending.builtAt}`,
+      });
+    } catch (err) {
+      this.appsInProgress.delete(appName);
+      throw err;
+    }
 
     // The swap itself is an ordinary start path, so promotion has no second
     // implementation of starting an app to drift from the first: a held
     // release of a running app is cut over to (#298 step 6), anything else
     // goes through the deploy path's start.
-    this.appsInProgress.add(appName);
     try {
       // Re-validated: pendingPromotion is not a system-tier field.
       if (this.releaseStore?.isReleasePathOf(appName, pending.releasePath)) {

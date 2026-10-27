@@ -114,6 +114,9 @@ export async function executeCommandInContainer(
   try {
     container = await docker.createContainer({
       name: containerName,
+      // Found by this label, never by name: an app called `build-victim-1` must
+      // not look like a build container of `victim`.
+      Labels: { [BUILD_LABEL]: appName },
       Image: image,
       Cmd: ['/bin/sh', '-c', command],
       WorkingDir: '/app',
@@ -220,25 +223,20 @@ export async function executeCommandInContainer(
 
 // -- Build-container bookkeeping -----------------------------------------------
 
-/** Name prefix of every build container (`drop-build-<app>-<timestamp>`). */
-const BUILD_CONTAINER_PREFIX = 'drop-build-';
-
-function escapeRegExp(text: string): string {
-  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
+/** Label every build container carries; its value is the app name. */
+const BUILD_LABEL = 'drop.build';
 
 /**
- * Whether a build container for `appName` exists (running or not). The name
- * filter docker applies is a substring match, so each name is re-checked
- * exactly: app `web` must not be held up by `web-2`'s build.
+ * Whether a build container for `appName` exists (running or not). Matched by
+ * label, and the label VALUE is re-checked on what docker returns rather than
+ * trusting the daemon's filter alone.
  */
 export async function hasBuildContainer(docker: Docker, appName: string): Promise<boolean> {
-  const exact = new RegExp(`^/?${escapeRegExp(BUILD_CONTAINER_PREFIX + appName)}-\\d+$`);
   const list = await docker.listContainers({
     all: true,
-    filters: { name: [BUILD_CONTAINER_PREFIX + appName + '-'] },
+    filters: { label: [`${BUILD_LABEL}=${appName}`] },
   });
-  return list.some((c) => (c.Names ?? []).some((n) => exact.test(n)));
+  return list.some((c) => c.Labels?.[BUILD_LABEL] === appName);
 }
 
 /**
@@ -249,11 +247,11 @@ export async function hasBuildContainer(docker: Docker, appName: string): Promis
 export async function reapBuildContainers(docker: Docker): Promise<number> {
   const list = await docker.listContainers({
     all: true,
-    filters: { name: [BUILD_CONTAINER_PREFIX] },
+    filters: { label: [BUILD_LABEL] },
   });
   let reaped = 0;
   for (const c of list) {
-    if (!(c.Names ?? []).some((n) => n.replace(/^\//, '').startsWith(BUILD_CONTAINER_PREFIX))) continue;
+    if (c.Labels?.[BUILD_LABEL] === undefined) continue;
     try {
       await docker.getContainer(c.Id).remove({ force: true });
       reaped++;

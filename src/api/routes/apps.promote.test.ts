@@ -83,6 +83,19 @@ describe('POST /apps/:name/promote', () => {
     expect(promoteApp).toHaveBeenCalledWith('alice-app');
   });
 
+  it('refuses with 409 while the app is building or deploying, without promoting', async () => {
+    jest.spyOn(platformOps, 'getPlatformOps').mockReturnValue({
+      restartApp: jest.fn(),
+      isAppInProgress: () => true,
+      promoteApp,
+    } as unknown as ReturnType<typeof platformOps.getPlatformOps>);
+
+    const res = await promote('alice-app', bearer(aliceToken));
+
+    expect(res.status).toBe(409);
+    expect(promoteApp).not.toHaveBeenCalled();
+  });
+
   it('lets an admin promote', async () => {
     const res = await promote('alice-app', bearer(adminToken));
 

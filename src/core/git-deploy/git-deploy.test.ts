@@ -21,6 +21,8 @@ import { eventBus } from '../event-bus';
 import { setPlatformOps, resetPlatformOps, AppInProgressError } from '../../api/platform-ops';
 import type { PlatformOps } from '../../api/platform-ops';
 import { makePlatformOpsStub } from '../../api/__testutils__/platform-ops';
+import * as activity from '../../managers/activity';
+import { getDeployTracker, resetDeployTracker } from '../../managers/deploy-tracker';
 // AppUpdatePayload isn't re-exported by ../event-bus (index.ts) - see the same
 // note in managers/deploy-tracker/deploy-tracker.ts.
 import type { AppDetectedPayload, AppUpdatePayload } from '../event-bus/event-bus.types';
@@ -82,7 +84,14 @@ jest.mock('child_process', () => ({
 
     if (sub[0] === 'ls-files') {
       const out = Object.keys(mockCloneFiles)
-        .map((rel) => '100644 abc123 0\t' + rel + '\0')
+        .map(
+          (rel) =>
+            '100644 ' +
+            require('crypto').createHash('sha1').update(mockCloneFiles[rel]).digest('hex') +
+            ' 0\t' +
+            rel +
+            '\0'
+        )
         .join('');
       callback(null, { stdout: out, stderr: '' });
       return {} as any;
@@ -891,6 +900,145 @@ describe('GitDeployService', () => {
 
         expect(heldAtPublish).toEqual([false]);
         expect(reservedNow.has(appName)).toBe(false);
+      });
+
+      it('reserves BEFORE charging the deploy quota: a refused attempt costs nothing', async () => {
+        const appName = 'land-no-charge';
+        await service.deploy({ repoUrl: `https://github.com/user/${appName}`, branch: 'main' });
+        const admit = jest.spyOn(breakerModule, 'admitDeploy');
+        admit.mockClear();
+        try {
+          reservedNow.add(appName);
+          await expect(service.redeploy(appName)).rejects.toBeInstanceOf(AppInProgressError);
+          reservedNow.clear();
+          installOps({ hasLiveBuildContainer: jest.fn().mockResolvedValue(true) });
+          await expect(service.redeploy(appName)).rejects.toBeInstanceOf(AppInProgressError);
+
+          expect(admit).not.toHaveBeenCalled();
+        } finally {
+          admit.mockRestore();
+        }
+      });
+
+      it('a first deploy appears in the apps folder whole, in one step, never half-landed', async () => {
+        const appName = 'land-atomic-first';
+        mockCloneFiles = { 'index.html': '<h1>v1</h1>', 'src/app.js': 'v1' };
+        let open!: () => void;
+        mockCloneGate = new Promise<void>((r) => {
+          open = r;
+        });
+
+        const run = service.deploy({ repoUrl: `https://github.com/user/${appName}`, branch: 'main' });
+        await new Promise((r) => setTimeout(r, 50));
+        expect(await exists(appDir(appName))).toBe(false);
+        open();
+        mockCloneGate = null;
+        await run;
+
+        expect(await fs.readFile(path.join(appDir(appName), 'src', 'app.js'), 'utf-8')).toBe('v1');
+        expect(await exists(path.join(appDir(appName), '.git'))).toBe(false);
+        // No staging directory is left in the clone base.
+        const base = path.join(tempDir, 'temp', '.git-clones');
+        expect(await fs.readdir(base).catch(() => [])).toEqual([]);
+        // The saved list was written for the next redeploy.
+        expect(await exists(path.join(tempDir, 'drop-svc', 'git-manifests', `${appName}.json`))).toBe(true);
+      });
+
+      it('a first deploy refused as busy (quiesced, or a stale build container) is an AppInProgressError', async () => {
+        installOps({ tryReserveApp: () => null });
+        await expect(
+          service.deploy({ repoUrl: 'https://github.com/user/land-first-busy', branch: 'main' })
+        ).rejects.toBeInstanceOf(AppInProgressError);
+        expect(getStateManager().hasApp('land-first-busy')).toBe(false);
+        expect(await exists(appDir('land-first-busy'))).toBe(false);
+
+        installOps({ hasLiveBuildContainer: jest.fn().mockResolvedValue(true) });
+        await expect(
+          service.deploy({ repoUrl: 'https://github.com/user/land-first-busy', branch: 'main' })
+        ).rejects.toBeInstanceOf(AppInProgressError);
+        expect(reservedNow.size).toBe(0);
+      });
+
+      it('queued redeploys are saved to disk and come back after a restart', async () => {
+        const appName = 'land-queue-persist';
+        await service.deploy({ repoUrl: `https://github.com/user/${appName}`, branch: 'main' });
+
+        service.queueRedeploy(appName, { automation: 'webhook' });
+        await new Promise((r) => setTimeout(r, 50));
+        const file = path.join(tempDir, 'drop-svc', 'git-pending-redeploys.json');
+        expect(JSON.parse(await fs.readFile(file, 'utf-8'))).toEqual({
+          [appName]: { automation: 'webhook' },
+        });
+        service.dispose();
+
+        const restarted = new GitDeployService({
+          appsDirectory: path.join(tempDir, 'webapps'),
+          resumeQueue: true,
+        });
+        await restarted.initialize();
+        expect((restarted as unknown as { pending: Map<string, unknown> }).pending.has(appName)).toBe(true);
+        restarted.dispose();
+
+        // A CLI-shaped service does not pick the queue up.
+        const cli = new GitDeployService({ appsDirectory: path.join(tempDir, 'webapps') });
+        await cli.initialize();
+        expect((cli as unknown as { pending: Map<string, unknown> }).pending.size).toBe(0);
+        cli.dispose();
+      });
+
+      it('a queued redeploy that fails is recorded as a failed deploy and in the activity log', async () => {
+        const appName = 'land-queue-fails';
+        await service.deploy({ repoUrl: `https://github.com/user/${appName}`, branch: 'main' });
+        resetDeployTracker();
+        getDeployTracker(path.join(tempDir, 'deploys.json'));
+        const logSpy = jest.spyOn(activity, 'logActivityFor').mockResolvedValue();
+        const failed: Array<{ appId: string }> = [];
+        const unsub = eventBus.subscribe('build:failed', (p) => {
+          failed.push({ appId: p.appId });
+        });
+        try {
+          service.queueRedeploy(appName, { automation: 'webhook' });
+          failNextPull('fatal: repository not found');
+
+          await (service as unknown as { flushPending(): Promise<void> }).flushPending();
+
+          expect(logSpy).toHaveBeenCalledTimes(1);
+          expect(logSpy.mock.calls[0][1]).toMatchObject({ action: 'redeploy', appName });
+          expect(String(logSpy.mock.calls[0][1].detail)).toContain('queued redeploy failed');
+          expect(failed).toEqual([{ appId: appName }]);
+        } finally {
+          unsub();
+          logSpy.mockRestore();
+          resetDeployTracker();
+          service.dispose();
+        }
+      });
+
+      it('a failure listing the tracked files carries no argv or absolute path either', async () => {
+        const appName = 'land-lsfiles-fails';
+        await service.deploy({ repoUrl: `https://github.com/user/${appName}`, branch: 'main' });
+        const mock = execFile as unknown as jest.Mock;
+        const original = mock.getMockImplementation() as (...a: unknown[]) => unknown;
+        mock.mockImplementation((cmd: string, args: string[], opts: unknown, cb?: Function) => {
+          if (Array.isArray(args) && args.includes('ls-files')) {
+            mock.mockImplementation(original);
+            const callback = (cb || opts) as (e: Error) => void;
+            callback(
+              Object.assign(new Error('Command failed: git ' + args.join(' ') + ' in ' + tempDir), {
+                code: 128,
+                stderr: 'fatal: index file corrupt',
+              })
+            );
+            return {} as unknown;
+          }
+          return original(cmd, args, opts, cb);
+        });
+
+        const err = await service.redeploy(appName).catch((e: Error) => e);
+
+        expect((err as Error).message).toContain('exit 128');
+        expect((err as Error).message).not.toContain('ls-files');
+        expect((err as Error).message).not.toContain(tempDir);
       });
 
       it('refuses to land while the reservation is taken, a build container is alive, or a monorepo child is busy', async () => {

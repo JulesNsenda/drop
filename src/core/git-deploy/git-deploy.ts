@@ -25,7 +25,10 @@ import {
   isValidGitHubUrl,
   isGitAvailable,
 } from './git-client';
-import { landTracked, readManifest, writeManifest } from './land';
+import { landTracked, readManifest, writeManifest, gitManifestDir } from './land';
+import { writeJsonAtomic } from '../../utils/atomic-write';
+import { logActivityFor } from '../../managers/activity';
+import { getDeployTracker } from '../../managers/deploy-tracker';
 import { getPlatformOps, AppInProgressError } from '../../api/platform-ops';
 import { getStateManager } from '../../managers/app/state-manager';
 import { getAppConfigService, getAppConfigServiceOrNull } from '../../managers/app/app-config';
@@ -70,6 +73,11 @@ export interface GitDeployServiceConfig {
    * clone out from under it.
    */
   sweepCloneBase?: boolean;
+  /**
+   * Reload redeploys that were queued before a restart and keep running the
+   * queue. Platform only, for the same reason as `sweepCloneBase`.
+   */
+  resumeQueue?: boolean;
 }
 
 const DEFAULT_MAX_GIT_ENTRIES = 200_000;
@@ -106,12 +114,14 @@ export class GitDeployService {
   /** Redeploys that were refused as busy; one per app, latest actor wins. */
   private pending: Map<string, DeployActor> = new Map();
   private pendingTimer: NodeJS.Timeout | null = null;
+  private readonly pendingFile: string;
 
   constructor(config: GitDeployServiceConfig) {
     this.config = config;
     const dataDir = path.dirname(config.appsDirectory);
     this.cloneBase = path.join(config.tempDirectory ?? path.join(dataDir, 'temp'), '.git-clones');
-    this.manifestDir = config.manifestDirectory ?? path.join(dataDir, 'drop-svc', 'git-manifests');
+    this.manifestDir = config.manifestDirectory ?? gitManifestDir(dataDir);
+    this.pendingFile = path.join(path.dirname(this.manifestDir), 'git-pending-redeploys.json');
     configureCloneBase(this.cloneBase);
   }
 
@@ -162,12 +172,59 @@ export class GitDeployService {
     if (this.config.sweepCloneBase) {
       await fs.rm(this.cloneBase, { recursive: true, force: true }).catch(() => undefined);
     }
+    if (this.config.resumeQueue) await this.loadPending();
     this.gitAvailable = await isGitAvailable();
     if (!this.gitAvailable) {
       logger.warn('git CLI not found - git deploy features will be unavailable', 'GIT-DEPLOY');
     } else {
       logger.info('Git deploy service initialized', 'GIT-DEPLOY');
     }
+    if (this.pending.size > 0) this.schedulePending();
+  }
+
+  /** Reload the redeploys that were queued when the platform last stopped. */
+  private async loadPending(): Promise<void> {
+    try {
+      const parsed = JSON.parse(await fs.readFile(this.pendingFile, 'utf-8')) as Record<string, DeployActor>;
+      for (const [name, actor] of Object.entries(parsed)) {
+        if (isValidAppName(name) && actor && typeof actor === 'object') this.pending.set(name, actor);
+      }
+    } catch {
+      // No file, or unreadable: nothing was queued.
+    }
+  }
+
+  private async persistPending(): Promise<void> {
+    try {
+      await fs.mkdir(path.dirname(this.pendingFile), { recursive: true, mode: 0o700 });
+      await writeJsonAtomic(this.pendingFile, Object.fromEntries(this.pending), { mode: 0o600 });
+    } catch (err) {
+      logger.warn('Could not save the queued redeploys', 'GIT-DEPLOY', err);
+    }
+  }
+
+  /** A queued redeploy that failed must leave a deploy record and an audit entry, not only a log line. */
+  private async recordQueuedFailure(appName: string, err: unknown): Promise<void> {
+    const message = err instanceof Error ? err.message : 'unknown error';
+    logger.warn(`Queued redeploy of ${appName} failed: ${message}`, 'GIT-DEPLOY');
+    try {
+      const tracker = getDeployTracker();
+      const buildId = `deploy-${appName}-${Date.now()}`;
+      if (!tracker.hasOpenEpisode(appName)) eventBus.publish('build:started', { appId: appName, buildId });
+      eventBus.publish('build:failed', {
+        appId: appName,
+        buildId,
+        error: err instanceof Error ? err : new Error(message),
+        stage: 'pre-build',
+      });
+    } catch {
+      // Tracker not initialised (isolated tests): observability only.
+    }
+    await logActivityFor(undefined, {
+      action: 'redeploy',
+      appName,
+      detail: `queued redeploy failed: ${message.slice(0, 200)}`,
+    }).catch(() => undefined);
   }
 
   isAvailable(): boolean {
@@ -188,6 +245,7 @@ export class GitDeployService {
    */
   queueRedeploy(appName: string, actor: DeployActor = {}): void {
     this.pending.set(appName, { ...this.pending.get(appName), ...actor });
+    void this.persistPending();
     this.schedulePending();
   }
 
@@ -203,6 +261,7 @@ export class GitDeployService {
   private async flushPending(): Promise<void> {
     for (const [appName, actor] of [...this.pending]) {
       this.pending.delete(appName);
+      await this.persistPending();
       try {
         await this.redeploy(appName, actor);
         logger.info(`Ran the queued redeploy of ${appName}`, 'GIT-DEPLOY');
@@ -211,13 +270,11 @@ export class GitDeployService {
           // Still busy: keep it, unless a newer request arrived meanwhile.
           this.pending.set(appName, { ...actor, ...this.pending.get(appName) });
         } else {
-          logger.warn(
-            `Queued redeploy of ${appName} failed: ${err instanceof Error ? err.message : 'unknown error'}`,
-            'GIT-DEPLOY'
-          );
+          await this.recordQueuedFailure(appName, err);
         }
       }
     }
+    await this.persistPending();
     this.schedulePending();
   }
 
@@ -568,7 +625,11 @@ export class GitDeployService {
       }
       const cloneDir = await fs.mkdtemp(path.join(base, `${appName}-`));
       try {
-        const info = await gitClone({ url, dest: cloneDir, branch, token });
+        const caps = {
+          maxBytes: this.config.maxUnpackedBytes ?? envDefaultCaps().maxUnpackedBytes,
+          maxEntries: this.config.maxEntries ?? envDefaultCaps().maxEntries,
+        };
+        const info = await gitClone({ url, dest: cloneDir, branch, token, ...caps });
         if (info.symlinks.length > 0) {
           const shown = info.symlinks.slice(0, 5).join(', ');
           logger.warn(
@@ -581,19 +642,44 @@ export class GitDeployService {
         if (firstDeploy && (await pathTaken(destPath))) {
           throw new Error(`Application '${appName}' already exists`);
         }
-        const previous = firstDeploy ? null : await readManifest(this.manifestDir, appName);
+        const limits = { maxBytes: caps.maxBytes, maxEntries: caps.maxEntries };
+        if (firstDeploy) {
+          // A new app is built beside the apps folder (same volume, never watched)
+          // and renamed into place in one step, so the watcher, the CLI and every
+          // other reader see either nothing or the whole tree, never half of it.
+          const stage = await fs.mkdtemp(path.join(base, `${appName}-stage-`));
+          try {
+            const landed = await landTracked({
+              cloneDir,
+              appDir: stage,
+              files: info.files,
+              previous: null,
+              limits,
+            });
+            await fs.chmod(stage, 0o755);
+            try {
+              await fs.rename(stage, destPath);
+            } catch (err) {
+              const code = (err as NodeJS.ErrnoException).code;
+              if (code === 'EEXIST' || code === 'ENOTEMPTY' || code === 'EPERM') {
+                throw new Error(`Application '${appName}' already exists`);
+              }
+              throw err;
+            }
+            if (state) state.created = true;
+            await writeManifest(this.manifestDir, appName, landed);
+          } finally {
+            await fs.rm(stage, { recursive: true, force: true }).catch(() => undefined);
+          }
+          return info.commitSha;
+        }
+        const previous = await readManifest(this.manifestDir, appName);
         const landed = await landTracked({
           cloneDir,
           appDir: destPath,
           files: info.files,
           previous,
-          limits: {
-            maxBytes: this.config.maxUnpackedBytes ?? envDefaultCaps().maxUnpackedBytes,
-            maxEntries: this.config.maxEntries ?? envDefaultCaps().maxEntries,
-          },
-          onCreatedAppDir: () => {
-            if (state) state.created = true;
-          },
+          limits,
         });
         await writeManifest(this.manifestDir, appName, landed);
         return info.commitSha;
@@ -646,6 +732,22 @@ export class GitDeployService {
     }
     const baseSource: GitSource = app.gitSource;
 
+    return this.serialised(appName, async () => {
+      // The reservation comes BEFORE the quota is charged: an attempt that is
+      // refused as busy must not consume a deploy. From here until just before
+      // the publish below, the platform's in-progress slot for this app is ours:
+      // no build, restart or deploy can start, and one that arrives is
+      // deferred rather than dropped.
+      const releaseReservation = await this.reserveFolder(appName, app, true);
+      let released = false;
+      const release = (): void => {
+        if (released) return;
+        released = true;
+        releaseReservation();
+      };
+      // This run supersedes any queued one for the app.
+      if (this.pending.delete(appName)) void this.persistPending();
+      try {
     // GUARDRAIL + QUOTA, before the clone. A redeploy is the request an agent
     // repeats, and a clone + rebuild is not free.
     await admitDeploy(appName, false, {
@@ -668,7 +770,7 @@ export class GitDeployService {
     // snapshot captured above, and updateApp REPLACES the map entry rather
     // than mutating it, so a second read of app.gitSource after this point
     // would still see the pre-redeploy value.
-    const effectiveTokenId = actor.tokenId !== undefined ? actor.tokenId : app.gitSource.tokenId;
+    const effectiveTokenId = actor.tokenId !== undefined ? actor.tokenId : baseSource.tokenId;
 
     // A CLEAR is a revocation, not a deploy outcome, so it is persisted BEFORE
     // the pull — the one deliberate asymmetry with the attach direction.
@@ -681,8 +783,8 @@ export class GitDeployService {
     // AFTER the pull does not apply here: there is nothing a later spread can
     // resurrect once the field is gone, and `effectiveTokenId` (null) drives
     // the post-pull write too, so the two agree.
-    if (actor.tokenId === null && app.gitSource.tokenId) {
-      const cleared: GitSource = { ...app.gitSource, tokenId: undefined };
+    if (actor.tokenId === null && baseSource.tokenId) {
+      const cleared: GitSource = { ...baseSource, tokenId: undefined };
       await stateManager.updateApp(appName, { gitSource: cleared } as Record<string, unknown>);
       logger.info(`Cleared the stored git credential for ${appName}`, 'GIT-DEPLOY');
     }
@@ -714,20 +816,6 @@ export class GitDeployService {
     // cannot be rolled back, which the rollback route reports as such.
     // The tree carries no .git (every git deploy clones fresh), so a restore
     // puts the files back and the next redeploy simply clones again.
-    return this.serialised(appName, async () => {
-      // From here until just before the publish below, the platform's own
-      // in-progress slot for this app is ours: no build, restart or deploy can
-      // start, and one that arrives is deferred rather than dropped.
-      const releaseReservation = await this.reserveFolder(appName, app, true);
-      let released = false;
-      const release = (): void => {
-        if (released) return;
-        released = true;
-        releaseReservation();
-      };
-      // This run supersedes any queued one for the app.
-      this.pending.delete(appName);
-      try {
         const snapshot = await captureBeforeRedeploy(appName);
         if (!snapshot.captured) {
           logger.info(`No rollback snapshot for ${appName}: ${snapshot.reason}`, 'GIT-DEPLOY');
