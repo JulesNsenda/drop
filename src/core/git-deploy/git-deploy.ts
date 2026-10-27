@@ -44,7 +44,7 @@ import { tryReserve, release, reservationPrincipal } from '../deploy-reservation
 import { hasEnoughDisk, getMinFreeDiskMb } from '../../utils/disk';
 import { eventBus } from '../event-bus';
 import { captureBeforeRedeploy } from '../../managers/rollback';
-import { admitDeploy } from '../../managers/guardrail/deploy-breaker';
+import { admitDeploy, type DeployActorInfo } from '../../managers/guardrail/deploy-breaker';
 import {
   checkEphemeralQuota,
   resolveTtlMinutes,
@@ -64,6 +64,30 @@ const GIT_TOKEN_APP_NAME = '__drop_git_tokens';
 // apps. An app already attached to a legacy token keeps using it.
 const GIT_TOKEN_OWNER_APP_NAME = '__drop_git_token_owners';
 const GIT_TOKEN_OWNER_KEY = 'owners';
+
+/** The DeployActor a guardrail-side DeployActorInfo stands for: who asked, and no token choice. */
+export function deployActorOfInfo(info: DeployActorInfo): DeployActor {
+  return { principalId: info.principalId, userId: info.actorUserId, automation: info.automationSource };
+}
+
+/**
+ * The rebuild trigger a git land is always followed by, published directly
+ * instead of waiting on the watcher: a no-change pull touches nothing on disk
+ * (the watcher would never fire), and on a slow pull the watcher's mid-pull
+ * flush could otherwise race this with a half-pulled tree. Shared by every
+ * path that lands a repository.
+ */
+export function publishRedeployUpdate(appName: string, appPath: string, actor: DeployActor): void {
+  eventBus.publish('app:update', {
+    name: appName,
+    path: appPath,
+    reason: 'git redeploy',
+    bypassCooldown: true,
+    principalId: actor.principalId,
+    actorUserId: actor.userId,
+    automationSource: actor.automation,
+  });
+}
 
 /**
  * Where a token is being resolved from. The two are different questions:
@@ -833,8 +857,7 @@ export class GitDeployService {
         released = true;
         releaseReservation();
       };
-      // This run supersedes any queued one for the app.
-      if (this.pending.delete(appName)) void this.persistPending();
+      this.supersedeQueued(appName);
       try {
         // GUARDRAIL + QUOTA, before the clone. A redeploy is the request an agent
         // repeats, and a clone + rebuild is not free.
@@ -858,19 +881,7 @@ export class GitDeployService {
         // (handleAppUpdate drops an update for an app that is still in progress).
         release();
 
-        // Publish the rebuild trigger directly instead of waiting on the watcher
-        // to notice file changes: a no-change pull touches nothing on disk (the
-        // watcher would never fire), and on a slow pull the watcher's mid-pull
-        // flush could otherwise race this with a half-pulled tree.
-        eventBus.publish('app:update', {
-          name: appName,
-          path: app.path,
-          reason: 'git redeploy',
-          bypassCooldown: true,
-          principalId: actor.principalId,
-          actorUserId: actor.userId,
-          automationSource: actor.automation,
-        });
+        publishRedeployUpdate(appName, app.path, actor);
 
         return landed;
       } finally {
@@ -879,8 +890,13 @@ export class GitDeployService {
     });
   }
 
-  /** The recorded clone URL of a git-deployed app: credential-stripped and re-validated (an older install may have stored one with userinfo). It is what is logged, cloned, persisted and returned. */
-  private recordedCloneUrl(app: AppState): string {
+  /** A run that lands now supersedes any queued (webhook) redeploy of the app. */
+  supersedeQueued(appName: string): void {
+    if (this.pending.delete(appName)) void this.persistPending();
+  }
+
+  /** The recorded clone URL of a git-deployed app: credential-stripped and re-validated (an older install may have stored one with userinfo). It is what is logged, cloned, persisted and returned. Throws on an invalid one. */
+  recordedCloneUrl(app: AppState): string {
     const recorded = app.gitSource!.repoUrl;
     const cloneUrl = normalizeRepoUrl(stripUrlCredentials(recorded) ?? recorded);
     if (!isValidGitHubUrl(cloneUrl)) {

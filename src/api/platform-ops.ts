@@ -143,6 +143,10 @@ export type RedeployRefusalCode =
   | 'APP_BUSY'
   | 'SERVICE_UNAVAILABLE'
   | 'APP_STOPPED'
+  // A git-backed app whose recorded repository URL no longer validates.
+  | 'INVALID_GIT_SOURCE'
+  // A service of a git-deployed group: its container holds the repository.
+  | 'REDEPLOY_VIA_CONTAINER'
   | 'RATE_LIMITED'
   | 'INSUFFICIENT_DISK';
 
@@ -154,9 +158,10 @@ export interface RedeployRefusal {
 
 /**
  * What an explicit redeploy came to: started (it has a builder slot and the
- * deploy id it builds under), accepted (no slot within the wait: it carries on
- * in the background, and has no id yet), a group (the app is a monorepo
- * container, which is re-expanded rather than built: its services deploy under
+ * deploy id it builds under), accepted (it carries on in the background and has
+ * no id yet: no slot within the wait, or a git-backed app, whose clone never
+ * runs inside the request), a group (the app is a monorepo container, which is
+ * re-expanded rather than built, in the background: its services deploy under
  * their own names), or refused.
  */
 export type RedeployStart =

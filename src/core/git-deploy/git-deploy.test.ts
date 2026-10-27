@@ -6,7 +6,7 @@ import * as fs from 'fs/promises';
 import * as path from 'path';
 import * as os from 'os';
 import { execFile } from 'child_process';
-import { GitDeployService, resetGitDeployService } from './git-deploy';
+import { GitDeployService, resetGitDeployService, deployActorOfInfo, publishRedeployUpdate } from './git-deploy';
 import { resetStateManager, getStateManager, AppStateManager } from '../../managers/app/state-manager';
 import { resetSecretManager, getSecretManager } from '../../managers/secret';
 import * as gitClient from './git-client';
@@ -681,6 +681,26 @@ describe('GitDeployService', () => {
         return original(cmd, args, opts, cb);
       });
     }
+
+    it('deployActorOfInfo and publishRedeployUpdate are the one conversion and the one post-land publish', () => {
+      expect(
+        deployActorOfInfo({ principalId: 'p-1', actorUserId: 'u-1', automationSource: 'webhook', agent: true })
+      ).toEqual({ principalId: 'p-1', userId: 'u-1', automation: 'webhook' });
+
+      const seen: AppUpdatePayload[] = [];
+      const unsubscribe = eventBus.subscribe('app:update', (payload) => void seen.push(payload));
+      publishRedeployUpdate('some-app', '/apps/some-app', { principalId: 'p-1', userId: 'u-1' });
+      unsubscribe();
+      expect(seen).toHaveLength(1);
+      expect(seen[0]).toMatchObject({
+        name: 'some-app',
+        path: '/apps/some-app',
+        reason: 'git redeploy',
+        bypassCooldown: true,
+        principalId: 'p-1',
+        actorUserId: 'u-1',
+      });
+    });
 
     it('publishes app:update with bypassCooldown after a successful pull', async () => {
       const appName = 'redeploy-app';

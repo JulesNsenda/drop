@@ -167,6 +167,49 @@ describe('POST /apps/:name/redeploy', () => {
       expect(logSpy).toHaveBeenCalledWith(expect.anything(), { action: 'redeploy', appName: 'site', detail: 'group' });
     });
 
+    describe('a service of a git-deployed group', () => {
+      const registerGroup = async (containerOwner: string) => {
+        const sm = getStateManager();
+        await sm.registerApp('svc', path.join(t.tempDir, 'svc'));
+        await sm.updateApp('svc', { userId: ownerId, group: 'g' } as Record<string, unknown>);
+        await sm.registerApp('box', path.join(t.tempDir, 'box'));
+        await sm.updateApp('box', {
+          userId: containerOwner,
+          group: 'g',
+          isGroupContainer: true,
+          gitSource: { repoUrl: 'https://github.com/user/box', branch: 'main' },
+        } as Record<string, unknown>);
+      };
+
+      it('is redeployed through its container: the container is what the platform is asked for, and what is answered', async () => {
+        await registerGroup(ownerId);
+        (ops.redeployApp as jest.Mock).mockResolvedValue({ group: { container: 'box' } });
+        const res = await redeploy('svc', bearer(ownerToken));
+        expect(res.status).toBe(202);
+        const json = await body(res);
+        expect((ops.redeployApp as jest.Mock).mock.calls[0][0]).toBe('box');
+        expect(json.data).toMatchObject({ group: true, container: 'box' });
+        expect(json.data.follow).toContain('app=box');
+        expect(logSpy).toHaveBeenCalledWith(expect.anything(), { action: 'redeploy', appName: 'box', detail: 'git' });
+      });
+
+      it("404s, naming only the requested app, when the caller has no access to the container", async () => {
+        const other = await createUser({ username: 'other', role: 'user', credential: { password: 'password123' } });
+        await registerGroup(other.id);
+        const res = await redeploy('svc', bearer(ownerToken));
+        expect(res.status).toBe(404);
+        expect((await body(res)).error.message).toBe("Application 'svc' not found");
+        expect(ops.redeployApp).not.toHaveBeenCalled();
+      });
+    });
+
+    it('maps a refused recorded repository URL to a 400 and a stale group child to a 409', async () => {
+      refuse({ code: 'INVALID_GIT_SOURCE', message: 'Invalid recorded repository URL for site' });
+      expect((await redeploy('site', bearer(ownerToken))).status).toBe(400);
+      refuse({ code: 'REDEPLOY_VIA_CONTAINER', message: 'redeploy the group container' });
+      expect((await redeploy('site', bearer(ownerToken))).status).toBe(409);
+    });
+
     it('a container answered to a role-none caller carries no follow link', async () => {
       (ops.redeployApp as jest.Mock).mockResolvedValue({ group: { container: 'site' } });
       const bare = new Hono();

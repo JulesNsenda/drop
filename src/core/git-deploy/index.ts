@@ -11,6 +11,8 @@ export {
   resetGitDeployService,
   gitCheckoutCaps,
   PlatformNotReadyError,
+  deployActorOfInfo,
+  publishRedeployUpdate,
 } from './git-deploy';
 export {
   gitClone,
