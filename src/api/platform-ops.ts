@@ -136,18 +136,19 @@ export function needsConfigDetail(err: AppNeedsConfigError, appName: string): st
 }
 
 /**
- * A reservation of one app's in-progress slot for an explicit redeploy
- * (`reserveForUpdate`). `release` and `consume` act only while the platform's
- * owner map still names THIS hold, so a stale hold can never free a later
- * owner's claim. `consume` is one-shot: it hands the claim to the build and
- * returns the callback that gives it back, after which `release` is a no-op;
- * it returns null when the hold is already consumed, released or replaced.
+ * What a `prepare` step may do with the reservation it runs under: mark the
+ * span in which it is writing the app's folder (so a build is deferred, not
+ * started, while it lands). It cannot release or hand the reservation on; the
+ * platform owns both.
  */
-export interface UpdateHold {
+export interface RedeployHold {
   readonly app: string;
-  release(): void;
-  consume(): (() => void) | null;
+  beginLand(): void;
+  endLand(): void;
 }
+
+/** Runs under the reservation, after admission and before the build is minted (a git land, later). */
+export type RedeployPrepare = (hold: RedeployHold) => Promise<void>;
 
 /** Why an explicit redeploy was refused. The route maps each code to its status. */
 export type RedeployRefusalCode =
@@ -165,15 +166,31 @@ export interface RedeployRefusal {
   retryAfterSeconds?: number;
 }
 
+/** Thrown by a `prepare` step to refuse the redeploy; the platform returns the refusal and releases everything. */
+export class RedeployRefusedError extends Error {
+  constructor(readonly refusal: RedeployRefusal) {
+    super(refusal.message);
+    this.name = 'RedeployRefusedError';
+  }
+}
+
 /**
- * What admission settled on, opaque to callers: handed back to
- * `startExplicitUpdate` untouched.
+ * What an explicit redeploy came to: started (the deploy id is minted and
+ * accepted, possibly still waiting for a builder slot - follow it at
+ * /deploys/<id>), a monorepo group (the container to follow per child), or
+ * refused.
  */
-export type AdmittedRedeploy = object;
+export type RedeployStart =
+  | { started: string }
+  | { group: { container: string } }
+  | { refused: RedeployRefusal };
 
-export type RedeployAdmission = { refused: RedeployRefusal } | { hold: UpdateHold; admitted: AdmittedRedeploy };
-
-export type RedeployStart = { started: string } | { refused: RedeployRefusal };
+/** A deploy accepted but not yet built, as the deploys routes need it: whose it is. */
+export interface QueuedDeploy {
+  appName: string;
+  /** The app's owner when it was accepted, for the same snapshot-based tenant filter episodes use. */
+  userId?: string;
+}
 
 export interface PlatformOps {
   /**
@@ -297,23 +314,34 @@ export interface PlatformOps {
   describeRollback(appName: string): Promise<RollbackSnapshotMeta | null>;
 
   /**
-   * Admit an explicit redeploy of a FILES app (source already on disk, rebuilt
-   * as it stands): take the app's slot, then decide under it that the app
-   * exists, is not git-backed or a monorepo container, passes the stopped
-   * rule, is admitted by the deploy guardrails (once, charging the caller's
-   * quota) and has disk. A refusal has released the slot already; otherwise the
-   * caller owns the returned hold and MUST pass it to `startExplicitUpdate`
-   * straight away. Authorization is the caller's, done first.
+   * Redeploy an app explicitly (source already on disk, rebuilt as it stands).
+   * ONE operation, and the reservation never leaves the platform: it takes the
+   * app's slot, decides under it that the app exists, is a files app (git-backed
+   * apps and monorepo groups are refused for now), is not busy, passes the
+   * stopped rule, has disk and is admitted by the deploy guardrails (once,
+   * charging the caller's quota), runs `prepare` if there is one, and starts.
+   *
+   * Resolves as soon as the deploy id is minted and accepted - BEFORE the wait
+   * for a builder slot, so a caller never waits on one. The build runs on, and
+   * whatever stops it (a refusal after the wait included) closes the episode
+   * under that same id. Refusals are returned, never thrown; the slot and the
+   * breaker keys are given back on every path. Authorization is the caller's.
    */
-  admitExplicitUpdate(appName: string, actor: DeployActorInfo): Promise<RedeployAdmission>;
+  redeployApp(appName: string, actor: DeployActorInfo, prepare?: RedeployPrepare): Promise<RedeployStart>;
 
   /**
-   * Start an admitted redeploy: consumes the hold, waits for a builder slot,
-   * and resolves with the deploy id as soon as the build is minted - the build
-   * and swap run on behind it and close their own outcome. Never throws for a
-   * refusal; the hold's claim is given back on every path.
+   * An accepted deploy that has no episode yet (still waiting for its builder
+   * slot), or undefined. Read-only: lets the deploys routes answer `queued`
+   * instead of 404 for an id the caller was just handed.
    */
-  startExplicitUpdate(hold: UpdateHold, admitted: AdmittedRedeploy): Promise<RedeployStart>;
+  getQueuedDeploy(deployId: string): QueuedDeploy | undefined;
+
+  /**
+   * Whether any app in the same monorepo group as `appName` is busy in a way
+   * that forbids touching it: for a container, any of its children; for a
+   * child, its container. False for an app outside any group.
+   */
+  isGroupBusy(appName: string): boolean;
 
   /**
    * Tear down every app belonging to a monorepo group (M4): stop+delete each

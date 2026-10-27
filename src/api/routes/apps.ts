@@ -67,7 +67,8 @@ import {
   ACCESS_GATE_ENFORCEMENT_AVAILABLE,
   gateEnforced,
 } from '../../managers/guardrail/access-gate';
-import { DeployRefusedError, type DeployActorInfo } from '../../managers/guardrail/deploy-breaker';
+import { DeployRefusedError } from '../../managers/guardrail/deploy-breaker';
+import { deployActorOf } from '../deploy-actor';
 import { QuotaExceededError } from '../../managers/guardrail/principal-quota';
 import { pruneOwnerDumpsToFit, predeleteMaxBytes } from '../../managers/guardrail/detach-limits';
 import { runUploadPreflight } from '../upload-preflight';
@@ -1328,30 +1329,20 @@ apps.post('/:name/redeploy', async c => {
     return c.json(error(ErrorCodes.SERVICE_UNAVAILABLE, 'Platform operations unavailable'), 503);
   }
 
-  // One actor, for the admission, the guardrail keys and the stopped rule.
-  const actor: DeployActorInfo = {
-    principalId: auth?.principalId,
-    actorUserId: auth?.userId,
-    agent: auth?.kind === 'agent',
-  };
+  // One operation: the platform reserves, admits (with the one actor, for the
+  // guardrail keys and the stopped rule alike) and starts. It answers as soon as
+  // the deploy id is minted, before any wait for a builder slot.
+  const result = await ops.redeployApp(name, deployActorOf(auth));
+  if ('refused' in result) return redeployRefusalResponse(c, result.refused);
 
-  const admission = await ops.admitExplicitUpdate(name, actor);
-  if ('refused' in admission) return redeployRefusalResponse(c, admission.refused);
-
-  let started;
-  try {
-    started = await ops.startExplicitUpdate(admission.hold, admission.admitted);
-  } catch (err) {
-    // The hold is the only thing standing between the app and a wedged slot;
-    // a consumed hold ignores this.
-    admission.hold.release();
-    throw err;
+  if ('group' in result) {
+    await logActivityFor(auth, { action: 'redeploy', appName: name, detail: 'group' });
+    return c.json(success({ group: true, container: result.group.container }), 202);
   }
-  if ('refused' in started) return redeployRefusalResponse(c, started.refused);
 
   await logActivityFor(auth, { action: 'redeploy', appName: name, detail: 'files' });
   return c.json(
-    success({ deployId: started.started, follow: `/api/v1/deploys/${started.started}/stream` }),
+    success({ deployId: result.started, follow: `/api/v1/deploys/${result.started}/stream` }),
     202
   );
 });

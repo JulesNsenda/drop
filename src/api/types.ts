@@ -118,6 +118,17 @@ export interface DeployStageDto {
   category?: string;
 }
 
+/**
+ * GET /deploys/:id for a deploy that was accepted but has not started building
+ * (waiting for a builder slot): there is no episode and no failure detail yet.
+ * The dashboard reads neither this route nor this shape.
+ */
+export interface DeployQueuedDto {
+  deployId: string;
+  appName: string;
+  status: 'queued';
+}
+
 export interface DeployEpisodeDto {
   deployId: string;
   appName: string;

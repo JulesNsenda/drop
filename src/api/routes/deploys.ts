@@ -7,13 +7,14 @@
  */
 
 import { Hono } from 'hono';
-import { success, DeployEpisodeDto, DeployStageDto, DeployDetailDto } from '../types';
+import { success, DeployEpisodeDto, DeployStageDto, DeployDetailDto, DeployQueuedDto } from '../types';
 import { NotFoundError, ValidationError } from '../middleware/error';
 import { AuthContext } from '../middleware/auth';
 import { canAccess } from '../access';
 import { getDeployTracker, getDeployDetailStore } from '../../managers/deploy-tracker';
 import type { DeployEpisode, DeployStage, DeployDetail } from '../../managers/deploy-tracker';
 import { getStateManager } from '../../managers/app/state-manager';
+import { getPlatformOps } from '../platform-ops';
 import { eventBus } from '../../core/event-bus';
 import { isValidAppName } from '../middleware/validate';
 
@@ -171,7 +172,9 @@ function terminalEnd(episode: DeployEpisode): StreamEnd | undefined {
 function streamEpisode(
   signal: AbortSignal,
   locate: () => DeployEpisode | undefined,
-  appearTimeoutMs?: number
+  appearTimeoutMs?: number,
+  /** An id accepted but not yet built: announced once, then waited for until its episode appears. */
+  queuedId?: string
 ): Response {
   const stream = new ReadableStream({
     start(controller) {
@@ -181,6 +184,7 @@ function streamEpisode(
       let lastSig = '';
       let lastWrite = Date.now();
       let scheduled = false;
+      let announcedQueued = false;
 
       const write = (chunk: string): void => {
         if (closed) return;
@@ -232,6 +236,9 @@ function streamEpisode(
           if (done) return end(done, episode.deployId);
         } else if (appearTimeoutMs !== undefined && Date.now() - openedAt > appearTimeoutMs) {
           return end('not-found');
+        } else if (queuedId && !announcedQueued) {
+          announcedQueued = true;
+          sendEvent('queued', { deployId: queuedId });
         }
 
         if (Date.now() - openedAt > STREAM_MAX_LIFETIME_MS) {
@@ -329,10 +336,21 @@ deploys.get('/:deployId/stream', async (c) => {
   };
 
   if (!find()) {
-    throw new NotFoundError(`No deploy found for '${deployId}'`);
+    // An id the caller was just handed (POST /apps/:name/redeploy answers
+    // before the wait for a builder slot) has no episode YET. Same tenant
+    // filter as an episode - the owner snapshot - so it is not an existence oracle.
+    const queued = queuedDeployOf(auth, deployId);
+    if (!queued) throw new NotFoundError(`No deploy found for '${deployId}'`);
+    return streamEpisode(c.req.raw.signal, find, undefined, deployId);
   }
   return streamEpisode(c.req.raw.signal, find);
 });
+
+/** The accepted-but-not-built deploy for `deployId`, when the caller may see it. */
+function queuedDeployOf(auth: AuthContext | undefined, deployId: string) {
+  const queued = getPlatformOps()?.getQueuedDeploy(deployId);
+  return queued && canAccess(auth, { userId: queued.userId }) ? queued : undefined;
+}
 
 // GET /deploys/:deployId - why a specific deploy failed
 deploys.get('/:deployId', async (c) => {
@@ -357,6 +375,12 @@ deploys.get('/:deployId', async (c) => {
   // teardown frees the app name, so a live lookup would hand a deleted
   // tenant's failure diagnostics to whoever registers that name next.
   if (!detail || !canAccess(auth, { userId: detail.userId })) {
+    // Not a failure with a detail, but an id that was just accepted and has not
+    // started building: queued, not a 404.
+    const queued = detail ? undefined : queuedDeployOf(auth, deployId);
+    if (queued) {
+      return c.json(success<DeployQueuedDto>({ deployId, appName: queued.appName, status: 'queued' }));
+    }
     throw new NotFoundError(`No deploy found for '${deployId}'`);
   }
 

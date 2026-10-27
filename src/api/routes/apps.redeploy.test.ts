@@ -25,15 +25,13 @@ describe('POST /apps/:name/redeploy', () => {
   let strangerToken: string;
   let readonlyToken: string;
   let logSpy: jest.SpyInstance;
-  let hold: { app: string; release: jest.Mock; consume: jest.Mock };
   let ops: PlatformOps;
 
   const body = async (res: Response): Promise<any> => res.json();
   const bearer = (token: string) => ({ Authorization: `Bearer ${token}` });
   const redeploy = (name: string, headers: Record<string, string>) =>
     t.hono.request(`/api/v1/apps/${name}/redeploy`, { method: 'POST', headers });
-  const refuseAdmission = (refused: RedeployRefusal) =>
-    (ops.admitExplicitUpdate as jest.Mock).mockResolvedValue({ refused });
+  const refuse = (refused: RedeployRefusal) => (ops.redeployApp as jest.Mock).mockResolvedValue({ refused });
 
   beforeEach(async () => {
     t = await createTestApiServer({ port: 3112, tempPrefix: 'drop-redeploy-route-', activityLog: true });
@@ -51,10 +49,8 @@ describe('POST /apps/:name/redeploy', () => {
     await sm.registerApp('site', path.join(t.tempDir, 'site'));
     await sm.updateApp('site', { userId: ownerId });
 
-    hold = { app: 'site', release: jest.fn(), consume: jest.fn() };
     ops = makePlatformOpsStub({
-      admitExplicitUpdate: jest.fn().mockResolvedValue({ hold, admitted: { marker: 'admitted' } }),
-      startExplicitUpdate: jest.fn().mockResolvedValue({ started: '11111111-2222-4333-8444-555555555555' }),
+      redeployApp: jest.fn().mockResolvedValue({ started: '11111111-2222-4333-8444-555555555555' }),
     });
     setPlatformOps(ops);
   });
@@ -68,7 +64,7 @@ describe('POST /apps/:name/redeploy', () => {
     it("404s another user's app, and never reaches admission", async () => {
       const res = await redeploy('site', bearer(strangerToken));
       expect(res.status).toBe(404);
-      expect(ops.admitExplicitUpdate).not.toHaveBeenCalled();
+      expect(ops.redeployApp).not.toHaveBeenCalled();
     });
 
     it('answers a stranger exactly as it answers an app that does not exist, naming only the requested app', async () => {
@@ -83,7 +79,7 @@ describe('POST /apps/:name/redeploy', () => {
     it('refuses an anonymous caller (401) and a read-only token (403)', async () => {
       expect((await redeploy('site', {})).status).toBe(401);
       expect((await redeploy('site', bearer(readonlyToken))).status).toBe(403);
-      expect(ops.admitExplicitUpdate).not.toHaveBeenCalled();
+      expect(ops.redeployApp).not.toHaveBeenCalled();
     });
 
     it('503s when the platform operations are not wired', async () => {
@@ -105,21 +101,29 @@ describe('POST /apps/:name/redeploy', () => {
       });
     });
 
-    it('hands admission ONE actor and starts exactly what was admitted', async () => {
+    it('makes ONE call, with the one actor and no prepare step', async () => {
       await redeploy('site', bearer(ownerToken));
-      expect(ops.admitExplicitUpdate).toHaveBeenCalledTimes(1);
-      const [name, actor] = (ops.admitExplicitUpdate as jest.Mock).mock.calls[0];
+      expect(ops.redeployApp).toHaveBeenCalledTimes(1);
+      const [name, actor, prepare] = (ops.redeployApp as jest.Mock).mock.calls[0];
       expect(name).toBe('site');
       expect(actor).toMatchObject({ actorUserId: ownerId, agent: false });
       expect(actor.principalId).toBeDefined();
-      expect(ops.startExplicitUpdate).toHaveBeenCalledWith(hold, { marker: 'admitted' });
+      expect(prepare).toBeUndefined();
+    });
+
+    it('answers 202 with the group when the platform says the folder is a monorepo group', async () => {
+      (ops.redeployApp as jest.Mock).mockResolvedValue({ group: { container: 'site' } });
+      const res = await redeploy('site', bearer(ownerToken));
+      expect(res.status).toBe(202);
+      expect((await body(res)).data).toEqual({ group: true, container: 'site' });
+      expect(logSpy).toHaveBeenCalledWith(expect.anything(), { action: 'redeploy', appName: 'site', detail: 'group' });
     });
 
     it('marks an agent token as an agent', async () => {
       const key = await createApiKey('agent-key', 'user', undefined, undefined, ownerId, { kind: 'agent' });
       const res = await redeploy('site', { 'X-API-Key': key.key });
       expect(res.status).toBe(202);
-      expect((ops.admitExplicitUpdate as jest.Mock).mock.calls[0][1]).toMatchObject({ agent: true });
+      expect((ops.redeployApp as jest.Mock).mock.calls[0][1]).toMatchObject({ agent: true });
     });
 
     it('records the acceptance in the activity log', async () => {
@@ -132,7 +136,7 @@ describe('POST /apps/:name/redeploy', () => {
     });
 
     it('records nothing when it is refused', async () => {
-      refuseAdmission({ code: 'APP_BUSY', message: 'busy' });
+      refuse({ code: 'APP_BUSY', message: 'busy' });
       await redeploy('site', bearer(ownerToken));
       expect(logSpy).not.toHaveBeenCalled();
     });
@@ -149,27 +153,17 @@ describe('POST /apps/:name/redeploy', () => {
       ['INSUFFICIENT_DISK', 507, 'INSUFFICIENT_DISK'],
     ];
 
-    it.each(cases)('maps an admission refusal %s to %i / %s, and starts nothing', async (code, status, apiCode) => {
-      refuseAdmission({ code, message: `refused: ${code}` });
+    it.each(cases)('maps a refusal %s to %i / %s', async (code, status, apiCode) => {
+      refuse({ code, message: `refused: ${code}` });
       const res = await redeploy('site', bearer(ownerToken));
       expect(res.status).toBe(status);
       const json = await body(res);
       expect(json.error).toMatchObject({ code: apiCode, message: `refused: ${code}` });
-      expect(ops.startExplicitUpdate).not.toHaveBeenCalled();
-    });
-
-    it('maps a refusal at the start the same way', async () => {
-      (ops.startExplicitUpdate as jest.Mock).mockResolvedValue({
-        refused: { code: 'APP_STOPPED', message: 'stopped while it waited' },
-      });
-      const res = await redeploy('site', bearer(ownerToken));
-      expect(res.status).toBe(409);
-      expect((await body(res)).error.code).toBe('APP_STOPPED');
       expect(logSpy).not.toHaveBeenCalled();
     });
 
     it('carries the retry hint as Retry-After and in the body', async () => {
-      refuseAdmission({ code: 'RATE_LIMITED', message: 'Too many failed deploys.', retryAfterSeconds: 37 });
+      refuse({ code: 'RATE_LIMITED', message: 'Too many failed deploys.', retryAfterSeconds: 37 });
       const res = await redeploy('site', bearer(ownerToken));
       expect(res.status).toBe(429);
       expect(res.headers.get('Retry-After')).toBe('37');
@@ -177,7 +171,7 @@ describe('POST /apps/:name/redeploy', () => {
     });
 
     it('tells a git-backed app where to go', async () => {
-      refuseAdmission({
+      refuse({
         code: 'REDEPLOY_NOT_SUPPORTED_YET',
         message: "Application 'site' is deployed from git; use POST /api/v1/git/redeploy/site",
       });
@@ -185,12 +179,12 @@ describe('POST /apps/:name/redeploy', () => {
       expect((await body(res)).error.message).toContain('/git/redeploy/site');
     });
 
-    it('releases the hold, and 500s, when starting throws', async () => {
+    it('500s when the platform operation itself throws', async () => {
       jest.spyOn(console, 'error').mockImplementation();
-      (ops.startExplicitUpdate as jest.Mock).mockRejectedValue(new Error('slot wait blew up'));
+      (ops.redeployApp as jest.Mock).mockRejectedValue(new Error('quota store down'));
       const res = await redeploy('site', bearer(ownerToken));
       expect(res.status).toBe(500);
-      expect(hold.release).toHaveBeenCalledTimes(1);
+      expect(logSpy).not.toHaveBeenCalled();
     });
   });
 

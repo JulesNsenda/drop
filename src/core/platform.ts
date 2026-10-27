@@ -161,11 +161,11 @@ import {
   type DetachServiceOutcome,
   type DetachServiceResult,
   type DetachServiceRestartOutcome,
-  type UpdateHold,
+  RedeployRefusedError,
   type RedeployRefusal,
-  type RedeployAdmission,
   type RedeployStart,
-  type AdmittedRedeploy,
+  type RedeployPrepare,
+  type QueuedDeploy,
 } from '../api/platform-ops';
 import { planSecretPreflight, generateSecretValue } from '../managers/secret/secret-preflight';
 import { Logger, createLogger } from '../utils/logger';
@@ -820,6 +820,30 @@ interface AdmittedUpdate {
   originalPort: number | undefined;
   /** What started the deploy, when it is not the watcher's ordinary update (see BuildStartedPayload.trigger). */
   trigger?: DeployTriggerTag;
+  /**
+   * An explicit redeploy also refuses, after the slot wait, when the app's
+   * monorepo group became busy. NOT checked for the anonymous path: a
+   * container's expansion calls handleAppUpdate for its children while it
+   * holds the container's own claim.
+   */
+  groupGuard?: boolean;
+}
+
+/**
+ * A reservation of one app's in-progress slot, from `reserve`. `release` and
+ * `consume` act only while the owner map still names THIS reservation, so a
+ * stale one can never free a later owner's claim. `consume` is one-shot: it
+ * hands the claim to the build and returns the callback that gives it back,
+ * after which `release` is a no-op (null when it was already consumed,
+ * released or replaced). `beginLand`/`endLand` mark the span in which a git
+ * deploy is writing the folder (`gitReserved`); a files redeploy never does.
+ */
+interface PlatformHold {
+  readonly app: string;
+  release(): void;
+  consume(): (() => void) | null;
+  beginLand(): void;
+  endLand(): void;
 }
 
 /** What acquireSlotAndRecheck hands to buildAndSwap: the build slot, which the caller then owns. */
@@ -1017,6 +1041,14 @@ export class DropPlatform {
    * claim.
    */
   private readonly holdOwners: Map<string, object> = new Map();
+  /**
+   * Explicit redeploys accepted (their id handed out) but not yet built: the
+   * id is minted before the wait for a builder slot, so the deploys routes
+   * need to know it is real while the tracker has no episode for it yet. An
+   * entry goes when its deploy settles; the episode (a refusal closes one under
+   * the same id) is by then recorded.
+   */
+  private readonly queuedDeploys: Map<string, QueuedDeploy> = new Map();
   // Builds deferred because the concurrent-build cap was full (appName -> its
   // path + type hint). A first-boot or single-drop burst can briefly saturate
   // the cap — in docker mode especially, where a first-time base-image pull
@@ -1721,49 +1753,25 @@ export class DropPlatform {
   }
 
   /**
-   * Claim an app's in-progress slot for a git deploy that is about to write its
-   * folder. Null when the app is busy or the platform is quiesced. While held,
-   * `handleBuildApp` defers the app's builds (see `gitReserved`).
+   * The ONE place an app's in-progress slot is reserved, and so the one place
+   * its gates live: not while quiesced, not while busy, not while an upload is
+   * writing the folder. The reservation is a hold (see PlatformHold) backed by
+   * a per-name owner map; `tryReserveApp` and an explicit redeploy both build
+   * on it, so they exclude each other.
    */
-  private tryReserveApp(name: string): (() => void) | null {
+  private reserve(name: string): PlatformHold | null {
     if (this.isQuiesced() || this.isBusy(name)) return null;
     // An upload in flight is writing the same folder.
-    if (this.uploadDeployService?.isUploading(name)) return null;
-    this.appsInProgress.add(name);
-    this.gitReserved.add(name);
-    const owner = {};
-    this.holdOwners.set(name, owner);
-    return () => {
-      // Only while this reservation still owns the app: a second call, or a
-      // call after another owner took the slot, is a no-op.
-      if (this.holdOwners.get(name) !== owner) return;
-      this.holdOwners.delete(name);
-      this.gitReserved.delete(name);
-      this.appsInProgress.delete(name);
-    };
-  }
-
-  /**
-   * Claim an app's in-progress slot for an explicit redeploy. The same gates as
-   * tryReserveApp and the same owner map (so the two exclude each other), but
-   * it does NOT mark `gitReserved`: nothing is writing the folder, the build
-   * reads it as it stands. Null when the app is busy, uploading, or the
-   * platform is quiesced.
-   *
-   * The hold is the only way to give the claim back until `consume` hands it to
-   * the build, which returns the callback that does. `release` and `consume`
-   * act only while the owner map still names this hold.
-   */
-  private reserveForUpdate(name: string): UpdateHold | null {
-    if (this.isQuiesced() || this.isBusy(name)) return null;
     if (this.uploadDeployService?.isUploading(name)) return null;
     this.appsInProgress.add(name);
     const owner = {};
     this.holdOwners.set(name, owner);
     let consumed = false;
+    const owns = (): boolean => this.holdOwners.get(name) === owner;
     const giveBack = (): void => {
-      if (this.holdOwners.get(name) !== owner) return;
+      if (!owns()) return;
       this.holdOwners.delete(name);
+      this.gitReserved.delete(name);
       this.appsInProgress.delete(name);
     };
     return {
@@ -1772,11 +1780,49 @@ export class DropPlatform {
         if (!consumed) giveBack();
       },
       consume: () => {
-        if (consumed || this.holdOwners.get(name) !== owner) return null;
+        if (consumed || !owns()) return null;
         consumed = true;
         return giveBack;
       },
+      beginLand: () => {
+        if (!consumed && owns()) this.gitReserved.add(name);
+      },
+      endLand: () => {
+        if (!consumed && owns()) this.gitReserved.delete(name);
+      },
     };
+  }
+
+  /**
+   * Claim an app's in-progress slot for a git deploy that is about to write its
+   * folder. Null when the app is busy or the platform is quiesced. While held,
+   * `handleBuildApp` defers the app's builds (see `gitReserved`). The external
+   * contract (git-deploy, the DELETE route): a release function, idempotent,
+   * with the land marked from the moment of the claim.
+   */
+  private tryReserveApp(name: string): (() => void) | null {
+    const hold = this.reserve(name);
+    if (!hold) return null;
+    hold.beginLand();
+    return () => hold.release();
+  }
+
+  /**
+   * Whether the app's monorepo group is busy in a way that forbids touching
+   * the app: for a container, any of its children; for a child, its container.
+   * False outside any group. The one rule behind git's folder reservation and
+   * the explicit redeploy's admission.
+   */
+  private isGroupBusy(name: string): boolean {
+    const stateManager = this.stateManager;
+    const app = stateManager?.getApp(name);
+    if (!stateManager || !app?.group) return false;
+    const apps = stateManager.getAllApps();
+    if (app.isGroupContainer) {
+      return apps.some((a) => a.group === app.group && !a.isGroupContainer && this.isBusy(a.name));
+    }
+    const container = apps.find((a) => a.isGroupContainer && a.group === app.group);
+    return !!container && this.isBusy(container.name);
   }
 
   /** Whether a build container for the app exists (docker isolation only). */
@@ -2468,8 +2514,9 @@ backup:
       restartApp: (name) => this.restartApp(name),
       isAppInProgress: (name) => this.isBusy(name),
       tryReserveApp: (name) => this.tryReserveApp(name),
-      admitExplicitUpdate: (name, actor) => this.admitExplicitUpdate(name, actor),
-      startExplicitUpdate: (hold, admitted) => this.startExplicitUpdate(hold, admitted),
+      redeployApp: (name, actor, prepare) => this.redeployApp(name, actor, prepare),
+      getQueuedDeploy: (id) => this.queuedDeploys.get(id),
+      isGroupBusy: (name) => this.isGroupBusy(name),
       hasLiveBuildContainer: (name) => this.hasLiveBuildContainer(name),
       objectStorageDeleteRisk: (name) => this.objectStorageDeleteRisk(name),
       retireObjectStorage: (name, opts) => this.retireObjectStorageOfDeletedApp(name, opts?.keepData),
@@ -7623,22 +7670,35 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
   }
 
   /**
-   * Admit an explicit redeploy of a FILES app (POST /apps/:name/redeploy).
-   * The slot first, synchronously; then, holding it, the checks - and every
-   * refusal releases the hold exactly once. Authorization is the caller's.
+   * Redeploy an app explicitly (POST /apps/:name/redeploy): rebuild the files
+   * it already has. ONE operation, and the reservation never leaves it:
    *
-   * Git-backed apps and monorepo containers are refused for now
-   * (REDEPLOY_NOT_SUPPORTED_YET); they need their folder landed first, which
-   * is the git path's job.
+   *  1. take the app's slot (a hold), synchronously;
+   *  2. under it, check the app is a files app and may be rebuilt (see
+   *     checkRedeployable), then run `prepare` if there is one and look at what
+   *     the folder is NOW (a git land can turn it into a monorepo group);
+   *  3. consume the hold, set the breaker keys (their lifetime is the hold's),
+   *     mint the deploy id, register it as queued and start the build WITHOUT
+   *     waiting for a builder slot - the caller gets the id at once;
+   *  4. the build runs on and closes its own outcome; a refusal after the wait
+   *     closes the episode under the same id.
+   *
+   * The hold is released in the finally until step 3 consumes it, so every
+   * earlier exit - a refusal, a throwing `prepare`, any error - gives the slot
+   * back exactly once and leaves no key behind. Authorization is the caller's.
    */
-  private async admitExplicitUpdate(appName: string, actor: DeployActorInfo): Promise<RedeployAdmission> {
+  private async redeployApp(
+    appName: string,
+    actor: DeployActorInfo,
+    prepare?: RedeployPrepare
+  ): Promise<RedeployStart> {
     if (!this.runtime || !this.stateManager || !this.detector || !this.builder) {
       return redeployRefusal('SERVICE_UNAVAILABLE', 'The platform is not ready to deploy');
     }
     if (this.isQuiesced()) {
       return redeployRefusal('SERVICE_UNAVAILABLE', 'Deploys are paused for a backup; retry shortly');
     }
-    const hold = this.reserveForUpdate(appName);
+    const hold = this.reserve(appName);
     if (!hold) {
       return redeployRefusal(
         'APP_BUSY',
@@ -7646,38 +7706,115 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       );
     }
     try {
-      const outcome = await this.admitUnderHold(appName, actor);
-      if ('refused' in outcome) {
-        hold.release();
-        return outcome;
+      const checked = await this.checkRedeployable(appName, actor);
+      if ('refused' in checked) return checked;
+      let appState = checked.appState;
+
+      if (prepare) {
+        try {
+          await prepare({ app: appName, beginLand: hold.beginLand, endLand: hold.endLand });
+        } catch (error) {
+          if (error instanceof RedeployRefusedError) return { refused: error.refusal };
+          throw error;
+        }
+        // The land is over, and it may have changed what this folder is.
+        hold.endLand();
+        const after = this.stateManager.getApp(appName);
+        if (!after) return redeployRefusal('NOT_FOUND', `Application '${appName}' not found`);
+        if ((await this.redeployClassOf(after, this.sourcePathOf(appName))) === 'container') {
+          return { group: { container: appName } };
+        }
+        appState = after;
       }
-      return { hold, admitted: outcome.admitted };
-    } catch (error) {
+
+      const releaseClaim = hold.consume();
+      if (!releaseClaim) {
+        return redeployRefusal('APP_BUSY', `The reservation for '${appName}' is no longer held - retry the redeploy`);
+      }
+      // Past this point the claim is the build's: nothing below may throw
+      // without giving it back, and the finally no longer can.
+      try {
+        this.breakerKeys.set(appName, this.guardrailKeys(appName, false, actor));
+        const deployId = crypto.randomUUID();
+        this.queuedDeploys.set(deployId, { appName, userId: appState.userId });
+        const admitted: AdmittedUpdate = {
+          appPath: this.sourcePathOf(appName),
+          statusAtEntry: appState.status,
+          appState,
+          wasRunning: appState.status === 'running',
+          originalPort: appState.port,
+          trigger: 'deploy',
+          groupGuard: true,
+        };
+        const update = await this.runClaimedUpdate(appName, admitted, releaseClaim, deployId);
+        if (!('started' in update)) {
+          // The early form always starts; this keeps the type honest.
+          this.queuedDeploys.delete(deployId);
+          return redeployRefusalOf(appName, update);
+        }
+        this.logger.info(`Explicit redeploy of ${appName} accepted (${deployId})`, 'UPDATE');
+        // Nobody awaits `done`: its rejection (the failure handler itself
+        // throwing) is logged here, after the outcome was closed, so it is never
+        // unhandled; the queued entry goes when the deploy settles.
+        update.done
+          .catch((error) =>
+            this.logger.error(`Redeploy of ${appName} failed while reporting its outcome`, 'UPDATE', error)
+          )
+          .finally(() => this.queuedDeploys.delete(deployId));
+        return { started: deployId };
+      } catch (error) {
+        releaseClaim();
+        this.releaseGuardrailKeys(appName);
+        throw error;
+      }
+    } finally {
       hold.release();
-      throw error;
     }
   }
 
-  /** admitExplicitUpdate's checks, run under the hold. Sets the breaker keys last, once nothing can refuse. */
-  private async admitUnderHold(
+  /** What a folder is, for a redeploy: git-backed, a monorepo group, or plain files. */
+  private async redeployClassOf(
+    appState: NonNullable<ReturnType<AppStateManager['getApp']>>,
+    appPath: string
+  ): Promise<'git' | 'container' | 'files'> {
+    if (resolveGitBackedName(appState, this.stateManager!)) return 'git';
+    if (appState.isGroupContainer || isMonorepoContainer(await parseDropYaml(appPath))) return 'container';
+    return 'files';
+  }
+
+  /**
+   * redeployApp's checks, run under the hold: the app exists and is a files app
+   * (git-backed apps and monorepo groups are refused for now), nothing around it
+   * is busy, the stopped rule, disk, and ONE admission with the one actor. Disk
+   * comes before the admission so a refused request never burns quota.
+   */
+  private async checkRedeployable(
     appName: string,
     actor: DeployActorInfo
-  ): Promise<{ refused: RedeployRefusal } | { admitted: AdmittedUpdate }> {
+  ): Promise<
+    { refused: RedeployRefusal } | { appState: NonNullable<ReturnType<AppStateManager['getApp']>> }
+  > {
     const appState = this.stateManager!.getApp(appName);
     if (!appState) return redeployRefusal('NOT_FOUND', `Application '${appName}' not found`);
     const appPath = this.sourcePathOf(appName);
 
-    if (resolveGitBackedName(appState, this.stateManager!)) {
+    const kind = await this.redeployClassOf(appState, appPath);
+    if (kind === 'git') {
       return redeployRefusal(
         'REDEPLOY_NOT_SUPPORTED_YET',
         `Application '${appName}' is deployed from git; use POST /api/v1/git/redeploy/${appName}`
       );
     }
-    if (appState.isGroupContainer || isMonorepoContainer(await parseDropYaml(appPath))) {
+    if (kind === 'container') {
       return redeployRefusal(
         'REDEPLOY_NOT_SUPPORTED_YET',
         `Application '${appName}' is a monorepo group; redeploying a group is not supported here yet`
       );
+    }
+    // A group being rewritten (a container's expansion) or a child being rebuilt
+    // under a container that is. Checked again after the slot wait.
+    if (this.isGroupBusy(appName)) {
+      return redeployRefusal('APP_BUSY', `Application '${appName}' belongs to a group that is busy - retry once it settles`);
     }
     // A build container left running (docker isolation) means a build is in
     // flight that the platform is not tracking.
@@ -7686,10 +7823,18 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     }
 
     // The stopped rule, decided once: a stopped app is rebuilt only to refresh a
-    // tree built for another Node runtime, and an agent token never rebuilds one.
+    // tree built for another Node runtime, and an agent never rebuilds one.
     const rebuildsStale = !actor.agent && (await this.rebuildsStaleTree(appName, appState, true));
     if (appState.status === 'stopped' && !rebuildsStale) {
       return redeployRefusal('APP_STOPPED', `Application '${appName}' is stopped; start it before redeploying`);
+    }
+
+    const disk = await hasEnoughDisk(appPath);
+    if (!disk.ok) {
+      return redeployRefusal(
+        'INSUFFICIENT_DISK',
+        `Insufficient disk space (${Math.round(disk.freeMb)} MB free, need ${getMinFreeDiskMb()} MB)`
+      );
     }
 
     // ONE admission, with the one actor: the breaker and the quota, charged here.
@@ -7701,52 +7846,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       }
       throw error;
     }
-
-    const disk = await hasEnoughDisk(appPath);
-    if (!disk.ok) {
-      return redeployRefusal(
-        'INSUFFICIENT_DISK',
-        `Insufficient disk space (${Math.round(disk.freeMb)} MB free, need ${getMinFreeDiskMb()} MB)`
-      );
-    }
-
-    this.breakerKeys.set(appName, this.guardrailKeys(appName, false, actor));
-    this.logger.info(`Explicit redeploy of ${appName} admitted`, 'UPDATE');
-    return {
-      admitted: {
-        appPath,
-        statusAtEntry: appState.status,
-        appState,
-        wasRunning: appState.status === 'running',
-        originalPort: appState.port,
-        trigger: 'deploy',
-      },
-    };
-  }
-
-  /**
-   * Start what admitExplicitUpdate admitted. Consumes the hold (a hold that was
-   * already consumed, released or replaced starts nothing), waits for a builder
-   * slot, and resolves with the deploy id as soon as it is minted; the build
-   * and swap run on behind it, close their own outcome and give the claim back.
-   * Never touches handleAppUpdate.
-   */
-  private async startExplicitUpdate(hold: UpdateHold, admitted: AdmittedRedeploy): Promise<RedeployStart> {
-    const releaseClaim = hold.consume();
-    if (!releaseClaim) {
-      return redeployRefusal(
-        'APP_BUSY',
-        `The reservation for '${hold.app}' is no longer held - retry the redeploy`
-      );
-    }
-    const update = await this.runClaimedUpdate(hold.app, admitted as AdmittedUpdate, releaseClaim);
-    if ('refused' in update) return redeployRefusalOf(hold.app, update);
-    // Nobody awaits `done`: its rejection (the failure handler itself throwing)
-    // is logged here, after the outcome was closed, so it is never unhandled.
-    update.done.catch((error) =>
-      this.logger.error(`Redeploy of ${hold.app} failed while reporting its outcome`, 'UPDATE', error)
-    );
-    return { started: update.started };
+    return { appState };
   }
 
   /**
@@ -7766,23 +7866,24 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
   private async runClaimedUpdate(
     appName: string,
     admitted: AdmittedUpdate,
-    releaseClaim: () => void
+    releaseClaim: () => void,
+    earlyDeployId?: string
   ): Promise<ClaimedUpdate> {
     const giveBack = (): void => {
       this.releaseGuardrailKeys(appName);
       releaseClaim();
     };
+    // The early form: the caller has already handed the id out (and registered
+    // it as queued), so it starts at once and the wait for the slot, and any
+    // refusal after it, happen behind it, closing the episode under that id.
+    if (earlyDeployId) {
+      return { started: earlyDeployId, done: this.acquireAndSwap(appName, admitted, earlyDeployId, giveBack) };
+    }
     let acquired: AcquiredSlot | UpdateRefused;
     try {
       acquired = await this.acquireSlotAndRecheck(appName, admitted);
     } catch (error) {
-      // The slot wait threw: a refusal nobody reported.
-      // Reported the way the guardrail refusal is, and the keys released BEFORE
-      // failDeployEpisode so the failure is not charged (the build never ran).
-      const failure = error instanceof Error ? error : new Error(String(error));
-      this.logger.warn(`Redeploy of ${appName} failed before its build: ${failure.message}`, 'UPDATE');
-      this.releaseGuardrailKeys(appName);
-      this.failDeployEpisode(appName, failure, crypto.randomUUID(), undefined, admitted.trigger);
+      this.reportPreBuildThrow(appName, error, crypto.randomUUID(), admitted.trigger);
       giveBack();
       throw error;
     }
@@ -7797,6 +7898,52 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     const deployId = crypto.randomUUID();
     const done = this.swapAndClose(appName, admitted, deployId, acquired, giveBack);
     return { started: deployId, done };
+  }
+
+  /**
+   * The slot wait threw: a refusal nobody reported. Reported the way the
+   * guardrail refusal is, and the keys released BEFORE failDeployEpisode so the
+   * failure is not charged (the build never ran).
+   */
+  private reportPreBuildThrow(appName: string, error: unknown, deployId: string, trigger?: DeployTriggerTag): void {
+    const failure = error instanceof Error ? error : new Error(String(error));
+    this.logger.warn(`Redeploy of ${appName} failed before its build: ${failure.message}`, 'UPDATE');
+    this.releaseGuardrailKeys(appName);
+    this.failDeployEpisode(appName, failure, deployId, undefined, trigger);
+  }
+
+  /** runClaimedUpdate's early form: the id is already out, so a refusal after the wait closes the episode under it. */
+  private async acquireAndSwap(
+    appName: string,
+    admitted: AdmittedUpdate,
+    deployId: string,
+    giveBack: () => void
+  ): Promise<boolean> {
+    let acquired: AcquiredSlot | UpdateRefused;
+    try {
+      acquired = await this.acquireSlotAndRecheck(appName, admitted, deployId);
+    } catch (error) {
+      this.reportPreBuildThrow(appName, error, deployId, admitted.trigger);
+      giveBack();
+      throw error;
+    }
+    if ('refused' in acquired) {
+      // The guardrail refusal closed its own episode (under this id); the rest
+      // do it here, keys released first so the failure is not charged.
+      if (acquired.refused !== 'guardrail') {
+        this.releaseGuardrailKeys(appName);
+        this.failDeployEpisode(
+          appName,
+          new Error(redeployRefusalOf(appName, acquired).refused.message),
+          deployId,
+          undefined,
+          admitted.trigger
+        );
+      }
+      giveBack();
+      return false;
+    }
+    return this.swapAndClose(appName, admitted, deployId, acquired, giveBack);
   }
 
   /** runClaimedUpdate's second phase: buildAndSwap, then whatever it left open closed, then the claim given back. */
@@ -7852,7 +7999,9 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
    */
   private async acquireSlotAndRecheck(
     appName: string,
-    admitted: AdmittedUpdate
+    admitted: AdmittedUpdate,
+    /** The id the deploy was already handed out under, when it was minted before the wait. */
+    deployId?: string
   ): Promise<AcquiredSlot | UpdateRefused> {
     // Wait for a builder slot BEFORE any side effect, so a redeploy queued
     // behind a full cap (a boot-reconcile burst) leaves status, build log and
@@ -7877,6 +8026,14 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     ) {
       this.logger.info(
         `Dropped redeploy for ${appName} - a git pull/upload began while waiting for a build slot`,
+        'UPDATE'
+      );
+      releaseSlot();
+      return { refused: 'busy' };
+    }
+    if (admitted.groupGuard && this.isGroupBusy(appName)) {
+      this.logger.info(
+        `Dropped redeploy for ${appName} - its monorepo group became busy while waiting for a build slot`,
         'UPDATE'
       );
       releaseSlot();
@@ -7928,7 +8085,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       this.failDeployEpisode(
         appName,
         new Error(refusal),
-        crypto.randomUUID(),
+        deployId ?? crypto.randomUUID(),
         'GUARDRAIL_TRIPPED',
         admitted.trigger
       );

@@ -116,6 +116,52 @@ describe('DeployTracker', () => {
       expect(tracker.getEpisodes('trig', 1)[0].trigger).toBe('deploy');
     });
 
+    it("an explicit trigger ignores the pending tag's timestamp, which belongs to an earlier event", async () => {
+      jest.useFakeTimers({
+        now: new Date('2026-01-01T00:00:00.000Z'),
+        doNotFake: ['setImmediate', 'nextTick', 'setTimeout', 'setInterval', 'clearTimeout', 'clearInterval', 'queueMicrotask'],
+      });
+      try {
+        bus.publish('app:update', {
+          name: 'trig3',
+          path: '/x',
+          reason: 'file change',
+          bypassCooldown: true,
+        } as never);
+        jest.setSystemTime(new Date('2026-01-01T00:05:00.000Z'));
+        bus.publish('build:started', { appId: 'trig3', buildId: 'b1', deployId: 'd3', trigger: 'deploy' });
+        bus.publish('app:updated', { appId: 'trig3', changes: { status: 'running' } });
+        await tracker.flush();
+
+        expect(tracker.getEpisodes('trig3', 1)[0].startedAt).toBe('2026-01-01T00:05:00.000Z');
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
+    it('without an explicit trigger the pending tag keeps its (earlier) timestamp', async () => {
+      jest.useFakeTimers({
+        now: new Date('2026-01-01T00:00:00.000Z'),
+        doNotFake: ['setImmediate', 'nextTick', 'setTimeout', 'setInterval', 'clearTimeout', 'clearInterval', 'queueMicrotask'],
+      });
+      try {
+        bus.publish('app:update', {
+          name: 'trig4',
+          path: '/x',
+          reason: 'file change',
+          bypassCooldown: true,
+        } as never);
+        jest.setSystemTime(new Date('2026-01-01T00:05:00.000Z'));
+        bus.publish('build:started', { appId: 'trig4', buildId: 'b1', deployId: 'd4' });
+        bus.publish('app:updated', { appId: 'trig4', changes: { status: 'running' } });
+        await tracker.flush();
+
+        expect(tracker.getEpisodes('trig4', 1)[0].startedAt).toBe('2026-01-01T00:00:00.000Z');
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
     it('falls back to the inferred tag when the publisher says nothing', async () => {
       bus.publish('app:update', {
         name: 'trig2',

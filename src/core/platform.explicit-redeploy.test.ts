@@ -1,9 +1,10 @@
 /**
- * The explicit-redeploy platform surface (#359 Item 2): the hold object, the
- * admission (`admitExplicitUpdate`) and the start (`startExplicitUpdate`).
+ * The explicit-redeploy platform surface (#359 Item 2): the reservation
+ * (`reserve`, and `tryReserveApp` built on it), `isGroupBusy`, and the one
+ * operation `redeployApp`.
  *
  * Driven against the real DropPlatform with the same private-seam stubs as
- * platform.update-exit-trace.test.ts: a fake builder (so the slot and the
+ * platform.update-exit-trace.test.ts: a fake builder (so the slot wait and the
  * build context are visible), a fake state manager, and the post-build swap
  * stubbed. Nothing here goes through handleAppUpdate.
  */
@@ -23,17 +24,19 @@ import { getDeployBreaker, resetDeployBreaker } from '../managers/guardrail/depl
 import { getPrincipalQuota, resetPrincipalQuota } from '../managers/guardrail/principal-quota';
 import { getDeployTracker, resetDeployTracker } from '../managers/deploy-tracker';
 import { hasEnoughDisk } from '../utils/disk';
-import type { UpdateHold } from '../api/platform-ops';
+import { RedeployRefusedError } from '../api/platform-ops';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
-describe('explicit redeploy: hold, admission, start', () => {
+describe('explicit redeploy: reservation, group rule, redeployApp', () => {
   let tempDir: string;
   let appPath: string;
   let platform: DropPlatform;
   let appState: any;
+  let allApps: any[] | undefined;
   let buildCtxs: any[];
   let buildGate: Promise<void> | undefined;
+  let slotGate: Promise<void> | undefined;
   let reserveEffect: (() => void) | undefined;
   let detectThrows: Error | undefined;
   let unsubs: Array<() => void>;
@@ -41,11 +44,25 @@ describe('explicit redeploy: hold, admission, start', () => {
   const actor = { principalId: 'p-1', actorUserId: 'u-1' };
 
   const p = () => platform as any;
+  const tick = (ms = 10) => new Promise((resolve) => setTimeout(resolve, ms));
+  /** Until the deploy has settled: nothing held, nothing queued. */
   const settle = async (): Promise<void> => {
-    for (let i = 0; i < 200 && (p().appsInProgress.has(appName) || p().holdOwners.has(appName)); i++) {
-      await new Promise((resolve) => setTimeout(resolve, 10));
+    for (
+      let i = 0;
+      i < 300 && (p().appsInProgress.has(appName) || p().holdOwners.has(appName) || p().queuedDeploys.size > 0);
+      i++
+    ) {
+      await tick();
     }
   };
+  /** After a refusal or a settled deploy nothing is held: no claim, no owner, no keys. */
+  const expectNothingHeld = (): void => {
+    expect(p().appsInProgress.has(appName)).toBe(false);
+    expect(p().holdOwners.has(appName)).toBe(false);
+    expect(p().gitReserved.has(appName)).toBe(false);
+    expect(p().breakerKeys.has(appName)).toBe(false);
+  };
+  const episodeOf = (deployId: string) => getDeployTracker().getEpisodes().find((e) => e.deployId === deployId);
 
   beforeEach(async () => {
     resetDeployBreaker();
@@ -60,8 +77,10 @@ describe('explicit redeploy: hold, admission, start', () => {
     getPrincipalQuota(path.join(tempDir, 'principal-quotas.json'));
     buildCtxs = [];
     buildGate = undefined;
+    slotGate = undefined;
     reserveEffect = undefined;
     detectThrows = undefined;
+    allApps = undefined;
 
     platform = createPlatform({
       dropRoot: tempDir,
@@ -69,10 +88,11 @@ describe('explicit redeploy: hold, admission, start', () => {
       logLevel: 'error',
       isolation: 'none',
     });
-    appState = { name: appName, status: 'running', port: 3005, path: appPath };
+    appState = { name: appName, status: 'running', port: 3005, path: appPath, userId: 'owner-1' };
     p().toolchainBackfilled = true;
     p().builder = {
       reserveSlot: jest.fn(async () => {
+        await slotGate;
         reserveEffect?.();
         return () => undefined;
       }),
@@ -103,10 +123,12 @@ describe('explicit redeploy: hold, admission, start', () => {
       getConfig: jest.fn().mockReturnValue(undefined),
     };
     p().stateManager = {
-      getApp: jest.fn(() => appState),
-      getAllApps: jest.fn(() => (appState ? [appState] : [])),
+      getApp: jest.fn((name: string) =>
+        name === appName ? appState : (allApps ?? []).find((a: any) => a.name === name)
+      ),
+      getAllApps: jest.fn(() => allApps ?? (appState ? [appState] : [])),
       setAppStatus: jest.fn(async (_n: string, status: string, details?: Record<string, unknown>) => {
-        appState = { name: appName, port: appState?.port, path: appPath, status, ...details };
+        appState = { name: appName, port: appState?.port, path: appPath, userId: 'owner-1', status, ...details };
       }),
       updateApp: jest.fn().mockResolvedValue(undefined),
     };
@@ -129,33 +151,47 @@ describe('explicit redeploy: hold, admission, start', () => {
     delete process.env.DROP_MIN_FREE_DISK_MB;
     resetPrincipalQuota();
     unsubs.forEach((u) => u());
+    // The tracker persists in the background: let it finish before the folder goes.
+    await getDeployTracker().flush();
     jest.restoreAllMocks();
     if (platform.isActive()) await platform.stop();
-    fs.rmSync(tempDir, { recursive: true, force: true });
+    fs.rmSync(tempDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   });
 
-  describe('the hold (reserveForUpdate)', () => {
+  describe('the reservation (reserve)', () => {
     it('claims the slot without marking a git land', () => {
-      const hold = p().reserveForUpdate(appName) as UpdateHold;
+      const hold = p().reserve(appName);
       expect(hold.app).toBe(appName);
       expect(p().appsInProgress.has(appName)).toBe(true);
       expect(p().isBusy(appName)).toBe(true);
       expect(p().gitReserved.has(appName)).toBe(false);
     });
 
+    it('beginLand and endLand mark and clear the land, while the hold is held', () => {
+      const hold = p().reserve(appName);
+      hold.beginLand();
+      expect(p().gitReserved.has(appName)).toBe(true);
+      hold.endLand();
+      expect(p().gitReserved.has(appName)).toBe(false);
+      hold.beginLand();
+      hold.release();
+      expect(p().gitReserved.has(appName)).toBe(false);
+      expect(p().appsInProgress.has(appName)).toBe(false);
+    });
+
     it('release frees the claim, once', () => {
-      const hold = p().reserveForUpdate(appName) as UpdateHold;
+      const hold = p().reserve(appName);
       hold.release();
       expect(p().appsInProgress.has(appName)).toBe(false);
       expect(p().holdOwners.has(appName)).toBe(false);
-      const next = p().reserveForUpdate(appName) as UpdateHold;
+      const next = p().reserve(appName);
       hold.release(); // the stale second release is a no-op
       expect(p().appsInProgress.has(appName)).toBe(true);
       next.release();
     });
 
     it('release after consume is a no-op', () => {
-      const hold = p().reserveForUpdate(appName) as UpdateHold;
+      const hold = p().reserve(appName);
       const giveBack = hold.consume()!;
       hold.release();
       expect(p().appsInProgress.has(appName)).toBe(true);
@@ -163,103 +199,116 @@ describe('explicit redeploy: hold, admission, start', () => {
       expect(p().appsInProgress.has(appName)).toBe(false);
     });
 
-    it('consume is one-shot', () => {
-      const hold = p().reserveForUpdate(appName) as UpdateHold;
+    it('consume is one-shot, and a released hold cannot be consumed', () => {
+      const hold = p().reserve(appName);
       expect(hold.consume()).toEqual(expect.any(Function));
       expect(hold.consume()).toBeNull();
-    });
-
-    it('a released hold cannot be consumed', () => {
-      const hold = p().reserveForUpdate(appName) as UpdateHold;
-      hold.release();
-      expect(hold.consume()).toBeNull();
+      p().appsInProgress.delete(appName);
+      p().holdOwners.delete(appName);
+      const other = p().reserve(appName);
+      other.release();
+      expect(other.consume()).toBeNull();
     });
 
     it("a hold cannot release a later owner's claim", () => {
-      const first = p().reserveForUpdate(appName) as UpdateHold;
+      const first = p().reserve(appName);
       const giveBack = first.consume()!;
       giveBack();
-      const second = p().reserveForUpdate(appName) as UpdateHold;
+      const second = p().reserve(appName);
       first.release();
       giveBack(); // the consumed callback, called again
+      first.beginLand(); // and a stale land marker
       expect(p().appsInProgress.has(appName)).toBe(true);
-      expect(second.consume()).toEqual(expect.any(Function));
-    });
-
-    it('reserveForUpdate and tryReserveApp exclude each other, both ways', () => {
-      const hold = p().reserveForUpdate(appName) as UpdateHold;
-      expect(p().tryReserveApp(appName)).toBeNull();
-      expect(p().reserveForUpdate(appName)).toBeNull();
-      hold.release();
-
-      const releaseGit = p().tryReserveApp(appName) as () => void;
-      expect(releaseGit).toEqual(expect.any(Function));
-      expect(p().gitReserved.has(appName)).toBe(true);
-      expect(p().reserveForUpdate(appName)).toBeNull();
-      releaseGit();
-      expect(p().appsInProgress.has(appName)).toBe(false);
       expect(p().gitReserved.has(appName)).toBe(false);
-    });
-
-    it("tryReserveApp's release cannot free a hold's claim", () => {
-      const releaseGit = p().tryReserveApp(appName) as () => void;
-      releaseGit();
-      const hold = p().reserveForUpdate(appName) as UpdateHold;
-      releaseGit(); // stale
-      expect(p().appsInProgress.has(appName)).toBe(true);
-      hold.release();
+      expect(second.consume()).toEqual(expect.any(Function));
     });
 
     it('is refused while quiesced and while an upload is writing the folder', () => {
       jest.spyOn(p(), 'isQuiesced').mockReturnValue(true);
-      expect(p().reserveForUpdate(appName)).toBeNull();
+      expect(p().reserve(appName)).toBeNull();
       (p().isQuiesced as jest.Mock).mockReturnValue(false);
       p().uploadDeployService = { isUploading: jest.fn().mockReturnValue(true) };
-      expect(p().reserveForUpdate(appName)).toBeNull();
+      expect(p().reserve(appName)).toBeNull();
     });
   });
 
-  describe('admitExplicitUpdate', () => {
-    /** After a refusal nothing is held: no claim, no owner, no keys. */
-    const expectNothingHeld = (): void => {
-      expect(p().appsInProgress.has(appName)).toBe(false);
-      expect(p().holdOwners.has(appName)).toBe(false);
-      expect(p().breakerKeys.has(appName)).toBe(false);
-    };
-
-    it('admits a files app: holds the slot, sets the keys, carries the entry snapshot and the trigger', async () => {
-      const out = await p().admitExplicitUpdate(appName, actor);
-      expect(out.hold.app).toBe(appName);
-      expect(out.admitted).toMatchObject({
-        appPath,
-        statusAtEntry: 'running',
-        wasRunning: true,
-        originalPort: 3005,
-        trigger: 'deploy',
-      });
+  describe("tryReserveApp keeps its external contract (git-deploy and the DELETE route)", () => {
+    it('returns a plain release function, with the land marked from the moment of the claim', () => {
+      const release = p().tryReserveApp(appName);
+      expect(typeof release).toBe('function');
       expect(p().appsInProgress.has(appName)).toBe(true);
-      expect(p().breakerKeys.get(appName)).toEqual(p().guardrailKeys(appName, false, actor));
-      out.hold.release();
+      expect(p().gitReserved.has(appName)).toBe(true);
+      release();
+      expect(p().appsInProgress.has(appName)).toBe(false);
+      expect(p().gitReserved.has(appName)).toBe(false);
     });
 
-    it('charges ONE admission, with the one actor', async () => {
-      const admit = jest.spyOn(breakerModule, 'admitDeploy');
-      const out = await p().admitExplicitUpdate(appName, actor);
-      expect(admit).toHaveBeenCalledTimes(1);
-      expect(admit).toHaveBeenCalledWith(appName, false, actor);
-      out.hold.release();
+    it('releases idempotently, and never frees a later owner', () => {
+      const release = p().tryReserveApp(appName);
+      release();
+      const next = p().tryReserveApp(appName);
+      release();
+      expect(p().appsInProgress.has(appName)).toBe(true);
+      expect(p().gitReserved.has(appName)).toBe(true);
+      next();
     });
 
-    it('refuses an unknown app, releasing the hold', async () => {
+    it('is null while busy, quiesced or uploading, and excludes a reserve, both ways', () => {
+      const hold = p().reserve(appName);
+      expect(p().tryReserveApp(appName)).toBeNull();
+      hold.release();
+      const release = p().tryReserveApp(appName);
+      expect(p().reserve(appName)).toBeNull();
+      release();
+      jest.spyOn(p(), 'isQuiesced').mockReturnValue(true);
+      expect(p().tryReserveApp(appName)).toBeNull();
+      (p().isQuiesced as jest.Mock).mockReturnValue(false);
+      p().uploadDeployService = { isUploading: jest.fn().mockReturnValue(true) };
+      expect(p().tryReserveApp(appName)).toBeNull();
+    });
+  });
+
+  describe('isGroupBusy', () => {
+    const child = { name: 'g-child', group: 'g', status: 'running' };
+    const container = { name: 'g-container', group: 'g', isGroupContainer: true, status: 'running' };
+    const sibling = { name: 'g-sibling', group: 'g', status: 'running' };
+
+    beforeEach(() => {
+      allApps = [container, child, sibling];
+    });
+
+    it('is true for a container while any child is busy', () => {
+      expect(p().isGroupBusy('g-container')).toBe(false);
+      p().appsInProgress.add('g-child');
+      expect(p().isGroupBusy('g-container')).toBe(true);
+    });
+
+    it('is true for a child while its container is busy, but not while only a sibling is', () => {
+      p().appsInProgress.add('g-sibling');
+      expect(p().isGroupBusy('g-child')).toBe(false);
+      p().appsInProgress.delete('g-sibling');
+      p().gitReserved.add('g-container');
+      expect(p().isGroupBusy('g-child')).toBe(true);
+    });
+
+    it('is false for an app outside any group', () => {
+      allApps = [{ name: appName, status: 'running' }, container];
+      p().appsInProgress.add('g-container');
+      expect(p().isGroupBusy(appName)).toBe(false);
+    });
+  });
+
+  describe('redeployApp: refusals give everything back', () => {
+    it('refuses an unknown app', async () => {
       appState = undefined;
-      const out = await p().admitExplicitUpdate(appName, actor);
+      const out = await p().redeployApp(appName, actor);
       expect(out.refused).toMatchObject({ code: 'NOT_FOUND' });
       expectNothingHeld();
     });
 
     it('refuses a git-backed app, pointing at /git/redeploy', async () => {
       appState = { ...appState, gitSource: { repoUrl: 'https://example.com/r.git', branch: 'main' } };
-      const out = await p().admitExplicitUpdate(appName, actor);
+      const out = await p().redeployApp(appName, actor);
       expect(out.refused.code).toBe('REDEPLOY_NOT_SUPPORTED_YET');
       expect(out.refused.message).toContain(`/git/redeploy/${appName}`);
       expectNothingHeld();
@@ -267,24 +316,24 @@ describe('explicit redeploy: hold, admission, start', () => {
 
     it('refuses a child of a git-deployed group', async () => {
       appState = { ...appState, group: 'g' };
-      p().stateManager.getAllApps.mockReturnValue([
+      allApps = [
         appState,
         { name: 'g-container', isGroupContainer: true, group: 'g', gitSource: { repoUrl: 'x', branch: 'main' } },
-      ]);
-      const out = await p().admitExplicitUpdate(appName, actor);
+      ];
+      const out = await p().redeployApp(appName, actor);
       expect(out.refused.code).toBe('REDEPLOY_NOT_SUPPORTED_YET');
       expectNothingHeld();
     });
 
     it('refuses a monorepo container, by flag and by its drop.yaml', async () => {
       appState = { ...appState, isGroupContainer: true };
-      let out = await p().admitExplicitUpdate(appName, actor);
+      let out = await p().redeployApp(appName, actor);
       expect(out.refused.code).toBe('REDEPLOY_NOT_SUPPORTED_YET');
       expectNothingHeld();
 
       appState = { name: appName, status: 'running', port: 3005, path: appPath };
       fs.writeFileSync(path.join(appPath, 'drop.yaml'), 'services:\n  web:\n    path: web\n    type: static\n');
-      out = await p().admitExplicitUpdate(appName, actor);
+      out = await p().redeployApp(appName, actor);
       expect(out.refused.code).toBe('REDEPLOY_NOT_SUPPORTED_YET');
       expectNothingHeld();
     });
@@ -292,7 +341,7 @@ describe('explicit redeploy: hold, admission, start', () => {
     it('refuses a stopped app', async () => {
       appState = { ...appState, status: 'stopped' };
       jest.spyOn(p(), 'dependenciesAreStale').mockResolvedValue(false);
-      const out = await p().admitExplicitUpdate(appName, actor);
+      const out = await p().redeployApp(appName, actor);
       expect(out.refused.code).toBe('APP_STOPPED');
       expectNothingHeld();
     });
@@ -301,18 +350,18 @@ describe('explicit redeploy: hold, admission, start', () => {
       appState = { ...appState, status: 'stopped' };
       jest.spyOn(p(), 'dependenciesAreStale').mockResolvedValue(true);
 
-      const agent = await p().admitExplicitUpdate(appName, { ...actor, agent: true });
+      const agent = await p().redeployApp(appName, { ...actor, agent: true });
       expect(agent.refused.code).toBe('APP_STOPPED');
       expectNothingHeld();
 
-      const human = await p().admitExplicitUpdate(appName, actor);
-      expect(human.hold).toBeDefined();
-      human.hold.release();
+      const human = await p().redeployApp(appName, actor);
+      expect(human.started).toMatch(UUID);
+      await settle();
     });
 
     it('refuses a busy app with APP_BUSY and leaves the other holder alone', async () => {
-      const other = p().reserveForUpdate(appName) as UpdateHold;
-      const out = await p().admitExplicitUpdate(appName, actor);
+      const other = p().reserve(appName);
+      const out = await p().redeployApp(appName, actor);
       expect(out.refused.code).toBe('APP_BUSY');
       expect(p().appsInProgress.has(appName)).toBe(true);
       expect(other.consume()).toEqual(expect.any(Function));
@@ -320,14 +369,24 @@ describe('explicit redeploy: hold, admission, start', () => {
 
     it('refuses while quiesced with SERVICE_UNAVAILABLE', async () => {
       jest.spyOn(p(), 'isQuiesced').mockReturnValue(true);
-      const out = await p().admitExplicitUpdate(appName, actor);
+      const out = await p().redeployApp(appName, actor);
       expect(out.refused.code).toBe('SERVICE_UNAVAILABLE');
       expectNothingHeld();
     });
 
+    it('refuses while its monorepo group is busy', async () => {
+      appState = { ...appState, group: 'g' };
+      allApps = [appState, { name: 'g-container', isGroupContainer: true, group: 'g' }];
+      p().appsInProgress.add('g-container');
+      const out = await p().redeployApp(appName, actor);
+      expect(out.refused.code).toBe('APP_BUSY');
+      expect(p().appsInProgress.has(appName)).toBe(false);
+      expect(p().holdOwners.has(appName)).toBe(false);
+    });
+
     it('refuses while a build container is still running', async () => {
       p().hasLiveBuildContainer.mockResolvedValue(true);
-      const out = await p().admitExplicitUpdate(appName, actor);
+      const out = await p().redeployApp(appName, actor);
       expect(out.refused.code).toBe('APP_BUSY');
       expectNothingHeld();
     });
@@ -335,103 +394,134 @@ describe('explicit redeploy: hold, admission, start', () => {
     it('refuses a tripped breaker with RATE_LIMITED and a retry hint', async () => {
       const [{ key, threshold }] = p().guardrailKeys(appName, false, actor);
       for (let i = 0; i < threshold; i++) getDeployBreaker().recordFailure(key, Date.now(), threshold);
-      const out = await p().admitExplicitUpdate(appName, actor);
+      const out = await p().redeployApp(appName, actor);
       expect(out.refused.code).toBe('RATE_LIMITED');
       expect(out.refused.retryAfterSeconds).toBeGreaterThan(0);
       expectNothingHeld();
     });
 
-    it('refuses a full disk with INSUFFICIENT_DISK', async () => {
+    it('refuses a full disk with INSUFFICIENT_DISK, BEFORE the admission so no quota is burned', async () => {
       (hasEnoughDisk as jest.Mock).mockResolvedValue({ ok: false, freeMb: 1 });
-      const out = await p().admitExplicitUpdate(appName, actor);
+      const admit = jest.spyOn(breakerModule, 'admitDeploy');
+      const out = await p().redeployApp(appName, actor);
       expect(out.refused.code).toBe('INSUFFICIENT_DISK');
+      expect(admit).not.toHaveBeenCalled();
       expectNothingHeld();
     });
 
     it('releases the hold when an unexpected error escapes the checks', async () => {
       jest.spyOn(breakerModule, 'admitDeploy').mockRejectedValue(new Error('quota store down'));
-      await expect(p().admitExplicitUpdate(appName, actor)).rejects.toThrow('quota store down');
+      await expect(p().redeployApp(appName, actor)).rejects.toThrow('quota store down');
       expectNothingHeld();
     });
   });
 
-  describe('startExplicitUpdate', () => {
-    it('resolves with the minted deploy id while the build is still running, then gives the claim back', async () => {
-      let open!: () => void;
-      buildGate = new Promise<void>((resolve) => (open = resolve));
-      const { hold, admitted } = await p().admitExplicitUpdate(appName, actor);
+  describe('redeployApp: accepted before the wait for a builder slot', () => {
+    it('charges ONE admission, with the one actor, and never touches handleAppUpdate', async () => {
+      const admit = jest.spyOn(breakerModule, 'admitDeploy');
       const handleAppUpdate = jest.spyOn(p(), 'handleAppUpdate');
-
-      const out = await p().startExplicitUpdate(hold, admitted);
+      const out = await p().redeployApp(appName, actor);
       expect(out.started).toMatch(UUID);
-      // The id is the one the build runs under and the tracker adopts.
-      for (let i = 0; i < 200 && buildCtxs.length === 0; i++) await new Promise((r) => setTimeout(r, 10));
-      expect(buildCtxs[0].deployId).toBe(out.started);
-      expect(buildCtxs[0].trigger).toBe('deploy');
-      expect(p().appsInProgress.has(appName)).toBe(true);
-
-      open();
+      expect(admit).toHaveBeenCalledTimes(1);
+      expect(admit).toHaveBeenCalledWith(appName, false, actor);
       await settle();
-      expect(p().appsInProgress.has(appName)).toBe(false);
-      expect(p().breakerKeys.has(appName)).toBe(false);
-      expect(p().runtime.start).toHaveBeenCalledTimes(1);
       expect(handleAppUpdate).not.toHaveBeenCalled();
     });
 
-    it('a hold that was released starts nothing', async () => {
-      const { hold, admitted } = await p().admitExplicitUpdate(appName, actor);
-      hold.release();
-      const out = await p().startExplicitUpdate(hold, admitted);
-      expect(out.refused.code).toBe('APP_BUSY');
-      expect(p().builder.build).not.toHaveBeenCalled();
-      expect(p().builder.reserveSlot).not.toHaveBeenCalled();
+    it('answers with the minted id while another build still holds the only slot', async () => {
+      let freeSlot!: () => void;
+      slotGate = new Promise<void>((resolve) => (freeSlot = resolve));
+      const out = await p().redeployApp(appName, actor);
+      expect(out.started).toMatch(UUID);
+
+      // Accepted, queued, claimed and keyed - and nothing has started building.
+      expect(p().queuedDeploys.get(out.started)).toEqual({ appName, userId: 'owner-1' });
+      expect(p().appsInProgress.has(appName)).toBe(true);
+      expect(p().breakerKeys.has(appName)).toBe(true);
+      expect(episodeOf(out.started)).toBeUndefined();
+      expect(buildCtxs).toHaveLength(0);
+
+      freeSlot();
+      for (let i = 0; i < 300 && buildCtxs.length === 0; i++) await tick();
+      // The very id handed out is the one the build runs, and the tracker adopts, under.
+      expect(buildCtxs[0].deployId).toBe(out.started);
+      expect(buildCtxs[0].trigger).toBe('deploy');
+      await settle();
+      expectNothingHeld();
+      expect(p().queuedDeploys.size).toBe(0);
+      expect(p().runtime.start).toHaveBeenCalledTimes(1);
     });
 
-    it('a hold can start once', async () => {
-      const { hold, admitted } = await p().admitExplicitUpdate(appName, actor);
-      const first = await p().startExplicitUpdate(hold, admitted);
-      expect(first.started).toBeDefined();
+    it('holds the claim while the build runs, and gives it back when it settles', async () => {
+      let open!: () => void;
+      buildGate = new Promise<void>((resolve) => (open = resolve));
+      const out = await p().redeployApp(appName, actor);
+      for (let i = 0; i < 300 && buildCtxs.length === 0; i++) await tick();
+      expect(p().appsInProgress.has(appName)).toBe(true);
+      expect(p().queuedDeploys.has(out.started)).toBe(true);
+      open();
       await settle();
-      const second = await p().startExplicitUpdate(hold, admitted);
-      expect(second.refused.code).toBe('APP_BUSY');
-      expect(buildCtxs).toHaveLength(1);
+      expectNothingHeld();
+    });
+
+    it('sets the breaker keys only after the hold is consumed', async () => {
+      let during: boolean | undefined;
+      let slotHeld!: () => void;
+      slotGate = new Promise<void>((resolve) => (slotHeld = resolve));
+      const out = await p().redeployApp(appName, actor, async () => {
+        during = p().breakerKeys.has(appName);
+      });
+      expect(during).toBe(false);
+      expect(p().breakerKeys.get(appName)).toEqual(p().guardrailKeys(appName, false, actor));
+      slotHeld();
+      await settle();
+      expect(out.started).toMatch(UUID);
     });
 
     it.each([
-      ['quiesced', 'SERVICE_UNAVAILABLE', () => (reserveEffect = () => jest.spyOn(p(), 'isQuiesced').mockReturnValue(true))],
-      ['busy', 'APP_BUSY', () => (reserveEffect = () => p().gitReserved.add(appName))],
-      ['gone', 'NOT_FOUND', () => (reserveEffect = () => (appState = undefined))],
-      ['stopped', 'APP_STOPPED', () => (reserveEffect = () => (appState = { ...appState, status: 'stopped' }))],
-      ['disk', 'INSUFFICIENT_DISK', () => (hasEnoughDisk as jest.Mock).mockResolvedValue({ ok: false, freeMb: 1 })],
-    ])('maps a %s refusal after the slot wait to %s, giving everything back', async (_reason, code, setup) => {
-      const { hold, admitted } = await p().admitExplicitUpdate(appName, actor);
-      (hasEnoughDisk as jest.Mock).mockResolvedValue({ ok: true, freeMb: 999999 });
+      ['quiesced', () => (reserveEffect = () => jest.spyOn(p(), 'isQuiesced').mockReturnValue(true))],
+      ['busy', () => (reserveEffect = () => p().gitReserved.add(appName))],
+      ['group busy', () => (reserveEffect = () => jest.spyOn(p(), 'isGroupBusy').mockReturnValue(true))],
+      ['gone', () => (reserveEffect = () => (appState = undefined))],
+      ['stopped', () => (reserveEffect = () => (appState = { ...appState, status: 'stopped' }))],
+      [
+        'disk',
+        () =>
+          (hasEnoughDisk as jest.Mock)
+            .mockResolvedValueOnce({ ok: true, freeMb: 999999 })
+            .mockResolvedValue({ ok: false, freeMb: 1 }),
+      ],
+      [
+        'guardrail',
+        () => jest.spyOn(p(), 'checkGuardrails').mockReturnValue({ allowed: false, failures: 3, retryAfterSeconds: 9 }),
+      ],
+    ])('a %s refusal after the wait closes the episode under the SAME id', async (_reason, setup) => {
       setup();
-      const out = await p().startExplicitUpdate(hold, admitted);
-      expect(out.refused.code).toBe(code);
-      expect(p().appsInProgress.has(appName)).toBe(false);
-      expect(p().holdOwners.has(appName)).toBe(false);
-      expect(p().breakerKeys.has(appName)).toBe(false);
-      expect(p().builder.build).not.toHaveBeenCalled();
-    });
+      const out = await p().redeployApp(appName, actor);
+      expect(out.started).toMatch(UUID);
+      await settle();
 
-    it('maps a breaker that tripped while it waited to RATE_LIMITED with the retry hint', async () => {
-      const { hold, admitted } = await p().admitExplicitUpdate(appName, actor);
-      jest.spyOn(p(), 'checkGuardrails').mockReturnValue({ allowed: false, failures: 3, retryAfterSeconds: 9 });
-      const out = await p().startExplicitUpdate(hold, admitted);
-      expect(out.refused).toMatchObject({ code: 'RATE_LIMITED', retryAfterSeconds: 9 });
+      const episode = episodeOf(out.started);
+      expect(episode).toBeDefined();
+      expect(episode!.status).toBe('failed');
+      expect(episode!.trigger).toBe('deploy');
+      expect(p().builder.build).not.toHaveBeenCalled();
+      expect(p().queuedDeploys.size).toBe(0);
+      expect(p().holdOwners.has(appName)).toBe(false);
       expect(p().appsInProgress.has(appName)).toBe(false);
+      expect(p().breakerKeys.has(appName)).toBe(false);
+      // Not charged: a refusal is not a failed build.
+      const [{ key }] = p().guardrailKeys(appName, false, actor);
+      expect(getDeployBreaker().peek(key).failures).toBe(0);
     });
 
     it('a pre-build failure carries the trigger on its episode', async () => {
       detectThrows = new Error('detect blew up');
-      const { hold, admitted } = await p().admitExplicitUpdate(appName, actor);
-      const out = await p().startExplicitUpdate(hold, admitted);
+      const out = await p().redeployApp(appName, actor);
       await settle();
-      const [episode] = getDeployTracker().getEpisodes(appName, 1);
-      expect(episode.deployId).toBe(out.started);
-      expect(episode.trigger).toBe('deploy');
-      expect(episode.status).toBe('failed');
+      const episode = episodeOf(out.started);
+      expect(episode!.trigger).toBe('deploy');
+      expect(episode!.status).toBe('failed');
       expect(p().appsInProgress.has(appName)).toBe(false);
     });
 
@@ -441,21 +531,80 @@ describe('explicit redeploy: hold, admission, start', () => {
         if (status === 'errored') throw new Error('state store down');
       });
       const logged = jest.spyOn(p().logger, 'error').mockImplementation(() => undefined);
-      const { hold, admitted } = await p().admitExplicitUpdate(appName, actor);
-      const out = await p().startExplicitUpdate(hold, admitted);
+      const out = await p().redeployApp(appName, actor);
       expect(out.started).toMatch(UUID);
       await settle();
-      for (let i = 0; i < 100 && logged.mock.calls.length === 0; i++) await new Promise((r) => setTimeout(r, 10));
+      for (let i = 0; i < 100 && logged.mock.calls.length === 0; i++) await tick();
       expect(logged).toHaveBeenCalledTimes(1);
       expect(p().appsInProgress.has(appName)).toBe(false);
     });
 
-    it('a slot wait that throws gives the claim back and surfaces', async () => {
+    it('a slot wait that throws is reported under the id handed out, and everything is given back', async () => {
       p().builder.reserveSlot.mockRejectedValue(new Error('slot wait blew up'));
-      const { hold, admitted } = await p().admitExplicitUpdate(appName, actor);
-      await expect(p().startExplicitUpdate(hold, admitted)).rejects.toThrow('slot wait blew up');
-      expect(p().appsInProgress.has(appName)).toBe(false);
-      expect(p().holdOwners.has(appName)).toBe(false);
+      const logged = jest.spyOn(p().logger, 'error').mockImplementation(() => undefined);
+      const out = await p().redeployApp(appName, actor);
+      expect(out.started).toMatch(UUID);
+      await settle();
+      expect(episodeOf(out.started)!.status).toBe('failed');
+      expect(logged).toHaveBeenCalledTimes(1);
+      expectNothingHeld();
+    });
+  });
+
+  describe('redeployApp: prepare', () => {
+    it('maps a refusal thrown by prepare, releasing the hold and never setting the keys', async () => {
+      let keysDuring: boolean | undefined;
+      const out = await p().redeployApp(appName, actor, async () => {
+        keysDuring = p().breakerKeys.has(appName);
+        throw new RedeployRefusedError({ code: 'APP_BUSY', message: 'the clone is still running' });
+      });
+      expect(out.refused).toEqual({ code: 'APP_BUSY', message: 'the clone is still running' });
+      expect(keysDuring).toBe(false);
+      expectNothingHeld();
+      expect(p().queuedDeploys.size).toBe(0);
+      expect(p().builder.build).not.toHaveBeenCalled();
+    });
+
+    it('releases the hold and rethrows when prepare fails some other way', async () => {
+      await expect(
+        p().redeployApp(appName, actor, async () => {
+          throw new Error('disk fell over');
+        })
+      ).rejects.toThrow('disk fell over');
+      expectNothingHeld();
+    });
+
+    it('lets prepare mark its land, and the build is not refused as busy for it', async () => {
+      const out = await p().redeployApp(appName, actor, async (hold: any) => {
+        expect(hold.app).toBe(appName);
+        hold.beginLand();
+        expect(p().gitReserved.has(appName)).toBe(true);
+        // It cannot release or consume the reservation.
+        expect(hold.release).toBeUndefined();
+        expect(hold.consume).toBeUndefined();
+      });
+      expect(out.started).toMatch(UUID);
+      await settle();
+      expect(buildCtxs).toHaveLength(1);
+      expectNothingHeld();
+    });
+
+    it('re-checks what the folder is after prepare: a group answers {group}, releasing everything', async () => {
+      const out = await p().redeployApp(appName, actor, async () => {
+        fs.writeFileSync(path.join(appPath, 'drop.yaml'), 'services:\n  web:\n    path: web\n    type: static\n');
+      });
+      expect(out).toEqual({ group: { container: appName } });
+      expectNothingHeld();
+      expect(p().queuedDeploys.size).toBe(0);
+      expect(p().builder.build).not.toHaveBeenCalled();
+    });
+
+    it('answers NOT_FOUND when prepare left no app behind', async () => {
+      const out = await p().redeployApp(appName, actor, async () => {
+        appState = undefined;
+      });
+      expect(out.refused.code).toBe('NOT_FOUND');
+      expectNothingHeld();
     });
   });
 });

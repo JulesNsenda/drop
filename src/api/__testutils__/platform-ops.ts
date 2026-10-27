@@ -22,7 +22,6 @@ import type {
   PlatformOps,
   AttachServiceResult,
   DetachServiceResult,
-  RedeployAdmission,
   RedeployStart,
 } from '../platform-ops';
 import type { AccessGateVerdict } from '../../managers/guardrail/access-gate';
@@ -54,11 +53,9 @@ export function makePlatformOpsStub(overrides?: Partial<PlatformOps>): PlatformO
     promoteApp: jest.fn().mockResolvedValue(undefined),
     rollbackApp: jest.fn(),
     describeRollback: jest.fn().mockResolvedValue(null),
-    admitExplicitUpdate: jest.fn().mockResolvedValue({
-      hold: { app: 'stub', release: jest.fn(), consume: jest.fn().mockReturnValue(() => undefined) },
-      admitted: {},
-    } satisfies RedeployAdmission),
-    startExplicitUpdate: jest.fn().mockResolvedValue({ started: 'stub-deploy-id' } satisfies RedeployStart),
+    redeployApp: jest.fn().mockResolvedValue({ started: 'stub-deploy-id' } satisfies RedeployStart),
+    getQueuedDeploy: jest.fn().mockReturnValue(undefined),
+    isGroupBusy: jest.fn().mockReturnValue(false),
     removeGroup: jest.fn().mockResolvedValue({ removed: [] }),
     purgeAppArtifacts: jest.fn().mockResolvedValue(undefined),
     reconfigureRoute: jest.fn().mockResolvedValue(undefined),
