@@ -32,6 +32,7 @@ import {
   gitRedeploy,
   getGitTokens,
   GitTokenInfo,
+  gitTokenOwnerLabel,
 } from '../hooks/useApi';
 import { describeDeleteBucketWarning } from '../components/attach-state';
 import { getAuthHeaders, useAuth } from '../hooks/useAuth';
@@ -461,6 +462,7 @@ function AppDetailPage() {
                   {gitTokens.map(t => (
                     <option key={t.id} value={t.id}>
                       Use token: {t.name}
+                      {isAdmin ? ` (${gitTokenOwnerLabel(t)})` : ''}
                     </option>
                   ))}
                   <option value={CREDENTIAL_CLEAR}>Clear stored credential</option>

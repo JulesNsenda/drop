@@ -174,8 +174,17 @@ export class SecretManager {
     }
   }
 
-  private async saveStore(store: SecretStore): Promise<void> {
-    await writeJsonAtomic(this.config.storePath, store, { mode: 0o600 });
+  // Writes are chained so they hit the disk, and rename into place, in the
+  // order they were requested; two overlapping saves could otherwise finish
+  // out of order and leave the older snapshot as the file. Each write
+  // serializes the store as it is WHEN IT RUNS, so the last one always
+  // carries every earlier change.
+  private writeChain: Promise<unknown> = Promise.resolve();
+
+  private saveStore(store: SecretStore): Promise<void> {
+    const run = this.writeChain.then(() => writeJsonAtomic(this.config.storePath, store, { mode: 0o600 }));
+    this.writeChain = run.catch(() => undefined);
+    return run;
   }
 
   /**

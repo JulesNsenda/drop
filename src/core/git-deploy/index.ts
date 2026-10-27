@@ -7,6 +7,7 @@
 export {
   GitDeployService,
   getGitDeployService,
+  getGitDeployServiceOrNull,
   resetGitDeployService,
   gitCheckoutCaps,
   PlatformNotReadyError,
@@ -25,5 +26,6 @@ export type {
   GitDeployResult,
   GitTokenInfo,
   GitTokenCreateRequest,
+  TokenCaller,
   GitCloneOptions,
 } from './git-deploy.types';

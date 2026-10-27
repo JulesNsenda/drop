@@ -32,6 +32,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Hardened how git-deployed apps are updated: a redeploy now downloads a fresh shallow copy into a private platform folder and copies the repository's files into the app, instead of running git inside the app's own folder. The copy is size- and entry-limited like an upload, refuses to write through links, and records which files it wrote so it only ever deletes those.
 - Hostnames under the platform's own public host can no longer be claimed as an app's custom domain.
 
+- **Stored git tokens are now scoped to the user who added them.** Listing,
+  deleting, and choosing a token for a git deploy or redeploy are limited to its
+  owner, and an administrator can manage any token. A token that is not yours
+  answers exactly like one that does not exist. Storing, deleting and
+  reassigning tokens needs a signed-in session, not an API key. Tokens added
+  before this change have no recorded owner, so they are administrator-only to
+  list, delete, or newly attach until an administrator assigns one with
+  `PUT /api/v1/git/tokens/:id/owner`; apps already attached to one keep using
+  it for redeploys, including webhook redeploys. Assigning an owner grants
+  nothing by itself: if apps with a different owner are attached to the token,
+  the request is refused (409) with their names, and `keepAttached` lists the
+  ones that should keep pulling with it. Those are marked as granted by the
+  administrator who assigned the owner; the others stop, and the response and
+  server log say which. A token an app already has follows its
+  owner: if the app changes hands, a token owned by someone else stops being
+  used for it, unless an administrator attached it on purpose; that grant is
+  recorded on the app and counts only for the owner it was made for. Choosing
+  another user's token needs an administrator in a signed-in session, not an
+  API key.
+- **Deleting an account now also deletes the git tokens it added.** Any app
+  that had one attached fails its next pull with the ordinary
+  "GitHub token ... not found" error until a new token is attached.
+
+
 ### Upgrading
 
 - Git-deployed apps no longer have a `.git` folder in their app directory (an existing one is removed on the first redeploy). Builds that read git metadata, such as `git describe`, can use the `DROP_GIT_COMMIT` environment variable, which holds the deployed commit.
@@ -56,6 +80,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   attaching object storage). That includes `AWS_REGION` and `AWS_PROFILE`: an
   app that relied on picking AWS settings up from the host's environment must
   set them as secrets. Container isolation was never affected.
+- On servers with several accounts, review which apps have a stored token
+  attached (admins: see the boot log and the token list) and rotate any personal
+  access token you did not expect to be in use. Tokens stored before this
+  release are admin-managed until an admin assigns an owner. At boot, one
+  warning line names each app (and token id, never the value) whose attached
+  token has no owner and whose owner is not an admin.
 
 ### Added
 

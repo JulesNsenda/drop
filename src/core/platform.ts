@@ -2109,8 +2109,13 @@ backup:
       ...gitCheckoutCaps(this.config.maxUploadUnpackedMb),
       sweepCloneBase: true,
       resumeQueue: true,
+      credentialsPath: this.credentialsStorePath(),
     });
     await this.gitDeployService.initialize();
+    // Surface grandfathered (ownerless) git tokens still in use by non-admin apps.
+    await this.gitDeployService
+      .auditLegacyAttachments()
+      .catch((err) => this.logger.warn(`Git token audit failed: ${err instanceof Error ? err.message : err}`, 'GIT-DEPLOY'));
 
     // Initialize upload deploy service (PRD-039). Staging lives under
     // data/temp — same root as getBuildWorkDir, well outside the watched

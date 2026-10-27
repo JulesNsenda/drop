@@ -197,6 +197,8 @@ function toAppDto(app: AppState, isAdmin = false): AppDto {
           ...app.gitSource,
           repoUrl: sanitizeRepoUrl(app.gitSource.repoUrl),
           tokenId: isAdmin ? app.gitSource.tokenId : undefined,
+          tokenGrantedBy: isAdmin ? app.gitSource.tokenGrantedBy : undefined,
+          tokenGrantedFor: isAdmin ? app.gitSource.tokenGrantedFor : undefined,
         }
       : app.gitSource,
     userId: app.userId,

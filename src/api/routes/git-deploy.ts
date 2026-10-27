@@ -13,8 +13,8 @@ import { getGitDeployService } from '../../core/git-deploy';
 import { AppInProgressError } from '../platform-ops';
 import { getStateManager } from '../../managers/app/state-manager';
 import { getSettingsManager } from '../../managers/settings/settings-manager';
-import { getUserById } from '../middleware/auth';
-import { canAccess } from '../access';
+import { getUserById, isAuthEnabled } from '../middleware/auth';
+import { canAccess, interactiveSessionOnly, tokenCallerOf } from '../access';
 import { logActivityFor } from '../../managers/activity';
 import { DeployRefusedError } from '../../managers/guardrail/deploy-breaker';
 import { QuotaExceededError } from '../../managers/guardrail/principal-quota';
@@ -22,6 +22,18 @@ import type { GitDeployRequest, GitTokenCreateRequest } from '../../core/git-dep
 import { GIT_TOKEN_ID_RE } from '../../core/git-deploy/git-deploy.types';
 
 const gitDeploy = new Hono();
+
+/**
+ * Managing stored credentials is a human act: an API key or OAuth token (a CI
+ * job, a deployed app, an agent) must not mint, delete or reassign them. With
+ * auth disabled by configuration there is no session to demand, so the gate
+ * stands down there only.
+ */
+function humanOnly(auth: AuthContext | undefined, action: string): string | null {
+  if (!auth && !isAuthEnabled()) return null;
+  const gate = interactiveSessionOnly(auth, action);
+  return gate.ok ? null : gate.message;
+}
 
 /** Minimal shape of the GitHub push payload we consume. */
 interface GitHubPushPayload {
@@ -89,7 +101,24 @@ gitDeploy.post('/deploy', async (c) => {
     body.agentCaller = auth?.kind === 'agent';
     body.callerIsAdmin = auth?.role === 'admin';
 
-    const result = await service.deploy(body);
+    // null and "" mean "no token", the same as leaving it out.
+    if ((body.tokenId as unknown) === null || body.tokenId === '') delete body.tokenId;
+    // The token is chosen by id, and WHO may choose it comes from the
+    // credential alone (see tokenCallerOf), as its own argument.
+    if (body.tokenId !== undefined && (typeof body.tokenId !== 'string' || !GIT_TOKEN_ID_RE.test(body.tokenId))) {
+      // Returned, not thrown: this sits inside the try below, whose catch
+      // would turn a ValidationError into a 500.
+      return c.json(
+        error(ErrorCodes.VALIDATION_ERROR, `tokenId must be a string matching ${GIT_TOKEN_ID_RE}`),
+        400
+      );
+    }
+    const tokenCaller = tokenCallerOf(auth);
+    if (!tokenCaller) {
+      return c.json(error(ErrorCodes.UNAUTHORIZED, 'Authentication required'), 401);
+    }
+
+    const result = await service.deploy(body, tokenCaller);
     await logActivityFor(auth, { action: 'git-deploy', appName: result.appName, detail: result.repoUrl });
     return c.json(success(result), 201);
   } catch (err) {
@@ -101,6 +130,11 @@ gitDeploy.post('/deploy', async (c) => {
       return c.json(error(ErrorCodes.CONFLICT, err.message), 409);
     }
     const message = err instanceof Error ? err.message : 'Deploy failed';
+    // A token id the caller supplied that resolves to nothing for them: their
+    // input, the same answer /redeploy gives.
+    if (message.startsWith('GitHub token ')) {
+      return c.json(error(ErrorCodes.VALIDATION_ERROR, message), 400);
+    }
     if (message.includes('already exists')) {
       return c.json(error(ErrorCodes.CONFLICT, message), 409);
     }
@@ -174,6 +208,11 @@ gitDeploy.post('/redeploy/:name', async (c) => {
     }
   }
 
+  const tokenCaller = tokenCallerOf(auth);
+  if (!tokenCaller) {
+    return c.json(error(ErrorCodes.UNAUTHORIZED, 'Authentication required'), 401);
+  }
+
   try {
     // Persist to target.name, the RESOLVED app, never c.req.param('name') —
     // registerApp spreads ...existing, so a gitSource written to a monorepo
@@ -182,7 +221,7 @@ gitDeploy.post('/redeploy/:name', async (c) => {
       principalId: auth?.principalId,
       userId: auth?.userId,
       tokenId,
-    });
+    }, tokenCaller);
     // A redeploy that changed the app's credential is a credential-scope
     // change to a tenant app — on a monorepo group it also re-credentials
     // every future unattended webhook redeploy of the whole group — so it must
@@ -301,7 +340,7 @@ gitDeploy.post('/webhook', async (c) => {
       // No caller: the webhook is unattended. Marked as automation rather than
       // left principal-less so a looping webhook gets its own guardrail bucket
       // instead of consuming the app owner's.
-      await service.redeploy(appName, { automation: 'webhook' });
+      await service.redeploy(appName, { automation: 'webhook' }, null);
       // Webhook auto-redeploys are unattended and had no audit trail — record
       // them (system action, no user). The API /git/redeploy route logs its
       // own; this webhook path is distinct, so there is no double-count.
@@ -334,13 +373,20 @@ gitDeploy.post('/webhook', async (c) => {
 
 // GET /git/tokens - List stored GitHub tokens (no values)
 gitDeploy.get('/tokens', async (c) => {
+  const auth = (c.get as Function)('auth') as AuthContext | undefined;
+  const caller = tokenCallerOf(auth);
+  if (!caller) return c.json(error(ErrorCodes.UNAUTHORIZED, 'Authentication required'), 401);
   const service = getGitDeployService();
-  const tokens = service.listTokens();
+  const tokens = service.listTokens(caller);
   return c.json(success(tokens, { total: tokens.length }));
 });
 
 // POST /git/tokens - Store a new GitHub PAT
 gitDeploy.post('/tokens', async (c) => {
+  const auth = (c.get as Function)('auth') as AuthContext | undefined;
+  const refusal = humanOnly(auth, 'Storing a git token');
+  if (refusal) return c.json(error(ErrorCodes.UNAUTHORIZED, refusal), 403);
+
   const body = await c.req.json<GitTokenCreateRequest>();
 
   if (!body.name || !body.token) {
@@ -348,21 +394,83 @@ gitDeploy.post('/tokens', async (c) => {
   }
 
   const service = getGitDeployService();
-  const tokenInfo = await service.setToken(body.name, body.token);
+  const tokenInfo = await service.setToken(body.name, body.token, auth?.userId);
   return c.json(success(tokenInfo), 201);
 });
 
 // DELETE /git/tokens/:id - Remove a stored token
 gitDeploy.delete('/tokens/:id', async (c) => {
   const id = c.req.param('id');
+  const auth = (c.get as Function)('auth') as AuthContext | undefined;
+  const refusal = humanOnly(auth, 'Deleting a git token');
+  if (refusal) return c.json(error(ErrorCodes.UNAUTHORIZED, refusal), 403);
+  const caller = tokenCallerOf(auth);
+  if (!caller) return c.json(error(ErrorCodes.UNAUTHORIZED, 'Authentication required'), 401);
   const service = getGitDeployService();
-  const deleted = await service.removeToken(id);
+  // A token that is not the caller's answers exactly like an unknown id.
+  const deleted = await service.removeToken(id, caller);
 
   if (!deleted) {
     return c.json(error(ErrorCodes.NOT_FOUND, `Token '${id}' not found`), 404);
   }
 
   return c.json(success({ message: 'Token deleted' }));
+});
+
+// PUT /git/tokens/:id/owner - Assign the owner of a token (admin; the way out of "legacy")
+gitDeploy.put('/tokens/:id/owner', async (c) => {
+  const id = c.req.param('id');
+  const auth = (c.get as Function)('auth') as AuthContext | undefined;
+  const refusal = humanOnly(auth, 'Assigning a git token owner');
+  if (refusal) return c.json(error(ErrorCodes.UNAUTHORIZED, refusal), 403);
+  // The route floor (authMiddleware('admin'), registered in server.ts) already
+  // refuses a non-admin; checked again here so the rule does not depend on
+  // that registration alone.
+  if (auth && auth.role !== 'admin') {
+    return c.json(error(ErrorCodes.UNAUTHORIZED, 'Admin access required'), 403);
+  }
+
+  const body = await c.req
+    .json<{ userId?: unknown; keepAttached?: unknown }>()
+    .catch(() => ({}) as { userId?: unknown; keepAttached?: unknown });
+  if (typeof body.userId !== 'string' || !body.userId) {
+    throw new ValidationError('userId is required');
+  }
+  if (
+    body.keepAttached !== undefined &&
+    (!Array.isArray(body.keepAttached) || !body.keepAttached.every((n) => typeof n === 'string'))
+  ) {
+    throw new ValidationError('keepAttached must be an array of app names');
+  }
+  if (!getUserById(body.userId)) {
+    return c.json(error(ErrorCodes.NOT_FOUND, 'User not found'), 404);
+  }
+
+  const result = await getGitDeployService().setTokenOwner(
+    id,
+    body.userId,
+    auth?.userId ?? 'admin',
+    body.keepAttached as string[] | undefined
+  );
+  if (result.status === 'unknown-token') {
+    return c.json(error(ErrorCodes.NOT_FOUND, `Token '${id}' not found`), 404);
+  }
+  if (result.status === 'needs-decision') {
+    // Nothing was changed. Name the apps so the admin can list the ones to keep.
+    return c.json(
+      {
+        ...error(
+          ErrorCodes.CONFLICT,
+          'Apps are attached to this token under another owner. Resend with keepAttached listing the apps that should keep pulling with it; any app not listed will stop.'
+        ),
+        apps: result.apps,
+      },
+      409
+    );
+  }
+  return c.json(
+    success({ message: 'Token owner updated', keptAttached: result.granted, willFail: result.failing })
+  );
 });
 
 export default gitDeploy;
