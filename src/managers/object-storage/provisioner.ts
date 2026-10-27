@@ -39,7 +39,20 @@ const DEFAULT_DROP_ROOT = isWindows ? 'C:\\drop' : '/var/drop';
 /** AWS region codes: `us-east-1`, `eu-central-1`, `ap-southeast-2`, `us-gov-west-1`… */
 export const AWS_REGION_RE = /^[a-z]{2}(?:-gov)?-[a-z]+-\d$/;
 
-export type StorageUnavailableReason = 'disabled' | 'not-configured' | 'no-credential';
+export type StorageUnavailableReason =
+  | 'disabled'
+  | 'not-configured'
+  | 'no-credential'
+  /** Tenant code runs on the host, beside the platform that holds the AWS admin key. */
+  | 'isolation'
+  /** No API auth: every route that can spend the operator's money would be open. */
+  | 'auth-disabled';
+
+/** What the platform is running as — facts the provisioner cannot know for itself. */
+export interface StorageEnvironment {
+  isolation: 'none' | 'docker';
+  authEnabled: boolean;
+}
 
 export type StorageAvailability =
   | { available: true; region: string; bucketPrefix: string }
@@ -99,6 +112,13 @@ function sameIncarnation(record: AppStorageAllocation, incarnation: AppIncarnati
 export interface ObjectStorageProvisionerOptions {
   allocations?: AllocationStore;
   credentials?: StorageCredentialStore;
+  /**
+   * The platform's isolation mode and auth state, read at call time. Absent
+   * means unknown, which is treated as the unsafe answer (no isolation, no
+   * auth): a provisioner nobody told about its environment refuses to create
+   * anything.
+   */
+  environment?: () => StorageEnvironment;
   /** Injected in tests; AWS in production. */
   providerFactory?: (config: AwsProviderConfig) => ObjectStorageProvider;
 }
@@ -107,12 +127,14 @@ export class ObjectStorageProvisioner {
   private readonly allocations: AllocationStore;
   private readonly credentials: StorageCredentialStore;
   private readonly providerFactory: (config: AwsProviderConfig) => ObjectStorageProvider;
+  private readonly environment: () => StorageEnvironment;
 
   constructor(options: ObjectStorageProvisionerOptions = {}) {
     const dir = path.join(process.env.DROP_ROOT || DEFAULT_DROP_ROOT, 'data', 'drop-svc');
     this.allocations =
       options.allocations ??
       new AllocationStore(path.join(dir, 'object-storage.json'), path.join(dir, 'encryption.key'));
+    this.environment = options.environment ?? (() => ({ isolation: 'none', authEnabled: false }));
     this.credentials = options.credentials ?? getStorageCredentialStore();
     this.providerFactory =
       options.providerFactory ??
@@ -121,6 +143,24 @@ export class ObjectStorageProvisioner {
 
   /** Whether an app could be given storage right now, and if not, why. */
   async availability(): Promise<StorageAvailability> {
+    // Platform facts first: they are not the operator's to fix from the
+    // settings page, and they outrank every setting.
+    const environment = this.environment();
+    if (environment.isolation !== 'docker') {
+      return {
+        available: false,
+        reason: 'isolation',
+        detail:
+          'Object storage needs container isolation (DROP_ISOLATION=docker). Without it, tenant apps run on the same host as the AWS admin key this feature holds.',
+      };
+    }
+    if (!environment.authEnabled) {
+      return {
+        available: false,
+        reason: 'auth-disabled',
+        detail: 'Object storage is unavailable while API authentication is disabled.',
+      };
+    }
     const settings = getSettingsManager().getObjectStorageSettings();
     if (!settings.enabled) {
       return { available: false, reason: 'disabled', detail: 'Object storage is not enabled on this platform.' };
@@ -475,7 +515,10 @@ export function resetObjectStorageProvisioner(): void {
  * Resets first, for the same reason the guest stores do: whatever bound the
  * singletons before boot held nothing worth keeping.
  */
-export function configureObjectStorage(dropRoot: string): ObjectStorageProvisioner {
+export function configureObjectStorage(
+  dropRoot: string,
+  environment: () => StorageEnvironment
+): ObjectStorageProvisioner {
   const dir = path.join(dropRoot, 'data', 'drop-svc');
   const keyFilePath = path.join(dir, 'encryption.key');
   resetStorageCredentialStore();
@@ -486,6 +529,7 @@ export function configureObjectStorage(dropRoot: string): ObjectStorageProvision
   });
   return getObjectStorageProvisioner({
     credentials,
+    environment,
     allocations: new AllocationStore(path.join(dir, 'object-storage.json'), keyFilePath),
   });
 }

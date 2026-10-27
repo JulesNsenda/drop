@@ -35,8 +35,9 @@ describe('object storage stores and provisioner', () => {
   let factory: jest.Mock;
   const savedEnv = { ...process.env };
 
+  let environment: { isolation: 'none' | 'docker'; authEnabled: boolean };
   const makeProvisioner = () =>
-    new ObjectStorageProvisioner({ allocations, credentials, providerFactory: factory });
+    new ObjectStorageProvisioner({ allocations, credentials, providerFactory: factory, environment: () => environment });
 
   async function configure(): Promise<void> {
     await getSettingsManager().setObjectStorageSettings({ enabled: true, region: 'eu-central-1', bucketPrefix: 'dropkit' });
@@ -44,6 +45,7 @@ describe('object storage stores and provisioner', () => {
   }
 
   beforeEach(async () => {
+    environment = { isolation: 'docker', authEnabled: true };
     // The provisioner logs loudly on a failed undo/revoke; the tests provoke that on purpose.
     jest.spyOn(console, 'error').mockImplementation();
     jest.spyOn(console, 'warn').mockImplementation();
@@ -91,7 +93,7 @@ describe('object storage stores and provisioner', () => {
 
       // A singleton already bound elsewhere (any earlier caller) is replaced.
       getObjectStorageProvisioner();
-      const configured = configureObjectStorage(root);
+      const configured = configureObjectStorage(root, () => ({ isolation: 'docker', authEnabled: true }));
 
       expect(getObjectStorageProvisioner()).toBe(configured);
       await getStorageCredentialStore().set({ accessKeyId: 'AKIA', secretAccessKey: 's' });
@@ -182,6 +184,43 @@ describe('object storage stores and provisioner', () => {
 
       await credentials.set({ accessKeyId: 'AKIAADMIN0000000', secretAccessKey: 'admin-secret-value' });
       expect(await p.availability()).toEqual({ available: true, region: 'eu-central-1', bucketPrefix: 'dropkit' });
+    });
+
+    describe('platform environment', () => {
+      it('is unavailable under isolation none, however well it is configured', async () => {
+        await configure();
+        environment = { isolation: 'none', authEnabled: true };
+        const p = makeProvisioner();
+
+        expect(await p.availability()).toEqual(expect.objectContaining({ available: false, reason: 'isolation' }));
+        await expect(p.provisionAppStorage('site')).rejects.toBeInstanceOf(ObjectStorageUnavailableError);
+        expect(factory).not.toHaveBeenCalled();
+      });
+
+      it('is unavailable while API auth is disabled', async () => {
+        await configure();
+        environment = { isolation: 'docker', authEnabled: false };
+
+        expect(await makeProvisioner().availability()).toEqual(
+          expect.objectContaining({ available: false, reason: 'auth-disabled' })
+        );
+      });
+
+      it('refuses by default when nothing told it about its environment (fail closed)', async () => {
+        await configure();
+        const p = new ObjectStorageProvisioner({ allocations, credentials, providerFactory: factory });
+        expect(await p.availability()).toEqual(expect.objectContaining({ available: false, reason: 'isolation' }));
+      });
+
+      it('can still tear down what exists after the platform stops qualifying', async () => {
+        await configure();
+        const p = makeProvisioner();
+        await p.provisionAppStorage('site');
+        environment = { isolation: 'none', authEnabled: false };
+
+        expect(await p.canDeprovision()).toBe(true);
+        expect(await p.deprovisionAppStorage('site')).toEqual(expect.objectContaining({ bucketDeleted: true }));
+      });
     });
 
     it('refuses to provision while unavailable, creating nothing', async () => {

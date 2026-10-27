@@ -73,6 +73,7 @@ import {
   ObjectStorageDetachIncompleteError,
   ObjectStorageIncarnationError,
   ObjectStorageUnavailableError,
+  blankInheritedAdminEnv,
   configureObjectStorage,
   resetObjectStorageProvisioner,
   resetStorageCredentialStore,
@@ -1151,7 +1152,14 @@ export class DropPlatform {
       // Left to their defaults they resolve DROP_ROOT from the environment,
       // which a `--root` boot (or a test platform) does not set, and the
       // admin routes would then read a different store from the platform's.
-      this.objectStorage = configureObjectStorage(this.config.dropRoot);
+      // The provisioner is told what this platform is, rather than reading
+      // the environment itself: object storage holds the operator's AWS admin
+      // key, so it is available only under container isolation and with API
+      // auth on (read live, so a config reload cannot leave it stale).
+      this.objectStorage = configureObjectStorage(this.config.dropRoot, () => ({
+        isolation: this.config.isolation === 'docker' ? 'docker' : 'none',
+        authEnabled: this.config.enableApiAuth,
+      }));
 
       // Initialize services
       await this.initializeServices();
@@ -10815,6 +10823,15 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       ...platformEnv,
       ...safeDepEnvVars,
     };
+
+    // Defence in depth for object storage (#301): a PM2 app inherits the
+    // platform's own environment, which is where the AWS admin key
+    // (DROP_S3_ADMIN_* / AWS_*) lives. Override whatever it would inherit with
+    // an empty value; a container gets only what is listed here, so it needs
+    // nothing. Everything the app was deliberately given is left alone.
+    if (this.config.isolation !== 'docker') {
+      Object.assign(env, blankInheritedAdminEnv(process.env, env));
+    }
 
     // Secret preflight — gate (PRD-051). A declared-required secret that is
     // neither auto-generated above nor present (non-empty) in the assembled

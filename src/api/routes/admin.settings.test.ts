@@ -273,6 +273,7 @@ describe('admin settings routes (PRD-041)', () => {
     resetStorageCredentialStore();
     resetObjectStorageProvisioner();
     getObjectStorageProvisioner({
+      environment: () => ({ isolation: 'docker', authEnabled: true }),
       allocations: new AllocationStore(path.join(tempDir, 'object-storage.json'), path.join(tempDir, 'encryption.key')),
       credentials: getStorageCredentialStore({
         credentialFilePath: path.join(tempDir, 'object-storage-credential.json'),

@@ -431,6 +431,55 @@ describe('DropPlatform.restartApp', () => {
     expect(spec.env!.DROP_API_URL).toBe('http://127.0.0.1:4114');
   }, 20000);
 
+  // #301: a PM2 app inherits the platform's environment, which is where the
+  // AWS admin key lives. The spec must blank it — but only what the app was not
+  // deliberately given.
+  describe('AWS admin environment (#301)', () => {
+    const saved = { ...process.env };
+    afterEach(() => {
+      process.env = { ...saved };
+    });
+
+    it('blanks inherited DROP_S3_* and AWS_* under isolation none, but not what the app itself is given', async () => {
+      process.env.DROP_S3_ADMIN_ACCESS_KEY_ID = 'AKIAADMIN';
+      process.env.DROP_S3_ADMIN_SECRET_ACCESS_KEY = 'admin-secret';
+      process.env.AWS_ACCESS_KEY_ID = 'AKIAHOST';
+      process.env.AWS_PROFILE = 'host-profile';
+      platform = makePlatform({ isolation: 'none' });
+      await platform.start();
+      // The app's own secret wins over the blank.
+      const secretManager = (platform as unknown as { secretManager: { set: Function } }).secretManager;
+      await secretManager.set('site', 'AWS_ACCESS_KEY_ID', 'AKIAOWNED');
+      const appPath = await createStaticApp('site');
+      await deploy('site', appPath);
+
+      const startSpy = jest.spyOn(fakeRuntime, 'start');
+      await platform!.restartApp('site');
+
+      const spec = startSpy.mock.calls[startSpy.mock.calls.length - 1][0];
+      expect(spec.env!.DROP_S3_ADMIN_ACCESS_KEY_ID).toBe('');
+      expect(spec.env!.DROP_S3_ADMIN_SECRET_ACCESS_KEY).toBe('');
+      expect(spec.env!.AWS_PROFILE).toBe('');
+      expect(spec.env!.AWS_ACCESS_KEY_ID).toBe('AKIAOWNED');
+    }, 20000);
+
+    it('leaves a container spec alone: it only ever gets what is listed', async () => {
+      process.env.AWS_PROFILE = 'host-profile';
+      // Docker mode needs a real Caddy to boot; the branch under test reads only config.
+      platform = makePlatform({ isolation: 'none' });
+      await platform.start();
+      const appPath = await createStaticApp('site');
+      await deploy('site', appPath);
+      (platform as unknown as { config: { isolation: string } }).config.isolation = 'docker';
+
+      const startSpy = jest.spyOn(fakeRuntime, 'start');
+      await platform!.restartApp('site');
+
+      const spec = startSpy.mock.calls[startSpy.mock.calls.length - 1][0];
+      expect(spec.env).not.toHaveProperty('AWS_PROFILE');
+    }, 20000);
+  });
+
   // ── Redis ALLOCATES on the restart path; Postgres does not ────────────────
   //
   // Two comments in platform.ts used to claim buildFreshStartSpec does no new

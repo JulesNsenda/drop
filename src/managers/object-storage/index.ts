@@ -8,7 +8,13 @@ export {
   configureObjectStorage,
   AWS_REGION_RE,
 } from './provisioner';
-export type { AppIncarnation, StorageAvailability, StorageUnavailableReason } from './provisioner';
+export type {
+  AppIncarnation,
+  StorageAvailability,
+  StorageEnvironment,
+  StorageUnavailableReason,
+} from './provisioner';
+export { APP_OWNED_AWS_NAMES, blankInheritedAdminEnv } from './env-guard';
 export {
   StorageCredentialStore,
   getStorageCredentialStore,
