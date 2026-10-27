@@ -89,10 +89,10 @@ describe('POST /apps/:name/source (upload deploy)', () => {
     await server.initialize();
     hono = server.getApp();
 
-    const alice = await createUser('alice', 'password123', 'user');
+    const alice = await createUser({ username: 'alice', role: 'user', credential: { password: 'password123' } });
     aliceId = alice.id;
-    await createUser('bob', 'password123', 'user');
-    await createUser('sysadmin', 'password123', 'admin');
+    await createUser({ username: 'bob', role: 'user', credential: { password: 'password123' } });
+    await createUser({ username: 'sysadmin', role: 'admin', credential: { password: 'password123' } });
     aliceToken = await getTestToken('alice', 'password123');
     bobToken = await getTestToken('bob', 'password123');
     adminToken = await getTestToken('sysadmin', 'password123');

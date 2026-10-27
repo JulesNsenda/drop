@@ -68,12 +68,12 @@ describe('/app-access (DROP-152 the gate)', () => {
     });
     await getAppConfigService().upsertConfig(APP, { type: 'nodejs', port: 4000 });
 
-    const owner = await createUser('owner', 'password123', 'user');
+    const owner = await createUser({ username: 'owner', role: 'user', credential: { password: 'password123' } });
     ownerId = owner.id;
-    const allowed = await createUser('allowed', 'password123', 'user');
+    const allowed = await createUser({ username: 'allowed', role: 'user', credential: { password: 'password123' } });
     allowedId = allowed.id;
     allowedToken = await getTestToken('allowed', 'password123');
-    const outsider = await createUser('outsider', 'password123', 'user');
+    const outsider = await createUser({ username: 'outsider', role: 'user', credential: { password: 'password123' } });
     outsiderId = outsider.id;
     outsiderToken = await getTestToken('outsider', 'password123');
 

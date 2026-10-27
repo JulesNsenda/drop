@@ -50,7 +50,7 @@ describe('POST /apps rejects a name that collides with a reserved host (DROP-135
     // item 6).
     setPublicUrl('https://dashboard.dropkit.sh');
 
-    await createUser('root', 'password123', 'admin');
+    await createUser({ username: 'root', role: 'admin', credential: { password: 'password123' } });
     adminToken = await getTestToken('root', 'password123');
   });
 

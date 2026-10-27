@@ -84,7 +84,7 @@ describe('a role-gated DELETE does not reach the artifact purge', () => {
     await server.initialize();
     app = server.getApp();
 
-    const bob = await createUser('bob-purge', 'password123', 'user');
+    const bob = await createUser({ username: 'bob-purge', role: 'user', credential: { password: 'password123' } });
     bobId = bob.id;
 
     await getStateManager().registerApp('bobapp', path.join(tempDir, 'bobapp'), 'nodejs');

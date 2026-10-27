@@ -57,9 +57,9 @@ describe('POST /api/v1/auth/agent-tokens', () => {
     await server.initialize();
     app = server.getApp();
 
-    const alice = await createUser('alice', 'password123', 'user');
-    await createUser('bob', 'password123', 'user');
-    const root = await createUser('root', 'password123', 'admin');
+    const alice = await createUser({ username: 'alice', role: 'user', credential: { password: 'password123' } });
+    await createUser({ username: 'bob', role: 'user', credential: { password: 'password123' } });
+    const root = await createUser({ username: 'root', role: 'admin', credential: { password: 'password123' } });
     adminId = root.id;
     aliceId = alice.id;
     aliceToken = await getTestToken('alice', 'password123');

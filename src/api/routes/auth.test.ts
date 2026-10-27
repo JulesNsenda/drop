@@ -75,7 +75,7 @@ describe('Auth Routes', () => {
     });
 
     // Create test admin user
-    await createUser('testadmin', 'adminpass123', 'admin');
+    await createUser({ username: 'testadmin', role: 'admin', credential: { password: 'adminpass123' } });
 
     // Set up Hono app with auth routes
     app = new Hono();

@@ -53,9 +53,9 @@ describe('POST /apps/:name/promote', () => {
     await server.initialize();
     app = server.getApp();
 
-    const alice = await createUser('alice', 'password123', 'user');
-    await createUser('bob', 'password123', 'user');
-    await createUser('sysadmin', 'password123', 'admin');
+    const alice = await createUser({ username: 'alice', role: 'user', credential: { password: 'password123' } });
+    await createUser({ username: 'bob', role: 'user', credential: { password: 'password123' } });
+    await createUser({ username: 'sysadmin', role: 'admin', credential: { password: 'password123' } });
     aliceId = alice.id;
     aliceToken = await getTestToken('alice', 'password123');
     bobToken = await getTestToken('bob', 'password123');

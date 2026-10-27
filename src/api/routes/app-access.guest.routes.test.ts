@@ -95,9 +95,9 @@ describe('/app-access — the guest arm (DROP-155)', () => {
     getSettingsManager({ settingsFilePath: path.join(t.tempDir, 'settings.json') });
     await getSettingsManager().setGuestInvitesEnabled(true);
 
-    const owner = await createUser('owner', 'password123', 'user');
+    const owner = await createUser({ username: 'owner', role: 'user', credential: { password: 'password123' } });
     ownerId = owner.id;
-    const allowed = await createUser('allowed', 'password123', 'user');
+    const allowed = await createUser({ username: 'allowed', role: 'user', credential: { password: 'password123' } });
     allowedId = allowed.id;
 
     const sm = getStateManager();

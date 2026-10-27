@@ -37,7 +37,7 @@ describe('destructive /apps verbs reject a readonly token', () => {
     await server.initialize();
     app = server.getApp();
 
-    const bob = await createUser('bob', 'password123', 'user');
+    const bob = await createUser({ username: 'bob', role: 'user', credential: { password: 'password123' } });
     bobId = bob.id;
   });
 

@@ -55,7 +55,7 @@ describe('extension catalog routes (DROP-151 Phase 1)', () => {
     await server.initialize();
     app = server.getApp();
 
-    await createUser('alice', 'password123', 'user');
+    await createUser({ username: 'alice', role: 'user', credential: { password: 'password123' } });
     aliceToken = await getTestToken('alice', 'password123');
   });
 
@@ -85,7 +85,7 @@ describe('extension catalog routes (DROP-151 Phase 1)', () => {
     // `authMiddleware('user')` or `'admin'`. This is the one test that pins
     // the actual configured tier.
     it('admits a readonly-role viewer, not just user/admin', async () => {
-      await createUser('viewer', 'password123', 'readonly');
+      await createUser({ username: 'viewer', role: 'readonly', credential: { password: 'password123' } });
       const viewerToken = await getTestToken('viewer', 'password123');
 
       const res = await app.request('/api/v1/extensions', { headers: authHeader(viewerToken) });

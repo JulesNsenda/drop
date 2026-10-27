@@ -8,7 +8,15 @@ import { Hono } from 'hono';
 import * as crypto from 'crypto';
 import { success, error, ErrorCodes } from '../types';
 import { getActivityLog } from '../../managers/activity';
-import { suspendUser, updateUser, listUsers, isAuthEnabled, AuthContext } from '../middleware/auth';
+import {
+  suspendUser,
+  updateUser,
+  listUsers,
+  isAuthEnabled,
+  hasNoWorkingLoginMethod,
+  NO_LOGIN_METHOD_WARNING,
+  AuthContext,
+} from '../middleware/auth';
 import { getStateManager } from '../../managers/app/state-manager';
 import { getAppRuntime } from '../../managers/runtime';
 import { logActivityFor } from '../../managers/activity';
@@ -246,7 +254,9 @@ admin.post('/users/:id/unsuspend', async (c) => {
     detail: `Unsuspended user ${userId}`,
   });
 
-  return c.json(success({ suspended: false }));
+  // A passwordless account whose identities predate the suspension has no way in.
+  const warning = hasNoWorkingLoginMethod(userId) ? NO_LOGIN_METHOD_WARNING : undefined;
+  return c.json(success({ suspended: false, ...(warning ? { warning } : {}) }));
 });
 
 // GET /admin/quota - Platform-wide quota / resource summary (df-style)
