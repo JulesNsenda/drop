@@ -52,6 +52,40 @@ export function newResourceSuffix(): string {
   return randomBytes(4).toString('hex');
 }
 
+const SUFFIX_RE = /[0-9a-f]{8}$/;
+/** `<prefix>-<app>-<8 hex>`: S3-valid, dot-free, 3-63 characters. */
+const GENERATED_BUCKET_RE = /^[a-z0-9][a-z0-9-]*-[0-9a-f]{8}$/;
+/** `drop-<prefix>-<app>-<8 hex>`, at most 64 characters. */
+const GENERATED_USER_RE = /^drop-[a-z0-9][a-z0-9-]*-[A-Za-z0-9_-]+-[0-9a-f]{8}$/;
+
+/**
+ * Whether a bucket/user pair has the shape DROP itself generates, with the
+ * one shared suffix. Teardown acts on names read back from a file, and an
+ * empty user name is not a harmless no-op: IAM `ListAccessKeys` with no
+ * `UserName` lists the CALLER's keys — the admin credential's own — and the
+ * delete loop would then revoke them. Deliberately NOT tied to the current
+ * `bucketPrefix` setting: an operator who changes it must still be able to
+ * remove what the old prefix created.
+ */
+export function isGeneratedResourcePair(bucket: unknown, userName: unknown): boolean {
+  if (typeof bucket !== 'string' || typeof userName !== 'string') return false;
+  if (bucket.length < 3 || bucket.length > 63 || userName.length > 64) return false;
+  if (!GENERATED_BUCKET_RE.test(bucket) || !GENERATED_USER_RE.test(userName)) return false;
+  return bucket.match(SUFFIX_RE)?.[0] === userName.match(SUFFIX_RE)?.[0];
+}
+
+export class UnsafeResourceNameError extends Error {
+  constructor() {
+    super('Refusing to tear down a bucket or IAM user whose name is not one DROP generated');
+    this.name = 'UnsafeResourceNameError';
+  }
+}
+
+/** Throws UnsafeResourceNameError unless the pair has the shape DROP generates. */
+export function assertGeneratedResourcePair(bucket: unknown, userName: unknown): void {
+  if (!isGeneratedResourcePair(bucket, userName)) throw new UnsafeResourceNameError();
+}
+
 /** A policy granting object read/write/list on one bucket, and nothing else. */
 export function bucketOnlyPolicy(bucket: string): string {
   return JSON.stringify({

@@ -92,7 +92,23 @@ describe('AwsObjectStorageProvider.provision', () => {
   });
 });
 
+const BUCKET = 'dropkit-site-a1b2c3d4';
+const USER = 'drop-dropkit-site-a1b2c3d4';
+
 describe('AwsObjectStorageProvider.deprovision', () => {
+  it.each([
+    ['an empty user (IAM would list the CALLER keys)', { bucket: BUCKET, userName: '' }],
+    ['an empty bucket', { bucket: '', userName: USER }],
+    ['a name DROP did not generate', { bucket: 'someone-elses-bucket', userName: USER }],
+    ['a bucket and user with different suffixes', { bucket: BUCKET, userName: 'drop-dropkit-site-ffffffff' }],
+  ])('refuses %s, touching nothing', async (_label, input) => {
+    const { calls, clients } = fakeClients({});
+    await expect(new AwsObjectStorageProvider('eu-central-1', clients).deprovision(input)).rejects.toMatchObject({
+      name: 'UnsafeResourceNameError',
+    });
+    expect(calls).toEqual([]);
+  });
+
   it('revokes first, then empties every version and upload, then deletes the bucket', async () => {
     let page = 0;
     const { calls, clients } = fakeClients({
@@ -109,7 +125,7 @@ describe('AwsObjectStorageProvider.deprovision', () => {
       ListMultipartUploadsCommand: () => ({ Uploads: [{ Key: 'big', UploadId: 'u1' }] }),
     });
 
-    const result = await new AwsObjectStorageProvider('eu-central-1', clients).deprovision({ bucket: 'b', userName: 'u' });
+    const result = await new AwsObjectStorageProvider('eu-central-1', clients).deprovision({ bucket: BUCKET, userName: USER });
 
     expect(result).toEqual({ objectsDeleted: 1201, bucketDeleted: true, userDeleted: true });
     const names = calls.map((c) => c.command);
@@ -129,14 +145,14 @@ describe('AwsObjectStorageProvider.deprovision', () => {
     });
 
     await expect(
-      new AwsObjectStorageProvider('eu-central-1', clients).deprovision({ bucket: 'b', userName: 'u' })
+      new AwsObjectStorageProvider('eu-central-1', clients).deprovision({ bucket: BUCKET, userName: USER })
     ).resolves.toEqual({ objectsDeleted: 0, bucketDeleted: false, userDeleted: false });
   });
 
   it('surfaces any other failure', async () => {
     const { clients } = fakeClients({ ListAccessKeysCommand: gone('AccessDenied') });
     await expect(
-      new AwsObjectStorageProvider('eu-central-1', clients).deprovision({ bucket: 'b', userName: 'u' })
+      new AwsObjectStorageProvider('eu-central-1', clients).deprovision({ bucket: BUCKET, userName: USER })
     ).rejects.toMatchObject({ name: 'AccessDenied' });
   });
 });

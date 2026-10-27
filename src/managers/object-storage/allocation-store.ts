@@ -19,7 +19,16 @@ interface StoredAllocation extends AppStorageAllocation {
   secretAccessKey: EncryptedData;
 }
 
+/**
+ * Keyed by app name, which is tenant-chosen: a plain `{}` would resolve
+ * `constructor`, `toString` or `__proto__` to an inherited member and read it
+ * as an allocation. Always built on a null prototype and read via `own()`.
+ */
 type StoreFile = Record<string, StoredAllocation>;
+
+function own(file: StoreFile, key: string): StoredAllocation | undefined {
+  return Object.hasOwn(file, key) ? file[key] : undefined;
+}
 
 export class AllocationStoreCorruptError extends Error {
   constructor(filePath: string) {
@@ -39,7 +48,7 @@ export class AllocationStore {
 
   /** The app's allocation without its secret, or null. */
   async get(appName: string): Promise<AppStorageAllocation | null> {
-    const stored = (await this.load())[appName];
+    const stored = own(await this.load(), appName);
     if (!stored) return null;
     const { secretAccessKey: _secret, ...allocation } = stored;
     return allocation;
@@ -61,7 +70,7 @@ export class AllocationStore {
 
   /** The app's allocation WITH its decrypted secret — for env injection only. */
   async getCredentials(appName: string): Promise<AppStorageCredentials | null> {
-    const stored = (await this.load())[appName];
+    const stored = own(await this.load(), appName);
     if (!stored) return null;
     const key = await loadPlatformMasterKey(this.keyFilePath);
     if (!key) throw new Error('encryption.key is absent or not 32 bytes — cannot read storage credentials');
@@ -78,7 +87,7 @@ export class AllocationStore {
 
   async remove(appName: string): Promise<void> {
     await this.write(async (file) => {
-      delete file[appName];
+      if (Object.hasOwn(file, appName)) delete file[appName];
     });
   }
 
@@ -91,11 +100,11 @@ export class AllocationStore {
    */
   async retire(appName: string, reason: 'teardown-failed' | 'kept'): Promise<void> {
     await this.write(async (file) => {
-      const stored = file[appName];
+      const stored = own(file, appName);
       if (!stored) return;
       const at = new Date().toISOString();
       let key = `${appName}#retired-${Date.now()}`;
-      for (let n = 1; file[key]; n += 1) key = `${appName}#retired-${Date.now()}-${n}`;
+      for (let n = 1; Object.hasOwn(file, key); n += 1) key = `${appName}#retired-${Date.now()}-${n}`;
       file[key] = { ...stored, retired: { at, reason } };
       delete file[appName];
     });
@@ -104,7 +113,7 @@ export class AllocationStore {
   /** Forget a retired record, once its resources are gone. */
   async removeRetired(key: string): Promise<void> {
     await this.write(async (file) => {
-      if (file[key]?.retired) delete file[key];
+      if (own(file, key)?.retired) delete file[key];
     });
   }
 
@@ -124,12 +133,14 @@ export class AllocationStore {
     try {
       raw = await fs.readFile(this.filePath, 'utf-8');
     } catch (err) {
-      if ((err as NodeJS.ErrnoException).code === 'ENOENT') return {};
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') return Object.create(null) as StoreFile;
       throw new AllocationStoreCorruptError(this.filePath);
     }
     try {
       const parsed = JSON.parse(raw);
-      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed as StoreFile;
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        return Object.assign(Object.create(null), parsed) as StoreFile;
+      }
     } catch {
       // fall through
     }

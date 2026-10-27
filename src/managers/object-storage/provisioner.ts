@@ -18,7 +18,13 @@ import {
 } from './credential-store';
 import { AllocationStore } from './allocation-store';
 import { AwsObjectStorageProvider, createAwsClients, type AwsProviderConfig } from './aws-provider';
-import { BUCKET_PREFIX_RE, bucketNameFor, iamUserNameFor, newResourceSuffix } from './naming';
+import {
+  BUCKET_PREFIX_RE,
+  assertGeneratedResourcePair,
+  bucketNameFor,
+  iamUserNameFor,
+  newResourceSuffix,
+} from './naming';
 import type {
   AppStorageAllocation,
   ObjectStorageProvider,
@@ -161,6 +167,7 @@ export class ObjectStorageProvisioner {
   async deprovisionAppStorage(appName: string): Promise<StorageDeprovisionResult | null> {
     const allocation = await this.allocations.get(appName);
     if (!allocation) return null;
+    assertGeneratedResourcePair(allocation.bucket, allocation.userName);
     const provider = await this.providerFor(allocation.region);
     const result = await provider.deprovision({ bucket: allocation.bucket, userName: allocation.userName });
     await this.allocations.remove(appName);
@@ -223,6 +230,7 @@ export class ObjectStorageProvisioner {
     let failed = 0;
     for (const { key, allocation } of pending) {
       try {
+        assertGeneratedResourcePair(allocation.bucket, allocation.userName);
         const provider = await this.providerFor(allocation.region);
         await provider.deprovision({ bucket: allocation.bucket, userName: allocation.userName });
         await this.allocations.removeRetired(key);

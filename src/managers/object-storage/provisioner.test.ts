@@ -134,6 +134,28 @@ describe('object storage stores and provisioner', () => {
       expect((await allocations.getCredentials('site'))?.secretAccessKey).toBe('app-secret-value');
     });
 
+    it.each(['constructor', 'toString', 'valueOf', 'hasOwnProperty', '__proto__'])(
+      'never resolves the app name %j to an inherited member',
+      async (name) => {
+        expect(await allocations.get(name)).toBeNull();
+        expect(await allocations.getCredentials(name)).toBeNull();
+        await allocations.retire(name, 'kept');
+        await allocations.remove(name);
+        await allocations.removeRetired(name);
+        expect(await allocations.list()).toEqual([]);
+
+        // ...and a real allocation under such a name is stored, found and removed as itself.
+        await allocations.put({
+          appName: name, provider: 'aws', region: 'eu-central-1', bucket: 'b', userName: 'u',
+          accessKeyId: 'AKIAAPP', createdAt: 'now', secretAccessKey: 'app-secret-value',
+        });
+        expect((await allocations.get(name))?.appName).toBe(name);
+        expect(Object.getPrototypeOf(Object.prototype)).toBeNull();
+        await allocations.remove(name);
+        expect(await allocations.get(name)).toBeNull();
+      }
+    );
+
     it('fails closed on a corrupt file instead of reading as empty', async () => {
       await fs.writeFile(path.join(dir, 'object-storage.json'), '{not json');
       await expect(allocations.get('site')).rejects.toBeInstanceOf(AllocationStoreCorruptError);
@@ -219,6 +241,28 @@ describe('object storage stores and provisioner', () => {
       expect(provider.deprovision).toHaveBeenCalledWith({ bucket: allocation.bucket, userName: allocation.userName });
       expect(await p.getAllocation('site')).toBeNull();
       expect(await p.deprovisionAppStorage('site')).toBeNull();
+    });
+
+    it.each([
+      ['an empty user', { bucket: 'dropkit-site-a1b2c3d4', userName: '' }],
+      ['an empty bucket', { bucket: '', userName: 'drop-dropkit-site-a1b2c3d4' }],
+      ['a foreign name', { bucket: 'prod-data', userName: 'admin' }],
+    ])('refuses to tear down %s read back from the store, calling AWS never', async (_l, names) => {
+      await configure();
+      const p = makeProvisioner();
+      await allocations.put({
+        appName: 'site', provider: 'aws', region: 'eu-central-1', ...names,
+        accessKeyId: 'AKIAAPP', createdAt: 'now', secretAccessKey: 's',
+      });
+
+      await expect(p.deprovisionAppStorage('site')).rejects.toMatchObject({ name: 'UnsafeResourceNameError' });
+      expect(provider.deprovision).not.toHaveBeenCalled();
+      expect(await p.getAllocation('site')).not.toBeNull();
+
+      // A retired record with such names is skipped by the sweep, not acted on.
+      await allocations.retire('site', 'teardown-failed');
+      expect(await p.sweepRetired()).toEqual({ destroyed: 0, failed: 1 });
+      expect(provider.deprovision).not.toHaveBeenCalled();
     });
 
     it('keeps the allocation when teardown fails, so it can be retried', async () => {

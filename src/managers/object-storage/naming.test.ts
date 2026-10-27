@@ -1,5 +1,12 @@
 /** Bucket/user naming and the per-bucket policy (#301). */
-import { bucketNameFor, iamUserNameFor, bucketOnlyPolicy, BUCKET_PREFIX_RE, newResourceSuffix } from './naming';
+import {
+  bucketNameFor,
+  iamUserNameFor,
+  bucketOnlyPolicy,
+  BUCKET_PREFIX_RE,
+  newResourceSuffix,
+  isGeneratedResourcePair,
+} from './naming';
 
 const S3_BUCKET_RE = /^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$/;
 
@@ -50,5 +57,30 @@ describe('bucketOnlyPolicy', () => {
     expect(actions.every((a) => a.startsWith('s3:'))).toBe(true);
     expect(actions.some((a) => a.includes('*') || /Acl|Policy/.test(a))).toBe(false);
     expect(policy.Statement.every((s: { Effect: string }) => s.Effect === 'Allow')).toBe(true);
+  });
+});
+
+describe('isGeneratedResourcePair', () => {
+  it('accepts what DROP generates, whatever the prefix or app name', () => {
+    const suffix = newResourceSuffix();
+    for (const app of ['site', 'My_App', 'x'.repeat(64)]) {
+      expect(isGeneratedResourcePair(bucketNameFor('dropkit', app, suffix), iamUserNameFor('dropkit', app, suffix))).toBe(true);
+    }
+  });
+
+  it.each([
+    ['empty', '', ''],
+    ['empty user', 'dropkit-site-a1b2c3d4', ''],
+    ['empty bucket', '', 'drop-dropkit-site-a1b2c3d4'],
+    ['foreign bucket', 'prod-backups', 'drop-dropkit-site-a1b2c3d4'],
+    ['foreign user', 'dropkit-site-a1b2c3d4', 'admin'],
+    ['mismatched suffix', 'dropkit-site-a1b2c3d4', 'drop-dropkit-site-b1b2c3d4'],
+    ['dotted bucket', 'dropkit.site-a1b2c3d4', 'drop-dropkit-site-a1b2c3d4'],
+  ])('rejects %s', (_label, bucket, user) => {
+    expect(isGeneratedResourcePair(bucket, user)).toBe(false);
+  });
+
+  it('rejects non-strings', () => {
+    expect(isGeneratedResourcePair(undefined, undefined)).toBe(false);
   });
 });
