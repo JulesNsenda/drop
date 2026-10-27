@@ -358,6 +358,8 @@ describe('DropPlatform object storage (#301)', () => {
     });
   });
 
+  const flushImmediates = (): Promise<void> => new Promise((resolve) => setImmediate(resolve));
+
   describe('detach', () => {
     it('persists the intent, revokes the key, restarts the app, and only then hands the drain to the sweep', async () => {
       const setServiceIntent = stubAppConfigService(baseConfig({ services: { 'object-storage': 'attached' } }));
@@ -368,6 +370,10 @@ describe('DropPlatform object storage (#301)', () => {
       const sweep = jest.spyOn(platform as any, 'sweepRetiredObjectStorage').mockResolvedValue(undefined);
 
       const result = await platform.detachService(appName, 'object-storage');
+      // The drain is kicked once detachService has released the app, not inside it.
+      expect(sweep).not.toHaveBeenCalled();
+      expect((platform as any).appsInProgress.has(appName)).toBe(false);
+      await flushImmediates();
 
       expect(result).toEqual({
         detached: true,
@@ -434,7 +440,9 @@ describe('DropPlatform object storage (#301)', () => {
       expect(JSON.stringify(result)).not.toContain('arn:aws');
       expect(setServiceIntent).toHaveBeenCalled();
       expect(doRestart).toHaveBeenCalled();
-      // Nothing was revoked, so there is nothing for the sweep to drain yet.
+      // Nothing was revoked, so there is nothing to drain right now; the
+      // periodic sweep finishes the revoke (see the provisioner tests).
+      await flushImmediates();
       expect(sweep).not.toHaveBeenCalled();
     });
 
@@ -470,6 +478,7 @@ describe('DropPlatform object storage (#301)', () => {
       expect(await platform.detachService(appName, 'object-storage')).toEqual(
         expect.objectContaining({ detached: true, deprovisioned: true, drainPending: true })
       );
+      await flushImmediates();
       expect(sweep).toHaveBeenCalledTimes(1);
     });
 
@@ -576,6 +585,10 @@ describe('DropPlatform object storage (#301)', () => {
       const { shouldDrain } = storage.sweepRetired.mock.calls[0][0] as { shouldDrain: (n: string) => boolean };
 
       expect(shouldDrain(appName)).toBe(true);
+      // An attach/detach/delete holding the app: the sweep keeps its hands off.
+      (platform as any).appsInProgress.add(appName);
+      expect(shouldDrain(appName)).toBe(false);
+      (platform as any).appsInProgress.delete(appName);
       stubAppConfigService(baseConfig({ services: { 'object-storage': 'attached' } }));
       expect(shouldDrain(appName)).toBe(false);
       stubAppConfigService(baseConfig());

@@ -3899,10 +3899,15 @@ backup:
     if (!this.objectStorage) return;
     try {
       const { destroyed, failed } = await this.objectStorage.sweepRetired({
-        // A live bucket is drained only for an app whose owner's intent is
-        // (still) 'detached' — the sweep is the one actor that deletes data
-        // with nobody watching.
-        shouldDrain: (appName) => this.appServiceIntent(appName, 'object-storage') === 'detached',
+        // A live bucket is revoked and drained only for an app whose owner's
+        // intent is (still) 'detached' — the sweep is the one actor that
+        // deletes data with nobody watching — and only while no attach,
+        // detach or delete is holding the app: a re-attach reuses the key
+        // before it writes 'attached', and the sweep must not revoke it in
+        // that window.
+        shouldDrain: (appName) =>
+          !this.appsInProgress.has(appName) &&
+          this.appServiceIntent(appName, 'object-storage') === 'detached',
       });
       if (destroyed > 0) {
         this.logger.info(`Removed ${destroyed} object-storage bucket(s) left behind by deleted or detached apps`, 'STORAGE');
@@ -9315,10 +9320,12 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     // 10. Restart, so the app comes back without the variables.
     const restartOutcome = await this.restartAfterDetach(appName, wasLive || wasRunning);
 
-    // 11. Drain through the sweep (not awaited), after the app is off the
-    // bucket. A failed revoke is retried here too: the sweep drains only
-    // revoked buckets, and a retried detach is what revokes this one.
-    if (outcome.detached && outcome.deprovisioned) void this.sweepRetiredObjectStorage();
+    // 11. Drain through the sweep, after the app is off the bucket. Not
+    // awaited, and not started inline: this detach still holds the app until
+    // detachService's finally releases it a few microtasks from now, and the
+    // sweep deliberately keeps its hands off a held app. A revoke that failed
+    // above is finished by that same sweep, not left for a manual retry.
+    if (outcome.detached) setImmediate(() => void this.sweepRetiredObjectStorage());
     return { ...outcome, ...restartOutcome };
   }
 

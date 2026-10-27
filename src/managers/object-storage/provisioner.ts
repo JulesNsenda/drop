@@ -408,11 +408,13 @@ export class ObjectStorageProvisioner {
    *  - Retired records (`deleting`, `teardown-failed`): drained and removed.
    *  - Retired `kept` records: only their IAM access is finished off; the
    *    bucket is the owner's, and only an admin destroys it.
-   *  - LIVE allocations whose key was revoked by a detach: drained, but only
-   *    while `shouldDrain` still says the owner's intent is detached —
-   *    checked again immediately before the drain, because the sweep is the
-   *    one actor that deletes data without a person present. The provisioner
-   *    does not know intents; the platform does.
+   *  - LIVE allocations the owner asked to detach (`shouldDrain`): their key
+   *    is revoked first if the detach itself could not (so a failed revoke is
+   *    finished here, not left to a manual retry), then the bucket is drained.
+   *    `shouldDrain` is asked again after each step and before anything is
+   *    deleted, because the sweep is the one actor that deletes data without
+   *    a person present. The provisioner does not know intents; the platform
+   *    does.
    *
    * A missing credential skips the whole pass rather than failing every record.
    */
@@ -425,9 +427,7 @@ export class ObjectStorageProvisioner {
         // that half. Its bucket is still never touched.
         (allocation.retired?.reason === 'kept' && !allocation.accessRevoked)
     );
-    const detached = (await this.allocations.list()).filter(
-      (allocation) => allocation.accessRevoked && opts.shouldDrain?.(allocation.appName)
-    );
+    const detached = (await this.allocations.list()).filter((allocation) => opts.shouldDrain?.(allocation.appName));
     if ((retired.length === 0 && detached.length === 0) || !(await this.credentials.isConfigured())) {
       return { destroyed: 0, failed: 0 };
     }
@@ -456,6 +456,12 @@ export class ObjectStorageProvisioner {
     for (const allocation of detached) {
       try {
         assertGeneratedResourcePair(allocation.bucket, allocation.userName);
+        if (!opts.shouldDrain?.(allocation.appName)) continue;
+        if (!allocation.accessRevoked) {
+          // The detach recorded its intent but could not revoke the key.
+          await this.revokeAppAccess(allocation.appName);
+          if (!opts.shouldDrain?.(allocation.appName)) continue;
+        }
         const provider = await this.providerFor(allocation.region);
         // The last look before data is deleted: the owner may have changed
         // their mind (or the app may have gone) since the list above.

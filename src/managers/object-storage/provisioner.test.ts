@@ -461,6 +461,48 @@ describe('object storage stores and provisioner', () => {
         expect(await p.getAllocation('site')).toBeNull();
       });
 
+      it('revokes a key the detach could not, then drains — by the sweep alone', async () => {
+        await configure();
+        const p = makeProvisioner();
+        const live = await p.provisionAppStorage('site');
+        // The detach persisted its intent, then the revoke threw: no accessRevoked.
+        provider.revokeAccess.mockRejectedValueOnce(new Error('Throttling'));
+        await expect(p.revokeAppAccess('site')).rejects.toThrow('Throttling');
+        expect((await p.getAllocation('site'))?.accessRevoked).toBeUndefined();
+
+        expect(await p.sweepRetired({ shouldDrain: () => true })).toEqual({ destroyed: 1, failed: 0 });
+
+        expect(provider.revokeAccess).toHaveBeenLastCalledWith({ userName: live.userName });
+        const revokeOrders = provider.revokeAccess.mock.invocationCallOrder;
+        expect(revokeOrders[revokeOrders.length - 1]).toBeLessThan(provider.deprovision.mock.invocationCallOrder[0]);
+        expect(await p.getAllocation('site')).toBeNull();
+      });
+
+      it('touches nothing of an unrevoked allocation while the owner does not want it detached', async () => {
+        await configure();
+        const p = makeProvisioner();
+        await p.provisionAppStorage('site');
+
+        expect(await p.sweepRetired({ shouldDrain: () => false })).toEqual({ destroyed: 0, failed: 0 });
+        expect(await p.sweepRetired()).toEqual({ destroyed: 0, failed: 0 });
+        expect(provider.revokeAccess).not.toHaveBeenCalled();
+        expect(provider.deprovision).not.toHaveBeenCalled();
+        expect((await p.getAllocation('site'))?.accessRevoked).toBeUndefined();
+        expect(await p.getEnvVars('site')).not.toBeNull();
+      });
+
+      it('stops before deleting if the intent flips back right after the revoke', async () => {
+        await configure();
+        const p = makeProvisioner();
+        await p.provisionAppStorage('site');
+        const answers = [true, true, false]; // list, before revoke, after revoke
+        expect(await p.sweepRetired({ shouldDrain: () => answers.shift() ?? false })).toEqual({ destroyed: 0, failed: 0 });
+        expect(provider.revokeAccess).toHaveBeenCalledTimes(1);
+        expect(provider.deprovision).not.toHaveBeenCalled();
+        // Revoked and recorded; attach is now refused until the detach completes.
+        await expect(p.provisionAppStorage('site')).rejects.toBeInstanceOf(ObjectStorageDetachIncompleteError);
+      });
+
       it('survives AWS failing between removing the user and removing the bucket, and finishes on retry', async () => {
         await configure();
         const p = makeProvisioner();

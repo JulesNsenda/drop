@@ -78,8 +78,11 @@ in `?confirm=`. The dashboard's confirm dialog sends it.
 A detach that did not finish shows as "Detach incomplete" with a retry button,
 and **attaching is refused until it is finished** (retry the detach; it is
 idempotent): attaching in between would hand the app a bucket that is about to
-be emptied. The background step only deletes a bucket while the owner's intent
-is still `detached`, re-checked immediately before it deletes anything.
+be emptied. The background step only touches a bucket while the owner's intent
+is still `detached` and no attach, detach or delete is holding the app,
+re-checked immediately before it deletes anything. If AWS refused to revoke the
+key during the detach, the same background step revokes it first, so a failed
+detach converges without a manual retry.
 
 ## When an app is deleted
 

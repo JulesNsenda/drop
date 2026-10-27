@@ -27,6 +27,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Upgrading
+
+- **`isolation: none` only: apps no longer inherit the platform's `AWS_*` and
+  `DROP_S3_*` environment.** A PM2 app used to receive every variable the
+  platform process was started with; any of those two prefixes that the app does
+  not set itself (as a secret, in `drop.yaml` `env:`, or by attaching object
+  storage) is now passed as empty. An app that relied on picking up AWS
+  credentials from the host's environment must set them as secrets. Container
+  isolation was never affected.
+
 ## [1.7.1] - 2026-10-26
 
 A security release. Ownership of apps and monorepo groups is enforced more strictly; read the Upgrading notes before taking it if other accounts deploy to your server.
