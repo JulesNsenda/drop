@@ -18,6 +18,14 @@ import { AppType } from '../../detector/detector.types';
 const SECRET_ENV_PREFIXES = ['DROP_', 'AWS_', 'CF_'];
 
 /**
+ * Reserved-prefix names the platform itself sets for a build and allows through
+ * as OVERRIDES: platform-set, not a secret; builds stamp versions from it. They
+ * are still stripped from the inherited `process.env`, so only the platform's
+ * own value can ever arrive.
+ */
+const PLATFORM_SET_BUILD_VARS: ReadonlySet<string> = new Set(['DROP_GIT_COMMIT']);
+
+/**
  * Build a child-process env from the parent env minus platform secrets, plus
  * overrides.
  *
@@ -46,7 +54,7 @@ export function sanitizeBuildEnv(overrides: Record<string, string> = {}): NodeJS
 
   const refused: string[] = [];
   for (const [key, value] of Object.entries(overrides)) {
-    if (isSecretKey(key)) {
+    if (isSecretKey(key) && !PLATFORM_SET_BUILD_VARS.has(key)) {
       refused.push(key);
       continue;
     }

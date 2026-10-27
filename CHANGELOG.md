@@ -29,7 +29,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- Hardened how git-deployed apps are updated: a redeploy now downloads a fresh shallow copy into a private platform folder and copies the repository's files into the app, instead of running git inside the app's own folder. The copy is size- and entry-limited like an upload, refuses to write through links, and records which files it wrote so it only ever deletes those.
 - Hostnames under the platform's own public host can no longer be claimed as an app's custom domain.
+
+### Upgrading
+
+- Git-deployed apps no longer have a `.git` folder in their app directory (an existing one is removed on the first redeploy). Builds that read git metadata, such as `git describe`, can use the `DROP_GIT_COMMIT` environment variable, which holds the deployed commit.
+- A redeploy removes files that were deleted upstream, but only ones DROP itself copied from the repository. Files an app wrote into its own folder are left alone; use `DROP_DATA_DIR` for state. The first redeploy after upgrading removes nothing.
+- Every redeploy re-downloads a shallow clone of the branch. A repository checkout is limited to 200,000 entries and `DROP_MAX_GIT_CHECKOUT_MB` megabytes (default: twice `DROP_MAX_UPLOAD_UNPACKED_MB`); larger repositories are refused.
+- A Dockerfile build receives the deployed commit as the `DROP_GIT_COMMIT` build argument (declare `ARG DROP_GIT_COMMIT`); monorepo services get the group's commit.
+- A redeploy that arrives while the app is building or deploying (a push webhook, for instance) is queued and run when the app is free, instead of being dropped. The queue survives a restart, and a queued redeploy that fails is recorded as a failed deploy and in the activity log.
+- A git checkout is sized from the repository before any file is written and refused if it is over the limits; a new app's files appear in the apps folder in a single step.
+- Files a redeploy has not changed are no longer rewritten, and changed files are replaced in place without a gap.
+- A rollback also restores the commit shown for the app and the list of files the next git redeploy may delete.
+- Build containers are now labelled `drop.build=<app>`; the platform finds and clears them by that label.
+- Symbolic links tracked in a repository are not recreated in the app folder (a warning names them).
+- A git redeploy is refused (409) while the app is building or deploying.
 
 ## [1.7.1] - 2026-10-26
 

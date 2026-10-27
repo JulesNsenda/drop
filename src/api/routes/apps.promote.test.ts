@@ -83,6 +83,17 @@ describe('POST /apps/:name/promote', () => {
     expect(promoteApp).toHaveBeenCalledWith('alice-app');
   });
 
+  it('answers 409 (not 500) when the app is claimed by a build between the request and the promotion', async () => {
+    // promoteApp claims the app itself and throws if it is busy; the route no
+    // longer pre-checks, so this is the only place the race can show.
+    promoteApp.mockRejectedValueOnce(new platformOps.AppInProgressError('alice-app'));
+
+    const res = await promote('alice-app', bearer(aliceToken));
+
+    expect(res.status).toBe(409);
+    expect(promoteApp).toHaveBeenCalledWith('alice-app');
+  });
+
   it('lets an admin promote', async () => {
     const res = await promote('alice-app', bearer(adminToken));
 

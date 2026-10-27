@@ -1108,6 +1108,14 @@ apps.post('/:name/promote', async c => {
     if (err instanceof StaleDependenciesError) {
       return c.json(error(ErrorCodes.CONFLICT, err.message), 409);
     }
+    // promoteApp claims the app before it touches anything, so a build that
+    // started in the meantime surfaces here (not as a 500).
+    if (err instanceof AppInProgressError) {
+      return c.json(
+        error(ErrorCodes.CONFLICT, `Application '${name}' is building or deploying - retry once it settles`),
+        409
+      );
+    }
     const message = err instanceof Error ? err.message : 'Promote failed';
     if (message.includes('awaiting promotion')) {
       return c.json(error(ErrorCodes.BAD_REQUEST, message), 400);
