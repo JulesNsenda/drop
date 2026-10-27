@@ -149,6 +149,12 @@ describe('git deploy folder reservation', () => {
       const logged: string[] = [];
       const logger = (platform as unknown as { logger: { info: (m: string, ...r: unknown[]) => void } }).logger;
       const original = logger.info.bind(logger);
+      // Every level is captured so a failure shows which guard returned instead.
+      for (const level of ['debug', 'warn', 'error'] as const) {
+        jest.spyOn(logger as unknown as Record<string, (m: string) => void>, level).mockImplementation((m: string) => {
+          logged.push(`${level}: ${m}`);
+        });
+      }
       jest.spyOn(logger, 'info').mockImplementation((m: string, ...rest: unknown[]) => {
         logged.push(m);
         original(m, ...rest);
@@ -159,7 +165,7 @@ describe('git deploy folder reservation', () => {
       expect(ran).toBe(false);
       // It was dropped by the re-check on the line before the claim, not by
       // some earlier guard.
-      expect(logged.some((m) => m.includes('a deploy took the app meanwhile'))).toBe(true);
+      expect(logged).toContainEqual(expect.stringContaining('a deploy took the app meanwhile'));
       expect(releaseB).not.toBeNull();
       expect(build).not.toHaveBeenCalled();
       // B's reservation is intact: still busy, still reserved.
